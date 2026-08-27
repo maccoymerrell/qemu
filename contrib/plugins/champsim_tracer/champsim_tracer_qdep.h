@@ -306,35 +306,37 @@ enum QDepState : uint8_t {
      */
     QDEP_R_DST_UNNAMED,
     /*
-     * Destination family only.  The value QEMU says this destination took is
-     * one QEMU's provenance CANNOT NAME, so the set it handed over is empty
-     * or missing a member and an empty set here is not evidence of absence.
-     * Two shapes, both measured, and they are one refusal because the cure
-     * is one thing -- a provenance that can name a constant:
+     * Destination family only.  A destination's provenance is EMPTY, the
+     * extraction is complete, and the template carries NO immediate slot to
+     * point at -- so the value is a constant this record has no word for.
      *
-     *   THE INSTRUCTION'S OWN IMMEDIATE.  `add $8,%rsp` takes its result from
-     *   RSP and from the encoded 8.  QEMU's provenance is a set of REGISTERS
-     *   and interned env ranges; a tcg_constant contributes nothing to it, so
-     *   the extracted set is {RSP} and the wire's immediate bit -- which the
-     *   format has, and which the refiner sets -- would go dark.  496 x86_64
-     *   rows on the four-ISA workload.
-     *
-     *   THE ARCHITECTURAL ZERO REGISTER.  `li a0,5` is `addi a0,x0,5`, and
-     *   R7.3 is verbatim "REG_ZERO exists, so it should be specified.  We
-     *   should not be dropping reg zero."  insn_dataflow_note_zero_reg()
-     *   states it -- but the note is consumed at ONE place, the store-data
-     *   provenance of a memop (accel/tcg/insn-dataflow.c, `df_zero_reg_temp`
-     *   on `m->data_prov`), and never reaches writes[].prov.  So a register
-     *   WRITE whose source operand was x0 arrives here with an empty set.
-     *   805 riscv64 rows.
-     *
-     * Refused rather than filled in.  Substituting the immediate bit into an
-     * empty mask -- which the store-data family does, on a provenance whose
-     * every short shape is already a refusal -- would here be a GUESS between
-     * the three ways a destination's set can be empty, and one of the three
-     * is the zero register a standing ruling forbids dropping.
+     * This is what is left of the class after the encoding rule above and
+     * after insn_dataflow_note_zero_reg() reaches writes[].prov: the zero
+     * register now arrives as a provenance BIT (R7.3, "REG_ZERO exists, so it
+     * should be specified"), and an immediate arrives as the bit above.  A
+     * row here is neither, and refusing is the honest answer -- publishing an
+     * empty mask would state that the destination waits on nothing, which is
+     * a claim nothing measured.
      */
     QDEP_R_DST_UNSTATED_CONST,
+    /*
+     * Destination family only.  Every destination's provenance was stated in
+     * full and named at least one register, but the INSTRUCTION carries an
+     * immediate -- and QEMU's provenance cannot mention one, so a mask built
+     * from registers alone would be SHORT by the immediate bit.
+     *
+     * `add $8,%rsp` is the shape: the result is RSP plus the encoded 8, the
+     * extracted set is {RSP}, and the wire's immediate bit -- which the
+     * format has, and which the refiner sets -- would go dark.  496 x86_64
+     * rows on the four-ISA workload when this was first measured.
+     *
+     * Counted apart from the empty-set gate because the two need different
+     * answers: there the empty set LEAVES the encoding as the only source and
+     * the slot publishes the immediate bit, here the encoding is an
+     * ADDITIONAL source beside registers QEMU did name, and no reading of
+     * "empty and complete" reaches it.
+     */
+    QDEP_R_DST_IMM_UNSTATED,
     /*
      * Destination family only.  QEMU's provenance for a destination names
      * THAT DESTINATION, and R7.1 rules on exactly this:

@@ -139,6 +139,15 @@ std::atomic<uint64_t> g_dst_wire_missing_other{0};
 std::atomic<uint64_t> g_addr_imm{0};
 std::atomic<uint64_t> g_addr_empty_no_imm{0};
 /*
+ * DESTINATION slots the same rule reached: the write's provenance was
+ * COMPLETE and named no register, no load slot and no env range, so the value
+ * is the instruction's own encoding and the mask carries the immediate bit.
+ * Counted per SLOT, beside the per-instruction refusal buckets, for
+ * g_addr_imm's reason -- and because the population it replaces (#227) was
+ * refused for as long as one refusal covered three different facts.
+ */
+std::atomic<uint64_t> g_dst_imm{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -1104,28 +1113,56 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
             }
         }
         /*
-         * THE CONSTANT GATE.  The store-data family substitutes the immediate
-         * bit into an empty mask; this family may not, and the difference is
-         * which ways the set can be empty.
+         * THE CONSTANT GATE, split into the two shapes it used to report as
+         * one.  A destination's provenance can be empty for three reasons and
+         * they do NOT have one answer, which is why one refusal covering all
+         * three could never be discharged:
          *
-         * A store's datum arrives on a provenance whose every short shape is
-         * already a refusal one gate earlier, so an empty set there leaves
-         * exactly one candidate: the encoding.  A destination's does not.  It
-         * can be empty because the value is the instruction's immediate,
-         * because the source operand was the architectural ZERO REGISTER
-         * whose note never reaches writes[].prov, or because the instruction
-         * genuinely breaks the chain.  Choosing between those would be a
-         * guess, and one of the three is the case R7.3 rules on by name.
+         *   the value is the instruction's own ENCODING -- the empty-and-
+         *   complete reading the address and store-data families already run
+         *   under, and the template has an immediate slot to point at;
+         *
+         *   the source operand was the architectural ZERO REGISTER, which
+         *   reaches this set as a provenance BIT (INSN_DF_ZERO_PROV_BIT) now
+         *   that insn_dataflow_note_zero_reg() is anchored to the writing
+         *   instruction -- so such a row is no longer empty and does not
+         *   arrive here at all;
+         *
+         *   a constant that is neither, which nothing here can name.
+         *
+         * The first two publish.  Only the third refuses, and it is counted
+         * under its own state so its size is a number rather than a residue.
          */
         if (q->n_dst_dep_regs[k] == 0 && q->dst_dep_load_slots[k] == 0) {
-            g_snprintf(why, whysz, "empty set for %s",
-                       generic_reg_name_or_unknown(q->dst_reg[k]));
-            return QDEP_R_DST_UNSTATED_CONST;
+            if (!f->has_immediate) {
+                g_snprintf(why, whysz, "empty set for %s",
+                           generic_reg_name_or_unknown(q->dst_reg[k]));
+                return QDEP_R_DST_UNSTATED_CONST;
+            }
+            /*
+             * The encoding.  apply_dst() writes the immediate bit for this
+             * slot; nothing is refused for it.
+             */
+        } else if (f->has_immediate) {
+            /*
+             * The destination named registers AND the instruction carries an
+             * immediate QEMU's provenance cannot mention, so the mask this
+             * would publish is SHORT by the immediate bit -- and unlike the
+             * empty case there is no reading of "complete" that resolves it:
+             * the encoding is an ADDITIONAL candidate source beside registers
+             * QEMU did name, and nothing stated says whether it contributed.
+             *
+             * `ldr x0,[x1,#8]` is why a blanket bit is not the answer.  Its
+             * destination's value came from the LOAD; the #8 is the address's
+             * business and is already in load_addr_dep[].  Setting the bit
+             * here would state that the loaded value waits on the encoding
+             * and would put the address's arithmetic into the data mask --
+             * the one conflation the separate address and data provenances
+             * exist to prevent.
+             */
+            g_snprintf(why, whysz, "immediate no provenance can mention");
+            return QDEP_R_DST_IMM_UNSTATED;
         }
-    }
-    if (f->has_immediate) {
-        g_snprintf(why, whysz, "immediate no provenance can mention");
-        return QDEP_R_DST_UNSTATED_CONST;
     }
     if (!f->has_reg_deps) {
         /*
@@ -1228,6 +1265,28 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
                 .fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        if (m == 0) {
+            /*
+             * THE ENCODING.  The provenance is empty and it is COMPLETE --
+             * every way it could have been short is a refusal in
+             * dst_precheck() -- so the value came from the one place a
+             * provenance made of registers and env ranges cannot name: the
+             * instruction's own encoding.  dst_precheck() has already refused
+             * the case with no immediate slot to point at, so reaching here
+             * means the bit exists.
+             *
+             * The same rule 4a104e0be4 settled for the address families and
+             * fb92a61ea4 for store data, under #230's condition -- it fires
+             * only where NO NOTE NAMES A REGISTER.  A folded register and the
+             * architectural zero register both arrive as provenance bits, so
+             * a row whose encoding does name a register has a non-empty mask
+             * and never reaches this line.  A shape that ought to carry a
+             * note appearing in this count means the note is not reaching the
+             * write, never that the rule needs an exception.
+             */
+            m = 1ULL << (f->n_src_regs + f->max_dep_loads);
+            g_dst_imm.fetch_add(1, std::memory_order_relaxed);
+        }
         f->dst_dep_mask[d] = m;
     }
     g_wstate[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
@@ -1249,7 +1308,8 @@ const char *state_name(unsigned s)
     case QDEP_R_HELPER_UNSTATED:return "refused: a helper-performed access whose operand travels through no argument (CP1)";
     case QDEP_NO_BLOCK:         return "stated by QEMU but the wire's HAS_REG flag is clear: consumer already at the default";
     case QDEP_R_DST_UNNAMED:    return "refused: a wire destination QEMU named only as env state, not as a TCG global (#218)";
-    case QDEP_R_DST_UNSTATED_CONST: return "refused: a destination's value came from a constant QEMU's provenance cannot name -- an immediate, or the zero register R7.3 forbids dropping";
+    case QDEP_R_DST_UNSTATED_CONST: return "refused: a destination's value came from a constant that is neither the encoding nor the zero register";
+    case QDEP_R_DST_IMM_UNSTATED: return "refused: the instruction carries an immediate QEMU's provenance cannot mention, so a register-only mask would be short by the immediate bit";
     case QDEP_R_DST_SELF:       return "refused: a destination is in its own provenance and R7.1 says only the INSTRUCTION's own source counts (in-place lowering)";
     default:                    return "?";
     }
@@ -1890,6 +1950,16 @@ void qdep_report(GString *report)
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
         "`no accesses / no dataflow ABI` still carries the refiner's mask:\n");
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  destination SLOTS (not rows) whose complete provenance"
+        " named nothing,\n"
+        "              published as the ENCODING (the immediate bit); a shape"
+        " whose value\n"
+        "               a note should name -- the zero register, a folded"
+        " register --\n"
+        "               appearing here means the note is not reaching the"
+        " write\n",
+        g_dst_imm.load(std::memory_order_relaxed));
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         uint64_t v = g_wstate[s].load(std::memory_order_relaxed);
         if (v) {

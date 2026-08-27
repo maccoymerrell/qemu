@@ -585,11 +585,17 @@ Decode by repeated outer-section unwrapping.
         the instruction's decoded operands on the rest.  The rest is not
         a leftover but a named set, and a run says how large it is: the
         tracer's statistics report a ``destination family`` census whose
-        buckets are the reasons, among them a destination QEMU names
-        only as a ``CPUArchState`` byte range, a value taken from a
-        constant no provenance can mention, and a destination that
-        appears inside its own provenance because the lowering computed
-        in place.
+        buckets are the reasons.  Among them: a destination QEMU names
+        only as a ``CPUArchState`` byte range; a destination whose value
+        came from a constant that is neither the encoding nor the zero
+        register; a destination that names registers on an instruction
+        that ALSO carries an immediate, where a register-only mask would
+        be short by the immediate bit; and a destination that appears
+        inside its own provenance because the lowering computed in
+        place.  A destination whose provenance is empty and complete on
+        a template that has an immediate slot is not a refusal at all —
+        the value is the encoding, and the mask carries the immediate
+        bit, counted in its own row of that census.
 
         Two consequences are visible on the wire.  On x86-64 a
         RIP-relative access names ``REG_IP`` in its address mask, and

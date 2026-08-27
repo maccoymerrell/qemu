@@ -131,6 +131,14 @@ GHashTable *g_dst_wire_missing = nullptr;   /* "mnem  REG" -> count */
 std::atomic<uint64_t> g_dst_wire_missing_pc{0};
 std::atomic<uint64_t> g_dst_wire_missing_other{0};
 /*
+ * Address slots whose provenance was COMPLETE and named no register, on a
+ * template that carries an immediate -- the encoding-derived address, counted
+ * because a rule nobody can see fire is a rule nobody can check.  See the
+ * immediate-provenance block in the HAS_ADDR section.
+ */
+std::atomic<uint64_t> g_addr_imm{0};
+std::atomic<uint64_t> g_addr_empty_no_imm{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -1626,6 +1634,74 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
     }
 
+    if (state == QDEP_OK) {
+        /*
+         * THE IMMEDIATE-PROVENANCE RULE, ON THE ADDRESS SIDE.
+         *
+         * fb92a61ea4 established it for store data: a provenance that is
+         * EMPTY and COMPLETE cannot mean the value came from nowhere, and
+         * the only remaining source is the instruction's own encoding, which
+         * is what the format's immediate bit means.  An address is under the
+         * same arithmetic -- it is computed from registers, from the
+         * encoding, or from both -- so the same reading applies and this
+         * settles it deliberately rather than leaving an empty address mask
+         * to mean two different things depending on which shape produced it.
+         * The x86-64 shape is displacement-only addressing, where the modrm
+         * names no base and no index.
+         *
+         * COMPLETE is what makes it sound, and completeness here is not an
+         * assumption: every way the provenance could have been short -- an
+         * unrepresentable register, an env range with no generic word, a
+         * dropped note -- is a refusal that has already sent this row to the
+         * all-inputs default above, so reaching this line means QEMU stated
+         * the address in full and stated no register.
+         *
+         * AND IT MAY FIRE ONLY WHERE NO NOTE NAMES A REGISTER, which is
+         * #230's lesson written as a condition rather than as advice.  A
+         * RIP-relative access has exactly this shape at the op stream --
+         * gen_lea_modrm_1() folds the program counter into the displacement
+         * and materialises the whole address with one movi -- and answering
+         * it "immediate" would state that an address the machine derives
+         * from RIP waits on nothing.  It does not reach here: the emitter
+         * states the fold (insn_dataflow_note_folded_reg on cpu_eip) and the
+         * row arrives with REG_IP in its mask.  A RIP-relative row appearing
+         * in g_addr_imm means the note is not reaching the access -- never
+         * that the rule needs an exception.
+         *
+         * Set only where the template HAS an immediate slot; without one
+         * there is no bit to point at and the empty mask stands, which is
+         * true as far as it goes.  Both halves are counted so the split is a
+         * measurement.
+         */
+        if (f->has_immediate) {
+            for (uint8_t k = 0; k < mdl_new; k++) {
+                if (ld_mask[k] == 0) {
+                    ld_mask[k] = 1ULL << f->n_src_regs;
+                    g_addr_imm.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            for (uint8_t k = 0; k < mds_new; k++) {
+                if (st_mask[k] == 0) {
+                    st_mask[k] = 1ULL << f->n_src_regs;
+                    g_addr_imm.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } else {
+            for (uint8_t k = 0; k < mdl_new; k++) {
+                if (ld_mask[k] == 0) {
+                    g_addr_empty_no_imm.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
+            }
+            for (uint8_t k = 0; k < mds_new; k++) {
+                if (st_mask[k] == 0) {
+                    g_addr_empty_no_imm.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
     if (state != QDEP_OK) {
         /*
          * The format default, by name.  has_addr_deps false means the
@@ -1775,6 +1851,18 @@ void qdep_report(GString *report)
         "numbers for it and not with the flip.\n");
 
     g_string_append(report, "\naddress families (HAS_ADDR):\n");
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  slots whose complete provenance named no register,"
+        " published as\n"
+        "              the ENCODING (displacement-only addressing; a"
+        " RIP-relative row\n"
+        "               here means the folded-register note is not reaching"
+        " the access)\n"
+        "  %10" G_GUINT64_FORMAT "  the same, on a template with no immediate slot to"
+        " point at:\n"
+        "               published EMPTY, which is true as far as it goes\n",
+        g_addr_imm.load(std::memory_order_relaxed),
+        g_addr_empty_no_imm.load(std::memory_order_relaxed));
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         uint64_t v = g_state[s].load(std::memory_order_relaxed);
         if (v) {

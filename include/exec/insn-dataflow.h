@@ -487,6 +487,16 @@ void insn_dataflow_note_zero_reg(const void *ts);
  * on the wire as an IMMEDIATE.  A consumer is then told the return-address
  * store waits on nothing, when it waits on RIP.
  *
+ * THE SAME FOLD REACHES ADDRESSES, and by the same route.  A RIP-relative
+ * memory operand is the instruction pointer plus a displacement, and
+ * gen_lea_modrm_0() adds s->pc into the displacement at decode time so that
+ * gen_lea_modrm_1() can materialise the whole address with one movi.  The
+ * empty provenance that leaves behind is not read as an immediate -- an
+ * address family has no immediate rule to fire -- it is published as an
+ * address that waits on nothing at all, which for the commonest form of
+ * access in position-independent code is a dependency simply missing.  The
+ * note is taken there too.
+ *
  * The note is taken AT THE ACCESSOR, the same place and for the same reason
  * as insn_dataflow_note_zero_reg()'s: the register the value stands for is
  * known there and nowhere downstream.  @ts is the temp the accessor returns
@@ -501,6 +511,17 @@ void insn_dataflow_note_zero_reg(const void *ts);
  * though it were the machine.  Taking the note in the CF_PCREL arm as well
  * is deliberate and not redundant bookkeeping: it makes the two regimes
  * publish the same set by construction instead of by coincidence.
+ *
+ * A NOTE DESCRIBES A TEMP'S CONTENTS AND EXPIRES WITH THEM.  Unless @ts is a
+ * constant -- interned by value, defined by no op, impossible to rewrite --
+ * the note is anchored to the op that has just written @ts, and the walk
+ * discards it once that temp has been written again.  This matters because
+ * x86 computes every address in a block into ONE temp (DisasContext::A0):
+ * without the anchor a single RIP-relative access would name the instruction
+ * pointer in the address set of every later access in the same block, which
+ * is a fabricated dependency and strictly worse than the missing one the
+ * note exists to supply.  So call this from the emitter that produced the
+ * value, while the write is still the last op emitted.
  *
  * @ts and @src_ts are TCGTemp pointers, void here for the same reason
  * insn_dataflow_note_memop()'s are.  Capture only; no op is emitted, altered

@@ -96,12 +96,14 @@
 #define DF_MAX_ZERO_NOTES     256
 /*
  * Folded-register operands stated by an emitter (insn_dataflow_note_folded_reg).
- * One per such operand a block resolves, and the only emitter that states one
- * is x86's eip_next_tl(), which a block reaches once per call instruction;
- * past the cap the notes stop and an access taken after is marked unnoted
- * rather than published with its datum's source missing.
+ * One per such operand a block resolves.  Two emitters state them, both x86's:
+ * eip_next_tl(), once per call instruction, and gen_lea_modrm_1(), once per
+ * RIP-relative memory operand -- which position-independent code reaches far
+ * more often than it calls, so the cap is sized for the address half.  Past it
+ * the notes stop and an access taken after is marked unnoted rather than
+ * published with its source missing.
  */
-#define DF_MAX_FOLD_NOTES     128
+#define DF_MAX_FOLD_NOTES     512
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -157,6 +159,20 @@ typedef struct DfMemopNote {
 typedef struct DfFoldNote {
     const void *ts;
     const void *src_ts;
+    /*
+     * The op that had just DEFINED @ts when the note was taken, or NULL when
+     * @ts is a constant, which no op defines and nothing can redefine.
+     *
+     * A note is a claim about a temp's CURRENT contents, and x86's address
+     * generation writes every address into one temp that lives for the whole
+     * block (DisasContext::A0).  Without the anchor, one RIP-relative access
+     * would name the instruction pointer for every later access in the same
+     * TB whose address happens to land in the same temp -- a fabricated
+     * dependency, which is worse than the missing one this closes.  The walk
+     * records each temp's defining op as it goes and df_fold_add_srcs()
+     * accepts the note only while the two still agree.
+     */
+    const TCGOp *anchor;
 } DfFoldNote;
 
 /*
@@ -310,6 +326,13 @@ struct InsnDataflowScratch {
     uint32_t stamp[TCG_MAX_TEMPS];
     uint64_t prov[TCG_MAX_TEMPS][INSN_DF_REG_WORDS];
     int64_t envoff[TCG_MAX_TEMPS];
+    /*
+     * The op that last wrote each temp, as the walk passes it.  Only the
+     * folded-register notes read it, and only to ask whether the temp still
+     * holds what the note described.  Same generation stamp as prov[] and
+     * envoff[], so a temp the block never writes reads back as NULL.
+     */
+    const TCGOp *defop[TCG_MAX_TEMPS];
 
     InsnDataflow out[INSN_DF_MAX_INSNS];
     unsigned ninsns;
@@ -383,6 +406,7 @@ static __thread struct InsnDataflowScratch *df;
 #define df_stamp            (df->stamp)
 #define df_prov             (df->prov)
 #define df_envoff           (df->envoff)
+#define df_defop            (df->defop)
 #define df_out              (df->out)
 #define df_ninsns           (df->ninsns)
 #define df_slot_off         (df->slot_off)
@@ -738,6 +762,7 @@ static void df_touch(size_t i)
         df_stamp[i] = df_gen;
         memset(df_prov[i], 0, sizeof(df_prov[i]));
         df_envoff[i] = INSN_DF_NOT_ENV;
+        df_defop[i] = NULL;
     }
 }
 
@@ -757,6 +782,18 @@ static void df_set_envoff(size_t i, int64_t v)
 {
     df_touch(i);
     df_envoff[i] = v;
+}
+
+static const TCGOp *df_defop_of(size_t i)
+{
+    df_touch(i);
+    return df_defop[i];
+}
+
+static void df_set_defop(size_t i, const TCGOp *op)
+{
+    df_touch(i);
+    df_defop[i] = op;
 }
 
 static void df_or(uint64_t *dst, const uint64_t *src)
@@ -1133,11 +1170,34 @@ static void df_fold_add_srcs(uint64_t *dst, const void *tsv, unsigned n,
     const TCGTemp *ts = (const TCGTemp *)tsv;
 
     for (unsigned i = 0; i < n; i++) {
+        size_t ti = (size_t)((ts + i) - tcg_ctx->temps);
+
+        if (ti >= TCG_MAX_TEMPS) {
+            continue;
+        }
         for (unsigned k = scope > df_n_fold ? df_n_fold : scope; k-- > 0; ) {
-            if (df_fold[k].ts == (const void *)(ts + i)) {
-                df_prov_add_temps(dst, df_fold[k].src_ts, 1);
-                break;
+            if (df_fold[k].ts != (const void *)(ts + i)) {
+                continue;
             }
+            /*
+             * The newest note for this temp, and the only one that can still
+             * be true of it: an older note describes contents a later one
+             * replaced.  It applies only if the temp still holds what the
+             * note described -- either because nothing can rewrite it (a
+             * constant, anchor NULL) or because the op that defined it when
+             * the note was taken is still the op that defined it here.
+             *
+             * Rejecting rather than searching on is deliberate.  A temp
+             * redefined since the note is a temp the note is silent about,
+             * and reaching further back would answer with a fact about
+             * contents that are gone -- x86's A0 carries every address in a
+             * block, so that is not a corner case but the common one.
+             */
+            if (df_fold[k].anchor == NULL ||
+                df_fold[k].anchor == df_defop_of(ti)) {
+                df_prov_add_temps(dst, df_fold[k].src_ts, 1);
+            }
+            break;
         }
     }
 }
@@ -1778,6 +1838,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     size_t ti = ts - s->temps;
 
                     df_or(df_prov_of(ti), prov);
+                    df_set_defop(ti, op);
                     if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
                         tlo = MIN(tlo, ti);
                         thi = MAX(thi, ti);
@@ -1925,6 +1986,12 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     thi = MAX(thi, ti);
                 }
                 memcpy(dp, prov, sizeof(prov));
+                /*
+                 * This op is now the temp's definition, which is what a
+                 * folded-register note taken against an earlier one has to
+                 * be tested against.  See DfFoldNote::anchor.
+                 */
+                df_set_defop(ti, op);
                 /*
                  * A load's value came from the field it loaded, which the
                  * op's own inputs do not say -- they name the base pointer.
@@ -2145,18 +2212,36 @@ void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts)
         return;
     }
     /*
-     * Deduplicated on the pair, because a block that calls the same target
-     * twice resolves the same interned constant twice and an undeduplicated
-     * list would fill with copies and then overflow, turning a fact the
-     * extractor holds into a refusal it does not need.
+     * A constant temp is interned by value and no op defines it, so there is
+     * nothing that could make the note stale and no anchor to take.  Any
+     * other temp is anchored to the op that has just written it -- the note
+     * is being taken by the emitter that produced the value, so the tail of
+     * the op list IS that write.
      */
-    for (unsigned i = 0; i < df_n_fold; i++) {
-        if (df_fold[i].ts == ts && df_fold[i].src_ts == src_ts) {
+    const TCGOp *anchor = ((const TCGTemp *)ts)->kind == TEMP_CONST
+                          ? NULL : QTAILQ_LAST(&tcg_ctx->ops);
+
+    /*
+     * Deduplicated against the NEWEST note for this temp, because a block
+     * that calls the same target twice resolves the same interned constant
+     * twice and an undeduplicated list would fill with copies and then
+     * overflow, turning a fact the extractor holds into a refusal it does
+     * not need.  Newest-first rather than any-match: the same temp restated
+     * after a different write is a different fact, and an any-match scan
+     * would drop the restatement and leave the stale note newest.
+     */
+    for (unsigned i = df_n_fold; i-- > 0; ) {
+        if (df_fold[i].ts != ts) {
+            continue;
+        }
+        if (df_fold[i].src_ts == src_ts && df_fold[i].anchor == anchor) {
             return;
         }
+        break;
     }
     df_fold[df_n_fold].ts = ts;
     df_fold[df_n_fold].src_ts = src_ts;
+    df_fold[df_n_fold].anchor = anchor;
     df_n_fold++;
 }
 

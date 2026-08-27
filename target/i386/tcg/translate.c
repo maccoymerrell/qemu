@@ -2044,6 +2044,25 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
             tcg_gen_movi_tl(s->A0, a.disp);
         }
         ea = s->A0;
+        if (a.base == -2) {
+            /*
+             * RIP-relative, which is what base == -2 means and the only
+             * thing it means: gen_lea_modrm_0() sets it where CODE64 and
+             * mod == 0 and no SIB select the pc-relative form, and adds
+             * s->pc + s->rip_offset into the displacement there.  So the
+             * address the guest computes IS the instruction pointer plus a
+             * constant, and the movi arm above hands on a value that reads
+             * as having come from nowhere -- an address with no producer,
+             * which is what an empty address mask on the wire says.  Say
+             * where it came from instead.  Stated in the CF_PCREL arm too,
+             * where the add already carries the read: that costs one
+             * deduplicated list entry and makes the two regimes publish the
+             * same set by construction rather than by coincidence.
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_note_folded_reg(tcgv_tl_temp(ea),
+                                          tcgv_tl_temp(cpu_eip));
+        }
     } else if (a.disp != 0) {
         tcg_gen_addi_tl(s->A0, ea, a.disp);
         ea = s->A0;

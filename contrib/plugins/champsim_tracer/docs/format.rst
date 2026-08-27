@@ -592,11 +592,14 @@ Decode by repeated outer-section unwrapping.
         in place.
 
         Two consequences are visible on the wire.  On x86-64 a
-        RIP-relative access carries an EMPTY address mask —
-        ``gen_lea_modrm_1`` materialises that address with
-        ``tcg_gen_movi_tl`` after folding the program counter into the
-        displacement at translation time, so no register feeds it and
-        there is no producer for a consumer to wait on.  And on the
+        RIP-relative access names ``REG_IP`` in its address mask, and
+        does so however the block was translated.  The value is the
+        program counter plus a displacement; that ``gen_lea_modrm_0``
+        adds the counter into the displacement at decode time so
+        ``gen_lea_modrm_1`` can materialise the whole address with one
+        ``tcg_gen_movi_tl`` is an emulation detail, and the emitter
+        states the register it computed away rather than leaving the
+        access looking like one with no producer.  And on the
         three targets with an architectural ZERO REGISTER, a store of
         it names that register: ``str xzr, [x0]`` publishes
         ``store_data_dep = {XZR}``, not an empty set.  QEMU models XZR,
@@ -624,6 +627,21 @@ Decode by repeated outer-section unwrapping.
         datum is the instruction's own immediate the immediate bit is
         set instead, so an empty mask is reserved for the case where
         the template carries no immediate slot to point at.
+
+        THE ADDRESS MASKS READ THE SAME WAY.  An address is computed
+        from registers, from the encoding, or from both, so an address
+        mask that names no register on an instruction whose provenance
+        was stated in full says the address came from the encoding, and
+        the immediate bit — the one position above the source run, the
+        address layout having no load-data slots — is set for it.  The
+        x86-64 shape is displacement-only addressing, where the modrm
+        names neither base nor index.  RIP-relative addressing is NOT
+        that shape and never takes this bit: its address depends on the
+        instruction pointer, the mask names ``REG_IP``, and a consumer
+        reading the immediate bit there would be told to wait on
+        nothing.  As with the store datum, an instruction whose
+        template carries no immediate slot publishes the empty mask
+        instead, which is true as far as it goes.
 
         A datum the ARCHITECTURE derives from a register names that
         register, whether or not the emulator had to read it.  An

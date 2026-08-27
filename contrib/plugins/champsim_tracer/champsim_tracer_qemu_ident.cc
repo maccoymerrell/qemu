@@ -14,16 +14,21 @@
  * this identity the intended SOURCE of the opcode taxonomy rather than a
  * key beside it.
  *
- * THE FLIP HAS STARTED, AND IT STARTED WHERE THE TWO KEYS DISAGREE.  The
- * classifier in champsim_tracer_decode.cc still indexes the Capstone
- * insn_id for the general case, because on every row where both keys can
- * speak they say the same thing -- zero opcode and zero branch-class
- * disagreements, four ISAs, measured.  The exception is the QID_SPLIT
- * set: one QEMU rule, several Capstone constants, different answers.  For
- * the subset of those that QEMU's own decode-table row settles, this file
- * hands the classifier the surviving candidate through
- * qemu_ident_adjudicated(), and THAT DOES move the wire.  Everything else
- * here is still a reader.
+ * THE FLIP HAS HAPPENED.  The classifier in champsim_tracer_decode.cc
+ * takes the wire's opcode, branch class, refiner selection and lane shape
+ * from THIS key: qemu_ident_classify() answers for every rule whose row
+ * carries a classification (tiers QID_OBSERVED and QID_ADJUDICATED), and
+ * the Capstone-keyed table is what a row that carries none falls back to.
+ * The rows that fall back are counted per reason and named below as
+ * survivors, not left as a silent default.
+ *
+ * The flip moved no byte of the wire on the census workloads, and that is
+ * the result rather than a disappointment: on every deciding row the two
+ * accounts already agreed -- 0 opcode and 0 branch-class disagreements
+ * against the WIRE on four ISAs -- so what changed is WHERE the answer
+ * comes from, which is the whole of what J6 asks.  What the flip does buy
+ * is that corrupting Capstone's identity can no longer move those rows,
+ * and the mutation control measures exactly that.
  *
  * Beside that, the identity is a KEY that Capstone does not control, and
  * that key can be asked three questions Capstone cannot be asked about
@@ -128,7 +133,20 @@ uint64_t g_n_no_identity;      /* QEMU exported none (id == 0) */
 uint64_t g_n_row_missing;      /* id carried, no row -- STALE TABLE */
 uint64_t g_n_name_mismatch;    /* row found, name disagrees -- STALE TABLE */
 uint64_t g_n_scored;           /* row found and name agreed */
-uint64_t g_tier_seen[4];
+/*
+ * ONE SLOT PER TIER, and the bound is written from the enum rather than
+ * from a number.  It used to be [4] with a `tier < 4 ? tier : 0` clamp,
+ * and QID_ADJUDICATED is 4: every adjudicated row was therefore tallied
+ * into slot 0, QID_NONE, and the census reported the tracer's most
+ * resolved rows as its residue.  Measured on x86_64 at the flip: 349 of
+ * 13,824 translated instructions, all four reached MOVDQ/NOP
+ * adjudications, printed as "NONE 349" -- exactly backwards.  A clamp
+ * that silently folds an unknown tier into a real one is the defect; the
+ * array is now sized by the enum and an out-of-range tier is counted
+ * apart and reported, never folded.
+ */
+uint64_t g_tier_seen[QID_ADJUDICATED + 1];
+uint64_t g_tier_out_of_range;
 /*
  * TWO Capstone-side accounts of the same instruction, and the difference
  * between them is the whole point of scoring both:
@@ -968,7 +986,11 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
 
     g_n_scored++;
     g_hash_table_add(g_rows_hit, GUINT_TO_POINTER(id));
-    g_tier_seen[row->tier < 4 ? row->tier : 0]++;
+    if (row->tier <= QID_ADJUDICATED) {
+        g_tier_seen[row->tier]++;
+    } else {
+        g_tier_out_of_range++;
+    }
 
     /* The Capstone half of the same instruction, taken from the same table
      * the wire's opcode comes from. */
@@ -1122,12 +1144,60 @@ void qemu_ident_report(GString *report)
     write_pair_census(report);
 
     /*
-     * The one place this identity reaches the wire.  Reported
-     * UNCONDITIONALLY, including when it is zero, because zero is the
-     * interesting number: it means no instruction in this run decoded
-     * through a rule the tables adjudicate, so the adjudication changed
-     * nothing here and no claim about it may be made from this run.
+     * WHERE THE WIRE'S CLASSIFICATION CAME FROM, for every decode this run
+     * classified.  The two DECIDED rows are the flipped population -- the
+     * opcode, branch class, refiner selection and lane shape those
+     * instructions publish were read off the rule QEMU dispatched on.  The
+     * SURVIVOR rows are the instructions whose rule states no
+     * classification, counted per reason, each with its own coverage path;
+     * they still take Capstone's answer and that is what makes them
+     * survivors rather than losses.
+     *
+     * Reported UNCONDITIONALLY, zeros included.  A zero in the survivor
+     * block is a claim this run supports; a zero in the DECIDED block would
+     * mean the flip did nothing here and no claim about it may be made from
+     * this run at all.
      */
+    QemuIdentSurvivors sv;
+    qemu_ident_survivors(&sv);
+    {
+        uint64_t decided = qemu_ident_decided_observed() +
+                           qemu_ident_adjudicated_hits();
+        uint64_t surv = sv.split + sv.name_matched + sv.none +
+                        sv.no_row + sv.no_ident + sv.isa_held;
+        g_string_append_printf(report,
+            "\n--- classification SOURCE: the decode rule, or Capstone "
+            "where the rule states nothing ---\n"
+            "  DECIDED by QEMU's rule, tier OBSERVED %10" PRIu64 "\n"
+            "  DECIDED by QEMU's rule, ADJUDICATED   %10" PRIu64 "\n"
+            "  SURVIVOR: rule's observations SPLIT   %10" PRIu64 "\n"
+            "  SURVIVOR: row NAME_MATCHED, unobserved%10" PRIu64 "\n"
+            "  SURVIVOR: row carries no class (NONE) %10" PRIu64 "\n"
+            "  SURVIVOR: id carried, no row          %10" PRIu64 "\n"
+            "  SURVIVOR: no identity exported (id 0) %10" PRIu64 "\n"
+            "  HELD: this ISA's flip is not taken       %10" PRIu64 "\n"
+            "  decided rows carrying UNKNOWN (must be 0) %6" PRIu64 "\n"
+            "  decided rows the Capstone row disputes    %10" PRIu64 "\n"
+            "  decided %" PRIu64 " of %" PRIu64 " classified\n"
+            "    HELD is riscv64 and mipsel: the golden net's w3_coverage "
+            "opcode probes go RED there, because translate_mips/OPC_SLL "
+            "was observed only as `sll` (MIPS `nop` is sll $zero,$zero,0) "
+            "and decode_insn32/ori only as `ori` (Zicbop prefetch.r/w/i "
+            "are ori x0,rs1,imm).  Both rows carry cap_split=false, so the "
+            "table does not say the join was partial.  Coverage path: a "
+            "generator corpus reaching those spellings makes both rows "
+            "QID_SPLIT -- survivors on the answer they already publish -- "
+            "and the hold lifts with no table edit.\n"
+            "    `the Capstone row disputes` is that same class measured "
+            "live wherever the flip IS taken.  It is not a defect count: "
+            "x86_64 `rdsspq` sits in it and the identity is right (QEMU "
+            "decodes it through the NOP slot and writes nothing).  It is "
+            "the population an adjudication has to be written for.\n",
+            qemu_ident_decided_observed(), qemu_ident_adjudicated_hits(),
+            sv.split, sv.name_matched, sv.none, sv.no_row, sv.no_ident,
+            sv.isa_held, sv.decided_unknown, sv.cap_disagree,
+            decided, decided + surv);
+    }
     {
         unsigned n_adj = 0, n_fired = 0, n_untallied = 0;
         for (unsigned i = 0; i < g_nrows; i++) {
@@ -1135,7 +1205,7 @@ void qemu_ident_report(GString *report)
                 n_adj++;
                 if (i >= CST_QID_MAX_ROW_HITS) {
                     n_untallied++;
-                } else if (qemu_ident_adjudicated_row_hits(i)) {
+                } else if (qemu_ident_row_hits(i)) {
                     n_fired++;
                 }
             }
@@ -1156,11 +1226,70 @@ void qemu_ident_report(GString *report)
             if (g_rows[i].tier != QID_ADJUDICATED) {
                 continue;
             }
-            uint64_t n = qemu_ident_adjudicated_row_hits(i);
+            uint64_t n = qemu_ident_row_hits(i);
             g_string_append_printf(report,
                 "    0x%08x %-14s %10" PRIu64 "%s\n",
                 g_rows[i].id, g_rows[i].name, n,
                 n ? "" : "   NOT REACHED by this run");
+        }
+    }
+
+    /*
+     * THE SURVIVOR CENSUS, BY RULE.  The counters above say how many
+     * decodes fell back and why; this says WHICH rules, because a
+     * survivor is only a named population if it is actually named.  Each
+     * tier's coverage path is stated beside it -- what would have to
+     * happen for the rule to start deciding -- so the list reads as work
+     * with a route rather than as residue.  A run that reaches no
+     * survivor rule prints the header and nothing else, which is itself
+     * the claim.
+     */
+    {
+        g_string_append_printf(report,
+            "\n--- SURVIVOR rules REACHED by this run, by decode rule ---\n"
+            "  QID_SPLIT        several classifications were observed "
+            "through the one rule; coverage path = an adjudication (a fact "
+            "QEMU's own decode-table row states that refutes or subsumes "
+            "all but one candidate), or a finer pattern-qualified key.\n"
+            "  QID_NAME_MATCHED nothing was ever observed decoding through "
+            "the rule, so its payload rests on its NAME; coverage path = a "
+            "generator corpus that reaches it, which promotes it to "
+            "QID_OBSERVED with no table edit at all.\n"
+            "  QID_NONE         the rule carries no classification; "
+            "coverage path = the same, plus a generic word for what it "
+            "decodes to.\n");
+        unsigned printed = 0;
+        for (unsigned i = 0; i < g_nrows && i < CST_QID_MAX_ROW_HITS; i++) {
+            uint8_t t = g_rows[i].tier;
+            if (t == QID_OBSERVED || t == QID_ADJUDICATED) {
+                continue;
+            }
+            uint64_t n = qemu_ident_row_hits(i);
+            if (!n) {
+                continue;
+            }
+            g_string_append_printf(report,
+                "    0x%08x %-14s %-16s %10" PRIu64 "\n",
+                g_rows[i].id,
+                t == QID_SPLIT ? "QID_SPLIT"
+                               : (t == QID_NAME_MATCHED ? "QID_NAME_MATCHED"
+                                                        : "QID_NONE"),
+                g_rows[i].name, n);
+            printed++;
+        }
+        if (!printed) {
+            /*
+             * TWO DIFFERENT ZEROS, and printing one word for both would be
+             * the silent-false-success shape exactly: on a flipped ISA an
+             * empty list means every rule decided, and on a HELD ISA it
+             * means no rule was ever consulted.  Say which.
+             */
+            g_string_append_printf(report, "%s",
+                sv.isa_held
+                ? "    n/a -- this ISA's flip is HELD, so no rule was "
+                  "consulted and this list has no subject\n"
+                : "    none -- every rule this run decoded through states "
+                  "a classification\n");
         }
     }
     if (g_len_seen || g_len_cap_failed) {
@@ -1303,16 +1432,23 @@ void qemu_ident_report(GString *report)
     g_string_append_printf(report,
         "  table rows reached                     %10u of %u\n"
         "  tier of the rows that executed:  OBSERVED %" PRIu64
+        "   ADJUDICATED %" PRIu64
         "   SPLIT %" PRIu64 "   NAME_MATCHED %" PRIu64
-        "   NONE %" PRIu64 "\n"
-        "    a NAME_MATCHED row that executes is a row the table "
-        "UNDERSTATES; a NONE row that executes is live residue -- an "
-        "instruction with no QEMU-side name agreeing about what it is; "
-        "a SPLIT row that executes is a rule whose own observations "
-        "disagreed, so the identity alone does not classify it.\n",
+        "   NONE %" PRIu64 "   tier out of range %" PRIu64 "\n"
+        "    OBSERVED and ADJUDICATED are the tiers the classifier takes "
+        "the wire's answer from; the other three are the survivor "
+        "population that still falls back to Capstone.  A NAME_MATCHED "
+        "row that executes is a row the table UNDERSTATES; a NONE row "
+        "that executes is live residue -- an instruction with no "
+        "QEMU-side name agreeing about what it is; a SPLIT row that "
+        "executes is a rule whose own observations disagreed, so the "
+        "identity alone does not classify it.  `tier out of range` must "
+        "be 0: it means a row carries a tier this reader has no column "
+        "for.\n",
         g_rows_hit ? g_hash_table_size(g_rows_hit) : 0, g_nrows,
-        g_tier_seen[QID_OBSERVED], g_tier_seen[QID_SPLIT],
-        g_tier_seen[QID_NAME_MATCHED], g_tier_seen[QID_NONE]);
+        g_tier_seen[QID_OBSERVED], g_tier_seen[QID_ADJUDICATED],
+        g_tier_seen[QID_SPLIT], g_tier_seen[QID_NAME_MATCHED],
+        g_tier_seen[QID_NONE], g_tier_out_of_range);
 
     g_string_append_printf(report,
         "  scored against the WIRE -- decode_detail_to_generic()'s answer, "

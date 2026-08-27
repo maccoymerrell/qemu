@@ -691,12 +691,35 @@ void report_undecodable_block(uint64_t pc)
  * SSE scalar-double move, so `rep movsl` was published as a lane-parallel
  * FP vector move.
  *
- * qemu_ident_adjudicated() answers for exactly the subset of those rules
- * that QEMU's own table row settles -- tier QID_ADJUDICATED, generated,
- * each carrying the source fact that decided it.  It returns nullptr for
- * everything else, including id 0 (no identity recorded) and including
- * the split rows still open, which keep the Capstone answer they had.
- * See champsim_tracer_qemu_ident.h.
+ * SO THE DECODE RULE IS THE KEY, and the Capstone id is the fallback.
+ * qemu_ident_classify() answers for every rule whose own row carries a
+ * classification -- tier QID_OBSERVED (QEMU was seen decoding through the
+ * rule and one classification was seen with it) and tier QID_ADJUDICATED
+ * (several were, and QEMU's own table row settles which, each carrying the
+ * source fact that decided it).  Those are the rows where the identity
+ * decides, and they are the overwhelming majority.
+ *
+ * THE REST ARE NAMED SURVIVORS and keep publishing Capstone's answer,
+ * because the rule genuinely does not state one:
+ *
+ *   QID_SPLIT         several classifications were observed through the one
+ *                     rule and nothing in QEMU's row picks between them;
+ *                     the row carries GEN_OP_UNKNOWN by construction.
+ *   QID_NAME_MATCHED  no decode through the rule was ever observed, so the
+ *                     row's payload rests on its NAME matching a Capstone
+ *                     mnemonic -- which is Capstone's answer wearing the
+ *                     identity's key, not an independent one.  Coverage
+ *                     path: a generator corpus that reaches the rule
+ *                     promotes it to QID_OBSERVED.
+ *   QID_NONE          residue: no classification at all.
+ *   no row / id 0     the identity is absent.  An offline decode of raw
+ *                     bytes always is (no insn handle, so no decode id),
+ *                     which is why the offline tools take the Capstone
+ *                     path in full.
+ *
+ * Every one of those is COUNTED, per class, so a survivor population is a
+ * number in the report rather than a silent fallback.  See
+ * champsim_tracer_qemu_ident.h.
  */
 extern thread_local bool g_dep_refine_suppressed;
 
@@ -709,15 +732,92 @@ extern thread_local bool g_dep_refine_suppressed;
 static std::atomic<uint64_t> g_qid_adjudicated_hits{0};
 
 /*
- * PER ROW, not only in total.  A single total cannot say WHICH
- * adjudication a run exercised, and a row that never fires is a row
- * whose ruling this run does not evidence -- which is a thing to report,
- * not to leave to be inferred from a non-zero sum.  Indexed by the row's
- * position in the (sorted, per-ISA) identity table.
+ * PER ROW, not only in total, and for EVERY row rather than only the
+ * adjudicated ones.  A single total cannot say WHICH rule a run
+ * exercised, and that matters in both directions: an adjudication that
+ * never fires is a ruling this run does not evidence, and a SURVIVOR row
+ * that fires is a named population with a coverage path -- reportable by
+ * name, not inferable from a sum.  Indexed by the row's position in the
+ * (sorted, per-ISA) identity table.
  */
-static std::atomic<uint64_t> g_qid_adjudicated_row_hits[CST_QID_MAX_ROW_HITS];
+static std::atomic<uint64_t> g_qid_row_hits[CST_QID_MAX_ROW_HITS];
 
-const InsnClassification *qemu_ident_adjudicated(uint32_t id)
+/*
+ * The survivor census: one counter per reason the identity did not decide.
+ * A survivor is not a failure and it is not a silent fallback -- it is a
+ * named population with a coverage path, and the only way that stays true
+ * is if each class is counted separately.  A single "fell back" total
+ * cannot say whether a run met three split rules or three thousand rows
+ * the generator has never seen.
+ */
+static std::atomic<uint64_t> g_qid_decided_observed{0};
+static std::atomic<uint64_t> g_qid_surv_split{0};
+static std::atomic<uint64_t> g_qid_surv_name_matched{0};
+static std::atomic<uint64_t> g_qid_surv_none{0};
+static std::atomic<uint64_t> g_qid_surv_no_row{0};
+static std::atomic<uint64_t> g_qid_surv_no_ident{0};
+/*
+ * MUST BE 0.  A row the classifier accepted as deciding, carrying no
+ * classification, would publish GEN_OP_UNKNOWN under the identity's
+ * authority.  QID_SPLIT is the tier that carries GEN_OP_UNKNOWN and it is
+ * a survivor, so this cannot happen -- which is exactly why it is counted
+ * rather than asserted away.
+ */
+static std::atomic<uint64_t> g_qid_decided_unknown{0};
+/*
+ * The rule DECIDED and the Capstone row it was joined through says
+ * something else.  MEASURED, and the reason this counter exists at all:
+ * QID_OBSERVED rests on the generator's observation corpus, and a rule
+ * reached by a SPELLING that corpus never saw is asserted to decide on
+ * evidence that does not cover the instance.  Two were caught by the
+ * golden net's coverage probes at the flip --
+ *
+ *   translate_mips/OPC_SLL  observed only as `sll`; MIPS `nop` is
+ *                           `sll $zero,$zero,0` and reaches the same rule
+ *   decode_insn32/ori       observed only as `ori`; Zicbop
+ *                           `prefetch.r/w/i` are `ori x0,rs1,imm`
+ *
+ * -- and in both the row carries cap_split=false, so nothing in the table
+ * says the join was partial.  A disagreement here is not by itself a
+ * defect (the identity is RIGHT about x86 `rdsspq`, which QEMU decodes
+ * through its NOP slot and Capstone names as a move); it is the exact
+ * population an adjudication has to be written for, so it is counted and
+ * reported rather than resolved by a rule of thumb.
+ */
+static std::atomic<uint64_t> g_qid_cap_disagree{0};
+/*
+ * Decodes on an ISA whose flip is HELD.  Not a silent fallback: the hold
+ * is a per-ISA decision with a number beside it, and this is the number.
+ */
+static std::atomic<uint64_t> g_qid_isa_held{0};
+
+/*
+ * WHICH ISAs THE CLASSIFICATION KEY IS FLIPPED ON, and the rule is
+ * per-ISA because a half-keyed ISA is the one thing this may not be: an
+ * instruction stream whose opcodes come from two decoders depending on
+ * which rule happened to be reached is not a taxonomy anybody can read.
+ *
+ * x86_64 and aarch64 are flipped.  riscv64 and mipsel are HELD, and the
+ * reason is measured rather than cautious: the golden net's w3_coverage
+ * opcode probes go RED on exactly those two, on the two rules named
+ * above, because the identity would publish GEN_OP_SHL for a MIPS `nop`
+ * and GEN_OP_OR for a RISC-V `prefetch.r`.  Under R12.1 that is
+ * information lost, and no discount applies.
+ *
+ * COVERAGE PATH, and it needs no table edit: the generator decides the
+ * tier from what it OBSERVED decoding through each rule.  A corpus that
+ * reaches `nop` and `prefetch.r` turns both rows into QID_SPLIT -- rows
+ * that state they do not classify -- which makes them survivors on the
+ * Capstone answer they already publish, and the hold lifts.  What the
+ * hold must NOT become is a permanent per-ISA carve-out: the two probes
+ * are the acceptance test, and they exist.
+ */
+static bool qemu_ident_key_flipped(TraceISA isa)
+{
+    return isa == TRACE_ISA_X86 || isa == TRACE_ISA_AARCH64;
+}
+
+static const QemuIdentRow *qemu_ident_lookup(uint32_t id, unsigned *index_out)
 {
     if (id == 0 || !active_qemu_ident || active_qemu_ident_size == 0) {
         return nullptr;
@@ -734,16 +834,73 @@ const InsnClassification *qemu_ident_adjudicated(uint32_t id)
     if (lo >= active_qemu_ident_size || active_qemu_ident[lo].id != id) {
         return nullptr;
     }
-    const QemuIdentRow *row = &active_qemu_ident[lo];
-    if (row->tier != QID_ADJUDICATED) {
+    *index_out = lo;
+    return &active_qemu_ident[lo];
+}
+
+const InsnClassification *qemu_ident_classify(
+    uint32_t id, const InsnClassification *cap_row)
+{
+    unsigned idx = 0;
+
+    if (!qemu_ident_key_flipped(trace_isa)) {
+        g_qid_isa_held.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    g_qid_adjudicated_hits.fetch_add(1, std::memory_order_relaxed);
-    if (lo < CST_QID_MAX_ROW_HITS) {
-        g_qid_adjudicated_row_hits[lo].fetch_add(1,
-                                                 std::memory_order_relaxed);
+
+    const QemuIdentRow *row = qemu_ident_lookup(id, &idx);
+
+    if (!row) {
+        (id == 0 ? g_qid_surv_no_ident : g_qid_surv_no_row)
+            .fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (idx < CST_QID_MAX_ROW_HITS) {
+        g_qid_row_hits[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+    switch (row->tier) {
+    case QID_ADJUDICATED:
+        g_qid_adjudicated_hits.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case QID_OBSERVED:
+        g_qid_decided_observed.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case QID_SPLIT:
+        g_qid_surv_split.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    case QID_NAME_MATCHED:
+        g_qid_surv_name_matched.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    default:
+        g_qid_surv_none.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (row->cls.opcode == GEN_OP_UNKNOWN) {
+        g_qid_decided_unknown.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (cap_row && cap_row->opcode != row->cls.opcode) {
+        g_qid_cap_disagree.fetch_add(1, std::memory_order_relaxed);
     }
     return &row->cls;
+}
+
+uint64_t qemu_ident_decided_observed(void)
+{
+    return g_qid_decided_observed.load(std::memory_order_relaxed);
+}
+
+void qemu_ident_survivors(QemuIdentSurvivors *out)
+{
+    out->split        = g_qid_surv_split.load(std::memory_order_relaxed);
+    out->name_matched = g_qid_surv_name_matched.load(std::memory_order_relaxed);
+    out->none         = g_qid_surv_none.load(std::memory_order_relaxed);
+    out->no_row       = g_qid_surv_no_row.load(std::memory_order_relaxed);
+    out->no_ident     = g_qid_surv_no_ident.load(std::memory_order_relaxed);
+    out->decided_unknown =
+        g_qid_decided_unknown.load(std::memory_order_relaxed);
+    out->isa_held     = g_qid_isa_held.load(std::memory_order_relaxed);
+    out->cap_disagree = g_qid_cap_disagree.load(std::memory_order_relaxed);
 }
 
 uint64_t qemu_ident_adjudicated_hits(void)
@@ -751,13 +908,12 @@ uint64_t qemu_ident_adjudicated_hits(void)
     return g_qid_adjudicated_hits.load(std::memory_order_relaxed);
 }
 
-uint64_t qemu_ident_adjudicated_row_hits(unsigned row_index)
+uint64_t qemu_ident_row_hits(unsigned row_index)
 {
     if (row_index >= CST_QID_MAX_ROW_HITS) {
         return 0;
     }
-    return g_qid_adjudicated_row_hits[row_index].load(
-        std::memory_order_relaxed);
+    return g_qid_row_hits[row_index].load(std::memory_order_relaxed);
 }
 
 static const InsnClassification *classify_insn_id(
@@ -765,13 +921,16 @@ static const InsnClassification *classify_insn_id(
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
 {
     uint32_t id = info->insn_id;
+    const InsnClassification *cap =
+        (active_insn_table && id < active_insn_table_size)
+            ? &active_insn_table[id] : nullptr;
 
-    const InsnClassification *adj = qemu_ident_adjudicated(info->decode_id);
-    if (adj) {
-        *opcode = adj->opcode;
-        *branch_type = adj->branch_type;
-        *flags = adj->flags;
-        return adj;
+    const InsnClassification *q = qemu_ident_classify(info->decode_id, cap);
+    if (q) {
+        *opcode = q->opcode;
+        *branch_type = q->branch_type;
+        *flags = q->flags;
+        return q;
     }
 
     if (active_insn_table && id < active_insn_table_size) {
@@ -792,24 +951,28 @@ static const InsnClassification *classify_insn_id(
  * Repair the fields a single insn_id cannot resolve, using the per-instance
  * detail Capstone printed.
  *
- * The classification table is keyed by insn_id, so wherever one id covers
- * several architectural behaviours the table can only carry one of them and
- * the discriminator is what Capstone printed for THIS instance -- the alias,
- * or an operand the alias implies.  Every arm below exists for that reason:
+ * THESE ARE THE NAMED SURVIVORS OF THE IDENTITY FLIP.  The classification
+ * now comes from QEMU's decode rule, and a rule is a STATIC fact: where one
+ * rule covers several architectural behaviours told apart by a REGISTER
+ * FIELD, the rule cannot say which, and the discriminator is what Capstone
+ * printed for THIS instance -- the alias, or an operand the alias implies.
+ * Each arm below is one such class, and each has a coverage path that
+ * would retire it: a per-instance fact from QEMU's own translation (the
+ * link register and successor the ops published), which the identity
+ * reader already derives for its audit but the wire does not yet take.
  *
- *  - riscv: one insn_id covers jal+j and jalr+jr+ret, and the
- *    call/jump/return role is carried by rd (Capstone prints the alias):
- *    "jal"/"jalr" link (call), "j"/"jr" do not (jump), "ret" returns.
- *  - aarch64: plain "b" and every conditional "b.<cc>" share
- *    AARCH64_INS_B (the table's static default is the unconditional
- *    DIRECT_JUMP); the condition lives only in the printed mnemonic.
- *  - mips: every "jr <rs>" shares MIPS_INS_JR (static default
+ *  - riscv: decode_insn32/jal covers jal and j, and decode_insn16/jalr
+ *    covers jr and ret; the call/jump/return role is carried by rd, a
+ *    field the rule leaves free (Capstone prints the alias): "jal"/"jalr"
+ *    link (call), "j"/"jr" do not (jump), "ret" returns.  Measured at the
+ *    flip: 113 ret + 18 j.
+ *  - mips: translate_mips/OPC_JR covers every "jr <rs>" (static default
  *    INDIRECT_JUMP); "jr $ra" is the architectural return idiom and the
- *    register is only visible per instance.  `bal` is the always-taken
- *    alias of `bgezal $zero`, so it inherits a condition it does not have.
- *    `mfhi` and `mflo` read different halves of the accumulator, and
- *    Capstone reports both as reading the whole pair, so the half the
- *    mnemonic does not name is dropped here.
+ *    register is only visible per instance.  Measured at the flip: 93.
+ *    `bal` is the always-taken alias of `bgezal $zero`, so it inherits a
+ *    condition it does not have.  `mfhi` and `mflo` read different halves
+ *    of the accumulator, and Capstone reports both as reading the whole
+ *    pair, so the half the mnemonic does not name is dropped here.
  *
  * BRANCH TYPE IS NOT THE ONLY FIELD IT REPAIRS, which is why it is not
  * named for one.  The same alias that hides a RISC-V call's role also hides
@@ -822,26 +985,29 @@ static const InsnClassification *classify_insn_id(
  * the printed form tells them apart.
  *
  * x86 (call direct/indirect) is handled by the per-row .refine callback
- * refine_x86_call_branch in the generated table; the remaining aarch64 /
- * mips control transfers (bl/blr/ret, jal/jalr/j) have distinct insn_ids
- * and need no refinement.
+ * refine_x86_call_branch in the generated table, which reads the OPERAND
+ * shape rather than the printed name and so rides the identity's payload
+ * unchanged; the remaining aarch64 / mips control transfers (bl/blr/ret,
+ * jal/jalr/j) have distinct decode rules and need no refinement.
  */
 static void refine_alias_fields(const qemu_plugin_insn_info *info,
                                 InsnFields *out, InsnRegNames *out_names)
 {
     switch (trace_isa) {
-    case TRACE_ISA_AARCH64: {
-        /* "b.eq", "b.ne", ... and the FEAT_HBC "bc.<cc>" form.  The
-         * refine runs after the MF_CONDITIONAL/branch_type-derived flag
-         * assignment, so set branch_conditional here as well. */
-        const char *m = info->mnemonic;
-        if ((m[0] == 'b' && m[1] == '.') ||
-            (m[0] == 'b' && m[1] == 'c' && m[2] == '.')) {
-            out->branch_type        = BRANCH_COND_DIRECT;
-            out->branch_conditional = true;
-        }
-        break;
-    }
+    /*
+     * aarch64 HAS NO ARM HERE ANY MORE.  It used to recover the
+     * conditional branch class from the printed "b.<cc>" / "bc.<cc>",
+     * because Capstone spells every one of them AARCH64_INS_B -- the same
+     * constant it gives the unconditional `b` -- and the condition lives
+     * in a field the constant does not carry.  QEMU's rule does carry it:
+     * a64.decode:199 extracts a 4-bit `cond`, and the identity row for
+     * disas_a64/B_cond states BRANCH_COND_DIRECT outright.  With the
+     * classification keyed on that rule the arm could only ever re-derive
+     * an answer the row already gives, so it is deleted rather than left
+     * as a second, quieter opinion.  Measured at the flip: 367 rows where
+     * the identity and the pre-refinement Capstone row disagreed, 0 where
+     * the identity and the WIRE did.
+     */
     case TRACE_ISA_MIPS: {
         const char *m = info->mnemonic;
         if ((!strcmp(m, "jr") || !strcmp(m, "jr.hb")) &&

@@ -1506,25 +1506,57 @@ extern unsigned active_insn_table_size;
  * active_insn_table, at the same sites, so the two accounts of one
  * instruction can never be bound to different ISAs.
  *
- * The classifier reads it for exactly one purpose -- the QID_ADJUDICATED
- * rows, where several Capstone constants decode through one QEMU rule
- * with different classifications and QEMU's own row settles which of
- * them describes it.  Rows are sorted by id; bisect.
+ * This is the classifier's PRIMARY key: the wire's opcode taxonomy,
+ * branch class and refiner selection come from the rule the translator
+ * dispatched on, and fall back to the Capstone-keyed table only on the
+ * rows whose rule states no classification.  Rows are sorted by id;
+ * bisect.
  */
 extern const QemuIdentRow *active_qemu_ident;
 extern unsigned active_qemu_ident_size;
 
 /*
- * The classification QEMU's own decode-table row settles for @id, or
- * nullptr when it settles nothing -- @id is 0 (no identity recorded, and
- * an offline decode of raw bytes always is), no row carries it, or the
- * row is any tier other than QID_ADJUDICATED.
- *
- * This is the one path by which the QEMU identity reaches the wire.
- * Everywhere else the two keys agree, measured, so routing the agreeing
- * rows through this one would move nothing.
+ * The classification QEMU's own decode rule states for @id, or nullptr
+ * when the rule states none.  Deciding tiers are QID_OBSERVED and
+ * QID_ADJUDICATED; QID_SPLIT / QID_NAME_MATCHED / QID_NONE, an id with no
+ * row, and id 0 (no identity recorded -- an offline decode of raw bytes
+ * always is) are SURVIVORS and return nullptr so the caller keeps the
+ * Capstone answer.  Every call is tallied into one of the classes below.
  */
-const InsnClassification *qemu_ident_adjudicated(uint32_t id);
+const InsnClassification *qemu_ident_classify(
+    uint32_t id, const InsnClassification *cap_row);
+
+/*
+ * Decodes the identity decided, on the QID_OBSERVED tier.  With
+ * qemu_ident_adjudicated_hits() below it is the whole flipped population;
+ * the survivors are the rest.
+ */
+uint64_t qemu_ident_decided_observed(void);
+
+/*
+ * The survivor census, by the reason the rule stated nothing.  Counted per
+ * class because a single total cannot tell three open split rules from
+ * three thousand rows no corpus has ever reached, and those have different
+ * coverage paths.  .decided_unknown is a MUST-BE-0 row: a deciding row
+ * carrying GEN_OP_UNKNOWN would publish "unknown" under the identity's
+ * authority, which the tier definitions make impossible.
+ */
+typedef struct {
+    uint64_t split;
+    uint64_t name_matched;
+    uint64_t none;
+    uint64_t no_row;
+    uint64_t no_ident;
+    uint64_t decided_unknown;
+    /* Decodes on an ISA whose flip is HELD -- see qemu_ident_key_flipped(). */
+    uint64_t isa_held;
+    /* Decided rows whose answer differs from the Capstone row they were
+     * joined through: the population an adjudication has to be written
+     * for, and the tripwire for a rule the generator's corpus covered
+     * with only one of the spellings that reach it. */
+    uint64_t cap_disagree;
+} QemuIdentSurvivors;
+void qemu_ident_survivors(QemuIdentSurvivors *out);
 
 /*
  * How many translated instructions took an adjudicated classification
@@ -1541,10 +1573,12 @@ uint64_t qemu_ident_adjudicated_hits(void);
  */
 #define CST_QID_MAX_ROW_HITS 4096
 
-/* Same tally, for ONE row of the active ISA's table, by its index in that
- * table.  Lets the exit report say which adjudication a run exercised
- * rather than only that some adjudication fired. */
-uint64_t qemu_ident_adjudicated_row_hits(unsigned row_index);
+/* Per-row tally for ONE row of the active ISA's table, by its index in
+ * that table, for EVERY tier.  Lets the exit report say which
+ * adjudication a run exercised rather than only that some adjudication
+ * fired, and -- the same question asked of the other side -- exactly
+ * which survivor rules a run fell back on. */
+uint64_t qemu_ident_row_hits(unsigned row_index);
 extern const RegClassification *active_reg_table;
 extern unsigned active_reg_table_size;
 /* The same registers keyed on QEMU identity; see QemuRegRow. */

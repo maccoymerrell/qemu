@@ -56,10 +56,17 @@ const InsnClassification *active_insn_table = nullptr;
  * construction rather than by omission: isaxcheck decodes raw bytes
  * through cap_disas_raw_detail(), which has no insn handle, so
  * qemu_plugin_insn_info::decode_id is always 0 and
- * qemu_ident_adjudicated() returns nullptr on every call.  The gate
- * therefore compiles the identity tables and links the lookup, and
- * covers NEITHER -- the adjudicated rows need a running translator
- * to reach.
+ * qemu_ident_classify() returns nullptr on every call, tallying the
+ * no-identity survivor class.
+ *
+ * A DISCLOSED BLIND SPOT, and a widening one.  The gate compiles the
+ * identity tables and links the lookup, and exercises the Capstone
+ * SURVIVOR path only -- so since the identity flip it no longer scores
+ * the source the live wire's opcode, branch class, refiner and lane
+ * shape come from on the deciding rows.  Reaching those needs a running
+ * translator, which is what the live batteries and the identity audit in
+ * champsim_tracer_qemu_ident.cc are for; this gate's zero is a statement
+ * about the fallback, not about the flip.
  */
 const QemuIdentRow *active_qemu_ident = nullptr;
 unsigned active_qemu_ident_size = 0;

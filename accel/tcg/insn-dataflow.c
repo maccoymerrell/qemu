@@ -41,6 +41,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op-common.h"
@@ -314,6 +315,18 @@ struct InsnDataflowScratch {
     unsigned ninsns;
 
     uint32_t slot_off[INSN_DF_MAX_FIELD_SLOTS];
+    /*
+     * The WIDEST access seen at that offset in this translation.
+     *
+     * A bit is interned by offset alone -- two accesses that start at the
+     * same byte are the same state -- but NAMING one needs its extent, and
+     * an offset on its own says nothing about how far the access reached.
+     * Widening rather than keeping the first is the direction that cannot
+     * mis-name: a helper handed the WHOLE vector file starts at the same
+     * byte as a store of its first register, and only the extent tells the
+     * two apart.  DF_FIELD_UNBOUNDED stands for a reach nothing stated.
+     */
+    uint32_t slot_size[INSN_DF_MAX_FIELD_SLOTS];
     unsigned nslots;
     bool slots_overflow;
 
@@ -373,6 +386,7 @@ static __thread struct InsnDataflowScratch *df;
 #define df_out              (df->out)
 #define df_ninsns           (df->ninsns)
 #define df_slot_off         (df->slot_off)
+#define df_slot_size        (df->slot_size)
 #define df_nslots           (df->nslots)
 #define df_slots_overflow   (df->slots_overflow)
 #define df_gvec             (df->gvec)
@@ -425,12 +439,29 @@ static void df_bind(void)
  * the case is not reachable in practice, and df_slots_overflow says so out
  * loud when it is.
  */
-static int df_intern(uint32_t off)
+static int df_intern(uint32_t off, uint32_t size)
 {
     unsigned base = tcg_ctx->nb_globals;
+    uint32_t reach = size ? size : DF_FIELD_UNBOUNDED;
 
+    /*
+     * KEYED BY OFFSET AND EXTENT, not by offset alone.
+     *
+     * Two accesses that start at the same byte and reach different distances
+     * are different accesses, and the extent is the only thing that says
+     * which register the range belongs to: `movaps %xmm0,(%rdi)` reads 16
+     * bytes at offsetof(xmm_regs) and a helper handed the whole vector file
+     * reads 2048 at the same byte.  Folding them onto one slot forces one
+     * extent on both, and the only safe choice then is the wider -- which
+     * costs the narrow access its name for the rest of the block.  Measured:
+     * merging cost six x86_64 store-data rows their register.
+     *
+     * Two slots for one offset is not a contradiction downstream.  A
+     * consumer resolves each to the register it belongs to and unions, so
+     * the same register arrives once however many bits named it.
+     */
     for (unsigned i = 0; i < df_nslots; i++) {
-        if (df_slot_off[i] == off) {
+        if (df_slot_off[i] == off && df_slot_size[i] == reach) {
             return (int)(base + i);
         }
     }
@@ -439,6 +470,7 @@ static int df_intern(uint32_t off)
         df_slots_overflow = true;
         return -1;
     }
+    df_slot_size[df_nslots] = reach;
     df_slot_off[df_nslots] = off;
     return (int)(base + df_nslots++);
 }
@@ -1549,7 +1581,8 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                                 pf_dir[n_pf] = row->env[q].dir;
                                 n_pf++;
                                 if (row->env[q].dir & INSN_DF_RD) {
-                                    int b = df_intern(row->env[q].off);
+                                    int b = df_intern(row->env[q].off,
+                                                      row->env[q].size);
 
                                     if (b >= 0) {
                                         df_bit(prov, (unsigned)b);
@@ -1660,7 +1693,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         n_pf++;
                     }
                     if (dir & INSN_DF_RD) {
-                        bit = df_intern((uint32_t)eo);
+                        bit = df_intern((uint32_t)eo, extent);
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
                         }
@@ -1702,7 +1735,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     }
                     eo = df_envoff_of(ts - s->temps);
                     if (eo != INSN_DF_NOT_ENV && eo >= 0) {
-                        int bit = df_intern((uint32_t)eo);
+                        int bit = df_intern((uint32_t)eo, 0);
 
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
@@ -1828,7 +1861,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                                      df_prov_of(vts - s->temps));
                     } else {
                         df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
-                        ld_field_bit = df_intern((uint32_t)eo);
+                        ld_field_bit = df_intern((uint32_t)eo, size);
                     }
                 }
             }
@@ -2526,6 +2559,131 @@ bool insn_dataflow_prov_memop(unsigned bit, unsigned *slot)
 bool insn_dataflow_prov_truncated(void)
 {
     return df && df_slots_overflow;
+}
+
+/*
+ * THE REGISTER FILES A TARGET DECLARED.
+ *
+ * Process-wide and write-once: the layout of CPUArchState is a property of
+ * the build, not of a translation or a vCPU, so this is filled in when the
+ * target creates its TCG globals and read from every thread thereafter.
+ * Declaration happens before any translation, which is what lets the reader
+ * side go lock-free.
+ */
+typedef struct DfRegFile {
+    const char *base;
+    const char *const *names;
+    uint32_t off;
+    uint32_t stride;
+    uint32_t elem;
+    uint32_t n;
+} DfRegFile;
+
+static DfRegFile df_regfile[INSN_DF_MAX_REGFILES];
+static unsigned df_n_regfile;
+
+void insn_dataflow_declare_regfile(const char *base, const char *const *names,
+                                   uint32_t off, uint32_t stride,
+                                   uint32_t elem, uint32_t n)
+{
+    if ((base == NULL && names == NULL) || n == 0 || elem == 0) {
+        return;
+    }
+    /*
+     * A file of more than one register needs a stride that covers its
+     * elements, or two of them share bytes and no offset could tell them
+     * apart.  Refusing is the only honest answer to a declaration that
+     * cannot be true.
+     */
+    if (n > 1 && stride < elem) {
+        return;
+    }
+    for (unsigned i = 0; i < df_n_regfile; i++) {
+        if (df_regfile[i].off == off && df_regfile[i].n == n) {
+            return;             /* the same declaration twice */
+        }
+    }
+    if (df_n_regfile >= INSN_DF_MAX_REGFILES) {
+        return;
+    }
+    df_regfile[df_n_regfile++] = (DfRegFile){
+        .base = base, .names = names, .off = off,
+        .stride = n > 1 ? stride : elem, .elem = elem, .n = n,
+    };
+}
+
+bool insn_dataflow_field_reg(uint32_t off, uint32_t size,
+                             char *buf, size_t buflen)
+{
+    TCGContext *s = tcg_ctx;
+
+    if (buf == NULL || buflen == 0 || size == 0 ||
+        size == DF_FIELD_UNBOUNDED) {
+        return false;
+    }
+    /*
+     * A TCG GLOBAL first.  An env range can coincide with one -- a target
+     * that reaches its own flags word by ld/st, or a helper row naming the
+     * bytes a global also names -- and the global's name is the same answer
+     * arrived at by a shorter route.  Asking here means the declarations
+     * below only have to cover what the globals do NOT.
+     */
+    for (unsigned i = 0; i < (unsigned)s->nb_globals; i++) {
+        uint32_t goff, gsize;
+        const char *nm = insn_dataflow_reg_name(i, &goff, &gsize);
+
+        if (nm && off >= goff && off - goff + size <= gsize) {
+            pstrcpy(buf, buflen, nm);
+            return true;
+        }
+    }
+    for (unsigned i = 0; i < df_n_regfile; i++) {
+        const DfRegFile *r = &df_regfile[i];
+        uint32_t d, idx, within;
+
+        if (off < r->off) {
+            continue;
+        }
+        d = off - r->off;
+        idx = d / r->stride;
+        if (idx >= r->n) {
+            continue;
+        }
+        within = d - idx * r->stride;
+        /*
+         * REACHING PAST THE REGISTER IS A REFUSAL, not a name.  A helper
+         * handed the whole vector file starts at the same byte as a store of
+         * its first register; calling that one xmm0 would publish a set
+         * short by thirty-one registers, which is the one error direction
+         * this whole file treats as a defect rather than a loss of accuracy.
+         */
+        if (within + size > r->elem) {
+            return false;
+        }
+        if (r->names) {
+            if (r->names[idx] == NULL) {
+                return false;
+            }
+            pstrcpy(buf, buflen, r->names[idx]);
+        } else if (r->n == 1) {
+            pstrcpy(buf, buflen, r->base);
+        } else {
+            snprintf(buf, buflen, "%s%u", r->base, idx);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool insn_dataflow_prov_field_reg(unsigned bit, char *buf, size_t buflen)
+{
+    unsigned base = tcg_ctx->nb_globals;
+
+    if (!df || bit < base || bit - base >= df_nslots) {
+        return false;
+    }
+    return insn_dataflow_field_reg(df_slot_off[bit - base],
+                                   df_slot_size[bit - base], buf, buflen);
 }
 
 unsigned insn_dataflow_nregs(void)

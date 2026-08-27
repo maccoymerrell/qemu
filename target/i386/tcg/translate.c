@@ -3928,6 +3928,26 @@ void tcg_x86_init(void)
                                      offsetof(CPUX86State, bnd_regs[i].ub),
                                      bnd_regu_names[i]);
     }
+
+    /*
+     * The vector file, for the dataflow extraction.
+     *
+     * Nothing above registers a TCG global for it -- SSE and AVX reach
+     * env->xmm_regs by ld/st and by helper, so every dependency on a vector
+     * register arrives at a consumer as a CPUArchState byte offset.  The
+     * offset IS the register's identity; inverting it back needs this
+     * struct's layout, which is why the statement belongs here, beside the
+     * globals, in offsetof() and sizeof() rather than in numbers.
+     *
+     * The x87 stack is deliberately NOT declared.  env->fpregs[] is indexed
+     * by PHYSICAL register while the GDB stub's st0..st7 are relative to
+     * fpstt, so an offset does not name an ST(i) without a run-time top --
+     * which a translation-time answer does not have.
+     */
+    insn_dataflow_declare_regfile("xmm", NULL,
+                                  offsetof(CPUX86State, xmm_regs),
+                                  sizeof(ZMMReg), sizeof(ZMMReg),
+                                  ARRAY_SIZE(((CPUX86State *)0)->xmm_regs));
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

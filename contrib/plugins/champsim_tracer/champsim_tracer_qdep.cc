@@ -35,6 +35,12 @@ namespace {
  * short in exactly the direction that costs a consumer correctness.
  */
 constexpr unsigned kMaxMemops = 64;
+/*
+ * Env-field records per instruction.  Comfortably above QEMU's own
+ * INSN_DF_MAX_FIELDS so the cap that bites is the extractor's, which SAYS it
+ * overflowed, rather than this one, which would only see a smaller number.
+ */
+constexpr unsigned kMaxFields = 64;
 
 std::atomic<bool>     g_tried{false};
 bool                  g_live = false;
@@ -82,6 +88,22 @@ GHashTable *g_monitor_name  = nullptr;   /* reservation-monitor global -> count 
  * nobody checked.
  */
 GHashTable *g_dst_unmapped_name = nullptr;
+/*
+ * The two remaining ways an ENV BYTE RANGE stays refused (#226).
+ *
+ * They are separate tallies because they are separate defects with separate
+ * owners.  g_field_unnamed is a range no target DECLARED -- a gap in the
+ * CPUArchState statement beside the globals, fixed in QEMU.  Both entries it
+ * can carry name the shape, not the offset, because an offset means nothing
+ * without the struct it indexes and the shapes are what a reader acts on.
+ *
+ * g_field_unmapped_name is a range QEMU DID name and the tracer has no
+ * generic word for -- a gap in the register table, fixed in its generator.
+ * Naming those by their QEMU spelling is the whole point: it is the list a
+ * table pass works from.
+ */
+GHashTable *g_field_unnamed = nullptr;
+GHashTable *g_field_unmapped_name = nullptr;
 /*
  * A register QEMU DID give this file a generic word for, stated as WRITTEN
  * by an instruction whose destination family is published -- and which the
@@ -221,6 +243,62 @@ bool add_reg(uint8_t *regs, uint8_t *n, uint8_t gen)
 }
 
 /*
+ * The generic word for an env byte range, by the name QEMU gives it.
+ *
+ * R5's case exactly: an env offset is a register whose storage no TCG global
+ * happens to name, and the offset IS the identity.  QEMU inverts it -- each
+ * target declares its register files beside the globals it registers -- and
+ * this puts the answer through the same two-stage name map the globals go
+ * through, because a register must not get one generic word by one route and
+ * a different one by the other.
+ *
+ * REG_ID_COUNT when the range has no name (nothing declared covers it, or it
+ * reaches past one register) or has a name the tracer's vocabulary does not
+ * carry.  Both are refusals, and the caller tallies which.
+ */
+/*
+ * Tally an env range by its OFFSET.
+ *
+ * The offset is meaningless without the struct it indexes and is exactly
+ * what a reader needs: `pahole`-ing CPUArchState at that number names the
+ * field, and naming it is the whole of the follow-up work.  A single
+ * "some ranges are undeclared" key would report that a gap exists and
+ * nothing about where.
+ */
+void tally_field_off(GHashTable **t, uint32_t off)
+{
+    char k[48];
+
+    g_snprintf(k, sizeof(k), "env offset %u (0x%x), no target declaration",
+               off, off);
+    tally(t, k);
+}
+
+uint8_t generic_for_field_name(const char *nm)
+{
+    uint8_t gen;
+
+    if (!nm || !*nm) {
+        return REG_ID_COUNT;
+    }
+    gen = generic_for_qemu_name(nm);
+    if (gen == REG_ID_COUNT) {
+        gen = fold_nonarch(nm);
+    }
+    /*
+     * REG_NONE is 0, so it passes every `< REG_ID_COUNT` test while meaning
+     * the opposite: the register table carries the register and states that
+     * it has NO generic word (its QREG_UNNAMED rows -- x86's fctrl and
+     * mxcsr, aarch64's fpsr and fpcr).  Returning it would put a dependency
+     * on "REG_NONE" into a published mask, which is a fabricated edge.
+     */
+    if (gen == REG_NONE) {
+        return REG_ID_COUNT;
+    }
+    return gen;
+}
+
+/*
  * The reservation monitor's VALUE half, by the name its target gave the TCG
  * global.  Three targets lower store-conditional onto a cmpxchg whose
  * COMPARE operand is this global, so it shows up as one input of the datum
@@ -303,10 +381,41 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
             }
             *load_slots |= (uint8_t)(1u << slot);
         } else {
-            /* An env byte range.  Inverting an offset back to a register
-             * needs the CPUArchState layout, which a plugin does not have
-             * and must not hard-code. */
-            return QDEP_R_FIELD;
+            /*
+             * An env byte range -- a register whose storage no TCG global
+             * names.  QEMU inverts the offset for us (each target declares
+             * its files beside its globals), so the answer is a NAME and
+             * goes through the same map every global's does.
+             *
+             * What still refuses: a range nothing declared covers, one that
+             * reaches past a single register -- a helper handed the whole
+             * vector file starts at the same byte as an access to its first
+             * element, and taking the first would publish a SHORT set -- and
+             * a register the tracer's vocabulary has no word for.  Each is
+             * tallied by name so the residual is a list, not an adjective.
+             */
+            char fnm[64];
+            uint8_t gen;
+
+            uint32_t foff = 0;
+
+            qemu_plugin_dataflow_prov_field(b, &foff);
+            if (!qemu_plugin_dataflow_prov_field_reg(b, fnm, sizeof(fnm))) {
+                tally_field_off(&g_field_unnamed, foff);
+                return QDEP_R_FIELD;
+            }
+            if (is_monitor_value(fnm)) {
+                tally(&g_monitor_name, fnm);
+                return QDEP_R_EMU_MONITOR;
+            }
+            gen = generic_for_field_name(fnm);
+            if (gen >= REG_ID_COUNT) {
+                tally(&g_field_unmapped_name, fnm);
+                return QDEP_R_FIELD;
+            }
+            if (!add_reg(regs, n, gen)) {
+                return QDEP_R_WIDE;
+            }
         }
     }
     return QDEP_OK;
@@ -789,6 +898,110 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
         if (rc != QDEP_OK) {
             out->dst_state = rc;
             return;
+        }
+    }
+
+    /*
+     * THE WRITES THAT ARE NOT GLOBALS (#226).
+     *
+     * A vector register is written by a store into CPUArchState, not by a
+     * write to a TCG global, so the loop above sees nothing at all for
+     * `movdqa %xmm1,%xmm2` -- and the wire's destination list, which does
+     * name REG_VEC2, then had no row to match and refused the whole family
+     * (QDEP_R_DST_UNNAMED).  The env fields carry the same two facts a
+     * global write does, the register and where its value came from, so
+     * they go through the same union.
+     *
+     * A field whose range has no name, or a name with no generic word, is
+     * SKIPPED and tallied exactly as an unmapped global is: it cannot equal
+     * any dst_regs[d], so no mask is ever written for it, and the wire slot
+     * that wanted it refuses one gate later where the slot list exists.
+     */
+    unsigned nf = qemu_plugin_insn_fields(tb, idx, nullptr, 0);
+
+    if (nf == QEMU_PLUGIN_DF_INCOMPLETE) {
+        out->dst_state = QDEP_R_NORECORD;
+        return;
+    }
+    if (nf > kMaxFields) {
+        out->dst_state = QDEP_R_WIDE;
+        return;
+    }
+    if (nf) {
+        qemu_plugin_dataflow_field fl[kMaxFields];
+
+        for (unsigned i = 0; i < nf; i++) {
+            fl[i].struct_size = sizeof(fl[i]);
+        }
+        if (qemu_plugin_insn_fields(tb, idx, fl, nf) != nf) {
+            out->dst_state = QDEP_R_NORECORD;
+            return;
+        }
+        for (unsigned i = 0; i < nf; i++) {
+            char fnm[64];
+            uint8_t gen, k;
+            uint8_t memop_slots = 0;
+            QDepState rc;
+
+            if (!(fl[i].dir & QEMU_PLUGIN_DF_WR)) {
+                continue;
+            }
+            if (!qemu_plugin_dataflow_field_reg(fl[i].env_offset, fl[i].size,
+                                                fnm, sizeof(fnm))) {
+                tally_field_off(&g_field_unnamed, fl[i].env_offset);
+                continue;
+            }
+            /*
+             * R7.7's category, reached by the field route rather than the
+             * global one: the reservation monitor is a product of the
+             * emulation and is deliberately given no generic word.  Skipped
+             * like any other write with no word, and tallied where the
+             * globals' monitor writes are so the category stays one number.
+             */
+            if (is_monitor_value(fnm)) {
+                tally(&g_monitor_name, fnm);
+                continue;
+            }
+            gen = generic_for_field_name(fnm);
+            if (gen >= REG_ID_COUNT) {
+                tally(&g_field_unmapped_name, fnm);
+                continue;
+            }
+            for (k = 0; k < out->n_dst; k++) {
+                if (out->dst_reg[k] == gen) {
+                    break;
+                }
+            }
+            if (k == out->n_dst) {
+                if (out->n_dst >= QDEP_MAX_DST) {
+                    out->dst_state = QDEP_R_WIDE;
+                    return;
+                }
+                out->dst_reg[out->n_dst++] = gen;
+            }
+            if (qemu_plugin_insn_field_prov(tb, idx, i, w.data(),
+                                            g_prov_words) != g_prov_words) {
+                out->dst_state = QDEP_R_NORECORD;
+                return;
+            }
+            rc = fold_prov(w.data(), out->dst_dep_regs[k],
+                           &out->n_dst_dep_regs[k], &memop_slots);
+            if (rc == QDEP_OK) {
+                for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
+                    if (!(memop_slots & (1u << m))) {
+                        continue;
+                    }
+                    if (m >= n_memops || load_ord[m] == 0xFF) {
+                        rc = QDEP_R_UNREPRESENTABLE;
+                        break;
+                    }
+                    out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+                }
+            }
+            if (rc != QDEP_OK) {
+                out->dst_state = rc;
+                return;
+            }
         }
     }
     out->dst_state = QDEP_OK;
@@ -1627,5 +1840,9 @@ void qdep_report(GString *report)
                "reservation-monitor value globals a store's datum named\n(the emulation-artefact category, #177 / f46873a738 -- NOT a decoder gap):");
     dump_tally(report, g_dst_unmapped_name,
                "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
+    dump_tally(report, g_field_unnamed,
+               "env byte ranges no target declared a register file for\n(#226: the offset IS the identity, so this is a gap in QEMU's statement\nof its own layout -- never a limit of what the machine knows):");
+    dump_tally(report, g_field_unmapped_name,
+               "env byte ranges QEMU NAMED that have no generic word\n(#226: the name reached this file and the register table has no row for\nit -- a generator pass, not a boundary question):");
     g_mutex_unlock(&g_tally_lock);
 }

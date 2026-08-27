@@ -53,6 +53,21 @@
  */
 #define INSN_DF_MAX_FIELDS  24
 
+/*
+ * An env byte range whose reach nothing stated.  A helper handed tcg_env, or
+ * a pointer this walk could not bound, may touch any of CPUArchState, so the
+ * range cannot be named for a register and must not be.
+ */
+#define DF_FIELD_UNBOUNDED  0xffffffffu
+
+/*
+ * How many register FILES a target may declare (see
+ * insn_dataflow_declare_regfile()).  One per array of architectural registers
+ * that no TCG global names, plus the scalars beside them; the widest in-tree
+ * target uses a handful.
+ */
+#define INSN_DF_MAX_REGFILES  24
+
 /* Instructions writing more than this are vanishingly rare; overflow is flagged. */
 #define INSN_DF_MAX_WRITES  8
 
@@ -604,6 +619,56 @@ unsigned insn_dataflow_nregs(void);
 /* Name and env offset of global @i, for a consumer building its own map. */
 const char *insn_dataflow_reg_name(unsigned i, uint32_t *off, uint32_t *size);
 
+/*
+ * Declare that @n architectural registers live in CPUArchState at @off, one
+ * every @stride bytes, each occupying the first @elem bytes of its slot.
+ *
+ * The k-th is called @names[k] when @names is given, and "@base<k>"
+ * otherwise -- or just "@base" when @n is 1.  Two spellings because two
+ * targets number their files and two name them: x86's are xmm0..xmm31 and
+ * ARM's v0..v31, while RISC-V's GDB stub calls f10 "fa0" and a rule that
+ * pasted a number onto a stem would name a register that does not exist.
+ *
+ * This is the answer to a question the extractor asks constantly and could
+ * not previously answer: an env byte range IS a register, and the offset IS
+ * its identity, but inverting one back to the other needs the CPUArchState
+ * layout and only the target has that.  So the target says so, once, at the
+ * same place and in the same terms it registers its TCG globals -- with
+ * offsetof() and sizeof(), which is the compiler reading the struct rather
+ * than anyone typing a number.
+ *
+ * The names are the target's GDB-stub spellings, because that is the
+ * namespace insn_dataflow_reg_name() already answers in and a consumer must
+ * not have to learn a second one to ask the same question twice.
+ *
+ * @elem may be smaller than @stride: ARM's ARMVectorReg is 256 bytes of SVE
+ * storage of which V<n> is the first 16, and x86's ZMMReg is 64.  The whole
+ * slot still belongs to the register, so @elem is the SLOT's extent, not the
+ * architectural width -- what it excludes is the padding between files.
+ *
+ * Idempotent: a target that initialises its TCG globals more than once
+ * declares the same files again and the second declaration is dropped.
+ */
+void insn_dataflow_declare_regfile(const char *base, const char *const *names,
+                                   uint32_t off, uint32_t stride,
+                                   uint32_t elem, uint32_t n);
+
+/*
+ * Name the register an env byte range belongs to, in the same namespace
+ * insn_dataflow_reg_name() answers in.  false when nothing declared covers
+ * it, or when the range REACHES BEYOND one register -- an access spanning
+ * two of them is not either of them, and naming it for the one it starts in
+ * would publish a set short by everything else it touched.
+ *
+ * @size is the access's extent; DF_FIELD_UNBOUNDED (or a size that leaves
+ * the register's slot) always refuses.
+ */
+bool insn_dataflow_field_reg(uint32_t off, uint32_t size,
+                             char *buf, size_t buflen);
+
+/* The same, for a provenance bit: the extent comes from the interned slot. */
+bool insn_dataflow_prov_field_reg(unsigned bit, char *buf, size_t buflen);
+
 #else /* !CONFIG_PLUGIN */
 
 /*
@@ -650,6 +715,12 @@ static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
 { }
 
 static inline void insn_dataflow_note_reset(void)
+{ }
+
+static inline void insn_dataflow_declare_regfile(const char *base,
+                                                 const char *const *names,
+                                                 uint32_t off, uint32_t stride,
+                                                 uint32_t elem, uint32_t n)
 { }
 
 #endif /* CONFIG_PLUGIN */

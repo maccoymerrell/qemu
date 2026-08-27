@@ -93,6 +93,19 @@ void a64_translate_init(void)
 
     cpu_exclusive_high = tcg_global_mem_new_i64(tcg_env,
         offsetof(CPUARMState, exclusive_high), "exclusive_high");
+
+    /*
+     * The vector file, for the dataflow extraction.  No TCG global names it
+     * -- every V/Z register access is a ld/st or a gvec op at a constant env
+     * offset -- so without this a consumer sees a byte range where a
+     * register belongs.  The slot is the whole ARMVectorReg, of which V<n>
+     * is the first 16 bytes and Z<n> the rest: the same register either way,
+     * which is what the GDB stub's single "v<n>" name says too.
+     */
+    insn_dataflow_declare_regfile("v", NULL,
+                                  offsetof(CPUARMState, vfp.zregs),
+                                  sizeof(ARMVectorReg), sizeof(ARMVectorReg),
+                                  ARRAY_SIZE(((CPUARMState *)0)->vfp.zregs));
 }
 
 /*

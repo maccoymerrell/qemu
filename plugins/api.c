@@ -376,6 +376,18 @@ bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset)
     return valid;
 }
 
+bool qemu_plugin_dataflow_field_reg(uint32_t env_offset, uint32_t size,
+                                    char *buf, size_t buflen)
+{
+    return insn_dataflow_field_reg(env_offset, size, buf, buflen);
+}
+
+bool qemu_plugin_dataflow_prov_field_reg(unsigned bit, char *buf,
+                                         size_t buflen)
+{
+    return insn_dataflow_prov_field_reg(bit, buf, buflen);
+}
+
 #define PLUGIN_DF_SET(name, member)                                          \
 unsigned name(const struct qemu_plugin_tb *tb, size_t idx,                   \
               uint64_t *words, unsigned nwords)                              \

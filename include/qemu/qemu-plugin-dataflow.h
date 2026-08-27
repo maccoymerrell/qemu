@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 4
+#define QEMU_PLUGIN_DATAFLOW_VERSION 5
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -245,6 +245,39 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
                                      uint64_t *words, unsigned nwords);
 QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset);
+
+/*
+ * NAME the register an env byte range belongs to, in the same namespace
+ * qemu_plugin_dataflow_reg_name() answers in.
+ *
+ * An env offset is not a shortfall in what QEMU knows; it is a register
+ * whose storage no TCG global happens to name -- x86's vector file, ARM's V
+ * registers, every target's FP status word.  The offset IS the identity, and
+ * inverting it needs the CPUArchState layout, which each target states once
+ * beside its globals.  A consumer that reads an unnamed offset as "QEMU
+ * cannot tell us" is reading its own missing lookup as a property of the
+ * machine.
+ *
+ * false when nothing covers the range, or when the range REACHES BEYOND one
+ * register: a helper handed a whole register file starts at the same byte as
+ * an access to its first element, and naming that for the first would
+ * publish a set short by the rest.  @size is the access's extent and must be
+ * the caller's real one.
+ *
+ * @buf is filled only on true.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_field_reg(uint32_t env_offset, uint32_t size,
+                                    char *buf, size_t buflen);
+
+/*
+ * The same, for a PROVENANCE bit above the globals: the extent comes from
+ * the slot the translation interned, so a caller holding only a bit does not
+ * have to reconstruct one it never saw.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_field_reg(unsigned bit, char *buf,
+                                         size_t buflen);
 
 /*
  * The guest memory accesses of an instruction, as the emitters stated them.

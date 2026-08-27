@@ -44,6 +44,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VAL_ROOT="$(cd "$HERE/.." && pwd)"
 QEMU_ROOT="$(cd "$VAL_ROOT/../../../.." && pwd)"
+# The one shared validator adjudicator; see tools/val_gate.sh.
+VAL_GATE="$(cd "$VAL_ROOT/.." && pwd)/tools/val_gate.sh"
+if [ ! -x "$VAL_GATE" ]; then
+    echo "large_scale: FAIL — no val_gate.sh at $VAL_GATE" >&2
+    exit 2
+fi
 
 : "${BUILD_DIR:=$QEMU_ROOT/build}"
 : "${PYTHON:=$HOME/anaconda3/bin/python3}"
@@ -133,14 +139,16 @@ run_one() {
         echo "RUN seed=$seed isa=$isa shape=$shape_label mode=$MODE status=CRASH rc=$rc log=$log"
         return 1
     fi
-    local errors
-    errors=$(printf '%s\n' "$summary" | sed -nE 's/.*errors=([0-9]+).*/\1/p')
-    errors=${errors:-0}
-    if [ "$errors" -gt 0 ]; then
-        echo "RUN seed=$seed isa=$isa shape=$shape_label status=FAIL errors=$errors log=$log"
+    # THE SHARED GATE decides, not a private sed.  The extraction that used
+    # to live here defaulted a failed match to errors=0 -- a log whose
+    # summary line changed shape would have been read as a clean run.
+    local verdict
+    verdict=$("$VAL_GATE" "$log" "$rc" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "RUN seed=$seed isa=$isa shape=$shape_label status=FAIL log=$log :: $verdict"
         return 1
     fi
-    echo "RUN seed=$seed isa=$isa shape=$shape_label status=OK errors=0 log=$log"
+    echo "RUN seed=$seed isa=$isa shape=$shape_label status=OK log=$log :: $verdict"
     rm -rf "$out"
     return 0
 }

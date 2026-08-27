@@ -204,9 +204,21 @@ def sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+#: The one shared adjudicator for a validator run.  Never re-implement its
+#: extraction here: the wave scripts that did grepped for "errors=0
+#: warnings=0", space-separated, against output that prints them comma-
+#: separated, and recorded the empty match as a pass.
+VAL_GATE = (Path(__file__).resolve().parents[1] / "tools" / "val_gate.sh")
+
+
 def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     """generate+build+trace+analyze+validate for one workload (all its ISAs).
-    Returns the validator exit code (0 == errors=0)."""
+
+    Returns 0 only when val_gate.sh adjudicates the run green: the process
+    exited 0, the log carries a summary line, and that line says errors=0.
+    The exit code alone was what this used to return, and the printed claim
+    "validator errors=0" was therefore never read off anything -- a run that
+    exited 0 without ever summarising would have been reported as a pass."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # setarch -R disables ASLR (ADDR_NO_RANDOMIZE, inherited by the qemu
     # child) so guest stack/mmap bases are fixed -> recorded memory
@@ -226,7 +238,15 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     proc = subprocess.run(cmd, cwd=VALIDATOR_DIR, env=PINNED_ENV,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True)
-    return proc.returncode
+    log = out_dir / "validator.log"
+    log.write_text(proc.stdout or "")
+    gate = subprocess.run(["bash", str(VAL_GATE), str(log),
+                           str(proc.returncode)],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+    if gate.returncode != 0:
+        print(f"  {(gate.stdout or '').strip()}")
+    return gate.returncode
 
 
 def cst_path(out_dir: Path, isa: str) -> Path:

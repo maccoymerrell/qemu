@@ -624,6 +624,21 @@ Decode by repeated outer-section unwrapping.
         datum is the instruction's own immediate the immediate bit is
         set instead, so an empty mask is reserved for the case where
         the template carries no immediate slot to point at.
+
+        A datum the ARCHITECTURE derives from a register names that
+        register, whether or not the emulator had to read it.  An
+        x86-64 ``call`` pushes RIP plus the instruction's length, so
+        every form of it — direct and indirect alike — publishes a
+        store-data mask naming ``REG_IP`` and nothing else: not the
+        register an indirect call reads to find its target, and not
+        the base register it reads to form that target's address.
+        That a translator may know the value at translation time and
+        emit it as a constant is an emulation detail; the mask states
+        the dependency the machine has.  On the ISAs whose calls write
+        the return address to a link REGISTER — AArch64 ``bl``/``blr``,
+        RISC-V ``jal``/``jalr``, MIPS ``jal``/``jalr`` — the
+        instruction declares no store at all, and this paragraph has
+        no subject there.
    4.6  Template profile block (consumed from tmpl_section,
         immediately after the last insn descriptor, present only when
         the `CST_FLAG_PROFILE` header bit is set — resolve the

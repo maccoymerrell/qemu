@@ -453,6 +453,47 @@ void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts);
 void insn_dataflow_note_zero_reg(const void *ts);
 
 /*
+ * CP-M, the FOLDED-REGISTER half -- a value an emitter derived from a
+ * register whose live value it did not have to read.
+ *
+ * `callq` pushes the return address, which the ISA defines as RIP plus the
+ * instruction's length.  x86's eip_next_tl() (target/i386/tcg/translate.c)
+ * hands that back three different ways depending on how the block is being
+ * translated: under CF_PCREL it emits `addi cpu_eip, delta` and the op stream
+ * carries the read, and otherwise it returns tcg_constant_tl(s->pc), because
+ * at translation time the value is already known.
+ *
+ * That difference is the emulator's, not the machine's.  The architectural
+ * source of the pushed datum is the instruction pointer in both regimes, so
+ * a walk over the ops must not report it as a register read in one and as a
+ * value from nowhere in the other -- and "from nowhere" is worse than vague:
+ * the format's store-data block reads an empty-and-complete provenance as
+ * "the datum came from the instruction's own encoding", so the fold arrives
+ * on the wire as an IMMEDIATE.  A consumer is then told the return-address
+ * store waits on nothing, when it waits on RIP.
+ *
+ * The note is taken AT THE ACCESSOR, the same place and for the same reason
+ * as insn_dataflow_note_zero_reg()'s: the register the value stands for is
+ * known there and nowhere downstream.  @ts is the temp the accessor returns
+ * and @src_ts is the TCG global whose architectural register it stands for,
+ * so this states a fact in the namespace every other provenance uses rather
+ * than reserving a bit of its own -- the instruction pointer HAS a global,
+ * which is exactly what the zero register does not.
+ *
+ * It states an operand, not a value.  The consumer decides whether a folded
+ * constant is worth a dependency edge; that is a microarchitectural decision
+ * and making it here would put the emulator's optimisation on the wire as
+ * though it were the machine.  Taking the note in the CF_PCREL arm as well
+ * is deliberate and not redundant bookkeeping: it makes the two regimes
+ * publish the same set by construction instead of by coincidence.
+ *
+ * @ts and @src_ts are TCGTemp pointers, void here for the same reason
+ * insn_dataflow_note_memop()'s are.  Capture only; no op is emitted, altered
+ * or suppressed, and a target that never calls this is unaffected.
+ */
+void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts);
+
+/*
  * CP-H -- the helper choke point.
  *
  * INDEX_op_call is the one op whose arguments do not describe themselves.
@@ -591,6 +632,10 @@ static inline void insn_dataflow_note_addr_alias(const void *alias_ts,
 { }
 
 static inline void insn_dataflow_note_zero_reg(const void *ts)
+{ }
+
+static inline void insn_dataflow_note_folded_reg(const void *ts,
+                                                 const void *src_ts)
 { }
 
 static inline void insn_dataflow_note_helper(const void *call_op,

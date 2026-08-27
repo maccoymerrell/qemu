@@ -93,6 +93,14 @@
  * operand missing.
  */
 #define DF_MAX_ZERO_NOTES     256
+/*
+ * Folded-register operands stated by an emitter (insn_dataflow_note_folded_reg).
+ * One per such operand a block resolves, and the only emitter that states one
+ * is x86's eip_next_tl(), which a block reaches once per call instruction;
+ * past the cap the notes stop and an access taken after is marked unnoted
+ * rather than published with its datum's source missing.
+ */
+#define DF_MAX_FOLD_NOTES     128
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -130,7 +138,25 @@ typedef struct DfMemopNote {
      */
     unsigned zero_n;
     bool zero_dropped;          /* a zero note was lost to overflow before this */
+    /*
+     * And again for the folded-register notes, for the same reason: a
+     * constant an emitter resolves AFTER this access cannot name its
+     * operands.
+     */
+    unsigned fold_n;
+    bool fold_dropped;          /* a fold note was lost to overflow before this */
 } DfMemopNote;
+
+/*
+ * CP-M, the folded-register half: one temp an emitter is handing on in place
+ * of an architectural register it did not read, and the TCG global for that
+ * register.  Unlike the zero register this one HAS a global, so the fact is
+ * stated in the ordinary provenance namespace and needs no bit of its own.
+ */
+typedef struct DfFoldNote {
+    const void *ts;
+    const void *src_ts;
+} DfFoldNote;
 
 /*
  * CP-M, the address half: one temp an emitter will pass as an access address,
@@ -313,6 +339,15 @@ struct InsnDataflowScratch {
     unsigned n_zero;
     bool zero_overflow;
 
+    /*
+     * CP-M, the folded-register half: the temps an emitter handed on in place
+     * of a register it computed away.  Pairs rather than pointers, because
+     * which register it stood for is exactly what has to be carried.
+     */
+    DfFoldNote fold[DF_MAX_FOLD_NOTES];
+    unsigned n_fold;
+    bool fold_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -352,6 +387,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_zero             (df->zero)
 #define df_n_zero           (df->n_zero)
 #define df_zero_overflow    (df->zero_overflow)
+#define df_fold             (df->fold)
+#define df_n_fold           (df->n_fold)
+#define df_fold_overflow    (df->fold_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -862,6 +900,8 @@ void insn_dataflow_note_reset(void)
     df_alias_overflow = false;
     df_n_zero = 0;
     df_zero_overflow = false;
+    df_n_fold = 0;
+    df_fold_overflow = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -1042,6 +1082,35 @@ static bool df_zero_reg_temp(const void *tsv, unsigned n, unsigned scope)
 }
 
 /*
+ * Fold the sources of any folded-register operand among the @n consecutive
+ * temps at @tsv into @dst, searching the first @scope notes newest-first.
+ *
+ * @scope is the count taken when the access's own note was recorded, for the
+ * reason df_zero_reg_temp() gives: a constant an emitter resolves for a LATER
+ * instruction must not retro-name this access's operands.
+ *
+ * The named source goes through df_prov_add_temps() rather than being turned
+ * into a bit here, so a global contributes its register bit and a temp
+ * contributes whatever it already carries -- the fact is stated once, in the
+ * one namespace, and the folded operand is indistinguishable on the wire from
+ * the same operand read live under CF_PCREL.  That is the point.
+ */
+static void df_fold_add_srcs(uint64_t *dst, const void *tsv, unsigned n,
+                             unsigned scope)
+{
+    const TCGTemp *ts = (const TCGTemp *)tsv;
+
+    for (unsigned i = 0; i < n; i++) {
+        for (unsigned k = scope > df_n_fold ? df_n_fold : scope; k-- > 0; ) {
+            if (df_fold[k].ts == (const void *)(ts + i)) {
+                df_prov_add_temps(dst, df_fold[k].src_ts, 1);
+                break;
+            }
+        }
+    }
+}
+
+/*
  * Attribute one qemu_ld/qemu_st op to the note its emitter left, and for a
  * load return the provenance bit that stands for the value it returned.
  *
@@ -1119,8 +1188,20 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
         m->is_store = store;
         m->size = n->size > UINT8_MAX ? UINT8_MAX : (uint8_t)n->size;
         df_prov_add_temps(m->addr_prov, addr_ts, 1);
+        df_fold_add_srcs(m->addr_prov, addr_ts, 1, n->fold_n);
         if (store) {
             df_prov_add_temps(m->data_prov, n->val_ts, n->nval);
+            /*
+             * A register the emitter folded to a translation-time constant,
+             * if that is what the data operand was.  Applied to BOTH halves
+             * of the access because the note is a fact about the TEMP and not
+             * about which parameter of tcg_gen_qemu_st_* it landed in; the
+             * address half has no stated occupant on any target this tree
+             * traces, and a rule that held only where an occupant happens to
+             * exist would be one more thing to re-derive later.
+             * See insn_dataflow_note_folded_reg().
+             */
+            df_fold_add_srcs(m->data_prov, n->val_ts, n->nval, n->fold_n);
             /*
              * The architectural zero register, if that is what the data
              * operand was.  Its temp holds a constant, so the walk above put
@@ -1139,6 +1220,15 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
                  */
                 d->memops_unnoted = 1;
             }
+        }
+        if (n->fold_dropped) {
+            /*
+             * And the same for a folded-register note lost to overflow: an
+             * empty data provenance would otherwise be published as complete,
+             * which the format's store-data block reads as "the datum is the
+             * instruction's immediate".  Say unaccounted instead.
+             */
+            d->memops_unnoted = 1;
         }
     }
     return store ? -1 : (int)(INSN_DF_MEMOP_PROV_BASE + n->rec);
@@ -1949,6 +2039,8 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
     df_memop[df_n_memop].alias_dropped = df_alias_overflow;
     df_memop[df_n_memop].zero_n = df_n_zero;
     df_memop[df_n_memop].zero_dropped = df_zero_overflow;
+    df_memop[df_n_memop].fold_n = df_n_fold;
+    df_memop[df_n_memop].fold_dropped = df_fold_overflow;
     df_n_memop++;
 }
 
@@ -1990,6 +2082,49 @@ void insn_dataflow_note_zero_reg(const void *ts)
         }
     }
     df_zero[df_n_zero++] = ts;
+}
+
+/*
+ * CP-M, the folded-register half.  See insn_dataflow_note_folded_reg() in the
+ * header for why the note is taken at the accessor and not at the access.
+ *
+ * Same list discipline as the zero notes -- append-only for the translation,
+ * searched by temp identity, scoped to the notes taken before the access
+ * being resolved -- and the same shared-constant caveat, bounded here by a
+ * property of the one emitter that states a note.  Without CF_PCREL
+ * eip_next_tl() returns tcg_constant_tl(s->pc), which is interned, so a
+ * SECOND way to reach the same temp would be a store whose data operand is
+ * the identical interned constant.  x86 does not have one: an immediate
+ * operand is materialised with tcg_gen_movi_tl() into a temp of its own
+ * (target/i386/tcg/emit.c.inc, X86_OP_IMM), never handed to a store emitter
+ * as the shared constant.  The claim is also measured rather than left as an
+ * argument -- the plugin's Capstone shadow scores every published row, and a
+ * store that acquired REG_IP without being a call would appear there.
+ */
+void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_fold >= DF_MAX_FOLD_NOTES) {
+        df_fold_overflow = true;
+        return;
+    }
+    /*
+     * Deduplicated on the pair, because a block that calls the same target
+     * twice resolves the same interned constant twice and an undeduplicated
+     * list would fill with copies and then overflow, turning a fact the
+     * extractor holds into a refusal it does not need.
+     */
+    for (unsigned i = 0; i < df_n_fold; i++) {
+        if (df_fold[i].ts == ts && df_fold[i].src_ts == src_ts) {
+            return;
+        }
+    }
+    df_fold[df_n_fold].ts = ts;
+    df_fold[df_n_fold].src_ts = src_ts;
+    df_n_fold++;
 }
 
 /* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */

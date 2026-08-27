@@ -26,6 +26,7 @@
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
 #include "exec/translator.h"
+#include "exec/insn-dataflow.h"
 #include "fpu/softfloat.h"
 
 #include "exec/helper-proto.h"
@@ -598,16 +599,30 @@ static TCGv_i32 eip_next_i32(DisasContext *s)
 
 static TCGv eip_next_tl(DisasContext *s)
 {
+    TCGv ret;
+
     assert(s->pc_save != -1);
     if (tb_cflags(s->base.tb) & CF_PCREL) {
-        TCGv ret = tcg_temp_new();
+        ret = tcg_temp_new();
         tcg_gen_addi_tl(ret, cpu_eip, s->pc - s->pc_save);
-        return ret;
     } else if (CODE64(s)) {
-        return tcg_constant_tl(s->pc);
+        ret = tcg_constant_tl(s->pc);
     } else {
-        return tcg_constant_tl((uint32_t)(s->pc - s->cs_base));
+        ret = tcg_constant_tl((uint32_t)(s->pc - s->cs_base));
     }
+    /*
+     * The value is the instruction pointer plus this instruction's length,
+     * whichever of the three ways above produced it.  gen_CALL and gen_CALL_m
+     * push it, so it reaches the wire as a store's data operand, and the two
+     * constant arms read as a value that came from nowhere -- which the
+     * format's store-data block spells "the instruction's immediate".  Say
+     * where it came from instead.  Stated in the CF_PCREL arm too, where the
+     * add above already carries the read: that costs one deduplicated list
+     * entry and makes the regimes identical by construction.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_folded_reg(tcgv_tl_temp(ret), tcgv_tl_temp(cpu_eip));
+    return ret;
 }
 
 static TCGv eip_cur_tl(DisasContext *s)

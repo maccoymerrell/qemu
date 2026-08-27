@@ -1407,15 +1407,26 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * every way it could have been short is a refusal above.  A store
          * must take its datum from somewhere, so what is left is the
          * instruction's own encoding, which is exactly what the format's
-         * immediate bit means.  `movq $5,(%rax)` and `callq` (whose pushed
-         * return address is tcg_constant_tl(s->pc), target/i386/tcg/
-         * translate.c:599-610) are the two shapes on the workload.
+         * immediate bit means.  `movq $5,(%rax)` is the shape on the
+         * workload: x86 materialises an immediate operand with movi into a
+         * temp of its own, so the walk sees a value with no antecedent and
+         * that is the truth about it.
          *
-         * Set only when the template HAS an immediate slot.  An indirect
-         * `callq *%rax` pushes the same translation-time constant and has no
-         * immediate operand, and pointing at a slot the template says does
-         * not exist would be naming a source rather than reporting one; that
-         * row publishes the empty mask, which is true as far as it goes.
+         * `callq` USED TO REACH HERE AND MUST NOT.  Its pushed datum is the
+         * return address, and eip_next_tl() folds that to tcg_constant_tl(
+         * s->pc) whenever CF_PCREL is off -- the same empty-and-complete
+         * shape, arriving at the same test, and answered "immediate" for a
+         * value the ISA derives from RIP.  R2, R3/J2.3 and R7.3 all say a
+         * QEMU fold is not the machine, so the fix is at QEMU's emitter:
+         * insn_dataflow_note_folded_reg() states the instruction pointer as
+         * the datum's source and the row arrives here with a non-empty mask.
+         * If a direct call is ever seen taking this branch again, the note is
+         * not reaching the access, not that the rule needs a call exception.
+         *
+         * Set only when the template HAS an immediate slot.  Pointing at a
+         * slot the template says does not exist would be naming a source
+         * rather than reporting one; such a row publishes the empty mask,
+         * which is true as far as it goes.
          */
         for (uint8_t k = 0; k < mds_new; k++) {
             if (sd_mask[k] == 0) {

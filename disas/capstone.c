@@ -9146,6 +9146,59 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * Capstone 6.0.0 MIPS PREFETCH-HINT over-claim workaround.
+         *
+         * `pref hint,offset(base)` is a HINT.  MIPS64 vol II defines it
+         * as performing no data access and raising no addressing
+         * exception, and QEMU agrees at the only place that can settle
+         * it -- OPC_PREF, OPC_PREFE and R6_OPC_PREF each fall through to
+         * a bare "Treat as NOP" in target/mips/tcg/translate.c
+         * (:18284, :17585, :16405) and emit no op at all.  Capstone
+         * nevertheless flags the MEM operand CS_AC_READ, i.e. claims a
+         * LOAD that no data access corresponds to.
+         *
+         * Under R2 the wire records ARCHITECTURAL dependencies, and a
+         * hint that moves no data has no load to record.  So the READ is
+         * cleared HERE, at the boundary, and not by a mnemonic-table row
+         * -- per the table-scope rule a Capstone over-claim is a boundary
+         * defect, while the table carries per-ISA vocabulary.
+         *
+         * WHAT THE TRACE STILL PUBLISHES, and why this is not a loss.
+         * The address-only memop a prefetch carries is the TRACER's own
+         * record, minted by vcpu_insn_synth_ea_cb from the synthetic-EA
+         * class (GEN_OP_PREFETCH), so a cache model still learns which
+         * line was hinted.  Clearing the flag moves the slot's SOURCE
+         * from a Capstone access flag to that class -- which is where
+         * the claim always belonged, because it is the tracer that mints
+         * the record.  synthetic_ea_slotless_mem_operand() allocates the
+         * slot exactly when the walk did not, so the count is unchanged;
+         * measured on the four-ISA workload, max_dep_loads stays 1 on
+         * every `pref` row.
+         *
+         * Placed AFTER the access==0 inference above so the two cannot
+         * fight: that loop reads a 0-access MEM operand as the MSA /
+         * unaligned defect and infers a direction from the data register
+         * operand.  `pref` has no register operand -- its operands are
+         * (IMM hint, MEM) -- so it could not reach that inference even
+         * if the order were reversed, but depending on that would be a
+         * coincidence rather than a rule.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify
+         * with `cstool -d mips64el 0000b08c`-style bytes for `pref` --
+         * fixed, the MEM operand must show no access flag.  Use a
+         * `cstool` built from `subprojects/capstone` (capstone.wrap's
+         * pinned revision), not a system package.
+         */
+        if (insn->id == MIPS_INS_PREF || insn->id == MIPS_INS_PREFE
+            || insn->id == MIPS_INS_PREFX) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type == QEMU_PLUGIN_OP_MEM) {
+                    op->access = 0;
+                }
+            }
+        }
+        /*
          * Capstone 6.0.0 MIPS store-conditional bug workaround.
          *
          * MIPS store-conditional (sc / scd / sce / scwp) atomically

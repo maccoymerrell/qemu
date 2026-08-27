@@ -2205,9 +2205,6 @@ def _check_expected_reg_sets(
                 n_insns_checked += 1
                 if actual_src == exp_src and actual_dst == exp_dst:
                     continue
-                if actual_src == exp_src and _r10_pc_only_gain(actual_dst,
-                                                               exp_dst):
-                    continue
                 n_errors += 1
                 if n_errors <= err_cap:
                     issues.append(Issue(
@@ -4446,31 +4443,6 @@ def _check_call_return_store(
     return issues
 
 
-def _r10_pc_only_gain(actual_dst: set, exp_dst: set) -> bool:
-    """R10: the wire may carry ``REG_PC`` where the reference does not.
-
-    A translation block ends by writing the program counter and QEMU charges
-    that write to whichever instruction the block ended on.  At a page
-    boundary that is an ordinary load or move, and the tracer publishes
-    ``REG_PC`` in its destination list per the maintainer's ruling.
-
-    NEITHER REFERENCE THIS ORACLE USES CAN SEE THAT.  Capstone decodes one
-    instruction and the hand-written expectation describes one instruction;
-    whether a *block* ended there depends on where the page fell, which is a
-    property of the layout, not of the encoding.  So a wire destination set
-    that is the reference's set plus exactly ``REG_PC`` is a fact the oracle
-    has no standing to contradict.
-
-    ONE DIRECTION ONLY.  The reverse -- the reference names ``REG_PC`` and
-    the wire does not -- is a real disagreement and still fails: that is a
-    branch whose pc destination went missing, which is what this oracle is
-    for.  Returns True only for the gain direction, so the caller counts it
-    rather than silently widening the comparison.
-    """
-    return bool(actual_dst) and actual_dst - exp_dst == {"REG_PC"} \
-        and not (exp_dst - actual_dst)
-
-
 def _check_static_reg_sets(
     templates: list[dict],
     isa: str,
@@ -4518,7 +4490,6 @@ def _check_static_reg_sets(
     n_checked = 0
     n_errors = 0
     n_skipped = 0
-    n_pc_seated = 0     # R10 pc-only gains, counted not hidden
     err_cap = 20
 
     def add(out: set[str], cap_id: int) -> None:
@@ -4682,10 +4653,6 @@ def _check_static_reg_sets(
             n_checked += 1
             if actual_src == exp_src and actual_dst == exp_dst:
                 continue
-            if actual_src == exp_src and _r10_pc_only_gain(actual_dst,
-                                                           exp_dst):
-                n_pc_seated += 1
-                continue
             n_errors += 1
             if n_errors <= err_cap:
                 issues.append(Issue(
@@ -4708,10 +4675,9 @@ def _check_static_reg_sets(
     issues.append(Issue(
         "static_reg_sets", "info",
         f"static register sets: ok={n_checked - n_errors} "
-        f"checked={n_checked} skipped={n_skipped} errors={n_errors} "
-        f"pc_seated={n_pc_seated}",
+        f"checked={n_checked} skipped={n_skipped} errors={n_errors}",
         {"checked": n_checked, "skipped": n_skipped,
-         "errors": n_errors, "pc_seated": n_pc_seated},
+         "errors": n_errors},
     ))
     return issues
 

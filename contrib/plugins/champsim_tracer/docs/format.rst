@@ -2970,41 +2970,6 @@ than sources per insn so the cost is lower).
      src_regs = [ REG_A, REG_B, ... ]   static source identities only
      dst_regs = [ REG_C, ... ]
 
-.. _pc-as-destination:
-
-``REG_PC`` as a destination
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-``dst_regs[]`` names every architectural register the instruction writes,
-and on a **block-terminal** instruction that includes the program counter.
-A translation block ends by writing the pc, and the write belongs to
-whichever instruction the block ended on — a branch usually, but at a page
-boundary an ordinary load or arithmetic instruction that no ISA manual
-calls a branch.  Both carry ``REG_PC`` in ``dst_regs[]``; the trace states
-the machine fact rather than the subset of it that happens to look like
-control flow.
-
-**The consumer contract.**  A pc write is control flow, and a consumer that
-models control flow from the entry stream and ``branch_type`` should drop
-``REG_PC`` from the destination list when it builds its dependency graph.
-Left in, it manufactures a serialising write-after-write chain through
-every block boundary that no real machine has.
-
-``branch_type`` remains the sole authority on what an instruction IS.  A
-page-final ``lw`` carrying ``REG_PC`` as a destination is
-``BRANCH_NONE``, exactly as it was before it carried one, and a consumer
-must never infer a branch from the destination list.  The same holds in
-reverse: the presence or absence of ``REG_PC`` says nothing about the
-instruction's class.
-
-Where the pc destination has a ``dst_dep[]`` mask, the mask is whatever
-the emitters stated about the value's provenance — the target registers of
-a real indirect branch, for instance.  Where they stated nothing, because
-the block-final pc is a constant the translator computed rather than a
-value derived from the instruction's inputs, the slot carries the format's
-all-inputs default.  It never carries the immediate bit: the next-PC is
-not a field of the instruction's encoding.
-
    delta fields for this instruction:
 
      CST_FID_DST_REG0  -> value of REG_C after execution
@@ -3099,6 +3064,50 @@ spellings resolve to the registers they denote.  :doc:`reference`
 carries the per-ID notes.
 
 The header map, not this table, is authoritative for decoding names.
+
+.. _pc-as-destination:
+
+``REG_PC`` as a destination
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``REG_PC`` appears in ``dst_regs[]`` on exactly the instructions the ISA
+defines as writing the program counter — branches, jumps, calls, returns
+and the syscall-class transfers.  For those the pc is an architectural
+destination like any other, and the trace names it.
+
+It does **not** appear on an instruction that merely happened to be last
+in a translation block.  A translation block ends by writing the pc, and
+QEMU charges that write to whichever instruction the block ended on: the
+delay-slot ``lw`` after a ``bne`` on mipsel, an ordinary ``mov`` that fell
+at a page boundary on x86_64.  That write belongs to the block, not to the
+instruction, and the trace does not publish it:
+
+  *"if you are actually referring to a QEMU-behavioral-artifact (not
+  architecturally justifiable as part of the ISA), then that should not be
+  getting emitted."*
+
+The number of such rows moves with the guest's argv and environment
+length, because which instruction lands last depends on where the block
+ends — the same instruction at the same address is or is not the block's
+last depending on how the stack was laid out.  A destination register list
+is a property of the instruction, so a fact that moves with the layout is
+not one of them, and it is excluded rather than published with a caveat.
+
+**The consumer contract.**  A pc write is control flow.  A consumer that
+models control flow from the entry stream and ``branch_type`` should drop
+``REG_PC`` from the destination list when it builds its dependency graph;
+left in, it manufactures a serialising write-after-write chain through
+every branch that no real machine has.
+
+``branch_type`` remains the sole authority on what an instruction IS.  The
+presence or absence of ``REG_PC`` in ``dst_regs[]`` says nothing about an
+instruction's class, in either direction, and a consumer must never infer
+one from the other.
+
+Where a pc destination carries a ``dst_dep[]`` mask, the mask is whatever
+the emitters stated about the value's provenance — the target register of
+an indirect branch, for instance — under the same rules as every other
+destination slot.
 
 5.5 Instruction Metadata
 ^^^^^^^^^^^^^^^^^^^^^^^^

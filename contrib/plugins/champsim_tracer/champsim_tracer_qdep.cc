@@ -116,40 +116,41 @@ GHashTable *g_field_unmapped_name = nullptr;
  * is empty.  It is NOT empty: on the four-ISA workload it is 212 rows, and
  * every one of them names REG_PC.
  *
- * THE PC ROW IS NO LONGER EXCLUDED -- R10 (2026-08-27).  A translation block
- * ends by writing the program counter, and QEMU attributes that write to
- * whichever instruction happened to be last, so `lw` at 0x4fffe on mipsel is
- * a page-final load that writes the pc.  The exclusion argued that adding the
- * write would make a load into a jump; the maintainer's ruling is that it
- * does not, because the wire already has a field that says what an
- * instruction IS:
+ * THE PC ROW IS EXCLUDED, AND R10.1 (2026-08-27) SAYS WHY.  R10 read the
+ * question as branches and answered it for branches: an instruction the ISA
+ * defines as writing the program counter may carry REG_PC as a destination,
+ * and every such instruction already does -- the operand walk lists it, and
+ * on x86_64 that is 2,726 rows across seven branch classes.  The rows
+ * counted HERE are the other thing entirely.  A translation block ends by
+ * writing the pc, and QEMU charges that write to whichever instruction the
+ * block ended on: a delay-slot `lw` on mipsel, a page-final `mov` on x86_64.
+ * The register belongs to the BLOCK, not to the instruction.
  *
- *     "It would be natural for any consumer to understand pc writes as
- *      branches, thus to treat pc dependencies differently (the consumer
- *      will likely drop the pc as a destination reg when consuming)."
+ *     "if you are actually referring to a QEMU-behavioral-artifact (not
+ *      architecturally justifiable as part of the ISA), then that should
+ *      not be getting emitted."
  *
- * So the machine fact is published and `branch_type` stays the control-flow
- * authority.  seat_pc_destination() puts REG_PC in `dst_regs[]` where QEMU
- * states the write and the walk did not list it; both counters below are
- * now tripwires and both must be 0:
+ * R1 (no context), R2 (architectural only) and J2.3 decided this before the
+ * amendment restated it, and the count is its own proof of non-architecture:
+ * it moves with argv length, because which instruction lands last depends on
+ * where the block ends.  Excluding it is not information loss under R12.1 --
+ * an artifact is not architectural information, the same category as a
+ * Capstone fabrication -- and the exclusion is JUSTIFIED, not pending, so
+ * the stats line states the contract rather than promising a ruling.
  *
- *   _pc    -- QEMU stated a pc write on a PUBLISHED row and the wire still
- *             does not carry it.  Reachable only if the slot list is
- *             already at MAX_DST_REGS, which is a capacity fact worth
- *             hearing about rather than silently dropping.
+ *   _pc    -- the artifact population itself.  CORRECT BY CONTRACT and NOT
+ *             a must-be-0.  It is counted because a population nobody can
+ *             quote is one nobody can say is bounded, and because an
+ *             ARCHITECTURAL pc write whose walk failed to list it would
+ *             land in this same count -- which is why the adjudication runs
+ *             on the wire's own branch_type and is on file, per row, rather
+ *             than being asserted here.
  *   _other -- any OTHER named register the machine writes and the wire does
  *             not name.  Unchanged, and still a must-be-0.
  */
 GHashTable *g_dst_wire_missing = nullptr;   /* "mnem  REG" -> count */
 std::atomic<uint64_t> g_dst_wire_missing_pc{0};
 std::atomic<uint64_t> g_dst_wire_missing_other{0};
-/*
- * R10 accounting: destinations seated by seat_pc_destination(), and of those,
- * the ones whose provenance QEMU could not state so the slot took the
- * format's own all-inputs default rather than a narrower claim.
- */
-std::atomic<uint64_t> g_dst_pc_seated{0};
-std::atomic<uint64_t> g_dst_pc_default{0};
 /*
  * Address slots whose provenance was COMPLETE and named no register, on a
  * template that carries an immediate -- the encoding-derived address, counted
@@ -1117,95 +1118,6 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
 }
 
 /*
- * R10 -- THE TERMINATOR'S pc WRITE IS A WIRE DESTINATION.
- *
- * A translation block ends by writing the program counter.  QEMU charges
- * that write to whichever instruction was last in the block, which on a
- * page boundary is an ordinary `lw` or `mov` that no ISA manual calls a
- * branch.  The wire's destination list comes from the operand walk and the
- * walk has never listed it, so the machine wrote a register the trace did
- * not name -- 3/0/3/209 rows on the four-ISA workload at c9d278d247, and
- * the number is layout-dependent because WHICH instruction lands last
- * depends on where the page ends.
- *
- * It is published now.  The ruling's own reason is the consumer's:
- * consumers read a pc write as control flow and drop pc as a destination
- * register, so stating the fact costs a consumer nothing and hiding it
- * costs one the ability to see block boundaries at all.
- *
- * TWO THINGS THIS DOES NOT DO.
- *
- * It does not change what the instruction IS.  `branch_type` is the
- * control-flow authority and is not consulted or written here; a page-final
- * `lw` carrying REG_PC is still BRANCH_NONE, and any future coupling of
- * classification to the pc destination is a defect, not a shortcut.
- *
- * It does not turn a publishing row into a refusal.  The seating happens
- * AFTER dst_precheck() has already returned its verdict on the list the
- * walk built, so a row that published before publishes now.  The cost of
- * that order is that the new slot never went through precheck's immediate
- * rules, which is why apply_dst() gives it the all-inputs default rather
- * than the "empty and complete means the encoding" reading: a block-final
- * pc write's constant is the translator's next-PC, not a field of the
- * instruction, and claiming the encoding for it would be a fabrication of
- * exactly the kind #205 and #248 closed.  Where QEMU DOES state a
- * provenance -- a real branch's target registers -- that mask is published
- * unchanged, because it is the machine's answer.
- *
- * Returns the seated slot index, or 0xFF when nothing was seated (QEMU
- * stated no pc write, the wire already carries it, or the slot list is
- * full -- the last of which leaves the tripwire counting, deliberately).
- */
-uint8_t seat_pc_destination(InsnFields *f, InsnRegNames *rn,
-                            const QDepInsn *q)
-{
-    bool stated = false;
-
-    for (uint8_t k = 0; k < q->n_dst; k++) {
-        if (q->dst_reg[k] == REG_PC) {
-            stated = true;
-            break;
-        }
-    }
-    if (!stated) {
-        return 0xFF;
-    }
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        if (f->dst_regs[d] == REG_PC) {
-            return 0xFF;    /* the walk listed it; nothing to add */
-        }
-    }
-    if (f->n_dst_regs >= MAX_DST_REGS) {
-        return 0xFF;        /* counted by g_dst_wire_missing_pc */
-    }
-
-    uint8_t slot = f->n_dst_regs++;
-
-    f->dst_regs[slot] = REG_PC;
-    f->dst_dep_mask[slot] = 0;
-    /*
-     * No lanes.  The pc is scalar, and a scalar destination on a vector
-     * instruction already carries a zero lane mask -- the operand walk only
-     * assigns lanes from vector operands.  This is that same shape, not a
-     * new one, and extr_u64_dst_lane_mask() gates on has_vec_lanes so a
-     * scalar instruction never publishes it at all.
-     */
-    f->dst_lane_mask[slot] = 0;
-    if (rn && rn->dst_qemu_reg_keys) {
-        /*
-         * The same key every walk-built slot carries.  Without it the slot
-         * names a register whose VALUE never reaches the wire, and the
-         * goto_tb override in snap_prev_tail_dsts() -- which stamps the
-         * BB-terminating instruction's pc destination with the successor
-         * this block actually went to -- would have nothing to override.
-         */
-        rn->dst_qemu_reg_keys[slot] = qemu_reg_key_for_generic(REG_PC);
-    }
-    g_dst_pc_seated.fetch_add(1, std::memory_order_relaxed);
-    return slot;
-}
-
-/*
  * Publish the destination family, or say why it was not published.
  *
  * The matching runs HERE and not in note_dst() because it needs
@@ -1467,7 +1379,7 @@ static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
  * mnemonic so the size of the decision is a measurement.
  */
 void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
-               unsigned wstate, const char *why, uint8_t pc_slot)
+               unsigned wstate, const char *why)
 {
     if (wstate != QDEP_OK) {
         if (wstate != QDEP_NONE && wstate != QDEP_NO_BLOCK) {
@@ -1531,22 +1443,7 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
                 .fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (m == 0 && d == pc_slot) {
-            /*
-             * THE SEATED pc SLOT, and it never reaches the encoding rule
-             * below.  That rule reads an empty-and-complete provenance as
-             * "the value is the instruction's own immediate", which is true
-             * of every slot dst_precheck() vetted and false of this one: a
-             * block-final pc write is `movi` of the NEXT PC, a number the
-             * translator computed, not a field anyone decoded.  The format's
-             * own over-approximation is the honest answer -- it claims no
-             * more than "this depends on the instruction's inputs", which
-             * cannot be wrong, where the encoding bit would claim something
-             * specific and false.
-             */
-            m = all_inputs_mask(f);
-            g_dst_pc_default.fetch_add(1, std::memory_order_relaxed);
-        } else if (m == 0) {
+        if (m == 0) {
             /*
              * THE ENCODING.  The provenance is empty and it is COMPLETE --
              * every way it could have been short is a refusal in
@@ -2016,18 +1913,6 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     if (q->writes_unbounded && f->n_dst_regs) {
         g_dst_would_refuse_unbounded.fetch_add(1, std::memory_order_relaxed);
     }
-    /*
-     * R10: seat the terminator's pc write BEFORE the source index is built,
-     * so the new slot's provenance registers are in the prefix every mask
-     * below is written against, and AFTER dst_precheck() so its verdict is
-     * the one the walk's own list earned.  Gated on that verdict because a
-     * refused family never reaches apply_dst()'s mask loop: seating a slot
-     * there would put a name on the wire with nothing to fill it.
-     */
-    uint8_t pc_slot = 0xFF;
-    if (wstate == QDEP_OK) {
-        pc_slot = seat_pc_destination(f, rn, q);
-    }
     {
         uint8_t qregs[MAX_SRC_REGS];
         uint8_t nq = qemu_named_regs(q, qregs, f, wstate == QDEP_OK);
@@ -2074,7 +1959,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
             g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         }
-        apply_dst(f, q, mnem, wstate, wwhy, pc_slot);
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
     }
 
@@ -2204,7 +2089,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         /* No store slot: no store_data_dep[] array exists to write. */
         g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
             .fetch_add(1, std::memory_order_relaxed);
-        apply_dst(f, q, mnem, wstate, wwhy, pc_slot);
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
     }
 
@@ -2270,7 +2155,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
         g_dstate[dstate == QDEP_OK ? QDEP_NO_BLOCK : dstate]
             .fetch_add(1, std::memory_order_relaxed);
-        apply_dst(f, q, mnem, wstate, wwhy, pc_slot);
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
     }
 
@@ -2290,7 +2175,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     }
     g_dstate[dstate].fetch_add(1, std::memory_order_relaxed);
 
-    apply_dst(f, q, mnem, wstate, wwhy, pc_slot);
+    apply_dst(f, q, mnem, wstate, wwhy);
 }
 
 void qdep_report(GString *report)
@@ -2424,28 +2309,29 @@ void qdep_report(GString *report)
         g_string_append_printf(report,
             "\n  the wire's destination LIST against QEMU's writes, on the\n"
             "  rows above that PUBLISHED (the direction dst_precheck does not\n"
-            "  cover -- `dst_regs[]` is otherwise the operand walk's, and a\n"
-            "  mask seated on QEMU's coordinates does not change that):\n"
+            "  cover -- `dst_regs[]` is the operand walk's, and a mask seated\n"
+            "  on QEMU's coordinates does not change that):\n"
             "  %10" G_GUINT64_FORMAT "  QEMU wrote REG_PC and the wire's list does not"
             " carry it\n"
-            "              (MUST BE 0 since R10 -- the terminator's pc write is"
-            " seated as a\n"
-            "               destination; a row here means the slot list was"
-            " already full)\n"
+            "              (CORRECT BY CONTRACT per R10.1, NOT a must-be-0: a"
+            " translation\n"
+            "               block ends by writing the pc and QEMU charges that"
+            " write to\n"
+            "               whichever instruction was last, so this is the"
+            " BLOCK's write,\n"
+            "               not an ISA-defined one -- excluded per R1/R2/J2.3."
+            "  ISA-defined\n"
+            "               pc writers carry REG_PC from the operand walk and"
+            " are not here.\n"
+            "               The count moves with argv length, which is the"
+            " proof it is an\n"
+            "               artifact; the per-row adjudication is on the wire's"
+            " branch_type)\n"
             "  %10" G_GUINT64_FORMAT "  QEMU wrote some OTHER named register the wire"
             " does not carry\n"
             "              (MUST BE 0 -- a destination the machine writes and"
             " the wire\n"
-            "               does not name)\n"
-            "  %10" G_GUINT64_FORMAT "  REG_PC destinations SEATED by R10 (the gain"
-            " leg, on the wire)\n"
-            "  %10" G_GUINT64_FORMAT "  of those, mask = the all-inputs default"
-            " because QEMU stated no\n"
-            "              provenance (a translator-computed next-PC is not"
-            " the encoding)\n",
-            pc_only, other,
-            g_dst_pc_seated.load(std::memory_order_relaxed),
-            g_dst_pc_default.load(std::memory_order_relaxed));
+            "               does not name)\n", pc_only, other);
         if (other) {
             dump_tally(report, g_dst_wire_missing,
                        "  by mnemonic and register:");

@@ -101,22 +101,55 @@ def find_plugin(build_dir: Path) -> Path:
 _NO_SUCH_PLUGIN = "/nonexistent-plugin-that-cannot-load.so"
 
 
-def _candidates(build_dir: Path) -> list[tuple[str, list[str]]]:
-    """(name, argv-prefix) for every binary in @build_dir that might load a
-    plugin; the plugin path is appended by the caller.  Deliberately
-    permissive — :func:`_usable` is what decides, by measurement."""
-    out: list[tuple[str, list[str]]] = []
-    for q in sorted(glob.glob(str(build_dir / "qemu-system-*"))):
-        if os.path.isfile(q) and os.access(q, os.X_OK):
-            out.append((os.path.basename(q),
-                        [q, "-M", "none", "-display", "none",
-                         "-monitor", "none", "-serial", "none",
-                         "-no-user-config", "-plugin"]))
+def _emulator_names(build_dir: Path) -> list[str]:
+    """The emulators THIS build configured, from meson's per-target
+    ``<exe>_tls_guard.ok`` markers.
+
+    The markers are the build's own statement of its target list, which a
+    glob over ``build/`` is not: a glob also matches ``qemu-img`` and any
+    binary somebody copied aside, and it says nothing about which targets
+    were configured.  The glob remains as the fallback for a tree with no
+    markers (non-Linux hosts skip the guard), and the caller treats an
+    empty result as a failure -- a set that cannot be established is not
+    an empty set.
+    """
+    names = [os.path.basename(m)[: -len("_tls_guard.ok")]
+             for m in sorted(glob.glob(str(build_dir / "*_tls_guard.ok")))]
+    if names:
+        return names
+    out = []
     for q in sorted(glob.glob(str(build_dir / "qemu-*"))):
         b = os.path.basename(q)
-        if b.startswith("qemu-system-") or "." in b:
+        if "." in b or b in _NOT_EMULATORS:
             continue
-        if os.path.isfile(q) and os.access(q, os.X_OK):
+        out.append(b)
+    return out
+
+
+#: build/ holds tools next to the emulators, and only the emulators load
+#: plugins.  Used only on the marker-less fallback path.
+_NOT_EMULATORS = {
+    "qemu-img", "qemu-io", "qemu-nbd", "qemu-edid", "qemu-ga", "qemu-keymap",
+    "qemu-pr-helper", "qemu-vmsr-helper", "qemu-bridge-helper",
+    "qemu-storage-daemon", "qemu-trace-stap",
+}
+
+
+def _candidates(build_dir: Path) -> list[tuple[str, list[str]]]:
+    """(name, argv-prefix) for every emulator in @build_dir; the plugin path
+    is appended by the caller.  Deliberately permissive about the argv —
+    the control arm in :func:`check` is what decides a binary is usable,
+    by measurement."""
+    out: list[tuple[str, list[str]]] = []
+    for b in _emulator_names(build_dir):
+        q = str(build_dir / b)
+        if not (os.path.isfile(q) and os.access(q, os.X_OK)):
+            continue
+        if b.startswith("qemu-system-"):
+            out.append((b, [q, "-M", "none", "-display", "none",
+                            "-monitor", "none", "-serial", "none",
+                            "-no-user-config", "-plugin"]))
+        else:
             out.append((b, [q, "-plugin"]))
     return out
 
@@ -149,7 +182,7 @@ def _tail(argv: list[str], plugin: str) -> list[str]:
 
 
 def check(build_dir: Path, label: str = "",
-          max_probes: int = 2) -> tuple[bool, list[str]]:
+          max_probes: int = 0) -> tuple[bool, list[str]]:
     """(ok, lines).  False when the plugin in @build_dir cannot be loaded, or
     when the question could not be asked — an unaskable question is a
     failure here, never a pass."""
@@ -166,8 +199,17 @@ def check(build_dir: Path, label: str = "",
     ok = True
     used = 0
     rejected: list[str] = []
+    # EVERY emulator, not a sample of two.  The sample was the hole: a
+    # plugin API change moves QEMU_PLUGIN_VERSION, `ninja contrib-plugins`
+    # rebuilds the plugin and no emulator, and the binaries that were NOT
+    # rebuilt refuse the plugin -- but two probes out of sixty-two can
+    # easily land on the two that happen to be current.  Two commits
+    # shipped exactly that way (plugin API v25 against v24 binaries).
+    # Sixty-two probes with their control arms cost about four seconds and
+    # the result is memoised per plugin build, so the sample bought
+    # nothing it was worth being wrong for.
     for name, pre in _candidates(build_dir):
-        if used >= max_probes:
+        if max_probes and used >= max_probes:
             break
         # CONTROL ARM.  A binary that does not report a load failure for a
         # plugin that does not exist cannot report one for a plugin that

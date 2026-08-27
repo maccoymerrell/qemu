@@ -129,8 +129,24 @@ uint64_t g_n_row_missing;      /* id carried, no row -- STALE TABLE */
 uint64_t g_n_name_mismatch;    /* row found, name disagrees -- STALE TABLE */
 uint64_t g_n_scored;           /* row found and name agreed */
 uint64_t g_tier_seen[4];
-uint64_t g_op_agree, g_op_disagree;
-uint64_t g_br_agree, g_br_disagree;
+/*
+ * TWO Capstone-side accounts of the same instruction, and the difference
+ * between them is the whole point of scoring both:
+ *
+ *   _tbl  the mnemonic TABLE row `info->insn_id` indexes.  That row is the
+ *         INPUT to decode_detail_to_generic()'s per-instance refiners, so
+ *         on every family a refiner touches it is not what any trace says.
+ *   _wire what decode_detail_to_generic() ANSWERED for this instruction --
+ *         the value the tracer publishes.  This is the account a claim
+ *         about a wire defect has to be made against.
+ *
+ * The `_tbl` pair was the only one scored until the four-ISA audit was
+ * asked to adjudicate a refiner-touched family and could not.
+ */
+uint64_t g_op_agree, g_op_disagree;          /* wire */
+uint64_t g_br_agree, g_br_disagree;          /* wire */
+uint64_t g_op_agree_tbl, g_op_disagree_tbl;  /* pre-refinement table row */
+uint64_t g_br_agree_tbl, g_br_disagree_tbl;
 uint64_t g_op_row_unknown;     /* row says GEN_OP_UNKNOWN: nothing to check */
 uint64_t g_br_row_unknown;     /* same row, same reason, branch class */
 
@@ -473,8 +489,10 @@ GHashTable *g_rows_hit;        /* id -> (gpointer)1 */
  * a shipped run needs. */
 GHashTable *g_id_to_caps;      /* qemu id   -> GHashTable of capstone ids */
 GHashTable *g_cap_to_ids;      /* cap id    -> GHashTable of qemu ids */
-GHashTable *g_opsig;           /* signature -> count */
+GHashTable *g_opsig;           /* signature -> count (wire) */
 GHashTable *g_brsig;
+GHashTable *g_opsig_tbl;       /* same, scored against the table row */
+GHashTable *g_brsig_tbl;
 GHashTable *g_stalesig;
 
 void tally(GHashTable **t, const char *key)
@@ -866,7 +884,8 @@ void qemu_ident_note_length(uint64_t pc, uint8_t qlen, uint8_t caplen,
 }
 
 void qemu_ident_note(const struct qemu_plugin_insn *insn,
-                     const qemu_plugin_insn_info *info)
+                     const qemu_plugin_insn_info *info,
+                     const InsnFields *wire)
 {
     /*
      * The pair census runs with no table: it is how the FIRST table for a
@@ -969,20 +988,39 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
          * the enumerated-zero shape in reverse: a number that is large for
          * a reason having nothing to do with what it claims to measure.
          */
+        uint8_t cap_op = wire ? wire->opcode : c->opcode;
         if (row->cls.opcode == GEN_OP_UNKNOWN) {
             g_op_row_unknown++;
-        } else if (row->cls.opcode == c->opcode) {
-            g_op_agree++;
         } else {
-            g_op_disagree++;
-            if (g_detail) {
-                char sig[224];
-                g_snprintf(sig, sizeof(sig), "%-34s qemu=%-18s cap=%-18s (%s)",
-                           row->name,
-                           generic_opcode_name_or_unknown(row->cls.opcode),
-                           generic_opcode_name_or_unknown(c->opcode),
-                           info->mnemonic);
-                tally(&g_opsig, sig);
+            if (row->cls.opcode == cap_op) {
+                g_op_agree++;
+            } else {
+                g_op_disagree++;
+                if (g_detail) {
+                    char sig[224];
+                    g_snprintf(sig, sizeof(sig),
+                               "%-34s qemu=%-18s wire=%-18s (%s)",
+                               row->name,
+                               generic_opcode_name_or_unknown(row->cls.opcode),
+                               generic_opcode_name_or_unknown(cap_op),
+                               info->mnemonic);
+                    tally(&g_opsig, sig);
+                }
+            }
+            if (row->cls.opcode == c->opcode) {
+                g_op_agree_tbl++;
+            } else {
+                g_op_disagree_tbl++;
+                if (g_detail) {
+                    char sig[224];
+                    g_snprintf(sig, sizeof(sig),
+                               "%-34s qemu=%-18s captbl=%-18s (%s)",
+                               row->name,
+                               generic_opcode_name_or_unknown(row->cls.opcode),
+                               generic_opcode_name_or_unknown(c->opcode),
+                               info->mnemonic);
+                    tally(&g_opsig_tbl, sig);
+                }
             }
         }
         /*
@@ -995,20 +1033,39 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
          * happened is that decode_insn16/jalr is a SPLIT row and the
          * rule genuinely does not say which of the three it is.
          */
+        uint8_t cap_bt = wire ? wire->branch_type : c->branch_type;
         if (row->cls.opcode == GEN_OP_UNKNOWN) {
             g_br_row_unknown++;
-        } else if (row->cls.branch_type == c->branch_type) {
-            g_br_agree++;
         } else {
-            g_br_disagree++;
-            if (g_detail) {
-                char sig[224];
-                g_snprintf(sig, sizeof(sig), "%-34s qemu=%-18s cap=%-18s (%s)",
-                           row->name,
-                           branch_type_name_or_unknown(row->cls.branch_type),
-                           branch_type_name_or_unknown(c->branch_type),
-                           info->mnemonic);
-                tally(&g_brsig, sig);
+            if (row->cls.branch_type == cap_bt) {
+                g_br_agree++;
+            } else {
+                g_br_disagree++;
+                if (g_detail) {
+                    char sig[224];
+                    g_snprintf(sig, sizeof(sig),
+                               "%-34s qemu=%-18s wire=%-18s (%s)",
+                               row->name,
+                               branch_type_name_or_unknown(row->cls.branch_type),
+                               branch_type_name_or_unknown(cap_bt),
+                               info->mnemonic);
+                    tally(&g_brsig, sig);
+                }
+            }
+            if (row->cls.branch_type == c->branch_type) {
+                g_br_agree_tbl++;
+            } else {
+                g_br_disagree_tbl++;
+                if (g_detail) {
+                    char sig[224];
+                    g_snprintf(sig, sizeof(sig),
+                               "%-34s qemu=%-18s captbl=%-18s (%s)",
+                               row->name,
+                               branch_type_name_or_unknown(row->cls.branch_type),
+                               branch_type_name_or_unknown(c->branch_type),
+                               info->mnemonic);
+                    tally(&g_brsig_tbl, sig);
+                }
             }
         }
     }
@@ -1258,12 +1315,22 @@ void qemu_ident_report(GString *report)
         g_tier_seen[QID_NAME_MATCHED], g_tier_seen[QID_NONE]);
 
     g_string_append_printf(report,
+        "  scored against the WIRE -- decode_detail_to_generic()'s answer, "
+        "which is what a trace carries:\n"
         "  opcode     agree %10" PRIu64 "   disagree %10" PRIu64
         "   row unclassified %" PRIu64 "\n"
         "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64
-        "   row unclassified %" PRIu64 "\n",
+        "   row unclassified %" PRIu64 "\n"
+        "  scored against the pre-refinement mnemonic TABLE ROW -- the "
+        "INPUT to those refiners, published nowhere.  A row where the two "
+        "accounts differ is a row a refiner rewrote, and only the WIRE "
+        "figure above can adjudicate it:\n"
+        "  opcode     agree %10" PRIu64 "   disagree %10" PRIu64 "\n"
+        "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64 "\n",
         g_op_agree, g_op_disagree, g_op_row_unknown,
-        g_br_agree, g_br_disagree, g_br_row_unknown);
+        g_br_agree, g_br_disagree, g_br_row_unknown,
+        g_op_agree_tbl, g_op_disagree_tbl,
+        g_br_agree_tbl, g_br_disagree_tbl);
 
     if (!g_detail) {
         g_string_append_printf(report,
@@ -1279,6 +1346,10 @@ void qemu_ident_report(GString *report)
     fanout(report, g_cap_to_ids, "distinct QEMU patterns per Capstone id");
 
     dump_tally(report, g_stalesig,  "staleness signatures", 16);
-    dump_tally(report, g_opsig,     "opcode disagreements", 24);
-    dump_tally(report, g_brsig,     "branch-type disagreements", 24);
+    dump_tally(report, g_opsig,     "opcode disagreements (vs WIRE)", 24);
+    dump_tally(report, g_brsig,     "branch-type disagreements (vs WIRE)", 24);
+    dump_tally(report, g_opsig_tbl,
+               "opcode disagreements (vs pre-refinement table row)", 24);
+    dump_tally(report, g_brsig_tbl,
+               "branch-type disagreements (vs pre-refinement table row)", 24);
 }

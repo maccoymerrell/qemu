@@ -29,9 +29,20 @@ unsigned qemu_ident_install(TraceISA isa);
  * One translated instruction.  Reads the identity QEMU exported for it,
  * finds the row, and scores the row against what Capstone said about the
  * same bytes.  Translation time only, reads only, cannot reach the wire.
+ *
+ * @wire is the classification the TRACER would PUBLISH for this
+ * instruction -- decode_detail_to_generic()'s answer, after the per-
+ * instance refiners.  It is a separate argument from @info because the
+ * mnemonic table row @info->insn_id indexes is the input to those
+ * refiners, not their result: on every family a refiner touches (aarch64
+ * `b` vs `b.<cc>`, mips `jr $ra`, `mfhi`/`mflo`, the x86 call-branch
+ * callback) the row and the wire hold DIFFERENT values, and a comparison
+ * against the row alone can neither confirm nor deny a wire defect there.
+ * Both are scored, and the report names which is which.
  */
 void qemu_ident_note(const struct qemu_plugin_insn *insn,
-                     const qemu_plugin_insn_info *info);
+                     const qemu_plugin_insn_info *info,
+                     const InsnFields *wire);
 
 /*
  * One translated instruction, LENGTH arm.  Independent of the identity

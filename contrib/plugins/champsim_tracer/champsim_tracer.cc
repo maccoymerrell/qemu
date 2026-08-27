@@ -10808,16 +10808,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         if (canonical_first[i]) {
             struct qemu_plugin_insn *qi = qemu_plugin_tb_get_insn(tb, i);
             uint32_t c = canonical_index[i];
-            qemu_ident_note(qi, &insn_info[c]);
             qnames[c] = qemu_plugin_insn_decode_name(qi);
 
             /*
-             * The branch arm needs the class the TRACER would publish, which
-             * is decode_detail_to_generic's answer and not the mnemonic
-             * table's raw row -- the per-instance alias repairs (riscv jal
-             * vs j, aarch64 b vs b.<cc>, mips jr $ra) are exactly the rows
-             * where the two accounts are worth comparing, so scoring the
-             * unrepaired row would be scoring a strawman.
+             * BOTH arms need the class the TRACER would publish, which is
+             * decode_detail_to_generic's answer and not the mnemonic table's
+             * raw row -- the per-instance alias repairs (riscv jal vs j,
+             * aarch64 b vs b.<cc>, mips jr $ra) are exactly the rows where
+             * the two accounts are worth comparing, so scoring the
+             * unrepaired row alone would be scoring a strawman.  It is
+             * computed BEFORE qemu_ident_note for that reason: the identity
+             * arm used to read the unrepaired row and could therefore
+             * neither confirm nor deny a wire defect in any refiner-touched
+             * family.
              */
             /* Heap-backed: an InsnFieldsScratch in STATIC TLS overruns
              * glibc's dlopen surplus and the .so stops loading. */
@@ -10833,6 +10836,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             decode_detail_to_generic(insn_pcs[c], &insn_info[c], &bt_s->f,
                                      nullptr);
             g_unknown_warn_suppressed = false;
+            qemu_ident_note(qi, &insn_info[c], &bt_s->f);
             qemu_ident_note_ctrl(qi, &insn_info[c], bt_s->f.branch_type,
                                  qnames[c], insn_pcs[c], insn_sizes[c]);
         }

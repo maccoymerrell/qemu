@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 7
+#define QEMU_PLUGIN_DATAFLOW_VERSION 8
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -137,6 +137,52 @@ QEMU_PLUGIN_API
 const char *qemu_plugin_dataflow_reg_name(unsigned reg,
                                           uint32_t *env_offset,
                                           uint32_t *size);
+
+/*
+ * True when @reg is the SELECTOR of a lowered register's representation --
+ * a global that says how the register's OTHER globals are to be read, and
+ * that carries no part of the architectural value.
+ *
+ * x86 declares one, cc_op.  QEMU does not keep EFLAGS: it keeps cc_op,
+ * cc_dst, cc_src and cc_src2, and the architectural value is a function of
+ * the four.  Three hold operands and results and ARE the flags an
+ * instruction writes; cc_op holds which function to apply.
+ *
+ * A consumer that reads every write as an architectural fact therefore sees
+ * `ja` define EFLAGS -- materialising the flags for its own test writes
+ * cc_op -- when `ja` writes no flag the ISA defines.  The distinction is not
+ * recoverable from the ops (a selector is written with a constant, and so is
+ * `mov $5,%rax`'s destination) and not recoverable from a mnemonic without
+ * asking a disassembler, which is the thing this interface exists to stop
+ * asking.  The target states it beside the global it creates.
+ *
+ * false for every register on a target that declares none, which is every
+ * target but x86 today -- AArch64, RISC-V and MIPS lower their condition
+ * state eagerly and have no selector to declare.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_reg_is_repr_selector(unsigned reg);
+
+/*
+ * Did an emitter state that a write to @reg on this instruction SUPPLIES a
+ * value -- put something in the register that did not come out of it?
+ *
+ * The question only has content for a LOWERED register, one architectural
+ * name spread over several TCG globals.  There, a write whose whole
+ * provenance is the register's own globals is a change of representation:
+ * x86 recomputes EFLAGS from cc_op/cc_dst/cc_src/cc_src2 into cc_src, which
+ * is why `jcc` looks like a flags writer and is not one.  `clc` then does
+ * the same thing and clears CF with a translator constant, and provenance --
+ * a union over the writes -- cannot tell the pair apart.  So the emitter
+ * that supplied the constant says so and this reports it.
+ *
+ * false when @reg is not a register this instruction wrote, and false when
+ * no emitter has said anything, which is the answer that keeps a consumer
+ * publishing what it already published.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_write_supplies_value(const struct qemu_plugin_tb *tb,
+                                           size_t idx, unsigned reg);
 
 /*
  * Register sets, copied into @words as a bitmap of @nwords 64-bit words.

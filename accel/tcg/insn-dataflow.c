@@ -133,6 +133,7 @@
  * a source that goes missing, which is the direction this file may not take.
  */
 #define DF_MAX_PRESERVE_NOTES 1024
+#define DF_MAX_VALUE_NOTES    1024
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -551,6 +552,15 @@ struct InsnDataflowScratch {
     unsigned n_preserve;
     bool preserve_overflow;
 
+    /*
+     * The (temp, op-range) pairs an emitter marked as SUPPLYING a value --
+     * the same note shape as the preserve half above and read the same way.
+     * See insn_dataflow_note_supplied_value().
+     */
+    DfPreserveNote value[DF_MAX_VALUE_NOTES];
+    unsigned n_value;
+    bool value_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -601,6 +611,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_preserve         (df->preserve)
 #define df_n_preserve       (df->n_preserve)
 #define df_preserve_overflow (df->preserve_overflow)
+#define df_value            (df->value)
+#define df_n_value          (df->n_value)
+#define df_value_overflow   (df->value_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -1108,10 +1121,19 @@ static const uint64_t *df_written_prov(const InsnDataflow *d, unsigned reg)
     return NULL;
 }
 
-static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
+static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
+                         bool supplies_value)
 {
     for (unsigned i = 0; i < d->n_writes; i++) {
         if (d->writes[i].reg == reg) {
+            /*
+             * STICKY, and the OR is the point.  A register written twice --
+             * once by a lowering that only re-expressed it and once by an
+             * emitter that put a new value in -- has had a value put in it,
+             * and the union of the two provenances cannot say so.  x86's
+             * `clc` is exactly that pair.
+             */
+            d->writes[i].supplies_value |= supplies_value;
             df_or(d->writes[i].prov, prov);
             return;
         }
@@ -1121,6 +1143,7 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
         return;
     }
     d->writes[d->n_writes].reg = (uint8_t)reg;
+    d->writes[d->n_writes].supplies_value = supplies_value;
     memcpy(d->writes[d->n_writes].prov, prov, sizeof(d->writes[0].prov));
     d->n_writes++;
 }
@@ -1197,6 +1220,8 @@ void insn_dataflow_note_reset(void)
     df_zero_overflow = false;
     df_n_preserve = 0;
     df_preserve_overflow = false;
+    df_n_value = 0;
+    df_value_overflow = false;
     df_n_fold = 0;
     df_fold_overflow = false;
     df_n_imm = 0;
@@ -1683,6 +1708,34 @@ static bool df_preserve_read(const void *ts, const TCGOp *op)
                 return true;
             }
             if (o == df_preserve[i].end) {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Did an emitter mark the write this op performs as SUPPLYING a value?
+ * The same lookup as df_preserve_read() and for the same reason: an
+ * emitter's write can expand into several ops and only the range names it.
+ */
+static bool df_supplied_value(const void *ts, const TCGOp *op)
+{
+    for (unsigned i = df_n_value; i-- > 0; ) {
+        const TCGOp *o;
+        unsigned n;
+
+        if (df_value[i].ts != ts) {
+            continue;
+        }
+        o = df_value[i].mark ? QTAILQ_NEXT(df_value[i].mark, link)
+                             : QTAILQ_FIRST(&tcg_ctx->ops);
+        for (n = 0; o != NULL && n < 64; o = QTAILQ_NEXT(o, link), n++) {
+            if (o == op) {
+                return true;
+            }
+            if (o == df_value[i].end) {
                 break;
             }
         }
@@ -2225,7 +2278,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
                 if (df_reg(ts, &idx)) {
                     df_bit(d->wr, idx);
-                    df_add_write(d, idx, prov);
+                    df_add_write(d, idx, prov, df_supplied_value(ts, op));
                 } else {
                     size_t ti = ts - s->temps;
 
@@ -2438,7 +2491,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
             if (df_reg(ts, &idx)) {
                 df_bit(d->wr, idx);
-                df_add_write(d, idx, prov);
+                df_add_write(d, idx, prov, df_supplied_value(ts, op));
             } else {
                 size_t ti = ts - s->temps;
                 uint64_t *dp = df_prov_of(ti);
@@ -2686,6 +2739,36 @@ void insn_dataflow_note_preserve_read(const void *ts, const void *mark)
     df_preserve[df_n_preserve].mark = mark;
     df_preserve[df_n_preserve].end = op;
     df_n_preserve++;
+}
+
+/*
+ * The supplied-value half.  See insn_dataflow_note_supplied_value() in the
+ * header for the one shape it exists for, and for why its absence is the
+ * dangerous direction rather than the safe one.
+ */
+void insn_dataflow_note_supplied_value(const void *ts, const void *mark)
+{
+    const TCGOp *op;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_value >= DF_MAX_VALUE_NOTES) {
+        df_value_overflow = true;
+        return;
+    }
+    op = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_value; i-- > 0; ) {
+        if (df_value[i].ts == ts && df_value[i].end == op) {
+            return;
+        }
+        break;
+    }
+    df_value[df_n_value].ts = ts;
+    df_value[df_n_value].mark = mark;
+    df_value[df_n_value].end = op;
+    df_n_value++;
 }
 
 /*
@@ -3329,6 +3412,53 @@ void insn_dataflow_declare_regfile(const char *base, const char *const *names,
         .base = base, .names = names, .off = off,
         .stride = n > 1 ? stride : elem, .elem = elem, .n = n,
     };
+}
+
+/*
+ * THE REPRESENTATION SELECTORS.  See insn_dataflow_declare_repr_selector()
+ * in the header for what one is and why the target has to say so.
+ *
+ * Kept as env OFFSETS rather than TCGTemp pointers: the temps belong to a
+ * TCGContext and the declaration is made once at target init, while the
+ * question is asked per translation from whichever context is current.  The
+ * offset is the identity every other declaration in this file uses.
+ */
+static uint32_t df_selector[INSN_DF_MAX_SELECTORS];
+static unsigned df_n_selector;
+
+void insn_dataflow_declare_repr_selector(const void *ts)
+{
+    const TCGTemp *t = ts;
+    uint32_t off;
+
+    if (t == NULL || t->kind != TEMP_GLOBAL) {
+        return;
+    }
+    off = (uint32_t)t->mem_offset;
+    for (unsigned i = 0; i < df_n_selector; i++) {
+        if (df_selector[i] == off) {
+            return;                 /* the same declaration twice */
+        }
+    }
+    if (df_n_selector >= INSN_DF_MAX_SELECTORS) {
+        return;
+    }
+    df_selector[df_n_selector++] = off;
+}
+
+bool insn_dataflow_reg_is_repr_selector(unsigned i)
+{
+    uint32_t off;
+
+    if (df_n_selector == 0 || !insn_dataflow_reg_name(i, &off, NULL)) {
+        return false;
+    }
+    for (unsigned k = 0; k < df_n_selector; k++) {
+        if (df_selector[k] == off) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool insn_dataflow_field_reg(uint32_t off, uint32_t size,

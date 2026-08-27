@@ -597,6 +597,30 @@ Decode by repeated outer-section unwrapping.
         the value is the encoding, and the mask carries the immediate
         bit, counted in its own row of that census.
 
+        A LOWERED REGISTER IS READ THROUGH THE EMULATOR'S OWN
+        STATEMENT OF ITS REPRESENTATION.  Where one architectural
+        register lives in several TCG globals — x86-64 keeps no
+        ``EFLAGS`` at all, only ``cc_op``, ``cc_dst``, ``cc_src`` and
+        ``cc_src2``, of which the architectural value is a function —
+        a write is only a destination when it changes the VALUE.  Two
+        shapes are therefore not destinations.  A write to the global
+        the target declared the representation's SELECTOR carries no
+        part of the value; and a write whose whole provenance lies
+        inside the register's own globals re-expresses the value
+        rather than producing one, which is what materialising the
+        flags for a test does.  So a conditional jump, a conditional
+        move and a ``setcc`` publish ``REG_FLAGS`` as a SOURCE and
+        carry no flags destination, which is what the ISA defines them
+        to do, and ``inc`` publishes the flags it writes without
+        naming them among their own inputs — the carry it preserves is
+        not a source, because the instruction does not take it as one.
+        An emitter that puts a value into an already-materialised
+        representation says so (``clc`` clears CF with a translator
+        constant), and that statement outranks the shape.  Both
+        populations are counted in the same census, and a register the
+        wire names as a destination whose every write these rules
+        struck is a must-be-0 row rather than a short mask.
+
         Two consequences are visible on the wire.  On x86-64 a
         RIP-relative access names ``REG_PC`` in its address mask, and
         does so however the block was translated.  The value is the

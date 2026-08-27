@@ -483,6 +483,19 @@ struct QDepInsn {
      */
     uint8_t dst_dep_imm[QDEP_MAX_DST];
     /*
+     * Generic registers whose EVERY stated write was a change of
+     * representation, so no destination row exists for them (#265).
+     *
+     * Kept because the ABSENCE of a row is only correct while the wire does
+     * not name the register either.  If it does, the interpretation has
+     * struck out the only thing that could have filled the slot and the
+     * family refuses -- which is a bounded, counted loss and a must-be-0,
+     * not a silent short mask.  Without this list the refusal would be
+     * indistinguishable from a register QEMU never mentioned.
+     */
+    uint8_t n_repr_only;
+    uint8_t repr_only[QDEP_MAX_DST];
+    /*
      * And the two facts that say whether a NO above is an answer.
      *
      * @imm_stated: a decoder on this instruction's path named its encoded

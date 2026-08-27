@@ -3951,6 +3951,23 @@ void tcg_x86_init(void)
                                      "cc_src2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
 
+    /*
+     * cc_op is the SELECTOR of the lazy-flag representation, not a piece of
+     * the flags.  cc_dst, cc_src and cc_src2 hold the operands and results
+     * that EFLAGS is computed FROM, and are therefore how an instruction
+     * that architecturally writes flags states what it wrote; cc_op holds
+     * which computation to apply, which is this emulator's bookkeeping and
+     * no part of the architectural value.
+     *
+     * Said here, and only here, because nothing downstream can tell: the
+     * write is `mov cc_op, <const>`, and so is `mov $5,%rax`'s.  Only the
+     * code that chose the lowering knows which of the two carries a value.
+     * Without this statement `ja` -- which writes NO flag the ISA defines --
+     * arrives at a consumer as an EFLAGS producer, because materialising the
+     * flags for its own test writes cc_op.
+     */
+    insn_dataflow_declare_repr_selector(tcgv_i32_temp(cpu_cc_op));
+
     for (i = 0; i < CPU_NB_REGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
                                          offsetof(CPUX86State, regs[i]),

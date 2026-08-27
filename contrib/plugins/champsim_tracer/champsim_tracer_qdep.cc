@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <array>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -48,6 +49,28 @@ const char           *g_refusal = nullptr;
 unsigned              g_nregs = 0;
 unsigned              g_prov_words = 0;
 std::vector<uint8_t>  g_gen_of_reg;      /* TCG global index -> GenericRegId */
+/*
+ * THE LOWERED-REGISTER MAP -- the two facts the lazy-flag interpretation
+ * needs, both read off QEMU once at init (#265/#184).
+ *
+ * @g_reg_is_selector: QEMU declared this global the SELECTOR of a lowered
+ * register's representation (insn_dataflow_declare_repr_selector).  x86's
+ * cc_op is the one on file: it says WHICH function computes EFLAGS from
+ * cc_dst/cc_src/cc_src2 and holds no part of the value.  The target states
+ * it because nothing downstream can tell -- the write is a constant store,
+ * and so is `mov $5,%rax`'s.
+ *
+ * @g_gen_nglobals: how many globals fold to each generic register.  Two or
+ * more means the register is LOWERED: several globals stand for one
+ * architectural name, and a write from one of them to another moves the
+ * value between representations rather than changing it.  One means the
+ * register has a single home, where a write naming itself is an ACCUMULATE
+ * (#228) and must keep its edge.  The count is what separates
+ * `jl` (cc_src <- cc_src) from `add %rax,%rax` (rax <- rax), and it is a
+ * property of QEMU's lowering, not of any mnemonic.
+ */
+std::vector<uint8_t>  g_reg_is_selector;
+std::array<uint16_t, REG_ID_COUNT> g_gen_nglobals{};
 
 /* Census.  Indexed by QDepState; every extracted instruction lands in
  * exactly one bucket per family, so each column sums to the instructions
@@ -198,6 +221,42 @@ std::atomic<uint64_t> g_dst_imm_absent{0};
  * before they reach here: see dst_precheck().
  */
 std::atomic<uint64_t> g_dst_accum{0};
+/*
+ * THE LAZY-FLAG INTERPRETATION, counted in the three directions it can go
+ * (#265/#184).  x86 materialises EFLAGS on demand: an instruction that only
+ * READS flags still writes cc_op, and re-expresses cc_src through the
+ * compute helper, so QEMU's write list named REG_FLAGS on 111 `jcc`, 6
+ * `cmov` and 2 `setcc` PCs that write no flag the ISA defines.  Those rows
+ * were the whole of the `_other` MUST-BE-0.
+ *
+ * @g_dst_repr_selector: writes to a declared SELECTOR, skipped.  R10.1's
+ * category reached from the register side: emulator bookkeeping is not
+ * architectural information.
+ *
+ * @g_dst_repr_change: writes struck as a CHANGE OF REPRESENTATION -- the
+ * destination is a lowered register and the write's whole provenance is
+ * inside that register's own set of globals.  A value re-expressed, not a
+ * value produced.  This is also where R7.1 lands `inc`'s preserved CF: the
+ * `cc_src <- cc_src` that carries it is this shape, so FLAGS stops appearing
+ * in its own destination mask, which R7.1 says it never should have.
+ *
+ * @g_dst_repr_refused: the direction that would be a LOSS, so it is a
+ * must-be-0 rather than a number to admire.  Every QEMU write to a register
+ * the WIRE names as a destination was struck above, so the row vanished and
+ * the family refuses (QDEP_R_DST_UNNAMED) rather than publishing.  The shape
+ * that would land here is `stc`/`clc`/`cmc`: materialise, then set one bit
+ * with a translator constant that no note distinguishes from the
+ * materialisation's own inputs.  It has no subject in the corpus; the
+ * coverage path is a QEMU-side note at those emitters saying the write
+ * SUPPLIES a value, which is the same shape #205 and #230 used.
+ */
+std::atomic<uint64_t> g_dst_repr_selector{0};
+std::atomic<uint64_t> g_dst_repr_change{0};
+std::atomic<uint64_t> g_dst_repr_refused{0};
+GHashTable *g_dst_repr_sig = nullptr;       /* "mnem  REG" -> count */
+GHashTable *g_dst_repr_refused_sig = nullptr;
+/* The lowered registers this target has: generic name -> global count. */
+GHashTable *g_lowered_reg = nullptr;
 /*
  * THE #236 FLIP'S REFUSE ROUTE, COUNTED BEFORE THE FLIP EXISTS.
  *
@@ -421,7 +480,86 @@ void qdep_init(void)
             g_gen_of_reg[i] = gen;
         }
     }
+    /*
+     * The lowered-register map, read off QEMU once (#265).  Both halves are
+     * QEMU's answers: which globals it declared SELECTORS, and how many of
+     * them fold to one architectural name.  Nothing here consults a
+     * mnemonic, an opcode taxonomy or a decoder -- J7 and R12 forbid keying
+     * this decision on any of them, and the shape does not need one.
+     */
+    g_reg_is_selector.assign(g_nregs, 0);
+    g_gen_nglobals.fill(0);
+    for (unsigned i = 0; i < g_nregs; i++) {
+        if (qemu_plugin_dataflow_reg_is_repr_selector(i)) {
+            g_reg_is_selector[i] = 1;
+        }
+        if (g_gen_of_reg[i] < REG_ID_COUNT) {
+            g_gen_nglobals[g_gen_of_reg[i]]++;
+        }
+    }
+    /*
+     * The lowered registers this target actually has, tallied so the
+     * interpretation's SUBJECT is a measurement on every ISA and not an
+     * x86 assumption.  A zero in the change-of-representation counter means
+     * something only when this list is non-empty: aarch64 lowers NZCV onto
+     * four globals exactly as x86 lowers EFLAGS onto four, and its zero is
+     * therefore the negative control -- the rule is live there and does not
+     * fire, because ARM's flag writes carry values.
+     */
+    for (unsigned g = 0; g < REG_ID_COUNT; g++) {
+        if (g_gen_nglobals[g] >= 2) {
+            char *k = g_strdup_printf("%-12s %u globals",
+                                      generic_reg_name_or_unknown((uint8_t)g),
+                                      (unsigned)g_gen_nglobals[g]);
+            tally(&g_lowered_reg, k);
+            g_free(k);
+        }
+    }
     g_live = true;
+}
+
+/*
+ * Is this write a CHANGE OF REPRESENTATION rather than a value?
+ *
+ * True when the destination is a LOWERED register -- two or more TCG globals
+ * fold to its one architectural name -- and the write's whole provenance is
+ * inside that same name.  x86's `gen_compute_eflags()` is the shape: it
+ * computes EFLAGS from cc_op/cc_dst/cc_src/cc_src2 and puts the answer back
+ * in cc_src, so the value is re-expressed and not changed, and QEMU's own
+ * dump measures it clean (106 such writes on the four-ISA workload, cc_src
+ * x94 and cc_dst x12, with 0 mixed cases).
+ *
+ * THE LOWERING COUNT IS WHAT MAKES THIS SAFE, and it is not decoration.
+ * `add %rax,%rax` writes rax with rax in its provenance and is a genuine
+ * ACCUMULATE (#228) whose edge R7/R3 require; the difference is that RAX has
+ * exactly one global, so no write to it can be moving a value between two
+ * spellings of the same register.  Dropping the count would delete every
+ * accumulate on every ISA.
+ *
+ * AN EMPTY PROVENANCE IS NOT THIS.  `xor %rax,%rax` folds to a constant, so
+ * the flags it really does define arrive with nothing named -- and reading
+ * that as a re-expression would delete an architectural write on 252 x86_64
+ * PCs, measured.  A representation change always names where it read the
+ * old representation from; that is what makes it one.  Likewise a load slot
+ * or the encoded-immediate bit puts the value's source outside the register,
+ * so neither is this shape either.
+ *
+ * @regs/@n are the fold's output in GENERIC ids, which is the coordinate the
+ * comparison has to be made in: cc_op, cc_dst, cc_src and cc_src2 all fold
+ * to REG_FLAGS, so a provenance naming all four arrives here as one entry.
+ */
+static bool is_repr_change(uint8_t gen, const uint8_t *regs, uint8_t n,
+                           uint8_t load_slots, uint8_t saw_imm)
+{
+    if (g_gen_nglobals[gen] < 2 || n == 0 || load_slots || saw_imm) {
+        return false;
+    }
+    for (uint8_t i = 0; i < n; i++) {
+        if (regs[i] != gen) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Add @gen to @regs, keeping it sorted and unique.  false when full. */
@@ -1070,9 +1208,24 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
     for (unsigned r = 0; r < g_nregs; r++) {
         uint8_t gen, k;
         uint8_t memop_slots = 0;
+        uint8_t sregs[QDEP_MAX_ADDR_REGS];
+        uint8_t sn = 0, simm = 0;
         QDepState rc;
 
         if (!(wr[r / 64] & (1ULL << (r % 64)))) {
+            continue;
+        }
+        /*
+         * A REPRESENTATION SELECTOR is not a register fact (#265).  QEMU
+         * declared it -- x86's cc_op, which says WHICH function computes
+         * EFLAGS from cc_dst/cc_src/cc_src2 and holds no part of the value.
+         * Every instruction that touches the flags for any reason writes it,
+         * including the ones that only READ them, so counting it as a
+         * destination made `ja` an EFLAGS producer.  R10.1's category
+         * reached from the register side.
+         */
+        if (g_reg_is_selector[r]) {
+            g_dst_repr_selector.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         gen = g_gen_of_reg[r];
@@ -1080,6 +1233,48 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             const char *nm =
                 qemu_plugin_dataflow_reg_name(r, nullptr, nullptr);
             tally(&g_dst_unmapped_name, nm ? nm : "?");
+            continue;
+        }
+        if (qemu_plugin_insn_write_prov(tb, idx, r, w.data(),
+                                        g_prov_words) != g_prov_words) {
+            out->dst_state = QDEP_R_NORECORD;
+            return;
+        }
+        /*
+         * FOLD FIRST, SEAT SECOND.  The row used to be created before the
+         * provenance was read, which cannot express "this write turned out
+         * not to be one": a destination whose every write is a change of
+         * representation has no row at all, and creating it first would
+         * leave an empty one behind that the wire comparison then reports as
+         * a register QEMU wrote and the wire does not carry.
+         */
+        rc = fold_prov(w.data(), sregs, &sn, &memop_slots, &simm);
+        if (rc != QDEP_OK) {
+            out->dst_state = rc;
+            return;
+        }
+        /*
+         * AND THE ONE SHAPE THE FOLD CANNOT SEE.  `clc` materialises the
+         * flags and then clears CF with a translator constant: two writes to
+         * cc_src, whose provenances union to the materialisation's own, and
+         * the second one is an architectural flag write.  QEMU's emitter
+         * says so (insn_dataflow_note_supplied_value) and the statement wins
+         * over the shape, because a shape that cannot see a fact must not
+         * overrule an emitter that states it.
+         */
+        if (!qemu_plugin_insn_write_supplies_value(tb, idx, r) &&
+            is_repr_change(gen, sregs, sn, memop_slots, simm)) {
+            g_dst_repr_change.fetch_add(1, std::memory_order_relaxed);
+            tally(&g_dst_repr_sig, generic_reg_name_or_unknown(gen));
+            if (out->n_repr_only < QDEP_MAX_DST) {
+                bool seen = false;
+                for (uint8_t z = 0; z < out->n_repr_only; z++) {
+                    seen |= (out->repr_only[z] == gen);
+                }
+                if (!seen) {
+                    out->repr_only[out->n_repr_only++] = gen;
+                }
+            }
             continue;
         }
         for (k = 0; k < out->n_dst; k++) {
@@ -1094,36 +1289,29 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             }
             out->dst_reg[out->n_dst++] = gen;
         }
-        if (qemu_plugin_insn_write_prov(tb, idx, r, w.data(),
-                                        g_prov_words) != g_prov_words) {
-            out->dst_state = QDEP_R_NORECORD;
-            return;
-        }
-        rc = fold_prov(w.data(), out->dst_dep_regs[k],
-                       &out->n_dst_dep_regs[k], &memop_slots,
-                       &out->dst_dep_imm[k]);
-        if (rc == QDEP_OK) {
-            /*
-             * MEMOP ordinals into LOAD ordinals, exactly as the store-data
-             * arm does it and for the same reason: QEMU numbers the
-             * load-data provenance bits by position in the WHOLE access
-             * list and the wire's load-data band is indexed by position
-             * among the LOADS.
-             */
-            for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
-                if (!(memop_slots & (1u << m))) {
-                    continue;
-                }
-                if (m >= n_memops || load_ord[m] == 0xFF) {
-                    rc = QDEP_R_UNREPRESENTABLE;
-                    break;
-                }
-                out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+        for (uint8_t z = 0; z < sn; z++) {
+            if (!add_reg(out->dst_dep_regs[k], &out->n_dst_dep_regs[k],
+                         sregs[z])) {
+                out->dst_state = QDEP_R_WIDE;
+                return;
             }
         }
-        if (rc != QDEP_OK) {
-            out->dst_state = rc;
-            return;
+        out->dst_dep_imm[k] |= simm;
+        /*
+         * MEMOP ordinals into LOAD ordinals, exactly as the store-data
+         * arm does it and for the same reason: QEMU numbers the load-data
+         * provenance bits by position in the WHOLE access list and the
+         * wire's load-data band is indexed by position among the LOADS.
+         */
+        for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
+            if (!(memop_slots & (1u << m))) {
+                continue;
+            }
+            if (m >= n_memops || load_ord[m] == 0xFF) {
+                out->dst_state = QDEP_R_UNREPRESENTABLE;
+                return;
+            }
+            out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
         }
     }
 
@@ -1299,6 +1487,33 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
             }
         }
         if (k == q->n_dst) {
+            /*
+             * THE LAZY-FLAG INTERPRETATION'S ONE LOSS DIRECTION, named
+             * before it is refused (#265).  A register the wire DOES carry
+             * as a destination, whose every stated write this file struck as
+             * a change of representation, has had the only thing that could
+             * fill its slot taken away.  Refusing the family is the honest
+             * outcome -- the block keeps the answer the refiner wrote, and
+             * nothing short is published -- but it is a LOSS and so it is
+             * counted separately from a register QEMU simply never
+             * mentioned, and tallied by mnemonic so the class is a list.
+             *
+             * The shape that would land here is `stc`/`clc`/`cmc`:
+             * materialise the flags, then set one bit with a translator
+             * constant, which arrives with the same provenance the
+             * materialisation had.  Its coverage path is a QEMU-side note at
+             * those emitters saying the write SUPPLIES a value, the same
+             * shape #205 and #230 used.  It has no subject in the corpus.
+             */
+            for (uint8_t z = 0; z < q->n_repr_only; z++) {
+                if (q->repr_only[z] != f->dst_regs[d]) {
+                    continue;
+                }
+                g_dst_repr_refused.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_dst_repr_refused_sig,
+                      generic_reg_name_or_unknown(f->dst_regs[d]));
+                break;
+            }
             g_snprintf(why, whysz, "no QEMU write row for %s",
                        generic_reg_name_or_unknown(f->dst_regs[d]));
             return QDEP_R_DST_UNNAMED;
@@ -2715,6 +2930,40 @@ void qdep_report(GString *report)
         " are not in here\n",
         g_dst_accum.load(std::memory_order_relaxed));
     g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  writes to a REPRESENTATION SELECTOR, not"
+        " counted as a destination:\n"
+        "              a global QEMU declared as saying HOW a lowered"
+        " register's other\n"
+        "               globals are read, holding no part of the value"
+        " (x86 cc_op).  Every\n"
+        "               instruction that touches the flags writes it,"
+        " including the ones\n"
+        "               that only READ them, so counting it made `ja` an"
+        " EFLAGS producer\n"
+        "  %10" G_GUINT64_FORMAT "  writes struck as a CHANGE OF REPRESENTATION:"
+        "\n"
+        "              the destination is a lowered register and the whole"
+        " provenance is\n"
+        "               inside that register's own globals -- a value"
+        " re-expressed, not\n"
+        "               produced (x86 gen_compute_eflags).  R7.1's"
+        " preserved bits land\n"
+        "               here too, so FLAGS no longer appears in its own"
+        " mask on inc/dec\n"
+        "  %10" G_GUINT64_FORMAT "  wire destinations left UNNAMED by the two"
+        " rules above (must be 0):\n"
+        "              every stated write to a register the wire DOES carry"
+        " was struck,\n"
+        "               so the family refuses rather than publishing a short"
+        " mask.  The\n"
+        "               shape is `stc`/`clc`: materialise, then set one bit"
+        " with a\n"
+        "               translator constant no note separates from the"
+        " materialisation\n",
+        g_dst_repr_selector.load(std::memory_order_relaxed),
+        g_dst_repr_change.load(std::memory_order_relaxed),
+        g_dst_repr_refused.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  destination rows the #236 LIST FLIP would have to"
         " REFUSE:\n"
         "              QEMU wrote a register through a helper whose INDEX the"
@@ -2788,6 +3037,12 @@ void qdep_report(GString *report)
                "NAMED SURVIVORS by mnemonic and cause (R12.1) -- rows whose dep\nblock exists because the refiner had content QEMU cannot yet state.\nThe cause IS the coverage path: it names the emitter or decoder that\nhas to state the fact for the row to leave this list.  Nothing here is\ndropped, widened to a default, or refused as an endpoint:");
     dump_tally(report, g_monitor_name,
                "reservation-monitor value globals a store's datum named\n(the emulation-artefact category, #177 / f46873a738 -- NOT a decoder gap):");
+    dump_tally(report, g_lowered_reg,
+               "LOWERED registers on this target -- one architectural name over\nseveral TCG globals (#265).  The change-of-representation rule can only\nfire on these, so an empty list makes its zero vacuous and a non-empty\none makes the zero a result:");
+    dump_tally(report, g_dst_repr_sig,
+               "registers whose writes were struck as a change of representation\n(#265: the lazy-flag interpretation's subject, by generic register):");
+    dump_tally(report, g_dst_repr_refused_sig,
+               "registers the wire carries whose every QEMU write was struck\n(the must-be-0 above, by generic register; the mnemonic is in the\nrefusal census under QDEP_R_DST_UNNAMED):");
     dump_tally(report, g_dst_unmapped_name,
                "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
     dump_tally(report, g_field_unnamed,

@@ -365,6 +365,11 @@ const char *qemu_plugin_dataflow_reg_name(unsigned reg, uint32_t *env_offset,
     return insn_dataflow_reg_name(reg, env_offset, size);
 }
 
+bool qemu_plugin_dataflow_reg_is_repr_selector(unsigned reg)
+{
+    return insn_dataflow_reg_is_repr_selector(reg);
+}
+
 bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset)
 {
     bool valid;
@@ -406,6 +411,22 @@ unsigned name(const struct qemu_plugin_tb *tb, size_t idx,                   \
 PLUGIN_DF_SET(qemu_plugin_insn_reg_reads,  rd)
 PLUGIN_DF_SET(qemu_plugin_insn_reg_writes, wr)
 PLUGIN_DF_SET(qemu_plugin_insn_reg_kills,  kill)
+
+bool qemu_plugin_insn_write_supplies_value(const struct qemu_plugin_tb *tb,
+                                           size_t idx, unsigned reg)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d)) {
+        return false;
+    }
+    for (unsigned i = 0; i < d->n_writes; i++) {
+        if (d->writes[i].reg == reg) {
+            return d->writes[i].supplies_value != 0;
+        }
+    }
+    return false;
+}
 
 unsigned qemu_plugin_insn_write_prov(const struct qemu_plugin_tb *tb,
                                      size_t idx, unsigned reg,

@@ -68,6 +68,15 @@
  */
 #define INSN_DF_MAX_REGFILES  24
 
+/*
+ * Representation SELECTORS -- globals that say how a lowered register's
+ * other globals are to be read (see insn_dataflow_declare_repr_selector()).
+ * One target declares one today; the bound is small on purpose, so a target
+ * that starts declaring whole files here shows up as a refused declaration
+ * rather than as a silently growing table.
+ */
+#define INSN_DF_MAX_SELECTORS  8
+
 /* Instructions writing more than this are vanishingly rare; overflow is flagged. */
 #define INSN_DF_MAX_WRITES  8
 
@@ -223,6 +232,14 @@ typedef struct InsnDataflowMemop {
 
 typedef struct InsnDataflowWrite {
     uint8_t  reg;                           /* index into the globals table */
+    /*
+     * An emitter said this write SUPPLIES a value (see
+     * insn_dataflow_note_supplied_value()).  Sticky across the merge below:
+     * a register written twice, once by a lowering that only re-expressed it
+     * and once by an emitter that put a new value in, has had a value put in
+     * it.
+     */
+    uint8_t  supplies_value;
     uint64_t prov[INSN_DF_REG_WORDS];       /* registers the value came from */
 } InsnDataflowWrite;
 
@@ -689,6 +706,43 @@ void insn_dataflow_note_encoded_imm(const void *ts);
 void insn_dataflow_note_preserve_read(const void *ts, const void *mark);
 
 /*
+ * The write just emitted puts a value INTO @ts that did not come from @ts.
+ *
+ * WHAT THIS IS FOR, and it is one shape.  A consumer reading a lowered
+ * register -- one architectural name over several TCG globals -- can tell a
+ * change of REPRESENTATION from a change of VALUE by looking at where the
+ * write read from: x86's `gen_compute_eflags()` recomputes EFLAGS from
+ * cc_op/cc_dst/cc_src/cc_src2 and puts the answer back in cc_src, and every
+ * register it names is one of the flags' own globals.  `jcc` does that and
+ * writes no flag the ISA defines, which is exactly the right reading.
+ *
+ * `clc` breaks it.  It materialises, THEN clears CF with
+ * `andi cc_src, cc_src, ~CC_C` -- a second write whose only named input is
+ * cc_src again, and whose new information is a TRANSLATOR constant that no
+ * op names and no encoding carries.  Provenance is a union over the writes,
+ * so the two are indistinguishable from the materialisation alone, and the
+ * shape reading would delete a flag write the ISA does define.
+ *
+ * So the emitter that supplied the constant says so.  It is not a mnemonic
+ * allowlist and could not be one: what it states is a property of the OP it
+ * has just emitted, and the same three ops mean the opposite thing when
+ * gen_compute_eflags emits them.
+ *
+ * ITS ABSENCE IS THE PESSIMISTIC DIRECTION IN THE OTHER FAMILIES AND THE
+ * DANGEROUS ONE HERE, which is why the consumer's must-be-0 census exists:
+ * a lowered register the wire names as a destination and no write supplied a
+ * value to refuses the whole dependency block and is counted, so an emitter
+ * this call has not reached shows up as a number rather than as a silently
+ * deleted destination.
+ *
+ * @ts is the global written; @mark bounds the note to the ops this emitter
+ * produced, taken with insn_dataflow_mark() before the write is emitted, as
+ * insn_dataflow_note_preserve_read()'s is.  Capture only: no op is emitted,
+ * altered or suppressed.
+ */
+void insn_dataflow_note_supplied_value(const void *ts, const void *mark);
+
+/*
  * The emitter's position in the op stream, for bounding a preserve-read note.
  * Opaque: the only thing a caller may do with it is hand it back.
  */
@@ -840,6 +894,44 @@ void insn_dataflow_declare_regfile(const char *base, const char *const *names,
                                    uint32_t elem, uint32_t n);
 
 /*
+ * Declare that TCG global @ts is the SELECTOR of a lowered register's
+ * representation: it says how the register's OTHER globals are to be read
+ * and carries no part of the architectural value itself.
+ *
+ * There is one on x86 and, so far, nowhere else.  QEMU does not keep EFLAGS;
+ * it keeps cc_op, cc_dst, cc_src and cc_src2, and the architectural value is
+ * a FUNCTION of the four.  Three of them hold operands and results -- real
+ * pieces of the value -- while cc_op holds which function to apply.  A
+ * consumer reading writes as architectural facts therefore sees `ja` define
+ * EFLAGS, because materialising the flags for the test writes cc_op (and
+ * re-expresses cc_src), and `ja` writes no flag the ISA defines.
+ *
+ * WHY THE TARGET STATES IT AND NOTHING INFERS IT.  The shape is not
+ * recoverable from the op stream: cc_op is written with a constant, and so
+ * is the destination of `mov $5,%rax`.  Nothing about the write says which
+ * of the two is a value.  Only the code that chose the lowering knows, so it
+ * says so here, beside the tcg_global_mem_new() that creates the global --
+ * the same place and the same terms insn_dataflow_declare_regfile() uses.
+ *
+ * R10.1's category, arrived at from the register side rather than the pc
+ * side: a QEMU bookkeeping artifact is not architectural information, and
+ * publishing it as a destination is not fidelity but noise.  What this does
+ * NOT do is touch the value-carrying globals -- cc_dst and cc_src are how
+ * `add` states the flags it really does write, and they keep saying so.
+ *
+ * @ts is a TCGTemp pointer, void here for the reason every other note's is.
+ * Idempotent; a second declaration of the same global is dropped.  Capture
+ * only: no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_declare_repr_selector(const void *ts);
+
+/*
+ * True when global @i was declared a representation selector above.  The
+ * index space is insn_dataflow_reg_name()'s.
+ */
+bool insn_dataflow_reg_is_repr_selector(unsigned i);
+
+/*
  * Name the register an env byte range belongs to, in the same namespace
  * insn_dataflow_reg_name() answers in.  false when nothing declared covers
  * it, or when the range REACHES BEYOND one register -- an access spanning
@@ -908,6 +1000,10 @@ static inline void insn_dataflow_note_preserve_read(const void *ts,
                                                     const void *mark)
 { }
 
+static inline void insn_dataflow_note_supplied_value(const void *ts,
+                                                     const void *mark)
+{ }
+
 static inline const void *insn_dataflow_mark(void)
 { return NULL; }
 
@@ -919,6 +1015,12 @@ static inline void insn_dataflow_declare_regfile(const char *base,
                                                  uint32_t off, uint32_t stride,
                                                  uint32_t elem, uint32_t n)
 { }
+
+static inline void insn_dataflow_declare_repr_selector(const void *ts)
+{ }
+
+static inline bool insn_dataflow_reg_is_repr_selector(unsigned i)
+{ return false; }
 
 #endif /* CONFIG_PLUGIN */
 

@@ -1614,8 +1614,21 @@ static void gen_CBW(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CLC(DisasContext *s, X86DecodedInsn *decode)
 {
+    const void *mark;
+
     gen_compute_eflags(s);
+    mark = insn_dataflow_mark();
     tcg_gen_andi_tl(cpu_cc_src, cpu_cc_src, ~CC_C);
+    /*
+     * The bit this instruction sets is a value the ISA defines it to put in
+     * EFLAGS, and it arrives as a TRANSLATOR constant that no op names and
+     * no encoding carries.  Without this note the write is indistinguishable
+     * from the gen_compute_eflags() above it -- both name cc_src and nothing
+     * else -- and a consumer reading the lowered flags by provenance shape
+     * would take the pair for a change of representation and delete an
+     * architectural flag write.  See insn_dataflow_note_supplied_value().
+     */
+    insn_dataflow_note_supplied_value(tcgv_tl_temp(cpu_cc_src), mark);
 }
 
 static void gen_CLD(DisasContext *s, X86DecodedInsn *decode)
@@ -1637,8 +1650,21 @@ static void gen_CLTS(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CMC(DisasContext *s, X86DecodedInsn *decode)
 {
+    const void *mark;
+
     gen_compute_eflags(s);
+    mark = insn_dataflow_mark();
     tcg_gen_xori_tl(cpu_cc_src, cpu_cc_src, CC_C);
+    /*
+     * The bit this instruction sets is a value the ISA defines it to put in
+     * EFLAGS, and it arrives as a TRANSLATOR constant that no op names and
+     * no encoding carries.  Without this note the write is indistinguishable
+     * from the gen_compute_eflags() above it -- both name cc_src and nothing
+     * else -- and a consumer reading the lowered flags by provenance shape
+     * would take the pair for a change of representation and delete an
+     * architectural flag write.  See insn_dataflow_note_supplied_value().
+     */
+    insn_dataflow_note_supplied_value(tcgv_tl_temp(cpu_cc_src), mark);
 }
 
 static void gen_CMOVcc(DisasContext *s, X86DecodedInsn *decode)
@@ -4048,8 +4074,21 @@ static void gen_SHRX(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_STC(DisasContext *s, X86DecodedInsn *decode)
 {
+    const void *mark;
+
     gen_compute_eflags(s);
+    mark = insn_dataflow_mark();
     tcg_gen_ori_tl(cpu_cc_src, cpu_cc_src, CC_C);
+    /*
+     * The bit this instruction sets is a value the ISA defines it to put in
+     * EFLAGS, and it arrives as a TRANSLATOR constant that no op names and
+     * no encoding carries.  Without this note the write is indistinguishable
+     * from the gen_compute_eflags() above it -- both name cc_src and nothing
+     * else -- and a consumer reading the lowered flags by provenance shape
+     * would take the pair for a change of representation and delete an
+     * architectural flag write.  See insn_dataflow_note_supplied_value().
+     */
+    insn_dataflow_note_supplied_value(tcgv_tl_temp(cpu_cc_src), mark);
 }
 
 static void gen_STD(DisasContext *s, X86DecodedInsn *decode)

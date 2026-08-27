@@ -50,31 +50,34 @@ std::vector<uint8_t>  g_gen_of_reg;      /* TCG global index -> GenericRegId */
 std::atomic<uint64_t> g_state[QDEP_STATE_COUNT];
 std::atomic<uint64_t> g_dstate[QDEP_STATE_COUNT];
 
-/* The shadow: what the Capstone operand walk would have published, scored
- * against what QEMU's emitters stated, on the rows where the wire now
- * carries QEMU's answer.  Counted per direction because a load and a store
- * of the same instruction are two independent claims. */
-std::atomic<uint64_t> g_shadow_ld_same{0}, g_shadow_ld_diff{0};
-std::atomic<uint64_t> g_shadow_st_same{0}, g_shadow_st_diff{0};
-/* The Capstone side had no block at all to compare: the row reached the
- * format default before this flip and reaches QEMU's mask after it. */
-std::atomic<uint64_t> g_shadow_absent{0};
-/* The store-data family's own shadow, scored on the rows where the wire now
- * takes that mask from QEMU. */
-std::atomic<uint64_t> g_shadow_sd_same{0}, g_shadow_sd_diff{0};
-
 /*
- * Every differing row, by mnemonic and by the names the two sides do not
- * share.  A count of disagreements that cannot say WHICH rows disagree
- * cannot be adjudicated, and an unadjudicated difference on the wire is
- * the thing this whole flip is supposed to remove.  Same for a global with
- * no generic word: the refusal is only actionable if the name is printed.
+ * THE CAPSTONE SHADOW IS GONE, and that is a deletion rather than an
+ * omission.  Six counters and two signature tallies used to score the masks
+ * the operand walk would have published against the ones QEMU's emitters
+ * state, on every row the wire takes from QEMU.  They fed nothing and were
+ * kept as a comparison arm -- which is exactly the shape J7 forbids on a
+ * path whose source has become QEMU, because a value still read is a value
+ * still relied on and the next question that needs an answer takes it.  The
+ * one-time A/B that retired them is in this wave's evidence, not in the
+ * running plugin.
+ *
+ * What survives is QEMU-side and not comparative: a name QEMU's provenance
+ * gave that this file has no generic word for is a REFUSAL, and a refusal
+ * nobody can name is a refusal nobody can act on.
  */
 GMutex g_tally_lock;
-GHashTable *g_shadow_sigs   = nullptr;   /* signature -> count */
-GHashTable *g_sd_sigs       = nullptr;   /* store-data signature -> count */
 GHashTable *g_unmapped_name = nullptr;   /* qemu global name -> count */
 GHashTable *g_monitor_name  = nullptr;   /* reservation-monitor global -> count */
+/*
+ * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
+ * WHICH instructions refused cannot be adjudicated, and an unadjudicated
+ * refusal is a published all-inputs default nobody ever looks at again.  The
+ * shadow tallies this replaces asked what CAPSTONE would have said; this one
+ * asks what QEMU could not say, which is the only question left.
+ */
+GHashTable *g_refusal_sig   = nullptr;   /* "mnem  reason" -> count */
+
+const char *state_name(unsigned s);
 
 void tally(GHashTable **t, const char *key)
 {
@@ -110,6 +113,17 @@ void dump_tally(GString *report, GHashTable *t, const char *heading)
             (const char *)l->data);
     }
     g_list_free(keys);
+}
+
+void note_refusal(const char *mnem, unsigned st, const char *fam,
+                  const char *detail)
+{
+    char *k = g_strdup_printf("%-10s %s  %s%s%s", mnem ? mnem : "?", fam,
+                              state_name(st),
+                              (detail && *detail) ? " -- " : "",
+                              (detail && *detail) ? detail : "");
+    tally(&g_refusal_sig, k);
+    g_free(k);
 }
 
 void qdep_init(void)
@@ -244,7 +258,7 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
             if (!load_slots) {
                 return QDEP_R_UNREPRESENTABLE;
             }
-            if (slot >= 8) {
+            if (slot >= QDEP_MAX_ACCESS) {
                 return QDEP_R_WIDE;
             }
             *load_slots |= (uint8_t)(1u << slot);
@@ -259,68 +273,6 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
 }
 
 /*
- * Name every bit a mask sets, in the format's own layout: src regs, then
- * @nloads load-data slots, then the immediate.  @nloads is max_dep_loads for
- * a store-data mask and ZERO for an address mask, which is the whole
- * difference between the two layouts.
- *
- * Used on both sides of both shadows, so a difference in a LOAD-DATA bit or
- * the IMMEDIATE bit is a named signature rather than something the
- * comparison silently agrees about.  It was the latter until now: the
- * address shadow compared REGISTER SETS, which cannot see either bit, so an
- * address mask losing its immediate bit to the flip would have scored as
- * agreement.  Same erasure shape as irdf's REG_IP drop, and found the same
- * way -- by writing the comparison down and asking what it cannot see.
- */
-void name_mask_bits(GString *out, const InsnFields *f, unsigned nloads,
-                    uint64_t mask, const char *prefix)
-{
-    unsigned nsrc = f->n_src_regs;
-
-    for (unsigned i = 0; i < nsrc && i < 64; i++) {
-        if (mask & (1ULL << i)) {
-            g_string_append_printf(out, " %s:%s", prefix,
-                                   generic_reg_name_or_unknown(f->src_regs[i]));
-        }
-    }
-    for (unsigned k = 0; k < nloads && nsrc + k < 64; k++) {
-        if (mask & (1ULL << (nsrc + k))) {
-            g_string_append_printf(out, " %s:LOAD%u", prefix, k);
-        }
-    }
-    if (nsrc + nloads < 64 && (mask & (1ULL << (nsrc + nloads)))) {
-        g_string_append_printf(out, " %s:IMM", prefix);
-    }
-}
-
-/* One row's disagreement on either family, named by BIT on both sides. */
-void mask_shadow_sig(GHashTable **tally_into, const char *mnem,
-                     const InsnFields *f, unsigned nloads, const char *tag,
-                     uint64_t cap_mask, uint64_t q_mask)
-{
-    GString *sig = g_string_new(mnem ? mnem : "?");
-
-    g_string_append_printf(sig, " %s", tag);
-    name_mask_bits(sig, f, nloads, q_mask & ~cap_mask, "qemu-extra");
-    name_mask_bits(sig, f, nloads, cap_mask & ~q_mask, "cap-extra");
-    tally(tally_into, sig->str);
-    g_string_free(sig, TRUE);
-}
-
-/*
- * One store-data row's disagreement, named on both sides and by BIT rather
- * than by register set, because the two masks differ in a load-data or
- * immediate bit as readily as in a register and a comparison that could not
- * see those would report agreement it had not established.
- */
-void data_shadow_sig(const char *mnem, const InsnFields *f,
-                     uint64_t cap_mask, uint64_t q_mask)
-{
-    mask_shadow_sig(&g_sd_sigs, mnem, f, f->max_dep_loads, "stdata",
-                    cap_mask, q_mask);
-}
-
-/*
  * Turn a generic-register set into a mask over this template's src slots.
  *
  * Returns false when a named register occupies no slot -- there is no bit
@@ -328,7 +280,7 @@ void data_shadow_sig(const char *mnem, const InsnFields *f,
  * and the whole instruction is refused for it.
  */
 bool regs_to_mask(const InsnFields *f, const uint8_t *regs, uint8_t n,
-                  uint8_t load_slots, uint64_t *out)
+                  uint8_t load_slots, uint64_t *out, char *why, size_t whysz)
 {
     uint64_t m = 0;
 
@@ -341,6 +293,10 @@ bool regs_to_mask(const InsnFields *f, const uint8_t *regs, uint8_t n,
             }
         }
         if (!found) {
+            if (why) {
+                g_snprintf(why, whysz, "no slot for %s",
+                           generic_reg_name_or_unknown(regs[k]));
+            }
             return false;
         }
     }
@@ -350,11 +306,15 @@ bool regs_to_mask(const InsnFields *f, const uint8_t *regs, uint8_t n,
      * which is the same disqualifying direction as a register with no slot,
      * so it fails the same way.
      */
-    for (unsigned k = 0; k < 8; k++) {
+    for (unsigned k = 0; k < QDEP_MAX_ACCESS; k++) {
         if (!(load_slots & (1u << k))) {
             continue;
         }
         if (k >= f->max_dep_loads || f->n_src_regs + k >= 64) {
+            if (why) {
+                g_snprintf(why, whysz, "no slot for LOAD%u (of %u)",
+                           k, f->max_dep_loads);
+            }
             return false;
         }
         m |= 1ULL << (f->n_src_regs + k);
@@ -571,6 +531,65 @@ bool reindex_src_for_qemu(InsnFields *f, InsnRegNames *rn,
  * prefix on those would make its LENGTH a function of Capstone's operand
  * list and put back, one level up, exactly the coupling this removes.
  */
+/*
+ * Carry a REGISTER-side mask (dst_dep[] / store_data_dep[]) across a change
+ * in the LOAD SLOT COUNT.
+ *
+ * The layout is  [0,nsrc) src | [nsrc, nsrc+nload) load-data | one imm bit
+ * (champsim_tracer_mnemonics.h), so resizing the load run moves both bands
+ * above the sources.  The src bits are untouched: they index a run this
+ * change does not resize.
+ *
+ * The load band cannot always be carried exactly, and where it cannot the
+ * answer is the OVER-approximation, never the short one -- a mask naming
+ * fewer inputs than really feed a value tells a consumer it may issue before
+ * a producer has landed:
+ *
+ *   GROWN   a slot the old count did not have is a sub-access of an operand
+ *           the old count DID have: `vmovdqu (%rax),%ymm0` is one Capstone
+ *           operand and two QEMU loads, and the destination takes both
+ *           halves.  So a mask that named any load slot names every new one
+ *           too; a mask that named none still names none, because the writer
+ *           positively said this value does not come from memory.
+ *   SHRUNK  a named slot may have no bit left.  Every remaining slot is set,
+ *           and when none remain the memory input cannot be expressed at
+ *           all -- *@lost says so and the caller publishes the all-inputs
+ *           default rather than a mask that quietly dropped it.
+ */
+uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
+                         unsigned new_n, bool *lost)
+{
+    const uint64_t src_bits = nsrc >= 64 ? ~0ULL : ((1ULL << nsrc) - 1);
+    uint64_t out = m & src_bits;
+    bool named = false;
+
+    *lost = false;
+    if (nsrc + new_n >= 64) {
+        *lost = true;
+        return out;
+    }
+    for (unsigned k = 0; k < old_n && nsrc + k < 64; k++) {
+        if (m & (1ULL << (nsrc + k))) {
+            named = true;
+            if (k < new_n) {
+                out |= 1ULL << (nsrc + k);
+            }
+        }
+    }
+    if (named) {
+        if (new_n == 0) {
+            *lost = true;
+        }
+        for (unsigned k = 0; k < new_n; k++) {
+            out |= 1ULL << (nsrc + k);
+        }
+    }
+    if (nsrc + old_n < 64 && (m & (1ULL << (nsrc + old_n)))) {
+        out |= 1ULL << (nsrc + new_n);      /* the immediate bit */
+    }
+    return out;
+}
+
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out)
 {
     uint8_t n = 0;
@@ -591,11 +610,17 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out)
     };
 
     if (q->state == QDEP_OK) {
-        take(q->load_regs, q->n_load_regs);
-        take(q->store_regs, q->n_store_regs);
+        for (uint8_t a = 0; a < q->n_loads; a++) {
+            take(q->load_addr_regs[a], q->n_load_addr_regs[a]);
+        }
+        for (uint8_t a = 0; a < q->n_stores; a++) {
+            take(q->store_addr_regs[a], q->n_store_addr_regs[a]);
+        }
     }
     if (q->data_state == QDEP_OK) {
-        take(q->data_regs, q->n_data_regs);
+        for (uint8_t a = 0; a < q->n_stores; a++) {
+            take(q->store_data_regs[a], q->n_store_data_regs[a]);
+        }
     }
     return n;
 }
@@ -607,8 +632,6 @@ const char *state_name(unsigned s)
     case QDEP_OK:               return "PUBLISHED from QEMU's emitters";
     case QDEP_R_STATUS:         return "refused: extraction reported itself incomplete";
     case QDEP_R_NORECORD:       return "refused: qemu withheld the access list or a provenance";
-    case QDEP_R_MULTI:          return "refused: >1 operand of a direction (slot pairing unproven)";
-    case QDEP_R_SHAPE:          return "refused: a direction the tracer claims that QEMU did not emit";
     case QDEP_R_FIELD:          return "refused: provenance named env state with no generic word";
     case QDEP_R_UNMAPPED:       return "refused: provenance named a global with no generic word";
     case QDEP_R_WIDE:           return "refused: more address registers than the record holds";
@@ -651,6 +674,11 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      * because a provenance that lost a source to slot exhaustion produces
      * precisely a short set.
      *
+     * Since the wire's SLOT COUNT is this list's length, every flag here is
+     * also a statement that the count is a lower bound rather than the MAX
+     * the template header means -- which is why `have_list` stays false on
+     * this path and the counts reach the format default instead.
+     *
      * n_helper_unbounded is the fourth, and it is the one an earlier draft
      * of this file did not check.  Its own contract says the reported sets
      * "are then SHORT, not merely coarse" -- a helper handed the whole CPU
@@ -680,11 +708,31 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         out->state = out->data_state = QDEP_R_NORECORD;
         return;
     }
+
+    /*
+     * From here the ACCESS LIST IS WHOLE, and that is the fact the slot
+     * counts are taken from.  It stays true even when a provenance below is
+     * refused: how many accesses there are and what each depends on are two
+     * different questions, and only the second can fail on its own.
+     */
+    out->have_list = true;
+
     if (n == 0) {
         /* No accesses: nothing to state, for either family. */
         out->state = out->data_state = QDEP_NONE;
         return;
     }
+
+    /*
+     * Ordinals within each direction.  QEMU numbers the accesses in one
+     * list; the wire numbers loads and stores separately, and the load-data
+     * provenance bits are numbered the FIRST way while the mask band they
+     * feed is indexed the SECOND.  @load_ord translates, and it exists
+     * because on `lock cmpxchgl` the two happen to agree and on anything
+     * whose accesses interleave they do not.
+     */
+    uint8_t load_ord[kMaxMemops];
+    memset(load_ord, 0xFF, sizeof(load_ord));
 
     /*
      * The two families are extracted in one pass but refused INDEPENDENTLY.
@@ -697,24 +745,45 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     for (unsigned i = 0; i < n; i++) {
         bool store = mo[i].is_store != 0;
         QDepState rc;
+        uint8_t a;
 
-        if (qemu_plugin_insn_memop_addr_prov(tb, idx, i, w.data(),
-                                             g_prov_words) != g_prov_words) {
-            out->state = out->data_state = QDEP_R_NORECORD;
+        /*
+         * More accesses of one direction than this extractor holds.  QEMU's
+         * own cap is the same number, so reaching it here means the list is
+         * whole and simply wider than the arrays -- refuse the COUNT for
+         * that direction rather than publish a truncated slot layout.
+         */
+        if ((store ? out->n_stores : out->n_loads) >= QDEP_MAX_ACCESS) {
+            out->state = out->data_state = QDEP_R_STATUS;
+            out->have_list = false;
             return;
         }
         if (store) {
-            out->qemu_has_store = true;
+            a = out->n_stores++;
         } else {
-            out->qemu_has_load = true;
+            a = out->n_loads++;
+            load_ord[i] = a;
+        }
+        /*
+         * mo[i].count_unbounded is DELIBERATELY not consulted.  It says a
+         * helper repeats THIS ONE stated access a data-dependent number of
+         * times, and the slot count has never been a bound on the dynamic
+         * count -- see champsim_tracer_qdep.h, and mnemonics.h on XSAVEOPT.
+         * One record is one slot carrying one address mask either way.
+         */
+        if (qemu_plugin_insn_memop_addr_prov(tb, idx, i, w.data(),
+                                             g_prov_words) != g_prov_words) {
+            out->state = out->data_state = QDEP_R_NORECORD;
+            out->have_list = false;
+            return;
         }
         /*
          * CP1.  A helper-performed access whose address is not one of the
          * helper's arguments hands over an EMPTY provenance, and folding it
          * would publish "this address depends on nothing" for an access that
          * genuinely reads registers -- the short mask this file exists never
-         * to write.  The DIRECTION above is still recorded, because it is
-         * stated and an admission gate needs it; only the mask is refused.
+         * to write.  The COUNT is still exact, because the access was
+         * stated; only the mask is refused.
          */
         if (mo[i].addr_unstated) {
             if (out->state == QDEP_NONE) {
@@ -722,8 +791,10 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             }
         }
         rc = store
-            ? fold_prov(w.data(), out->store_regs, &out->n_store_regs, nullptr)
-            : fold_prov(w.data(), out->load_regs, &out->n_load_regs, nullptr);
+            ? fold_prov(w.data(), out->store_addr_regs[a],
+                        &out->n_store_addr_regs[a], nullptr)
+            : fold_prov(w.data(), out->load_addr_regs[a],
+                        &out->n_load_addr_regs[a], nullptr);
         if (rc != QDEP_OK && out->state == QDEP_NONE) {
             out->state = rc;    /* first refusal wins; a later access
                                  * succeeding does not undo it */
@@ -745,8 +816,29 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             }
             continue;
         }
-        rc = fold_prov(w.data(), out->data_regs, &out->n_data_regs,
-                       &out->data_load_slots);
+        uint8_t memop_slots = 0;
+        rc = fold_prov(w.data(), out->store_data_regs[a],
+                       &out->n_store_data_regs[a], &memop_slots);
+        if (rc == QDEP_OK) {
+            /*
+             * Translate MEMOP ordinals into LOAD ordinals.  A bit naming an
+             * access that is not one of this instruction's loads is one this
+             * extractor cannot place in the load-data band, and placing it
+             * anywhere else would name a slot that means something different
+             * -- so it is refused rather than approximated.
+             */
+            for (unsigned k = 0; k < QDEP_MAX_ACCESS; k++) {
+                if (!(memop_slots & (1u << k))) {
+                    continue;
+                }
+                if (k >= n || load_ord[k] == 0xFF) {
+                    rc = QDEP_R_UNREPRESENTABLE;
+                    break;
+                }
+                out->store_data_load_slots[a] |=
+                    (uint8_t)(1u << load_ord[k]);
+            }
+        }
         if (rc != QDEP_OK && out->data_state == QDEP_NONE) {
             out->data_state = rc;   /* first refusal wins */
         }
@@ -759,7 +851,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     if (out->state == QDEP_NONE) {
         out->state = QDEP_OK;
     }
-    if (out->data_state == QDEP_NONE && out->qemu_has_store) {
+    if (out->data_state == QDEP_NONE && out->n_stores > 0) {
         out->data_state = QDEP_OK;
     }
 }
@@ -767,35 +859,96 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 const char *mnem)
 {
-    unsigned state = q ? q->state : QDEP_NONE;
-    unsigned dstate = q ? q->data_state : QDEP_NONE;
-
-    if (f->max_dep_loads == 0 && f->max_dep_stores == 0) {
+    if (!g_live || !q) {
         /*
-         * The tracer's walk found no memory operand.  Nothing on this
-         * instruction can carry an address or store-data mask, whatever QEMU
-         * said -- both blocks' arrays are sized by these two counts and a
-         * mask with no array to live in cannot be written.  Not a refusal:
-         * there is no claim here to refuse.
+         * The dataflow ABI handshake never succeeded, so there is no answer
+         * to prefer and nothing to displace.  The counts stay exactly as the
+         * operand walk left them: zeroing them here would gut every memory
+         * annotation in the trace to say something this file did not learn.
+         * The disablement itself is reported by name in qdep_report().
          */
         g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
+    unsigned state = q->state;
+    unsigned dstate = q->data_state;
+
+    /* ---------------- ADMISSION: the slot counts are QEMU's ------------- */
     /*
-     * The two SHAPE checks below disqualify both families at once, and that
-     * is not a fold of one into the other: they say the tracer's operand list
-     * and QEMU's access list do not describe the same accesses, so neither
-     * family's per-access pairing means anything.
+     * How many load slots and store slots this instruction HAS is now the
+     * length of QEMU's access list for each direction, and no longer the
+     * number of memory OPERANDS the Capstone walk enumerated.  The two were
+     * never answers to the same question -- one operand is two accesses on
+     * `vmovdqu`, `ldp` and `stp`, and `lock cmpxchgl` has a store no operand
+     * counted -- and the count is what sizes the mask arrays, fixes the
+     * register masks' load-data and immediate bit offsets, and decides
+     * whether a runtime memop finds a static slot at all.
+     *
+     * When QEMU cannot state a direction's count the direction reaches the
+     * format's own default, ZERO slots: no mask array, the consumer back at
+     * all-to-all, and the DYNAMIC count still riding CST_FID_N_LOADS /
+     * CST_FID_N_STORES.  It never falls back to the operand walk's number.
      */
+    const uint8_t mdl_old = f->max_dep_loads;
+    const uint8_t mds_old = f->max_dep_stores;
+    uint8_t mdl_new = 0, mds_new = 0;
+    unsigned adm = QDEP_OK;
+
+    if (!q->have_list) {
+        adm = (state == QDEP_R_STATUS) ? QDEP_R_STATUS : QDEP_R_NORECORD;
+    } else {
+        mdl_new = q->n_loads;
+        mds_new = q->n_stores;
+    }
+
+    f->max_dep_loads  = mdl_new;
+    f->max_dep_stores = mds_new;
+
     /*
-     * Seat QEMU's own register list at the head of src_regs[] FIRST, so
-     * every mask written below is written in a coordinate system QEMU owns.
-     * Done before the gates, not after: the gates only decide whether the
-     * masks are PUBLISHED, and the permutation has to be applied whether
-     * they are or not -- dst_dep_mask[] indexes the same slots and would
-     * otherwise be left reading the old order.
+     * The register masks were written against the OLD load run and have to
+     * be re-seated onto the new one.  dst_dep_mask[] is the refiners' and is
+     * not rewritten below, so it is carried here; store_data_dep_mask[] is
+     * overwritten in full further down and needs no carry.
+     */
+    if (mdl_old != mdl_new) {
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            bool lost = false;
+            uint64_t v = carry_load_band(f->dst_dep_mask[d], f->n_src_regs,
+                                         mdl_old, mdl_new, &lost);
+            f->dst_dep_mask[d] = lost ? all_inputs_mask(f) : v;
+        }
+    }
+
+    if (mdl_new == 0 && mds_new == 0) {
+        /*
+         * No slots at all: neither block has an array to live in, whatever
+         * either side said.  Where that is QEMU's own answer -- an
+         * instruction with no accesses -- it is not a refusal and there is
+         * no claim here to refuse; where it is a refusal it is counted as
+         * one, so the cost of the honest default is a number.
+         */
+        f->has_addr_deps = false;
+        if (mds_old != 0 || mdl_old != 0) {
+            /* Something WAS claimed and is now unclaimed; say which. */
+            unsigned r = (adm != QDEP_OK) ? adm : QDEP_NONE;
+            if (r != QDEP_NONE) {
+                note_refusal(mnem, r, "count", nullptr);
+            }
+            g_state[r].fetch_add(1, std::memory_order_relaxed);
+            g_dstate[r].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
+            g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    /*
+     * Seat QEMU's own register list at the head of src_regs[], so every mask
+     * written below is written in a coordinate system QEMU owns.  Done after
+     * the counts and before the masks, because the permutation carries the
+     * load-data band with it and that band's width is the count just set.
      */
     {
         uint8_t qregs[MAX_SRC_REGS];
@@ -820,48 +973,34 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
     }
 
-    bool shape_bad = false, multi = false;
-    if ((f->max_dep_loads > 0) != q->qemu_has_load ||
-        (f->max_dep_stores > 0) != q->qemu_has_store) {
-        /*
-         * The tracer claims a direction QEMU did not emit (a helper
-         * performed the access inside the call, or the walk invented an
-         * operand).  Either way there is no emitter statement to publish
-         * for that direction, and publishing one direction from QEMU and
-         * leaving the other from Capstone would put two sources in one
-         * block.
-         */
-        shape_bad = true;
-    } else if (f->max_dep_loads > 1 || f->max_dep_stores > 1) {
-        /*
-         * More than one operand of a direction.  QEMU's list is in
-         * emission order and the tracer's is in Capstone operand order;
-         * nothing proves the k-th of one is the k-th of the other, and
-         * a mask attached to the wrong access is worse than no mask.
-         */
-        multi = true;
-    }
-    if (shape_bad || multi) {
-        unsigned r = shape_bad ? QDEP_R_SHAPE : QDEP_R_MULTI;
-        if (state == QDEP_OK) {
-            state = r;
-        }
-        if (dstate == QDEP_OK) {
-            dstate = r;
-        }
-    }
-
     /* ---------------- the HAS_ADDR block ---------------- */
+    /*
+     * One mask per ACCESS, and slot k is QEMU's access k in both the count
+     * and the mask.  The MULTI refusal that used to sit here -- "nothing
+     * proves the k-th of one list is the k-th of the other" -- was true of
+     * two lists and has no subject when there is one.
+     */
+    char why[64] = "";
+    char dwhy[64] = "";
+    uint64_t ld_mask[QDEP_MAX_ACCESS];
+    uint64_t st_mask[QDEP_MAX_ACCESS];
+    memset(ld_mask, 0, sizeof(ld_mask));
+    memset(st_mask, 0, sizeof(st_mask));
 
-    uint64_t ld_mask = 0, st_mask = 0;
     if (state == QDEP_OK) {
-        if (f->max_dep_loads > 0 &&
-            !regs_to_mask(f, q->load_regs, q->n_load_regs, 0, &ld_mask)) {
-            state = QDEP_R_UNREPRESENTABLE;
-        } else if (f->max_dep_stores > 0 &&
-                   !regs_to_mask(f, q->store_regs, q->n_store_regs, 0,
-                                 &st_mask)) {
-            state = QDEP_R_UNREPRESENTABLE;
+        for (uint8_t k = 0; k < mdl_new && state == QDEP_OK; k++) {
+            if (!regs_to_mask(f, q->load_addr_regs[k],
+                              q->n_load_addr_regs[k], 0, &ld_mask[k],
+                              why, sizeof(why))) {
+                state = QDEP_R_UNREPRESENTABLE;
+            }
+        }
+        for (uint8_t k = 0; k < mds_new && state == QDEP_OK; k++) {
+            if (!regs_to_mask(f, q->store_addr_regs[k],
+                              q->n_store_addr_regs[k], 0, &st_mask[k],
+                              why, sizeof(why))) {
+                state = QDEP_R_UNREPRESENTABLE;
+            }
         }
     }
 
@@ -873,42 +1012,14 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * return to the Capstone answer that used to be here.
          */
         f->has_addr_deps = false;
+        note_refusal(mnem, state, "addr ", why);
         g_state[state].fetch_add(1, std::memory_order_relaxed);
     } else {
-        /* The shadow, taken BEFORE the overwrite -- afterwards there is
-         * nothing left to compare against. */
-        if (!f->has_addr_deps) {
-            g_shadow_absent.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            /*
-             * Compared as WHOLE MASKS, not as register sets.  An address
-             * mask has an immediate bit as well as its register bits, and a
-             * comparison over register sets alone cannot see it -- so a row
-             * whose immediate bit this flip drops would have been scored as
-             * agreement.  That is the erasure shape irdf's REG_IP drop had,
-             * and it is not repeated here.
-             */
-            if (f->max_dep_loads > 0 && f->load_addr_dep_mask[0] != ld_mask) {
-                g_shadow_ld_diff.fetch_add(1, std::memory_order_relaxed);
-                mask_shadow_sig(&g_shadow_sigs, mnem, f, 0, "ldaddr",
-                                f->load_addr_dep_mask[0], ld_mask);
-            } else if (f->max_dep_loads > 0) {
-                g_shadow_ld_same.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (f->max_dep_stores > 0 && f->store_addr_dep_mask[0] != st_mask) {
-                g_shadow_st_diff.fetch_add(1, std::memory_order_relaxed);
-                mask_shadow_sig(&g_shadow_sigs, mnem, f, 0, "staddr",
-                                f->store_addr_dep_mask[0], st_mask);
-            } else if (f->max_dep_stores > 0) {
-                g_shadow_st_same.fetch_add(1, std::memory_order_relaxed);
-            }
+        for (uint8_t k = 0; k < mdl_new; k++) {
+            f->load_addr_dep_mask[k] = ld_mask[k];
         }
-
-        for (uint8_t k = 0; k < f->max_dep_loads; k++) {
-            f->load_addr_dep_mask[k] = ld_mask;
-        }
-        for (uint8_t k = 0; k < f->max_dep_stores; k++) {
-            f->store_addr_dep_mask[k] = st_mask;
+        for (uint8_t k = 0; k < mds_new; k++) {
+            f->store_addr_dep_mask[k] = st_mask[k];
         }
         f->has_addr_deps = true;
         g_state[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
@@ -916,19 +1027,26 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
 
     /* ---------------- the store-data half of HAS_REG ---------------- */
 
-    if (f->max_dep_stores == 0) {
-        /* No store operand: no store_data_dep[] array exists to write. */
-        g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
+    if (mds_new == 0) {
+        /* No store slot: no store_data_dep[] array exists to write. */
+        g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
+            .fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    uint64_t sd_mask = 0;
-    if (dstate == QDEP_OK &&
-        !regs_to_mask(f, q->data_regs, q->n_data_regs, q->data_load_slots,
-                      &sd_mask)) {
-        dstate = QDEP_R_UNREPRESENTABLE;
+    uint64_t sd_mask[QDEP_MAX_ACCESS];
+    memset(sd_mask, 0, sizeof(sd_mask));
+    if (dstate == QDEP_OK) {
+        for (uint8_t k = 0; k < mds_new && dstate == QDEP_OK; k++) {
+            if (!regs_to_mask(f, q->store_data_regs[k],
+                              q->n_store_data_regs[k],
+                              q->store_data_load_slots[k], &sd_mask[k],
+                              dwhy, sizeof(dwhy))) {
+                dstate = QDEP_R_UNREPRESENTABLE;
+            }
+        }
     }
-    if (dstate == QDEP_OK && sd_mask == 0 && f->has_immediate) {
+    if (dstate == QDEP_OK && f->has_immediate) {
         /*
          * The stored value came from no register, no load slot and no env
          * state -- and the provenance that says so is COMPLETE, because
@@ -945,7 +1063,11 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * not exist would be naming a source rather than reporting one; that
          * row publishes the empty mask, which is true as far as it goes.
          */
-        sd_mask = 1ULL << (f->n_src_regs + f->max_dep_loads);
+        for (uint8_t k = 0; k < mds_new; k++) {
+            if (sd_mask[k] == 0) {
+                sd_mask[k] = 1ULL << (f->n_src_regs + f->max_dep_loads);
+            }
+        }
     }
 
     if (!f->has_reg_deps) {
@@ -957,20 +1079,13 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * so the report can say how much precision that costs: QDEP_NO_BLOCK
          * where QEMU HAD an answer, the refusal reason where it did not.
          */
+        if (dstate != QDEP_OK) {
+            note_refusal(mnem, dstate, "sdata(HAS_REG clear, unpublished)",
+                         dwhy);
+        }
         g_dstate[dstate == QDEP_OK ? QDEP_NO_BLOCK : dstate]
             .fetch_add(1, std::memory_order_relaxed);
         return;
-    }
-
-    /* The shadow, taken BEFORE the overwrite. */
-    if (dstate == QDEP_OK) {
-        uint64_t cap_mask = f->store_data_dep_mask[0];
-        if (cap_mask == sd_mask) {
-            g_shadow_sd_same.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_shadow_sd_diff.fetch_add(1, std::memory_order_relaxed);
-            data_shadow_sig(mnem, f, cap_mask, sd_mask);
-        }
     }
 
     /*
@@ -980,9 +1095,12 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * mask staying where it is -- a family whose source has flipped may not
      * have rows still quietly carrying the old one.
      */
-    uint64_t publish = (dstate == QDEP_OK) ? sd_mask : all_inputs_mask(f);
-    for (uint8_t k = 0; k < f->max_dep_stores; k++) {
-        f->store_data_dep_mask[k] = publish;
+    for (uint8_t k = 0; k < mds_new; k++) {
+        f->store_data_dep_mask[k] =
+            (dstate == QDEP_OK) ? sd_mask[k] : all_inputs_mask(f);
+    }
+    if (dstate != QDEP_OK) {
+        note_refusal(mnem, dstate, "sdata", dwhy);
     }
     g_dstate[dstate].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1005,11 +1123,11 @@ void qdep_report(GString *report)
         "Three of the template dependency sub-block's four families --\n"
         "load_addr_dep[], store_addr_dep[] and store_data_dep[] -- are\n"
         "written from the provenance QEMU's own tcg_gen_qemu_ld/st emitters\n"
-        "stated for each access, not from the Capstone MEM operand.  A row\n"
-        "this extractor cannot state IN FULL reaches the format's own\n"
-        "all-inputs default; it never publishes a short mask and never falls\n"
-        "back to the Capstone answer.  The refusal rows below are that\n"
-        "fallback, counted.\n");
+        "stated for each access, and the number of SLOTS each family has is\n"
+        "the length of that access list.  A row this extractor cannot state\n"
+        "IN FULL reaches the format's own default -- all-inputs for a mask,\n"
+        "ZERO slots for a count -- and never falls back to the Capstone\n"
+        "operand walk.  The refusal rows below are that default, counted.\n");
 
     g_string_append(report, "\naddress families (HAS_ADDR):\n");
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
@@ -1032,31 +1150,11 @@ void qdep_report(GString *report)
         g_string_append_printf(report, "  extractor DISABLED: %s\n", g_refusal);
     }
 
-    g_string_append(report,
-        "\nthe Capstone shadow, on the rows the wire now takes from QEMU\n"
-        "(compared before the overwrite; it feeds nothing):\n");
-    g_string_append_printf(report,
-        "  load address:  %" G_GUINT64_FORMAT " same, %" G_GUINT64_FORMAT " differ\n"
-        "  store address: %" G_GUINT64_FORMAT " same, %" G_GUINT64_FORMAT " differ\n"
-        "  store data:    %" G_GUINT64_FORMAT " same, %" G_GUINT64_FORMAT " differ\n"
-        "  %" G_GUINT64_FORMAT " rows had no Capstone address block to compare\n",
-        g_shadow_ld_same.load(std::memory_order_relaxed),
-        g_shadow_ld_diff.load(std::memory_order_relaxed),
-        g_shadow_st_same.load(std::memory_order_relaxed),
-        g_shadow_st_diff.load(std::memory_order_relaxed),
-        g_shadow_sd_same.load(std::memory_order_relaxed),
-        g_shadow_sd_diff.load(std::memory_order_relaxed),
-        g_shadow_absent.load(std::memory_order_relaxed));
-
     g_mutex_lock(&g_tally_lock);
-    dump_tally(report, g_shadow_sigs,
-               "address shadow disagreements (qemu-extra = a register the OLD "
-               "wire's mask did NOT name):");
-    dump_tally(report, g_sd_sigs,
-               "store-data shadow disagreements, by BIT of the published mask\n"
-               "(qemu-extra = an input the OLD wire's mask did NOT name):");
     dump_tally(report, g_unmapped_name,
                "globals a provenance named that have no generic word\n(per ACCESS, so an instruction refused on both an address and a datum\ncounts twice here and once above):");
+    dump_tally(report, g_refusal_sig,
+               "refused rows by mnemonic and reason (the format default,\nwritten out; `count` means the SLOT COUNT went to zero):");
     dump_tally(report, g_monitor_name,
                "reservation-monitor value globals a store's datum named\n(the emulation-artefact category, #177 / f46873a738 -- NOT a decoder gap):");
     g_mutex_unlock(&g_tally_lock);

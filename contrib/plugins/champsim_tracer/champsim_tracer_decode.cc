@@ -1349,12 +1349,17 @@ void decode_detail_to_generic(uint64_t pc,
             addr_mask |= add_src_cap_reg(out, out_names, op->segment_id);
 
             /*
-             * Count against the template-static MAX load/store totals,
-             * which bound the dep-mask layout (loads at bits
-             * [n_src_regs, n_src_regs+max_dep_loads); stores feed
-             * store_data_dep_mask[max_dep_stores]).  LEA / prefetch-hint
-             * MEM operands lack both READ and WRITE — no real memop,
-             * don't count.
+             * An INTERIM count, and it does not reach the wire.
+             * qdep_apply() runs after this walk and after every refiner
+             * and overwrites both totals with the number of memory
+             * ACCESS RECORDS QEMU's own emitters stated -- see
+             * champsim_tracer_qdep.h.  What the walk still decides is
+             * the dep-mask layout the refiners write into
+             * (loads at bits [n_src_regs, n_src_regs+max_dep_loads);
+             * stores feed store_data_dep_mask[max_dep_stores]), which
+             * qdep_apply() then re-seats onto its own count.  LEA /
+             * prefetch-hint MEM operands lack both READ and WRITE — no
+             * real memop, don't count.
              *
              * THIS IS A COUNT OF STATIC MEMORY OPERANDS, NOT OF
              * ACCESSES, and the runtime count is routinely LARGER.  One

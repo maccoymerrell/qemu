@@ -965,12 +965,13 @@ static void write_template_profile(BitWriter *sub,
  * Write the template dictionary section.  Wire layout (template and
  * per-insn record fields) is specified in docs/format.rst.
  *
- * Encoding gotcha: max_dep_loads / max_dep_stores are template-static
- * MAX counts, not per-iter.  max_dep_loads bounds the dep-mask bit
- * layout (load slots occupy bits [n_src, n_src+max_dep_loads));
- * max_dep_stores sizes store_data_dep_mask[] in the HAS_REG sub-block.
- * The runtime per-iter counts ride separately on CST_FID_N_LOADS /
- * CST_FID_N_STORES and may be smaller.
+ * Encoding gotcha: max_dep_loads / max_dep_stores count static memory
+ * ACCESS RECORDS as QEMU's emitters stated them, not per-iter accesses.
+ * max_dep_loads bounds the dep-mask bit layout (load slots occupy bits
+ * [n_src, n_src+max_dep_loads)); max_dep_stores sizes
+ * store_data_dep_mask[] in the HAS_REG sub-block.  The runtime per-iter
+ * counts ride separately on CST_FID_N_LOADS / CST_FID_N_STORES and may
+ * be smaller OR larger.
  */
 static void write_bin_templates(BitWriter *bw)
 {

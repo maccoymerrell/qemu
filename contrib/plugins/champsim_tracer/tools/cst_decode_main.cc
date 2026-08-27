@@ -1110,11 +1110,13 @@ void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
  * Uncovered ones get a trailing "  ld[..](0x..)"/"  st(0x..)".  Two
  * kinds are uncovered:
  *
- *   - No static slot at all (load_idx >= max_dep_loads): typically the
- *     implicit stack memops on CALL/PUSH/POP/RET that Capstone doesn't
- *     enumerate, so the walker never bumped max_dep_loads/stores.  The
- *     decoder has no address-input set for these and prints a bare
- *     "ld(0x..)".
+ *   - No static slot at all (load_idx >= max_dep_loads): the execution
+ *     performed more accesses of that direction than the template has
+ *     static records for.  One record repeating is the ordinary case --
+ *     `ld4 {v0.16b-v3.16b},[x1]` is one record and 64 memops, MIPS `swr`
+ *     one record and one to four -- and a zero count is a writer that had
+ *     no static answer to give at all.  The decoder has no address-input
+ *     set for these and prints a bare "ld(0x..)".
  *   - A static slot that the operand renderer did not place: the slot
  *     exists and HAS_ADDR describes it, but the wire's dep masks route
  *     every sink around the load_data input, so it reached no arrow.

@@ -36,11 +36,15 @@ extern "C" {
  *   bits [n_src_regs,    n_src_regs + max_dep_loads)     load_data[i]
  *   bit   n_src_regs + max_dep_loads                      immediate
  *
- * @max_dep_loads / @max_dep_stores are populated by the operand
- * walker at template-build time from MEM-op access flags.  They are
- * the template-static MAX counts (the runtime per-iteration count
- * rides on CST_FID_N_LOADS / CST_FID_N_STORES deltas and can be
- * smaller, but never larger — they bound the static mask width).
+ * @max_dep_loads / @max_dep_stores are the counts of static memory
+ * ACCESS RECORDS.  A refiner sees the operand walker's interim value;
+ * qdep_apply() runs AFTER every refiner and overwrites it with QEMU's
+ * own access count, which is why a refiner's load-slot and immediate
+ * bits are re-seated onto the new run at that point rather than being
+ * trusted where they sit (champsim_tracer_qdep.cc, carry_load_band).
+ * They do NOT bound the runtime per-execution count, which rides on
+ * CST_FID_N_LOADS / CST_FID_N_STORES and is routinely larger — one
+ * record repeats (x86 XSAVEOPT is one store record issuing 88 stores).
  *
  * Refiners run once at template-construction time (per unique PC),
  * never during tracing.  Keep them branchy-but-cheap; consumers

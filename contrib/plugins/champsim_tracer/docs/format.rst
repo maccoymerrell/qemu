@@ -517,9 +517,9 @@ Decode by repeated outer-section unwrapping.
           n_dst              : u8
           src_regs[n_src]    : u8 each    ; resolve via encoding_maps.reg
           dst_regs[n_dst]    : u8 each    ; resolve via encoding_maps.reg
-          max_dep_loads      : u8         ; static memory-OPERAND count
-                                          ; (not an access count -- see below)
-          max_dep_stores     : u8         ; static memory-OPERAND count
+          max_dep_loads      : u8         ; static ACCESS-RECORD count
+                                          ; (not a per-execution count -- see below)
+          max_dep_stores     : u8         ; static ACCESS-RECORD count
           if (flags & ids.insn_flag_has_imm):
             immediate        : SLEB
           insn_size          : u8         ; 0..16
@@ -535,18 +535,32 @@ Decode by repeated outer-section unwrapping.
             load_addr_dep[0..max_dep_loads-1]    : ULEB each
             store_addr_dep[0..max_dep_stores-1]  : ULEB each
         ``max_dep_loads`` and ``max_dep_stores`` count the instruction's
-        static memory OPERANDS, and they exist to size the per-operand
-        address-dependency arrays above.  They are not a bound on how
-        many accesses an execution performs, and the dynamic count is
-        frequently larger: one operand expands into as many accesses as
-        the form performs, so AArch64 ``ld4 {v0.16b-v3.16b}, [x1]`` is
-        one operand publishing 64 memops, and x86 ``XSAVEOPT`` is one
-        operand issuing tens of stores.  One address mask describes every
-        access an operand expands into, because they all compute their
-        address from the same input registers.  The per-access stream is
-        ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` and the slot fields
-        they gate, bounded by ``CST_FID_SLOT_COUNT``; a consumer sizing a
-        per-access array must read those and never these.
+        static memory ACCESS RECORDS -- the guest accesses of each
+        direction that the emulator's own load/store emitters stated for
+        this instruction -- and they exist to size the per-access
+        dependency arrays above.  Slot ``k`` of ``load_addr_dep[]`` is
+        the ``k``-th LOAD record and slot ``k`` of ``store_addr_dep[]``
+        / ``store_data_dep[]`` is the ``k``-th STORE record, both in
+        emission order.
+
+        They are *not* a bound on how many accesses an execution
+        performs, and the dynamic count is frequently larger: one record
+        may repeat, so AArch64 ``ld4 {v0.16b-v3.16b}, [x1]`` publishes 64
+        memops, x86 ``XSAVEOPT`` issues tens of stores, and MIPS ``swr``
+        writes one to four bytes depending on the runtime alignment.  One
+        address mask describes every access a record expands into,
+        because they all compute their address from the same input
+        registers.  The per-access stream is ``CST_FID_N_LOADS`` /
+        ``CST_FID_N_STORES`` and the slot fields they gate, bounded by
+        ``CST_FID_SLOT_COUNT``; a consumer sizing a per-execution array
+        must read those and never these.
+
+        A count of ZERO means the writer had no static answer to give --
+        either the instruction performs no access of that direction, or
+        the access list could not be stated in full.  The direction then
+        has no mask array at all and the consumer is at the all-to-all
+        default, with the dynamic stream still describing what ran.  Zero
+        is never a claim that no access occurs.
 
         Mask array sizes all come from the outer template header
         (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
@@ -3490,8 +3504,8 @@ before the payload.
    |   n_dst           u8                             |
    |   src_regs        u8[n_src]                      |
    |   dst_regs        u8[n_dst]                      |
-   |   max_dep_loads   u8      template-static MAX     |
-   |   max_dep_stores  u8      template-static MAX     |
+   |   max_dep_loads   u8      static access records |
+   |   max_dep_stores  u8      static access records |
    |   immediate       SLEB    only if HAS_IMM        |
    |   insn_size       u8                             |
    |   insn_bytes      bytes[insn_size]               |
@@ -3514,10 +3528,11 @@ sub-block follows the instruction bytes:
 
 Mask array sizes (``n_dst``, ``max_dep_loads``, ``max_dep_stores``) all
 come from the outer template header — the dep block itself carries
-only the masks.  ``max_dep_loads`` / ``max_dep_stores`` are the
-template-static MAX counts; the runtime per-iteration mem-op counts
-ride on ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` and can be smaller
-(e.g. a conditional load that didn't fire) but never larger.
+only the masks.  ``max_dep_loads`` / ``max_dep_stores`` are the counts
+of static ACCESS RECORDS, defined in Step 4.5 above; the runtime
+per-execution mem-op counts ride on ``CST_FID_N_LOADS`` /
+``CST_FID_N_STORES`` and may be either smaller (a conditional access
+that did not fire) or larger (one record repeating).
 
 Bit layout inside each register/load mask:
 

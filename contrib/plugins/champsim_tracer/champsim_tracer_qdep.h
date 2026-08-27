@@ -70,18 +70,57 @@
  * 48,374 blocks are unchanged (SETPROOF.txt): this is a permutation of the
  * coordinate system and not a change of content.
  *
- * WHAT IS STILL CAPSTONE'S, so this paragraph cannot be read as more than
- * it says.  The mutation arms still SUPPRESS address blocks -- 8,980 of
- * 10,272 on x86_64's access arm reach the format default instead of being
- * published -- and the route is not the indexing.  It is
- * `max_dep_loads` / `max_dep_stores`: template-header scalars that the
- * Capstone operand walk counts, that this file's shape and multi gates
- * compare QEMU's access list against, and that SIZE the mask arrays.  The
- * same two scalars set the load-data and immediate bit offsets, so the
- * STORE-DATA family is invariant in its register bits and not in those two.
- * Re-sourcing them from QEMU is a content change and not a format change,
- * but it moves the runtime memop slot layout as well as the wire, so it is
- * its own pass, not a corollary of this one.
+ * AND THE SLOTS ARE PER ACCESS, WHICH IS THE ADMISSION HALF.  Until
+ * 2026-08-27 the mask ARRAYS were sized by `max_dep_loads` /
+ * `max_dep_stores` as the Capstone operand walk counted them, and this file
+ * compared QEMU's access list against that count in two gates -- a SHAPE
+ * gate (a direction one side claims and the other does not) and a MULTI
+ * gate (>1 operand of a direction, where nothing proved the k-th of one
+ * list was the k-th of the other).  Both gates spoke Capstone's number, so
+ * corrupting Capstone's operands SUPPRESSED published address blocks
+ * wholesale: 8,980 of 10,272 on x86_64's access arm reached the format
+ * default instead of being published.
+ *
+ * THE TWO LISTS WERE NEVER TWO ANSWERS TO ONE QUESTION.  Capstone counts
+ * static memory OPERANDS; QEMU's memop list counts ACCESSES, one
+ * tcg_gen_qemu_ld/st each.  `vmovdqu (%rax),%ymm0` is one operand and two
+ * QEMU loads; `stp x0,x1,[sp]` is one operand and two QEMU stores; `lock
+ * cmpxchgl` has a store the operand walk never counted.  Measured over the
+ * four-ISA workload, 95 of 12,623 templates disagreed and QEMU was LONGER
+ * on 91 of them.
+ *
+ * So the counts are QEMU's, per access, and four things follow at once:
+ * the mask arrays are sized by QEMU's access count; the load-data and
+ * immediate BIT OFFSETS of the register masks (`n_src + max_dep_loads`)
+ * move onto that count; the decoder's runtime slot cap admits accesses
+ * that had no static slot at all; and the MULTI refusal DISSOLVES, because
+ * with both the count and the masks coming from ONE list the k-th pairing
+ * is true by construction rather than assumed.
+ *
+ * WHEN QEMU CANNOT STATE THE COUNT, and this is where J7 is easiest to
+ * break.  One shape: the extraction reported itself INCOMPLETE
+ * (`memops_truncated` / `memops_unnoted` / a truncated provenance ->
+ * QDEP_R_STATUS), or it withheld the list entirely (QDEP_R_NORECORD).  The
+ * list is then not a count of anything, so the instruction reaches the
+ * format's own default -- ZERO static slots, no mask array, the consumer
+ * back at all-to-all with the DYNAMIC count still riding CST_FID_N_LOADS /
+ * CST_FID_N_STORES -- and is COUNTED.  It never reaches back to Capstone's
+ * number, which is what J7 forbids and what "leave it there and you will
+ * rely on it" predicts would happen.
+ *
+ * `count_unbounded` IS NOT THAT SHAPE, and the first draft of this flip
+ * treated it as one.  The flag says a helper repeats ONE stated access a
+ * data-dependent number of times -- mipsel `swr` writes one to four bytes
+ * from one base depending on the runtime alignment (target/mips/tcg/
+ * ldst_helper.c:94) -- and this field has never been a bound on the DYNAMIC
+ * count.  champsim_tracer_mnemonics.h says so in as many words: the static
+ * caps and the wire's per-execution slot ceiling are "deliberately NOT the
+ * same quantity", and x86 XSAVEOPT is ONE static store slot issuing 88
+ * stores.  So an unbounded repetition is one ACCESS RECORD carrying one
+ * address mask, exactly as it always was, and the repetition rides the
+ * dynamic stream.  Refusing the count for it would have dropped mipsel
+ * `swr`'s published store address on a stricter reading of the field than
+ * the field has ever had -- measured, one row.
  *
  * THE HAS_REG FLAG IS SHARED, and that bounds this flip in a way the address
  * flip was not bounded.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs
@@ -123,6 +162,16 @@ struct InsnRegNames;
  */
 #define QDEP_MAX_ADDR_REGS 8
 
+/*
+ * How many ACCESSES of one direction this extractor holds per instruction.
+ *
+ * Not a guess: INSN_DF_MAX_MEMOPS is 8 on the QEMU side, so a form with more
+ * accesses than this arrives with `memops_truncated` already set and is
+ * refused one gate earlier.  Sized to match so the two caps cannot disagree
+ * about which instruction was refused and why.
+ */
+#define QDEP_MAX_ACCESS 8
+
 /* Why an instruction's dependency block is what it is.  Exactly one applies
  * per family.  The address family cannot reach QDEP_R_EMU_MONITOR (R9's
  * alias note already substitutes the guest register there); the data family
@@ -134,8 +183,19 @@ enum QDepState : uint8_t {
     QDEP_OK,             /* QEMU stated it; the masks below are the wire's */
     QDEP_R_STATUS,       /* the extraction reported itself incomplete */
     QDEP_R_NORECORD,     /* qemu withheld the access list or a provenance */
-    QDEP_R_MULTI,        /* >1 operand of a direction: slot pairing unproven */
-    QDEP_R_SHAPE,        /* a direction the tracer claims that QEMU did not emit */
+    /*
+     * QDEP_R_MULTI AND QDEP_R_SHAPE STOOD HERE, and are deleted rather than
+     * left as a gap nobody can read.
+     *
+     * MULTI refused every instruction with more than one operand of a
+     * direction because "nothing proves the k-th of one list is the k-th of
+     * the other" -- true while the COUNT came from Capstone's operand walk
+     * and the MASKS came from QEMU's access list.  With both from one list
+     * the k-th pairing is not assumed, it is the same k, and the refusal has
+     * nothing left to refuse.  SHAPE refused an instruction whose claimed
+     * direction QEMU did not emit; that claim was Capstone's and is no
+     * longer made.
+     */
     QDEP_R_FIELD,        /* provenance named env state with no generic word */
     QDEP_R_UNMAPPED,     /* provenance named a global with no generic word */
     QDEP_R_WIDE,         /* more regs than QDEP_MAX_ADDR_REGS */
@@ -195,21 +255,43 @@ enum QDepState : uint8_t {
 struct QDepInsn {
     uint8_t state;          /* address family */
     uint8_t data_state;     /* store-data family */
-    bool    qemu_has_load;
-    bool    qemu_has_store;
-    uint8_t n_load_regs;
-    uint8_t n_store_regs;
-    uint8_t n_data_regs;
-    uint8_t load_regs[QDEP_MAX_ADDR_REGS];
-    uint8_t store_regs[QDEP_MAX_ADDR_REGS];
-    uint8_t data_regs[QDEP_MAX_ADDR_REGS];
     /*
-     * Which of THIS instruction's load slots the stored datum came from.
-     * A store's data provenance can name a value the same instruction
-     * loaded -- every read-modify-write does -- and the HAS_REG mask has a
-     * bit per load slot to carry it, so it is kept rather than refused.
+     * The access list was obtained at all.  False on the two shapes where
+     * QEMU said it could not tell us: the extraction reported itself
+     * incomplete, or it withheld the list.  Nothing below is then readable
+     * and the counts are not a MAX of anything.
      */
-    uint8_t data_load_slots;
+    bool    have_list;
+    /* QEMU's ACCESS counts, in the order the target emitted them. */
+    uint8_t n_loads;
+    uint8_t n_stores;
+    /*
+     * PER ACCESS, because the wire's slot k is now QEMU's access k.  A
+     * union over the accesses of a direction -- which is what this carried
+     * until 2026-08-27 -- says every access of `stp x0,x1,[sp]` depends on
+     * everything either of them depends on, which is true here only because
+     * they share a base and is not true in general.
+     */
+    uint8_t n_load_addr_regs[QDEP_MAX_ACCESS];
+    uint8_t load_addr_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
+    uint8_t n_store_addr_regs[QDEP_MAX_ACCESS];
+    uint8_t store_addr_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
+    uint8_t n_store_data_regs[QDEP_MAX_ACCESS];
+    uint8_t store_data_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
+    /*
+     * Which of THIS instruction's LOAD ACCESSES the stored datum came from,
+     * one bitmap per store access.  A store's data provenance can name a
+     * value the same instruction loaded -- every read-modify-write does --
+     * and the HAS_REG mask has a bit per load slot to carry it, so it is
+     * kept rather than refused.
+     *
+     * Indexed by LOAD ordinal, not by memop ordinal.  QEMU numbers the
+     * load-data provenance bits by position in the WHOLE access list
+     * (insn_dataflow_prov_memop), and the wire's load-data band is indexed
+     * by position among the LOADS; on any instruction whose accesses
+     * interleave, reading one as the other names a different slot.
+     */
+    uint8_t store_data_load_slots[QDEP_MAX_ACCESS];
 };
 
 /*
@@ -230,9 +312,16 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
  * that sets has_reg_deps writes store_data_dep_mask[] -- so a mask written
  * before them would be overwritten by them.
  *
- * Compares the Capstone-derived masks it is about to replace and counts the
- * verdict per family, then either writes QEMU's answer or falls back to the
- * format's default, by name.
+ * Sets the instruction's slot COUNTS from QEMU's access list first -- the
+ * masks below and the register masks' load-data / immediate bit offsets are
+ * all laid out against them -- then writes QEMU's answer per access, or the
+ * format's default, by name, where it could not be stated.
+ *
+ * No comparison against what it replaces.  There was one, a shadow census of
+ * the Capstone masks scored before the overwrite, and it was deleted with
+ * the gates that read Capstone's counts: a path whose source has become QEMU
+ * keeps no retained comparison arm, because a value still read is a value
+ * still relied on.  The one-time A/B lives in this wave's evidence.
  */
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 const char *mnem);

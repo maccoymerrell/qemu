@@ -224,11 +224,24 @@ typedef struct InsnFields {
      */
     bool    is_atomic;
     /*
-     * Template-static MAX memory read/write counts per execution
-     * (dynamic per-iteration counts ride CST_FID_N_LOADS /
-     * CST_FID_N_STORES deltas).  Also fix the dep-mask bit layout
-     * below.  Populated by the operand walker at template-build time;
-     * carried in the outer template header.
+     * How many static memory ACCESS RECORDS of each direction this
+     * instruction has, in the order QEMU's emitters stated them.  Slot k
+     * of load_addr_dep_mask[] is QEMU's k-th LOAD; slot k of the two
+     * store arrays is its k-th STORE.  Also fix the dep-mask bit layout
+     * below; carried in the outer template header.
+     *
+     * NOT a bound on the per-execution count, which rides CST_FID_N_LOADS
+     * / CST_FID_N_STORES and may be larger (one record repeating) or
+     * smaller (a conditional access that did not fire).
+     *
+     * The operand walker writes an interim value at template-build time
+     * and qdep_apply() OVERWRITES it with QEMU's access count -- the two
+     * were never counts of the same thing, since one Capstone MEM operand
+     * is two QEMU accesses on `vmovdqu`, `ldp` and `stp`, and `lock
+     * cmpxchgl` has a store no operand counted.  Zero means the writer
+     * had no static answer: either no access of that direction, or the
+     * access list could not be stated in full.  See
+     * champsim_tracer_qdep.h.
      */
     uint8_t  max_dep_loads;
     uint8_t  max_dep_stores;

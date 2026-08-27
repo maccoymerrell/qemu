@@ -266,6 +266,19 @@ typedef struct DfHelperField {
      * PUBLISHED, because the wire carries operands.
      */
     uint8_t kind;
+    /*
+     * The ARRAY INDEX was not stated in the source.
+     *
+     * `env->xregs[mops_destreg(syn)]` is a write to one general register and
+     * the source does not say which, so the range recorded here is the whole
+     * file.  Such a range REACHES PAST a register and is therefore named as
+     * none of them -- correctly, since calling it the first would publish a
+     * set short by thirty-one.  The bit exists so a consumer can tell that
+     * apart from a range that simply has no declared owner: this one is a
+     * write QEMU DID account for and could not narrow, which is a fact about
+     * the instruction rather than a gap in anybody's table.
+     */
+    uint8_t unbounded;
 } DfHelperField;
 
 #define DF_HF_OPERAND   0
@@ -301,6 +314,20 @@ typedef struct DfHelperUsage {
      * tcg_env if it takes one -- the same numbering hn->arg[] uses.
      */
     uint8_t argdir[DF_MAX_HELPER_ARGS];
+    /*
+     * Per LOGICAL argument: the EXTENT in bytes of the state that pointer
+     * reaches, or 0 for "not stated".  It is sizeof() the type the helper's
+     * own definition declares the parameter to point at.
+     *
+     * The gvec constructors state their operands' width at the call site and
+     * nothing stated it for anyone else, so every non-gvec pointer argument
+     * arrived here with extent 0 -- and a range of unstated width names no
+     * register, which is why `movsd`'s and `punpcklqdq`'s XMM destinations
+     * reached the wire with no QEMU write row behind them.  The gvec figure
+     * still wins where it exists: it is the width of THIS call, while this
+     * is the width of the parameter's type.
+     */
+    uint16_t argsize[DF_MAX_HELPER_ARGS];
     /* The footprint through tcg_env, complete when @env_bounded. */
     const DfHelperField *env;
     uint8_t n_env;
@@ -1020,6 +1047,7 @@ void insn_dataflow_note_reset(void)
 static const DfHelperNote *df_find_helper(const TCGOp *op);
 static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir);
 static const DfHelperUsage *df_helper_usage_row(const char *name);
+static uint32_t df_helper_argsize(const DfHelperUsage *u, unsigned argno);
 
 /*
  * CP-H census -- which helpers were reached, and WHY each one is not
@@ -1726,6 +1754,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                                 pf_size[n_pf] = row->env[q].size;
                                 pf_dir[n_pf] = row->env[q].dir;
                                 n_pf++;
+                                /*
+                                 * A member the row could not narrow to an
+                                 * element is still a footprint the helper
+                                 * has; it is published as the whole file and
+                                 * the instruction is labelled, because a
+                                 * consumer that REPLACES its own list with
+                                 * this one must not read "the file" as "these
+                                 * registers".
+                                 */
+                                if (row->env[q].unbounded) {
+                                    d->helper_writes_unbounded |=
+                                        (row->env[q].dir & INSN_DF_WR) != 0;
+                                }
                                 if (row->env[q].dir & INSN_DF_RD) {
                                     int b = df_intern(row->env[q].off,
                                                       row->env[q].size);
@@ -1798,6 +1839,23 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     }
                     if (dir == 0 && !df_helper_usage_of(hn->name, k, &dir)) {
                         dir = 0;
+                    }
+                    /*
+                     * THE EXTENT, when the constructor did not state one.
+                     *
+                     * A gvec call carries its operand size and this is not
+                     * reached; every other helper carried nothing, and a
+                     * range of width 0 resolves to no register at all --
+                     * insn_dataflow_field_reg() refuses it, correctly, since
+                     * a width it was not told cannot be shown to stay inside
+                     * one register.  The row's figure is sizeof() the type
+                     * the helper's own signature declares, so an SSE helper
+                     * handed &env->xmm_regs[n] now reaches the wire as a
+                     * write of THAT vector register instead of as an
+                     * unnamed byte range.
+                     */
+                    if (extent == 0) {
+                        extent = df_helper_argsize(row, k);
                     }
                     if (dir == 0) {
                         /* Nobody stated it.  Both directions, and say so. */
@@ -2426,7 +2484,7 @@ void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts)
  * instruction that reaches one.
  */
 static const DfHelperUsage df_helper_usage[] = {
-    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }
+    { NULL, { 0 }, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };
 #endif
 
@@ -2474,6 +2532,15 @@ static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir)
         return true;
     }
     return false;
+}
+
+/* The extent the row states for pointer argument @argno, or 0. */
+static uint32_t df_helper_argsize(const DfHelperUsage *u, unsigned argno)
+{
+    if (u && argno < DF_MAX_HELPER_ARGS) {
+        return u->argsize[argno];
+    }
+    return 0;
 }
 
 /*

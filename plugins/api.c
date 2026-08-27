@@ -578,6 +578,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.memops_count_unbounded = d->memops_count_unbounded;
     st.memops_addr_unstated = d->memops_addr_unstated;
     st.memops_data_unstated = d->memops_data_unstated;
+    st.helper_writes_unbounded = d->helper_writes_unbounded;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

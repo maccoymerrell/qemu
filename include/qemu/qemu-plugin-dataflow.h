@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 5
+#define QEMU_PLUGIN_DATAFLOW_VERSION 6
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -472,7 +472,22 @@ typedef struct qemu_plugin_dataflow_status {
     uint8_t  memops_count_unbounded;
     uint8_t  memops_addr_unstated;
     uint8_t  memops_data_unstated;
-    uint8_t  reserved[2];
+    /*
+     * A helper WROTE a register FILE and the index it wrote was computed at
+     * run time, so the range QEMU accounted for covers the file and names
+     * none of its elements: aarch64's MOPS set writes
+     * `env->xregs[mops_destreg(syndrome)]`.
+     *
+     * The write set this instruction reports is therefore a SUPERSET of the
+     * registers it names.  A consumer that FILLS its own destination list
+     * from these rows is unaffected -- every name it does get is real.  A
+     * consumer that REPLACES its list with them must refuse the instruction,
+     * because "somewhere in this file" is a different claim from "these
+     * registers" and publishing the named subset as complete would be a
+     * missing dependency.
+     */
+    uint8_t  helper_writes_unbounded;
+    uint8_t  reserved[1];
 } qemu_plugin_dataflow_status;
 
 /*

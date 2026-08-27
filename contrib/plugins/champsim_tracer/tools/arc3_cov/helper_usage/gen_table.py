@@ -90,8 +90,85 @@ def derive_guard(isa, libs, present):
     return out
 
 
+def _components(expr):
+    """Every member identifier in an access expression.
+
+    `cp15.sctlr_el[1]` -> {'cp15', 'sctlr_el'}.  The compiler names the
+    MEMBER it could not find, at whatever depth, so a row is matched against
+    the rejected name by its components rather than by its whole text.
+    Matching only the leading name made a family probe unable to drop
+    `keys.apia` when `keys` is absent on 32-bit arm, and the generator exited
+    "probe made no progress" instead of refusing the row.
+    """
+    return set(re.findall(r'[A-Za-z_][A-Za-z_0-9]*', expr))
+
+
+def check_sizeof(isa, types, workdir, lib=None):
+    """Type name -> sizeof, from the COMPILER, for the types it accepts.
+
+    The extent of the state a POINTER ARGUMENT reaches is the size of what it
+    points at, and the definition's own signature names that type.  Nothing
+    here computes a size; a type the target's headers cannot size simply gets
+    no entry, and the argument then states no extent -- which is what it did
+    before this existed, for every non-gvec helper there is.
+    """
+    if not types:
+        return {}
+    e = probe_cmd(isa, lib)
+    os.makedirs(workdir, exist_ok=True)
+    tag = (lib or LIB[isa]).replace('-', '_')
+    src = os.path.join(workdir, 'tprobe_%s.c' % tag)
+    remaining = sorted(types)
+    while True:
+        with open(src, 'w') as f:
+            f.write('#include "qemu/osdep.h"\n#include "cpu.h"\n')
+            f.write('#include <stdio.h>\nint main(void){\n')
+            for t in remaining:
+                f.write('  printf("%s %zu\\n", "{t}", sizeof({t}));\n'
+                        .format(t=t))
+            f.write('  return 0;\n}\n')
+        cmd = shlex.split(e['command'])
+        out, i = [], 0
+        while i < len(cmd):
+            a = cmd[i]
+            if a in ('-o', '-MQ', '-MF'):
+                i += 2; continue
+            if a in ('-c', '-MD', '-pipe', '-Werror'):
+                i += 1; continue
+            if a.endswith('.c'):
+                out.append(src); i += 1; continue
+            out.append(a); i += 1
+        binp = os.path.join(workdir, 'tprobe_%s' % tag)
+        out += ['-w', '-o', binp]
+        r = subprocess.run(out, cwd=e['directory'], capture_output=True,
+                           text=True)
+        if r.returncode == 0:
+            run = subprocess.run([binp], capture_output=True, text=True)
+            res = {}
+            for line in run.stdout.splitlines():
+                n, sz = line.rsplit(' ', 1)
+                res[n] = int(sz)
+            return res
+        bad = {t for t in remaining
+               if re.search(r'\b%s\b' % re.escape(t.split()[-1]), r.stderr)}
+        if not bad:
+            return {}
+        before = len(remaining)
+        remaining = [x for x in remaining if x not in bad]
+        if not remaining:
+            return {}
+        if len(remaining) == before:
+            return {}
+
+
 def check_fields(isa, fields, workdir, lib=None):
-    """Return the subset of @fields that really are CPUArchState members."""
+    """Return the subset of @fields that really are CPUArchState members.
+
+    A field may be a member NAME or an ACCESS EXPRESSION with a constant
+    subscript -- `regs[0]`.  The expression is what is offsetof'd, because
+    the element is what the helper wrote and a range spanning the whole file
+    reaches past every register in it and can be named as none of them.
+    """
     e = probe_cmd(isa, lib)
     os.makedirs(workdir, exist_ok=True)
     tag = (lib or LIB[isa]).replace('-', '_')
@@ -138,6 +215,9 @@ def check_fields(isa, fields, workdir, lib=None):
                              r.stderr))
         bad |= set(re.findall(r"no member named %s([A-Za-z_0-9]+)%s in" % (q, q),
                               r.stderr))
+        # The compiler names the MEMBER; an expression that reaches it -- at
+        # any depth, subscripted or not -- goes with it.
+        bad |= {x for x in remaining if _components(x) & bad}
         if not bad:
             raise SystemExit('probe failed for %s (%s) and named no member:'
                              '\n%s' % (isa, lib or LIB[isa], r.stderr[-4000:]))
@@ -275,12 +355,15 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
         if v.get('_guard'):
             w('#if %s\n' % v['_guard'])
         w('static const DfHelperField dfu_%s_env[] = {\n' % name)
+        unb = set(v.get('env_unbounded', []))
         for f, d in sorted(v['env'].items()):
             kind = 'DF_HF_XLAT' if f in v.get('xlat', []) else 'DF_HF_OPERAND'
             w('    { offsetof(CPUArchState, %s), '
-              'sizeof(((CPUArchState *)0)->%s), %s, %s },'
-              '   /* %s */\n'
-              % (f, f, DIRNAME[d], kind, v.get('env_where', {}).get(f, '')))
+              'sizeof(((CPUArchState *)0)->%s), %s, %s, %d },'
+              '   /* %s%s */\n'
+              % (f, f, DIRNAME[d], kind, 1 if f in unb else 0,
+                 v.get('env_where', {}).get(f, ''),
+                 ', INDEX NOT STATED' if f in unb else ''))
         w('};\n')
         if v.get('_guard'):
             w('#endif\n')
@@ -308,13 +391,19 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
         if v.get('_guard'):
             w('#if %s\n' % v['_guard'])
         ad = v.get('argdir', {})
-        dirs = []
+        asz = v.get('argsize', {})
+        dirs, sizes = [], []
         for k in range(8):
             x = ad.get(str(k), ad.get(k, 0))
             dirs.append(0 if x == 'env' else (x or 0))
+            sizes.append(int(asz.get(str(k), asz.get(k, 0)) or 0))
         while dirs and dirs[-1] == 0:
             dirs.pop()
-        w('    { "%s", { %s },\n' % (name, ', '.join(str(d) for d in dirs) or '0'))
+        while sizes and sizes[-1] == 0:
+            sizes.pop()
+        w('    { "%s", { %s }, { %s },\n'
+          % (name, ', '.join(str(d) for d in dirs) or '0',
+             ', '.join(str(z) for z in sizes) or '0'))
         if v['env']:
             w('      dfu_%s_env, ARRAY_SIZE(dfu_%s_env), true,\n'
               % (name, name))
@@ -327,7 +416,7 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
             w('      NULL, 0 },\n')
         if v.get('_guard'):
             w('#endif\n')
-    w('    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }\n};\n')
+    w('    { NULL, { 0 }, { 0 }, NULL, 0, false, NULL, NULL, 0 }\n};\n')
     return len(rows), refused, guarded
 
 
@@ -350,6 +439,46 @@ if __name__ == '__main__':
     for v in extra.values():
         fields |= set(v['env'])
     offs = check_fields(a.isa, fields, a.workdir)
+
+    # THE EXTENT OF EACH POINTER ARGUMENT, from its declared pointee type.
+    #
+    # A gvec constructor tells the call site how wide its operands are; every
+    # other helper told it nothing, so `helper_punpcklqdq_xmm(env, d, v, s)`
+    # reached a vector register through an argument whose extent was 0 -- and
+    # a range of unstated width names no register, which is why the wire's
+    # XMM destinations had no QEMU write row.  The type the DEFINITION
+    # declares is the fact; the compiler turns it into a size.
+    types = set()
+    for v in d['rows'].values():
+        if v['status'] == 'OK':
+            types |= set(v.get('argtype', {}).values())
+    tsz = check_sizeof(a.isa, types, a.workdir)
+    for v in d['rows'].values():
+        if v['status'] != 'OK':
+            continue
+        ad = v.get('argdir', {})
+        v['argsize'] = {}
+        for k, t in v.get('argtype', {}).items():
+            # tcg_env is not an operand: the env branch of the consumer
+            # handles it through the member list and never asks for an
+            # extent.  Emitting sizeof(CPUArchState) here would put a number
+            # in the table that nothing reads and that does not fit the
+            # field -- see the width check below.
+            if ad.get(k, ad.get(str(k))) == 'env':
+                continue
+            if t not in tsz:
+                continue
+            # A SIZE THAT DOES NOT FIT IS NOT STATED.
+            #
+            # The field is 16 bits.  Truncating a wider one would publish an
+            # extent SMALLER than the state the pointer reaches, and a short
+            # extent is exactly what lets a range be resolved to the wrong
+            # register -- the one error direction this table exists to avoid.
+            # Reporting nothing leaves the argument where it was before this
+            # column existed.
+            if tsz[t] > 0xffff:
+                continue
+            v['argsize'][k] = tsz[t]
 
     # The file is compiled by every target defining GUARD[isa], not only by
     # the one it is named for.  Probe all of them and partition the fields by

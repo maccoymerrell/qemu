@@ -263,6 +263,20 @@ typedef struct InsnDataflow {
      * none of them.
      */
     uint8_t  n_helper_unbounded;
+    /*
+     * A helper WROTE a register file whose element the reader could not
+     * name: `env->xregs[mops_destreg(syndrome)]`, where the index is
+     * computed at run time.  The write is accounted for -- the range covers
+     * the file -- and no element of it can be published, so the write set
+     * this instruction states is a SUPERSET of the registers it names.
+     *
+     * A consumer that merely FILLS its own destination list from these rows
+     * is unaffected.  A consumer that REPLACES its list with them must
+     * refuse this instruction, because "somewhere in the general file" is
+     * not the same claim as "these registers" and publishing the named
+     * subset as though it were complete would be a missing dependency.
+     */
+    uint8_t  helper_writes_unbounded;
 
     /*
      * The accesses themselves, in the order the target emitted them.

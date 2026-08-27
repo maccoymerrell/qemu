@@ -40,130 +40,137 @@
  */
 
 static const DfHelperField dfu_fadd_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:398 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:398 */
 };
 static const DfHelperField dfu_fcvt_d_l_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:518 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:518 */
 };
 static const DfHelperField dfu_fcvt_d_s_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:448 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:448 */
+};
+static const DfHelperField dfu_fcvt_d_w_env[] = {
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:508 */
 };
 static const DfHelperField dfu_fcvt_lu_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:503 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:503 */
 };
 static const DfHelperField dfu_fcvt_lu_s_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:343 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:343 */
 };
 static const DfHelperField dfu_fcvt_s_l_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:358 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:358 */
 };
 static const DfHelperField dfu_feq_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:478 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:478 */
 };
 static const DfHelperField dfu_flt_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:468 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:468 */
 };
 static const DfHelperField dfu_fmadd_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:151 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:151 */
 };
 static const DfHelperField dfu_fmadd_s_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:139 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:139 */
 };
 static const DfHelperField dfu_fmul_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:408 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:408 */
 };
 static const DfHelperField dfu_fmul_s_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:237 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:237 */
 };
 static const DfHelperField dfu_fsqrt_d_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:453 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:453 */
 };
 static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/riscv/op_helper.c:41 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/op_helper.c:41 */
 };
 static const DfHelperField dfu_set_rounding_mode_env[] = {
-    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:82 */
-    { offsetof(CPUArchState, frm), sizeof(((CPUArchState *)0)->frm), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/riscv/fpu_helper.c:60 */
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/riscv/op_helper.c:41 */
+    { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:82 */
+    { offsetof(CPUArchState, frm), sizeof(((CPUArchState *)0)->frm), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:60 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/op_helper.c:41 */
 };
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {
-    { offsetof(CPUArchState, elp), sizeof(((CPUArchState *)0)->elp), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:186 */
-    { offsetof(CPUArchState, menvcfg), sizeof(((CPUArchState *)0)->menvcfg), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:81 */
-    { offsetof(CPUArchState, misa_ext), sizeof(((CPUArchState *)0)->misa_ext), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu.h:572 */
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:146 */
-    { offsetof(CPUArchState, priv), sizeof(((CPUArchState *)0)->priv), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:76 */
-    { offsetof(CPUArchState, senvcfg), sizeof(((CPUArchState *)0)->senvcfg), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:79 */
-    { offsetof(CPUArchState, vill), sizeof(((CPUArchState *)0)->vill), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:166 */
-    { offsetof(CPUArchState, vl), sizeof(((CPUArchState *)0)->vl), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:164 */
-    { offsetof(CPUArchState, vstart), sizeof(((CPUArchState *)0)->vstart), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:164 */
-    { offsetof(CPUArchState, vtype), sizeof(((CPUArchState *)0)->vtype), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:160 */
-    { offsetof(CPUArchState, xl), sizeof(((CPUArchState *)0)->xl), INSN_DF_RD, DF_HF_XLAT },   /* ../target/riscv/cpu_helper.c:146 */
+    { offsetof(CPUArchState, elp), sizeof(((CPUArchState *)0)->elp), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:186 */
+    { offsetof(CPUArchState, menvcfg), sizeof(((CPUArchState *)0)->menvcfg), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:81 */
+    { offsetof(CPUArchState, misa_ext), sizeof(((CPUArchState *)0)->misa_ext), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu.h:572 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:146 */
+    { offsetof(CPUArchState, priv), sizeof(((CPUArchState *)0)->priv), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:76 */
+    { offsetof(CPUArchState, senvcfg), sizeof(((CPUArchState *)0)->senvcfg), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:79 */
+    { offsetof(CPUArchState, vill), sizeof(((CPUArchState *)0)->vill), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:166 */
+    { offsetof(CPUArchState, vl), sizeof(((CPUArchState *)0)->vl), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:164 */
+    { offsetof(CPUArchState, vstart), sizeof(((CPUArchState *)0)->vstart), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:164 */
+    { offsetof(CPUArchState, vtype), sizeof(((CPUArchState *)0)->vtype), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:160 */
+    { offsetof(CPUArchState, xl), sizeof(((CPUArchState *)0)->xl), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:146 */
 };
 
 static const DfHelperUsage df_helper_usage[] = {
-    { "fadd_d", { 0 },
+    { "fadd_d", { 0 }, { 0 },
       dfu_fadd_d_env, ARRAY_SIZE(dfu_fadd_d_env), true,
       "../target/riscv/fpu_helper.c:396",
       NULL, 0 },
-    { "fcvt_d_l", { 0 },
+    { "fcvt_d_l", { 0 }, { 0 },
       dfu_fcvt_d_l_env, ARRAY_SIZE(dfu_fcvt_d_l_env), true,
       "../target/riscv/fpu_helper.c:516",
       NULL, 0 },
-    { "fcvt_d_s", { 0 },
+    { "fcvt_d_s", { 0 }, { 0 },
       dfu_fcvt_d_s_env, ARRAY_SIZE(dfu_fcvt_d_s_env), true,
       "../target/riscv/fpu_helper.c:445",
       NULL, 0 },
-    { "fcvt_lu_d", { 0 },
+    { "fcvt_d_w", { 0 }, { 0 },
+      dfu_fcvt_d_w_env, ARRAY_SIZE(dfu_fcvt_d_w_env), true,
+      "../target/riscv/fpu_helper.c:506",
+      NULL, 0 },
+    { "fcvt_lu_d", { 0 }, { 0 },
       dfu_fcvt_lu_d_env, ARRAY_SIZE(dfu_fcvt_lu_d_env), true,
       "../target/riscv/fpu_helper.c:501",
       NULL, 0 },
-    { "fcvt_lu_s", { 0 },
+    { "fcvt_lu_s", { 0 }, { 0 },
       dfu_fcvt_lu_s_env, ARRAY_SIZE(dfu_fcvt_lu_s_env), true,
       "../target/riscv/fpu_helper.c:340",
       NULL, 0 },
-    { "fcvt_s_l", { 0 },
+    { "fcvt_s_l", { 0 }, { 0 },
       dfu_fcvt_s_l_env, ARRAY_SIZE(dfu_fcvt_s_l_env), true,
       "../target/riscv/fpu_helper.c:356",
       NULL, 0 },
-    { "feq_d", { 0 },
+    { "feq_d", { 0 }, { 0 },
       dfu_feq_d_env, ARRAY_SIZE(dfu_feq_d_env), true,
       "../target/riscv/fpu_helper.c:476",
       NULL, 0 },
-    { "flt_d", { 0 },
+    { "flt_d", { 0 }, { 0 },
       dfu_flt_d_env, ARRAY_SIZE(dfu_flt_d_env), true,
       "../target/riscv/fpu_helper.c:466",
       NULL, 0 },
-    { "fmadd_d", { 0 },
+    { "fmadd_d", { 0 }, { 0 },
       dfu_fmadd_d_env, ARRAY_SIZE(dfu_fmadd_d_env), true,
       "../target/riscv/fpu_helper.c:148",
       NULL, 0 },
-    { "fmadd_s", { 0 },
+    { "fmadd_s", { 0 }, { 0 },
       dfu_fmadd_s_env, ARRAY_SIZE(dfu_fmadd_s_env), true,
       "../target/riscv/fpu_helper.c:142",
       NULL, 0 },
-    { "fmul_d", { 0 },
+    { "fmul_d", { 0 }, { 0 },
       dfu_fmul_d_env, ARRAY_SIZE(dfu_fmul_d_env), true,
       "../target/riscv/fpu_helper.c:406",
       NULL, 0 },
-    { "fmul_s", { 0 },
+    { "fmul_s", { 0 }, { 0 },
       dfu_fmul_s_env, ARRAY_SIZE(dfu_fmul_s_env), true,
       "../target/riscv/fpu_helper.c:233",
       NULL, 0 },
-    { "fsqrt_d", { 0 },
+    { "fsqrt_d", { 0 }, { 0 },
       dfu_fsqrt_d_env, ARRAY_SIZE(dfu_fsqrt_d_env), true,
       "../target/riscv/fpu_helper.c:451",
       NULL, 0 },
-    { "raise_exception", { 0 },
+    { "raise_exception", { 0 }, { 0 },
       dfu_raise_exception_env, ARRAY_SIZE(dfu_raise_exception_env), true,
       "../target/riscv/op_helper.c:47",
       NULL, 0 },
-    { "set_rounding_mode", { 0 },
+    { "set_rounding_mode", { 0 }, { 0 },
       dfu_set_rounding_mode_env, ARRAY_SIZE(dfu_set_rounding_mode_env), true,
       "../target/riscv/fpu_helper.c:55",
       NULL, 0 },
-    { "lookup_tb_ptr", { 0 },
+    { "lookup_tb_ptr", { 0 }, { 0 },
       dfu_lookup_tb_ptr_env, ARRAY_SIZE(dfu_lookup_tb_ptr_env), true,
       "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
       NULL, 0 },
-    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }
+    { NULL, { 0 }, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };

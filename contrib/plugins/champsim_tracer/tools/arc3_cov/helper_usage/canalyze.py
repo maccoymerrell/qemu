@@ -61,6 +61,8 @@ class Unit:
             self.loc.append((cur_file, cur_line))
         self.funcs = {}
         self._index_functions()
+        self.enums = {}
+        self._index_enums()
 
     # -- function indexing ------------------------------------------------
     def _match_back(self, i, open_t, close_t):
@@ -90,6 +92,82 @@ class Unit:
                     return i
             i += 1
         return -1
+
+    def _index_enums(self):
+        """Bind enumeration constants to the integers QEMU gave them.
+
+        `env->regs[R_EAX]` is an access to ONE register and the source says
+        which: target/i386/cpu.h writes `R_EAX = 0`.  R_EAX is an ENUMERATOR,
+        not a macro, so the preprocessor leaves the identifier standing and a
+        reader that only accepts a numeric token sees a subscript it cannot
+        read -- which widened cpuid's four destinations to the whole 128-byte
+        `regs` array and lost every one of them a name.  Per R5 the
+        information is in the source; this reads it.
+
+        NOTHING IS EVALUATED.  A binding is taken only when the enumerator is
+        written as a plain integer literal, or is the implicit successor of
+        one already bound.  An initializer that is an expression stops the
+        run: that enumerator and every implicit one after it in the same
+        block stay unbound, so a name this reader is unsure of is a name it
+        does not have rather than one it computed.
+
+        A name bound to two different values in two blocks is DROPPED, since
+        an ambiguous constant would decide a subscript by which header the
+        reader happened to see first.
+        """
+        toks, n = self.toks, len(self.toks)
+        i = 0
+        seen = {}
+        while i < n:
+            if toks[i][1] != 'enum':
+                i += 1
+                continue
+            j = i + 1
+            if j < n and toks[j][0] == 'id':
+                j += 1            # a tag
+            if j >= n or toks[j][1] != '{':
+                i += 1
+                continue
+            close = self._match_fwd(j, '{', '}')
+            if close < 0:
+                i = j + 1
+                continue
+            self._read_enum_body(j + 1, close, seen)
+            i = close + 1
+        self.enums = {k: v for k, v in seen.items() if v is not None}
+
+    def _read_enum_body(self, lo, hi, seen):
+        toks = self.toks
+        nxt = 0                  # the next implicit value, None once lost
+        k = lo
+        while k < hi:
+            if toks[k][0] != 'id':
+                k += 1
+                continue
+            name = toks[k][1]
+            k += 1
+            val = nxt
+            if k < hi and toks[k][1] == '=':
+                k += 1
+                if k < hi and toks[k][0] == 'num' and \
+                        (k + 1 >= hi or toks[k + 1][1] == ','):
+                    txt = toks[k][1].rstrip('uUlL')
+                    val = int(txt, 0) if txt[:2].lower() == '0x' \
+                        else (int(txt) if txt.isdigit() else None)
+                    k += 1
+                else:
+                    val = None
+                # An expression initializer: this name and every implicit
+                # successor after it are unreadable.
+            nxt = None if val is None else val + 1
+            if val is not None:
+                if name in seen and seen[name] != val:
+                    seen[name] = None       # ambiguous: no binding at all
+                elif name not in seen:
+                    seen[name] = val
+            while k < hi and toks[k][1] != ',':
+                k += 1
+            k += 1
 
     def _index_functions(self):
         n = len(self.toks)
@@ -274,6 +352,10 @@ class Analysis:
         self.seen = set()
         self.where = {}         # field -> "file:line"
         self.pending_derived = {}
+        # Fields whose ARRAY INDEX was not a constant: the recorded range is
+        # the whole file and no element of it can be named.  Kept apart from
+        # env_fields so a row can state which of its members it narrowed.
+        self.env_unbounded = set()
         self.cpu_escapes = []   # unresolved callees reached via the CPU view
         # CP1.  Guest memory accesses the helper performs ITSELF, keyed by
         # (direction, address argument) -- see _guest_access().  The value
@@ -414,25 +496,96 @@ class Analysis:
             i += 1
 
     def _path_end(self, u, i, end):
-        """Consume root [-> . [ ] ]* and return the index one past it, plus
-        the first member name reached."""
+        """Consume root [-> . [ ] ]* and return (index past it, first member,
+        full access path, index-not-stated).
+
+        THE WHOLE PATH IS THE NAME, and a CONSTANT SUBSCRIPT is part of it.
+
+        `env->regs[R_EAX] = eax` is a write to ONE register and
+        `env->cp15.tpidr_el[0] = x` is a write to one system register.  Both
+        are valid offsetof designators, so the generator can hand each to the
+        compiler and get the element's own offset and width.  Recording only
+        the first member instead produced `regs` (128 bytes over sixteen
+        registers) and `cp15` (2,416 bytes over the whole system file) -- and
+        a range that reaches past a register is REFUSED downstream rather
+        than named, which is exactly why QEMU's write list came out short of
+        the machine's and cpuid's four destinations reached the wire with no
+        row behind them.
+
+        Enumerators are resolved because they are QEMU's own binding, not an
+        evaluation: see Unit._index_enums().
+
+        THE PATH STOPS WHERE THE READER STOPS BEING SURE:
+
+          a VARIABLE subscript -- `env->xregs[mops_destreg(syn)]` -- ends the
+          path at the array and reports index-not-stated, so the range is the
+          whole file and the caller knows it names no element of it.  Guessing
+          one is the error direction this file treats as disqualifying;
+
+          a `->` after the first step is a POINTER member, and what it reaches
+          is not inside CPUArchState at all, so the path ends at the pointer.
+
+        The FIRST member is still returned beside the path: the carrier-struct
+        rule (`ac->env`) keys on that name and must not see a path.
+        """
         toks = u.toks
         j = i + 1
-        field = None
+        first = None
+        path = None
+        var_index = False
+        step = 0
         while j < end:
             t = toks[j][1]
             if t in ('->', '.') and j + 1 < end and toks[j + 1][0] == 'id':
-                if field is None:
-                    field = toks[j + 1][1]
+                if step > 0 and t == '->':
+                    break       # a pointer member: outside CPUArchState
+                nm = toks[j + 1][1]
+                if first is None:
+                    first, path = nm, nm
+                elif path is not None:
+                    path = '%s.%s' % (path, nm)
+                step += 1
                 j += 2
             elif t == '[':
                 cl = u._match_fwd(j, '[', ']')
                 if cl < 0:
                     break
+                if path is not None:
+                    lit = self._const_index(u, j, cl)
+                    if lit is None:
+                        var_index = True
+                        path = None     # the path stops being nameable here
+                    else:
+                        path = '%s[%s]' % (path, lit)
                 j = cl + 1
             else:
                 break
-        return j, field
+        if path is None:
+            path = first
+        return j, first, path, var_index
+
+    @staticmethod
+    def _const_index(u, opn, cl):
+        """The integer between [ and ], as written, or None.
+
+        Accepted ONLY when the whole subscript is a single integer token --
+        the shape a macro constant leaves behind after expansion.  An
+        expression, even a constant-folding one, is not read: this reader
+        does not evaluate C, and a subscript it computed itself would be a
+        number nothing in the source states.
+        """
+        if cl != opn + 2:
+            return None
+        kind, text = u.toks[opn + 1]
+        if kind == 'id':
+            v = u.enums.get(text)
+            return None if v is None else str(v)
+        if kind != 'num':
+            return None
+        text = text.rstrip('uUlL')
+        if not text.isdigit():
+            return None
+        return text
 
     def _derived(self, u, lo, j, end, taint, newroot, fname):
         """An accessor expression spanning [lo, j) evaluates to @newroot."""
@@ -464,7 +617,7 @@ class Analysis:
         # one.  x86_cpu_xsave_xcr0_components() reads the feature words that
         # way and nothing else in helper_cpuid reaches them.
         if newroot == 'env' and nxt in ('->', '.'):
-            k, field = self._path_end(u, j - 1, end)
+            k, _first, field, var_index = self._path_end(u, j - 1, end)
             prev2 = toks[lo - 1][1] if lo > 0 else ''
             nxt2 = toks[k][1] if k < end else ''
             if nxt2 == '=':
@@ -477,12 +630,11 @@ class Analysis:
             if prev2 == '&':
                 d = RD | WR
             if field:
-                self.env_fields[field] = self.env_fields.get(field, 0) | d
-                self.where.setdefault(field, '%s:%d' % u.loc[j - 1])
+                self._note_env(field, d, '%s:%d' % u.loc[j - 1], var_index)
             return k
         # `env_cpu(env)->field` -- a CPUState member, outside this model.
         if nxt in ('->', '.'):
-            k, field = self._path_end(u, j - 1, end)
+            k, _first, field, _var = self._path_end(u, j - 1, end)
             return k
         if newroot == 'env':
             raise Refusal('the env view escapes into an expression this '
@@ -492,7 +644,7 @@ class Analysis:
     def _access(self, u, i, end, taint, fname):
         toks, loc = u.toks, u.loc
         root, off = taint[toks[i][1]]
-        j, field = self._path_end(u, i, end)
+        j, first, field, var_index = self._path_end(u, i, end)
         lo = i
         # A macro that parenthesises its result -- x86's CC_SRC expands to
         # (env->cc_src) -- puts the assignment operator OUTSIDE the paren, so
@@ -506,9 +658,11 @@ class Analysis:
             lo -= 1
             j += 1
             if j < end and toks[j][1] in ('->', '.', '['):
-                j2, f2 = self._path_end(u, j - 1, end)
+                j2, fi2, f2, v2 = self._path_end(u, j - 1, end)
                 if field is None:
                     field = f2
+                    first = fi2
+                    var_index = v2
                 j = j2
         prev = toks[lo - 1][1] if lo > 0 else ''
         nxt = toks[j][1] if j < end else ''
@@ -538,7 +692,7 @@ class Analysis:
         # the carrier's env member was consumed as an ordinary member of a
         # struct outside the model, and do_fldenv()'s whole footprint was
         # dropped on the floor.
-        if field == ENV_MEMBER and root != 'env':
+        if first == ENV_MEMBER and root != 'env':
             # Hand _derived the span that ends AT the env member, not at the
             # end of the whole path: `cpu->env.features[i]` continues past it
             # and _derived must see the `.` to know the access is an ordinary
@@ -589,13 +743,27 @@ class Analysis:
             self.arg_dir[root] = self.arg_dir.get(root, 0) | (RD | WR)
             return j
         if root == 'env':
-            self.env_fields[field] = self.env_fields.get(field, 0) | d
-            self.where.setdefault(field, '%s:%d' % loc[i])
+            self._note_env(field, d, '%s:%d' % loc[i], var_index)
         elif root in ('cpu', 'carrier'):
             pass            # not a CPUArchState member: outside the universe
         else:
             self.arg_dir[root] = self.arg_dir.get(root, 0) | d
         return j
+
+    def _note_env(self, field, d, where, var_index=False):
+        """Record one CPUArchState access, at the one place they are recorded.
+
+        @field is either a member name or `member[N]` with N the constant the
+        source wrote.  @var_index says the subscript was NOT a constant, so
+        the range recorded is the WHOLE array and the reader could not narrow
+        it -- that fact is kept, because a consumer replacing its own list
+        with this one has to know the difference between "these registers"
+        and "somewhere in this file".
+        """
+        self.env_fields[field] = self.env_fields.get(field, 0) | d
+        self.where.setdefault(field, where)
+        if var_index:
+            self.env_unbounded.add(field)
 
     def _scalar_roots(self, u, args):
         """Actual arguments that are a bare scalar this frame can name."""

@@ -48,102 +48,133 @@
  */
 
 static const DfHelperField dfu_cfc1_env[] = {
-    { offsetof(CPUArchState, CP0_Config5), sizeof(((CPUArchState *)0)->CP0_Config5), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:52 */
-    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:54 */
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:47 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, CP0_Config5), sizeof(((CPUArchState *)0)->CP0_Config5), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:52 */
+    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:54 */
+    { offsetof(CPUArchState, active_fpu.fcr0), sizeof(((CPUArchState *)0)->active_fpu.fcr0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:47 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:71 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_d_le_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1838 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1838 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1838 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_d_ule_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1814 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1814 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1814 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_d_un_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1798 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1798 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1798 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_s_eq_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1879 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1879 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1879 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_s_le_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1917 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1917 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1917 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_cmp_s_lt_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1911 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1911 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1911 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_add_d_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1222 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1222 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_add_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1232 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1232 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_cvt_w_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:387 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:387 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_cvtd_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:253 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:253 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
+};
+static const DfHelperField dfu_float_cvtd_w_env[] = {
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:262 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_div_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1340 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1340 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_mul_d_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1294 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1294 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_mul_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1304 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1304 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_sqrt_d_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:237 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:237 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_sqrt_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:244 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:244 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_sub_d_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1258 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1258 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_sub_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:1268 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:1268 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_trunc_w_d_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:504 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:504 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_float_trunc_w_s_env[] = {
-    { offsetof(CPUArchState, active_fpu), sizeof(((CPUArchState *)0)->active_fpu), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/fpu_helper.c:517 */
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, active_fpu.fcr31), sizeof(((CPUArchState *)0)->active_fpu.fcr31), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:214 */
+    { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:517 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_raise_exception_err_env[] = {
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/mips/tcg/exception.c:164 */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_swl_env[] = {
-    { offsetof(CPUArchState, CP0_Config0), sizeof(((CPUArchState *)0)->CP0_Config0), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/mips/internal.h:346 */
+    { offsetof(CPUArchState, CP0_Config0), sizeof(((CPUArchState *)0)->CP0_Config0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/internal.h:346 */
 };
 static const DfHelperField dfu_swr_env[] = {
-    { offsetof(CPUArchState, CP0_Config0), sizeof(((CPUArchState *)0)->CP0_Config0), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/mips/internal.h:346 */
+    { offsetof(CPUArchState, CP0_Config0), sizeof(((CPUArchState *)0)->CP0_Config0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/internal.h:346 */
 };
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {
-    { offsetof(CPUArchState, active_tc), sizeof(((CPUArchState *)0)->active_tc), INSN_DF_RD, DF_HF_XLAT },   /* ../target/mips/cpu.h:1432 */
-    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_XLAT },   /* ../target/mips/cpu.h:1434 */
+    { offsetof(CPUArchState, active_tc), sizeof(((CPUArchState *)0)->active_tc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/mips/cpu.h:1432 */
+    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/mips/cpu.h:1434 */
 };
 static const DfHelperAccess dfu_swl_acc[] = {
     { INSN_DF_WR, 2, 1, 1, 1 },   /* ../target/mips/tcg/ldst_helper.c:77, 4 site(s) */
@@ -153,113 +184,117 @@ static const DfHelperAccess dfu_swr_acc[] = {
 };
 
 static const DfHelperUsage df_helper_usage[] = {
-    { "cfc1", { 0 },
+    { "cfc1", { 0 }, { 0 },
       dfu_cfc1_env, ARRAY_SIZE(dfu_cfc1_env), true,
       "../target/mips/tcg/fpu_helper.c:41",
       NULL, 0 },
-    { "cmp_d_le", { 0 },
+    { "cmp_d_le", { 0 }, { 0 },
       dfu_cmp_d_le_env, ARRAY_SIZE(dfu_cmp_d_le_env), true,
       "../target/mips/tcg/fpu_helper.c:1838",
       NULL, 0 },
-    { "cmp_d_ule", { 0 },
+    { "cmp_d_ule", { 0 }, { 0 },
       dfu_cmp_d_ule_env, ARRAY_SIZE(dfu_cmp_d_ule_env), true,
       "../target/mips/tcg/fpu_helper.c:1814",
       NULL, 0 },
-    { "cmp_d_un", { 0 },
+    { "cmp_d_un", { 0 }, { 0 },
       dfu_cmp_d_un_env, ARRAY_SIZE(dfu_cmp_d_un_env), true,
       "../target/mips/tcg/fpu_helper.c:1798",
       NULL, 0 },
-    { "cmp_s_eq", { 0 },
+    { "cmp_s_eq", { 0 }, { 0 },
       dfu_cmp_s_eq_env, ARRAY_SIZE(dfu_cmp_s_eq_env), true,
       "../target/mips/tcg/fpu_helper.c:1879",
       NULL, 0 },
-    { "cmp_s_le", { 0 },
+    { "cmp_s_le", { 0 }, { 0 },
       dfu_cmp_s_le_env, ARRAY_SIZE(dfu_cmp_s_le_env), true,
       "../target/mips/tcg/fpu_helper.c:1917",
       NULL, 0 },
-    { "cmp_s_lt", { 0 },
+    { "cmp_s_lt", { 0 }, { 0 },
       dfu_cmp_s_lt_env, ARRAY_SIZE(dfu_cmp_s_lt_env), true,
       "../target/mips/tcg/fpu_helper.c:1911",
       NULL, 0 },
-    { "float_abs_s", { 0 },
+    { "float_abs_s", { 0 }, { 0 },
       NULL, 0, true,
       "../target/mips/tcg/fpu_helper.c:981",
       NULL, 0 },
-    { "float_add_d", { 0 },
+    { "float_add_d", { 0 }, { 0 },
       dfu_float_add_d_env, ARRAY_SIZE(dfu_float_add_d_env), true,
       "../target/mips/tcg/fpu_helper.c:1217",
       NULL, 0 },
-    { "float_add_s", { 0 },
+    { "float_add_s", { 0 }, { 0 },
       dfu_float_add_s_env, ARRAY_SIZE(dfu_float_add_s_env), true,
       "../target/mips/tcg/fpu_helper.c:1227",
       NULL, 0 },
-    { "float_chs_s", { 0 },
+    { "float_chs_s", { 0 }, { 0 },
       NULL, 0, true,
       "../target/mips/tcg/fpu_helper.c:1001",
       NULL, 0 },
-    { "float_cvt_w_s", { 0 },
+    { "float_cvt_w_s", { 0 }, { 0 },
       dfu_float_cvt_w_s_env, ARRAY_SIZE(dfu_float_cvt_w_s_env), true,
       "../target/mips/tcg/fpu_helper.c:383",
       NULL, 0 },
-    { "float_cvtd_s", { 0 },
+    { "float_cvtd_s", { 0 }, { 0 },
       dfu_float_cvtd_s_env, ARRAY_SIZE(dfu_float_cvtd_s_env), true,
       "../target/mips/tcg/fpu_helper.c:249",
       NULL, 0 },
-    { "float_div_s", { 0 },
+    { "float_cvtd_w", { 0 }, { 0 },
+      dfu_float_cvtd_w_env, ARRAY_SIZE(dfu_float_cvtd_w_env), true,
+      "../target/mips/tcg/fpu_helper.c:258",
+      NULL, 0 },
+    { "float_div_s", { 0 }, { 0 },
       dfu_float_div_s_env, ARRAY_SIZE(dfu_float_div_s_env), true,
       "../target/mips/tcg/fpu_helper.c:1335",
       NULL, 0 },
-    { "float_mul_d", { 0 },
+    { "float_mul_d", { 0 }, { 0 },
       dfu_float_mul_d_env, ARRAY_SIZE(dfu_float_mul_d_env), true,
       "../target/mips/tcg/fpu_helper.c:1289",
       NULL, 0 },
-    { "float_mul_s", { 0 },
+    { "float_mul_s", { 0 }, { 0 },
       dfu_float_mul_s_env, ARRAY_SIZE(dfu_float_mul_s_env), true,
       "../target/mips/tcg/fpu_helper.c:1299",
       NULL, 0 },
-    { "float_sqrt_d", { 0 },
+    { "float_sqrt_d", { 0 }, { 0 },
       dfu_float_sqrt_d_env, ARRAY_SIZE(dfu_float_sqrt_d_env), true,
       "../target/mips/tcg/fpu_helper.c:235",
       NULL, 0 },
-    { "float_sqrt_s", { 0 },
+    { "float_sqrt_s", { 0 }, { 0 },
       dfu_float_sqrt_s_env, ARRAY_SIZE(dfu_float_sqrt_s_env), true,
       "../target/mips/tcg/fpu_helper.c:242",
       NULL, 0 },
-    { "float_sub_d", { 0 },
+    { "float_sub_d", { 0 }, { 0 },
       dfu_float_sub_d_env, ARRAY_SIZE(dfu_float_sub_d_env), true,
       "../target/mips/tcg/fpu_helper.c:1253",
       NULL, 0 },
-    { "float_sub_s", { 0 },
+    { "float_sub_s", { 0 }, { 0 },
       dfu_float_sub_s_env, ARRAY_SIZE(dfu_float_sub_s_env), true,
       "../target/mips/tcg/fpu_helper.c:1263",
       NULL, 0 },
-    { "float_trunc_w_d", { 0 },
+    { "float_trunc_w_d", { 0 }, { 0 },
       dfu_float_trunc_w_d_env, ARRAY_SIZE(dfu_float_trunc_w_d_env), true,
       "../target/mips/tcg/fpu_helper.c:500",
       NULL, 0 },
-    { "float_trunc_w_s", { 0 },
+    { "float_trunc_w_s", { 0 }, { 0 },
       dfu_float_trunc_w_s_env, ARRAY_SIZE(dfu_float_trunc_w_s_env), true,
       "../target/mips/tcg/fpu_helper.c:513",
       NULL, 0 },
-    { "raise_exception", { 0 },
+    { "raise_exception", { 0 }, { 0 },
       dfu_raise_exception_env, ARRAY_SIZE(dfu_raise_exception_env), true,
       "../target/mips/tcg/exception.c:54",
       NULL, 0 },
-    { "raise_exception_err", { 0 },
+    { "raise_exception_err", { 0 }, { 0 },
       dfu_raise_exception_err_env, ARRAY_SIZE(dfu_raise_exception_err_env), true,
       "../target/mips/tcg/exception.c:48",
       NULL, 0 },
-    { "swl", { 0 },
+    { "swl", { 0 }, { 0 },
       dfu_swl_env, ARRAY_SIZE(dfu_swl_env), true,
       "../target/mips/tcg/ldst_helper.c:71",
       dfu_swl_acc, ARRAY_SIZE(dfu_swl_acc) },
-    { "swr", { 0 },
+    { "swr", { 0 }, { 0 },
       dfu_swr_env, ARRAY_SIZE(dfu_swr_env), true,
       "../target/mips/tcg/ldst_helper.c:95",
       dfu_swr_acc, ARRAY_SIZE(dfu_swr_acc) },
-    { "lookup_tb_ptr", { 0 },
+    { "lookup_tb_ptr", { 0 }, { 0 },
       dfu_lookup_tb_ptr_env, ARRAY_SIZE(dfu_lookup_tb_ptr_env), true,
       "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
       NULL, 0 },
-    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }
+    { NULL, { 0 }, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };

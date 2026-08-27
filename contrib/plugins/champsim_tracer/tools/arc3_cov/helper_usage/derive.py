@@ -63,6 +63,27 @@ def roots_of(params, envty):
     return roots
 
 
+def _pointee(params):
+    """Parameter index -> the type text with ONE pointer level removed.
+
+    Read off the DEFINITION's own signature and returned as text; whether it
+    is a type the target's headers can size is the generator's question, and
+    it asks the compiler.  Nothing here computes a size.
+    """
+    out = {}
+    for i, (nm, star, nmi, text) in enumerate(params):
+        if not star or not nm:
+            continue
+        t = text
+        if nm and t.endswith(nm):
+            t = t[:-len(nm)]
+        t = t.replace('*', ' ', 1).strip()
+        t = ' '.join(t.split())
+        if t and '*' not in t and '[' not in t:
+            out[i] = t
+    return out
+
+
 def derive(isa, helpers, ppdir, verbose=False):
     units, failed, envty = units_for(isa, ppdir, verbose)
     index = {}
@@ -102,6 +123,18 @@ def derive(isa, helpers, ppdir, verbose=False):
                       argdir=argdir,
                       env={k: v for k, v in sorted(a.env_fields.items())},
                       env_where=a.where,
+                      # Members whose ARRAY INDEX the reader could not read
+                      # off the source: the range is the whole file and names
+                      # no element of it.  See Analysis._note_env().
+                      env_unbounded=sorted(a.env_unbounded),
+                      # The POINTEE TYPE of each pointer parameter, as the
+                      # definition declares it.  It is what states the EXTENT
+                      # of the state a pointer argument reaches -- the fact
+                      # the gvec constructors supply for their operands and
+                      # nothing supplied for anyone else, so every non-gvec
+                      # pointer argument arrived at the consumer with extent
+                      # 0 and could not be resolved to a register.
+                      argtype={i: t for i, t in _pointee(params).items()},
                       # CP1: the GUEST MEMORY the helper reaches itself, which
                       # no qemu_ld/st op names because there is none -- the
                       # access happens inside the call.

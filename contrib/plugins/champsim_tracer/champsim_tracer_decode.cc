@@ -1679,7 +1679,7 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
         const RegClassification *base_rc = lookup_reg_class(op->reg_id);
         const RegClassification *index_rc = lookup_reg_class(op->index_id);
         bool base_is_pc =
-            base_rc && base_rc->n_regs == 0 && base_rc->reg_id == REG_IP;
+            base_rc && base_rc->n_regs == 0 && base_rc->reg_id == REG_PC;
         if (base_is_pc) {
             /* Fold next-insn-PC into the displacement; no base read
              * needed at exec time.  Matches x86 RIP-relative semantics

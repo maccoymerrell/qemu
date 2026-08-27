@@ -74,7 +74,7 @@ static const QemuRegRow qemu_regs_mips[] = {
     { .feature = "org.gnu.gdb.mips.cpu", .name = "k0", .reg_id = REG_GPR26, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
     { .feature = "org.gnu.gdb.mips.cpu", .name = "k1", .reg_id = REG_GPR27, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
     { .feature = "org.gnu.gdb.mips.cpu", .name = "lo", .reg_id = REG_ACC0, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
-    { .feature = "org.gnu.gdb.mips.cpu", .name = "pc", .reg_id = REG_IP, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
+    { .feature = "org.gnu.gdb.mips.cpu", .name = "pc", .reg_id = REG_PC, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
     { .feature = "org.gnu.gdb.mips.cpu", .name = "ra", .reg_id = REG_LR, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
     { .feature = "org.gnu.gdb.mips.cpu", .name = "s0", .reg_id = REG_GPR16, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
     { .feature = "org.gnu.gdb.mips.cpu", .name = "s1", .reg_id = REG_GPR17, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */

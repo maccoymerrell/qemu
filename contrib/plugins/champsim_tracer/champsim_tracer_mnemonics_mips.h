@@ -125,7 +125,7 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_MSAREQUEST] = { .reg_id = REG_SYS },  /* msarequest */
     [MIPS_REG_MSASAVE] = { .reg_id = REG_SYS },  /* msasave */
     [MIPS_REG_MSAUNMAP] = { .reg_id = REG_SYS },  /* msaunmap */
-    [MIPS_REG_PC] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "pc" } },  /* pc */
+    [MIPS_REG_PC] = { .reg_id = REG_PC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "pc" } },  /* pc */
     [MIPS_REG_RA] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra */
     [MIPS_REG_RA_NM] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra_nm */
     [MIPS_REG_SP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "sp" } },  /* sp */

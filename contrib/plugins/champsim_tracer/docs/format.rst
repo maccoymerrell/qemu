@@ -598,7 +598,7 @@ Decode by repeated outer-section unwrapping.
         bit, counted in its own row of that census.
 
         Two consequences are visible on the wire.  On x86-64 a
-        RIP-relative access names ``REG_IP`` in its address mask, and
+        RIP-relative access names ``REG_PC`` in its address mask, and
         does so however the block was translated.  The value is the
         program counter plus a displacement; that ``gen_lea_modrm_0``
         adds the counter into the displacement at decode time so
@@ -643,7 +643,7 @@ Decode by repeated outer-section unwrapping.
         x86-64 shape is displacement-only addressing, where the modrm
         names neither base nor index.  RIP-relative addressing is NOT
         that shape and never takes this bit: its address depends on the
-        instruction pointer, the mask names ``REG_IP``, and a consumer
+        program counter, the mask names ``REG_PC``, and a consumer
         reading the immediate bit there would be told to wait on
         nothing.  As with the store datum, an instruction whose
         template carries no immediate slot publishes the empty mask
@@ -653,7 +653,7 @@ Decode by repeated outer-section unwrapping.
         register, whether or not the emulator had to read it.  An
         x86-64 ``call`` pushes RIP plus the instruction's length, so
         every form of it — direct and indirect alike — publishes a
-        store-data mask naming ``REG_IP`` and nothing else: not the
+        store-data mask naming ``REG_PC`` and nothing else: not the
         register an indirect call reads to find its target, and not
         the base register it reads to form that target's address.
         That a translator may know the value at translation time and

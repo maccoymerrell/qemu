@@ -1896,7 +1896,7 @@ def classify_x86_reg(name: str) -> RegEntry:
     if name in {"EIZ", "RIZ"}:
         return reg_none()
     if name in {"IP", "EIP", "RIP"}:
-        return reg_ent("REG_IP")
+        return reg_ent("REG_PC")
     if name == "EFLAGS":
         return RegEntry("REG_FLAGS", is_int_flags=True)
     # FPSW is the x87 STATUS WORD -- condition codes C0-C3, the
@@ -2288,7 +2288,7 @@ def classify_mips_reg(name: str) -> RegEntry:
     if stem == "ZERO":
         return reg_ent("REG_ZERO")
     if stem == "PC":
-        return reg_ent("REG_IP")
+        return reg_ent("REG_PC")
     if stem == "SP":
         return reg_ent("REG_SP")
     if stem == "FP":

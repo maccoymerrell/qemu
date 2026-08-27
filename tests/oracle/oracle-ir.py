@@ -572,10 +572,10 @@ def main():
         # RIP is materialised lazily and is dropped from both sides of every
         # comparison isaxcheck makes, for the same reason: whether it appears
         # is a property of where the TB ended, not of the instruction.
-        ir_r.discard("REG_IP")
-        ir_w.discard("REG_IP")
-        src.discard("REG_IP")
-        dst.discard("REG_IP")
+        ir_r.discard("REG_PC")
+        ir_w.discard("REG_PC")
+        src.discard("REG_PC")
+        dst.discard("REG_PC")
 
         mnem = text.split()[0] if text else "?"
         if i.reenc and "REG_FLAGS" in dst and "eflags" not in i.w:

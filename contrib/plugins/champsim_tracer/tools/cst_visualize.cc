@@ -889,8 +889,7 @@ static bool reg_is_special_excluded(const std::string &name)
 {
     return (name.find("ZERO") != std::string::npos)
         || (name.find("FLAGS") != std::string::npos)
-        || (name == "REG_IP" || name == "IP"
-            || name == "REG_PC" || name == "PC")
+        || (name == "REG_PC" || name == "PC")
         || (name == "REG_NONE" || name == "NONE");
 }
 
@@ -1135,7 +1134,7 @@ static const char *gen_op_color(const std::string &label)
  * each class to a palette band and the index within the class to an
  * offset so a given register draws the same colour in every plot, with
  * the common low GPRs on the vivid head.  gen_reg already drops the
- * architectural side-effect regs (IP/FLAGS/ZERO), so those need no slot.
+ * architectural side-effect regs (PC/FLAGS/ZERO), so those need no slot.
  */
 static const char *gen_reg_color(const std::string &label)
 {
@@ -2356,7 +2355,7 @@ struct WalkCtx {
      * physical-register-file rename eliminates the WAW/WAR hazards
      * of, leaving only RAW edges to bound parallelism.
      *
-     * Special regs (FLAGS/IP/ZERO/NONE) are excluded from both
+     * Special regs (FLAGS/PC/ZERO/NONE) are excluded from both
      * sides so the metric is dominated by real GPR/FPR/VEC data
      * flow rather than the implicit FLAGS chain every arithmetic
      * op would otherwise serialize through.  Self-RMW IS counted:
@@ -3109,7 +3108,7 @@ static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 }
 
 /* Shared between dep_depth and ilp: build the special-reg lookup
- * once from the trace's reg-name map.  Excludes FLAGS / IP / ZERO /
+ * once from the trace's reg-name map.  Excludes FLAGS / PC / ZERO /
  * NONE so they neither carry nor break chains. */
 static void df_ensure_excluded_built(WalkCtx &ctx)
 {
@@ -3145,7 +3144,7 @@ static inline void df_gather_addrs(const cst::BodyWalker::BB &bb, uint32_t i,
  * bounded to a tumbling --rob-size window:
  *   complete_i = 1 + max(producer_complete[r] for r in real srcs)
  *   producer_complete[r] := complete_i for r in real dsts
- * "Real" = NOT one of FLAGS / IP / ZERO / NONE.  Self-RMW IS a
+ * "Real" = NOT one of FLAGS / PC / ZERO / NONE.  Self-RMW IS a
  * real chain (rename removes only WAR/WAW; the RAW through the
  * arch reg survives).  When the chunk reaches window_size insns
  * we tally the just-completed window's IPC sample (for the ilp
@@ -4557,7 +4556,7 @@ static void build_metric_state(WalkCtx &ctx,
      * them.  Done up-front so the per-entry hot path is just one
      * matrix update per (series, bin). */
     if (opts.metric == Metric::GenOp || opts.metric == Metric::GenReg) {
-        /* gen_reg drops architectural side-effect regs (IP/PC/FLAGS/
+        /* gen_reg drops architectural side-effect regs (PC/FLAGS/
          * ZERO/NONE) from the histogram — they appear on virtually
          * every insn and would otherwise drown out the named GPR /
          * FPR / VEC traffic that the chart is supposed to surface.

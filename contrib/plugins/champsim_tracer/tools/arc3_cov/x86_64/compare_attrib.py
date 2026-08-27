@@ -18,7 +18,7 @@ Rulings applied: R4 (canonical full width on both sides -- the reference
 side is already largest-enclosing), R5 (a conditional form names every
 candidate; a preserving conditional write is also a source), R3 (an idiom
 reads its source -- neither side special-cases idioms), R9 (branch class
-is not a register question -- RIP/REG_IP is dropped on both sides).
+is not a register question -- RIP/REG_PC is dropped on both sides).
 
 Author: Maccoy Merrell.
 """
@@ -103,11 +103,11 @@ BOUNDARY_REG = {
 # Dropped on BOTH sides, with the reason.
 #   CS/DS/ES/SS : segment bases are forced to zero in 64-bit mode -> no dataflow
 #   RIP         : R9 -- control flow travels the branch taxonomy, and the
-#                 tracer drops REG_IP by construction (isax_generic_reg_dropped)
+#                 tracer drops REG_PC by construction (isax_generic_reg_dropped)
 #   STACKPUSH/POP: XED pseudo-operands, redundant with RSP which XED names
 #                 separately in the very same operand list
 DROP_REF = {'CS', 'DS', 'ES', 'SS', 'RIP', 'STACKPUSH', 'STACKPOP'}
-DROP_TRACER = {'REG_IP', 'REG_ZERO', 'REG_NONE', 'REG_SEG0', 'REG_SEG1',
+DROP_TRACER = {'REG_PC', 'REG_ZERO', 'REG_NONE', 'REG_SEG0', 'REG_SEG1',
                'REG_SEG2', 'REG_SEG5'}   # SEG0=cs SEG1=ds SEG2=es SEG5=ss
 
 # Many-to-one collapses in the tracer vocabulary: agreement on these rows is

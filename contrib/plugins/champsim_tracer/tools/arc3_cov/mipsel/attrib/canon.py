@@ -121,7 +121,7 @@ def canon(name):
     if m: return "REG_COPROC1"
     m = re.fullmatch(r"HWR(\d+)", n)
     if m: return HWR_GROUP.get(int(m.group(1)), "REG_SYS")
-    if n == "PC": return "REG_IP"
+    if n == "PC": return "REG_PC"
     return "UNMAPPED:" + name
 
 def canon_set(name):
@@ -148,11 +148,11 @@ def canon_set(name):
 # the same suppression in 7880bf6125 (mra_ref.to_sets did dst.discard('ZERO'))
 # and the comparison is only cross-ISA comparable if both lose it.
 #
-# REG_IP stays.  It is not the zero register and R7.3 does not reach it: the
+# REG_PC stays.  It is not the zero register and R7.3 does not reach it: the
 # program counter is not part of the register file the dependency model
 # arbitrates, and every branch would otherwise carry a PC read/write that no
 # consumer renames.
-DROP = {"REG_IP", "-", "", None}
+DROP = {"REG_PC", "-", "", None}
 
 def drop(s):
     return set(x for x in s if x not in DROP)

@@ -2836,7 +2836,7 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
     trace is self-describing (every ENCODINGS section carries its own
     {gen_id ↔ name} mapping), and a previous numeric-id version of
     this validator silently broke when the plugin's GenericRegId
-    layout shifted (REG_FLAGS, REG_IP, etc. moved by 25 slots when
+    layout shifted (REG_FLAGS, REG_PC, etc. moved by 25 slots when
     new register banks landed).  Comparing by name lets the validator
     track header changes automatically and lets multiple trace
     versions coexist with no per-version translation table.
@@ -4363,7 +4363,7 @@ def _check_call_return_store(
     isa: str,
     reg_id_to_name: dict[int, str],
 ) -> list[Issue]:
-    """A call that pushes a return address must say it pushes the IP.
+    """A call that pushes a return address must say it pushes the PC.
 
     On the ISAs that write the return address to memory (x86), the
     store's DATA dependency is the return address and nothing else --
@@ -4388,7 +4388,7 @@ def _check_call_return_store(
     _, branch_names = _load_name_tables()
     call_types = {"BRANCH_DIRECT_CALL", "BRANCH_INDIRECT_CALL",
                   "DIRECT_CALL", "INDIRECT_CALL"}
-    ip_names = {"REG_IP", "IP"}
+    pc_names = {"REG_PC", "PC"}
 
     issues: list[Issue] = []
     n_checked = 0
@@ -4407,7 +4407,7 @@ def _check_call_return_store(
             srcs = ins.get("src_regs") or []
             ip_bits = 0
             for i, r in enumerate(srcs):
-                if reg_id_to_name.get(int(r), "") in ip_names:
+                if reg_id_to_name.get(int(r), "") in pc_names:
                     ip_bits |= 1 << i
             bad = (len(sd) != 1 or ip_bits == 0 or sd[0] != ip_bits)
             if not bad:
@@ -4418,7 +4418,7 @@ def _check_call_return_store(
                     "call_return_store", "error",
                     f"template t{tmpl['template_id']} insn #{idx} "
                     f"pc=0x{int(ins['pc']):x}: a call's store-data "
-                    f"dependency must name the return address (REG_IP) "
+                    f"dependency must name the return address (REG_PC) "
                     f"and only that",
                     {"template_id": int(tmpl["template_id"]),
                      "insn_index": idx,
@@ -4450,7 +4450,7 @@ def _check_static_reg_sets(
 ) -> list[Issue]:
     """Compare template src/dst register IDs to Capstone ground truth.
 
-    Comparison is **by symbolic name** (REG_FLAGS, REG_IP, …) rather
+    Comparison is **by symbolic name** (REG_FLAGS, REG_PC, …) rather
     than numeric GenericRegId.  The trace's own ENCODINGS section
     supplies the per-trace `gen_id → name` mapping in
     @reg_id_to_name; the validator translates the trace's numeric
@@ -4690,7 +4690,7 @@ def _check_static_reg_sets(
 
 # GenericRegId numbering (must match build_reg_names() in
 # champsim_tracer_decode.py): REG_NONE=0, GPRn=1+n, SP=250, FLAGS=251,
-# IP=252, LR=253, FP_REG=254.
+# PC=252, LR=253, FP_REG=254.
 
 def _x86_64_name_to_genid() -> dict[str, int]:
     m: dict[str, int] = {}
@@ -4710,7 +4710,7 @@ def _x86_64_name_to_genid() -> dict[str, int]:
         gid = 7 + (n - 8)  # r8 → REG_GPR6 → 7
         for suf in ("", "d", "w", "b"):
             m[f"r{n}{suf}"] = gid
-    # SP=250, FP_REG=254, IP=252
+    # SP=250, FP_REG=254, PC=252
     for s in ("rsp", "esp", "sp", "spl"):
         m[s] = 250
     for s in ("rbp", "ebp", "bp", "bpl"):
@@ -5465,7 +5465,7 @@ def _unsupported_reg_coverage(isa: str) -> set[str]:
         "mipsel": {
             "REG_ACC1", "REG_ACC2", "REG_ACC3",
             "REG_ACCHI1", "REG_ACCHI2", "REG_ACCHI3",
-            "REG_FLAGS", "REG_IP",
+            "REG_FLAGS", "REG_PC",
             "REG_SYS", "REG_VCTRL",
             *(f"REG_PRED{i}" for i in range(32)),
             *(f"REG_VEC{i}" for i in range(32)),

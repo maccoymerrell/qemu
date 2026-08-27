@@ -418,7 +418,7 @@ def _x86_dst_label(r, only_ref, only_trc):
     logs, and each is shared with the wrong-path leg's rule table rather than
     restated here.
     """
-    if not only_ref and only_trc == frozenset(('REG_IP',)):
+    if not only_ref and only_trc == frozenset(('REG_PC',)):
         # gem5 keeps the instruction pointer in the PCState; no operand list
         # on any control transfer names it.
         return 'REF-NO-RIP-OPERAND'

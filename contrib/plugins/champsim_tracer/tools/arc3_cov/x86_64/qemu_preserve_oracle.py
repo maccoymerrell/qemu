@@ -103,7 +103,7 @@ FLAGS_GLOBALS = frozenset(('cc_op', 'cc_dst', 'cc_src', 'cc_src2'))
 GLOBALS = dict(GLOBALS_GPR)
 for _g in FLAGS_GLOBALS:
     GLOBALS[_g] = 'REG_FLAGS'
-GLOBALS['rip'] = 'REG_IP'
+GLOBALS['rip'] = 'REG_PC'
 
 # Bare words TCG prints that name a CONDITION or a memory-op descriptor
 # rather than a value.  Anything else that is neither a temporary nor a

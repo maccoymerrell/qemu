@@ -391,7 +391,7 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                           f->branch_type == BRANCH_INDIRECT_CALL);
 
     bool any_store = false;
-    int ip_src = is_call ? find_src_slot(f, REG_IP) : -1;
+    int ip_src = is_call ? find_src_slot(f, REG_PC) : -1;
     if (ip_src >= 0 && f->max_dep_stores < MAX_STORES) {
         /* A call pushes its return address and nothing else, whatever
          * else it happens to read to find its target. */

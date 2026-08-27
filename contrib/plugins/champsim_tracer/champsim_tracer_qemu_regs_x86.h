@@ -65,7 +65,7 @@ static const QemuRegRow qemu_regs_x86[] = {
     { .feature = "org.gnu.gdb.i386.core", .name = "rcx", .reg_id = REG_GPR1, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */
     { .feature = "org.gnu.gdb.i386.core", .name = "rdi", .reg_id = REG_GPR5, .cap_rows = 4, .tier = QREG_ROUTED },  /* 4 capstone rows */
     { .feature = "org.gnu.gdb.i386.core", .name = "rdx", .reg_id = REG_GPR2, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */
-    { .feature = "org.gnu.gdb.i386.core", .name = "rip", .reg_id = REG_IP, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
+    { .feature = "org.gnu.gdb.i386.core", .name = "rip", .reg_id = REG_PC, .cap_rows = 3, .tier = QREG_ROUTED },  /* 3 capstone rows */
     { .feature = "org.gnu.gdb.i386.core", .name = "rsi", .reg_id = REG_GPR4, .cap_rows = 4, .tier = QREG_ROUTED },  /* 4 capstone rows */
     { .feature = "org.gnu.gdb.i386.core", .name = "rsp", .reg_id = REG_SP, .cap_rows = 4, .tier = QREG_ROUTED },  /* 4 capstone rows */
     { .feature = "org.gnu.gdb.i386.core", .name = "ss", .reg_id = REG_SEG5, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */

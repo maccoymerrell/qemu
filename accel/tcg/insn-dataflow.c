@@ -2798,7 +2798,7 @@ void insn_dataflow_note_encoded_imm(const void *ts)
  * (target/i386/tcg/emit.c.inc, X86_OP_IMM), never handed to a store emitter
  * as the shared constant.  The claim is also measured rather than left as an
  * argument -- the plugin's Capstone shadow scores every published row, and a
- * store that acquired REG_IP without being a call would appear there.
+ * store that acquired REG_PC without being a call would appear there.
  */
 void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts)
 {

@@ -323,7 +323,7 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
      *
      * arm_reg_snap_cbs skips the callback that would capture canonical
      * [n-2] when the TB ends [branch, delay slot], deferring the branch's
-     * snap to snap_prev_tail_dsts so its REG_IP dst can take the goto_tb
+     * snap to snap_prev_tail_dsts so its REG_PC dst can take the goto_tb
      * successor override.  That deferral is CORRECT-PATH ONLY: it pushes
      * into pending_reg_snaps.  On the wrong path nothing pushed a snap for
      * that branch, so pulling one FIFO-wise underran the buffer and the walk

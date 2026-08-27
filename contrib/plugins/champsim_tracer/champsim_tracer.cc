@@ -6956,7 +6956,7 @@ void emit_finalized_bb(BodyStreamState *out_stream,
  * (TraceSegmentManager::finish drops it before it calls the flush hook),
  * so a close that went through it would capture nothing and hand the emit
  * a short register slice, which the emit then discards WHOLE.  And there
- * is no successor to put in the terminating branch's REG_IP dst, nor any
+ * is no successor to put in the terminating branch's REG_PC dst, nor any
  * goto_tb staleness to repair: a block that left TCG through an exception
  * synced its PC on the way out, so the live read is the value.
  */
@@ -6979,10 +6979,10 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
          * [branch@n-2, delay@n-1]; otherwise it is the branch itself.
          *
          * On a delay-slot tail the branch's snap was deferred here (see
-         * tb_arm_new_template_cbs) so its REG_IP (PC) dst can take the
+         * tb_arm_new_template_cbs) so its REG_PC (PC) dst can take the
          * goto_tb successor override.  Capture the branch (n-2) first,
          * then the delay slot (n-1) — matching execution and template
-         * order.  The override fires only on the branch's REG_IP dst,
+         * order.  The override fires only on the branch's REG_PC dst,
          * so applying it in both passes is correct on every ISA.
          *
          * A TRUNCATED fragment stops before that tail, so the deferred
@@ -7000,7 +7000,7 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
                 RegSnap s;
                 g_reg_snaps.read_into_snap(
                     cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                if (!at_close && fl->dst_regs[i] == REG_IP) {
+                if (!at_close && fl->dst_regs[i] == REG_PC) {
                     /* The BB-terminating branch's PC dst.  Correct-path
                      * TBs chain via goto_tb, which SKIPS the env->eip
                      * write at the boundary, so the live read is stale
@@ -7057,7 +7057,7 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
  * the dispatch-time capture's is: nothing has executed since.  It is taken
  * with @at_close set, which both lets the capture past the active-segment
  * guard the closing flush has already cleared and leaves the terminating
- * branch's REG_IP dst on its live read — there is no successor PC to
+ * branch's REG_PC dst on its live read — there is no successor PC to
  * substitute, and the exception that ended the block synced the PC.
  */
 bool close_seal_at_terminator(unsigned int cpu_index,
@@ -7086,7 +7086,7 @@ bool close_seal_at_terminator(unsigned int cpu_index,
 }
 
 /*
- * Rewrite the REG_IP destination values among the tail dst snaps the glue
+ * Rewrite the REG_PC destination values among the tail dst snaps the glue
  * prologue captured for @tmpl (see snap_prev_tail_dsts): the prologue
  * stamps the DISPATCHED next PC, and a seal that resolves a different
  * architectural successor (fault case (c) resume PC, async departure PC)
@@ -7130,7 +7130,7 @@ static void patch_tail_ip_snaps(unsigned int cpu_index,
     for (unsigned k = 0; k < n_idx; k++) {
         const InsnFields *fl = &tmpl->insn_fields[idxs[k]];
         for (uint8_t i = 0; i < fl->n_dst_regs; i++, pos++) {
-            if (fl->dst_regs[i] == REG_IP) {
+            if (fl->dst_regs[i] == REG_PC) {
                 sink[base + pos].value = cst_wide_from_u64(current_pc);
             }
         }
@@ -7817,7 +7817,7 @@ bool collect_finalized_bbs(unsigned int cpu_index,
         if (is_last_executed) {
             /* The tail insn's dst snaps were captured by this dispatch's
              * glue prologue (the note_prev_extent site), which stamped the
-             * DISPATCHED next PC into the branch's REG_IP dst.  A seal
+             * DISPATCHED next PC into the branch's REG_PC dst.  A seal
              * override (a case-(c) fault's resume PC, an async departure)
              * resolves a different architectural successor — patch those
              * positions with the resolved value. */
@@ -8663,7 +8663,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * still hold prev's last retired instruction's post-exec values (this
      * TB's body has not run), and this may be the only dispatch that can
      * still observe them — which is precisely what makes a measured extent
-     * FULLY OBSERVED (§4.2a).  The branch's REG_IP dst is stamped with the
+     * FULLY OBSERVED (§4.2a).  The branch's REG_PC dst is stamped with the
      * dispatched next PC; a seal that resolves a different successor
      * patches it (patch_tail_ip_snaps).
      */
@@ -9468,12 +9468,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
  * Delay-slot tail: on MIPS (and similar ISAs) a true BB ends with a
  * [branch, delay-slot] pair kept in true execution order — branch at
  * canonical[n-2], delay slot at canonical[n-1].  The branch's PC-dst
- * (REG_IP) needs the goto_tb override that only snap_prev_tail_dsts can
+ * (REG_PC) needs the goto_tb override that only snap_prev_tail_dsts can
  * supply (it knows the successor PC), so DEFER the branch's snap to the
  * next TB rather than capturing it here at the delay slot's pre-exec hook.
  * Detect the pair by branch_type and skip the cb whose ci-1 is the branch
  * (ci == n-1); snap_prev_tail_dsts then captures both canonical[n-2]
- * (branch, with REG_IP override) and canonical[n-1] (delay slot) at the
+ * (branch, with REG_PC override) and canonical[n-1] (delay slot) at the
  * right time.
  */
 static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
@@ -9514,7 +9514,7 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
         }
         if (delay_slot_tail && ci == canonical_n_insns - 1) {
             /* The cb HERE would capture canonical[n-2] (the branch); defer
-             * it to snap_prev_tail_dsts so the branch's REG_IP dst gets the
+             * it to snap_prev_tail_dsts so the branch's REG_PC dst gets the
              * goto_tb successor override. */
             continue;
         }

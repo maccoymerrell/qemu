@@ -50,7 +50,7 @@ def canon_gpr(n):
 TRC_MAP = {
     'REG_FLAGS': 'FLAGS', 'REG_FCSR': 'FCSR', 'REG_SYS': 'SYS', 'REG_TLS': 'TLS',
     'REG_SP': 'SP', 'REG_LR': 'LR', 'REG_FP_REG': 'FP_REG', 'REG_ZERO': 'ZERO',
-    'REG_IP': 'IP', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'VCTRL',
+    'REG_PC': 'PC', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'VCTRL',
     'REG_PRED16': 'FFR', 'REG_VEC32': 'ZT0',
     # The R8 split of the AArch64 system-register file (cap_aarch64_sysreg_class)
     # gives the privileged file one generic ID per DEPENDENCE-BEHAVIOUR group
@@ -92,7 +92,7 @@ def trc_tok(t):
 
 
 LLVM_MAP = {'nzcv': 'FLAGS', 'fpcr': 'FCSR', 'fpsr': 'FCSR', 'sp': 'SP',
-            'zr': 'ZERO', 'ffr': 'FFR', 'zt0': 'ZT0', 'pc': 'IP'}
+            'zr': 'ZERO', 'ffr': 'FFR', 'zt0': 'ZT0', 'pc': 'PC'}
 
 
 def llvm_tok(t):
@@ -114,9 +114,9 @@ def llvm_tok(t):
     return t
 
 
-# reference token space is already canonical except PC
+# reference token space is already canonical
 def ref_tok(t):
-    return 'IP' if t == 'PC' else t
+    return t
 
 
 CLASS_RE = re.compile(r'^(GPR|VEC|PRED)\d+$')
@@ -127,7 +127,7 @@ CLASS_RE = re.compile(r'^(GPR|VEC|PRED)\d+$')
 # them, so a difference here is a representational boundary, not an
 # attribution error.  Counted and reported separately, never dropped.
 def tier_b(t):
-    return t == 'IP' or t.startswith('PSTATE.')
+    return t == 'PC' or t.startswith('PSTATE.')
 
 
 def split_tiers(s):

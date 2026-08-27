@@ -30,7 +30,7 @@ X86_EXEC = {
     # scratch file and the CS effective base.  Measured on `jnz`: gem5's
     # micro-op trio names integer:17, integer:18, the five cc registers and
     # miscellaneous:153 -- and no instruction pointer at all -- while the
-    # tracer names REG_IP as both a source and a destination, which is the
+    # tracer names REG_PC as both a source and a destination, which is the
     # architectural truth.
     'REF-NO-RIP-OPERAND':
         Rule('REF-NO-RIP-OPERAND', 'reference-gap', {SUPERSET},

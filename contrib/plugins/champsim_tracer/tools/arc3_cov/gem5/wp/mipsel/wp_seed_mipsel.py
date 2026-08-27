@@ -76,7 +76,7 @@ def reg_to_mips(name):
         return ('hi', 0)
     if name == 'REG_FCSR':
         return ('fcsr', 0)
-    if name == 'REG_IP':
+    if name == 'REG_PC':
         return ('pc', 0)
     return None
 

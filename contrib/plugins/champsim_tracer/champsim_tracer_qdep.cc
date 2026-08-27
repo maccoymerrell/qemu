@@ -114,9 +114,9 @@ GHashTable *g_field_unmapped_name = nullptr;
  * row refuses the whole family (QDEP_R_DST_UNNAMED).  Its mirror was
  * silently dropped, and a silently dropped population is one nobody can say
  * is empty.  It is NOT empty: on the four-ISA workload it is 212 rows, and
- * every one of them names REG_IP.
+ * every one of them names REG_PC.
  *
- * REG_IP IS EXCLUDED ON PURPOSE, AND THE EXCLUSION IS THE POINT.  A
+ * REG_PC IS EXCLUDED ON PURPOSE, AND THE EXCLUSION IS THE POINT.  A
  * translation block ends by writing the program counter, and QEMU attributes
  * that write to whichever instruction happened to be last -- `lw` at 0x4fffe
  * on mipsel is a page-final load, not a jump.  R2 and R3/J2.3 say a QEMU
@@ -124,7 +124,7 @@ GHashTable *g_field_unmapped_name = nullptr;
  * fact; the same reading forbids ADDING one, so the PC write does not become
  * a destination of a load.  Counted apart from the rest so that the claim
  * "the exclusion is exactly one named class" is a measurement and the OTHER
- * count is the tripwire: a non-REG_IP row here is a destination the machine
+ * count is the tripwire: a non-REG_PC row here is a destination the machine
  * writes and the wire does not name.
  */
 GHashTable *g_dst_wire_missing = nullptr;   /* "mnem  REG" -> count */
@@ -1117,7 +1117,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
  * then publishes nothing puts a register on the wire that no dependency
  * refers to.  That is not hypothetical: the first draft seated the PC write's
  * provenance on every aarch64 `br x17`, whose wire destination list is EMPTY,
- * and 1,786 instructions gained a REG_IP source with nothing pointing at it.
+ * and 1,786 instructions gained a REG_PC source with nothing pointing at it.
  * The validator's static_reg_sets check failed on 11 of them, which is the
  * gate doing its job -- and the reason this predicate exists.
  *
@@ -1337,7 +1337,7 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
         if (on_wire) {
             continue;
         }
-        if (q->dst_reg[k] == REG_IP) {
+        if (q->dst_reg[k] == REG_PC) {
             g_dst_wire_missing_pc.fetch_add(1, std::memory_order_relaxed);
         } else {
             char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
@@ -1870,7 +1870,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * it "immediate" would state that an address the machine derives
          * from RIP waits on nothing.  It does not reach here: the emitter
          * states the fold (insn_dataflow_note_folded_reg on cpu_eip) and the
-         * row arrives with REG_IP in its mask.  A RIP-relative row appearing
+         * row arrives with REG_PC in its mask.  A RIP-relative row appearing
          * in g_addr_imm means the note is not reaching the access -- never
          * that the rule needs an exception.
          *
@@ -2138,7 +2138,7 @@ void qdep_report(GString *report)
             "  rows above that PUBLISHED (the direction dst_precheck does not\n"
             "  cover -- `dst_regs[]` is still the operand walk's, and a mask\n"
             "  seated on QEMU's coordinates does not change that):\n"
-            "  %10" G_GUINT64_FORMAT "  QEMU wrote REG_IP and the wire's list does not"
+            "  %10" G_GUINT64_FORMAT "  QEMU wrote REG_PC and the wire's list does not"
             " carry it\n"
             "              (a block ends by writing the pc and QEMU charges"
             " that write to\n"

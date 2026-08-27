@@ -652,7 +652,7 @@ static bool drop_zero = true;
  *     discarded, so it is a dataflow no-op.  LLVM names it in def/use lists,
  *     Capstone usually does not.
  *   - the program counter: the tracer carries control flow through the
- *     BRANCH_* taxonomy and the entry stream, never through a REG_IP
+ *     BRANCH_* taxonomy and the entry stream, never through a REG_PC
  *     dependency edge, and LLVM's MCInstrDesc does not model PC at all.
  *   - x86 MXCSR: LLVM gives EVERY SSE/AVX instruction an implicit MXCSR
  *     use (rounding mode + exception mask) and Capstone models none, so
@@ -1404,7 +1404,7 @@ static std::string falsify_mode, falsify_mnem;
  * counted separately -- rows MATCHED, and rows where the COMPARED set
  * actually moved -- and a run that damaged nothing refuses.
  *
- * "Compared set" is the operative word: REG_ZERO, REG_IP and REG_NONE are
+ * "Compared set" is the operative word: REG_ZERO, REG_PC and REG_NONE are
  * struck from both sides before the register classes run, so planting or
  * erasing one of those is a change the comparison can never see and is not
  * counted as one.

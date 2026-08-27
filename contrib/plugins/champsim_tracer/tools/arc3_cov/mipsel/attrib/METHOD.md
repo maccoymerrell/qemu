@@ -57,7 +57,7 @@ comparison (`attrib/canon.py`), so a naming difference is never a disagreement.
 Per **R4** a sub-register difference is not a disagreement either: `HI<n>` and
 `LO<n>` are the two halves of the 64-bit accumulator `AC<n>` and both
 canonicalise to `REG_ACC<n>`; LLVM's `D<n>_64` (FGR64) canonicalises to
-`REG_FPR<n>`.  `REG_IP` is dropped on both sides.
+`REG_FPR<n>`.  `REG_PC` is dropped on both sides.
 
 **`REG_ZERO` is not.**  It used to be, symmetrically, and a symmetric
 blindfold is still a blindfold: a fabricated write to `$zero` and a correct

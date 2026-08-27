@@ -775,8 +775,9 @@ numeric ID a name occupies.
      - Stack pointer.
    * - ``REG_FLAGS``
      - Flags / condition-code register (RFLAGS, NZCV, ``mstatus``).
-   * - ``REG_IP``
-     - Instruction / program counter.
+   * - ``REG_PC``
+     - Program counter.  The generic space spells it ``PC``; ``IP``
+       is an x86 word for the same register and is not used here.
    * - ``REG_LR``
      - Link register (return address) on architectures that have
        one architecturally.

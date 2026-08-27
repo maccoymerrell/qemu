@@ -117,7 +117,7 @@ const char *isax_opcode_name(unsigned opcode);
 /* GenericRegId values the comparison folds out on both sides, for the
  * same reasons is_dropped_reg() does at the boundary: the architectural
  * zero register is a dataflow no-op, and control flow travels through the
- * branch taxonomy rather than a REG_IP dependency edge. */
+ * branch taxonomy rather than a REG_PC dependency edge. */
 bool isax_generic_reg_dropped(unsigned gen_id);
 
 /*

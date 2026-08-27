@@ -104,7 +104,7 @@ Row = collections.namedtuple(
 #: the tracer ids no gem5 register can ever match, because gem5 models the
 #: state somewhere that is not a register operand.  Named here so that their
 #: appearance in a tracer set is adjudicated by RULE and not by a guess.
-_RIP = 'REG_IP'
+_RIP = 'REG_PC'
 _SEGS = frozenset('REG_SEG%d' % i for i in range(6))
 _SYSCALL_BYTES = 0x050f          # `0f 05`, little-endian in the tracer's word
 

@@ -117,7 +117,7 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_EDI] = { .reg_id = REG_GPR5, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdi" } },  /* edi */
     [X86_REG_EDX] = { .reg_id = REG_GPR2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdx" } },  /* edx */
     [X86_REG_EFLAGS] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "eflags" }, .is_int_flags = true },  /* eflags */
-    [X86_REG_EIP] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* eip */
+    [X86_REG_EIP] = { .reg_id = REG_PC, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* eip */
     [X86_REG_EIZ] = {},
     [X86_REG_ES] = { .reg_id = REG_SEG2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "es" } },  /* es */
     [X86_REG_ESI] = { .reg_id = REG_GPR4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsi" } },  /* esi */
@@ -125,14 +125,14 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_FPSW] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "fstat" } },  /* fpsw */
     [X86_REG_FS] = { .reg_id = REG_SEG3, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "fs" } },  /* fs */
     [X86_REG_GS] = { .reg_id = REG_SEG4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "gs" } },  /* gs */
-    [X86_REG_IP] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* ip */
+    [X86_REG_IP] = { .reg_id = REG_PC, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* ip */
     [X86_REG_RAX] = { .reg_id = REG_GPR0, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rax" } },  /* rax */
     [X86_REG_RBP] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rbp" } },  /* rbp */
     [X86_REG_RBX] = { .reg_id = REG_GPR3, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rbx" } },  /* rbx */
     [X86_REG_RCX] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rcx" } },  /* rcx */
     [X86_REG_RDI] = { .reg_id = REG_GPR5, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdi" } },  /* rdi */
     [X86_REG_RDX] = { .reg_id = REG_GPR2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdx" } },  /* rdx */
-    [X86_REG_RIP] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* rip */
+    [X86_REG_RIP] = { .reg_id = REG_PC, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* rip */
     [X86_REG_RIZ] = {},
     [X86_REG_RSI] = { .reg_id = REG_GPR4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsi" } },  /* rsi */
     [X86_REG_RSP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsp" } },  /* rsp */

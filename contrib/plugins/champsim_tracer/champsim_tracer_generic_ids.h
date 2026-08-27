@@ -462,7 +462,7 @@ enum GenericRegId {
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
-    REG_IP = 252,
+    REG_PC = 252,
     REG_LR = 253,
     REG_FP_REG = 254,
     /* Sentinel: one past the highest defined register ID.  Sized so a
@@ -615,7 +615,7 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_SSP:     return "REG_SSP";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
-    case REG_IP:      return "REG_IP";
+    case REG_PC:      return "REG_PC";
     case REG_LR:      return "REG_LR";
     case REG_FP_REG:  return "REG_FP_REG";
     default: break;

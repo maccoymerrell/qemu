@@ -245,7 +245,7 @@ bool isax_generic_reg_dropped(unsigned gen_id)
     /* Mirrors is_dropped_reg() on the boundary side: the architectural
      * zero register is a dataflow no-op whichever decoder names it, and
      * the tracer carries control flow through the BRANCH_* taxonomy and
-     * the entry stream, never through a REG_IP dependency edge.
+     * the entry stream, never through a REG_PC dependency edge.
      *
      * REG_ZERO used to be struck here UNCONDITIONALLY while the boundary
      * side honoured --keep-zero, so the flag was inert on this layer and
@@ -256,5 +256,5 @@ bool isax_generic_reg_dropped(unsigned gen_id)
     if (gen_id == REG_ZERO) {
         return fields_drop_zero;
     }
-    return gen_id == REG_NONE || gen_id == REG_IP;
+    return gen_id == REG_NONE || gen_id == REG_PC;
 }

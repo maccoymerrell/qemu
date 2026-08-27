@@ -94,7 +94,7 @@ def tracer_vocab(isa):
 # dropped on BOTH sides, for the same reasons isax_generic_reg_dropped() drops
 # them from the register-set comparison; dropping on one side only would
 # manufacture a disagreement out of a convention.
-DROPPED = frozenset(('REG_ZERO', 'REG_IP'))
+DROPPED = frozenset(('REG_ZERO', 'REG_PC'))
 
 
 class Access(object):

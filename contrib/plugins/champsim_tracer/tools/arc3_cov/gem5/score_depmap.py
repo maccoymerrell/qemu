@@ -241,11 +241,11 @@ def score_pair(t, g, att, tallies, per_family, imm_masks, notes):
         if v == 'AGREE':
             return None
         if (axis in ('load-addr-dep', 'store-addr-dep')
-                and (tt - gg) == {'REG_IP'}):
+                and (tt - gg) == {'REG_PC'}):
             # gem5's x86 decoder resolves RIP-relative addressing at DECODE
             # time -- the displacement is folded against the instruction's
             # own PC and length -- so its address micro-op names no register
-            # at all.  The trace names REG_IP, which is architecturally right
+            # at all.  The trace names REG_PC, which is architecturally right
             # and strictly more informative.  Reference-side, and named here
             # so that 345 rows of it cannot read as trace imprecision.
             return 'REF-RIP-RELATIVE-FOLDED'

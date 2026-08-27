@@ -73,7 +73,7 @@ PIN_TO_GENERIC = {}
 for _i, _n in enumerate(_GPR):
     PIN_TO_GENERIC[_n] = 'REG_GPR%d' % _i
 PIN_TO_GENERIC.update({'rsp': 'REG_SP', 'rbp': 'REG_FP_REG',
-                       'rip': 'REG_IP', 'flags': 'REG_FLAGS',
+                       'rip': 'REG_PC', 'flags': 'REG_FLAGS',
                        'rflags': 'REG_FLAGS', 'eflags': 'REG_FLAGS'})
 for _i in range(32):
     PIN_TO_GENERIC['vec%d' % _i] = 'REG_VEC%d' % _i

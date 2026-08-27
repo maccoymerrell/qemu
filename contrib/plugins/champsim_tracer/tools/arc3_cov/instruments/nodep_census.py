@@ -5,7 +5,7 @@ Supersedes exec27b/verify/nodep_census.py and its per-wave copies.
 
 WHY AN ABSOLUTE CENSUS EXISTS AT ALL.  #230 was an x86_64 direct callq
 publishing its return-address store-data dependency as the IMMEDIATE bit
-instead of REG_IP, and its INDIRECT sibling publishing an empty mask.  Every
+instead of REG_PC, and its INDIRECT sibling publishing an empty mask.  Every
 J3 arm was blind to it, and blind for a structural reason worth writing
 down: J3 measures COUPLING -- whether a fact MOVES when Capstone is
 corrupted -- and a fact that is uniformly wrong in BOTH arms does not move.

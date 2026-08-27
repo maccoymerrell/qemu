@@ -359,8 +359,8 @@ void tally(GHashTable **t, const char *key)
  *   tracer's GDB-stub names are "hi" and "lo", so only the DSP-free pair
  *   would ever have matched by name and in fact none did.
  *
- * pc, on every target that has a global for it: the tracer's REG_IP.  Both
- *   sides drop REG_IP before scoring -- whether QEMU materialises the pc is
+ * pc, on every target that has a global for it: the tracer's REG_PC.  Both
+ *   sides drop REG_PC before scoring -- whether QEMU materialises the pc is
  *   a property of where the TB ended -- but mapping it is still what lets
  *   the instruction be SCORED at all rather than discarded as unmapped.
  *
@@ -383,7 +383,7 @@ uint8_t fold_nonarch(const char *name)
         return REG_FLAGS;                       /* aarch64 */
     }
     if (!strcmp(name, "pc")) {
-        return REG_IP;
+        return REG_PC;
     }
     /*
      * The last two spellings a '/'-alias split cannot reach, because QEMU and
@@ -728,7 +728,7 @@ void prov_to_set(const uint64_t *words, unsigned nwords, ProvSet &out)
     out.regs.erase(std::unique(out.regs.begin(), out.regs.end()),
                    out.regs.end());
     out.regs.erase(std::remove(out.regs.begin(), out.regs.end(),
-                               (uint8_t)REG_IP), out.regs.end());
+                               (uint8_t)REG_PC), out.regs.end());
 }
 
 /* The tracer's mask, in the same shape.  Bit layout per
@@ -751,7 +751,7 @@ void mask_to_set(const InsnFields &f, uint64_t mask, ProvSet &out)
     out.regs.erase(std::unique(out.regs.begin(), out.regs.end()),
                    out.regs.end());
     out.regs.erase(std::remove(out.regs.begin(), out.regs.end(),
-                               (uint8_t)REG_IP), out.regs.end());
+                               (uint8_t)REG_PC), out.regs.end());
 }
 
 /* Append every name the two sets do not share.  Empty means they agree. */
@@ -1320,7 +1320,7 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
      * where the TB ended, not of the instruction.
      */
     auto drop_ip = [](std::vector<uint8_t> &v) {
-        v.erase(std::remove(v.begin(), v.end(), (uint8_t)REG_IP), v.end());
+        v.erase(std::remove(v.begin(), v.end(), (uint8_t)REG_PC), v.end());
     };
     drop_ip(ir_r); drop_ip(ir_w); drop_ip(tr_r); drop_ip(tr_w);
 

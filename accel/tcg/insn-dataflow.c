@@ -122,6 +122,17 @@
  * not contribute" state it must not infer.
  */
 #define DF_MAX_IMM_NOTES      1024
+/*
+ * Preserve-reads stated by a WRITEBACK emitter
+ * (insn_dataflow_note_preserve_read).  One per partial write an instruction
+ * performs, PER INSTRUCTION -- the note names the op that has just consumed
+ * the background, so a block of nothing but `setne %al` takes one note per
+ * instruction.  Sized like the zero-register notes.  Past the cap the notes
+ * stop, and the instructions after it report their preserve-read as an
+ * ordinary operand read: pessimistic -- an edge nothing needs -- rather than
+ * a source that goes missing, which is the direction this file may not take.
+ */
+#define DF_MAX_PRESERVE_NOTES 1024
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -249,6 +260,51 @@ typedef struct DfImmNote {
     const void *ts;
     const TCGOp *anchor;
 } DfImmNote;
+
+/*
+ * CP-M, the preserve-read half: one READ of a guest register that an emitter
+ * performed only to carry the bits its write does not touch.
+ *
+ * THE PAIR IS THE FACT, and it is (temp, CONSUMING op) rather than (temp,
+ * anchor of the last op) as every other note here is.  A preserve-read is a
+ * property of ONE ARGUMENT OF ONE OP -- `deposit cpu_regs[EAX],
+ * cpu_regs[EAX], t0, 0, 8` reads EAX as background -- and the same
+ * instruction can read the same global as a genuine operand in a different
+ * op: `add %al,%bl` fetches BL through `ext8u t0, cpu_regs[EBX]` and then
+ * writes back through a deposit whose background is cpu_regs[EBX] again.
+ * A note scoped to the instruction would strike out both and lose the
+ * architectural edge; scoped to the op, it strikes out exactly the one the
+ * emitter said was a preserve.
+ *
+ * WHY THE EMITTER AND NOT THE OP SHAPE.  `deposit d, d, x, pos, len` is the
+ * same three ops for AArch64's MOVK, which the architecture DOES define as
+ * reading Xd, and for x86's byte-register writeback, which R7.1 rules does
+ * not make RAX a source.  Nothing in the op list separates them; the
+ * emitter knows which one it is writing, because one is the decoder
+ * resolving an operand and the other is a writeback helper preserving bits
+ * the instruction never named.  So the fact is stated there, once, at the
+ * writeback -- and its ABSENCE leaves the read exactly as it was, which is
+ * the pessimistic direction: a missing note publishes an edge nothing
+ * needs, never drops one something does.
+ */
+typedef struct DfPreserveNote {
+    const void *ts;
+    /*
+     * The op range the emitter produced, exclusive of @mark and inclusive of
+     * @end.  A RANGE and not a single op because tcg_gen_deposit_*() is not
+     * always one op: the host backend takes it whole when it can, and expands
+     * it into and/shift/or when it cannot -- and then the read of the
+     * background is in the FIRST op of the expansion while the last op is the
+     * one the emitter can name.  MIPS's `mtc1` is the measured case, where
+     * `deposit_i64 f,f,t,0,32` is not a valid host deposit and the note keyed
+     * on the last op alone silently matched nothing.
+     *
+     * @mark is NULL when the emitter had produced no op at all, which means
+     * the range starts at the first op of the block.
+     */
+    const TCGOp *mark;
+    const TCGOp *end;
+} DfPreserveNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
 typedef struct DfHelperNote {
@@ -487,6 +543,14 @@ struct InsnDataflowScratch {
     unsigned n_imm;
     bool imm_overflow;
 
+    /*
+     * CP-M, the preserve-read half: the (temp, op) pairs a writeback emitter
+     * marked as carrying only the bits its write does not reach.
+     */
+    DfPreserveNote preserve[DF_MAX_PRESERVE_NOTES];
+    unsigned n_preserve;
+    bool preserve_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -534,6 +598,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_imm              (df->imm)
 #define df_n_imm            (df->n_imm)
 #define df_imm_overflow     (df->imm_overflow)
+#define df_preserve         (df->preserve)
+#define df_n_preserve       (df->n_preserve)
+#define df_preserve_overflow (df->preserve_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -1004,6 +1071,43 @@ static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
     }
 }
 
+/*
+ * THE VALUE THIS INSTRUCTION ALREADY PUT IN @reg, or NULL if it has not
+ * written it yet.
+ *
+ * A lowering that computes IN PLACE reads the destination global back after
+ * writing it -- riscv64's `flw fa0,0(a6)` loads straight into cpu_fpr[rd]
+ * and then NaN-boxes it with `ori cpu_fpr[rd],cpu_fpr[rd],mask`, mipsel's
+ * `lwc1` does the same, and aarch64's post-indexed loads write the base
+ * register and read it again to form the writeback.  Read as an operand
+ * fetch, that second read says the instruction depends on the architectural
+ * incoming value of a register whose incoming value the instruction had
+ * already destroyed.
+ *
+ * It does not.  The value in the global at that point is the one THIS
+ * instruction produced, so the dependency the read carries is the
+ * dependency of that production -- which is exactly what a renaming regfile
+ * would forward (R7: "would the regfile have to respect this edge for the
+ * instruction to execute correctly?").  Returning the earlier write's
+ * provenance and substituting it for the register's own bit is that
+ * forwarding, done once, in the walk that has the fact.
+ *
+ * It cannot LOSE an edge.  If the earlier write was itself partial -- a
+ * `deposit` whose background operand was the same global -- then R is in
+ * its own provenance already and the forwarded set still carries it; the
+ * substitution only removes R where R's value at the point of the read owed
+ * nothing to R's value at the start of the instruction.
+ */
+static const uint64_t *df_written_prov(const InsnDataflow *d, unsigned reg)
+{
+    for (unsigned i = 0; i < d->n_writes; i++) {
+        if (d->writes[i].reg == reg) {
+            return d->writes[i].prov;
+        }
+    }
+    return NULL;
+}
+
 static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
 {
     for (unsigned i = 0; i < d->n_writes; i++) {
@@ -1091,6 +1195,8 @@ void insn_dataflow_note_reset(void)
     df_alias_overflow = false;
     df_n_zero = 0;
     df_zero_overflow = false;
+    df_n_preserve = 0;
+    df_preserve_overflow = false;
     df_n_fold = 0;
     df_fold_overflow = false;
     df_n_imm = 0;
@@ -1544,6 +1650,46 @@ static void df_settle_memop_prov(const InsnDataflow *d, size_t lo, size_t hi)
  * the note anchors to is this instruction's insn_start and nothing inside the
  * range would ever match it.
  */
+/*
+ * Did a writeback emitter say that @op's read of @ts carries only the bits
+ * @op does not write?
+ *
+ * Searched over the whole block's notes rather than over an instruction
+ * window, and it is safe to: the key is the CONSUMING OP, which belongs to
+ * exactly one instruction and cannot be restated by another.  That is what
+ * the zero-register and immediate notes need their anchors and cursors for
+ * -- their key is an interned CONSTANT, which every instruction in the block
+ * shares.
+ */
+static bool df_preserve_read(const void *ts, const TCGOp *op)
+{
+    for (unsigned i = df_n_preserve; i-- > 0; ) {
+        const TCGOp *o;
+        unsigned n;
+
+        if (df_preserve[i].ts != ts) {
+            continue;
+        }
+        o = df_preserve[i].mark ? QTAILQ_NEXT(df_preserve[i].mark, link)
+                                : QTAILQ_FIRST(&tcg_ctx->ops);
+        /*
+         * Bounded, and the bound is a cost guard rather than a semantic one:
+         * an emitter's expansion is a handful of ops, and a range longer than
+         * this is not one this note was meant to describe.  Giving up leaves
+         * the read an operand read, which is the pessimistic direction.
+         */
+        for (n = 0; o != NULL && n < 64; o = QTAILQ_NEXT(o, link), n++) {
+            if (o == op) {
+                return true;
+            }
+            if (o == df_preserve[i].end) {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
                     unsigned *zero_cursor, unsigned *imm_cursor)
@@ -1653,11 +1799,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
              */
             for (unsigned i = 0; i < nb_iargs; i++) {
                 TCGTemp *ts = arg_temp(op->args[nb_oargs + i]);
+                const uint64_t *fwd;
 
                 df_or(prov, df_prov_of(ts - s->temps));
                 if (df_reg(ts, &idx)) {
-                    df_bit(d->rd, idx);
-                    df_bit(prov, idx);
+                    /* See df_written_prov(): a read-back of this
+                     * instruction's own result is not an operand fetch. */
+                    fwd = df_written_prov(d, idx);
+                    if (fwd) {
+                        df_or(prov, fwd);
+                    } else {
+                        df_bit(d->rd, idx);
+                        df_bit(prov, idx);
+                    }
                 }
             }
 
@@ -2216,8 +2370,34 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                 d->imm_reached = 1;
             }
             if (df_reg(ts, &idx)) {
-                df_bit(d->rd, idx);
-                df_bit(prov, idx);
+                /*
+                 * A READ-BACK OF THIS INSTRUCTION'S OWN RESULT is not an
+                 * operand fetch, and naming the register here is what put
+                 * every in-place lowering's destination in its own
+                 * provenance.  See df_written_prov().
+                 */
+                const uint64_t *fwd;
+
+                if (df_preserve_read(ts, op)) {
+                    /*
+                     * THE CARRIER NOTE.  The emitter that produced this op
+                     * said the register is here only to carry the bits the
+                     * write does not reach -- R7.1: "the fact that a
+                     * register's upper contents may not be modified does not
+                     * imply it is a source AND a destination for the
+                     * instruction unless the instruction specifically takes
+                     * it as a source."  It contributes neither to the read
+                     * set nor to the provenance.  See DfPreserveNote.
+                     */
+                    continue;
+                }
+                fwd = df_written_prov(d, idx);
+                if (fwd) {
+                    df_or(prov, fwd);
+                } else {
+                    df_bit(d->rd, idx);
+                    df_bit(prov, idx);
+                }
             } else if (df_zero_reg_temp(ts, 1, zero_lo, *zero_cursor)) {
                 /*
                  * The architectural ZERO REGISTER, stated by the accessor
@@ -2465,6 +2645,65 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
  * INSTRUCTION said the word, and a constant temp is exactly the case where
  * two instructions can say it about the same temp.
  */
+/*
+ * CP-M, the preserve-read half.  See insn_dataflow_note_preserve_read() in
+ * the header for why the note is taken at the WRITEBACK and nowhere else.
+ *
+ * The op is looked up rather than passed because the emitter has just
+ * produced it: `tcg_gen_deposit_tl(...)` then this call, exactly as the
+ * folded-register notes are taken.  Deduplicated against the newest note on
+ * the pair, for DfZeroNote's reason -- one emitter may state the same fact
+ * twice and two emitters may state different facts about one temp.
+ */
+void insn_dataflow_note_preserve_read(const void *ts, const void *mark)
+{
+    const TCGOp *op;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_preserve >= DF_MAX_PRESERVE_NOTES) {
+        /*
+         * No flag reaches a consumer for this one, and none should: a lost
+         * preserve-note leaves the read looking like an operand, which
+         * publishes an edge the instruction does not need.  That is
+         * pessimism, the direction this file errs in on purpose, and not the
+         * missing-source direction the other notes' overflow flags exist to
+         * report.
+         */
+        df_preserve_overflow = true;
+        return;
+    }
+    op = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_preserve; i-- > 0; ) {
+        if (df_preserve[i].ts == ts && df_preserve[i].end == op) {
+            return;
+        }
+        break;
+    }
+    df_preserve[df_n_preserve].ts = ts;
+    df_preserve[df_n_preserve].mark = mark;
+    df_preserve[df_n_preserve].end = op;
+    df_n_preserve++;
+}
+
+/*
+ * The op an emitter has produced so far, as an opaque handle.
+ *
+ * Paired with insn_dataflow_note_preserve_read(): taken BEFORE the writeback
+ * is emitted, it bounds the note to the ops that writeback produced and to no
+ * others.  NULL is a legitimate answer -- the emitter may be the first thing
+ * in the block -- and the note reads it as "from the beginning".
+ */
+const void *insn_dataflow_mark(void)
+{
+    if (df_disabled()) {
+        return NULL;
+    }
+    return QTAILQ_LAST(&tcg_ctx->ops);
+}
+
 void insn_dataflow_note_zero_reg(const void *ts)
 {
     const TCGOp *anchor;

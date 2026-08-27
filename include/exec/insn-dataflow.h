@@ -646,6 +646,55 @@ void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts);
 void insn_dataflow_note_encoded_imm(const void *ts);
 
 /*
+ * CP-M, the PRESERVE-READ half -- the read a WRITEBACK performs to carry the
+ * bits it is not writing.
+ *
+ * WHAT THIS IS FOR.  A destination register that appears in its OWN
+ * provenance poses a question the op list cannot answer.  `add %rax,%rbx`
+ * really does read RBX; `setne %al` does not read RAX, and QEMU emits the
+ * identical shape for both -- an op whose output global is also one of its
+ * input globals -- because a byte write into a 64-bit register is lowered as
+ * a deposit whose background operand is the register.  R7.1 rules on which
+ * is which, verbatim: "the fact that a register's upper contents may not be
+ * modified does not imply it is a source AND a destination for the
+ * instruction unless the instruction specifically takes it as a source."
+ *
+ * WHERE IT IS STATED, and why nowhere else.  At the WRITEBACK EMITTER, which
+ * is the one place that knows it is preserving rather than reading: x86's
+ * gen_op_deposit_reg_v(), which every byte- and word-width destination goes
+ * through, and MIPS's gen_store_fpr32()/gen_store_fpr32h(), which write one
+ * half of a 64-bit FP register.  A structural test on the op cannot stand in
+ * for it -- AArch64's MOVK emits the same `deposit d,d,x,pos,len` and the
+ * architecture DOES define it as reading Xd, so the same three ops mean
+ * opposite things in the two places, and only the emitter knows which it is.
+ *
+ * @ts is the temp being read as the background, and the note is keyed on the
+ * op that has just consumed it, so it strikes out THAT ARGUMENT OF THAT OP
+ * and nothing else.  `add %al,%bl` fetches BL as an operand in one op and
+ * preserves RBX in another; a note scoped to the instruction would strike
+ * out both and lose an architectural edge.
+ *
+ * ITS ABSENCE IS NOT AN ANSWER AND IS NOT USED AS ONE.  A read nobody marked
+ * stays exactly what it was -- an operand read -- so an emitter this call
+ * has not reached yet publishes an edge a consumer does not need, which is
+ * pessimism, rather than dropping one it does, which is the error direction
+ * the extractor may not take.  That is why this note reads the opposite way
+ * round from insn_dataflow_note_encoded_imm(): there the absence of a bit
+ * had to be qualified by @imm_stated, here it needs no qualification at all.
+ *
+ * @ts is a TCGTemp pointer, void here for the same reason
+ * insn_dataflow_note_memop()'s is.  Capture only; no op is emitted, altered
+ * or suppressed.
+ */
+void insn_dataflow_note_preserve_read(const void *ts, const void *mark);
+
+/*
+ * The emitter's position in the op stream, for bounding a preserve-read note.
+ * Opaque: the only thing a caller may do with it is hand it back.
+ */
+const void *insn_dataflow_mark(void);
+
+/*
  * CP-H -- the helper choke point.
  *
  * INDEX_op_call is the one op whose arguments do not describe themselves.
@@ -854,6 +903,13 @@ static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
                                                const uint8_t *dir,
                                                unsigned n, uint32_t oprsz)
 { }
+
+static inline void insn_dataflow_note_preserve_read(const void *ts,
+                                                    const void *mark)
+{ }
+
+static inline const void *insn_dataflow_mark(void)
+{ return NULL; }
 
 static inline void insn_dataflow_note_reset(void)
 { }

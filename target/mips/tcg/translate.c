@@ -1444,12 +1444,23 @@ void gen_load_fpr32(DisasContext *ctx, TCGv_i32 t, int reg)
 void gen_store_fpr32(DisasContext *ctx, TCGv_i32 t, int reg)
 {
     TCGv_i64 t64;
+    const void *mark;
+
     if (ctx->hflags & MIPS_HFLAG_FRE) {
         generate_exception(ctx, EXCP_RI);
     }
     t64 = tcg_temp_new_i64();
     tcg_gen_extu_i32_i64(t64, t);
+    mark = insn_dataflow_mark();
     tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 0, 32);
+    /*
+     * The deposit read the register only to carry the half it did not write
+     * -- R7.1's narrow write, and `mtc1 rt,$f0` names no FP source at all.
+     * Where the instruction genuinely reads the register the operand came
+     * through gen_load_fpr32/64 in a different op, which this note, keyed on
+     * the consuming op, does not touch.
+     */
+    insn_dataflow_note_preserve_read(tcgv_i64_temp(fpu_f64[reg]), mark);
 }
 
 static void gen_load_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg)
@@ -1465,8 +1476,13 @@ static void gen_store_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg)
 {
     if (ctx->hflags & MIPS_HFLAG_F64) {
         TCGv_i64 t64 = tcg_temp_new_i64();
+        const void *mark;
+
         tcg_gen_extu_i32_i64(t64, t);
+        mark = insn_dataflow_mark();
         tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 32, 32);
+        /* The upper half's writeback; see gen_store_fpr32(). */
+        insn_dataflow_note_preserve_read(tcgv_i64_temp(fpu_f64[reg]), mark);
     } else {
         gen_store_fpr32(ctx, t, reg | 1);
     }

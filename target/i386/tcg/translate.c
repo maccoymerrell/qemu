@@ -444,21 +444,48 @@ static inline MemOp mo_stacksize(DisasContext *s)
  * If DEST is not NULL, store the result into DEST and return the
  * register's TCGv.
  */
+/*
+ * The deposit just emitted read @bg only to carry the bits it did not write.
+ *
+ * R7.1: a narrow write does not make the enclosing register a source, and
+ * this is the emitter that performs every one of x86's narrow writes -- the
+ * background operand is here because the register file is 64 bits wide and
+ * `setne %al` is 8, not because the instruction named RAX.  Where the
+ * instruction DOES name it -- `add %al,%bl` -- the operand was fetched by a
+ * different op through gen_op_mov_v_reg(), and the note, which is keyed on
+ * the consuming op, leaves that read alone.
+ *
+ * Stated only for the IN-PLACE form.  When a caller passes its own @dest the
+ * preserved bits travel into a temp that may become a different
+ * architectural register, and there the dependency is real.
+ */
+static void gen_note_deposit_preserve(TCGv dest, TCGv bg, const void *mark)
+{
+    if (dest == bg) {
+        insn_dataflow_note_preserve_read(tcgv_tl_temp(bg), mark);
+    }
+}
+
 static TCGv gen_op_deposit_reg_v(DisasContext *s, MemOp ot, int reg, TCGv dest, TCGv t0)
 {
+    const void *mark = insn_dataflow_mark();
+
     switch(ot) {
     case MO_8:
         if (byte_reg_is_xH(s, reg)) {
             dest = dest ? dest : cpu_regs[reg - 4];
             tcg_gen_deposit_tl(dest, cpu_regs[reg - 4], t0, 8, 8);
+            gen_note_deposit_preserve(dest, cpu_regs[reg - 4], mark);
             return cpu_regs[reg - 4];
         }
         dest = dest ? dest : cpu_regs[reg];
         tcg_gen_deposit_tl(dest, cpu_regs[reg], t0, 0, 8);
+        gen_note_deposit_preserve(dest, cpu_regs[reg], mark);
         break;
     case MO_16:
         dest = dest ? dest : cpu_regs[reg];
         tcg_gen_deposit_tl(dest, cpu_regs[reg], t0, 0, 16);
+        gen_note_deposit_preserve(dest, cpu_regs[reg], mark);
         break;
     case MO_32:
         /* For x86_64, this sets the higher half of register to zero.

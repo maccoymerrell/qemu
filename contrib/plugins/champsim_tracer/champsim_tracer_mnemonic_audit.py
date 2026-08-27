@@ -5139,6 +5139,77 @@ QID_ADJUDICATIONS: dict[tuple[str, int], tuple[str, str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# QID_BRANCH_CLASS: the transfer class QEMU's own rule states and the
+# Capstone key cannot express
+# ---------------------------------------------------------------------------
+#
+# A row here is NOT a second opinion about an ambiguous case.  It is the
+# narrow shape where QEMU's decode rule and the Capstone constant observed
+# through it are at DIFFERENT GRANULARITIES on the branch class alone: the
+# rule names one transfer and the constant names a family that contains
+# several.  aarch64 is the whole population -- Capstone spells every
+# `b.<cc>` as AARCH64_INS_B, the same constant it gives the unconditional
+# `b`, and the condition lives in a field the constant does not carry.
+#
+# Without this the identity row carried BRANCH_DIRECT_JUMP for a
+# conditional branch and the class was recovered PER INSTANCE, at decode
+# time, by matching the printed mnemonic "b." -- refine_alias_fields() in
+# champsim_tracer_decode.cc.  That route is Capstone's disassembly text,
+# which J6 removes from every correctness path; and it can only ever
+# repair the instances the tracer decodes, never the identity row a wire
+# flip would publish from.  The fact belongs on the row.
+#
+# THE BAR, and it is the QID_ADJUDICATIONS bar restated for one field:
+# the entry may only state what QEMU's decode table itself states, and
+# `why` is that source fact, emitted into the generated header beside the
+# row.  It may not be used to prefer one classification over another where
+# both describe the rule -- that is a taxonomy ruling, not a QEMU fact.
+#
+# The generator REFUSES an entry that names an identity the universe does
+# not contain, and one whose row already carries the branch class it
+# states: a ruling that changes nothing is a ruling written against
+# evidence that has moved, and it is louder as an error than as a no-op.
+QID_BRANCH_CLASS: dict[tuple[str, str], tuple[str, str]] = {
+    ("aarch64", "disas_a64/B_cond"): (
+        "BRANCH_COND_DIRECT",
+        "a64.decode:199 `B_cond 0101010 0 ... c:1 cond:4 imm=%imm19` -- the "
+        "rule extracts a 4-bit condition; Capstone spells both b.<cc> and "
+        "the unconditional b as AARCH64_INS_B"),
+}
+
+
+def apply_branch_class(info: IsaInfo, entry: Entry, ident: QemuIdent,
+                       ) -> tuple[Entry, str | None]:
+    """State QEMU's own branch class on the row, where it has one.
+
+    Returns the (possibly rewritten) entry and the source fact that
+    rewrote it.  Refuses loudly on a stale entry rather than passing.
+    """
+    got = QID_BRANCH_CLASS.get((info.key, ident.name))
+    if got is None:
+        return entry, None
+    want, why = got
+    if entry.branch == want:
+        raise SystemExit(
+            f"{info.key}: QID_BRANCH_CLASS names {ident.name} "
+            f"(0x{ident.ident:08x}) as {want}, which the row ALREADY "
+            f"carries.  A rule that changes nothing is stale against this "
+            f"table; delete it or re-state what it is for.")
+    import dataclasses
+    return dataclasses.replace(entry, branch=want), why
+
+
+def _branch_class_unreached(info: IsaInfo, idents: list[QemuIdent]) -> None:
+    """Every QID_BRANCH_CLASS entry for this ISA must name a real rule."""
+    have = {i.name for i in idents}
+    for (key, name) in QID_BRANCH_CLASS:
+        if key == info.key and name not in have:
+            raise SystemExit(
+                f"{info.key}: QID_BRANCH_CLASS names {name}, which is not a "
+                f"rule in this target's identity universe")
+
+
 def _pattern_mnemonic_candidates(pattern: str) -> list[str]:
     """Spellings of a decodetree pattern name to try against Capstone.
 
@@ -5209,6 +5280,10 @@ class IdentRow:
     # source fact that decided it, and it is emitted beside the row so the
     # generated header carries the reason and not just the outcome.
     adjudged: str | None = None
+    # Set when QEMU's own rule states the row's BRANCH CLASS and the
+    # Capstone constant observed through it cannot express one (see
+    # QID_BRANCH_CLASS).  The text is that source fact.
+    branch_fact: str | None = None
 
 
 def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
@@ -5227,6 +5302,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                         row's operand template does not contradict it.
       QID_NONE          neither.  Residue, named in the census.
     """
+    _branch_class_unreached(info, idents)
     m2c = _mnemonic_to_const(info)
     v2c = enum_value_map(info)
     rows: list[IdentRow] = []
@@ -5328,9 +5404,10 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                 tier = QID_NAME_MATCHED
                 entry = cand
                 break
+        entry, branch_fact = apply_branch_class(info, entry, ident)
         rows.append(IdentRow(ident, entry, tier, mnems,
                              tuple(sorted(dict.fromkeys(caps))),
-                             tuple(split), refused, adjudged))
+                             tuple(split), refused, adjudged, branch_fact))
     return rows
 
 
@@ -5428,7 +5505,10 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
     ]
     for r in rows:
         note = ""
-        if r.adjudged:
+        if r.branch_fact:
+            note = ("  /* branch class from QEMU's rule: " +
+                    r.branch_fact + " */")
+        elif r.adjudged:
             note = ("  /* ADJUDICATED from " +
                     "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
                               for e, ms in r.split) +

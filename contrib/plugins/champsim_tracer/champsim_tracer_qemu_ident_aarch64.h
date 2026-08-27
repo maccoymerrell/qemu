@@ -4520,7 +4520,7 @@ static const QemuIdentRow qemu_ident_aarch64[] = {
     { 0xdd9c9f96u, "disas_a64/SDOT_vi", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_VEC_MADD, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0xddd221a9u, "disas_a64/B_cond", QID_OBSERVED, false,
-      { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_JUMP, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
+      { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_COND_DIRECT, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },  /* branch class from QEMU's rule: a64.decode:199 `B_cond 0101010 0 ... c:1 cond:4 imm=%imm19` -- the rule extracts a 4-bit condition; Capstone spells both b.<cc> and the unconditional b as AARCH64_INS_B */
     { 0xddd27dddu, "disas_a32/UMAAL", QID_NONE, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xdde6ab84u, "disas_a64/AUTIB1716", QID_NONE, false,

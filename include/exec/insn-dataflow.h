@@ -51,7 +51,7 @@
  * offsets and resolved by the consumer, which is the only side that knows
  * what a byte range means.
  */
-#define INSN_DF_MAX_FIELDS  8
+#define INSN_DF_MAX_FIELDS  24
 
 /* Instructions writing more than this are vanishingly rare; overflow is flagged. */
 #define INSN_DF_MAX_WRITES  8

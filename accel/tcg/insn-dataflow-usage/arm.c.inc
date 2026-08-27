@@ -38,14 +38,14 @@
  *   cpyp                 read  addr=UNSTATED data=-    count unbounded
  *   cpyp                 write addr=UNSTATED data=-    count unbounded
  *   dc_zva               write addr=UNSTATED data=-    one access
+ *   sete                 write addr=UNSTATED data=-    count unbounded
+ *   setm                 write addr=UNSTATED data=-    count unbounded
+ *   setp                 write addr=UNSTATED data=-    count unbounded
+ *   sve_ld1bb_r          read  addr=UNSTATED data=-    one access
+ *   sve_st1bb_r          write addr=UNSTATED data=-    one access
  *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   access_check_cp_reg      env passed to accessfn(), not defined in this unit
- *   sete                     env passed to stepfn(), not defined in this unit
- *   setm                     env passed to stepfn(), not defined in this unit
- *   setp                     env passed to stepfn(), not defined in this unit
- *   sve_ld1bb_r              env passed to tlb_fn(), not defined in this unit
- *   sve_st1bb_r              env passed to tlb_fn(), not defined in this unit
  *
  * Rows the mechanical reader refused and a HAND enumeration supplies.
  * Each carries its justification in full:
@@ -218,11 +218,69 @@ static const DfHelperField dfu_rebuild_hflags_a64_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/helper.c:11687 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/helper.c:6740 */
 };
+static const DfHelperField dfu_sete_env[] = {
+    { offsetof(CPUArchState, CF), sizeof(((CPUArchState *)0)->CF), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1462 */
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/internals.h:406 */
+    { offsetof(CPUArchState, exception), sizeof(((CPUArchState *)0)->exception), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/op_helper.c:68 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:463 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1684 */
+};
+static const DfHelperField dfu_setm_env[] = {
+    { offsetof(CPUArchState, CF), sizeof(((CPUArchState *)0)->CF), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1462 */
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/internals.h:406 */
+    { offsetof(CPUArchState, exception), sizeof(((CPUArchState *)0)->exception), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/op_helper.c:68 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:463 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1684 */
+};
+static const DfHelperField dfu_setp_env[] = {
+    { offsetof(CPUArchState, CF), sizeof(((CPUArchState *)0)->CF), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1782 */
+    { offsetof(CPUArchState, NF), sizeof(((CPUArchState *)0)->NF), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1780 */
+    { offsetof(CPUArchState, VF), sizeof(((CPUArchState *)0)->VF), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1783 */
+    { offsetof(CPUArchState, ZF), sizeof(((CPUArchState *)0)->ZF), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1781 */
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/internals.h:406 */
+    { offsetof(CPUArchState, exception), sizeof(((CPUArchState *)0)->exception), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/op_helper.c:68 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:463 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1684 */
+};
 static const DfHelperField dfu_st2g_env[] = {
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:47 */
 };
 static const DfHelperField dfu_stg_env[] = {
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:47 */
+};
+static const DfHelperField dfu_sve_ld1bb_r_env[] = {
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/mte_helper.c:650 */
+    { offsetof(CPUArchState, exception), sizeof(((CPUArchState *)0)->exception), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/mte_helper.c:608 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:47 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:463 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/sve_helper.c:5874 */
+};
+static const DfHelperField dfu_sve_st1bb_r_env[] = {
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/mte_helper.c:650 */
+    { offsetof(CPUArchState, exception), sizeof(((CPUArchState *)0)->exception), INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/mte_helper.c:608 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:47 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:463 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND },   /* ../target/arm/tcg/sve_helper.c:6546 */
 };
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, btype), sizeof(((CPUArchState *)0)->btype), INSN_DF_RD, DF_HF_XLAT },   /* ../target/arm/helper.c:11779 */
@@ -263,6 +321,21 @@ static const DfHelperAccess dfu_cpyp_acc[] = {
 };
 static const DfHelperAccess dfu_dc_zva_acc[] = {
     { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 0 },   /* ../target/arm/tcg/helper-a64.c:1358, 1 site(s) */
+};
+static const DfHelperAccess dfu_sete_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:1547, 3 site(s) */
+};
+static const DfHelperAccess dfu_setm_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:1547, 3 site(s) */
+};
+static const DfHelperAccess dfu_setp_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:1547, 3 site(s) */
+};
+static const DfHelperAccess dfu_sve_ld1bb_r_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 0 },   /* ../target/arm/tcg/sve_ldst_internal.h:71, 1 site(s) */
+};
+static const DfHelperAccess dfu_sve_st1bb_r_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 0 },   /* ../target/arm/tcg/sve_ldst_internal.h:83, 1 site(s) */
 };
 
 static const DfHelperUsage df_helper_usage[] = {
@@ -378,6 +451,18 @@ static const DfHelperUsage df_helper_usage[] = {
       NULL, 0, true,
       "../target/arm/tcg/vfp_helper.c:479",
       NULL, 0 },
+    { "sete", { 0 },
+      dfu_sete_env, ARRAY_SIZE(dfu_sete_env), true,
+      "../target/arm/tcg/helper-a64.c:1930",
+      dfu_sete_acc, ARRAY_SIZE(dfu_sete_acc) },
+    { "setm", { 0 },
+      dfu_setm_env, ARRAY_SIZE(dfu_setm_env), true,
+      "../target/arm/tcg/helper-a64.c:1862",
+      dfu_setm_acc, ARRAY_SIZE(dfu_setm_acc) },
+    { "setp", { 0 },
+      dfu_setp_env, ARRAY_SIZE(dfu_setp_env), true,
+      "../target/arm/tcg/helper-a64.c:1787",
+      dfu_setp_acc, ARRAY_SIZE(dfu_setp_acc) },
     { "st2g", { 0 },
       dfu_st2g_env, ARRAY_SIZE(dfu_st2g_env), true,
       "../target/arm/tcg/mte_helper.c:429",
@@ -386,6 +471,14 @@ static const DfHelperUsage df_helper_usage[] = {
       dfu_stg_env, ARRAY_SIZE(dfu_stg_env), true,
       "../target/arm/tcg/mte_helper.c:371",
       NULL, 0 },
+    { "sve_ld1bb_r", { 0, 3 },
+      dfu_sve_ld1bb_r_env, ARRAY_SIZE(dfu_sve_ld1bb_r_env), true,
+      "../target/arm/tcg/sve_helper.c:6065",
+      dfu_sve_ld1bb_r_acc, ARRAY_SIZE(dfu_sve_ld1bb_r_acc) },
+    { "sve_st1bb_r", { 0, 3 },
+      dfu_sve_st1bb_r_env, ARRAY_SIZE(dfu_sve_st1bb_r_env), true,
+      "../target/arm/tcg/sve_helper.c:6681",
+      dfu_sve_st1bb_r_acc, ARRAY_SIZE(dfu_sve_st1bb_r_acc) },
     { "sve_whilel", { 3 },
       NULL, 0, true,
       "../target/arm/tcg/sve_helper.c:4143",

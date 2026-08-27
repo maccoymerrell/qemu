@@ -283,6 +283,23 @@ class Analysis:
         self._sframe = [{}]     # scalar parameter name -> argument index
         self._pending_sroots = None
         self._in_acc = 0        # depth inside an access primitive's own body
+        # A CALLEE handed over as an argument.
+        #
+        # aarch64's MOPS set helpers reach their guest stores through one:
+        # HELPER(setp) is `do_setp(env, syndrome, mtedesc, set_step, false,
+        # GETPC())` and do_setp() calls `stepfn(env, ...)`.  Read literally,
+        # `stepfn` is defined in no unit, the env root reaches it, and the
+        # helper is REFUSED -- which is this reader's limit written down as
+        # the machine's, the shape R5 rules out.
+        #
+        # It is bounded and it is derived: the binding exists only when the
+        # ACTUAL argument at the call site is the NAME of a function these
+        # units define, so the concrete callee is read off QEMU's own source
+        # at the site that chose it.  A call through a STRUCT MEMBER --
+        # `ri->accessfn`, whose table has hundreds of entries -- has no such
+        # site and stays refused.
+        self._fnframe = [{}]    # parameter name -> concrete function name
+        self._pending_fnroots = None
 
     def lookup(self, name):
         for u in self.units:
@@ -301,7 +318,15 @@ class Analysis:
         return self
 
     def _walk(self, u, fname, roots, depth):
-        key = (id(u), fname, tuple(sorted(roots.items())))
+        fnr = self._pending_fnroots
+        self._pending_fnroots = None
+        # The function-pointer binding is part of the walk's IDENTITY, not a
+        # decoration on it: do_setp(..., set_step, ...) and
+        # do_setp(..., set_step_tags, ...) are the same function reached with
+        # the same roots and they touch different state.  Leaving it out of
+        # the key memoises the first and silently gives the second its answer.
+        key = (id(u), fname, tuple(sorted(roots.items())),
+               tuple(sorted((fnr or {}).items())))
         if key in self.seen:
             return
         if depth > self.MAX_DEPTH:
@@ -331,11 +356,17 @@ class Analysis:
         for pi, root in (sr or {}).items():
             if pi < len(params) and params[pi][0]:
                 sframe[params[pi][0]] = root
+        fnframe = {}
+        for pi, callee in (fnr or {}).items():
+            if pi < len(params) and params[pi][0]:
+                fnframe[params[pi][0]] = callee
         self._sframe.append(sframe)
+        self._fnframe.append(fnframe)
         try:
             self._scan(u, brace, end, taint, depth, fname)
         finally:
             self._sframe.pop()
+            self._fnframe.pop()
 
     def _scan(self, u, brace, end, taint, depth, fname):
         toks, loc = u.toks, u.loc
@@ -626,9 +657,37 @@ class Analysis:
             if prev['data'] != data:
                 prev['data'] = None
 
+    def _fn_roots(self, u, args, taint):
+        """Actual arguments that NAME a function these units define.
+
+        The binding is only ever read off a call site that wrote the name
+        down, which is what makes it a derivation rather than a guess: a
+        `ri->stepfn` has no such site and gets none.  A parameter already
+        bound in the CALLER's frame is forwarded, so a pointer handed two
+        levels down keeps its concrete callee.
+        """
+        out = {}
+        for ai, grp in enumerate(args):
+            if len(grp) != 1:
+                continue
+            kind, txt = u.toks[grp[0]]
+            if kind != 'id' or txt in taint:
+                continue
+            fwd = self._fnframe[-1].get(txt)
+            if fwd is not None:
+                out[ai] = fwd
+            elif self.lookup(txt)[1] is not None:
+                out[ai] = txt
+        return out
+
     def _call(self, u, i, cp, taint, depth, fname):
         toks = u.toks
         callee = toks[i][1]
+        # A call through a parameter the caller bound to a named function is
+        # a call to that function.  Substituted before anything else looks at
+        # the name, so lookup(), the access-primitive table and the refusal
+        # all see the concrete callee.
+        callee = self._fnframe[-1].get(callee, callee)
         # split the actual arguments
         args, cur, d = [], [], 0
         for k in range(i + 2, cp):
@@ -711,6 +770,7 @@ class Analysis:
                         self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
                 return
             self._pending_sroots = self._scalar_roots(u, args)
+            self._pending_fnroots = self._fn_roots(u, args, taint)
             if acc:
                 self._in_acc += 1
             try:

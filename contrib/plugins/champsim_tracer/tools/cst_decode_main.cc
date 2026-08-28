@@ -1089,6 +1089,73 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         if (out_placed_loads) *out_placed_loads = shift_out(placed);
         return any;
     }
+
+    /*
+     * THE READ SET IS NOT THE DEPENDENCY SET, AND THE ROW OWES THE READER
+     * BOTH.
+     *
+     * Everything above renders a SINK and the inputs some mask routes to
+     * it.  A source register the instruction READS but that no published
+     * mask routes anywhere therefore reached no arrow and vanished from
+     * the line -- while `--format=legacy` and `--templates-only`, which
+     * print `src_regs[]` directly, both kept it.  `jcc` is the case in
+     * point: the wire says src=[REG_FLAGS,REG_PC] dst=[REG_PC] with
+     * dst_dep naming the immediate alone (QEMU computes the taken target
+     * as a constant, which is the truth about the dataflow), so the body
+     * row printed `jcc $0x401689 -> %pc[...]` and named neither register.
+     * Measured on one 400k-instruction x86_64 trace: 45,808 body rows
+     * naming a source register nowhere at all, and a PIN register-set
+     * cross-check reading those rows scored 41,859 of them TRACER-SUBSET
+     * against a wire that was right the whole time.
+     *
+     * The residual group closes it.  Inputs the sink loop did not place
+     * are appended as their own `  ;  `-separated group with NO arrow --
+     * exactly the shape the no-sink case above already uses for a pure
+     * read (`cmp %gp0, %gp1`), so "no arrow" reads as "these are read and
+     * feed no published sink" everywhere on the line.
+     *
+     * Two exclusions, both because the register is already on the row:
+     *   - a src_reg named by any HAS_ADDR mask is printed inside its own
+     *     `ld[..]` / `st[..]` -- relocated, never lost;
+     *   - load_data slots are not registers, and an unplaced one is
+     *     rendered in full by emit_disasm_memops (which needs it to stay
+     *     OUT of @placed to know that).
+     */
+    /* HAS_ADDR mask layout is src bits [0,n_src) then the imm at bit
+     * n_src -- NOT the HAS_REG pool layout, whose bit n_src is the first
+     * load_data slot.  Keep the two apart. */
+    uint64_t addr_srcs = 0;
+    bool addr_names_imm = false;
+    for (uint64_t m : insn.load_addr_dep_mask) {
+        addr_srcs |= m & src_bits_mask;
+        if (n_src < 64 && (m & ((uint64_t)1 << n_src))) addr_names_imm = true;
+    }
+    for (uint64_t m : insn.store_addr_dep_mask) {
+        addr_srcs |= m & src_bits_mask;
+        if (n_src < 64 && (m & ((uint64_t)1 << n_src))) addr_names_imm = true;
+    }
+    uint64_t residual = src_bits_mask & ~placed & ~addr_srcs;
+    if (insn.has_immediate && !addr_names_imm && n_src < 64) {
+        /* The imm sits one slot past the load_data slots in pool order. */
+        size_t imm_i = (size_t)n_src + insn.max_dep_loads;
+        if (imm_i < inputs.size() && imm_i < 64 &&
+            !(placed & ((uint64_t)1 << imm_i))) {
+            residual |= ((uint64_t)1 << imm_i);
+        }
+    }
+    residual &= (inputs.size() >= 64) ? ~(uint64_t)0
+                                      : (((uint64_t)1 << inputs.size()) - 1);
+    if (residual) {
+        open_group();
+        bool any = false;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (!(residual & ((uint64_t)1 << i))) continue;
+            if (any) line.append(", ");
+            line.append(inputs[i]);
+            any = true;
+        }
+    }
+
     if (out_placed_loads) *out_placed_loads = shift_out(placed);
     return true;
 }

@@ -22,7 +22,7 @@ is not a register question -- RIP/REG_PC is dropped on both sides).
 
 Author: Maccoy Merrell.
 """
-import sys, os, re, json, collections, subprocess, time
+import sys, os, re, json, collections, subprocess, time, hashlib
 
 D = os.path.dirname(os.path.abspath(__file__))
 COV = os.path.dirname(D)
@@ -545,11 +545,33 @@ def reprobe_or_refuse(d, falsify=None):
 
 
 _falsify = None
+# --seed-only writes ../attrib.seed.tsv INSTEAD of ../attrib.tsv.
+#
+# WHY THE TWO FILES EXIST, and it is the fix for a non-repeatable column.
+# The reachability legs must be told WHICH encodings to execute, and the
+# honest answer -- every row the comparison does not leave AGREE -- can only
+# be known by running the comparison.  The old script resolved that by
+# publishing ../attrib.tsv from a PARTIAL reach set, running the legs, and
+# letting a later invocation quietly overwrite it.  The published column was
+# then a function of HOW FAR THE SCRIPT GOT: measured 2026-08-28, the
+# partial-set and converged-set editions differ on exactly 30 rows -- VMX,
+# XOP/LWP, MCOMMIT, TPAUSE/UMWAIT, PCONFIG and the six VIA PadLock rows --
+# every one of them 'yes' from the permissive fallback and 'no' once the
+# execution probe had actually run them (all 30 SIGILL).  Every other column
+# was byte-identical, which is what makes the seed file safe to feed the
+# reachability legs.
+#
+# So the seed edition is a NAMED, SEPARATE artifact whose reachability column
+# is explicitly not a measurement, and ../attrib.tsv is written once, from
+# the complete set, and refuses otherwise.
+_seed_only = False
 for _a in sys.argv[1:]:
     if _a.startswith('--falsify='):
         _falsify = _a.split('=', 1)[1]
+    elif _a == '--seed-only':
+        _seed_only = True
     else:
-        sys.exit('usage: compare_attrib.py [--falsify=MODE:MNEM]')
+        sys.exit('usage: compare_attrib.py [--falsify=MODE:MNEM] [--seed-only]')
 TRACER_BATCH = reprobe_or_refuse(D, _falsify)
 
 TR = {}
@@ -606,10 +628,15 @@ if os.path.exists(_reach_path):
                 REACH[q[0]] = (q[1] == 'yes')
 # A check that cannot find its subject must fail rather than quietly fall
 # back to the guess it replaced.
-if not REACH:
+if not REACH and not _seed_only:
     sys.exit('reach.tsv missing or empty: reachability is measured, not '
              'assumed.  Run REPRODUCE.sh, which builds reach_probe.c and '
              'executes every encoding under qemu-x86_64.')
+if not REACH:
+    sys.stderr.write('SEED PASS: no reach.tsv yet.  The qemu_tcg_reachable '
+                     'column of attrib.seed.tsv is the QEMU-derived scope '
+                     'model alone and MUST NOT be quoted; its only job here '
+                     'is to name the encodings the legs must execute.\n')
 
 # The execution probe is fed the encodings the TRACER could not decode
 # (REPRODUCE.sh), and at CPL3 a SIGILL from a privileged opcode says
@@ -911,7 +938,58 @@ for opid, mnem, enc_hex, srctab in opcodes:
                  '1' if trow.accounted else '0'))
 
 # ---------------------------------------------------------------- outputs
-with open(os.path.join(COV, 'attrib.tsv'), 'w') as f:
+#
+# THE COLUMN MUST BE A MEASUREMENT WHEREVER IT IS LOAD-BEARING.
+#
+# `qemu_tcg_reachable` decides two published things: coverage_report.py's
+# REACHABLE-UNPROBED term (an UNPROBED row that no guest can execute is not a
+# coverage hole), and the reachability decomposition of the DISAGREE rows in
+# the R13 verdict.  Both read only rows the comparison did NOT leave AGREE.
+# On an AGREE row the column is decorative -- the tracer decodes the
+# encoding, so whether a guest can run it changes nothing.
+#
+# So the invariant is exactly: EVERY NON-AGREE ROW MUST CARRY AN EXECUTION
+# VERDICT.  Where it does not, the value printed is the QEMU-derived scope
+# model's, whose default direction is permissive -- and a permissive default
+# standing in for a measurement is how 30 rows read `yes` in one edition of
+# this table and `no` in the next.  This refuses instead.
+_need = sorted({r[4] for r in rows if r[6] != 'AGREE'})
+_have = set(REACH)
+_gap = [h for h in _need if h not in _have]
+# A FALSIFY ARM IS A DELIBERATELY DAMAGED TABLE and must not be held to the
+# completeness rule: damaging a mnemonic moves rows out of AGREE, so the
+# reach set -- derived from the UNDAMAGED comparison -- is short by exactly
+# the rows the damage created.  The arm's only reading is the AGREE count.
+_scratch = _seed_only or bool(_falsify)
+if _gap and not _scratch:
+    _by = {r[4]: r for r in rows if r[4] in set(_gap)}
+    sys.stderr.write(
+        'REACHABILITY IS INCOMPLETE: %d of %d non-AGREE encodings have no '
+        'execution verdict in reach.tsv, so their qemu_tcg_reachable would '
+        'be the scope model\'s permissive guess rather than a measurement.\n'
+        % (len(_gap), len(_need)))
+    for _h in _gap[:10]:
+        _r = _by[_h]
+        sys.stderr.write('  %-20s %-14s %s %s\n'
+                         % (_h, _r[1], _r[6], _r[15] if len(_r) > 15 else ''))
+    if len(_gap) > 10:
+        sys.stderr.write('  ... and %d more\n' % (len(_gap) - 10))
+    sys.exit('run the reachability legs over EVERY non-AGREE encoding '
+             '(REPRODUCE.sh derives that set from attrib.seed.tsv) and score '
+             'again.  Publishing this table would publish a guess in the one '
+             'place the column is read.')
+
+# THE PUBLISHED TABLE IS WRITTEN ONCE, BY ONE INVOCATION.
+#
+# The falsify battery calls this script fourteen times, and every one of them
+# used to overwrite ../attrib.tsv -- thirteen with a damaged tracer table.
+# The published file was then whatever the LAST call left, which is why the
+# script had to end with a bare re-run whose only purpose was to put the
+# right content back.  A file that has to be repaired after every use is not
+# a published artifact.  Scratch editions now have their own names.
+_ATTRIB = ('attrib.seed.tsv' if _seed_only else
+           'attrib.falsify.tsv' if _falsify else 'attrib.tsv')
+with open(os.path.join(COV, _ATTRIB), 'w') as f:
     f.write('#opcode_id\tmnemonic\tencoding_hex\textension\t'
             'probe_hex\tqemu_tcg_reachable\tverdict\tsignature\t'
             'ref_src\tref_dst\ttracer_src\ttracer_dst\ticed_backs\t'
@@ -1066,6 +1144,16 @@ w('  (reach_probe.c).  A name test on XED\'s extension / isa-set is kept')
 w('  only to be contradicted out loud.')
 w('    encodings with an execution verdict     : %d' % len(REACH))
 w('    encodings the name test stood in for    : %d' % len(reach_unmeasured))
+# THE REACH-SET STAMP.  The column is a function of this set, so the set is
+# named on the report rather than assumed from the file's presence: two
+# editions of this table that differ only here differ ONLY in this column,
+# and that has happened (30 rows, 2026-08-28).  A reader comparing two
+# reports can settle it without re-running anything.
+w('    reach.tsv sha256                        : %s'
+  % (hashlib.sha256(open(_reach_path, 'rb').read()).hexdigest()[:32]
+     if os.path.exists(_reach_path) else '(absent -- SEED PASS)'))
+w('    non-AGREE rows, all of which MUST have one: %d, missing %d'
+  % (len(_need), len(_gap)))
 w('    name test contradicted by the run       : %d' % len(reach_conflicts))
 for hx, ext, iset, guess, ran in reach_conflicts[:12]:
     w('      %-16s %-16s %-18s name=%s run=%s' %
@@ -1229,7 +1317,9 @@ w('  REG_VEC<n>   <- XMM<n>, YMM<n>, ZMM<n> (true aliases, correct per R4)')
 w('                  AND MM<n>, which in hardware aliases ST(<n>), not XMM')
 
 txt = '\n'.join(out) + '\n'
-open(os.path.join(COV, 'attrib_signatures.txt'), 'w').write(txt)
+open(os.path.join(COV, 'attrib_signatures.seed.txt' if _seed_only
+                  else 'attrib_signatures.falsify.txt' if _falsify
+                  else 'attrib_signatures.txt'), 'w').write(txt)
 print(txt)
 
 # An exclusion that nothing in QEMU justifies is not an exclusion.  This is

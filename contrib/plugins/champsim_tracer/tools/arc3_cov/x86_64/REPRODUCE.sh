@@ -9,6 +9,67 @@ Q=/mnt/md0/QEMU/qemu
 PY=/home/maccoy-merrell/anaconda3/bin/python
 K=$R/xed-src/kits/xed-install-base-2026-08-22-lin-x86-64
 LC=/usr/bin/llvm-config-18
+
+# ---- PREREQUISITE, CHECKED BEFORE ANY WORK ---------------------------------
+# CST_OBJDUMP_NEW must name a binutils >= 2.45 objdump.  This is a REFUSAL,
+# not a default, and it is checked HERE rather than at the ILLOPC audit an
+# hour later, because a prerequisite discovered at the end costs the whole run.
+#
+# WHY IT IS REQUIRED, and why the fallback that used to stand in for it is
+# gone.  The audit consults five decoders and calls a row SINGLE-SOURCE when
+# only one names it.  The line that ran the objdump columns was
+#
+#     --objdump "${CST_OBJDUMP_NEW:-objdump}" --objdump objdump
+#
+# and with the variable unset -- which it was, everywhere, because nothing
+# ever set or documented it -- BOTH slots resolved to the distribution
+# objdump.  The audit then reported five decoders while consulting four, and
+# convicted exactly the ten families a 2.42 objdump cannot know: MOVRS x2,
+# RDMSR_IMM32, WRMSRNS_IMM32, AMX-FP8 x4 and AMX-MOVRS x2.  Measured
+# 2026-08-28 against a 2.45.1 built from source: it decodes all ten and 2.42
+# calls every one of them `(bad)`.
+#
+# There is no sudo on this host, so the prerequisite is satisfied by building
+# binutils into a prefix:
+#
+#     curl -O https://sourceware.org/pub/binutils/releases/binutils-2.45.1.tar.xz
+#     tar xf binutils-2.45.1.tar.xz
+#     mkdir build-binutils && cd build-binutils
+#     ../binutils-2.45.1/configure --prefix=/mnt/md0/QEMU/tools/binutils-2.45.1 \
+#         --disable-nls --disable-gdb --disable-gdbserver --disable-sim
+#     make -j 12 && make install
+#     export CST_OBJDUMP_NEW=/mnt/md0/QEMU/tools/binutils-2.45.1/bin/objdump
+if [ -z "${CST_OBJDUMP_NEW:-}" ]; then
+  echo "REFUSED: CST_OBJDUMP_NEW is not set." >&2
+  echo "  The ILLOPC audit needs a binutils >= 2.45 objdump as an INDEPENDENT" >&2
+  echo "  fifth decoder.  There is no fallback: standing in the distribution" >&2
+  echo "  objdump for it consults one decoder twice and reports it as two," >&2
+  echo "  which convicted ten rows that a 2.45 objdump decodes.  See the" >&2
+  echo "  build recipe in the comment above this check." >&2
+  exit 2
+fi
+[ -x "$CST_OBJDUMP_NEW" ] || {
+  echo "REFUSED: CST_OBJDUMP_NEW=$CST_OBJDUMP_NEW is not an executable." >&2; exit 2; }
+OBJDUMP_NEW_VER=$("$CST_OBJDUMP_NEW" --version | head -1)
+OBJDUMP_OLD_VER=$(objdump --version | head -1)
+$PY - "$OBJDUMP_NEW_VER" <<'VEOF' || exit 2
+import re, sys
+m = re.search(r'(\d+)\.(\d+)', sys.argv[1])
+if not m:
+    sys.exit('REFUSED: cannot read a version out of %r' % sys.argv[1])
+if (int(m.group(1)), int(m.group(2))) < (2, 45):
+    sys.exit('REFUSED: CST_OBJDUMP_NEW is %s; the audit needs >= 2.45, because'
+             ' 2.42 and older call MOVRS / RDMSR_IMM32 / WRMSRNS_IMM32 /'
+             ' AMX-FP8 / AMX-MOVRS "(bad)" and that silence reads as a'
+             ' single-source row.' % sys.argv[1])
+VEOF
+[ "$OBJDUMP_NEW_VER" != "$OBJDUMP_OLD_VER" ] || {
+  echo "REFUSED: CST_OBJDUMP_NEW and the objdump on PATH are the same build" >&2
+  echo "  ($OBJDUMP_NEW_VER).  Two --objdump slots holding one decoder is the" >&2
+  echo "  defect this check exists to stop; illopc_audit.py refuses it too." >&2
+  exit 2; }
+echo "objdump columns: NEW=$OBJDUMP_NEW_VER  DIST=$OBJDUMP_OLD_VER"
+
 mkdir -p "$D"; cd "$D"
 
 # The harness is the TREE's copy; the working directory only holds evidence.
@@ -45,62 +106,6 @@ $PY icedtsv.py probe_uniq.hex > iced.tsv 2> iced.err
 # rule has stopped reaching its subject -- a finding, not a pass.
 grep -h 'R7.1-NARROW' xl3.err iced.err
 
-# ---- reachability, MEASURED, in four legs -------------------------------
-# Whether a QEMU x86_64 guest can execute an encoding decides whether a decode
-# gap there costs anything.  It is not read off XED's extension string: that
-# guess called all 128 APX forms of BMI1/BMI2/ADOX_ADCX/LZCNT/MOVBE/RAO/
-# USER_MSR reachable, and QEMU TCG SIGILLs every one.  Each encoding the
-# tracer arm could not decode is EXECUTED instead, and compare_attrib.py
-# refuses to run without the result.
-#
-# ONE LEG IS NOT ENOUGH, and each of the three added here closes a specific
-# way the single leg could be wrong:
-#  * its INPUT is the rows the tracer's own decoder rejected ($2 != 1).  That
-#    is deliberate and stays -- reach_probe calls the bytes for real, and
-#    calling all 8,880 encodings in-process would run jumps, syscalls and
-#    halts -- but it does mean the decoder chose the sample, so the sample
-#    cannot also be the justification.
-#  * -cpu max is ONE configuration.  reach_models.sh runs every 64-bit-capable
-#    CPU model QEMU has and then every CPUID flag forced on at once, so "no
-#    model advertises the feature" is counted rather than assumed, and it
-#    reads each model's CPUID out of the guest so the count is measured too.
-#  * qemu-x86_64 runs everything at CPL 3, so a SIGILL from a privileged
-#    opcode says "privilege".  sysprobe_run.sh executes the same encodings at
-#    CPL 0 in long mode under qemu-system-x86_64 and reports the exception
-#    vector, which removes the privilege reading entirely.
-#  * WHERE QEMU refused is discriminated by -d unimp: gen_unknown_opcode()
-#    logs ILLOPC and means the tables have no entry; its absence means QEMU
-#    decoded something and refused it later -- or ran it, which is the worst
-#    case and the one a signal alone cannot tell apart.
-gcc -O0 -Wall -static -o reach_probe reach_probe.c
-# THE INPUT SET IS NOT "the rows the decoder rejected", AND THAT DEFECT COST A
-# RE-MEASUREMENT.  Written that way, this file could not reproduce its own
-# published table: the legs were run over the rejected rows only, while the
-# matrix also needs a reachability verdict for every row the COMPARISON left
-# TRACER-SUBSET, ORTHOGONAL or UNACCOUNTED -- a row the tracer decodes but
-# gets wrong still costs nothing if no QEMU guest can execute it.  Measured
-# 2026-08-25 at 04e25599b5: rejected rows 2649, rows the matrix could not
-# retire for want of a leg 49, and the published UNREACHABLE was 2698.  The
-# banked evidence directory happened to hold the union because it had been
-# MERGED by hand; nothing in this script produced it.
-#
-# So the set is a FIXPOINT, and the second pass is not optional: run the legs,
-# score, ask the matrix which rows it could not measure, add exactly those and
-# run again.  The loop ends when the matrix names none, and the final matrix
-# run below refuses if any remain.
-awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv | sort -u > reach_in.hex
-"$T"/reach_models.sh "$D"                 # -> r_max_postfix, model_matrix, illopc, cpuid/
-"$T"/sysprobe_run.sh "$D" max             # -> cpl0.tsv
-#  * CPL 0 removes the PRIVILEGE reading of a #UD.  It does not remove the
-#    ENABLE reading: an instruction QEMU implemented behind CR4.VMXE,
-#    EFER.SVME, XCR0 or an IA32_* enable MSR faults at CPL 0 exactly the way
-#    an unimplemented one does.  sysprobe_enab_run.sh runs the same encodings
-#    with every architectural enable SET AND PROVEN SET by reading the
-#    register back, and records the enables QEMU refuses with their own
-#    exception vector -- which is the stronger answer, because a refused
-#    enable is a gate that cannot open under any configuration.
-"$T"/sysprobe_enab_run.sh "$D" max        # -> cpl0_enab.tsv, enables.tsv
-cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.py uses
 
 # ---- the exclusion, derived from QEMU rather than from the decoder ---------
 # Prints the feature vocabulary the decode tables can gate on, the CPUID
@@ -190,6 +195,87 @@ if conv or noise or not fired:
                      % (conv, noise, fired))
 EOF
 
+
+# ---- the SEED comparison, which exists only to name the reach input set ---
+# Its qemu_tcg_reachable column is the scope model's alone and is NOT a
+# measurement; nothing may quote attrib.seed.tsv.  Every OTHER column in it
+# is identical to the published table's -- verified by construction, since
+# reachability is a pure output of this comparator and feeds no verdict --
+# which is what makes it a safe input to the legs below.
+$PY compare_attrib.py --seed-only     # -> ../attrib.seed.tsv
+
+# ---- reachability, MEASURED, in four legs -------------------------------
+# Whether a QEMU x86_64 guest can execute an encoding decides whether a decode
+# gap there costs anything.  It is not read off XED's extension string: that
+# guess called all 128 APX forms of BMI1/BMI2/ADOX_ADCX/LZCNT/MOVBE/RAO/
+# USER_MSR reachable, and QEMU TCG SIGILLs every one.  Each encoding the
+# tracer arm could not decode is EXECUTED instead, and compare_attrib.py
+# refuses to run without the result.
+#
+# ONE LEG IS NOT ENOUGH, and each of the three added here closes a specific
+# way the single leg could be wrong:
+#  * its INPUT is the rows the tracer's own decoder rejected ($2 != 1).  That
+#    is deliberate and stays -- reach_probe calls the bytes for real, and
+#    calling all 8,880 encodings in-process would run jumps, syscalls and
+#    halts -- but it does mean the decoder chose the sample, so the sample
+#    cannot also be the justification.
+#  * -cpu max is ONE configuration.  reach_models.sh runs every 64-bit-capable
+#    CPU model QEMU has and then every CPUID flag forced on at once, so "no
+#    model advertises the feature" is counted rather than assumed, and it
+#    reads each model's CPUID out of the guest so the count is measured too.
+#  * qemu-x86_64 runs everything at CPL 3, so a SIGILL from a privileged
+#    opcode says "privilege".  sysprobe_run.sh executes the same encodings at
+#    CPL 0 in long mode under qemu-system-x86_64 and reports the exception
+#    vector, which removes the privilege reading entirely.
+#  * WHERE QEMU refused is discriminated by -d unimp: gen_unknown_opcode()
+#    logs ILLOPC and means the tables have no entry; its absence means QEMU
+#    decoded something and refused it later -- or ran it, which is the worst
+#    case and the one a signal alone cannot tell apart.
+gcc -O0 -Wall -static -o reach_probe reach_probe.c
+# THE INPUT SET IS A ONE-SHOT FUNCTION OF THE COMPARISON, and it took two
+# re-measurements to get there.
+#
+# Written as "the rows the decoder rejected", this file could not reproduce
+# its own published table: the matrix ALSO needs a reachability verdict for
+# every row the COMPARISON leaves non-AGREE -- a row the tracer decodes but
+# gets wrong still costs nothing if no QEMU guest can execute it.  That was
+# patched with a FIXPOINT: run the legs, score, ask the matrix which rows it
+# could not measure, add exactly those, run again.
+#
+# THE FIXPOINT WAS ITSELF THE DEFECT (#287).  It made the published
+# `qemu_tcg_reachable` column a function of WHICH ITERATION had last written
+# reach.tsv when compare_attrib.py ran, and compare_attrib.py ran on both
+# sides of it.  MEASURED 2026-08-28 by holding everything else fixed and
+# feeding the two reach sets: the partial-set and converged-set editions of
+# attrib.tsv differ on exactly 30 rows -- VMCALL VMLAUNCH VMRESUME VMXOFF
+# VMXON VMREAD(x2) VMWRITE(x2) VMPTRLD VMPTRST VMCLEAR INVEPT INVVPID
+# PCONFIG TPAUSE UMWAIT MCOMMIT LLWPCB LWPINS(x2) and the eight VIA PadLock
+# rows -- every one 'yes' from the permissive fallback and 'no' once
+# executed, and the five-leg matrix calls all 30 UNREACHABLE.  No other
+# column moved, on any of the 8,873 rows.
+#
+# So the set is derived ONCE, from the seed comparison, as EXACTLY the rows
+# whose reachability anything downstream can read: the non-AGREE rows.  That
+# is a deterministic function of the build, it strictly contains what the
+# fixpoint used to converge on (2,837 rows against 2,698), and it removes the
+# second pass rather than iterating it.  compare_attrib.py refuses to publish
+# ../attrib.tsv if any non-AGREE row is still missing a verdict, so a short
+# set fails loudly instead of printing a guess.
+awk -F'\t' 'NR>1 && $7 != "AGREE" { print $5 }' ../attrib.seed.tsv \
+    | sort -u > reach_in.hex
+echo "reach input set: $(wc -l < reach_in.hex) non-AGREE encodings"
+"$T"/reach_models.sh "$D"                 # -> r_max_postfix, model_matrix, illopc, cpuid/
+"$T"/sysprobe_run.sh "$D" max             # -> cpl0.tsv
+#  * CPL 0 removes the PRIVILEGE reading of a #UD.  It does not remove the
+#    ENABLE reading: an instruction QEMU implemented behind CR4.VMXE,
+#    EFER.SVME, XCR0 or an IA32_* enable MSR faults at CPL 0 exactly the way
+#    an unimplemented one does.  sysprobe_enab_run.sh runs the same encodings
+#    with every architectural enable SET AND PROVEN SET by reading the
+#    register back, and records the enables QEMU refuses with their own
+#    exception vector -- which is the stronger answer, because a refused
+#    enable is a gate that cannot open under any configuration.
+"$T"/sysprobe_enab_run.sh "$D" max        # -> cpl0_enab.tsv, enables.tsv
+cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.py uses
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 
@@ -200,34 +286,25 @@ $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 # gating CPUID word, whether that word is inside a TCG_*_FEATURES mask, how
 # many configurations actually advertise it, and which builtin_x86_defs[]
 # models name it.  Exits 1 while any row is UNCOVERED -- which is the point.
-# `|| true` here and in the second pass is deliberate -- the matrix exits 1
-# while any row is UNCOVERED and the steps below it still have to run -- but
-# the status is NOT discarded: the final gate at the bottom of this file reads
-# the verdict back out of the matrix and is this script's exit status.
+# `|| true` is deliberate -- the matrix exits 1 while any row is UNCOVERED and
+# the steps below it still have to run -- but the status is NOT discarded: the
+# final gate at the bottom of this file reads the verdict back out of the
+# matrix and is this script's exit status.
 $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
     --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
 
-# ---- the second pass of the fixpoint ---------------------------------------
-# Every row the matrix could not retire for want of a leg goes back through the
-# legs, and the matrix is re-run.  A row that is still NOT-MEASURED after this
-# is a leg that refused to reach its subject, not a row without a verdict.
+# ---- the fixpoint is gone; this is the assertion that replaced it ---------
+# The second pass used to exist because the legs had been fed only the rows
+# the DECODER rejected, leaving the matrix without a verdict for rows the
+# comparison left non-AGREE.  The input set is now derived from the seed
+# comparison and contains every one of those by construction, so there is
+# nothing left to iterate -- and a NOT-MEASURED row here is a leg that
+# refused to reach its subject, which is fatal rather than a cue to loop.
 awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i}
-     NR>1 && $h["verdict"]=="UNCOVERED" && $h["qemu_refusal"]=="NOT-MEASURED" \
-     { print $h["probe_hex"] }' ../reach_matrix.tsv | sort -u > reach_add.hex
-if [ -s reach_add.hex ]; then
-  echo "second pass: $(wc -l < reach_add.hex) rows had no reachability leg"
-  sort -u reach_in.hex reach_add.hex > reach_in.next && mv reach_in.next reach_in.hex
-  "$T"/reach_models.sh "$D"
-  "$T"/sysprobe_run.sh "$D" max
-  "$T"/sysprobe_enab_run.sh "$D" max
-  cp r_max_postfix.tsv reach.tsv
-  $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
-      --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
-  awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i}
-       NR>1 && $h["qemu_refusal"]=="NOT-MEASURED" { n++ }
-       END { if (n) { print "STILL NOT-MEASURED: " n; exit 1 } }' \
-      ../reach_matrix.tsv || exit 1
-fi
+     NR>1 && $h["qemu_refusal"]=="NOT-MEASURED" { n++ }
+     END { if (n) { print "STILL NOT-MEASURED: " n " rows -- a reachability \
+leg did not reach its subject; the one-shot input set is supposed to make \
+this impossible"; exit 1 } }' ../reach_matrix.tsv || exit 1
 
 # ---- attribute every DECODED-THEN-REFUSED row to a line of QEMU -----------
 # The legs above say WHERE the refusal is not (not privilege, not a CPU model,
@@ -276,7 +353,21 @@ for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
   $PY compare_attrib.py --falsify=drop-src:$M 2>/dev/null | grep -m1 '  AGREE  '
 done
 cp tracer_batch.good.tsv tracer_batch.tsv
+
+# ---- the determinism check, in the script that produces the table ---------
+# #287: the published qemu_tcg_reachable column used to depend on how far
+# this file had got.  It no longer can -- the reach set is a one-shot
+# function of the seed comparison and the falsify arms write elsewhere -- so
+# the claim is now CHECKABLE HERE, and a claim nobody checks is a claim.
+# Re-score the undamaged table and require the published file byte-for-byte.
+cp ../attrib.tsv ../attrib.published.tsv
 $PY compare_attrib.py > /dev/null
+cmp ../attrib.published.tsv ../attrib.tsv || {
+  echo "RE-SCORE IS NOT BYTE-IDENTICAL: scoring the same inputs twice in one" >&2
+  echo "  run produced two different tables.  #287's class is back." >&2
+  exit 1; }
+rm -f ../attrib.published.tsv
+echo "re-score byte-identical: attrib.tsv is a function of its inputs alone"
 
 # ---- audit the ILLOPC rows -------------------------------------------------
 # An UNREACHABLE row refused at NO-TABLE-ENTRY(ILLOPC) asserts two things, and
@@ -288,14 +379,17 @@ $PY compare_attrib.py > /dev/null
 # DISK to name the table, the slot and what occupies it.  A slot that turns
 # out to be OCCUPIED is fatal.
 #
-# PASS A RECENT objdump.  A distribution objdump lags the newest ISA
-# extensions by years -- Ubuntu's 2.42 does not know MOVRS, AMX-FP8,
-# AMX-MOVRS or the MSR_IMM forms, and its silence would read as "only one
-# decoder names this row".  2.45 settles all ten.  Repeat --objdump freely;
-# every one contributes a column.
+# THE FIFTH DECODER IS A PREREQUISITE, checked at the top of this file.
+# A distribution objdump lags the newest ISA extensions by years -- Ubuntu's
+# 2.42 does not know MOVRS, AMX-FP8, AMX-MOVRS or the MSR_IMM forms, and its
+# silence would read as "only one decoder names this row".  MEASURED
+# 2026-08-28: 2.45.1 decodes all sixteen encodings of those ten rows and 2.42
+# calls every one `(bad)`.  Repeat --objdump freely; every DISTINCT one
+# contributes a column, and illopc_audit.py refuses a repeat rather than
+# counting one decoder twice.
 $PY "$T"/illopc_audit.py --matrix ../reach_matrix.tsv \
     --xl3 xl3.tsv --iced iced.tsv --root "$Q" \
-    --objdump "${CST_OBJDUMP_NEW:-objdump}" --objdump objdump \
+    --objdump "$CST_OBJDUMP_NEW" --objdump objdump \
     --allow-single-source "$T"/illopc_single_source.allow \
     -o ../illopc_audit.tsv
 

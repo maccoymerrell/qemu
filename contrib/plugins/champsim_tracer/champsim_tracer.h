@@ -1548,7 +1548,9 @@ typedef struct {
     uint64_t no_row;
     uint64_t no_ident;
     uint64_t decided_unknown;
-    /* Decodes on an ISA whose flip is HELD -- see qemu_ident_key_flipped(). */
+    /* Decodes on an ISA whose flip is HELD -- see qemu_ident_key_flipped().
+     * All four targets are flipped, so this is a MUST-BE-0 row: a decode
+     * counted here is a TraceISA that function does not name. */
     uint64_t isa_held;
     /* Decided rows whose answer differs from the Capstone row they were
      * joined through: the population an adjudication has to be written

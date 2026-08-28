@@ -797,24 +797,55 @@ static std::atomic<uint64_t> g_qid_isa_held{0};
  * instruction stream whose opcodes come from two decoders depending on
  * which rule happened to be reached is not a taxonomy anybody can read.
  *
- * x86_64 and aarch64 are flipped.  riscv64 and mipsel are HELD, and the
- * reason is measured rather than cautious: the golden net's w3_coverage
- * opcode probes go RED on exactly those two, on the two rules named
- * above, because the identity would publish GEN_OP_SHL for a MIPS `nop`
- * and GEN_OP_OR for a RISC-V `prefetch.r`.  Under R12.1 that is
- * information lost, and no discount applies.
+ * ALL FOUR are flipped.  riscv64 and mipsel were held, and the hold was
+ * a MEASURED CORPUS GAP rather than a design boundary: the generator
+ * decides a row's tier from the spellings it OBSERVED decoding through
+ * that rule, and two rules had been observed under one spelling each
+ * while a second spelling reaches them --
  *
- * COVERAGE PATH, and it needs no table edit: the generator decides the
- * tier from what it OBSERVED decoding through each rule.  A corpus that
- * reaches `nop` and `prefetch.r` turns both rows into QID_SPLIT -- rows
- * that state they do not classify -- which makes them survivors on the
- * Capstone answer they already publish, and the hold lifts.  What the
- * hold must NOT become is a permanent per-ISA carve-out: the two probes
- * are the acceptance test, and they exist.
+ *   translate_mips/OPC_SLL  observed only as `sll`; `ssnop` is
+ *                           `sll $zero,$zero,1` and reaches the same rule
+ *   decode_insn32/ori       observed only as `ori`; Zicbop
+ *                           `prefetch.r/w/i` are `ori x0,rs1,imm`
+ *
+ * -- with both rows carrying cap_split=false, so nothing in the table
+ * said the join was partial.  The hold lifted by WIDENING THE CORPUS,
+ * not by editing a row: the validator's own --coverage workload decodes
+ * `ssnop` and all three Zicbop prefetches, and adding it to the pair
+ * census turns both rows into QID_SPLIT -- rows that state they do not
+ * classify -- which makes them survivors on the Capstone answer they
+ * already publish.  A third row moved with them, `translate_mips/OPC_JR`
+ * (jr and jr.hb differ in .dep_refine), for the same reason and to the
+ * same effect.
+ *
+ * ONE CORRECTION TO THE RECORD, because it was stated the other way and
+ * a corpus fact has to be exact: a plain MIPS `nop` IS `sll $zero,
+ * $zero,0` architecturally, but it is NOT a second spelling AT THIS
+ * BOUNDARY.  Capstone 6 reports it under MIPS_INS_SLL and carries `nop`
+ * in alias_id, and the pair census is keyed on insn_id, so a nop and an
+ * sll arrive as the same Capstone constant.  MIPS_INS_NOP appears
+ * nowhere in the whole corpus; MIPS_INS_SSNOP is what splits the row,
+ * and ssnop is a distinct encoding rather than an alias.
+ *
+ * WHAT THE FLIP DOES NOT ORPHAN on these two ISAs, stated because J7
+ * asks and the answer here is "nothing": QID_BRANCH_CLASS -- the table
+ * of transfer classes read off QEMU's own .decode files -- carries no
+ * riscv or mips entry at all, so no row on either ISA states a branch
+ * class from a source independent of Capstone.  Every surviving
+ * Capstone read in refine_alias_fields() below is either a WITHIN-RULE
+ * discriminator (mips `jr $ra` and `bal`, riscv `j`/`jr`/`ret`/`call`
+ * -- forms that share one trans_ function with the instruction they are
+ * aliases of, and are told apart only by a register field the rule does
+ * not carry) or a Capstone register-LIST repair (mips mfhi/mflo
+ * accumulator halves, riscv C-extension HINT reads, the aliased link
+ * register).  Neither kind is a classification the rule could state, so
+ * neither is a second opinion, and deleting one would lose information
+ * the wire carries today.
  */
 static bool qemu_ident_key_flipped(TraceISA isa)
 {
-    return isa == TRACE_ISA_X86 || isa == TRACE_ISA_AARCH64;
+    return isa == TRACE_ISA_X86 || isa == TRACE_ISA_AARCH64 ||
+           isa == TRACE_ISA_RISCV || isa == TRACE_ISA_MIPS;
 }
 
 static const QemuIdentRow *qemu_ident_lookup(uint32_t id, unsigned *index_out)

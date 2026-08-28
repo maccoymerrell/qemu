@@ -254,6 +254,45 @@ _start:
   vse32.v v16, (t3)
 """
 
+# -------------------------------------------------- fcsr fold, frm non-zero
+#
+# The tracer folds fflags (0x001), frm (0x002) and fcsr (0x003) onto one
+# GenericRegId, REG_FCSR.  Every other probe leaves frm at 0, and while frm is
+# 0 the three registers hold the same bits, so a fold that publishes the wrong
+# member's value agrees with the reference on every row.  A corpus that cannot
+# distinguish them has not tested them.
+#
+# This probe sets frm to a non-zero value FIRST, so fcsr (0x21) and fflags
+# (0x01) and frm (0x01) are three different numbers, and then reads fcsr back
+# with csrr after every write.  The readback is the discriminator: the wire's
+# REG_FCSR snapshots and the guest's own csrr result must agree, and a
+# consumer replaying destination snapshots forward is exactly what checks it.
+PROBES['p_fcsr'] = """
+.section .text
+.globl _start
+_start:
+  lla   t6, arena
+  li    t0, 0x3f800000
+  li    t1, 0x40400000
+  fmv.w.x  ft0, t0
+  fmv.w.x  ft1, t1
+  li    t2, 1
+  fsrm  s0, t2            # frm <- 1 (RTZ); s0 = old frm (0)
+  csrr  s1, fcsr          # 0x20  -- frm=1, fflags=0
+  fdiv.s ft5, ft0, ft1    # inexact: fflags |= NX
+  csrr  s2, fcsr          # 0x21
+  csrr  s3, fflags        # 0x01
+  csrr  s4, frm           # 0x01
+  li    t3, 0x18
+  csrw  fflags, t3        # fflags <- 0x18
+  csrr  s5, fcsr          # 0x38
+  csrr  s6, fflags        # 0x18
+  li    t4, 0x00
+  csrw  fcsr, t4          # fcsr <- 0
+  csrr  s7, fcsr          # 0x00
+  csrr  s8, frm           # 0x00
+"""
+
 # ------------------------------------------- control transfer + compressed
 PROBES['p_flow'] = """
 .section .text

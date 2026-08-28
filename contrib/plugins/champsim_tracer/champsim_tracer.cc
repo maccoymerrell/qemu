@@ -3184,6 +3184,10 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
 
+    /* A vCPU exists, so qemu_plugin_get_registers() is callable and the
+     * value-capture container rule may consult QEMU's namespace. */
+    cst_reg_namespace_ready();
+
     /*
      * Resolve cap_mode lazily on first vCPU init: the per-ISA mode
      * resolvers may call qemu_plugin_path_to_binary(), which needs a

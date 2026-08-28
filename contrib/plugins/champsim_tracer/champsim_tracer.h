@@ -1921,6 +1921,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
  * still pins which generic IDs exist, just no live values).  Defined
  * in champsim_tracer_decode.cc.
  */
+/* Announce that qemu_plugin_get_registers() is now callable (a vCPU has
+ * reported in).  Until this is called the value-capture container rule
+ * cannot consult QEMU's descriptor list; see qemu_reg_value_key(). */
+void cst_reg_namespace_ready(void);
+
 void capture_initial_regfile(unsigned int cpu_index,
                              std::vector<InitialRegSnap> *out);
 

@@ -317,6 +317,122 @@ static bool sysreg_name_exposed(const char *name)
     return g_hash_table_contains(g_sysreg_exposed, name);
 }
 
+/*
+ * FIELD-INSIDE-A-REGISTER: the key whose VALUE a snapshot must carry.
+ *
+ * Some architectural registers are not registers beside their
+ * neighbours but named FIELDS of a wider one -- RISC-V fflags and frm
+ * inside fcsr, vxsat and vxrm inside vcsr.  The generic vocabulary folds
+ * the whole group onto one id (REG_FCSR) because that is the dependency
+ * a consumer schedules against, and the wire has no discriminator to say
+ * which member a given snapshot was taken at.  Publishing the field's
+ * own content therefore makes one wire name carry three registers'
+ * histories at three granularities, and the guest's own readback of the
+ * container disagrees with every field row -- R13/Spike measured
+ * %fcsr[0x1] published where `csrr fcsr` next returned 0x20, and
+ * %fcsr[0x18] where it returned 0x38 (item #277).
+ *
+ * So the VALUE published for a field is the CONTAINER's.  One wire name,
+ * one register's history, and the register the guest can read back.  The
+ * identity is untouched: the member still folds to REG_FCSR.
+ *
+ * Naming the member on the wire instead is the other repair and it is an
+ * EPOCH change (a per-slot member discriminator the format has no room
+ * for while frozen); it is filed for the next epoch list rather than
+ * approximated here.
+ *
+ * When the ISA has no such nesting -- x86 fctrl/fstat/ftag/mxcsr,
+ * AArch64 fpcr/fpsr and MIPS fcr31 are each whole registers, MEASURED,
+ * not assumed -- sysreg_value_container is NULL and every key passes
+ * through untouched.
+ */
+static GHashTable *g_value_container_keys;   /* "feature\0name" -> QemuRegKey * */
+
+/*
+ * qemu_plugin_get_registers() asserts on `current_cpu`, so it may only be
+ * called from a vCPU context.  The key producers below run at install
+ * time too -- the generic-ID reverse index and the width-0 REGFILE
+ * pinning both resolve keys before any vCPU exists -- so the descriptor
+ * list is off limits until a vCPU has reported in.  vcpu_init_cb flips
+ * this; before it does, the exposure question has no answer, which is
+ * NOT the same as "QEMU does not carry it".
+ */
+static bool g_reg_namespace_ready;
+
+void cst_reg_namespace_ready(void)
+{
+    g_reg_namespace_ready = true;
+}
+
+/*
+ * Tri-state form of sysreg_name_exposed(): 1 present, 0 absent,
+ * -1 the descriptor list is not reachable yet so the question has no
+ * answer.  The third value exists so a redirect declined before any vCPU
+ * has registers is never counted as a register QEMU does not carry.
+ * Caller holds g_sysreg_key_lock.
+ */
+static int sysreg_name_exposure(const char *name)
+{
+    if (!g_reg_namespace_ready) {
+        return -1;
+    }
+    if (!g_sysreg_exposed) {
+        g_autoptr(GArray) probe = qemu_plugin_get_registers();
+        if (!probe || probe->len == 0) {
+            return -1;
+        }
+    }
+    return sysreg_name_exposed(name) ? 1 : 0;
+}
+
+static const QemuRegKey *qemu_reg_value_key(const QemuRegKey *key)
+{
+    if (!qemu_reg_key_valid(key)) {
+        return key;
+    }
+    SysregValueContainerFn fn = isa_properties[trace_isa].sysreg_value_container;
+    if (!fn) {
+        return key;
+    }
+    const char *container = fn(key->name);
+    if (!container || cst_str_eq(container, key->name)) {
+        return key;
+    }
+
+    g_mutex_lock(&g_sysreg_key_lock);
+    int exposed = sysreg_name_exposure(container);
+    if (exposed != 1) {
+        g_mutex_unlock(&g_sysreg_key_lock);
+        /*
+         * The container is not in QEMU's descriptor list, so redirecting
+         * would publish a width-0 field -- strictly worse than the
+         * member's own value.  Keep the member and SAY SO: a silent
+         * fallback here would be a fold-value defect that reads as
+         * fixed.  exposed == -1 (list not up yet) is not a refusal and
+         * is not counted.
+         */
+        if (exposed == 0) {
+            g_stats.reg_value_container_unresolved++;
+        }
+        return key;
+    }
+    if (!g_value_container_keys) {
+        g_value_container_keys = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                       g_free, nullptr);
+    }
+    g_autofree char *lookup = g_strdup_printf("%s\n%s", key->feature, container);
+    QemuRegKey *out =
+        (QemuRegKey *)g_hash_table_lookup(g_value_container_keys, lookup);
+    if (!out) {
+        out = g_new0(QemuRegKey, 1);
+        out->feature = g_strdup(key->feature);
+        out->name = g_strdup(container);
+        g_hash_table_insert(g_value_container_keys, g_strdup(lookup), out);
+    }
+    g_mutex_unlock(&g_sysreg_key_lock);
+    return out;
+}
+
 static const QemuRegKey *qemu_reg_for_sysreg(const char *boundary_name)
 {
     const IsaProperties *props = &isa_properties[trace_isa];
@@ -349,7 +465,7 @@ static const QemuRegKey *qemu_reg_for_sysreg(const char *boundary_name)
         g_hash_table_insert(g_sysreg_keys, (gpointer)key->name, key);
     }
     g_mutex_unlock(&g_sysreg_key_lock);
-    return key;
+    return qemu_reg_value_key(key);
 }
 
 static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
@@ -358,7 +474,7 @@ static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
         return nullptr;
     }
     const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
-    return qemu_reg_key_valid(k) ? k : nullptr;
+    return qemu_reg_key_valid(k) ? qemu_reg_value_key(k) : nullptr;
 }
 
 /*
@@ -391,7 +507,8 @@ static inline const QemuRegKey *qemu_reg_for_row(const RegClassification *rc)
          * than a neighbour's content.  A missing value is a gap a
          * reference can see; a confidently wrong one is not.
          */
-        return qemu_reg_key_valid(&rc->qemu_reg) ? &rc->qemu_reg : nullptr;
+        return qemu_reg_key_valid(&rc->qemu_reg)
+                   ? qemu_reg_value_key(&rc->qemu_reg) : nullptr;
     }
     return qemu_reg_for_generic(rc->reg_id);
 }

@@ -23,6 +23,6 @@ gem5cp	aarch64	gem5/rc_aarch64.log	22	200	#94	R13_VERDICT.md 4.1 -- 5 REF-NEON-P
 gem5cp	mipsel	gem5/rc_mipsel.log	1	100	-	R13_VERDICT.md 4.2 -- 1 IMPLDEF-MACHINE-VALUE (a machine-identity register, not a datum)
 gem5wp	aarch64	gem5/wp_aarch64.log	0	3000	-	R13_VERDICT.md 5.1 -- 15/15 axis mutations FIRED, 8/8 cache-maintenance rules REFUSED
 gem5wp	mipsel	gem5/wp_mipsel.log	6	250	#269,#221,#266	R13_VERDICT.md 5.2 -- 3 facts on MIPS FR=0 FP pairs: 1 reference gap, 2 in-place-lowering self-source, 1 odd-half write the list does not name
-spikecp	riscv64	spike/FINAL/REPORT.txt	6	2500	-	R13_VERDICT.md 4.3 -- 2 csr-src-set UNACCOUNTED + 3 vocabulary-gap + 1 tracer-defect, 12/12 axes proven live
+spikecp	riscv64	spike/FINAL/REPORT.txt	5	2500	#277b	exec32/fcsr/EVIDENCE.md -- the tracer-defect row is GONE (the fold-value fix publishes the composed fcsr); 2 csr-src-set UNACCOUNTED + 3 CSR-FOLD-MULTI vocabulary-gap remain, 12/12 axes proven live
 spikewp	riscv64	spike/wp/final/REPORT.txt	0	2500	-	R13_VERDICT.md 5.3 -- 99 excursions rebuilt from the trace alone and re-executed; 0 WP defects
 pin	x86_64	pin/cmp_fixed_sameinput.txt	42149	350000	#271,#272	R13_VERDICT.md 4.4 -- 41,859 of the 42,149 are the cst_decode --format=disasm renderer, NOT the wire (independently re-measured, verify/SRCDROP.txt); the ceiling drops to the low hundreds when #271 lands

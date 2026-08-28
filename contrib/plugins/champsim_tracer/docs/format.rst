@@ -154,6 +154,28 @@ Forward compatibility (normative)
   not an additive change; it requires a new epoch (a formal-release
   magic bump).  Extend per record via field-IDs, not new tags.
 
+.. _next-epoch-list:
+
+Carried to the next epoch
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Repairs that cannot be expressed additively, recorded in one place so a
+formal release has the list.  Nothing here is scheduled and nothing
+here licenses a magic bump on its own.
+
+* **A member discriminator for a folded register ID.**  A generic ID
+  stands for a class, and where the class has several architectural
+  members a destination snapshot cannot say which one it was taken at.
+  Within this epoch the value rule (:ref:`folded-register-values`)
+  makes a NESTED member publish its container, so ``REG_FCSR`` on
+  RISC-V is one register's history; it does nothing for members that
+  are not nested — RISC-V ``fcsr`` and ``vcsr`` under one ID, x86
+  ``fstat`` and ``mxcsr``, AArch64 ``fpcr`` and ``fpsr``, and
+  ``REG_VCTRL`` standing for ``vl``, ``vstart`` and ``vtype`` at once.
+  Naming the member needs a per-slot discriminator the
+  destination-snapshot record has no room for, so it is an epoch
+  change.
+
 Minimum conformant trace (normative)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -3033,6 +3055,41 @@ and off.
 Register snapshots are scalar 512-bit values. The capture path copies
 up to the first 64 little-endian bytes returned by
 ``qemu_plugin_read_register()``.
+
+.. _folded-register-values:
+
+The value a folded ID carries
+"""""""""""""""""""""""""""""
+
+A generic ID is a behaviour class, so several architectural registers
+can share one — RISC-V ``fflags``, ``frm``, ``fcsr``, ``vxsat``,
+``vxrm`` and ``vcsr`` all reach ``REG_FCSR``.  Some of those are not
+registers beside one another but named FIELDS of a wider one: the
+unprivileged ISA defines ``fcsr`` as ``{frm[7:5], fflags[4:0]}`` and
+RVV 1.0 defines ``vcsr`` as ``{vxrm[2:1], vxsat[0]}``.
+
+**Where a register is a field of a container the guest can also read,
+the snapshot carries the CONTAINER's value.**  ``csrw fflags, t3``
+publishes ``REG_FCSR`` = the whole ``fcsr`` word after the write, which
+is what the guest's own ``csrr s5, fcsr`` reads back — not the five-bit
+field.  The identity is unaffected: the member still folds to
+``REG_FCSR``, which is the dependency a consumer schedules against.
+
+The rule exists because the wire has one name for the group and no
+discriminator for which member a snapshot was taken at.  Publishing the
+field's own content made ``REG_FCSR``'s history a mixture of three
+registers' contents at three granularities that no consumer could
+separate, and it disagreed with the guest's own readback of the
+register the wire named.
+
+It is a rule about NESTING, not about folding.  Two whole registers
+sharing an ID — x86 ``fstat`` and ``mxcsr``, AArch64 ``fpcr`` and
+``fpsr``, each measured and each unaffected by a write to the other —
+are not composed into anything, so each snapshot there carries the
+value of the register the instruction actually wrote.  A consumer
+reading ``REG_FCSR`` on those ISAs still sees more than one register's
+history interleaved; naming the member is the repair for that, and it
+is an epoch change (:ref:`next-epoch-list`).
 
 Register IDs are one-byte ``GenericRegId`` values. The trace header's
 ``reg`` map gives the exact name for each value, including special values

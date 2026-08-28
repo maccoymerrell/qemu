@@ -872,6 +872,21 @@ typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
  */
 typedef const char *(*SysregQemuNameFn)(const char *boundary_name);
 
+/*
+ * A QEMU register name -> the name of the architectural register whose
+ * VALUE a snapshot of it must publish, or NULL when the register IS the
+ * whole thing.
+ *
+ * The rename above answers "what does QEMU call this register"; this
+ * answers a different question -- "is this register a FIELD of a larger
+ * one the guest can read back".  Where it is, the wire's single fold id
+ * cannot say which granularity a snapshot was taken at, so the value
+ * published is the containing register's and the id's history is one
+ * register's history.  RISC-V's fcsr/vcsr are the live case; see
+ * riscv_sysreg_value_container().  NULL on an ISA with no such nesting.
+ */
+typedef const char *(*SysregValueContainerFn)(const char *qemu_name);
+
 static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
 {
     switch (sysreg_class) {
@@ -912,6 +927,13 @@ typedef struct {
      */
     const char           *sysreg_feature;
     SysregQemuNameFn      sysreg_qemu_name;
+    /*
+     * sysreg_value_container — the field-inside-a-register rule for this
+     * ISA's VALUE captures (see SysregValueContainerFn).  NULL means the
+     * ISA has no register that is a named field of another, which is a
+     * measured claim per ISA, not a default.
+     */
+    SysregValueContainerFn sysreg_value_container;
     MetaFlagsMapperFn     flags_to_metaflags;
     AddrCanonicalizeFn    canonicalize_addr;
     /*
@@ -996,6 +1018,7 @@ const IsaProperties isa_properties[] = {
          * vxrm, vcsr, vl, vtype, vlenb among them -- carry exactly the
          * names cap_riscv_csr_name() spells, so no rename is needed. */
         .sysreg_feature = "org.gnu.gdb.riscv.csr",
+        .sysreg_value_container = riscv_sysreg_value_container,
         .canonicalize_addr = riscv_canonicalize_addr,
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,

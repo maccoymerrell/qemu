@@ -389,6 +389,9 @@ void append_stats_summary(GString *report, const char *label,
         { "WP host syscalls blocked (must be 0)",
           qemu_plugin_spec_syscall_blocked_count() },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
+        /* Invariant, not a measurement: see reg_value_container_unresolved. */
+        { "Reg-value container unresolved (must be 0)",
+                                        stats.reg_value_container_unresolved },
         /* Invariant, not a measurement: see tb_refused_decode_fail_cp. */
         { "BBs refused, boundary could not decode (must be 0)",
                                                 stats.tb_refused_decode_fail_cp },

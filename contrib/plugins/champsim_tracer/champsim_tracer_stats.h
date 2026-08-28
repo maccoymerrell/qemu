@@ -1273,6 +1273,23 @@ struct Stats {
     uint64_t unknown_insn_warnings = 0;
 
     /*
+     * INVARIANT, not a measurement.  A register the wire publishes as a
+     * FIELD of a wider one (RISC-V fflags/frm inside fcsr, vxsat/vxrm
+     * inside vcsr) has its VALUE read from the container, so REG_FCSR's
+     * snapshot history is one register's history and matches the guest's
+     * own readback -- see qemu_reg_value_key() and item #277.  This row
+     * counts the times the container was named and QEMU's descriptor
+     * list did NOT carry it, so the capture fell back to the member's
+     * own content and the defect is live again for that register.  On
+     * RISC-V it must read 0: fcsr, fflags and frm share the `fs`
+     * predicate and vcsr, vxsat and vxrm share `vs`, so a member cannot
+     * be exposed without its container.  A non-zero names a guest
+     * configuration that broke that pairing and must be investigated,
+     * never absorbed.
+     */
+    uint64_t reg_value_container_unresolved = 0;
+
+    /*
      * Basic blocks REFUSED because the boundary could not decode one of
      * their instructions (detect_tb_poison's "Capstone decode failure").
      * The refusal is whole-block: a single undecodable byte sequence

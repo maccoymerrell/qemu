@@ -119,9 +119,32 @@ Every departure from the rank-1 answer carries a rule id, recorded per row in
 
 ## Verification of the measurement itself
 
-* **Falsification.** All 730 agreeing rows were perturbed (drop one source, or
-  plant a phantom destination where there is none) and re-compared: **730/730
-  were flagged**.  The comparison cannot report agreement it has not checked.
+* **Falsification, whole-table.** All 730 agreeing rows *of the pre-fix table*
+  were perturbed (drop one source, or plant a phantom destination where there
+  is none) and re-compared: **730/730 were flagged**.  The comparison cannot
+  report agreement it has not checked.  That sweep is a measurement of an
+  earlier table and is kept as the record of it; the table has since moved to
+  977 agreeing rows, and the row count above is NOT the current denominator.
+
+* **Falsification, standing control (`falsify_shim.sh`).**  The whole-table
+  sweep above is expensive and historical; what a published zero needs is a
+  control that is re-run beside it.  mipsel is the only one of the four ISAs
+  that reads **0 disagreements**, and it is also the only one that could not
+  use `isaxcheck --falsify=drop-src:<mnem>` -- `parse.py` probes with `--hex`,
+  where the tool refuses `--falsify` because the run returns before
+  `compare()`.  `falsify_shim.sh` stands in: pointed at by `CST_ISAXCHECK`, it
+  erases the first register from the fields-layer `SRC{}` set of the mnemonic
+  named in `CST_FALSIFY_MNEM`, and reports on stderr how many sets it damaged
+  so an inert run cannot read as a passing one.
+
+      CST_ISAXCHECK=./falsify_shim.sh CST_FALSIFY_MNEM=abs.d python parse.py
+      python build_ref.py && python adjudicate.py && python emit.py
+
+  Measured at `47bbdc2619`: clean `agree=977 disagree=0`, damaged
+  `agree=976 disagree=1` with the single signature `SRC-miss{FPRN}`.  The zero
+  is a measurement, not a vacuity.  Name a mnemonic that is in the
+  denominator -- the match is exact, so `move` selects nothing (the 977
+  representative encodings carry the MSA `move.v` and no plain `move`).
 * **Vacuous agreement.** Exactly **1** of the 730 agrees with both sets empty
   (`sync`, correctly empty); 35 agree with an empty destination set, all of them
   stores, branches and prefetches.

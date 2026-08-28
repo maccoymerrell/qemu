@@ -42,6 +42,13 @@ constexpr unsigned kMaxMemops = 64;
  * overflowed, rather than this one, which would only see a smaller number.
  */
 constexpr unsigned kMaxFields = 64;
+/*
+ * Destinations the encoding names that the emulator discards
+ * (qemu_plugin_insn_discards()).  QEMU's own cap is four; eight leaves the
+ * refusal above reachable if that ever grows, which is the direction a
+ * short destination LIST must fail in.
+ */
+constexpr unsigned kMaxDiscards = 8;
 
 std::atomic<bool>     g_tried{false};
 bool                  g_live = false;
@@ -127,6 +134,20 @@ GHashTable *g_dst_unmapped_name = nullptr;
  */
 GHashTable *g_field_unnamed = nullptr;
 GHashTable *g_field_unmapped_name = nullptr;
+/*
+ * The DISCARDED destinations (#260), on both sides of the same question.
+ *
+ * g_discard_rows counts the statements that landed -- an emitter said the
+ * instruction writes a register the emulator throws away, and the row got a
+ * generic word and a destination slot.  It is the number that makes the
+ * #218 droppable population's fall a measurement rather than an absence.
+ *
+ * g_discard_unmapped_name is the mirror: a name QEMU stated and the register
+ * table has no generic word for.  Same shape and same fix as
+ * g_field_unmapped_name -- the generator's table, not this file.
+ */
+std::atomic<uint64_t> g_discard_rows{0};
+GHashTable *g_discard_unmapped_name = nullptr;
 /*
  * A register QEMU DID give this file a generic word for, stated as WRITTEN
  * by an instruction whose destination family is published -- and which the
@@ -1395,6 +1416,112 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             }
             if (qemu_plugin_insn_field_prov(tb, idx, i, w.data(),
                                             g_prov_words) != g_prov_words) {
+                out->dst_state = QDEP_R_NORECORD;
+                return;
+            }
+            rc = fold_prov(w.data(), out->dst_dep_regs[k],
+                           &out->n_dst_dep_regs[k], &memop_slots,
+                           &out->dst_dep_imm[k]);
+            if (rc == QDEP_OK) {
+                for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
+                    if (!(memop_slots & (1u << m))) {
+                        continue;
+                    }
+                    if (m >= n_memops || load_ord[m] == 0xFF) {
+                        rc = QDEP_R_UNREPRESENTABLE;
+                        break;
+                    }
+                    out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+                }
+            }
+            if (rc != QDEP_OK) {
+                out->dst_state = rc;
+                return;
+            }
+        }
+    }
+
+    /*
+     * THE WRITES THE EMULATOR THREW AWAY (#260).
+     *
+     * A register with no TCG global and no CPUArchState storage appears in
+     * neither loop above, because both are indexed by a place the value
+     * lives and this value lives nowhere.  AArch64's `cmp x0,x1` IS
+     * `subs xzr,x0,x1`; MIPS' `mul` leaves HI and LO architecturally
+     * UNPREDICTABLE; `move $zero,$ra` translates to no op at all.  The wire
+     * carries all three as destinations and, until QEMU's emitters stated
+     * them, they were the whole of the #218 droppable population -- a
+     * register the ISA says the instruction writes with no QEMU row to
+     * match, which refused the family and, at the flip, would have deleted
+     * a real destination.
+     *
+     * Read exactly like a field: name to generic word, provenance through
+     * the same fold, unioned onto the same row if some other route already
+     * created one.  A name with no generic word is SKIPPED and tallied,
+     * because it cannot equal any dst_regs[d] and so no mask is ever
+     * written for it.
+     */
+    unsigned nd = qemu_plugin_insn_discards(tb, idx, nullptr, 0);
+
+    if (nd == QEMU_PLUGIN_DF_INCOMPLETE) {
+        out->dst_state = QDEP_R_NORECORD;
+        return;
+    }
+    if (nd > kMaxDiscards) {
+        out->dst_state = QDEP_R_WIDE;
+        return;
+    }
+    if (nd) {
+        qemu_plugin_dataflow_discard dc[kMaxDiscards];
+
+        for (unsigned i = 0; i < nd; i++) {
+            dc[i].struct_size = sizeof(dc[i]);
+        }
+        if (qemu_plugin_insn_discards(tb, idx, dc, nd) != nd) {
+            out->dst_state = QDEP_R_NORECORD;
+            return;
+        }
+        for (unsigned i = 0; i < nd; i++) {
+            uint8_t gen, k;
+            uint8_t memop_slots = 0;
+            QDepState rc;
+
+            if (dc[i].zero_reg) {
+                /*
+                 * The architectural ZERO register, resolved the way a
+                 * zero-register SOURCE already is (fold_prov's
+                 * qemu_plugin_dataflow_prov_zero_reg arm): by QEMU saying
+                 * which register it is, not by a name in a table.  It has
+                 * none -- AArch64's XZR is not in the GDB namespace and a
+                 * synthetic row for it would put a register that cannot be
+                 * read into the namespace values are read from.
+                 */
+                gen = (uint8_t)REG_ZERO;
+            } else if (!dc[i].reg) {
+                tally(&g_discard_unmapped_name, "?");
+                continue;
+            } else {
+                gen = generic_for_qemu_name(dc[i].reg);
+                if (gen >= REG_ID_COUNT) {
+                    tally(&g_discard_unmapped_name, dc[i].reg);
+                    continue;
+                }
+            }
+            g_discard_rows.fetch_add(1, std::memory_order_relaxed);
+            for (k = 0; k < out->n_dst; k++) {
+                if (out->dst_reg[k] == gen) {
+                    break;
+                }
+            }
+            if (k == out->n_dst) {
+                if (out->n_dst >= QDEP_MAX_DST) {
+                    out->dst_state = QDEP_R_WIDE;
+                    return;
+                }
+                out->dst_reg[out->n_dst++] = gen;
+            }
+            if (qemu_plugin_insn_discard_prov(tb, idx, i, w.data(),
+                                              g_prov_words) != g_prov_words) {
                 out->dst_state = QDEP_R_NORECORD;
                 return;
             }
@@ -2964,6 +3091,19 @@ void qdep_report(GString *report)
         g_dst_repr_change.load(std::memory_order_relaxed),
         g_dst_repr_refused.load(std::memory_order_relaxed));
     g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  DISCARDED destination rows an emitter stated"
+        " (#260):\n"
+        "              a register the ENCODING names and the emulator throws"
+        " away --\n"
+        "               aarch64 `cmp`/`tst`/`cmn` writing XZR, MIPS `mul`"
+        " destroying\n"
+        "               HI and LO, `move $zero,$ra` translating to no op at"
+        " all.  It has\n"
+        "               no TCG global and no env range, so nothing but the"
+        " emitter's own\n"
+        "               statement can put it in QEMU's write list\n",
+        g_discard_rows.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  destination rows the #236 LIST FLIP would have to"
         " REFUSE:\n"
         "              QEMU wrote a register through a helper whose INDEX the"
@@ -3049,5 +3189,7 @@ void qdep_report(GString *report)
                "env byte ranges no target declared a register file for\n(#226: the offset IS the identity, so this is a gap in QEMU's statement\nof its own layout -- never a limit of what the machine knows):");
     dump_tally(report, g_field_unmapped_name,
                "env byte ranges QEMU NAMED that have no generic word\n(#226: the name reached this file and the register table has no row for\nit -- a generator pass, not a boundary question):");
+    dump_tally(report, g_discard_unmapped_name,
+               "DISCARDED destinations QEMU NAMED that have no generic word\n(#260: an emitter said the instruction writes a register the emulator\nthrows away and the register table has no row for that name -- a\ngenerator pass, the same shape as the line above):");
     g_mutex_unlock(&g_tally_lock);
 }

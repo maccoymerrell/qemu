@@ -296,7 +296,13 @@ static const InsnDataflow *plugin_df(const struct qemu_plugin_tb *tb,
 /* Would a set from this instruction be a whole one? */
 static bool plugin_df_complete(const InsnDataflow *d)
 {
-    return !d->fields_overflow && !d->writes_overflow;
+    /*
+     * The discard overflow is in here for the reason the other two are: a
+     * consumer that builds its destination LIST from these accessors would
+     * publish a set short by a register the instruction writes, and a short
+     * destination set is a missing dependency rather than a coarse one.
+     */
+    return !d->fields_overflow && !d->writes_overflow && !d->discards_overflow;
 }
 
 static unsigned plugin_df_copy(const uint64_t *src, uint64_t *words,
@@ -492,6 +498,46 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
     return plugin_df_copy_prov(d->fields[field].prov, words, nwords);
 }
 
+unsigned qemu_plugin_insn_discards(const struct qemu_plugin_tb *tb, size_t idx,
+                                   qemu_plugin_dataflow_discard *out,
+                                   unsigned ndiscards)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d)) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (ndiscards < d->n_discards || out == NULL) {
+        return d->n_discards;
+    }
+    for (unsigned i = 0; i < d->n_discards; i++) {
+        uint32_t want = out[i].struct_size;
+        qemu_plugin_dataflow_discard r = {
+            .struct_size = sizeof(r),
+            .reg = d->discards[i].reg,
+            .zero_reg = d->discards[i].zero_reg,
+        };
+
+        if (want == 0 || want > sizeof(r)) {
+            want = sizeof(r);
+        }
+        memcpy(&out[i], &r, want);
+    }
+    return d->n_discards;
+}
+
+unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,
+                                       size_t idx, unsigned discard,
+                                       uint64_t *words, unsigned nwords)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d) || discard >= d->n_discards) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_copy_prov(d->discards[discard].prov, words, nwords);
+}
+
 /*
  * Are this instruction's ACCESS records whole?
  *
@@ -593,7 +639,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_mem_reads = d->n_mem_rd;
     st.n_mem_writes = d->n_mem_wr;
     st.fields_truncated = d->fields_overflow;
-    st.writes_truncated = d->writes_overflow;
+    st.writes_truncated = d->writes_overflow || d->discards_overflow;
     st.prov_truncated = insn_dataflow_prov_truncated();
     st.helper_model = d->helper_model;
     st.n_helper_unknown = d->n_helper_unknown;

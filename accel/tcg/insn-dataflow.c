@@ -100,6 +100,16 @@
  */
 #define DF_MAX_ZERO_NOTES     1024
 /*
+ * Discarded-write notes (insn_dataflow_note_discarded_write).  One per
+ * destination an instruction names and the emulator throws away.  AArch64
+ * reaches this most often -- every `cmp`, `tst` and `cmn` in a block takes one
+ * -- so it is sized like the zero-register cap rather than like the handful
+ * of emitters that state the others.  Past the cap the notes stop and the
+ * overflow flag makes the extraction incomplete, because a destination list
+ * that is SHORT is the one error direction this file treats as an error.
+ */
+#define DF_MAX_DISCARD_NOTES  1024
+/*
  * Folded-register operands stated by an emitter (insn_dataflow_note_folded_reg).
  * One per such operand a block resolves.  Two emitters state them, both x86's:
  * eip_next_tl(), once per call instruction, and gen_lea_modrm_1(), once per
@@ -255,6 +265,31 @@ typedef struct DfZeroNote {
     const void *ts;
     const TCGOp *anchor;
 } DfZeroNote;
+
+/*
+ * CP-M, the discarded-write half: one destination the ENCODING names, the
+ * name it has in the target's own namespace, and the temp whose end-of-
+ * instruction contents are the value it receives.
+ *
+ * The anchor is the op the emitter had last produced, exactly as DfZeroNote's
+ * is, and it is load-bearing for the same reason turned around: AArch64's
+ * cpu_reg(s, 31) hands out a FRESH temp per call, but a block full of `cmp`s
+ * takes one note apiece and the walk has to give each to its own instruction.
+ */
+typedef struct DfDiscardNote {
+    const void *ts;
+    const char *reg;            /* NULL when @zero says which register */
+    bool zero;
+    /*
+     * The accessor could not say whether this use is a read or a write, so
+     * the walk decides: a later op of this instruction writing @ts is the
+     * architectural write, and @anchor being still its definition means the
+     * temp was only ever the constant the accessor put in it.  See
+     * insn_dataflow_note_zero_write_holder().
+     */
+    bool holder;
+    const TCGOp *anchor;
+} DfDiscardNote;
 
 /*
  * CP-M, the encoded-immediate half: one temp a DECODER is handing on as the
@@ -564,6 +599,10 @@ struct InsnDataflowScratch {
      * is one architectural zero register per target, so which one it is never
      * has to be carried.
      */
+    DfDiscardNote discard[DF_MAX_DISCARD_NOTES];
+    unsigned n_discard;
+    bool discard_overflow;
+
     DfZeroNote zero[DF_MAX_ZERO_NOTES];
     unsigned n_zero;
     bool zero_overflow;
@@ -654,6 +693,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_alias            (df->alias)
 #define df_n_alias          (df->n_alias)
 #define df_alias_overflow   (df->alias_overflow)
+#define df_discard          (df->discard)
+#define df_n_discard        (df->n_discard)
+#define df_discard_overflow (df->discard_overflow)
 #define df_zero             (df->zero)
 #define df_n_zero           (df->n_zero)
 #define df_zero_overflow    (df->zero_overflow)
@@ -1343,6 +1385,80 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->n_fields++;
 }
 
+/*
+ * Record a destination the encoding names that the emulator threw away.
+ *
+ * The provenance is @ts's at the end of the instruction, and there are two
+ * ways to read that, matching the two things @ts can be.  A GLOBAL is a guest
+ * register: if this instruction wrote it, the discarded value came from
+ * wherever that write came from; if it only read it, the discarded value IS
+ * that register.  Anything else is a temp, and the walk has already computed
+ * its provenance in place.
+ *
+ * Merged on the register NAME rather than appended, so an emitter that states
+ * the same discarded destination twice -- once per lowering arm -- produces
+ * one row whose provenance is the union, exactly as a register written twice
+ * does in df_add_write().
+ */
+static void df_add_discard(InsnDataflow *d, const DfDiscardNote *n)
+{
+    const char *reg = n->reg;
+    bool zero = n->zero;
+    const TCGTemp *ts = n->ts;
+    uint64_t prov[INSN_DF_REG_WORDS];
+    unsigned idx;
+
+    if ((reg == NULL && !zero) || ts == NULL) {
+        return;
+    }
+    if (n->holder) {
+        /*
+         * A holder that no op but the accessor's own movi ever wrote was a
+         * SOURCE use of the register, not a destination.  `mov x0,xzr`
+         * reaches the same accessor as `cmp x0,x1` and publishing a write
+         * for it would fabricate a destination -- the error direction this
+         * whole file treats as worse than a missing one, because it is a
+         * dependency that does not exist.
+         */
+        if (df_reg(ts, &idx) ||
+            df_defop_of(ts - tcg_ctx->temps) == n->anchor) {
+            return;
+        }
+    }
+    memset(prov, 0, sizeof(prov));
+    if (df_reg(ts, &idx)) {
+        const uint64_t *fwd = df_written_prov(d, idx);
+
+        if (fwd) {
+            df_or(prov, fwd);
+        } else {
+            df_bit(prov, idx);
+        }
+    } else {
+        df_or(prov, df_prov_of(ts - tcg_ctx->temps));
+    }
+
+    for (unsigned i = 0; i < d->n_discards; i++) {
+        bool same = zero ? (d->discards[i].zero_reg != 0)
+                         : (d->discards[i].reg != NULL &&
+                            !strcmp(d->discards[i].reg, reg));
+
+        if (same) {
+            df_or(d->discards[i].prov, prov);
+            return;
+        }
+    }
+    if (d->n_discards >= INSN_DF_MAX_DISCARDS) {
+        d->discards_overflow = 1;
+        return;
+    }
+    d->discards[d->n_discards].reg = reg;
+    d->discards[d->n_discards].zero_reg = zero ? 1 : 0;
+    memcpy(d->discards[d->n_discards].prov, prov,
+           sizeof(d->discards[d->n_discards].prov));
+    d->n_discards++;
+}
+
 void insn_dataflow_note_reset(void)
 {
     if (df_disabled()) {
@@ -1360,6 +1476,8 @@ void insn_dataflow_note_reset(void)
     df_alias_overflow = false;
     df_n_zero = 0;
     df_zero_overflow = false;
+    df_n_discard = 0;
+    df_discard_overflow = false;
     df_n_preserve = 0;
     df_preserve_overflow = false;
     df_n_value = 0;
@@ -1961,7 +2079,8 @@ static void df_carrier_defined(const void *ts)
 
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
-                    unsigned *zero_cursor, unsigned *imm_cursor)
+                    unsigned *zero_cursor, unsigned *imm_cursor,
+                    unsigned *disc_cursor)
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
@@ -1993,12 +2112,22 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      * the same interned constant -- see DfImmNote.
      */
     unsigned imm_lo = *imm_cursor;
+    /*
+     * And the discarded-write notes, on the same discipline.  The low bound
+     * is what keeps one `cmp`'s XZR destination out of every later
+     * instruction in the block.
+     */
+    unsigned disc_lo = *disc_cursor;
 
     while (*zero_cursor < df_n_zero && df_zero[*zero_cursor].anchor == marker) {
         (*zero_cursor)++;
     }
     while (*imm_cursor < df_n_imm && df_imm[*imm_cursor].anchor == marker) {
         (*imm_cursor)++;
+    }
+    while (*disc_cursor < df_n_discard &&
+           df_discard[*disc_cursor].anchor == marker) {
+        (*disc_cursor)++;
     }
 
     /*
@@ -2038,6 +2167,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         while (prev_op != NULL && *imm_cursor < df_n_imm &&
                df_imm[*imm_cursor].anchor == prev_op) {
             (*imm_cursor)++;
+        }
+        while (prev_op != NULL && *disc_cursor < df_n_discard &&
+               df_discard[*disc_cursor].anchor == prev_op) {
+            (*disc_cursor)++;
         }
         prev_op = op;
 
@@ -2824,6 +2957,25 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
            df_imm[*imm_cursor].anchor == prev_op) {
         (*imm_cursor)++;
     }
+    while (prev_op != NULL && *disc_cursor < df_n_discard &&
+           df_discard[*disc_cursor].anchor == prev_op) {
+        (*disc_cursor)++;
+    }
+    /*
+     * THE DISCARDED WRITES, resolved LAST because their provenance is a
+     * property of the finished instruction and not of any one op.
+     *
+     * The value a discarded destination receives is whatever @ts holds when
+     * the instruction is over: for AArch64's throwaway XZR temp that is what
+     * the flag-setting op put there, and for a global the instruction only
+     * read it is the register itself.  Resolving it during the op loop would
+     * mean guessing which op is the last writer, which is precisely the
+     * question `cmp`'s lowering -- result into the temp, flags into four
+     * others -- gives no stable answer to.
+     */
+    for (unsigned i = disc_lo; i < *disc_cursor; i++) {
+        df_add_discard(d, &df_discard[i]);
+    }
     /*
      * An instruction whose decoder spoke at all: stated even when the
      * constant never reached an op, because the two facts answer different
@@ -3183,6 +3335,65 @@ void insn_dataflow_note_zero_reg(const void *ts)
 }
 
 /*
+ * CP-M, the discarded-write half.  See insn_dataflow_note_discarded_write()
+ * in the header for what the note says and why the name rather than an index.
+ *
+ * Same list discipline as the zero-register notes -- append-only for the
+ * translation, deduplicated on the (temp, register, anchor) TRIPLE, resolved
+ * only inside the instruction whose op range reached the anchor.  The
+ * register is part of the key because one temp legitimately stands for two
+ * discarded destinations: MIPS `mul` destroys HI and LO together and states
+ * both against the multiply's own result temp.
+ */
+static void df_note_discard(const void *ts, const char *reg, bool zero,
+                            bool holder)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (ts == NULL || (reg == NULL && !zero)) {
+        return;
+    }
+    df_bind();
+    if (df_n_discard >= DF_MAX_DISCARD_NOTES) {
+        df_discard_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_discard; i-- > 0; ) {
+        if (df_discard[i].ts == ts && df_discard[i].reg == reg &&
+            df_discard[i].zero == zero && df_discard[i].holder == holder &&
+            df_discard[i].anchor == anchor) {
+            return;                 /* the same statement twice */
+        }
+        break;
+    }
+    df_discard[df_n_discard].ts = ts;
+    df_discard[df_n_discard].reg = reg;
+    df_discard[df_n_discard].zero = zero;
+    df_discard[df_n_discard].holder = holder;
+    df_discard[df_n_discard].anchor = anchor;
+    df_n_discard++;
+}
+
+void insn_dataflow_note_discarded_write(const void *ts, const char *reg)
+{
+    df_note_discard(ts, reg, false, false);
+}
+
+void insn_dataflow_note_discarded_zero_write(const void *ts)
+{
+    df_note_discard(ts, NULL, true, false);
+}
+
+void insn_dataflow_note_zero_write_holder(const void *ts)
+{
+    df_note_discard(ts, NULL, true, true);
+}
+
+/*
  * CP-M, the encoded-immediate half.  See insn_dataflow_note_encoded_imm() in
  * the header for why the note is taken at the decoder and nowhere below it.
  *
@@ -3518,6 +3729,7 @@ void insn_dataflow_extract(unsigned num_insns)
     unsigned memop_cursor;
     unsigned zero_cursor;
     unsigned imm_cursor;
+    unsigned disc_cursor;
     bool prof;
     int64_t t0;
 
@@ -3550,6 +3762,7 @@ void insn_dataflow_extract(unsigned num_insns)
     memop_cursor = 0;
     zero_cursor = 0;
     imm_cursor = 0;
+    disc_cursor = 0;
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         if (op->opc != INDEX_op_insn_start) {
@@ -3557,7 +3770,7 @@ void insn_dataflow_extract(unsigned num_insns)
         }
         if (first != NULL && idx > 0) {
             df_insn(&df_out[idx - 1], first, op, marker, &memop_cursor,
-                    &zero_cursor, &imm_cursor);
+                    &zero_cursor, &imm_cursor, &disc_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
@@ -3575,7 +3788,7 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     if (first != NULL && idx > 0) {
         df_insn(&df_out[idx - 1], first, NULL, marker, &memop_cursor,
-                &zero_cursor, &imm_cursor);
+                &zero_cursor, &imm_cursor, &disc_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;
@@ -3721,8 +3934,14 @@ bool insn_dataflow_prov_truncated(void)
      * empty provenance, which for a destination reads as "the value is a
      * constant" -- exactly the claim that cannot be supported once a note has
      * been dropped.
+     *
+     * @df_discard_overflow is the discarded-write notes' cap, and it is here
+     * for the sharper version of the same reason: a dropped note is a
+     * DESTINATION missing from the list, and a consumer whose list is QEMU's
+     * would publish a shorter set than the instruction writes.
      */
-    return df && (df_slots_overflow || df_zero_overflow);
+    return df && (df_slots_overflow || df_zero_overflow ||
+                  df_discard_overflow);
 }
 
 /*

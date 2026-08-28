@@ -552,6 +552,19 @@ TCGv_i64 cpu_reg(DisasContext *s, int reg)
          * this is where it is said.  Capture only.
          */
         insn_dataflow_note_zero_reg(tcgv_i64_temp(t));
+        /*
+         * CP-M, the DISCARDED-WRITE half.  The same temp is also where a
+         * WRITE to XZR goes to die: `cmp x0,x1` IS `subs xzr,x0,x1`, and the
+         * flag-setting emitter puts the subtraction's result in here and
+         * nothing reads it.  The encoding names XZR as the destination
+         * (R7.3), so the fact is stated at the one place the register number
+         * is known.  Whether this call is a source or a destination is not
+         * knowable here and does not need to be: the note is resolved
+         * against the temp's contents at the END of the instruction, so a
+         * read use resolves to the constant zero the movi above put in it
+         * and a write use resolves to what the writing op computed.
+         */
+        insn_dataflow_note_zero_write_holder(tcgv_i64_temp(t));
         return t;
     } else {
         return cpu_X[reg];

@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 8
+#define QEMU_PLUGIN_DATAFLOW_VERSION 9
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -291,6 +291,52 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
                                      uint64_t *words, unsigned nwords);
 QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset);
+
+/*
+ * THE DESTINATIONS THE ENCODING NAMES AND THE EMULATOR DISCARDS.
+ *
+ * A register with no TCG global and no CPUArchState storage cannot appear in
+ * qemu_plugin_insn_reg_writes() or in qemu_plugin_insn_fields(), because both
+ * are indexed by a place the value lives and this value lives nowhere.
+ * AArch64's XZR is the case in point: `cmp x0,x1` IS `subs xzr,x0,x1`, and
+ * the op stream carries the subtraction with its result going into a temp
+ * that is then dropped.  MIPS reaches the same shape twice more -- `mul`
+ * leaves HI and LO architecturally UNPREDICTABLE, and `move $zero,$ra`
+ * translates to no op at all.
+ *
+ * A consumer that FILLS a destination list from the two accessors above is
+ * short by exactly these registers.  They are named here, with the same
+ * provenance every other write carries, so a list built from QEMU's facts is
+ * the list the instruction writes.
+ *
+ * @reg is the architectural name in the namespace qemu_plugin_dataflow_reg_name()
+ * and qemu_plugin_dataflow_field_reg() answer in; the pointer is owned by QEMU
+ * and stays valid for the process's life.
+ *
+ * Returns the number of rows, or writes min(n, count) of them when @out is
+ * non-NULL, on the two-call convention qemu_plugin_insn_fields() uses.
+ */
+typedef struct qemu_plugin_dataflow_discard {
+    uint32_t struct_size;
+    /*
+     * NULL when @zero_reg is set.  The architectural ZERO register has no
+     * name in this namespace on the targets that have one -- AArch64's XZR
+     * is not a GDB register -- so it is identified the way a zero-register
+     * OPERAND already is (qemu_plugin_dataflow_prov_zero_reg): by being the
+     * one register that needs no name.
+     */
+    const char *reg;
+    uint8_t zero_reg;
+} qemu_plugin_dataflow_discard;
+
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_discards(const struct qemu_plugin_tb *tb, size_t idx,
+                                   qemu_plugin_dataflow_discard *out,
+                                   unsigned ndiscards);
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,
+                                       size_t idx, unsigned discard,
+                                       uint64_t *words, unsigned nwords);
 
 /*
  * NAME the register an env byte range belongs to, in the same namespace
@@ -502,7 +548,12 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t n_mem_reads;
     uint32_t n_mem_writes;
     uint8_t  fields_truncated;  /* more fields than could be recorded */
-    uint8_t  writes_truncated;  /* more writes than could carry provenance */
+    /*
+     * More writes than could carry provenance -- OR more discarded
+     * destinations (qemu_plugin_insn_discards()) than there was room for,
+     * which is the same fact about the same list.
+     */
+    uint8_t  writes_truncated;
     uint8_t  prov_truncated;    /* a provenance lost a member to an array cap */
     /*
      * How much of this instruction's HELPER work is stated and how much is

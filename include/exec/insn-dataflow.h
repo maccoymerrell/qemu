@@ -80,6 +80,14 @@
 /* Instructions writing more than this are vanishingly rare; overflow is flagged. */
 #define INSN_DF_MAX_WRITES  8
 
+/*
+ * Destinations the encoding names that the emulator discards.  Two is the
+ * widest real case in this tree -- MIPS' `mul rd,rs,rt`, whose HI and LO the
+ * architecture leaves UNPREDICTABLE -- and four leaves room without making
+ * the overflow flag unreachable.
+ */
+#define INSN_DF_MAX_DISCARDS 4
+
 /* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
 #define INSN_DF_MAX_GVEC_OPERANDS 5
 /*
@@ -230,6 +238,30 @@ typedef struct InsnDataflowMemop {
     uint64_t data_prov[INSN_DF_REG_WORDS];  /* what produced it: stores */
 } InsnDataflowMemop;
 
+/*
+ * A destination the ENCODING names and the emulator does not keep.
+ *
+ * See insn_dataflow_note_discarded_write().  @reg is the architectural
+ * register's name in the target's own namespace -- the same strings
+ * insn_dataflow_reg_name() and insn_dataflow_field_reg() produce -- because
+ * the register has neither a TCG global nor an env byte range to be named
+ * by, and inventing a third vocabulary for it would make the consumer's
+ * name-to-register map incomplete in a way nothing measures.
+ */
+typedef struct InsnDataflowDiscard {
+    /*
+     * The architectural name, or NULL when @zero_reg says which register it
+     * is.  The zero register has no name in QEMU's namespace on every target
+     * that has one -- AArch64's XZR is not a GDB register and MIPS' `zero`
+     * only is by accident of the XML -- so it is identified the way the READ
+     * side already identifies it (insn_dataflow_prov_zero_reg): by being the
+     * one register that needs no name.
+     */
+    const char *reg;
+    uint8_t  zero_reg;
+    uint64_t prov[INSN_DF_REG_WORDS];   /* where the discarded value came from */
+} InsnDataflowDiscard;
+
 typedef struct InsnDataflowWrite {
     uint8_t  reg;                           /* index into the globals table */
     /*
@@ -275,6 +307,19 @@ typedef struct InsnDataflow {
     InsnDataflowWrite writes[INSN_DF_MAX_WRITES];
     uint8_t  n_writes;
     uint8_t  writes_overflow;
+
+    /*
+     * The writes the emulator threw away.  Kept apart from writes[] because
+     * they are named differently and for no other reason: writes[] is indexed
+     * by TCG global and these registers have none, which is the whole fact
+     * that puts them here.  A consumer building a destination LIST must read
+     * both; one reading only writes[] is short by exactly the registers the
+     * ISA says the instruction writes and QEMU had no storage to write them
+     * to.
+     */
+    InsnDataflowDiscard discards[INSN_DF_MAX_DISCARDS];
+    uint8_t  n_discards;
+    uint8_t  discards_overflow;
 
     InsnDataflowField fields[INSN_DF_MAX_FIELDS];
     uint8_t  n_fields;
@@ -593,6 +638,109 @@ void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts);
  * or suppressed, and a target that never calls this is unaffected.
  */
 void insn_dataflow_note_zero_reg(const void *ts);
+
+/*
+ * CP-M, the DISCARDED-WRITE half -- a destination the ENCODING names and the
+ * emulator does not keep.
+ *
+ * `cmp x0,x1` IS `subs xzr,x0,x1`; `tst`/`cmn` are `ands`/`adds` into the same
+ * place.  The encoding names XZR as the destination register, and QEMU hands
+ * the emitter a throwaway temp for it (cpu_reg(s, 31)) because the value has
+ * nowhere to go.  MIPS `mul rd,rs,rt` is the same shape from the other side:
+ * the architecture leaves HI and LO UNPREDICTABLE, which is the ISA saying the
+ * multiplier destroyed them, and QEMU -- correct to emulate, since nothing may
+ * read them -- writes neither.  `move $zero,$ra` is the smallest case of all:
+ * gen_logic() sees rd == 0 and emits no op at all.
+ *
+ * In every one of those the op list carries NO write, so a walk over the ops
+ * reports a destination set SHORT of what the instruction names.  That is a
+ * missing dependency for any consumer that keeps a scoreboard: XZR and $zero
+ * are architecturally written (R7.3 -- "REG_ZERO exists, so it should be
+ * specified"), and a destroyed HI/LO is a WAW hazard against the next `mfhi`
+ * whether or not the value is defined.  R2 decides it: what the ISA says the
+ * instruction writes is the machine's, and that the emulator can prove nobody
+ * will look is the emulator's business.
+ *
+ * THE NOTE IS THE WRITE-SIDE SIBLING OF insn_dataflow_note_zero_reg(), taken
+ * at the same kind of place and for the same reason: the accessor or the
+ * emitter is where the register NUMBER is still known, and one op later it is
+ * not known anywhere.
+ *
+ * @reg is the architectural register's name in the target's own namespace --
+ * the spelling insn_dataflow_reg_name() gives a global and
+ * insn_dataflow_field_reg() gives an env range.  It has to be a name rather
+ * than an index because these registers have neither a global nor a byte range
+ * to index, which is exactly why their writes are invisible.  The pointer must
+ * outlive the translation; a string literal is the intended form.
+ *
+ * @ts is the temp or global whose CONTENTS AT THE END OF THIS INSTRUCTION are
+ * the value the architecture writes.  It may be
+ *
+ *   the throwaway destination itself -- AArch64's cpu_reg(s, 31), which the
+ *   flag-setting op writes and nothing reads, so the walk's provenance for it
+ *   is exactly the subtraction's inputs;
+ *
+ *   a register the same computation DID land in -- MIPS' cpu_gpr[rd] on
+ *   `mul`, whose provenance is the multiply's two operands, which are the two
+ *   operands HI and LO were destroyed by;
+ *
+ *   or a global the instruction only read -- MIPS' cpu_gpr[rs] on
+ *   `move $zero,$rs`, where the emulator emitted nothing and the value that
+ *   would have been written is the one it was handed.
+ *
+ * It states an OPERAND RELATIONSHIP, not a value.  Whether a discarded write
+ * is worth a dependency edge is the consumer's decision; making it here would
+ * put the emulator's dead-code elimination on the wire as though it were the
+ * machine.
+ *
+ * THE NOTE IS ANCHORED, on the same discipline as the zero-register notes: it
+ * records the op its emitter had last produced, and the walk resolves it only
+ * inside the instruction whose op range reached it.  Without that a single
+ * `cmp` would name XZR as a destination of every later instruction in the
+ * block.
+ *
+ * Capture only; no op is emitted, altered or suppressed, and a target that
+ * never calls this is unaffected -- it reports no discarded writes, which is
+ * a different fact from "this instruction discards none" only in that nobody
+ * looked, and the count says which.
+ */
+void insn_dataflow_note_discarded_write(const void *ts, const char *reg);
+
+/*
+ * The same statement for the ARCHITECTURAL ZERO REGISTER, which needs no name.
+ *
+ * XZR, x0 and $zero are the one destination no target can spell in the
+ * namespace above: AArch64's is not a GDB register at all, and giving it a
+ * synthetic row in QEMU's register table would put a register that does not
+ * exist into the namespace a consumer READS VALUES from.  The read side
+ * already solved this -- a zero-register operand travels as a reserved
+ * provenance bit and insn_dataflow_prov_zero_reg() names it -- and the write
+ * side uses the same identity rather than inventing a second one.
+ *
+ * @ts is read exactly as insn_dataflow_note_discarded_write()'s is.
+ */
+void insn_dataflow_note_discarded_zero_write(const void *ts);
+
+/*
+ * The zero register again, from an accessor that CANNOT KNOW whether this use
+ * is a read or a write.
+ *
+ * AArch64's cpu_reg(s, 31) hands out one throwaway temp for both: `cmp x0,x1`
+ * writes the subtraction into it and drops it, and `mov x0,xzr` reads it as a
+ * source.  The accessor is still the only place the register number is known,
+ * so the statement is made there and the walk decides which use it was, by
+ * the one thing that separates them: whether an op of this instruction OTHER
+ * than the movi that materialised the temp wrote it.
+ *
+ * Getting that wrong in the permissive direction is not a loss of precision,
+ * it is a FABRICATED destination -- `mov x0,xzr` would publish a write to a
+ * register it only reads -- so the test is on the op that defines the temp
+ * and not on anything softer.
+ *
+ * @ts is the temp the accessor is about to return, and the note must be taken
+ * while the materialising write is still the last op emitted.
+ */
+void insn_dataflow_note_zero_write_holder(const void *ts);
 
 /*
  * CP-M, the FOLDED-REGISTER half -- a value an emitter derived from a
@@ -1088,6 +1236,16 @@ static inline void insn_dataflow_note_folded_reg(const void *ts,
 { }
 
 static inline void insn_dataflow_note_encoded_imm(const void *ts)
+{
+}
+static inline void insn_dataflow_note_discarded_write(const void *ts,
+                                                      const char *reg)
+{
+}
+static inline void insn_dataflow_note_discarded_zero_write(const void *ts)
+{
+}
+static inline void insn_dataflow_note_zero_write_holder(const void *ts)
 {
 }
 

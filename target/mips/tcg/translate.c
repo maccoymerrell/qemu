@@ -3065,6 +3065,19 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         } else {
             tcg_gen_movi_tl(cpu_gpr[rd], 0);
         }
+        /*
+         * CP-M, the DISCARDED-WRITE half.  MIPS32 defines HI and LO as
+         * UNPREDICTABLE after MUL, which is the architecture saying the
+         * multiplier ran and destroyed them; QEMU correctly emits no write,
+         * because nothing may read the result back.  The destruction is
+         * still a WAW hazard against the next `mfhi`/`mflo` and a consumer
+         * keeping a scoreboard has to see it (R2).  The value is the one the
+         * multiply produced, so cpu_gpr[rd] -- which the ops just gave the
+         * multiply's own provenance -- is what the note names.  Capture
+         * only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_discarded_write(tcgv_tl_temp(cpu_gpr[rd]), "hi");
+        insn_dataflow_note_discarded_write(tcgv_tl_temp(cpu_gpr[rd]), "lo");
         break;
     }
 }
@@ -3118,7 +3131,24 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
     if (rd == 0) {
-        /* If no destination, treat it as a NOP. */
+        /*
+         * If no destination, treat it as a NOP.
+         *
+         * CP-M, the DISCARDED-WRITE half.  A NOP is what the EMULATOR may
+         * do -- nothing can read $zero back -- and not what the instruction
+         * is: `move $zero,$ra` is `or $0,$31,$0`, and the encoding names
+         * $zero as the destination exactly the way it would name $t0
+         * (R7.3).  With no op emitted the walk sees no write at all, so the
+         * fact is stated here, where the register numbers are still in hand.
+         * One statement per source operand; they merge into one row whose
+         * provenance is their union.  Capture only.
+         */
+        if (rs != 0) {
+            insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_gpr[rs]));
+        }
+        if (rt != 0) {
+            insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_gpr[rt]));
+        }
         return;
     }
 

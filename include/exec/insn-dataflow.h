@@ -349,6 +349,15 @@ typedef struct InsnDataflow {
     uint8_t  imm_reached;
 
     /*
+     * How many reads this instruction folded onto a REPRESENTATION CARRIER's
+     * register.  See insn_dataflow_note_repr_carrier().  Saturating, and
+     * present so the rule's zero is a measurement rather than an assumption:
+     * an ISA that declares no carrier reads 0 because it has no subject, and
+     * that is a different fact from a declared carrier the walk never folded.
+     */
+    uint8_t  n_repr_carrier;
+
+    /*
      * The accesses themselves, in the order the target emitted them.
      *
      * n_mem_rd/n_mem_wr count qemu_ld/qemu_st OPS; @n_memops counts the
@@ -777,6 +786,60 @@ void insn_dataflow_note_preserve_read(const void *ts, const void *mark);
 void insn_dataflow_note_supplied_value(const void *ts, const void *mark);
 
 /*
+ * Temp @ts is a REPRESENTATION CARRIER for the lowered register that TCG
+ * global @stands_for_ts belongs to: a redundant spelling of a value that
+ * register already holds, kept in a temp because it is only live inside one
+ * translation block.
+ *
+ * WHAT THIS IS FOR, and again it is one shape.  x86 keeps no EFLAGS, and
+ * three of the four globals it keeps instead are not quite enough: for the
+ * subtract family CF is `CC_SRCT < CC_SRC` unsigned, and CC_SRCT -- the
+ * compare's FIRST operand -- is recoverable from cc_dst + cc_src but not
+ * present in either.  So the translator caches it, in DisasContext::cc_srcT,
+ * and every later flags CONSUMER in the same block reads it.
+ *
+ * The op list says that read came from the GPR the compare fetched.  It did:
+ * `cmp %rbx,%rsi` copies RSI into the carrier, and `cmovb`, `seta` and `setb`
+ * two instructions later read the carrier back.  Chasing that provenance
+ * publishes RSI as a source of all three -- an edge the architecture does not
+ * define, on instructions whose only input is the flags.  TWO INDEPENDENT
+ * REFERENCES saw it: gem5's wrong-path leg counted it UNACCOUNTED and PIN's
+ * correct-path leg absorbed it as an unexplained tracer superset.
+ *
+ * WHY THE EMITTER STATES IT AND NOTHING INFERS IT, which is the same answer
+ * insn_dataflow_declare_repr_selector() gives.  The carrier is an ordinary
+ * temp holding an ordinary value; nothing about `mov cc_srcT,T0` distinguishes
+ * it from `mov tmp,T0`.  Only the code that chose to cache the flags in a temp
+ * knows that is what the temp is for, so it says so beside the tcg_temp_new()
+ * that creates it.
+ *
+ * THE INSTRUCTION BOUNDARY IS THE DISCRIMINATOR, and it is not a refinement --
+ * without it the note would delete real edges.  The same temp is ordinary
+ * scratch INSIDE the instruction that fills it: x86's `cmpxchg` loads memory
+ * into cc_srcT and writes it back to a register, and `xadd` and `sub`-with-LOCK
+ * take their result out of it.  Those reads follow a write this instruction
+ * performed and are left exactly as they were.  A read that follows no write of
+ * this instruction's is reading a value the PREVIOUS instruction left behind,
+ * and emulator-private storage is the only thing that could have carried it
+ * there -- architecturally, what crosses an instruction boundary crosses it in
+ * a register or in memory.  So that read is a read of @stands_for_ts's
+ * register, which is what the carrier is a spelling of.
+ *
+ * IT ADDS AN EDGE AND CANNOT REMOVE ONE.  The register the carrier stands for
+ * enters the read set and the provenance; what leaves is the stale origin,
+ * which is the fabricated half.  On the measured witnesses the flags global is
+ * read directly as well, so the fold is idempotent there -- the point is the
+ * case where it is not.
+ *
+ * @ts and @stands_for_ts are TCGTemp pointers, void here for the reason every
+ * other note's are; @stands_for_ts must be a TEMP_GLOBAL.  Stated once per
+ * translation, before any op is emitted.  Capture only: no op is emitted,
+ * altered or suppressed.
+ */
+void insn_dataflow_note_repr_carrier(const void *ts,
+                                     const void *stands_for_ts);
+
+/*
  * The emitter's position in the op stream, for bounding a preserve-read note.
  * Opaque: the only thing a caller may do with it is hand it back.
  */
@@ -1045,6 +1108,10 @@ static inline void insn_dataflow_note_preserve_read(const void *ts,
 
 static inline void insn_dataflow_note_supplied_value(const void *ts,
                                                      const void *mark)
+{ }
+
+static inline void insn_dataflow_note_repr_carrier(const void *ts,
+                                                   const void *stands_for_ts)
 { }
 
 static inline const void *insn_dataflow_mark(void)

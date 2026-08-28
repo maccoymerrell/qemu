@@ -134,6 +134,13 @@
  */
 #define DF_MAX_PRESERVE_NOTES 1024
 #define DF_MAX_VALUE_NOTES    1024
+/*
+ * Representation carriers.  One per lowered register a target caches in a
+ * temp, stated once per translation -- x86 has exactly one, and no other
+ * target in the tree has any.  Four is room for a target that lowers more
+ * than one register that way.
+ */
+#define DF_MAX_CARRIER_NOTES  4
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -313,6 +320,27 @@ typedef struct DfPreserveNote {
     const TCGOp *mark;
     const TCGOp *end;
 } DfPreserveNote;
+
+/*
+ * A REPRESENTATION CARRIER: a temp holding a redundant spelling of a value
+ * one of the guest's own registers already carries.  See
+ * insn_dataflow_note_repr_carrier() in the header.
+ *
+ * @stands_for is kept as the GLOBAL'S INDEX rather than as a pointer, because
+ * that is the namespace the read set and the provenance are written in and
+ * resolving it once per translation costs nothing.
+ *
+ * @defined_here is the instruction boundary, and it is what keeps the note
+ * from deleting real edges: it says an op of the instruction CURRENTLY being
+ * walked has already written the carrier, so a read of it is that write's
+ * value and not the previous instruction's.  Cleared at the top of every
+ * instruction; see df_insn().
+ */
+typedef struct DfCarrierNote {
+    const void *ts;
+    unsigned stands_for;
+    bool defined_here;
+} DfCarrierNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
 typedef struct DfHelperNote {
@@ -576,6 +604,15 @@ struct InsnDataflowScratch {
     unsigned n_value;
     bool value_overflow;
 
+    /*
+     * The temps a target declared as carrying a lowered register's value.
+     * No overflow flag: the array is sized above what any target in the tree
+     * declares, and a declaration that did not fit would be reported by the
+     * carrier fold reading 0 on an ISA whose stats say it declared one.
+     */
+    DfCarrierNote carrier[DF_MAX_CARRIER_NOTES];
+    unsigned n_carrier;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -632,6 +669,8 @@ static __thread struct InsnDataflowScratch *df;
 #define df_value            (df->value)
 #define df_n_value          (df->n_value)
 #define df_value_overflow   (df->value_overflow)
+#define df_carrier          (df->carrier)
+#define df_n_carrier        (df->n_carrier)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -955,6 +994,18 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
         fprintf(f, "H 0x%" PRIx64 " model=%u unknown=%u unbounded=%u\n",
                 pc, d->helper_model, d->n_helper_unknown,
                 d->n_helper_unbounded);
+    }
+    /*
+     * The representation-carrier folds, on a record type of its own for the
+     * reason the H line has one: this dump is diffed against the behavioural
+     * oracle's report and a line carrying a field the oracle cannot produce
+     * would differ on every instruction.  Printed only when the rule fired, so
+     * its presence in a dump is the firing witness and its absence over a
+     * whole range is a measurement rather than a silence.
+     */
+    if (d->n_repr_carrier) {
+        fprintf(f, "R 0x%" PRIx64 " repr_carrier folds=%u\n",
+                pc, d->n_repr_carrier);
     }
 }
 
@@ -1313,6 +1364,7 @@ void insn_dataflow_note_reset(void)
     df_preserve_overflow = false;
     df_n_value = 0;
     df_value_overflow = false;
+    df_n_carrier = 0;
     df_n_fold = 0;
     df_fold_overflow = false;
     df_n_imm = 0;
@@ -1874,6 +1926,39 @@ static bool df_supplied_value(const void *ts, const TCGOp *op)
     return false;
 }
 
+/*
+ * Is a READ of @ts a read of the register a carrier stands for?
+ *
+ * True only for a declared carrier whose value NO op of the instruction
+ * being walked has produced.  That is the whole discriminator, and it is
+ * stated at length in insn_dataflow_note_repr_carrier(): inside the
+ * instruction that fills it the temp is ordinary scratch -- x86's `cmpxchg`
+ * writes a register out of it -- and only a value that OUTLIVED its
+ * producing instruction was carried there by the emulator rather than by
+ * the machine.
+ */
+static bool df_carrier_read(const void *ts, unsigned *stands_for)
+{
+    for (unsigned i = 0; i < df_n_carrier; i++) {
+        if (df_carrier[i].ts == ts && !df_carrier[i].defined_here) {
+            *stands_for = df_carrier[i].stands_for;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An op of the instruction being walked has just written @ts. */
+static void df_carrier_defined(const void *ts)
+{
+    for (unsigned i = 0; i < df_n_carrier; i++) {
+        if (df_carrier[i].ts == ts) {
+            df_carrier[i].defined_here = true;
+            return;
+        }
+    }
+}
+
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
                     unsigned *zero_cursor, unsigned *imm_cursor)
@@ -1914,6 +1999,16 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     }
     while (*imm_cursor < df_n_imm && df_imm[*imm_cursor].anchor == marker) {
         (*imm_cursor)++;
+    }
+
+    /*
+     * The instruction boundary the carrier rule turns on.  Every declared
+     * carrier starts this instruction holding whatever the PREVIOUS one left
+     * in it, which is the case the rule is about; an op below that writes one
+     * flips it back to ordinary dataflow for the rest of this instruction.
+     */
+    for (unsigned i = 0; i < df_n_carrier; i++) {
+        df_carrier[i].defined_here = false;
     }
 
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
@@ -2531,6 +2626,29 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         memset(prov, 0, sizeof(prov));
         for (unsigned i = 0; i < nb_iargs; i++) {
             TCGTemp *ts = arg_temp(op->args[nb_oargs + i]);
+            unsigned carried;
+
+            /*
+             * A REPRESENTATION CARRIER holding a value this instruction did
+             * not produce is the register it re-expresses, and NOT the place
+             * that register's value came from an instruction ago.  x86 caches
+             * the subtract family's first operand in DisasContext::cc_srcT so
+             * that CF stays computable, and chasing that temp's provenance
+             * published the compared GPR as a source of every later `cmovb`,
+             * `seta` and `setb` -- an edge two independent references caught
+             * and the architecture does not define.
+             *
+             * The register goes in, the stale origin stays out; nothing else
+             * about the read changes.  See insn_dataflow_note_repr_carrier().
+             */
+            if (df_carrier_read(ts, &carried)) {
+                df_bit(d->rd, carried);
+                df_bit(prov, carried);
+                if (d->n_repr_carrier < UINT8_MAX) {
+                    d->n_repr_carrier++;
+                }
+                continue;
+            }
 
             df_or(prov, df_prov_of(ts - s->temps));
             /*
@@ -2633,6 +2751,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                 size_t ti = ts - s->temps;
                 uint64_t *dp = df_prov_of(ti);
 
+                df_carrier_defined(ts);
                 if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
                     tlo = MIN(tlo, ti);
                     thi = MAX(thi, ti);
@@ -2959,6 +3078,56 @@ void insn_dataflow_note_supplied_value(const void *ts, const void *mark)
     df_value[df_n_value].mark = mark;
     df_value[df_n_value].end = op;
     df_n_value++;
+}
+
+/*
+ * THE REPRESENTATION CARRIERS.  See insn_dataflow_note_repr_carrier() in the
+ * header for what one is and why the emitter has to say so.
+ *
+ * A per-translation note and not a target-init declaration, unlike the
+ * selectors beside it: a carrier is a TEMP, so it is created afresh for every
+ * translation block and the pointer that identifies it is only good for that
+ * one.  tcg_func_start() clears the note array before translator_loop() calls
+ * init_disas_context(), which is where a target states this, so the note is in
+ * place before the first op of the block exists.
+ *
+ * @stands_for_ts is resolved to its GLOBAL INDEX here rather than kept as a
+ * pointer, because the index is what the read set and the provenance are
+ * written in and this is the one place that has to do the lookup.
+ */
+void insn_dataflow_note_repr_carrier(const void *ts, const void *stands_for_ts)
+{
+    const TCGTemp *g = stands_for_ts;
+    unsigned idx;
+
+    if (df_disabled()) {
+        return;
+    }
+    /*
+     * Both halves have to be real and the second has to be a global: the
+     * note's whole content is "read this as THAT register", and a name that
+     * does not resolve would silently turn the fold into a dropped read.
+     */
+    if (ts == NULL || g == NULL || g->kind != TEMP_GLOBAL) {
+        return;
+    }
+    df_bind();
+    idx = (unsigned)(g - tcg_ctx->temps);
+    if (idx >= (unsigned)tcg_ctx->nb_globals) {
+        return;
+    }
+    for (unsigned i = 0; i < df_n_carrier; i++) {
+        if (df_carrier[i].ts == ts) {
+            return;                 /* the same declaration twice */
+        }
+    }
+    if (df_n_carrier >= DF_MAX_CARRIER_NOTES) {
+        return;
+    }
+    df_carrier[df_n_carrier].ts = ts;
+    df_carrier[df_n_carrier].stands_for = idx;
+    df_carrier[df_n_carrier].defined_here = false;
+    df_n_carrier++;
 }
 
 /*

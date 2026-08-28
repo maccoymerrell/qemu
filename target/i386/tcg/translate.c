@@ -4133,6 +4133,23 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->tmp3_i32 = tcg_temp_new_i32();
     dc->tmp4 = tcg_temp_new();
     dc->cc_srcT = tcg_temp_new();
+    /*
+     * cc_srcT is the fifth member of the flags lowering and the only one that
+     * is not a global.  For the subtract family CF is `CC_SRCT < CC_SRC`
+     * unsigned, and CC_SRCT -- the compare's first operand -- is
+     * cc_dst + cc_src, so it holds nothing the flags do not already hold; it
+     * is cached here because recomputing it inside a block is pointless work
+     * and because it only ever has to live as far as the next TB boundary
+     * (i386_tr_init_disas_context starts every block at CC_OP_DYNAMIC, so
+     * nothing reads it before this block's own compare fills it).
+     *
+     * Which means a read of it that this instruction did not fill is a read
+     * of the FLAGS, and the extractor must not publish it as a read of the
+     * register the compare happened to take.  Only this file knows that, so
+     * this file says it, beside the tcg_temp_new() that creates the temp.
+     */
+    insn_dataflow_note_repr_carrier(tcgv_tl_temp(dc->cc_srcT),
+                                    tcgv_tl_temp(cpu_cc_src));
 }
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)

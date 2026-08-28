@@ -24,6 +24,27 @@ its own record; a tracer that is merely tracing a different process does not.
 A load whose bytes are not all known is UNCHECKED and reported as such --
 the window opens mid-execution, so most early loads read memory written
 before the window.  Silence is not agreement here either.
+
+THE KERNEL WRITES USER MEMORY AND NO INSTRUCTION RECORDS IT
+
+A memop stream is a record of what INSTRUCTIONS did.  A syscall that takes
+an output pointer has the kernel write the buffer, and no instruction memop
+exists for that write, so the shadow's copy of those bytes is stale from the
+moment the syscall returns.  Scoring such a load against the shadow convicts
+the tracer of a store it was never able to see.
+
+Measured, and this is why the rule below exists: `prlimit64(0, RLIMIT_STACK,
+NULL, &lim)` at CP index 4038 of the x86_64 register-arm workload writes
+`rlim_cur = 0x800000` into a stack slot last written by a `rep stosq` at
+index 97; the reload at index 4045 then reads 0x800000 where the shadow
+still holds 0.  That single row was the whole VIOLATED population of three
+consecutive banks.
+
+So a load is CHECKED only when every one of its bytes was stored SINCE the
+most recent syscall.  Bytes older than that are UNCHECKED-ACROSS-SYSCALL --
+a named bucket, counted, and reported together with how many of them WOULD
+have scored as violations, so the exclusion can never quietly absorb a real
+defect.
 """
 import argparse
 import collections
@@ -39,6 +60,10 @@ AP.add_argument('--maxreport', type=int, default=25)
 A = AP.parse_args()
 if bool(A.qemu) == bool(A.pin):
     sys.exit('exactly one of --qemu / --pin')
+
+#: x86_64 `syscall`.  This tool is x86_64 user mode by construction (see the
+#: module docstring), so the encoding is stated here rather than decoded.
+SYSCALL_ENC = '0f05'
 
 OUT = open(A.out, 'w') if A.out else sys.stdout
 
@@ -58,6 +83,8 @@ def q_stream(path, limit):
         if limit is not None and n >= limit:
             return
         j = json.loads(line)
+        if j['b'] == SYSCALL_ENC:
+            yield n, 'sc', 0, 0, 0
         for tag, ak, wk, vk in (('ld', 'la', 'lw', 'lv'),
                                 ('st', 'sa', 'sw', 'sv')):
             addrs = list(dict.fromkeys(j[ak]))
@@ -73,6 +100,8 @@ def p_stream(path, limit):
     P = pinmemlib.read_memop(path, nrec=limit)
     for n in range(len(P)):
         r = P[n]
+        if bytes(r['bytes'][:int(r['len'])]).hex() == SYSCALL_ENC:
+            yield n, 'sc', 0, 0, 0
         if r['n_ld'] > r['ld_rec'] or r['n_st'] > r['st_rec']:
             continue
         for tag, ek, sk, dk, gk, ck in (
@@ -86,32 +115,50 @@ def p_stream(path, limit):
 src = q_stream(A.qemu, A.limit) if A.qemu else p_stream(A.pin, A.limit)
 label = A.qemu or A.pin
 
-shadow = {}
+shadow = {}          # addr -> (byte, syscall epoch the byte was stored in)
+epoch = 0            # bumped by every syscall instruction in the stream
 st = collections.Counter()
 mism = collections.Counter()
 sample = {}
 LOAD_W_MAX = 64
 
 for n, tag, addr, w, val in src:
+    if tag == 'sc':
+        # Everything the shadow holds is now potentially stale: the kernel
+        # may have written any of it on this syscall's behalf, and no memop
+        # records that.  Bytes are not erased -- an older byte stays
+        # readable and is reported in its own bucket -- so the loss of
+        # coverage is counted rather than hidden.
+        epoch += 1
+        st['syscalls'] += 1
+        continue
     if w <= 0 or w > LOAD_W_MAX:
         st['skipped_width'] += 1
         continue
     if tag == 'st':
         st['stores'] += 1
         for k in range(w):
-            shadow[addr + k] = (val >> (8 * k)) & 0xff
+            shadow[addr + k] = ((val >> (8 * k)) & 0xff, epoch)
         continue
     st['loads'] += 1
     known = True
+    stale = False
     exp = 0
     for k in range(w):
         b = shadow.get(addr + k)
         if b is None:
             known = False
             break
-        exp |= b << (8 * k)
+        exp |= b[0] << (8 * k)
+        if b[1] < epoch:
+            stale = True
     if not known:
         st['loads_unchecked'] += 1
+        continue
+    if stale:
+        st['loads_unchecked_syscall'] += 1
+        if exp != val:
+            st['stale_would_have_violated'] += 1
         continue
     st['loads_checked'] += 1
     if exp == val:
@@ -125,8 +172,15 @@ for n, tag, addr, w, val in src:
 say("store-to-load self-consistency: %s" % label)
 say("  stores replayed          %10d" % st['stores'])
 say("  loads seen               %10d" % st['loads'])
+say("  syscalls seen            %10d" % st['syscalls'])
 say("  loads UNCHECKED          %10d   (bytes not written inside the window)"
     % st['loads_unchecked'])
+say("  loads UNCHECKED-SYSCALL  %10d   (bytes last written before the most "
+    "recent syscall; the kernel may have overwritten them and no memop "
+    "would record it)" % st['loads_unchecked_syscall'])
+say("    of those, value != shadow %7d   (NOT scored: excluded because the "
+    "shadow is stale, not because the tracer agreed)"
+    % st['stale_would_have_violated'])
 say("  loads CHECKED            %10d" % st['loads_checked'])
 say("  loads MATCHED            %10d" % st['loads_match'])
 say("  loads VIOLATED           %10d" % st['loads_mismatch'])

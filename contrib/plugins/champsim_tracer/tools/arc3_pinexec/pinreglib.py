@@ -173,7 +173,7 @@ def q_canon(ref):
     """champsim_tracer generic register ref -> shared vocabulary.
 
     From `champsim_tracer_mnemonics_x86.h`: GPR0..GPR13 = rax rcx rdx rbx
-    rsi rdi r8..r15, SP = rsp, FP_REG = rbp, IP = rip, FLAGS = eflags,
+    rsi rdi r8..r15, SP = rsp, FP_REG = rbp, PC = rip, FLAGS = eflags,
     VECn = xmm_n, PREDn = k_n, FPRn = st_n, SEG0..5 = cs ds es fs gs ss.
     Returns None for refs with no architectural meaning."""
     if not ref.startswith('%'):
@@ -191,6 +191,7 @@ def q_canon(ref):
         return 'k%s' % b[1:]
     if b.startswith('f') and b[1:].isdigit():
         return 'st%s' % b[1:]
-    return {'sp': 'rsp', 'fpr': 'rbp', 'ip': 'rip', 'flags': 'flags',
+    return {'sp': 'rsp', 'fpr': 'rbp', 'pc': 'rip', 'ip': 'rip',
+            'flags': 'flags',
             'mflags': None, 'zero': None, 'lr': None,
             'fcsr': 'mxcsr', 'vctrl': 'mxcsr'}.get(b, b)

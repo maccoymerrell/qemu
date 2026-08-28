@@ -703,8 +703,17 @@ def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd,
                         'has no row for this encoding, so no mechanism is '
                         'derived')
             bad, good = [], []
-            for reg, side in ([(classtok(r), 0) for r in sextra] +
-                              [(classtok(r), 1) for r in dextra]):
+            # SORTED, and that is not cosmetic.  sextra/dextra are SETS, so an
+            # unsorted walk builds the mechanism PROSE in whatever order the
+            # interpreter hands them over: the same measurement then writes two
+            # different `mechanism` strings across runs, and 58 x87 rows moved
+            # that column between two same-tip scorings of an identical table
+            # (exec31/statics).  The Mn token the taxonomy keys on is stable,
+            # so no verdict ever moved -- but a diff of two attrib.tsv files
+            # showed 58 spurious changes, which is exactly the noise a real
+            # change hides in.
+            for reg, side in (sorted((classtok(r), 0) for r in sextra) +
+                              sorted((classtok(r), 1) for r in dextra)):
                 axis = X87_AXIS_OF.get(reg, (None, None))[side]
                 if axis is None:
                     bad.append('%s/%s' % (reg, 'src' if side == 0 else 'dst'))

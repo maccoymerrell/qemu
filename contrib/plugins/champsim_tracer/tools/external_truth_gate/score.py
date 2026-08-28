@@ -95,11 +95,47 @@ def read_manifest(path):
 
 
 def newest_mtime(paths):
-    best = 0.0
+    best, which = 0.0, None
     for p in paths:
-        if os.path.exists(p):
-            best = max(best, os.path.getmtime(p))
-    return best
+        if os.path.exists(p) and os.path.getmtime(p) > best:
+            best, which = os.path.getmtime(p), p
+    return best, which
+
+
+# THE STALENESS REFERENCE IS THE WHOLE MEASURED SUBJECT, NOT JUST THE PLUGIN.
+#
+# It used to be the plugin .so and cst_decode alone, and that is a hole this
+# arc walked straight into.  Every execution leg -- gem5, Spike, PIN -- runs a
+# QEMU EMULATOR beside the plugin, and the dataflow facts those legs score are
+# produced by the emulator: the translator states them and the plugin only
+# carries them.  #288's fix (9070200114) lived entirely in
+# accel/tcg/insn-dataflow.c and target/i386/tcg/translate.c and touched
+# neither of the two files this guard used to watch, so a report taken BEFORE
+# that fix would have been called fresh AFTER it.  It was caught only because
+# an unrelated relink happened to move cst_decode's mtime in between.
+#
+# So the reference is the newest of the plugin, the offline decoder and every
+# emulator present in the build directory, and the file that set it is named
+# in the header so the reader can see which one the reports are being held
+# against.
+def newest_binary(build_dir):
+    paths = [
+        os.path.join(build_dir, 'contrib/plugins/libchampsim_tracer.so'),
+        os.path.join(build_dir, 'contrib/plugins/cst_decode'),
+    ]
+    # WHICH `qemu-*` FILES ARE EMULATORS IS ASKED OF THE BUILD, NOT OF A LIST.
+    # `qemu-img`, `qemu-nbd` and `qemu-bridge-helper` all match any name
+    # pattern one would write, and a hand-maintained exclusion list would go
+    # stale silently.  Meson emits one `<target>_tls_guard.ok` stamp per
+    # EMULATOR and for nothing else -- 62 of them in this build against 208
+    # `qemu-*` entries -- so the stamp is the discriminator.
+    for name in sorted(os.listdir(build_dir)):
+        if not name.endswith('_tls_guard.ok'):
+            continue
+        emu = os.path.join(build_dir, name[:-len('_tls_guard.ok')])
+        if os.path.isfile(emu) and os.access(emu, os.X_OK):
+            paths.append(emu)
+    return newest_mtime(paths)
 
 
 def score_one(row, root, binary_mtime):
@@ -199,10 +235,7 @@ def main():
 
     binary_mtime = 0.0
     if a.build_dir:
-        binary_mtime = newest_mtime([
-            os.path.join(a.build_dir, 'contrib/plugins/libchampsim_tracer.so'),
-            os.path.join(a.build_dir, 'contrib/plugins/cst_decode'),
-        ])
+        binary_mtime, ref_path = newest_binary(a.build_dir)
         if not binary_mtime:
             sys.exit('BUILD DIRECTORY HAS NO TRACER BINARIES: %s.  The '
                      'staleness guard cannot run, so it may not be skipped.'
@@ -211,7 +244,11 @@ def main():
     print('R13 EXTERNAL-TRUTH GATE')
     print('evidence root : %s' % a.root)
     print('manifest      : %s' % a.manifest)
-    print('staleness ref : %s' % (a.build_dir or 'NOT CHECKED (no --build-dir)'))
+    if a.build_dir:
+        print('staleness ref : %s' % a.build_dir)
+        print('  newest binary : %s' % ref_path)
+    else:
+        print('staleness ref : NOT CHECKED (no --build-dir)')
     print('')
     print('%-8s %-8s %9s %9s %9s  %s'
           % ('leg', 'isa', 'headline', 'ceiling', 'scored', 'verdict'))

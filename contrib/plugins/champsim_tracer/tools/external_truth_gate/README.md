@@ -9,14 +9,17 @@ rather than against the tracer's own instruments.
 
 ## What it reads
 
-Twelve legs, one row each in `ADJUDICATED.tsv`:
+Thirteen legs, one row each in `ADJUDICATED.tsv`.  The count is a fact
+about the manifest, not a round number: the `gem5wp` family gained its
+`x86_64` row when that leg was built, and this file said "twelve" for a
+day afterwards.  If the two ever disagree again, the manifest is right.
 
 | leg | what it is |
 | --- | --- |
 | `isax` | the eight-arm boundary/fields gate, Capstone as an EXTERNAL reference against LLVM MC, four ISAs |
 | `static` × 4 | the whole-opcode-space register-attribution sweep — XED, iced-x86, LLVM MC, Arm MRA, Sail, binutils `mips-opc` — read off the four-ISA cross-tabulation |
 | `gem5cp` × 2 | gem5 correct-path execution, aarch64 and mipsel: destination sets and VALUES, memop count / address / width, store and load data |
-| `gem5wp` × 2 | gem5 wrong-path: every excursion rebuilt from the trace alone and re-executed |
+| `gem5wp` × 3 | gem5 wrong-path, aarch64 / x86_64 / mipsel: every excursion rebuilt from the trace alone and re-executed |
 | `spikecp` | Spike correct-path execution, riscv64, including CSR sets and values |
 | `spikewp` | Spike wrong-path, riscv64 |
 | `pin` | PIN correct-path execution, x86_64: register sets, register VALUES, memop count / address / width / data |
@@ -35,8 +38,12 @@ agreement rate. The gate fails when
   adjudicated row by row;
 * the leg's scored population is below its floor — a leg that compared
   almost nothing reports few disagreements for the wrong reason;
-* a report is older than the tracer binaries it claims to have measured
+* a report is older than the binaries it claims to have measured
   (`--build-dir`) — a green taken against a previous build is not a green.
+  The reference is the newest of the plugin, `cst_decode` **and every
+  emulator in the build directory**: an execution leg's facts are produced
+  by the translator, so a QEMU-side fix with no plugin change would
+  otherwise leave every execution report looking fresh.
 
 ## What it does not do
 

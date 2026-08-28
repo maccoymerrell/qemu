@@ -508,6 +508,15 @@ struct QDepInsn {
     uint8_t imm_stated;
     uint8_t imm_reached;
     /*
+     * @imm_non_dataflow: a decoder said one of this instruction's encoded
+     * fields is a field the ARCHITECTURE does not define as a dataflow
+     * operand -- MIPS' trap and break codes.  It is the third fact the
+     * other two cannot express: without it a register-only destination on
+     * such an instruction is indistinguishable from one whose immediate the
+     * emulator folded away, and those want opposite answers (#252).
+     */
+    uint8_t imm_non_dataflow;
+    /*
      * @writes_unbounded: QEMU wrote a register through a helper whose INDEX
      * the source does not state -- aarch64 MOPS `cpyfe`/`sete`, whose
      * destination is `env->xregs[mops_destreg(syndrome)]`.  749579ea65 made

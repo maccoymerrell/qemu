@@ -307,8 +307,20 @@ typedef struct DfDiscardNote {
  * instruction whose op range reached it, exactly as DfZeroNote's does.
  */
 typedef struct DfImmNote {
+    /*
+     * The temp the emitter materialised the field into, or NULL for the
+     * VALUE-STATING form -- the field that never becomes a temp at all.
+     * See insn_dataflow_note_encoded_imm_value() in the header.
+     */
     const void *ts;
     const TCGOp *anchor;
+    /*
+     * Value form only.  @role is one of INSN_DF_IMM_ROLE_*, and 0 on a
+     * temp-form note, whose role the temp itself already carries: it is an
+     * operand, because an emitter materialised it to be read.
+     */
+    uint64_t value;
+    uint8_t role;
 } DfImmNote;
 
 /*
@@ -1701,7 +1713,37 @@ static bool df_imm_temp(const void *tsv, unsigned lo, unsigned hi)
         hi = df_n_imm;
     }
     for (unsigned k = lo; k < hi; k++) {
-        if (df_imm[k].ts == tsv) {
+        /*
+         * A VALUE-form note has no temp, and NULL is a temp pointer nobody
+         * passes -- but the test is written on ts rather than on the role so
+         * that a future note shape cannot accidentally match here.
+         */
+        if (df_imm[k].ts != NULL && df_imm[k].ts == tsv) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Does an OPERAND-role value note anchor to @op?
+ *
+ * The scan starts at the block cursor, which is where it must: at the point
+ * @op is being walked the cursor has already moved past every note anchored
+ * at an EARLIER op (the advance at the top of the op loop), so the notes
+ * anchored at @op -- taken by the emitter immediately after it emitted @op
+ * -- are the contiguous run beginning there.  Nothing before the cursor can
+ * match, and the loop stops at the first note with a different anchor, so
+ * this is a constant number of comparisons per op rather than a scan.
+ */
+static bool df_imm_operand_at(const TCGOp *op, unsigned cursor)
+{
+    for (unsigned k = cursor; k < df_n_imm; k++) {
+        if (df_imm[k].anchor != op) {
+            return false;
+        }
+        if (df_imm[k].ts == NULL &&
+            df_imm[k].role == INSN_DF_IMM_ROLE_OPERAND) {
             return true;
         }
     }
@@ -2861,6 +2903,24 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         }
 
         /*
+         * THE INSTRUCTION'S OWN ENCODED FIELD, stated BY VALUE because no
+         * temp ever carried it.  `tcg_gen_extract_i64(rd, rn, pos, len)`
+         * puts the bitfield position and length in op->args, where the
+         * argument walk above cannot see them and where there is nothing to
+         * hang a provenance on -- so the decoder said so at the op, and the
+         * bit goes into the op's provenance exactly where the temp form's
+         * would have gone.  See insn_dataflow_note_encoded_imm_value().
+         *
+         * Placed before the load rule below so that rule still wins: a value
+         * that came out of memory came out of memory, whatever arithmetic
+         * the address took.
+         */
+        if (df_imm_operand_at(op, *imm_cursor)) {
+            df_bit(prov, INSN_DF_IMM_PROV_BIT);
+            d->imm_reached = 1;
+        }
+
+        /*
          * What a load returned did not come from the registers that computed
          * its address -- it came from memory, and the address is a separate
          * dependency with a separate latency.  The op cannot say so (its
@@ -2984,6 +3044,26 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      */
     if (*imm_cursor > imm_lo) {
         d->imm_stated = 1;
+    }
+    /*
+     * And whether one of the fields it spoke about is a field the
+     * ARCHITECTURE does not define as a dataflow operand -- MIPS' trap and
+     * break codes.  Scoped to this instruction's own notes for the reason
+     * every note here is: a block of `teq` must not let the first one's
+     * statement answer for the rest.
+     *
+     * A separate flag rather than a third state of the two above, because it
+     * is a third FACT: stated-and-folded and stated-and-not-an-operand are
+     * opposite claims about the same absent bit, and collapsing them would
+     * put the emulator's optimisation and the machine's own definition under
+     * one word again -- which is the mistake @imm_reached exists to undo.
+     */
+    for (unsigned i = imm_lo; i < *imm_cursor; i++) {
+        if (df_imm[i].ts == NULL &&
+            df_imm[i].role == INSN_DF_IMM_ROLE_NON_DATAFLOW) {
+            d->imm_non_dataflow = 1;
+            break;
+        }
     }
     df_settle_memop_prov(d, tlo, thi);
 }
@@ -3433,6 +3513,64 @@ void insn_dataflow_note_encoded_imm(const void *ts)
     }
     df_imm[df_n_imm].ts = ts;
     df_imm[df_n_imm].anchor = anchor;
+    df_imm[df_n_imm].value = 0;
+    df_imm[df_n_imm].role = 0;
+    df_n_imm++;
+}
+
+/*
+ * CP-M, the encoded-immediate half -- the VALUE-STATING form (#252).  See
+ * insn_dataflow_note_encoded_imm_value() in the header for what the two
+ * roles mean and why the anchor means something different for each.
+ *
+ * Same list, same cap and same overflow behaviour as the temp form, because
+ * it answers the same question about the same field and a consumer reading
+ * @imm_stated must not be able to tell which call said it.
+ *
+ * The dedup key is the whole note -- (anchor, role, value) -- and it is a
+ * FULL scan of this translation's notes rather than the temp form's
+ * look-at-the-last-one.  An OPERAND emitter states one field per op it
+ * anchors to and so can never collide; a NON_DATAFLOW emitter states its
+ * field once and its anchor is whatever op happened to be last, which on
+ * `teq rs,rt,code` with rs == rt is the PREVIOUS instruction's op -- the
+ * degenerate always-trap path emits nothing before the note.  Scoping keeps
+ * that note out of this instruction (it is consumed at the boundary, so it
+ * never enters the window), and the full-scan dedup keeps a repeated
+ * statement from consuming the cap.
+ */
+void insn_dataflow_note_encoded_imm_value(uint64_t value, unsigned role)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (role != INSN_DF_IMM_ROLE_OPERAND &&
+        role != INSN_DF_IMM_ROLE_NON_DATAFLOW) {
+        /*
+         * A role this file does not know is a caller that has not been
+         * updated, and inventing a meaning for it is how a fabricated fact
+         * gets onto the wire.  Dropped, and the instruction reports
+         * imm_stated = 0, which is the state every consumer refuses on.
+         */
+        return;
+    }
+    df_bind();
+    if (df_n_imm >= DF_MAX_IMM_NOTES) {
+        df_imm_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = 0; i < df_n_imm; i++) {
+        if (df_imm[i].ts == NULL && df_imm[i].anchor == anchor &&
+            df_imm[i].role == role && df_imm[i].value == value) {
+            return;
+        }
+    }
+    df_imm[df_n_imm].ts = NULL;
+    df_imm[df_n_imm].anchor = anchor;
+    df_imm[df_n_imm].value = value;
+    df_imm[df_n_imm].role = (uint8_t)role;
     df_n_imm++;
 }
 

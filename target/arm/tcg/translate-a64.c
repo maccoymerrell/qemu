@@ -4924,6 +4924,17 @@ static bool trans_MOVK(DisasContext *s, arg_movw *a)
     if (!a->sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  MOVK's hw field selects which 16-bit lane the immediate lands in.
+     * The encoding's insert position reaches the lowering as an OP ARGUMENT of
+     * tcg_gen_deposit_i64(), so no temp carries it and the dataflow walk's
+     * argument scan cannot see it -- while the destination's value depends
+     * on it exactly as it depends on Rn.  The note takes the OPERAND role
+     * and anchors to the op just emitted, which is the one that consumed
+     * it.  See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)pos,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -4968,6 +4979,19 @@ static bool trans_SBFM(DisasContext *s, arg_SBFM *a)
          */
         tcg_gen_deposit_z_i64(tcg_rd, tcg_tmp, pos, len);
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  SBFM's immr/imms are the bitfield's rotate and width, and every
+     * alias the assembler spells from them -- asr, sbfx, sbfiz -- is this
+     * one encoding.
+     * The encoding's extracted position and length reaches the lowering as an OP ARGUMENT of
+     * tcg_gen_sextract_i64/deposit_z_i64(), so no temp carries it and the dataflow walk's
+     * argument scan cannot see it -- while the destination's value depends
+     * on it exactly as it depends on Rn.  The note takes the OPERAND role
+     * and anchors to the op just emitted, which is the one that consumed
+     * it.  See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value(((uint64_t)a->immr << 32) | a->imms,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -4993,6 +5017,19 @@ static bool trans_UBFM(DisasContext *s, arg_UBFM *a)
         pos = (bitsize - ri) & (bitsize - 1);
         tcg_gen_deposit_z_i64(tcg_rd, tcg_tmp, pos, len);
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  UBFM's immr/imms are the bitfield's rotate and width, and the
+     * aliases the assembler spells from them -- lsl, lsr, ubfx, ubfiz --
+     * are this one encoding.
+     * The encoding's extracted position and length reaches the lowering as an OP ARGUMENT of
+     * tcg_gen_extract_i64/deposit_z_i64(), so no temp carries it and the dataflow walk's
+     * argument scan cannot see it -- while the destination's value depends
+     * on it exactly as it depends on Rn.  The note takes the OPERAND role
+     * and anchors to the op just emitted, which is the one that consumed
+     * it.  See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value(((uint64_t)a->immr << 32) | a->imms,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -5023,6 +5060,18 @@ static bool trans_BFM(DisasContext *s, arg_BFM *a)
     if (!a->sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  BFM's immr/imms are the inserted field's rotate and width; bfi and
+     * bfxil are aliases of this encoding.
+     * The encoding's insert position and length reaches the lowering as an OP ARGUMENT of
+     * tcg_gen_deposit_i64(), so no temp carries it and the dataflow walk's
+     * argument scan cannot see it -- while the destination's value depends
+     * on it exactly as it depends on Rn.  The note takes the OPERAND role
+     * and anchors to the op just emitted, which is the one that consumed
+     * it.  See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value(((uint64_t)a->immr << 32) | a->imms,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -5063,6 +5112,18 @@ static bool trans_EXTR(DisasContext *s, arg_extract *a)
             tcg_gen_extu_i32_i64(tcg_rd, t0);
         }
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  EXTR's lsb field is where the double-width extraction starts; ror
+     * is the alias with Rn == Rm.
+     * The encoding's extraction position reaches the lowering as an OP ARGUMENT of
+     * tcg_gen_extract2_i64/rotri_i32(), so no temp carries it and the dataflow walk's
+     * argument scan cannot see it -- while the destination's value depends
+     * on it exactly as it depends on Rn.  The note takes the OPERAND role
+     * and anchors to the op just emitted, which is the one that consumed
+     * it.  See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)a->imm,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -7235,6 +7296,13 @@ static bool trans_EXT_d(DisasContext *s, arg_EXT_d *a)
             tcg_gen_extract2_i64(lo, lo, hi, a->imm * 8);
         }
         write_fp_dreg(s, a->rd, lo);
+        /*
+         * CP-M, the encoded-immediate half, VALUE-STATING form -- SIMD EXT's
+         * element index, handed to tcg_gen_extract2_i64() as an OP ARGUMENT.
+         * OPERAND role; see insn_dataflow_note_encoded_imm_value().
+         */
+        insn_dataflow_note_encoded_imm_value((uint64_t)a->imm,
+                                             INSN_DF_IMM_ROLE_OPERAND);
     }
     return true;
 }
@@ -7267,6 +7335,13 @@ static bool trans_EXT_q(DisasContext *s, arg_EXT_q *a)
     write_vec_element(s, lo, a->rd, 0, MO_64);
     write_vec_element(s, hi, a->rd, 1, MO_64);
     clear_vec_high(s, true, a->rd);
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form -- SIMD EXT's
+     * element index, handed to tcg_gen_extract2_i64() as an OP ARGUMENT.
+     * OPERAND role; see insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)a->imm,
+                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -7614,6 +7689,16 @@ static bool trans_Vimm(DisasContext *s, arg_Vimm *a)
     if (fp_access_check(s)) {
         uint64_t imm = asimd_imm_const(a->abcdefgh, a->cmode, a->op);
         gen_gvec_fn2i(s, a->q, a->rd, a->rd, imm, fn, MO_64);
+        /*
+         * CP-M, the encoded-immediate half, VALUE-STATING form.  The abcdefgh/cmode fields ARE the value movi, orr
+         * and bic put into the vector register.
+         * It reaches the lowering as an OP ARGUMENT, so no temp carries it
+         * and the dataflow walk's argument scan cannot see it, while the
+         * destination's value depends on it.  OPERAND role, anchored to the
+         * op just emitted.  See insn_dataflow_note_encoded_imm_value().
+         */
+        insn_dataflow_note_encoded_imm_value(imm,
+                                             INSN_DF_IMM_ROLE_OPERAND);
     }
     return true;
 }
@@ -7626,6 +7711,15 @@ static bool do_vec_shift_imm(DisasContext *s, arg_qrri_e *a, GVecGen2iFn *fn)
 {
     if (fp_access_check(s)) {
         gen_gvec_fn2i(s, a->q, a->rd, a->rn, a->imm, fn, a->esz);
+        /*
+         * CP-M, the encoded-immediate half, VALUE-STATING form.  The vector shift-by-immediate family's count.
+         * It reaches the lowering as an OP ARGUMENT, so no temp carries it
+         * and the dataflow walk's argument scan cannot see it, while the
+         * destination's value depends on it.  OPERAND role, anchored to the
+         * op just emitted.  See insn_dataflow_note_encoded_imm_value().
+         */
+        insn_dataflow_note_encoded_imm_value((uint64_t)a->imm,
+                                             INSN_DF_IMM_ROLE_OPERAND);
     }
     return true;
 }
@@ -7819,6 +7913,14 @@ static bool do_vec_shift_imm_narrow(DisasContext *s, arg_qrri_e *a,
 
     write_vec_element(s, tcg_rd, a->rd, a->q, MO_64);
     clear_vec_high(s, a->q, a->rd);
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form -- the narrowing
+     * shift family's count, handed to the per-element shift function as a
+     * plain C argument that becomes an OP ARGUMENT.  OPERAND role; see
+     * insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)a->imm,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 
@@ -8770,6 +8872,13 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
     /* Load the arguments for the new comparison.  */
     if (a->imm) {
         tcg_y = tcg_constant_i64(a->y);
+        /*
+         * CP-M, the encoded-immediate half.  CCMP's immediate form compares
+         * Rn against the encoding's imm5, and this is the temp the
+         * comparison below reads it from.  Capture only; no op is emitted,
+         * altered or suppressed.  See insn_dataflow_note_encoded_imm().
+         */
+        insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_y));
     } else {
         tcg_y = cpu_reg(s, a->y);
     }
@@ -8802,6 +8911,18 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
             tcg_gen_and_i32(cpu_NF, cpu_NF, tcg_t2);
         }
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  CCMP's #nzcv
+     * field IS what the flags become when the condition is false, and the
+     * lowering spends it at translation time -- each bit picks `or` or
+     * `andc` for its flag -- so no temp and no op argument carries it and
+     * the walk has nothing to see.  One note per flag, anchored at that
+     * flag's own op, because that is where the encoding's contribution
+     * lands: bit N of #nzcv decides flag N and nothing else.
+     * See insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)nzcv,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     if (nzcv & 4) { /* Z */
         if (has_andc) {
             tcg_gen_andc_i32(cpu_ZF, cpu_ZF, tcg_t1);
@@ -8811,6 +8932,9 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
     } else {
         tcg_gen_or_i32(cpu_ZF, cpu_ZF, tcg_t0);
     }
+    /* The same statement for this flag; see the note above the N block. */
+    insn_dataflow_note_encoded_imm_value((uint64_t)nzcv,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     if (nzcv & 2) { /* C */
         tcg_gen_or_i32(cpu_CF, cpu_CF, tcg_t0);
     } else {
@@ -8820,6 +8944,9 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
             tcg_gen_and_i32(cpu_CF, cpu_CF, tcg_t2);
         }
     }
+    /* The same statement for this flag; see the note above the N block. */
+    insn_dataflow_note_encoded_imm_value((uint64_t)nzcv,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     if (nzcv & 1) { /* V */
         tcg_gen_or_i32(cpu_VF, cpu_VF, tcg_t1);
     } else {
@@ -8829,6 +8956,9 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
             tcg_gen_and_i32(cpu_VF, cpu_VF, tcg_t2);
         }
     }
+    /* The same statement for this flag; see the note above the N block. */
+    insn_dataflow_note_encoded_imm_value((uint64_t)nzcv,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     return true;
 }
 

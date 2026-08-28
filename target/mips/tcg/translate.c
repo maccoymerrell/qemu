@@ -1419,6 +1419,16 @@ void generate_exception_end(DisasContext *ctx, int excp)
 
 void generate_exception_break(DisasContext *ctx, int code)
 {
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form -- `break`'s
+     * 20-bit code, the sibling of the trap code stated in gen_trap().  The
+     * architecture leaves it entirely to software: the breakpoint exception
+     * it raises has its Cause.ExcCode fixed by the opcode, and no state the
+     * instruction writes depends on the field.  See
+     * insn_dataflow_note_encoded_imm_value().
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)(uint32_t)code,
+                                         INSN_DF_IMM_ROLE_NON_DATAFLOW);
 #ifdef CONFIG_USER_ONLY
     /* Pass the break code along to cpu_loop. */
     tcg_gen_st_i32(tcg_constant_i32(code), tcg_env,
@@ -5245,6 +5255,28 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
     case OPC_TLT:
     case OPC_TLTU:
     case OPC_TNE:
+        /*
+         * CP-M, the encoded-immediate half, VALUE-STATING form.  The
+         * register-form traps carry a 10-bit CODE field, and MIPS defines it
+         * as a value for software to read back out of the instruction word:
+         * the exception the trap raises has its Cause.ExcCode fixed by the
+         * OPCODE, so nothing the instruction writes depends on the code.  It
+         * is an encoded field that is not a dataflow operand, which is a
+         * fact only a decoder can state -- the op list cannot distinguish it
+         * from an immediate the emulator folded away, and those two want
+         * opposite answers.  See insn_dataflow_note_encoded_imm_value().
+         *
+         * The register-form cases only: the Txx-immediate forms below have
+         * no code field at all (their caller passes 0), and stating a field
+         * the encoding does not carry would be a fabrication.
+         *
+         * The user-mode store of @code into CPUMIPSState::error_code a few
+         * lines down is QEMU's own path for handing the code to cpu_loop,
+         * not an architectural read -- error_code is already on file as an
+         * emulation artefact.
+         */
+        insn_dataflow_note_encoded_imm_value((uint64_t)(uint32_t)code,
+                                             INSN_DF_IMM_ROLE_NON_DATAFLOW);
         mips_ident(ctx,
             opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
             opc == OPC_TGE ? MIPS_ID_OPC_TGE :
@@ -5902,6 +5934,21 @@ fail:
         gen_reserved_instruction(ctx);
         return;
     }
+    /*
+     * CP-M, the encoded-immediate half, VALUE-STATING form.  `ext`/`ins` and
+     * their 64-bit siblings encode the field POSITION and SIZE, and the
+     * lowering hands them to tcg_gen_extract_tl()/tcg_gen_deposit_tl() as OP
+     * ARGUMENTS -- there is no temp for the temp-stating form to name, and
+     * the argument walk cannot see them.  The result depends on them exactly
+     * as it depends on rs, so the note goes in with the OPERAND role and its
+     * anchor is the op just emitted, which is the one that consumed them.
+     *
+     * @lsb alone is stated: it and @msb are two halves of one encoded
+     * position-and-extent operand and the wire carries a single immediate
+     * slot, so a second note would say the same thing twice.
+     */
+    insn_dataflow_note_encoded_imm_value((uint64_t)(uint32_t)lsb,
+                                         INSN_DF_IMM_ROLE_OPERAND);
     gen_store_gpr(t0, rt);
 }
 

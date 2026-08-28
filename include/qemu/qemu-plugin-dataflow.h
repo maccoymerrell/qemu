@@ -635,6 +635,30 @@ typedef struct qemu_plugin_dataflow_status {
      */
     uint8_t  imm_stated;
     uint8_t  imm_reached;
+    /*
+     * THE THIRD FACT, and the one the two above cannot express.
+     *
+     * @imm_non_dataflow: a decoder said one of this instruction's encoded
+     * fields is a field the ARCHITECTURE does not define as a dataflow
+     * operand.  MIPS' `teq rs,rt,code` and `break code` are the class: the
+     * exception they raise has its cause fixed by the OPCODE and the code
+     * is left in the instruction word for software to read, so nothing the
+     * instruction writes depends on it and QEMU is right never to
+     * materialise it.
+     *
+     * Without this, such an instruction is indistinguishable from one whose
+     * immediate the emulator FOLDED away -- stated, never reached -- and
+     * those want opposite answers: a fold is an emulator optimisation a
+     * consumer must not publish as the machine's, while this is the
+     * machine's own definition and licenses reading a register-only
+     * destination mask as COMPLETE.
+     *
+     * Instruction granularity, the same as the two flags above: an
+     * instruction with two encoded fields, one a dataflow operand and one
+     * not, sets both and a consumer cannot ask which field the answer is
+     * about.
+     */
+    uint8_t  imm_non_dataflow;
 } qemu_plugin_dataflow_status;
 
 /*

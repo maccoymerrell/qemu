@@ -653,6 +653,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.helper_writes_unbounded = d->helper_writes_unbounded;
     st.imm_stated = d->imm_stated;
     st.imm_reached = d->imm_reached;
+    st.imm_non_dataflow = d->imm_non_dataflow;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

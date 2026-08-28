@@ -394,6 +394,37 @@ typedef struct InsnDataflow {
     uint8_t  imm_reached;
 
     /*
+     * A decoder stated that one of this instruction's encoded fields is a
+     * field THE ARCHITECTURE DOES NOT DEFINE AS A DATAFLOW OPERAND -- see
+     * insn_dataflow_note_encoded_imm_value() and its NON_DATAFLOW role.
+     *
+     * It answers the one question @imm_stated and @imm_reached together
+     * cannot.  MIPS' `teq rs,rt,code` and `break code` carry a software-
+     * defined trap code that the architecture never feeds to anything: the
+     * exception state the instruction writes is decided by the OPCODE, and
+     * QEMU is right never to materialise the field.  Read through the other
+     * two flags that instruction is indistinguishable from one whose
+     * immediate the emulator FOLDED away -- stated, never reached -- and the
+     * fold is an emulator optimisation R7.3 forbids publishing.  They are
+     * opposite facts: one says the encoding's contribution was optimised out
+     * of the op stream, the other says the architecture never gave it one.
+     *
+     * Its presence licenses reading a register-only destination mask as
+     * COMPLETE.  Its absence licenses nothing, exactly as @imm_stated's
+     * absence does: a decoder that has not been reached yet reports 0 and
+     * every consumer keeps refusing.
+     *
+     * GRANULARITY, stated so it cannot be over-read: this is a fact about
+     * the INSTRUCTION, the same granularity @imm_stated and @imm_reached
+     * already run under.  An instruction carrying two encoded fields, one a
+     * dataflow operand and one not, reports both flags and a consumer cannot
+     * ask which field the answer is about.  No ISA in the corpus has one;
+     * when one appears the note carries the VALUE that distinguishes them
+     * and this becomes a count.
+     */
+    uint8_t  imm_non_dataflow;
+
+    /*
      * How many reads this instruction folded onto a REPRESENTATION CARRIER's
      * register.  See insn_dataflow_note_repr_carrier().  Saturating, and
      * present so the rule's zero is a measurement rather than an assumption:
@@ -455,6 +486,36 @@ typedef struct InsnDataflow {
  * saying so.
  */
 #define INSN_DF_HELPER_OPAQUE   2
+
+/*
+ * The ROLE a decoder gives an encoded field it states BY VALUE.
+ *
+ * insn_dataflow_note_encoded_imm() names a TEMP, which is the whole of what
+ * it can say: the emitter materialised the encoding into a temp and the
+ * dataflow walk follows the temp.  A field that never becomes a temp is
+ * outside its reach entirely, and there are two disjoint reasons a field
+ * never becomes one.  They need opposite answers, so the note that states
+ * them carries which.
+ */
+enum {
+    /*
+     * The value IS an operand of the computation -- it just travels as an
+     * ARGUMENT OF AN OP rather than through a temp.  A bitfield extract's
+     * position and length, a shift-by-immediate's count, a MOVK's insert
+     * position: `tcg_gen_extract_i64(rd, rn, pos, len)` puts pos and len in
+     * op->args, where no temp exists to carry a provenance bit, and the
+     * destination's value depends on them exactly as it depends on rn.
+     */
+    INSN_DF_IMM_ROLE_OPERAND = 1,
+    /*
+     * The architecture defines the field as NOT a dataflow operand, and
+     * QEMU is right never to read it.  MIPS' trap and break codes are the
+     * class: `teq rs,rt,code` raises with Cause.ExcCode fixed by the opcode
+     * and the code left for software to read out of the instruction word,
+     * so nothing the instruction writes depends on it.
+     */
+    INSN_DF_IMM_ROLE_NON_DATAFLOW = 2,
+};
 
 #ifdef CONFIG_PLUGIN
 
@@ -853,6 +914,56 @@ void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts);
  */
 void insn_dataflow_note_encoded_imm(const void *ts);
 
+
+/*
+ * CP-M, the encoded-immediate half -- the VALUE-STATING form.
+ *
+ * WHAT IT IS FOR.  The temp-stating form above can only speak about fields
+ * the emitter materialised.  Two populations it cannot reach were measured
+ * and filed rather than guessed at (#252): 39 aarch64/mipsel bitfield and
+ * shift rows whose immediate is an op ARGUMENT, and the mipsel trap/break
+ * rows whose code QEMU correctly never touches.  Both arrive at a consumer
+ * as "no decoder on this path states this instruction's immediate", which
+ * is a coverage hole -- and a coverage hole is not an answer, so both
+ * refuse.  This states the fact the temp form has no temp for.
+ *
+ * @value is the field as the decoder extracted it and @role is what the
+ * architecture makes of it.  The value is recorded rather than dropped
+ * because it is what makes this a statement about a FIELD: a note carrying
+ * only a role would be an assertion about the instruction that nothing
+ * could later separate into its fields, which is the granularity trap
+ * @imm_non_dataflow's own comment names.
+ *
+ * WHERE IT IS STATED, and why nowhere else.  At the decoder, in the
+ * function that has the field in hand: MIPS' gen_trap() and its break
+ * sibling, gen_bitops(), AArch64's trans_SBFM/UBFM/BFM/MOVK/EXTR.  Those
+ * are the places where "this is the instruction's field, and this is what
+ * the ISA says it does" is a FACT.  One level down it is not -- an op
+ * argument is an integer and says nothing about an encoding.
+ *
+ * THE ANCHOR, and it means something DIFFERENT for the two roles, which is
+ * why they are one call and not two.
+ *
+ * An OPERAND note is taken AFTER the op that takes the value as an
+ * argument has been emitted, so its anchor IS that op, and the walk gives
+ * the immediate's provenance bit to that op's result -- the same place the
+ * temp form's bit would have landed had a temp existed.  (The temp form is
+ * stated BEFORE its op for the mirror-image reason: its anchor has to be
+ * the op the consuming op FOLLOWS, so the note is resolvable when the
+ * consuming op is walked.)
+ *
+ * A NON_DATAFLOW note has no consuming op by construction, so its anchor
+ * only says WHICH INSTRUCTION spoke -- the same scoping every note here
+ * runs under, and the reason a block full of `teq` does not let one
+ * instruction's statement answer for the next one's.
+ *
+ * Capture only; no op is emitted, altered or suppressed, and a target that
+ * never calls this is unaffected -- its instructions report
+ * imm_non_dataflow = 0 and every consumer keeps refusing rather than
+ * reading the absence as an answer.
+ */
+void insn_dataflow_note_encoded_imm_value(uint64_t value, unsigned role);
+
 /*
  * CP-M, the PRESERVE-READ half -- the read a WRITEBACK performs to carry the
  * bits it is not writing.
@@ -1236,6 +1347,10 @@ static inline void insn_dataflow_note_folded_reg(const void *ts,
 { }
 
 static inline void insn_dataflow_note_encoded_imm(const void *ts)
+{
+}
+static inline void insn_dataflow_note_encoded_imm_value(uint64_t value,
+                                                        unsigned role)
 {
 }
 static inline void insn_dataflow_note_discarded_write(const void *ts,

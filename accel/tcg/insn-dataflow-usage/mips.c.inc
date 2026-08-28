@@ -76,7 +76,26 @@
  *     destinations of the raising instruction -- R2 and J2.3, the same
  *     discriminator R10.1 applies to the block-final pc write. The set
  *     below is therefore what the source states AND the vocabulary can
- *     name, and nothing else.
+ *     name, and nothing else. DIRECTION CORRECTED 2026-08-27: both fields
+ *     are 3 (READ-MODIFY-WRITE), not 2 (write). The citations above were
+ *     always read-modify-writes and the row understated them. CP0_Status is
+ *     READ twice before it is written -- `if (!(env->CP0_Status & (1 <<
+ *     CP0St_EXL)))` is the gate on the whole set_EPC body (:1418) and
+ *     Status.BEV selects the vector (:1445/:1449) -- and the write is
+ *     `env->CP0_Status |= 1 << CP0St_EXL` (:1432), which reads it a third
+ *     time. CP0_Cause is read by every one of its three writes: the BD bit
+ *     is a qatomic_or/qatomic_and (:1428/:1430) and the exception code goes
+ *     through mips_cause_set_field (:1456), a cmpxchg loop over the whole
+ *     word (../target/mips/internal.h:172). R7 is the reason this matters
+ *     rather than being a pedantic label: a read-modify-write MAKES THE OLD
+ *     VALUE A SOURCE, so the destination's provenance names REG_SYSEXC
+ *     instead of being empty -- and an empty provenance on a published
+ *     destination is what dst_precheck() refuses, taking the whole
+ *     destination family of the raising instruction with it. Measured on
+ *     `neg` (a TRAPPING `sub`, whose other destination is an ordinary GPR):
+ *     with dir=2 the refusal deleted that GPR's published mask and the
+ *     instruction's whole dep block. Stating the read that the source
+ *     performs is both the true fact and the fix.
  *   raise_exception_err:
  *     MERGED with the row the mechanical reader DID derive for this helper,
  *     whose fields (error_code) keep their derived citations above; the
@@ -109,7 +128,26 @@
  *     destinations of the raising instruction -- R2 and J2.3, the same
  *     discriminator R10.1 applies to the block-final pc write. The set
  *     below is therefore what the source states AND the vocabulary can
- *     name, and nothing else.
+ *     name, and nothing else. DIRECTION CORRECTED 2026-08-27: both fields
+ *     are 3 (READ-MODIFY-WRITE), not 2 (write). The citations above were
+ *     always read-modify-writes and the row understated them. CP0_Status is
+ *     READ twice before it is written -- `if (!(env->CP0_Status & (1 <<
+ *     CP0St_EXL)))` is the gate on the whole set_EPC body (:1418) and
+ *     Status.BEV selects the vector (:1445/:1449) -- and the write is
+ *     `env->CP0_Status |= 1 << CP0St_EXL` (:1432), which reads it a third
+ *     time. CP0_Cause is read by every one of its three writes: the BD bit
+ *     is a qatomic_or/qatomic_and (:1428/:1430) and the exception code goes
+ *     through mips_cause_set_field (:1456), a cmpxchg loop over the whole
+ *     word (../target/mips/internal.h:172). R7 is the reason this matters
+ *     rather than being a pedantic label: a read-modify-write MAKES THE OLD
+ *     VALUE A SOURCE, so the destination's provenance names REG_SYSEXC
+ *     instead of being empty -- and an empty provenance on a published
+ *     destination is what dst_precheck() refuses, taking the whole
+ *     destination family of the raising instruction with it. Measured on
+ *     `neg` (a TRAPPING `sub`, whose other destination is an ordinary GPR):
+ *     with dir=2 the refusal deleted that GPR's published mask and the
+ *     instruction's whole dep block. Stating the read that the source
+ *     performs is both the true fact and the fix.
  */
 
 static const DfHelperField dfu_cfc1_env[] = {
@@ -236,13 +274,13 @@ static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/mips/cpu.h:1434 */
 };
 static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
-    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
+    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
+    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperField dfu_raise_exception_err_env[] = {
-    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
-    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
+    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
+    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperAccess dfu_swl_acc[] = {

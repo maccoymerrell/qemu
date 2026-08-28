@@ -243,6 +243,16 @@ std::atomic<uint64_t> g_dst_imm_absent{0};
  */
 std::atomic<uint64_t> g_dst_accum{0};
 /*
+ * DESTINATION SLOTS whose register-only mask is complete because the ONE
+ * encoded field the instruction carries is a field the architecture does not
+ * define as a dataflow operand (#252).  MIPS' `teq rs,rt,code` and `break
+ * code` are the class, and the number is here rather than implied because
+ * the row it replaces published `dst_dep = IMM` -- a claim that the CP0
+ * exception state depends on the trap code, which is false.  A correction
+ * that reports no count is a claim nobody can check.
+ */
+std::atomic<uint64_t> g_dst_imm_non_dataflow{0};
+/*
  * THE LAZY-FLAG INTERPRETATION, counted in the three directions it can go
  * (#265/#184).  x86 materialises EFLAGS on demand: an instruction that only
  * READS flags still writes cc_op, and re-expresses cc_src through the
@@ -1697,7 +1707,25 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
          * under its own state so its size is a number rather than a residue.
          */
         if (q->n_dst_dep_regs[k] == 0 && q->dst_dep_load_slots[k] == 0) {
-            if (!f->has_immediate) {
+            /*
+             * AND THE ENCODING IS NOT ALWAYS A CANDIDATE.  The empty-and-
+             * complete reading says "the value came from the instruction's
+             * own encoding" because nothing else is left -- but on an
+             * instruction whose encoded field the ARCHITECTURE does not
+             * define as a dataflow operand, that reading names a source the
+             * machine does not have.  MIPS `teq rs,zero,0x7` published
+             * `dst_dep = IMM` on this route: the claim that the exception
+             * state it writes depends on the trap code, which QEMU never
+             * materialises and the ISA never feeds to anything (R2 --
+             * architectural dependencies, and this is not one).
+             *
+             * The decoder's NON_DATAFLOW statement removes the encoding from
+             * the candidates, and what is left is genuinely empty: a
+             * constant this file cannot name, which is the third shape
+             * below and refuses under its own state.
+             */
+            if (!f->has_immediate ||
+                (q->imm_non_dataflow && !q->imm_reached)) {
                 g_snprintf(why, whysz, "empty set for %s",
                            generic_reg_name_or_unknown(q->dst_reg[k]));
                 return QDEP_R_DST_UNSTATED_CONST;
@@ -1743,6 +1771,26 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
                  * `ldr x0,[x1,#8]` case, and the #8 is in the address mask
                  * where a consumer that wants it will find it.
                  */
+            } else if (q->imm_non_dataflow) {
+                /*
+                 * THE THIRD VERDICT (#252).  The decoder stated that the
+                 * field the encoding carries is one the ARCHITECTURE does
+                 * not define as a dataflow operand, so the bit did not fail
+                 * to arrive -- it was never going to.  MIPS' trap and break
+                 * codes are the class: the exception's Cause.ExcCode is
+                 * fixed by the OPCODE and the code is left in the
+                 * instruction word for software to read, so nothing this
+                 * instruction writes depends on it.
+                 *
+                 * The register-only mask IS complete, and this is not the
+                 * folded case below: there the encoding WOULD have fed the
+                 * value and the emulator optimised it away, which R7.3
+                 * forbids publishing as the machine's; here the machine
+                 * itself never gave the field a path.  Opposite facts, so
+                 * opposite answers, and the count says how many rows the
+                 * distinction is worth.
+                 */
+                g_dst_imm_non_dataflow.fetch_add(1, std::memory_order_relaxed);
             } else if (q->imm_stated) {
                 /*
                  * Stated, but QEMU folded the value away before any op read
@@ -2181,6 +2229,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      */
     out->imm_stated = st.imm_stated;
     out->imm_reached = st.imm_reached;
+    out->imm_non_dataflow = st.imm_non_dataflow;
     /*
      * The destination-side unbounded flag, carried but NOT acted on -- see
      * QDepInsn::writes_unbounded.  It is deliberately not in the refusal
@@ -3046,6 +3095,16 @@ void qdep_report(GString *report)
         " (`ldr x0,[x1,#8]`)\n",
         g_dst_imm_feeds.load(std::memory_order_relaxed),
         g_dst_imm_absent.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  the same shape, COMPLETE BY THE ARCHITECTURE'S OWN"
+        " DEFINITION: a decoder\n"
+        "              stated that the field the encoding carries is not a"
+        " dataflow operand\n"
+        "               (MIPS trap and break codes), so the register-only"
+        " mask is complete\n"
+        "               and the row no longer claims the exception state"
+        " depends on it\n",
+        g_dst_imm_non_dataflow.load(std::memory_order_relaxed));
     g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  destination SLOTS published with the DESTINATION"
         " ITSELF in their mask:\n"

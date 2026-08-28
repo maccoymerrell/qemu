@@ -1170,6 +1170,76 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
  * %xmm2,%xmm2 as breaking its dependency chain, which it does not -- a missed
  * dependency, arrived at by a change that looked like a simplification.
  */
+/*
+ * CP-M, THE ENV-SCRATCH HALF (#218/#246).
+ *
+ * A target may route a value through a byte range of CPUArchState that names
+ * no architectural register.  x86's `movdqu (%rax),%xmm4` is the shape:
+ * QEMU stores the loaded halves into env->xmm_t0 and then copies xmm_t0 into
+ * the destination, so the destination's provenance reads `@2912` -- a
+ * translation scratch -- where the machine's answer is the LOAD.  The same
+ * lowering carries `pmovmskb`, `pslldq`, `psrldq` and their VEX forms.
+ *
+ * The value did not come from nowhere and it did not come from a register:
+ * this instruction PUT it there, and the write that put it there is already
+ * in @d->fields with its own provenance.  Forwarding that provenance is
+ * QEMU's own statement of the same instruction, read one step further back --
+ * the identical move the folded-register note makes for a constant.
+ *
+ * THE FORWARD IS CONFINED TO RANGES NOTHING NAMES, in both directions, so it
+ * can never cost a name (R12.1):
+ *
+ *   - a READ of a range some target DECLARED keeps the field bit it always
+ *     had; the register is the answer and there is nothing better to say;
+ *   - a WRITE that overlaps and IS named is not folded away either -- the
+ *     whole forward is refused for that read, and the field bit stands;
+ *   - a read only PARTLY covered by this instruction's writes keeps the field
+ *     bit too, because the uncovered bytes are the architectural prior value
+ *     and dropping them would publish a SHORT set.
+ *
+ * Bounded to the instruction being walked: @d is the per-instruction
+ * descriptor and its field list starts empty, so nothing here can see a write
+ * from the instruction before.
+ */
+static bool df_field_named(uint32_t off, uint32_t size)
+{
+    char nm[64];
+
+    return insn_dataflow_field_reg(off, size, nm, sizeof(nm));
+}
+
+static bool df_field_forward(const InsnDataflow *d, uint32_t off, uint32_t size,
+                             uint64_t *out)
+{
+    uint64_t need, have = 0;
+
+    if (size == 0 || size > 64 || df_field_named(off, size)) {
+        return false;
+    }
+    need = size == 64 ? ~(uint64_t)0 : (((uint64_t)1 << size) - 1);
+    memset(out, 0, sizeof(uint64_t) * INSN_DF_REG_WORDS);
+    for (unsigned i = 0; i < d->n_fields; i++) {
+        const InsnDataflowField *f = &d->fields[i];
+        uint32_t lo, hi;
+
+        if (!(f->dir & INSN_DF_WR)) {
+            continue;
+        }
+        if (f->off + f->size <= off || f->off >= off + size) {
+            continue;
+        }
+        if (df_field_named(f->off, f->size)) {
+            return false;
+        }
+        lo = MAX(f->off, off);
+        hi = MIN(f->off + f->size, off + size);
+        have |= (hi - lo == 64 ? ~(uint64_t)0
+                               : ((((uint64_t)1 << (hi - lo)) - 1) << (lo - off)));
+        df_or(out, f->prov);
+    }
+    return have == need;
+}
+
 static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
                          uint8_t dir, const uint64_t *prov)
 {
@@ -1792,6 +1862,8 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         uint32_t size;
         int ld_field_bit = -1;
         int memop_data_bit = -1;
+        uint64_t ld_fwd[INSN_DF_REG_WORDS];
+        bool ld_fwd_valid = false;
 
         /*
          * A note's anchor is the last op its emitter had produced, so the
@@ -2366,8 +2438,12 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         df_add_field(d, (uint32_t)eo, size, INSN_DF_WR,
                                      df_prov_of(vts - s->temps));
                     } else {
+                        if (df_field_forward(d, (uint32_t)eo, size, ld_fwd)) {
+                            ld_fwd_valid = true;
+                        } else {
+                            ld_field_bit = df_intern((uint32_t)eo, size);
+                        }
                         df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
-                        ld_field_bit = df_intern((uint32_t)eo, size);
                     }
                 }
             }
@@ -2516,6 +2592,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                  */
                 if (ld_field_bit >= 0) {
                     df_bit(dp, (unsigned)ld_field_bit);
+                } else if (ld_fwd_valid) {
+                    /* The scratch's own account, from the write that filled
+                     * it -- see df_field_forward(). */
+                    df_or(dp, ld_fwd);
                 }
             }
         }

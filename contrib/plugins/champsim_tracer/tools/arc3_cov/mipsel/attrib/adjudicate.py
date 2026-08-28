@@ -27,6 +27,16 @@ msa_fp_bases = set(h[:-3] for h in msacsr_h if h.endswith("_df")) - {"cfcmsa", "
 TRAP_UNCOND = {"syscall", "break"}
 TRAP_COND = {"teq","tge","tgeu","tlt","tltu","tne",
              "teqi","tgei","tgeiu","tlti","tltiu","tnei"}
+# THE TRAPPING ARITHMETIC is on the general exception path too, and the ISA
+# draws the line rather than a judgement call: MIPS ships each of these as a
+# PAIR whose only difference is the trap -- add/addu, addi/addiu, sub/subu and
+# the three 64-bit pairs -- so raising on signed overflow is part of what the
+# OPCODE means, and the `u` member is deliberately absent from this set.
+# QEMU takes EXCP_OVERFLOW to the same set_EPC: label (cause 12) that syscall
+# (8) and the conditional traps (13) reach, so the footprint is identical and
+# Q-TRAP states it.  The line is still drawn at instructions that RAISE, not
+# at instructions that can FAULT: a load's architectural effect is the load.
+TRAP_ARITH = {"add", "addi", "sub", "dadd", "daddi", "dsub"}
 # sdbbp is NOT on the general exception path: it raises EXCP_DBp, whose
 # footprint is the EJTAG debug file plus the Status/Cause it shares.
 TRAP_DEBUG = {"sdbbp"}
@@ -65,7 +75,10 @@ RULES = {
               "(mips_cause_set_field, :1456, a cmpxchg loop -- internal.h:172), and "
               "writes CP0_EPC (:1422). Registers 12/13/14 -- REG_SYSEXC, and register 8 "
               "(BadInstr, :1043) is the same id. R4: a conditional trap names the write "
-              "as a candidate whether or not it fires."),
+              "as a candidate whether or not it fires -- and the same clause covers the "
+              "trapping arithmetic, whose EXCP_OVERFLOW reaches that same label with "
+              "cause 12.  No static mipsel reference models MIPS exception entry at "
+              "all, so every one of these rows is TRACER-SUPERSET by construction."),
  "Q-TRAPD":  ("R7.6 applied to the DEBUG entry path, which is a different footprint. "
               "sdbbp raises EXCP_DBp (translate.c:13049, :13454), not EXCP_TRAP, so it "
               "reaches set_DEPC/enter_debug_mode (tlb_helper.c:1204-1233): CP0_Debug is "
@@ -218,7 +231,7 @@ def main():
         # the generic id is a consequence, exactly as on the tracer side.
         # A number, not a (number, sel) pair, because a number is all the
         # decode carries: Capstone's COP0<n> constants have no select field.
-        if m in TRAP_UNCOND or m in TRAP_COND:
+        if m in TRAP_UNCOND or m in TRAP_COND or m in TRAP_ARITH:
             # set_EPC: RMW Status(12) and Cause(13), write EPC(14).
             for cn in (12, 13):
                 src.add(cp0(cn)); dst.add(cp0(cn))

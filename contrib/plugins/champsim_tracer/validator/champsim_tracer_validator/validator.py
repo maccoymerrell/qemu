@@ -4202,6 +4202,27 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
             for _r in (_cs.mips.MIPS_REG_COP013, _cs.mips.MIPS_REG_COP023,
                        _cs.mips.MIPS_REG_COP024):
                 add(exp_dst, _r)
+        # Same class, same write set, cause 12 instead of 8 or 13: the
+        # TRAPPING ARITHMETIC.  add/addi/sub and the 64-bit forms are
+        # DEFINED to raise Integer Overflow, QEMU emits that inline
+        # (generate_exception(ctx, EXCP_OVERFLOW) in gen_arith) and
+        # EXCP_OVERFLOW reaches the same set_EPC label, so the boundary
+        # gives them the same three registers.  The non-trapping siblings
+        # -- addu / addiu / subu / daddu / daddiu / dsubu -- are absent
+        # here for the same reason they are absent at the boundary: the
+        # ISA ships the pair and only one member takes the exception.
+        #
+        # THIS MIRROR KEYS ON THE MNEMONIC, THE BOUNDARY KEYS ON THE ID,
+        # so the alias spellings have to be listed explicitly: `neg` and
+        # `dneg` are what Capstone PRINTS for `sub rd,$0,rt` and
+        # `dsub rd,$0,rt`, whose ids are MIPS_INS_SUB and MIPS_INS_DSUB
+        # (measured, cst_runs/p3/arc3/exec30/negrow/CSTOOL_IDS.txt).
+        elif mnem in ("add", "addi", "sub", "neg",
+                      "dadd", "daddi", "dsub", "dneg"):
+            for _r in (_cs.mips.MIPS_REG_COP012, _cs.mips.MIPS_REG_COP013):
+                add(exp_src, _r)
+                add(exp_dst, _r)
+            add(exp_dst, _cs.mips.MIPS_REG_COP014)
 
     elif isa == "x86_64":
         # Match the STEM, not the mnemonic: Capstone puts prefix words inside

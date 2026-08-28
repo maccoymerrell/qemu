@@ -5619,6 +5619,19 @@ mipsel R-wr-phantom trunc.w.s +cop#
 # whether or not the comparison fires -- and user mode, where it never
 # happens, is the same inert case.
 #
+# THE TRAPPING ARITHMETIC joins that class, and the ISA draws the line
+# itself.  add, addi, sub and their 64-bit siblings raise on signed
+# overflow, and QEMU's gen_op_addr_add path takes EXCP_OVERFLOW to the same
+# `set_EPC:` label with cause 12 -- the identical Status/Cause/EPC
+# footprint syscall (8) and the traps (13) reach.  What makes it the
+# opcode's own effect rather than a property of its operands is that MIPS
+# ships each of these as a PAIR whose only difference is the trap:
+# add/addu, addi/addiu, sub/subu and the three 64-bit pairs.  The `u`
+# member is in neither this list nor the boundary's, which is the
+# discriminator working.  `neg` is Capstone's spelling of `sub rd,$zero,rt`
+# and appears here because the rows key on the mnemonic while the boundary
+# keys on the instruction id.
+#
 # The line is drawn at instructions that RAISE, not at instructions that
 # can FAULT.  A load's architectural effect is the load; the fault is a
 # property of the address it computed.  Admitting it would put the
@@ -5656,10 +5669,18 @@ mipsel R-wr-phantom tlbr +cop#
 mipsel R-rd-phantom tlbwi +cop#
 mipsel R-rd-phantom tlbwr +cop#
 mipsel R-rd-phantom wait +cop#
+mipsel R-rd-phantom add +cop#
+mipsel R-wr-phantom add +cop#
+mipsel R-rd-phantom addi +cop#
+mipsel R-wr-phantom addi +cop#
 mipsel R-rd-phantom break +cop#
 mipsel R-wr-phantom break +cop#
+mipsel R-rd-phantom neg +cop#
+mipsel R-wr-phantom neg +cop#
 mipsel R-rd-phantom sdbbp +cop#
 mipsel R-wr-phantom sdbbp +cop#
+mipsel R-rd-phantom sub +cop#
+mipsel R-wr-phantom sub +cop#
 mipsel R-rd-phantom syscall +cop#
 mipsel R-wr-phantom syscall +cop#
 mipsel R-rd-phantom teq +cop#

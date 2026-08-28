@@ -9802,13 +9802,17 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          *     access: tlb*, di/ei, eret, deret, wait, dvpe/evpe, dmt/emt.
          *
          * (b) The instruction whose architectural effect IS to raise an
-         *     exception: syscall, break, sdbbp and the twelve conditional
-         *     traps.  R7.6 puts the state that exception writes in the
-         *     raising instruction's set, because a later `mfc0` of EPC,
-         *     Cause or Status must wait on the write -- an edge a
-         *     renaming regfile has to respect (R7).  R4 covers the
-         *     conditional members: `teq` names the write as a candidate
-         *     whether or not the comparison fires, and user mode, where
+         *     exception: syscall, break, sdbbp, the twelve conditional
+         *     traps, and the six trapping-arithmetic opcodes whose ISA
+         *     definition includes Integer Overflow (add, addi, sub and
+         *     their 64-bit forms -- see the case group for why they are
+         *     class (b) and a faulting load is not).  R7.6 puts the state
+         *     that exception writes in the raising instruction's set,
+         *     because a later `mfc0` of EPC, Cause or Status must wait on
+         *     the write -- an edge a renaming regfile has to respect (R7).
+         *     R4 covers the conditional members: `teq` names the write as
+         *     a candidate whether or not the comparison fires, `add` names
+         *     it whether or not the sum overflows, and user mode, where
          *     the write never happens at all, is the same inert case.
          *
          * A load that MISSES THE TLB is neither.  Its architectural
@@ -9975,6 +9979,70 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         case MIPS_INS_TLTU:
         case MIPS_INS_TNE:
         case MIPS_INS_TNEI:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP014, true);
+            break;
+        /*
+         * The TRAPPING ARITHMETIC, which is the same class and the same
+         * write set, reached through cause 12 instead of 8 or 13.
+         *
+         * `add`, `addi`, `sub` and their 64-bit forms are DEFINED to raise
+         * Integer Overflow: the ISA leaves the destination unmodified and
+         * takes the exception.  QEMU emits that inline --
+         * `generate_exception(ctx, EXCP_OVERFLOW)` in gen_arith
+         * (target/mips/tcg/translate.c:2599, :2635, :2916, :2958, :2998,
+         * :3038 and the two 64-bit sites :4684, :4708) -- and EXCP_OVERFLOW
+         * reaches the SAME `set_EPC:` label as syscall and the traps
+         * (target/mips/tcg/system/tlb_helper.c:1372, `cause = 12`), so the
+         * state written is identical: CP0_Status read and read-modify-written
+         * for EXL, CP0_Cause read-modify-written twice, CP0_EPC written.
+         * R7.6 puts that state in the raising instruction's set and R4 covers
+         * the conditional part exactly as it covers `teq`: the write is a
+         * candidate whether or not the operands overflow.
+         *
+         * THIS IS NOT THE TLB-MISS CASE the paragraph above excludes, and
+         * the discriminator is the ISA's own, not a judgement call.  MIPS
+         * ships each of these as a PAIR whose only difference is the trap --
+         * add/addu, addi/addiu, sub/subu, dadd/daddu, daddi/daddiu,
+         * dsub/dsubu -- so the exception is part of what the OPCODE means,
+         * and the non-trapping sibling correctly gets nothing.  A load that
+         * misses the TLB has no such sibling: its fault is a property of the
+         * address it computed, which is why admitting it would put
+         * REG_SYSEXC in the set of every instruction.  The set here is
+         * closed and enumerated by the ISA at six opcodes.
+         *
+         * WHICH IDS, MEASURED rather than assumed (R8.7), with the wrap
+         * Capstone's own `cstool`; the table is in
+         * cst_runs/p3/arc3/exec30/negrow/CSTOOL_IDS.txt:
+         *
+         *   `neg $t2,$t3` (0x000b5022) decodes with ID **MIPS_INS_SUB**, not
+         *   MIPS_INS_NEG -- `neg` is an alias the printer spells, and
+         *   `dneg` is likewise MIPS_INS_DSUB.  MIPS_INS_NEG is therefore NOT
+         *   listed: nothing in the sweep reaches it, and an unreachable case
+         *   is not a mapped one.
+         *
+         *   The microMIPS 32-bit encodings map onto the SAME base ids
+         *   (add 0x41100149 -> 98, addi 0x00041109 -> 146,
+         *   sub 0x41900149 -> 1250, assembled with `as -mmicromips`), so
+         *   unlike break16/sdbbp16 these need no separate rows.
+         *
+         *   The non-trapping siblings decode to their own distinct ids
+         *   (addu 128, addiu 64, subu 66, daddu 488, daddiu 487, dsubu 579)
+         *   and are absent from this list by construction.
+         *
+         * Verify with `isaxcheck --isa=mipsel --hex=22500b00` (`neg`), whose
+         * `DST{}` must carry REG_SYSEXC beside REG_GPR10, and
+         * `--hex=23402a01` (`subu`), whose `DST{}` must not.
+         */
+        case MIPS_INS_ADD:
+        case MIPS_INS_ADDI:
+        case MIPS_INS_SUB:
+        case MIPS_INS_DADD:
+        case MIPS_INS_DADDI:
+        case MIPS_INS_DSUB:
             cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
             cap_mips_add_implicit(out, handle, MIPS_REG_COP013, false);
             cap_mips_add_implicit(out, handle, MIPS_REG_COP012, true);

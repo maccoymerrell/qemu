@@ -4045,6 +4045,22 @@ mipsel FR-wr-phantom tlbr +REG_SYSMMU
 mipsel FR-rd-phantom tlbwi +REG_SYSMMU
 mipsel FR-rd-phantom tlbwr +REG_SYSMMU
 mipsel FR-rd-phantom wait +REG_SYSEXC
+# THE TRAPPING ARITHMETIC, the same class as the traps below and admitted
+# on the same fact: add, addi, sub and their 64-bit siblings raise on
+# signed overflow and reach the same `set_EPC:` body, so the exception file
+# is part of what the OPCODE does -- MIPS ships each as a PAIR whose only
+# difference is the trap (add/addu, addi/addiu, sub/subu), and the `u`
+# member is in neither list.  LLVM MC models no MIPS exception entry at
+# all.  `neg` is Capstone's spelling of `sub rd,$zero,rt`; the rows key on
+# the mnemonic, the boundary keys on the instruction id.
+mipsel FR-rd-phantom add +REG_SYSEXC
+mipsel FR-wr-phantom add +REG_SYSEXC
+mipsel FR-rd-phantom addi +REG_SYSEXC
+mipsel FR-wr-phantom addi +REG_SYSEXC
+mipsel FR-rd-phantom neg +REG_SYSEXC
+mipsel FR-wr-phantom neg +REG_SYSEXC
+mipsel FR-rd-phantom sub +REG_SYSEXC
+mipsel FR-wr-phantom sub +REG_SYSEXC
 mipsel FR-rd-phantom break +REG_SYSEXC
 mipsel FR-wr-phantom break +REG_SYSEXC
 mipsel FR-rd-phantom syscall +REG_SYSEXC

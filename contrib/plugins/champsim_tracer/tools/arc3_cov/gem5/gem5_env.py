@@ -7,21 +7,45 @@ whose system interpreter is a different version, that library exists only
 inside the Anaconda installation gem5 was configured against, and the leg is
 unrunnable until the loader is pointed at it.
 
-The obvious way to point it there -- putting the whole Anaconda ``lib`` on
-``LD_LIBRARY_PATH`` -- MAKES gem5 SEGFAULT, and that is the failure this module
-exists to make impossible.  Anaconda ships ``libstdc++.so.6`` at
-``GLIBCXX_3.4.29``; gem5 here was compiled by the system GCC against
-``GLIBCXX_3.4.33``.  Put the older one first and gem5 links, starts, runs its
-embedded Python, and dies inside it with ``SIGSEGV``.  Measured on this host,
-one library at a time, with only ``libpython`` plus one candidate exposed:
-
-    libstdc++.so.6  -> exit 139        <- the cause, alone sufficient
-    libgcc_s.so.1   -> exit 0
-    libz.so.1       -> exit 0
-
 So the interpreter is exposed through a SHIM DIRECTORY holding exactly one
 symlink -- the ``libpython`` soname gem5 asked for -- and nothing else.  Every
 other library keeps resolving the way it did at link time.
+
+THE SECOND HALF OF THIS DOCSTRING USED TO CLAIM A SEGFAULT.  It said that
+putting the whole Anaconda ``lib`` on ``LD_LIBRARY_PATH`` makes gem5 SIGSEGV,
+because Anaconda ships ``libstdc++.so.6`` at ``GLIBCXX_3.4.29`` while gem5 was
+compiled against ``GLIBCXX_3.4.33``, and it quoted a per-library table with
+``libstdc++.so.6 -> exit 139``.  **RE-MEASURED 2026-08-28 against the gem5.opt
+now on this host (X86, built 2026-08-24) and it does not reproduce, in either
+half of the argument** (evidence
+``cst_runs/p3/arc3/exec33/statics/gem5env/REMEASURE.txt``):
+
+* the PREMISE is false for this binary -- the highest ``GLIBCXX`` symbol
+  version gem5.opt actually requires is ``3.4.29``, which is exactly what
+  Anaconda's ``libstdc++`` provides.  The system copy's ``3.4.33`` is a
+  ceiling gem5 never reaches.
+* the OUTCOME is false -- with Anaconda's ``libstdc++`` resolving in front
+  (confirmed by ``ldd`` under the same environment), gem5 runs a config,
+  executes its embedded Python and exits 0.  So does the whole-``lib`` arm the
+  docstring called "the obvious way".  Every arm exits 0; the only non-zero
+  reading in the sweep is the arm with NO shim, which exits 127 because
+  ``libpython3.11.so.1.0`` is not found.
+
+**WHAT IS LOAD-BEARING, then, is the libpython half alone**, and it is
+load-bearing absolutely: without the shim there is no run at all.
+
+**AND THE NEVER-DO SURVIVES, restated as what it is.**  ``sanitize_ld_path``
+below still drops any inherited directory that supplies ``libstdc++.so.6`` or
+``libgcc_s.so.1``, and that is kept deliberately -- but as a PROSPECTIVE guard
+on a real hazard, not as the reproduction of a measured crash.  The hazard is
+structural: those two are the C++ ABI gem5 was compiled against, an inherited
+``LD_LIBRARY_PATH`` can substitute an older copy for either, and the failure
+mode when the versions genuinely do not line up is a crash inside the embedded
+interpreter rather than a loader diagnostic.  Today's gem5 happens to be
+compatible with both copies on this host; a gem5 rebuilt by a newer compiler
+would not be, and the guard costs nothing.  It is never to be removed on the
+strength of "it does not segfault now" -- which is exactly what this
+re-measurement says, and exactly why the sentence is here.
 
 Everything here raises ``MissingPrerequisite``, whose message NAMES the thing
 that is absent.  A leg that cannot run must say what it needs; it must never
@@ -189,10 +213,11 @@ def locate_libpython(soname, python_home=None, explicit_dir=None):
 def make_pylib_shim(libpython_path, cache_dir):
     """A directory holding ONLY ``libpython``, for ``LD_LIBRARY_PATH``.
 
-    Deliberately not the interpreter's own ``lib``: see the module docstring.
-    Exposing that directory puts Anaconda's GLIBCXX_3.4.29 ``libstdc++`` in
-    front of the GLIBCXX_3.4.33 one gem5 was compiled against, and gem5
-    SIGSEGVs.
+    Deliberately not the interpreter's own ``lib``.  Exposing that directory
+    substitutes the interpreter's ``libstdc++``/``libgcc_s`` for the ones gem5
+    was linked against, and this module will not do that by accident -- see
+    the module docstring for what that was measured to cost (2026-08-28: on
+    THIS gem5, nothing; the guard is prospective and stays).
     """
     d = os.path.join(cache_dir, 'pylib')
     os.makedirs(d, exist_ok=True)
@@ -211,7 +236,10 @@ def make_pylib_shim(libpython_path, cache_dir):
 # --------------------------------------------- an LD_LIBRARY_PATH that is safe
 #: Libraries whose ABI gem5 is compiled against.  A directory on the inherited
 #: ``LD_LIBRARY_PATH`` that supplies one of these can override the copy gem5
-#: was linked with, and that is exactly how the SIGSEGV happened.
+#: was linked with.  PROSPECTIVE, not historical: re-measured 2026-08-28, this
+#: gem5 runs fine either way (module docstring).  The substitution is still
+#: never made deliberately, because when the versions DO diverge the failure
+#: lands inside the embedded interpreter with no loader diagnostic.
 ABI_LIBS = ('libstdc++.so.6', 'libgcc_s.so.1')
 
 
@@ -256,7 +284,8 @@ def gem5_environment(gem5_bin, cache_dir, python_home=None,
     for d, lib in dropped:
         notes.append('DROPPED from LD_LIBRARY_PATH: %s -- it supplies %s, '
                      'which would override the copy gem5 was compiled '
-                     'against (this is the documented SIGSEGV)' % (d, lib))
+                     'against (prospective ABI guard, see gem5_env.py)'
+                     % (d, lib))
     env['LD_LIBRARY_PATH'] = os.pathsep.join([shim] + keep)
     notes.append('LD_LIBRARY_PATH=%s' % env['LD_LIBRARY_PATH'])
     return env, notes

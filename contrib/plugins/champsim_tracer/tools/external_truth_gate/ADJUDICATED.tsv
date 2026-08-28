@@ -1,0 +1,28 @@
+# ARC 3 / R13 -- THE ADJUDICATED CEILINGS OF THE EXTERNAL-TRUTH FLOW
+#
+# One row per (leg, isa).  A leg's HEADLINE is the count of rows where the
+# tracer drops information a reference states, or where the difference is not
+# understood.  The CEILING is the value a maintainer has adjudicated, row by
+# row, in the verdict named in ADJUDICATION.  The gate FAILS when a headline
+# EXCEEDS its ceiling, when a report is missing, when a headline cannot be
+# parsed, or when the leg's scored population is below FLOOR.
+#
+# A ceiling is never a target.  RETIRED_BY names the work item whose landing
+# must lower it; a ceiling with no RETIRED_BY is one this project accepts as
+# a property of the reference, not of the trace.
+#
+# Author: Maccoy Merrell.
+#
+#leg	isa	report	ceiling	floor	retired_by	adjudication
+isax	all	statics/isax/rc.txt	0	8	-	8 arms, rc=0/unallowed=0/dead_allow_rules=0; ceiling is the count of arms that did not exit 0
+static	x86_64	statics/coverage_report.txt	47	6000	#232,#216	R13_VERDICT.md 3.1 -- 24 reachable TRACER-SUBSET (18 Capstone flag defects + 6 VIA PadLock), 19 unreachable, 10 UNACCOUNTED all UNREACHABLE by five legs
+static	aarch64	statics/coverage_report.txt	0	3000	-	R13_VERDICT.md 3.2
+static	riscv64	statics/coverage_report.txt	0	1000	-	R13_VERDICT.md 3.3
+static	mipsel	statics/coverage_report.txt	0	900	-	R13_VERDICT.md 3.4 -- firing control is mipsel/falsify_shim.sh, both arms proven
+gem5cp	aarch64	gem5/rc_aarch64.log	22	200	#94	R13_VERDICT.md 4.1 -- 5 REF-NEON-PAIRWISE-DEST, 3 IMPLDEF-MACHINE-VALUE, 6 memop-extent, 3 PREFETCH-SIZE, 2 FPSR-GRANULARITY, 3 SAME-BYTES-DIFFERENT-SPLIT
+gem5cp	mipsel	gem5/rc_mipsel.log	1	100	-	R13_VERDICT.md 4.2 -- 1 IMPLDEF-MACHINE-VALUE (a machine-identity register, not a datum)
+gem5wp	aarch64	gem5/wp_aarch64.log	0	3000	-	R13_VERDICT.md 5.1 -- 15/15 axis mutations FIRED, 8/8 cache-maintenance rules REFUSED
+gem5wp	mipsel	gem5/wp_mipsel.log	6	250	#269,#221,#266	R13_VERDICT.md 5.2 -- 3 facts on MIPS FR=0 FP pairs: 1 reference gap, 2 in-place-lowering self-source, 1 odd-half write the list does not name
+spikecp	riscv64	spike/FINAL/REPORT.txt	6	2500	-	R13_VERDICT.md 4.3 -- 2 csr-src-set UNACCOUNTED + 3 vocabulary-gap + 1 tracer-defect, 12/12 axes proven live
+spikewp	riscv64	spike/wp/final/REPORT.txt	0	2500	-	R13_VERDICT.md 5.3 -- 99 excursions rebuilt from the trace alone and re-executed; 0 WP defects
+pin	x86_64	pin/cmp_fixed_sameinput.txt	42149	350000	#271,#272	R13_VERDICT.md 4.4 -- 41,859 of the 42,149 are the cst_decode --format=disasm renderer, NOT the wire (independently re-measured, verify/SRCDROP.txt); the ceiling drops to the low hundreds when #271 lands

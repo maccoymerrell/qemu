@@ -497,6 +497,77 @@ kernel_written = set()
 #: what cpu_loop.c's EXCP_SYSCALL arm writes back that no instruction does.
 SYSCALL_KERNEL_WRITES = ('rax',)
 
+#: THE SYSCALL REGISTER-EFFECT VERDICT for the pair currently being scored.
+#: Empty for every encoding but 0f05.  Filled by syscall_effects() below and
+#: read by classify_value(); a dict rather than an argument because the same
+#: verdict decides three different registers on the same instruction and
+#: recomputing it per register would let the three disagree.
+SYSFX = {}
+#: One row per syscall instance whose rcx/r11/flags disagreed, with both
+#: sides' numbers.  An aggregated report cannot say WHICH instance survived
+#: (#281 left 2 of 13 standing and they could not be named without opening
+#: them), so the adjudication is printed per instance, always, not behind a
+#: diagnostic flag.
+sys_rows = []
+
+
+def syscall_effects(rec, q, pd):
+    """Did BOTH sides perform SYSCALL's architectural register effects?
+
+    SYSCALL's whole register footprint is three writes: RCX <- the address of
+    the next instruction, R11 <- RFLAGS, RIP <- LSTAR.  Whether an instrument
+    performed the first two is a fact each side states ABOUT ITSELF -- rcx
+    against its own next-instruction address, r11 against its own rflags --
+    so it is decidable without comparing the two sides at all.
+
+    That is exactly what the question needs.  A value disagreement on
+    rcx/r11/flags means the CLOBBER IS MISSING only if some side did not
+    perform it.  If both performed it, the disagreement is in the flags word
+    that ARRIVED, and R11-equals-RFLAGS on each side also proves RFLAGS is
+    unchanged across the instruction -- the hardware answer, measured
+    natively under #281.  Naming that a missing clobber is a false
+    justification, which is what #293 filed.
+
+    Returns a dict with 'performed' and, when it is False, a 'why' naming the
+    check that failed.  A missing record on either side is NOT performed: a
+    check that cannot find its subject fails."""
+    def ref(c):
+        e = pd.get(c)
+        return None if e is None else e[0]
+
+    def trc(c):
+        e = q['_dv'].get(c)
+        return None if e is None else e[0]
+
+    ref_next = int(rec['ip']) + int(rec['len'])
+    trc_next = int(q['pc'], 16) + len(q['_b'])
+    out = {'ref_rcx': ref('rcx'), 'ref_r11': ref('r11'),
+           'ref_flags': ref('flags'), 'ref_next': ref_next,
+           'trc_rcx': trc('rcx'), 'trc_r11': trc('r11'),
+           'trc_flags': trc('flags'), 'trc_next': trc_next}
+    for k in ('ref_rcx', 'ref_r11', 'ref_flags',
+              'trc_rcx', 'trc_r11', 'trc_flags'):
+        if out[k] is None:
+            out['performed'] = False
+            out['why'] = 'no-' + k.replace('_', '-')
+            return out
+    if out['ref_r11'] != out['ref_flags']:
+        out['performed'] = False
+        out['why'] = 'reference-r11-is-not-its-own-rflags'
+    elif out['trc_r11'] != out['trc_flags']:
+        out['performed'] = False
+        out['why'] = 'tracer-r11-is-not-its-own-rflags'
+    elif out['ref_rcx'] != out['ref_next']:
+        out['performed'] = False
+        out['why'] = 'reference-rcx-is-not-its-own-next-ip'
+    elif out['trc_rcx'] != out['trc_next']:
+        out['performed'] = False
+        out['why'] = 'tracer-rcx-is-not-its-own-next-pc'
+    else:
+        out['performed'] = True
+        out['why'] = ''
+    return out
+
 
 def classify_value(reg, qv, pv, w, inherited, enc):
     """Name the mechanism behind a cross-run register-value difference.
@@ -510,38 +581,52 @@ def classify_value(reg, qv, pv, w, inherited, enc):
     a, b = qv & m, pv & m
     if w == 8 and (b - a) in ESTAB:
         return ('MAPPING-POINTER', 'ORTHOGONAL')
-    if enc == SYSCALL_ENC and reg in ('rcx', 'r11'):
-        # THE DEFECT THIS RULE WAS WRITTEN FOR IS FIXED (#281).  Kept as a
-        # REGRESSION TRIPWIRE, and its former justification is corrected
-        # here rather than left standing, because a false justification in a
-        # reference harness is how a real disagreement gets waved through.
+    if enc == SYSCALL_ENC and reg in ('rcx', 'r11', 'flags'):
+        # THE CLOBBER IS TESTED, NOT ASSUMED FROM THE ENCODING  (#281, #293).
         #
-        # WHAT IT USED TO SAY, AND WHY THAT IS NOW FALSE.  SYSCALL performs
-        # three register effects -- RCX <- RIP-of-next, R11 <- RFLAGS,
-        # RFLAGS <- RFLAGS & ~IA32_FMASK (SYSRET restores RFLAGS from R11).
-        # This comment used to assert that qemu-user's helper_syscall did
-        # NONE of them.  It now does the first two: see
-        # target/i386/tcg/user/seg_helper.c, long mode, correct path.  The
-        # third is deliberately not emulated and MUST NOT BE -- measured
-        # natively, a Linux process observes RFLAGS UNCHANGED across a
-        # syscall, which is exactly what qemu-user now produces.
+        # SYSCALL performs three register effects -- RCX <- RIP-of-next,
+        # R11 <- RFLAGS, RFLAGS <- RFLAGS & ~IA32_FMASK, the last undone by
+        # the kernel's SYSRET.  qemu-user performs the first two on the
+        # correct path since #281 (target/i386/tcg/user/seg_helper.c, long
+        # mode).  The third is deliberately not emulated and MUST NOT BE:
+        # measured natively under #281, one static binary run on real
+        # hardware observes RFLAGS UNCHANGED across a syscall, and qemu-user
+        # produces the identical answer.
         #
-        # WHAT IS MEASURED AT THE FIX, over four same-tip runs of this leg:
-        #   rcx    13 -> 0, 0, 0, 0        the class is gone outright
-        #   r11    13 -> 2, 1, 1, 1        and every survivor is NOT this
-        # In every surviving instance the tracer's r11 EQUALS the tracer's
-        # own flags and the reference's r11 equals the reference's flags
-        # (witnessed: pc 0x418ea0 and 0x418efc, qemu 0x206 vs ref 0x202,
-        # bit 2 / PF only).  So R11 took the flags word correctly on both
-        # sides and the disagreement is entirely in the flags that went IN
-        # -- the pointer-placement PF class already adjudicated under #272,
-        # not a clobber defect.
+        # THIS RULE USED TO CONVICT ON THE ENCODING ALONE.  Two rules did:
+        # `QEMU-USER-SYSCALL-NO-RCX-R11-CLOBBER` and
+        # `QEMU-USER-SYSCALL-NO-RFLAGS-CLOBBER`.  After the fix they still
+        # claimed 4 rows, and the witness showed none of them was this class:
+        # at pc 0x418ea0 and 0x418efc the tracer read r11 = flags = 0x206 and
+        # the reference read r11 = flags = 0x202, differing in bit 2 (PF)
+        # alone.  Both sides had performed the clobber correctly; the
+        # difference was entirely in the flags word that arrived -- the
+        # pointer-placement class adjudicated under #272.
         #
-        # THEY ARE STILL COUNTED, deliberately.  Re-labelling them
-        # ORTHOGONAL would lower the criterion by a scorer edit rather than
-        # by a trace change, which is the one direction this harness must
-        # never move on its own.  The re-adjudication is filed, not taken.
-        return ('QEMU-USER-SYSCALL-NO-RCX-R11-CLOBBER', 'TRACER-SUBSET')
+        # syscall_effects() now decides it from the record: each side's r11
+        # against ITS OWN rflags and each side's rcx against ITS OWN next
+        # instruction address.  That keeps the regression tripwire -- an
+        # emulator that stops writing r11 fails `tracer-r11-is-not-its-own-
+        # rflags` and is convicted TRACER-SUBSET, per instance, by name --
+        # while refusing to call an input difference a missing write.  The
+        # per-instance numbers are printed in the report's SYSCALL section,
+        # unconditionally.
+        SYSFX.setdefault('_regs', []).append(reg)
+        if not SYSFX.get('performed'):
+            return ('QEMU-USER-SYSCALL-CLOBBER-NOT-PERFORMED:'
+                    + (SYSFX.get('why') or 'no-record'), 'TRACER-SUBSET')
+        if reg == 'rcx':
+            # Both sides put their own next-instruction address in rcx, so a
+            # remaining difference is where the CODE sits, and only a delta
+            # the pairing itself measured may explain it.
+            if w == 8 and (b - a) in CODE_DELTAS:
+                return ('SYSCALL-NEXT-IP-UNDER-A-MEASURED-CODE-DELTA',
+                        'ORTHOGONAL')
+            return ('SYSCALL-NEXT-IP-CODE-DELTA-UNESTABLISHED', 'UNACCOUNTED')
+        # r11 and flags: r11 == rflags on BOTH sides, so this register's
+        # disagreement IS the flags word's disagreement, and the equality
+        # also says rflags did not change here.  The difference came in.
+        return ('SYSCALL-INHERITED-FLAGS-INPUT', 'ORTHOGONAL')
     hs = is_host_specific(enc)
     if hs:
         return ('HOST-VS-EMULATED-CPU:' + hs, 'ORTHOGONAL')
@@ -569,23 +654,6 @@ def classify_value(reg, qv, pv, w, inherited, enc):
         if mapping_of(a) is not None:
             return ('IN-MAPPING-WRONG-DELTA', 'UNACCOUNTED')
         return ('POINTER-OUTSIDE-EVERY-MEASURED-MAPPING', 'ORTHOGONAL')
-    if enc == SYSCALL_ENC and reg == 'flags':
-        # THIS RULE'S NAME IS A MISNOMER AND ITS ORIGINAL READING WAS WRONG.
-        # It was written as "the third register of the SYSCALL clobber set",
-        # on the reading that qemu-user failed to apply the IA32_FMASK entry
-        # mask.  MEASURED (#281 witness, the same static binary run natively
-        # and emulated): a Linux process observes RFLAGS UNCHANGED across a
-        # syscall on REAL HARDWARE -- the kernel's SYSRET reloads RFLAGS
-        # from R11 -- and qemu-user produces the identical answer.  There is
-        # no missing flags clobber to model; applying one would move the
-        # emulator AWAY from the hardware answer.
-        #
-        # What the rule actually claims, at this tip, is the same two
-        # syscall instances the r11 rule claims, whose flags differed
-        # BEFORE the instruction by one bit (PF) because a pointer landed
-        # differently in the two runs.  Left counted for the reason given
-        # at the r11 rule: the correction is a re-adjudication, filed.
-        return ('QEMU-USER-SYSCALL-NO-RFLAGS-CLOBBER', 'TRACER-SUBSET')
     if reg in kernel_written:
         # THE SAME BOUNDARY, THE OTHER DIRECTION, AND ALSO UPSTREAM QEMU'S.
         # cpu_loop.c DOES write the syscall's result: env->regs[R_EAX] = ret,
@@ -750,6 +818,12 @@ for pos, (pi, qj) in enumerate(pairs):
     pset = frozenset(ps)
     dset = frozenset(pd)
 
+    # The syscall register-effect verdict for THIS pair, decided once and
+    # read by every register the rule covers (#293).
+    SYSFX.clear()
+    if q['b'] == SYSCALL_ENC:
+        SYSFX.update(syscall_effects(r, q, pd))
+
     if int(r['decode_ok']) == 0:
         st['ref_decode_fail'] += 1
         note(setsig, 'refdecode', (q['b'], q['m'], q['c']), qj)
@@ -906,6 +980,18 @@ for pos, (pi, qj) in enumerate(pairs):
                     unexplained_mem[a >> MEMPAGE] = unexplained[c]
             note(valsig, 'dstval', (q['b'], q['c'], c, cat, direction), qj)
 
+    if SYSFX.get('_regs'):
+        sys_rows.append({'pos': pos, 'pc': q['pc'],
+                         'regs': ','.join(sorted(set(SYSFX['_regs']))),
+                         'performed': SYSFX['performed'],
+                         'why': SYSFX['why'],
+                         'ref_rcx': SYSFX['ref_rcx'], 'ref_r11': SYSFX['ref_r11'],
+                         'ref_flags': SYSFX['ref_flags'],
+                         'ref_next': SYSFX['ref_next'],
+                         'trc_rcx': SYSFX['trc_rcx'], 'trc_r11': SYSFX['trc_r11'],
+                         'trc_flags': SYSFX['trc_flags'],
+                         'trc_next': SYSFX['trc_next']})
+
     # publish this instruction's destination writes into the shadow file
     for c, (qv, qw) in q['_sv'].items():
         shadow[c] = (qv, qw)
@@ -1018,6 +1104,30 @@ for kind in ('dstval', 'srcval', 'ripsrc', 'dstval_rep'):
 for sig, n in valsig['dstval_absent'].most_common(A.maxreport):
     say("    %-18s %-10s %-10s reference has a value, tracer has none %8d"
         % (sig[0][:18], sig[1][:10], sig[2], n))
+
+say("")
+say("=== SYSCALL REGISTER EFFECTS, PER INSTANCE ===")
+say("  Every syscall whose rcx / r11 / rflags disagreed, with the numbers the")
+say("  verdict was taken from.  PERFORMED means each side's r11 equals ITS OWN")
+say("  rflags and each side's rcx equals ITS OWN next-instruction address, so")
+say("  both instruments carried out the write and the remaining difference")
+say("  came IN.  NOT-PERFORMED names the check that failed and is counted as")
+say("  TRACER-SUBSET.  Printed unconditionally: an aggregated row cannot say")
+say("  which instance survived (#281 left two standing and #293 could not name")
+say("  them without opening them).")
+if not sys_rows:
+    say("  (no syscall register disagreement in this pairing)")
+for w in sys_rows:
+    say("  pos=%-8d pc=%s  regs=%-12s %s%s"
+        % (w['pos'], w['pc'], w['regs'],
+           'PERFORMED' if w['performed'] else 'NOT-PERFORMED',
+           '' if w['performed'] else ': ' + w['why']))
+    say("      reference  rcx=%#x next-ip=%#x  r11=%#x rflags=%#x  r11==rflags %s"
+        % (w['ref_rcx'] or 0, w['ref_next'], w['ref_r11'] or 0,
+           w['ref_flags'] or 0, w['ref_r11'] == w['ref_flags']))
+    say("      tracer     rcx=%#x next-pc=%#x  r11=%#x rflags=%#x  r11==rflags %s"
+        % (w['trc_rcx'] or 0, w['trc_next'], w['trc_r11'] or 0,
+           w['trc_flags'] or 0, w['trc_r11'] == w['trc_flags']))
 
 say("")
 say("=== THE UNACCOUNTED RESIDUE, RESOLVED TO ITS ROOTS ===")

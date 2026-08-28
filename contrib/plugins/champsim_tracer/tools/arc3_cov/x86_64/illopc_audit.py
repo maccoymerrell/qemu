@@ -351,7 +351,9 @@ def main():
     ap.add_argument('--xl3', required=True, help='xl3.tsv (XED + LLVM MC)')
     ap.add_argument('--iced', required=True, help='iced.tsv')
     ap.add_argument('--objdump', action='append', default=None,
-                    help='objdump to consult; repeatable.  A DISTRIBUTION '
+                    help='objdump to consult; repeatable, and each one is '
+                         'counted as an independent decoder -- passing the '
+                         'same binary twice is REFUSED.  A DISTRIBUTION '
                          'objdump lags the newest ISA extensions by years, so '
                          'pass a recent one too rather than letting its '
                          'ignorance read as a single-source row.')
@@ -392,6 +394,31 @@ def main():
                  'fourth, and a leg that cannot find its subject must fail')
     vers = [subprocess.run([o, '--version'], capture_output=True,
                            text=True).stdout.splitlines()[0] for o in objs]
+
+    # A COLUMN THAT IS THE SAME DECODER TWICE IS NOT A COLUMN, and this audit
+    # shipped one.  `--objdump "${CST_OBJDUMP_NEW:-objdump}" --objdump objdump`
+    # with the variable unset resolved BOTH slots to the distribution binary,
+    # so `len(opin)` counted five decoders while four ran, and the SINGLE-
+    # SOURCE message printed the same version string twice -- which is how it
+    # was eventually caught.  Ten rows were convicted on the strength of a
+    # decoder that had been asked the same question twice.
+    #
+    # The fallback is deleted rather than deduplicated: silently collapsing
+    # to four would keep the count honest and lose the fifth opinion without
+    # saying so, and a leg that cannot reach its subject must FAIL.  Identity
+    # is decided on the resolved path AND on the version banner, because two
+    # different paths can be the same build (a symlink, a hardlink, a copy).
+    seen = {}
+    for o, v in zip(objs, vers):
+        key = (os.path.realpath(shutil.which(o) or o), v)
+        if key in seen:
+            sys.exit('THE SAME objdump WAS PASSED TWICE (%s -> %s, %s).  Each '
+                     '--objdump is counted as an independent decoder, so a '
+                     'repeat inflates the decoder count and can convict a row '
+                     'as SINGLE-SOURCE on four opinions while claiming five.  '
+                     'Pass distinct binaries or pass one.'
+                     % (o, key[0], v))
+        seen[key] = o
 
     hexes = sorted({r['probe_hex'] for r in rows})
     # CONTROL for leg (a): the same pipeline, on a probe whose opcode byte has

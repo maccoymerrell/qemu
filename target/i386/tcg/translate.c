@@ -1514,6 +1514,7 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         (!(tb_cflags(s->base.tb) & (CF_USE_ICOUNT | CF_SINGLE_STEP))
 	 && !(s->flags & (HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
     bool had_rf = s->flags & HF_RF_MASK;
+    unsigned df_memop_mark = 0;
 
     /*
      * Even if EFLAGS.RF was set on entry (such as if we're on the second or
@@ -1586,6 +1587,13 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     }
 
     gen_set_label(loop);
+    /*
+     * Where this iteration's accesses are noted.  With @can_loop the same
+     * accesses are emitted a SECOND time below for the peeled last
+     * iteration, and the two emissions are one architectural access on
+     * mutually exclusive paths -- see insn_dataflow_note_path_alt().
+     */
+    df_memop_mark = insn_dataflow_memop_mark();
     fn(s, ot, dshift);
     tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
 #ifdef CONFIG_PLUGIN
@@ -1649,7 +1657,15 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
          */
         gen_set_label(last);
         set_cc_op(s, CC_OP_DYNAMIC);
+        /*
+         * The peeled last iteration performs the SAME access the loop body
+         * performs, on the path the loop body does not take.  Told, not
+         * inferred: a per-emission count would give the instruction a memory
+         * slot no execution ever fills.
+         */
+        insn_dataflow_note_path_alt(df_memop_mark);
         fn(s, ot, dshift);
+        insn_dataflow_note_path_alt_end();
         tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
 #ifdef CONFIG_PLUGIN
         gen_rep_plugin_count_iter(s, rep_iters);

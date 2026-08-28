@@ -178,6 +178,13 @@ typedef struct DfMemopNote {
      */
     unsigned fold_n;
     bool fold_dropped;          /* a fold note was lost to overflow before this */
+    /*
+     * The note this one is a SECOND EMISSION of, or -1.  Set inside an
+     * alternate-path scope (insn_dataflow_note_path_alt): the two emissions
+     * are ONE architectural access lowered onto mutually exclusive code
+     * paths, so this note fills @alt_of's record instead of allocating one.
+     */
+    int alt_of;
 } DfMemopNote;
 
 /*
@@ -510,6 +517,14 @@ struct InsnDataflowScratch {
     DfMemopNote memop[DF_MAX_MEMOP_NOTES];
     unsigned n_memop;
     bool memop_overflow;
+    /*
+     * The open alternate-path scope: which note the emissions inside it
+     * mirror, and how many have been taken.  @alt_open is false everywhere
+     * but inside the peeled copy of a self-looping string operation.
+     */
+    bool alt_open;
+    unsigned alt_mark;
+    unsigned alt_taken;
 
     DfAliasNote alias[DF_MAX_ALIAS_NOTES];
     unsigned n_alias;
@@ -596,6 +611,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_memop            (df->memop)
 #define df_n_memop          (df->n_memop)
 #define df_memop_overflow   (df->memop_overflow)
+#define df_alt_open         (df->alt_open)
+#define df_alt_mark         (df->alt_mark)
+#define df_alt_taken        (df->alt_taken)
 #define df_alias            (df->alias)
 #define df_n_alias          (df->n_alias)
 #define df_alias_overflow   (df->alias_overflow)
@@ -1284,6 +1302,9 @@ void insn_dataflow_note_reset(void)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_alt_open = false;
+    df_alt_mark = 0;
+    df_alt_taken = 0;
     df_n_alias = 0;
     df_alias_overflow = false;
     df_n_zero = 0;
@@ -1610,6 +1631,46 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
          */
         d->memops_unnoted = 1;
         return -1;
+    }
+    if (n->rec < 0 && n->alt_of >= 0) {
+        /*
+         * A SECOND EMISSION of one architectural access -- the peeled last
+         * iteration of a self-looping string operation; see
+         * insn_dataflow_note_path_alt().  It fills the record its
+         * counterpart filled rather than allocating one, because the wire's
+         * slot count is how many accesses ONE EXECUTION performs and this is
+         * the same access on the path the first emission does not take.
+         *
+         * IT CONTRIBUTES NO PROVENANCE, and that is a decision with a
+         * reason.  The peeled copy reads the address register AFTER the loop
+         * body advanced it, so its temp chain names the induction the loop
+         * added -- on i386 `rep stosq` the direction flag reaches the
+         * address that way.  That is a CROSS-ITERATION edge, and the wire
+         * publishes one entry per iteration with the pointer register in
+         * both its source and its destination list, so the register chain
+         * already carries it.  Merging it into THIS access's address would
+         * state that one iteration's store address depends on the flag that
+         * advances the pointer for the NEXT one -- and on the four targets
+         * here it also names an env field with no architectural word, which
+         * refuses the whole address family and loses the register the
+         * instruction genuinely addresses through.  The first emission is
+         * the access as one execution performs it.
+         *
+         * The counterpart must already HAVE a record and agree about
+         * direction and width.  When it does not -- the op stream reached
+         * this emission without reaching the first, or the emitter's claim
+         * that they are one access does not hold -- the note falls through
+         * to the allocation below and is reported as an access of its own.
+         * An unmatched alternate is over-reported, never dropped.
+         */
+        const DfMemopNote *prim = &df_memop[n->alt_of];
+
+        if (prim->rec >= 0 && prim->rec < (int)d->n_memops &&
+            prim->is_store == store && prim->size == n->size) {
+            n->rec = prim->rec;
+            return store ? -1
+                         : (int)(INSN_DF_MEMOP_PROV_BASE + n->rec);
+        }
     }
     if (n->rec < 0) {
         const void *addr_ts = n->addr_ts;
@@ -2753,7 +2814,56 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
     df_memop[df_n_memop].zero_dropped = df_zero_overflow;
     df_memop[df_n_memop].fold_n = df_n_fold;
     df_memop[df_n_memop].fold_dropped = df_fold_overflow;
+    /*
+     * Inside an alternate-path scope this emission mirrors the note @alt_mark
+     * positions in; outside one it is an access of its own.  A mirror of a
+     * note that does not exist stays -1 and the access is allocated
+     * normally: an unmatched alternate is REPORTED, never dropped.
+     */
+    df_memop[df_n_memop].alt_of = -1;
+    if (df_alt_open) {
+        unsigned src = df_alt_mark + df_alt_taken;
+
+        df_alt_taken++;
+        if (src < df_n_memop) {
+            df_memop[df_n_memop].alt_of = (int)src;
+        }
+    }
     df_n_memop++;
+}
+
+/*
+ * The alternate-path scope.  See insn_dataflow_note_path_alt() in the header
+ * for what it states and why only the emitter can state it.
+ */
+unsigned insn_dataflow_memop_mark(void)
+{
+    if (df_disabled()) {
+        return 0;
+    }
+    df_bind();
+    return df_n_memop;
+}
+
+void insn_dataflow_note_path_alt(unsigned mark)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    df_alt_open = true;
+    df_alt_mark = mark;
+    df_alt_taken = 0;
+}
+
+void insn_dataflow_note_path_alt_end(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    df_alt_open = false;
+    df_alt_taken = 0;
 }
 
 /*
@@ -3340,6 +3450,9 @@ void insn_dataflow_extract(unsigned num_insns)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_alt_open = false;
+    df_alt_mark = 0;
+    df_alt_taken = 0;
     df_n_alias = 0;
     df_alias_overflow = false;
     if (df_helper_overflow) {

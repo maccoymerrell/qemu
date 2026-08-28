@@ -472,6 +472,40 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
                               unsigned size, bool is_store);
 
 /*
+ * CP-M, the ALTERNATE-PATH half -- one architectural access an emitter
+ * lowers at TWO code sites.
+ *
+ * The wire's per-access slot model asks how many accesses ONE EXECUTION of
+ * the instruction performs.  A note is taken per emission, and for most
+ * lowerings those are the same number.  They are not the same number when a
+ * translator peels a copy of the access onto a second, mutually exclusive
+ * path: i386's `do_gen_rep()` emits its string operation once for the loop
+ * body and once again for the last iteration (`can_loop`, target/i386/tcg/
+ * translate.c), so `rep stosq` arrives here with TWO store notes for the one
+ * store an iteration performs.  Counting them as two accesses gives the
+ * template a slot no execution ever fills -- a fabricated dependency with an
+ * address provenance nothing states.
+ *
+ * The emitter is the only party that knows the two sites are one access, so
+ * it says so.  Take @mark before the FIRST emission; open the scope before
+ * the peeled copy and close it after.  Notes taken inside the scope fill the
+ * records their counterparts at @mark filled, unioning provenance rather
+ * than allocating a record of their own.
+ *
+ * The mapping is positional: the i-th note inside the scope mirrors the
+ * (@mark + i)-th note.  That holds because the two sites emit the same
+ * accesses in the same order -- they are the same emitter call.  A note
+ * whose counterpart does not exist, or disagrees about direction, falls back
+ * to allocating its own record: an unmatched alternate is reported as an
+ * access rather than silently dropped.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+unsigned insn_dataflow_memop_mark(void);
+void insn_dataflow_note_path_alt(unsigned mark);
+void insn_dataflow_note_path_alt_end(void);
+
+/*
  * CP-M, the address half -- an access QEMU routes through a temp of its own.
  *
  * Three translators lower store-conditional onto a compare-exchange whose
@@ -968,6 +1002,15 @@ static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
 static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
                                             const void *addr_ts,
                                             unsigned size, bool is_store)
+{ }
+
+static inline unsigned insn_dataflow_memop_mark(void)
+{ return 0; }
+
+static inline void insn_dataflow_note_path_alt(unsigned mark)
+{ }
+
+static inline void insn_dataflow_note_path_alt_end(void)
 { }
 
 static inline void insn_dataflow_note_addr_alias(const void *alias_ts,

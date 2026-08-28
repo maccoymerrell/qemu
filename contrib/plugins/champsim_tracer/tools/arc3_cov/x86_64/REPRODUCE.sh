@@ -243,7 +243,12 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 # ---- prove the gate can fire ----------------------------------------------
 # An agreement rate quoted off an instrument nobody has watched fail vouches
 # for nothing.  drop-src must cost exactly the agreeing rows of the damaged
-# mnemonic, against a baseline of 5835:
+# mnemonic.  THE COSTS ARE THE CONTROL; THE BASELINE IS NOT.  A baseline
+# figure written here goes stale the moment the decode moves -- it read 5835
+# when this list was drawn up, 6059 at 04e25599b5 and 6043 at 47bbdc2619 --
+# and a stale one invites reading an unchanged number as a passing control.
+# So compare each arm against THIS RUN's own baseline, printed above the
+# loop, and require exactly these deltas:
 #   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2   ud0 3   ud1 2
 #   xlatb 1   smswl 1   lmsww 2   rdfsbasel 1   lfsl 1   cmpxchg8b 1
 # NOTE THE SPELLINGS.  --falsify matches the mnemonic EXACTLY, so `smsw`
@@ -260,6 +265,8 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 # control honest in both directions -- run the damaged table without the flag
 # and the report refuses instead of quoting a number off it.
 cp tracer_batch.tsv tracer_batch.good.tsv
+echo -n "falsify baseline -> "
+$PY compare_attrib.py | grep -m1 '  AGREE  '
 for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
          rdfsbasel lfsl cmpxchg8b; do
   "$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields \

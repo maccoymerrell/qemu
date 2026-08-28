@@ -77,6 +77,18 @@ AP.add_argument('--mutate', default=None,
                      'QEMU side -- dropsrc | extrasrc | dropdst | dstvalue | '
                      'srcvalue')
 AP.add_argument('--mutate-every', type=int, default=997)
+AP.add_argument('--witness', default=None,
+                help='comma-separated ENCODINGS (as printed in the report, '
+                     'e.g. 0f05).  For every disagreeing VALUE row on one of '
+                     'those encodings, print ONE LINE PER INSTANCE to stderr: '
+                     'position, pc, register, both values, and the category '
+                     'the classifier reached.  Diagnostics only -- it reads '
+                     'the same decisions the report is built from and cannot '
+                     'change a count, and the report on stdout/--out is '
+                     'byte-identical with and without it.  It exists because '
+                     'an aggregated row cannot say WHICH instance survived: '
+                     '#281 left 2 of 13 syscall r11 rows standing and the '
+                     'residue could not be named without opening them.')
 AP.add_argument('--summary', default=None,
                 help='APPEND one machine-parsable CONTROL SUMMARY line, '
                      'carrying EVERY axis, to this file.  A negative control '
@@ -404,6 +416,25 @@ def note(book, kind, sig, qj):
     sample.setdefault((kind, sig), qj)
 
 
+WITNESS_ENC = set(x.strip().lower()
+                  for x in (A.witness or '').split(',') if x.strip())
+
+
+def witness(axis, q, pos, reg, qv, pv, w, cat, direction):
+    """Per-INSTANCE trace of one disagreeing value row, to stderr.
+
+    Off unless --witness names this encoding.  It prints what the classifier
+    decided and the two values it decided on, so a surviving row in an
+    aggregated count can be opened and named instead of guessed at."""
+    if not WITNESS_ENC or q['b'].lower() not in WITNESS_ENC:
+        return
+    m = (1 << (8 * w)) - 1
+    print('WITNESS %-7s pos=%-8d pc=%-12s %-6s qemu=%#018x ref=%#018x '
+          'w=%d  %s / %s'
+          % (axis, pos, q.get('pc'), reg, qv & m, pv & m, w, cat, direction),
+          file=sys.stderr)
+
+
 # The identically-placed mapping: the range of QEMU pointer values whose
 # PIN counterpart was the SAME value.  A load from outside it reads a cell
 # the two processes placed differently, so its content is process-private
@@ -480,25 +511,36 @@ def classify_value(reg, qv, pv, w, inherited, enc):
     if w == 8 and (b - a) in ESTAB:
         return ('MAPPING-POINTER', 'ORTHOGONAL')
     if enc == SYSCALL_ENC and reg in ('rcx', 'r11'):
-        # ARCHITECTURAL DEFECT, and it is upstream QEMU's, not the plugin's.
-        # SYSCALL performs THREE register effects: RCX <- RIP-of-next,
-        # R11 <- RFLAGS, and RFLAGS <- RFLAGS & ~IA32_FMASK (SYSRET then
-        # restores RFLAGS from R11).  QEMU's linux-user helper_syscall
-        # (target/i386/tcg/user/seg_helper.c:29) raises EXCP_SYSCALL and
-        # cpu_loop.c's EXCP_SYSCALL arm (linux-user/i386/cpu_loop.c:241)
-        # writes back only env->regs[R_EAX] and env->eip -- so NONE of the
-        # three happens and all three registers keep whatever they held.
-        # The tracer NAMES them correctly and publishes QEMU's value.
+        # THE DEFECT THIS RULE WAS WRITTEN FOR IS FIXED (#281).  Kept as a
+        # REGRESSION TRIPWIRE, and its former justification is corrected
+        # here rather than left standing, because a false justification in a
+        # reference harness is how a real disagreement gets waved through.
         #
-        # RCX and R11 are named HERE, ahead of every other rule, because
-        # SYSCALL clobbers them UNCONDITIONALLY: whatever else was true of
-        # this instruction's inputs, those two registers were going to
-        # differ.  RFLAGS is not in that position -- the flags going IN may
-        # already differ for an ordinary reason -- so it is named at the
-        # BOTTOM of this function, where it only claims rows nothing else
-        # explains.  Ordering it here instead moved 22 rows out of
-        # INHERITED-DIFFERING-INPUT and raised the criterion from 300 to
-        # 322, which is a rule taking credit for rows it did not earn.
+        # WHAT IT USED TO SAY, AND WHY THAT IS NOW FALSE.  SYSCALL performs
+        # three register effects -- RCX <- RIP-of-next, R11 <- RFLAGS,
+        # RFLAGS <- RFLAGS & ~IA32_FMASK (SYSRET restores RFLAGS from R11).
+        # This comment used to assert that qemu-user's helper_syscall did
+        # NONE of them.  It now does the first two: see
+        # target/i386/tcg/user/seg_helper.c, long mode, correct path.  The
+        # third is deliberately not emulated and MUST NOT BE -- measured
+        # natively, a Linux process observes RFLAGS UNCHANGED across a
+        # syscall, which is exactly what qemu-user now produces.
+        #
+        # WHAT IS MEASURED AT THE FIX, over four same-tip runs of this leg:
+        #   rcx    13 -> 0, 0, 0, 0        the class is gone outright
+        #   r11    13 -> 2, 1, 1, 1        and every survivor is NOT this
+        # In every surviving instance the tracer's r11 EQUALS the tracer's
+        # own flags and the reference's r11 equals the reference's flags
+        # (witnessed: pc 0x418ea0 and 0x418efc, qemu 0x206 vs ref 0x202,
+        # bit 2 / PF only).  So R11 took the flags word correctly on both
+        # sides and the disagreement is entirely in the flags that went IN
+        # -- the pointer-placement PF class already adjudicated under #272,
+        # not a clobber defect.
+        #
+        # THEY ARE STILL COUNTED, deliberately.  Re-labelling them
+        # ORTHOGONAL would lower the criterion by a scorer edit rather than
+        # by a trace change, which is the one direction this harness must
+        # never move on its own.  The re-adjudication is filed, not taken.
         return ('QEMU-USER-SYSCALL-NO-RCX-R11-CLOBBER', 'TRACER-SUBSET')
     hs = is_host_specific(enc)
     if hs:
@@ -528,12 +570,21 @@ def classify_value(reg, qv, pv, w, inherited, enc):
             return ('IN-MAPPING-WRONG-DELTA', 'UNACCOUNTED')
         return ('POINTER-OUTSIDE-EVERY-MEASURED-MAPPING', 'ORTHOGONAL')
     if enc == SYSCALL_ENC and reg == 'flags':
-        # The third register of the SYSCALL clobber set named above, placed
-        # here rather than beside RCX/R11 for the reason given there.
-        # OBSERVED: `syscall` at 0x41740e published flags 0x206 --
-        # byte-identical to what `subq $8,%rsp` left three instructions
-        # earlier -- against the reference's 0x202.  Neither the entry mask
-        # nor the SYSRET restore happened, so the value never moved.
+        # THIS RULE'S NAME IS A MISNOMER AND ITS ORIGINAL READING WAS WRONG.
+        # It was written as "the third register of the SYSCALL clobber set",
+        # on the reading that qemu-user failed to apply the IA32_FMASK entry
+        # mask.  MEASURED (#281 witness, the same static binary run natively
+        # and emulated): a Linux process observes RFLAGS UNCHANGED across a
+        # syscall on REAL HARDWARE -- the kernel's SYSRET reloads RFLAGS
+        # from R11 -- and qemu-user produces the identical answer.  There is
+        # no missing flags clobber to model; applying one would move the
+        # emulator AWAY from the hardware answer.
+        #
+        # What the rule actually claims, at this tip, is the same two
+        # syscall instances the r11 rule claims, whose flags differed
+        # BEFORE the instruction by one bit (PF) because a pointer landed
+        # differently in the two runs.  Left counted for the reason given
+        # at the r11 rule: the correction is a re-adjudication, filed.
         return ('QEMU-USER-SYSCALL-NO-RFLAGS-CLOBBER', 'TRACER-SUBSET')
     if reg in kernel_written:
         # THE SAME BOUNDARY, THE OTHER DIRECTION, AND ALSO UPSTREAM QEMU'S.
@@ -790,6 +841,7 @@ for pos, (pi, qj) in enumerate(pairs):
         else:
             st['srcval_mismatch'] += 1
             cat, direction = classify_value(c, qv, pv, w, inherited, q['b'])
+            witness('srcval', q, pos, c, qv, pv, w, cat, direction)
             if direction == 'ORTHOGONAL':
                 tainted.add(c)
                 inherited = True
@@ -835,6 +887,7 @@ for pos, (pi, qj) in enumerate(pairs):
         else:
             st['dstval_mismatch'] += 1
             cat, direction = classify_value(c, qv, pv, w, inherited, q['b'])
+            witness('dstval', q, pos, c, qv, pv, w, cat, direction)
             if direction == 'ORTHOGONAL':
                 tainted.add(c)
             elif direction == 'UNACCOUNTED':

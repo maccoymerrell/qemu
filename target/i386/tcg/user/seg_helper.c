@@ -30,6 +30,85 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
 
+#if defined(TARGET_X86_64) && defined(CONFIG_LINUX_USER)
+    /*
+     * SYSCALL's REGISTER EFFECTS, WHICH HAPPEN IN THE INSTRUCTION AND NOT IN
+     * THE KERNEL.
+     *
+     * Intel SDM vol.2 and AMD APM vol.3 both define SYSCALL as writing two
+     * general-purpose registers before it transfers control:
+     *
+     *     RCX    <- RIP of the instruction following SYSCALL
+     *     R11    <- RFLAGS, with RF cleared
+     *     RFLAGS <- RFLAGS AND NOT(IA32_FMASK)
+     *
+     * The first two are architecture, not kernel policy: they happen on the
+     * user side of the boundary, and a user-mode ABI is built on top of them
+     * (Linux's SYSRET return path reloads RFLAGS from R11, which is why a
+     * process observes its flags PRESERVED across a syscall but its RCX and
+     * R11 DESTROYED).  Every x86_64 psABI accordingly lists both registers as
+     * call-clobbered by a syscall.
+     *
+     * This helper used to raise EXCP_SYSCALL and write neither, so a guest
+     * saw RCX and R11 carry their pre-SYSCALL values across the call.  That is
+     * a value no real machine can produce, and it is visible: a dependency
+     * chain through RCX or R11 that hardware breaks at the syscall survives
+     * it here, and the registers land in a signal frame with stale contents.
+     * Measured, natively and under emulation, in the witness that accompanies
+     * this change: real hardware answers RCX = next RIP, R11 = the flags word
+     * going in; qemu-user answered with the sentinels the program planted.
+     *
+     * The third effect is deliberately NOT emulated, and the same measurement
+     * is why.  IA32_FMASK belongs to a kernel this mode does not have, and the
+     * masking it describes is undone by the SYSRET the kernel returns through,
+     * so a *-linux-user process must observe RFLAGS UNCHANGED across a
+     * syscall -- which is exactly what it observes natively, and exactly what
+     * it observes here.  Masking env->eflags by an env->fmask no guest ever
+     * wrote would move this AWAY from the hardware answer.
+     *
+     * SCOPE, and both boundaries are there because a host dispatcher reads
+     * the register this write would destroy:
+     *
+     *   - Long mode only.  Legacy-mode SYSCALL writes ECX alone, but it is
+     *     not a Linux entry point on real 32-bit hardware, and this emulator
+     *     routes it into cpu_loop()'s int-0x80 arm, which reads ECX as the
+     *     syscall's SECOND ARGUMENT.
+     *   - *-linux-user only.  bsd-user's amd64 dispatcher
+     *     (bsd-user/x86_64/target_arch_cpu.h) passes env->regs[R_ECX] as the
+     *     syscall's FOURTH ARGUMENT.  That is its own defect -- FreeBSD's
+     *     amd64 ABI puts arg4 in %r10 for precisely the reason this comment
+     *     is about -- but it is a defect in a dispatcher this change is not
+     *     authorised to touch, and clobbering RCX underneath it would turn a
+     *     wrong REGISTER VALUE into wrong SYSCALL BEHAVIOUR.
+     *
+     * Neither exclusion is a claim that the ISA differs there; both are
+     * emulator paths that would break, and both are named so the next reader
+     * can widen the scope by fixing the dispatcher rather than by guessing.
+     */
+    /*
+     * WRONG-PATH CARVE-OUT, and it is the one already ruled for this
+     * instruction.  A speculative SYSCALL is fetched and executed but never
+     * performed: the walker treats the unfollowable kernel edge as a branch
+     * side and continues at the architectural fall-through, leaving the
+     * skipped instruction's destinations at their previous values as its
+     * deterministic placeholder (champsim_tracer_wp.cc states the rule; the
+     * system-mode SYSCALL states the identical carve-out in
+     * target/i386/tcg/system/seg_helper.c, where the unwind precedes the
+     * RCX/R11 stores for exactly this reason).  Writing them here would make
+     * a wrong-path SYSCALL differ from a system-mode one for no architectural
+     * reason.  The CORRECT path -- the one a trace publishes and a reference
+     * measures -- takes the stores.
+     */
+    if ((env->hflags & HF_LMA_MASK)
+#ifdef CONFIG_PLUGIN
+        && likely(!cs->plugin_spec_mode)
+#endif
+        ) {
+        env->regs[R_ECX] = env->eip + next_eip_addend;
+        env->regs[11] = cpu_compute_eflags(env) & ~RF_MASK;
+    }
+#endif /* TARGET_X86_64 && CONFIG_LINUX_USER */
+
     cs->exception_index = EXCP_SYSCALL;
     env->exception_is_int = 0;
     env->exception_next_eip = env->eip + next_eip_addend;

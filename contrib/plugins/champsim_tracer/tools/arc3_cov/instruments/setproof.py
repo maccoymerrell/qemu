@@ -55,6 +55,66 @@ def compare(a, b):
     return common, changed, real_lost, real_gain, floor
 
 
+def rename_pairs(lost, gain, a, b):
+    """LOST/GAIN pairs that are one register RENAME, not a loss and a gain.
+
+    WHY THIS COLUMN EXISTS (#267).  With --suffix .dkey the family key is
+    per destination REGISTER -- "dst_dep@REG_IP" -- so renaming a generic
+    register moves every row of that register from the LOST column to the
+    GAIN column, at the same PCs, carrying the same facts.  Measured at
+    be8767a9aa against exec27d/verify/basekey: R11's REG_IP -> REG_PC
+    (5664563443) scored REAL-LOST=562 / REAL-GAIN=562 on x86_64 while the
+    wire had lost nothing at all.  A reader taking that 562 to R12.1's
+    "REAL-LOST=0, HARD" bar would report non-compliance that does not exist;
+    a reader in the other direction could let a real loss ride in beside a
+    rename.  Both are the instrument, not the wire.
+
+    SO IT IS REPORTED, NEVER SUBTRACTED.  REAL-LOST and REAL-GAIN keep their
+    full counts -- R12.1 forbids discounts and this is not one.  What is
+    added is the NAME of the shape, so the adjudication is on the record
+    instead of in someone's head:
+
+      RENAME-PAIRED      same PC, same family prefix, the register the
+                         family is keyed on is the only difference, and the
+                         pairing is 1:1 at that PC (an ambiguous pairing is
+                         not claimed).
+      payload-identical  ...and the row's own payload matches once the old
+                         register name is rewritten to the new one.  That is
+                         the strong form: nothing about the row changed but
+                         the register's spelling.
+
+    A LOST row with no partner is never paired, so a genuine loss cannot hide
+    here; the selftest plants exactly that case.
+    """
+    def split(fam):
+        return fam.split("@", 1) if "@" in fam else (fam, None)
+
+    by_pc_lost = collections.defaultdict(list)
+    by_pc_gain = collections.defaultdict(list)
+    for k in lost:
+        pre, reg = split(k[1])
+        if reg is not None:
+            by_pc_lost[(k[0], pre)].append((k, reg))
+    for k in gain:
+        pre, reg = split(k[1])
+        if reg is not None:
+            by_pc_gain[(k[0], pre)].append((k, reg))
+
+    pairs = []
+    for slot, ls in by_pc_lost.items():
+        gs = by_pc_gain.get(slot)
+        # 1:1 only.  Two lost and one gained at the same (pc, family) is not
+        # a rename this instrument is willing to assert.
+        if not gs or len(ls) != 1 or len(gs) != 1:
+            continue
+        (lk, lreg), (gk, greg) = ls[0], gs[0]
+        if lreg == greg:
+            continue
+        same = str(a[lk]).replace(lreg, greg) == str(b[gk])
+        pairs.append((slot[0], slot[1], lreg, greg, same))
+    return pairs
+
+
 def run(before, after, isas, suffix, show=12, quiet=False):
     """Returns (exit_code, totals)."""
     reasons = []
@@ -71,12 +131,23 @@ def run(before, after, isas, suffix, show=12, quiet=False):
                 print("%-8s NOT SCORED -- vacuity (see below)" % isa)
             continue
         common, changed, lost, gain, floor = compare(a, b)
+        pairs = rename_pairs(lost, gain, a, b)
         if not quiet:
             fam = collections.Counter(k[1] for k in changed)
             print("%-8s arms=%d/%d common=%-6d CHANGED=%-4d REAL-LOST=%-4d "
                   "REAL-GAIN=%-4d floor(pc-only-one-arm)=%d"
                   % (isa, len(a), len(b), len(common), len(changed),
                      len(lost), len(gain), floor))
+            if pairs:
+                # REPORTED, NEVER SUBTRACTED -- see rename_pairs().
+                ident = sum(1 for p in pairs if p[4])
+                regs = collections.Counter((p[2], p[3]) for p in pairs)
+                print("           RENAME-PAIRED %d of REAL-LOST %d "
+                      "(payload identical modulo the rename: %d) -- reported, "
+                      "NOT subtracted"
+                      % (len(pairs), len(lost), ident))
+                for (o, n), c in sorted(regs.items(), key=lambda kv: -kv[1]):
+                    print("             %-14s -> %-14s %d" % (o, n, c))
             for f, n in sorted(fam.items(), key=lambda kv: -kv[1]):
                 print("           CHANGED by family: %-18s %d" % (f, n))
             for tag, rows, src in (("REAL-LOST", lost, a), ("REAL-GAIN", gain, b)):
@@ -89,12 +160,18 @@ def run(before, after, isas, suffix, show=12, quiet=False):
         tot["lost"] += len(lost)
         tot["gain"] += len(gain)
         tot["floor"] += floor
+        tot["renamed"] += len(pairs)
+        tot["renamed_identical"] += sum(1 for p in pairs if p[4])
         tot["scored"] += 1
     if not quiet:
         print("TOTAL scored_isas=%d common=%d CHANGED=%d REAL-LOST=%d "
               "REAL-GAIN=%d floor=%d"
               % (tot["scored"], tot["common"], tot["chg"], tot["lost"],
                  tot["gain"], tot["floor"]))
+        if tot["renamed"]:
+            print("TOTAL RENAME-PAIRED=%d (payload identical modulo the "
+                  "rename: %d) -- reported, NOT subtracted from REAL-LOST"
+                  % (tot["renamed"], tot["renamed_identical"]))
     rc = L.report_vacuity(reasons) if not quiet else (2 if reasons else 0)
     return rc, tot
 
@@ -202,6 +279,58 @@ def selftest():
         checks.append(("--suffix .dkey scores the per-register form",
                        rc == 0 and tot["common"] == 1,
                        "rc=%d common=%d" % (rc, tot["common"])))
+
+        # ARM: #267 -- A REGISTER RENAME IS NAMED, AND IS NOT SUBTRACTED.
+        # The .dkey family key carries the register, so R11's REG_IP->REG_PC
+        # moved 562 x86_64 rows from LOST to GAIN at be8767a9aa while the wire
+        # lost nothing.  REAL-LOST must still read 1 (no discount, R12.1) AND
+        # the pair must be NAMED, with the payload-identity stated.
+        M = _plant(tmp, "M", None); N = _plant(tmp, "N", None)
+        pre = {("0x1000", "dst_dep@REG_IP"): ("N=REG_SP,REG_IP,IMM", "R=0x7")}
+        post = {("0x1000", "dst_dep@REG_PC"): ("N=REG_SP,REG_PC,IMM", "R=0x7")}
+        # A second PC keeps both arms non-vacuous and gives the pairing a
+        # negative neighbour it must not touch.
+        keep = {("0x2000", "dst_dep@REG_GPR0"): ("N=REG_GPR1", "R=0x4")}
+        _write(M, "x86_64", {**pre, **keep}, ".dkey")
+        _write(N, "x86_64", {**post, **keep}, ".dkey")
+        rc, tot = run(M, N, ["x86_64"], ".dkey", quiet=True)
+        checks.append(("PLANTED register rename: REAL-LOST is NOT discounted",
+                       rc == 0 and tot["lost"] == 1 and tot["gain"] == 1,
+                       "rc=%d lost=%d gain=%d" % (rc, tot["lost"], tot["gain"])))
+        checks.append(("...and it is NAMED as a rename pair, payload-identical",
+                       tot["renamed"] == 1 and tot["renamed_identical"] == 1,
+                       "renamed=%d identical=%d"
+                       % (tot["renamed"], tot["renamed_identical"])))
+
+        # ARM: A GENUINE LOSS CANNOT HIDE IN THE RENAME COLUMN.  The PC stays
+        # in both arms -- otherwise it would score FLOOR and never reach the
+        # loss column at all -- but its dst_dep is gone and what appeared in
+        # its place belongs to a DIFFERENT family.  The row must still be
+        # REAL-LOST, and must NOT be paired: a rename is same-PC AND
+        # same-family-prefix, and this is only the first of those.
+        P = _plant(tmp, "P", None)
+        _write(P, "x86_64",
+               {("0x1000", "store_data_dep@REG_GPR3"): ("N=Z", "R=0x8"),
+                **keep}, ".dkey")
+        rc, tot = run(M, P, ["x86_64"], ".dkey", quiet=True)
+        checks.append(("PLANTED genuine loss is NOT paired away",
+                       rc == 0 and tot["lost"] == 1 and tot["renamed"] == 0,
+                       "rc=%d lost=%d renamed=%d"
+                       % (rc, tot["lost"], tot["renamed"])))
+
+        # ARM: an AMBIGUOUS pairing (two lost, one gained at the same PC and
+        # family) is NOT claimed as a rename -- the instrument declines rather
+        # than guesses, which is what keeps the column trustworthy.
+        Q = _plant(tmp, "Q", None); R = _plant(tmp, "R", None)
+        amb_a = {("0x3000", "dst_dep@REG_IP"): ("N=A", "R=0x1"),
+                 ("0x3000", "dst_dep@REG_SP"): ("N=B", "R=0x2")}
+        amb_b = {("0x3000", "dst_dep@REG_PC"): ("N=A", "R=0x1")}
+        _write(Q, "x86_64", {**amb_a, **keep}, ".dkey")
+        _write(R, "x86_64", {**amb_b, **keep}, ".dkey")
+        rc, tot = run(Q, R, ["x86_64"], ".dkey", quiet=True)
+        checks.append(("AMBIGUOUS 2-lost/1-gained pairing is DECLINED",
+                       tot["lost"] == 2 and tot["renamed"] == 0,
+                       "lost=%d renamed=%d" % (tot["lost"], tot["renamed"])))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return L.selftest_report("setproof.py", checks)

@@ -1132,6 +1132,32 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
             fprintf(f, "O 0x%" PRIx64 " %s truncated\n", pc, dir ? "w" : "r");
         }
     }
+    /*
+     * AND THE OTHER THREE REASONS THE LISTS ARE NOT THE ANSWER.
+     *
+     * plugin_df_list() refuses on FOUR conditions, not one: the list's own
+     * overflow, printed above as `truncated`, and the three flags
+     * plugin_df_complete() reads -- fields, writes, discards.  The test is
+     * spelled out here rather than shared with plugins/api.c because that
+     * file is the plugin ABI and this one is the dump; a new flag has to be
+     * added to both, and the comment above each says so.  Until this
+     * line existed the dump could express only the first, so a reader of
+     * this file -- ordlist_check is one, and it is a standing acceptance --
+     * saw a complete-looking list of 24 entries for an instruction whose
+     * accessors were handing every consumer QEMU_PLUGIN_DF_INCOMPLETE.  A
+     * dump that cannot say its subject is refused is the failure mode this
+     * whole interface is shaped against, so it says it, and it names WHICH
+     * limit so the reading is actionable rather than a bare flag.
+     *
+     * Printed only when something is set: an X line means "these lists are
+     * NOT the answer", and a reader that never sees one has a whole file of
+     * answers.
+     */
+    if (d->fields_overflow || d->writes_overflow || d->discards_overflow) {
+        fprintf(f, "X 0x%" PRIx64 " incomplete fields=%u writes=%u"
+                " discards=%u\n", pc, d->fields_overflow,
+                d->writes_overflow, d->discards_overflow);
+    }
     for (unsigned i = 0; i < d->n_mem_rd; i++) {
         fprintf(f, "D 0x%" PRIx64 " r mem op=df\n", pc);
     }

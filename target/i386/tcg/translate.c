@@ -2244,6 +2244,25 @@ static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
      * (JMP_m / CALL_m) take a different path and never reach here.
      */
     plugin_gen_record_branch_target((uint64_t)(s->pc + diff));
+    /*
+     * The target is the INSTRUCTION POINTER plus a displacement the encoding
+     * carries, which makes RIP a source operand of every Jcc, JCXZ and LOOPcc
+     * in the program.  Without CF_PCREL, gen_jmp_rel() does that addition in C
+     * and emits `movi cpu_eip, <constant>`: no op reads the register, no temp
+     * stands for it, and a consumer asking what this instruction reads is told
+     * nothing at all.  R7.3 rules that the register the encoding names is not
+     * the emulator's to drop, so it is said here, where the pc-relative form is
+     * known.  Stated in the CF_PCREL arm too, where the addition already
+     * carries the read: one deduplicated list entry, and the two regimes
+     * publish the same read set by construction.
+     *
+     * Here rather than inside gen_jmp_rel(), which is also the FALL-THROUGH
+     * edge's emitter: naming RIP there would make it a source of whichever
+     * instruction happened to end a translation block, a fabricated dependency
+     * that moves with the block boundaries.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_eip));
     if (not_taken) {
         gen_set_label(not_taken);
     }

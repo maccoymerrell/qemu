@@ -2620,6 +2620,17 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
         } else {
+            /*
+             * `addiu rt,$zero,imm` IS `li rt,imm`, and this arm folds the
+             * source away: gen_load_gpr() is never called, so no
+             * zero-register note is taken and no op reads the operand.  R7.3
+             * rules the register the encoding names is not the emulator's to
+             * drop, so it is said here, where the register number is known.
+             * Calling the accessor to get a temp to hang a note on would emit
+             * a dead constant, which the capture discipline forbids.
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_note_folded_read_zero();
             tcg_gen_movi_tl(cpu_gpr[rt], uimm);
         }
         break;

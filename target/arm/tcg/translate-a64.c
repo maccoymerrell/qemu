@@ -8678,6 +8678,18 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
         TCGv_i64 tcg_rd = cpu_reg(s, a->rd);
         TCGv_i64 tcg_rm = cpu_reg(s, a->rm);
 
+        /*
+         * The encoding names XZR as Rn -- that is what makes these MOV and
+         * MVN -- and this fast path drops it: cpu_reg(s, 31) is never called,
+         * so no zero-register note is taken and no op reads the operand.  R7.3
+         * rules the register the encoding names is not the emulator's to drop,
+         * so say it here, where the register number is known.  Calling the
+         * accessor to get a temp to hang a note on would emit a dead constant,
+         * which the capture discipline forbids.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_folded_read_zero();
+
         if (a->n) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);
             if (!a->sf) {

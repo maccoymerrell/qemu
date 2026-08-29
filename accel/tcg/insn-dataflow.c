@@ -120,6 +120,17 @@
  */
 #define DF_MAX_FOLD_NOTES     512
 /*
+ * Folded-READ notes (insn_dataflow_note_folded_read).  One per source register
+ * an instruction's encoding names and the emitter resolved at translation
+ * time, PER INSTRUCTION -- the note carries an anchor and is deduplicated
+ * against it, so a block of nothing but conditional branches takes one note
+ * per branch rather than one for the block.  Sized like the zero-register
+ * notes: INSN_DF_MAX_INSNS instructions, one or two such operands each.  Past
+ * the cap the notes stop and the read list would be SHORT by a source the
+ * encoding named, so the overflow refuses the list rather than shortening it.
+ */
+#define DF_MAX_ENCREAD_NOTES  1024
+/*
  * Encoded-immediate operands stated by a decoder
  * (insn_dataflow_note_encoded_imm).  One per immediate operand an
  * instruction names, PER INSTRUCTION -- the note carries an anchor and is
@@ -228,6 +239,30 @@ typedef struct DfFoldNote {
      */
     const TCGOp *anchor;
 } DfFoldNote;
+
+/*
+ * CP-M, the folded-READ half: one architectural register an instruction's
+ * encoding names as a source, for which the emitter produced no temp at all.
+ * The register is what is carried -- there is nothing else to carry, which is
+ * the difference from DfFoldNote above.
+ */
+typedef struct DfEncReadNote {
+    /*
+     * The TCG global for the register, or NULL for the ZERO-REGISTER form,
+     * which has no global on any target that has the register -- the whole
+     * reason it needs a form of its own.
+     */
+    const void *src_ts;
+    /*
+     * The op the stating emitter had produced when the note was taken, which
+     * bounds the note to ONE instruction under the same cursor discipline the
+     * zero-register and immediate notes run under.  Without it the first `je`
+     * in a block would name the instruction pointer as a source of every
+     * instruction after it.
+     */
+    const TCGOp *anchor;
+    uint8_t zero;
+} DfEncReadNote;
 
 /*
  * CP-M, the address half: one temp an emitter will pass as an access address,
@@ -636,6 +671,15 @@ struct InsnDataflowScratch {
     bool fold_overflow;
 
     /*
+     * CP-M, the folded-READ half: the registers an encoding names as sources
+     * for which no temp was ever made.  The absence of a temp is the whole
+     * reason the note exists.
+     */
+    DfEncReadNote encread[DF_MAX_ENCREAD_NOTES];
+    unsigned n_encread;
+    bool encread_overflow;
+
+    /*
      * CP-M, the encoded-immediate half: the temps a decoder handed on as the
      * value its encoding names.  Pointers plus an anchor, no value: which
      * immediate it was is the guest's business and the wire's immediate bit
@@ -721,6 +765,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_fold             (df->fold)
 #define df_n_fold           (df->n_fold)
 #define df_fold_overflow    (df->fold_overflow)
+#define df_encread          (df->encread)
+#define df_n_encread        (df->n_encread)
+#define df_encread_overflow (df->encread_overflow)
 #define df_imm              (df->imm)
 #define df_n_imm            (df->n_imm)
 #define df_imm_overflow     (df->imm_overflow)
@@ -1650,6 +1697,8 @@ void insn_dataflow_note_reset(void)
     df_n_carrier = 0;
     df_n_fold = 0;
     df_fold_overflow = false;
+    df_n_encread = 0;
+    df_encread_overflow = false;
     df_n_imm = 0;
     df_imm_overflow = false;
     df_n_helper = 0;
@@ -1917,6 +1966,39 @@ static bool df_imm_operand_at(const TCGOp *op, unsigned cursor)
  * one namespace, and the folded operand is indistinguishable on the wire from
  * the same operand read live under CF_PCREL.  That is the point.
  */
+/*
+ * The GLOBAL a fold note names for @ts, or NULL.
+ *
+ * Same acceptance rule as df_fold_add_srcs() below and for the same reason:
+ * the newest note for the temp, and only while the op that defined the temp
+ * when the note was taken is still the op that defines it here.  A constant
+ * (anchor NULL) no op defines cannot go stale.
+ *
+ * Split out because the READ arm needs the register and not a provenance
+ * bitmap: a folded operand an op really reads is a SOURCE of the instruction,
+ * which is a different fact from where a value came from, and putting it in a
+ * provenance instead would decide the consumer's dependency question here.
+ */
+static const TCGTemp *df_fold_src_of(const TCGTemp *ts, unsigned scope)
+{
+    size_t ti = (size_t)(ts - tcg_ctx->temps);
+
+    if (ti >= TCG_MAX_TEMPS) {
+        return NULL;
+    }
+    for (unsigned k = scope > df_n_fold ? df_n_fold : scope; k-- > 0; ) {
+        if (df_fold[k].ts != (const void *)ts) {
+            continue;
+        }
+        if (df_fold[k].anchor == NULL ||
+            df_fold[k].anchor == df_defop_of(ti)) {
+            return (const TCGTemp *)df_fold[k].src_ts;
+        }
+        break;
+    }
+    return NULL;
+}
+
 static void df_fold_add_srcs(uint64_t *dst, const void *tsv, unsigned n,
                              unsigned scope)
 {
@@ -2275,7 +2357,7 @@ static void df_carrier_defined(const void *ts)
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
                     unsigned *zero_cursor, unsigned *imm_cursor,
-                    unsigned *disc_cursor)
+                    unsigned *disc_cursor, unsigned *encread_cursor)
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
@@ -2313,6 +2395,12 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      * instruction in the block.
      */
     unsigned disc_lo = *disc_cursor;
+    /*
+     * And the folded-READ notes, on the same discipline.  The low bound keeps
+     * one branch's statement about the instruction pointer out of every later
+     * instruction in the block -- see DfEncReadNote.
+     */
+    unsigned encread_lo = *encread_cursor;
 
     while (*zero_cursor < df_n_zero && df_zero[*zero_cursor].anchor == marker) {
         (*zero_cursor)++;
@@ -2323,6 +2411,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     while (*disc_cursor < df_n_discard &&
            df_discard[*disc_cursor].anchor == marker) {
         (*disc_cursor)++;
+    }
+    while (*encread_cursor < df_n_encread &&
+           df_encread[*encread_cursor].anchor == marker) {
+        (*encread_cursor)++;
     }
 
     /*
@@ -2366,6 +2458,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         while (prev_op != NULL && *disc_cursor < df_n_discard &&
                df_discard[*disc_cursor].anchor == prev_op) {
             (*disc_cursor)++;
+        }
+        while (prev_op != NULL && *encread_cursor < df_n_encread &&
+               df_encread[*encread_cursor].anchor == prev_op) {
+            (*encread_cursor)++;
         }
         prev_op = op;
 
@@ -2983,6 +3079,29 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
             df_or(prov, df_prov_of(ts - s->temps));
             /*
+             * A REGISTER THE EMITTER FOLDED, that this op is really reading.
+             * The note says the temp holds that register's value; the op
+             * reading it is what makes the register a SOURCE of this
+             * instruction, and without this the read set is short by exactly
+             * the register the encoding named -- every RIP-relative address on
+             * x86, and the return address a call pushes.
+             *
+             * Into the read set and the ordered list only.  NOT into @prov:
+             * whether a folded constant is a dependency EDGE is the consumer's
+             * call, and a bit here would be this file making it -- and would
+             * move destination masks the wire already publishes.
+             * See insn_dataflow_note_folded_reg().
+             */
+            {
+                const TCGTemp *fsrc = df_fold_src_of(ts, df_n_fold);
+                unsigned fidx;
+
+                if (fsrc != NULL && df_reg(fsrc, &fidx)) {
+                    df_bit(d->rd, fidx);
+                    df_ord_read(d, INSN_DF_ORD_GLOBAL, fidx);
+                }
+            }
+            /*
              * THE INSTRUCTION'S OWN ENCODED IMMEDIATE, stated by the decoder
              * that materialised it.  Tested on its own rather than as a branch
              * of the chain below, because the three facts are not exclusive:
@@ -3189,6 +3308,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
            df_discard[*disc_cursor].anchor == prev_op) {
         (*disc_cursor)++;
     }
+    while (prev_op != NULL && *encread_cursor < df_n_encread &&
+           df_encread[*encread_cursor].anchor == prev_op) {
+        (*encread_cursor)++;
+    }
     /*
      * THE DISCARDED WRITES, resolved LAST because their provenance is a
      * property of the finished instruction and not of any one op.
@@ -3201,6 +3324,46 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      * question `cmp`'s lowering -- result into the temp, flags into four
      * others -- gives no stable answer to.
      */
+    /*
+     * THE FOLDED READS -- registers the encoding named as sources for which
+     * the emitter produced no temp, so the op walk above could not have seen
+     * them.  Resolved here, after the walk, which puts them at the END of the
+     * ordered read list: there is no op to interleave them at, and the
+     * ordering contract reserves exactly that position for a member no op
+     * names.
+     *
+     * Both the bitmap and the list, because they answer different questions
+     * and a member in one but not the other is a contradiction a consumer
+     * would have to guess its way out of.  Nothing goes into any provenance:
+     * whether a folded operand is a dependency EDGE is the consumer's decision
+     * (see the header), and a bit in a write's provenance would be this file
+     * making it.
+     */
+    if (df_encread_overflow) {
+        /*
+         * Block-wide and deliberately over-broad, like the other note caps: a
+         * dropped statement is a SOURCE missing from the list and nothing here
+         * can say which instruction lost it.  The list is refused rather than
+         * published short -- the one error direction this file treats as an
+         * error.
+         */
+        d->rd_ord_overflow = 1;
+    }
+    for (unsigned i = encread_lo; i < *encread_cursor; i++) {
+        unsigned idx;
+
+        if (df_encread[i].zero) {
+            /*
+             * The architectural zero register has no TCG global, so @d->rd
+             * cannot hold it and the ordered list is the only place it can go
+             * -- the same asymmetry the operand-walk arm lives with.
+             */
+            df_ord_read(d, INSN_DF_ORD_ZERO, 0);
+        } else if (df_reg((const TCGTemp *)df_encread[i].src_ts, &idx)) {
+            df_bit(d->rd, idx);
+            df_ord_read(d, INSN_DF_ORD_GLOBAL, idx);
+        }
+    }
     for (unsigned i = disc_lo; i < *disc_cursor; i++) {
         df_add_discard(d, &df_discard[i]);
     }
@@ -3821,6 +3984,60 @@ void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts)
     df_n_fold++;
 }
 
+/*
+ * CP-M, the folded-READ half.  See insn_dataflow_note_folded_read() in the
+ * header for what the note says and why it needs no temp.
+ *
+ * Same list discipline as the zero-register notes -- append-only for the
+ * translation, anchored to the op the stating emitter had produced, resolved
+ * only inside the instruction whose op range reached that anchor.
+ *
+ * Deduplicated against the NEWEST note only, and on the (register, kind,
+ * anchor) triple.  One instruction can state the same register twice -- a call
+ * states it for the pushed return address and again for the target -- and both
+ * are one fact; the same register restated under a LATER anchor is a different
+ * instruction's fact and must not be swallowed.
+ */
+static void df_note_encread(const void *src_ts, bool zero)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (src_ts == NULL && !zero) {
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].src_ts == src_ts &&
+            df_encread[i].zero == (zero ? 1 : 0) &&
+            df_encread[i].anchor == anchor) {
+            return;
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = src_ts;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = zero ? 1 : 0;
+    df_n_encread++;
+}
+
+void insn_dataflow_note_folded_read(const void *src_ts)
+{
+    df_note_encread(src_ts, false);
+}
+
+void insn_dataflow_note_folded_read_zero(void)
+{
+    df_note_encread(NULL, true);
+}
+
 /* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */
 void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts)
 {
@@ -4054,6 +4271,7 @@ void insn_dataflow_extract(unsigned num_insns)
     unsigned zero_cursor;
     unsigned imm_cursor;
     unsigned disc_cursor;
+    unsigned encread_cursor;
     bool prof;
     int64_t t0;
 
@@ -4087,6 +4305,7 @@ void insn_dataflow_extract(unsigned num_insns)
     zero_cursor = 0;
     imm_cursor = 0;
     disc_cursor = 0;
+    encread_cursor = 0;
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         if (op->opc != INDEX_op_insn_start) {
@@ -4094,7 +4313,8 @@ void insn_dataflow_extract(unsigned num_insns)
         }
         if (first != NULL && idx > 0) {
             df_insn(&df_out[idx - 1], first, op, marker, &memop_cursor,
-                    &zero_cursor, &imm_cursor, &disc_cursor);
+                    &zero_cursor, &imm_cursor, &disc_cursor,
+                    &encread_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
@@ -4112,7 +4332,8 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     if (first != NULL && idx > 0) {
         df_insn(&df_out[idx - 1], first, NULL, marker, &memop_cursor,
-                &zero_cursor, &imm_cursor, &disc_cursor);
+                &zero_cursor, &imm_cursor, &disc_cursor,
+                &encread_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;

@@ -994,6 +994,77 @@ void insn_dataflow_note_indexed_write(const void *ts, const char *reg);
 void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts);
 
 /*
+ * CP-M, the FOLDED-READ half -- a register the ENCODING names as a source
+ * that the emitter resolved at translation time, so no op will ever read it.
+ *
+ * WHAT THIS IS FOR.  insn_dataflow_note_folded_reg() above says "this TEMP
+ * holds register R's value".  It needs a temp, and there are sources for which
+ * the emitter never makes one.  A direct conditional branch is the whole class
+ * on x86: `je .+2` computes its target as the instruction pointer plus a
+ * displacement, and QEMU does that addition in C, emitting
+ * `movi cpu_eip, <constant>`.  No temp anywhere in the op stream stands for
+ * RIP, so a consumer asking what this instruction reads is told nothing, and
+ * the register the encoding names -- which R7.3 says is not the emulator's to
+ * drop -- is missing from the read set of every branch in the program.
+ *
+ * WHAT IT SAYS, EXACTLY.  The instruction being translated takes @src_ts's
+ * architectural register as a SOURCE.  It says nothing about a value and
+ * nothing about a temp: there is no temp, which is the entire reason this
+ * exists.  @src_ts is the TCG GLOBAL for the register, so the fact lands in
+ * the ordinary read namespace -- the read bitmap and the ordered read list --
+ * and needs no bit of its own.
+ *
+ * WHERE IT LANDS IN THE ORDERED LIST.  After the op-walk's entries, in the
+ * position the ordering contract reserves for a member no op names.  It cannot
+ * be interleaved: there is no op to interleave it at.
+ *
+ * A CONSUMER DECIDES WHETHER IT IS AN EDGE.  Whether a branch target the
+ * translator folded is worth a dependency is a microarchitectural question,
+ * and answering it here would put the emulator's optimisation on the wire as
+ * though it were the machine.  This states the operand; the consumer rules.
+ *
+ * STATE IT IN EVERY TRANSLATION REGIME.  On x86 the CF_PCREL arm genuinely
+ * reads cpu_eip and the default arm does not; stating the note in both makes
+ * the two regimes publish the same read set BY CONSTRUCTION rather than by
+ * coincidence, at the cost of one deduplicated list entry.  A regime-shaped
+ * dataflow answer is a defect this tree has had to fix before.
+ *
+ * STATE IT ONLY WHERE THE ENCODING REALLY NAMES THE REGISTER.  Every
+ * instruction implicitly advances the program counter; that is not what this
+ * is for, and stating it at a fall-through edge would name the instruction
+ * pointer as a source of whichever instruction happened to end a translation
+ * block -- a fabricated dependency that moves with the block boundaries.  Call
+ * it from the emitter that forms a PC-RELATIVE OPERAND, and nowhere else.
+ *
+ * @src_ts is a TCGTemp pointer, void here for the same reason
+ * insn_dataflow_note_memop()'s are.  Capture only; no op is emitted, altered
+ * or suppressed, and a target that never calls this is unaffected.
+ */
+void insn_dataflow_note_folded_read(const void *src_ts);
+
+/*
+ * The ZERO-REGISTER form of the folded read.
+ *
+ * The same statement -- the encoding names a source the emitter resolved at
+ * translation time -- about the one register for which there is no TCG global
+ * to pass: the architectural zero.  `mov xd,xn` IS `orr xd,xzr,xn`,
+ * `mv rd,rs` IS `add rd,x0,rs` and `li rt,imm` IS `addiu rt,$zero,imm`; every
+ * one of them is an encoding that names the zero register, and every one is
+ * lowered to a plain move with that operand folded out before an op could read
+ * it.  Calling the accessor to obtain a temp to hang a note on would emit a
+ * dead constant, which the capture discipline here forbids, so the fact is
+ * stated directly.
+ *
+ * It reaches the ORDERED READ LIST and not the read bitmap, which is indexed
+ * by TCG global and can express neither this register nor a CPUArchState byte
+ * range.  That asymmetry is why the list is not a permutation of the bitmap,
+ * and it is already the contract.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_folded_read_zero(void);
+
+/*
  * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
  * encoding names, as it becomes a TCG value.
  *

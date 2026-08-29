@@ -2347,6 +2347,13 @@ static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
      * forms (JMP_m, CALL_m) take a separate path. */
     plugin_gen_record_branch_target(
         (uint64_t)(s->pc + decode->immediate));
+    /*
+     * RIP is a source operand of a direct JMP (and of the CALL that reaches
+     * here through gen_CALL) for the same reason and on the same terms as the
+     * conditional forms -- see the note at gen_conditional_jump_labels().
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_eip));
     gen_update_cc_op(s);
     gen_jmp_rel(s, s->dflag, decode->immediate, 0);
 }

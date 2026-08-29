@@ -17,6 +17,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_qdep.h"
+#include "champsim_tracer_src_survivors.h"
 
 /* The dataflow header carries no linkage guard of its own -- neither does
  * qemu-plugin.h, which champsim_tracer.h wraps the same way.  Without this
@@ -159,6 +160,39 @@ GHashTable *g_src_qemu_extra_sig = nullptr;
  */
 GHashTable *g_src_survivor_ident = nullptr;
 GHashTable *g_src_ident_witness = nullptr;
+/*
+ * THE FLIP'S COST, PER PUBLISHED SOURCE, measured against the survivor
+ * table rather than argued from it.
+ *
+ * A source-list flip publishes  QEMU's ordered read list  UNION  the rows
+ * champsim_tracer_src_survivors.h carries for this instruction's decode
+ * identity.  Whether that union is the set the wire publishes today is a
+ * question with two directions and they are counted apart, because one is
+ * a LOSS and the other is a GAIN and a single number would be readable as
+ * neither:
+ *
+ *   MISSING  a register the wire publishes today that the union does NOT
+ *            contain.  R12.1 forbids it: this is exactly the information
+ *            the flip would drop.  MUST BE 0.
+ *   EXTRA    a register the union contains that the wire does not publish
+ *            today.  Two populations share it -- QEMU-EXTRA (a source the
+ *            emulator states and the decode never named) and any register
+ *            a survivor row supplies to an instruction that does not want
+ *            it.  Tallied by row so the two are separable by inspection.
+ *
+ * MEASUREMENT ONLY.  Nothing here writes a wire field; the flip that would
+ * use this union is not this change.  What it does is make the flip's cost
+ * a number BEFORE the flip, which is the discipline the destination side's
+ * refuse route already follows.
+ */
+uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
+                          uint8_t *out, uint8_t cap);
+std::atomic<uint64_t> g_src_flip_missing{0};
+std::atomic<uint64_t> g_src_flip_extra{0};
+std::atomic<uint64_t> g_src_flip_scored{0};
+std::atomic<uint64_t> g_src_flip_no_row{0};
+GHashTable *g_src_flip_missing_sig = nullptr;
+GHashTable *g_src_flip_extra_sig = nullptr;
 /*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
@@ -1202,6 +1236,74 @@ uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
         out |= 1ULL << (nsrc + new_n);      /* the immediate bit */
     }
     return out;
+}
+
+/*
+ * THE SURVIVOR ROWS FOR ONE DECODE IDENTITY, resolved to registers.
+ *
+ * champsim_tracer_src_survivors.h is a MEASUREMENT re-emitted as a table
+ * (tools/gen_src_survivors.py): every register the tracer's per-ISA decode
+ * publishes as a source that QEMU's ordered read list does not state, keyed
+ * on qemu_plugin_insn_decode_id() because that is the only identity that
+ * survives the operand walk's removal.  A row is one of two kinds and the
+ * generator picked which from the census, not from a reading:
+ *
+ *   SRC_SURV_FIXED  the register belongs to the RULE.  `ret` reads SS in
+ *                   every encoding of `ret`; an aarch64 FP instruction
+ *                   consults the FP-enable gate whichever registers it
+ *                   names.  The row carries the generic id.
+ *   SRC_SURV_SELF   the register belongs to the INSTANCE.  `movlpd` writes
+ *                   one half of an XMM and leaves the other, `mthc1` one
+ *                   half of an FPR: the merged-into register is a source
+ *                   and it is whichever register the encoding named.  No
+ *                   constant can stand for that, so the row names none and
+ *                   the registers come from @f's own destination list.
+ *
+ * A decode id with NO row contributes nothing, and that is counted
+ * (g_src_flip_no_row) rather than passed over: a corpus-derived table is
+ * complete for the corpus it was derived from and the count is what says
+ * how often an instruction outside it turns up.
+ */
+uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
+                          uint8_t *out, uint8_t cap)
+{
+    unsigned isa = (unsigned)trace_isa;
+    uint8_t n = 0;
+
+    if (isa >= G_N_ELEMENTS(g_src_survivor_tables)) {
+        return 0;
+    }
+    const SrcSurvivorTable *t = &g_src_survivor_tables[isa];
+
+    if (!t->rows) {
+        return 0;
+    }
+    auto take = [&](uint8_t r) {
+        if (r == REG_NONE) {
+            return;
+        }
+        for (uint8_t k = 0; k < n; k++) {
+            if (out[k] == r) {
+                return;
+            }
+        }
+        if (n < cap) {
+            out[n++] = r;
+        }
+    };
+    for (unsigned i = 0; i < t->n; i++) {
+        if (t->rows[i].decode_id != decode_id) {
+            continue;
+        }
+        if (t->rows[i].kind == SRC_SURV_SELF) {
+            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                take(f->dst_regs[d]);
+            }
+        } else {
+            take(t->rows[i].reg);
+        }
+    }
+    return n;
 }
 
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
@@ -2279,10 +2381,38 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
              * rule is, and so a second mnemonic under one id is visible.
              */
             {
+                /*
+                 * THE ROLE COLUMN, and it is a measurement rather than a
+                 * label.  A survivor is reachable from the decode identity
+                 * in one of exactly two ways and the census says which:
+                 *
+                 *  FIXED  the register is a property of the RULE -- `ret`
+                 *         reads SS, an aarch64 FP instruction reads the
+                 *         FP-enable gate -- so the same register is right
+                 *         for every instruction the rule decodes.
+                 *  SELF   the register is a property of the INSTANCE -- a
+                 *         partial write merging into whichever register the
+                 *         encoding named -- so no constant can stand for it
+                 *         and it has to be read from the instruction's own
+                 *         destination list.
+                 *
+                 * The test is whether the SAME instruction publishes this
+                 * register as a DESTINATION.  gen_src_survivors.py reads
+                 * this column; nothing chooses the kind by hand.
+                 */
+                bool self = false;
+
+                for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                    if (f->dst_regs[d] == f->src_regs[i]) {
+                        self = true;
+                        break;
+                    }
+                }
                 char *key = g_strdup_printf(
-                    "%08x %-26s %-14s %s", q->decode_id,
+                    "%08x %-26s %-14s %-5s %s", q->decode_id,
                     q->decode_name ? q->decode_name : "?",
                     generic_reg_name_or_unknown(f->src_regs[i]),
+                    self ? "SELF" : "FIXED",
                     mnem ? mnem : "?");
                 tally(&g_src_survivor_ident, key);
                 g_free(key);
@@ -2323,6 +2453,67 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                                             generic_reg_name_or_unknown(
                                                 q->src_reg[k]));
                 tally(&g_src_qemu_extra_sig, key);
+                g_free(key);
+            }
+        }
+        /*
+         * THE FLIP'S COST, both directions, against the survivor table.
+         * See g_src_flip_missing's comment for what the two columns mean
+         * and why they are never netted.  Measurement only.
+         */
+        {
+            uint8_t surv[MAX_SRC_REGS];
+            uint8_t ns = src_survivor_regs(q->decode_id, f, surv,
+                                           (uint8_t)MAX_SRC_REGS);
+            auto in_union = [&](uint8_t r) {
+                for (uint8_t k = 0; k < q->n_src; k++) {
+                    if (q->src_reg[k] == r) {
+                        return true;
+                    }
+                }
+                for (uint8_t k = 0; k < ns; k++) {
+                    if (surv[k] == r) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            g_src_flip_scored.fetch_add(1, std::memory_order_relaxed);
+            if (!ns) {
+                g_src_flip_no_row.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (uint8_t i = 0; i < f->n_src_regs; i++) {
+                if (in_union(f->src_regs[i])) {
+                    continue;
+                }
+                g_src_flip_missing.fetch_add(1, std::memory_order_relaxed);
+                char *key = g_strdup_printf(
+                    "%08x %-26s %-14s %s", q->decode_id,
+                    q->decode_name ? q->decode_name : "?",
+                    generic_reg_name_or_unknown(f->src_regs[i]),
+                    mnem ? mnem : "?");
+                tally(&g_src_flip_missing_sig, key);
+                g_free(key);
+            }
+            for (uint8_t k = 0; k < ns; k++) {
+                bool on_wire = false;
+
+                for (uint8_t i = 0; i < f->n_src_regs; i++) {
+                    if (f->src_regs[i] == surv[k]) {
+                        on_wire = true;
+                        break;
+                    }
+                }
+                if (on_wire) {
+                    continue;
+                }
+                g_src_flip_extra.fetch_add(1, std::memory_order_relaxed);
+                char *key = g_strdup_printf(
+                    "%08x %-26s %-14s %s", q->decode_id,
+                    q->decode_name ? q->decode_name : "?",
+                    generic_reg_name_or_unknown(surv[k]),
+                    mnem ? mnem : "?");
+                tally(&g_src_flip_extra_sig, key);
                 g_free(key);
             }
         }
@@ -3577,6 +3768,47 @@ void qdep_report(GString *report)
         g_src_insn_nostate.load(std::memory_order_relaxed),
         g_src_wide.load(std::memory_order_relaxed));
     g_string_append(report,
+        "\nTHE SOURCE-LIST FLIP'S COST, measured against the survivor table\n"
+        "(champsim_tracer_src_survivors.h, generated by\n"
+        "tools/gen_src_survivors.py from the census above).  The flip would\n"
+        "publish QEMU's ordered read list UNION the rows that table carries\n"
+        "for the instruction's DECODE IDENTITY; these two rows say what that\n"
+        "union is and is not, per published source entry.  MEASUREMENT ONLY:\n"
+        "the wire's source list is still the operand walk's.\n");
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  published sources the union DOES NOT"
+        " CONTAIN -- MUST BE 0.\n"
+        "               R12.1: this is the information the flip would drop,"
+        " and a\n"
+        "               non-zero here is a table that does not carry its own"
+        " census\n"
+        "  %10" G_GUINT64_FORMAT "  registers a SURVIVOR ROW supplies that"
+        " the wire does not\n"
+        "               publish -- MUST BE 0.  A table row reaching an"
+        " instruction that\n"
+        "               does not want it is a FABRICATION, and R12.1 forbids"
+        " it exactly\n"
+        "               as it forbids the loss above."
+        "  Scored\n"
+        "               over the table's rows ALONE: the registers QEMU"
+        " states and\n"
+        "               the wire lacks are the QEMU-EXTRA line above and are"
+        " not\n"
+        "               counted twice here\n"
+        "  %10" G_GUINT64_FORMAT "  instructions scored for the two rows"
+        " above\n"
+        "  %10" G_GUINT64_FORMAT "  of them whose decode identity has NO"
+        " survivor row.  Not a\n"
+        "               defect on its own -- most instructions need none --"
+        " but it is\n"
+        "               what says how much of the population the table was"
+        " never\n"
+        "               derived from\n",
+        g_src_flip_missing.load(std::memory_order_relaxed),
+        g_src_flip_extra.load(std::memory_order_relaxed),
+        g_src_flip_scored.load(std::memory_order_relaxed),
+        g_src_flip_no_row.load(std::memory_order_relaxed));
+    g_string_append(report,
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
         "`no accesses / no dataflow ABI` still carries the refiner's mask:\n");
@@ -3804,9 +4036,13 @@ void qdep_report(GString *report)
     dump_tally(report, g_src_unjustified_sig,
                "SOURCE entries the wire publishes that QEMU's read list does\nnot justify, by mnemonic and generic register.  These are the source\nhalf's NAMED SURVIVORS (R12.1): every one is published exactly as\nbefore, and each row is a coverage path -- an emitter that has to state\nthe read, or an adjudication that the wire is right and QEMU is short:");
     dump_tally(report, g_src_survivor_ident,
-               "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the same\nrows as the block above, re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, and the mnemonic as an ANNOTATION.  A source-list flip\nlooks a survivor up by the id, because after the flip the mnemonic is\ngone; the rule name and the mnemonic are printed so a reader can see\nWHICH instruction a row is and so a second mnemonic under one id shows:");
+               "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the same\nrows as the block above, re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, the ROLE, and the mnemonic as an ANNOTATION.  A\nsource-list flip looks a survivor up by the id, because after the flip the\nmnemonic is gone.  ROLE says how the register is reached from the id:\nFIXED means the same register on every instruction the rule decodes, SELF\nmeans the instruction's own destination register (a partial write merging\ninto what the encoding named), which no constant can stand for.  This is\nthe column tools/gen_src_survivors.py reads:");
     dump_tally(report, g_src_ident_witness,
                "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over the WHOLE scored population, not only the survivors.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying:");
+    dump_tally(report, g_src_flip_missing_sig,
+               "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
+    dump_tally(report, g_src_flip_extra_sig,
+               "FLIP COST, THE FABRICATION DIRECTION -- registers a\nSURVIVOR ROW supplies that the wire does not publish, by decode id, rule,\nregister and mnemonic.  A FIXED row reaching an instruction the rule\ndecodes but that does not read the register lands here, and so does a\nSELF row on an instruction whose destination is not also a source.  The\nblock is empty when every row is right for every instruction its rule\ncarries:");
     dump_tally(report, g_src_qemu_extra_sig,
                "SOURCES QEMU states that the wire does not publish, by\nmnemonic and generic register.  The OTHER direction, and not a defect\nin either list on its own -- a source the wire lacks is what a list flip\nwould add, and it is listed so the two directions stay two numbers:");
     dump_tally(report, g_dst_reseat_refused_sig,

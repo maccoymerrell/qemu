@@ -288,6 +288,13 @@ typedef struct DfDiscardNote {
      * insn_dataflow_note_zero_write_holder().
      */
     bool holder;
+    /*
+     * The emulator PERFORMS this write, through an index only the encoding
+     * states.  See insn_dataflow_note_indexed_write(); part of the note key
+     * for the same reason @reg is, so a target that states both about one
+     * temp keeps two statements.
+     */
+    bool by_index;
     const TCGOp *anchor;
 } DfDiscardNote;
 
@@ -1457,6 +1464,14 @@ static void df_add_discard(InsnDataflow *d, const DfDiscardNote *n)
 
         if (same) {
             df_or(d->discards[i].prov, prov);
+            /*
+             * STICKY, and in one direction only: a register stated twice,
+             * once by a lowering arm that threw the write away and once by
+             * one that performed it, HAS been performed.  The opposite
+             * accumulation would let a discarding arm erase the fact that
+             * the machine's write happened.
+             */
+            d->discards[i].by_index |= n->by_index ? 1 : 0;
             return;
         }
     }
@@ -1466,6 +1481,7 @@ static void df_add_discard(InsnDataflow *d, const DfDiscardNote *n)
     }
     d->discards[d->n_discards].reg = reg;
     d->discards[d->n_discards].zero_reg = zero ? 1 : 0;
+    d->discards[d->n_discards].by_index = n->by_index ? 1 : 0;
     memcpy(d->discards[d->n_discards].prov, prov,
            sizeof(d->discards[d->n_discards].prov));
     d->n_discards++;
@@ -3426,7 +3442,7 @@ void insn_dataflow_note_zero_reg(const void *ts)
  * both against the multiply's own result temp.
  */
 static void df_note_discard(const void *ts, const char *reg, bool zero,
-                            bool holder)
+                            bool holder, bool by_index)
 {
     const TCGOp *anchor;
 
@@ -3445,6 +3461,7 @@ static void df_note_discard(const void *ts, const char *reg, bool zero,
     for (unsigned i = df_n_discard; i-- > 0; ) {
         if (df_discard[i].ts == ts && df_discard[i].reg == reg &&
             df_discard[i].zero == zero && df_discard[i].holder == holder &&
+            df_discard[i].by_index == by_index &&
             df_discard[i].anchor == anchor) {
             return;                 /* the same statement twice */
         }
@@ -3454,23 +3471,40 @@ static void df_note_discard(const void *ts, const char *reg, bool zero,
     df_discard[df_n_discard].reg = reg;
     df_discard[df_n_discard].zero = zero;
     df_discard[df_n_discard].holder = holder;
+    df_discard[df_n_discard].by_index = by_index;
     df_discard[df_n_discard].anchor = anchor;
     df_n_discard++;
 }
 
 void insn_dataflow_note_discarded_write(const void *ts, const char *reg)
 {
-    df_note_discard(ts, reg, false, false);
+    df_note_discard(ts, reg, false, false, false);
 }
 
 void insn_dataflow_note_discarded_zero_write(const void *ts)
 {
-    df_note_discard(ts, NULL, true, false);
+    df_note_discard(ts, NULL, true, false, false);
 }
 
 void insn_dataflow_note_zero_write_holder(const void *ts)
 {
-    df_note_discard(ts, NULL, true, true);
+    df_note_discard(ts, NULL, true, true, false);
+}
+
+/*
+ * CP-M, the INDEXED-WRITE half.  See insn_dataflow_note_indexed_write() in
+ * the header for why a performed write arrives on the same list as a
+ * discarded one, and why it is nevertheless not the same statement.
+ *
+ * It shares df_note_discard()'s storage because it needs exactly what that
+ * list provides and nothing else: a register named in the target's own
+ * namespace, a temp whose end-of-instruction provenance is the answer, and
+ * the anchor that keeps a block of them apart.  @by_index is what separates
+ * the two facts once they are there.
+ */
+void insn_dataflow_note_indexed_write(const void *ts, const char *reg)
+{
+    df_note_discard(ts, reg, false, false, true);
 }
 
 /*

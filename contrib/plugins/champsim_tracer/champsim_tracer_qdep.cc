@@ -135,18 +135,27 @@ GHashTable *g_dst_unmapped_name = nullptr;
 GHashTable *g_field_unnamed = nullptr;
 GHashTable *g_field_unmapped_name = nullptr;
 /*
- * The DISCARDED destinations (#260), on both sides of the same question.
+ * The destinations the ENCODING names and the OP STREAM does not carry
+ * (#260), on both sides of the same question and split by CAUSE.
  *
- * g_discard_rows counts the statements that landed -- an emitter said the
- * instruction writes a register the emulator throws away, and the row got a
- * generic word and a destination slot.  It is the number that makes the
- * #218 droppable population's fall a measurement rather than an absence.
+ * g_discard_rows counts the statements that landed where the emulator threw
+ * the write away -- `cmp` into XZR, `mul`'s destroyed HI/LO, `move $zero`.
+ * It is the number that makes the #218 droppable population's fall a
+ * measurement rather than an absence.
  *
- * g_discard_unmapped_name is the mirror: a name QEMU stated and the register
- * table has no generic word for.  Same shape and same fix as
+ * g_indexed_write_rows counts the OTHER cause, and it is counted apart
+ * because it is the opposite claim about the same absent op: the emulator
+ * PERFORMS this write, through an index only the encoding states.  AArch64's
+ * FEAT_MOPS is the class -- `cpyfe`/`cpyfm`/`sete`/`setm` pass one syndrome
+ * word and the helper pulls Rd, Rs and Rn out of it.  Folding the two would
+ * make g_discard_rows a count of neither thing.
+ *
+ * g_discard_unmapped_name is the mirror of both: a name QEMU stated and the
+ * register table has no generic word for.  Same shape and same fix as
  * g_field_unmapped_name -- the generator's table, not this file.
  */
 std::atomic<uint64_t> g_discard_rows{0};
+std::atomic<uint64_t> g_indexed_write_rows{0};
 GHashTable *g_discard_unmapped_name = nullptr;
 /*
  * A register QEMU DID give this file a generic word for, stated as WRITTEN
@@ -1517,7 +1526,11 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                     continue;
                 }
             }
-            g_discard_rows.fetch_add(1, std::memory_order_relaxed);
+            if (dc[i].by_index) {
+                g_indexed_write_rows.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_discard_rows.fetch_add(1, std::memory_order_relaxed);
+            }
             for (k = 0; k < out->n_dst; k++) {
                 if (out->dst_reg[k] == gen) {
                     break;
@@ -3162,6 +3175,20 @@ void qdep_report(GString *report)
         " emitter's own\n"
         "               statement can put it in QEMU's write list\n",
         g_discard_rows.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  INDEXED destination rows an emitter stated"
+        " (#260):\n"
+        "              a register the ENCODING names and the emulator WRITES,"
+        " through an\n"
+        "               index no op carries -- aarch64 FEAT_MOPS, whose helper"
+        " pulls Rd,\n"
+        "               Rs and Rn out of the syndrome word and addresses"
+        " env->xregs[]\n"
+        "               with them.  Counted apart from the line above because"
+        " the write\n"
+        "               HAPPENS: folding them would make that number a count of"
+        " neither\n",
+        g_indexed_write_rows.load(std::memory_order_relaxed));
     g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  destination rows the #236 LIST FLIP would have to"
         " REFUSE:\n"

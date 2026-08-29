@@ -516,6 +516,7 @@ unsigned qemu_plugin_insn_discards(const struct qemu_plugin_tb *tb, size_t idx,
             .struct_size = sizeof(r),
             .reg = d->discards[i].reg,
             .zero_reg = d->discards[i].zero_reg,
+            .by_index = d->discards[i].by_index,
         };
 
         if (want == 0 || want > sizeof(r)) {

@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 9
+#define QEMU_PLUGIN_DATAFLOW_VERSION 10
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -293,16 +293,27 @@ QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset);
 
 /*
- * THE DESTINATIONS THE ENCODING NAMES AND THE EMULATOR DISCARDS.
+ * THE DESTINATIONS THE ENCODING NAMES AND THE OP STREAM DOES NOT CARRY.
  *
- * A register with no TCG global and no CPUArchState storage cannot appear in
- * qemu_plugin_insn_reg_writes() or in qemu_plugin_insn_fields(), because both
- * are indexed by a place the value lives and this value lives nowhere.
- * AArch64's XZR is the case in point: `cmp x0,x1` IS `subs xzr,x0,x1`, and
- * the op stream carries the subtraction with its result going into a temp
- * that is then dropped.  MIPS reaches the same shape twice more -- `mul`
- * leaves HI and LO architecturally UNPREDICTABLE, and `move $zero,$ra`
- * translates to no op at all.
+ * TWO CAUSES, opposite claims about the same absent op, and @by_index says
+ * which.
+ *
+ * THE EMULATOR DISCARDED IT.  A register with no TCG global and no
+ * CPUArchState storage cannot appear in qemu_plugin_insn_reg_writes() or in
+ * qemu_plugin_insn_fields(), because both are indexed by a place the value
+ * lives and this value lives nowhere.  AArch64's XZR is the case in point:
+ * `cmp x0,x1` IS `subs xzr,x0,x1`, and the op stream carries the subtraction
+ * with its result going into a temp that is then dropped.  MIPS reaches the
+ * same shape twice more -- `mul` leaves HI and LO architecturally
+ * UNPREDICTABLE, and `move $zero,$ra` translates to no op at all.
+ *
+ * THE EMULATOR PERFORMED IT, THROUGH AN INDEX ONLY THE ENCODING STATES.
+ * AArch64's FEAT_MOPS hands its helper one syndrome word and the helper pulls
+ * the three register numbers out of it to address env->xregs[]; the op stream
+ * carries a call and two constants and no GPR write at all, and the
+ * per-helper usage row can say `xregs` but not WHICH.  The registers are
+ * named here because the decoder knew them, and @by_index is set because the
+ * write happens -- the next instruction reads it.
  *
  * A consumer that FILLS a destination list from the two accessors above is
  * short by exactly these registers.  They are named here, with the same
@@ -327,6 +338,13 @@ typedef struct qemu_plugin_dataflow_discard {
      */
     const char *reg;
     uint8_t zero_reg;
+    /*
+     * The emulator PERFORMS this write; it is not thrown away.  A consumer
+     * building the instruction's destination list wants both kinds and may
+     * ignore this; a consumer counting how much the emulator elides must not,
+     * because folding the two makes that number mean neither thing.
+     */
+    uint8_t by_index;
 } qemu_plugin_dataflow_discard;
 
 QEMU_PLUGIN_API

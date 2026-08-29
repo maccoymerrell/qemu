@@ -4558,6 +4558,60 @@ static void gen_mops_plugin_tb_end(DisasContext *s)
 #endif
 }
 
+/*
+ * CP-M, the INDEXED-WRITE half -- FEAT_MOPS' destination registers.
+ *
+ * `cpyfp`/`cpyfm`/`cpyfe` and `setp`/`setm`/`sete` pass the helper ONE
+ * constant, the syndrome, and the helper pulls Rd, Rs and Rn back out of it
+ * to address env->xregs[] (helper-a64.c do_cpy_common/do_setp and their
+ * siblings).  So the op list carries a call and two or three constants and no
+ * GPR write at all, and a destination list built from the ops is short by
+ * every register the instruction's own encoding names -- the failure
+ * direction insn-dataflow.h treats as worse than an imprecise answer.
+ *
+ * The registers are known HERE, in the same decode that packed them into the
+ * syndrome, and one op later they are known nowhere.  So this is where they
+ * are said.
+ *
+ * THE PROVENANCE IS THE WHOLE SYNDROME-NAMED SET, and that is a decision
+ * rather than a shortcut.  The helper's stopping point is data-dependent --
+ * how many bytes one step moves depends on the count in Xn and on the
+ * alignment of the addresses in Xd and Xs -- so every one of the updated
+ * registers can depend on every one of them.  Naming the set is an
+ * over-approximation ONLY where an ISA-level argument could rule an edge out,
+ * and the direction is the safe one: a mask naming FEWER registers than
+ * really feed a value tells a consumer it may issue before a producer has
+ * landed.  One note per (destination, source) pair; the rows merge on the
+ * register NAME and their provenances union.
+ *
+ * TAKEN AFTER THE CALL IS EMITTED.  The note anchors on the last op produced,
+ * and before the call that op still belongs to the PREVIOUS instruction.
+ */
+static void gen_mops_note_writes(const int *wr, unsigned nwr,
+                                 const int *rd, unsigned nrd)
+{
+    for (unsigned w = 0; w < nwr; w++) {
+        for (unsigned r = 0; r < nrd; r++) {
+            /*
+             * REGISTER 31 IS NOT cpu_X[31] HERE.  `set`'s Rs may be 31, and
+             * the architecture reads it as XZR; cpu_X[31] is SP, so naming it
+             * would put a register the instruction never touches into the
+             * provenance -- a fabricated edge, the error this file's whole
+             * note discipline is arranged against.  XZR is architecturally
+             * zero and contributes no edge, so the source is skipped: what is
+             * left is short by nothing a consumer can order against.  Neither
+             * DESTINATION can be 31 -- do_SET and do_CPY UNDEF on it before
+             * reaching here -- so @wr never indexes past the GPRs.
+             */
+            if (rd[r] == 31) {
+                continue;
+            }
+            insn_dataflow_note_indexed_write(tcgv_i64_temp(cpu_X[rd[r]]),
+                                             regnames[wr[w]]);
+        }
+    }
+}
+
 static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
                    bool is_setg, SetFn fn)
 {
@@ -4604,6 +4658,18 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
      */
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
+    /*
+     * SET updates the ADDRESS (Xd) and the COUNT (Xn); Xs holds the byte to
+     * write and the architecture does not update it.  All three are inputs:
+     * how far one call gets depends on the count and on Xd's alignment, and
+     * the datum is read every step.
+     */
+    {
+        const int wr[] = { a->rd, a->rn };
+        const int rdd[] = { a->rd, a->rs, a->rn };
+
+        gen_mops_note_writes(wr, ARRAY_SIZE(wr), rdd, ARRAY_SIZE(rdd));
+    }
     gen_mops_plugin_tb_end(s);
     return true;
 }
@@ -4666,6 +4732,15 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),
        tcg_constant_i32(rdesc));
+    /*
+     * CPY updates all three: the destination pointer, the source pointer and
+     * the remaining count.
+     */
+    {
+        const int rw[] = { a->rd, a->rs, a->rn };
+
+        gen_mops_note_writes(rw, ARRAY_SIZE(rw), rw, ARRAY_SIZE(rw));
+    }
     gen_mops_plugin_tb_end(s);
     return true;
 }

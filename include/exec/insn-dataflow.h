@@ -239,14 +239,21 @@ typedef struct InsnDataflowMemop {
 } InsnDataflowMemop;
 
 /*
- * A destination the ENCODING names and the emulator does not keep.
+ * A destination the ENCODING names that the op stream does not carry.
  *
- * See insn_dataflow_note_discarded_write().  @reg is the architectural
- * register's name in the target's own namespace -- the same strings
- * insn_dataflow_reg_name() and insn_dataflow_field_reg() produce -- because
- * the register has neither a TCG global nor an env byte range to be named
- * by, and inventing a third vocabulary for it would make the consumer's
- * name-to-register map incomplete in a way nothing measures.
+ * TWO CAUSES, and they are opposite claims about the same absent op, so the
+ * row says which.  The emulator DISCARDED the write -- see
+ * insn_dataflow_note_discarded_write() -- or the emulator PERFORMS it through
+ * a runtime index no op names, see insn_dataflow_note_indexed_write().
+ *
+ * @reg is the architectural register's name in the target's own namespace --
+ * the same strings insn_dataflow_reg_name() and insn_dataflow_field_reg()
+ * produce -- because a discarded register has neither a TCG global nor an env
+ * byte range to be named by, and inventing a third vocabulary for it would
+ * make the consumer's name-to-register map incomplete in a way nothing
+ * measures.  An indexed write names the same way for the same reason from the
+ * other side: the global exists, but which one it is is a value the encoding
+ * carries and the op list does not.
  */
 typedef struct InsnDataflowDiscard {
     /*
@@ -259,7 +266,19 @@ typedef struct InsnDataflowDiscard {
      */
     const char *reg;
     uint8_t  zero_reg;
-    uint64_t prov[INSN_DF_REG_WORDS];   /* where the discarded value came from */
+    /*
+     * The emulator PERFORMS this write; it is not thrown away.  Set by
+     * insn_dataflow_note_indexed_write() and STICKY across the merge, on the
+     * same discipline InsnDataflowWrite.supplies_value uses: a register
+     * stated twice, once as discarded by one lowering arm and once as
+     * performed by another, has been performed.
+     *
+     * A consumer that only wants "what does this instruction write" may
+     * ignore it; a consumer counting the emulator's dead-code elimination
+     * must not, and the two counts are what it exists to keep apart.
+     */
+    uint8_t  by_index;
+    uint64_t prov[INSN_DF_REG_WORDS];   /* where the value came from */
 } InsnDataflowDiscard;
 
 typedef struct InsnDataflowWrite {
@@ -802,6 +821,50 @@ void insn_dataflow_note_discarded_zero_write(const void *ts);
  * while the materialising write is still the last op emitted.
  */
 void insn_dataflow_note_zero_write_holder(const void *ts);
+
+/*
+ * CP-M, the INDEXED-WRITE half -- a destination the emulator writes through
+ * an index only the ENCODING states.
+ *
+ * AArch64's FEAT_MOPS is the whole of the class today.  `cpyfe`, `cpyfm`,
+ * `sete` and `setm` hand the helper ONE constant -- the syndrome -- and the
+ * helper pulls the three register numbers back out of it and addresses
+ * env->xregs[] with them (target/arm/tcg/helper-a64.c).  The op list carries
+ * a call and two constants; it carries no write to any GPR at all, and the
+ * per-helper usage row can only say `xregs` with INDEX NOT STATED.  So a
+ * destination list built from the op stream is SHORT by exactly the
+ * registers the instruction's own encoding names, which is the one error
+ * direction this file treats as worse than an imprecise one.
+ *
+ * THIS IS NOT insn_dataflow_note_discarded_write(), and the difference is a
+ * fact and not a shade.  A discarded write is one the emulator PROVED nobody
+ * would read and therefore did not perform; MOPS' writes are performed, and
+ * the next instruction reads them.  Saying so with the discarded-write note
+ * would put a performed write into the count of the emulator's dead-code
+ * elimination -- a number that then means neither thing.  @by_index carries
+ * the separation onto the row.
+ *
+ * @reg is the architectural name, and it must be a pointer that outlives the
+ * translation: the target's own register-name table is the intended form
+ * (AArch64's `regnames[]`), which is also what insn_dataflow_reg_name()
+ * returns for the same global, so the two vocabularies cannot drift.
+ *
+ * @ts is read exactly as insn_dataflow_note_discarded_write()'s is -- the
+ * temp or global whose provenance at the END of this instruction is where the
+ * written value came from.  For MOPS that is a GLOBAL the instruction only
+ * READS, so the note resolves to the register itself, and the emitter states
+ * the write once per SOURCE it depends on: the rows merge on the register
+ * NAME and their provenances union, which is how a value the helper computes
+ * from three registers gets all three named without any op having said so.
+ *
+ * THE ANCHOR IS LOAD-BEARING and it points the other way from the zero
+ * register's.  The note must be taken AFTER the helper call is emitted, not
+ * before: taken before, the last op produced still belongs to the PREVIOUS
+ * instruction and the walk would give the whole statement away to it.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_indexed_write(const void *ts, const char *reg);
 
 /*
  * CP-M, the FOLDED-REGISTER half -- a value an emitter derived from a
@@ -1363,6 +1426,10 @@ static inline void insn_dataflow_note_discarded_zero_write(const void *ts)
 static inline void insn_dataflow_note_zero_write_holder(const void *ts)
 {
 }
+static inline void insn_dataflow_note_indexed_write(const void *ts,
+                                                    const char *reg)
+{ }
+
 
 static inline void insn_dataflow_note_helper(const void *call_op,
                                              const void *info,

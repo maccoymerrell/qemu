@@ -45,6 +45,20 @@ agreement rate. The gate fails when
   by the translator, so a QEMU-side fix with no plugin change would
   otherwise leave every execution report looking fresh.
 
+  The reference is a **behaviour** time, not a link time. QEMU rebuilds
+  `qemu-version.h` from `git describe`, so any commit at all relinks all 62
+  emulators and moves all 62 mtimes; keyed on mtime, the guard called every
+  execution leg stale after a comment. Each binary is now held at the moment
+  its behaviour-bearing bytes last changed — a sha256 over its allocatable
+  `PROGBITS` section contents and `NOBITS` sizes, with the version stamp
+  masked out, remembered in `<build-dir>/.cst_behavior_ref.json`. A relink
+  that reproduces the same bytes does not move the bar; a real change does,
+  and the gate names the binary that moved it. One case is deliberately NOT
+  absorbed: a version string whose LENGTH changes (`-dirty` appearing or
+  going) shifts every rodata object after it and therefore shifts real
+  bytes, so the guard reports stale — the conservative direction. See
+  `behavior_digest.py`.
+
 ## What it does not do
 
 It does not run the legs. gem5, Spike and PIN take hours and need guests this

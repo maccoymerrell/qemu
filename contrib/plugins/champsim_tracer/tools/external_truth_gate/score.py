@@ -27,8 +27,12 @@ import argparse
 import os
 import re
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import behavior_digest  # noqa: E402  (same directory, no package)
+
 MANIFEST = os.path.join(HERE, 'ADJUDICATED.tsv')
 
 # Each leg's report is written by a different harness, so the headline is
@@ -94,14 +98,6 @@ def read_manifest(path):
     return rows
 
 
-def newest_mtime(paths):
-    best, which = 0.0, None
-    for p in paths:
-        if os.path.exists(p) and os.path.getmtime(p) > best:
-            best, which = os.path.getmtime(p), p
-    return best, which
-
-
 # THE STALENESS REFERENCE IS THE WHOLE MEASURED SUBJECT, NOT JUST THE PLUGIN.
 #
 # It used to be the plugin .so and cst_decode alone, and that is a hole this
@@ -118,6 +114,15 @@ def newest_mtime(paths):
 # emulator present in the build directory, and the file that set it is named
 # in the header so the reader can see which one the reports are being held
 # against.
+#
+# AND THE REFERENCE IS A BEHAVIOUR TIME, NOT A LINK TIME (#292).  Widening the
+# reference to all 62 emulators made the guard correct and made it useless in
+# the same commit: QEMU rebuilds `qemu-version.h` from `git describe`, so any
+# commit at all relinks every emulator and moves every mtime, and every
+# execution leg read stale after a comment.  What each binary is now held at
+# is the mtime at which its BEHAVIOUR-BEARING BYTES last changed -- see
+# behavior_digest.py for what that means and, just as importantly, for the one
+# case it refuses to absorb.
 def newest_binary(build_dir):
     paths = [
         os.path.join(build_dir, 'contrib/plugins/libchampsim_tracer.so'),
@@ -135,7 +140,7 @@ def newest_binary(build_dir):
         emu = os.path.join(build_dir, name[:-len('_tls_guard.ok')])
         if os.path.isfile(emu) and os.access(emu, os.X_OK):
             paths.append(emu)
-    return newest_mtime(paths)
+    return behavior_digest.behaviour_reference(build_dir, paths)
 
 
 def score_one(row, root, binary_mtime):
@@ -234,8 +239,9 @@ def main():
     only = set(a.only.split(',')) if a.only else None
 
     binary_mtime = 0.0
+    ref_rows = []
     if a.build_dir:
-        binary_mtime, ref_path = newest_binary(a.build_dir)
+        binary_mtime, ref_path, ref_rows = newest_binary(a.build_dir)
         if not binary_mtime:
             sys.exit('BUILD DIRECTORY HAS NO TRACER BINARIES: %s.  The '
                      'staleness guard cannot run, so it may not be skipped.'
@@ -246,7 +252,19 @@ def main():
     print('manifest      : %s' % a.manifest)
     if a.build_dir:
         print('staleness ref : %s' % a.build_dir)
-        print('  newest binary : %s' % ref_path)
+        print('  behaviour of  : %s' % ref_path)
+        print('  last changed  : %s'
+              % time.strftime('%Y-%m-%d %H:%M:%S',
+                              time.localtime(binary_mtime)))
+        moved = [r for r in ref_rows if r[4] != 'cached']
+        recomputed = len(moved)
+        changed = [r for r in moved if r[4].startswith('behaviour CHANGED')]
+        unreadable = [r for r in ref_rows if r[3] is None]
+        print('  %d binaries, %d re-digested, %d changed behaviour, '
+              '%d unreadable' % (len(ref_rows), recomputed, len(changed),
+                                 len(unreadable)))
+        for r in changed + unreadable:
+            print('    %-58s %s' % (os.path.basename(r[0]), r[4]))
     else:
         print('staleness ref : NOT CHECKED (no --build-dir)')
     print('')

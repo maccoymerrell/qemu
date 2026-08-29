@@ -52,7 +52,14 @@ usage() {
 # gate that always fails is as useless as one that always passes.
 selftest() {
     SCRATCH=${1:-${TMPDIR:-/tmp}/etg_selftest.$$}
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec33/verify/evroot}
+    # THE DEFAULT FIXTURE MOVES WITH THE CEILINGS (#305).  Arm A requires the
+    # unmodified reports to PASS, so the fixture has to be an evidence root
+    # whose headlines are at or under the ceilings CURRENTLY adjudicated.  When
+    # a ceiling is LOWERED -- #293 took the PIN row from 265 to 261 -- an older
+    # root's report is suddenly above it and arm A goes red for a reason that
+    # has nothing to do with the arm.  That red is the signal to re-point this
+    # default at the newest root, not to relax the ceiling.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec38/green/evroot}
     if [ ! -d "$SRC" ]; then
         echo "SELFTEST CANNOT RUN: no evidence root at $SRC." >&2
         echo "Set ETG_SELFTEST_ROOT.  A selftest with no subject FAILS." >&2
@@ -179,7 +186,7 @@ selftest() {
     # be an emulator: it reads the printed reference back and checks that the
     # emulator binaries were in the candidate set at all.
     "$PY" "$SCORE" "$SCRATCH/clean" --build-dir "$BD" > "$SCRATCH/e.out" 2>&1 || true
-    REF=$(sed -n 's/^  newest binary : //p' "$SCRATCH/e.out")
+    REF=$(sed -n 's/^  behaviour of  : //p' "$SCRATCH/e.out")
     if [ -z "$REF" ]; then
         echo "    ARM E FAILED -- the scorer did not print its staleness" >&2
         echo "    reference, so nobody can tell what the reports are held" >&2
@@ -204,9 +211,65 @@ selftest() {
         exit 1
     fi
 
+    echo "=== SELFTEST ARM F: the behaviour digest must ignore the version"
+    echo "===              stamp and must NOT ignore a code change"
+    # #292's fix has to discriminate in BOTH directions, and neither direction
+    # can be shown by a gate run: at any one tip the build has exactly one
+    # behaviour, so the guard's answer is a constant.  Prove the property on
+    # fixtures instead -- three shared objects this arm compiles itself:
+    #
+    #   base   a function returning 1, carrying the stamp "STAMP-AAAA"
+    #   stamp  the same function, carrying "STAMP-BBBB" -- SAME LENGTH
+    #   code   the stamp of `base`, but the function returns 2
+    #
+    # base vs stamp must give the SAME digest (that is the whole point) and
+    # base vs code must give DIFFERENT digests (or the guard is blind).  This
+    # is tip-independent, so it keeps proving the same thing after any commit.
+    CC=${CC:-cc}
+    FIX="$SCRATCH/fixtures"
+    mkdir -p "$FIX"
+    cat > "$FIX/base.c" <<'EOF_F'
+const char *cst_stamp(void) { return "STAMP-AAAA"; }
+int cst_value(void) { return 1; }
+EOF_F
+    sed 's/STAMP-AAAA/STAMP-BBBB/' "$FIX/base.c" > "$FIX/stamp.c"
+    sed 's/return 1;/return 2;/'   "$FIX/base.c" > "$FIX/code.c"
+    for f in base stamp code; do
+        if ! "$CC" -shared -fPIC -O2 -o "$FIX/$f.so" "$FIX/$f.c" \
+                 > "$FIX/$f.cc.log" 2>&1; then
+            echo "    ARM F CANNOT RUN: $CC could not build the fixture." >&2
+            cat "$FIX/$f.cc.log" >&2
+            exit 1
+        fi
+    done
+    BDG="$HERE/external_truth_gate/behavior_digest.py"
+    D_BASE=$("$PY" "$BDG" --stamp STAMP-AAAA --stamp STAMP-BBBB \
+                   "$FIX/base.so"  | awk '{print $1}')
+    D_STAMP=$("$PY" "$BDG" --stamp STAMP-AAAA --stamp STAMP-BBBB \
+                   "$FIX/stamp.so" | awk '{print $1}')
+    D_CODE=$("$PY" "$BDG" --stamp STAMP-AAAA --stamp STAMP-BBBB \
+                   "$FIX/code.so"  | awk '{print $1}')
+    if [ -z "$D_BASE" ] || [ -z "$D_STAMP" ] || [ -z "$D_CODE" ]; then
+        echo "    ARM F FAILED -- a fixture produced no digest, so the" >&2
+        echo "    comparison has no subject." >&2
+        exit 1
+    fi
+    if [ "$D_BASE" != "$D_STAMP" ]; then
+        echo "    ARM F FAILED -- a same-length stamp change moved the" >&2
+        echo "    digest, so #292 is not fixed: $D_BASE vs $D_STAMP" >&2
+        exit 1
+    fi
+    if [ "$D_BASE" = "$D_CODE" ]; then
+        echo "    ARM F FAILED -- a CODE change did not move the digest." >&2
+        echo "    The guard would pass a report taken before a real fix." >&2
+        exit 1
+    fi
+    echo "    stamp change: digest identical; code change: digest moved"
+
     echo ""
-    echo "SELFTEST PASSED -- 5 arms: clean green, planted red, missing red,"
-    echo "stale red, and the staleness reference proven to cover the emulators."
+    echo "SELFTEST PASSED -- 6 arms: clean green, planted red, missing red,"
+    echo "stale red, the staleness reference proven to cover the emulators,"
+    echo "and the behaviour digest proven to discriminate in both directions."
     echo "evidence: $SCRATCH"
     exit 0
 }

@@ -402,7 +402,18 @@ case "$STAGE" in
     link)    stage_link ;;
     compile) stage_compile ;;
     battery) stage_battery ;;
-    all)     stage_link; stage_compile; [ "$FAILED" = 0 ] && stage_battery ;;
+    # `all` RUNS ALL THREE STAGES, ALWAYS.  It used to short-circuit the
+    # battery whenever link or compile had already failed, on the reasoning
+    # that a battery with no plugin has nothing to say.  It has something to
+    # say and it says it: stage_battery's first act is to look for the
+    # plugin, and when it is missing it FAILS with that sentence.  Skipping
+    # it printed NOTHING about the third of R14's three stages, so a reader
+    # of an `all` run could not tell "the battery passed" from "the battery
+    # never ran" -- which is the silent-skip this file's own header forbids.
+    # The verdict does not change either way (FAILED is already 1); what
+    # changes is that the output now accounts for every stage it claims to
+    # cover.
+    all)     stage_link; stage_compile; stage_battery ;;
     *) echo "nocapstone_gate: unknown stage '$STAGE'" >&2; exit 2 ;;
 esac
 

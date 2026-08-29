@@ -5268,6 +5268,76 @@ QID_ADJUDICATIONS: dict[tuple[str, int], tuple[str, str]] = {
                      "decode-new.c.inc:564 X86_OP_ENTRY3(MOVDQ, W,x, "
                      "None,None, V,x, vex4_unal) -- as 0x1ef, store "
                      "direction"),
+
+    # decode_insn32/ori (0x8046d85c) IS NOT ADJUDICATED, and the reason is
+    # a measurement, because it looks adjudicable and is not.
+    #
+    # QEMU's decode file appears to settle it outright.  insn32.decode:153,
+    # the line directly above the ori pattern, says in words:
+    #
+    #   # cbo.prefetch_{i,r,m} instructions are ori with rd=x0 and not
+    #   # decoded.
+    #
+    # There is no prefetch row anywhere in riscv's decode tables, so on the
+    # letter of "what rule did the emulator dispatch on" the answer is ori
+    # and the GEN_OP_PREFETCH candidate is refuted.  That adjudication was
+    # WRITTEN, APPLIED and MEASURED, and the wire's own acceptance caught
+    # it: the validator coverage cell reports
+    #
+    #   opcode_assertion: blk_34 (probe_riscv_prefetch): expected a
+    #   PREFETCH instruction in its template insns but saw only
+    #   ['BRANCH', 'OR']
+    #
+    # 101 rows in the four-ISA wire corpus stop saying PREFETCH and start
+    # saying OR.  That is REAL-LOST under R12.1 and it does not become
+    # acceptable by being derivable from a QEMU comment: QEMU not modelling
+    # Zicbop is an EMULATOR GAP, not a statement that a prefetch is an or,
+    # and the standing ruling on upstream gaps is that they are reported as
+    # gaps rather than absorbed as tracer answers.  The Capstone key is
+    # genuinely finer here and carries information QEMU's rule does not.
+    #
+    # So the row stays QID_SPLIT -- it states that this identity does not
+    # determine the classification -- and the survivor keeps publishing the
+    # per-instance answer it publishes today.  It retires when QEMU decodes
+    # Zicbop, not before.
+
+    # 0x2b918996 = insn16.decode:173
+    #   slli            000 .  .....  ..... 10 @c_shift2
+    # One pattern, one trans_ function.  The two candidates -- c.slli and
+    # the RV128 shamt-encoding Capstone spells c.slli64 -- agree on every
+    # field the wire carries: same opcode GEN_OP_SHL, same branch class,
+    # same flags, same lane pair.  They differ ONLY in whether
+    # .dep_refine is stated, and that difference is not a fact about the
+    # instruction: it comes from Capstone's per-constant encoding-variant
+    # table, where one spelling carries a clean single-in/single-out
+    # shape and the other's variants are under-tagged.
+    #
+    # Same disposition, and same reason, as ("x86", 0x1ee): stating the
+    # pass-through refiner is the same answer said precisely, it is the
+    # shape a shift-by-immediate genuinely has, and the refiner bails by
+    # itself on any runtime shape outside that group -- so adopting it
+    # can narrow a mask and cannot invent an edge.
+    ("riscv", 0x2b918996): (
+        "RISCV_INS_C_SLLI64",
+        "insn16.decode:173 slli 000 . ..... ..... 10 @c_shift2 -- one "
+        "pattern; the candidates agree on opcode, branch class and flags "
+        "and differ only in whether the pass-through refiner is stated"),
+
+    # 0x88cd7ecf = target/mips/tcg/translate.c:229
+    #   OPC_JR       = 0x08 | OPC_SPECIAL, /* Also JR.HB */
+    # QEMU says it in the enumerator's own comment: this opcode IS jr.hb
+    # as well as jr.  There is no second decode and no second identity --
+    # gen_compute_branch() is reached with op1 == OPC_JR for both, and the
+    # hint bits are not consulted.  As with the riscv row above, the two
+    # candidates agree on opcode, branch class and flags and differ only
+    # in the Capstone-derived .dep_refine annotation.
+    ("mips", 0x88cd7ecf): (
+        "MIPS_INS_JR_HB",
+        "translate.c:229 OPC_JR = 0x08 | OPC_SPECIAL, whose own comment "
+        "says `Also JR.HB` -- one opcode for both spellings, hint bits "
+        "not consulted; the "
+        "candidates differ only in whether the pass-through refiner is "
+        "stated"),
 }
 
 
@@ -5635,24 +5705,45 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
         "",
         f"static const QemuIdentRow qemu_ident_{info.key}[] = {{",
     ]
+    def _note(body: str) -> str:
+        """Render one trailing /* ... */ note, refusing a body that would
+        break out of it.
+
+        The reasons quote QEMU source, and QEMU source contains comments.
+        A reason carrying `/*` or `*/` terminates the generated comment
+        early and the header stops compiling -- which is how it was found,
+        by quoting `OPC_JR = 0x08 | OPC_SPECIAL, /* Also JR.HB */`
+        verbatim.  A generator that can emit an uncompilable header on a
+        legal-looking input has a defect, so it refuses here rather than
+        writing the file: the fix belongs in the reason text, where a
+        human can rephrase it, not in a silent escape that would leave the
+        published justification subtly different from what was written.
+        """
+        if "/*" in body or "*/" in body:
+            raise SystemExit(
+                "qemu-ident note would break out of its C comment: "
+                + body)
+        return "  /* " + body + " */"
+
     for r in rows:
         note = ""
         if r.branch_fact:
-            note = ("  /* branch class from QEMU's rule: " +
-                    r.branch_fact + " */")
+            note = _note("branch class from QEMU's rule: " + r.branch_fact)
         elif r.adjudged:
-            note = ("  /* ADJUDICATED from " +
-                    "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
-                              for e, ms in r.split) +
-                    " -- " + r.adjudged + " */")
+            note = _note(
+                "ADJUDICATED from "
+                + "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
+                            for e, ms in r.split)
+                + " -- " + r.adjudged)
         elif r.split:
-            note = ("  /* SPLIT: " +
-                    "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
-                              for e, ms in r.split) + " */")
+            note = _note(
+                "SPLIT: "
+                + "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
+                            for e, ms in r.split))
         elif r.mnems:
-            note = "  /* " + ", ".join(r.mnems[:4]) + " */"
+            note = _note(", ".join(r.mnems[:4]))
         elif r.refused:
-            note = f"  /* emitter refused the name -> {r.refused} */"
+            note = _note(f"emitter refused the name -> {r.refused}")
         out.append(f'    {{ 0x{r.ident.ident:08x}u, "{r.ident.name}", '
                    f'{r.tier}, {"true" if r.split else "false"},')
         out.append(f'      {format_cls_init(r.entry)} }},{note}')

@@ -337,8 +337,8 @@ static const QemuIdentRow qemu_ident_riscv[] = {
       { .opcode = GEN_OP_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x2b50bcb9u, "decode_insn32/vmseq_vv", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_RISCV_VTYPE, .lane_parallel = true } },
-    { 0x2b918996u, "decode_insn16/slli", QID_SPLIT, true,
-      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* SPLIT: GEN_OP_SHL <- c_slli; GEN_OP_SHL <- c_slli64 */
+    { 0x2b918996u, "decode_insn16/slli", QID_ADJUDICATED, true,
+      { .opcode = GEN_OP_SHL, .branch_type = BRANCH_NONE, .flags = MF_NONE, .dep_refine = dep_passthrough } },  /* ADJUDICATED from GEN_OP_SHL <- c_slli; GEN_OP_SHL <- c_slli64 -- insn16.decode:173 slli 000 . ..... ..... 10 @c_shift2 -- one pattern; the candidates agree on opcode, branch class and flags and differ only in whether the pass-through refiner is stated */
     { 0x2bb404b1u, "decode_insn32/vmslt_vx", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_RISCV_VTYPE, .lane_parallel = true } },
     { 0x2c416f44u, "decode_insn32/bexti", QID_NAME_MATCHED, false,

@@ -1397,8 +1397,8 @@ static const QemuIdentRow qemu_ident_mips[] = {
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x88c58a77u, "decode_ase_msa/FFQR", QID_NONE, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
-    { 0x88cd7ecfu, "translate_mips/OPC_JR", QID_SPLIT, true,
-      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* SPLIT: GEN_OP_BRANCH <- jr; GEN_OP_BRANCH <- jr_hb */
+    { 0x88cd7ecfu, "translate_mips/OPC_JR", QID_ADJUDICATED, true,
+      { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_INDIRECT_JUMP, .flags = MF_NONE, .dep_refine = dep_passthrough } },  /* ADJUDICATED from GEN_OP_BRANCH <- jr; GEN_OP_BRANCH <- jr_hb -- translate.c:229 OPC_JR = 0x08 | OPC_SPECIAL, whose own comment says `Also JR.HB` -- one opcode for both spellings, hint bits not consulted; the candidates differ only in whether the pass-through refiner is stated */
     { 0x88cf9e10u, "translate_mips/OPC_DPA_W_QH", QID_NONE, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x890dc7b0u, "translate_mips/OPC_SUBQH_W", QID_NONE, false,

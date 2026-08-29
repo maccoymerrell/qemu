@@ -510,13 +510,13 @@ struct QDepInsn {
     /*
      * THE SOURCE LIST QEMU STATES, in the order the translation stated it.
      *
-     * The MEASUREMENT half of the source side, and measurement only: nothing
-     * here reaches the wire.  The question it exists to answer is the one
-     * the destination side has been answering since #232 and the source side
-     * never has -- for each register the wire PUBLISHES as a source, is
-     * there a QEMU statement that justifies it?  Until this list existed the
-     * source half of `src_regs[]` was unmeasured, which is not the same
-     * thing as measured and fine.
+     * THE WIRE'S SOURCE LIST is built from this: qemu_named_regs() takes it,
+     * so every register QEMU states the instruction reads is seated in
+     * src_regs[].  It is also still the census's subject -- for each register
+     * the wire PUBLISHES as a source, is there a QEMU statement that
+     * justifies it? -- because the two questions are the same one asked from
+     * opposite ends, and the census is what names the rows QEMU does not
+     * state.
      *
      * Read off qemu_plugin_insn_reg_read_list(), so it carries the two kinds
      * of member the read BITMAP cannot: a CPUArchState byte range, and the

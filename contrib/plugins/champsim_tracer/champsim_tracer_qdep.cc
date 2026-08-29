@@ -388,6 +388,31 @@ std::atomic<uint64_t> g_src_qemu_extra{0};
 std::atomic<uint64_t> g_src_insn_scored{0};
 std::atomic<uint64_t> g_src_insn_nostate{0};
 std::atomic<uint64_t> g_src_wide{0};
+/*
+ * READ-LIST MEMBERS THE TRACER'S VOCABULARY DROPS.
+ *
+ * note_src() SKIPS a member of QEMU's ordered read list it has no generic
+ * word for, and keeps the instruction scorable.  That is the right choice --
+ * refusing the whole instruction on one unnamed member would hide every
+ * other entry's verdict behind a vocabulary gap -- but it is not free, and
+ * until these counters existed the cost was invisible in exactly the
+ * direction that matters: a skipped member cannot justify anything, so a
+ * source the wire publishes CORRECTLY is reported UNJUSTIFIED, and the
+ * survivor table is then asked to carry a row for a fact QEMU did state.
+ *
+ * Split by WHY the member could not be named, because the three have three
+ * different coverage paths: a global outside the target's register count, a
+ * CPUArchState byte range no declared regfile covers, and a byte range with
+ * a QEMU field name that generic_for_field_name() does not map.  The last
+ * is the one #218/#226/#237 closed for the WRITE side; this is the read
+ * side of the same vocabulary.
+ */
+std::atomic<uint64_t> g_src_skip_global{0};
+std::atomic<uint64_t> g_src_skip_field_unnamed{0};
+std::atomic<uint64_t> g_src_skip_field_generic{0};
+std::atomic<uint64_t> g_src_skip_other{0};
+std::atomic<uint64_t> g_src_skip_insns{0};
+GHashTable *g_src_skip_sig = nullptr;    /* "reason  name" -> count */
 std::atomic<uint64_t> g_dst_repr_refused{0};
 GHashTable *g_dst_repr_sig = nullptr;       /* "mnem  REG" -> count */
 GHashTable *g_dst_repr_refused_sig = nullptr;
@@ -1391,6 +1416,7 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
 {
     unsigned n = qemu_plugin_insn_reg_read_list(tb, idx, nullptr, 0);
     std::vector<qemu_plugin_dataflow_reg_entry> e;
+    unsigned skipped = 0;
 
     if (n == QEMU_PLUGIN_DF_INCOMPLETE) {
         out->src_state = QDEP_R_NORECORD;
@@ -1421,6 +1447,8 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
         switch (e[i].kind) {
         case QEMU_PLUGIN_DF_ENT_GLOBAL: {
             if (e[i].reg >= g_nregs) {
+                g_src_skip_global.fetch_add(1, std::memory_order_relaxed);
+                skipped++;
                 continue;
             }
             /*
@@ -1442,29 +1470,71 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
 
             if (nf == QEMU_PLUGIN_DF_INCOMPLETE || nf > kMaxFields ||
                 e[i].index >= nf) {
+                g_src_skip_field_unnamed.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                tally(&g_src_skip_sig, "field-list  (no fields[] row)");
+                skipped++;
                 continue;
             }
             for (unsigned k = 0; k < nf; k++) {
                 fl[k].struct_size = sizeof(fl[k]);
             }
             if (qemu_plugin_insn_fields(tb, idx, fl, nf) != nf) {
+                g_src_skip_field_unnamed.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                tally(&g_src_skip_sig, "field-list  (second call short)");
+                skipped++;
                 continue;
             }
             if (!qemu_plugin_dataflow_field_reg(fl[e[i].index].env_offset,
                                                 fl[e[i].index].size,
                                                 fnm, sizeof(fnm))) {
+                g_src_skip_field_unnamed.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                {
+                    char *k2 = g_strdup_printf(
+                        "field-range  off=%u size=%u (no declared regfile)",
+                        fl[e[i].index].env_offset, fl[e[i].index].size);
+                    tally(&g_src_skip_sig, k2);
+                    g_free(k2);
+                }
+                skipped++;
                 continue;
             }
             gen = generic_for_field_name(fnm);
+            if (gen >= REG_ID_COUNT) {
+                g_src_skip_field_generic.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                {
+                    char *k2 = g_strdup_printf("field-word   %s", fnm);
+                    tally(&g_src_skip_sig, k2);
+                    g_free(k2);
+                }
+                skipped++;
+                continue;
+            }
             break;
         }
         case QEMU_PLUGIN_DF_ENT_ZERO:
             gen = REG_ZERO;
             break;
         default:
+            g_src_skip_other.fetch_add(1, std::memory_order_relaxed);
+            tally(&g_src_skip_sig, "kind         (unknown entry kind)");
+            skipped++;
             continue;
         }
         if (gen >= REG_ID_COUNT) {
+            g_src_skip_global.fetch_add(1, std::memory_order_relaxed);
+            {
+                const char *nm = qemu_plugin_dataflow_reg_name(e[i].reg,
+                                                              nullptr, nullptr);
+                char *k2 = g_strdup_printf("global-word  %s",
+                                           nm ? nm : "?");
+                tally(&g_src_skip_sig, k2);
+                g_free(k2);
+            }
+            skipped++;
             continue;
         }
         {
@@ -1493,6 +1563,9 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
             }
             out->src_reg[out->n_src++] = gen;
         }
+    }
+    if (skipped) {
+        g_src_skip_insns.fetch_add(1, std::memory_order_relaxed);
     }
     out->src_state = QDEP_OK;
 }
@@ -3767,6 +3840,34 @@ void qdep_report(GString *report)
         g_src_insn_scored.load(std::memory_order_relaxed),
         g_src_insn_nostate.load(std::memory_order_relaxed),
         g_src_wide.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "\nAND THE HALF OF THE SCORE THAT IS THE TRACER'S OWN VOCABULARY.\n"
+        "A member of QEMU's ordered read list this file has no generic word\n"
+        "for is SKIPPED and the instruction stays scorable, so the member\n"
+        "cannot justify anything -- and a source the wire publishes CORRECTLY\n"
+        "is then reported UNJUSTIFIED above.  These rows say how much of the\n"
+        "UNJUSTIFIED count is a QEMU statement this file could not read,\n"
+        "rather than a fact QEMU never made.  A non-zero here is a COVERAGE\n"
+        "PATH in the tracer's register vocabulary, not a survivor.\n"
+        "  %10" G_GUINT64_FORMAT "  read-list members skipped: a TCG global"
+        " with no generic word\n"
+        "  %10" G_GUINT64_FORMAT "  read-list members skipped: an env byte"
+        " range no declared\n"
+        "               regfile names (the #226 declaration's read side)\n"
+        "  %10" G_GUINT64_FORMAT "  read-list members skipped: a NAMED env"
+        " field with no generic\n"
+        "               word (the #218/#237 vocabulary's read side)\n"
+        "  %10" G_GUINT64_FORMAT "  read-list members skipped: an entry kind"
+        " this file does not\n"
+        "               know -- a NEW ABI kind would land here rather than"
+        " vanish\n"
+        "  %10" G_GUINT64_FORMAT "  instructions with at least one skipped"
+        " read-list member\n",
+        g_src_skip_global.load(std::memory_order_relaxed),
+        g_src_skip_field_unnamed.load(std::memory_order_relaxed),
+        g_src_skip_field_generic.load(std::memory_order_relaxed),
+        g_src_skip_other.load(std::memory_order_relaxed),
+        g_src_skip_insns.load(std::memory_order_relaxed));
     g_string_append(report,
         "\nTHE SOURCE-LIST FLIP'S COST, measured against the survivor table\n"
         "(champsim_tracer_src_survivors.h, generated by\n"
@@ -4013,6 +4114,8 @@ void qdep_report(GString *report)
     }
 
     g_mutex_lock(&g_tally_lock);
+    dump_tally(report, g_src_skip_sig,
+               "READ-LIST MEMBERS THE TRACER'S VOCABULARY DROPPED, by reason\nand name.  Each row is a fact QEMU DID state about a source that this\nfile could not carry into the score, so every published register it\nwould have justified is counted UNJUSTIFIED instead.  The reason IS the\ncoverage path: `field-word` needs a generic word, `field-range` needs an\ninsn_dataflow_declare_regfile() row, `global-word` needs a name mapping:");
     dump_tally(report, g_unmapped_name,
                "globals a provenance named that have no generic word\n(per ACCESS, so an instruction refused on both an address and a datum\ncounts twice here and once above):");
     dump_tally(report, g_refusal_sig,

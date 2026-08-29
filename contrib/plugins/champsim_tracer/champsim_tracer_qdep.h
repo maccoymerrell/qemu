@@ -517,10 +517,20 @@ struct QDepInsn {
      */
     uint8_t imm_non_dataflow;
     /*
-     * @writes_unbounded: QEMU wrote a register through a helper whose INDEX
-     * the source does not state -- aarch64 MOPS `cpyfe`/`sete`, whose
-     * destination is `env->xregs[mops_destreg(syndrome)]`.  749579ea65 made
-     * the CP-H reader say so instead of silently reporting a short set.
+     * @writes_unbounded: QEMU wrote an env member its own dataflow row could
+     * NOT narrow to a single register, so the write set it reports is short
+     * by a member it cannot name.  749579ea65 made the CP-H reader say so
+     * instead of silently reporting a short set.
+     *
+     * THE CONDITION IS GENERAL.  It mirrors `row->env[q].unbounded` on a
+     * WRITTEN member (accel/tcg/insn-dataflow.c, the helper_writes_unbounded
+     * assignment) and is not tied to any one target.  aarch64 MOPS
+     * `cpyfe`/`sete`, destination `env->xregs[mops_destreg(syndrome)]`, is
+     * the instance this flag was written for and the one whose coverage path
+     * is known.  It is NOT the only occupant: x86_64 carries rows here too,
+     * they are not MOPS, and nothing yet attributes them per mnemonic.  Do
+     * not read the counter as a MOPS count -- that reading was printed in
+     * the stats report and was wrong.
      *
      * IT IS NOT A REFUSAL CONDITION TODAY, and that is deliberate.  The
      * #236 LIST FLIP -- replacing the wire's `dst_regs[]` with QEMU's write

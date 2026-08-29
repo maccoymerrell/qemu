@@ -265,6 +265,18 @@ EOF_F
         exit 1
     fi
     echo "    stamp change: digest identical; code change: digest moved"
+    # The fixtures above only exercise a stamp the linker kept in ONE piece.
+    # The case that cost 29 emulators is a stamp SPLIT across a merged string
+    # pool, and it cannot be produced from a two-line C file -- so the mask is
+    # also required to reproduce the bytes actually measured in
+    # qemu-system-aarch64 .rodata, in both directions.
+    if ! "$PY" "$BDG" --selfcheck > "$FIX/mask.out" 2>&1; then
+        echo "    ARM F FAILED -- the stamp mask does not reproduce the" >&2
+        echo "    measured split-stamp bytes:" >&2
+        cat "$FIX/mask.out" >&2
+        exit 1
+    fi
+    sed 's/^/    /' "$FIX/mask.out"
 
     echo ""
     echo "SELFTEST PASSED -- 6 arms: clean green, planted red, missing red,"

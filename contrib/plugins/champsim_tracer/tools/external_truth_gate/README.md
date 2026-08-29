@@ -51,7 +51,9 @@ agreement rate. The gate fails when
   execution leg stale after a comment. Each binary is now held at the moment
   its behaviour-bearing bytes last changed — a sha256 over its allocatable
   `PROGBITS` section contents and `NOBITS` sizes, with the version stamp
-  masked out, remembered in `<build-dir>/.cst_behavior_ref.json`. A relink
+  masked out — whole occurrences and the long head/tail FRAGMENTS the linker's
+  merged string pool leaves behind, which is how 29 of the 62 emulators carried
+  the stamp — remembered in `<build-dir>/.cst_behavior_ref.json`. A relink
   that reproduces the same bytes does not move the bar; a real change does,
   and the gate names the binary that moved it. One case is deliberately NOT
   absorbed: a version string whose LENGTH changes (`-dirty` appearing or

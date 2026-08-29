@@ -165,12 +165,74 @@ def digest(path, stamps=()):
             data = fh.read(sh_size)
             if len(data) != sh_size:
                 raise NotAnElf('section %s truncated' % name)
-            for s in stamps:
-                if s in data:
-                    data = data.replace(s, b'\0' * len(s))
+            data = mask_stamps(data, stamps)
             h.update(b'P\0%s\0%d\n' % (name.encode(), sh_size))
             h.update(data)
     return h.hexdigest()
+
+
+# THE STAMP DOES NOT ALWAYS SURVIVE THE LINK IN ONE PIECE.
+#
+# Masking whole occurrences is not enough, and the softmmu binaries are where
+# that shows.  Measured on qemu-system-aarch64 across a real commit (only the
+# version string changed), .rodata carried the stamp TWICE: once verbatim
+# inside "QEMU emulator version ...", and once at 0x196e30 as
+#
+#     v10.0.8-1270-g23  270-g23da1c79b7\0
+#
+# -- the linker's merged string pool holding a 16-byte head and the matching
+# 15-byte tail adjacent, with no verbatim copy of the whole stamp anywhere
+# near.  Masking literals left both fragments, so 29 of 62 emulators reported
+# a behaviour change for a version bump and the fix delivered nothing where it
+# was needed most.
+#
+# So fragments are masked too: at every place the stamp's first eight bytes
+# occur, the longest matching PREFIX is zeroed, and at every place its last
+# eight bytes occur, the longest matching SUFFIX is zeroed -- both only when
+# the fragment reaches MIN_FRAGMENT bytes, which is what keeps this from
+# turning into a licence to zero any byte that looks version-ish.  Two
+# memchr-speed scans per stamp, not one scan per candidate length.
+MIN_FRAGMENT = 12
+_ANCHOR = 8
+
+
+def mask_stamps(data, stamps):
+    """Zero every whole occurrence of each stamp, and every long fragment."""
+    out = None
+    for s in stamps:
+        if len(s) < MIN_FRAGMENT:
+            continue
+        head, tail = s[:_ANCHOR], s[-_ANCHOR:]
+        hits = []
+        # Whole occurrences and head-anchored prefixes are the same walk: at a
+        # head hit, extend as far as the stamp still agrees.
+        i = data.find(head)
+        while i >= 0:
+            n = _ANCHOR
+            while (n < len(s) and i + n < len(data)
+                   and data[i + n] == s[n]):
+                n += 1
+            if n >= MIN_FRAGMENT:
+                hits.append((i, n))
+            i = data.find(head, i + 1)
+        # Tail-anchored suffixes: walk backwards from the end of the hit.
+        j = data.find(tail)
+        while j >= 0:
+            end = j + _ANCHOR
+            n = _ANCHOR
+            while (n < len(s) and end - n - 1 >= 0
+                   and data[end - n - 1] == s[len(s) - n - 1]):
+                n += 1
+            if n >= MIN_FRAGMENT:
+                hits.append((end - n, n))
+            j = data.find(tail, j + 1)
+        if hits:
+            if out is None:
+                out = bytearray(data)
+                data = out
+            for off, n in hits:
+                out[off:off + n] = b'\0' * n
+    return bytes(data) if out is not None else data
 
 
 def _load_cache(build_dir):
@@ -259,6 +321,53 @@ def behaviour_reference(build_dir, paths):
     return best, which, rows
 
 
+def _selfcheck():
+    """Prove mask_stamps() on the byte patterns that were actually measured.
+
+    The whole-literal case is easy and was never the problem.  The case that
+    cost 29 emulators is the SPLIT one, and the bytes below are copied from
+    qemu-system-aarch64 .rodata at 0x196e30 across a real commit: a 16-byte
+    head and the matching 15-byte tail, adjacent, with no verbatim copy of the
+    stamp anywhere in the region.  Two builds must reduce to the same bytes.
+    """
+    bad = 0
+
+    def arm(name, a_bytes, a_stamps, b_bytes, b_stamps, want_equal):
+        nonlocal bad
+        a = mask_stamps(a_bytes, sorted(a_stamps, key=len, reverse=True))
+        b = mask_stamps(b_bytes, sorted(b_stamps, key=len, reverse=True))
+        got = (a == b)
+        ok = (got == want_equal)
+        print('%-28s %s (masked equal: %s, wanted: %s)'
+              % (name, 'ok' if ok else 'FAILED', got, want_equal))
+        if not ok:
+            bad += 1
+
+    s1 = b'v10.0.8-1269-gcd28220db7'
+    s2 = b'v10.0.8-1270-g23da1c79b7'
+    f1 = b'10.0.8 (v10.0.8-1269-gcd28220db7)'
+    f2 = b'10.0.8 (v10.0.8-1270-g23da1c79b7)'
+
+    arm('whole literal',
+        b'QEMU emulator version ' + f1 + b'\nCopyright', [s1, f1],
+        b'QEMU emulator version ' + f2 + b'\nCopyright', [s2, f2], True)
+
+    arm('split head+tail (0x196e30)',
+        b'\x0a\x00\x00' + s1[:16] + s1[9:] + b'\x00\x80\x00', [s1, f1],
+        b'\x0a\x00\x00' + s2[:16] + s2[9:] + b'\x00\x80\x00', [s2, f2], True)
+
+    # And the direction that must NOT collapse: real bytes either side of the
+    # stamp have to survive, or the mask would be hiding the very changes the
+    # guard exists to catch.
+    arm('code either side survives',
+        b'\x48\x89\xe5' + s1 + b'\xc3', [s1, f1],
+        b'\x48\x89\xe5' + s2 + b'\x90', [s2, f2], False)
+    arm('short lookalike not masked',
+        b'v10.0.8-x', [s1, f1],
+        b'v10.0.8-y', [s2, f2], False)
+    return 1 if bad else 0
+
+
 def _main(argv):
     """Print the behaviour digest of each named file.
 
@@ -269,6 +378,8 @@ def _main(argv):
 
       behavior_digest.py [--stamp S]... FILE...
     """
+    if argv and argv[0] == '--selfcheck':
+        return _selfcheck()
     stamps, files = [], []
     i = 0
     while i < len(argv):

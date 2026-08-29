@@ -3184,6 +3184,30 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         if (rt != 0) {
             insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_gpr[rt]));
         }
+        /*
+         * AND THE READS, which the discarded-write notes above do NOT say.
+         *
+         * A discarded write states a WRITE and where its value came from;
+         * the provenance is not the instruction's READ SET, and this arm
+         * emits no op at all, so QEMU's ordered read list for `move
+         * $zero,$ra` is EMPTY while the encoding plainly names $ra as a
+         * source.  R7.3/R15: a source the emulator resolved at translation
+         * time -- here, resolved into nothing, because nothing can read
+         * $zero back -- is not the emulator's to drop.
+         *
+         * The zero-register operand of a two-operand form is deliberately
+         * NOT stated here.  That is the OTHER direction, a source the wire
+         * does not carry today, and it belongs with the same statement in
+         * gen_logic()'s own zero-folding arms rather than with this one.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs != 0) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
+        }
+        if (rt != 0) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
+        }
         return;
     }
 

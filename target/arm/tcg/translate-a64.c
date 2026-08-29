@@ -4610,6 +4610,37 @@ static void gen_mops_note_writes(const int *wr, unsigned nwr,
                                              regnames[wr[w]]);
         }
     }
+    /*
+     * AND THE SAME REGISTERS AS READS, which the loop above does NOT say.
+     *
+     * insn_dataflow_note_indexed_write() states a WRITE and the registers
+     * that write's value came from; it puts nothing in the instruction's
+     * ORDERED READ LIST, because provenance and read set are two facts and
+     * this file has been careful to keep them apart.  For every other
+     * instruction the read set falls out of the op walk, and here it cannot:
+     * the helper reaches env->xregs[] through indices it pulls back out of
+     * the syndrome constant, so no op names a GPR and QEMU's read list for
+     * `setm`/`cpye` and their siblings is EMPTY.
+     *
+     * The registers the encoding names as sources are known here and nowhere
+     * later -- the same reason the writes are stated here -- and R7.3/R15
+     * rule that a source the emulator resolved at translation time is not
+     * the emulator's to drop.  insn_dataflow_note_folded_read() is exactly
+     * that statement: the encoding names this register, no op will read it.
+     *
+     * @rd is the source list the caller built, so SET states Xd/Xs/Xn and
+     * CPY states Xd/Xs/Xn -- each instruction's own read set, not a shared
+     * one.  Register 31 is skipped for the reason above: `set`'s Xs may be
+     * XZR, cpu_X[31] is SP, and naming it would fabricate an edge.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    for (unsigned r = 0; r < nrd; r++) {
+        if (rd[r] == 31) {
+            continue;
+        }
+        insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_X[rd[r]]));
+    }
 }
 
 static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,

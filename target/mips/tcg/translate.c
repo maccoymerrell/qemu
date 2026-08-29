@@ -2957,6 +2957,30 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_ADDU ? MIPS_ID_OPC_ADDU :
             MIPS_ID_NONE);
+        /*
+         * `move rd,rs` IS `addu rd,rs,$zero`, and every arm below with a
+         * zero operand folds it away -- cpu_gpr[0] is never touched, so no
+         * op reads it and QEMU's ordered read list is short by a register
+         * the ENCODING names.  R7.3/R15 rule that absence the emulator's
+         * lowering choice and not the machine's, and gen_logic()'s NOR arm
+         * already says exactly this about `not rd,rs`.  One statement even
+         * when BOTH operands are $zero: the read set is a set and they are
+         * the same register.
+         *
+         * IT IS SAID HERE AND NOT IN A TABLE, and that is the whole point.
+         * A survivor table is keyed on the DECODE IDENTITY, which is the
+         * same for `addu $v0,$a0,$a1` and `addu $v0,$a0,$zero`; a constant
+         * row would hand the three-register form a REG_ZERO source it does
+         * not have.  Measured before this note existed: 493 fabricated rows
+         * on the w19 corpus, 609 on w3_coverage, 49 on the validator's own
+         * mipsel workload.  The condition is a property of the ENCODING and
+         * only the decoder can test it.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0 && rt != 0) {
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);

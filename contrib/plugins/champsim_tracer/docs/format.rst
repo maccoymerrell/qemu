@@ -3161,6 +3161,35 @@ carries the per-ID notes.
 
 The header map, not this table, is authoritative for decoding names.
 
+Where ``dst_regs[]`` comes from
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``dst_regs[]`` is the dictionary every destination-family field is read
+through: slot *d* names ``dst_regs[d]``, and ``dst_dep[d]``,
+``dst_lane_mask[d]`` and the *d*-th register snapshot all belong to it.
+
+Where the destination family publishes a dependency block, the list **is
+QEMU's own write list, in QEMU's order** — the registers the emitters
+stated this instruction writes, including the ones no op carries (a
+destination the emulator discarded, and one it performs through a runtime
+index the encoding names).  ``REG_PC`` is the single exception described
+in the section below: whether a pc write is the instruction's or the
+block's is not a distinction QEMU's statements draw, so a pc destination is
+carried only where the instruction's own decoding already named one.
+
+Where the destination family **refuses** — the dependency block carries no
+QEMU-stated mask and the wire keeps what the classifier wrote — the list is
+the classifier's too.  That pairing is the contract, not an accident: a
+refused row's mask and the list it indexes come from **one** source, so a
+consumer never reads a slot number written against one dictionary through
+another.  A block whose entries came from two sources would be worse than
+either alone, because nothing on the wire says which entry is which.
+
+Both facts are counted on every run, in the tracer's own statistics, as the
+number of published families whose dictionary is QEMU's and the number
+where the two lists could not be reconciled.  The second is a must-be-0
+row.
+
 .. _pc-as-destination:
 
 ``REG_PC`` as a destination

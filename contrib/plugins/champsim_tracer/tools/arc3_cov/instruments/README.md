@@ -12,15 +12,39 @@ the one location; later waves cite these paths and nothing else.
 | `score_families.py` | the J3 mutation battery over all four dependency families, floor-excluded, under both floor definitions |
 | `score_dst.py` | the destination family keyed per destination REGISTER |
 | `nodep_census.py` | the absolute census of slots naming no architectural register (the #230 class) |
+| `identsplit.py` | per-FIELD diff of a QID_SPLIT identity row's candidates: is the split about the INSTRUCTION, or only about which refiner is named |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
-fail on it.  Run all five before quoting any of them:
+fail on it.  Run them all before quoting any of them:
 
 ```sh
-for t in keyfacts setproof score_families score_dst nodep_census; do
+for t in keyfacts setproof score_families score_dst nodep_census identsplit; do
     python "$t.py" --selftest || echo "SELFTEST RED: $t"
 done
 ```
+
+## Why `identsplit.py` exists
+
+A QID_SPLIT row is decided by comparing the WHOLE `Entry`, so one word
+covers two different findings: candidates that disagree about what the
+instruction IS, and candidates that agree on every field the wire carries
+and differ only in whether a refiner is named.  Those have different
+dispositions, and reading a row's disposition off the whole-Entry verdict
+is how a taxonomy ruling gets written as if it were a QEMU fact.
+
+The tool also keeps `.refine` and `.dep_refine` apart, which the standing
+adjudications turn on and a single "refiner" bucket would hide.
+`.dep_refine` writes dependency masks only; `.refine` runs FIRST and
+rewrites the classification, opcode included.  Measured at EXEC39: the
+DEP-REFINER-ONLY set the tool reports is EXACTLY the set of rows the
+maintainer's standing refiner adjudications already cover, plus one that
+was not yet written, which is the cross-check that says the verdict means
+what it claims.
+
+The verdict is an input to an adjudication and never a substitute for
+one.  DEP-REFINER-ONLY says only that the row is in the shape a refiner
+adjudication MAY be written for; the adjudication still has to name a
+QEMU source fact, and it still has to survive the wire's own acceptance.
 
 ## The three rules these tools encode
 

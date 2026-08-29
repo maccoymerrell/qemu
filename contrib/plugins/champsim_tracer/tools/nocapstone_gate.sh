@@ -211,6 +211,13 @@ stage_battery() {
         elif ! grep -qE 'exec_cp=[1-9]' "$cell/audit.txt"; then
             fail "battery/$isa: audit reports exec_cp=0 — the run executed no traced instruction"; ok=0
         fi
+        # The auditor's own vacuity refusal (#313) is what makes its rc=0
+        # mean something on THIS trace.  If a future edit deletes Oracle 0,
+        # every zero below it silently goes back to being free, so the gate
+        # asserts the oracle RAN rather than trusting that it exists.
+        if ! grep -q '^=== VACUITY (Oracle 0) ===' "$cell/audit.txt"; then
+            fail "battery/$isa: cst_audit printed no VACUITY oracle — the empty-trace refusal (#313) is not in this binary, so its rc=0 is not evidence"; ok=0
+        fi
         if [ -f "$cell/s.stats" ]; then
             python3 "$SRC_ROOT/contrib/plugins/champsim_tracer/tools/arc3_cov/instruments/must0_scan.py" \
                     "$cell/s.stats" > "$cell/must0.txt" 2>&1

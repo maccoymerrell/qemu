@@ -13,6 +13,24 @@
  * Every field name was accepted on EVERY configured target that
  * compiles this file (they define TARGET_I386): i386-linux-user, i386-softmmu, x86_64-linux-user, x86_64-softmmu.
  *
+ * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,
+ * enumerated, and marked DF_HF_XLAT so the footprint is complete
+ * and the OPERAND set is not.  Selected by the SOURCE LINE the
+ * reader read the member off, never by helper name, so a sibling
+ * reaching the same line is covered the day it is derived:
+ *   divl_EAX                 eip      ../target/i386/tcg/excp_helper.c:127
+ *   divq_EAX                 eip      ../target/i386/tcg/excp_helper.c:127
+ *   fwait                    eip      ../target/i386/tcg/excp_helper.c:127
+ *   idivq_EAX                eip      ../target/i386/tcg/excp_helper.c:127
+ *   raise_exception          eip      ../target/i386/tcg/excp_helper.c:127
+ *   rechecking_single_step   eip      ../target/i386/tcg/excp_helper.c:127
+ *   xgetbv                   eip      ../target/i386/tcg/excp_helper.c:127
+ *   eip @ ../target/i386/tcg/excp_helper.c:127:
+ *     the exception frame's return address -- `env->exception_next_eip =
+ *     env->eip + next_eip_addend` in raise_interrupt2(), the common raise
+ *     path every helper that can fault reaches. It records WHERE the
+ *     exception happened; the instruction computes nothing from it
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   rdtsc                    env passed to cpu_get_tsc(), not defined in this unit
  *
@@ -135,7 +153,7 @@ static const DfHelperField dfu_cvttss2sq_env[] = {
     { offsetof(CPUArchState, sse_status), sizeof(((CPUArchState *)0)->sse_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/ops_sse.h:834 */
 };
 static const DfHelperField dfu_divl_EAX_env[] = {
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -144,7 +162,7 @@ static const DfHelperField dfu_divl_EAX_env[] = {
     { offsetof(CPUArchState, regs[2]), sizeof(((CPUArchState *)0)->regs[2]), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/int_helper.c:114 */
 };
 static const DfHelperField dfu_divq_EAX_env[] = {
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -314,7 +332,7 @@ static const DfHelperField dfu_fucomi_ST0_FT0_env[] = {
 };
 static const DfHelperField dfu_fwait_env[] = {
     { offsetof(CPUArchState, cr[0]), sizeof(((CPUArchState *)0)->cr[0]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:232 */
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -330,7 +348,7 @@ static const DfHelperField dfu_fxchg_ST0_STN_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:520, INDEX NOT STATED */
 };
 static const DfHelperField dfu_idivq_EAX_env[] = {
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -355,7 +373,7 @@ static const DfHelperField dfu_mulss_env[] = {
     { offsetof(CPUArchState, sse_status), sizeof(((CPUArchState *)0)->sse_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/ops_sse.h:531 */
 };
 static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -371,7 +389,7 @@ static const DfHelperField dfu_read_eflags_env[] = {
 };
 static const DfHelperField dfu_rechecking_single_step_env[] = {
     { offsetof(CPUArchState, eflags), sizeof(((CPUArchState *)0)->eflags), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/bpt_helper.c:37 */
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
@@ -405,7 +423,7 @@ static const DfHelperField dfu_update_mxcsr_env[] = {
 };
 static const DfHelperField dfu_xgetbv_env[] = {
     { offsetof(CPUArchState, cr[4]), sizeof(((CPUArchState *)0)->cr[4]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:3198 */
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:125 */
     { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:126 */
     { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */

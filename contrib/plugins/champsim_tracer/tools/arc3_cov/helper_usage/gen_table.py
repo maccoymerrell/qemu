@@ -230,6 +230,95 @@ def check_fields(isa, fields, workdir, lib=None):
 DIRNAME = {0: '0', 1: 'INSN_DF_RD', 2: 'INSN_DF_WR',
            3: 'INSN_DF_RD | INSN_DF_WR'}
 
+#
+# READS THE EMULATOR MAKES ON ITS OWN BEHALF -- keyed on the SOURCE LINE the
+# mechanical reader read them off, never on a list of helper names.
+#
+# WHY THIS EXISTS.  A helper handed tcg_env can read a member that IS a
+# register of the guest machine without that read being an OPERAND of the
+# instruction that called it.  The reader is right about the access -- the
+# helper really does load env->pc -- and wrong about nothing; the question
+# the `kind` column answers is a different one, and it already has the
+# DF_HF_XLAT answer for helper_lookup_tb_ptr's read of the same member.
+#
+# MEASURED, and it is why this table is here rather than in a comment.  With
+# QEMU's ordered read list seated in the wire's src_regs[], aarch64
+# `ccmp x0,x1,#0,eq` at the gem5 wrong-path probe's pc=0x4000f8 published
+# REG_PC as a source.  gem5's own commit line for that instruction reads
+# SR=[integer:1,condition_code:0,condition_code:1,condition_code:2,integer:0]
+# -- no program counter -- and the architecture agrees: a conditional compare
+# reads none.  The carrier was helper_guarded_page_check(env), which QEMU
+# emits AHEAD of the first instruction of a block entered with a non-zero
+# PSTATE.BTYPE, and whose body is `is_guarded_page(env, env->pc, 0)` -- an
+# INSTRUCTION-FETCH page-attribute probe on the instruction's own address.
+# The fetch is in no instruction's model on any target; publishing it here
+# would have made the wire say ccmp depends on the program counter.
+#
+# THE KEY IS THE CITATION so the rule cannot silently miss a sibling.  Every
+# helper that can raise reaches the same two lines -- x86's
+# `env->exception_next_eip = env->eip + next_eip_addend` and riscv's
+# trace_riscv_exception(..., env->pc) -- so a helper added to the census
+# tomorrow is covered the day it is derived, without anyone remembering to
+# name it.  A name list would have covered `divl_EAX` and missed `idivl_EAX`.
+#
+# WHAT IS DELIBERATELY NOT IN HERE.  x86 helper_syscall reads env->eip at
+# ../target/i386/tcg/user/seg_helper.c and that read IS an operand: SYSCALL
+# writes RIP-of-the-next-instruction into RCX, which is architecture and not
+# bookkeeping (Intel SDM vol.2, AMD APM vol.3).  It keeps DF_HF_OPERAND.
+# The rule is about the emulator reading the PC to say WHERE it is, never
+# about an instruction reading the PC to compute a VALUE.
+#
+NOT_OPERAND_SITES = {
+    'x86_64': {
+        'eip': {
+            '../target/i386/tcg/excp_helper.c:127':
+                'the exception frame\'s return address -- '
+                '`env->exception_next_eip = env->eip + next_eip_addend` in '
+                'raise_interrupt2(), the common raise path every helper that '
+                'can fault reaches.  It records WHERE the exception happened; '
+                'the instruction computes nothing from it',
+        },
+    },
+    'aarch64': {
+        'pc': {
+            '../target/arm/tcg/helper-a64.c:2555':
+                'the BTI guarded-page check -- `is_guarded_page(env, '
+                'env->pc, 0)`, an MMU_INST_FETCH probe of the attributes of '
+                'the page the instruction was FETCHED from.  QEMU\'s own '
+                'comment says the value is the block\'s start address and '
+                'is up to date for exactly that reason.  No instruction '
+                'records reading its own encoding, and this is that read',
+        },
+    },
+    'riscv64': {
+        'pc': {
+            '../target/riscv/op_helper.c:41':
+                'a TRACE POINT -- trace_riscv_exception(exception, name, '
+                'env->pc) inside riscv_raise_exception().  It names the '
+                'faulting address for a log line and reaches no guest state',
+        },
+    },
+}
+
+
+def apply_not_operand(isa, rows):
+    """Mark the emulator's own reads DF_HF_XLAT.  Returns the applied rows.
+
+    Reads the citation the mechanical reader recorded for the member, so a
+    member the reader read off a DIFFERENT line keeps DF_HF_OPERAND even
+    under the same helper and the same field name.
+    """
+    sites = NOT_OPERAND_SITES.get(isa, {})
+    applied = []
+    for name, v in rows:
+        for f, where in sorted(v.get('env_where', {}).items()):
+            why = sites.get(f, {}).get(where)
+            if why is None or not (v['env'].get(f, 0) & 1):
+                continue
+            v['xlat'] = sorted(set(v.get('xlat', [])) | {f})
+            applied.append((name, f, where, why))
+    return applied
+
 
 def row_guard(v, field_guard, refuse):
     """The macro a row must be emitted under, '' for none, None to refuse.
@@ -327,6 +416,8 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
             print('%s: hand row %s REFUSED -- direction collision on %s'
                   % (isa, name, ','.join(bad)))
 
+    not_operand = apply_not_operand(isa, rows)
+
     w = out.write
     hand = set(merged)
     refused = [(n, why) for n, why in refused if n not in hand]
@@ -369,6 +460,29 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
                      'arg%d' % m['data'] if m['data'] is not None
                      else '-',
                      'count unbounded' if m['unbounded'] else 'one access'))
+        w(' *\n')
+    if not_operand:
+        w(' * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,\n'
+          ' * enumerated, and marked DF_HF_XLAT so the footprint is complete\n'
+          ' * and the OPERAND set is not.  Selected by the SOURCE LINE the\n'
+          ' * reader read the member off, never by helper name, so a sibling\n'
+          ' * reaching the same line is covered the day it is derived:\n')
+        for n, f, where, why in sorted(not_operand):
+            w(' *   %-24s %-8s %s\n' % (n, f, where))
+        seen = set()
+        for _, f, where, why in sorted(not_operand):
+            if (f, where) in seen:
+                continue
+            seen.add((f, where))
+            w(' *   %s @ %s:\n' % (f, where))
+            line = ''
+            for word in why.split():
+                if len(line) + len(word) > 66:
+                    w(' *     %s\n' % line)
+                    line = ''
+                line = (line + ' ' + word).strip()
+            if line:
+                w(' *     %s\n' % line)
         w(' *\n')
     w(' * Rows refused, and therefore still OVER-APPROXIMATED at run time:\n')
     if not refused:

@@ -462,8 +462,8 @@ typedef struct DfHelperField {
     uint32_t size;
     uint8_t dir;
     /*
-     * Whether this access is an OPERAND of the guest instruction or QEMU's
-     * own TRANSLATION CONTEXT.
+     * Whether this access is an OPERAND of the guest instruction, or a read
+     * THE EMULATOR MAKES ON ITS OWN BEHALF.
      *
      * helper_lookup_tb_ptr's only CPUArchState reads are
      * cpu_get_tb_cpu_state(), which computes the key QEMU looks the next
@@ -474,6 +474,20 @@ typedef struct DfHelperField {
      * edge -- and eleven of them per branch overran INSN_DF_MAX_FIELDS on
      * every chained branch, measured: riscv64's truncation count went 0 ->
      * 383 the first time this row shipped without the distinction.
+     *
+     * THE TRANSLATION KEY IS NOT THE ONLY SUCH READ, and saying it was is
+     * what let the second kind through.  An exception-raise path records
+     * the faulting address (x86 `env->exception_next_eip = env->eip + ...`,
+     * riscv's trace point on env->pc), and aarch64's BTI check probes the
+     * attributes of the page the instruction was FETCHED from by handing
+     * `env->pc` to is_guarded_page().  Those are the emulator saying WHERE
+     * it is, not the instruction computing a value -- and the last of them
+     * was measured putting REG_PC on the wire as a source of
+     * `ccmp x0,x1,#0,eq`, which reads no program counter in any mode.  The
+     * usage table's generator selects them by the SOURCE LINE the reader
+     * read the member off, so a helper reaching the same line is covered
+     * without anyone remembering to name it, and helper_syscall's read of
+     * `env->eip` -- which becomes RCX, and IS an operand -- is not.
      *
      * They are still ENUMERATED, because a row that omitted them would be
      * claiming a footprint it had not accounted for.  They are not
@@ -496,6 +510,14 @@ typedef struct DfHelperField {
 } DfHelperField;
 
 #define DF_HF_OPERAND   0
+/*
+ * Not an operand: the emulator's own read.  Named XLAT for the first member
+ * of the class -- the TB lookup key -- and it now also carries the
+ * exception-raise path's record of the faulting address and the BTI check's
+ * probe of the fetched page.  The name is kept because it is the column's
+ * wire-visible spelling in four generated tables and renaming it would move
+ * audit rows for a fact that has not changed.
+ */
 #define DF_HF_XLAT      1
 
 /*

@@ -13,6 +13,18 @@
  * Every field name was accepted on EVERY configured target that
  * compiles this file (they define TARGET_RISCV): riscv32-linux-user, riscv32-softmmu, riscv64-linux-user, riscv64-softmmu.
  *
+ * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,
+ * enumerated, and marked DF_HF_XLAT so the footprint is complete
+ * and the OPERAND set is not.  Selected by the SOURCE LINE the
+ * reader read the member off, never by helper name, so a sibling
+ * reaching the same line is covered the day it is derived:
+ *   raise_exception          pc       ../target/riscv/op_helper.c:41
+ *   set_rounding_mode        pc       ../target/riscv/op_helper.c:41
+ *   pc @ ../target/riscv/op_helper.c:41:
+ *     a TRACE POINT -- trace_riscv_exception(exception, name, env->pc)
+ *     inside riscv_raise_exception(). It names the faulting address for a
+ *     log line and reaches no guest state
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   csrr                     env passed to predicate(), not defined in this unit
  *   csrw                     env passed to predicate(), not defined in this unit
@@ -82,12 +94,12 @@ static const DfHelperField dfu_fsqrt_d_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:453 */
 };
 static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/op_helper.c:41 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/op_helper.c:41 */
 };
 static const DfHelperField dfu_set_rounding_mode_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:82 */
     { offsetof(CPUArchState, frm), sizeof(((CPUArchState *)0)->frm), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/fpu_helper.c:60 */
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/riscv/op_helper.c:41 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/op_helper.c:41 */
 };
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, elp), sizeof(((CPUArchState *)0)->elp), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/riscv/cpu_helper.c:186 */

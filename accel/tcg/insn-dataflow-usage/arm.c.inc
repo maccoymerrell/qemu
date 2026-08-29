@@ -44,6 +44,20 @@
  *   sve_ld1bb_r          read  addr=UNSTATED data=-    one access
  *   sve_st1bb_r          write addr=UNSTATED data=-    one access
  *
+ * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,
+ * enumerated, and marked DF_HF_XLAT so the footprint is complete
+ * and the OPERAND set is not.  Selected by the SOURCE LINE the
+ * reader read the member off, never by helper name, so a sibling
+ * reaching the same line is covered the day it is derived:
+ *   guarded_page_check       pc       ../target/arm/tcg/helper-a64.c:2555
+ *   pc @ ../target/arm/tcg/helper-a64.c:2555:
+ *     the BTI guarded-page check -- `is_guarded_page(env, env->pc, 0)`,
+ *     an MMU_INST_FETCH probe of the attributes of the page the
+ *     instruction was FETCHED from. QEMU's own comment says the value is
+ *     the block's start address and is up to date for exactly that
+ *     reason. No instruction records reading its own encoding, and this
+ *     is that read
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   access_check_cp_reg      env passed to accessfn(), not defined in this unit
  *
@@ -250,7 +264,7 @@ static const DfHelperField dfu_guarded_page_check_env[] = {
     { offsetof(CPUArchState, exception.syndrome), sizeof(((CPUArchState *)0)->exception.syndrome), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/op_helper.c:68 */
     { offsetof(CPUArchState, exception.target_el), sizeof(((CPUArchState *)0)->exception.target_el), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/op_helper.c:69 */
     { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2493 */
-    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/helper-a64.c:2555 */
+    { offsetof(CPUArchState, pc), sizeof(((CPUArchState *)0)->pc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/helper-a64.c:2555 */
     { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:463 */
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */

@@ -5338,6 +5338,30 @@ QID_ADJUDICATIONS: dict[tuple[str, int], tuple[str, str]] = {
         "not consulted; the "
         "candidates differ only in whether the pass-through refiner is "
         "stated"),
+
+    # 0x48fe989e = target/arm/tcg/a64.decode:295
+    #   SYS  1101 0101 00 l:1 11 op1:3 crn:4 crm:4 op2:3 rt:5 op0=3
+    # One pattern, one trans_ function, and the direction is a FIELD of
+    # that pattern: `l` selects read from write, and trans_SYS hands it
+    # straight to handle_sys() as `isread`.  Both spellings Capstone
+    # gives it -- mrs (l=1) and msr (l=0) -- are the same rule moving one
+    # value between a GPR and a system register, and the classifier says
+    # so: same opcode GEN_OP_MOV, same branch class, same flags, same
+    # (absent) lane pair.  The one field they differ in is whether
+    # .dep_refine is stated.
+    #
+    # Same disposition and same reason as ("x86", 0x1ee), and the reason
+    # is checked against dep_passthrough rather than assumed: the shape
+    # is one source register into one destination register, which is the
+    # single-destination arm's exact subject, and the refiner BAILS
+    # WITHOUT PUBLISHING on any runtime shape outside it.  So adopting it
+    # can narrow a mask and cannot invent an edge.
+    ("aarch64", 0x48fe989e): (
+        "AARCH64_INS_MRS",
+        "a64.decode:295 SYS 1101 0101 00 l:1 11 op1:3 crn:4 crm:4 op2:3 "
+        "rt:5 op0=3 -- one pattern whose `l` field selects the direction "
+        "and is passed to handle_sys() as isread; the candidates differ "
+        "only in whether the pass-through refiner is stated"),
 }
 
 

@@ -1975,8 +1975,8 @@ static const QemuIdentRow qemu_ident_aarch64[] = {
       { .opcode = GEN_OP_VEC_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0x48db0eecu, "disas_t16/STR_rr", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_STORE, .branch_type = BRANCH_NONE, .flags = MF_NONE, .refine = refine_arm64_ldst_access, .dep_refine = dep_passthrough } },
-    { 0x48fe989eu, "disas_a64/SYS@1101010100.11...................", QID_SPLIT, true,
-      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* SPLIT: GEN_OP_MOV <- mrs; GEN_OP_MOV <- msr */
+    { 0x48fe989eu, "disas_a64/SYS@1101010100.11...................", QID_ADJUDICATED, true,
+      { .opcode = GEN_OP_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE, .dep_refine = dep_passthrough } },  /* ADJUDICATED from GEN_OP_MOV <- mrs; GEN_OP_MOV <- msr -- a64.decode:295 SYS 1101 0101 00 l:1 11 op1:3 crn:4 crm:4 op2:3 rt:5 op0=3 -- one pattern whose `l` field selects the direction and is passed to handle_sys() as isread; the candidates differ only in whether the pass-through refiner is stated */
     { 0x48ffbf74u, "disas_a64/LDR_v_i@00111100110.........01..........", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_LOAD, .branch_type = BRANCH_NONE, .flags = MF_NONE, .refine = refine_arm64_ldst_access, .dep_refine = dep_passthrough } },
     { 0x4904f0fdu, "disas_a64/SSRA_v@0.001111001.....000101..........", QID_NAME_MATCHED, false,

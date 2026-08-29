@@ -5,18 +5,40 @@
  * Author: Maccoy Merrell
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
+ * WHAT THIS TOOL IS, UNDER R13 AND R14
+ * ------------------------------------
+ * It is the STATIC LEG of the R13 external-truth gate, and Capstone appears
+ * in it as ONE EXTERNAL REFERENCE DECODER among several — LLVM MC, XED,
+ * iced.  It is NOT a gate on the plugin, and linking Capstone here says
+ * nothing about whether the plugin depends on Capstone: that question has
+ * its own gate (tools/nocapstone_gate.sh, ruling R14), which scopes itself
+ * to the plugin's own translation units for exactly this reason.  A
+ * reference decoder is a measuring instrument; a plugin dependency is the
+ * thing measured.  Conflating the two would make R14 unclosable, because
+ * the reference flow is meant to outlive the removal.
+ *
  * WHY THIS EXISTS
  * ---------------
  * Per instruction the tracer consumes (a) whether it touches memory and in
  * which direction, (b) its architectural register read/write sets, (c) its
- * branch taxonomy.  All three come from Capstone by way of the correction
- * boundary in disas/capstone.c.  Every self-consistency check the project
- * owns reads that same metadata, so a decoder defect is invisible to all of
- * them — it corrupts the trace and the checks agree with the corruption.
- * Intel PIN cross-validation broke that circle on x86 and found five real
- * defects.  PIN cannot reach aarch64 / riscv64 / mipsel; LLVM's MC layer can,
- * and is a second, independently maintained decoder plus instruction
- * description database.
+ * branch taxonomy.  Historically all three came from Capstone by way of the
+ * correction boundary in disas/capstone.c, and that is the circle this tool
+ * was built to break: every self-consistency check the project owns read
+ * that same metadata, so a decoder defect was invisible to all of them — it
+ * corrupted the trace and the checks agreed with the corruption.  Intel PIN
+ * cross-validation broke the circle on x86 and found five real defects.  PIN
+ * cannot reach aarch64 / riscv64 / mipsel; LLVM's MC layer can, and is a
+ * second, independently maintained decoder plus instruction description
+ * database.
+ *
+ * THAT PREMISE IS NOW PARTLY HISTORICAL, and saying so is the point.  The
+ * ARC 3 flip moved the memory direction, the dependency masks and the branch
+ * taxonomy onto QEMU's own translation; what the boundary still decides for
+ * the wire is the opcode taxonomy's residual rules and the ORDERED SOURCE
+ * AND DESTINATION REGISTER LISTS.  Those are what this tool's disagreement
+ * columns still speak to.  Nothing here should be read as a claim that the
+ * boundary is where the trace's facts come from — see docs/architecture.rst
+ * for what does.
  *
  * WHAT IS COMPARED — AND WHY IT IS THE BOUNDARY, NOT RAW CAPSTONE
  * ---------------------------------------------------------------

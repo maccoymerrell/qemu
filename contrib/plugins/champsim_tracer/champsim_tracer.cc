@@ -10452,6 +10452,33 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
             } else if (!spec) {
                 g_first_insn_word.emplace(ipc, word);
             }
+            /*
+             * R14's SECOND ADMISSION GATE, and the one that is easy to
+             * miss: the consult at build_canonical_insns decides what an
+             * instruction IS, and this decides whether its whole basic
+             * block enters the trace at all.  Both read the same Capstone
+             * answer, so a removal that retires the first and leaves this
+             * one reading mnemonic[0] refuses every block on a
+             * Capstone-free build, where the field is empty by
+             * construction.
+             *
+             * IT IS NOT DEAD, and a wpdepth=16 battery is not powerful
+             * enough to say that it is.  Measured at this tip over the
+             * four-ISA wire corpus (exec38/poison), correct-path row 0 on
+             * all four as the invariant requires, wrong-path row:
+             *
+             *     wpdepth=64     aarch64 1   mipsel 3   riscv64 0   x86_64 0
+             *     wpdepth=4096   aarch64 2   mipsel 0   riscv64 1   x86_64 1
+             *
+             * So this route really refuses wrong-path blocks, on three of
+             * the four ISAs, and deleting it would silently admit them
+             * with no decode behind them.  It needs a QEMU-SOURCED
+             * replacement, not a deletion and not a re-spelling:
+             * decode_id == 0 is NOT that replacement, because QEMU
+             * legitimately records no identity for instructions the
+             * correct path executes (12 on x86_64, 6 on aarch64 in the
+             * same corpus), so keying on it would poison real blocks.
+             */
             if (!p.poisoned &&
                 cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
                 p.poisoned = true;

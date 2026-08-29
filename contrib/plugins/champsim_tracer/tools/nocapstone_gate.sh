@@ -198,12 +198,19 @@ stage_battery() {
         elif [ "$tmpl" -le 0 ]; then
             fail "battery/$isa: the trace is EMPTY (templates=$tmpl) — strict decode and audit both pass on it, so their zeros mean nothing here"; ok=0
         fi
-        if ! grep -qE 'exec_cp=[1-9]' "$cell/audit.txt" 2>/dev/null; then
-            fail "battery/$isa: audit reports exec_cp=0 — the run executed no traced instruction"; ok=0
-        fi
+        # ORDER MATTERS AND IT WAS WRONG.  This grep used to run BEFORE the
+        # line below that writes audit.txt, so it read a file that did not
+        # exist yet (or, worse, a stale one from a previous invocation of
+        # the gate against the same --out directory).  Run the auditor, then
+        # read what it wrote.
         "$aud" "$cell/s.cst" > "$cell/audit.txt" 2>&1
         local arc=$?
         [ "$arc" = 0 ] || { fail "battery/$isa: cst_audit rc=$arc"; ok=0; }
+        if [ ! -s "$cell/audit.txt" ]; then
+            fail "battery/$isa: cst_audit produced no output — a check that cannot find its subject fails"; ok=0
+        elif ! grep -qE 'exec_cp=[1-9]' "$cell/audit.txt"; then
+            fail "battery/$isa: audit reports exec_cp=0 — the run executed no traced instruction"; ok=0
+        fi
         if [ -f "$cell/s.stats" ]; then
             python3 "$SRC_ROOT/contrib/plugins/champsim_tracer/tools/arc3_cov/instruments/must0_scan.py" \
                     "$cell/s.stats" > "$cell/must0.txt" 2>&1

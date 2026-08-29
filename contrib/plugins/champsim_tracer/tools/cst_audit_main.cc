@@ -1348,6 +1348,59 @@ int main(int argc, char **argv)
 
         bool fail = false;
 
+        /*
+         * Oracle 0 — VACUITY.  This one runs first because every other
+         * check in this file is a CONSERVATION or a COMPLETENESS check
+         * over a population, and both are trivially satisfied by the
+         * empty population.
+         *
+         * MEASURED, and this is why the oracle exists: a trace carrying
+         * templates=0, exec_cp=0 and a 2-byte body (the leading and
+         * trailing CST_MAGIC with nothing between them) passed this tool
+         * with rc=0 and printed "rollup 100.00%", and passed
+         * `cst_decode --strict` with rc=0 at the same time.  Nothing was
+         * wrong with either verdict on its own terms: an empty partition
+         * reconciles, and a walker that visits no entry finds no
+         * impossible attribution.  The two zeros simply did not mean what
+         * every acceptance gate in this tree read them to mean.
+         *
+         * A gate reading only those exit codes therefore reports GREEN on
+         * a plugin that traced nothing at all — the exact output shape a
+         * decoder removal produces when it is done by deletion instead of
+         * by replacement.  So the tool refuses the empty trace itself,
+         * rather than leaving every caller to remember a guard.
+         *
+         * The condition is deliberately the CONJUNCTION of "no template
+         * was published" and "no correct-path instruction was executed".
+         * Either alone has honest occupants — a trace can legitimately
+         * publish templates whose blocks never retired inside the capture
+         * window — but a trace with neither has no instruction in it
+         * under any reading, and no consumer can do anything with it.
+         */
+        std::printf("\n=== VACUITY (Oracle 0) ===\n");
+        std::printf("  templates %s   profile exec_cp %s   CP entries %s\n",
+                    fmt_n(s.templates_count).c_str(),
+                    fmt_n(prof_exec_cp).c_str(),
+                    fmt_n(s.cp_entries).c_str());
+        if (s.templates_count == 0 && prof_exec_cp == 0) {
+            std::printf("  VIOLATED: the trace carries no instruction — "
+                        "every other oracle below is vacuously satisfied "
+                        "and its zero means nothing\n");
+            std::fprintf(stderr,
+                "cst_audit: FAIL: EMPTY TRACE: templates=%llu exec_cp=%llu "
+                "cp_entries=%llu body=%llu B — the byte rollup and the "
+                "completeness lints are all trivially satisfied by an empty "
+                "population, so their zeros are not evidence of health\n",
+                (unsigned long long)s.templates_count,
+                (unsigned long long)prof_exec_cp,
+                (unsigned long long)s.cp_entries,
+                (unsigned long long)s.body_total);
+            fail = true;
+        } else {
+            std::printf("  OK: the population the oracles below score is "
+                        "non-empty\n");
+        }
+
         /* Impossible-attribution lint verdict (cst_lint.h): always
          * printed, and a nonzero count fails the audit — a corrupt
          * trace must not exit 0.  A conservation-only check (the byte

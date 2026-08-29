@@ -2782,6 +2782,42 @@ int run_body_render(const Options &opts, const cst::Header &h,
         walker.stats().cp_entries >= opts.max_entries;
     if (!stopped_early) body_stream->finalize();
 
+    /*
+     * VACUITY REFUSAL (--strict only).
+     *
+     * MEASURED on this tree: a trace carrying templates=0, exec_cp=0 and a
+     * two-byte body — the leading and trailing CST_MAGIC with nothing in
+     * between — walked cleanly here and exited 0 under --strict, and passed
+     * `cst_audit` with "rollup 100.00%" at the same moment.  Neither verdict
+     * was wrong on its own terms: a walker that visits no entry cannot find
+     * an impossible attribution, and an empty byte partition reconciles.
+     * The zeros simply did not carry the meaning every acceptance gate in
+     * this tree read into them.
+     *
+     * --strict is the mode the gates invoke, and its contract is "refuse a
+     * trace a consumer cannot use".  A trace with no template and no
+     * correct-path entry is exactly that, so it is refused HERE rather than
+     * left to each caller to remember a separate non-emptiness guard.  The
+     * default (non-strict) mode is untouched: rendering an empty trace to
+     * stdout is a legitimate thing to ask for, and the output stays
+     * byte-identical.
+     *
+     * --max deliberately stops the walk early, so cp_entries is not
+     * evidence of anything under it; the check only runs on a full walk.
+     * The condition is the CONJUNCTION with templates — a trace may
+     * honestly publish templates whose blocks never retired inside the
+     * capture window, but one with neither has no instruction in it under
+     * any reading.
+     */
+    if (opts.strict && opts.max_entries == 0 &&
+        templates.empty() && walker.stats().cp_entries == 0) {
+        std::fprintf(stderr,
+                     "cst_decode: EMPTY TRACE: templates=0 cp_entries=0 — "
+                     "the strict walk found nothing to check, so its zero "
+                     "findings are not evidence of a healthy trace\n");
+        return 1;
+    }
+
     /* Impossible-attribution lint (cst_lint.h).  Silent on a clean
      * trace so the rendered output stays byte-identical; a corrupt
      * trace gets a trailing summary comment, and --strict escalates

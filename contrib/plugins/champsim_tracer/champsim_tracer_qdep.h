@@ -532,6 +532,26 @@ struct QDepInsn {
     uint8_t src_state;
     uint8_t n_src;
     uint8_t src_reg[QDEP_MAX_SRC];
+
+    /*
+     * QEMU'S OWN DECODE IDENTITY for this instruction, carried so the source
+     * census can key its survivor rows on it.
+     *
+     * The survivors -- published sources QEMU's read list does not justify --
+     * are what a source-list flip has to carry across, and a table of them
+     * has to be keyed on something the flip can look up at translation time.
+     * That key may NOT be the mnemonic: the mnemonic is the disassembler's
+     * word, which is the dependency being removed, and it is not even a
+     * function of the decode (`clflush` and `nop` are one decode rule).
+     * @decode_id is qemu_plugin_insn_decode_id()'s slot; @decode_name is its
+     * spelling, carried for the report and never as the key.
+     *
+     * Whether the id ALONE separates the survivor rows is a question the
+     * census answers rather than assumes -- see the collision witness in
+     * qdep_report().
+     */
+    uint32_t decode_id;
+    const char *decode_name;
     /*
      * And the two facts that say whether a NO above is an answer.
      *

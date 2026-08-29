@@ -139,6 +139,27 @@ GHashTable *g_dst_unmapped_name = nullptr;
 GHashTable *g_src_unjustified_sig = nullptr;
 GHashTable *g_src_qemu_extra_sig = nullptr;
 /*
+ * THE SURVIVOR ROWS, KEYED ON QEMU'S OWN DECODE IDENTITY, and the witness
+ * that says whether that key is sharp enough to be one.
+ *
+ * @g_src_survivor_ident is the same population as g_src_unjustified_sig --
+ * a published source QEMU's read list does not justify -- re-keyed from the
+ * disassembler's mnemonic onto qemu_plugin_insn_decode_id().  A flip that
+ * stops taking the source list from the operand walk has to carry these
+ * rows, and it can only look them up by something it still has after the
+ * walk is gone.
+ *
+ * @g_src_ident_witness is why the re-key is MEASURED rather than assumed.
+ * One decode rule can carry several instructions -- x86 `clflush` decodes
+ * through QEMU's NOP row -- so a survivor table keyed on the id alone would
+ * hand one instruction's sources to another.  This tally is (decode id,
+ * mnemonic) over the SAME scored population, so a decode id that shows more
+ * than one mnemonic is visible as a collision instead of being discovered
+ * after the table is built.
+ */
+GHashTable *g_src_survivor_ident = nullptr;
+GHashTable *g_src_ident_witness = nullptr;
+/*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
  * They are separate tallies because they are separate defects with separate
@@ -2251,6 +2272,34 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 tally(&g_src_unjustified_sig, key);
                 g_free(key);
             }
+            /*
+             * The same row, keyed the way a flip would have to look it up.
+             * The mnemonic is APPENDED as an annotation and is not part of
+             * the key's meaning -- it is there so a reader can tell what the
+             * rule is, and so a second mnemonic under one id is visible.
+             */
+            {
+                char *key = g_strdup_printf(
+                    "%08x %-26s %-14s %s", q->decode_id,
+                    q->decode_name ? q->decode_name : "?",
+                    generic_reg_name_or_unknown(f->src_regs[i]),
+                    mnem ? mnem : "?");
+                tally(&g_src_survivor_ident, key);
+                g_free(key);
+            }
+        }
+        /*
+         * THE COLLISION WITNESS, over the whole scored population and not
+         * only the survivors: a decode id that appears with two mnemonics is
+         * a rule carrying more than one instruction, and a survivor table
+         * keyed on that id would give one of them the other's sources.
+         */
+        {
+            char *key = g_strdup_printf("%08x %-26s %s", q->decode_id,
+                                        q->decode_name ? q->decode_name : "?",
+                                        mnem ? mnem : "?");
+            tally(&g_src_ident_witness, key);
+            g_free(key);
         }
         /*
          * And the OTHER direction, counted and never added to the one above.
@@ -2573,6 +2622,19 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     qdep_init();
     if (!g_live) {
         return;
+    }
+    /*
+     * Read before anything can refuse: the identity is what a refusal has to
+     * be reported AGAINST, so taking it only on the success path would make
+     * the refusing rows the ones with no name.
+     */
+    {
+        struct qemu_plugin_insn *ins = qemu_plugin_tb_get_insn(tb, idx);
+
+        if (ins) {
+            out->decode_id = qemu_plugin_insn_decode_id(ins);
+            out->decode_name = qemu_plugin_insn_decode_name(ins);
+        }
     }
 
     st.struct_size = sizeof(st);
@@ -3741,6 +3803,10 @@ void qdep_report(GString *report)
                "env byte ranges QEMU NAMED that have no generic word\n(#226: the name reached this file and the register table has no row for\nit -- a generator pass, not a boundary question):");
     dump_tally(report, g_src_unjustified_sig,
                "SOURCE entries the wire publishes that QEMU's read list does\nnot justify, by mnemonic and generic register.  These are the source\nhalf's NAMED SURVIVORS (R12.1): every one is published exactly as\nbefore, and each row is a coverage path -- an emitter that has to state\nthe read, or an adjudication that the wire is right and QEMU is short:");
+    dump_tally(report, g_src_survivor_ident,
+               "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the same\nrows as the block above, re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, and the mnemonic as an ANNOTATION.  A source-list flip\nlooks a survivor up by the id, because after the flip the mnemonic is\ngone; the rule name and the mnemonic are printed so a reader can see\nWHICH instruction a row is and so a second mnemonic under one id shows:");
+    dump_tally(report, g_src_ident_witness,
+               "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over the WHOLE scored population, not only the survivors.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying:");
     dump_tally(report, g_src_qemu_extra_sig,
                "SOURCES QEMU states that the wire does not publish, by\nmnemonic and generic register.  The OTHER direction, and not a defect\nin either list on its own -- a source the wire lacks is what a list flip\nwould add, and it is listed so the two directions stay two numbers:");
     dump_tally(report, g_dst_reseat_refused_sig,

@@ -88,6 +88,70 @@ fi
 
 FAILED=0
 note()  { printf '%s\n' "$*"; }
+
+# A RED WITH NO SIZE IS NOT ACTIONABLE.
+#
+# "Still a dependency" was the whole message for several passes, and every
+# pass then had to re-derive the same three numbers by hand before it could
+# say what remained.  The gate owns those numbers: it is already standing in
+# the tree, and the surfaces are greppable.  So a RED prints them, from the
+# SOURCE rather than from a note somebody has to keep current, and it refuses
+# if it finds none -- a survey that cannot see the dependency the gate just
+# convicted on is broken, not encouraging.
+#
+# The three surfaces, and why each is separate work:
+#
+#   headers    plugin translation units that #include a Capstone header.
+#              These are the compile-time tie the link stage cannot see.
+#              Reference tools (isaxcheck, capstone_workaround_probe) are
+#              excluded BY NAME -- R13 keeps Capstone as an external
+#              reference and linking it there is not a plugin dependency.
+#   rows       table rows keyed on a Capstone enumerator.  Re-spelling these
+#              into a local copy of the same constants is REFUSED under R14;
+#              they retire when the fact each row carries comes from QEMU.
+#   gates      the admission sites: the consult that decides what an
+#              instruction IS, and the poison check that decides whether its
+#              whole basic block enters the trace.  Both read the same
+#              Capstone answer and both must move together (#317).
+survey() {
+    P="$SRC_ROOT/contrib/plugins/champsim_tracer"
+    note ""
+    note "nocapstone_gate: what is left, counted from the tree"
+
+    hdrs=$(grep -rl '#include <capstone/' "$P" --include='*.h' --include='*.cc' \
+             2>/dev/null | grep -v '/tools/' | sort)
+    nh=$(printf '%s\n' "$hdrs" | grep -c . )
+    note "  headers  $nh plugin file(s) include a Capstone header:"
+    printf '%s\n' "$hdrs" | grep . | sed "s#^$SRC_ROOT/#             #"
+
+    note "  rows     table rows whose ARRAY INDEX is a Capstone enumerator,"
+    note "           counted per ISA as instruction rows + register rows:"
+    nr=0
+    for h in "$P"/champsim_tracer_mnemonics_*.h; do
+        [ -f "$h" ] || continue
+        ni=$(grep -cE '^[[:space:]]*\[(X86|AARCH64|ARM64|RISCV|MIPS)_INS_' \
+                  "$h" 2>/dev/null)
+        nrg=$(grep -cE '^[[:space:]]*\[(X86|AARCH64|ARM64|RISCV|MIPS)_REG_' \
+                  "$h" 2>/dev/null)
+        nr=$((nr + ni + nrg))
+        note "             $(basename "$h")  insn $ni  reg $nrg"
+    done
+    note "             total $nr"
+
+    note "  gates    admission sites that read the Capstone answer:"
+    grep -n 'qemu_plugin_cap_decode(' "$P/champsim_tracer.cc" 2>/dev/null \
+        | sed 's/^/             champsim_tracer.cc:/;s/ *$//' | head -4
+    grep -n 'cst_cap_arch >= 0 && !insn_info\[ci\].mnemonic\[0\]' \
+         "$P/champsim_tracer.cc" 2>/dev/null \
+        | sed 's/^/             champsim_tracer.cc:/' | head -2
+
+    if [ "$nh" = 0 ] && [ "$nr" = 0 ]; then
+        note "  SURVEY FOUND NOTHING while the gate is RED -- the survey is"
+        note "  broken, not the dependency gone.  Fix the survey."
+    fi
+}
+
+
 pass()  { note "nocapstone_gate: PASS  $*"; }
 fail()  { note "nocapstone_gate: FAIL  $*"; FAILED=1; }
 
@@ -356,4 +420,5 @@ if [ "$FAILED" = 0 ]; then
     exit 0
 fi
 note "nocapstone_gate: RED — Capstone is still a dependency of the plugin"
+survey
 exit 1

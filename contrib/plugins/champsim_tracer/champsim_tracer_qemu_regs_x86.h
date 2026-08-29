@@ -25,7 +25,7 @@
 
 /* x86: 66 QEMU registers, 54 reachable from
  * Capstone, 12 reachable only by QEMU identity,
- * 62 carrying a generic id. */
+ * 64 carrying a generic id. */
 static const QemuRegRow qemu_regs_x86[] = {
     { .feature = "org.gnu.gdb.i386.core", .name = "cr0", .reg_id = REG_CTRL0, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
     { .feature = "org.gnu.gdb.i386.core", .name = "cr2", .reg_id = REG_CTRL2, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
@@ -44,11 +44,11 @@ static const QemuRegRow qemu_regs_x86[] = {
     { .feature = "org.gnu.gdb.i386.core", .name = "fop", .reg_id = REG_FCSR, .cap_rows = 0, .tier = QREG_UNNAMED },  /* x87 last-opcode, part of the saved FP environment.  UNREACHABLE -- gdbstub.c returns 0; QEMU has no field */
     { .feature = "org.gnu.gdb.i386.core", .name = "foseg", .reg_id = REG_FCSR, .cap_rows = 0, .tier = QREG_UNNAMED },  /* x87 last-data selector, saved FP environment.  UNREACHABLE -- gdbstub.c returns 0; QEMU has no field */
     { .feature = "org.gnu.gdb.i386.core", .name = "fs", .reg_id = REG_SEG3, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
-    { .feature = "org.gnu.gdb.i386.core", .name = "fs_base", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
+    { .feature = "org.gnu.gdb.i386.core", .name = "fs_base", .reg_id = REG_SEG3, .cap_rows = 0, .tier = QREG_UNNAMED },  /* the FS segment register's hidden base (env->segs[R_FS].base); OBSERVED via the declared env range -- the address provenance of every FS-overridden access */
     { .feature = "org.gnu.gdb.i386.core", .name = "fstat", .reg_id = REG_FCSR, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
     { .feature = "org.gnu.gdb.i386.core", .name = "ftag", .reg_id = REG_FCSR, .cap_rows = 0, .tier = QREG_UNNAMED },  /* x87 tag word: status.  UNREACHABLE -- QEMU keeps the unpacked env->fptags[8] and gdbstub.c returns 0 for the packed word */
     { .feature = "org.gnu.gdb.i386.core", .name = "gs", .reg_id = REG_SEG4, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
-    { .feature = "org.gnu.gdb.i386.core", .name = "gs_base", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
+    { .feature = "org.gnu.gdb.i386.core", .name = "gs_base", .reg_id = REG_SEG4, .cap_rows = 0, .tier = QREG_UNNAMED },  /* the GS segment register's hidden base (env->segs[R_GS].base); same role as fs_base above */
     { .feature = "org.gnu.gdb.i386.core", .name = "k_gs_base", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
     { .feature = "org.gnu.gdb.i386.core", .name = "mxcsr", .reg_id = REG_FCSR, .cap_rows = 0, .tier = QREG_UNNAMED },  /* SSE control AND status in one register (env->mxcsr); generic_ids.h names it REG_FCSR explicitly */
     { .feature = "org.gnu.gdb.i386.core", .name = "r10", .reg_id = REG_GPR8, .cap_rows = 4, .tier = QREG_ROUTED },  /* 4 capstone rows */

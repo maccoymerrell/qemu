@@ -579,6 +579,34 @@ static void gen_addi2_i128(TCGv retl, TCGv reth,
 
 static bool trans_addi(DisasContext *ctx, arg_addi *a)
 {
+    /*
+     * C.MV rd,rs2 IS `add rd, x0, rs2` -- that is the manual's definition of
+     * the encoding -- and this translator reaches it through the addi rule
+     *
+     *   addi   100 0  .....  ..... 10 @c_mv          (insn16.decode)
+     *   @c_mv  ... . ..... .....  .. &i imm=0 rs1=%rs2_5 %rd
+     *
+     * whose format puts rs2 in the rs1 slot and sets imm=0.  x0 is never a
+     * field of the args, get_gpr() is never called for it, and no op reads
+     * it: the zero-register note the accessor would have taken is not taken,
+     * and the source the encoding names reaches nothing.  R15 rules that a
+     * lowering QEMU chose is not architectural truth -- the register stays --
+     * so it is said here, at the one place the C.MV rule is distinguishable.
+     *
+     * THE GUARD IS THE RULE'S OWN FIXED BITS, which is also the qualification
+     * QEMU publishes as this rule's decode identity
+     * (`decode_insn16/addi@1000..........10`, mask 0xf003 value 0x8002).  The
+     * two other patterns carrying those bits, C.JR and the rs1=0 RES form,
+     * are matched ahead of this one inside the same decodetree group and
+     * never reach here, so the guard selects C.MV exactly.  The 32-bit `mv`
+     * pseudo-instruction is `addi rd,rs1,0` in the manual too and names no
+     * zero register; cur_insn_len keeps it out.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (ctx->cur_insn_len == 2 && (ctx->opcode & 0xf003) == 0x8002) {
+        insn_dataflow_note_folded_read_zero();
+    }
     return gen_arith_imm_fn(ctx, a, EXT_NONE, tcg_gen_addi_tl, gen_addi2_i128);
 }
 

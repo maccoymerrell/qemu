@@ -8836,6 +8836,16 @@ static bool do_muladd(DisasContext *s, arg_rrrr *a,
 
     if (a->ra == 31 && !is_sub) {
         /* Special-case MADD with rA == XZR; it is the standard MUL alias */
+        /*
+         * And the addend the encoding names is XZR, which this arm folds
+         * away: the else arm below calls cpu_reg(s, a->ra) and would take
+         * the zero-register note, this one never does.  MUL, SMULL and UMULL
+         * are exactly MADD/SMADDL/UMADDL with Ra == XZR, so the register is
+         * part of the instruction (R7.3/R15) and is stated here, where the
+         * register number is known.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_folded_read_zero();
         tcg_gen_mul_i64(tcg_rd, tcg_op1, tcg_op2);
     } else {
         TCGv_i64 tcg_tmp = tcg_temp_new_i64();
@@ -9059,6 +9069,20 @@ static bool trans_CSEL(DisasContext *s, arg_CSEL *a)
 
     if (a->rn == 31 && a->rm == 31 && (a->else_inc ^ a->else_inv)) {
         /* CSET & CSETM.  */
+        /*
+         * The encoding names XZR as BOTH Rn and Rm -- that is what makes
+         * CSINC/CSINV read as CSET/CSETM -- and this fast path drops it:
+         * cpu_reg(s, 31) is never called on either operand, so no
+         * zero-register note is taken and no op reads them.  R7.3/R15 rule
+         * that the register the encoding names is not the emulator's to
+         * drop, so say it here, where the register numbers are known.  One
+         * statement: the read set is a set, and the two operands are the
+         * same register.  Calling the accessor to get a temp to hang a note
+         * on would emit a dead constant, which the capture discipline
+         * forbids.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_folded_read_zero();
         if (a->else_inv) {
             tcg_gen_negsetcond_i64(tcg_invert_cond(c.cond),
                                    tcg_rd, c.value, zero);

@@ -2708,6 +2708,20 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_ORI ? MIPS_ID_OPC_ORI :
             MIPS_ID_NONE);
+        /*
+         * `ori rt,$zero,imm` IS `li rt,imm`, and the else arm below folds
+         * the source away: cpu_gpr[0] is never touched, gen_load_gpr() is
+         * never called, so no zero-register note is taken and no op reads
+         * the operand.  R7.3/R15 rule the register the encoding names is
+         * not the emulator's to drop, so it is said here, where the
+         * register number is known.  Calling the accessor to get a temp to
+         * hang a note on would emit a dead constant, which the capture
+         * discipline forbids.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0) {
             tcg_gen_ori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -3188,6 +3202,19 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_NOR ? MIPS_ID_OPC_NOR :
             MIPS_ID_NONE);
+        /*
+         * `not rd,rs` IS `nor rd,rs,$zero`, and every arm below with a zero
+         * operand folds it away -- cpu_gpr[0] is never touched, so no
+         * zero-register note is taken and no op reads the operand.
+         * R7.3/R15 rule the register the encoding names is not the
+         * emulator's to drop, so it is said here, where the register
+         * numbers are known.  One statement even when BOTH operands are
+         * $zero: the read set is a set and they are the same register.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0 && rt != 0) {
             tcg_gen_nor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {

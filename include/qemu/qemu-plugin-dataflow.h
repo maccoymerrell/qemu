@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 12
+#define QEMU_PLUGIN_DATAFLOW_VERSION 13
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in

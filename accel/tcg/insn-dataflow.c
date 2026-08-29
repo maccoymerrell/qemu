@@ -1969,10 +1969,30 @@ static bool df_imm_operand_at(const TCGOp *op, unsigned cursor)
 /*
  * The GLOBAL a fold note names for @ts, or NULL.
  *
- * Same acceptance rule as df_fold_add_srcs() below and for the same reason:
- * the newest note for the temp, and only while the op that defined the temp
- * when the note was taken is still the op that defines it here.  A constant
- * (anchor NULL) no op defines cannot go stale.
+ * SAME ACCEPTANCE TEST as df_fold_add_srcs() below -- a note applies only
+ * while the op that defined the temp when the note was taken is still the op
+ * that defines it here, and a constant (anchor NULL) no op defines cannot go
+ * stale.  That test is what keeps x86's A0, which carries every address in a
+ * block, from leaking one instruction's folded register into the next.
+ *
+ * BUT NOT THE SAME SEARCH.  df_fold_add_srcs() runs under a note-count scope
+ * captured when the memop note was taken, so "the newest note for this temp"
+ * is already the note belonging to the access being resolved, and stopping
+ * there is right.  This arm has no such scope: it is called from the op walk
+ * with the whole translation's notes in view, so "newest for this temp" is
+ * the LAST instruction in the block that folded into A0, and for every
+ * earlier one the anchor test would reject and the read the encoding named
+ * would be lost -- 245 x86_64 source entries on the w19 corpus, every
+ * RIP-relative shape in a block containing more than one.
+ *
+ * So the search runs on until it finds the note whose anchor IS the temp's
+ * current defining op.  That is not weaker: (ts, anchor) identifies exactly
+ * the note taken when this op wrote this temp, ops are unique within a
+ * translation, and a note taken later in the block is anchored to a later op
+ * that cannot be the current one.  Rejection and search-on give the same
+ * answer whenever the newest note matches; they differ only where the newest
+ * note describes a LATER definition, and there the older matching note is the
+ * one the temp is actually holding.
  *
  * Split out because the READ arm needs the register and not a provenance
  * bitmap: a folded operand an op really reads is a SOURCE of the instruction,
@@ -1982,19 +2002,19 @@ static bool df_imm_operand_at(const TCGOp *op, unsigned cursor)
 static const TCGTemp *df_fold_src_of(const TCGTemp *ts, unsigned scope)
 {
     size_t ti = (size_t)(ts - tcg_ctx->temps);
+    const TCGOp *defop;
 
     if (ti >= TCG_MAX_TEMPS) {
         return NULL;
     }
+    defop = df_defop_of(ti);
     for (unsigned k = scope > df_n_fold ? df_n_fold : scope; k-- > 0; ) {
         if (df_fold[k].ts != (const void *)ts) {
             continue;
         }
-        if (df_fold[k].anchor == NULL ||
-            df_fold[k].anchor == df_defop_of(ti)) {
+        if (df_fold[k].anchor == NULL || df_fold[k].anchor == defop) {
             return (const TCGTemp *)df_fold[k].src_ts;
         }
-        break;
     }
     return NULL;
 }

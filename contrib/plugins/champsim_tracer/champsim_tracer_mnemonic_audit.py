@@ -4546,6 +4546,32 @@ class QemuRegRow:
 # same key the table is sorted on.
 QEMU_ONLY_REG_IDS: dict[str, dict[tuple[str, str], tuple[str, str]]] = {
     "x86": {
+        # The SEGMENT-REGISTER BASES.  QEMU's namespace carries `fs`/`gs` (the
+        # selector) and `fs_base`/`gs_base` (the hidden descriptor's base)
+        # as separate rows; Capstone's enum has a constant only for the
+        # selector, so the base rows were emitted REG_NONE.  That is again a
+        # true statement about the ROUTE and a false one about the REGISTER:
+        # in 64-bit mode the selector is architecturally inert and the base
+        # IS what an FS- or GS-overridden address depends on, so a row saying
+        # the base has no generic word makes every `mov %fs:0x28,%rax` read
+        # as depending on nothing.  Under the composed-register contract
+        # (#277: a folded FIELD publishes its CONTAINER) the base is a member
+        # of the segment register, and the container's word is the answer.
+        #
+        # k_gs_base is deliberately NOT here: MSR_KERNEL_GS_BASE is a
+        # different architectural register that swapgs exchanges with GS, not
+        # a member of it.
+        ("org.gnu.gdb.i386.core", "fs_base"): (
+            "REG_SEG3",
+            "the FS segment register's hidden base (env->segs[R_FS].base); "
+            "OBSERVED via the declared env range -- the address provenance "
+            "of every FS-overridden access",
+        ),
+        ("org.gnu.gdb.i386.core", "gs_base"): (
+            "REG_SEG4",
+            "the GS segment register's hidden base (env->segs[R_GS].base); "
+            "same role as fs_base above",
+        ),
         ("org.gnu.gdb.i386.core", "fctrl"): (
             "REG_FPCW",
             "x87 control word (env->fpuc); OBSERVED via the declared env "

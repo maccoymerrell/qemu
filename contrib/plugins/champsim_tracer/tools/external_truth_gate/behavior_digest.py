@@ -200,8 +200,17 @@ def mask_stamps(data, stamps):
     """Zero every whole occurrence of each stamp, and every long fragment."""
     out = None
     for s in stamps:
-        if len(s) < MIN_FRAGMENT:
+        if len(s) < _ANCHOR:
             continue
+        # MIN_FRAGMENT is a floor on PARTIAL matches, not on the stamp.  It
+        # used to skip the stamp entirely when the stamp itself was shorter
+        # than the floor, which silently disabled masking for short stamps --
+        # whole occurrences included.  Selftest arm F builds a 10-byte fixture
+        # stamp, so its positive direction ("a same-length stamp change must
+        # not move the digest") could not pass, and the guard's own proof read
+        # RED while real 24-byte version stamps masked correctly.  The floor
+        # now applies where it was meant to: to the length ACCEPTED at a hit.
+        keep = min(MIN_FRAGMENT, len(s))
         head, tail = s[:_ANCHOR], s[-_ANCHOR:]
         hits = []
         # Whole occurrences and head-anchored prefixes are the same walk: at a
@@ -212,7 +221,7 @@ def mask_stamps(data, stamps):
             while (n < len(s) and i + n < len(data)
                    and data[i + n] == s[n]):
                 n += 1
-            if n >= MIN_FRAGMENT:
+            if n >= keep:
                 hits.append((i, n))
             i = data.find(head, i + 1)
         # Tail-anchored suffixes: walk backwards from the end of the hit.
@@ -223,7 +232,7 @@ def mask_stamps(data, stamps):
             while (n < len(s) and end - n - 1 >= 0
                    and data[end - n - 1] == s[len(s) - n - 1]):
                 n += 1
-            if n >= MIN_FRAGMENT:
+            if n >= keep:
                 hits.append((end - n, n))
             j = data.find(tail, j + 1)
         if hits:

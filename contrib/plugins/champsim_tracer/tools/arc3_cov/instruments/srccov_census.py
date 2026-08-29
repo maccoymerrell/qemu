@@ -39,6 +39,8 @@ Usage:  srccov_census.py <stats.log>... [--max-unjustified N]
         srccov_census.py --selftest
 """
 import argparse
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -93,6 +95,9 @@ def census(paths, quiet=False):
             bad.append("%s: %s" % (label, reason))
     if not quiet:
         print(__doc__.split("Usage:")[0].rstrip())
+        # WHERE THIS READING WAS TAKEN FROM (#327).  Part of the number, not
+        # context: see L.cwd_stamp().
+        print(); print(L.cwd_stamp())
         hdr = "%-9s" % "isa" + "".join("%13s" % n for n, _ in ROWS)
         print(); print(hdr); print("-" * len(hdr))
         for label, vals, reason in out:
@@ -171,6 +176,31 @@ def selftest():
         rc, out = census([good, absent], quiet=True)
         checks.append(("one bad file in a batch FAILS the whole run",
                        rc != 0, "rc=%d" % rc))
+
+        # #327: the reading must carry the directory it was taken from, and
+        # the stamp must actually MOVE when the directory does -- a constant
+        # string would satisfy a grep and prove nothing.
+        here = os.getcwd()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                census([good], quiet=False)
+            printed_here = buf.getvalue()
+            os.chdir(tmp)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                census([good], quiet=False)
+            printed_tmp = buf.getvalue()
+        finally:
+            os.chdir(here)
+        checks.append(("#327 the table carries a HARNESS CWD stamp",
+                       L.CWD_STAMP_TAG in printed_here
+                       and here in printed_here,
+                       "tag+path present"))
+        checks.append(("#327 the stamp MOVES with the directory",
+                       os.path.realpath(tmp) in printed_tmp
+                       and here not in printed_tmp.split("isa")[0],
+                       "differs between two cwds"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return L.selftest_report("srccov_census.py", checks)

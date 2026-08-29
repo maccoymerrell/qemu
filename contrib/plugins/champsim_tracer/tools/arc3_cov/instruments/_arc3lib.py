@@ -172,6 +172,39 @@ def report_vacuity(reasons):
     return 2
 
 
+#: The stamp every scorer prints above its table (#327).
+CWD_STAMP_TAG = "HARNESS CWD:"
+
+
+def cwd_stamp():
+    """The working directory a reading was taken from, as a header block.
+
+    WHY A NUMBER FROM THESE TOOLS IS NOT PORTABLE BETWEEN DIRECTORIES (#327).
+    qemu-user copies the host environment onto the guest's starting stack,
+    and the working directory is part of that environment, so a run started
+    from a longer path puts every guest stack address somewhere else.  On
+    x86_64 that moves which instructions the corpus reaches: the source
+    census and SETPROOF's CHANGED column were measured at 576/3491 from
+    .../p3/arc3 and 577/3489 from .../exec45/verify24 -- same commit, same
+    binaries, each reading exactly repeatable inside its own directory.
+    PASS 23 saw the spread, checked repeatability, and concluded it was a
+    source difference between tips; it was not.  The same carrier is #294's,
+    which found it for the OUTPUT directory.
+
+    So the directory is not context, it is part of the reading, and it is
+    printed with the reading rather than left to a pass to remember.  A
+    comparison between two numbers carrying different stamps is not a
+    comparison.
+    """
+    return ("# %s %s\n"
+            "#   (#327) qemu-user puts the host environment, working "
+            "directory included,\n"
+            "#   on the guest's starting stack, so x86_64 columns move with "
+            "this path.\n"
+            "#   Compare only against a reading carrying the SAME stamp."
+            % (CWD_STAMP_TAG, os.getcwd()))
+
+
 def selftest_report(name, checks):
     """Print and adjudicate a list of (label, ok, detail) selftest checks."""
     bad = 0

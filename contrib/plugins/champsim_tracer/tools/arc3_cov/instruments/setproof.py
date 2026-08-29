@@ -32,6 +32,8 @@ Usage:
 """
 import argparse
 import collections
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -119,6 +121,11 @@ def run(before, after, isas, suffix, show=12, quiet=False):
     """Returns (exit_code, totals)."""
     reasons = []
     tot = collections.Counter()
+    if not quiet:
+        # WHERE THIS READING WAS TAKEN FROM (#327).  The x86_64 CHANGED
+        # column moves with the harness's working directory; the stamp is
+        # part of the number.  See L.cwd_stamp().
+        print(L.cwd_stamp())
     for isa in isas:
         pa = L.keyfile(before, isa, suffix)
         pb = L.keyfile(after, isa, suffix)
@@ -331,6 +338,30 @@ def selftest():
         checks.append(("AMBIGUOUS 2-lost/1-gained pairing is DECLINED",
                        tot["lost"] == 2 and tot["renamed"] == 0,
                        "lost=%d renamed=%d" % (tot["lost"], tot["renamed"])))
+
+        # #327: the report must carry the directory it was taken from, and
+        # the stamp must MOVE when the directory does.
+        here = os.getcwd()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                run(A, B, ["x86_64"], ".key")
+            printed_here = buf.getvalue()
+            os.chdir(tmp)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                run(A, B, ["x86_64"], ".key")
+            printed_tmp = buf.getvalue()
+        finally:
+            os.chdir(here)
+        checks.append(("#327 the report carries a HARNESS CWD stamp",
+                       L.CWD_STAMP_TAG in printed_here
+                       and here in printed_here,
+                       "tag+path present"))
+        checks.append(("#327 the stamp MOVES with the directory",
+                       os.path.realpath(tmp) in printed_tmp
+                       and here not in printed_tmp,
+                       "differs between two cwds"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return L.selftest_report("setproof.py", checks)

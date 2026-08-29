@@ -168,31 +168,6 @@ uint64_t g_br_agree_tbl, g_br_disagree_tbl;
 uint64_t g_op_row_unknown;     /* row says GEN_OP_UNKNOWN: nothing to check */
 uint64_t g_br_row_unknown;     /* same row, same reason, branch class */
 
-/*
- * THE LENGTH ARM.  Independent of the identity table -- it runs on all four
- * targets, x86_64 included, because instruction length is a fact QEMU states
- * for every instruction it translates whether or not a decodetree pattern
- * named it.
- *
- * QEMU's answer is the translator's own pc advance (plugin_gen_insn_end:
- * insn->len = db->pc_next - vaddr), i.e. the number of bytes the emulator
- * consumed to produce the code it then ran.  Capstone's answer is cs_insn
- * ->size for the same address.  They are scored against each other over a
- * window WIDER than QEMU's answer wherever the TB supplies one, so Capstone
- * is free to claim a longer instruction and be caught at it; where the
- * window is exactly QEMU's length (the last instruction of a TB, whose
- * successor bytes this pass does not have) Capstone is bounded by the
- * number under test and the sample is tallied apart rather than counted as
- * an agreement it could not have failed.
- */
-uint64_t g_len_seen;          /* instructions with both answers available   */
-uint64_t g_len_agree;
-uint64_t g_len_disagree;
-uint64_t g_len_cap_failed;    /* Capstone would not decode the window       */
-uint64_t g_len_window_bound;  /* subset of seen: window == QEMU's own answer */
-uint64_t g_len_wide_seen;     /* subset of seen: window strictly wider       */
-uint64_t g_len_wide_disagree; /* the disagreements that a wide window found  */
-GHashTable *g_lensig;
 
 /*
  * THE BRANCH ARM.  Also independent of the identity table, and for a
@@ -844,63 +819,6 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
     g_mutex_unlock(&g_lock);
 }
 
-void qemu_ident_note_length(uint64_t pc, uint8_t qlen, uint8_t caplen,
-                            uint8_t window_len, const char *cap_mnem,
-                            const char *qname, const uint8_t *bytes)
-{
-    g_mutex_lock(&g_lock);
-    if (caplen == 0) {
-        g_len_cap_failed++;
-        if (g_detail) {
-            char sig[224];
-            char hex[3 * 16 + 1];
-            unsigned n = window_len > 16 ? 16 : window_len;
-            for (unsigned i = 0; i < n; i++) {
-                g_snprintf(hex + 3 * i, 4, "%02x ", bytes[i]);
-            }
-            hex[3 * n] = 0;
-            g_snprintf(sig, sizeof(sig),
-                       "CAPSTONE REFUSED  qlen=%u qemu=%-24s [%s]",
-                       qlen, qname ? qname : "-", hex);
-            tally(&g_lensig, sig);
-        }
-        g_mutex_unlock(&g_lock);
-        return;
-    }
-
-    g_len_seen++;
-    bool wide = window_len > qlen;
-    if (wide) {
-        g_len_wide_seen++;
-    } else {
-        g_len_window_bound++;
-    }
-    if (caplen == qlen) {
-        g_len_agree++;
-    } else {
-        g_len_disagree++;
-        if (wide) {
-            g_len_wide_disagree++;
-        }
-        if (g_detail) {
-            char sig[256];
-            char hex[3 * 16 + 1];
-            unsigned n = window_len > 16 ? 16 : window_len;
-            for (unsigned i = 0; i < n; i++) {
-                g_snprintf(hex + 3 * i, 4, "%02x ", bytes[i]);
-            }
-            hex[3 * n] = 0;
-            g_snprintf(sig, sizeof(sig),
-                       "qemu=%u cap=%u  win=%u  %-14s %-24s [%s]",
-                       qlen, caplen, window_len,
-                       cap_mnem ? cap_mnem : "-", qname ? qname : "-", hex);
-            tally(&g_lensig, sig);
-        }
-    }
-    (void)pc;
-    g_mutex_unlock(&g_lock);
-}
-
 void qemu_ident_note(const struct qemu_plugin_insn *insn,
                      const qemu_plugin_insn_info *info,
                      const InsnFields *wire)
@@ -1294,36 +1212,6 @@ void qemu_ident_report(GString *report)
                   "a classification\n");
         }
     }
-    if (g_len_seen || g_len_cap_failed) {
-        g_string_append_printf(report,
-            "\n--- instruction LENGTH: the translator's pc advance against "
-            "the disassembler's ---\n"
-            "QEMU's answer is what the emulator consumed to produce the code "
-            "it ran (db->pc_next - vaddr).  Capstone's is cs_insn->size over "
-            "the same address.  Where the TB supplies bytes past the "
-            "instruction, Capstone is given them, so it is free to claim a "
-            "LONGER instruction and be caught at it; where it is not, the "
-            "sample is counted apart because Capstone was bounded by the "
-            "number under test.\n"
-            "  scored                                 %10" PRIu64 "\n"
-            "    of which given a WIDER window        %10" PRIu64 "\n"
-            "    of which bounded by QEMU's answer    %10" PRIu64 "\n"
-            "  agree                                  %10" PRIu64 "\n"
-            "  DISAGREE                               %10" PRIu64
-            "   (wide-window subset %" PRIu64 ")\n"
-            "  Capstone refused the window            %10" PRIu64 "\n",
-            g_len_seen, g_len_wide_seen, g_len_window_bound,
-            g_len_agree, g_len_disagree, g_len_wide_disagree,
-            g_len_cap_failed);
-        if (g_detail) {
-            dump_tally(report, g_lensig, "length disagreements", 40);
-        } else {
-            g_string_append_printf(report,
-                "  (set CST_QEMU_IDENT_AUDIT=1 for the per-encoding "
-                "disagreements)\n");
-        }
-    }
-
     if (g_br2_seen || g_br2_unavail) {
         g_string_append_printf(report,
             "\n--- BRANCH class: the transfer the translator PERFORMED "

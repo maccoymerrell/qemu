@@ -45,18 +45,6 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
                      const InsnFields *wire);
 
 /*
- * One translated instruction, LENGTH arm.  Independent of the identity
- * table and therefore run on all four targets: @qlen is what QEMU's
- * translator advanced pc by, @caplen what Capstone claims for the same
- * address (0 = it refused), @window_len how many real bytes Capstone was
- * allowed to look at.  A window wider than @qlen is what lets Capstone
- * over-claim and be seen doing it.
- */
-void qemu_ident_note_length(uint64_t pc, uint8_t qlen, uint8_t caplen,
-                            uint8_t window_len, const char *cap_mnem,
-                            const char *qname, const uint8_t *bytes);
-
-/*
  * One translated instruction, BRANCH arm.  @tracer_bt is the branch class
  * the tracer would publish for it (decode_detail_to_generic's answer, alias
  * repairs included), scored against the transfer QEMU's translator actually

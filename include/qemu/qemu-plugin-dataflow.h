@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 10
+#define QEMU_PLUGIN_DATAFLOW_VERSION 11
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -219,6 +219,105 @@ unsigned qemu_plugin_insn_reg_writes(const struct qemu_plugin_tb *tb, size_t idx
 QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_reg_kills(const struct qemu_plugin_tb *tb, size_t idx,
                                     uint64_t *words, unsigned nwords);
+
+/*
+ * THE SAME TWO SETS AS ORDERED LISTS.
+ *
+ * WHY A LIST AS WELL AS A SET.  A consumer that only asks "does this
+ * instruction read rbx" is served by the bitmaps above.  A consumer that
+ * PUBLISHES a register list -- a trace format with a source array and a
+ * dependency mask whose bit i means "slot i" -- needs two things a bitmap
+ * cannot give it.  It needs every member, including the ones no TCG global
+ * names; and it needs an ORDER that is a property of the instruction rather
+ * than of the register file's numbering.  Sorting the bitmap supplies an
+ * order, but it is the target's register index, so `sub rd,rs1,rs2` and
+ * `sub rd,rs2,rs1` sort identically and a mask written for slot 0 would mean
+ * a different operand on the two.
+ *
+ * THE ORDERING CONTRACT, in full, because a consumer will build a wire format
+ * on it:
+ *
+ *   1. Entries appear in the order the extraction FIRST OBSERVED each member,
+ *      walking the instruction's TCG ops from first to last.  A member
+ *      observed more than once appears ONCE, at its first position.
+ *
+ *   2. A member no op names -- a destination the emulator discarded, the env
+ *      footprint of a called helper or of a gvec expansion -- is appended
+ *      after the op-walk entries, in the order its emitter's notes were
+ *      applied.  It CANNOT be interleaved, because there is no op to
+ *      interleave it at.  This is stated rather than hidden: a consumer that
+ *      needs "the second architectural operand" must not read entry 1.
+ *
+ *   3. The ORDER OF DIRECTIONS is independent.  A CPUArchState range read and
+ *      written by one emitter statement is one row of
+ *      qemu_plugin_insn_fields() and appears in BOTH lists, at the position
+ *      each direction was stated in that list.
+ *
+ *   4. The lists are NOT a permutation of the bitmaps.  They also carry
+ *      members the bitmaps cannot name:
+ *        - a CPUArchState byte range (a vector register, an x87 slot, an FP
+ *          status word), which has no TCG global to set a bit for;
+ *        - the architectural ZERO REGISTER, which on every target that has
+ *          one is a constant with no global at all.  A consumer building a
+ *          source list from the read bitmap alone is short by exactly the
+ *          register the encoding named.
+ *      Conversely a KILL is in neither list: it is not a read and not a
+ *      write, and it stays where it is, in its own bitmap.
+ *
+ *   5. Determinism.  For a given QEMU binary, target and translation of a
+ *      given encoding, the order is fixed.  It is a property of the ops the
+ *      TARGET EMITTED, so it may differ between two QEMU versions in the way
+ *      every other fact here may, and it is emphatically NOT the operand
+ *      order the ISA manual prints.  A consumer that persists a list must
+ *      persist it with the names, exactly as the register namespace's own
+ *      rule says.
+ *
+ * REFUSAL, on the same rule as the sets: nothing is written and
+ * QEMU_PLUGIN_DF_INCOMPLETE is returned when the extraction could not record
+ * this instruction in full -- including when the LIST itself overflowed, which
+ * is its own limit and is reported by qemu_plugin_insn_dataflow_status().  A
+ * list short by a member is a missing dependency wearing the shape of a whole
+ * answer.
+ *
+ * Otherwise returns the number of entries; if that exceeds @nentries, or @out
+ * is NULL, nothing is written and the caller asks again with room.  A return
+ * of 0 with a successful call means the instruction states no member of that
+ * direction, which is a fact and not a refusal -- ask the status accessor if
+ * the difference matters.
+ */
+#define QEMU_PLUGIN_DF_ENT_GLOBAL   0
+#define QEMU_PLUGIN_DF_ENT_FIELD    1
+#define QEMU_PLUGIN_DF_ENT_DISCARD  2
+#define QEMU_PLUGIN_DF_ENT_ZERO     3
+
+typedef struct qemu_plugin_dataflow_reg_entry {
+    uint32_t struct_size;       /* caller sets to sizeof(*this) */
+    uint32_t kind;              /* QEMU_PLUGIN_DF_ENT_* */
+    /*
+     * GLOBAL: the register, in the qemu_plugin_dataflow_reg_name() namespace.
+     * Otherwise UINT32_MAX -- not 0, which is a valid register.
+     */
+    uint32_t reg;
+    /*
+     * FIELD: the index into this instruction's qemu_plugin_insn_fields()
+     * array, so the extent and the provenance are read from the one place
+     * that holds them rather than duplicated here where they could drift.
+     * DISCARD: the index into qemu_plugin_insn_discards().
+     * Otherwise UINT32_MAX.
+     */
+    uint32_t index;
+} qemu_plugin_dataflow_reg_entry;
+
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_reg_read_list(const struct qemu_plugin_tb *tb,
+                                        size_t idx,
+                                        qemu_plugin_dataflow_reg_entry *out,
+                                        unsigned nentries);
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_reg_write_list(const struct qemu_plugin_tb *tb,
+                                         size_t idx,
+                                         qemu_plugin_dataflow_reg_entry *out,
+                                         unsigned nentries);
 
 /*
  * Where a written register's value came from, as a set in the same namespace.
@@ -677,6 +776,20 @@ typedef struct qemu_plugin_dataflow_status {
      * about.
      */
     uint8_t  imm_non_dataflow;
+    /*
+     * The ORDERED LIST of that direction ran out of room, so the list is
+     * short by at least one member and MUST NOT be published.
+     *
+     * Its own limit, and reported on its own, because it is not the same
+     * question as @fields_truncated or @writes_truncated: a list carries
+     * members from several arrays -- globals, env ranges, discarded
+     * destinations, the zero register -- and can overflow while every one of
+     * those arrays had room.  The list accessors already refuse on it; this
+     * is what lets a consumer say WHY it was refused, and what makes the
+     * refusal countable rather than an unexplained empty answer.
+     */
+    uint8_t  read_list_truncated;
+    uint8_t  write_list_truncated;
 } qemu_plugin_dataflow_status;
 
 /*

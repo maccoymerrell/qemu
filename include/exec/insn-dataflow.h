@@ -81,6 +81,49 @@
 #define INSN_DF_MAX_WRITES  8
 
 /*
+ * THE ORDERED LISTS.
+ *
+ * The bitmaps above answer "is this register read/written".  A consumer that
+ * has to PUBLISH a register LIST needs a second thing the bitmap cannot give
+ * it: an order, and one that does not change between two translations of the
+ * same encoding.  Sorting a bitmap by register index would supply an order,
+ * but it is the TARGET's index, so `add rd,rs1,rs2` and `add rd,rs2,rs1`
+ * would come out identical and a mask written against slot 0 would mean a
+ * different operand on the two.
+ *
+ * So the order is recorded rather than reconstructed: each member is appended
+ * the first time the extraction observes it, walking the instruction's ops
+ * from first to last.  See qemu-plugin-dataflow.h for the contract as a
+ * consumer sees it; the two files must agree and this is the shorter half.
+ *
+ * The bound is per instruction and per direction.  It is above the widest
+ * real case in the tree (x86 far-call reads eight globals and two env
+ * ranges) with room, and the overflow is FLAGGED rather than truncated for
+ * the reason every other set here is: a list short by a member is a missing
+ * dependency, and it is the shape most likely to pass for a whole one.
+ */
+#define INSN_DF_MAX_ORDERED  24
+
+/* @kind of one ordered member. */
+#define INSN_DF_ORD_GLOBAL   0  /* a TCG global; @index is its register index */
+#define INSN_DF_ORD_FIELD    1  /* a CPUArchState byte range; @index into fields[] */
+#define INSN_DF_ORD_DISCARD  2  /* encoding names it, no op carries it; into discards[] */
+#define INSN_DF_ORD_ZERO     3  /* the architectural zero register; @index unused */
+
+typedef struct InsnDataflowOrdered {
+    uint8_t  kind;
+    /*
+     * GLOBAL: the register index, the same namespace the bitmaps use.
+     * FIELD:  the index into fields[] -- NOT an env offset, because the
+     *         field's extent and provenance live there and duplicating
+     *         either here would give a consumer two places to read one fact.
+     * DISCARD: the index into discards[].
+     * ZERO:   unused, and zero.
+     */
+    uint8_t  index;
+} InsnDataflowOrdered;
+
+/*
  * Destinations the encoding names that the emulator discards.  Two is the
  * widest real case in this tree -- MIPS' `mul rd,rs,rt`, whose HI and LO the
  * architecture leaves UNPREDICTABLE -- and four leaves room without making
@@ -339,6 +382,28 @@ typedef struct InsnDataflow {
     InsnDataflowDiscard discards[INSN_DF_MAX_DISCARDS];
     uint8_t  n_discards;
     uint8_t  discards_overflow;
+
+    /*
+     * THE SAME FACTS, IN THE ORDER THE TRANSLATION STATED THEM.
+     *
+     * Not a permutation of rd[]/wr[]: those are indexed by TCG global and
+     * these lists also carry the members a global cannot name -- a
+     * CPUArchState byte range, and the architectural zero register, which on
+     * every target that has one is a constant with no global at all.  A
+     * consumer building a register LIST from the bitmaps alone is short by
+     * exactly those, which is why the lists exist rather than an ordering
+     * hint beside the bitmaps.
+     *
+     * A member appears ONCE, at the position of its first observation.  See
+     * INSN_DF_MAX_ORDERED for what the bound means and why the overflow is
+     * flagged rather than truncated.
+     */
+    InsnDataflowOrdered rd_ord[INSN_DF_MAX_ORDERED];
+    uint8_t  n_rd_ord;
+    uint8_t  rd_ord_overflow;
+    InsnDataflowOrdered wr_ord[INSN_DF_MAX_ORDERED];
+    uint8_t  n_wr_ord;
+    uint8_t  wr_ord_overflow;
 
     InsnDataflowField fields[INSN_DF_MAX_FIELDS];
     uint8_t  n_fields;

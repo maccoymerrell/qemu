@@ -1010,6 +1010,59 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
             fputc('\n', f);
         }
     }
+    /*
+     * THE ORDERED LISTS, on a record type of their own.
+     *
+     * The D lines above are emitted in REGISTER-INDEX order and always were:
+     * they answer membership, and a reader that wanted an order would be
+     * reading the target's numbering.  An O line is the position the
+     * translation stated the member at, which is the fact the D lines cannot
+     * carry and the one a list-publishing consumer is built on.  A separate
+     * type rather than a field on D because every existing reader of this
+     * format skips an unknown line and none of them survives a changed one.
+     */
+    for (unsigned dir = 0; dir < 2; dir++) {
+        const InsnDataflowOrdered *list = dir ? d->wr_ord : d->rd_ord;
+        unsigned cnt = dir ? d->n_wr_ord : d->n_rd_ord;
+        bool ovf = dir ? d->wr_ord_overflow : d->rd_ord_overflow;
+
+        for (unsigned i = 0; i < cnt; i++) {
+            fprintf(f, "O 0x%" PRIx64 " %s pos=%u ", pc, dir ? "w" : "r", i);
+            switch (list[i].kind) {
+            case INSN_DF_ORD_GLOBAL: {
+                const char *nm = insn_dataflow_reg_name(list[i].index,
+                                                        NULL, NULL);
+                fprintf(f, "global reg=%s\n", nm ? nm : "?");
+                break;
+            }
+            case INSN_DF_ORD_FIELD:
+                fprintf(f, "field off=%u size=%u\n",
+                        d->fields[list[i].index].off,
+                        d->fields[list[i].index].size);
+                break;
+            case INSN_DF_ORD_DISCARD:
+                fprintf(f, "discard reg=%s zero=%u by_index=%u\n",
+                        d->discards[list[i].index].reg
+                            ? d->discards[list[i].index].reg : "-",
+                        d->discards[list[i].index].zero_reg,
+                        d->discards[list[i].index].by_index);
+                break;
+            case INSN_DF_ORD_ZERO:
+                fprintf(f, "zeroreg\n");
+                break;
+            default:
+                fprintf(f, "unknown kind=%u\n", list[i].kind);
+                break;
+            }
+        }
+        if (ovf) {
+            /*
+             * Said even when the list is empty, because an overflow is
+             * exactly the state in which the printed list is NOT the answer.
+             */
+            fprintf(f, "O 0x%" PRIx64 " %s truncated\n", pc, dir ? "w" : "r");
+        }
+    }
     for (unsigned i = 0; i < d->n_mem_rd; i++) {
         fprintf(f, "D 0x%" PRIx64 " r mem op=df\n", pc);
     }
@@ -1215,6 +1268,78 @@ static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
 }
 
 /*
+ * Append one member to an ORDERED list, at the position of its first
+ * observation.
+ *
+ * Idempotent by (kind, index), because the caller sites are the places the
+ * facts are STATED and a fact stated twice is one fact: an operand read by
+ * two ops of the same instruction, a register written by both arms of a
+ * lowering.  Keeping the FIRST position is what makes the order a property of
+ * the encoding rather than of how many times the target happened to touch a
+ * temp.
+ *
+ * A full list is FLAGGED and the member is dropped, on the rule the rest of
+ * this file runs under: a list short by a member is a missing dependency, and
+ * the flag is what stops a consumer reading the short list as a whole one.
+ * The flag is not "this instruction is wide" -- it is "do not publish this
+ * list at all".
+ */
+static void df_ord_add(InsnDataflowOrdered *list, uint8_t *n, uint8_t *ovf,
+                       uint8_t kind, unsigned index)
+{
+    /*
+     * An index that does not fit the byte is not recordable, and recording a
+     * TRUNCATED one would name a different register.  The bounds it can come
+     * from -- INSN_DF_MAX_REGS, INSN_DF_MAX_FIELDS, INSN_DF_MAX_DISCARDS --
+     * are all below 256 today; the check is here so that a target that raises
+     * one fails loudly rather than silently renaming an operand.
+     */
+    if (index > 0xff) {
+        *ovf = 1;
+        return;
+    }
+    for (unsigned i = 0; i < *n; i++) {
+        if (list[i].kind == kind && list[i].index == (uint8_t)index) {
+            return;
+        }
+    }
+    if (*n >= INSN_DF_MAX_ORDERED) {
+        *ovf = 1;
+        return;
+    }
+    list[*n].kind = kind;
+    list[*n].index = (uint8_t)index;
+    (*n)++;
+}
+
+static void df_ord_read(InsnDataflow *d, uint8_t kind, unsigned index)
+{
+    df_ord_add(d->rd_ord, &d->n_rd_ord, &d->rd_ord_overflow, kind, index);
+}
+
+static void df_ord_write(InsnDataflow *d, uint8_t kind, unsigned index)
+{
+    df_ord_add(d->wr_ord, &d->n_wr_ord, &d->wr_ord_overflow, kind, index);
+}
+
+/*
+ * A CPUArchState byte range enters whichever list(s) its direction names.
+ *
+ * Both, when the emitter stated both -- a gvec helper's in-place destination
+ * is read and written by one row, and a consumer that saw it in only one list
+ * would either miss the input edge or miss the output.
+ */
+static void df_ord_field(InsnDataflow *d, unsigned field, uint8_t dir)
+{
+    if (dir & INSN_DF_RD) {
+        df_ord_read(d, INSN_DF_ORD_FIELD, field);
+    }
+    if (dir & INSN_DF_WR) {
+        df_ord_write(d, INSN_DF_ORD_FIELD, field);
+    }
+}
+
+/*
  * THE VALUE THIS INSTRUCTION ALREADY PUT IN @reg, or NULL if it has not
  * written it yet.
  *
@@ -1379,6 +1504,15 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
             if (prov) {
                 df_or(d->fields[i].prov, prov);
             }
+            /*
+             * THE ORDER IS PER DIRECTION, which is why this is here and not
+             * only on the append below.  A field first touched as a READ and
+             * written later is one row in fields[] with two directions, and
+             * its position in the WRITE list is where the write was stated,
+             * not where the read was.  Merging the row does not merge the
+             * two positions.
+             */
+            df_ord_field(d, i, dir);
             return;
         }
     }
@@ -1401,6 +1535,7 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
         memcpy(d->fields[d->n_fields].prov, prov,
                sizeof(d->fields[d->n_fields].prov));
     }
+    df_ord_field(d, d->n_fields, dir);
     d->n_fields++;
 }
 
@@ -1472,6 +1607,7 @@ static void df_add_discard(InsnDataflow *d, const DfDiscardNote *n)
              * the machine's write happened.
              */
             d->discards[i].by_index |= n->by_index ? 1 : 0;
+            df_ord_write(d, INSN_DF_ORD_DISCARD, i);
             return;
         }
     }
@@ -1484,6 +1620,7 @@ static void df_add_discard(InsnDataflow *d, const DfDiscardNote *n)
     d->discards[d->n_discards].by_index = n->by_index ? 1 : 0;
     memcpy(d->discards[d->n_discards].prov, prov,
            sizeof(d->discards[d->n_discards].prov));
+    df_ord_write(d, INSN_DF_ORD_DISCARD, d->n_discards);
     d->n_discards++;
 }
 
@@ -2282,6 +2419,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         df_or(prov, fwd);
                     } else {
                         df_bit(d->rd, idx);
+                        df_ord_read(d, INSN_DF_ORD_GLOBAL, idx);
                         df_bit(prov, idx);
                     }
                 }
@@ -2697,6 +2835,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
                 if (df_reg(ts, &idx)) {
                     df_bit(d->wr, idx);
+                    df_ord_write(d, INSN_DF_ORD_GLOBAL, idx);
                     df_add_write(d, idx, prov, df_supplied_value(ts, op));
                 } else {
                     size_t ti = ts - s->temps;
@@ -2834,6 +2973,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
              */
             if (df_carrier_read(ts, &carried)) {
                 df_bit(d->rd, carried);
+                df_ord_read(d, INSN_DF_ORD_GLOBAL, carried);
                 df_bit(prov, carried);
                 if (d->n_repr_carrier < UINT8_MAX) {
                     d->n_repr_carrier++;
@@ -2895,6 +3035,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     df_or(prov, fwd);
                 } else {
                     df_bit(d->rd, idx);
+                    df_ord_read(d, INSN_DF_ORD_GLOBAL, idx);
                     df_bit(prov, idx);
                 }
             } else if (df_zero_reg_temp(ts, 1, zero_lo, *zero_cursor)) {
@@ -2915,6 +3056,16 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                  * every write after the first instruction that read it.
                  */
                 df_bit(prov, INSN_DF_ZERO_PROV_BIT);
+                /*
+                 * AND INTO THE ORDERED LIST, which is the one place it can
+                 * go.  It has no TCG global, so @d->rd cannot hold it -- and
+                 * a consumer building a source LIST from the read set alone
+                 * is short by exactly the register the encoding named, which
+                 * R7.3 rules is not the emulator's to drop.  The bitmap's
+                 * inability to say it is why the list is not a permutation
+                 * of the bitmap.
+                 */
+                df_ord_read(d, INSN_DF_ORD_ZERO, 0);
             }
         }
 
@@ -2955,6 +3106,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
             if (df_reg(ts, &idx)) {
                 df_bit(d->wr, idx);
+                df_ord_write(d, INSN_DF_ORD_GLOBAL, idx);
                 df_add_write(d, idx, prov, df_supplied_value(ts, op));
             } else {
                 size_t ti = ts - s->temps;

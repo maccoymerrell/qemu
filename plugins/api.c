@@ -418,6 +418,97 @@ PLUGIN_DF_SET(qemu_plugin_insn_reg_reads,  rd)
 PLUGIN_DF_SET(qemu_plugin_insn_reg_writes, wr)
 PLUGIN_DF_SET(qemu_plugin_insn_reg_kills,  kill)
 
+/*
+ * The ordered lists.
+ *
+ * Refuses on the LIST's own overflow as well as on the three the sets refuse
+ * on.  A list that dropped a member is short by a register the instruction
+ * touched, and a short list published as a whole one is the failure this
+ * whole interface is shaped around; qemu_plugin_insn_dataflow_status() says
+ * which limit it was.
+ */
+static unsigned plugin_df_list(const InsnDataflow *d,
+                               const InsnDataflowOrdered *src,
+                               unsigned n, bool ovf,
+                               qemu_plugin_dataflow_reg_entry *out,
+                               unsigned nentries)
+{
+    if (d == NULL || !plugin_df_complete(d) || ovf) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nentries < n || out == NULL) {
+        return n;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t want = out[i].struct_size;
+        qemu_plugin_dataflow_reg_entry e = {
+            .struct_size = sizeof(e),
+            .kind = src[i].kind,
+            .reg = UINT32_MAX,
+            .index = UINT32_MAX,
+        };
+
+        switch (src[i].kind) {
+        case INSN_DF_ORD_GLOBAL:
+            e.kind = QEMU_PLUGIN_DF_ENT_GLOBAL;
+            e.reg = src[i].index;
+            break;
+        case INSN_DF_ORD_FIELD:
+            e.kind = QEMU_PLUGIN_DF_ENT_FIELD;
+            e.index = src[i].index;
+            break;
+        case INSN_DF_ORD_DISCARD:
+            e.kind = QEMU_PLUGIN_DF_ENT_DISCARD;
+            e.index = src[i].index;
+            break;
+        case INSN_DF_ORD_ZERO:
+            e.kind = QEMU_PLUGIN_DF_ENT_ZERO;
+            break;
+        default:
+            /*
+             * A kind this build does not know cannot be described, and
+             * describing it wrongly would name a register.  Refuse the whole
+             * list rather than hand back an entry a consumer would read as
+             * one of the four it knows.
+             */
+            return QEMU_PLUGIN_DF_INCOMPLETE;
+        }
+        if (want == 0 || want > sizeof(e)) {
+            want = sizeof(e);
+        }
+        memcpy(&out[i], &e, want);
+    }
+    return n;
+}
+
+unsigned qemu_plugin_insn_reg_read_list(const struct qemu_plugin_tb *tb,
+                                        size_t idx,
+                                        qemu_plugin_dataflow_reg_entry *out,
+                                        unsigned nentries)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_list(d, d->rd_ord, d->n_rd_ord, d->rd_ord_overflow,
+                          out, nentries);
+}
+
+unsigned qemu_plugin_insn_reg_write_list(const struct qemu_plugin_tb *tb,
+                                         size_t idx,
+                                         qemu_plugin_dataflow_reg_entry *out,
+                                         unsigned nentries)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_list(d, d->wr_ord, d->n_wr_ord, d->wr_ord_overflow,
+                          out, nentries);
+}
+
 bool qemu_plugin_insn_write_supplies_value(const struct qemu_plugin_tb *tb,
                                            size_t idx, unsigned reg)
 {
@@ -655,6 +746,8 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.imm_stated = d->imm_stated;
     st.imm_reached = d->imm_reached;
     st.imm_non_dataflow = d->imm_non_dataflow;
+    st.read_list_truncated = d->rd_ord_overflow;
+    st.write_list_truncated = d->wr_ord_overflow;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

@@ -3789,18 +3789,6 @@ sources.  A consumer gains nothing from relying on that and must not;
 it is recorded because it is what makes an address mask's value a
 function of the emitter's answer alone.
 
-The array's CONTENT has the same origin.  ``src_regs[]`` carries every
-register the emulator's own emitters stated the instruction reads --
-the ordered read list its translation produced, which names a
-zero-register operand and a program counter the encoding supplies even
-where the emulator created no value for either.  Registers the tracer's
-per-ISA decode published that the emulator does not state are carried
-alongside them rather than dropped; the wire's source list is a
-superset of both, never a choice between them.  This is a statement
-about where the entries come from, not about what an entry MEANS: an
-entry is still exactly "a register this instruction reads", and the
-masks index it exactly as above.
-
 Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore

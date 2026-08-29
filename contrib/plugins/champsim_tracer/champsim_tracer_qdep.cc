@@ -1237,32 +1237,6 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
             }
         }
     }
-    /*
-     * THE INSTRUCTION'S OWN SOURCE LIST, in QEMU's order, last.
-     *
-     * The three runs above are PROVENANCE: the registers a particular
-     * dependency of this instruction was derived from.  This one is the
-     * instruction's read set -- every register QEMU's emitters stated the
-     * instruction reads, ordered by qemu_plugin_insn_reg_read_list()'s own
-     * ordering contract (qemu-plugin-dataflow.h).  It is what the wire's
-     * src_regs[] is FOR, and until this call the wire took it from the
-     * Capstone operand walk alone.
-     *
-     * LAST, for the same reason the destination family is last: a register
-     * the provenance runs already named keeps the slot it already had, so
-     * every mask this file writes keeps the bit position it had before this
-     * run existed.  A read the provenance runs did not name is APPENDED --
-     * a source the wire was missing, seated where nothing else moves.
-     *
-     * Gated on src_state alone.  It is qdep_note_insn()'s RAW verdict for
-     * the read list, not the shape or count gates the memory families pass
-     * through: those are decided from access lists this run does not read,
-     * and gating on them would make the source list's length a function of
-     * a question about memory.
-     */
-    if (q->src_state == QDEP_OK) {
-        take(q->src_reg, q->n_src);
-    }
     return n;
 }
 
@@ -1278,12 +1252,10 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
  * invented and every SSE instruction would report its whole input set that
  * way.  The census would then be measuring this reader, not the wire.
  *
- * ON THE WIRE.  qemu_named_regs() takes this list, so every register QEMU
- * states the instruction reads is seated in src_regs[] -- the census below
- * still scores it, but it is no longer only a measurement.  Kept on QDepInsn
- * rather than computed at the scoring site because the accessors are keyed on
- * (tb, idx) and there is no later moment at which that pair still names
- * anything.
+ * MEASUREMENT ONLY.  Nothing here is written to any wire field; the flip that
+ * would use it is not this change.  Kept on QDepInsn rather than computed at
+ * the scoring site because the accessors are keyed on (tb, idx) and there is
+ * no later moment at which that pair still names anything.
  *
  * A member with no generic word is SKIPPED, not refused, and the instruction
  * stays scorable.  The scoring asks whether a PUBLISHED register is justified;
@@ -3506,11 +3478,9 @@ void qdep_report(GString *report)
     }
     g_string_append(report,
         "\nSOURCE-SIDE MEMBERSHIP COVERAGE -- per PUBLISHED src_regs[i], is\n"
-        "there a QEMU statement that justifies it?  The wire's source list is\n"
-        "BUILT from this same read list (qemu_named_regs), so a JUSTIFIED\n"
-        "entry is one QEMU seated and an UNJUSTIFIED one is a register only\n"
-        "the operand walk supplied.  Read off QEMU's ORDERED read list, so a\n"
-        "zero-register\n"
+        "there a QEMU statement that justifies it?  MEASUREMENT ONLY: the\n"
+        "wire's source list is still the operand walk's and nothing here\n"
+        "moves it.  Read off QEMU's ORDERED read list, so a zero-register\n"
         "source and a CPUArchState-only source both count as stated -- the\n"
         "read bitmap can express neither and scoring against it would report\n"
         "every one of them as invented.\n");

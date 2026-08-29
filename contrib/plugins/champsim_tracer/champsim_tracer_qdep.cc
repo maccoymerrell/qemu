@@ -118,6 +118,26 @@ GHashTable *g_monitor_name  = nullptr;   /* reservation-monitor global -> count 
  * nobody checked.
  */
 GHashTable *g_dst_unmapped_name = nullptr;
+
+/*
+ * THE SOURCE-SIDE MEMBERSHIP CENSUS (the unmeasured half).
+ *
+ * The destination list has been scored against QEMU's writes since #232.
+ * The SOURCE list never was, and "not measured" was being carried as though
+ * it were "measured and fine".  These count, per published `src_regs[i]`,
+ * whether QEMU stated a read that justifies it.
+ *
+ * @g_src_justified / @g_src_unjustified partition the published entries of
+ * every instruction whose read list QEMU gave us.  @g_src_nostate counts the
+ * entries of instructions where it did not, which is a THIRD outcome and not
+ * a failure of the register: folding those into unjustified would blame the
+ * wire for QEMU's refusal.  @g_src_qemu_extra is the other direction -- QEMU
+ * states a source the wire does not publish -- which is not scored here
+ * because it is not what this census is for; it is counted so the two
+ * directions can never be quoted as one number.
+ */
+GHashTable *g_src_unjustified_sig = nullptr;
+GHashTable *g_src_qemu_extra_sig = nullptr;
 /*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
@@ -306,6 +326,13 @@ std::atomic<uint64_t> g_dst_imm_non_dataflow{0};
  */
 std::atomic<uint64_t> g_dst_repr_selector{0};
 std::atomic<uint64_t> g_dst_repr_change{0};
+std::atomic<uint64_t> g_src_justified{0};
+std::atomic<uint64_t> g_src_unjustified{0};
+std::atomic<uint64_t> g_src_nostate{0};
+std::atomic<uint64_t> g_src_qemu_extra{0};
+std::atomic<uint64_t> g_src_insn_scored{0};
+std::atomic<uint64_t> g_src_insn_nostate{0};
+std::atomic<uint64_t> g_src_wide{0};
 std::atomic<uint64_t> g_dst_repr_refused{0};
 GHashTable *g_dst_repr_sig = nullptr;       /* "mnem  REG" -> count */
 GHashTable *g_dst_repr_refused_sig = nullptr;
@@ -1214,6 +1241,140 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
 }
 
 /*
+ * THE SOURCE LIST QEMU STATES, folded to generic words.
+ *
+ * Read off the ORDERED read list rather than the read BITMAP, because the
+ * bitmap is indexed by TCG global and two kinds of source have no global at
+ * all: a CPUArchState byte range -- every vector and x87 source on x86, every
+ * V register on aarch64 -- and the architectural zero register, which R7.3
+ * says is a source the encoding named and not the emulator's to drop.  Scored
+ * against the bitmap, `add rd,x0,rs` would report x0 as a source the wire
+ * invented and every SSE instruction would report its whole input set that
+ * way.  The census would then be measuring this reader, not the wire.
+ *
+ * MEASUREMENT ONLY.  Nothing here is written to any wire field; the flip that
+ * would use it is not this change.  Kept on QDepInsn rather than computed at
+ * the scoring site because the accessors are keyed on (tb, idx) and there is
+ * no later moment at which that pair still names anything.
+ *
+ * A member with no generic word is SKIPPED, not refused, and the instruction
+ * stays scorable.  The scoring asks whether a PUBLISHED register is justified;
+ * a QEMU source the tracer has no word for cannot justify or refute one, and
+ * refusing the instruction on it would hide every other entry's verdict behind
+ * a vocabulary gap.
+ */
+static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
+                     QDepInsn *out)
+{
+    unsigned n = qemu_plugin_insn_reg_read_list(tb, idx, nullptr, 0);
+    std::vector<qemu_plugin_dataflow_reg_entry> e;
+
+    if (n == QEMU_PLUGIN_DF_INCOMPLETE) {
+        out->src_state = QDEP_R_NORECORD;
+        return;
+    }
+    if (n == 0) {
+        /*
+         * An instruction that reads nothing.  A RESULT, not a refusal:
+         * QDEP_OK with an empty list says every published source is
+         * unjustified, which is the honest reading and the one the census
+         * has to be able to reach.
+         */
+        out->src_state = QDEP_OK;
+        return;
+    }
+    e.resize(n);
+    for (unsigned i = 0; i < n; i++) {
+        e[i].struct_size = sizeof(e[i]);
+    }
+    if (qemu_plugin_insn_reg_read_list(tb, idx, e.data(), n) != n) {
+        out->src_state = QDEP_R_NORECORD;
+        return;
+    }
+
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t gen = REG_ID_COUNT;
+
+        switch (e[i].kind) {
+        case QEMU_PLUGIN_DF_ENT_GLOBAL: {
+            if (e[i].reg >= g_nregs) {
+                continue;
+            }
+            /*
+             * A REPRESENTATION SELECTOR is not struck here, and the reason
+             * is the opposite of the one that strikes it on the write side.
+             * There it made `ja` an EFLAGS producer, because every
+             * instruction that touches the flags writes cc_op.  Here reading
+             * cc_op IS reading the flags -- it is how the value is fetched --
+             * and it folds to the same generic word the other three cc_
+             * globals do, so it adds no register the read did not involve.
+             */
+            gen = g_gen_of_reg[e[i].reg];
+            break;
+        }
+        case QEMU_PLUGIN_DF_ENT_FIELD: {
+            char fnm[64];
+            qemu_plugin_dataflow_field fl[kMaxFields];
+            unsigned nf = qemu_plugin_insn_fields(tb, idx, nullptr, 0);
+
+            if (nf == QEMU_PLUGIN_DF_INCOMPLETE || nf > kMaxFields ||
+                e[i].index >= nf) {
+                continue;
+            }
+            for (unsigned k = 0; k < nf; k++) {
+                fl[k].struct_size = sizeof(fl[k]);
+            }
+            if (qemu_plugin_insn_fields(tb, idx, fl, nf) != nf) {
+                continue;
+            }
+            if (!qemu_plugin_dataflow_field_reg(fl[e[i].index].env_offset,
+                                                fl[e[i].index].size,
+                                                fnm, sizeof(fnm))) {
+                continue;
+            }
+            gen = generic_for_field_name(fnm);
+            break;
+        }
+        case QEMU_PLUGIN_DF_ENT_ZERO:
+            gen = REG_ZERO;
+            break;
+        default:
+            continue;
+        }
+        if (gen >= REG_ID_COUNT) {
+            continue;
+        }
+        {
+            uint8_t k;
+
+            for (k = 0; k < out->n_src; k++) {
+                if (out->src_reg[k] == gen) {
+                    break;
+                }
+            }
+            if (k < out->n_src) {
+                continue;
+            }
+            if (out->n_src >= QDEP_MAX_SRC) {
+                /*
+                 * Over the fold's bound.  REFUSED, because a short source
+                 * list scored against the wire reports a real source as
+                 * unjustified and puts a coverage row on a list that has no
+                 * defect in it.  The census's third outcome exists for
+                 * exactly this.
+                 */
+                out->src_state = QDEP_R_WIDE;
+                out->n_src = 0;
+                g_src_wide.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            out->src_reg[out->n_src++] = gen;
+        }
+    }
+    out->src_state = QDEP_OK;
+}
+
+/*
  * THE DESTINATION FAMILY, read off the writes QEMU's emitters stated.
  *
  * `writes[]` carries, per TCG global this instruction defines, the set the
@@ -2052,6 +2213,75 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * used, and split so R10.1's block-final pc write is never mistaken for
      * a destination the wire is missing.
      */
+    /*
+     * THE SOURCE-SIDE MEMBERSHIP CENSUS (the unmeasured half).
+     *
+     * Per PUBLISHED source entry: did QEMU state a read that justifies it?
+     * Nothing here writes anything -- `src_regs[]` is still the operand
+     * walk's and this change does not move it.  What it does is stop the
+     * source half being carried as fine because nobody had looked.
+     *
+     * Three outcomes, kept apart on purpose.  JUSTIFIED and UNJUSTIFIED
+     * partition the entries of instructions whose read list QEMU gave us;
+     * NOSTATE counts the entries of the instructions where it did not, and
+     * folding those into unjustified would blame the wire for QEMU's own
+     * refusal -- the shape that made the destination side's first numbers a
+     * 219x overstatement (#231).
+     */
+    if (q->src_state == QDEP_OK) {
+        g_src_insn_scored.fetch_add(1, std::memory_order_relaxed);
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            bool justified = false;
+
+            for (uint8_t k = 0; k < q->n_src; k++) {
+                if (q->src_reg[k] == f->src_regs[i]) {
+                    justified = true;
+                    break;
+                }
+            }
+            if (justified) {
+                g_src_justified.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            g_src_unjustified.fetch_add(1, std::memory_order_relaxed);
+            {
+                char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
+                                            generic_reg_name_or_unknown(
+                                                f->src_regs[i]));
+                tally(&g_src_unjustified_sig, key);
+                g_free(key);
+            }
+        }
+        /*
+         * And the OTHER direction, counted and never added to the one above.
+         * A register QEMU reads that the wire does not publish is a
+         * different question with a different answer -- it is what the flip
+         * would GAIN, not what it would have to justify -- and one number
+         * covering both would be readable as neither.
+         */
+        for (uint8_t k = 0; k < q->n_src; k++) {
+            bool on_wire = false;
+
+            for (uint8_t i = 0; i < f->n_src_regs; i++) {
+                if (f->src_regs[i] == q->src_reg[k]) {
+                    on_wire = true;
+                    break;
+                }
+            }
+            if (!on_wire) {
+                g_src_qemu_extra.fetch_add(1, std::memory_order_relaxed);
+                char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
+                                            generic_reg_name_or_unknown(
+                                                q->src_reg[k]));
+                tally(&g_src_qemu_extra_sig, key);
+                g_free(key);
+            }
+        }
+    } else {
+        g_src_insn_nostate.fetch_add(1, std::memory_order_relaxed);
+        g_src_nostate.fetch_add(f->n_src_regs, std::memory_order_relaxed);
+    }
+
     for (uint8_t k = 0; k < q->n_dst; k++) {
         bool on_wire = false;
 
@@ -2347,7 +2577,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
 
     st.struct_size = sizeof(st);
     if (!qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
-        out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
+        out->state = out->data_state = out->dst_state =
+            out->src_state = QDEP_R_NORECORD;
         return;
     }
     /*
@@ -2380,7 +2611,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     if (st.memops_truncated || st.memops_unnoted ||
         st.fields_truncated || st.writes_truncated || st.prov_truncated ||
         st.n_helper_unbounded) {
-        out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
+        out->state = out->data_state = out->dst_state =
+            out->src_state = QDEP_R_STATUS;
         return;
     }
 
@@ -2404,12 +2636,22 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      */
     out->writes_unbounded = st.helper_writes_unbounded;
 
+    /*
+     * The source list, taken HERE rather than beside note_dst(), because it
+     * does not depend on the access list and an instruction with no memop
+     * returns through a different path below.  Extracting it once, before
+     * that fork, is what keeps the census's population equal to the
+     * population the status gate admitted.
+     */
+    note_src(tb, idx, out);
+
     for (unsigned i = 0; i < kMaxMemops; i++) {
         mo[i].struct_size = sizeof(mo[i]);
     }
     n = qemu_plugin_insn_memops(tb, idx, mo, kMaxMemops);
     if (n == QEMU_PLUGIN_DF_INCOMPLETE || n > kMaxMemops) {
-        out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
+        out->state = out->data_state = out->dst_state =
+            out->src_state = QDEP_R_NORECORD;
         return;
     }
 
@@ -2467,7 +2709,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
          * that direction rather than publish a truncated slot layout.
          */
         if ((store ? out->n_stores : out->n_loads) >= QDEP_MAX_ACCESS) {
-            out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
+            out->state = out->data_state = out->dst_state =
+            out->src_state = QDEP_R_STATUS;
             out->have_list = false;
             return;
         }
@@ -2486,7 +2729,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
          */
         if (qemu_plugin_insn_memop_addr_prov(tb, idx, i, w.data(),
                                              g_prov_words) != g_prov_words) {
-            out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
+            out->state = out->data_state = out->dst_state =
+            out->src_state = QDEP_R_NORECORD;
             out->have_list = false;
             return;
         }
@@ -3233,6 +3477,44 @@ void qdep_report(GString *report)
         }
     }
     g_string_append(report,
+        "\nSOURCE-SIDE MEMBERSHIP COVERAGE -- per PUBLISHED src_regs[i], is\n"
+        "there a QEMU statement that justifies it?  MEASUREMENT ONLY: the\n"
+        "wire's source list is still the operand walk's and nothing here\n"
+        "moves it.  Read off QEMU's ORDERED read list, so a zero-register\n"
+        "source and a CPUArchState-only source both count as stated -- the\n"
+        "read bitmap can express neither and scoring against it would report\n"
+        "every one of them as invented.\n");
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  published source entries JUSTIFIED\n"
+        "  %10" G_GUINT64_FORMAT "  published source entries UNJUSTIFIED --"
+        " QEMU stated the read set\n"
+        "               for this instruction and this register is not in it."
+        "  These\n"
+        "               are the NAMED SURVIVORS the flip would have to carry"
+        " (R12.1)\n"
+        "  %10" G_GUINT64_FORMAT "  published source entries NOT SCORED --"
+        " QEMU withheld the read\n"
+        "               list for the instruction.  A THIRD outcome, never"
+        " folded into\n"
+        "               the line above: that would blame the wire for QEMU's"
+        " refusal\n"
+        "  %10" G_GUINT64_FORMAT "  registers QEMU reads that the wire does"
+        " NOT publish -- the\n"
+        "               OTHER direction, counted apart because it is what a"
+        " flip would\n"
+        "               GAIN and not what it would have to justify\n"
+        "  %10" G_GUINT64_FORMAT "  instructions scored\n"
+        "  %10" G_GUINT64_FORMAT "  instructions not scored\n"
+        "  %10" G_GUINT64_FORMAT "  read lists over the fold's bound,"
+        " refused rather than shortened\n",
+        g_src_justified.load(std::memory_order_relaxed),
+        g_src_unjustified.load(std::memory_order_relaxed),
+        g_src_nostate.load(std::memory_order_relaxed),
+        g_src_qemu_extra.load(std::memory_order_relaxed),
+        g_src_insn_scored.load(std::memory_order_relaxed),
+        g_src_insn_nostate.load(std::memory_order_relaxed),
+        g_src_wide.load(std::memory_order_relaxed));
+    g_string_append(report,
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
         "`no accesses / no dataflow ABI` still carries the refiner's mask:\n");
@@ -3457,6 +3739,10 @@ void qdep_report(GString *report)
                "env byte ranges no target declared a register file for\n(#226: the offset IS the identity, so this is a gap in QEMU's statement\nof its own layout -- never a limit of what the machine knows):");
     dump_tally(report, g_field_unmapped_name,
                "env byte ranges QEMU NAMED that have no generic word\n(#226: the name reached this file and the register table has no row for\nit -- a generator pass, not a boundary question):");
+    dump_tally(report, g_src_unjustified_sig,
+               "SOURCE entries the wire publishes that QEMU's read list does\nnot justify, by mnemonic and generic register.  These are the source\nhalf's NAMED SURVIVORS (R12.1): every one is published exactly as\nbefore, and each row is a coverage path -- an emitter that has to state\nthe read, or an adjudication that the wire is right and QEMU is short:");
+    dump_tally(report, g_src_qemu_extra_sig,
+               "SOURCES QEMU states that the wire does not publish, by\nmnemonic and generic register.  The OTHER direction, and not a defect\nin either list on its own -- a source the wire lacks is what a list flip\nwould add, and it is listed so the two directions stay two numbers:");
     dump_tally(report, g_dst_reseat_refused_sig,
                "DESTINATION LISTS THE RE-SEATING COULD NOT TAKE (#232: the two\nlists are not the same set, so the wire's slot dictionary is still the\noperand walk's on these mnemonics):");
     dump_tally(report, g_discard_unmapped_name,

@@ -237,6 +237,17 @@ struct InsnRegNames;
  */
 #define QDEP_MAX_DST 8
 
+/*
+ * How many DISTINCT generic source registers one instruction's read list may
+ * carry.  Wider than QDEP_MAX_DST because the read side genuinely is: an x86
+ * far call reads eight globals and two env ranges, and several globals fold
+ * to one generic word, so the bound is on the folded count and not on the
+ * raw one.  An instruction over it is COUNTED, never truncated -- a short
+ * source list scored against the wire would report a real source as
+ * unjustified and put a coverage row on a list that has no defect in it.
+ */
+#define QDEP_MAX_SRC 16
+
 /* Why an instruction's dependency block is what it is.  Exactly one applies
  * per family.  The address family cannot reach QDEP_R_EMU_MONITOR (R9's
  * alias note already substitutes the guest register there); the data family
@@ -495,6 +506,32 @@ struct QDepInsn {
      */
     uint8_t n_repr_only;
     uint8_t repr_only[QDEP_MAX_DST];
+
+    /*
+     * THE SOURCE LIST QEMU STATES, in the order the translation stated it.
+     *
+     * The MEASUREMENT half of the source side, and measurement only: nothing
+     * here reaches the wire.  The question it exists to answer is the one
+     * the destination side has been answering since #232 and the source side
+     * never has -- for each register the wire PUBLISHES as a source, is
+     * there a QEMU statement that justifies it?  Until this list existed the
+     * source half of `src_regs[]` was unmeasured, which is not the same
+     * thing as measured and fine.
+     *
+     * Read off qemu_plugin_insn_reg_read_list(), so it carries the two kinds
+     * of member the read BITMAP cannot: a CPUArchState byte range, and the
+     * architectural zero register.  Scoring against the bitmap alone would
+     * report every `add rd,x0,rs` zero-register source and every vector
+     * source as unjustified, which is the instrument being wrong about the
+     * machine rather than the wire being wrong.
+     *
+     * Generic ids, deduplicated, for the reason dst_reg[] is: several
+     * globals stand for one architectural register and the wire has one
+     * slot for it.
+     */
+    uint8_t src_state;
+    uint8_t n_src;
+    uint8_t src_reg[QDEP_MAX_SRC];
     /*
      * And the two facts that say whether a NO above is an answer.
      *

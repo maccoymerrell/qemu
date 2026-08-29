@@ -5,6 +5,7 @@
 # Usage:
 #   nocapstone_gate.sh [--build-dir DIR] [--nocap-dir DIR] [--out DIR]
 #                      [--stage link|compile|battery|all] [--configure]
+#   nocapstone_gate.sh --selftest [scratch-dir]
 #
 # THE RULING.  "I want the removal of Capstone enforced.  No 'one residual
 # here' or 'mostly removed'.  I want it out as a dependency for the qemu
@@ -56,6 +57,7 @@ BUILD_DIR="$SRC_ROOT/build"
 NOCAP_DIR="$SRC_ROOT/build-nocap"
 OUT_DIR=""
 STAGE=all
+SELFTEST_DIR=""
 DO_CONFIGURE=0
 NINJA_JOBS=${NINJA_JOBS:-12}
 
@@ -69,20 +71,114 @@ while [ $# -gt 0 ]; do
         --out)       OUT_DIR=$2;   shift 2 ;;
         --stage)     STAGE=$2;     shift 2 ;;
         --configure) DO_CONFIGURE=1; shift ;;
+        --selftest)  STAGE=selftest; SELFTEST_DIR=${2:-}; \
+                     [ -n "${SELFTEST_DIR}" ] && shift; shift ;;
         -h|--help)   sed -n '2,50p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "nocapstone_gate: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 
-if [ -z "$OUT_DIR" ]; then
-    OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nocapgate.XXXXXX")
+if [ "$STAGE" != selftest ]; then
+    if [ -z "$OUT_DIR" ]; then
+        OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nocapgate.XXXXXX")
+    fi
+    mkdir -p "$OUT_DIR" ||
+        { echo "nocapstone_gate: FAIL — cannot create $OUT_DIR"; exit 1; }
 fi
-mkdir -p "$OUT_DIR" || { echo "nocapstone_gate: FAIL — cannot create $OUT_DIR"; exit 1; }
 
 FAILED=0
 note()  { printf '%s\n' "$*"; }
 pass()  { note "nocapstone_gate: PASS  $*"; }
 fail()  { note "nocapstone_gate: FAIL  $*"; FAILED=1; }
+
+# ------------------------------------------------------------- selftest
+# A GATE IS ONLY A GATE IF IT CAN GO RED, AND ONLY USEFUL IF IT CAN GO
+# GREEN.  Neither direction may be inferred from the tree's current state:
+# today the link stage is red because the plugin really does import
+# `qemu_plugin_cap_decode`, and once the flip lands it will be green for
+# the same reason -- in both worlds the gate's own discrimination is
+# UNTESTED, because the subject only ever takes one value.
+#
+# So the selftest supplies both values itself.  It compiles two tiny
+# shared objects into a scratch build tree shaped like a real one and runs
+# the LINK stage against each:
+#
+#   clean.so    imports only non-Capstone symbols            -> must PASS
+#   planted.so  imports qemu_plugin_cap_decode and nothing
+#               else that matters                            -> must FAIL
+#   (absent)    no .so at the path the stage reads           -> must FAIL
+#
+# The third arm is the standing failure mode of every check in this tree:
+# a stage that cannot find its subject must report RED, never skip into a
+# pass.  All three are tip-independent -- they do not consult the plugin,
+# so they keep proving the same thing after the flip lands.
+#
+# The COMPILE and BATTERY stages are deliberately NOT self-tested here.
+# Their subject is a whole --disable-capstone QEMU build; a scratch
+# fixture for them would test a mock, and a gate that passes its own mock
+# is the false success this file exists to prevent.  Their red direction
+# is instead witnessed for real, every run, for as long as R14 is unmet:
+# `--stage compile` fails on the missing capstone header, and that failure
+# is quoted in the evidence.
+selftest() {
+    local scratch=${1:-$(mktemp -d "${TMPDIR:-/tmp}/nocapgate_selftest.XXXXXX")}
+    local cc=${CC:-cc}
+    mkdir -p "$scratch/clean/contrib/plugins" \
+             "$scratch/planted/contrib/plugins" \
+             "$scratch/absent/contrib/plugins" || {
+        echo "nocapstone_gate: SELFTEST CANNOT RUN — cannot create $scratch"
+        return 1
+    }
+
+    cat > "$scratch/clean.c" <<'EOF'
+extern int qemu_plugin_insn_decode_id(const void *insn);
+int probe(const void *i) { return qemu_plugin_insn_decode_id(i); }
+EOF
+    cat > "$scratch/planted.c" <<'EOF'
+extern int qemu_plugin_cap_decode(int a, unsigned m, const unsigned char *b,
+                                  unsigned n, unsigned long pc, void *out);
+int probe(const unsigned char *b, void *o)
+{ return qemu_plugin_cap_decode(0, 0, b, 4, 0, o); }
+EOF
+    for which in clean planted; do
+        if ! "$cc" -shared -fPIC -o \
+             "$scratch/$which/contrib/plugins/libchampsim_tracer.so" \
+             "$scratch/$which.c" > "$scratch/$which.cc.log" 2>&1; then
+            echo "nocapstone_gate: SELFTEST CANNOT RUN — $cc could not build" \
+                 "the $which fixture (see $scratch/$which.cc.log)"
+            return 1
+        fi
+    done
+
+    local rc_clean rc_planted rc_absent bad=0
+    ( BUILD_DIR="$scratch/clean";   OUT_DIR="$scratch/out_clean";   \
+      mkdir -p "$OUT_DIR"; FAILED=0; stage_link; exit $FAILED ) \
+        > "$scratch/clean.gate" 2>&1
+    rc_clean=$?
+    ( BUILD_DIR="$scratch/planted"; OUT_DIR="$scratch/out_planted"; \
+      mkdir -p "$OUT_DIR"; FAILED=0; stage_link; exit $FAILED ) \
+        > "$scratch/planted.gate" 2>&1
+    rc_planted=$?
+    ( BUILD_DIR="$scratch/absent";  OUT_DIR="$scratch/out_absent";  \
+      mkdir -p "$OUT_DIR"; FAILED=0; stage_link; exit $FAILED ) \
+        > "$scratch/absent.gate" 2>&1
+    rc_absent=$?
+
+    note "nocapstone_gate: SELFTEST (scratch $scratch)"
+    note "  link/clean    rc=$rc_clean   (expect 0)  $(head -n1 "$scratch/clean.gate")"
+    note "  link/planted  rc=$rc_planted   (expect 1)  $(head -n1 "$scratch/planted.gate")"
+    note "  link/absent   rc=$rc_absent   (expect 1)  $(head -n1 "$scratch/absent.gate")"
+    [ "$rc_clean"   = 0 ] || { note "  SELFTEST FAIL: the link stage refused a plugin with NO Capstone import"; bad=1; }
+    [ "$rc_planted" = 1 ] || { note "  SELFTEST FAIL: the link stage PASSED a planted qemu_plugin_cap_decode call"; bad=1; }
+    [ "$rc_absent"  = 1 ] || { note "  SELFTEST FAIL: the link stage passed with no subject to read"; bad=1; }
+    if [ "$bad" = 0 ]; then
+        note "nocapstone_gate: SELFTEST GREEN — the link stage discriminates in"
+        note "  both directions and refuses a missing subject"
+        return 0
+    fi
+    note "nocapstone_gate: SELFTEST RED — this gate's verdicts cannot be trusted"
+    return 1
+}
 
 # ---------------------------------------------------------------- stage link
 stage_link() {
@@ -230,12 +326,15 @@ stage_battery() {
 
 note "nocapstone_gate: R14 — Capstone is not a plugin dependency"
 note "  source     $SRC_ROOT"
-note "  build      $BUILD_DIR"
-note "  nocap      $NOCAP_DIR"
-note "  evidence   $OUT_DIR"
+if [ "$STAGE" != selftest ]; then
+    note "  build      $BUILD_DIR"
+    note "  nocap      $NOCAP_DIR"
+    note "  evidence   $OUT_DIR"
+fi
 note ""
 
 case "$STAGE" in
+    selftest) selftest "$SELFTEST_DIR" || FAILED=1 ;;
     link)    stage_link ;;
     compile) stage_compile ;;
     battery) stage_battery ;;
@@ -244,6 +343,14 @@ case "$STAGE" in
 esac
 
 note ""
+if [ "$STAGE" = selftest ]; then
+    # SAY WHAT WAS MEASURED.  A selftest run inspects fixtures, never the
+    # plugin, so it may not borrow the R14 verdict sentence: printing
+    # "the plugin makes no Capstone-backed call" after a run that never
+    # opened the plugin is the false success this file exists to prevent.
+    [ "$FAILED" = 0 ] && exit 0
+    exit 1
+fi
 if [ "$FAILED" = 0 ]; then
     note "nocapstone_gate: GREEN — the plugin makes no Capstone-backed call and needs no Capstone header"
     exit 0

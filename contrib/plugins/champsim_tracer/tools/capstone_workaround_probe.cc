@@ -31,6 +31,24 @@
  * subprojects/capstone, or just run this tool, whenever a comment says to
  * "verify with cstool").
  *
+ * R14 DISPOSITION OF EVERY CASE IN THIS FILE.  All of them are reachable
+ * only through the boundary's two DETAIL exits -- cap_disas_plugin_detail()
+ * (from qemu_plugin_insn_detail()) and cap_disas_raw_detail() (from
+ * qemu_plugin_cap_decode()).  QEMU's own -d in_asm and monitor disassembly
+ * go through cap_disas(), which prints mnemonic/op_str and never reads a
+ * per-operand access flag.  So not one workaround in disas/capstone.c has a
+ * consumer outside the plugin boundary, and none may be retired while that
+ * boundary is still consulted: they repair the access flags that feed the
+ * wire's memory direction and its ordered register lists, so deleting one
+ * today changes the trace and owes a per-row adjudication under R12.1.
+ * They retire TOGETHER, in the change that leaves qemu_plugin_cap_decode()
+ * with no caller.  This tool retires with them, and is therefore the LAST
+ * thing to go rather than the first -- it is what says which workarounds a
+ * Capstone bump has already made unnecessary, and it keeps that job right
+ * up to the change that deletes the subject.  isaxcheck does NOT retire:
+ * it is R13's static leg, where Capstone is one external reference decoder
+ * among LLVM MC / XED / iced, and a reference decoder is not a dependency.
+ *
  * To retest against a new Capstone: bump subprojects/capstone.wrap,
  * reconfigure, `ninja -C build contrib-plugins`, then run
  * `build/contrib/plugins/capstone_workaround_probe`. A workaround whose

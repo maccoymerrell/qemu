@@ -279,9 +279,11 @@ Capstone workaround maintenance
 
 **Retiring a Capstone workaround**
 
-``disas/capstone.c`` carries roughly a dozen boundary workarounds for
-access-flag and operand-modelling defects in Capstone 6.0.0-Alpha7, the
-revision ``subprojects/capstone.wrap`` pins.  Each lives behind a
+``disas/capstone.c`` carries **32** boundary workarounds for access-flag
+and operand-modelling defects in Capstone 6.0.0-Alpha7, the revision
+``subprojects/capstone.wrap`` pins — that count is not an estimate, it is
+what ``capstone_workaround_probe`` enumerates, and every one of them
+reports ``STILL NEEDED`` against the pinned revision.  Each lives behind a
 narrowly-scoped predicate function (``cap_x86_is_test``,
 ``cap_aarch64_infer_mem_access``, ``cap_fill_mips_operands``'s inline
 MSA/unaligned check, ...), and each function's comment states three
@@ -352,6 +354,45 @@ ones a given Capstone bump has already fixed.
    golden net as a sign the affected encodings never appeared in the
    golden corpus (check by hand with ``cst_decode --format=disasm``),
    not as confirmation the removal was safe.
+
+**Who these workarounds serve, and when they retire (ruling R14)**
+
+Ruling R14 asks for Capstone to stop being a dependency of the plugin,
+which raises the question of what happens to these 32.  The answer is the
+same for all 32, and it follows from where they are reachable from rather
+than from what each one repairs.
+
+Every one of them lives inside a ``cap_fill_*_operands`` filler, and the
+only routes into those fillers are the boundary's two DETAIL exits:
+``cap_disas_plugin_detail()``, reached from ``plugin_disas_detail()`` and
+so from ``qemu_plugin_insn_detail()``, and ``cap_disas_raw_detail()``,
+reached from ``qemu_plugin_cap_decode()``.  QEMU's own disassembly — the
+``-d in_asm`` and monitor paths through ``cap_disas()`` — prints
+Capstone's ``mnemonic`` and ``op_str`` and never reads a per-operand
+access flag.  So:
+
+* **No workaround here is needed by QEMU's own output.**  Not one of the
+  32 has a consumer outside the plugin boundary and the R13 static leg
+  that deliberately drives the same boundary (``isaxcheck``).
+* **None of them may be retired before the consult is.**  They repair the
+  operand access flags that feed the wire's memory direction and its
+  ordered source and destination register lists, so deleting one today
+  changes the trace.  Under R12.1 that is a loss to be adjudicated row by
+  row, not a tidy-up.
+* **All 32 retire together, with the consult, in the same change.**  The
+  moment ``qemu_plugin_cap_decode()`` has no caller, every predicate here
+  is unreachable and the whole catalogue goes.
+
+``capstone_workaround_probe`` retires with its subject and is therefore
+the *last* thing to go, not the first: it is the tool that establishes
+which workarounds a Capstone bump has made unnecessary, and it keeps that
+job right up to the change that deletes the boundary.  ``isaxcheck`` does
+**not** retire — it is the R13 external-truth gate's static leg, where
+Capstone is one reference decoder among LLVM MC, XED and iced.  A
+reference decoder is a measuring instrument; a plugin dependency is the
+thing measured.  ``tools/nocapstone_gate.sh`` scopes itself to the
+plugin's own translation units for exactly this reason, and linking
+Capstone into ``isaxcheck`` says nothing about whether R14 is met.
 
 *Why not just trust a system* ``cstool``:  a system-installed
 ``cstool`` is routinely a different Capstone major version than the one

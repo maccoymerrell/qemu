@@ -4017,22 +4017,16 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 add(exp_dst, _rv.RISCV_REG_SSP)
                 add(exp_src, _rv.RISCV_REG_X0 + (1 if half == 0x6081 else 5))
         # A trap return reads the PC it returns to and rewrites the
-        # status word; `lpad` reads the label in x7 and consumes ELP.
-        #
-        # `fence` IS DELIBERATELY ABSENT.  It used to expect a REG_SYS
-        # source on the menvcfg.FIOM reading; that source was adjudicated
-        # a wire over-name and deleted at the boundary -- FENCE encodes
-        # both its operands as immediates and names no register (RISC-V
-        # Unprivileged ISA, "RV32I Base Integer Instruction Set", section
-        # "Memory Ordering Instructions").  This expectation moves with
-        # the adjudication; it is not an independent opinion about the
-        # instruction.
+        # status word; `fence` reads menvcfg.FIOM, which changes what it
+        # orders; `lpad` reads the label in x7 and consumes ELP.
         if mnem == "mret":
             exp_src.add("REG_SYS")
             exp_dst.add("REG_SYS")
         elif mnem == "sret":
             exp_src.add("REG_SYS")
             exp_dst.add("REG_SYS")
+        elif mnem == "fence":
+            exp_src.add("REG_SYS")
         elif mnem == "lpad":
             add(exp_src, _rv.RISCV_REG_X7)
             exp_src.add("REG_SYS")

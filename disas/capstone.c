@@ -446,7 +446,6 @@ static bool cap_x86_is_mask_arith_dest_last(const char *mnem);
 static bool cap_x86_is_ktest(const char *mnem);
 static bool cap_x86_is_ssp_read(const char *mnem);
 static bool cap_x86_is_x87_tag_only(const char *mnem);
-static bool cap_x86_is_cet_disabled_nop(const char *mnem);
 static const char *cap_x86_mnem_stem(const char *mnem);
 static bool cap_x86_is_cmov(const char *mnem);
 
@@ -790,10 +789,6 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * access; drop the operand instead (the multi-byte-NOP treatment,
      * for a register). */
     bool tag_only = cap_x86_is_x87_tag_only(insn->mnemonic);
-    /* RDSSPD/RDSSPQ are a NOP with CET off, which is every machine QEMU
-     * models: the named register is neither read nor written.  Same
-     * drop treatment as FFREEP -- see cap_x86_is_cet_disabled_nop. */
-    bool tag_only_cet = cap_x86_is_cet_disabled_nop(insn->mnemonic);
     /* Capstone-6.0.0-Alpha7 bugs on the conditional moves, two of them.
      * CMOVcc reports its destination WRITE-only: a conditional move
      * whose condition is false leaves the destination holding the value
@@ -918,7 +913,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
                 op->access |= QEMU_PLUGIN_OP_ACC_READ;
             }
         }
-        if (tag_only || tag_only_cet) {
+        if (tag_only) {
             op->type = QEMU_PLUGIN_OP_INVALID;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
@@ -1897,14 +1892,10 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
      * store-repair predicate above) and no system register.  LLVM MC
      * agrees: `--hex=0f38f608` gives RD{r0,r1} WR{} on both sides.
      */
-    /*
-     * RDSSPD / RDSSPQ DELIBERATELY ABSENT.  With shadow stacks
-     * disabled -- the only machine QEMU models -- the SDM defines them
-     * as a NOP that reads nothing, so naming SSP here published a
-     * source with no architectural referent.  ADJUDICATED WIRE
-     * DELETION, MAINTAINER-REVERTABLE ON ONE WORD; the full citation
-     * and the matching operand drop are at cap_x86_is_cet_disabled_nop.
-     */
+    case X86_INS_RDSSPD:
+    case X86_INS_RDSSPQ:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP, CAP_X86_SYS_R);
+        break;
     case X86_INS_INCSSPD:
     case X86_INS_INCSSPQ:
     case X86_INS_RSTORSSP:
@@ -2680,59 +2671,6 @@ static bool cap_x86_is_ssp_read(const char *mnem)
 static bool cap_x86_is_x87_tag_only(const char *mnem)
 {
     return mnem && strcmp(mnem, "ffreep") == 0;
-}
-
-/*
- * RDSSPD / RDSSPQ ON A MACHINE WITH NO CET: a true NOP.
- * ADJUDICATED WIRE DELETION -- MAINTAINER-REVERTABLE ON ONE WORD.
- *
- * Intel SDM Vol. 2B, RDSSPD/RDSSPQ, "Operation":
- *
- *     IF CPL = 3
- *         IF CR4.CET = 1 AND IA32_U_CET.SH_STK_EN = 1
- *             THEN R := SSP;
- *         FI;
- *     ELSE
- *         IF CR4.CET = 1 AND IA32_S_CET.SH_STK_EN = 1
- *             THEN R := SSP;
- *         FI;
- *     FI;
- *
- * and the description: "This instruction is a NOP on processors that
- * do not support CET, or when shadow stacks are not enabled."  With
- * shadow stacks disabled the destination register is NOT WRITTEN and
- * SSP is NOT READ -- the encoding is chosen precisely so that a
- * CET-unaware binary can execute it as a hint.
- *
- * QEMU MODELS NO CET.  `F3 REX.W 0F 1E /1` is decoded through the
- * generic reserved-NOP row (target/i386/tcg/decode-new.c.inc), there
- * is no `ssp` field in CPUX86State (checked against the binary's
- * DWARF: only fred_ssp1..3), and QEMU's own dataflow states nothing at
- * all for the instruction (EXEC52 3, witness 0x7ffff71aa053: one `A`
- * line and nothing else).  On the modeled machine NEITHER published
- * source exists:
- *
- *   REG_SSP   was appended by cap_x86_add_sysregs below -- deleted
- *             there, on the same adjudication.
- *   REG_GPR0  is the printed register operand.  Capstone reports it
- *             access == 0, and because the instruction classifies
- *             GEN_OP_NOP the plugin's positional fallback has no
- *             destination slot to give it, so it landed as a SOURCE
- *             (see the have_access_info comment in
- *             champsim_tracer_decode.cc, which measured exactly this).
- *             Dropped here, the multi-byte-NOP treatment, so the
- *             repair cannot fabricate an access in either direction.
- *
- * IF CET IS EVER MODELLED both halves come back together, with the
- * enable bits as their gate; this predicate is the one place to look.
- * RDSSP is the only CET form treated this way -- INCSSP, RSTORSSP,
- * SAVEPREVSSP, SETSSBSY and CLRSSBSY are all #UD without CET and so
- * never reach a trace at all, which is why they keep their operands.
- */
-static bool cap_x86_is_cet_disabled_nop(const char *mnem)
-{
-    return mnem && (strcmp(mnem, "rdsspd") == 0 ||
-                    strcmp(mnem, "rdsspq") == 0);
 }
 
 /* Append @reg to the implicit write (@is_write) or read list of an x86
@@ -8699,36 +8637,31 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                               | QEMU_PLUGIN_OP_ACC_WRITE);
         }
         /*
-         * `fence pred,succ` READS NO REGISTER.  ADJUDICATED WIRE
-         * DELETION -- MAINTAINER-REVERTABLE ON ONE WORD.
+         * `fence` reads menvcfg.
          *
-         * The RISC-V Unprivileged ISA, "RV32I Base Integer Instruction
-         * Set", section "Memory Ordering Instructions", defines FENCE
-         * with BOTH operands as encoded immediates: the 4-bit `pred`
-         * and 4-bit `succ` device/memory sets sit in instruction bits
-         * 27:24 and 23:20, `rs1` and `rd` are reserved zero, and the
-         * instruction names no source register at all.  There is no
-         * architectural referent for the REG_SYS source the wire used
-         * to publish here, and QEMU emits `tcg_gen_mb()` and states no
-         * read (EXEC50 C5 / EXEC51 3 / EXEC52 3).
+         * FIOM -- "Fence of I/O implies Memory" -- makes the I and O
+         * bits of a fence's predecessor and successor sets imply R and
+         * W, so the same encoding orders a different set of accesses
+         * depending on what menvcfg (or senvcfg, one level down) holds.
+         * Sail says it in two lines: `let fiom = is_fiom_active(); let
+         * pred = effective_fence_set(pred, fiom)`.  This is a change of
+         * semantics, not a legality gate, which is why it is named here
+         * and the CBO / WFI / Zicfiss enable bits are not.
          *
-         * WHAT WAS HERE, and why it went.  This clause named menvcfg on
-         * the FIOM reading -- "Fence of I/O implies Memory" makes the I
-         * and O bits of pred/succ imply R and W, so the same encoding
-         * orders a different set of accesses depending on menvcfg.
-         * FIOM changes which accesses the fence ORDERS; it never
-         * changes a value the instruction produces or consumes, and it
-         * cannot be a dataflow source of an instruction that has no
-         * destination.  The consumer the source list serves is a
-         * dependence model, and an edge from every CSR write to every
-         * fence is an edge onto a register the instruction never reads
-         * -- the same over-naming R2/R3 forbid in the other direction.
+         * `fence.tso` and `fence.i` have their own clauses and no FIOM
+         * term, so the test is on the exact mnemonic.
          *
-         * `fence.tso` and `fence.i` never carried the term.  The CBO /
-         * WFI / Zicfiss enable bits below are a DIFFERENT rule (R7.4,
-         * a CSR that decides whether an instruction TRAPS) and are
-         * untouched: those instructions do produce results.
+         * FIOM is a change of SEMANTICS rather than a legality gate,
+         * which is why this one was named while the CBO, WFI and
+         * Zicfiss enable bits were not.  R7.4 retired that distinction
+         * -- a CSR that decides whether an instruction TRAPS is a
+         * source, because a pending write to it must resolve before the
+         * instruction may proceed -- and those three are named below.
          */
+        if (!strcmp(insn->mnemonic, "fence")) {
+            cap_riscv_add_csr(out, 0x30a /* menvcfg */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        }
         /*
          * The enable bits that decide whether WFI and a cache-block
          * operation TRAP (R7.4).

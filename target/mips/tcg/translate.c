@@ -2508,6 +2508,30 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     /* generate cmpxchg */
     val = tcg_temp_new();
     gen_load_gpr(val, rt);
+    /*
+     * THE DATUM REGISTER IS A SOURCE, and the walk cannot see that it is.
+     *
+     * `sc rt,off(base)` READS rt -- the word to be stored -- and WRITES rt
+     * -- the success flag.  Both are architectural and the read is the one
+     * QEMU's op stream loses, because the FAIL path above already wrote
+     * cpu_gpr[rt] (the zero the failure returns) before this line reads it.
+     * The extractor's standing rule is that a read of a register the
+     * instruction has already written is a read of the instruction's own
+     * intermediate value and not an input edge -- which is right for a
+     * lowering that computes into a register and reads it back, and wrong
+     * here, because the write above and this read are on MUTUALLY EXCLUSIVE
+     * paths and no execution performs both.
+     *
+     * The emitter is the only party that knows the two sites cannot both
+     * run, so it states the read.  Stated even when rt is $zero: R7.3 keeps
+     * the zero register on the wire, and gen_load_gpr() hands back a
+     * constant there with no global to name.
+     */
+    if (rt == 0) {
+        insn_dataflow_note_folded_read_zero();
+    } else {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
+    }
     tcg_gen_atomic_cmpxchg_tl(t0, cpu_lladdr, cpu_llval, val,
                               eva ? MIPS_HFLAG_UM : ctx->mem_idx, tcg_mo);
     tcg_gen_setcond_tl(TCG_COND_EQ, t0, t0, cpu_llval);

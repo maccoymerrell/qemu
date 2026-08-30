@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 13
+#define QEMU_PLUGIN_DATAFLOW_VERSION 14
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -260,7 +260,12 @@ unsigned qemu_plugin_insn_reg_kills(const struct qemu_plugin_tb *tb, size_t idx,
  *        - the architectural ZERO REGISTER, which on every target that has
  *          one is a constant with no global at all.  A consumer building a
  *          source list from the read bitmap alone is short by exactly the
- *          register the encoding named.
+ *          register the encoding named;
+ *        - a source stated by NAME ALONE (READ list only), which has neither
+ *          a global nor an env range because it does not live in
+ *          CPUArchState -- AArch64's ARM_CP_CONST system registers are read
+ *          out of the CPU object at translate time.  Read its name from
+ *          qemu_plugin_insn_named_reads().
  *      Conversely a KILL is in neither list: it is not a read and not a
  *      write, and it stays where it is, in its own bitmap.
  *
@@ -289,6 +294,7 @@ unsigned qemu_plugin_insn_reg_kills(const struct qemu_plugin_tb *tb, size_t idx,
 #define QEMU_PLUGIN_DF_ENT_FIELD    1
 #define QEMU_PLUGIN_DF_ENT_DISCARD  2
 #define QEMU_PLUGIN_DF_ENT_ZERO     3
+#define QEMU_PLUGIN_DF_ENT_NAME     4
 
 typedef struct qemu_plugin_dataflow_reg_entry {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */
@@ -303,6 +309,7 @@ typedef struct qemu_plugin_dataflow_reg_entry {
      * array, so the extent and the provenance are read from the one place
      * that holds them rather than duplicated here where they could drift.
      * DISCARD: the index into qemu_plugin_insn_discards().
+     * NAME:    the index into qemu_plugin_insn_named_reads().
      * Otherwise UINT32_MAX.
      */
     uint32_t index;
@@ -450,6 +457,36 @@ QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_discards(const struct qemu_plugin_tb *tb, size_t idx,
                                    qemu_plugin_dataflow_discard *out,
                                    unsigned ndiscards);
+
+/*
+ * The sources this instruction NAMES that have no global and no env range.
+ *
+ * The read side's counterpart to qemu_plugin_insn_discards().  A register
+ * QEMU resolves at translation time out of storage that is not CPUArchState
+ * -- AArch64's ARM_CP_CONST system registers live in the ARMCPU object --
+ * has no bit to set and no byte range to state, so it travels by name and
+ * reaches the ORDERED READ LIST as QEMU_PLUGIN_DF_ENT_NAME with @index into
+ * this array.  It never appears in the write list and never in a bitmap.
+ *
+ * The name is in the same namespace qemu_plugin_dataflow_reg_name() and
+ * qemu_plugin_insn_discards() use, so a consumer's name-to-register map
+ * needs no second spelling.  There is no provenance: the instruction depends
+ * on the value, it did not compute it.
+ *
+ * Refusal and sizing exactly as qemu_plugin_insn_discards(): nothing is
+ * written and QEMU_PLUGIN_DF_INCOMPLETE is returned when the record is not
+ * whole, and a short @nnames or a NULL @out returns the count.
+ */
+typedef struct qemu_plugin_dataflow_named_read {
+    uint32_t struct_size;       /* caller sets to sizeof(*this) */
+    const char *reg;            /* the architectural name */
+} qemu_plugin_dataflow_named_read;
+
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_named_reads(const struct qemu_plugin_tb *tb,
+                                      size_t idx,
+                                      qemu_plugin_dataflow_named_read *out,
+                                      unsigned nnames);
 QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,
                                        size_t idx, unsigned discard,

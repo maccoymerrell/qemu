@@ -50,6 +50,14 @@ constexpr unsigned kMaxFields = 64;
  * short destination LIST must fail in.
  */
 constexpr unsigned kMaxDiscards = 8;
+/*
+ * Sources the encoding names that have neither a global nor an env range
+ * (qemu_plugin_insn_named_reads()).  QEMU's own cap is four; eight leaves
+ * the refusal reachable if that grows, for the same reason kMaxDiscards is
+ * wider than its own -- a source LIST must fail in the direction that says
+ * so rather than silently reading a short one.
+ */
+constexpr unsigned kMaxNamedReads = 8;
 
 std::atomic<bool>     g_tried{false};
 bool                  g_live = false;
@@ -1639,6 +1647,56 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
         case QEMU_PLUGIN_DF_ENT_ZERO:
             gen = REG_ZERO;
             break;
+        case QEMU_PLUGIN_DF_ENT_NAME: {
+            /*
+             * A source QEMU states by NAME because it has neither a TCG
+             * global nor a CPUArchState range -- an AArch64 ARM_CP_CONST
+             * system register, read out of the ARMCPU object at translation
+             * time.  The name is in the same namespace a DISCARDED
+             * DESTINATION's is, so it takes the same route to a generic
+             * word: the QEMU-indexed table first, then the non-architectural
+             * fold, exactly as generic_for_field_name() does for a range.
+             */
+            qemu_plugin_dataflow_named_read nr[kMaxNamedReads];
+            unsigned nn = qemu_plugin_insn_named_reads(tb, idx, nullptr, 0);
+
+            if (nn == QEMU_PLUGIN_DF_INCOMPLETE || nn > kMaxNamedReads ||
+                e[i].index >= nn) {
+                g_src_skip_other.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_src_skip_sig, "name-list   (no named_reads[] row)");
+                skipped++;
+                continue;
+            }
+            for (unsigned k = 0; k < nn; k++) {
+                nr[k].struct_size = sizeof(nr[k]);
+            }
+            if (qemu_plugin_insn_named_reads(tb, idx, nr, nn) != nn) {
+                g_src_skip_other.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_src_skip_sig, "name-list   (second call short)");
+                skipped++;
+                continue;
+            }
+            {
+                const char *nm = nr[e[i].index].reg;
+
+                gen = nm ? generic_for_qemu_name(nm) : REG_ID_COUNT;
+                if (gen >= REG_ID_COUNT && nm) {
+                    gen = fold_nonarch(nm);
+                }
+                if (gen >= REG_ID_COUNT) {
+                    g_src_skip_other.fetch_add(1, std::memory_order_relaxed);
+                    {
+                        char *k2 = g_strdup_printf("name-word    %s",
+                                                   nm ? nm : "?");
+                        tally(&g_src_skip_sig, k2);
+                        g_free(k2);
+                    }
+                    skipped++;
+                    continue;
+                }
+            }
+            break;
+        }
         default:
             g_src_skip_other.fetch_add(1, std::memory_order_relaxed);
             tally(&g_src_skip_sig, "kind         (unknown entry kind)");

@@ -2920,6 +2920,21 @@ static void handle_sys(DisasContext *s, bool isread,
 
     if (isread) {
         if (ri->type & ARM_CP_CONST) {
+            /*
+             * A CONSTANT system register: the value lives in the ARMCPU
+             * object (ARMCPRegInfo::resetvalue), QEMU resolves it here at
+             * TRANSLATION time, and the op stream that follows is one movi
+             * of an immediate.  `mrs x0, midr_el1` therefore states no read
+             * at all, and the register the ENCODING names is missing from
+             * the instruction's source list.
+             *
+             * That is a lowering decision, not the architecture (R15), and a
+             * register the encoding names is not the emulator's to drop
+             * (R7.3).  There is no env offset to state -- ARMCPU is not
+             * CPUArchState -- so it is stated by NAME, which is the only
+             * identity this register has.
+             */
+            insn_dataflow_note_stated_read_name(ri->name);
             tcg_gen_movi_i64(tcg_rt, ri->resetvalue);
         } else if (ri->readfn) {
             if (!tcg_ri) {

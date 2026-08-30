@@ -482,6 +482,28 @@ uint8_t fold_nonarch(const char *name)
     if (!strcmp(name, "gcr_el1")) {
         return REG_SYS;
     }
+    /*
+     * MIDR_EL1, the main ID register.
+     *
+     * It arrives by a different door from every spelling above: not as a
+     * declared env range but as a NAME, because QEMU holds it in the ARMCPU
+     * object and resolves `mrs xN, midr_el1` at translation time
+     * (ARM_CP_CONST, translate-a64.c).  The spelling is therefore
+     * ARMCPRegInfo::name, which is UPPER case, where a declared regfile name
+     * is lower -- two namespaces, matched exactly as each spells itself
+     * rather than case-folded, so a future collision is a compile-visible
+     * duplicate rather than a silent one.
+     *
+     * REG_SYSID is the vocabulary's word for the read-only implementation
+     * constants and already names this class (RISC-V VLENB/mvendorid/marchid,
+     * MIPS PRId/Config, aarch64 fcr0 sit on it), and REG_SYSID is what the
+     * wire has always published for this instruction -- the census row this
+     * closes is a published REG_SYSID with nothing in QEMU's union to justify
+     * it.  Nothing is invented here; a spelling meets a word that exists.
+     */
+    if (!strcmp(name, "MIDR_EL1")) {
+        return REG_SYSID;
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

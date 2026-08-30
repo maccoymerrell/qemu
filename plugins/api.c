@@ -464,6 +464,10 @@ static unsigned plugin_df_list(const InsnDataflow *d,
         case INSN_DF_ORD_ZERO:
             e.kind = QEMU_PLUGIN_DF_ENT_ZERO;
             break;
+        case INSN_DF_ORD_NAME:
+            e.kind = QEMU_PLUGIN_DF_ENT_NAME;
+            e.index = src[i].index;
+            break;
         default:
             /*
              * A kind this build does not know cannot be described, and
@@ -616,6 +620,34 @@ unsigned qemu_plugin_insn_discards(const struct qemu_plugin_tb *tb, size_t idx,
         memcpy(&out[i], &r, want);
     }
     return d->n_discards;
+}
+
+unsigned qemu_plugin_insn_named_reads(const struct qemu_plugin_tb *tb,
+                                      size_t idx,
+                                      qemu_plugin_dataflow_named_read *out,
+                                      unsigned nnames)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d)) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nnames < d->n_named_reads || out == NULL) {
+        return d->n_named_reads;
+    }
+    for (unsigned i = 0; i < d->n_named_reads; i++) {
+        uint32_t want = out[i].struct_size;
+        qemu_plugin_dataflow_named_read r = {
+            .struct_size = sizeof(r),
+            .reg = d->named_reads[i].reg,
+        };
+
+        if (want == 0 || want > sizeof(r)) {
+            want = sizeof(r);
+        }
+        memcpy(&out[i], &r, want);
+    }
+    return d->n_named_reads;
 }
 
 unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,

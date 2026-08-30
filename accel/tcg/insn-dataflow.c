@@ -271,6 +271,13 @@ typedef struct DfEncReadNote {
      */
     uint32_t env_off;
     uint32_t env_size;
+    /*
+     * The NAME form, for a register that has no global, no temp AND no env
+     * range -- AArch64's ARM_CP_CONST system registers live in ARMCPU, not
+     * CPUArchState.  Non-NULL for that form alone, and it is checked BEFORE
+     * @env_size so the three forms stay mutually exclusive by construction.
+     */
+    const char *name;
 } DfEncReadNote;
 
 /*
@@ -1441,6 +1448,35 @@ static void df_ord_read(InsnDataflow *d, uint8_t kind, unsigned index)
 static void df_ord_write(InsnDataflow *d, uint8_t kind, unsigned index)
 {
     df_ord_add(d->wr_ord, &d->n_wr_ord, &d->wr_ord_overflow, kind, index);
+}
+
+/*
+ * A source stated by NAME alone -- see INSN_DF_MAX_NAMED_READS.
+ *
+ * Idempotent by name, on the same rule df_ord_add() runs under: an
+ * instruction that states the same register twice states one fact.  A full
+ * array is FLAGGED and the member dropped, and the flag lands on the READ
+ * list's overflow because that is the list a consumer would otherwise read
+ * short.
+ */
+static void df_add_named_read(InsnDataflow *d, const char *reg)
+{
+    unsigned i;
+
+    for (i = 0; i < d->n_named_reads; i++) {
+        if (strcmp(d->named_reads[i].reg, reg) == 0) {
+            df_ord_read(d, INSN_DF_ORD_NAME, i);
+            return;
+        }
+    }
+    if (d->n_named_reads >= INSN_DF_MAX_NAMED_READS) {
+        d->named_reads_overflow = 1;
+        d->rd_ord_overflow = 1;
+        return;
+    }
+    d->named_reads[d->n_named_reads].reg = reg;
+    df_ord_read(d, INSN_DF_ORD_NAME, d->n_named_reads);
+    d->n_named_reads++;
 }
 
 /*
@@ -3446,7 +3482,16 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     for (unsigned i = encread_lo; i < *encread_cursor; i++) {
         unsigned idx;
 
-        if (df_encread[i].env_size) {
+        if (df_encread[i].name) {
+            /*
+             * A register with no global and no env range: its NAME is its
+             * identity, so it goes into named_reads[] and reaches the ordered
+             * read list from there.  No bit in @d->rd -- there is no global
+             * to set one for -- and no provenance, because the instruction
+             * depends on the value rather than computing it.
+             */
+            df_add_named_read(d, df_encread[i].name);
+        } else if (df_encread[i].env_size) {
             /*
              * A range rather than a register id, so it goes onto the env
              * side -- the same route an ordinary env load takes, which is
@@ -4132,6 +4177,7 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].zero = zero ? 1 : 0;
     df_encread[df_n_encread].env_off = 0;
     df_encread[df_n_encread].env_size = 0;
+    df_encread[df_n_encread].name = NULL;
     df_n_encread++;
 }
 
@@ -4192,6 +4238,56 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].zero = 0;
     df_encread[df_n_encread].env_off = off;
     df_encread[df_n_encread].env_size = size;
+    df_encread[df_n_encread].name = NULL;
+    df_n_encread++;
+}
+
+/*
+ * The FOURTH folded-read form: a register stated by NAME.  See
+ * insn_dataflow_note_stated_read_name() in the header for what it says and
+ * why a name rather than a range.
+ *
+ * It shares df_encread[]'s storage for the reason the range form does: the
+ * per-instruction cursor window that keeps one decoder's statements apart
+ * from the next one's already exists here, and a fourth list would be a
+ * fourth chance to get that window wrong.  The key is (name, anchor) -- one
+ * instruction naming the same register twice is one fact.
+ */
+void insn_dataflow_note_stated_read_name(const char *reg)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (reg == NULL || reg[0] == '\0') {
+        /*
+         * An unnamed member is indistinguishable from "no note" downstream,
+         * and a row with an empty name would put a nameless register into a
+         * consumer's name-to-register map.  Refused at the door.
+         */
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].name != NULL &&
+            df_encread[i].anchor == anchor &&
+            strcmp(df_encread[i].name, reg) == 0) {
+            return;
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = 0;
+    df_encread[df_n_encread].env_size = 0;
+    df_encread[df_n_encread].name = reg;
     df_n_encread++;
 }
 

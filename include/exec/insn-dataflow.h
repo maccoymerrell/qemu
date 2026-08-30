@@ -109,6 +109,7 @@
 #define INSN_DF_ORD_FIELD    1  /* a CPUArchState byte range; @index into fields[] */
 #define INSN_DF_ORD_DISCARD  2  /* encoding names it, no op carries it; into discards[] */
 #define INSN_DF_ORD_ZERO     3  /* the architectural zero register; @index unused */
+#define INSN_DF_ORD_NAME     4  /* stated by NAME alone; into named_reads[] */
 
 typedef struct InsnDataflowOrdered {
     uint8_t  kind;
@@ -118,6 +119,7 @@ typedef struct InsnDataflowOrdered {
      *         field's extent and provenance live there and duplicating
      *         either here would give a consumer two places to read one fact.
      * DISCARD: the index into discards[].
+     * NAME:   the index into named_reads[].
      * ZERO:   unused, and zero.
      */
     uint8_t  index;
@@ -130,6 +132,37 @@ typedef struct InsnDataflowOrdered {
  * the overflow flag unreachable.
  */
 #define INSN_DF_MAX_DISCARDS 4
+
+/*
+ * SOURCES THE ENCODING NAMES THAT HAVE NEITHER A GLOBAL NOR AN ENV RANGE.
+ *
+ * The read side's counterpart to discards[], and it exists for the same
+ * reason: a register with no TCG global and no CPUArchState byte range has
+ * nothing for either of the other two kinds to point at, so its own name is
+ * the only identity it has.
+ *
+ * The case that motivated it is AArch64's ARM_CP_CONST system registers.
+ * `mrs x0, midr_el1` reads the main ID register, whose value QEMU resolves at
+ * TRANSLATION time (translate-a64.c emits `movi tcg_rt, ri->resetvalue` and
+ * nothing else) out of ARMCPU -- the CPU OBJECT, not CPUArchState.  So there
+ * is no env offset for insn_dataflow_note_stated_read_env() to state and no
+ * op for the walk to find, and the read of a register the encoding names
+ * outright was missing from the list entirely.
+ *
+ * Four, on the same reasoning as INSN_DF_MAX_DISCARDS: one is the widest real
+ * case and the rest is room, with the overflow FLAGGED rather than truncated.
+ */
+#define INSN_DF_MAX_NAMED_READS 4
+
+typedef struct InsnDataflowNamedRead {
+    /*
+     * The architectural name, in the target's own namespace and a pointer
+     * that outlives the translation -- ARMCPRegInfo::name is the intended
+     * form, exactly as InsnDataflowDiscard::reg takes regnames[].  A consumer
+     * maps it the same way it maps a discarded destination's name.
+     */
+    const char *reg;
+} InsnDataflowNamedRead;
 
 /* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
 #define INSN_DF_MAX_GVEC_OPERANDS 5
@@ -382,6 +415,17 @@ typedef struct InsnDataflow {
     InsnDataflowDiscard discards[INSN_DF_MAX_DISCARDS];
     uint8_t  n_discards;
     uint8_t  discards_overflow;
+
+    /*
+     * The sources named the same way, for the same reason -- see
+     * INSN_DF_MAX_NAMED_READS.  Deliberately NOT folded into discards[]:
+     * those are destinations the emulator threw away and a consumer counts
+     * them to measure the emulator's dead-code elimination, so putting a
+     * READ in that array would make one number mean two things.
+     */
+    InsnDataflowNamedRead named_reads[INSN_DF_MAX_NAMED_READS];
+    uint8_t  n_named_reads;
+    uint8_t  named_reads_overflow;
 
     /*
      * THE SAME FACTS, IN THE ORDER THE TRANSLATION STATED THEM.
@@ -1105,6 +1149,46 @@ void insn_dataflow_note_folded_read_zero(void);
 void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size);
 
 /*
+ * The NAME form of the same statement: a register the instruction reads that
+ * the emulator resolved at TRANSLATION time and that has no env range to be
+ * stated as.
+ *
+ * WHY A NAME AND NOT A RANGE.  insn_dataflow_note_stated_read_env() takes an
+ * offsetof()/sizeof() pair because for the registers it serves the range IS
+ * the register, so one declaration names every access to those bytes.  That
+ * is unavailable here: AArch64's ARM_CP_CONST registers -- MIDR_EL1 and its
+ * siblings -- are read out of the ARMCPU object at translate time, not out of
+ * CPUArchState, so there is no env offset to give and a synthetic one would
+ * be a lie about where the register lives.  Its NAME is the only identity it
+ * has, which is exactly the position insn_dataflow_note_discarded_write() is
+ * in on the write side, and this takes the name the same way.
+ *
+ * IT IS A SOURCE.  The encoding names the register, the instruction's result
+ * is its value, and QEMU answering the question early is a lowering decision
+ * -- R15 says a lowering decision is not architectural truth, and R7.3 says
+ * a register the encoding names is not the emulator's to drop.
+ *
+ * @reg must outlive the translation; ARMCPRegInfo::name is the intended form.
+ * A NULL or empty name is refused -- an unnamed member cannot be told from
+ * "no note" downstream, on the same rule that refuses a zero-size range.
+ *
+ * The member reaches the ORDERED READ LIST as INSN_DF_ORD_NAME and carries NO
+ * provenance: the instruction depends on the value, it did not compute it.
+ * It sets no bit in @rd, because there is no global to set one for -- the
+ * same asymmetry the zero register and the env ranges already live with.
+ *
+ * NO ANCHOR, deliberately, and for the same reason
+ * insn_dataflow_note_stated_read_env() has none: the note names a register
+ * outright rather than describing a temp's contents, so there is no temp
+ * whose rewrite could invalidate it.  It is scoped to the instruction whose
+ * note window it falls in, which is what keeps one `mrs` from answering for
+ * the next.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_stated_read_name(const char *reg);
+
+/*
  * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
  * encoding names, as it becomes a TCG value.
  *
@@ -1604,6 +1688,9 @@ static inline void insn_dataflow_note_zero_write_holder(const void *ts)
 }
 static inline void insn_dataflow_note_indexed_write(const void *ts,
                                                     const char *reg)
+{ }
+
+static inline void insn_dataflow_note_stated_read_name(const char *reg)
 { }
 
 

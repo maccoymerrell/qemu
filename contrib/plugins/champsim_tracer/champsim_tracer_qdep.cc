@@ -605,8 +605,17 @@ void note_survivor(const char *mnem, unsigned st, const char *detail)
     g_free(k);
 }
 
+bool src_container_range(const char *nm, uint8_t *lo, uint8_t *hi);
+void container_rule_selftest(void);
+
 void qdep_init(void)
 {
+    /*
+     * The containment rule's falsifier, run before anything can be scored
+     * by it.  See container_rule_selftest() for the arms.
+     */
+    container_rule_selftest();
+
     bool expected = false;
     if (!g_tried.compare_exchange_strong(expected, true)) {
         return;
@@ -768,6 +777,96 @@ void tally_field_off(GHashTable **t, uint32_t off)
     g_snprintf(k, sizeof(k), "env offset %u (0x%x), no target declaration",
                off, off);
     tally(t, k);
+}
+
+/*
+ * THE COMPOSED-REGISTER CONTAINMENT TABLE (#277).
+ *
+ * #277 settled that a member field and its container are ONE composed
+ * register and that the container covers the member.  This table is the
+ * read side of that contract: QEMU states the container -- it is what the
+ * emulator's storage and its helpers actually take -- and the wire
+ * publishes the member the encoding selects.  Neither is wrong, and a
+ * census that scored them as disagreement was reporting a granularity
+ * difference as a missing dependency.
+ *
+ * Keyed on QEMU'S SPELLING, not on a generic word, because the container
+ * is exactly the thing the vocabulary has no member-level word for -- that
+ * is what makes it a container.  Each row is measured, not predicted:
+ *
+ *   fcr31    mipsel's FP control/status word.  `bc1t` tests one FCC bit;
+ *            QEMU's ordered read list names `fcr31`, which is where the
+ *            eight FCC bits live (MIPS64 Vol II, FCSR bits 23 and 25-31).
+ *            The wire names REG_PRED0..7, the bit the encoding selects.
+ *
+ *   fpregs   x86's x87 stack.  Every instruction that reads the stack
+ *            reaches it through a helper that takes the whole array, so
+ *            what QEMU states is off=fpregs size=128 -- the file.  The wire
+ *            names ST(0) as REG_FPR0.  The array cannot be declared per
+ *            element (it is indexed by PHYSICAL register while ST(i) is
+ *            relative to env->fpstt), which is why the container is the
+ *            only statement available and why it is the right one.
+ *
+ * ONE DIRECTION ONLY.  A container justifies a member; it is never
+ * published, never enters the flip's union, and never counts as a source
+ * QEMU states that the wire lacks.  The selftest below is what proves the
+ * rule cannot reach an unrelated register.
+ */
+bool src_container_range(const char *nm, uint8_t *lo, uint8_t *hi)
+{
+    if (!nm || !*nm) {
+        return false;
+    }
+    if (!strcmp(nm, "fcr31")) {
+        *lo = REG_PRED0;
+        *hi = (uint8_t)(REG_PRED0 + 7);
+        return true;
+    }
+    if (!strcmp(nm, "fpregs")) {
+        *lo = REG_FPR0;
+        *hi = (uint8_t)(REG_FPR0 + 7);
+        return true;
+    }
+    return false;
+}
+
+std::atomic<uint64_t> g_cont_selftest_arms{0};
+std::atomic<uint64_t> g_cont_selftest_failed{0};
+
+/*
+ * The rule's own falsifier, run once at install.
+ *
+ * Four arms, and the last two are the point: a rule that justified
+ * everything would make the census's zero vacuous, so the negative arms are
+ * what make the positive ones mean anything.
+ */
+void container_rule_selftest(void)
+{
+    struct { const char *nm; uint8_t reg; bool want; } arms[] = {
+        /* POSITIVE: the container covers its own member. */
+        { "fcr31",  REG_PRED0,                 true  },
+        { "fpregs", REG_FPR0,                  true  },
+        /* NEGATIVE: a container does NOT cover an unrelated register. */
+        { "fcr31",  REG_GPR0,                  false },
+        { "fpregs", REG_GPR0,                  false },
+        /* NEGATIVE: a container does not cover PAST its own bank. */
+        { "fcr31",  (uint8_t)(REG_PRED0 + 8),  false },
+        { "fpregs", (uint8_t)(REG_FPR0 + 8),   false },
+        /* NEGATIVE: an ordinary register is not a container at all. */
+        { "rax",    REG_GPR0,                  false },
+        { "fcsr",   REG_FCSR,                  false },
+    };
+
+    for (const auto &a : arms) {
+        uint8_t lo = 0, hi = 0;
+        bool got = src_container_range(a.nm, &lo, &hi) &&
+                   a.reg >= lo && a.reg <= hi;
+
+        g_cont_selftest_arms.fetch_add(1, std::memory_order_relaxed);
+        if (got != a.want) {
+            g_cont_selftest_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 uint8_t generic_for_field_name(const char *nm)
@@ -1461,6 +1560,18 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
              * globals do, so it adds no register the read did not involve.
              */
             gen = g_gen_of_reg[e[i].reg];
+            {
+                uint8_t clo = 0, chi = 0;
+                const char *cnm = qemu_plugin_dataflow_reg_name(e[i].reg, nullptr,
+                                                                nullptr);
+
+                if (src_container_range(cnm, &clo, &chi) &&
+                    out->n_src_cont < QDEP_MAX_SRC) {
+                    out->src_cont_lo[out->n_src_cont] = clo;
+                    out->src_cont_hi[out->n_src_cont] = chi;
+                    out->n_src_cont++;
+                }
+            }
             break;
         }
         case QEMU_PLUGIN_DF_ENT_FIELD: {
@@ -1500,6 +1611,16 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
                 }
                 skipped++;
                 continue;
+            }
+            {
+                uint8_t clo = 0, chi = 0;
+
+                if (src_container_range(fnm, &clo, &chi) &&
+                    out->n_src_cont < QDEP_MAX_SRC) {
+                    out->src_cont_lo[out->n_src_cont] = clo;
+                    out->src_cont_hi[out->n_src_cont] = chi;
+                    out->n_src_cont++;
+                }
             }
             gen = generic_for_field_name(fnm);
             if (gen >= REG_ID_COUNT) {
@@ -2435,6 +2556,18 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                     break;
                 }
             }
+            /*
+             * AND THE COMPOSED-REGISTER READING (#277): a published MEMBER
+             * is justified by QEMU stating the CONTAINER it lives in.  See
+             * src_container_range() for the table and for why this direction
+             * is the only one the rule runs in.
+             */
+            for (uint8_t k = 0; !justified && k < q->n_src_cont; k++) {
+                if (f->src_regs[i] >= q->src_cont_lo[k] &&
+                    f->src_regs[i] <= q->src_cont_hi[k]) {
+                    justified = true;
+                }
+            }
             if (justified) {
                 g_src_justified.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -2541,6 +2674,15 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             auto in_union = [&](uint8_t r) {
                 for (uint8_t k = 0; k < q->n_src; k++) {
                     if (q->src_reg[k] == r) {
+                        return true;
+                    }
+                }
+                /* The composed-register reading, #277 -- same rule as the
+                 * justification test above, because the flip publishes
+                 * QEMU's read list and a container in that list carries its
+                 * member's dependency by construction. */
+                for (uint8_t k = 0; k < q->n_src_cont; k++) {
+                    if (r >= q->src_cont_lo[k] && r <= q->src_cont_hi[k]) {
                         return true;
                     }
                 }
@@ -3868,6 +4010,22 @@ void qdep_report(GString *report)
         g_src_skip_field_generic.load(std::memory_order_relaxed),
         g_src_skip_other.load(std::memory_order_relaxed),
         g_src_skip_insns.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "\nTHE COMPOSED-REGISTER CONTAINMENT RULE (#277), and its own\n"
+        "falsifier.  A published MEMBER is JUSTIFIED above when QEMU's read\n"
+        "list names the CONTAINER it lives in -- mipsel's `fcr31` over the\n"
+        "FCC bits, x86's `fpregs` over the x87 stack.  The rule runs in ONE\n"
+        "direction: a container justifies a member, is never published, and\n"
+        "never enters the QEMU-EXTRA line above.  The arms below include\n"
+        "NEGATIVE cases -- a container against an unrelated register, a\n"
+        "container against the slot one past its own bank, and an ordinary\n"
+        "register asked to be a container -- because a rule that justified\n"
+        "everything would make the zero above vacuous:\n"
+        "  %10" G_GUINT64_FORMAT "  containment selftest arms run\n"
+        "  %10" G_GUINT64_FORMAT "  containment selftest arms FAILED --"
+        " MUST BE 0\n",
+        g_cont_selftest_arms.load(std::memory_order_relaxed),
+        g_cont_selftest_failed.load(std::memory_order_relaxed));
     g_string_append(report,
         "\nTHE SOURCE-LIST FLIP'S COST, measured against the survivor table\n"
         "(champsim_tracer_src_survivors.h, generated by\n"

@@ -534,6 +534,31 @@ struct QDepInsn {
     uint8_t src_reg[QDEP_MAX_SRC];
 
     /*
+     * THE CONTAINERS THIS INSTRUCTION'S READ LIST NAMED (#277).
+     *
+     * A composed register is one register: the member and the container it
+     * lives in are the same storage at two granularities, and #277 settled
+     * that the container COVERS the member.  QEMU states the container --
+     * mipsel's `bc1t` reads the whole `fcr31` because that is where the FCC
+     * bit is, x86's `fxam` reads the whole `fpregs` array because that is
+     * what its helper takes -- while the wire publishes the MEMBER the
+     * encoding selects, and neither is wrong.
+     *
+     * Kept apart from src_reg[] on purpose.  These entries JUSTIFY a
+     * published member and nothing else: they are never published, never
+     * offered to the flip's union, and never counted as a source QEMU
+     * states that the wire lacks.  Folding them into src_reg[] would let a
+     * container stand IN for a member, which is the fabrication direction.
+     *
+     * Each row is an INCLUSIVE generic-id range, because a container covers
+     * a contiguous member bank in every case measured (REG_PRED0..7 for
+     * mipsel's condition codes, REG_FPR0..7 for the x87 stack).
+     */
+    uint8_t n_src_cont;
+    uint8_t src_cont_lo[QDEP_MAX_SRC];
+    uint8_t src_cont_hi[QDEP_MAX_SRC];
+
+    /*
      * QEMU'S OWN DECODE IDENTITY for this instruction, carried so the source
      * census can key its survivor rows on it.
      *

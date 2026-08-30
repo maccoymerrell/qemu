@@ -19521,6 +19521,32 @@ void mips_tcg_init(void)
                                   sizeof(((CPUMIPSState *)0)->CP0_Cause),
                                   sizeof(((CPUMIPSState *)0)->CP0_Cause),
                                   1);
+    /*
+     * CP0_UserLocal -- the THREAD POINTER, and the register `rdhwr rt,$29`
+     * reads.
+     *
+     * The read IS stated: gen_rdhwr's UL arm emits a load from this env
+     * offset, so the extractor sees a byte range and asks what register it
+     * is.  Nothing answered, because no TCG global names it and it has no
+     * row in the GDB stub's namespace either (#240) -- so a fact QEMU DID
+     * state arrived at a consumer as an anonymous range and every published
+     * REG_TLS source it would have justified was counted unjustified.
+     *
+     * Declared here for the same reason the three CP0 rows above are, and
+     * in the same terms: offsetof() and sizeof(), the compiler reading
+     * CPUMIPSState.  The spelling is "userlocal" because the GDB stub has
+     * none to borrow; champsim_tracer's fold_nonarch() is where that
+     * spelling meets REG_TLS, which is the same route "lr" and "x8/s0"
+     * already take.
+     */
+    insn_dataflow_declare_regfile("userlocal", NULL,
+                                  offsetof(CPUMIPSState,
+                                           active_tc.CP0_UserLocal),
+                                  sizeof(((CPUMIPSState *)0)
+                                         ->active_tc.CP0_UserLocal),
+                                  sizeof(((CPUMIPSState *)0)
+                                         ->active_tc.CP0_UserLocal),
+                                  1);
 }
 
 void mips_restore_state_to_opc(CPUState *cs,

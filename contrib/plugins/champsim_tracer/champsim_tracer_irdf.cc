@@ -398,6 +398,28 @@ uint8_t fold_nonarch(const char *name)
     if (!strcmp(name, "lr")) {
         return REG_LR;
     }
+    /*
+     * The THREAD POINTER, on the two targets that hold it in a place no
+     * name reaches.
+     *
+     * Both are DECLARED REGFILE names rather than TCG globals -- aarch64's
+     * TPIDR_EL0 lives in cp15 and mipsel's is active_tc.CP0_UserLocal --
+     * and neither appears in its target's GDB-stub namespace (#240), so the
+     * generated QEMU-indexed table cannot carry a row for either: a
+     * QEMU_ONLY_REG_IDS rule naming a register the namespace does not
+     * contain is dead by construction and the generator rejects it.  This
+     * map is the place a QEMU spelling with no table row meets its word,
+     * which is exactly what it already does for "lr" and "x8/s0" above.
+     *
+     * REG_TLS is the vocabulary's own word for this register and names both
+     * of them by name (champsim_tracer_generic_ids.h: "the thread pointer
+     * -- AArch64 TPIDR_EL0 / MIPS CP0_UserLocal"), so nothing is invented
+     * here; the spelling is being connected to a word that already exists.
+     */
+    if (!strcmp(name, "tpidr_el0") ||    /* aarch64, cp15.tpidr_el0   */
+        !strcmp(name, "userlocal")) {    /* mipsel, CP0_UserLocal     */
+        return REG_TLS;
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

@@ -1525,4 +1525,25 @@ void riscv_translate_init(void)
                              "load_res");
     load_val = tcg_global_mem_new(tcg_env, offsetof(CPURISCVState, load_val),
                              "load_val");
+
+    /*
+     * The DYNAMIC ROUNDING MODE, which every FP arithmetic instruction
+     * reads.
+     *
+     * gen_set_rm() resolves rm==DYN by loading env->frm, and the helper the
+     * instruction then calls reads the resulting float_status; the LOAD is
+     * stated, but no TCG global names this offset, so the extractor saw an
+     * anonymous byte range and every published REG_FCSR source it would
+     * have justified was counted unjustified.  "frm" is the RISC-V GDB
+     * stub's own spelling of the CSR (org.gnu.gdb.riscv.csr), so the name
+     * resolves to REG_FCSR through the register table with no fold needed.
+     *
+     * Declared in offsetof()/sizeof() beside the globals, which is the
+     * compiler reading CPURISCVState rather than anyone typing a number.
+     */
+    insn_dataflow_declare_regfile("frm", NULL,
+                                  offsetof(CPURISCVState, frm),
+                                  sizeof(((CPURISCVState *)0)->frm),
+                                  sizeof(((CPURISCVState *)0)->frm),
+                                  1);
 }

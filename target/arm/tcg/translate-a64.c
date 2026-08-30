@@ -106,6 +106,31 @@ void a64_translate_init(void)
                                   offsetof(CPUARMState, vfp.zregs),
                                   sizeof(ARMVectorReg), sizeof(ARMVectorReg),
                                   ARRAY_SIZE(((CPUARMState *)0)->vfp.zregs));
+
+    /*
+     * TPIDR_EL0, the THREAD POINTER, and the register `mrs xN, tpidr_el0`
+     * reads.
+     *
+     * The read IS stated -- the system-register path loads from this env
+     * offset -- but no TCG global names it and the GDB stub's core and FPU
+     * features do not carry it either, so the extractor saw an anonymous
+     * byte range and every published REG_TLS source it would have justified
+     * was counted unjustified.  Declared in offsetof()/sizeof() beside the
+     * vector file above, for the same reason and in the same terms; the
+     * spelling is the architecture's, and champsim_tracer's fold_nonarch()
+     * is where it meets REG_TLS.
+     *
+     * ONLY element 0 of cp15.tpidr_el[] is declared.  The other three are
+     * the higher exception levels' thread pointers, the vocabulary has no
+     * word for them, and a name that resolves to nothing moves a refusal
+     * one gate later without answering anything -- the same reason
+     * target/mips leaves CP0_EPC undeclared beside its three CP0 rows.
+     */
+    insn_dataflow_declare_regfile("tpidr_el0", NULL,
+                                  offsetof(CPUARMState, cp15.tpidr_el[0]),
+                                  sizeof(((CPUARMState *)0)->cp15.tpidr_el[0]),
+                                  sizeof(((CPUARMState *)0)->cp15.tpidr_el[0]),
+                                  1);
 }
 
 /*

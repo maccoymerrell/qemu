@@ -457,8 +457,14 @@ def _sidecar(path, rows, splits, witness=(), owed=()):
 def selftest():
     d = tempfile.mkdtemp(prefix="gen_src_survivors_selftest.")
     fails = []
+    ran = []
 
     def chk(name, cond, why=""):
+        # COUNT THE CHECK THAT ACTUALLY RAN.  The summary below used to
+        # print a hard-coded literal, so adding or removing an arm left the
+        # reported total untouched -- a summary asserting a number it never
+        # took is the failure shape this whole instrument exists to catch.
+        ran.append(name)
         print("  %-46s %s%s" % (name, "ok" if cond else "FAIL",
                                 "" if cond else "  -- " + why))
         if not cond:
@@ -544,7 +550,7 @@ def selftest():
 
     shutil.rmtree(d, ignore_errors=True)
     print("\ngen_src_survivors.py selftest: %d check(s), %d failure(s)"
-          % (10, len(fails)))
+          % (len(ran), len(fails)))
     return 1 if fails else 0
 
 

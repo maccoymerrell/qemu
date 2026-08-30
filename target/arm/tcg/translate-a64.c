@@ -151,6 +151,44 @@ void a64_translate_init(void)
                                   sizeof(((CPUARMState *)0)->cp15.cpacr_el1),
                                   sizeof(((CPUARMState *)0)->cp15.cpacr_el1),
                                   1);
+
+    /*
+     * The SOFTFLOAT STATUS FILE -- the rounding mode, the trapped-exception
+     * flags and the NaN behaviour every FP arithmetic instruction reads.
+     *
+     * The read is ORDINARY and always was: the helper is handed a pointer
+     * into vfp.fp_status[] and reads it.  What was missing is the name --
+     * the file is an array of `float_status` structs and no declaration said
+     * which register those bytes are, so the read arrived as an anonymous
+     * range and every published REG_FCSR source it would have justified was
+     * counted unjustified (#332).
+     *
+     * DECLARED AS THE WHOLE ARRAY, one row per element and the stride the
+     * compiler's.  The elements are QEMU's own split of the file by
+     * operating regime (the FPCR-controlled one, the fixed-behaviour ones,
+     * the FP16 ones); they are one architectural control-and-status file
+     * seen through several lenses, and the generator's own rule -- a
+     * control-and-status file that cannot be split is REG_FCSR -- is what
+     * champsim_tracer's fold_nonarch() applies to the shared spelling.
+     */
+    insn_dataflow_declare_regfile("fp_status", NULL,
+                                  offsetof(CPUARMState, vfp.fp_status),
+                                  sizeof(((CPUARMState *)0)->vfp.fp_status[0]),
+                                  sizeof(((CPUARMState *)0)->vfp.fp_status[0]),
+                                  ARRAY_SIZE(((CPUARMState *)0)->vfp.fp_status));
+
+    /*
+     * GCR_EL1, the tag-generation control `irg` reads.
+     *
+     * Same shape as the thread pointer: a real env load with no TCG global
+     * and no GDB-stub row, so the range had no name.  REG_SYS is the word
+     * the wire already carries for it.
+     */
+    insn_dataflow_declare_regfile("gcr_el1", NULL,
+                                  offsetof(CPUARMState, cp15.gcr_el1),
+                                  sizeof(((CPUARMState *)0)->cp15.gcr_el1),
+                                  sizeof(((CPUARMState *)0)->cp15.gcr_el1),
+                                  1);
 }
 
 /*

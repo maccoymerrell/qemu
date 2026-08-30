@@ -1546,4 +1546,22 @@ void riscv_translate_init(void)
                                   sizeof(((CPURISCVState *)0)->frm),
                                   sizeof(((CPURISCVState *)0)->frm),
                                   1);
+
+    /*
+     * The SOFTFLOAT STATUS FILE, and the half of the FCSR reads that never
+     * touch `frm`.
+     *
+     * A static-rounding-mode `fadd.d` and a comparison like `feq.d` do not
+     * call gen_set_rm(), so the frm declaration above cannot reach them --
+     * but they DO read env->fp_status, which holds the accrued exception
+     * flags and the NaN behaviour, and that read was arriving as an
+     * anonymous range.  Declared under the SAME spelling as AArch64's array
+     * of the same struct, because it is the same register: the
+     * control-and-status file the vocabulary calls REG_FCSR.
+     */
+    insn_dataflow_declare_regfile("fp_status", NULL,
+                                  offsetof(CPURISCVState, fp_status),
+                                  sizeof(((CPURISCVState *)0)->fp_status),
+                                  sizeof(((CPURISCVState *)0)->fp_status),
+                                  1);
 }

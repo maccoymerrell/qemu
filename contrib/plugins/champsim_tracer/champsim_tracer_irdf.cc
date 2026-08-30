@@ -436,6 +436,37 @@ uint8_t fold_nonarch(const char *name)
     if (!strcmp(name, "cpacr_el1")) {
         return REG_SYSFPEN;
     }
+    /*
+     * The SOFTFLOAT STATUS FILE, one spelling on both targets that have one.
+     *
+     * `float_status` is QEMU's own container for the rounding mode, the
+     * accrued exception flags and the NaN rules -- the contents of the
+     * architectural FP control-and-status register, held where the softfloat
+     * code can reach them.  AArch64 splits it into an array by operating
+     * regime and RISC-V keeps one; both are the same architectural file, and
+     * the generator's standing rule for a control-and-status file that
+     * cannot be split into control and status halves is REG_FCSR.
+     */
+    if (!strncmp(name, "fp_status", 9)) {
+        /*
+         * A PREFIX, because a declared file of more than one element is
+         * spelled base-plus-index: AArch64's eight elements arrive as
+         * "fp_status0".."fp_status7" and RISC-V's single one as "fp_status".
+         * Every one of them is the same architectural register, so the
+         * element number is not a discriminator here and matching the base
+         * is matching the register.  Nothing else in either target's
+         * namespace begins with these nine characters.
+         */
+        return REG_FCSR;
+    }
+    /*
+     * GCR_EL1, the tag-generation control.  REG_SYS is the word the wire
+     * already publishes for it; the declaration is what lets QEMU's own read
+     * of the range say the same thing.
+     */
+    if (!strcmp(name, "gcr_el1")) {
+        return REG_SYS;
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

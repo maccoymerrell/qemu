@@ -1187,6 +1187,70 @@ static void qsh_record_sig(uint32_t decode_id, uint32_t insn_id,
     g_mutex_unlock(&g_qsh_sig_lock);
 }
 
+/*
+ * THE ENUM-PUBLISHED ROWS, BY NAME.
+ *
+ * The count above is the R14 deletion bar; a bar with no names cannot be
+ * closed, because "who is still in it" is exactly the question a closure
+ * has to answer.  This table carries the same population one row per
+ * (decode identity, Capstone id) so each survivor can be read off the
+ * sidecar and attributed to the mechanism that would retire it, instead
+ * of being reported as a bucket.  A silent bucket is the failure mode
+ * this tree has been bitten by; a bounded, named, overflow-reporting
+ * table is the shape that is not one.
+ *
+ * The identity is printed EVEN WHEN IT IS 0, because 0 is itself a
+ * distinct membership reason -- QEMU exported no identity for the
+ * instruction at all -- and folding it in with "the id had no row" hides
+ * which of the two a reader is looking at.
+ */
+#define CST_QEP_MAX_SIGS 128
+struct QepSig {
+    uint32_t decode_id;
+    uint32_t insn_id;
+    uint8_t  opcode;               /* what the enum row PUBLISHES */
+    uint64_t count;
+    char     mnem[24];
+};
+static QepSig   g_qep_sig[CST_QEP_MAX_SIGS];
+static unsigned g_qep_nsig;
+static uint64_t g_qep_sig_overflow;
+static GMutex   g_qep_sig_lock;
+
+static void qep_record_sig(uint32_t decode_id, uint32_t insn_id,
+                           uint8_t opcode, const char *mnem)
+{
+    g_mutex_lock(&g_qep_sig_lock);
+    for (unsigned i = 0; i < g_qep_nsig; i++) {
+        if (g_qep_sig[i].decode_id == decode_id &&
+            g_qep_sig[i].insn_id == insn_id) {
+            g_qep_sig[i].count++;
+            g_mutex_unlock(&g_qep_sig_lock);
+            return;
+        }
+    }
+    if (g_qep_nsig >= CST_QEP_MAX_SIGS) {
+        g_qep_sig_overflow++;
+        g_mutex_unlock(&g_qep_sig_lock);
+        return;
+    }
+    QepSig *e = &g_qep_sig[g_qep_nsig++];
+    e->decode_id = decode_id;
+    e->insn_id = insn_id;
+    e->opcode = opcode;
+    e->count = 1;
+    e->mnem[0] = '\0';
+    if (mnem && mnem[0]) {
+        size_t n = strlen(mnem);
+        if (n >= sizeof(e->mnem)) {
+            n = sizeof(e->mnem) - 1;
+        }
+        memcpy(e->mnem, mnem, n);
+        e->mnem[n] = '\0';
+    }
+    g_mutex_unlock(&g_qep_sig_lock);
+}
+
 static void qid_shadow_score(const qemu_plugin_insn_info *info,
                              const InsnClassification *dkey,
                              const InsnClassification *enum_row)
@@ -1207,6 +1271,8 @@ static void qid_shadow_score(const qemu_plugin_insn_info *info,
              * the table today and this classification does not move to
              * the other key -- it becomes GEN_OP_UNKNOWN. */
             g_qsh_enum_published.fetch_add(1, std::memory_order_relaxed);
+            qep_record_sig(info->decode_id, info->insn_id,
+                           enum_row->opcode, info->mnemonic);
         }
         return;
     }
@@ -1295,6 +1361,42 @@ void qemu_ident_shadow_report(GString *report)
         "below)\n"
         "%12" PRIu64 "  no enum row for this insn_id at all\n",
         insns, both, agree, disagree, enum_pub, no_dkey, no_enum);
+
+    /*
+     * THE BAR'S OWN MEMBERSHIP, named rather than bucketed.  Printed
+     * unconditionally: a deletion bar reported only as a number is one a
+     * reader cannot close, and the population is small by construction --
+     * it is what is LEFT after the identity key answered.
+     */
+    g_mutex_lock(&g_qep_sig_lock);
+    if (enum_pub == 0) {
+        g_string_append_printf(report,
+            "  ENUM-PUBLISHED rows, by name: none -- the bar is 0 on this "
+            "run, so there is no population to name.\n");
+    } else {
+        g_string_append_printf(report,
+            "  ENUM-PUBLISHED rows, by name (%u distinct).  `decode_id=0` "
+            "is its own membership reason -- QEMU exported NO identity for "
+            "the instruction -- and is not the same population as an id "
+            "whose row is missing or silent:\n", g_qep_nsig);
+        for (unsigned i = 0; i < g_qep_nsig; i++) {
+            const QepSig *e = &g_qep_sig[i];
+            g_string_append_printf(report,
+                "    decode_id=0x%08x insn_id=%u %-16s n=%" PRIu64
+                " publishes=%s%s\n",
+                e->decode_id, e->insn_id, e->mnem[0] ? e->mnem : "-",
+                e->count, generic_opcode_name_or_unknown(e->opcode),
+                e->decode_id == 0 ? "   <- NO IDENTITY EXPORTED" : "");
+        }
+    }
+    if (g_qep_sig_overflow) {
+        g_string_append_printf(report,
+            "    signature table overflowed: %" PRIu64 " further "
+            "ENUM-PUBLISHED classifications were counted but NOT named.  "
+            "The count above is complete; this list is not.\n",
+            g_qep_sig_overflow);
+    }
+    g_mutex_unlock(&g_qep_sig_lock);
 
     g_string_append_printf(report, "  per-column disagreements:\n");
     for (unsigned c = 0; c < CST_QSH_COLS; c++) {

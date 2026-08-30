@@ -487,6 +487,19 @@ GHashTable *g_brsig;
 GHashTable *g_opsig_tbl;       /* same, scored against the table row */
 GHashTable *g_brsig_tbl;
 GHashTable *g_stalesig;
+/*
+ * THE id == 0 POPULATION, BY NAME.
+ *
+ * `no identity exported` was reported as a bare count, and a bare count is
+ * a bucket: it says how many instructions QEMU recorded no decode rule
+ * for and nothing at all about WHICH, so no reader can tell a translator
+ * path that never calls plugin_gen_record_insn_identity() from a mode the
+ * instrumentation does not reach.  Always tallied, never gated on
+ * CST_QEMU_IDENT_AUDIT, because the population is 0.0% of translated
+ * instructions on every target measured and a census nobody enables is a
+ * census nobody reads.
+ */
+GHashTable *g_nosig;
 
 void tally(GHashTable **t, const char *key)
 {
@@ -845,6 +858,20 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
      */
     if (id == 0) {
         g_n_no_identity++;
+        /*
+         * Named here and not merely counted.  The Capstone half is what
+         * the boundary decoded for the same instruction, so the signature
+         * says what the instruction IS even though QEMU stated no rule
+         * for it -- which is the whole content of the question "why does
+         * this export nothing".
+         */
+        {
+            char sig[96];
+            g_snprintf(sig, sizeof(sig), "%-16s insn_id=%u",
+                       info && info->mnemonic[0] ? info->mnemonic : "-",
+                       info ? info->insn_id : 0u);
+            tally(&g_nosig, sig);
+        }
         g_mutex_unlock(&g_lock);
         return;
     }
@@ -1320,6 +1347,38 @@ void qemu_ident_report(GString *report)
         g_n_insns, g_n_no_identity,
         100.0 * (double)g_n_no_identity / (double)g_n_insns,
         g_n_row_missing, g_n_name_mismatch, g_n_scored);
+
+    if (g_n_no_identity) {
+        /*
+         * NAME FIRST, COUNT LAST, and that is not cosmetic.  The
+         * must-be-0 scanner reads a VALUE-FIRST line as the head of a
+         * census row whose sentence may run over the following indented
+         * lines, so a bare `<count>  <name>` list emitted here swallows
+         * the paragraph below it -- which ends in the words "must be 0"
+         * -- and manufactures a violated invariant out of a name list.
+         * Measured: the aarch64 validator leg failed with `udf
+         * insn_id=1284 ... = 30` before this line was turned around.
+         */
+        g_string_append_printf(report,
+            "  no identity exported (id == 0), by Capstone name "
+            "(%u distinct):\n",
+            g_nosig ? g_hash_table_size(g_nosig) : 0);
+        if (g_nosig) {
+            GList *keys = g_hash_table_get_keys(g_nosig);
+            keys = g_list_sort(keys, (GCompareFunc)g_strcmp0);
+            unsigned n = 0;
+            for (GList *l = keys; l && n < 24; l = l->next, n++) {
+                g_string_append_printf(report, "    %s  n=%u\n",
+                    (const char *)l->data,
+                    GPOINTER_TO_UINT(g_hash_table_lookup(g_nosig, l->data)));
+            }
+            if (g_hash_table_size(g_nosig) > 24) {
+                g_string_append_printf(report, "    ... %u more\n",
+                                       g_hash_table_size(g_nosig) - 24);
+            }
+            g_list_free(keys);
+        }
+    }
 
     g_string_append_printf(report,
         "  table rows reached                     %10u of %u\n"

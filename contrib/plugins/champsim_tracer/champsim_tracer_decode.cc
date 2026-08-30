@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -1064,6 +1065,256 @@ uint64_t qemu_ident_row_hits(unsigned row_index)
     return g_qid_row_hits[row_index].load(std::memory_order_relaxed);
 }
 
+/*
+ * THE SHADOW LOOKUP -- the A/B that has to pass before the enum-keyed
+ * mnemonic tables can be deleted.
+ *
+ * R14 asks for the four champsim_tracer_mnemonics_<isa>.h tables to go,
+ * and the key that replaces theirs is the decode identity.  Nothing may
+ * be deleted on the strength of "the decode-identity table exists": the
+ * two keys have to be shown to ANSWER THE SAME THING, per instruction,
+ * on real corpora, on every column a consumer reads.  This computes both
+ * answers for every instruction and scores them against each other.
+ *
+ *   dkey   the decode-identity row's payload, admitted on EXACTLY the
+ *          terms the live path admits it (qemu_ident_classify: a row
+ *          exists, its tier is OBSERVED or ADJUDICATED, and its opcode
+ *          is not GEN_OP_UNKNOWN).  Scoring a more generous admission
+ *          would measure a key the flip would not actually use.
+ *   enum   active_insn_table[info->insn_id] -- the Capstone-enum-keyed
+ *          row, the thing R14 deletes.
+ *
+ * DISAGREEMENTS is the must-be-0 row, and it is per COLUMN, not per
+ * instruction pair: `.refine`, `.dep_refine` and the lane pair are as
+ * much of the classification as the opcode, and a comparison that read
+ * only the opcode word would call two different classifications equal.
+ *
+ * AN INSTRUCTION THE dkey ROUTE CANNOT ANSWER IS NOT AN AGREEMENT.  It
+ * is counted apart, under the reason it could not, because those rows
+ * are exactly the ones that CANNOT flip and naming them is the result.
+ * Folding them into the agree column would publish the enum table's own
+ * answer as confirmation of a key that never spoke -- the shape past
+ * corpora-narrowing took.
+ *
+ * READ-ONLY BY CONSTRUCTION.  It is called after classify_insn_id has
+ * already decided what to return, is handed both answers, and returns
+ * void.  No wire field is reachable from here, so the instrument cannot
+ * be the thing that moves a trace.
+ */
+#define CST_QSH_COLS 7
+static const char *const g_qsh_col_name[CST_QSH_COLS] = {
+    "opcode", "branch_type", "flags", "refine",
+    "dep_refine", "lane_mask_kind", "lane_parallel",
+};
+static std::atomic<uint64_t> g_qsh_insns{0};       /* classify calls */
+static std::atomic<uint64_t> g_qsh_both{0};        /* both keys answered */
+static std::atomic<uint64_t> g_qsh_agree{0};       /* ... and agreed on all */
+static std::atomic<uint64_t> g_qsh_disagree{0};    /* ... and did not */
+static std::atomic<uint64_t> g_qsh_col[CST_QSH_COLS];
+static std::atomic<uint64_t> g_qsh_no_dkey{0};     /* dkey route silent */
+static std::atomic<uint64_t> g_qsh_no_enum{0};     /* no enum row at all */
+static std::atomic<uint64_t> g_qsh_enum_published{0}; /* enum row IS the answer */
+
+/*
+ * The disagreeing signatures themselves, bounded and de-duplicated.  A
+ * count with no names cannot be adjudicated, and an unbounded table on a
+ * translation-time path is a memory defect; the overflow is reported
+ * rather than dropped silently.
+ */
+#define CST_QSH_MAX_SIGS 256
+struct QshSig {
+    uint32_t decode_id;
+    uint32_t insn_id;
+    uint32_t cols;                 /* bitmask over g_qsh_col_name */
+    uint64_t count;
+    char     mnem[24];
+};
+static QshSig  g_qsh_sig[CST_QSH_MAX_SIGS];
+static unsigned g_qsh_nsig;
+static uint64_t g_qsh_sig_overflow;
+static GMutex   g_qsh_sig_lock;
+
+static void qsh_record_sig(uint32_t decode_id, uint32_t insn_id,
+                           uint32_t cols, const char *mnem)
+{
+    g_mutex_lock(&g_qsh_sig_lock);
+    for (unsigned i = 0; i < g_qsh_nsig; i++) {
+        if (g_qsh_sig[i].decode_id == decode_id &&
+            g_qsh_sig[i].insn_id == insn_id &&
+            g_qsh_sig[i].cols == cols) {
+            g_qsh_sig[i].count++;
+            g_mutex_unlock(&g_qsh_sig_lock);
+            return;
+        }
+    }
+    if (g_qsh_nsig >= CST_QSH_MAX_SIGS) {
+        g_qsh_sig_overflow++;
+        g_mutex_unlock(&g_qsh_sig_lock);
+        return;
+    }
+    QshSig *e = &g_qsh_sig[g_qsh_nsig++];
+    e->decode_id = decode_id;
+    e->insn_id = insn_id;
+    e->cols = cols;
+    e->count = 1;
+    e->mnem[0] = '\0';
+    if (mnem && mnem[0]) {
+        size_t n = strlen(mnem);
+        if (n >= sizeof(e->mnem)) {
+            n = sizeof(e->mnem) - 1;
+        }
+        memcpy(e->mnem, mnem, n);
+        e->mnem[n] = '\0';
+    }
+    g_mutex_unlock(&g_qsh_sig_lock);
+}
+
+static void qid_shadow_score(const qemu_plugin_insn_info *info,
+                             const InsnClassification *dkey,
+                             const InsnClassification *enum_row)
+{
+    g_qsh_insns.fetch_add(1, std::memory_order_relaxed);
+    if (!enum_row) {
+        g_qsh_no_enum.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!dkey) {
+        /* Why it was silent is already counted, per reason, by
+         * qemu_ident_classify's own survivor block; this row is the
+         * total so the three populations add up to g_qsh_insns. */
+        g_qsh_no_dkey.fetch_add(1, std::memory_order_relaxed);
+        if (enum_row) {
+            /* THE ROW THAT BLOCKS THE DELETION.  The identity key said
+             * nothing, so classify_insn_id fell through and the enum
+             * table's row is what this instruction PUBLISHES.  Delete
+             * the table today and this classification does not move to
+             * the other key -- it becomes GEN_OP_UNKNOWN. */
+            g_qsh_enum_published.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (!enum_row) {
+        return;
+    }
+    g_qsh_both.fetch_add(1, std::memory_order_relaxed);
+
+    uint32_t cols = 0;
+    if (dkey->opcode         != enum_row->opcode)         cols |= 1u << 0;
+    if (dkey->branch_type    != enum_row->branch_type)    cols |= 1u << 1;
+    if (dkey->flags          != enum_row->flags)          cols |= 1u << 2;
+    if (dkey->refine         != enum_row->refine)         cols |= 1u << 3;
+    if (dkey->dep_refine     != enum_row->dep_refine)     cols |= 1u << 4;
+    if (dkey->lane_mask_kind != enum_row->lane_mask_kind) cols |= 1u << 5;
+    if (dkey->lane_parallel  != enum_row->lane_parallel)  cols |= 1u << 6;
+
+    if (!cols) {
+        g_qsh_agree.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_qsh_disagree.fetch_add(1, std::memory_order_relaxed);
+    for (unsigned c = 0; c < CST_QSH_COLS; c++) {
+        if (cols & (1u << c)) {
+            g_qsh_col[c].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    qsh_record_sig(info->decode_id, info->insn_id, cols, info->mnemonic);
+}
+
+void qemu_ident_shadow_report(GString *report)
+{
+    uint64_t insns    = g_qsh_insns.load(std::memory_order_relaxed);
+    uint64_t both     = g_qsh_both.load(std::memory_order_relaxed);
+    uint64_t agree    = g_qsh_agree.load(std::memory_order_relaxed);
+    uint64_t disagree = g_qsh_disagree.load(std::memory_order_relaxed);
+    uint64_t no_dkey  = g_qsh_no_dkey.load(std::memory_order_relaxed);
+    uint64_t no_enum  = g_qsh_no_enum.load(std::memory_order_relaxed);
+
+    uint64_t enum_pub = g_qsh_enum_published.load(std::memory_order_relaxed);
+
+    g_string_append_printf(report,
+        "\n--- SHADOW LOOKUP: the decode-identity key against the "
+        "Capstone-enum key, per column ---\n"
+        "Both answers are computed for every instruction; the wire takes "
+        "whichever classify_insn_id() already chose and is not reachable "
+        "from here.  An instruction the identity key cannot answer is NOT "
+        "scored as agreement -- it is the population that cannot flip.\n"
+        "%12" PRIu64 "  instructions classified\n"
+        "%12" PRIu64 "  both keys answered -- the comparable population\n"
+        "%12" PRIu64 "  ... and AGREED on every column\n"
+        "%12" PRIu64 "  KEY-DISAGREE: instructions the two keys answer "
+        "differently.\n"
+        "               NOT a must-be-0 row, and deliberately does not carry "
+        "that phrase --\n"
+        "               it is honestly non-zero and reading it as a red gate "
+        "would be a false\n"
+        "               alarm, the same membership rule ADJ-OWED and "
+        "NOT-SCORED sit under.\n"
+        "               Read it exactly: it does NOT mean the wire moved.  "
+        "Where the identity\n"
+        "               key speaks it has already won, so its answer is the "
+        "published one and\n"
+        "               the enum row is dead weight.  What a non-zero says is "
+        "that the two keys\n"
+        "               are NOT interchangeable -- ONE OF THEM IS WRONG -- so "
+        "'deleting the enum\n"
+        "               table loses nothing' is a claim no run supports until "
+        "every signature\n"
+        "               below is adjudicated against the identity tiers and "
+        "the R13 references.\n"
+        "               Never assume the enum row is the right one; it is the "
+        "one under audit.\n"
+        "%12" PRIu64 "  ENUM-PUBLISHED: classifications the ENUM TABLE is "
+        "the answer for.\n"
+        "               Also NOT a must-be-0 row, for the same reason, and it "
+        "is THE R14\n"
+        "               DELETION BAR: it must reach 0 before the four\n"
+        "               champsim_tracer_mnemonics_<isa>.h tables may be "
+        "deleted.  The identity\n"
+        "               key said nothing for these, so the enum row IS the "
+        "answer on the wire\n"
+        "               and its deletion would not re-key them, it would "
+        "erase them to UNKNOWN.\n"
+        "%12" PRIu64 "  identity key SILENT (reasons in the survivor block "
+        "below)\n"
+        "%12" PRIu64 "  no enum row for this insn_id at all\n",
+        insns, both, agree, disagree, enum_pub, no_dkey, no_enum);
+
+    g_string_append_printf(report, "  per-column disagreements:\n");
+    for (unsigned c = 0; c < CST_QSH_COLS; c++) {
+        g_string_append_printf(report, "    %-16s %10" PRIu64 "\n",
+                               g_qsh_col_name[c],
+                               g_qsh_col[c].load(std::memory_order_relaxed));
+    }
+
+    g_mutex_lock(&g_qsh_sig_lock);
+    g_string_append_printf(report,
+        "  disagreeing signatures: %u distinct%s\n", g_qsh_nsig,
+        g_qsh_sig_overflow ? " (TABLE FULL -- see overflow below)" : "");
+    for (unsigned i = 0; i < g_qsh_nsig; i++) {
+        const QshSig *e = &g_qsh_sig[i];
+        char cols[128];
+        cols[0] = '\0';
+        for (unsigned c = 0; c < CST_QSH_COLS; c++) {
+            if (e->cols & (1u << c)) {
+                if (cols[0]) {
+                    g_strlcat(cols, ",", sizeof(cols));
+                }
+                g_strlcat(cols, g_qsh_col_name[c], sizeof(cols));
+            }
+        }
+        g_string_append_printf(report,
+            "    decode_id=0x%08x insn_id=%u %-16s n=%" PRIu64 " "
+            "cols=%s\n", e->decode_id, e->insn_id,
+            e->mnem[0] ? e->mnem : "-", e->count, cols);
+    }
+    if (g_qsh_sig_overflow) {
+        g_string_append_printf(report,
+            "    signature table overflowed: %" PRIu64 " further "
+            "disagreements were counted but NOT named.  The count above is "
+            "complete; this list is not.\n", g_qsh_sig_overflow);
+    }
+    g_mutex_unlock(&g_qsh_sig_lock);
+}
+
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
@@ -1074,6 +1325,8 @@ static const InsnClassification *classify_insn_id(
             ? &active_insn_table[id] : nullptr;
 
     const InsnClassification *q = qemu_ident_classify(info->decode_id, cap);
+    /* Read-only A/B; scored for every instruction, whichever key wins. */
+    qid_shadow_score(info, q, cap);
     if (q) {
         *opcode = q->opcode;
         *branch_type = q->branch_type;

@@ -1059,6 +1059,8 @@ static void write_pair_census(GString *report)
 
 void qemu_ident_report(GString *report)
 {
+    qemu_ident_shadow_report(report);
+
     write_pair_census(report);
 
     /*

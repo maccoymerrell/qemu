@@ -202,6 +202,91 @@ std::atomic<uint64_t> g_src_flip_no_row{0};
 GHashTable *g_src_flip_missing_sig = nullptr;
 GHashTable *g_src_flip_extra_sig = nullptr;
 /*
+ * ADJUDICATION-OWED -- the THIRD outcome of the loss direction, and the
+ * reason it is not the second.
+ *
+ * A published source lands in MISSING when neither QEMU's read list nor a
+ * survivor row carries it, and that row is an R12.1 violation waiting for a
+ * flip to commit it.  Two classes on this wire are in that position for a
+ * DIFFERENT reason, and calling them MISSING says something false about
+ * both: their deletion was already written, landed, MEASURED AGAINST THE
+ * EXTERNAL REFERENCES, and reverted, because the references contradicted
+ * the adjudication.  They are not rows nobody has looked at.  They are rows
+ * a maintainer has been asked about and has not yet ruled on.
+ *
+ *   riscv64 `fence`, REG_SYS.  The encoding names no register -- both
+ *     operands are immediates -- and on that reading the source has no
+ *     architectural referent.  But Sail, the architecture's own executable
+ *     specification, states ref_src = REG_SYS for FENCE, and the deleted
+ *     clause was exactly the menvcfg.FIOM dependency Sail models; R7.4
+ *     already rules that a CSR whose value decides an instruction's
+ *     behaviour IS a source.  QUESTION: does R7.4 reach FIOM?
+ *
+ *   x86_64 `rdsspq`, REG_GPR0 + REG_SSP.  With CET disabled -- the only
+ *     machine QEMU models -- the SDM defines the instruction as a NOP that
+ *     reads nothing and writes nothing.  But XED models the instruction
+ *     FORM as SRC {REG_SSP} DST {GPR}, PIN reports ref_only = ssp on it,
+ *     and the R13 x86_64 leg goes AGREE -> DISAGREE the moment the wire
+ *     stops publishing them.  QUESTION: does the wire owe the instruction
+ *     form or this machine's runtime state -- and separately, is REG_GPR0
+ *     a source at all, or the destination Capstone's access==0 mislaid?
+ *
+ * COUNTED APART FROM MISSING, NEVER FOLDED INTO JUSTIFIED.  Folding them
+ * into JUSTIFIED would assert the wire is right, which is the very thing
+ * nobody has ruled; leaving them in MISSING would assert a flip may delete
+ * them, which R12.1 forbids and which the references contradict.  A third
+ * column is the only honest place, and it prints the question with the row
+ * so the open item cannot decay into a number.
+ *
+ * KEYED ON (isa, decode id, MNEMONIC) -- deliberately, and this is NOT a
+ * survivor row.  x86 decode id 0x0000054b is QEMU's NOP slot and carries
+ * `endbr64` (410 census rows) beside `rdsspq` (3), so a row keyed on the id
+ * alone would silence a population it was never adjudicated for.  A flip
+ * cannot look this table up, because after the flip the mnemonic is gone;
+ * that is correct.  This table is a LEDGER OF OPEN QUESTIONS, not an input
+ * to any wire decision, and no flip may land while it is non-empty.
+ *
+ * NO SILENT WIDENING.  `rdsspd` shares the adjudication class and has no
+ * row here because it has no census row in the corpus this was measured on.
+ * If it ever appears it reads MISSING, loudly, and needs its own row and
+ * its own question -- which is the behaviour wanted.
+ */
+struct SrcAdjOwedRow {
+    unsigned    isa;          /* TraceISA */
+    uint32_t    decode_id;
+    const char *mnem;
+    uint8_t     reg;
+    const char *question;
+};
+static const SrcAdjOwedRow g_src_adj_owed[] = {
+    { TRACE_ISA_RISCV, 0xecf2c479u, "fence",  REG_SYS,
+      "does R7.4 (a trap/behaviour-deciding CSR IS a source) reach "
+      "menvcfg.FIOM, which Sail models as FENCE's system source?" },
+    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_GPR0,
+      "is the printed register operand a SOURCE, a DESTINATION (Capstone "
+      "reports access==0 and XED says DST {GPR}), or absent on a machine "
+      "with CET disabled?" },
+    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_SSP,
+      "does the wire owe the INSTRUCTION FORM (XED SRC {REG_SSP}, PIN "
+      "ref_only=ssp) or THIS machine's runtime state (SDM: NOP when shadow "
+      "stacks are disabled, and QEMU models no CET)?" },
+};
+static const char *src_adj_owed_question(uint32_t decode_id, const char *mnem,
+                                         uint8_t reg)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(g_src_adj_owed); i++) {
+        if (g_src_adj_owed[i].isa == (unsigned)trace_isa &&
+            g_src_adj_owed[i].decode_id == decode_id &&
+            g_src_adj_owed[i].reg == reg &&
+            mnem && strcmp(g_src_adj_owed[i].mnem, mnem) == 0) {
+            return g_src_adj_owed[i].question;
+        }
+    }
+    return nullptr;
+}
+std::atomic<uint64_t> g_src_adj_owed_n{0};
+GHashTable *g_src_adj_owed_sig = nullptr;
+/*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
  * They are separate tallies because they are separate defects with separate
@@ -2759,6 +2844,27 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 if (in_union(f->src_regs[i])) {
                     continue;
                 }
+                /*
+                 * ADJUDICATION-OWED FIRST, and it is a redirection rather
+                 * than an exemption: the row is still counted, still
+                 * printed with its decode id and register, and still blocks
+                 * the flip -- it is counted in a column that says WHY it is
+                 * there.  See g_src_adj_owed for the two classes and the
+                 * questions they are waiting on.
+                 */
+                const char *owed = src_adj_owed_question(
+                    q->decode_id, mnem, f->src_regs[i]);
+                if (owed) {
+                    g_src_adj_owed_n.fetch_add(1, std::memory_order_relaxed);
+                    char *okey = g_strdup_printf(
+                        "%08x %-26s %-14s %-10s Q: %s", q->decode_id,
+                        q->decode_name ? q->decode_name : "?",
+                        generic_reg_name_or_unknown(f->src_regs[i]),
+                        mnem ? mnem : "?", owed);
+                    tally(&g_src_adj_owed_sig, okey);
+                    g_free(okey);
+                    continue;
+                }
                 g_src_flip_missing.fetch_add(1, std::memory_order_relaxed);
                 char *key = g_strdup_printf(
                     "%08x %-26s %-14s %s", q->decode_id,
@@ -4120,11 +4226,29 @@ void qdep_report(GString *report)
         " but it is\n"
         "               what says how much of the population the table was"
         " never\n"
-        "               derived from\n",
+        "               derived from\n"
+        "  %10" G_GUINT64_FORMAT "  of the loss direction held back as"
+        " ADJUDICATION-OWED, and\n"
+        "               NOT counted in the first row above.  A published"
+        " source whose\n"
+        "               deletion was written, landed, measured against the"
+        " external\n"
+        "               references and REVERTED because they contradicted"
+        " it: a\n"
+        "               question in front of the maintainer, not a row"
+        " nobody has\n"
+        "               looked at.  It is NEVER folded into JUSTIFIED --"
+        " that would\n"
+        "               assert the wire is right, which is the thing not"
+        " yet ruled\n"
+        "               -- and no source-list flip may land while it is"
+        " non-zero.\n"
+        "               The rows and their questions are listed below\n",
         g_src_flip_missing.load(std::memory_order_relaxed),
         g_src_flip_extra.load(std::memory_order_relaxed),
         g_src_flip_scored.load(std::memory_order_relaxed),
-        g_src_flip_no_row.load(std::memory_order_relaxed));
+        g_src_flip_no_row.load(std::memory_order_relaxed),
+        g_src_adj_owed_n.load(std::memory_order_relaxed));
     g_string_append(report,
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
@@ -4360,6 +4484,8 @@ void qdep_report(GString *report)
                "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over the WHOLE scored population, not only the survivors.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying:");
     dump_tally(report, g_src_flip_missing_sig,
                "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
+    dump_tally(report, g_src_adj_owed_sig,
+               "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows:");
     dump_tally(report, g_src_flip_extra_sig,
                "FLIP COST, THE FABRICATION DIRECTION -- registers a\nSURVIVOR ROW supplies that the wire does not publish, by decode id, rule,\nregister and mnemonic.  A FIXED row reaching an instruction the rule\ndecodes but that does not read the register lands here, and so does a\nSELF row on an instruction whose destination is not also a source.  The\nblock is empty when every row is right for every instruction its rule\ncarries:");
     dump_tally(report, g_src_qemu_extra_sig,

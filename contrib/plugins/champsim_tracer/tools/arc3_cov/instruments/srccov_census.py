@@ -30,6 +30,18 @@ WHAT THE COLUMNS MEAN, and why they are kept apart:
                and UNJUSTIFIED moves by orders of magnitude, the movement is
                the change and not the environment (#314).
   OVER-BOUND   read lists past the fold's cap, refused rather than shortened.
+  ADJ-OWED     published sources the flip's union does not contain that are
+               NOT counted as MISSING, because their deletion was written,
+               landed, measured against the external references and REVERTED
+               when those references contradicted it (PASS 29: riscv64
+               `fence` REG_SYS vs Sail/menvcfg.FIOM; x86_64 `rdsspq`
+               REG_GPR0+REG_SSP vs XED/PIN).  A FOURTH outcome, and it is
+               kept apart from BOTH neighbours on purpose: folding it into
+               JUSTIFIED would assert the wire is right, which is the very
+               thing no ruling has said; leaving it in MISSING would assert
+               a flip may delete it, which R12.1 forbids.  Non-zero here is
+               not a defect -- it is an open maintainer question, and it
+               blocks any source-list flip until it is answered.
 
 VACUITY (#313/#235).  A stats file with no census block FAILS.  A census
 whose INSN-SCORED is zero FAILS.  A reader that cannot find its subject must
@@ -58,6 +70,8 @@ ROWS = [
     ("INSN-SCORED", r"(\d+)\s+instructions scored"),
     ("INSN-NOT",    r"(\d+)\s+instructions not scored"),
     ("OVER-BOUND",  r"(\d+)\s+read lists over the fold's bound"),
+    ("ADJ-OWED",    r"(\d+)\s+of the loss direction held back as "
+                    r"ADJUDICATION-OWED"),
 ]
 MARKER = "SOURCE-SIDE MEMBERSHIP COVERAGE"
 
@@ -120,7 +134,7 @@ def census(paths, quiet=False):
 # --------------------------------------------------------------------------
 # selftest
 
-def _block(just, unjust, nots, extra, scored, notscored, over):
+def _block(just, unjust, nots, extra, scored, notscored, over, owed=0):
     return (MARKER + " -- per PUBLISHED src_regs[i]\n"
             "  %d  published source entries JUSTIFIED\n"
             "  %d  published source entries UNJUSTIFIED -- x\n"
@@ -129,7 +143,10 @@ def _block(just, unjust, nots, extra, scored, notscored, over):
             "  %d  instructions scored\n"
             "  %d  instructions not scored\n"
             "  %d  read lists over the fold's bound, refused rather than "
-            "shortened\n" % (just, unjust, nots, extra, scored, notscored, over))
+            "shortened\n"
+            "  %d  of the loss direction held back as ADJUDICATION-OWED, and\n"
+            "               NOT counted in the first row above\n"
+            % (just, unjust, nots, extra, scored, notscored, over, owed))
 
 
 def selftest():
@@ -140,15 +157,16 @@ def selftest():
         vac = os.path.join(tmp, "vacuous.stats.log")
         absent = os.path.join(tmp, "absent.stats.log")
         short = os.path.join(tmp, "short.stats.log")
-        open(good, "w").write(_block(22235, 5436, 0, 21, 20315, 0, 0))
-        open(vac, "w").write(_block(0, 0, 0, 0, 0, 0, 0))
+        open(good, "w").write(_block(22235, 5436, 0, 21, 20315, 0, 0, 22))
+        open(vac, "w").write(_block(0, 0, 0, 0, 0, 0, 0, 0))
         open(absent, "w").write("a stats file with everything BUT the census\n")
         open(short, "w").write(MARKER + "\n  5  published source entries "
                                "JUSTIFIED\n")
 
         rc, out = census([good], quiet=True)
         checks.append(("clean census: rc=0 and the columns are read exactly",
-                       rc == 0 and out[0][1] == [22235, 5436, 0, 21, 20315, 0, 0],
+                       rc == 0 and out[0][1] == [22235, 5436, 0, 21, 20315,
+                                                 0, 0, 22],
                        "rc=%d vals=%s" % (rc, out[0][1])))
 
         # A census that scored nothing is not a census with no survivors.

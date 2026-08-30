@@ -26,8 +26,35 @@ a comparison that had no subject.  An empty side is a FAILURE, never a
 floor.  Both arms must have rows, per ISA, before anything is scored; a
 missing or empty key file exits non-zero and says which arm and why.
 
+THE COVERAGE COLUMN, and why cross-pass byte-identity is not the property
+it reads as (PASS 34, verify34/SETPROOF_DELTA.txt).  The BEFORE arm here is
+usually a banked baseline that never moves; the AFTER arm is a fresh run,
+and WHICH PCs that run reaches is not fixed.  Measured across PASSes 31-34
+against one banked baseline, strncmp's aligned fast path was executed in
+PASS 34 and not in 31-33, and eleven CHANGED rows appeared with it.  Two
+readings can therefore differ without a single fact having moved, and --
+worse for the reader -- can AGREE while covering different subjects.
+
+So every reading now states its own coverage beside its verdict:
+
+  baseline    PCs in the BEFORE arm (the reference's whole subject)
+  compared    PCs present in BOTH arms -- the only PCs any verdict is
+              about
+  skipped     PCs in one arm only.  These are the FLOOR: never a result,
+              and now never invisible either.
+
+and the cross-reading comparison (`--compare`) will NOT use the word
+IDENTICAL unless the two readings' coverages match.  When they do not it
+scores the verdicts at the MATCHED coverage -- the PCs both readings
+actually looked at -- and says so in its own verdict word.  Comparing the
+two report files as bytes, which is what passes used to do, silently reads
+a coverage difference as a content difference and a coverage difference as
+sameness in the other direction.
+
 Usage:
   setproof.py <before-dir> <after-dir> [--isas a,b] [--suffix .key|.dkey]
+                                       [--verdicts OUT.tsv]
+  setproof.py --compare A.tsv B.tsv
   setproof.py --selftest
 """
 import argparse
@@ -44,7 +71,12 @@ import _arc3lib as L  # noqa: E402
 
 
 def compare(a, b):
-    """Score one ISA.  Both sides are known non-empty by the time we get here."""
+    """Score one ISA.  Both sides are known non-empty by the time we get here.
+
+    Returns (common, changed, real_lost, real_gain, floor, cov) where @cov is
+    the reading's COVERAGE -- see coverage() -- because a verdict without its
+    coverage is not a reading anyone can compare to another one.
+    """
     pa = {k[0] for k in a}
     pb = {k[0] for k in b}
     both = pa & pb
@@ -54,7 +86,205 @@ def compare(a, b):
     real_gain = sorted(k for k in set(b) - set(a) if k[0] in both)
     floor = (len(set(a) - set(b)) - len(real_lost)
              + len(set(b) - set(a)) - len(real_gain))
-    return common, changed, real_lost, real_gain, floor
+    cov = {"baseline_pcs": pa, "after_pcs": pb, "compared_pcs": both}
+    return common, changed, real_lost, real_gain, floor, cov
+
+
+def cov_line(isa, cov):
+    """The coverage of one ISA's reading, as one printable line.
+
+    THE PROPERTY THIS MAKES VISIBLE (PASS 34).  `compared` is the ONLY set
+    any verdict above is about.  `skipped` is the rest of either arm, and it
+    MOVES between runs of the same build: PASS 34's after-arm executed
+    strncmp's aligned fast path and PASSes 31-33's did not, which is eleven
+    CHANGED rows appearing with no fact having changed.  Two readings whose
+    coverages differ are not two readings of the same thing.
+    """
+    return ("%-8s COVERAGE baseline_pcs=%d after_pcs=%d compared_pcs=%d "
+            "skipped_floor=%d (baseline-only %d, after-only %d)"
+            % (isa, len(cov["baseline_pcs"]), len(cov["after_pcs"]),
+               len(cov["compared_pcs"]),
+               len(cov["baseline_pcs"] ^ cov["after_pcs"]),
+               len(cov["baseline_pcs"] - cov["after_pcs"]),
+               len(cov["after_pcs"] - cov["baseline_pcs"])))
+
+
+#
+# THE CROSS-READING VERDICT FILE.
+#
+# One row per key, carrying the verdict AND enough of the coverage to
+# reconstruct it: which arms the key's PC was present in.  A pass banks this
+# beside its report and the next pass compares THESE, not the report bytes.
+#
+VERDICT_HEADER = "#isa\tpc\tfamily\tverdict\tin_baseline\tin_after"
+
+
+def verdict_rows(isa, a, b):
+    """Every key of either arm, with its verdict and its arm membership."""
+    pa = {k[0] for k in a}
+    pb = {k[0] for k in b}
+    both = pa & pb
+    rows = []
+    for k in sorted(set(a) | set(b)):
+        in_a, in_b = k in a, k in b
+        if in_a and in_b:
+            v = "SAME" if a[k] == b[k] else "CHANGED"
+        elif in_a:
+            v = "REAL-LOST" if k[0] in both else "FLOOR-BASELINE-ONLY"
+        else:
+            v = "REAL-GAIN" if k[0] in both else "FLOOR-AFTER-ONLY"
+        rows.append((isa, k[0], k[1], v,
+                     "1" if k[0] in pa else "0",
+                     "1" if k[0] in pb else "0"))
+    return rows
+
+
+def write_verdicts(path, rows):
+    with open(path, "w") as fh:
+        fh.write(VERDICT_HEADER + "\n")
+        for r in rows:
+            fh.write("\t".join(r) + "\n")
+
+
+def load_verdicts(path):
+    """Read a verdict file into (verdicts, baseline_pcs, after_pcs) per ISA.
+
+    Returns None when the file does not exist -- a missing reading is a
+    refusal, never an empty comparison, for the #235 reason.
+    """
+    if not os.path.exists(path):
+        return None
+    verdicts = collections.defaultdict(dict)
+    base = collections.defaultdict(set)
+    after = collections.defaultdict(set)
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 6:
+                continue
+            isa, pc, fam, v, in_a, in_b = f[:6]
+            verdicts[isa][(pc, fam)] = v
+            if in_a == "1":
+                base[isa].add(pc)
+            if in_b == "1":
+                after[isa].add(pc)
+    return verdicts, base, after
+
+
+def compare_readings(pa, pb, quiet=False):
+    """Compare two SETPROOF READINGS at their MATCHED coverage.
+
+    WHY THIS EXISTS AND WHY IT REFUSES THE WORD "IDENTICAL" (PASS 34).
+    Passes used to establish "the SETPROOF is unchanged" by diffing the two
+    report files as bytes.  That reads a coverage difference as a content
+    difference -- and, worse, cannot distinguish "the same verdicts over the
+    same PCs" from "the same verdicts over different PCs".  The after arm's
+    executed-PC set is not stable across runs of one build, so the second
+    case is the common one and the byte diff never said so.
+
+    So: coverage first, verdicts second, and the word IDENTICAL is reserved
+    for the case where BOTH match.  When only the verdicts match, the reading
+    is IDENTICAL-AT-MATCHED-COVERAGE and the coverage delta is printed beside
+    it.  A verdict that differs at a PC both readings looked at is a real
+    difference and exits non-zero; a coverage difference alone does not,
+    because it is the instrument's own floor -- but it is never silent.
+    """
+    reasons = []
+    if pa is None:
+        reasons.append("VACUITY FAILURE: reading A was never produced.")
+    if pb is None:
+        reasons.append("VACUITY FAILURE: reading B was never produced.")
+    if reasons:
+        return (L.report_vacuity(reasons) if not quiet else 2), {}
+
+    va, ba, aa = pa
+    vb, bb, ab = pb
+    tot = collections.Counter()
+    isas = sorted(set(va) | set(vb))
+    if not isas:
+        reasons.append("VACUITY FAILURE: neither reading scored any ISA.")
+        return L.report_vacuity(reasons), tot
+
+    for isa in isas:
+        if isa not in va or isa not in vb:
+            reasons.append("VACUITY FAILURE: %s is scored in only one of the "
+                           "two readings, so there is nothing to compare for "
+                           "it." % isa)
+            continue
+        if ba[isa] != bb[isa]:
+            # Not a floor.  The baseline is supposed to be the SAME banked
+            # arm in both readings; if its PC set moved, the two readings are
+            # against different references and no verdict comparison is
+            # meaningful.
+            reasons.append("VACUITY FAILURE: %s BASELINE differs between the "
+                           "two readings (%d vs %d PCs, %d not shared) -- "
+                           "these are readings against different references."
+                           % (isa, len(ba[isa]), len(bb[isa]),
+                              len(ba[isa] ^ bb[isa])))
+            continue
+
+        matched = aa[isa] & ab[isa]
+        cov_same = aa[isa] == ab[isa]
+        if not matched:
+            reasons.append("VACUITY FAILURE: %s matched coverage is EMPTY -- "
+                           "the two readings share no executed PC, so any "
+                           "agreement between them would be about nothing."
+                           % isa)
+            continue
+
+        ka = {k: v for k, v in va[isa].items() if k[0] in matched}
+        kb = {k: v for k, v in vb[isa].items() if k[0] in matched}
+        keys = set(ka) | set(kb)
+        differ = sorted(k for k in keys if ka.get(k) != kb.get(k))
+        tot["isas"] += 1
+        tot["matched_pcs"] += len(matched)
+        tot["rows"] += len(keys)
+        tot["differ"] += len(differ)
+        if not cov_same:
+            tot["cov_moved"] += 1
+        tot["a_only_pcs"] += len(aa[isa] - ab[isa])
+        tot["b_only_pcs"] += len(ab[isa] - aa[isa])
+
+        if not quiet:
+            print("%-8s coverage A after_pcs=%d  B after_pcs=%d  "
+                  "MATCHED=%d  (A-only %d, B-only %d)"
+                  % (isa, len(aa[isa]), len(ab[isa]), len(matched),
+                     len(aa[isa] - ab[isa]), len(ab[isa] - aa[isa])))
+            print("%-8s verdicts at matched coverage: rows=%d differing=%d %s"
+                  % (isa, len(keys), len(differ),
+                     "" if differ else "(none)"))
+            for k in differ[:20]:
+                print("     DIFFER %s %s  A=%s  B=%s"
+                      % (k[0], k[1], ka.get(k, "-"), kb.get(k, "-")))
+
+    rc = (L.report_vacuity(reasons) if not quiet else (2 if reasons else 0))
+    if rc:
+        return rc, tot
+    if tot["differ"]:
+        verdict = "VERDICTS DIFFER AT MATCHED COVERAGE"
+        rc = 1
+    elif tot["cov_moved"]:
+        verdict = ("IDENTICAL-AT-MATCHED-COVERAGE -- and NOT identical: the "
+                   "two readings covered different executed-PC sets "
+                   "(A-only %d, B-only %d PCs over %d ISA(s)).  The word "
+                   "IDENTICAL is refused here on purpose."
+                   % (tot["a_only_pcs"], tot["b_only_pcs"], tot["cov_moved"]))
+        rc = 0
+    else:
+        verdict = "IDENTICAL -- same coverage AND same verdicts"
+        rc = 0
+    if not quiet:
+        print("READING COMPARISON: %s" % verdict)
+        print("TOTAL isas=%d matched_pcs=%d rows=%d differing=%d "
+              "coverage_moved_on=%d isa(s)"
+              % (tot["isas"], tot["matched_pcs"], tot["rows"], tot["differ"],
+                 tot["cov_moved"]))
+    tot["verdict_identical"] = 1 if verdict.startswith("IDENTICAL --") else 0
+    tot["verdict_matched_only"] = 1 if verdict.startswith(
+        "IDENTICAL-AT-MATCHED") else 0
+    return rc, tot
 
 
 def rename_pairs(lost, gain, a, b):
@@ -117,9 +347,16 @@ def rename_pairs(lost, gain, a, b):
     return pairs
 
 
-def run(before, after, isas, suffix, show=12, quiet=False):
-    """Returns (exit_code, totals)."""
+def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None):
+    """Returns (exit_code, totals).
+
+    @verdicts, when given, is a path to write the per-key verdict file
+    that --compare reads.  A pass banks that beside its report so the
+    NEXT pass can compare readings at matched coverage instead of
+    diffing report bytes.
+    """
     reasons = []
+    vrows = []
     tot = collections.Counter()
     if not quiet:
         # WHERE THIS READING WAS TAKEN FROM (#327).  The x86_64 CHANGED
@@ -137,14 +374,18 @@ def run(before, after, isas, suffix, show=12, quiet=False):
             if not quiet:
                 print("%-8s NOT SCORED -- vacuity (see below)" % isa)
             continue
-        common, changed, lost, gain, floor = compare(a, b)
+        common, changed, lost, gain, floor, cov = compare(a, b)
         pairs = rename_pairs(lost, gain, a, b)
+        vrows.extend(verdict_rows(isa, a, b))
         if not quiet:
             fam = collections.Counter(k[1] for k in changed)
             print("%-8s arms=%d/%d common=%-6d CHANGED=%-4d REAL-LOST=%-4d "
                   "REAL-GAIN=%-4d floor(pc-only-one-arm)=%d"
                   % (isa, len(a), len(b), len(common), len(changed),
                      len(lost), len(gain), floor))
+            # THE COVERAGE, printed BESIDE the verdict and never below
+            # it, because the verdict is only about the compared set.
+            print("         " + cov_line(isa, cov))
             if pairs:
                 # REPORTED, NEVER SUBTRACTED -- see rename_pairs().
                 ident = sum(1 for p in pairs if p[4])
@@ -170,11 +411,20 @@ def run(before, after, isas, suffix, show=12, quiet=False):
         tot["renamed"] += len(pairs)
         tot["renamed_identical"] += sum(1 for p in pairs if p[4])
         tot["scored"] += 1
+        tot["compared_pcs"] += len(cov["compared_pcs"])
+        tot["skipped_pcs"] += len(cov["baseline_pcs"] ^ cov["after_pcs"])
+    if verdicts and vrows:
+        write_verdicts(verdicts, vrows)
     if not quiet:
         print("TOTAL scored_isas=%d common=%d CHANGED=%d REAL-LOST=%d "
               "REAL-GAIN=%d floor=%d"
               % (tot["scored"], tot["common"], tot["chg"], tot["lost"],
                  tot["gain"], tot["floor"]))
+        print("TOTAL COVERAGE compared_pcs=%d skipped_floor_pcs=%d -- every "
+              "verdict above is about the COMPARED set alone.  The skipped "
+              "set is not stable run to run (PASS 34), so two readings are "
+              "compared with --compare, never as report bytes."
+              % (tot["compared_pcs"], tot["skipped_pcs"]))
         if tot["renamed"]:
             print("TOTAL RENAME-PAIRED=%d (payload identical modulo the "
                   "rename: %d) -- reported, NOT subtracted from REAL-LOST"
@@ -339,6 +589,130 @@ def selftest():
                        tot["lost"] == 2 and tot["renamed"] == 0,
                        "lost=%d renamed=%d" % (tot["lost"], tot["renamed"])))
 
+        # ==================================================================
+        # PASS 34, F-B: THE COVERAGE ARMS.  A reading must state what it
+        # looked at, and two readings may only be called IDENTICAL when they
+        # looked at the same thing.
+        # ==================================================================
+
+        # ARM: the report PRINTS its coverage, and the numbers are the real
+        # ones -- baseline 2 PCs, after 2 PCs, compared 2, skipped 0 for the
+        # identical pair; and the FLOORED pair (ARM 4's shape) must show the
+        # skip rather than hide it.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run(A, B, ["x86_64"], ".key")
+        cov_same = buf.getvalue()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run(A, E, ["x86_64"], ".key")
+        cov_moved = buf.getvalue()
+        checks.append(("the reading PRINTS its coverage beside the verdict",
+                       "COVERAGE baseline_pcs=2 after_pcs=2 compared_pcs=2 "
+                       "skipped_floor=0" in cov_same,
+                       "coverage line present and exact"))
+        checks.append(("a MOVED coverage is stated, not hidden in the floor",
+                       "compared_pcs=1 skipped_floor=2" in cov_moved,
+                       "skipped_floor is non-zero and named"))
+
+        # ARM: two readings with the SAME coverage and the SAME verdicts are
+        # the only case allowed to be called IDENTICAL.
+        v1 = os.path.join(tmp, "r1.tsv")
+        v2 = os.path.join(tmp, "r2.tsv")
+        run(A, B, ["x86_64"], ".key", quiet=True, verdicts=v1)
+        run(A, B, ["x86_64"], ".key", quiet=True, verdicts=v2)
+        rc, ct = compare_readings(load_verdicts(v1), load_verdicts(v2),
+                                  quiet=True)
+        checks.append(("two readings, same coverage + same verdicts = "
+                       "IDENTICAL",
+                       rc == 0 and ct["verdict_identical"] == 1
+                       and ct["differ"] == 0,
+                       "rc=%d identical=%d differ=%d"
+                       % (rc, ct["verdict_identical"], ct["differ"])))
+
+        # ARM: THE PLANT THIS WHOLE COLUMN EXISTS FOR.  The second reading's
+        # AFTER arm reaches a PC the first never executed -- strncmp's
+        # aligned fast path, in miniature -- and agrees on every PC they
+        # share.  A byte diff of the two reports calls that a difference; the
+        # honest verdict is IDENTICAL-AT-MATCHED-COVERAGE, and the word
+        # IDENTICAL must be REFUSED.
+        S1 = _plant(tmp, "S1", None)
+        S2 = _plant(tmp, "S2", None)
+        base2 = dict(base)
+        base2[("0x3000", "dst_dep")] = ("RAW=0x8", "NAME=rsi")
+        _write(S1, "x86_64", base2)          # baseline: knows 0x3000
+        _write(S2, "x86_64", base)           # after run 1: did NOT reach it
+        v3 = os.path.join(tmp, "r3.tsv")
+        run(S1, S2, ["x86_64"], ".key", quiet=True, verdicts=v3)
+        S3 = _plant(tmp, "S3", None)
+        _write(S3, "x86_64", base2)          # after run 2: DID reach it
+        v4 = os.path.join(tmp, "r4.tsv")
+        run(S1, S3, ["x86_64"], ".key", quiet=True, verdicts=v4)
+        rc, ct = compare_readings(load_verdicts(v3), load_verdicts(v4),
+                                  quiet=True)
+        checks.append(("PLANTED coverage move: IDENTICAL is REFUSED",
+                       rc == 0 and ct["verdict_identical"] == 0
+                       and ct["verdict_matched_only"] == 1
+                       and ct["cov_moved"] == 1 and ct["differ"] == 0,
+                       "rc=%d identical=%d matched_only=%d cov_moved=%d "
+                       "differ=%d" % (rc, ct["verdict_identical"],
+                                      ct["verdict_matched_only"],
+                                      ct["cov_moved"], ct["differ"])))
+        checks.append(("...and the two report BODIES really do differ, so a "
+                       "byte diff would have called it a change",
+                       open(v3).read() != open(v4).read(),
+                       "verdict files differ as bytes"))
+
+        # ARM: a REAL verdict difference at a PC both readings covered is a
+        # difference, and exits non-zero -- the coverage column may not
+        # absorb it.
+        S4 = _plant(tmp, "S4", None)
+        moved = dict(base)
+        moved[("0x1000", "dst_dep")] = ("RAW=0x99", "NAME=zzz")
+        _write(S4, "x86_64", moved)
+        v5 = os.path.join(tmp, "r5.tsv")
+        run(A, S4, ["x86_64"], ".key", quiet=True, verdicts=v5)
+        rc, ct = compare_readings(load_verdicts(v1), load_verdicts(v5),
+                                  quiet=True)
+        checks.append(("a verdict difference at MATCHED coverage FAILS",
+                       rc == 1 and ct["differ"] == 1,
+                       "rc=%d differ=%d" % (rc, ct["differ"])))
+
+        # ARM: a missing reading is a REFUSAL, never an empty comparison.
+        rc, ct = compare_readings(load_verdicts(v1),
+                                  load_verdicts(os.path.join(tmp, "nope.tsv")),
+                                  quiet=True)
+        checks.append(("a MISSING reading REFUSES, never compares",
+                       rc == 2, "rc=%d" % rc))
+
+        # ARM: readings taken against DIFFERENT baselines refuse -- their
+        # verdicts are not about the same reference.
+        v6 = os.path.join(tmp, "r6.tsv")
+        run(S1, S3, ["x86_64"], ".key", quiet=True, verdicts=v6)
+        rc, ct = compare_readings(load_verdicts(v1), load_verdicts(v6),
+                                  quiet=True)
+        checks.append(("readings against DIFFERENT baselines REFUSE",
+                       rc == 2, "rc=%d" % rc))
+
+        # ARM: disjoint after-arms -> matched coverage EMPTY -> refuse,
+        # because agreement over nothing is not agreement (#235's shape).
+        S5 = _plant(tmp, "S5", None)
+        S6 = _plant(tmp, "S6", None)
+        wide = {("0x1000", "dst_dep"): ("R=1", "N=a"),
+                ("0x2000", "dst_dep"): ("R=2", "N=b")}
+        _write(S5, "x86_64", wide)
+        _write(S6, "x86_64", {("0x1000", "dst_dep"): ("R=1", "N=a")})
+        v7 = os.path.join(tmp, "r7.tsv")
+        run(S5, S6, ["x86_64"], ".key", quiet=True, verdicts=v7)
+        S7 = _plant(tmp, "S7", None)
+        _write(S7, "x86_64", {("0x2000", "dst_dep"): ("R=2", "N=b")})
+        v8 = os.path.join(tmp, "r8.tsv")
+        run(S5, S7, ["x86_64"], ".key", quiet=True, verdicts=v8)
+        rc, ct = compare_readings(load_verdicts(v7), load_verdicts(v8),
+                                  quiet=True)
+        checks.append(("DISJOINT after-arms: empty matched coverage REFUSES",
+                       rc == 2, "rc=%d" % rc))
+
         # #327: the report must carry the directory it was taken from, and
         # the stamp must MOVE when the directory does.
         here = os.getcwd()
@@ -377,15 +751,23 @@ def main():
                     help=".key (per-family) or .dkey (per destination register)")
     ap.add_argument("--show", type=int, default=12,
                     help="how many CHANGED rows to print per ISA")
+    ap.add_argument("--verdicts",
+                    help="write the per-key verdict file --compare reads")
+    ap.add_argument("--compare", nargs=2, metavar=("A.tsv", "B.tsv"),
+                    help="compare two verdict files at MATCHED coverage")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.compare:
+        rc, _ = compare_readings(load_verdicts(args.compare[0]),
+                                 load_verdicts(args.compare[1]))
+        return rc
     if not (args.before and args.after):
         L.die_usage("usage: setproof.py <before-dir> <after-dir> "
                     "[--isas ...] [--suffix .key|.dkey]")
     rc, _ = run(args.before, args.after, args.isas.split(","), args.suffix,
-                show=args.show)
+                show=args.show, verdicts=args.verdicts)
     return rc
 
 

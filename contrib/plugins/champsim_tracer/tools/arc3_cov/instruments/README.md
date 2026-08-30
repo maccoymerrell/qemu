@@ -8,7 +8,7 @@ the one location; later waves cite these paths and nothing else.
 | tool | what it answers |
 | --- | --- |
 | `keyfacts.py` | extract per-PC facts from `cst_decode --format=raw` (`.key`), or the per-destination-register form (`--dst`, `.dkey`) |
-| `setproof.py` | did a set of published facts move between two arms — CHANGED / REAL-LOST / REAL-GAIN / FLOOR |
+| `setproof.py` | did a set of published facts move between two arms — CHANGED / REAL-LOST / REAL-GAIN / FLOOR, each with the reading's own COVERAGE; `--compare` scores two readings at matched coverage |
 | `score_families.py` | the J3 mutation battery over all four dependency families, floor-excluded, under both floor definitions |
 | `score_dst.py` | the destination family keyed per destination REGISTER |
 | `nodep_census.py` | the absolute census of slots naming no architectural register (the #230 class) |
@@ -62,6 +62,21 @@ tree published 4 riscv64 PCs on one side and 6 on the other, with 0 of the
 12,016 common keys differing.  A key present in one arm only is FLOOR and is
 never counted as a loss or a gain.  A family that disappears at a PC both
 arms published is REAL-LOST and always is.
+
+**A reading states its own COVERAGE, and two readings are compared at the
+MATCHED coverage — never as report bytes (PASS 34).**  `setproof.py`'s
+BEFORE arm is a banked baseline that does not move; its AFTER arm is a fresh
+run, and which PCs that run executes is *not* stable.  Measured across
+PASSes 31-34 against one banked baseline, `strncmp`'s aligned fast path ran
+in PASS 34 and not in 31-33, and eleven CHANGED rows arrived with it — no
+fact having moved.  So the per-ISA line now carries
+`COVERAGE baseline_pcs=… compared_pcs=… skipped_floor=…`, `--verdicts`
+banks the per-key verdicts, and `--compare A.tsv B.tsv` scores two readings
+at the PCs they BOTH covered.  That mode will not print the word
+`IDENTICAL` unless the coverages match as well as the verdicts; when only
+the verdicts match it says `IDENTICAL-AT-MATCHED-COVERAGE` and prints the
+coverage delta.  Readings taken against different baselines, and readings
+whose matched coverage is empty, are refusals.
 
 **A dependency array is keyed by its destination REGISTER, not its slot
 (#231).**  `dst_dep[]` has one mask per wire destination slot and the slot

@@ -2966,7 +2966,18 @@ static bool cap_x86_eflags_read_lost(const cs_insn *insn)
         if (!g_str_has_prefix(m, shifts[i])) {
             continue;
         }
-        for (uint8_t k = 0; k < x86->op_count; k++) {
+        /*
+         * The COUNT operand, and NOT any operand.  Capstone is configured
+         * for AT&T syntax here, so the destination is the LAST operand and
+         * the count is one of the ones before it; scanning the whole array
+         * makes `shrb $5, %cl` -- whose count is the immediate and whose
+         * DESTINATION happens to be CL -- read as a CL-count shift and
+         * publish an EFLAGS source the instruction does not have.  That was
+         * measured on the wire (two rows, ld.so's `shrb $0x5,%cl`), and it
+         * is the exact case the paragraph above says this repair excludes:
+         * "a non-zero immediate cannot preserve".
+         */
+        for (uint8_t k = 0; k + 1 < x86->op_count; k++) {
             if (x86->operands[k].type == X86_OP_REG &&
                 x86->operands[k].reg == X86_REG_CL) {
                 return true;

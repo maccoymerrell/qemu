@@ -1356,6 +1356,23 @@ static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
         *store = false; *size = 8; return true;
     case INDEX_op_ld_vec:
         *store = false; *size = tcg_type_size(TCGOP_TYPE(op)); return true;
+    /*
+     * The DUPLICATING vector load.  It has the same three-argument shape as
+     * ld_vec -- destination, base pointer, byte offset -- and reads ONE
+     * ELEMENT rather than a whole vector: tcg_gen_dup_mem_vec() takes the
+     * element width in the op's vece field and broadcasts it.  Reading the
+     * size from TCGOP_TYPE() here would name the whole destination vector as
+     * the source range, which is a different register on a target whose
+     * vector file is declared per element.
+     *
+     * Missing it entirely is what this case fixes.  x86_64's `vpbroadcastb
+     * %xmm0, %ymm0` lowers to exactly one of these plus the stores that
+     * spread it, and with the op unclassified the walk saw the stores and no
+     * read at all -- the destination came back with an EMPTY provenance and
+     * QEMU stated that the instruction reads nothing.
+     */
+    case INDEX_op_dupm_vec:
+        *store = false; *size = 1u << TCGOP_VECE(op); return true;
     case INDEX_op_st8_i32: case INDEX_op_st8_i64:
         *store = true; *size = 1; return true;
     case INDEX_op_st16_i32: case INDEX_op_st16_i64:

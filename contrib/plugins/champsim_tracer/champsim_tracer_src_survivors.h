@@ -8,8 +8,8 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/p3/arc3/exec55/pass2/snapshot, 32 sidecar(s):
- *   x86_64   10 sidecar(s), 13 row(s), 3 REFUSED on an ambiguous id
+ * is /mnt/md0/QEMU/cst_runs/p3/arc3/exec56/snapshot, 32 sidecar(s):
+ *   x86_64   10 sidecar(s), 7 row(s), 3 REFUSED on an ambiguous id
  *   aarch64  8 sidecar(s), 8 row(s)
  *   riscv64  7 sidecar(s), 10 row(s), 1 REFUSED on an ambiguous id
  *   mipsel   7 sidecar(s), 1 row(s)
@@ -41,7 +41,7 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 13 rows, 603 census entries, from 10 sidecar(s) */
+/* x86_64 -- 7 rows, 591 census entries, from 10 sidecar(s) */
 /* REFUSED, not carried: 0x0000054bu NOP REG_GPR0 (rdsspq x3) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -64,12 +64,6 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0x00000419u, SRC_SURV_SELF , REG_NONE      , "VMOVHPx_ld" },   /* movhps x4 */
     { 0x0000041au, SRC_SURV_SELF , REG_NONE      , "VMOVHPx_ld" },   /* movhpd x4 */
     { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , "RET" },   /* retq x527 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG0      , "MOV" },   /* movw x2 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG1      , "MOV" },   /* movw x2 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG2      , "MOV" },   /* movw x2 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG3      , "MOV" },   /* movw x2 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG4      , "MOV" },   /* movw x2 */
-    { 0x00000745u, SRC_SURV_FIXED, REG_SEG5      , "MOV" },   /* movw x2 */
     { 0x00000767u, SRC_SURV_SELF , REG_NONE      , "LEAVE" },   /* leave x39 */
 };
 
@@ -125,6 +119,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 32 rows over the four ISAs. */
+/* 26 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

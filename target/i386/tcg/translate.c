@@ -4128,6 +4128,45 @@ void tcg_x86_init(void)
                                   sizeof(((CPUX86State *)0)->xcr0), 1);
 
     /*
+     * The SEGMENT SELECTORS.
+     *
+     * `mov %es,%ax` and its five siblings read env->segs[seg].selector by
+     * ld -- no TCG global names the selector, only the hidden base does
+     * (es_base .. gs_base above) -- so the read arrives at a consumer as a
+     * CPUArchState byte offset and only this file knows which register that
+     * offset is.  Witnessed on QEMU's own dump: the six instructions at
+     * 0x401275..0x401284 of the golden net's w3_coverage cell read
+     * off=184/208/232/256/280/304 size=4, which is exactly
+     * segs[R_ES..R_GS].selector, and until this declaration every one of
+     * them arrived as an unnamed four-byte range.
+     *
+     * The names are the GDB stub's, in QEMU'S OWN R_* ORDER -- ES, CS, SS,
+     * DS, FS, GS -- because that is the order env->segs[] is indexed in and
+     * the declaration inverts an OFFSET, not a GDB register number.
+     *
+     * @elem is the SELECTOR's four bytes, not the 24-byte SegmentCache slot.
+     * The rest of the slot is the hidden descriptor cache: `base` already
+     * has a TCG global of its own (which the lookup consults first), and
+     * `limit`/`flags` are not the selector and must not be named for it.
+     * A read that reaches past the four bytes therefore refuses, which is
+     * the direction this file treats as correct.
+     */
+    {
+        static const char *const seg_names[] = {
+            "es", "cs", "ss", "ds", "fs", "gs",
+        };
+
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(seg_names) !=
+                          ARRAY_SIZE(((CPUX86State *)0)->segs));
+        insn_dataflow_declare_regfile(
+            NULL, seg_names,
+            offsetof(CPUX86State, segs),
+            sizeof(((CPUX86State *)0)->segs[0]),
+            sizeof(((CPUX86State *)0)->segs[0].selector),
+            ARRAY_SIZE(((CPUX86State *)0)->segs));
+    }
+
+    /*
      * The x87 STACK, declared as ONE register and not as eight.
      *
      * The reason eight is wrong is stated above the vector file: env->fpregs

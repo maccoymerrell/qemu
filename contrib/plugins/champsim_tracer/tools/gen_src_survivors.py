@@ -15,10 +15,10 @@ INPUT.  One stats sidecar per ISA, each containing the block headed
 
     <count>  <decode_id>  <rule name>  <generic register>  <role>  <mnemonic>
 
-where <role> is SELF when the register the wire publishes as a source is also
-a register the wire publishes as a DESTINATION of the same instruction, and
-FIXED when it is not.  That distinction is the whole of the classification and
-it is read, never guessed:
+where <role> is SELF@<p> when the register the wire publishes as a source is
+also the register the wire publishes as DESTINATION NUMBER p of the same
+instruction, and FIXED when it is not a destination at all.  That distinction
+is the whole of the classification and it is read, never guessed:
 
   FIXED  the register is a property of the RULE -- x86 `ret` reads SS, an
          aarch64 FP instruction reads the FP-enable gate.  The row carries the
@@ -26,9 +26,16 @@ it is read, never guessed:
          instruction the rule decodes.
   SELF   the register is a property of the INSTANCE -- `movlpd` merges into
          whichever XMM the encoding names, `mthc1` into whichever FPR.  The
-         row carries NO register: it says "this rule's destinations are also
-         its sources", and the register is read at translation time from the
-         instruction's own destination list.
+         row carries NO register: it says "destination number p of this rule
+         is also one of its sources", and the register is read at translation
+         time from that ONE position in the instruction's own destination
+         list.
+
+         THE POSITION IS NOT DECORATION.  Without it the row supplied the
+         whole destination list, and an aarch64 `fadd v0.2d,v1.2d,v2.2d` --
+         whose survivor is REG_FCSR, a destination as well as a source --
+         handed REG_VEC0 to a wire that never published it.  Eight
+         fabricated registers on the golden net, from four rules.
 
 A rule that shows BOTH roles gets both kinds of row.
 
@@ -122,7 +129,7 @@ HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
 SPLIT_HDR = "SURVIVOR rules REACHED by this run"
 WITNESS_HDR = "DECODE-IDENTITY COLLISION WITNESS"
 OWED_HDR = "ADJUDICATION-OWED -- published sources"
-ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+(SELF|FIXED)\s+(\S+)\s*$")
+ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+(SELF@\d+|FIXED)\s+(\S+)\s*$")
 SPLIT_ROW = re.compile(r"^\s*0x([0-9a-f]{8})\s+QID_SPLIT\s")
 WITNESS_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(\S+)\s*$")
 OWED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+Q:")
@@ -320,13 +327,16 @@ def emit(out, inputs, src):
     a("")
     a("typedef enum {")
     a("    SRC_SURV_FIXED = 0,   /* @reg, the same register on every instance */")
-    a("    SRC_SURV_SELF  = 1,   /* the instance's own destination registers   */")
+    a("    SRC_SURV_SELF  = 1,   /* @dst_pos, ONE slot of this instance's own  */")
+    a("                          /* destination list -- never the whole list   */")
     a("} SrcSurvivorKind;")
     a("")
     a("typedef struct {")
     a("    uint32_t decode_id;")
     a("    uint8_t  kind;        /* SrcSurvivorKind */")
     a("    uint8_t  reg;         /* generic id; REG_NONE for SRC_SURV_SELF */")
+    a("    uint8_t  dst_pos;     /* SRC_SURV_SELF: which destination slot;")
+    a("                           * 0 and unread for SRC_SURV_FIXED */")
     a("    const char *rule;     /* annotation: QEMU's spelling of the rule */")
     a("} SrcSurvivorRow;")
     a("")
@@ -344,7 +354,7 @@ def emit(out, inputs, src):
              ents, "y" if ents == 1 else "ies", seen[isa]))
         for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
             a("/* REFUSED, not carried: 0x%08xu %s %s (%s x%d) --"
-              % (did, rule, reg or "SELF", ",".join(sorted(mn)), cnt))
+              % (did, rule, reg or role, ",".join(sorted(mn)), cnt))
             if why == "AMBIGUOUS":
                 a(" * the census shows this decode id carrying more than one")
                 a(" * instruction, so an id-keyed row would fire on the others")
@@ -377,8 +387,9 @@ def emit(out, inputs, src):
         for (did, role, reg), (rule, cnt, mnems) in sorted(rows.items()):
             kind = "SRC_SURV_FIXED" if role == "FIXED" else "SRC_SURV_SELF"
             r = reg if role == "FIXED" else "REG_NONE"
-            a("    { 0x%08xu, %-14s, %-14s, \"%s\" },   /* %s x%d */"
-              % (did, kind, r, rule, ",".join(sorted(mnems)), cnt))
+            pos = 0 if role == "FIXED" else int(role.split("@", 1)[1])
+            a("    { 0x%08xu, %-14s, %-14s, %u, \"%s\" },   /* %s x%d */"
+              % (did, kind, r, pos, rule, ",".join(sorted(mnems)), cnt))
         a("};")
         a("")
         total += len(rows)
@@ -406,7 +417,7 @@ def emit(out, inputs, src):
     for isa in ISAS:
         for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
             print("  REFUSED %-8s 0x%08x %s %s (%s x%d): %s"
-                  % (isa, did, rule, reg or "SELF", ",".join(sorted(mn)), cnt,
+                  % (isa, did, rule, reg or role, ",".join(sorted(mn)), cnt,
                      "the id carries more than one instruction"
                      if why == "AMBIGUOUS" else
                      "ADJUDICATION-OWED, an open maintainer question"))
@@ -457,7 +468,12 @@ def selftest():
     me = [sys.executable, os.path.abspath(__file__)]
 
     good = ["       521  000006da RET                        REG_SEG5"
-            "       FIXED retq"]
+            "       FIXED   retq",
+            # A SELF row, at destination slot 1.  The position is the whole
+            # point of the role: a row that supplied the instance's WHOLE
+            # destination list fabricated eight registers on the golden net.
+            "         2  e91326ac disas_a64/FADD_v           REG_FCSR"
+            "       SELF@1  fadd"]
     split = ["         2  00000776 x87                        REG_FPR0"
              "       FIXED fstpt",
              "         3  0000054b NOP                        REG_SSP"
@@ -468,7 +484,8 @@ def selftest():
                "         2  00000776 x87                        fstpt",
                "         1  00000776 x87                        fldt",
                "       410  0000054b NOP                        endbr64",
-               "         3  0000054b NOP                        rdsspq"]
+               "         3  0000054b NOP                        rdsspq",
+               "         2  e91326ac disas_a64/FADD_v           fadd"]
 
     owedrow = ["        16  ecf2c479 decode_insn32/fence        REG_SYS"
                "        fence     Q: does R7.4 reach FIOM?"]
@@ -502,6 +519,9 @@ def selftest():
         and "carries \nmore than one" not in txt
         and "more than one instruction" in rc.stdout)
     chk("ARM D: the un-split row IS carried", "0x000006dau, SRC_SURV" in txt)
+    chk("ARM D0: a SELF row carries its DESTINATION POSITION, not the list",
+        "0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1," in txt,
+        "expected dst_pos 1 on the SELF row")
     chk("ARM D1: an ADJUDICATION-OWED row is NOT carried",
         "0xecf2c479u, SRC_SURV" not in txt
         and "ADJUDICATION-OWED, an open maintainer question" in rc.stdout)

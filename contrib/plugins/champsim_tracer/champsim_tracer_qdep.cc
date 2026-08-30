@@ -1474,7 +1474,11 @@ uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
  *                   half of an FPR: the merged-into register is a source
  *                   and it is whichever register the encoding named.  No
  *                   constant can stand for that, so the row names none and
- *                   the registers come from @f's own destination list.
+ *                   the register comes from ONE POSITION in @f's own
+ *                   destination list -- the position the census recorded
+ *                   the survivor at.  Supplying the WHOLE list instead is
+ *                   what fabricated REG_VEC0 on aarch64 vector FP, whose
+ *                   survivor is REG_FCSR at dst_regs[1].
  *
  * A decode id with NO row contributes nothing, and that is counted
  * (g_src_flip_no_row) rather than passed over: a corpus-derived table is
@@ -1513,8 +1517,12 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
             continue;
         }
         if (t->rows[i].kind == SRC_SURV_SELF) {
-            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                take(f->dst_regs[d]);
+            /* One position, not the list.  A row whose position the
+             * instance does not have contributes nothing rather than
+             * falling back to a neighbour: a register at a different
+             * position is a different register. */
+            if (t->rows[i].dst_pos < f->n_dst_regs) {
+                take(f->dst_regs[t->rows[i].dst_pos]);
             }
         } else {
             take(t->rows[i].reg);
@@ -2658,13 +2666,6 @@ static bool reseat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
 bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                const char *mnem, unsigned wstate, const char *why)
 {
-    if (wstate != QDEP_OK) {
-        if (wstate != QDEP_NONE) {
-            note_refusal(mnem, wstate, "dst  ", why);
-        }
-        g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
     /*
      * The two lists' disagreement, counted in the direction dst_precheck()
      * cannot see: a register QEMU named that the wire's list does not carry.
@@ -2739,30 +2740,49 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                  *         reads SS, an aarch64 FP instruction reads the
                  *         FP-enable gate -- so the same register is right
                  *         for every instruction the rule decodes.
-                 *  SELF   the register is a property of the INSTANCE -- a
+                 *  SELF@p the register is a property of the INSTANCE -- a
                  *         partial write merging into whichever register the
                  *         encoding named -- so no constant can stand for it
                  *         and it has to be read from the instruction's own
-                 *         destination list.
+                 *         destination list, AT THE POSITION p PRINTED HERE.
                  *
                  * The test is whether the SAME instruction publishes this
                  * register as a DESTINATION.  gen_src_survivors.py reads
                  * this column; nothing chooses the kind by hand.
+                 *
+                 * THE POSITION IS PART OF THE ROLE, and it is why the column
+                 * is not the bare word SELF it used to be.  "Also a
+                 * destination" is not "varies per instance": an aarch64
+                 * `fadd v0.2d,v1.2d,v2.2d` publishes REG_FCSR as BOTH a
+                 * source and a destination, so it scored SELF, and a row
+                 * that then supplied the instance's WHOLE destination list
+                 * handed REG_VEC0 to a wire that never published it -- 8
+                 * fabricated registers on the golden net, measured.  With
+                 * the position, FADD_v's survivor is dst_regs[1] and is
+                 * REG_FCSR on every instance, while INS_general's is
+                 * dst_regs[0] and travels with the encoding: both exact,
+                 * and neither supplies a register the instruction does not
+                 * have in that slot.
                  */
                 bool self = false;
+                uint8_t self_pos = 0;
 
                 for (uint8_t d = 0; d < f->n_dst_regs; d++) {
                     if (f->dst_regs[d] == f->src_regs[i]) {
                         self = true;
+                        self_pos = d;
                         break;
                     }
                 }
+                char *role = self ? g_strdup_printf("SELF@%u", self_pos)
+                                  : g_strdup("FIXED");
                 char *key = g_strdup_printf(
-                    "%08x %-26s %-14s %-5s %s", q->decode_id,
+                    "%08x %-26s %-14s %-7s %s", q->decode_id,
                     q->decode_name ? q->decode_name : "?",
                     generic_reg_name_or_unknown(f->src_regs[i]),
-                    self ? "SELF" : "FIXED",
+                    role,
                     mnem ? mnem : "?");
+                g_free(role);
                 tally(&g_src_survivor_ident, key);
                 g_free(key);
             }
@@ -2899,6 +2919,36 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     } else {
         g_src_insn_nostate.fetch_add(1, std::memory_order_relaxed);
         g_src_nostate.fetch_add(f->n_src_regs, std::memory_order_relaxed);
+    }
+
+    /*
+     * THE WRITE-SIDE REFUSAL RETURNS HERE, AFTER THE SOURCE CENSUS, AND THAT
+     * POSITION IS THE POINT (#327/#328).
+     *
+     * It used to be the first statement of this function.  The write state
+     * says nothing about the READ list -- QEMU can refuse to state what an
+     * instruction WROTE and still state exactly what it READ -- so returning
+     * on it before the source census ran censored the source census by a
+     * fact about a different list.  What that produced was not a small
+     * error: it was a ZERO ABOUT A POPULATION THE CENSUS NEVER LOOKED AT,
+     * and the arc's own gates were drawn from it.  Measured on the golden
+     * net at the moment the return moved, the population the census could
+     * suddenly see carried 60 fabricated x86_64 registers and 14 x86_64
+     * losses that every reading before it had scored 0.
+     *
+     * The consequence to expect, and it is NOT a defect: NOT-SCORED is now
+     * HONESTLY NON-ZERO.  It counts published sources on instructions whose
+     * read list QEMU withheld, which is a real third outcome and always was.
+     * It is not a must-be-0 row -- it carries no "MUST BE 0" text and
+     * must0_scan.py does not score it -- and a reader who calls its non-zero
+     * red is reading the pre-hoist censored zero back in.
+     */
+    if (wstate != QDEP_OK) {
+        if (wstate != QDEP_NONE) {
+            note_refusal(mnem, wstate, "dst  ", why);
+        }
+        g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
 
     for (uint8_t k = 0; k < q->n_dst; k++) {
@@ -4129,7 +4179,14 @@ void qdep_report(GString *report)
         "               list for the instruction.  A THIRD outcome, never"
         " folded into\n"
         "               the line above: that would blame the wire for QEMU's"
-        " refusal\n"
+        " refusal.\n"
+        "               HONESTLY NON-ZERO, and not a must-be-0 row: this"
+        " census now\n"
+        "               runs BEFORE apply_dst's write-side refusal return"
+        " (#327/#328),\n"
+        "               so it sees the whole population.  The zero it used"
+        " to print\n"
+        "               was a zero about instructions it never looked at\n"
         "  %10" G_GUINT64_FORMAT "  registers QEMU reads that the wire does"
         " NOT publish -- the\n"
         "               OTHER direction, counted apart because it is what a"

@@ -20,7 +20,13 @@ WHAT THE COLUMNS MEAN, and why they are kept apart:
                THIRD outcome, never folded into UNJUSTIFIED -- folding it
                would blame the wire for the emulator's own refusal, which is
                how the destination side's first figures became a 219x
-               overstatement (#231).
+               overstatement (#231).  HONESTLY NON-ZERO: the census runs
+               before apply_dst's write-side refusal return (#327/#328), so
+               it scores the whole population.  A zero here would now mean
+               every instruction in the corpus had its read list stated, not
+               that nothing was withheld -- and the zero this column printed
+               before the hoist was a zero about instructions it never
+               looked at.
   QEMU-EXTRA   the OPPOSITE direction: a register QEMU reads that the wire
                does not publish.  Counted apart because it is what a flip
                would GAIN, not what it owes.  Netting it against UNJUSTIFIED

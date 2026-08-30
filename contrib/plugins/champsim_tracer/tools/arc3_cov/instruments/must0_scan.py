@@ -21,6 +21,23 @@ begins on -- the phrase line itself when the phrase starts the row, otherwise
 the nearest preceding line that starts with an integer, within the height of
 one wrapped row.
 
+WHAT IS *NOT* A MUST-BE-0 ROW, stated because two census columns are now
+honestly non-zero and reading them as red would be a false alarm:
+
+  NOT-SCORED   published sources on instructions whose read list QEMU
+               withheld.  Non-zero by construction since the source census
+               was hoisted above apply_dst's write-side refusal return
+               (#327/#328) -- before that it printed a zero about a
+               population it never looked at.
+  ADJ-OWED     published sources held out of MISSING because their deletion
+               was landed, measured against the external references and
+               REVERTED.  Non-zero means an OPEN maintainer question, and it
+               blocks any source-list flip; it does not mean a red gate.
+
+Neither line carries the phrase, so neither is scanned here.  That is the
+membership rule and not a special case: a column is a must-be-0 row exactly
+when the plugin writes "MUST BE 0" in its own text.
+
 Exit 1 when any row is non-zero, or when a file carries NO must-be-0 row at
 all: a scanner that cannot find its subject FAILS.  Exit 2 on a usage or
 selftest failure.

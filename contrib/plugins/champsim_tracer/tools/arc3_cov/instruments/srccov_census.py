@@ -155,6 +155,61 @@ def _block(just, unjust, nots, extra, scored, notscored, over, owed=0):
             % (just, unjust, nots, extra, scored, notscored, over, owed))
 
 
+SURV_HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
+SURV_ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)"
+                      r"\s+(SELF@\d+|FIXED)\s+(\S+)\s*$")
+
+
+def survivors(paths, quiet=False):
+    """Print the NAMED survivor rows the UNJUSTIFIED column counts.
+
+    The column says HOW MANY; this says WHICH, which is the form an
+    adjudication needs.  It is the same block gen_src_survivors.py reads,
+    so a row printed here and a row in the emitted table are the same
+    measurement seen twice -- and a disagreement between them is visible
+    rather than inferred.
+
+    A file with no survivor block FAILS.  A reader that cannot find its
+    subject must not report success (#313/#235): "no rows" and "no block"
+    are different facts and only one of them is a clean census.
+    """
+    rc, seen = 0, 0
+    for path in paths:
+        try:
+            text = open(path, errors="replace").read()
+        except OSError as e:
+            print("FAIL %s: %s" % (path, e))
+            rc = 1
+            continue
+        if SURV_HDR not in text:
+            print("FAIL %s: no survivor block -- the census did not run"
+                  % path)
+            rc = 1
+            continue
+        rows, none = [], False
+        for line in text.split(SURV_HDR, 1)[1].splitlines():
+            if line.strip() == "(none)":
+                none = True
+                break
+            m = SURV_ROW.match(line)
+            if m:
+                rows.append(m.groups())
+            elif rows and not line.strip():
+                break
+        seen += 1
+        if not quiet:
+            print("%s: %d survivor row(s)%s"
+                  % (path, len(rows), "  (block read `(none)`)"
+                     if none and not rows else ""))
+            for cnt, did, rule, reg, role, mnem in rows:
+                print("  %8s  %s  %-30s %-14s %-7s %s"
+                      % (cnt, did, rule, reg, role, mnem))
+    if not seen and not rc:
+        print("FAIL: no file carried a survivor block")
+        rc = 1
+    return rc
+
+
 def selftest():
     checks = []
     tmp = tempfile.mkdtemp(prefix="srccov_census_selftest_")
@@ -201,6 +256,30 @@ def selftest():
         checks.append(("one bad file in a batch FAILS the whole run",
                        rc != 0, "rc=%d" % rc))
 
+        # --survivors reads the NAMED rows.  Both arms matter: a real row
+        # must be found, and a file with no survivor block must FAIL rather
+        # than print "0 rows" -- the flag existed only in prose until now
+        # and prose cannot be vacuous the way a reader can.
+        surv = os.path.join(tmp, "surv.stats.log")
+        open(surv, "w").write(
+            _block(1, 1, 0, 0, 1, 0, 0, 0)
+            + "\n" + SURV_HDR + " -- rows:\n"
+            "         2  e91326ac disas_a64/FADD_v           REG_FCSR"
+            "       SELF@1  fadd\n"
+            "       521  000006da RET                        REG_SEG5"
+            "       FIXED   retq\n\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            src_rc = survivors([surv])
+        txt = buf.getvalue()
+        checks.append(("--survivors prints the NAMED rows, role included",
+                       src_rc == 0 and "2 survivor row(s)" in txt
+                       and "SELF@1" in txt and "FIXED" in txt,
+                       "rc=%d" % src_rc))
+        checks.append(("--survivors FAILS on a file with no survivor block",
+                       survivors([absent], quiet=True) != 0,
+                       "a reader that cannot find its subject must fail"))
+
         # #327: the reading must carry the directory it was taken from, and
         # the stamp must actually MOVE when the directory does -- a constant
         # string would satisfy a grep and prove nothing.
@@ -239,12 +318,18 @@ def main():
                     help="fail when the UNJUSTIFIED total exceeds N; this is "
                          "the R12.1 named-survivor budget for a source-list "
                          "flip, and it only means anything with a stated tip")
+    ap.add_argument("--survivors", action="store_true",
+                    help="print the NAMED survivor rows the UNJUSTIFIED "
+                         "column counts -- decode id, rule, register, role "
+                         "and mnemonic -- instead of the column table")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
     if not args.stats:
         L.die_usage("usage: srccov_census.py <stats.log>...")
+    if args.survivors:
+        return survivors(args.stats)
     rc, out = census(args.stats)
     if rc:
         return rc

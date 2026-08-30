@@ -847,13 +847,32 @@ def net_validate(build: Path, root: Path, waivers: dict,
               f"({only}).  A gate with no subject is a failure, not a pass.",
               file=sys.stderr)
         return 2
-    if root.exists():
-        shutil.rmtree(root)
+
+    # CLEAR ONLY WHAT THIS RUN IS ABOUT TO REGENERATE.
+    #
+    # This used to be `shutil.rmtree(root)` -- the whole netval root, after
+    # the --only subset had already been computed two lines above.  A run
+    # with `--only w3_coverage w8_repregs` therefore destroyed the sidecars
+    # of the other seven workloads, and those sidecars are the SOURCE CORPUS
+    # `tools/gen_src_survivors.py` derives the survivor table from.  The
+    # gate that produces the corpus was deleting it, on every subset run,
+    # which is how the table came to carry rows from two workloads and none
+    # from the other seven (exec54 3c; PASS 28's "survivor-table input
+    # destruction", now localized to this line).
+    #
+    # A cell directory still has to be cleared before it is re-run -- a
+    # stale .cst left beside a fresh one is a different silent-false-success
+    # -- so the removal is per-workload and happens where the workload is
+    # named.  Nothing outside the subset is touched.
+    root.mkdir(parents=True, exist_ok=True)
     fails, ran = [], 0
     for wl in wls:
         name = wl["name"]
         extra = (FAULT_ARG,) if fault == name else ()
-        rc = run_all(build, wl, root / name, extra_args=extra)
+        cell = root / name
+        if cell.exists():
+            shutil.rmtree(cell)
+        rc = run_all(build, wl, cell, extra_args=extra)
         ran += 1
         base = baselines.get(name, 0)
         verdict = "PASS" if rc == base else "FAIL"

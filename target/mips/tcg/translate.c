@@ -2440,6 +2440,44 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
 
 
 /* Store conditional */
+/*
+ * The base register a PREFETCH computes its effective address from.
+ *
+ * Every PREF form QEMU implements is "Treat as NOP" -- a prefetch has no
+ * architectural effect a functional emulator has to model, so the arms below
+ * emit no op at all and QEMU's ordered read list for the instruction is
+ * EMPTY.  The instruction still READS the base register: the encoding names
+ * it and the architecture defines the effective address as base + offset.
+ * R2 records ARCHITECTURAL dependencies and R15 says a lowering choice --
+ * here, the choice to lower a prefetch to nothing -- is not architectural
+ * truth, so the read is stated here, where the register number is known.
+ *
+ * PREFX indexes with a register instead of an immediate and therefore reads
+ * TWO: @index is that second register, or -1 for the immediate-offset forms.
+ *
+ * A $zero operand takes the zero note for the same reason gen_logic()'s
+ * folding arms do: cpu_gpr[0] is not a real global and calling the accessor
+ * for a temp to hang a note on would emit a dead constant.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_pref_note_operands(int base, int index)
+{
+    if (base == 0) {
+        insn_dataflow_note_folded_read_zero();
+    } else {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[base]));
+    }
+    if (index < 0) {
+        return;
+    }
+    if (index == 0) {
+        insn_dataflow_note_folded_read_zero();
+    } else {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[index]));
+    }
+}
+
 static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
                         MemOp tcg_mo, bool eva)
 {
@@ -3277,6 +3315,28 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_OR ? MIPS_ID_OPC_OR :
             MIPS_ID_NONE);
+        /*
+         * `move rd,rs` IS `or rd,rs,$zero` -- the assembler's idiom and the
+         * one the compiler emits -- and every arm below with a zero operand
+         * folds it away: cpu_gpr[0] is never touched, so no op reads it and
+         * QEMU's ordered read list is short by a register the ENCODING
+         * names.  R7.3/R15 rule that absence the emulator's lowering choice
+         * and not the machine's; OPC_NOR above and OPC_ADDU in gen_arith()
+         * already say exactly this about `not rd,rs` and `move rd,rs`'s
+         * other spelling.  One statement even when BOTH operands are $zero:
+         * the read set is a set and they are the same register.
+         *
+         * IT IS SAID HERE AND NOT IN A TABLE.  A survivor table is keyed on
+         * the DECODE IDENTITY, and `or $v0,$a0,$a1` and `or $v0,$a0,$zero`
+         * share it, so a constant row would hand the three-register form a
+         * REG_ZERO source it does not have.  The condition is a property of
+         * the ENCODING and only the decoder can test it.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_or_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -16621,7 +16681,8 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
             /* hint codes 24-31 are reserved and signal RI */
             gen_reserved_instruction(ctx);
         }
-        /* Treat as NOP. */
+        /* Treat as NOP.  See gen_pref_note_operands() for the read it hides. */
+        gen_pref_note_operands(rs, -1);
         break;
     case R6_OPC_CACHE:
         mips_ident(ctx,
@@ -17801,7 +17862,8 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
                 op1 == OPC_PREFE ? MIPS_ID_OPC_PREFE :
                 MIPS_ID_NONE);
             check_cp0_enabled(ctx);
-            /* Treat as NOP. */
+            /* Treat as NOP.  See gen_pref_note_operands(). */
+            gen_pref_note_operands(rs, -1);
             return;
         }
     }
@@ -18500,7 +18562,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             op == OPC_PREF ? MIPS_ID_OPC_PREF :
             MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 | INSN_R5900);
-        /* Treat as NOP. */
+        /* Treat as NOP.  See gen_pref_note_operands(). */
+        gen_pref_note_operands(rs, -1);
         break;
 
     /* Floating point (COP1). */
@@ -18842,7 +18905,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                     op1 == OPC_PREFX ? MIPS_ID_OPC_PREFX :
                     MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
-                /* Treat as NOP. */
+                /* Treat as NOP.  See gen_pref_note_operands(). */
+                gen_pref_note_operands(rs, rt);
                 break;
             case OPC_ALNV_PS:
                 mips_ident(ctx,

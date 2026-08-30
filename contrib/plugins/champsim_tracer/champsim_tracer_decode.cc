@@ -1106,6 +1106,24 @@ static const char *const g_qsh_col_name[CST_QSH_COLS] = {
     "opcode", "branch_type", "flags", "refine",
     "dep_refine", "lane_mask_kind", "lane_parallel",
 };
+/*
+ * The OPEN CLASS a column's standing disagreement belongs to, or nullptr
+ * when it has none.  Printed beside the count so a number with a filed
+ * question does not read as an unexplained one -- and, just as much, so a
+ * column with NO entry here reads as the finding it would be.  See the
+ * NAMED OPEN CLASSES block in qemu_ident_shadow_report() for the question
+ * itself; this table is only the tag.
+ */
+static const char *const g_qsh_col_open_class[CST_QSH_COLS] = {
+    nullptr,                       /* opcode */
+    "(a filed class covers PART of this column: #290 -- see below, and "
+    "check the subject)",
+    nullptr,                       /* flags */
+    nullptr,                       /* refine */
+    nullptr,                       /* dep_refine */
+    nullptr,                       /* lane_mask_kind */
+    nullptr,                       /* lane_parallel */
+};
 static std::atomic<uint64_t> g_qsh_insns{0};       /* classify calls */
 static std::atomic<uint64_t> g_qsh_both{0};        /* both keys answered */
 static std::atomic<uint64_t> g_qsh_agree{0};       /* ... and agreed on all */
@@ -1280,10 +1298,95 @@ void qemu_ident_shadow_report(GString *report)
 
     g_string_append_printf(report, "  per-column disagreements:\n");
     for (unsigned c = 0; c < CST_QSH_COLS; c++) {
-        g_string_append_printf(report, "    %-16s %10" PRIu64 "\n",
-                               g_qsh_col_name[c],
-                               g_qsh_col[c].load(std::memory_order_relaxed));
+        uint64_t n = g_qsh_col[c].load(std::memory_order_relaxed);
+        const char *cls = g_qsh_col_open_class[c];
+
+        g_string_append_printf(report, "    %-16s %10" PRIu64 "%s%s\n",
+                               g_qsh_col_name[c], n,
+                               (n && cls) ? "   " : "",
+                               (n && cls) ? cls : "");
     }
+    /*
+     * THE NAMED OPEN CLASSES, and why a standing number gets a name here.
+     *
+     * A non-zero column with a FILED adjudication question is not an
+     * unexplained number, and printing it bare invites every reader to
+     * rediscover it: the aarch64 branch_type column has stood at ~13.6k
+     * across passes and has been re-derived as a new finding more than
+     * once.  The tag above says which class a column's rows belong to; the
+     * block below states the question, and the mnemonics measured under
+     * that column in THIS run are printed with it so the tag is checked
+     * against the data rather than asserted over it.
+     *
+     * A column with NO tag and a non-zero count has no filed question, and
+     * that is exactly the case a reader should treat as a finding.
+     */
+    g_string_append_printf(report,
+        "  NAMED OPEN CLASSES behind the columns above.  A standing\n"
+        "  disagreement with a FILED question is not an unexplained number\n"
+        "  and should stop being re-derived as a new finding; a non-zero\n"
+        "  column with NO entry here, or a row outside a named class's\n"
+        "  stated subject, IS one.  The subject is printed under each class\n"
+        "  so the tag is checked against this run's data rather than\n"
+        "  asserted over it.\n"
+        "    branch_type   #290 OPEN, and NARROW.  Its subject is the\n"
+        "                  aarch64 UDF decode rule ALONE: down a wrong-path\n"
+        "                  excursion the walker reaches bytes that decode as\n"
+        "                  `udf`, the identity key and the enum row disagree\n"
+        "                  on whether that is a control transfer, and the\n"
+        "                  adjudication rule written for `svc` is keyed on\n"
+        "                  the decode rule so it does not reach UDF.  It was\n"
+        "                  measured at 2 rows, WRONG-PATH ONLY -- the same\n"
+        "                  audit at wp=0 reads 0 for it.  #290 therefore\n"
+        "                  explains `udf` rows and NOTHING ELSE in this\n"
+        "                  column.\n");
+    g_mutex_lock(&g_qsh_sig_lock);
+    {
+        unsigned c = 1;                 /* branch_type */
+        bool any = false;
+        uint64_t named = 0, unnamed = 0;
+
+        g_string_append_printf(report,
+            "    THE COLUMN'S ACTUAL SUBJECT IN THIS RUN, so the tag above "
+            "can be checked:\n");
+        for (unsigned i = 0; i < g_qsh_nsig; i++) {
+            const char *m;
+            bool is_udf;
+
+            if (!(g_qsh_sig[i].cols & (1u << c))) {
+                continue;
+            }
+            any = true;
+            m = g_qsh_sig[i].mnem[0] ? g_qsh_sig[i].mnem : "-";
+            is_udf = (g_strcmp0(m, "udf") == 0);
+            if (is_udf) {
+                named += g_qsh_sig[i].count;
+            } else {
+                unnamed += g_qsh_sig[i].count;
+            }
+            g_string_append_printf(report,
+                "      %-16s decode_id=0x%08x n=%-8" PRIu64 " %s\n",
+                m, g_qsh_sig[i].decode_id, g_qsh_sig[i].count,
+                is_udf ? "#290" : "NOT #290 -- no filed class");
+        }
+        if (!any) {
+            g_string_append_printf(report,
+                "      (none -- the column is 0 on this target, or its rows "
+                "did not reach the signature table)\n");
+        } else {
+            g_string_append_printf(report,
+                "      attributed to #290 %" PRIu64 ", NOT attributed %"
+                PRIu64 ".\n"
+                "      A NOT-attributed count is NOT covered by the tag "
+                "above.  It is\n"
+                "      the population an adjudication still has to be "
+                "written for, and\n"
+                "      quoting #290 over it is the mis-attribution this "
+                "split exists to\n"
+                "      prevent.\n", named, unnamed);
+        }
+    }
+    g_mutex_unlock(&g_qsh_sig_lock);
 
     g_mutex_lock(&g_qsh_sig_lock);
     g_string_append_printf(report,

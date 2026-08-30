@@ -673,6 +673,40 @@ static bool trans_ori(DisasContext *ctx, arg_ori *a)
     return gen_logic_imm_fn(ctx, a, tcg_gen_ori_tl);
 }
 
+/*
+ * Zicbop PREFETCH.I / PREFETCH.R / PREFETCH.W.
+ *
+ * The architecture puts these three inside the ORI encoding at rd=x0, and
+ * a prefetch is a HINT: nothing architectural is observable, which is also
+ * true of the `ori x0, rs1, imm` those bits already were.  QEMU's behaviour
+ * is therefore deliberately unchanged -- each form runs the identical body,
+ * reads rs1, and discards the write to x0.
+ *
+ * They are separate decode RULES because the architecture defines them as
+ * separate instructions and separates them by a fixed field, and a rule is
+ * what qemu_plugin_insn_decode_id() reports.  Before this, `ori` answered
+ * for all four and could not say which of them it had decoded.
+ *
+ * No extension predicate: without Zicbop these encodings are a HINT the
+ * base ISA already allows and QEMU already executed as this ori, so gating
+ * them would make a currently-legal encoding illegal, which is a behaviour
+ * change and not what this is.
+ */
+static bool trans_prefetch_i(DisasContext *ctx, arg_prefetch_i *a)
+{
+    return trans_ori(ctx, a);
+}
+
+static bool trans_prefetch_r(DisasContext *ctx, arg_prefetch_r *a)
+{
+    return trans_ori(ctx, a);
+}
+
+static bool trans_prefetch_w(DisasContext *ctx, arg_prefetch_w *a)
+{
+    return trans_ori(ctx, a);
+}
+
 static bool trans_andi(DisasContext *ctx, arg_andi *a)
 {
     return gen_logic_imm_fn(ctx, a, tcg_gen_andi_tl);

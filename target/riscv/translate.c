@@ -804,6 +804,23 @@ EX_SH(3)
 EX_SH(4)
 EX_SH(12)
 
+/*
+ * Zicbop.  A prefetch is the ORI encoding with rd=x0, and the low five bits
+ * of its immediate are the form selector rather than free immediate bits.
+ * The pattern fixes those five, so the remaining seven (imm[11:5]) are
+ * re-assembled here into the very immediate @i would have extracted -- the
+ * selector included, because that is what those bits are in the ori the
+ * encoding still is.
+ */
+#define EX_PREFETCH(sel) \
+    static int ex_prefetch_sel##sel(DisasContext *ctx, int imm) \
+    {                                                           \
+        return (imm << 5) | sel;                                \
+    }
+EX_PREFETCH(0)
+EX_PREFETCH(1)
+EX_PREFETCH(3)
+
 #define REQUIRE_EXT(ctx, ext) do { \
     if (!has_ext(ctx, ext)) {      \
         return false;              \

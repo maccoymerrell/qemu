@@ -5455,37 +5455,23 @@ QID_ADJUDICATIONS: dict[tuple[str, int], tuple[str, str]] = {
                      "None,None, V,x, vex4_unal) -- as 0x1ef, store "
                      "direction"),
 
-    # decode_insn32/ori (0x8046d85c) IS NOT ADJUDICATED, and the reason is
-    # a measurement, because it looks adjudicable and is not.
+    # decode_insn32/ori (0x8046d85c) WAS a QID_SPLIT.  It is not adjudicated
+    # now either -- because there is nothing left to adjudicate.
     #
-    # QEMU's decode file appears to settle it outright.  insn32.decode:153,
-    # the line directly above the ori pattern, says in words:
+    # The note that stood here recorded, at length, why adjudicating the three
+    # Zicbop prefetches to `ori` was REAL-LOST under R12.1: the adjudication
+    # was written, applied and MEASURED, and 101 wire rows stopped saying
+    # PREFETCH and started saying OR, which the validator's own coverage cell
+    # caught.  QEMU not modelling Zicbop was an EMULATOR GAP, not a statement
+    # that a prefetch is an or.  The note ended: "It retires when QEMU decodes
+    # Zicbop, not before."
     #
-    #   # cbo.prefetch_{i,r,m} instructions are ori with rd=x0 and not
-    #   # decoded.
-    #
-    # There is no prefetch row anywhere in riscv's decode tables, so on the
-    # letter of "what rule did the emulator dispatch on" the answer is ori
-    # and the GEN_OP_PREFETCH candidate is refuted.  That adjudication was
-    # WRITTEN, APPLIED and MEASURED, and the wire's own acceptance caught
-    # it: the validator coverage cell reports
-    #
-    #   opcode_assertion: blk_34 (probe_riscv_prefetch): expected a
-    #   PREFETCH instruction in its template insns but saw only
-    #   ['BRANCH', 'OR']
-    #
-    # 101 rows in the four-ISA wire corpus stop saying PREFETCH and start
-    # saying OR.  That is REAL-LOST under R12.1 and it does not become
-    # acceptable by being derivable from a QEMU comment: QEMU not modelling
-    # Zicbop is an EMULATOR GAP, not a statement that a prefetch is an or,
-    # and the standing ruling on upstream gaps is that they are reported as
-    # gaps rather than absorbed as tracer answers.  The Capstone key is
-    # genuinely finer here and carries information QEMU's rule does not.
-    #
-    # So the row stays QID_SPLIT -- it states that this identity does not
-    # determine the classification -- and the survivor keeps publishing the
-    # per-instance answer it publishes today.  It retires when QEMU decodes
-    # Zicbop, not before.
+    # QEMU decodes Zicbop.  insn32.decode carries prefetch_i / prefetch_r /
+    # prefetch_w as three patterns of their own, each a decode rule with its
+    # own identity, and `ori` answers only for an ori.  The gap is closed at
+    # the emulator rather than absorbed as a tracer answer, which is what the
+    # standing ruling on upstream gaps asks for, and the note retires with the
+    # fix it named.
 
     # 0x2b918996 = insn16.decode:173
     #   slli            000 .  .....  ..... 10 @c_shift2

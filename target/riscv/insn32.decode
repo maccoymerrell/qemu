@@ -150,8 +150,32 @@ addi     ............     ..... 000 ..... 0010011 @i
 slti     ............     ..... 010 ..... 0010011 @i
 sltiu    ............     ..... 011 ..... 0010011 @i
 xori     ............     ..... 100 ..... 0010011 @i
-# cbo.prefetch_{i,r,m} instructions are ori with rd=x0 and not decoded.
-ori      ............     ..... 110 ..... 0010011 @i
+# Zicbop.  PREFETCH.I / PREFETCH.R / PREFETCH.W live INSIDE the ORI encoding:
+# rd=x0, and the low five bits of the immediate -- the bits an R-type would
+# spend on rs2 -- select which of the three it is.  They are three
+# instructions the architecture defines and separates by a fixed field, so
+# they are three decode rules; one `ori` pattern for all four cannot say
+# which it decoded.  The specific patterns go first, as every other carve-out
+# in this file is written, and the general pattern's own fixed bits are
+# untouched so the identity it publishes does not move.
+#
+# @i extracts rd and the whole 12-bit immediate, and decodetree refuses a
+# pattern that fixes bits its own format reads, so each prefetch supplies
+# rd=0 and rebuilds the SAME immediate @i would have produced from the seven
+# bits it leaves free plus its own selector.  Same &i argument set, same
+# values, and all three reach trans_ori's body: a prefetch is architecturally
+# a hint, QEMU already executed these encodings as an ori into x0 whose
+# result is discarded, and that is unchanged here.  What is new is the
+# identity.
+%imm_prefetch_i  25:s7 !function=ex_prefetch_sel0
+%imm_prefetch_r  25:s7 !function=ex_prefetch_sel1
+%imm_prefetch_w  25:s7 !function=ex_prefetch_sel3
+{
+  prefetch_i ....... 00000 ..... 110 00000 0010011 &i imm=%imm_prefetch_i %rs1 rd=0
+  prefetch_r ....... 00001 ..... 110 00000 0010011 &i imm=%imm_prefetch_r %rs1 rd=0
+  prefetch_w ....... 00011 ..... 110 00000 0010011 &i imm=%imm_prefetch_w %rs1 rd=0
+  ori      ............     ..... 110 ..... 0010011 @i
+}
 andi     ............     ..... 111 ..... 0010011 @i
 slli     00000. ......    ..... 001 ..... 0010011 @sh
 srli     00000. ......    ..... 101 ..... 0010011 @sh

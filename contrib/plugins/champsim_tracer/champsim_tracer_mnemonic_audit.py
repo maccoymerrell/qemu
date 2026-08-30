@@ -1376,6 +1376,7 @@ X86_SSE_LEGACY_MNEM_PREFIXES: tuple[str, ...] = (
     "DPPS", "DPPD",
     "INSERTPS", "EXTRACTPS",
     "HADDPS", "HADDPD", "HSUBPS", "HSUBPD",
+    "ADDSUBPS", "ADDSUBPD",
     "ROUNDPS", "ROUNDPD", "ROUNDSS", "ROUNDSD",
     # SSE/SSE2 packed integer — the "P*" family.  These ALL operate
     # on XMM (or MMX); none of them shadow GPR ops.
@@ -1403,7 +1404,9 @@ X86_CROSS_LANE_PREFIXES: tuple[str, ...] = (
     "VPEXTR", "VPINSR", "PEXTR", "PINSR",
     "VPMOVSX", "VPMOVZX", "PMOVSX", "PMOVZX",
     "VPACKS", "VPACKU", "PACKS", "PACKU",
-    "VUNPCK", "PUNPCK", "VPUNPCK",
+    "VUNPCK", "PUNPCK", "VPUNPCK", "UNPCK",
+    "MOVMSK", "VMOVMSK", "PMOVMSK", "VPMOVMSK",
+    "EXTRACTPS", "INSERTPS",
     "VPSADBW", "PSADBW",
     "VDPPS", "VDPPD", "DPPS", "DPPD",
     "VPMADDWD", "PMADDWD",
@@ -1412,16 +1415,45 @@ X86_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 
 
 def classify_x86_lane(const_name: str,
-                      variants: tuple) -> tuple[str, bool] | None:
+                      variants: tuple,
+                      by_canon: dict,
+                      gen_op: str) -> tuple[str, bool] | None:
     name = const_name.removeprefix("X86_INS_")
     # (a) Capstone variant gate: AVX/EVEX width markers,
     #     MMX_ prefix, or AVX V<mnemonic>...  (canonical names
     #     starting with "V" cover the entire AVX/EVEX family).
-    has_variant_vec_marker = any(
-        any(m in v.internal for m in X86_VARIANT_VEC_MARKERS) or
-        v.internal.startswith("X86_V")
+    has_width_marker = any(
+        any(m in v.internal for m in X86_VARIANT_VEC_MARKERS)
         for v in variants
     )
+    has_vex_variant = any(v.internal.startswith("X86_V") for v in variants)
+    # The VEX/EVEX prefix is an ENCODING fact.  `vldmxcsr` loads the same
+    # 32-bit control word as `ldmxcsr` and `vucomisd` compares the same
+    # low element as `ucomisd` -- neither grew a lane by being VEX-encoded.
+    # Taking `X86_V...` as evidence of vector-ness gave one architectural
+    # operation two different lane answers depending on how it was spelled,
+    # measured on 19 twin pairs in this table (EXEC61).  So when the
+    # VEX-stripped base is itself a Capstone canonical, the base decides:
+    # a base the legacy test rejects is not made vector by the prefix.  A
+    # VEX-only mnemonic (no legacy twin) keeps the prefix as its marker,
+    # since there is no base to consult.
+    # The demotion needs affirmative evidence that the operation is not
+    # vector, and the legacy list alone is not that: it is a coverage list,
+    # and a base absent from it (PHADDD, MOVD, MASKMOVDQU) may still be
+    # packed.  Demoting on the list alone dropped six VPHADD/VPHSUB rows
+    # to the GEN_OP_VEC_* fallback, which re-promoted them to
+    # lane_parallel=true -- a cross-lane op relabelled element-wise, the
+    # one direction this file calls unsafe.  So the opcode classifier has
+    # to agree the operation is not vector before the prefix is discounted.
+    if (has_vex_variant and name.startswith("V")
+            and not gen_op.startswith("GEN_OP_VEC_")):
+        base = "X86_INS_" + name[1:]
+        if base in by_canon:
+            base_name = name[1:]
+            if not any(base_name.startswith(p)
+                       for p in X86_SSE_LEGACY_MNEM_PREFIXES):
+                has_vex_variant = False
+    has_variant_vec_marker = has_width_marker or has_vex_variant
     # (b) Legacy SSE/MMX fallback: variants carry no width marker
     #     (XMM is implied) but the canonical mnemonic itself
     #     uniquely names a vector family.
@@ -1498,7 +1530,9 @@ AARCH64_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 
 
 def classify_aarch64_lane(const_name: str,
-                          variants: tuple) -> tuple[str, bool] | None:
+                          variants: tuple,
+                          by_canon: dict,
+                          gen_op: str) -> tuple[str, bool] | None:
     name = const_name.removeprefix("AARCH64_INS_")
     by_variant = any(_aarch64_variant_is_vec(v.internal) for v in variants)
     by_name = any(name == p or name.startswith(p)
@@ -1538,7 +1572,9 @@ RISCV_V_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 
 
 def classify_riscv_lane(const_name: str,
-                        variants: tuple) -> tuple[str, bool] | None:
+                        variants: tuple,
+                        by_canon: dict,
+                        gen_op: str) -> tuple[str, bool] | None:
     name = const_name.removeprefix("RISCV_INS_")
     # vset* are config insns, not vec data ops.
     if name.startswith("VSET"):
@@ -1584,7 +1620,9 @@ def _mips_variant_is_msa(internal: str) -> bool:
 
 
 def classify_mips_lane(const_name: str,
-                       variants: tuple) -> tuple[str, bool] | None:
+                       variants: tuple,
+                       by_canon: dict,
+                       gen_op: str) -> tuple[str, bool] | None:
     name = const_name.removeprefix("MIPS_INS_")
     if not any(name.endswith(s) for s in MSA_LANE_SUFFIXES):
         return None
@@ -1652,7 +1690,8 @@ def classify_lane_info(info: IsaInfo,
     result = None
     if fn is not None:
         variants = _variants_by_canonical(info.key).get(const_name, ())
-        result = fn(const_name, variants)
+        result = fn(const_name, variants,
+                    _variants_by_canonical(info.key), gen_op)
     if result is not None:
         return result
     if gen_op.startswith("GEN_OP_VEC_"):

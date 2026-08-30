@@ -69,6 +69,12 @@
 # Formats 16:
 @cr        ....  ..... .....  .. &r      rs2=%rs2_5       rs1=%rd     %rd
 @ci        ... . ..... .....  .. &i      imm=%imm_ci      rs1=%rd     %rd
+# C.NOP: @ci with rd fixed to x0.  The rd bits are FIXED BY THE PATTERN,
+# so the format must supply rd (and rs1, which @ci derives from it)
+# rather than extract them -- decodetree refuses a pattern that fixes
+# bits its own format reads.  Same &i argument set, same values, so
+# trans_addi is reached with exactly what it was reached with before.
+@c_nop     ... . ..... .....  .. &i      imm=%imm_ci      rs1=0       rd=0
 @cl_q      ... . .....  ..... .. &i      imm=%uimm_cl_q   rs1=%rs1_3  rd=%rs2_3
 @cl_d      ... ... ... .. ... .. &i      imm=%uimm_cl_d   rs1=%rs1_3  rd=%rs2_3
 @cl_w      ... ... ... .. ... .. &i      imm=%uimm_cl_w   rs1=%rs1_3  rd=%rs2_3
@@ -137,7 +143,24 @@ sw                110  ... ... .. ... 00 @cs_w
 }
 
 # *** RV32/64C Standard Extension (Quadrant 1) ***
-addi              000 .  .....  ..... 01 @ci
+{
+  # C.NOP IS C.ADDI WITH rd=x0.  The manual defines them as two
+  # instructions in one encoding and the difference is a fixed field, not a
+  # spelling: rd=00000 is C.NOP (nzimm=0 canonical, nzimm!=0 a HINT), any
+  # other rd is C.ADDI.  Both reach trans_addi and QEMU's behaviour is
+  # unchanged -- writing x0 was already discarded.
+  #
+  # They are two PATTERNS so that they are two decode RULES, which is what
+  # gives each its own identity: a plugin keying on the one rule saw the
+  # disassembler name it sometimes c.addi and sometimes c.nop and could not
+  # tell which, so the rule stated no classification at all.  The more
+  # specific pattern goes first, which is how every other carve-out in this
+  # file is written.  The general pattern's own fixed bits are untouched, so
+  # the identity it already publishes -- decode_insn16/addi@000...........01
+  # -- does not move.
+  addi            000 .  00000  ..... 01 @c_nop
+  addi            000 .  .....  ..... 01 @ci
+}
 addi              010 .  .....  ..... 01 @c_li
 {
   # c.sspush x1 carving out of zcmops

@@ -607,6 +607,27 @@ static bool trans_addi(DisasContext *ctx, arg_addi *a)
     if (ctx->cur_insn_len == 2 && (ctx->opcode & 0xf003) == 0x8002) {
         insn_dataflow_note_folded_read_zero();
     }
+    /*
+     * AND rs1, when the lowering of `mv rd,rd` erases it too.
+     *
+     * `tcg_gen_addi_tl(dest, src1, 0)` is `tcg_gen_mov_tl(dest, src1)`, and
+     * that emits NOTHING when dest == src1.  So `mv a0,a0` -- whether spelled
+     * `c.mv a0,a0` or `addi a0,a0,0` -- produces no op at all: the read of
+     * rs1 goes with the write, and QEMU's ordered read list for the
+     * instruction is the zero register alone (on the compressed form) or
+     * empty (on the 32-bit one).  R7.3/R15: the register the encoding names
+     * is not the emulator's to drop, and neither is the one its lowering
+     * happened to make redundant.
+     *
+     * Guarded on the elision itself.  Every other `addi` emits an op that
+     * reads rs1 and the op walk states it; rs1 == 0 is the zero register,
+     * which get_gpr() already notes at its own accessor.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (a->imm == 0 && a->rd == a->rs1 && a->rs1 != 0) {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[a->rs1]));
+    }
     return gen_arith_imm_fn(ctx, a, EXT_NONE, tcg_gen_addi_tl, gen_addi2_i128);
 }
 

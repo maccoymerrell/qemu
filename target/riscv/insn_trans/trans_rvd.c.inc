@@ -268,6 +268,24 @@ static bool trans_fsgnj_d(DisasContext *ctx, arg_fsgnj_d *a)
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     if (a->rs1 == a->rs2) { /* FMOV */
         dest = get_fpr_d(ctx, a->rs1);
+        /*
+         * `fmv.d fd,fs` IS `fsgnj.d fd,fs,fs`, and on the FMOV path the whole
+         * instruction is a move: dest becomes cpu_fpr[rs1] and gen_set_fpr_d()
+         * below lowers to `tcg_gen_mov_i64(cpu_fpr[rd], cpu_fpr[rs1])`, which
+         * emits NOTHING when rd == rs1.  `fmv.d f0,f0` therefore leaves no op
+         * at all -- no read of the source register the encoding names twice,
+         * and no write either -- so QEMU's ordered read list for it is empty.
+         * R7.3/R15: that absence is the emulator's lowering choice, not the
+         * machine's.
+         *
+         * Guarded on the elision: rd != rs1 emits the mov and the op walk
+         * states the read.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (a->rd == a->rs1) {
+            insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_fpr[a->rs1]));
+        }
     } else {
         TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
         TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);

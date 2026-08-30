@@ -8858,6 +8858,34 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
          */
         insn_dataflow_note_folded_read_zero();
 
+        /*
+         * AND Rm, when the lowering of `mov xd,xd` erases it entirely.
+         *
+         * `tcg_gen_mov_i64(ret, arg)` emits NOTHING when ret == arg, so for
+         * the identity move -- `mov x0,x0`, which is `orr x0,xzr,x0` -- this
+         * whole arm produces no op at all: no read of Rm, and no write of Rd
+         * either.  QEMU's ordered read list for the instruction is then the
+         * zero register alone, and Rm, which the encoding names as plainly as
+         * it does on `mov x1,x2`, is gone.  R7.3/R15: that absence is the
+         * emulator's lowering choice, not the machine's.
+         *
+         * GUARDED ON THE ELISION, the way gen_logic()'s and gen_arith()'s
+         * mips arms are guarded on their zero fold: every other path through
+         * here (`mvn`, the 32-bit `ext32u` form, rd != rm) emits an op that
+         * reads Rm, and the op walk states it.  Stating it twice would be
+         * harmless -- the read set is a set -- but a note that has a subject
+         * only in the case it exists for is the one that can be tested.
+         *
+         * Rm == 31 cannot reach here with anything to say: cpu_reg(s, 31)
+         * mints a fresh zero constant, so ret != arg, the mov IS emitted, and
+         * the zero register is already stated above.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (!a->n && a->sf && a->rd == a->rm && a->rm != 31) {
+            insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_X[a->rm]));
+        }
+
         if (a->n) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);
             if (!a->sf) {

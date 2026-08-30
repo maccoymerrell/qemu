@@ -2986,7 +2986,29 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         /*
          * If no destination, treat it as a NOP.
          * For add & sub, we must generate the overflow exception when needed.
+         *
+         * AND THE READS, which that NOP erases.  `addu $zero,$t0,$t1` is a
+         * real instruction whose encoding names $t0 and $t1 as sources; the
+         * emulator may drop the WRITE, because nothing can read $zero back,
+         * but R7.3/R15 do not let it drop the operands with it.  With no op
+         * emitted the walk sees nothing at all, so the read set for the whole
+         * instruction is empty while the wire publishes the registers the
+         * encoding named.  gen_logic()'s own rd == 0 arm has said exactly
+         * this since be84cc6598; this is the arithmetic half of it, and it
+         * adds the zero-register operand of a two-operand form, which the
+         * wire DOES carry here (`addu $zero,$zero,$zero`).
+         *
+         * Capture only; no op is emitted, altered or suppressed.
          */
+        if (rs != 0) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
+        }
+        if (rt != 0) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
+        }
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         return;
     }
 
@@ -3042,6 +3064,28 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
          */
         if (rs == 0 || rt == 0) {
             insn_dataflow_note_folded_read_zero();
+        }
+        /*
+         * AND THE SURVIVING OPERAND, when `move rd,rd` erases it too.
+         *
+         * The two mov arms below go through `tcg_gen_mov_tl(cpu_gpr[rd],
+         * cpu_gpr[rX])`, which emits NOTHING when rd == rX.  `move $t0,$t0`
+         * -- `addu $t0,$t0,$zero` -- therefore leaves NO op at all: the zero
+         * note above is the entire ordered read list, and rX, which the
+         * encoding names as plainly as it does on `move $t0,$t1`, is gone
+         * with the write.  R7.3/R15: that absence is the emulator's lowering
+         * choice, not the machine's.
+         *
+         * Guarded on the elision, like the zero fold above it: every other
+         * path here emits an op that reads rX and the op walk states it.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rd != 0 && rs == 0 && rt == rd) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
+        }
+        if (rd != 0 && rt == 0 && rs == rd) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
         }
         if (rs != 0 && rt != 0) {
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
@@ -3360,6 +3404,28 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
          */
         if (rs == 0 || rt == 0) {
             insn_dataflow_note_folded_read_zero();
+        }
+        /*
+         * AND THE SURVIVING OPERAND, when `move rd,rd` erases it too.
+         *
+         * The two mov arms below go through `tcg_gen_mov_tl(cpu_gpr[rd],
+         * cpu_gpr[rX])`, which emits NOTHING when rd == rX.  `move $t0,$t0`
+         * -- `or $t0,$t0,$zero` -- therefore leaves NO op at all: the zero
+         * note above is the entire ordered read list, and rX, which the
+         * encoding names as plainly as it does on `move $t0,$t1`, is gone
+         * with the write.  R7.3/R15: that absence is the emulator's lowering
+         * choice, not the machine's.
+         *
+         * Guarded on the elision, like the zero fold above it: every other
+         * path here emits an op that reads rX and the op walk states it.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rd != 0 && rs == 0 && rt == rd) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
+        }
+        if (rd != 0 && rt == 0 && rs == rd) {
+            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
         }
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_or_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);

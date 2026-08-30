@@ -2090,6 +2090,29 @@ static bool trans_vmv_v_v(DisasContext *s, arg_vmv_v_v *a)
         vext_check_isa_ill(s) &&
         /* vmv.v.v has rs2 = 0 and vm = 1 */
         vext_check_sss(s, a->rd, a->rs1, 0, 1)) {
+        /*
+         * `vmv.v.v vd,vd` erases itself.  tcg_gen_gvec_mov() emits nothing
+         * when dofs == aofs, and the helper path below is reached only when
+         * the vector length is dynamic, so the identity move leaves NO op:
+         * no read of the source vector register the encoding names, and no
+         * write of the destination.  QEMU's ordered read list for it is
+         * empty while the wire publishes the register.  R7.3/R15: the
+         * absence is the emulator's lowering choice, not the machine's.
+         *
+         * Stated for BOTH lowerings by construction, so the read set does
+         * not depend on which one this translation took -- a regime-shaped
+         * dataflow answer is a defect this tree has had to fix before -- and
+         * guarded on the elision, so it has a subject only where the op walk
+         * has none.  The vector register file is an env byte range with no
+         * TCG global, so the note names it through the same accessor the
+         * ordinary path uses -- insn_dataflow_note_stated_read_env(), the form
+         * whose range IS the register.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (a->rd == a->rs1) {
+            insn_dataflow_note_stated_read_env(vreg_ofs(s, a->rs1), MAXSZ(s));
+        }
         if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
             tcg_gen_gvec_mov(s->sew, vreg_ofs(s, a->rd),
                              vreg_ofs(s, a->rs1),

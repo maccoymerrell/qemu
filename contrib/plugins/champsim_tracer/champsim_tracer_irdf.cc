@@ -420,6 +420,22 @@ uint8_t fold_nonarch(const char *name)
         !strcmp(name, "userlocal")) {    /* mipsel, CP0_UserLocal     */
         return REG_TLS;
     }
+    /*
+     * The FP/SIMD EXECUTION-ENABLE GATE, which is a source of every
+     * instruction it gates (R7.4) and which QEMU resolves at translation
+     * time -- so it arrives as a DECLARED RANGE stated by
+     * fp_access_check_only(), never as a global an op walk could find.
+     *
+     * REG_SYSFPEN is the vocabulary's existing word for it and names it in
+     * those terms already (champsim_tracer_generic_ids.h: "FP / vector
+     * execution-enable gate"), so this connects a spelling to a word rather
+     * than inventing either.  CPTR_EL2 and CPTR_EL3 are the same gate at the
+     * higher exception levels and would reach the same word; the statement
+     * names CPACR_EL1 alone and says why at the site.
+     */
+    if (!strcmp(name, "cpacr_el1")) {
+        return REG_SYSFPEN;
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

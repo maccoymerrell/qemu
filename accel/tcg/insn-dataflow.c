@@ -262,6 +262,15 @@ typedef struct DfEncReadNote {
      */
     const TCGOp *anchor;
     uint8_t zero;
+    /*
+     * The CPUArchState-RANGE form, for a register the instruction reads that
+     * has no TCG global AND no temp -- because the emulator resolved the read
+     * at TRANSLATION time and left no op behind at all.  @env_size is 0 for
+     * the two forms above and non-zero for this one, which is what tells them
+     * apart; @env_off is only meaningful when it is set.
+     */
+    uint32_t env_off;
+    uint32_t env_size;
 } DfEncReadNote;
 
 /*
@@ -3420,7 +3429,17 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     for (unsigned i = encread_lo; i < *encread_cursor; i++) {
         unsigned idx;
 
-        if (df_encread[i].zero) {
+        if (df_encread[i].env_size) {
+            /*
+             * A range rather than a register id, so it goes onto the env
+             * side -- the same route an ordinary env load takes, which is
+             * what lets a declared regfile give it its name downstream.  No
+             * provenance: this instruction did not compute the value, it
+             * depends on it.
+             */
+            df_add_field(d, df_encread[i].env_off, df_encread[i].env_size,
+                         INSN_DF_RD, NULL);
+        } else if (df_encread[i].zero) {
             /*
              * The architectural zero register has no TCG global, so @d->rd
              * cannot hold it and the ordered list is the only place it can go
@@ -4083,7 +4102,8 @@ static void df_note_encread(const void *src_ts, bool zero)
     }
     anchor = QTAILQ_LAST(&tcg_ctx->ops);
     for (unsigned i = df_n_encread; i-- > 0; ) {
-        if (df_encread[i].src_ts == src_ts &&
+        if (df_encread[i].env_size == 0 &&
+            df_encread[i].src_ts == src_ts &&
             df_encread[i].zero == (zero ? 1 : 0) &&
             df_encread[i].anchor == anchor) {
             return;
@@ -4093,6 +4113,8 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].src_ts = src_ts;
     df_encread[df_n_encread].anchor = anchor;
     df_encread[df_n_encread].zero = zero ? 1 : 0;
+    df_encread[df_n_encread].env_off = 0;
+    df_encread[df_n_encread].env_size = 0;
     df_n_encread++;
 }
 
@@ -4104,6 +4126,56 @@ void insn_dataflow_note_folded_read(const void *src_ts)
 void insn_dataflow_note_folded_read_zero(void)
 {
     df_note_encread(NULL, true);
+}
+
+/*
+ * The THIRD folded-read form: a register the instruction reads that the
+ * emulator resolved BEFORE the op stream existed.  See
+ * insn_dataflow_note_stated_read_env() in the header for what the note says.
+ *
+ * It shares df_encread[]'s storage and therefore its cursor discipline, which
+ * is the whole reason it lives here rather than on a list of its own: the
+ * anchor window that keeps one instruction's folded reads apart from the next
+ * one's is exactly the window this note needs, and a second list would be a
+ * second chance to get that wrong.  The pair (range, anchor) is the key --
+ * one instruction stating the same gate twice is one fact, two instructions
+ * stating it are two.
+ */
+void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (size == 0) {
+        /*
+         * An unbounded range cannot be told from the temp forms in this
+         * struct and would be indistinguishable from "no note" downstream.
+         * Refused at the door rather than stored as a fact nobody can read.
+         */
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].env_size == size &&
+            df_encread[i].env_off == off &&
+            df_encread[i].anchor == anchor) {
+            return;
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = off;
+    df_encread[df_n_encread].env_size = size;
+    df_n_encread++;
 }
 
 /* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */

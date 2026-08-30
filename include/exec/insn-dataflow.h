@@ -1065,6 +1065,46 @@ void insn_dataflow_note_folded_read(const void *src_ts);
 void insn_dataflow_note_folded_read_zero(void);
 
 /*
+ * The TRAP-GATE form of the folded read: a CPUArchState byte range the
+ * instruction reads, stated by a decoder that resolved the read at
+ * TRANSLATION time and emitted no op for it.
+ *
+ * WHAT THIS IS FOR.  The two forms above cover a source the emitter folded
+ * out of an op stream that still exists.  This one covers a source that never
+ * reached an op stream at all: state the emulator hoisted out of the
+ * instruction entirely and pre-computed, so that at runtime there is nothing
+ * left to see.  AArch64's FP/SIMD enable gate is the case that motivated it --
+ * CPACR_EL1.FPEN decides whether the instruction executes or traps, QEMU
+ * folds that decision into the TB flags at translation time, and by the time
+ * fp_access_check() runs the answer is a C variable rather than a guest
+ * register read.  Nothing in the op stream can be walked to find it.
+ *
+ * IT IS A SOURCE, and that is a ruling rather than a reading of the emulator:
+ * a pending write to the gate must resolve before the instruction may
+ * proceed, so the regfile has to respect the edge (R7.4, which names AArch64
+ * CPACR alongside the RISC-V CSRs it was asked about).  The emulator's choice
+ * to answer the question early is a lowering decision and lowering decisions
+ * are not architectural truth (R15).
+ *
+ * WHY A RANGE AND NOT A NAME.  The range is what the register IS -- the same
+ * offsetof()/sizeof() pair insn_dataflow_declare_regfile() takes -- so the
+ * declaration that names every other access to those bytes names this one
+ * too, and there is no second spelling to keep in step.  A range with no
+ * declaration behind it arrives downstream as an anonymous span, which is a
+ * coverage gap in the target's declarations and reports itself as one.
+ *
+ * The range reaches the ORDERED READ LIST through fields[], exactly as an
+ * ordinary env load does, and carries NO provenance: the instruction depends
+ * on the value, it did not compute it.
+ *
+ * @size must be non-zero; an unbounded range cannot be told from "no note"
+ * downstream and is refused.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size);
+
+/*
  * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
  * encoding names, as it becomes a TCG value.
  *

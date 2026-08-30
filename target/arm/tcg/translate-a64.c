@@ -131,6 +131,26 @@ void a64_translate_init(void)
                                   sizeof(((CPUARMState *)0)->cp15.tpidr_el[0]),
                                   sizeof(((CPUARMState *)0)->cp15.tpidr_el[0]),
                                   1);
+
+    /*
+     * CPACR_EL1, the FP/SIMD EXECUTION-ENABLE GATE, and the register every
+     * FP, SIMD, SVE and SME instruction depends on to execute at all.
+     *
+     * Declared for the same reason as the thread pointer above -- it has no
+     * TCG global and no row in the GDB stub's namespace, so an access to
+     * these bytes arrives downstream as an anonymous range -- but it is NOT
+     * the same case, because the gate is not read by an op the walk could
+     * find.  QEMU resolves CPACR_EL1.FPEN (with the EL2 and EL3 traps) into
+     * `fp_excp_el` when it computes the TB flags, so by translation time the
+     * answer is a C field and there is no guest-register read left anywhere
+     * in the instruction.  fp_access_check_only() states it (see the note
+     * there); the declaration is what gives the range its name.
+     */
+    insn_dataflow_declare_regfile("cpacr_el1", NULL,
+                                  offsetof(CPUARMState, cp15.cpacr_el1),
+                                  sizeof(((CPUARMState *)0)->cp15.cpacr_el1),
+                                  sizeof(((CPUARMState *)0)->cp15.cpacr_el1),
+                                  1);
 }
 
 /*
@@ -1442,6 +1462,45 @@ static void do_vec_ld(DisasContext *s, int destidx, int element,
  */
 static bool fp_access_check_only(DisasContext *s)
 {
+    /*
+     * THE GATE IS A SOURCE, and this is the one place every instruction
+     * subject to it passes through.
+     *
+     * Whether this instruction executes or traps is decided by
+     * CPACR_EL1.FPEN (and by CPTR_EL2/EL3 at the levels that implement
+     * them).  A pending write to that gate must resolve before the
+     * instruction may proceed, which is a dependency edge the regfile has to
+     * respect -- R7.4, which names AArch64 CPACR by name alongside the
+     * RISC-V CSRs it was asked about.
+     *
+     * QEMU cannot be walked for it.  The gate is folded into `fp_excp_el`
+     * when the TB flags are computed, so at translation time the answer is
+     * already a C field and the instruction's op stream contains no read of
+     * any guest register that decided it.  That the emulator answers the
+     * question early is a lowering choice, and a lowering choice is not
+     * architectural truth (R15) -- so the fact is STATED here rather than
+     * inferred from an op that does not exist.
+     *
+     * STATED BEFORE THE BRANCH, deliberately: the instruction reads the gate
+     * whichever way the gate answers, and stating it only on the path that
+     * proceeds would make the read a function of the value read.
+     *
+     * ONE register, not three.  CPTR_EL2 and CPTR_EL3 are the same gate at
+     * the higher exception levels and reach the same word in the consumer's
+     * vocabulary (REG_SYSFPEN, "FP / vector execution-enable gate"), so
+     * naming all three would put three members in the read list that arrive
+     * as one register and cost every FP instruction two more entries out of
+     * a bounded per-instruction list.  The finer distinction has no
+     * expression downstream; that it does not is a granularity item of its
+     * own and not something this note can settle.
+     *
+     * Capture only -- no op is emitted, altered or suppressed, and the
+     * generated code is byte-identical with the note present or absent.
+     */
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUARMState, cp15.cpacr_el1),
+        sizeof(((CPUARMState *)0)->cp15.cpacr_el1));
+
     if (s->fp_excp_el) {
         assert(!s->fp_access_checked);
         s->fp_access_checked = -1;

@@ -2523,10 +2523,29 @@ FP_VEC_PROMOTE_OPS = {
 # variants (ADCS, SBCS, BICS, ...) don't have CMP-style aliases in
 # the AArch64 assembler grammar, so they stay on their canonical
 # arithmetic opcode even when written with an XZR destination.
+# BICS is here for a reason the other three do not need.  SUBS / ADDS /
+# ANDS are on this list because ARM defines the CMP / CMN / TST alias
+# mnemonics for them.  BICS with Rd=XZR has no alias mnemonic at all --
+# and the refiner does not read one.  It reads the DESTINATION SET: every
+# dst_regs[] entry REG_FLAGS or REG_ZERO means the regfile keeps nothing
+# and only NZCV survives, which is exactly as true of `bics xzr, xn, xm`
+# as of `ands xzr, xn, xm`.  Gating a shape-detecting refiner on the
+# assembler's spelling is the defect, and it had a witness: QEMU's own
+# rule `ANDS_r ... @logic_shift` (a64.decode:738) decodes BOTH forms, so
+# the identity table could only read QID_SPLIT -- two candidates that
+# agree on opcode, branch, flags, dep_refine and both lane columns and
+# differ on `.refine` ALONE (exec61/adj/ANDS_R_COLUMN.txt).  Both forms
+# of the rule are qualified, not just the one a corpus reached.
+#
+# SBCS and ADCS reach the same promotion switch and are NOT added: they
+# belong to a different decode rule, their carry-in makes "compare" a
+# stronger word than the encoding supports, and neither has been
+# measured here.  Named so the omission is a decision, not an oversight.
 CMP_ALIAS_PROMOTE_INSNS = {
     "AARCH64_INS_SUBS",
     "AARCH64_INS_ADDS",
     "AARCH64_INS_ANDS",
+    "AARCH64_INS_BICS",
 }
 
 
@@ -4207,13 +4226,14 @@ def full_entry(info: IsaInfo, const_name: str,
     if (refine is None and info.key == "aarch64"
             and new.op in FP_VEC_PROMOTE_OPS):
         refine = "refine_arm64_fp_vec"
-    # AArch64 CMP / CMN / TST are aliases for the flag-writing
-    # SUBS / ADDS / ANDS forms with the destination register set
-    # to XZR / WZR.  Capstone returns the underlying SUBS/ADDS/ANDS
-    # insn id, so the static table picks GEN_OP_INT_SUB /
-    # GEN_OP_INT_ADD / GEN_OP_AND.  refine_arm64_cmp_alias detects
-    # the flag-only shape (REG_ZERO is the only register dst) and
-    # promotes opcode to CMP / TEST.  Only fills empty .refine.
+    # The flag-only shape: a flag-writing form whose destination is
+    # XZR / WZR keeps nothing in the regfile and only writes NZCV.
+    # Capstone returns the underlying SUBS/ADDS/ANDS/BICS insn id, so
+    # the static table picks GEN_OP_INT_SUB / GEN_OP_INT_ADD /
+    # GEN_OP_AND.  refine_arm64_cmp_alias detects the shape (every
+    # register destination is REG_ZERO or REG_FLAGS) and promotes
+    # opcode to CMP / TEST.  Only fills empty .refine.  See
+    # CMP_ALIAS_PROMOTE_INSNS for why the set is not the alias list.
     if (refine is None and info.key == "aarch64"
             and const_name in CMP_ALIAS_PROMOTE_INSNS):
         refine = "refine_arm64_cmp_alias"

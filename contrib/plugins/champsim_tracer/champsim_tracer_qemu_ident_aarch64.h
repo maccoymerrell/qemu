@@ -3461,8 +3461,8 @@ static const QemuIdentRow qemu_ident_aarch64[] = {
       { .opcode = GEN_OP_LOAD, .branch_type = BRANCH_NONE, .flags = MF_NONE, .refine = refine_arm64_ldst_access, .dep_refine = dep_passthrough } },
     { 0x81920064u, "disas_a64/UQRSHRN_si@0111111100001...100111..........", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
-    { 0x81968b39u, "disas_a64/ANDS_r", QID_SPLIT, true,
-      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* SPLIT: GEN_OP_AND <- ands; GEN_OP_AND <- bics */
+    { 0x81968b39u, "disas_a64/ANDS_r", QID_OBSERVED, false,
+      { .opcode = GEN_OP_AND, .branch_type = BRANCH_NONE, .flags = MF_NONE, .refine = refine_arm64_cmp_alias, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0x819c5b6bu, "disas_t16/SUB_rri@00111...........", QID_NAME_MATCHED, false,
       { .opcode = GEN_OP_INT_SUB, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0x81a9e9fbu, "disas_a64/STZG@11011001011.........11..........", QID_NAME_MATCHED, false,

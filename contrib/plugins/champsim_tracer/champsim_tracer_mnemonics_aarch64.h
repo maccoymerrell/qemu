@@ -908,10 +908,18 @@ static void refine_arm64_fp_vec(
 }
 
 /*
- * AArch64 CMP / CMN / TST are assembler aliases for SUBS / ADDS /
- * ANDS where the destination register is XZR (or WZR for 32-bit
- * forms).  Capstone returns the underlying SUBS/ADDS/ANDS insn id
- * (the assembler mnemonic alias is just the disasm string), and
+ * THE FLAG-ONLY SHAPE.  A flag-writing form whose destination register
+ * is XZR (or WZR for 32-bit forms) keeps nothing in the regfile: the
+ * result is discarded and only NZCV survives.  AArch64 gives three of
+ * these assembler alias mnemonics -- CMP / CMN / TST for SUBS / ADDS /
+ * ANDS -- and does NOT give one to `bics xzr, xn, xm`, which has the
+ * identical shape.  This refiner is named for the aliases but does not
+ * read one: the detection below is the DESTINATION SET, so BICS is in
+ * scope too and is in CMP_ALIAS_PROMOTE_INSNS for that reason (it is
+ * also the second form of QEMU's own ANDS_r rule, so gating on the
+ * alias list left that rule's identity row unresolvable).  Capstone
+ * returns the underlying SUBS/ADDS/ANDS/BICS insn id (the assembler
+ * mnemonic alias is just the disasm string), and
  * recent Capstone versions resolve the alias by dropping XZR from
  * the explicit operand list — only the implicit NZCV write remains,
  * so the walker's dst_regs[] for a `cmp` ends up containing just
@@ -955,7 +963,10 @@ static void refine_arm64_cmp_alias(
                              * dedicated GEN_OP_CMN. */
         f->opcode = GEN_OP_CMP;
         break;
-    case GEN_OP_AND:        /* ANDS xzr, ...  -> TST */
+    case GEN_OP_AND:        /* ANDS xzr, ... -> TST; BICS xzr, ...
+                             * is the same discard-and-keep-flags
+                             * shape and has no alias mnemonic of its
+                             * own, so it maps here too. */
         f->opcode = GEN_OP_TEST;
         break;
     default:
@@ -1262,6 +1273,7 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [AARCH64_INS_BICS]                    = { .opcode = GEN_OP_AND,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
+                                        .refine = refine_arm64_cmp_alias,
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [AARCH64_INS_BIC]                     = { .opcode = GEN_OP_AND,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,

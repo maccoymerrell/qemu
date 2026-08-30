@@ -340,17 +340,27 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
 };
 
 /*
- * Memory counts are runtime fields derived from QEMU memory callbacks,
- * not from opcode semantics.  These helpers are retained only so table
- * entries that reference them remain valid no-ops.
+ * THREE EMPTY REFINERS USED TO LIVE HERE -- refine_x86_implicit_stack_store,
+ * refine_x86_implicit_stack_load and refine_x86_sse_mov_access -- and they
+ * were not free.  Memory counts are runtime fields derived from QEMU memory
+ * callbacks rather than from opcode semantics, so the three bodies had been
+ * emptied and kept only so the rows naming them stayed valid; the wire could
+ * not tell them from no refiner at all, because calling a function that
+ * writes nothing and not calling one are the same instruction.
+ *
+ * The identity tables COULD tell them apart, and that was the defect.  A row
+ * carrying an empty refiner and a row carrying none compare unequal, so a
+ * decode rule observed decoding both spellings -- `decode-new/MOVD_to@vex=0`
+ * and `decode-new/MOVD_from@vex=0`, `movd` against `movq`, both GEN_OP_MOV --
+ * was tiered QID_SPLIT, published nothing, and left the enum table as the
+ * answer on the wire for every one of those instructions.
+ *
+ * champsim_tracer_mnemonic_audit.py now proves emptiness FROM THE BODY, per
+ * name, and drops a proven-empty refiner where it would otherwise be carried
+ * forward; with no row left referencing these three, the compiler's own
+ * unused-function error is what removed them.  A refiner added here with a
+ * real body is unaffected: the proof is one-sided and can only fail to fire.
  */
-static void refine_x86_implicit_stack_store(
-    const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    (void)info;
-    (void)f;
-}
-
 static void refine_x86_call_branch(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
@@ -371,20 +381,6 @@ static void refine_x86_jump_branch(
         f->branch_type = BRANCH_INDIRECT_JUMP;
     }
     f->branch_conditional = false;
-}
-
-static void refine_x86_implicit_stack_load(
-    const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    (void)info;
-    (void)f;
-}
-
-static void refine_x86_sse_mov_access(
-    const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    (void)info;
-    (void)f;
 }
 
 static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
@@ -977,7 +973,6 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_LEA]                         = { .opcode = GEN_OP_LEA,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_lea },
     [X86_INS_LEAVE]                       = { .opcode = GEN_OP_POP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_load,
                                         .dep_refine = dep_x86_stack_pop },
     [X86_INS_LES]                         = { .opcode = GEN_OP_LOAD,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_passthrough },
@@ -1075,7 +1070,6 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [X86_INS_MOVQ]                        = { .opcode = GEN_OP_MOV,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_sse_mov_access,
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [X86_INS_MOVDQ2Q]                     = { .opcode = GEN_OP_VEC_MOV, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
@@ -1425,7 +1419,6 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [X86_INS_MOVUPS]                      = { .opcode = GEN_OP_VEC_MOV, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_sse_mov_access,
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [X86_INS_MOVZX]                       = { .opcode = GEN_OP_MOVZX,  .branch_type = BRANCH_NONE,           .flags = MF_NONE,
@@ -1670,7 +1663,6 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
     [X86_INS_POP]                         = { .opcode = GEN_OP_POP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_load,
                                         .dep_refine = dep_x86_stack_pop },
     [X86_INS_POPAW]                       = { .opcode = GEN_OP_POP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_x86_stack_pop },
@@ -1721,19 +1713,16 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = false },
     [X86_INS_PUSH]                        = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_store,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_PUSHAW]                      = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_PUSHAL]                      = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_PUSHF]                       = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_store,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_PUSHFD]                      = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_PUSHFQ]                      = { .opcode = GEN_OP_PUSH,   .branch_type = BRANCH_NONE,           .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_store,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_RCL]                         = { .opcode = GEN_OP_ROL,    .branch_type = BRANCH_NONE,           .flags = MF_NONE },
     [X86_INS_RCPPS]                       = { .opcode = GEN_OP_VEC_DIV, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
@@ -1761,7 +1750,6 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_REPNE]                       = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE },
     [X86_INS_REP]                         = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE },
     [X86_INS_RET]                         = { .opcode = GEN_OP_RET,    .branch_type = BRANCH_RETURN,         .flags = MF_NONE,
-                                        .refine = refine_x86_implicit_stack_load,
                                         .dep_refine = dep_x86_stack_pop },
     [X86_INS_REX64]                       = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE },
     [X86_INS_ROL]                         = { .opcode = GEN_OP_ROL,    .branch_type = BRANCH_NONE,           .flags = MF_NONE },

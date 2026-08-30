@@ -1772,17 +1772,123 @@ def enum_reg_constants(info: IsaInfo) -> list[str]:
     return names
 
 
+REFINER_DEF_RE = re.compile(
+    r"static\s+void\s+(?P<name>\w+)\s*\(\s*"
+    r"const\s+struct\s+qemu_plugin_insn_info\s*\*\s*\w+\s*,\s*"
+    r"InsnFields\s*\*\s*\w+\s*\)\s*\{")
+
+
+def refiner_bodies(text: str) -> dict[str, str]:
+    """Every refiner DEFINED in this header, name -> body text.
+
+    Read from the source rather than from a list of names, because a list
+    of names is a claim and the body is the fact.  A refiner defined
+    somewhere else is simply absent here, and absence is reported as
+    "not provable from this file" rather than assumed either way.
+    """
+    out: dict[str, str] = {}
+    for m in REFINER_DEF_RE.finditer(text):
+        i, depth = m.end(), 1
+        while i < len(text) and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        out[m.group("name")] = text[m.end():i - 1]
+    return out
+
+
+def _body_is_empty(body: str) -> bool:
+    """True when the body can do nothing at all.
+
+    Comments, whitespace and `(void)x;` parameter-silencing casts are
+    removed; anything left means the refiner may write a field, and the
+    answer is NO.  The test is deliberately one-sided: it can only fail
+    to prove emptiness, never claim it wrongly.
+    """
+    stripped = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+    stripped = re.sub(r"//[^\n]*", "", stripped)
+    stripped = re.sub(r"\(\s*void\s*\)\s*\w+\s*;", "", stripped)
+    return stripped.strip() == ""
+
+
+def noop_refiner_census(info: IsaInfo, text: str, body: str):
+    """THE NO-OP REFINER EQUIVALENCE, and the census that proves it.
+
+    A `.refine` that names a function whose body is empty is not a
+    classification: it writes no field, so a row carrying it and a row
+    carrying nothing publish the SAME instruction on the wire.  The
+    identity tables did not know that.  `full_entry` builds one Entry per
+    Capstone constant, Entry is compared field by field, and a refiner
+    NAME that differs makes two behaviourally identical payloads compare
+    unequal -- so a decode rule observed decoding both spellings was
+    tiered QID_SPLIT, published nothing, and left the enum table as the
+    answer on the wire.  Measured on x86: `decode-new/MOVD_to@vex=0` and
+    `decode-new/MOVD_from@vex=0`, split between `movd` (no refine) and
+    `movq` (`refine_x86_sse_mov_access`, an empty body), both candidates
+    GEN_OP_MOV.
+
+    The equivalence is therefore: a PROVEN-EMPTY refiner is equal to no
+    refiner.  It is proven per name from the body in this header, never
+    from the name, and the census below is exhaustive over both
+    directions -- every refiner DEFINED here with its verdict and its row
+    count, and every refiner REFERENCED by the table with whether a
+    definition was found at all.  A referenced name with no definition in
+    this file is reported as unprovable and is NEVER dropped.
+    """
+    defined = refiner_bodies(text)
+    referenced: dict[str, int] = {}
+    for match in ENTRY_RE.finditer(body):
+        for name in (match.group("refine"), match.group("dep_refine")):
+            if name:
+                referenced[name] = referenced.get(name, 0) + 1
+    noop = {n for n, b in defined.items() if _body_is_empty(b)}
+    rows = []
+    for name in sorted(defined):
+        rows.append((name, name in noop, referenced.get(name, 0), True))
+    for name in sorted(referenced):
+        if name not in defined:
+            rows.append((name, False, referenced[name], False))
+    return noop, rows
+
+
+def print_noop_refiner_census(info: IsaInfo) -> None:
+    text = info.header.read_text()
+    noop, rows = noop_refiner_census(info, text, table_body(text, info))
+    print(f"  no-op refiner equivalence -- {info.key}: "
+          f"{len(rows)} refiner names, {len(noop)} PROVEN EMPTY")
+    for name, is_noop, nrows, provable in rows:
+        if not provable:
+            verdict = "not defined in this header -- NOT provable, kept"
+        elif is_noop:
+            verdict = "PROVEN EMPTY -- equal to no refiner, dropped"
+        else:
+            verdict = "live"
+        print(f"    {name:44} rows={nrows:<4} {verdict}")
+
+
 def parse_existing(info: IsaInfo) -> dict[str, Entry]:
     text = info.header.read_text()
     body = table_body(text, info)
+    noop, _rows = noop_refiner_census(info, text, body)
     entries: dict[str, Entry] = {}
     for match in ENTRY_RE.finditer(body):
+        refine = match.group("refine")
+        dep_refine = match.group("dep_refine")
+        # The equivalence, applied where the annotation is carried
+        # forward: an empty refiner is not preserved, because preserving
+        # it re-creates the false split it caused.
+        if refine in noop:
+            refine = None
+        if dep_refine in noop:
+            dep_refine = None
         entries[match.group("const")] = Entry(
             match.group("op"),
             match.group("branch"),
             norm_flags(match.group("flags")),
-            match.group("refine"),
-            match.group("dep_refine"),
+            refine,
+            dep_refine,
         )
     return entries
 
@@ -4346,6 +4452,7 @@ def targeted_fix(isa: str, const_name: str, old: Entry, new: Entry) -> bool:
 
 def audit_one(info: IsaInfo, *, max_lines: int) -> int:
     constants = enum_constants(info)
+    print_noop_refiner_census(info)
     existing = parse_existing(info)
     missing: list[tuple[str, Entry]] = []
     mismatched: list[tuple[str, Entry, Entry]] = []
@@ -4501,6 +4608,7 @@ def audit_regs_one(info: IsaInfo, *, max_lines: int) -> int:
 
 def apply_one(info: IsaInfo) -> None:
     constants = enum_constants(info)
+    print_noop_refiner_census(info)
     existing = parse_existing(info)
     text = info.header.read_text()
     new_text = replace_table_body(text, info, generated_body(info, constants, existing))

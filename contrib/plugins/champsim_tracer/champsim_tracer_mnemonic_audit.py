@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_DIR = Path(__file__).resolve().parent
+IDENT_CORPUS_DIR = PLUGIN_DIR / "ident_corpus"
 CAPSTONE_INCLUDE = ROOT / "subprojects" / "capstone" / "include" / "capstone"
 GDB_XML_DIR = ROOT / "gdb-xml"
 
@@ -5538,6 +5539,46 @@ class IdentRow:
     branch_fact: str | None = None
 
 
+def _refuse_stale_observations(info: IsaInfo, idents: list[QemuIdent],
+                               obs: dict[int, dict[str, object]]) -> None:
+    """An observation whose id now names a DIFFERENT rule is not evidence.
+
+    A decode id is not stable across source edits, and on i386 it is
+    literally __LINE__ in decode-new.c.inc -- inserting a line there
+    renumbers every slot after it.  A banked observation carrying a stale
+    id would be joined to whatever rule now sits at that id, and the row
+    would state a classification QEMU never made through it: a fabricated
+    decode, arriving as a promotion rather than as an error.
+
+    That is exactly why the pair census carries the NAME beside the id.
+    It was carried and never read until now.  It is read here, and a
+    disagreement REFUSES -- re-take the census at this tip rather than
+    merging observations across the edit that moved the rule.
+
+    An id the universe does not contain at all is a rule that was renamed
+    or removed; the observation has no subject and is dropped, which is
+    the safe direction and is already what the join did.
+    """
+    universe = {i.ident: i.name for i in idents}
+    stale = []
+    for ident, e in obs.items():
+        name = e.get("name")
+        if not isinstance(name, str) or name in ("", "-"):
+            continue
+        now = universe.get(ident)
+        if now is not None and now != name:
+            stale.append((ident, name, now))
+    if stale:
+        detail = "; ".join("0x%08x observed as %r, universe now %r"
+                           % row for row in sorted(stale)[:8])
+        raise SystemExit(
+            f"{info.key}: {len(stale)} observation(s) name a rule the "
+            f"current decoders do not have at that id -- {detail}.  These "
+            f"were taken before an edit moved the rule and joining them "
+            f"would state a decode QEMU never made.  Re-take the census at "
+            f"this tip.")
+
+
 def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                     obs: dict[int, dict[str, object]],
                     existing: dict[str, Entry]) -> list[IdentRow]:
@@ -5557,6 +5598,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
     _branch_class_unreached(info, idents)
     m2c = _mnemonic_to_const(info)
     v2c = enum_value_map(info)
+    _refuse_stale_observations(info, idents, obs)
     rows: list[IdentRow] = []
     for ident in sorted(idents, key=lambda r: r.ident):
         seen = obs.get(ident.ident)
@@ -5997,8 +6039,27 @@ def main() -> int:
             # The observed set is per ISA: pointing every target at every
             # TSV would join one target's ids against another's, and the
             # ids are explicitly not comparable across targets.
+            # THE CORPUS IS IN THE TREE.  Without an explicit --pairs the
+            # generator reads ident_corpus/, the banked union census that
+            # tools/merge_ident_pairs.py maintains, so `--qemu-ident --apply`
+            # reproduces the shipped headers from the checkout alone.  Before
+            # that bank existed the observed set was whatever run directories
+            # the author had to hand, and EXEC57 measured what that costs: a
+            # fresh whole-battery corpus reached FEWER rules than the shipped
+            # tables carry, so regenerating would have DEMOTED 104 rows that
+            # already answer, and the pass correctly refused to regenerate at
+            # all.  A generated file has to be derivable from the tree.
             pair_paths = [p for p in args.pairs
                           if _observed_matches_isa(Path(p), key)]
+            if not args.pairs:
+                banked = IDENT_CORPUS_DIR / f"pairs_{key}.tsv"
+                if not banked.is_file():
+                    parser.error(
+                        f"no banked pair census at {banked} and no --pairs "
+                        f"given -- refusing to generate an identity table "
+                        f"from an empty observed set, which would demote "
+                        f"every OBSERVED row to NAME_MATCHED or NONE")
+                pair_paths = [banked]
             if pair_paths:
                 obs = load_pairs(pair_paths)
             else:

@@ -234,6 +234,21 @@ static inline int times_2_plus_1(DisasContext *s, int x)
     return x * 2 + 1;
 }
 
+/*
+ * The Advanced SIMD modified-immediate table fixes some of cmode's four
+ * bits per row and leaves the rest free; these rebuild the whole cmode
+ * value from the free ones.  x is bit 13 for the 10x0 / 10x1 rows.
+ */
+static inline int times_2_plus_8(DisasContext *s, int x)
+{
+    return x * 2 + 8;
+}
+
+static inline int times_2_plus_9(DisasContext *s, int x)
+{
+    return x * 2 + 9;
+}
+
 static inline int rsub_64(DisasContext *s, int x)
 {
     return 64 - x;

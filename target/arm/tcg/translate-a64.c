@@ -7913,7 +7913,16 @@ static void gen_movi(unsigned vece, uint32_t dofs, uint32_t aofs,
     tcg_gen_gvec_dup_imm(MO_64, dofs, oprsz, maxsz, c);
 }
 
-static bool trans_Vimm(DisasContext *s, arg_Vimm *a)
+/*
+ * Advanced SIMD modified immediate.  MOVI, MVNI, ORR, BIC and FMOV all
+ * live in this encoding and the architecture separates them by (cmode,
+ * op), so a64.decode gives each of the table's non-MOVI rows a decode
+ * rule of its own and they all arrive here.  The body below still reads
+ * cmode/op, because the immediate the instruction materialises is built
+ * from them; what the split changes is the identity QEMU publishes for
+ * the rule it dispatched through, not what the rule does.
+ */
+static bool do_vimm(DisasContext *s, arg_vimm *a)
 {
     GVecGen2iFn *fn;
 
@@ -7945,6 +7954,13 @@ static bool trans_Vimm(DisasContext *s, arg_Vimm *a)
     }
     return true;
 }
+
+TRANS(Vimm, do_vimm, a)
+TRANS(ORR_vi, do_vimm, a)
+TRANS(BIC_vi, do_vimm, a)
+TRANS(MVNI_v, do_vimm, a)
+TRANS(FMOVI_v_s, do_vimm, a)
+TRANS(FMOVI_v_d, do_vimm, a)
 
 /*
  * Advanced SIMD Shift by Immediate

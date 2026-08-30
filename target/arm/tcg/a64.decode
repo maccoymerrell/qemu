@@ -1457,7 +1457,51 @@ FCCMP           00011110 .. 1 rm:5 cond:4 01 rn:5 e:1 nzcv:4  esz=%esz_hsd
 FMOVI_v_h       0 q:1 00 1111 00000 ... 1111 11 ..... rd:5  %abcdefgh
 
 # MOVI, MVNI, ORR, BIC, FMOV are all intermixed via cmode.
-Vimm            0 q:1 op:1 0 1111 00000 ... cmode:4 01 ..... rd:5 %abcdefgh
+#
+# They are also five different INSTRUCTIONS, told apart by (cmode, op) in
+# the architecture's own "Advanced SIMD modified immediate" table, and a
+# single pattern here is a single decode rule that cannot say which of them
+# it decoded.  Each row of that table that is not MOVI therefore gets its
+# own pattern, listed first; every one of them reaches the same
+# do_vimm() and QEMU's behaviour is unchanged.  What is left in the general
+# Vimm pattern is exactly MOVI -- 32-bit shifted, 16-bit shifted, 32-bit
+# shifting-ones, 8-bit, and the 64-bit scalar/vector form at op=1
+# cmode=1110 -- so the surviving rule claims to be one instruction and is.
+# Its own fixed bits are untouched, so the identity it publishes does not
+# move.
+&vimm           q op cmode rd abcdefgh
+
+# cmode is bits 15:12.  A row of the table fixes some of those bits and
+# leaves the rest free, so the free bits are re-read into the same cmode
+# value the general pattern would have extracted.
+%vimm_cmode_0xx0  13:2 !function=times_2
+%vimm_cmode_0xx1  13:2 !function=times_2_plus_1
+%vimm_cmode_10x0  13:1 !function=times_2_plus_8
+%vimm_cmode_10x1  13:1 !function=times_2_plus_9
+%vimm_cmode_110x  12:1 !function=plus_12
+
+{
+  ORR_vi          0 q:1 0 0 1111 00000 ... 0..1 01 ..... rd:5 \
+                  &vimm op=0 cmode=%vimm_cmode_0xx1 %abcdefgh
+  ORR_vi          0 q:1 0 0 1111 00000 ... 10.1 01 ..... rd:5 \
+                  &vimm op=0 cmode=%vimm_cmode_10x1 %abcdefgh
+  BIC_vi          0 q:1 1 0 1111 00000 ... 0..1 01 ..... rd:5 \
+                  &vimm op=1 cmode=%vimm_cmode_0xx1 %abcdefgh
+  BIC_vi          0 q:1 1 0 1111 00000 ... 10.1 01 ..... rd:5 \
+                  &vimm op=1 cmode=%vimm_cmode_10x1 %abcdefgh
+  MVNI_v          0 q:1 1 0 1111 00000 ... 0..0 01 ..... rd:5 \
+                  &vimm op=1 cmode=%vimm_cmode_0xx0 %abcdefgh
+  MVNI_v          0 q:1 1 0 1111 00000 ... 10.0 01 ..... rd:5 \
+                  &vimm op=1 cmode=%vimm_cmode_10x0 %abcdefgh
+  MVNI_v          0 q:1 1 0 1111 00000 ... 110. 01 ..... rd:5 \
+                  &vimm op=1 cmode=%vimm_cmode_110x %abcdefgh
+  FMOVI_v_s       0 q:1 0 0 1111 00000 ... 1111 01 ..... rd:5 \
+                  &vimm op=0 cmode=15 %abcdefgh
+  FMOVI_v_d       0 q:1 1 0 1111 00000 ... 1111 01 ..... rd:5 \
+                  &vimm op=1 cmode=15 %abcdefgh
+  Vimm            0 q:1 op:1 0 1111 00000 ... cmode:4 01 ..... rd:5 \
+                  &vimm %abcdefgh
+}
 
 SSHR_v          0.00 11110 .... ... 00000 1 ..... .....     @q_shri_b
 SSHR_v          0.00 11110 .... ... 00000 1 ..... .....     @q_shri_h

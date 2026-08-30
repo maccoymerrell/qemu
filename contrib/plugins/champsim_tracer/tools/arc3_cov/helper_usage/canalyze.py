@@ -356,6 +356,10 @@ class Analysis:
         # the whole file and no element of it can be named.  Kept apart from
         # env_fields so a row can state which of its members it narrowed.
         self.env_unbounded = set()
+        # SUBSCRIPT EXPRESSIONS a path walk stepped over, as (open, close)
+        # token indices, waiting to be scanned in their own right.  See
+        # _path_end()'s `[` arm and _drain_subs().
+        self._pending_subs = []
         self.cpu_escapes = []   # unresolved callees reached via the CPU view
         # CP1.  Guest memory accesses the helper performs ITSELF, keyed by
         # (direction, address argument) -- see _guest_access().  The value
@@ -466,6 +470,7 @@ class Analysis:
                     base -= 2
                 i = self._derived(u, max(base, 0), i + 1, end, taint, 'env',
                                   fname)
+                self._drain_subs(u, taint, depth, fname)
                 continue
             # An accessor between the env and CPUState views of one CPU.
             if (txt in ENV_TO_CPU or txt in CPU_TO_ENV) and \
@@ -480,6 +485,7 @@ class Analysis:
                         newroot = 'cpu' if txt in ENV_TO_CPU else 'env'
                         i = self._derived(u, i, cp + 1, end, taint, newroot,
                                           fname)
+                        self._drain_subs(u, taint, depth, fname)
                         continue
             # a call?
             if i + 1 < end and toks[i + 1][1] == '(' and txt not in (
@@ -492,8 +498,21 @@ class Analysis:
                     continue
             if txt in taint and (i == 0 or toks[i - 1][1] not in ('->', '.')):
                 i = self._access(u, i, end, taint, fname)
+                self._drain_subs(u, taint, depth, fname)
                 continue
             i += 1
+
+    def _drain_subs(self, u, taint, depth, fname):
+        """Scan the subscript expressions _path_end() stepped over.
+
+        A subscript is an rvalue context, so an access found inside one is
+        classified by the same rules that classify any other -- no direction
+        is assumed here.  Draining in a loop rather than a for: a nested
+        subscript pushes while this runs.
+        """
+        while self._pending_subs:
+            opn, cl = self._pending_subs.pop()
+            self._scan(u, opn, cl, taint, depth, fname)
 
     def _path_end(self, u, i, end):
         """Consume root [-> . [ ] ]* and return (index past it, first member,
@@ -550,13 +569,25 @@ class Analysis:
                 cl = u._match_fwd(j, '[', ']')
                 if cl < 0:
                     break
-                if path is not None:
-                    lit = self._const_index(u, j, cl)
-                    if lit is None:
+                lit = self._const_index(u, j, cl)
+                if lit is None:
+                    # A SUBSCRIPT THE READER CANNOT NAME IS STILL AN
+                    # EXPRESSION, AND WHAT IT READS IS READ.
+                    #
+                    # `ST(n)` expands to `env->fpregs[(env->fpstt + (n)) & 7]`
+                    # and names TWO members: the array, which this walk
+                    # reports, and `fpstt`, which the subscript states.  The
+                    # walk resumes past the `]`, so without this the
+                    # subscript's own reads were dropped whole and
+                    # helper_fxchg_ST0_STN came out reading fpregs alone --
+                    # a missing dependency published as though the footprint
+                    # were complete.
+                    self._pending_subs.append((j, cl))
+                    if path is not None:
                         var_index = True
-                        path = None     # the path stops being nameable here
-                    else:
-                        path = '%s[%s]' % (path, lit)
+                        path = None   # the path stops being nameable here
+                elif path is not None:
+                    path = '%s[%s]' % (path, lit)
                 j = cl + 1
             else:
                 break

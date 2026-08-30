@@ -99,7 +99,7 @@ static const DfHelperField dfu_autia_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
-    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:11687 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
 };
 #endif
 static const DfHelperField dfu_cpye_env[] = {
@@ -119,6 +119,7 @@ static const DfHelperField dfu_cpye_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2454, INDEX NOT STATED */
 };
 static const DfHelperField dfu_cpyfe_env[] = {
@@ -138,6 +139,7 @@ static const DfHelperField dfu_cpyfe_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2454, INDEX NOT STATED */
 };
 static const DfHelperField dfu_cpyfm_env[] = {
@@ -157,6 +159,7 @@ static const DfHelperField dfu_cpyfm_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2357, INDEX NOT STATED */
 };
 static const DfHelperField dfu_cpyfp_env[] = {
@@ -179,6 +182,7 @@ static const DfHelperField dfu_cpyfp_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2236, INDEX NOT STATED */
 };
 static const DfHelperField dfu_cpym_env[] = {
@@ -198,6 +202,7 @@ static const DfHelperField dfu_cpym_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2357, INDEX NOT STATED */
 };
 static const DfHelperField dfu_cpyp_env[] = {
@@ -220,6 +225,7 @@ static const DfHelperField dfu_cpyp_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:2236, INDEX NOT STATED */
 };
 static const DfHelperField dfu_dc_zva_env[] = {
@@ -240,6 +246,7 @@ static const DfHelperField dfu_exception_bkpt_insn_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
 };
 static const DfHelperField dfu_exception_with_syndrome_env[] = {
     { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:1312 */
@@ -252,6 +259,7 @@ static const DfHelperField dfu_exception_with_syndrome_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
 };
 static const DfHelperField dfu_guarded_page_br_env[] = {
     { offsetof(CPUArchState, btype), sizeof(((CPUArchState *)0)->btype), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/helper-a64.c:2567 */
@@ -269,6 +277,7 @@ static const DfHelperField dfu_guarded_page_check_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
 };
 static const DfHelperField dfu_irg_env[] = {
     { offsetof(CPUArchState, cp15.gcr_el1), sizeof(((CPUArchState *)0)->cp15.gcr_el1), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/mte_helper.c:224 */
@@ -293,7 +302,7 @@ static const DfHelperField dfu_pacia_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
-    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:11687 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
 };
 #endif
 static const DfHelperField dfu_rebuild_hflags_a64_env[] = {
@@ -344,6 +353,7 @@ static const DfHelperField dfu_sete_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:1684, INDEX NOT STATED */
 };
 static const DfHelperField dfu_setm_env[] = {
@@ -363,6 +373,7 @@ static const DfHelperField dfu_setm_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:1684, INDEX NOT STATED */
 };
 static const DfHelperField dfu_setp_env[] = {
@@ -385,6 +396,7 @@ static const DfHelperField dfu_setp_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, xregs), sizeof(((CPUArchState *)0)->xregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/helper-a64.c:1684, INDEX NOT STATED */
 };
 static const DfHelperField dfu_st2g_env[] = {
@@ -407,6 +419,7 @@ static const DfHelperField dfu_sve_ld1bb_r_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:5874, INDEX NOT STATED */
 };
 static const DfHelperField dfu_sve_st1bb_r_env[] = {
@@ -423,6 +436,7 @@ static const DfHelperField dfu_sve_st1bb_r_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6546, INDEX NOT STATED */
 };
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {

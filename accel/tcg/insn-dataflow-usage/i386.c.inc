@@ -172,10 +172,12 @@ static const DfHelperField dfu_divq_EAX_env[] = {
 };
 static const DfHelperField dfu_fabs_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:669, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:669 */
 };
 static const DfHelperField dfu_fadd_ST0_FT0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:580, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:580 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
     { offsetof(CPUArchState, ft0), sizeof(((CPUArchState *)0)->ft0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:580 */
@@ -183,17 +185,20 @@ static const DfHelperField dfu_fadd_ST0_FT0_env[] = {
 static const DfHelperField dfu_fadd_STN_ST0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:620, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:620 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
 };
 static const DfHelperField dfu_fchs_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:664, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:664 */
 };
 static const DfHelperField dfu_fdecstp_env[] = {
     { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:479 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:480 */
 };
 static const DfHelperField dfu_ffree_STN_env[] = {
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:493 */
     { offsetof(CPUArchState, fptags), sizeof(((CPUArchState *)0)->fptags), INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:493, INDEX NOT STATED */
 };
 static const DfHelperField dfu_fincstp_env[] = {
@@ -202,6 +207,7 @@ static const DfHelperField dfu_fincstp_env[] = {
 };
 static const DfHelperField dfu_fld1_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:674, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:674 */
 };
 static const DfHelperField dfu_fldcw_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:780 */
@@ -224,6 +230,7 @@ static const DfHelperField dfu_fldl_ST0_env[] = {
 };
 static const DfHelperField dfu_fldpi_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:707, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:707 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:704 */
 };
 static const DfHelperField dfu_flds_FT0_env[] = {
@@ -247,20 +254,25 @@ static const DfHelperField dfu_fldt_ST0_env[] = {
 };
 static const DfHelperField dfu_fldz_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:743, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:743 */
 };
 static const DfHelperField dfu_fmov_FT0_STN_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:503, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:503 */
     { offsetof(CPUArchState, ft0), sizeof(((CPUArchState *)0)->ft0), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:503 */
 };
 static const DfHelperField dfu_fmov_ST0_STN_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:508, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:508 */
 };
 static const DfHelperField dfu_fmov_STN_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:513, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:513 */
 };
 static const DfHelperField dfu_fmul_ST0_FT0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:587, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:587 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
     { offsetof(CPUArchState, ft0), sizeof(((CPUArchState *)0)->ft0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:587 */
@@ -273,7 +285,7 @@ static const DfHelperField dfu_fnstsw_env[] = {
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:753 */
 };
 static const DfHelperField dfu_fpop_env[] = {
-    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:86 */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:85 */
     { offsetof(CPUArchState, fptags), sizeof(((CPUArchState *)0)->fptags), INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:85, INDEX NOT STATED */
 };
 static const DfHelperField dfu_fpush_env[] = {
@@ -283,6 +295,7 @@ static const DfHelperField dfu_fpush_env[] = {
 static const DfHelperField dfu_fsqrt_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:2303, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:2303 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:2304 */
 };
@@ -301,21 +314,25 @@ static const DfHelperField dfu_fstenv_env[] = {
 static const DfHelperField dfu_fstl_ST0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:361, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:361 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
 };
 static const DfHelperField dfu_fsts_ST0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:348, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:348 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
 };
 static const DfHelperField dfu_fstt_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:464, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:464 */
 };
 static const DfHelperField dfu_fsubr_STN_ST0_env[] = {
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:641, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:641 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
 };
@@ -326,6 +343,7 @@ static const DfHelperField dfu_fucomi_ST0_FT0_env[] = {
     { offsetof(CPUArchState, cc_src2), sizeof(((CPUArchState *)0)->cc_src2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/cc_helper.c:211 */
     { offsetof(CPUArchState, fp_status), sizeof(((CPUArchState *)0)->fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:204 */
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:570, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:570 */
     { offsetof(CPUArchState, fpuc), sizeof(((CPUArchState *)0)->fpuc), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:134 */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:133 */
     { offsetof(CPUArchState, ft0), sizeof(((CPUArchState *)0)->ft0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:570 */
@@ -341,11 +359,13 @@ static const DfHelperField dfu_fwait_env[] = {
 };
 static const DfHelperField dfu_fxam_ST0_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:2415, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:2415 */
     { offsetof(CPUArchState, fptags), sizeof(((CPUArchState *)0)->fptags), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:2422, INDEX NOT STATED */
     { offsetof(CPUArchState, fpus), sizeof(((CPUArchState *)0)->fpus), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:2417 */
 };
 static const DfHelperField dfu_fxchg_ST0_STN_env[] = {
     { offsetof(CPUArchState, fpregs), sizeof(((CPUArchState *)0)->fpregs), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/i386/tcg/fpu_helper.c:520, INDEX NOT STATED */
+    { offsetof(CPUArchState, fpstt), sizeof(((CPUArchState *)0)->fpstt), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/fpu_helper.c:520 */
 };
 static const DfHelperField dfu_idivq_EAX_env[] = {
     { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/tcg/excp_helper.c:127 */

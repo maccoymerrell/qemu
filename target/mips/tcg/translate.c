@@ -2884,7 +2884,7 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     switch (opc) {
     case OPC_SLL:
         mips_ident(ctx,
-            opc == OPC_SLL ? MIPS_ID_OPC_SLL :
+            opc == OPC_SLL ? mips_ident_q_OPC_SLL(ctx->opcode) :
             MIPS_ID_NONE);
         tcg_gen_shli_tl(t0, t0, uimm);
         tcg_gen_ext32s_tl(cpu_gpr[rt], t0);
@@ -5491,6 +5491,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
     case OPC_TLT:
     case OPC_TLTU:
     case OPC_TNE:
+        mips_ident(ctx,
+            opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
+            opc == OPC_TGE ? MIPS_ID_OPC_TGE :
+            opc == OPC_TGEU ? MIPS_ID_OPC_TGEU :
+            opc == OPC_TLT ? MIPS_ID_OPC_TLT :
+            opc == OPC_TLTU ? MIPS_ID_OPC_TLTU :
+            opc == OPC_TNE ? MIPS_ID_OPC_TNE :
+            MIPS_ID_NONE);
         /*
          * CP-M, the encoded-immediate half, VALUE-STATING form.  The
          * register-form traps carry a 10-bit CODE field, and MIPS defines it
@@ -5513,14 +5521,6 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
          */
         insn_dataflow_note_encoded_imm_value((uint64_t)(uint32_t)code,
                                              INSN_DF_IMM_ROLE_NON_DATAFLOW);
-        mips_ident(ctx,
-            opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
-            opc == OPC_TGE ? MIPS_ID_OPC_TGE :
-            opc == OPC_TGEU ? MIPS_ID_OPC_TGEU :
-            opc == OPC_TLT ? MIPS_ID_OPC_TLT :
-            opc == OPC_TLTU ? MIPS_ID_OPC_TLTU :
-            opc == OPC_TNE ? MIPS_ID_OPC_TNE :
-            MIPS_ID_NONE);
         /* Compare two registers */
         if (rs != rt) {
             gen_load_gpr(t0, rs);
@@ -16410,7 +16410,7 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     switch (op1) {
     case OPC_SLL:          /* Shift with immediate */
         mips_ident(ctx,
-            op1 == OPC_SLL ? MIPS_ID_OPC_SLL :
+            op1 == OPC_SLL ? mips_ident_q_OPC_SLL(ctx->opcode) :
             MIPS_ID_NONE);
         if (sa == 5 && rd == 0 &&
             rs == 0 && rt == 0) { /* PAUSE */

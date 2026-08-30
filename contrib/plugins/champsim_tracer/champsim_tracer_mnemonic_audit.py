@@ -4858,6 +4858,16 @@ QEMU_IDENT_HANDWRITTEN = {
 IDENT_ROW_RE = re.compile(
     r'^\s*\{\s*(0x[0-9a-f]+)u,\s*"([^"]+)"\s*\},\s*/\*\s*(\S+):(\d+)\s*\*/')
 
+# The same row with its provenance on the line ABOVE.  An ENCODING-QUALIFIED
+# identity carries its 32 fixed bits in the name, and the row plus a trailing
+# `/* file:line */` does not fit 80 columns, so the generator lifts the
+# comment.  Reading only the one-line form would make those rows INVISIBLE to
+# the universe -- the census would report the rule unqualified and the split
+# unresolved, which is a zero produced by not looking.
+IDENT_ROW_BARE_RE = re.compile(
+    r'^\s*\{\s*(0x[0-9a-f]+)u,\s*"([^"]+)"\s*\},\s*$')
+IDENT_PROV_RE = re.compile(r'^\s*/\*\s*(\S+):(\d+)\s*\*/\s*$')
+
 
 @dataclass(frozen=True)
 class QemuIdent:
@@ -5009,11 +5019,31 @@ def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
         extra.append(path)
     rows: list[QemuIdent] = []
     for path in files + extra:
+        prov = None
         for line in path.read_text().splitlines():
             m = IDENT_ROW_RE.match(line)
             if m:
                 rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
                                       m.group(3), int(m.group(4))))
+                prov = None
+                continue
+            m = IDENT_PROV_RE.match(line)
+            if m:
+                prov = (m.group(1), int(m.group(2)))
+                continue
+            m = IDENT_ROW_BARE_RE.match(line)
+            if m:
+                if prov is None:
+                    raise SystemExit(
+                        f"{path}: identity row {m.group(2)!r} carries no "
+                        f"provenance, on its own line or the one above -- a "
+                        f"row with no source is not a rule this generator "
+                        f"will admit")
+                rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
+                                      prov[0], prov[1]))
+                prov = None
+                continue
+            prov = None
     if not rows:
         raise SystemExit(
             f"{apdir}: decoders carry no identity rows -- the tree was built "

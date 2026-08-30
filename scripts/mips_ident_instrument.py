@@ -35,12 +35,114 @@ import argparse
 import os
 import re
 import sys
+import textwrap
 
 # The opcode-enumerator families that appear as case labels in the
 # hand-written MIPS decoder.  A case label outside these families is not
 # an instruction identity (CP0 register selectors, DISAS_* states, format
 # codes, plain integers) and is reported as residue rather than exported.
 OPC_PREFIXES = ('OPC_', 'R6_OPC_', 'MMI_OPC_', 'TX79_OPC_')
+
+# ---------------------------------------------------------------------------
+# ENCODING-QUALIFIED SUB-RULES
+# ---------------------------------------------------------------------------
+#
+# One `case OPC_*` label, several ARCHITECTURAL INSTRUCTIONS, told apart by
+# FIXED ENCODING BITS and by nothing else.  MIPS defines its execution hints
+# inside the SLL encoding: SLL r0,r0,sa with rs=rt=rd=0 is NOP at sa=0, SSNOP
+# at 1, EHB at 3 and PAUSE at 5.  QEMU's switch is on MASK_SPECIAL(), which
+# masks those fields off, so all of them arrive at `case OPC_SLL` and the one
+# identity cannot say which instruction ran.  The plugin's identity table
+# therefore reported the rule QID_SPLIT -- observed decoding to two different
+# classifications, deciding neither -- and every instruction through it fell
+# back to the Capstone table.
+#
+# The discriminator here is the INSTRUCTION WORD, never a disassembler's
+# spelling: a (mask, value) pair over the encoding, in the shape decodetree
+# already publishes for a pattern reached from several rules
+# (`decode_insn16/addi@000...........01`).  The base rule's own name and id do
+# NOT move -- a form that matches none of the qualifications still reports
+# `translate_mips/OPC_SLL`, exactly as it did.  Only the qualified forms get a
+# new identity, and that is the deliberate, adjudicated part.
+#
+# THE COMPLETENESS RULE, and it is why all four hints are listed rather than
+# just the one the corpus happened to split on.  Carving `ssnop` out and
+# leaving the rest would make the base row claim to be `sll` for encodings
+# that are NOT an sll -- an identity answering confidently and wrongly, which
+# is worse than the split it replaced.  A rule is qualified for every form the
+# architecture defines inside it, or not at all.
+#
+# Fields: enumerator -> [(mask, value, bits, why), ...].  `bits` is the
+# match written out MSB-first with '.' for a don't-care, so the generated name
+# reads the same way a decodetree pattern's does.  The generator CHECKS that
+# mask/value are consistent with bits and refuses otherwise.
+ENCODING_QUALIFIED = {
+    'OPC_SLL': [
+        (0xffffffff, 0x00000000,
+         '00000000000000000000000000000000',
+         'NOP -- SLL r0,r0,0'),
+        (0xffffffff, 0x00000040,
+         '00000000000000000000000001000000',
+         'SSNOP -- SLL r0,r0,1'),
+        (0xffffffff, 0x000000c0,
+         '00000000000000000000000011000000',
+         'EHB -- SLL r0,r0,3'),
+        (0xffffffff, 0x00000140,
+         '00000000000000000000000101000000',
+         'PAUSE -- SLL r0,r0,5, and QEMU names this one itself at the '
+         'OPC_SLL arm of decode_opc_special'),
+    ],
+}
+
+
+def qual_suffix(bits):
+    """The identity-name suffix for a qualified form: `@` + its fixed bits."""
+    return '@' + bits
+
+
+def qual_c_ident(name, idx):
+    """A C enumerator for a qualified form.
+
+       The bits go in the NAME (which is the identity) and a short ordinal in
+       the C identifier: a 32-character bit string makes an unreadable
+       enumerator, and the row's comment carries the bits verbatim."""
+    return '%s__Q%d' % (name, idx)
+
+
+def check_qualifications():
+    """Refuse a self-inconsistent entry rather than emitting one.
+
+       An entry whose bit string disagrees with its (mask, value) would
+       publish an identity naming an encoding it does not match, which is a
+       fabricated decode dressed as a finer key."""
+    for name, forms in ENCODING_QUALIFIED.items():
+        seen = set()
+        for (mask, value, bits, why) in forms:
+            if len(bits) != 32:
+                return '%s: %r is %d bits, not 32' % (name, bits, len(bits))
+            m = v = 0
+            for ch in bits:
+                m <<= 1
+                v <<= 1
+                if ch == '.':
+                    continue
+                if ch not in '01':
+                    return '%s: %r has a character that is not 0, 1 or .' % (
+                        name, bits)
+                m |= 1
+                v |= int(ch)
+            if m != mask or v != (value & mask):
+                return ('%s: bits %s say mask=0x%08x value=0x%08x, the entry '
+                        'says mask=0x%08x value=0x%08x'
+                        % (name, bits, m, v, mask, value & mask))
+            if value & ~mask:
+                return '%s: value 0x%08x has bits outside its mask' % (
+                    name, value)
+            if bits in seen:
+                return '%s: %s listed twice' % (name, bits)
+            seen.add(bits)
+    return None
+
 
 MARK = 'mips_ident(ctx,'
 GEN_BY = 'Auto-generated by scripts/mips_ident_instrument.py'
@@ -282,6 +384,11 @@ def strip_instrumentation(lines):
 
 
 def build(path_c, path_inc, report):
+    bad = check_qualifications()
+    if bad is not None:
+        print('ERROR: ENCODING_QUALIFIED is self-inconsistent -- %s' % bad,
+              file=sys.stderr)
+        return 1
     with open(path_c) as f:
         lines = f.read().split('\n')
     lines, removed = strip_instrumentation(lines)
@@ -354,14 +461,19 @@ def build(path_c, path_inc, report):
             cont = indent + '    '
             body = ['%s%s' % (indent, MARK)]
             for (_, lab) in run:
-                arm = ('%s%s == %s ? MIPS_ID_%s :'
-                       % (cont, expr, lab, label_identity(lab)))
+                ident = label_identity(lab)
+                # An opcode with encoding-qualified sub-rules selects through
+                # its generated qualifier, which reads the INSTRUCTION WORD.
+                # Same statement, same place, same base identity when nothing
+                # matches -- see ENCODING_QUALIFIED.
+                pick = ('mips_ident_q_%s(ctx->opcode)' % ident
+                        if ident in ENCODING_QUALIFIED else 'MIPS_ID_%s' % ident)
+                arm = '%s%s == %s ? %s :' % (cont, expr, lab, pick)
                 if len(arm) <= 79:
                     body.append(arm)
                 else:
                     body.append('%s%s == %s ?' % (cont, expr, lab))
-                    body.append('%s    MIPS_ID_%s :' % (cont,
-                                                        label_identity(lab)))
+                    body.append('%s    %s :' % (cont, pick))
             body.append('%sMIPS_ID_NONE);' % cont)
             # The statement just introduced turns what was a bare stack of
             # case labels into a fallthrough that -Wimplicit-fallthrough=2
@@ -407,6 +519,7 @@ def build(path_c, path_inc, report):
     # an id would silently merge in every consumer.
     rows = []
     byhash = {}
+    qualified = {}      # base enumerator -> [(c_ident, mask, value, bits, why)]
     for nm in sorted(names):
         qual = 'translate_mips/' + nm
         h = fnv1a32(qual)
@@ -416,6 +529,28 @@ def build(path_c, path_inc, report):
             return 1
         byhash[h] = qual
         rows.append((nm, qual, h, first_line[nm]))
+        # The qualified forms of this rule, if it has any.  They are rows in
+        # their own right: same table, same id derivation, name suffixed by
+        # the fixed bits that select the form.
+        for idx, (mask, value, bits, why) in enumerate(
+                ENCODING_QUALIFIED.get(nm, [])):
+            cid = qual_c_ident(nm, idx)
+            qname = qual + qual_suffix(bits)
+            qh = fnv1a32(qname)
+            if qh in byhash:
+                print('ERROR: decode identity hash collision between %s and %s'
+                      % (byhash[qh], qname), file=sys.stderr)
+                return 1
+            byhash[qh] = qname
+            rows.append((cid, qname, qh, first_line[nm]))
+            qualified.setdefault(nm, []).append((cid, mask, value, bits, why))
+    for nm in ENCODING_QUALIFIED:
+        if nm not in qualified:
+            print('ERROR: ENCODING_QUALIFIED names %s, which is not a case '
+                  'label this decoder switches on -- a qualification with no '
+                  'rule to qualify is a stale entry, not a no-op' % nm,
+                  file=sys.stderr)
+            return 1
 
     with open(path_inc, 'w') as f:
         f.write('/*\n'
@@ -442,9 +577,37 @@ def build(path_c, path_inc, report):
         f.write('    { 0, NULL },\n')
         base = os.path.basename(path_c)
         for (nm, qual, h, ln) in rows:
-            f.write('    { 0x%08xu, "%s" },  /* %s:%d */\n'
-                    % (h, qual, base, ln))
+            if '@' in qual:
+                # A qualified name is 55 characters of identity; the row plus
+                # a trailing provenance comment does not fit 80 columns, so
+                # the provenance goes above it rather than off the edge.
+                f.write('    /* %s:%d */\n    { 0x%08xu, "%s" },\n'
+                        % (base, ln, h, qual))
+            else:
+                f.write('    { 0x%08xu, "%s" },  /* %s:%d */\n'
+                        % (h, qual, base, ln))
         f.write('};\n')
+        if qualified:
+            f.write('\n/*\n'
+                    ' * ENCODING-QUALIFIED SUB-RULES.  One case label, several\n'
+                    ' * architectural instructions, told apart by fixed encoding\n'
+                    ' * bits -- MIPS puts its execution hints inside the SLL\n'
+                    ' * encoding, and MASK_SPECIAL() masks the deciding fields\n'
+                    ' * off before the switch sees them.  The discriminator is\n'
+                    ' * the instruction word and nothing else; an encoding that\n'
+                    ' * matches no qualification keeps the base rule\'s own\n'
+                    ' * identity, unchanged.\n'
+                    ' */\n')
+            for nm in sorted(qualified):
+                f.write('static inline MipsIdent mips_ident_q_%s(uint32_t insn)'
+                        '\n{\n' % nm)
+                for (cid, mask, value, bits, why) in qualified[nm]:
+                    for line in textwrap.wrap(why, 68):
+                        f.write('    /* %s */\n' % line)
+                    f.write('    if ((insn & 0x%08xu) == 0x%08xu) {\n'
+                            '        return MIPS_ID_%s;\n'
+                            '    }\n' % (mask, value, cid))
+                f.write('    return MIPS_ID_%s;\n}\n' % nm)
 
     # Emit the instrumented translate.c.
     out = []

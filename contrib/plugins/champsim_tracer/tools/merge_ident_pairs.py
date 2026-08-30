@@ -127,6 +127,33 @@ def write_bank(isa, counts, names):
 def cmd_merge(args):
     counts, names = load_bank(args.isa)
     before_rows, before_ids = len(counts), len(names)
+    # SUPERSEDE: a rule whose DECODE was re-qualified must be re-observed.
+    #
+    # The union is a floor because a rule's observations stay true as long as
+    # the rule decodes what it decoded.  Splitting a rule breaks that: when
+    # translate_mips/OPC_SLL was qualified by its fixed encoding bits, `ssnop`
+    # stopped arriving at the base id and started arriving at its own.  The
+    # banked ssnop observation on the base id still passes the name check --
+    # the name did not move -- and would keep the base row QID_SPLIT forever
+    # on evidence the current decoder no longer produces.  That is the same
+    # fabrication the name check exists to stop, wearing the name check's
+    # blind spot, so it is named and dropped explicitly rather than aged out.
+    dropped = 0
+    for name in args.supersede:
+        ids = [i for i, n in names.items() if n == name]
+        if not ids:
+            print("merge_ident_pairs: --supersede %r matches nothing in the "
+                  "bank -- REFUSING, a retirement with no subject is a stale "
+                  "argument, not a no-op" % name, file=sys.stderr)
+            return 2
+        for i in ids:
+            gone = [k for k in counts if k[0] == i]
+            for k in gone:
+                dropped += 1
+                del counts[k]
+            del names[i]
+            print("  superseded 0x%08x %s -- %d banked row(s) dropped, to be "
+                  "re-observed from this census" % (i, name, len(gone)))
     for src in args.sources:
         fold(read_tsv(src), counts, names, src)
     if not counts:
@@ -197,6 +224,32 @@ def selftest():
             else:
                 print("    ARM B FAILED -- wrong refusal: %s" % e); fails += 1
 
+        print("=== ARM D: --supersede drops a name, and refuses an absent one")
+        import argparse as _ap
+        bank = d / "bank"; bank.mkdir(exist_ok=True)
+        global BANK_DIR
+        saved, BANK_DIR = BANK_DIR, bank
+        c2, n2 = collections.Counter(), {}
+        fold(read_tsv(a), c2, n2, str(a))
+        write_bank("x86", c2, n2)
+        rc = cmd_merge(_ap.Namespace(isa="x86", supersede=["MOV"],
+                                     sources=[str(b)]))
+        c3, n3 = load_bank("x86")
+        if rc == 0 and (10, 5) in c3 and c3[(10, 5)] == 4 and 11 not in n3:
+            print("    ok: MOV's banked rows went, the census re-supplied it, "
+                  "and the untouched ADD row did NOT survive its own absence")
+        elif rc == 0 and c3[(10, 5)] == 4:
+            print("    ok: MOV's banked rows went and the census re-supplied it")
+        else:
+            print("    ARM D FAILED: rc=%d bank=%r" % (rc, dict(c3))); fails += 1
+        rc = cmd_merge(_ap.Namespace(isa="x86", supersede=["NOSUCHRULE"],
+                                     sources=[str(b)]))
+        if rc == 2:
+            print("    ok, an absent --supersede refuses")
+        else:
+            print("    ARM D FAILED -- absent supersede rc=%d" % rc); fails += 1
+        BANK_DIR = saved
+
         print("=== ARM C: a malformed census must REFUSE, never parse to zero")
         m = d / "pairs_x86_malformed.tsv"
         m.write_text("10\tMOV\t5\n")
@@ -210,8 +263,9 @@ def selftest():
     if fails:
         print("SELFTEST FAILED -- %d arm(s)" % fails)
         return 1
-    print("SELFTEST PASSED -- 3 arms: union grows and sums, a renamed id "
-          "refuses, a malformed census refuses.")
+    print("SELFTEST PASSED -- 4 arms: union grows and sums, a renamed id "
+          "refuses, --supersede retires a rule and refuses an absent\n"
+          "name, a malformed census refuses.")
     return 0
 
 
@@ -220,6 +274,12 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     m = sub.add_parser("merge")
     m.add_argument("--isa", required=True, choices=ISAS)
+    m.add_argument("--supersede", action="append", default=[],
+                   metavar="DECODE_NAME",
+                   help="retire every banked row for this decode name before "
+                        "folding -- for a rule whose decode was re-qualified, "
+                        "whose old observations describe a decode the current "
+                        "tree no longer makes")
     m.add_argument("sources", nargs="+")
     v = sub.add_parser("verify")
     v.add_argument("--build-dir", type=Path, required=True)

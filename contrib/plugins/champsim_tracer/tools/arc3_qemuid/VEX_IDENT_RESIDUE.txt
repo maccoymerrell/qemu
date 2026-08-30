@@ -1,0 +1,53 @@
+x86_vex_ident_instrument residue report
+=======================================
+
+decode table      : /mnt/md0/QEMU/qemu/target/i386/tcg/decode-new.c.inc
+previous inserts stripped: 1
+publish site      : line 2926 (below all 854 sites, max 1932)
+qualify members   : 8
+rows carved       : 30 over 15 slot(s)
+(slot, vex) pairs checked: 5980  qualified 30  residual 5950
+
+every member, every slot of it
+------------------------------
+MOVD_from    decode-new.c.inc:551, decode-new.c.inc:552
+MOVQ         decode-new.c.inc:553, decode-new.c.inc:618
+MOVD_to      decode-new.c.inc:1394
+VMOVLPx      decode-new.c.inc:973, decode-new.c.inc:996, decode-new.c.inc:1027
+VMOVSD_ld    decode-new.c.inc:980
+VMOVLPx_st   decode-new.c.inc:1003, decode-new.c.inc:1087, decode-new.c.inc:1208
+VCVTSI2Sx    decode-new.c.inc:1074, decode-new.c.inc:1075
+VCMP         decode-new.c.inc:1303
+
+every row, in selector order
+----------------------------
+0x7ff65894  decode-new/MOVD_from@vex=0          decode-new.c.inc:551  X86_OP_ENTRY3      hashed "decode-new/MOVD_from@vex=0#551"
+0xb580027b  decode-new/MOVD_from@vex=1          decode-new.c.inc:551  X86_OP_ENTRY3      hashed "decode-new/MOVD_from@vex=1#551"
+0x82f65d4d  decode-new/MOVD_from@vex=0          decode-new.c.inc:552  X86_OP_ENTRY3      hashed "decode-new/MOVD_from@vex=0#552"
+0xb680040e  decode-new/MOVD_from@vex=1          decode-new.c.inc:552  X86_OP_ENTRY3      hashed "decode-new/MOVD_from@vex=1#552"
+0x4e673a9a  decode-new/MOVQ@vex=0               decode-new.c.inc:553  X86_OP_ENTRY3      hashed "decode-new/MOVQ@vex=0#553"
+0xa7f33281  decode-new/MOVQ@vex=1               decode-new.c.inc:553  X86_OP_ENTRY3      hashed "decode-new/MOVQ@vex=1#553"
+0xd2c0ce9e  decode-new/MOVQ@vex=0               decode-new.c.inc:618  X86_OP_ENTRY3      hashed "decode-new/MOVQ@vex=0#618"
+0xe3fe6645  decode-new/MOVQ@vex=1               decode-new.c.inc:618  X86_OP_ENTRY3      hashed "decode-new/MOVQ@vex=1#618"
+0xecac981b  decode-new/VMOVLPx@vex=0            decode-new.c.inc:973  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=0#973"
+0x85fea1e0  decode-new/VMOVLPx@vex=1            decode-new.c.inc:973  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=1#973"
+0xdf973185  decode-new/VMOVSD_ld@vex=0          decode-new.c.inc:980  X86_OP_ENTRY3      hashed "decode-new/VMOVSD_ld@vex=0#980"
+0x183f6d6a  decode-new/VMOVSD_ld@vex=1          decode-new.c.inc:980  X86_OP_ENTRY3      hashed "decode-new/VMOVSD_ld@vex=1#980"
+0xdf89f162  decode-new/VMOVLPx@vex=0            decode-new.c.inc:996  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=0#996"
+0x9b215531  decode-new/VMOVLPx@vex=1            decode-new.c.inc:996  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=1#996"
+0x78101a1e  decode-new/VMOVLPx_st@vex=0         decode-new.c.inc:1003  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=0#1003"
+0xe81e2f97  decode-new/VMOVLPx_st@vex=1         decode-new.c.inc:1003  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=1#1003"
+0xa733a08c  decode-new/VMOVLPx@vex=0            decode-new.c.inc:1027  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=0#1027"
+0x1f41c29d  decode-new/VMOVLPx@vex=1            decode-new.c.inc:1027  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx@vex=1#1027"
+0x4b67d58e  decode-new/VCVTSI2Sx@vex=0          decode-new.c.inc:1074  X86_OP_ENTRY3      hashed "decode-new/VCVTSI2Sx@vex=0#1074"
+0xe401508f  decode-new/VCVTSI2Sx@vex=1          decode-new.c.inc:1074  X86_OP_ENTRY3      hashed "decode-new/VCVTSI2Sx@vex=1#1074"
+0x4c67d721  decode-new/VCVTSI2Sx@vex=0          decode-new.c.inc:1075  X86_OP_ENTRY3      hashed "decode-new/VCVTSI2Sx@vex=0#1075"
+0xe3014efc  decode-new/VCVTSI2Sx@vex=1          decode-new.c.inc:1075  X86_OP_ENTRY3      hashed "decode-new/VCVTSI2Sx@vex=1#1075"
+0x6c238ef2  decode-new/VMOVLPx_st@vex=0         decode-new.c.inc:1087  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=0#1087"
+0xd40a8863  decode-new/VMOVLPx_st@vex=1         decode-new.c.inc:1087  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=1#1087"
+0x4c3ea5e9  decode-new/VMOVLPx_st@vex=0         decode-new.c.inc:1208  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=0#1208"
+0x02b2561c  decode-new/VMOVLPx_st@vex=1         decode-new.c.inc:1208  X86_OP_ENTRY3      hashed "decode-new/VMOVLPx_st@vex=1#1208"
+0x8a0a186b  decode-new/VCMP@vex=0               decode-new.c.inc:1303  X86_OP_ENTRY4      hashed "decode-new/VCMP@vex=0#1303"
+0x0374fb5a  decode-new/VCMP@vex=1               decode-new.c.inc:1303  X86_OP_ENTRY4      hashed "decode-new/VCMP@vex=1#1303"
+0xa83c17e9  decode-new/MOVD_to@vex=0            decode-new.c.inc:1394  X86_OP_ENTRY3      hashed "decode-new/MOVD_to@vex=0#1394"
+0x77af7d50  decode-new/MOVD_to@vex=1            decode-new.c.inc:1394  X86_OP_ENTRY3      hashed "decode-new/MOVD_to@vex=1#1394"

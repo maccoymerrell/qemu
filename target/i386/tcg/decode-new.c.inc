@@ -2592,6 +2592,29 @@ illegal:
  * Convert one instruction. s->base.is_jmp is set if the translation must
  * be stopped.
  */
+/*
+ * ENCODING-QUALIFIED IDENTITY, for the rows that serve two encodings.
+ *
+ * The table above is indexed by opcode, and a VEX prefix only supplies
+ * the implied 0F/66/F2/F3 bytes, so one row -- one __LINE__ slot, one
+ * identity -- is reached by the legacy SSE spelling of an instruction
+ * and by its VEX spelling alike.  Where the two classify differently the
+ * identity cannot say which it is: `movsd xmm, xmm` merges into a
+ * destination it also reads, `vmovsd` writes a full vector destination
+ * from two sources, and the one slot at line 973 answers for both.
+ *
+ * The discriminator is not missing.  decode_insn() sets PREFIX_VEX
+ * before this table is consulted, so the encoding is a fact the
+ * DisasContext already holds; it simply never reached the identity.
+ *
+ * scripts/x86_vex_ident_instrument.py states the finer identity, one row
+ * per (slot, encoding), and inserts the publish below.  THE BASE ROWS DO
+ * NOT MOVE: no X86_OP_* row is edited and no line is inserted above one,
+ * so every slot keeps its number, and a slot with no qualified row keeps
+ * the row's own id and name bit for bit.
+ */
+#include "vex_ident.c.inc"
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2901,6 +2924,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
      * faults instead of executing.
      */
     plugin_gen_record_insn_identity(decode.e.slot, decode.e.mnemonic);
+    vex_ident_publish(decode.e.slot, (s->prefix & PREFIX_VEX) != 0);  /* vex_ident */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

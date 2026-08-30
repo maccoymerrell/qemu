@@ -13,6 +13,7 @@ import argparse
 import os
 import re
 import sys
+import dataclasses
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -4904,6 +4905,19 @@ QEMU_IDENT_SOURCE_TABLES: dict[str, str] = {
 # not looking.
 X86_IDENT_QUALIFIED = "target/i386/tcg/x87_ident.c.inc"
 
+# Nor is the escape space the only place one row answers for two
+# instructions.  The table is indexed by opcode and a VEX prefix only
+# supplies the implied 0F/66/F2/F3 bytes, so one row is reached by the
+# legacy SSE spelling of an instruction and by its VEX spelling alike --
+# `movsd xmm, xmm` merges into a destination it also reads, `vmovsd`
+# writes a full vector destination from two sources, and one slot answers
+# for both.  scripts/x86_vex_ident_instrument.py states the finer
+# identity, one row per (slot, encoding).  Unlike the x87 leaves these
+# rows ARE table rows, so each carries its base row's macro suffix -- the
+# EMITTER FACT -- rather than a kind of its own; see
+# parse_x86_vex_identities().
+X86_IDENT_VEX = "target/i386/tcg/vex_ident.c.inc"
+
 # The emitter fact for a qualified leaf.  It is NOT an X86_OP_* macro
 # suffix: the leaf is a case label inside gen_x87, not a table row, so
 # there is no operand template to read and x86_emitter_refuses() must not
@@ -5052,9 +5066,24 @@ def parse_x86_identities() -> list[QemuIdent]:
         raise SystemExit(
             f"x86: {len(clashes)} source lines carry more than one slot -- "
             f"the exported id cannot tell them apart")
-    qualified = parse_x86_qualified_identities()
+    qualified = parse_x86_qualified_identities() + parse_x86_vex_identities(rows)
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
+    seen_q: dict[int, str] = {}
+    qq: list[QemuIdent] = []
+    for q in qualified:
+        if q.ident in seen_q:
+            qq.append(q)
+        else:
+            seen_q[q.ident] = q.name
+    if qq:
+        for q in qq:
+            print(f"  ID COLLISION 0x{q.ident:08x}: {q.name} vs "
+                  f"{seen_q[q.ident]}, two qualified rows on one id")
+        raise SystemExit(
+            f"x86: {len(qq)} qualified identity hash(es) collide with each "
+            f"other -- two rules sharing one id merge silently in every "
+            f"consumer")
     if collide:
         for q in collide:
             print(f"  ID COLLISION 0x{q.ident:08x}: {q.name} vs the "
@@ -5064,6 +5093,82 @@ def parse_x86_identities() -> list[QemuIdent]:
             f"__LINE__ slot -- two rules sharing one id merge silently in "
             f"every consumer")
     return rows + qualified
+
+
+def _read_qualified_table(path: Path, kind: str) -> list[QemuIdent]:
+    """Rows of a hand-off identity table, provenance comment LIFTED.
+
+    A qualified identity plus a trailing `/* file:line */` does not fit 80
+    columns, so the generators put the provenance on the line above.
+    Reading only the one-line form would make every such row INVISIBLE to
+    the universe -- the census would report the rule unqualified and the
+    split unresolved, which is a zero produced by not looking.
+    """
+    rows: list[QemuIdent] = []
+    prov: tuple[str, int] | None = None
+    for line in path.read_text().splitlines():
+        m = IDENT_PROV_RE.match(line)
+        if m:
+            prov = (m.group(1), int(m.group(2)))
+            continue
+        m = IDENT_ROW_BARE_RE.match(line)
+        if m and prov is not None:
+            rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
+                                  prov[0], prov[1], kind))
+        prov = None
+    return rows
+
+
+def parse_x86_vex_identities(base: list[QemuIdent]) -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED rows of decode-table slots that serve both.
+
+    Each row's provenance names the BASE SLOT it was carved from, and the
+    base row's macro suffix is the emitter fact that separates `cmp` from
+    `sub` -- so the kind is taken from the base rather than invented here,
+    and the qualified row answers x86_emitter_refuses() exactly as its base
+    row would.
+
+    Both halves of the provenance are CHECKED against the current table.  A
+    carved row whose slot no longer exists, or whose base row now names a
+    different rule, is a stale table attaching one rule's identity to
+    another's -- the same fabrication merge_ident_pairs.py's name check
+    exists to stop, and it is refused here rather than aged out.
+    """
+    path = ROOT / X86_IDENT_VEX
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_vex_ident_instrument.py.  Without it the rows that "
+            f"serve two encodings report as unqualified, which is not what "
+            f"the source says.")
+    by_slot = {r.ident: r for r in base}
+    rows: list[QemuIdent] = []
+    stale: list[str] = []
+    for r in _read_qualified_table(path, ""):
+        b = by_slot.get(r.src_line)
+        if b is None:
+            stale.append(f"{r.name}: base slot {r.src_line} carries no "
+                         f"X86_OP_* row")
+            continue
+        if b.name != r.pattern:
+            stale.append(f"{r.name}: base slot {r.src_line} now names "
+                         f"{b.name!r}")
+            continue
+        rows.append(dataclasses.replace(r, kind=b.kind))
+    if stale:
+        for why in stale:
+            print(f"  STALE VEX ROW {why}")
+        raise SystemExit(
+            f"x86: {len(stale)} encoding-qualified row(s) no longer match "
+            f"the decode table they were carved from -- re-run "
+            f"scripts/x86_vex_ident_instrument.py rather than joining an old "
+            f"carve to a new rule")
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'no decode-table row serves two encodings'")
+    return rows
 
 
 def parse_x86_qualified_identities() -> list[QemuIdent]:
@@ -5085,18 +5190,7 @@ def parse_x86_qualified_identities() -> list[QemuIdent]:
             f"scripts/x86_x87_ident_instrument.py.  Without it the x87 "
             f"escape rows report as unqualified, which is not what the "
             f"source says.")
-    rows: list[QemuIdent] = []
-    prov: tuple[str, int] | None = None
-    for line in path.read_text().splitlines():
-        m = IDENT_PROV_RE.match(line)
-        if m:
-            prov = (m.group(1), int(m.group(2)))
-            continue
-        m = IDENT_ROW_BARE_RE.match(line)
-        if m and prov is not None:
-            rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
-                                  prov[0], prov[1], X86_QUALIFIED_KIND))
-        prov = None
+    rows = _read_qualified_table(path, X86_QUALIFIED_KIND)
     if not rows:
         raise SystemExit(
             f"{path}: no identity rows matched -- the reader does not fit "

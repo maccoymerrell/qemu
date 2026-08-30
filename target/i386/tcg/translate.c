@@ -4095,6 +4095,60 @@ void tcg_x86_init(void)
                                   offsetof(CPUX86State, mxcsr),
                                   sizeof(((CPUX86State *)0)->mxcsr),
                                   sizeof(((CPUX86State *)0)->mxcsr), 1);
+
+    /*
+     * The DIRECTION FLAG.
+     *
+     * EFLAGS.DF is the one architectural flag QEMU does not keep in the
+     * lazy cc_* quartet: do_gen_string() reads env->df to build the pointer
+     * increment for every string instruction, and gen_CLD()/gen_STD() are
+     * the only writers.  The field IS EFLAGS.DF -- QEMU stores it as +1/-1
+     * rather than as bit 10, which is a representation choice and not a
+     * different register -- so it is declared under the GDB stub's name for
+     * the word it belongs to.  `rep stosq` is the witness: it reads this
+     * field to decide which way rdi walks, and until this declaration that
+     * read arrived downstream as an anonymous four-byte range.
+     */
+    insn_dataflow_declare_regfile("eflags", NULL,
+                                  offsetof(CPUX86State, df),
+                                  sizeof(((CPUX86State *)0)->df),
+                                  sizeof(((CPUX86State *)0)->df), 1);
+
+    /*
+     * XCR0, the extended control register.
+     *
+     * `xgetbv` reads it and returns it in edx:eax; no TCG global names it
+     * and it is not in the GDB stub's namespace, so the read arrives as a
+     * CPUArchState byte offset and only this file knows which register that
+     * offset is.  Declared under its architectural name.
+     */
+    insn_dataflow_declare_regfile("xcr0", NULL,
+                                  offsetof(CPUX86State, xcr0),
+                                  sizeof(((CPUX86State *)0)->xcr0),
+                                  sizeof(((CPUX86State *)0)->xcr0), 1);
+
+    /*
+     * The x87 STACK, declared as ONE register and not as eight.
+     *
+     * The reason eight is wrong is stated above the vector file: env->fpregs
+     * is indexed by PHYSICAL register while ST(i) is relative to env->fpstt,
+     * so an offset does not name an ST(i) without a run-time top.  That
+     * argument rules out naming an ELEMENT.  It does not rule out naming the
+     * FILE, and naming the file is what the accesses actually are: every x87
+     * instruction that reads the stack reaches it through a helper that
+     * takes the whole array, so what arrives here is off=fpregs size=128 --
+     * the container, exactly.
+     *
+     * It is declared with NO generic word on the consumer side on purpose.
+     * A container justifies a member (a published ST(0) is covered by a
+     * stated read of the file it lives in, #277) and it must never stand IN
+     * for one, which is what a generic word would let it do on the write
+     * side.
+     */
+    insn_dataflow_declare_regfile("fpregs", NULL,
+                                  offsetof(CPUX86State, fpregs),
+                                  sizeof(((CPUX86State *)0)->fpregs),
+                                  sizeof(((CPUX86State *)0)->fpregs), 1);
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

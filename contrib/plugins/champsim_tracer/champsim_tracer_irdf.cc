@@ -437,6 +437,21 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYSFPEN;
     }
     /*
+     * XCR0, x86's extended control register, DECLARED by
+     * target/i386/tcg/translate.c and absent from the i386 GDB stub's
+     * namespace -- the same shape as the thread pointers above, so the
+     * generated QEMU-indexed table cannot carry a row for it.
+     *
+     * REG_SYS is the vocabulary's residual privileged-file word and XCR0 is
+     * a privileged control register with no finer class in it, so this
+     * connects a spelling to a word rather than inventing either.  `xgetbv`
+     * is the witness: it reads XCR0 and returns it, and the wire has always
+     * published REG_SYS for it.
+     */
+    if (!strcmp(name, "xcr0")) {
+        return REG_SYS;
+    }
+    /*
      * The SOFTFLOAT STATUS FILE, one spelling on both targets that have one.
      *
      * `float_status` is QEMU's own container for the rounding mode, the

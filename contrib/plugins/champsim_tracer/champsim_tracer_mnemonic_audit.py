@@ -4832,6 +4832,26 @@ QEMU_IDENT_SOURCE_TABLES: dict[str, str] = {
     "x86": "target/i386/tcg/decode-new.c.inc",
 }
 
+# i386's decode table is not the whole of its identity universe.  The
+# eight escape rows 0xD8..0xDF all name `x87` and gen_x87() then dispatches
+# on the modrm byte internally, so those eight ids answer for the whole
+# x87 instruction set and one of them names an operation for every other
+# instruction under its escape byte too.
+# scripts/x86_x87_ident_instrument.py states the finer identity in the
+# source, one row per dispatch leaf, in the same row format the MIPS
+# hand-written table uses.  Reading only decode-new.c.inc here would
+# report those leaves as absent -- the census would say the escape rules
+# are unqualified and the split unresolved, which is a zero produced by
+# not looking.
+X86_IDENT_QUALIFIED = "target/i386/tcg/x87_ident.c.inc"
+
+# The emitter fact for a qualified leaf.  It is NOT an X86_OP_* macro
+# suffix: the leaf is a case label inside gen_x87, not a table row, so
+# there is no operand template to read and x86_emitter_refuses() must not
+# read one.  Naming the kind rather than borrowing the escape row's is
+# what keeps that honest.
+X86_QUALIFIED_KIND = "x87leaf"
+
 # One X86_OP_* macro site.  Group 1 is the macro suffix (the emitter
 # fact), group 2 the first argument, group 3 the second -- for the
 # three-operand forms that is op0_, the DESTINATION template, and it is
@@ -4973,6 +4993,56 @@ def parse_x86_identities() -> list[QemuIdent]:
         raise SystemExit(
             f"x86: {len(clashes)} source lines carry more than one slot -- "
             f"the exported id cannot tell them apart")
+    qualified = parse_x86_qualified_identities()
+    slots = {r.ident for r in rows}
+    collide = [q for q in qualified if q.ident in slots]
+    if collide:
+        for q in collide:
+            print(f"  ID COLLISION 0x{q.ident:08x}: {q.name} vs the "
+                  f"decode-new.c.inc slot at that id")
+        raise SystemExit(
+            f"x86: {len(collide)} qualified identity hash(es) collide with a "
+            f"__LINE__ slot -- two rules sharing one id merge silently in "
+            f"every consumer")
+    return rows + qualified
+
+
+def parse_x86_qualified_identities() -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED leaves of gen_x87's internal dispatch.
+
+    Same row format as the MIPS hand-written table: the provenance comment
+    is LIFTED above the row, because a 51-character identity plus a
+    trailing `/* file:line */` does not fit 80 columns.  Reading only the
+    one-line form would make every leaf invisible.
+
+    Fails loudly on an empty or absent table.  A missing file and 'the x87
+    space has no internal dispatch' are indistinguishable in a count, and
+    only one of them is a fact about QEMU.
+    """
+    path = ROOT / X86_IDENT_QUALIFIED
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_x87_ident_instrument.py.  Without it the x87 "
+            f"escape rows report as unqualified, which is not what the "
+            f"source says.")
+    rows: list[QemuIdent] = []
+    prov: tuple[str, int] | None = None
+    for line in path.read_text().splitlines():
+        m = IDENT_PROV_RE.match(line)
+        if m:
+            prov = (m.group(1), int(m.group(2)))
+            continue
+        m = IDENT_ROW_BARE_RE.match(line)
+        if m and prov is not None:
+            rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
+                                  prov[0], prov[1], X86_QUALIFIED_KIND))
+        prov = None
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'gen_x87 has no internal dispatch'")
     return rows
 
 

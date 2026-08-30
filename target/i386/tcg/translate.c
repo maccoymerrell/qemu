@@ -2718,6 +2718,34 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
 
 #include "emit.c.inc"
 
+/*
+ * THE x87 ESCAPE SPACE HAS EIGHT DECODE-TABLE ROWS AND OVER A HUNDRED
+ * INSTRUCTIONS.
+ *
+ * decode-new.c.inc gives each of 0xD8..0xDF one X86_OP_ENTRY row, and the
+ * identity plugin_gen_record_insn_identity() publishes for it is that
+ * row's __LINE__.  gen_x87() then dispatches on the modrm byte itself, so
+ * one identity answers for every instruction under an escape byte, and a
+ * consumer that learns what the rule decodes to from watching it decode
+ * learns whichever instruction it happened to see: the 0xD8 row was
+ * observed with an `fadds` and thereafter named an addition for `fdivs`
+ * too.  The discriminator never reaches the decode table, so no amount of
+ * further observation can settle it.
+ *
+ * scripts/x86_x87_ident_instrument.py states the finer identity, reading
+ * the switches below and emitting one row per dispatch leaf into
+ * x87_ident.c.inc, named by the fixed (opcode, modrm) bits that select it.
+ * The eight escape rows keep their own ids and their name; an encoding
+ * gen_x87 refuses publishes nothing and leaves the escape row's identity
+ * exactly as it was.
+ *
+ * The publish sits on the RETURNING path, not at the point the leaf is
+ * chosen: the CR0.EM/TS arm returns before any decode happens, and every
+ * refusal jumps to illegal_op past it, so what is published is a decision
+ * the emulator took rather than one it considered.
+ */
+#include "x87_ident.c.inc"
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -3274,6 +3302,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         tcg_gen_st_tl(eip_cur_tl(s),
                       tcg_env, offsetof(CPUX86State, fpip));
     }
+    x87_ident_publish(b, modrm);  /* x87_ident */
     return;
 
  illegal_op:

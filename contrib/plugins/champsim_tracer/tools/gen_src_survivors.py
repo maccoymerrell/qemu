@@ -39,34 +39,156 @@ from one workload and the plugin's own flip-cost census immediately reported
 aarch64 FP/SIMD rules the first corpus never executed, one x86 `movsd` and
 one mipsel `addu rd,rs,$zero`.  The CLASSES were right; the ROW SET was the
 corpus's.  So the generator takes as many sidecars per ISA as the caller has,
-and the caller is expected to hand it every corpus the tree gates on.  The
-residual it cannot remove is the flip-cost census's `no-table-row` count,
-which is what says how much of the population was never scored at all.
+and the caller is expected to hand it every corpus the tree gates on.
+
+THREE THINGS THIS REFUSES TO DO, each because it did them once and the
+result was false:
+
+1. IT WILL NOT READ A LIVE PATH.  The sidecars it reads are produced by
+   `golden_net.py validate`, which deletes and re-creates the cell
+   directories it is about to run.  A generator reading those paths directly
+   races the gate that writes them, and a table derived half from one run and
+   half from the next is not derived from anything.  So emitting requires a
+   SNAPSHOT: `--snapshot DIR <isa>=<path> ...` copies every input into DIR
+   and writes DIR/MANIFEST.sha256; `--out H --from-snapshot DIR` re-verifies
+   every copy against that manifest and emits from the copies alone.  A
+   changed byte, a missing file, or a bare path handed to the emit mode is a
+   refusal, not a warning.
+
+2. IT WILL NOT SAY AN EMPTY TABLE IS TRUE OF THE ISA.  The header this
+   generator emitted before carried, for riscv64, the sentence "every
+   published source on this ISA is justified by QEMU's read list, so the
+   flip has nothing to carry".  Measured against the golden net at the same
+   tip, riscv64 was the WORST ISA: 139 published sources the union did not
+   contain.  The sentence was not false about the corpus it was derived
+   from -- that corpus really did print `(none)` -- it was false about the
+   ISA, which is what it said.  An empty table is now written as a fact
+   about THE SIDECARS, named and counted, and the header refuses the
+   generalisation in its own words.
+
+3. IT WILL NOT KEY A ROW ON A DECODE ID THAT CARRIES MORE THAN ONE
+   INSTRUCTION.  x86 decode id 0x00000776 is QEMU's `x87` slot and carries
+   `fldt`, `fstpt` and `fucomi`; a row derived from `fstpt` and keyed on the
+   id alone fired on `fldt`, which does not read FPR0, and the plugin's own
+   FABRICATION row read 2.  The census already measures this, twice, and the
+   generator reads BOTH:
+
+     the DECODE-IDENTITY COLLISION WITNESS -- (decode id, rule, mnemonic)
+       over the WHOLE scored population.  An id printed with two different
+       mnemonics is one rule carrying several instructions, and that is the
+       criterion, because it is the exact condition under which an id-keyed
+       row fabricates.  It is strictly wider than the one below: x86
+       0x0000054b is QEMU's NOP slot, carries `endbr64` beside `rdsspq`, and
+       the census does NOT call it split (it is adjudicated), so a table
+       keyed on the id alone would have handed 410 `endbr64` rows a
+       REG_GPR0 + REG_SSP source they do not have.
+     the QID_SPLIT set, from "SURVIVOR rules REACHED by this run", kept as
+       well because it names ids whose CLASSIFICATION is ambiguous even when
+       this corpus happened to reach only one spelling.
+
+4. IT WILL NOT CARRY A ROW THE CENSUS COUNTS AS ADJUDICATION-OWED.  Those
+   are the (id, register) pairs whose deletion was written, landed, measured
+   against the external references and REVERTED because the references
+   contradicted it -- riscv64 `fence` REG_SYS, x86_64 `rdsspq`
+   REG_GPR0 + REG_SSP.  Carrying one would move it out of the loss direction
+   and drop the ADJUDICATION-OWED count to zero, and that count is the thing
+   that says no source-list flip may land while a maintainer question is
+   open.  Answering an open question by making its counter read zero is the
+   failure this whole file is shaped against, so those rows are refused with
+   their own reason and stay owed.
+
+   The refused rows are printed and written into the header as a comment,
+   because a row that is not carried stays in the loss direction and blocks
+   the flip -- that has to be visible rather than silently absent.
 
 Usage:
-  gen_src_survivors.py --out <header> <isa>=<stats.log> [<isa>=<stats.log> ...]
+  gen_src_survivors.py --snapshot DIR <isa>=<stats.log> [<isa>=<stats.log> ...]
+  gen_src_survivors.py --out <header> --from-snapshot DIR
+  gen_src_survivors.py --selftest
 
 An ISA may be repeated; the rows union.
+
+Author: Maccoy Merrell.
 """
+import hashlib
+import os
 import re
+import shutil
 import sys
+import tempfile
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
+SPLIT_HDR = "SURVIVOR rules REACHED by this run"
+WITNESS_HDR = "DECODE-IDENTITY COLLISION WITNESS"
+OWED_HDR = "ADJUDICATION-OWED -- published sources"
 ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+(SELF|FIXED)\s+(\S+)\s*$")
+SPLIT_ROW = re.compile(r"^\s*0x([0-9a-f]{8})\s+QID_SPLIT\s")
+WITNESS_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(\S+)\s*$")
+OWED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+Q:")
+MANIFEST = "MANIFEST.sha256"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def parse(path):
-    """Return {(decode_id, kind, reg): (rule, count, mnemonics)} for one ISA."""
+    """Return (rows, ambiguous_ids, owed, saw_none) for one sidecar.
+
+    rows           {(decode_id, role, reg): (rule, count, {mnemonics})}
+    ambiguous_ids  {decode_id} that must not key a row: the collision
+                   witness shows the id carrying more than one mnemonic, or
+                   the census reports it QID_SPLIT
+    owed           {(decode_id, reg)} the census counts as ADJUDICATION-OWED
+    saw_none       True when the survivor block was present and read `(none)`
+    """
     text = open(path, "r", errors="replace").read()
     if HDR not in text:
         sys.exit("FAIL %s: no survivor block -- the census did not run" % path)
+
+    split_ids = set()
+    if SPLIT_HDR in text:
+        for line in text.split(SPLIT_HDR, 1)[1].splitlines():
+            m = SPLIT_ROW.match(line)
+            if m:
+                split_ids.add(int(m.group(1), 16))
+            elif split_ids and not line.strip():
+                # The block ends at its first blank line; the lines BEFORE the
+                # first row are the block's own prose (and the tail of the
+                # header line the split above cut), which must not end it.
+                break
+
+    if WITNESS_HDR in text:
+        seen = {}
+        for line in text.split(WITNESS_HDR, 1)[1].splitlines():
+            m = WITNESS_ROW.match(line)
+            if m:
+                seen.setdefault(int(m.group(1), 16), set()).add(m.group(3))
+            elif seen and not line.strip():
+                break
+        for did, mn in seen.items():
+            if len(mn) > 1:
+                split_ids.add(did)
+
+    owed = set()
+    if OWED_HDR in text:
+        for line in text.split(OWED_HDR, 1)[1].splitlines():
+            m = OWED_ROW.match(line)
+            if m:
+                owed.add((int(m.group(1), 16), m.group(3)))
+            elif owed and not line.strip():
+                break
+
     block = text.split(HDR, 1)[1]
-    rows = {}
-    seen_any = False
+    rows, seen_any = {}, False
     for line in block.splitlines():
         if line.strip() == "(none)":
-            return rows, True
+            return rows, split_ids, owed, True
         m = ROW.match(line)
         if not m:
             if seen_any and not line.strip():
@@ -75,41 +197,96 @@ def parse(path):
         seen_any = True
         cnt, did, rule, reg, role, mnem = m.groups()
         key = (int(did, 16), role, reg if role == "FIXED" else "")
-        rule_, c, mn = rows.get(key, (rule, 0, set()))
+        _, c, mn = rows.get(key, (rule, 0, set()))
         rows[key] = (rule, c + int(cnt), mn | {mnem})
     if not seen_any:
         sys.exit("FAIL %s: survivor block present but unparsable" % path)
-    return rows, True
+    return rows, split_ids, owed, False
 
 
-def main(argv):
-    out = None
-    inputs = {}
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--out":
-            out = argv[i + 1]
-            i += 2
-            continue
-        isa, _, path = argv[i].partition("=")
-        if isa not in ISAS:
-            sys.exit("unknown isa %r" % isa)
-        inputs.setdefault(isa, []).append(path)
-        i += 1
-    if not out or sorted(inputs) != sorted(ISAS):
-        sys.exit(__doc__)
-
-    per = {}
+def make_snapshot(dest, inputs):
+    """Copy every input under @dest and record its sha256.  The copies are
+    what the emit mode reads, so a gate re-running underneath cannot move the
+    table's inputs out from under it."""
+    os.makedirs(dest, exist_ok=True)
+    lines, n = [], 0
     for isa in ISAS:
-        merged = {}
+        for i, path in enumerate(inputs.get(isa, [])):
+            if not os.path.isfile(path):
+                sys.exit("FAIL: no such sidecar: %s" % path)
+            name = "%s.%02d.%s" % (isa, i, os.path.basename(path))
+            shutil.copyfile(path, os.path.join(dest, name))
+            lines.append("%s  %s  %s" % (sha256(path), name, os.path.abspath(path)))
+            n += 1
+    if not n:
+        sys.exit("FAIL: --snapshot with no inputs; a snapshot of nothing is "
+                 "not a corpus")
+    with open(os.path.join(dest, MANIFEST), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("snapshot %s: %d sidecar(s), manifest %s" % (dest, n, MANIFEST))
+    return 0
+
+
+def read_snapshot(src):
+    """Verify @src against its manifest and return {isa: [paths]}."""
+    man = os.path.join(src, MANIFEST)
+    if not os.path.isfile(man):
+        sys.exit("FAIL: %s has no %s -- emitting is only allowed from a "
+                 "snapshot this tool made (a live path races the gate that "
+                 "writes it)" % (src, MANIFEST))
+    out, n = {}, 0
+    for line in open(man):
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        want, name, origin = line.split("  ", 2)
+        path = os.path.join(src, name)
+        if not os.path.isfile(path):
+            sys.exit("FAIL: snapshot %s is missing %s (from %s)"
+                     % (src, name, origin))
+        got = sha256(path)
+        if got != want:
+            sys.exit("FAIL: snapshot %s: %s changed under us\n"
+                     "  manifest %s\n  now      %s" % (src, name, want, got))
+        isa = name.split(".", 1)[0]
+        if isa not in ISAS:
+            sys.exit("FAIL: snapshot %s: %s names no known ISA" % (src, name))
+        out.setdefault(isa, []).append(path)
+        n += 1
+    if sorted(out) != sorted(ISAS):
+        sys.exit("FAIL: snapshot %s covers %s; all four ISAs are required "
+                 "(a table missing an ISA reads as 'this ISA has no "
+                 "survivors', which is the falsehood this refuses to emit)"
+                 % (src, sorted(out)))
+    print("snapshot %s verified: %d sidecar(s), all four ISAs" % (src, n))
+    return out
+
+
+def emit(out, inputs, src):
+    per, splits, seen, clean, owed = {}, {}, {}, {}, {}
+    for isa in ISAS:
+        merged, sp, ow, files, all_none = {}, set(), set(), 0, True
         for path in inputs[isa]:
-            rows, ok = parse(path)
-            if not ok:
-                sys.exit("FAIL %s: census absent" % path)
+            rows, s, o, saw_none = parse(path)
+            files += 1
+            sp |= s
+            ow |= o
+            if not saw_none:
+                all_none = False
             for key, (rule, cnt, mn) in rows.items():
-                r0, c0, m0 = merged.get(key, (rule, 0, set()))
+                _, c0, m0 = merged.get(key, (rule, 0, set()))
                 merged[key] = (rule, c0 + cnt, m0 | mn)
-        per[isa] = merged
+        per[isa], splits[isa], seen[isa], owed[isa] = merged, sp, files, ow
+        clean[isa] = all_none and files > 0
+
+    # REFUSAL 3: an id that carries more than one instruction cannot key a row.
+    refused = {isa: [] for isa in ISAS}
+    for isa in ISAS:
+        for key in list(per[isa]):
+            if key[0] in splits[isa]:
+                refused[isa].append((key, per[isa].pop(key), "AMBIGUOUS"))
+            elif (key[0], key[2]) in owed[isa]:
+                refused[isa].append((key, per[isa].pop(key), "OWED"))
 
     w = []
     a = w.append
@@ -121,6 +298,16 @@ def main(argv):
     a(" * register the tracer's per-ISA decode publishes as a source that QEMU's")
     a(" * ordered read list does not state -- the population R12.1 forbids")
     a(" * dropping when the source list stops being the operand walk's.")
+    a(" *")
+    a(" * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus")
+    a(" * is %s, %d sidecar(s):" % (os.path.abspath(src),
+                                    sum(seen[i] for i in ISAS)))
+    for isa in ISAS:
+        a(" *   %-8s %d sidecar(s), %d row(s)%s"
+          % (isa, seen[isa], len(per[isa]),
+             ", %d REFUSED on an ambiguous id" % len(refused[isa])
+             if refused[isa] else ""))
+    a(" * Nothing here says anything about an instruction no sidecar executed.")
     a(" *")
     a(" * Author: Maccoy Merrell.")
     a(" */")
@@ -152,14 +339,38 @@ def main(argv):
     for isa in ISAS:
         rows = per[isa]
         ents = sum(v[1] for v in rows.values())
-        a("/* %s -- %d row%s, %d census entr%s */"
+        a("/* %s -- %d row%s, %d census entr%s, from %d sidecar(s) */"
           % (isa, len(rows), "" if len(rows) == 1 else "s",
-             ents, "y" if ents == 1 else "ies"))
+             ents, "y" if ents == 1 else "ies", seen[isa]))
+        for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
+            a("/* REFUSED, not carried: 0x%08xu %s %s (%s x%d) --"
+              % (did, rule, reg or "SELF", ",".join(sorted(mn)), cnt))
+            if why == "AMBIGUOUS":
+                a(" * the census shows this decode id carrying more than one")
+                a(" * instruction, so an id-keyed row would fire on the others")
+                a(" * too.  It stays in the loss direction and blocks the flip")
+                a(" * until the id is qualified. */")
+            else:
+                a(" * the census counts this row as ADJUDICATION-OWED: an open")
+                a(" * maintainer question, measured against the external")
+                a(" * references and reverted.  Carrying it would zero the")
+                a(" * count that blocks the flip while the question is open,")
+                a(" * which is answering it by arithmetic. */")
         if not rows:
-            a("/* No array: every published source on this ISA is justified by")
-            a(" * QEMU's read list, so the flip has nothing to carry.  An EMPTY")
-            a(" * table is a RESULT here and the descriptor below says so with a")
-            a(" * null pointer rather than a zero-length array. */")
+            a("/* No array.  THIS IS A FACT ABOUT THE %d SIDECAR(S) NAMED"
+              % seen[isa])
+            a(" * ABOVE, NOT ABOUT THE ISA: each of them printed the survivor")
+            if clean[isa]:
+                a(" * block and each read `(none)`, so no instruction THEY")
+                a(" * EXECUTED publishes a source QEMU's read list lacks.")
+            else:
+                a(" * block and none of them contributed a row, so no")
+                a(" * instruction THEY EXECUTED publishes a source QEMU's read")
+                a(" * list lacks.")
+            a(" * An instruction no sidecar ran is not covered by this and")
+            a(" * would land in the census's loss direction the first time it")
+            a(" * does run.  A wider corpus is the only thing that widens this")
+            a(" * claim; the null pointer below does not. */")
             a("")
             continue
         a("static const SrcSurvivorRow g_src_survivors_%s[] = {" % isa)
@@ -171,8 +382,9 @@ def main(argv):
         a("};")
         a("")
         total += len(rows)
-    a("/* Indexed by TraceISA.  A null row pointer is \"this ISA has no")
-    a(" * survivors\", which is a measured answer and not a missing table. */")
+    a("/* Indexed by TraceISA.  A null row pointer means the arrays above say")
+    a(" * which of the two things it is for that ISA -- a measured `(none)` or")
+    a(" * a corpus that never reached it. */")
     a("static const SrcSurvivorTable g_src_survivor_tables[] = {")
     a("    [TRACE_ISA_UNKNOWN] = { NULL, 0 },")
     for isa, enum in (("x86_64", "TRACE_ISA_X86"), ("aarch64", "TRACE_ISA_AARCH64"),
@@ -188,8 +400,172 @@ def main(argv):
     a("")
     a("#endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */")
     open(out, "w").write("\n".join(w) + "\n")
-    print("wrote %s: %d rows" % (out, total))
+    nref = sum(len(refused[i]) for i in ISAS)
+    print("wrote %s: %d rows, %d refused on an ambiguous decode id"
+          % (out, total, nref))
+    for isa in ISAS:
+        for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
+            print("  REFUSED %-8s 0x%08x %s %s (%s x%d): %s"
+                  % (isa, did, rule, reg or "SELF", ",".join(sorted(mn)), cnt,
+                     "the id carries more than one instruction"
+                     if why == "AMBIGUOUS" else
+                     "ADJUDICATION-OWED, an open maintainer question"))
+        if not per[isa]:
+            print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "
+                  "about those sidecars, not about the ISA" % (isa, seen[isa]))
     return 0
+
+
+# ---------------------------------------------------------------- selftest
+_BLOCK = """
+%s -- the same
+rows as the block above.  This is the column tools/gen_src_survivors.py reads:
+%s
+
+%s -- (decode id, rule, mnemonic):
+%s
+
+SURVIVOR rules REACHED by this run, by decode rule:
+%s
+
+%s the union does not
+contain that are NOT counted as MISSING:
+%s
+
+next section
+""" % (HDR, "%s", WITNESS_HDR, "%s", "%s", OWED_HDR, "%s")
+
+
+def _sidecar(path, rows, splits, witness=(), owed=()):
+    open(path, "w").write(_BLOCK % ("\n".join(rows) or "  (none)",
+                                    "\n".join(witness),
+                                    "\n".join(splits),
+                                    "\n".join(owed)))
+
+
+def selftest():
+    d = tempfile.mkdtemp(prefix="gen_src_survivors_selftest.")
+    fails = []
+
+    def chk(name, cond, why=""):
+        print("  %-46s %s%s" % (name, "ok" if cond else "FAIL",
+                                "" if cond else "  -- " + why))
+        if not cond:
+            fails.append(name)
+
+    import subprocess
+    me = [sys.executable, os.path.abspath(__file__)]
+
+    good = ["       521  000006da RET                        REG_SEG5"
+            "       FIXED retq"]
+    split = ["         2  00000776 x87                        REG_FPR0"
+             "       FIXED fstpt",
+             "         3  0000054b NOP                        REG_SSP"
+             "        FIXED rdsspq"]
+    splitline = ["    0x00000776 QID_SPLIT      x87                      15"]
+    # 0x0000054b is NOT QID_SPLIT; only the collision witness catches it.
+    witness = ["       521  000006da RET                        retq",
+               "         2  00000776 x87                        fstpt",
+               "         1  00000776 x87                        fldt",
+               "       410  0000054b NOP                        endbr64",
+               "         3  0000054b NOP                        rdsspq"]
+
+    owedrow = ["        16  ecf2c479 decode_insn32/fence        REG_SYS"
+               "        fence     Q: does R7.4 reach FIOM?"]
+    owedsurv = ["        16  ecf2c479 decode_insn32/fence        REG_SYS"
+                "        FIXED fence"]
+    x = os.path.join(d, "x86_64.log")
+    _sidecar(x, good + split + owedsurv, splitline, witness, owedrow)
+    a_ = os.path.join(d, "aarch64.log"); _sidecar(a_, [], [])
+    r = os.path.join(d, "riscv64.log"); _sidecar(r, [], [])
+    m = os.path.join(d, "mipsel.log"); _sidecar(m, [], [])
+
+    snap = os.path.join(d, "snap")
+    rc = subprocess.run(me + ["--snapshot", snap, "x86_64=" + x,
+                              "aarch64=" + a_, "riscv64=" + r, "mipsel=" + m],
+                        capture_output=True, text=True)
+    chk("ARM A: snapshot is created", rc.returncode == 0, rc.stderr.strip())
+
+    h = os.path.join(d, "out.h")
+    rc = subprocess.run(me + ["--out", h, "--from-snapshot", snap],
+                        capture_output=True, text=True)
+    txt = open(h).read() if os.path.exists(h) else ""
+    chk("ARM B: emit from a verified snapshot", rc.returncode == 0,
+        rc.stderr.strip())
+    chk("ARM C: the QID_SPLIT row is NOT carried",
+        "0x00000776u, SRC_SURV" not in txt)
+    chk("ARM C1: an id the WITNESS alone shows colliding is NOT carried",
+        "0x0000054bu, SRC_SURV" not in txt)
+    chk("ARM C2: and both are REPORTED, not silently dropped",
+        "REFUSED, not carried: 0x00000776" in txt
+        and "REFUSED, not carried: 0x0000054b" in txt
+        and "carries \nmore than one" not in txt
+        and "more than one instruction" in rc.stdout)
+    chk("ARM D: the un-split row IS carried", "0x000006dau, SRC_SURV" in txt)
+    chk("ARM D1: an ADJUDICATION-OWED row is NOT carried",
+        "0xecf2c479u, SRC_SURV" not in txt
+        and "ADJUDICATION-OWED, an open maintainer question" in rc.stdout)
+    chk("ARM E: an empty table is scoped to the sidecars, not the ISA",
+        "FACT ABOUT THE" in txt and "NOT ABOUT THE ISA" in txt)
+    chk("ARM F: and it makes no claim about the ISA in general",
+        "every published source on this ISA is justified" not in txt)
+
+    rc = subprocess.run(me + ["--out", h + ".2", "x86_64=" + x,
+                              "aarch64=" + a_, "riscv64=" + r, "mipsel=" + m],
+                        capture_output=True, text=True)
+    chk("ARM G: emitting from LIVE paths is refused",
+        rc.returncode != 0 and not os.path.exists(h + ".2"), rc.stdout.strip())
+
+    open(os.path.join(snap, "x86_64.00.x86_64.log"), "a").write("tamper\n")
+    rc = subprocess.run(me + ["--out", h + ".3", "--from-snapshot", snap],
+                        capture_output=True, text=True)
+    chk("ARM H: a snapshot that moved under us is refused",
+        rc.returncode != 0 and "changed under us" in (rc.stdout + rc.stderr))
+
+    shutil.rmtree(d, ignore_errors=True)
+    print("\ngen_src_survivors.py selftest: %d check(s), %d failure(s)"
+          % (10, len(fails)))
+    return 1 if fails else 0
+
+
+def main(argv):
+    if argv[:1] == ["--selftest"]:
+        return selftest()
+    out = snapshot = from_snapshot = None
+    inputs, i = {}, 0
+    while i < len(argv):
+        if argv[i] == "--out":
+            out = argv[i + 1]; i += 2; continue
+        if argv[i] == "--snapshot":
+            snapshot = argv[i + 1]; i += 2; continue
+        if argv[i] == "--from-snapshot":
+            from_snapshot = argv[i + 1]; i += 2; continue
+        isa, _, path = argv[i].partition("=")
+        if isa not in ISAS:
+            sys.exit("unknown isa %r" % isa)
+        inputs.setdefault(isa, []).append(path)
+        i += 1
+
+    if snapshot:
+        if out or from_snapshot:
+            sys.exit("--snapshot takes inputs and nothing else")
+        if sorted(inputs) != sorted(ISAS):
+            sys.exit("--snapshot needs at least one sidecar for each of %s"
+                     % ", ".join(ISAS))
+        return make_snapshot(snapshot, inputs)
+
+    if not out:
+        sys.exit(__doc__)
+    if not from_snapshot:
+        sys.exit("REFUSING: emitting requires --from-snapshot DIR.\n"
+                 "A sidecar path is written by the same gate that produces "
+                 "it, and reading one live gave this table a corpus that no "
+                 "single run ever had.  Run --snapshot DIR <isa>=<path>... "
+                 "first, then emit from DIR.")
+    if inputs:
+        sys.exit("REFUSING: --from-snapshot and bare <isa>=<path> inputs "
+                 "together; the snapshot is the corpus or nothing is")
+    return emit(out, read_snapshot(from_snapshot), from_snapshot)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,14 @@
  * ordered read list does not state -- the population R12.1 forbids
  * dropping when the source list stops being the operand walk's.
  *
+ * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
+ * is /mnt/md0/QEMU/cst_runs/p3/arc3/exec55/pass2/snapshot, 32 sidecar(s):
+ *   x86_64   10 sidecar(s), 13 row(s), 3 REFUSED on an ambiguous id
+ *   aarch64  8 sidecar(s), 8 row(s)
+ *   riscv64  7 sidecar(s), 10 row(s), 1 REFUSED on an ambiguous id
+ *   mipsel   7 sidecar(s), 1 row(s)
+ * Nothing here says anything about an instruction no sidecar executed.
+ *
  * Author: Maccoy Merrell.
  */
 #ifndef CHAMPSIM_TRACER_SRC_SURVIVORS_H
@@ -33,80 +41,90 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 7 rows, 584 census entries */
+/* x86_64 -- 13 rows, 603 census entries, from 10 sidecar(s) */
+/* REFUSED, not carried: 0x0000054bu NOP REG_GPR0 (rdsspq x3) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x0000054bu NOP REG_SSP (rdsspq x3) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x00000774u x87 SELF (fxch x14) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
+    { 0x00000384u, SRC_SURV_SELF , REG_NONE      , "PINSR" },   /* pinsrd x8 */
     { 0x000003cdu, SRC_SURV_SELF , REG_NONE      , "VMOVLPx" },   /* movsd x2 */
     { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , "VMOVLPx_ld" },   /* movlpd x7 */
     { 0x00000419u, SRC_SURV_SELF , REG_NONE      , "VMOVHPx_ld" },   /* movhps x4 */
     { 0x0000041au, SRC_SURV_SELF , REG_NONE      , "VMOVHPx_ld" },   /* movhpd x4 */
-    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , "RET" },   /* retq x526 */
+    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , "RET" },   /* retq x527 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG0      , "MOV" },   /* movw x2 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG1      , "MOV" },   /* movw x2 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG2      , "MOV" },   /* movw x2 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG3      , "MOV" },   /* movw x2 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG4      , "MOV" },   /* movw x2 */
+    { 0x00000745u, SRC_SURV_FIXED, REG_SEG5      , "MOV" },   /* movw x2 */
     { 0x00000767u, SRC_SURV_SELF , REG_NONE      , "LEAVE" },   /* leave x39 */
-    { 0x00000776u, SRC_SURV_FIXED, REG_FPR0      , "x87" },   /* fstpt x2 */
 };
 
-/* aarch64 -- 35 rows, 184 census entries */
+/* aarch64 -- 8 rows, 15 census entries, from 8 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_aarch64[] = {
-    { 0x07db0dd8u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LD_mult@0.001100.10.....1010............" },   /* ld1 x2 */
-    { 0x1b55859du, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LDR_v_i@00111100110.........11.........." },   /* ldr x6 */
-    { 0x1babbcc3u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/ABS_v" },   /* abs x2 */
-    { 0x1bb429dau, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LDR_v_i@0011110111......................" },   /* ldr x22 */
-    { 0x22418e9fu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/SHRN_v@0.00111100001...100001.........." },   /* shrn x9 */
-    { 0x247a246bu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LDP_v@1010110101......................" },   /* ldp x20 */
+    { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x2 */
+    { 0x13e03a7eu, SRC_SURV_SELF , REG_NONE      , "disas_a64/FSUB_v@0.0011101.1.....110101.........." },   /* fsub x2 */
+    { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , "disas_a64/INS_general" },   /* mov x2 */
     { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , "disas_a64/FABS_s" },   /* fabs x1 */
-    { 0x30a7252au, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/FABS_s" },   /* fabs x1 */
-    { 0x41dbc9c5u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/SABD_v" },   /* sabd x2 */
-    { 0x4fbbcf8bu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LDR_v_i@..11110101......................" },   /* ldr x10 */
-    { 0x509c5f9eu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/CMHS_v" },   /* cmhs x5 */
-    { 0x515000c3u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LDR_v_i@00111100110.........00.........." },   /* ldur x1 */
-    { 0x58ec15fdu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/PMUL_v" },   /* pmul x2 */
-    { 0x601d078cu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/ZIP1" },   /* zip1 x2 */
-    { 0x605df073u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/MLA_v" },   /* mla x2 */
-    { 0x6129f221u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LD_mult@0.001100.10.....0010............" },   /* ld1 x2 */
-    { 0x64cb0abdu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/MLS_v" },   /* mls x2 */
-    { 0x6c41b0f9u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/CMEQ_v" },   /* cmeq x12 */
-    { 0x6c7a295du, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/Vimm" },   /* bic,movi,mvni x10 */
-    { 0x757f650du, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/EXT_q" },   /* ext x3 */
-    { 0x78d05764u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/FMOV_s" },   /* fmov x2 */
-    { 0x7b4cfd32u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LD_mult@0.001100.10.....0110............" },   /* ld1 x2 */
-    { 0x88a5ca54u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/BIT_v" },   /* bit x7 */
-    { 0x9271162du, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/LD_mult@0.001100.10.....0111............" },   /* ld1 x7 */
-    { 0x93ea4495u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/TRN1" },   /* trn1 x2 */
-    { 0xa895fe02u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/ADDP_v" },   /* addp x3 */
-    { 0xb5dd7901u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/STP_v@1010110010......................" },   /* stp x1 */
-    { 0xbb863ba4u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/DUP_general" },   /* dup x8 */
-    { 0xc43e92d6u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/NOT_v" },   /* mvn x2 */
-    { 0xc557a631u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/EOR_v" },   /* eor x8 */
-    { 0xc7124336u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/BSL_v" },   /* bsl x2 */
-    { 0xc8963eaau, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/UMAXP_v" },   /* umaxp x17 */
-    { 0xcc384ebeu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/UZP1" },   /* uzp1 x2 */
-    { 0xd192549eu, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/ORR_v" },   /* mov x3 */
-    { 0xf8b0ed76u, SRC_SURV_FIXED, REG_SYSFPEN   , "disas_a64/STP_v@1010110110......................" },   /* stp x2 */
+    { 0x583d7c95u, SRC_SURV_SELF , REG_NONE      , "disas_a64/FDIV_v@0.1011100.1.....111111.........." },   /* fdiv x2 */
+    { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , "disas_a64/NOP@1111100110......................" },   /* prfm x2 */
+    { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , "disas_a64/NOP@11111000100.........00.........." },   /* prfum x2 */
+    { 0xe91326acu, SRC_SURV_SELF , REG_NONE      , "disas_a64/FADD_v@0.0011100.1.....110101.........." },   /* fadd x2 */
 };
 
-/* riscv64 -- 0 rows, 0 census entries */
-/* No array: every published source on this ISA is justified by
- * QEMU's read list, so the flip has nothing to carry.  An EMPTY
- * table is a RESULT here and the descriptor below says so with a
- * null pointer rather than a zero-length array. */
+/* riscv64 -- 10 rows, 76 census entries, from 7 sidecar(s) */
+/* REFUSED, not carried: 0xecf2c479u decode_insn32/fence REG_SYS (fence x17) --
+ * the census counts this row as ADJUDICATION-OWED: an open
+ * maintainer question, measured against the external
+ * references and reverted.  Carrying it would zero the
+ * count that blocks the flip while the question is open,
+ * which is answering it by arithmetic. */
+static const SrcSurvivorRow g_src_survivors_riscv64[] = {
+    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC4      , "decode_insn32/vsub_vv" },   /* vsub.vv x1 */
+    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC5      , "decode_insn32/vsub_vv" },   /* vsub.vv x1 */
+    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , "decode_insn32/vsub_vv" },   /* vsub.vv x2 */
+    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , "decode_insn32/vmv_v_v" },   /* vmv.v.v x64 */
+    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC1      , "decode_insn32/vadd_vv" },   /* vadd.vv x1 */
+    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC2      , "decode_insn32/vadd_vv" },   /* vadd.vv x1 */
+    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , "decode_insn32/vadd_vv" },   /* vadd.vv x2 */
+    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC7      , "decode_insn32/vmul_vv" },   /* vmul.vv x1 */
+    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC8      , "decode_insn32/vmul_vv" },   /* vmul.vv x1 */
+    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , "decode_insn32/vmul_vv" },   /* vmul.vv x2 */
+};
 
-/* mipsel -- 1 row, 2 census entries */
+/* mipsel -- 1 row, 2 census entries, from 7 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
     { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , "translate_mips/OPC_MTHC1" },   /* mthc1 x2 */
 };
 
-/* Indexed by TraceISA.  A null row pointer is "this ISA has no
- * survivors", which is a measured answer and not a missing table. */
+/* Indexed by TraceISA.  A null row pointer means the arrays above say
+ * which of the two things it is for that ISA -- a measured `(none)` or
+ * a corpus that never reached it. */
 static const SrcSurvivorTable g_src_survivor_tables[] = {
     [TRACE_ISA_UNKNOWN] = { NULL, 0 },
     [TRACE_ISA_X86    ] = { g_src_survivors_x86_64,
                             G_N_ELEMENTS(g_src_survivors_x86_64) },
     [TRACE_ISA_AARCH64] = { g_src_survivors_aarch64,
                             G_N_ELEMENTS(g_src_survivors_aarch64) },
-    [TRACE_ISA_RISCV  ] = { NULL, 0 },
+    [TRACE_ISA_RISCV  ] = { g_src_survivors_riscv64,
+                            G_N_ELEMENTS(g_src_survivors_riscv64) },
     [TRACE_ISA_MIPS   ] = { g_src_survivors_mipsel,
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 43 rows over the four ISAs. */
+/* 32 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

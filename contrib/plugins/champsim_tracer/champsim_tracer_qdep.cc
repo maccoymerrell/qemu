@@ -162,12 +162,25 @@ GHashTable *g_src_qemu_extra_sig = nullptr;
  * One decode rule can carry several instructions -- x86 `clflush` decodes
  * through QEMU's NOP row -- so a survivor table keyed on the id alone would
  * hand one instruction's sources to another.  This tally is (decode id,
- * mnemonic) over the SAME scored population, so a decode id that shows more
- * than one mnemonic is visible as a collision instead of being discovered
- * after the table is built.
+ * mnemonic) over EVERY row apply_dst() is reached for -- NOT only the rows
+ * whose read list QEMU stated, which is the narrower population the
+ * survivor tally beside it scores.  The two are deliberately different
+ * subjects and @g_src_ident_witness_reached is what says so out loud.
  */
 GHashTable *g_src_survivor_ident = nullptr;
 GHashTable *g_src_ident_witness = nullptr;
+/*
+ * THE COLLISION WITNESS'S OWN POPULATION, so its completeness is a
+ * measurement instead of a sentence in its header.
+ *
+ * Every row the witness site is reached for increments this; the report
+ * prints it beside the SUM of the printed counts and the difference is a
+ * must-be-0.  Before this existed the witness sat inside the read-list gate
+ * while its header claimed the whole population, and the shortfall was
+ * invisible: nothing compared what it had seen with what it printed.  A
+ * list that cannot state its own coverage cannot be read as coverage.
+ */
+std::atomic<uint64_t> g_src_ident_witness_reached{0};
 /*
  * THE FLIP'S COST, PER PUBLISHED SOURCE, measured against the survivor
  * table rather than argued from it.
@@ -671,6 +684,110 @@ void dump_tally(GString *report, GHashTable *t, const char *heading)
     g_list_free(keys);
 }
 
+/*
+ * The SUM of a tally's counts, which is the only way to ask a printed list
+ * how much of its population it actually printed.  g_hash_table_size() gives
+ * the number of DISTINCT keys and says nothing about coverage: a list can
+ * hold 241 rows and account for 7,305 of 7,319 reached instructions, and the
+ * shortfall is invisible in both the row count and the rows themselves.
+ */
+/*
+ * @g_tally_lock is a plain GMutex and is NOT recursive, and the report's
+ * whole dump_tally() sequence runs inside it, so the form that takes the
+ * lock cannot be called from there -- it wedges the process at close, with
+ * an empty sidecar and no diagnostic, which is exactly how this was found.
+ * Two entry points, and the split is named rather than left to a caller's
+ * memory: this one requires the lock to be HELD.
+ */
+uint64_t tally_total_locked(GHashTable *t)
+{
+    uint64_t n = 0;
+
+    if (t) {
+        GHashTableIter it;
+        gpointer k, v;
+
+        g_hash_table_iter_init(&it, t);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            n += GPOINTER_TO_UINT(v);
+        }
+    }
+    return n;
+}
+
+/* ...and this one TAKES it, for callers outside the report's held region. */
+uint64_t tally_total(GHashTable *t)
+{
+    uint64_t n;
+
+    g_mutex_lock(&g_tally_lock);
+    n = tally_total_locked(t);
+    g_mutex_unlock(&g_tally_lock);
+    return n;
+}
+
+/*
+ * THE COMPLETENESS CHECK'S OWN FALSIFIER, run before anything can be scored
+ * by it.
+ *
+ * The check the report makes is "rows reached == rows printed".  A check
+ * that can only say yes proves nothing, so this builds a tally by hand,
+ * confirms the sum tracks every increment (including repeats of one key,
+ * which is exactly how a collision row is spelled), and then plants the
+ * defect the real one had -- a row reached and NOT tallied -- and requires
+ * the arithmetic to show the shortfall.  The counts are printed by the
+ * caller; a failure is loud and refuses.
+ */
+static void witness_completeness_selftest(void)
+{
+    GHashTable *t = nullptr;
+    uint64_t reached = 0;
+    unsigned bad = 0;
+
+    /* ARM 1: an empty tally over an empty population is complete. */
+    if (tally_total(t) != reached) {
+        bad++;
+    }
+
+    /* ARM 2: three reached rows, two distinct keys, all tallied. */
+    for (int i = 0; i < 3; i++) {
+        tally(&t, i == 2 ? "00000001 rule-b mnem-b" : "00000000 rule-a mnem-a");
+        reached++;
+    }
+    if (g_hash_table_size(t) != 2 || tally_total(t) != 3 || reached != 3) {
+        bad++;
+    }
+    if (tally_total(t) != reached) {
+        bad++;
+    }
+
+    /* ARM 3: THE PLANT -- a row reached and not tallied.  This is the
+     * defect the witness carried: the site was reached, the tier counters
+     * moved, and the list said nothing.  The check must see it. */
+    reached++;
+    if (tally_total(t) >= reached) {
+        bad++;                  /* the shortfall was NOT visible */
+    }
+    if (reached - tally_total(t) != 1) {
+        bad++;                  /* ...or was mis-sized */
+    }
+
+    /* ARM 4: tallying the missed row restores completeness. */
+    tally(&t, "00000002 rule-c mnem-c");
+    if (tally_total(t) != reached) {
+        bad++;
+    }
+
+    g_hash_table_destroy(t);
+    if (bad) {
+        fprintf(stderr,
+                "champsim_tracer: witness completeness selftest FAILED "
+                "(%u arm(s)) -- the reached-vs-printed check cannot be "
+                "trusted, so no coverage claim from it may be read.\n", bad);
+        abort();
+    }
+}
+
 void note_refusal(const char *mnem, unsigned st, const char *fam,
                   const char *detail)
 {
@@ -708,6 +825,11 @@ void qdep_init(void)
      * by it.  See container_rule_selftest() for the arms.
      */
     container_rule_selftest();
+    /*
+     * And the completeness check's own falsifier, for the same reason: a
+     * coverage number nobody can make wrong is not a coverage number.
+     */
+    witness_completeness_selftest();
 
     bool expected = false;
     if (!g_tried.compare_exchange_strong(expected, true)) {
@@ -2675,6 +2797,42 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * a destination the wire is missing.
      */
     /*
+     * THE COLLISION WITNESS, and it is DELIBERATELY OUTSIDE the read-list
+     * gate below.
+     *
+     * What it measures: a decode id that appears with two mnemonics is one
+     * rule carrying more than one instruction, and a survivor table keyed on
+     * that id alone would give one of them the other's sources.  That is a
+     * fact about the DECODE IDENTITY, and the decode identity exists whether
+     * or not QEMU stated the instruction's read list.
+     *
+     * IT USED TO SIT INSIDE `if (q->src_state == QDEP_OK)`, which is the
+     * gate on a DIFFERENT list, and the block's own header said it ran "over
+     * the WHOLE scored population".  It did not: every instruction whose
+     * read list QEMU refused was reached, counted in the tier totals, and
+     * silently absent from this list.  Measured on the constructed x87
+     * fixture (PASS 34, verify34/FDIVS_WITNESS.txt), the omitted row was
+     * `fdivs` -- decode id 0x3764970a, the exact row a reader chasing the
+     * x87 identities goes looking for -- and on the libc cell the list ran
+     * 14 rows short of its own population.  A census that names its subject
+     * as "the whole population" and quietly drops part of it is the standing
+     * failure mode of this tree, so the fix is the position, not the prose.
+     *
+     * The completeness of this list is now ENFORCED, not asserted:
+     * @g_src_ident_witness_reached counts every row this site is reached
+     * for, the report prints it beside the sum of the printed counts, and
+     * their difference is a must-be-0.  See the report block and
+     * witness_completeness_selftest().
+     */
+    {
+        char *key = g_strdup_printf("%08x %-26s %s", q->decode_id,
+                                    q->decode_name ? q->decode_name : "?",
+                                    mnem ? mnem : "?");
+        tally(&g_src_ident_witness, key);
+        g_free(key);
+        g_src_ident_witness_reached.fetch_add(1, std::memory_order_relaxed);
+    }
+    /*
      * THE SOURCE-SIDE MEMBERSHIP CENSUS (the unmeasured half).
      *
      * Per PUBLISHED source entry: did QEMU state a read that justifies it?
@@ -2786,19 +2944,6 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 tally(&g_src_survivor_ident, key);
                 g_free(key);
             }
-        }
-        /*
-         * THE COLLISION WITNESS, over the whole scored population and not
-         * only the survivors: a decode id that appears with two mnemonics is
-         * a rule carrying more than one instruction, and a survivor table
-         * keyed on that id would give one of them the other's sources.
-         */
-        {
-            char *key = g_strdup_printf("%08x %-26s %s", q->decode_id,
-                                        q->decode_name ? q->decode_name : "?",
-                                        mnem ? mnem : "?");
-            tally(&g_src_ident_witness, key);
-            g_free(key);
         }
         /*
          * And the OTHER direction, counted and never added to the one above.
@@ -4538,7 +4683,34 @@ void qdep_report(GString *report)
     dump_tally(report, g_src_survivor_ident,
                "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the same\nrows as the block above, re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, the ROLE, and the mnemonic as an ANNOTATION.  A\nsource-list flip looks a survivor up by the id, because after the flip the\nmnemonic is gone.  ROLE says how the register is reached from the id:\nFIXED means the same register on every instruction the rule decodes, SELF\nmeans the instruction's own destination register (a partial write merging\ninto what the encoding named), which no constant can stand for.  This is\nthe column tools/gen_src_survivors.py reads:");
     dump_tally(report, g_src_ident_witness,
-               "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over the WHOLE scored population, not only the survivors.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying:");
+               "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over EVERY row the source census is reached for, survivor or\nnot, and INCLUDING the rows whose read list QEMU refused to state.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying, so a row missing from it is a collision nobody\nis warned about.  Its own coverage is stated and enforced below:");
+    {
+        uint64_t reached =
+            g_src_ident_witness_reached.load(std::memory_order_relaxed);
+        /* The lock is already held here -- see tally_total_locked(). */
+        uint64_t printed = tally_total_locked(g_src_ident_witness);
+
+        g_string_append_printf(report,
+            "  COLLISION WITNESS COVERAGE -- the list's own completeness,\n"
+            "  measured rather than claimed by its header.  Before this\n"
+            "  existed the block sat inside the read-list gate while saying\n"
+            "  it ran over the whole population, and every instruction whose\n"
+            "  read list QEMU refused was reached and silently unlisted --\n"
+            "  on the constructed x87 fixture the one row dropped was the\n"
+            "  `fdivs` row a reader goes there to find:\n"
+            "  %10" G_GUINT64_FORMAT "  rows REACHED (every apply_dst() row, all read-list\n"
+            "              states)\n"
+            "  %10" G_GUINT64_FORMAT "  rows PRINTED (the sum of the counts above, not the\n"
+            "              number of distinct rows)\n"
+            "  %10" G_GUINT64_FORMAT "  reached MINUS printed -- MUST BE 0.  A non-zero here is\n"
+            "              a population this list did not look at, and no\n"
+            "              coverage claim may be read from it while it holds.\n"
+            "              The check has its own falsifier: see\n"
+            "              witness_completeness_selftest(), which plants a\n"
+            "              reached-but-untallied row and requires the\n"
+            "              shortfall to show.\n",
+            reached, printed, reached - printed);
+    }
     dump_tally(report, g_src_flip_missing_sig,
                "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
     dump_tally(report, g_src_adj_owed_sig,

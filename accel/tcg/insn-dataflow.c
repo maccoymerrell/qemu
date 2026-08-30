@@ -1135,6 +1135,24 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
             case INSN_DF_ORD_ZERO:
                 fprintf(f, "zeroreg\n");
                 break;
+            case INSN_DF_ORD_NAME:
+                /*
+                 * The NAME form prints its register the same way the
+                 * GLOBAL form does, and for the same reason: the name IS
+                 * the identity.  There is no D line to pair it with --
+                 * a register resolved at translation time out of the CPU
+                 * OBJECT sets no bit in @rd and has no env range -- so
+                 * without this arm the entry printed `unknown kind=4` and
+                 * every reader scored a stated source as garbage.  A
+                 * checker comparing the ordered list against the D-line
+                 * bitmap has to be told this kind is legitimately absent
+                 * from that bitmap; ordlist_check.py's `name` arm is the
+                 * matching half and says so.
+                 */
+                fprintf(f, "name reg=%s\n",
+                        d->named_reads[list[i].index].reg
+                            ? d->named_reads[list[i].index].reg : "?");
+                break;
             default:
                 fprintf(f, "unknown kind=%u\n", list[i].kind);
                 break;

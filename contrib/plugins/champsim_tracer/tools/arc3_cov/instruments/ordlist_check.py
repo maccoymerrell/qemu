@@ -13,10 +13,19 @@ This reads a QEMU_DF_DUMP and checks, per instruction:
   MISSING   a member the bitmap has and the list does not.  The error that
             matters.  A list flip built on a short list publishes a register
             set the machine does not have.
-  EXTRA     a member the list has and the bitmap does not, EXCLUDING the two
-            kinds the bitmap cannot express (the architectural zero register,
-            and a discarded destination).  Those are the reason the list
-            exists; anything else here is a fabricated member.
+  EXTRA     a member the list has and the bitmap does not, EXCLUDING the
+            three kinds the bitmap cannot express (the architectural zero
+            register, a discarded destination, and a source stated by NAME).
+            Those are the reason the list exists; anything else here --
+            including a kind this checker does not recognise -- is a
+            fabricated member.
+  NAME      entries of the third of those kinds, INSN_DF_ORD_NAME: a register
+            the emulator resolved at translation time out of the CPU object
+            rather than CPUArchState (aarch64 ARM_CP_CONST, e.g. MIDR_EL1),
+            so it sets no bit in @rd and has no env range.  Reported on its
+            own row and never merged into `ord`, because a kind the bitmap
+            cannot check is a kind this checker is NOT checking and that has
+            to be visible rather than assumed clean.
   DUP       one member twice in one list.  The append is idempotent by
             construction, so a hit means the idempotence key is wrong.
   TRUNC     a list that overflowed.  Not an error in itself -- it is the
@@ -37,6 +46,7 @@ O 0x1000 r pos=0 global reg=rax
 O 0x1000 w pos=0 global reg=rbx
 O 0x1000 w pos=1 field off=928 size=16
 O 0x1000 r pos=1 zeroreg
+O 0x1000 r pos=2 name reg=MIDR_EL1
 A 0x1000 ops=0 calls=0 opaque=0
 """
 
@@ -45,11 +55,18 @@ def selftest(tmpdir):
     """Prove every verdict this checker can reach is reachable.
 
     A checker whose failure arms have never fired is not evidence; a green
-    from one is the absence of a test, not the absence of a defect.  Five
-    arms: the clean fixture passes, and each of the four failure kinds is
-    planted and must be caught.  The zeroreg line is in the fixture on
-    purpose -- it is a member the bitmap cannot express, so a checker that
-    scored it as EXTRA would fail the clean arm.
+    from one is the absence of a test, not the absence of a defect.  Seven
+    arms: the clean fixture passes, each of the four failure kinds is
+    planted and must be caught, the NAME kind is proven COUNTED rather than
+    merely tolerated, and a kind this checker does not know is proven to
+    still score EXTRA.
+
+    The zeroreg AND name lines are in the fixture on purpose -- both are
+    members the D-line bitmap cannot express, so a checker that scored
+    either as EXTRA would fail the clean arm.  The `bogus` arm is what keeps
+    that tolerance narrow: it must be a WHITELIST of kinds, not a general
+    amnesty for anything the parser did not recognise, and the arm fails the
+    moment somebody widens it into one.
     """
     import os
     arms = [
@@ -63,6 +80,15 @@ def selftest(tmpdir):
                                  "O 0x1000 r pos=2 global reg=rax\nA 0x1000"),
          1, "DUP"),
         ("vacuous", "", 1, "VACUOUS"),
+        # The NAME kind is legitimate AND counted: a silent tolerance would
+        # satisfy the clean arm while reporting nothing, which is the same
+        # blindness in a quieter form.
+        ("name", _FIXTURE, 0, "NAME=1"),
+        # ... and an UNKNOWN kind is still a fabricated member.  This is the
+        # arm that proves the name arm did not turn the EXTRA test off.
+        ("bogus", _FIXTURE.replace("A 0x1000",
+                                   "O 0x1000 r pos=3 wibble reg=zz\nA 0x1000"),
+         1, "EXTRA"),
     ]
     ok = True
     for name, body, want_rc, want_word in arms:
@@ -82,7 +108,7 @@ def selftest(tmpdir):
                  "OK" if good else "BROKEN"))
         if not good:
             print(out.rstrip())
-    print("selftest: %s" % ("ALL 5 ARMS OK" if ok else "BROKEN"))
+    print("selftest: %s" % ("ALL %d ARMS OK" % len(arms) if ok else "BROKEN"))
     return 0 if ok else 1
 
 
@@ -97,7 +123,8 @@ def main(argv):
         return 2
     rc = 0
     for path in argv[1:]:
-        tot = dict(insns=0, ord=0, missing=0, extra=0, dup=0, trunc=0)
+        tot = dict(insns=0, ord=0, missing=0, extra=0, dup=0, trunc=0,
+                   name=0)
         first = []
 
         def flush(pc, bm, lst, trunc):
@@ -116,6 +143,9 @@ def main(argv):
             tot['insns'] += 1
             tot['ord'] += len(lst)
             tot['trunc'] += len(trunc)
+            # Counted from the LIST, not from the de-duplicated set below,
+            # so two entries naming the same register read as two.
+            tot['name'] += sum(1 for e in lst if e[1] == 'name')
             if len(set(lst)) != len(lst):
                 tot['dup'] += len(lst) - len(set(lst))
                 if len(first) < 8:
@@ -129,6 +159,20 @@ def main(argv):
                     if len(first) < 8:
                         first.append("MISSING %s %s" % (pc, m))
             for m in S:
+                if m[1] == 'name':
+                    # A SOURCE STATED BY NAME (INSN_DF_ORD_NAME) is
+                    # LEGITIMATELY ABSENT FROM THE BITMAP, and this arm is
+                    # the reason the aarch64 leg failed on `mrs x0,midr_el1`
+                    # at 0x400c0c.  MIDR_EL1 is ARM_CP_CONST: it lives in the
+                    # ARMCPU object, not CPUArchState, so it sets no bit in
+                    # @rd and has no env range -- there is no D line for the
+                    # bitmap to carry and there never can be.  Scoring it
+                    # EXTRA said the translation stated a register it does
+                    # not read, which is the opposite of the truth.  It is
+                    # counted on its own row rather than merged into `ord`:
+                    # a kind the bitmap cannot check is a kind this checker
+                    # is NOT checking, and that has to be visible.
+                    continue
                 if m[1] in ('zeroreg', 'discard'):
                     continue      # the bitmap cannot express these
                 if m[1] == 'unknown' or m not in bm:
@@ -180,6 +224,8 @@ def main(argv):
                         lst.append((d, 'discard', kv.get('reg')))
                     elif kind == 'zeroreg':
                         lst.append((d, 'zeroreg', '-'))
+                    elif kind == 'name':
+                        lst.append((d, 'name', kv.get('reg')))
                     else:
                         lst.append((d, 'unknown', kind))
         flush(cur, bm, lst, trunc)
@@ -187,9 +233,10 @@ def main(argv):
         vac = "OK" if (tot['ord'] > 0 and tot['insns'] > 0) else "VACUOUS"
         bad = tot['missing'] or tot['extra'] or tot['dup'] or vac != "OK"
         print("%s: records=%d ord_entries=%d MISSING=%d EXTRA=%d DUP=%d "
-              "TRUNC=%d vacuity=%s -> %s"
+              "TRUNC=%d NAME=%d vacuity=%s -> %s"
               % (path, tot['insns'], tot['ord'], tot['missing'], tot['extra'],
-                 tot['dup'], tot['trunc'], vac, "FAIL" if bad else "PASS"))
+                 tot['dup'], tot['trunc'], tot['name'], vac,
+                 "FAIL" if bad else "PASS"))
         for s_ in first:
             print("    %s" % s_)
         if bad:

@@ -696,7 +696,23 @@ def capture(build: Path, root: Path, waivers: dict) -> int:
     return 1 if bad else 0
 
 
-def check(build: Path, root: Path, waivers: dict) -> int:
+def check(build: Path, root: Path, waivers: dict,
+          only: list[str] | None = None) -> int:
+    """Compare the net's cells to the recorded hash reference.
+
+    @only restricts the run to the named workloads.  It was declared on the
+    top-level parser but consumed by `validate` alone, so `check --only X`
+    silently ran ALL NINE -- a flag that appears to narrow a run and does
+    not is worse than no flag, because the operator believes a number that
+    came from somewhere else.
+
+    A SUBSET RUN MUST NOT REPORT THE WHOLE NET.  The verdict line names the
+    workloads actually compared, and the SVG/fixture goldens -- which are
+    not per-workload -- are scored only on a full run, because scoring them
+    under a subset would let a one-workload invocation claim the renderer
+    is green.  A subset that matches nothing REFUSES: a gate with no
+    subject is a failure, not a pass.
+    """
     if not MANIFEST.exists():
         print(f"no manifest at {MANIFEST}; run capture first", file=sys.stderr)
         return 2
@@ -719,18 +735,31 @@ def check(build: Path, root: Path, waivers: dict) -> int:
               f"with --work-root {Path(cap_root).parent} or re-capture.",
               file=sys.stderr)
         return 2
-    if root.exists():
-        shutil.rmtree(root)
+    wls = [w for w in WORKLOADS if only is None or w["name"] in only]
+    if not wls:
+        print(f"REFUSING: --only matched no workload ({only}).  A gate with "
+              f"no subject is a failure, not a pass.", file=sys.stderr)
+        return 2
+    if only is None:
+        if root.exists():
+            shutil.rmtree(root)
     fails, validate_fails = [], []
-    produced = {}
-    for wl in WORKLOADS:
+    produced, scored = {}, set()
+    for wl in wls:
         name = wl["name"]
         out = root / name
+        # Clear only THIS cell's directory under --only.  The whole-root
+        # removal above is the full-run form; doing it under a subset would
+        # destroy the unselected workloads' outputs, which is the defect
+        # ceb2ace953 fixed in `validate` and this arm shared.
+        if only is not None and out.exists():
+            shutil.rmtree(out)
         rc = run_all(build, wl, out)
         for isa in wl["isas"]:
             cell = f"{name}:{isa}"
             if cell not in manifest["cells"]:
                 continue
+            scored.add(cell)
             cst = cst_path(out, isa)
             if not cst.exists():
                 fails.append(f"{cell}: trace not produced"); continue
@@ -751,8 +780,11 @@ def check(build: Path, root: Path, waivers: dict) -> int:
                 validate_fails.append(
                     f"{cell}: validator rc={rc} (baseline {base_rc})")
     # SVG goldens: render the FROZEN golden trace, never a re-traced .cst,
-    # so a mismatch can only be a renderer change.
-    for key, want in manifest.get("svg", {}).items():
+    # so a mismatch can only be a renderer change.  They are not
+    # per-workload, so a SUBSET run does not score them -- and does not
+    # claim them either (see the verdict line).
+    for key, want in ({} if only is not None
+                      else manifest.get("svg", {})).items():
         name, isa, metric = key.split(":")
         cst = GOLDEN_TRACES / f"{name}_{isa}.cst"
         if not cst.exists():
@@ -763,7 +795,8 @@ def check(build: Path, root: Path, waivers: dict) -> int:
     # Fixture SVG goldens: same discipline against the permanent
     # system-mode fixture traces.
     fx_files = {fx["name"]: fx["file"] for fx in FIXTURES}
-    for key, want in manifest.get("svg_fixtures", {}).items():
+    for key, want in ({} if only is not None
+                      else manifest.get("svg_fixtures", {})).items():
         name, metric = key.split(":")
         fname = fx_files.get(name, f"{name}.cst")
         cst = FIXTURES_DIR / fname
@@ -774,13 +807,22 @@ def check(build: Path, root: Path, waivers: dict) -> int:
             fails.append(f"fixture svg {key}: SVG mismatch "
                          f"(fixture {fname})")
 
+    scope = ("" if only is None
+             else f" [SUBSET: {', '.join(w['name'] for w in wls)}]")
     if fails or validate_fails:
-        print("\n=== GOLDEN NET FAILED ===")
+        print(f"\n=== GOLDEN NET FAILED{scope} ===")
         for f in fails:
             print(f"  HASH  {f}")
         for f in sorted(set(validate_fails)):
             print(f"  VALID {f}")
         return 1
+    if only is not None:
+        print(f"\nGOLDEN NET SUBSET GREEN: {len(scored)} cells over "
+              f"{len(wls)} workload(s) byte-identical; validator errors=0."
+              f"  THIS IS NOT A VERDICT ON THE NET: "
+              f"{len(manifest['cells']) - len(scored)} cell(s) and every SVG "
+              f"golden were NOT compared.")
+        return 0
     print(f"\nGOLDEN NET GREEN: {len(manifest['cells'])} cells + "
           f"{len(manifest.get('svg', {}))} svg goldens + "
           f"{len(manifest.get('svg_fixtures', {}))} fixture svg goldens "
@@ -1824,7 +1866,11 @@ def main() -> int:
                          "coverage and is safe to run while the hash arm is "
                          "held")
     ap.add_argument("--only", action="append", default=None,
-                    help="validate mode: restrict to these workload names")
+                    help="check/validate modes: restrict the run to these "
+                         "workload names.  A subset verdict says so and "
+                         "names what it did NOT compare; a subset matching "
+                         "no workload REFUSES.  Ignored by capture, which "
+                         "writes the whole reference or none of it")
     ap.add_argument("--build-dir", type=Path, required=True)
     ap.add_argument("--system", action="store_true",
                     help="operate on the SYSTEM-mode cells (separate manifest "
@@ -1932,8 +1978,12 @@ def main() -> int:
         return net_validate(build, args.work_root / "netval", waivers,
                             only=args.only)
     if args.mode == "capture":
+        if args.only:
+            print("REFUSING: --only has no meaning for capture -- a partial "
+                  "reference is not a reference.", file=sys.stderr)
+            return 2
         return capture(build, shared, waivers)
-    return check(build, shared, waivers)
+    return check(build, shared, waivers, only=args.only)
 
 
 if __name__ == "__main__":

@@ -1066,12 +1066,41 @@ static bool do_csr_post(DisasContext *ctx)
     return true;
 }
 
+/*
+ * The CSR the encoding NAMES, stated as a read.
+ *
+ * A CSR access lowers to gen_helper_csrr()/csrrw(), which take the csr
+ * NUMBER as an i32 constant and reach the register through csr_ops[]'s
+ * accessor.  No op in the stream touches the CSR's storage, so the
+ * instruction's source list arrives without it: `frflags a5` (csrrs a5,
+ * fflags, x0) publishes no fflags read at all, and `frrm` publishes no frm.
+ *
+ * That is a lowering decision and not the architecture (R15); a register
+ * the encoding names is not the emulator's to drop (R7.3).  There is no env
+ * range to state -- the accessor may compute the value rather than load it
+ * -- so it is stated by NAME, the same form AArch64's system registers take.
+ *
+ * The number-to-name route is riscv_get_csr_ops(), which is the table's own
+ * public accessor; csr_ops[].name is a string literal and so outlives the
+ * translation, as the note requires.  A csr the table does not implement has
+ * a NULL name and the note refuses it at the door rather than inventing a
+ * spelling.
+ */
+static void gen_note_csr_read(int csrno)
+{
+    riscv_csr_operations ops;
+
+    riscv_get_csr_ops(csrno, &ops);
+    insn_dataflow_note_stated_read_name(ops.name);
+}
+
 static bool do_csrr(DisasContext *ctx, int rd, int rc)
 {
     TCGv dest = dest_gpr(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
     translator_io_start(&ctx->base);
+    gen_note_csr_read(rc);
     gen_helper_csrr(dest, tcg_env, csr);
     gen_set_gpr(ctx, rd, dest);
     return do_csr_post(ctx);
@@ -1092,6 +1121,7 @@ static bool do_csrrw(DisasContext *ctx, int rd, int rc, TCGv src, TCGv mask)
     TCGv_i32 csr = tcg_constant_i32(rc);
 
     translator_io_start(&ctx->base);
+    gen_note_csr_read(rc);
     gen_helper_csrrw(dest, tcg_env, csr, src, mask);
     gen_set_gpr(ctx, rd, dest);
     return do_csr_post(ctx);
@@ -1104,6 +1134,7 @@ static bool do_csrr_i128(DisasContext *ctx, int rd, int rc)
     TCGv_i32 csr = tcg_constant_i32(rc);
 
     translator_io_start(&ctx->base);
+    gen_note_csr_read(rc);
     gen_helper_csrr_i128(destl, tcg_env, csr);
     tcg_gen_ld_tl(desth, tcg_env, offsetof(CPURISCVState, retxh));
     gen_set_gpr128(ctx, rd, destl, desth);
@@ -1127,6 +1158,7 @@ static bool do_csrrw_i128(DisasContext *ctx, int rd, int rc,
     TCGv_i32 csr = tcg_constant_i32(rc);
 
     translator_io_start(&ctx->base);
+    gen_note_csr_read(rc);
     gen_helper_csrrw_i128(destl, tcg_env, csr, srcl, srch, maskl, maskh);
     tcg_gen_ld_tl(desth, tcg_env, offsetof(CPURISCVState, retxh));
     gen_set_gpr128(ctx, rd, destl, desth);

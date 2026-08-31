@@ -329,12 +329,23 @@ GHashTable *g_src_flip_extra_sig = nullptr;
  *     row would have silenced exactly that alarm.
  *
  * KEYED ON (isa, decode id, MNEMONIC) -- deliberately, and this is NOT a
- * survivor row.  x86 decode id 0x0000054b is QEMU's NOP slot and carries
- * `endbr64` (410 census rows) beside `rdsspq` (3), so a row keyed on the id
- * alone would silence a population it was never adjudicated for.  A flip
- * cannot look this table up, because after the flip the mnemonic is gone;
- * that is correct.  This table is a LEDGER, not an input to any wire
- * decision.
+ * survivor row.  The key kept the ledger honest when x86 decode id
+ * 0x0000054b was QEMU's NOP slot carrying `endbr64` (410 census rows)
+ * beside `rdsspq` (3): a row keyed on the id alone would have silenced a
+ * population it was never adjudicated for.  The CET encodings now have
+ * identities of their own (target/i386/tcg/cet_ident.c.inc), so the id
+ * below is the rdssp arm's and carries no other instruction -- and the
+ * mnemonic stays in the key anyway, because it is what keeps `rdsspd` out
+ * (see NO SILENT WIDENING below).  A flip cannot look this table up,
+ * because after the flip the mnemonic is gone; that is correct.  This
+ * table is a LEDGER, not an input to any wire decision.
+ *
+ * THE ID MOVED AND THE LEDGER SAID SO.  When the qualification landed, this
+ * row's 0x0000054b stopped matching and the register read MISSING on the
+ * must-be-0 line -- 3 of them, on the very first battery.  That is the
+ * alarm the RETIRED REG_GPR0 row above is described as protecting, firing
+ * for real on an id change rather than on a boundary regression, and it is
+ * why the id here is updated rather than the row being made id-insensitive.
  *
  * NO SILENT WIDENING.  `rdsspd` shares the adjudication class and has no
  * row here because it has no census row in the corpus this was measured on.
@@ -365,13 +376,15 @@ static const SrcAdjRow g_src_adj_ledger[] = {
       "INTO THE TRACE.\"  menvcfg.FIOM decides what a fence ORDERS, Sail "
       "states ref_src=REG_SYS, and QEMU's empty read list at trans_fence "
       "is the statement gap, not the architecture" },
-    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
+    { TRACE_ISA_X86,   0xdb9bac2bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
       "ADJUDICATED-KEEP-R16.  R16 verbatim: \"IF THE DEPENDENCY EXISTS IN "
       "THE ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  ... "
       "I DON'T CARE ABOUT SEMANTICS.  A NOP SEMANTIC STILL HAS REAL "
       "DEPENDENCIES IN THE CHOSEN REGISTER.\"  The instruction FORM reads "
       "SSP (XED SRC {REG_SSP}, PIN ref_only=ssp); the modelled machine's "
-      "CET state does not remove an ISA dependency" },
+      "CET state does not remove an ISA dependency.  The id is the rdssp "
+      "arm of decode-new.c.inc:1355 (decode-new/NOP@f3=1,modrm=11001...), "
+      "not the reserved-NOP slot it used to share with endbr64" },
 };
 static const SrcAdjRow *src_adj_row(uint32_t decode_id, const char *mnem,
                                     uint8_t reg)

@@ -7194,7 +7194,15 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
 
     for r in rows:
         note = ""
-        if r.branch_fact:
+        if r.stmt_ruled:
+            # A statement that disagreed with an older payload, and the
+            # ruling that settled it.  It goes BESIDE THE ROW for the same
+            # reason an adjudication does: the header is what a reader
+            # has, and a row whose class was decided against evidence
+            # should carry the reason it was decided, not send the reader
+            # to the generator to find out.
+            note = _note("RULED over the older payload -- " + r.stmt_ruled)
+        elif r.branch_fact:
             note = _note("branch class from QEMU's rule: " + r.branch_fact)
         elif r.adjudged:
             note = _note(

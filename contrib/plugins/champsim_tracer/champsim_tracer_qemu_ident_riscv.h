@@ -1604,7 +1604,7 @@ static const QemuIdentRow qemu_ident_riscv[] = {
     { 0xcccec18bu, "decode_insn32/minu", QID_STATED, false,
       { .opcode = GEN_OP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xcd0d7519u, "decode_insn32/lpad", QID_STATED, false,
-      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- insn32.decode:129 lpad label:20 00000 0010111, ahead of auipc in the same decode group -- trans_lpad() writes no GPR, and QEMU's own comment on its early return is that lpad comes from NOP space */
     { 0xcdaafcd6u, "decode_insn32/fltq_h", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xcdfb03dcu, "decode_xthead/th_ldd", QID_STATED, false,

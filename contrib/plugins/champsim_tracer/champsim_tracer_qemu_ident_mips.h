@@ -920,7 +920,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x56742982u, "translate_mips/OPC_CMP_SEQ_D", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56a43d41u, "translate_mips/OPC_PMON", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },  /* RULED over the older payload -- translate.c:16582 gen_helper_pmon() -- QEMU's SPECIAL 0x05 arm is the PMON monitor entry; the observed X86-style INT_ADD comes from the disassembler reading the same encoding as MIPS R6 LSA */
     { 0x56bf3397u, "translate_mips/OPC_PADDSH", QID_STATED, false,
       { .opcode = GEN_OP_VEC_ADD, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56f2fd2eu, "translate_mips/R6_OPC_CMP_UN_S", QID_STATED, false,
@@ -1080,7 +1080,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x676261dcu, "translate_mips/OPC_CMPGU_LT_QB", QID_STATED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x67dd568cu, "translate_mips/OPC_SLL@00000000000000000000000000000000", QID_STATED, false,
-      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- translate.c:16457 `if (sa == 5 && rd == 0 && rs == 0 && rt == 0)` on the OPC_SLL arm -- QEMU separates the zero-destination encodings itself, and scripts/mips_ident_instrument.py qualifies this one as `NOP -- SLL r0,r0,0` */
     { 0x68767bbeu, "decode_ase_msa/MAX_A", QID_STATED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x68794accu, "translate_mips/OPC_MOV_D", QID_VERIFIED, false,

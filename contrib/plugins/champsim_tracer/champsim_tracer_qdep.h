@@ -258,6 +258,32 @@ enum QDepState : uint8_t {
     QDEP_NONE = 0,       /* not extracted (no dataflow ABI, or no accesses) */
     QDEP_OK,             /* QEMU stated it; the masks below are the wire's */
     QDEP_R_STATUS,       /* the extraction reported itself incomplete */
+    /*
+     * QDEP_R_SHORT -- THE READ LIST IS A LOWER BOUND, NOT A REFUSAL.
+     *
+     * The extraction reported itself incomplete AND QEMU still stated a
+     * read list.  Those are not the same fact and until this state existed
+     * the second was thrown away with the first: qdep_note_insn() returned
+     * on the status word before it ever asked for the list, so an
+     * instruction whose emulation runs through an unbounded helper
+     * published NOTHING from QEMU no matter what QEMU said about it.
+     *
+     * WHY THE LIST IS STILL USABLE.  Incompleteness makes the read list
+     * SHORT -- some register QEMU reads is missing from it -- and short is
+     * a bound in one direction only.  Every member that IS there is a read
+     * QEMU's own emitters stated, so seating it can only ADD a source the
+     * wire would otherwise have to get from the operand walk.  It can never
+     * remove one, and R12.1's forbidden direction is removal.
+     *
+     * WHAT IT MAY NOT DO, and this is why it is a separate state rather
+     * than QDEP_OK.  A short list cannot adjudicate ABSENCE: "QEMU does not
+     * state this register" is exactly the sentence it is not entitled to.
+     * So the justification census still scores QDEP_OK alone, the survivor
+     * population is unchanged, and NOT-SCORED keeps counting these
+     * instructions.  The state widens what the wire PUBLISHES and narrows
+     * nothing the census CONCLUDES.
+     */
+    QDEP_R_SHORT,
     QDEP_R_NORECORD,     /* qemu withheld the access list or a provenance */
     /*
      * QDEP_R_MULTI AND QDEP_R_SHAPE STOOD HERE, and are deleted rather than
@@ -577,6 +603,42 @@ struct QDepInsn {
      */
     uint32_t decode_id;
     const char *decode_name;
+    /*
+     * The instruction's virtual address, carried for the PER-PC WITNESS
+     * alone (CST_SRC_PC_DUMP) and read by nothing on the wire path.
+     *
+     * A census keyed on the decode identity can say WHICH RULE published a
+     * source QEMU does not state; it can never say which instruction, and
+     * an adjudication that has to be written per program counter -- the 33
+     * pcs the operand walk's read arm was the only supplier for -- needs
+     * the program counter.  Taken beside the identity, on the same
+     * unconditional path, so a refused instruction still has one.
+     */
+    uint64_t insn_vaddr;
+
+    /*
+     * THE WITNESS'S TWO EXTRA FACTS.  Neither is read by anything that
+     * writes a wire field; both exist because the per-pc witness had to
+     * answer a question the wire path deliberately does not ask.
+     *
+     * @status_flags is which of qemu_plugin_insn_dataflow_status()'s
+     * incompleteness bits fired, kept apart instead of folded into the one
+     * refusal word.  "extraction reported itself incomplete" is six
+     * different statements and they do not have one remedy: an unbounded
+     * HELPER footprint is a QEMU-side note that has not been written, while
+     * a truncated memop list is a bound in this file.
+     *
+     * @n_srcx / @srcx is QEMU's ordered read list taken WITHOUT the status
+     * gate -- the list the extraction does state on an instruction whose
+     * extraction also says it is short.  The wire does not use it; it is
+     * here so "the read list is refused" can be told apart from "there is
+     * no read list", which from the wire's side look identical and want
+     * opposite answers.
+     */
+    uint8_t status_flags;
+    uint8_t srcx_state;
+    uint8_t n_srcx;
+    uint8_t srcx[QDEP_MAX_SRC];
     /*
      * And the two facts that say whether a NO above is an answer.
      *

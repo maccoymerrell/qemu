@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <array>
+#include <mutex>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -169,6 +170,30 @@ GHashTable *g_src_qemu_extra_sig = nullptr;
  */
 GHashTable *g_src_survivor_ident = nullptr;
 GHashTable *g_src_ident_witness = nullptr;
+/*
+ * THE SAME ROWS FOR THE POPULATION THE CENSUS CANNOT SCORE, and it is a
+ * separate table because it is a separate claim.
+ *
+ * @g_src_survivor_ident's rows say "QEMU stated this instruction's read set
+ * and this published register is not in it".  On an instruction whose read
+ * list QEMU withheld or reported short, that sentence cannot be said, so
+ * those rows are absent from it -- correctly.  What was NOT correct was
+ * that they were absent from EVERYTHING: NOT-SCORED was a bare count with
+ * no list behind it, and a source-list flip has to carry these registers
+ * for exactly the same reason it carries the scored survivors -- after the
+ * flip the read list contributes nothing here, so the survivor table is
+ * their only supplier.
+ *
+ * Measured, and this is why the table exists: of the 33 program counters
+ * that lost a published source when the operand walk's read arm was
+ * deleted as an excursion, 30 sat in this population and not one of them
+ * appeared in any identity-keyed list this file printed.
+ *
+ * The rows carry the SAME columns and the SAME role measurement, so
+ * tools/gen_src_survivors.py reads them with the same parser, under a
+ * heading that says which claim they are.
+ */
+GHashTable *g_src_nostate_ident = nullptr;
 /*
  * THE COLLISION WITNESS'S OWN POPULATION, so its completeness is a
  * measurement instead of a sentence in its header.
@@ -1796,8 +1821,42 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
      * and gating on them would make the source list's length a function of
      * a question about memory.
      */
-    if (q->src_state == QDEP_OK) {
+    if (q->src_state == QDEP_OK || q->src_state == QDEP_R_SHORT) {
         take(q->src_reg, q->n_src);
+    }
+    /*
+     * AND THE MEMBERS A STATED CONTAINER COVERS (#277), which until now
+     * justified a published source without supplying one.
+     *
+     * #277 settled that a container and its member are one register at two
+     * granularities and that the container COVERS the member: mipsel's
+     * `bc1t` reads the whole `fcr31` because that is where the condition
+     * bit lives, and the wire publishes the FCC the encoding selects.  The
+     * census has always read that as JUSTIFIED -- correctly -- but the
+     * justification reached the SCORE and not the WIRE: qemu_named_regs()
+     * seated src_reg[] alone, so the member arrived on the wire only from
+     * the operand walk, and a census reading 0 UNJUSTIFIED said nothing
+     * about whether the walk could be removed.  Measured: deleting the
+     * walk's read arm took REG_PRED0 and REG_PRED1 off two mipsel `bc1t`
+     * program counters whose census rows were green on both arms.
+     *
+     * This seats the PUBLISHED MEMBER, never the container and never the
+     * whole range.  The container is QEMU's statement that the storage is
+     * read; which member of it this encoding selects is the wire's own
+     * answer, already in @f.  Nothing is invented: a register not published
+     * cannot be seated by this run, so the union can only regain a source
+     * the wire already carries.
+     */
+    if ((q->src_state == QDEP_OK || q->src_state == QDEP_R_SHORT) && f) {
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            for (uint8_t k = 0; k < q->n_src_cont; k++) {
+                if (f->src_regs[i] >= q->src_cont_lo[k] &&
+                    f->src_regs[i] <= q->src_cont_hi[k]) {
+                    take(&f->src_regs[i], 1);
+                    break;
+                }
+            }
+        }
     }
     /*
      * THE SURVIVOR ROWS, after the read list.
@@ -2909,6 +2968,124 @@ static bool reseat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
     return true;
 }
 
+/*
+ * THE PER-PC SOURCE WITNESS.  See the call site in apply_dst() for why a
+ * tally cannot answer the question this answers.
+ *
+ * One line per instruction whose source list is decided, TSV, columns:
+ *
+ *   pc  decode_id  rule  mnemonic  src_state  wstate
+ *   PUB=<published src_regs[]>          the wire's list, post-reindex
+ *   QN=<qemu_named_regs()>              what the list becomes once the
+ *                                       operand walk's read arm is gone
+ *   SURV=<survivor rows for this id>    the compiled-in table's answer
+ *   RD=<QEMU's ordered read list>       what the emulator states
+ *   CONT=<container ranges>             #277's justification ranges
+ *
+ * The file is opened once, appended to under a lock, and closed by the
+ * process exit; a run that sets the variable to a path it cannot open gets
+ * no witness and no silent success -- the failure is recorded in the
+ * sidecar by the report, because a witness that cannot find its subject
+ * must FAIL rather than print nothing.
+ */
+std::atomic<int> g_src_pc_dump_state{0};     /* 0 unasked, 1 open, 2 failed */
+FILE *g_src_pc_dump = nullptr;
+std::mutex g_src_pc_dump_lock;
+std::atomic<uint64_t> g_src_pc_dump_rows{0};
+
+void reglist_str(GString *g, const uint8_t *regs, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        g_string_append_printf(g, "%s%s", i ? "," : "",
+                               generic_reg_name_or_unknown(regs[i]));
+    }
+    if (!n) {
+        g_string_append(g, "-");
+    }
+}
+
+void dump_src_pc_row(const InsnFields *f, const QDepInsn *q,
+                     const char *mnem, unsigned wstate)
+{
+    int st = g_src_pc_dump_state.load(std::memory_order_relaxed);
+
+    if (st == 2) {
+        return;
+    }
+    if (st == 0) {
+        std::lock_guard<std::mutex> lk(g_src_pc_dump_lock);
+        if (g_src_pc_dump_state.load(std::memory_order_relaxed) == 0) {
+            const char *path = getenv("CST_SRC_PC_DUMP");
+
+            if (!path) {
+                g_src_pc_dump_state.store(2, std::memory_order_relaxed);
+                return;
+            }
+            g_src_pc_dump = fopen(path, "w");
+            if (!g_src_pc_dump) {
+                g_src_pc_dump_state.store(2, std::memory_order_relaxed);
+                return;
+            }
+            fprintf(g_src_pc_dump,
+                    "#pc\tdecode_id\trule\tmnem\tsrc_state\twstate\tPUB\tQN"
+                    "\tSURV\tRD\tSTATUS\tRDX\tCONT\n");
+            g_src_pc_dump_state.store(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_src_pc_dump_state.load(std::memory_order_relaxed) != 1) {
+        return;
+    }
+
+    uint8_t qn[MAX_SRC_REGS];
+    uint8_t nq = qemu_named_regs(q, qn, f, wstate == QDEP_OK);
+    uint8_t sv[MAX_SRC_REGS];
+    uint8_t ns = src_survivor_regs(q->decode_id, f, sv, (uint8_t)MAX_SRC_REGS);
+
+    GString *g = g_string_new(nullptr);
+    g_string_append_printf(g, "0x%" PRIx64 "\t%08x\t%s\t%s\t%s\t%s\t",
+                           q->insn_vaddr, q->decode_id,
+                           q->decode_name ? q->decode_name : "?",
+                           mnem ? mnem : "?",
+                           state_name(q->src_state), state_name(wstate));
+    reglist_str(g, f->src_regs, f->n_src_regs);
+    g_string_append_c(g, '\t');
+    reglist_str(g, qn, nq);
+    g_string_append_c(g, '\t');
+    reglist_str(g, sv, ns);
+    g_string_append_c(g, '\t');
+    reglist_str(g, q->src_reg, q->n_src);
+    g_string_append_c(g, '\t');
+    g_string_append_printf(g, "%s%s%s%s%s%s",
+                           q->status_flags & 0x01 ? "memops_truncated," : "",
+                           q->status_flags & 0x02 ? "memops_unnoted," : "",
+                           q->status_flags & 0x04 ? "fields_truncated," : "",
+                           q->status_flags & 0x08 ? "writes_truncated," : "",
+                           q->status_flags & 0x10 ? "prov_truncated," : "",
+                           q->status_flags & 0x20 ? "helper_unbounded," : "");
+    if (!q->status_flags) {
+        g_string_append(g, "-");
+    }
+    g_string_append_c(g, '\t');
+    g_string_append_printf(g, "%s:", state_name(q->srcx_state));
+    reglist_str(g, q->srcx, q->n_srcx);
+    g_string_append_c(g, '\t');
+    for (uint8_t k = 0; k < q->n_src_cont; k++) {
+        g_string_append_printf(g, "%s%s..%s", k ? "," : "",
+                               generic_reg_name_or_unknown(q->src_cont_lo[k]),
+                               generic_reg_name_or_unknown(q->src_cont_hi[k]));
+    }
+    if (!q->n_src_cont) {
+        g_string_append(g, "-");
+    }
+    g_string_append_c(g, '\n');
+    {
+        std::lock_guard<std::mutex> lk(g_src_pc_dump_lock);
+        fputs(g->str, g_src_pc_dump);
+    }
+    g_src_pc_dump_rows.fetch_add(1, std::memory_order_relaxed);
+    g_string_free(g, TRUE);
+}
+
 bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                const char *mnem, unsigned wstate, const char *why)
 {
@@ -2956,6 +3133,34 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         g_free(key);
         g_src_ident_witness_reached.fetch_add(1, std::memory_order_relaxed);
     }
+    /*
+     * THE PER-PC WITNESS DUMP, env-gated (CST_SRC_PC_DUMP=<path>).
+     *
+     * WHY A PER-PC DUMP AND NOT A TALLY.  Every source-side census in this
+     * file is a TALLY keyed on the decode identity, and a tally answers
+     * "which rules" but never "which instruction".  When the operand walk's
+     * read arm was deleted as a measurement excursion, 33 program counters
+     * lost a published source and not one of them could be named from a
+     * tally: the rows the deletion took off the wire sat in the NOT-SCORED
+     * population, which no identity-keyed list here reaches.  Adjudicating
+     * a row per program counter needs the program counter, so this writes
+     * one line per instruction the wire's source list is decided for:
+     *
+     *   pc  decode_id  decode_rule  mnemonic  src_state  |  published  |
+     *   qemu_named_regs (what the source list would be with the operand
+     *   walk's read arm gone)  |  survivor rows for this identity  |
+     *   QEMU's ordered read list  |  the container ranges (#277)
+     *
+     * OUTSIDE the read-list gate, for the same reason the collision witness
+     * above is: the question is about the decode identity, which exists
+     * whether or not QEMU stated a read list, and a witness that skips the
+     * refused instructions is blind to exactly the population that needed
+     * witnessing.
+     *
+     * MEASUREMENT ONLY and OFF unless asked for: no wire field is written
+     * here, and with the variable unset the site is a single relaxed load.
+     */
+    dump_src_pc_row(f, q, mnem, wstate);
     /*
      * THE SOURCE-SIDE MEMBERSHIP CENSUS (the unmeasured half).
      *
@@ -3196,6 +3401,55 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     } else {
         g_src_insn_nostate.fetch_add(1, std::memory_order_relaxed);
         g_src_nostate.fetch_add(f->n_src_regs, std::memory_order_relaxed);
+        /*
+         * The rows, keyed exactly as the scored survivors are.  A register
+         * this instruction publishes that QEMU's (short or withheld) read
+         * list does not carry is a register the flip has to get from
+         * somewhere, and the somewhere is a survivor row.  Members already
+         * in the list are skipped so the two tables never double-count the
+         * same register, and the ROLE is measured the same way -- see the
+         * scored arm for why the POSITION is part of it.
+         */
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            bool have = false;
+
+            for (uint8_t k = 0; k < q->n_src; k++) {
+                if (q->src_reg[k] == f->src_regs[i]) {
+                    have = true;
+                    break;
+                }
+            }
+            for (uint8_t k = 0; !have && k < q->n_src_cont; k++) {
+                if (f->src_regs[i] >= q->src_cont_lo[k] &&
+                    f->src_regs[i] <= q->src_cont_hi[k]) {
+                    have = true;
+                }
+            }
+            if (have) {
+                continue;
+            }
+            bool self = false;
+            uint8_t self_pos = 0;
+
+            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                if (f->dst_regs[d] == f->src_regs[i]) {
+                    self = true;
+                    self_pos = d;
+                    break;
+                }
+            }
+            char *role = self ? g_strdup_printf("SELF@%u", self_pos)
+                              : g_strdup("FIXED");
+            char *key = g_strdup_printf(
+                "%08x %-26s %-14s %-7s %s", q->decode_id,
+                q->decode_name ? q->decode_name : "?",
+                generic_reg_name_or_unknown(f->src_regs[i]),
+                role,
+                mnem ? mnem : "?");
+            g_free(role);
+            tally(&g_src_nostate_ident, key);
+            g_free(key);
+        }
     }
 
     /*
@@ -3378,6 +3632,7 @@ const char *state_name(unsigned s)
     case QDEP_NONE:             return "no accesses / no dataflow ABI";
     case QDEP_OK:               return "PUBLISHED from QEMU's emitters";
     case QDEP_R_STATUS:         return "refused: extraction reported itself incomplete";
+    case QDEP_R_SHORT:          return "LOWER BOUND: extraction incomplete, QEMU's read list taken anyway";
     case QDEP_R_NORECORD:       return "refused: qemu withheld the access list or a provenance";
     case QDEP_R_FIELD:          return "refused: provenance named env state with no generic word";
     case QDEP_R_UNMAPPED:       return "refused: provenance named a global with no generic word";
@@ -3531,6 +3786,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         if (ins) {
             out->decode_id = qemu_plugin_insn_decode_id(ins);
             out->decode_name = qemu_plugin_insn_decode_name(ins);
+            out->insn_vaddr = qemu_plugin_insn_vaddr(ins);
         }
     }
 
@@ -3567,11 +3823,47 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      * Refusing on the first would be irdf's `n_calls > 0` decline, which R5
      * ruled is a reader's limit written down as the machine's.
      */
-    if (st.memops_truncated || st.memops_unnoted ||
-        st.fields_truncated || st.writes_truncated || st.prov_truncated ||
-        st.n_helper_unbounded) {
-        out->state = out->data_state = out->dst_state =
-            out->src_state = QDEP_R_STATUS;
+    out->status_flags =
+        (uint8_t)((st.memops_truncated  ? 0x01 : 0) |
+                  (st.memops_unnoted    ? 0x02 : 0) |
+                  (st.fields_truncated  ? 0x04 : 0) |
+                  (st.writes_truncated  ? 0x08 : 0) |
+                  (st.prov_truncated    ? 0x10 : 0) |
+                  (st.n_helper_unbounded? 0x20 : 0));
+    if (out->status_flags) {
+        /*
+         * REFUSED, exactly as before -- and MEASURED on the way out.
+         *
+         * The read list is taken here and parked in @srcx, which nothing on
+         * the wire path reads.  It answers the one question the refusal
+         * makes unanswerable from outside: on an instruction whose
+         * extraction reports itself short, did QEMU state any reads at all?
+         * "Refused" and "there is nothing to refuse" print identically in
+         * the census and want opposite remedies -- a note at the emitter
+         * versus a survivor row -- and 30 of the 33 program counters the
+         * operand walk's read arm was the only supplier for land here.
+         */
+        note_src(tb, idx, out);
+        out->srcx_state = out->src_state;
+        out->n_srcx = out->n_src;
+        memcpy(out->srcx, out->src_reg, sizeof(out->srcx));
+        out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
+        /*
+         * The MEMORY and DESTINATION families are refused exactly as before:
+         * their subject is a LIST WHOSE LENGTH the wire publishes, and a
+         * short list there is a short mask.  The READ list is not that: it
+         * is a set, the wire's src_regs[] is a union, and a member missing
+         * from it costs a source the operand walk still supplies today.  So
+         * the read list survives the gate as a LOWER BOUND -- see
+         * QDEP_R_SHORT -- and it is empty-with-a-reason where note_src()
+         * itself refused.
+         */
+        out->src_state = (out->src_state == QDEP_OK && out->n_src)
+                       ? QDEP_R_SHORT : QDEP_R_STATUS;
+        if (out->src_state != QDEP_R_SHORT) {
+            out->n_src = 0;
+            memset(out->src_reg, 0, sizeof(out->src_reg));
+        }
         return;
     }
 
@@ -4850,6 +5142,8 @@ void qdep_report(GString *report)
                "SOURCE entries the wire publishes that QEMU's read list does\nnot justify, by mnemonic and generic register.  These are the source\nhalf's NAMED SURVIVORS (R12.1): every one is published exactly as\nbefore, and each row is a coverage path -- an emitter that has to state\nthe read, or an adjudication that the wire is right and QEMU is short:");
     dump_tally(report, g_src_survivor_ident,
                "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the same\nrows as the block above, re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, the ROLE, and the mnemonic as an ANNOTATION.  A\nsource-list flip looks a survivor up by the id, because after the flip the\nmnemonic is gone.  ROLE says how the register is reached from the id:\nFIXED means the same register on every instruction the rule decodes, SELF\nmeans the instruction's own destination register (a partial write merging\ninto what the encoding named), which no constant can stand for.  This is\nthe column tools/gen_src_survivors.py reads:");
+    dump_tally(report, g_src_nostate_ident,
+               "SOURCE SURVIVORS ON THE POPULATION THE CENSUS CANNOT SCORE --\nsame columns, same ROLE measurement, DIFFERENT CLAIM.  A row here is a\npublished source on an instruction whose read list QEMU withheld or\nreported short, so the census may not call it unjustified -- it may only\nsay nobody could ask.  A source-list flip still has to carry it: after the\nflip the read list supplies nothing on these instructions, so the survivor\ntable is the register's only route to the wire.  This block exists because\nNOT-SCORED was a bare count with no list behind it, and 30 of the 33\nprogram counters that lost a published source to the operand walk's\ndeletion were in it.  tools/gen_src_survivors.py reads this block too:");
     dump_tally(report, g_src_ident_witness,
                "DECODE-IDENTITY COLLISION WITNESS -- (decode id, decode rule,\nmnemonic) over EVERY row the source census is reached for, survivor or\nnot, and INCLUDING the rows whose read list QEMU refused to state.  A\ndecode id printed twice with two different mnemonics is one rule carrying\nseveral instructions (x86 clflush decodes through QEMU's NOP row), and a\nsurvivor table keyed on that id alone would hand one instruction the\nother's sources.  This is the measurement that says whether the id is a\nkey or needs qualifying, so a row missing from it is a collision nobody\nis warned about.  Its own coverage is stated and enforced below:");
     {

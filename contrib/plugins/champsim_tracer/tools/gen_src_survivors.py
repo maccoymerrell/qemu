@@ -154,6 +154,16 @@ import tempfile
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
+# The SECOND survivor block, same columns and same role measurement, and a
+# DIFFERENT CLAIM: a published source on an instruction whose read list QEMU
+# withheld or reported short.  The census may not call those unjustified -- it
+# may only say nobody could ask -- so they are printed apart.  They are read
+# here because the FLIP has the same obligation either way: after it, the read
+# list supplies nothing on those instructions, so a register the wire publishes
+# reaches it only from this table.  Until this header was read, 30 of the 33
+# program counters the operand walk's read arm was the only supplier for were
+# invisible to this generator, and it emitted a table that dropped them.
+NOSTATE_HDR = "SOURCE SURVIVORS ON THE POPULATION THE CENSUS CANNOT SCORE"
 SPLIT_HDR = "SURVIVOR rules REACHED by this run"
 WITNESS_HDR = "DECODE-IDENTITY COLLISION WITNESS"
 OWED_HDR = "ADJUDICATION-OWED -- published sources"
@@ -227,24 +237,44 @@ def parse(path):
             elif owed and not line.strip():
                 break
 
-    block = text.split(HDR, 1)[1]
-    rows, seen_any = {}, False
-    for line in block.splitlines():
-        if line.strip() == "(none)":
-            return rows, split_ids, owed, True
-        m = ROW.match(line)
-        if not m:
-            if seen_any and not line.strip():
-                break
-            continue
-        seen_any = True
-        cnt, did, rule, reg, role, mnem = m.groups()
-        key = (int(did, 16), role, reg if role == "FIXED" else "")
-        _, c, mn = rows.get(key, (rule, 0, set()))
-        rows[key] = (rule, c + int(cnt), mn | {mnem})
-    if not seen_any:
-        sys.exit("FAIL %s: survivor block present but unparsable" % path)
-    return rows, split_ids, owed, False
+    def read_block(hdr, rows, required):
+        """Fold one survivor block's rows into @rows.
+
+        Returns (saw_any, saw_none).  A block whose header is present and
+        whose body is neither rows nor the literal `(none)` is a REFUSAL,
+        not an empty result: a reader that cannot find its subject must
+        fail rather than emit a table derived from nothing.
+        """
+        if hdr not in text:
+            if required:
+                sys.exit("FAIL %s: no survivor block -- the census did not "
+                         "run" % path)
+            return False, False
+        seen_any = False
+        for line in text.split(hdr, 1)[1].splitlines():
+            if line.strip() == "(none)":
+                return False, True
+            m = ROW.match(line)
+            if not m:
+                if seen_any and not line.strip():
+                    break
+                continue
+            seen_any = True
+            cnt, did, rule, reg, role, mnem = m.groups()
+            key = (int(did, 16), role, reg if role == "FIXED" else "")
+            _, c, mn = rows.get(key, (rule, 0, set()))
+            rows[key] = (rule, c + int(cnt), mn | {mnem})
+        if not seen_any:
+            sys.exit("FAIL %s: block %r present but unparsable" % (path, hdr))
+        return True, False
+
+    rows = {}
+    any_a, none_a = read_block(HDR, rows, True)
+    # NOT required: a sidecar produced before the second block existed is a
+    # readable sidecar, and refusing it would make this generator unable to
+    # read its own corpus history.  Its ABSENCE is reported by the caller.
+    any_b, none_b = read_block(NOSTATE_HDR, rows, False)
+    return rows, split_ids, owed, (none_a and not any_b)
 
 
 def make_snapshot(dest, inputs):
@@ -498,11 +528,22 @@ next section
 """ % (HDR, "%s", WITNESS_HDR, "%s", "%s", OWED_HDR, "%s")
 
 
-def _sidecar(path, rows, splits, witness=(), owed=()):
-    open(path, "w").write(_BLOCK % ("\n".join(rows) or "  (none)",
-                                    "\n".join(witness),
-                                    "\n".join(splits),
-                                    "\n".join(owed)))
+_NOSTATE_BLOCK = """
+%s --
+same columns, DIFFERENT CLAIM:
+%s
+
+""" % (NOSTATE_HDR, "%s")
+
+
+def _sidecar(path, rows, splits, witness=(), owed=(), nostate=None):
+    body = _BLOCK % ("\n".join(rows) or "  (none)",
+                     "\n".join(witness),
+                     "\n".join(splits),
+                     "\n".join(owed))
+    if nostate is not None:
+        body += _NOSTATE_BLOCK % ("\n".join(nostate) or "  (none)")
+    open(path, "w").write(body)
 
 
 def selftest():
@@ -564,7 +605,21 @@ def selftest():
     x = os.path.join(d, "x86_64.log")
     _sidecar(x, good + split + owedsurv + ruledsurv + noident, splitline,
              witness, owedrow + ruledrow)
-    a_ = os.path.join(d, "aarch64.log"); _sidecar(a_, [], [])
+    # aarch64 carries the SECOND claim and NOTHING in the first: its
+    # survivor block reads `(none)` and its NOT-SCORED block carries two
+    # rows, one on an id the witness shows colliding.  This is the exact
+    # shape the corpus produced -- x86 `cpuid` and `rdtsc` are only ever in
+    # the second block -- and without this arm the whole NOT-SCORED reader
+    # would be untested.
+    nostate = ["        15  00000507 CPUID                      REG_GPR0"
+               "       SELF@0  cpuid",
+               "         2  48fe989e disas_a64/SYS@1101         REG_SYSID"
+               "      FIXED   mrs"]
+    nswitness = ["        15  00000507 CPUID                      cpuid",
+                 "         2  48fe989e disas_a64/SYS@1101         mrs",
+                 "         1  48fe989e disas_a64/SYS@1101         msr"]
+    a_ = os.path.join(d, "aarch64.log")
+    _sidecar(a_, [], [], nswitness, (), nostate)
     r = os.path.join(d, "riscv64.log"); _sidecar(r, [], [])
     m = os.path.join(d, "mipsel.log"); _sidecar(m, [], [])
 
@@ -612,6 +667,14 @@ def selftest():
     rc = subprocess.run(me + ["--out", h + ".2", "x86_64=" + x,
                               "aarch64=" + a_, "riscv64=" + r, "mipsel=" + m],
                         capture_output=True, text=True)
+    chk("ARM N: a NOT-SCORED-block row IS carried (the second claim)",
+        "0x00000507u, SRC_SURV_SELF , REG_NONE      , 0," in txt,
+        "the survivor block read (none); only the NOT-SCORED block has it")
+    chk("ARM N1: and the collision witness still refuses one there",
+        "0x48fe989eu, SRC_SURV" not in txt
+        and "REFUSED, not carried: 0x48fe989e" in txt)
+    chk("ARM N2: an ISA with rows ONLY in the second block is not EMPTY",
+        "EMPTY aarch64" not in rc.stdout)
     chk("ARM G: emitting from LIVE paths is refused",
         rc.returncode != 0 and not os.path.exists(h + ".2"), rc.stdout.strip())
 

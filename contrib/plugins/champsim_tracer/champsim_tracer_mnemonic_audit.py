@@ -3685,7 +3685,24 @@ def classify_riscv(m: str) -> Entry:
     return ent("GEN_OP_UNKNOWN")
 
 
-def classify_mips(m: str) -> Entry:
+# The MIPS data formats that appear in a MNEMONIC, widest-first.  MSA and
+# the DSP ASE write the element width as a decodetree FIELD (`df`), so a
+# rule is named FADD / CLE_S / ASUB_S while the spelling the classifier is
+# keyed on is fadd.w / cle_s.b / asub_s.d.  Asking the classifier about
+# one width is asking it about the same instruction, and `_w` first is
+# deliberate: it is the width whose row the shipped Capstone-keyed table
+# already carries for every one of these families, so a pattern name and
+# its own enum rows cannot end up with two different answers.
+MIPS_DATA_FORMATS = ("_w", "_d", "_h", "_b", "_ph", "_qb",
+                     "_ob", "_qh", "_pw", "_ql")
+
+# The 64-bit DSP formats, which a QEMU enumerator DOES spell in the name
+# (OPC_ABSQ_S_OB, OPC_PICK_QH).  They are the same operation at another
+# width, so the word normalises by dropping them and asking again.
+MIPS_WIDE_DSP_FORMATS = ("_ob", "_qh", "_pw", "_ql")
+
+
+def classify_mips(m: str, _df_retry: bool = False) -> Entry:
     # MSA per-element bit ops (BCLR/BNEG/BSET/BINSL/BINSR + i/_df
     # forms) are vector bitwise, NOT branches -- they must beat the
     # "bne"/"b*" branch-prefix rules below (bneg_b -> "bne...").
@@ -3752,7 +3769,12 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_MOV")
     if m in {"la", "dla"}:
         return ent("GEN_OP_LEA")
-    if m.startswith("s_"):
+    # The FP store formats -- `s.d`, `s.s`.  Written as an anchored set
+    # rather than an `s_` prefix: the prefix also answered for
+    # `s_fmt`, which is the NAME OF A DECODE GROUP in QEMU's MIPS
+    # translator (OPC_S_FMT dispatches the single-precision FP
+    # arithmetic space) and is not a store at all.
+    if re.match(r"^s_(s|d|w|l|ps)$", m):
         return ent("GEN_OP_STORE")
     if re.match(r"^pref(e|x)?$", m):
         return ent("GEN_OP_PREFETCH")
@@ -3834,7 +3856,18 @@ def classify_mips(m: str) -> Entry:
     if m.startswith(("bmnz", "bmz", "bsel", "seleqz", "selnez",
                       "sel")):
         return ent("GEN_OP_CMOV")
-    if re.search(r"_(b|h|w|d|ph|qb|v)$", m) or m.startswith(("v", "msa", "copy_", "insert_", "splati", "splat_", "ldi_")):
+    # The `v`-spelled MIPS mnemonics, NAMED rather than taken by a
+    # one-letter prefix.  A bare `startswith("v")` answered for any
+    # string beginning with that letter, and the statement route walked
+    # straight into it: `@vec` is msa.decode's operand-shape format, not
+    # an instruction, and the catch-all classified it GEN_OP_VEC_LOGIC --
+    # which then out-ranked the pattern name on BSEL_V/BMNZ_V/BMZ_V and
+    # made three bit-select rules disagree with their own payload.  MIPS
+    # has exactly four `v` mnemonics: MSA's vshf and the VR54xx multiply
+    # trio, and they are listed.
+    if re.search(r"_(b|h|w|d|ph|qb|v)$", m) or m.startswith(
+            ("vshf", "v3mulu", "vmulu", "vmm",
+             "msa", "copy_", "insert_", "splati", "splat_", "ldi_")):
         if m.startswith("dpadd"):
             return ent("GEN_OP_VEC_MADD")
         if m.startswith("dpsub"):
@@ -3866,6 +3899,23 @@ def classify_mips(m: str) -> Entry:
             return ent("GEN_OP_VEC_MOV")
         if m.startswith(("shf", "ilv", "pck", "sld", "splat", "vshf")):
             return ent("GEN_OP_VEC_SHUF")
+        # The width-suffixed catch-all.  It is right for the vector
+        # families the generic space has no closer opcode for -- lane
+        # compares, min/max, saturation, population counts -- and it is
+        # reached by a real Capstone mnemonic carrying a real width.
+        #
+        # IT IS NOT REACHED FROM THE DATA-FORMAT RETRY.  That probe asks
+        # this classifier about `<word>_w` for a word QEMU wrote, and a
+        # catch-all keyed on the suffix alone answers for any string at
+        # all: `vec` and `i8` are msa.decode's operand-shape FORMATS, and
+        # letting them through classified two encoding templates as
+        # instructions and out-ranked the rules' own names.  That is the
+        # `#shfl` hazard, measured here rather than argued: on the retry
+        # path a word this function does not RECOGNISE stays unknown, and
+        # the statement route then reports it as a hole in the vocabulary
+        # instead of filling it with a guess.
+        if _df_retry:
+            return ent("GEN_OP_UNKNOWN")
         return ent("GEN_OP_VEC_LOGIC")
     if m.startswith(("madd", "maddu")):
         return ent("GEN_OP_INT_MADD")
@@ -3925,6 +3975,151 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_CMP")
     if m.startswith("cmp"):
         return ent("GEN_OP_CMP")
+    # --- THE FAMILIES QEMU DECODES AND CAPSTONE'S MIPS VOCABULARY DOES
+    #     NOT REACH -------------------------------------------------
+    #
+    # Everything above answers a Capstone MIPS constant.  QEMU decodes
+    # three families Capstone has no constant for at all -- the PS2 (TX79
+    # / MMI) 128-bit integer SIMD, Loongson's GS load/store and CSR
+    # extensions, and the 64-bit DSP data formats -- plus the MSA and DSP
+    # rule names whose width lives in a field.  None of the words below
+    # is a Capstone mnemonic, so nothing here can move a row of the
+    # enum-keyed table; they exist because QEMU's own decoders say them.
+    #
+    # MSA lane compares, min/max, saturation and lane counts.  The
+    # generic space has no vector-compare or vector-min opcode, and the
+    # width-suffixed spellings of these same instructions already answer
+    # GEN_OP_VEC_LOGIC in the shipped table -- so the rule name answers
+    # what its own widths answer, and the two accounts of one
+    # instruction cannot disagree.
+    if m.startswith(("ceq", "cle", "clt", "clei", "clti", "ceqi",
+                     "fcaf", "fceq", "fcle", "fclt", "fcne", "fcor",
+                     "fcue", "fcul", "fcun",
+                     "fsaf", "fseq", "fsle", "fslt", "fsne", "fsor",
+                     "fsue", "fsul", "fsun",
+                     "fclass", "fexdo", "fexup", "fexp2", "flog2",
+                     "ffint", "ffql", "ffqr", "ftq", "frint",
+                     "fmax", "fmin", "max_", "maxi", "min_", "mini",
+                     "nloc", "nlzc", "pcnt", "sat_", "fill")):
+        return ent("GEN_OP_VEC_LOGIC")
+    if m.startswith("ave"):
+        return ent("GEN_OP_VEC_ADD")
+    # MSA whole-vector load and store: msa.decode names them LD and ST,
+    # and `ld` already reaches the scalar rule above, so only ST is left
+    # to say -- said the same way, as the access it is.
+    if m == "st":
+        return ent("GEN_OP_STORE")
+    # --- PS2 / TX79 MMI: 128-bit packed integer SIMD ------------------
+    # QEMU's own tx79.decode and the MMI_OPC_ enumerators.  The `p`
+    # prefix is MMI's "parallel", i.e. these are the vector forms of the
+    # scalar ops of the same name.
+    if m.startswith(("padd", "paddu")):
+        return ent("GEN_OP_VEC_ADD")
+    if m.startswith(("psub", "psubu", "pasub")):
+        return ent("GEN_OP_VEC_SUB")
+    if m.startswith(("pmadd", "phmadd")):
+        return ent("GEN_OP_VEC_MADD")
+    if m.startswith(("pmsub", "phmsub")):
+        return ent("GEN_OP_VEC_MSUB")
+    if m.startswith(("pmul", "pdiv", "pmfhl", "pmthl")):
+        return ent("GEN_OP_VEC_MUL" if m.startswith("pmul")
+                   else "GEN_OP_VEC_DIV" if m.startswith("pdiv")
+                   else "GEN_OP_VEC_MOV")
+    if m.startswith(("pcpy", "pext", "pins", "ppac", "pack", "pshuf",
+                     "punpck", "prot3w", "pmovmsk", "pinteh", "pinth",
+                     "prevh", "pexch", "pexcw", "pexeh", "pexew")):
+        return ent("GEN_OP_VEC_SHUF")
+    if m.startswith(("psll", "psrl", "psra", "prot")):
+        return ent("GEN_OP_VEC_LOGIC")
+    if m.startswith(("pand", "por", "pnor", "pxor", "pceq", "pcgt",
+                     "pcmpeq", "pcmpgt", "pmax", "pmin", "pavg",
+                     "pabs", "plzcw", "pcpyud")):
+        return ent("GEN_OP_VEC_LOGIC")
+    # MDMX byte-interleaved accumulate, and the VR54xx multiply-
+    # accumulate family, which write the HI/LO accumulator pair.
+    if m.startswith("biadd"):
+        return ent("GEN_OP_VEC_ADD")
+    if m.startswith("macc"):
+        return ent("GEN_OP_INT_MADD")
+    # The PS2's second HI/LO accumulator: mfhi1/mflo1/mthi1/mtlo1 move
+    # between a GPR and it, exactly as mfhi/mflo do for the first.
+    if m in {"mfhi1", "mflo1", "mthi1", "mtlo1"}:
+        return ent("GEN_OP_MOV")
+    # The PS2 128-bit GPR load and store.
+    if m in {"lq", "sq"}:
+        return ent("GEN_OP_VEC_LOAD" if m == "lq" else "GEN_OP_VEC_STORE")
+    # --- Loongson GS extensions ---------------------------------------
+    # `gsl*` is a load and `gss*` a store, and QEMU writes the two group
+    # opcodes down as exactly that: OPC_GSSHFL = OPC_LWC2 and
+    # OPC_GSSHFS = OPC_SWC2 (translate.c), so the group rows take the
+    # class of the family they dispatch.  The quad forms move 128 bits.
+    if m in {"gslq", "gslqc1"}:
+        return ent("GEN_OP_VEC_LOAD")
+    if m in {"gssq", "gssqc1"}:
+        return ent("GEN_OP_VEC_STORE")
+    if m.startswith("gsl") or m == "gsshfl":
+        return ent("GEN_OP_LOAD")
+    if m.startswith("gss") or m == "gsshfs":
+        return ent("GEN_OP_STORE")
+    # Loongson / VR54xx configuration and control-status reads and
+    # writes: one value between a GPR and an implementation register.
+    if m in {"cpucfg", "rdcsr", "wrcsr", "drdcsr", "dwrcsr"}:
+        return ent("GEN_OP_MOV")
+    # VR54xx reciprocal / reciprocal-square-root estimate steps.
+    if m.startswith(("recip1", "recip2")):
+        return ent("GEN_OP_FP_DIV")
+    if m.startswith(("rsqrt1", "rsqrt2")):
+        return ent("GEN_OP_FP_SQRT")
+    # --- DSP ASE families the width-suffixed rules above do not reach --
+    # `absq_s` is a saturating absolute value, `raddu` a reduction add,
+    # and the precr / precrq / precrqu / pick / repl / replv family are
+    # element gather-and-pack operations.
+    if m.startswith("absq"):
+        return ent("GEN_OP_VEC_LOGIC")
+    if m.startswith("raddu"):
+        return ent("GEN_OP_VEC_ADD")
+    if m.startswith(("precr", "precrq", "precrqu", "packrl", "pick",
+                     "repl", "replv", "dappend", "dbalign", "dshilo",
+                     "dshilov")):
+        return ent("GEN_OP_VEC_SHUF")
+    # 64-bit DSP multiply-accumulate into the HI/LO pair.
+    if m.startswith(("dmadd", "dmaddu")):
+        return ent("GEN_OP_INT_MADD")
+    if m.startswith(("dmsub", "dmsubu")):
+        return ent("GEN_OP_INT_MSUB")
+    # `alnv.ps` selects a paired-single pair from two registers at a
+    # byte offset -- an element select, not an arithmetic op.
+    if m.startswith("alnv"):
+        return ent("GEN_OP_VEC_SHUF")
+    # movcf.s / movcf.ps: move-conditional on an FPU condition code.
+    # movcf.s / movcf.ps and the integer movci group (movf / movt):
+    # move-conditional on an FPU condition code.
+    if m.startswith(("movcf", "movci")):
+        return ent("GEN_OP_CMOV")
+
+    # --- THE DATA FORMAT IS A FIELD, NOT PART OF THE MNEMONIC ---------
+    #
+    # Everything above is keyed on a Capstone spelling, which carries the
+    # element width: `asub_s.b`, `fadd.w`, `pick.qh`.  QEMU's decode rules
+    # do not -- msa.decode names the rule ASUB_S and takes `df` as a
+    # field, and the hand-written decoder's enumerators spell the wide DSP
+    # formats but not the narrow ones.  A word that reaches here with no
+    # data format is therefore the same instruction with the field left in
+    # the field, and it takes the answer its own widths take.
+    #
+    # ONE LEVEL ONLY, and the width is not invented: every candidate is
+    # this word plus a format MIPS defines, asked of this same classifier.
+    if not _df_retry:
+        bases = [m]
+        for wide in MIPS_WIDE_DSP_FORMATS:
+            if m.endswith(wide) and len(m) > len(wide):
+                bases.insert(0, m[:-len(wide)])
+                break
+        for base in bases:
+            for df in MIPS_DATA_FORMATS:
+                cand = classify_mips(base + df, _df_retry=True)
+                if cand.op != "GEN_OP_UNKNOWN":
+                    return cand
     return ent("GEN_OP_UNKNOWN")
 
 
@@ -6084,6 +6279,28 @@ def _pinning_formats(isa: str, base: str) -> frozenset[str]:
     return frozenset(out)
 
 
+# The C-namespace markers a target's HAND-WRITTEN decoder puts in front
+# of its opcode enumerators.  decodetree names a rule after the
+# instruction; a hand-written switch names it after the enumerator, and
+# the enumerator lives in a namespace.  Peeling the marker is reading the
+# same word without the namespace -- nothing is invented and nothing is
+# offered that QEMU did not write.
+#
+# Ordered longest-first so `MMI_OPC_` peels as itself and not as a
+# `MMI_` prefix over a name beginning `opc_`.
+QEMU_ENUMERATOR_PREFIXES: dict[str, tuple[str, ...]] = {
+    "mips": ("mmi_opc_", "mxu_opc_", "nm_opc_", "r6_opc_", "opc_"),
+}
+
+
+def _enumerator_word(isa: str, pat: str) -> str | None:
+    """`pat` with its target's enumerator namespace peeled, or None."""
+    for pref in QEMU_ENUMERATOR_PREFIXES.get(isa, ()):
+        if pat.startswith(pref) and len(pat) > len(pref):
+            return pat[len(pref):]
+    return None
+
+
 def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
     """(word, where it came from), most specific first -- all QEMU's own."""
     out: list[tuple[str, str]] = []
@@ -6107,7 +6324,25 @@ def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
                 add(_word(f), "format")
 
     pat = _word(ident.pattern)
-    add(pat, "pattern")
+    # THE ENUMERATOR PREFIX REPLACES THE PATTERN WORD -- it does not
+    # precede it.  A hand-written decoder switches on QEMU's own C
+    # enumerators (OPC_DSLLV, R6_OPC_CMP_ULT_D, MMI_OPC_MADDU), and the
+    # namespace marker in front is not part of any spelling QEMU ever
+    # used for the instruction: `opc_add_d` is not a word, it is `add_d`
+    # written inside a C namespace.
+    #
+    # OFFERING BOTH IS THE #shfl HAZARD AGAIN, and it was measured rather
+    # than assumed.  With `opc_add_d` still offered first the mips
+    # vocabulary answers it GEN_OP_VEC_LOGIC -- a catch-all firing on a
+    # string it does not know -- and 18 admitted FP rows moved
+    # FP_ADD/FP_CVT/FP_CMP -> VEC_LOGIC.  Replacing takes the same
+    # measurement to 163 agreeing rows and ONE admitted disagreement.
+    # So the prefix is peeled off the front, and what remains is the
+    # word, alone.
+    stripped = _enumerator_word(info.key, pat)
+    if stripped is not None:
+        pat = stripped
+    add(pat, "pattern" if stripped is None else "enumerator")
     q = pat
     while "_" in q:
         q = q.rsplit("_", 1)[0]
@@ -6190,6 +6425,160 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "gen_exception_illegal(); a reserved encoding the decoder exists "
         "to refuse, taking a trap to a vector",
         no_class=True),
+    # --- mips ---------------------------------------------------------
+    # THE DISPATCH ROWS.  QEMU's MIPS translator is a nest of switches on
+    # the major opcode and then on a minor field, and every level calls
+    # mips_ident() with the enumerator it matched.  mips_ident() OVERWRITES
+    # (translate.c:1361), so a group's own id survives only where no leaf
+    # claimed the encoding -- and those encodings reach the switch's
+    # default, which is gen_reserved_instruction(), which marks the decode
+    # FAULTED and publishes nothing at all.  The row is therefore an
+    # internal dispatch step and not an instruction, and it takes the
+    # NAMED kind the reserved encodings take: a trap to a vector, which
+    # is what the machine does with the bytes that could ever reach it.
+    #
+    # One entry per GROUP WORD.  `c0` answers for c0_1 .. c0_f as well,
+    # because the enumerator peel offers the specific word first and this
+    # one after it.
+    ("mips", "special"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "special", "ruled",
+        "translate.c:18153 case OPC_SPECIAL: decode_opc_special(env, ctx) "
+        "-- the major-opcode dispatch step; every instruction it reaches "
+        "re-identifies itself and an encoding none claims is reserved",
+        no_class=True),
+    ("mips", "special2"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "special2", "ruled",
+        "translate.c case OPC_SPECIAL2: decode_opc_special2_legacy() -- "
+        "as OPC_SPECIAL, one level down",
+        no_class=True),
+    ("mips", "special3"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "special3", "ruled",
+        "translate.c case OPC_SPECIAL3: decode_opc_special3() -- as "
+        "OPC_SPECIAL, one level down",
+        no_class=True),
+    ("mips", "regimm"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "regimm", "ruled",
+        "translate.c case OPC_REGIMM: the rt-field dispatch for the "
+        "branch-and-trap-immediate space; every leaf re-identifies",
+        no_class=True),
+    ("mips", "cp0"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cp0", "ruled",
+        "translate.c case OPC_CP0: the coprocessor-0 dispatch step",
+        no_class=True),
+    ("mips", "cp1"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cp1", "ruled",
+        "translate.c:18715 case OPC_CP1: MASK_CP1(ctx->opcode) then a "
+        "switch whose every arm re-identifies",
+        no_class=True),
+    ("mips", "cp2"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cp2", "ruled",
+        "translate.c case OPC_CP2: the coprocessor-2 dispatch step",
+        no_class=True),
+    ("mips", "cp3"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cp3", "ruled",
+        "translate.c case OPC_CP3: the coprocessor-3 dispatch step",
+        no_class=True),
+    ("mips", "c0"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "c0", "ruled",
+        "translate.c:18346 case OPC_C0 ... OPC_C0_F: the fifteen "
+        "cop0-function dispatch rows, one per value of the field the "
+        "next switch reads",
+        no_class=True),
+    ("mips", "lx_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "lx_dsp", "ruled",
+        "translate.c:17028 case OPC_LX_DSP: MASK_LX(ctx->opcode) then a "
+        "switch whose every arm re-identifies (LBUX/LHX/LWX/LDX)",
+        no_class=True),
+    ("mips", "s_fmt"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "s_fmt", "ruled",
+        "translate.c:18812 case OPC_S_FMT: gen_farith(), whose 101 arms "
+        "each re-identify and whose default is gen_reserved_instruction()",
+        no_class=True),
+    ("mips", "d_fmt"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "d_fmt", "ruled",
+        "translate.c:18812 case OPC_D_FMT: as OPC_S_FMT, double format",
+        no_class=True),
+    ("mips", "w_fmt"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "w_fmt", "ruled",
+        "translate.c case OPC_W_FMT: as OPC_S_FMT, word format",
+        no_class=True),
+    ("mips", "l_fmt"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "l_fmt", "ruled",
+        "translate.c case OPC_L_FMT: as OPC_S_FMT, long format",
+        no_class=True),
+    ("mips", "ps_fmt"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "ps_fmt", "ruled",
+        "translate.c case OPC_PS_FMT: as OPC_S_FMT, paired-single format",
+        no_class=True),
+    ("mips", "pcrel"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "pcrel", "ruled",
+        "translate.c:19202 case OPC_PCREL: gen_pcrel(), which identifies "
+        "ADDIUPC, LWPC, LWUPC, AUIPC, ALUIPC and LDPC itself",
+        no_class=True),
+    ("mips", "spim"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "spim", "ruled",
+        "translate.c:16421 case OPC_SPIM: MIPS_INVAL(\"spim "
+        "(unofficial)\") then gen_reserved_instruction(ctx) -- an "
+        "unofficial encoding QEMU exists to refuse",
+        no_class=True),
+
+    # THE BYTE-SHUFFLE GROUPS, whose own id survives for exactly one
+    # thing and QEMU says which.  Every named sub-operation of
+    # OPC_BSHFL re-identifies, so the group's id reaches a plugin only
+    # through the arm above that switch:
+    #
+    #     if (rd == 0) {
+    #         /* Treat as NOP. */
+    #         break;
+    #     }
+    #
+    # -- an encoding whose destination is $zero, which writes nothing.
+    # That is QEMU's own word for it and it is also what the machine
+    # does.
+    ("mips", "bshfl"): Statement(
+        ent("GEN_OP_NOP"), "bshfl", "ruled",
+        "translate.c:16845 `if (rd == 0) { /* Treat as NOP. */ break; }` "
+        "ahead of the sub-opcode switch -- every named arm of OPC_BSHFL "
+        "re-identifies, so the group's own identity is published for the "
+        "rd == 0 encodings alone"),
+    ("mips", "dbshfl"): Statement(
+        ent("GEN_OP_NOP"), "dbshfl", "ruled",
+        "translate.c case OPC_DBSHFL -- as OPC_BSHFL, the 64-bit group"),
+
+    # PMON is a firmware entry point: the arm emits gen_helper_pmon(),
+    # which leaves the guest and enters the PROM monitor.  Nothing about
+    # it is arithmetic; it is a trap out of the program, which is the
+    # class every other trap-taking MIPS instruction carries.
+    ("mips", "pmon"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "pmon", "ruled",
+        "translate.c:16582 gen_helper_pmon(tcg_env, tcg_constant_i32(sa)) "
+        "-- `Pmon entry point, also R4010 selsl`, a trap into the PROM "
+        "monitor"),
+
+    # MDMX is DECODED and NOT IMPLEMENTED, and that is an emulator gap
+    # rather than a statement about the instruction.  The arm sets the
+    # identity and then generates nothing at all, so a class taken from
+    # what QEMU emits would say `nop` about a SIMD instruction that a
+    # machine with the ASE executes.  The row is marked no_class for
+    # exactly that reason: it records that this rule has no class the
+    # decoder can state, and the standing ruling on upstream gaps says
+    # such a gap closes at the emulator, not by absorbing it here.
+    ("mips", "mdmx"): Statement(
+        ent("GEN_OP_NOP"), "mdmx", "ruled",
+        "translate.c:19196 case OPC_MDMX: `/* MDMX: Not implemented. */` "
+        "and break -- QEMU makes the decode and emits no operation; the "
+        "class is an EMULATOR GAP and this row states no architectural "
+        "answer",
+        no_class=True),
+
+    # The CP0 move-and-modify group: DI/EI/DVPE/EVPE/DMT/EMT/DVP/EVP all
+    # read one CP0 register into a GPR and set or clear one bit of it.
+    ("mips", "mfmc0"): Statement(
+        ent("GEN_OP_MOV"), "mfmc0", "ruled",
+        "translate.c:18384 case OPC_MFMC0 -- the DI/EI/DVPE/EVPE family, "
+        "each of which moves one CP0 register into a GPR and rewrites one "
+        "bit of it"),
+
     ("riscv", "c64_illegal"): Statement(
         ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "c64_illegal", "ruled",
         "insn16.decode c64_illegal -- the RV32 encodings RV64 reclaims; "
@@ -6221,6 +6610,38 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
     # the checking path it writes only CPURISCVState.elp, which is not a
     # register the wire carries.  Nothing is lost by stating NOP: an
     # auipc into x0 produces nothing either.
+    # translate.c OPC_SLL, qualified to the whole 32-bit encoding
+    # 0x00000000 -- `sll $zero, $zero, 0`, which is MIPS's canonical nop
+    # and is why the assembler emits that word for one.  The pin hook
+    # reads the rule's own fixed bits: rs, rt and rd are all register 0,
+    # and register 0 is hardwired, so the shift computes into nothing.
+    # The observation says GEN_OP_SHL because Capstone spells the
+    # encoding MIPS_INS_SLL -- a disassembler naming the field layout,
+    # not the instruction.  QEMU qualifies this encoding apart from the
+    # other three (ssnop, ehb, pause) for exactly the reason the
+    # statement gives, and the ssnop row's own observation agrees with
+    # the statement, which is the same fact read through the other key.
+    ("mips", "translate_mips/OPC_SLL@00000000000000000000000000000000"):
+        "translate.c:16457 `if (sa == 5 && rd == 0 && rs == 0 && rt == 0)` "
+        "on the OPC_SLL arm -- QEMU separates the zero-destination "
+        "encodings itself, and scripts/mips_ident_instrument.py qualifies "
+        "this one as `NOP -- SLL r0,r0,0`",
+
+    # translate.c:16573 case OPC_PMON.  QEMU decodes SPECIAL function
+    # 0x05 as the PMON monitor entry point and emits gen_helper_pmon();
+    # MIPS Release 6 reuses the same encoding for LSA, and the
+    # disassembler this corpus was joined through reads it that way, so
+    # the observation says GEN_OP_INT_ADD.  The two are reading different
+    # architectures out of one word.  Under R20 the row states what the
+    # rule QEMU DISPATCHED does, and the disagreement is recorded rather
+    # than resolved by preference: it is a QEMU-versus-disassembler
+    # architecture-level disagreement, and it belongs in the open ledger
+    # for the admission wave rather than in a silent choice here.
+    ("mips", "translate_mips/OPC_PMON"):
+        "translate.c:16582 gen_helper_pmon() -- QEMU's SPECIAL 0x05 arm "
+        "is the PMON monitor entry; the observed X86-style INT_ADD comes "
+        "from the disassembler reading the same encoding as MIPS R6 LSA",
+
     ("riscv", "decode_insn32/lpad"):
         "insn32.decode:129 lpad label:20 00000 0010111, ahead of auipc in "
         "the same decode group -- trans_lpad() writes no GPR, and QEMU's "
@@ -6235,7 +6656,7 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
 # build teaches nothing -- it just stops it.  An ISA outside the set keeps
 # the observation-derived tiers exactly as they were, and the census says
 # so on every run rather than letting the difference go unremarked.
-QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv"})
+QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv", "mips"})
 
 
 _PIN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\b")
@@ -6287,8 +6708,53 @@ def _riscv_link_pin(ident: QemuIdent, st: Statement,
         f"jump a call, and QEMU writes the pin down")
 
 
+def _mips_zero_dest_pin(ident: QemuIdent, st: Statement,
+                        pins: dict[str, int]) -> Statement | None:
+    """A MIPS encoding that writes $zero performs no architectural write.
+
+    The hand-written MIPS decoder reaches one `case OPC_SLL` arm for
+    four architecturally distinct instructions -- nop, ssnop, ehb and
+    pause -- because the shift's operand fields are what separate them
+    and the switch masks those fields off.  QEMU qualifies exactly those
+    encodings apart (`scripts/mips_ident_instrument.py`), so the rule's
+    identity carries its whole 32-bit encoding, every bit fixed.
+
+    Read that encoding.  A SPECIAL-format rule with rs, rt and rd all
+    pinned to register 0 computes a value into $zero, which is hardwired:
+    the instruction has no data result, and MIPS gives those encodings
+    their own names for exactly that reason.  QEMU says so on the same
+    arm -- `if (sa == 5 && rd == 0 && rs == 0 && rt == 0) { /* PAUSE */ }`
+    at translate.c's OPC_SLL case.
+
+    Only a FULLY pinned encoding is read: a `.` anywhere in the bits is a
+    field the rule leaves free, and a free rd is a runtime value the
+    class may not be taken from.
+    """
+    if ident.decoder != "translate_mips":
+        return None
+    bits = ident.bits
+    if len(bits) != 32 or "." in bits:
+        return None
+    word = int(bits, 2)
+    if word >> 26 != 0:                       # not the SPECIAL opcode
+        return None
+    rs, rt, rd = (word >> 21) & 31, (word >> 16) & 31, (word >> 11) & 31
+    if (rs, rt, rd) != (0, 0, 0):
+        return None
+    if st.entry.op == "GEN_OP_NOP":
+        return None
+    return Statement(
+        ent("GEN_OP_NOP"), st.word, "pin",
+        f"{ident.src_file}:{ident.src_line} is reached with the whole "
+        f"encoding {bits} fixed -- a SPECIAL-format rule with rs, rt and "
+        f"rd all register 0, which writes $zero and therefore nothing; "
+        f"QEMU separates these encodings on the same arm "
+        f"(`sa == 5 && rd == 0 && rs == 0 && rt == 0` for PAUSE)")
+
+
 RULE_PIN_HOOKS = {
     "riscv": _riscv_link_pin,
+    "mips": _mips_zero_dest_pin,
 }
 
 

@@ -320,6 +320,63 @@ def apply_not_operand(isa, rows):
     return applied
 
 
+#
+# THE TRANSLATION KEY, RECOMPUTED -- the same class as above, arrived at from
+# the WRITE side, and keyed on a structural fact rather than on a name list.
+#
+# WHY THE SITE KEY CANNOT REACH THIS ONE.  NOT_OPERAND_SITES names a member
+# read at a particular line, which works when the emulator's own read is one
+# read at one place.  helper_rebuild_hflags_a64 is the other shape: its body
+# is `env->hflags = rebuild_hflags_a64(env, el, fp_el, mmu_idx)` and the
+# twenty-eight members it reads to get there are read at twenty-five
+# different lines in five files -- internals.h:406 (scr_el3), helper.c:275
+# (pstate), debug_helper.c:168 (mdscr_el1) and so on -- every one of which is
+# ALSO reached by helpers where the same member IS an operand.  Marking those
+# lines would take the operand with it.
+#
+# THE KEY IS THE WRITE SET.  env->hflags is not architectural state: it is
+# QEMU's cache of the flags cpu_get_tb_cpu_state() computes, the key the next
+# translation is looked up by, and helper_lookup_tb_ptr's hand row already
+# marks it DF_HF_XLAT on every target that has one.  A helper whose ONLY
+# CPUArchState write is that member has therefore changed nothing the guest
+# can observe; every member it read was an input to the key, and none of them
+# is an operand of the instruction that called it.
+#
+# MEASURED, and it is why this is a rule rather than a comment.  aarch64
+# `msr tpidr_el0, x19` ends its TB with gen_rebuild_hflags(), and the row's
+# twenty-eight reads plus two writes filled INSN_DF_MAX_FIELDS (24) exactly
+# as riscv64's chained branches did before the read side of this class was
+# named.  The field table then overflowed, qemu_plugin_insn_reg_read_list()
+# reported itself INCOMPLETE, and the one register the instruction really
+# does read -- x19 -- was refused with it.  Raising the cap would have hidden
+# that: the table was not too small, it was full of state the instruction
+# does not touch.
+#
+KEY_CACHE_MEMBER = {'x86_64': 'hflags', 'aarch64': 'hflags',
+                    'mipsel': 'hflags'}
+
+
+def apply_key_cache(isa, rows):
+    """Mark a key-recomputing helper's WHOLE footprint DF_HF_XLAT.
+
+    Selected by the write set, never by name: the helper qualifies exactly
+    when the only CPUArchState member it writes is the target's cached
+    translation key.  A helper that writes anything else keeps every row it
+    has, which is the over-approximating direction.
+    """
+    member = KEY_CACHE_MEMBER.get(isa)
+    applied = []
+    if member is None:
+        return applied
+    for name, v in rows:
+        wr = {f for f, d in v['env'].items() if d & 2}
+        if wr != {member}:
+            continue
+        v['xlat'] = sorted(set(v.get('xlat', [])) | set(v['env']))
+        applied.append((name, member, sorted(v['env'])))
+    return applied
+
+
 def row_guard(v, field_guard, refuse):
     """The macro a row must be emitted under, '' for none, None to refuse.
 
@@ -417,6 +474,7 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
                   % (isa, name, ','.join(bad)))
 
     not_operand = apply_not_operand(isa, rows)
+    key_cache = apply_key_cache(isa, rows)
 
     w = out.write
     hand = set(merged)
@@ -483,6 +541,18 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
                 line = (line + ' ' + word).strip()
             if line:
                 w(' *     %s\n' % line)
+        w(' *\n')
+    if key_cache:
+        w(' * THE TRANSLATION KEY, RECOMPUTED.  A helper whose ONLY\n'
+          ' * CPUArchState write is the cached TB-lookup key has computed\n'
+          ' * that key and nothing the guest can observe, so its WHOLE\n'
+          ' * footprint is the emulator\'s own and is marked DF_HF_XLAT --\n'
+          ' * enumerated so the row still accounts for it, not published\n'
+          ' * because the wire carries operands.  Selected by the WRITE SET,\n'
+          ' * never by helper name:\n')
+        for n, member, fl in sorted(key_cache):
+            w(' *   %-24s writes only %s; %d member(s) not published\n'
+              % (n, member, len(fl)))
         w(' *\n')
     w(' * Rows refused, and therefore still OVER-APPROXIMATED at run time:\n')
     if not refused:

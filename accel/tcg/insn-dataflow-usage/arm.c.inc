@@ -58,6 +58,15 @@
  *     reason. No instruction records reading its own encoding, and this
  *     is that read
  *
+ * THE TRANSLATION KEY, RECOMPUTED.  A helper whose ONLY
+ * CPUArchState write is the cached TB-lookup key has computed
+ * that key and nothing the guest can observe, so its WHOLE
+ * footprint is the emulator's own and is marked DF_HF_XLAT --
+ * enumerated so the row still accounts for it, not published
+ * because the wire carries operands.  Selected by the WRITE SET,
+ * never by helper name:
+ *   rebuild_hflags_a64       writes only hflags; 29 member(s) not published
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   access_check_cp_reg      env passed to accessfn(), not defined in this unit
  *
@@ -306,35 +315,35 @@ static const DfHelperField dfu_pacia_env[] = {
 };
 #endif
 static const DfHelperField dfu_rebuild_hflags_a64_env[] = {
-    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:1312 */
-    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:1169, INDEX NOT STATED */
-    { offsetof(CPUArchState, cp15.fgt_exec[0]), sizeof(((CPUArchState *)0)->cp15.fgt_exec[0]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:338 */
-    { offsetof(CPUArchState, cp15.hcr_el2), sizeof(((CPUArchState *)0)->cp15.hcr_el2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:5631 */
-    { offsetof(CPUArchState, cp15.mdcr_el2), sizeof(((CPUArchState *)0)->cp15.mdcr_el2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:32 */
-    { offsetof(CPUArchState, cp15.mdcr_el3), sizeof(((CPUArchState *)0)->cp15.mdcr_el3), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:77 */
-    { offsetof(CPUArchState, cp15.mdscr_el1), sizeof(((CPUArchState *)0)->cp15.mdscr_el1), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:168 */
-    { offsetof(CPUArchState, cp15.osdlr_el1), sizeof(((CPUArchState *)0)->cp15.osdlr_el1), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:152 */
-    { offsetof(CPUArchState, cp15.oslsr_el1), sizeof(((CPUArchState *)0)->cp15.oslsr_el1), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:152 */
-    { offsetof(CPUArchState, cp15.scr_el3), sizeof(((CPUArchState *)0)->cp15.scr_el3), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:406 */
-    { offsetof(CPUArchState, cp15.sctlr_el[2]), sizeof(((CPUArchState *)0)->cp15.sctlr_el[2]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:361 */
-    { offsetof(CPUArchState, cp15.sder), sizeof(((CPUArchState *)0)->cp15.sder), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:107 */
-    { offsetof(CPUArchState, cp15.vstcr_el2), sizeof(((CPUArchState *)0)->cp15.vstcr_el2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:1165 */
-    { offsetof(CPUArchState, cp15.vtcr_el2), sizeof(((CPUArchState *)0)->cp15.vtcr_el2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:1154 */
-    { offsetof(CPUArchState, daif), sizeof(((CPUArchState *)0)->daif), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/debug_helper.c:89 */
-    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2493 */
-    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:499 */
-    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:275 */
-    { offsetof(CPUArchState, svcr), sizeof(((CPUArchState *)0)->svcr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:6771 */
-    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:277 */
-    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
-    { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
-    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:11687 */
-    { offsetof(CPUArchState, vfp.fpcr), sizeof(((CPUArchState *)0)->vfp.fpcr), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:417 */
-    { offsetof(CPUArchState, vfp.smcr_el), sizeof(((CPUArchState *)0)->vfp.smcr_el), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:6745 */
-    { offsetof(CPUArchState, vfp.smcr_el[1]), sizeof(((CPUArchState *)0)->vfp.smcr_el[1]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:148 */
-    { offsetof(CPUArchState, vfp.smcr_el[2]), sizeof(((CPUArchState *)0)->vfp.smcr_el[2]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:153 */
-    { offsetof(CPUArchState, vfp.smcr_el[3]), sizeof(((CPUArchState *)0)->vfp.smcr_el[3]), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/hflags.c:158 */
-    { offsetof(CPUArchState, vfp.zcr_el), sizeof(((CPUArchState *)0)->vfp.zcr_el), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/helper.c:6740 */
+    { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/cpu.h:1312 */
+    { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD, DF_HF_XLAT, 1 },   /* ../target/arm/internals.h:1169, INDEX NOT STATED */
+    { offsetof(CPUArchState, cp15.fgt_exec[0]), sizeof(((CPUArchState *)0)->cp15.fgt_exec[0]), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:338 */
+    { offsetof(CPUArchState, cp15.hcr_el2), sizeof(((CPUArchState *)0)->cp15.hcr_el2), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:5631 */
+    { offsetof(CPUArchState, cp15.mdcr_el2), sizeof(((CPUArchState *)0)->cp15.mdcr_el2), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:32 */
+    { offsetof(CPUArchState, cp15.mdcr_el3), sizeof(((CPUArchState *)0)->cp15.mdcr_el3), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:77 */
+    { offsetof(CPUArchState, cp15.mdscr_el1), sizeof(((CPUArchState *)0)->cp15.mdscr_el1), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:168 */
+    { offsetof(CPUArchState, cp15.osdlr_el1), sizeof(((CPUArchState *)0)->cp15.osdlr_el1), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:152 */
+    { offsetof(CPUArchState, cp15.oslsr_el1), sizeof(((CPUArchState *)0)->cp15.oslsr_el1), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:152 */
+    { offsetof(CPUArchState, cp15.scr_el3), sizeof(((CPUArchState *)0)->cp15.scr_el3), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/internals.h:406 */
+    { offsetof(CPUArchState, cp15.sctlr_el[2]), sizeof(((CPUArchState *)0)->cp15.sctlr_el[2]), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:361 */
+    { offsetof(CPUArchState, cp15.sder), sizeof(((CPUArchState *)0)->cp15.sder), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:107 */
+    { offsetof(CPUArchState, cp15.vstcr_el2), sizeof(((CPUArchState *)0)->cp15.vstcr_el2), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/internals.h:1165 */
+    { offsetof(CPUArchState, cp15.vtcr_el2), sizeof(((CPUArchState *)0)->cp15.vtcr_el2), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/internals.h:1154 */
+    { offsetof(CPUArchState, daif), sizeof(((CPUArchState *)0)->daif), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/debug_helper.c:89 */
+    { offsetof(CPUArchState, features), sizeof(((CPUArchState *)0)->features), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/cpu.h:2493 */
+    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_WR, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:499 */
+    { offsetof(CPUArchState, pstate), sizeof(((CPUArchState *)0)->pstate), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:275 */
+    { offsetof(CPUArchState, svcr), sizeof(((CPUArchState *)0)->svcr), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:6771 */
+    { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:277 */
+    { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_XLAT, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
+    { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/cpu.h:2676 */
+    { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:11687 */
+    { offsetof(CPUArchState, vfp.fpcr), sizeof(((CPUArchState *)0)->vfp.fpcr), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:417 */
+    { offsetof(CPUArchState, vfp.smcr_el), sizeof(((CPUArchState *)0)->vfp.smcr_el), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:6745 */
+    { offsetof(CPUArchState, vfp.smcr_el[1]), sizeof(((CPUArchState *)0)->vfp.smcr_el[1]), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:148 */
+    { offsetof(CPUArchState, vfp.smcr_el[2]), sizeof(((CPUArchState *)0)->vfp.smcr_el[2]), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:153 */
+    { offsetof(CPUArchState, vfp.smcr_el[3]), sizeof(((CPUArchState *)0)->vfp.smcr_el[3]), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/tcg/hflags.c:158 */
+    { offsetof(CPUArchState, vfp.zcr_el), sizeof(((CPUArchState *)0)->vfp.zcr_el), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/arm/helper.c:6740 */
 };
 static const DfHelperField dfu_sete_env[] = {
     { offsetof(CPUArchState, CF), sizeof(((CPUArchState *)0)->CF), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/helper-a64.c:1462 */

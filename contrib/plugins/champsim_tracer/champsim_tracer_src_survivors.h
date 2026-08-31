@@ -8,11 +8,11 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/exec70/snap/srcsurv_snapshot, 112 sidecar(s):
- *   x86_64   34 sidecar(s), 8 row(s), 3 REFUSED (reason on each row below)
- *   aarch64  28 sidecar(s), 16 row(s)
- *   riscv64  25 sidecar(s), 15 row(s)
- *   mipsel   25 sidecar(s), 1 row(s), 2 REFUSED (reason on each row below)
+ * is /mnt/md0/QEMU/cst_runs/exec74/gensnap/snap, 144 sidecar(s):
+ *   x86_64   44 sidecar(s), 23 row(s), 7 REFUSED (reason on each row below)
+ *   aarch64  36 sidecar(s), 25 row(s), 3 REFUSED (reason on each row below)
+ *   riscv64  32 sidecar(s), 47 row(s), 16 REFUSED (reason on each row below)
+ *   mipsel   32 sidecar(s), 5 row(s), 2 REFUSED (reason on each row below)
  * Nothing here says anything about an instruction no sidecar executed.
  *
  * Author: Maccoy Merrell.
@@ -44,7 +44,7 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 8 rows, 2671 census entries, from 34 sidecar(s) */
+/* x86_64 -- 23 rows, 3353 census entries, from 44 sidecar(s) */
 /* REFUSED, not carried: 0x0000054bu NOP REG_GPR2 (nopl x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -55,62 +55,233 @@ typedef struct {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
-/* REFUSED, not carried: 0x0000054bu NOP REG_SSP (rdsspq x16) --
+/* REFUSED, not carried: 0x0000054bu NOP REG_SSP (rdsspq x19) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x00000569u VDIV REG_VEC1 (divsd x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x00000569u VDIV SELF@0 (divsd x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x00000632u IDIV SELF@0 (idivl x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x00000632u IDIV SELF@1 (idivl x1) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
-    { 0x00000384u, SRC_SURV_SELF , REG_NONE      , 0, "PINSR" },   /* pinsrd x24 */
-    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x21 */
-    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x29 */
-    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x12 */
-    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x2370 */
-    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x205 */
+    { 0x000002e0u, SRC_SURV_FIXED, REG_VEC1      , 0, "VFMADD132Sx" },   /* vfmadd132sd x2 */
+    { 0x000002e0u, SRC_SURV_FIXED, REG_VEC2      , 0, "VFMADD132Sx" },   /* vfmadd132sd x2 */
+    { 0x000002e0u, SRC_SURV_SELF , REG_NONE      , 0, "VFMADD132Sx" },   /* vfmadd132sd x2 */
+    { 0x000002e2u, SRC_SURV_FIXED, REG_VEC4      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x2 */
+    { 0x000002e2u, SRC_SURV_FIXED, REG_VEC5      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x2 */
+    { 0x000002e2u, SRC_SURV_SELF , REG_NONE      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x2 */
+    { 0x00000384u, SRC_SURV_SELF , REG_NONE      , 0, "PINSR" },   /* pinsrd x32 */
+    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x28 */
+    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x33 */
+    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x16 */
+    { 0x000004c9u, SRC_SURV_FIXED, REG_SYSTIMER  , 0, "RDTSC" },   /* rdtsc x12 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, "CPUID" },   /* cpuid x28 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, "CPUID" },   /* cpuid x28 */
+    { 0x00000535u, SRC_SURV_FIXED, REG_VEC1      , 0, "PMADDWD" },   /* pmaddwd x2 */
+    { 0x00000535u, SRC_SURV_SELF , REG_NONE      , 0, "PMADDWD" },   /* pmaddwd x2 */
+    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x2896 */
+    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x244 */
+    { 0x36b0d666u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101010" },   /* fldl2e x2 */
+    { 0xbbb3e65cu, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101001" },   /* fldl2t x2 */
+    { 0xde1beaa4u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101100" },   /* fldlg2 x2 */
+    { 0xdf1bec37u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101101" },   /* fldln2 x2 */
     { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
-    { 0xecac981bu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VMOVLPx@vex=0" },   /* movsd x6 */
+    { 0xecac981bu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VMOVLPx@vex=0" },   /* movsd x8 */
 };
 
-/* aarch64 -- 16 rows, 104 census entries, from 28 sidecar(s) */
+/* aarch64 -- 25 rows, 137 census entries, from 36 sidecar(s) */
+/* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_FCSR (mrs x8) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_GPR19 (msr x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_SYSID (mrs x3) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_aarch64[] = {
-    { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x6 */
-    { 0x13e03a7eu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FSUB_v@0.0011101.1.....110101.........." },   /* fsub x6 */
-    { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/INS_general" },   /* mov x6 */
-    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x31 */
-    { 0x583d7c95u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FDIV_v@0.1011100.1.....111111.........." },   /* fdiv x6 */
+    { 0x085b7b49u, SRC_SURV_FIXED, REG_VEC4      , 0, "disas_a64/TBL_TBX" },   /* tbl x2 */
+    { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x8 */
+    { 0x13e03a7eu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FSUB_v@0.0011101.1.....110101.........." },   /* fsub x8 */
+    { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/INS_general" },   /* mov x8 */
+    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x32 */
+    { 0x583d7c95u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FDIV_v@0.1011100.1.....111111.........." },   /* fdiv x8 */
     { 0x5c29c765u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
     { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
     { 0x62e8a5aeu, SRC_SURV_FIXED, REG_PRED1     , 0, "disas_sve/LD_zpri@1010010....0....101............." },   /* ld1b x1 */
-    { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@1111100110......................" },   /* prfm x6 */
-    { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@11111000100.........00.........." },   /* prfum x6 */
+    { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@1111100110......................" },   /* prfm x8 */
+    { 0x81b1e8f0u, SRC_SURV_FIXED, REG_GPR9      , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x2 */
+    { 0x81b1e8f0u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x2 */
+    { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@11111000100.........00.........." },   /* prfum x8 */
     { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FNEG_s" },   /* fneg x22 */
-    { 0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FADD_v@0.0011100.1.....110101.........." },   /* fadd x6 */
+    { 0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FADD_v@0.0011100.1.....110101.........." },   /* fadd x8 */
     { 0xeba5bbf5u, SRC_SURV_FIXED, REG_PRED0     , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x1 */
     { 0xeba5bbf5u, SRC_SURV_FIXED, REG_PRED1     , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x2 */
     { 0xeba5bbf5u, SRC_SURV_FIXED, REG_VEC0      , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x2 */
     { 0xeba5bbf5u, SRC_SURV_FIXED, REG_VEC1      , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x1 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_GPR9      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC5      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC6      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC7      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC8      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x2 */
 };
 
-/* riscv64 -- 15 rows, 325 census entries, from 25 sidecar(s) */
+/* riscv64 -- 47 rows, 452 census entries, from 32 sidecar(s) */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC0 (vmadc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC11 (vmadc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC12 (vmadc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC22 (vmadc.vv x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC23 (vmadc.vv x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm SELF@0 (vmadc.vv,vmadc.vvm x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm SELF@1 (vmadc.vv,vmadc.vvm x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x2726f523u decode_insn32/csrrs REG_FCSR (frcsr,frflags,frrm x4) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0x2b26fb6fu decode_insn32/csrrw SELF@1 (fscsr x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC0 (vmsbc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC14 (vmsbc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC15 (vmsbc.vvm x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC25 (vmsbc.vv x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC26 (vmsbc.vv x1) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm SELF@0 (vmsbc.vv,vmsbc.vvm x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
+/* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm SELF@1 (vmsbc.vv,vmsbc.vvm x2) --
+ * the census shows this decode id carrying more than one
+ * instruction, so an id-keyed row would fire on the others
+ * too.  It stays in the loss direction and blocks the flip
+ * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_riscv64[] = {
-    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC4      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
-    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
-    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
-    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
-    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmv_v_v" },   /* vmv.v.v x96 */
-    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmv_v_v" },   /* vmv.v.v x96 */
-    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC1      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x3 */
-    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC2      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x3 */
-    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x3 */
-    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadd_vv" },   /* vadd.vv x3 */
-    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC7      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
-    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
-    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
-    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
-    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x97 */
+    { 0x1d7ee76bu, SRC_SURV_FIXED, REG_ZERO      , 0, "decode_insn32/vsetvli" },   /* vsetvli x3 */
+    { 0x51bfc656u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fmsub_d" },   /* fmsub.d x1 */
+    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC4      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x4 */
+    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x4 */
+    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x4 */
+    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsub_vv" },   /* vsub.vv x4 */
+    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmv_v_v" },   /* vmv.v.v x128 */
+    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmv_v_v" },   /* vmv.v.v x128 */
+    { 0x887129a3u, SRC_SURV_FIXED, REG_VEC10     , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x1 */
+    { 0x887129a3u, SRC_SURV_FIXED, REG_VEC11     , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x1 */
+    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x1 */
+    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x1 */
+    { 0x9179a794u, SRC_SURV_FIXED, REG_VEC13     , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x1 */
+    { 0x9179a794u, SRC_SURV_FIXED, REG_VEC14     , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x1 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x1 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x1 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 2, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x1 */
+    { 0xcfc5a63eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fdiv_d" },   /* fdiv.d x1 */
+    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC1      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x4 */
+    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC2      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x4 */
+    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x4 */
+    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadd_vv" },   /* vadd.vv x4 */
+    { 0xd33e245cu, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x1 */
+    { 0xd33e245cu, SRC_SURV_FIXED, REG_VEC20     , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x1 */
+    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x1 */
+    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x1 */
+    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC7      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x4 */
+    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x4 */
+    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x4 */
+    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmul_vv" },   /* vmul.vv x4 */
+    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x1 */
+    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC17     , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x1 */
+    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC18     , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x1 */
+    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x1 */
+    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x1 */
+    { 0xde4e315bu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fsub_d" },   /* fsub.d x1 */
+    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x114 */
+    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x1 */
+    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x1 */
+    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC9      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x1 */
+    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x1 */
+    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x1 */
+    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x1 */
+    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x1 */
+    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC6      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x1 */
+    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x1 */
+    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadc_vvm" },   /* vadc.vvm x1 */
 };
 
-/* mipsel -- 1 row, 298 census entries, from 25 sidecar(s) */
+/* mipsel -- 5 rows, 304 census entries, from 32 sidecar(s) */
 /* REFUSED, not carried: 0x00000000u ? REG_COPROC0 (swc2 x1) --
  * the census printed NO decode identity for this row (id 0,
  * rule `?`): QEMU named no decode rule for the bytes.  That
@@ -130,7 +301,11 @@ static const SrcSurvivorRow g_src_survivors_riscv64[] = {
  * with a differing row count.  It stays in the loss
  * direction. */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
-    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x298 */
+    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x300 */
+    { 0x3e9bb316u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MADD_D" },   /* madd.d x1 */
+    { 0x740ff847u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MSUB_D" },   /* msub.d x1 */
+    { 0xa65bcb79u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_DIV_D" },   /* div.d x1 */
+    { 0xdffae667u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_CMP_EQ_D" },   /* c.eq.d x1 */
 };
 
 /* Indexed by TraceISA.  A null row pointer means the arrays above say
@@ -148,6 +323,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 40 rows over the four ISAs. */
+/* 100 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

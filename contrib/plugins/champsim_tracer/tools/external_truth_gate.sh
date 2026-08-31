@@ -55,11 +55,14 @@ selftest() {
     # THE DEFAULT FIXTURE MOVES WITH THE CEILINGS (#305).  Arm A requires the
     # unmodified reports to PASS, so the fixture has to be an evidence root
     # whose headlines are at or under the ceilings CURRENTLY adjudicated.  When
-    # a ceiling is LOWERED -- #293 took the PIN row from 265 to 261 -- an older
-    # root's report is suddenly above it and arm A goes red for a reason that
-    # has nothing to do with the arm.  That red is the signal to re-point this
-    # default at the newest root, not to relax the ceiling.
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec38/green/evroot}
+    # a ceiling is LOWERED -- #293 took the PIN row from 265 to 261, and R19's
+    # refresh took it from 261 to 259 -- an older root's report is suddenly
+    # above it and arm A goes red for a reason that has nothing to do with the
+    # arm.  That red is the signal to re-point this default at the newest root,
+    # not to relax the ceiling.  It has now happened twice, so the rule is
+    # working: exec38/green/evroot carries the 261 the pin row no longer
+    # adjudicates, and the default moves to the newest COMPLETE root instead.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/exec72/r13/evroot}
     if [ ! -d "$SRC" ]; then
         echo "SELFTEST CANNOT RUN: no evidence root at $SRC." >&2
         echo "Set ETG_SELFTEST_ROOT.  A selftest with no subject FAILS." >&2

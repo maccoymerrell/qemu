@@ -2614,6 +2614,7 @@ illegal:
  * the row's own id and name bit for bit.
  */
 #include "vex_ident.c.inc"
+#include "cet_ident.c.inc"
 
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
@@ -2925,6 +2926,8 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
      */
     plugin_gen_record_insn_identity(decode.e.slot, decode.e.mnemonic);
     vex_ident_publish(decode.e.slot, (s->prefix & PREFIX_VEX) != 0);  /* vex_ident */
+    cet_ident_publish(decode.e.slot,
+                      (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

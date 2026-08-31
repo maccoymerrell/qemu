@@ -5035,6 +5035,15 @@ X86_IDENT_QUALIFIED = "target/i386/tcg/x87_ident.c.inc"
 # parse_x86_vex_identities().
 X86_IDENT_VEX = "target/i386/tcg/vex_ident.c.inc"
 
+# THE CET ENCODINGS SHARE THE RESERVED-NOP ROW.  QEMU does not model CET,
+# so `endbr64`, `endbr32` and `rdsspd`/`rdsspq` are all decoded through
+# [0x1e] = X86_OP_ENTRY1(NOP, nop,v) -- one slot for instructions that do
+# not read the same registers, and 228 `endbr64` against one `rdsspq` in
+# the w19 corpus.  scripts/x86_cet_ident_instrument.py states the finer
+# identity from `s->prefix` and `s->modrm`; the rows are read here by the
+# same reader the VEX rows use.
+X86_IDENT_CET = "target/i386/tcg/cet_ident.c.inc"
+
 # The emitter fact for a qualified leaf.  It is NOT an X86_OP_* macro
 # suffix: the leaf is a case label inside gen_x87, not a table row, so
 # there is no operand template to read and x86_emitter_refuses() must not
@@ -5183,7 +5192,9 @@ def parse_x86_identities() -> list[QemuIdent]:
         raise SystemExit(
             f"x86: {len(clashes)} source lines carry more than one slot -- "
             f"the exported id cannot tell them apart")
-    qualified = parse_x86_qualified_identities() + parse_x86_vex_identities(rows)
+    qualified = (parse_x86_qualified_identities()
+                 + parse_x86_vex_identities(rows)
+                 + parse_x86_cet_identities(rows))
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
     seen_q: dict[int, str] = {}
@@ -5285,6 +5296,53 @@ def parse_x86_vex_identities(base: list[QemuIdent]) -> list[QemuIdent]:
             f"{path}: no identity rows matched -- the reader does not fit "
             f"this table, and reporting an empty universe would read as "
             f"'no decode-table row serves two encodings'")
+    return rows
+
+
+def parse_x86_cet_identities(base: list[QemuIdent]) -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED arms of the reserved-NOP row CET shares.
+
+    Same shape and the same checks as parse_x86_vex_identities(): the row's
+    provenance names the base slot, the base row's macro suffix supplies
+    the kind rather than this function inventing one, and a carve whose
+    slot no longer exists or now names a different rule is REFUSED rather
+    than aged out -- joining an old carve to a new rule is the fabrication
+    that check exists to stop.
+    """
+    path = ROOT / X86_IDENT_CET
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_cet_ident_instrument.py.  Without it the CET "
+            f"encodings report as unqualified, which is not what the "
+            f"source says.")
+    by_slot = {r.ident: r for r in base}
+    rows: list[QemuIdent] = []
+    stale: list[str] = []
+    for r in _read_qualified_table(path, ""):
+        b = by_slot.get(r.src_line)
+        if b is None:
+            stale.append(f"{r.name}: base slot {r.src_line} carries no "
+                         f"X86_OP_* row")
+            continue
+        if b.name != r.pattern:
+            stale.append(f"{r.name}: base slot {r.src_line} now names "
+                         f"{b.name!r}")
+            continue
+        rows.append(dataclasses.replace(r, kind=b.kind))
+    if stale:
+        for why in stale:
+            print(f"  STALE CET ROW {why}")
+        raise SystemExit(
+            f"x86: {len(stale)} CET-qualified row(s) no longer match the "
+            f"decode table they were carved from -- re-run "
+            f"scripts/x86_cet_ident_instrument.py rather than joining an "
+            f"old carve to a new rule")
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'the reserved-NOP row carries only one instruction'")
     return rows
 
 

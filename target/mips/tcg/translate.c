@@ -10249,6 +10249,32 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
 #endif /* !CONFIG_USER_ONLY */
 
 /* CP1 Branches (before delay slot) */
+/*
+ * The CONDITION-CODE BIT the branch tests, stated by name.
+ *
+ * QEMU holds the eight FP condition codes as bits of one global, fpu_fcr31,
+ * so `bc1t $fcc1, target` lowers to a shift of THE WHOLE REGISTER and the op
+ * walk can say only that fcr31 was read.  The wire's word for that is
+ * REG_FCSR, while what the instruction reads is FCC1 -- REG_PRED1 -- and
+ * under the composed-register contract (#277) a stated CONTAINER justifies a
+ * published MEMBER in the census and supplies nothing to the wire.
+ *
+ * The member is not unknown: `cc` is the encoding's own condition-code
+ * field and this function has it.  Saying so is what R7.3 asks -- a register
+ * the encoding names is not the emulator's to drop -- and each note sits
+ * beside the shift that performs that bit's read, so an `any2`/`any4` form
+ * states the two or four codes it really tests rather than a single one
+ * standing in for all of them.
+ */
+static void gen_note_fcc_read(int cc)
+{
+    static const char *const fcc_names[8] = {
+        "fcc0", "fcc1", "fcc2", "fcc3", "fcc4", "fcc5", "fcc6", "fcc7"
+    };
+
+    insn_dataflow_note_stated_read_name(fcc_names[cc & 7]);
+}
+
 static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
                                 int32_t cc, int32_t offset)
 {
@@ -10271,6 +10297,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         mips_ident(ctx,
             op == OPC_BC1F ? MIPS_ID_OPC_BC1F :
             MIPS_ID_NONE);
+        gen_note_fcc_read(cc);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_not_i32(t0, t0);
         tcg_gen_andi_i32(t0, t0, 1);
@@ -10280,6 +10307,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         mips_ident(ctx,
             op == OPC_BC1FL ? MIPS_ID_OPC_BC1FL :
             MIPS_ID_NONE);
+        gen_note_fcc_read(cc);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_not_i32(t0, t0);
         tcg_gen_andi_i32(t0, t0, 1);
@@ -10289,6 +10317,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         mips_ident(ctx,
             op == OPC_BC1T ? MIPS_ID_OPC_BC1T :
             MIPS_ID_NONE);
+        gen_note_fcc_read(cc);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
@@ -10297,6 +10326,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         mips_ident(ctx,
             op == OPC_BC1TL ? MIPS_ID_OPC_BC1TL :
             MIPS_ID_NONE);
+        gen_note_fcc_read(cc);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
@@ -10309,7 +10339,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
             MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
+            gen_note_fcc_read(cc);
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
+            gen_note_fcc_read(cc + 1);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 1));
             tcg_gen_nand_i32(t0, t0, t1);
             tcg_gen_andi_i32(t0, t0, 1);
@@ -10322,7 +10354,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
             MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
+            gen_note_fcc_read(cc);
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
+            gen_note_fcc_read(cc + 1);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 1));
             tcg_gen_or_i32(t0, t0, t1);
             tcg_gen_andi_i32(t0, t0, 1);
@@ -10335,11 +10369,15 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
             MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
+            gen_note_fcc_read(cc);
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
+            gen_note_fcc_read(cc + 1);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 1));
             tcg_gen_and_i32(t0, t0, t1);
+            gen_note_fcc_read(cc + 2);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 2));
             tcg_gen_and_i32(t0, t0, t1);
+            gen_note_fcc_read(cc + 3);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 3));
             tcg_gen_nand_i32(t0, t0, t1);
             tcg_gen_andi_i32(t0, t0, 1);
@@ -10352,11 +10390,15 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
             MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
+            gen_note_fcc_read(cc);
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
+            gen_note_fcc_read(cc + 1);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 1));
             tcg_gen_or_i32(t0, t0, t1);
+            gen_note_fcc_read(cc + 2);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 2));
             tcg_gen_or_i32(t0, t0, t1);
+            gen_note_fcc_read(cc + 3);
             tcg_gen_shri_i32(t1, fpu_fcr31, get_fp_bit(cc + 3));
             tcg_gen_or_i32(t0, t0, t1);
             tcg_gen_andi_i32(t0, t0, 1);

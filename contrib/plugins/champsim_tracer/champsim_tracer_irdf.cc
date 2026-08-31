@@ -529,6 +529,21 @@ uint8_t fold_nonarch(const char *name)
     if (!strcmp(name, "FPCR")) {
         return REG_FCSR;
     }
+    /*
+     * The MIPS FP CONDITION CODES.  QEMU keeps all eight as bits of the
+     * fpu_fcr31 global and gen_compute_branch1() states the one the branch
+     * tests by name; the GDB-stub namespace carries only the container
+     * (`fcr31`), so the generated table cannot hold a row for a member --
+     * the same position tpidr_el0 and userlocal are in above.
+     *
+     * REG_PRED<n> is the vocabulary's own word for a one-bit predicate and
+     * REG_PRED0/REG_PRED1 are what the wire publishes for `bc1t $fcc0` and
+     * `bc1t $fcc1`, so the member meets the word it already had.
+     */
+    if (!strncmp(name, "fcc", 3) && name[3] >= '0' && name[3] <= '7' &&
+        name[4] == '\0') {
+        return (uint8_t)(REG_PRED0 + (name[3] - '0'));
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

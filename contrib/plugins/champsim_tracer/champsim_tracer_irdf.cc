@@ -504,6 +504,31 @@ uint8_t fold_nonarch(const char *name)
     if (!strcmp(name, "MIDR_EL1")) {
         return REG_SYSID;
     }
+    /*
+     * DCZID_EL0 and FPCR, the two AArch64 system registers `mrs` reaches
+     * through an ACCESSOR rather than through a constant or an env load.
+     * They arrive by the same door MIDR_EL1 does -- ARMCPRegInfo::name,
+     * UPPER case, stated at translate-a64.c's readfn arm -- so the same
+     * exact-spelling match applies and a case fold is still refused.
+     *
+     * Neither spelling can reach the generated table: it is keyed on QEMU's
+     * GDB-stub namespace, and AArch64's stub carries `fpcr` (lower case, a
+     * different spelling of the same register) and no system-register
+     * feature at all.
+     *
+     * DCZID_EL0 is a read-only implementation constant -- the DC ZVA block
+     * size -- which is what REG_SYSID names, and REG_SYSID is what the wire
+     * has always published for `mrs xN, dczid_el0`.  FPCR is the FP
+     * control-and-status file, REG_FCSR, which is both what the wire
+     * publishes for `mrs xN, fpcr` and what the table's own `fpcr` row
+     * carries.  Two spellings meeting words that exist.
+     */
+    if (!strcmp(name, "DCZID_EL0")) {
+        return REG_SYSID;
+    }
+    if (!strcmp(name, "FPCR")) {
+        return REG_FCSR;
+    }
     if (!strcmp(name, "x8/s0")) {
         return REG_FP_REG;
     }

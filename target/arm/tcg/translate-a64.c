@@ -2937,6 +2937,24 @@ static void handle_sys(DisasContext *s, bool isread,
             insn_dataflow_note_stated_read_name(ri->name);
             tcg_gen_movi_i64(tcg_rt, ri->resetvalue);
         } else if (ri->readfn) {
+            /*
+             * A system register QEMU reads through an ACCESSOR.  The lowering
+             * is gen_helper_get_cp_reg64(tcg_rt, tcg_env, tcg_ri): the
+             * register the encoding names travels as an opaque ARMCPRegInfo
+             * pointer, so no op in the stream touches its storage and the
+             * instruction's source list comes out without it.  `mrs x2, fpcr`
+             * reads FPCR and `mrs x0, dczid_el0` reads DCZID_EL0; neither
+             * appears, and what does appear is whatever CPUArchState the
+             * accessor's own footprint happens to name.
+             *
+             * Same fact as the ARM_CP_CONST arm eight lines above and the
+             * same rule: a register the ENCODING names is not the emulator's
+             * to drop (R7.3), and where it lives is a lowering decision
+             * (R15).  Stated by NAME because ARMCPRegInfo::name is the
+             * identity this register has here -- there is no env offset to
+             * state when the read is a call.
+             */
+            insn_dataflow_note_stated_read_name(ri->name);
             if (!tcg_ri) {
                 tcg_ri = gen_lookup_cp_reg(key);
             }

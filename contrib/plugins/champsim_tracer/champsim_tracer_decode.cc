@@ -872,6 +872,9 @@ static std::atomic<uint64_t> g_qid_decided_observed{0};
 static std::atomic<uint64_t> g_qid_surv_split{0};
 static std::atomic<uint64_t> g_qid_surv_name_matched{0};
 static std::atomic<uint64_t> g_qid_surv_none{0};
+/* Rows whose class QEMU's rule STATES, which this gate does not
+ * yet admit -- see qemu_ident_classify() in champsim_tracer.h. */
+static std::atomic<uint64_t> g_qid_surv_stated{0};
 static std::atomic<uint64_t> g_qid_surv_no_row{0};
 static std::atomic<uint64_t> g_qid_surv_no_ident{0};
 /*
@@ -1011,9 +1014,27 @@ const InsnClassification *qemu_ident_classify(
     case QID_ADJUDICATED:
         g_qid_adjudicated_hits.fetch_add(1, std::memory_order_relaxed);
         break;
+    /*
+     * QID_VERIFIED is what QID_OBSERVED became on a table whose classes
+     * QEMU's own rules state (R20).  It is admitted on exactly the same
+     * terms and counted in the same column, because it is the same
+     * population: a rule QEMU was seen decoding through, whose class an
+     * independent reading agreed with.  What changed is which of the two
+     * is the SOURCE, and that is not something this gate can see.
+     */
+    case QID_VERIFIED:
     case QID_OBSERVED:
         g_qid_decided_observed.fetch_add(1, std::memory_order_relaxed);
         break;
+    /*
+     * A STATED row has an answer and this gate does not take it yet --
+     * see the note on qemu_ident_classify() in champsim_tracer.h.  It is
+     * counted in a column of its own so it can never be added to the
+     * tiers that genuinely carry no class.
+     */
+    case QID_STATED:
+        g_qid_surv_stated.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
     case QID_SPLIT:
         g_qid_surv_split.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -1044,6 +1065,7 @@ void qemu_ident_survivors(QemuIdentSurvivors *out)
     out->split        = g_qid_surv_split.load(std::memory_order_relaxed);
     out->name_matched = g_qid_surv_name_matched.load(std::memory_order_relaxed);
     out->none         = g_qid_surv_none.load(std::memory_order_relaxed);
+    out->stated       = g_qid_surv_stated.load(std::memory_order_relaxed);
     out->no_row       = g_qid_surv_no_row.load(std::memory_order_relaxed);
     out->no_ident     = g_qid_surv_no_ident.load(std::memory_order_relaxed);
     out->decided_unknown =

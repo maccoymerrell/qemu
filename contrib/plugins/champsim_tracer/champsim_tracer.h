@@ -1517,19 +1517,30 @@ extern unsigned active_qemu_ident_size;
 
 /*
  * The classification QEMU's own decode rule states for @id, or nullptr
- * when the rule states none.  Deciding tiers are QID_OBSERVED and
- * QID_ADJUDICATED; QID_SPLIT / QID_NAME_MATCHED / QID_NONE, an id with no
- * row, and id 0 (no identity recorded -- an offline decode of raw bytes
- * always is) are SURVIVORS and return nullptr so the caller keeps the
- * Capstone answer.  Every call is tallied into one of the classes below.
+ * when the rule states none.  Deciding tiers are QID_VERIFIED (the R20
+ * tables) and QID_OBSERVED / QID_ADJUDICATED (the tables whose vocabulary
+ * has not been taught yet); QID_STATED, QID_SPLIT, QID_NAME_MATCHED,
+ * QID_NONE, an id with no row, and id 0 (no identity recorded -- an
+ * offline decode of raw bytes always is) are SURVIVORS and return nullptr
+ * so the caller keeps the Capstone answer.  Every call is tallied into
+ * one of the classes below.
+ *
+ * QID_STATED SURVIVES HERE ON PURPOSE, and it is the one row of this
+ * census that is a statement of work rather than of evidence.  Under R20
+ * the statement IS the classification, so a stated row has an answer and
+ * this gate declines to take it.  Admitting it is a wire change on every
+ * rule a corpus never reached, which is a population that has to be
+ * attributed row by row -- the admission gate's own wave.  Until then the
+ * count below says exactly how much answer is being left on the table.
  */
 const InsnClassification *qemu_ident_classify(
     uint32_t id, const InsnClassification *cap_row);
 
 /*
- * Decodes the identity decided, on the QID_OBSERVED tier.  With
- * qemu_ident_adjudicated_hits() below it is the whole flipped population;
- * the survivors are the rest.
+ * Decodes the identity decided, on the tier whose class an independent
+ * reading has agreed with -- QID_VERIFIED on a stated table, QID_OBSERVED
+ * on one not yet taught.  With qemu_ident_adjudicated_hits() below it is
+ * the whole flipped population; the survivors are the rest.
  */
 uint64_t qemu_ident_decided_observed(void);
 
@@ -1545,6 +1556,14 @@ typedef struct {
     uint64_t split;
     uint64_t name_matched;
     uint64_t none;
+    /*
+     * Decodes through a row whose class QEMU's own rule STATES and which
+     * nothing independent has yet been read against.  Not a hole in the
+     * table -- the statement is complete -- but a hole in what this gate
+     * admits, and it is counted apart from the tiers that really do
+     * carry no answer so the two can never be read as one number.
+     */
+    uint64_t stated;
     uint64_t no_row;
     uint64_t no_ident;
     uint64_t decided_unknown;

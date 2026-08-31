@@ -145,7 +145,7 @@ uint64_t g_n_scored;           /* row found and name agreed */
  * array is now sized by the enum and an out-of-range tier is counted
  * apart and reported, never folded.
  */
-uint64_t g_tier_seen[QID_ADJUDICATED + 1];
+uint64_t g_tier_seen[QID_TIER_COUNT];
 uint64_t g_tier_out_of_range;
 /*
  * TWO Capstone-side accounts of the same instruction, and the difference
@@ -931,7 +931,7 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
 
     g_n_scored++;
     g_hash_table_add(g_rows_hit, GUINT_TO_POINTER(id));
-    if (row->tier <= QID_ADJUDICATED) {
+    if (row->tier < QID_TIER_COUNT) {
         g_tier_seen[row->tier]++;
     } else {
         g_tier_out_of_range++;
@@ -1110,7 +1110,7 @@ void qemu_ident_report(GString *report)
     {
         uint64_t decided = qemu_ident_decided_observed() +
                            qemu_ident_adjudicated_hits();
-        uint64_t surv = sv.split + sv.name_matched + sv.none +
+        uint64_t surv = sv.split + sv.name_matched + sv.none + sv.stated +
                         sv.no_row + sv.no_ident + sv.isa_held;
         g_string_append_printf(report,
             "\n--- classification SOURCE: the decode rule, or Capstone "
@@ -1120,6 +1120,7 @@ void qemu_ident_report(GString *report)
             "  SURVIVOR: rule's observations SPLIT   %10" PRIu64 "\n"
             "  SURVIVOR: row NAME_MATCHED, unobserved%10" PRIu64 "\n"
             "  SURVIVOR: row carries no class (NONE) %10" PRIu64 "\n"
+            "  SURVIVOR: row STATED, gate not yet open%10" PRIu64 "\n"
             "  SURVIVOR: id carried, no row          %10" PRIu64 "\n"
             "  SURVIVOR: no identity exported (id 0) %10" PRIu64 "\n"
             "  HELD: this ISA's flip is not taken (must be 0) %5" PRIu64 "\n"
@@ -1143,7 +1144,8 @@ void qemu_ident_report(GString *report)
             "population an adjudication has to be written for, reported "
             "per ISA at every run.\n",
             qemu_ident_decided_observed(), qemu_ident_adjudicated_hits(),
-            sv.split, sv.name_matched, sv.none, sv.no_row, sv.no_ident,
+            sv.split, sv.name_matched, sv.none, sv.stated,
+            sv.no_row, sv.no_ident,
             sv.isa_held, sv.decided_unknown, sv.cap_disagree,
             decided, decided + surv);
     }
@@ -1206,11 +1208,18 @@ void qemu_ident_report(GString *report)
             "QID_OBSERVED with no table edit at all.\n"
             "  QID_NONE         the rule carries no classification; "
             "coverage path = the same, plus a generic word for what it "
-            "decodes to.\n");
+            "decodes to.\n"
+            "  QID_STATED       QEMU's own rule STATES the class and this "
+            "gate does not admit it yet; coverage path = the admission "
+            "gate, not the table -- the row already answers.  It is listed "
+            "here because it is a decode the wire took from Capstone, "
+            "which is what this list is for, and NOT because the rule is "
+            "short of an answer.\n");
         unsigned printed = 0;
         for (unsigned i = 0; i < g_nrows && i < CST_QID_MAX_ROW_HITS; i++) {
             uint8_t t = g_rows[i].tier;
-            if (t == QID_OBSERVED || t == QID_ADJUDICATED) {
+            if (t == QID_OBSERVED || t == QID_ADJUDICATED ||
+                t == QID_VERIFIED) {
                 continue;
             }
             uint64_t n = qemu_ident_row_hits(i);
@@ -1221,8 +1230,9 @@ void qemu_ident_report(GString *report)
                 "    0x%08x %-14s %-16s %10" PRIu64 "\n",
                 g_rows[i].id,
                 t == QID_SPLIT ? "QID_SPLIT"
-                               : (t == QID_NAME_MATCHED ? "QID_NAME_MATCHED"
-                                                        : "QID_NONE"),
+                : t == QID_NAME_MATCHED ? "QID_NAME_MATCHED"
+                : t == QID_STATED ? "QID_STATED"
+                                  : "QID_NONE",
                 g_rows[i].name, n);
             printed++;
         }
@@ -1396,21 +1406,30 @@ void qemu_ident_report(GString *report)
 
     g_string_append_printf(report,
         "  table rows reached                     %10u of %u\n"
-        "  tier of the rows that executed:  OBSERVED %" PRIu64
+        "  tier of the rows that executed:  VERIFIED %" PRIu64
+        "   STATED %" PRIu64
+        "   OBSERVED %" PRIu64
         "   ADJUDICATED %" PRIu64
         "   SPLIT %" PRIu64 "   NAME_MATCHED %" PRIu64
         "   NONE %" PRIu64 "   tier out of range %" PRIu64 "\n"
-        "    OBSERVED and ADJUDICATED are the tiers the classifier takes "
-        "the wire's answer from; the other three are the survivor "
-        "population that still falls back to Capstone.  A NAME_MATCHED "
-        "row that executes is a row the table UNDERSTATES; a NONE row "
-        "that executes is live residue -- an instruction with no "
-        "QEMU-side name agreeing about what it is; a SPLIT row that "
+        "    VERIFIED, OBSERVED and ADJUDICATED are the tiers the "
+        "classifier takes the wire's answer from.  VERIFIED and STATED "
+        "are the R20 tiers: the class is a static fact of QEMU's decode "
+        "rule, and the difference between them is only whether an "
+        "independent reading has agreed with it -- a STATED row is NOT "
+        "short of a classification, it is short of an admission, and its "
+        "coverage path is the gate rather than the table.  A "
+        "NAME_MATCHED row that executes is a row the table UNDERSTATES; "
+        "a NONE row that executes is live residue -- an instruction with "
+        "no QEMU-side name agreeing about what it is; a SPLIT row that "
         "executes is a rule whose own observations disagreed, so the "
-        "identity alone does not classify it.  `tier out of range` must "
-        "be 0: it means a row carries a tier this reader has no column "
-        "for.\n",
+        "identity alone does not classify it.  On a stated table "
+        "NAME_MATCHED and NONE are 0 BY CONSTRUCTION and a non-zero "
+        "there is a stale header, not a coverage gap.  `tier out of "
+        "range` must be 0: it means a row carries a tier this reader has "
+        "no column for.\n",
         g_rows_hit ? g_hash_table_size(g_rows_hit) : 0, g_nrows,
+        g_tier_seen[QID_VERIFIED], g_tier_seen[QID_STATED],
         g_tier_seen[QID_OBSERVED], g_tier_seen[QID_ADJUDICATED],
         g_tier_seen[QID_SPLIT], g_tier_seen[QID_NAME_MATCHED],
         g_tier_seen[QID_NONE], g_tier_out_of_range);

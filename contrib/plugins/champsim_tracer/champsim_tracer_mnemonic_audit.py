@@ -3660,6 +3660,15 @@ def classify_riscv(m: str) -> Entry:
             return ent("GEN_OP_INT_ADD")
         if t.startswith(("mveqz", "mvnez")):
             return ent("GEN_OP_CMOV")
+        # XTheadFmv moves the upper half of a 64-bit FP register to or
+        # from a GPR.  It is a register move and nothing else; without
+        # this arm it reached the block's NOP tail, which says the
+        # instruction writes nothing.  Capstone has no RISCV_INS_TH_FMV_*
+        # constant, so the gap was invisible until QEMU's own rule names
+        # (decode_xthead/th_fmv_x_hw, th_fmv_hw_x) were asked the
+        # question -- which is the whole point of asking them.
+        if t.startswith("fmv"):
+            return ent("GEN_OP_FP_MOV")
         if t.startswith("extu"):
             return ent("GEN_OP_MOVZX")
         if t.startswith("ext"):
@@ -5571,6 +5580,18 @@ QID_SPLIT = "QID_SPLIT"                # observed, and the observations
 QID_ADJUDICATED = "QID_ADJUDICATED"     # the observations disagreed and
                                         # QEMU's own decode-table row settles
                                         # which of them describes the rule
+# The two R20 tiers.  They are not a finer grade of the ones above; they
+# say the class came from a different PLACE.
+QID_STATED = "QID_STATED"        # QEMU's own rule states the class, and
+                                 # nothing else was available to check it
+                                 # against.  Coverage is closed by
+                                 # construction, so this is a complete
+                                 # answer and not a fallback.
+QID_VERIFIED = "QID_VERIFIED"    # QEMU's own rule states the class AND an
+                                 # independent reading agreed with it.
+                                 # This is what the OBSERVED tier became:
+                                 # the observation is no longer the source,
+                                 # it is the check that passed.
 
 
 # ---------------------------------------------------------------------------
@@ -5853,6 +5874,412 @@ def x86_emitter_refuses(ident: QemuIdent, entry: Entry) -> bool:
     return entry.op in X86_FLAGS_ONLY_REFUSED_OPS
 
 
+# ---------------------------------------------------------------------------
+# THE STATEMENT -- the class of a decode RULE is a static fact of QEMU's
+# decoder, said in QEMU's own words
+# ---------------------------------------------------------------------------
+#
+# R20.  A generic opcode class is a compile-time property of the rule QEMU
+# dispatched on, not a property of an instruction someone watched execute.
+# Reaching it through observation was a Capstone-era holdover: the payload
+# was keyed by a disassembler constant, so the only way to attach it to a
+# QEMU rule was to see the two together.  Nothing about the class needs
+# that.  The rule is in the source; so is what it does.
+#
+# So the row's .opcode / .branch_type / .flags are STATED here, from the
+# words QEMU itself wrote, and the vocabulary that turns a word into a
+# generic class is the SAME classifier every other table uses -- the one
+# that already knows `jal` is a call and `lw` is a load.  What changes is
+# only which string it is asked about.
+#
+# WHICH WORDS, and in this order, most specific first:
+#
+#   format    the `@name` the line references, AND ONLY where that format
+#             pins an architectural field to a constant.  `addi ... 10
+#             @c_mv` is QEMU stating the form: the rule reaches
+#             trans_addi, and @c_mv pins imm=0, which is what makes it a
+#             move rather than an add.  Same for @c_nop and @c_li.  A
+#             format that pins nothing is an encoding template and says
+#             nothing about the operation -- see _pinning_formats.
+#   pattern   the rule's own trans_ name, lowercased.
+#   prefix    that name with its trailing _<form> parts peeled one at a
+#             time -- ADD_i, LDR_v_i, c_fsw.  Nothing is invented: every
+#             candidate is a prefix of a name QEMU wrote.
+#
+# and then a STRUCTURAL refinement from the pattern line's own pinned
+# fields, where an ISA makes one operand decide the class.  RISC-V does:
+# `jal` and `jalr` are link-and-jump, and whether the link is taken is
+# rd -- so `jal ... @cj rd=0` is c.j, a JUMP, and `jal ... @cj rd=1` is
+# c.jal, a CALL, through one trans_ function and one pattern name.  The
+# pin is in the file; the class follows it.
+#
+# THE TRAILING `#` COMMENT IS NOT READ, and that is a measurement rather
+# than an omission.  It was read first, and insn32.decode:824 refuted it:
+# `zip 0000100 01111 ..... 001 ..... 0010011 @r2  #shfl` -- the note
+# names the draft-B spelling the encoding used to have, not what the rule
+# is, and the vocabulary answered for `shfl` with an unrelated class.
+# A comment is prose about a rule; the pattern, the format and the pins
+# are the rule.
+#
+# THIS IS NOT THE NAME_MATCHED ROUTE, and the difference is the one R20
+# corrects.  What was refuted was joining CAPSTONE SPELLINGS to QEMU rules
+# and calling the coincidence evidence.  Reading QEMU's own comment, its
+# own format reference and its own pattern name is reading the decoder.
+#
+# COVERAGE IS CLOSED BY CONSTRUCTION.  A rule that reaches the end of the
+# word list with nothing stated is a BUILD ERROR naming the rule -- never
+# a silent GEN_OP_UNKNOWN row.  The two escape hatches are both explicit
+# and both carry their reason into the generated header:
+# QEMU_RULE_STATEMENTS for a word the shared vocabulary has no rule for,
+# and the `no_class` flag on such an entry for a rule that genuinely has
+# no architectural class (a reserved-encoding trap, an internal dispatch
+# row) -- which gets a NAMED kind, not UNKNOWN.
+
+
+@dataclass(frozen=True)
+class Statement:
+    """What QEMU's own rule says this instruction class is."""
+    entry: Entry
+    word: str          # the QEMU word that stated it
+    source: str        # comment | format | pattern | prefix | ruled
+    why: str = ""      # for a ruled word, the QEMU source fact
+    no_class: bool = False   # a NAMED non-architectural kind
+
+
+# Where each target's decode sources live, for resolving the basename the
+# generated decoder's provenance comment carries.  A rule whose source
+# file cannot be found still gets its pattern-name words; it just loses
+# the two finer ones, and the census says how many rules that is rather
+# than letting a silent path change the answer.
+QEMU_DECODE_SOURCE_DIRS: dict[str, tuple[str, ...]] = {
+    "riscv":   ("target/riscv", "target/riscv/insn_trans"),
+    "aarch64": ("target/arm/tcg", "target/arm"),
+    "mips":    ("target/mips/tcg", "target/mips"),
+    "x86":     ("target/i386/tcg", "target/i386"),
+}
+
+
+@lru_cache(maxsize=None)
+def _decode_source_text(isa: str, base: str) -> tuple[str, ...]:
+    for rel in QEMU_DECODE_SOURCE_DIRS.get(isa, ()):
+        path = ROOT / rel / base
+        if path.is_file():
+            return tuple(path.read_text().splitlines())
+    return ()
+
+
+def _rule_source_line(info: IsaInfo, ident: QemuIdent) -> str:
+    lines = _decode_source_text(info.key, ident.src_file)
+    if not lines or not (1 <= ident.src_line <= len(lines)):
+        return ""
+    return lines[ident.src_line - 1]
+
+
+def _word(text: str) -> str:
+    """Fold one QEMU token into the vocabulary's spelling.
+
+    The vocabulary keys on lowercase with `_` where an ISA writes `.`,
+    which is the same fold _norm_mnemonic applies -- riscv writes c.j in
+    a comment and c_j in an identifier, and they are one word.
+    """
+    return text.strip().strip(",;()").lower().replace(".", "_")
+
+
+_COMMENT_RE = re.compile(r"#\s*(.+?)\s*$")
+_FORMAT_RE = re.compile(r"@([A-Za-z0-9_]+)")
+_FORMAT_DEF_RE = re.compile(r"^\s*@([A-Za-z0-9_]+)\s")
+_PINNED_FIELD_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*-?\d+\b")
+
+
+@lru_cache(maxsize=None)
+def _pinning_formats(isa: str, base: str) -> frozenset[str]:
+    """The formats in one .decode file that PIN an architectural field.
+
+    A decodetree format is two different things wearing one syntax.
+    Most are pure encoding -- `@th_meminc ..... &th_meminc %rd %rs1
+    %imm5 %imm2` binds extraction functions and says nothing about what
+    the instruction is.  A few pin a field to a CONSTANT, and that is
+    QEMU stating the FORM:
+
+        @c_nop  ... . ..... ..... .. &i imm=%imm_ci rs1=0 rd=0
+        @c_mv   ... . ..... ..... .. &i imm=0 rs1=%rs2_5 %rd
+        @c_li   ... . ..... ..... .. &i imm=%imm_ci rs1=0 %rd
+
+    All three reach trans_addi.  What makes one a nop, one a move and
+    one a load-immediate is exactly the pinned operand, and the pin is
+    written down.  So the format word is read as a statement only when
+    the format pins something; otherwise it is an encoding template and
+    reading it would let `@th_meminc` classify a load.
+
+    The discriminator is structural and comes from the same file the
+    rule does -- no list of blessed format names, and a format that
+    stops pinning stops being consulted, automatically.
+    """
+    out: set[str] = set()
+    for line in _decode_source_text(isa, base):
+        m = _FORMAT_DEF_RE.match(line)
+        if not m:
+            continue
+        body = line.split("#", 1)[0]
+        if _PINNED_FIELD_RE.search(body[m.end():]):
+            out.add(m.group(1))
+    return frozenset(out)
+
+
+def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
+    """(word, where it came from), most specific first -- all QEMU's own."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(word: str, source: str) -> None:
+        if word and word not in seen:
+            seen.add(word)
+            out.append((word, source))
+
+    line = _rule_source_line(info, ident)
+    if line:
+        # The format reference comes from the part of the line BEFORE any
+        # comment: a `@fmt` inside prose is prose.  Only a format that
+        # PINS an architectural field is read as a statement -- see
+        # _pinning_formats for why the other kind may not be.
+        body = line.split("#", 1)[0]
+        pinning = _pinning_formats(info.key, ident.src_file)
+        for f in _FORMAT_RE.findall(body):
+            if f in pinning:
+                add(_word(f), "format")
+
+    pat = _word(ident.pattern)
+    add(pat, "pattern")
+    q = pat
+    while "_" in q:
+        q = q.rsplit("_", 1)[0]
+        add(q, "prefix")
+    return out
+
+
+# Words the shared vocabulary has no rule for, stated here with the QEMU
+# fact that states them.  An entry is REFUSED if the vocabulary already
+# answers for its word: a ruling that changes nothing is written against
+# evidence that has moved, and it is louder as an error than as a no-op.
+#
+# `no_class` marks the rules that have no architectural class at all --
+# reserved encodings the decoder exists to REFUSE, and internal dispatch
+# rows that are not instructions.  They get a NAMED kind (the trap they
+# take, which is what the machine does) rather than UNKNOWN.
+QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
+    # --- riscv --------------------------------------------------------
+    # RV128 quad load/store.  insn32.decode:236/237 spell them `lq`/`sq`
+    # beside `ld`/`sd`, with the same @i/@s formats; they are the 128-bit
+    # width of the same access and nothing else.
+    ("riscv", "lq"): Statement(
+        ent("GEN_OP_LOAD"), "lq", "ruled",
+        "insn32.decode:236 lq ............ ..... 010 ..... 0001111 @i -- "
+        "the RV128 quad-width load, beside ld/lw/lh/lb"),
+    ("riscv", "sq"): Statement(
+        ent("GEN_OP_STORE"), "sq", "ruled",
+        "insn32.decode:237 sq ............ ..... 100 ..... 0100011 @s -- "
+        "the RV128 quad-width store, beside sd/sw/sh/sb"),
+    # Smrnmi return-from-trap.  insn32.decode:125, beside mret/sret, and
+    # trans_mnret() ends the block on a return exactly as trans_mret does.
+    ("riscv", "mnret"): Statement(
+        ent("GEN_OP_RET", "BRANCH_RETURN"), "mnret", "ruled",
+        "insn32.decode:125 mnret 0111000 00010 00000 000 00000 1110011 -- "
+        "the Smrnmi resumable-NMI return, beside mret and sret"),
+    # Zicfilp landing pad.  The instruction's whole architectural effect
+    # is to clear the expected-landing-pad state; with the extension off
+    # it is defined to be a no-op, which is how QEMU's trans_lpad() ends
+    # when cfi_lp is not enabled.
+    ("riscv", "lpad"): Statement(
+        ent("GEN_OP_NOP"), "lpad", "ruled",
+        "insn32.decode:130 lpad label:20 00000 0010111 -- the Zicfilp "
+        "landing pad; its effect is on landing-pad state, and it is "
+        "architecturally a no-op where the extension is off"),
+    # Zimop `may-be-operation`: architecturally defined to write zero to
+    # rd unless some extension gives the encoding a meaning, and QEMU
+    # implements exactly that.
+    # The compressed Zcmop.  Its 32-bit siblings mop_r_n / mop_rr_n are
+    # already answered NOP by the shared vocabulary, and this rule is the
+    # same architectural family under a name that vocabulary does not
+    # reach -- QEMU spells it c_mop_n, Capstone's prefixes are mop_ and
+    # cmop_.  It takes the family's answer rather than a second one:
+    # whether a may-be-operation's defined write of zero to rd should be
+    # NOP or MOV is a question about the generic opcode space, and
+    # answering it HERE, for one of three spellings, would put two
+    # answers in one table for one instruction.
+    ("riscv", "c_mop_n"): Statement(
+        ent("GEN_OP_NOP"), "c_mop_n", "ruled",
+        "insn16.decode:170 c_mop_n 011 0 0 n:3 1 00000 01 -- the Zcmop "
+        "may-be-operation, the compressed spelling of mop_r_n/mop_rr_n"),
+    # Smctr clear.  It discards the control-transfer record buffer: a
+    # machine-state maintenance operation with no data result, which is
+    # the class the cache/TLB maintenance ops already carry.
+    ("riscv", "sctrclr"): Statement(
+        ent("GEN_OP_FENCE", flags="MF_ATOMIC"), "sctrclr", "ruled",
+        "insn32.decode:117 sctrclr 000100000100 00000 000 00000 1110011 -- "
+        "Smctr control-transfer-record clear, a machine-state maintenance "
+        "operation with no data result"),
+    # The reserved-encoding rules.  decodetree gives a name to the
+    # patterns whose whole job is to REFUSE -- `illegal` and, for the
+    # encodings RV64 reclaims from RV32, `c64_illegal`.  trans_illegal()
+    # is gen_exception_illegal(); the rule takes a trap to a vector,
+    # which is what the machine does and what every other trap-taking
+    # instruction in this table is classified as.  It is a NAMED kind,
+    # not UNKNOWN: the row states that the rule has no data behaviour
+    # because it has no instruction, rather than declining to answer.
+    ("riscv", "illegal"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "illegal", "ruled",
+        "insn16.decode illegal -- trans_illegal() is "
+        "gen_exception_illegal(); a reserved encoding the decoder exists "
+        "to refuse, taking a trap to a vector",
+        no_class=True),
+    ("riscv", "c64_illegal"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "c64_illegal", "ruled",
+        "insn16.decode c64_illegal -- the RV32 encodings RV64 reclaims; "
+        "trans_c64_illegal() refuses them the same way trans_illegal() "
+        "does",
+        no_class=True),
+}
+
+
+# A rule whose STATEMENT and whose observed classification disagree is a
+# BUILD ERROR unless it is named here.  The statement is the source under
+# R20, so a disagreement is not resolved by preferring one silently: it
+# means either the vocabulary is wrong about QEMU's word (fix the
+# vocabulary) or the observation was naming something the rule is not
+# (record why, here).  Both are cheap; guessing is not.
+QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
+    # insn32.decode:128-131
+    #   {
+    #     lpad   label:20                   00000 0010111
+    #     auipc  ....................       ..... 0010111 @u
+    #   }
+    # The Zicfilp landing pad lives in AUIPC's encoding with rd pinned to
+    # x0, and QEMU's decode GROUP puts lpad first, so those bytes reach
+    # trans_lpad and never trans_auipc.  The observation says LEA because
+    # the disassembler read the same bytes as an auipc; the rule QEMU ran
+    # computes no address and writes no register.  trans_lpad() returns
+    # immediately when fcfi_lp_expected is clear -- QEMU's own comment on
+    # that early return is "lpad comes from NOP space anyways" -- and on
+    # the checking path it writes only CPURISCVState.elp, which is not a
+    # register the wire carries.  Nothing is lost by stating NOP: an
+    # auipc into x0 produces nothing either.
+    ("riscv", "decode_insn32/lpad"):
+        "insn32.decode:129 lpad label:20 00000 0010111, ahead of auipc in "
+        "the same decode group -- trans_lpad() writes no GPR, and QEMU's "
+        "own comment on its early return is that lpad comes from NOP space",
+}
+
+
+# The ISAs whose rows are STATED: the class comes from QEMU's own rule and
+# coverage is closed by construction, so an unstated rule is a build error
+# rather than a QID_NONE row.  The set grows one ISA at a time, because
+# the vocabulary is per ISA and a half-taught vocabulary that refuses the
+# build teaches nothing -- it just stops it.  An ISA outside the set keeps
+# the observation-derived tiers exactly as they were, and the census says
+# so on every run rather than letting the difference go unremarked.
+QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv"})
+
+
+_PIN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\b")
+
+
+def qemu_rule_pins(info: IsaInfo, ident: QemuIdent) -> dict[str, int]:
+    """The fields the rule's OWN line pins to a constant."""
+    line = _rule_source_line(info, ident)
+    if not line:
+        return {}
+    body = line.split("#", 1)[0]
+    return {m.group(1): int(m.group(2)) for m in _PIN_RE.finditer(body)}
+
+
+def _riscv_link_pin(ident: QemuIdent, st: Statement,
+                    pins: dict[str, int]) -> Statement | None:
+    """rd decides whether a RISC-V jump links, and QEMU pins it.
+
+    `jal` and `jalr` are one operation each -- jump, optionally writing
+    the return address to rd -- and the ISA carries the call/jump/return
+    role in rd alone.  Quadrants 1 and 2 of the compressed encoding split
+    that role across four rules reaching two trans_ functions, and the
+    split is written as a pin: rd=0 for c.j and c.jr, rd=1 for c.jal and
+    c.jalr.  Reading the pin is reading the decoder.
+
+    Only rules whose statement is already a jal/jalr branch are touched,
+    and only when rd is pinned -- an unpinned rd is a runtime value and
+    the class stays what the rule alone can say.
+    """
+    # Keyed on the PATTERN -- the trans_ function, which is the
+    # operation -- not on the word that happened to state the class.
+    # @c_jalr pins imm=0, so it is a pinning format and states the word
+    # `c_jalr` first; the rule underneath is still trans_jalr and the
+    # role is still rd.
+    if ident.pattern not in ("jal", "jalr") or "rd" not in pins:
+        return None
+    linked = pins["rd"] != 0
+    indirect = ident.pattern == "jalr"
+    branch = ("BRANCH_INDIRECT_CALL" if linked and indirect else
+              "BRANCH_DIRECT_CALL" if linked else
+              "BRANCH_INDIRECT_JUMP" if indirect else
+              "BRANCH_DIRECT_JUMP")
+    if branch == st.entry.branch:
+        return None
+    return Statement(
+        dataclasses.replace(st.entry, branch=branch), st.word, "pin",
+        f"{ident.src_file}:{ident.src_line} pins rd={pins['rd']} on a "
+        f"{ident.pattern} rule -- the link register is what makes a RISC-V "
+        f"jump a call, and QEMU writes the pin down")
+
+
+RULE_PIN_HOOKS = {
+    "riscv": _riscv_link_pin,
+}
+
+
+def state_rule(info: IsaInfo, ident: QemuIdent) -> Statement | None:
+    """What QEMU's rule states this is, or None if nothing states it."""
+    st = None
+    for word, source in qemu_rule_words(info, ident):
+        ruled = QEMU_RULE_STATEMENTS.get((info.key, word))
+        if ruled is not None:
+            st = dataclasses.replace(ruled, word=word)
+            break
+        cand = CLASSIFIERS[info.key](word)
+        if cand.op != "GEN_OP_UNKNOWN":
+            st = Statement(cand, word, source)
+            break
+    if st is None:
+        return None
+    hook = RULE_PIN_HOOKS.get(info.key)
+    if hook is not None:
+        refined = hook(ident, st, qemu_rule_pins(info, ident))
+        if refined is not None:
+            return refined
+    return st
+
+
+def _refuse_dead_statement_rules(info: IsaInfo,
+                                 idents: list[QemuIdent]) -> None:
+    """Every ruled word must be REACHED, and must still be needed."""
+    reached: set[str] = set()
+    for ident in idents:
+        for word, _src in qemu_rule_words(info, ident):
+            reached.add(word)
+    for (key, word), st in QEMU_RULE_STATEMENTS.items():
+        if key != info.key:
+            continue
+        if word not in reached:
+            raise SystemExit(
+                f"{info.key}: QEMU_RULE_STATEMENTS rules the word {word!r}, "
+                f"which no rule in this target's identity universe says.  "
+                f"The ruling is stale against the tree; delete it or "
+                f"re-state what it is for.")
+        if CLASSIFIERS[info.key](word).op != "GEN_OP_UNKNOWN":
+            raise SystemExit(
+                f"{info.key}: QEMU_RULE_STATEMENTS rules the word {word!r}, "
+                f"which the shared vocabulary ALREADY answers for.  A "
+                f"ruling that changes nothing is written against evidence "
+                f"that has moved; delete it.")
+
+
 @dataclass(frozen=True)
 class IdentRow:
     """One QEMU decode identity, carrying the classification it keys."""
@@ -5884,6 +6311,13 @@ class IdentRow:
     # Capstone constant observed through it cannot express one (see
     # QID_BRANCH_CLASS).  The text is that source fact.
     branch_fact: str | None = None
+    # The STATEMENT the row's class was taken from, on the ISAs where the
+    # statement is the source (R20).  None elsewhere, and the census says
+    # which ISAs those are rather than leaving it to be inferred.
+    stmt: Statement | None = None
+    # Set when the statement and an existing payload disagreed on the
+    # class and the disagreement is RULED.  The text is the ruling.
+    stmt_ruled: str | None = None
 
 
 def _refuse_stale_observations(info: IsaInfo, idents: list[QemuIdent],
@@ -5943,6 +6377,8 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
       QID_NONE          neither.  Residue, named in the census.
     """
     _branch_class_unreached(info, idents)
+    if info.key in QEMU_IDENT_STATED:
+        _refuse_dead_statement_rules(info, idents)
     m2c = _mnemonic_to_const(info)
     v2c = enum_value_map(info)
     _refuse_stale_observations(info, idents, obs)
@@ -6046,10 +6482,78 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                 entry = cand
                 break
         entry, branch_fact = apply_branch_class(info, entry, ident)
+        stmt = None
+        stmt_ruled = None
+        if info.key in QEMU_IDENT_STATED:
+            entry, tier, stmt, stmt_ruled = _apply_statement(
+                info, ident, entry, tier)
         rows.append(IdentRow(ident, entry, tier, mnems,
                              tuple(sorted(dict.fromkeys(caps))),
-                             tuple(split), refused, adjudged, branch_fact))
+                             tuple(split), refused, adjudged, branch_fact,
+                             stmt, stmt_ruled))
     return rows
+
+
+def _apply_statement(info: IsaInfo, ident: QemuIdent, entry: Entry,
+                     tier: str) -> tuple[Entry, str, Statement, str | None]:
+    """Make QEMU's own rule the SOURCE of this row's class.
+
+    Two things happen here and they are deliberately different.
+
+    The class comes from the STATEMENT.  Where the row had no payload at
+    all -- the QID_NONE and QID_SPLIT residue -- the statement is the
+    whole row, and that is how the residue dies: by construction, not by
+    running more programs.
+
+    Where the row already had a payload, the statement must AGREE with it
+    on opcode and branch class, and a disagreement is a build error
+    unless it is ruled.  The payload is then kept VERBATIM rather than
+    rebuilt from the statement, because the class is not all a payload
+    is: .refine, .dep_refine and the lane pair still come from the older
+    route, and swapping the class in underneath them would publish an
+    annotation derived for one operation beside the name of another.
+    Those annotations are the deletion's subject, not this one's, and
+    the row says which half it got from where.
+    """
+    st = state_rule(info, ident)
+    if st is None:
+        raise SystemExit(
+            f"{info.key}: decode rule {ident.name} "
+            f"(0x{ident.ident:08x}, {ident.src_file}:{ident.src_line}) "
+            f"exports an identity and states NO class.  Under R20 the "
+            f"class is a static property of the rule, so this is a hole "
+            f"in the vocabulary, not a row: teach the shared classifier "
+            f"the word QEMU used, or rule it in QEMU_RULE_STATEMENTS with "
+            f"the source fact that states it.  Words tried: "
+            f"{', '.join(w for w, _ in qemu_rule_words(info, ident))}")
+    had_payload = entry.op != "GEN_OP_UNKNOWN"
+    if not had_payload:
+        return st.entry, QID_STATED, st, None
+    if (st.entry.op, st.entry.branch) == (entry.op, entry.branch):
+        # The statement and the older route agree.  That is the whole
+        # point of keeping the older route running: it is VERIFICATION
+        # now, and this row is where it passed.
+        #
+        # ONLY an OBSERVATION earns the VERIFIED tier.  A QID_NAME_MATCHED
+        # payload is the Capstone-spelling join, and the statement is the
+        # same vocabulary asked about a name from the same rule -- the two
+        # agreeing is one route agreeing with itself, which is not a
+        # check.  Those rows are STATED, which is what they now are, and
+        # the tier stops claiming a confirmation that never happened.
+        independent = tier in (QID_OBSERVED, QID_ADJUDICATED)
+        return entry, (QID_VERIFIED if independent else QID_STATED), st, None
+    ruled = QEMU_STATEMENT_DISAGREEMENTS.get((info.key, ident.name))
+    if ruled is None:
+        raise SystemExit(
+            f"{info.key}: decode rule {ident.name} "
+            f"(0x{ident.ident:08x}, {ident.src_file}:{ident.src_line}) "
+            f"STATES {st.entry.op}/{st.entry.branch} from QEMU's own word "
+            f"{st.word!r} ({st.source}), and the {tier} payload it "
+            f"carries says {entry.op}/{entry.branch}.  One of them is "
+            f"wrong about the rule and the generator will not pick "
+            f"silently: fix the vocabulary, or rule the row in "
+            f"QEMU_STATEMENT_DISAGREEMENTS with the reason.")
+    return st.entry, QID_STATED, st, ruled
 
 
 def format_cls_init(entry: Entry) -> str:
@@ -6239,9 +6743,43 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
 
     tiers = collections.Counter(r.tier for r in rows)
     print("row provenance:")
-    for t in (QID_OBSERVED, QID_ADJUDICATED, QID_SPLIT, QID_NAME_MATCHED,
-              QID_NONE):
+    for t in (QID_VERIFIED, QID_STATED, QID_OBSERVED, QID_ADJUDICATED,
+              QID_SPLIT, QID_NAME_MATCHED, QID_NONE):
         print(f"    {t:<18} {tiers.get(t, 0)}")
+    if key in QEMU_IDENT_STATED:
+        # THE CONSTRUCTIONAL CENSUS.  On a stated ISA the interesting
+        # number is not how many rows have an answer -- all of them do,
+        # or the generator would not have written the file -- but WHICH
+        # QEMU WORD said so, because that is the thing a reader can go
+        # and check.
+        src = collections.Counter(r.stmt.source for r in rows if r.stmt)
+        print("statement source (R20: the class is a static fact of the "
+              "rule, and this is the word that states it):")
+        for s, n in src.most_common():
+            print(f"    {s:<18} {n}")
+        noclass = [r for r in rows if r.stmt and r.stmt.no_class]
+        print(f"    NAMED no-class rules (reserved encodings, internal "
+              f"dispatch): {len(noclass)}")
+        for r in noclass:
+            print(f"        {r.ident.name}  -> {r.entry.op}/"
+                  f"{r.entry.branch}")
+        ruled = [r for r in rows if r.stmt_ruled]
+        print(f"    statements RULED over an older payload: {len(ruled)}")
+        for r in ruled:
+            print(f"        {r.ident.name}  -> {r.entry.op}/{r.entry.branch}")
+            print(f"            {r.stmt_ruled}")
+        # Every rule, with the word that stated it, so a review is
+        # possible at all.  Not truncated: a spot check of the first
+        # forty rows is how a mis-stated family survives.
+        detail = Path(os.environ.get("CST_STATEMENT_DUMP", "")) \
+            if os.environ.get("CST_STATEMENT_DUMP") else None
+        if detail is not None:
+            detail.write_text("".join(
+                f"{r.ident.name}\t{r.tier}\t{r.entry.op}\t{r.entry.branch}"
+                f"\t{r.entry.flags}\t{r.stmt.word if r.stmt else ''}"
+                f"\t{r.stmt.source if r.stmt else ''}\n"
+                for r in rows))
+            print(f"    every rule + the word that stated it -> {detail}")
     refused = [r for r in rows if r.refused]
     if refused:
         print(f"    names REFUSED by the row's own operand template: "
@@ -6256,7 +6794,14 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
     id2mn: dict[int, set] = {}
     mn2id: dict[str, set] = {}
     for r in rows:
-        if r.tier not in (QID_OBSERVED, QID_ADJUDICATED, QID_SPLIT):
+        # A row with observed CAPS is one the cardinality question can be
+        # asked of, whatever tier the class ended up on.  Keying this on
+        # the tier list stopped working the moment the tiers stopped
+        # being about observation: on a stated ISA every row moved to
+        # QID_STATED/QID_VERIFIED and the census printed "over 0
+        # exercised identities", which is a measurement that silently
+        # lost its subject rather than one that found nothing.
+        if not r.caps:
             continue
         id2mn[r.ident.ident] = set(r.caps)
         for m in r.caps:
@@ -6325,8 +6870,15 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
     # tracer would have nothing to say about.
     residue = [r for r in rows if r.tier == QID_NONE]
     live = [r for r in residue if r.ident.ident in obs]
-    print(f"NO ROW -- identities with no classification at all: "
-          f"{len(residue)} ({len(live)} of them EXERCISED)")
+    if key in QEMU_IDENT_STATED:
+        print(f"NO ROW -- identities with no classification at all: "
+              f"{len(residue)} ({len(live)} of them EXERCISED)   "
+              f"-- 0 BY CONSTRUCTION on a stated ISA: a rule that states "
+              f"nothing is a build error, so a non-zero here is a stale "
+              f"header and not a coverage gap")
+    else:
+        print(f"NO ROW -- identities with no classification at all: "
+              f"{len(residue)} ({len(live)} of them EXERCISED)")
     for r in residue:
         mark = "  <-- EXERCISED" if r.ident.ident in obs else ""
         print(f"    {r.ident.name}  ({r.ident.src_file}:"

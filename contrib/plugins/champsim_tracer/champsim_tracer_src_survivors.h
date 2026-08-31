@@ -8,11 +8,11 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/p3/arc3/exec64/srcsurv_snapshot, 108 sidecar(s):
- *   x86_64   33 sidecar(s), 8 row(s), 4 REFUSED on an ambiguous id
- *   aarch64  27 sidecar(s), 16 row(s)
- *   riscv64  24 sidecar(s), 14 row(s), 1 REFUSED on an ambiguous id
- *   mipsel   24 sidecar(s), 1 row(s)
+ * is /mnt/md0/QEMU/cst_runs/exec70/snap/srcsurv_snapshot, 112 sidecar(s):
+ *   x86_64   34 sidecar(s), 8 row(s), 3 REFUSED (reason on each row below)
+ *   aarch64  28 sidecar(s), 16 row(s)
+ *   riscv64  25 sidecar(s), 15 row(s)
+ *   mipsel   25 sidecar(s), 1 row(s), 2 REFUSED (reason on each row below)
  * Nothing here says anything about an instruction no sidecar executed.
  *
  * Author: Maccoy Merrell.
@@ -44,12 +44,7 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 8 rows, 2098 census entries, from 33 sidecar(s) */
-/* REFUSED, not carried: 0x0000054bu NOP REG_GPR0 (rdsspq x13) --
- * the census shows this decode id carrying more than one
- * instruction, so an id-keyed row would fire on the others
- * too.  It stays in the loss direction and blocks the flip
- * until the id is qualified. */
+/* x86_64 -- 8 rows, 2671 census entries, from 34 sidecar(s) */
 /* REFUSED, not carried: 0x0000054bu NOP REG_GPR2 (nopl x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -60,28 +55,28 @@ typedef struct {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
-/* REFUSED, not carried: 0x0000054bu NOP REG_SSP (rdsspq x13) --
+/* REFUSED, not carried: 0x0000054bu NOP REG_SSP (rdsspq x16) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0x00000384u, SRC_SURV_SELF , REG_NONE      , 0, "PINSR" },   /* pinsrd x24 */
-    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x14 */
-    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x25 */
-    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x8 */
-    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x1851 */
-    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x166 */
+    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x21 */
+    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x29 */
+    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x12 */
+    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x2370 */
+    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x205 */
     { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
     { 0xecac981bu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VMOVLPx@vex=0" },   /* movsd x6 */
 };
 
-/* aarch64 -- 16 rows, 103 census entries, from 27 sidecar(s) */
+/* aarch64 -- 16 rows, 104 census entries, from 28 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x6 */
     { 0x13e03a7eu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FSUB_v@0.0011101.1.....110101.........." },   /* fsub x6 */
     { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/INS_general" },   /* mov x6 */
-    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x30 */
+    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x31 */
     { 0x583d7c95u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FDIV_v@0.1011100.1.....111111.........." },   /* fdiv x6 */
     { 0x5c29c765u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
     { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
@@ -96,13 +91,7 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0xeba5bbf5u, SRC_SURV_FIXED, REG_VEC1      , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x1 */
 };
 
-/* riscv64 -- 14 rows, 228 census entries, from 24 sidecar(s) */
-/* REFUSED, not carried: 0xecf2c479u decode_insn32/fence REG_SYS (fence x81) --
- * the census counts this row as ADJUDICATION-OWED: an open
- * maintainer question, measured against the external
- * references and reverted.  Carrying it would zero the
- * count that blocks the flip while the question is open,
- * which is answering it by arithmetic. */
+/* riscv64 -- 15 rows, 325 census entries, from 25 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_riscv64[] = {
     { 0x6832c275u, SRC_SURV_FIXED, REG_VEC4      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
     { 0x6832c275u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x3 */
@@ -118,11 +107,30 @@ static const SrcSurvivorRow g_src_survivors_riscv64[] = {
     { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
     { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
     { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmul_vv" },   /* vmul.vv x3 */
+    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x97 */
 };
 
-/* mipsel -- 1 row, 296 census entries, from 24 sidecar(s) */
+/* mipsel -- 1 row, 298 census entries, from 25 sidecar(s) */
+/* REFUSED, not carried: 0x00000000u ? REG_COPROC0 (swc2 x1) --
+ * the census printed NO decode identity for this row (id 0,
+ * rule `?`): QEMU named no decode rule for the bytes.  That
+ * is not an identity to key on -- a row keyed on it fires on
+ * EVERY instruction whose rule is unknown.  Measured to be
+ * wrong-path wander over undefined bytes, and not
+ * reproducible: 1 run in 12 of the same cell produced it,
+ * with a differing row count.  It stays in the loss
+ * direction. */
+/* REFUSED, not carried: 0x00000000u ? REG_GPR7 (swc2 x1) --
+ * the census printed NO decode identity for this row (id 0,
+ * rule `?`): QEMU named no decode rule for the bytes.  That
+ * is not an identity to key on -- a row keyed on it fires on
+ * EVERY instruction whose rule is unknown.  Measured to be
+ * wrong-path wander over undefined bytes, and not
+ * reproducible: 1 run in 12 of the same cell produced it,
+ * with a differing row count.  It stays in the loss
+ * direction. */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
-    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x296 */
+    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x298 */
 };
 
 /* Indexed by TraceISA.  A null row pointer means the arrays above say
@@ -140,6 +148,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 39 rows over the four ISAs. */
+/* 40 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

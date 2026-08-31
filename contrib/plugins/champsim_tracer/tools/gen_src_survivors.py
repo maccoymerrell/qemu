@@ -119,6 +119,23 @@ result was false:
    that is never available.  Proven by ARM D2 of the selftest, which plants
    an `R16:` row and requires it to appear in the emitted header.
 
+5. IT WILL NOT KEY A ROW ON AN ABSENT DECODE IDENTITY.  The census prints
+   a row whose rule QEMU did not name as decode id `00000000` with the rule
+   spelled `?`.  That is not a weak identity, it is the statement that there
+   is no identity, and it fails the table's key in the widest possible way:
+   a row keyed on id 0 fires on EVERY instruction whose decode rule is
+   unknown, on every ISA, forever.  Refusal 3 cannot catch it -- its test is
+   whether the id carries more than one mnemonic, and within any one corpus
+   the absent id has usually only collected one.
+
+   The first full-coverage snapshot produced exactly this: mipsel `swc2`
+   (a COP2 store) arrived with REG_COPROC0 and REG_GPR7 under id 0 from a
+   WRONG-PATH excursion decoding undefined bytes.  It is not reproducible --
+   the same cell, same binary, same options, same `setarch -R` produced it
+   in 1 run of 12, and with a different row count -- so carrying it would
+   have written run-to-run noise into a compiled table.  Refused with its
+   own reason, and counted in the loss direction like every other refusal.
+
 Usage:
   gen_src_survivors.py --snapshot DIR <isa>=<stats.log> [<isa>=<stats.log> ...]
   gen_src_survivors.py --out <header> --from-snapshot DIR
@@ -306,10 +323,15 @@ def emit(out, inputs, src):
         clean[isa] = all_none and files > 0
 
     # REFUSAL 3: an id that carries more than one instruction cannot key a row.
+    # REFUSAL 5 is checked FIRST: a row with no decode identity at all cannot
+    # be qualified by any of the tests below, because they all take the id as
+    # a key and it has none.
     refused = {isa: [] for isa in ISAS}
     for isa in ISAS:
         for key in list(per[isa]):
-            if key[0] in splits[isa]:
+            if key[0] == 0 or per[isa][key][0] == "?":
+                refused[isa].append((key, per[isa].pop(key), "NOIDENT"))
+            elif key[0] in splits[isa]:
                 refused[isa].append((key, per[isa].pop(key), "AMBIGUOUS"))
             elif (key[0], key[2]) in owed[isa]:
                 refused[isa].append((key, per[isa].pop(key), "OWED"))
@@ -331,7 +353,7 @@ def emit(out, inputs, src):
     for isa in ISAS:
         a(" *   %-8s %d sidecar(s), %d row(s)%s"
           % (isa, seen[isa], len(per[isa]),
-             ", %d REFUSED on an ambiguous id" % len(refused[isa])
+             ", %d REFUSED (reason on each row below)" % len(refused[isa])
              if refused[isa] else ""))
     a(" * Nothing here says anything about an instruction no sidecar executed.")
     a(" *")
@@ -374,7 +396,16 @@ def emit(out, inputs, src):
         for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
             a("/* REFUSED, not carried: 0x%08xu %s %s (%s x%d) --"
               % (did, rule, reg or role, ",".join(sorted(mn)), cnt))
-            if why == "AMBIGUOUS":
+            if why == "NOIDENT":
+                a(" * the census printed NO decode identity for this row (id 0,")
+                a(" * rule `?`): QEMU named no decode rule for the bytes.  That")
+                a(" * is not an identity to key on -- a row keyed on it fires on")
+                a(" * EVERY instruction whose rule is unknown.  Measured to be")
+                a(" * wrong-path wander over undefined bytes, and not")
+                a(" * reproducible: 1 run in 12 of the same cell produced it,")
+                a(" * with a differing row count.  It stays in the loss")
+                a(" * direction. */")
+            elif why == "AMBIGUOUS":
                 a(" * the census shows this decode id carrying more than one")
                 a(" * instruction, so an id-keyed row would fire on the others")
                 a(" * too.  It stays in the loss direction and blocks the flip")
@@ -431,14 +462,15 @@ def emit(out, inputs, src):
     a("#endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */")
     open(out, "w").write("\n".join(w) + "\n")
     nref = sum(len(refused[i]) for i in ISAS)
-    print("wrote %s: %d rows, %d refused on an ambiguous decode id"
-          % (out, total, nref))
+    print("wrote %s: %d rows, %d refused" % (out, total, nref))
     for isa in ISAS:
         for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
             print("  REFUSED %-8s 0x%08x %s %s (%s x%d): %s"
                   % (isa, did, rule, reg or role, ",".join(sorted(mn)), cnt,
                      "the id carries more than one instruction"
                      if why == "AMBIGUOUS" else
+                     "no decode identity at all (id 0 / rule `?`)"
+                     if why == "NOIDENT" else
                      "ADJUDICATION-OWED, an open maintainer question"))
         if not per[isa]:
             print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "
@@ -523,9 +555,15 @@ def selftest():
                 "       fabs      R16: ADJUDICATED-KEEP-R16, architectural"]
     ruledsurv = ["         9  30a7252a disas_a64/FABS_s           REG_FCSR"
                  "       FIXED fabs"]
+    # A row the census could not name a rule for: id 0, rule `?`.  Its
+    # witness line carries ONE mnemonic, so refusal 3 stays silent and only
+    # refusal 5 can catch it -- that is what this fixture is shaped to prove.
+    noident = ["         1  00000000 ?                          REG_COPROC0"
+               "    FIXED   swc2"]
+    witness = witness + ["         1  00000000 ?                          swc2"]
     x = os.path.join(d, "x86_64.log")
-    _sidecar(x, good + split + owedsurv + ruledsurv, splitline, witness,
-             owedrow + ruledrow)
+    _sidecar(x, good + split + owedsurv + ruledsurv + noident, splitline,
+             witness, owedrow + ruledrow)
     a_ = os.path.join(d, "aarch64.log"); _sidecar(a_, [], [])
     r = os.path.join(d, "riscv64.log"); _sidecar(r, [], [])
     m = os.path.join(d, "mipsel.log"); _sidecar(m, [], [])
@@ -555,6 +593,11 @@ def selftest():
     chk("ARM D0: a SELF row carries its DESTINATION POSITION, not the list",
         "0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1," in txt,
         "expected dst_pos 1 on the SELF row")
+    chk("ARM C3: a row with NO decode identity is NOT carried",
+        "0x00000000u, SRC_SURV_FIXED, REG_COPROC0" not in txt
+        and "REFUSED, not carried: 0x00000000u" in txt
+        and "no decode identity at all" in rc.stdout,
+        "an id-0 / rule-`?` row reached the table")
     chk("ARM D1: an ADJUDICATION-OWED row is NOT carried",
         "0xecf2c479u, SRC_SURV" not in txt
         and "ADJUDICATION-OWED, an open maintainer question" in rc.stdout)

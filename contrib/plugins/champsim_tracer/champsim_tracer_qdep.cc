@@ -215,90 +215,156 @@ std::atomic<uint64_t> g_src_flip_no_row{0};
 GHashTable *g_src_flip_missing_sig = nullptr;
 GHashTable *g_src_flip_extra_sig = nullptr;
 /*
- * ADJUDICATION-OWED -- the THIRD outcome of the loss direction, and the
- * reason it is not the second.
+ * THE ADJUDICATION LEDGER -- the THIRD outcome of the loss direction, and
+ * the reason it is not the second.
  *
  * A published source lands in MISSING when neither QEMU's read list nor a
  * survivor row carries it, and that row is an R12.1 violation waiting for a
- * flip to commit it.  Two classes on this wire are in that position for a
+ * flip to commit it.  Some classes on this wire are in that position for a
  * DIFFERENT reason, and calling them MISSING says something false about
- * both: their deletion was already written, landed, MEASURED AGAINST THE
+ * them: their deletion was already written, landed, MEASURED AGAINST THE
  * EXTERNAL REFERENCES, and reverted, because the references contradicted
- * the adjudication.  They are not rows nobody has looked at.  They are rows
- * a maintainer has been asked about and has not yet ruled on.
+ * the adjudication.  They were not rows nobody had looked at.  They were
+ * rows a maintainer had been asked about.
+ *
+ * THE LEDGER NOW HAS TWO STATES, and a row must be in exactly one:
+ *
+ *   ADJ_OWED   the question is still in front of the maintainer.  The row
+ *              is counted in ADJUDICATION-OWED, printed with its question,
+ *              NEVER folded into JUSTIFIED, and NO SOURCE-LIST FLIP MAY
+ *              LAND WHILE THE COUNT IS NON-ZERO.
+ *
+ *   ADJ_R16    the question has been RULED, and the ruling is that the wire
+ *              is right.  The row is counted in JUSTIFIED-BY-ADJUDICATION
+ *              (R16) and printed with the ruling text, in a column of its
+ *              own.  It is still not folded into JUSTIFIED, because
+ *              JUSTIFIED means one specific mechanical thing -- QEMU's
+ *              ordered read list contains the register -- and it does not
+ *              contain these.  An adjudication and a read-list hit are two
+ *              different reasons for a row to be right, and a census that
+ *              spends them into one column can no longer say which rows
+ *              rest on a measurement and which rest on a ruling.
+ *
+ * THE CLOSURE IS VISIBLE, NEVER SILENT.  A row does not leave this table
+ * when it is ruled on; it changes state, keeps its count, and prints the
+ * ruling.  The alternative -- deleting the row so ADJUDICATION-OWED reads
+ * zero -- is answering a question by arithmetic, which is the failure the
+ * whole ledger is shaped against.  A reader who wants to know what happened
+ * to riscv64 `fence` finds the row, the ruling and the count in one place.
+ *
+ * R16 (2026-08-30), the ruling these rows close under, verbatim:
+ *
+ *   "We record ARCHITECTURAL DEPENDENCIES.  IF THE DEPENDENCY EXISTS IN THE
+ *    ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  Does
+ *    FENCE depend on the system register contents?  THEN THAT IS A
+ *    DEPENDENCY.  I DON'T CARE ABOUT SEMANTICS.  A NOP SEMANTIC STILL HAS
+ *    REAL DEPENDENCIES IN THE CHOSEN REGISTER.  MICROARCHITECTURAL
+ *    OPTIMIZATIONS SHOULD NOT BE LEAKING INTO THE TRACE.  QEMU
+ *    OPTIMIZATIONS SHOULD NOT BE LEAKING INTO THE TRACE.  We should be
+ *    recording ALL INSTRUCTIONS THAT EXECUTE.  If the instructions were not
+ *    being included, that was a bug.  We should be including all
+ *    information those instructions should have."
+ *
+ * THE ROWS, and what R16 did to each:
  *
  *   riscv64 `fence`, REG_SYS.  The encoding names no register -- both
- *     operands are immediates -- and on that reading the source has no
+ *     operands are immediates -- and on that reading the source had no
  *     architectural referent.  But Sail, the architecture's own executable
  *     specification, states ref_src = REG_SYS for FENCE, and the deleted
- *     clause was exactly the menvcfg.FIOM dependency Sail models; R7.4
- *     already rules that a CSR whose value decides an instruction's
- *     behaviour IS a source.  QUESTION: does R7.4 reach FIOM?
+ *     clause was exactly the menvcfg.FIOM dependency Sail models: FIOM
+ *     decides whether the fence's device-ordering bits also order main
+ *     memory, so the CSR's value changes what the instruction DOES.  R16
+ *     answers the question the row was waiting on -- the dependency exists
+ *     in the ISA, so it is recorded, and the emptiness of QEMU's read list
+ *     is a QEMU statement gap and not an architectural fact.  ADJUDICATED-
+ *     KEEP-R16.
  *
- *   x86_64 `rdsspq`, REG_GPR0 + REG_SSP.  With CET disabled -- the only
- *     machine QEMU models -- the SDM defines the instruction as a NOP that
- *     reads nothing and writes nothing.  But XED models the instruction
- *     FORM as SRC {REG_SSP} DST {GPR}, PIN reports ref_only = ssp on it,
- *     and the R13 x86_64 leg goes AGREE -> DISAGREE the moment the wire
- *     stops publishing them.  QUESTION: does the wire owe the instruction
- *     form or this machine's runtime state -- and separately, is REG_GPR0
- *     a source at all, or the destination Capstone's access==0 mislaid?
+ *   x86_64 `rdsspq`, REG_SSP.  With CET disabled -- the only machine QEMU
+ *     models -- the SDM defines the instruction as a NOP.  But XED models
+ *     the instruction FORM as SRC {REG_SSP} DST {GPR}, and PIN reports
+ *     ref_only = ssp on it.  R16 rules that the instruction form's
+ *     dependencies are recorded regardless of the modelled machine's CET
+ *     state -- a NOP SEMANTIC STILL HAS REAL DEPENDENCIES IN THE CHOSEN
+ *     REGISTER.  ADJUDICATED-KEEP-R16.
  *
- * COUNTED APART FROM MISSING, NEVER FOLDED INTO JUSTIFIED.  Folding them
- * into JUSTIFIED would assert the wire is right, which is the very thing
- * nobody has ruled; leaving them in MISSING would assert a flip may delete
- * them, which R12.1 forbids and which the references contradict.  A third
- * column is the only honest place, and it prints the question with the row
- * so the open item cannot decay into a number.
+ *   x86_64 `rdsspq`, REG_GPR0 -- RETIRED FROM THIS TABLE, and the reason is
+ *     the one thing here that is not a keep.  R16's second consequence is
+ *     that the GPR is the architectural DESTINATION (XED `SRC {SSP} DST
+ *     {RAX}`, iced-x86 `DST {RAX}`, PIN dstset `ref_only=rax`) and that its
+ *     source seat was an accident: Capstone reported the operand
+ *     access == 0, the instruction classifies GEN_OP_NOP, and the
+ *     positional fallback had no destination slot to give it.  The repair
+ *     is a REAL BOUNDARY ACCESS at cap_fill_x86_operands (see
+ *     cap_x86_is_ssp_dest in disas/capstone.c), after which the register is
+ *     published as a destination and is no longer a published source at
+ *     all -- so it can no longer reach this table.  ITS ROW IS DELETED
+ *     RATHER THAN MARKED KEPT, deliberately: if the boundary repair ever
+ *     stops reaching, REG_GPR0 reappears as a published source with no
+ *     ledger row and reads MISSING, loudly, on a must-be-0 line.  A KEEP
+ *     row would have silenced exactly that alarm.
  *
  * KEYED ON (isa, decode id, MNEMONIC) -- deliberately, and this is NOT a
  * survivor row.  x86 decode id 0x0000054b is QEMU's NOP slot and carries
  * `endbr64` (410 census rows) beside `rdsspq` (3), so a row keyed on the id
  * alone would silence a population it was never adjudicated for.  A flip
  * cannot look this table up, because after the flip the mnemonic is gone;
- * that is correct.  This table is a LEDGER OF OPEN QUESTIONS, not an input
- * to any wire decision, and no flip may land while it is non-empty.
+ * that is correct.  This table is a LEDGER, not an input to any wire
+ * decision.
  *
  * NO SILENT WIDENING.  `rdsspd` shares the adjudication class and has no
  * row here because it has no census row in the corpus this was measured on.
  * If it ever appears it reads MISSING, loudly, and needs its own row and
- * its own question -- which is the behaviour wanted.
+ * its own status -- which is the behaviour wanted.
  */
-struct SrcAdjOwedRow {
+enum SrcAdjState {
+    SRC_ADJ_OWED = 0,   /* question open; blocks the flip                */
+    SRC_ADJ_R16  = 1,   /* ruled by R16: the wire is right, and why      */
+};
+struct SrcAdjRow {
     unsigned    isa;          /* TraceISA */
     uint32_t    decode_id;
     const char *mnem;
     uint8_t     reg;
-    const char *question;
+    unsigned    state;        /* SrcAdjState */
+    const char *text;         /* the question, or the ruling */
 };
-static const SrcAdjOwedRow g_src_adj_owed[] = {
-    { TRACE_ISA_RISCV, 0xecf2c479u, "fence",  REG_SYS,
-      "does R7.4 (a trap/behaviour-deciding CSR IS a source) reach "
-      "menvcfg.FIOM, which Sail models as FENCE's system source?" },
-    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_GPR0,
-      "is the printed register operand a SOURCE, a DESTINATION (Capstone "
-      "reports access==0 and XED says DST {GPR}), or absent on a machine "
-      "with CET disabled?" },
-    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_SSP,
-      "does the wire owe the INSTRUCTION FORM (XED SRC {REG_SSP}, PIN "
-      "ref_only=ssp) or THIS machine's runtime state (SDM: NOP when shadow "
-      "stacks are disabled, and QEMU models no CET)?" },
+static const SrcAdjRow g_src_adj_ledger[] = {
+    { TRACE_ISA_RISCV, 0xecf2c479u, "fence",  REG_SYS, SRC_ADJ_R16,
+      "ADJUDICATED-KEEP-R16.  R16 verbatim: \"We record ARCHITECTURAL "
+      "DEPENDENCIES.  IF THE DEPENDENCY EXISTS IN THE ISA, OR THE REGISTER "
+      "IS AN ISA REGISTER, THEN WE RECORD IT.  Does FENCE depend on the "
+      "system register contents?  THEN THAT IS A DEPENDENCY.  I DON'T CARE "
+      "ABOUT SEMANTICS.  A NOP SEMANTIC STILL HAS REAL DEPENDENCIES IN THE "
+      "CHOSEN REGISTER.  MICROARCHITECTURAL OPTIMIZATIONS SHOULD NOT BE "
+      "LEAKING INTO THE TRACE.  QEMU OPTIMIZATIONS SHOULD NOT BE LEAKING "
+      "INTO THE TRACE.\"  menvcfg.FIOM decides what a fence ORDERS, Sail "
+      "states ref_src=REG_SYS, and QEMU's empty read list at trans_fence "
+      "is the statement gap, not the architecture" },
+    { TRACE_ISA_X86,   0x0000054bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
+      "ADJUDICATED-KEEP-R16.  R16 verbatim: \"IF THE DEPENDENCY EXISTS IN "
+      "THE ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  ... "
+      "I DON'T CARE ABOUT SEMANTICS.  A NOP SEMANTIC STILL HAS REAL "
+      "DEPENDENCIES IN THE CHOSEN REGISTER.\"  The instruction FORM reads "
+      "SSP (XED SRC {REG_SSP}, PIN ref_only=ssp); the modelled machine's "
+      "CET state does not remove an ISA dependency" },
 };
-static const char *src_adj_owed_question(uint32_t decode_id, const char *mnem,
-                                         uint8_t reg)
+static const SrcAdjRow *src_adj_row(uint32_t decode_id, const char *mnem,
+                                    uint8_t reg)
 {
-    for (unsigned i = 0; i < G_N_ELEMENTS(g_src_adj_owed); i++) {
-        if (g_src_adj_owed[i].isa == (unsigned)trace_isa &&
-            g_src_adj_owed[i].decode_id == decode_id &&
-            g_src_adj_owed[i].reg == reg &&
-            mnem && strcmp(g_src_adj_owed[i].mnem, mnem) == 0) {
-            return g_src_adj_owed[i].question;
+    for (unsigned i = 0; i < G_N_ELEMENTS(g_src_adj_ledger); i++) {
+        if (g_src_adj_ledger[i].isa == (unsigned)trace_isa &&
+            g_src_adj_ledger[i].decode_id == decode_id &&
+            g_src_adj_ledger[i].reg == reg &&
+            mnem && strcmp(g_src_adj_ledger[i].mnem, mnem) == 0) {
+            return &g_src_adj_ledger[i];
         }
     }
     return nullptr;
 }
 std::atomic<uint64_t> g_src_adj_owed_n{0};
 GHashTable *g_src_adj_owed_sig = nullptr;
+std::atomic<uint64_t> g_src_adj_r16_n{0};
+GHashTable *g_src_adj_r16_sig = nullptr;
 /*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
@@ -3010,23 +3076,31 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                     continue;
                 }
                 /*
-                 * ADJUDICATION-OWED FIRST, and it is a redirection rather
-                 * than an exemption: the row is still counted, still
-                 * printed with its decode id and register, and still blocks
-                 * the flip -- it is counted in a column that says WHY it is
-                 * there.  See g_src_adj_owed for the two classes and the
-                 * questions they are waiting on.
+                 * THE ADJUDICATION LEDGER FIRST, and it is a redirection
+                 * rather than an exemption: the row is still counted, still
+                 * printed with its decode id and register, and an OWED row
+                 * still blocks the flip -- it is counted in a column that
+                 * says WHY it is there.  See g_src_adj_ledger for the rows,
+                 * their states and the ruling each closed under.
                  */
-                const char *owed = src_adj_owed_question(
+                const SrcAdjRow *adj = src_adj_row(
                     q->decode_id, mnem, f->src_regs[i]);
-                if (owed) {
-                    g_src_adj_owed_n.fetch_add(1, std::memory_order_relaxed);
+                if (adj) {
+                    bool ruled = adj->state == SRC_ADJ_R16;
                     char *okey = g_strdup_printf(
-                        "%08x %-26s %-14s %-10s Q: %s", q->decode_id,
+                        "%08x %-26s %-14s %-10s %s %s", q->decode_id,
                         q->decode_name ? q->decode_name : "?",
                         generic_reg_name_or_unknown(f->src_regs[i]),
-                        mnem ? mnem : "?", owed);
-                    tally(&g_src_adj_owed_sig, okey);
+                        mnem ? mnem : "?", ruled ? "R16:" : "Q:", adj->text);
+                    if (ruled) {
+                        g_src_adj_r16_n.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                        tally(&g_src_adj_r16_sig, okey);
+                    } else {
+                        g_src_adj_owed_n.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                        tally(&g_src_adj_owed_sig, okey);
+                    }
                     g_free(okey);
                     continue;
                 }
@@ -4445,12 +4519,46 @@ void qdep_report(GString *report)
         " yet ruled\n"
         "               -- and no source-list flip may land while it is"
         " non-zero.\n"
-        "               The rows and their questions are listed below\n",
+        "               The rows and their questions are listed below\n"
+        "  %10" G_GUINT64_FORMAT "  JUSTIFIED BY ADJUDICATION (R16) -- the"
+        " same ledger, the\n"
+        "               rows a RULING has closed, and NOT counted in either"
+        " row above.\n"
+        "               R16 verbatim: \"We record ARCHITECTURAL"
+        " DEPENDENCIES.  IF THE\n"
+        "               DEPENDENCY EXISTS IN THE ISA, OR THE REGISTER IS AN"
+        " ISA REGISTER,\n"
+        "               THEN WE RECORD IT. ... I DON'T CARE ABOUT SEMANTICS."
+        "  A NOP\n"
+        "               SEMANTIC STILL HAS REAL DEPENDENCIES IN THE CHOSEN"
+        " REGISTER.\n"
+        "               MICROARCHITECTURAL OPTIMIZATIONS SHOULD NOT BE"
+        " LEAKING INTO THE\n"
+        "               TRACE.  QEMU OPTIMIZATIONS SHOULD NOT BE LEAKING"
+        " INTO THE TRACE.\"\n"
+        "               STILL NOT FOLDED INTO JUSTIFIED, and the distinction"
+        " is the point:\n"
+        "               JUSTIFIED means QEMU's ordered read list contains the"
+        " register,\n"
+        "               which for these rows it does not.  A ruling and a"
+        " read-list hit\n"
+        "               are two different reasons for a row to be right, and"
+        " a census\n"
+        "               that spends them into one column can no longer say"
+        " which rows\n"
+        "               rest on a measurement and which rest on a decision."
+        "  A flip may\n"
+        "               land with this column non-zero -- it must carry these"
+        " registers,\n"
+        "               and the survivor table is where it says so.  The rows"
+        " and their\n"
+        "               rulings are listed below\n",
         g_src_flip_missing.load(std::memory_order_relaxed),
         g_src_flip_extra.load(std::memory_order_relaxed),
         g_src_flip_scored.load(std::memory_order_relaxed),
         g_src_flip_no_row.load(std::memory_order_relaxed),
-        g_src_adj_owed_n.load(std::memory_order_relaxed));
+        g_src_adj_owed_n.load(std::memory_order_relaxed),
+        g_src_adj_r16_n.load(std::memory_order_relaxed));
     g_string_append(report,
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
@@ -4714,7 +4822,9 @@ void qdep_report(GString *report)
     dump_tally(report, g_src_flip_missing_sig,
                "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
     dump_tally(report, g_src_adj_owed_sig,
-               "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows:");
+               "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows.  A row leaves this block by being RULED, never by being deleted:\nthe ruled rows are in the R16 block below, with their counts intact:");
+    dump_tally(report, g_src_adj_r16_sig,
+               "JUSTIFIED BY ADJUDICATION (R16) -- the same ledger, the rows\na RULING has closed.  Columns: decode id, rule, register, mnemonic, and\nthe RULING the row closed under, quoted rather than referenced so the\nreason travels with the sidecar.  These are NOT counted as MISSING and\nare NOT folded into JUSTIFIED: JUSTIFIED means QEMU's ordered read list\ncontains the register, which for these rows it does not, and a census\nthat spent a ruling and a read-list hit into one column could no longer\nsay which of its rows rest on a measurement.  A source-list flip MAY\nland with this block non-empty, and must carry every register in it:");
     dump_tally(report, g_src_flip_extra_sig,
                "FLIP COST, THE FABRICATION DIRECTION -- registers a\nSURVIVOR ROW supplies that the wire does not publish, by decode id, rule,\nregister and mnemonic.  A FIXED row reaching an instruction the rule\ndecodes but that does not read the register lands here, and so does a\nSELF row on an instruction whose destination is not also a source.  The\nblock is empty when every row is right for every instruction its rule\ncarries:");
     dump_tally(report, g_src_qemu_extra_sig,

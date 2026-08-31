@@ -68,4 +68,12 @@ void qemu_ident_report(GString *report);
  */
 void qemu_ident_shadow_report(GString *report);
 
+/*
+ * The ENUM-PUBLISHED count -- classifications for which the Capstone-enum
+ * table, not the decode identity, is the answer the wire carries.  It is
+ * the R14 deletion bar, and the identity audit prints it so its own header
+ * can state which key the wire took RATHER THAN ASSERTING ONE.
+ */
+uint64_t qemu_ident_enum_published(void);
+
 #endif /* CHAMPSIM_TRACER_QEMU_IDENT_READER_H */

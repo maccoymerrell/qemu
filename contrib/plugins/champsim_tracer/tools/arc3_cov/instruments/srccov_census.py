@@ -39,15 +39,30 @@ WHAT THE COLUMNS MEAN, and why they are kept apart:
   ADJ-OWED     published sources the flip's union does not contain that are
                NOT counted as MISSING, because their deletion was written,
                landed, measured against the external references and REVERTED
-               when those references contradicted it (PASS 29: riscv64
-               `fence` REG_SYS vs Sail/menvcfg.FIOM; x86_64 `rdsspq`
-               REG_GPR0+REG_SSP vs XED/PIN).  A FOURTH outcome, and it is
-               kept apart from BOTH neighbours on purpose: folding it into
-               JUSTIFIED would assert the wire is right, which is the very
-               thing no ruling has said; leaving it in MISSING would assert
-               a flip may delete it, which R12.1 forbids.  Non-zero here is
-               not a defect -- it is an open maintainer question, and it
-               blocks any source-list flip until it is answered.
+               when those references contradicted it (PASS 29).  A FOURTH
+               outcome, and it is kept apart from BOTH neighbours on purpose:
+               folding it into JUSTIFIED would assert the wire is right,
+               which is the very thing no ruling has said; leaving it in
+               MISSING would assert a flip may delete it, which R12.1
+               forbids.  Non-zero here is not a defect -- it is an open
+               maintainer question, and it blocks any source-list flip until
+               it is answered.
+  ADJ-R16      the FIFTH outcome, and the one an answered question lands in:
+               the same ledger, the rows a RULING has closed.  R16 (2026-08-30)
+               rules that an architectural dependency is recorded whatever
+               QEMU's lowering or the modelled machine's state does with it,
+               and it closed riscv64 `fence` REG_SYS (menvcfg.FIOM decides
+               what the fence ORDERS; Sail states it) and x86_64 `rdsspq`
+               REG_SSP (XED SRC {REG_SSP}; a NOP semantic still has real
+               dependencies).  STILL NOT FOLDED INTO JUSTIFIED: JUSTIFIED
+               means QEMU's ordered read list contains the register, which
+               for these rows it does not, and one column cannot say both.
+               Non-zero here does NOT block a flip -- it OBLIGES one: the
+               flip must carry every register in it.
+               ADJ-OWED and ADJ-R16 never share a row.  A row leaves ADJ-OWED
+               by being ruled, never by being deleted, and the count follows
+               it, so the closure of a question is visible as an arithmetic
+               identity across two censuses rather than as an absence.
 
 VACUITY (#313/#235).  A stats file with no census block FAILS.  A census
 whose INSN-SCORED is zero FAILS.  A reader that cannot find its subject must
@@ -78,6 +93,7 @@ ROWS = [
     ("OVER-BOUND",  r"(\d+)\s+read lists over the fold's bound"),
     ("ADJ-OWED",    r"(\d+)\s+of the loss direction held back as "
                     r"ADJUDICATION-OWED"),
+    ("ADJ-R16",     r"(\d+)\s+JUSTIFIED BY ADJUDICATION \(R16\)"),
 ]
 MARKER = "SOURCE-SIDE MEMBERSHIP COVERAGE"
 
@@ -140,7 +156,8 @@ def census(paths, quiet=False):
 # --------------------------------------------------------------------------
 # selftest
 
-def _block(just, unjust, nots, extra, scored, notscored, over, owed=0):
+def _block(just, unjust, nots, extra, scored, notscored, over, owed=0,
+           r16=0):
     return (MARKER + " -- per PUBLISHED src_regs[i]\n"
             "  %d  published source entries JUSTIFIED\n"
             "  %d  published source entries UNJUSTIFIED -- x\n"
@@ -152,7 +169,10 @@ def _block(just, unjust, nots, extra, scored, notscored, over, owed=0):
             "shortened\n"
             "  %d  of the loss direction held back as ADJUDICATION-OWED, and\n"
             "               NOT counted in the first row above\n"
-            % (just, unjust, nots, extra, scored, notscored, over, owed))
+            "  %d  JUSTIFIED BY ADJUDICATION (R16) -- the same ledger, the\n"
+            "               rows a RULING has closed\n"
+            % (just, unjust, nots, extra, scored, notscored, over, owed,
+               r16))
 
 
 SURV_HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
@@ -218,8 +238,8 @@ def selftest():
         vac = os.path.join(tmp, "vacuous.stats.log")
         absent = os.path.join(tmp, "absent.stats.log")
         short = os.path.join(tmp, "short.stats.log")
-        open(good, "w").write(_block(22235, 5436, 0, 21, 20315, 0, 0, 22))
-        open(vac, "w").write(_block(0, 0, 0, 0, 0, 0, 0, 0))
+        open(good, "w").write(_block(22235, 5436, 0, 21, 20315, 0, 0, 22, 19))
+        open(vac, "w").write(_block(0, 0, 0, 0, 0, 0, 0, 0, 0))
         open(absent, "w").write("a stats file with everything BUT the census\n")
         open(short, "w").write(MARKER + "\n  5  published source entries "
                                "JUSTIFIED\n")
@@ -227,7 +247,7 @@ def selftest():
         rc, out = census([good], quiet=True)
         checks.append(("clean census: rc=0 and the columns are read exactly",
                        rc == 0 and out[0][1] == [22235, 5436, 0, 21, 20315,
-                                                 0, 0, 22],
+                                                 0, 0, 22, 19],
                        "rc=%d vals=%s" % (rc, out[0][1])))
 
         # A census that scored nothing is not a census with no survivors.

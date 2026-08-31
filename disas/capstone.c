@@ -445,6 +445,7 @@ static uint8_t cap_x86_x87_mem_access(const char *mnem);
 static bool cap_x86_is_mask_arith_dest_last(const char *mnem);
 static bool cap_x86_is_ktest(const char *mnem);
 static bool cap_x86_is_ssp_read(const char *mnem);
+static bool cap_x86_is_ssp_dest(const char *mnem);
 static bool cap_x86_is_x87_tag_only(const char *mnem);
 static const char *cap_x86_mnem_stem(const char *mnem);
 static bool cap_x86_is_cmov(const char *mnem);
@@ -783,6 +784,11 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * count — a pure READ; the write target is SSP, which is not an
      * operand. */
     bool ssp_read = cap_x86_is_ssp_read(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: RDSSPD / RDSSPQ report their sole
+     * register operand -- the instruction's DESTINATION -- access == 0.
+     * See cap_x86_is_ssp_dest for why the repair is a write and not a
+     * drop. */
+    bool ssp_dest = cap_x86_is_ssp_dest(insn->mnemonic);
     /* FFREEP names an st(i) operand it never reads or writes as data —
      * it only marks the x87 tag word empty.  Capstone reports
      * access == 0, which downstream would repair into a fabricated
@@ -959,6 +965,16 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * the destination (the source is the memory operand);
              * Capstone erases its WRITE along with the memory access. */
             if (erased_load && op->access == 0) {
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* RDSSPD / RDSSPQ load the shadow-stack pointer into the
+             * GPR their sole register operand names: that operand is the
+             * instruction's DESTINATION and Capstone reports it with no
+             * access at all.  Saying so is architecturally exact -- XED
+             * `SRC {SSP} DST {RAX}`, iced-x86 `DST {RAX}`, PIN's dstset
+             * `ref_only=rax` -- and it is a no-op on every encoding
+             * Capstone already reports correctly. */
+            if (ssp_dest && op->access == 0) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
             }
             /* A gather zeroes its mask register on completion, so the
@@ -2662,6 +2678,52 @@ static bool cap_x86_is_ktest(const char *mnem)
 static bool cap_x86_is_ssp_read(const char *mnem)
 {
     return mnem && g_str_has_prefix(mnem, "incssp");
+}
+
+/*
+ * Capstone-6.0.0-Alpha7 bug: RDSSPD / RDSSPQ lose the access on the GPR
+ * they load the shadow-stack pointer into.
+ *
+ * `IF ShadowStackEnabled(CPL): dest := SSP` -- Intel SDM Vol. 2B,
+ * RDSSPD/RDSSPQ "Operation".  The named GPR is the destination and the
+ * only architectural effect the instruction has; Capstone returns it
+ * with access == 0, naming the operand while saying nothing about what
+ * the instruction does to it.
+ *
+ * WHY A WRITE AND NOT A DROP, and why it is not left alone.  An operand
+ * with no access reaches the plugin's POSITIONAL FALLBACK, which places
+ * by operand order and has no destination slot to hand out while the
+ * instruction classifies GEN_OP_NOP -- so the register landed on the
+ * wire as a SOURCE, in the one role all three static references and PIN
+ * agree it does not have.  A drop would lose the register entirely,
+ * which is the R12.1 direction that is never available.  Stating the
+ * architectural access is the only repair that adds no information the
+ * ISA does not define and removes none that it does: it is R16 applied
+ * at the boundary, where the defect is.
+ *
+ * ALL THREE STATIC REFERENCES AND THE EXECUTION REFERENCE, measured:
+ *   XED       f3480f1ec8  SRC {SSP}      DST {RAX}
+ *   iced-x86  f3480f1ec8  SRC {}         DST {RAX}
+ *   LLVM MC   f3480f1ec8  SRC {RAX,SSP}  DST {RAX}
+ *   PIN       f3480f1ec8  srcset ref_only={} tracer_only=rax;
+ *                         dstset ref_only=rax tracer_only={}
+ * LLVM MC alone ALSO keeps the GPR as a source, modelling the SDM's
+ * conditional write (with CET disabled the old value survives, so the
+ * write merges).  That reading is R17.1c's, it is a strictly wider set,
+ * and it is NOT taken here: R16's consequence for this row is that the
+ * GPR MOVES to the destination list, and a register published in both
+ * roles would leave the XED and PIN legs disagreeing in the SRC-EXTRA
+ * direction they disagree in today.  The dissent is recorded rather
+ * than resolved by silence.
+ *
+ * The SSP system register is appended separately as a READ by
+ * cap_x86_add_sysreg; the two halves of the instruction's dataflow are
+ * stated in the two places that can state them.
+ */
+static bool cap_x86_is_ssp_dest(const char *mnem)
+{
+    return mnem && (strcmp(mnem, "rdsspd") == 0 ||
+                    strcmp(mnem, "rdsspq") == 0);
 }
 
 /* FFREEP: tags st(i) empty and pops — the named register is neither

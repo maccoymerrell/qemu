@@ -1336,17 +1336,31 @@ void qemu_ident_report(GString *report)
         "The table is champsim_tracer_qemu_ident_<isa>.h, one row per "
         "decode rule, keyed by qemu_plugin_insn_decode_id().  Under ruling "
         "J6 this identity is the INTENDED source of the wire's opcode "
-        "taxonomy; it is not the source yet, so today the wire still "
-        "takes its opcode from Capstone and the numbers below measure "
-        "how ready the replacement is.\n"
+        "taxonomy, AND ON THIS RUN IT IS ALREADY THE SOURCE FOR EVERY "
+        "CLASSIFICATION BUT THE ENUM-PUBLISHED ONES, whose count is "
+        "printed below and measured rather than asserted.  Where the "
+        "identity key speaks, classify_insn_id() has already taken its "
+        "answer and the Capstone-enum row is dead weight; the enum table "
+        "is the wire's answer only where the identity key said nothing.  "
+        "That residue is the R14 deletion bar and the numbers below "
+        "measure how ready the replacement is.\n"
         "  translated instructions read           %10" PRIu64 "\n"
         "  no identity exported (id == 0)         %10" PRIu64 "  %5.1f%%\n"
         "  id carried, NO ROW IN TABLE            %10" PRIu64 "  <- stale table\n"
         "  row found, NAME DISAGREES              %10" PRIu64 "  <- stale table\n"
-        "  scored against the Capstone row        %10" PRIu64 "\n",
+        "  scored against the Capstone row        %10" PRIu64 "\n"
+        "  ENUM-PUBLISHED, this run               %10" PRIu64 "  <- the rows "
+        "the enum table IS still the answer for\n"
+        "               Counted by the shadow lookup over the same "
+        "population; read its block for the\n"
+        "               per-name partition.  It is NOT a must-be-0 row here "
+        "either -- it is the bar,\n"
+        "               and quoting it without naming the corpus it was "
+        "measured on says nothing.\n",
         g_n_insns, g_n_no_identity,
         100.0 * (double)g_n_no_identity / (double)g_n_insns,
-        g_n_row_missing, g_n_name_mismatch, g_n_scored);
+        g_n_row_missing, g_n_name_mismatch, g_n_scored,
+        qemu_ident_enum_published());
 
     if (g_n_no_identity) {
         /*

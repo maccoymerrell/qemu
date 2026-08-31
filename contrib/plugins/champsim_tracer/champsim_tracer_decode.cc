@@ -1303,6 +1303,11 @@ static void qid_shadow_score(const qemu_plugin_insn_info *info,
     qsh_record_sig(info->decode_id, info->insn_id, cols, info->mnemonic);
 }
 
+uint64_t qemu_ident_enum_published(void)
+{
+    return g_qsh_enum_published.load(std::memory_order_relaxed);
+}
+
 void qemu_ident_shadow_report(GString *report)
 {
     uint64_t insns    = g_qsh_insns.load(std::memory_order_relaxed);

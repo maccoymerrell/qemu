@@ -33,8 +33,12 @@ honestly non-zero and reading them as red would be a false alarm:
                was landed, measured against the external references and
                REVERTED.  Non-zero means an OPEN maintainer question, and it
                blocks any source-list flip; it does not mean a red gate.
+  ADJ-R16      the same ledger's RULED rows (R16, 2026-08-30).  Non-zero
+               means a question was ANSWERED and the register stays -- the
+               opposite of a defect, and the count is deliberately kept
+               rather than deleted so the closure is visible.
 
-Neither line carries the phrase, so neither is scanned here.  That is the
+None of those lines carries the phrase, so none is scanned here.  That is the
 membership rule and not a special case: a column is a must-be-0 row exactly
 when the plugin writes "MUST BE 0" in its own text.
 

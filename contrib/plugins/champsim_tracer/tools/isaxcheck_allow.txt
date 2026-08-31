@@ -1795,8 +1795,6 @@ x86_64 R-rd-missing rdsspq +r#
 x86_64 R-rd-missing tpause +r#
 x86_64 R-rd-missing umonitor +r#
 x86_64 R-rd-missing umwait +r#
-x86_64 R-wr-missing rdsspd +r#
-x86_64 R-wr-missing rdsspq +r#
 x86_64 R-wr-missing tpause +flags
 x86_64 R-wr-missing umwait +flags
 x86_64 R-wr-phantom lcalll +r#
@@ -1809,8 +1807,6 @@ x86_64 R-wr-phantom rdrandl +flags,r#
 x86_64 Z-access0 clrssbsy MEM
 x86_64 Z-access0 ljmpq MEM
 x86_64 Z-access0 prefetchwt1 MEM
-x86_64 Z-access0 rdsspd REG
-x86_64 Z-access0 rdsspq REG
 x86_64 Z-access0 rstorssp MEM
 x86_64 Z-access0 umonitor REG
 

@@ -96,8 +96,7 @@ result was false:
 4. IT WILL NOT CARRY A ROW THE CENSUS COUNTS AS ADJUDICATION-OWED.  Those
    are the (id, register) pairs whose deletion was written, landed, measured
    against the external references and REVERTED because the references
-   contradicted it -- riscv64 `fence` REG_SYS, x86_64 `rdsspq`
-   REG_GPR0 + REG_SSP.  Carrying one would move it out of the loss direction
+   contradicted it.  Carrying one would move it out of the loss direction
    and drop the ADJUDICATION-OWED count to zero, and that count is the thing
    that says no source-list flip may land while a maintainer question is
    open.  Answering an open question by making its counter read zero is the
@@ -107,6 +106,18 @@ result was false:
    The refused rows are printed and written into the header as a comment,
    because a row that is not carried stays in the loss direction and blocks
    the flip -- that has to be visible rather than silently absent.
+
+   A RULED ROW IS A DIFFERENT ROW, AND IT IS CARRIED.  The ledger the census
+   prints has two states and marks them apart in the row itself: an OPEN row
+   reads `Q: <question>` and a row a ruling has closed reads
+   `R16: <ruling>`.  Only the `Q:` form is refused here.  That is not an
+   accident of the regex, it is the rule: a ruling that the wire is right is
+   exactly the statement that a flip MUST keep publishing the register, so
+   the survivor table -- which is how a flip says what it carries -- has to
+   carry it.  Refusing a ruled row would make the flip delete a register a
+   maintainer has just ruled architectural, which is the R12.1 direction
+   that is never available.  Proven by ARM D2 of the selftest, which plants
+   an `R16:` row and requires it to appear in the emitted header.
 
 Usage:
   gen_src_survivors.py --snapshot DIR <isa>=<stats.log> [<isa>=<stats.log> ...]
@@ -132,7 +143,10 @@ OWED_HDR = "ADJUDICATION-OWED -- published sources"
 ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+(SELF@\d+|FIXED)\s+(\S+)\s*$")
 SPLIT_ROW = re.compile(r"^\s*0x([0-9a-f]{8})\s+QID_SPLIT\s")
 WITNESS_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(\S+)\s*$")
+# An OPEN ledger row, and ONLY an open one: the census marks a ruled row
+# `R16:` in the same column, and a ruled row is carried (docstring item 4).
 OWED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+Q:")
+RULED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+R16:")
 MANIFEST = "MANIFEST.sha256"
 
 
@@ -188,6 +202,11 @@ def parse(path):
             m = OWED_ROW.match(line)
             if m:
                 owed.add((int(m.group(1), 16), m.group(3)))
+            elif RULED_ROW.match(line):
+                # A ruled row sits in the same ledger and is deliberately
+                # NOT added: it is carried.  Matched explicitly so that a
+                # future third state cannot fall through as "not owed".
+                continue
             elif owed and not line.strip():
                 break
 
@@ -497,8 +516,16 @@ def selftest():
                "        fence     Q: does R7.4 reach FIOM?"]
     owedsurv = ["        16  ecf2c479 decode_insn32/fence        REG_SYS"
                 "        FIXED fence"]
+    # ... and a RULED row of the same shape, in the same ledger block.  It
+    # must be CARRIED: a ruling that the wire is right is the statement that
+    # a flip has to keep publishing the register.
+    ruledrow = ["         9  30a7252a disas_a64/FABS_s           REG_FCSR"
+                "       fabs      R16: ADJUDICATED-KEEP-R16, architectural"]
+    ruledsurv = ["         9  30a7252a disas_a64/FABS_s           REG_FCSR"
+                 "       FIXED fabs"]
     x = os.path.join(d, "x86_64.log")
-    _sidecar(x, good + split + owedsurv, splitline, witness, owedrow)
+    _sidecar(x, good + split + owedsurv + ruledsurv, splitline, witness,
+             owedrow + ruledrow)
     a_ = os.path.join(d, "aarch64.log"); _sidecar(a_, [], [])
     r = os.path.join(d, "riscv64.log"); _sidecar(r, [], [])
     m = os.path.join(d, "mipsel.log"); _sidecar(m, [], [])
@@ -531,6 +558,9 @@ def selftest():
     chk("ARM D1: an ADJUDICATION-OWED row is NOT carried",
         "0xecf2c479u, SRC_SURV" not in txt
         and "ADJUDICATION-OWED, an open maintainer question" in rc.stdout)
+    chk("ARM D2: a RULED (R16) row in the same ledger IS carried",
+        "0x30a7252au, SRC_SURV" in txt,
+        "a ruling that the wire is right must not make the flip drop it")
     chk("ARM E: an empty table is scoped to the sidecars, not the ISA",
         "FACT ABOUT THE" in txt and "NOT ABOUT THE ISA" in txt)
     chk("ARM F: and it makes no claim about the ISA in general",

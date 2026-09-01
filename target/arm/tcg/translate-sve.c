@@ -4930,6 +4930,30 @@ static bool trans_LDFF1_zprr(DisasContext *s, arg_rprr_load *a)
         return false;
     }
     s->is_nonstreaming = true;
+    /*
+     * THE FFR, WHICH A FIRST-FAULT OR NON-FAULT LOAD READS.
+     *
+     * QEMU does not: sve_ldnfff1_r() computes the active elements from Pg
+     * alone and record_fault() only ever WRITES pregs[FFR_PRED_NUM].  The
+     * architecture gates each element on the FFR as well as on the governing
+     * predicate -- which is what makes an FFR-chained loop terminate -- and
+     * R16 records an ISA-defined dependency whatever the emulator chose to
+     * do with it.
+     *
+     * NOT ADJUDICATED FROM THIS FILE ALONE.  The external decode leg agrees
+     * and can be checked in the tree: LLVM marks exactly these forms
+     * `Uses = [FFR], Defs = [FFR]`, and the table Capstone generates from it
+     * carries the register in BOTH slots --
+     * arch/AArch64/AArch64GenCSMappingInsn.inc gives LDFF1B_D_REAL,
+     * LDNF1B_D_IMM_REAL and GLDFF1B_D_REAL `{ AARCH64_REG_FFR, 0 }` for
+     * regs_use where the plain LD1B_D_IMM beside them carries `{ 0 }`.  The
+     * claim therefore DISCRIMINATES rather than blanketing the load group.
+     *
+     * `ffr` is the spelling the architecture and the GDB stub both use;
+     * QEMU stores it as pregs[16] so that it can be handled as any other
+     * predicate, which is why sve_pred_names[] lists it by name.
+     */
+    note_sve_pred_read(FFR_PRED_NUM);
     if (sve_access_check(s)) {
         TCGv_i64 addr = tcg_temp_new_i64();
         tcg_gen_shli_i64(addr, cpu_reg(s, a->rm), dtype_msz(a->dtype));
@@ -5032,6 +5056,8 @@ static bool trans_LDNF1_zpri(DisasContext *s, arg_rpri_load *a)
         return false;
     }
     s->is_nonstreaming = true;
+    /* The FFR, read; see trans_LDFF1_zprr() for the class and its evidence. */
+    note_sve_pred_read(FFR_PRED_NUM);
     if (sve_access_check(s)) {
         int vsz = vec_full_reg_size(s);
         int elements = vsz >> dtype_esz[a->dtype];
@@ -5840,6 +5866,15 @@ static bool trans_LD1_zprz(DisasContext *s, arg_LD1_zprz *a)
     }
     assert(fn != NULL);
 
+    /*
+     * The FFR on the FIRST-FAULT gather forms only: @ff is an encoding bit,
+     * so the statement follows the encoding rather than the group.  See
+     * trans_LDFF1_zprr() for the class and its evidence.
+     */
+    if (a->ff) {
+        note_sve_pred_read(FFR_PRED_NUM);
+    }
+
     do_mem_zpz(s, a->rd, a->pg, a->rm, a->scale * a->msz,
                cpu_reg_sp(s, a->rn), a->msz, false, fn);
     return true;
@@ -5871,6 +5906,11 @@ static bool trans_LD1_zpiz(DisasContext *s, arg_LD1_zpiz *a)
         break;
     }
     assert(fn != NULL);
+
+    /* The FFR on the first-fault forms; see trans_LD1_zprz() above. */
+    if (a->ff) {
+        note_sve_pred_read(FFR_PRED_NUM);
+    }
 
     /* Treat LD1_zpiz (zn[x] + imm) the same way as LD1_zprz (rn + zm[x])
      * by loading the immediate into the scalar parameter.

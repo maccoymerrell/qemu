@@ -337,11 +337,86 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
     }
 }
 
+/*
+ * THE VECTOR REGISTER AN SSE/AVX OPERAND NAMES, stated where the emitter
+ * reaches it.
+ *
+ * WHY ANYTHING HAS TO BE STATED.  op_ptr() hands the helper a POINTER built
+ * from tcg_env (tcg_gen_addi_ptr), and a pointer computed from tcg_env is an
+ * ADDRESS -- not a read of the bytes it addresses.  So an operand the
+ * emitter passes by pointer reaches no ordered read list at all.  Measured
+ * on the translate-only encoding sled at this tip, `vmaxps`, `vcmpeqps`,
+ * `vhaddps` and `cmpeqpd` arrive with QEMU's read list holding the address
+ * GPR and the FP control word and NO vector register: the xmm the encoding
+ * names reached the wire only through the operand walk beside it.
+ *
+ * WHY HERE AND NOT AT THE OPERAND LOAD.  gen_load() looked like the site --
+ * decode-new.c.inc calls it on operands 1 and 2 and on nothing else -- but
+ * an operand SLOT is not an operand READ.  X86_OP_ENTRY2 fills slot 1 with
+ * X86_TYPE_2op and a legacy X86_TYPE_H re-decodes to operand 0, so a
+ * two-operand legacy form carries its own destination in slot 1 whether or
+ * not the instruction merges into it.  Measured, stating slot 1 from
+ * gen_load() put 9,624 registers on the wire that the encoding does not
+ * name -- `cvtps2pd`, `cvtpd2ps`, `sqrtps` and the rest of the unary group,
+ * every one of which OVERWRITES its destination.  op_ptr() does not have
+ * that problem because it is not called at all for an operand the emitter
+ * does not use: gen_VCVTPS2PD asks for pointers 0 and 2 and never for 1.
+ * The emitter's own usage is the fact, and this is where it is expressed.
+ *
+ * OPERANDS 1 AND 2 ONLY.  Operand 0 is the destination gen_writeback()
+ * writes back, and a helper's output pointer is not a read; the instructions
+ * whose destination is ALSO a source say so at their own emitters (the FMA
+ * addend below is the pattern).  Operands 1 and 2 are never an output: the
+ * only writeback decode-new.c.inc performs is operand 0's, so a helper
+ * writing through either would write a register QEMU never writes back --
+ * checked against the shapes that pass them first, `vpmaskmov*_st` and the
+ * `ptest` / `ucomis` / `pcmpestr` compares, all of which only read.
+ *
+ * BY RANGE, because for the vector file the range IS the register: the whole
+ * ZMMReg slot is what insn_dataflow_declare_regfile("xmm", ...) already
+ * declares in translate.c, so this statement is named by the same
+ * declaration that names every ordinary load of those bytes and there is no
+ * second spelling to keep in step.  The slot is stated whole on every width
+ * -- `vmaxss` reads 32 bits of it and `vmaxps` 128 or 256 -- because R17
+ * settles that those are ONE register whose per-read width is recorded
+ * separately; the identity does not narrow with the operand.
+ *
+ * REGISTER OPERANDS ONLY.  A memory operand's value is loaded into
+ * CPUX86State::xmm_t0 (compute_xmm_offset) before the emitter runs, so
+ * vector_reg_offset() would then name a scratch slot rather than an
+ * architectural register; the load itself is an access QEMU already states.
+ * Stating xmm_t0 would put a register on the wire the encoding does not
+ * name.
+ *
+ * X86_OP_SSE ONLY, deliberately and not silently.  An MMX operand's offset
+ * lands inside env->fpregs[n].mmx, whose only declaration today is the
+ * whole-array x87 CONTAINER -- which names the file and must never stand in
+ * for a member.  mm<n> IS a physical index, unlike ST(i), so it can be
+ * declared; that is a separate statement with its own evidence, and until it
+ * exists an MMX operand is left open in the family ledger rather than
+ * answered with the wrong register.
+ *
+ * R7.3 (a register the encoding names is not the emulator's to drop) and R15
+ * (a lowering decision is not architectural truth).
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_vector_operand_read(X86DecodedOp *op)
+{
+    if (op->has_ea || op->unit != X86_OP_SSE) {
+        return;
+    }
+    insn_dataflow_note_stated_read_env(vector_reg_offset(op), sizeof(ZMMReg));
+}
+
 static TCGv_ptr op_ptr(X86DecodedInsn *decode, int opn)
 {
     X86DecodedOp *op = &decode->op[opn];
 
     assert(op->unit == X86_OP_MMX || op->unit == X86_OP_SSE);
+    if (opn != 0) {
+        gen_note_vector_operand_read(op);
+    }
     if (op->v_ptr) {
         return op->v_ptr;
     }
@@ -638,54 +713,48 @@ FP_SSE(VDIV, div)
 FP_SSE(VMAX, max)
 
 /*
- * THE THREE MULTIPLICANDS AN FMA ENCODING NAMES, stated at the decode site.
+ * THE THIRD MULTIPLICAND AN FMA ENCODING NAMES -- its DESTINATION.
  *
- * `vfmadd132sd xmm1, xmm2, xmm0` reads all three of its operands -- the 132,
- * 213 and 231 forms differ only in which product each one enters -- and the
- * destination is one of them, so every FMA form has three vector SOURCES.
- * None of them reaches QEMU's ordered read list: op_ptr() hands the helper a
- * POINTER built from tcg_env (tcg_gen_addi_ptr), and a pointer computed from
- * tcg_env is an address, not a read of the bytes it addresses.  Measured on
- * a guest that executes the scalar forms with several distinct register
- * triples, every one of the three arrived as `field-range off=<xmm> size=0
- * (no declared regfile)` -- an unbounded span, which downstream is
- * indistinguishable from no statement at all -- and the registers the wire
- * published came from the operand walk alone.
+ * `vfmadd132sd xmm1, xmm2, xmm0` reads all three of its operands: the 132,
+ * 213 and 231 forms differ only in which product each one enters, and the
+ * destination is always one of them, so every FMA form has three vector
+ * SOURCES.  Two of the three are ordinary operand loads and gen_note_vector_
+ * operand_read() states them from gen_load(); the destination is not loaded
+ * at all -- gen_writeback() writes operand 0 and nothing reads it -- so the
+ * fact that an FMA also READS it has no other site to be stated at.
  *
- * BY RANGE, because for the vector file the range IS the register: the whole
- * ZMMReg slot is what insn_dataflow_declare_regfile("xmm", ...) already
- * declares in translate.c, so this statement is named by the same
- * declaration that names every ordinary load of those bytes and there is no
- * second spelling to keep in step.  That is the opposite choice from the SVE
- * predicate in translate-sve.c, and for the opposite reason: this file is
- * declared already and nothing else reaches these bytes by pointer.
+ * None of the three reaches QEMU's ordered read list on its own: op_ptr()
+ * hands the helper a POINTER built from tcg_env (tcg_gen_addi_ptr), and a
+ * pointer computed from tcg_env is an address, not a read of the bytes it
+ * addresses.  Measured on a guest that executes the scalar forms with
+ * several distinct register triples, every one of the three arrived as
+ * `field-range off=<xmm> size=0 (no declared regfile)` -- an unbounded span,
+ * which downstream is indistinguishable from no statement at all -- and the
+ * registers the wire published came from the operand walk alone.
  *
- * REGISTER OPERANDS ONLY.  A memory operand's value is loaded into
- * CPUX86State::xmm_t0 before the helper runs, so op->offset then names a
- * scratch slot and not an architectural register; the load itself is an
- * access QEMU already states.  Stating xmm_t0 would put a register on the
- * wire that the encoding does not name.
+ * REGISTER DESTINATION ONLY, on the same rule the operand-load statement
+ * follows: with has_ea the offset names CPUX86State::xmm_t0, a scratch slot
+ * and not an architectural register.
  *
  * R7.3 (a register the encoding names is not the emulator's to drop) and R15
  * (a lowering decision is not architectural truth).
  *
  * Capture only; no op is emitted, altered or suppressed.
  */
-static void gen_note_vector_operand_read(X86DecodedInsn *decode, int opn)
-{
-    X86DecodedOp *op = &decode->op[opn];
-
-    if (op->has_ea || op->unit != X86_OP_SSE) {
-        return;
-    }
-    insn_dataflow_note_stated_read_env(vector_reg_offset(op), sizeof(ZMMReg));
-}
-
 static void gen_note_fma_operand_reads(X86DecodedInsn *decode)
 {
-    gen_note_vector_operand_read(decode, 0);
-    gen_note_vector_operand_read(decode, 1);
-    gen_note_vector_operand_read(decode, 2);
+    /*
+     * OPERAND 0 ONLY.  Operands 1 and 2 are stated by gen_load(), which
+     * decode-new.c.inc calls on exactly those two slots for every decode-new
+     * instruction; an FMA is the case where the DESTINATION is also read, so
+     * the only fact left for this site is the one no operand load can carry.
+     */
+    X86DecodedOp *op = &decode->op[0];
+
+    if (op->has_ea) {
+        return;
+    }
+    gen_note_vector_operand_read(op);
 }
 
 #define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \

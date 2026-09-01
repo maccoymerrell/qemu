@@ -4289,6 +4289,48 @@ static bool trans_ST_mult(DisasContext *s, arg_ldst_mult *a)
 
     elements = (a->q ? 16 : 8) >> size;
     tcg_ebytes = tcg_constant_i64(1 << size);
+
+    /*
+     * THE STORE-DATA REGISTER LIST, stated -- one statement per register the
+     * encoding names.
+     *
+     * `st4 {v20.16b-v23.16b}, [x11]` names four vector registers in one
+     * operand, and the emulator's extraction reports itself incomplete on
+     * this shape (gen_mte_checkN() above hands a helper tcg_env), so QEMU's
+     * ordered read list for the instruction is refused wholesale and the
+     * registers reach a consumer only from a disassembler's operand walk.
+     * Measured, that left the wire publishing the DERIVING corpus's
+     * registers instead of the encoding's: every `st4` published REG_VEC5..8
+     * and REG_GPR9 whatever it actually stored.
+     *
+     * STATED WHERE THE LIST IS COMPUTED, and by exactly the expression the
+     * stores below use -- `(a->rt + r + xs) % 32`, the architectural wrap
+     * that makes {v30,v31,v0,v1} a legal list.  Naming only a->rt would
+     * publish a list short by the members that make the form what it is,
+     * which is the same rule do_mem_zpa() states its ST2/ST3/ST4 data
+     * vectors under (translate-sve.c, a76f8026d6).
+     *
+     * ONCE PER REGISTER, not once per element: the element loop below reads
+     * the same register `elements` times and the read set is a set.  The
+     * range is the bytes this form reads -- 16 for the Q form, 8 otherwise
+     * -- inside the slot insn_dataflow_declare_regfile("v", ...) declares.
+     *
+     * The BASE register needs no statement: cpu_reg_sp() above is a TCG
+     * global and the walk already sees it.
+     *
+     * R7.3 and R15, as for every other statement of this kind.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    for (r = 0; r < a->rpt; r++) {
+        int xs;
+        for (xs = 0; xs < a->selem; xs++) {
+            insn_dataflow_note_stated_read_env(
+                vec_full_reg_offset(s, (a->rt + r + xs) % 32),
+                a->q ? 16 : 8);
+        }
+    }
+
     for (r = 0; r < a->rpt; r++) {
         int e;
         for (e = 0; e < elements; e++) {

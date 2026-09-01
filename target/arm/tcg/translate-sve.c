@@ -334,6 +334,30 @@ static void note_sve_pred_read(int pg)
     }
 }
 
+/*
+ * A DATA VECTOR THE ENCODING NAMES AS A SOURCE, stated by RANGE.
+ *
+ * The counterpart of note_sve_pred_read() for the other file, and by range
+ * rather than by name for the reason do_mem_zpa() already states it that
+ * way: the vector file IS declared -- translate-a64.c's
+ * insn_dataflow_declare_regfile("v", ...) -- so the offsetof()/sizeof() pair
+ * that describes the register is the register, and one declaration names
+ * every access to those bytes including this one.  The predicates go the
+ * other way because their file is not declared.
+ *
+ * The sites that need it are the ones which build the operand pointer BY
+ * HAND -- tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(...)) -- where
+ * an address computed from tcg_env is not a read of the bytes it addresses.
+ * The gvec constructors do not need it: they pass OFFSETS and the gvec
+ * machinery states each operand's direction, so those reads already reach
+ * the ordered list.
+ */
+static void note_sve_vec_read(DisasContext *s, int z)
+{
+    insn_dataflow_note_stated_read_env(vec_full_reg_offset(s, z),
+                                       vec_full_reg_size(s));
+}
+
 /* Invoke an out-of-line helper on 4 Zregs, 1 Preg, plus fpst. */
 static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
                                 int rd, int rn, int rm, int ra, int pg,
@@ -550,6 +574,15 @@ static bool do_mov_z(DisasContext *s, int rd, int rn)
 {
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+
+        /*
+         * The SOURCE vector.  tcg_gen_gvec_mov() emits NOTHING when the two
+         * offsets are equal, so the fold arms that reach here with rd == rn
+         * -- `sqinch zdn, all, mul #0` and its siblings, where the increment
+         * is zero -- leave no op to read.  The register the encoding names
+         * is not the emulator's to drop (R7.3).
+         */
+        note_sve_vec_read(s, rn);
         tcg_gen_gvec_mov(MO_8, vec_full_reg_offset(s, rd),
                          vec_full_reg_offset(s, rn), vsz, vsz);
     }
@@ -939,6 +972,7 @@ static bool do_vpz_ool(DisasContext *s, arg_rpr_esz *a,
     t_pg = tcg_temp_new_ptr();
 
     note_sve_pred_read(a->pg);
+    note_sve_vec_read(s, a->rn);
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     fn(temp, t_zn, t_pg, desc);
@@ -1927,6 +1961,8 @@ static void do_sat_addsub_vec(DisasContext *s, int esz, int rd, int rn,
     TCGv_i32 t32, desc;
     TCGv_i64 t64;
 
+    note_sve_vec_read(s, rn);
+
     dptr = tcg_temp_new_ptr();
     nptr = tcg_temp_new_ptr();
     tcg_gen_addi_ptr(dptr, tcg_env, vec_full_reg_offset(s, rd));
@@ -2174,6 +2210,7 @@ static void do_cpy_m(DisasContext *s, int esz, int rd, int rn, int pg,
     TCGv_ptr t_pg = tcg_temp_new_ptr();
 
     note_sve_pred_read(pg);
+    note_sve_vec_read(s, rn);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
@@ -2323,6 +2360,7 @@ static void do_insr_i64(DisasContext *s, arg_rrr_esz *a, TCGv_i64 val)
     TCGv_ptr t_zd = tcg_temp_new_ptr();
     TCGv_ptr t_zn = tcg_temp_new_ptr();
 
+    note_sve_vec_read(s, a->rn);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
 
@@ -2637,6 +2675,16 @@ static TCGv_i64 load_last_active(DisasContext *s, TCGv_i32 last,
         tcg_gen_xori_i32(last, last, 8 - (1 << esz));
     }
 #endif
+    /*
+     * THE VECTOR THE ELEMENT COMES OUT OF.  The load below is at a RUNTIME
+     * index -- tcg_env plus the last-active element's byte offset, with the
+     * register base folded into the load's displacement -- so the walk sees
+     * an env access it cannot bound to a register and states nothing.  Which
+     * register is read is an encoding field and is in hand right here.
+     * CLASTA/CLASTB/LASTA/LASTB are the whole class.
+     */
+    note_sve_vec_read(s, rm);
+
     tcg_gen_ext_i32_ptr(p, last);
     tcg_gen_add_ptr(p, p, tcg_env);
 
@@ -2668,6 +2716,15 @@ static bool do_clast_vector(DisasContext *s, arg_rprr_esz *a, bool before)
     if (!before) {
         incr_last_active(s, last, esz);
     }
+
+    /*
+     * Zdn is a SOURCE as well: when the predicate has no active element the
+     * destination keeps its value, and R16 has a conditional carrying every
+     * potential source.  QEMU's `if (a->rd != a->rn)` branch below is the
+     * MOVPRFX case and emits the move only there, so on the ordinary
+     * `clasta zdn, pg, zdn, zm` encoding nothing reads it.
+     */
+    note_sve_vec_read(s, a->rn);
 
     ele = load_last_active(s, last, a->rm, esz);
 
@@ -2884,6 +2941,8 @@ static bool do_ppzz_flags(DisasContext *s, arg_rprr_esz *a,
     pg = tcg_temp_new_ptr();
 
     note_sve_pred_read(a->pg);
+    note_sve_vec_read(s, a->rn);
+    note_sve_vec_read(s, a->rm);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(zm, tcg_env, vec_full_reg_offset(s, a->rm));
@@ -2958,6 +3017,7 @@ static bool do_ppzi_flags(DisasContext *s, arg_rpri_esz *a,
     pg = tcg_temp_new_ptr();
 
     note_sve_pred_read(a->pg);
+    note_sve_vec_read(s, a->rn);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(pg, tcg_env, pred_full_reg_offset(s, a->pg));
@@ -3754,6 +3814,7 @@ static bool do_reduce(DisasContext *s, arg_rpr_esz *a,
     t_pg = tcg_temp_new_ptr();
 
     note_sve_pred_read(a->pg);
+    note_sve_vec_read(s, a->rn);
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
@@ -3902,6 +3963,7 @@ static bool trans_FADDA(DisasContext *s, arg_rprr_esz *a)
     t_rm = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
     note_sve_pred_read(a->pg);
+    note_sve_vec_read(s, a->rm);
     tcg_gen_addi_ptr(t_rm, tcg_env, vec_full_reg_offset(s, a->rm));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     t_fpst = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
@@ -4001,6 +4063,7 @@ static void do_fp_scalar(DisasContext *s, int zd, int zn, int pg, bool is_fp16,
     t_zn = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
     note_sve_pred_read(pg);
+    note_sve_vec_read(s, zn);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, zd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, zn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));

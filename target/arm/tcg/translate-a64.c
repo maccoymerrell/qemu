@@ -4426,6 +4426,31 @@ static bool trans_LD_single(DisasContext *s, arg_ldst_single *a)
     clean_addr = gen_mte_checkN(s, tcg_rn, false, a->p || a->rn != 31,
                                 total, mop);
 
+    /*
+     * THE DESTINATION REGISTERS, WHICH THIS FORM ALSO READS.
+     *
+     * `ld1 {v0.b}[3], [x0]` replaces ONE ELEMENT and leaves every other bit
+     * of V0 as it was, so the architecture reads the register it writes --
+     * a merging write, and R17's value-read test says a partial write reads
+     * itself when it merges.  Nothing in the op stream says so: do_vec_ld()
+     * stores into the element slot and the preservation of the rest is a
+     * property of the STORAGE, not of an op.  LLVM states the same fact as
+     * a tied operand on these forms.
+     *
+     * ONE STATEMENT PER REGISTER THE ENCODING NAMES, by the same `(rt + xs)
+     * % 32` wrap the loop below uses -- LD2/LD3/LD4 name two, three or four,
+     * and the list wraps.  The range is the whole 16-byte V register: the
+     * lane written is one element of it and every other byte is the source.
+     *
+     * The REPLICATING form (trans_LD_single_repl) is deliberately not given
+     * this: `ld1r` fills the register outright and reads nothing of it.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    for (xs = 0, rt = a->rt; xs < a->selem; xs++, rt = (rt + 1) % 32) {
+        insn_dataflow_note_stated_read_env(vec_full_reg_offset(s, rt), 16);
+    }
+
     tcg_ebytes = tcg_constant_i64(1 << a->scale);
     for (xs = 0, rt = a->rt; xs < a->selem; xs++, rt = (rt + 1) % 32) {
         do_vec_ld(s, rt, a->index, clean_addr, mop);
@@ -5443,6 +5468,28 @@ static bool trans_TBL_TBX(DisasContext *s, arg_TBL_TBX *a)
 {
     if (fp_access_check(s)) {
         int len = (a->len + 1) * 16;
+
+        /*
+         * THE TABLE, which is `len / 16` consecutive vector registers
+         * starting at Vn and wrapping at 32.  The encoding names them and
+         * the emitter folds the FIRST one into the descriptor's low bits
+         * (`| a->rn` below) and reconstructs the rest inside the helper, so
+         * QEMU's read list names none of them -- exactly the descriptor
+         * shape a76f8026d6 states its SVE data vectors under.  Vm carries
+         * the indices and is passed as an offset, so it is already read.
+         *
+         * TBX also reads its destination, whose elements survive an
+         * out-of-range index; the read list is a set, so `tbx v0,{v0},v1`
+         * naming V0 once is the whole fact.
+         */
+        for (int i = 0; i < len / 16; i++) {
+            insn_dataflow_note_stated_read_env(
+                vec_full_reg_offset(s, (a->rn + i) % 32), 16);
+        }
+        if (a->tbx) {
+            insn_dataflow_note_stated_read_env(
+                vec_full_reg_offset(s, a->rd), a->q ? 16 : 8);
+        }
 
         tcg_gen_gvec_2_ptr(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rm), tcg_env,

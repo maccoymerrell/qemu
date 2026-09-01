@@ -2638,6 +2638,25 @@ illegal:
  */
 #include "prefetch_ident.c.inc"
 
+/*
+ * THE WHOLE 3DNow! INSTRUCTION SET SHARES ONE ROW.  Its opcode byte
+ * comes AFTER the modrm byte and any displacement, so the table cannot
+ * index on it and [0x0f] models it as an immediate -- one slot, one
+ * identity, for twenty-four instructions that are an add, a compare, a
+ * multiply and two conversions among them.
+ *
+ * The discriminator is not missing: gen_3dnow() reads decode->immediate
+ * and indexes fns_3dnow[] with it, and decode_insn() has recorded that
+ * immediate before the row is published.
+ *
+ * scripts/x86_3dnow_ident_instrument.py states the finer identity, one
+ * row per arm, every arm read out of fns_3dnow[] itself.  THE BASE ROW
+ * DOES NOT MOVE: no X86_OP_* row is edited and no line is inserted above
+ * one, so every slot keeps its number, and an immediate that indexes no
+ * arm keeps the row's own id and name bit for bit.
+ */
+#include "threednow_ident.c.inc"
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2951,6 +2970,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     cet_ident_publish(decode.e.slot,
                       (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
     prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
+    threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

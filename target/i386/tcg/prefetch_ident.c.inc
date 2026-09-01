@@ -32,7 +32,7 @@
  * THE BASE ROWS DO NOT MOVE.  decode-new.c.inc is not
  * edited apart from the one inserted call, which sits below
  * every X86_OP_* site in the file (last site line 1932, call
- * line 2952) so no slot is renumbered.  An encoding that
+ * line 2971) so no slot is renumbered.  An encoding that
  * reaches no arm -- every reserved NOP of the [0x18] group,
  * every mod=11 form -- publishes nothing here and keeps the
  * row's own id and name bit for bit.
@@ -44,10 +44,10 @@
  * state a hint the decoder this tree links against does not
  * name, so those encodings keep the base NOP row.
  *
- * EXHAUSTIVE, not sampled: 772096 (slot, modrm) pairs -- every
+ * EXHAUSTIVE, not sampled: 777216 (slot, modrm) pairs -- every
  * __LINE__ this file can hand out, times all 256 modrm
  * bytes -- checked against the selector below.  168 reach a
- * qualified identity, 771928 do not, no pair reaches two, and
+ * qualified identity, 777048 do not, no pair reaches two, and
  * every arm is reachable.
  */
 

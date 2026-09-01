@@ -5591,6 +5591,19 @@ X86_IDENT_CET = "target/i386/tcg/cet_ident.c.inc"
 # rows use.
 X86_IDENT_PREFETCH = "target/i386/tcg/prefetch_ident.c.inc"
 
+# THE WHOLE 3DNow! SET SHARES ONE ROW.  Its opcode byte comes AFTER the
+# modrm byte and any displacement, so QEMU's table cannot index on it and
+# models it as an immediate: [0x0f] = X86_OP_ENTRY3(3dnow, P,q, Q,q, I,b).
+# One slot answers for twenty-four instructions -- `pfadd`, `pfsub`,
+# `pfmul`, `pfcmpge`, `pi2fd`, `pf2id`, `pavgusb`, `pmulhrw` and the rest
+# -- and the only word the row offers is the placeholder `3dnow`, which
+# classifies an add, a compare, a multiply and two conversions the same.
+# scripts/x86_3dnow_ident_instrument.py states the finer identity from
+# `decode->immediate`, every arm read out of gen_3dnow's own fns_3dnow[];
+# the rows are read here by the same reader the VEX, CET and prefetch rows
+# use.
+X86_IDENT_3DNOW = "target/i386/tcg/threednow_ident.c.inc"
+
 # THE UNCONVERTED 0F SPACES SHARE FIVE ROWS BETWEEN FORTY-ONE
 # INSTRUCTIONS.  0F 00, 0F 01, 0F 1A, 0F 1B and the 0F C7 group are not
 # converted to the new decoder, so each is one X86_OP_ENTRY(multi0F, ...)
@@ -5777,6 +5790,7 @@ def parse_x86_identities() -> list[QemuIdent]:
                  + parse_x86_vex_identities(rows)
                  + parse_x86_cet_identities(rows)
                  + parse_x86_prefetch_identities(rows)
+                 + parse_x86_3dnow_identities(rows)
                  + parse_x86_multi0f_identities())
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
@@ -5980,6 +5994,51 @@ def parse_x86_prefetch_identities(base: list[QemuIdent]) -> list[QemuIdent]:
             f"{path}: no identity rows matched -- the reader does not fit "
             f"this table, and reporting an empty universe would read as "
             f"'the prefetch groups carry only a NOP'")
+    return rows
+
+
+def parse_x86_3dnow_identities(base: list[QemuIdent]) -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED arms of the row the whole 3DNow! set shares.
+
+    Same shape and the same checks as parse_x86_prefetch_identities(): the
+    row's provenance names the base slot, the base row's macro suffix
+    supplies the kind, and a carve whose slot no longer exists or now
+    names a different rule is REFUSED rather than aged out.
+    """
+    path = ROOT / X86_IDENT_3DNOW
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_3dnow_ident_instrument.py.  Without it the whole "
+            f"3DNow! set reports as one rule named `3dnow`, which is the "
+            f"class of none of its twenty-four instructions.")
+    by_slot = {r.ident: r for r in base}
+    rows: list[QemuIdent] = []
+    stale: list[str] = []
+    for r in _read_qualified_table(path, ""):
+        b = by_slot.get(r.src_line)
+        if b is None:
+            stale.append(f"{r.name}: base slot {r.src_line} carries no "
+                         f"X86_OP_* row")
+            continue
+        if b.name != r.pattern:
+            stale.append(f"{r.name}: base slot {r.src_line} now names "
+                         f"{b.name!r}")
+            continue
+        rows.append(dataclasses.replace(r, kind=b.kind))
+    if stale:
+        for why in stale:
+            print(f"  STALE 3DNOW ROW {why}")
+        raise SystemExit(
+            f"x86: {len(stale)} 3DNow!-qualified row(s) no longer match the "
+            f"decode table they were carved from -- re-run "
+            f"scripts/x86_3dnow_ident_instrument.py rather than joining an "
+            f"old carve to a new rule")
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'gen_3dnow has no internal dispatch'")
     return rows
 
 

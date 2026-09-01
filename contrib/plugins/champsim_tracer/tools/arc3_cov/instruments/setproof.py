@@ -70,6 +70,131 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import _arc3lib as L  # noqa: E402
 
 
+# --------------------------------------------------------------------------
+# THE RELOCATION JOIN (#334, exec97 FINDING 49-B)
+#
+# The join is on the ABSOLUTE guest pc, and a guest's high mapping is not a
+# fixed address.  Measured at PASS 49: `qemu-x86_64` grew by ~3,100 lines of
+# target/i386 and the guest's ld.so/libc mapping moved DOWN exactly 2 MiB,
+# so 4,497 of the baseline's 13,327 pcs had no partner in the after arm and
+# 4,497 of the after arm's had none in the baseline.  Every one of them fell
+# into floor(pc-only-one-arm), which is EXCLUDED from every verdict -- so the
+# compared population collapsed 414,138 -> 356,163 facts, a third of the
+# subject went unlooked-at, and REAL-LOST=0 read exactly as green as before.
+#
+# It is NOT the env block (#327): an env-padding sweep from 0 to 16,384 bytes
+# never moved the mapping and an `env -i` re-run reproduced the shifted
+# address.  What moves is the emulator binary, which any wave can do.
+#
+# THE DELTA IS DISCOVERED, NEVER ASSUMED.  Nothing here knows about 0x200000.
+# The candidate set is built out of the two arms' own unmatched pcs, every
+# candidate is scored by how many pcs it actually joins, and a candidate is
+# accepted only if it is page-aligned and joins at least MIN_RELOC_HIT of the
+# smaller unmatched set.  A wave that genuinely moved code -- where the
+# unmatched pcs do NOT share one offset -- finds no delta and gets the old
+# behaviour, which is the floor plus the coverage refusal below.
+#
+# AND IT CANNOT CREATE A PASS.  Rebasing only renames a baseline pc to a pc
+# the after arm already has; it never invents a key, never merges two keys,
+# and refuses outright if a rebased pc would collide with one the baseline
+# already carries.  A family that really disappeared at a relocated pc scores
+# REAL-LOST after the rebase, where before the rebase it scored nothing at
+# all -- the join makes the instrument STRICTER, which is the direction a
+# repair to a coverage hole has to go.
+
+# A relocation is a mapping move, so it is page-aligned.  A "delta" that is
+# not is two unrelated addresses that happened to differ by it.
+RELOC_ALIGN = 0x1000
+# The share of the smaller unmatched set one delta must join before it is
+# called a relocation.  Below this the unmatched pcs do not share an offset
+# and the honest answer is that coverage collapsed, not that it moved.
+MIN_RELOC_HIT = 0.90
+# How many pcs from each side seed the candidate set.  The candidates are
+# pairwise differences, so this is quadratic; 96 x 96 is 9,216 candidates,
+# every one of them then scored against the WHOLE unmatched set.  A real
+# relocation puts its delta in this set from any two pcs at all, so a sample
+# is sufficient -- and the SCORING is exhaustive, which is where the claim
+# lives.
+RELOC_SEED = 96
+
+
+def _as_int(pc):
+    try:
+        return int(pc, 16) if isinstance(pc, str) else int(pc)
+    except ValueError:
+        return None
+
+
+def find_relocation(a_pcs, b_pcs):
+    """The single constant offset that joins the two arms' unmatched pcs.
+
+    Returns (delta, joined, considered) or None.  @joined is how many
+    baseline-only pcs the delta lands on an after-only pc; @considered is
+    the size of the smaller unmatched set, which is the denominator the
+    MIN_RELOC_HIT threshold is against.
+    """
+    only_a = a_pcs - b_pcs
+    only_b = b_pcs - a_pcs
+    if not only_a or not only_b:
+        return None
+    ia = sorted(x for x in (_as_int(p) for p in only_a) if x is not None)
+    ib = sorted(x for x in (_as_int(p) for p in only_b) if x is not None)
+    if not ia or not ib:
+        return None
+    sb = set(ib)
+    considered = min(len(ia), len(ib))
+    best = None
+    seen = set()
+    for x in ia[:RELOC_SEED]:
+        for y in ib[:RELOC_SEED]:
+            d = y - x
+            if not d or d % RELOC_ALIGN or d in seen:
+                continue
+            seen.add(d)
+            hit = sum(1 for p in ia if p + d in sb)
+            if best is None or hit > best[1]:
+                best = (d, hit)
+    if best is None or best[1] < considered * MIN_RELOC_HIT:
+        return None
+    return best[0], best[1], considered
+
+
+def rebase_keys(a, delta, a_pcs, b_pcs):
+    """Rewrite the baseline's relocated pcs, and nothing else.
+
+    ONLY a pc the baseline has and the after arm does not, whose image under
+    @delta the after arm DOES have, is rewritten.  A pc both arms carry is
+    left alone -- it is not part of the relocated region and rewriting it
+    would move a key off a subject that was being compared correctly.
+
+    Returns (rebased_dict, moved_pcs) or None when a rewrite would collide
+    with a key the baseline already carries.  A collision means the delta
+    folded two distinct pcs onto one, and a fold is a merge: it would compare
+    one instruction's facts against another's and could show either a false
+    CHANGED or a false SAME.  The instrument refuses instead.
+    """
+    only_a = a_pcs - b_pcs
+    moved = {}
+    for p in only_a:
+        v = _as_int(p)
+        if v is None:
+            continue
+        img = "0x%x" % (v + delta)
+        if img in b_pcs:
+            moved[p] = img
+    if not moved:
+        return None
+    images = set(moved.values())
+    if images & a_pcs:
+        return None
+    if len(images) != len(moved):
+        return None
+    out = {}
+    for k, v in a.items():
+        out[(moved.get(k[0], k[0]), k[1])] = v
+    return out, moved
+
+
 def compare(a, b):
     """Score one ISA.  Both sides are known non-empty by the time we get here.
 
@@ -347,7 +472,8 @@ def rename_pairs(lost, gain, a, b):
     return pairs
 
 
-def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None):
+def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None,
+        min_coverage=0.95, no_reloc=False):
     """Returns (exit_code, totals).
 
     @verdicts, when given, is a path to write the per-key verdict file
@@ -374,6 +500,34 @@ def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None):
             if not quiet:
                 print("%-8s NOT SCORED -- vacuity (see below)" % isa)
             continue
+        # THE RELOCATION JOIN, BEFORE ANYTHING IS SCORED.  See
+        # find_relocation(): the delta is discovered from the arms' own
+        # unmatched pcs and is never assumed, and rebasing only renames a
+        # baseline pc onto one the after arm already has.
+        reloc = None
+        if not no_reloc:
+            a_pcs = {k[0] for k in a}
+            b_pcs = {k[0] for k in b}
+            found = find_relocation(a_pcs, b_pcs)
+            if found is not None:
+                delta, joined, considered = found
+                done = rebase_keys(a, delta, a_pcs, b_pcs)
+                if done is None:
+                    reasons.append(
+                        "%s RELOCATION REFUSED: the discovered delta "
+                        "%s0x%x joins %d of %d unmatched pcs but rewriting "
+                        "them would collide with a pc the baseline "
+                        "already carries, which would MERGE two "
+                        "instructions' facts.  Re-capture the baseline at "
+                        "this tip rather than scoring a fold."
+                        % (isa, "-" if delta < 0 else "+", abs(delta),
+                           joined, considered))
+                    if not quiet:
+                        print("%-8s NOT SCORED -- relocation would fold "
+                              "two pcs into one" % isa)
+                    continue
+                a, moved = done
+                reloc = (delta, len(moved), considered)
         common, changed, lost, gain, floor, cov = compare(a, b)
         pairs = rename_pairs(lost, gain, a, b)
         vrows.extend(verdict_rows(isa, a, b))
@@ -386,6 +540,15 @@ def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None):
             # THE COVERAGE, printed BESIDE the verdict and never below
             # it, because the verdict is only about the compared set.
             print("         " + cov_line(isa, cov))
+            if reloc is not None:
+                # NEVER SILENT.  A reading whose subject was rebased is a
+                # different reading from one whose subject was not, and the
+                # delta is part of the number.
+                print("           RELOCATION JOINED: delta %s0x%x rebased "
+                      "%d baseline pc(s) of %d unmatched -- discovered "
+                      "from the arms' own pcs, page-aligned, no fold"
+                      % ("-" if reloc[0] < 0 else "+", abs(reloc[0]),
+                         reloc[1], reloc[2]))
             if pairs:
                 # REPORTED, NEVER SUBTRACTED -- see rename_pairs().
                 ident = sum(1 for p in pairs if p[4])
@@ -403,6 +566,41 @@ def run(before, after, isas, suffix, show=12, quiet=False, verdicts=None):
                     print("     %s %s %s %s" % (tag, k[0], k[1], src[k]))
             for k in changed[:show]:
                 print("     CHANGED %s %s  %s -> %s" % (k[0], k[1], a[k], b[k]))
+        # THE COVERAGE FLOOR, WHICH REFUSES (#334).  Until now the
+        # coverage was PRINTED and nothing gated on it, so a subject that
+        # collapsed -- for any reason, relocation or otherwise -- still
+        # published REAL-LOST=0 as though it had been looked at.  A
+        # verdict about two thirds of a population is not the verdict the
+        # bar is written against, so below the floor the ISA is REFUSED
+        # rather than reported.
+        #
+        # THE DENOMINATOR IS THE BASELINE, and that is the whole design of
+        # the floor.  The reference is what every verdict is against, so
+        # the hole is a pc the reference HAS and this reading did not
+        # look at -- a fact it states that nothing checked.  A pc the
+        # AFTER arm reaches and the baseline does not is the opposite
+        # shape: there is nothing there to have lost, and it is the
+        # ordinary run-to-run drift PASS 34 measured (strncmp's aligned
+        # fast path, executed in one reading and not the next).  Scoring
+        # that as a coverage failure would refuse readings that are
+        # complete, and would train the floor to be turned off.
+        # Both numbers stay on the coverage line either way.
+        base_n = len(cov["baseline_pcs"])
+        share = (len(cov["compared_pcs"]) / base_n) if base_n else 0.0
+        if share < min_coverage:
+            reasons.append(
+                "%s COVERAGE FLOOR: only %d of the baseline's %d pcs "
+                "(%.1f%%) are in both arms, below the %.1f%% floor.  Every "
+                "verdict here would be about the compared set alone, so "
+                "REAL-LOST=0 would be a statement about %.1f%% of the "
+                "reference and would read as one about all of it.  "
+                "Re-capture the baseline at this tip, or lower "
+                "--min-coverage deliberately and say why."
+                % (isa, len(cov["compared_pcs"]), base_n, 100.0 * share,
+                   100.0 * min_coverage, 100.0 * share))
+            if not quiet:
+                print("%-8s NOT SCORED -- coverage floor (see below)" % isa)
+            continue
         tot["common"] += len(common)
         tot["chg"] += len(changed)
         tot["lost"] += len(lost)
@@ -487,7 +685,10 @@ def selftest():
         del floored[("0x1004", "dst_dep")]
         floored[("0x2000", "dst_dep")] = ("RAW=0x9", "NAME=rdx")
         _write(E, "x86_64", floored)
-        rc, tot = run(A, E, ["x86_64"], ".key", quiet=True)
+        # The floor GATE is a separate arm below; this one is about the
+        # floor COLUMN, and a two-pc toy is under any useful floor, so it
+        # is scored with the gate deliberately open and says so.
+        rc, tot = run(A, E, ["x86_64"], ".key", quiet=True, min_coverage=0.0)
         checks.append(("PLANTED build-noise PC scores FLOOR, not REAL-LOST",
                        rc == 0 and tot["lost"] == 0 and tot["gain"] == 0
                        and tot["floor"] == 2,
@@ -588,6 +789,108 @@ def selftest():
         checks.append(("AMBIGUOUS 2-lost/1-gained pairing is DECLINED",
                        tot["lost"] == 2 and tot["renamed"] == 0,
                        "lost=%d renamed=%d" % (tot["lost"], tot["renamed"])))
+
+        # ==================================================================
+        # #334: THE RELOCATION JOIN AND THE COVERAGE FLOOR.
+        #
+        # exec97 FINDING 49-B: the emulator binary grew, the guest's high
+        # mapping moved down exactly 2 MiB, 4,497 pcs lost their partner and
+        # fell into the excluded floor -- and REAL-LOST=0 read as green over
+        # two thirds of the subject.  These arms are that shape, planted.
+        # ==================================================================
+
+        # A whole-region relocation: every pc of the AFTER arm is the
+        # baseline's plus one page-aligned constant.  Without the join the
+        # compared set is EMPTY; with it the verdict is restored to the row.
+        RA = _plant(tmp, "RA", None); RB = _plant(tmp, "RB", None)
+        DELTA = 0x200000
+        # TWO families per pc, so a family can be removed at a pc that
+        # still exists in both arms -- which is the only shape REAL-LOST
+        # is defined on (#212/#214: a pc in one arm only is the floor).
+        reg = {}
+        for i in range(40):
+            pc = "0x%x" % (0x7fff0000 + i * 4)
+            reg[(pc, "dst_dep")] = ("RAW=0x%x" % i, "NAME=r%d" % i)
+            reg[(pc, "store_data_dep")] = ("RAW=0x%x" % (i + 1), "NAME=s%d" % i)
+        moved = {("0x%x" % (int(k[0], 16) + DELTA), k[1]): v
+                 for k, v in reg.items()}
+        _write(RA, "x86_64", reg); _write(RB, "x86_64", moved)
+        rc, tot = run(RA, RB, ["x86_64"], ".key", quiet=True)
+        checks.append(("PLANTED 2 MiB relocation is JOINED, not floored",
+                       rc == 0 and tot["common"] == 80 and tot["lost"] == 0
+                       and tot["floor"] == 0,
+                       "rc=%d common=%d lost=%d floor=%d"
+                       % (rc, tot["common"], tot["lost"], tot["floor"])))
+
+        rc, tot = run(RA, RB, ["x86_64"], ".key", quiet=True,
+                      no_reloc=True, min_coverage=0.0)
+        checks.append(("...and WITHOUT the join the same arms compare NOTHING",
+                       tot["common"] == 0 and tot["floor"] == 160,
+                       "common=%d floor=%d" % (tot["common"], tot["floor"])))
+
+        # A REAL LOSS INSIDE THE RELOCATED REGION IS STILL FOUND.  This is
+        # the arm that says the join makes the instrument stricter: before
+        # it, this row scored nothing at all.
+        RC = _plant(tmp, "RC", None)
+        holed = dict(moved)
+        del holed[("0x%x" % (0x7fff0000 + 4 * 4 + DELTA), "dst_dep")]
+        _write(RC, "x86_64", holed)
+        rc, tot = run(RA, RC, ["x86_64"], ".key", quiet=True)
+        checks.append(("a REAL loss inside the relocated region is REAL-LOST",
+                       tot["lost"] == 1,
+                       "lost=%d common=%d" % (tot["lost"], tot["common"])))
+
+        # A CONTENT CHANGE inside the relocated region is CHANGED, not SAME.
+        RD = _plant(tmp, "RD", None)
+        edited = dict(moved)
+        edited[("0x%x" % (0x7fff0000 + 7 * 4 + DELTA), "dst_dep")] = (
+            "RAW=0xdead", "NAME=rZ")
+        _write(RD, "x86_64", edited)
+        rc, tot = run(RA, RD, ["x86_64"], ".key", quiet=True)
+        checks.append(("a content change inside the relocated region is CHANGED",
+                       tot["chg"] == 1 and tot["lost"] == 0,
+                       "changed=%d lost=%d" % (tot["chg"], tot["lost"])))
+
+        # NO RELOCATION, NO REBASE.  Two arms that share their pcs must not
+        # acquire a delta out of the floor's own noise.
+        rc, tot = run(A, A, ["x86_64"], ".key", quiet=True)
+        checks.append(("identical arms discover NO relocation",
+                       rc == 0 and tot["common"] == 3,
+                       "rc=%d common=%d" % (rc, tot["common"])))
+
+        # AN UNALIGNED OFFSET IS NOT A RELOCATION.  Same shape, a delta of
+        # 0x101 -- code that genuinely moved, not a mapping that did.
+        RE = _plant(tmp, "RE", None)
+        skewed = {("0x%x" % (int(k[0], 16) + 0x101), k[1]): v
+                  for k, v in reg.items()}
+        _write(RE, "x86_64", skewed)
+        rc, tot = run(RA, RE, ["x86_64"], ".key", quiet=True, min_coverage=0.0)
+        checks.append(("an UNALIGNED offset is NOT joined as a relocation",
+                       tot["common"] == 0,
+                       "common=%d" % tot["common"]))
+
+        # THE COVERAGE FLOOR REFUSES.  Same arms, join disabled: the subject
+        # collapses to nothing and the instrument must say so rather than
+        # publish REAL-LOST=0 over it.
+        rc, tot = run(RA, RB, ["x86_64"], ".key", quiet=True, no_reloc=True)
+        checks.append(("a COLLAPSED subject REFUSES instead of scoring 0",
+                       rc == 2 and tot["scored"] == 0,
+                       "rc=%d scored=%d lost=%d"
+                       % (rc, tot["scored"], tot["lost"])))
+
+        # ...and the floor is a THRESHOLD, not a switch: a subject just
+        # above it scores.
+        RF = _plant(tmp, "RF", None)
+        nearly = dict(reg)
+        del nearly[("0x%x" % (0x7fff0000 + 3 * 4), "dst_dep")]
+        nearly[("0x60000000", "dst_dep")] = ("RAW=0x0", "NAME=rQ")
+        _write(RF, "x86_64", nearly)
+        rc, tot = run(RA, RF, ["x86_64"], ".key", quiet=True,
+                      min_coverage=0.90)
+        checks.append(("a subject just ABOVE the floor still scores",
+                       rc == 0 and tot["scored"] == 1,
+                       "rc=%d scored=%d compared=%d"
+                       % (rc, tot["scored"], tot["compared_pcs"])))
 
         # ==================================================================
         # PASS 34, F-B: THE COVERAGE ARMS.  A reading must state what it
@@ -755,6 +1058,15 @@ def main():
                     help="write the per-key verdict file --compare reads")
     ap.add_argument("--compare", nargs=2, metavar=("A.tsv", "B.tsv"),
                     help="compare two verdict files at MATCHED coverage")
+    ap.add_argument("--min-coverage", type=float, default=0.95,
+                    help="REFUSE an ISA whose compared pcs are below this "
+                         "share of the wider arm (default 0.95).  The "
+                         "verdict is only about the compared set, so a "
+                         "collapsed subject must refuse, not report.")
+    ap.add_argument("--no-relocation-join", action="store_true",
+                    help="score on absolute pcs only, without discovering a "
+                         "mapping relocation.  For measuring what the join "
+                         "is worth; never for a verdict.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -767,7 +1079,9 @@ def main():
         L.die_usage("usage: setproof.py <before-dir> <after-dir> "
                     "[--isas ...] [--suffix .key|.dkey]")
     rc, _ = run(args.before, args.after, args.isas.split(","), args.suffix,
-                show=args.show, verdicts=args.verdicts)
+                show=args.show, verdicts=args.verdicts,
+                min_coverage=args.min_coverage,
+                no_reloc=args.no_relocation_join)
     return rc
 
 

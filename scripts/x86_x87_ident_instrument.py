@@ -238,7 +238,12 @@ def scan_switch(lines, clean, open_idx, end_idx):
                     if lab is None:
                         cur['has_default'] = True
                     else:
-                        cur['labels'].append(lab)
+                        # The LINE is part of the label.  A group's labels
+                        # are spread over several lines and each line
+                        # carries QEMU's own word for the values on it --
+                        # reading only the group's first comment names
+                        # `flds` for fsts, fstps, fildl and eleven more.
+                        cur['labels'].append((lab, i))
                 cur['end'] = i
                 i += 1
                 continue
@@ -312,7 +317,10 @@ def model(path_c):
                          '%d -- the model does not fit this source'
                          % len(tops))
 
-    leaves = []          # (mem, op, rm_or_None, why)
+    # QEMU's own naming of the arithmetic families, read once: the
+    # `fxxx` leaves resolve through it and nothing else in the file does.
+    arith = arith_dispatch_maps(lines, clean)
+    leaves = []          # (mem, op, rm_or_None, why, line, word, wsrc)
     residue = []
     for which, open_idx in enumerate(tops):
         mem = (which == 0)
@@ -328,16 +336,10 @@ def model(path_c):
                                 'top-level default shares a group with a '
                                 'case label'))
                 continue
-            ops = []
-            bad = False
-            for lab in g['labels']:
-                vals = label_values(lab)
-                if vals is None:
-                    residue.append((g['start'] + 1, 'label %r' % lab))
-                    bad = True
-                    break
-                ops.extend(vals)
-            if bad:
+            ops = expand_labels(lines, g['labels'])
+            if ops is None:
+                residue.append((g['start'] + 1,
+                                'a label this model cannot expand'))
                 continue
             if is_illegal_only(lines, clean, g['body']):
                 continue
@@ -345,51 +347,265 @@ def model(path_c):
             gline = g['start'] + 1
             rmsw = inner_rm_switch(lines, clean, g['body'])
             if rmsw is None:
-                for o in ops:
-                    leaves.append((mem, o, None, why, gline))
+                for o, ow in ops:
+                    word, wsrc, bad = leaf_word(lines, clean, o,
+                                                ow or why, g['body'], arith)
+                    if bad:
+                        residue.append((gline, bad))
+                    leaves.append((mem, o, None, ow or why, gline,
+                                   word, wsrc))
                 continue
             if len(ops) != 1:
                 residue.append((g['start'] + 1,
                                 'a `switch (rm)` group covers %d op values; '
                                 'the model keys rm per op' % len(ops)))
                 continue
+            op0, op0w = ops[0]
             _, rgroups, _ = scan_switch(lines, clean, rmsw, g['body'][1])
             taken = set()
             defgroup = None
             for rg in rgroups:
-                rms = []
-                bad = False
-                for lab in rg['labels']:
-                    vals = label_values(lab)
-                    if vals is None:
-                        residue.append((rg['start'] + 1, 'rm label %r' % lab))
-                        bad = True
-                        break
-                    rms.extend(vals)
-                if bad:
+                rms = expand_labels(lines, rg['labels'])
+                if rms is None:
+                    residue.append((rg['start'] + 1,
+                                    'an rm label this model cannot expand'))
                     continue
                 if rg['has_default']:
                     defgroup = (rg, rms)
-                    taken.update(rms)
+                    taken.update(r for r, _ in rms)
                     continue
-                taken.update(rms)
+                taken.update(r for r, _ in rms)
                 if is_illegal_only(lines, clean, rg['body']):
                     continue
                 rwhy = comment_of(lines, rg['start'])
-                for r in rms:
-                    leaves.append((mem, ops[0], r, rwhy or why,
-                                   rg['start'] + 1))
+                for r, rw in rms:
+                    # The WORD may only come from the rm level.  A group
+                    # comment (`grp d9/5`, `df/4`) names the DISPATCH the
+                    # leaves hang off, not any of them, and reading it
+                    # would give seven leaves one word that is not an
+                    # instruction at all.
+                    w = rw or rwhy
+                    word, wsrc, bad = leaf_word(lines, clean, op0, w,
+                                                rg['body'], arith)
+                    w = w or op0w or why
+                    if bad:
+                        residue.append((rg['start'] + 1, bad))
+                    leaves.append((mem, op0, r, w, rg['start'] + 1,
+                                   word, wsrc))
             if defgroup is not None:
                 rg, rms = defgroup
                 if is_illegal_only(lines, clean, rg['body']):
                     continue
                 rwhy = comment_of(lines, rg['start'])
+                named = dict(rms)
                 for r in range(8):
-                    if r in taken and r not in rms:
+                    if r in taken and r not in named:
                         continue
-                    leaves.append((mem, ops[0], r, rwhy or why,
-                                   rg['start'] + 1))
+                    w = named.get(r) or rwhy
+                    word, wsrc, bad = leaf_word(lines, clean, op0, w,
+                                                rg['body'], arith)
+                    w = w or op0w or why
+                    if bad:
+                        residue.append((rg['start'] + 1, bad))
+                    leaves.append((mem, op0, r, w, rg['start'] + 1,
+                                   word, wsrc))
     return lines, leaves, residue
+
+
+def expand_labels(lines, labels):
+    """[(value, QEMU's own word for it)] over a group's case labels.
+
+       ONE WORD PER LINE, and positionally where the line covers several
+       values.  `case 0x18 ... 0x1b: /* fildl, fisttpl, fistl, fistpl */`
+       is four values and a comment naming four instructions in order,
+       which is QEMU writing one word per value; a comment whose comma
+       count does not match the label's span is prose about the family
+       (`fxxx st, sti`) and stands for all of them.
+    """
+    out = []
+    for lab, li in labels:
+        vals = label_values(lab)
+        if vals is None:
+            return None
+        parts = [w.strip() for w in comment_of(lines, li).split(',')]
+        parts = [w for w in parts if w]
+        if len(parts) == len(vals) and len(vals) > 1:
+            out.extend(zip(vals, parts))
+        else:
+            whole = comment_of(lines, li)
+            out.extend((v, whole) for v in vals)
+    return out
+
+
+# A family word: QEMU writes the operation as a run of `x` because the
+# switch it is on does not distinguish them -- `fxxxs`, `fixxxl`,
+# `fxxxp sti, st`, `fcmovxx`.  The word is a placeholder and may not be
+# classified as one.
+PLACEHOLDER_RE = re.compile(r'xx+')
+
+# The operand-form suffixes QEMU appends to an x87 helper's name.  They
+# say where the operands come from, not what the operation is:
+# `fadd_ST0_FT0` and `fadd_STN_ST0` are one operation written twice.
+HELPER_FORMS = ('ST0', 'FT0', 'STN')
+
+HELPER_CALL_RE = re.compile(r'\bgen_helper_([A-Za-z0-9_]+)\s*\(')
+ARITH_CALL_RE = re.compile(r'\bgen_helper_(fp_arith_[A-Za-z0-9_]+)\s*\(')
+IF_OP_RE = re.compile(
+    r'^if\s*\(\s*op\s*(>=|<=|==|!=|>|<)\s*(0x[0-9a-fA-F]+|\d+)\s*\)\s*\{$')
+ELSE_RE = re.compile(r'^\}\s*else\s*\{$')
+
+
+def helper_stem(name):
+    """An x87 helper's name with its operand-form suffix peeled."""
+    parts = name.split('_')
+    while len(parts) > 1 and parts[-1] in HELPER_FORMS:
+        parts.pop()
+    return '_'.join(parts)
+
+
+def op_reachable(clean, span, op):
+    """The lines of a leaf body this OP value actually reaches.
+
+       gen_x87 folds three architectural forms into one group and splits
+       them again with `if (op >= 0x20)`, so which helper a leaf emits is
+       a function of its own op.  The guard is read rather than guessed:
+       only `if (op <rel> <constant>)` is understood, every other brace is
+       carried through unchanged, and a body whose guards this cannot read
+       simply yields all its lines -- which the caller then refuses if it
+       leaves the operation ambiguous.
+    """
+    frames = []          # [open_depth, active, is_op_if, parent_active, cond]
+    depth = 0
+    out = []
+    for i in range(span[0], span[1] + 1):
+        st = clean[i].strip()
+        if (ELSE_RE.match(st) and frames
+                and frames[-1][0] == depth - 1 and frames[-1][2]):
+            f = frames[-1]
+            f[4] = not f[4]
+            f[1] = f[3] and f[4]
+            continue
+        active = all(f[1] for f in frames)
+        m = IF_OP_RE.match(st)
+        if m:
+            k = int(m.group(2), 0)
+            rel = m.group(1)
+            cond = {'>=': op >= k, '<=': op <= k, '==': op == k,
+                    '!=': op != k, '>': op > k, '<': op < k}[rel]
+            frames.append([depth, active and cond, True, active, cond])
+            depth += 1
+            continue
+        if active:
+            out.append(clean[i])
+        nd = depth + st.count('{') - st.count('}')
+        if nd > depth:
+            for _ in range(nd - depth):
+                frames.append([depth, active, False, active, True])
+        elif nd < depth:
+            while frames and frames[-1][0] >= nd:
+                frames.pop()
+        depth = nd
+    return out
+
+
+def arith_dispatch_maps(lines, clean):
+    """QEMU's own naming of the x87 arithmetic ops, per dispatch function.
+
+       `gen_helper_fp_arith_ST0_FT0(op & 7)` and its STN_ST0 twin are
+       where the `fxxx` families resolve: each is a switch over the same
+       three bits naming one helper per value, in QEMU's source, and that
+       naming is the statement the family leaves are short of.
+    """
+    out = {}
+    for i, l in enumerate(lines):
+        if not l.startswith('static void gen_helper_fp_arith_'):
+            continue
+        fname = l[len('static void gen_helper_'):].split('(')[0]
+        depth = 0
+        seen = False
+        table = {}
+        cur = []
+        for j in range(i, len(lines)):
+            c = clean[j]
+            labs = line_labels(c)
+            if labs is not None and depth == 2:
+                cur = [int(v, 0) for v in labs if v and CONST_RE.match(v)]
+            else:
+                m = HELPER_CALL_RE.search(c)
+                if m and cur:
+                    for v in cur:
+                        table[v] = helper_stem(m.group(1))
+                    cur = []
+            depth += c.count('{') - c.count('}')
+            if c.count('{'):
+                seen = True
+            if seen and depth == 0:
+                break
+        out[fname] = table
+    return out
+
+
+def leaf_word(lines, clean, op, why, body, arith):
+    """QEMU's own word for one dispatch leaf, and where it came from.
+
+       Three sources, and nothing else is offered:
+
+         label    the comment on the leaf's own `case` line.
+         arith    where that word carries an `x` placeholder, the operation
+                  the `gen_helper_fp_arith_*` dispatch the leaf reaches
+                  names for `op & 7` -- QEMU resolving its own family.
+                  A placeholder whose leaf reaches no such dispatch is a
+                  family the switch does not split at all (`fcmovxx` is
+                  one operation under sixteen conditions), and the
+                  placeholder is dropped rather than resolved.
+         helper   where the leaf has no comment, the operation helper its
+                  body emits, form suffix peeled.  QEMU names the
+                  operation last and stages its operands before it.
+
+       Returns (word, source, refusal) -- refusal non-empty means the leaf
+       states nothing, which the caller turns into a build error.
+    """
+    first = why.split(',')[0].strip().split()
+    word = first[0].lower() if first else ''
+    if word and not PLACEHOLDER_RE.search(word):
+        return word, 'label', ''
+    body_lines = op_reachable(clean, body, op)
+    if word:
+        names = set()
+        for c in body_lines:
+            for m in ARITH_CALL_RE.finditer(c):
+                names.add(m.group(1))
+        if len(names) > 1:
+            return '', 'arith', (
+                'leaf op=0x%02x reaches %d fp_arith dispatches (%s); the '
+                'family word %r cannot be resolved'
+                % (op, len(names), ', '.join(sorted(names)), word))
+        if names:
+            fname = names.pop()
+            table = arith.get(fname)
+            if table is None:
+                return '', 'arith', (
+                    'leaf op=0x%02x calls gen_helper_%s, which this model '
+                    'did not parse' % (op, fname))
+            stem = table.get(op & 7)
+            if stem is None:
+                return '', 'arith', (
+                    'gen_helper_%s names no operation for op & 7 = %d'
+                    % (fname, op & 7))
+            return stem, 'arith', ''
+        stripped = PLACEHOLDER_RE.sub('', word)
+        if not stripped:
+            return '', 'arith', (
+                'leaf op=0x%02x has the family word %r and reaches no '
+                'fp_arith dispatch' % (op, word))
+        return stripped, 'family', ''
+    stems = [helper_stem(m.group(1))
+             for c in body_lines for m in HELPER_CALL_RE.finditer(c)]
+    if not stems:
+        return '', 'helper', (
+            'leaf op=0x%02x carries no comment and emits no helper -- '
+            'nothing in the source names it' % op)
+    return stems[-1], 'helper', ''
 
 
 def comment_of(lines, idx):
@@ -485,7 +701,7 @@ def build(path_c, path_dec, path_inc, report):
 
     rows = []
     byname = {}
-    for (mem, op, rm, why, gline) in ordered:
+    for (mem, op, rm, why, gline, word, wsrc) in ordered:
         bits = bits_of(mem, op, rm)
         name = 'decode-new/x87@' + bits
         if name in byname:
@@ -493,17 +709,19 @@ def build(path_c, path_dec, path_inc, report):
                   file=sys.stderr)
             return 1
         byname[name] = True
-        rows.append((name, fnv1a32(name), bits, mem, op, rm, why, gline))
+        rows.append((name, fnv1a32(name), bits, mem, op, rm, why, gline,
+                     word, wsrc))
 
     byhash = {}
-    for (name, h, _, _, _, _, _, _) in rows:
+    for row in rows:
+        name, h = row[0], row[1]
         if h in byhash:
             print('ERROR: decode identity hash collision between %s and %s'
                   % (byhash[h], name), file=sys.stderr)
             return 1
         byhash[h] = name
     slots = read_slot_universe(path_dec)
-    clash = [(n, h) for (n, h, _, _, _, _, _, _) in rows if h in slots]
+    clash = [(r[0], r[1]) for r in rows if r[1] in slots]
     if clash:
         for (n, h) in clash:
             print('ERROR: %s hashes to 0x%08x, which is also a '
@@ -516,7 +734,7 @@ def build(path_c, path_dec, path_inc, report):
     # what makes the memory rows' `..` mod field honest rather than a
     # claim: the ordering is measured over all 2048, not asserted.
     want = {}
-    for (mem, op, rm, _, _) in leaves:
+    for (mem, op, rm, _, _, _, _) in leaves:
         b = 0xD8 | ((op >> 3) & 7)
         for modrm in range(256):
             m_mod = (modrm >> 6) & 3
@@ -572,6 +790,26 @@ def build(path_c, path_dec, path_inc, report):
             ' * 32 of that name, the derivation scripts/decodetree.py uses,\n'
             ' * so every identity in this tree is made the same way.\n'
             ' *\n'
+            ' * THE PROVENANCE LINE CARRIES QEMU\'S OWN WORD for the\n'
+            ' * leaf, because the leaf has no other name: every one of\n'
+            ' * these rules is spelled `x87` in the decode table, and the\n'
+            ' * `case` line inside gen_x87 is where the instruction is\n'
+            ' * named.  `word=<w>(<where>)`, and <where> is one of three:\n'
+            ' *   label   the comment on the leaf\'s OWN case line, read\n'
+            ' *           positionally where one line covers several\n'
+            ' *           values and names one instruction per value.\n'
+            ' *   arith   where that comment carries an `x` placeholder,\n'
+            ' *           the operation gen_helper_fp_arith_ST0_FT0 or\n'
+            ' *           _STN_ST0 names for this leaf\'s `op & 7` -- QEMU\n'
+            ' *           resolving its own family, with the `if (op >=\n'
+            ' *           0x20)` guard read rather than guessed.\n'
+            ' *   helper  where the leaf has no comment at all, the\n'
+            ' *           operation helper its body emits, operand-form\n'
+            ' *           suffix peeled: gen_helper_fldz_ST0 is `fldz`.\n'
+            ' * A leaf that reaches none of the three is REFUSED, so the\n'
+            ' * word is present on every row or the generator does not\n'
+            ' * write the file.\n'
+            ' *\n'
             " * THE ROWS ARE ORDERED and the don't-care bits read under that\n"
             ' * order, exactly as decodetree\'s @-suffixed pattern names do.\n'
             ' * A memory-operand leaf is reached for mod = 00, 01 and 10 and\n'
@@ -595,16 +833,21 @@ def build(path_c, path_dec, path_inc, report):
                 '} x87_ident_tab[] = {\n')
         f.write('    { 0, NULL },\n')
         base = os.path.basename(path_c)
-        for (name, h, bits, mem, op, rm, why, gline) in rows:
+        for (name, h, bits, mem, op, rm, why, gline, word, wsrc) in rows:
             # Two comment lines, the second in the shape the
             # MIPS table uses, because a 51-character identity
             # plus a trailing provenance comment does not fit
             # 80 columns and the consumer reads the lifted form.
+            #
+            # The WORD rides on the provenance line, because it is
+            # the half of the provenance a consumer needs and a
+            # word left in prose is a word nothing reads.
             f.write('    /* %-3s op=0x%02x %-6s %s */\n'
                     % ('mem' if mem else 'reg', op,
                        'rm=%d' % rm if rm is not None else '',
                        why))
-            f.write('    /* %s:%d */\n' % (base, gline))
+            f.write('    /* %s:%d word=%s(%s) */\n'
+                    % (base, gline, word, wsrc))
             f.write('    { 0x%08xu, "%s" },\n' % (h, name))
         f.write('};\n\n')
         f.write('/*\n'
@@ -685,11 +928,11 @@ def build(path_c, path_dec, path_inc, report):
         f.write('unmodelled labels : %d\n\n' % len(residue))
         f.write('every leaf, in the order the selector matches them\n')
         f.write('-------------------------------------------------\n')
-        for (name, h, bits, mem, op, rm, why, gline) in rows:
-            f.write('0x%08x  %s  %s op=0x%02x%s  %s:%d  %s\n'
+        for (name, h, bits, mem, op, rm, why, gline, word, wsrc) in rows:
+            f.write('0x%08x  %s  %s op=0x%02x%s  %s:%d  word=%s(%s)  %s\n'
                     % (h, name, 'mem' if mem else 'reg', op,
                        ' rm=%d' % rm if rm is not None else '',
-                       os.path.basename(path_c), gline, why))
+                       os.path.basename(path_c), gline, word, wsrc, why))
     print('x87: %d dispatch leaves, %d encodings checked, %d unmodelled'
           % (len(rows), checked, len(residue)))
     return 0

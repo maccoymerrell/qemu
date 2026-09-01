@@ -2876,6 +2876,18 @@ def classify_x86(m: str) -> Entry:
             return ent("GEN_OP_VEC_MOV")
         if re.match(r"^mov[a-z]*s[sd]$", m):
             return ent("GEN_OP_FP_MOV")
+        # NOT for a QEMU IDENTIFIER.  This is the last arm of a `mov`
+        # prefix test, so it answers for any string beginning those three
+        # letters -- including the names QEMU gives its generators, which
+        # carry a form suffix: `movsd_ld` is `movsd` with QEMU's `_ld`
+        # on it, and answering GEN_OP_MOV for the identifier out-ranks
+        # the peel that would have found the scalar-double move.  No x86
+        # mnemonic beginning `mov` contains an underscore, so the
+        # discriminator is the underscore itself and the peeled word --
+        # which is a spelling somebody used -- answers on the next
+        # candidate.
+        if "_" in m:
+            return ent("GEN_OP_UNKNOWN")
         return ent("GEN_OP_MOV")
 
     if m in {"comisd", "comiss", "ucomisd", "ucomiss"}:
@@ -2905,7 +2917,15 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_INT_ADD")
     if m.startswith("sub"):
         return ent("GEN_OP_INT_SUB")
-    if m.startswith(("imul", "mul")):
+    # ANCHORED, not a prefix.  `startswith("mul")` answers for any string
+    # beginning those three letters, and QEMU has one: `multi0F`, the
+    # name of the UNCONVERTED 0F 00 / 0F 01 dispatch row, which the
+    # statement route then classified as an integer multiply.  x86's
+    # multiplies are `mul`, `imul` and BMI2's `mulx`, plus the AT&T
+    # width suffix QEMU's disassembler prints; the packed forms
+    # (mulps/mulpd/mulss/mulsd) are answered above and PMUL*/VPMUL* below.
+    # width suffix, plus the OPERAND-COUNT suffix QEMU writes on IMUL3.
+    if re.match(r"^i?mul(x|[bwlq]|[0-9])?$", m):
         return ent("GEN_OP_INT_MUL")
     if m.startswith(("idiv", "div")):
         return ent("GEN_OP_INT_DIV")
@@ -5280,7 +5300,12 @@ IDENT_ROW_RE = re.compile(
 # unresolved, which is a zero produced by not looking.
 IDENT_ROW_BARE_RE = re.compile(
     r'^\s*\{\s*(0x[0-9a-f]+)u,\s*"([^"]+)"\s*\},\s*$')
-IDENT_PROV_RE = re.compile(r'^\s*/\*\s*(\S+):(\d+)\s*\*/\s*$')
+# The lifted provenance line of a hand-off identity table.  A table may
+# carry a WORD on it -- QEMU's own name for the leaf, which for a
+# generator's internal dispatch is the only place the name exists at
+# all -- and a table that carries none is read exactly as before.
+IDENT_PROV_RE = re.compile(
+    r'^\s*/\*\s*(\S+):(\d+)(?:\s+word=(\S+?)\([a-z]+\))?\s*\*/\s*$')
 
 
 @dataclass(frozen=True)
@@ -5298,6 +5323,13 @@ class QemuIdent:
     # "decodetree" -- their pattern name is the identity and there is no
     # second fact to read.
     kind: str = "decodetree"
+    # QEMU's OWN WORD for this rule, where the rule's name is not one.  A
+    # generator that dispatches internally -- gen_x87 switching on modrm --
+    # gives every leaf the escape row's name, and the only place the leaf
+    # is named at all is the `case` line the instrument read it off.  The
+    # instrument exports it; this is where it arrives.  Empty for a rule
+    # whose own name is the word.
+    word: str = ""
 
     @property
     def decoder(self) -> str:
@@ -5432,12 +5464,12 @@ def _read_qualified_table(path: Path, kind: str) -> list[QemuIdent]:
     for line in path.read_text().splitlines():
         m = IDENT_PROV_RE.match(line)
         if m:
-            prov = (m.group(1), int(m.group(2)))
+            prov = (m.group(1), int(m.group(2)), m.group(3))
             continue
         m = IDENT_ROW_BARE_RE.match(line)
         if m and prov is not None:
             rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
-                                  prov[0], prov[1], kind))
+                                  prov[0], prov[1], kind, prov[2] or ""))
         prov = None
     return rows
 
@@ -5622,7 +5654,7 @@ def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
                 continue
             m = IDENT_PROV_RE.match(line)
             if m:
-                prov = (m.group(1), int(m.group(2)))
+                prov = (m.group(1), int(m.group(2)), m.group(3))
                 continue
             m = IDENT_ROW_BARE_RE.match(line)
             if m:
@@ -5633,7 +5665,8 @@ def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
                         f"row with no source is not a rule this generator "
                         f"will admit")
                 rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
-                                      prov[0], prov[1]))
+                                      prov[0], prov[1], "decodetree",
+                                      prov[2] or ""))
                 prov = None
                 continue
             prov = None
@@ -6214,6 +6247,21 @@ QEMU_DECODE_SOURCE_DIRS: dict[str, tuple[str, ...]] = {
 
 @lru_cache(maxsize=None)
 def _decode_source_text(isa: str, base: str) -> tuple[str, ...]:
+    """The lines of the file a rule's provenance names.
+
+    THE PROVENANCE IS NOT ONE SHAPE, and assuming it was is how x86 lost
+    every finer word it has.  decodetree writes a BASENAME
+    (`insn32.decode`), so the directory list above is what finds it; the
+    i386 table's plain rows carry a path that is already ROOT-RELATIVE
+    (`target/i386/tcg/decode-new.c.inc`), and joining a directory in
+    front of that resolves nothing.  Both are tried, root-relative
+    first, because a path with a directory in it is a path and only a
+    bare name needs searching for.
+    """
+    if "/" in base:
+        path = ROOT / base
+        if path.is_file():
+            return tuple(path.read_text().splitlines())
     for rel in QEMU_DECODE_SOURCE_DIRS.get(isa, ()):
         path = ROOT / rel / base
         if path.is_file():
@@ -6301,6 +6349,45 @@ def _enumerator_word(isa: str, pat: str) -> str | None:
     return None
 
 
+def _x86_encoding_word(ident: QemuIdent) -> str | None:
+    """An i386 row's name in the spelling its QUALIFIED ENCODING uses.
+
+    scripts/x86_vex_ident_instrument.py carves a row that serves two
+    encodings into `...@vex=0` and `...@vex=1`, because the legacy SSE
+    spelling of an instruction and its VEX spelling do not classify the
+    same way -- `movd` moves a general register, `vmovd` moves a vector
+    lane.  The carve is in the identity; the NAME is the same on both
+    arms, so a statement taken from the name alone would answer once for
+    two rules and undo the carve.
+
+    QEMU's own table writes the V: VMOVSS beside MOVSS, VPERMQ, VPMULLD.
+    So the VEX arm's word is the row's name carrying that V, whether or
+    not the row was already written with one.
+
+    ONE DIRECTION ONLY, and that is a measurement.  Taking the V OFF for
+    the legacy arm looks like the same rule read backwards and is not:
+    QEMU names a row for the GENERATOR it dispatches to, so VMOVLPx
+    serves MOVSD and VCMP serves CMPPS/CMPSD, and stripping the V yields
+    `movlpx` and `cmp` -- one a placeholder, the other an unrelated
+    integer compare that the vocabulary answers confidently.  A legacy
+    arm therefore keeps the row's own name, and where that name is the
+    generator rather than the instruction the row is, the disagreement is
+    RECORDED rather than papered over with a spelling nobody wrote.
+    """
+    if "@" not in ident.name:
+        return None
+    qual = ident.name.split("@", 1)[1]
+    pat = _word(ident.pattern)
+    if "vex=1" in qual:
+        return pat if pat.startswith("v") else "v" + pat
+    return None
+
+
+QUALIFIER_WORD_HOOKS = {
+    "x86": _x86_encoding_word,
+}
+
+
 def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
     """(word, where it came from), most specific first -- all QEMU's own."""
     out: list[tuple[str, str]] = []
@@ -6310,6 +6397,44 @@ def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
         if word and word not in seen:
             seen.add(word)
             out.append((word, source))
+
+    def add_peeled(word: str, source: str) -> None:
+        """A word and the prefixes QEMU's own form suffixes leave.
+
+        A hook-supplied word is a QEMU IDENTIFIER exactly as a pattern
+        name is -- `movsd_ld` carries the same `_ld` that `VMOVSD_ld`
+        does -- so it is peeled on the same terms and for the same
+        reason, immediately after itself rather than after every other
+        candidate.
+        """
+        add(word, source)
+        q = word
+        while "_" in q:
+            q = q.rsplit("_", 1)[0]
+            add(q, "prefix")
+
+    # THE LEAF'S OWN WORD FIRST, where an instrument exported one.  A
+    # generator that dispatches internally hands every leaf the escape
+    # row's name -- all 144 gen_x87 leaves are `x87` -- and the leaf's
+    # own `case` line is the only place QEMU names it.  The instrument
+    # read it there; offering it ahead of the shared name is offering
+    # the more specific of two words QEMU wrote, which is the order
+    # everything below is already in.
+    if ident.word:
+        add_peeled(_word(ident.word), "leaf")
+
+    # THE ENCODING'S OWN SPELLING, where the identity is qualified by one.
+    # A decode-table row that serves both a legacy and a VEX encoding
+    # carries ONE name, so the two arms a qualification instrument carved
+    # apart would state the same class through it -- which is exactly the
+    # distinction the carve exists to make.  QEMU's own table spells the
+    # VEX form of a row with a leading V (VMOVSS beside MOVSS, VPERMQ),
+    # so the arm's spelling is the row's name under that convention.
+    ehook = QUALIFIER_WORD_HOOKS.get(info.key)
+    if ehook is not None:
+        w = ehook(ident)
+        if w:
+            add_peeled(_word(w), "encoding")
 
     line = _rule_source_line(info, ident)
     if line:
@@ -6579,6 +6704,173 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "each of which moves one CP0 register into a GPR and rewrites one "
         "bit of it"),
 
+    # --- x86 ----------------------------------------------------------
+    # THE CONDITIONAL BRANCH FAMILY.  QEMU gives the conditional jumps no
+    # name of their own: 32 rows all spelled `Jcc`, and what separates
+    # them is where they sit in their table.  The array index IS the
+    # condition -- its low nibble is the tttn field the encoding carries
+    # and gen_jcc() tests -- so the sixteen one-byte rows and the sixteen
+    # 0F rows are the sixteen conditions written twice, once at each
+    # displacement width.  Every one of them is a direct branch taken on a
+    # flag test, which is one class; that the indices really are the two
+    # complete runs is checked rather than believed
+    # (_x86_jcc_is_the_condition_field).
+    ("x86", "jcc"): Statement(
+        ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT"), "jcc", "ruled",
+        "decode-new.c.inc [0x70]..[0x7F] and [0x80]..[0x8F] -- 32 rows "
+        "spelled X86_OP_ENTRYr(Jcc, J,b) and (Jcc, J,z_f64), whose array "
+        "index's low nibble is the condition gen_jcc() tests; a direct "
+        "branch taken on a flag test, at two displacement widths"),
+
+    # THE x87 ESCAPE ROWS.  scripts/x86_x87_ident_instrument.py qualifies
+    # every leaf of gen_x87's internal dispatch and publishes the leaf's
+    # own identity on the path that generates code, so these eight ids
+    # survive only where no leaf matched -- which reaches gen_x87's
+    # illegal_op -- or where CR0.EM/TS sent the instruction to #NM before
+    # any decode happened.  Both are traps, and the row takes the NAMED
+    # kind every other trap-taking rule takes.
+    ("x86", "x87"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "x87", "ruled",
+        "decode-new.c.inc:1907-1914 the eight X86_OP_ENTRY1(x87, ...) "
+        "escape rows -- every leaf of gen_x87 republishes its own "
+        "identity, so these ids reach a plugin only through gen_x87's "
+        "illegal_op or its CR0.EM/TS #NM arm",
+        no_class=True),
+
+    # THE 3DNow! ESCAPE.  0F 0F is one row for the whole extension: the
+    # operation is the TRAILING IMMEDIATE, read inside the generator, so
+    # this identity is as coarse as the x87 escape rows were before they
+    # were qualified.  fns_3dnow[] is 24 packed operations on MMX
+    # registers -- pfadd, pfmul, pfmin, pfcmpge, pi2fd and the rest --
+    # and what they share is that each is one short vector ALU operation,
+    # which is the class the row states.  The coarseness is real and the
+    # remedy is the one the x87, VEX and CET legs already are: an
+    # immediate-keyed identity instrument.  Until then this row says the
+    # true general thing rather than picking one of twenty-four.
+    ("x86", "3dnow"): Statement(
+        ent("GEN_OP_VEC_ALU_SHORT"), "3dnow", "ruled",
+        "decode-new.c.inc:1347 [0x0f] = X86_OP_ENTRY3(3dnow, P,q, Q,q, "
+        "I,b, cpuid(3DNOW)) with emit.c.inc:499 fns_3dnow[] -- the 0F 0F "
+        "escape, whose 24 arms are each one packed operation on MMX "
+        "registers selected by the trailing immediate"),
+
+    # THE UNCONVERTED LEGACY DISPATCH.  `multi0F` is the name QEMU gives
+    # every row whose group it has not moved into the new decode table:
+    # 0F 00 (SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (SGDT/SIDT/LGDT/LIDT/
+    # SMSW/LMSW/INVLPG/SWAPGS/RDTSCP/XGETBV/XSETBV/monitor/mwait/clac/
+    # stac/the SVM ops/rdpkru/wrpkru), 0F 1A and 0F 1B (the MPX bound
+    # registers) and group9's register form (RDRAND/RDSEED/RDPID).  It is
+    # a DISPATCH row that QEMU spelled as an entry, because the dispatch
+    # is a switch inside gen_multi0F() rather than a `.decode` function --
+    # so unlike an X86_OP_GROUP* row its identity really is published for
+    # the instructions it reaches, and as coarsely as the x87 escape rows
+    # were before they were qualified.
+    #
+    # What the arms share is that each operates on MACHINE STATE -- a
+    # descriptor table, a control or extended-control register, a
+    # protection key, a bound register, the monitor -- rather than
+    # producing a data result, which is the class the maintenance
+    # operations already carry.  The coarseness is real and the remedy is
+    # the one the x87, VEX and CET legs are: a modrm-keyed identity
+    # instrument, or QEMU converting the rows.  Until then the row says
+    # the true general thing rather than picking one of forty.
+    ("x86", "multi0f"): Statement(
+        ent("GEN_OP_FENCE"), "multi0f", "ruled",
+        "decode-new.c.inc:368, 1197, 1198, 1351 and 1352 -- the rows "
+        "QEMU marks `unconverted`, whose operation gen_multi0F() "
+        "(translate.c:3312) selects from the opcode byte and modrm; "
+        "every arm operates on machine state rather than producing a "
+        "data result"),
+
+    # THE UNDEFINED-OPCODE ROWS.  UD0, UD1 and UD2 exist to raise #UD --
+    # gen_UD() is gen_illegal_opcode(), a trap to a vector -- and that is
+    # the same NAMED kind riscv's `illegal` and MIPS's reserved rows take.
+    ("x86", "ud"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "ud", "ruled",
+        "decode-new.c.inc:1339, 1437 and 1480 -- UD2, UD1 and UD0, whose "
+        "generator is gen_illegal_opcode(): an encoding the architecture "
+        "defines as raising #UD",
+        no_class=True),
+
+    # THE FAR TRANSFERS.  A far call pushes the return CS:EIP and jumps
+    # through a segment selector; a far jump does not push.  QEMU spells
+    # both the immediate (`CALLF`, `JMPF`) and the memory-indirect
+    # (`CALLF_m`, `JMPF_m`) forms, and the `_m` names take these answers
+    # through the prefix peel.
+    ("x86", "callf"): Statement(
+        ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_CALL"), "callf", "ruled",
+        "decode-new.c.inc:1868 [0x9A] X86_OP_ENTRYrr(CALLF, ...) and "
+        "1606 [0x0b] X86_OP_ENTRYr(CALLF_m, M,p) -- the far call, which "
+        "pushes the return CS:EIP and transfers through a segment "
+        "selector the instruction does not encode as a displacement"),
+    ("x86", "jmpf"): Statement(
+        ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP"), "jmpf", "ruled",
+        "decode-new.c.inc:1918 [0xEA] X86_OP_ENTRYrr(JMPF, ...) and "
+        "1608 [0x0d] X86_OP_ENTRYr(JMPF_m, M,p) -- the far jump, which "
+        "transfers through a segment selector and pushes nothing"),
+
+    # THE SEGMENT-BASE MOVES.  RDFSBASE / RDGSBASE read a segment base
+    # register into a GPR and WRFSBASE / WRGSBASE write it back; QEMU
+    # writes the pair of them as one row each with the segment left as
+    # `xx`, because the register is the modrm reg field.
+    ("x86", "rdxxbase"): Statement(
+        ent("GEN_OP_MOV"), "rdxxbase", "ruled",
+        "decode-new.c.inc:389-390 X86_OP_ENTRYw(RDxxBASE, R,y, "
+        "cpuid(FSGSBASE) chk(o64) p_f3) -- RDFSBASE/RDGSBASE, a move of "
+        "a segment base register into a general register"),
+    ("x86", "wrxxbase"): Statement(
+        ent("GEN_OP_MOV"), "wrxxbase", "ruled",
+        "decode-new.c.inc:391-392 X86_OP_ENTRYr(WRxxBASE, ...) -- "
+        "WRFSBASE/WRGSBASE, the same move in the other direction"),
+
+    # THE MMX/SSE CONVERSION PAIRS, whose `x` is the packing the prefix
+    # picks (CVTPI2PS / CVTPI2PD and so on).  Both directions convert
+    # between packed integers in an MMX register and packed floats in an
+    # SSE one, which is one class whichever way it goes.
+    ("x86", "cvtpi2px"): Statement(
+        ent("GEN_OP_FP_CVT"), "cvtpi2px", "ruled",
+        "decode-new.c.inc:1072-1073 X86_OP_ENTRY3(CVTPI2Px, V,x, "
+        "None,None, Q,q) -- CVTPI2PS/CVTPI2PD, packed integer to packed "
+        "floating point"),
+    ("x86", "cvtpx2pi"): Statement(
+        ent("GEN_OP_FP_CVT"), "cvtpx2pi", "ruled",
+        "decode-new.c.inc:1109-1110 X86_OP_ENTRY3(CVTPx2PI, P,q, "
+        "None,None, W,q) -- CVTPS2PI/CVTPD2PI, the same conversion "
+        "back"),
+    ("x86", "cvttpx2pi"): Statement(
+        ent("GEN_OP_FP_CVT"), "cvttpx2pi", "ruled",
+        "decode-new.c.inc:1097-1098 X86_OP_ENTRY3(CVTTPx2PI, P,q, "
+        "None,None, W,q) -- CVTTPS2PI/CVTTPD2PI, the truncating form of "
+        "the same conversion"),
+
+    # THE STRING INSTRUCTIONS.  QEMU names them by the family -- INS,
+    # OUTS, LODS, STOS, SCAS, MOVS -- and takes the operand width from
+    # the row rather than the name, so the vocabulary's width-suffixed
+    # spellings (`stosb`, `lodsq`) never meet these words.  Each is
+    # stated as the memory operation it performs, once, with the port
+    # forms taking the direction of the transfer they make.
+    ("x86", "lods"): Statement(
+        ent("GEN_OP_LOAD"), "lods", "ruled",
+        "decode-new.c.inc:1880-1881 X86_OP_ENTRYr(LODS, X,b) -- load a "
+        "string element from DS:rSI into the accumulator"),
+    ("x86", "stos"): Statement(
+        ent("GEN_OP_STORE"), "stos", "ruled",
+        "decode-new.c.inc:1877-1878 X86_OP_ENTRYwr(STOS, Y,b, 0,b) -- "
+        "store the accumulator to ES:rDI"),
+    ("x86", "scas"): Statement(
+        ent("GEN_OP_CMP"), "scas", "ruled",
+        "decode-new.c.inc:1882-1883 X86_OP_ENTRYrr(SCAS, 0,b, Y,b) -- "
+        "compare the accumulator against ES:rDI and write only flags; "
+        "the row is spelled ENTRYrr for exactly that reason"),
+    ("x86", "ins"): Statement(
+        ent("GEN_OP_STORE"), "ins", "ruled",
+        "decode-new.c.inc:1842-1843 X86_OP_ENTRYrr(INS, Y,b, 2,w) -- "
+        "read an I/O port and store the result to ES:rDI"),
+    ("x86", "outs"): Statement(
+        ent("GEN_OP_LOAD"), "outs", "ruled",
+        "decode-new.c.inc:1844-1845 X86_OP_ENTRYrr(OUTS, X,b, 2,w) -- "
+        "load a string element from DS:rSI and write it to an I/O port"),
+
     ("riscv", "c64_illegal"): Statement(
         ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "c64_illegal", "ruled",
         "insn16.decode c64_illegal -- the RV32 encodings RV64 reclaims; "
@@ -6642,11 +6934,195 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
         "is the PMON monitor entry; the observed X86-style INT_ADD comes "
         "from the disassembler reading the same encoding as MIPS R6 LSA",
 
+    # --- x86 ----------------------------------------------------------
+    # THE GROUP ROWS A NAME MATCH REACHED.  Both of these are decode
+    # steps whose id restamps on every path, so the payload beside them
+    # came from matching the group's name to a Capstone spelling -- the
+    # route R20 replaces -- and never from an observation.
+    ("x86", "VINSERTPS@target/i386/tcg/decode-new.c.inc:899"):
+        "target/i386/tcg/decode-new.c.inc:899 X86_OP_GROUP0(VINSERTPS) -- "
+        "decode_VINSERTPS() copies vinsertps_reg or vinsertps_mem over "
+        "the entry for every value of mod, so the group row's own id is "
+        "published for nothing at all; the VEC_SHUF beside it is a name "
+        "match against the Capstone spelling of the leaf",
+    ("x86", "MOV_CR_DR"):
+        "target/i386/tcg/decode-new.c.inc:1186 decode_MOV_CR_DR() forces "
+        "s->modrm |= 0xC0 and then X86_OP_SET_GEN(entry, MOV), which "
+        "restamps .slot to line 1193 on every path -- the four group "
+        "rows at 1219-1222 publish only through #UD, and the GEN_OP_MOV "
+        "beside them is a name match on the group's own name",
+
+    # THE SCALAR-versus-VECTOR MOVE TAXONOMY.  QEMU names the row for
+    # the generator, and the generator is shared: VMOVSS serves the
+    # legacy `movss` too, and VMOVLPx serves `movsd` (QEMU says so on
+    # the row: `/* MOVSD */`).  The vocabulary answers `vmovss` VEC_MOV
+    # and `movss` FP_MOV, which is a decision about OUR generic space --
+    # whether a scalar single- or double-precision move through an XMM
+    # register is a floating-point move or a vector one -- and not
+    # something QEMU states.  The rows are recorded rather than resolved
+    # by preference, which is the same bar QID_ADJUDICATIONS sets.
+    ("x86", "VMOVSS@target/i386/tcg/decode-new.c.inc:972"):
+        "target/i386/tcg/decode-new.c.inc:972 X86_OP_ENTRY3(VMOVSS, V,x, H,x, "
+        "W,x, vex5) -- one row for `movss` and `vmovss`; the corpus saw "
+        "the legacy spelling and the vocabulary answers the two "
+        "differently, which is a taxonomy question about the generic "
+        "space rather than a fact about the rule",
+    ("x86", "VMOVSS_ld@target/i386/tcg/decode-new.c.inc:979"):
+        "target/i386/tcg/decode-new.c.inc:979 -- as VMOVSS, the memory-source form",
+    ("x86", "VMOVSS_st@target/i386/tcg/decode-new.c.inc:1002"):
+        "target/i386/tcg/decode-new.c.inc:1002 -- as VMOVSS, the memory-destination form",
+    ("x86", "decode-new/VMOVLPx@vex=0@decode-new.c.inc:973"):
+        "target/i386/tcg/decode-new.c.inc:973 X86_OP_ENTRY3(VMOVLPx, V,x, H,x, "
+        "W,x, vex5), whose own trailing comment names MOVSD -- the "
+        "legacy arm is the scalar double move and QEMU's name is the "
+        "generator it shares with MOVLPS/MOVLPD, so the row's name is "
+        "not the instruction and the vocabulary answers the two "
+        "spellings differently",
+    ("x86", "decode-new/VMOVLPx_st@vex=0@decode-new.c.inc:1003"):
+        "target/i386/tcg/decode-new.c.inc:1003 -- as VMOVLPx, the memory-destination form",
+    ("x86", "decode-new/VMOVSD_ld@vex=0@decode-new.c.inc:980"):
+        "target/i386/tcg/decode-new.c.inc:980 X86_OP_ENTRY3(VMOVSD_ld, V,x, H,x, "
+        "M,sd, vex5) -- the legacy arm is `movsd`; the row is named for "
+        "the VEX spelling and the vocabulary answers vmovsd VEC_MOV "
+        "against movsd FP_MOV",
+    ("x86", "decode-new/MOVD_from@vex=1@decode-new.c.inc:551"):
+        "target/i386/tcg/decode-new.c.inc:551 X86_OP_ENTRY3(MOVD_from, ...) under "
+        "PREFIX_VEX -- the VEX arm is `vmovd`, a vector-lane move, and "
+        "the GEN_OP_MOV beside it is the name match that carving the "
+        "two encodings apart exists to replace",
+
+    # PACKSSWB.  The statement and the payload are the SAME vocabulary
+    # asked about two spellings of one instruction: `packsswb` answers
+    # VEC_SHUF and `vpacksswb` answers VEC_LOGIC.  That asymmetry is a
+    # defect in the generic vocabulary rather than a fact about QEMU's
+    # rule, and repairing it moves a Capstone-keyed table row, which is
+    # a wire change that has to be attributed on its own.  Recorded here
+    # so the size of it is visible rather than absorbed.
+    ("x86", "PACKSSWB@target/i386/tcg/decode-new.c.inc:1252"):
+        "target/i386/tcg/decode-new.c.inc:1252 X86_OP_ENTRY3(PACKSSWB, V,x, H,x, "
+        "W,x, vex4 mmx avx2_256 p_00_66) -- the shared vocabulary "
+        "answers `packsswb` VEC_SHUF and `vpacksswb` VEC_LOGIC for one "
+        "instruction; the disagreement is between two spellings of our "
+        "own classifier, not between QEMU and an observation",
+
+    # THE UNCONVERTED LEGACY DISPATCH ROW THE CORPUS REACHED.  0F 01 was
+    # observed as `xgetbv` and `xtest`, both of which the vocabulary
+    # answers GEN_OP_NOP, so the row carries NOP for a slot that also
+    # answers for LGDT, INVLPG, SWAPGS and the SVM ops.  The statement
+    # names what every arm of gen_multi0F() has in common; the
+    # observation names two of forty.
+    ("x86", "multi0F@target/i386/tcg/decode-new.c.inc:1198"):
+        "target/i386/tcg/decode-new.c.inc:1198 [0x01] = "
+        "X86_OP_ENTRY1(multi0F, nop,v, nolea) -- one identity for the "
+        "whole 0F 01 group; the GEN_OP_NOP beside it is `xgetbv` and "
+        "`xtest`, the two arms the corpus happened to execute",
+
+    # THE PREFETCH HINTS.  Both rows are the reserved-NOP generator:
+    # QEMU decodes the encoding, emits nothing, and the architecture
+    # allows exactly that because a prefetch is a hint.  The observation
+    # says PREFETCH because the disassembler names the hint the encoding
+    # carries.  Under R20 the row states what the rule QEMU dispatched
+    # does; the two are reading different levels of the same encoding
+    # and that is recorded rather than resolved by preference.
+    ("x86", "NOP@target/i386/tcg/decode-new.c.inc:1340"):
+        "target/i386/tcg/decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v) -- "
+        "the 3DNow! prefetch, decoded through gen_NOP; QEMU models no "
+        "cache, so the rule emits nothing while the disassembler names "
+        "the hint",
+    ("x86", "NOP@target/i386/tcg/decode-new.c.inc:1349"):
+        "target/i386/tcg/decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v) -- "
+        "the SSE prefetch / reserved-NOP group, one row for "
+        "prefetchnta, prefetcht0, prefetcht1, prefetcht2 and the "
+        "reserved encodings beside them; as 0x0d, gen_NOP emits nothing",
+
+    # 0x63 WITHOUT REX.W.  decode_63() picks between three rows and this
+    # is the third: `static const X86OpEntry mov = X86_OP_ENTRY3(MOV,
+    # G,v, E,v, None, None)`, reached when CODE64 and not REX_W.  The
+    # encoding is architecturally MOVSXD, which is what the
+    # disassembler prints, and sign-extending 32 bits into 32 bits is
+    # the identity -- so QEMU writes the arm as a plain move and is
+    # right to.  The row states the rule; the observation names the
+    # encoding.
+    ("x86", "MOV@target/i386/tcg/decode-new.c.inc:1497"):
+        "target/i386/tcg/decode-new.c.inc:1497 decode_63()'s `mov` arm, reached when "
+        "CODE64(s) and not REX_W(s) -- MOVSXD with a 32-bit operand "
+        "size sign-extends 32 bits into 32, which QEMU writes as the "
+        "plain move it is",
+
+    # THE STRING OPERATIONS WHOSE OBSERVED PAYLOAD IS THE POINTER
+    # UPDATE.  `stosb`, `stosd`, `stosq` and `outsd` all classify
+    # GEN_OP_INT_ADD through the shared vocabulary -- a catch-all
+    # answering for the rSI/rDI increment rather than the transfer -- so
+    # the rows the corpus reached carry the increment as their class.
+    # The statement names the memory operation the rule performs.  The
+    # vocabulary defect is real and repairing it moves Capstone-keyed
+    # table rows, which is a wire change to attribute on its own.
+    ("x86", "STOS@target/i386/tcg/decode-new.c.inc:1877"):
+        "target/i386/tcg/decode-new.c.inc:1877 [0xAA] = X86_OP_ENTRYwr(STOS, Y,b, "
+        "0,b) -- the rule stores the accumulator to ES:rDI; the "
+        "GEN_OP_INT_ADD beside it is the shared vocabulary answering "
+        "`stosb` with the pointer update",
+    ("x86", "STOS@target/i386/tcg/decode-new.c.inc:1878"):
+        "target/i386/tcg/decode-new.c.inc:1878 -- as 1877, the non-byte widths "
+        "(`stosd`, `stosq`)",
+    ("x86", "OUTS@target/i386/tcg/decode-new.c.inc:1845"):
+        "target/i386/tcg/decode-new.c.inc:1845 [0x6F] = X86_OP_ENTRYrr(OUTS, X,b, "
+        "2,w) -- the rule loads from DS:rSI and writes an I/O port; the "
+        "GEN_OP_INT_ADD beside it is `outsd` answered with the pointer "
+        "update",
+
     ("riscv", "decode_insn32/lpad"):
         "insn32.decode:129 lpad label:20 00000 0010111, ahead of auipc in "
         "the same decode group -- trans_lpad() writes no GPR, and QEMU's "
         "own comment on its early return is that lpad comes from NOP space",
 }
+
+
+def _disagreement_keys(ident: QemuIdent) -> tuple[str, str]:
+    """The two keys a ruling may be written under, most specific first.
+
+    A decodetree pattern name is an identity, so the NAME is enough there
+    and every ruling written so far is keyed on one.  i386's is not:
+    QEMU names a table row for the GENERATOR it dispatches to, so four
+    rows are named MOV_CR_DR and a dozen are named NOP, and a ruling
+    keyed on the name alone would settle every one of them from evidence
+    about a single row.  So a row may also be named by its source line,
+    and that key is tried first.
+    """
+    return (f"{ident.name}@{ident.src_file}:{ident.src_line}", ident.name)
+
+
+def _statement_disagreement(info: IsaInfo,
+                            ident: QemuIdent) -> str | None:
+    for key in _disagreement_keys(ident):
+        ruled = QEMU_STATEMENT_DISAGREEMENTS.get((info.key, key))
+        if ruled is not None:
+            return ruled
+    return None
+
+
+def _refuse_dead_statement_disagreements(info: IsaInfo,
+                                         idents: list[QemuIdent]) -> None:
+    """Every ruling must still name a row that exists.
+
+    A ruling settles ONE row against ONE piece of evidence.  When the row
+    moves or goes, the ruling stops describing anything and would sit in
+    the table permitting a disagreement that no longer happens -- which
+    is the shape of the allowlist entries whose justifications were
+    false.  It is refused instead.
+    """
+    have: set[str] = set()
+    for ident in idents:
+        have.update(_disagreement_keys(ident))
+    for (key, name) in QEMU_STATEMENT_DISAGREEMENTS:
+        if key != info.key:
+            continue
+        if name not in have:
+            raise SystemExit(
+                f"{info.key}: QEMU_STATEMENT_DISAGREEMENTS rules "
+                f"{name!r}, which is not a rule in this target's identity "
+                f"universe.  The ruling is stale against the tree; delete "
+                f"it or re-state which row it settles.")
 
 
 # The ISAs whose rows are STATED: the class comes from QEMU's own rule and
@@ -6656,7 +7132,7 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
 # build teaches nothing -- it just stops it.  An ISA outside the set keeps
 # the observation-derived tiers exactly as they were, and the census says
 # so on every run rather than letting the difference go unremarked.
-QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv", "mips"})
+QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv", "mips", "x86"})
 
 
 _PIN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\b")
@@ -6752,14 +7228,361 @@ def _mips_zero_dest_pin(ident: QemuIdent, st: Statement,
         f"(`sa == 5 && rd == 0 && rs == 0 && rt == 0` for PAUSE)")
 
 
+# ---------------------------------------------------------------------------
+# x86: what an i386 table row says besides its name
+# ---------------------------------------------------------------------------
+#
+# The i386 decode table is hand-written C, so a row carries facts a
+# decodetree pattern does not: the MACRO it was written with, the flags
+# in its trailing initialiser, and -- for a group's leaf table -- its
+# ARRAY INDEX.  All three are QEMU stating something about the rule that
+# the rule's NAME does not, and all three are read here.
+
+
+def _x86_group_row(ident: QemuIdent) -> Statement | None:
+    """An X86_OP_GROUP* row is a DECODE STEP, not an instruction.
+
+    The macro is the fact.  `.decode` replaces the entry before anything
+    is generated, and both ways of replacing it restamp the identity --
+    X86_OP_SET_GEN with the leaf generator's own `__LINE__`, X86_OP_SET_LEAF
+    with the leaf table row's -- so a group row's id reaches a plugin only
+    for an encoding its decode function claimed for nothing.  That
+    encoding falls to `if (!decode.e.gen) goto unknown_op`
+    (decode-new.c.inc:2786), which is #UD.
+
+    It is therefore the NAMED kind the reserved encodings take, on the
+    same terms riscv's `illegal` and MIPS's OPC_SPECIAL take it: the row
+    states that the rule has no data behaviour because it has no
+    instruction, rather than declining to answer.  That every group
+    decoder really does restamp is CHECKED, not assumed -- see
+    _x86_group_decoders_restamp().
+    """
+    if not ident.kind.startswith("GROUP"):
+        return None
+    return Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+        _word(ident.pattern), "kind",
+        f"{ident.src_file}:{ident.src_line} is an X86_OP_GROUP* row -- "
+        f"decode_{ident.pattern}() replaces the entry and restamps .slot "
+        f"with the leaf's own __LINE__, so this id publishes only for an "
+        f"encoding no leaf claimed, which decode-new.c.inc:2786 takes "
+        f"to #UD",
+        no_class=True)
+
+
+RULE_KIND_HOOKS = {
+    "x86": _x86_group_row,
+}
+
+
+# The flags an i386 row's own initialiser carries that name what the row
+# IS.  Each is QEMU writing the operation down in a place the row's NAME
+# is not: `zextT0` on the 0F B6/B7 rows is what makes a MOV row a MOVZX,
+# and the CLFLUSH feature gate is what makes one reserved-NOP row a cache
+# flush.  The word goes through the same vocabulary every other word
+# does; nothing here states a class.  An entry that no row carries, or
+# whose word the vocabulary cannot answer, is REFUSED -- see
+# _refuse_dead_x86_row_flags(); a silent no-op would look exactly like a
+# rule that never needed refining.
+#
+# A flag REFINES ONE GENERATOR'S ROWS; it does not reclassify anything
+# that carries it.  `zextT0` says the row writes back zero-extended,
+# which on a row QEMU sends to gen_MOV is the whole operation and on a
+# bit-scan or a segment-base write is how the result is stored --
+# demoting BSF, or WRFSBASE, to a zero-extending move because the row
+# zero-extends would be the substantial-operation rule read backwards.
+#
+# So an entry names the GENERATOR whose rows it refines as well as the
+# word, and both are checked: `zextT0` on a row named MOV is MOVZX,
+# `zextT0` on a row named WRxxBASE is a writeback width.  MEASURED, not
+# assumed -- group15_reg[2] and [3] (decode-new.c.inc:391-392) carry
+# `zextT0` and are WRFSBASE/WRGSBASE.
+X86_ROW_WORD_FLAGS: tuple[tuple[str, str, str, str], ...] = (
+    ("zextT0", "MOV", "movzx",
+     "the row zero-extends T0 into its destination and QEMU sends it to "
+     "gen_MOV, which makes the extension the whole operation -- 0F B6 "
+     "and 0F B7 are MOVZX, written through the MOV generator"),
+    ("sextT0", "MOV", "movsx",
+     "the row sign-extends T0 into its destination and QEMU sends it to "
+     "gen_MOV -- 0F BE, 0F BF and the REX.W arm of 0x63 are MOVSX, "
+     "written through the MOV generator"),
+    ("cpuid(CLFLUSH)", "NOP", "clflush",
+     "the row is gated on the CLFLUSH feature bit and QEMU sends it to "
+     "gen_NOP -- 0F AE /7 is CLFLUSH, written through the NOP generator "
+     "because QEMU models no cache to flush"),
+)
+
+
+# A row spelled X86_OP_ENTRYrr computes a result the table writes
+# nowhere, and the generic space has a class for exactly that: an
+# arithmetic compare and a logical test.  This is the same fact
+# x86_emitter_refuses() reads on the name-match route, followed through
+# to the class instead of stopping at a refusal.
+#
+# Only these two.  The refusal set is wider because a row that discards
+# an ADD, an OR or an XOR would be something the generic space has no
+# word for, and inventing one here would be worse than the build error.
+X86_FLAGS_ONLY_CLASS: dict[str, str] = {
+    "GEN_OP_INT_SUB": "cmp",
+    "GEN_OP_AND": "test",
+}
+
+
+X86_LEAF_ARRAY_RE = re.compile(
+    r'^\s*static const X86OpLeaf\s+([A-Za-z0-9_]+)\s*\[')
+X86_LEAF_ROW_RE = re.compile(r'^\s*X86_OP_LEAF(_NONE)?\s*[\(,]')
+X86_SET_LEAF_RE = re.compile(
+    r'X86_OP_SET_LEAF\s*\(\s*entry\s*,\s*([A-Za-z0-9_]+)\s*\[\s*op\s*\]')
+X86_OP_EQ_RE = re.compile(r'^\s*if\s*\(\s*op\s*==\s*(\d+)\s*\)')
+
+
+@lru_cache(maxsize=None)
+def _x86_no_dest_leaf_lines() -> frozenset[int]:
+    """The lines of leaf-table rows the group decoder writes NOWHERE.
+
+    A leaf row has no operand template of its own -- X86_OP_LEAF carries
+    a generator, a name and a slot and nothing else -- so the macro
+    cannot say what X86_OP_ENTRYrr says on a plain row.  The group
+    decoder says it instead, by INDEX:
+
+        X86_OP_SET_LEAF(entry, group1_gen[op]);
+        if (op == 7) {
+            /* prevent writeback for CMP */
+            entry->op1 = entry->op0;
+            entry->op0 = X86_TYPE_None;
+
+    So index 7 of group1_gen[] -- `X86_OP_LEAF(SUB)` -- is the row whose
+    result goes nowhere, which is how `cmp` is spelled through a slot
+    named SUB.  The array, the index and the nulling are all read out of
+    the file; nothing is written down here but the shape.
+    """
+    lines = _decode_source_text("x86", QEMU_IDENT_SOURCE_TABLES["x86"])
+    arrays: dict[str, list[int]] = {}
+    cur: str | None = None
+    for i, raw in enumerate(lines, 1):
+        m = X86_LEAF_ARRAY_RE.match(raw)
+        if m:
+            cur = m.group(1)
+            arrays[cur] = []
+            continue
+        if cur is None:
+            continue
+        if X86_LEAF_ROW_RE.match(raw):
+            arrays[cur].append(i)
+            continue
+        if raw.strip().startswith("};"):
+            cur = None
+    out: set[int] = set()
+    pending: str | None = None
+    for i, raw in enumerate(lines, 1):
+        m = X86_SET_LEAF_RE.search(raw)
+        if m:
+            pending = m.group(1)
+            continue
+        if pending is None:
+            continue
+        m = X86_OP_EQ_RE.match(raw)
+        if m:
+            idx = int(m.group(1))
+            body = "\n".join(lines[i:i + 8])
+            if "entry->op0 = X86_TYPE_None;" in body:
+                rows = arrays.get(pending, [])
+                if idx < len(rows):
+                    out.add(rows[idx])
+            continue
+        if raw.startswith("}"):
+            pending = None
+    return frozenset(out)
+
+
+def _x86_row_refine(ident: QemuIdent, st: Statement,
+                    pins: dict[str, int]) -> Statement | None:
+    """Re-state a row from the facts its own line and macro carry."""
+    line = _rule_source_line(ISAS["x86"], ident)
+    for flag, generator, word, why in X86_ROW_WORD_FLAGS:
+        if flag not in line or ident.pattern != generator:
+            continue
+        cand = CLASSIFIERS["x86"](word)
+        if (cand.op, cand.branch) == (st.entry.op, st.entry.branch):
+            return None
+        return Statement(
+            cand, word, "flag",
+            f"{ident.src_file}:{ident.src_line} carries `{flag}` -- {why}")
+
+    no_dest = (ident.kind == "ENTRYrr" or ident.kind.endswith("/noDest")
+               or (ident.kind == "LEAF"
+                   and ident.src_line in _x86_no_dest_leaf_lines()))
+    if not no_dest:
+        return None
+    word = X86_FLAGS_ONLY_CLASS.get(st.entry.op)
+    if word is None:
+        if st.entry.op in X86_FLAGS_ONLY_REFUSED_OPS:
+            raise SystemExit(
+                f"x86: {ident.name} ({ident.src_file}:{ident.src_line}) is "
+                f"spelled {ident.kind} -- the result is written nowhere -- "
+                f"and states {st.entry.op}, which the generic space has no "
+                f"flags-only class for.  Name the class rather than "
+                f"publishing a value-producing op for a row that produces "
+                f"no value.")
+        return None
+    cand = CLASSIFIERS["x86"](word)
+    if (cand.op, cand.branch) == (st.entry.op, st.entry.branch):
+        return None
+    if ident.kind == "LEAF":
+        why = (f"{ident.src_file}:{ident.src_line} is the leaf whose group "
+               f"decoder nulls entry->op0 by index -- the result is written "
+               f"nowhere, so a slot named {ident.pattern} is the flags-only "
+               f"form")
+    else:
+        why = (f"{ident.src_file}:{ident.src_line} is spelled "
+               f"X86_OP_ENTRYrr, which expands to op0 = None -- QEMU "
+               f"computes the result and the table writes it nowhere, so a "
+               f"slot named {ident.pattern} is the flags-only form")
+    return Statement(cand, word, "emitter", why)
+
+
+def _refuse_dead_x86_row_flags(idents: list[QemuIdent]) -> None:
+    """Every row flag must be REACHED and must still say something."""
+    info = ISAS["x86"]
+    seen = [(i.pattern, _rule_source_line(info, i)) for i in idents]
+    for flag, generator, word, _why in X86_ROW_WORD_FLAGS:
+        if not any(flag in l and pat == generator for pat, l in seen):
+            raise SystemExit(
+                f"x86: X86_ROW_WORD_FLAGS reads {flag!r} on a row named "
+                f"{generator!r}, and no rule in this target's identity "
+                f"universe is both.  The entry is stale against the tree; "
+                f"delete it or re-state what it is for.")
+        if CLASSIFIERS["x86"](word).op == "GEN_OP_UNKNOWN":
+            raise SystemExit(
+                f"x86: X86_ROW_WORD_FLAGS turns {flag!r} into the word "
+                f"{word!r}, which the shared vocabulary does not answer -- "
+                f"the refinement would silently do nothing.")
+
+
+def _x86_group_decoders_restamp(idents: list[QemuIdent]) -> None:
+    """Every group decoder must replace the identity it was reached with.
+
+    _x86_group_row() states that a GROUP row is a decode step whose id
+    survives only into a #UD, and that claim rests entirely on the group
+    decoder restamping .slot on every path that generates code.  There
+    are three ways to do it -- copy a whole X86_OP_ENTRY row over the
+    entry, X86_OP_SET_GEN, or X86_OP_SET_LEAF -- and a decoder that does
+    none of them would leave the group's own id on a real instruction,
+    which is the defect the x87 leg exists because of.
+    """
+    lines = _decode_source_text("x86", QEMU_IDENT_SOURCE_TABLES["x86"])
+    want = {i.pattern for i in idents if i.kind.startswith("GROUP")}
+    bodies: dict[str, list[str]] = {}
+    cur: str | None = None
+    for raw in lines:
+        m = re.match(r'^static void ((?:do_)?decode_[A-Za-z0-9_]+)\(', raw)
+        if m:
+            cur = m.group(1)
+            bodies[cur] = []
+            continue
+        if cur is None:
+            continue
+        if raw.startswith("}"):
+            cur = None
+            continue
+        bodies[cur].append(raw)
+    bodies = {k[len("decode_"):] if k.startswith("decode_") else k: v
+              for k, v in bodies.items()}
+    def restamps(fn: str, depth: int = 0) -> bool:
+        """Does decode_<fn>() replace the entry on every path it has?
+
+        THREE WAYS, and a fourth that is the first three one call away.
+        decode_0F() reads the second opcode byte and hands the entry to
+        do_decode_0F(), which copies a row out of opcodes_0F[] -- a
+        delegation, not an omission, and refusing it would have made the
+        check demand that QEMU inline a function.  One level of
+        delegation is followed; a deeper chain, or a cycle, reads as a
+        decoder this check cannot see through and fails.
+        """
+        body = bodies.get(fn)
+        if body is None or depth > 1:
+            return False
+        text = "\n".join(body)
+        if ("X86_OP_SET_GEN(" in text or "X86_OP_SET_LEAF(" in text
+                or "*entry = " in text):
+            return True
+        return any(restamps(m.group(1), depth + 1)
+                   for m in re.finditer(
+                       r'\b((?:do_)?decode_[A-Za-z0-9_]+)\s*\('
+                       r'\s*s\s*,\s*env\s*,\s*entry\s*,', text))
+
+    bad: list[str] = []
+    for name in sorted(want):
+        if name not in bodies:
+            bad.append(f"decode_{name}() is not in the file at all")
+            continue
+        if not restamps(name):
+            bad.append(f"decode_{name}() neither copies a row nor calls "
+                       f"X86_OP_SET_GEN / X86_OP_SET_LEAF, on its own or "
+                       f"through one delegation")
+    if bad:
+        for why in bad:
+            print(f"  X86 GROUP ROW PUBLISHES {why}")
+        raise SystemExit(
+            f"x86: {len(bad)} group decoder(s) can leave the group row's "
+            f"own identity on an instruction QEMU generates code for.  The "
+            f"NAMED kind those rows carry says the id reaches a plugin only "
+            f"through #UD, and that is no longer true.")
+
+
+def _x86_jcc_is_the_condition_field(idents: list[QemuIdent]) -> None:
+    """The Jcc rows are the sixteen conditions, twice, and nothing else.
+
+    QEMU gives the conditional branches no name of their own: 32 rows all
+    spelled `Jcc`, distinguished only by where they sit in their table.
+    The array index IS the condition -- its low nibble is the tttn field
+    the encoding carries and gen_jcc() tests -- so the ruling that states
+    the family rests on the indices being exactly the two complete runs
+    of sixteen.  That is checked here rather than believed: a row moving
+    out of the run, or a seventeenth appearing, would make the ruling
+    describe a table that no longer exists.
+    """
+    info = ISAS["x86"]
+    got: list[int] = []
+    for i in idents:
+        if i.pattern != "Jcc":
+            continue
+        m = re.match(r'\s*\[0x([0-9A-Fa-f]{2})\]',
+                     _rule_source_line(info, i))
+        if m is None:
+            raise SystemExit(
+                f"x86: the Jcc row at {i.src_file}:{i.src_line} is not "
+                f"written as a table index, so its condition code cannot "
+                f"be read -- the family ruling has lost its source")
+        got.append(int(m.group(1), 16))
+    want = list(range(0x70, 0x80)) + list(range(0x80, 0x90))
+    if sorted(got) != want:
+        raise SystemExit(
+            f"x86: the Jcc rows sit at "
+            f"{', '.join('0x%02x' % v for v in sorted(got))}, not at the "
+            f"two complete runs 0x70..0x7F and 0x80..0x8F.  The ruling "
+            f"states the family from the condition field of exactly those "
+            f"indices and no longer describes the table.")
+
+
+
 RULE_PIN_HOOKS = {
     "riscv": _riscv_link_pin,
     "mips": _mips_zero_dest_pin,
 }
+RULE_PIN_HOOKS["x86"] = _x86_row_refine
 
 
 def state_rule(info: IsaInfo, ident: QemuIdent) -> Statement | None:
     """What QEMU's rule states this is, or None if nothing states it."""
+    kind_hook = RULE_KIND_HOOKS.get(info.key)
+    if kind_hook is not None:
+        # The MACRO the row was written with, ahead of every word: a row
+        # that is a decode step is not an instruction whose name should
+        # be looked up, and looking it up would answer.
+        st = kind_hook(ident)
+        if st is not None:
+            return st
     st = None
     for word, source in qemu_rule_words(info, ident):
         ruled = QEMU_RULE_STATEMENTS.get((info.key, word))
@@ -6903,6 +7726,11 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
     _branch_class_unreached(info, idents)
     if info.key in QEMU_IDENT_STATED:
         _refuse_dead_statement_rules(info, idents)
+        _refuse_dead_statement_disagreements(info, idents)
+        if info.key == "x86":
+            _refuse_dead_x86_row_flags(idents)
+            _x86_group_decoders_restamp(idents)
+            _x86_jcc_is_the_condition_field(idents)
     m2c = _mnemonic_to_const(info)
     v2c = enum_value_map(info)
     _refuse_stale_observations(info, idents, obs)
@@ -7066,7 +7894,7 @@ def _apply_statement(info: IsaInfo, ident: QemuIdent, entry: Entry,
         # the tier stops claiming a confirmation that never happened.
         independent = tier in (QID_OBSERVED, QID_ADJUDICATED)
         return entry, (QID_VERIFIED if independent else QID_STATED), st, None
-    ruled = QEMU_STATEMENT_DISAGREEMENTS.get((info.key, ident.name))
+    ruled = _statement_disagreement(info, ident)
     if ruled is None:
         raise SystemExit(
             f"{info.key}: decode rule {ident.name} "

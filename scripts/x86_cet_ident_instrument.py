@@ -290,7 +290,13 @@ def build(path_dec, path_out, report):
         # cannot read is a row invisible to the universe, which reports
         # as 'this rule was never qualified'.
         w('    /* %s: %s; FNV-1a-32 of "%s#%d" */' % (spell, why, name, slot))
-        w('    /* decode-new.c.inc:%d */' % slot)
+        # The WORD rides on the provenance line the plugin's identity
+        # generator reads.  QEMU has no word for these encodings at all --
+        # not modelling CET is the whole reason this table exists -- so
+        # the arm's own name is the only one there is, and leaving it in
+        # prose would make the qualified row state the reserved NOP the
+        # base row states and undo the carve.
+        w('    /* decode-new.c.inc:%d word=%s(arm) */' % (slot, spell))
         w('    { 0x%08xu, "%s" },' % (ident, name))
     w('};')
     w('')

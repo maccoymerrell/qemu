@@ -44,13 +44,13 @@ static const struct {
 } cet_ident_tab[] = {
     { 0, NULL },
     /* endbr64: F3 0F 1E FA -- terminate an indirect branch, 64-bit; FNV-1a-32 of "decode-new/NOP@f3=1,modrm=11111010#1355" */
-    /* decode-new.c.inc:1355 */
+    /* decode-new.c.inc:1355 word=endbr64(arm) */
     { 0x2f2da3d8u, "decode-new/NOP@f3=1,modrm=11111010" },
     /* endbr32: F3 0F 1E FB -- terminate an indirect branch, 32-bit; FNV-1a-32 of "decode-new/NOP@f3=1,modrm=11111011#1355" */
-    /* decode-new.c.inc:1355 */
+    /* decode-new.c.inc:1355 word=endbr32(arm) */
     { 0xb139944du, "decode-new/NOP@f3=1,modrm=11111011" },
     /* rdssp: F3 0F 1E /1 mod=11 -- read the shadow-stack pointer into a GPR; rdsspd and rdsspq differ by REX.W alone and read the same register, so operand size is not a discriminator here; FNV-1a-32 of "decode-new/NOP@f3=1,modrm=11001...#1355" */
-    /* decode-new.c.inc:1355 */
+    /* decode-new.c.inc:1355 word=rdssp(arm) */
     { 0xdb9bac2bu, "decode-new/NOP@f3=1,modrm=11001..." },
 };
 

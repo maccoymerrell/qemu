@@ -65,17 +65,31 @@ ISAS="x86_64 aarch64 riscv64 mipsel"
 # and that is exactly what makes it dangerous: a REFUSED verdict reads as "the
 # change moved the population" when it can just as easily be this.
 #
-# So the corpus is a UNION OVER REPEATS.  Every repeat is a real capture and
-# a union invents nothing: an encoding in the corpus was reached by some run.
-# The per-repeat coverage delta is PRINTED rather than smoothed away, because
-# the instability is a fact about the instrument that a reader has to be able
-# to see; and the conflict check is unchanged, so an encoding two repeats
-# disagree about is still a refusal and never a last-writer-wins.
+# THE CAUSE IS AT_RANDOM, AND IT IS PINNABLE.  `setarch -R` fixes the address
+# space and fixes nothing else: the guest is still handed sixteen fresh random
+# bytes in its auxv every run, glibc turns them into the stack canary and the
+# pointer guard, and those bytes sit in guest memory where a wrong-path walk
+# reads them AS INSTRUCTIONS.  Two runs of one binary therefore decode
+# different bytes at the same address.  linux-user already has the pin --
+# `-seed` for AT_RANDOM and `-pid` for the identity the guest reads from
+# set_tid_address -- and this gate simply never used them.  With both, two
+# captures of one build are BYTE-IDENTICAL, dump file for dump file.
+#
+# The corpus is ALSO a union over repeats, and with the input pinned that is
+# no longer a way to average over noise -- it is a CHECK.  Every repeat must
+# reach the same set, so `missed_by_one_capture` must read 0 on every cell,
+# and a non-zero says the reach depends on something still unpinned.  The
+# conflict check is unchanged: an encoding two repeats give different rows
+# for is a refusal, never a last-writer-wins.
 # The wrong path is the whole subject, so wp=0 alone would be the carve-out
 # this gate exists to remove.  Both settings, always.
 WPS=${CST_SRCENC_WPS:-"0 16"}
 # Repeats per (isa, wp); see THE COVERAGE PRECONDITION note above.
 REPEATS=${CST_SRCENC_REPEATS:-3}
+# The guest-side inputs `setarch -R` does NOT pin.  Fixed values, not
+# per-run ones: the point is that two captures of one build agree.
+SEED=${CST_ENC_SEED:-1}
+PIDBASE=${CST_ENC_PIDBASE:-90000}
 
 case $mode in
 capture)
@@ -101,6 +115,7 @@ capture)
             # itself is a by-product here and is removed after the run, but a
             # harness that writes one uncompressed is how the rule rots.
             CST_SRC_ENC_DUMP="$d" setarch -R "$build/qemu-$isa" \
+                -seed "$SEED" -pid "$PIDBASE" \
                 -plugin "$build/contrib/plugins/libchampsim_tracer.so,outfile=$out/t_$isa,wp=$wp,compress=zstd -T0 -3 -q -c" \
                 "${BIN[$isa]}" > /dev/null \
                 2> "$out/$isa.wp$wp.r$rep.stats.log"

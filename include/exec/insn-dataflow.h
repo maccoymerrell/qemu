@@ -198,16 +198,51 @@ typedef struct InsnDataflowNamedRead {
  * count is flagged rather than silently short.
  */
 /*
- * RAISED FROM 8 TO 32 at PASS 49.  `st4 {v0.8b-v3.8b}, [x0]` is thirty-two
- * one-byte stores, and at 8 the whole instruction arrived memops_truncated.
- * 32 is the largest value the provenance namespace allows without widening
- * INSN_DF_REG_WORDS: the memop bits are the TOP INSN_DF_MAX_MEMOPS of the
- * 256-bit namespace, whose lower end already holds MIPS' 128 globals plus
- * INSN_DF_MAX_FIELD_SLOTS = 64 interned ranges, so the base may not fall
- * below 192.  The .16b forms of ST3/ST4 need 48 and 64 and stay refused
- * WITH THEIR REASON rather than being silently shortened.
+ * RAISED 8 -> 32 at PASS 49 and 32 -> 48 here, and the value is measured
+ * rather than argued.  `st4 {v0.8b-v3.8b}, [x0]` is thirty-two one-byte
+ * stores and arrived memops_truncated at 8.
+ *
+ * THE TWO REAL CONSTRAINTS, both read out of the code that enforces them:
+ *
+ *   accel/tcg/insn-dataflow.c  QEMU_BUILD_BUG_ON(INSN_DF_MEMOP_PROV_BASE / 64
+ *                              != INSN_DF_REG_WORDS - 1)
+ *       The memop bits are the TOP INSN_DF_MAX_MEMOPS of the 256-bit
+ *       namespace and the whole region must live in one word, so the base may
+ *       not fall below 192  =>  MEMOPS <= 64.
+ *
+ *   accel/tcg/insn-dataflow.c  df_intern() refuses when
+ *                              nb_globals + df_nslots >= INSN_DF_IMM_PROV_BIT
+ *       The worst target's globals plus INSN_DF_MAX_FIELD_SLOTS = 64 interned
+ *       ranges must fit below IMM_PROV_BIT = 254 - MEMOPS.  mipsel is the
+ *       worst and its live count, read from the QEMU_DF_DUMP header rather
+ *       than from memory, is 130 -- so the last slot index is 130 + 63 = 193
+ *       and 193 < 254 - MEMOPS  =>  MEMOPS <= 60.
+ *
+ * 48 clears both with twelve to spare and is the value the tree BUILDS at:
+ * a full ninja over every target, 0 warnings, the build assert satisfied.
+ *
+ * WHAT THIS CLOSES, MEASURED OVER THE WHOLE x86_64 SLED (6,416,314
+ * encodings, wp0 and wp16):
+ *
+ *     rows carrying memops_truncated   2,561  ->  0
+ *     `enter` encodings REFUSED        2,561  ->  0   of 6,123
+ *
+ * x86 `enter` is the only class in the sled that truncates at 32 -- 1,400
+ * rows demand 34 memops and 1,161 demand 38 -- and 48 closes it completely.
+ * A refused write state is information QEMU could have stated and the wire
+ * did not carry, which is the R12.1 direction.
+ *
+ * THE TWO CLAIMS THIS COMMENT USED TO MAKE ARE BOTH RETRACTED.  It said 32
+ * was "the largest value the provenance namespace allows", which is off by
+ * 28 against the arithmetic above and off by 16 against a tree that
+ * compiles at 48; and it said "the .16b forms of ST3/ST4 need 48 and 64 and
+ * stay refused WITH THEIR REASON", which the sled refutes -- memops_truncated
+ * is 0 on aarch64, riscv64 and mipsel across the whole 9.16M-encoding
+ * population, and the 96 Q=1 `st4` encodings publish all four vector
+ * registers with a clean status.  The class that was refused was never the
+ * one named.
  */
-#define INSN_DF_MAX_MEMOPS  32
+#define INSN_DF_MAX_MEMOPS  48
 
 /*
  * The third region of the provenance namespace: the DATA a load returned.

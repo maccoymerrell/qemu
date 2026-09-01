@@ -758,6 +758,45 @@ static void finalize_rvv_inst(DisasContext *ctx)
     ctx->vstart_eq_zero = true;
 }
 
+/*
+ * THE FP CONTROL AND STATUS AN FP HELPER IS HANDED tcg_env TO REACH.
+ *
+ * Every floating-point helper in fpu_helper.c that takes CPURISCVState takes
+ * it for one purpose: `&env->fp_status`, the softfloat status word holding
+ * the rounding mode, the accrued exception flags and the NaN rules.
+ * `helper_fmin_s` reads it twice, `helper_flt_s` once, `helper_fcvt_w_s`
+ * once; there is no member of the group that takes env and leaves it alone
+ * except FCLASS, which reads only the NaN-boxing rule and, per the ISA, sets
+ * no flag and honours no rounding mode -- so FCLASS is deliberately NOT
+ * given this statement.
+ *
+ * WHAT IT REPLACES.  tcg_env passed to a helper is the whole CPU state, and
+ * nothing in the CALL says which of it the helper reaches; the read arrives
+ * only if the helper has a row in the CP-H usage table, and that table's
+ * subject is "the helpers an OBSERVED run reached".  Measured at PASS 49
+ * that made the answer a property of which runs had been censused rather
+ * than of the architecture: `fadd.d` carried REG_FCSR and `fmin.d` beside it
+ * did not, two instructions with one dependence disagreeing about it.  The
+ * decode site knows, statically, for every form.
+ *
+ * BY RANGE, because the range IS the register: translate.c's own
+ * insn_dataflow_declare_regfile("fp_status", ...) takes exactly this
+ * offsetof()/sizeof() pair, so the declaration that names every other access
+ * to these bytes names this one too.
+ *
+ * gen_set_rm() below reaches the same register through a real env load on
+ * the dynamic-rounding-mode forms; the read list is a set, so an instruction
+ * that does both says it once.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_fp_status_read(void)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPURISCVState, fp_status),
+        sizeof(((CPURISCVState *)0)->fp_status));
+}
+
 static void gen_set_rm(DisasContext *ctx, int rm)
 {
     if (ctx->frm == rm) {

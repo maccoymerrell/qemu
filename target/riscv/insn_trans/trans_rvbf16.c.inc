@@ -43,6 +43,7 @@ static bool trans_fcvt_bf16_s(DisasContext *ctx, arg_fcvt_bf16_s *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_fcvt_bf16_s(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
     mark_fs_dirty(ctx);
@@ -58,6 +59,7 @@ static bool trans_fcvt_s_bf16(DisasContext *ctx, arg_fcvt_s_bf16 *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_fcvt_s_bf16(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
     mark_fs_dirty(ctx);

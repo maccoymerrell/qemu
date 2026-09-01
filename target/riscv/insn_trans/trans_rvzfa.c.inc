@@ -187,6 +187,8 @@ static bool trans_fminm_s(DisasContext *ctx, arg_fminm_s *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fminm_s(dest, tcg_env, src1, src2);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -203,6 +205,8 @@ static bool trans_fmaxm_s(DisasContext *ctx, arg_fmaxm_s *a)
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fmaxm_s(dest, tcg_env, src1, src2);
     gen_set_fpr_hs(ctx, a->rd, dest);
@@ -221,6 +225,8 @@ static bool trans_fminm_d(DisasContext *ctx, arg_fminm_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fminm_d(dest, tcg_env, src1, src2);
     gen_set_fpr_d(ctx, a->rd, dest);
 
@@ -237,6 +243,8 @@ static bool trans_fmaxm_d(DisasContext *ctx, arg_fmaxm_d *a)
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fmaxm_d(dest, tcg_env, src1, src2);
     gen_set_fpr_d(ctx, a->rd, dest);
@@ -255,6 +263,8 @@ static bool trans_fminm_h(DisasContext *ctx, arg_fminm_h *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fminm_h(dest, tcg_env, src1, src2);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -271,6 +281,8 @@ static bool trans_fmaxm_h(DisasContext *ctx, arg_fmaxm_h *a)
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fmaxm_h(dest, tcg_env, src1, src2);
     gen_set_fpr_hs(ctx, a->rd, dest);
@@ -289,6 +301,7 @@ static bool trans_fround_s(DisasContext *ctx, arg_fround_s *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_fround_s(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -306,6 +319,7 @@ static bool trans_froundnx_s(DisasContext *ctx, arg_froundnx_s *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_froundnx_s(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -323,6 +337,7 @@ static bool trans_fround_d(DisasContext *ctx, arg_fround_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_fround_d(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -340,6 +355,7 @@ static bool trans_froundnx_d(DisasContext *ctx, arg_froundnx_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_froundnx_d(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -357,6 +373,7 @@ static bool trans_fround_h(DisasContext *ctx, arg_fround_h *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_fround_h(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -374,6 +391,7 @@ static bool trans_froundnx_h(DisasContext *ctx, arg_froundnx_h *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
     gen_set_rm(ctx, a->rm);
+    note_fp_status_read();
     gen_helper_froundnx_h(dest, tcg_env, src1);
     gen_set_fpr_hs(ctx, a->rd, dest);
 
@@ -440,6 +458,8 @@ bool trans_fleq_s(DisasContext *ctx, arg_fleq_s *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fleq_s(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;
@@ -454,6 +474,8 @@ bool trans_fltq_s(DisasContext *ctx, arg_fltq_s *a)
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fltq_s(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
@@ -470,6 +492,8 @@ bool trans_fleq_d(DisasContext *ctx, arg_fleq_d *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fleq_d(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;
@@ -484,6 +508,8 @@ bool trans_fltq_d(DisasContext *ctx, arg_fltq_d *a)
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fltq_d(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
@@ -500,6 +526,8 @@ bool trans_fleq_h(DisasContext *ctx, arg_fleq_h *a)
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
 
+    note_fp_status_read();
+
     gen_helper_fleq_h(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;
@@ -514,6 +542,8 @@ bool trans_fltq_h(DisasContext *ctx, arg_fltq_h *a)
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
+
+    note_fp_status_read();
 
     gen_helper_fltq_h(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);

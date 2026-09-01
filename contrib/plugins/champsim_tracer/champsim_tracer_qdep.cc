@@ -668,6 +668,13 @@ std::atomic<uint64_t> g_src_wide{0};
  * side of the same vocabulary.
  */
 std::atomic<uint64_t> g_src_skip_global{0};
+/*
+ * ...and the fourth outcome, which is NOT a coverage path: the member is
+ * QEMU's own lowering state and must never have a word.  Counted apart so
+ * `global-word` keeps meaning "a register this file is missing a word for"
+ * -- see nonarch_lowering_reason().
+ */
+std::atomic<uint64_t> g_src_skip_lowering{0};
 std::atomic<uint64_t> g_src_skip_field_unnamed{0};
 std::atomic<uint64_t> g_src_skip_field_generic{0};
 std::atomic<uint64_t> g_src_skip_other{0};
@@ -2165,15 +2172,21 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
             continue;
         }
         if (gen >= REG_ID_COUNT) {
-            g_src_skip_global.fetch_add(1, std::memory_order_relaxed);
-            {
-                const char *nm = qemu_plugin_dataflow_reg_name(e[i].reg,
-                                                              nullptr, nullptr);
-                char *k2 = g_strdup_printf("global-word  %s",
-                                           nm ? nm : "?");
-                tally(&g_src_skip_sig, k2);
-                g_free(k2);
+            const char *nm = qemu_plugin_dataflow_reg_name(e[i].reg,
+                                                           nullptr, nullptr);
+            const char *low = nm ? nonarch_lowering_reason(trace_isa, nm)
+                                 : nullptr;
+            char *k2;
+
+            if (low) {
+                g_src_skip_lowering.fetch_add(1, std::memory_order_relaxed);
+                k2 = g_strdup_printf("lowering     %s -- %s", nm, low);
+            } else {
+                g_src_skip_global.fetch_add(1, std::memory_order_relaxed);
+                k2 = g_strdup_printf("global-word  %s", nm ? nm : "?");
             }
+            tally(&g_src_skip_sig, k2);
+            g_free(k2);
             skipped++;
             continue;
         }
@@ -5711,7 +5724,7 @@ void qdep_report(GString *report)
 
     g_mutex_lock(&g_tally_lock);
     dump_tally(report, g_src_skip_sig,
-               "READ-LIST MEMBERS THE TRACER'S VOCABULARY DROPPED, by reason\nand name.  Each row is a fact QEMU DID state about a source that this\nfile could not carry into the score, so every published register it\nwould have justified is counted UNJUSTIFIED instead.  The reason IS the\ncoverage path: `field-word` needs a generic word, `field-range` needs an\ninsn_dataflow_declare_regfile() row, `global-word` needs a name mapping:");
+               "READ-LIST MEMBERS THE TRACER'S VOCABULARY DROPPED, by reason\nand name.  Each row is a fact QEMU DID state about a source that this\nfile could not carry into the score, so every published register it\nwould have justified is counted UNJUSTIFIED instead.  The reason IS the\ncoverage path: `field-word` needs a generic word, `field-range` needs an\ninsn_dataflow_declare_regfile() row, `global-word` needs a name mapping.\n`lowering` is the one reason that is NOT a coverage path -- the member is\nQEMU's own lowering state, the architecture has no such register, and\ngiving it a word would publish the emulator's internals as architecture\n(R16).  Those rows are refused CORRECTLY and nothing is owed for them:");
     dump_tally(report, g_unmapped_name,
                "globals a provenance named that have no generic word\n(per ACCESS, so an instruction refused on both an address and a datum\ncounts twice here and once above):");
     dump_tally(report, g_refusal_sig,

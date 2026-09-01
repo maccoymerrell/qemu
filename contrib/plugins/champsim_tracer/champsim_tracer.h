@@ -1869,6 +1869,16 @@ uint8_t generic_for_qemu_name(const char *name);
 uint8_t fold_nonarch(const char *name);
 
 /*
+ * Why a TCG global is QEMU's own LOWERING STATE rather than a register the
+ * vocabulary is missing a word for, or nullptr when it is not.  A member
+ * this names is refused CORRECTLY and has no coverage path: giving it a
+ * word would publish QEMU's lowering as architecture, which R16 forbids.
+ * See the definition for what is and is not in it -- the LL/SC reservation
+ * is deliberately NOT, because the architecture really does have it.
+ */
+const char *nonarch_lowering_reason(TraceISA isa, const char *name);
+
+/*
  * Suppress the unknown-mnemonic warning and its counter for the duration of
  * a decode taken for measurement.  See champsim_tracer_decode.cc.
  */

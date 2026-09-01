@@ -372,6 +372,52 @@ void tally(GHashTable **t, const char *key)
 }  /* namespace -- reopened below; fold_nonarch is shared with the qdep TU,
     * because two copies of a name map are two maps that drift apart. */
 
+/*
+ * QEMU'S OWN LOWERING STATE, WHICH MUST NEVER BECOME A WORD (R16).
+ *
+ * A TCG global is not automatically a register.  Some of them hold state
+ * the ARCHITECTURE does not have, minted so one translation block can hand
+ * a value to the next: mips evaluates a branch condition into `bcond` and
+ * its target into `btarget` because the condition is computed BEFORE the
+ * delay slot and consumed AFTER it, and `hflags` is QEMU's cached digest of
+ * CP0 mode bits, recomputed by compute_hflags() rather than named by any
+ * instruction.  Nothing in the MIPS ISA can read or write any of the three.
+ *
+ * The read-list vocabulary census used to report them as `global-word`, the
+ * reason whose coverage path is "needs a name mapping" -- so 2,894 of
+ * mipsel's 2,978 drops read as a vocabulary gap somebody should close, when
+ * closing it would put QEMU's lowering on the wire and violate the one rule
+ * this arc is built on.  They are their own outcome now, with the reason,
+ * and the census stops asking for a fix that would be a defect.
+ *
+ * This is NOT the place for state the architecture does have and this file
+ * has no word for.  The LL/SC reservation is the live example -- mips
+ * `lladdr`/`llval`, riscv `load_res`/`load_val` -- and it stays counted as a
+ * vocabulary gap, because MIPS LLbit and the RISC-V reservation set are
+ * ISA-defined and an SC really does read them.  They need a generic id
+ * allocated, which is a wire-vocabulary decision and not a fold.
+ */
+const char *nonarch_lowering_reason(TraceISA isa, const char *name)
+{
+    if (isa != TRACE_ISA_MIPS) {
+        return nullptr;
+    }
+    if (!strcmp(name, "bcond")) {
+        return "mips delay-slot branch condition, computed before the "
+               "delay slot and consumed after it (translate.c:1178)";
+    }
+    if (!strcmp(name, "btarget")) {
+        return "mips delay-slot branch target, same mechanism as bcond "
+               "(translate.c:1177)";
+    }
+    if (!strcmp(name, "hflags")) {
+        return "QEMU's cached digest of CP0 mode bits, recomputed by "
+               "compute_hflags() and named by no instruction "
+               "(translate.c:1180)";
+    }
+    return nullptr;
+}
+
 uint8_t fold_nonarch(const char *name)
 {
     if (!strcmp(name, "cc_op") || !strcmp(name, "cc_dst") ||

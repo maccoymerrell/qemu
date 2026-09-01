@@ -125,17 +125,57 @@ def read_ledger(path):
     return out
 
 
-def compare(a_path, b_path, isas, ledger):
-    """Returns (rc, report_lines, losses, adjudicated, gains)."""
+def read_reach(path):
+    """(isa, encoding) -> (reach class, subclass, rule).
+
+       Written by srcenc_reach.py beside this file.  A restriction whose file
+       cannot be read is a REFUSAL, never an unrestricted run: a bar that
+       silently scores the whole population when its filter goes missing is
+       the loudest version of the silent false success this tree keeps
+       filing."""
+    out = {}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 3:
+                continue
+            out[(f[0], f[1].strip().lower())] = (
+                f[2], f[3] if len(f) > 3 else "?",
+                f[4] if len(f) > 4 else "?")
+    if not out:
+        raise SystemExit("srcenc_ab: reach corpus %s carried no rows -- "
+                         "REFUSING" % path)
+    return out
+
+
+def compare(a_path, b_path, isas, ledger, reach=None, keep=("INSTRUCTION",)):
+    """Returns (rc, report_lines, losses, adjudicated, gains).
+
+       @reach RESTRICTS the scored population to the encodings the sled
+       reached as INSTRUCTIONS.  It is a restriction and not a filter on the
+       ANSWER: matched coverage is still checked over the FULL population
+       above, so a restriction can never hide an arm that stopped reaching an
+       encoding, and every excluded encoding is counted and reported by class
+       so the exclusion is enumerable rather than assumed.  A shared encoding
+       with no reach row REFUSES -- neither keeping nor dropping it is an
+       answer the caller asked for."""
     lines = []
     losses = []          # (isa, enc, mnem, reg)
     adjud = []           # (isa, enc, mnem, reg, reason)
     gains = 0
     used = set()
     rc = 0
+    excluded = {}        # (isa, class) -> count
+    exc_rules = {}       # (isa, class) -> {rule: count}
+    unclassified = []
     lines.append("=== PUBLISHED SOURCE SETS, PER ENCODING, ARM A vs ARM B ===")
     lines.append("A = %s" % a_path)
     lines.append("B = %s" % b_path)
+    if reach is not None:
+        lines.append("REACH RESTRICTION: scoring only %s (%d classified "
+                     "encodings)" % ("/".join(keep), len(reach)))
 
     A, ea = load(a_path)
     B, eb = load(b_path)
@@ -173,6 +213,17 @@ def compare(a_path, b_path, isas, ledger):
                          "same encodings, so a DISAGREE count over them is "
                          "not readable.")
         for k in sorted(shared):
+            if reach is not None:
+                cls = reach.get(k)
+                if cls is None:
+                    unclassified.append(k)
+                    continue
+                if cls[0] not in keep:
+                    excluded[(isa, cls[0])] = \
+                        excluded.get((isa, cls[0]), 0) + 1
+                    d = exc_rules.setdefault((isa, cls[0]), {})
+                    d[cls[2]] = d.get(cls[2], 0) + 1
+                    continue
             lost = sorted(A[k][1] - B[k][1])
             got = sorted(B[k][1] - A[k][1])
             gains += len(got)
@@ -193,6 +244,29 @@ def compare(a_path, b_path, isas, ledger):
         if isa not in isas:
             lines.append("  NOTE: %s is in the corpus and was not scored "
                          "(not in --isa)" % isa)
+
+    if reach is not None:
+        lines.append("")
+        lines.append("=== THE EXCLUDED POPULATION (not scored), BY CLASS ===")
+        if not excluded:
+            lines.append("    none")
+        for key in sorted(excluded):
+            lines.append("  %-8s %-16s %9d encodings" % (key[0], key[1],
+                                                         excluded[key]))
+            d = exc_rules.get(key, {})
+            for rn in sorted(d, key=lambda r: -d[r])[:10]:
+                lines.append("      %-56s %9d" % (rn[:56], d[rn]))
+            lines.append("      (%d distinct rules)" % len(d))
+        if unclassified:
+            rc = 2
+            lines.append("UNCLASSIFIED shared encodings: %d -- REFUSING."
+                         % len(unclassified))
+            for k in unclassified[:8]:
+                lines.append("      %-8s %s" % (k[0], k[1]))
+            lines.append("      A reach restriction that does not cover the "
+                         "population cannot say whether the rows it does not "
+                         "name were reached; keeping OR dropping them would "
+                         "be a guess.")
 
     lines.append("")
     lines.append("ADJUDICATED losses (counted, excluded from the bar): %d"
@@ -338,6 +412,49 @@ def selftest():
     chk("L an ISA absent from BOTH arms is an ERROR, not a silent zero",
         rc == 2, "\n".join(lines))
 
+    # ---------------------------------------------------------------
+    # THE REACH RESTRICTION.  Two planted fires in opposite directions:
+    # a loss on an encoding the sled reached as an INSTRUCTION must still
+    # fire, and the SAME loss on an encoding it only reached as a trap must
+    # not -- and a population the restriction does not cover must REFUSE
+    # rather than pick a default.
+    # ---------------------------------------------------------------
+    def _reach(rows):
+        pth = os.path.join(d, "reach_%d.tsv" % len(ran))
+        with open(pth, "w") as fh:
+            fh.write("#isa\tencoding\treach\tsubclass\trule\tmnem\n")
+            for isa, enc, cls, rule in rows:
+                fh.write("%s\t%s\t%s\tsub\t%s\tm\n" % (isa, enc, cls, rule))
+        return read_reach(pth)
+
+    all_insn = _reach([(i, e, "INSTRUCTION", "r") for i in ISAS
+                       for e in ("d9e5", "f7fe")])
+    rc, lines, loss, adj, gains = compare(a, c, ISAS, {}, reach=all_insn)
+    chk("M a loss on a REACHED=INSTRUCTION encoding still FIRES (rc=1)",
+        rc == 1 and len(loss) == 4, "\n".join(lines))
+
+    trapped = _reach([(i, "d9e5", "TRAP-TRANSLATED", "disas_sme/LDST1")
+                      for i in ISAS]
+                     + [(i, "f7fe", "INSTRUCTION", "r") for i in ISAS])
+    rc, lines, loss, adj, gains = compare(a, c, ISAS, {}, reach=trapped)
+    chk("N the same loss on a TRAP-TRANSLATED encoding is EXCLUDED (rc=0)",
+        rc == 0 and not loss, "\n".join(lines))
+    chk("N2 ... and the exclusion is ENUMERATED by class and rule",
+        any("TRAP-TRANSLATED" in L for L in lines)
+        and any("disas_sme/LDST1" in L for L in lines), "\n".join(lines))
+
+    short = _reach([(i, "d9e5", "INSTRUCTION", "r") for i in ISAS])
+    rc, lines, loss, adj, gains = compare(a, c, ISAS, {}, reach=short)
+    chk("O a reach corpus that does not COVER the population REFUSES (rc=2)",
+        rc == 2 and any("UNCLASSIFIED" in L for L in lines), "\n".join(lines))
+
+    # And the restriction must not be able to hide a COVERAGE break: an arm
+    # that stopped reaching an encoding is an error even when the missing
+    # encoding is one the restriction would have excluded anyway.
+    rc, lines, loss, adj, gains = compare(a, g, ISAS, {}, reach=trapped)
+    chk("P unmatched coverage is STILL an ERROR under a restriction (rc=2)",
+        rc == 2, "\n".join(lines))
+
     print("\nsrcenc_ab.py selftest: %d check(s), %d failure(s)"
           % (len(ran), len(fails)))
     return 1 if fails else 0
@@ -350,13 +467,24 @@ def main(argv):
     ap.add_argument("--isa", action="append", default=None)
     ap.add_argument("--adjudicated", default=None)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--reach", default=None,
+                    help="a reach corpus from srcenc_reach.py.  RESTRICTS "
+                         "the scored population to the encodings the sled "
+                         "reached as instructions; matched coverage is still "
+                         "checked over the full population, and every "
+                         "excluded encoding is reported by class and rule.")
+    ap.add_argument("--reach-keep", action="append", default=None,
+                    help="reach class(es) to SCORE (default INSTRUCTION)")
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
     if not (args.a and args.b):
         ap.error("two corpus files are required")
+    reach = read_reach(args.reach) if args.reach else None
     rc, lines, _, _, _ = compare(args.a, args.b, tuple(args.isa or ISAS),
-                                 read_ledger(args.adjudicated))
+                                 read_ledger(args.adjudicated), reach=reach,
+                                 keep=tuple(args.reach_keep
+                                            or ("INSTRUCTION",)))
     print("\n".join(lines))
     return rc
 

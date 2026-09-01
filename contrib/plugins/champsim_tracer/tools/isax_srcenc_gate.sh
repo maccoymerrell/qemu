@@ -104,10 +104,15 @@ run_arms() {
             [ "$r" = 2 ] && worst=2
             [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
             grep -h '^# srcenc=' "$out/${layer:0:1}_$isa.txt" >> "$out/rc.txt" 2>/dev/null
-            local u
-            u=$(grep -c '^UNREACHED' "$out/${layer:0:1}_$isa.txt" 2>/dev/null || echo 0)
-            [ "$u" != 0 ] && echo "  unreached_mnemonics_named=$u (UNREACHED lines" \
-                "in ${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
+            # Only a --srcenc arm has a reach to report.  `grep -c` exits 1
+            # on zero matches, so its status is discarded rather than turned
+            # into a second count by an `|| echo`.
+            if [ -n "$corpus" ]; then
+                local u
+                u=$(grep -c '^UNREACHED' "$out/${layer:0:1}_$isa.txt" 2>/dev/null) || true
+                echo "  unreached_mnemonics_named=${u:-0} (UNREACHED lines in" \
+                     "${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
+            fi
         done
     done
     echo "ALL_ARMS_DONE worst_rc=$worst" >> "$out/rc.txt"

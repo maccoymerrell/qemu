@@ -2772,9 +2772,21 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
     target_ulong uimm;
 
     if (rt == 0) {
-        /* If no destination, treat it as a NOP. */
-        /* The operands the NOP erases; see note_gpr_folded_read(). */
-        note_gpr_folded_read(rs);
+        /*
+         * If no destination, treat it as a NOP.
+         *
+         * The operand the NOP erases; see note_gpr_folded_read().  LUI is
+         * the exception and it is a REAL one: before MIPS32R6 `lui rt,imm`
+         * has no source register at all -- bits 25:21 are a reserved field
+         * the architecture requires to be zero, not a register the encoding
+         * names -- and only R6's AUI makes them an operand.  The same test
+         * the emitter itself uses below decides it.  Measured: stating it
+         * unconditionally put REG_ZERO on 2,304 `lui` encodings that read
+         * nothing, which is the fabrication R15/R16 call a defect.
+         */
+        if (opc != OPC_LUI || (ctx->insn_flags & ISA_MIPS_R6)) {
+            note_gpr_folded_read(rs);
+        }
         return;
     }
     uimm = (uint16_t)imm;

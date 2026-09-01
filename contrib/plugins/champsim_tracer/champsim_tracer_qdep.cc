@@ -241,6 +241,51 @@ std::atomic<uint64_t> g_src_flip_no_row{0};
 GHashTable *g_src_flip_missing_sig = nullptr;
 GHashTable *g_src_flip_extra_sig = nullptr;
 /*
+ * THE SURVIVOR-ROW REFUTATION -- the fabrication instrument that is not
+ * circular.
+ *
+ * g_src_flip_extra above scores "a register a survivor row supplies that the
+ * WIRE does not publish", and it reads zero by construction: qemu_named_regs()
+ * has already seated the survivor row's own output INTO that wire, so the row
+ * is being compared against a list that contains it.  It read 0 on all four
+ * ISAs through PASS 45 while TWELVE aarch64 SVE encodings were publishing a
+ * predicate or a store-data vector their encoding does not name (exec81 M3),
+ * and it would have read 0 for any successor of those.  A number that cannot
+ * be anything but zero is not evidence, so it stays -- as the SEATING CHECK
+ * it actually is -- and the fabrication question is asked somewhere else.
+ *
+ * ASKED AGAINST QEMU'S STATED FACTS INSTEAD, never against the wire.  For
+ * each register a survivor row supplies to an instruction, the fact recorded
+ * is whether QEMU's own stated read list carries it -- named, or inside a
+ * stated container under the #277 rule.  Keyed on (decode id, rule,
+ * register), so the two tallies below are the same population split by what
+ * the emulator said, and NOTHING the wire publishes enters either one.
+ *
+ * THE REFUTATION IS THE JOIN.  A key that appears in BOTH tables is a rule
+ * for which QEMU states that register on some instances and does not on
+ * others -- and a SRC_SURV_FIXED row means "the same register on every
+ * instruction this rule decodes".  On the instances where QEMU is silent the
+ * row is supplying a register the encoding does not carry.  That is exactly
+ * the M3 shape: `ld1b` under LD_zpri, where the decodetree pattern leaves Pg
+ * free, QEMU now states the governing predicate per instance, and a row
+ * frozen at REG_PRED1 fabricates it on every p0 instance.
+ *
+ * WHY THIS DOES NOT FIRE ON A LEGITIMATE FIXED ROW.  x86 `idivl` reads
+ * REG_GPR0 and REG_GPR2 by ISA definition and QEMU states NEITHER on ANY
+ * instance, so those keys are silent-only and never join.  A row whose
+ * register QEMU always states is stated-only and never joins either -- it is
+ * a redundant row, which is a different finding and is reported as one.  The
+ * join needs the emulator's own facts to DISAGREE with themselves across
+ * instances of one rule, and only an ENCODED operand does that.
+ *
+ * MEASUREMENT ONLY.  Nothing here writes a wire field.
+ */
+std::atomic<uint64_t> g_surv_ref_stated{0};
+std::atomic<uint64_t> g_surv_ref_silent{0};
+GHashTable *g_surv_ref_stated_sig = nullptr;
+GHashTable *g_surv_ref_silent_sig = nullptr;
+GHashTable *g_surv_ref_short_sig = nullptr;
+/*
  * THE ADJUDICATION LEDGER -- the THIRD outcome of the loss direction, and
  * the reason it is not the second.
  *
@@ -3211,6 +3256,71 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      */
     dump_src_pc_row(f, q, mnem, wstate);
     /*
+     * THE SURVIVOR-ROW REFUTATION, and it runs OUTSIDE the read-list gate
+     * below for the same reason the witness above does: the claim under
+     * test is about the DECODE RULE, which exists whether or not QEMU
+     * stated a complete read list, and the population that most needs
+     * testing is exactly the one a `src_state == QDEP_OK` gate skips.  The
+     * fourteen SVE encodings exec81 measured as fabricating are all in it.
+     *
+     * See g_surv_ref_stated for why the JOIN of the tallies is the finding
+     * and no single tally is one.
+     */
+    {
+        uint8_t sv[MAX_SRC_REGS];
+        uint8_t nsv = src_survivor_regs(q->decode_id, f, sv,
+                                        (uint8_t)MAX_SRC_REGS);
+
+        for (uint8_t k = 0; k < nsv; k++) {
+            bool stated = false;
+
+            for (uint8_t j = 0; j < q->n_src; j++) {
+                if (q->src_reg[j] == sv[k]) {
+                    stated = true;
+                    break;
+                }
+            }
+            /* The composed-register reading (#277), the same direction the
+             * justification test runs it in: a container QEMU states carries
+             * its member, so a survivor register inside one is STATED. */
+            for (uint8_t j = 0; !stated && j < q->n_src_cont; j++) {
+                if (sv[k] >= q->src_cont_lo[j] && sv[k] <= q->src_cont_hi[j]) {
+                    stated = true;
+                }
+            }
+            /*
+             * Keyed on (decode id, rule, register) and NOT on the mnemonic:
+             * the claim is about the RULE, and a key carrying the mnemonic
+             * would split one rule's instances into buckets that can never
+             * join.
+             */
+            char *rkey = g_strdup_printf(
+                "%08x %-26s %s", q->decode_id,
+                q->decode_name ? q->decode_name : "?",
+                generic_reg_name_or_unknown(sv[k]));
+
+            if (stated) {
+                g_surv_ref_stated.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_surv_ref_stated_sig, rkey);
+            } else {
+                g_surv_ref_silent.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_surv_ref_silent_sig, rkey);
+                /*
+                 * A silent instance whose read list QEMU did not state in
+                 * full is WEAKER evidence -- the register could be missing
+                 * from the shortfall rather than from the encoding -- so it
+                 * is counted apart and printed on the row.  Folding the two
+                 * would let a short list masquerade as a fabrication, and
+                 * separating them costs one counter.
+                 */
+                if (q->src_state != QDEP_OK) {
+                    tally(&g_surv_ref_short_sig, rkey);
+                }
+            }
+            g_free(rkey);
+        }
+    }
+    /*
      * THE SOURCE-SIDE MEMBERSHIP CENSUS (the unmeasured half).
      *
      * Per PUBLISHED source entry: did QEMU state a read that justifies it?
@@ -5421,6 +5531,112 @@ void qdep_report(GString *report)
                "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows.  A row leaves this block by being RULED, never by being deleted:\nthe ruled rows are in the R16 block below, with their counts intact:");
     dump_tally(report, g_src_adj_r16_sig,
                "JUSTIFIED BY ADJUDICATION (R16) -- the same ledger, the rows\na RULING has closed.  Columns: decode id, rule, register, mnemonic, and\nthe RULING the row closed under, quoted rather than referenced so the\nreason travels with the sidecar.  These are NOT counted as MISSING and\nare NOT folded into JUSTIFIED: JUSTIFIED means QEMU's ordered read list\ncontains the register, which for these rows it does not, and a census\nthat spent a ruling and a read-list hit into one column could no longer\nsay which of its rows rest on a measurement.  A source-list flip MAY\nland with this block non-empty, and must carry every register in it:");
+    /*
+     * THE SURVIVOR-ROW REFUTATION, printed as the JOIN of the two tallies
+     * rather than as either of them.  Runs with @g_tally_lock HELD, so it
+     * reads the tables directly -- tally() takes the lock and would wedge
+     * the report, which is how that split came to be named at all.
+     */
+    {
+        uint64_t rows = 0, insns = 0, redundant = 0, short_insns = 0;
+        GString *body = g_string_new(nullptr);
+
+        if (g_surv_ref_silent_sig) {
+            GList *keys = g_hash_table_get_keys(g_surv_ref_silent_sig);
+
+            keys = g_list_sort(keys, (GCompareFunc)g_strcmp0);
+            for (GList *l = keys; l; l = l->next) {
+                guint sil = GPOINTER_TO_UINT(
+                    g_hash_table_lookup(g_surv_ref_silent_sig, l->data));
+                guint sta = g_surv_ref_stated_sig
+                    ? GPOINTER_TO_UINT(g_hash_table_lookup(
+                          g_surv_ref_stated_sig, l->data)) : 0;
+
+                if (!sta) {
+                    continue;   /* silent on every instance: not refuted */
+                }
+                guint sh = g_surv_ref_short_sig
+                    ? GPOINTER_TO_UINT(g_hash_table_lookup(
+                          g_surv_ref_short_sig, l->data)) : 0;
+
+                rows++;
+                insns += sil;
+                short_insns += sh;
+                g_string_append_printf(body,
+                    "  %8u silent (%u under a SHORT read list)  %8u stated"
+                    "  %s\n", sil, sh, sta, (const char *)l->data);
+            }
+            g_list_free(keys);
+        }
+        if (g_surv_ref_stated_sig) {
+            GList *keys = g_hash_table_get_keys(g_surv_ref_stated_sig);
+
+            for (GList *l = keys; l; l = l->next) {
+                if (!g_surv_ref_silent_sig
+                    || !g_hash_table_lookup(g_surv_ref_silent_sig, l->data)) {
+                    redundant++;
+                }
+            }
+            g_list_free(keys);
+        }
+        g_string_append_printf(report,
+            "\nTHE SURVIVOR-ROW REFUTATION -- survivor rows scored against"
+            " QEMU'S OWN\nSTATED FACTS, never against the wire.  A register a"
+            " row supplies is\nrecorded as STATED when the emulator's ordered"
+            " read list carries it\n(named, or inside a stated container under"
+            " #277) and SILENT when it does\nnot.  Neither tally is a finding."
+            "  The finding is the JOIN: a rule whose\nown emulator facts say"
+            " the register on some instances and not on others is\na rule for"
+            " which that register is an ENCODED OPERAND, and a SRC_SURV_FIXED"
+            "\nrow claiming it on every instance FABRICATES it on the rest."
+            "\n\nTHIS IS NOT g_src_flip_extra ABOVE, which is circular:"
+            " qemu_named_regs()\nseats a survivor row's output into the wire"
+            " before that column compares the\ntwo, so it reads zero by"
+            " construction and read zero through PASS 45 while\ntwelve"
+            " aarch64 SVE encodings published a predicate or a vector their"
+            "\nencoding does not name.\n"
+            "  %10" G_GUINT64_FORMAT "  survivor register-instances QEMU'S"
+            " READ LIST STATES\n"
+            "  %10" G_GUINT64_FORMAT "  survivor register-instances QEMU IS"
+            " SILENT about\n"
+            "  %10" G_GUINT64_FORMAT "  REFUTED ROWS -- (rule, register) pairs"
+            " QEMU states on some\n"
+            "              instances and not others.  MUST BE 0: the register"
+            " is an\n"
+            "               encoded operand and the row is not keyed on what"
+            " it claims\n"
+            "               to be keyed on.  The remedy is QEMU stating the"
+            " operand at\n"
+            "               the decode site and the row being dropped by the"
+            " generator,\n"
+            "               never a finer survivor key\n"
+            "  %10" G_GUINT64_FORMAT "  register-instances those refuted rows"
+            " FABRICATE\n"
+            "  %10" G_GUINT64_FORMAT "  ... of which the instance's read list"
+            " was SHORT, so the\n"
+            "               register could be missing from the shortfall"
+            " rather than\n"
+            "               from the encoding.  Counted apart and never"
+            " folded in:\n"
+            "               a short list may not masquerade as a"
+            " fabrication\n"
+            "  %10" G_GUINT64_FORMAT "  rows QEMU states on EVERY instance --"
+            " REDUNDANT, not wrong:\n"
+            "               the emulator already carries the register and the"
+            " row adds\n"
+            "               nothing.  Reported so a table audit can retire"
+            " them\n",
+            g_surv_ref_stated.load(std::memory_order_relaxed),
+            g_surv_ref_silent.load(std::memory_order_relaxed),
+            rows, insns, short_insns, redundant);
+        if (rows) {
+            g_string_append(report,
+                "  the refuted rows, one line each (silent instances, stated"
+                " instances,\n  decode id, rule, register):\n");
+            g_string_append(report, body->str);
+        }
+        g_string_free(body, TRUE);
+    }
     dump_tally(report, g_src_flip_extra_sig,
                "FLIP COST, THE FABRICATION DIRECTION -- registers a\nSURVIVOR ROW supplies that the wire does not publish, by decode id, rule,\nregister and mnemonic.  A FIXED row reaching an instruction the rule\ndecodes but that does not read the register lands here, and so does a\nSELF row on an instruction whose destination is not also a source.  The\nblock is empty when every row is right for every instruction its rule\ncarries:");
     dump_tally(report, g_src_qemu_extra_sig,

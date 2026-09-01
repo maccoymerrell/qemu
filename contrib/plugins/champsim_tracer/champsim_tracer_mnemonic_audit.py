@@ -6669,6 +6669,17 @@ class Statement:
     source: str        # comment | format | pattern | prefix | ruled
     why: str = ""      # for a ruled word, the QEMU source fact
     no_class: bool = False   # a NAMED non-architectural kind
+    # THE IDENTITY CANNOT REACH A PLUGIN AT ALL.  Distinct from
+    # `no_class`, which is a rule that IS published and whose class is a
+    # trap.  This is a rule whose id no encoding can carry to the publish
+    # site: the row is a decode step, the decoder replaces it before any
+    # code is generated, and the one path that keeps the step's own id
+    # leaves the decode before the identity is recorded.  Such a row
+    # states GEN_OP_UNKNOWN and says why on its own face -- naming a
+    # class for it would be describing an instruction that does not
+    # exist, and the plugin's own qemu_ident_classify() falls back to
+    # Capstone on an UNKNOWN payload and counts the fallback.
+    unpublishable: bool = False
 
 
 # Where each target's decode sources live, for resolving the basename the
@@ -8036,24 +8047,37 @@ def _x86_group_row(ident: QemuIdent) -> Statement | None:
     encoding falls to `if (!decode.e.gen) goto unknown_op`
     (decode-new.c.inc:2786), which is #UD.
 
-    It is therefore the NAMED kind the reserved encodings take, on the
-    same terms riscv's `illegal` and MIPS's OPC_SPECIAL take it: the row
-    states that the rule has no data behaviour because it has no
-    instruction, rather than declining to answer.  That every group
-    decoder really does restamp is CHECKED, not assumed -- see
-    _x86_group_decoders_restamp().
+    IT IS NOT THE TRAP KIND, AND THAT WAS THE CORRECTION.  These rows
+    used to state GEN_OP_SYSCALL / BRANCH_SYSCALL_TYPE on the same terms
+    riscv's `illegal` and MIPS's OPC_SPECIAL take it -- the trap the
+    machine takes.  Those two rules ARE published: a decodetree rule that
+    refuses an encoding is still reached, and the instruction executes as
+    an exception.  This one is not.  `if (!decode.e.gen) goto unknown_op`
+    sits UPSTREAM of plugin_gen_record_insn_identity(), so the single
+    path that keeps a group row's own id leaves disas_insn() before the
+    identity is recorded and the id reaches no plugin on any path.
+    Stating a class for it would be classifying an instruction that
+    cannot appear, so the row states GEN_OP_UNKNOWN and carries the
+    reason; the plugin falls back to Capstone on an UNKNOWN payload and
+    counts the fallback, so the safe direction is also the honest one.
+
+    BOTH HALVES ARE CHECKED, NOT ASSUMED: that every group decoder really
+    does restamp (_x86_group_decoders_restamp) and that the #UD exit
+    really is above the publish (_x86_unknown_op_precedes_publish).
     """
     if not ident.kind.startswith("GROUP"):
         return None
     return Statement(
-        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+        ent("GEN_OP_UNKNOWN"),
         _word(ident.pattern), "kind",
         f"{ident.src_file}:{ident.src_line} is an X86_OP_GROUP* row -- "
         f"decode_{ident.pattern}() replaces the entry and restamps .slot "
-        f"with the leaf's own __LINE__, so this id publishes only for an "
-        f"encoding no leaf claimed, which decode-new.c.inc:2786 takes "
-        f"to #UD",
-        no_class=True)
+        f"with the leaf's own __LINE__, so the only encoding that keeps "
+        f"this id is one no leaf claimed; that encoding leaves through "
+        f"`if (!decode.e.gen) goto unknown_op`, which is UPSTREAM of the "
+        f"identity publish, so the id reaches no plugin on any path and "
+        f"there is no instruction here to classify",
+        no_class=True, unpublishable=True)
 
 
 RULE_KIND_HOOKS = {
@@ -8316,6 +8340,40 @@ def _x86_group_decoders_restamp(idents: list[QemuIdent]) -> None:
             f"through #UD, and that is no longer true.")
 
 
+def _x86_unknown_op_precedes_publish() -> None:
+    """The #UD exit for an unclaimed encoding is ABOVE the identity publish.
+
+    _x86_group_row() states that a GROUP row's id reaches no plugin on
+    any path, and the whole of that claim is one ordering: a decode whose
+    entry no leaf claimed leaves through `if (!decode.e.gen) goto
+    unknown_op`, and that test is upstream of
+    plugin_gen_record_insn_identity(decode.e.slot, ...).  If a future edit
+    moved the publish above it -- or moved the test below it -- every
+    group row would start publishing its own id for the reserved
+    encodings under it, and the rows would be saying GEN_OP_UNKNOWN about
+    instructions that really do reach the wire.  That is a silent
+    reversal, so it is measured here rather than remembered.
+    """
+    lines = _decode_source_text("x86", QEMU_IDENT_SOURCE_TABLES["x86"])
+    guard = [n for n, l in enumerate(lines, 1)
+             if re.match(r'\s*if \(!decode\.e\.gen\) \{\s*$', l)]
+    pub = [n for n, l in enumerate(lines, 1)
+           if "plugin_gen_record_insn_identity(decode.e.slot" in l]
+    if len(guard) != 1 or len(pub) != 1:
+        raise SystemExit(
+            f"x86: expected exactly one `if (!decode.e.gen)` guard and one "
+            f"identity publish in {QEMU_IDENT_SOURCE_TABLES['x86']}, found "
+            f"{len(guard)} and {len(pub)}.  The group rows' claim that their "
+            f"id reaches no plugin rests on their order; it cannot be read.")
+    if guard[0] >= pub[0]:
+        raise SystemExit(
+            f"x86: the unclaimed-encoding exit is at line {guard[0]} and the "
+            f"identity publish at line {pub[0]} -- the exit is NO LONGER "
+            f"above the publish, so an X86_OP_GROUP* row's own id now "
+            f"reaches a plugin.  Those rows state GEN_OP_UNKNOWN because it "
+            f"could not; re-state them before this ships.")
+
+
 def _x86_jcc_is_the_condition_field(idents: list[QemuIdent]) -> None:
     """The Jcc rows are the sixteen conditions, twice, and nothing else.
 
@@ -8556,6 +8614,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
         if info.key == "x86":
             _refuse_dead_x86_row_flags(idents)
             _x86_group_decoders_restamp(idents)
+            _x86_unknown_op_precedes_publish()
             _x86_jcc_is_the_condition_field(idents)
     m2c = _mnemonic_to_const(info)
     v2c = enum_value_map(info)
@@ -8704,6 +8763,18 @@ def _apply_statement(info: IsaInfo, ident: QemuIdent, entry: Entry,
             f"the word QEMU used, or rule it in QEMU_RULE_STATEMENTS with "
             f"the source fact that states it.  Words tried: "
             f"{', '.join(w for w, _ in qemu_rule_words(info, ident))}")
+    if st.unpublishable:
+        # The rule's identity cannot reach a plugin, so there is no
+        # instruction under this row to classify and no older payload to
+        # weigh against.  A NAME_MATCHED payload here is the Capstone
+        # spelling of the GROUP's own placeholder name -- `VINSERTPS`,
+        # `group1`, `x87` -- joined to a rule that is a decode step, and
+        # keeping it would publish one instruction's class beside
+        # another's name for an encoding that never arrives.  The row
+        # states UNKNOWN and says why, and no disagreement ruling is
+        # asked for: the two sides are not disagreeing about an
+        # instruction, one of them is describing a step.
+        return Entry("GEN_OP_UNKNOWN"), QID_STATED, st, None
     had_payload = entry.op != "GEN_OP_UNKNOWN"
     if not had_payload:
         return st.entry, QID_STATED, st, None
@@ -8848,7 +8919,15 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
 
     for r in rows:
         note = ""
-        if r.stmt_ruled:
+        if r.stmt is not None and r.stmt.unpublishable:
+            # A row whose identity cannot reach a plugin at all.  It says
+            # so ON ITS FACE, because a reader who finds GEN_OP_UNKNOWN
+            # here has to be able to tell "nobody has classified this
+            # yet" from "there is nothing here to classify" -- and the
+            # second is a stronger statement than the first, not a
+            # weaker one.
+            note = _note("NOT PUBLISHABLE -- " + r.stmt.why)
+        elif r.stmt_ruled:
             # A statement that disagreed with an older payload, and the
             # ruling that settled it.  It goes BESIDE THE ROW for the same
             # reason an adjudication does: the header is what a reader

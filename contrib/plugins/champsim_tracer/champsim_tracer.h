@@ -1517,21 +1517,25 @@ extern unsigned active_qemu_ident_size;
 
 /*
  * The classification QEMU's own decode rule states for @id, or nullptr
- * when the rule states none.  Deciding tiers are QID_VERIFIED (the R20
- * tables) and QID_OBSERVED / QID_ADJUDICATED (the tables whose vocabulary
- * has not been taught yet); QID_STATED, QID_SPLIT, QID_NAME_MATCHED,
- * QID_NONE, an id with no row, and id 0 (no identity recorded -- an
- * offline decode of raw bytes always is) are SURVIVORS and return nullptr
- * so the caller keeps the Capstone answer.  Every call is tallied into
- * one of the classes below.
+ * when the rule states none.  Deciding tiers are QID_STATED and
+ * QID_VERIFIED (the R20 tables) and QID_OBSERVED / QID_ADJUDICATED (the
+ * tables whose vocabulary has not been taught yet); QID_SPLIT,
+ * QID_NAME_MATCHED, QID_NONE, an id with no row, and id 0 (no identity
+ * recorded -- an offline decode of raw bytes always is) are SURVIVORS and
+ * return nullptr so the caller keeps the Capstone answer.  Every call is
+ * tallied into one of the classes below.
  *
- * QID_STATED SURVIVES HERE ON PURPOSE, and it is the one row of this
- * census that is a statement of work rather than of evidence.  Under R20
- * the statement IS the classification, so a stated row has an answer and
- * this gate declines to take it.  Admitting it is a wire change on every
- * rule a corpus never reached, which is a population that has to be
- * attributed row by row -- the admission gate's own wave.  Until then the
- * count below says exactly how much answer is being left on the table.
+ * QID_STATED IS ADMITTED, and what it means to admit it is worth being
+ * exact about.  Under R20 the class of a rule is a compile-time property
+ * of QEMU's decoder, read from the rule's own words at generation time;
+ * an execution can DISAGREE with that statement, which is what
+ * QID_VERIFIED records, but it cannot supply it.  So the difference
+ * between the two deciding R20 tiers is whether a check has run, never
+ * whether an answer exists, and a gate that refused STATED was publishing
+ * a disassembler's opinion over the emulator's own on every rule no
+ * corpus had happened to reach.  The two are still counted apart, because
+ * "how much of the decided population has an independent reading behind
+ * it" is a question the census must keep being able to answer.
  */
 const InsnClassification *qemu_ident_classify(
     uint32_t id, const InsnClassification *cap_row);
@@ -1545,6 +1549,15 @@ const InsnClassification *qemu_ident_classify(
 uint64_t qemu_ident_decided_observed(void);
 
 /*
+ * Decodes the identity decided on the tier whose class QEMU's rule STATES
+ * and which nothing independent has yet been read against -- QID_STATED.
+ * Reported beside qemu_ident_decided_observed() rather than folded into
+ * it: both are published, and the split is the standing measure of how
+ * much of the wire's classification a second reading has confirmed.
+ */
+uint64_t qemu_ident_decided_stated(void);
+
+/*
  * The survivor census, by the reason the rule stated nothing.  Counted per
  * class because a single total cannot tell three open split rules from
  * three thousand rows no corpus has ever reached, and those have different
@@ -1556,14 +1569,6 @@ typedef struct {
     uint64_t split;
     uint64_t name_matched;
     uint64_t none;
-    /*
-     * Decodes through a row whose class QEMU's own rule STATES and which
-     * nothing independent has yet been read against.  Not a hole in the
-     * table -- the statement is complete -- but a hole in what this gate
-     * admits, and it is counted apart from the tiers that really do
-     * carry no answer so the two can never be read as one number.
-     */
-    uint64_t stated;
     uint64_t no_row;
     uint64_t no_ident;
     uint64_t decided_unknown;

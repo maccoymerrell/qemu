@@ -872,9 +872,16 @@ static std::atomic<uint64_t> g_qid_decided_observed{0};
 static std::atomic<uint64_t> g_qid_surv_split{0};
 static std::atomic<uint64_t> g_qid_surv_name_matched{0};
 static std::atomic<uint64_t> g_qid_surv_none{0};
-/* Rows whose class QEMU's rule STATES, which this gate does not
- * yet admit -- see qemu_ident_classify() in champsim_tracer.h. */
-static std::atomic<uint64_t> g_qid_surv_stated{0};
+/*
+ * Rows whose class QEMU's own decode RULE states, and which nothing
+ * independent has yet been read against -- see qemu_ident_classify() in
+ * champsim_tracer.h.  DECIDED, not a survivor: under R20 the statement IS
+ * the classification, and a tier that carries the answer and is refused
+ * anyway publishes a disassembler's opinion over the emulator's own.
+ * Counted apart from QID_VERIFIED so the census keeps saying how much of
+ * the decided population has an independent reading behind it.
+ */
+static std::atomic<uint64_t> g_qid_decided_stated{0};
 static std::atomic<uint64_t> g_qid_surv_no_row{0};
 static std::atomic<uint64_t> g_qid_surv_no_ident{0};
 /*
@@ -1027,14 +1034,16 @@ const InsnClassification *qemu_ident_classify(
         g_qid_decided_observed.fetch_add(1, std::memory_order_relaxed);
         break;
     /*
-     * A STATED row has an answer and this gate does not take it yet --
-     * see the note on qemu_ident_classify() in champsim_tracer.h.  It is
-     * counted in a column of its own so it can never be added to the
-     * tiers that genuinely carry no class.
+     * A STATED row's class is a compile-time property of QEMU's decode
+     * rule, read from the rule's own words, so there is nothing an
+     * execution could add to it and nothing for this gate to wait for.
+     * It is ADMITTED, and counted in a column of its own: what separates
+     * it from QID_VERIFIED is whether an independent reading has agreed,
+     * which is a fact about the CHECK and not about the answer.
      */
     case QID_STATED:
-        g_qid_surv_stated.fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+        g_qid_decided_stated.fetch_add(1, std::memory_order_relaxed);
+        break;
     case QID_SPLIT:
         g_qid_surv_split.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -1060,12 +1069,16 @@ uint64_t qemu_ident_decided_observed(void)
     return g_qid_decided_observed.load(std::memory_order_relaxed);
 }
 
+uint64_t qemu_ident_decided_stated(void)
+{
+    return g_qid_decided_stated.load(std::memory_order_relaxed);
+}
+
 void qemu_ident_survivors(QemuIdentSurvivors *out)
 {
     out->split        = g_qid_surv_split.load(std::memory_order_relaxed);
     out->name_matched = g_qid_surv_name_matched.load(std::memory_order_relaxed);
     out->none         = g_qid_surv_none.load(std::memory_order_relaxed);
-    out->stated       = g_qid_surv_stated.load(std::memory_order_relaxed);
     out->no_row       = g_qid_surv_no_row.load(std::memory_order_relaxed);
     out->no_ident     = g_qid_surv_no_ident.load(std::memory_order_relaxed);
     out->decided_unknown =

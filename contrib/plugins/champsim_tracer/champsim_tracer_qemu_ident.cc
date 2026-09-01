@@ -1109,18 +1109,19 @@ void qemu_ident_report(GString *report)
     qemu_ident_survivors(&sv);
     {
         uint64_t decided = qemu_ident_decided_observed() +
+                           qemu_ident_decided_stated() +
                            qemu_ident_adjudicated_hits();
-        uint64_t surv = sv.split + sv.name_matched + sv.none + sv.stated +
+        uint64_t surv = sv.split + sv.name_matched + sv.none +
                         sv.no_row + sv.no_ident + sv.isa_held;
         g_string_append_printf(report,
             "\n--- classification SOURCE: the decode rule, or Capstone "
             "where the rule states nothing ---\n"
-            "  DECIDED by QEMU's rule, tier OBSERVED %10" PRIu64 "\n"
+            "  DECIDED by rule, VERIFIED (or OBSERVED) %8" PRIu64 "\n"
+            "  DECIDED by QEMU's rule, tier STATED   %10" PRIu64 "\n"
             "  DECIDED by QEMU's rule, ADJUDICATED   %10" PRIu64 "\n"
             "  SURVIVOR: rule's observations SPLIT   %10" PRIu64 "\n"
             "  SURVIVOR: row NAME_MATCHED, unobserved%10" PRIu64 "\n"
             "  SURVIVOR: row carries no class (NONE) %10" PRIu64 "\n"
-            "  SURVIVOR: row STATED, gate not yet open%10" PRIu64 "\n"
             "  SURVIVOR: id carried, no row          %10" PRIu64 "\n"
             "  SURVIVOR: no identity exported (id 0) %10" PRIu64 "\n"
             "  HELD: this ISA's flip is not taken (must be 0) %5" PRIu64 "\n"
@@ -1137,11 +1138,14 @@ void qemu_ident_report(GString *report)
             "observation is a check, so the two ways a rule can carry no "
             "answer are SPLIT on a table still keyed by observation and "
             "STATED on one that is not.\n"
-            "    STATED is a decode whose rule DOES state a class and "
-            "which this gate declines to take -- the count of answer left "
-            "on the table until the admission wave, not a hole.  A rule "
-            "whose statement and whose older payload disagreed carries a "
-            "written ruling in the generated header beside its row.\n"
+            "    STATED and VERIFIED are BOTH decided and both publish; "
+            "the split says how much of the decided population an "
+            "INDEPENDENT reading has agreed with, and nothing else.  A "
+            "STATED row's class is a compile-time property of QEMU's "
+            "decode rule, so an execution can disagree with it but cannot "
+            "supply it; a rule whose statement and whose older payload "
+            "disagreed carries a written ruling in the generated header "
+            "beside its row.\n"
             "    `the Capstone row disputes` is the STANDING GUARD on one "
             "generic exposure: a rule the generator's corpus covered "
             "under only one of the spellings that reach it, so the row's "
@@ -1152,8 +1156,9 @@ void qemu_ident_report(GString *report)
             "from it at the source instead: an encoding-qualified "
             "identity gives each spelling its own rule, and then there is "
             "nothing left for the two keys to disagree about.\n",
-            qemu_ident_decided_observed(), qemu_ident_adjudicated_hits(),
-            sv.split, sv.name_matched, sv.none, sv.stated,
+            qemu_ident_decided_observed(), qemu_ident_decided_stated(),
+            qemu_ident_adjudicated_hits(),
+            sv.split, sv.name_matched, sv.none,
             sv.no_row, sv.no_ident,
             sv.isa_held, sv.decided_unknown, sv.cap_disagree,
             decided, decided + surv);

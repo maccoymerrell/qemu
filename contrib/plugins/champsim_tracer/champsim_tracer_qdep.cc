@@ -44,7 +44,11 @@ constexpr unsigned kMaxMemops = 64;
  * INSN_DF_MAX_FIELDS so the cap that bites is the extractor's, which SAYS it
  * overflowed, rather than this one, which would only see a smaller number.
  */
-constexpr unsigned kMaxFields = 64;
+/*
+ * Raised from 64 to 128 in step with INSN_DF_MAX_FIELDS' rise to 64 at PASS
+ * 49; the inequality between the two is the whole point of the bound.
+ */
+constexpr unsigned kMaxFields = 128;
 /*
  * Destinations the encoding names that the emulator discards
  * (qemu_plugin_insn_discards()).  QEMU's own cap is four; eight leaves the

@@ -51,7 +51,27 @@
  * offsets and resolved by the consumer, which is the only side that knows
  * what a byte range means.
  */
-#define INSN_DF_MAX_FIELDS  24
+/*
+ * RAISED FROM 24 TO 64 at PASS 49, and the number came from a measurement.
+ *
+ * A field is an env byte RANGE, and an emitter that walks a vector ELEMENT
+ * AT A TIME produces one per element rather than one per register: the
+ * widening NEON group (`sabal`, `smlal`, `addhn` and their siblings) reads
+ * eight elements of two sources and merges eight of the destination, which
+ * is thirty-odd ranges describing three registers.  At 24 the extraction
+ * reported fields_truncated, the plugin's status gate refused the whole
+ * instruction, and every one of those rows arrived on the wire with an
+ * EMPTY read list -- 11,449 register-instances of aarch64's bar.
+ *
+ * The cost is 40 bytes per slot per instruction in the per-context scratch,
+ * which is g_malloc0()'d once per TCGContext: 1.35 MiB at 24 fields, 2.13
+ * MiB at 64.  It is calloc'd and only the pages a translation touches are
+ * ever faulted in, so the resident cost tracks block length rather than the
+ * bound.  The plugin's own kMaxFields is raised in step and stays ABOVE
+ * this one, so the cap that bites remains the extractor's -- the one that
+ * SAYS it overflowed.
+ */
+#define INSN_DF_MAX_FIELDS  64
 
 /*
  * An env byte range whose reach nothing stated.  A helper handed tcg_env, or
@@ -102,7 +122,13 @@
  * the reason every other set here is: a list short by a member is a missing
  * dependency, and it is the shape most likely to pass for a whole one.
  */
-#define INSN_DF_MAX_ORDERED  24
+/*
+ * RAISED FROM 24 TO 64 at PASS 49, in step with INSN_DF_MAX_FIELDS and for
+ * the same reason: an element-at-a-time emitter appends one ordered member
+ * per RANGE, so raising the field bound alone would only move the overflow
+ * from fields[] to here.  Two bytes per slot.
+ */
+#define INSN_DF_MAX_ORDERED  64
 
 /* @kind of one ordered member. */
 #define INSN_DF_ORD_GLOBAL   0  /* a TCG global; @index is its register index */
@@ -171,7 +197,17 @@ typedef struct InsnDataflowNamedRead {
  * AArch64's LD4/ST4 (four) and 32-bit x86's PUSHA (eight); beyond that the
  * count is flagged rather than silently short.
  */
-#define INSN_DF_MAX_MEMOPS  8
+/*
+ * RAISED FROM 8 TO 32 at PASS 49.  `st4 {v0.8b-v3.8b}, [x0]` is thirty-two
+ * one-byte stores, and at 8 the whole instruction arrived memops_truncated.
+ * 32 is the largest value the provenance namespace allows without widening
+ * INSN_DF_REG_WORDS: the memop bits are the TOP INSN_DF_MAX_MEMOPS of the
+ * 256-bit namespace, whose lower end already holds MIPS' 128 globals plus
+ * INSN_DF_MAX_FIELD_SLOTS = 64 interned ranges, so the base may not fall
+ * below 192.  The .16b forms of ST3/ST4 need 48 and 64 and stay refused
+ * WITH THEIR REASON rather than being silently shortened.
+ */
+#define INSN_DF_MAX_MEMOPS  32
 
 /*
  * The third region of the provenance namespace: the DATA a load returned.

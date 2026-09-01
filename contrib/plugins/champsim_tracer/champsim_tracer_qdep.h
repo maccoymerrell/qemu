@@ -220,12 +220,12 @@ struct InsnRegNames;
 /*
  * How many ACCESSES of one direction this extractor holds per instruction.
  *
- * Not a guess: INSN_DF_MAX_MEMOPS is 8 on the QEMU side, so a form with more
+ * Not a guess: INSN_DF_MAX_MEMOPS is 32 on the QEMU side, so a form with more
  * accesses than this arrives with `memops_truncated` already set and is
  * refused one gate earlier.  Sized to match so the two caps cannot disagree
  * about which instruction was refused and why.
  */
-#define QDEP_MAX_ACCESS 8
+#define QDEP_MAX_ACCESS 32
 
 /*
  * How many DISTINCT written registers this extractor holds per instruction.

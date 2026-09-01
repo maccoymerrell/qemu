@@ -1216,6 +1216,35 @@ void gen_store_gpr(TCGv t, int reg)
     }
 }
 
+/*
+ * A GENERAL REGISTER THE ENCODING NAMES AS A SOURCE THAT NO OP READS.
+ *
+ * MIPS' translator folds an operand away wherever the architecture makes
+ * the result independent of it, and it does so in three shapes: an early
+ * return when the destination is $zero ("If no destination, treat it as a
+ * NOP"), a fold arm when a source is $zero (`andi rt,$zero,imm` is `li
+ * rt,0`), and a comparison the branch code answers statically (`beq $t0,$t0`
+ * is always taken).  All three are decisions about what the EMULATOR needs
+ * to compute.  None of them is a statement about what the INSTRUCTION reads:
+ * R7.3 says a register the encoding names is not the emulator's to drop and
+ * R15 says a lowering decision is not architectural truth, which is why the
+ * zero register is expressed here rather than folded with the value.
+ *
+ * gen_load_gpr() takes the zero note for the paths that DO call it; this is
+ * for the paths that call nothing, where there is no temp to hang a note on
+ * and calling the accessor to make one would emit a dead constant.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_gpr_folded_read(int reg)
+{
+    if (reg == 0) {
+        insn_dataflow_note_folded_read_zero();
+    } else {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[reg]));
+    }
+}
+
 #if defined(TARGET_MIPS64)
 void gen_load_gpr_hi(TCGv_i64 t, int reg)
 {
@@ -2636,6 +2665,8 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
          * If no destination, treat it as a NOP.
          * For addi, we must generate the overflow exception when needed.
          */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
         return;
     }
 
@@ -2742,6 +2773,8 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
 
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
         return;
     }
     uimm = (uint16_t)imm;
@@ -2760,6 +2793,10 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_ANDI ? MIPS_ID_OPC_ANDI :
             MIPS_ID_NONE);
+        /* `andi rt,$zero,imm` IS `li rt,0`; see note_gpr_folded_read(). */
+        if (rs == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0)) {
             tcg_gen_andi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2794,6 +2831,10 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_XORI ? MIPS_ID_OPC_XORI :
             MIPS_ID_NONE);
+        /* `xori rt,$zero,imm` IS `li rt,imm`; see note_gpr_folded_read(). */
+        if (rs == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0)) {
             tcg_gen_xori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2804,6 +2845,14 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_LUI ? MIPS_ID_OPC_LUI :
             MIPS_ID_NONE);
+        /*
+         * `lui` is `aui rt,$zero,imm` on R6 and a distinct instruction
+         * before it; on the R6 encoding the source register IS named and
+         * the else arm folds it away.  See note_gpr_folded_read().
+         */
+        if (rs == 0 && (ctx->insn_flags & ISA_MIPS_R6)) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0 && (ctx->insn_flags & ISA_MIPS_R6)) {
             /* OPC_AUI */
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], imm << 16);
@@ -2827,6 +2876,8 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
 
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
         return;
     }
     t0 = tcg_temp_new();
@@ -3000,15 +3051,8 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
          *
          * Capture only; no op is emitted, altered or suppressed.
          */
-        if (rs != 0) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
-        }
-        if (rt != 0) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
-        }
-        if (rs == 0 || rt == 0) {
-            insn_dataflow_note_folded_read_zero();
-        }
+        note_gpr_folded_read(rs);
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -3224,6 +3268,10 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_MUL ? MIPS_ID_OPC_MUL :
             MIPS_ID_NONE);
+        /* `mul rd,rs,$zero` IS `li rd,0`; see note_gpr_folded_read(). */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_mul_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -3255,6 +3303,9 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -3325,19 +3376,16 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
          * time -- here, resolved into nothing, because nothing can read
          * $zero back -- is not the emulator's to drop.
          *
-         * The zero-register operand of a two-operand form is deliberately
-         * NOT stated here.  That is the OTHER direction, a source the wire
-         * does not carry today, and it belongs with the same statement in
-         * gen_logic()'s own zero-folding arms rather than with this one.
+         * The zero-register operand IS stated, which reverses an earlier
+         * reading of this arm.  It was deferred as "a source the wire does
+         * not carry today"; measured at PASS 49 the wire carries it --
+         * `and $zero,$zero,$zero` loses REG_ZERO when the operand walk goes
+         * -- and R15 rules the zero register expressed.
          *
          * Capture only; no op is emitted, altered or suppressed.
          */
-        if (rs != 0) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
-        }
-        if (rt != 0) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
-        }
+        note_gpr_folded_read(rs);
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -3346,6 +3394,10 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_AND ? MIPS_ID_OPC_AND :
             MIPS_ID_NONE);
+        /* `and rd,rs,$zero` IS `li rd,0`; see note_gpr_folded_read(). */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_and_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else {
@@ -3441,6 +3493,10 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_XOR ? MIPS_ID_OPC_XOR :
             MIPS_ID_NONE);
+        /* `xor rd,rs,$zero` IS `move rd,rs`; see note_gpr_folded_read(). */
+        if (rs == 0 || rt == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_xor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -3462,6 +3518,9 @@ static void gen_slt(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -3496,6 +3555,9 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
          * If no destination, treat it as a NOP.
          * For add & sub, we must generate the overflow exception when needed.
          */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -4382,6 +4444,8 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /* Treat as NOP. */
+        /* The operand the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
         return;
     }
     t0 = cpu_gpr[rd];
@@ -5521,7 +5585,15 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
          */
         insn_dataflow_note_encoded_imm_value((uint64_t)(uint32_t)code,
                                              INSN_DF_IMM_ROLE_NON_DATAFLOW);
-        /* Compare two registers */
+        /*
+         * Compare two registers.  `teq $t0,$t0` and `teq $zero,$zero` are
+         * answered statically and QEMU loads neither operand, but the
+         * encoding names both.  See note_gpr_folded_read().
+         */
+        if (rs == rt) {
+            note_gpr_folded_read(rs);
+            note_gpr_folded_read(rt);
+        }
         if (rs != rt) {
             gen_load_gpr(t0, rs);
             gen_load_gpr(t1, rt);
@@ -5542,7 +5614,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
             opc == OPC_TLTIU ? MIPS_ID_OPC_TLTIU :
             opc == OPC_TNEI ? MIPS_ID_OPC_TNEI :
             MIPS_ID_NONE);
-        /* Compare register to immediate */
+        /*
+         * Compare register to immediate.  `tgei $zero,0` is answered
+         * statically; the register is still named.  See
+         * note_gpr_folded_read().
+         */
+        if (rs == 0 && imm == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0 || imm != 0) {
             gen_load_gpr(t0, rs);
             tcg_gen_movi_tl(t1, (int32_t)imm);
@@ -5706,7 +5785,17 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             opc == OPC_BNE ? MIPS_ID_OPC_BNE :
             opc == OPC_BNEL ? MIPS_ID_OPC_BNEL :
             MIPS_ID_NONE);
-        /* Compare two registers */
+        /*
+         * Compare two registers.  When they are the SAME register the
+         * comparison is statically known and QEMU loads neither, but the
+         * encoding names both -- `beqz $t0` is `beq $t0,$zero`, and `b` is
+         * `beq $zero,$zero`, whose two operands the wire carries.  See
+         * note_gpr_folded_read().
+         */
+        if (rs == rt) {
+            note_gpr_folded_read(rs);
+            note_gpr_folded_read(rt);
+        }
         if (rs != rt) {
             gen_load_gpr(t0, rs);
             gen_load_gpr(t1, rt);
@@ -5740,7 +5829,14 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             opc == OPC_BLTZALL ? MIPS_ID_OPC_BLTZALL :
             opc == OPC_BLTZL ? MIPS_ID_OPC_BLTZL :
             MIPS_ID_NONE);
-        /* Compare to zero */
+        /*
+         * Compare to zero.  `bltz $zero` is a branch never taken and `bgez
+         * $zero` one always taken, so QEMU loads nothing -- but the encoding
+         * names the register.  See note_gpr_folded_read().
+         */
+        if (rs == 0) {
+            insn_dataflow_note_folded_read_zero();
+        }
         if (rs != 0) {
             gen_load_gpr(t0, rs);
             bcond_compute = 1;
@@ -6194,6 +6290,8 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /* The operands the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rt);
         return;
     }
 
@@ -10790,6 +10888,8 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
 
     if (rd == 0) {
         /* Treat as NOP. */
+        /* The operand the NOP erases; see note_gpr_folded_read(). */
+        note_gpr_folded_read(rs);
         return;
     }
 

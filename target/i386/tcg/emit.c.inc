@@ -637,6 +637,57 @@ FP_SSE(VMIN, min)
 FP_SSE(VDIV, div)
 FP_SSE(VMAX, max)
 
+/*
+ * THE THREE MULTIPLICANDS AN FMA ENCODING NAMES, stated at the decode site.
+ *
+ * `vfmadd132sd xmm1, xmm2, xmm0` reads all three of its operands -- the 132,
+ * 213 and 231 forms differ only in which product each one enters -- and the
+ * destination is one of them, so every FMA form has three vector SOURCES.
+ * None of them reaches QEMU's ordered read list: op_ptr() hands the helper a
+ * POINTER built from tcg_env (tcg_gen_addi_ptr), and a pointer computed from
+ * tcg_env is an address, not a read of the bytes it addresses.  Measured on
+ * a guest that executes the scalar forms with several distinct register
+ * triples, every one of the three arrived as `field-range off=<xmm> size=0
+ * (no declared regfile)` -- an unbounded span, which downstream is
+ * indistinguishable from no statement at all -- and the registers the wire
+ * published came from the operand walk alone.
+ *
+ * BY RANGE, because for the vector file the range IS the register: the whole
+ * ZMMReg slot is what insn_dataflow_declare_regfile("xmm", ...) already
+ * declares in translate.c, so this statement is named by the same
+ * declaration that names every ordinary load of those bytes and there is no
+ * second spelling to keep in step.  That is the opposite choice from the SVE
+ * predicate in translate-sve.c, and for the opposite reason: this file is
+ * declared already and nothing else reaches these bytes by pointer.
+ *
+ * REGISTER OPERANDS ONLY.  A memory operand's value is loaded into
+ * CPUX86State::xmm_t0 before the helper runs, so op->offset then names a
+ * scratch slot and not an architectural register; the load itself is an
+ * access QEMU already states.  Stating xmm_t0 would put a register on the
+ * wire that the encoding does not name.
+ *
+ * R7.3 (a register the encoding names is not the emulator's to drop) and R15
+ * (a lowering decision is not architectural truth).
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_vector_operand_read(X86DecodedInsn *decode, int opn)
+{
+    X86DecodedOp *op = &decode->op[opn];
+
+    if (op->has_ea || op->unit != X86_OP_SSE) {
+        return;
+    }
+    insn_dataflow_note_stated_read_env(vector_reg_offset(op), sizeof(ZMMReg));
+}
+
+static void gen_note_fma_operand_reads(X86DecodedInsn *decode)
+{
+    gen_note_vector_operand_read(decode, 0);
+    gen_note_vector_operand_read(decode, 1);
+    gen_note_vector_operand_read(decode, 2);
+}
+
 #define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
 {                                                                                  \
@@ -644,6 +695,7 @@ static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)            
     SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm : gen_helper_fma4ps_ymm; \
     SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                                   \
                                                                                    \
+    gen_note_fma_operand_reads(decode);                                            \
     fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
        tcg_constant_i32(even),                                                     \
        tcg_constant_i32((even) ^ (odd)));                                          \
@@ -655,6 +707,7 @@ static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)            
 {                                                                                  \
     SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;        \
                                                                                    \
+    gen_note_fma_operand_reads(decode);                                            \
     fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
        tcg_constant_i32(flags));                                                   \
 }                                                                                  \

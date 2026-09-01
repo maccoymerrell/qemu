@@ -4910,14 +4910,25 @@ bool insn_dataflow_field_reg(uint32_t off, uint32_t size,
         }
         within = d - idx * r->stride;
         /*
-         * REACHING PAST THE REGISTER IS A REFUSAL, not a name.  A helper
+         * REACHING PAST THE REGISTER IS NOT A NAME FROM THIS FILE.  A helper
          * handed the whole vector file starts at the same byte as a store of
          * its first register; calling that one xmm0 would publish a set
          * short by thirty-one registers, which is the one error direction
          * this whole file treats as a defect rather than a loss of accuracy.
+         *
+         * It moves to the NEXT declaration rather than refusing outright,
+         * because one target's registers can nest inside another's: x86's
+         * mm<n> is the low half of the physical x87 slot fpregs[n], and the
+         * x87 stack is declared as the whole CONTAINER because ST(i) is
+         * relative to a run-time top.  A read of eight bytes at fpregs[n] is
+         * mm<n>; a read of all 128 is the container.  Both are true and only
+         * the width tells them apart, so the narrow file has to be able to
+         * decline without taking the wide one down with it.  If no
+         * declaration fits, the loop still ends in the same refusal -- this
+         * is a no-op for every target whose declared files do not overlap.
          */
         if (within + size > r->elem) {
-            return false;
+            continue;
         }
         if (r->names) {
             if (r->names[idx] == NULL) {

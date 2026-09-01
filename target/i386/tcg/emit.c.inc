@@ -388,13 +388,12 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
  * Stating xmm_t0 would put a register on the wire the encoding does not
  * name.
  *
- * X86_OP_SSE ONLY, deliberately and not silently.  An MMX operand's offset
- * lands inside env->fpregs[n].mmx, whose only declaration today is the
- * whole-array x87 CONTAINER -- which names the file and must never stand in
- * for a member.  mm<n> IS a physical index, unlike ST(i), so it can be
- * declared; that is a separate statement with its own evidence, and until it
- * exists an MMX operand is left open in the family ledger rather than
- * answered with the wrong register.
+ * MMX TOO, by its own range and its own declaration.  An MMX operand's
+ * offset lands inside env->fpregs[n].mmx, which translate.c declares as an
+ * eight-element file ahead of the whole-array x87 container -- mm<n> is a
+ * PHYSICAL index, unlike ST(i), so the range is the register there as well.
+ * The size is what tells the two files apart, which is why this passes
+ * sizeof(MMXReg) and not the SSE width.
  *
  * R7.3 (a register the encoding names is not the emulator's to drop) and R15
  * (a lowering decision is not architectural truth).
@@ -403,10 +402,21 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
  */
 static void gen_note_vector_operand_read(X86DecodedOp *op)
 {
-    if (op->has_ea || op->unit != X86_OP_SSE) {
+    if (op->has_ea) {
         return;
     }
-    insn_dataflow_note_stated_read_env(vector_reg_offset(op), sizeof(ZMMReg));
+    switch (op->unit) {
+    case X86_OP_SSE:
+        insn_dataflow_note_stated_read_env(vector_reg_offset(op),
+                                           sizeof(ZMMReg));
+        break;
+    case X86_OP_MMX:
+        insn_dataflow_note_stated_read_env(vector_reg_offset(op),
+                                           sizeof(MMXReg));
+        break;
+    default:
+        break;
+    }
 }
 
 /*

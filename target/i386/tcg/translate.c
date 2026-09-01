@@ -4299,6 +4299,43 @@ void tcg_x86_init(void)
      * for one, which is what a generic word would let it do on the write
      * side.
      */
+    /*
+     * THE MMX FILE, declared BEFORE the container it lives inside.
+     *
+     * mm<n> is the low 64 bits of the PHYSICAL x87 slot fpregs[n] -- the
+     * architecture aliases them, and QEMU stores them that way
+     * (FPReg is a union of floatx80 and MMXReg).  Unlike ST(i) the index is
+     * not relative to anything: MMX_OFFSET(n) IS mm<n>, so here the range is
+     * the register and the file can be declared element by element.
+     *
+     * SPELLED st<n>, which is not a compromise.  The consumer's namespace is
+     * the GDB stub's, and the i386 stub has no mm<n>: `st<n>` is the only
+     * name those bytes have there, which is why the operand walk beside this
+     * publishes an MMX operand as REG_FPR<n> already.  The two spellings
+     * denote the same eight slots by the same index whenever an MMX
+     * instruction is running, and QEMU is what guarantees it -- every MMX
+     * form emits gen_helper_enter_mmx(), and helper_enter_mmx() sets
+     * env->fpstt = 0, so ST(i) and the physical slot coincide for exactly
+     * the instructions this file answers for.
+     *
+     * ORDER MATTERS AND IS THE POINT.  insn_dataflow_field_reg() walks the
+     * declarations in order and takes the first whose element CONTAINS the
+     * access, so the narrow file has to come first or an eight-byte read at
+     * fpregs[n] would be answered by the 128-byte container.  A read wider
+     * than eight bytes declines here and the container below answers it.
+     */
+    {
+        static const char *const mmx_names[8] = {
+            "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+        };
+
+        insn_dataflow_declare_regfile(
+            NULL, mmx_names,
+            offsetof(CPUX86State, fpregs[0].mmx),
+            sizeof(((CPUX86State *)0)->fpregs[0]),
+            sizeof(((CPUX86State *)0)->fpregs[0].mmx), 8);
+    }
+
     insn_dataflow_declare_regfile("fpregs", NULL,
                                   offsetof(CPUX86State, fpregs),
                                   sizeof(((CPUX86State *)0)->fpregs),

@@ -6388,6 +6388,106 @@ QUALIFIER_WORD_HOOKS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# WHICH PINNING FORMATS ACTUALLY STATE AN OPERATION
+# ---------------------------------------------------------------------------
+#
+# _pinning_formats separates a format that pins an architectural field from
+# one that only binds extraction functions, and on RISC-V that separation is
+# the whole answer: `@c_mv` pins imm=0, and the pin is what makes trans_addi
+# a move.  On ARM it is NOT the answer, and the difference is a measurement.
+#
+# target/arm pins constantly, and what it pins is the ADDRESSING MODE and the
+# ELEMENT SIZE, never the operation:
+#
+#     @ldst_imm       ... imm:s9 .. rn:5 rt:5  &ldst_imm unpriv=0 p=0 w=0
+#     @ldst_imm_post  ... imm:s9 .. rn:5 rt:5  &ldst_imm unpriv=0 p=1 w=1
+#     @bitfield_64    1 .. ...... 1 immr:6 imms:6 rn:5 rd:5  &bitfield sf=1
+#
+# `p`/`w` are pre- and post-indexed writeback and `sf` is the operand width.
+# LDR_i and STR_i BOTH reference @ldst_imm; SBFM, BFM and UBFM all reference
+# @bitfield_64.  Read as a statement, `ldst_imm` answers LOAD for every store
+# in the table and `bitfield_64` answers with a catch-all firing on a string
+# it does not know -- 134 rules stated the wrong class, and every one of them
+# would have had to be written down as a ruled disagreement to land.
+#
+# The discriminator is the one this generator already uses everywhere else: a
+# KEY THAT SEVERAL DIFFERENTLY-CLASSIFIED RULES SHARE DOES NOT DETERMINE THE
+# CLASS.  A format referenced by rules whose own names classify differently is
+# an encoding template by that fact alone -- LOAD and STORE cannot both be
+# what @ldst_imm says -- and it is dropped from the statement sources.  A
+# format all of whose users agree is left alone, which is what keeps @c_mv,
+# @c_nop, @c_li, @c_jalr and @cb_z stating the RISC-V forms they exist for.
+#
+# It is structural, it reads the same file the rule does, and it is
+# self-maintaining: a format that starts serving a second operation stops
+# being consulted on the next regeneration, with no list to update.
+#
+# THE ANSWER COMPARED IS THE RULE'S OWN NAME, not its final classification.
+# Comparing final classifications would be circular -- the format is one of
+# the inputs to that -- so what is asked of each user is only what its own
+# trans_ name and that name's prefixes say.
+_FORMAT_TEMPLATES: dict[str, frozenset[tuple[str, str]]] = {}
+
+
+def _name_words(info: IsaInfo, ident: QemuIdent) -> list[str]:
+    """The words a rule's OWN NAME offers, most specific first."""
+    pat = _word(ident.pattern)
+    stripped = _enumerator_word(info.key, pat)
+    if stripped is not None:
+        pat = stripped
+    out = [pat]
+    q = pat
+    while "_" in q:
+        q = q.rsplit("_", 1)[0]
+        out.append(q)
+    return out
+
+
+def _name_answer(info: IsaInfo, ident: QemuIdent) -> tuple[str, str] | None:
+    """What a rule's own name says it is, with no format consulted."""
+    for w in _name_words(info, ident):
+        ruled = QEMU_RULE_STATEMENTS.get((info.key, w))
+        if ruled is not None:
+            return (ruled.entry.op, ruled.entry.branch)
+        cand = CLASSIFIERS[info.key](w)
+        if cand.op != "GEN_OP_UNKNOWN":
+            return (cand.op, cand.branch)
+    return None
+
+
+def _prime_format_templates(info: IsaInfo, idents: list[QemuIdent]) -> None:
+    """Decide, per (file, format), whether the format states an operation."""
+    answers: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for ident in idents:
+        line = _rule_source_line(info, ident)
+        if not line:
+            continue
+        pinning = _pinning_formats(info.key, ident.src_file)
+        refs = [f for f in _FORMAT_RE.findall(line.split("#", 1)[0])
+                if f in pinning]
+        if not refs:
+            continue
+        ans = _name_answer(info, ident)
+        for f in refs:
+            slot = answers.setdefault((ident.src_file, _word(f)), set())
+            if ans is not None:
+                slot.add(ans)
+    _FORMAT_TEMPLATES[info.key] = frozenset(
+        k for k, v in answers.items() if len(v) >= 2)
+
+
+def _format_is_template(info: IsaInfo, src_file: str, word: str) -> bool:
+    templates = _FORMAT_TEMPLATES.get(info.key)
+    if templates is None:
+        raise SystemExit(
+            f"{info.key}: a format word was asked about before the "
+            f"encoding-template census ran.  _prime_format_templates() must "
+            f"see the whole identity universe first; reading a format "
+            f"without it would state an operation from an encoding template.")
+    return (src_file, word) in templates
+
+
 def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
     """(word, where it came from), most specific first -- all QEMU's own."""
     out: list[tuple[str, str]] = []
@@ -6445,8 +6545,16 @@ def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
         body = line.split("#", 1)[0]
         pinning = _pinning_formats(info.key, ident.src_file)
         for f in _FORMAT_RE.findall(body):
-            if f in pinning:
-                add(_word(f), "format")
+            if f not in pinning:
+                continue
+            w = _word(f)
+            # ...and only where the format is not an ENCODING TEMPLATE that
+            # several differently-classified rules share.  See
+            # _prime_format_templates: @ldst_imm serves LDR_i and STR_i alike
+            # and cannot be stating either one.
+            if _format_is_template(info, ident.src_file, w):
+                continue
+            add(w, "format")
 
     pat = _word(ident.pattern)
     # THE ENUMERATOR PREFIX REPLACES THE PATTERN WORD -- it does not
@@ -7724,6 +7832,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
       QID_NONE          neither.  Residue, named in the census.
     """
     _branch_class_unreached(info, idents)
+    _prime_format_templates(info, idents)
     if info.key in QEMU_IDENT_STATED:
         _refuse_dead_statement_rules(info, idents)
         _refuse_dead_statement_disagreements(info, idents)

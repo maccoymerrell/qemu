@@ -1,0 +1,21 @@
+# ADJUDICATED OPCODE-CLASS TRANSITIONS -- the transitions a maintainer has
+# ruled may happen, read by opcenc_loss_gate.sh / opcenc_ab.py.
+#
+#   <isa> <encoding-hex> <A_CLASS> <B_CLASS>   # reason
+#
+# The A and B classes are BOTH named, so a row amnesties one exact transition
+# and nothing else: a ledger keyed on the encoding alone would silently cover
+# a second, different move on the same bytes later.
+#
+# A row here is counted, printed and excluded from the bar.  A row whose
+# subject the measurement does not contain is STALE and FAILS the gate -- a
+# ledger that outlives its subject is how a gate quietly stops gating -- so a
+# transition that has been landed and is no longer a difference between the
+# two arms must be REMOVED from this file, not left as a comment.
+#
+# An entry with no reason is refused at parse time.  "It was already like
+# that" is not a reason; name the ruling or the measurement.
+#
+# EMPTY BY DESIGN at the tip: the two arms of a no-op comparison publish the
+# same class for every encoding, and every row added here is a wire change
+# somebody has to have ruled.

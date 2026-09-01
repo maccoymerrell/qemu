@@ -1686,6 +1686,16 @@ BBTemplate *TemplateStore::create_tb_template(
                              &insn_bytes[(size_t)i * MAX_INSN_BYTES],
                              insn_sizes[i],
                              insn_info ? insn_info[i].mnemonic : nullptr);
+            /*
+             * THE PER-ENCODING OPCODE-CLASS CORPUS, beside it and for the
+             * same reason: `.opcode` is packed into the template two lines
+             * below, so this is the class the wire publishes.  Separately
+             * env-gated; neither corpus costs the other anything.
+             */
+            dump_opc_enc_row(&scratch[i].f,
+                             &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                             insn_sizes[i],
+                             insn_info ? insn_info[i].mnemonic : nullptr);
             srcs[i] = &scratch[i].f;
             name_srcs[i] = with_names ? &nscratch[i].rn : nullptr;
         }

@@ -769,6 +769,43 @@ void qdep_mutate_refiner_dst(InsnFields *f);
 void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
                       uint8_t size, const char *mnem);
 
+/*
+ * THE PER-ENCODING OPCODE-CLASS CORPUS, env-gated (CST_OPC_ENC_DUMP=<path>).
+ *
+ *   <isa>\t<encoding bytes, hex>\t<mnemonic>\t<GenericOpcode name>
+ *
+ * WHY IT IS A SECOND CORPUS AND NOT A COLUMN ON THE FIRST.  The read-list
+ * corpus is a gate's subject: srcenc_loss_gate compares two arms and fails
+ * on a register leaving the wire.  Widening its row would move the file
+ * shape under every reader that already parses it, and the two corpora are
+ * not asked for together -- a source A/B does not want to pay for an
+ * opcode census and a class A/B does not want the register lists.
+ *
+ * WHY IT EXISTS AT ALL.  Nothing in this tree watches `.opcode`.  SETPROOF
+ * scores register SETS; srcenc scores READ LISTS; the identity census counts
+ * rows and tiers.  PASS 45 stated the consequence plainly: no loss
+ * instrument here can see an opcode-class move, so a change that reclassifies
+ * an encoding -- GEN_OP_INT_ADD becoming GEN_OP_UNKNOWN, or becoming
+ * GEN_OP_INT_SUB -- passes every standing bar.  That is the precise gap the
+ * QID_STATED admission has to cross: 86.7% of the identity rows state an
+ * opcode that `qemu_ident_classify()` currently refuses to publish, and
+ * admitting them moves the wire's opcode column with no instrument watching.
+ *
+ * THE CLASS IS TAKEN AFTER qdep_apply(), at the same site and off the same
+ * InsnFields as the read list, so it is the class the template packs and a
+ * consumer reads out of the trace -- not an intermediate, and not a
+ * re-derivation that could drift from one.
+ *
+ * IT SEES THE WRONG PATH for the same reason the read-list corpus does, and
+ * the capture takes wp=0 and wp=16 for the same reason: an encoding only the
+ * wrong path translates is outside every per-pc instrument in this tree.
+ *
+ * MEASUREMENT ONLY and OFF unless asked for: with the variable unset the
+ * site is a single relaxed load, and no wire field is written here ever.
+ */
+void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
+                      uint8_t size, const char *mnem);
+
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the
  * trace, not a debugging aid, and a fact nobody prints is a fact nobody

@@ -3811,107 +3811,195 @@ void decide_block(InsnFields *f, bool qemu_dst, bool qemu_sdata,
 }  /* namespace */
 
 /*
- * THE PER-ENCODING READ-LIST CORPUS.  See the declaration in
- * champsim_tracer_qdep.h for why a host tool cannot derive this and has to
- * be handed it.
+ * THE PER-ENCODING CORPORA.  See the declarations in
+ * champsim_tracer_qdep.h for why a host tool cannot derive these and has to
+ * be handed them.
  *
- * DEDUPLICATED ON THE ENCODING, which is why the state is here and not in
- * the caller: a hot loop executes one encoding millions of times and the
- * corpus wants it once.  The key is the exact byte string AND its length, so
- * two encodings that differ in a field nothing reads are still two rows --
- * the sweep this feeds enumerates encodings, and folding distinct ones
- * together here would silently narrow it.
+ * TWO SUBJECTS, ONE MECHANISM.  The read-list corpus exports the source
+ * registers the wire publishes for an encoding; the opcode-class corpus
+ * exports the GenericOpcode it publishes for the same encoding.  Everything
+ * around those two columns is identical -- the env gate, the open-once, the
+ * dedup key, the hex spelling, the per-row flush -- so it is written once
+ * here and instantiated twice.  A second hand-copied dumper is how the
+ * truncation defect described below gets fixed in one corpus and not the
+ * other.
  *
- * A ROW IS WRITTEN ONCE AND NEVER REVISED.  The published source list for an
- * encoding is a function of the encoding and the tables, so a second sighting
- * has nothing to add; where that stops being true the corpus builder's own
- * duplicate check reports a CONFLICT rather than letting the last writer win.
+ * DEDUPLICATED ON THE ENCODING, which is why the state is a member and not
+ * the caller's: a hot loop executes one encoding millions of times and a
+ * corpus wants it once.  The key is the exact byte string AND its length,
+ * so two encodings that differ in a field nothing reads are still two rows
+ * -- the sweeps these feed enumerate encodings, and folding distinct ones
+ * together here would silently narrow them.
+ *
+ * A ROW IS WRITTEN ONCE AND NEVER REVISED.  What an encoding publishes is a
+ * function of the encoding and the tables, so a second sighting has nothing
+ * to add; where that stops being true the corpus builder's own duplicate
+ * check reports a CONFLICT rather than letting the last writer win.
  */
-std::atomic<int> g_src_enc_dump_state{0};    /* 0 unasked, 1 open, 2 failed */
-FILE *g_src_enc_dump = nullptr;
-std::mutex g_src_enc_dump_lock;
-std::set<std::array<uint8_t, MAX_INSN_BYTES + 1> > g_src_enc_seen;
-std::atomic<uint64_t> g_src_enc_dump_rows{0};
+namespace {
+
+struct EncCorpus {
+    const char *env;                 /* the variable that asks for it */
+    const char *header;              /* the TSV header line it writes */
+    std::atomic<int> state{0};       /* 0 unasked, 1 open, 2 failed */
+    FILE *fp = nullptr;
+    std::mutex lock;
+    std::set<std::array<uint8_t, MAX_INSN_BYTES + 1> > seen;
+    std::atomic<uint64_t> rows{0};
+
+    /*
+     * Is this corpus taking rows?  Resolves the env variable exactly once
+     * and latches the answer; with the variable unset every later call is a
+     * single relaxed load.
+     */
+    bool live()
+    {
+        int st = state.load(std::memory_order_relaxed);
+
+        if (st == 2) {
+            return false;
+        }
+        if (st == 0) {
+            std::lock_guard<std::mutex> lk(lock);
+            if (state.load(std::memory_order_relaxed) == 0) {
+                const char *path = getenv(env);
+
+                if (!path) {
+                    state.store(2, std::memory_order_relaxed);
+                    return false;
+                }
+                fp = fopen(path, "w");
+                if (!fp) {
+                    state.store(2, std::memory_order_relaxed);
+                    return false;
+                }
+                fputs(header, fp);
+                state.store(1, std::memory_order_relaxed);
+            }
+        }
+        return state.load(std::memory_order_relaxed) == 1;
+    }
+
+    /* First sighting of this encoding?  Caller holds nothing; this takes
+     * the lock and keeps it for the write, so a row cannot be claimed by
+     * one thread and written by another. */
+    bool claim(std::unique_lock<std::mutex> &lk,
+               const uint8_t *bytes, uint8_t n)
+    {
+        std::array<uint8_t, MAX_INSN_BYTES + 1> key{};
+
+        key[0] = n;
+        for (uint8_t i = 0; i < n; i++) {
+            key[i + 1] = bytes[i];
+        }
+        lk = std::unique_lock<std::mutex>(lock);
+        return seen.insert(key).second;
+    }
+
+    void write(const char *row)
+    {
+        fputs(row, fp);
+        /*
+         * FLUSHED PER ROW, and this is not caution -- it is a defect this
+         * path had and the corpus builder caught on its first run.  Nothing
+         * closes this stream: the plugin's exit path does not own it, so the
+         * FINAL row sat in stdio's buffer and reached the file cut in half.
+         * The mipsel capture's last line read `mipsel<TAB>41006014<TAB>bn` --
+         * a mnemonic sheared mid-word, no source column, no newline.
+         *
+         * A corpus that silently loses its tail is worse than one that
+         * refuses: the truncated row still PARSES, as a row whose payload
+         * column is empty, so a gate reading it would score that encoding as
+         * publishing nothing and report no error at all.  Both of the two
+         * "conflicting encodings" the builder reported on that run were
+         * this, and both went away here.
+         *
+         * The cost is bounded by the DEDUPLICATION above -- one flush per
+         * distinct encoding, never per executed instruction -- and the whole
+         * path is off unless asked for.
+         */
+        fflush(fp);
+        rows.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
+EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
+
+/* The encoding, hex, as both corpora spell it.  @out must hold
+ * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
+uint8_t enc_hex(char *out, const uint8_t *bytes, uint8_t size)
+{
+    uint8_t n = size < MAX_INSN_BYTES ? size : (uint8_t)MAX_INSN_BYTES;
+
+    for (uint8_t i = 0; i < n; i++) {
+        static const char d[] = "0123456789abcdef";
+        out[2 * i]     = d[bytes[i] >> 4];
+        out[2 * i + 1] = d[bytes[i] & 0xf];
+    }
+    out[2 * n] = '\0';
+    return n;
+}
+
+}  /* namespace */
 
 void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
                       uint8_t size, const char *mnem)
 {
-    int st = g_src_enc_dump_state.load(std::memory_order_relaxed);
-
-    if (st == 2 || !f || !bytes || !size) {
-        return;
-    }
-    if (st == 0) {
-        std::lock_guard<std::mutex> lk(g_src_enc_dump_lock);
-        if (g_src_enc_dump_state.load(std::memory_order_relaxed) == 0) {
-            const char *path = getenv("CST_SRC_ENC_DUMP");
-
-            if (!path) {
-                g_src_enc_dump_state.store(2, std::memory_order_relaxed);
-                return;
-            }
-            g_src_enc_dump = fopen(path, "w");
-            if (!g_src_enc_dump) {
-                g_src_enc_dump_state.store(2, std::memory_order_relaxed);
-                return;
-            }
-            fprintf(g_src_enc_dump, "#isa\tencoding\tmnem\tsrc\n");
-            g_src_enc_dump_state.store(1, std::memory_order_relaxed);
-        }
-    }
-    if (g_src_enc_dump_state.load(std::memory_order_relaxed) != 1) {
+    if (!f || !bytes || !size || !g_src_enc.live()) {
         return;
     }
 
-    uint8_t n = size < MAX_INSN_BYTES ? size : (uint8_t)MAX_INSN_BYTES;
     char hex[2 * MAX_INSN_BYTES + 1];
+    uint8_t n = enc_hex(hex, bytes, size);
+    std::unique_lock<std::mutex> lk;
 
-    for (uint8_t i = 0; i < n; i++) {
-        static const char d[] = "0123456789abcdef";
-        hex[2 * i]     = d[bytes[i] >> 4];
-        hex[2 * i + 1] = d[bytes[i] & 0xf];
-    }
-    hex[2 * n] = '\0';
-
-    std::array<uint8_t, MAX_INSN_BYTES + 1> key{};
-    key[0] = n;
-    for (uint8_t i = 0; i < n; i++) {
-        key[i + 1] = bytes[i];
-    }
-
-    std::lock_guard<std::mutex> lk(g_src_enc_dump_lock);
-    if (!g_src_enc_seen.insert(key).second) {
+    if (!g_src_enc.claim(lk, bytes, n)) {
         return;
     }
 
     GString *g = g_string_new(nullptr);
+
     g_string_append_printf(g, "%s\t%s\t%s\t",
                            target_name ? target_name : "?",
                            hex, mnem ? mnem : "?");
     reglist_str(g, f->src_regs, f->n_src_regs);
     g_string_append_c(g, '\n');
-    fputs(g->str, g_src_enc_dump);
-    /*
-     * FLUSHED PER ROW, and this is not caution -- it is a defect this
-     * function had and the corpus builder caught on its first run.  Nothing
-     * closes this stream: the plugin's exit path does not own it, so the
-     * FINAL row sat in stdio's buffer and reached the file cut in half.  The
-     * mipsel capture's last line read `mipsel<TAB>41006014<TAB>bn` -- a
-     * mnemonic sheared mid-word, no source column, no newline.
-     *
-     * A corpus that silently loses its tail is worse than one that refuses:
-     * the truncated row still PARSES, as a row whose read list is empty, so
-     * a gate reading it would score that encoding as publishing nothing and
-     * report no error at all.  Both of the two "conflicting encodings" the
-     * builder reported on that run were this, and both went away here.
-     *
-     * The cost is bounded by the DEDUPLICATION above -- one flush per
-     * distinct encoding, never per executed instruction -- and the whole
-     * path is off unless asked for.
-     */
-    fflush(g_src_enc_dump);
+    g_src_enc.write(g->str);
     g_string_free(g, TRUE);
-    g_src_enc_dump_rows.fetch_add(1, std::memory_order_relaxed);
+}
+
+void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
+                      uint8_t size, const char *mnem)
+{
+    if (!f || !bytes || !size || !g_opc_enc.live()) {
+        return;
+    }
+
+    char hex[2 * MAX_INSN_BYTES + 1];
+    uint8_t n = enc_hex(hex, bytes, size);
+    std::unique_lock<std::mutex> lk;
+
+    if (!g_opc_enc.claim(lk, bytes, n)) {
+        return;
+    }
+
+    GString *g = g_string_new(nullptr);
+
+    /*
+     * BY NAME, not by number.  The GenericOpcode enumerators are dense and
+     * renumber whenever one is inserted, so a corpus of integers taken
+     * before a table edit and one taken after would compare as a wholesale
+     * class move with nothing having happened.  The names are the stable
+     * subject, and they are what an adjudication ledger has to be written
+     * in to stay readable.
+     */
+    g_string_append_printf(g, "%s\t%s\t%s\t%s\n",
+                           target_name ? target_name : "?",
+                           hex, mnem ? mnem : "?",
+                           generic_opcode_name_or_unknown(f->opcode));
+    g_opc_enc.write(g->str);
+    g_string_free(g, TRUE);
 }
 
 

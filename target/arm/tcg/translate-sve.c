@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "translate.h"
 #include "translate-a64.h"
+#include "exec/insn-dataflow.h"
 #include "fpu/softfloat.h"
 
 
@@ -4455,6 +4456,41 @@ uint32_t make_svemte_desc(DisasContext *s, unsigned vsz, uint32_t nregs,
     return simd_desc(vsz, vsz, desc | data);
 }
 
+/*
+ * The GOVERNING PREDICATE, stated by NAME.
+ *
+ * Pg is an encoding field, so the emulator resolves it at TRANSLATION time
+ * and hands the helper a POINTER computed from tcg_env -- an address, not a
+ * read of the bytes it addresses -- which is precisely the shape
+ * insn_dataflow_note_stated_read_name() exists for.
+ *
+ * BY NAME AND NOT BY RANGE, which was measured rather than chosen.  The
+ * range form needs the predicate file declared, and declaring it renames
+ * every OTHER access to those bytes as well -- including the pointer a
+ * predicate-producing helper is handed, whose direction the extraction
+ * cannot see and conservatively counts as a read.  Three `whilelo`
+ * encodings then published their own destination predicate as a source, a
+ * register the instruction does not read: a fabrication, and one introduced
+ * by the declaration rather than found by it.  The name form states the one
+ * fact this site knows and reinterprets nothing else.
+ *
+ * FFR is pregs[16] in QEMU's storage so that it can be handled as any other
+ * predicate; the architecture and the GDB stub both call it `ffr`, which is
+ * why the spellings are listed rather than pasted from an index.
+ */
+static const char * const sve_pred_names[17] = {
+    "p0",  "p1",  "p2",  "p3",  "p4",  "p5",  "p6",  "p7",
+    "p8",  "p9",  "p10", "p11", "p12", "p13", "p14", "p15",
+    "ffr",
+};
+
+static void note_sve_pred_read(int pg)
+{
+    if (pg >= 0 && pg < (int)ARRAY_SIZE(sve_pred_names)) {
+        insn_dataflow_note_stated_read_name(sve_pred_names[pg]);
+    }
+}
+
 static void do_mem_zpa(DisasContext *s, int zt, int pg, TCGv_i64 addr,
                        int dtype, uint32_t nregs, bool is_write,
                        gen_helper_gvec_mem *fn)
@@ -4474,6 +4510,43 @@ static void do_mem_zpa(DisasContext *s, int zt, int pg, TCGv_i64 addr,
     desc = make_svemte_desc(s, vec_full_reg_size(s), nregs,
                             dtype_msz(dtype), is_write, zt);
     t_pg = tcg_temp_new_ptr();
+
+    /*
+     * THE GOVERNING PREDICATE AND THE STORE DATA, stated: the predicate by
+     * name (see note_sve_pred_read() above for why not by range) and the
+     * data vectors by the range that IS each of them, the vector file being
+     * declared already.
+     *
+     * Neither reaches the op walk.  The predicate is handed to the helper as
+     * a POINTER -- tcg_gen_addi_ptr(t_pg, tcg_env, ...) below -- and a
+     * pointer computed from tcg_env is an address, not a read of the bytes
+     * it points at; the data vector is not even that, it is folded into the
+     * descriptor's Zt field and reconstructed inside the helper.  So an
+     * instruction the encoding spells `st1b {z2.b}, p0, [x7]` leaves QEMU's
+     * ordered read list naming neither p0 nor z2.
+     *
+     * R7.3: a register the encoding names is not the emulator's to drop, and
+     * R15: that the emulator carries it as a descriptor field rather than as
+     * an op is a lowering decision, not architectural truth.  The predicate
+     * decides which elements are accessed on every form, load and store
+     * alike, so it is stated unconditionally; the data vectors are read only
+     * when the access is a STORE, and a load's Zt is a destination that this
+     * must not turn into a source.
+     *
+     * ONE STATEMENT PER REGISTER the multi-register forms name: ST2/ST3/ST4
+     * store from Zt, Zt+1, ... modulo 32, and naming only the first would
+     * publish a list short by the very members that make the form what it
+     * is.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    note_sve_pred_read(pg);
+    if (is_write) {
+        for (uint32_t i = 0; i < nregs; i++) {
+            insn_dataflow_note_stated_read_env(
+                vec_full_reg_offset(s, (zt + i) % 32), vec_full_reg_size(s));
+        }
+    }
 
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
     fn(tcg_env, t_pg, addr, tcg_constant_i32(desc));
@@ -5246,6 +5319,26 @@ static void do_mem_zpz(DisasContext *s, int zt, int pg, int zm,
     TCGv_ptr t_pg = tcg_temp_new_ptr();
     TCGv_ptr t_zt = tcg_temp_new_ptr();
     uint32_t desc;
+
+    /*
+     * The same three registers the gather/scatter forms name, and the same
+     * reason they are stated: the pointers below are addresses computed from
+     * tcg_env, not reads of the storage they point at, so the governing
+     * predicate, the vector of offsets and (on a scatter) the data vector are
+     * absent from QEMU's ordered read list.  See do_mem_zpa() above for the
+     * ruling this rests on.
+     *
+     * Zm is read either way -- it carries the addresses -- while Zt is a
+     * source only when the access writes memory; on a gather it is the
+     * destination.
+     */
+    note_sve_pred_read(pg);
+    insn_dataflow_note_stated_read_env(vec_full_reg_offset(s, zm),
+                                       vec_full_reg_size(s));
+    if (is_write) {
+        insn_dataflow_note_stated_read_env(vec_full_reg_offset(s, zt),
+                                           vec_full_reg_size(s));
+    }
 
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
     tcg_gen_addi_ptr(t_zm, tcg_env, vec_full_reg_offset(s, zm));

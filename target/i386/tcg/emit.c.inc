@@ -2008,10 +2008,49 @@ static void gen_DEC(DisasContext *s, X86DecodedInsn *decode)
     prepare_update_cc_incdec(decode, s, CC_OP_DECB + ot);
 }
 
+/*
+ * THE DIVIDEND, stated by the ranges that are its two halves.
+ *
+ * `div`/`idiv` read a double-width dividend held in EDX:EAX (AH:AL at
+ * byte width) and the encoding names neither -- they are implicit operands
+ * of the opcode.  QEMU passes only the DIVISOR as a TCG value and lets the
+ * helper reach into CPUX86State for the other two, so whether those reads
+ * reach the ordered read list depends on how completely the helper's env
+ * accesses could be extracted.  Measured, that is not a property of the
+ * architecture: `divl`, `divq` and `idivq` carried REG_GPR0 and REG_GPR2
+ * while `idivl` did not, three forms of one instruction disagreeing about
+ * an operand all four of them read.
+ *
+ * R7.3 says an operand the instruction reads is not the emulator's to drop
+ * and R15 says how the emulator happens to lower it is not architectural
+ * truth, so the fact is STATED at the decode site, where the operand width
+ * is in hand, rather than inferred from an extraction that can come back
+ * short.  Stated on every width by construction: a read set that depends on
+ * which helper the translation picked is the defect this replaces.
+ *
+ * BOTH HALVES ALWAYS.  At byte width the dividend is AX -- one register in
+ * the architecture and the low half of RAX here -- so EDX is not read and
+ * is not stated; every wider form reads both.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_dividend_read(MemOp ot)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[R_EAX]),
+        sizeof(((CPUX86State *)0)->regs[R_EAX]));
+    if (ot != MO_8) {
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUX86State, regs[R_EDX]),
+            sizeof(((CPUX86State *)0)->regs[R_EDX]));
+    }
+}
+
 static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
 
+    gen_note_dividend_read(ot);
     switch(ot) {
     case MO_8:
         gen_helper_divb_AL(tcg_env, s->T0);
@@ -2085,6 +2124,8 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 static void gen_IDIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
+
+    gen_note_dividend_read(ot);
 
     switch(ot) {
     case MO_8:

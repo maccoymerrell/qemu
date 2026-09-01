@@ -235,6 +235,17 @@ def run_gem5(binary, cfg, env, isa, guest, outdir):
     return log
 
 
+#: The standing compression for every trace this harness writes.
+#: A reference run's trace is a working file, not a deliverable, and an
+#: uncompressed one costs disk for nothing -- 124 of them, 34.6 MB, were
+#: measured under one evidence root because these drivers built their
+#: plugin option string without it.  It is set HERE, where the option
+#: string is built, so no caller can forget it; `cst_audit` names the
+#: member codec, which is how the compliance check reads it back rather
+#: than assuming.
+CST_COMPRESS = 'zstd -T0 -3 -q -c'
+
+
 def run_tracer(qemu_dir, isa, guest, outdir):
     qemu = os.path.join(qemu_dir, 'build', QEMU_BIN[isa])
     plugin = os.path.join(qemu_dir,
@@ -242,7 +253,8 @@ def run_tracer(qemu_dir, isa, guest, outdir):
     stem = os.path.join(outdir, os.path.basename(guest))
     p = subprocess.run(
         [qemu, '-plugin',
-         '%s,outfile=%s,memdata=1,regdata=1,wp=0' % (plugin, stem), guest],
+         '%s,outfile=%s,memdata=1,regdata=1,wp=0,compress=%s'
+         % (plugin, stem, CST_COMPRESS), guest],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:
         raise RuntimeError('qemu exit %d: %s'

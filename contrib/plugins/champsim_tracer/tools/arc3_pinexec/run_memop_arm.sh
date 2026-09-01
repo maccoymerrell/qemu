@@ -63,8 +63,18 @@ ENV=(env -i HOME=/tmp LANG=C)
 [ -s memop.bin ] || fail "PIN wrote no reference"
 
 # ---------------------------------------------------------------- tracer
+# compress= is part of the option string, not an afterthought: a reference
+# run's trace is a working file and an uncompressed one costs disk for
+# nothing.  cst_audit names the member codec, which is how the compliance
+# check reads it back rather than assuming.
+#
+# The comment sits HERE and not inside the command: a `#` line between two
+# backslash continuations ENDS the continuation, so `./w` became its own
+# command and qemu ran with no guest ("qemu: no user program specified").
+# `bash -n` accepts that happily -- it is valid syntax and the wrong
+# command -- and only running the leg caught it.
 "${ENV[@]}" setarch -R "$QB"/qemu-x86_64 \
-    -plugin "$QB"/contrib/plugins/libchampsim_tracer.so,outfile=q,wp=0,memdata=1,regdata=1 \
+    -plugin "$QB"/contrib/plugins/libchampsim_tracer.so,outfile=q,wp=0,memdata=1,regdata=1,"compress=zstd -T0 -3 -q -c" \
     ./w >q.stdout 2>q.err
 [ $? -eq 0 ] || fail "tracer run (see $OUT/q.err)"
 

@@ -202,10 +202,22 @@ def parse_ref(logpath, elfpath, gem5_dir, sel=None):
 
 
 # ------------------------------------------------------------------ the runs
-def run_tracer(qemu, plugin, guest, out, wpdepth):
+#: The standing compression for every trace this harness writes.
+#: A reference run's trace is a working file, not a deliverable, and an
+#: uncompressed one costs disk for nothing -- 124 of them, 34.6 MB, were
+#: measured under one evidence root because these drivers built their
+#: plugin option string without it.  It is set HERE, where the option
+#: string is built, so no caller can forget it; `cst_audit` names the
+#: member codec, which is how the compliance check reads it back rather
+#: than assuming.
+CST_COMPRESS = 'zstd -T0 -3 -q -c'
+
+
+def run_tracer(qemu, plugin, guest, out, wpdepth, compress=None):
     trace = out + '.cst'
     opt = ('%s,outfile=%s,memdata=1,regdata=1,wpdepth=%d'
            % (plugin, out, wpdepth))
+    opt += ',compress=%s' % (compress or CST_COMPRESS)
     p = subprocess.run([qemu, '-plugin', opt, guest],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:

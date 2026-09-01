@@ -110,11 +110,23 @@ def run_spike(spike, pk, guest, out, dtc_dir=None, isa='rv64gcv'):
     return log
 
 
+#: The standing compression for every trace this harness writes.
+#: A reference run's trace is a working file, not a deliverable, and an
+#: uncompressed one costs disk for nothing -- 124 of them, 34.6 MB, were
+#: measured under one evidence root because these drivers built their
+#: plugin option string without it.  It is set HERE, where the option
+#: string is built, so no caller can forget it; `cst_audit` names the
+#: member codec, which is how the compliance check reads it back rather
+#: than assuming.
+CST_COMPRESS = 'zstd -T0 -3 -q -c'
+
+
 def run_tracer(qemu, plugin, guest, out):
     trace = out + '.cst'
     p = subprocess.run(
         [qemu, '-plugin',
-         '%s,outfile=%s,memdata=1,regdata=1,wp=0' % (plugin, out),
+         '%s,outfile=%s,memdata=1,regdata=1,wp=0,compress=%s'
+         % (plugin, out, CST_COMPRESS),
          guest],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:

@@ -168,11 +168,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1392,6 +1394,199 @@ static bool want_decode = true, want_mem = true, want_branch = true,
  */
 enum Layer { LAYER_BOUNDARY, LAYER_FIELDS, LAYER_FIXUPS };
 static Layer layer = LAYER_BOUNDARY;
+
+/*
+ * THE READ SUBJECT, WHEN THE DECODER NO LONGER HOLDS IT (--srcenc=FILE).
+ *
+ * WHY THIS OPTION EXISTS.  Both of this tool's layers score the tracer's
+ * READ side by decoding an encoding here, in this process, and asking the
+ * tracer's model what it makes of that decode.  That is sound exactly while
+ * the wire's source list COMES from a decode this process can perform.  It
+ * does not any more: the wire's sources are QEMU's own ordered read list,
+ * stated at TRANSLATION time inside the emulator, plus the survivor rows for
+ * what QEMU does not state.  Neither is reachable from a host tool.
+ *
+ * The failure mode that fact produces is worth naming, because it is the one
+ * that blocked the Capstone deletion for four passes.  With the operand
+ * walk's read arm deleted, the read classes did not go RED and they did not
+ * go GREEN -- their subject simply vanished, every allowlist rule that
+ * justified a read disagreement stopped matching anything, and the run
+ * failed on DEAD RULES.  A rule going dead because the phantom it excused is
+ * no longer produced looks identical to a rule going dead because a decoder
+ * bump moved a signature out from under it.  A gate that cannot tell those
+ * apart is not measuring the read side; it is measuring its own plumbing.
+ *
+ * So the subject is taken from the place that has it.  `CST_SRC_ENC_DUMP`
+ * (champsim_tracer_qdep.cc) writes one row per DISTINCT ENCODING carrying
+ * the source list the WIRE PUBLISHES, after qdep_apply().  Under
+ * `--srcenc=FILE` the read comparison scores THAT against LLVM, in
+ * GenericRegId space, under its own signature family:
+ *
+ *     SR-rd-missing <mnem> +<regs>   LLVM reads it, the wire does not
+ *     SR-rd-phantom <mnem> +<regs>   the wire publishes it, LLVM does not
+ *
+ * The family is deliberately layer-independent.  The wire's source list is
+ * one list; it is not a property of which decoder view this tool happens to
+ * be holding, and giving the boundary and fields runs separate read
+ * signatures would assert a difference that no longer exists.
+ *
+ * REACH IS REPORTED, NEVER ASSUMED.  A corpus is built by running guests and
+ * by driving the translate-only sled, so it covers the encodings those
+ * reached and no others.  An encoding the corpus does not carry is
+ * UNREACHED: its read classes are not scored, it is counted, and the summary
+ * line prints srcenc_reach=covered/total per arm.  It is never treated as
+ * agreement -- an unmeasured encoding that reads as a pass is the silent
+ * false success this tree keeps having to relearn.
+ *
+ * The DEAD-RULE DETECTOR STAYS LIVE.  Rules in the superseded read families
+ * (`R-rd-*`, `FR-rd-*`) are reported as SUPERSEDED with a count rather than
+ * silently exempted, and every other rule is scored exactly as before.
+ */
+static const char *srcenc_path = nullptr;
+static std::map<std::string, std::set<unsigned> > srcenc_map;
+static std::map<std::string, std::string> srcenc_mnem;
+static unsigned long srcenc_covered = 0, srcenc_unreached = 0;
+static std::map<std::string, unsigned long> srcenc_unreached_by_mnem;
+static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
+
+/* --dump-pop=FILE: the sled's population.  One line per encoding this sweep
+ * DECODES, in the same hex spelling the corpus is keyed on, so the sled can
+ * be driven over exactly what the gate will ask about.  Written by the shard
+ * that decoded it; the caller merges and de-duplicates. */
+/*
+ * --dump-pop=FILE [--pop-per-mnem=K]: the sled's population.
+ *
+ * THE WHOLE SWEEP CANNOT BE THE POPULATION, and the number says why: one
+ * 256th of the AArch64 sweep decodes 265,018 encodings, so the arm decodes
+ * about 68 million.  Driving 68 million QEMU translations, keeping a
+ * deduplication key for each and writing a row per encoding is gigabytes of
+ * corpus per ISA to answer a gate whose signatures erase register numbers --
+ * the same 68 million encodings collapse into a few hundred distinct
+ * signatures.
+ *
+ * So the population is STRATIFIED BY MNEMONIC: at most K encodings per
+ * mnemonic per shard.  The shards stripe the encoding space, so K per shard
+ * over N shards spreads K*N samples across the register fields rather than
+ * taking the first K opcodes and stopping.  Deterministic: the same sweep,
+ * shard count and K produce the same population, which is what lets a
+ * corpus be compared against one captured yesterday.
+ *
+ * WHAT THAT COSTS IS REPORTED, NOT ABSORBED.  Every encoding outside the
+ * population is UNREACHED at scoring time and counted there; the summary
+ * line prints reach in both the units that matter -- encodings, which is
+ * small, and MNEMONICS, which is what the signature keys are built from and
+ * is the number that says whether the gate can still see a class of defect.
+ */
+static const char *pop_path = nullptr;
+static unsigned pop_per_mnem = 0;
+static FILE *pop_file = nullptr;
+static std::map<std::string, unsigned> pop_seen_by_mnem;
+
+/* The plugin's generic register NAMES are the corpus's vocabulary and this
+ * tool's own (isax_generic_reg_name comes from the same header).  The id
+ * space is a uint8_t, so the whole map is 256 probes; a name that renders
+ * through the numeric fallback is not a name and is not entered, which is
+ * what makes a corpus written by a differently-numbered build REFUSE here
+ * instead of matching the wrong register. */
+static const std::map<std::string, unsigned> &srcenc_name_map(void)
+{
+    static std::map<std::string, unsigned> m;
+    if (m.empty()) {
+        for (unsigned id = 0; id < 256; id++) {
+            const char *n = isax_generic_reg_name(id);
+            if (!n) continue;
+            std::string s(n);
+            /* generic_reg_name_or_unknown()'s fallback spells REG_<decimal>;
+             * every real name has a non-digit after the prefix. */
+            if (s.size() > 4 && s.compare(0, 4, "REG_") == 0 &&
+                std::isdigit((unsigned char)s[4])) continue;
+            m.emplace(s, id);
+        }
+    }
+    return m;
+}
+
+/*
+ * Load the per-encoding corpus for THIS arm's ISA.
+ *
+ * REFUSES rather than degrades on every input it cannot read exactly: an
+ * unopenable file, a row whose ISA column names an ISA the file also claims
+ * elsewhere with a different answer, a register token that is not in this
+ * build's name space, and -- the case that matters most -- a corpus that
+ * carries no row at all for this ISA.  An empty corpus that scores zero
+ * disagreements is indistinguishable from a perfect one.
+ */
+static bool srcenc_load(const char *path, const char *isa)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "isaxcheck: --srcenc=%s cannot be opened: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    const std::map<std::string, unsigned> &nm = srcenc_name_map();
+    char *line = nullptr; size_t cap = 0; ssize_t len;
+    unsigned long rows = 0, conflicts = 0;
+    while ((len = getline(&line, &cap, f)) > 0) {
+        if (line[0] == '#') continue;
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (!len) continue;
+        std::vector<std::string> col;
+        const char *p = line, *q;
+        while ((q = strchr(p, '\t')) != nullptr) {
+            col.push_back(std::string(p, q - p)); p = q + 1;
+        }
+        col.push_back(std::string(p));
+        if (col.size() < 4) continue;
+        if (col[0] != isa) continue;
+        std::set<unsigned> regs;
+        if (col[3] != "-") {
+            std::string t;
+            std::istringstream is(col[3]);
+            bool bad = false;
+            while (std::getline(is, t, ',')) {
+                auto it = nm.find(t);
+                if (it == nm.end()) {
+                    fprintf(stderr, "isaxcheck: --srcenc=%s row '%s' names "
+                            "register '%s', which this build has no id for -- "
+                            "REFUSING (a corpus and a binary that disagree "
+                            "about the register space cannot be compared)\n",
+                            path, col[1].c_str(), t.c_str());
+                    bad = true; break;
+                }
+                regs.insert(it->second);
+            }
+            if (bad) { free(line); fclose(f); return false; }
+        }
+        auto ins = srcenc_map.emplace(col[1], regs);
+        if (!ins.second) {
+            if (ins.first->second != regs) {
+                fprintf(stderr, "isaxcheck: --srcenc=%s encoding %s carries "
+                        "two DIFFERENT source lists -- REFUSING (a corpus "
+                        "that disagrees with itself has no answer to give)\n",
+                        path, col[1].c_str());
+                conflicts++;
+            }
+        } else {
+            srcenc_mnem[col[1]] = col[2];
+        }
+        rows++;
+    }
+    free(line);
+    fclose(f);
+    if (conflicts) return false;
+    if (!rows) {
+        fprintf(stderr, "isaxcheck: --srcenc=%s carries no row for isa=%s -- "
+                "REFUSING.  An empty corpus scores zero disagreements for the "
+                "same reason a perfect one does, and this gate must not be "
+                "unable to tell them apart\n", path, isa);
+        return false;
+    }
+    fprintf(stderr, "# srcenc corpus=%s isa=%s encodings=%zu rows=%lu\n",
+            path, isa, srcenc_map.size(), rows);
+    return true;
+}
 static bool falsify_requested = false;
 
 /*
@@ -1534,6 +1729,97 @@ enum { BR_NONE = 0, BR_RETURN = 3, BR_DIRECT_CALL = 7, BR_INDIRECT_CALL = 8 };
  */
 static std::map<std::string, unsigned long> size_gap_by_mnem;
 
+/*
+ * LLVM's register tokens, carried into GenericRegId space through the
+ * tracer's own register table.
+ *
+ * @have is the set the answer is being compared AGAINST, and it is a
+ * parameter rather than a capture because it decides the multi-candidate
+ * case: where one LLVM token resolves to several generic ids, EVERY id the
+ * other side actually holds counts as accounted for by that token.  Two
+ * different things put several ids behind one token and both need that
+ * answer -- the tracer splitting one architectural register across ids
+ * (AArch64 `lr` / `w30`), where at most one can be present and picking it is
+ * right; and the tracer deliberately naming SEVERAL registers for one
+ * operand, which is what a register-list row is (MIPS `$ac0` is the
+ * accumulator PAIR and resolves to REG_ACC0 and REG_ACCHI0 together).
+ *
+ * Taking one candidate and stopping reported the other half of a pair as a
+ * phantom on every DSP accumulate and every MADD: a difference the choice
+ * created, not one the decoders have.  When none is present the first
+ * candidate still stands in, so a genuinely missing register is still
+ * reported.
+ *
+ * A token the tracer's table does not classify at all gets its own bucket
+ * rather than being dropped quietly -- a blind spot of exactly the shape
+ * this tool exists to remove.
+ */
+static void map_llvm_regs(const std::set<std::string> &toks,
+                          const std::set<unsigned> &have,
+                          const std::string &m, const std::string &sample,
+                          std::set<unsigned> *out)
+{
+    for (const std::string &tok : toks) {
+        if (is_dropped_reg(tok)) continue;
+        const std::set<unsigned> *cand = generic_candidates(tok);
+        if (!cand || cand->empty()) {
+            note("FN-unmapped-llvm-reg " + m + " " + tok, sample);
+            continue;
+        }
+        bool any = false;
+        for (unsigned k : *cand) {
+            if (!have.count(k)) continue;
+            any = true;
+            if (!isax_generic_reg_dropped(k)) out->insert(k);
+        }
+        if (!any) {
+            unsigned g = *cand->begin();
+            if (!isax_generic_reg_dropped(g)) out->insert(g);
+        }
+    }
+}
+
+/*
+ * SCORE THE WIRE'S PUBLISHED SOURCE LIST AGAINST LLVM.
+ *
+ * @row is the corpus's answer for this encoding, or nullptr when the corpus
+ * does not carry it.  A missing row is NOT an agreement and is NOT a
+ * disagreement: it is an encoding nothing has measured, counted in
+ * srcenc_unreached and printed as reach on the summary line.  Returning
+ * silently here with no counter moving is the whole failure this option
+ * exists to remove, so the count is taken at the call site before the row is
+ * ever dereferenced.
+ *
+ * The signature family is layer-independent by construction -- see the
+ * --srcenc commentary above.
+ */
+static void srcenc_score_reads(const std::set<unsigned> *row,
+                               const std::set<std::string> &llvm_rd,
+                               const std::string &m, const std::string &sample)
+{
+    if (!row) return;
+
+    std::set<unsigned> wire(*row);
+    for (auto it = wire.begin(); it != wire.end(); )
+        it = isax_generic_reg_dropped(*it) ? wire.erase(it) : std::next(it);
+
+    std::set<unsigned> lg;
+    map_llvm_regs(llvm_rd, wire, m, sample, &lg);
+
+    std::vector<unsigned> missing, phantom;
+    std::set_difference(lg.begin(), lg.end(), wire.begin(), wire.end(),
+                        std::back_inserter(missing));
+    std::set_difference(wire.begin(), wire.end(), lg.begin(), lg.end(),
+                        std::back_inserter(phantom));
+
+    std::string ctx = sample + "  wireRD{" + gensetstr(wire) + "} llvmRD{" +
+                      gensetstr(lg) + "}";
+    if (!missing.empty())
+        note("SR-rd-missing " + m + " +" + genliststr(missing), ctx);
+    if (!phantom.empty())
+        note("SR-rd-phantom " + m + " +" + genliststr(phantom), ctx);
+}
+
 static void compare(const uint8_t *b, size_t n)
 {
     CsView c; LlView l;
@@ -1550,6 +1836,40 @@ static void compare(const uint8_t *b, size_t n)
 
     unsigned bl = c.ok ? c.size : (l.ok ? l.size : (unsigned)n);
     std::string hx = hexbytes(b, bl);
+
+    /*
+     * THE SLED POPULATION.  Written before any class runs and for every
+     * encoding EITHER decoder accepted, so the sled is asked to reach the
+     * whole space this sweep can score rather than the subset that happens
+     * to disagree today.  The hex spelling is the corpus key's, so the two
+     * files join directly.
+     */
+    if (pop_file) {
+        const std::string &pm = c.ok ? c.mnem : std::string("?");
+        if (!pop_per_mnem || pop_seen_by_mnem[pm]++ < pop_per_mnem)
+            fprintf(pop_file, "%s\t%s\t%s\n", cfg.name, hx.c_str(), pm.c_str());
+    }
+
+    /*
+     * THE READ SUBJECT for this encoding, when one was supplied.  Looked up
+     * on the bytes the decoders actually consumed -- an encoding whose length
+     * the sled read differently is a different key and reads as UNREACHED,
+     * which is the honest answer rather than a comparison between two
+     * instructions.
+     */
+    const std::set<unsigned> *srcenc_row = nullptr;
+    if (srcenc_path && want_regs) {
+        auto it = srcenc_map.find(hx);
+        if (c.ok) srcenc_mnem_all.insert(c.mnem);
+        if (it != srcenc_map.end()) {
+            srcenc_row = &it->second;
+            srcenc_covered++;
+            if (c.ok) srcenc_mnem_hit.insert(c.mnem);
+        } else {
+            srcenc_unreached++;
+            if (c.ok) srcenc_unreached_by_mnem[c.mnem]++;
+        }
+    }
     std::string cd = c.ok ? (c.mnem + " " + c.ops) : std::string("<cs-reject>");
     std::string ld = l.ok ? l.text : std::string("<llvm-reject>");
     std::string sample = hx + "  cs{" + cd + "}  llvm{" + ld + "}";
@@ -1658,52 +1978,8 @@ static void compare(const uint8_t *b, size_t n)
         }
         std::set<unsigned> fsrc0(f.src.begin(), f.src.end());
         std::set<unsigned> fdst0(f.dst.begin(), f.dst.end());
-        for (const auto *S : {&l.rd, &l.wr}) {
-            bool is_rd = (S == &l.rd);
-            std::set<unsigned> *out = is_rd ? &lgrd : &lgwr;
-            const std::set<unsigned> &have = is_rd ? fsrc0 : fdst0;
-            for (const std::string &tok : *S) {
-                if (is_dropped_reg(tok)) continue;
-                const std::set<unsigned> *cand = generic_candidates(tok);
-                if (!cand || cand->empty()) {
-                    /* A register LLVM names that the tracer's own table
-                     * does not classify at all.  Dropping it quietly would
-                     * be a blind spot of exactly the shape this tool exists
-                     * to remove, so it gets a bucket. */
-                    note("FN-unmapped-llvm-reg " + m + " " + tok, sample);
-                    continue;
-                }
-                /* Where the token has several candidates, EVERY one the
-                 * fields set actually contains counts as accounted for by
-                 * this LLVM register.  Two different things put several
-                 * ids behind one token and both need the same answer:
-                 *
-                 *  - the tracer splitting one architectural register
-                 *    across generic ids (AArch64 `lr` / `w30`), where at
-                 *    most one can be present and picking it is right;
-                 *  - the tracer deliberately naming SEVERAL registers for
-                 *    one operand, which is what a register-list row is --
-                 *    MIPS `$ac0` is the accumulator PAIR and resolves to
-                 *    REG_ACC0 and REG_ACCHI0 together.
-                 *
-                 * Taking one candidate and stopping reported the other
-                 * half of a pair as a phantom on every DSP accumulate and
-                 * every MADD: a difference the choice created, not one
-                 * the decoders have.  When none is present the first
-                 * candidate still stands in, so a genuinely missing
-                 * register is still reported. */
-                bool any = false;
-                for (unsigned k : *cand) {
-                    if (!have.count(k)) continue;
-                    any = true;
-                    if (!isax_generic_reg_dropped(k)) out->insert(k);
-                }
-                if (!any) {
-                    unsigned g = *cand->begin();
-                    if (!isax_generic_reg_dropped(g)) out->insert(g);
-                }
-            }
-        }
+        map_llvm_regs(l.rd, fsrc0, m, sample, &lgrd);
+        map_llvm_regs(l.wr, fdst0, m, sample, &lgwr);
     }
 
     // --- class Z: metadata holes the boundary hands the plugin --------------
@@ -1792,10 +2068,17 @@ static void compare(const uint8_t *b, size_t n)
             note("FR-wr-missing " + m + " +" + genliststr(wonly), ctx);
         if (!conly.empty())
             note("FR-wr-phantom " + m + " +" + genliststr(conly), ctx);
-        if (!ronly.empty())
-            note("FR-rd-missing " + m + " +" + genliststr(ronly), ctx);
-        if (!cronly.empty())
-            note("FR-rd-phantom " + m + " +" + genliststr(cronly), ctx);
+        /* The WRITE arm above is unconditional: the destination list is
+         * still the operand walk's and this tool is still where it is
+         * scored.  The READ arm below is the one whose subject moved. */
+        if (!srcenc_path) {
+            if (!ronly.empty())
+                note("FR-rd-missing " + m + " +" + genliststr(ronly), ctx);
+            if (!cronly.empty())
+                note("FR-rd-phantom " + m + " +" + genliststr(cronly), ctx);
+        } else {
+            srcenc_score_reads(srcenc_row, l.rd, m, sample);
+        }
     } else if (want_regs) {
         for (auto *S : {&c.rd, &c.wr, &l.rd, &l.wr}) {
             for (auto it = S->begin(); it != S->end(); )
@@ -1812,17 +2095,35 @@ static void compare(const uint8_t *b, size_t n)
         if (!conly.empty())
             note("R-wr-phantom " + m + " +" + liststr(conly),
                  sample + "  csWR{" + setstr(c.wr) + "} llvmWR{" + setstr(l.wr) + "}");
-        std::vector<std::string> ronly, cronly;
-        std::set_difference(l.rd.begin(), l.rd.end(), c.rd.begin(), c.rd.end(),
-                            std::back_inserter(ronly));
-        std::set_difference(c.rd.begin(), c.rd.end(), l.rd.begin(), l.rd.end(),
-                            std::back_inserter(cronly));
-        if (!ronly.empty())
-            note("R-rd-missing " + m + " +" + liststr(ronly),
-                 sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" + setstr(l.rd) + "}");
-        if (!cronly.empty())
-            note("R-rd-phantom " + m + " +" + liststr(cronly),
-                 sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" + setstr(l.rd) + "}");
+        if (!srcenc_path) {
+            std::vector<std::string> ronly, cronly;
+            std::set_difference(l.rd.begin(), l.rd.end(),
+                                c.rd.begin(), c.rd.end(),
+                                std::back_inserter(ronly));
+            std::set_difference(c.rd.begin(), c.rd.end(),
+                                l.rd.begin(), l.rd.end(),
+                                std::back_inserter(cronly));
+            if (!ronly.empty())
+                note("R-rd-missing " + m + " +" + liststr(ronly),
+                     sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" +
+                     setstr(l.rd) + "}");
+            if (!cronly.empty())
+                note("R-rd-phantom " + m + " +" + liststr(cronly),
+                     sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" +
+                     setstr(l.rd) + "}");
+        } else {
+            /*
+             * The boundary arm scores the corpus too, and against the SAME
+             * LLVM read set in the SAME vocabulary, so both arms produce one
+             * identical family of rows.  That is deliberate: the wire has one
+             * source list, and a boundary-flavoured and a fields-flavoured
+             * copy of it would be asserting a difference that no longer
+             * exists.  LLVM's names cross into GenericRegId space through
+             * the tracer's own register table -- the same route the fields
+             * layer takes -- so `x30` and `r30` meet as REG_LR.
+             */
+            srcenc_score_reads(srcenc_row, l.rd, m, sample);
+        }
     }
 }
 
@@ -2300,14 +2601,59 @@ static void sweep_x86(unsigned shard, unsigned nshard)
                 }
 }
 
+/*
+ * THE SHARD PROTOCOL for the reach counters.
+ *
+ * The sweep FORKS, so every counter compare() touches lives in a child and
+ * dies with it.  The first run of --srcenc printed `srcenc_reach=0/0` on
+ * every arm for exactly that reason: the parent had never swept anything and
+ * was reporting its own untouched zeroes.  A gate that cannot see its own
+ * subject and prints a number anyway is the standing failure mode of this
+ * tree, and reach is the number the whole option exists to make honest.
+ *
+ * So the counters cross the pipe with the buckets.  Mnemonic SETS cross as
+ * one line each rather than as counts, because reach in mnemonics is a set
+ * union over shards and summing per-shard sizes would count a mnemonic twice
+ * for every shard that saw it.
+ */
+static void emit_srcenc_shard(void)
+{
+    if (!srcenc_path) return;
+    printf("#srcenccov\t%lu\t\n", srcenc_covered);
+    printf("#srcencunr\t%lu\t\n", srcenc_unreached);
+    for (const auto &m : srcenc_mnem_hit) printf("#srcencmh\t0\t%s\n", m.c_str());
+    for (const auto &m : srcenc_mnem_all) printf("#srcencma\t0\t%s\n", m.c_str());
+    for (const auto &kv : srcenc_unreached_by_mnem)
+        printf("#srcencum\t%lu\t%s\n", kv.second, kv.first.c_str());
+}
+
 static void run_sweep(unsigned shard, unsigned nshard)
 {
+    /*
+     * The population file is opened HERE, per shard, and named for the
+     * shard.  The sweep forks its shards, so a single FILE* opened before
+     * the fork would have every child appending through its own copy of one
+     * shared file offset -- interleaved, torn rows, and a population file
+     * that silently under-reports.  One file per shard; the caller merges.
+     */
+    if (pop_path) {
+        char nm[4096];
+        snprintf(nm, sizeof nm, "%s.%u", pop_path, shard);
+        pop_file = fopen(nm, "w");
+        if (!pop_file) {
+            fprintf(stderr, "isaxcheck: --dump-pop cannot write %s: %s -- "
+                    "REFUSING (a population dump that silently writes nothing "
+                    "produces a sled with no subject)\n", nm, strerror(errno));
+            _exit(2);
+        }
+    }
     switch (isa) {
     case ISA_AARCH64: sweep_aarch64(shard, nshard); break;
     case ISA_RISCV64: sweep_riscv(shard, nshard); break;
     case ISA_MIPSEL:  sweep_mips(shard, nshard); break;
     case ISA_X86_64:  sweep_x86(shard, nshard); break;
     }
+    if (pop_file) { fclose(pop_file); pop_file = nullptr; }
 }
 
 // ---------------------------------------------------------------------------
@@ -2448,6 +2794,20 @@ static void usage(void)
         "                  against --allow (a listed repair that stops\n"
         "                  happening fails, as does an unlisted one)\n"
         "  --allow=FILE    allowlist of justified residual signatures\n"
+        "  --srcenc=FILE   take the READ subject from the per-encoding\n"
+        "                  corpus CST_SRC_ENC_DUMP writes (the source\n"
+        "                  list the WIRE publishes) instead of from a\n"
+        "                  decode performed here.  Read disagreements\n"
+        "                  are then reported as SR-rd-missing /\n"
+        "                  SR-rd-phantom in GenericRegId space, and the\n"
+        "                  R-rd-*/FR-rd-* allowlist rules are reported\n"
+        "                  SUPERSEDED rather than dead.  An encoding the\n"
+        "                  corpus does not carry is UNREACHED, counted,\n"
+        "                  and never scored as agreement; the summary\n"
+        "                  line prints srcenc_reach=covered/total\n"
+        "  --dump-pop=FILE write every encoding this sweep decodes to\n"
+        "                  FILE.<shard>, which is the population the\n"
+        "                  translate-only sled is driven over\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
         "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
         "  --cs-mode-add=NAME[,NAME...]  add Capstone mode bits that the\n"
@@ -2490,6 +2850,9 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
         else if (!strncmp(argv[i], "--cs-mode-add=", 14)) csmodeadd = argv[i] + 14;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
+        else if (!strncmp(argv[i], "--srcenc=", 9)) srcenc_path = argv[i] + 9;
+        else if (!strncmp(argv[i], "--dump-pop=", 11)) pop_path = argv[i] + 11;
+        else if (!strncmp(argv[i], "--pop-per-mnem=", 15)) pop_per_mnem = (unsigned)atoi(argv[i] + 15);
         else if (!strncmp(argv[i], "--falsify=", 10)) {
             const char *spec = argv[i] + 10;
             const char *colon = strchr(spec, ':');
@@ -2516,6 +2879,7 @@ int main(int argc, char **argv)
     want_mem = strchr(classes, 'M');
     want_branch = strchr(classes, 'B');
     want_regs = strchr(classes, 'R');
+
 
     /* An arm that cannot reach the register classes is not an arm.  Both
      * conditions below make --falsify a guaranteed no-op, and a no-op that
@@ -2619,6 +2983,13 @@ int main(int argc, char **argv)
         return 2;
     }
     build_name_to_generic();
+
+    /* The corpus is loaded HERE and not at option-parse time: it is keyed on
+     * this arm's ISA and its register tokens resolve through the tracer's own
+     * name space, neither of which exists until the isa row is chosen and
+     * isax_fields_init() has bound the tables.  An earlier draft loaded it
+     * beside the --classes flags and read cfg.name before it was assigned. */
+    if (srcenc_path && !srcenc_load(srcenc_path, cfg.name)) return 2;
 
     if (hexone) {
         uint8_t b[24]; unsigned n = 0;
@@ -2770,6 +3141,7 @@ int main(int argc, char **argv)
         }
         for (auto &kv : size_gap_by_mnem)
             printf("#sizegap\t%lu\t%s\n", kv.second, kv.first.c_str());
+        emit_srcenc_shard();
         for (auto &kv : buckets)
             printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
                    kv.second.sample.c_str());
@@ -2808,6 +3180,7 @@ int main(int argc, char **argv)
                 for (auto &kv : size_gap_by_mnem)
                     printf("#sizegap\t%lu\t%s\n", kv.second,
                            kv.first.c_str());
+                emit_srcenc_shard();
                 for (auto &kv : buckets)
                     printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
                            kv.second.sample.c_str());
@@ -2848,6 +3221,13 @@ int main(int argc, char **argv)
                 if (key == "#falsmatch") { falsify_matched += cnt; continue; }
                 if (key == "#falsmut") { falsify_mutated += cnt; continue; }
                 if (key == "#sizegap") { size_gap_by_mnem[samp] += cnt; continue; }
+                if (key == "#srcenccov") { srcenc_covered += cnt; continue; }
+                if (key == "#srcencunr") { srcenc_unreached += cnt; continue; }
+                if (key == "#srcencmh") { srcenc_mnem_hit.insert(samp); continue; }
+                if (key == "#srcencma") { srcenc_mnem_all.insert(samp); continue; }
+                if (key == "#srcencum") {
+                    srcenc_unreached_by_mnem[samp] += cnt; continue;
+                }
                 auto &b = buckets[key];
                 if (!b.n) b.sample = samp;
                 b.n += cnt;
@@ -2884,9 +3264,35 @@ int main(int argc, char **argv)
      * that matters -- a decoder bump moved the signature and the rule now
      * silently protects nothing while the reader believes it does.
      */
-    std::vector<const AllowRule *> dead;
-    for (const auto &r : allow_rules)
-        if (!r.used && r.isa == cfg.name) dead.push_back(&r);
+    /*
+     * SUPERSEDED, NOT AMNESTIED.  Under --srcenc the read comparison has a
+     * different subject and a different signature family, so every unused
+     * `R-rd-*` / `FR-rd-*` rule is unused for a reason the run KNOWS -- its
+     * class is not being scored -- rather than for the reason the dead-rule
+     * detector exists to catch.  Folding the two together in either
+     * direction destroys the instrument: counted as dead, a --srcenc run can
+     * never be green; counted as used, a decoder bump that moved a signature
+     * would hide inside the same silence.
+     *
+     * So they are separated, counted, and PRINTED with their line numbers.
+     * The rules themselves are not deleted here; a rule whose phantom no
+     * longer exists at all is retired in the allowlist file, with the reason
+     * written next to it, which is a source edit and not a runtime decision.
+     *
+     * Every other rule is scored exactly as before, including the write
+     * families this option does not touch.
+     */
+    auto is_superseded_key = [](const std::string &k) {
+        return srcenc_path &&
+               (k.compare(0, 6, "R-rd-m") == 0 || k.compare(0, 6, "R-rd-p") == 0 ||
+                k.compare(0, 7, "FR-rd-m") == 0 || k.compare(0, 7, "FR-rd-p") == 0);
+    };
+    std::vector<const AllowRule *> dead, superseded;
+    for (const auto &r : allow_rules) {
+        if (r.used || r.isa != cfg.name) continue;
+        if (is_superseded_key(r.key)) superseded.push_back(&r);
+        else dead.push_back(&r);
+    }
 
     /* subtarget_gap only means anything where an LLVM rejection is one of
      * the outcomes.  --fixups compares the tracer against itself. */
@@ -2910,6 +3316,41 @@ int main(int argc, char **argv)
                gap_sigs, gap_encodings,
                size_gap_by_mnem.size(), size_gap_encodings,
                dead.size(), regmap_ambiguous_tokens);
+        if (srcenc_path) {
+            unsigned long tot = srcenc_covered + srcenc_unreached;
+            printf("# srcenc=%s corpus_encodings=%zu "
+                   "srcenc_reach_encodings=%lu/%lu (%.4f%%) "
+                   "srcenc_reach_mnemonics=%zu/%zu (%.2f%%) "
+                   "mnemonics_wholly_unreached=%zu "
+                   "superseded_allow_rules=%zu\n",
+                   srcenc_path, srcenc_map.size(),
+                   srcenc_covered, tot,
+                   tot ? 100.0 * (double)srcenc_covered / (double)tot : 0.0,
+                   srcenc_mnem_hit.size(), srcenc_mnem_all.size(),
+                   srcenc_mnem_all.size()
+                     ? 100.0 * (double)srcenc_mnem_hit.size() /
+                       (double)srcenc_mnem_all.size() : 0.0,
+                   srcenc_mnem_all.size() - srcenc_mnem_hit.size(),
+                   superseded.size());
+            if (getenv("ISAX_DUMP_UNREACHED"))
+                for (const auto &kv : srcenc_unreached_by_mnem)
+                    printf("UNREACHED %-9lu %s\n", kv.second, kv.first.c_str());
+            /*
+             * REACH ZERO IS A REFUSAL, not a pass.  An arm whose corpus
+             * answers nothing scores no read class at all, and every read
+             * rule in the allowlist reads SUPERSEDED -- which would exit 0
+             * while measuring nothing.  Exit 2, the "could not look" code,
+             * never the gate's 1 and never 0.
+             */
+            if (!srcenc_covered) {
+                fprintf(stderr, "isaxcheck: --srcenc corpus answered 0 of %lu "
+                        "encodings on %s -- REFUSING.  An arm that reaches "
+                        "nothing scores no read class, and a run that scores "
+                        "nothing must not report all-clear\n",
+                        tot, cfg.name);
+                return 2;
+            }
+        }
         if (getenv("ISAX_DUMP_SIZEGAP"))
             for (const auto &kv : size_gap_by_mnem)
                 fprintf(stderr, "SIZEGAP %-8lu %s\n", kv.second,
@@ -2928,6 +3369,9 @@ int main(int argc, char **argv)
     }
     for (const AllowRule *r : dead)
         printf("DEAD %s:%u %s %s\n", allow ? allow : "-", r->lineno,
+               r->isa.c_str(), r->key.c_str());
+    for (const AllowRule *r : superseded)
+        printf("SUPERSEDED %s:%u %s %s\n", allow ? allow : "-", r->lineno,
                r->isa.c_str(), r->key.c_str());
 
     if (!falsify_mnem.empty() && falsify_refused()) return 2;

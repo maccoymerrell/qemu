@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cinttypes>
 #include <execinfo.h>
 #include <malloc.h>
 #include <memory>
@@ -3825,6 +3826,118 @@ static BBTemplate *alt_translate_chain(uint64_t pc)
         g_alt_mint.no_chain++;
     }
     return head;
+}
+
+/*
+ * ============================================================
+ * THE TRANSLATE-ONLY ENCODING SLED (CST_SLED=<base>:<stride>:<count>)
+ * ============================================================
+ *
+ * WHY IT EXISTS.  `isaxcheck` scores the tracer's READ side by decoding an
+ * encoding in its own process and asking the tracer's model what it makes of
+ * the result.  That is sound exactly while the wire's source list comes from
+ * a decode a host tool can perform.  It does not: the wire's sources are
+ * QEMU's ordered read list, stated at TRANSLATION time inside the emulator,
+ * plus the survivor rows for what QEMU does not state.  With the Capstone
+ * operand walk's read arm removed the gate's read classes did not go red and
+ * did not go green -- their SUBJECT vanished, and every allowlist rule that
+ * justified a read disagreement went DEAD, which is indistinguishable from a
+ * decoder bump moving a signature out from under a rule.
+ *
+ * So the subject is exported from the only place that holds it.  A sled is a
+ * guest image whose text is a run of fixed-stride SLOTS, each carrying one
+ * encoding followed by a terminator; this driver walks the slots and asks
+ * QEMU to TRANSLATE each one.  Translation is the whole point: it runs
+ * vcpu_tb_trans -> create_tb_template -> qdep_apply, which is where
+ * dump_src_enc_row() writes the per-encoding corpus, over the list the wire
+ * really publishes.  NOTHING IS EXECUTED -- an arbitrary 32-bit word is not
+ * a runnable program, which is why a sled that ran its slots could only ever
+ * reach the encodings that happen not to fault.
+ *
+ * A SLOT QEMU DECLINES IS COUNTED, NEVER SKIPPED SILENTLY.  Undefined
+ * encodings, unmapped slots and a full code buffer are all real outcomes
+ * here, and a corpus that is short without saying so would be read as an
+ * encoding whose source list is empty rather than as one nobody asked about.
+ * The consumer's reach arithmetic is only as honest as this count.
+ *
+ * MEASUREMENT ONLY, and off unless asked for: with CST_SLED unset this is
+ * one relaxed load on the first dispatch of each vCPU and nothing else.  It
+ * writes no wire field and opens no window; g_alt_translating suppresses the
+ * translate-time marker scan for the same reason the alternate path does,
+ * since a marker in code the guest never runs would open or close a capture
+ * window that belongs to no execution.
+ */
+static std::atomic<bool> g_sled_done{false};
+
+struct SledStats {
+    uint64_t slots      = 0;   /* slots the spec named                    */
+    uint64_t translated = 0;   /* translations QEMU accepted              */
+    uint64_t declined   = 0;   /* QEMU refused (unmapped / undecodable)   */
+    uint64_t no_chain   = 0;   /* translated, but the plugin built none   */
+};
+
+/*
+ * One slot.  Deliberately NOT alt_translate_chain(): that function's counters
+ * describe branch-alternate MINTING, and folding a measurement sweep's
+ * millions of translations into them would make the mint statistics a trace
+ * carries mean something different depending on an environment variable.
+ */
+static void sled_translate_one(uint64_t pc, SledStats *st)
+{
+    g_alt_translating = true;
+    bool ok = qemu_plugin_translate_at(pc);
+    g_alt_translating = false;
+    if (!ok) {
+        st->declined++;
+        return;
+    }
+    st->translated++;
+    g_mutex_lock(&data_lock);
+    BBTemplate *head = g_template_store.lookup_tb_chain_head(pc);
+    g_mutex_unlock(&data_lock);
+    if (!head) {
+        st->no_chain++;
+    }
+}
+
+/*
+ * Drive the whole sled once, on the first dispatch that sees the flag.
+ *
+ * REFUSES rather than degrades on a spec it cannot read: a malformed
+ * CST_SLED, a zero stride or a zero count would each produce a corpus that
+ * is short for a reason nothing records.  A refusal names the value.
+ */
+static void sled_run_once(void)
+{
+    bool expect = false;
+    if (!g_sled_done.compare_exchange_strong(expect, true,
+                                             std::memory_order_acq_rel)) {
+        return;
+    }
+    const char *spec = getenv("CST_SLED");
+    if (!spec) {
+        return;
+    }
+    uint64_t base = 0, stride = 0, count = 0;
+    if (sscanf(spec, "%" SCNx64 ":%" SCNu64 ":%" SCNu64,
+               &base, &stride, &count) != 3 ||
+        !base || !stride || !count) {
+        fprintf(stderr, "champsim_tracer: CST_SLED='%s' is not "
+                "<hexbase>:<stride>:<count> with all three non-zero -- "
+                "REFUSING (a sled that silently walks nothing produces a "
+                "corpus that reads as an empty source list)\n", spec);
+        return;
+    }
+    SledStats st;
+    st.slots = count;
+    for (uint64_t i = 0; i < count; i++) {
+        sled_translate_one(base + i * stride, &st);
+    }
+    fprintf(stderr, "# sled base=0x%" PRIx64 " stride=%" PRIu64
+            " slots=%" PRIu64 " translated=%" PRIu64 " declined=%" PRIu64
+            " no_chain=%" PRIu64 "\n",
+            base, stride, st.slots, st.translated, st.declined, st.no_chain);
+    fflush(stderr);
 }
 
 /*
@@ -9283,6 +9396,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * Both CP-mode and WP-mode (qemu_plugin_exec_tb) invocations
      * deliver the executing TB through the same pointer. */
     BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
+
+    /* THE SLED, if one was asked for: one relaxed load per dispatch until
+     * the first one claims it, then one relaxed load forever.  Placed at the
+     * top so the sled runs against a guest whose image is mapped and before
+     * any of this callback's state has been touched. */
+    if (!g_sled_done.load(std::memory_order_relaxed)) {
+        sled_run_once();
+    }
 
     /* WP-mode early-out runs BEFORE exec_lock acquisition.  The CP
      * thread that triggered this WP simulation already holds

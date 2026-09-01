@@ -3119,7 +3119,90 @@ def classify_x86(m: str) -> Entry:
     return ent("GEN_OP_UNKNOWN")
 
 
+
+# The suffixed decodetree rule names above, each pointing at the bare
+# spelling the vocabulary already answers.  QEMU's own suffixes:
+#   _s / _v   scalar and vector forms of one A64 operation
+#   _d / _q   the 64- and 128-bit forms
+#   _sve2     the SVE2 spelling of a NEON operation
+AARCH64_FORM_STEMS: dict[str, str] = {
+    "neg_s": "neg", "neg_v": "neg",
+    "ext_d": "ext", "ext_q": "ext", "ext_sve2": "ext",
+    "mvni_v": "mvni",
+    "urecpe_v": "urecpe", "ursqrte_v": "ursqrte",
+}
+
+
+def _refuse_dead_form_stems() -> None:
+    """Every stem entry must be REACHED and must still change something."""
+    for word, stem in AARCH64_FORM_STEMS.items():
+        got = classify_aarch64(stem)
+        if got.op == "GEN_OP_UNKNOWN":
+            raise SystemExit(
+                f"aarch64: AARCH64_FORM_STEMS maps {word!r} to {stem!r}, "
+                f"which the vocabulary does not answer for.  The entry "
+                f"would delegate one silence to another; teach the stem.")
+        without = _classify_aarch64_without_stems(word)
+        if (without.op, without.branch) == (got.op, got.branch):
+            raise SystemExit(
+                f"aarch64: AARCH64_FORM_STEMS maps {word!r} to {stem!r}, "
+                f"and the cascade already answers {word!r} the same way.  "
+                f"The entry changes nothing; delete it.")
+
+
+def _classify_aarch64_without_stems(m: str) -> Entry:
+    """What the cascade says about a word with the stem block bypassed."""
+    saved = dict(AARCH64_FORM_STEMS)
+    AARCH64_FORM_STEMS.clear()
+    try:
+        return classify_aarch64(m)
+    finally:
+        AARCH64_FORM_STEMS.update(saved)
+
+
 def classify_aarch64(m: str) -> Entry:
+    # ------------------------------------------------------------------
+    # QEMU DECODETREE RULE NAMES THAT CARRY A FORM SUFFIX
+    # ------------------------------------------------------------------
+    # Everything below this block was written for BARE mnemonics, which
+    # is what a Capstone constant folds to, and it separates families by
+    # PREFIX.  a64.decode and sve.decode name a rule for the instruction
+    # plus the form it decodes -- NEG_s beside NEG_v, EXT_d beside EXT_q,
+    # MVNI_v, LD_mult, ST_zpri -- and a prefix rule for an unrelated
+    # family answers those first: `neg_s` reaches startswith("neg") in the
+    # INT_ADD row, `mvni_v` reaches startswith("mvn") in the NOT row, and
+    # `ext_d` reaches startswith("ext") in the MOV row, while the bare
+    # `neg`, `mvni` and `ext` are each caught earlier and correctly.  It
+    # is the catch-all-answering-for-a-string-it-does-not-know hazard the
+    # mips enumerator peel and the x86 `mov` fallback were narrowed for,
+    # arriving through a suffix instead of a namespace.
+    #
+    # A STEM ENTRY MAY ONLY RESTORE WHAT THE VOCABULARY ALREADY SAYS.  The
+    # answer is delegated to the bare word, never written here, so this
+    # block cannot invent a class -- and _refuse_dead_form_stems checks
+    # both halves at generation time: the stem must be answered, and it
+    # must differ from what the suffixed spelling would otherwise get, so
+    # an entry that has stopped changing anything is an error rather than
+    # a no-op.
+    stem = AARCH64_FORM_STEMS.get(m)
+    if stem is not None:
+        return classify_aarch64(stem)
+    # The rules whose bare stem is not a word at all.  LD_mult / ST_mult
+    # are a64.decode's names for the LD1..LD4 / ST1..ST4 multiple-structure
+    # accesses and LD_zpri / ST_zpri / LD_zprr / ST_zprr are sve.decode's
+    # contiguous predicated ones: vector memory in both cases, which is
+    # what the Capstone-keyed rows for LD1/ST1 already say.
+    if m.startswith(("ld_mult", "ld_single", "ld_zpri", "ld_zprr",
+                     "ld_zpa", "ldnt_z", "ld1r")):
+        return ent("GEN_OP_VEC_LOAD")
+    if m.startswith(("st_mult", "st_single", "st_zpri", "st_zprr",
+                     "st_zpa", "stnt_z")):
+        return ent("GEN_OP_VEC_STORE")
+    # B_cond is a64.decode:113; peeled to `b` it takes the unconditional
+    # branch row, which is the one thing it is not.
+    if m == "b_cond":
+        return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
+
     if m in {"b"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"bc", "cbz", "cbnz", "tbz", "tbnz"}:
@@ -3402,6 +3485,242 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_VEC_LOGIC")
     if m in {"zero"}:
         return ent("GEN_OP_VEC_LOGIC")
+
+    # ------------------------------------------------------------------
+    # AArch32 -- the NEON, VFP and MVE vocabulary
+    # ------------------------------------------------------------------
+    #
+    # The aarch64 target decodes A32 and T32 as well as A64, so its
+    # identity universe carries target/arm/tcg's five hand-written and
+    # decodetree AArch32 decoders beside a64.decode: mve.decode,
+    # neon-dp.decode, neon-ls.decode, neon-shared.decode, vfp.decode,
+    # vfp-uncond.decode, m-nocp.decode, a32.decode, t16.decode and
+    # t32.decode.  Everything above this point is the A64/SVE/SME
+    # vocabulary, whose spellings are bare (FADD, LD1, CNT); AArch32
+    # writes the same operations with a leading V and a form suffix
+    # (VADD_fp_3s, VLDR_vstr, VQRSHRN_s64_2sh), and none of those words
+    # reached a rule.  947 of the target's 3,315 decode rules stated
+    # nothing at all because of it.
+    #
+    # THE SECTION IS LAST ON PURPOSE.  A word only arrives here after
+    # every rule above has declined it, so nothing that already had an
+    # answer can be moved by anything below -- which is why all four
+    # Capstone-keyed mnemonic tables regenerate byte for byte.  The two
+    # AArch64 constants that do begin with a V, VECFP and VECINT, are
+    # answered by the vector catch-all above and never reach this line.
+    #
+    # FLOATING POINT IS FP_*, INTEGER IS VEC_*, and the split is read off
+    # QEMU's own suffix rather than out of the decoder the rule sits in.
+    # vfp.decode writes precision as _dp / _sp / _hp, and both NEON and
+    # MVE mark a float form with _fp or with an f-named operation
+    # (VCVT, VDIV, VSQRT, VFMA, VMAXNM, VRINT, VRECPE, VRSQRTE).  This
+    # is the same convention the A64 half already follows: FADD is
+    # GEN_OP_FP_ADD whether its operands are a scalar or a vector, and
+    # refine_arm64_fp_vec promotes the packed form at decode time from
+    # the operands.  Stating FP_ADD for a packed MVE add is therefore
+    # the SAME answer the table gives the A64 spelling of it, not a
+    # weaker one.
+    if m.startswith("v"):
+        fp = ("_fp" in m or m.endswith(("_dp", "_sp", "_hp"))
+              or "_f_" in m or m.endswith("_f"))
+
+        # --- memory ---------------------------------------------------
+        # VLDR_VSTR, VLDM_VSTM, VLDST_multiple, VLDST_single and
+        # VLLDM_VLSTM are ONE rule serving both directions: the L bit
+        # picks load or store inside the generator, exactly as the x87
+        # escape and the 0F 0F 3DNow! escape pick their operation from a
+        # field the decode row does not read.  The row states the access
+        # family it is in and says so; splitting it needs the instance.
+        if m.startswith(("vldst", "vldr_vstr", "vldm_vstm", "vlldm_vlstm")):
+            return ent("GEN_OP_VEC_LOAD")
+        if m.startswith(("vldr", "vld", "vpop")):
+            return ent("GEN_OP_VEC_LOAD")
+        if m.startswith(("vstr", "vst", "vpush", "vscclrm")):
+            return ent("GEN_OP_VEC_STORE")
+
+        # --- moves and system registers -------------------------------
+        # VMSR / VMRS move between a general register and the FP status
+        # and control register; VMOV_to_gp / VMOV_from_gp cross the same
+        # boundary for data.  All of them are moves.
+        if m.startswith(("vmsr", "vmrs")):
+            return ent("GEN_OP_MOV")
+        if m.startswith(("vmovn", "vmovx")):
+            return ent("GEN_OP_VEC_SHUF")
+        if m.startswith("vmov"):
+            return ent("GEN_OP_VEC_MOV")
+        if m.startswith("vimm"):
+            # a64.decode:1502 Vimm is the vector-immediate group (MOVI /
+            # MVNI / the FMOV immediate forms) and mve.decode's VIMM_1r is
+            # the MVE spelling of the same thing: an immediate MOVE.
+            return ent("GEN_OP_VEC_MOV")
+        if m.startswith(("vdup", "vins", "vswp", "vext", "vtbl",
+                         "vtrn", "vuzp", "vzip", "vrev", "vsel", "vpsel")):
+            return ent("GEN_OP_VEC_SHUF")
+
+        # --- floating point -------------------------------------------
+        if m.startswith(("vcvt", "vjcvt")):
+            return ent("GEN_OP_FP_CVT")
+        if m.startswith(("vsqrt", "vrsqrte", "vrsqrts")):
+            return ent("GEN_OP_FP_SQRT")
+        if m.startswith(("vdiv", "vrecpe", "vrecps")):
+            return ent("GEN_OP_FP_DIV")
+        if m.startswith(("vrint", "vabs", "vneg")) and fp:
+            return ent("GEN_OP_FP_MOV")
+        if m.startswith("vrint"):
+            return ent("GEN_OP_FP_MOV")
+        if m.startswith(("vfnma", "vfma", "vmla")) and fp:
+            return ent("GEN_OP_FP_MADD")
+        if m.startswith(("vfnms", "vfms", "vmls", "vnmls")) and fp:
+            return ent("GEN_OP_FP_MSUB")
+        if m.startswith(("vfnma", "vfnms", "vfma", "vfms", "vfml")):
+            return ent("GEN_OP_FP_MADD")
+        if m.startswith(("vnmla",)):
+            return ent("GEN_OP_FP_MADD")
+        if m.startswith(("vnmls",)):
+            return ent("GEN_OP_FP_MSUB")
+        if m.startswith(("vnmul",)):
+            return ent("GEN_OP_FP_MUL")
+        if m.startswith(("vmaxnm", "vminnm", "vacge", "vacgt", "vcmp")) and True:
+            return ent("GEN_OP_FP_CMP")
+        if fp:
+            if m.startswith(("vadd", "vpadd")):
+                return ent("GEN_OP_FP_ADD")
+            if m.startswith(("vsub", "vabd")):
+                return ent("GEN_OP_FP_SUB")
+            if m.startswith(("vmul",)):
+                return ent("GEN_OP_FP_MUL")
+            if m.startswith(("vmax", "vmin", "vpmax", "vpmin", "vceq",
+                             "vcge", "vcgt", "vcle", "vclt")):
+                return ent("GEN_OP_FP_CMP")
+
+        # --- integer vector -------------------------------------------
+        if m.startswith(("vaddhn", "vraddhn")):
+            return ent("GEN_OP_VEC_ADD")
+        if m.startswith(("vsubhn", "vrsubhn")):
+            return ent("GEN_OP_VEC_SUB")
+        if m.startswith(("vadd", "vpadd", "vpadal", "vpaddl", "vqadd",
+                         "vhadd", "vrhadd", "vaddv", "vaddlv", "vadc")):
+            return ent("GEN_OP_VEC_ADD")
+        if m.startswith(("vsub", "vqsub", "vhsub", "vsbc")):
+            return ent("GEN_OP_VEC_SUB")
+        if m.startswith(("vabav", "vabd", "vaba")):
+            return ent("GEN_OP_VEC_SUB")
+        if m.startswith(("vmladav", "vmlaldav", "vrmlaldavh", "vmlal",
+                         "vqdmlal", "vqrdmlah", "vqdmlah", "vmla",
+                         "vmlas", "vqdmladh", "vqrdmladh", "vdot",
+                         "vsdot", "vudot", "vusdot", "vsudot", "vcmla",
+                         "vmmla", "vsmmla", "vummla", "vusmmla",
+                         "vqdmlash", "vqrdmlash")):
+            return ent("GEN_OP_VEC_MADD")
+        if m.startswith(("vmlsdav", "vmlsldav", "vrmlsldavh", "vmlsl",
+                         "vqdmlsl", "vqrdmlsh", "vmls", "vqdmlsdh",
+                         "vqrdmlsdh")):
+            return ent("GEN_OP_VEC_MSUB")
+        if m.startswith(("vmull", "vqdmull", "vmullp", "vmulh", "vrmulh",
+                         "vqdmulh", "vqrdmulh", "vcmul", "vmul")):
+            return ent("GEN_OP_VEC_MUL")
+        if m.startswith(("vand", "vbic", "vorr", "vorn", "veor", "vmvn",
+                         "vbsl", "vbif", "vbit", "vpnot", "vtst",
+                         "vcnt", "vcls", "vclz", "vbrsr")):
+            return ent("GEN_OP_VEC_LOGIC")
+        if m.startswith(("vmax", "vmin", "vpmax", "vpmin")):
+            return ent("GEN_OP_VEC_LOGIC")
+        if m.startswith(("vceq", "vcge", "vcgt", "vcle", "vclt")):
+            return ent("GEN_OP_VEC_LOGIC")
+        if m.startswith(("vshll", "vshl", "vqshl", "vqrshl", "vrshl",
+                         "vshlc", "vsli", "vsri", "vshr", "vrshr",
+                         "vsra", "vrsra", "vshri", "vrshri", "vshrn",
+                         "vrshrn", "vqshrn", "vqrshrn", "vqshrun",
+                         "vqrshrun")):
+            return ent("GEN_OP_VEC_LOGIC")
+        if m.startswith(("vqmovn", "vqmovun")):
+            return ent("GEN_OP_VEC_SHUF")
+        if m.startswith(("vabs", "vneg", "vqabs", "vqneg")):
+            return ent("GEN_OP_NEG")
+        if m.startswith(("vcadd", "vhcadd")):
+            return ent("GEN_OP_VEC_ADD")
+        # The MVE loop and predication rules.  VPST / VPT set the
+        # predicate mask for the following beats, VCTP builds a tail
+        # predicate from a length, and the DLS / WLS / LE / LCTP loop
+        # rules live beside them in mve.decode's low-overhead-branch
+        # block; the four that are branches are answered by the A32
+        # section below rather than here.
+        if m.startswith(("vpst", "vpt", "vctp", "vddup", "vidup",
+                         "vdwdup", "viwdup")):
+            return ent("GEN_OP_VEC_LOGIC")
+
+    # ------------------------------------------------------------------
+    # AArch32 -- the A32 / T32 integer, branch and system vocabulary
+    # ------------------------------------------------------------------
+    # Same terms as the SIMD section above and for the same reason: these
+    # are QEMU's own trans_ names out of a32.decode, a32-uncond.decode,
+    # t16.decode, t32.decode and m-nocp.decode, and none of them reached
+    # a rule written for A64's bare spellings.  Nothing above declines a
+    # word and then finds it here, so no existing answer moves.
+    if m.startswith(("blx", "bl")):
+        # BLX register and BLX immediate are both calls; the T16 rule is
+        # spelled BLX_suffix because Thumb encodes the immediate form as
+        # a pair of halfwords and QEMU names the second one.
+        return ent("GEN_OP_BRANCH",
+                   "BRANCH_INDIRECT_CALL" if m.startswith(("blx_r", "blxns"))
+                   else "BRANCH_DIRECT_CALL")
+    if m.startswith(("bx", "bra", "braz", "tbb", "tbh")):
+        # BX / BXJ / BXNS and the A64 pointer-authenticated BRA / BRAZ
+        # all branch to a register; TBB / TBH branch through a table.
+        return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
+    if m in {"bkpt", "hvc_", "udf_"}:
+        return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
+    if m.startswith(("rsb", "rsc")):
+        # Reverse subtract: the same subtraction with the operands the
+        # other way round.
+        return ent("GEN_OP_INT_SUB")
+    if m.startswith("teq"):
+        return ent("GEN_OP_TEST")
+    if m.startswith(("smlab", "smlat", "smlaw", "smlad", "smmla",
+                     "umaal", "usada8", "smuad")):
+        return ent("GEN_OP_INT_MADD")
+    if m.startswith(("smlsd", "smmls", "smusd")):
+        return ent("GEN_OP_INT_MSUB")
+    if m.startswith(("sasx", "ssax", "uasx", "usax", "uhasx", "uhsax",
+                     "shsax", "shasx", "uqasx", "uqsax", "qasx", "qsax")):
+        # The parallel add-and-subtract-with-exchange family: one halfword
+        # lane adds while the other subtracts.  It is the SIMD add family
+        # the halving and saturating siblings above already sit in.
+        return ent("GEN_OP_VEC_ADD")
+    if m.startswith(("bfci", "sbfx", "ubfx")):
+        # BFCI is a32.decode's name for BFC and BFI together (bfc is bfi
+        # with rn=15, a32.decode:423), and SBFX / UBFX are the extract
+        # half: all of them rewrite a field of the destination.
+        return ent("GEN_OP_BITMANIP")
+    if m.startswith(("ssat", "usat", "pkh")):
+        # Saturate to a bit width, and pack-halfword: both rewrite a
+        # field of the destination rather than compute a value.
+        return ent("GEN_OP_BITMANIP")
+    if m.startswith(("pld", "pldw")):
+        return ent("GEN_OP_PREFETCH")
+    if m.startswith(("mcrr", "mrrc", "mcr", "mrc", "clrm", "tt", "sg")):
+        # Coprocessor register moves, CLRM (clear a register list) and
+        # the M-profile TT / SG queries: register writes with no
+        # arithmetic.
+        return ent("GEN_OP_MOV")
+    if m == "rfe":
+        return ent("GEN_OP_RET", "BRANCH_RETURN")
+    if m == "srs":
+        return ent("GEN_OP_STORE")
+    if m.startswith(("cps", "setend", "it")):
+        # CPS, SETEND and IT write execution state -- interrupt masks,
+        # endianness, the Thumb condition block -- and produce no data.
+        return ent("GEN_OP_MOV")
+    if m == "esb":
+        return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
+    if m.startswith(("sincdecp", "sincdec")):
+        # SVE INC / DEC by element count or by predicate count: an add of
+        # a computed count to a register or a vector.
+        return ent("GEN_OP_VEC_ADD" if m.endswith(("_v", "_z"))
+                   else "GEN_OP_INT_ADD")
+    if m.startswith("dot"):
+        return ent("GEN_OP_VEC_MADD")
+
     return ent("GEN_OP_UNKNOWN")
 
 
@@ -6383,6 +6702,57 @@ def _x86_encoding_word(ident: QemuIdent) -> str | None:
     return None
 
 
+
+def _aarch64_placeholder_word(info: IsaInfo, ident: QemuIdent) -> str | None:
+    """The instruction a64.decode names above a row it spells `NOP`.
+
+    a64.decode uses the rule name NOP for two different things.  One is
+    the hint space, where NOP really is the instruction.  The other is
+    an encoding QEMU implements by doing nothing, and there the rule
+    name is the LOWERING and not the instruction -- all four PRFM /
+    PRFUM rows are spelled NOP, and R16 does not let a QEMU
+    implementation choice reach the wire as an architectural class.  A
+    prefetch reads an address; a nop does not.
+
+    The only place QEMU names those encodings is the full-line comment
+    it puts above each of them, which is where decodetree section
+    headers live:
+
+        # PRFM
+        NOP             11 111 0 01 10 ------------ ----- -----
+
+        # PRFM : prefetch memory: a no-op for QEMU
+        NOP             11 111 0 00 10 0 --------- 00 ----- -----
+
+    That comment is read here, and ONLY for a row whose own name is the
+    placeholder -- everywhere else the rule names itself and there is
+    nothing to look up.  The word is offered as a candidate, so a
+    comment that is prose declines by itself: the hint-space NOP at
+    a64.decode:252 is headed `# The canonical NOP has CRm == op2 == 0`,
+    the vocabulary has no rule for `the`, and the row keeps NOP.
+    """
+    if _word(ident.pattern) != "nop":
+        return None
+    lines = _decode_source_text(info.key, ident.src_file)
+    i = ident.src_line - 2
+    while i >= 0 and not lines[i].strip():
+        i -= 1
+    if i < 0:
+        return None
+    text = lines[i].strip()
+    if not text.startswith("#"):
+        return None
+    tokens = text.lstrip("#").strip().split()
+    if not tokens:
+        return None
+    return _word(tokens[0])
+
+
+PLACEHOLDER_WORD_HOOKS = {
+    "aarch64": _aarch64_placeholder_word,
+}
+
+
 QUALIFIER_WORD_HOOKS = {
     "x86": _x86_encoding_word,
 }
@@ -6530,6 +6900,16 @@ def qemu_rule_words(info: IsaInfo, ident: QemuIdent) -> list[tuple[str, str]]:
     # distinction the carve exists to make.  QEMU's own table spells the
     # VEX form of a row with a leading V (VMOVSS beside MOVSS, VPERMQ),
     # so the arm's spelling is the row's name under that convention.
+    # A ROW WHOSE NAME IS THE DECODER'S PLACEHOLDER, before anything
+    # else: where QEMU spells a rule NOP because its implementation does
+    # nothing, the rule name is the lowering and the instruction is named
+    # in the comment above it.  See _aarch64_placeholder_word.
+    phook = PLACEHOLDER_WORD_HOOKS.get(info.key)
+    if phook is not None:
+        w = phook(info, ident)
+        if w:
+            add(w, "placeholder")
+
     ehook = QUALIFIER_WORD_HOOKS.get(info.key)
     if ehook is not None:
         w = ehook(ident)
@@ -6658,6 +7038,61 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "gen_exception_illegal(); a reserved encoding the decoder exists "
         "to refuse, taking a trap to a vector",
         no_class=True),
+    # --- aarch64 (which decodes A32 and T32 as well as A64) -----------
+    # THE RESERVED-ENCODING RULES, on the terms riscv's `illegal` is
+    # stated on: a rule whose whole job is to REFUSE.  It is a NAMED
+    # kind, not UNKNOWN -- the row states that the rule has no data
+    # behaviour because it has no instruction, rather than declining to
+    # answer.
+    ("aarch64", "invalid"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "invalid", "ruled",
+        "translate-sve.c:556 trans_INVALID() is unallocated_encoding(s); "
+        "sve.decode writes it inside an overlap group ahead of CPY_m_i and "
+        "CPY_z_i to claim the encodings those patterns must not take",
+        no_class=True),
+    ("aarch64", "nocp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "nocp", "ruled",
+        "m-nocp.decode:68 NOCP / :71 NOCP_8_1, translate-m-nocp.c:726 -- the "
+        "M-profile disabled-coprocessor check; it raises the NOCP exception "
+        "and otherwise returns false so the real VFP decode runs, so the id "
+        "publishes only for the encodings that TRAP",
+        no_class=True),
+    # THE M-PROFILE LOW-OVERHEAD LOOP.  Four rules that are one mechanism.
+    ("aarch64", "dls"): Statement(
+        ent("GEN_OP_MOV"), "dls", "ruled",
+        "t32.decode:738 DLS ... rn:4 ... size=4, translate.c:6681 -- "
+        "low-overhead loop start: it writes the loop counter from Rn into "
+        "LR (and, for DLSTP, FPSCR.LTPSIZE) and transfers control nowhere"),
+    ("aarch64", "wls"): Statement(
+        ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT"), "wls", "ruled",
+        "t32.decode:739 WLS ... imm=%lob_imm, translate.c:6719 -- "
+        "low-overhead WHILE-loop start: it writes LR and branches over the "
+        "loop body when the count is already zero, to a label the "
+        "instruction's own immediate names"),
+    ("aarch64", "le"): Statement(
+        ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT"), "le", "ruled",
+        "t32.decode:741 LE ... imm=%lob_imm, translate.c:6791 -- "
+        "low-overhead loop end: it decrements LR and branches back to the "
+        "loop body while the count is non-zero"),
+    ("aarch64", "lctp"): Statement(
+        ent("GEN_OP_MOV"), "lctp", "ruled",
+        "t32.decode:746 LCTP, translate.c:6907 -- loop clear with tail "
+        "predication; its whole architectural effect is to reset "
+        "FPSCR.LTPSIZE, a register write with no data result"),
+    # BRANCH FUTURE.  The one place a QEMU IMPDEF choice and the
+    # architecture agree, which is why it may be read: the ARM ARM
+    # PERMITS an implementation of BF / BFL / BFCSEL / BFX / BFLX that
+    # discards the branch-info cache immediately, and that permission is
+    # architectural.  The class is not being taken from QEMU's decision
+    # to exercise it -- it is taken from the architecture allowing the
+    # instruction to produce nothing.
+    ("aarch64", "bf"): Statement(
+        ent("GEN_OP_NOP"), "bf", "ruled",
+        "t32.decode:729-732 BF (BFL / BFCSEL / BF / BFX / BFLX), "
+        "translate.c:6661 -- the M-profile branch-future insns; the "
+        "architecture permits an implementation equivalent to discarding "
+        "the LO_BRANCH_INFO cache immediately, which produces no data "
+        "result and no transfer of control"),
     # --- mips ---------------------------------------------------------
     # THE DISPATCH ROWS.  QEMU's MIPS translator is a nest of switches on
     # the major opcode and then on a minor field, and every level calls
@@ -6995,6 +7430,63 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
 # vocabulary) or the observation was naming something the rule is not
 # (record why, here).  Both are cheap; guessing is not.
 QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
+    # --- aarch64 ------------------------------------------------------
+    # a64.decode:242 / :246, inside the hint-space overlap group:
+    #     PACIASP     1101 0101 0000 0011 0010 0011 001 11111
+    #     AUTIASP     1101 0101 0000 0011 0010 0011 101 11111
+    # The observation says NOP because these encodings live in the HINT
+    # space, and a CPU without FEAT_PAuth executes them as hints -- which
+    # is what Capstone's row describes and what the wire has been
+    # publishing.  On a CPU that HAS the feature, and qemu-aarch64's
+    # `max` and `neoverse` models do, PACIASP signs the return address:
+    # it reads X30 and SP and WRITES X30, and AUTIASP authenticates and
+    # writes X30 back.  A row that says NOP says the instruction produces
+    # nothing, and under R16 an architectural write may not be dropped
+    # because one configuration of the machine elides it.  The statement
+    # is the register move QEMU's own trans_ function performs
+    # (translate-a64.c gen_pacia / gen_autia writing cpu_reg(s, 30)).
+    ("aarch64", "disas_a64/PACIASP"):
+        "a64.decode:242 PACIASP, translate-a64.c trans_PACIASP -> "
+        "gen_pacia(s, cpu_reg(s,30), cpu_reg_sp(s,31)) writing X30 -- the "
+        "NOP payload is the FEAT_PAuth-absent behaviour of the hint space, "
+        "not the instruction; R16 keeps the architectural write",
+    ("aarch64", "disas_a64/AUTIASP"):
+        "a64.decode:246 AUTIASP, translate-a64.c trans_AUTIASP -> "
+        "gen_autia(s, cpu_reg(s,30), cpu_reg_sp(s,31)) writing X30 -- as "
+        "PACIASP, the authenticate half",
+    # a64.decode:294  SYS ... op0=2
+    # The payload is a NAME_MATCHED join: Capstone spells the whole
+    # SYS/SYSL alias space `sys` and the vocabulary answers the family
+    # with cache maintenance, which is what all but one member of the
+    # op0=1 space does.  This row is not in that space.  op0=2 is the
+    # DEBUG register space -- DBGDTRTX_EL0, OSLAR_EL1 and the rest -- and
+    # QEMU pins the field on the row itself, so what reaches trans_SYS
+    # here is MSR/MRS on a debug register with `l` choosing the
+    # direction.  The op0=3 row beside it carries the same correction and
+    # arrives at it from the other side: its own observations are mrs and
+    # msr, and the 0x48fe989e adjudication already settled it as MOV.
+    ("aarch64", "disas_a64/SYS@1101010100.10...................@a64.decode:294"):
+        "a64.decode:294 SYS ... op0=2 -- the pinned op0 is the debug "
+        "register space, so the row is MSR/MRS on a debug register and not "
+        "the SYS/SYSL maintenance space op0=1 selects; the CACHE_FLUSH "
+        "payload is the Capstone spelling of the whole alias family",
+    # t16.decode:190 / t32.decode:132  B_cond_thumb
+    # The payload is the same kind of join: the rule name peels to `b`,
+    # Capstone's ARM row for a conditional branch is spelled `b` with the
+    # condition in the operand detail, and the vocabulary's `b` rule is
+    # the UNCONDITIONAL branch.  QEMU's rule name says `cond` in it, and
+    # trans_B_cond_thumb() emits arm_skip_unless(s, a->cond) before the
+    # jump: the branch is conditional, and the branch class the wire
+    # carries decides how a predictor is driven.
+    ("aarch64", "disas_t16/B_cond_thumb"):
+        "t16.decode:267 B_cond_thumb, translate.c trans_B_cond_thumb() -> "
+        "arm_skip_unless(s, a->cond) then gen_jmp() -- the rule's own name "
+        "carries the condition and its body tests it; the "
+        "BRANCH_DIRECT_JUMP payload is the `b` spelling Capstone gives "
+        "every A32/T32 branch",
+    ("aarch64", "disas_t32/B_cond_thumb"):
+        "t32.decode:422 B_cond_thumb, translate.c trans_B_cond_thumb() -- as "
+        "the T16 rule, the 32-bit encoding of the same conditional branch",
     # insn32.decode:128-131
     #   {
     #     lpad   label:20                   00000 0010111
@@ -7240,7 +7732,8 @@ def _refuse_dead_statement_disagreements(info: IsaInfo,
 # build teaches nothing -- it just stops it.  An ISA outside the set keeps
 # the observation-derived tiers exactly as they were, and the census says
 # so on every run rather than letting the difference go unremarked.
-QEMU_IDENT_STATED: frozenset[str] = frozenset({"riscv", "mips", "x86"})
+QEMU_IDENT_STATED: frozenset[str] = frozenset(
+    {"riscv", "mips", "x86", "aarch64"})
 
 
 _PIN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\b")
@@ -7674,11 +8167,50 @@ def _x86_jcc_is_the_condition_field(idents: list[QemuIdent]) -> None:
 
 
 
+
+def _aarch64_sys_op0_pin(ident: QemuIdent, st: Statement,
+                         pins: dict[str, int]) -> Statement | None:
+    """op0 decides which system space a SYS row is in, and QEMU pins it.
+
+    a64.decode writes the system-instruction encoding as three rules that
+    differ in ONE pinned field:
+
+        :293  SYS  1101 0101 00 l:1 01 op1:3 crn:4 crm:4 op2:3 rt:5 op0=1
+        :294  SYS  1101 0101 00 l:1 10 op1:3 crn:4 crm:4 op2:3 rt:5 op0=2
+        :295  SYS  1101 0101 00 l:1 11 op1:3 crn:4 crm:4 op2:3 rt:5 op0=3
+
+    op0 is the architectural field that selects the space, and only op0=1
+    is the SYS / SYSL instruction proper -- the DC / IC / AT / TLBI
+    maintenance aliases the `sys` vocabulary rule was written for.  op0=2
+    is the debug register space and op0=3 is the system-register space,
+    and both of those are MSR / MRS: one value moved between a general
+    register and a system register, with `l` choosing the direction.
+    That is what the 0x48fe989e adjudication measured from the mrs and
+    msr spellings observed through :295, and the pin is the same fact
+    stated in the file rather than inferred from a decode.
+
+    Same shape as the RISC-V link pin: the class follows an operand the
+    rule itself pins, and the pin is written down.
+    """
+    op0 = pins.get("op0")
+    if op0 is None or st.word not in ("sys", "sysl"):
+        return None
+    if op0 == 1:
+        return st
+    return dataclasses.replace(
+        st, entry=ent("GEN_OP_MOV"), source="pattern+pin",
+        why=f"a64.decode:{ident.src_line} pins op0={op0} -- the "
+            f"{'debug' if op0 == 2 else 'system'}-register space, which is "
+            f"MSR/MRS with `l` choosing the direction, not the SYS/SYSL "
+            f"maintenance space op0=1 selects")
+
+
 RULE_PIN_HOOKS = {
     "riscv": _riscv_link_pin,
     "mips": _mips_zero_dest_pin,
 }
 RULE_PIN_HOOKS["x86"] = _x86_row_refine
+RULE_PIN_HOOKS["aarch64"] = _aarch64_sys_op0_pin
 
 
 def state_rule(info: IsaInfo, ident: QemuIdent) -> Statement | None:

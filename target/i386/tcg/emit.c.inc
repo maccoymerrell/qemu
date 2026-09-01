@@ -409,6 +409,49 @@ static void gen_note_vector_operand_read(X86DecodedOp *op)
     insn_dataflow_note_stated_read_env(vector_reg_offset(op), sizeof(ZMMReg));
 }
 
+/*
+ * THE SAME STATEMENT FOR A REGISTER THE ENCODING NAMES OUTSIDE THE OPERAND
+ * ARRAY.  Two shapes reach a vector register by number rather than through
+ * X86DecodedOp: the ternary blends' control operand -- implicitly XMM0 in
+ * the legacy forms, imm8[7:4] under VEX -- and a VSIB index.  Both are
+ * registers the ENCODING names, both are read, and neither has an op slot
+ * for gen_note_vector_operand_read() to take.  Same file, same range, same
+ * declaration.
+ */
+static void gen_note_vector_reg_read(int reg)
+{
+    insn_dataflow_note_stated_read_env(ZMM_OFFSET(reg), sizeof(ZMMReg));
+}
+
+/*
+ * A VECTOR REGISTER AN EMITTER READS THROUGH X86DecodedOp::offset, WITHOUT
+ * A POINTER.
+ *
+ * The gvec and ld/st emitters do not call op_ptr(): they address the file
+ * directly, `tcg_gen_gvec_mov(MO_64, decode->op[0].offset,
+ * decode->op[1].offset, ...)` and its relatives.  Two things then hide the
+ * read from the ordered list.
+ *
+ * The first is that the extraction does not attribute a gvec's loads to the
+ * offset they came from, so the register never arrives.  The second is a
+ * LOWERING DECISION, and it is the one R15 is about: every one of these
+ * sites guards the copy with `if (decode->op[0].offset !=
+ * decode->op[1].offset)` or folds the whole operation to a constant when the
+ * immediate makes the answer independent of the input -- `psrlw $17,%xmm0`
+ * becomes gvec_dup_imm(0).  The instruction still READS the operand the
+ * encoding names; QEMU has merely worked out that it need not move the bytes
+ * to get the right answer.  R16: no emulator optimisation reaches the trace.
+ *
+ * Stated at the sites that do it, one call per operand, because which
+ * operand is read is a property of the instruction and not of the shape.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_vector_gvec_read(X86DecodedInsn *decode, int opn)
+{
+    gen_note_vector_operand_read(&decode->op[opn]);
+}
+
 static TCGv_ptr op_ptr(X86DecodedInsn *decode, int opn)
 {
     X86DecodedOp *op = &decode->op[opn];
@@ -889,6 +932,15 @@ static inline void gen_ternary_sse(DisasContext *s, X86DecodedInsn *decode,
     SSEFunc_0_epppp fn = s->vex_l ? ymm : xmm;
     TCGv_ptr ptr3 = tcg_temp_new_ptr();
 
+    /*
+     * THE CONTROL REGISTER A BLEND READS.  op3 is XMM0 in the legacy
+     * `blendvps` / `blendvpd` / `pblendvb` forms and imm8[7:4] under VEX;
+     * either way the encoding names it and the blend reads it lane by lane.
+     * It reaches the helper as this pointer, which is an address and not a
+     * read, and it has no X86DecodedOp of its own.
+     */
+    gen_note_vector_reg_read(op3);
+
     /* The format of the fourth input is Lx */
     tcg_gen_addi_ptr(ptr3, tcg_env, ZMM_OFFSET(op3));
     fn(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, ptr3);
@@ -1251,6 +1303,16 @@ static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
     TCGv_i32 scale = tcg_constant_i32(decode->mem.scale);
     TCGv_ptr index = tcg_temp_new_ptr();
     TCGv mask = tcg_constant_tl(MAKE_64BIT_MASK(0, 8 << s->aflag));
+
+    /*
+     * WHAT A GATHER READS BESIDES ITS MASK.  The INDEX vector is an operand
+     * of the VSIB memory form and reaches the helper as a pointer, so it is
+     * an address here and not a read; and the DESTINATION is a source,
+     * because a lane whose mask bit is clear keeps the value it had.  The
+     * mask itself is operand 1 and op_ptr() states it.
+     */
+    gen_note_vector_reg_read(decode->mem.index);
+    gen_note_vector_operand_read(&decode->op[0]);
 
     /* Pass third input as (index, base, scale) */
     tcg_gen_addi_ptr(index, tcg_env, ZMM_OFFSET(decode->mem.index));
@@ -2069,8 +2131,14 @@ static void gen_CVTPI2Px(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_helper_enter_mmx(tcg_env);
     if (s->prefix & PREFIX_DATA) {
+        /*
+         * `cvtpi2pd` writes both quadwords of the destination, so it reads
+         * nothing of what was there.  Its single-precision sibling does.
+         */
         gen_helper_cvtpi2pd(tcg_env, OP_PTR0, OP_PTR2);
     } else {
+        /* `cvtpi2ps` writes the low two floats and PRESERVES the high two. */
+        gen_note_vector_operand_read(&decode->op[0]);
         gen_helper_cvtpi2ps(tcg_env, OP_PTR0, OP_PTR2);
     }
 }
@@ -2207,11 +2275,19 @@ static void gen_EXTRQ_i(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i32 length = tcg_constant_i32(decode->immediate & 63);
     TCGv_i32 index = tcg_constant_i32((decode->immediate >> 8) & 63);
 
+    /*
+     * THE DESTINATION IS A SOURCE HERE, and its own emitter is the only
+     * place that knows it: op_ptr() states operands 1 and 2, gen_writeback()
+     * writes operand 0, and nothing between them says that this instruction
+     * also READS what it writes.
+     */
+    gen_note_vector_operand_read(&decode->op[0]);
     gen_helper_extrq_i(tcg_env, OP_PTR0, index, length);
 }
 
 static void gen_EXTRQ_r(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_note_vector_operand_read(&decode->op[0]);
     gen_helper_extrq_r(tcg_env, OP_PTR0, OP_PTR2);
 }
 
@@ -2440,11 +2516,13 @@ static void gen_INSERTQ_i(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i32 length = tcg_constant_i32(decode->immediate & 63);
     TCGv_i32 index = tcg_constant_i32((decode->immediate >> 8) & 63);
 
+    gen_note_vector_operand_read(&decode->op[0]);
     gen_helper_insertq_i(tcg_env, OP_PTR0, OP_PTR1, index, length);
 }
 
 static void gen_INSERTQ_r(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_note_vector_operand_read(&decode->op[0]);
     gen_helper_insertq_r(tcg_env, OP_PTR0, OP_PTR2);
 }
 
@@ -2781,6 +2859,8 @@ static void gen_MOVD_to(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_MOVDQ(DisasContext *s, X86DecodedInsn *decode)
 {
+    /* The register it moves FROM; `movaps %xmm0,%xmm0` reads xmm0 too. */
+    gen_note_vector_gvec_read(decode, 2);
     gen_store_sse(s, decode, decode->op[2].offset);
 }
 
@@ -3115,6 +3195,9 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
 
+    /* Every element the insert does not write keeps operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->op[1].offset != decode->op[0].offset) {
         assert(vec_len == 16);
         gen_store_sse(s, decode, decode->op[1].offset);
@@ -3297,6 +3380,9 @@ static void gen_PSRLW_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->immediate >= 16) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
     } else {
@@ -3309,6 +3395,9 @@ static void gen_PSRLW_i(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PSLLW_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
+
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
 
     if (decode->immediate >= 16) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
@@ -3323,6 +3412,9 @@ static void gen_PSRAW_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->immediate >= 16) {
         decode->immediate = 15;
     }
@@ -3334,6 +3426,9 @@ static void gen_PSRAW_i(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PSRLD_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
+
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
 
     if (decode->immediate >= 32) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
@@ -3348,6 +3443,9 @@ static void gen_PSLLD_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->immediate >= 32) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
     } else {
@@ -3361,6 +3459,9 @@ static void gen_PSRAD_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->immediate >= 32) {
         decode->immediate = 31;
     }
@@ -3372,6 +3473,9 @@ static void gen_PSRAD_i(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PSRLQ_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
+
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
 
     if (decode->immediate >= 64) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
@@ -3385,6 +3489,9 @@ static void gen_PSRLQ_i(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PSLLQ_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
+
+    /* The shifted operand, read whatever the count folds the result to. */
+    gen_note_vector_gvec_read(decode, 1);
 
     if (decode->immediate >= 64) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
@@ -4099,6 +4206,14 @@ static void gen_SHA1MSG2(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1RNDS4(DisasContext *s, X86DecodedInsn *decode)
 {
+    /*
+     * THE DESTINATION IS A SOURCE HERE, and its own emitter is the only
+     * place that knows it: op_ptr() states operands 1 and 2, gen_writeback()
+     * writes operand 0, and nothing between them says that this instruction
+     * also READS what it writes.
+     */
+    gen_note_vector_operand_read(&decode->op[0]);
+
     switch(decode->immediate & 3) {
     case 0:
         gen_helper_sha1rnds4_f0(OP_PTR0, OP_PTR0, OP_PTR1);
@@ -4492,6 +4607,8 @@ static void gen_VCVTSI2Sx(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i32 in;
 
+    /* The converted scalar replaces one element; the rest are operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
 
 #ifdef TARGET_X86_64
@@ -4595,6 +4712,13 @@ static void gen_vinsertps(DisasContext *s, X86DecodedInsn *decode)
 
     assert(!s->vex_l);
 
+    /*
+     * Operand 1 supplies every lane the insert leaves alone.  The
+     * `new_mask == 15` arm zeroes them instead of copying, which is the
+     * IMMEDIATE deciding the result and not the operand ceasing to be read.
+     */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (new_mask == 15) {
         /* All zeroes except possibly for the inserted element */
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
@@ -4636,6 +4760,9 @@ static void gen_VINSERTPS_m(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VINSERTx128(DisasContext *s, X86DecodedInsn *decode)
 {
     int mask = decode->immediate & 1;
+
+    /* The 128-bit lane the insert does not write is operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_gvec_mov(MO_64,
                      decode->op[0].offset + offsetof(YMMReg, YMM_X(mask)),
                      decode->op[2].offset + offsetof(YMMReg, YMM_X(0)), 16, 16);
@@ -4680,6 +4807,9 @@ static void gen_VMOVHPx_st(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VMOVHPx(DisasContext *s, X86DecodedInsn *decode)
 {
+    /* The half this does not write is operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
+
     if (decode->op[0].offset != decode->op[2].offset) {
         tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(1)));
         tcg_gen_st_i64(s->tmp1_i64, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(1)));
@@ -4692,6 +4822,8 @@ static void gen_VMOVHPx(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VMOVHLPS(DisasContext *s, X86DecodedInsn *decode)
 {
+    /* The high quadword of the result is operand 1's, kept unchanged. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(1)));
     tcg_gen_st_i64(s->tmp1_i64, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
     if (decode->op[0].offset != decode->op[1].offset) {
@@ -4702,6 +4834,8 @@ static void gen_VMOVHLPS(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VMOVLHPS(DisasContext *s, X86DecodedInsn *decode)
 {
+    /* The low quadword of the result is operand 1's, kept unchanged. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[2].offset);
     tcg_gen_st_i64(s->tmp1_i64, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(1)));
     if (decode->op[0].offset != decode->op[1].offset) {
@@ -4719,6 +4853,8 @@ static void gen_VMOVLPx(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* Everything above the low quadword is operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(s->tmp1_i64, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
@@ -4728,6 +4864,8 @@ static void gen_VMOVLPx_ld(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* Everything above the loaded quadword is operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEUQ);
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(s->tmp1_i64, OP_PTR0, offsetof(ZMMReg, ZMM_Q(0)));
@@ -4752,6 +4890,8 @@ static void gen_VMOVSS(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
 
+    /* The upper 96 bits of the result are operand 1's. */
+    gen_note_vector_gvec_read(decode, 1);
     tcg_gen_ld_i32(s->tmp2_i32, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i32(s->tmp2_i32, OP_PTR0, offsetof(ZMMReg, ZMM_L(0)));

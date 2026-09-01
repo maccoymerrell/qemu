@@ -2880,6 +2880,45 @@ run.
    hashed as ``golden_net`` does: 12 distinct with ``-seed`` alone, 12
    distinct with ``-pid`` alone, 1 distinct with both.
 
+Decoder corrections
+-------------------
+
+QEMU is the tracer's decoder of record, so a defect in its decode table
+is a defect in the trace.  Corrections are fixed here, on this fork, and
+each one carries the reference that settles it and a guest-visible test
+that fails before the fix and passes after.
+
+``target/i386/tcg/decode-new.c.inc`` — EXTRQ's immediate form
+
+   ``66 0F 78 /0 ib ib`` is ``EXTRQ xmm1, imm8, imm8``.  The ``/0`` is an
+   OPCODE EXTENSION occupying ModRM.reg; the register the instruction
+   reads and writes is ModRM.rm.  The table row spelled the operand
+   ``V,x``, which is ModRM.reg, so the emulator operated on the wrong
+   register: ``66 0f 78 c1 08 08`` — ModRM ``0xc1``, mod=11, reg=000,
+   rm=001 — extracted into XMM0 and left XMM1 untouched.
+
+   The operand is ``U,x``, exactly as it already is on ``EXTRQ_r`` two
+   entries below, which shares the same helper and the same AMD
+   encoding shape.  ``U`` additionally requires mod=11, which this
+   encoding has.
+
+   Measured, ``qemu-x86_64 -cpu max``, XMM0 = ``2222…/1111…`` and
+   XMM1 = ``8888…/fedcba9876543210``::
+
+     before   xmm0 out 2222222222222222 0000000000000011   xmm1 unchanged
+     after    xmm0 unchanged                               xmm1 out 8888888888888888 0000000000000032
+
+   In both arms exactly one register moves, and only after the fix is it
+   the one AMD names.  The test is ``EXTRQ_TEST.c`` in the wave evidence
+   and reports OK / DEFECT / UNDECIDED on those two facts alone.
+
+   NOT FIXED HERE, and named rather than absorbed: ``decode_0F78()``
+   dispatches on the prefix alone, so ``66 0F 78 /1``..``/7`` also reach
+   ``EXTRQ_i`` where AMD defines only ``/0``.  That is a second, smaller
+   defect in the same row — an encoding QEMU accepts that the
+   architecture does not — and it is a different change with a different
+   test.
+
 Build wiring
 ------------
 

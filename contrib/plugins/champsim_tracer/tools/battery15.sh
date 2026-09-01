@@ -346,8 +346,14 @@ run_row6() {
         record 6 2 "must0_scan -- no sidecar anywhere under the run directory"
         return
     fi
-    "$PY" "$T/arc3_cov/instruments/must0_scan.py" "${M0[@]}" \
-          > "$O/MUST0.txt" 2>&1
+    # --min-subjects 4: the four smoke sidecars are guaranteed to carry a
+    # census, so a run that finds fewer than four is a scanner that lost its
+    # subject and fails.  The rest of the sweep is short exit reports the
+    # per-encoding captures write, which carry none and are named rather
+    # than counted as failures -- see must0_scan.py's own note on why the
+    # subject rule belongs to the RUN and not to each file.
+    "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 4 \
+          "${M0[@]}" > "$O/MUST0.txt" 2>&1
     record 6 $? "must0_scan over $n sidecar(s) -- every *.stats.log this run produced"
 }
 

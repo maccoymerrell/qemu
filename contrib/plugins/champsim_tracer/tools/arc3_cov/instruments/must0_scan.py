@@ -42,9 +42,25 @@ None of those lines carries the phrase, so none is scanned here.  That is the
 membership rule and not a special case: a column is a must-be-0 row exactly
 when the plugin writes "MUST BE 0" in its own text.
 
-Exit 1 when any row is non-zero, or when a file carries NO must-be-0 row at
-all: a scanner that cannot find its subject FAILS.  Exit 2 on a usage or
-selftest failure.
+Exit 1 when any row is non-zero, or when the run found FEWER THAN
+--min-subjects files carrying a must-be-0 row: a scanner that cannot find its
+subject FAILS.  Exit 2 on a usage or selftest failure.
+
+WHY THE SUBJECT RULE IS ABOUT THE RUN AND NOT ABOUT EACH FILE.  It used to
+be per file, which was right while callers named four sidecars they knew
+carried the census.  Pointed at every `*.stats.log` a battery produces --
+which is where the `0000054b nopl` witness was found sitting on a standing
+corpus after three passes called it unreachable -- most of the files are the
+SHORT exit reports the per-encoding captures write, and those legitimately
+carry no census at all.  Failing on them would make the wide scope
+permanently red for a reason that is not a defect, and a check that is always
+red is a check nobody reads.
+
+So a file with no must-be-0 row is COUNTED AND NAMED, and the guard moves to
+the run: --min-subjects (default 1) is how many files must have carried one.
+A caller that knows it handed over four censuses passes --min-subjects 4 and
+gets the old guarantee back for the population it actually cares about, while
+the wide scan still reads every file that has something to say.
 
 Author: Maccoy Merrell.
 """
@@ -75,20 +91,24 @@ def scan(path):
     return rows
 
 
-def report(paths, quiet=False):
+def report(paths, quiet=False, min_subjects=1):
     rc = 0
+    subjects = 0
+    empty = []
+    nonzero_files = 0
     for p in paths:
         if not os.path.exists(p):
+            # A path the CALLER named and that is not there is still a hard
+            # failure: the caller asserted it exists.
             print('%s: MISSING -- a scanner that cannot find its subject '
                   'fails' % p)
             rc = 1
             continue
         rows = scan(p)
         if not rows:
-            print('%s: NO must-be-0 ROW FOUND -- the scanner has no subject'
-                  % p)
-            rc = 1
+            empty.append(p)
             continue
+        subjects += 1
         bad = [r for r in rows if r[0] != 0]
         print('%s: must-be-0 rows=%d non-zero=%d'
               % (p, len(rows), len(bad)))
@@ -96,7 +116,27 @@ def report(paths, quiet=False):
             for v, t in rows:
                 print('     %s  %s' % ('?' if v is None else v, t))
         if bad:
+            nonzero_files += 1
             rc = 1
+    if empty:
+        # NAMED, never silent.  These are the files that had nothing to say;
+        # a census that LOST its rows would appear here too, which is why the
+        # list is printed rather than counted.
+        print('files carrying NO must-be-0 row: %d (short exit reports carry '
+              'none; a census that lost its rows would also appear here)'
+              % len(empty))
+        for p in empty[:20]:
+            print('     no subject: %s' % p)
+        if len(empty) > 20:
+            print('     ... and %d more' % (len(empty) - 20))
+    print('SCANNED %d file(s): %d carried a must-be-0 census, %d of those '
+          'had a NON-ZERO row, %d carried none'
+          % (len(paths), subjects, nonzero_files, len(empty)))
+    if subjects < min_subjects:
+        print('FAIL: %d file(s) carried a must-be-0 census, below the '
+              '--min-subjects floor of %d.  A scanner that cannot find its '
+              'subject FAILS.' % (subjects, min_subjects))
+        rc = 1
     return rc
 
 
@@ -150,17 +190,40 @@ def selftest():
 
     n = w('none.log', _NO_SUBJECT)
     if report([n], quiet=True) == 0:
-        print('ARM 4 FAILED: a file with no must-be-0 row passed by silence')
+        print('ARM 4 FAILED: a run whose only file has no row passed by '
+              'silence'); ok = False
+    else:
+        print('ARM 4 ok: a run with NO subject at all FAILS')
+
+    # ARM 4b: a file with no row beside one that HAS rows is not fatal -- it
+    # is the short exit report the wide scope necessarily includes -- but the
+    # run still reads the file that has something to say.
+    if report([n, a], quiet=True) != 0:
+        print('ARM 4b FAILED: a no-row file made a clean scan red'); ok = False
+    else:
+        print('ARM 4b ok: a no-row file beside a real census is not fatal')
+
+    # ARM 4c: ...and --min-subjects still refuses a scan that found fewer
+    # censuses than the caller says it handed over.
+    if report([n, a], quiet=True, min_subjects=2) == 0:
+        print('ARM 4c FAILED: --min-subjects did not refuse'); ok = False
+    else:
+        print('ARM 4c ok: --min-subjects refuses a run short of subjects')
+
+    # ARM 4d: a non-zero row in the wide scan is still red, with a no-row
+    # file beside it -- the tolerance may not swallow a real finding.
+    if report([n, br], quiet=True) == 0:
+        print('ARM 4d FAILED: a non-zero row passed beside a no-row file')
         ok = False
     else:
-        print('ARM 4 ok: absent subject FAILS')
+        print('ARM 4d ok: a non-zero row is red however wide the scan')
 
     if report([os.path.join(d, 'nope.log')], quiet=True) == 0:
         print('ARM 5 FAILED: a missing file passed'); ok = False
     else:
         print('ARM 5 ok: missing file FAILS')
 
-    print('SELFTEST %s -- 5 arms' % ('PASSED' if ok else 'FAILED'))
+    print('SELFTEST %s -- 8 arms' % ('PASSED' if ok else 'FAILED'))
     return 0 if ok else 2
 
 
@@ -170,12 +233,18 @@ def main():
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--quiet', action='store_true',
                     help='print the per-file totals without the row list')
+    ap.add_argument('--min-subjects', type=int, default=1,
+                    help='how many files must carry a must-be-0 census '
+                         '(default 1).  A run below the floor FAILS; a '
+                         'single file with no census does not, because the '
+                         'wide scope necessarily includes short exit '
+                         'reports.')
     a = ap.parse_args()
     if a.selftest:
         return selftest()
     if not a.files:
         ap.error('no files given; a scanner with no subject is not a check')
-    return report(a.files, a.quiet)
+    return report(a.files, a.quiet, a.min_subjects)
 
 
 if __name__ == '__main__':

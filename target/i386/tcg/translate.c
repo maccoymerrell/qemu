@@ -2330,9 +2330,49 @@ static void gen_movl_seg(DisasContext *s, X86Seg seg_reg, TCGv src, bool inhibit
     }
 }
 
+/*
+ * WHAT A FAR CALL READS TO PUSH WITH.
+ *
+ * A far call saves the current CS:(E)IP on the stack before it transfers, so
+ * two registers it never names in its encoding are operands: the STACK
+ * POINTER it stores through, and the PROGRAM COUNTER whose next value is the
+ * return address being pushed.
+ *
+ * Neither reaches QEMU's ordered read list, and for two different reasons.
+ * The stack pointer is read by helper_lcall_protected() / helper_lcall_real()
+ * from inside a helper the extraction reports it cannot bound.  The program
+ * counter is worse: eip_next_tl() resolves the return address at TRANSLATION
+ * time into a CONSTANT, so by the time the helper runs there is no read of
+ * cpu_eip left to see -- the same shape as AArch64's FP-enable gate, and the
+ * same answer.  R15: the emulator working the value out early is a lowering
+ * decision, not architectural truth.
+ *
+ * Measured on the encoding sled, `lcallq`, `lcalll` and `lcallw` all read
+ * `RD = <the two address GPRs>` and nothing else, while the wire carried
+ * REG_SP and REG_PC from the operand walk beside it -- 42,071 registers over
+ * the CALLF_m rule.
+ *
+ * STATED IN gen_far_call() rather than at CALLF_m, because it is true of the
+ * direct far call too; the register-indirect form is only where the loss was
+ * measured.  gen_far_jmp() is NOT annotated: a far jump pushes nothing.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_far_call_pushes(void)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[R_ESP]),
+        sizeof(((CPUX86State *)0)->regs[R_ESP]));
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, eip),
+        sizeof(((CPUX86State *)0)->eip));
+}
+
 static void gen_far_call(DisasContext *s)
 {
     TCGv_i32 new_cs = tcg_temp_new_i32();
+
+    gen_note_far_call_pushes();
     tcg_gen_trunc_tl_i32(new_cs, s->T1);
     if (PE(s) && !VM86(s)) {
         gen_helper_lcall_protected(tcg_env, new_cs, s->T0,

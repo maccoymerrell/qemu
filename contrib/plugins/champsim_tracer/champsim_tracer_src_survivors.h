@@ -9,9 +9,9 @@
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
  * is /mnt/md0/QEMU/cst_runs/exec79/gensnap/snap, 176 sidecar(s):
- *   x86_64   54 sidecar(s), 24 row(s), 7 REFUSED (reason on each row below)
- *   aarch64  44 sidecar(s), 25 row(s), 3 REFUSED (reason on each row below)
- *   riscv64  39 sidecar(s), 47 row(s), 16 REFUSED (reason on each row below)
+ *   x86_64   54 sidecar(s), 20 row(s), 11 REFUSED (reason on each row below)
+ *   aarch64  44 sidecar(s), 17 row(s), 11 REFUSED (reason on each row below)
+ *   riscv64  39 sidecar(s), 26 row(s), 37 REFUSED (reason on each row below)
  *   mipsel   39 sidecar(s), 5 row(s), 2 REFUSED (reason on each row below)
  * Nothing here says anything about an instruction no sidecar executed.
  *
@@ -44,7 +44,51 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 24 rows, 4038 census entries, from 54 sidecar(s) */
+/* x86_64 -- 20 rows, 4022 census entries, from 54 sidecar(s) */
+/* REFUSED, not carried: 0x000002e0u VFMADD132Sx REG_VEC1 (vfmadd132sd x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x000002e0u VFMADD132Sx REG_VEC2 (vfmadd132sd x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x000002e2u VFMSUB132Sx REG_VEC4 (vfmsub132sd x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x000002e2u VFMSUB132Sx REG_VEC5 (vfmsub132sd x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
 /* REFUSED, not carried: 0x0000054bu NOP REG_GPR2 (nopl x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -81,11 +125,7 @@ typedef struct {
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
-    { 0x000002e0u, SRC_SURV_FIXED, REG_VEC1      , 0, "VFMADD132Sx" },   /* vfmadd132sd x4 */
-    { 0x000002e0u, SRC_SURV_FIXED, REG_VEC2      , 0, "VFMADD132Sx" },   /* vfmadd132sd x4 */
     { 0x000002e0u, SRC_SURV_SELF , REG_NONE      , 0, "VFMADD132Sx" },   /* vfmadd132sd x4 */
-    { 0x000002e2u, SRC_SURV_FIXED, REG_VEC4      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x4 */
-    { 0x000002e2u, SRC_SURV_FIXED, REG_VEC5      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x4 */
     { 0x000002e2u, SRC_SURV_SELF , REG_NONE      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x4 */
     { 0x00000384u, SRC_SURV_SELF , REG_NONE      , 0, "PINSR" },   /* pinsrd x40 */
     { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x35 */
@@ -107,7 +147,7 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0xecac981bu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VMOVLPx@vex=0" },   /* movsd x10 */
 };
 
-/* aarch64 -- 25 rows, 170 census entries, from 44 sidecar(s) */
+/* aarch64 -- 17 rows, 148 census entries, from 44 sidecar(s) */
 /* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_FCSR (mrs x10) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -123,6 +163,94 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
+/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_PRED0 (st1b x1) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_PRED1 (st1b x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_VEC0 (st1b x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_VEC1 (st1b x1) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_VEC5 (st4 x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_VEC6 (st4 x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_VEC7 (st4 x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_VEC8 (st4 x4) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
 static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0x085b7b49u, SRC_SURV_FIXED, REG_VEC4      , 0, "disas_a64/TBL_TBX" },   /* tbl x4 */
     { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x10 */
@@ -139,19 +267,11 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@11111000100.........00.........." },   /* prfum x10 */
     { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FNEG_s" },   /* fneg x22 */
     { 0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FADD_v@0.0011100.1.....110101.........." },   /* fadd x10 */
-    { 0xeba5bbf5u, SRC_SURV_FIXED, REG_PRED0     , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x1 */
-    { 0xeba5bbf5u, SRC_SURV_FIXED, REG_PRED1     , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x2 */
-    { 0xeba5bbf5u, SRC_SURV_FIXED, REG_VEC0      , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x2 */
-    { 0xeba5bbf5u, SRC_SURV_FIXED, REG_VEC1      , 0, "disas_sve/ST_zpri@1110010....0....111............." },   /* st1b x1 */
     { 0xf38c59fcu, SRC_SURV_FIXED, REG_GPR9      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
     { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
-    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC5      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
-    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC6      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
-    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC7      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
-    { 0xf38c59fcu, SRC_SURV_FIXED, REG_VEC8      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
 };
 
-/* riscv64 -- 47 rows, 579 census entries, from 39 sidecar(s) */
+/* riscv64 -- 26 rows, 519 census entries, from 39 sidecar(s) */
 /* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC0 (vmadc.vvm x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -197,6 +317,72 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
+/* REFUSED, not carried: 0x6832c275u decode_insn32/vsub_vv REG_VEC4 (vsub.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x6832c275u decode_insn32/vsub_vv REG_VEC5 (vsub.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x887129a3u decode_insn32/vfmadd_vv REG_VEC10 (vfmadd.vv x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x887129a3u decode_insn32/vfmadd_vv REG_VEC11 (vfmadd.vv x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x9179a794u decode_insn32/vfmsub_vv REG_VEC13 (vfmsub.vv x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x9179a794u decode_insn32/vfmsub_vv REG_VEC14 (vfmsub.vv x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
 /* REFUSED, not carried: 0xa0d6c6a1u decode_insn32/vmsbc_vvm REG_VEC0 (vmsbc.vvm x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -232,52 +418,196 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
+/* REFUSED, not carried: 0xd2488b0eu decode_insn32/vadd_vv REG_VEC1 (vadd.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd2488b0eu decode_insn32/vadd_vv REG_VEC2 (vadd.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd33e245cu decode_insn32/vmerge_vxm REG_VEC0 (vmerge.vxm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd33e245cu decode_insn32/vmerge_vxm REG_VEC20 (vmerge.vxm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd6082df1u decode_insn32/vmul_vv REG_VEC7 (vmul.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd6082df1u decode_insn32/vmul_vv REG_VEC8 (vmul.vv x5) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd757c28eu decode_insn32/vmerge_vvm REG_VEC0 (vmerge.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd757c28eu decode_insn32/vmerge_vvm REG_VEC17 (vmerge.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xd757c28eu decode_insn32/vmerge_vvm REG_VEC18 (vmerge.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf9fe03f8u decode_insn32/vsbc_vvm REG_VEC0 (vsbc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf9fe03f8u decode_insn32/vsbc_vvm REG_VEC8 (vsbc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xf9fe03f8u decode_insn32/vsbc_vvm REG_VEC9 (vsbc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xfc9b7984u decode_insn32/vadc_vvm REG_VEC0 (vadc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xfc9b7984u decode_insn32/vadc_vvm REG_VEC5 (vadc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0xfc9b7984u decode_insn32/vadc_vvm REG_VEC6 (vadc.vvm x2) --
+ * this decode id carries another FIXED row from the SAME
+ * NUMBERED BANK, so the pair claims one rule reads two
+ * different registers of that bank on every instance --
+ * an ENCODED OPERAND frozen at whatever the deriving
+ * corpus ran.  Measured fabricating on live instructions
+ * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
+ * register the encoding names is published by the
+ * emulator's own statement; this row published the
+ * deriving corpus's instead.  An adjudicated correction
+ * under R15/R16, not a loss under R12.1. */
 static const SrcSurvivorRow g_src_survivors_riscv64[] = {
     { 0x1d7ee76bu, SRC_SURV_FIXED, REG_ZERO      , 0, "decode_insn32/vsetvli" },   /* vsetvli x6 */
     { 0x51bfc656u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fmsub_d" },   /* fmsub.d x2 */
-    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC4      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x5 */
-    { 0x6832c275u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x5 */
     { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x5 */
     { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsub_vv" },   /* vsub.vv x5 */
     { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmv_v_v" },   /* vmv.v.v x160 */
     { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmv_v_v" },   /* vmv.v.v x160 */
-    { 0x887129a3u, SRC_SURV_FIXED, REG_VEC10     , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
-    { 0x887129a3u, SRC_SURV_FIXED, REG_VEC11     , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
     { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
     { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
-    { 0x9179a794u, SRC_SURV_FIXED, REG_VEC13     , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
-    { 0x9179a794u, SRC_SURV_FIXED, REG_VEC14     , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
     { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
     { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
     { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 2, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
     { 0xcfc5a63eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fdiv_d" },   /* fdiv.d x2 */
-    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC1      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x5 */
-    { 0xd2488b0eu, SRC_SURV_FIXED, REG_VEC2      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x5 */
     { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x5 */
     { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadd_vv" },   /* vadd.vv x5 */
-    { 0xd33e245cu, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
-    { 0xd33e245cu, SRC_SURV_FIXED, REG_VEC20     , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
     { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
     { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
-    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC7      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x5 */
-    { 0xd6082df1u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x5 */
     { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x5 */
     { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmul_vv" },   /* vmul.vv x5 */
-    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
-    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC17     , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
-    { 0xd757c28eu, SRC_SURV_FIXED, REG_VEC18     , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
     { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
     { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
     { 0xde4e315bu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fsub_d" },   /* fsub.d x2 */
     { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x131 */
-    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
-    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC8      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
-    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC9      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
     { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
     { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
-    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
-    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC5      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
-    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC6      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
     { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
     { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
 };
@@ -324,6 +654,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 101 rows over the four ISAs. */
+/* 68 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

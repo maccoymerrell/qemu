@@ -136,6 +136,39 @@ result was false:
    have written run-to-run noise into a compiled table.  Refused with its
    own reason, and counted in the loss direction like every other refusal.
 
+6. IT WILL NOT CARRY A FIXED ROW WHOSE ID ALREADY CARRIES ANOTHER FIXED ROW
+   FROM THE SAME NUMBERED REGISTER BANK.  SRC_SURV_FIXED means "the same
+   register on every instruction this rule decodes".  Two of them naming
+   two different vectors -- or two different predicates -- under ONE decode
+   id is the table saying a rule reads both on every instance, which is
+   what an ENCODED OPERAND looks like once it has been frozen at whatever
+   the deriving corpus happened to run.
+
+   MEASURED, on live instructions, not argued.  riscv64 `vadd.vv v8,v9,v10`
+   published REG_VEC1 and REG_VEC2 beside its own v9 and v10; x86
+   `vfmadd132sd %xmm7,%xmm8,%xmm6` published REG_VEC1 and REG_VEC2 beside
+   its own three; aarch64 `st4 {v20.16b-v23.16b},[x11]` published REG_VEC5
+   through REG_VEC8 and REG_GPR9, the registers of the ONE st4 the deriving
+   corpus ran.  Thirteen decode ids, thirty-three rows.
+
+   The runtime refutation route cannot reach these: it needs the emulator
+   to STATE the register on at least one instance, and for RVV and scalar
+   FMA every instance was silent, so a join over them read a clean 0 while
+   the rows fabricated in the same run.  This test is STATIC, over the
+   table's own shape, and it is the same test the plugin prints as a
+   MUST-BE-0 row (champsim_tracer_qdep.cc) so that the header and the
+   counter cannot disagree.
+
+   SINGLETON REGISTERS ARE NEVER A BANK.  A rule reading one fixed vector
+   and one fixed control register says nothing suspicious; only a COLLISION
+   inside one numbered bank is read as a refutation.  A row refused here is
+   printed and written into the header with its reason, like every other
+   refusal -- the register the encoding names is still published, by the
+   emulator's own statement where the decode site makes one and by the
+   operand walk until it goes, and the removal is an ADJUDICATED
+   CORRECTION under R15/R16 rather than a loss under R12.1: a register the
+   encoding does not name was never information.
+
 Usage:
   gen_src_survivors.py --snapshot DIR <isa>=<stats.log> [<isa>=<stats.log> ...]
   gen_src_survivors.py --out <header> --from-snapshot DIR
@@ -175,6 +208,26 @@ WITNESS_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(\S+)\s*$")
 OWED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+Q:")
 RULED_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+\S+\s+R16:")
 MANIFEST = "MANIFEST.sha256"
+
+# The NUMBERED REGISTER BANKS, by the generic-id spelling the census prints.
+# Kept as name prefixes rather than as numbers because the census's column is
+# the name and the enumerators renumber; the plugin's own must-be-0 counter
+# asks the same question of the same four banks over the compiled ids.
+BANKS = ("REG_GPR", "REG_FPR", "REG_VEC", "REG_PRED")
+
+
+def bank_of(reg):
+    """Which numbered bank @reg belongs to, or None for a singleton.
+
+    A bank member is a stem followed by digits and nothing else: `REG_VEC12`
+    is v12 and `REG_VCTRL` is not a vector at all.  Matching on the stem
+    alone would fold every control register whose name starts with one of
+    these into a bank and refuse rows that are not frozen operands.
+    """
+    for b in BANKS:
+        if reg.startswith(b) and reg[len(b):].isdigit():
+            return b
+    return None
 
 
 def sha256(path):
@@ -365,6 +418,24 @@ def emit(out, inputs, src):
                 refused[isa].append((key, per[isa].pop(key), "AMBIGUOUS"))
             elif (key[0], key[2]) in owed[isa]:
                 refused[isa].append((key, per[isa].pop(key), "OWED"))
+    # REFUSAL 6, applied after the three above so that a row already refused
+    # for a worse reason keeps that reason: an id with no identity, or one
+    # carrying several instructions, is not merely a frozen operand.
+    for isa in ISAS:
+        banked = {}
+        for (did, role, reg) in per[isa]:
+            if role != "FIXED":
+                continue
+            b = bank_of(reg)
+            if b:
+                banked.setdefault((did, b), set()).add(reg)
+        for key in list(per[isa]):
+            did, role, reg = key
+            if role != "FIXED":
+                continue
+            b = bank_of(reg)
+            if b and len(banked.get((did, b), ())) > 1:
+                refused[isa].append((key, per[isa].pop(key), "FROZEN"))
 
     w = []
     a = w.append
@@ -440,6 +511,17 @@ def emit(out, inputs, src):
                 a(" * instruction, so an id-keyed row would fire on the others")
                 a(" * too.  It stays in the loss direction and blocks the flip")
                 a(" * until the id is qualified. */")
+            elif why == "FROZEN":
+                a(" * this decode id carries another FIXED row from the SAME")
+                a(" * NUMBERED BANK, so the pair claims one rule reads two")
+                a(" * different registers of that bank on every instance --")
+                a(" * an ENCODED OPERAND frozen at whatever the deriving")
+                a(" * corpus ran.  Measured fabricating on live instructions")
+                a(" * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The")
+                a(" * register the encoding names is published by the")
+                a(" * emulator's own statement; this row published the")
+                a(" * deriving corpus's instead.  An adjudicated correction")
+                a(" * under R15/R16, not a loss under R12.1. */")
             else:
                 a(" * the census counts this row as ADJUDICATION-OWED: an open")
                 a(" * maintainer question, measured against the external")
@@ -501,6 +583,9 @@ def emit(out, inputs, src):
                      if why == "AMBIGUOUS" else
                      "no decode identity at all (id 0 / rule `?`)"
                      if why == "NOIDENT" else
+                     "a FROZEN ENCODED OPERAND: the id carries another FIXED "
+                     "row from the same numbered bank"
+                     if why == "FROZEN" else
                      "ADJUDICATION-OWED, an open maintainer question"))
         if not per[isa]:
             print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "
@@ -602,9 +687,50 @@ def selftest():
     noident = ["         1  00000000 ?                          REG_COPROC0"
                "    FIXED   swc2"]
     witness = witness + ["         1  00000000 ?                          swc2"]
+    # REFUSAL 6's fixtures, and its NEGATIVE controls.
+    #
+    #   0x000002e0  two FIXED rows from ONE bank -- a frozen encoded operand,
+    #               and the shape that must be refused.
+    #   0x0000abcd  one FIXED bank row beside a SINGLETON -- carried; a rule
+    #               reading one fixed vector and one fixed control register
+    #               says nothing suspicious.
+    #   0x0000dcba  two FIXED rows from DIFFERENT banks -- carried, for the
+    #               same reason.
+    #   0x0000face  a bank row beside a SELF row of the same bank -- carried;
+    #               a SELF row names an instance's own destination and is not
+    #               a frozen constant, so it can never make a pair.
+    #   0x0000feed  REG_VCTRL beside REG_VEC9: `REG_VCTRL` starts with no
+    #               bank stem followed by digits and is not a bank member, so
+    #               a stem-only match would refuse this row wrongly.
+    frozen = ["         3  000002e0 VFMADD132Sx                REG_VEC1"
+              "       FIXED   vfmadd132sd",
+              "         3  000002e0 VFMADD132Sx                REG_VEC2"
+              "       FIXED   vfmadd132sd"]
+    notfrozen = ["         4  0000abcd SOMERULE                   REG_VEC3"
+                 "       FIXED   somemn",
+                 "         4  0000abcd SOMERULE                   REG_FPCW"
+                 "       FIXED   somemn",
+                 "         5  0000dcba OTHERRULE                  REG_VEC4"
+                 "       FIXED   othermn",
+                 "         5  0000dcba OTHERRULE                  REG_GPR7"
+                 "       FIXED   othermn",
+                 "         6  0000face SELFRULE                   REG_VEC5"
+                 "       FIXED   selfmn",
+                 "         6  0000face SELFRULE                   REG_VEC6"
+                 "       SELF@0  selfmn",
+                 "         7  0000feed CTRLRULE                   REG_VEC9"
+                 "       FIXED   ctrlmn",
+                 "         7  0000feed CTRLRULE                   REG_VCTRL"
+                 "     FIXED   ctrlmn"]
+    witness = witness + [
+        "         3  000002e0 VFMADD132Sx                vfmadd132sd",
+        "         4  0000abcd SOMERULE                   somemn",
+        "         5  0000dcba OTHERRULE                  othermn",
+        "         6  0000face SELFRULE                   selfmn",
+        "         7  0000feed CTRLRULE                   ctrlmn"]
     x = os.path.join(d, "x86_64.log")
-    _sidecar(x, good + split + owedsurv + ruledsurv + noident, splitline,
-             witness, owedrow + ruledrow)
+    _sidecar(x, good + split + owedsurv + ruledsurv + noident + frozen
+             + notfrozen, splitline, witness, owedrow + ruledrow)
     # aarch64 carries the SECOND claim and NOTHING in the first: its
     # survivor block reads `(none)` and its NOT-SCORED block carries two
     # rows, one on an id the witness shows colliding.  This is the exact
@@ -659,6 +785,28 @@ def selftest():
     chk("ARM D2: a RULED (R16) row in the same ledger IS carried",
         "0x30a7252au, SRC_SURV" in txt,
         "a ruling that the wire is right must not make the flip drop it")
+    chk("ARM K1: a FROZEN ENCODED OPERAND pair is NOT carried",
+        "0x000002e0u, SRC_SURV" not in txt
+        and "REFUSED, not carried: 0x000002e0" in txt
+        and "FROZEN ENCODED OPERAND" in rc.stdout,
+        "two FIXED rows from one bank under one id reached the table")
+    chk("ARM K1a: BOTH rows of the pair are refused, not just one",
+        txt.count("REFUSED, not carried: 0x000002e0") == 2)
+    chk("ARM K2: a bank row beside a SINGLETON is CARRIED",
+        "0x0000abcdu, SRC_SURV_FIXED, REG_VEC3" in txt
+        and "0x0000abcdu, SRC_SURV_FIXED, REG_FPCW" in txt,
+        "a singleton register is never a bank")
+    chk("ARM K3: two FIXED rows from DIFFERENT banks are CARRIED",
+        "0x0000dcbau, SRC_SURV_FIXED, REG_VEC4" in txt
+        and "0x0000dcbau, SRC_SURV_FIXED, REG_GPR7" in txt)
+    chk("ARM K4: a SELF row cannot make a bank pair",
+        "0x0000faceu, SRC_SURV_FIXED, REG_VEC5" in txt
+        and "0x0000faceu, SRC_SURV_SELF" in txt,
+        "SELF names the instance's own destination, never a constant")
+    chk("ARM K5: a stem that is not followed by digits is not a bank",
+        "0x0000feedu, SRC_SURV_FIXED, REG_VEC9" in txt
+        and "0x0000feedu, SRC_SURV_FIXED, REG_VCTRL" in txt,
+        "REG_VCTRL is not a member of the REG_VEC bank")
     chk("ARM E: an empty table is scoped to the sidecars, not the ISA",
         "FACT ABOUT THE" in txt and "NOT ABOUT THE ISA" in txt)
     chk("ARM F: and it makes no claim about the ISA in general",

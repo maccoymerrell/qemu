@@ -257,6 +257,68 @@ static uint32_t vreg_ofs(DisasContext *s, int reg)
     return offsetof(CPURISCVState, vreg) + reg * s->cfg_ptr->vlenb;
 }
 
+/*
+ * THE VECTOR OPERANDS AN OPIVV/OPIVX/OPFVV ENCODING NAMES, stated BY NAME.
+ *
+ * Every one of these shapes reaches the vector file through a POINTER built
+ * from tcg_env -- tcg_gen_addi_ptr() here, or the same inside
+ * tcg_gen_gvec_*_ptr() -- and a pointer computed from tcg_env is an address,
+ * not a read of the bytes it addresses.  The register numbers themselves are
+ * encoding fields the decodetree arg struct still holds, so the fact is in
+ * hand at exactly this point and nowhere later.
+ *
+ * BY NAME AND NOT BY RANGE, and that was MEASURED rather than chosen.  The
+ * range form needs the vector file declared, and declaring it renames every
+ * OTHER access to those bytes as well -- including the mask pointer these
+ * constructors pass UNCONDITIONALLY.  tcg_gen_gvec_4_ptr() notes its second
+ * operand read because for its own callers it is one; for RVV that operand
+ * is v0, handed over even when vm=1 and ignored inside the helper.  Measured
+ * on a guest executing the nine OPIVV/OPFVV rules, declaring the file
+ * published REG_VEC0 on six UNMASKED `vfmadd.vv` / `vfmsub.vv` encodings: a
+ * register the instruction does not read, and a fabrication introduced by
+ * the declaration rather than found by it.  That is the same trap the SVE
+ * predicate file sprang on `whilelo` (translate-sve.c, a76f8026d6), and the
+ * answer is the same one: the name form states the fact this site knows and
+ * reinterprets nothing else.
+ *
+ * The names are the GDB stub's own spelling -- target/riscv/gdbstub.c builds
+ * org.gnu.gdb.riscv.vector as v0..v31 -- which is the namespace
+ * insn_dataflow_reg_name() answers in.
+ *
+ * R7.3 (a register the encoding names is not the emulator's to drop) and R15
+ * (a lowering decision is not architectural truth) are what this rests on.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static const char * const rvv_vreg_names[32] = {
+    "v0",  "v1",  "v2",  "v3",  "v4",  "v5",  "v6",  "v7",
+    "v8",  "v9",  "v10", "v11", "v12", "v13", "v14", "v15",
+    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+    "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+};
+
+static void note_vreg_read(uint32_t vreg)
+{
+    if (vreg < ARRAY_SIZE(rvv_vreg_names)) {
+        insn_dataflow_note_stated_read_name(rvv_vreg_names[vreg]);
+    }
+}
+
+/*
+ * The GOVERNING MASK, which is v0 and is read only when vm=0.
+ *
+ * The encoding decides this in one bit and the emulator passes the pointer
+ * either way, so the bit is the only thing that separates an operand from a
+ * pointer the helper will not look at.  Stated here so that every caller
+ * asks the question the same way.
+ */
+static void note_vreg_mask_read(uint32_t vm)
+{
+    if (!vm) {
+        note_vreg_read(0);
+    }
+}
+
 /* check functions */
 
 /*
@@ -1258,6 +1320,16 @@ static inline bool
 do_opivv_gvec(DisasContext *s, arg_rmrr *a, GVecGen3Fn *gvec_fn,
               gen_helper_gvec_4_ptr *fn)
 {
+    /*
+     * Stated for BOTH lowerings by construction, before the branch that
+     * picks between them: a read set that depends on which one this
+     * translation took is a regime-shaped dataflow answer, which is a
+     * defect this tree has had to fix before.
+     */
+    note_vreg_read(a->rs1);
+    note_vreg_read(a->rs2);
+    note_vreg_mask_read(a->vm);
+
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
         gvec_fn(s->sew, vreg_ofs(s, a->rd),
                 vreg_ofs(s, a->rs2), vreg_ofs(s, a->rs1),
@@ -1302,6 +1374,11 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
                         gen_helper_opivx *fn, DisasContext *s)
 {
     TCGv_ptr dest, src2, mask;
+    /*
+     * @rs1 is a GENERAL register on this shape -- get_gpr() below reads a
+     * TCG global the walk already sees -- so only the vector operand and
+     * the mask need stating.
+     */
     TCGv src1;
     TCGv_i32 desc;
     uint32_t data = 0;
@@ -1310,6 +1387,9 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
     mask = tcg_temp_new_ptr();
     src2 = tcg_temp_new_ptr();
     src1 = get_gpr(s, rs1, EXT_SIGN);
+
+    note_vreg_read(vs2);
+    note_vreg_mask_read(vm);
 
     data = FIELD_DP32(data, VDATA, VM, vm);
     data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
@@ -1705,6 +1785,10 @@ static bool opivv_trans(uint32_t vd, uint32_t vs1, uint32_t vs2, uint32_t vm,
                         gen_helper_gvec_4_ptr *fn, DisasContext *s)
 {
     uint32_t data = 0;
+
+    note_vreg_read(vs1);
+    note_vreg_read(vs2);
+    note_vreg_mask_read(vm);
 
     data = FIELD_DP32(data, VDATA, VM, vm);
     data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
@@ -2344,6 +2428,10 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
             gen_helper_##NAME##_d,                                 \
         };                                                         \
         gen_set_rm(s, RISCV_FRM_DYN);                              \
+                                                                   \
+        note_vreg_read(a->rs1);                                    \
+        note_vreg_read(a->rs2);                                    \
+        note_vreg_mask_read(a->vm);                                \
                                                                    \
         data = FIELD_DP32(data, VDATA, VM, a->vm);                 \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \

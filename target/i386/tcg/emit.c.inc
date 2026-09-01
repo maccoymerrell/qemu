@@ -3111,9 +3111,43 @@ static void gen_PAUSE(DisasContext *s, X86DecodedInsn *decode)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+/*
+ * THE TWO LENGTHS AN EXPLICIT-LENGTH STRING COMPARE READS.
+ *
+ * `pcmpestri` and `pcmpestrm` differ from their implicit-length siblings in
+ * exactly one way: the number of valid elements in each operand is not found
+ * by scanning for a null, it is GIVEN -- in EAX/RAX for the first operand
+ * and EDX/RDX for the second.  Every result the instruction produces depends
+ * on both.
+ *
+ * Neither reaches QEMU's ordered read list.  helper_pcmpestri_xmm() reads
+ * env->regs[R_EAX] and env->regs[R_EDX] itself, from inside a helper the
+ * extraction reports it cannot bound (`helper_unbounded`), so the register
+ * arrives from nowhere; measured on the encoding sled, the two account for
+ * 43,711 of the registers these four rules lose.
+ *
+ * BOTH WIDTHS, ONE STATEMENT.  The operand is RAX/RDX under REX.W and
+ * EAX/EDX otherwise -- one register whose per-read width is recorded
+ * separately (R17) -- so the slot is stated whole, as gen_note_dividend_read()
+ * already does for the dividend.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_explicit_lengths_read(void)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[R_EAX]),
+        sizeof(((CPUX86State *)0)->regs[R_EAX]));
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[R_EDX]),
+        sizeof(((CPUX86State *)0)->regs[R_EDX]));
+}
+
 static void gen_PCMPESTRI(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
+
+    gen_note_explicit_lengths_read();
     gen_helper_pcmpestri_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
@@ -3121,6 +3155,8 @@ static void gen_PCMPESTRI(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PCMPESTRM(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
+
+    gen_note_explicit_lengths_read();
     gen_helper_pcmpestrm_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
     assume_cc_op(s, CC_OP_EFLAGS);
     if ((s->prefix & PREFIX_VEX) && !s->vex_l) {

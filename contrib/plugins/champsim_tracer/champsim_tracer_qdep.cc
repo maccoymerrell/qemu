@@ -14,6 +14,7 @@
 #include <cstring>
 #include <array>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -3773,6 +3774,111 @@ void decide_block(InsnFields *f, bool qemu_dst, bool qemu_sdata,
 }
 
 }  /* namespace */
+
+/*
+ * THE PER-ENCODING READ-LIST CORPUS.  See the declaration in
+ * champsim_tracer_qdep.h for why a host tool cannot derive this and has to
+ * be handed it.
+ *
+ * DEDUPLICATED ON THE ENCODING, which is why the state is here and not in
+ * the caller: a hot loop executes one encoding millions of times and the
+ * corpus wants it once.  The key is the exact byte string AND its length, so
+ * two encodings that differ in a field nothing reads are still two rows --
+ * the sweep this feeds enumerates encodings, and folding distinct ones
+ * together here would silently narrow it.
+ *
+ * A ROW IS WRITTEN ONCE AND NEVER REVISED.  The published source list for an
+ * encoding is a function of the encoding and the tables, so a second sighting
+ * has nothing to add; where that stops being true the corpus builder's own
+ * duplicate check reports a CONFLICT rather than letting the last writer win.
+ */
+std::atomic<int> g_src_enc_dump_state{0};    /* 0 unasked, 1 open, 2 failed */
+FILE *g_src_enc_dump = nullptr;
+std::mutex g_src_enc_dump_lock;
+std::set<std::array<uint8_t, MAX_INSN_BYTES + 1> > g_src_enc_seen;
+std::atomic<uint64_t> g_src_enc_dump_rows{0};
+
+void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
+                      uint8_t size, const char *mnem)
+{
+    int st = g_src_enc_dump_state.load(std::memory_order_relaxed);
+
+    if (st == 2 || !f || !bytes || !size) {
+        return;
+    }
+    if (st == 0) {
+        std::lock_guard<std::mutex> lk(g_src_enc_dump_lock);
+        if (g_src_enc_dump_state.load(std::memory_order_relaxed) == 0) {
+            const char *path = getenv("CST_SRC_ENC_DUMP");
+
+            if (!path) {
+                g_src_enc_dump_state.store(2, std::memory_order_relaxed);
+                return;
+            }
+            g_src_enc_dump = fopen(path, "w");
+            if (!g_src_enc_dump) {
+                g_src_enc_dump_state.store(2, std::memory_order_relaxed);
+                return;
+            }
+            fprintf(g_src_enc_dump, "#isa\tencoding\tmnem\tsrc\n");
+            g_src_enc_dump_state.store(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_src_enc_dump_state.load(std::memory_order_relaxed) != 1) {
+        return;
+    }
+
+    uint8_t n = size < MAX_INSN_BYTES ? size : (uint8_t)MAX_INSN_BYTES;
+    char hex[2 * MAX_INSN_BYTES + 1];
+
+    for (uint8_t i = 0; i < n; i++) {
+        static const char d[] = "0123456789abcdef";
+        hex[2 * i]     = d[bytes[i] >> 4];
+        hex[2 * i + 1] = d[bytes[i] & 0xf];
+    }
+    hex[2 * n] = '\0';
+
+    std::array<uint8_t, MAX_INSN_BYTES + 1> key{};
+    key[0] = n;
+    for (uint8_t i = 0; i < n; i++) {
+        key[i + 1] = bytes[i];
+    }
+
+    std::lock_guard<std::mutex> lk(g_src_enc_dump_lock);
+    if (!g_src_enc_seen.insert(key).second) {
+        return;
+    }
+
+    GString *g = g_string_new(nullptr);
+    g_string_append_printf(g, "%s\t%s\t%s\t",
+                           target_name ? target_name : "?",
+                           hex, mnem ? mnem : "?");
+    reglist_str(g, f->src_regs, f->n_src_regs);
+    g_string_append_c(g, '\n');
+    fputs(g->str, g_src_enc_dump);
+    /*
+     * FLUSHED PER ROW, and this is not caution -- it is a defect this
+     * function had and the corpus builder caught on its first run.  Nothing
+     * closes this stream: the plugin's exit path does not own it, so the
+     * FINAL row sat in stdio's buffer and reached the file cut in half.  The
+     * mipsel capture's last line read `mipsel<TAB>41006014<TAB>bn` -- a
+     * mnemonic sheared mid-word, no source column, no newline.
+     *
+     * A corpus that silently loses its tail is worse than one that refuses:
+     * the truncated row still PARSES, as a row whose read list is empty, so
+     * a gate reading it would score that encoding as publishing nothing and
+     * report no error at all.  Both of the two "conflicting encodings" the
+     * builder reported on that run were this, and both went away here.
+     *
+     * The cost is bounded by the DEDUPLICATION above -- one flush per
+     * distinct encoding, never per executed instruction -- and the whole
+     * path is off unless asked for.
+     */
+    fflush(g_src_enc_dump);
+    g_string_free(g, TRUE);
+    g_src_enc_dump_rows.fetch_add(1, std::memory_order_relaxed);
+}
+
 
 void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
 {

@@ -734,6 +734,41 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
  * is what the wire still takes from Capstone.  See the definition. */
 void qdep_mutate_refiner_dst(InsnFields *f);
 
+/*
+ * THE PER-ENCODING READ-LIST CORPUS, env-gated (CST_SRC_ENC_DUMP=<path>).
+ *
+ * WHY THIS EXISTS.  `isaxcheck` scores the tracer's READ side by decoding an
+ * encoding with a host tool and asking the tracer's own model what it makes
+ * of the result.  That works only while the read side COMES from that
+ * decode.  Where the wire's source list is QEMU's ordered read list plus the
+ * survivor rows, neither is reachable from a host tool -- QEMU states the
+ * read list at TRANSLATION time, inside the emulator, for the encoding being
+ * translated -- so a static sweep has nothing left to compare and the
+ * classes that scored the read side lose their subject rather than pass.
+ *
+ * So the subject is exported from the place that has it.  One row per
+ * DISTINCT ENCODING -- not per program counter, because a pc-keyed gate can
+ * only be replayed against the same binary at the same load address, and the
+ * sweep this feeds enumerates encodings:
+ *
+ *   <isa>\t<encoding bytes, hex>\t<mnemonic>\t<published source registers>
+ *
+ * The register list is what the WIRE PUBLISHES, taken after qdep_apply() has
+ * run, so it is the list a consumer reads out of the trace -- not an
+ * intermediate, and not a re-derivation that could drift from one.
+ *
+ * IT SEES THE WRONG PATH, and that is the point rather than a side effect.
+ * Every standing per-pc source instrument in this tree runs at wp=0, so an
+ * instruction only the wrong path translates is outside all of them.  A
+ * corpus taken at wp=0 AND wp=16 covers both, and the first time it was run
+ * it found twenty encodings a wp=0 bar had just reported clean.
+ *
+ * MEASUREMENT ONLY and OFF unless asked for: with the variable unset the
+ * site is a single relaxed load, and no wire field is written here ever.
+ */
+void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
+                      uint8_t size, const char *mnem);
+
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the
  * trace, not a debugging aid, and a fact nobody prints is a fact nobody

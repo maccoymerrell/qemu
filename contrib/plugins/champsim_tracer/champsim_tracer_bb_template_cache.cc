@@ -1671,6 +1671,21 @@ BBTemplate *TemplateStore::create_tb_template(
                                 &insn_qdep[i],
                                 insn_info ? insn_info[i].mnemonic : nullptr);
             }
+            /*
+             * THE PER-ENCODING READ-LIST CORPUS, after qdep_apply() and so
+             * over the list the wire really publishes.  Env-gated and inert
+             * with the variable unset; see dump_src_enc_row().
+             *
+             * HERE and not beside the per-pc witness inside qdep_apply()
+             * because the encoding bytes only exist at this level -- the
+             * dependency model is handed fields, never the instruction --
+             * and a corpus keyed on anything but the encoding cannot be
+             * replayed by a sweep that enumerates encodings.
+             */
+            dump_src_enc_row(&scratch[i].f,
+                             &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                             insn_sizes[i],
+                             insn_info ? insn_info[i].mnemonic : nullptr);
             srcs[i] = &scratch[i].f;
             name_srcs[i] = with_names ? &nscratch[i].rn : nullptr;
         }

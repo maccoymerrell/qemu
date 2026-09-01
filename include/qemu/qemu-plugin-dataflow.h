@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 14
+#define QEMU_PLUGIN_DATAFLOW_VERSION 15
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -720,6 +720,33 @@ typedef struct qemu_plugin_dataflow_status {
      * dependency edge that was measured and one that was assumed.
      */
     uint8_t  helper_model;
+    /*
+     * Of @n_calls, how many the translator declared TCG_CALL_NO_RETURN.
+     *
+     * WHAT IT ANSWERS.  n_calls says a helper ran.  This says the
+     * translation ENDED in one that does not come back -- which on every
+     * target is how a translation RAISES instead of computing.  It is the
+     * only field here that separates an instruction QEMU translated the BODY
+     * of from one it translated only the EXCEPTION for: an enable check that
+     * refused (SME with SMEN clear, SVE trapped by CPTR, an encoding routed
+     * to UNDEF) emits the raise and returns, never touching an operand,
+     * while every other field it sets -- no memops, an empty write list, a
+     * read list holding the feature-enable state -- is also what a genuinely
+     * operand-free instruction sets.
+     *
+     * WHY NOT DERIVE IT FROM THE BLOCK'S SHAPE.  DISAS_NORETURN suppresses
+     * the block epilogue, so a raising instruction emits no exit_tb and no
+     * goto_tb at all: the control-transfer classification reports NOTHING
+     * for it, which is indistinguishable from a block that merely ran out of
+     * room.  The call flag is the fact; the block's silence is not.
+     *
+     * IT IS A COUNT, NOT A VERDICT.  `svc`, `brk` and MIPS `break` call a
+     * noreturn helper too, and for those the exception IS the body.
+     * Separating a body-trap from a gate-trap is a join the consumer makes
+     * against the rest of the instruction's dataflow; this supplies the half
+     * nothing else carries.
+     */
+    uint32_t n_noreturn_calls;
     /*
      * (helper, pointer argument) pairs on this instruction whose DIRECTION
      * the per-helper usage table does not state, and which are therefore

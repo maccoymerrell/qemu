@@ -456,6 +456,34 @@ typedef struct InsnDataflow {
     uint8_t  n_mem_wr;
     uint8_t  n_calls;
     /*
+     * Of those calls, how many the translator declared TCG_CALL_NO_RETURN:
+     * a helper that does not come back, which on every target is how a
+     * translation RAISES rather than computes.
+     *
+     * WHY IT IS ITS OWN COUNT.  n_calls says a helper ran; it cannot say
+     * whether what followed the call was the rest of the instruction or
+     * nothing at all.  The difference is the difference between an
+     * instruction QEMU translated the BODY of and one it translated only the
+     * EXCEPTION for -- an enable check that refused (SME with SMEN clear,
+     * SVE with CPTR trapping, an unimplemented encoding routed to UNDEF) --
+     * and no other field of this struct distinguishes them.  A sweep that
+     * scores such a translation as the instruction's is scoring a trap.
+     *
+     * It is TCG's own flag, set by the DEF_HELPER declaration and acted on
+     * by the register allocator (tcg/tcg.c reads TCG_CALL_NO_RETURN when it
+     * decides whether liveness continues past the call), so it is a
+     * statement the emulator already makes for its own reasons rather than
+     * an annotation added for this reader.
+     *
+     * IT IS A COUNT, NOT A CLASSIFICATION.  An architecturally
+     * unconditional trap -- `svc`, `brk`, MIPS `break` -- also calls a
+     * noreturn helper, and for those the exception IS the instruction body.
+     * Separating the two is the consumer's join against the rest of the
+     * instruction's dataflow (an enable check reads the feature-enable state
+     * and no operand); this field supplies the half nothing else carries.
+     */
+    uint8_t  n_noreturn_calls;
+    /*
      * CP-H -- how much of this instruction's helper work the emitter was
      * able to state, and how much is an over-approximation standing in for
      * it.  An instruction that calls no helper is EXACT trivially.

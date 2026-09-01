@@ -3097,6 +3097,14 @@ struct SrcMechStage {
     uint8_t     n_cont;
     uint8_t     cont_lo[QDEP_MAX_SRC];
     uint8_t     cont_hi[QDEP_MAX_SRC];
+    /* The translation's SHAPE, and QEMU's write side.  See QDepInsn. */
+    uint8_t     x_have_shape;
+    uint8_t     x_calls;
+    uint8_t     x_noreturn_calls;
+    uint8_t     x_mem_reads;
+    uint8_t     x_mem_writes;
+    uint8_t     n_wr;
+    uint8_t     wr[QDEP_MAX_DST];
 };
 static thread_local SrcMechStage g_mech_stage;
 std::atomic<uint64_t> g_mech_stage_mismatch{0};
@@ -3330,6 +3338,21 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         m->n_cont = q->n_src_cont;
         memcpy(m->cont_lo, q->src_cont_lo, q->n_src_cont);
         memcpy(m->cont_hi, q->src_cont_hi, q->n_src_cont);
+        m->x_have_shape     = q->x_have_shape;
+        m->x_calls          = q->x_calls;
+        m->x_noreturn_calls = q->x_noreturn_calls;
+        m->x_mem_reads      = q->x_mem_reads;
+        m->x_mem_writes     = q->x_mem_writes;
+        /*
+         * QEMU's WRITE side, by generic name.  It is the other half of the
+         * body-versus-trap join: an enable check writes the exception state
+         * and the program counter and nothing architectural, while an
+         * instruction QEMU translated the body of names its destinations.
+         * Empty where the destination family refused -- which the shape
+         * counts above let a reader tell apart from "wrote nothing".
+         */
+        m->n_wr = q->n_dst;
+        memcpy(m->wr, q->dst_reg, q->n_dst);
     }
     /*
      * THE SURVIVOR-ROW REFUTATION, and it runs OUTSIDE the read-list gate
@@ -4113,7 +4136,7 @@ EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
 EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
-    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\n"};
+    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -4278,6 +4301,32 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
     if (!m->n_cont) {
         g_string_append(g, "-");
     }
+    /*
+     * XLAT -- THE TRANSLATION'S SHAPE, and WR -- QEMU's write side.
+     *
+     * The columns that let a reader ask whether the row describes an
+     * INSTRUCTION at all.  Everything to the left of them is what QEMU said
+     * about the operands of a translation; these two say what the
+     * translation WAS.  An enable check that refused reads `noret=1` with
+     * no accesses and no architectural destination, and every other column
+     * on the row still reads exactly like an instruction QEMU stated few
+     * reads for -- which is how 38,400 aarch64 access traps were scored as
+     * losses before this column existed.
+     *
+     * `shape=-` where the status read itself failed: the counts are then
+     * not zero, they are absent, and a reader must not take an absent count
+     * for a measured one.
+     */
+    g_string_append_c(g, '\t');
+    if (m->x_have_shape) {
+        g_string_append_printf(g, "noret=%u,calls=%u,memr=%u,memw=%u",
+                               m->x_noreturn_calls, m->x_calls,
+                               m->x_mem_reads, m->x_mem_writes);
+    } else {
+        g_string_append(g, "shape=-");
+    }
+    g_string_append_c(g, '\t');
+    reglist_str(g, m->wr, m->n_wr);
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);
@@ -4319,6 +4368,24 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             out->src_state = QDEP_R_NORECORD;
         return;
     }
+    /*
+     * THE TRANSLATION'S SHAPE, taken here -- BEFORE any refusal return.
+     *
+     * A sweep's question "did QEMU translate this instruction's body, or
+     * only the trap an enable check raised for it?" is asked most often
+     * about the instructions whose extraction refused, so a reader that
+     * only got the shape on the clean path would be blind exactly where it
+     * is needed.  Nothing on the wire path reads these; see QDepInsn.
+     */
+    out->x_have_shape     = 1;
+    out->x_calls          = (uint8_t)(st.n_calls > 255 ? 255 : st.n_calls);
+    out->x_noreturn_calls = (uint8_t)(st.n_noreturn_calls > 255
+                                      ? 255 : st.n_noreturn_calls);
+    out->x_mem_reads      = (uint8_t)(st.n_mem_reads > 255
+                                      ? 255 : st.n_mem_reads);
+    out->x_mem_writes     = (uint8_t)(st.n_mem_writes > 255
+                                      ? 255 : st.n_mem_writes);
+
     /*
      * memops_unnoted is the one that matters most here and it is checked
      * FIRST: it says an access happened that no emitter note accounted for,

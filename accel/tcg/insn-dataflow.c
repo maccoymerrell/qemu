@@ -2641,6 +2641,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             nb_oargs = TCGOP_CALLO(op);
             nb_iargs = TCGOP_CALLI(op);
             d->n_calls++;
+            /*
+             * TCG's own statement that this call does not come back.  Read
+             * here, at the call, rather than inferred later from the block's
+             * shape: DISAS_NORETURN suppresses the epilogue entirely, so a
+             * walk looking for exit_tb finds NOTHING for a raising
+             * instruction and cannot tell it from a block that ran out of
+             * ops.  See INSN_DF n_noreturn_calls for what the count is for.
+             */
+            if (tcg_call_flags(op) & TCG_CALL_NO_RETURN) {
+                if (d->n_noreturn_calls < 255) {
+                    d->n_noreturn_calls++;
+                }
+            }
 
             memset(prov, 0, sizeof(prov));
 

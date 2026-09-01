@@ -695,6 +695,42 @@ struct QDepInsn {
      * state the index at the emitter and retire the refusal, not to keep it.
      */
     uint8_t writes_unbounded;
+
+    /*
+     * THE TRANSLATION'S SHAPE -- what QEMU EMITTED for this instruction,
+     * as opposed to what it stated about the instruction's operands.
+     *
+     * WHY THE WIRE PATH DOES NOT READ IT.  None of these fields decides a
+     * dependency; they exist so a SWEEP can tell whether the translation it
+     * scored is the instruction's BODY at all.  An encoding whose trans_
+     * function early-returns on an enable check -- SME with SMEN clear, SVE
+     * trapped by CPTR, a feature the sled's context does not grant -- is
+     * translated as the ACCESS TRAP and never touches an operand, yet it
+     * arrives at every reader here indistinguishable from an instruction
+     * QEMU translated in full and simply stated few reads for.  exec89
+     * measured 38,400 aarch64 encodings of exactly that shape being scored
+     * as losses; scoring a trap as an instruction is not a loss bar.
+     *
+     * @x_have_shape says the status read succeeded, so the four counts
+     * below are readable.  It is taken BEFORE the status-refusal return,
+     * because a refused extraction is exactly the population whose shape a
+     * sweep most needs -- a reader that only gets the shape on the clean
+     * path is blind on the rows that matter.
+     *
+     * @x_noreturn_calls is the load-bearing one: a call the translator
+     * declared TCG_CALL_NO_RETURN is how a translation RAISES rather than
+     * computes, on every target.  Read the header field's contract in
+     * qemu-plugin-dataflow.h before using it -- it is a COUNT and not a
+     * verdict, because an architecturally unconditional trap (`svc`, `brk`,
+     * MIPS `break`) calls a noreturn helper too and for those the exception
+     * IS the body.  The separation is a JOIN against the rest of the
+     * instruction's dataflow, and it is made in the sweep, not here.
+     */
+    uint8_t x_have_shape;
+    uint8_t x_calls;
+    uint8_t x_noreturn_calls;
+    uint8_t x_mem_reads;
+    uint8_t x_mem_writes;
 };
 
 /*
@@ -810,7 +846,13 @@ void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
  * THE PER-ENCODING MECHANISM CORPUS, env-gated (CST_SRC_MECH_DUMP=<path>).
  *
  *   <isa> <encoding hex> <mnemonic> <decode_id> <decode rule> <src_state>
- *   <wstate> PUB QN SURV RD STATUS RDX CONT
+ *   <wstate> PUB QN SURV RD STATUS RDX CONT XLAT WR
+ *
+ * XLAT and WR say what the TRANSLATION WAS, where every column before them
+ * says what QEMU stated about the operands of one.  See QDepInsn's
+ * @x_have_shape block: an encoding whose trans_ function early-returns on an
+ * enable check is translated as the access trap and reads, on every other
+ * column, exactly like an instruction with few stated reads.
  *
  * WHY A THIRD CORPUS.  The read-list corpus (dump_src_enc_row) says WHAT an
  * encoding publishes; an A/B over two builds says WHICH registers the

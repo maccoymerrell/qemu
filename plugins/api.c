@@ -760,6 +760,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
         return false;
     }
     st.n_calls = d->n_calls;
+    st.n_noreturn_calls = d->n_noreturn_calls;
     st.n_mem_reads = d->n_mem_rd;
     st.n_mem_writes = d->n_mem_wr;
     st.fields_truncated = d->fields_overflow;

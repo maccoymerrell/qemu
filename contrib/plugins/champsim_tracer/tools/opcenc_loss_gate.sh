@@ -81,6 +81,24 @@ ISAS="x86_64 aarch64 riscv64 mipsel"
 # set_tid_address -- and this gate simply never used them.  With both, two
 # captures of one build are BYTE-IDENTICAL, dump file for dump file.
 #
+#
+# AND THE ENVIRONMENT IS PART OF THE GUEST.  Pinning AT_RANDOM was not
+# enough either, and the residue had a sharper cause: linux-user copies the
+# HOST ENVIRONMENT onto the guest's initial stack, so one extra byte
+# anywhere in it moves every guest stack address, and a wrong-path walk
+# reads different bytes at the same pc.  Measured directly -- one build, one
+# guest, `-seed`/`-pid` pinned, and only the length of the dump path's env
+# var changed:
+#
+#     CST_..._DUMP=<N chars>   vs the same again   IDENTICAL
+#     CST_..._DUMP=<N chars>   vs <N+4 chars>      DIFFER (7466 vs 7464 rows)
+#
+# which is why every earlier refusal paired output directories whose NAMES
+# were different lengths, and every pass paired ones that were not.  So the
+# guest runs under `env -i` with a FIXED environment, from inside the output
+# directory, writing RELATIVE filenames -- the whole env string is then a
+# constant and does not carry the harness's own paths into the guest.
+#
 # The corpus is ALSO a union over repeats, and with the input pinned that is
 # no longer a way to average over noise -- it is a CHECK.  Every repeat must
 # reach the same set, so `missed_by_one_capture` must read 0 on every cell,
@@ -120,12 +138,17 @@ capture)
             # compress= on every trace this writes (the I/O rule); the trace
             # itself is a by-product here and is removed after the run, but a
             # harness that writes one uncompressed is how the rule rots.
-            CST_OPC_ENC_DUMP="$d" setarch -R "$build/qemu-$isa" \
-                -seed "$SEED" -pid "$PIDBASE" \
-                -plugin "$build/contrib/plugins/libchampsim_tracer.so,outfile=$out/t_$isa,wp=$wp,compress=zstd -T0 -3 -q -c" \
+            # env -i, from inside $out, with RELATIVE filenames: the
+            # env block the guest is handed must not carry this harness's
+            # own path lengths.  setarch runs first, so it is still found
+            # on the normal PATH; only the qemu exec sees the empty env.
+            ( cd "$out" && setarch -R env -i CST_OPC_ENC_DUMP=cst_enc_dump.tsv \
+                "$build/qemu-$isa" -seed "$SEED" -pid "$PIDBASE" \
+                -plugin "$build/contrib/plugins/libchampsim_tracer.so,outfile=cst_enc_trace,wp=$wp,compress=zstd -T0 -3 -q -c" \
                 "${BIN[$isa]}" > /dev/null \
-                2> "$out/$isa.wp$wp.r$rep.stats.log"
+                2> "$isa.wp$wp.r$rep.stats.log" )
             rc=$?
+            mv -f "$out/cst_enc_dump.tsv" "$d" 2>/dev/null || :
             n=$(grep -vc '^#' "$d" 2>/dev/null)
             [ -n "$n" ] || n=0
             if [ "$n" -le 0 ]; then
@@ -135,7 +158,7 @@ capture)
                 exit 2
             fi
             echo "dump $isa wp$wp r$rep rc=$rc encodings=$n" >> "$out/RC.txt"
-            rm -f "$out/t_$isa.cst"
+            rm -f "$out/cst_enc_trace.cst"
           done
           # THE INSTABILITY, MEASURED AT THE POINT IT HAPPENS.  Repeat 1 is
           # scored against the union of all repeats for this (isa, wp): how

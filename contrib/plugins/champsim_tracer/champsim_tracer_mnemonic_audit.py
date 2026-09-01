@@ -5578,6 +5578,28 @@ X86_IDENT_VEX = "target/i386/tcg/vex_ident.c.inc"
 # same reader the VEX rows use.
 X86_IDENT_CET = "target/i386/tcg/cet_ident.c.inc"
 
+# THE UNCONVERTED 0F SPACES SHARE FIVE ROWS BETWEEN FORTY-ONE
+# INSTRUCTIONS.  0F 00, 0F 01, 0F 1A, 0F 1B and the 0F C7 group are not
+# converted to the new decoder, so each is one X86_OP_ENTRY(multi0F, ...)
+# site dispatching to gen_multi0F(), which switches on the opcode, the
+# modrm byte and the prefix itself.  One identity therefore answers for
+# `sgdt`, `xgetbv`, `swapgs`, `rdtscp`, `bndcl` and the rest, and the only
+# word the row offers is the placeholder name `multi0F` -- which classifies
+# as none of them.  scripts/x86_multi0f_ident_instrument.py states the
+# finer identity, one row per arm, each anchored at the case label in
+# gen_multi0F that names it.  Like the x87 leaves these are NOT table rows,
+# so they carry a kind of their own rather than borrowing an operand
+# template they do not have.
+X86_IDENT_MULTI0F = "target/i386/tcg/multi0f_ident.c.inc"
+
+# The emitter fact for a qualified multi0F arm.  As with the x87 leaves it
+# is not an X86_OP_* macro suffix: the arm is a case label inside
+# gen_multi0F, there is no operand template to read, and naming the kind
+# rather than borrowing the shared row's is what keeps
+# x86_emitter_refuses() from reading a template that describes a different
+# instruction.
+X86_MULTI0F_KIND = "multi0farm"
+
 # The emitter fact for a qualified leaf.  It is NOT an X86_OP_* macro
 # suffix: the leaf is a case label inside gen_x87, not a table row, so
 # there is no operand template to read and x86_emitter_refuses() must not
@@ -5740,7 +5762,8 @@ def parse_x86_identities() -> list[QemuIdent]:
             f"the exported id cannot tell them apart")
     qualified = (parse_x86_qualified_identities()
                  + parse_x86_vex_identities(rows)
-                 + parse_x86_cet_identities(rows))
+                 + parse_x86_cet_identities(rows)
+                 + parse_x86_multi0f_identities())
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
     seen_q: dict[int, str] = {}
@@ -5917,6 +5940,35 @@ def parse_x86_qualified_identities() -> list[QemuIdent]:
             f"{path}: no identity rows matched -- the reader does not fit "
             f"this table, and reporting an empty universe would read as "
             f"'gen_x87 has no internal dispatch'")
+    return rows
+
+
+def parse_x86_multi0f_identities() -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED arms of gen_multi0F's internal dispatch.
+
+    Same row format and the same failure rule as the x87 leaves: the
+    provenance is LIFTED above the row and names the translate.c line of
+    the case label the arm was read from, so a row cannot outlive the arm
+    it describes -- the instrument itself refuses to emit one whose anchor
+    it can no longer find.
+
+    Fails loudly on an empty or absent table.  A missing file and 'the
+    unconverted 0F spaces have no internal dispatch' are indistinguishable
+    in a count, and only one of them is a fact about QEMU.
+    """
+    path = ROOT / X86_IDENT_MULTI0F
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_multi0f_ident_instrument.py.  Without it the five "
+            f"multi0F rows report as unqualified, which is not what the "
+            f"source says.")
+    rows = _read_qualified_table(path, X86_MULTI0F_KIND)
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'gen_multi0F has no internal dispatch'")
     return rows
 
 

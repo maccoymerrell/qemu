@@ -6840,6 +6840,23 @@ aarch64 FR-rd-phantom luti2 +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom luti4 +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom str +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom zero +REG_SYSFPEN,REG_VCTRL
+
+# --- NOT RETIRED, and the measurement says why (exec92).  Passes 44-47 each
+#     recorded `zero +REG_SYSFPEN,REG_VCTRL` as one of the two rules that go
+#     DEAD under exec72's banked Capstone deletion, and read that as a rule
+#     describing a Capstone-era operand-walk phantom that the deletion simply
+#     removes.  Scored against the subject the wire actually publishes --
+#     isaxcheck --srcenc over the per-encoding source corpus -- the phantom is
+#     still there:
+#
+#       SR-rd-phantom zero +REG_SYSFPEN,REG_VCTRL  n=1
+#         010048c0  zero { zt0 }  wireRD{REG_SYSFPEN,REG_VCTRL} llvmRD{-}
+#
+#     The wire publishes exactly this pair on exactly this encoding, so the
+#     row has an occupant and the ZT0 justification above is the reason it is
+#     allowed.  It goes dead under the deletion because the read comparison's
+#     SUBJECT vanishes there, not because the disagreement stopped happening
+#     -- which is the distinction tools/isax_srcenc_gate.sh exists to draw.
 x86_64 FB-flow-presence ud1 cs-yes llvm-no
 x86_64 FM-llvm-mem-cs-none ud1 load
 x86_64 FR-rd-missing cmpxchg16b +REG_SEG0
@@ -7189,6 +7206,16 @@ x86_64 FR-rd-phantom shrw +REG_FLAGS
 x86_64 FR-rd-phantom vmfunc +REG_GPR#
 x86_64 FR-rd-phantom xabort +REG_GPR#
 x86_64 FR-rd-phantom xbegin +REG_GPR#
+
+# --- NOT RETIRED, and the measurement says why (exec92).  `xbegin +REG_GPR#`
+#     is the second of the two rules passes 44-47 recorded going DEAD under
+#     the banked Capstone deletion.  Under the wire's own source subject it
+#     does not fire -- but it is not scored either: the sled corpus carries
+#     ZERO `xbegin` encodings on both arms (no `c7f8*` key in either), so the
+#     mnemonic is UNREACHED, not clean.  Deleting a rule on a zero the
+#     instrument was never shown able to break is the silent false success
+#     this tree keeps relearning, so the row stays until a corpus that
+#     reaches `xbegin` answers for it.
 x86_64 FR-wr-phantom encls +REG_GPR#
 x86_64 FR-wr-phantom enclu +REG_GPR#
 x86_64 FR-wr-phantom enclv +REG_GPR#

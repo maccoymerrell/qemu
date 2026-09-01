@@ -3084,9 +3084,44 @@ void dump_src_pc_row(const InsnFields *f, const QDepInsn *q,
     reglist_str(g, q->srcx, q->n_srcx);
     g_string_append_c(g, '\t');
     for (uint8_t k = 0; k < q->n_src_cont; k++) {
-        g_string_append_printf(g, "%s%s..%s", k ? "," : "",
-                               generic_reg_name_or_unknown(q->src_cont_lo[k]),
-                               generic_reg_name_or_unknown(q->src_cont_hi[k]));
+        /*
+         * TWO CALLS, TWO STATEMENTS, and that is the whole point.
+         *
+         * generic_reg_name_or_unknown() answers a BANK register out of one
+         * `static __thread char buf[24]`, so two calls in one argument list
+         * alias: both %s print whichever call the compiler evaluated last.
+         * This site printed the container's LOW bound twice, and what it
+         * therefore said about x86 `fxam` was
+         *
+         *     CONT=REG_FPR0..REG_FPR0
+         *
+         * -- a SINGLETON container, i.e. "QEMU stated a read of exactly
+         * REG_FPR0".  The container is `fpregs`, REG_FPR0..REG_FPR7, the
+         * whole x87 register file: QEMU stated that the FILE is read and
+         * said nothing about WHICH entry.  Those two readings have opposite
+         * consequences for the source-list flip -- a singleton can simply be
+         * seated on the wire, a bank cannot, because which member the
+         * encoding selects is not in QEMU's statement -- and a reader
+         * chasing the wrong-path FPR0 losses is led by this column straight
+         * to the wrong one.
+         *
+         * The aliasing is a property of the callee's buffer, so the fix is
+         * at the call: the low bound is copied out before the high bound is
+         * asked for.  This is the only multi-call argument list in the
+         * plugin (swept, all TUs), and a name the function does not have a
+         * word for is NULL, which is printed as such rather than as the
+         * other bound.
+         */
+        const char *lo = generic_reg_name_or_unknown(q->src_cont_lo[k]);
+        char lo_buf[24];
+
+        g_strlcpy(lo_buf, lo ? lo : "(unnamed)", sizeof(lo_buf));
+        {
+            const char *hi = generic_reg_name_or_unknown(q->src_cont_hi[k]);
+
+            g_string_append_printf(g, "%s%s..%s", k ? "," : "", lo_buf,
+                                   hi ? hi : "(unnamed)");
+        }
     }
     if (!q->n_src_cont) {
         g_string_append(g, "-");

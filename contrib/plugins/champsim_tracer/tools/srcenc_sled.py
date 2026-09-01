@@ -74,6 +74,11 @@ import sys
 # bytes and the encoding reads UNREACHED downstream -- the honest answer,
 # rather than a comparison between two different instructions.
 # --------------------------------------------------------------------------
+#: Where QEMU may BEGIN an instruction inside a slot, in bytes.  Used to
+#: enumerate the byte strings the slot's own PADDING can be decoded as -- see
+#: terminator_collisions().
+ALIGN = {"x86_64": 1, "riscv64": 2, "aarch64": 4, "mipsel": 4}
+
 ISAS = {
     "x86_64": dict(
         machine=62, elfclass=64, entry_stub=bytes.fromhex("b8e700000031ff0f05"),
@@ -110,6 +115,56 @@ ISAS = {
         load=0x00400000,
     ),
 }
+
+
+def terminator_collisions(isa, lengths):
+    """The byte strings a population encoding must NOT be, because the slot's
+    own PADDING already decodes as them.
+
+    WHY THE SLED CANNOT ANSWER FOR THEM.  A slot is `[encoding][terminator
+    repeated to the stride]`, and the padding is translated too -- it is what
+    ends the block.  An encoding that is also one of those padding
+    instructions therefore reaches the translator in TWO architectural
+    situations in the same sweep: at a slot start, where it is the subject,
+    and inside the padding, where it is not.  On MIPS the second situation is
+    a DELAY SLOT: the terminator is `nop; jr $ra; nop`, and the trailing nop's
+    op range carries the branch's own ops, because gen_branch() emits them at
+    the end of the delay slot's translate_insn().
+
+    The two situations produce two different answers for one encoding.  That
+    is not a defect in either answer -- it is QEMU correctly translating the
+    same bytes in two contexts -- but the corpus's key is the encoding, so it
+    has no way to hold both, and whichever the per-chunk deduplication saw
+    first is the one that would be published.
+
+    IT WAS ALREADY HAPPENING AND WAS ALREADY VISIBLE ONCE.  The first wide
+    MIPS capture refused on `0800e003` (`jr $ra`, the terminator's own second
+    word) carrying REG_LR at one address and REG_SYSEXC,REG_LR at another;
+    that one was outside the population and was reported as incidental.
+    `00000000` (`nop`, the terminator's first and third words) is INSIDE the
+    population, and it was published from whichever context won -- silently,
+    because the two contexts happened to state the same READ LIST and differed
+    only in what the translation EMITTED, which no column carried until the
+    XLAT column did.
+
+    So they are removed from the population, NAMED and COUNTED.  Downstream
+    reads them as UNREACHED, which is the sled's honest answer: an encoding
+    whose measurement the layout decides is one the sled cannot measure.
+
+    Enumerated STRUCTURALLY from the layout itself -- the padding stream is
+    the terminator repeated, so it is periodic with the terminator's length,
+    and the starts are the ISA's decode alignment.  Nothing here is a list of
+    encodings."""
+    spec = ISAS[isa]
+    term = spec["term"]
+    align = ALIGN[isa]
+    stream = term * (2 + max(lengths) // max(1, len(term)) + 1)
+    out = set()
+    for i in range(0, len(term), align):
+        for L in lengths:
+            if i + L <= len(stream):
+                out.add(stream[i:i + L])
+    return out
 
 
 def build_elf(isa, encodings, path):
@@ -211,6 +266,20 @@ def main():
 
     os.makedirs(a.out, exist_ok=True)
     pop = read_pop(a.pop, a.isa)
+    # THE LAYOUT'S OWN INSTRUCTIONS ARE NOT SUBJECTS.  See
+    # terminator_collisions(): an encoding the padding also decodes as reaches
+    # the translator in two architectural situations and the corpus can hold
+    # only one row for it.  Removed here, named and counted, rather than
+    # published from whichever context the deduplication saw first.
+    if pop:
+        bad = terminator_collisions(a.isa, {len(e) for e in pop})
+        drop = [e for e in pop if e in bad]
+        if drop:
+            pop = [e for e in pop if e not in bad]
+            print("srcenc_sled: %s -- %d population encoding(s) are also the "
+                  "slot PADDING and cannot be measured free of the layout; "
+                  "REMOVED from the population and reported UNREACHED: %s"
+                  % (a.isa, len(drop), " ".join(e.hex() for e in drop)))
     if not pop:
         raise SystemExit("srcenc_sled: population file %s carries no %s row "
                          "-- REFUSING (an empty sled produces an empty corpus, "

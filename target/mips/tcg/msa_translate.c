@@ -13,6 +13,7 @@
 #include "qemu/osdep.h"
 #include "exec/plugin-gen.h"
 #include "translate.h"
+#include "exec/insn-dataflow.h"
 #include "fpu_helper.h"
 
 static int elm_n(DisasContext *ctx, int x);
@@ -132,6 +133,46 @@ static int bit_df(DisasContext *ctx, int x)
 
 static TCGv_i64 msa_wr_d[64];
 
+/*
+ * AN MSA VECTOR REGISTER THE ENCODING NAMES AS A SOURCE, stated by RANGE.
+ *
+ * Every MSA data-processing instruction lowers to a helper handed tcg_env
+ * and the register NUMBERS as i32 CONSTANTS: gen_msa_3r(tcg_env,
+ * tcg_constant_i32(a->wd), tcg_constant_i32(a->ws), tcg_constant_i32(a->wt))
+ * and the six shapes beside it.  Nothing in the op stream touches the
+ * registers' storage, so QEMU's ordered read list for `addv.b $w1,$w2,$w3`
+ * is EMPTY -- measured, ALL 46,342 MSA rows in the PASS 48 corpus carry an
+ * empty read list, which is 81,803 register-instances of mipsel's bar.
+ *
+ * That the emulator carries the operand as a descriptor constant rather than
+ * as an op is a lowering decision (R15) and a register the encoding names is
+ * not the emulator's to drop (R7.3).  The numbers are decodetree fields and
+ * are in hand at exactly these call sites and nowhere later.
+ *
+ * BY RANGE, because the range IS the register: `w<n>` is
+ * active_fpu.fpr[n].wr, the file declared beside the TCG globals in
+ * msa_translate_init() below, so one declaration names every access to those
+ * bytes.
+ *
+ * ONLY ws AND wt ARE STATED HERE.  wd is the destination on every shape, and
+ * on the merging and accumulating forms -- BMNZ/BMZ/BSEL, MADDV, DPADD --
+ * it is a source as well.  Which of the two it is is a per-helper fact these
+ * shared choke points cannot see, and naming it here would put a source on
+ * the wire for every `addv` that does not read it.  Those forms stay open
+ * with this as their reason.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_msa_wr_read(int wr)
+{
+    if (wr >= 0 && wr < 32) {
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUMIPSState, active_fpu.fpr[0].wr)
+                + wr * sizeof(((CPUMIPSState *)0)->active_fpu.fpr[0]),
+            sizeof(((CPUMIPSState *)0)->active_fpu.fpr[0].wr));
+    }
+}
+
 void msa_translate_init(void)
 {
     int i;
@@ -150,6 +191,39 @@ void msa_translate_init(void)
         msa_wr_d[i * 2 + 1] =
                 tcg_global_mem_new_i64(tcg_env, off, msaregnames[i * 2 + 1]);
     }
+
+    /*
+     * The MSA VECTOR FILE, for the dataflow extraction.
+     *
+     * No TCG global names a whole MSA register: the two halves above are
+     * separate i64 globals and the low one IS the scalar FP global `f<n>`,
+     * because the architecture maps the two files onto one storage.  So an
+     * access to a whole `w<n>` -- which is what note_msa_wr_read() states --
+     * arrives downstream as an anonymous byte range unless something says
+     * what those bytes are.
+     *
+     * The names are SPELLED OUT rather than derived from msaregnames[],
+     * which carries the two HALVES (`w0.d0`, `w0.d1`); this declares the
+     * whole register, which the architecture and the MSA assembler both call
+     * `w<n>`.  The stride is sizeof(fpr_t) -- the union the FPU and MSA
+     * share -- and the size is sizeof(wr_t), the MSA view of it, which is
+     * the compiler reading target/mips/cpu.h rather than anyone typing a
+     * number.
+     */
+    static const char * const msa_wr_names[32] = {
+        "w0",  "w1",  "w2",  "w3",  "w4",  "w5",  "w6",  "w7",
+        "w8",  "w9",  "w10", "w11", "w12", "w13", "w14", "w15",
+        "w16", "w17", "w18", "w19", "w20", "w21", "w22", "w23",
+        "w24", "w25", "w26", "w27", "w28", "w29", "w30", "w31",
+    };
+
+    insn_dataflow_declare_regfile("w", msa_wr_names,
+                                  offsetof(CPUMIPSState, active_fpu.fpr[0].wr),
+                                  sizeof(((CPUMIPSState *)0)->
+                                         active_fpu.fpr[0].wr),
+                                  sizeof(((CPUMIPSState *)0)->
+                                         active_fpu.fpr[0]),
+                                  32);
 }
 
 /*
@@ -298,6 +372,7 @@ static bool trans_msa_i8(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    note_msa_wr_read(a->ws);
     gen_msa_i8(tcg_env,
                tcg_constant_i32(a->wd),
                tcg_constant_i32(a->ws),
@@ -324,6 +399,7 @@ static bool trans_SHF(DisasContext *ctx, arg_msa_i *a)
         return true;
     }
 
+    note_msa_wr_read(a->ws);
     gen_helper_msa_shf_df(tcg_env,
                           tcg_constant_i32(a->df),
                           tcg_constant_i32(a->wd),
@@ -340,6 +416,7 @@ static bool trans_msa_i5(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    note_msa_wr_read(a->ws);
     gen_msa_i5(tcg_env,
                tcg_constant_i32(a->df),
                tcg_constant_i32(a->wd),
@@ -415,6 +492,8 @@ static bool trans_msa_3rf(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    note_msa_wr_read(a->ws);
+    note_msa_wr_read(a->wt);
     gen_msa_3rf(tcg_env,
                 tcg_constant_i32(a->df),
                 tcg_constant_i32(a->wd),
@@ -435,6 +514,8 @@ static bool trans_msa_3r(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    note_msa_wr_read(a->ws);
+    note_msa_wr_read(a->wt);
     gen_msa_3r(tcg_env,
                tcg_constant_i32(a->wd),
                tcg_constant_i32(a->ws),

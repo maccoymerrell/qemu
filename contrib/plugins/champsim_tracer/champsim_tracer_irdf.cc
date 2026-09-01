@@ -452,6 +452,38 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * THE MIPS MSA VECTOR FILE, `w0`..`w31`.
+     *
+     * Declared by target/mips/tcg/msa_translate.c and absent from the MIPS
+     * GDB-stub namespace -- QEMU's mips gdbstub carries org.gnu.gdb.mips.cpu
+     * with f0..f31 and no MSA feature at all -- so the generated
+     * QEMU-indexed table cannot carry a row for these: a rule naming a
+     * register the namespace does not contain is dead by construction and
+     * the generator rejects it.  Same shape as the thread pointers and XCR0
+     * above.
+     *
+     * REG_VEC<n> is the vocabulary's word for a vector register file and is
+     * ALREADY what the wire publishes for MSA, so this connects a spelling
+     * to an existing word rather than inventing either.
+     *
+     * NAMED, NOT SILENT: MSA `w<n>` and scalar FP `f<n>` are ONE STORAGE in
+     * the architecture -- f<n> is the low 64 bits of w<n>, which is why
+     * msa_translate_init() maps msa_wr_d[n*2] onto fpu_f64[n] -- and the
+     * wire gives them different words, REG_VEC<n> and REG_FPR<n>.  A
+     * consumer joining them will miss the dependence between `add.d $f0`
+     * and `addv.b $w0`.  That is a VOCABULARY question about what the two
+     * words mean, it predates this map (the operand walk answers it the same
+     * way), and it is recorded here rather than settled in passing.
+     */
+    if (name[0] == 'w' && name[1] >= '0' && name[1] <= '9') {
+        char *end = NULL;
+        long idx = strtol(name + 1, &end, 10);
+
+        if (end != NULL && *end == '\0' && idx >= 0 && idx <= 31) {
+            return (uint8_t)(REG_VEC0 + idx);
+        }
+    }
+    /*
      * The SOFTFLOAT STATUS FILE, one spelling on both targets that have one.
      *
      * `float_status` is QEMU's own container for the rounding mode, the

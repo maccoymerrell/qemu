@@ -167,7 +167,17 @@ def terminator_collisions(isa, lengths):
     return out
 
 
-def build_elf(isa, encodings, path):
+#: e_flags for the 32-bit image.  Zero for every ISA except a mipsel sled
+#: aimed at a CPU model whose FCR31.NAN2008 is fixed SET -- P5600 and the
+#: other MSA-capable models -- where linux-user/mips/cpu_loop.c refuses an
+#: image whose flags say legacy NaN and whose CPU cannot be moved.  An MSA
+#: encoding is not reachable AT ALL on the default 24Kf, so a sled that means
+#: to translate one has to say which CPU it means and carry the matching
+#: ABI flag.
+EF_MIPS_NAN2008 = 0x00000400
+
+
+def build_elf(isa, encodings, path, elf_flags=0):
     """Write the sled image.  Returns (base, stride, count)."""
     spec = ISAS[isa]
     stride, term = spec["stride"], spec["term"]
@@ -211,7 +221,8 @@ def build_elf(isa, encodings, path):
         eh = struct.pack("<4sBBBBB7xHHIIIIIHHHHHH",
                          b"\x7fELF", 1, 1, 1, 0, 0,
                          2, spec["machine"], 1,
-                         load + off, ehsz, 0, 0, ehsz, phsz, 1, 0, 0, 0)
+                         load + off, ehsz, 0, elf_flags,
+                         ehsz, phsz, 1, 0, 0, 0)
         ph = struct.pack("<IIIIIIII", 1, off, load + off, load + off,
                          len(body), len(body), 5, 0x1000)
 
@@ -253,6 +264,17 @@ def main():
                          "one because QEMU flushes its code buffer under a "
                          "sweep this dense and a flush mid-image is not a "
                          "failure this script should have to model")
+    ap.add_argument("--cpu", default=None,
+                    help="QEMU_CPU for the sled run.  The DEFAULT model is "
+                         "what the banked corpora were captured with; a "
+                         "different one measures a different machine and the "
+                         "two must not be compared.  Needed to reach an "
+                         "extension the default model does not implement -- "
+                         "mipsel MSA is not translated at all on 24Kf.")
+    ap.add_argument("--nan2008", action="store_true",
+                    help="set EF_MIPS_NAN2008 in the mipsel image's e_flags, "
+                         "which the MSA-capable CPU models require of an ELF "
+                         "before linux-user will run it at all.")
     ap.add_argument("--emit-only", action="store_true")
     ap.add_argument("--mech", action="store_true",
                     help="ALSO capture the per-encoding MECHANISM corpus "
@@ -296,12 +318,15 @@ def main():
     for k in range(0, len(pop), a.chunk):
         chunk = pop[k:k + a.chunk]
         img = os.path.join(a.out, "sled_%s_%d" % (a.isa, k // a.chunk))
-        base, stride, n = build_elf(a.isa, chunk, img)
+        base, stride, n = build_elf(a.isa, chunk, img,
+                                   EF_MIPS_NAN2008 if a.nan2008 else 0)
         if a.emit_only:
             print("emitted %s slots=%d base=0x%x stride=%d" % (img, n, base, stride))
             continue
         tsv = img + ".tsv"
         env = dict(os.environ)
+        if a.cpu:
+            env["QEMU_CPU"] = a.cpu
         env["CST_SRC_ENC_DUMP"] = tsv
         mtsv = img + ".mech.tsv"
         if a.mech:

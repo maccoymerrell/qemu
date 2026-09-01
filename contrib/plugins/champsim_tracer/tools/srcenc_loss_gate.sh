@@ -143,6 +143,15 @@ capture)
                 2> "$isa.wp$wp.r$rep.stats.log" )
             rc=$?
             mv -f "$out/cst_enc_dump.tsv" "$d" 2>/dev/null || :
+            # The plugin writes its exit report to <outfile>.stats.log, and
+            # the outfile is now one fixed relative name, so every cell
+            # would land on the same file and only the last would survive.
+            # Named per cell here: an exit report a reader cannot attribute
+            # to a run is not evidence.
+            mv -f "$out/cst_enc_trace.stats.log" \
+                  "$out/$isa.wp$wp.r$rep.exit.log" 2>/dev/null || :
+            mv -f "$out/cst_enc_trace.unknown_warnings.log" \
+                  "$out/$isa.wp$wp.r$rep.unknown.log" 2>/dev/null || :
             n=$(grep -vc '^#' "$d" 2>/dev/null)
             [ -n "$n" ] || n=0
             if [ "$n" -le 0 ]; then

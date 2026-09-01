@@ -8,11 +8,11 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/exec79/gensnap/snap, 176 sidecar(s):
- *   x86_64   54 sidecar(s), 20 row(s), 11 REFUSED (reason on each row below)
- *   aarch64  44 sidecar(s), 17 row(s), 11 REFUSED (reason on each row below)
- *   riscv64  39 sidecar(s), 26 row(s), 37 REFUSED (reason on each row below)
- *   mipsel   39 sidecar(s), 5 row(s), 2 REFUSED (reason on each row below)
+ * is /mnt/md0/QEMU/cst_runs/exec92/gensnap/snap2, 180 sidecar(s):
+ *   x86_64   55 sidecar(s), 20 row(s), 11 REFUSED (reason on each row below)
+ *   aarch64  45 sidecar(s), 18 row(s), 7 REFUSED (reason on each row below)
+ *   riscv64  40 sidecar(s), 26 row(s), 37 REFUSED (reason on each row below)
+ *   mipsel   40 sidecar(s), 5 row(s), 2 REFUSED (reason on each row below)
  * Nothing here says anything about an instruction no sidecar executed.
  *
  * Author: Maccoy Merrell.
@@ -44,7 +44,7 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 20 rows, 4022 census entries, from 54 sidecar(s) */
+/* x86_64 -- 20 rows, 4668 census entries, from 55 sidecar(s) */
 /* REFUSED, not carried: 0x000002e0u VFMADD132Sx REG_VEC1 (vfmadd132sd x4) --
  * this decode id carries another FIXED row from the SAME
  * NUMBERED BANK, so the pair claims one rule reads two
@@ -128,26 +128,26 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0x000002e0u, SRC_SURV_SELF , REG_NONE      , 0, "VFMADD132Sx" },   /* vfmadd132sd x4 */
     { 0x000002e2u, SRC_SURV_SELF , REG_NONE      , 0, "VFMSUB132Sx" },   /* vfmsub132sd x4 */
     { 0x00000384u, SRC_SURV_SELF , REG_NONE      , 0, "PINSR" },   /* pinsrd x40 */
-    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x35 */
-    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x37 */
-    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x20 */
-    { 0x000004c9u, SRC_SURV_FIXED, REG_SYSTIMER  , 0, "RDTSC" },   /* rdtsc x24 */
-    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, "CPUID" },   /* cpuid x56 */
-    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, "CPUID" },   /* cpuid x56 */
+    { 0x000003fdu, SRC_SURV_SELF , REG_NONE      , 0, "VMOVLPx_ld" },   /* movlpd x42 */
+    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x41 */
+    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x24 */
+    { 0x000004c9u, SRC_SURV_FIXED, REG_SYSTIMER  , 0, "RDTSC" },   /* rdtsc x36 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, "CPUID" },   /* cpuid x84 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, "CPUID" },   /* cpuid x84 */
     { 0x00000535u, SRC_SURV_FIXED, REG_VEC1      , 0, "PMADDWD" },   /* pmaddwd x4 */
     { 0x00000535u, SRC_SURV_SELF , REG_NONE      , 0, "PMADDWD" },   /* pmaddwd x4 */
-    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x3422 */
-    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x283 */
+    { 0x000006dau, SRC_SURV_FIXED, REG_SEG5      , 0, "RET" },   /* retq x3943 */
+    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x322 */
     { 0x36b0d666u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101010" },   /* fldl2e x4 */
     { 0xbbb3e65cu, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101001" },   /* fldl2t x4 */
-    { 0xdb9bac2bu, SRC_SURV_FIXED, REG_SSP       , 0, "decode-new/NOP@f3=1,modrm=11001..." },   /* rdsspq x3 */
+    { 0xdb9bac2bu, SRC_SURV_FIXED, REG_SSP       , 0, "decode-new/NOP@f3=1,modrm=11001..." },   /* rdsspq x6 */
     { 0xde1beaa4u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101100" },   /* fldlg2 x4 */
     { 0xdf1bec37u, SRC_SURV_FIXED, REG_FPCW      , 0, "decode-new/x87@1101100111101101" },   /* fldln2 x4 */
     { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
     { 0xecac981bu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VMOVLPx@vex=0" },   /* movsd x10 */
 };
 
-/* aarch64 -- 17 rows, 148 census entries, from 44 sidecar(s) */
+/* aarch64 -- 18 rows, 152 census entries, from 45 sidecar(s) */
 /* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_FCSR (mrs x10) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -163,50 +163,6 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
-/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_PRED0 (st1b x1) --
- * this decode id carries another FIXED row from the SAME
- * NUMBERED BANK, so the pair claims one rule reads two
- * different registers of that bank on every instance --
- * an ENCODED OPERAND frozen at whatever the deriving
- * corpus ran.  Measured fabricating on live instructions
- * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
- * register the encoding names is published by the
- * emulator's own statement; this row published the
- * deriving corpus's instead.  An adjudicated correction
- * under R15/R16, not a loss under R12.1. */
-/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_PRED1 (st1b x2) --
- * this decode id carries another FIXED row from the SAME
- * NUMBERED BANK, so the pair claims one rule reads two
- * different registers of that bank on every instance --
- * an ENCODED OPERAND frozen at whatever the deriving
- * corpus ran.  Measured fabricating on live instructions
- * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
- * register the encoding names is published by the
- * emulator's own statement; this row published the
- * deriving corpus's instead.  An adjudicated correction
- * under R15/R16, not a loss under R12.1. */
-/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_VEC0 (st1b x2) --
- * this decode id carries another FIXED row from the SAME
- * NUMBERED BANK, so the pair claims one rule reads two
- * different registers of that bank on every instance --
- * an ENCODED OPERAND frozen at whatever the deriving
- * corpus ran.  Measured fabricating on live instructions
- * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
- * register the encoding names is published by the
- * emulator's own statement; this row published the
- * deriving corpus's instead.  An adjudicated correction
- * under R15/R16, not a loss under R12.1. */
-/* REFUSED, not carried: 0xeba5bbf5u disas_sve/ST_zpri@1110010....0....111............. REG_VEC1 (st1b x1) --
- * this decode id carries another FIXED row from the SAME
- * NUMBERED BANK, so the pair claims one rule reads two
- * different registers of that bank on every instance --
- * an ENCODED OPERAND frozen at whatever the deriving
- * corpus ran.  Measured fabricating on live instructions
- * (riscv64 RVV, x86 scalar FMA, aarch64 st4).  The
- * register the encoding names is published by the
- * emulator's own statement; this row published the
- * deriving corpus's instead.  An adjudicated correction
- * under R15/R16, not a loss under R12.1. */
 /* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_VEC5 (st4 x4) --
  * this decode id carries another FIXED row from the SAME
  * NUMBERED BANK, so the pair claims one rule reads two
@@ -256,22 +212,23 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0x10fdc617u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FMUL_v@0.1011100.1.....110111.........." },   /* fmul x10 */
     { 0x13e03a7eu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FSUB_v@0.0011101.1.....110101.........." },   /* fsub x10 */
     { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/INS_general" },   /* mov x10 */
-    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x33 */
+    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x34 */
+    { 0x43db9465u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FADD_s" },   /* fadd x2 */
     { 0x583d7c95u, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FDIV_v@0.1011100.1.....111111.........." },   /* fdiv x10 */
     { 0x5c29c765u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
     { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x1 */
-    { 0x62e8a5aeu, SRC_SURV_FIXED, REG_PRED1     , 0, "disas_sve/LD_zpri@1010010....0....101............." },   /* ld1b x1 */
     { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@1111100110......................" },   /* prfm x10 */
     { 0x81b1e8f0u, SRC_SURV_FIXED, REG_GPR9      , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x4 */
     { 0x81b1e8f0u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x4 */
     { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@11111000100.........00.........." },   /* prfum x10 */
+    { 0xbc50bbddu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FDIV_s" },   /* fdiv x2 */
     { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FNEG_s" },   /* fneg x22 */
     { 0xe91326acu, SRC_SURV_SELF , REG_NONE      , 1, "disas_a64/FADD_v@0.0011100.1.....110101.........." },   /* fadd x10 */
     { 0xf38c59fcu, SRC_SURV_FIXED, REG_GPR9      , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
     { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x4 */
 };
 
-/* riscv64 -- 26 rows, 519 census entries, from 39 sidecar(s) */
+/* riscv64 -- 26 rows, 535 census entries, from 40 sidecar(s) */
 /* REFUSED, not carried: 0x24c5df69u decode_insn32/vmadc_vvm REG_VEC0 (vmadc.vvm x2) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -605,14 +562,14 @@ static const SrcSurvivorRow g_src_survivors_riscv64[] = {
     { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
     { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
     { 0xde4e315bu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/fsub_d" },   /* fsub.d x2 */
-    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x131 */
+    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x147 */
     { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
     { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
     { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
     { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
 };
 
-/* mipsel -- 5 rows, 310 census entries, from 39 sidecar(s) */
+/* mipsel -- 5 rows, 312 census entries, from 40 sidecar(s) */
 /* REFUSED, not carried: 0x00000000u ? REG_COPROC0 (swc2 x1) --
  * the census printed NO decode identity for this row (id 0,
  * rule `?`): QEMU named no decode rule for the bytes.  That
@@ -632,7 +589,7 @@ static const SrcSurvivorRow g_src_survivors_riscv64[] = {
  * with a differing row count.  It stays in the loss
  * direction. */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
-    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x302 */
+    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x304 */
     { 0x3e9bb316u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MADD_D" },   /* madd.d x2 */
     { 0x740ff847u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MSUB_D" },   /* msub.d x2 */
     { 0xa65bcb79u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_DIV_D" },   /* div.d x2 */
@@ -654,6 +611,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 68 rows over the four ISAs. */
+/* 69 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

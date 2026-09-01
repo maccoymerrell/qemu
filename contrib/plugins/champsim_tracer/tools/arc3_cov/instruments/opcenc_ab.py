@@ -53,12 +53,33 @@ row to score.
 THE ADJUDICATION LEDGER.  --adjudicated FILE names the exact transition a
 maintainer has ruled, one per line with a reason:
 
-    <isa> <encoding-hex> <A_CLASS> <B_CLASS>   # reason
+    <isa> <encoding-hex> <A_CLASS> <B_CLASS>            # reason  -- PENDING
+    LANDED <isa> <encoding-hex> <A_CLASS> <B_CLASS>     # reason  -- LANDED
 
 An adjudicated loss or move is counted, printed and EXCLUDED FROM THE BAR; an
-unadjudicated one fails.  A ledger line matching nothing in this measurement
-is STALE and fails too, because a ledger that outlives its subject is how a
-gate quietly stops gating.
+unadjudicated one fails.
+
+THE TWO ROW KINDS DIFFER IN ONE PLACE AND ONE ONLY: whether the row is
+required to have a subject.
+
+A PENDING row describes a transition between the two arms of a comparison
+that is being run NOW.  It must appear in that measurement; a PENDING line
+matching nothing is STALE and fails, because a ledger that outlives its
+subject is how a gate quietly stops gating, and because once the change is
+the tip the row has to be retired or it silently amnesties a future
+regression of the same shape.
+
+A LANDED row describes a transition that IS ALREADY ON THE WIRE at the tip.
+It is exempt from the stale rule for a reason that is not convenience: an A/A
+comparison at the tip contains none of them, and a cross-tip A/B against an
+older arm contains all of them, and BOTH are legitimate runs of this gate.
+Without the kind, the twenty transitions #333 admitted and the thirteen the
+PREFETCH repair returned had to be re-litigated by hand every time anyone
+compared across them, which is how a ruling gets re-decided differently.
+
+A LANDED ROW CANNOT AMNESTY A REGRESSION.  A row names BOTH classes, so
+`A -> B` says nothing about `B -> A`; a change that put a landed transition
+back the way it was is a different key, is unadjudicated, and fails.
 
 INPUT.  Two corpus files as CST_OPC_ENC_DUMP writes them, one row per
 distinct encoding:
@@ -117,29 +138,53 @@ def load(path):
 
 
 def read_ledger(path):
-    """{(isa, encoding, a_class, b_class): reason}."""
-    out = {}
+    """({key: reason}, {key: reason}) -- (pending, landed).
+
+    A key is (isa, encoding, a_class, b_class).  Both kinds amnesty the same
+    way; only PENDING keys are subject to the stale rule.  See the module
+    docstring for why that distinction is not a loophole.
+    """
+    pending, landed = {}, {}
     if not path:
-        return out
+        return pending, landed
     with open(path, errors="replace") as fh:
         for n, line in enumerate(fh, 1):
             body = line.split("#", 1)
             row = body[0].split()
             if not row:
                 continue
+            into = pending
+            if row[0] == "LANDED":
+                into = landed
+                row = row[1:]
+            elif row[0].upper() == "LANDED":
+                sys.exit("FAIL %s:%d: the LANDED keyword is spelled in "
+                         "capitals; %r is not it" % (path, n, row[0]))
             if len(row) != 4:
-                sys.exit("FAIL %s:%d: want '<isa> <encoding> <A_CLASS> "
-                         "<B_CLASS>  # reason'" % (path, n))
+                sys.exit("FAIL %s:%d: want '[LANDED] <isa> <encoding> "
+                         "<A_CLASS> <B_CLASS>  # reason'" % (path, n))
             if len(body) < 2 or not body[1].strip():
                 sys.exit("FAIL %s:%d: an adjudication with no reason is not "
                          "an adjudication" % (path, n))
             isa, enc, ca, cb = row
-            out[(isa, enc.lower(), ca, cb)] = body[1].strip()
-    return out
+            key = (isa, enc.lower(), ca, cb)
+            if key in pending or key in landed:
+                sys.exit("FAIL %s:%d: this transition is already ruled "
+                         "earlier in the file; one row per transition, so "
+                         "the reason a reader finds is the reason that "
+                         "applies" % (path, n))
+            into[key] = body[1].strip()
+    return pending, landed
 
 
-def compare(a_path, b_path, isas, ledger):
-    """Returns (rc, lines, losses, moves, adjudicated, gains)."""
+def compare(a_path, b_path, isas, ledgers):
+    """Returns (rc, lines, losses, moves, adjudicated, gains).
+
+    @ledgers is (pending, landed) as read_ledger() returns it.  Both amnesty;
+    only PENDING rows must have a subject in THIS measurement.
+    """
+    pending, landed = ledgers
+    ledger = {**landed, **pending}
     lines = []
     losses = []          # (isa, enc, mnem, a_cls, b_cls)
     moves = []           # (isa, enc, mnem, a_cls, b_cls)
@@ -218,7 +263,17 @@ def compare(a_path, b_path, isas, ledger):
     for isa, enc, mnem, ca, cb, why, kind in adjud:
         lines.append("    %-5s %-8s %-16s %-10s %s -> %s   %s"
                      % (kind, isa, enc, mnem[:10], ca, cb, why))
-    stale = [k for k in ledger if k not in used]
+    # LANDED rows are exempt from the stale rule BY DESIGN: an A/A run at
+    # the tip contains none of them and a cross-tip A/B contains all of
+    # them, and both are legitimate.  PENDING rows are not exempt, which is
+    # what keeps the rule doing its job.
+    stale = [k for k in pending if k not in used]
+    used_landed = sum(1 for k in landed if k in used)
+    if landed:
+        lines.append("LANDED ledger rows: %d ruled, %d reached by this "
+                     "measurement (a LANDED row needs no subject here -- an "
+                     "A/A run at the tip contains none of them)"
+                     % (len(landed), used_landed))
     if stale:
         rc = max(rc, 1)
         lines.append("STALE ledger rows (subject not in this measurement): %d"
@@ -287,7 +342,7 @@ def selftest():
 
     a = arm("a", base)
     b = arm("b", base)
-    rc, L, loss, mv, adj, gn = compare(a, b, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, b, ISAS, ({}, {}))
     chk("A identical arms PASS (rc=0; 0 losses, 0 moves, 0 gains)",
         rc == 0 and not loss and not mv and not gn, "\n".join(L))
 
@@ -295,7 +350,7 @@ def selftest():
     # the exact shape a table deletion would produce.
     c = arm("c", [(i, e, m, UNCLASSIFIED if e == "0106" else k)
                   for i, e, m, k in base])
-    rc, L, loss, mv, adj, gn = compare(a, c, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, c, ISAS, ({}, {}))
     chk("B a class LOST to GEN_OP_UNKNOWN FIRES (rc=1, 4 losses, one per ISA)",
         rc == 1 and len(loss) == 4 and not mv
         and all(x[3] == "GEN_OP_INT_ADD" for x in loss), "\n".join(L))
@@ -303,14 +358,14 @@ def selftest():
     # PLANTED FIRE 2 -- a class MOVES.  The QID_STATED admission's own shape.
     e = arm("e", [(i, en, m, "GEN_OP_INT_SUB" if en == "0106" else k)
                   for i, en, m, k in base])
-    rc, L, loss, mv, adj, gn = compare(a, e, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, e, ISAS, ({}, {}))
     chk("C a class MOVE fires SEPARATELY from a loss (rc=1, 0 losses, 4 moves)",
         rc == 1 and not loss and len(mv) == 4, "\n".join(L))
 
     # A GAIN is not the bar, and is never confused with a move.
     f = arm("f", [(i, en, m, "GEN_OP_INT_XOR" if en == "ffff" else k)
                   for i, en, m, k in base])
-    rc, L, loss, mv, adj, gn = compare(a, f, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, f, ISAS, ({}, {}))
     chk("D a GAIN does not fire and is NAMED (rc=0, 4 gains, 0 moves)",
         rc == 0 and not loss and not mv and len(gn) == 4, "\n".join(L))
 
@@ -319,7 +374,7 @@ def selftest():
                    UNCLASSIFIED if en == "0106"
                    else ("GEN_OP_INT_XOR" if en == "ffff" else k))
                   for i, en, m, k in base])
-    rc, L, loss, mv, adj, gn = compare(a, g, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, g, ISAS, ({}, {}))
     chk("E loss+gain in one arm still FIRES (netting would read zero)",
         rc == 1 and len(loss) == 4 and len(gn) == 4, "\n".join(L))
 
@@ -336,12 +391,46 @@ def selftest():
     chk("G a ledger keyed on the WRONG transition does not amnesty a loss",
         rc == 1 and len(loss) == 4, "\n".join(L))
 
+    # --- THE LANDED ROW KIND -------------------------------------------
+    # A transition already on the wire is ruled once and re-read on every
+    # cross-tip A/B; it must not go stale in an A/A run at the tip, and it
+    # must not amnesty the same transition running backwards.
+    lled = os.path.join(d, "landed.txt")
+    with open(lled, "w") as fh:
+        for isa in ISAS:
+            fh.write("LANDED %s 0106 GEN_OP_INT_ADD GEN_OP_INT_SUB"
+                     "  # selftest, already on the wire\n" % isa)
+    rc, L, loss, mv, adj, gn = compare(a, e, ISAS, read_ledger(lled))
+    chk("H1 a LANDED row amnesties its transition exactly as PENDING does",
+        rc == 0 and not mv and len(adj) == 4, "\n".join(L))
+    rc, L, loss, mv, adj, gn = compare(a, b, ISAS, read_ledger(lled))
+    chk("H2 a LANDED row with NO subject is NOT stale (A/A at the tip)",
+        rc == 0 and not loss and not mv, "\n".join(L))
+    # ...and running the same transition BACKWARDS is a different key, so
+    # the landed ruling cannot cover a regression of what it ruled.
+    eb = arm("eb", [(i, en, m, "GEN_OP_INT_SUB" if en == "0106" else k)
+                    for i, en, m, k in base])
+    rc, L, loss, mv, adj, gn = compare(eb, a, ISAS, read_ledger(lled))
+    chk("H3 a LANDED row does NOT amnesty the same transition reversed",
+        rc == 1 and len(mv) == 4, "\n".join(L))
+    # A PENDING row with no subject is still stale -- the rule survives.
     rc, L, loss, mv, adj, gn = compare(a, b, ISAS, read_ledger(led))
     chk("H a STALE ledger row FAILS (its subject is not in the measurement)",
         rc == 1 and not loss and not mv, "\n".join(L))
 
     with open(os.path.join(d, "noreason.txt"), "w") as fh:
         fh.write("x86_64 0106 GEN_OP_INT_ADD GEN_OP_INT_SUB\n")
+    lc = os.path.join(d, "lowercase.txt")
+    with open(lc, "w") as fh:
+        fh.write("landed x86_64 0106 GEN_OP_INT_ADD GEN_OP_INT_SUB  # r\n")
+    ok = False
+    try:
+        read_ledger(lc)
+    except SystemExit:
+        ok = True
+    chk("H4 a lowercase `landed` keyword is REFUSED, never read as an ISA",
+        ok)
+
     try:
         read_ledger(os.path.join(d, "noreason.txt"))
         ok = False
@@ -350,35 +439,35 @@ def selftest():
     chk("I an adjudication with no reason is REFUSED", ok)
 
     h = arm("h", [r for r in base if r[1] != "d9e5"])
-    rc, L, loss, mv, adj, gn = compare(a, h, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, h, ISAS, ({}, {}))
     chk("J unmatched encoding coverage is an ERROR (rc=2)", rc == 2,
         "\n".join(L))
 
     p = os.path.join(d, "empty.tsv")
     open(p, "w").write("#isa\tencoding\tmnem\topcode\n")
-    rc, L, loss, mv, adj, gn = compare(a, p, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, p, ISAS, ({}, {}))
     chk("K an EMPTY corpus REFUSES rather than passing vacuously", rc == 2,
         "\n".join(L))
 
     rc, L, loss, mv, adj, gn = compare(a, os.path.join(d, "nope.tsv"),
-                                       ISAS, {})
+                                       ISAS, ({}, {}))
     chk("L a MISSING corpus REFUSES rather than passing vacuously", rc == 2,
         "\n".join(L))
 
     q = os.path.join(d, "conflict.tsv")
     _write_corpus(q, base + [("x86_64", "0106", "addl", "GEN_OP_INT_SUB")])
-    rc, L, loss, mv, adj, gn = compare(a, q, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, q, ISAS, ({}, {}))
     chk("M a CONFLICTING duplicate encoding REFUSES (rc=2)", rc == 2,
         "\n".join(L))
 
     r = os.path.join(d, "unspell.tsv")
     _write_corpus(r, base + [("x86_64", "ab12", "?", UNSPELLABLE)])
-    rc, L, loss, mv, adj, gn = compare(a, r, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(a, r, ISAS, ({}, {}))
     chk("N a class the plugin could not SPELL is an ERROR, not a row (rc=2)",
         rc == 2, "\n".join(L))
 
     s = arm("s", [x for x in base if x[0] != "aarch64"])
-    rc, L, loss, mv, adj, gn = compare(s, s, ISAS, {})
+    rc, L, loss, mv, adj, gn = compare(s, s, ISAS, ({}, {}))
     chk("O an ISA absent from BOTH arms is an ERROR, not a silent zero",
         rc == 2, "\n".join(L))
 

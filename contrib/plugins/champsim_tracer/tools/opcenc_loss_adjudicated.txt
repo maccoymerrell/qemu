@@ -7,15 +7,123 @@
 # and nothing else: a ledger keyed on the encoding alone would silently cover
 # a second, different move on the same bytes later.
 #
-# A row here is counted, printed and excluded from the bar.  A row whose
-# subject the measurement does not contain is STALE and FAILS the gate -- a
-# ledger that outlives its subject is how a gate quietly stops gating -- so a
-# transition that has been landed and is no longer a difference between the
-# two arms must be REMOVED from this file, not left as a comment.
+# A row here is counted, printed and excluded from the bar.  A PENDING row
+# whose subject the measurement does not contain is STALE and FAILS the gate
+# -- a ledger that outlives its subject is how a gate quietly stops gating --
+# so a transition that has landed is PROMOTED to a LANDED row below, never
+# left as a PENDING one and never left as a comment.
 #
 # An entry with no reason is refused at parse time.  "It was already like
 # that" is not a reason; name the ruling or the measurement.
 #
-# EMPTY BY DESIGN at the tip: the two arms of a no-op comparison publish the
-# same class for every encoding, and every row added here is a wire change
-# somebody has to have ruled.
+# TWO ROW KINDS, and the difference is whether the row must have a subject.
+#
+#   <isa> <enc> <A> <B>          # reason   PENDING -- a transition between
+#                                the two arms of a comparison being run NOW.
+#                                It MUST appear in that measurement; a
+#                                PENDING row matching nothing is STALE and
+#                                fails, and once the change is the tip the
+#                                row is retired or promoted to LANDED.
+#
+#   LANDED <isa> <enc> <A> <B>   # reason   LANDED -- a transition that is
+#                                ALREADY on the wire.  Exempt from the stale
+#                                rule, because an A/A run at the tip contains
+#                                none of them and a cross-tip A/B against an
+#                                older arm contains all of them, and both are
+#                                legitimate runs of this gate.
+#
+# WHY THE LANDED SECTION EXISTS.  Without it, every A/B that reached across
+# #333's admission or the PREFETCH repair re-litigated the same thirty-three
+# transitions by hand, in a wave-local file that died with the wave -- which
+# is how one ruling gets decided two different ways.  A ruling is written
+# once and read here.
+#
+# AND IT CANNOT AMNESTY A REGRESSION.  A row names BOTH classes, so `A -> B`
+# says nothing about `B -> A`: a change that put a landed transition back the
+# way it was is a different key, is unadjudicated, and fails.  The
+# instrument's H3 selftest arm is exactly that case.
+#
+# THE PENDING SECTION IS EMPTY BY DESIGN at the tip: the two arms of a no-op
+# comparison publish the same class for every encoding, and every PENDING row
+# added here is a wire change somebody has to have ruled.
+
+# ==========================================================================
+# LANDED -- on the wire at the tip.  Read on any A/B that reaches across the
+# commit named in the reason; never required to have a subject.
+# ==========================================================================
+
+# --- #333, the QID_STATED admission (11e5509b76) -------------------------
+# The tier the admission opened made every rule whose class QEMU STATES
+# publish it.  These are the encodings the w19 corpus executes where the
+# stated class and the older Capstone-keyed class differ.  Each is written
+# beside its row in the generated identity header.
+#
+# x86 `movsd`: decode-new.c.inc:980 X86_OP_ENTRY3(VMOVSD_ld, V,x, H,x, M,sd,
+# vex5) and :1002 VMOVLPx_st.  R20 -- the class is a static fact of the RULE,
+# and QEMU's word for the rule is VMOVSD / VMOVLPx.  `movsd` is Capstone's
+# spelling of the same rule's legacy arm and the generic vocabulary answers
+# the two spellings differently; that asymmetry is a question about the
+# generic opcode space (exec78's `packsswb`/`vpacksswb` row), not about the
+# rule.
+LANDED x86_64 f20f1001         GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f1002         GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f1005590e0000 GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f10055f0e0000 GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f10442408     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f10442418     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f104c2418     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f10542410     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f2410f1001       GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVSD_ld, R20 rule word
+LANDED x86_64 f20f11442408     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+LANDED x86_64 f20f11442410     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+LANDED x86_64 f20f11442418     GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+LANDED x86_64 f20f114580       GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+LANDED x86_64 f20f118560ffffff GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+LANDED x86_64 f20f118580fbffff GEN_OP_FP_MOV GEN_OP_VEC_MOV # 11e5509b76, VMOVLPx_st, R20 rule word
+
+# x86 `stos`: decode-new.c.inc:1877 [0xAA] = X86_OP_ENTRYwr(STOS, Y,b, 0,b)
+# and :1878 for the wider forms.  The rule STORES the accumulator to ES:rDI
+# and the pointer update is its side effect; GEN_OP_INT_ADD was the shared
+# vocabulary answering `stosb` with that side effect instead of the transfer,
+# which is the substantial-operation rule read backwards.
+LANDED x86_64 f348ab           GEN_OP_INT_ADD GEN_OP_STORE # 11e5509b76, STOS stores; the rDI update is the side effect
+LANDED x86_64 f3aa             GEN_OP_INT_ADD GEN_OP_STORE # 11e5509b76, STOS stores; the rDI update is the side effect
+
+# aarch64 PACIASP / AUTIASP: a64.decode:242/246, trans_PACIASP ->
+# gen_pacia(s, cpu_reg(s,30), cpu_reg_sp(s,31)) WRITES X30 and trans_AUTIASP
+# is the authenticate half.  The NOP payload is the FEAT_PAuth-ABSENT
+# behaviour of the hint space, not the instruction, and R16 keeps the
+# architectural write.  The register side never moved.
+LANDED aarch64 3f2303d5        GEN_OP_NOP GEN_OP_MOV # 11e5509b76, PACIASP writes X30 (R16)
+LANDED aarch64 bf2303d5        GEN_OP_NOP GEN_OP_MOV # 11e5509b76, AUTIASP writes X30 (R16)
+
+# mipsel `nop`: translate.c:16457 separates the zero-destination SLL
+# encodings itself and scripts/mips_ident_instrument.py qualifies this one as
+# NOP -- SLL r0,r0,0.  The instruction is a nop and the rule says so.
+LANDED mipsel 00000000         GEN_OP_SHL GEN_OP_NOP # 11e5509b76, OPC_SLL sa=rd=rs=rt=0 is the nop encoding
+
+# --- the PREFETCH repair (ef8bbe0fc1) ------------------------------------
+# The x86 PREFETCH class left the wire when da800e941e's inert rewrite of
+# decode ids 0x53c/0x545 went live under the admission.  The identity carve
+# in scripts/x86_prefetch_ident_instrument.py returns it: ModRM.reg is the
+# group selector and every one of these is an ISA-defined memory hint on an
+# m8 operand.  R16 -- `NOP` is what gen_NOP emits, not what the instruction
+# is.  Thirteen encodings, measured over the 64,441-encoding wide corpus.
+LANDED x86_64 0f0d4c2418       GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetchw, 0F 0D /1 m8 (R16)
+LANDED x86_64 0f180c24         GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f180cd4         GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f18442410       GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetchnta, 0F 18 /0 m8 (R16)
+LANDED x86_64 0f18542408       GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht1, 0F 18 /2 m8 (R16)
+LANDED x86_64 0f188e80000000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188e80100000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188e80200000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188e80300000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188ec0000000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188ec0100000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188ec0200000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+LANDED x86_64 0f188ec0300000   GEN_OP_NOP GEN_OP_PREFETCH # ef8bbe0fc1, prefetcht0, 0F 18 /1 m8 (R16)
+
+# ==========================================================================
+# PENDING -- transitions between the two arms of a comparison being run now.
+# Empty at the tip; a row here that has no subject FAILS.
+# ==========================================================================

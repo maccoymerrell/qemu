@@ -1696,6 +1696,18 @@ BBTemplate *TemplateStore::create_tb_template(
                              &insn_bytes[(size_t)i * MAX_INSN_BYTES],
                              insn_sizes[i],
                              insn_info ? insn_info[i].mnemonic : nullptr);
+            /*
+             * AND THE PER-ENCODING MECHANISM CORPUS, beside both, because
+             * it answers the question they raise: when the two arms of a
+             * source A/B disagree, WHY did QEMU not supply the register?
+             * The pc is passed so the staged answer can be proved to belong
+             * to this instruction rather than assumed to.  Separately
+             * env-gated; none of the three costs the others anything.
+             */
+            dump_src_mech_row(tmpl->insn_pcs[i], &scratch[i].f,
+                              &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                              insn_sizes[i],
+                              insn_info ? insn_info[i].mnemonic : nullptr);
             srcs[i] = &scratch[i].f;
             name_srcs[i] = with_names ? &nscratch[i].rn : nullptr;
         }

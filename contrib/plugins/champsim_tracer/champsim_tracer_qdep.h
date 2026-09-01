@@ -806,6 +806,45 @@ void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
 void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
                       uint8_t size, const char *mnem);
 
+/*
+ * THE PER-ENCODING MECHANISM CORPUS, env-gated (CST_SRC_MECH_DUMP=<path>).
+ *
+ *   <isa> <encoding hex> <mnemonic> <decode_id> <decode rule> <src_state>
+ *   <wstate> PUB QN SURV RD STATUS RDX CONT
+ *
+ * WHY A THIRD CORPUS.  The read-list corpus (dump_src_enc_row) says WHAT an
+ * encoding publishes; an A/B over two builds says WHICH registers the
+ * operand walk is the only supplier of.  Neither says WHY QEMU did not
+ * supply them, and "why" is the whole question a fix has to answer: a
+ * register missing because the read list was REFUSED needs a different
+ * repair from one missing because QEMU stated a complete list that simply
+ * does not mention it.  Those are the two mechanisms, they need opposite
+ * work, and no instrument in this tree could tell them apart per encoding.
+ *
+ * The columns are the PER-PC witness's columns (dump_src_pc_row), keyed on
+ * the ENCODING instead of the program counter, because the loss population
+ * lives in the space no guest executes -- the sled reaches it and a pc does
+ * not name it.  Identical column meanings on purpose: a reader written for
+ * one file reads the other, and the two can be joined where they overlap.
+ *
+ * WHY NOT A COLUMN ON THE READ-LIST CORPUS.  Same answer as the opcode
+ * corpus: srcenc_loss_gate parses that file's fourth column and fails a
+ * build on it.  Widening a gate's subject to carry a diagnostic is how a
+ * gate stops meaning what its name says.
+ *
+ * MEASUREMENT ONLY and OFF unless asked for: with the variable unset the
+ * site is a single relaxed load, the staging slot is never filled, and
+ * neither qemu_named_regs() nor src_survivor_regs() is called for it.
+ */
+/* Whether that corpus is taking rows.  Public because the STAGING of a
+ * mechanism answer happens one call earlier than the row is written, in
+ * qdep_apply(), and neither qemu_named_regs() nor src_survivor_regs() may be
+ * walked on the translation path for an instrument nobody asked for. */
+bool src_mech_corpus_live(void);
+
+void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
+                       uint8_t size, const char *mnem);
+
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the
  * trace, not a debugging aid, and a fact nobody prints is a fact nobody

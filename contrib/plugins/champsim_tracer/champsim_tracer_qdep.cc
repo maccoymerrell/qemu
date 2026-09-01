@@ -3052,6 +3052,55 @@ FILE *g_src_pc_dump = nullptr;
 std::mutex g_src_pc_dump_lock;
 std::atomic<uint64_t> g_src_pc_dump_rows{0};
 
+/*
+ * THE MECHANISM CORPUS'S STAGING SLOT.
+ *
+ * dump_src_mech_row() is called from create_tb_template(), which is the only
+ * level that holds the ENCODING BYTES -- the dependency model is handed
+ * fields, never the instruction.  The MECHANISM columns are the opposite:
+ * they live on QDepInsn and on two derived lists (qemu_named_regs(), the
+ * survivor rows) that only qdep_apply() is positioned to compute, and one of
+ * their inputs -- dst_precheck()'s verdict -- exists nowhere else at all.
+ *
+ * So the answer is staged here, by the same statement that writes the per-pc
+ * witness, and read one call later by the encoding-keyed writer.  The two
+ * calls are adjacent for one instruction on one thread: create_tb_template()
+ * runs qdep_apply() and then the dump calls, per instruction, in a loop.
+ * `pc` is carried and re-checked at the read so a slot filled for one
+ * instruction can never be written under another one's encoding -- a
+ * mismatch is DROPPED and counted, never printed, because a mechanism row
+ * attributed to the wrong encoding is worse than a missing one.
+ *
+ * FILLED ONLY WHEN THE CORPUS IS LIVE.  With CST_SRC_MECH_DUMP unset this
+ * whole block is one relaxed load: qemu_named_regs() and src_survivor_regs()
+ * are not walked, and the translation path pays nothing for an instrument
+ * nobody asked for.
+ */
+
+struct SrcMechStage {
+    bool        valid;
+    uint64_t    pc;
+    uint32_t    decode_id;
+    const char *rule;
+    uint8_t     src_state;
+    uint8_t     srcx_state;
+    uint8_t     status_flags;
+    uint8_t     wstate;
+    uint8_t     n_qn;
+    uint8_t     qn[MAX_SRC_REGS];
+    uint8_t     n_sv;
+    uint8_t     sv[MAX_SRC_REGS];
+    uint8_t     n_rd;
+    uint8_t     rd[QDEP_MAX_SRC];
+    uint8_t     n_rdx;
+    uint8_t     rdx[QDEP_MAX_SRC];
+    uint8_t     n_cont;
+    uint8_t     cont_lo[QDEP_MAX_SRC];
+    uint8_t     cont_hi[QDEP_MAX_SRC];
+};
+static thread_local SrcMechStage g_mech_stage;
+std::atomic<uint64_t> g_mech_stage_mismatch{0};
+
 void reglist_str(GString *g, const uint8_t *regs, uint8_t n)
 {
     for (uint8_t i = 0; i < n; i++) {
@@ -3255,6 +3304,33 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * here, and with the variable unset the site is a single relaxed load.
      */
     dump_src_pc_row(f, q, mnem, wstate);
+    /*
+     * AND STAGE THE SAME ANSWER FOR THE PER-ENCODING MECHANISM CORPUS,
+     * which is written one call later from the level that holds the
+     * encoding bytes.  See SrcMechStage.
+     */
+    if (src_mech_corpus_live()) {
+        SrcMechStage *m = &g_mech_stage;
+
+        m->valid        = true;
+        m->pc           = q->insn_vaddr;
+        m->decode_id    = q->decode_id;
+        m->rule         = q->decode_name;
+        m->src_state    = q->src_state;
+        m->srcx_state   = q->srcx_state;
+        m->status_flags = q->status_flags;
+        m->wstate       = (uint8_t)wstate;
+        m->n_qn = qemu_named_regs(q, m->qn, f, wstate == QDEP_OK);
+        m->n_sv = src_survivor_regs(q->decode_id, f, m->sv,
+                                    (uint8_t)MAX_SRC_REGS);
+        m->n_rd = q->n_src;
+        memcpy(m->rd, q->src_reg, q->n_src);
+        m->n_rdx = q->n_srcx;
+        memcpy(m->rdx, q->srcx, q->n_srcx);
+        m->n_cont = q->n_src_cont;
+        memcpy(m->cont_lo, q->src_cont_lo, q->n_src_cont);
+        memcpy(m->cont_hi, q->src_cont_hi, q->n_src_cont);
+    }
     /*
      * THE SURVIVOR-ROW REFUTATION, and it runs OUTSIDE the read-list gate
      * below for the same reason the witness above does: the claim under
@@ -4035,6 +4111,9 @@ struct EncCorpus {
 
 EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
 EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
+EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
+    "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
+    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -4052,6 +4131,11 @@ uint8_t enc_hex(char *out, const uint8_t *bytes, uint8_t size)
 }
 
 }  /* namespace */
+
+bool src_mech_corpus_live(void)
+{
+    return g_src_mech.live();
+}
 
 void dump_src_enc_row(const InsnFields *f, const uint8_t *bytes,
                       uint8_t size, const char *mnem)
@@ -4109,6 +4193,93 @@ void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
                            hex, mnem ? mnem : "?",
                            generic_opcode_name_or_unknown(f->opcode));
     g_opc_enc.write(g->str);
+    g_string_free(g, TRUE);
+}
+
+/*
+ * THE PER-ENCODING MECHANISM CORPUS.  See champsim_tracer_qdep.h.
+ *
+ * Every column is the answer qdep_apply() staged for THIS instruction;
+ * nothing is recomputed here, because a second computation from a different
+ * vantage point is a second opinion and this file already has the first one.
+ *
+ * A stage that does not name @pc is DROPPED and counted.  That happens when
+ * qdep_apply() did not run for the encoding being written -- a decode with
+ * no dependency block at all -- and printing the PREVIOUS instruction's
+ * mechanism under this encoding would be a fabricated row, which is the one
+ * failure mode a corpus like this must not have.  A dropped row leaves the
+ * encoding UNREACHED downstream, which is the honest reading.
+ */
+void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
+                       uint8_t size, const char *mnem)
+{
+    if (!f || !bytes || !size || !g_src_mech.live()) {
+        return;
+    }
+
+    SrcMechStage *m = &g_mech_stage;
+
+    if (!m->valid || m->pc != pc) {
+        g_mech_stage_mismatch.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    /* Consumed exactly once: the next encoding gets its own stage or none. */
+    m->valid = false;
+
+    char hex[2 * MAX_INSN_BYTES + 1];
+    uint8_t n = enc_hex(hex, bytes, size);
+    std::unique_lock<std::mutex> lk;
+
+    if (!g_src_mech.claim(lk, bytes, n)) {
+        return;
+    }
+
+    GString *g = g_string_new(nullptr);
+
+    g_string_append_printf(g, "%s\t%s\t%s\t%08x\t%s\t%s\t%s\t",
+                           target_name ? target_name : "?",
+                           hex, mnem ? mnem : "?",
+                           m->decode_id, m->rule ? m->rule : "?",
+                           state_name(m->src_state),
+                           state_name(m->wstate));
+    reglist_str(g, f->src_regs, f->n_src_regs);
+    g_string_append_c(g, '\t');
+    reglist_str(g, m->qn, m->n_qn);
+    g_string_append_c(g, '\t');
+    reglist_str(g, m->sv, m->n_sv);
+    g_string_append_c(g, '\t');
+    reglist_str(g, m->rd, m->n_rd);
+    g_string_append_c(g, '\t');
+    g_string_append_printf(g, "%s%s%s%s%s%s",
+                           m->status_flags & 0x01 ? "memops_truncated," : "",
+                           m->status_flags & 0x02 ? "memops_unnoted," : "",
+                           m->status_flags & 0x04 ? "fields_truncated," : "",
+                           m->status_flags & 0x08 ? "writes_truncated," : "",
+                           m->status_flags & 0x10 ? "prov_truncated," : "",
+                           m->status_flags & 0x20 ? "helper_unbounded," : "");
+    if (!m->status_flags) {
+        g_string_append(g, "-");
+    }
+    g_string_append_c(g, '\t');
+    g_string_append_printf(g, "%s:", state_name(m->srcx_state));
+    reglist_str(g, m->rdx, m->n_rdx);
+    g_string_append_c(g, '\t');
+    for (uint8_t k = 0; k < m->n_cont; k++) {
+        /* TWO calls, TWO statements: generic_reg_name_or_unknown() answers a
+         * bank register out of one thread-local buffer, so two calls in one
+         * argument list alias and both %s print the same bound.  The per-pc
+         * witness printed `REG_FPR0..REG_FPR0` for the whole x87 file that
+         * way; this site does not repeat it. */
+        g_string_append_printf(g, "%s%s", k ? "," : "",
+                               generic_reg_name_or_unknown(m->cont_lo[k]));
+        g_string_append_printf(g, "..%s",
+                               generic_reg_name_or_unknown(m->cont_hi[k]));
+    }
+    if (!m->n_cont) {
+        g_string_append(g, "-");
+    }
+    g_string_append_c(g, '\n');
+    g_src_mech.write(g->str);
     g_string_free(g, TRUE);
 }
 
@@ -5525,6 +5696,27 @@ void qdep_report(GString *report)
             "              shortfall to show.\n",
             reached, printed, reached - printed);
     }
+    /*
+     * THE MECHANISM CORPUS'S OWN DROP COUNT.
+     *
+     * Reported UNCONDITIONALLY, zeros included, and with the variable unset
+     * it reads a structural zero -- the writer returns before the counter on
+     * a corpus nobody asked for.  A dropped row is an encoding the corpus
+     * does not carry a mechanism for, and downstream that is UNREACHED and
+     * therefore invisible.  A corpus whose holes are invisible is the exact
+     * shape this tree keeps having to relearn, so the hole is COUNTED here
+     * rather than inferred from a row count nobody compares to anything.
+     */
+    g_string_append_printf(report,
+        "\n--- the per-encoding MECHANISM corpus (CST_SRC_MECH_DUMP) ---\n"
+        "  %10" G_GUINT64_FORMAT "  rows DROPPED because the staged mechanism did not\n"
+        "              name the encoding being written -- MUST BE 0.  The\n"
+        "              stage is filled by qdep_apply() and read one call\n"
+        "              later under the same pc; a mismatch means the\n"
+        "              instruction had no dependency block at all, and the\n"
+        "              row is dropped rather than printed with the previous\n"
+        "              instruction's mechanism under this encoding.\n",
+        g_mech_stage_mismatch.load(std::memory_order_relaxed));
     dump_tally(report, g_src_flip_missing_sig,
                "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
     dump_tally(report, g_src_adj_owed_sig,

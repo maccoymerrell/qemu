@@ -199,6 +199,14 @@ def main():
                          "sweep this dense and a flush mid-image is not a "
                          "failure this script should have to model")
     ap.add_argument("--emit-only", action="store_true")
+    ap.add_argument("--mech", action="store_true",
+                    help="ALSO capture the per-encoding MECHANISM corpus "
+                         "(CST_SRC_MECH_DUMP) into corpus_mech_<isa>.tsv.  "
+                         "The read-list corpus says WHAT an encoding "
+                         "publishes; this one says why QEMU did not supply "
+                         "what it does not.  Captured in the SAME run, so "
+                         "the two files describe one translation and cannot "
+                         "drift apart between two sweeps.")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -215,7 +223,7 @@ def main():
         if not os.path.exists(p):
             raise SystemExit("srcenc_sled: %s does not exist -- REFUSING" % p)
 
-    rows, parts = 0, []
+    rows, parts, mparts = 0, [], []
     for k in range(0, len(pop), a.chunk):
         chunk = pop[k:k + a.chunk]
         img = os.path.join(a.out, "sled_%s_%d" % (a.isa, k // a.chunk))
@@ -226,6 +234,9 @@ def main():
         tsv = img + ".tsv"
         env = dict(os.environ)
         env["CST_SRC_ENC_DUMP"] = tsv
+        mtsv = img + ".mech.tsv"
+        if a.mech:
+            env["CST_SRC_MECH_DUMP"] = mtsv
         env["CST_SLED"] = "%x:%d:%d" % (base, stride, n)
         log = img + ".log"
         with open(log, "w") as lf:
@@ -248,6 +259,26 @@ def main():
                 "srcenc_sled: chunk %d produced no corpus row -- REFUSING.  "
                 "An empty capture is not a short one; see %s"
                 % (k // a.chunk, log))
+        if a.mech:
+            mgot = 0
+            if os.path.exists(mtsv):
+                with open(mtsv) as f:
+                    mgot = sum(1 for L in f if not L.startswith("#"))
+            # THE TWO CORPORA MUST AGREE ROW FOR ROW.  Both are written from
+            # the same loop over the same instructions and both deduplicate on
+            # the same encoding key, so a difference is a DROPPED mechanism
+            # row -- an encoding whose "why" the sweep silently does not
+            # carry, which downstream reads as UNREACHED rather than as a
+            # hole.  The plugin counts its own drops in the sidecar; this is
+            # the second, independent reading of the same fact.
+            if mgot != got:
+                raise SystemExit(
+                    "srcenc_sled: chunk %d wrote %d read-list rows but %d "
+                    "mechanism rows -- REFUSING.  The two corpora describe "
+                    "the same translations and a shortfall is a mechanism "
+                    "row dropped; see %s and the sidecar's MECHANISM block"
+                    % (k // a.chunk, got, mgot, log))
+            mparts.append(mtsv)
         rows += got
         parts.append(tsv)
 
@@ -315,6 +346,47 @@ def main():
         f.write("#isa\tencoding\tmnem\tsrc\n")
         for line in seen.values():
             f.write(line)
+    if a.mech:
+        # THE SAME SCOPING as the read-list merge above, for the same reason:
+        # the entry stub and the slot terminator are by-products of the
+        # layout, not subjects.  A mechanism conflict on a POPULATION
+        # encoding refuses here too -- QEMU's read list being
+        # translation-context dependent (see above) makes its MECHANISM
+        # context dependent as well, and two answers is no answer.
+        mmerged = os.path.join(a.out, "corpus_mech_%s.tsv" % a.isa)
+        mseen, mhdr, mconf = {}, None, 0
+        for t in mparts:
+            with open(t) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        mhdr = mhdr or line
+                        continue
+                    c = line.split("\t")
+                    if len(c) < 4 or c[1] not in wanted:
+                        continue
+                    prev = mseen.get(c[1])
+                    if prev is None:
+                        mseen[c[1]] = line
+                    elif prev != line:
+                        mconf += 1
+                        sys.stderr.write("MECH-CONFLICT %s\n  %s  %s"
+                                         % (c[1], prev, line))
+        if mconf:
+            raise SystemExit(
+                "srcenc_sled: %d POPULATION encoding(s) carry two DIFFERENT "
+                "mechanism rows -- REFUSING" % mconf)
+        with open(mmerged, "w") as f:
+            f.write(mhdr or "#\n")
+            for line in mseen.values():
+                f.write(line)
+        print("mech-corpus %s encodings=%d" % (a.isa, len(mseen)))
+        if len(mseen) != len(seen):
+            raise SystemExit(
+                "srcenc_sled: the merged read-list corpus carries %d "
+                "encodings and the merged mechanism corpus %d -- REFUSING "
+                "(one encoding, two files, one row each)"
+                % (len(seen), len(mseen)))
+
     print("corpus %s encodings=%d (raw rows %d) population=%d "
           "incidental_rows=%d incidental_encodings=%d "
           "incidental_conflicts=%d"

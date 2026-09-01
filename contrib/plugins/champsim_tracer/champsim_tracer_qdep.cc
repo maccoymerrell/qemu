@@ -5637,6 +5637,174 @@ void qdep_report(GString *report)
         }
         g_string_free(body, TRUE);
     }
+    /*
+     * THE SECOND REFUTATION ROUTE, and it exists because the first one has
+     * a population it cannot reach.  The join above needs QEMU to STATE the
+     * register on at least one instance of the rule; where the emulator
+     * refuses the whole read list -- riscv64 RVV, x86 scalar FMA -- every
+     * instance is SILENT, the join can never fire, and the instrument would
+     * report a clean 0 over exactly the rows exec86 measured as fabricating
+     * on live instructions.  A zero that cannot be anything else is what
+     * this whole block exists to stop reporting.
+     *
+     * SO THE TABLE IS ALSO READ AGAINST ITSELF, statically and without any
+     * run.  SRC_SURV_FIXED means "the same register on every instruction
+     * this rule decodes".  A decode id carrying TWO fixed rows from the SAME
+     * NUMBERED BANK is that table saying one rule reads two different
+     * vectors, or two different predicates, on every instance -- which is
+     * what an ENCODED operand looks like once it has been frozen at whatever
+     * the deriving corpus happened to run.  exec81 named this as the
+     * generator's ready criterion; it is measured here so the count exists
+     * before the generator changes.
+     *
+     * Singleton banks are untouched: a rule that reads one fixed vector and
+     * one fixed control register says nothing suspicious, and only a
+     * COLLISION inside one numbered bank is read as a refutation.
+     */
+    {
+        unsigned isa = (unsigned)trace_isa;
+        const SrcSurvivorTable *t =
+            isa < G_N_ELEMENTS(g_src_survivor_tables)
+                ? &g_src_survivor_tables[isa] : nullptr;
+        uint64_t bank_rows = 0, bank_ids = 0, bank_reach = 0;
+        GString *body = g_string_new(nullptr);
+
+        auto bank_of = [](uint8_t r) -> int {
+            if (r >= REG_GPR0  && r < REG_GPR0  + 32) return 1;
+            if (r >= REG_FPR0  && r < REG_FPR0  + 32) return 2;
+            if (r >= REG_VEC0  && r < REG_VEC0  + 64) return 3;
+            if (r >= REG_PRED0 && r < REG_PRED0 + 32) return 4;
+            return 0;   /* a singleton register is never a bank */
+        };
+        if (t && t->rows) {
+            for (unsigned i = 0; i < t->n; i++) {
+                const SrcSurvivorRow *a = &t->rows[i];
+                int ba = a->kind == SRC_SURV_FIXED ? bank_of(a->reg) : 0;
+                bool collides = false;
+
+                if (!ba) {
+                    continue;
+                }
+                for (unsigned j = 0; j < t->n; j++) {
+                    const SrcSurvivorRow *b = &t->rows[j];
+
+                    if (j == i || b->decode_id != a->decode_id
+                        || b->kind != SRC_SURV_FIXED || b->reg == a->reg) {
+                        continue;
+                    }
+                    if (bank_of(b->reg) == ba) {
+                        collides = true;
+                        break;
+                    }
+                }
+                if (!collides) {
+                    continue;
+                }
+                bank_rows++;
+                /*
+                 * Reach, from this run's own tallies: how many register
+                 * instances the row actually supplied here.  Matched on the
+                 * decode id and the register NAME, because the tally's key
+                 * carries QEMU's spelling of the rule and the table carries
+                 * its own annotation of it -- a row whose two spellings
+                 * differ must not silently read as unreached.
+                 */
+                const char *rn = generic_reg_name_or_unknown(a->reg);
+                char *pre = g_strdup_printf("%08x ", a->decode_id);
+                uint64_t reach = 0;
+
+                for (int pass = 0; pass < 2; pass++) {
+                    GHashTable *h = pass ? g_surv_ref_stated_sig
+                                         : g_surv_ref_silent_sig;
+                    if (!h) {
+                        continue;
+                    }
+                    GList *keys = g_hash_table_get_keys(h);
+
+                    for (GList *l = keys; l; l = l->next) {
+                        const char *k = (const char *)l->data;
+                        size_t kl = strlen(k), rl = strlen(rn);
+
+                        if (g_str_has_prefix(k, pre) && kl > rl
+                            && g_strcmp0(k + kl - rl, rn) == 0) {
+                            reach += GPOINTER_TO_UINT(
+                                g_hash_table_lookup(h, k));
+                        }
+                    }
+                    g_list_free(keys);
+                }
+                g_free(pre);
+                bank_reach += reach;
+                g_string_append_printf(body,
+                    "  %8" G_GUINT64_FORMAT " reached  %08x %-26s %-12s  %s\n",
+                    reach, a->decode_id, a->rule ? a->rule : "?", rn,
+                    reach ? "MEASURED on a live instruction"
+                          : "not reached by this run");
+            }
+            for (unsigned i = 0; i < t->n; i++) {
+                bool first = true;
+
+                for (unsigned j = 0; j < i; j++) {
+                    if (t->rows[j].decode_id == t->rows[i].decode_id) {
+                        first = false;
+                        break;
+                    }
+                }
+                if (!first) {
+                    continue;
+                }
+                int seen[5] = {0, 0, 0, 0, 0};
+                bool hit = false;
+
+                for (unsigned j = 0; j < t->n; j++) {
+                    if (t->rows[j].decode_id != t->rows[i].decode_id
+                        || t->rows[j].kind != SRC_SURV_FIXED) {
+                        continue;
+                    }
+                    int b = bank_of(t->rows[j].reg);
+                    if (b && ++seen[b] > 1) {
+                        hit = true;
+                    }
+                }
+                if (hit) {
+                    bank_ids++;
+                }
+            }
+        }
+        g_string_append_printf(report,
+            "\nTHE SAME QUESTION ASKED OF THE TABLE'S OWN SHAPE, because the"
+            " join above\nhas a population it cannot reach.  The join needs"
+            " QEMU to STATE the\nregister on at least one instance; where the"
+            " emulator refuses the whole\nread list -- riscv64 RVV, x86"
+            " scalar FMA -- every instance is SILENT and\nthe join reads a"
+            " clean 0 over rows that DO fabricate.  SRC_SURV_FIXED\nmeans"
+            " \"the same register on every instruction this rule decodes\","
+            " so a decode\nid carrying TWO fixed rows from ONE NUMBERED BANK"
+            " is the table saying a rule\nreads two different vectors on"
+            " every instance -- an ENCODED operand frozen\nat whatever the"
+            " deriving corpus ran.  Singleton registers are never a bank.\n"
+            "  %10" G_GUINT64_FORMAT "  decode ids whose FIXED rows COLLIDE"
+            " inside one bank\n"
+            "  %10" G_GUINT64_FORMAT "  rows those ids carry -- MUST BE 0."
+            "  The remedy is QEMU\n"
+            "               stating the encoded operand at the decode site and"
+            " the row\n"
+            "               being dropped by the generator, never a finer"
+            " survivor key:\n"
+            "               keying per (pattern, operand) is a table of the"
+            " ENCODING\n"
+            "               rather than of the rule\n"
+            "  %10" G_GUINT64_FORMAT "  register-instances they supplied ON"
+            " THIS RUN.  A row with 0\n"
+            "               here is STATIC INDICATION ONLY and must be"
+            " reported as\n"
+            "               unreached, never as clean\n",
+            bank_ids, bank_rows, bank_reach);
+        if (bank_rows) {
+            g_string_append(report, body->str);
+        }
+        g_string_free(body, TRUE);
+    }
     dump_tally(report, g_src_flip_extra_sig,
                "FLIP COST, THE FABRICATION DIRECTION -- registers a\nSURVIVOR ROW supplies that the wire does not publish, by decode id, rule,\nregister and mnemonic.  A FIXED row reaching an instruction the rule\ndecodes but that does not read the register lands here, and so does a\nSELF row on an instruction whose destination is not also a source.  The\nblock is empty when every row is right for every instruction its rule\ncarries:");
     dump_tally(report, g_src_qemu_extra_sig,

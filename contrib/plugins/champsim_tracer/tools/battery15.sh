@@ -52,6 +52,15 @@
 # every build stage here asserts the .so hash it expects and the script fails
 # loudly if a revert did not return.
 #
+# RUN `ninja` FIRST, ESPECIALLY AFTER A COMMIT.  Row 11's build gate refuses
+# if it has to rebuild anything, on the correct ground that a capture taken
+# before that rebuild ran old code.  `git commit -o <paths>` -- a PARTIAL
+# commit -- checks the named paths out through a temporary index and rewrites
+# their mtimes, so a battery started straight after one sees four stale
+# emulators whose CONTENT never changed.  Measured at exec98: row 11 rc=2
+# with net_validator_gate.sh standalone green on the same bytes minutes
+# earlier.  The gate is right and the remedy is the one it prints.
+#
 # ARM DIRECTORY NAMES ARE ALL THE SAME LENGTH (#327).  qemu-user puts the cwd
 # on the guest stack, so two arms at paths of different lengths reach
 # different pc sets and a gate correctly refuses on coverage instead of
@@ -561,7 +570,16 @@ PYEOF
             if [ "$sop" = "$SO0" ]; then
                 record "$arm" 2 "the build did NOT move the .so -- the plant did not compile in"
             fi
+            # THE SAME POPULATION AS ARM A, INCLUDING THE GOLDEN-NET CELLS.
+            # A plant arm captured over a narrower corpus refuses on
+            # COVERAGE instead of reporting the loss it planted -- non-zero
+            # either way, so the row still passes, but "the gate could not
+            # look" is much weaker evidence than "the gate saw the loss",
+            # and the point of a planted fire is the second one.  Measured
+            # when this was wrong: only_A=4581, gate_rc=2 where PASS 49
+            # read gate_rc=1.
             "$T/opcenc_loss_gate.sh" capture "$Q" "$O/opce/$arm" "$WORKLOAD" \
+                ${NETCELLS[@]+"${NETCELLS[@]}"} \
                 > "$O/opce_cap_$arm.log" 2>&1
             "$T/opcenc_loss_gate.sh" compare "$Q" "$O/opce/armA/corpus.tsv" \
                 "$O/opce/$arm/corpus.tsv" > "$O/opce_$arm.log" 2>&1

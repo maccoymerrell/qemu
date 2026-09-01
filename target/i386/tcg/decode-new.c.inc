@@ -2616,6 +2616,28 @@ illegal:
 #include "vex_ident.c.inc"
 #include "cet_ident.c.inc"
 
+/*
+ * THE PREFETCH GROUPS SHARE THE NOP ROWS.  QEMU models no cache, so
+ * gen_NOP is what a prefetch lowers to and the table NAMES both group
+ * rows `NOP` -- [0x0d] for the 3DNow! group, [0x18] for the SSE group.
+ * One identity therefore answers for `prefetchnta`, `prefetcht0`,
+ * `prefetcht1`, `prefetcht2`, `prefetch`, `prefetchw` and `prefetchwt1`
+ * alike, and for the reserved NOPs beside them, and the only word it
+ * offers is the lowering.
+ *
+ * The discriminator is not missing: both groups select on ModRM.reg,
+ * every one of the hints is defined on m8, and s->modrm is a fact
+ * disas_insn() holds before the row is published.
+ *
+ * scripts/x86_prefetch_ident_instrument.py states the finer identity,
+ * one row per arm, and inserts the publish below.  THE BASE ROWS DO NOT
+ * MOVE: no X86_OP_* row is edited and no line is inserted above one, so
+ * every slot keeps its number, and an encoding with no qualified row --
+ * every reserved NOP, every mod=11 form -- keeps the row's own id and
+ * name bit for bit.
+ */
+#include "prefetch_ident.c.inc"
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2928,6 +2950,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     vex_ident_publish(decode.e.slot, (s->prefix & PREFIX_VEX) != 0);  /* vex_ident */
     cet_ident_publish(decode.e.slot,
                       (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
+    prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

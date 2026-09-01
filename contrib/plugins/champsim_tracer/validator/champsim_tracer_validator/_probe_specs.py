@@ -211,9 +211,17 @@ _register_probe('probe_x86_fp_sqrt_cmp', {'x86_64': {'asm': '"sqrtsd %%xmm1, %%x
             'opcodes': ['FP_SQRT', 'FP_CMP']}})
 
 _register_probe('probe_x86_fp_mov_cvt', {'x86_64': {'asm': '"movsd %%xmm1, %%xmm0\\n\\t"\n'
-                   '    "cvtsi2sd %%rax, %%xmm2"',
-            'clobbers': '"xmm0","xmm2"',
-            'opcodes': ['FP_MOV', 'FP_CVT']}})
+                   '    "cvtsi2sd %%rax, %%xmm2\\n\\t"\n'
+                   '    "sub $16, %%rsp\\n\\t"\n'
+                   '    "flds (%%rsp)\\n\\t"\n'
+                   '    "fstps (%%rsp)\\n\\t"\n'
+                   '    "add $16, %%rsp"',
+            'clobbers': '"xmm0","xmm2","cc","memory"',
+            # `movsd xmm,xmm` publishes VEC_MOV: the register form merges
+            # into a destination it also reads, which is the vector move.
+            # The x87 pair keeps FP_MOV -- the class this probe is named
+            # for -- a subject on x86; without it the class had none.
+            'opcodes': ['VEC_MOV', 'FP_CVT', 'FP_MOV']}})
 
 _register_probe('probe_x86_fma', {'x86_64': {'asm': '"vfmadd132sd %%xmm1, %%xmm2, %%xmm0\\n\\t"\n'
                    '    "vfmsub132sd %%xmm4, %%xmm5, %%xmm3"',
@@ -434,7 +442,11 @@ _register_probe('probe_mips_fp_mov_cvt', {'mipsel': {'asm': '"mov.d    $f0, $f2\
 
 _register_probe('probe_mips_nop', {'mipsel': {'asm': '"nop\\n\\t"\n    "nop"',
             'clobbers': '"memory"',
-            'opcodes': ['SHL']}})
+            # MIPS spells `nop` as `sll $0, $0, 0` and the identity now
+            # answers the encoding rather than the shift form it borrows,
+            # so this probe asserts the class its own name states.  SHL
+            # keeps its subject in probe_mips_shift.
+            'opcodes': ['NOP']}})
 
 _register_probe('probe_x86_mov', {'x86_64': {'asm': '"mov %%rbx, %%rax"',
             'clobbers': '"rax"',

@@ -960,13 +960,13 @@ static const QemuIdentRow qemu_ident_x86[] = {
     { 0x0000053bu, "UD", QID_VERIFIED, false,
       { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
     { 0x0000053cu, "NOP", QID_STATED, false,
-      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v) -- the 3DNow! prefetch, decoded through gen_NOP; QEMU models no cache, so the rule emits nothing while the disassembler names the hint */
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v) -- the 3DNow! group's residue after the carve: ModRM.reg 0, 1 and 2 publish PREFETCH under qualified ids and reg 3..7 is a reserved encoding Capstone does not name.  The PREFETCH observation is the pre-carve census of the reg=0/1 encodings */
     { 0x0000053du, "EMMS", QID_STATED, false,
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0x00000543u, "3dnow", QID_STATED, false,
       { .opcode = GEN_OP_VEC_ALU_SHORT, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x00000545u, "NOP", QID_STATED, false,
-      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v) -- the SSE prefetch / reserved-NOP group, one row for prefetchnta, prefetcht0, prefetcht1, prefetcht2 and the reserved encodings beside them; as 0x0d, gen_NOP emits nothing */
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v) -- the SSE group's residue after the carve: ModRM.reg 0..3 publish PREFETCH under qualified ids, and reg 4..7 plus every mod=11 form is the reserved NOP the SDM defines and `nopl` is spelled for.  The PREFETCH observation is the pre-carve census */
     { 0x00000546u, "NOP", QID_STATED, false,
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x00000547u, "multi0F", QID_STATED, false,
@@ -1893,6 +1893,8 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_FP_SUB, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x47cdb165u, "decode-new/x87@1101101011011...", QID_STATED, false,
       { .opcode = GEN_OP_CMOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+    { 0x4a22ba75u, "decode-new/NOP@0f18,mod!=11,modrm=..000...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v), ModRM.reg=0 -- Intel SDM PREFETCHNTA m8; the row is named for gen_NOP, which is the lowering, and R16 keeps the lowering off the wire.  The reserved reg=4..7 forms of this same group reach no arm and keep the NOP the row states, which is what they are */
     { 0x4a367851u, "decode-new/x87@11011000..100...", QID_STATED, false,
       { .opcode = GEN_OP_FP_SUB, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x4a8332d7u, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=none", QID_STATED, false,
@@ -2021,6 +2023,8 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_FP_DIV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x8d36bb08u, "translate.c/multi0F@b=101,modrm=11001000", QID_STATED, false,
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+    { 0x8d5a7656u, "decode-new/NOP@0f0d,mod!=11,modrm=..010...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1340 [0x0d] ModRM.reg=2 -- Intel SDM PREFETCHWT1 m8; as reg=0 */
     { 0x8e9f2fc1u, "decode-new/x87@11011111..000...", QID_STATED, false,
       { .opcode = GEN_OP_FP_CVT, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x8f0f2a2fu, "decode-new/x87@1101111111101...", QID_STATED, false,
@@ -2089,14 +2093,22 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_VEC_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:551 X86_OP_ENTRY3(MOVD_from, ...) under PREFIX_VEX -- the VEX arm is `vmovd`, a vector-lane move, and the GEN_OP_MOV beside it is the name match that carving the two encodings apart exists to replace */
     { 0xb680040eu, "decode-new/MOVD_from@vex=1", QID_VERIFIED, false,
       { .opcode = GEN_OP_VEC_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
+    { 0xb7f68454u, "decode-new/NOP@0f0d,mod!=11,modrm=..001...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1340 [0x0d] ModRM.reg=1 -- AMD APM PREFETCHW m8, prefetch with intent to write; as reg=0 */
+    { 0xb820246eu, "decode-new/NOP@0f18,mod!=11,modrm=..001...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1349 [0x18] ModRM.reg=1 -- Intel SDM PREFETCHT0 m8; as reg=0 */
     { 0xbbb3e65cu, "decode-new/x87@1101100111101001", QID_VERIFIED, false,
       { .opcode = GEN_OP_FP_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xbbff3fa7u, "decode-new/x87@1101111111000...", QID_STATED, false,
       { .opcode = GEN_OP_FP_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xbcb3e7efu, "decode-new/x87@1101100111101000", QID_VERIFIED, false,
       { .opcode = GEN_OP_FP_MOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+    { 0xc1a0029bu, "decode-new/NOP@0f0d,mod!=11,modrm=..000...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v), ModRM.reg=0 -- AMD APM PREFETCH m8; the row is named for gen_NOP, which is the lowering, and R16 keeps the lowering off the wire */
     { 0xc1f82cd0u, "decode-new/x87@1101101111000...", QID_STATED, false,
       { .opcode = GEN_OP_CMOV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+    { 0xc3dfe114u, "decode-new/NOP@0f18,mod!=11,modrm=..010...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1349 [0x18] ModRM.reg=2 -- Intel SDM PREFETCHT1 m8; as reg=0 */
     { 0xc598d93au, "decode-new/x87@11011100..100...", QID_STATED, false,
       { .opcode = GEN_OP_FP_SUB, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xc7c62e3bu, "translate.c/multi0F@b=101,modrm=11011010", QID_STATED, false,
@@ -2209,6 +2221,8 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0xf98987cau, "decode-new/x87@11011010..111...", QID_STATED, false,
       { .opcode = GEN_OP_FP_DIV, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
+    { 0xfbdb8073u, "decode-new/NOP@0f18,mod!=11,modrm=..011...", QID_STATED, false,
+      { .opcode = GEN_OP_PREFETCH, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- decode-new.c.inc:1349 [0x18] ModRM.reg=3 -- Intel SDM PREFETCHT2 m8; as reg=0 */
     { 0xffce0a37u, "decode-new/x87@1101111011011001", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
 };

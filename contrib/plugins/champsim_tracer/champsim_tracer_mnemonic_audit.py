@@ -5578,6 +5578,19 @@ X86_IDENT_VEX = "target/i386/tcg/vex_ident.c.inc"
 # same reader the VEX rows use.
 X86_IDENT_CET = "target/i386/tcg/cet_ident.c.inc"
 
+# THE PREFETCH GROUPS SHARE THE NOP ROWS.  QEMU models no cache, so a
+# prefetch lowers to gen_NOP and the decode table names both group rows
+# `NOP`: [0x0d] = X86_OP_ENTRY1(NOP, M,v) for the 3DNow! group and
+# [0x18] = X86_OP_ENTRY1(NOP, nop,v) for the SSE group.  Two slots answer
+# for seven ISA-defined memory hints and for the reserved NOPs beside
+# them, and the only word either offers is the LOWERING -- which R16
+# forbids as trace content, and which is exactly how the class left the
+# wire once the STATED tier was admitted.
+# scripts/x86_prefetch_ident_instrument.py states the finer identity from
+# `s->modrm`; the rows are read here by the same reader the VEX and CET
+# rows use.
+X86_IDENT_PREFETCH = "target/i386/tcg/prefetch_ident.c.inc"
+
 # THE UNCONVERTED 0F SPACES SHARE FIVE ROWS BETWEEN FORTY-ONE
 # INSTRUCTIONS.  0F 00, 0F 01, 0F 1A, 0F 1B and the 0F C7 group are not
 # converted to the new decoder, so each is one X86_OP_ENTRY(multi0F, ...)
@@ -5763,6 +5776,7 @@ def parse_x86_identities() -> list[QemuIdent]:
     qualified = (parse_x86_qualified_identities()
                  + parse_x86_vex_identities(rows)
                  + parse_x86_cet_identities(rows)
+                 + parse_x86_prefetch_identities(rows)
                  + parse_x86_multi0f_identities())
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
@@ -5912,6 +5926,60 @@ def parse_x86_cet_identities(base: list[QemuIdent]) -> list[QemuIdent]:
             f"{path}: no identity rows matched -- the reader does not fit "
             f"this table, and reporting an empty universe would read as "
             f"'the reserved-NOP row carries only one instruction'")
+    return rows
+
+
+def parse_x86_prefetch_identities(base: list[QemuIdent]) -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED arms of the two NOP rows PREFETCH shares.
+
+    Same shape and the same checks as parse_x86_cet_identities(): the
+    row's provenance names the base slot, the base row's macro suffix
+    supplies the kind rather than this function inventing one, and a
+    carve whose slot no longer exists or now names a different rule is
+    REFUSED rather than aged out.
+
+    The refusal on an EMPTY table matters more here than anywhere else in
+    this file.  Without these rows the two slots state the word QEMU
+    lowers them to -- `NOP` -- for `prefetchnta` and `prefetcht0` alike,
+    and the whole x86 PREFETCH class leaves the wire while every count in
+    the census still reads clean.  That is not a hypothetical: it is what
+    the tables published between `da800e941e` and this reader existing.
+    """
+    path = ROOT / X86_IDENT_PREFETCH
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_prefetch_ident_instrument.py.  Without it the "
+            f"PREFETCH encodings report as unqualified and publish the "
+            f"NOP their row is named for, which is QEMU's lowering and "
+            f"not the instruction.")
+    by_slot = {r.ident: r for r in base}
+    rows: list[QemuIdent] = []
+    stale: list[str] = []
+    for r in _read_qualified_table(path, ""):
+        b = by_slot.get(r.src_line)
+        if b is None:
+            stale.append(f"{r.name}: base slot {r.src_line} carries no "
+                         f"X86_OP_* row")
+            continue
+        if b.name != r.pattern:
+            stale.append(f"{r.name}: base slot {r.src_line} now names "
+                         f"{b.name!r}")
+            continue
+        rows.append(dataclasses.replace(r, kind=b.kind))
+    if stale:
+        for why in stale:
+            print(f"  STALE PREFETCH ROW {why}")
+        raise SystemExit(
+            f"x86: {len(stale)} prefetch-qualified row(s) no longer match "
+            f"the decode table they were carved from -- re-run "
+            f"scripts/x86_prefetch_ident_instrument.py rather than joining "
+            f"an old carve to a new rule")
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'the prefetch groups carry only a NOP'")
     return rows
 
 
@@ -7669,23 +7737,43 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
         "whole 0F 01 group; the GEN_OP_NOP beside it is `xgetbv` and "
         "`xtest`, the two arms the corpus happened to execute",
 
-    # THE PREFETCH HINTS.  Both rows are the reserved-NOP generator:
-    # QEMU decodes the encoding, emits nothing, and the architecture
-    # allows exactly that because a prefetch is a hint.  The observation
-    # says PREFETCH because the disassembler names the hint the encoding
-    # carries.  Under R20 the row states what the rule QEMU dispatched
-    # does; the two are reading different levels of the same encoding
-    # and that is recorded rather than resolved by preference.
+    # THE TWO PREFETCH-GROUP BASE ROWS, AFTER THE CARVE.  What these
+    # rows now answer for is the RESIDUE of their groups: every hint the
+    # architecture defines reaches a row of its own out of
+    # scripts/x86_prefetch_ident_instrument.py, and what is left under
+    # the base slot is the reserved ModRM.reg space -- 0F 18 /4../7,
+    # which the SDM defines as a reserved NOP and binutils and Capstone
+    # both spell `nopl`, and 0F 0D /3../7, which Capstone rejects
+    # outright.  For that residue NOP is the architectural answer and
+    # not merely the lowering.
+    #
+    # The PREFETCH observation beside each row is the banked pair
+    # census, captured before the carve existed: every spelling in it --
+    # prefetchnta, prefetcht0, prefetcht1, prefetcht2, prefetchw -- is
+    # an encoding that now publishes a qualified id and no longer
+    # reaches this slot at all.  It is named here rather than deleted so
+    # the census stays the record of what was measured.
+    #
+    # THE OLD RULING ON THESE TWO ROWS IS RETRACTED.  It read "QEMU
+    # models no cache, so the rule emits nothing while the disassembler
+    # names the hint", and that is a statement about the emulator's
+    # lowering offered as a reason to publish NOP for an ISA-defined
+    # hint.  R16 forbids a lowering fact as trace content, and between
+    # `da800e941e` and this carve it took the whole x86 PREFETCH class
+    # off the wire -- the first REAL-LOST of this arc from the QEMU side
+    # rather than the Capstone side (exec97 FINDING 49-C).
     ("x86", "NOP@target/i386/tcg/decode-new.c.inc:1340"):
         "target/i386/tcg/decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v) -- "
-        "the 3DNow! prefetch, decoded through gen_NOP; QEMU models no "
-        "cache, so the rule emits nothing while the disassembler names "
-        "the hint",
+        "the 3DNow! group's residue after the carve: ModRM.reg 0, 1 and "
+        "2 publish PREFETCH under qualified ids and reg 3..7 is a "
+        "reserved encoding Capstone does not name.  The PREFETCH "
+        "observation is the pre-carve census of the reg=0/1 encodings",
     ("x86", "NOP@target/i386/tcg/decode-new.c.inc:1349"):
         "target/i386/tcg/decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v) -- "
-        "the SSE prefetch / reserved-NOP group, one row for "
-        "prefetchnta, prefetcht0, prefetcht1, prefetcht2 and the "
-        "reserved encodings beside them; as 0x0d, gen_NOP emits nothing",
+        "the SSE group's residue after the carve: ModRM.reg 0..3 publish "
+        "PREFETCH under qualified ids, and reg 4..7 plus every mod=11 "
+        "form is the reserved NOP the SDM defines and `nopl` is spelled "
+        "for.  The PREFETCH observation is the pre-carve census",
 
     # 0x63 WITHOUT REX.W.  decode_63() picks between three rows and this
     # is the third: `static const X86OpEntry mov = X86_OP_ENTRY3(MOV,
@@ -7722,6 +7810,51 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
         "2,w) -- the rule loads from DS:rSI and writes an I/O port; the "
         "GEN_OP_INT_ADD beside it is `outsd` answered with the pointer "
         "update",
+
+    # --- x86 -----------------------------------------------------------
+    # THE PREFETCH GROUPS.  decode-new.c.inc:1340 [0x0d] and :1349 [0x18]
+    # are both spelled X86_OP_ENTRY1(NOP, ...) because gen_NOP is what a
+    # prefetch LOWERS to on a machine with no cache.  The rows carved out
+    # of them by scripts/x86_prefetch_ident_instrument.py therefore peel
+    # to the pattern name `NOP`, and the NAME_MATCHED join answers the
+    # Capstone spelling of that name -- GEN_OP_NOP -- for every one of
+    # them.  The word beside each arm is the instruction: ModRM.reg is the
+    # group selector, the SDM and the APM define each hint on an m8
+    # operand, and Capstone, binutils and XED all name them.
+    #
+    # R16 decides which of the two is trace content.  `NOP` is a statement
+    # about QEMU's lowering; PREFETCHNTA is a statement about the ISA, and
+    # the ISA does not stop defining the hint because this emulator has
+    # nothing to prefetch into.  391e65d07f settles the same question on
+    # the register side.  The other three targets never had it to settle:
+    # aarch64 carries 31 PREFETCH rows (PLD, PLDW, PRFM), riscv 3 and mips
+    # 4, all in deciding tiers, so x86 publishing NOP for the same kind of
+    # instruction was an asymmetry no rule of this arc produced.
+    ("x86", "decode-new/NOP@0f0d,mod!=11,modrm=..000..."):
+        "decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v), "
+        "ModRM.reg=0 -- AMD APM PREFETCH m8; the row is named for gen_NOP, "
+        "which is the lowering, and R16 keeps the lowering off the wire",
+    ("x86", "decode-new/NOP@0f0d,mod!=11,modrm=..001..."):
+        "decode-new.c.inc:1340 [0x0d] ModRM.reg=1 -- AMD APM PREFETCHW m8, "
+        "prefetch with intent to write; as reg=0",
+    ("x86", "decode-new/NOP@0f0d,mod!=11,modrm=..010..."):
+        "decode-new.c.inc:1340 [0x0d] ModRM.reg=2 -- Intel SDM "
+        "PREFETCHWT1 m8; as reg=0",
+    ("x86", "decode-new/NOP@0f18,mod!=11,modrm=..000..."):
+        "decode-new.c.inc:1349 [0x18] = X86_OP_ENTRY1(NOP, nop,v), "
+        "ModRM.reg=0 -- Intel SDM PREFETCHNTA m8; the row is named for "
+        "gen_NOP, which is the lowering, and R16 keeps the lowering off "
+        "the wire.  The reserved reg=4..7 forms of this same group reach "
+        "no arm and keep the NOP the row states, which is what they are",
+    ("x86", "decode-new/NOP@0f18,mod!=11,modrm=..001..."):
+        "decode-new.c.inc:1349 [0x18] ModRM.reg=1 -- Intel SDM "
+        "PREFETCHT0 m8; as reg=0",
+    ("x86", "decode-new/NOP@0f18,mod!=11,modrm=..010..."):
+        "decode-new.c.inc:1349 [0x18] ModRM.reg=2 -- Intel SDM "
+        "PREFETCHT1 m8; as reg=0",
+    ("x86", "decode-new/NOP@0f18,mod!=11,modrm=..011..."):
+        "decode-new.c.inc:1349 [0x18] ModRM.reg=3 -- Intel SDM "
+        "PREFETCHT2 m8; as reg=0",
 
     ("riscv", "decode_insn32/lpad"):
         "insn32.decode:129 lpad label:20 00000 0010111, ahead of auipc in "

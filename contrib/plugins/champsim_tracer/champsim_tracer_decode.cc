@@ -1560,6 +1560,48 @@ void qemu_ident_shadow_report(GString *report)
     g_mutex_unlock(&g_qsh_sig_lock);
 }
 
+/*
+ * THE ONE REMAINING ROUTE TO THE ENUM TABLE, and it is a NAMED one.
+ *
+ * With the STATED tier admitted, every reason a decode identity could
+ * carry no class -- SPLIT, NAME_MATCHED, NONE, an id with no row -- reads
+ * 0 on all four targets.  What is left is decode_id == 0: QEMU exported
+ * NO identity, which it does deliberately when the translation it
+ * generated is not the instruction it was asked about (a translation that
+ * only RAISES; see the plugin-side rule).  A wrong-path walk reaches such
+ * bytes and the tracer classifies them anyway, so the enum row is still
+ * the answer for those and nothing else.
+ *
+ * Measured at this tip over the w19 corpus, wp0 and wp16: 18 decodes on
+ * two targets -- x86 `hlt` x12, aarch64 `udf` x6 -- and 0 everywhere
+ * else.  That is the whole live dependency on the four
+ * champsim_tracer_mnemonics_<isa>.h tables.
+ */
+static std::atomic<uint64_t> g_qid_enum_raise_only{0};
+/*
+ * MUST BE 0.  An identity WAS exported, and the row for it still carries
+ * no class.  Before the admission wave this was the ordinary case and the
+ * Capstone row quietly answered for it; now it is a defect with a
+ * generator that should have refused to emit the table, so it is REFUSED
+ * at the point of use rather than papered over -- the instruction
+ * publishes GEN_OP_UNKNOWN and says so in the sidecar.
+ *
+ * Falling back here would be the failure mode this whole arc is against:
+ * a second, quieter answer arriving from the key that is being retired,
+ * on exactly the rows nobody has looked at.
+ */
+static std::atomic<uint64_t> g_qid_abstain_refused{0};
+
+uint64_t qemu_ident_enum_raise_only(void)
+{
+    return g_qid_enum_raise_only.load(std::memory_order_relaxed);
+}
+
+uint64_t qemu_ident_abstain_refused(void)
+{
+    return g_qid_abstain_refused.load(std::memory_order_relaxed);
+}
+
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
@@ -1579,12 +1621,23 @@ static const InsnClassification *classify_insn_id(
         return q;
     }
 
-    if (active_insn_table && id < active_insn_table_size) {
-        const InsnClassification *c = &active_insn_table[id];
-        *opcode = c->opcode;
-        *branch_type = c->branch_type;
-        *flags = c->flags;
-        return c;
+    if (info->decode_id == 0 && cap) {
+        g_qid_enum_raise_only.fetch_add(1, std::memory_order_relaxed);
+        *opcode = cap->opcode;
+        *branch_type = cap->branch_type;
+        *flags = cap->flags;
+        return cap;
+    }
+
+    if (info->decode_id != 0) {
+        /*
+         * Counted here and reported as a must-be-0 row; the SIDECAR line
+         * comes from the caller, which already warns on every instruction
+         * it publishes as GEN_OP_UNKNOWN.  Warning again here would double
+         * both the log and the acceptance counter that reads it, which is
+         * the defect the note on warn_unknown_instruction describes.
+         */
+        g_qid_abstain_refused.fetch_add(1, std::memory_order_relaxed);
     }
 
     *opcode = GEN_OP_UNKNOWN;

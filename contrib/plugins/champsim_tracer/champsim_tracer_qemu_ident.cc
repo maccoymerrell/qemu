@@ -1124,10 +1124,25 @@ void qemu_ident_report(GString *report)
             "  SURVIVOR: row carries no class (NONE) %10" PRIu64 "\n"
             "  SURVIVOR: id carried, no row          %10" PRIu64 "\n"
             "  SURVIVOR: no identity exported (id 0) %10" PRIu64 "\n"
+            "    of those, ENUM-ANSWERED (raise-only)%10" PRIu64 "\n"
+            "  REFUSED: identity carried, row abstained (must be 0) %3"
+            PRIu64 "\n"
             "  HELD: this ISA's flip is not taken (must be 0) %5" PRIu64 "\n"
             "  decided rows carrying UNKNOWN (must be 0) %6" PRIu64 "\n"
             "  decided rows the Capstone row disputes    %10" PRIu64 "\n"
             "  decided %" PRIu64 " of %" PRIu64 " classified\n"
+            "    `no identity exported` is the ONE route left to the "
+            "Capstone-enum table, and it is a NAMED one: QEMU withholds an "
+            "identity when the translation it generated is not the "
+            "instruction it was asked about -- a translation that only "
+            "RAISES -- so there is no rule to key on and the enum row is "
+            "the answer for those and nothing else.  A wrong-path walk "
+            "reaches such bytes, which is why the count is not 0.\n"
+            "    REFUSED is a MUST-BE-0 row and it is the enum-abstain "
+            "fallback's replacement.  An identity WAS exported and its row "
+            "carries no class: that is a defect in a generated table, and "
+            "the classifier publishes GEN_OP_UNKNOWN rather than quietly "
+            "taking the answer of the key being retired.\n"
             "    HELD is a MUST-BE-0 row: all four targets are flipped, "
             "so a decode counted here is one whose TraceISA "
             "qemu_ident_key_flipped() does not name.\n"
@@ -1160,6 +1175,7 @@ void qemu_ident_report(GString *report)
             qemu_ident_adjudicated_hits(),
             sv.split, sv.name_matched, sv.none,
             sv.no_row, sv.no_ident,
+            qemu_ident_enum_raise_only(), qemu_ident_abstain_refused(),
             sv.isa_held, sv.decided_unknown, sv.cap_disagree,
             decided, decided + surv);
     }

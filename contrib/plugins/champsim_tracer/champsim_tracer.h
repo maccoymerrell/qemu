@@ -1592,6 +1592,32 @@ void qemu_ident_survivors(QemuIdentSurvivors *out);
 uint64_t qemu_ident_adjudicated_hits(void);
 
 /*
+ * THE ONLY ROUTE LEFT TO THE CAPSTONE-ENUM TABLE, and the row that says
+ * the route is a named one rather than a fallback.
+ *
+ * With QID_STATED admitted, every reason an identity could carry no class
+ * -- SPLIT, NAME_MATCHED, NONE, an id with no row -- reads 0 on all four
+ * targets.  What remains is decode_id == 0: QEMU exported NO identity,
+ * which it does deliberately when the translation it generated is not the
+ * instruction it was asked about, i.e. a translation that only RAISES.  A
+ * wrong-path walk reaches such bytes, the tracer classifies them anyway,
+ * and the enum row is the answer for those and for nothing else.
+ */
+uint64_t qemu_ident_enum_raise_only(void);
+
+/*
+ * MUST BE 0.  An identity WAS exported and its row still carries no class.
+ * That used to be the ordinary case, with the Capstone row quietly
+ * answering for it; it is now a defect in a generated table, and the
+ * classifier REFUSES rather than taking the other key's answer -- the
+ * instruction publishes GEN_OP_UNKNOWN and the caller's sidecar warning
+ * names it.  A silent second answer arriving from the key being retired,
+ * on exactly the rows nobody has looked at, is the failure this arc is
+ * against.
+ */
+uint64_t qemu_ident_abstain_refused(void);
+
+/*
  * The largest identity table is aarch64's 2,563 rows; the tally array is
  * sized for the widest and a row past it simply is not tallied per-row
  * (the total above still counts it).  Checked, not assumed: the reader

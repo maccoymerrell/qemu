@@ -10,6 +10,7 @@
 #include "exec/helper-gen.h"
 #include "internals.h"
 #include "cpu-features.h"
+#include "exec/insn-dataflow.h"
 
 /* internal defines */
 
@@ -696,12 +697,58 @@ static inline CPUARMTBFlags arm_tbflags_from_tb(const TranslationBlock *tb)
  * (see the comment in cpu.h for details). Return a TCGv_ptr which has
  * been set up to point to the requested field in the CPU state struct.
  */
+/*
+ * THE FP CONTROL AND STATUS THE INSTRUCTION OPERATES UNDER.
+ *
+ * Split out of fpstatus_ptr() below so that the handful of emitters which
+ * hand the helper tcg_env INSTEAD of a status pointer -- FMLAL and its
+ * siblings, which reach vfp.fp_status[FPST_A64] and vfp.fpcr from inside
+ * the helper -- can state the same fact in the same terms.  For those, the
+ * pointer the walk would have followed does not exist at all.
+ */
+static inline void note_fpstatus_read(ARMFPStatusFlavour flavour)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUARMState, vfp.fp_status[flavour]),
+        sizeof(((CPUARMState *)0)->vfp.fp_status[0]));
+}
+
 static inline TCGv_ptr fpstatus_ptr(ARMFPStatusFlavour flavour)
 {
     TCGv_ptr statusptr = tcg_temp_new_ptr();
     int offset = offsetof(CPUARMState, vfp.fp_status[flavour]);
 
     tcg_gen_addi_ptr(statusptr, tcg_env, offset);
+
+    /*
+     * THE FP CONTROL AND STATUS THE INSTRUCTION OPERATES UNDER, stated here
+     * because here is where the fact is: this function exists for one
+     * purpose, to hand a floating-point helper the status word its result
+     * depends on, and every caller is an instruction that reads the rounding
+     * mode, the flush-to-zero and default-NaN behaviour, or both.
+     *
+     * WHAT IT REPLACES.  The pointer built above is an ADDRESS computed from
+     * tcg_env, not a read of the bytes it addresses, so the read reaches the
+     * ordered list only through the helper's own usage row -- and only where
+     * that row exists and carries an argument size.  Measured on the sled at
+     * PASS 49, that made the answer a property of the TABLE rather than of
+     * the architecture: `ucvtf` published REG_FCSR on 1,248 encodings of one
+     * decode rule and not on the 1,824 beside them, three widths of one
+     * instruction disagreeing about a register all three of them read.  That
+     * is the same shape a76f8026d6 found on x86 div/idiv, and it has the same
+     * answer -- state it at the site that knows, once, for every form.
+     *
+     * BY RANGE, because the range IS the register: it is the offsetof()/
+     * sizeof() pair insn_dataflow_declare_regfile("fp_status", ...) already
+     * takes in translate-a64.c, so the declaration that names every other
+     * access to these bytes names this one too and there is no second
+     * spelling to keep in step.  (The predicate file is stated by NAME for
+     * the opposite reason: it is not declared, and declaring it would rename
+     * accesses whose direction the extraction cannot see.)
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    note_fpstatus_read(flavour);
     return statusptr;
 }
 

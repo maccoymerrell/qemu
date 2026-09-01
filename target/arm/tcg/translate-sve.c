@@ -264,6 +264,15 @@ static bool gen_gvec_env_zzzz(DisasContext *s, gen_helper_gvec_4_ptr *fn,
                               int rd, int rn, int rm, int ra,
                               int data)
 {
+    /*
+     * These helpers are handed tcg_env INSTEAD of a status pointer and reach
+     * vfp.fp_status[] and vfp.fpcr from inside -- is_ebf() reads FPCR.EBF and
+     * copies the A64 status word before every BFDOT/BFMMLA, and the FMLAL
+     * family reads FPCR.AH and FPCR.FZ16 the same way.  There is no pointer
+     * for the walk to follow, so the fact is stated; see note_fpstatus_read()
+     * in translate.h.
+     */
+    note_fpstatus_read(FPST_A64);
     return gen_gvec_ptr_zzzz(s, fn, rd, rn, rm, ra, data, tcg_env);
 }
 
@@ -7474,9 +7483,12 @@ TRANS_FEAT(FLOGB, aa64_sve2, gen_gvec_fpst_arg_zpz, flogb_fns[a->esz],
 
 static bool do_FMLAL_zzzw(DisasContext *s, arg_rrrr_esz *a, bool sub, bool sel)
 {
-    return gen_gvec_ptr_zzzz(s, gen_helper_sve2_fmlal_zzzw_s,
+    /* gen_gvec_env_zzzz() is this call with the env pointer folded in; it
+     * is used here so that the FP status these helpers read out of env is
+     * stated in one place for the whole class. */
+    return gen_gvec_env_zzzz(s, gen_helper_sve2_fmlal_zzzw_s,
                              a->rd, a->rn, a->rm, a->ra,
-                             (sel << 1) | sub, tcg_env);
+                             (sel << 1) | sub);
 }
 
 TRANS_FEAT(FMLALB_zzzw, aa64_sve2, do_FMLAL_zzzw, a, false, false)
@@ -7486,9 +7498,9 @@ TRANS_FEAT(FMLSLT_zzzw, aa64_sve2, do_FMLAL_zzzw, a, true, true)
 
 static bool do_FMLAL_zzxw(DisasContext *s, arg_rrxr_esz *a, bool sub, bool sel)
 {
-    return gen_gvec_ptr_zzzz(s, gen_helper_sve2_fmlal_zzxw_s,
+    return gen_gvec_env_zzzz(s, gen_helper_sve2_fmlal_zzxw_s,
                              a->rd, a->rn, a->rm, a->ra,
-                             (a->index << 2) | (sel << 1) | sub, tcg_env);
+                             (a->index << 2) | (sel << 1) | sub);
 }
 
 TRANS_FEAT(FMLALB_zzxw, aa64_sve2, do_FMLAL_zzxw, a, false, false)

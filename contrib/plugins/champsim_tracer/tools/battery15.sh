@@ -21,8 +21,8 @@
 #    2-5  smoke x4 ISAs              run + strict decode + audit + vacuity,
 #                                    every trace compressed, read from
 #                                    cst_audit's own member line
-#    6  must0_scan                   every "MUST BE 0" row in the four
-#                                    sidecars
+#    6  must0_scan                   every "MUST BE 0" row in EVERY sidecar
+#                                    this run produces -- see the scope note
 #    7-10 val_gate x4 ISAs           the seed-driven validator, per ISA
 #   11  net_validator_gate           the golden-net corpus
 #   12  src_loss_gate                the PER-PC source-loss gate
@@ -137,11 +137,51 @@ selftest() {
     if [ "$f" -nt "$b" ]; then ok "L restore moves MTIME FORWARD (ninja relinks)"
     else bad "L restore left the old mtime -- a planted build would survive"; fi
 
+    # M/N/O: THE MANDATORY ROWS.  A --rows run that leaves out a row which
+    # guards the wire must be RED, not quietly narrower.  This is the exact
+    # shape that let the PREFETCH class off the wire: the wave ran rows 7-10,
+    # reported "validator all seed 4242 rc=0", and never ran row 11 -- the
+    # only standing row whose corpus contains a prefetch, and the row that
+    # was red on exactly those encodings.
+    RCFILE="$scratch/rc2.txt"; : > "$RCFILE"; RED=0
+    ROWS="1,14"
+    for m in $MANDATORY; do
+        selected "$m" || record "$m" 2 "MANDATORY ROW NOT SELECTED"
+    done
+    t "M omitting a mandatory row turns the battery RED" "$RED" 1
+    t "N ...and every omitted mandatory row is NAMED" \
+      "$(grep -c 'MANDATORY ROW NOT SELECTED' "$RCFILE")" \
+      "$(set -- $MANDATORY; echo $#)"
+    RCFILE="$scratch/rc3.txt"; : > "$RCFILE"; RED=0
+    ROWS="all"
+    for m in $MANDATORY; do
+        selected "$m" || record "$m" 2 "MANDATORY ROW NOT SELECTED"
+    done
+    t "O a full battery records no mandatory omission" "$RED" 0
+    # P: row 11 is in the set.  Named explicitly, because the set is only
+    # worth having if the row the defect went through is a member.
+    case " $MANDATORY " in
+      *" 11 "*) ok "P row 11 (net_validator_gate) is MANDATORY" ;;
+      *) bad "P row 11 is NOT mandatory -- the set does not cover the defect" ;;
+    esac
+    n=$((n+1))
+    ROWS="all"
+
     echo "arms=$n failures=$fails"
     [ "$fails" -eq 0 ]
 }
 
 # ------------------------------------------------------------- primitives --
+# THE MANDATORY ROWS.  A row here may be deselected, but deselecting it is
+# RED: it is recorded rc=2 with its reason, so a partial battery cannot read
+# as a bar.  Row 11 is the reason the set exists -- it is the only standing
+# row whose corpus reaches an x86 prefetch, it was RED at 391e65d07f on
+# exactly those encodings, and the wave that put them on the wrong side of
+# the wire reported "validator all seed 4242 rc=0" (rows 7-10) and never ran
+# it.  Row 15 joins it because it is the only per-encoding opcode gate, and
+# row 6 because its scan is what reads every sidecar the run produced.
+MANDATORY="6 11 15"
+
 # A row is selected when --rows was not given, or names it, or names its
 # parent (so 12b rides on 12 and nobody has to list both).
 selected() {
@@ -278,16 +318,38 @@ if selected 2 || selected 6; then
 fi
 
 # ---- ROW 6: the must-be-0 scan ------------------------------------------
-if selected 6; then
-    if [ "$smoke_done" -eq 1 ]; then
-        "$PY" "$T/arc3_cov/instruments/must0_scan.py" \
-              "$O"/smoke/{x86_64,aarch64,riscv64,mipsel}.stats.log \
-              > "$O/MUST0.txt" 2>&1
-        record 6 $? "must0_scan over the four sidecars"
-    else
-        record 6 2 "must0_scan -- the smoke rows produced no sidecar"
+#
+# THE SCOPE WAS THE BUG, NOT THE SCANNER (exec97 FINDING 49-D).  This row
+# read exactly four sidecars -- the four smoke runs -- for as long as it has
+# existed.  verify47 filed a published-source witness (`0000054b NOP
+# REG_GPR2/REG_GPR5`, `nopl`, #331) as a class "the standing corpora are
+# blind to", and PASS 48 confirmed it by scanning thirty-six sidecars and
+# reading NON-ZERO 0.  Pointed at all 291 sidecars a pass produces, the same
+# scanner finds the witness sitting on two SHADOW cells -- a corpus that runs
+# every pass -- and finds four more non-zero rows on the R13 probe sidecars.
+# Neither the instrument nor the corpora were blind; the four paths were.
+#
+# So the row now scans every *.stats.log under the run directory, whatever
+# produced it, and the count of files is reported so a shrinking scope is
+# visible in the record rather than in nobody's memory.  It runs LAST of the
+# rows that write sidecars -- placement below, at the end of the file -- so
+# that the validator, the net gate and the four per-encoding gates have all
+# left theirs behind by the time it looks.
+#
+# A row that finds NO sidecar at all is REFUSED, not passed: that is the
+# standing rule, and it is the rule this scope violated by construction.
+run_row6() {
+    local n
+    mapfile -t M0 < <(find "$O" -name '*.stats.log' -type f | sort)
+    n=${#M0[@]}
+    if [ "$n" -eq 0 ]; then
+        record 6 2 "must0_scan -- no sidecar anywhere under the run directory"
+        return
     fi
-fi
+    "$PY" "$T/arc3_cov/instruments/must0_scan.py" "${M0[@]}" \
+          > "$O/MUST0.txt" 2>&1
+    record 6 $? "must0_scan over $n sidecar(s) -- every *.stats.log this run produced"
+}
 
 # ---- ROWS 7-10: the validator, four ISAs --------------------------------
 if selected 7; then
@@ -426,9 +488,33 @@ if selected 15; then
     "$PY" "$T/arc3_cov/instruments/opcenc_ab.py" --selftest > "$O/opcenc_selftest.log" 2>&1
     record 15s $? "opcenc_ab --selftest"
     if need_dir "$WORKLOAD" "the workload directory (--workload-dir)"; then
-        "$T/opcenc_loss_gate.sh" capture "$Q" "$O/opce/armA" "$WORKLOAD" > "$O/opce_capA.log" 2>&1
+        # THE GATE'S CORPUS MAY NOT BE NARROWER THAN THE WIRE IT GUARDS.
+        # w19's four guests are 31,325 encodings and contain no prefetch, so
+        # this gate scored the x86 PREFETCH class off the wire and read "0
+        # unadjudicated moves" -- correctly, about a population that could
+        # not contain the instruction (exec97 FINDING 49-C).  Row 11 has just
+        # built the golden-net cells, which do contain it, so they are handed
+        # to both captures as extra guests.
+        #
+        # The list is derived from what is on disk, not written down: a cell
+        # that stops being generated drops out of the corpus and the
+        # per-cell counts in the capture's own RC.txt say so, where a
+        # hard-coded list would keep naming it and refuse.  A missing NET
+        # root is not fatal here -- row 11 owns that verdict and is
+        # mandatory -- but the widening is REPORTED either way, because a
+        # gate whose population silently narrowed is the whole defect.
+        NETROOT=${CST_NET_WORK_ROOT:-/mnt/md0/QEMU/cst_runs/valunify/golden_wr}/netval
+        NETCELLS=()
+        for isa in x86_64 aarch64 riscv64 mipsel; do
+            while IFS= read -r cb; do
+                [ -x "$cb" ] && NETCELLS+=("$isa:$cb")
+            done < <(find "$NETROOT" -type f -name "*_$isa" 2>/dev/null | sort)
+        done
+        record 15w $([ "${#NETCELLS[@]}" -gt 0 ] && echo 0 || echo 1) \
+            "opcenc corpus widened by ${#NETCELLS[@]} golden-net cell(s) beside the 4 w19 guests"
+        "$T/opcenc_loss_gate.sh" capture "$Q" "$O/opce/armA" "$WORKLOAD" ${NETCELLS[@]+"${NETCELLS[@]}"} > "$O/opce_capA.log" 2>&1
         record 15A $? "opcenc capture A"
-        "$T/opcenc_loss_gate.sh" capture "$Q" "$O/opce/armB" "$WORKLOAD" > "$O/opce_capB.log" 2>&1
+        "$T/opcenc_loss_gate.sh" capture "$Q" "$O/opce/armB" "$WORKLOAD" ${NETCELLS[@]+"${NETCELLS[@]}"} > "$O/opce_capB.log" 2>&1
         record 15B $? "opcenc capture B"
         "$T/opcenc_loss_gate.sh" compare "$Q" "$O/opce/armA/corpus.tsv" \
             "$O/opce/armB/corpus.tsv" > "$O/opce.log" 2>&1
@@ -490,6 +576,25 @@ PYEOF
     else
         record 15 2 "opcenc_loss_gate -- no workload directory"
     fi
+fi
+
+# ---- THE MANDATORY ROWS ---------------------------------------------------
+# A mandatory row that was not selected is RED, with its reason on the
+# record.  --rows stays useful for chasing one row; it just cannot produce a
+# green transcript while a row that guards the wire went unrun.
+for m in $MANDATORY; do
+    selected "$m" || record "$m" 2 \
+        "MANDATORY ROW NOT SELECTED -- a battery that skips it is not a bar"
+done
+
+# ---- ROW 6, RUN HERE ------------------------------------------------------
+# Defined above, invoked here: the scan is over EVERY sidecar this run
+# produced, so it must run after the last row that produces one.  Selecting
+# row 6 without the rows that write sidecars is still legal and still
+# refuses if nothing was written, which is the honest answer to "scan what
+# this run made" when the run made nothing.
+if selected 6; then
+    run_row6
 fi
 
 # ---- close ---------------------------------------------------------------

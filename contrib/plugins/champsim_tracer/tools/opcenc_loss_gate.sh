@@ -2,8 +2,25 @@
 # THE PER-ENCODING OPCODE-CLASS GATE: does a candidate change move, or erase,
 # the GenericOpcode an encoding publishes?
 #
-#   opcenc_loss_gate.sh capture <build-dir> <out-dir> <workload-dir>
+#   opcenc_loss_gate.sh capture <build-dir> <out-dir> <workload-dir> \
+#                                                     [<isa>:<guest> ...]
 #   opcenc_loss_gate.sh compare <build-dir> <A-corpus.tsv> <B-corpus.tsv>
+#
+# THE CORPUS MAY NOT BE NARROWER THAN THE WIRE IT GUARDS.  Until PASS 49 the
+# capture read exactly four guests -- the w19 `prog`, `prog.a64`, `prog.rv64`
+# and `prog.mipsel` -- and that population is 31,325 encodings against the
+# 64,441 the golden net and the shadow census actually run.  w19 executes no
+# prefetch, so when the x86 PREFETCH class left the wire this gate scored the
+# change and reported "0 unadjudicated moves", correctly, about a population
+# that could not contain the instruction.  A count over the two corpora, not
+# an inference about them: encodings whose mnemonic contains "prefetch",
+# w19 corpus 0, wide corpus 16.
+#
+# So the capture takes EXTRA GUESTS: any number of `<isa>:<path>` arguments
+# after the workload directory, each captured on the same terms as the four
+# -- both wp settings, every repeat, merged into the same per-ISA union with
+# the same conflict refusal.  The battery hands it the golden-net cells it
+# has just built, which is where the prefetch lives.
 #
 # WHY IT IS A STANDING ROW BESIDE srcenc_loss_gate.sh AND NOT A ONE-OFF.
 # PASS 45 named the hole in one line -- "no loss instrument can see an
@@ -119,6 +136,26 @@ case $mode in
 capture)
     out=${1:?output directory}
     wl=${2:?workload directory (prog, prog.a64, prog.rv64, prog.mipsel)}
+    shift 2
+    # EXTRA GUESTS, `<isa>:<path>`.  Validated here rather than at use: a
+    # typo'd ISA would otherwise silently contribute nothing and the gate
+    # would report a corpus that quietly lost a cell, which is the exact
+    # failure this widening exists to fix.
+    declare -A EXTRA=()
+    for spec in "$@"; do
+        eisa=${spec%%:*}; epath=${spec#*:}
+        case " $ISAS " in
+            *" $eisa "*) ;;
+            *) echo "opcenc_loss_gate: REFUSED -- extra guest '$spec' names" \
+                    "ISA '$eisa', which is not one of: $ISAS" >&2; exit 2 ;;
+        esac
+        if [ ! -f "$epath" ]; then
+            echo "opcenc_loss_gate: REFUSED -- extra guest '$spec' does not" \
+                 "exist.  A capture that cannot find its guest FAILS." >&2
+            exit 2
+        fi
+        EXTRA[$eisa]="${EXTRA[$eisa]:-} $epath"
+    done
     mkdir -p "$out" || exit 2
     : > "$out/RC.txt"
     echo "SO_SHA=$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" \
@@ -132,9 +169,15 @@ capture)
                  | tee -a "$out/RC.txt"
             exit 2
         fi
+        # The w19 guest is cell 0; every extra guest for this ISA follows it.
+        # They are captured on identical terms and merge into one per-ISA
+        # union, so the widening changes the POPULATION and nothing else.
+        cell=-1
+        for guest in "${BIN[$isa]}" ${EXTRA[$isa]:-}; do
+        cell=$((cell+1))
         for wp in $WPS; do
           for rep in $(seq 1 "$REPEATS"); do
-            d=$out/$isa.wp$wp.r$rep.tsv
+            d=$out/$isa.c$cell.wp$wp.r$rep.tsv
             # compress= on every trace this writes (the I/O rule); the trace
             # itself is a by-product here and is removed after the run, but a
             # harness that writes one uncompressed is how the rule rots.
@@ -145,8 +188,8 @@ capture)
             ( cd "$out" && setarch -R env -i CST_OPC_ENC_DUMP=cst_enc_dump.tsv \
                 "$build/qemu-$isa" -seed "$SEED" -pid "$PIDBASE" \
                 -plugin "$build/contrib/plugins/libchampsim_tracer.so,outfile=cst_enc_trace,wp=$wp,compress=zstd -T0 -3 -q -c" \
-                "${BIN[$isa]}" > /dev/null \
-                2> "$isa.wp$wp.r$rep.stats.log" )
+                "$guest" > /dev/null \
+                2> "$isa.c$cell.wp$wp.r$rep.stats.log" )
             rc=$?
             mv -f "$out/cst_enc_dump.tsv" "$d" 2>/dev/null || :
             # The plugin writes its exit report to <outfile>.stats.log, and
@@ -155,18 +198,20 @@ capture)
             # Named per cell here: an exit report a reader cannot attribute
             # to a run is not evidence.
             mv -f "$out/cst_enc_trace.stats.log" \
-                  "$out/$isa.wp$wp.r$rep.exit.log" 2>/dev/null || :
+                  "$out/$isa.c$cell.wp$wp.r$rep.exit.log" 2>/dev/null || :
             mv -f "$out/cst_enc_trace.unknown_warnings.log" \
-                  "$out/$isa.wp$wp.r$rep.unknown.log" 2>/dev/null || :
+                  "$out/$isa.c$cell.wp$wp.r$rep.unknown.log" 2>/dev/null || :
             n=$(grep -vc '^#' "$d" 2>/dev/null)
             [ -n "$n" ] || n=0
             if [ "$n" -le 0 ]; then
-                echo "opcenc_loss_gate: REFUSED -- $isa wp$wp repeat $rep" \
-                     "produced no corpus rows.  An empty corpus is not a" \
-                     "short one." | tee -a "$out/RC.txt"
+                echo "opcenc_loss_gate: REFUSED -- $isa cell $cell" \
+                     "($guest) wp$wp repeat $rep produced no corpus rows." \
+                     "An empty corpus is not a short one." \
+                     | tee -a "$out/RC.txt"
                 exit 2
             fi
-            echo "dump $isa wp$wp r$rep rc=$rc encodings=$n" >> "$out/RC.txt"
+            echo "dump $isa c$cell wp$wp r$rep rc=$rc encodings=$n" \
+                 >> "$out/RC.txt"
             rm -f "$out/cst_enc_trace.cst"
           done
           # THE INSTABILITY, MEASURED AT THE POINT IT HAPPENS.  Repeat 1 is
@@ -174,18 +219,20 @@ capture)
           # many encodings one capture alone would have missed.  A zero here
           # says the wrong-path reach was stable on this cell; a non-zero is
           # the number a single-capture arm would have been comparing with.
-          u=$(cat "$out"/$isa.wp$wp.r*.tsv | grep -v '^#' | cut -f2 \
+          u=$(cat "$out"/$isa.c$cell.wp$wp.r*.tsv | grep -v '^#' | cut -f2 \
               | sort -u | wc -l)
-          o=$(grep -v '^#' "$out/$isa.wp$wp.r1.tsv" | cut -f2 | sort -u | wc -l)
-          echo "repeat-spread $isa wp$wp union=$u first_capture=$o" \
+          o=$(grep -v '^#' "$out/$isa.c$cell.wp$wp.r1.tsv" | cut -f2 \
+              | sort -u | wc -l)
+          echo "repeat-spread $isa c$cell wp$wp union=$u first_capture=$o" \
                "missed_by_one_capture=$((u - o))" >> "$out/RC.txt"
+        done
         done
     done
     # MERGE per ISA.  sort -u collapses identical rows; an encoding left with
     # two DIFFERENT rows is a conflict the instrument refuses on, and it is
     # reported here too so the capture names it at the point it was made.
     for isa in $ISAS; do
-        cat "$out"/$isa.wp*.r*.tsv | grep -v '^#' | sort -u \
+        cat "$out"/$isa.c*.wp*.r*.tsv | grep -v '^#' | sort -u \
             > "$out/$isa.merged.tsv"
         dup=$(cut -f2 "$out/$isa.merged.tsv" | sort | uniq -d | wc -l)
         echo "merge $isa encodings=$(wc -l < "$out/$isa.merged.tsv")" \

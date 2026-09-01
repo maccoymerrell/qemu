@@ -2829,6 +2829,43 @@ static void gen_note_st0_read(void)
     insn_dataflow_note_stated_read_name("st0");
 }
 
+/*
+ * ST(i), THE STACK OPERAND THE ENCODING NAMES.
+ *
+ * The block above states ST(0), the implicit operand.  This states the
+ * EXPLICIT one, and it is the same fact for the same reason: the helper is
+ * handed the whole `fpregs` array, the extraction sees the container, and a
+ * stated container justifies a published member without supplying one.
+ * Measured with the operand walk's read arm deleted, `faddp`, `fcmovb`,
+ * `fxch`, `fucomi`, `fcompp` and the register-operand arithmetic all lose
+ * their REG_FPR<i> -- 34,464 registers over the class.
+ *
+ * WHY A NAME AND NOT A RANGE, again.  env->fpregs is indexed by PHYSICAL
+ * register and ST(i) is relative to env->fpstt, so no offset names an ST(i);
+ * the file's declaration says exactly that.  But `st<i>` IS the name -- the
+ * GDB stub answers st<n> by reading env->fpregs[(env->fpstt + n) & 7], so
+ * the stub's spelling is TOP-relative in precisely the way the encoding's
+ * ST(i) is, and @i here is the ModRM r/m field the instruction carries.
+ *
+ * PLACED AT THE HELPER CALLS THAT TAKE THE INDEX, never once per
+ * instruction.  `ffree %st(i)` and `ffreep %st(i)` are NOT annotated: they
+ * mark the tag word empty and never look at the value, so ST(i) is not a
+ * source of theirs and stating it would fabricate.  `fld %st(i)` is not
+ * annotated either -- QEMU pushes BEFORE the move, so the index the helper
+ * receives is one past the one the encoding names, and a statement here
+ * would have to reason about the push to be right; it stays in the ledger.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_sti_read(int i)
+{
+    static const char *const st_names[8] = {
+        "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+    };
+
+    insn_dataflow_note_stated_read_name(st_names[i & 7]);
+}
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -3081,6 +3118,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x29: /* fxchg4 sti, undocumented op */
         case 0x39: /* fxchg7 sti, undocumented op */
             gen_note_st0_read();
+            gen_note_sti_read(opreg);
             gen_helper_fxchg_ST0_STN(tcg_env, tcg_constant_i32(opreg));
             break;
         case 0x0a: /* grp d9/2 */
@@ -3164,7 +3202,10 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 gen_helper_f2xm1(tcg_env);
                 break;
             case 1: /* fyl2x */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fyl2x(tcg_env);
                 break;
             case 2: /* fptan */
@@ -3172,7 +3213,10 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 gen_helper_fptan(tcg_env);
                 break;
             case 3: /* fpatan */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fpatan(tcg_env);
                 break;
             case 4: /* fxtract */
@@ -3180,7 +3224,10 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 gen_helper_fxtract(tcg_env);
                 break;
             case 5: /* fprem1 */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fprem1(tcg_env);
                 break;
             case 6: /* fdecstp */
@@ -3195,11 +3242,17 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x0f: /* grp d9/7 */
             switch (rm) {
             case 0: /* fprem */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fprem(tcg_env);
                 break;
             case 1: /* fyl2xp1 */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fyl2xp1(tcg_env);
                 break;
             case 2: /* fsqrt */
@@ -3211,7 +3264,10 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 gen_helper_fsincos(tcg_env);
                 break;
             case 5: /* fscale */
+                /* Two-operand: ST(1) is the other multiplicand /
+                 * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
+                gen_note_sti_read(1);
                 gen_helper_fscale(tcg_env);
                 break;
             case 4: /* frndint */
@@ -3237,11 +3293,15 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 
                 op1 = op & 7;
                 if (op >= 0x20) {
+                    /* `fxxx %st,%st(i)`: both operands, result into ST(i). */
+                    gen_note_st0_read();
+                    gen_note_sti_read(opreg);
                     gen_helper_fp_arith_STN_ST0(op1, opreg);
                     if (op >= 0x30) {
                         gen_helper_fpop(tcg_env);
                     }
                 } else {
+                    gen_note_sti_read(opreg);
                     gen_helper_fmov_FT0_STN(tcg_env,
                                             tcg_constant_i32(opreg));
                     gen_note_st0_read();
@@ -3251,6 +3311,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x02: /* fcom */
         case 0x22: /* fcom2, undocumented op */
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fcom_ST0_FT0(tcg_env);
@@ -3258,6 +3319,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x03: /* fcomp */
         case 0x23: /* fcomp3, undocumented op */
         case 0x32: /* fcomp5, undocumented op */
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fcom_ST0_FT0(tcg_env);
@@ -3266,6 +3328,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x15: /* da/5 */
             switch (rm) {
             case 1: /* fucompp */
+                gen_note_sti_read(1);
                 gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(1));
                 gen_note_st0_read();
                 gen_helper_fucom_ST0_FT0(tcg_env);
@@ -3301,6 +3364,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 goto illegal_op;
             }
             gen_update_cc_op(s);
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fucomi_ST0_FT0(tcg_env);
@@ -3311,6 +3375,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 goto illegal_op;
             }
             gen_update_cc_op(s);
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fcomi_ST0_FT0(tcg_env);
@@ -3332,11 +3397,13 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             gen_helper_fpop(tcg_env);
             break;
         case 0x2c: /* fucom st(i) */
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fucom_ST0_FT0(tcg_env);
             break;
         case 0x2d: /* fucomp st(i) */
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fucom_ST0_FT0(tcg_env);
@@ -3345,6 +3412,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x33: /* de/3 */
             switch (rm) {
             case 1: /* fcompp */
+                gen_note_sti_read(1);
                 gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(1));
                 gen_note_st0_read();
                 gen_helper_fcom_ST0_FT0(tcg_env);
@@ -3375,6 +3443,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 goto illegal_op;
             }
             gen_update_cc_op(s);
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fucomi_ST0_FT0(tcg_env);
@@ -3386,6 +3455,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 goto illegal_op;
             }
             gen_update_cc_op(s);
+            gen_note_sti_read(opreg);
             gen_helper_fmov_FT0_STN(tcg_env, tcg_constant_i32(opreg));
             gen_note_st0_read();
             gen_helper_fcomi_ST0_FT0(tcg_env);
@@ -3410,6 +3480,14 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 op1 = fcmov_cc[op & 3] | (((op >> 3) & 1) ^ 1);
                 l1 = gen_new_label();
                 gen_jcc_noeob(s, op1, l1);
+                /*
+                 * R17: a conditional carries ALL its potential sources, so
+                 * ST(i) is stated whether or not the condition takes -- and
+                 * ST(0) with it, because the arm that does not take LEAVES
+                 * ST(0) alone, which makes the destination its own source.
+                 */
+                gen_note_st0_read();
+                gen_note_sti_read(opreg);
                 gen_helper_fmov_ST0_STN(tcg_env,
                                         tcg_constant_i32(opreg));
                 gen_set_label(l1);

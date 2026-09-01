@@ -1187,16 +1187,16 @@ LD1RO_zpri      1010010 .. 01 0.... 001 ... ..... ..... \
                 @rpri_load_msz nreg=0
 
 # SVE 32-bit gather prefetch (scalar plus 32-bit scaled offsets)
-PRF_ns          1000010 00 -1 ----- 0-- --- ----- 0 ----
+PRF_ns          1000010 00 -1 ----- 0-- pg:3 ----- 0 ----
 
 # SVE 32-bit gather prefetch (vector plus immediate)
-PRF_ns          1000010 -- 00 ----- 111 --- ----- 0 ----
+PRF_ns          1000010 -- 00 ----- 111 pg:3 ----- 0 ----
 
 # SVE contiguous prefetch (scalar plus immediate)
-PRF             1000010 11 1- ----- 0-- --- ----- 0 ----
+PRF             1000010 11 1- ----- 0-- pg:3 ----- 0 ----
 
 # SVE contiguous prefetch (scalar plus scalar)
-PRF_rr          1000010 -- 00 rm:5 110 --- ----- 0 ----
+PRF_rr          1000010 -- 00 rm:5 110 pg:3 ----- 0 ----
 
 ### SVE Memory 64-bit Gather Group
 
@@ -1227,13 +1227,13 @@ LD1_zpiz        1100010 .. 01 ..... 1.. ... ..... ..... \
                 @rpri_g_load esz=3
 
 # SVE 64-bit gather prefetch (scalar plus 64-bit scaled offsets)
-PRF_ns          1100010 00 11 ----- 1-- --- ----- 0 ----
+PRF_ns          1100010 00 11 ----- 1-- pg:3 ----- 0 ----
 
 # SVE 64-bit gather prefetch (scalar plus unpacked 32-bit scaled offsets)
-PRF_ns          1100010 00 -1 ----- 0-- --- ----- 0 ----
+PRF_ns          1100010 00 -1 ----- 0-- pg:3 ----- 0 ----
 
 # SVE 64-bit gather prefetch (vector plus immediate)
-PRF_ns          1100010 -- 00 ----- 111 --- ----- 0 ----
+PRF_ns          1100010 -- 00 ----- 111 pg:3 ----- 0 ----
 
 ### SVE Memory Store Group
 

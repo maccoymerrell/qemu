@@ -279,6 +279,52 @@ static bool gen_gvec_env_arg_zzxz(DisasContext *s, gen_helper_gvec_4_ptr *fn,
     return gen_gvec_env_zzzz(s, fn, a->rd, a->rn, a->rm, a->ra, a->index);
 }
 
+/*
+ * A PREDICATE REGISTER THE ENCODING NAMES AS A SOURCE, stated by NAME.
+ *
+ * A predicate number is an encoding field, so the emulator resolves it at
+ * TRANSLATION time and never reads it as a register: it either hands the
+ * helper a POINTER computed from tcg_env -- an address, not a read of the
+ * bytes it addresses -- or it loads those bytes directly at a constant
+ * offset that nothing names, because the predicate file is not declared
+ * (see below for why it is not).  Either way QEMU's ordered read list comes
+ * out without the register the encoding spelled, and this is precisely the
+ * shape insn_dataflow_note_stated_read_name() exists for.
+ *
+ * IT IS CALLED ONLY WHERE THE SITE KNOWS THE REGISTER IS A SOURCE.  Pd is a
+ * destination on every form below and is never stated here; where a form
+ * reads its own destination -- PFIRST/PNEXT's Pdn, BRKA/BRKB merging -- the
+ * site says so itself.  That per-site knowledge is the whole reason the
+ * name form is used instead of a declaration, which cannot tell the two
+ * apart.
+ *
+ * BY NAME AND NOT BY RANGE, which was measured rather than chosen.  The
+ * range form needs the predicate file declared, and declaring it renames
+ * every OTHER access to those bytes as well -- including the pointer a
+ * predicate-producing helper is handed, whose direction the extraction
+ * cannot see and conservatively counts as a read.  Three `whilelo`
+ * encodings then published their own destination predicate as a source, a
+ * register the instruction does not read: a fabrication, and one introduced
+ * by the declaration rather than found by it.  The name form states the one
+ * fact this site knows and reinterprets nothing else.
+ *
+ * FFR is pregs[16] in QEMU's storage so that it can be handled as any other
+ * predicate; the architecture and the GDB stub both call it `ffr`, which is
+ * why the spellings are listed rather than pasted from an index.
+ */
+static const char * const sve_pred_names[17] = {
+    "p0",  "p1",  "p2",  "p3",  "p4",  "p5",  "p6",  "p7",
+    "p8",  "p9",  "p10", "p11", "p12", "p13", "p14", "p15",
+    "ffr",
+};
+
+static void note_sve_pred_read(int pg)
+{
+    if (pg >= 0 && pg < (int)ARRAY_SIZE(sve_pred_names)) {
+        insn_dataflow_note_stated_read_name(sve_pred_names[pg]);
+    }
+}
+
 /* Invoke an out-of-line helper on 4 Zregs, 1 Preg, plus fpst. */
 static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
                                 int rd, int rn, int rm, int ra, int pg,
@@ -289,7 +335,11 @@ static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
-        TCGv_ptr status = fpstatus_ptr(flavour);
+        TCGv_ptr status;
+
+        /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
+        note_sve_pred_read(pg);
+        status = fpstatus_ptr(flavour);
 
         tcg_gen_gvec_5_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
@@ -310,6 +360,9 @@ static bool gen_gvec_ool_zzp(DisasContext *s, gen_helper_gvec_3 *fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+
+        /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
+        note_sve_pred_read(pg);
         tcg_gen_gvec_3_ool(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            pred_full_reg_offset(s, pg),
@@ -339,7 +392,11 @@ static bool gen_gvec_fpst_zzp(DisasContext *s, gen_helper_gvec_3_ptr *fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
-        TCGv_ptr status = fpstatus_ptr(flavour);
+        TCGv_ptr status;
+
+        /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
+        note_sve_pred_read(pg);
+        status = fpstatus_ptr(flavour);
 
         tcg_gen_gvec_3_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
@@ -365,6 +422,9 @@ static bool gen_gvec_ool_zzzp(DisasContext *s, gen_helper_gvec_4 *fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+
+        /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
+        note_sve_pred_read(pg);
         tcg_gen_gvec_4_ool(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            vec_full_reg_offset(s, rm),
@@ -390,7 +450,11 @@ static bool gen_gvec_fpst_zzzp(DisasContext *s, gen_helper_gvec_4_ptr *fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
-        TCGv_ptr status = fpstatus_ptr(flavour);
+        TCGv_ptr status;
+
+        /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
+        note_sve_pred_read(pg);
+        status = fpstatus_ptr(flavour);
 
         tcg_gen_gvec_4_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
@@ -496,6 +560,15 @@ static bool gen_gvec_fn_ppp(DisasContext *s, GVecGen3Fn *gvec_fn,
 {
     if (sve_access_check(s)) {
         unsigned psz = pred_gvec_reg_size(s);
+
+        /*
+         * The two SOURCE predicates.  The gvec expander reads them out of
+         * the env at a constant offset, which is a read the walk sees but
+         * cannot name; rd is the destination and is not stated.
+         */
+        note_sve_pred_read(rn);
+        note_sve_pred_read(rm);
+
         gvec_fn(MO_64, pred_full_reg_offset(s, rd),
                 pred_full_reg_offset(s, rn),
                 pred_full_reg_offset(s, rm), psz, psz);
@@ -508,6 +581,8 @@ static bool do_mov_p(DisasContext *s, int rd, int rn)
 {
     if (sve_access_check(s)) {
         unsigned psz = pred_gvec_reg_size(s);
+
+        note_sve_pred_read(rn);
         tcg_gen_gvec_mov(MO_8, pred_full_reg_offset(s, rd),
                          pred_full_reg_offset(s, rn), psz, psz);
     }
@@ -854,6 +929,7 @@ static bool do_vpz_ool(DisasContext *s, arg_rpr_esz *a,
     t_zn = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
 
+    note_sve_pred_read(a->pg);
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     fn(temp, t_zn, t_pg, desc);
@@ -1066,6 +1142,7 @@ static bool do_zpzzz_ool(DisasContext *s, arg_rprrr_esz *a,
 {
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+        note_sve_pred_read(a->pg);
         tcg_gen_gvec_5_ool(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->ra),
                            vec_full_reg_offset(s, a->rn),
@@ -1265,6 +1342,16 @@ static bool do_pppp_flags(DisasContext *s, arg_rprr_s *a,
     int mofs = pred_full_reg_offset(s, a->rm);
     int gofs = pred_full_reg_offset(s, a->pg);
 
+    /*
+     * THE THREE SOURCE PREDICATES of a predicate logical operation.  Every
+     * lowering below reads all three -- the whole-file gvec op, the 64-bit
+     * temp path and the flag-setting path alike -- so they are stated once,
+     * here, and the read list does not depend on which arm was taken.
+     */
+    note_sve_pred_read(a->rn);
+    note_sve_pred_read(a->rm);
+    note_sve_pred_read(a->pg);
+
     if (!a->s) {
         tcg_gen_gvec_4(dofs, nofs, mofs, gofs, psz, psz, gvec_op);
         return true;
@@ -1411,6 +1498,10 @@ static bool trans_SEL_pppp(DisasContext *s, arg_rprr_s *a)
     }
     if (sve_access_check(s)) {
         unsigned psz = pred_gvec_reg_size(s);
+
+        note_sve_pred_read(a->pg);
+        note_sve_pred_read(a->rn);
+        note_sve_pred_read(a->rm);
         tcg_gen_gvec_bitsel(MO_8, pred_full_reg_offset(s, a->rd),
                             pred_full_reg_offset(s, a->pg),
                             pred_full_reg_offset(s, a->rn),
@@ -1547,6 +1638,9 @@ static bool trans_PTEST(DisasContext *s, arg_PTEST *a)
         int nofs = pred_full_reg_offset(s, a->rn);
         int gofs = pred_full_reg_offset(s, a->pg);
         int words = DIV_ROUND_UP(pred_full_reg_size(s), 8);
+
+        note_sve_pred_read(a->pg);
+        note_sve_pred_read(a->rn);
 
         if (words == 1) {
             TCGv_i64 pn = tcg_temp_new_i64();
@@ -1719,6 +1813,15 @@ static bool do_pfirst_pnext(DisasContext *s, arg_rr_esz *a,
 
     desc = FIELD_DP32(desc, PREDDESC, OPRSZ, pred_full_reg_size(s));
     desc = FIELD_DP32(desc, PREDDESC, ESZ, a->esz);
+
+    /*
+     * PFIRST and PNEXT are `Pdn, Pg, Pdn`: the architecture names the
+     * destination as a source too, and the helper reads it through t_pd
+     * before it writes.  Both are stated, in the order the encoding gives
+     * them.
+     */
+    note_sve_pred_read(a->rn);
+    note_sve_pred_read(a->rd);
 
     tcg_gen_addi_ptr(t_pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2061,6 +2164,7 @@ static void do_cpy_m(DisasContext *s, int esz, int rd, int rn, int pg,
     TCGv_ptr t_zn = tcg_temp_new_ptr();
     TCGv_ptr t_pg = tcg_temp_new_ptr();
 
+    note_sve_pred_read(pg);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
@@ -2104,6 +2208,8 @@ static bool trans_CPY_z_i(DisasContext *s, arg_CPY_z_i *a)
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+
+        note_sve_pred_read(a->pg);
         tcg_gen_gvec_2i_ool(vec_full_reg_offset(s, a->rd),
                             pred_full_reg_offset(s, a->pg),
                             tcg_constant_i64(a->imm),
@@ -2307,6 +2413,9 @@ static bool do_perm_pred3(DisasContext *s, arg_rrr_esz *a, bool high_odd,
     desc = FIELD_DP32(desc, PREDDESC, ESZ, a->esz);
     desc = FIELD_DP32(desc, PREDDESC, DATA, high_odd);
 
+    note_sve_pred_read(a->rn);
+    note_sve_pred_read(a->rm);
+
     tcg_gen_addi_ptr(t_d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_n, tcg_env, pred_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(t_m, tcg_env, pred_full_reg_offset(s, a->rm));
@@ -2326,6 +2435,8 @@ static bool do_perm_pred2(DisasContext *s, arg_rr_esz *a, bool high_odd,
     TCGv_ptr t_d = tcg_temp_new_ptr();
     TCGv_ptr t_n = tcg_temp_new_ptr();
     uint32_t desc = 0;
+
+    note_sve_pred_read(a->rn);
 
     tcg_gen_addi_ptr(t_d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2440,6 +2551,7 @@ static void find_last_active(DisasContext *s, TCGv_i32 ret, int esz, int pg)
     desc = FIELD_DP32(desc, PREDDESC, OPRSZ, pred_full_reg_size(s));
     desc = FIELD_DP32(desc, PREDDESC, ESZ, esz);
 
+    note_sve_pred_read(pg);
     tcg_gen_addi_ptr(t_p, tcg_env, pred_full_reg_offset(s, pg));
 
     gen_helper_sve_last_active_element(ret, t_p, tcg_constant_i32(desc));
@@ -2762,6 +2874,7 @@ static bool do_ppzz_flags(DisasContext *s, arg_rprr_esz *a,
     zm = tcg_temp_new_ptr();
     pg = tcg_temp_new_ptr();
 
+    note_sve_pred_read(a->pg);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(zm, tcg_env, vec_full_reg_offset(s, a->rm));
@@ -2835,6 +2948,7 @@ static bool do_ppzi_flags(DisasContext *s, arg_rpri_esz *a,
     zn = tcg_temp_new_ptr();
     pg = tcg_temp_new_ptr();
 
+    note_sve_pred_read(a->pg);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(pg, tcg_env, pred_full_reg_offset(s, a->pg));
@@ -2886,6 +3000,10 @@ static bool do_brk3(DisasContext *s, arg_rprr_s *a,
     TCGv_ptr g = tcg_temp_new_ptr();
     TCGv_i32 desc = tcg_constant_i32(FIELD_DP32(0, PREDDESC, OPRSZ, vsz));
 
+    note_sve_pred_read(a->pg);
+    note_sve_pred_read(a->rn);
+    note_sve_pred_read(a->rm);
+
     tcg_gen_addi_ptr(d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(n, tcg_env, pred_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(m, tcg_env, pred_full_reg_offset(s, a->rm));
@@ -2902,7 +3020,8 @@ static bool do_brk3(DisasContext *s, arg_rprr_s *a,
 }
 
 static bool do_brk2(DisasContext *s, arg_rpr_s *a,
-                    gen_helper_gvec_3 *fn, gen_helper_gvec_flags_3 *fn_s)
+                    gen_helper_gvec_3 *fn, gen_helper_gvec_flags_3 *fn_s,
+                    bool rd_is_src)
 {
     if (!sve_access_check(s)) {
         return true;
@@ -2915,6 +3034,20 @@ static bool do_brk2(DisasContext *s, arg_rpr_s *a,
     TCGv_ptr n = tcg_temp_new_ptr();
     TCGv_ptr g = tcg_temp_new_ptr();
     TCGv_i32 desc = tcg_constant_i32(FIELD_DP32(0, PREDDESC, OPRSZ, vsz));
+
+    /*
+     * BRKA/BRKB with MERGING predication, and BRKN, read the destination:
+     * `BRKA Pd.B, Pg/M, Pn.B` leaves the inactive elements of Pd unchanged
+     * and `BRKN Pdn.B, Pg/Z, Pm.B, Pdn.B` spells Pdn out twice.  The
+     * ZEROING forms do not, and stating Pd for them would name a register
+     * the encoding does not read.  @rd_is_src is where that difference is
+     * held, because do_brk2() itself cannot see it.
+     */
+    note_sve_pred_read(a->pg);
+    note_sve_pred_read(a->rn);
+    if (rd_is_src) {
+        note_sve_pred_read(a->rd);
+    }
 
     tcg_gen_addi_ptr(d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2936,17 +3069,17 @@ TRANS_FEAT(BRKPB, aa64_sve, do_brk3, a,
            gen_helper_sve_brkpb, gen_helper_sve_brkpbs)
 
 TRANS_FEAT(BRKA_m, aa64_sve, do_brk2, a,
-           gen_helper_sve_brka_m, gen_helper_sve_brkas_m)
+           gen_helper_sve_brka_m, gen_helper_sve_brkas_m, true)
 TRANS_FEAT(BRKB_m, aa64_sve, do_brk2, a,
-           gen_helper_sve_brkb_m, gen_helper_sve_brkbs_m)
+           gen_helper_sve_brkb_m, gen_helper_sve_brkbs_m, true)
 
 TRANS_FEAT(BRKA_z, aa64_sve, do_brk2, a,
-           gen_helper_sve_brka_z, gen_helper_sve_brkas_z)
+           gen_helper_sve_brka_z, gen_helper_sve_brkas_z, false)
 TRANS_FEAT(BRKB_z, aa64_sve, do_brk2, a,
-           gen_helper_sve_brkb_z, gen_helper_sve_brkbs_z)
+           gen_helper_sve_brkb_z, gen_helper_sve_brkbs_z, false)
 
 TRANS_FEAT(BRKN, aa64_sve, do_brk2, a,
-           gen_helper_sve_brkn, gen_helper_sve_brkns)
+           gen_helper_sve_brkn, gen_helper_sve_brkns, true)
 
 /*
  *** SVE Predicate Count Group
@@ -2955,6 +3088,15 @@ TRANS_FEAT(BRKN, aa64_sve, do_brk2, a,
 static void do_cntp(DisasContext *s, TCGv_i64 val, int esz, int pn, int pg)
 {
     unsigned psz = pred_full_reg_size(s);
+
+    /*
+     * Both predicates, stated once for BOTH lowerings.  The narrow arm below
+     * reads them with ld_i64 at an offset nothing names and the wide arm
+     * hands the helper pointers; a read list that differed between the two
+     * would be a regime-shaped answer to an architectural question.
+     */
+    note_sve_pred_read(pg);
+    note_sve_pred_read(pn);
 
     if (psz <= 8) {
         uint64_t psz_mask;
@@ -3602,6 +3744,7 @@ static bool do_reduce(DisasContext *s, arg_rpr_esz *a,
     t_zn = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
 
+    note_sve_pred_read(a->pg);
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
@@ -3682,6 +3825,7 @@ static bool do_ppz_fp(DisasContext *s, arg_rpr_esz *a,
         TCGv_ptr status =
             fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
 
+        note_sve_pred_read(a->pg);
         tcg_gen_gvec_3_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            pred_full_reg_offset(s, a->pg),
@@ -3748,6 +3892,7 @@ static bool trans_FADDA(DisasContext *s, arg_rprr_esz *a)
     t_val = load_esz(tcg_env, vec_reg_offset(s, a->rn, 0, a->esz), a->esz);
     t_rm = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
+    note_sve_pred_read(a->pg);
     tcg_gen_addi_ptr(t_rm, tcg_env, vec_full_reg_offset(s, a->rm));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->pg));
     t_fpst = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
@@ -3846,6 +3991,7 @@ static void do_fp_scalar(DisasContext *s, int zd, int zn, int pg, bool is_fp16,
     t_zd = tcg_temp_new_ptr();
     t_zn = tcg_temp_new_ptr();
     t_pg = tcg_temp_new_ptr();
+    note_sve_pred_read(pg);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, zd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, zn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
@@ -3924,6 +4070,7 @@ static bool do_fp_cmp(DisasContext *s, arg_rprr_esz *a,
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
         TCGv_ptr status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
+        note_sve_pred_read(a->pg);
         tcg_gen_gvec_4_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm),
@@ -4081,6 +4228,7 @@ static bool do_frint_mode(DisasContext *s, arg_rpr_esz *a,
     }
 
     vsz = vec_full_reg_size(s);
+    note_sve_pred_read(a->pg);
     status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
     tmode = gen_set_rmode(mode, status);
 
@@ -4406,6 +4554,14 @@ static bool trans_STR_pri(DisasContext *s, arg_rri *a)
     if (sve_access_check(s)) {
         int size = pred_full_reg_size(s);
         int off = pred_full_reg_offset(s, a->rd);
+
+        /*
+         * `str p3, [x0]` writes the predicate to memory: the encoding's
+         * `rd` field is this instruction's SOURCE.  gen_sve_str() reaches
+         * it through env loads at an offset nothing names, so the read is
+         * in the op stream and still comes out anonymous.
+         */
+        note_sve_pred_read(a->rd);
         gen_sve_str(s, tcg_env, off, size, a->rn, a->imm * size);
     }
     return true;
@@ -4454,41 +4610,6 @@ uint32_t make_svemte_desc(DisasContext *s, unsigned vsz, uint32_t nregs,
         desc <<= SVE_MTEDESC_SHIFT;
     }
     return simd_desc(vsz, vsz, desc | data);
-}
-
-/*
- * The GOVERNING PREDICATE, stated by NAME.
- *
- * Pg is an encoding field, so the emulator resolves it at TRANSLATION time
- * and hands the helper a POINTER computed from tcg_env -- an address, not a
- * read of the bytes it addresses -- which is precisely the shape
- * insn_dataflow_note_stated_read_name() exists for.
- *
- * BY NAME AND NOT BY RANGE, which was measured rather than chosen.  The
- * range form needs the predicate file declared, and declaring it renames
- * every OTHER access to those bytes as well -- including the pointer a
- * predicate-producing helper is handed, whose direction the extraction
- * cannot see and conservatively counts as a read.  Three `whilelo`
- * encodings then published their own destination predicate as a source, a
- * register the instruction does not read: a fabrication, and one introduced
- * by the declaration rather than found by it.  The name form states the one
- * fact this site knows and reinterprets nothing else.
- *
- * FFR is pregs[16] in QEMU's storage so that it can be handled as any other
- * predicate; the architecture and the GDB stub both call it `ffr`, which is
- * why the spellings are listed rather than pasted from an index.
- */
-static const char * const sve_pred_names[17] = {
-    "p0",  "p1",  "p2",  "p3",  "p4",  "p5",  "p6",  "p7",
-    "p8",  "p9",  "p10", "p11", "p12", "p13", "p14", "p15",
-    "ffr",
-};
-
-static void note_sve_pred_read(int pg)
-{
-    if (pg >= 0 && pg < (int)ARRAY_SIZE(sve_pred_names)) {
-        insn_dataflow_note_stated_read_name(sve_pred_names[pg]);
-    }
 }
 
 static void do_mem_zpa(DisasContext *s, int zt, int pg, TCGv_i64 addr,
@@ -4936,6 +5057,15 @@ static void do_ldrq(DisasContext *s, int zt, int pg, TCGv_i64 addr, int dtype)
         addr = clean_data_tbi(s, addr);
     }
 
+    /*
+     * The GOVERNING PREDICATE.  On the wide-vector path below QEMU copies
+     * its leading bits into `preg_tmp` and hands the helper a pointer to
+     * THAT, so the op stream names a scratch slot where the encoding named
+     * p<n>; on the narrow path the pointer is an address, not a read.
+     * Either way the register the encoding spells is stated here.
+     */
+    note_sve_pred_read(pg);
+
     poff = pred_full_reg_offset(s, pg);
     if (vsz > 16) {
         /*
@@ -5019,6 +5149,8 @@ static void do_ldro(DisasContext *s, int zt, int pg, TCGv_i64 addr, int dtype)
     if (!s->mte_active[0]) {
         addr = clean_data_tbi(s, addr);
     }
+
+    note_sve_pred_read(pg);
 
     poff = pred_full_reg_offset(s, pg);
     if (vsz > 32) {
@@ -5113,6 +5245,14 @@ static bool trans_LD1R_zpri(DisasContext *s, arg_rpri_load *a)
     }
 
     over = gen_new_label();
+
+    /*
+     * The GOVERNING PREDICATE, stated for BOTH arms of the test below: the
+     * narrow one reads it with ld_i64 at an offset nothing names, the wide
+     * one passes it to find_last_active().  Whether the load happens at all
+     * is this register's answer.
+     */
+    note_sve_pred_read(a->pg);
 
     /* If the guarding predicate has no bits set, no load occurs.  */
     if (psz <= 8) {
@@ -5967,12 +6107,34 @@ static bool trans_STNT1_zprz(DisasContext *s, arg_ST1_zprz *a)
  * Prefetches
  */
 
+/*
+ * THE GOVERNING PREDICATE OF A PREFETCH.
+ *
+ * QEMU models an SVE prefetch as a nop, so these three emitters produce no
+ * op at all and the extraction has nothing to walk.  That is a MODELLING
+ * decision about the memory system, not a statement that the instruction
+ * reads nothing: the encoding names Pg in bits 12:10 on every prefetch form
+ * and the architecture predicates the access on it.  R15 says a lowering
+ * decision is not architectural truth and R16 says an ISA-defined dependency
+ * is recorded whatever the emulator chose to do with it, so the register the
+ * encoding spells is stated here.
+ *
+ * Pg is why the decode patterns now NAME the field they used to discard.
+ * The base and offset registers are deliberately NOT stated: bits 9:5 are a
+ * general register on the scalar-plus-offset shapes and a VECTOR on the
+ * vector-plus-immediate ones, one decodetree argument set covers both, and a
+ * single name for the two would put the wrong register file on the wire.
+ * That is an open row with a reason, not a silent gap.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
 static bool trans_PRF(DisasContext *s, arg_PRF *a)
 {
     if (!dc_isar_feature(aa64_sve, s)) {
         return false;
     }
     /* Prefetch is a nop within QEMU.  */
+    note_sve_pred_read(a->pg);
     (void)sve_access_check(s);
     return true;
 }
@@ -5983,6 +6145,7 @@ static bool trans_PRF_rr(DisasContext *s, arg_PRF_rr *a)
         return false;
     }
     /* Prefetch is a nop within QEMU.  */
+    note_sve_pred_read(a->pg);
     (void)sve_access_check(s);
     return true;
 }
@@ -5993,6 +6156,7 @@ static bool trans_PRF_ns(DisasContext *s, arg_PRF_ns *a)
         return false;
     }
     /* Prefetch is a nop within QEMU.  */
+    note_sve_pred_read(a->pg);
     s->is_nonstreaming = true;
     (void)sve_access_check(s);
     return true;
@@ -7347,6 +7511,15 @@ static bool trans_PSEL(DisasContext *s, arg_psel *a)
     dbit = tcg_temp_new_i64();
     didx = tcg_temp_new_i64();
     ptr = tcg_temp_new_ptr();
+
+    /*
+     * `psel pd, pn, pm.<T>[wv, #imm]` reads BOTH source predicates: Pm
+     * supplies the selecting bit and Pn the value copied under it.  Pm is
+     * reached through a pointer built from tcg_env and Pn by a gvec op at
+     * an offset nothing names, so neither survives into the read list.
+     */
+    note_sve_pred_read(a->pn);
+    note_sve_pred_read(a->pm);
 
     /* Compute the predicate element. */
     tcg_gen_addi_i64(tmp, cpu_reg(s, a->rv), a->imm);

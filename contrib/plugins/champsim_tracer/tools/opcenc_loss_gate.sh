@@ -55,9 +55,33 @@ py=${CST_PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}
 inst=$here/arc3_cov/instruments/opcenc_ab.py
 led=${CST_OPCENC_LEDGER:-$here/opcenc_loss_adjudicated.txt}
 ISAS="x86_64 aarch64 riscv64 mipsel"
+# THE COVERAGE PRECONDITION IS NOT FREE, AND IT WAS NOT STABLE.
+#
+# This gate refuses unless the two arms cover the SAME encodings, which is
+# right: a class comparison over two different populations is not readable.
+# But exec96 ran the control that had never been run -- ONE build, TWO
+# captures, compared against each other -- and it REFUSED: x86_64 only_A=1
+# only_B=6, aarch64 only_B=4, riscv64 only_A=13 only_B=2.  The arms were the
+# same binary.
+#
+# The moving part is the WRONG PATH.  A wrong-path excursion walks whatever
+# bytes the redirected pc lands on, and some of those addresses hold data the
+# guest has not written yet, so a handful of the encodings the sweep reaches
+# differ between two runs of one binary.  It is a few rows in seven thousand,
+# and that is exactly what makes it dangerous: a REFUSED verdict reads as "the
+# change moved the population" when it can just as easily be this.
+#
+# So the corpus is a UNION OVER REPEATS.  Every repeat is a real capture and
+# a union invents nothing: an encoding in the corpus was reached by some run.
+# The per-repeat coverage delta is PRINTED rather than smoothed away, because
+# the instability is a fact about the instrument that a reader has to be able
+# to see; and the conflict check is unchanged, so an encoding two repeats
+# disagree about is still a refusal and never a last-writer-wins.
 # The wrong path is part of the subject, so wp=0 alone would be the carve-out
 # this gate exists to remove.  Both settings, always.
 WPS=${CST_OPCENC_WPS:-"0 16"}
+# Repeats per (isa, wp); see THE COVERAGE PRECONDITION note above.
+REPEATS=${CST_OPCENC_REPEATS:-3}
 
 case $mode in
 capture)
@@ -77,31 +101,45 @@ capture)
             exit 2
         fi
         for wp in $WPS; do
-            d=$out/$isa.wp$wp.tsv
+          for rep in $(seq 1 "$REPEATS"); do
+            d=$out/$isa.wp$wp.r$rep.tsv
             # compress= on every trace this writes (the I/O rule); the trace
             # itself is a by-product here and is removed after the run, but a
             # harness that writes one uncompressed is how the rule rots.
             CST_OPC_ENC_DUMP="$d" setarch -R "$build/qemu-$isa" \
                 -plugin "$build/contrib/plugins/libchampsim_tracer.so,outfile=$out/t_$isa,wp=$wp,compress=zstd -T0 -3 -q -c" \
-                "${BIN[$isa]}" > /dev/null 2> "$out/$isa.wp$wp.stats.log"
+                "${BIN[$isa]}" > /dev/null \
+                2> "$out/$isa.wp$wp.r$rep.stats.log"
             rc=$?
             n=$(grep -vc '^#' "$d" 2>/dev/null)
             [ -n "$n" ] || n=0
             if [ "$n" -le 0 ]; then
-                echo "opcenc_loss_gate: REFUSED -- $isa wp$wp produced no" \
-                     "corpus rows.  An empty corpus is not a short one." \
-                     | tee -a "$out/RC.txt"
+                echo "opcenc_loss_gate: REFUSED -- $isa wp$wp repeat $rep" \
+                     "produced no corpus rows.  An empty corpus is not a" \
+                     "short one." | tee -a "$out/RC.txt"
                 exit 2
             fi
-            echo "dump $isa wp$wp rc=$rc encodings=$n" >> "$out/RC.txt"
+            echo "dump $isa wp$wp r$rep rc=$rc encodings=$n" >> "$out/RC.txt"
             rm -f "$out/t_$isa.cst"
+          done
+          # THE INSTABILITY, MEASURED AT THE POINT IT HAPPENS.  Repeat 1 is
+          # scored against the union of all repeats for this (isa, wp): how
+          # many encodings one capture alone would have missed.  A zero here
+          # says the wrong-path reach was stable on this cell; a non-zero is
+          # the number a single-capture arm would have been comparing with.
+          u=$(cat "$out"/$isa.wp$wp.r*.tsv | grep -v '^#' | cut -f2 \
+              | sort -u | wc -l)
+          o=$(grep -v '^#' "$out/$isa.wp$wp.r1.tsv" | cut -f2 | sort -u | wc -l)
+          echo "repeat-spread $isa wp$wp union=$u first_capture=$o" \
+               "missed_by_one_capture=$((u - o))" >> "$out/RC.txt"
         done
     done
     # MERGE per ISA.  sort -u collapses identical rows; an encoding left with
     # two DIFFERENT rows is a conflict the instrument refuses on, and it is
     # reported here too so the capture names it at the point it was made.
     for isa in $ISAS; do
-        cat "$out"/$isa.wp*.tsv | grep -v '^#' | sort -u > "$out/$isa.merged.tsv"
+        cat "$out"/$isa.wp*.r*.tsv | grep -v '^#' | sort -u \
+            > "$out/$isa.merged.tsv"
         dup=$(cut -f2 "$out/$isa.merged.tsv" | sort | uniq -d | wc -l)
         echo "merge $isa encodings=$(wc -l < "$out/$isa.merged.tsv")" \
              "conflicting_encodings=$dup" >> "$out/RC.txt"

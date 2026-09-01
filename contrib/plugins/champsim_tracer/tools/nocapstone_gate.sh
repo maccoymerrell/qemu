@@ -64,6 +64,13 @@ NINJA_JOBS=${NINJA_JOBS:-12}
 TARGETS="x86_64-linux-user,aarch64-linux-user,riscv64-linux-user,mipsel-linux-user,x86_64-softmmu,aarch64-softmmu,riscv64-softmmu,mipsel-softmmu"
 ISAS="x86_64 aarch64 riscv64 mipsel"
 
+# The standing I/O rule: a harness in this tree writes its traces compressed.
+# Set where the plugin option string is built, so the battery stage cannot
+# omit it by forgetting to pass it -- the same shape the six Python drivers
+# and the two pin scripts carry.  cst_audit reads the compressed member
+# transparently, so nothing downstream of the run changes.
+CST_COMPRESS=${CST_COMPRESS:-"zstd -T0 -3 -q -c"}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-dir) BUILD_DIR=$2; shift 2 ;;
@@ -332,7 +339,8 @@ stage_battery() {
         # The smoke arm has to prove the plugin produces a decodable,
         # auditable trace on this ISA; the validator battery is the richer
         # subject and runs separately against the same build.
-        "$emu" -plugin "$so,outfile=$cell/s" /bin/true > "$cell/run.log" 2>&1
+        "$emu" -plugin "$so,outfile=$cell/s,compress=$CST_COMPRESS" \
+            /bin/true > "$cell/run.log" 2>&1
         local rrc=$?
         if [ "$rrc" != 0 ]; then
             fail "battery/$isa: run rc=$rrc (see $cell/run.log)"; ok=0; continue

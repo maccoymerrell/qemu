@@ -3144,19 +3144,19 @@ The
 compressed-special band holds the classes that are one register rather
 than a bank: ``REG_BOUND0..3``, ``REG_ACC0..3``, ``REG_ZERO``,
 ``REG_MATRIX``, ``REG_SYS``, ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``,
-``REG_SSP`` and ``REG_LLRES``.
+and ``REG_SSP``.
 
-``REG_LLRES`` is the load-reserved / load-linked reservation, the
-address half of the exclusive monitor: the MIPS LLbit and its address,
-the RISC-V reservation set, the AArch64 local exclusive monitor.  A
-store-conditional succeeds if and only if the reservation its
-load-linked established is still held, so the pair carries a
-dependency the ISA defines and the register class is what expresses
-it.  The VALUE half an emulator keeps beside it — a copy of what the
-load returned, so that store-conditional can be lowered onto a
-compare-and-swap — is not architectural state and has no ID: real
-hardware keeps no such copy, and a consumer must not read one from
-this class.
+The exclusive monitor has no ID in either half.  A load-linked writes
+a reservation and its store-conditional succeeds only while that
+reservation is held, but the reservation is not a register: it is
+state the implementation keeps, an ``ll`` and its ``sc`` name real
+registers, and the edge between them is the consumer's to model.  What
+the trace does carry for the pair is the store-conditional's own
+address register, recorded through the emitter that computes it rather
+than through the monitor the emulator routes it via.  The value copy an
+emulator keeps beside the reservation — so that store-conditional can
+be lowered onto a compare-and-swap — is likewise absent: real hardware
+keeps no such copy, and a consumer must not read one from any class.
 
 Two registers that a renaming regfile would not have to order against
 each other never share an ID.  System and control registers are spread

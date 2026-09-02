@@ -445,44 +445,59 @@ enum GenericRegId {
      *               self-dependency — on the instruction whose entire
      *               purpose is comparing those two.
      *
-     *   REG_LLRES   the LOAD-RESERVED / LOAD-LINKED RESERVATION — the
-     *               address half of the exclusive monitor: MIPS'
-     *               LLbit-and-address (env->lladdr), the RISC-V
-     *               reservation set (env->load_res) and AArch64's
-     *               exclusive monitor (env->exclusive_addr).  The ISA
-     *               DEFINES load-linked / store-conditional through
-     *               this state: `sc` succeeds if and only if the
-     *               reservation the matching `ll` established is still
-     *               held, so an SC really does read what an LL wrote
-     *               and a trace without it shows two instructions with
-     *               no edge between them where the architecture has
-     *               one.  R16: an ISA-defined dependency is recorded.
+     * 248 AND 249 ARE DELIBERATELY UNALLOCATED, and 248 has a ruling
+     * behind it rather than a taxonomy argument.
      *
-     *               THE VALUE HALF IS NOT HERE and must not be folded
-     *               onto this.  `llval`, `load_val`, `exclusive_val`
-     *               and `exclusive_high` exist because QEMU lowers
-     *               store-conditional onto a cmpxchg and needs
-     *               something to compare; real hardware keeps no such
-     *               copy.  That is the emulation-artefact category
-     *               f46873a738 established for #177 and R15 keeps it
-     *               off the wire — champsim_tracer_qdep.cc's
-     *               is_monitor_value() is where it stays named as one.
+     * 248 briefly held REG_LLRES, the address half of the exclusive
+     * monitor — MIPS' LLbit-and-address (env->lladdr), the RISC-V
+     * reservation set (env->load_res), AArch64's exclusive monitor
+     * (env->exclusive_addr).  It does not exist, because R7.7 says
+     * so in the maintainer's own words: "reservation state is a
+     * product of the instruction, not the register used ... those
+     * instructions (from all 3 mentioned ISAs) should be referencing
+     * real registers, it is the microarch that handles the
+     * reservation state."  R2 and R16 are the general form of the
+     * same line — a reservation is microarchitectural, and the wire
+     * carries architectural state.
      *
-     * 249 is deliberately unallocated.  It briefly held
-     * REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS DSPControl)
-     * and REG_VCSR (RISC-V vcsr / MIPS MSACSR) — the third of those
-     * three slots is the one REG_SSP now occupies and the first is the
-     * one REG_LLRES takes above.  Each named a register from exactly
-     * one ISA whose behaviour an existing class already covered, or
-     * split a rounding-mode-and-status word away from REG_FCSR, which
-     * already is one.  They now fold to REG_VCTRL, REG_FLAGS and
-     * REG_FCSR respectively — folds onto the SAME behaviour, which is
-     * what distinguishes them from the collisions above.  249 is left
-     * as a hole rather than reused so nothing renumbers.
+     * The ll→sc edge is real and is the consumer's to model; R7.7
+     * decided that explicitly ("it would be up to the consumer to
+     * model"), so a wire without the edge is not a silent identity
+     * under R16.  What the wire DOES carry for this pair is the
+     * store-conditional's real address register, which R9.3's
+     * insn_dataflow_note_addr_alias() SUBSTITUTES for the monitor at
+     * the three emitters that hold the proof — and R9.3's own words
+     * are "IT SUBSTITUTES, IT DOES NOT UNION.  R7.7 forbids the
+     * monitor being in the set at all."  A slot here would be that
+     * union.  Six R13 legs on three ISAs measured it as one: gem5 and
+     * the Spike/Sail model each scored the tracer a strict superset
+     * on `ldxr`/`ll`/`lr` and on `stxr`/`sc`, 29 rows with no label
+     * available, and `sail_effects.py` lists `reservation` and
+     * `reservation_valid` in NON_ARCH_REGS for the same reason.
+     *
+     * The VALUE half never had a slot and must not acquire one:
+     * `llval`, `load_val`, `exclusive_val` and `exclusive_high` exist
+     * because QEMU lowers store-conditional onto a cmpxchg and needs
+     * something to compare.  Real hardware keeps no such copy — the
+     * emulation-artefact category f46873a738 established for #177.
+     * champsim_tracer_qdep.cc's is_monitor_value() names them there,
+     * and champsim_tracer_irdf.cc's nonarch_global() holds all seven
+     * spellings, both halves.
+     *
+     * 249 is unallocated for a taxonomy reason instead.  It briefly
+     * held REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS
+     * DSPControl) and REG_VCSR (RISC-V vcsr / MIPS MSACSR) — the
+     * third of those three slots is the one REG_SSP now occupies.
+     * Each named a register from exactly one ISA whose behaviour an
+     * existing class already covered, or split a rounding-mode-and
+     * -status word away from REG_FCSR, which already is one.  They
+     * now fold to REG_VCTRL, REG_FLAGS and REG_FCSR respectively —
+     * folds onto the SAME behaviour, which is what distinguishes them
+     * from the collisions above.  Both slots are left as holes rather
+     * than reused so nothing renumbers.
      */
     REG_TLS = 246,
     REG_SSP = 247,
-    REG_LLRES = 248,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -637,7 +652,6 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";
     case REG_SSP:     return "REG_SSP";
-    case REG_LLRES:   return "REG_LLRES";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_PC:      return "REG_PC";

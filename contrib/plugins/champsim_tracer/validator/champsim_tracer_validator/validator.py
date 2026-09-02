@@ -4723,11 +4723,11 @@ def _check_static_reg_sets(
             #
             # `dst_regs[]` is now built from QEMU's own write list, and the
             # seating ADMITS a destination QEMU states that Capstone's
-            # operand walk never found.  mipsel `ll` is the first: it writes
-            # the load-linked reservation, no Capstone register enum has an
-            # id for one on any target, and the wire now carries REG_LLRES
-            # as its second destination.  Scoring that against a Capstone
-            # expectation reports the GAIN as a mismatch.
+            # operand walk never found -- the mipsel Reserved-Instruction
+            # raise writes REG_SYSEXC and no Capstone register enum has it
+            # on the destination side of those encodings.  Scoring a write
+            # QEMU states against a Capstone expectation reports the GAIN as
+            # a mismatch.
             #
             # The asymmetry is the same one the source arm above has, and it
             # is kept for the same reason -- the direction that would be

@@ -101,16 +101,32 @@ bool nonarch_global(const char *n)
 {
     static const char *const kInternal[] = {
         /*
-         * target/arm, target/mips, target/riscv: the VALUE half of the
-         * exclusive monitor.  QEMU lowers store-conditional onto a cmpxchg
-         * and needs something to compare; real hardware keeps no such copy,
-         * so these four are emulation artefacts and stay out.  The ADDRESS
-         * half is NOT here any more -- it is architectural state and now has
-         * a word, REG_LLRES; see fold_nonarch() below.
+         * THE EXCLUSIVE MONITOR, BOTH HALVES, ON ALL THREE TARGETS THAT HAVE
+         * ONE.  R7.7 is verbatim: "reservation state is a product of the
+         * instruction, not the register used ... those instructions (from all
+         * 3 mentioned ISAs) should be referencing real registers, it is the
+         * microarch that handles the reservation state."  R2/R16 put the same
+         * line in the general form -- a reservation is microarchitectural, and
+         * what is microarchitectural does not reach the wire.
+         *
+         * The ADDRESS half is here for that reason and not for the VALUE
+         * half's.  R9.1 read the address arm against R7 and found the store
+         * -conditional's real address register on the other side of QEMU's
+         * `cpu_exclusive_addr` / `cpu_lladdr` / `load_res` indirection; R9.3
+         * landed insn_dataflow_note_addr_alias() to SUBSTITUTE that register,
+         * and states the constraint in its own capitals -- "IT SUBSTITUTES,
+         * IT DOES NOT UNION.  R7.7 forbids the monitor being in the set at
+         * all, so unioning would preserve the exact dependency this removes."
+         * Naming the monitor beside the substituted register is that union.
+         *
+         * The VALUE half is here because QEMU lowers store-conditional onto a
+         * cmpxchg and needs a copy of what the load returned; real hardware
+         * keeps no such copy, which is the f46873a738 / #177 emulation
+         * -artefact category.
          */
-        "exclusive_val", "exclusive_high",
-        "llval",
-        "load_val",
+        "exclusive_addr", "exclusive_val", "exclusive_high",
+        "lladdr", "llval",
+        "load_res", "load_val",
         /* target/mips: the delay-slot branch machinery. */
         "bcond", "btarget",
     };
@@ -518,36 +534,6 @@ uint8_t fold_nonarch(const char *name)
      */
     if (!strcmp(name, "elp")) {
         return REG_SYS;
-    }
-    /*
-     * THE LOAD-RESERVED / LOAD-LINKED RESERVATION, on the three targets that
-     * have one.
-     *
-     * `sc` succeeds if and only if the reservation the matching `ll`
-     * established is still held.  That is not a QEMU mechanism, it is how the
-     * ISA defines the pair: MIPS specifies LLbit and its address, RISC-V a
-     * reservation set, AArch64 a local exclusive monitor with a tagged
-     * address.  Until now the wire showed an `ll` and its `sc` with NO edge
-     * between them, which R16 calls a silent identity and therefore a bug.
-     *
-     * ONLY THE ADDRESS HALF.  `llval`, `load_val`, `exclusive_val` and
-     * `exclusive_high` are QEMU's compare operands -- it lowers
-     * store-conditional onto a cmpxchg and needs a copy of what was loaded --
-     * and real hardware keeps no such copy.  R15 keeps them off the wire and
-     * champsim_tracer_qdep.cc's is_monitor_value() is where they stay named
-     * as the emulation artefact they are.
-     *
-     * A WIRE-VOCABULARY ADDITION, not a fold: REG_LLRES is a new generic id
-     * in a slot the vocabulary deliberately left empty, and it is the first
-     * word the tracer has for this state.  The reasoning, including its
-     * tension with R7.7's "reservation state is a product of the instruction,
-     * not the register used" -- which was ruled about the VALUE half -- is
-     * written out at the enum.
-     */
-    if (!strcmp(name, "lladdr") ||        /* mipsel   */
-        !strcmp(name, "load_res") ||      /* riscv64  */
-        !strcmp(name, "exclusive_addr")) {/* aarch64  */
-        return REG_LLRES;
     }
     /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and

@@ -4520,6 +4520,8 @@ def _check_static_reg_sets(
     n_skipped = 0
     n_surplus = 0
     surplus_regs: set[str] = set()
+    n_dst_surplus = 0
+    dst_surplus_regs: set[str] = set()
     err_cap = 20
 
     def add(out: set[str], cap_id: int) -> None:
@@ -4716,6 +4718,34 @@ def _check_static_reg_sets(
                 n_surplus += 1
                 surplus_regs.update(actual_src - exp_src)
                 continue
+            #
+            # AND NEITHER IS THE DESTINATION LIST (#232).
+            #
+            # `dst_regs[]` is now built from QEMU's own write list, and the
+            # seating ADMITS a destination QEMU states that Capstone's
+            # operand walk never found.  mipsel `ll` is the first: it writes
+            # the load-linked reservation, no Capstone register enum has an
+            # id for one on any target, and the wire now carries REG_LLRES
+            # as its second destination.  Scoring that against a Capstone
+            # expectation reports the GAIN as a mismatch.
+            #
+            # The asymmetry is the same one the source arm above has, and it
+            # is kept for the same reason -- the direction that would be
+            # information loss keeps ALL of the check's power:
+            #
+            #   a Capstone-named destination the wire does NOT carry -> ERROR
+            #   destinations the wire carries and Capstone does not   -> counted
+            #
+            # Counted and NAMED per register in the summary, so the rows this
+            # stopped failing on are a number in every log rather than a
+            # silence.  The source sets must still agree exactly here: a row
+            # whose BOTH lists disagree is not a gain on one side, it is a
+            # row nobody has looked at.
+            #
+            if actual_src == exp_src and exp_dst < actual_dst:
+                n_dst_surplus += 1
+                dst_surplus_regs.update(actual_dst - exp_dst)
+                continue
             n_errors += 1
             if n_errors <= err_cap:
                 issues.append(Issue(
@@ -4741,15 +4771,20 @@ def _check_static_reg_sets(
         f"checked={n_checked} skipped={n_skipped} errors={n_errors} "
         f"qemu_surplus_src={n_surplus}"
         + (" [" + ",".join(sorted(surplus_regs)) + "]" if surplus_regs
-           else ""),
+           else "")
+        + f" qemu_surplus_dst={n_dst_surplus}"
+        + (" [" + ",".join(sorted(dst_surplus_regs)) + "]"
+           if dst_surplus_regs else ""),
         {"checked": n_checked, "skipped": n_skipped,
          "errors": n_errors, "qemu_surplus_src": n_surplus,
          "qemu_surplus_regs": sorted(surplus_regs),
+         "qemu_surplus_dst": n_dst_surplus,
+         "qemu_surplus_dst_regs": sorted(dst_surplus_regs),
          # Printed in full whenever it has an occupant, so the rows this
          # check stopped failing are a number in every log rather than a
          # silence.  A count that only lives in a detail dict nobody reads
          # is the same as no count at all.
-         "notable": n_surplus > 0},
+         "notable": n_surplus > 0 or n_dst_surplus > 0},
     ))
     return issues
 

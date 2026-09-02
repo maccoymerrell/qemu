@@ -357,6 +357,39 @@ def mips32_acc(mn, a, b, hi=None, lo=None):
     return None
 
 
+_FPR_RE = re.compile(r'^REG_FPR(\d+)$')
+
+
+def _odd_halves_of_named_pairs(only_trc, named):
+    """Is every register the tracer adds the ODD half of an FR=0 FPR pair
+    whose EVEN half the reference named on this same instruction?
+
+    Under Status.FR=0 a MIPS 64-bit FPR IS the even/odd pair (MIPS
+    Architecture For Programmers Vol. II, LDC1/SDC1 and the FPU register
+    model): the doubleword occupies f[n] and f[n+1], and QEMU's
+    gen_load_fpr64 / gen_store_fpr64 read and write both containers.  gem5
+    models the FPR file as 64 bits wide and names the EVEN register alone, so
+    the odd half has no counterpart to disagree with.
+
+    STRUCTURAL, so it cannot widen: every added name must be REG_FPR<odd> AND
+    its REG_FPR<odd-1> sibling must be in the set the REFERENCE itself
+    published for this instruction.  A tracer that invented an odd register
+    the reference did not pair, or that added an even one, does not match and
+    stays UNACCOUNTED.  Under FR=1 the tracer names no odd half, so the test
+    cannot fire there either.
+    """
+    if not only_trc:
+        return False
+    for n in only_trc:
+        m = _FPR_RE.match(n)
+        if not m:
+            return False
+        idx = int(m.group(1))
+        if idx % 2 == 0 or ('REG_FPR%d' % (idx - 1)) not in named:
+            return False
+    return True
+
+
 def label_dst(only_ref, only_trc, ref, trc):
     if only_trc and not only_ref:
         if mnemonic(ref) in _HINT_MNEMONICS:
@@ -372,6 +405,9 @@ def label_dst(only_ref, only_trc, ref, trc):
         if only_trc == frozenset(('REG_PRED0',)) and \
                 any(n == 'REG_FCSR' for n, _v, _w in ref.writes):
             return 'FPCC-GRANULARITY'
+        if _odd_halves_of_named_pairs(
+                only_trc, set(n for n, _v, _w in ref.writes)):
+            return 'REF-NAMES-EVEN-OF-PAIR'
     return None
 
 
@@ -385,6 +421,8 @@ def label_src(only_ref, only_trc, ref):
             return 'REF-ZERO-OPERAND-AS-INVALID'
         if only_trc == frozenset(('REG_FCSR',)):
             return 'REF-NO-FCSR-TRAFFIC'
+        if _odd_halves_of_named_pairs(only_trc, set(ref.srcs)):
+            return 'REF-NAMES-EVEN-OF-PAIR'
     return None
 
 

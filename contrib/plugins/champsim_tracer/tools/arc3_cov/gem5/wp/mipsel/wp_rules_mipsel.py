@@ -120,6 +120,33 @@ MIPSEL_WP = {
              note='gem5 MIPS does not publish the FCSR read (rounding mode) or '
                   'the FCSR write (exception flags) an FP operation performs'),
 
+    # THE FR=0 FPR PAIR.  Under Status.FR=0 a MIPS 64-bit floating-point
+    # register IS the even/odd pair -- MIPS Architecture For Programmers
+    # Vol. II defines LDC1/SDC1 and the double-precision forms over f[n] and
+    # f[n+1] together -- and QEMU's gen_load_fpr64 / gen_store_fpr64 read and
+    # write both containers, one deposit per container.  gem5 models the FPR
+    # file as 64 bits wide and reaches its ExeTracer naming the EVEN register
+    # alone, so the odd half has nothing on the reference side to disagree
+    # with.  The architecture names the pair; the reference names half of it.
+    #
+    # R13_VERDICT.md 5.2 asked for this rule by name ("the comparator wants a
+    # REF-NAMES-EVEN-OF-PAIR rule and not a tracer change") while the rows it
+    # covers were carried on the ceiling instead.  The #232 destination flip
+    # put the same mechanism on the DESTINATION side -- dst_regs[] became
+    # QEMU's write list, which states both containers -- and that is what made
+    # writing it down unavoidable.
+    #
+    # The matcher is structural and cannot widen: every register the tracer
+    # adds must be REG_FPR<odd> whose REG_FPR<odd-1> sibling the REFERENCE
+    # itself published on the same instruction, with nothing on the reference
+    # -only side.  An invented odd register the reference did not pair does
+    # not match, and under FR=1 the tracer names no odd half at all.
+    'REF-NAMES-EVEN-OF-PAIR':
+        Rule('REF-NAMES-EVEN-OF-PAIR', 'reference-gap', {SUPERSET},
+             note='FR=0 makes the FPR the even/odd pair and QEMU touches both '
+                  'containers; gem5 models a 64-bit FPR file and names only '
+                  'the even register'),
+
     # gem5 implements neither `pref`/`prefe` ("Prefetching not implemented for
     # MIPS") nor `synci` ("instruction 'synci' unimplemented"), so it names no
     # source, issues no request, and has nothing for either of the tracer's

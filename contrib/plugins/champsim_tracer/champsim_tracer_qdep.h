@@ -245,6 +245,15 @@ struct InsnRegNames;
 #define QDEP_MAX_ACCESS QEMU_PLUGIN_DF_MAX_MEMOPS
 
 /*
+ * The load-slot bitmaps below are one machine word, so the ordinal space has
+ * to fit in one.  Asserted rather than commented: raising the cap past 64
+ * would silently reintroduce exactly the truncation #332 was, and a build
+ * failure is the only form of that warning anybody reads.
+ */
+static_assert(QDEP_MAX_ACCESS <= 64,
+              "QDEP_MAX_ACCESS exceeds the width of the load-slot bitmaps");
+
+/*
  * How many DISTINCT written registers this extractor holds per instruction.
  *
  * QEMU's own cap is INSN_DF_MAX_WRITES = 8 and a translation that exceeds it
@@ -503,7 +512,27 @@ struct QDepInsn {
      * by position among the LOADS; on any instruction whose accesses
      * interleave, reading one as the other names a different slot.
      */
-    uint8_t store_data_load_slots[QDEP_MAX_ACCESS];
+    /*
+     * 64 BITS, NOT 8, AND THE WIDTH IS THE CAP'S (#332).
+     *
+     * This is a bitmap over LOAD ORDINALS, and the ordinal space is
+     * QDEP_MAX_ACCESS wide.  It was uint8_t while the cap was 8; the cap has
+     * been 32 since fd59da3b86 and 48 since exec98, and the bitmap did not
+     * follow.  Two things went wrong and only the second was visible:
+     *
+     *   a provenance naming LOAD8 or higher was silently DROPPED, because
+     *   `(uint8_t)(1u << slot)` truncates to nothing above bit 7 while the
+     *   guard beside it tests the slot against the CAP and lets it through;
+     *
+     *   and the reader loop runs k to QDEP_MAX_ACCESS, so at 48 it evaluates
+     *   `1u << 32` -- undefined, and on x86 a shift modulo 32, which aliases
+     *   bit 0 back into range.  A set LOAD0 was therefore re-detected as
+     *   LOAD32, failed the "no slot for LOAD32" test, and REFUSED the whole
+     *   family.  Measured: x86 `pushq (%rax)` published
+     *   store_data_deps[0] = load_data[0] at 5c79bab9ae and the all-inputs
+     *   widening at 92a7d3f9ca, which is the R12.1 direction.
+     */
+    uint64_t store_data_load_slots[QDEP_MAX_ACCESS];
 
     /*
      * THE DESTINATION FAMILY -- `dst_dep[]`, the other half of HAS_REG.
@@ -528,7 +557,8 @@ struct QDepInsn {
     uint8_t dst_reg[QDEP_MAX_DST];              /* generic id written */
     uint8_t n_dst_dep_regs[QDEP_MAX_DST];
     uint8_t dst_dep_regs[QDEP_MAX_DST][QDEP_MAX_ADDR_REGS];
-    uint8_t dst_dep_load_slots[QDEP_MAX_DST];   /* by LOAD ordinal */
+    uint64_t dst_dep_load_slots[QDEP_MAX_DST]; /* by LOAD ordinal; see
+                                                * store_data_load_slots */
     /*
      * Did the INSTRUCTION'S ENCODED IMMEDIATE reach this destination?  One
      * per destination register, because that is the question the wire asks:

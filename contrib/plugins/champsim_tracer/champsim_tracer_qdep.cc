@@ -1095,7 +1095,7 @@ void qdep_init(void)
  * to REG_FLAGS, so a provenance naming all four arrives here as one entry.
  */
 static bool is_repr_change(uint8_t gen, const uint8_t *regs, uint8_t n,
-                           uint8_t load_slots, uint8_t saw_imm)
+                           uint64_t load_slots, uint8_t saw_imm)
 {
     if (g_gen_nglobals[gen] < 2 || n == 0 || load_slots || saw_imm) {
         return false;
@@ -1316,7 +1316,7 @@ bool is_monitor_value(const char *nm)
  * there and a recorded slot here.
  */
 QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
-                    uint8_t *load_slots, uint8_t *saw_imm)
+                    uint64_t *load_slots, uint8_t *saw_imm)
 {
     for (unsigned b = 0; b < g_prov_words * 64; b++) {
         unsigned slot;
@@ -1378,7 +1378,7 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
             if (slot >= QDEP_MAX_ACCESS) {
                 return QDEP_R_WIDE;
             }
-            *load_slots |= (uint8_t)(1u << slot);
+            *load_slots |= 1ULL << slot;
         } else {
             /*
              * An env byte range -- a register whose storage no TCG global
@@ -1428,7 +1428,7 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
  * and the whole instruction is refused for it.
  */
 bool regs_to_mask(const InsnFields *f, const uint8_t *regs, uint8_t n,
-                  uint8_t load_slots, uint64_t *out, char *why, size_t whysz)
+                  uint64_t load_slots, uint64_t *out, char *why, size_t whysz)
 {
     uint64_t m = 0;
 
@@ -1455,7 +1455,7 @@ bool regs_to_mask(const InsnFields *f, const uint8_t *regs, uint8_t n,
      * so it fails the same way.
      */
     for (unsigned k = 0; k < QDEP_MAX_ACCESS; k++) {
-        if (!(load_slots & (1u << k))) {
+        if (!(load_slots & (1ULL << k))) {
             continue;
         }
         if (k >= f->max_dep_loads || f->n_src_regs + k >= 64) {
@@ -2271,7 +2271,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
     std::vector<uint64_t> w(g_prov_words);
     for (unsigned r = 0; r < g_nregs; r++) {
         uint8_t gen, k;
-        uint8_t memop_slots = 0;
+        uint64_t memop_slots = 0;
         uint8_t sregs[QDEP_MAX_ADDR_REGS];
         uint8_t sn = 0, simm = 0;
         QDepState rc;
@@ -2368,14 +2368,14 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
          * wire's load-data band is indexed by position among the LOADS.
          */
         for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
-            if (!(memop_slots & (1u << m))) {
+            if (!(memop_slots & (1ULL << m))) {
                 continue;
             }
             if (m >= n_memops || load_ord[m] == 0xFF) {
                 out->dst_state = QDEP_R_UNREPRESENTABLE;
                 return;
             }
-            out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+            out->dst_dep_load_slots[k] |= 1ULL << load_ord[m];
         }
     }
 
@@ -2418,7 +2418,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
         for (unsigned i = 0; i < nf; i++) {
             char fnm[64];
             uint8_t gen, k;
-            uint8_t memop_slots = 0;
+            uint64_t memop_slots = 0;
             QDepState rc;
 
             if (!(fl[i].dir & QEMU_PLUGIN_DF_WR)) {
@@ -2467,14 +2467,14 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                            &out->dst_dep_imm[k]);
             if (rc == QDEP_OK) {
                 for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
-                    if (!(memop_slots & (1u << m))) {
+                    if (!(memop_slots & (1ULL << m))) {
                         continue;
                     }
                     if (m >= n_memops || load_ord[m] == 0xFF) {
                         rc = QDEP_R_UNREPRESENTABLE;
                         break;
                     }
-                    out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+                    out->dst_dep_load_slots[k] |= 1ULL << load_ord[m];
                 }
             }
             if (rc != QDEP_OK) {
@@ -2526,7 +2526,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
         }
         for (unsigned i = 0; i < nd; i++) {
             uint8_t gen, k;
-            uint8_t memop_slots = 0;
+            uint64_t memop_slots = 0;
             QDepState rc;
 
             if (dc[i].zero_reg) {
@@ -2577,14 +2577,14 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                            &out->dst_dep_imm[k]);
             if (rc == QDEP_OK) {
                 for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
-                    if (!(memop_slots & (1u << m))) {
+                    if (!(memop_slots & (1ULL << m))) {
                         continue;
                     }
                     if (m >= n_memops || load_ord[m] == 0xFF) {
                         rc = QDEP_R_UNREPRESENTABLE;
                         break;
                     }
-                    out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+                    out->dst_dep_load_slots[k] |= 1ULL << load_ord[m];
                 }
             }
             if (rc != QDEP_OK) {
@@ -4694,7 +4694,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             }
             continue;
         }
-        uint8_t memop_slots = 0;
+        uint64_t memop_slots = 0;
         rc = fold_prov(w.data(), out->store_data_regs[a],
                        &out->n_store_data_regs[a], &memop_slots, nullptr);
         if (rc == QDEP_OK) {
@@ -4706,15 +4706,14 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
              * -- so it is refused rather than approximated.
              */
             for (unsigned k = 0; k < QDEP_MAX_ACCESS; k++) {
-                if (!(memop_slots & (1u << k))) {
+                if (!(memop_slots & (1ULL << k))) {
                     continue;
                 }
                 if (k >= n || load_ord[k] == 0xFF) {
                     rc = QDEP_R_UNREPRESENTABLE;
                     break;
                 }
-                out->store_data_load_slots[a] |=
-                    (uint8_t)(1u << load_ord[k]);
+                out->store_data_load_slots[a] |= 1ULL << load_ord[k];
             }
         }
         if (rc != QDEP_OK && out->data_state == QDEP_NONE) {

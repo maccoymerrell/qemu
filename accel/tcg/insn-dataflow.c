@@ -294,6 +294,19 @@ typedef struct DfEncReadNote {
      * mutually exclusive by construction.
      */
     uint8_t refused;
+    /*
+     * THE DIRECTION of the NAME and RANGE forms.  Zero for every read form
+     * and for the refusal, one for insn_dataflow_note_stated_write_env() and
+     * insn_dataflow_note_stated_write_name().
+     *
+     * A bit on this list rather than a list of its own, for the reason every
+     * other form here shares the storage: the only property these notes need
+     * is the per-instruction anchor window that keeps one decoder's
+     * statements apart from the next one's, and a second list would be a
+     * second chance to get that window wrong.  It is part of the dedup key --
+     * an instruction that reads a range and writes it states two facts.
+     */
+    uint8_t write;
 } DfEncReadNote;
 
 /*
@@ -1180,9 +1193,13 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
                  * from that bitmap; ordlist_check.py's `name` arm is the
                  * matching half and says so.
                  */
-                fprintf(f, "name reg=%s\n",
-                        d->named_reads[list[i].index].reg
-                            ? d->named_reads[list[i].index].reg : "?");
+                {
+                    const char *nm = dir
+                        ? d->named_writes[list[i].index].reg
+                        : d->named_reads[list[i].index].reg;
+
+                    fprintf(f, "name reg=%s\n", nm ? nm : "?");
+                }
                 break;
             default:
                 fprintf(f, "unknown kind=%u\n", list[i].kind);
@@ -1534,6 +1551,35 @@ static void df_add_named_read(InsnDataflow *d, const char *reg)
     d->named_reads[d->n_named_reads].reg = reg;
     df_ord_read(d, INSN_DF_ORD_NAME, d->n_named_reads);
     d->n_named_reads++;
+}
+
+/*
+ * A destination stated by NAME alone -- see INSN_DF_MAX_NAMED_WRITES.
+ *
+ * The write twin of df_add_named_read(), idempotent by name on the same rule
+ * and flagging a full array on the same rule.  The flag lands on the WRITE
+ * list's overflow because that is the list a consumer would otherwise read
+ * short, and a destination missing from a list is the error direction this
+ * file treats as the worse one.
+ */
+static void df_add_named_write(InsnDataflow *d, const char *reg)
+{
+    unsigned i;
+
+    for (i = 0; i < d->n_named_writes; i++) {
+        if (strcmp(d->named_writes[i].reg, reg) == 0) {
+            df_ord_write(d, INSN_DF_ORD_NAME, i);
+            return;
+        }
+    }
+    if (d->n_named_writes >= INSN_DF_MAX_NAMED_WRITES) {
+        d->named_writes_overflow = 1;
+        d->wr_ord_overflow = 1;
+        return;
+    }
+    d->named_writes[d->n_named_writes].reg = reg;
+    df_ord_write(d, INSN_DF_ORD_NAME, d->n_named_writes);
+    d->n_named_writes++;
 }
 
 /*
@@ -3625,12 +3671,14 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     if (df_encread_overflow) {
         /*
          * Block-wide and deliberately over-broad, like the other note caps: a
-         * dropped statement is a SOURCE missing from the list and nothing here
-         * can say which instruction lost it.  The list is refused rather than
-         * published short -- the one error direction this file treats as an
-         * error.
+         * dropped statement is a member missing from a list and nothing here
+         * can say which instruction lost it, nor -- since the list also
+         * carries the stated WRITE forms -- which DIRECTION it was in.  Both
+         * lists are refused rather than published short, which is the one
+         * error direction this file treats as an error.
          */
         d->rd_ord_overflow = 1;
+        d->wr_ord_overflow = 1;
     }
     for (unsigned i = encread_lo; i < *encread_cursor; i++) {
         unsigned idx;
@@ -3648,22 +3696,28 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         } else if (df_encread[i].name) {
             /*
              * A register with no global and no env range: its NAME is its
-             * identity, so it goes into named_reads[] and reaches the ordered
-             * read list from there.  No bit in @d->rd -- there is no global
-             * to set one for -- and no provenance, because the instruction
-             * depends on the value rather than computing it.
+             * identity, so it goes into named_reads[] / named_writes[] and
+             * reaches the ordered list for its direction from there.  No bit
+             * in @d->rd or @d->wr -- there is no global to set one for -- and
+             * no provenance either way: a stated read depends on the value
+             * rather than computing it, and a stated write says the write
+             * happened and where it landed, not what fed it.
              */
-            df_add_named_read(d, df_encread[i].name);
+            if (df_encread[i].write) {
+                df_add_named_write(d, df_encread[i].name);
+            } else {
+                df_add_named_read(d, df_encread[i].name);
+            }
         } else if (df_encread[i].env_size) {
             /*
              * A range rather than a register id, so it goes onto the env
-             * side -- the same route an ordinary env load takes, which is
-             * what lets a declared regfile give it its name downstream.  No
-             * provenance: this instruction did not compute the value, it
-             * depends on it.
+             * side -- the same route an ordinary env load or store takes,
+             * which is what lets a declared regfile give it its name
+             * downstream.  No provenance, in either direction, for the
+             * reason above.
              */
             df_add_field(d, df_encread[i].env_off, df_encread[i].env_size,
-                         INSN_DF_RD, NULL);
+                         df_encread[i].write ? INSN_DF_WR : INSN_DF_RD, NULL);
         } else if (df_encread[i].zero) {
             /*
              * The architectural zero register has no TCG global, so @d->rd
@@ -4343,6 +4397,7 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].write = 0;
     df_n_encread++;
 }
 
@@ -4393,6 +4448,7 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     for (unsigned i = df_n_encread; i-- > 0; ) {
         if (df_encread[i].env_size == size &&
             df_encread[i].env_off == off &&
+            !df_encread[i].write &&
             df_encread[i].anchor == anchor) {
             return;
         }
@@ -4405,6 +4461,7 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].env_size = size;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].write = 0;
     df_n_encread++;
 }
 
@@ -4443,6 +4500,7 @@ void insn_dataflow_note_translation_refused(void)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 1;
+    df_encread[df_n_encread].write = 0;
     df_n_encread++;
 }
 
@@ -4480,6 +4538,7 @@ void insn_dataflow_note_stated_read_name(const char *reg)
     anchor = QTAILQ_LAST(&tcg_ctx->ops);
     for (unsigned i = df_n_encread; i-- > 0; ) {
         if (df_encread[i].name != NULL &&
+            !df_encread[i].write &&
             df_encread[i].anchor == anchor &&
             strcmp(df_encread[i].name, reg) == 0) {
             return;
@@ -4493,6 +4552,97 @@ void insn_dataflow_note_stated_read_name(const char *reg)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = reg;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].write = 0;
+    df_n_encread++;
+}
+
+/*
+ * THE WRITE FORMS.  See insn_dataflow_note_stated_write_env() and
+ * insn_dataflow_note_stated_write_name() in the header for what each states
+ * and why a helper's destination cannot be found any other way.
+ *
+ * They ride df_encread[]'s storage for the property every note on this list
+ * needs and only that one: the per-instruction anchor window.  The DIRECTION
+ * is a field rather than a separate list, and it is part of the dedup key --
+ * an instruction that states a read of a range and a write of the same range
+ * has stated two facts, and folding them would lose one of the two lists'
+ * members.
+ */
+void insn_dataflow_note_stated_write_env(uint32_t off, uint32_t size)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (size == 0) {
+        /* Refused at the door, on the read form's rule. */
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].env_size == size &&
+            df_encread[i].env_off == off &&
+            df_encread[i].write &&
+            df_encread[i].anchor == anchor) {
+            return;
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = off;
+    df_encread[df_n_encread].env_size = size;
+    df_encread[df_n_encread].name = NULL;
+    df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].write = 1;
+    df_n_encread++;
+}
+
+void insn_dataflow_note_stated_write_name(const char *reg)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    if (reg == NULL || reg[0] == '\0') {
+        /*
+         * An unnamed member is indistinguishable from "no note" downstream,
+         * and a row with an empty name would put a nameless register into a
+         * consumer's destination list.  Refused at the door.
+         */
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].name != NULL &&
+            df_encread[i].write &&
+            df_encread[i].anchor == anchor &&
+            strcmp(df_encread[i].name, reg) == 0) {
+            return;
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = 0;
+    df_encread[df_n_encread].env_size = 0;
+    df_encread[df_n_encread].name = reg;
+    df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].write = 1;
     df_n_encread++;
 }
 

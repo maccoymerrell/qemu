@@ -64,6 +64,14 @@ constexpr unsigned kMaxDiscards = 8;
  * so rather than silently reading a short one.
  */
 constexpr unsigned kMaxNamedReads = 8;
+/*
+ * Destinations the encoding names that have neither a global nor an env
+ * range that IS the register (qemu_plugin_insn_named_writes()).  QEMU's own
+ * cap is four; eight on kMaxDiscards' rule -- a destination LIST that grew
+ * past what QEMU can hold must REFUSE rather than read short, and a cap
+ * equal to QEMU's would make that refusal unreachable.
+ */
+constexpr unsigned kMaxNamedWrites = 8;
 
 std::atomic<bool>     g_tried{false};
 bool                  g_live = false;
@@ -491,6 +499,22 @@ GHashTable *g_field_unmapped_name = nullptr;
  */
 std::atomic<uint64_t> g_discard_rows{0};
 std::atomic<uint64_t> g_indexed_write_rows{0};
+/*
+ * THE STATED-WRITE ROWS, the fourth route and the newest one.
+ *
+ * A destination the emulator PERFORMS where neither a global, an env range
+ * that IS the register, nor a discard can name it -- x87's ST(0), whose
+ * fpregs[] slot is env->fpstt-relative at run time.  Counted apart from the
+ * two above on their own rule: a discard was thrown away, an indexed write
+ * was performed through an index the encoding carries, and this was
+ * performed inside a helper with nothing in the op stream to find.  Three
+ * causes, three numbers.
+ *
+ * g_named_write_unmapped_name is the mirror, on g_discard_unmapped_name's
+ * shape and with the same fix: the generator's register table, not this file.
+ */
+std::atomic<uint64_t> g_named_write_rows{0};
+GHashTable *g_named_write_unmapped_name = nullptr;
 /*
  * THE DESTINATION LIST'S SOURCE, both outcomes (#232).
  *
@@ -2678,6 +2702,80 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             if (rc != QDEP_OK) {
                 out->dst_state = rc;
                 return;
+            }
+        }
+    }
+
+    /*
+     * THE WRITES THE EMULATOR PERFORMED WHERE NOTHING NAMES THEM.
+     *
+     * The fourth route, and the last one a destination can reach here by.
+     * The three loops above are each indexed by a place the value lives -- a
+     * TCG global, a CPUArchState byte range, a name the emulator threw the
+     * write away under -- and a write that happens INSIDE A HELPER, into
+     * storage indexed by a runtime value, is in none of them.  x87's ST(0)
+     * is the case: `fldt` writes the stack top, QEMU performs that write in
+     * helper_fldt_ST0() into env->fpregs[], and fpregs[] is indexed by the
+     * PHYSICAL register while ST(0) is env->fpstt-relative.  What the field
+     * loop sees is the 128-byte CONTAINER, whose name is `fpregs` and which
+     * has no generic word, so it is skipped -- correctly, because a stated
+     * container justifies a published member and supplies none.
+     *
+     * NOT the same population as the discards.  A discard is a destination
+     * the emulator computed and DROPPED; these are destinations it
+     * PERFORMED.  Folding them would make g_discard_rows mean two things.
+     *
+     * NO PROVENANCE, and that is the statement QEMU makes rather than a gap
+     * this reads over: the note says the write happened and where it landed,
+     * not what fed it.  A written field the gvec constructor states arrives
+     * with an empty provenance for the same reason and by the same route, so
+     * the row is created exactly as that one is -- the register joins
+     * dst_reg[] and contributes nothing to the mask.
+     */
+    unsigned nn = qemu_plugin_insn_named_writes(tb, idx, nullptr, 0);
+
+    if (nn == QEMU_PLUGIN_DF_INCOMPLETE) {
+        out->dst_state = QDEP_R_NORECORD;
+        return;
+    }
+    if (nn > kMaxNamedWrites) {
+        out->dst_state = QDEP_R_WIDE;
+        return;
+    }
+    if (nn) {
+        qemu_plugin_dataflow_named_write nw[kMaxNamedWrites];
+
+        for (unsigned i = 0; i < nn; i++) {
+            nw[i].struct_size = sizeof(nw[i]);
+        }
+        if (qemu_plugin_insn_named_writes(tb, idx, nw, nn) != nn) {
+            out->dst_state = QDEP_R_NORECORD;
+            return;
+        }
+        for (unsigned i = 0; i < nn; i++) {
+            uint8_t gen, k;
+
+            if (!nw[i].reg) {
+                tally(&g_named_write_unmapped_name, "?");
+                continue;
+            }
+            gen = generic_for_qemu_name(nw[i].reg);
+            if (gen >= REG_ID_COUNT) {
+                tally(&g_named_write_unmapped_name, nw[i].reg);
+                continue;
+            }
+            g_named_write_rows.fetch_add(1, std::memory_order_relaxed);
+            for (k = 0; k < out->n_dst; k++) {
+                if (out->dst_reg[k] == gen) {
+                    break;
+                }
+            }
+            if (k == out->n_dst) {
+                if (out->n_dst >= QDEP_MAX_DST) {
+                    out->dst_state = QDEP_R_WIDE;
+                    return;
+                }
+                out->dst_reg[out->n_dst++] = gen;
             }
         }
     }
@@ -5848,6 +5946,20 @@ void qdep_report(GString *report)
         " neither\n",
         g_indexed_write_rows.load(std::memory_order_relaxed));
     g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  STATED destination rows an emitter named"
+        " (#232):\n"
+        "              a register the emulator WRITES inside a helper, into"
+        " storage no\n"
+        "               byte range names -- x87's ST(0), whose fpregs[] slot"
+        " is fpstt-\n"
+        "               relative at run time, so the extraction sees the"
+        " 128-byte\n"
+        "               container and nothing about which element.  Counted"
+        " apart from\n"
+        "               both lines above: this write HAPPENS and no index"
+        " carries it\n",
+        g_named_write_rows.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  published destination families whose SLOT"
         " DICTIONARY is\n"
         "              QEMU's own write list, in QEMU's order (#232), and\n"
@@ -6336,5 +6448,7 @@ void qdep_report(GString *report)
                "DESTINATION LISTS THE RE-SEATING COULD NOT TAKE (#232: the two\nlists are not the same set, so the wire's slot dictionary is still the\noperand walk's on these mnemonics):");
     dump_tally(report, g_discard_unmapped_name,
                "DISCARDED destinations QEMU NAMED that have no generic word\n(#260: an emitter said the instruction writes a register the emulator\nthrows away and the register table has no row for that name -- a\ngenerator pass, the same shape as the line above):");
+    dump_tally(report, g_named_write_unmapped_name,
+               "STATED destinations QEMU NAMED that have no generic word\n(#232: an emitter said the instruction PERFORMS a write to a register\nno global and no byte range names, and the register table has no row\nfor that name -- a generator pass, the same shape as the line above):");
     g_mutex_unlock(&g_tally_lock);
 }

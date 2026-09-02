@@ -267,6 +267,18 @@ typedef uint64_t qemu_plugin_id_t;
  *   an ABI break and the version moves for it, additive though the
  *   field is.
  *
+ * version 27:
+ * - added qemu_plugin_insn_named_writes(): the destinations an
+ *   instruction WRITES that have neither a TCG global nor a
+ *   CPUArchState byte range that IS the register -- a write the
+ *   emulator performs inside a helper, or into storage indexed by a
+ *   runtime value (x87's ST(i) is fpstt-relative while fpregs[] is
+ *   physical).  Its members reach the ORDERED WRITE LIST as
+ *   QEMU_PLUGIN_DF_ENT_NAME, so a consumer that resolved that kind
+ *   against qemu_plugin_insn_named_reads() in both directions would
+ *   now index the wrong array: the version moves for that, additive
+ *   though the accessor is.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -278,7 +290,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 26
+#define QEMU_PLUGIN_VERSION 27
 
 /*
  * The two values a signed vCPU index takes when it is not an index.

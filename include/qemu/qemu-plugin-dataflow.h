@@ -261,11 +261,15 @@ unsigned qemu_plugin_insn_reg_kills(const struct qemu_plugin_tb *tb, size_t idx,
  *          one is a constant with no global at all.  A consumer building a
  *          source list from the read bitmap alone is short by exactly the
  *          register the encoding named;
- *        - a source stated by NAME ALONE (READ list only), which has neither
- *          a global nor an env range because it does not live in
- *          CPUArchState -- AArch64's ARM_CP_CONST system registers are read
- *          out of the CPU object at translate time.  Read its name from
- *          qemu_plugin_insn_named_reads().
+ *        - a member stated by NAME ALONE, which has neither a global nor an
+ *          env range that IS the register.  On the READ side that is a
+ *          source QEMU resolved out of storage other than CPUArchState --
+ *          AArch64's ARM_CP_CONST system registers are read out of the CPU
+ *          object at translate time.  On the WRITE side it is a destination
+ *          the emulator PERFORMED where no bitmap and no byte range can name
+ *          it -- x87's ST(i), whose fpregs[] slot is fpstt-relative at
+ *          runtime.  Read the name from qemu_plugin_insn_named_reads() and
+ *          qemu_plugin_insn_named_writes() respectively.
  *      Conversely a KILL is in neither list: it is not a read and not a
  *      write, and it stays where it is, in its own bitmap.
  *
@@ -309,7 +313,9 @@ typedef struct qemu_plugin_dataflow_reg_entry {
      * array, so the extent and the provenance are read from the one place
      * that holds them rather than duplicated here where they could drift.
      * DISCARD: the index into qemu_plugin_insn_discards().
-     * NAME:    the index into qemu_plugin_insn_named_reads().
+     * NAME:    the index into qemu_plugin_insn_named_reads() in the READ
+     *          list, and into qemu_plugin_insn_named_writes() in the WRITE
+     *          list.
      * Otherwise UINT32_MAX.
      */
     uint32_t index;
@@ -487,6 +493,46 @@ unsigned qemu_plugin_insn_named_reads(const struct qemu_plugin_tb *tb,
                                       size_t idx,
                                       qemu_plugin_dataflow_named_read *out,
                                       unsigned nnames);
+
+/*
+ * The destinations this instruction WRITES that have no global and no env
+ * range that IS the register.
+ *
+ * NOT the same population as qemu_plugin_insn_discards(), and the difference
+ * is the whole reason this is a second array.  A DISCARD is a destination the
+ * emulator computed and threw away; a consumer counts discards to measure how
+ * much the emulator elides.  A NAMED WRITE is one the emulator PERFORMED --
+ * inside a helper, or into storage whose byte range does not stand for the
+ * architectural register -- so the machine's state moved and the only
+ * identity the destination has is its name.  x87's ST(i) is the case:
+ * env->fpregs[] is indexed by the PHYSICAL register while ST(0) is
+ * env->fpstt-relative, a RUNTIME value, so no byte range IS "ST(0)".
+ *
+ * A member reaches the ORDERED WRITE LIST as QEMU_PLUGIN_DF_ENT_NAME with
+ * @index into THIS array -- the read list's NAME entries index
+ * qemu_plugin_insn_named_reads(), exactly as a FIELD entry indexes
+ * qemu_plugin_insn_fields() in both.  It never sets a bit in the write
+ * bitmap, because there is no global to set one for.
+ *
+ * There is no provenance.  The statement is that the write happened and where
+ * it landed, not what its value was computed from; a consumer that needs the
+ * inputs reads the instruction's source list, which the helper's own usage
+ * row already fills.
+ *
+ * The name is in the same namespace qemu_plugin_dataflow_reg_name() and
+ * qemu_plugin_insn_discards() use.  Refusal and sizing exactly as
+ * qemu_plugin_insn_named_reads().
+ */
+typedef struct qemu_plugin_dataflow_named_write {
+    uint32_t struct_size;       /* caller sets to sizeof(*this) */
+    const char *reg;            /* the architectural name */
+} qemu_plugin_dataflow_named_write;
+
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_named_writes(const struct qemu_plugin_tb *tb,
+                                       size_t idx,
+                                       qemu_plugin_dataflow_named_write *out,
+                                       unsigned nnames);
 QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,
                                        size_t idx, unsigned discard,

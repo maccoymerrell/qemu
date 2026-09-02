@@ -301,8 +301,16 @@ static bool plugin_df_complete(const InsnDataflow *d)
      * consumer that builds its destination LIST from these accessors would
      * publish a set short by a register the instruction writes, and a short
      * destination set is a missing dependency rather than a coarse one.
+     *
+     * The named-write overflow is here on exactly that argument.  It is the
+     * fourth route a destination reaches a consumer by, so a full
+     * named_writes[] drops a register the instruction wrote and nothing in
+     * the other three says so.  named_reads[] is deliberately NOT here: it
+     * is a SOURCE shortfall, and it already refuses the ordered read list,
+     * which is where a source-list consumer reads it.
      */
-    return !d->fields_overflow && !d->writes_overflow && !d->discards_overflow;
+    return !d->fields_overflow && !d->writes_overflow &&
+           !d->discards_overflow && !d->named_writes_overflow;
 }
 
 static unsigned plugin_df_copy(const uint64_t *src, uint64_t *words,
@@ -648,6 +656,34 @@ unsigned qemu_plugin_insn_named_reads(const struct qemu_plugin_tb *tb,
         memcpy(&out[i], &r, want);
     }
     return d->n_named_reads;
+}
+
+unsigned qemu_plugin_insn_named_writes(const struct qemu_plugin_tb *tb,
+                                       size_t idx,
+                                       qemu_plugin_dataflow_named_write *out,
+                                       unsigned nnames)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d)) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nnames < d->n_named_writes || out == NULL) {
+        return d->n_named_writes;
+    }
+    for (unsigned i = 0; i < d->n_named_writes; i++) {
+        uint32_t want = out[i].struct_size;
+        qemu_plugin_dataflow_named_write r = {
+            .struct_size = sizeof(r),
+            .reg = d->named_writes[i].reg,
+        };
+
+        if (want == 0 || want > sizeof(r)) {
+            want = sizeof(r);
+        }
+        memcpy(&out[i], &r, want);
+    }
+    return d->n_named_writes;
 }
 
 unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,

@@ -135,7 +135,13 @@
 #define INSN_DF_ORD_FIELD    1  /* a CPUArchState byte range; @index into fields[] */
 #define INSN_DF_ORD_DISCARD  2  /* encoding names it, no op carries it; into discards[] */
 #define INSN_DF_ORD_ZERO     3  /* the architectural zero register; @index unused */
-#define INSN_DF_ORD_NAME     4  /* stated by NAME alone; into named_reads[] */
+/*
+ * Stated by NAME alone.  @index is into named_reads[] in the READ list and
+ * into named_writes[] in the WRITE list -- one kind, and the list it appears
+ * in says which array holds the name, exactly as INSN_DF_ORD_FIELD's index
+ * means fields[] in both.
+ */
+#define INSN_DF_ORD_NAME     4
 
 typedef struct InsnDataflowOrdered {
     uint8_t  kind;
@@ -145,7 +151,8 @@ typedef struct InsnDataflowOrdered {
      *         field's extent and provenance live there and duplicating
      *         either here would give a consumer two places to read one fact.
      * DISCARD: the index into discards[].
-     * NAME:   the index into named_reads[].
+     * NAME:   the index into named_reads[] (read list) or named_writes[]
+     *         (write list).
      * ZERO:   unused, and zero.
      */
     uint8_t  index;
@@ -189,6 +196,41 @@ typedef struct InsnDataflowNamedRead {
      */
     const char *reg;
 } InsnDataflowNamedRead;
+
+/*
+ * DESTINATIONS THE ENCODING NAMES THAT HAVE NEITHER A GLOBAL NOR AN ENV RANGE
+ * THE WRITE CAN BE STATED AS.
+ *
+ * The write side's counterpart to named_reads[], and NOT the same thing as
+ * discards[].  A discard is a destination the emulator THREW AWAY: the value
+ * was computed and dropped, and a consumer counts discards to measure exactly
+ * that.  A named write is a destination the emulator PERFORMED, inside a
+ * helper or through storage whose byte range does not stand for the register
+ * a consumer names -- so the write happened, the machine's state moved, and
+ * the only identity the destination has is its architectural name.
+ *
+ * x87's ST(i) is the case that motivated it.  `fldt` writes the top of the
+ * FP stack; QEMU performs that write inside helper_fldt_ST0(), into
+ * env->fpregs[], which is indexed by the PHYSICAL register while st0..st7 are
+ * relative to env->fpstt.  There is no byte range that IS "ST(0)" -- the
+ * range that holds it depends on a runtime value -- so the env form cannot
+ * state it and the name is what is left.
+ *
+ * Four, on the same reasoning as INSN_DF_MAX_NAMED_READS: room above the
+ * widest real case, with the overflow FLAGGED rather than truncated.
+ */
+#define INSN_DF_MAX_NAMED_WRITES 4
+
+typedef struct InsnDataflowNamedWrite {
+    /*
+     * The architectural name, in the target's own namespace and a pointer
+     * that outlives the translation -- a string literal at the decode site is
+     * the intended form, exactly as InsnDataflowDiscard::reg takes
+     * regnames[].  A consumer maps it the same way it maps a discarded
+     * destination's name.
+     */
+    const char *reg;
+} InsnDataflowNamedWrite;
 
 /* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
 #define INSN_DF_MAX_GVEC_OPERANDS 5
@@ -497,6 +539,17 @@ typedef struct InsnDataflow {
     InsnDataflowNamedRead named_reads[INSN_DF_MAX_NAMED_READS];
     uint8_t  n_named_reads;
     uint8_t  named_reads_overflow;
+
+    /*
+     * The destinations named the same way -- see INSN_DF_MAX_NAMED_WRITES.
+     * A consumer building a destination LIST must read this alongside
+     * writes[], fields[] and discards[]; one reading only the first three is
+     * short by exactly the registers the emulator wrote somewhere no bitmap
+     * and no byte range can name.
+     */
+    InsnDataflowNamedWrite named_writes[INSN_DF_MAX_NAMED_WRITES];
+    uint8_t  n_named_writes;
+    uint8_t  named_writes_overflow;
 
     /*
      * THE SAME FACTS, IN THE ORDER THE TRANSLATION STATED THEM.
@@ -1315,6 +1368,84 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size);
 void insn_dataflow_note_stated_read_name(const char *reg);
 
 /*
+ * THE WRITE TWIN OF insn_dataflow_note_stated_read_env(): a CPUArchState byte
+ * range the instruction WRITES, stated by the emitter that knows the write
+ * happens rather than read off an op that performs it.
+ *
+ * WHAT THIS IS FOR.  The op walk finds a destination by finding the op that
+ * defines it: a write to a TCG global, or a store into env that df_add_field()
+ * turns into a written range.  A destination a HELPER writes has neither.
+ * `fldt` moves the top of the x87 stack, `rstorssp` writes the shadow-stack
+ * pointer, `bndldx` loads a bounds register -- in every one of them the guest
+ * register the instruction exists to write is written by C code behind a
+ * helper call, and the ops the translation emitted name only the call.  The
+ * destination is missing from the write side entirely, and a missing
+ * destination is a dependency edge that does not exist: nothing downstream
+ * can tell it from an instruction that writes nothing.
+ *
+ * WHY THE EMITTER MAY STATE IT.  The write is a STATIC fact of the encoding
+ * (R20): the site that chose to call the helper is the site that knows which
+ * architectural register the helper will write, and it knows it at
+ * translation time, once, for every execution of those bytes.  Nothing is
+ * observed and nothing is derived.
+ *
+ * WHAT IT DOES NOT SAY.  Nothing about PROVENANCE.  The range enters
+ * fields[] with an EMPTY provenance, which is the same statement the read
+ * form makes in the other direction: this file is saying the write happened
+ * and where it landed, not what its value was computed from.  A consumer
+ * that needs the inputs reads the instruction's source list, which the
+ * helper's own usage row already fills.
+ *
+ * The range reaches the ORDERED WRITE LIST through fields[], exactly as an
+ * ordinary env store does, so a declared regfile gives it its name
+ * downstream and no second spelling has to be kept in step.
+ *
+ * @size must be non-zero, on the read form's rule: an unbounded range cannot
+ * be told from "no note" downstream and is refused at the door.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_stated_write_env(uint32_t off, uint32_t size);
+
+/*
+ * The NAME form of the same statement: a destination the instruction writes
+ * that has no TCG global and no CPUArchState range that IS the register.
+ *
+ * WHY A NAME AND NOT A RANGE.  x87's ST(i) is the case that forces it.  The
+ * bytes are in env->fpregs[], but fpregs[] is indexed by the PHYSICAL
+ * register while the architectural ST(0) is env->fpstt-relative -- a RUNTIME
+ * value.  Stating a range would either name the wrong register (whichever
+ * physical slot the offset happens to be) or invent a synthetic offset, and
+ * both are worse than saying nothing: they put a register that was not
+ * written into a consumer's destination list.  The architectural name has
+ * none of that ambiguity, and it is the identity a consumer's register
+ * vocabulary already keys on -- the position
+ * insn_dataflow_note_discarded_write() is in, reached from the other side.
+ *
+ * IT IS A WRITE THAT HAPPENED, which is what separates it from a discard: a
+ * discarded destination is one the emulator COMPUTED AND DROPPED, and
+ * consumers count discards to measure the emulator's dead-code elimination.
+ * Putting a performed write in that array would make one number mean two
+ * things -- the same reason named_reads[] is not folded into discards[].
+ *
+ * @reg must outlive the translation; a string literal at the decode site is
+ * the intended form.  A NULL or empty name is refused, on the read form's
+ * rule.
+ *
+ * The member reaches the ORDERED WRITE LIST as INSN_DF_ORD_NAME and carries
+ * NO provenance, for the reason the env form carries none.  It sets no bit in
+ * @wr, because there is no global to set one for.
+ *
+ * NO ANCHOR, deliberately: the note names a register outright rather than
+ * describing a temp's contents, so there is no temp whose rewrite could
+ * invalidate it.  It is scoped to the instruction whose note window it falls
+ * in.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_stated_write_name(const char *reg);
+
+/*
  * THE TRANSLATOR'S OWN WORD THAT WHAT IT EMITTED IS NOT THE INSTRUCTION.
  *
  * Called from the site that made the decision -- the failing arm of a
@@ -1842,7 +1973,18 @@ static inline void insn_dataflow_note_indexed_write(const void *ts,
                                                     const char *reg)
 { }
 
+static inline void insn_dataflow_note_stated_read_env(uint32_t off,
+                                                      uint32_t size)
+{ }
+
 static inline void insn_dataflow_note_stated_read_name(const char *reg)
+{ }
+
+static inline void insn_dataflow_note_stated_write_env(uint32_t off,
+                                                       uint32_t size)
+{ }
+
+static inline void insn_dataflow_note_stated_write_name(const char *reg)
 { }
 
 static inline void insn_dataflow_note_translation_refused(void)

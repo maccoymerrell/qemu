@@ -1441,6 +1441,13 @@ static Layer layer = LAYER_BOUNDARY;
  * The DEAD-RULE DETECTOR STAYS LIVE.  Rules in the superseded read families
  * (`R-rd-*`, `FR-rd-*`) are reported as SUPERSEDED with a count rather than
  * silently exempted, and every other rule is scored exactly as before.
+ *
+ * AND THE SUPERSESSION IS SYMMETRIC.  A BARE arm does not score `SR-rd-*`
+ * either -- that family exists only under `--srcenc` -- so in a bare arm
+ * those rules are SUPERSEDED for the same reason and by the same rule.
+ * Without that, adding an `SR-` row to the allowlist takes every bare arm
+ * red on `dead_allow_rules` while `unallowed` stays 0, which is the gate
+ * reporting a defect in an allowlist it never asked a question of.
  */
 static const char *srcenc_path = nullptr;
 static std::map<std::string, std::set<unsigned> > srcenc_map;
@@ -3283,9 +3290,37 @@ int main(int argc, char **argv)
      * families this option does not touch.
      */
     auto is_superseded_key = [](const std::string &k) {
-        return srcenc_path &&
-               (k.compare(0, 6, "R-rd-m") == 0 || k.compare(0, 6, "R-rd-p") == 0 ||
-                k.compare(0, 7, "FR-rd-m") == 0 || k.compare(0, 7, "FR-rd-p") == 0);
+        /*
+         * SUPERSESSION RUNS BOTH WAYS, and it has to.  Under `--srcenc` the
+         * `R-rd-*` / `FR-rd-*` read families are not scored, so their rules
+         * are SUPERSEDED rather than dead -- that is the case above and it
+         * was the only one for as long as no allowlist carried an `SR-` row.
+         *
+         * WITHOUT `--srcenc` the mirror holds and nothing said so.  The
+         * `SR-rd-*` family is produced ONLY by the srcenc comparison, so in
+         * a bare arm every `SR-` rule matches nothing -- not because the
+         * disagreement it excuses has gone, but because this arm does not
+         * ask the question.  Reporting those as DEAD is the exact confusion
+         * the comment above this function warns about: "a rule going dead
+         * because the phantom it excused is no longer produced looks
+         * identical to a rule going dead because a decoder bump moved a
+         * signature out from under it."  A rule whose FAMILY this arm never
+         * scores is neither.
+         *
+         * MEASURED at exec103: 327 `SR-rd-missing` rows for the zero-base
+         * segment override took the four bare arms from rc=0 to rc=1 with
+         * `dead_allow_rules=327` and `unallowed=0` -- a gate reporting a
+         * defect in an allowlist that was correct, on arms whose subject it
+         * had never had.  The dead-rule detector stays live for every family
+         * an arm DOES score, which is the property it exists for.
+         */
+        if (srcenc_path) {
+            return k.compare(0, 6, "R-rd-m") == 0 ||
+                   k.compare(0, 6, "R-rd-p") == 0 ||
+                   k.compare(0, 7, "FR-rd-m") == 0 ||
+                   k.compare(0, 7, "FR-rd-p") == 0;
+        }
+        return k.compare(0, 6, "SR-rd-") == 0;
     };
     std::vector<const AllowRule *> dead, superseded;
     for (const auto &r : allow_rules) {

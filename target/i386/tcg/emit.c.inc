@@ -5159,10 +5159,35 @@ static void gen_XOR(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * XCR0 IS AN OPERAND OF THE WHOLE XSAVE FAMILY.
+ *
+ * The requested-feature bitmap an XSAVE instruction acts on is EDX:EAX AND
+ * XCR0 -- helper_xsave() and helper_xrstor() both open with
+ * `rfbm &= env->xcr0`, and helper_xrstor() then refuses a state-component
+ * bitmap XCR0 does not enable.  Which components are saved or restored is
+ * therefore a function of the register, not merely permitted by it.
+ *
+ * EDX:EAX reach the read list as TCG globals through the concat above.  XCR0
+ * does not: it is read inside the helper, the extraction reports the helper
+ * unbounded, and the wire carried REG_SYS from the operand walk alone --
+ * 26,512 registers over the XSAVE, XSAVEOPT and XRSTOR rules.  It is stated
+ * as a range against the `xcr0` declaration in translate.c, which is the
+ * declaration `xgetbv` already leans on.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_xcr0_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, xcr0),
+                                       sizeof(((CPUX86State *)0)->xcr0));
+}
+
 static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();
 
+    gen_note_xcr0_read();
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     gen_helper_xrstor(tcg_env, s->A0, features);
     if (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_MPX) {
@@ -5178,6 +5203,7 @@ static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();
 
+    gen_note_xcr0_read();
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     gen_helper_xsave(tcg_env, s->A0, features);
 }
@@ -5186,6 +5212,7 @@ static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();
 
+    gen_note_xcr0_read();
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     gen_helper_xsave(tcg_env, s->A0, features);
 }

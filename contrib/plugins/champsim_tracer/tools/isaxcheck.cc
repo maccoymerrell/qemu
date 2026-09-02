@@ -1530,6 +1530,44 @@ static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
  * `lfence`/`incsspq`, `tpause`/`umonitor`.  Those are the R20 class: a join
  * failure to report, never a dataflow signature to score.
  */
+/*
+ * THE REFERENCE-COVERAGE CENSUS, and why an adjudication needs it.
+ *
+ * A large part of the `--srcenc` residue is `SR-rd-phantom` on one register:
+ * the wire publishes it and LLVM does not.  The claim that settles those
+ * rows is not about any one instruction -- it is that LLVM's MCInstrDesc HAS
+ * NO OPERAND FOR THAT REGISTER AT ALL, anywhere in the target description,
+ * so its silence is a coverage boundary of the reference and not a statement
+ * about the encoding.  A justification like that is exactly the shape this
+ * tree has been burned by before: plausible, load-bearing, and never
+ * checked.  So it is measured rather than asserted.
+ *
+ * For every encoding this sweep decodes, every generic register LLVM's read
+ * or write description could name is counted, and so is every generic
+ * register the WIRE publishes.  A register with a large wire count and a
+ * ZERO llvm count is a reference-coverage class; one with a non-zero llvm
+ * count is a disagreement about instructions, which is a different question
+ * and is not covered by that justification.  `ISAX_DUMP_REGCOV=1` prints the
+ * table.
+ *
+ * The candidate expansion is deliberately GENEROUS -- every generic id an
+ * LLVM token could mean, not the one a disambiguator picks -- because the
+ * claim being tested is "could LLVM ever name this register", and an
+ * over-count can only make the claim HARDER to support.
+ */
+static std::map<unsigned, unsigned long> llvmcov_rd, llvmcov_wr, wirecov_src;
+
+static void regcov_count(const std::set<std::string> &toks,
+                         std::map<unsigned, unsigned long> &into)
+{
+    std::set<unsigned> gs;
+    for (const std::string &t : toks) {
+        const std::set<unsigned> *c = generic_candidates(t);
+        if (c) gs.insert(c->begin(), c->end());
+    }
+    for (unsigned g : gs) into[g]++;
+}
+
 static unsigned long srcenc_join_scored = 0;
 static unsigned long srcenc_join_failed = 0;
 static unsigned long srcenc_join_llvm_reject = 0;
@@ -2007,6 +2045,12 @@ static void srcenc_score_reads(const std::set<unsigned> *row,
                                const std::string &m, const std::string &sample)
 {
     if (!row) return;
+    /* The coverage census is taken BEFORE the join, over every encoding the
+     * corpus reaches, because the question it answers -- can LLVM ever name
+     * this register -- is not conditioned on the two decoders agreeing. */
+    regcov_count(l.rd, llvmcov_rd);
+    regcov_count(l.wr, llvmcov_wr);
+    for (unsigned g : *row) if (!isax_generic_reg_dropped(g)) wirecov_src[g]++;
     /* The join is asked BEFORE any set is built.  A row that does not join
      * is not a dataflow answer at all, so it never reaches a signature. */
     if (!srcenc_join_ok(c, l, sample)) return;
@@ -2848,6 +2892,9 @@ static void emit_srcenc_shard(void)
     printf("#srcencjr\t%lu\t\n", srcenc_join_llvm_reject);
     printf("#srcencjz\t%lu\t\n", srcenc_join_size);
     printf("#srcencjm\t%lu\t\n", srcenc_join_mnem);
+    for (const auto &kv : llvmcov_rd) printf("#covlr\t%lu\t%u\n", kv.second, kv.first);
+    for (const auto &kv : llvmcov_wr) printf("#covlw\t%lu\t%u\n", kv.second, kv.first);
+    for (const auto &kv : wirecov_src) printf("#covws\t%lu\t%u\n", kv.second, kv.first);
     for (unsigned i = 0; i < sizeof(alias_rows) / sizeof(alias_rows[0]); i++)
         printf("#srcencja\t%lu\t%u\n", alias_rows[i].hits, i);
     for (const auto &kv : srcenc_joinfail)
@@ -3462,6 +3509,12 @@ int main(int argc, char **argv)
                 }
                 if (key == "#srcencjz") { srcenc_join_size += cnt; continue; }
                 if (key == "#srcencjm") { srcenc_join_mnem += cnt; continue; }
+                if (key == "#covlr" || key == "#covlw" || key == "#covws") {
+                    unsigned g = (unsigned)strtoul(samp.c_str(), nullptr, 10);
+                    (key == "#covlr" ? llvmcov_rd
+                     : key == "#covlw" ? llvmcov_wr : wirecov_src)[g] += cnt;
+                    continue;
+                }
                 if (key == "#srcencja") {
                     unsigned i = (unsigned)strtoul(samp.c_str(), nullptr, 10);
                     if (i < sizeof(alias_rows) / sizeof(alias_rows[0]))
@@ -3655,6 +3708,21 @@ int main(int argc, char **argv)
             }
             if (dead_alias)
                 printf("# srcenc_join dead_alias_rows=%u\n", dead_alias);
+            if (getenv("ISAX_DUMP_REGCOV")) {
+                std::set<unsigned> ids;
+                for (const auto &kv : llvmcov_rd) ids.insert(kv.first);
+                for (const auto &kv : llvmcov_wr) ids.insert(kv.first);
+                for (const auto &kv : wirecov_src) ids.insert(kv.first);
+                for (unsigned g : ids) {
+                    const char *n = isax_generic_reg_name(g);
+                    printf("REGCOV %-16s llvm_rd=%-10lu llvm_wr=%-10lu "
+                           "wire_src=%-10lu %s\n",
+                           n ? n : "?", llvmcov_rd[g], llvmcov_wr[g],
+                           wirecov_src[g],
+                           (!llvmcov_rd[g] && !llvmcov_wr[g] && wirecov_src[g])
+                               ? "REFERENCE-HAS-NO-OPERAND" : "");
+                }
+            }
             if (getenv("ISAX_DUMP_UNREACHED"))
                 for (const auto &kv : srcenc_unreached_by_mnem)
                     printf("UNREACHED %-9lu %s\n", kv.second, kv.first.c_str());

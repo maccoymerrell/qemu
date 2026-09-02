@@ -3121,6 +3121,7 @@ struct SrcMechStage {
     uint8_t     x_mem_reads;
     uint8_t     x_mem_writes;
     uint8_t     n_wr;
+    uint8_t     wstate_q;       /* QEMU's write-side verdict, q->dst_state */
     uint8_t     wr[QDEP_MAX_DST];
 };
 static thread_local SrcMechStage g_mech_stage;
@@ -3370,6 +3371,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          */
         m->n_wr = q->n_dst;
         memcpy(m->wr, q->dst_reg, q->n_dst);
+        m->wstate_q = (uint8_t)q->dst_state;
     }
     /*
      * THE SURVIVOR-ROW REFUTATION, and it runs OUTSIDE the read-list gate
@@ -4153,7 +4155,7 @@ EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
 EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
-    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\n"};
+    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -4364,6 +4366,28 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
      */
     g_string_append_c(g, '\t');
     reglist_str(g, f->dst_regs, f->n_dst_regs);
+    /*
+     * WSTQ -- QEMU'S OWN WRITE-SIDE VERDICT, apart from the wire's.
+     *
+     * `wstate` is dst_precheck()'s COMPOSITE: it answers "will the
+     * destination family be published", which mixes QEMU's extraction
+     * verdict with a question about the wire's slot list.  A reader
+     * scoring WR against PUBD has to tell two completely different rows
+     * apart and cannot:
+     *
+     *   WR = -   because QEMU STATED that this instruction writes nothing
+     *            (`clz $0,$0` -- the lowering drops a write to the zero
+     *            register), which is a fact the walk's destination can be
+     *            scored against; and
+     *   WR = -   because the extraction REFUSED, which is no fact at all
+     *            and makes every published destination read as walk-only.
+     *
+     * The second scored as the first turns an absent measurement into a
+     * loss, which is the direction this tree treats as a defect.  WSTQ is
+     * q->dst_state alone, so the two are separable on the row.
+     */
+    g_string_append_c(g, '\t');
+    g_string_append(g, state_name(m->wstate_q));
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);

@@ -280,6 +280,20 @@ typedef struct DfEncReadNote {
      * @env_size so the three forms stay mutually exclusive by construction.
      */
     const char *name;
+    /*
+     * THE TRANSLATION-REFUSED form, which states nothing about a register at
+     * all: the translator declined to translate this encoding's BODY in this
+     * translation's context -- wrong privilege level, wrong exception level,
+     * a CPU model without the extension -- and what it emitted instead is a
+     * raise, or on one target nothing whatsoever.
+     *
+     * It shares this list because it needs exactly this list's property and
+     * nothing else: the anchor window that keeps one instruction's statements
+     * apart from the next one's.  Every other field is zero for it, and it is
+     * checked FIRST when the notes are resolved so the register forms stay
+     * mutually exclusive by construction.
+     */
+    uint8_t refused;
 } DfEncReadNote;
 
 /*
@@ -3621,7 +3635,17 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     for (unsigned i = encread_lo; i < *encread_cursor; i++) {
         unsigned idx;
 
-        if (df_encread[i].name) {
+        if (df_encread[i].refused) {
+            /*
+             * Not a register statement: the translator's own word that this
+             * translation is not the instruction's body.  It contributes
+             * nothing to any list, which is the point -- the lists are EMPTY
+             * or nearly so precisely because the body was never translated,
+             * and without this a consumer cannot tell that from an
+             * instruction that genuinely reads and writes nothing.
+             */
+            d->translation_refused = 1;
+        } else if (df_encread[i].name) {
             /*
              * A register with no global and no env range: its NAME is its
              * identity, so it goes into named_reads[] and reaches the ordered
@@ -4318,6 +4342,7 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].env_off = 0;
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = NULL;
+    df_encread[df_n_encread].refused = 0;
     df_n_encread++;
 }
 
@@ -4379,6 +4404,45 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].env_off = off;
     df_encread[df_n_encread].env_size = size;
     df_encread[df_n_encread].name = NULL;
+    df_encread[df_n_encread].refused = 0;
+    df_n_encread++;
+}
+
+/*
+ * THE TRANSLATOR'S OWN WORD THAT THIS IS NOT THE INSTRUCTION'S BODY.
+ *
+ * See insn_dataflow_note_translation_refused() in the header for what the
+ * statement means and why no reader can derive it.  It rides df_encread[]'s
+ * storage for the single property it needs -- the per-instruction anchor
+ * window -- and sets no register field, so the resolver's first test picks
+ * it out and the register forms are untouched.
+ */
+void insn_dataflow_note_translation_refused(void)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].refused && df_encread[i].anchor == anchor) {
+            return;                 /* the same statement twice */
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = 0;
+    df_encread[df_n_encread].env_size = 0;
+    df_encread[df_n_encread].name = NULL;
+    df_encread[df_n_encread].refused = 1;
     df_n_encread++;
 }
 
@@ -4428,6 +4492,7 @@ void insn_dataflow_note_stated_read_name(const char *reg)
     df_encread[df_n_encread].env_off = 0;
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = reg;
+    df_encread[df_n_encread].refused = 0;
     df_n_encread++;
 }
 

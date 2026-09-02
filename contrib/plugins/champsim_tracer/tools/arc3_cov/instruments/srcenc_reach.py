@@ -51,6 +51,39 @@ EMITTED, from columns the plugin's mechanism corpus carries:
                      refused: it raised (noret >= 1), performed no access,
                      wrote no architectural destination, and READ THE GATE --
                      a non-empty read list consisting only of system state.
+    CONTEXT-REFUSED  an identity, and the TARGET SAID the body was never
+                     translated: the encoding is unavailable at this
+                     privilege level, this exception level, or on this CPU
+                     model.  The one class here that is STATED rather than
+                     inferred, because the state that decided is not in the
+                     op stream -- see below.
+
+WHY ONE CLASS HAD TO BE STATED AND NOT INFERRED
+-----------------------------------------------
+The four columns above answer "what did the translator emit".  They cannot
+answer "why", and for one whole family the why is the entire question.
+
+x86 `lgdt` at CPL 3 emits a #GP raise: `noret=1, calls=1, memr=0, memw=0`,
+`RD=-`, `WR=REG_PC`.  A64 `sys` at EL0 emits an UNDEF raise with the same six
+numbers.  x86 `syscall` emits its raise with the same six numbers too -- and
+for `syscall` the exception IS the body, its operands are real, and excluding
+it would hide a loss.  The rows are IDENTICAL; the difference is that CPL and
+the exception level were hoisted into DisasContext before a single op existed,
+so the check that refused left no trace to read.
+
+MIPS is worse and in the other direction: on a model without the MSA ASE the
+whole 0x1E opcode space translates to NOTHING AT ALL -- `calls=0, memr=0,
+memw=0`, both lists empty -- which is also what a genuine no-operand
+instruction looks like.  90,813 registers, the largest single row on any
+target's bar, sat there because Capstone decodes MSA unconditionally and the
+guest CPU has none.
+
+So the class is a STATEMENT from the target, at the site that decided:
+insn_dataflow_note_translation_refused(), read here as `refused=1` in the
+XLAT column.  A corpus taken before the field existed carries no `refused`
+key at all, parse_xlat() returns no such entry, and every row falls through
+to the classes it had before -- which is the correct behaviour for an old
+corpus and is why the key is read with a default rather than required.
 
 WHY THE GATE MUST BE STATE THE TRANSLATION READ AND DID NOT WRITE
 -----------------------------------------------------------------
@@ -121,6 +154,7 @@ ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 REACH_INSN = "INSTRUCTION"
 REACH_NODEC = "NO-DECODE"
 REACH_TRAP = "TRAP-TRANSLATED"
+REACH_REFUSED = "CONTEXT-REFUSED"
 REACH_UNREADABLE = "UNREADABLE"
 
 #: The register namespace's SYSTEM half, by prefix.  The tracer generates
@@ -198,6 +232,18 @@ def classify(row):
         return REACH_NODEC, "no-identity", \
             "decode_id=0: QEMU recorded no decode-table slot, so there is " \
             "no statement a register can be missing from"
+
+    if xl.get("refused", 0):
+        # THE TRANSLATOR'S OWN WORD, and the only class here that is not
+        # inferred.  See the module header for why nothing can be inferred:
+        # the state that decided -- x86's CPL, A64's exception level, MIPS'
+        # ASE availability -- is hoisted out of the op stream at translation
+        # time, so every column below reads exactly like a body-trap.
+        return REACH_REFUSED, "translator-refused", \
+            "the target stated that what it translated is not this " \
+            "instruction's body: the encoding is unavailable in this " \
+            "translation's context (privilege level, exception level, or " \
+            "a CPU model without the extension)"
 
     rd = reglist(row.get("RD", ""))
     wr = reglist(row.get("WR", ""))
@@ -326,6 +372,20 @@ _EX_TEQ0 = dict(isa="mipsel", encoding="34000000", mnem="teq",
 _EX_NOSHAPE = dict(isa="x86_64", encoding="0f0b", mnem="ud2",
                    decode_id="11111111", rule="illegal_op", RD="-", WR="-",
                    XLAT="shape=-")
+#: x86 `lgdt` at CPL 3, from the live x86_64 sweep.  SIX NUMBERS IDENTICAL TO
+#: `svc`'s -- and the difference is the whole question, which is why the
+#: target states it.
+_EX_REFUSED = dict(isa="x86_64", encoding="0f0110", mnem="lgdtq",
+                   decode_id="0000a11c",
+                   rule="translate.c/multi0F@b=101,modrm=..010...,mem",
+                   RD="-", WR="REG_PC",
+                   XLAT="noret=1,calls=1,memr=0,memw=0,refused=1")
+#: MIPS MSA on a model without the ASE: nothing was translated AT ALL, which
+#: is also what a genuine no-operand instruction looks like.
+_EX_REFUSED_EMPTY = dict(isa="mipsel", encoding="00000078", mnem="fcaf.w",
+                         decode_id="6e19d3b5", rule="translate_mips/OPC_MDMX",
+                         RD="-", WR="-",
+                         XLAT="noret=0,calls=0,memr=0,memw=0,refused=1")
 
 
 def selftest():
@@ -356,6 +416,11 @@ def selftest():
 
     arm("E2 teq $0,$0: bookkeeping is not a gate", _EX_TEQ0, REACH_INSN,
         "body-trap")
+
+    arm("N  lgdt at CPL 3: the target said it is not a body",
+        _EX_REFUSED, REACH_REFUSED, "translator-refused")
+    arm("O  MSA on a model without it: nothing translated",
+        _EX_REFUSED_EMPTY, REACH_REFUSED, "translator-refused")
 
     print("--- FIRING CONTROLS, both directions ---")
     # 1. A genuine trap that LOSES its noreturn signal must stop being a
@@ -390,6 +455,39 @@ def selftest():
     t4 = dict(_EX_TRAP, WR="REG_PC,REG_SYSFPEN")
     arm("K2 a 'gate' the raise also WRITES is not one", t4, REACH_INSN,
         "body-trap")
+    # 5z. THE REFUSAL CONTROLS.  The statement must be the ONLY thing that
+    #     produces the class, in both directions.
+    #     (a) lgdt's row with `refused` taken away is INDISTINGUISHABLE from
+    #         svc and must classify as svc does -- if it did not, the class
+    #         was coming from the rule name or the register lists.
+    r1 = dict(_EX_REFUSED, XLAT="noret=1,calls=1,memr=0,memw=0")
+    arm("N2 lgdt WITHOUT the statement is a body-trap", r1, REACH_INSN,
+        "body-trap")
+    #     (b) svc's own row GIVEN the statement must become refused, or the
+    #         flag is being ignored on rows that already look like traps.
+    r2 = dict(_EX_SVC, XLAT="noret=1,calls=1,memr=0,memw=0,refused=1")
+    arm("N3 svc GIVEN the statement IS refused", r2, REACH_REFUSED,
+        "translator-refused")
+    #     (c) an ordinary instruction given it must be refused too: the
+    #         statement outranks every inference below it, because a body
+    #         that was never translated cannot have produced those lists.
+    r3 = dict(_EX_INSN, XLAT="noret=0,calls=0,memr=0,memw=0,refused=1")
+    arm("N4 a full instruction row GIVEN it is refused", r3, REACH_REFUSED,
+        "translator-refused")
+    #     (d) refused=0 spelled out explicitly must change nothing.
+    r4 = dict(_EX_INSN, XLAT="noret=0,calls=0,memr=0,memw=0,refused=0")
+    arm("N5 an explicit refused=0 is not a refusal", r4, REACH_INSN, "body")
+    #     (e) a corpus with NO refused key at all -- every row taken before
+    #         the field existed -- must classify exactly as it used to.
+    r5 = dict(_EX_REFUSED, XLAT="noret=1,calls=1,memr=0,memw=0")
+    arm("N6 an OLD corpus (no key) is unaffected", r5, REACH_INSN,
+        "body-trap")
+    #     (f) and a row whose shape is ABSENT stays UNREADABLE even with the
+    #         statement: an unreadable status cannot be trusted to carry it.
+    r6 = dict(_EX_REFUSED, XLAT="shape=-")
+    arm("N7 an absent shape outranks the statement", r6, REACH_UNREADABLE,
+        "no-shape")
+
     # 5c. ... and the converse: teq's row with the exception state removed
     #     from the WRITE list becomes a gate check, so arm E2's answer comes
     #     from the read/write join and not from the ISA or the rule name.

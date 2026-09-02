@@ -1797,6 +1797,23 @@ static bool check_cpl0(DisasContext *s)
     if (CPL(s) == 0) {
         return true;
     }
+    /*
+     * WHAT FOLLOWS IS NOT THE INSTRUCTION.  Every caller returns without
+     * emitting a single op of the body -- `lgdt` never reaches its two
+     * tcg_gen_st_tl()s, `lmsw` never reaches its helper -- so the
+     * translation is a #GP raise with no read list and no architectural
+     * write, which is exactly the shape `syscall` has and `syscall` is a
+     * body.  The privilege that decided is not in the op stream either:
+     * QEMU hoists CPL out of the guest state into DisasContext at
+     * translation time, so nothing downstream can see the check happen.
+     * Only this function knows, so this function says it.
+     *
+     * NOT a claim about the encoding in general: the same bytes at CPL 0
+     * translate the body and this note is never taken.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_translation_refused();
     gen_exception_gpf(s);
     return false;
 }

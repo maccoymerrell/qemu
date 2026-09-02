@@ -3266,6 +3266,7 @@ struct SrcMechStage {
     uint8_t     x_noreturn_calls;
     uint8_t     x_mem_reads;
     uint8_t     x_mem_writes;
+    uint8_t     x_refused;      /* the translator declined the body */
     uint8_t     n_wr;
     uint8_t     wstate_q;       /* QEMU's write-side verdict, q->dst_state */
     uint8_t     wr[QDEP_MAX_DST];
@@ -3507,6 +3508,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         m->x_noreturn_calls = q->x_noreturn_calls;
         m->x_mem_reads      = q->x_mem_reads;
         m->x_mem_writes     = q->x_mem_writes;
+        m->x_refused        = q->x_refused;
         /*
          * QEMU's WRITE side, by generic name.  It is the other half of the
          * body-versus-trap join: an enable check writes the exception state
@@ -4501,9 +4503,11 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
      */
     g_string_append_c(g, '\t');
     if (m->x_have_shape) {
-        g_string_append_printf(g, "noret=%u,calls=%u,memr=%u,memw=%u",
+        g_string_append_printf(g,
+                               "noret=%u,calls=%u,memr=%u,memw=%u,refused=%u",
                                m->x_noreturn_calls, m->x_calls,
-                               m->x_mem_reads, m->x_mem_writes);
+                               m->x_mem_reads, m->x_mem_writes,
+                               m->x_refused);
     } else {
         g_string_append(g, "shape=-");
     }
@@ -4609,6 +4613,15 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
                                       ? 255 : st.n_mem_reads);
     out->x_mem_writes     = (uint8_t)(st.n_mem_writes > 255
                                       ? 255 : st.n_mem_writes);
+    /*
+     * AND THE TRANSLATOR'S OWN WORD that what it emitted is not the
+     * instruction: a privilege check that refused, an exception level with
+     * no such register, a CPU model without the ASE.  The four counts above
+     * cannot carry it -- `lgdt` at CPL 3 and `syscall` produce the same
+     * four numbers -- and only the target knows.  See
+     * qemu_plugin_dataflow_status::translation_refused.
+     */
+    out->x_refused        = st.translation_refused;
 
     /*
      * memops_unnoted is the one that matters most here and it is checked

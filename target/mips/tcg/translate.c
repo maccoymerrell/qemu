@@ -19410,6 +19410,30 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             op == OPC_MDMX ? MIPS_ID_OPC_MDMX :
             MIPS_ID_NONE);
         /* MDMX: Not implemented. */
+        /*
+         * WHAT WAS TRANSLATED IS NOT THE INSTRUCTION -- and here it is not
+         * even a raise.  Major opcode 0x1E is the MDMX/MSA space, and an
+         * encoding reaches this arm only after decode_opc() offered it to
+         * decode_ase_msa() and `ase_msa_available(env)` said no: on a model
+         * with the ASE the same bytes decode to `addv.b` and translate a
+         * body.  What is emitted instead is NOTHING, so the row downstream
+         * reads calls=0, memr=0, memw=0 with an empty read and write list --
+         * indistinguishable from an instruction that genuinely touches
+         * nothing, and 90,813 registers of the loss bar are Capstone
+         * answering for MSA on a CPU that has none.
+         *
+         * THAT THE ARM EMITS NOTHING IS AN UPSTREAM DEFECT, and this note is
+         * not a paper over it: MIPS64 requires the MDMX/MSA opcode space to
+         * signal a Reserved Instruction exception on an implementation
+         * without the ASE, so this should be gen_reserved_instruction(ctx)
+         * and a guest that executes 0x78000000 on 24Kf should take a
+         * signal rather than fall through.  The statement here is true
+         * either way -- the translator declined the encoding on this model
+         * -- and stays true when the raise is fixed.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_translation_refused();
         break;
     case OPC_PCREL:
         mips_ident(ctx,

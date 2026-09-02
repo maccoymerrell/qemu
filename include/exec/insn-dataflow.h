@@ -652,6 +652,33 @@ typedef struct InsnDataflow {
     uint8_t  imm_non_dataflow;
 
     /*
+     * THE TRANSLATOR DECLINED TO TRANSLATE THIS ENCODING'S BODY, and said so.
+     *
+     * WHAT IT SEPARATES.  @n_noreturn_calls already tells a raise from a
+     * computation, and the consumer's join against the read list already
+     * tells an ENABLE CHECK THAT CONSULTED SOMETHING from an unconditional
+     * trap.  Neither can reach the third case: an instruction whose
+     * availability the TRANSLATOR decided from state it hoisted out of the
+     * op stream.  x86 folds CPL into DisasContext, so `lgdt` at CPL 3 raises
+     * having read nothing; A64 folds the exception level, so `sys` at EL0
+     * raises having read nothing; and MIPS never enters the MSA decoder at
+     * all on a model without the ASE, so the encoding's translation is
+     * EMPTY -- no call, no raise, no list.  All three arrive looking exactly
+     * like `svc`, whose exception IS its body and whose registers are a real
+     * loss when they go missing.
+     *
+     * Only the code that made the decision knows, which is why this is a
+     * statement and not a rule.  A sweep that scores such a translation as
+     * the instruction's is scoring the translation's CONTEXT: the encoding
+     * is not an instruction there, so nothing about its operands is missing.
+     *
+     * It is NOT a judgement about the encoding in general.  The same bytes
+     * at CPL 0, at EL1, or on a model with the extension translate a body
+     * and this flag reads 0.
+     */
+    uint8_t  translation_refused;
+
+    /*
      * How many reads this instruction folded onto a REPRESENTATION CARRIER's
      * register.  See insn_dataflow_note_repr_carrier().  Saturating, and
      * present so the rule's zero is a measurement rather than an assumption:
@@ -1288,6 +1315,32 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size);
 void insn_dataflow_note_stated_read_name(const char *reg);
 
 /*
+ * THE TRANSLATOR'S OWN WORD THAT WHAT IT EMITTED IS NOT THE INSTRUCTION.
+ *
+ * Called from the site that made the decision -- the failing arm of a
+ * privilege check, the exception-level test that routes an encoding to
+ * UNDEF, the decoder arm a CPU model without the extension falls into -- it
+ * sets @translation_refused on the instruction being translated.  See that
+ * field for what the flag separates and why nothing downstream can derive
+ * it.
+ *
+ * WHY IT IS NOT A REGISTER STATEMENT.  Every other note in this file says
+ * what an instruction touched.  This one says that the thing translated is
+ * not the instruction, so its lists describe a raise rather than a body and
+ * a consumer scoring them against the ISA is scoring the wrong subject.
+ *
+ * ANCHORED, on the same discipline as the folded-read notes: it records the
+ * op its emitter had last produced, and the walk resolves it only inside the
+ * instruction whose op range reached it.  Stating it twice for one
+ * instruction is one fact.
+ *
+ * Capture only; no op is emitted, altered or suppressed, and a target that
+ * never calls it reports 0 -- which says nobody looked, not that nothing was
+ * refused.
+ */
+void insn_dataflow_note_translation_refused(void);
+
+/*
  * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
  * encoding names, as it becomes a TCG value.
  *
@@ -1790,6 +1843,9 @@ static inline void insn_dataflow_note_indexed_write(const void *ts,
 { }
 
 static inline void insn_dataflow_note_stated_read_name(const char *reg)
+{ }
+
+static inline void insn_dataflow_note_translation_refused(void)
 { }
 
 

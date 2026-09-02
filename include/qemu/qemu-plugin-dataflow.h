@@ -854,6 +854,29 @@ typedef struct qemu_plugin_dataflow_status {
      */
     uint8_t  read_list_truncated;
     uint8_t  write_list_truncated;
+    /*
+     * THE TRANSLATOR DECLINED TO TRANSLATE THIS ENCODING'S BODY, and said so
+     * at the site that decided.
+     *
+     * @n_noreturn_calls above separates a raise from a computation, and a
+     * consumer's join against the read list separates an enable check that
+     * CONSULTED something from an unconditional trap.  Neither reaches the
+     * case where the availability decision was made from state the
+     * translator hoisted out of the op stream: x86 folds CPL into its
+     * DisasContext, so `lgdt` at CPL 3 raises having read nothing; A64 folds
+     * the exception level, so `sys` at EL0 does the same; and MIPS never
+     * enters the MSA decoder on a model without the ASE, so the translation
+     * is empty -- no call, no raise, no list.  All three look exactly like
+     * `svc`, whose exception IS its body and whose operands really are
+     * missing when they are absent.
+     *
+     * A consumer scoring an instruction's operands must EXCLUDE a row with
+     * this set: the encoding is not an instruction in this translation's
+     * context, so nothing about its operands can be missing.  A 0 on every
+     * row of a target means that target states nothing here, which is a
+     * different fact from "nothing was refused".
+     */
+    uint8_t  translation_refused;
 } qemu_plugin_dataflow_status;
 
 /*

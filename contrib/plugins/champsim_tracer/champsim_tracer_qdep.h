@@ -778,6 +778,17 @@ struct QDepInsn {
     uint8_t x_noreturn_calls;
     uint8_t x_mem_reads;
     uint8_t x_mem_writes;
+    /*
+     * @x_refused is the translator's own word that what it emitted is NOT
+     * this instruction: a privilege check that refused, an exception level
+     * with no such register, a CPU model without the extension.  The four
+     * counts above cannot carry it -- x86 `lgdt` at CPL 3 and `syscall`
+     * produce the same four numbers, and MIPS' MSA space on a model without
+     * the ASE produces all zeroes -- and no reader can derive it, because
+     * the state that decided was hoisted out of the op stream at translation
+     * time.  See qemu_plugin_dataflow_status::translation_refused.
+     */
+    uint8_t x_refused;
 };
 
 /*

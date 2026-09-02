@@ -2689,6 +2689,24 @@ static void gen_sysreg_undef(DisasContext *s, bool isread,
     } else {
         syndrome = syn_uncategorized();
     }
+    /*
+     * WHAT FOLLOWS IS NOT THE INSTRUCTION.  Both callers return here having
+     * emitted no part of the access -- the register does not exist on this
+     * CPU, or its accessfn refused it at this exception level -- so the
+     * translation is an UNDEF raise that reads nothing and writes only the
+     * program counter.  `svc` has that same shape and for `svc` the
+     * exception IS the body, so nothing downstream can tell the two apart;
+     * and the exception level that decided is not in the op stream either,
+     * because it lives in DisasContext.  Only this function knows.
+     *
+     * The operand walk is not wrong about these encodings -- SYS's execute
+     * ASL does read X[t] -- it is answering about an instruction that does
+     * not execute here.  The same encoding at EL1 translates a body and this
+     * note is never taken.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_translation_refused();
     gen_exception_insn(s, 0, EXCP_UDEF, syndrome);
 }
 

@@ -34,6 +34,15 @@
 # instrument measuring the tracer and an instrument measuring its own
 # plumbing.
 #
+# THE JOIN IS SEPARATED FROM THE DATAFLOW.  A corpus row is keyed on bytes
+# and the reference answer is LLVM's decode of those bytes; when the two
+# decoders read the bytes as DIFFERENT INSTRUCTIONS the resulting register
+# difference is a JOIN FAILURE, not a tracer finding, and scoring it as one
+# inflates the residue with rows no dataflow change can close.  Such rows are
+# separated into their own `JOINFAIL` family, counted by ordered mnemonic
+# pair, and reported on the `# srcenc_join` line beside the scored count --
+# never dropped.  See the --srcenc commentary in isaxcheck.cc for the test.
+#
 # REACH IS PRINTED AND UNREACHED RULES ARE NAMED.  An encoding the corpus
 # does not carry is scored by nothing; `ISAX_DUMP_UNREACHED` is exported so
 # every wholly unreached mnemonic is listed with its encoding count beside
@@ -103,7 +112,8 @@ run_arms() {
             # rc=2 dominates rc=1: "could not look" is never a mere failure.
             [ "$r" = 2 ] && worst=2
             [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
-            grep -h '^# srcenc=' "$out/${layer:0:1}_$isa.txt" >> "$out/rc.txt" 2>/dev/null
+            grep -hE '^# srcenc=|^# srcenc_join ' "$out/${layer:0:1}_$isa.txt" \
+                >> "$out/rc.txt" 2>/dev/null
             # Only a --srcenc arm has a reach to report.  `grep -c` exits 1
             # on zero matches, so its status is discarded rather than turned
             # into a second count by an `|| echo`.
@@ -111,6 +121,12 @@ run_arms() {
                 local u
                 u=$(grep -c '^UNREACHED' "$out/${layer:0:1}_$isa.txt" 2>/dev/null) || true
                 echo "  unreached_mnemonics_named=${u:-0} (UNREACHED lines in" \
+                     "${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
+                # The join census is bounded by DISTINCT mnemonic pairs, so
+                # its line count is a number worth carrying beside the reach.
+                local j
+                j=$(grep -c '^JOINFAIL' "$out/${layer:0:1}_$isa.txt" 2>/dev/null) || true
+                echo "  joinfail_pairs_named=${j:-0} (JOINFAIL lines in" \
                      "${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
             fi
         done

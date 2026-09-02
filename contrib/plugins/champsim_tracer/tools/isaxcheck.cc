@@ -1456,6 +1456,198 @@ static unsigned long srcenc_covered = 0, srcenc_unreached = 0;
 static std::map<std::string, unsigned long> srcenc_unreached_by_mnem;
 static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
 
+/*
+ * THE JOIN, AND WHY IT IS REPORTED SEPARATELY FROM THE DATAFLOW.
+ *
+ * `SR-rd-*` is a claim about DATAFLOW: these bytes read this register and
+ * the wire did not say so, or said so and the reference does not.  That
+ * claim is only meaningful when both sides are talking about THE SAME
+ * INSTRUCTION.  The corpus row is keyed on a byte string, the reference
+ * answer is LLVM's decode of that byte string, and nothing until now checked
+ * that the two decoders agreed on what the bytes ARE.  When they do not --
+ * `f3 48 0f ae 37` is `clrssbsy (%rdi)` to Capstone and `xsaveopt64 (%rdi)`
+ * to LLVM -- the row that comes out compares one instruction's published
+ * source list against a different instruction's architectural read set.  The
+ * difference is real and it is not a tracer finding; it is a JOIN FAILURE
+ * between two decoders, and scoring it as dataflow inflates the residue with
+ * rows no dataflow change can ever close.
+ *
+ * R20's scope correction is what this implements: a name-matched comparison
+ * is valid only across a Capstone-spelling join, so the rows that do not
+ * join are SEPARATED and reported in their own family rather than scored.
+ *
+ * SEPARATED, NEVER DISCARDED.  Every join failure is counted, bucketed by
+ * the ORDERED PAIR of mnemonics that failed to join, and printed under
+ * `JOINFAIL` with a representative encoding.  The summary line carries the
+ * scored and the failed counts side by side, so a residue that falls because
+ * the separation landed is visibly the same population, redistributed.
+ *
+ * TWO CONDITIONS AND THREE SPELLING LAYERS.  A row is scored only when LLVM
+ * accepted the bytes and both decoders consumed the SAME NUMBER OF BYTES --
+ * the corpus key is Capstone's length, so a different length is a different
+ * instruction even under an identical name.  Then the two renderings are
+ * reduced to a CORE MNEMONIC and compared.  The reduction has three layers,
+ * and every one of them was derived from the tool's own JOINFAIL census
+ * rather than from lore:
+ *
+ *   1. LEADING ASSEMBLER DIRECTIVES are skipped.  LLVM's MIPS printer wraps
+ *      `rdhwr` in `.set push / .set mips32r2 / ... / .set pop`, so the first
+ *      token of its rendering is a directive and not a mnemonic at all.
+ *      Measured: 32 encodings on mipsel, the ISA's entire join residue.
+ *
+ *   2. LEADING x86 PREFIX WORDS are skipped, on BOTH sides.  Capstone folds
+ *      a prefix into its mnemonic field (`rep insb`, `bnd ja`, `repz retq`)
+ *      and LLVM prints it as a leading word of the rendering, sometimes
+ *      under a different spelling of the same byte (`f2` is `bnd` to one and
+ *      `repne` to the other).  The instruction under the prefix is the same
+ *      instruction.  Measured: this layer alone joins 1,797,127 of the
+ *      2,279,823 x86_64 encodings that a bare first-token comparison
+ *      separates.  A rendering that reduces to nothing but prefixes is a
+ *      LONE PREFIX BYTE decoded as an instruction and joins only another
+ *      such rendering.
+ *
+ *   3. AN AT&T OPERAND-SIZE SUFFIX PRESENT ON ONE SIDE AND ABSENT ON THE
+ *      OTHER is folded: `cvtsi2sdl`/`cvtsi2sd`, `lgs`/`lgsq`, `ud1`/`ud1l`,
+ *      `xsave`/`xsave64`.  One decoder spells the width the encoding already
+ *      fixes and the other leaves it to the operands.  The fold requires one
+ *      name to be a strict PREFIX of the other with the remainder a size
+ *      suffix, so a pair that disagrees about WHICH width was decoded --
+ *      `popw`/`popq`, `insw`/`insl`, `rdrandl`/`rdrandq` -- is not folded and
+ *      stays a join failure, which is right: those two decoders read the
+ *      operand-size prefixes differently and are describing different
+ *      instructions.
+ *
+ * THEN AN ALIAS TABLE, AND IT IS SMALL BECAUSE IT IS MEASURED.  What the
+ * three layers leave on the fixed-width ISAs is four ordered pairs, each an
+ * ARCHITECTURALLY DEFINED ALIAS -- one encoding with two assembly spellings,
+ * which no dataflow difference can follow from.  Each row carries the
+ * reference that says so, and an alias row that matches nothing is REPORTED
+ * as dead in the same breath as a dead allowlist rule, so a table entry
+ * cannot quietly outlive the decoder behaviour it describes.
+ *
+ * WHAT IS DELIBERATELY NOT FOLDED is every pair where the two decoders name
+ * different instructions -- `clwb`/`xsaveopt64`, `nopw`/`cldemote`,
+ * `lfence`/`incsspq`, `tpause`/`umonitor`.  Those are the R20 class: a join
+ * failure to report, never a dataflow signature to score.
+ */
+static unsigned long srcenc_join_scored = 0;
+static unsigned long srcenc_join_failed = 0;
+static unsigned long srcenc_join_llvm_reject = 0;
+static unsigned long srcenc_join_size = 0;
+static unsigned long srcenc_join_mnem = 0;
+struct JoinFail { std::string sample; unsigned long n = 0; };
+static std::map<std::string, JoinFail> srcenc_joinfail;
+
+/*
+ * The x86 legacy prefixes as the TWO DECODERS SPELL THEM, which is not the
+ * same list as the architecture's: `f2` appears here as both `repne` and
+ * `bnd`, and `f3` as `rep`, `repe` and `repz`, because that is what the two
+ * printers emit for the one byte.  Non-x86 arms never match a row here.
+ */
+static bool is_prefix_word(const std::string &w)
+{
+    static const std::set<std::string> P = {
+        "rep", "repe", "repz", "repne", "repnz", "bnd", "lock", "notrack",
+        "addr32", "data16", "xacquire", "xrelease", "rex64",
+    };
+    return P.count(w) != 0;
+}
+
+/* AT&T operand-size suffixes, longest first so `64` is tried before `4`
+ * could ever be. */
+static bool is_size_suffix(const std::string &t)
+{
+    return t == "64" || t == "b" || t == "w" || t == "l" || t == "q";
+}
+
+/*
+ * Reduce a rendering to its core mnemonic: skip `.directive operand` pairs,
+ * skip prefix words, return the first word that is neither.  A rendering
+ * made only of prefixes returns the sentinel, which compares equal only to
+ * itself -- a lone prefix byte is an instruction, and it is the same
+ * instruction on both sides.
+ */
+static std::string core_mnem(const std::string &text)
+{
+    std::vector<std::string> w;
+    std::istringstream is(lower(text));
+    std::string t;
+    while (is >> t) w.push_back(t);
+    size_t i = 0;
+    while (i < w.size()) {
+        if (w[i][0] == '.') { i += 2; continue; }   /* `.set push` */
+        if (is_prefix_word(w[i])) { i++; continue; }
+        return w[i];
+    }
+    return "<prefix-only>";
+}
+
+/*
+ * ARCHITECTURALLY DEFINED ALIASES: one encoding, two spellings.  Every row
+ * is a pair the JOINFAIL census produced, with the reference that settles it.
+ */
+struct AliasRow { const char *isa, *cs, *llvm, *why; unsigned long hits; };
+static AliasRow alias_rows[] = {
+    /* Arm ARM C6.2 (BFC/BFI/BFXIL are all aliases of BFM; BFC is BFI with
+     * Rn == ZR, which is exactly what LLVM prints).  The register sets may
+     * still differ -- LLVM names the zero register that BFC's spelling
+     * hides -- and under R15 that difference is a REAL comparison, which is
+     * the reason to join rather than separate. */
+    { "aarch64", "bfc", "bfi",   "Arm ARM C6.2 BFM aliases", 0 },
+    { "aarch64", "bfc", "bfxil", "Arm ARM C6.2 BFM aliases", 0 },
+    /* Arm ARM C6.2 TLBIP: an alias of SYSP with op1/CRn/CRm/op2 fixed. */
+    { "aarch64", "tlbip", "sysp", "Arm ARM C6.2 TLBIP is SYSP", 0 },
+    /* RISC-V Zihintpause: PAUSE is a HINT encoded as FENCE with pred=W,
+     * succ=0, rd=x0, rs1=x0, fm=0 -- the encoding LLVM prints back. */
+    { "riscv64", "pause", "fence", "RISC-V Zihintpause: PAUSE is FENCE W,0", 0 },
+};
+
+static bool alias_joins(const std::string &cs, const std::string &ll)
+{
+    for (auto &r : alias_rows) {
+        if (strcmp(r.isa, cfg.name)) continue;
+        if (cs == r.cs && ll == r.llvm) { r.hits++; return true; }
+    }
+    return false;
+}
+
+/* One name is the other plus an AT&T size suffix. */
+static bool suffix_joins(const std::string &a, const std::string &b)
+{
+    const std::string &s = a.size() < b.size() ? a : b;
+    const std::string &l = a.size() < b.size() ? b : a;
+    if (s.empty() || s.size() >= l.size()) return false;
+    if (l.compare(0, s.size(), s)) return false;
+    return is_size_suffix(l.substr(s.size()));
+}
+
+/*
+ * Does this encoding join?  Returns true when the row may be scored as
+ * dataflow; otherwise records the failure under its ordered mnemonic pair
+ * and returns false.  @sample is the already-built `hex cs{} llvm{}` line,
+ * so a reader never has to reconstruct which bytes produced the pair.
+ */
+static bool srcenc_join_ok(const CsView &c, const LlView &l,
+                           const std::string &sample)
+{
+    std::string cm = c.ok ? core_mnem(c.mnem) : std::string("<cs-reject>");
+    std::string lm = l.ok ? core_mnem(l.text) : std::string("<llvm-reject>");
+    const char *why = nullptr;
+    if (!l.ok) { why = "llvm-reject"; srcenc_join_llvm_reject++; }
+    else if (!c.ok) { why = "cs-reject"; }
+    else if (c.size != l.size) { why = "size"; srcenc_join_size++; }
+    else if (cm != lm && !suffix_joins(cm, lm) && !alias_joins(cm, lm)) {
+        why = "mnem"; srcenc_join_mnem++;
+    }
+    if (!why) { srcenc_join_scored++; return true; }
+    srcenc_join_failed++;
+    std::string key = std::string(why) + " " + cm + " -> " + lm;
+    auto &jf = srcenc_joinfail[key];
+    if (!jf.n) jf.sample = sample;
+    jf.n++;
+    return false;
+}
+
 /* --dump-pop=FILE: the sled's population.  One line per encoding this sweep
  * DECODES, in the same hex spelling the corpus is keyed on, so the sled can
  * be driven over exactly what the gate will ask about.  Written by the shard
@@ -1513,6 +1705,16 @@ static const std::map<std::string, unsigned> &srcenc_name_map(void)
     return m;
 }
 
+/*
+ * Load the per-encoding corpus for THIS arm's ISA.
+ *
+ * REFUSES rather than degrades on every input it cannot read exactly: an
+ * unopenable file, a row whose ISA column names an ISA the file also claims
+ * elsewhere with a different answer, a register token that is not in this
+ * build's name space, and -- the case that matters most -- a corpus that
+ * carries no row at all for this ISA.  An empty corpus that scores zero
+ * disagreements is indistinguishable from a perfect one.
+ */
 /*
  * Load the per-encoding corpus for THIS arm's ISA.
  *
@@ -1801,10 +2003,14 @@ static void map_llvm_regs(const std::set<std::string> &toks,
  * --srcenc commentary above.
  */
 static void srcenc_score_reads(const std::set<unsigned> *row,
-                               const std::set<std::string> &llvm_rd,
+                               const CsView &c, const LlView &l,
                                const std::string &m, const std::string &sample)
 {
     if (!row) return;
+    /* The join is asked BEFORE any set is built.  A row that does not join
+     * is not a dataflow answer at all, so it never reaches a signature. */
+    if (!srcenc_join_ok(c, l, sample)) return;
+    const std::set<std::string> &llvm_rd = l.rd;
 
     std::set<unsigned> wire(*row);
     for (auto it = wire.begin(); it != wire.end(); )
@@ -2084,7 +2290,7 @@ static void compare(const uint8_t *b, size_t n)
             if (!cronly.empty())
                 note("FR-rd-phantom " + m + " +" + genliststr(cronly), ctx);
         } else {
-            srcenc_score_reads(srcenc_row, l.rd, m, sample);
+            srcenc_score_reads(srcenc_row, c, l, m, sample);
         }
     } else if (want_regs) {
         for (auto *S : {&c.rd, &c.wr, &l.rd, &l.wr}) {
@@ -2129,7 +2335,7 @@ static void compare(const uint8_t *b, size_t n)
              * the tracer's own register table -- the same route the fields
              * layer takes -- so `x30` and `r30` meet as REG_LR.
              */
-            srcenc_score_reads(srcenc_row, l.rd, m, sample);
+            srcenc_score_reads(srcenc_row, c, l, m, sample);
         }
     }
 }
@@ -2632,6 +2838,21 @@ static void emit_srcenc_shard(void)
     for (const auto &m : srcenc_mnem_all) printf("#srcencma\t0\t%s\n", m.c_str());
     for (const auto &kv : srcenc_unreached_by_mnem)
         printf("#srcencum\t%lu\t%s\n", kv.second, kv.first.c_str());
+    /*
+     * The join census crosses the shard pipe like everything else.  The
+     * record's sample field carries KEY \x1f SAMPLE, because the wire format
+     * here is `key TAB count TAB sample` and the join key is itself a
+     * multi-word string; \x1f cannot occur in either half.
+     */
+    printf("#srcencjs\t%lu\t\n", srcenc_join_scored);
+    printf("#srcencjr\t%lu\t\n", srcenc_join_llvm_reject);
+    printf("#srcencjz\t%lu\t\n", srcenc_join_size);
+    printf("#srcencjm\t%lu\t\n", srcenc_join_mnem);
+    for (unsigned i = 0; i < sizeof(alias_rows) / sizeof(alias_rows[0]); i++)
+        printf("#srcencja\t%lu\t%u\n", alias_rows[i].hits, i);
+    for (const auto &kv : srcenc_joinfail)
+        printf("#srcencjf\t%lu\t%s\x1f%s\n", kv.second.n,
+               kv.first.c_str(), kv.second.sample.c_str());
 }
 
 static void run_sweep(unsigned shard, unsigned nshard)
@@ -3235,6 +3456,27 @@ int main(int argc, char **argv)
                 if (key == "#srcencum") {
                     srcenc_unreached_by_mnem[samp] += cnt; continue;
                 }
+                if (key == "#srcencjs") { srcenc_join_scored += cnt; continue; }
+                if (key == "#srcencjr") {
+                    srcenc_join_llvm_reject += cnt; continue;
+                }
+                if (key == "#srcencjz") { srcenc_join_size += cnt; continue; }
+                if (key == "#srcencjm") { srcenc_join_mnem += cnt; continue; }
+                if (key == "#srcencja") {
+                    unsigned i = (unsigned)strtoul(samp.c_str(), nullptr, 10);
+                    if (i < sizeof(alias_rows) / sizeof(alias_rows[0]))
+                        alias_rows[i].hits += cnt;
+                    continue;
+                }
+                if (key == "#srcencjf") {
+                    size_t u = samp.find('\x1f');
+                    if (u == std::string::npos) continue;
+                    auto &jf = srcenc_joinfail[samp.substr(0, u)];
+                    if (!jf.n) jf.sample = samp.substr(u + 1);
+                    jf.n += cnt;
+                    srcenc_join_failed += cnt;
+                    continue;
+                }
                 auto &b = buckets[key];
                 if (!b.n) b.sample = samp;
                 b.n += cnt;
@@ -3367,6 +3609,52 @@ int main(int argc, char **argv)
                        (double)srcenc_mnem_all.size() : 0.0,
                    srcenc_mnem_all.size() - srcenc_mnem_hit.size(),
                    superseded.size());
+            /*
+             * THE JOIN LINE.  Printed unconditionally, next to the reach
+             * line, because a residue and the population it was scored over
+             * are one reading: `scored` is the number of encodings whose two
+             * decoders agreed on the instruction and whose dataflow was
+             * therefore compared, and `failed` is the number separated out
+             * with the reason each was separated for.  A separation that is
+             * not published is indistinguishable from a filter.
+             */
+            unsigned long jtot = srcenc_join_scored + srcenc_join_failed;
+            printf("# srcenc_join scored=%lu failed=%lu of=%lu (%.4f%% "
+                   "scored) fail_llvm_reject=%lu fail_size=%lu fail_mnem=%lu "
+                   "distinct_fail_pairs=%zu\n",
+                   srcenc_join_scored, srcenc_join_failed, jtot,
+                   jtot ? 100.0 * (double)srcenc_join_scored / (double)jtot
+                        : 0.0,
+                   srcenc_join_llvm_reject, srcenc_join_size,
+                   srcenc_join_mnem, srcenc_joinfail.size());
+            /* The whole vocabulary, always -- it is the input an alias
+             * adjudication has to be argued from, and it is bounded by the
+             * number of DISTINCT mnemonic pairs, not by the population. */
+            for (const auto &kv : srcenc_joinfail)
+                printf("JOINFAIL %-9lu %s\n    %s\n", kv.second.n,
+                       kv.first.c_str(), kv.second.sample.c_str());
+            /*
+             * A DEAD ALIAS ROW IS REPORTED, for the reason a dead allowlist
+             * rule is: a fold that matches nothing has outlived the decoder
+             * behaviour it describes, and an unaudited fold is exactly the
+             * amnesty this family exists to avoid.  Rows for other ISAs are
+             * not this arm's to judge and are not counted.
+             */
+            unsigned dead_alias = 0;
+            for (const auto &r : alias_rows) {
+                if (strcmp(r.isa, cfg.name)) continue;
+                if (r.hits) continue;
+                dead_alias++;
+                printf("DEAD-ALIAS %s %s -> %s   (%s)\n",
+                       r.isa, r.cs, r.llvm, r.why);
+            }
+            for (const auto &r : alias_rows) {
+                if (strcmp(r.isa, cfg.name) || !r.hits) continue;
+                printf("ALIAS-JOINED %-9lu %s -> %s   (%s)\n",
+                       r.hits, r.cs, r.llvm, r.why);
+            }
+            if (dead_alias)
+                printf("# srcenc_join dead_alias_rows=%u\n", dead_alias);
             if (getenv("ISAX_DUMP_UNREACHED"))
                 for (const auto &kv : srcenc_unreached_by_mnem)
                     printf("UNREACHED %-9lu %s\n", kv.second, kv.first.c_str());

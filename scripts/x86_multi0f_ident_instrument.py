@@ -34,8 +34,13 @@
 #     row's provenance, so a row can never outlive the arm it describes;
 #
 #   * the name is `translate.c/multi0F@b=<hex>,modrm=<bits>[,pfx=<name>]`
-#     and the id is FNV-1a-32 of it with the anchor line appended, the
-#     derivation scripts/decodetree.py and the three other legs use;
+#     and the id is FNV-1a-32 of the NAME ALONE -- the derivation
+#     scripts/x86_x87_ident_instrument.py and scripts/mips_ident_instrument.py
+#     use, and for their reason: these arms share one X86_OP_ENTRY slot, so
+#     there is no runtime __LINE__ to append, and appending the ANCHOR line
+#     instead made every id a function of where translate.c happens to hold
+#     the case label.  The anchor is still located, still refused when it is
+#     missing or doubled, and still printed as the row's provenance;
 #
 #   * the selector is checked EXHAUSTIVELY over the whole (b, prefix,
 #     modrm) space this function can be entered with -- not sampled -- and
@@ -350,7 +355,38 @@ def build(path_tr, path_out, path_x87, report):
             b, bits_name(mask, value, mem))
         if pfx != PFX_ANY:
             name += ',pfx=%s' % pfx
-        rows.append((name, fnv1a32('%s#%d' % (name, found[0])), found[0], arm))
+        # THE IDENTITY IS THE NAME ALONE, AND THE LINE IS PROVENANCE ONLY.
+        #
+        # It used to be fnv1a32('<name>#<anchor line>'), and that made every
+        # one of these forty-two ids a function of where gen_multi0F()'s case
+        # labels happen to sit in translate.c.  Adding lines ABOVE them --
+        # which a QEMU-side dataflow declaration does routinely -- renumbered
+        # all forty-two at once, so the shipped table stopped regenerating
+        # from its own tree: verify48 measured 42 rows, names identical as a
+        # set, and ZERO ids in common with a fresh emit, the anchors having
+        # moved by a uniform +349.
+        #
+        # That is exactly the fragility scripts/decodetree.py:ident_hash()
+        # gives as its reason for being a hash rather than a table ordinal --
+        # "an ordinal renumbers whenever a pattern is added to or removed
+        # from the .decode file, which would silently invalidate any table a
+        # consumer had keyed on it".  A source line number IS an ordinal.
+        #
+        # THE OTHER LEGS ARE NOT WRONG AND ARE NOT CHANGED.  3DNow!, PREFETCH,
+        # CET and VEX append decode-new.c.inc's own __LINE__, which is the
+        # slot QEMU STAMPS at run time: their id SHOULD move when that moves,
+        # because the thing they qualify moved.  gen_multi0F's arms have no
+        # such slot -- all five X86_OP_ENTRY sites share one -- so the anchor
+        # line was never the runtime identity here, only a citation.  The x87
+        # and MIPS legs, whose arms are likewise located by anchor, already
+        # key on the name alone; this joins them.
+        #
+        # Uniqueness is not weakened: the name carries b, the modrm bits and
+        # the prefix, and the assertion below still refuses two arms that
+        # share one.  The anchor is still LOCATED, still refused when missing
+        # or doubled, and still printed beside each row -- so a row still
+        # cannot outlive the arm it describes.
+        rows.append((name, fnv1a32(name), found[0], arm))
 
     ids = [r[1] for r in rows]
     if len(set(ids)) != len(ids):
@@ -410,9 +446,13 @@ def build(path_tr, path_out, path_x87, report):
     w(' * so the arms are keyed on prefix and mod alone and a disabled')
     w(' * machine publishes the same identity as an enabled one.')
     w(' *')
-    w(' * The id is FNV-1a-32 of the name with the anchor line appended,')
-    w(' * the derivation scripts/decodetree.py uses, printed beside each')
-    w(' * row so it can be recomputed by hand.')
+    w(' * The id is FNV-1a-32 of the NAME ALONE.  These arms share one')
+    w(' * X86_OP_ENTRY slot, so there is no runtime __LINE__ to append;')
+    w(' * appending the anchor line instead made every id a function of')
+    w(' * where translate.c holds the case label, and a declaration added')
+    w(' * above them renumbered all forty-two at once.  The anchor is')
+    w(' * still located and still printed beside each row, as the row\'s')
+    w(' * provenance and not as part of its identity.')
     w(' *')
     w(' * THE BASE ROWS DO NOT MOVE.  decode-new.c.inc is not edited at')
     w(' * all; an encoding that reaches no arm publishes nothing here and')

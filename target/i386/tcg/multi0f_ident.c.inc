@@ -24,9 +24,13 @@
  * so the arms are keyed on prefix and mod alone and a disabled
  * machine publishes the same identity as an enabled one.
  *
- * The id is FNV-1a-32 of the name with the anchor line appended,
- * the derivation scripts/decodetree.py uses, printed beside each
- * row so it can be recomputed by hand.
+ * The id is FNV-1a-32 of the NAME ALONE.  These arms share one
+ * X86_OP_ENTRY slot, so there is no runtime __LINE__ to append;
+ * appending the anchor line instead made every id a function of
+ * where translate.c holds the case label, and a declaration added
+ * above them renumbered all forty-two at once.  The anchor is
+ * still located and still printed beside each row, as the row's
+ * provenance and not as part of its identity.
  *
  * THE BASE ROWS DO NOT MOVE.  decode-new.c.inc is not edited at
  * all; an encoding that reaches no arm publishes nothing here and
@@ -48,131 +52,131 @@ static const struct {
 } multi0f_ident_tab[] = {
     { 0, NULL },
     /* sldt: case 0:  sldt */
-    /* translate.c:3584 word=sldt(arm) */
-    { 0x040d6df5u, "translate.c/multi0F@b=100,modrm=..000..." },
+    /* translate.c:3933 word=sldt(arm) */
+    { 0x4e666268u, "translate.c/multi0F@b=100,modrm=..000..." },
     /* str: case 1:  str */
-    /* translate.c:3606 word=str(arm) */
-    { 0xd2c598e5u, "translate.c/multi0F@b=100,modrm=..001..." },
+    /* translate.c:3956 word=str(arm) */
+    { 0x11571ae1u, "translate.c/multi0F@b=100,modrm=..001..." },
     /* lldt: case 2:  lldt */
-    /* translate.c:3596 word=lldt(arm) */
-    { 0x58ea2d77u, "translate.c/multi0F@b=100,modrm=..010..." },
+    /* translate.c:3945 word=lldt(arm) */
+    { 0x4ea6536fu, "translate.c/multi0F@b=100,modrm=..010..." },
     /* ltr: case 3:  ltr */
-    /* translate.c:3618 word=ltr(arm) */
-    { 0x5029b777u, "translate.c/multi0F@b=100,modrm=..011..." },
+    /* translate.c:3968 word=ltr(arm) */
+    { 0x004c74f6u, "translate.c/multi0F@b=100,modrm=..011..." },
     /* verr: case 4:  verr */
-    /* translate.c:3628 word=verr(arm) */
-    { 0xe9ff2061u, "translate.c/multi0F@b=100,modrm=..100..." },
+    /* translate.c:3979 word=verr(arm) */
+    { 0xa1042119u, "translate.c/multi0F@b=100,modrm=..100..." },
     /* verw: case 5:  verw */
-    /* translate.c:3629 word=verw(arm) */
-    { 0x6d4bb1e5u, "translate.c/multi0F@b=100,modrm=..101..." },
+    /* translate.c:3980 word=verw(arm) */
+    { 0xdf509d20u, "translate.c/multi0F@b=100,modrm=..101..." },
     /* sgdt: CASE_MODRM_MEM_OP(0):  sgdt */
-    /* translate.c:3648 word=sgdt(arm) */
-    { 0x2edb4c2cu, "translate.c/multi0F@b=101,modrm=..000...,mem" },
+    /* translate.c:3999 word=sgdt(arm) */
+    { 0x42a96af8u, "translate.c/multi0F@b=101,modrm=..000...,mem" },
     /* sidt: CASE_MODRM_MEM_OP(1):  sidt */
-    /* translate.c:3704 word=sidt(arm) */
-    { 0xcee0ee64u, "translate.c/multi0F@b=101,modrm=..001...,mem" },
+    /* translate.c:4055 word=sidt(arm) */
+    { 0xf86291b1u, "translate.c/multi0F@b=101,modrm=..001...,mem" },
     /* lgdt: CASE_MODRM_MEM_OP(2):  lgdt */
-    /* translate.c:3852 word=lgdt(arm) */
-    { 0x38fcf610u, "translate.c/multi0F@b=101,modrm=..010...,mem" },
+    /* translate.c:4217 word=lgdt(arm) */
+    { 0x62ad41c3u, "translate.c/multi0F@b=101,modrm=..010...,mem" },
     /* lidt: CASE_MODRM_MEM_OP(3):  lidt */
-    /* translate.c:3868 word=lidt(arm) */
-    { 0x98bc8a9eu, "translate.c/multi0F@b=101,modrm=..011...,mem" },
+    /* translate.c:4233 word=lidt(arm) */
+    { 0x313f21aau, "translate.c/multi0F@b=101,modrm=..011...,mem" },
     /* invlpg: CASE_MODRM_MEM_OP(7):  invlpg */
-    /* translate.c:3935 word=invlpg(arm) */
-    { 0xe0a59278u, "translate.c/multi0F@b=101,modrm=..111...,mem" },
+    /* translate.c:4300 word=invlpg(arm) */
+    { 0xaf30bda7u, "translate.c/multi0F@b=101,modrm=..111...,mem" },
     /* monitor: case 0xc8:  monitor */
-    /* translate.c:3666 word=monitor(arm) */
-    { 0x8d36bb08u, "translate.c/multi0F@b=101,modrm=11001000" },
+    /* translate.c:4017 word=monitor(arm) */
+    { 0xa5334654u, "translate.c/multi0F@b=101,modrm=11001000" },
     /* mwait: case 0xc9:  mwait */
-    /* translate.c:3676 word=mwait(arm) */
-    { 0xd7eea1dcu, "translate.c/multi0F@b=101,modrm=11001001" },
+    /* translate.c:4027 word=mwait(arm) */
+    { 0xa63347e7u, "translate.c/multi0F@b=101,modrm=11001001" },
     /* clac: case 0xca:  clac */
-    /* translate.c:3686 word=clac(arm) */
-    { 0xe6b3dd41u, "translate.c/multi0F@b=101,modrm=11001010" },
+    /* translate.c:4037 word=clac(arm) */
+    { 0xab358e5du, "translate.c/multi0F@b=101,modrm=11001010" },
     /* stac: case 0xcb:  stac */
-    /* translate.c:3695 word=stac(arm) */
-    { 0x6e197624u, "translate.c/multi0F@b=101,modrm=11001011" },
+    /* translate.c:4046 word=stac(arm) */
+    { 0xaa358ccau, "translate.c/multi0F@b=101,modrm=11001011" },
     /* xgetbv: case 0xd0:  xgetbv */
-    /* translate.c:3721 word=xgetbv(arm) */
-    { 0x32d2cd1cu, "translate.c/multi0F@b=101,modrm=11010000" },
+    /* translate.c:4072 word=xgetbv(arm) */
+    { 0x56cb1c22u, "translate.c/multi0F@b=101,modrm=11010000" },
     /* xsetbv: case 0xd1:  xsetbv */
-    /* translate.c:3731 word=xsetbv(arm) */
-    { 0xde2d0d24u, "translate.c/multi0F@b=101,modrm=11010001" },
+    /* translate.c:4096 word=xsetbv(arm) */
+    { 0x57cb1db5u, "translate.c/multi0F@b=101,modrm=11010001" },
     /* vmrun: case 0xd8:  VMRUN */
-    /* translate.c:3748 word=vmrun(arm) */
-    { 0x37582f06u, "translate.c/multi0F@b=101,modrm=11011000" },
+    /* translate.c:4113 word=vmrun(arm) */
+    { 0x5d7ac9b3u, "translate.c/multi0F@b=101,modrm=11011000" },
     /* vmmcall: case 0xd9:  VMMCALL */
-    /* translate.c:3768 word=vmmcall(arm) */
-    { 0xf0eebe4du, "translate.c/multi0F@b=101,modrm=11011001" },
+    /* translate.c:4133 word=vmmcall(arm) */
+    { 0x5c7ac820u, "translate.c/multi0F@b=101,modrm=11011001" },
     /* vmload: case 0xda:  VMLOAD */
-    /* translate.c:3777 word=vmload(arm) */
-    { 0xc7c62e3bu, "translate.c/multi0F@b=101,modrm=11011010" },
+    /* translate.c:4142 word=vmload(arm) */
+    { 0xf777ea8au, "translate.c/multi0F@b=101,modrm=11011010" },
     /* vmsave: case 0xdb:  VMSAVE */
-    /* translate.c:3789 word=vmsave(arm) */
-    { 0x5bacfd27u, "translate.c/multi0F@b=101,modrm=11011011" },
+    /* translate.c:4154 word=vmsave(arm) */
+    { 0xf877ec1du, "translate.c/multi0F@b=101,modrm=11011011" },
     /* stgi: case 0xdc:  STGI */
-    /* translate.c:3801 word=stgi(arm) */
-    { 0x05e2907du, "translate.c/multi0F@b=101,modrm=11011100" },
+    /* translate.c:4166 word=stgi(arm) */
+    { 0xfee395e8u, "translate.c/multi0F@b=101,modrm=11011100" },
     /* clgi: case 0xdd:  CLGI */
-    /* translate.c:3814 word=clgi(arm) */
-    { 0x1b7de51eu, "translate.c/multi0F@b=101,modrm=11011101" },
+    /* translate.c:4179 word=clgi(arm) */
+    { 0xffe3977bu, "translate.c/multi0F@b=101,modrm=11011101" },
     /* skinit: case 0xde:  SKINIT */
-    /* translate.c:3826 word=skinit(arm) */
-    { 0x0637ad19u, "translate.c/multi0F@b=101,modrm=11011110" },
+    /* translate.c:4191 word=skinit(arm) */
+    { 0x04e5ddf1u, "translate.c/multi0F@b=101,modrm=11011110" },
     /* invlpga: case 0xdf:  INVLPGA */
-    /* translate.c:3835 word=invlpga(arm) */
-    { 0x07a55ae8u, "translate.c/multi0F@b=101,modrm=11011111" },
+    /* translate.c:4200 word=invlpga(arm) */
+    { 0x03e5dc5eu, "translate.c/multi0F@b=101,modrm=11011111" },
     /* rdpkru: case 0xee:  rdpkru */
-    /* translate.c:3899 word=rdpkru(arm) */
-    { 0xa4b055edu, "translate.c/multi0F@b=101,modrm=11101110" },
+    /* translate.c:4264 word=rdpkru(arm) */
+    { 0x711b113bu, "translate.c/multi0F@b=101,modrm=11101110" },
     /* wrpkru: case 0xef:  wrpkru */
-    /* translate.c:3907 word=wrpkru(arm) */
-    { 0xe8bfb4f0u, "translate.c/multi0F@b=101,modrm=11101111" },
+    /* translate.c:4272 word=wrpkru(arm) */
+    { 0x701b0fa8u, "translate.c/multi0F@b=101,modrm=11101111" },
     /* swapgs: case 0xf8:  swapgs */
-    /* translate.c:3945 word=swapgs(arm) */
-    { 0x19949b8cu, "translate.c/multi0F@b=101,modrm=11111000" },
+    /* translate.c:4310 word=swapgs(arm) */
+    { 0x907a2d7eu, "translate.c/multi0F@b=101,modrm=11111000" },
     /* rdtscp: case 0xf9:  rdtscp */
-    /* translate.c:3960 word=rdtscp(arm) */
-    { 0x24ca2814u, "translate.c/multi0F@b=101,modrm=11111001" },
+    /* translate.c:4325 word=rdtscp(arm) */
+    { 0x917a2f11u, "translate.c/multi0F@b=101,modrm=11111001" },
     /* smsw: CASE_MODRM_OP(4):  smsw */
-    /* translate.c:3884 word=smsw(arm) */
-    { 0x7ddd3b42u, "translate.c/multi0F@b=101,modrm=..100..." },
+    /* translate.c:4249 word=smsw(arm) */
+    { 0xfb39d824u, "translate.c/multi0F@b=101,modrm=..100..." },
     /* lmsw: CASE_MODRM_OP(6):  lmsw */
-    /* translate.c:3917 word=lmsw(arm) */
-    { 0x18c97f34u, "translate.c/multi0F@b=101,modrm=..110..." },
+    /* translate.c:4282 word=lmsw(arm) */
+    { 0x0e0bb96bu, "translate.c/multi0F@b=101,modrm=..110..." },
     /* rdrand: case 6:  RDRAND */
-    /* translate.c:3561 word=rdrand(arm) */
-    { 0x83374d08u, "translate.c/multi0F@b=1c7,modrm=..110..." },
+    /* translate.c:3910 word=rdrand(arm) */
+    { 0xc7765114u, "translate.c/multi0F@b=1c7,modrm=..110..." },
     /* rdpid: CPUID_7_0_ECX_RDPID */
-    /* translate.c:3547 word=rdpid(arm) */
-    { 0x5954253bu, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=repz" },
+    /* translate.c:3896 word=rdpid(arm) */
+    { 0xd3db13a1u, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=repz" },
     /* rdseed: CPUID_7_0_EBX_RDSEED */
-    /* translate.c:3555 word=rdseed(arm) */
-    { 0x4a8332d7u, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=none" },
+    /* translate.c:3904 word=rdseed(arm) */
+    { 0x42a2b0bcu, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=none" },
     /* bndcl: bndcl */
-    /* translate.c:3982 word=bndcl(arm) */
-    { 0xccf6c741u, "translate.c/multi0F@b=11a,modrm=........,pfx=repz" },
+    /* translate.c:4347 word=bndcl(arm) */
+    { 0xfb65e892u, "translate.c/multi0F@b=11a,modrm=........,pfx=repz" },
     /* bndcu: bndcu */
-    /* translate.c:3989 word=bndcu(arm) */
-    { 0xf234d746u, "translate.c/multi0F@b=11a,modrm=........,pfx=repnz" },
+    /* translate.c:4354 word=bndcu(arm) */
+    { 0xb18a33e4u, "translate.c/multi0F@b=11a,modrm=........,pfx=repnz" },
     /* bndmov: bndmov -- from reg/mem */
-    /* translate.c:3998 word=bndmov(arm) */
-    { 0x377eb8cbu, "translate.c/multi0F@b=11a,modrm=........,pfx=data" },
+    /* translate.c:4363 word=bndmov(arm) */
+    { 0x5e748d31u, "translate.c/multi0F@b=11a,modrm=........,pfx=data" },
     /* bndldx: bndldx */
-    /* translate.c:4030 word=bndldx(arm) */
-    { 0x73e869eeu, "translate.c/multi0F@b=11a,modrm=........,mem,pfx=none" },
+    /* translate.c:4395 word=bndldx(arm) */
+    { 0xaa96b4a8u, "translate.c/multi0F@b=11a,modrm=........,mem,pfx=none" },
     /* bndmk: bndmk */
-    /* translate.c:4066 word=bndmk(arm) */
-    { 0x0598bb5du, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=repz" },
+    /* translate.c:4431 word=bndmk(arm) */
+    { 0xe5e49430u, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=repz" },
     /* bndcn: bndcn */
-    /* translate.c:4093 word=bndcn(arm) */
-    { 0x7205c518u, "translate.c/multi0F@b=11b,modrm=........,pfx=repnz" },
+    /* translate.c:4458 word=bndcn(arm) */
+    { 0x86a210efu, "translate.c/multi0F@b=11b,modrm=........,pfx=repnz" },
     /* bndmov: bndmov -- to reg/mem */
-    /* translate.c:4100 word=bndmov(arm) */
-    { 0x6c85a6dau, "translate.c/multi0F@b=11b,modrm=........,pfx=data" },
+    /* translate.c:4465 word=bndmov(arm) */
+    { 0xe31a4ce8u, "translate.c/multi0F@b=11b,modrm=........,pfx=data" },
     /* bndstx: bndstx */
-    /* translate.c:4130 word=bndstx(arm) */
-    { 0xc957813eu, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=none" },
+    /* translate.c:4495 word=bndstx(arm) */
+    { 0x08a3cf99u, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=none" },
 };
 
 /* Prefix requirement, as gen_multi0F itself tests it. */

@@ -3210,6 +3210,91 @@ static void gen_note_x87_env_reads(int mod, int op, int rm)
     }
 }
 
+/*
+ * THE STATUS WORD IS WRITTEN BY ALMOST EVERY x87 INSTRUCTION, and QEMU
+ * writes it for most of them by accident of where the value lives.
+ *
+ * FPSW carries the condition codes, the sticky exception flags and TOP, and
+ * the SDM gives every arithmetic, load, store, compare, transcendental and
+ * stack instruction in the escape space a FPU-flags row: C1 at minimum, the
+ * exception bits wherever the operation can raise, TOP wherever it pushes or
+ * pops.  Nothing about that is conditional on the operand, so this is one
+ * fact about the space rather than a table over it -- which is why it is
+ * stated uniformly here and not arm by arm.
+ *
+ * WHAT WAS MISSING.  A helper that pushes, pops or sets a condition code
+ * touches env->fpus or env->fpstt, and the extraction sees that store, so
+ * most of the space already carried the write.  The instructions QEMU
+ * implements WITHOUT touching either word did not: `fcmovcc`, `fst %st(i)`,
+ * `fxch`, `fchs` and `fabs` are moves and sign flips in this emulator, and
+ * the SDM defines all five as updating C1.  Measured at exec104 that is the
+ * whole of x86_64's REG_FCSR destination bar -- 7,638 registers over 14
+ * rule-and-mnemonic classes and no others.  Not modelling C1 is a lowering
+ * decision, and R15 says a lowering decision is not architectural truth;
+ * R16 says the ISA-defined write is recorded whatever the emulator does
+ * with it.
+ *
+ * WHAT DOES NOT WRITE IT, and every one is the architecture's own exception
+ * rather than this emulator's.  Two groups:
+ *
+ *   THE WORDS THAT NAME SOMETHING ELSE.  `fldcw` and `fnstcw` name only the
+ *   control word, `fnstsw` (both the memory form and `fnstsw %ax`) READS the
+ *   status word to store it, and `fnstenv` stores the environment and then
+ *   masks exceptions in FCW, leaving FSW alone.  The read side above draws
+ *   its FPSW line through the same instructions from the other direction,
+ *   which is the cross-check.
+ *
+ *   THE ONES THAT PERFORM NO OPERATION.  `fnop`, and the three 287 encodings
+ *   `feni`, `fdisi` and `fsetpm` that a 387 and later treat as `fnop`.  The
+ *   SDM lists their condition codes as UNDEFINED rather than as written, and
+ *   an instruction with no operation has no exception condition to record
+ *   either, so there is no defined update to state.  This is the direction
+ *   the first measurement of this note got wrong: stating FSW for the four
+ *   put 374 registers on the GAIN side of the destination bar -- a
+ *   destination QEMU claims and the wire does not carry -- which is the
+ *   fabrication direction, and it was the whole of that arm's gain.
+ *
+ * TOP IS NOT STATED HERE.  env->fpstt is the other half of the declared
+ * `fstat` register, and it moves only where the instruction pushes or pops
+ * -- which is exactly where QEMU's own helper already writes it, so a
+ * statement would add nothing and a blanket one would claim a TOP update for
+ * `fchs`.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_x87_env_writes(int mod, int op, int rm)
+{
+    if (mod != 3) {
+        switch (op) {
+        case 0x0d: /* fldcw   -- the control word, and only that */
+        case 0x0e: /* fnstenv -- stores the environment, masks in FCW */
+        case 0x0f: /* fnstcw  -- the control word, and only that */
+        case 0x2f: /* fnstsw  -- READS the status word to store it */
+            return;
+        }
+    } else {
+        switch (op) {
+        case 0x0a:
+            if (rm == 0) {
+                return;         /* fnop */
+            }
+            break;
+        case 0x1c:
+            if (rm == 0 || rm == 1 || rm == 4) {
+                return;         /* feni, fdisi, fsetpm */
+            }
+            break;
+        case 0x3c:
+            if (rm == 0) {
+                return;         /* fnstsw %ax, the register form of the same */
+            }
+            break;
+        }
+    }
+    insn_dataflow_note_stated_write_env(offsetof(CPUX86State, fpus),
+                                        sizeof(((CPUX86State *)0)->fpus));
+}
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -3901,6 +3986,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                       tcg_env, offsetof(CPUX86State, fpip));
     }
     gen_note_x87_env_reads(mod, op, rm);
+    gen_note_x87_env_writes(mod, op, rm);
     x87_ident_publish(b, modrm);  /* x87_ident */
     return;
 
@@ -3959,6 +4045,87 @@ static void gen_note_bnd_ub(int n)
     insn_dataflow_note_stated_read_env(
         offsetof(CPUX86State, bnd_regs[0].ub) + n * sizeof(BNDReg),
         sizeof(((CPUX86State *)0)->bnd_regs[0].ub));
+}
+
+/*
+ * THE BOUND REGISTER AN MPX INSTRUCTION WRITES.
+ *
+ * The exact mirror of gen_note_mpx_source(), and it exists for the identical
+ * reason: both emitter blocks sit inside `if (s->flags & HF_MPX_EN_MASK)`,
+ * so on a guest that has not enabled MPX the op stream carries no write of
+ * any bound register and `bndmk`, `bndldx` and `bndmov` all reach the
+ * extraction with no architectural destination at all.  Measured at exec104
+ * that is 15,441 x86_64 registers on the destination bar -- REG_BOUND0
+ * through REG_BOUND3, and the second-largest class on that side.
+ *
+ * IT IS AN ARCHITECTURAL WRITE WHETHER OR NOT MPX IS ON.  With MPX disabled
+ * the instruction is a NOP on real silicon too, and QEMU is right to emit
+ * nothing; R16 records the ISA-defined destination regardless of machine
+ * state, exactly as the source note records the ISA-defined dependency.
+ * The `mod == 3` register-to-register `bndmov` has a second version of the
+ * same shape -- QEMU skips the two moves when HF_MPX_IU_MASK is clear,
+ * because the bounds are at their INIT value -- and the write is stated
+ * there too, on the same rule.
+ *
+ * THE LEGALITY TESTS ARE RESTATED, in the same spelling and off @modrm and
+ * @s, for the reason gen_note_mpx_source() restates them: they live inside
+ * the enable guard where a disabled machine never runs them.
+ *
+ * WHICH INSTRUCTIONS, and which half.  `bndmk`, `bndldx` and the two
+ * `bndmov` directions write a WHOLE bound register, so both halves are
+ * stated; `bndcl`, `bndcu` and `bndcn` are checks with no destination, and
+ * `bndstx` and the memory form of `bndmov` write MEMORY.  The destination
+ * of the store-direction `bndmov` is bnd<reg2>, not bnd<reg> -- the source
+ * note states the opposite register for the same encoding, which is the
+ * cross-check that the direction is right.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_bnd_write(int n)
+{
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, bnd_regs[0].lb) + n * sizeof(BNDReg),
+        sizeof(((CPUX86State *)0)->bnd_regs[0].lb));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, bnd_regs[0].ub) + n * sizeof(BNDReg),
+        sizeof(((CPUX86State *)0)->bnd_regs[0].ub));
+}
+
+static void gen_note_mpx_dest(DisasContext *s, int b, int modrm, int prefixes)
+{
+    int mod = (modrm >> 6) & 3;
+    int reg = ((modrm >> 3) & 7) | REX_R(s);
+    int reg2 = (modrm & 7) | REX_B(s);
+
+    if ((b != 0x11a && b != 0x11b) || reg >= 4 || s->aflag == MO_16) {
+        return;
+    }
+
+    if (b == 0x11a) {
+        if (prefixes & (PREFIX_REPZ | PREFIX_REPNZ)) {
+            /* bndcl / bndcu: a check, and it writes no bound register. */
+        } else if (prefixes & PREFIX_DATA) {
+            /* bndmov bnd<reg> <- bnd<reg2>/m */
+            if (mod != 3 || reg2 < 4) {
+                gen_note_bnd_write(reg);
+            }
+        } else if (mod != 3) {
+            gen_note_bnd_write(reg);            /* bndldx bnd<reg> <- mib */
+        }
+    } else {
+        if (mod != 3 && (prefixes & PREFIX_REPZ)) {
+            gen_note_bnd_write(reg);            /* bndmk bnd<reg> <- m */
+        } else if (prefixes & PREFIX_REPNZ) {
+            /* bndcn: a check. */
+        } else if (prefixes & PREFIX_DATA) {
+            /* bndmov bnd<reg2>/m <- bnd<reg>; only the register form
+             * writes a bound register. */
+            if (mod == 3 && reg2 < 4) {
+                gen_note_bnd_write(reg2);
+            }
+        }
+        /* bndstx writes MEMORY. */
+    }
 }
 
 static void gen_note_mpx_source(DisasContext *s, int b, int modrm,
@@ -4665,6 +4832,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
         g_assert_not_reached();
     }
     gen_note_mpx_source(s, b, modrm, prefixes);
+    gen_note_mpx_dest(s, b, modrm, prefixes);
     multi0f_ident_publish(b, modrm, prefixes);  /* multi0f_ident */
     return;
  illegal_op:

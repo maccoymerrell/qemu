@@ -5172,8 +5172,8 @@ static void gen_XOR(DisasContext *s, X86DecodedInsn *decode)
  * does not: it is read inside the helper, the extraction reports the helper
  * unbounded, and the wire carried REG_SYS from the operand walk alone --
  * 26,512 registers over the XSAVE, XSAVEOPT and XRSTOR rules.  It is stated
- * as a range against the `xcr0` declaration in translate.c, which is the
- * declaration `xgetbv` already leans on.
+ * as a range against the `xcr0` declaration in translate.c, the same
+ * declaration the `xgetbv` site states its own read against.
  *
  * Capture only; no op is emitted, altered or suppressed.
  */

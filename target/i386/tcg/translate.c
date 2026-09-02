@@ -4074,6 +4074,20 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 || (s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
                 goto illegal_op;
             }
+            /*
+             * XGETBV RETURNS XCR[ECX], SO THE EXTENDED CONTROL REGISTER IS
+             * ITS OPERAND, NOT ITS PERMISSION.  helper_xgetbv() reads
+             * env->xcr0 on BOTH selectors the architecture defines -- ecx=0
+             * returns it whole and ecx=1 returns `env->xcr0 & get_xinuse()`
+             * (fpu_helper.c:3201-3208) -- so the read happens on every path
+             * that does not fault.  It happens INSIDE the helper, the
+             * extraction reports the helper unbounded, and no TCG global
+             * names XCR0, which is exactly the shape gen_note_xcr0_read()
+             * was added for at the XSAVE sites.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            gen_note_xcr0_read();
             tcg_gen_trunc_tl_i32(s->tmp2_i32, cpu_regs[R_ECX]);
             gen_helper_xgetbv(s->tmp1_i64, tcg_env, s->tmp2_i32);
             tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], s->tmp1_i64);

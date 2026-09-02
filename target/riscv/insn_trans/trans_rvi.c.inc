@@ -44,6 +44,38 @@ static bool trans_lpad(DisasContext *ctx, arg_lpad *a)
      * lpad comes from NOP space anyways, so return true if
      * fcfi_lp_expected is false.
      */
+    /*
+     * WHAT A LANDING PAD READS, stated before the emulator decides it has
+     * nothing to do.
+     *
+     * `lpad` checks the label the indirect branch left in x7 against the one
+     * in its own encoding and traps on a mismatch, then clears the
+     * expected-landing-pad state that branch set.  Both are reads the ISA
+     * defines.  Neither reaches the op stream on a guest that is not in a
+     * landing-pad window: `ctx->fcfi_lp_expected` comes from the TB flags,
+     * the early return below emits NOTHING, and `lpad` is a NOP out of the
+     * hint space -- so all 96 encodings arrive at the extraction with
+     * `RD = -` and the wire carried REG_GPR7 and REG_SYS from
+     * disas/capstone.c alone.
+     *
+     * R16 records an ISA-defined dependency regardless of machine state, and
+     * R17 says a conditional carries all its potential sources; whether this
+     * guest has Zicfilp forward-edge tracking armed is machine state.  So the
+     * two reads are stated HERE, above the early return, rather than below
+     * it where they would describe only the armed case.
+     *
+     * x7 is stated as a RANGE over CPURISCVState::gpr[7], which is the TCG
+     * global `x7/t2` and resolves through it; the label register is fixed by
+     * the ISA and is not an encoded field, so there is nothing to read off
+     * @a.  ELP is stated against its own declaration in translate.c.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_read_env(offsetof(CPURISCVState, gpr[7]),
+                                       sizeof(((CPURISCVState *)0)->gpr[7]));
+    insn_dataflow_note_stated_read_env(offsetof(CPURISCVState, elp),
+                                       sizeof(((CPURISCVState *)0)->elp));
+
     if (!ctx->fcfi_lp_expected) {
         return true;
     }

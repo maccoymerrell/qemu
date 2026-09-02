@@ -498,6 +498,21 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * ZICFILP'S EXPECTED-LANDING-PAD STATE, declared by
+     * target/riscv/translate.c as `elp` and absent from the RISC-V GDB stub's
+     * namespace -- the same shape as XCR0 above.
+     *
+     * It has no CSR address to be named by: its architectural homes are the
+     * status word's MPELP and SPELP fields, and QEMU keeps it as a bool of
+     * its own.  REG_SYS is the vocabulary's residual privileged-file word and
+     * is what the wire already publishes for it, because disas/capstone.c
+     * names the same state on mstatus and mstatus lands there.  So this
+     * connects a spelling to a word rather than inventing either.
+     */
+    if (!strcmp(name, "elp")) {
+        return REG_SYS;
+    }
+    /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and
      * TR -- DECLARED by target/i386/tcg/translate.c and absent from the i386
      * GDB stub's namespace, the same shape as XCR0 above.

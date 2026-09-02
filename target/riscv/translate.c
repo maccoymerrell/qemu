@@ -1620,4 +1620,27 @@ void riscv_translate_init(void)
                                   sizeof(((CPURISCVState *)0)->fp_status),
                                   sizeof(((CPURISCVState *)0)->fp_status),
                                   1);
+
+    /*
+     * THE EXPECTED-LANDING-PAD STATE, Zicfilp's forward-edge bit.
+     *
+     * An indirect branch with a landing-pad label SETS it and the `lpad` that
+     * receives control CLEARS it; if any other instruction executes while it
+     * is set, the CPU takes a software-check exception.  So it is a register
+     * in the only sense the dependency model has: a value one instruction
+     * writes and another reads.
+     *
+     * It has no CSR address of its own -- its architectural homes are the
+     * status word's MPELP and SPELP fields -- so there is no CSR number to
+     * name it by, and QEMU keeps it as a bool of its own.  Declared under
+     * that spelling, and folded to the vocabulary's residual privileged word
+     * by the plugin, which is the route `xcr0` and the x86 descriptor tables
+     * already take.  disas/capstone.c names the same state on mstatus for the
+     * same reason and says so at its own site.
+     */
+    insn_dataflow_declare_regfile("elp", NULL,
+                                  offsetof(CPURISCVState, elp),
+                                  sizeof(((CPURISCVState *)0)->elp),
+                                  sizeof(((CPURISCVState *)0)->elp),
+                                  1);
 }

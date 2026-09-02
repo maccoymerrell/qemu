@@ -100,19 +100,12 @@ std::vector<const char *> g_reg_names;
 bool nonarch_global(const char *n)
 {
     static const char *const kInternal[] = {
-        /*
-         * target/arm, target/mips, target/riscv: the VALUE half of the
-         * exclusive monitor.  QEMU lowers store-conditional onto a cmpxchg
-         * and needs something to compare; real hardware keeps no such copy,
-         * so these four are emulation artefacts and stay out.  The ADDRESS
-         * half is NOT here any more -- it is architectural state and now has
-         * a word, REG_LLRES; see fold_nonarch() below.
-         */
-        "exclusive_val", "exclusive_high",
-        "llval",
-        "load_val",
-        /* target/mips: the delay-slot branch machinery. */
-        "bcond", "btarget",
+        /* target/arm: the load-exclusive monitor.  Not architectural. */
+        "exclusive_addr", "exclusive_val", "exclusive_high",
+        /* target/mips: the delay-slot branch machinery, and the LL monitor. */
+        "bcond", "btarget", "lladdr", "llval",
+        /* target/riscv: the load-reserved monitor. */
+        "load_res", "load_val",
     };
     for (const char *k : kInternal) {
         if (!strcmp(n, k)) {
@@ -518,36 +511,6 @@ uint8_t fold_nonarch(const char *name)
      */
     if (!strcmp(name, "elp")) {
         return REG_SYS;
-    }
-    /*
-     * THE LOAD-RESERVED / LOAD-LINKED RESERVATION, on the three targets that
-     * have one.
-     *
-     * `sc` succeeds if and only if the reservation the matching `ll`
-     * established is still held.  That is not a QEMU mechanism, it is how the
-     * ISA defines the pair: MIPS specifies LLbit and its address, RISC-V a
-     * reservation set, AArch64 a local exclusive monitor with a tagged
-     * address.  Until now the wire showed an `ll` and its `sc` with NO edge
-     * between them, which R16 calls a silent identity and therefore a bug.
-     *
-     * ONLY THE ADDRESS HALF.  `llval`, `load_val`, `exclusive_val` and
-     * `exclusive_high` are QEMU's compare operands -- it lowers
-     * store-conditional onto a cmpxchg and needs a copy of what was loaded --
-     * and real hardware keeps no such copy.  R15 keeps them off the wire and
-     * champsim_tracer_qdep.cc's is_monitor_value() is where they stay named
-     * as the emulation artefact they are.
-     *
-     * A WIRE-VOCABULARY ADDITION, not a fold: REG_LLRES is a new generic id
-     * in a slot the vocabulary deliberately left empty, and it is the first
-     * word the tracer has for this state.  The reasoning, including its
-     * tension with R7.7's "reservation state is a product of the instruction,
-     * not the register used" -- which was ruled about the VALUE half -- is
-     * written out at the enum.
-     */
-    if (!strcmp(name, "lladdr") ||        /* mipsel   */
-        !strcmp(name, "load_res") ||      /* riscv64  */
-        !strcmp(name, "exclusive_addr")) {/* aarch64  */
-        return REG_LLRES;
     }
     /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and

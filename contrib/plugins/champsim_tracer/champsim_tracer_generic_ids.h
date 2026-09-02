@@ -445,44 +445,20 @@ enum GenericRegId {
      *               self-dependency — on the instruction whose entire
      *               purpose is comparing those two.
      *
-     *   REG_LLRES   the LOAD-RESERVED / LOAD-LINKED RESERVATION — the
-     *               address half of the exclusive monitor: MIPS'
-     *               LLbit-and-address (env->lladdr), the RISC-V
-     *               reservation set (env->load_res) and AArch64's
-     *               exclusive monitor (env->exclusive_addr).  The ISA
-     *               DEFINES load-linked / store-conditional through
-     *               this state: `sc` succeeds if and only if the
-     *               reservation the matching `ll` established is still
-     *               held, so an SC really does read what an LL wrote
-     *               and a trace without it shows two instructions with
-     *               no edge between them where the architecture has
-     *               one.  R16: an ISA-defined dependency is recorded.
-     *
-     *               THE VALUE HALF IS NOT HERE and must not be folded
-     *               onto this.  `llval`, `load_val`, `exclusive_val`
-     *               and `exclusive_high` exist because QEMU lowers
-     *               store-conditional onto a cmpxchg and needs
-     *               something to compare; real hardware keeps no such
-     *               copy.  That is the emulation-artefact category
-     *               f46873a738 established for #177 and R15 keeps it
-     *               off the wire — champsim_tracer_qdep.cc's
-     *               is_monitor_value() is where it stays named as one.
-     *
-     * 249 is deliberately unallocated.  It briefly held
+     * 248-249 are deliberately unallocated.  They briefly held
      * REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS DSPControl)
      * and REG_VCSR (RISC-V vcsr / MIPS MSACSR) — the third of those
-     * three slots is the one REG_SSP now occupies and the first is the
-     * one REG_LLRES takes above.  Each named a register from exactly
-     * one ISA whose behaviour an existing class already covered, or
-     * split a rounding-mode-and-status word away from REG_FCSR, which
-     * already is one.  They now fold to REG_VCTRL, REG_FLAGS and
-     * REG_FCSR respectively — folds onto the SAME behaviour, which is
-     * what distinguishes them from the collisions above.  249 is left
-     * as a hole rather than reused so nothing renumbers.
+     * three slots is the one REG_SSP now occupies.  The first two
+     * named a register from exactly one ISA whose behaviour an
+     * existing class already covered; the third split a
+     * rounding-mode-and-status word away from REG_FCSR, which already
+     * is one.  They now fold to REG_VCTRL, REG_FLAGS and REG_FCSR
+     * respectively — folds onto the SAME behaviour, which is what
+     * distinguishes them from the collisions above.  Left as holes
+     * rather than reused so nothing renumbers.
      */
     REG_TLS = 246,
     REG_SSP = 247,
-    REG_LLRES = 248,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -637,7 +613,6 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";
     case REG_SSP:     return "REG_SSP";
-    case REG_LLRES:   return "REG_LLRES";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_PC:      return "REG_PC";

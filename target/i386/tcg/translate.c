@@ -4629,6 +4629,39 @@ void tcg_x86_init(void)
                                   sizeof(((CPUX86State *)0)->xcr0), 1);
 
     /*
+     * THE CONTROL REGISTERS.
+     *
+     * `smsw` reads env->cr[0] with a plain tcg_gen_ld_tl() and `lmsw` reads
+     * it to merge the low four bits into -- both in the op stream, both
+     * arriving as an anonymous span for want of a declaration, exactly like
+     * the descriptor tables below.  6,745 registers on the smsw rule alone.
+     *
+     * The names are the GDB stub's, which is the namespace
+     * insn_dataflow_reg_name() answers in and the one REG_CTRL<n> is keyed
+     * on.  cr[1] is skipped because QEMU says at the member that it is
+     * unused and no instruction names it; the file is therefore declared one
+     * register at a time rather than as an array, so the hole is visible
+     * instead of being papered over with a name for a register that does not
+     * exist.
+     */
+    insn_dataflow_declare_regfile("cr0", NULL,
+                                  offsetof(CPUX86State, cr[0]),
+                                  sizeof(((CPUX86State *)0)->cr[0]),
+                                  sizeof(((CPUX86State *)0)->cr[0]), 1);
+    insn_dataflow_declare_regfile("cr2", NULL,
+                                  offsetof(CPUX86State, cr[2]),
+                                  sizeof(((CPUX86State *)0)->cr[2]),
+                                  sizeof(((CPUX86State *)0)->cr[2]), 1);
+    insn_dataflow_declare_regfile("cr3", NULL,
+                                  offsetof(CPUX86State, cr[3]),
+                                  sizeof(((CPUX86State *)0)->cr[3]),
+                                  sizeof(((CPUX86State *)0)->cr[3]), 1);
+    insn_dataflow_declare_regfile("cr4", NULL,
+                                  offsetof(CPUX86State, cr[4]),
+                                  sizeof(((CPUX86State *)0)->cr[4]),
+                                  sizeof(((CPUX86State *)0)->cr[4]), 1);
+
+    /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS: GDTR, IDTR, LDTR and TR.
      *
      * `sldt` and `str` read env->ldt.selector and env->tr.selector with a

@@ -5243,13 +5243,21 @@ static void cap_aarch64_sysinstr_contract(csh handle, const cs_insn *insn,
      * SYSL's Xt is its DESTINATION.  Capstone reports it READ, and the
      * Rt field is at 4:0 exactly as it is for SYS, so the operand is
      * identified by the field rather than by trusting the access bits
-     * that are wrong.  Rt == 31 is the architectural "no register" form
-     * and stays as it is.
+     * that are wrong.
+     *
+     * Rt == 31 IS NOT A "NO REGISTER" FORM, whatever the earlier reading
+     * here said.  SYS's Xt is optional and its absence is spelled Rt = 31,
+     * which is why the branch above puts XZR in that instruction's READ
+     * list; SYSL has no such variant.  ARM DDI 0487C.a, SYSL (C6-980):
+     * "<Xt>  Is the 64-bit name of the general-purpose DESTINATION
+     * register, encoded in the 'Rt' field", with the whole operation
+     * being "X[t] = AArch64.SysInstrWithResult(1, sys_op1, sys_crn,
+     * sys_crm, sys_op2);".  At Rt = 31 that destination is XZR and the
+     * result is discarded -- a write nobody keeps, never a read.  So the
+     * zero register takes the SAME correction every other Rt takes, and
+     * the field is what selects it, exactly as above.
      */
     unsigned rt = w & 0x1Fu;
-    if (rt == 31) {
-        return;
-    }
     for (uint8_t i = 0; i < out->n_operands; i++) {
         qemu_plugin_operand *op = &out->operands[i];
         if (op->type == QEMU_PLUGIN_OP_REG

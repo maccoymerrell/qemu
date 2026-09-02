@@ -1583,7 +1583,7 @@ static const struct {
     { 0xab9bcdfau, "translate_mips/OPC_PCMPGTB" },  /* translate.c:4298 */
     { 0xa19bbe3cu, "translate_mips/OPC_PCMPGTH" },  /* translate.c:4292 */
     { 0x989bb011u, "translate_mips/OPC_PCMPGTW" },  /* translate.c:4286 */
-    { 0xe5dfdea9u, "translate_mips/OPC_PCREL" },  /* translate.c:15764 */
+    { 0xe5dfdea9u, "translate_mips/OPC_PCREL" },  /* translate.c:15771 */
     { 0xb3422c2eu, "translate_mips/OPC_PEXTRH" },  /* translate.c:4380 */
     { 0xfe880f26u, "translate_mips/OPC_PICK_OB" },  /* translate.c:13391 */
     { 0x0ed59b9fu, "translate_mips/OPC_PICK_PH" },  /* translate.c:13314 */

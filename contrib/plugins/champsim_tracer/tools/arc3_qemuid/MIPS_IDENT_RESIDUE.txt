@@ -911,14 +911,14 @@ translate.c:15283  in decode_opc_legacy  switch (op1)  -- default:
 translate.c:15550  in decode_opc_legacy  switch (r6_op)  -- default:
 translate.c:15562  in decode_opc_legacy  switch (op1)  -- default:
 translate.c:15648  in decode_opc_legacy  switch (op1)  -- default:
-translate.c:15768  in decode_opc_legacy  switch (op)  -- default:
-translate.c:16040  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_STOP'
-translate.c:16044  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_NEXT'
-translate.c:16049  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_EXIT'
-translate.c:16052  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_NORETURN'
-translate.c:16054  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- default:
-translate.c:16253  in mips_restore_state_to_opc  switch (env->hflags & MIPS_HFLAG_BMASK_BASE)  -- non-opcode label 'MIPS_HFLAG_BR'
-translate.c:16255  in mips_restore_state_to_opc  switch (env->hflags & MIPS_HFLAG_BMASK_BASE)  -- non-opcode label 'MIPS_HFLAG_BC'
+translate.c:15775  in decode_opc_legacy  switch (op)  -- default:
+translate.c:16047  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_STOP'
+translate.c:16051  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_NEXT'
+translate.c:16056  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_EXIT'
+translate.c:16059  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- non-opcode label 'DISAS_NORETURN'
+translate.c:16061  in mips_tr_tb_stop  switch (ctx->base.is_jmp)  -- default:
+translate.c:16260  in mips_restore_state_to_opc  switch (env->hflags & MIPS_HFLAG_BMASK_BASE)  -- non-opcode label 'MIPS_HFLAG_BR'
+translate.c:16262  in mips_restore_state_to_opc  switch (env->hflags & MIPS_HFLAG_BMASK_BASE)  -- non-opcode label 'MIPS_HFLAG_BC'
 
 distinct opcode identities exported
 -----------------------------------
@@ -1515,7 +1515,7 @@ distinct opcode identities exported
 0xab9bcdfa  translate_mips/OPC_PCMPGTB  (translate.c:4298)
 0xa19bbe3c  translate_mips/OPC_PCMPGTH  (translate.c:4292)
 0x989bb011  translate_mips/OPC_PCMPGTW  (translate.c:4286)
-0xe5dfdea9  translate_mips/OPC_PCREL  (translate.c:15764)
+0xe5dfdea9  translate_mips/OPC_PCREL  (translate.c:15771)
 0xb3422c2e  translate_mips/OPC_PEXTRH  (translate.c:4380)
 0xfe880f26  translate_mips/OPC_PICK_OB  (translate.c:13391)
 0x0ed59b9f  translate_mips/OPC_PICK_PH  (translate.c:13314)

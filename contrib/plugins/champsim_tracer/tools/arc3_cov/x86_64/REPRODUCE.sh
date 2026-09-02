@@ -313,6 +313,12 @@ this impossible"; exit 1 } }' ../reach_matrix.tsv || exit 1
 # enable, so the row must be re-probed and may be a coverage hole) or
 # REFUSED-BY-MODEL (QEMU refuses the enable itself).  Citations are locators
 # resolved against the tree, so a fact that has stopped holding exits 1.
+# The table joins the matrix on the OPCODE IDENTITY, so a probe re-seat can
+# no longer move a row.  That indifference is measured before it is relied
+# on: --selftest offers the same matrix under two different probe seatings
+# and requires an identical adjudication, with a vacuity arm proving the
+# encodings really did move.
+$PY "$T"/qemu_decode_adjudicate.py --selftest || exit 1
 $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
     --enables "$D"/enables.tsv --cpl0-enab "$D"/cpl0_enab.tsv \
     -o ../decode_adjudication.tsv

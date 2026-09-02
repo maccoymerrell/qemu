@@ -23,6 +23,13 @@
 #                                    cst_audit's own member line
 #    6  must0_scan                   every "MUST BE 0" row in EVERY sidecar
 #                                    this run produces -- see the scope note
+#    6w   ... THE DECLARED WIDER      the same scan over the sidecar
+#           POPULATION                populations this run did NOT produce:
+#                                    the R13 evidence root and any
+#                                    --must0-root.  A declared root with no
+#                                    census is REFUSED, never skipped
+#    6b   ... PLANTED FIRE            a synthetic non-zero row under a
+#                                    declared root; row 6w must go red
 #    7-10 val_gate x4 ISAs           the seed-driven validator, per ISA
 #   11  net_validator_gate           the golden-net corpus
 #   12  src_loss_gate                the PER-PC source-loss gate
@@ -201,6 +208,38 @@ selftest() {
     n=$((n+1))
     ROWS="all"
 
+    # S: FINDING 59-B.  A battery that declares NO wider sidecar population
+    # has not closed the finding, so row 6w is RED rather than absent.  The
+    # gap was never the scanner -- it was that nothing pointed it at the
+    # corpora where the rows fire.
+    RCFILE="$scratch/rc5.txt"; : > "$RCFILE"; RED=0
+    O=$scratch/s; mkdir -p "$O"; R13_ROOT=""; MUST0_ROOTS=()
+    run_row6w
+    t "S a battery declaring no wider must-be-0 population is RED" "$RED" 1
+    n=$((n+1))
+
+    # T: a DECLARED root that carries no census is REFUSED, not skipped.  A
+    # root nobody could check must never read as a root that came back clean.
+    RCFILE="$scratch/rc6.txt"; : > "$RCFILE"; RED=0
+    mkdir -p "$scratch/emptyroot"
+    MUST0_ROOTS=("$scratch/emptyroot")
+    run_row6w
+    t "T a declared root with no sidecar REFUSES" "$RED" 1
+    n=$((n+1))
+    MUST0_ROOTS=()
+
+    # U: the wide scope can fire.  A scan nobody has watched fail vouches for
+    # nothing, and this is the arm that says the planted control works.
+    RCFILE="$scratch/rc7.txt"; : > "$RCFILE"; RED=0
+    PLANTS=1
+    run_row6b
+    t "U the planted non-zero row is REFUSED (the wide scope can fire)" \
+      "$RED" 0
+    n=$((n+1))
+    grep -q 'rc=0' "$RCFILE"
+    t "U2 ... and it was recorded as a PASSING control arm" "$?" 0
+    n=$((n+1))
+
     echo "arms=$n failures=$fails"
     [ "$fails" -eq 0 ]
 }
@@ -253,6 +292,107 @@ restore_and_touch() {
 
 so_hash() { sha256sum "$Q/contrib/plugins/libchampsim_tracer.so" | cut -c1-12; }
 
+# The harness root and the interpreter are needed by the rows AND by the
+# selftest, which runs before the option parser; a row that cannot find
+# must0_scan.py would otherwise "pass" in the selftest for the wrong reason.
+T=$(cd "$(dirname "$0")" && pwd)
+PY=${CST_PYTHON:-python3}
+PLANTS=1
+MUST0_ROOTS=()
+R13_ROOT=${CST_R13_ROOT:-}
+
+# ---- ROW 6w: THE DECLARED WIDER POPULATION -------------------------------
+#
+# FINDING 59-B.  Row 6 above reads every sidecar THIS RUN produces, and its
+# scope is honest, but it is not the population where the rows fire.  The
+# `published sources the union DOES NOT CONTAIN` row was NON-ZERO on 19
+# sidecars across all four ISAs -- the shadow corpus and the R13 reference
+# probes -- for at least two passes, and neither standing instrument looked:
+# row 6 does not run those corpora, and shadow_rollup.py checks a different
+# identity set entirely.  A must-be-0 row that no gate evaluates over the
+# population where it fires is a row that can go non-zero for a whole arc
+# with nobody learning.
+#
+# So the battery now reads the populations it is RESPONSIBLE FOR but does not
+# produce: the R13 evidence root (added automatically -- row 16 already
+# requires one, and reading a probe's trace without reading its census is
+# precisely the gap) plus any --must0-root the wave declares.
+#
+# EACH ROOT IS SCANNED SEPARATELY AND EACH IS REFUSED ON ITS OWN.  A declared
+# root with no census-carrying sidecar under it has not been checked, and
+# reporting one aggregate rc would let a root that contributed nothing hide
+# behind one that contributed everything.  The file counts are printed so a
+# shrinking scope is visible in the record.
+#
+# THIS ROW IS RED AT THE TIP AND THAT IS THE FINDING, NOT A BUG IN THE ROW.
+# What is left non-zero after the census was re-keyed onto the producer's own
+# union is a small named class of published sources that ONLY the operand
+# walk supplies -- x86 MPX `bnd*` address registers and the lazy-flag `adc`
+# read, aarch64 `prfm`/`prfum`, mipsel `synci`, riscv64 RVV `vm`/`vtype`.
+# Each is an open defect with a named mechanism and an owner at a QEMU decode
+# site (R20), NOT a loss anyone has ruled removable, so none of it belongs in
+# an adjudicated-loss ledger: those files say "EMPTY IS THE CORRECT STATE"
+# and they mean it.  The row goes green when the class closes.
+run_row6w() {
+    local roots=() r n rc=0 i=0
+    [ -n "$R13_ROOT" ] && roots+=("$R13_ROOT")
+    [ ${#MUST0_ROOTS[@]} -gt 0 ] && roots+=("${MUST0_ROOTS[@]}")
+    if [ ${#roots[@]} -eq 0 ]; then
+        record 6w 2 "must0_scan WIDE -- no population declared (--must0-root \
+or --r13-root).  FINDING 59-B is that this scan had no population; a battery \
+that declares none has not closed it"
+        return
+    fi
+    for r in "${roots[@]}"; do
+        i=$((i+1))
+        if [ ! -d "$r" ]; then
+            record 6w.$i 2 "must0_scan WIDE -- declared root '$r' is not a directory"
+            rc=1
+            continue
+        fi
+        mapfile -t MW < <(find "$r" -name '*.stats.log' -type f | sort)
+        n=${#MW[@]}
+        if [ "$n" -eq 0 ]; then
+            record 6w.$i 2 "must0_scan WIDE -- no sidecar under declared root '$r'"
+            rc=1
+            continue
+        fi
+        # --min-subjects 1: a declared root that turns out to carry no census
+        # at all is a root nobody checked, and it fails rather than passing.
+        "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 1 \
+              "${MW[@]}" > "$O/MUST0_WIDE_$i.txt" 2>&1
+        local one=$?
+        [ "$one" -eq 0 ] || rc=$one
+        record 6w.$i $one "must0_scan over $n sidecar(s) under declared root '$r'"
+    done
+    record 6w $rc "must0_scan WIDE -- ${#roots[@]} declared population(s)"
+}
+
+# ---- ROW 6b: THE PLANTED FIRE FOR THE WIDE SCOPE -------------------------
+#
+# A scope that has never been seen to fire is not evidence that the
+# population is clean; it is evidence of nothing.  This plants a sidecar
+# carrying a non-zero must-be-0 row under a scratch root, declares that root
+# exactly the way a wave declares one, and REQUIRES a non-zero rc.
+run_row6b() {
+    local d=$O/must0_plant
+    rm -rf "$d"; mkdir -p "$d"
+    printf 'PLANTED CONTROL -- not a tracer sidecar\n' > "$d/plant.stats.log"
+    printf '         7  a row this control invented -- MUST BE 0\n' \
+        >> "$d/plant.stats.log"
+    "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 1 \
+          "$d/plant.stats.log" > "$O/MUST0_PLANT.txt" 2>&1
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        record 6b 1 "PLANTED FIRE -- must0_scan read a planted NON-ZERO row \
+as clean; the wide scope proves nothing"
+    else
+        record 6b 0 "PLANTED FIRE -- must0_scan REFUSED the planted non-zero \
+row (rc=$rc), so the wide scope can fire"
+    fi
+}
+
+
 # ------------------------------------------------------------------- main --
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 if [ "$1" = "--selftest" ]; then
@@ -268,6 +408,15 @@ WORKLOAD=${CST_BATTERY_WORKLOAD:-}
 SRC_LOSS_A=${CST_SRC_LOSS_A:-}
 SRC_LOSS_B=""
 R13_ROOT=${CST_R13_ROOT:-}
+# Sidecar populations this run does not produce but is responsible for
+# reading.  Colon-separated in the environment, repeatable on the command
+# line; the R13 evidence root is added automatically below because row 16
+# already requires one and a battery that reads its probes' traces without
+# reading their censuses is the exact gap FINDING 59-B named.
+MUST0_ROOTS=()
+if [ -n "${CST_MUST0_ROOTS:-}" ]; then
+    IFS=':' read -r -a MUST0_ROOTS <<< "$CST_MUST0_ROOTS"
+fi
 ROWS=all
 SEED=4242
 WP=16
@@ -280,6 +429,7 @@ while [ $# -gt 0 ]; do
         --src-loss-b)   SRC_LOSS_B=$2; shift 2 ;;
         --rows)         ROWS=$2; shift 2 ;;
         --r13-root)     R13_ROOT=$2; shift 2 ;;
+        --must0-root)   MUST0_ROOTS+=("$2"); shift 2 ;;
         --seed)         SEED=$2; shift 2 ;;
         --wp)           WP=$2; shift 2 ;;
         --no-plants)    PLANTS=0; shift ;;
@@ -290,7 +440,6 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SRC_LOSS_B" ] || SRC_LOSS_B=$SRC_LOSS_A
 
-T=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$T/../../../.." && pwd)
 VD=$T/../validator
 mkdir -p "$O" || exit 2
@@ -683,6 +832,13 @@ done
 # this run made" when the run made nothing.
 if selected 6; then
     run_row6
+    run_row6w
+    if [ "$PLANTS" -eq 1 ]; then
+        run_row6b
+    else
+        record 6b 2 "PLANTED FIRE DESELECTED (--no-plants) -- a wide scope \
+nobody has watched fire is not evidence"
+    fi
 fi
 
 # ---- close ---------------------------------------------------------------

@@ -840,11 +840,33 @@ for pos, (pi, qj) in enumerate(pairs):
             st[axis + '_match'] += 1
             continue
         st[axis + '_mismatch'] += 1
-        only_p = sorted(pv_set - qv_set)
-        only_q = sorted(qv_set - pv_set)
-        if all(VOCAB_FOLD.get(x) in qv_set for x in only_p) and \
-                all(x in set(VOCAB_FOLD.get(y) for y in only_p) for x in only_q) \
-                and only_p:
+        # THE FOLD IS A NORMALISATION OF THE REFERENCE, NOT A WHOLE-ROW
+        # ESCAPE HATCH.  It used to be applied as a test on the finished
+        # difference -- "every reference-only name folds INTO the tracer's
+        # set, AND the tracer's extra set is EXACTLY that folded image" --
+        # which is only true while the folded register is the ONLY thing the
+        # tracer names beyond the reference.  Give a folded row one more
+        # legitimate tracer-only register and the second clause fails, the
+        # row falls through to UNACCOUNTED, and a row where the reference is
+        # missing NOTHING is scored inside the criterion.
+        #
+        # Measured, on this leg: `0f01d0 xgetbv` reads XCR0, which the tracer
+        # publishes as REG_SYS (the fold), and ALSO reads CR4 -- helper_xgetbv()
+        # opens with `env->cr[4] & CR4_OSXSAVE_MASK` (fpu_helper.c:3196), a read
+        # PIN does not model.  With the fold applied to the difference the row
+        # read ORTHOGONAL while `sys` was the tracer's only extra and
+        # UNACCOUNTED as soon as `ctrl4` joined it: +1 on the criterion for a
+        # register the tracer GAINED.
+        #
+        # Folding the reference FIRST and differencing afterwards says what is
+        # true -- ref_only is empty, tracer_only is {ctrl4}, TRACER-SUPERSET --
+        # and it does not weaken the loss direction: a reference name with no
+        # fold entry still survives into only_p and still scores SUBSET or
+        # UNACCOUNTED.  The leg's own dropsrc control is the proof.
+        pv_folded = set(VOCAB_FOLD.get(x, x) for x in pv_set)
+        only_p = sorted(pv_folded - qv_set)
+        only_q = sorted(qv_set - pv_folded)
+        if not only_p and not only_q:
             direction = 'ORTHOGONAL'
         elif only_p and not only_q:
             direction = 'TRACER-SUBSET'

@@ -52,130 +52,130 @@ static const struct {
 } multi0f_ident_tab[] = {
     { 0, NULL },
     /* sldt: case 0:  sldt */
-    /* translate.c:3933 word=sldt(arm) */
+    /* translate.c:3950 word=sldt(arm) */
     { 0x4e666268u, "translate.c/multi0F@b=100,modrm=..000..." },
     /* str: case 1:  str */
-    /* translate.c:3956 word=str(arm) */
+    /* translate.c:3973 word=str(arm) */
     { 0x11571ae1u, "translate.c/multi0F@b=100,modrm=..001..." },
     /* lldt: case 2:  lldt */
-    /* translate.c:3945 word=lldt(arm) */
+    /* translate.c:3962 word=lldt(arm) */
     { 0x4ea6536fu, "translate.c/multi0F@b=100,modrm=..010..." },
     /* ltr: case 3:  ltr */
-    /* translate.c:3968 word=ltr(arm) */
+    /* translate.c:3985 word=ltr(arm) */
     { 0x004c74f6u, "translate.c/multi0F@b=100,modrm=..011..." },
     /* verr: case 4:  verr */
-    /* translate.c:3979 word=verr(arm) */
+    /* translate.c:3996 word=verr(arm) */
     { 0xa1042119u, "translate.c/multi0F@b=100,modrm=..100..." },
     /* verw: case 5:  verw */
-    /* translate.c:3980 word=verw(arm) */
+    /* translate.c:3997 word=verw(arm) */
     { 0xdf509d20u, "translate.c/multi0F@b=100,modrm=..101..." },
     /* sgdt: CASE_MODRM_MEM_OP(0):  sgdt */
-    /* translate.c:3999 word=sgdt(arm) */
+    /* translate.c:4016 word=sgdt(arm) */
     { 0x42a96af8u, "translate.c/multi0F@b=101,modrm=..000...,mem" },
     /* sidt: CASE_MODRM_MEM_OP(1):  sidt */
-    /* translate.c:4055 word=sidt(arm) */
+    /* translate.c:4072 word=sidt(arm) */
     { 0xf86291b1u, "translate.c/multi0F@b=101,modrm=..001...,mem" },
     /* lgdt: CASE_MODRM_MEM_OP(2):  lgdt */
-    /* translate.c:4217 word=lgdt(arm) */
+    /* translate.c:4234 word=lgdt(arm) */
     { 0x62ad41c3u, "translate.c/multi0F@b=101,modrm=..010...,mem" },
     /* lidt: CASE_MODRM_MEM_OP(3):  lidt */
-    /* translate.c:4233 word=lidt(arm) */
+    /* translate.c:4250 word=lidt(arm) */
     { 0x313f21aau, "translate.c/multi0F@b=101,modrm=..011...,mem" },
     /* invlpg: CASE_MODRM_MEM_OP(7):  invlpg */
-    /* translate.c:4300 word=invlpg(arm) */
+    /* translate.c:4317 word=invlpg(arm) */
     { 0xaf30bda7u, "translate.c/multi0F@b=101,modrm=..111...,mem" },
     /* monitor: case 0xc8:  monitor */
-    /* translate.c:4017 word=monitor(arm) */
+    /* translate.c:4034 word=monitor(arm) */
     { 0xa5334654u, "translate.c/multi0F@b=101,modrm=11001000" },
     /* mwait: case 0xc9:  mwait */
-    /* translate.c:4027 word=mwait(arm) */
+    /* translate.c:4044 word=mwait(arm) */
     { 0xa63347e7u, "translate.c/multi0F@b=101,modrm=11001001" },
     /* clac: case 0xca:  clac */
-    /* translate.c:4037 word=clac(arm) */
+    /* translate.c:4054 word=clac(arm) */
     { 0xab358e5du, "translate.c/multi0F@b=101,modrm=11001010" },
     /* stac: case 0xcb:  stac */
-    /* translate.c:4046 word=stac(arm) */
+    /* translate.c:4063 word=stac(arm) */
     { 0xaa358ccau, "translate.c/multi0F@b=101,modrm=11001011" },
     /* xgetbv: case 0xd0:  xgetbv */
-    /* translate.c:4072 word=xgetbv(arm) */
+    /* translate.c:4089 word=xgetbv(arm) */
     { 0x56cb1c22u, "translate.c/multi0F@b=101,modrm=11010000" },
     /* xsetbv: case 0xd1:  xsetbv */
-    /* translate.c:4096 word=xsetbv(arm) */
+    /* translate.c:4113 word=xsetbv(arm) */
     { 0x57cb1db5u, "translate.c/multi0F@b=101,modrm=11010001" },
     /* vmrun: case 0xd8:  VMRUN */
-    /* translate.c:4113 word=vmrun(arm) */
+    /* translate.c:4130 word=vmrun(arm) */
     { 0x5d7ac9b3u, "translate.c/multi0F@b=101,modrm=11011000" },
     /* vmmcall: case 0xd9:  VMMCALL */
-    /* translate.c:4133 word=vmmcall(arm) */
+    /* translate.c:4150 word=vmmcall(arm) */
     { 0x5c7ac820u, "translate.c/multi0F@b=101,modrm=11011001" },
     /* vmload: case 0xda:  VMLOAD */
-    /* translate.c:4142 word=vmload(arm) */
+    /* translate.c:4159 word=vmload(arm) */
     { 0xf777ea8au, "translate.c/multi0F@b=101,modrm=11011010" },
     /* vmsave: case 0xdb:  VMSAVE */
-    /* translate.c:4154 word=vmsave(arm) */
+    /* translate.c:4171 word=vmsave(arm) */
     { 0xf877ec1du, "translate.c/multi0F@b=101,modrm=11011011" },
     /* stgi: case 0xdc:  STGI */
-    /* translate.c:4166 word=stgi(arm) */
+    /* translate.c:4183 word=stgi(arm) */
     { 0xfee395e8u, "translate.c/multi0F@b=101,modrm=11011100" },
     /* clgi: case 0xdd:  CLGI */
-    /* translate.c:4179 word=clgi(arm) */
+    /* translate.c:4196 word=clgi(arm) */
     { 0xffe3977bu, "translate.c/multi0F@b=101,modrm=11011101" },
     /* skinit: case 0xde:  SKINIT */
-    /* translate.c:4191 word=skinit(arm) */
+    /* translate.c:4208 word=skinit(arm) */
     { 0x04e5ddf1u, "translate.c/multi0F@b=101,modrm=11011110" },
     /* invlpga: case 0xdf:  INVLPGA */
-    /* translate.c:4200 word=invlpga(arm) */
+    /* translate.c:4217 word=invlpga(arm) */
     { 0x03e5dc5eu, "translate.c/multi0F@b=101,modrm=11011111" },
     /* rdpkru: case 0xee:  rdpkru */
-    /* translate.c:4264 word=rdpkru(arm) */
+    /* translate.c:4281 word=rdpkru(arm) */
     { 0x711b113bu, "translate.c/multi0F@b=101,modrm=11101110" },
     /* wrpkru: case 0xef:  wrpkru */
-    /* translate.c:4272 word=wrpkru(arm) */
+    /* translate.c:4289 word=wrpkru(arm) */
     { 0x701b0fa8u, "translate.c/multi0F@b=101,modrm=11101111" },
     /* swapgs: case 0xf8:  swapgs */
-    /* translate.c:4310 word=swapgs(arm) */
+    /* translate.c:4327 word=swapgs(arm) */
     { 0x907a2d7eu, "translate.c/multi0F@b=101,modrm=11111000" },
     /* rdtscp: case 0xf9:  rdtscp */
-    /* translate.c:4325 word=rdtscp(arm) */
+    /* translate.c:4342 word=rdtscp(arm) */
     { 0x917a2f11u, "translate.c/multi0F@b=101,modrm=11111001" },
     /* smsw: CASE_MODRM_OP(4):  smsw */
-    /* translate.c:4249 word=smsw(arm) */
+    /* translate.c:4266 word=smsw(arm) */
     { 0xfb39d824u, "translate.c/multi0F@b=101,modrm=..100..." },
     /* lmsw: CASE_MODRM_OP(6):  lmsw */
-    /* translate.c:4282 word=lmsw(arm) */
+    /* translate.c:4299 word=lmsw(arm) */
     { 0x0e0bb96bu, "translate.c/multi0F@b=101,modrm=..110..." },
     /* rdrand: case 6:  RDRAND */
-    /* translate.c:3910 word=rdrand(arm) */
+    /* translate.c:3927 word=rdrand(arm) */
     { 0xc7765114u, "translate.c/multi0F@b=1c7,modrm=..110..." },
     /* rdpid: CPUID_7_0_ECX_RDPID */
-    /* translate.c:3896 word=rdpid(arm) */
+    /* translate.c:3913 word=rdpid(arm) */
     { 0xd3db13a1u, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=repz" },
     /* rdseed: CPUID_7_0_EBX_RDSEED */
-    /* translate.c:3904 word=rdseed(arm) */
+    /* translate.c:3921 word=rdseed(arm) */
     { 0x42a2b0bcu, "translate.c/multi0F@b=1c7,modrm=..111...,pfx=none" },
     /* bndcl: bndcl */
-    /* translate.c:4347 word=bndcl(arm) */
+    /* translate.c:4364 word=bndcl(arm) */
     { 0xfb65e892u, "translate.c/multi0F@b=11a,modrm=........,pfx=repz" },
     /* bndcu: bndcu */
-    /* translate.c:4354 word=bndcu(arm) */
+    /* translate.c:4371 word=bndcu(arm) */
     { 0xb18a33e4u, "translate.c/multi0F@b=11a,modrm=........,pfx=repnz" },
     /* bndmov: bndmov -- from reg/mem */
-    /* translate.c:4363 word=bndmov(arm) */
+    /* translate.c:4380 word=bndmov(arm) */
     { 0x5e748d31u, "translate.c/multi0F@b=11a,modrm=........,pfx=data" },
     /* bndldx: bndldx */
-    /* translate.c:4395 word=bndldx(arm) */
+    /* translate.c:4412 word=bndldx(arm) */
     { 0xaa96b4a8u, "translate.c/multi0F@b=11a,modrm=........,mem,pfx=none" },
     /* bndmk: bndmk */
-    /* translate.c:4431 word=bndmk(arm) */
+    /* translate.c:4448 word=bndmk(arm) */
     { 0xe5e49430u, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=repz" },
     /* bndcn: bndcn */
-    /* translate.c:4458 word=bndcn(arm) */
+    /* translate.c:4475 word=bndcn(arm) */
     { 0x86a210efu, "translate.c/multi0F@b=11b,modrm=........,pfx=repnz" },
     /* bndmov: bndmov -- to reg/mem */
-    /* translate.c:4465 word=bndmov(arm) */
+    /* translate.c:4482 word=bndmov(arm) */
     { 0xe31a4ce8u, "translate.c/multi0F@b=11b,modrm=........,pfx=data" },
     /* bndstx: bndstx */
-    /* translate.c:4495 word=bndstx(arm) */
+    /* translate.c:4512 word=bndstx(arm) */
     { 0x08a3cf99u, "translate.c/multi0F@b=11b,modrm=........,mem,pfx=none" },
 };
 

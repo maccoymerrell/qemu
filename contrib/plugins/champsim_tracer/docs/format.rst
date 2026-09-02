@@ -3177,6 +3177,15 @@ in the section below: whether a pc write is the instruction's or the
 block's is not a distinction QEMU's statements draw, so a pc destination is
 carried only where the instruction's own decoding already named one.
 
+That includes a destination **the tracer's own decoding never found**.  A
+register QEMU states as written and the per-ISA classifier did not list is
+seated in ``dst_regs[]`` all the same, with its mask taken from QEMU's
+provenance for that write, its lane mask empty — a register QEMU names as a
+machine register is a scalar destination — and its value read through the
+same register handle every other slot uses.  A trace may therefore carry a
+destination for an instruction whose classifier row names fewer, and the
+number of such seats is reported per run.
+
 Where the destination family **refuses** — the dependency block carries no
 QEMU-stated mask and the wire keeps what the classifier wrote — the list is
 the classifier's too.  That pairing is the contract, not an accident: a
@@ -3188,7 +3197,10 @@ either alone, because nothing on the wire says which entry is which.
 Both facts are counted on every run, in the tracer's own statistics, as the
 number of published families whose dictionary is QEMU's and the number
 where the two lists could not be reconciled.  The second is a must-be-0
-row.
+row, and it now covers one direction only: a destination the wire names and
+QEMU does not.  The mirror — QEMU naming one the classifier did not — is no
+longer a reason to refuse, and is reported beside it as the number of
+families whose slot list grew and the number of registers seated into them.
 
 .. _pc-as-destination:
 

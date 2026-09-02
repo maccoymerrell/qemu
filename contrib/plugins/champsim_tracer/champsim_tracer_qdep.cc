@@ -505,6 +505,22 @@ std::atomic<uint64_t> g_indexed_write_rows{0};
 std::atomic<uint64_t> g_dst_reseated{0};
 std::atomic<uint64_t> g_dst_reseat_refused{0};
 GHashTable *g_dst_reseat_refused_sig = nullptr;
+/*
+ * THE ADMISSION (#232), counted apart from the seating it happens inside.
+ *
+ * A destination QEMU states that the operand walk never found.  Before the
+ * seating existed there was no slot for one and no way to make one, so the
+ * register was counted as missing and dropped; g_dst_wire_missing is that
+ * same population seen from the other side, by mnemonic and register, and
+ * the two must agree.
+ *
+ * Kept as its own pair rather than folded into g_dst_reseated because a
+ * seating that only PERMUTES and a seating that GROWS the list are different
+ * facts about the wire, and the second is the one that changes what a
+ * consumer reads.
+ */
+std::atomic<uint64_t> g_dst_admitted_rows{0};
+std::atomic<uint64_t> g_dst_admitted_regs{0};
 GHashTable *g_discard_unmapped_name = nullptr;
 /*
  * A register QEMU DID give this file a generic word for, stated as WRITTEN
@@ -1814,6 +1830,37 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
     return n;
 }
 
+/*
+ * WILL QEMU'S WRITE ROW @k BE SEATED IN THE WIRE'S DESTINATION LIST?
+ *
+ * One predicate, consulted from the two places that must agree about it:
+ * seat_dst_for_qemu(), which builds the list, and qemu_named_regs(), which
+ * seats the PROVENANCE of every destination that list will carry.  When the
+ * two disagreed the mask loop refused the whole family -- regs_to_mask()
+ * cannot set a bit for a provenance register nothing put in src_regs[] --
+ * so the disagreement did not silently publish, it silently REFUSED, which
+ * is the harder failure to see.
+ *
+ * The only row it excludes is R10.1's.  QEMU charges a translation block's
+ * final pc write to whichever instruction the block ended on, so its write
+ * list carries REG_PC on instructions the ISA does not define as writing
+ * it; the separation is taken from whether the wire's own list already
+ * carries REG_PC, which is a surviving operand-walk input on exactly one
+ * register with #261/R10 as its coverage path.
+ */
+static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
+{
+    if (q->dst_reg[k] != REG_PC) {
+        return true;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        if (f->dst_regs[d] == REG_PC) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
                         const InsnFields *f, bool dst_ok)
 {
@@ -1859,12 +1906,53 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
      * on the wire that no dependency refers to.  See dst_precheck().
      */
     if (dst_ok && f) {
+        /*
+         * OVER QEMU'S WRITE ROWS, not over the wire's slots (#232).
+         *
+         * It used to iterate f->dst_regs[] and look the row up, which seated
+         * provenance for exactly the destinations the OPERAND WALK had found.
+         * A destination QEMU states and the walk never had -- the admission
+         * seat_dst_for_qemu() now takes -- would then reach the wire with its
+         * provenance registers absent from src_regs[], and regs_to_mask()
+         * would refuse the whole destination family rather than publish it.
+         *
+         * dst_row_seated() is the same predicate the seating uses, so the two
+         * cannot drift: every destination that will exist has its inputs, and
+         * no destination that will not exist puts a register on the wire that
+         * no dependency refers to (which is the failure dst_precheck()'s own
+         * header records from the first draft).
+         */
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {
             for (uint8_t k = 0; k < q->n_dst; k++) {
                 if (q->dst_reg[k] == f->dst_regs[d]) {
                     take(q->dst_dep_regs[k], q->n_dst_dep_regs[k]);
                     break;
                 }
+            }
+        }
+        /*
+         * AND THE ADMITTED DESTINATIONS' INPUTS, AFTER THEM.
+         *
+         * AFTER, and iterating the wire's slots FIRST, for the reason the
+         * read list and the survivor rows are ordered the way they are: a
+         * register the runs above already named keeps the slot it already
+         * had, so every mask this file writes keeps the bit position it had
+         * before the admission existed.  Taking QEMU's enumeration for the
+         * whole prefix instead was built and MEASURED first, and it moved
+         * 4,548 encodings' source ORDER on x86_64 and mipsel without moving
+         * a single source SET -- movement that belongs to no statement.
+         */
+        for (uint8_t k = 0; k < q->n_dst; k++) {
+            bool on_wire = false;
+
+            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                if (f->dst_regs[d] == q->dst_reg[k]) {
+                    on_wire = true;
+                    break;
+                }
+            }
+            if (!on_wire && dst_row_seated(q, f, k)) {
+                take(q->dst_dep_regs[k], q->n_dst_dep_regs[k]);
             }
         }
     }
@@ -2652,6 +2740,11 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
     if (st != QDEP_OK) {
         return st;
     }
+    /*
+     * FIRST, THE WIRE'S OWN SLOTS: every one must have a QEMU write row, or
+     * the family refuses.  This direction is about the SLOT LIST and is
+     * asked of the wire's entries alone.
+     */
     for (uint8_t d = 0; d < f->n_dst_regs; d++) {
         uint8_t k;
 
@@ -2691,6 +2784,26 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
             g_snprintf(why, whysz, "no QEMU write row for %s",
                        generic_reg_name_or_unknown(f->dst_regs[d]));
             return QDEP_R_DST_UNNAMED;
+        }
+    }
+    /*
+     * THEN THE VALUE CHECKS, OVER EVERY ROW THE SEATING WILL TAKE (#232).
+     *
+     * These used to hang off the loop above and therefore ran only on the
+     * destinations the Capstone operand walk had found.  With the admission
+     * that is a hole with a name: a destination QEMU states and the walk
+     * never had reaches apply_dst() unchecked, and apply_dst()'s
+     * empty-provenance branch then writes the immediate bit on the stated
+     * ground that "dst_precheck() has already refused the case with no
+     * immediate slot to point at".  It would not have.  The mask would carry
+     * a dependency on an encoding the instruction does not have.
+     *
+     * dst_row_seated() is the same predicate the seating and the source
+     * index use, so all three ask about the same set.
+     */
+    for (uint8_t k = 0; k < q->n_dst; k++) {
+        if (!dst_row_seated(q, f, k)) {
+            continue;
         }
         /*
          * A DESTINATION IN ITS OWN PROVENANCE IS NOW A DECISION AND NOT A
@@ -2966,28 +3079,24 @@ static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
  * dst_dep_mask[], dst_lane_mask[] and the reg-snapshot keys -- so no
  * consumer ever sees a mask, a lane set and a dictionary from two orders.
  */
-static bool reseat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
-                                const QDepInsn *q)
+#define DST_SLOT_ADMITTED  0xffu    /* new slot with no operand-walk origin */
+
+static bool seat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
+                              const QDepInsn *q, unsigned *admitted)
 {
     uint8_t neworder[MAX_DST_REGS];
-    uint8_t from[MAX_DST_REGS];         /* new slot -> old slot */
-    unsigned n = 0;
+    uint8_t from[MAX_DST_REGS];         /* new slot -> old slot, or ADMITTED */
+    unsigned n = 0, took = 0, adm = 0;
     const unsigned ndst = f->n_dst_regs;
-    bool wire_has_pc = false;
 
     if (ndst > MAX_DST_REGS) {
         return false;
-    }
-    for (uint8_t d = 0; d < ndst; d++) {
-        if (f->dst_regs[d] == REG_PC) {
-            wire_has_pc = true;
-        }
     }
     for (uint8_t k = 0; k < q->n_dst; k++) {
         uint8_t r = q->dst_reg[k];
         uint8_t d;
 
-        if (r == REG_PC && !wire_has_pc) {
+        if (!dst_row_seated(q, f, k)) {
             continue;               /* the BLOCK's pc write -- R10.1 */
         }
         for (d = 0; d < ndst; d++) {
@@ -2995,44 +3104,77 @@ static bool reseat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
                 break;
             }
         }
-        if (d == ndst) {
-            return false;           /* QEMU names one the wire lacks */
-        }
         if (n >= MAX_DST_REGS) {
+            /*
+             * The union does not fit the record.  REFUSED rather than
+             * truncated, because a destination list short by a register is
+             * indistinguishable downstream from an instruction that does
+             * not write it.
+             */
             return false;
         }
-        from[n] = d;
+        if (d == ndst) {
+            from[n] = DST_SLOT_ADMITTED;
+            adm++;
+        } else {
+            from[n] = d;
+            took++;
+        }
         neworder[n++] = r;
     }
-    if (n != ndst) {
-        return false;               /* the wire names one QEMU lacks */
-    }
-    {
-        bool moved = false;
-
-        for (unsigned d = 0; d < ndst; d++) {
-            if (from[d] != d) {
-                moved = true;
-                break;
-            }
-        }
-        if (!moved) {
-            return true;            /* already QEMU's order */
-        }
+    if (took != ndst) {
+        /*
+         * The wire names a destination QEMU does not.  dst_precheck() has
+         * already refused every such row -- it is the #218 direction -- so
+         * this is unreachable, and it stays a REFUSAL rather than a drop:
+         * seating the rest would silently take a published destination off
+         * the wire, which is the one direction R12.1 never allows.
+         */
+        return false;
     }
     {
         uint64_t dep[MAX_DST_REGS], lane[MAX_DST_REGS];
         const QemuRegKey *keys[MAX_DST_REGS];
         const bool have_keys = rn && rn->dst_qemu_reg_keys;
 
-        for (unsigned d = 0; d < ndst; d++) {
-            dep[d]  = f->dst_dep_mask[from[d]];
-            lane[d] = f->dst_lane_mask[from[d]];
-            if (have_keys) {
-                keys[d] = rn->dst_qemu_reg_keys[from[d]];
+        for (unsigned d = 0; d < n; d++) {
+            if (from[d] == DST_SLOT_ADMITTED) {
+                /*
+                 * A slot the operand walk never made, so there is nothing to
+                 * carry and every field is stated rather than moved.
+                 *
+                 * The dep mask is left at zero because the loop in
+                 * apply_dst() writes EVERY slot's mask from QEMU's own
+                 * provenance immediately below -- this value is never the
+                 * one published.
+                 *
+                 * The lane mask is zero and that is the ANSWER, not a
+                 * default: a register QEMU names as a TCG global is a scalar
+                 * destination, and the lane-mask model gives a scalar slot
+                 * mask 0.  The registers the walk lists and QEMU does not
+                 * are the CPUArchState byte ranges (#218) -- x86's XMM and
+                 * x87 files, aarch64's V registers -- and those cannot
+                 * arrive here, because QEMU never named them.
+                 *
+                 * The value key is resolved from the generic id through the
+                 * same published accessor the source side's admission uses,
+                 * so an admitted destination's VALUE reaches the wire like
+                 * any other slot's rather than reading as absent.
+                 */
+                dep[d]  = 0;
+                lane[d] = 0;
+                if (have_keys) {
+                    keys[d] = qemu_reg_key_for_generic(neworder[d]);
+                }
+            } else {
+                dep[d]  = f->dst_dep_mask[from[d]];
+                lane[d] = f->dst_lane_mask[from[d]];
+                if (have_keys) {
+                    keys[d] = rn->dst_qemu_reg_keys[from[d]];
+                }
             }
         }
-        for (unsigned d = 0; d < ndst; d++) {
+        for (unsigned d = 0; d < n; d++) {
             f->dst_regs[d]      = neworder[d];
             f->dst_dep_mask[d]  = dep[d];
             f->dst_lane_mask[d] = lane[d];
@@ -3040,6 +3182,10 @@ static bool reseat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
                 rn->dst_qemu_reg_keys[d] = keys[d];
             }
         }
+        f->n_dst_regs = (uint8_t)n;
+    }
+    if (admitted) {
+        *admitted = adm;
     }
     return true;
 }
@@ -3774,6 +3920,17 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         if (q->dst_reg[k] == REG_PC) {
             g_dst_wire_missing_pc.fetch_add(1, std::memory_order_relaxed);
         } else {
+            /*
+             * COUNTED HERE, SEATED BELOW.  Until the admission landed this
+             * was a must-be-0 -- "a destination the machine writes and the
+             * wire does not name" -- and it was a must-be-0 the wire had no
+             * way to satisfy: nothing could put a register on the
+             * destination list that the Capstone operand walk had not found.
+             *
+             * seat_dst_for_qemu() now seats it, so the row is a GAIN and not
+             * a loss, and it is counted BEFORE the seat because this is the
+             * level that holds the mnemonic.
+             */
             char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
                                         generic_reg_name_or_unknown(
                                             q->dst_reg[k]));
@@ -3782,8 +3939,14 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             g_dst_wire_missing_other.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (reseat_dst_for_qemu(f, rn, q)) {
+    unsigned admitted = 0;
+    if (seat_dst_for_qemu(f, rn, q, &admitted)) {
         g_dst_reseated.fetch_add(1, std::memory_order_relaxed);
+        if (admitted) {
+            g_dst_admitted_rows.fetch_add(1, std::memory_order_relaxed);
+            g_dst_admitted_regs.fetch_add(admitted,
+                                          std::memory_order_relaxed);
+        }
     } else {
         /*
          * The two lists are not the same set, so no permutation of one is
@@ -5675,15 +5838,19 @@ void qdep_report(GString *report)
         "  %10" G_GUINT64_FORMAT "  published destination families whose SLOT"
         " DICTIONARY is\n"
         "              QEMU's own write list, in QEMU's order (#232), and\n"
-        "  %10" G_GUINT64_FORMAT "  families where it could NOT be -- the two lists"
-        " are not the\n"
-        "               same set, so no permutation of the walk's answer is"
-        " QEMU's and\n"
-        "               the walk's list stands.  MUST BE 0: it is the only"
-        " route left by\n"
+        "  %10" G_GUINT64_FORMAT "  families where it could NOT be -- the wire names"
+        " a destination\n"
+        "               QEMU does not, or the union does not fit the record,"
+        " so the\n"
+        "               walk's list stands.  MUST BE 0: it is the only route"
+        " left by\n"
         "               which the operand walk decides which register a"
         " destination slot\n"
-        "               is for\n",
+        "               is for.  The MIRROR direction -- QEMU naming one the"
+        " walk did\n"
+        "               not -- is no longer a refusal at all; it is admitted"
+        " and counted\n"
+        "               below\n",
         g_dst_reseated.load(std::memory_order_relaxed),
         g_dst_reseat_refused.load(std::memory_order_relaxed));
     g_string_append_printf(report,
@@ -5753,15 +5920,37 @@ void qdep_report(GString *report)
             " proof it is an\n"
             "               artifact; the per-row adjudication is on the wire's"
             " branch_type)\n"
-            "  %10" G_GUINT64_FORMAT "  QEMU wrote some OTHER named register the wire"
-            " does not carry\n"
-            "              (MUST BE 0 -- a destination the machine writes and"
-            " the wire\n"
-            "               does not name)\n", pc_only, other);
+            "  %10" G_GUINT64_FORMAT "  QEMU wrote some OTHER named register the"
+            " operand walk did\n"
+            "              not find, and the seating ADMITTED it (#232).  A"
+            " GAIN, not a\n"
+            "               loss, and no longer a must-be-0: it WAS one, and"
+            " it was one\n"
+            "               the wire had no way to satisfy -- nothing could"
+            " put a register\n"
+            "               on the destination list that Capstone's operand"
+            " walk had not\n"
+            "               found, so the only available outcome was to drop"
+            " it.  The\n"
+            "               must-be-0 that replaces it is the seat REFUSAL"
+            " row above\n", pc_only, other);
         if (other) {
             dump_tally(report, g_dst_wire_missing,
-                       "  by mnemonic and register:");
+                       "  by mnemonic and register (each row is a destination"
+                       " slot the wire\n  gained):");
         }
+        g_string_append_printf(report,
+            "  %10" G_GUINT64_FORMAT "  destination families whose slot list GREW,"
+            " carrying\n"
+            "  %10" G_GUINT64_FORMAT "  admitted destination registers in total."
+            "  Counted apart from\n"
+            "               the permuting seatings because a seating that"
+            " only reorders and\n"
+            "               a seating that GROWS the list are different facts"
+            " about the\n"
+            "               wire, and the second is the one a consumer sees\n",
+            g_dst_admitted_rows.load(std::memory_order_relaxed),
+            g_dst_admitted_regs.load(std::memory_order_relaxed));
     }
     if (g_refusal) {
         g_string_append_printf(report, "  extractor DISABLED: %s\n", g_refusal);

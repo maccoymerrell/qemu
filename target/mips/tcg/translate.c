@@ -19411,29 +19411,36 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             MIPS_ID_NONE);
         /* MDMX: Not implemented. */
         /*
-         * WHAT WAS TRANSLATED IS NOT THE INSTRUCTION -- and here it is not
-         * even a raise.  Major opcode 0x1E is the MDMX/MSA space, and an
-         * encoding reaches this arm only after decode_opc() offered it to
-         * decode_ase_msa() and `ase_msa_available(env)` said no: on a model
-         * with the ASE the same bytes decode to `addv.b` and translate a
-         * body.  What is emitted instead is NOTHING, so the row downstream
-         * reads calls=0, memr=0, memw=0 with an empty read and write list --
-         * indistinguishable from an instruction that genuinely touches
-         * nothing, and 90,813 registers of the loss bar are Capstone
-         * answering for MSA on a CPU that has none.
+         * WHAT WAS TRANSLATED IS NOT THE INSTRUCTION.  Major opcode 0x1E is
+         * the MDMX/MSA space, and an encoding reaches this arm only after
+         * decode_opc() offered it to decode_ase_msa() and
+         * `ase_msa_available(env)` said no: on a model with the ASE the same
+         * bytes decode to `addv.b` and translate a body.  On a model without
+         * it the architecture is explicit -- the MDMX/MSA major opcode is
+         * reserved, and an implementation that does not provide the ASE
+         * signals a Reserved Instruction exception.  That is what is emitted
+         * here.
          *
-         * THAT THE ARM EMITS NOTHING IS AN UPSTREAM DEFECT, and this note is
-         * not a paper over it: MIPS64 requires the MDMX/MSA opcode space to
-         * signal a Reserved Instruction exception on an implementation
-         * without the ASE, so this should be gen_reserved_instruction(ctx)
-         * and a guest that executes 0x78000000 on 24Kf should take a
-         * signal rather than fall through.  The statement here is true
-         * either way -- the translator declined the encoding on this model
-         * -- and stays true when the raise is fixed.
+         * Before this raise existed the arm emitted NOTHING, so the guest
+         * fell through 0x78000000 as if it were a no-op and the row
+         * downstream read calls=0, memr=0, memw=0 with an empty read and
+         * write list -- indistinguishable from an instruction that genuinely
+         * touches nothing.  Both were wrong in the same direction: the guest
+         * saw an architecturally impossible fall-through and the trace saw an
+         * instruction with no effects.
          *
-         * Capture only; no op is emitted, altered or suppressed.
+         * The refusal statement is unchanged by the raise and is not made
+         * redundant by it.  It says the TRANSLATOR DECLINED THE ENCODING on
+         * this model, which a consumer needs in order to read the missing
+         * dataflow as an unavailable ASE rather than as an instruction that
+         * reads and writes nothing; the ops emitted are an exception raise,
+         * whose own dataflow is the raise's, not MDMX's.
+         *
+         * Capture only; the note emits, alters and suppresses no op.
          */
         insn_dataflow_note_translation_refused();
+        MIPS_INVAL("major opcode");
+        gen_reserved_instruction(ctx);
         break;
     case OPC_PCREL:
         mips_ident(ctx,

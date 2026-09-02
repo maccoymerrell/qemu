@@ -2919,6 +2919,41 @@ that fails before the fix and passes after.
    architecture does not — and it is a different change with a different
    test.
 
+``target/mips/tcg/translate.c`` — the MDMX/MSA major opcode on a CPU
+without the ASE
+
+   Major opcode ``0x1E`` is the MDMX/MSA encoding space.  An encoding
+   reaches the ``OPC_MDMX`` arm of ``decode_opc_legacy()`` only after
+   ``decode_opc()`` has offered it to ``decode_ase_msa()`` and
+   ``ase_msa_available(env)`` has said no — that is, only on a model
+   that does not implement the ASE.  The arm was a bare ``break``.  It
+   emitted no ops at all, so the guest walked through the encoding as
+   if it were a ``nop``.
+
+   *MIPS64 Architecture For Programmers Volume II* defines the MDMX
+   opcode space as reserved on an implementation that does not provide
+   the ASE, and reserved encodings signal a Reserved Instruction
+   exception.  The fix is the ``gen_reserved_instruction(ctx)`` every
+   other declining arm in the same switch already uses.
+
+   Measured with a freestanding ``mipsel`` binary that prints
+   ``BEFORE``, executes ``.word 0x78000000``, then prints ``AFTER``::
+
+     before   -cpu 24Kf   BEFORE AFTER    rc=0     (fall-through)
+     after    -cpu 24Kf   BEFORE          SIGILL   (signal 4)
+     after    -cpu 74Kf   BEFORE          SIGILL   (signal 4)
+     after    -cpu P5600  BEFORE AFTER    rc=0     (MSA: addv.b executes)
+
+   The MSA arms are unmoved, which is the half of the test that says the
+   raise is conditioned on the ASE and not on the opcode.
+
+   The arm's ``insn_dataflow_note_translation_refused()`` statement is
+   unchanged by the raise and is not made redundant by it: it says the
+   translator declined the encoding on this model, which is what lets a
+   consumer read the absent dataflow as an unavailable ASE rather than
+   as an instruction with no effects.  The ops now emitted are the
+   exception raise's, and the raise's dataflow is its own.
+
 Build wiring
 ------------
 

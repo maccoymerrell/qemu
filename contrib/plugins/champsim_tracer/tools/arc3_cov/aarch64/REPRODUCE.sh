@@ -39,6 +39,12 @@ cd "$D"
 
 # ---- the four steps, in the order that makes them a measurement -----------
 $PY reprobe.py "$ISAX"          # tracer arm  -> tracer_fields.tsv
+# The LLVM cross-check arm is a CACHE over the denominator's encodings, and a
+# cache that is not re-derived goes stale exactly the way tracer_fields.tsv
+# did: a representative that moves loses its row and the column reads blank.
+# compare.py refuses on an uncovered denominator; this is what keeps it
+# covered.
+tail -n +2 opcodes.tsv | cut -f3 | "$ISAX" --isa=aarch64 --batch > fields_all.txt
 $PY sweep.py                    # MRA         -> ref_mra.json  (~135 s)
 $PY compare.py                  # both + LLVM -> attrib.tsv, attrib_signatures.txt
 $PY adjudicate.py               # -> attrib_adjudication.txt

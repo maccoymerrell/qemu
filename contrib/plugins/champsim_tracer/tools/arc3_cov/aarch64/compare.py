@@ -274,6 +274,28 @@ def main():
         rd = csv.DictReader(f, delimiter='\t')
         for x in rd:
             llvm[x['hex']] = (x['l_rd'], x['l_wr'], x['l_ok'])
+    # ---- THE LLVM ARM IS A CACHE AND MUST COVER THE DENOMINATOR ----------
+    #
+    # fields_all.txt is an isaxcheck --batch dump over opcodes.tsv, kept on
+    # disk.  Nothing re-derived it, so a representative that MOVED silently
+    # lost its cross-check row and the `llvm_src` column simply read '-' --
+    # the same shape as the tracer_fields.tsv staleness this harness already
+    # has a guard for.  MEASURED: re-seating `movprfx_z_p_z_` at its merging
+    # M bit orphaned exactly one row, and nothing said so.
+    #
+    # Missing rows are therefore counted and named.  A blank llvm_src is a
+    # legitimate state for a row LLVM does not decode; it is not a legitimate
+    # state for a row the cache was never asked about, and the two are
+    # indistinguishable downstream, so the refusal is here.
+    uncov = [x['hex'] for x in rows if x['hex'] not in llvm]
+    if uncov:
+        sys.exit('REFUSED: %d of %d opcodes.tsv encodings have no row in '
+                 'fields_all.txt -- the LLVM cross-check cache does not cover '
+                 'the denominator and those rows would read as "LLVM says '
+                 'nothing" when nothing asked LLVM.  Re-derive it:\n'
+                 "  cut -f3 opcodes.tsv | tail -n +2 | isaxcheck "
+                 '--isa=aarch64 --batch > fields_all.txt\n  first missing: %s'
+                 % (len(uncov), len(rows), ' '.join(uncov[:8])))
 
     out = open(BASE + '/attrib.tsv', 'w')
     cols = ['opcode_id', 'mnemonic', 'hex', 'disasm', 'instr_class', 'ref_rank',

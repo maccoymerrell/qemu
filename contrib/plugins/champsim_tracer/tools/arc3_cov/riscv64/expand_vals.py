@@ -193,9 +193,31 @@ VAR_OVERRIDE = {
     ('CSRReg', 'csr'): 0x340, ('CSRImm', 'csr'): 0x340,
 }
 
+# THE MASK FIELD SEATS AT ZERO -- MASKED -- ON EVERY CLAUSE THAT HAS ONE.
+#
+# `vm` is one bit, so the width rule below would give it 1, which is the
+# UNMASKED value: `v0` is not read, and every RVV row's reference footprint is
+# then the footprint of an instruction with no mask operand.  That is the
+# degeneracy exec106's probe audit measured on 586 opcodes
+# (probedeg/ADJUDICATION.md), and it is the RVV twin of the rule mkprobe.py
+# already states for x86 EVEX: "an EVEX opcode carrying a mask slot is
+# re-probed with aaa=001 so the mask operand is actually exercised (C3)".
+#
+# It is a SEATING and not a new subject.  The Sail encdec clause names `vm`
+# as a field of the clause -- `encdec_vvfunct6(funct6) @ vm @ ...` -- so both
+# values are one opcode by the reference's own construction.  Clauses that FIX
+# the mask (`vadc`, `vmadc`, `vmerge`, `vmv` and friends spell it as a literal
+# bit) have no free `vm` field and are untouched here.
+#
+# Keyed on the VARIABLE NAME rather than on (node, var) because the claim is
+# about the field, not about one clause, and a per-node list would go stale
+# the moment the model gained a vector clause.
+FREE_VAR_SEAT = {'vm': 0}
+
 IMM_DEFAULT = 3   # 3, not 1: an immediate of 1 turns sltiu into the seqz alias
 def imm_value(node, var, width):
     if (node, var) in VAR_OVERRIDE: return VAR_OVERRIDE[(node, var)]
+    if var in FREE_VAR_SEAT: return FREE_VAR_SEAT[var]
     return IMM_DEFAULT if width >= 2 else 1
 
 def expand(c):

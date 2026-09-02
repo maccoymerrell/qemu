@@ -63,6 +63,78 @@ def reprobe(rows):
     return moved
 
 
+VM_FIELD = re.compile(r'(?<![A-Za-z0-9_])vm(?![A-Za-z0-9_])')
+VM_BIT = 25
+
+
+def reseat_vm(rows):
+    """Move every RVV representative off the value where the mask is inert.
+
+    THE RULE THIS IS AN INSTANCE OF is mkprobe.py's, stated in its opening
+    paragraph for x86: "an EVEX opcode carrying a mask slot is re-probed with
+    aaa=001 so the mask operand is actually exercised (C3)".  A probe encoding
+    whose field sits at the value where the modelled effect DOES NOT HAPPEN is
+    not a probe of that effect.  Every RVV representative here seats `vm = 1`
+    -- UNMASKED -- so `v0` is never read and the tracer answer the comparison
+    scores is the answer for an instruction that has no mask operand.
+    exec106's probe-degeneracy audit measured 586 opcodes in that state
+    (probedeg/ADJUDICATION.md).
+
+    WHY IT IS THE SAME SUBJECT AND NOT A NEW ONE.  The Sail encdec clause
+    names `vm` as a field OF THE CLAUSE -- `encdec_vvfunct6(funct6) @ vm @
+    ...` -- so both values are one opcode by the reference's own
+    construction, exactly as `LDR_32_ldst_pos` and `_immpre` are two by
+    aarch64's.  Re-seating changes the ENCODING probed and never the OPCODE
+    measured.
+
+    THE ACCEPTANCE RULE IS WHAT EXCLUDES THE COMBINATIONS RVV RESERVES.
+    `vmv`, `vadc`/`vmadc` and friends FIX `vm`, so their bit-25 variants
+    decode to a different instruction or to nothing at all; the variant is
+    taken only when LLVM reads it as the SAME MNEMONIC at the SAME LENGTH.
+    That is `mkprobe.py`'s own `same_opcode` rule expressed in fixed-width
+    terms, and it is the reference deciding, not this file.
+
+    Returns the rows that moved, for printing.  A row that does not move is
+    not an error: most of the space has no `vm` field at all.
+    """
+    cand = [r for r in rows
+            if r['bytes'] == 4 and VM_FIELD.search(r['text'])
+            and (r['word'] >> VM_BIT) & 1]
+    if not cand:
+        return [], []
+    want = [(r, r['word'] & ~(1 << VM_BIT)) for r in cand]
+    inp = '\n'.join(w.to_bytes(4, 'little').hex() for _, w in want) + '\n'
+    p = subprocess.run([ISAX, '--isa=riscv64', '--layer=boundary', '--batch'],
+                       input=inp, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit('isaxcheck refused the vm re-seat batch rc=%d\n%s'
+                         % (p.returncode, p.stderr[-2000:]))
+    got = {row['hex']: row
+           for row in csv.DictReader(p.stdout.splitlines(), delimiter='\t')}
+    moved, refused = [], []
+    for r, w in want:
+        h = w.to_bytes(4, 'little').hex()
+        d = got.get(h)
+        if d is None:
+            raise SystemExit('isaxcheck returned no row for %s' % h)
+        same = (d['l_ok'] == '1'
+                and d['l_text'].split()[:1] == r['l_text'].split()[:1]
+                and int(d['l_sz'] or 0) == 4)
+        if not same:
+            refused.append((r['node'], r['mnemonic'], h,
+                            d['l_text'] or '(no LLVM decode)'))
+            continue
+        r['word'] = w
+        r['hex'] = h
+        moved.append((r['node'], r['mnemonic'], r['hex'], d['l_text']))
+    return moved, refused
+
+
+VM_MOVED, VM_REFUSED = reseat_vm(rows)
+print('vm re-seat: %d representative(s) moved to the MASKED encoding, '
+      '%d refused by the reference' % (len(VM_MOVED), len(VM_REFUSED)))
+for m in VM_REFUSED[:20]:
+    print('  refused %-14s %-14s %s  LLVM: %s' % m)
 MOVED = reprobe(rows)
 print('re-probed %d rows against %s' % (len(rows), ISAX))
 if MOVED:

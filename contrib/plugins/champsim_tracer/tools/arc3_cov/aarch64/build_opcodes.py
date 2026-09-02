@@ -311,6 +311,59 @@ for _ in range(int(os.environ.get("DECOL", "300"))):
         if ok_mn(r, m):
             r["state"] = "exact"
         taken.add(w)
+# ------------------------------------------------------------- field seats --
+# A PROBE ENCODING WHOSE FIELD SITS AT THE VALUE WHERE THE MODELLED EFFECT
+# DOES NOT HAPPEN IS NOT A PROBE OF THAT EFFECT.  The rule is mkprobe.py's,
+# stated there for x86 EVEX mask slots; exec106's probe-degeneracy audit asked
+# the same question of this denominator and found exactly ONE row in that
+# state (probedeg/ADJUDICATION.md).
+#
+# `movprfx_z_p_z_` is the one MRA encoding whose two predication modes are the
+# SAME named encoding -- bit 16 (`M`) selects zeroing from merging, and the
+# representative seated /z.  The merging form READS ITS DESTINATION and the
+# zeroing form does not, so the row was measuring an instruction with one
+# fewer source than the encoding can name.  `cpy_z_o_i_` and `cpy_z_p_i_` are
+# NOT this class: they are two rows of the denominator with a probe each, and
+# nothing here touches them.
+#
+# The seat is applied AFTER collision resolution and is then held to the same
+# two conditions the resolution holds every representative to: the encoding
+# must be unused, and the reference must still read it as the same
+# instruction.  A seat that fails either is a claim about the denominator and
+# ends the run rather than quietly leaving the row where it was.
+SEAT = {
+    "movprfx_z_p_z_": [(16, 1)],       # M = merging, so Zd is read
+}
+seated = []
+taken = {r["word"] for r in subjects}
+for r in subjects:
+    if r["enc"] not in SEAT:
+        continue
+    w = r["word"]
+    for pos, val in SEAT[r["enc"]]:
+        w = (w | (1 << pos)) if val else (w & ~(1 << pos))
+    if w == r["word"]:
+        continue
+    seated.append((r, w))
+if seated:
+    res = batch([w for _, w in seated])
+    for r, w in seated:
+        rec = res.get(hx(w))
+        m = mn_of(rec)
+        if w in taken:
+            sys.exit("SEAT REFUSED: %s -> %08x collides with another "
+                     "representative" % (r["enc"], w))
+        if m is None or not ok_mn(r, m):
+            sys.exit("SEAT REFUSED: %s -> %08x does not decode to %s (%r); "
+                     "the seated value is a different instruction, not the "
+                     "same one exercised" % (r["enc"], w, r["mnem"], m))
+        taken.discard(r["word"])
+        r["word"], r["dec"] = w, rec
+        taken.add(w)
+        sys.stderr.write("seated %s at %s -> %s\n"
+                         % (r["enc"], hx(w),
+                            (rec.get("l_text") or "").strip()))
+
 byhex = defaultdict(list)
 for r in subjects:
     byhex[r["word"]].append(r)

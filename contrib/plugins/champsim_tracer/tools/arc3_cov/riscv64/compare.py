@@ -212,6 +212,36 @@ def main():
     missing = [k for k in base if k not in byid]
     assert not missing, ('unjoined opcode rows: %d %r' % (len(missing), missing[:5]))
 
+    # ---- THE TWO SIDES MUST BE PROBING THE SAME ENCODING ------------------
+    #
+    # The join is on the opcode identity, and until now nothing checked that
+    # the two representatives behind one identity were the same bit pattern.
+    # They are built by two generators -- expand.py writes rows.json, which
+    # emit.py turns into opcodes.tsv, and expand_vals.py writes
+    # rows_vals.json, which the Sail evaluation below reads -- so they agree
+    # only as long as both seat every free field the same way.
+    #
+    # MEASURED, not hypothetical: seating the RVV `vm` field at 0 in one
+    # generator and not the other made the tracer read the MASKED encoding
+    # and the reference the UNMASKED one, and the comparison reported 586
+    # UNACCOUNTED rows whose whole content was a `v0` the reference had never
+    # been asked about.  A disagreement about the subject must not be
+    # reportable as a disagreement about the answer, so it refuses here.
+    mism = []
+    for oid, meta in sorted(base.items()):
+        r = byid[oid]
+        h = r['word'].to_bytes(r['bytes'], 'little').hex()
+        if h != meta['hex']:
+            mism.append((oid, meta['hex'], h))
+    if mism:
+        raise SystemExit(
+            'REFUSED: %d opcode(s) whose tracer and reference representatives '
+            'are DIFFERENT ENCODINGS -- the two generators have drifted and '
+            'nothing below would be a comparison of one instruction:\n  '
+            % len(mism)
+            + '\n  '.join('%-40s opcodes.tsv=%s rows_vals=%s' % m
+                          for m in mism[:10]))
+
     model = S.Model(SAIL)
     an = S.Analyzer(model)
 

@@ -368,6 +368,27 @@ typedef struct InsnDataflowField {
      * second way of saying where its value came from.
      */
     uint64_t prov[INSN_DF_REG_WORDS];
+    /*
+     * A WRITE reached this row and stated NO provenance at all.
+     *
+     * @prov is a SET, and an empty set has always had two readings that no
+     * consumer could tell apart: the value came from a constant -- the
+     * empty-and-complete reading the address and store-data families already
+     * run under -- or nobody said where it came from.  Three routes create a
+     * written field and only one of them computes a provenance: an env store
+     * hands df_prov_of() the value temp, while the gvec constructor's
+     * destination and insn_dataflow_note_stated_write_env()'s stated range
+     * both arrive with NULL.  Their rows are indistinguishable from a
+     * genuinely constant one, and a consumer reading empty-and-complete on
+     * them publishes "this destination came from the instruction's encoding"
+     * for a write nothing described.
+     *
+     * MONOTONE, AND ONLY THE WRITE DIRECTION TOUCHES IT: a row written twice,
+     * once with a provenance and once without, has a set that is SHORT, and
+     * short must never read as complete.  A read contribution states nothing
+     * about where a written value came from and leaves it alone.
+     */
+    uint8_t  prov_unstated;
 } InsnDataflowField;
 
 #define INSN_DF_RD          1

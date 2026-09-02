@@ -579,6 +579,15 @@ unsigned qemu_plugin_insn_fields(const struct qemu_plugin_tb *tb, size_t idx,
             .env_offset = d->fields[i].off,
             .size = d->fields[i].size,
             .dir = d->fields[i].dir,
+            /*
+             * The write direction's answer, and only there: a read-only row
+             * has no written value to describe.  Negated at the boundary
+             * because the internal flag records the DEFECT (a write said
+             * nothing) while the exported one states the PROPERTY a consumer
+             * has to check before reading an empty set as an answer.
+             */
+            .prov_stated = (d->fields[i].dir & INSN_DF_WR) &&
+                           !d->fields[i].prov_unstated,
         };
 
         if (want == 0 || want > sizeof(f)) {

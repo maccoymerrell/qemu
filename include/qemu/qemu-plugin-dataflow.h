@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 15
+#define QEMU_PLUGIN_DATAFLOW_VERSION 16
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -391,6 +391,37 @@ typedef struct qemu_plugin_dataflow_field {
     uint32_t env_offset;
     uint32_t size;              /* 0 when reached by pointer: extent unknown */
     uint32_t dir;               /* QEMU_PLUGIN_DF_RD / _WR */
+    /*
+     * EVERY WRITE THAT REACHED THIS ROW SAID WHERE ITS VALUE CAME FROM.
+     *
+     * WHY A CONSUMER NEEDS IT.  qemu_plugin_insn_field_prov() answers with a
+     * SET, and an EMPTY set has two readings that the set alone cannot
+     * separate: the value came from a constant -- the empty-and-complete
+     * reading, which for a destination means the instruction's own encoding
+     * -- or nobody described the write.  Three routes create a written field
+     * here and only one of them computes a provenance: an ordinary env store
+     * hands the walk the value temp, while the gvec constructor's
+     * destination range and a range stated by
+     * insn_dataflow_note_stated_write_env() both arrive with nothing.  Their
+     * rows are shaped exactly like a constant one.
+     *
+     * So a consumer that publishes empty-as-encoding must ask this first.
+     * With the bit CLEAR the empty set means "not described" and the
+     * encoding reading is a fabrication -- it would name the encoding as the
+     * source of a value nothing said anything about.  With it SET the set is
+     * an answer, and an empty answer is the emitter's own statement that no
+     * register fed the write.
+     *
+     * ZERO on a read-only row, where the question has no subject: @prov
+     * describes where a WRITTEN value came from, and a read contribution
+     * neither states that nor impeaches it.
+     *
+     * MONOTONE ACROSS MERGES.  A field written twice, once described and
+     * once not, has a set that is SHORT, and a short set may never be read as
+     * complete -- so one silent write clears the bit for the row and no later
+     * described write puts it back.
+     */
+    uint8_t  prov_stated;
 } qemu_plugin_dataflow_field;
 
 QEMU_PLUGIN_API

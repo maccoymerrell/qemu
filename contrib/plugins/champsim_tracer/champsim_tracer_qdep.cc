@@ -478,6 +478,21 @@ GHashTable *g_src_adj_r16_sig = nullptr;
 GHashTable *g_field_unnamed = nullptr;
 GHashTable *g_field_unmapped_name = nullptr;
 /*
+ * THE WRITES NOBODY DESCRIBED, sized by QEMU's own spelling of the range.
+ *
+ * qemu_plugin_dataflow_field::prov_stated is clear on a written row that
+ * reached fields[] with no provenance -- the gvec constructor's destination
+ * and every range stated by insn_dataflow_note_stated_write_env().  This is
+ * that population as a LIST rather than a total, because the two routes have
+ * different owners and the list is what says which: a `fpregs`/`bnd`/`fpus`
+ * row closes at the x86 decode site that knows what the helper computes
+ * from, and a gvec destination closes in the constructor.  The counter beside
+ * it is the number of DESTINATIONS the guard refused for it, which is the
+ * cost the wire is paying today.
+ */
+GHashTable *g_dst_prov_unstated_by_reg = nullptr;
+std::atomic<uint64_t> g_dst_prov_unstated{0};
+/*
  * The destinations the ENCODING names and the OP STREAM does not carry
  * (#260), on both sides of the same question and split by CAUSE.
  *
@@ -2587,6 +2602,17 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                 out->dst_state = QDEP_R_NORECORD;
                 return;
             }
+            /*
+             * WHETHER THE SET IS AN ANSWER, carried beside it.  Accumulated
+             * with |= rather than assigned, for the reason QEMU's own flag is
+             * monotone: two field rows can land on ONE generic destination --
+             * a register file written twice, a range and its container -- and
+             * a described write cannot make a silent one described.
+             */
+            if (!fl[i].prov_stated) {
+                out->dst_prov_unstated[k] = 1;
+                tally(&g_dst_prov_unstated_by_reg, fnm);
+            }
             rc = fold_prov(w.data(), out->dst_dep_regs[k],
                            &out->n_dst_dep_regs[k], &memop_slots,
                            &out->dst_dep_imm[k]);
@@ -2985,6 +3011,27 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
              * constant this file cannot name, which is the third shape
              * below and refuses under its own state.
              */
+            /*
+             * AND THE FOURTH SHAPE, which is the one the three above could
+             * not express: the set is empty because NOTHING DESCRIBED THE
+             * WRITE.  It is checked FIRST because it disqualifies the
+             * encoding reading outright -- that reading argues "nothing else
+             * is left", and on a row nobody spoke for, nothing was ever
+             * enumerated to be left over.  x87's `fldt`, the MPX bounds
+             * loads and the x86 status-word writes all reach here through
+             * insn_dataflow_note_stated_write_env(), and the gvec
+             * constructor's destination range reaches it too.
+             *
+             * Refusing rather than publishing IMM is the direction this file
+             * takes everywhere else: an over-approximation costs a consumer
+             * scheduling accuracy, a fabricated source costs it correctness.
+             */
+            if (q->dst_prov_unstated[k]) {
+                g_snprintf(why, whysz, "no stated provenance for %s",
+                           generic_reg_name_or_unknown(q->dst_reg[k]));
+                g_dst_prov_unstated.fetch_add(1, std::memory_order_relaxed);
+                return QDEP_R_DST_PROV_UNSTATED;
+            }
             if (!f->has_immediate ||
                 (q->imm_non_dataflow && !q->imm_reached)) {
                 g_snprintf(why, whysz, "empty set for %s",
@@ -4197,6 +4244,7 @@ const char *state_name(unsigned s)
     case QDEP_NO_BLOCK:         return "stated by QEMU but the wire's HAS_REG flag is clear: consumer already at the default";
     case QDEP_R_DST_UNNAMED:    return "refused: a wire destination QEMU named only as env state, not as a TCG global (#218)";
     case QDEP_R_DST_UNSTATED_CONST: return "refused: a destination's value came from a constant that is neither the encoding nor the zero register";
+    case QDEP_R_DST_PROV_UNSTATED: return "refused: the write that filled this destination stated NO provenance, so its empty set is not an answer and the encoding rule has no subject";
     case QDEP_R_DST_IMM_UNSTATED: return "refused: the instruction carries an immediate QEMU's provenance cannot mention, so a register-only mask would be short by the immediate bit";
     case QDEP_R_DST_IMM_UNSTATED_PATH: return "refused: the instruction carries an immediate NO DECODER ON ITS PATH STATES, so an absent immediate-provenance bit means nobody looked (#248 coverage)";
     case QDEP_R_DST_IMM_FOLDED: return "refused: the decoder stated this instruction's immediate and QEMU folded the value away before any op read it, so the absent bit is the emulator's optimisation";
@@ -6236,6 +6284,8 @@ void qdep_report(GString *report)
                "env byte ranges no target declared a register file for\n(#226: the offset IS the identity, so this is a gap in QEMU's statement\nof its own layout -- never a limit of what the machine knows):");
     dump_tally(report, g_field_unmapped_name,
                "env byte ranges QEMU NAMED that have no generic word\n(#226: the name reached this file and the register table has no row for\nit -- a generator pass, not a boundary question):");
+    dump_tally(report, g_dst_prov_unstated_by_reg,
+               "WRITTEN env ranges QEMU DESCRIBED THE PLACE OF AND NOT THE\nVALUE -- qemu_plugin_dataflow_field::prov_stated clear, by QEMU's own\nname for the range.  An EMPTY provenance here is not an answer, so the\nempty-and-complete rule (\"the value is the instruction's own encoding\")\nhas no subject and the destination is REFUSED under\nQDEP_R_DST_PROV_UNSTATED rather than published as the immediate.  Two\nroutes reach this list and they close in different places: a range stated\nby insn_dataflow_note_stated_write_env() closes at the decode site that\nknows what the helper computes from (R20), and a gvec constructor's\ndestination closes in the constructor.  The list is what tells them\napart:");
     dump_tally(report, g_src_unjustified_sig,
                "SOURCE entries the wire publishes that QEMU's read list does\nnot justify, by mnemonic and generic register.  These are the source\nhalf's NAMED SURVIVORS (R12.1): every one is published exactly as\nbefore, and each row is a coverage path -- an emitter that has to state\nthe read, or an adjudication that the wire is right and QEMU is short:");
     dump_tally(report, g_src_survivor_ident,

@@ -398,6 +398,21 @@ enum QDepState : uint8_t {
      */
     QDEP_R_DST_UNSTATED_CONST,
     /*
+     * Destination family only.  A destination's provenance is EMPTY and the
+     * write that filled it STATED NO PROVENANCE AT ALL, so the set is not an
+     * answer and the empty-and-complete reading has no subject.
+     *
+     * Kept apart from QDEP_R_DST_UNSTATED_CONST because the two want
+     * opposite remedies and only one of them is the tracer's.  A constant
+     * this file has no word for is a VOCABULARY gap; a write nobody
+     * described is a gap in QEMU's own emitters, and it closes at the decode
+     * site that knows what the helper will compute from (R20) -- not here.
+     * Folding them would put both under one number and make the second
+     * invisible, which is how the x87, MPX and status-word writes went a
+     * whole pass reported as constants.
+     */
+    QDEP_R_DST_PROV_UNSTATED,
+    /*
      * Destination family only.  Every destination's provenance was stated in
      * full and named at least one register, but the INSTRUCTION carries an
      * immediate -- and QEMU's provenance cannot mention one, so a mask built
@@ -566,6 +581,23 @@ struct QDepInsn {
      * the flags it writes, and both instructions carry an immediate.
      */
     uint8_t dst_dep_imm[QDEP_MAX_DST];
+    /*
+     * A WRITE INTO THIS DESTINATION SAID NOTHING ABOUT WHERE ITS VALUE CAME
+     * FROM -- qemu_plugin_dataflow_field::prov_stated clear on the field row
+     * that filled it.
+     *
+     * It exists because an EMPTY provenance has two readings and the wire's
+     * rule for one of them is a publish.  The empty-and-complete rule says a
+     * destination with no register in its set was computed from the
+     * instruction's own encoding, and that is sound only where the set is an
+     * ANSWER.  On a row nothing described -- the gvec constructor's
+     * destination range, a range stated by the write note -- the same set
+     * means nobody spoke, and publishing the encoding there names a source
+     * the instruction may not have.  So the two are kept apart per
+     * DESTINATION rather than per instruction: one row of a multi-write
+     * instruction can be described and the next silent.
+     */
+    uint8_t dst_prov_unstated[QDEP_MAX_DST];
     /*
      * Generic registers whose EVERY stated write was a change of
      * representation, so no destination row exists for them (#265).

@@ -1763,6 +1763,15 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
             d->fields[i].dir |= dir;
             if (prov) {
                 df_or(d->fields[i].prov, prov);
+            } else if (dir & INSN_DF_WR) {
+                /*
+                 * A write arrived with nothing to say about where its value
+                 * came from, so this row's set is SHORT from here on.  See
+                 * InsnDataflowField::prov_unstated: it is monotone, because
+                 * a later stated write cannot make an earlier silent one
+                 * described.
+                 */
+                d->fields[i].prov_unstated = 1;
             }
             /*
              * THE ORDER IS PER DIRECTION, which is why this is here and not
@@ -1789,11 +1798,14 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->fields[d->n_fields].off = off;
     d->fields[d->n_fields].size = (uint16_t)size;
     d->fields[d->n_fields].dir = dir;
+    d->fields[d->n_fields].prov_unstated = 0;
     memset(d->fields[d->n_fields].prov, 0,
            sizeof(d->fields[d->n_fields].prov));
     if (prov) {
         memcpy(d->fields[d->n_fields].prov, prov,
                sizeof(d->fields[d->n_fields].prov));
+    } else if (dir & INSN_DF_WR) {
+        d->fields[d->n_fields].prov_unstated = 1;
     }
     df_ord_field(d, d->n_fields, dir);
     d->n_fields++;

@@ -87,6 +87,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ident_instrument_paths  # noqa: E402  (path fixed up just above)
+
 # The one-row-two-encodings group.  Ordered as the witness reports them.
 #
 #   MOVD_from   0x228  legacy movd/movq GEN_OP_MOV vs VEX GEN_OP_VEC_MOV
@@ -431,17 +434,15 @@ def build(path_dec, path_out, report):
 
 def main():
     ap = argparse.ArgumentParser()
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ap.add_argument('--decode',
-                    default=os.path.join(here, 'target/i386/tcg/decode-new.c.inc'))
-    ap.add_argument('--out',
-                    default=os.path.join(here, 'target/i386/tcg/vex_ident.c.inc'))
-    ap.add_argument('--report',
-                    default=os.path.join(
-                        here, 'contrib/plugins/champsim_tracer/tools/'
-                        'arc3_qemuid/VEX_IDENT_RESIDUE.txt'))
-    args = ap.parse_args()
-    return build(args.decode, args.out, args.report)
+    paths = ident_instrument_paths.Paths(__file__)
+    paths.add_input(ap, '--decode', 'target/i386/tcg/decode-new.c.inc')
+    paths.add_output(ap, '--out', 'target/i386/tcg/vex_ident.c.inc')
+    paths.add_output(ap, '--report',
+                     'contrib/plugins/champsim_tracer/tools/arc3_qemuid/'
+                     'VEX_IDENT_RESIDUE.txt')
+    paths.install(ap)
+    return ident_instrument_paths.main_wrapper(
+        paths, ap, lambda a, v: build(v[0], v[1], v[2]))
 
 
 if __name__ == '__main__':

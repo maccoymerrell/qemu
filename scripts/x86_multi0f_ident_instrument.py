@@ -60,8 +60,12 @@
 #
 # Author: Maccoy Merrell.
 import argparse
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ident_instrument_paths  # noqa: E402  (path fixed up just above)
 
 FUNC_RE = re.compile(r'^static void gen_multi0F\(')
 INCLUDE_TAG = '/* multi0f_ident */'
@@ -595,12 +599,14 @@ def build(path_tr, path_out, path_x87, report):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--translate', default='target/i386/tcg/translate.c')
-    ap.add_argument('--x87', default='target/i386/tcg/x87_ident.c.inc')
-    ap.add_argument('-o', default='target/i386/tcg/multi0f_ident.c.inc')
+    paths = ident_instrument_paths.Paths(__file__)
+    paths.add_input(ap, '--translate', 'target/i386/tcg/translate.c')
+    paths.add_input(ap, '--x87', 'target/i386/tcg/x87_ident.c.inc')
+    paths.add_output(ap, '-o', 'target/i386/tcg/multi0f_ident.c.inc')
+    paths.install(ap)
     ap.add_argument('-q', action='store_true')
-    a = ap.parse_args()
-    return build(a.translate, a.o, a.x87, not a.q)
+    return ident_instrument_paths.main_wrapper(
+        paths, ap, lambda a, v: build(v[0], v[2], v[1], not a.q))
 
 
 if __name__ == '__main__':

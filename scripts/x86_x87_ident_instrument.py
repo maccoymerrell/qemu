@@ -69,6 +69,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ident_instrument_paths  # noqa: E402  (path fixed up just above)
+
 FUNC = 'static void gen_x87(DisasContext *s, X86DecodedInsn *decode)'
 MARK = 'x87_ident_publish(b, modrm);'
 FT_TAG = '  /* x87_ident */'
@@ -940,22 +943,16 @@ def build(path_c, path_dec, path_inc, report):
 
 def main():
     ap = argparse.ArgumentParser()
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ap.add_argument('--source',
-                    default=os.path.join(here, 'target/i386/tcg/translate.c'))
-    ap.add_argument('--decode-table',
-                    default=os.path.join(here,
-                                         'target/i386/tcg/decode-new.c.inc'))
-    ap.add_argument('--table',
-                    default=os.path.join(here,
-                                         'target/i386/tcg/x87_ident.c.inc'))
-    ap.add_argument('--report',
-                    default=os.path.join(
-                        here,
-                        'contrib/plugins/champsim_tracer/tools/arc3_qemuid/'
-                        'X87_IDENT_RESIDUE.txt'))
-    args = ap.parse_args()
-    return build(args.source, args.decode_table, args.table, args.report)
+    paths = ident_instrument_paths.Paths(__file__)
+    paths.add_input(ap, '--source', 'target/i386/tcg/translate.c')
+    paths.add_input(ap, '--decode-table', 'target/i386/tcg/decode-new.c.inc')
+    paths.add_output(ap, '--table', 'target/i386/tcg/x87_ident.c.inc')
+    paths.add_output(ap, '--report',
+                     'contrib/plugins/champsim_tracer/tools/arc3_qemuid/'
+                     'X87_IDENT_RESIDUE.txt')
+    paths.install(ap)
+    return ident_instrument_paths.main_wrapper(
+        paths, ap, lambda a, v: build(v[0], v[1], v[2], v[3]))
 
 
 if __name__ == '__main__':

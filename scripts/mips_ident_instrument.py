@@ -37,6 +37,9 @@ import re
 import sys
 import textwrap
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ident_instrument_paths  # noqa: E402  (path fixed up just above)
+
 # The opcode-enumerator families that appear as case labels in the
 # hand-written MIPS decoder.  A case label outside these families is not
 # an instruction identity (CP0 register selectors, DISAS_* states, format
@@ -653,19 +656,15 @@ def build(path_c, path_inc, report):
 
 def main():
     ap = argparse.ArgumentParser()
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ap.add_argument('--source',
-                    default=os.path.join(here, 'target/mips/tcg/translate.c'))
-    ap.add_argument('--table',
-                    default=os.path.join(here,
-                                         'target/mips/tcg/translate_ident.c.inc'))
-    ap.add_argument('--report',
-                    default=os.path.join(
-                        here,
-                        'contrib/plugins/champsim_tracer/tools/arc3_qemuid/'
-                        'MIPS_IDENT_RESIDUE.txt'))
-    args = ap.parse_args()
-    return build(args.source, args.table, args.report)
+    paths = ident_instrument_paths.Paths(__file__)
+    paths.add_input(ap, '--source', 'target/mips/tcg/translate.c')
+    paths.add_output(ap, '--table', 'target/mips/tcg/translate_ident.c.inc')
+    paths.add_output(ap, '--report',
+                     'contrib/plugins/champsim_tracer/tools/arc3_qemuid/'
+                     'MIPS_IDENT_RESIDUE.txt')
+    paths.install(ap)
+    return ident_instrument_paths.main_wrapper(
+        paths, ap, lambda a, v: build(v[0], v[1], v[2]))
 
 
 if __name__ == '__main__':

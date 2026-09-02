@@ -59,8 +59,12 @@
 #
 # Author: Maccoy Merrell.
 import argparse
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ident_instrument_paths  # noqa: E402  (path fixed up just above)
 
 SLOT_RE = re.compile(
     r'\bX86_OP_(ENTRY[0-4rw]{0,2}|GROUP[0-3rw]{0,2}|LEAF|SET_GEN)'
@@ -379,12 +383,14 @@ def build(path_dec, path_emit, path_out, report):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--decode', default='target/i386/tcg/decode-new.c.inc')
-    ap.add_argument('--emit', default='target/i386/tcg/emit.c.inc')
-    ap.add_argument('-o', default='target/i386/tcg/threednow_ident.c.inc')
+    paths = ident_instrument_paths.Paths(__file__)
+    paths.add_input(ap, '--decode', 'target/i386/tcg/decode-new.c.inc')
+    paths.add_input(ap, '--emit', 'target/i386/tcg/emit.c.inc')
+    paths.add_output(ap, '-o', 'target/i386/tcg/threednow_ident.c.inc')
+    paths.install(ap)
     ap.add_argument('-q', action='store_true')
-    a = ap.parse_args()
-    return build(a.decode, a.emit, a.o, not a.q)
+    return ident_instrument_paths.main_wrapper(
+        paths, ap, lambda a, v: build(v[0], v[1], v[2], not a.q))
 
 
 if __name__ == '__main__':

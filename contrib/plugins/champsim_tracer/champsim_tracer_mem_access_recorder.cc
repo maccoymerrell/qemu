@@ -414,10 +414,11 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
         if (seen != gen &&
             impossible_warned_gen.compare_exchange_strong(seen, gen)) {
             fprintf(stderr,
-                    "champsim_tracer: WARNING memop attributed to a "
-                    "memop-incapable insn (template %u insn[%d] "
-                    "pc=0x%" PRIx64 ") — attribution corruption "
-                    "upstream of the drain; counted in "
+                    "champsim_tracer: WARNING a memop landed on an insn "
+                    "whose STATIC SLOT COUNT is zero (template %u "
+                    "insn[%d] pc=0x%" PRIx64 ") — the access is "
+                    "attributed correctly; what is missing is the "
+                    "layout to hang it on.  Counted in "
                     "cp_impossible_slot_memops (once per segment)\n",
                     bb_tmpl->template_id, slot, bb_tmpl->insn_pcs[slot]);
         }

@@ -828,6 +828,19 @@ std::atomic<uint64_t> g_addr_blk_absent{0};
  * beside a sentence that is not about it. */
 std::atomic<uint64_t> g_addr_slot_default{0};
 /*
+ * THE ACCESS LIST ADMITTED PAST A STATUS REFUSAL, and the slots that came
+ * back with it (59-A).
+ *
+ * qdep_note_insn()'s status gate used to refuse the whole extraction on six
+ * flags at once.  Three of them impeach the ACCESS LIST and three do not,
+ * and the count is now taken on the second three -- see the stanza there.
+ * Counted per instruction and per SLOT because the two answer different
+ * questions: how many instructions stopped losing their layout, and how many
+ * load/store slots the wire got back to hang a dependency on.
+ */
+std::atomic<uint64_t> g_status_count_admitted{0};
+std::atomic<uint64_t> g_status_count_slots{0};
+/*
  * The address side's must-be-0, and it is a difference for the same reason
  * the register side's is: @g_addr_fact_stated counts an address QEMU stated
  * where it is ESTABLISHED, in qdep_apply()'s per-access loop, and
@@ -4789,6 +4802,93 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             out->n_src = 0;
             memset(out->src_reg, 0, sizeof(out->src_reg));
         }
+        /*
+         * AND THE ACCESS LIST'S LENGTH IS STILL QEMU'S WHERE QEMU STILL
+         * STATES IT.  Same shape as QDEP_R_SHORT one field over: the status
+         * word and the access list are not the same fact, and until this
+         * stanza the second was thrown away with the first.
+         *
+         * The six flags are not one claim.  THREE IMPEACH THE LIST --
+         * @memops_truncated says it was capped, @memops_unnoted says a member
+         * is missing, @prov_truncated says a set inside it lost one -- and
+         * QEMU refuses qemu_plugin_insn_memops() on exactly those three, so
+         * the call below IS that predicate and this file does not restate it.
+         * The other three are about something else entirely:
+         * @fields_truncated and @writes_truncated are register-side
+         * capacities, and @n_helper_unbounded's own contract says the
+         * reported READ AND WRITE SETS are short.  None of the three says
+         * how many accesses the instruction has.
+         *
+         * Refusing the COUNT on them cost a real dependency, which is why
+         * this is a correctness fix and not a tidy-up.  With no load slot
+         * there is no load-data bit for a destination mask to name, so
+         * `divss val(%rip), %xmm0` published its result as waiting on the
+         * ADDRESS register instead of on the loaded value -- while `mulss`,
+         * the next opcode byte, published the load because its helper
+         * happens to be bounded.  The runtime memop then found no static
+         * slot and tripped cp_impossible_slot_memops.  Under R16 a
+         * dependency the ISA defines and the trace does not carry is a
+         * defect.
+         *
+         * NOTHING NEW IS ASSERTED.  @state, @data_state and @dst_state stay
+         * QDEP_R_STATUS, and that is precisely the condition qdep_apply()
+         * reads to leave every per-slot answer unread: every address mask
+         * and the store-data mask reach the format's own all-inputs default
+         * -- bit-for-bit what a consumer assumes with no block at all -- and
+         * the destination family is refused exactly as before.  What is
+         * admitted is the LENGTH of a list QEMU says is whole.  The
+         * precedent is already in this function: mo[i].count_unbounded is
+         * deliberately not consulted, because the slot count has never been
+         * a bound on the dynamic count.
+         */
+        for (unsigned i = 0; i < kMaxMemops; i++) {
+            mo[i].struct_size = sizeof(mo[i]);
+        }
+        n = qemu_plugin_insn_memops(tb, idx, mo, kMaxMemops);
+        if (n != QEMU_PLUGIN_DF_INCOMPLETE && n <= kMaxMemops) {
+            bool room = true;
+
+            for (unsigned i = 0; i < n && room; i++) {
+                bool store = mo[i].is_store != 0;
+                uint8_t a;
+
+                if ((store ? out->n_stores : out->n_loads) >=
+                    QDEP_MAX_ACCESS) {
+                    /*
+                     * Wider than the arrays hold, and the same answer the
+                     * clean path gives: refuse the layout rather than
+                     * publish a truncated one.
+                     */
+                    room = false;
+                    break;
+                }
+                a = store ? out->n_stores++ : out->n_loads++;
+                /*
+                 * Stated as REFUSED per access, not left at QDEP_NONE.  The
+                 * loop that would read them is already short-circuited by
+                 * @state, so this is not what keeps a mask off the wire --
+                 * it is so a slot's own row cannot be misread as "QEMU had
+                 * nothing to say here" by anything added later.
+                 */
+                if (store) {
+                    out->store_addr_state[a] = QDEP_R_STATUS;
+                } else {
+                    out->load_addr_state[a] = QDEP_R_STATUS;
+                }
+            }
+            if (room) {
+                out->have_list = true;
+                g_status_count_admitted.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                g_status_count_slots.fetch_add(out->n_loads + out->n_stores,
+                                               std::memory_order_relaxed);
+            } else {
+                out->n_loads = out->n_stores = 0;
+                memset(out->load_addr_state, 0, sizeof(out->load_addr_state));
+                memset(out->store_addr_state, 0,
+                       sizeof(out->store_addr_state));
+            }
+        }
         return;
     }
 
@@ -5587,6 +5687,8 @@ void qdep_report(GString *report)
         uint64_t ad = g_addr_slot_default.load(std::memory_order_relaxed);
         uint64_t as_ = g_addr_fact_stated.load(std::memory_order_relaxed);
         uint64_t ac = g_addr_fact_carried.load(std::memory_order_relaxed);
+        uint64_t sca = g_status_count_admitted.load(std::memory_order_relaxed);
+        uint64_t scs = g_status_count_slots.load(std::memory_order_relaxed);
 
         if (aq || am || aa) {
             g_string_append_printf(report,
@@ -5621,6 +5723,36 @@ void qdep_report(GString *report)
                 "               between them.  %" G_GUINT64_FORMAT " stated,"
                 " %" G_GUINT64_FORMAT " carried\n",
                 aq, am, ad, aa, as_ - ac, as_, ac);
+        }
+        if (sca) {
+            g_string_append_printf(report,
+                "\nthe ACCESS LIST PAST A STATUS REFUSAL (59-A):\n"
+                "  %10" G_GUINT64_FORMAT "  instructions whose extraction"
+                " reported itself incomplete and\n"
+                "               whose ACCESS LIST QEMU still stated whole,"
+                " carrying\n"
+                "               %" G_GUINT64_FORMAT " slot(s).  The status word"
+                " and the access list are\n"
+                "               separate facts: three of the six status flags"
+                " impeach the\n"
+                "               list -- and qemu_plugin_insn_memops() refuses"
+                " on exactly those\n"
+                "               three, so the call IS the predicate -- while"
+                " field capacity,\n"
+                "               write capacity and unbounded helper FOOTPRINT"
+                " say nothing\n"
+                "               about how many accesses there are.  Every mask"
+                " on these rows\n"
+                "               is still the format's own all-inputs default;"
+                " what came back\n"
+                "               is the LAYOUT, so a destination can name the"
+                " loaded value\n"
+                "               instead of the address it was computed from.  A"
+                " row here with\n"
+                "               ZERO slots moved no wire and only stopped"
+                " reporting a refusal\n"
+                "               for a list QEMU had stated as empty\n",
+                sca, scs);
         }
     }
 

@@ -107,13 +107,20 @@ struct Stats {
      * still surfacing here indicates a leak).  Dropped at drain
      * instead of mis-slotted onto insn 0. */
     uint64_t cp_orphan_mem_accesses = 0;
-    /* CP memops whose insn_pc DID match a template slot, but the slot's
-     * instruction cannot physically touch memory (static max loads and
+    /* CP memops whose insn_pc DID match a template slot, but the slot
+     * carries NO STATIC SLOT COUNT to hold them (static max loads and
      * stores both zero; atomics and synthetic-EA opcode classes
-     * exempt).  The memop is still emitted — the trace records what
-     * was observed — but a nonzero count means attribution corruption
-     * upstream of the drain, the class the offline lint (cst_lint.h)
-     * fails traces on. */
+     * exempt).  The memop is still emitted — the trace records what was
+     * observed.
+     *
+     * A nonzero count is a MISSING LAYOUT, and naming it "attribution
+     * corruption" sent one reader to the wrong file: the two ways to get
+     * here are a record reaching a template it does not belong to, and a
+     * template whose slot count was refused for an instruction that
+     * really does access memory.  59-A was the second — a status refusal
+     * discarding an access list QEMU had stated whole — and the row
+     * cannot tell them apart, so it names the symptom.  It is still the
+     * class the offline lint (cst_lint.h) fails traces on. */
     uint64_t cp_impossible_slot_memops = 0;
     /* Memops an entry could not address, because the instruction issued
      * more than CST_FID_SLOT_COUNT of one direction and the wire has no

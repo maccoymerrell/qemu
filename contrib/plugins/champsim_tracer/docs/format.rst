@@ -3143,8 +3143,20 @@ ID.  The role does not travel on the wire; the ID does.
 The
 compressed-special band holds the classes that are one register rather
 than a bank: ``REG_BOUND0..3``, ``REG_ACC0..3``, ``REG_ZERO``,
-``REG_MATRIX``, ``REG_SYS``, ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``
-and ``REG_SSP``.
+``REG_MATRIX``, ``REG_SYS``, ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``,
+``REG_SSP`` and ``REG_LLRES``.
+
+``REG_LLRES`` is the load-reserved / load-linked reservation, the
+address half of the exclusive monitor: the MIPS LLbit and its address,
+the RISC-V reservation set, the AArch64 local exclusive monitor.  A
+store-conditional succeeds if and only if the reservation its
+load-linked established is still held, so the pair carries a
+dependency the ISA defines and the register class is what expresses
+it.  The VALUE half an emulator keeps beside it — a copy of what the
+load returned, so that store-conditional can be lowered onto a
+compare-and-swap — is not architectural state and has no ID: real
+hardware keeps no such copy, and a consumer must not read one from
+this class.
 
 Two registers that a renaming regfile would not have to order against
 each other never share an ID.  System and control registers are spread

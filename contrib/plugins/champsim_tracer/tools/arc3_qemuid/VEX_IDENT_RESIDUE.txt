@@ -3,10 +3,10 @@ x86_vex_ident_instrument residue report
 
 decode table      : /mnt/md0/QEMU/qemu/target/i386/tcg/decode-new.c.inc
 previous inserts stripped: 1
-publish site      : line 2926 (below all 854 sites, max 1932)
+publish site      : line 2968 (below all 854 sites, max 1932)
 qualify members   : 8
 rows carved       : 30 over 15 slot(s)
-(slot, vex) pairs checked: 5980  qualified 30  residual 5950
+(slot, vex) pairs checked: 6072  qualified 30  residual 6042
 
 every member, every slot of it
 ------------------------------

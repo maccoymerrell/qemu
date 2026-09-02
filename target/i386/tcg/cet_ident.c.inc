@@ -26,15 +26,15 @@
  * THE BASE ROW DOES NOT MOVE.  decode-new.c.inc is not
  * edited apart from the one inserted call, which sits
  * below every X86_OP_* site in the file (last site line
- * 1932, call line 2928) so no slot is renumbered.  An encoding
+ * 1932, call line 2969) so no slot is renumbered.  An encoding
  * that reaches no arm -- every plain reserved NOP, and
  * every 0F 1E without F3 -- publishes nothing here and
  * keeps the row's own id and name bit for bit.
  *
- * EXHAUSTIVE, not sampled: 1531904 (slot, f3, modrm) triples --
+ * EXHAUSTIVE, not sampled: 1553920 (slot, f3, modrm) triples --
  * every __LINE__ this file can hand out, times both prefix
  * states, times all 256 modrm bytes -- checked against the
- * selector below.  10 reach a qualified identity, 1531894 do
+ * selector below.  10 reach a qualified identity, 1553910 do
  * not, no triple reaches two, and every arm is reachable.
  */
 

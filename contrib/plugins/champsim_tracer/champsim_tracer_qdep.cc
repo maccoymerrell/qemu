@@ -4153,7 +4153,7 @@ EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
 EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
-    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\n"};
+    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -4344,6 +4344,26 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
     }
     g_string_append_c(g, '\t');
     reglist_str(g, m->wr, m->n_wr);
+    /*
+     * PUBD -- THE WIRE'S DESTINATION DICTIONARY, beside the write list QEMU
+     * states, and read off @f at the same moment PUB is.
+     *
+     * WR alone cannot answer the destination side's question.  Every
+     * source-side instrument in this corpus works because PUB and RD sit on
+     * one row: the difference between what the wire carries and what QEMU
+     * states IS the measurement.  The destination side had only half of
+     * that pair, so the cost of taking QEMU's write list for `dst_regs[]`
+     * -- which registers the operand walk supplies that QEMU does not state,
+     * and which QEMU states that the walk never had -- could not be scored
+     * per encoding at all.
+     *
+     * Off @f rather than off the stage, exactly like PUB: the stage is taken
+     * inside apply_dst() BEFORE reseat_dst_for_qemu() runs, and the wire's
+     * dictionary is what the reindex left behind.  A PUBD read from the
+     * stage would be the pre-permutation list, which is a different subject.
+     */
+    g_string_append_c(g, '\t');
+    reglist_str(g, f->dst_regs, f->n_dst_regs);
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);

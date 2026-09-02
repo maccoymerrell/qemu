@@ -2582,6 +2582,7 @@ static void gen_INTO(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_IRET(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_note_return_pops(true);
     if (!PE(s) || VM86(s)) {
         gen_helper_iret_real(tcg_env, tcg_constant_i32(s->dflag - 1));
     } else {
@@ -3966,6 +3967,7 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
 {
     int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
+    gen_note_return_pops(false);
     MemOp ot = gen_pop_T0(s);
     gen_stack_update(s, adjust + (1 << ot));
     gen_op_jmp_v(s, s->T0);
@@ -3977,6 +3979,7 @@ static void gen_RETF(DisasContext *s, X86DecodedInsn *decode)
 {
     int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
+    gen_note_return_pops(true);
     if (!PE(s) || VM86(s)) {
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], 0);
         /* pop offset */

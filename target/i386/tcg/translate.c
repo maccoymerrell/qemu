@@ -2368,6 +2368,55 @@ static void gen_note_far_call_pushes(void)
         sizeof(((CPUX86State *)0)->eip));
 }
 
+/*
+ * WHAT A RETURN READS TO POP WITH.
+ *
+ * `ret`, `lret` and `iret` all take their operands off the stack, and the
+ * stack is addressed through SS.  Neither the near nor the far form reaches
+ * QEMU's ordered read list with it:
+ *
+ *   - gen_lea_v_seg_dest() returns EARLY in 64-bit address mode without
+ *     touching cpu_seg_base[R_SS], because SS.base is architecturally zero
+ *     there and adding it would be a no-op.  That is a lowering decision --
+ *     R15 -- and it removes the only op that named the segment.
+ *   - helper_lret_protected() and the two iret helpers do the whole pop
+ *     themselves, so the extraction reports the helper unbounded and the
+ *     STACK POINTER goes with the segment; `lretl` reads RD = - and nothing
+ *     else, while the wire carried REG_SP and REG_SEG5 from the operand walk
+ *     beside it.
+ *
+ * 35,993 registers over the RET and RETF rules, plus 21,069 REG_SP on RETF.
+ *
+ * THE REFERENCE TABLES NAME EXACTLY THESE THREE.  Capstone's x86 mapping --
+ * generated from LLVM -- gives `X86_RETQ` regs_use `{ RSP, SS }`, `X86_LRETQ`
+ * `{ RSP, SS }` with `{ RSP, RIP, CS }` modified, and the same for the 16-
+ * and 32-bit forms and for IRET; `X86_CALL64pcrel32`, `PUSH64r` and `POP64r`
+ * carry no SS at all.  XED describes the same asymmetry from the other side,
+ * as an SS-segmented memory operand on the returns.  That asymmetry is the
+ * table's and it is NOT adjudicated here: a push writes through SS as surely
+ * as a return reads through it, and this note deliberately does not extend to
+ * the push and pop forms, because the loss it closes is on the returns and a
+ * wire change that wide belongs to a measurement of its own.
+ *
+ * @far says whether the stack pointer goes with the segment.  The near
+ * return's RSP is already in the read list -- gen_pop_T0() reads the global
+ * -- so stating it there would add nothing; the far and interrupt returns
+ * lose it inside the helper.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_return_pops(bool far)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, segs[R_SS].selector),
+        sizeof(((CPUX86State *)0)->segs[R_SS].selector));
+    if (far) {
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUX86State, regs[R_ESP]),
+            sizeof(((CPUX86State *)0)->regs[R_ESP]));
+    }
+}
+
 static void gen_far_call(DisasContext *s)
 {
     TCGv_i32 new_cs = tcg_temp_new_i32();

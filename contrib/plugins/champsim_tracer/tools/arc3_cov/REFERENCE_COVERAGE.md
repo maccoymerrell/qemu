@@ -49,6 +49,10 @@ sweep (x86_64 6,416,314 / aarch64 1,408,171 / riscv64 86,889 / mipsel
 | mipsel  | `REG_SYSDBG`   | 0 | 0 | 289 |
 | mipsel  | `REG_SYSTIMER` | 0 | 0 | 128 |
 | riscv64 | `REG_SYS`      | 0 | 0 | 10,009 |
+| x86_64  | `REG_SYS`      | 0 | 0 | 42,749 |
+| x86_64  | `REG_SYSMMU`   | 0 | 0 | 37,214 |
+| x86_64  | `REG_SYSTIMER` | 0 | 0 | 7,108 |
+| x86_64  | `REG_SSP`      | 0 | 0 | 5,126 |
 
 **THE mipsel `REG_SYSEXC` NUMBER IS WHY THIS WAS NOT WRITTEN EARLIER.**
 exec106 measured it at 163,536 on a corpus captured before its own
@@ -59,10 +63,10 @@ written against the old figure would have carried a census that had already
 stopped being true, which is the failure mode this file is supposed to
 prevent, not repeat.
 
-x86_64's census is the slowest arm (6.4M encodings) and had not finished
-when this document was written; exec106's x86_64 readings were
-`REG_SYS 42,749`, `REG_SYSMMU 37,214`, `REG_SYSTIMER 7,108`, `REG_SSP
-5,126`, and they are QUOTED, not re-measured.  They are not entered above.
+NINETEEN ROWS IN TOTAL.  x86_64's census is the slowest arm (6.4M
+encodings) and finished after the first four ISAs; its four rows reproduce
+exec106's readings to the unit, which is the expected result -- nothing
+between the two passes touched an x86 translator.
 
 ## THE ROWS THAT DO NOT PASS, AND WHAT EACH IS OWED INSTEAD
 
@@ -138,15 +142,17 @@ twice).  Of the three ISAs whose census is complete here:
     aarch64  residue 1,079   covered by the passing registers  918
     mipsel   residue   893   covered by the passing registers  645
     riscv64  residue 1,046   covered by the passing registers   44
+    x86_64   residue   502   covered by the passing registers   35
     ---------------------------------------------------------------
-    three ISAs 3,018                                          1,607
+    per arm    3,520                                          1,642
+    both arms  7,040                                          3,284
 
-So the rows would move a standing gate's denominator by a little over half
-its rows on those three arms.  That is a large, single, reversible decision
-about a bar, its x86_64 quarter is not yet measured at this tip, and this
-is the pass that just re-quoted the residue clean.  The adjudication is
-therefore WRITTEN, with its census and its deletion check, and the
-allowlist lines are left for the maintainer to accept as one decision
-rather than smuggled in beside a measurement of the thing they change.
+So the rows would remove **3,284 of the 7,040** residue signatures -- 47%
+of a standing gate's denominator, and 85% of aarch64's.  That is a large,
+single, reversible decision about a bar, and this is the pass that just
+re-quoted that residue clean.  The adjudication is therefore WRITTEN, with
+its census and its deletion check, and the allowlist lines are left for the
+maintainer to accept as one decision rather than smuggled in beside a
+measurement of the thing they change.
 
 Author: Maccoy Merrell.

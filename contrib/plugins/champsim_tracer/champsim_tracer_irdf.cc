@@ -517,6 +517,25 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYSMMU;
     }
     /*
+     * THE MPX BOUND REGISTERS.
+     *
+     * BND<n> is one 128-bit architectural register and QEMU keeps it as TWO
+     * TCG globals, `bnd<n>_lb` and `bnd<n>_ub` over bnd_regs[n].lb and .ub.
+     * Splitting a register into a lower and an upper half is a storage
+     * decision -- the same shape as x86's FPSW.TOP living outside env->fpus,
+     * which target/i386 declares under one name for the same reason -- so
+     * both spellings answer to the one word.
+     *
+     * REG_BOUND<n> already IS that word: the operand walk publishes
+     * X86_REG_BND<n> as REG_BOUND<n> today.  This connects QEMU's spelling to
+     * it; the i386 GDB stub has no bound registers, so the generated
+     * QEMU-indexed table can carry no row for them.
+     */
+    if (!strncmp(name, "bnd", 3) && name[3] >= '0' && name[3] <= '3' &&
+        (!strcmp(name + 4, "_lb") || !strcmp(name + 4, "_ub"))) {
+        return REG_BOUND0 + (name[3] - '0');
+    }
+    /*
      * THE MIPS MSA VECTOR FILE, `w0`..`w31`.
      *
      * Declared by target/mips/tcg/msa_translate.c and absent from the MIPS

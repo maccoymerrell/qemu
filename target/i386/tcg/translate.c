@@ -3768,6 +3768,101 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 }
 
 /*
+ * THE BOUND REGISTER AN MPX INSTRUCTION READS.
+ *
+ * QEMU translates the whole of `0F 1A` and `0F 1B` to NOTHING unless
+ * HF_MPX_EN_MASK is set in the TB flags -- `if (s->flags & HF_MPX_EN_MASK)`
+ * wraps both cases end to end -- so on a guest that has not enabled MPX the
+ * op stream carries no read of any bound register and `bndcl`, `bndcu`,
+ * `bndcn`, `bndmov` and `bndstx` all reach the extraction with `RD = -`.
+ * 26,741 registers over five decode rules, and the wire carried REG_BOUND<n>
+ * from the operand walk alone.
+ *
+ * R16 IS WHY THIS IS STATED ANYWAY.  Whether the enable bit is set is machine
+ * state; the ISA defines `bndcl bnd0,rax` as reading BND0.LB whatever
+ * BNDCFGx says, and R16 records ISA-defined dependencies regardless of
+ * machine state.  R17 says the same thing from the other side: a conditional
+ * carries all its potential sources, and the enable bit is the condition.
+ *
+ * ON THE RETURNING PATH, beside multi0f_ident_publish(), for that publish's
+ * reason -- the `reg >= 4` and 16-bit-address refusals inside the enabled
+ * arms jump to illegal_op, and a note taken here therefore describes an
+ * encoding the emulator accepted.
+ *
+ * THE LEGALITY TESTS ARE RESTATED HERE, and that is worth naming rather than
+ * hiding.  They live inside the enable guard, where a disabled machine never
+ * runs them: with MPX off, `bndcl bnd4,rax` is a NOP and not #UD, and moving
+ * the tests out would change what the guest does.  So the note applies the
+ * same two conditions in the same spelling -- the register field is
+ * `((modrm >> 3) & 7) | REX_R(s)` and must be below four, and a 16-bit
+ * address form has no MPX encoding -- and reads them off @modrm and @s, never
+ * off a private table.
+ *
+ * WHICH HALF.  BND<n> is one 128-bit register that QEMU keeps as two
+ * globals, bnd<n>_lb and bnd<n>_ub, and both fold to REG_BOUND<n>; the note
+ * states the half the instruction actually uses, because that is what the
+ * ISA defines -- `bndcl` checks the LOWER bound and `bndcu`/`bndcn` the
+ * upper -- and the two forms that move a whole register state both.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_bnd_lb(int n)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, bnd_regs[0].lb) + n * sizeof(BNDReg),
+        sizeof(((CPUX86State *)0)->bnd_regs[0].lb));
+}
+
+static void gen_note_bnd_ub(int n)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, bnd_regs[0].ub) + n * sizeof(BNDReg),
+        sizeof(((CPUX86State *)0)->bnd_regs[0].ub));
+}
+
+static void gen_note_mpx_source(DisasContext *s, int b, int modrm,
+                                int prefixes)
+{
+    int mod = (modrm >> 6) & 3;
+    int reg = ((modrm >> 3) & 7) | REX_R(s);
+    int reg2 = (modrm & 7) | REX_B(s);
+
+    if ((b != 0x11a && b != 0x11b) || reg >= 4 || s->aflag == MO_16) {
+        return;
+    }
+
+    if (b == 0x11a) {
+        if (prefixes & PREFIX_REPZ) {            /* bndcl: lower bound */
+            gen_note_bnd_lb(reg);
+        } else if (prefixes & PREFIX_REPNZ) {    /* bndcu: upper bound */
+            gen_note_bnd_ub(reg);
+        } else if (prefixes & PREFIX_DATA) {
+            /* bndmov bnd<reg> <- bnd<reg2>; the memory form reads memory */
+            if (mod == 3 && reg2 < 4) {
+                gen_note_bnd_lb(reg2);
+                gen_note_bnd_ub(reg2);
+            }
+        }
+        /* bndldx WRITES bnd<reg> and reads no bound register. */
+    } else {
+        if (mod != 3 && (prefixes & PREFIX_REPZ)) {
+            /* bndmk WRITES bnd<reg>. */
+        } else if (prefixes & PREFIX_REPNZ) {    /* bndcn: upper bound */
+            gen_note_bnd_ub(reg);
+        } else if (prefixes & PREFIX_DATA) {
+            /* bndmov bnd<reg2>/m <- bnd<reg> */
+            if (mod != 3 || reg2 < 4) {
+                gen_note_bnd_lb(reg);
+                gen_note_bnd_ub(reg);
+            }
+        } else if (mod != 3) {                   /* bndstx */
+            gen_note_bnd_lb(reg);
+            gen_note_bnd_ub(reg);
+        }
+    }
+}
+
+/*
  * multi0f_ident: ENCODING-QUALIFIED IDENTITY for the unconverted 0F spaces.
  *
  * gen_multi0F() is reached from five decode-table rows and
@@ -4414,6 +4509,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
     default:
         g_assert_not_reached();
     }
+    gen_note_mpx_source(s, b, modrm, prefixes);
     multi0f_ident_publish(b, modrm, prefixes);  /* multi0f_ident */
     return;
  illegal_op:

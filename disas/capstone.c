@@ -532,6 +532,8 @@ static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
 static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
                                        qemu_plugin_insn_info *out);
+static void cap_x86_zero_count_shift_contract(const cs_insn *insn,
+                                             qemu_plugin_insn_info *out);
 static void cap_x86_add_sysregs(const cs_insn *insn,
                                 qemu_plugin_insn_info *out);
 /*
@@ -1153,6 +1155,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
                    string_op;
 
     cap_x86_eflags_from_bitmask(handle, insn, out);
+    cap_x86_zero_count_shift_contract(insn, out);
     cap_x86_add_sysregs(insn, out);
     cap_x86_add_x87_implicit(x87fx, out, handle);
     cap_x86_add_pcmpstr_implicit(insn, out, handle);
@@ -3093,6 +3096,105 @@ static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
     if (ef & CAP_X86_EFLAGS_READS) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, false);
     }
+}
+
+/*
+ * A SHIFT OR ROTATE WHOSE ENCODED COUNT IS ZERO TOUCHES NO FLAG -- NEITHER
+ * AS A SOURCE NOR AS A DESTINATION.
+ *
+ * The SDM states it on every page of the family, in the same words:
+ *
+ *   SAL/SAR/SHL/SHR (Vol. 2B 4-687), Flags Affected: "If the count is 0,
+ *       the flags are not affected."
+ *   RCL/RCR/ROL/ROR (Vol. 2B 4-543), Flags Affected: "If the masked count
+ *       is 0, the flags are not affected."  RCL's Operation makes the read
+ *       side of that explicit as well -- "WHILE (tempCOUNT != 0) DO
+ *       tempCF := MSB(DEST); DEST := (DEST * 2) + CF; ..." -- so the CF
+ *       the rotate-through-carry consumes is read INSIDE a loop that a
+ *       zero count never enters.
+ *   SHLD (Vol. 2B 4-706) / SHRD (4-709): "If the count operand is 0, the
+ *       flags are not affected."
+ *
+ * Capstone reports the dependency anyway.  detail->x86.eflags is filled
+ * from the per-mnemonic tables and knows nothing about the immediate, so
+ * `shlb $0,%al` comes back writing EFLAGS and `rclb $0,%al` comes back
+ * reading and writing it, and the operand walk mints a producer and a
+ * consumer for a register the instruction does not touch.
+ *
+ * QEMU DRAWS THE SAME LINE THE SDM DOES, which is why these rows are in the
+ * bar at all: gen_shift_count() returns *count = NULL when
+ * `(decode->immediate & mask) == 0`, and gen_RCL(), gen_RCR() and the shift
+ * emitters return immediately on it, emitting no op whatsoever.  QEMU's read
+ * list holds the r/m operand alone and its write list is EMPTY -- not
+ * refused, empty -- on all nine rules.
+ *
+ * READ OFF THE ENCODING, not off the mnemonic.  The two spaces that can
+ * carry a zero count are the group-2 imm8 opcodes C0 and C1 (whose ModRM.reg
+ * selects ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR, all eight of them this family)
+ * and the double-precision shifts 0F A4 (SHLD) and 0F AC (SHRD).  The
+ * CL-counted forms (D2/D3, 0F A5, 0F AD) and the count-1 forms (D0/D1) are
+ * NOT here and must not be: a count that is only known at run time can be
+ * zero or not, and R17 says a conditional carries all its potential sources.
+ * The mask is the architecture's own -- 3FH under REX.W, 1FH otherwise
+ * (SDM, RCL/RCR/ROL/ROR, "determine count") -- which is the same number
+ * gen_shift_count() uses, so `rclq $0x20,%rax` (count 32, real) and
+ * `rcll $0x20,%eax` (count 0 after masking) are told apart the way both the
+ * reference and the emulator tell them apart.
+ *
+ * The DESTINATION REGISTER is deliberately left alone.  Whether an operand
+ * the encoding names and no execution assigns is still a destination is the
+ * frozen-encoded-operand question, which is open and is not this one; what
+ * is settled here is the FLAGS, which the reference says in one sentence.
+ */
+static void cap_x86_zero_count_shift_contract(const cs_insn *insn,
+                                              qemu_plugin_insn_info *out)
+{
+    const cs_x86 *x86;
+    uint64_t mask;
+    bool found = false;
+    uint64_t imm = 0;
+
+    if (insn->detail == NULL) {
+        return;
+    }
+    x86 = &insn->detail->x86;
+
+    if (x86->opcode[0] == 0xC0 || x86->opcode[0] == 0xC1) {
+        if (x86->opcode[1] != 0) {
+            return;                     /* not the one-byte group-2 space */
+        }
+    } else if (x86->opcode[0] == 0x0F &&
+               (x86->opcode[1] == 0xA4 || x86->opcode[1] == 0xAC)) {
+        if (x86->opcode[2] != 0) {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    /*
+     * The count is the LAST immediate operand: SHLD/SHRD's other operands
+     * are registers, and the group-2 forms have exactly one.  A form that
+     * reaches here with no immediate at all is not the imm8 encoding this
+     * contract is about, and it is left alone rather than guessed at.
+     */
+    for (uint8_t i = 0; i < x86->op_count; i++) {
+        if (x86->operands[i].type == X86_OP_IMM) {
+            imm = (uint64_t)x86->operands[i].imm;
+            found = true;
+        }
+    }
+    if (!found) {
+        return;
+    }
+
+    mask = (x86->rex & 0x08) ? 0x3Fu : 0x1Fu;
+    if ((imm & mask) != 0) {
+        return;
+    }
+
+    cap_x86_drop_implicit(out, X86_REG_EFLAGS, false);
+    cap_x86_drop_implicit(out, X86_REG_EFLAGS, true);
 }
 
 /*

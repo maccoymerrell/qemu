@@ -7279,3 +7279,83 @@ x86_64 FR-wr-phantom xabort +REG_GPR#
 # the operand, which is not expected.
 x86_64 FR-rd-missing roundsd +REG_VEC#
 x86_64 FR-rd-missing roundss +REG_VEC#
+
+# THE ENCODED-ZERO-COUNT SHIFTS AND ROTATES, at the field layer.
+#
+# Same class as section (4) of isaxcheck_allow.txt, seen through the
+# InsnFields the dependency model records rather than through the boundary's
+# register lists: `shlq $0`, `rclb $0`, `shldq $0` and the rest of the
+# C0/C1 and 0F A4 / 0F AC space with a masked-zero immediate touch no flag,
+# and LLVM MC's MCInstrDesc names EFLAGS for the family regardless because a
+# register allocator must assume the clobber.
+#
+# Intel SDM states it once per page -- SAL/SAR/SHL/SHR (Vol. 2B 4-687),
+# RCL/RCR/ROL/ROR (4-543), SHLD (4-706), SHRD (4-709), all in the words "if
+# the count is 0, the flags are not affected" -- and the MACHINE was asked
+# rather than only the page: exec102/hw/zcount.c seeds EFLAGS with 0x000 and
+# 0x8D5, executes one such instruction and reads the word back, and all nine
+# zero-count forms leave every arithmetic flag as seeded on both seeds while
+# three count-1 firing controls move.  QEMU agrees at
+# gen_shift_count(): `*count = NULL` when `(decode->immediate & mask) == 0`,
+# after which the emitters return having emitted no op.
+#
+# The REG_SEG0 / REG_SEG1 spellings are the segment-slot difference LLVM's
+# X86 memory operand always carries, now visible on these encodings because
+# the flags have left the tracer's side of the comparison.
+#
+# Removable when LLVM MC can express a flag effect conditioned on an operand
+# VALUE, which MCInstrDesc has no form for.
+x86_64 FR-rd-missing rclb +REG_FLAGS
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcll +REG_FLAGS
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rclq +REG_FLAGS
+x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rclw +REG_FLAGS
+x86_64 FR-rd-missing rcrb +REG_FLAGS
+x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcrl +REG_FLAGS
+x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcrq +REG_FLAGS
+x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcrw +REG_FLAGS
+x86_64 FR-wr-missing rclb +REG_FLAGS
+x86_64 FR-wr-missing rcll +REG_FLAGS
+x86_64 FR-wr-missing rclq +REG_FLAGS
+x86_64 FR-wr-missing rclw +REG_FLAGS
+x86_64 FR-wr-missing rcrb +REG_FLAGS
+x86_64 FR-wr-missing rcrl +REG_FLAGS
+x86_64 FR-wr-missing rcrq +REG_FLAGS
+x86_64 FR-wr-missing rcrw +REG_FLAGS
+x86_64 FR-wr-missing rolb +REG_FLAGS
+x86_64 FR-wr-missing roll +REG_FLAGS
+x86_64 FR-wr-missing rolq +REG_FLAGS
+x86_64 FR-wr-missing rolw +REG_FLAGS
+x86_64 FR-wr-missing rorb +REG_FLAGS
+x86_64 FR-wr-missing rorl +REG_FLAGS
+x86_64 FR-wr-missing rorq +REG_FLAGS
+x86_64 FR-wr-missing rorw +REG_FLAGS
+x86_64 FR-wr-missing sarb +REG_FLAGS
+x86_64 FR-wr-missing sarl +REG_FLAGS
+x86_64 FR-wr-missing sarq +REG_FLAGS
+x86_64 FR-wr-missing sarw +REG_FLAGS
+x86_64 FR-wr-missing shlb +REG_FLAGS
+x86_64 FR-wr-missing shldl +REG_FLAGS
+x86_64 FR-wr-missing shldq +REG_FLAGS
+x86_64 FR-wr-missing shldw +REG_FLAGS
+x86_64 FR-wr-missing shll +REG_FLAGS
+x86_64 FR-wr-missing shlq +REG_FLAGS
+x86_64 FR-wr-missing shlw +REG_FLAGS
+x86_64 FR-wr-missing shrb +REG_FLAGS
+x86_64 FR-wr-missing shrdl +REG_FLAGS
+x86_64 FR-wr-missing shrdq +REG_FLAGS
+x86_64 FR-wr-missing shrdw +REG_FLAGS
+x86_64 FR-wr-missing shrl +REG_FLAGS
+x86_64 FR-wr-missing shrq +REG_FLAGS
+x86_64 FR-wr-missing shrw +REG_FLAGS

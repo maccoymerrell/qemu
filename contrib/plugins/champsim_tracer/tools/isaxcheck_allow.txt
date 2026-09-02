@@ -8692,6 +8692,103 @@ x86_64 R-rd-missing rcrl +ds
 x86_64 R-rd-missing rcrq +cs
 x86_64 R-rd-missing rcrq +ds
 
+# (4) THE ENCODED-ZERO-COUNT SHIFTS AND ROTATES, whose flag access LLVM MC
+#     models and the MACHINE does not perform.
+#
+#     `shlq $0,%rax`, `rclb $0,%al`, `shldq $0,%rcx,%rax` and the rest of the
+#     C0/C1 and 0F A4 / 0F AC space with an immediate whose masked value is
+#     zero write NO FLAG and -- for the rotate-through-carry forms -- read
+#     none either.  Intel SDM says so on every page of the family, in the
+#     same sentence: SAL/SAR/SHL/SHR (Vol. 2B 4-687) "If the count is 0, the
+#     flags are not affected"; RCL/RCR/ROL/ROR (4-543) "If the masked count
+#     is 0, the flags are not affected", with RCL's Operation reading CF
+#     inside a `WHILE (tempCOUNT != 0)` loop a zero count never enters;
+#     SHLD (4-706) / SHRD (4-709) "If the count operand is 0, the flags are
+#     not affected."
+#
+#     MEASURED ON THE MACHINE, not argued from the page.  A host probe
+#     (exec102/hw/zcount.c) seeds EFLAGS with 0x000 and with 0x8D5, executes
+#     one such instruction, and reads the word back: all NINE zero-count
+#     forms leave every arithmetic flag exactly as seeded on both seeds,
+#     while the three count-1 firing controls move.  That is the same
+#     question PIN would be asked, asked of the part it models.
+#
+#     LLVM's MCInstrDesc says `Defs = [EFLAGS]` for the whole family because
+#     a register allocator must assume the clobber -- the same
+#     register-allocator convenience the CWD/CDQ/CQO entry above names, and
+#     the same reason its `Defs = [AT]` on the MIPS FP branches is in section
+#     1.  It is not a claim about execution and the machine contradicts it.
+#
+#     QEMU DRAWS THE SAME LINE: gen_shift_count() (target/i386/tcg/emit.c.inc)
+#     returns `*count = NULL` when `(decode->immediate & mask) == 0`, and
+#     gen_RCL(), gen_RCR() and the shift emitters return on it having emitted
+#     no op at all -- so QEMU's write list for these encodings is EMPTY, not
+#     refused.  The boundary correction is
+#     cap_x86_zero_count_shift_contract() in disas/capstone.c.
+#
+#     The `+cs,flags` / `+ds,flags` rows are section (2)'s segment-slot
+#     difference seen on these same encodings, now that the flags have left
+#     the tracer's side of the comparison; section (2)'s `+cs` rows still
+#     fire on the CL and count-1 forms, which is why both spellings are here.
+#
+#     Deletable when LLVM MC models the count-0 case, which -- being a
+#     run-time property of an operand -- MCInstrDesc has no way to express.
+x86_64 R-rd-missing rclb +cs,flags
+x86_64 R-rd-missing rclb +ds,flags
+x86_64 R-rd-missing rclb +flags
+x86_64 R-rd-missing rcll +cs,flags
+x86_64 R-rd-missing rcll +ds,flags
+x86_64 R-rd-missing rcll +flags
+x86_64 R-rd-missing rclq +cs,flags
+x86_64 R-rd-missing rclq +ds,flags
+x86_64 R-rd-missing rclq +flags
+x86_64 R-rd-missing rclw +flags
+x86_64 R-rd-missing rcrb +cs,flags
+x86_64 R-rd-missing rcrb +ds,flags
+x86_64 R-rd-missing rcrb +flags
+x86_64 R-rd-missing rcrl +cs,flags
+x86_64 R-rd-missing rcrl +ds,flags
+x86_64 R-rd-missing rcrl +flags
+x86_64 R-rd-missing rcrq +cs,flags
+x86_64 R-rd-missing rcrq +ds,flags
+x86_64 R-rd-missing rcrq +flags
+x86_64 R-rd-missing rcrw +flags
+x86_64 R-wr-missing rclb +flags
+x86_64 R-wr-missing rcll +flags
+x86_64 R-wr-missing rclq +flags
+x86_64 R-wr-missing rclw +flags
+x86_64 R-wr-missing rcrb +flags
+x86_64 R-wr-missing rcrl +flags
+x86_64 R-wr-missing rcrq +flags
+x86_64 R-wr-missing rcrw +flags
+x86_64 R-wr-missing rolb +flags
+x86_64 R-wr-missing roll +flags
+x86_64 R-wr-missing rolq +flags
+x86_64 R-wr-missing rolw +flags
+x86_64 R-wr-missing rorb +flags
+x86_64 R-wr-missing rorl +flags
+x86_64 R-wr-missing rorq +flags
+x86_64 R-wr-missing rorw +flags
+x86_64 R-wr-missing sarb +flags
+x86_64 R-wr-missing sarl +flags
+x86_64 R-wr-missing sarq +flags
+x86_64 R-wr-missing sarw +flags
+x86_64 R-wr-missing shlb +flags
+x86_64 R-wr-missing shldl +flags
+x86_64 R-wr-missing shldq +flags
+x86_64 R-wr-missing shldw +flags
+x86_64 R-wr-missing shll +flags
+x86_64 R-wr-missing shlq +flags
+x86_64 R-wr-missing shlw +flags
+x86_64 R-wr-missing shrb +flags
+x86_64 R-wr-missing shrdl +flags
+x86_64 R-wr-missing shrdq +flags
+x86_64 R-wr-missing shrdw +flags
+x86_64 R-wr-missing shrl +flags
+x86_64 R-wr-missing shrq +flags
+x86_64 R-wr-missing shrw +flags
+
+
 # (3) pushq / pushw of %fs or %gs.  LLVM MC names NEITHER the segment source
 #     nor the stack pointer for these two forms; Capstone names the segment,
 #     and the boundary now adds back the rsp READ that Capstone drops on the

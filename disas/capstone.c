@@ -5272,6 +5272,56 @@ static void cap_aarch64_sysinstr_contract(csh handle, const cs_insn *insn,
 }
 
 /*
+ * THE ALWAYS-CONDITIONS: B.cond and BC.cond with cond = AL or NV read no
+ * flag at all.
+ *
+ * A64 gives the whole conditional-branch space one operation --
+ * "if ConditionHolds(cond) then BranchTo(PC[] + offset, BranchType_JMP);"
+ * (ARM DDI 0487C.a, B.cond) -- and ConditionHolds is where the flags are
+ * or are not read (shared/functions/system/ConditionHolds, J1-6366):
+ *
+ *     case cond<3:1> of
+ *         when '000' result = (PSTATE.Z == '1');
+ *         ...
+ *         when '111' result = TRUE;              // AL
+ *     // Condition flag values in the set '111x' indicate always true
+ *     if cond<0> == '1' && cond != '1111' then result = !result;
+ *
+ * The '111' arm names no PSTATE field, and the inversion that follows is
+ * explicitly excluded for '1111', so at cond = 0b1110 (AL) and 0b1111 (NV)
+ * NZCV is architecturally NOT AN INPUT.  Capstone reports the read anyway:
+ * its condition-code operand carries the flags for every cond alike, and the
+ * dependency it mints is on a register the branch never consults.  QEMU draws
+ * the same line the ARM ARM does -- trans_B_cond() comments "0xe and 0xf are
+ * both 'always' conditions" and emits gen_goto_tb() with no arm_gen_test_cc()
+ * -- so with the operand walk's read arm removed the wire loses a source that
+ * was never there, and 6,144 encodings in the swept population said so.
+ *
+ * READ OFF THE ENCODING, not off the mnemonic or the instruction id.  The
+ * space is 0101010 0 imm19 o0 cond: o0 = 0 is B.cond and o0 = 1 is BC.cond
+ * (FEAT_HBC), the cond field is at 3:0 in both, and a spelling table would
+ * be a second decoder to keep in step with this one.
+ */
+static void cap_aarch64_always_cond_contract(const cs_insn *insn,
+                                             qemu_plugin_insn_info *out)
+{
+    uint32_t w;
+
+    if (insn->size != 4) {
+        return;
+    }
+    w = ldl_le_p(insn->bytes);
+    if ((w & 0xFF000000u) != 0x54000000u) {
+        return;
+    }
+    /* cond<3:1> == '111': AL (0b1110) and NV (0b1111). */
+    if ((w & 0xEu) != 0xEu) {
+        return;
+    }
+    cap_aarch64_drop_implicit_read(out, AARCH64_REG_NZCV);
+}
+
+/*
  * ESB -- the HINT encoding that updates the deferred-error register.
  *
  * ESB is `hint #16` and Capstone reports it as AARCH64_INS_HINT, so the
@@ -6619,6 +6669,7 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
     cap_aarch64_msr_imm_contract(insn, out);
     cap_aarch64_implicit_sysregs(insn, out);
     cap_aarch64_hint_contract(handle, insn, out);
+    cap_aarch64_always_cond_contract(insn, out);
     cap_aarch64_sysinstr_contract(handle, insn, out);
     cap_aarch64_ls64_contract(insn, handle, out);
 

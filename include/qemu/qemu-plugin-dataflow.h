@@ -874,6 +874,24 @@ typedef struct qemu_plugin_dataflow_status {
  */
 #define QEMU_PLUGIN_DF_HELPER_OPAQUE  2
 
+/*
+ * THE MEMOP CAP, EXPORTED SO A CONSUMER DOES NOT HAVE TO WRITE IT DOWN AGAIN.
+ *
+ * `qemu_plugin_insn_memop_*` walks a list QEMU fills against a fixed cap, and
+ * a form with more accesses than that arrives with `memops_truncated` set.  A
+ * consumer sizing its own per-access arrays needs the SAME number or the two
+ * disagree about which instruction was refused and why -- and they did: the
+ * champsim_tracer extractor spelled 32 in its own header, QEMU's cap became 48
+ * to close x86 `enter`, and the band 33..48 became one QEMU states whole and
+ * the consumer refuses.
+ *
+ * accel/tcg/insn-dataflow.c asserts at BUILD TIME that this equals
+ * INSN_DF_MAX_MEMOPS, so raising one without the other does not compile.  It
+ * is a plain constant, not a struct member: adding it moves no field and does
+ * not change QEMU_PLUGIN_DATAFLOW_VERSION.
+ */
+#define QEMU_PLUGIN_DF_MAX_MEMOPS  48
+
 QEMU_PLUGIN_API
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
                                       size_t idx,

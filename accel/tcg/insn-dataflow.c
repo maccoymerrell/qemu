@@ -47,6 +47,8 @@
 #include "tcg/tcg-op-common.h"
 #include "tcg/tcg-internal.h"
 #include "exec/insn-dataflow.h"
+/* for QEMU_PLUGIN_DF_MAX_MEMOPS, asserted equal to INSN_DF_MAX_MEMOPS below */
+#include "qemu/qemu-plugin-dataflow.h"
 /*
  * For dh_typecode_ptr.  The typemask a helper carries is built out of these,
  * so reading it with the same names the builder used is the only way the two
@@ -1338,6 +1340,14 @@ static bool df_test(const uint64_t *p, unsigned bit)
  * df_settle_memop_prov().
  */
 QEMU_BUILD_BUG_ON(INSN_DF_MEMOP_PROV_BASE / 64 != INSN_DF_REG_WORDS - 1);
+/*
+ * The plugin ABI publishes the same cap so a consumer can size its own
+ * per-access arrays without writing the number down a second time.  A literal
+ * in two files is how the champsim_tracer extractor came to hold 32 while this
+ * held 48, leaving a band 33..48 that QEMU states whole and the consumer
+ * refuses.  This refuses to compile instead.
+ */
+QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_MAX_MEMOPS != INSN_DF_MAX_MEMOPS);
 #define DF_MEMOP_WORD  (INSN_DF_REG_WORDS - 1)
 #define DF_MEMOP_MASK  (~0ULL << (INSN_DF_MEMOP_PROV_BASE % 64))
 

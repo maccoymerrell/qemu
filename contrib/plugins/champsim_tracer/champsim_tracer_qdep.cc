@@ -4562,9 +4562,11 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
 
         /*
          * More accesses of one direction than this extractor holds.  QEMU's
-         * own cap is the same number, so reaching it here means the list is
-         * whole and simply wider than the arrays -- refuse the COUNT for
-         * that direction rather than publish a truncated slot layout.
+         * own cap IS this number -- QDEP_MAX_ACCESS is defined as
+         * INSN_DF_MAX_MEMOPS rather than as a literal, so the two cannot
+         * drift apart -- and reaching it here therefore means the list is
+         * whole and simply wider than the arrays: refuse the COUNT for that
+         * direction rather than publish a truncated slot layout.
          */
         if ((store ? out->n_stores : out->n_loads) >= QDEP_MAX_ACCESS) {
             out->state = out->data_state = out->dst_state =

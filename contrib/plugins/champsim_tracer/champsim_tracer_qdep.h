@@ -203,6 +203,17 @@
 
 #include <glib.h>
 
+/*
+ * For QEMU_PLUGIN_DF_MAX_MEMOPS.  The ABI headers are C; every plugin TU that
+ * pulls them in has to say so, or the declarations pick up C++ linkage from
+ * whichever translation unit reaches them first and the .so ships mangled
+ * undefined symbols.
+ */
+extern "C" {
+#include <qemu-plugin.h>
+#include <qemu-plugin-dataflow.h>
+}
+
 struct qemu_plugin_tb;
 struct InsnFields;
 struct InsnRegNames;
@@ -220,12 +231,18 @@ struct InsnRegNames;
 /*
  * How many ACCESSES of one direction this extractor holds per instruction.
  *
- * Not a guess: INSN_DF_MAX_MEMOPS is 32 on the QEMU side, so a form with more
- * accesses than this arrives with `memops_truncated` already set and is
- * refused one gate earlier.  Sized to match so the two caps cannot disagree
- * about which instruction was refused and why.
+ * Not a guess, and not written down twice: it is INSN_DF_MAX_MEMOPS, the cap
+ * QEMU fills the list against, so a form with more accesses than QEMU holds
+ * arrives with `memops_truncated` already set and is refused one gate earlier
+ * and the two caps CANNOT disagree about which instruction was refused and
+ * why.  Spelling the number here is how they came to disagree: fd59da3b86
+ * raised QEMU's cap 8 -> 32 and this followed; the 32 -> 48 that closed x86
+ * `enter` did not, and the band 33..48 became one QEMU states whole and this
+ * extractor refuses.  Measured empty at the time (aarch64 `ld4`/`st4` .16b
+ * reach exactly 32, 96 encodings each, and nothing in a 9,162,613-encoding
+ * sweep goes past it), which is luck, not a guarantee.
  */
-#define QDEP_MAX_ACCESS 32
+#define QDEP_MAX_ACCESS QEMU_PLUGIN_DF_MAX_MEMOPS
 
 /*
  * How many DISTINCT written registers this extractor holds per instruction.

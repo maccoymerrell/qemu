@@ -498,6 +498,25 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and
+     * TR -- DECLARED by target/i386/tcg/translate.c and absent from the i386
+     * GDB stub's namespace, the same shape as XCR0 above.
+     *
+     * These four are not a new word and not a new spelling.  REG_SYSMMU is
+     * the vocabulary's word for "the state address translation reads", and
+     * names these four registers outright
+     * (qemu-plugin.h: "x86 GDTR / IDTR / LDTR / TR, the descriptor tables a
+     * segment load and an interrupt reach"); the spellings are the ones
+     * disas/capstone.c's own table already answers in
+     * (`{ "gdtr", QEMU_PLUGIN_SYSREG_MMU }` and its three siblings).  So this
+     * connects the QEMU-side declaration to the word the boundary was already
+     * producing, which is what lets the boundary go.
+     */
+    if (!strcmp(name, "gdtr") || !strcmp(name, "idtr") ||
+        !strcmp(name, "ldtr") || !strcmp(name, "tr")) {
+        return REG_SYSMMU;
+    }
+    /*
      * THE MIPS MSA VECTOR FILE, `w0`..`w31`.
      *
      * Declared by target/mips/tcg/msa_translate.c and absent from the MIPS

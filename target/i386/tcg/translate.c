@@ -2405,6 +2405,37 @@ static void gen_note_far_call_pushes(void)
  *
  * Capture only; no op is emitted, altered or suppressed.
  */
+/*
+ * `lldt` AND `ltr` READ THE GDT TO RESOLVE THE SELECTOR THEY ARE GIVEN.
+ *
+ * The selector is an index into the global descriptor table, and both helpers
+ * say so in one line -- `dt = &env->gdt` in helper_lldt() and helper_ltr()
+ * (seg_helper.c) -- before they walk it and write env->ldt or env->tr.  The
+ * read is inside the helper, so nothing in the op stream carries it; the wire
+ * carried REG_SYSMMU from disas/capstone.c, which models the same two
+ * instructions the same way and cites the same two lines.
+ *
+ * STATED BEFORE THE CPL TEST, not inside it.  `if (!PE(s) || VM86(s)) goto
+ * illegal_op` is a DECODE refusal and the note sits after it; check_cpl0() is
+ * a run-time privilege fault on an instruction that decoded as `lldt`, and
+ * R17 says a conditional carries all its potential sources.  Placing the note
+ * inside the CPL0 arm would make the fact true only of a kernel translation,
+ * which is a statement about the guest's current privilege rather than about
+ * the instruction.
+ *
+ * Only the GDT is stated.  The destination -- env->ldt or env->tr -- is a
+ * WRITE, and the declarations above name it on that side.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_gdt_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, gdt.base),
+                                       sizeof(((CPUX86State *)0)->gdt.base));
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, gdt.limit),
+                                       sizeof(((CPUX86State *)0)->gdt.limit));
+}
+
 static void gen_note_return_pops(bool far)
 {
     insn_dataflow_note_stated_read_env(
@@ -3819,6 +3850,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
         case 2: /* lldt */
             if (!PE(s) || VM86(s))
                 goto illegal_op;
+            gen_note_gdt_read();
             if (check_cpl0(s)) {
                 gen_svm_check_intercept(s, SVM_EXIT_LDTR_WRITE);
                 gen_ld_modrm(s, decode, MO_16);
@@ -3841,6 +3873,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
         case 3: /* ltr */
             if (!PE(s) || VM86(s))
                 goto illegal_op;
+            gen_note_gdt_read();
             if (check_cpl0(s)) {
                 gen_svm_check_intercept(s, SVM_EXIT_TR_WRITE);
                 gen_ld_modrm(s, decode, MO_16);
@@ -4594,6 +4627,79 @@ void tcg_x86_init(void)
                                   offsetof(CPUX86State, xcr0),
                                   sizeof(((CPUX86State *)0)->xcr0),
                                   sizeof(((CPUX86State *)0)->xcr0), 1);
+
+    /*
+     * THE DESCRIPTOR-TABLE AND TASK REGISTERS: GDTR, IDTR, LDTR and TR.
+     *
+     * `sldt` and `str` read env->ldt.selector and env->tr.selector with a
+     * plain tcg_gen_ld32u_tl(), and `sgdt` and `sidt` read env->gdt.limit /
+     * .base and env->idt.limit / .base the same way -- so unlike the system
+     * registers around them these ARE in the op stream.  What they were
+     * missing is a NAME: nothing declared those bytes, so the read arrived
+     * downstream as an anonymous span and was dropped, and the wire carried
+     * REG_SYSMMU from disas/capstone.c's own modelling of the four
+     * instructions instead.  36,571 registers over six decode rules, closed
+     * by a declaration rather than by a statement, because the emulator was
+     * already doing the read.
+     *
+     * The names are the ones disas/capstone.c uses for the same four
+     * registers -- gdtr, idtr, ldtr, tr -- so the spelling that reaches the
+     * consumer is the spelling the boundary already answers in, and nothing
+     * new is invented on either side.  None of the four is in the i386 GDB
+     * stub's namespace, which is why the generated QEMU-indexed table has no
+     * row for them and the plugin's fold_nonarch() carries the word.
+     *
+     * EACH FIELD IS DECLARED SEPARATELY under the one name, exactly as
+     * `fstat` is: QEMU spreads one architectural register over several
+     * SegmentCache members, and an access that spanned two of them would land
+     * in neither extent and refuse -- which is the direction this file treats
+     * as correct.  GDTR and IDTR have no selector, and QEMU says so at the
+     * struct member ("only base and limit are used"); LDTR and TR have one,
+     * and their base and limit are the hidden descriptor the architecture
+     * loads with it.  `flags` is left out of all four: it is QEMU's packed
+     * access-rights word, which is a storage form and not a field the ISA
+     * names.
+     */
+    insn_dataflow_declare_regfile("gdtr", NULL,
+                                  offsetof(CPUX86State, gdt.base),
+                                  sizeof(((CPUX86State *)0)->gdt.base),
+                                  sizeof(((CPUX86State *)0)->gdt.base), 1);
+    insn_dataflow_declare_regfile("gdtr", NULL,
+                                  offsetof(CPUX86State, gdt.limit),
+                                  sizeof(((CPUX86State *)0)->gdt.limit),
+                                  sizeof(((CPUX86State *)0)->gdt.limit), 1);
+    insn_dataflow_declare_regfile("idtr", NULL,
+                                  offsetof(CPUX86State, idt.base),
+                                  sizeof(((CPUX86State *)0)->idt.base),
+                                  sizeof(((CPUX86State *)0)->idt.base), 1);
+    insn_dataflow_declare_regfile("idtr", NULL,
+                                  offsetof(CPUX86State, idt.limit),
+                                  sizeof(((CPUX86State *)0)->idt.limit),
+                                  sizeof(((CPUX86State *)0)->idt.limit), 1);
+    insn_dataflow_declare_regfile("ldtr", NULL,
+                                  offsetof(CPUX86State, ldt.selector),
+                                  sizeof(((CPUX86State *)0)->ldt.selector),
+                                  sizeof(((CPUX86State *)0)->ldt.selector), 1);
+    insn_dataflow_declare_regfile("ldtr", NULL,
+                                  offsetof(CPUX86State, ldt.base),
+                                  sizeof(((CPUX86State *)0)->ldt.base),
+                                  sizeof(((CPUX86State *)0)->ldt.base), 1);
+    insn_dataflow_declare_regfile("ldtr", NULL,
+                                  offsetof(CPUX86State, ldt.limit),
+                                  sizeof(((CPUX86State *)0)->ldt.limit),
+                                  sizeof(((CPUX86State *)0)->ldt.limit), 1);
+    insn_dataflow_declare_regfile("tr", NULL,
+                                  offsetof(CPUX86State, tr.selector),
+                                  sizeof(((CPUX86State *)0)->tr.selector),
+                                  sizeof(((CPUX86State *)0)->tr.selector), 1);
+    insn_dataflow_declare_regfile("tr", NULL,
+                                  offsetof(CPUX86State, tr.base),
+                                  sizeof(((CPUX86State *)0)->tr.base),
+                                  sizeof(((CPUX86State *)0)->tr.base), 1);
+    insn_dataflow_declare_regfile("tr", NULL,
+                                  offsetof(CPUX86State, tr.limit),
+                                  sizeof(((CPUX86State *)0)->tr.limit),
+                                  sizeof(((CPUX86State *)0)->tr.limit), 1);
 
     /*
      * The SEGMENT SELECTORS.

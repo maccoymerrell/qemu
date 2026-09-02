@@ -2756,6 +2756,77 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_qemu_st_i128(t, s->tmp0, mem_index, mop);
 }
 
+/*
+ * THE x87 CONTROL AND STATUS WORDS, stated for the instruction that reads
+ * them.
+ *
+ * WHAT IS MISSING WITHOUT THIS.  FPCW decides how the x87 datapath rounds
+ * (RC), to what precision (PC) and which exceptions are delivered rather
+ * than defaulted (the mask bits); FPSW carries the stack top, the condition
+ * codes and the sticky exception flags.  Neither is a TCG global and neither
+ * is read by an op: every x87 instruction reaches them from inside a helper
+ * that was handed nothing but `tcg_env`, so `helper_fadd_ST0_FT0()` reading
+ * `env->fpuc` on its way into `floatx80_add()` leaves nothing at all in the
+ * op stream.  Measured with the operand walk's read arm deleted, 199,166
+ * encodings lose REG_FPCW and 131,791 lose REG_FCSR -- the largest single
+ * class left on x86_64, and 62.6% of that target's whole remaining bar.
+ *
+ * WHY A RANGE.  Both words ARE their env fields, and both are declared:
+ * `fctrl` over env->fpuc, `fstat` over env->fpus and env->fpstt (QEMU keeps
+ * FPSW.TOP in a field of its own, and the declaration puts both under the one
+ * architectural name).  So the range is the register and there is no second
+ * spelling to keep in step -- the same reason
+ * insn_dataflow_note_stated_read_env() exists.
+ *
+ * WHERE IT IS PLACED, and why nowhere earlier.  On the RETURNING path,
+ * beside x87_ident_publish(), for the reason stated above that publish: every
+ * refusal in gen_x87() jumps to illegal_op, so a note taken here describes a
+ * decision the emulator TOOK.  A note at the head of the function would
+ * describe one it merely considered, and would put the control word in the
+ * read list of an encoding that never executes.
+ *
+ * WHICH INSTRUCTIONS READ WHICH, and why this is not "all of them".  The
+ * classification below is the architecture's, checked against an external
+ * table rather than read off this emulator: LLVM's x86 scheduling info --
+ * which is where Capstone's regs_use comes from -- DISCRIMINATES exactly
+ * where the SDM does.  `fld1` and `fldz` do not read FPCW and `fldl2t`,
+ * `fldl2e`, `fldpi`, `fldlg2` and `fldln2` do, because 1.0 and 0.0 are
+ * exactly representable and the five irrational constants are rounded per
+ * RC.  `fldt` and `fstpt` do not, because m80 is the internal format and the
+ * move is exact, while `flds`/`fstps` and every integer and BCD form convert
+ * and therefore round.  `fld %st(i)`, `fxch`, `fst %st(i)`, `fchs`, `fabs`,
+ * `fxam`, `ffree`, `fdecstp`, `fincstp` and `fcmovcc` do not, because none of
+ * them computes a numeric result; their only tie to FPCW is the IM mask for a
+ * stack fault, which is a delivery question and not a dataflow one.  A table
+ * that draws those lines is evidence about the ISA; a table that blanketed
+ * the x87 space would be evidence about nothing.
+ *
+ * FPSW is read wherever the instruction TOUCHES THE STACK, which is the
+ * uniform fact its TOP field makes true: an ST(i) reference, a push and a pop
+ * all resolve through TOP, so the word is a source of each of them.  The
+ * exceptions are the four that do not go near the stack -- `fldcw` and
+ * `fnstcw`, which name only the control word -- and the three that WRITE the
+ * status word outright: `fnclex`, `fninit` and the environment restores
+ * `fldenv` and `frstor`.  `fnstsw` reads it, `fnstenv` and `fnsave` read it
+ * because they store it, and `fldcw` and `fldenv` do NOT read the control
+ * word they load, whatever a MOD flag in a decoder table says about it.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_fctrl_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, fpuc),
+                                       sizeof(((CPUX86State *)0)->fpuc));
+}
+
+static void gen_note_fstat_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, fpus),
+                                       sizeof(((CPUX86State *)0)->fpus));
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, fpstt),
+                                       sizeof(((CPUX86State *)0)->fpstt));
+}
+
 #include "emit.c.inc"
 
 /*
@@ -2864,6 +2935,108 @@ static void gen_note_sti_read(int i)
     };
 
     insn_dataflow_note_stated_read_name(st_names[i & 7]);
+}
+
+/*
+ * @mod, @op and @rm are gen_x87()'s own decode variables, in its own
+ * spelling: @op is ((b & 7) << 3) | ModRM.reg, which is the value its two
+ * switches dispatch on, and @rm is ModRM.rm, which is the second-level
+ * selector for the register-form groups.  Reading the classification off
+ * anything else -- a mnemonic, a helper name, a scratch table of opcodes --
+ * would be a second decoder to keep in step with this one.
+ */
+static void gen_note_x87_env_reads(int mod, int op, int rm)
+{
+    bool ctrl, stat;
+
+    if (mod != 3) {
+        switch (op) {
+        case 0x0c: /* fldenv  -- loads the environment, reads neither */
+        case 0x0d: /* fldcw   -- loads the control word, reads neither */
+        case 0x2c: /* frstor  -- restores the whole state */
+            ctrl = false;
+            stat = false;
+            break;
+        case 0x0f: /* fnstcw  -- stores the control word, and only that */
+            ctrl = true;
+            stat = false;
+            break;
+        case 0x1d: /* fldt    -- m80 is the internal format: exact */
+        case 0x1f: /* fstpt   -- likewise */
+        case 0x2f: /* fnstsw  -- stores the status word, and only that */
+            ctrl = false;
+            stat = true;
+            break;
+        default:
+            /*
+             * Every remaining memory form converts or computes: the eight
+             * arithmetic groups over all four operand widths, the real and
+             * integer loads and stores, fisttp, fbld, fbstp, fnstenv and
+             * fnsave.
+             */
+            ctrl = true;
+            stat = true;
+            break;
+        }
+    } else {
+        switch (op) {
+        case 0x1c: /* feni, fdisi, fclex, fninit, fsetpm */
+            /*
+             * fnclex and fninit WRITE the status word; the three 287-era
+             * arms are nops on this CPU.  None of the five reads either.
+             */
+            ctrl = false;
+            stat = false;
+            break;
+        case 0x0c: /* grp d9/4: fchs, fabs, ftst, fxam */
+            ctrl = (rm == 4);          /* ftst compares against 0.0 */
+            stat = true;
+            break;
+        case 0x0d: /* grp d9/5: the seven constants */
+            ctrl = (rm >= 1 && rm <= 5);   /* l2t l2e pi lg2 ln2 round */
+            stat = true;
+            break;
+        case 0x0e: /* grp d9/6 */
+            ctrl = (rm <= 5);          /* not fdecstp, not fincstp */
+            stat = true;
+            break;
+        case 0x08: /* fld %st(i)     -- an exact move */
+        case 0x09: /* fxch %st(i) */
+        case 0x29:
+        case 0x39:
+        case 0x0a: /* d9/2 group: fnop */
+        case 0x0b: /* fstp1 %st(i), undocumented */
+        case 0x3a: /* fstp8 %st(i), undocumented */
+        case 0x3b: /* fstp9 %st(i), undocumented */
+        case 0x10 ... 0x13: /* fcmovcc */
+        case 0x18 ... 0x1b:
+        case 0x28: /* ffree %st(i)   -- marks the tag word, reads no value */
+        case 0x38: /* ffreep %st(i) */
+        case 0x2a: /* fst %st(i)     -- an exact move */
+        case 0x2b: /* fstp %st(i) */
+        case 0x3c: /* df/4: fnstsw %ax */
+            ctrl = false;
+            stat = true;
+            break;
+        default:
+            /*
+             * Every remaining register form computes or compares: the
+             * arithmetic groups in all three directions, the compare and
+             * unordered-compare groups including the EFLAGS-setting ones,
+             * and the d9/7 transcendentals.
+             */
+            ctrl = true;
+            stat = true;
+            break;
+        }
+    }
+
+    if (ctrl) {
+        gen_note_fctrl_read();
+    }
+    if (stat) {
+        gen_note_fstat_read();
+    }
 }
 
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
@@ -3506,6 +3679,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         tcg_gen_st_tl(eip_cur_tl(s),
                       tcg_env, offsetof(CPUX86State, fpip));
     }
+    gen_note_x87_env_reads(mod, op, rm);
     x87_ident_publish(b, modrm);  /* x87_ident */
     return;
 

@@ -2310,11 +2310,30 @@ static void gen_FXRSTOR(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * FXSAVE WRITES THE CONTROL AND STATUS WORDS OUT, so it reads them.
+ *
+ * The helper takes `tcg_env` and does the whole store itself, so the only
+ * thing the op stream carries is the address; the environment fields it
+ * copies leave no trace.  gen_note_fctrl_read() and gen_note_fstat_read()
+ * are stated for the same reason and against the same declarations gen_x87()
+ * uses -- see the block above them in translate.c.  MXCSR goes with them:
+ * the FXSAVE image has it at offset 24, `fxsave` is the SSE control word's
+ * only architectural reader outside `ldmxcsr`/`stmxcsr`, and it is declared
+ * under its own name.
+ *
+ * FXRSTOR is NOT annotated: it LOADS all three, which makes them
+ * destinations, and this file states reads.
+ */
 static void gen_FXSAVE(DisasContext *s, X86DecodedInsn *decode)
 {
     if ((s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
+        gen_note_fctrl_read();
+        gen_note_fstat_read();
+        insn_dataflow_note_stated_read_env(offsetof(CPUX86State, mxcsr),
+                                           sizeof(((CPUX86State *)0)->mxcsr));
         gen_helper_fxsave(tcg_env, s->A0);
     }
 }

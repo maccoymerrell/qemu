@@ -3035,6 +3035,80 @@ static void gen_note_sti_read(int i)
 }
 
 /*
+ * THE SAME TWO REGISTERS ON THE WRITE SIDE.
+ *
+ * The two blocks above state x87 SOURCES.  These state DESTINATIONS, and
+ * they exist because the destination was missing outright: every x87
+ * instruction that writes the stack does it inside a helper handed
+ * `tcg_env`, so what the extraction sees is a store into the 128-byte
+ * `fpregs` CONTAINER and nothing about which element.  `fpregs` is declared
+ * as one register (see its declaration) and a stated container justifies a
+ * published member without supplying one, so QEMU's write list carried no
+ * ST(i) at all.  Measured at exec104: 13,788 x86_64 registers reach the
+ * destination bar as REG_FPR0 that the operand walk supplies and QEMU does
+ * not state, led by `fldt` at 5,474 -- the largest single row on that side.
+ *
+ * WHY A NAME AND NOT A RANGE, unchanged from the read side: env->fpregs is
+ * indexed by PHYSICAL register, ST(i) is relative to env->fpstt, and `st<n>`
+ * is the GDB stub's own top-relative spelling.
+ *
+ * WHICH ARMS ARE ANNOTATED, and the ONE RULE that decides it.  A note here
+ * names a register in the ARCHITECTURAL post-state, so it may only be taken
+ * where the name the encoding's destination has does not MOVE under the
+ * instruction's own stack adjustment:
+ *
+ *   - A PUSH followed by a write of the new top is annotated.  `flds`,
+ *     `fldl`, `fildl`, `fildll`, `fldt`, `fbld`, `fld %st(i)` and the seven
+ *     constant loads all write ST(0) as the SDM names it, and `st0` after
+ *     the push is that register.
+ *   - AN IN-PLACE WRITE with no push and no pop is annotated: `fchs`,
+ *     `fabs`, `fsqrt`, `frndint`, `fsin`, `fcos`, `f2xm1`, `fprem`,
+ *     `fprem1`, `fscale`, `fxchg`, `fst %st(i)`, `fcmovcc`, the
+ *     non-popping arithmetic in both operand orders, and the memory
+ *     arithmetic that is not a compare.
+ *   - A WRITE FOLLOWED BY A POP IS NOT, and neither is a write followed by
+ *     a push.  `fstp %st(i)` writes the register the encoding calls ST(i)
+ *     and then pops, so after the instruction those bytes are ST(i-1) and
+ *     `st<i>` names the wrong one; `faddp` and its siblings have the same
+ *     shape; `fptan`, `fsincos` and `fxtract` write ST(0) and then push, so
+ *     the value lands in what is ST(1) by the time the instruction ends;
+ *     `fyl2x`, `fyl2xp1` and `fpatan` write ST(1) and pop.  Stating a
+ *     top-relative name for any of them would have to reason about the
+ *     adjustment to be right, which is exactly what left `fld %st(i)`'s
+ *     SOURCE in the ledger, and it stays there in this direction too.
+ *   - AN INSTRUCTION THAT WRITES NO REGISTER VALUE is not annotated at all:
+ *     `fcom`, `fcomp`, `fucom`, `fcomi`, `ftst` and `fxam` produce flags,
+ *     `ffree` marks a tag, `fdecstp` and `fincstp` move TOP, and `fldenv`,
+ *     `fldcw`, `fclex` and `fninit` name the environment.  `frstor` DOES
+ *     write all eight, physically and relative to the TOP it restores, and
+ *     is left in the ledger with the push/pop forms for the same reason.
+ *
+ * The classification is the architecture's, taken from the SDM's own
+ * destination column, and it is checked against the read side's: an arm that
+ * states a read of ST(0) and no write is a compare or a store, and every one
+ * of them is named above.
+ *
+ * NO PROVENANCE, on the primitive's contract: the note says the write
+ * happened and which register it landed in.  What fed it is the
+ * instruction's source list, which the two blocks above already fill.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_st0_write(void)
+{
+    insn_dataflow_note_stated_write_name("st0");
+}
+
+static void gen_note_sti_write(int i)
+{
+    static const char *const st_names[8] = {
+        "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+    };
+
+    insn_dataflow_note_stated_write_name(st_names[i & 7]);
+}
+
+/*
  * @mod, @op and @rm are gen_x87()'s own decode variables, in its own
  * spelling: @op is ((b & 7) << 3) | ModRM.reg, which is the value its two
  * switches dispatch on, and @rm is ModRM.rm, which is the second-level
@@ -3195,6 +3269,14 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 }
 
                 gen_note_st0_read();
+                /*
+                 * op1 2 and 3 are `fcom`/`fcomp`: they produce condition
+                 * codes and leave the stack value alone.  Every other arm
+                 * of gen_helper_fp_arith_ST0_FT0() replaces ST(0) in place.
+                 */
+                if (op1 != 2 && op1 != 3) {
+                    gen_note_st0_write();
+                }
                 gen_helper_fp_arith_ST0_FT0(op1);
                 if (op1 == 3) {
                     /* fcomp needs pop */
@@ -3233,6 +3315,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                     gen_helper_fildl_ST0(tcg_env, s->tmp2_i32);
                     break;
                 }
+                gen_note_st0_write();
                 break;
             case 1:
                 /* XXX: the corresponding CPUID bit must be tested ! */
@@ -3316,6 +3399,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             update_fip = update_fdp = false;
             break;
         case 0x1d: /* fldt mem */
+            gen_note_st0_write();
             gen_helper_fldt_ST0(tcg_env, s->A0);
             break;
         case 0x1f: /* fstpt mem */
@@ -3340,6 +3424,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             update_fip = update_fdp = false;
             break;
         case 0x3c: /* fbld */
+            gen_note_st0_write();
             gen_helper_fbld_ST0(tcg_env, s->A0);
             break;
         case 0x3e: /* fbstp */
@@ -3350,6 +3435,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x3d: /* fildll */
             tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0,
                                 s->mem_index, MO_LEUQ);
+            gen_note_st0_write();
             gen_helper_fildll_ST0(tcg_env, s->tmp1_i64);
             break;
         case 0x3f: /* fistpll */
@@ -3380,6 +3466,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 
         switch (op) {
         case 0x08: /* fld sti */
+            gen_note_st0_write();
             gen_helper_fpush(tcg_env);
             gen_helper_fmov_ST0_STN(tcg_env,
                                     tcg_constant_i32((opreg + 1) & 7));
@@ -3389,6 +3476,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x39: /* fxchg7 sti, undocumented op */
             gen_note_st0_read();
             gen_note_sti_read(opreg);
+            gen_note_st0_write();
+            gen_note_sti_write(opreg);
             gen_helper_fxchg_ST0_STN(tcg_env, tcg_constant_i32(opreg));
             break;
         case 0x0a: /* grp d9/2 */
@@ -3410,10 +3499,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             switch (rm) {
             case 0: /* fchs */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fchs_ST0(tcg_env);
                 break;
             case 1: /* fabs */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fabs_ST0(tcg_env);
                 break;
             case 4: /* ftst */
@@ -3431,6 +3522,14 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x0d: /* grp d9/5 */
             {
+                /*
+                 * The seven constant loads all PUSH and then write the new
+                 * top; the note is taken once for the group because the
+                 * destination is the same register on every arm.
+                 */
+                if (rm <= 6) {
+                    gen_note_st0_write();
+                }
                 switch (rm) {
                 case 0:
                     gen_helper_fpush(tcg_env);
@@ -3469,6 +3568,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             switch (rm) {
             case 0: /* f2xm1 */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_f2xm1(tcg_env);
                 break;
             case 1: /* fyl2x */
@@ -3498,6 +3598,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_st0_write();
                 gen_helper_fprem1(tcg_env);
                 break;
             case 6: /* fdecstp */
@@ -3516,6 +3617,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_st0_write();
                 gen_helper_fprem(tcg_env);
                 break;
             case 1: /* fyl2xp1 */
@@ -3527,6 +3629,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 break;
             case 2: /* fsqrt */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fsqrt(tcg_env);
                 break;
             case 3: /* fsincos */
@@ -3538,19 +3641,23 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_st0_write();
                 gen_helper_fscale(tcg_env);
                 break;
             case 4: /* frndint */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_frndint(tcg_env);
                 break;
             case 6: /* fsin */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fsin(tcg_env);
                 break;
             default:
             case 7: /* fcos */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fcos(tcg_env);
                 break;
             }
@@ -3566,6 +3673,15 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                     /* `fxxx %st,%st(i)`: both operands, result into ST(i). */
                     gen_note_st0_read();
                     gen_note_sti_read(opreg);
+                    /*
+                     * The 0x30 block is `fxxxp %st,%st(i)`, which writes
+                     * ST(i) and then POPS -- after which those bytes are
+                     * ST(i-1), so no top-relative name states the
+                     * destination.  See gen_note_sti_write() for the rule.
+                     */
+                    if (op < 0x30) {
+                        gen_note_sti_write(opreg);
+                    }
                     gen_helper_fp_arith_STN_ST0(op1, opreg);
                     if (op >= 0x30) {
                         gen_helper_fpop(tcg_env);
@@ -3575,6 +3691,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                     gen_helper_fmov_FT0_STN(tcg_env,
                                             tcg_constant_i32(opreg));
                     gen_note_st0_read();
+                    gen_note_st0_write();
                     gen_helper_fp_arith_ST0_FT0(op1);
                 }
             }
@@ -3656,6 +3773,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x2a: /* fst sti */
             gen_note_st0_read();
+            gen_note_sti_write(opreg);
             gen_helper_fmov_STN_ST0(tcg_env, tcg_constant_i32(opreg));
             break;
         case 0x2b: /* fstp sti */
@@ -3758,6 +3876,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  */
                 gen_note_st0_read();
                 gen_note_sti_read(opreg);
+                /*
+                 * And the destination on the same rule: `fcmovcc` writes
+                 * ST(0) in place with no stack adjustment either way, so
+                 * `st0` names it whether the condition took or not.
+                 */
+                gen_note_st0_write();
                 gen_helper_fmov_ST0_STN(tcg_env,
                                         tcg_constant_i32(opreg));
                 gen_set_label(l1);

@@ -3439,7 +3439,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     df_ord_read(d, INSN_DF_ORD_GLOBAL, idx);
                     df_bit(prov, idx);
                 }
-            } else if (df_zero_reg_temp(ts, 1, zero_lo, *zero_cursor)) {
+            } else if (df_zero_reg_temp_live(ts, zero_lo, *zero_cursor)) {
                 /*
                  * The architectural ZERO REGISTER, stated by the accessor
                  * that resolved the operand.  Its temp holds a constant, so

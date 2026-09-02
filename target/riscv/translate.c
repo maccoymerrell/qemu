@@ -403,8 +403,32 @@ static TCGv dest_gprh(DisasContext *ctx, int reg_num)
     return cpu_gprh[reg_num];
 }
 
+/*
+ * CP-M, the DISCARDED-WRITE half: an instruction whose rd field names x0.
+ *
+ * RISC-V hardwires x0 to zero, so QEMU emits nothing for a write to it and
+ * the walk sees an instruction with no destination -- `lw x0,0(a0)` reaches
+ * a consumer as a load that produces nothing, `addi x0,a0,1` as an
+ * instruction with no effect at all.  Dropping the write is what the
+ * EMULATOR may do, because nothing can read x0 back; it is not what the
+ * INSTRUCTION is.  The encoding names x0 in rd exactly the way it would name
+ * a5 (R7.3), and R15 says the lowering decision is not architectural truth.
+ *
+ * The value that would have been written is passed through, so the discarded
+ * write carries the provenance the performed one would have had.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_gpr_zero_dest(TCGv t)
+{
+    insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(t));
+}
+
 static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 {
+    if (reg_num == 0) {
+        note_gpr_zero_dest(t);
+    }
     if (reg_num != 0) {
         switch (get_ol(ctx)) {
         case MXL_RV32:
@@ -426,6 +450,15 @@ static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 
 static void gen_set_gpri(DisasContext *ctx, int reg_num, target_long imm)
 {
+    if (reg_num == 0) {
+        /*
+         * The same statement, for the forms whose value is an immediate and
+         * never lands in a temp.  The constant is named rather than nothing:
+         * an empty provenance and an unstated one are different facts, and
+         * only this call site can tell them apart.
+         */
+        note_gpr_zero_dest(tcg_constant_tl(imm));
+    }
     if (reg_num != 0) {
         switch (get_ol(ctx)) {
         case MXL_RV32:

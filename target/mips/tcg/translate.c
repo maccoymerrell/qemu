@@ -1213,6 +1213,25 @@ void gen_store_gpr(TCGv t, int reg)
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
     if (reg != 0) {
         tcg_gen_mov_tl(cpu_gpr[reg], t);
+    } else {
+        /*
+         * CP-M, the DISCARDED-WRITE half, on the destination side of the
+         * same register gen_load_gpr() above states on the source side.
+         *
+         * cpu_gpr[0] is deliberately NULL, so writing $zero emits nothing
+         * and the walk sees an instruction with no destination at all --
+         * `lw $zero,0($a0)` reaches a consumer as a load that produces
+         * nothing.  Discarding the value is what the EMULATOR may do,
+         * because nothing can read $zero back; it is not what the
+         * INSTRUCTION is, and the encoding names $zero in the rt field
+         * exactly the way it would name $t0 (R7.3).  R15 says the lowering
+         * decision is not the architectural truth.
+         *
+         * @t is the value that would have been written, so the discarded
+         * write carries the same provenance the performed one would have.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(t));
     }
 }
 
@@ -1242,6 +1261,35 @@ static void note_gpr_folded_read(int reg)
         insn_dataflow_note_folded_read_zero();
     } else {
         insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[reg]));
+    }
+}
+
+/*
+ * THE DESTINATION THE SAME FOLD ERASES.
+ *
+ * The three "If no destination, treat it as a NOP" early returns above
+ * return before any op is emitted, so gen_store_gpr()'s discarded-write
+ * statement never runs for them and the instruction reaches a consumer
+ * producing nothing.  It produces $zero: `addiu $zero,$t0,4` names $zero in
+ * its rt field, and R7.3 and R15 both say a register the encoding names is
+ * not the emulator's to drop.
+ *
+ * @src is the source register whose value the write would have been
+ * computed from, or 0 where the encoding names none, and @imm is the
+ * encoded immediate -- which is the value's whole provenance for `lui` and
+ * for any form whose source is $zero.  Naming the constant rather than
+ * nothing keeps the discarded write's account of itself the same shape the
+ * performed write's would have had.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_gpr_zero_dest(int src, target_ulong imm)
+{
+    if (src != 0) {
+        insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_gpr[src]));
+    } else {
+        insn_dataflow_note_discarded_zero_write(
+            tcgv_tl_temp(tcg_constant_tl(imm)));
     }
 }
 
@@ -2708,6 +2756,8 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
          */
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
+        /* And the destination it erases; see note_gpr_zero_dest(). */
+        note_gpr_zero_dest(rs, uimm);
         return;
     }
 
@@ -2828,6 +2878,13 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         if (opc != OPC_LUI || (ctx->insn_flags & ISA_MIPS_R6)) {
             note_gpr_folded_read(rs);
         }
+        /*
+         * And the destination it erases.  Stated for LUI too, and without
+         * the R6 test above it: the read side had to ask whether bits 25:21
+         * are a register at all, and the WRITE side has no such question --
+         * `lui $zero,imm` names $zero in rt on every revision.
+         */
+        note_gpr_zero_dest(opc == OPC_LUI ? 0 : rs, (uint16_t)imm);
         return;
     }
     uimm = (uint16_t)imm;
@@ -2931,6 +2988,8 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
         /* If no destination, treat it as a NOP. */
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
+        /* And the destination it erases; see note_gpr_zero_dest(). */
+        note_gpr_zero_dest(rs, uimm);
         return;
     }
     t0 = tcg_temp_new();

@@ -20,15 +20,20 @@ def iforms(hexlist):
                        capture_output=True, text=True, check=True)
     out = {}
     for line in p.stdout.splitlines()[1:]:
-        h, ok, ln, ifm = line.split('\t')
-        out[h] = (ok, ln, ifm)
+        h, ok, ln, immw, ifm = line.split('\t')
+        out[h] = (ok, ln, immw, ifm)
     return out
+
+def same_opcode(a, b):
+    """Two decodes name the same opcode at the same size: ok, length, iform.
+    The immediate WIDTH is deliberately not part of this test -- it is an
+    input to choosing a variant, never evidence that the variant is valid."""
+    return (b and a and b[0] == '1' and a[0] == '1'
+            and b[1] == a[1] and b[3] == a[3])
 
 base, var = list(cand.keys()), list(cand.values())
 old, new = iforms(base), iforms(var)
-accept = {b: v for b, v in zip(base, var)
-          if new.get(v) and old.get(b) and new[v][0] == '1'
-          and new[v][1:] == old[b][1:]}
+accept = {b: v for b, v in zip(base, var) if same_opcode(old.get(b), new.get(v))}
 print('EVEX mask-slot opcodes with aaa=000 : %d' % len(cand))
 print('variant keeps same iform and length : %d  (rejected %d)'
       % (len(accept), len(cand) - len(accept)))
@@ -59,6 +64,47 @@ if len(fix) != len(broken):
     print('  STILL UNDECODABLE                  : %s'
           % ' '.join(h for h in broken if h not in fix))
 probe = {opid: fix.get(h, h) for opid, h in base_probe.items()}
+
+# A PROBE WHOSE IMMEDIATE IS THE ONE VALUE THAT SWITCHES THE OPERATION OFF IS
+# NOT A PROBE OF THAT OPERATION.  XED's representative encoding fills every
+# immediate with zero, and for the shift/rotate family zero is not a count --
+# it is the architectural instruction to do nothing.  The SDM says so four
+# times (SAL/SAR/SHL/SHR 4-687, RCL/RCR/ROL/ROR 4-543, SHLD 4-706, SHRD
+# 4-709: "If the masked count is 0, the flags are not affected"), and QEMU
+# implements exactly that -- gen_shift_count() returns a NULL count on
+# (imm & mask) == 0, so no flag write is generated and the tracer states
+# none.  XED's iform-level answer carries Defs=[EFLAGS] regardless, because
+# an iform has no operand VALUE to condition on.  Comparing the two on this
+# encoding is a category error, and it read as 36 x86_64 opcodes UNCOVERED
+# and a static headline of 83 against an adjudicated ceiling of 47.
+#
+# So the count is re-seated to 1 and the SAME acceptance rule the two stages
+# above use is applied: the variant is taken only when XED decodes it to the
+# same iform at the same length.  This changes the ENCODING probed, never the
+# opcode measured.  It is restricted to probes carrying exactly one one-byte
+# immediate -- asked of XED, not guessed from the opcode -- so a ModRM byte
+# or a displacement that happens to be zero is never touched, and a two-
+# immediate form (ENTER) reports width 2 and is excluded by that.
+#
+# The zero-count encoding is not thereby unmeasured: it is what the whole-
+# population sweeps carry, and the boundary and fields gates hold its 54
+# reference signatures under a written allowlist entry.  This leg measures
+# the opcode; those measure the encoding.
+dec2 = iforms(sorted(set(probe.values())))
+imm_cand = {}
+for h in sorted(set(probe.values())):
+    d = dec2.get(h)
+    if d and d[0] == '1' and d[2] == '1' and h.endswith('00'):
+        imm_cand[h] = h[:-2] + '01'
+if imm_cand:
+    ib, iv = list(imm_cand.keys()), list(imm_cand.values())
+    o2, n2 = iforms(ib), iforms(iv)
+    imm_ok = {b: v for b, v in zip(ib, iv) if same_opcode(o2.get(b), n2.get(v))}
+    print('probes whose only immediate is a zero byte : %d' % len(imm_cand))
+    print('  re-seated to 1, same iform and length    : %d  (rejected %d)'
+          % (len(imm_ok), len(imm_cand) - len(imm_ok)))
+    probe = {opid: imm_ok.get(h, h) for opid, h in probe.items()}
+
 json.dump(probe, open(os.path.join(D, 'probe_map.json'), 'w'))
 u = sorted(set(probe.values()))
 open(os.path.join(D, 'probe_uniq.hex'), 'w').write(''.join(h + '\n' for h in u))

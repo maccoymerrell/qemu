@@ -189,7 +189,16 @@ ROWS = [
     # ---- 0F 79: SSE4A register form ---------------------------------------
     ('0f7900', 'VMWRITE',     REFUSED,  'insertq-regform',    'CR4.VMXE'),
     # ---- 0F 3A F0: RORX, p_f2 and VEX-only --------------------------------
-    ('f30f3af0c000', 'HRESET', NOT_IMPL, 'rorx-pf2',          None),
+    # THE IMMEDIATE BYTE IS THE PROBE'S, NOT THIS ROW'S.  HRESET is `F3 0F 3A
+    # F0 /0 ib`, so its probe carries an imm8, and mkprobe.py re-seats a probe
+    # whose only immediate is zero to 1 (a zero shift count is the value at
+    # which the shift family's flag write does not happen -- see that file).
+    # This row is keyed on the probe encoding, so it follows the probe.  The
+    # refusal reason does not: `rorx-pf2` is about the 0F3AF0 slot holding
+    # RORX and being VEX-only, which no immediate value can change.  The
+    # matrix/adjudication cross-check at the end of REPRODUCE.sh is what
+    # caught the drift, and it is meant to.
+    ('f30f3af0c001', 'HRESET', NOT_IMPL, 'rorx-pf2',          None),
     # ---- VEX.256.F2.0F38 CB..CD over the legacy SHA-NI trio ---------------
     ('c4e27fcbc0', 'VSHA512RNDS2', NOT_IMPL, 'sha-novex',     None),
     ('c4e27fccc0', 'VSHA512MSG1',  NOT_IMPL, 'sha-novex',     None),

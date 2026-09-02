@@ -1967,6 +1967,52 @@ static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
     return truedst;
 }
 
+/*
+ * THE POINTER-AUTHENTICATION MODIFIER THE ENCODING PINS TO X[31].
+ *
+ * Three A64 families take a PAC modifier that the encoding fixes at register
+ * 31 and the assembler syntax therefore never prints, and QEMU lowers all
+ * three the same way -- tcg_constant_i64(0).  That constant is the register:
+ * the execute ASL names X[31], not a literal, and R15 rules that the
+ * emulator's lowering is not architectural truth.  Nothing in the op stream
+ * says so, so the read is stated here, where the encoding is still in hand.
+ *
+ * The three, with the pages that pin them (the same list, and the same
+ * reading, this tree already closed at disas/capstone.c's
+ * cap_aarch64_reads_zero_modifier over the 2022-12 MRA):
+ *
+ *   LDRAA / LDRAB.  "address = AuthDA(address, X[31])" -- ARM DDI 0487C.a,
+ *   C6-701, which is the whole of what "using a modifier of zero" on C6-700
+ *   means.  6,144 registers, the second-largest row in aarch64's bar.
+ *
+ *   BRAAZ / BRABZ / BLRAAZ / BLRABZ.  Z == '0' forces m == 31 and also makes
+ *   source_is_sp FALSE, so modifier = X[m] is X[31] -- which is precisely
+ *   what separates them from BRAA with Rm = 31 and Z = '1', whose modifier is
+ *   SP.  124 registers.
+ *
+ *   The Z forms of PACIA/PACIB/PACDA/PACDB/AUTIA/AUTIB/AUTDA/AUTDB, where the
+ *   decode sets n = 31 outright, and the HINT-space PACIAZ/PACIBZ/AUTIAZ/
+ *   AUTIBZ, which do the same to X[30]'s modifier.
+ *
+ * DELIBERATELY NOT ON: PACIA1716 / AUTIA1716, whose modifier is X[16]; the SP
+ * forms PACIASP / RETAA and their siblings, whose modifier is SP[]; PACGA,
+ * which takes an explicit Xm; XPACI / XPACD / XPACLRI, which take no modifier
+ * at all.  Same page, same list, opposite answer.
+ *
+ * OUTSIDE THE pauth_active TEST, and that placement is the point.  Whether
+ * this guest turned pointer authentication on decides whether QEMU emits the
+ * helper; it does not decide what the instruction reads.  R16 is explicit
+ * that ISA-defined dependencies are recorded regardless of machine state and
+ * that no emulator optimisation leaks into the trace, which is the same rule
+ * 22d7666262 landed the MPX bound registers under.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_pac_zero_modifier(void)
+{
+    insn_dataflow_note_folded_read_zero();
+}
+
 static bool trans_BRAZ(DisasContext *s, arg_braz *a)
 {
     TCGv_i64 dst;
@@ -1975,6 +2021,7 @@ static bool trans_BRAZ(DisasContext *s, arg_braz *a)
         return false;
     }
 
+    note_pac_zero_modifier();
     dst = auth_branch_target(s, cpu_reg(s, a->rn), tcg_constant_i64(0), !a->m);
     set_btype_for_br(s, a->rn);
     gen_a64_set_pc(s, dst);
@@ -1990,6 +2037,7 @@ static bool trans_BLRAZ(DisasContext *s, arg_braz *a)
         return false;
     }
 
+    note_pac_zero_modifier();
     dst = auth_branch_target(s, cpu_reg(s, a->rn), tcg_constant_i64(0), !a->m);
     lr = cpu_reg(s, 30);
     if (dst == lr) {
@@ -2247,6 +2295,7 @@ static bool trans_ESB(DisasContext *s, arg_ESB *a)
 
 static bool trans_PACIAZ(DisasContext *s, arg_PACIAZ *a)
 {
+    note_pac_zero_modifier();
     if (s->pauth_active) {
         gen_helper_pacia(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
     }
@@ -2263,6 +2312,7 @@ static bool trans_PACIASP(DisasContext *s, arg_PACIASP *a)
 
 static bool trans_PACIBZ(DisasContext *s, arg_PACIBZ *a)
 {
+    note_pac_zero_modifier();
     if (s->pauth_active) {
         gen_helper_pacib(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
     }
@@ -2279,6 +2329,7 @@ static bool trans_PACIBSP(DisasContext *s, arg_PACIBSP *a)
 
 static bool trans_AUTIAZ(DisasContext *s, arg_AUTIAZ *a)
 {
+    note_pac_zero_modifier();
     if (s->pauth_active) {
         gen_helper_autia(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
     }
@@ -2295,6 +2346,7 @@ static bool trans_AUTIASP(DisasContext *s, arg_AUTIASP *a)
 
 static bool trans_AUTIBZ(DisasContext *s, arg_AUTIBZ *a)
 {
+    note_pac_zero_modifier();
     if (s->pauth_active) {
         gen_helper_autib(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
     }
@@ -4065,6 +4117,7 @@ static bool trans_LDRA(DisasContext *s, arg_LDRA *a)
     }
     dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
 
+    note_pac_zero_modifier();
     if (s->pauth_active) {
         if (!a->m) {
             gen_helper_autda_combined(dirty_addr, tcg_env, dirty_addr,
@@ -8920,6 +8973,7 @@ static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
             return false;
         }
         tcg_rn = tcg_constant_i64(0);
+        note_pac_zero_modifier();
     } else {
         tcg_rn = cpu_reg_sp(s, a->rn);
     }

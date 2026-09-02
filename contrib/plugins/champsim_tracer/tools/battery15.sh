@@ -34,6 +34,14 @@
 #   15  opcenc_loss_gate             the PER-ENCODING opcode-class gate
 #   15b   ... PLANTED FIRE, LOSS     the class erased in BOTH layers
 #   15c   ... PLANTED FIRE, MOVE     the class changed
+#   16  external_truth_gate          R13, the STANDING external-truth gate,
+#                                    run at this tip with its staleness
+#                                    guard armed (--build-dir).  MANDATORY,
+#                                    and RED without an evidence root
+#
+# THE NAME IS HISTORICAL.  "battery15" is what a pass invokes and what every
+# transcript names; the row count is not in the contract and renaming the
+# file would orphan every ledger that cites it.  There are sixteen rows.
 #
 # EVERY rc IS READ FROM THE PROCESS THAT PRODUCED IT.  Nothing here quotes a
 # number from a log it did not also take the exit status of, and no row is
@@ -173,6 +181,23 @@ selftest() {
       *" 11 "*) ok "P row 11 (net_validator_gate) is MANDATORY" ;;
       *) bad "P row 11 is NOT mandatory -- the set does not cover the defect" ;;
     esac
+    # Q: row 16 is in the set, for the same reason and a second defect.  R13
+    # is a standing gate by ruling and exec99 landed eight wire-changing
+    # commits without it; a battery that can go green while the external
+    # references were never consulted is the hole verify48 filed.
+    case " $MANDATORY " in
+      *" 16 "*) ok "Q row 16 (R13 external-truth gate) is MANDATORY" ;;
+      *) bad "Q row 16 is NOT mandatory -- a wave can still skip R13" ;;
+    esac
+    # R: with no evidence root the row is RED, never skipped.
+    RCFILE="$scratch/rc4.txt"; : > "$RCFILE"; RED=0
+    R13_ROOT=""
+    if selected 16; then
+        if [ -z "$R13_ROOT" ]; then
+            record 16 2 "R13 external-truth gate -- NO EVIDENCE ROOT"
+        fi
+    fi
+    t "R a battery with no R13 evidence root is RED" "$RED" 1
     n=$((n+1))
     ROWS="all"
 
@@ -189,7 +214,7 @@ selftest() {
 # the wire reported "validator all seed 4242 rc=0" (rows 7-10) and never ran
 # it.  Row 15 joins it because it is the only per-encoding opcode gate, and
 # row 6 because its scan is what reads every sidecar the run produced.
-MANDATORY="6 11 15"
+MANDATORY="6 11 15 16"
 
 # A row is selected when --rows was not given, or names it, or names its
 # parent (so 12b rides on 12 and nobody has to list both).
@@ -242,6 +267,7 @@ Q=$1; O=$2; shift 2
 WORKLOAD=${CST_BATTERY_WORKLOAD:-}
 SRC_LOSS_A=${CST_SRC_LOSS_A:-}
 SRC_LOSS_B=""
+R13_ROOT=${CST_R13_ROOT:-}
 ROWS=all
 SEED=4242
 WP=16
@@ -253,6 +279,7 @@ while [ $# -gt 0 ]; do
         --src-loss-a)   SRC_LOSS_A=$2; shift 2 ;;
         --src-loss-b)   SRC_LOSS_B=$2; shift 2 ;;
         --rows)         ROWS=$2; shift 2 ;;
+        --r13-root)     R13_ROOT=$2; shift 2 ;;
         --seed)         SEED=$2; shift 2 ;;
         --wp)           WP=$2; shift 2 ;;
         --no-plants)    PLANTS=0; shift ;;
@@ -599,6 +626,43 @@ PYEOF
         fi
     else
         record 15 2 "opcenc_loss_gate -- no workload directory"
+    fi
+fi
+
+# ---- ROW 16: THE R13 EXTERNAL-TRUTH GATE, AT THIS TIP ---------------------
+#
+# THE HOLE THIS CLOSES.  R13 is a STANDING GATE by ruling -- the external
+# references are consulted on EVERY wire-changing wave -- and nothing made
+# the battery ask.  exec99 landed EIGHT wire-changing commits, closed on a
+# green fifteen-row battery, and never ran it; verify48 ran it afterwards and
+# found it RED.  A standing gate that only runs when somebody remembers is
+# not standing, and "the wave forgot" is a mechanism, so it gets a row.
+#
+# THE STALENESS TEST IS NOT REIMPLEMENTED HERE.  score.py already refuses an
+# evidence root older than the tracer binaries it is supposed to have
+# measured, and it decides that on the binaries' BEHAVIOUR DIGEST rather than
+# on mtimes or commit dates -- so a comment-only commit that relinks 62
+# emulators does not stale the evidence, and a wire change that leaves the
+# mtime alone does.  A second staleness rule written here would be a second
+# opinion about the same question, and the two would drift.  This row's whole
+# job is to make the gate RUN, with --build-dir on so the guard is armed.
+#
+# NO EVIDENCE ROOT IS RED, NOT SKIPPED.  A battery that cannot find the R13
+# evidence cannot say the gate passed, and a row that reports PASS because
+# its subject is missing is the standing failure mode of this tree.  Point it
+# at the root with --r13-root or CST_R13_ROOT.
+if selected 16; then
+    if [ -z "$R13_ROOT" ]; then
+        record 16 2 "R13 external-truth gate -- NO EVIDENCE ROOT (--r13-root \
+or CST_R13_ROOT).  R13 is a standing gate; a battery that cannot run it \
+cannot report a bar"
+    elif [ ! -d "$R13_ROOT" ]; then
+        record 16 2 "R13 external-truth gate -- evidence root '$R13_ROOT' \
+is not a directory"
+    else
+        "$T/external_truth_gate.sh" "$R13_ROOT" --build-dir "$Q" \
+            > "$O/r13_gate.log" 2>&1
+        record 16 $? "external_truth_gate (staleness guard ARMED via --build-dir)"
     fi
 fi
 

@@ -220,29 +220,36 @@ GHashTable *g_src_nostate_ident = nullptr;
  */
 std::atomic<uint64_t> g_src_ident_witness_reached{0};
 /*
- * THE FLIP'S COST, PER PUBLISHED SOURCE, measured against the survivor
- * table rather than argued from it.
+ * THE OPERAND WALK'S REMAINING COST, PER PUBLISHED SOURCE, measured against
+ * what QEMU alone supplies rather than argued from it.
  *
- * A source-list flip publishes  QEMU's ordered read list  UNION  the rows
- * champsim_tracer_src_survivors.h carries for this instruction's decode
- * identity.  Whether that union is the set the wire publishes today is a
- * question with two directions and they are counted apart, because one is
- * a LOSS and the other is a GAIN and a single number would be readable as
- * neither:
+ * THE UNION IS qemu_named_regs(), CALLED -- not a second derivation of it.
+ * That function is what seats the wire's source prefix, and it takes every
+ * access's ADDRESS provenance, every store's DATA registers, every published
+ * destination's provenance, QEMU's ordered read list, the members a stated
+ * container covers (#277) and the survivor rows for the decode identity.
+ * Re-deriving a narrower union here is what made this row non-zero on 19
+ * sidecars across all four ISAs with no defect under it (FINDING 59-B).
  *
- *   MISSING  a register the wire publishes today that the union does NOT
- *            contain.  R12.1 forbids it: this is exactly the information
- *            the flip would drop.  MUST BE 0.
- *   EXTRA    a register the union contains that the wire does not publish
- *            today.  Two populations share it -- QEMU-EXTRA (a source the
- *            emulator states and the decode never named) and any register
- *            a survivor row supplies to an instruction that does not want
- *            it.  Tallied by row so the two are separable by inspection.
+ * WHAT THE TWO DIRECTIONS MEAN NOW THAT THE FLIP HAS LANDED (94dc9e649c).
+ * The wire is that prefix followed by the operand walk's remaining sources:
+ * reindex_src_for_qemu() is a permutation and drops nothing, which is the
+ * "and keeps what QEMU never said" half of the flip.  So the two directions
+ * are counted apart because one is a LOSS and the other a GAIN and a single
+ * number would be readable as neither:
  *
- * MEASUREMENT ONLY.  Nothing here writes a wire field; the flip that would
- * use this union is not this change.  What it does is make the flip's cost
- * a number BEFORE the flip, which is the discipline the destination side's
- * refuse route already follows.
+ *   MISSING  a register the wire publishes today that ONLY the operand walk
+ *            supplies.  It is the cost of deleting the walk's read arm --
+ *            the banked step-3 deletion -- and R12.1 forbids paying it:
+ *            this is exactly the information that deletion would drop.
+ *            MUST BE 0.
+ *   EXTRA    a register a survivor row supplies that the wire does not
+ *            publish today.  Tallied by row; see g_surv_ref_silent for the
+ *            fabrication question, which this row cannot ask.
+ *
+ * MEASUREMENT ONLY.  Nothing here writes a wire field.  What it does is make
+ * the pending deletion's cost a number BEFORE the deletion, which is the
+ * discipline the destination side's refuse route already follows.
  */
 uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
                           uint8_t *out, uint8_t cap);
@@ -3891,23 +3898,45 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             uint8_t surv[MAX_SRC_REGS];
             uint8_t ns = src_survivor_regs(q->decode_id, f, surv,
                                            (uint8_t)MAX_SRC_REGS);
+            /*
+             * THE UNION IS THE PRODUCER'S OWN ANSWER, CALLED (#59-B).
+             *
+             * It used to be re-derived here as "read list UNION containers
+             * UNION survivor rows", which is a STRICT SUBSET of what
+             * qemu_named_regs() seats: that function also takes each
+             * access's ADDRESS provenance, each store's DATA registers and
+             * every published destination's provenance.  A register QEMU
+             * states only in one of those three -- x86 `setb (%r13,%rax)`'s
+             * address registers, `bndstx`'s, `fnstcw`'s segment -- was
+             * therefore seated on the wire by the producer and then counted
+             * HERE as a source the union does not contain.  The row read
+             * non-zero on 19 sidecars across all four ISAs with no defect
+             * under it, which is the second horn FINDING 59-B named: the
+             * checker computed a different union than the producer.
+             *
+             * Calling the producer removes the drift by construction rather
+             * than by keeping two lists in step.  The arguments are the ones
+             * qdep_apply() passes at the seating site -- @f and
+             * @wstate == QDEP_OK -- because a union computed under different
+             * arguments is a different union, and dst_precheck()'s verdict
+             * is exactly what decides whether the destination family's
+             * provenance is seated at all.
+             *
+             * WHAT THE ROW NOW MEASURES, stated because the flip has landed
+             * and the old sentence about it has not been true since
+             * 94dc9e649c: the wire is qemu_named_regs()'s prefix followed by
+             * the operand walk's remaining sources (reindex_src_for_qemu()
+             * is a permutation and drops nothing).  A non-zero row is
+             * therefore a published source that ONLY the walk supplies, and
+             * it is the cost of deleting the walk's read arm -- the banked
+             * step-3 deletion -- not the cost of the flip that already
+             * landed.
+             */
+            uint8_t qn[MAX_SRC_REGS];
+            uint8_t nqn = qemu_named_regs(q, qn, f, wstate == QDEP_OK);
             auto in_union = [&](uint8_t r) {
-                for (uint8_t k = 0; k < q->n_src; k++) {
-                    if (q->src_reg[k] == r) {
-                        return true;
-                    }
-                }
-                /* The composed-register reading, #277 -- same rule as the
-                 * justification test above, because the flip publishes
-                 * QEMU's read list and a container in that list carries its
-                 * member's dependency by construction. */
-                for (uint8_t k = 0; k < q->n_src_cont; k++) {
-                    if (r >= q->src_cont_lo[k] && r <= q->src_cont_hi[k]) {
-                        return true;
-                    }
-                }
-                for (uint8_t k = 0; k < ns; k++) {
-                    if (surv[k] == r) {
+                for (uint8_t k = 0; k < nqn; k++) {
+                    if (qn[k] == r) {
                         return true;
                     }
                 }
@@ -5925,20 +5954,27 @@ void qdep_report(GString *report)
         g_cont_selftest_arms.load(std::memory_order_relaxed),
         g_cont_selftest_failed.load(std::memory_order_relaxed));
     g_string_append(report,
-        "\nTHE SOURCE-LIST FLIP'S COST, measured against the survivor table\n"
-        "(champsim_tracer_src_survivors.h, generated by\n"
-        "tools/gen_src_survivors.py from the census above).  The flip would\n"
-        "publish QEMU's ordered read list UNION the rows that table carries\n"
-        "for the instruction's DECODE IDENTITY; these two rows say what that\n"
-        "union is and is not, per published source entry.  MEASUREMENT ONLY:\n"
-        "the wire's source list is still the operand walk's.\n");
+        "\nWHAT THE OPERAND WALK STILL SUPPLIES ALONE, per published source\n"
+        "entry.  THE SOURCE-LIST FLIP HAS LANDED (94dc9e649c): the wire is\n"
+        "qemu_named_regs() -- every access address provenance, every store\n"
+        "datum, every published destination's provenance, QEMU's ordered read\n"
+        "list, the members a stated container covers, and the rows\n"
+        "champsim_tracer_src_survivors.h carries for the decode identity --\n"
+        "followed by the operand walk's remaining sources, which the reindex\n"
+        "permutation keeps rather than drops.  The union below is that same\n"
+        "function CALLED, so the checker and the producer cannot drift.  These\n"
+        "two rows therefore price the DELETION of the walk's read arm, not the\n"
+        "flip; nothing here writes a wire field.\n");
     g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  published sources the union DOES NOT"
         " CONTAIN -- MUST BE 0.\n"
-        "               R12.1: this is the information the flip would drop,"
-        " and a\n"
-        "               non-zero here is a table that does not carry its own"
-        " census\n"
+        "               R12.1: this is the information DELETING THE OPERAND"
+        " WALK'S READ\n"
+        "               ARM would drop -- the union above is what the wire"
+        " would be left\n"
+        "               with -- and a non-zero here is a survivor table that"
+        " does not\n"
+        "               carry its own census\n"
         "  %10" G_GUINT64_FORMAT "  registers a SURVIVOR ROW supplies that"
         " the wire does not\n"
         "               publish -- MUST BE 0.  A table row reaching an"
@@ -6343,7 +6379,7 @@ void qdep_report(GString *report)
         "              instruction's mechanism under this encoding.\n",
         g_mech_stage_mismatch.load(std::memory_order_relaxed));
     dump_tally(report, g_src_flip_missing_sig,
-               "FLIP COST, THE LOSS DIRECTION -- published sources the\nsurvivor table plus QEMU's read list does NOT contain, by decode id,\nrule, register and mnemonic.  Every row here is a register a source-list\nflip would delete from the wire, which R12.1 forbids; the block is empty\nwhen the table carries its own census:");
+               "FLIP COST, THE LOSS DIRECTION -- published sources that\nqemu_named_regs() does NOT contain, by decode id, rule, register and\nmnemonic.  Every row here is a register ONLY the operand walk supplies,\nso every row is one that deleting the walk's read arm would delete from\nthe wire, which R12.1 forbids; the block is empty when QEMU's own\nstatements and the survivor table carry the whole published list:");
     dump_tally(report, g_src_adj_owed_sig,
                "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows.  A row leaves this block by being RULED, never by being deleted:\nthe ruled rows are in the R16 block below, with their counts intact:");
     dump_tally(report, g_src_adj_r16_sig,

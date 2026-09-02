@@ -317,6 +317,21 @@ typedef struct DfAliasNote {
 typedef struct DfZeroNote {
     const void *ts;
     const TCGOp *anchor;
+    /*
+     * An op OTHER than @anchor has written @ts, so the temp no longer holds
+     * the register the accessor named.  A64's do_fcvt_scalar() is the shape
+     * this exists for: it takes cpu_reg(s, rd) -- which for rd == 31 is a
+     * noted XZR temp -- and then uses it as the SCRATCH the source vector
+     * element is loaded into, so by the time the conversion helper reads it
+     * the temp holds Vn and not XZR.  Resolving the note there would publish
+     * a read of the zero register that the instruction does not perform.
+     *
+     * @anchor itself is exempt because for every accessor that hands out a
+     * fresh temp -- cpu_reg(), read_cpu_reg(), gen_load_gpr() -- the anchor
+     * IS the movi that put the constant there, and treating that as a
+     * redefinition would retire every note the moment it was taken.
+     */
+    bool redefined;
 } DfZeroNote;
 
 /*
@@ -2036,6 +2051,39 @@ static bool df_zero_reg_temp(const void *tsv, unsigned n,
 }
 
 /*
+ * The same question, asked of a temp that must STILL HOLD the register.
+ *
+ * WHY THERE ARE TWO.  df_zero_reg_temp() answers "was this temp named as the
+ * zero register", which is what the store-data and write paths want: they ask
+ * at the point the accessor's constant is consumed, and a store's data temp
+ * being that constant is proof enough of what it stood for.  A HELPER
+ * ARGUMENT is not in that position.  A translator is free to reuse the temp
+ * the accessor handed it as ordinary scratch before the call, and A64 does:
+ * do_fcvt_scalar() takes cpu_reg(s, rd) -- a noted XZR temp when rd == 31 --
+ * and loads the SOURCE vector element into it, so at the call the temp holds
+ * Vn.  Resolving the note there publishes a read of XZR that
+ * `fcvtzs xzr, d20` does not perform, which is the one error this file must
+ * not make.
+ *
+ * So the call path asks the stronger question, and only the call path: the
+ * older callers keep the reading they were measured under, and whether their
+ * position has the same exposure is a separate subject with a separate
+ * measurement, named in UNRESOLVED rather than changed here on the way past.
+ */
+static bool df_zero_reg_temp_live(const void *tsv, unsigned lo, unsigned hi)
+{
+    if (hi > df_n_zero) {
+        hi = df_n_zero;
+    }
+    for (unsigned k = lo; k < hi; k++) {
+        if (df_zero[k].ts == tsv && !df_zero[k].redefined) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * Is the temp at @tsv one a DECODER named as this instruction's encoded
  * immediate, among the notes in [@lo, @hi)?
  *
@@ -2501,6 +2549,23 @@ static bool df_carrier_read(const void *ts, unsigned *stands_for)
     return false;
 }
 
+/*
+ * An op of the instruction being walked has just written @ts, so any
+ * zero-register note on it that some OTHER op made is now stale.
+ *
+ * Every note is scanned rather than the newest: one temp may carry notes from
+ * two anchors inside one block, and only the one whose anchor is this very op
+ * is the definition rather than a redefinition.
+ */
+static void df_zero_reg_defined(const void *ts, const TCGOp *op)
+{
+    for (unsigned i = 0; i < df_n_zero; i++) {
+        if (df_zero[i].ts == ts && df_zero[i].anchor != op) {
+            df_zero[i].redefined = true;
+        }
+    }
+}
+
 /* An op of the instruction being walked has just written @ts. */
 static void df_carrier_defined(const void *ts)
 {
@@ -2689,6 +2754,37 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         df_ord_read(d, INSN_DF_ORD_GLOBAL, idx);
                         df_bit(prov, idx);
                     }
+                } else if (df_zero_reg_temp_live(ts, zero_lo, *zero_cursor)) {
+                    /*
+                     * THE ARCHITECTURAL ZERO REGISTER, HANDED TO A HELPER.
+                     *
+                     * The accessor that resolved the operand said so -- it is
+                     * the only place the register NUMBER still exists -- and
+                     * the generic op walk below resolves that note where the
+                     * temp reaches an ordinary op.  A call op never reaches
+                     * that walk: it is served by this branch and leaves it at
+                     * the `continue` beneath, so a zero-register operand whose
+                     * ONLY consumer is a helper argument was noted and never
+                     * resolved, and the read left the wire.
+                     *
+                     * That is not a rare shape.  It is how every target hands
+                     * an operand to code TCG cannot express: `scvtf d0,xzr`
+                     * and `crc32b w0,wzr,w1` on AArch64, the PAC family whose
+                     * modifier the encoding pins to X[31] --
+                     * `address = AuthDA(address, X[31,64])` in LDRAA's execute
+                     * ASL -- and on RISC-V every `aes64es`, `clmul`, `sm4ed`
+                     * and `xperm8` form whose operand is x0, which get_gpr()
+                     * resolves to ctx->zero and passes straight into the call.
+                     *
+                     * The bit goes in @prov and the member in the ORDERED
+                     * READ LIST, exactly as the generic path does it and for
+                     * the reasons stated there: @d->rd is indexed by TCG
+                     * global and this register has none.  Bounded to this
+                     * instruction's own notes, so a prefix window cannot name
+                     * the zero register in every later call.
+                     */
+                    df_bit(prov, INSN_DF_ZERO_PROV_BIT);
+                    df_ord_read(d, INSN_DF_ORD_ZERO, 0);
                 }
             }
 
@@ -3109,6 +3205,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
                     df_or(df_prov_of(ti), prov);
                     df_set_defop(ti, op);
+                    df_zero_reg_defined(ts, op);
                     if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
                         tlo = MIN(tlo, ti);
                         thi = MAX(thi, ti);
@@ -3403,6 +3500,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                 uint64_t *dp = df_prov_of(ti);
 
                 df_carrier_defined(ts);
+                df_zero_reg_defined(ts, op);
                 if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
                     tlo = MIN(tlo, ti);
                     thi = MAX(thi, ti);
@@ -3932,6 +4030,7 @@ void insn_dataflow_note_zero_reg(const void *ts)
     }
     df_zero[df_n_zero].ts = ts;
     df_zero[df_n_zero].anchor = anchor;
+    df_zero[df_n_zero].redefined = false;
     df_n_zero++;
 }
 

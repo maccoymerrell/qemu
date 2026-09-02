@@ -1886,6 +1886,46 @@ static inline void check_eva(DisasContext *ctx)
  */
 #define gen_ldcmp_fpr32(ctx, x, y) gen_load_fpr32(ctx, x, y)
 #define gen_ldcmp_fpr64(ctx, x, y) gen_load_fpr64(ctx, x, y)
+/*
+ * FCSR, for the compare that leaves the rest of it alone.
+ *
+ * WHAT IS MISSING WITHOUT THIS.  `c.<cond>.fmt` reaches FCSR twice and the op
+ * stream shows neither: it is lowered to gen_helper_0e2i(cmp_d_lt, ...), which
+ * is a call handed tcg_env, and every access happens inside the helper.  The
+ * fcr31 TCG GLOBAL exists and would have been walked -- it is simply never
+ * touched by the translated code for this instruction.  Measured with the
+ * operand walk's read arm deleted, ~30 OPC_CMP_* rules lose REG_FCSR, the
+ * largest closable class on mipsel after the model-unreachable MSA space.
+ *
+ * WHY IT IS A READ, from the architecture rather than from this emulator.
+ * MIPS Architecture For Programmers Vol. II, C.cond.fmt: the result is
+ * "written into condition code CC", one bit of FCSR, and the surrounding
+ * bits -- the other seven condition codes, the sticky Flags, the rounding
+ * mode -- are untouched.  A write of one field that PRESERVES the rest is a
+ * merge, and R17 rules a partial write reads itself when it merges.  The same
+ * page names a second, independent read on the delivery path: "If the Invalid
+ * Operation Enable bit is set in the FCSR, no result is written and an
+ * Invalid Operation exception is taken immediately."  QEMU performs exactly
+ * this read-modify-write -- SET_FP_COND()/CLEAR_FP_COND() rewrite
+ * env->active_fpu.fcr31 from its own value, and update_fcr31() ORs the new
+ * cause bits into it.
+ *
+ * BY RANGE, because the range IS the register: fpu_fcr31 is declared over
+ * these very bytes in mips_translate_init(), so the name every other access
+ * to them resolves to names this one too, and there is no second spelling.
+ *
+ * NOT ON CMP.cond.fmt (Release 6, gen_r6_cmp_*): that instruction writes a
+ * whole FPR with an all-ones or all-zeros mask and defines no condition-code
+ * field, so it has no field to merge with.  The line the reference draws is
+ * the line drawn here.
+ */
+static void note_fcr31_read(void)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUMIPSState, active_fpu.fcr31),
+        sizeof(((CPUMIPSState *)0)->active_fpu.fcr31));
+}
+
 #define FOP_CONDS(type, abs, fmt, ifmt, bits)                                 \
 static inline void gen_cmp ## type ## _ ## fmt(DisasContext *ctx, int n,      \
                                                int ft, int fs, int cc)        \
@@ -1910,6 +1950,7 @@ static inline void gen_cmp ## type ## _ ## fmt(DisasContext *ctx, int n,      \
     }                                                                         \
     gen_ldcmp_fpr##bits(ctx, fp0, fs);                                        \
     gen_ldcmp_fpr##bits(ctx, fp1, ft);                                        \
+    note_fcr31_read();                                                        \
     switch (n) {                                                              \
     case  0:                                                                  \
         gen_helper_0e2i(cmp ## type ## _ ## fmt ## _f, fp0, fp1, cc);         \

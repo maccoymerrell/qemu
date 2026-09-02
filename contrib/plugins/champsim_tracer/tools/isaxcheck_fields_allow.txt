@@ -484,6 +484,27 @@ aarch64 FR-rd-phantom fadda +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fccmp +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fccmpe +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fneg +REG_FCSR,REG_SYSFPEN
+# THE ALWAYS-CONDITIONS.  LLVM MC gives every B.cond / BC.cond form the same
+# condition-code Use, so `bc.al` and `bc.nv` arrive with `llvmRD{nzcv}` --
+# and at cond<3:1> == '111' the architecture reads no flag at all.
+# ARM DDI 0487C.a, shared/functions/system/ConditionHolds (J1-6366):
+#
+#     case cond<3:1> of
+#         ...
+#         when '111' result = TRUE;                 // AL
+#     // Condition flag values in the set '111x' indicate always true
+#     if cond<0> == '1' && cond != '1111' then result = !result;
+#
+# The '111' arm names no PSTATE field and the inversion below it is
+# explicitly excluded for '1111', so NZCV is not an input to either
+# encoding.  QEMU draws the same line -- trans_B_cond() emits a plain
+# gen_goto_tb() with no arm_gen_test_cc() for 0xe and 0xf -- and
+# disas/capstone.c's cap_aarch64_always_cond_contract() drops the read the
+# reference mints, which is what makes this an `rd-missing` row rather than
+# a silent agreement.  Removable if LLVM ever stops attaching the flags to
+# the always-conditions; `cstool -d aarch64 1f000054` shows Capstone
+# carrying the same claim, so the correction is not version-specific.
+aarch64 FR-rd-missing bc.* +REG_FLAGS
 aarch64 FR-rd-missing eretaa +REG_LR
 aarch64 FR-rd-missing eretab +REG_LR
 aarch64 FR-rd-missing mov +REG_MATRIX

@@ -46,6 +46,24 @@ class Entry:
     # champsim_tracer_mnemonics.h.
     lane_mask_kind: str = "LANE_MASK_KIND_NONE"
     lane_parallel: bool = False
+    # A RULE THAT WITHDRAWS A CLASS, told apart from no rule at all.
+    #
+    # `GEN_OP_UNKNOWN` is what the classifier returns when it has nothing
+    # to say, and the audit correctly reads that as "no rule covers this
+    # row" and leaves the existing row alone.  The consequence went
+    # unnoticed until a wrong word had to come out: a rule could ADD a
+    # class and CHANGE a class, but it could never WITHDRAW one.  Every
+    # path that could have written UNKNOWN was the same path that meant
+    # "say nothing", so a mistaken class, once in a generated table, was
+    # immortal against the generator that produced it -- and the tables
+    # are not hand-editable, so it was immortal outright.
+    #
+    # `refused` is the difference.  It marks an Entry whose UNKNOWN is an
+    # ANSWER: the rule looked, and states that the shared vocabulary has
+    # no word for this instruction.  Such an Entry is compared, reported
+    # and WRITTEN like any other.  Nothing else changes: an unmarked
+    # UNKNOWN still means silence and is still left alone.
+    refused: bool = False
 
     def without_refine(self) -> "Entry":
         """Strip preserved-across-runs annotations (.refine and
@@ -1975,6 +1993,17 @@ def ent(op: str, branch: str = "BRANCH_NONE", flags: str = "MF_NONE") -> Entry:
     return Entry(op, branch, norm_flags(flags))
 
 
+def refuse(branch: str = "BRANCH_NONE", flags: str = "MF_NONE") -> Entry:
+    """The vocabulary has no word for this instruction, and says so.
+
+    Distinct from a bare `ent("GEN_OP_UNKNOWN")`, which means the
+    classifier had nothing to say and leaves any existing row standing.
+    A refusal is written.  Fields other than the opcode keep their
+    answers: refusing to name the OPERATION does not withdraw a
+    control-flow fact that is separately true."""
+    return Entry("GEN_OP_UNKNOWN", branch, norm_flags(flags), refused=True)
+
+
 def reg_ent(primary: str, aliases: list[str] | tuple[str, ...] = ()) -> RegEntry:
     aliases_t = tuple(aliases)
     if aliases_t == (primary,):
@@ -2752,9 +2781,17 @@ def classify_x86(m: str) -> Entry:
     #                        instruction blocks with no wrong path at all.  When
     #                        one does fire, it is an exception, and the fault
     #                        machinery models it as such.
-    if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "vmcall", "vmmcall",
-             "ud0", "ud1", "ud2"}:
+    if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "vmcall", "vmmcall"}:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
+    # UD0/UD1/UD2 raise #UD.  They sat in the set above and therefore
+    # published GEN_OP_SYSCALL, which names a different trap -- see the
+    # ("x86", "ud") statement in QEMU_RULE_STATEMENTS for the full reason.
+    # The two paths have to agree: qemu_ident_classify() returns nullptr on
+    # a GEN_OP_UNKNOWN payload and falls back to THIS table, so leaving the
+    # name-based row saying SYSCALL would re-assert through the fallback
+    # exactly what the ruled row withdrew.
+    if m in {"ud0", "ud1", "ud2"}:
+        return refuse("BRANCH_SYSCALL_TYPE")
     if m in {"hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
         return ent("GEN_OP_NOP")
     if m.startswith("prefetch"):
@@ -4862,9 +4899,18 @@ def full_entry(info: IsaInfo, const_name: str,
     """
     new = classify(info, const_name)
     old = existing.get(const_name)
-    if new.op == "GEN_OP_UNKNOWN" and old is None:
+    # A REFUSAL IS AN ANSWER AND IS EMITTED.  Both guards below read
+    # `GEN_OP_UNKNOWN` as "the classifier said nothing" -- keep the row
+    # that is there, or emit none at all.  That is right for silence and
+    # wrong for a rule that has looked and states the vocabulary has no
+    # word: it made a published class unwithdrawable, because the only way
+    # to write UNKNOWN was the same way of saying nothing.  `refused`
+    # separates them, so a withdrawal reaches the table.
+    if new.refused:
+        pass
+    elif new.op == "GEN_OP_UNKNOWN" and old is None:
         return None
-    if new.op == "GEN_OP_UNKNOWN" and old is not None:
+    elif new.op == "GEN_OP_UNKNOWN" and old is not None:
         new = old.without_refine()
     refine = old.refine if old and old.refine else None
     # Classifier-driven .refine: AArch64 has one Capstone insn id
@@ -4955,7 +5001,7 @@ def generated_reg_body(info: IsaInfo, constants: list[str]) -> str:
 
 
 def targeted_fix(isa: str, const_name: str, old: Entry, new: Entry) -> bool:
-    if new.op == "GEN_OP_UNKNOWN":
+    if new.op == "GEN_OP_UNKNOWN" and not new.refused:
         return False
     if new.op in MADD_OPS and old.op != new.op:
         return True
@@ -5001,6 +5047,7 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
     mismatched: list[tuple[str, Entry, Entry]] = []
     stale = [name for name in sorted(existing) if name not in constants]
     unknown_existing: list[str] = []
+    refused_rows: list[tuple[str, str]] = []   # (const, the op withdrawn)
     dep_histogram: dict[str, int] = {}
     dep_affirmative_count: int = 0      # rows the classifier picked positively
     dep_fallback_rows: list[tuple[str, str]] = []   # (const_name, op)
@@ -5011,13 +5058,18 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
         new = classify(info, const_name)
         old = existing.get(const_name)
         if old is None:
-            if new.op != "GEN_OP_UNKNOWN":
+            if new.op != "GEN_OP_UNKNOWN" or new.refused:
                 missing.append((const_name, new))
             continue
-        if new.op == "GEN_OP_UNKNOWN":
+        if new.op == "GEN_OP_UNKNOWN" and not new.refused:
             unknown_existing.append(const_name)
             continue
-        if old.without_refine() != new:
+        if new.refused:
+            refused_rows.append((const_name, old.op))
+        # `without_refine()` on BOTH sides: `refused` is a property of the
+        # RULE, never of the row it writes, so a refusal that has already
+        # landed must compare equal to itself on the next run.
+        if old.without_refine() != new.without_refine():
             mismatched.append((const_name, old, new))
         # Dep-coverage tally.  Rows are assigned a refiner and
         # accounted as either affirmative (classifier had positive
@@ -5065,6 +5117,13 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
             print(f"    ... {len(stale) - max_lines} more")
     if unknown_existing:
         print(f"  existing entries with no rule coverage: {len(unknown_existing)}")
+    # A withdrawal is louder than an addition: it says a published word was
+    # wrong.  Named, always, with what it replaces.
+    if refused_rows:
+        print(f"  rules REFUSING the opcode (vocabulary has no word): "
+              f"{len(refused_rows)}")
+        for const_name, old_op in refused_rows[:max_lines]:
+            print(f"    {const_name}: {old_op} -> GEN_OP_UNKNOWN (refused)")
 
     # Dep-refiner coverage report.  Every row carries an explicit
     # refiner; rows where the classifier had positive evidence count
@@ -7515,14 +7574,43 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "every arm operates on machine state rather than producing a "
         "data result"),
 
-    # THE UNDEFINED-OPCODE ROWS.  UD0, UD1 and UD2 exist to raise #UD --
-    # gen_UD() is gen_illegal_opcode(), a trap to a vector -- and that is
-    # the same NAMED kind riscv's `illegal` and MIPS's reserved rows take.
+    # THE UNDEFINED-OPCODE ROWS.  UD0, UD1 and UD2 exist to raise #UD, and
+    # the OPCODE field refuses rather than borrowing another trap's word.
+    #
+    # The `no_class` doctrine above says such a row gets "the trap they
+    # take, which is what the machine does".  The trap these take is #UD,
+    # the invalid-opcode fault.  The shared vocabulary has no word for it.
+    # This row used to state GEN_OP_SYSCALL on the reasoning that a trap to
+    # a vector is a trap to a vector -- but GEN_OP_SYSCALL is not a generic
+    # name for "traps"; it is the name of a DIFFERENT trap, the deliberate
+    # entry to supervisor code that `syscall`, `sysenter` and `int` make.  A
+    # consumer reading it models a system call where the machine faults,
+    # which is a fabricated event, not a coarse one.
+    #
+    # So the row REFUSES the opcode: naming the wrong trap is worse than
+    # naming none, because none is visible and wrong is not.  The refusal
+    # is the vocabulary's, and it is stated on the row's own face.
+    #
+    # THE CONTROL-FLOW FIELD IS A DIFFERENT QUESTION AND KEEPS ITS ANSWER.
+    # `BRANCH_SYSCALL_TYPE` is the branch taxonomy's word for "fetch
+    # diverts to a vector, every time, with no target the front end can
+    # walk", and that is TRUE of #UD.  Sealing the block there is the same
+    # fact whichever vector is taken, so the seal stands; only the claim
+    # about what OPERATION the instruction performs is withdrawn.
+    #
+    # ALL THREE, because the ISA draws no line between them: SDM defines
+    # UD0 (0F FF), UD1 (0F B9) and UD2 (0F 0B) alike as raising #UD, and
+    # QEMU generates all three through the same gen_illegal_opcode().
+    # Refusing two and answering for the third would state a distinction
+    # neither the architecture nor the emulator makes.
     ("x86", "ud"): Statement(
-        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "ud", "ruled",
+        refuse("BRANCH_SYSCALL_TYPE"), "ud", "ruled",
         "decode-new.c.inc:1339, 1437 and 1480 -- UD2, UD1 and UD0, whose "
         "generator is gen_illegal_opcode(): an encoding the architecture "
-        "defines as raising #UD",
+        "defines as raising #UD.  The vocabulary has no word for that "
+        "fault and GEN_OP_SYSCALL names a different one, so the opcode is "
+        "REFUSED; the BRANCH_SYSCALL_TYPE seal is the separate, true fact "
+        "that fetch diverts to a vector unconditionally",
         no_class=True),
 
     # THE FAR TRANSFERS.  A far call pushes the return CS:EIP and jumps

@@ -2153,8 +2153,84 @@ static bool trans_ERETA(DisasContext *s, arg_reta *a)
     return true;
 }
 
+/*
+ * THE BASE REGISTER OF A PREFETCH.
+ *
+ * QEMU does not model caches, so every PRFM and PRFUM encoding is decoded
+ * through the NOP rows of a64.decode (lines 345, 460, 495 and 517) and
+ * trans_NOP() emits nothing.  The address is never computed, so no op reads
+ * the base register and a walk of the op stream finds the instruction
+ * reading nothing at all -- `prfm pldl1keep, [x21]` arrives at a consumer
+ * with an empty source list.
+ *
+ * ARM DDI 0487, PRFM (immediate): the address is `X[n] + offset` and `X[]`'s
+ * read form is invoked with `n`, so the base register is an operand of the
+ * instruction whether or not the implementation does anything with the
+ * address.  R16 records an ISA-defined dependency regardless of what the
+ * emulator makes of the semantics, and R15 says QEMU's decision to drop the
+ * whole address computation is a lowering decision, not architectural truth.
+ * The register is STATED here, where the encoding fields are in hand.
+ *
+ * PER ENCODING, and read off the encoding rather than off a decodetree
+ * argument set, because the NOP rows carry no fields: giving the prefetch
+ * rows their own pattern names would rename the identity QEMU already
+ * publishes for them (decodetree qualifies each row by its own bits, so
+ * `disas_a64/NOP@1111100110...` is already unique to PRFM (unsigned
+ * offset)), and an identity churn is a worse trade than a mask table beside
+ * the encodings it names.  This is the shape x86's prefetch_ident_of() uses
+ * for the same instruction class on the other target.
+ *
+ *   PRFM  (immediate, unsigned offset)  11 111 0 01 10 imm12 Rn Rt
+ *   PRFUM (unscaled immediate)          11 111 0 00 10 0 imm9 00 Rn Rt
+ *   PRFM  (register offset)             11 111 0 00 10 1 Rm option S 10 Rn Rt
+ *   PRFM  (literal)                     11 011 0 00 imm19 Rt   -- PC-relative,
+ *                                       names no general register and states
+ *                                       nothing here.
+ *
+ * Rt is the prefetch OPERATION (<prfop>), a five-bit immediate and not a
+ * register, so it is not stated.  The register-offset form reads Rm as well
+ * as Rn and states both.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_prefetch_base_read(DisasContext *s)
+{
+    static const struct {
+        uint32_t mask;
+        uint32_t value;
+        bool has_rm;
+    } prfm_forms[] = {
+        /* PRFM (immediate, unsigned offset) */
+        { 0xffc00000u, 0xf9800000u, false },
+        /* PRFUM (unscaled immediate) */
+        { 0xffe00c00u, 0xf8800000u, false },
+        /* PRFM (register offset); option<1> is 1 on every defined form */
+        { 0xffe02c00u, 0xf8a02800u, true  },
+    };
+    uint32_t insn = s->insn;
+
+    for (size_t i = 0; i < ARRAY_SIZE(prfm_forms); i++) {
+        if ((insn & prfm_forms[i].mask) != prfm_forms[i].value) {
+            continue;
+        }
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUARMState, xregs[0]) +
+            extract32(insn, 5, 5) * sizeof(((CPUARMState *)0)->xregs[0]),
+            sizeof(((CPUARMState *)0)->xregs[0]));
+        if (prfm_forms[i].has_rm) {
+            insn_dataflow_note_stated_read_env(
+                offsetof(CPUARMState, xregs[0]) +
+                extract32(insn, 16, 5) *
+                sizeof(((CPUARMState *)0)->xregs[0]),
+                sizeof(((CPUARMState *)0)->xregs[0]));
+        }
+        return;
+    }
+}
+
 static bool trans_NOP(DisasContext *s, arg_NOP *a)
 {
+    note_prefetch_base_read(s);
     return true;
 }
 

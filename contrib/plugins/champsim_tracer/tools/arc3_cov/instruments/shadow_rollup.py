@@ -167,6 +167,22 @@ def roll(files, label):
         for f in refused:
             print("   ", f)
         sys.exit(2)
+    # AN EMPTY SUBJECT HAS A SECOND SHAPE, AND IT IS THE ONE THAT SURVIVED.
+    #
+    # The file-count refusal above catches "no sidecars".  It does not catch
+    # sidecars that PARSE and carry nothing: N files whose blocks are present
+    # and whose every counter is zero roll up to `0 == 0 + 0` on all three
+    # identities, print "N sidecars", and CLOSE.  That is the same instrument
+    # with nothing to look at, wearing a non-zero file count -- and the
+    # guard the selftest wrote against the original defect ("no output pairs
+    # '0 sidecars' with 'CLOSES'") reads it as clean, because the count is not
+    # zero.  A corpus that classified nothing AND translated nothing is a
+    # subject the roll-up cannot speak about, so it refuses instead.
+    if not t["classified"] and not t["translated"]:
+        refuse("%s: %d sidecar(s) parsed and every population is EMPTY -- "
+               "0 classified, 0 translated.  The identities would all close "
+               "vacuously over zero rows, which is the file-count refusal's "
+               "defect in a second dress." % (label, n))
     print("== %s : %d sidecars, 0 refused" % (label, n))
     print("  classified                     %10d" % t["classified"])
     print("  comparable                     %10d" % t["comparable"])
@@ -356,6 +372,21 @@ def selftest(scratch=None):
           "'0 sidecars' with 'CLOSES'",
           all(not ("0 sidecars" in o and "CLOSES" in o)
               for o in (out, out2)))
+
+    # L: the file count is not zero and the POPULATION is.  This is the arm
+    # the original selftest could not have written, because K's guard keys on
+    # the sidecar count and this shape has two of them.
+    hollow = os.path.join(tmp, "hollow")
+    os.makedirs(hollow, exist_ok=True)
+    for arm in ("wp0", "wp16"):
+        _sidecar(os.path.join(hollow, "h_%s.stats.log" % arm),
+                 classified=0, comparable=0, agree=0, kd=0, enumpub=0,
+                 silent=0, translated=0, scored=0,
+                 VERIFIED=0, STATED=0, OBSERVED=0)
+    rcL, outL = _run([hollow])
+    check("L sidecars that PARSE and carry NOTHING refuse (rc=2), never "
+          "close on 0 == 0 + 0", rcL == 2 and "CLOSES" not in outL,
+          "rc=%s" % rcL)
 
     print("failures=%d" % fails)
     if scratch is None:

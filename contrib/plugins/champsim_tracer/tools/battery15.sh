@@ -778,6 +778,46 @@ PYEOF
     fi
 fi
 
+# ---- THE MANDATORY ROWS ---------------------------------------------------
+# A mandatory row that was not selected is RED, with its reason on the
+# record.  --rows stays useful for chasing one row; it just cannot produce a
+# green transcript while a row that guards the wire went unrun.
+for m in $MANDATORY; do
+    selected "$m" || record "$m" 2 \
+        "MANDATORY ROW NOT SELECTED -- a battery that skips it is not a bar"
+done
+
+# ---- ROW 6, RUN HERE ------------------------------------------------------
+# Defined above, invoked here: the scan is over EVERY sidecar this run
+# produced, so it must run after the last row that produces one.  Selecting
+# row 6 without the rows that write sidecars is still legal and still
+# refuses if nothing was written, which is the honest answer to "scan what
+# this run made" when the run made nothing.
+if selected 6; then
+    run_row6
+    run_row6w
+    if [ "$PLANTS" -eq 1 ]; then
+        run_row6b
+    else
+        record 6b 2 "PLANTED FIRE DESELECTED (--no-plants) -- a wide scope \
+nobody has watched fire is not evidence"
+    fi
+fi
+
+# ---- ROW 16 RUNS LAST, AND THAT IS PART OF THE ROW -----------------------
+#
+# It used to run in numeric position, before rows 6/6w/6b.  Its subject is
+# the R13 evidence root, and score.py refuses a root older than the
+# BEHAVIOUR of the binaries it claims to have measured -- so the row's answer
+# depends on when in the battery it is asked.  exec110/CORRECTIONS C2 is the
+# measured case: a regeneration arm restored generated headers by content and
+# then TOUCHED them (the standing rule that forbids `cp -p`), the next ninja
+# relinked, and two static legs scored before the tracer they describe was
+# built.  The rule that came out of it is that every leg whose guard reads
+# the binary must run after the last arm that can move one.  Inside this
+# script that means LAST: any earlier position leaves rows that write
+# sidecars, plant fires and touch tracked files still to come, and a green
+# taken before them is a green against a previous build.
 # ---- ROW 16: THE R13 EXTERNAL-TRUTH GATE, AT THIS TIP ---------------------
 #
 # THE HOLE THIS CLOSES.  R13 is a STANDING GATE by ruling -- the external
@@ -812,32 +852,6 @@ is not a directory"
         "$T/external_truth_gate.sh" "$R13_ROOT" --build-dir "$Q" \
             > "$O/r13_gate.log" 2>&1
         record 16 $? "external_truth_gate (staleness guard ARMED via --build-dir)"
-    fi
-fi
-
-# ---- THE MANDATORY ROWS ---------------------------------------------------
-# A mandatory row that was not selected is RED, with its reason on the
-# record.  --rows stays useful for chasing one row; it just cannot produce a
-# green transcript while a row that guards the wire went unrun.
-for m in $MANDATORY; do
-    selected "$m" || record "$m" 2 \
-        "MANDATORY ROW NOT SELECTED -- a battery that skips it is not a bar"
-done
-
-# ---- ROW 6, RUN HERE ------------------------------------------------------
-# Defined above, invoked here: the scan is over EVERY sidecar this run
-# produced, so it must run after the last row that produces one.  Selecting
-# row 6 without the rows that write sidecars is still legal and still
-# refuses if nothing was written, which is the honest answer to "scan what
-# this run made" when the run made nothing.
-if selected 6; then
-    run_row6
-    run_row6w
-    if [ "$PLANTS" -eq 1 ]; then
-        run_row6b
-    else
-        record 6b 2 "PLANTED FIRE DESELECTED (--no-plants) -- a wide scope \
-nobody has watched fire is not evidence"
     fi
 fi
 

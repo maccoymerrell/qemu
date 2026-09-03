@@ -319,6 +319,36 @@ static void note_vreg_mask_read(uint32_t vm)
     }
 }
 
+/*
+ * THE DESTINATION VECTOR REGISTER, WHICH IS ALSO A SOURCE.
+ *
+ * A vector instruction does not necessarily write the whole destination
+ * register group.  The RISC-V V specification gives three ways for the old
+ * contents to survive: elements past `vl` are undisturbed when `vtype.vta`
+ * is 0, masked-off elements are undisturbed when `vtype.vma` is 0, and
+ * elements below `vstart` are always undisturbed.  In each case the value
+ * the instruction leaves in `vd` is a function of the value `vd` already
+ * held, which makes the destination a source.
+ *
+ * WHICH OF THE THREE APPLIES IS MACHINE STATE -- vl, vstart and two bits of
+ * vtype -- and R16 records an ISA-defined dependency regardless of the
+ * machine state that decides whether it bites, while R17 says a conditional
+ * carries ALL of its potential sources.  So `vd` is stated on every
+ * invocation, not only on the ones where QEMU's translation-time test says
+ * the merge happens: a set that moved with `s->vl_eq_vlmax` would be one
+ * architectural question answered two ways depending on what the last
+ * `vsetvli` did.
+ *
+ * The operand walk cannot supply it either way: the GVEC arm reaches the
+ * file by offset and the helper arm by a pointer built from tcg_env, and
+ * neither is a read of the destination's bytes.
+ */
+static void note_vreg_dest_read(uint32_t vd)
+{
+    note_vreg_read(vd);
+}
+
+
 /* check functions */
 
 /*
@@ -716,12 +746,73 @@ static bool vext_check_slide(DisasContext *s, int vd, int vs2,
 }
 
 /*
+ * THE VECTOR CONFIGURATION EVERY RVV INSTRUCTION READS.
+ *
+ * `vtype` (SEW, LMUL, vta, vma, vill) and `vl` are architectural state that
+ * every vector instruction depends on: the RISC-V V specification defines
+ * each one's element width, register grouping, tail and mask behaviour and
+ * body length out of those two registers, and an instruction executed with
+ * `vtype.vill` set is reserved.  A `vxor.vv` with a different `vtype` before
+ * it computes something different from the same bytes.
+ *
+ * QEMU resolves all of that at TRANSLATION time: cpu_get_tb_cpu_state()
+ * folds SEW, LMUL, vl_eq_vlmax and vill into the TB flags, and by the time a
+ * trans_ function runs they are C variables on DisasContext.  Nothing in the
+ * op stream reads either register, so a walk of the ops reports a vector
+ * instruction that does not depend on its own configuration.
+ *
+ * This is the shape insn_dataflow_note_stated_read_env() was introduced for
+ * -- AArch64's CPACR FPEN gate, hoisted into the TB flags the same way -- and
+ * R7.4 already ruled that a gate resolved early is still a source, because a
+ * pending write to it must resolve before the instruction may proceed.  R15
+ * says the early answer is a lowering decision and not architectural truth;
+ * R16 records the dependency regardless of the machine state that makes it
+ * predictable.
+ *
+ * NOT ON `vsetvl`/`vsetvli`/`vsetivli`, and that is the line the reference
+ * draws rather than a convenience: those instructions WRITE vtype and vl and
+ * compute the new values from their operands (`vsetivli` from two
+ * immediates, reading neither register).  do_vsetvl()/do_vsetivli() do not
+ * call this function, so they state nothing here.  The one case that does
+ * read vl -- `vsetvl` with rd == 0 and rs1 == 0, "keep the current vl" --
+ * reads cpu_vl through a real op, which the walk already sees.
+ *
+ * BY RANGE, because the range IS the register: translate.c declares both
+ * under the GDB stub's own spellings (org.gnu.gdb.riscv.csr), so the
+ * declaration that names every other access to those bytes names these too.
+ * The NAME form was measured and REJECTED: named_reads[] holds four entries,
+ * an OPIVV encoding already spends three of them stating its own vector
+ * operands, and a fifth name overflows the record -- which loses not the
+ * fifth but ALL of them.  Eleven REG_VEC sources went missing on one probe
+ * before this was a range.
+ *
+ * STATED ONLY WHEN THE INSTRUCTION IS NOT RESERVED, so an encoding that
+ * raises instead of executing states nothing -- the rule the identity
+ * publish follows on every target.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_vector_config_read(void)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPURISCVState, vtype),
+        sizeof(((CPURISCVState *)0)->vtype));
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPURISCVState, vl),
+        sizeof(((CPURISCVState *)0)->vl));
+}
+
+/*
  * In cpu_get_tb_cpu_state(), set VILL if RVV was not present.
  * So RVV is also be checked in this function.
  */
 static bool vext_check_isa_ill(DisasContext *s)
 {
-    return !s->vill;
+    if (s->vill) {
+        return false;
+    }
+    note_vector_config_read();
+    return true;
 }
 
 /* common translation macro */
@@ -1329,6 +1420,7 @@ do_opivv_gvec(DisasContext *s, arg_rmrr *a, GVecGen3Fn *gvec_fn,
     note_vreg_read(a->rs1);
     note_vreg_read(a->rs2);
     note_vreg_mask_read(a->vm);
+    note_vreg_dest_read(a->rd);
 
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
         gvec_fn(s->sew, vreg_ofs(s, a->rd),
@@ -1390,6 +1482,7 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
 
     note_vreg_read(vs2);
     note_vreg_mask_read(vm);
+    note_vreg_dest_read(vd);
 
     data = FIELD_DP32(data, VDATA, VM, vm);
     data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
@@ -1425,6 +1518,18 @@ do_opivx_gvec(DisasContext *s, arg_rmrr *a, GVecGen2sFn *gvec_fn,
 {
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
         TCGv_i64 src1 = tcg_temp_new_i64();
+
+        /*
+         * The GVEC arm reaches the vector file by OFFSET rather than by
+         * pointer, and an inline gvec expansion carries no read of the
+         * source range the walk can attribute to this instruction.  Stated
+         * here so the read set is the same set the helper arm's
+         * opivx_trans() states -- a set that depends on which lowering
+         * s->vl_eq_vlmax picked is the regime-shaped answer do_opivv_gvec()
+         * already refuses to give.
+         */
+        note_vreg_read(a->rs2);
+        note_vreg_dest_read(a->rd);
 
         tcg_gen_ext_tl_i64(src1, get_gpr(s, a->rs1, EXT_SIGN));
         gvec_fn(s->sew, vreg_ofs(s, a->rd), vreg_ofs(s, a->rs2),
@@ -1549,6 +1654,18 @@ static bool opivi_trans(uint32_t vd, uint32_t imm, uint32_t vs2, uint32_t vm,
     src2 = tcg_temp_new_ptr();
     src1 = tcg_constant_tl(extract_imm(s, imm, imm_mode));
 
+    /*
+     * @imm is encoded in the instruction, so the vector operand and the
+     * governing mask are the only registers this shape names that the op
+     * stream cannot carry: both reach the helper as POINTERS built from
+     * tcg_env, which is an address computed from the environment and not a
+     * read of the bytes it addresses.  Same statement opivx_trans() makes
+     * for the same reason.
+     */
+    note_vreg_read(vs2);
+    note_vreg_mask_read(vm);
+    note_vreg_dest_read(vd);
+
     data = FIELD_DP32(data, VDATA, VM, vm);
     data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
@@ -1575,6 +1692,9 @@ do_opivi_gvec(DisasContext *s, arg_rmrr *a, GVecGen2iFn *gvec_fn,
               gen_helper_opivx *fn, imm_mode_t imm_mode)
 {
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
+        /* The GVEC arm's statement; see do_opivx_gvec() above. */
+        note_vreg_read(a->rs2);
+        note_vreg_dest_read(a->rd);
         gvec_fn(s->sew, vreg_ofs(s, a->rd), vreg_ofs(s, a->rs2),
                 extract_imm(s, a->rs1, imm_mode), MAXSZ(s), MAXSZ(s));
         finalize_rvv_inst(s);
@@ -1789,6 +1909,7 @@ static bool opivv_trans(uint32_t vd, uint32_t vs1, uint32_t vs2, uint32_t vm,
     note_vreg_read(vs1);
     note_vreg_read(vs2);
     note_vreg_mask_read(vm);
+    note_vreg_dest_read(vd);
 
     data = FIELD_DP32(data, VDATA, VM, vm);
     data = FIELD_DP32(data, VDATA, LMUL, s->lmul);

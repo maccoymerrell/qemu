@@ -1676,4 +1676,32 @@ void riscv_translate_init(void)
                                   sizeof(((CPURISCVState *)0)->elp),
                                   sizeof(((CPURISCVState *)0)->elp),
                                   1);
+
+    /*
+     * THE VECTOR CONFIGURATION, `vtype` and `vl`.
+     *
+     * note_vector_config_read() in trans_rvv.c.inc states both on every
+     * vector instruction, because QEMU folds SEW, LMUL and vill into the TB
+     * flags and no op reads either register.  The statement travels as a byte
+     * RANGE rather than as a name so that it does not consume one of the four
+     * named-read slots -- an OPIVV encoding already spends three of them on
+     * its own vector operands, and a fifth name overflows the record and
+     * loses every one of them.  Declared here so the range arrives downstream
+     * as the register instead of as an anonymous span.
+     *
+     * Both spellings are the RISC-V GDB stub's own (org.gnu.gdb.riscv.csr),
+     * so they resolve through the register table with no fold needed.  `vl`
+     * additionally has a TCG global over the same bytes, named identically,
+     * so the two routes to it answer with one word.
+     */
+    insn_dataflow_declare_regfile("vtype", NULL,
+                                  offsetof(CPURISCVState, vtype),
+                                  sizeof(((CPURISCVState *)0)->vtype),
+                                  sizeof(((CPURISCVState *)0)->vtype),
+                                  1);
+    insn_dataflow_declare_regfile("vl", NULL,
+                                  offsetof(CPURISCVState, vl),
+                                  sizeof(((CPURISCVState *)0)->vl),
+                                  sizeof(((CPURISCVState *)0)->vl),
+                                  1);
 }

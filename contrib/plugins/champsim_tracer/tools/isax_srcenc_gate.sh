@@ -50,7 +50,10 @@
 # answers nothing at all, and rc=2 is never folded into rc=0 here: an arm
 # that reaches nothing must not report all-clear.
 #
-# rc=0 every arm green, rc=1 an arm failed, rc=2 the gate could not look.
+# rc=0 every arm green, rc=1 an arm failed, rc=2 the gate could not look --
+# and "could not look" includes a BARE arm over an allowlist carrying
+# `SR-rd-*` rules, which that arm never scores.  See the NOT-A-FULL-GATE
+# roll-up in run_arms() and FINDING 65-D.
 #
 # Author: Maccoy Merrell.
 set -u
@@ -94,7 +97,7 @@ run_arms() {
       echo "ISAX_SHA=$(sha256sum "$build/contrib/plugins/isaxcheck" | cut -c1-16)"
       echo "CORPUS_DIR=${corpusdir:-<none>}"
     } >> "$out/rc.txt"
-    local worst=0 isa layer corpus r
+    local worst=0 partial=0 isa layer corpus r
     for isa in $isas; do
         corpus=""
         if [ -n "$corpusdir" ]; then
@@ -114,6 +117,25 @@ run_arms() {
             [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
             grep -hE '^# srcenc=|^# srcenc_join ' "$out/${layer:0:1}_$isa.txt" \
                 >> "$out/rc.txt" 2>/dev/null
+            # THE PARTIALITY OF A BARE ARM IS STATED, NOT INFERRED.
+            # isaxcheck exempts the `SR-rd-*` family from its dead-rule
+            # detector in a bare arm, because a bare arm never scores that
+            # family -- correct, and silent.  FINDING 65-D: two mipsel
+            # `SR-rd-phantom` rows landed DEAD, the eight standing bare arms
+            # all reported `dead_allow_rules=0`, and exec110's table quoted
+            # that eight times.  A bare arm is not a full gate over an
+            # allowlist carrying rules it cannot reach, and it says so here.
+            local sup
+            sup=$(sed -n 's/.*superseded_allow_rules=\([0-9]*\).*/\1/p' \
+                  "$out/${layer:0:1}_$isa.txt" | head -1)
+            if [ -z "$corpus" ] && [ -n "${sup:-}" ] && [ "${sup:-0}" -gt 0 ]; then
+                echo "  NOT-A-FULL-GATE $layer $isa: $sup allowlist rule(s)" \
+                     "in SR-rd-* are UNSCORED by a bare arm -- their" \
+                     "dead/live state is unknown here.  Run this gate as" \
+                     "\`run <build> <out> <corpus>\` to score them." \
+                     >> "$out/rc.txt"
+                partial=$((partial+1))
+            fi
             # Only a --srcenc arm has a reach to report.  `grep -c` exits 1
             # on zero matches, so its status is discarded rather than turned
             # into a second count by an `|| echo`.
@@ -131,7 +153,11 @@ run_arms() {
             fi
         done
     done
-    echo "ALL_ARMS_DONE worst_rc=$worst" >> "$out/rc.txt"
+    echo "ALL_ARMS_DONE worst_rc=$worst unscored_arms=$partial" >> "$out/rc.txt"
+    # An arm that could not look at part of its allowlist is the gate's own
+    # rc=2 case -- "could not look" -- not a pass.  Rolling it up as rc=0 is
+    # what let 65-D's two rows through a gate built to catch them.
+    [ "$partial" -gt 0 ] && [ "$worst" = 0 ] && worst=2
     cat "$out/rc.txt"
     return $worst
 }
@@ -180,6 +206,26 @@ SH
     grep -q 'ISAX_DUMP_UNREACHED' "${BASH_SOURCE[0]}" \
         && echo "PASS  G the unreached dump is armed by the gate itself" \
         || { echo "FAIL  G"; f=$((f+1)); }
+    # H/I: FINDING 65-D.  A bare arm over an allowlist carrying rules it
+    # never scores is not a pass, and the count has to be the tool's own.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=327 unscored_family=SR-rd-* ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o7" "" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  H a BARE arm with unscored allowlist rules is rc=2, not rc=0" \
+               || { echo "FAIL  H"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE boundary x86_64: 327 ' "$t/o7/rc.txt" \
+        && echo "PASS  I and the unscored count is NAMED with its arm" \
+        || { echo "FAIL  I"; f=$((f+1)); }
+    # J: the same arm WITH a corpus is a full gate and stays green.
+    run_arms "$t/b" "$t/o8" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 0 ] && echo "PASS  J the same arm WITH a corpus rolls up rc=0" \
+               || { echo "FAIL  J"; f=$((f+1)); }
     rm -rf "$t"
     echo "isax_srcenc_gate selftest: $f failure(s)"
     [ "$f" = 0 ] || return 1

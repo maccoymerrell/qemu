@@ -3789,14 +3789,44 @@ int main(int argc, char **argv)
         else dead.push_back(&r);
     }
 
+    /*
+     * SUPERSESSION IS REPORTED ON THE SUMMARY LINE, IN EVERY ARM.
+     *
+     * The count used to be printed only under `--srcenc`, on the reach line.
+     * That put it where a bare arm never prints it, and a bare arm is the
+     * one that needs it: `is_superseded_key()` above exempts the whole
+     * `SR-rd-*` family from the dead-rule detector in a bare arm, correctly
+     * -- an arm that never asks a question cannot call the answer stale --
+     * but nothing on the line said so, so a bare arm's `dead_allow_rules=0`
+     * read as "every rule in this allowlist is live".
+     *
+     * MEASURED (FINDING 65-D, PASS 65).  Two mipsel `SR-rd-phantom` rows
+     * landed dead: reached by nothing, licensing nothing.  The `--srcenc`
+     * census named them the day they landed.  The eight STANDING R13 static
+     * arms are bare, and all eight reported `dead_allow_rules=0`; exec110's
+     * table quoted that eight times.  The rows survived a pass inside a gate
+     * whose whole purpose is to find them.
+     *
+     * So the number moves to the line that is read, and it is joined by the
+     * NAME of the family this arm did not score.  `dead_allow_rules=0
+     * superseded_allow_rules=235 unscored_family=SR-rd-*` cannot be misread
+     * as an all-clear over the whole allowlist; `dead_allow_rules=0
+     * superseded_allow_rules=0 unscored_family=-` can, and is one.
+     */
+    const char *unscored_family =
+        superseded.empty() ? "-"
+                           : (srcenc_path ? "R-rd-*,FR-rd-*" : "SR-rd-*");
+
     /* subtarget_gap only means anything where an LLVM rejection is one of
      * the outcomes.  --fixups compares the tracer against itself. */
     if (layer == LAYER_FIXUPS)
         printf("# isa=%s layer=fixups encodings_tried=%lu "
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
-               "dead_allow_rules=%zu\n",
+               "dead_allow_rules=%zu superseded_allow_rules=%zu "
+               "unscored_family=%s\n",
                cfg.name, total_tried, buckets.size(),
-               buckets.size() - unallowed, unallowed, dead.size());
+               buckets.size() - unallowed, unallowed, dead.size(),
+               superseded.size(), unscored_family);
     else
     {
         unsigned long size_gap_encodings = 0;
@@ -3804,20 +3834,21 @@ int main(int argc, char **argv)
         printf("# isa=%s layer=%s encodings_tried=%lu "
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
                "subtarget_gap=%lu/%lu size_gap=%zu/%lu "
-               "dead_allow_rules=%zu ambiguous_reg_tokens=%u\n",
+               "dead_allow_rules=%zu superseded_allow_rules=%zu "
+               "unscored_family=%s ambiguous_reg_tokens=%u\n",
                cfg.name, layer == LAYER_FIELDS ? "fields" : "boundary",
                total_tried, buckets.size(),
                buckets.size() - unallowed, unallowed,
                gap_sigs, gap_encodings,
                size_gap_by_mnem.size(), size_gap_encodings,
-               dead.size(), regmap_ambiguous_tokens);
+               dead.size(), superseded.size(), unscored_family,
+               regmap_ambiguous_tokens);
         if (srcenc_path) {
             unsigned long tot = srcenc_covered + srcenc_unreached;
             printf("# srcenc=%s corpus_encodings=%zu "
                    "srcenc_reach_encodings=%lu/%lu (%.4f%%) "
                    "srcenc_reach_mnemonics=%zu/%zu (%.2f%%) "
-                   "mnemonics_wholly_unreached=%zu "
-                   "superseded_allow_rules=%zu\n",
+                   "mnemonics_wholly_unreached=%zu\n",
                    srcenc_path, srcenc_map.size(),
                    srcenc_covered, tot,
                    tot ? 100.0 * (double)srcenc_covered / (double)tot : 0.0,
@@ -3825,8 +3856,7 @@ int main(int argc, char **argv)
                    srcenc_mnem_all.size()
                      ? 100.0 * (double)srcenc_mnem_hit.size() /
                        (double)srcenc_mnem_all.size() : 0.0,
-                   srcenc_mnem_all.size() - srcenc_mnem_hit.size(),
-                   superseded.size());
+                   srcenc_mnem_all.size() - srcenc_mnem_hit.size());
             /*
              * THE JOIN LINE.  Printed unconditionally, next to the reach
              * line, because a residue and the population it was scored over

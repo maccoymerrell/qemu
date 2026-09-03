@@ -9566,11 +9566,27 @@ x86_64 SR-rd-missing xorw +REG_SEG2
 # REG_SYSMMU 22,320; REG_SYS 24,687; REG_SSP 2,618) -- and x86_64 REG_SSP is
 # UNANSWERABLE-TOKEN-DROPPED, which is FINDING 62-B's refuted row arriving as
 # a measurement instead of an argument.  See arc3_cov/REFERENCE_COVERAGE.md.
+#
+# TWO OF THE SEVEN WERE RETIRED THE PASS AFTER THEY LANDED (PASS 66,
+# FINDING 65-D).  A REGCOV line saying `llvm_rd=0 llvm_wr=0
+# REFERENCE-HAS-NO-OPERAND` establishes that the reference cannot answer for
+# the register.  It does NOT establish that a signature exists for a row to
+# license -- and the qualifier here is the WHOLE difference set, so a row
+# matches only where that register is the ENTIRE disagreement.  On mipsel
+# REG_SYSDBG and REG_SYSTIMER never are: their census lines (0/0/289 and
+# 0/0/128 above) are real, every one of those encodings disagrees about
+# something else as well, and the two rows matched nothing on the day they
+# landed:
+#
+#     DEAD isaxcheck_allow.txt:9575 mipsel SR-rd-phantom * +REG_SYSDBG
+#     DEAD isaxcheck_allow.txt:9576 mipsel SR-rd-phantom * +REG_SYSTIMER
+#
+# The census-coverage test above is therefore NECESSARY AND NOT SUFFICIENT,
+# and this note is the correction: a row also has to be reached.  The five
+# that remain were re-measured at retirement time and each still matches.
 # =====================================================================
 x86_64 SR-rd-phantom * +REG_SYS
 x86_64 SR-rd-phantom * +REG_SYSMMU
 x86_64 SR-rd-phantom * +REG_SYSTIMER
 riscv64 SR-rd-phantom * +REG_SYS
 mipsel SR-rd-phantom * +REG_SYSEXC
-mipsel SR-rd-phantom * +REG_SYSDBG
-mipsel SR-rd-phantom * +REG_SYSTIMER

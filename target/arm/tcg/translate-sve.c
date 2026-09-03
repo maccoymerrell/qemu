@@ -585,6 +585,17 @@ static bool gen_gvec_fn_zzi(DisasContext *s, GVecGen2iFn *gvec_fn,
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+
+        /*
+         * THE DESTINATION, stated because the expander may not emit one.
+         * The read-modify-write shifts -- USRA, SRSRA, SRI, SLI -- reduce to
+         * nothing at the shift amounts where the accumulate adds zero or the
+         * insert covers no bits, and gvec then emits no op at all.  The
+         * other forms here write Zd through the expander and the statement
+         * is the same register they already carry, so it merges rather than
+         * adds.
+         */
+        note_sve_vec_write(s, rd);
         gvec_fn(esz, vec_full_reg_offset(s, rd),
                 vec_full_reg_offset(s, rn), imm, vsz, vsz);
     }
@@ -654,6 +665,14 @@ static bool do_mov_z(DisasContext *s, int rd, int rn)
          * is not the emulator's to drop (R7.3).
          */
         note_sve_vec_read(s, rn);
+        /*
+         * AND ITS DESTINATION, for the same reason in the same arm: an
+         * elided move writes no op either, so `movprfx z0, z0` and
+         * `sqinch z31, all, mul #0` reached a consumer writing NOTHING.  The
+         * emulator's discovery that the value is already in place is a
+         * lowering fact; the architecture says the register is written.
+         */
+        note_sve_vec_write(s, rd);
         tcg_gen_gvec_mov(MO_8, vec_full_reg_offset(s, rd),
                          vec_full_reg_offset(s, rn), vsz, vsz);
     }
@@ -2142,6 +2161,29 @@ static bool trans_INCDEC_r(DisasContext *s, arg_incdec_cnt *a)
         int inc = numelem * a->imm * (a->d ? -1 : 1);
         TCGv_i64 reg = cpu_reg(s, a->rd);
 
+        if (inc == 0) {
+            /*
+             * A ZERO INCREMENT EMITS NOTHING.  tcg_gen_addi_i64() with a zero
+             * constant and ret == arg reduces to no op at all, so
+             * `incb x5, vl1` -- a real write of the value the register
+             * already holds -- left the walk nothing to find and the
+             * instruction reached a consumer writing no register.  That the
+             * emulator can prove the value does not move is a lowering fact;
+             * the architecture writes the destination either way (R16), and
+             * this is the one place the register number is still known.
+             *
+             * The value written is the one @reg was handed, which is exactly
+             * the @ts insn_dataflow_note_discarded_write() asks for.  XZR has
+             * no spelling in any namespace and travels as the zero-register
+             * identity instead, the same one cpu_reg() states above.
+             */
+            if (a->rd == 31) {
+                insn_dataflow_note_discarded_zero_write(tcgv_i64_temp(reg));
+            } else {
+                insn_dataflow_note_discarded_write(tcgv_i64_temp(reg),
+                                                   a64_reg_name(a->rd));
+            }
+        }
         tcg_gen_addi_i64(reg, reg, inc);
     }
     return true;

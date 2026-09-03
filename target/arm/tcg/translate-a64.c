@@ -622,6 +622,20 @@ static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
  * to cpu_X[31] and ZR accesses to a temporary which can be discarded.
  * This is the point of the _sp forms.
  */
+/*
+ * THE ARCHITECTURAL NAME OF A GENERAL REGISTER, for the notes that must state
+ * one.  insn_dataflow_note_discarded_write() takes a spelling rather than an
+ * index because the registers it exists for have no global to index, and an
+ * emitter in another translation unit -- translate-sve.c's zero-increment
+ * INCDEC_r -- still has to spell the register it elided a write to.  These
+ * are the same strings the TCG globals carry, which is what
+ * insn_dataflow_reg_name() would return for them.
+ */
+const char *a64_reg_name(int reg)
+{
+    return regnames[reg];
+}
+
 TCGv_i64 cpu_reg(DisasContext *s, int reg)
 {
     if (reg == 31) {

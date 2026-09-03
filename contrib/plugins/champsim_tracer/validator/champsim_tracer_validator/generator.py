@@ -57,7 +57,8 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
                        isa: str = "x86_64",
                        coverage: bool = False,
                        hot_iters: int = 0,
-                       stride_loops: bool = False) -> CFG:
+                       stride_loops: bool = False,
+                       probe_groups: tuple[str, ...] = ()) -> CFG:
     r = random.Random(hashlib.sha256(f"{seed}:cfg".encode()).digest())
 
     # StrideLoopHead is x86_64-only; ignore the request on other ISAs.
@@ -122,6 +123,25 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
             new_id = add(pname)
             nodes[prev_join].successors = [new_id]
             prev_join = new_id
+
+    # Opt-in groups, chained after the coverage probes and in the order the
+    # caller named them, so a workload that asks for one gets a stable
+    # position for it whatever else is on.  A group NO registered block
+    # declares is a typo and refused here: generating a workload silently
+    # missing the family it was asked for is exactly the shape that lets a
+    # cell pass while witnessing nothing.
+    if probe_groups:
+        known = set(B.probe_groups())
+        unknown = [g for g in probe_groups if g not in known]
+        if unknown:
+            raise ValueError(
+                "unknown probe group(s) %r; registered groups are %r"
+                % (unknown, sorted(known)))
+        for group in probe_groups:
+            for pname in B.probe_group_blocks_for_isa(isa, (group,)):
+                new_id = add(pname)
+                nodes[prev_join].successors = [new_id]
+                prev_join = new_id
 
     for _ in range(num_diamonds):
         root_id = add(B.CondBranch.name)
@@ -529,6 +549,10 @@ class GenerateParams:
     coverage: bool = False
     hot_iters: int = 0
     stride_loops: bool = False
+    # Opt-in instruction-family groups to chain in (see
+    # asm_blocks.probe_group_blocks_for_isa).  Empty by default: a group is
+    # emitted only when a workload names it.
+    probe_groups: tuple[str, ...] = ()
     marker: bool = False
     # Emit the START marker itself.  False keeps the in-window probes and
     # the END marker but omits the opening sequence, for runs where
@@ -562,6 +586,7 @@ def generate(params: GenerateParams, out_dir: Path, prog_name: str
         coverage=params.coverage,
         hot_iters=params.hot_iters,
         stride_loops=params.stride_loops,
+        probe_groups=tuple(params.probe_groups),
     )
     arena_u64 = _assign_slots(cfg)
     plans, init_values = _plan_nodes(cfg, params.seed, params.isa)

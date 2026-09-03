@@ -171,6 +171,30 @@ def coverage_probes_for_isa(isa: str) -> list[str]:
     return out
 
 
+def probe_groups() -> list[str]:
+    """Every group name any registered block declares."""
+    return sorted({cls.probe_group for cls in all_blocks()
+                   if cls.probe_group})
+
+
+def probe_group_blocks_for_isa(isa: str, groups) -> list[str]:
+    """Block names to chain in for @groups, in registration order.
+
+    A group naming no block for @isa is not an error -- FEAT_MOPS is an
+    AArch64 instruction family and asking for it on riscv64 has no answer --
+    but a group NO block declares on ANY ISA is a typo, and the caller
+    (generator._build_diamond_cfg) refuses it there rather than silently
+    generating a workload without the thing it was asked for.
+    """
+    want = set(groups or ())
+    out: list[str] = []
+    for cls in all_blocks():
+        if (cls.probe_group in want and isa in cls.supported_isas
+                and cls.num_successors == 1 and not cls.terminal):
+            out.append(cls.name)
+    return out
+
+
 def emit_data_u64(isa: str, value: int) -> list[str]:
     value &= (1 << 64) - 1
     if isa.startswith("mips"):
@@ -647,6 +671,14 @@ class CodeBlock:
     randomizable: ClassVar[bool] = True
     coverage_probe: ClassVar[bool] = True
     terminal: ClassVar[bool] = False
+    # Named opt-in group this block belongs to, or None.  A grouped block is
+    # NOT in the coverage set: `--coverage` emits every coverage probe, so a
+    # block added there changes every workload that already uses the flag,
+    # and with it every golden captured from one.  A group is the way to add
+    # an instruction family that only ONE cell should carry -- the caller
+    # asks for it by name with `--probe-group`, and no existing workload's
+    # instruction stream moves.
+    probe_group: ClassVar[str | None] = None
     # Opt-in to the dense author-intent annotator (analyze-time
     # `annotate_expected_insns`).  Set True only on blocks that decode to a
     # SINGLE true basic block — one terminal branch, no internal branch
@@ -3030,6 +3062,202 @@ def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
     _Probe.emit = _emit
     _Probe.__name__ = f"Probe_{name}"
     register(_Probe)
+
+
+# ---------------------------------------------------------------------------
+# Opt-in probe groups (`--probe-group`).  These are NOT coverage probes: a
+# coverage probe joins every `--coverage` workload, so adding one moves the
+# instruction stream of cells that already exist.  A group is emitted only
+# when it is asked for by name, which is what lets a NEW golden cell carry a
+# NEW instruction family while every captured cell stays byte-identical.
+# ---------------------------------------------------------------------------
+
+
+@register
+class MopsBulkTransferAarch64(CodeBlock):
+    """FEAT_MOPS bulk transfers: the SET triple and the forward CPY triple.
+
+    ARMv8.8's ``SETP``/``SETM``/``SETE`` and ``CPYFP``/``CPYFM``/``CPYFE``
+    are a memset and a memcpy written as three architectural instructions
+    each, and QEMU implements them with a helper that moves a page-bounded
+    chunk at a time and re-enters the same instruction until the size
+    register drains.  The tracer sees that as a self-branching
+    ``BRANCH_REP`` whose fan-out unit is one memory access, so this block
+    exercises three things no other block reaches: the MOPS fan-out itself,
+    the bulk-memory callback that reports transfers no ``qemu_ld``/
+    ``qemu_st`` ever performed, and -- the reason the cell exists -- the
+    DESTINATION LIST QEMU states for an instruction whose registers are
+    pulled back out of the syndrome at the decode site rather than named by
+    any TCG op.
+
+    THE DESTINATION REGISTER IS X30 ON PURPOSE.  The SET triple's address
+    operand is written back, so ``setp [x30]!, x2!, x4`` publishes the link
+    register as a destination.  TCG spells that register ``lr`` and the GDB
+    stub spells it ``x30``, and until 7246ce9cf6 the write paths resolved
+    the name in the stub's namespace alone and dropped every destination
+    that happened to be X30 -- publishing a list short by the register the
+    instruction exists to update.  A cell whose MOPS operand is any other
+    register cannot witness that; this one carries the published order
+    ``%gp2, %flags, %lr`` in its template dictionary, so the golden moves if
+    the fold is ever removed again.
+
+    Both buffers are carved out of the STACK rather than the arena, for
+    the reason probe_x86_load_store's ``fnstcw (%rsp)`` is: the arena is
+    the validator's ground-truth memory and every access to it is matched
+    against a declared ExpectedMemOp.  A MOPS transfer's accesses are
+    16 bytes wide and their tiling is QEMU's own page-chunking choice, so
+    declaring them would freeze an implementation decision into a golden
+    cell; the tiling already has a dedicated oracle in
+    tests/test_mops_memops.py, which asserts it as a covering rather than
+    as a list.  256 bytes of stack, destination first and source second,
+    disjoint -- which is what the forward CPY triple requires.
+    """
+    name = "mops_bulk_transfer_aarch64"
+    scratch_slots = 0
+    supported_isas = ("aarch64",)
+    randomizable = False
+    coverage_probe = False
+    probe_group = "mops"
+    #: Bytes moved by each triple (== 16 slots).
+    XFER = 128
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            # The MOPS family fans out exactly the way an x86 REP does:
+            # one self-loop iteration per body entry, each carrying ONE
+            # memory access (champsim_tracer_decode.cc sets
+            # rep_memops_per_iter = 1 for it).  So the per-execution memop
+            # SHAPE is deliberately non-uniform -- a CPYF iteration
+            # carries a load or a store and not both -- and this is the
+            # flag that says so, the same one X86RepIterationFanout sets.
+            aggregate_fanout=True,
+            # GEN_OP_MOV + BRANCH_REP is what the AArch64 mnemonic table
+            # states for the whole MOPS family; asserting both is what
+            # fails the cell if a table regeneration ever drops the rows.
+            asserted_opcodes=["MOV"],
+            asserted_branch_types=["BRANCH_REP"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        frame = 2 * cls.XFER
+        lines = _prologue(ctx.block_id) + [
+            # .arch_extension rather than .arch: it ADDS the MOPS mnemonics
+            # without resetting the base architecture the rest of the file
+            # is assembled against, and the matching `nomops` below keeps
+            # the addition from outliving this block.
+            "  .arch_extension mops",
+            f"  sub sp, sp, #{frame}",
+            "  mov x9, sp",
+            f"  add x10, sp, #{cls.XFER}",
+            # x30 is the SET triple's address operand -- see the class
+            # docstring.  The generated flow never holds lr live (nothing
+            # here returns through it), which DirectCall's `bl` already
+            # relies on.
+            "  mov x30, x9",
+            f"  mov x2, #{cls.XFER}",
+            "  mov x4, #0x5a",
+            "  setp [x30]!, x2!, x4",
+            "  setm [x30]!, x2!, x4",
+            "  sete [x30]!, x2!, x4",
+            "  mov x5, x9",
+            "  mov x6, x10",
+            f"  mov x2, #{cls.XFER}",
+            "  cpyfp [x5]!, [x6]!, x2!",
+            "  cpyfm [x5]!, [x6]!, x2!",
+            "  cpyfe [x5]!, [x6]!, x2!",
+            f"  add sp, sp, #{frame}",
+            "  .arch_extension nomops",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class SaturatingVectorGroup(CodeBlock):
+    """The saturating vector integer group, and what it reads to saturate.
+
+    AArch64 keeps FPSR.QC -- the sticky "a saturating instruction clipped a
+    result" bit -- in ``vfp.qc[]``, apart from the status words, so a gvec
+    op can raise it without a helper call.  QC is STICKY, which makes the
+    value written depend on the value held: ``sqadd`` READS the bit it may
+    set, and since 93247f8507 the wire says so (``%fcsr`` on both sides of
+    the arrow).  Two QEMU sites state it differently and BOTH are here:
+    ``gen_gvec_fn3_qc()`` hands the helper a qc POINTER, so the vector
+    ``sqdmulh`` states the write alone; ``do_int3_qc_vector_idx()`` passes
+    qc as a gvec OPERAND, so the INDEXED ``sqdmulh`` states the read too.
+    A cell carrying only one of the two shapes cannot tell them apart.
+
+    The x86_64 arm is the same instruction CLASS and deliberately not the
+    same claim: SSE integer saturation is silent -- no status register
+    records that a lane clipped -- so this arm witnesses the classification
+    (VEC_ADD/VEC_SUB/VEC_SHUF on the saturating and packing forms) and
+    stands as the contrast that makes the AArch64 status source a
+    measurement rather than an assumption.
+
+    Every operand is materialised in-block, so the values that saturate are
+    the same on every run and no arena slot is read or written.
+    """
+    name = "satvec_group"
+    scratch_slots = 0
+    supported_isas = ("x86_64", "aarch64")
+    randomizable = False
+    coverage_probe = False
+    probe_group = "satvec"
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        if ctx.isa == "aarch64":
+            ops = ["VEC_MOV", "VEC_ADD", "VEC_SUB", "VEC_MUL"]
+        else:
+            ops = ["VEC_ADD", "VEC_SUB", "VEC_SHUF"]
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_opcodes=ops,
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "aarch64":
+            lines += [
+                # 0x70 + 0x70 saturates in every signed byte lane, so QC is
+                # really set rather than merely readable.
+                "  movi v0.8b, #0x70",
+                "  movi v1.8b, #0x70",
+                "  sqadd v2.8b, v0.8b, v1.8b",
+                "  uqadd v3.8b, v0.8b, v1.8b",
+                "  sqsub v4.8b, v0.8b, v1.8b",
+                "  uqsub v5.8b, v0.8b, v1.8b",
+                # The two QC-stating shapes, in the order the commit
+                # message names them: pointer-passing then operand-passing.
+                "  sqdmulh v6.4h, v0.4h, v1.4h",
+                "  sqdmulh v7.4h, v0.4h, v1.h[0]",
+                # Accumulate-and-saturate: the destination is read as data
+                # as well as written, on top of the status read.
+                "  suqadd v2.8b, v0.8b",
+            ]
+        else:
+            lines += [
+                "  movq $0x7070707070707070, %rax",
+                "  movq %rax, %xmm0",
+                "  punpcklqdq %xmm0, %xmm0",
+                "  movdqa %xmm0, %xmm1",
+                "  paddsb %xmm1, %xmm0",
+                "  paddusb %xmm1, %xmm2",
+                "  psubsw %xmm1, %xmm3",
+                "  psubusw %xmm1, %xmm4",
+                "  packsswb %xmm1, %xmm5",
+                "  packuswb %xmm1, %xmm6",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
 
 
 # Inline-asm coverage probes live in `_probe_specs` as a flat data file:

@@ -31,6 +31,13 @@ from . import _lldet as LLDET
 from . import _must0
 from . import _stall_condition as STALL
 from . import _plugin_load as PLUGLOAD
+from . import asm_blocks as _B
+
+
+def B_PROBE_GROUPS():
+    """Group names for --help, read from the block registry so the
+    help text cannot drift from what is registered."""
+    return _B.probe_groups()
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -195,6 +202,14 @@ def _parse_args() -> argparse.Namespace:
                         "that exercises varying load/store ADDRESSES across "
                         "executions of the same template; intended for "
                         "stressing the per-execution memop encoder.")
+    g.add_argument("--probe-group", action="append", default=None,
+                   metavar="NAME", dest="probe_group",
+                   help="Chain in one opt-in instruction-family group by "
+                        "name (repeatable).  Unlike --coverage, a group is "
+                        "emitted ONLY when asked for, so naming one cannot "
+                        "move the instruction stream of a workload that "
+                        "does not name it.  Registered groups: "
+                        + ", ".join(B_PROBE_GROUPS()) + ".")
     g.add_argument("--devio-probe", type=int, default=0,
                    help="Emit N write(1, ...) console writes right after the "
                         "in-window probes, so the traced process drives a "
@@ -302,6 +317,9 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --hot-iters`.")
     al.add_argument("--stride-loops", action="store_true",
                     help="See `generate --stride-loops`.")
+    al.add_argument("--probe-group", action="append", default=None,
+                    metavar="NAME", dest="probe_group",
+                    help="See `generate --probe-group`.")
     al.add_argument("--devio-probe", type=int, default=0,
                     help="See `generate --devio-probe`.")
     al.add_argument("--sleep-probe", type=int, default=0,
@@ -612,6 +630,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         coverage=getattr(args, "coverage", False),
         hot_iters=getattr(args, "hot_iters", 0),
         stride_loops=getattr(args, "stride_loops", False),
+        probe_groups=tuple(getattr(args, "probe_group", None) or ()),
         # System-mode tracing relies on the marker firing in the workload's
         # own address space, so --system implies --marker.
         marker=getattr(args, "marker", False) or getattr(args, "system", False),

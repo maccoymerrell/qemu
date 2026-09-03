@@ -273,6 +273,7 @@ static bool gen_gvec_env_zzzz(DisasContext *s, gen_helper_gvec_4_ptr *fn,
      * in translate.h.
      */
     note_fpstatus_read(FPST_A64);
+    note_fpstatus_write(FPST_A64);
     return gen_gvec_ptr_zzzz(s, fn, rd, rn, rm, ra, data, tcg_env);
 }
 

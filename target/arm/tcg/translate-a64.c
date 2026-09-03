@@ -933,6 +933,7 @@ static void gen_gvec_op4_env(DisasContext *s, bool is_q, int rd, int rn,
      * in translate.h.
      */
     note_fpstatus_read(FPST_A64);
+    note_fpstatus_write(FPST_A64);
     tcg_gen_gvec_4_ptr(vec_full_reg_offset(s, rd),
                        vec_full_reg_offset(s, rn),
                        vec_full_reg_offset(s, rm),
@@ -6755,6 +6756,7 @@ static bool do_fmlal(DisasContext *s, arg_qrrr_e *a, bool is_s, bool is_2)
          * Same fact, same terms; see note_fpstatus_read() in translate.h.
          */
         note_fpstatus_read(FPST_A64);
+        note_fpstatus_write(FPST_A64);
         tcg_gen_gvec_3_ptr(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm), tcg_env,
@@ -7533,6 +7535,7 @@ static bool do_fmlal_idx(DisasContext *s, arg_qrrx_e *a, bool is_s, bool is_2)
 
         /* The indexed form of the same; see do_fmlal() above. */
         note_fpstatus_read(FPST_A64);
+        note_fpstatus_write(FPST_A64);
         tcg_gen_gvec_3_ptr(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm), tcg_env,

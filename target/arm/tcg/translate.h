@@ -713,6 +713,47 @@ static inline void note_fpstatus_read(ARMFPStatusFlavour flavour)
         sizeof(((CPUARMState *)0)->vfp.fp_status[0]));
 }
 
+/*
+ * THE FP STATUS THE INSTRUCTION ACCUMULATES ITS EXCEPTIONS INTO.
+ *
+ * The write twin of note_fpstatus_read(), and needed at the same sites: an
+ * FP instruction's cumulative exception bits are set by softfloat inside the
+ * helper, so the ops the translation emitted name the status POINTER and
+ * never a write of the bytes it addresses.  The register the architecture
+ * says the instruction updates is missing from the write side entirely, and a
+ * missing destination is a dependency edge that does not exist.
+ *
+ * WHICH FLAVOURS, and it is QEMU's own answer rather than a judgement made
+ * here.  vfp_get_fpsr_from_host() ORs the accrued flags of six of the eight
+ * status words into FPSR and deliberately skips FPST_AH and FPST_AH_F16,
+ * "because they are used for insns that must not set the cumulative exception
+ * bits" -- FPCR.AH == 1 is defined to suppress exactly that.  So the two AH
+ * flavours are REFUSED here: stating a write for them would put a register on
+ * the wire that the instruction does not update, which is the direction the
+ * x87 `fnop` arm was caught in at PASS 57 and the reason that arm was cut.
+ *
+ * BY RANGE, on the read note's rule: the range IS the register, named by the
+ * insn_dataflow_declare_regfile("fp_status", ...) in translate-a64.c, so one
+ * declaration names the read, the write and every ordinary access alike.
+ *
+ * WHAT IT DOES NOT SAY.  Nothing about the VALUE: the flags an execution
+ * actually raises are a property of the operands, not of the encoding, and
+ * this note is the STATIC fact that the encoding updates the register (R20).
+ * A consumer that needs the inputs reads the instruction's source list, which
+ * note_fpstatus_read() already fills with the same register.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static inline void note_fpstatus_write(ARMFPStatusFlavour flavour)
+{
+    if (flavour == FPST_AH || flavour == FPST_AH_F16) {
+        return;
+    }
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUARMState, vfp.fp_status[flavour]),
+        sizeof(((CPUARMState *)0)->vfp.fp_status[0]));
+}
+
 static inline TCGv_ptr fpstatus_ptr(ARMFPStatusFlavour flavour)
 {
     TCGv_ptr statusptr = tcg_temp_new_ptr();
@@ -749,6 +790,7 @@ static inline TCGv_ptr fpstatus_ptr(ARMFPStatusFlavour flavour)
      * Capture only; no op is emitted, altered or suppressed.
      */
     note_fpstatus_read(flavour);
+    note_fpstatus_write(flavour);
     return statusptr;
 }
 

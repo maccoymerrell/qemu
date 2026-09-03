@@ -290,6 +290,16 @@ typedef struct X86OpLeaf {
     uint16_t    slot;
 } X86OpLeaf;
 
+/*
+ * The row marker for X86OpEntry::encoded_operands.
+ *
+ * It lives here rather than beside `nolea` and the other row macros in
+ * decode-new.c.inc because every X86_OP_* site's identity IS its source line
+ * in that file (X86OpEntry::slot, and the generated cet_ident/prefetch_ident
+ * tables key on it), so a line may be edited there but not inserted.
+ */
+#define encops .encoded_operands = true,
+
 struct X86OpEntry {
     /* Based on the is_decode flags.  */
     union {
@@ -316,6 +326,21 @@ struct X86OpEntry {
     unsigned     intercept:8;
     bool         has_intercept:1;
     bool         is_decode:1;
+    /*
+     * THE ENCODING NAMES OPERANDS THIS ROW NEVER LOADS.
+     *
+     * Set on the rows whose instruction has ModRM-encoded operands that the
+     * emulator resolves and then does nothing with -- the reserved-NOP space,
+     * the prefetch groups, UD0 and UD1.  Their registers are architectural
+     * operands of the encoding (R16: a NOP semantic still has real
+     * dependencies in the chosen register), and because no op is emitted for
+     * them a walk of the op stream cannot find them.  nop_operands_note()
+     * states them; see nop_operands.c.inc for what each row's reference names.
+     *
+     * A row without the bit states nothing, so the flag is the whole scope of
+     * the statement and is greppable as such.
+     */
+    bool         encoded_operands:1;
 
     /*
      * QEMU's own identity for this table slot, handed to plugins by

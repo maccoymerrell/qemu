@@ -1337,7 +1337,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x08] = X86_OP_ENTRY0(NOP,           svm(INVD)),
     [0x09] = X86_OP_ENTRY0(NOP,           svm(WBINVD)),
     [0x0b] = X86_OP_ENTRY0(UD),           /* UD2 */
-    [0x0d] = X86_OP_ENTRY1(NOP,  M,v),    /* 3DNow! prefetch */
+    [0x0d] = X86_OP_ENTRY1(NOP,  M,v, encops), /* 3DNow! prefetch */
     [0x0e] = X86_OP_ENTRY0(EMMS,                              cpuid(3DNOW)), /* femms */
     /*
      * 3DNow!'s opcode byte comes *after* modrm and displacements, making it
@@ -1346,14 +1346,14 @@ static const X86OpEntry opcodes_0F[256] = {
      */
     [0x0f] = X86_OP_ENTRY3(3dnow,       P,q, Q,q, I,b,        cpuid(3DNOW)),
 
-    [0x18] = X86_OP_ENTRY1(NOP,  nop,v),  /* prefetch/reserved NOP */
-    [0x19] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
+    [0x18] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* prefetch/reserved NOP */
+    [0x19] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* reserved NOP */
     [0x1a] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
     [0x1b] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
-    [0x1c] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
-    [0x1d] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
-    [0x1e] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
-    [0x1f] = X86_OP_ENTRY1(NOP,  nop,v),  /* NOP/reserved NOP */
+    [0x1c] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* reserved NOP */
+    [0x1d] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* reserved NOP */
+    [0x1e] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* reserved NOP */
+    [0x1f] = X86_OP_ENTRY1(NOP,  nop,v, encops),  /* NOP/reserved NOP */
 
     [0x28] = X86_OP_ENTRY3(MOVDQ,      V,x,  None,None, W,x, vex1 p_00_66), /* MOVAPS */
     [0x29] = X86_OP_ENTRY3(MOVDQ,      W,x,  None,None, V,x, vex1 p_00_66), /* MOVAPS */
@@ -1434,7 +1434,7 @@ static const X86OpEntry opcodes_0F[256] = {
 
     [0xb8] = X86_OP_GROUP0(0FB8),
     /* decoded as modrm, which is visible as a difference between page fault and #UD */
-    [0xb9] = X86_OP_ENTRYr(UD,     nop,v),                        /* UD1 */
+    [0xb9] = X86_OP_ENTRYr(UD,     nop,v, encops),                        /* UD1 */
     [0xba] = X86_OP_GROUP2(group8, E,v, I,b),
     [0xbb] = X86_OP_ENTRY2(BTC,    E,v, G,v,             btEvGv),
     [0xbc] = X86_OP_GROUP0(0FBC),
@@ -1477,7 +1477,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xfc] = X86_OP_ENTRY3(PADDB,  V,x, H,x, W,x,  vex4 mmx avx2_256 p_00_66),
     [0xfd] = X86_OP_ENTRY3(PADDW,  V,x, H,x, W,x,  vex4 mmx avx2_256 p_00_66),
     [0xfe] = X86_OP_ENTRY3(PADDD,  V,x, H,x, W,x,  vex4 mmx avx2_256 p_00_66),
-    [0xff] = X86_OP_ENTRYr(UD,     nop,v),                        /* UD0 */
+    [0xff] = X86_OP_ENTRYr(UD,     nop,v, encops),                        /* UD0 */
 };
 
 static void do_decode_0F(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -2657,6 +2657,14 @@ illegal:
  */
 #include "threednow_ident.c.inc"
 
+/*
+ * The operands the reserved-NOP, prefetch and UD0/UD1 rows name and never
+ * load.  Included below every X86_OP_* site in this file -- last site line
+ * 1932 -- so no slot is renumbered, and after the two ident files because
+ * it asks them which arm an encoding reached.
+ */
+#include "nop_operands.c.inc"
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2971,6 +2979,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
                       (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
     prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
     threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
+    nop_operands_note(s, &decode);  /* nop_operands */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

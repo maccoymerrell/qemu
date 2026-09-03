@@ -3798,9 +3798,25 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
             if access & 2:
                 add(exp_dst, tile)
             add(exp_src, int(getattr(sme, "slice_reg", 0) or 0))
-        # The FEAT_MOPS prologue reads the PSTATE.NZCV it then rewrites.
-        if mnem.startswith(("cpyp", "cpyfp", "setp", "setgp")):
-            add(exp_src, _a64.AARCH64_REG_NZCV)
+        # THE FEAT_MOPS PROLOGUE DOES NOT READ PSTATE.NZCV, and this is
+        # where a rule saying it does used to stand.  It was added as a
+        # mirror of a `disas/capstone.c` repair -- that file has exactly
+        # one MOPS repair, cap_aarch64_is_mops_set's store-access fix, and
+        # never had this one -- so the oracle demanded a source no layer
+        # supplies and every MOPS prologue in a trace failed against a
+        # register nobody wrote.
+        #
+        # The architecture is the other way round: the P instruction WRITES
+        # NZCV to say which option the implementation chose, and the M and E
+        # instructions READ it back to check.  QEMU says the same thing in
+        # its own code -- do_setp() / do_cpyp() end with "Set NZCV = 0000 to
+        # indicate we are an Option A implementation" and never consult the
+        # flags, while do_setm()/do_cpym() call check_mops_wrong_option(),
+        # whose whole body is a test of env->CF --
+        # and so does raw Capstone, which reports regs_read [] on `setp` and
+        # regs_read [nzcv] on `setm`/`sete`.  Nothing to mirror, so nothing
+        # is added: the write side is already in Capstone's regs_write and
+        # the read side is already in the M/E forms' regs_read.
         # R7.3: the zero register an alias spelling hides, and the one
         # the encoding pins.  Both halves of 0fae66d3d2's boundary repair.
         _a64_restore_alias_zero_reg(d, add, exp_src, exp_dst)

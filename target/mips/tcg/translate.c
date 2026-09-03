@@ -18474,6 +18474,29 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R2);
             /*
+             * THE BASE REGISTER.
+             *
+             * MIPS64 Vol II, SYNCI: "vAddr <- GPR[base] + sign_extend(offset)"
+             * -- the effective address names the base register, and the
+             * instruction is defined in terms of it whether or not the
+             * implementation has a cache to act on.  QEMU synchronises by
+             * ending the TB and emits no address computation at all, so no op
+             * reads the register and a walk of the op stream finds `synci`
+             * reading nothing.  R16 records the ISA-defined dependency
+             * regardless of the semantics the emulator gives it, and R15 says
+             * dropping the address computation is a lowering decision rather
+             * than architectural truth.
+             *
+             * Stated by the byte range that IS the register, so the
+             * declaration naming every other access to those bytes names this
+             * one; `rt` is the hint field and not a register, and is not
+             * stated.  Capture only.
+             */
+            insn_dataflow_note_stated_read_env(
+                offsetof(CPUMIPSState, active_tc.gpr[0]) +
+                rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
+                sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
+            /*
              * Break the TB to be able to sync copied instructions
              * immediately.
              */
@@ -19179,6 +19202,31 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             gen_loongson_lswc2(ctx, rt, rs, rd);
         } else {
             /* OPC_LWC2, OPC_SWC2 */
+            /*
+             * THE BASE REGISTER OF A COPROCESSOR-2 LOAD OR STORE, and the
+             * translator's own word that the raise is not the instruction.
+             *
+             * MIPS64 Vol II defines LWC2/SWC2 (and LDC2/SDC2 below) with
+             * "vAddr <- GPR[base] + sign_extend(offset)", so the base
+             * register is an operand of the encoding.  QEMU models no
+             * coprocessor 2 on these models and raises Coprocessor Unusable
+             * instead, which emits the raise's dataflow and none of the
+             * instruction's -- so a walk of the op stream finds a load that
+             * reads no address register at all.  R16 records the ISA-defined
+             * dependency regardless of the machine state (Status.CU2) that
+             * decides whether the access is permitted, and R15 says the
+             * emulator's decision to raise instead is a lowering fact.
+             *
+             * The refusal is stated beside it for the reason the MDMX arm
+             * states one: a consumer needs to read the missing dataflow as
+             * an unimplemented coprocessor rather than as an instruction
+             * that touches nothing.  Both are capture only.
+             */
+            insn_dataflow_note_stated_read_env(
+                offsetof(CPUMIPSState, active_tc.gpr[0]) +
+                rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
+                sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
+            insn_dataflow_note_translation_refused();
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
@@ -19202,6 +19250,12 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             gen_loongson_lsdc2(ctx, rt, rs, rd);
         } else {
             /* OPC_LWC2, OPC_SWC2 */
+            /* The base register and the refusal; see the LWC2 arm above. */
+            insn_dataflow_note_stated_read_env(
+                offsetof(CPUMIPSState, active_tc.gpr[0]) +
+                rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
+                sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
+            insn_dataflow_note_translation_refused();
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }

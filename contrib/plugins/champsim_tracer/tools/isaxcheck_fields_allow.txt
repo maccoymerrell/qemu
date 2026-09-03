@@ -2743,7 +2743,6 @@ x86_64 FB-flow-presence sysexitl cs-yes llvm-no
 x86_64 FB-flow-presence sysexitq cs-yes llvm-no
 x86_64 FB-flow-presence sysretl cs-yes llvm-no
 x86_64 FB-flow-presence sysretq cs-yes llvm-no
-x86_64 FB-flow-presence ud2 cs-yes llvm-no
 x86_64 FB-flow-presence vmcall cs-yes llvm-no
 x86_64 FB-flow-presence vmmcall cs-yes llvm-no
 x86_64 FB-flow-presence xbegin cs-no llvm-yes
@@ -2752,7 +2751,6 @@ x86_64 FM-cs-mem-llvm-none iretq
 x86_64 FM-cs-mem-llvm-none iretw
 x86_64 FM-llvm-mem-cs-none int load store
 x86_64 FM-llvm-mem-cs-none int3 load store
-x86_64 FM-llvm-mem-cs-none ud2 load
 x86_64 FR-rd-phantom int +REG_FLAGS,REG_SP
 x86_64 FR-rd-phantom int3 +REG_FLAGS,REG_SP
 x86_64 FR-rd-phantom iretl +REG_FLAGS,REG_SEG5,REG_SP
@@ -6878,8 +6876,6 @@ aarch64 FR-rd-phantom zero +REG_SYSFPEN,REG_VCTRL
 #     allowed.  It goes dead under the deletion because the read comparison's
 #     SUBJECT vanishes there, not because the disagreement stopped happening
 #     -- which is the distinction tools/isax_srcenc_gate.sh exists to draw.
-x86_64 FB-flow-presence ud1 cs-yes llvm-no
-x86_64 FM-llvm-mem-cs-none ud1 load
 x86_64 FR-rd-missing cmpxchg16b +REG_SEG0
 x86_64 FR-rd-missing cmpxchg16b +REG_SEG1
 x86_64 FR-rd-missing cmpxchg8b +REG_SEG0
@@ -7726,3 +7722,40 @@ x86_64 SR-rd-missing xorl +REG_SEG0
 x86_64 SR-rd-missing xorl +REG_SEG2
 x86_64 SR-rd-missing xorw +REG_SEG0
 x86_64 SR-rd-missing xorw +REG_SEG2
+
+# =====================================================================
+# THE #UD ROWS -- THE OPCODE THE TRACER REFUSES BY RULE (PASS 66)
+#
+# UD0, UD1 and UD2 published `GEN_OP_SYSCALL` until 7773e9a469.  They raise
+# #UD, `GEN_OP_SYSCALL` is the name of a DIFFERENT trap, and the shared
+# vocabulary has no word for an invalid-opcode fault -- so the ruled row now
+# REFUSES the opcode and publishes `GEN_OP_UNKNOWN`, keeping the separately
+# true `BRANCH_SYSCALL_TYPE` seal.
+#
+# The fields layer sees that refusal as `FU-unclassified`, which is the
+# CORRECT report and the intended one: the tracer states no class for these
+# encodings, and the gate saying so is the refusal arriving where it should.
+# These two rows allow that signature and name the ruling as the reason;
+# they are not excusing a gap the tracer failed to fill.
+#
+# FOUR ROWS WERE RETIRED FOR THIS, and the sequence is worth recording.
+# They excused the signatures the OLD class produced --
+# `FB-flow-presence ud{1,2} cs-yes llvm-no` and
+# `FM-llvm-mem-cs-none ud{1,2} load` -- and they went dead the moment the
+# class changed, because the disagreement they described stopped being
+# published.  Nothing was looking for that: the eight STANDING isax arms are
+# bare, a bare arm reports `dead_allow_rules=0` over rules it never scores,
+# and this pass had just finished making that visible (474a32ec7c, FINDING
+# 65-D).  The `--srcenc` arm named all four the first time it ran after the
+# change.
+#
+# AND UD0 IS NOT HERE, WHICH IS THE SAME LESSON AGAIN.  A row for it was
+# written with these two, on the symmetry that the ruling covers all three
+# encodings -- and the gate reported it DEAD on the next run, because UD0
+# (0F FF) is not in the corpus and the row licensed nothing.  That is
+# exactly the mistake FINDING 65-D retired two mipsel rows for: a
+# justification is necessary and a row also has to be REACHED.  The ruling
+# still covers UD0; an allowlist row is not where that is recorded.
+# =====================================================================
+x86_64 FU-unclassified ud1
+x86_64 FU-unclassified ud2

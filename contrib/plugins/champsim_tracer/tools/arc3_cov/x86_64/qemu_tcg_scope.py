@@ -111,10 +111,19 @@ class QemuFacts(object):
         i = self.decode.index('X86OpEntry opcodes_0F[256]')
         t = self.decode[i:self.decode.index('\n};', i)]
         out = set()
+        # THE CITED FACT IS THE OPERAND FORM AND THE ABSENCE OF A cpuid()
+        # GATE -- not the punctuation after them.  These entries carry a FLAG
+        # LIST now (`X86_OP_ENTRY1(NOP, nop,v, encops)`, landed 4d9ec8775e so
+        # the reserved-NOP space states the ModRM register it encodes), and a
+        # pattern that required the close-paren immediately after `,v` read
+        # that as the whole scope citation going stale.  It had not: 0F 1E and
+        # 0F 0D are still ungated NOP entries.  So the flags are PARSED and the
+        # gate is asked of them, which is the fact the citation rests on.
         for line in t.splitlines():
             m = re.match(r'\s*\[(0x[0-9a-f]{2})\] = X86_OP_ENTRY1\(NOP,'
-                         r'\s*(?:nop|M),v\)(.*)', line)
-            if m and 'cpuid(' not in m.group(2):
+                         r'\s*(?:nop|M),v\s*(,[^)]*)?\)(.*)', line)
+            if m and 'cpuid(' not in (m.group(2) or '') \
+                 and 'cpuid(' not in m.group(3):
                 out.add(m.group(1)[2:])
         return out
 
@@ -150,8 +159,14 @@ class QemuFacts(object):
         return bool(re.search(r'\[0xD5\] = X86_OP_ENTRY2\(AAD', self.decode))
 
     def prefetch_is_memory_only(self):
-        """0F 0D is implemented, ungated, and takes a memory operand only."""
-        return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\)',
+        """0F 0D is implemented, ungated, and takes a memory operand only.
+
+        The assertion is on the OPERAND FORM -- `M,v`, memory only -- which is
+        what OPERAND-FORM-REFUSED cites when it declines the register form.  A
+        trailing flag list does not touch that, so the pattern stops at the
+        operand form rather than at the entry's closing paren.
+        """
+        return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
                               self.decode))
 
     def supports(self, cpuid_symbol):

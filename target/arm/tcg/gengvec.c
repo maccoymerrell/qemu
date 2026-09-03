@@ -31,6 +31,22 @@ static void gen_gvec_fn3_qc(uint32_t rd_ofs, uint32_t rn_ofs, uint32_t rm_ofs,
 
     tcg_debug_assert(opr_sz <= sizeof_field(CPUARMState, vfp.qc));
     tcg_gen_addi_ptr(qc_ptr, tcg_env, offsetof(CPUARMState, vfp.qc));
+    /*
+     * FPSR.QC, WRITTEN.  These helpers are handed a POINTER to vfp.qc and
+     * raise the saturation bit through it, so the ops name an address
+     * computed from tcg_env and never a write of the bytes it addresses --
+     * the same shape fpstatus_ptr() is in on the other status word, and
+     * answered the same way.  The range is named by the
+     * insn_dataflow_declare_regfile("fpsr_qc", ...) in translate-a64.c.
+     *
+     * The sibling expanders below pass vfp.qc as a gvec OPERAND rather than
+     * as a pointer, and the expander states its direction itself; only this
+     * one owes a statement.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_write_env(offsetof(CPUARMState, vfp.qc),
+                                        sizeof_field(CPUARMState, vfp.qc));
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, qc_ptr,
                        opr_sz, max_sz, 0, fn);
 }

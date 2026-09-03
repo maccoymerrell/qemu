@@ -616,6 +616,16 @@ uint8_t fold_nonarch(const char *name)
      * the generator's standing rule for a control-and-status file that
      * cannot be split into control and status halves is REG_FCSR.
      */
+    /*
+     * FPSR.QC, the cumulative saturation bit, DECLARED by translate-a64.c as
+     * a range of its own because QEMU stores it apart from the rest of the
+     * status word.  It is the same architectural register as the file below
+     * -- FPSR bit 27 -- and reaches the same word by the same rule; the two
+     * spellings exist because the two byte ranges do.
+     */
+    if (!strcmp(name, "fpsr_qc")) {
+        return REG_FCSR;
+    }
     if (!strncmp(name, "fp_status", 9)) {
         /*
          * A PREFIX, because a declared file of more than one element is

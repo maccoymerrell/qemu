@@ -1353,6 +1353,30 @@ TRANS_FEAT(INDEX_rr, aa64_sve, do_index, a->esz, a->rd,
  *** SVE Stack Allocation Group
  */
 
+/*
+ * A GENERAL-REGISTER WRITE AN IDENTITY ADD ELIDES.
+ *
+ * `addvl x0, x0, #0` and its three siblings lower to
+ * tcg_gen_addi_i64(rd, rn, 0); with rd and rn the same global that emits no
+ * op at all, and the instruction reached a consumer writing nothing.  The
+ * architecture writes the destination whatever the immediate is (R16), and
+ * this is the only place the register number is still known.
+ *
+ * These are the _sp forms, so register 31 is the STACK POINTER and a real
+ * global -- a64_reg_name() spells it "sp" -- and the zero-register identity
+ * does not apply.  The value written is the one the register already holds,
+ * which is exactly the @ts insn_dataflow_note_discarded_write() asks for.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_elided_addvl_write(int rd, int rn, int imm, TCGv_i64 reg)
+{
+    if (imm == 0 && rd == rn) {
+        insn_dataflow_note_discarded_write(tcgv_i64_temp(reg),
+                                           a64_reg_name(rd));
+    }
+}
+
 static bool trans_ADDVL(DisasContext *s, arg_ADDVL *a)
 {
     if (!dc_isar_feature(aa64_sve, s)) {
@@ -1361,6 +1385,8 @@ static bool trans_ADDVL(DisasContext *s, arg_ADDVL *a)
     if (sve_access_check(s)) {
         TCGv_i64 rd = cpu_reg_sp(s, a->rd);
         TCGv_i64 rn = cpu_reg_sp(s, a->rn);
+
+        note_elided_addvl_write(a->rd, a->rn, a->imm, rd);
         tcg_gen_addi_i64(rd, rn, a->imm * vec_full_reg_size(s));
     }
     return true;
@@ -1374,6 +1400,8 @@ static bool trans_ADDSVL(DisasContext *s, arg_ADDSVL *a)
     if (sme_enabled_check(s)) {
         TCGv_i64 rd = cpu_reg_sp(s, a->rd);
         TCGv_i64 rn = cpu_reg_sp(s, a->rn);
+
+        note_elided_addvl_write(a->rd, a->rn, a->imm, rd);
         tcg_gen_addi_i64(rd, rn, a->imm * streaming_vec_reg_size(s));
     }
     return true;
@@ -1387,6 +1415,8 @@ static bool trans_ADDPL(DisasContext *s, arg_ADDPL *a)
     if (sve_access_check(s)) {
         TCGv_i64 rd = cpu_reg_sp(s, a->rd);
         TCGv_i64 rn = cpu_reg_sp(s, a->rn);
+
+        note_elided_addvl_write(a->rd, a->rn, a->imm, rd);
         tcg_gen_addi_i64(rd, rn, a->imm * pred_full_reg_size(s));
     }
     return true;
@@ -1400,6 +1430,8 @@ static bool trans_ADDSPL(DisasContext *s, arg_ADDSPL *a)
     if (sme_enabled_check(s)) {
         TCGv_i64 rd = cpu_reg_sp(s, a->rd);
         TCGv_i64 rn = cpu_reg_sp(s, a->rn);
+
+        note_elided_addvl_write(a->rd, a->rn, a->imm, rd);
         tcg_gen_addi_i64(rd, rn, a->imm * streaming_pred_reg_size(s));
     }
     return true;

@@ -178,6 +178,32 @@ void a64_translate_init(void)
                                   ARRAY_SIZE(((CPUARMState *)0)->vfp.fp_status));
 
     /*
+     * FPSR.QC, the CUMULATIVE SATURATION bit, which the saturating vector
+     * integer instructions write.
+     *
+     * QEMU keeps it apart from the rest of the status word -- vfp.qc[] is a
+     * four-word vector so a gvec op can OR into it without a helper call --
+     * and the ops that write it name the range, not a global, so without a
+     * declaration the write arrived as an anonymous CPUArchState range and
+     * `sqadd v0.8b, v0.8b, v1.8b` published no status destination at all.
+     *
+     * IT IS THE SAME ARCHITECTURAL REGISTER as the file declared above:
+     * FPSR bit 27, held where the vector code can reach it.  The spelling is
+     * separate because the BYTES are separate, and champsim_tracer's
+     * fold_nonarch() is where both meet REG_FCSR, on the generator's standing
+     * rule for a control-and-status file that cannot be split.
+     *
+     * DECLARED AS ONE REGISTER, not four: the four words are one bit's
+     * storage, ORed together by vfp_get_fpsr(), and numbering them would put
+     * four registers into a namespace the architecture gives one.
+     */
+    insn_dataflow_declare_regfile("fpsr_qc", NULL,
+                                  offsetof(CPUARMState, vfp.qc),
+                                  sizeof(((CPUARMState *)0)->vfp.qc),
+                                  sizeof(((CPUARMState *)0)->vfp.qc),
+                                  1);
+
+    /*
      * GCR_EL1, the tag-generation control `irg` reads.
      *
      * Same shape as the thread pointer: a real env load with no TCG global
@@ -5585,6 +5611,22 @@ static bool trans_EXTR(DisasContext *s, arg_extract *a)
          * tcg shl_i32/shl_i64 is undefined for 32/64 bit shifts,
          * so an extract from bit 0 is a special case.
          */
+        if (a->sf && a->rd == a->rm) {
+            /*
+             * `extr xd, xn, xd, #0` is `mov xd, xd`, and tcg_gen_mov_i64()
+             * with one global for both ends emits nothing.  The architecture
+             * writes Xd; that the emulator can prove the value is already
+             * there is a lowering fact (R16), and this is the only place the
+             * register number is still known.  The value written is the one
+             * the register already holds, which is the @ts the note asks for.
+             */
+            if (a->rd == 31) {
+                insn_dataflow_note_discarded_zero_write(tcgv_i64_temp(tcg_rd));
+            } else {
+                insn_dataflow_note_discarded_write(tcgv_i64_temp(tcg_rd),
+                                                   a64_reg_name(a->rd));
+            }
+        }
         if (a->sf) {
             tcg_gen_mov_i64(tcg_rd, cpu_reg(s, a->rm));
         } else {
@@ -7603,6 +7645,17 @@ static bool do_int3_qc_vector_idx(DisasContext *s, arg_qrrx_e *a,
 {
     assert(a->esz == MO_16 || a->esz == MO_32);
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, WRITTEN.  vfp.qc is passed here as the FOURTH gvec
+         * operand rather than as the destination, so the expander states it
+         * as a read and the helper raises the saturation bit through the
+         * pointer it was handed.  The sibling expanders in gengvec.c pass it
+         * as the operand a tcg_gen_gvec_4() writes and owe nothing; this
+         * one, and gen_gvec_fn3_qc()'s pointer form, do.
+         */
+        insn_dataflow_note_stated_write_env(offsetof(CPUARMState, vfp.qc),
+                                            sizeof_field(CPUARMState,
+                                                         vfp.qc));
         tcg_gen_gvec_4_ool(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm),

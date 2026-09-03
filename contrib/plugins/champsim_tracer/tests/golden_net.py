@@ -133,6 +133,65 @@ WORKLOADS = [
     # excluding the case.
     {"name": "w9_tbflush",   "seed": "0x0909", "isas": ["x86_64"],
      "args": ["--diamonds", "64", "--regdata", "--tb-size", "1"]},
+    # THE TWO CELLS ADDED FOR THE FAMILIES NO CELL CARRIED (R22).
+    #
+    # Two wire-changing commits landed against instruction families the net
+    # had no subject for, and both said so in their own messages: "A golden
+    # covering FEAT_MOPS bulk ops on aarch64 would move by that reordering;
+    # none was recaptured" (7246ce9cf6) and "THE WIRE'S SOURCE LIST GROWS
+    # ... No golden was recaptured" (93247f8507).  A net whose green cannot
+    # be moved by a change to the wire is a green about something else.
+    #
+    # Neither family is reachable from --coverage, and putting them there
+    # would move w3_coverage and w8_repregs.  They arrive through
+    # --probe-group instead: an opt-in chain emitted only when named, so
+    # every cell that already exists is byte-for-byte untouched.
+    #
+    # The `witness` key is what makes each cell demonstrably about its
+    # subject.  A hash says "these bytes"; a witness says WHICH published
+    # register list those bytes have to contain, in the decode's own words,
+    # and it is asserted at capture AND at check.  A generator change that
+    # dropped the block, or an ISA whose assembler quietly refused the
+    # mnemonics, would leave the hashes internally consistent and the cell
+    # about nothing -- that is the failure this key exists to make loud.
+    {"name": "w10_mops",     "seed": "0x0a0a", "isas": ["aarch64"],
+     "args": ["--diamonds", "4", "--regdata", "--probe-group", "mops"],
+     "witness": {"aarch64": [
+         # setp: the destination list carries the link register, and its
+         # ORDER is what 7246ce9cf6 changed.  Before that commit the write
+         # paths resolved X30 in the GDB-stub namespace alone and dropped
+         # it, publishing a list short by the register the instruction
+         # exists to update.
+         r"rep\s+%lr, %gp4, %gp2 -> %gp2, %flags, %lr",
+         # setm / sete: the option flags the prologue wrote, read back.
+         r"rep\s+%gp2, %gp4, %lr, %flags -> %lr, %gp2",
+         # cpyfp, and its main/epilogue partners.
+         r"rep\s+%gp5, %gp6, %gp2 -> %gp2, %flags, %gp5, %gp6",
+         r"rep\s+%gp2, %gp5, %gp6, %flags -> %gp5, %gp6, %gp2",
+     ]}},
+    {"name": "w11_satvec",   "seed": "0x0b0b", "isas": ["aarch64", "x86_64"],
+     "args": ["--diamonds", "4", "--regdata", "--probe-group", "satvec"],
+     "witness": {"aarch64": [
+         # sqadd / sqsub: FPSR.QC is sticky, so the saturating forms READ
+         # the bit they may set -- the source 93247f8507 added.
+         r"vadd\s+%v0, %v1, %fcsr, %sysfpen -> %fcsr, %v2",
+         r"vsub\s+%v0, %v1, %fcsr, %sysfpen -> %fcsr, %v4",
+         # The two QEMU sites that state QC differently, side by side:
+         # gen_gvec_fn3_qc() passes a POINTER (the vector form states the
+         # write alone) and do_int3_qc_vector_idx() passes qc as a gvec
+         # OPERAND (the indexed form states the read as well).
+         r"vmul\s+%v6, %v0, %v1, %sysfpen -> %v6, %fcsr",
+         r"vmul\s+%v7, %v0, %v1, %fcsr, %sysfpen -> %v7, %fcsr",
+     ], "x86_64": [
+         # The contrast arm: the same instruction CLASS on an ISA whose
+         # saturation is silent.  No status register appears, and that is
+         # the measurement that keeps the AArch64 rows above from reading
+         # as a property of saturation in general.
+         r"66 0f ec c1\s+vadd\s+%v0, %v1 -> %v0",
+         r"66 0f dc d1\s+vadd\s+%v1, %v2 -> %v2",
+         r"66 0f e9 d9\s+vsub\s+%v1, %v3 -> %v3",
+         r"66 0f 63 e9\s+vshuf\s+%v1, %v5 -> %v5",
+     ]}},
     # w8_dense (large --coverage --regdata) stays out for a reason that IS
     # measured: it is a scale cell covered by validator/large_scale.  The
     # SMALL coverage+regdata shape is w8_repregs above.
@@ -291,6 +350,31 @@ def triple_hash(build: Path, cst: Path) -> dict:
         "legacy": sha(legacy.encode()),
         "templates": sha(templates.encode()),
     }
+
+
+def witness_failures(build: Path, cst: Path, wl: dict, isa: str) -> list[str]:
+    """Every witness pattern @wl declares for @isa that the trace does NOT
+    carry, as human-readable failure lines.
+
+    A HASH IS NOT A WITNESS.  It records that the bytes are the recorded
+    bytes; it cannot say the cell ever contained the instruction family it
+    was added for.  A cell whose subject silently disappeared -- a generator
+    block dropped, an assembler that refused a mnemonic, a probe group
+    renamed -- would still hash consistently against its own reference and
+    would report GREEN forever about nothing.  So a cell may declare, in the
+    decode's own vocabulary, the published register lists it exists to
+    cover, and both capture and check assert them.
+
+    Matched against `--templates-only`, which is the template DICTIONARY:
+    what the wire says each instruction reads and writes.  That is the
+    subject of both commits these cells were added for.
+    """
+    pats = (wl.get("witness") or {}).get(isa) or []
+    if not pats:
+        return []
+    text = decode_text(build, cst, "templates")
+    return [f"witness not found in {isa} decode: {p}"
+            for p in pats if not re.search(p, text)]
 
 
 def svg_hash(build: Path, cst: Path, metric: str) -> str:
@@ -696,6 +780,115 @@ def capture(build: Path, root: Path, waivers: dict) -> int:
     return 1 if bad else 0
 
 
+def capture_add(build: Path, root: Path, waivers: dict,
+                names: list[str]) -> int:
+    """Capture the reference for NEW cells only, merging into the manifest.
+
+    WHY THIS IS NOT `capture`.  A full capture rewrites every cell, which is
+    the correct thing when the whole reference is being replaced and the
+    wrong thing when a matrix GAINS a workload: the cells that already exist
+    would be re-recorded from whatever build is in the tree today, and their
+    old hashes -- the only record of what the wire used to say -- would be
+    gone.  This path physically cannot do that.  It reads the manifest,
+    REFUSES any name whose cells are already recorded, and writes only the
+    keys it just measured.
+
+    Everything else is the full capture's discipline unchanged: the same
+    work root (its length feeds the guest stack base, so a cell captured
+    under another root is red for a reason that has nothing to do with the
+    tracer), the same double-trace determinism gate, and the same rule that
+    a reference is an assertion which needs a written reason.  The added
+    cells carry their OWN provenance, because they were measured on a
+    different build than the rest of the manifest and a reader must be able
+    to see that.
+    """
+    if not MANIFEST.exists():
+        print(f"no manifest at {MANIFEST}; there is nothing to add to -- run "
+              f"a full capture first", file=sys.stderr)
+        return 2
+    manifest = json.loads(MANIFEST.read_text())
+    prov, rc = gate_build(build, system=False, waivers=waivers, mode="capture")
+    if rc:
+        return rc
+    cap_root = manifest.get("work_root")
+    if cap_root is not None and cap_root != str(root):
+        print(f"work-root mismatch: manifest captured under {cap_root}, "
+              f"add invoked under {root}.  A cell captured under a different "
+              f"root cannot be checked beside the others.", file=sys.stderr)
+        return 2
+    by_name = {w["name"]: w for w in WORKLOADS}
+    wls = []
+    for n in names:
+        if n not in by_name:
+            print(f"REFUSING: {n!r} is not a workload in WORKLOADS.",
+                  file=sys.stderr)
+            return 2
+        held = [f"{n}:{isa}" for isa in by_name[n]["isas"]
+                if f"{n}:{isa}" in manifest.get("cells", {})]
+        if held:
+            print(f"REFUSING: {held} already recorded.  This path adds "
+                  f"cells; it never replaces one.  Use a full capture (and "
+                  f"say why) to move a reference that exists.",
+                  file=sys.stderr)
+            return 2
+        wls.append(by_name[n])
+
+    N_DET = 2
+    bad = 0
+    added: dict[str, dict] = {}
+    for wl in wls:
+        name = wl["name"]
+        out = root / name
+        if out.exists():
+            shutil.rmtree(out)
+        runs, rc0 = [], 0
+        for i in range(N_DET):
+            rcx = run_all(build, wl, out)
+            if i == 0:
+                rc0 = rcx
+            runs.append({isa: (triple_hash(build, cst_path(out, isa))
+                               if cst_path(out, isa).exists() else None)
+                         for isa in wl["isas"]})
+        for isa in wl["isas"]:
+            cell = f"{name}:{isa}"
+            hs = [r[isa] for r in runs]
+            if any(h is None for h in hs):
+                print(f"  REFUSE {cell}: trace not produced"); bad += 1
+                continue
+            if any(h != hs[0] for h in hs[1:]):
+                moved = sorted({k for h in hs[1:] for k in h
+                                if h[k] != hs[0][k]})
+                print(f"  REFUSE {cell}: NONDETERMINISTIC {moved}"); bad += 1
+                continue
+            # A CELL THAT CANNOT WITNESS ITS SUBJECT IS NOT RECORDED.  The
+            # hashes would be perfectly self-consistent and the cell would
+            # be about nothing; recording it would put a green in the net
+            # with no case behind it.
+            miss = witness_failures(build, cst_path(out, isa), wl, isa)
+            if miss:
+                for m in miss:
+                    print(f"  REFUSE {cell}: {m}")
+                bad += 1
+                continue
+            added[cell] = {**hs[0], "validate_rc": rc0}
+            print(f"  {cell}: deterministic, witnessed, "
+                  f"{'ok' if rc0 == 0 else f'VALIDATE_RC={rc0}'}")
+    if bad:
+        print(f"\nREFUSING to write: {bad} cell(s) did not qualify.  "
+              f"The manifest is unchanged.", file=sys.stderr)
+        return 1
+    manifest.setdefault("cells", {}).update(added)
+    ledger = manifest.setdefault("added_cells", {})
+    for cell in added:
+        ledger[cell] = {"reason": CAPTURE_REASON, "provenance": prov,
+                        "captured_at": datetime.datetime.now()
+                        .astimezone().isoformat(timespec="seconds")}
+    MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    print(f"\nadded {len(added)} cell(s) to {MANIFEST}; "
+          f"{len(manifest['cells']) - len(added)} existing cell(s) untouched")
+    return 0
+
+
 def check(build: Path, root: Path, waivers: dict,
           only: list[str] | None = None) -> int:
     """Compare the net's cells to the recorded hash reference.
@@ -758,6 +951,16 @@ def check(build: Path, root: Path, waivers: dict,
         for isa in wl["isas"]:
             cell = f"{name}:{isa}"
             if cell not in manifest["cells"]:
+                # A CELL WITH NO RECORDED REFERENCE IS NOT A PASS.  This
+                # used to `continue` in silence, so a workload added to
+                # WORKLOADS and never captured was run on every check and
+                # compared against nothing -- the same shape as an
+                # exclusion nobody measured (3cafb8e5fb).  Say it, and
+                # fail the run: capture the cell, or take it out of the
+                # matrix.
+                fails.append(f"{cell}: in WORKLOADS but NOT in the "
+                             f"manifest -- no reference to compare against "
+                             f"(run `capture --add {name}`)")
                 continue
             scored.add(cell)
             cst = cst_path(out, isa)
@@ -765,6 +968,11 @@ def check(build: Path, root: Path, waivers: dict,
                 fails.append(f"{cell}: trace not produced"); continue
             produced[cell] = (build, cst)
             got = triple_hash(build, cst)
+            # The cell's own subject, asserted before its bytes are
+            # compared: a witness failure and a hash failure are different
+            # diagnoses and the reader needs both.
+            for w in witness_failures(build, cst, wl, isa):
+                fails.append(f"{cell}: {w}")
             want = {k: manifest["cells"][cell][k] for k in ("body", "legacy", "templates")}
             if got != want:
                 moved = [k for k in want if got[k] != want[k]]
@@ -1912,6 +2120,12 @@ def main() -> int:
     # So `capture` will not run without a reason, and the reason is stored
     # next to the hashes it justifies.  `check` never needs one: it
     # asserts nothing.
+    ap.add_argument("--add", action="append", default=None,
+                    help="capture mode: record the reference for these NEW "
+                         "workloads and MERGE them into the manifest, "
+                         "leaving every recorded cell untouched.  Refuses a "
+                         "name that already has cells: this path adds, it "
+                         "never replaces.")
     ap.add_argument("--reason", default=None,
                     help="REQUIRED for capture: why the reference is being "
                          "replaced -- name the defect the old bytes carried, "
@@ -1978,6 +2192,13 @@ def main() -> int:
         return net_validate(build, args.work_root / "netval", waivers,
                             only=args.only)
     if args.mode == "capture":
+        if args.add:
+            if args.only:
+                print("REFUSING: --only and --add are different requests; "
+                      "name the new cells with --add alone.",
+                      file=sys.stderr)
+                return 2
+            return capture_add(build, shared, waivers, args.add)
         if args.only:
             print("REFUSING: --only has no meaning for capture -- a partial "
                   "reference is not a reference.", file=sys.stderr)

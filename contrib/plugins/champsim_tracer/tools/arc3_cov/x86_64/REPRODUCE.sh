@@ -332,14 +332,34 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 # and a stale one invites reading an unchanged number as a passing control.
 # So compare each arm against THIS RUN's own baseline, printed above the
 # loop, and require exactly these deltas:
-#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2   ud0 3   ud1 2
+#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2
 #   xlatb 1   smswl 1   lmsww 2   rdfsbasel 1   lfsl 1   cmpxchg8b 1
 # NOTE THE SPELLINGS.  --falsify matches the mnemonic EXACTLY, so `smsw`
 # matches nothing and the tool says so with exit 2 -- take the exit code,
 # never the AGREE line, or an unchanged count reads as a passing control.
-# ud0 is in the list on purpose too -- it is the family the UD0 misdecode
-# repair created, and a repair nobody has watched fail is a repair that
-# vouches for nothing.
+#
+# ud0 AND ud1 WERE IN THIS LIST AND THE WATCH MOVED RATHER THAN ENDED.
+# They were here to watch the UD0 misdecode repair, on the rule that a
+# repair nobody has watched fail vouches for nothing.  7773e9a469 then
+# withdrew GEN_OP_SYSCALL from UD0/UD1/UD2 -- #UD is not a system call, and
+# the shared vocabulary has no word for an invalid-opcode fault, so the
+# ruled row REFUSES the opcode rather than borrowing a neighbouring trap's
+# name.  A refused opcode is not decoded, so `--falsify=drop-src:ud0`
+# matches nothing and the arm reports that it did not reach its subject.
+# That is the arm working: it says so instead of printing an unchanged
+# count.
+#
+# The subject did not disappear, it CHANGED SHAPE, so the watch changes
+# shape with it and gets TIGHTER (R19).  What is asserted about these
+# encodings now is asserted by this same script, twice, and both refuse:
+#   * qemu_tcg_scope.classify() must charge them to ARCHITECTURAL-UD, cited
+#     to the decode entries and gen_UD(); an uncited unreachable row stops
+#     compare_attrib.py outright, and the selfcheck re-asserts the citation
+#     against the live tree at every run.
+#   * qemu_decode_adjudicate.py must carry all six XED iforms and no others;
+#     its set comparison against the reach matrix refuses on either
+#     direction of disagreement.
+# A claim per row, re-derived per run, in place of one delta.
 # sqrtsd is in the list on purpose -- it is an R7.1-SCALAR row, so it proves
 # the rows that rule closed are watched rather than blindly agreeing.
 # compare_attrib.py RE-DERIVES the tracer table from the live binary and
@@ -350,7 +370,7 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 cp tracer_batch.tsv tracer_batch.good.tsv
 echo -n "falsify baseline -> "
 $PY compare_attrib.py | grep -m1 '  AGREE  '
-for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
+for M in movq vmovq vpsadbw sqrtsd xlatb smswl lmsww \
          rdfsbasel lfsl cmpxchg8b; do
   "$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields \
       --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv \

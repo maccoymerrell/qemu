@@ -169,6 +169,17 @@ class QemuFacts(object):
         return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
                               self.decode))
 
+    def ud_rows_are_ud(self):
+        """UD0, UD1 and UD2 all decode to the UD entry, which raises #UD.
+
+        The three rows and the emitter are asserted together, because the
+        citation is the PAIR: a table entry named UD proves nothing if
+        gen_UD() ever stopped raising.
+        """
+        return (bool(re.search(r'\[0x0b\] = X86_OP_ENTRY0\(UD\)', self.decode))
+                and bool(re.search(r'\[0xb9\] = X86_OP_ENTRYr\(UD,', self.decode))
+                and bool(re.search(r'\[0xff\] = X86_OP_ENTRYr\(UD,', self.decode)))
+
     def supports(self, cpuid_symbol):
         return cpuid_symbol in self.tcg_cpuid
 
@@ -244,6 +255,11 @@ _CITE = {
     'novocab': 'X86_FEAT_%s is absent from the decode tables\' feature '
                'vocabulary in %s (%d names, none of them this one), so no '
                'entry there can require it',
+    'ud': '%s -- [0x0b] = X86_OP_ENTRY0(UD) (UD2), [0xb9] and [0xff] = '
+          'X86_OP_ENTRYr(UD, ...) (UD1, UD0); gen_UD() in '
+          'target/i386/tcg/emit.c.inc is gen_illegal_opcode().  QEMU decodes '
+          'these bytes and the machine takes an invalid-opcode fault instead '
+          'of executing an instruction',
 }
 
 _REMEDY_TCG = ('a QEMU release whose x86 TCG front end implements it: no CPU '
@@ -279,6 +295,29 @@ def classify(hexs, ext, isa_set, root=None):
     f = facts(root)
     b, i = _strip_prefixes(hexs)
     op = b[i] if i < len(b) else ''
+
+    # UD0, UD1, UD2.  These are DECODED -- the entry exists, the emitter is
+    # gen_illegal_opcode() -- and the machine's answer to them is a fault.
+    # No guest executes one AS AN INSTRUCTION, so there is no instruction
+    # whose register sets could be carried, and the row is out of scope for
+    # the reason the ISA gives rather than for anything the tracer did.
+    #
+    # THE MODEL DID NOT HAVE THIS MECHANISM AND THE ROWS WENT UNCITED.
+    # 7773e9a469 withdrew GEN_OP_SYSCALL from all three -- correctly, #UD is
+    # not a system call -- and they became `tracer_decode_fail` rows the
+    # reach probe measures as unreachable, which is exactly true and exactly
+    # what this classifier is asked to charge to a mechanism.  Six rows
+    # (0f0b, 0fb9c0, 0fb900, 0fffc0 twice, 0fff00) with no citation stop the
+    # report, which is the instrument working: the answer owed was a
+    # mechanism, and this is it.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in ('0b', 'b9', 'ff'):
+        return Scope('ARCHITECTURAL-UD', _CITE['ud'] % _DECODE,
+                     'nothing -- the ISA defines these encodings as raising '
+                     '#UD, so no guest ever executes one as an instruction '
+                     'and there are no register sets to carry.  The fault '
+                     'itself is on the wire: the tracer publishes the block '
+                     'seal (BRANCH_SYSCALL_TYPE) and REFUSES the opcode '
+                     'rather than naming a neighbouring trap')
 
     if op == '62':
         return Scope('EVEX-PREFIX-NOT-DECODED', _CITE['evex'], _REMEDY_ACCEL)
@@ -334,6 +373,9 @@ def selfcheck(root=None):
     if not f.rex2_is_an_opcode():
         bad.append('[0xD5] is no longer the AAD entry: REX2 may now be a '
                    'prefix, and the APX-legacy exclusion is stale')
+    if not f.ud_rows_are_ud():
+        bad.append('0F 0B / 0F B9 / 0F FF no longer read as UD entries in the '
+                   'decode tables: the ARCHITECTURAL-UD exclusion is stale')
     if not f.prefetch_is_memory_only():
         bad.append('0F 0D no longer reads `X86_OP_ENTRY1(NOP, M,v)`: the '
                    'OPERAND-FORM-REFUSED citation is stale')

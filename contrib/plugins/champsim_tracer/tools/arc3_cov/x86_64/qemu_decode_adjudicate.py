@@ -79,6 +79,13 @@ SITES = {
         locator=r'case 0xee: /\* rdpkru \*/',
         what='the 0F 01 EE/EF slot holds RDPKRU/WRPKRU, which refuse any '
              '66/F2/F3 prefix; the F3 form is not decoded as anything'),
+    'ud-entry': dict(
+        file=_DECODE,
+        locator=r'\[0x0b\] = X86_OP_ENTRY0\(UD\)',
+        what='UD0, UD1 and UD2 have decode-table entries whose emitter is '
+             'gen_UD() = gen_illegal_opcode(): QEMU decodes the bytes and the '
+             'machine takes the invalid-opcode fault the ISA defines for '
+             'them, so no instruction executes'),
     'grp6-absent': dict(
         file=_TRANSLATE,
         locator=r'default:\n            goto illegal_op;\n        \}\n'
@@ -173,6 +180,27 @@ SITES = {
 # opcode_id -> (mnemonic, verdict, refusal site, the enable that would have to
 # open for the row to become reachable -- or None when QEMU has no such gate)
 ROWS = [
+    # ---- UD0 / UD1 / UD2: DECODED, AND THE DECODE IS A FAULT --------------
+    #
+    # Not a QEMU gap and not a model refusal in the sense the rest of this
+    # table means: the entry exists, the emitter runs, and what it emits is
+    # the architectural #UD.  These are the only rows here whose refusal is
+    # the ISA's own answer rather than a limit of the emulator, which is why
+    # they carry no enable -- there is no bit that would make them execute.
+    #
+    # They arrived when 7773e9a469 withdrew GEN_OP_SYSCALL from all three:
+    # #UD is not a system call, the shared vocabulary has no word for an
+    # invalid-opcode fault, and the ruled row REFUSES the opcode rather than
+    # borrowing a neighbouring trap's name.  The tracer stating no class is
+    # what puts them in the unprobed population, and the population is where
+    # this table has to answer for them.
+    ('XED_IFORM_UD2',              'UD2',  REFUSED, 'ud-entry', None),
+    ('XED_IFORM_UD1_GPR32_GPR32',  'UD1',  REFUSED, 'ud-entry', None),
+    ('XED_IFORM_UD1_GPR32_MEMd',   'UD1',  REFUSED, 'ud-entry', None),
+    ('XED_IFORM_UD0',              'UD0',  REFUSED, 'ud-entry', None),
+    ('XED_IFORM_UD0_GPR32_GPR32',  'UD0',  REFUSED, 'ud-entry', None),
+    ('XED_IFORM_UD0_GPR32_MEMd',   'UD0',  REFUSED, 'ud-entry', None),
+
     # ---- 0F 01 group 7, no case for this modrm ---------------------------
     ('XED_IFORM_VMCALL',
      'VMCALL', REFUSED, 'grp7-absent', 'CR4.VMXE'),

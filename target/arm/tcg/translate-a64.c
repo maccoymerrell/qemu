@@ -2539,23 +2539,54 @@ static bool trans_SB(DisasContext *s, arg_SB *a)
     return true;
 }
 
+/*
+ * THE THREE FEAT_FlagM FORMS COMPUTE FLAGS FROM FLAGS, WHICH IS A SHAPE THE
+ * PROVENANCE CANNOT TELL FROM A CHANGE OF REPRESENTATION.
+ *
+ * NZCV is LOWERED here: four TCG globals stand for one architectural
+ * register.  A consumer that groups them -- and it must, to read the flags
+ * at all -- sees `xor CF, CF, 1` as a write to NZCV whose value came from
+ * NZCV and from nothing else, with no load and no encoded operand.  That is
+ * bit for bit the shape of a flag MATERIALISATION, which is a
+ * representation change and not a definition, and a consumer deleting those
+ * deletes these with them.
+ *
+ * MEASURED: `cfinv` and `xaflag` are two of the three aarch64 instructions
+ * in the corpus whose EVERY QEMU write is struck as a representation change,
+ * so QEMU's write list for them is empty and the flag write they perform
+ * reaches nothing.  They are the +2 in FINDING 66V-C's destination ledger.
+ *
+ * THE EMITTER STATES IT, because only the emitter can.  This is x86 `clc`'s
+ * situation exactly and it is settled the same way: a shape that cannot see
+ * a fact must not overrule an emitter that states it.  The note does not
+ * change the provenance -- these instructions really do read the flags they
+ * write, and that edge is published -- it says the write is a DEFINITION.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
 static bool trans_CFINV(DisasContext *s, arg_CFINV *a)
 {
+    const void *mark;
+
     if (!dc_isar_feature(aa64_condm_4, s)) {
         return false;
     }
+    mark = insn_dataflow_mark();
     tcg_gen_xori_i32(cpu_CF, cpu_CF, 1);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_CF), mark);
     return true;
 }
 
 static bool trans_XAFLAG(DisasContext *s, arg_XAFLAG *a)
 {
     TCGv_i32 z;
+    const void *mark;
 
     if (!dc_isar_feature(aa64_condm_5, s)) {
         return false;
     }
 
+    mark = insn_dataflow_mark();
     z = tcg_temp_new_i32();
 
     tcg_gen_setcondi_i32(TCG_COND_EQ, z, cpu_ZF, 0);
@@ -2581,15 +2612,29 @@ static bool trans_XAFLAG(DisasContext *s, arg_XAFLAG *a)
     /* C | Z */
     tcg_gen_or_i32(cpu_CF, cpu_CF, z);
 
+    /*
+     * All four are architectural definitions, not re-representations; see
+     * trans_CFINV() above for what the note is holding off and why the
+     * emitter is the only place that can state it.  One note per written
+     * global, because the strike is decided per register.
+     */
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_NF), mark);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_ZF), mark);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_VF), mark);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_CF), mark);
+
     return true;
 }
 
 static bool trans_AXFLAG(DisasContext *s, arg_AXFLAG *a)
 {
+    const void *mark;
+
     if (!dc_isar_feature(aa64_condm_5, s)) {
         return false;
     }
 
+    mark = insn_dataflow_mark();
     tcg_gen_sari_i32(cpu_VF, cpu_VF, 31);         /* V ? -1 : 0 */
     tcg_gen_andc_i32(cpu_CF, cpu_CF, cpu_VF);     /* C & !V */
 
@@ -2598,6 +2643,17 @@ static bool trans_AXFLAG(DisasContext *s, arg_AXFLAG *a)
 
     tcg_gen_movi_i32(cpu_NF, 0);
     tcg_gen_movi_i32(cpu_VF, 0);
+
+    /*
+     * The C and Z writes are definitions computed from the flags, on
+     * trans_CFINV()'s rule.  N and V are set to a translator CONSTANT, so
+     * their provenance is empty rather than mistakable, and they refuse
+     * under a different rule -- the empty-set one -- which this note does
+     * not and should not reach.  Stated here so the remaining half of
+     * `axflag` is a named question and not a silence.
+     */
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_CF), mark);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_ZF), mark);
 
     return true;
 }

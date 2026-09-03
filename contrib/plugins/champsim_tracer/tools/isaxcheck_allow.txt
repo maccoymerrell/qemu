@@ -9527,3 +9527,50 @@ x86_64 SR-rd-missing xorl +REG_SEG0
 x86_64 SR-rd-missing xorl +REG_SEG2
 x86_64 SR-rd-missing xorw +REG_SEG0
 x86_64 SR-rd-missing xorw +REG_SEG2
+
+# =====================================================================
+# THE SYSTEM REGISTERS THE REFERENCE HAS NO OPERAND FOR -- SEVEN ROWS,
+# RE-DERIVED (exec112, PASS 64)
+#
+# WHAT THE DISAGREEMENT IS.  The wire names a system register as a source
+# and LLVM MC names nothing there: `SR-rd-phantom <mnem> +REG_SYS*`, where
+# the qualifier is the WHOLE difference set, so a row is licensed only when
+# that register is the entire disagreement.
+#
+# WHY IT IS NOT A TRACER DEFECT.  LLVM models these registers as
+# IMMEDIATES or does not model them at all -- a RISC-V CSR number, a MIPS
+# coprocessor-0 selector, an x86 MSR index -- so its MCInstrDesc has no
+# register operand to name.  `rdmsr` reads a model-specific register and
+# LLVM's description says only that it writes EDX:EAX; `cbo.clean` operates
+# on a cache block and LLVM names no CSR; `lldtw` loads the LDT register.
+# The tracer records the architectural read.  R16: the dependency is the
+# ISA's, and a reference that does not model the register cannot refute it.
+#
+# HOW TO CHECK WHETHER IT CAN BE DELETED.  Run the coverage census --
+# `ISAX_DUMP_REGCOV=1 isaxcheck --isa=<isa> --check --srcenc=<corpus>` --
+# and read the register's REGCOV line.  The row stands only while that line
+# reads llvm_rd=0 llvm_wr=0 with the tag REFERENCE-HAS-NO-OPERAND.  Two
+# other tags now exist and NEITHER justifies a row: UNANSWERABLE-NO-INDEX-KEY
+# (the census cannot name the register at all) and UNANSWERABLE-TOKEN-DROPPED
+# (the token is on is_dropped_reg()'s list, so the zero is this tool's own
+# doing).  Measured at this tip, all four ISAs:
+#
+#   x86_64  REG_SYS 0/0/42,749  REG_SYSMMU 0/0/37,214  REG_SYSTIMER 0/0/7,108
+#   riscv64 REG_SYS 0/0/10,009
+#   mipsel  REG_SYSEXC 0/0/163,536  REG_SYSDBG 0/0/289  REG_SYSTIMER 0/0/128
+#
+# TWELVE ROWS THAT WERE PREPARED FOR THIS BLOCK ARE NOT HERE, AND THAT IS
+# THE POINT.  All eleven aarch64 rows are REFUTED by the repaired census --
+# LLVM names every one of those registers once the index is keyed off QEMU's
+# own system-register names (REG_SYSFPEN llvm_rd=2,673; REG_SYSEXC 13,950;
+# REG_SYSMMU 22,320; REG_SYS 24,687; REG_SSP 2,618) -- and x86_64 REG_SSP is
+# UNANSWERABLE-TOKEN-DROPPED, which is FINDING 62-B's refuted row arriving as
+# a measurement instead of an argument.  See arc3_cov/REFERENCE_COVERAGE.md.
+# =====================================================================
+x86_64 SR-rd-phantom * +REG_SYS
+x86_64 SR-rd-phantom * +REG_SYSMMU
+x86_64 SR-rd-phantom * +REG_SYSTIMER
+riscv64 SR-rd-phantom * +REG_SYS
+mipsel SR-rd-phantom * +REG_SYSEXC
+mipsel SR-rd-phantom * +REG_SYSDBG
+mipsel SR-rd-phantom * +REG_SYSTIMER

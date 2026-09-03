@@ -1,5 +1,19 @@
 # THE REFERENCE-COVERAGE ADJUDICATION, PER REGISTER AND PER ISA
 
+> **RE-DERIVED AT exec112 (PASS 64).  TWELVE OF THE NINETEEN ROWS BELOW ARE
+> REFUTED BY MEASUREMENT AND SEVEN SURVIVE.**  The census's LLVM side was
+> indexed through CAPSTONE's register table, so a register Capstone cannot
+> name had no key at all and every LLVM token for it mapped to nothing:
+> `llvm_rd = 0` BY CONSTRUCTION, whatever `MCInstrDesc` says (FINDING 62-B).
+> The index is now re-derived off QEMU's OWN system-register names -- the
+> boundary states both the spelling and the architectural role, and the
+> generic id comes from the role, so nothing here is a hand-written
+> correspondence.  The census also LABELS the two ways a zero can be
+> manufactured instead of scoring them as measurements.  What that changed is
+> in "THE RE-DERIVATION" below; the original rows are kept underneath it
+> unedited, because a refuted row is evidence and deleting it would hide the
+> shape of the mistake.
+
 exec103 named a class of `SR-rd-phantom` residue rows and offered one
 sentence to justify them: registers *"LLVM's MCInstrDesc simply has no
 operand for"*.  exec106 tested that sentence with a census
@@ -26,7 +40,79 @@ population, so the disagreement is a boundary of the REFERENCE and not a
 defect in the tracer.  Anything else is a disagreement about content, and
 content is argued, not exempted.
 
-## THE ROWS THAT PASS, MEASURED AT THIS TIP
+
+## THE RE-DERIVATION (exec112, PASS 64)
+
+The census now prints one of THREE tags on a row that reads `llvm_rd = 0`
+and `llvm_wr = 0` with `wire_src > 0`, and only the first justifies an
+adjudication:
+
+  * `REFERENCE-HAS-NO-OPERAND` -- the index CAN name the register, no token
+    for it is dropped, and LLVM still names it nowhere.  A measurement.
+  * `UNANSWERABLE-NO-INDEX-KEY` -- no LLVM token maps to the register at
+    all.  The zero is the index's, not the reference's.
+  * `UNANSWERABLE-TOKEN-DROPPED` -- every spelling that maps to it is on
+    `is_dropped_reg()`'s fold list, so the census threw the answer away.
+
+Measured at this tip over the same four corpora, with the index keyed off
+QEMU's names (878 keys learned on aarch64, 11 on x86_64, 4 on riscv64, 0 on
+mipsel -- the mipsel boundary states no named system-register operand):
+
+| ISA | register | before | NOW | verdict |
+| --- | --- | ---: | --- | --- |
+| aarch64 | `REG_SYSFPEN`  | 0 / 0 | llvm_rd **2,673**  | REFUTED |
+| aarch64 | `REG_SYS`      | 0 / 0 | llvm_rd **24,687** | REFUTED |
+| aarch64 | `REG_SYSMMU`   | 0 / 0 | llvm_rd **22,320** | REFUTED |
+| aarch64 | `REG_SYSDBG`   | 0 / 0 | llvm_rd **13,977** | REFUTED |
+| aarch64 | `REG_SYSPERF`  | 0 / 0 | llvm_rd **19,053** | REFUTED |
+| aarch64 | `REG_VCTRL`    | 0 / 0 | named              | REFUTED |
+| aarch64 | `REG_SYSEXC`   | 0 / 0 | llvm_rd **13,950** | REFUTED |
+| aarch64 | `REG_SYSID`    | 0 / 0 | llvm_rd **11,160** | REFUTED |
+| aarch64 | `REG_SYSCACHE` | 0 / 0 | llvm_rd **11,362** | REFUTED |
+| aarch64 | `REG_SYSTIMER` | 0 / 0 | llvm_rd **5,580**  | REFUTED |
+| aarch64 | `REG_SSP`      | 0 / 0 | llvm_rd **2,618**  | REFUTED |
+| x86_64  | `REG_SSP`      | 0 / 0 | UNANSWERABLE-TOKEN-DROPPED | REFUTED |
+| x86_64  | `REG_SYS`      | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| x86_64  | `REG_SYSMMU`   | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| x86_64  | `REG_SYSTIMER` | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| riscv64 | `REG_SYS`      | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| mipsel  | `REG_SYSEXC`   | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| mipsel  | `REG_SYSDBG`   | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+| mipsel  | `REG_SYSTIMER` | 0 / 0 | REFERENCE-HAS-NO-OPERAND | SURVIVES |
+
+WHY AARCH64 MOVED AND MIPSEL DID NOT.  LLVM's AArch64 has no system-register
+CLASS -- `MRS`/`MSR` take an immediate -- which is what the original rows
+said, and it is still true of the register file.  What LLVM DOES have is the
+system register's NAME in the printed operand, and the boundary spells the
+same names (`cap_aarch64_copy_sysreg_name`), so once QEMU's spelling is a key
+the two sides join on it.  On mipsel the boundary states no named
+system-register operand at all, so no key was learned and the three
+surviving rows rest on Capstone's own MIPS coprocessor tokens, which the
+index has always had.
+
+WHAT THIS COSTS THE RESIDUE, RE-QUOTED HONESTLY.  The nineteen rows were
+quoted at 3,284 of 7,040 residue signatures -- 47% of the gate's denominator,
+85% of aarch64's.  The seven that survive cover **718** signatures:
+60 on x86_64, 90 on riscv64, 568 on mipsel, and **0 on aarch64**.  The
+difference is not a saving; it is 2,566 signatures that are REAL
+disagreements and stay in the residue where a maintainer can see them.
+
+THE SEVEN ARE LANDED, as globbed rows at the end of `isaxcheck_allow.txt`
+with this census attached.  The glob is on the MNEMONIC only: the qualifier
+is the whole difference set, so a row is licensed only where the register is
+the entire disagreement -- which is exactly the claim being made.
+
+REG_SSP's own history is the reason the labels exist.  Its row read
+`llvm_rd = 0` for TWO independent reasons, either of which alone
+manufactures the zero: Capstone's x86 enum has no `X86_REG_SSP`, so the index
+had no key; and `ssp` is on the drop list, so the token is folded out before
+the census counts it.  LLVM names SSP implicitly on 66 x86 opcodes, `callq`
+among them.  The row was written as a boundary of the reference and it was a
+boundary of this tool.
+
+## THE ORIGINAL ROWS, AS WRITTEN AT exec109 (KEPT FOR THE RECORD)
+
+### THE ROWS THAT PASS, MEASURED AT THIS TIP
 
 Corpus: the four `--srcenc` corpora captured fresh from this tip's sled
 sweep (x86_64 6,416,314 / aarch64 1,408,171 / riscv64 86,889 / mipsel

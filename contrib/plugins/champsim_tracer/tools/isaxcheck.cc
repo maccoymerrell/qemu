@@ -797,6 +797,49 @@ static const std::set<unsigned> *generic_candidates(const std::string &tok)
     return it == name_to_generic.end() ? nullptr : &it->second;
 }
 
+/*
+ * THE LLVM SIDE OF THE INDEX IS RE-DERIVED OFF QEMU'S OWN NAMES.
+ *
+ * `build_name_to_generic()` builds `name_to_generic` by walking CAPSTONE's
+ * register table, so a generic register CAPSTONE CANNOT NAME has no key at
+ * all -- and every LLVM token for it then maps to nothing and is counted as
+ * zero.  That is not a measurement of the reference; it is a property of the
+ * index, and the reference-coverage census read it as the former on fifteen
+ * of nineteen adjudicated rows (FINDING 62-B).  On one of them the result was
+ * demonstrably false: LLVM's x86 MCInstrDesc names `SSP` implicitly on 66
+ * opcodes, `callq` among them, while the census reported llvm_rd = 0 because
+ * `subprojects/capstone/include/capstone/x86.h` has no `X86_REG_SSP`.
+ *
+ * QEMU names these registers.  A QEMU_PLUGIN_OP_SYSREG operand carries the
+ * boundary's own printed spelling in `reg_name` -- `ssp`, `fpcw`, `mxcsr`,
+ * `gdtr`, and the AArch64 and RISC-V system-register names beside them --
+ * together with the architectural ROLE the generic id is a rename of.  So the
+ * key is taken from QEMU's name and the id from QEMU's role, and neither is
+ * a hand-written correspondence that could drift when the classification
+ * changes.  This is the isaxcheck.cc:845 `fpcw` precedent generalised from
+ * one token to every system register the boundary names.
+ *
+ * It only ever ADDS keys.  A token Capstone also spells keeps the candidate
+ * set the register-table walk gave it and gains the sysreg id beside it,
+ * which is the same GENEROUS expansion the census already documents: an
+ * over-count can only make a REFERENCE-HAS-NO-OPERAND claim harder to
+ * support.
+ */
+static unsigned regcov_sysreg_keys;
+/* the (token, id) pairs THIS process learned, so they can cross the pipe */
+static std::set<std::pair<std::string, unsigned> > regcov_sysreg_learned;
+
+static void index_qemu_sysreg_name(const char *reg_name, unsigned g)
+{
+    if (!reg_name || !reg_name[0] || !g) return;
+    std::string tok = norm_reg(reg_name);
+    if (tok.empty()) return;
+    if (name_to_generic[tok].insert(g).second) {
+        regcov_sysreg_keys++;
+        regcov_sysreg_learned.insert(std::make_pair(tok, g));
+    }
+}
+
 static void build_name_to_generic(void)
 {
     csh h;
@@ -1069,6 +1112,10 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
             // expectations come from the MRA and the Sail model and name
             // the register exactly.
             std::string nm = sysreg_class_token(g);
+            // QEMU names this register even where Capstone has no id for it,
+            // and the LLVM side of the coverage index is keyed on names.  See
+            // index_qemu_sysreg_name().
+            index_qemu_sysreg_name(op->reg_name, g);
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
                 if (!nm.empty()) v.rd.insert(nm);
                 v.grd.insert(g);
@@ -1557,15 +1604,88 @@ static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
  */
 static std::map<unsigned, unsigned long> llvmcov_rd, llvmcov_wr, wirecov_src;
 
+/*
+ * TOKENS THE INDEX COULD NOT NAME WHEN THEY WERE SEEN, kept so the census is
+ * ORDER-INDEPENDENT.
+ *
+ * index_qemu_sysreg_name() below grows the index as the sweep observes QEMU's
+ * own system-register names, so a token can arrive before the key for it
+ * exists.  Counting it as "no candidate" at that moment would make the census
+ * depend on the order the corpus happens to be swept in -- the same
+ * instruction scored differently at position 1 and position 10,000.  So an
+ * unresolvable token is REMEMBERED here and re-resolved once, against the
+ * final index, in regcov_settle().
+ */
+static std::map<std::string, unsigned long> regcov_pending_rd, regcov_pending_wr;
+
+/* The union of every shard's indexable-id set, plus this process's own. */
+static std::set<unsigned> regcov_indexable;
+
 static void regcov_count(const std::set<std::string> &toks,
                          std::map<unsigned, unsigned long> &into)
 {
     std::set<unsigned> gs;
     for (const std::string &t : toks) {
         const std::set<unsigned> *c = generic_candidates(t);
-        if (c) gs.insert(c->begin(), c->end());
+        if (c) {
+            gs.insert(c->begin(), c->end());
+        } else {
+            (&into == &llvmcov_rd ? regcov_pending_rd
+                                  : regcov_pending_wr)[t]++;
+        }
     }
     for (unsigned g : gs) into[g]++;
+}
+
+/* Re-resolve the tokens that had no key when they were seen.  Called once,
+ * after the sweep, before any census is printed or shipped across the shard
+ * pipe. */
+static void regcov_settle(void)
+{
+    for (int which = 0; which < 2; which++) {
+        auto &pend = which ? regcov_pending_wr : regcov_pending_rd;
+        auto &into = which ? llvmcov_wr : llvmcov_rd;
+        for (const auto &kv : pend) {
+            const std::set<unsigned> *c = generic_candidates(kv.first);
+            if (!c) continue;
+            for (unsigned g : *c) into[g] += kv.second;
+        }
+        pend.clear();
+    }
+}
+
+/* Every generic id the index can name at all -- the discriminator between a
+ * measured REFERENCE-HAS-NO-OPERAND and an UNANSWERABLE structural zero. */
+static void regcov_indexable_ids(std::set<unsigned> &into)
+{
+    for (const auto &kv : name_to_generic)
+        into.insert(kv.second.begin(), kv.second.end());
+}
+
+/*
+ * AND THE THIRD WAY A ZERO CAN BE MANUFACTURED: the token is DROPPED.
+ *
+ * `is_dropped_reg()` folds a handful of tokens out of both sides before the
+ * set difference, because the two decoders model them by different
+ * conventions -- x86 `mxcsr` and `ssp` among them, each with its reason
+ * written where the list is.  That is a decision about the COMPARISON, and it
+ * is defensible there.  It is not a decision about the CENSUS: a register
+ * whose every spelling is on that list reads llvm_rd = 0 no matter what
+ * MCInstrDesc says, exactly the way a register with no index key does.
+ *
+ * So an id all of whose tokens are dropped is UNANSWERABLE here too, and for
+ * a reason worth telling apart from the missing key: the answer exists and
+ * this tool is throwing it away on purpose.
+ */
+static bool regcov_all_tokens_dropped(unsigned g)
+{
+    bool any = false;
+    for (const auto &kv : name_to_generic) {
+        if (!kv.second.count(g)) continue;
+        any = true;
+        if (!is_dropped_reg(kv.first)) return false;
+    }
+    return any;
 }
 
 static unsigned long srcenc_join_scored = 0;
@@ -2892,9 +3012,39 @@ static void emit_srcenc_shard(void)
     printf("#srcencjr\t%lu\t\n", srcenc_join_llvm_reject);
     printf("#srcencjz\t%lu\t\n", srcenc_join_size);
     printf("#srcencjm\t%lu\t\n", srcenc_join_mnem);
+    /* Re-resolve before shipping: a token seen before QEMU's name for it
+     * entered the index must not cross the pipe as a zero.
+     *
+     * AND WHAT STILL WILL NOT RESOLVE CROSSES THE PIPE UNRESOLVED.  The
+     * index grows from what a shard DECODES, and the sweep is sharded by
+     * encoding: the shard that decodes `rdsspq` learns QEMU's name for the
+     * shadow-stack pointer, and the shard that decodes the CALL family --
+     * where LLVM names the same register -- may learn nothing.  Settling
+     * only inside a shard would then score `ssp` as unnameable in every
+     * shard but one, which is the structural zero all over again, one level
+     * down.  So the learned KEYS and the leftover TOKENS both cross, and
+     * the parent settles against the union. */
+    regcov_settle();
+    for (const auto &kv : regcov_sysreg_learned)
+        printf("#covsk\t%u\t%s\n", kv.second, kv.first.c_str());
+    for (int which = 0; which < 2; which++) {
+        const auto &pend = which ? regcov_pending_wr : regcov_pending_rd;
+        for (const auto &kv : pend)
+            printf("#covp%c\t%lu\t%s\n", which ? 'w' : 'r',
+                   kv.second, kv.first.c_str());
+    }
     for (const auto &kv : llvmcov_rd) printf("#covlr\t%lu\t%u\n", kv.second, kv.first);
     for (const auto &kv : llvmcov_wr) printf("#covlw\t%lu\t%u\n", kv.second, kv.first);
     for (const auto &kv : wirecov_src) printf("#covws\t%lu\t%u\n", kv.second, kv.first);
+    /* WHICH IDS THE INDEX CAN NAME crosses the pipe too.  The parent's own
+     * index carries only the Capstone-table keys -- it never swept anything --
+     * so a structural zero would otherwise be reported as a measured one for
+     * every register the SHARDS learned a name for. */
+    {
+        std::set<unsigned> ix;
+        regcov_indexable_ids(ix);
+        for (unsigned g : ix) printf("#covidx\t0\t%u\n", g);
+    }
     for (unsigned i = 0; i < sizeof(alias_rows) / sizeof(alias_rows[0]); i++)
         printf("#srcencja\t%lu\t%u\n", alias_rows[i].hits, i);
     for (const auto &kv : srcenc_joinfail)
@@ -3509,6 +3659,21 @@ int main(int argc, char **argv)
                 }
                 if (key == "#srcencjz") { srcenc_join_size += cnt; continue; }
                 if (key == "#srcencjm") { srcenc_join_mnem += cnt; continue; }
+                if (key == "#covsk") {
+                    /* a (token, id) pair a shard learned from QEMU's own
+                     * system-register name; it joins THIS process's index so
+                     * the settle below can use it */
+                    if (name_to_generic[samp].insert((unsigned)cnt).second)
+                        regcov_sysreg_keys++;
+                    continue;
+                }
+                if (key == "#covpr") { regcov_pending_rd[samp] += cnt; continue; }
+                if (key == "#covpw") { regcov_pending_wr[samp] += cnt; continue; }
+                if (key == "#covidx") {
+                    regcov_indexable.insert(
+                        (unsigned)strtoul(samp.c_str(), nullptr, 10));
+                    continue;
+                }
                 if (key == "#covlr" || key == "#covlw" || key == "#covws") {
                     unsigned g = (unsigned)strtoul(samp.c_str(), nullptr, 10);
                     (key == "#covlr" ? llvmcov_rd
@@ -3709,19 +3874,52 @@ int main(int argc, char **argv)
             if (dead_alias)
                 printf("# srcenc_join dead_alias_rows=%u\n", dead_alias);
             if (getenv("ISAX_DUMP_REGCOV")) {
+                /* Settle this process's own tokens (a --jobs=1 run never
+                 * forked, so nothing settled them on the shard path) and
+                 * fold its index into the shards'. */
+                regcov_settle();          /* now against the UNION index */
+                regcov_indexable_ids(regcov_indexable);
                 std::set<unsigned> ids;
                 for (const auto &kv : llvmcov_rd) ids.insert(kv.first);
                 for (const auto &kv : llvmcov_wr) ids.insert(kv.first);
                 for (const auto &kv : wirecov_src) ids.insert(kv.first);
                 for (unsigned g : ids) {
                     const char *n = isax_generic_reg_name(g);
+                    /*
+                     * A ZERO WITH NO KEY IS NOT A MEASUREMENT.
+                     *
+                     * REFERENCE-HAS-NO-OPERAND says "the reference never
+                     * names this register" and is what an adjudication row
+                     * rests on.  It may only be printed for a register the
+                     * index COULD have named: one an LLVM token maps to
+                     * through name_to_generic.  For a register no key
+                     * reaches, llvm_rd and llvm_wr are zero BY
+                     * CONSTRUCTION whatever MCInstrDesc says, and the
+                     * honest report is that the question is unanswerable
+                     * here -- FINDING 62-B, where fifteen of nineteen
+                     * adjudicated rows sat on this hole and one of them
+                     * (x86_64 REG_SSP, which LLVM names on 66 opcodes) was
+                     * false because of it.
+                     */
+                    bool zero = !llvmcov_rd[g] && !llvmcov_wr[g]
+                                && wirecov_src[g];
+                    const char *tag = "";
+                    if (zero) {
+                        if (!regcov_indexable.count(g))
+                            tag = "UNANSWERABLE-NO-INDEX-KEY";
+                        else if (regcov_all_tokens_dropped(g))
+                            tag = "UNANSWERABLE-TOKEN-DROPPED";
+                        else
+                            tag = "REFERENCE-HAS-NO-OPERAND";
+                    }
                     printf("REGCOV %-16s llvm_rd=%-10lu llvm_wr=%-10lu "
                            "wire_src=%-10lu %s\n",
                            n ? n : "?", llvmcov_rd[g], llvmcov_wr[g],
-                           wirecov_src[g],
-                           (!llvmcov_rd[g] && !llvmcov_wr[g] && wirecov_src[g])
-                               ? "REFERENCE-HAS-NO-OPERAND" : "");
+                           wirecov_src[g], tag);
                 }
+                printf("# regcov index: %zu ids nameable, %u key(s) added "
+                       "from QEMU's own system-register names\n",
+                       regcov_indexable.size(), regcov_sysreg_keys);
             }
             if (getenv("ISAX_DUMP_UNREACHED"))
                 for (const auto &kv : srcenc_unreached_by_mnem)

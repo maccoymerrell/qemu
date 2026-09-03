@@ -9,7 +9,7 @@
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
  * is /mnt/md0/QEMU/cst_runs/verify51/snapre/snapU, 402 sidecar(s):
- *   x86_64   115 sidecar(s), 12 row(s), 4 REFUSED (reason on each row below)
+ *   x86_64   115 sidecar(s), 10 row(s), 6 REFUSED (reason on each row below)
  *   aarch64  149 sidecar(s), 9 row(s), 17 REFUSED (reason on each row below)
  *   riscv64  69 sidecar(s), 25 row(s), 6 REFUSED (reason on each row below)
  *   mipsel   69 sidecar(s), 5 row(s)
@@ -44,7 +44,7 @@ typedef struct {
     unsigned              n;
 } SrcSurvivorTable;
 
-/* x86_64 -- 12 rows, 1657 census entries, from 115 sidecar(s) */
+/* x86_64 -- 10 rows, 1643 census entries, from 115 sidecar(s) */
 /* REFUSED, not carried: 0x000004feu SETcc REG_GPR13 (setb x1) --
  * this decode id carries another FIXED row from the SAME
  * NUMBERED BANK, so the pair claims one rule reads two
@@ -89,6 +89,24 @@ typedef struct {
  * emulator's own statement; this row published the
  * deriving corpus's instead.  An adjudicated correction
  * under R15/R16, not a loss under R12.1. */
+/* REFUSED, not carried: 0x11a75e40u decode-new/x87@11011001..111... REG_SEG0 (fnstcw x7) --
+ * disas/capstone.c already DROPS this register for this
+ * instruction class as a disassembler defect, so the
+ * operand walk no longer supplies it and this table would
+ * be its only remaining supplier -- re-adding, one layer
+ * up, the dependency the boundary removed.  QEMU refutes
+ * it at its own decode site as well.  An ADJUDICATED
+ * CORRECTION under R15/R16: a register the instruction
+ * cannot read was never information. */
+/* REFUSED, not carried: 0xa459584bu decode-new/x87@11011101..111... REG_SEG0 (fnstsw x7) --
+ * disas/capstone.c already DROPS this register for this
+ * instruction class as a disassembler defect, so the
+ * operand walk no longer supplies it and this table would
+ * be its only remaining supplier -- re-adding, one layer
+ * up, the dependency the boundary removed.  QEMU refutes
+ * it at its own decode site as well.  An ADJUDICATED
+ * CORRECTION under R15/R16: a register the instruction
+ * cannot read was never information. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x74 */
     { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x44 */
@@ -96,10 +114,8 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, "CPUID" },   /* cpuid x390 */
     { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, "CPUID" },   /* cpuid x390 */
     { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x580 */
-    { 0x11a75e40u, SRC_SURV_FIXED, REG_SEG0      , 0, "decode-new/x87@11011001..111..." },   /* fnstcw x7 */
     { 0x44ae204eu, SRC_SURV_FIXED, REG_FPR1      , 0, "decode-new/x87@1101110111000..." },   /* ffree x7 */
     { 0x5f43c580u, SRC_SURV_FIXED, REG_GPR12     , 0, "decode-new/x87@1101111111100000" },   /* fnstsw x7 */
-    { 0xa459584bu, SRC_SURV_FIXED, REG_SEG0      , 0, "decode-new/x87@11011101..111..." },   /* fnstsw x7 */
     { 0xdb9bac2bu, SRC_SURV_FIXED, REG_SSP       , 0, "decode-new/NOP@f3=1,modrm=11001..." },   /* rdsspq x39 */
     { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
 };
@@ -357,6 +373,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 51 rows over the four ISAs. */
+/* 49 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

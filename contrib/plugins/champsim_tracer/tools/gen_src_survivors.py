@@ -186,6 +186,30 @@ import sys
 import tempfile
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
+
+#: REGISTERS `disas/capstone.c` ALREADY DROPS, by (isa, decode-rule
+#: substring, register-name prefix).  See REFUSAL 7.  Each row names the
+#: boundary function that makes the drop, so a boundary repair that is
+#: retired on a Capstone bump leaves a row here with nothing to match and the
+#: dead-rule detector can see it.
+BOUNDARY_DROPS = (
+    # cap_x86_is_x87_escape(): Capstone 6.0.0-Alpha7 names a SEGMENT REGISTER
+    # in the implicit read list of every x87 escape -- `fcoms (%rax)` comes
+    # back reading SS and `ficoms (%rax)` reading DS, for a shape that
+    # `movl (%rax),%eax` reports no segment for at all.  The boundary drops
+    # all six because "the only segment an access genuinely takes an input
+    # from is an override, and an override arrives as the memory operand's
+    # segment_id".
+    #
+    # The two rows this refuses are `fnstcw` and the memory form of `fnstsw`,
+    # both claiming REG_SEG0 (CS).  QEMU refutes them at its own decode site:
+    # translate.c sets `update_fip = update_fdp = false` for both, so the
+    # `segs[R_CS].selector` load that every FIP-updating x87 instruction
+    # emits is not emitted for these -- and the SDM says the same thing, by
+    # listing FNSTCW and FNSTSW among the control instructions that do not
+    # update the FPU instruction pointer.
+    ("x86_64", "x87", "REG_SEG"),
+)
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
 # The SECOND survivor block, same columns and same role measurement, and a
 # DIFFERENT CLAIM: a published source on an instruction whose read list QEMU
@@ -437,6 +461,28 @@ def emit(out, inputs, src):
             if b and len(banked.get((did, b), ())) > 1:
                 refused[isa].append((key, per[isa].pop(key), "FROZEN"))
 
+    # REFUSAL 7, applied last so a row already refused for a structural
+    # reason keeps that reason: THE DECODE BOUNDARY ALREADY DROPS THIS
+    # REGISTER FOR THIS INSTRUCTION CLASS.
+    #
+    # A survivor row is a register the WIRE published and QEMU did not state.
+    # When `disas/capstone.c` explicitly removes that register from that
+    # instruction class as a DISASSEMBLER DEFECT, the operand walk stops
+    # supplying it and this table becomes its only remaining supplier -- so a
+    # row here re-adds, one layer up, exactly the dependency the boundary
+    # just took out.  That is not the loss direction R12.1 protects: a
+    # register the boundary has ruled the instruction cannot read was never
+    # information, so the removal is an ADJUDICATED CORRECTION under R15/R16.
+    for isa in ISAS:
+        for key in list(per[isa]):
+            did, role, reg = key
+            rule = per[isa][key][0]
+            for b_isa, b_rule, b_pfx in BOUNDARY_DROPS:
+                if isa == b_isa and b_rule in rule and (reg or "").startswith(
+                        b_pfx):
+                    refused[isa].append((key, per[isa].pop(key), "BOUNDARY"))
+                    break
+
     w = []
     a = w.append
     a("/*")
@@ -511,6 +557,15 @@ def emit(out, inputs, src):
                 a(" * instruction, so an id-keyed row would fire on the others")
                 a(" * too.  It stays in the loss direction and blocks the flip")
                 a(" * until the id is qualified. */")
+            elif why == "BOUNDARY":
+                a(" * disas/capstone.c already DROPS this register for this")
+                a(" * instruction class as a disassembler defect, so the")
+                a(" * operand walk no longer supplies it and this table would")
+                a(" * be its only remaining supplier -- re-adding, one layer")
+                a(" * up, the dependency the boundary removed.  QEMU refutes")
+                a(" * it at its own decode site as well.  An ADJUDICATED")
+                a(" * CORRECTION under R15/R16: a register the instruction")
+                a(" * cannot read was never information. */")
             elif why == "FROZEN":
                 a(" * this decode id carries another FIXED row from the SAME")
                 a(" * NUMBERED BANK, so the pair claims one rule reads two")
@@ -586,6 +641,9 @@ def emit(out, inputs, src):
                      "a FROZEN ENCODED OPERAND: the id carries another FIXED "
                      "row from the same numbered bank"
                      if why == "FROZEN" else
+                     "the DECODE BOUNDARY already drops this register for "
+                     "this instruction class"
+                     if why == "BOUNDARY" else
                      "ADJUDICATION-OWED, an open maintainer question"))
         if not per[isa]:
             print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "

@@ -2985,6 +2985,7 @@ static void gen_note_fstat_read(void)
 }
 
 #include "io_operands.c.inc"
+#include "trap_operands.c.inc"
 #include "emit.c.inc"
 
 /*

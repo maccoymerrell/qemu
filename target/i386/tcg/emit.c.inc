@@ -2557,6 +2557,7 @@ static void gen_INSERTQ_r(DisasContext *s, X86DecodedInsn *decode)
 static void gen_INT(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_interrupt(s, decode->immediate);
+    gen_trap_operands_note_gate();  /* trap_operands */
 }
 
 static void gen_INT1(DisasContext *s, X86DecodedInsn *decode)
@@ -2565,11 +2566,13 @@ static void gen_INT1(DisasContext *s, X86DecodedInsn *decode)
     gen_update_eip_next(s);
     gen_helper_icebp(tcg_env);
     s->base.is_jmp = DISAS_NORETURN;
+    gen_trap_operands_note_gate();  /* trap_operands */
 }
 
 static void gen_INT3(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_interrupt(s, EXCP03_INT3);
+    gen_trap_operands_note_gate();  /* trap_operands */
 }
 
 static void gen_INTO(DisasContext *s, X86DecodedInsn *decode)
@@ -2577,6 +2580,7 @@ static void gen_INTO(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_into(tcg_env, cur_insn_len_i32(s));
+    gen_trap_operands_note_gate();  /* trap_operands */
 }
 
 static void gen_IRET(DisasContext *s, X86DecodedInsn *decode)

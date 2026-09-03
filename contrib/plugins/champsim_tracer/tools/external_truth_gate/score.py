@@ -52,6 +52,16 @@ HEADLINE = {
     'gem5wp':  (re.compile(r'THE NUMBER THAT MATTERS:\s*WP-DEFECT \+ RECONSTRUCTION-GAP \+\s*\n\s*UNACCOUNTED\s*=\s*(\d+)'), 'int'),
     'spikewp': (re.compile(r'THE NUMBER THAT MATTERS:\s*WP-DEFECT \+ RECONSTRUCTION-GAP \+\s*\n\s*UNACCOUNTED\s*=\s*(\d+)'), 'int'),
     'pin':     (re.compile(r'SUBSET \+ UNACCOUNTED \(the criterion; must be 0\):\s*(\d+)'), 'int'),
+    # THE DEPENDENCY MAP, and it is scored in BOTH directions by two rows
+    # over the SAME report.  `depmap` is the loss direction -- the map omits
+    # an edge gem5 states -- and `depmapprec` is the precision the map
+    # discards.  Two rows rather than one sum, because a sum lets a new loss
+    # hide behind a retired over-approximation; and both rather than the loss
+    # alone, because three of the instrument's five falsifiers land in the
+    # precision column, so a gate holding only the loss number could not see
+    # the arms that prove the axis convicts.  See score_depmap.py.
+    'depmap':     (None, 'depmap'),
+    'depmapprec': (None, 'depmapprec'),
 }
 
 # The population each leg actually compared.  A leg reporting zero
@@ -64,6 +74,9 @@ FLOOR = {
     'gem5wp':  re.compile(r'^TOTAL\s+(\d+)', re.M),
     'spikewp': re.compile(r'^TOTAL\s+(\d+)', re.M),
     'pin':     re.compile(r'lockstep walk:\s*(\d+) byte-identical pairs'),
+    # the number of dependency FACTS compared, summed over the four axes
+    'depmap':     re.compile(r'^TOTAL FACTS = (\d+)', re.M),
+    'depmapprec': re.compile(r'^TOTAL FACTS = (\d+)', re.M),
 }
 
 
@@ -182,6 +195,39 @@ def score_one(row, root, binary_mtime):
                     'runs and the tracer never decoded drops the WHOLE '
                     'instruction; it is never folded into a rate.'
                     % hm.group(4))
+    elif kind in ('depmap', 'depmapprec'):
+        # An INERT axis is checked FIRST and on BOTH rows.  An axis that
+        # compared nothing contributes 0 to the loss count and 0 to the
+        # precision count, so either number would read like a pass for the
+        # one reason that is never a pass -- the probe stopped reaching that
+        # family.  The per-axis floor cannot catch it either, because the
+        # floor is the SUM over axes.
+        im = re.search(r'^INERT AXES = (\d+)', text, re.M)
+        if not im:
+            return (False, None, None,
+                    'INERT-AXIS LINE NOT FOUND in %s.  The report changed '
+                    'shape; that is a failure, not a zero.' % path)
+        want = (r'^THE NUMBER THAT MATTERS: MISSING-EDGE \+ BOTH = (\d+)'
+                if kind == 'depmap' else
+                r'^PRECISION-DISCARDED \(STRICTLY-SMALLER\) = (\d+)')
+        hm = re.search(want, text, re.M)
+        if not hm:
+            return (False, None, None,
+                    'HEADLINE NOT FOUND in %s.  The report changed shape or '
+                    'the leg died before writing it; either way this is a '
+                    'failure, not a zero.' % path)
+        headline = int(hm.group(1))
+        fm = FLOOR[row.leg].search(text)
+        if not fm:
+            return (False, headline, None,
+                    'SCORED POPULATION NOT FOUND in %s -- a headline with no '
+                    'denominator cannot be believed.' % path)
+        scored = int(fm.group(1))
+        if int(im.group(1)) != 0:
+            return (False, headline, scored,
+                    'INERT AXES = %s.  An axis that compared nothing reports '
+                    'no disagreement for the wrong reason; it is a demand for '
+                    'a better probe, never a pass.' % im.group(1))
     elif kind == 'isax':
         arms = pat.findall(text)
         if not arms:
@@ -268,21 +314,21 @@ def main():
     else:
         print('staleness ref : NOT CHECKED (no --build-dir)')
     print('')
-    print('%-8s %-8s %9s %9s %9s  %s'
+    print('%-10s %-8s %9s %9s %9s  %s'
           % ('leg', 'isa', 'headline', 'ceiling', 'scored', 'verdict'))
-    print('-' * 78)
+    print('-' * 80)
 
     failures = []
     for r in rows:
         if only is not None and r.leg not in only:
-            print('%-8s %-8s %9s %9d %9s  NOT RUN -- fails the gate'
+            print('%-10s %-8s %9s %9d %9s  NOT RUN -- fails the gate'
                   % (r.leg, r.isa, '-', r.ceiling, '-'))
             failures.append((r, 'NOT RUN: this leg was excluded by --only.  '
                                 'The flow is a gate, so a leg that did not run '
                                 'is a failure, not a skip.'))
             continue
         ok, headline, scored, why = score_one(r, a.root, binary_mtime)
-        print('%-8s %-8s %9s %9d %9s  %s'
+        print('%-10s %-8s %9s %9d %9s  %s'
               % (r.leg, r.isa,
                  '-' if headline is None else headline, r.ceiling,
                  '-' if scored is None else scored,

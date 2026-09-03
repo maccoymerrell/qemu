@@ -486,6 +486,33 @@ def report(a, tallies, per_family, imm_masks, notes, fam_seen, fam_smaller,
         os.path.basename(g) for g in a.guests)))
     w('alignment: %s' % dict(align_notes))
     w('')
+
+    # ---- THE HEADLINE BLOCK -- what the R13 gate reads ---------------------
+    #
+    # This leg is scored by external_truth_gate/score.py, and that scorer
+    # refuses to guess: a headline it cannot parse is a FAILURE and never a
+    # zero.  So the three numbers it holds against the manifest are stated
+    # here, on their own lines, by the process that computed them.
+    #
+    # TWO ceilings, not one, and the reason is the falsifiers.  The loss
+    # direction (MISSING-EDGE + BOTH -- the map omits an edge the reference
+    # states) is what R12.1 forbids, and it is the criterion.  But three of
+    # the five falsifiers this instrument carries -- add-edge, all-to-all and
+    # part of drop-addr-edge -- land in STRICTLY-SMALLER, so a gate holding
+    # only the loss number would be BLIND to the arms that prove the axis can
+    # convict.  The precision number is therefore held at its adjudicated
+    # measurement too, exactly like `pin`: no margin, and a row above it is a
+    # finding to open rather than slack to spend.
+    loss = sum(tallies[ax].missing + tallies[ax].both for ax in AXES)
+    prec = sum(tallies[ax].smaller for ax in AXES)
+    facts = sum(tallies[ax].facts for ax in AXES)
+    inert = [ax for ax in AXES if tallies[ax].facts == 0]
+    w('THE NUMBER THAT MATTERS: MISSING-EDGE + BOTH = %d' % loss)
+    w('PRECISION-DISCARDED (STRICTLY-SMALLER) = %d' % prec)
+    w('TOTAL FACTS = %d' % facts)
+    w('INERT AXES = %d%s' % (len(inert),
+                             ('  [%s]' % ' '.join(inert)) if inert else ''))
+    w('')
     w('## axes')
     w('')
     w('| axis | facts | agree | MISSING-EDGE | STRICTLY-SMALLER | BOTH |')

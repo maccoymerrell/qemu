@@ -335,6 +335,44 @@ static void note_sve_pred_read(int pg)
 }
 
 /*
+ * THE PREDICATE THE ENCODING NAMES AS ITS DESTINATION.
+ *
+ * The write twin of note_sve_pred_read(), and it is needed for the same
+ * reason in the same place: the predicate file has no TCG global and no
+ * declaration, so a write to Pd arrives at the extraction as an anonymous
+ * CPUArchState byte range and leaves the instruction with NO destination at
+ * all.  Every form below reaches its Pd one of three ways -- a gvec expander
+ * given pred_full_reg_offset(), a plain tcg_gen_st_i64() into that offset, or
+ * a pointer handed to a helper -- and none of the three carries a name.
+ *
+ * BY NAME AND NOT BY RANGE, which is the read side's rule and holds here for
+ * the same measured reason: declaring the predicate file would rename every
+ * other access to those bytes, including the pointer a predicate-producing
+ * helper is handed, whose direction the extraction cannot see.  The name form
+ * states the one fact this site knows.
+ *
+ * IT IS CALLED ONLY WHERE THE SITE KNOWS THE REGISTER IS A DESTINATION, and
+ * only for the architectural destination: the governing predicate Pg is a
+ * source on every form and is never stated here.  Where a form both reads and
+ * writes one register -- PFIRST/PNEXT's Pdn, BRKA/BRKB merging -- the site
+ * states both, in the direction each applies.
+ *
+ * THE WRITE IS UNCONDITIONAL IN THE ENCODING'S OWN TERMS (R17): a merging
+ * form writes its destination whether or not the governing predicate selects
+ * any element, because the architecture defines the unselected elements as
+ * retaining their previous value, which is a read-modify-write of the same
+ * register and not an absence of one.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_sve_pred_write(int pd)
+{
+    if (pd >= 0 && pd < (int)ARRAY_SIZE(sve_pred_names)) {
+        insn_dataflow_note_stated_write_name(sve_pred_names[pd]);
+    }
+}
+
+/*
  * A DATA VECTOR THE ENCODING NAMES AS A SOURCE, stated by RANGE.
  *
  * The counterpart of note_sve_pred_read() for the other file, and by range
@@ -357,6 +395,7 @@ static void note_sve_vec_read(DisasContext *s, int z)
     insn_dataflow_note_stated_read_env(vec_full_reg_offset(s, z),
                                        vec_full_reg_size(s));
 }
+
 
 /* Invoke an out-of-line helper on 4 Zregs, 1 Preg, plus fpst. */
 static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
@@ -610,6 +649,7 @@ static bool gen_gvec_fn_ppp(DisasContext *s, GVecGen3Fn *gvec_fn,
          */
         note_sve_pred_read(rn);
         note_sve_pred_read(rm);
+        note_sve_pred_write(rd);
 
         gvec_fn(MO_64, pred_full_reg_offset(s, rd),
                 pred_full_reg_offset(s, rn),
@@ -625,6 +665,7 @@ static bool do_mov_p(DisasContext *s, int rd, int rn)
         unsigned psz = pred_gvec_reg_size(s);
 
         note_sve_pred_read(rn);
+        note_sve_pred_write(rd);
         tcg_gen_gvec_mov(MO_8, pred_full_reg_offset(s, rd),
                          pred_full_reg_offset(s, rn), psz, psz);
     }
@@ -1394,6 +1435,7 @@ static bool do_pppp_flags(DisasContext *s, arg_rprr_s *a,
     note_sve_pred_read(a->rn);
     note_sve_pred_read(a->rm);
     note_sve_pred_read(a->pg);
+    note_sve_pred_write(a->rd);
 
     if (!a->s) {
         tcg_gen_gvec_4(dofs, nofs, mofs, gofs, psz, psz, gvec_op);
@@ -1545,6 +1587,7 @@ static bool trans_SEL_pppp(DisasContext *s, arg_rprr_s *a)
         note_sve_pred_read(a->pg);
         note_sve_pred_read(a->rn);
         note_sve_pred_read(a->rm);
+        note_sve_pred_write(a->rd);
         tcg_gen_gvec_bitsel(MO_8, pred_full_reg_offset(s, a->rd),
                             pred_full_reg_offset(s, a->pg),
                             pred_full_reg_offset(s, a->rn),
@@ -1754,6 +1797,15 @@ static bool do_predset(DisasContext *s, int esz, int rd, int pat, bool setflag)
     uint64_t word, lastword;
     TCGv_i64 t;
 
+    /*
+     * PTRUE, PFALSE and SETFFR all WRITE their predicate and read nothing:
+     * the value stored is decided by the pattern field at translation time.
+     * Every lowering below -- the single store, the gvec dup, the unrolled
+     * loop -- lands in the same register, so the statement is made once here
+     * rather than per arm.
+     */
+    note_sve_pred_write(rd);
+
     numelem = decode_pred_count(fullsz, pat, esz);
 
     /* Determine what we must store into each bit, and how many.  */
@@ -1865,6 +1917,7 @@ static bool do_pfirst_pnext(DisasContext *s, arg_rr_esz *a,
      */
     note_sve_pred_read(a->rn);
     note_sve_pred_read(a->rd);
+    note_sve_pred_write(a->rd);
 
     tcg_gen_addi_ptr(t_pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2462,6 +2515,7 @@ static bool do_perm_pred3(DisasContext *s, arg_rrr_esz *a, bool high_odd,
 
     note_sve_pred_read(a->rn);
     note_sve_pred_read(a->rm);
+    note_sve_pred_write(a->rd);
 
     tcg_gen_addi_ptr(t_d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2484,6 +2538,7 @@ static bool do_perm_pred2(DisasContext *s, arg_rr_esz *a, bool high_odd,
     uint32_t desc = 0;
 
     note_sve_pred_read(a->rn);
+    note_sve_pred_write(a->rd);
 
     tcg_gen_addi_ptr(t_d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -2943,6 +2998,7 @@ static bool do_ppzz_flags(DisasContext *s, arg_rprr_esz *a,
     note_sve_pred_read(a->pg);
     note_sve_vec_read(s, a->rn);
     note_sve_vec_read(s, a->rm);
+    note_sve_pred_write(a->rd);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(zm, tcg_env, vec_full_reg_offset(s, a->rm));
@@ -3018,6 +3074,7 @@ static bool do_ppzi_flags(DisasContext *s, arg_rpri_esz *a,
 
     note_sve_pred_read(a->pg);
     note_sve_vec_read(s, a->rn);
+    note_sve_pred_write(a->rd);
     tcg_gen_addi_ptr(pd, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(zn, tcg_env, vec_full_reg_offset(s, a->rn));
     tcg_gen_addi_ptr(pg, tcg_env, pred_full_reg_offset(s, a->pg));
@@ -3072,6 +3129,7 @@ static bool do_brk3(DisasContext *s, arg_rprr_s *a,
     note_sve_pred_read(a->pg);
     note_sve_pred_read(a->rn);
     note_sve_pred_read(a->rm);
+    note_sve_pred_write(a->rd);
 
     tcg_gen_addi_ptr(d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -3117,6 +3175,7 @@ static bool do_brk2(DisasContext *s, arg_rpr_s *a,
     if (rd_is_src) {
         note_sve_pred_read(a->rd);
     }
+    note_sve_pred_write(a->rd);
 
     tcg_gen_addi_ptr(d, tcg_env, pred_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(n, tcg_env, pred_full_reg_offset(s, a->rn));
@@ -3417,6 +3476,7 @@ static bool trans_WHILE(DisasContext *s, arg_WHILE *a)
     desc = FIELD_DP32(desc, PREDDESC, ESZ, a->esz);
 
     ptr = tcg_temp_new_ptr();
+    note_sve_pred_write(a->rd);
     tcg_gen_addi_ptr(ptr, tcg_env, pred_full_reg_offset(s, a->rd));
 
     if (a->lt) {
@@ -3480,6 +3540,7 @@ static bool trans_WHILE_ptr(DisasContext *s, arg_WHILE_ptr *a)
     desc = FIELD_DP32(desc, PREDDESC, ESZ, a->esz);
 
     ptr = tcg_temp_new_ptr();
+    note_sve_pred_write(a->rd);
     tcg_gen_addi_ptr(ptr, tcg_env, pred_full_reg_offset(s, a->rd));
 
     gen_helper_sve_whilel(t2, ptr, t2, tcg_constant_i32(desc));
@@ -3896,6 +3957,7 @@ static bool do_ppz_fp(DisasContext *s, arg_rpr_esz *a,
             fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
 
         note_sve_pred_read(a->pg);
+        note_sve_pred_write(a->rd);
         tcg_gen_gvec_3_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            pred_full_reg_offset(s, a->pg),
@@ -4143,6 +4205,7 @@ static bool do_fp_cmp(DisasContext *s, arg_rprr_esz *a,
         unsigned vsz = vec_full_reg_size(s);
         TCGv_ptr status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
         note_sve_pred_read(a->pg);
+        note_sve_pred_write(a->rd);
         tcg_gen_gvec_4_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm),
@@ -4600,6 +4663,7 @@ static bool trans_LDR_pri(DisasContext *s, arg_rri *a)
     if (sve_access_check(s)) {
         int size = pred_full_reg_size(s);
         int off = pred_full_reg_offset(s, a->rd);
+        note_sve_pred_write(a->rd);
         gen_sve_ldr(s, tcg_env, off, size, a->rn, a->imm * size);
     }
     return true;
@@ -7635,6 +7699,7 @@ static bool trans_PSEL(DisasContext *s, arg_psel *a)
      */
     note_sve_pred_read(a->pn);
     note_sve_pred_read(a->pm);
+    note_sve_pred_write(a->pd);
 
     /* Compute the predicate element. */
     tcg_gen_addi_i64(tmp, cpu_reg(s, a->rv), a->imm);

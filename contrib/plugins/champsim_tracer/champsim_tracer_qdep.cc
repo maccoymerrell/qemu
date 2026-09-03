@@ -2702,7 +2702,23 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                 tally(&g_discard_unmapped_name, "?");
                 continue;
             } else {
+                /*
+                 * BOTH STAGES, the same two the named-READ path takes.  The
+                 * fold layer is not optional and was not optional here
+                 * either: aarch64's X30 is spelled "lr" by TCG and "x30" by
+                 * the GDB stub, so `setm`/`cpym`'s indexed write of Xd == 30
+                 * -- a name the DECODE SITE states, from regnames[] -- found
+                 * no row and was dropped, and the instruction published a
+                 * destination list short by the register it exists to
+                 * update.  Measured at 1,440 registers on the aarch64
+                 * destination bar.  A spelling QEMU can state as a read and
+                 * cannot state as a write is a defect in this map, not an
+                 * answer QEMU declined to give.
+                 */
                 gen = generic_for_qemu_name(dc[i].reg);
+                if (gen >= REG_ID_COUNT) {
+                    gen = fold_nonarch(dc[i].reg);
+                }
                 if (gen >= REG_ID_COUNT) {
                     tally(&g_discard_unmapped_name, dc[i].reg);
                     continue;
@@ -2805,7 +2821,11 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                 tally(&g_named_write_unmapped_name, "?");
                 continue;
             }
+            /* Both stages; see the discard path above for why. */
             gen = generic_for_qemu_name(nw[i].reg);
+            if (gen >= REG_ID_COUNT) {
+                gen = fold_nonarch(nw[i].reg);
+            }
             if (gen >= REG_ID_COUNT) {
                 tally(&g_named_write_unmapped_name, nw[i].reg);
                 continue;

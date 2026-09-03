@@ -963,6 +963,43 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
     }
 }
 
+/*
+ * THE FLAG AN INSTRUCTION READS THAT QEMU ALREADY KNOWS THE VALUE OF.
+ *
+ * The lazy-flag representation carries the OPERANDS of the last flag-setting
+ * instruction rather than EFLAGS itself, so the arms below can answer a flag
+ * query from s->cc_op alone: after a logic op CF and OF are architecturally
+ * zero, after `popcnt` CF, OF and SF are, and gen_prepare_eflags_c/o/s hand
+ * their caller TCG_COND_NEVER and emit nothing at all.  No op reads a global,
+ * so a walk of the op stream finds no flag read, and `adcw` -- whose SDM
+ * Operation is DEST <- DEST + SRC + CF -- reaches a consumer with no
+ * REG_FLAGS in its source list while the very same instruction one cc_op
+ * later has one.
+ *
+ * One architectural question with two answers depending on what the PREVIOUS
+ * instruction was is the defect; R17 requires the source set to be invocation
+ * invariant, R15 says QEMU resolving the question early is a lowering
+ * decision and not architectural truth, and R16 records the dependency
+ * regardless of the machine state that makes its value predictable.  So the
+ * folded arms STATE the read the emitted arms perform.
+ *
+ * NOT THE ZERO-SHIFT CASE.  9075cbf1a1 removed a published flag from
+ * `shl $0` because the ISA says a shift by an encoded zero touches no flag --
+ * the instruction genuinely has no flag dependency there.  This is the
+ * opposite shape: the dependency is in the instruction's own Operation
+ * section and only its VALUE is known early, which R16 says is not a reason
+ * to drop it.
+ *
+ * Stated under the GDB stub's name for the word, which is how the direction
+ * flag's declaration already names EFLAGS on this target.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_folded_eflags_read(void)
+{
+    insn_dataflow_note_stated_read_name("eflags");
+}
+
 /* compute eflags.C, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
@@ -987,6 +1024,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
+        gen_note_folded_eflags_read();
         return (CCPrepare) { .cond = TCG_COND_NEVER };
 
     case CC_OP_INCB ... CC_OP_INCQ:
@@ -1058,6 +1096,7 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
         return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
                              .imm = CC_S };
     case CC_OP_POPCNT:
+        gen_note_folded_eflags_read();
         return (CCPrepare) { .cond = TCG_COND_NEVER };
     default:
         return gen_prepare_sign_nz(cpu_cc_dst, cc_op_size(s->cc_op));
@@ -1074,6 +1113,7 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
                              .no_setcond = true };
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
+        gen_note_folded_eflags_read();
         return (CCPrepare) { .cond = TCG_COND_NEVER };
     case CC_OP_MULB ... CC_OP_MULQ:
         return (CCPrepare) { .cond = TCG_COND_NE, .reg = cpu_cc_src };

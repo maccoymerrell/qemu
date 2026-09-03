@@ -669,9 +669,36 @@ static TCGv eip_cur_tl(DisasContext *s)
 /* Compute SEG:REG into DEST.  SEG is selected from the override segment
    (OVR_SEG) and the default segment (DEF_SEG).  OVR_SEG may be -1 to
    indicate no override.  */
+/*
+ * WHICH SEGMENT'S BASE AN ADDRESS COMPUTATION ADDS, or -1 for none.
+ *
+ * Split out of gen_lea_v_seg_dest() below, which used to decide it inline,
+ * because a second caller has to ask the identical question about an access
+ * it never emitted: io_operands.c.inc states the segment read of an `outs`
+ * whose body gen_check_io() refused, and a copy of this rule there would be
+ * a copy that goes stale the first time the addressing rules move.
+ */
+static int gen_lea_seg_of(DisasContext *s, MemOp aflag, int def_seg,
+                          int ovr_seg)
+{
+    switch (aflag) {
+#ifdef TARGET_X86_64
+    case MO_64:
+        return ovr_seg;
+#endif
+    case MO_32:
+    case MO_16:
+        return (ovr_seg < 0 && ADDSEG(s)) ? def_seg : ovr_seg;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
                                int def_seg, int ovr_seg)
 {
+    ovr_seg = gen_lea_seg_of(s, aflag, def_seg, ovr_seg);
+
     switch (aflag) {
 #ifdef TARGET_X86_64
     case MO_64:
@@ -683,9 +710,6 @@ static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
 #endif
     case MO_32:
         /* 32 bit address */
-        if (ovr_seg < 0 && ADDSEG(s)) {
-            ovr_seg = def_seg;
-        }
         if (ovr_seg < 0) {
             tcg_gen_ext32u_tl(dest, a0);
             return;
@@ -696,11 +720,7 @@ static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
         tcg_gen_ext16u_tl(dest, a0);
         a0 = dest;
         if (ovr_seg < 0) {
-            if (ADDSEG(s)) {
-                ovr_seg = def_seg;
-            } else {
-                return;
-            }
+            return;
         }
         break;
     default:
@@ -2964,6 +2984,7 @@ static void gen_note_fstat_read(void)
                                        sizeof(((CPUX86State *)0)->fpstt));
 }
 
+#include "io_operands.c.inc"
 #include "emit.c.inc"
 
 /*

@@ -2501,13 +2501,13 @@ static void gen_IN(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_trunc_tl_i32(port, s->T0);
     tcg_gen_ext16u_i32(port, port);
-    if (!gen_check_io(s, ot, port, SVM_IOIO_TYPE_MASK)) {
-        return;
+    if (gen_check_io(s, ot, port, SVM_IOIO_TYPE_MASK)) {
+        translator_io_start(&s->base);
+        gen_helper_in_func(ot, s->T0, port);
+        gen_writeback(s, decode, 0, s->T0);
+        gen_bpt_io(s, port, ot);
     }
-    translator_io_start(&s->base);
-    gen_helper_in_func(ot, s->T0, port);
-    gen_writeback(s, decode, 0, s->T0);
-    gen_bpt_io(s, port, ot);
+    gen_io_operands_note_port(R_EAX);
 }
 
 static void gen_INC(DisasContext *s, X86DecodedInsn *decode)
@@ -2531,13 +2531,12 @@ static void gen_INS(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_trunc_tl_i32(port, s->T1);
     tcg_gen_ext16u_i32(port, port);
-    if (!gen_check_io(s, ot, port,
-                      SVM_IOIO_TYPE_MASK | SVM_IOIO_STR_MASK)) {
-        return;
+    if (gen_check_io(s, ot, port,
+                     SVM_IOIO_TYPE_MASK | SVM_IOIO_STR_MASK)) {
+        translator_io_start(&s->base);
+        gen_repz(s, ot, gen_ins);
     }
-
-    translator_io_start(&s->base);
-    gen_repz(s, ot, gen_ins);
+    gen_io_operands_note_string(s, R_EDI, R_ES, -1);
 }
 
 static void gen_INSERTQ_i(DisasContext *s, X86DecodedInsn *decode)
@@ -3077,13 +3076,13 @@ static void gen_OUT(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_trunc_tl_i32(port, s->T1);
     tcg_gen_ext16u_i32(port, port);
-    if (!gen_check_io(s, ot, port, 0)) {
-        return;
+    if (gen_check_io(s, ot, port, 0)) {
+        tcg_gen_trunc_tl_i32(value, s->T0);
+        translator_io_start(&s->base);
+        gen_helper_out_func(ot, port, value);
+        gen_bpt_io(s, port, ot);
     }
-    tcg_gen_trunc_tl_i32(value, s->T0);
-    translator_io_start(&s->base);
-    gen_helper_out_func(ot, port, value);
-    gen_bpt_io(s, port, ot);
+    gen_io_operands_note_port(-1);
 }
 
 static void gen_OUTS(DisasContext *s, X86DecodedInsn *decode)
@@ -3093,12 +3092,11 @@ static void gen_OUTS(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_trunc_tl_i32(port, s->T1);
     tcg_gen_ext16u_i32(port, port);
-    if (!gen_check_io(s, ot, port, SVM_IOIO_STR_MASK)) {
-        return;
+    if (gen_check_io(s, ot, port, SVM_IOIO_STR_MASK)) {
+        translator_io_start(&s->base);
+        gen_repz(s, ot, gen_outs);
     }
-
-    translator_io_start(&s->base);
-    gen_repz(s, ot, gen_outs);
+    gen_io_operands_note_string(s, R_ESI, R_DS, s->override);
 }
 
 static void gen_PALIGNR(DisasContext *s, X86DecodedInsn *decode)

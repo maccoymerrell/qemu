@@ -2687,6 +2687,32 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     s->vex_w = false;
     s->has_modrm = false;
     s->prefix = 0;
+    goto next_byte;
+
+    /*
+     * THE REX PREFIX IS POSITIONAL, AND A LEGACY PREFIX AFTER IT RETIRES IT.
+     * SDM Vol 2 2.2.1: "If used, the REX prefix byte must immediately precede
+     * the opcode byte or the escape opcode byte (0FH) ... other placements
+     * are ignored."  The collection loop below reaches this label from every
+     * legacy prefix, so a REX seen earlier in the same instruction stops
+     * applying the moment another prefix follows it.
+     *
+     * Without this, `f0 26 4c 66 11 22` decoded as
+     * `lock adc %r12w,%es:(%rdx)` -- the 66 was harmless and REX.R survived
+     * it -- where the architecture, binutils and LLVM all read
+     * `lock adc %sp,%es:(%rdx)`.  The same silence renumbered the byte
+     * registers, because REX_PREFIX(s) is what chooses %sil over %dh, and
+     * it made `4c 26 c5 f0 57 c0` (`es vxorps`) #UD on the VEX rule that
+     * forbids a REX *immediately* before the VEX escape.
+     */
+ legacy_prefix:
+#ifdef TARGET_X86_64
+    s->prefix &= ~PREFIX_REX;
+    s->rex_r = 0;
+    s->rex_x = 0;
+    s->rex_b = 0;
+    s->vex_w = false;
+#endif
 
  next_byte:
     b = x86_ldub_code(env, s);
@@ -2696,38 +2722,38 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     case 0xf3:
         s->prefix |= PREFIX_REPZ;
         s->prefix &= ~PREFIX_REPNZ;
-        goto next_byte;
+        goto legacy_prefix;
     case 0xf2:
         s->prefix |= PREFIX_REPNZ;
         s->prefix &= ~PREFIX_REPZ;
-        goto next_byte;
+        goto legacy_prefix;
     case 0xf0:
         s->prefix |= PREFIX_LOCK;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x2e:
         s->override = R_CS;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x36:
         s->override = R_SS;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x3e:
         s->override = R_DS;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x26:
         s->override = R_ES;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x64:
         s->override = R_FS;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x65:
         s->override = R_GS;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x66:
         s->prefix |= PREFIX_DATA;
-        goto next_byte;
+        goto legacy_prefix;
     case 0x67:
         s->prefix |= PREFIX_ADR;
-        goto next_byte;
+        goto legacy_prefix;
 #ifdef TARGET_X86_64
     case 0x40 ... 0x4f:
         if (CODE64(s)) {

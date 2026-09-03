@@ -257,4 +257,66 @@ its census and its deletion check, and the allowlist lines are left for the
 maintainer to accept as one decision rather than smuggled in beside a
 measurement of the thing they change.
 
+## THE DESTINATION SIDE: `rmif`, THE ONLY aarch64 ROW LEFT, ADJUDICATED
+
+The rows above are the SOURCE side.  One destination row is adjudicated the
+same way and belongs beside them, because it is the whole of what the
+aarch64 destination bar has left.
+
+**THE MEASUREMENT.**  At the tip, over 1,408,171 aarch64 encodings, the
+walk-only destination population -- registers the wire publishes as
+destinations that QEMU does not state -- is **90 encodings / 90 registers**,
+and it is five rows:
+
+    REG_FLAGS      82   disas_a64/RMIF                      rmif
+    REG_SYSCACHE    3   disas_a64/SYS@1101010100.01...      dc
+    REG_VCTRL       3   disas_a64/MSR_i_SVCR                smstop
+    REG_SYSEXC      1   disas_a64/ESB                       esb
+    REG_GPR16       1   disas_a64/NOP@110101010000001100... chkfeat
+
+**ALL 82 CARRY `mask == 0`, AND THAT IS MEASURED, NOT INFERRED.**  Of the
+192 `rmif` encodings the sled reaches, the 82 whose `REG_FLAGS` QEMU does not
+state have mask field 0 -- every one, across 28 distinct rotate amounts --
+and all 110 with a non-zero mask have it stated.  The split is exactly the
+mask bit.
+
+**THE ARCHITECTURE SAYS QEMU IS RIGHT.**  RMIF's operation writes
+`PSTATE.<N,Z,C,V>` bit by bit under `mask<3:0>`; with mask 0 no PSTATE bit is
+assigned.  `trans_RMIF()` emits an op per mask bit and therefore emits none,
+so its write list is empty and correct.
+
+**THE REFERENCE SAYS THE WIRE IS RIGHT.**  LLVM defines `RMIF` through
+`FlagRotate` -> `BaseFlagManipulation`
+(`llvm/lib/Target/AArch64/AArch64InstrFormats.td:2446-2468`), and that class
+carries
+
+    let Uses = [NZCV];
+    let Defs = [NZCV];
+
+with **no dependence on the mask operand** -- `Defs` is a property of the
+instruction class, and a static description has no other choice.  Every
+encoding, mask 0 included, is described as defining NZCV.  The tracer's
+destination list agrees with it exactly.
+
+**VERDICT: KEEP.  The deletion is REFUSED.**  Dropping `REG_FLAGS` from a
+mask-0 `rmif` would make the trace a strict subset of the reference on this
+encoding class, which is the direction the standing rule closes -- and the
+rule exists because two such deletions have already been killed at this
+gate.  What would justify it is a per-encoding fact read from the mask
+field, which is a precision the reference does not have and this project has
+not ruled it may exceed; that ruling is the retirement path, and it is
+named here rather than taken.
+
+**WHAT THIS ROW IS NOT.**  It is not a coverage gap and not a defect on
+either side: QEMU is architecturally exact, the wire matches the reference,
+and the 82 is the size of the gap between those two true statements.  It is
+also, since the FlagM extraction fix, the ONLY `REG_FLAGS` row here --
+`cfinv` and `xaflag` contributed 2 more until QEMU's writes for them stopped
+being struck as changes of representation, and their departure is what makes
+the destination ledger's six-class rollup reconcile exactly
+(44,316 - 90 = 44,226).
+
+Measured with `arc3_cov/instruments/dstbar.py` (untruncated per-register
+tables); evidence `/mnt/md0/QEMU/cst_runs/exec116/DSTBAR_tip_a64.txt`.
+
 Author: Maccoy Merrell.

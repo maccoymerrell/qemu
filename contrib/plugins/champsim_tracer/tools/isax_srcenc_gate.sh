@@ -51,9 +51,12 @@
 # that reaches nothing must not report all-clear.
 #
 # rc=0 every arm green, rc=1 an arm failed, rc=2 the gate could not look --
-# and "could not look" includes a BARE arm over an allowlist carrying
-# `SR-rd-*` rules, which that arm never scores.  See the NOT-A-FULL-GATE
-# roll-up in run_arms() and FINDING 65-D.
+# and "could not look" includes ANY arm over an allowlist carrying rules in
+# the read family that arm does not score.  A bare arm never scores
+# `SR-rd-*`; a `--srcenc` arm never scores `R-rd-*`/`FR-rd-*`.  Neither shape
+# is a whole gate on its own, and each is told so from its own
+# `unscored_family=` token.  See the NOT-A-FULL-GATE roll-up in run_arms(),
+# FINDING 65-D (the bare side) and FINDING 66V-D (the `--srcenc` side).
 #
 # Author: Maccoy Merrell.
 set -u
@@ -117,22 +120,41 @@ run_arms() {
             [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
             grep -hE '^# srcenc=|^# srcenc_join ' "$out/${layer:0:1}_$isa.txt" \
                 >> "$out/rc.txt" 2>/dev/null
-            # THE PARTIALITY OF A BARE ARM IS STATED, NOT INFERRED.
-            # isaxcheck exempts the `SR-rd-*` family from its dead-rule
-            # detector in a bare arm, because a bare arm never scores that
-            # family -- correct, and silent.  FINDING 65-D: two mipsel
+            # THE PARTIALITY OF AN ARM IS STATED, NOT INFERRED, AND IT IS
+            # NOT A PROPERTY OF ONE ARM SHAPE.
+            #
+            # isaxcheck exempts from its dead-rule detector whichever read
+            # family the arm it is running does not score -- correct, and
+            # silent.  FINDING 65-D found that on the BARE side: two mipsel
             # `SR-rd-phantom` rows landed DEAD, the eight standing bare arms
             # all reported `dead_allow_rules=0`, and exec110's table quoted
-            # that eight times.  A bare arm is not a full gate over an
-            # allowlist carrying rules it cannot reach, and it says so here.
-            local sup
+            # that eight times.
+            #
+            # FINDING 66V-D IS THE SAME DEFECT FROM THE OTHER SIDE, and it
+            # got in because this test read `[ -z "$corpus" ]`.  A `--srcenc`
+            # arm does not score `R-rd-*`/`FR-rd-*`; dff6fe3242 measured a
+            # dead-rule closure on one and reported `4 -> 1 -> 0` while two
+            # `FR-rd-missing ud1 +REG_SEG{0,1}` rows sat dead in the same
+            # allowlist, where the bare arm named them.  A gate that protects
+            # one arm shape from its own blind spot and not the other has
+            # simply moved the blind spot.
+            #
+            # So the test is the TOOL's answer, not the script's model of the
+            # arm: any arm reporting `superseded_allow_rules>0` is partial,
+            # and the family it did not score is quoted from that arm's own
+            # `unscored_family=` token.  No arm shape is assumed to be whole;
+            # covering the allowlist takes both.
+            local sup fam
             sup=$(sed -n 's/.*superseded_allow_rules=\([0-9]*\).*/\1/p' \
                   "$out/${layer:0:1}_$isa.txt" | head -1)
-            if [ -z "$corpus" ] && [ -n "${sup:-}" ] && [ "${sup:-0}" -gt 0 ]; then
+            fam=$(sed -n 's/.*unscored_family=\([^ ]*\).*/\1/p' \
+                  "$out/${layer:0:1}_$isa.txt" | head -1)
+            if [ -n "${sup:-}" ] && [ "${sup:-0}" -gt 0 ]; then
                 echo "  NOT-A-FULL-GATE $layer $isa: $sup allowlist rule(s)" \
-                     "in SR-rd-* are UNSCORED by a bare arm -- their" \
-                     "dead/live state is unknown here.  Run this gate as" \
-                     "\`run <build> <out> <corpus>\` to score them." \
+                     "in ${fam:-<unnamed>} are UNSCORED by this arm -- their" \
+                     "dead/live state is unknown here.  Score them on the" \
+                     "other arm: a bare arm and a \`run <build> <out>" \
+                     "<corpus>\` arm are partial in COMPLEMENTARY families." \
                      >> "$out/rc.txt"
                 partial=$((partial+1))
             fi
@@ -222,10 +244,42 @@ SH
     grep -q 'NOT-A-FULL-GATE boundary x86_64: 327 ' "$t/o7/rc.txt" \
         && echo "PASS  I and the unscored count is NAMED with its arm" \
         || { echo "FAIL  I"; f=$((f+1)); }
-    # J: the same arm WITH a corpus is a full gate and stays green.
+    # J: what a WHOLE gate looks like -- an arm that scored every family it
+    # carries reports `superseded_allow_rules=0 unscored_family=-` and is the
+    # only shape that rolls up rc=0.  Having a corpus is not that property;
+    # J asserted that it was until FINDING 66V-D.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=0 unscored_family=- ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
     run_arms "$t/b" "$t/o8" "$t/corpus_ok" x86_64 >/dev/null 2>&1
-    [ $? = 0 ] && echo "PASS  J the same arm WITH a corpus rolls up rc=0" \
+    [ $? = 0 ] && echo "PASS  J an arm that scored EVERY family rolls up rc=0" \
                || { echo "FAIL  J"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE' "$t/o8/rc.txt" \
+        && { echo "FAIL  J2"; f=$((f+1)); } \
+        || echo "PASS  J2 and a whole arm is not slandered as partial"
+    # K/L: FINDING 66V-D.  The `--srcenc` side of the same defect.  An arm
+    # WITH a corpus does not score `R-rd-*`/`FR-rd-*`, so it is partial too,
+    # and the family it names must be ITS OWN, not the bare arm's.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=fields encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=41 unscored_family=R-rd-*,FR-rd-* ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o9" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  K a --srcenc arm with unscored rules is rc=2, not rc=0" \
+               || { echo "FAIL  K"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE fields x86_64: 41 allowlist rule(s) in R-rd-\*,FR-rd-\*' \
+         "$t/o9/rc.txt" \
+        && echo "PASS  L and it names R-rd-*,FR-rd-*, the family THAT arm did not score" \
+        || { echo "FAIL  L"; f=$((f+1)); }
     rm -rf "$t"
     echo "isax_srcenc_gate selftest: $f failure(s)"
     [ "$f" = 0 ] || return 1

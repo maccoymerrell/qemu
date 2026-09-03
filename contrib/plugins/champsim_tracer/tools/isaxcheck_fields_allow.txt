@@ -6880,8 +6880,6 @@ x86_64 FR-rd-missing cmpxchg16b +REG_SEG0
 x86_64 FR-rd-missing cmpxchg16b +REG_SEG1
 x86_64 FR-rd-missing cmpxchg8b +REG_SEG0
 x86_64 FR-rd-missing cmpxchg8b +REG_SEG1
-x86_64 FR-rd-missing ud1 +REG_SEG0
-x86_64 FR-rd-missing ud1 +REG_SEG1
 x86_64 FR-rd-phantom rdfsbasel +REG_SEG3
 x86_64 FR-rd-phantom rdfsbaseq +REG_SEG3
 x86_64 FR-rd-phantom rdgsbasel +REG_SEG4
@@ -7756,6 +7754,23 @@ x86_64 SR-rd-missing xorw +REG_SEG2
 # exactly the mistake FINDING 65-D retired two mipsel rows for: a
 # justification is necessary and a row also has to be REACHED.  The ruling
 # still covers UD0; an allowlist row is not where that is recorded.
+#
+# TWO MORE ROWS WERE RETIRED A PASS LATER, and they are the reason the
+# sentence above says FOUR and the closure said zero.  `FR-rd-missing ud1
+# +REG_SEG0` and `+REG_SEG1` excused the read disagreement the OLD class
+# produced.  They died with the other four and for the same reason -- and
+# they outlived the closure that counted them, because that closure was
+# measured on a `--srcenc` arm, which does not score the `FR-rd-*` family at
+# all.  Four rows were visible to it; these two were not; `dead_allow_rules
+# 4 -> 1 -> 0` was true of the arm and false of the allowlist, and the
+# eight STANDING bare arms went red on them for a pass.  FINDING 66V-D.
+#
+# WHY NO `FR-*` SIGNATURE FOR THESE ENCODINGS CAN COME BACK while the
+# refusal stands: the fields comparison reaches class R only through
+# `decode_detail_to_generic()`, and on a refused opcode that returns not-ok,
+# so isaxcheck emits `FU-unclassified` and RETURNS -- classes M, B and R are
+# never scored for that encoding.  The two rows below are what the arm sees
+# for UD1 now; there is nothing else left for a row to license.
 # =====================================================================
 x86_64 FU-unclassified ud1
 x86_64 FU-unclassified ud2

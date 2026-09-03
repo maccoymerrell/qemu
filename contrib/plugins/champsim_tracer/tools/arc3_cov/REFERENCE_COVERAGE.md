@@ -183,11 +183,27 @@ the same instruction, and neither is a coverage question:
     An accumulating status word is precisely the case where those two
     readings diverge.
 
-The argument therefore belongs with exec105's x87 push/pop ledger, which is
-the same question about the same file of registers, and it is PARKED there
-by standing instruction. **No coverage exemption may be written for
-`REG_FCSR`, and this file records the refusal rather than leaving the row
-looking un-adjudicated.**
+The argument belonged with exec105's x87 push/pop ledger, which is the same
+question about the same file of registers, and it was PARKED there.  **THE
+LEDGER IS CLOSED AND THE ARGUMENT LANDS WITH IT.**  What was reasoning is
+now two measurements, on two ISAs, in this file's own corpus:
+
+  * `d1bf96151d` states the WRITE half of the aarch64 FP status word at
+    `fpstatus_ptr()`, where the READ half was already stated, and refuses it
+    for exactly the two flavours QEMU's own `vfp_get_fpsr_from_host()`
+    excludes because FPCR.AH suppresses the cumulative bits.  8,218 aarch64
+    encodings now carry the register in BOTH directions.  Nothing had to
+    choose between them.
+  * `93247f8507` declares FPSR.QC, whose stickiness makes the read
+    architectural under R17's merging-partial-write rule, and the wire's
+    SOURCE list gains it on 1,344 encodings at the same time as QEMU's write
+    list does.
+
+An accumulating status register is read AND written by the same instruction.
+LLVM lists it under `Defs` because a register-allocation model needs no
+finer answer; this format needs one and records both.  The two counts were
+never in conflict, and the row is SETTLED rather than exempted: **no
+coverage exemption is written for `REG_FCSR`, and none is needed.**
 
 ### `REG_SYSMMU` on mipsel — REFUTED, and dropped
 

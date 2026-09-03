@@ -5328,6 +5328,28 @@ static bool gen_add_sub_imm_with_tags(DisasContext *s, arg_rri_tag *a,
     tcg_rn = cpu_reg_sp(s, a->rn);
     tcg_rd = cpu_reg_sp(s, a->rd);
 
+    /*
+     * THE TAG-EXCLUSION REGISTER IS AN OPERAND OF ADDG AND SUBG, AND THIS
+     * BUILD READS IT BEHIND A HELPER OR NOT AT ALL.
+     *
+     * AArch64.AddressAdd's own pseudocode reaches `exclude = GCR_EL1.Exclude`
+     * before it chooses a tag, so which tag ADDG produces is a function of
+     * GCR_EL1's value.  Two things hide that from an op-stream walk: when tag
+     * access is enabled the read happens inside helper_addsubg()
+     * (`extract32(env->cp15.gcr_el1, 0, 16)`), and when it is disabled the
+     * else-arm below never reads it at all.  The second is machine state and
+     * R16 says machine state does not remove an ISA dependency; the first is
+     * a lowering decision and R15 says a lowering decision is not
+     * architectural truth.  So the register is stated here, unconditionally,
+     * for the same reason gen_check_fp_access() states CPACR_EL1 above.
+     *
+     * Capture only -- no op is emitted, altered or suppressed, and the
+     * generated code is byte-identical with the note present or absent.
+     */
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUARMState, cp15.gcr_el1),
+        sizeof(((CPUARMState *)0)->cp15.gcr_el1));
+
     if (s->ata[0]) {
         gen_helper_addsubg(tcg_rd, tcg_env, tcg_rn,
                            tcg_constant_i32(imm),
@@ -9070,6 +9092,21 @@ static bool trans_IRG(DisasContext *s, arg_rrr *a)
     if (dc_isar_feature(aa64_mte_insn_reg, s)) {
         TCGv_i64 tcg_rd = cpu_reg_sp(s, a->rd);
         TCGv_i64 tcg_rn = cpu_reg_sp(s, a->rn);
+
+        /*
+         * IRG's TWO SYSTEM INPUTS, on the same rule as ADDG's one.
+         * helper_irg() reads GCR_EL1 for the exclusion set and the RRND
+         * choice, and RGSR_EL1 for the seed the deterministic algorithm
+         * walks; ChooseRandomNonExcludedTag in the ARM ARM names the same
+         * two.  Both are behind the helper when tag access is on and absent
+         * entirely when it is off, so neither reaches an op-stream walk.
+         */
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUARMState, cp15.gcr_el1),
+            sizeof(((CPUARMState *)0)->cp15.gcr_el1));
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUARMState, cp15.rgsr_el1),
+            sizeof(((CPUARMState *)0)->cp15.rgsr_el1));
 
         if (s->ata[0]) {
             gen_helper_irg(tcg_rd, tcg_env, tcg_rn, cpu_reg(s, a->rm));

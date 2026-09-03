@@ -216,10 +216,19 @@ typedef struct InsnDataflowNamedRead {
  * range that holds it depends on a runtime value -- so the env form cannot
  * state it and the name is what is left.
  *
- * Four, on the same reasoning as INSN_DF_MAX_NAMED_READS: room above the
- * widest real case, with the overflow FLAGGED rather than truncated.
+ * EIGHT, and the number is x87's.  Four was chosen as room above the widest
+ * real case when the widest real case was `fldt`, which names one.  `frstor`
+ * names EIGHT -- it reloads every data register, and the SET st0..st7 is
+ * closed under the stack rotation, so it is the one x87 form whose statement
+ * does not depend on which frame it is read in.  At four the overflow flag
+ * fired, the extraction reported itself incomplete, and the instruction's
+ * whole SOURCE list was withheld along with it: a capacity chosen for the
+ * cases that existed cost 6,208 encodings their read list the moment a wider
+ * one was stated.  The overflow is still FLAGGED rather than truncated; the
+ * bound is now above the architecture's widest form rather than above the
+ * emitters' current usage.
  */
-#define INSN_DF_MAX_NAMED_WRITES 4
+#define INSN_DF_MAX_NAMED_WRITES 8
 
 typedef struct InsnDataflowNamedWrite {
     /*

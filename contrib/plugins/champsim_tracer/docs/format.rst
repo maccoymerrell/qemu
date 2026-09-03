@@ -3173,6 +3173,60 @@ carries the per-ID notes.
 
 The header map, not this table, is authoritative for decoding names.
 
+.. _fmt-stack-relative-names:
+
+Stack-relative names are per-instruction
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+One register file in the supported set is not addressed absolutely.  x87's
+data registers are named ``ST(0)``..``ST(7)`` **relative to TOP**, a field
+of the FPU status word that many x87 instructions move as part of their own
+operation: ``fld`` pushes, ``fstp`` pops, ``fptan`` writes and then pushes.
+The same eighty bytes are ``ST(1)`` before one instruction and ``ST(0)``
+after it.
+
+A trace therefore has to say *when* such a name is read, and the rule is:
+
+  **Every stack-relative register a record names is named in the frame that
+  instruction's own architectural description uses — that is, before the
+  stack adjustment the same description performs.**
+
+So ``fstp %st(3)`` publishes ``ST(3)`` as its destination, because its
+operation is *"ST(i) ← ST(0); pop"* and ``ST(3)`` is what the destination is
+called on the line that writes it.  ``fld %st(3)`` publishes ``ST(3)`` as a
+source, because its operation is *"push ST(i)"*.  ``fyl2x`` publishes
+``ST(1)`` as a destination and pops afterwards.  ``faddp %st,%st(2)``
+publishes ``ST(2)``.
+
+This is the same shape the format already uses for its other
+per-instruction frame: a record states what its own instruction names, and
+the consumer composes the frames.
+
+**What a consumer does with it.**  The adjustment each x87 instruction makes
+is a static property of its opcode, not of its operands or of any value, so
+a consumer reading the body stream in **program order** can carry TOP across
+the strand and resolve every name it meets:
+
+1. Start a strand's x87 tracking at the TOP the first ``BODY_TAG_REGFILE``
+   for that thread carries in the status word, or — if the consumer does not
+   model absolute registers — at an arbitrary origin, since only the
+   *relative* answer is ever needed.
+2. For each instruction, resolve its published ``ST(i)`` names against the
+   TOP in effect **on arrival**.
+3. Then apply that instruction's own adjustment (``push`` decrements,
+   ``pop`` increments, ``FDECSTP``/``FINCSTP`` move it directly,
+   ``FNINIT``/``FRSTOR`` set it) before moving to the next record.
+
+Two consequences are worth stating outright.  ``FRSTOR`` names all eight
+registers, and needs no frame at all: the set ``{ST(0)..ST(7)}`` is closed
+under the rotation, so it denotes the same eight registers whatever TOP is.
+And an instruction that only moves TOP — ``FDECSTP``, ``FINCSTP`` — names no
+data register, because it writes none; it changes what later names mean, and
+step 3 is where that is accounted for.
+
+No other register file in the format is stack-relative, and the rule is
+inert everywhere else.
+
 Where ``dst_regs[]`` comes from
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

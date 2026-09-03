@@ -3058,10 +3058,11 @@ static void gen_note_st0_read(void)
  * PLACED AT THE HELPER CALLS THAT TAKE THE INDEX, never once per
  * instruction.  `ffree %st(i)` and `ffreep %st(i)` are NOT annotated: they
  * mark the tag word empty and never look at the value, so ST(i) is not a
- * source of theirs and stating it would fabricate.  `fld %st(i)` is not
- * annotated either -- QEMU pushes BEFORE the move, so the index the helper
- * receives is one past the one the encoding names, and a statement here
- * would have to reason about the push to be right; it stays in the ledger.
+ * source of theirs and stating it would fabricate.  `fld %st(i)` IS
+ * annotated, and the index stated is the ENCODING'S: QEMU pushes before the
+ * move and hands the helper (i + 1), which is the same register under the
+ * adjustment the instruction itself makes.  See gen_note_sti_write() for
+ * the frame rule that settles it.
  *
  * Capture only; no op is emitted, altered or suppressed.
  */
@@ -3092,36 +3093,45 @@ static void gen_note_sti_read(int i)
  * indexed by PHYSICAL register, ST(i) is relative to env->fpstt, and `st<n>`
  * is the GDB stub's own top-relative spelling.
  *
- * WHICH ARMS ARE ANNOTATED, and the ONE RULE that decides it.  A note here
- * names a register in the ARCHITECTURAL post-state, so it may only be taken
- * where the name the encoding's destination has does not MOVE under the
- * instruction's own stack adjustment:
+ * WHICH FRAME THE NAME IS IN, which is the whole of the rule.
  *
- *   - A PUSH followed by a write of the new top is annotated.  `flds`,
- *     `fldl`, `fildl`, `fildll`, `fldt`, `fbld`, `fld %st(i)` and the seven
- *     constant loads all write ST(0) as the SDM names it, and `st0` after
- *     the push is that register.
- *   - AN IN-PLACE WRITE with no push and no pop is annotated: `fchs`,
- *     `fabs`, `fsqrt`, `frndint`, `fsin`, `fcos`, `f2xm1`, `fprem`,
- *     `fprem1`, `fscale`, `fxchg`, `fst %st(i)`, `fcmovcc`, the
- *     non-popping arithmetic in both operand orders, and the memory
- *     arithmetic that is not a compare.
- *   - A WRITE FOLLOWED BY A POP IS NOT, and neither is a write followed by
- *     a push.  `fstp %st(i)` writes the register the encoding calls ST(i)
- *     and then pops, so after the instruction those bytes are ST(i-1) and
- *     `st<i>` names the wrong one; `faddp` and its siblings have the same
- *     shape; `fptan`, `fsincos` and `fxtract` write ST(0) and then push, so
- *     the value lands in what is ST(1) by the time the instruction ends;
- *     `fyl2x`, `fyl2xp1` and `fpatan` write ST(1) and pop.  Stating a
- *     top-relative name for any of them would have to reason about the
- *     adjustment to be right, which is exactly what left `fld %st(i)`'s
- *     SOURCE in the ledger, and it stays there in this direction too.
- *   - AN INSTRUCTION THAT WRITES NO REGISTER VALUE is not annotated at all:
- *     `fcom`, `fcomp`, `fucom`, `fcomi`, `ftst` and `fxam` produce flags,
- *     `ffree` marks a tag, `fdecstp` and `fincstp` move TOP, and `fldenv`,
- *     `fldcw`, `fclex` and `fninit` name the environment.  `frstor` DOES
- *     write all eight, physically and relative to the TOP it restores, and
- *     is left in the ledger with the push/pop forms for the same reason.
+ * A top-relative name is only a name once you say WHEN it is read.  An
+ * earlier form of these notes answered "in the architectural POST-state",
+ * and that answer made every form which adjusts the stack unstatable:
+ * `fstp %st(i)` writes the register the encoding calls ST(i) and then pops,
+ * so in the post-state those bytes are ST(i-1); `faddp` has the same shape;
+ * `fptan`, `fsincos` and `fxtract` write ST(0) and then push.  Eight
+ * families and 2,256 registers stayed off QEMU's write side for want of a
+ * frame, while the ENCODING named the destination unambiguously the whole
+ * time.
+ *
+ * THE FRAME IS THE INSTRUCTION'S OWN SDM PAGE.  Every name published for an
+ * instruction -- source and destination alike -- is the name that
+ * instruction's own operation section uses, evaluated before the stack
+ * adjustment that same section describes.  `fstp %st(i)` states `st<i>`
+ * because its page says "ST(i) <- ST(0); pop"; `fyl2x` states `st1` because
+ * its page says "ST(1) <- ST(1) * log2 ST(0); pop"; `fld %st(i)` states
+ * `st<i>` as a SOURCE because its page says "push ST(i)".  Nothing is
+ * derived and nothing depends on a runtime TOP: the name is a static
+ * property of the encoding, which is what R20 requires of a decode-site
+ * statement.
+ *
+ * THE CONSUMER RESOLVES THE FRAMES, and it already has everything it needs
+ * to: the stack adjustment each x87 instruction makes is a static property
+ * of its opcode, so a consumer walking the body stream in PROGRAM ORDER
+ * tracks TOP across the strand and reads each instruction's names in the
+ * frame that instruction established.  That is the same shape R21 settles
+ * for the other per-instruction frame in this format, and format.rst carries
+ * the join.
+ *
+ * SO EVERY ARM THAT WRITES A DATA REGISTER IS ANNOTATED, and the classes
+ * that are not are the ones that write no data register at all: `fcom`,
+ * `fcomp`, `fucom`, `fcomi`, `ftst` and `fxam` produce flags; `ffree` marks
+ * a tag word and never touches the value; `fdecstp` and `fincstp` move TOP
+ * and nothing else; `fldenv`, `fldcw`, `fclex` and `fninit` name the
+ * environment.  `frstor` writes all eight and is stated as all eight -- the
+ * one arm whose answer needs no frame, because {st0..st7} is closed under
+ * the rotation.
  *
  * The classification is the architecture's, taken from the SDM's own
  * destination column, and it is checked against the read side's: an arm that
@@ -3533,6 +3543,17 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             gen_helper_fpop(tcg_env);
             break;
         case 0x2c: /* frstor mem */
+            /*
+             * FRSTOR loads all eight data registers, and the SET {st0..st7}
+             * is CLOSED under the stack rotation -- whatever TOP the restored
+             * image carries, the eight names are the same eight registers.
+             * So this one arm needs no frame argument at all: it is the only
+             * x87 destination statement whose answer does not depend on which
+             * frame it is read in.
+             */
+            for (int i = 0; i < 8; i++) {
+                gen_note_sti_write(i);
+            }
             gen_helper_frstor(tcg_env, s->A0,
                               tcg_constant_i32(s->dflag - 1));
             update_fip = update_fdp = false;
@@ -3591,6 +3612,14 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 
         switch (op) {
         case 0x08: /* fld sti */
+            /*
+             * `fld %st(i)` reads ST(i) IN ITS OWN PAGE'S FRAME -- before the
+             * push -- and writes the new ST(0).  QEMU pushes first and hands
+             * the helper (opreg + 1), which is the same register renamed by
+             * the adjustment the instruction itself makes; the name the
+             * ENCODING carries is `st<i>`, and that is what is stated.
+             */
+            gen_note_sti_read(opreg);
             gen_note_st0_write();
             gen_helper_fpush(tcg_env);
             gen_helper_fmov_ST0_STN(tcg_env,
@@ -3701,10 +3730,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_sti_write(1);
                 gen_helper_fyl2x(tcg_env);
                 break;
             case 2: /* fptan */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fptan(tcg_env);
                 break;
             case 3: /* fpatan */
@@ -3712,10 +3743,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_sti_write(1);
                 gen_helper_fpatan(tcg_env);
                 break;
             case 4: /* fxtract */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fxtract(tcg_env);
                 break;
             case 5: /* fprem1 */
@@ -3750,6 +3783,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
+                gen_note_sti_write(1);
                 gen_helper_fyl2xp1(tcg_env);
                 break;
             case 2: /* fsqrt */
@@ -3759,6 +3793,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 break;
             case 3: /* fsincos */
                 gen_note_st0_read();
+                gen_note_st0_write();
                 gen_helper_fsincos(tcg_env);
                 break;
             case 5: /* fscale */
@@ -3800,13 +3835,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                     gen_note_sti_read(opreg);
                     /*
                      * The 0x30 block is `fxxxp %st,%st(i)`, which writes
-                     * ST(i) and then POPS -- after which those bytes are
-                     * ST(i-1), so no top-relative name states the
-                     * destination.  See gen_note_sti_write() for the rule.
+                     * ST(i) and then pops.  The name is the ENCODING'S,
+                     * taken in its own page's frame, so the pop that follows
+                     * does not change what is stated.  See
+                     * gen_note_sti_write() for the rule.
                      */
-                    if (op < 0x30) {
-                        gen_note_sti_write(opreg);
-                    }
+                    gen_note_sti_write(opreg);
                     gen_helper_fp_arith_STN_ST0(op1, opreg);
                     if (op >= 0x30) {
                         gen_helper_fpop(tcg_env);
@@ -3906,6 +3940,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x3a: /* fstp8 sti, undocumented op */
         case 0x3b: /* fstp9 sti, undocumented op */
             gen_note_st0_read();
+            gen_note_sti_write(opreg);
             gen_helper_fmov_STN_ST0(tcg_env, tcg_constant_i32(opreg));
             gen_helper_fpop(tcg_env);
             break;

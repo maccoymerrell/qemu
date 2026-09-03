@@ -396,6 +396,37 @@ static void note_sve_vec_read(DisasContext *s, int z)
                                        vec_full_reg_size(s));
 }
 
+/*
+ * A DATA VECTOR THE ENCODING NAMES AS ITS DESTINATION, stated by RANGE.
+ *
+ * The write twin of note_sve_vec_read(), needed at the same sites and for the
+ * mirror reason.  Where an emitter passes the gvec machinery an OFFSET, the
+ * expander states the destination's direction itself and nothing is owed
+ * here.  Where it builds the pointer BY HAND --
+ * tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(...)) -- the ops name
+ * an address computed from tcg_env and the write happens inside the helper,
+ * so the instruction reaches a consumer with no destination at all: `mov
+ * z31.b, p0/m, #1` and `ld1b {z31.b}, p0/z, [x0]` both land in Z31 and
+ * neither says so.
+ *
+ * BY RANGE, because the vector file IS declared -- translate-a64.c's
+ * insn_dataflow_declare_regfile("v", ...) -- so the offsetof()/sizeof() pair
+ * that describes the register is the register, and the same declaration that
+ * names every ordinary access names this one.
+ *
+ * THE RANGE IS THE WHOLE REGISTER (R17 width): vec_full_reg_size() is the
+ * current vector length, which is the width every one of these forms writes.
+ * A predicated form writes it too -- the architecture defines the inactive
+ * elements as either zeroed or preserved, and preservation is a
+ * read-modify-write of the same bytes, not an absence of a write.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_sve_vec_write(DisasContext *s, int z)
+{
+    insn_dataflow_note_stated_write_env(vec_full_reg_offset(s, z),
+                                        vec_full_reg_size(s));
+}
 
 /* Invoke an out-of-line helper on 4 Zregs, 1 Preg, plus fpst. */
 static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
@@ -1268,6 +1299,7 @@ static bool do_index(DisasContext *s, int esz, int rd,
     desc = tcg_constant_i32(simd_desc(vsz, vsz, 0));
     t_zd = tcg_temp_new_ptr();
 
+    note_sve_vec_write(s, rd);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, rd));
     if (esz == 3) {
         gen_helper_sve_index_d(t_zd, start, incr, desc);
@@ -2015,6 +2047,7 @@ static void do_sat_addsub_vec(DisasContext *s, int esz, int rd, int rn,
     TCGv_i64 t64;
 
     note_sve_vec_read(s, rn);
+    note_sve_vec_write(s, rd);
 
     dptr = tcg_temp_new_ptr();
     nptr = tcg_temp_new_ptr();
@@ -2264,6 +2297,7 @@ static void do_cpy_m(DisasContext *s, int esz, int rd, int rn, int pg,
 
     note_sve_pred_read(pg);
     note_sve_vec_read(s, rn);
+    note_sve_vec_write(s, rd);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, rn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
@@ -2414,6 +2448,7 @@ static void do_insr_i64(DisasContext *s, arg_rrr_esz *a, TCGv_i64 val)
     TCGv_ptr t_zn = tcg_temp_new_ptr();
 
     note_sve_vec_read(s, a->rn);
+    note_sve_vec_write(s, a->rd);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
 
@@ -4126,6 +4161,7 @@ static void do_fp_scalar(DisasContext *s, int zd, int zn, int pg, bool is_fp16,
     t_pg = tcg_temp_new_ptr();
     note_sve_pred_read(pg);
     note_sve_vec_read(s, zn);
+    note_sve_vec_write(s, zd);
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, zd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, zn));
     tcg_gen_addi_ptr(t_pg, tcg_env, pred_full_reg_offset(s, pg));
@@ -4802,6 +4838,18 @@ static void do_mem_zpa(DisasContext *s, int zt, int pg, TCGv_i64 addr,
         for (uint32_t i = 0; i < nregs; i++) {
             insn_dataflow_note_stated_read_env(
                 vec_full_reg_offset(s, (zt + i) % 32), vec_full_reg_size(s));
+        }
+    } else {
+        /*
+         * THE LOAD DIRECTION'S DESTINATIONS, the mirror of the store data
+         * above and invisible for the identical reason: Zt is carried in the
+         * descriptor, not in an op, so a load leaves QEMU's ordered WRITE
+         * list empty and the instruction arrives downstream writing nothing.
+         * One statement per register the multi-register forms name, modulo
+         * 32, exactly as the store side counts them.
+         */
+        for (uint32_t i = 0; i < nregs; i++) {
+            note_sve_vec_write(s, (zt + i) % 32);
         }
     }
 

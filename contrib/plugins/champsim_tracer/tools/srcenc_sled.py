@@ -234,10 +234,65 @@ def build_elf(isa, encodings, path, elf_flags=0):
     return base, stride, len(encodings)
 
 
+# How a compressed member is opened, keyed on the suffix the compressor
+# left behind.  `gzip` and `lzma` are in the standard library; zstd is not,
+# and the tree already shells out to the binary everywhere else, so this
+# does too rather than adding a dependency a fresh checkout would not have.
+_DECOMP = {
+    ".zst":  ["zstd", "-dcq"],
+    ".zstd": ["zstd", "-dcq"],
+    ".xz":   ["xz", "-dcq"],
+    ".gz":   ["gzip", "-dcq"],
+}
+
+
+def open_maybe_compressed(path):
+    """Open a text file that a disk sweep may have compressed underneath us.
+
+    The population files are ordinary evidence-root artefacts, which means
+    the periodic text-bulk compression treats them as subjects -- and it
+    should: they are large, they are text, and they compress twenty to one.
+    What broke was only that this reader could not follow.  Two of
+    exec100/pop's four members were left as `.tsv.zst` by such a pass and
+    `open()` handed their frame bytes to `bytes.fromhex`, so the arm read a
+    population of zero rather than failing loudly.
+
+    Compressing evidence is right and this reader was wrong, so the reader
+    is what changes.  The NAME a caller passes stays the uncompressed one --
+    that name is what manifests, harnesses and run scripts carry -- and if
+    only a compressed sibling exists it is used, so a sweep can compress a
+    corpus without editing every consumer that names it.
+    """
+    if not os.path.exists(path):
+        for suf, cmd in _DECOMP.items():
+            if os.path.exists(path + suf):
+                path = path + suf
+                break
+    root, ext = os.path.splitext(path)
+    cmd = _DECOMP.get(ext.lower())
+    if cmd is None:
+        return open(path)
+    try:
+        pr = subprocess.run(cmd + [path], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=False)
+    except FileNotFoundError:
+        raise SystemExit("srcenc_sled: %s needs %s on PATH to read %s"
+                         % (sys.argv[0], cmd[0], path))
+    if pr.returncode != 0:
+        # A decompressor's own exit status, never inferred from empty output:
+        # a corpus that reads as zero rows is the silent false success this
+        # whole path exists to have stopped.
+        raise SystemExit("srcenc_sled: %s failed on %s (rc=%d): %s"
+                         % (cmd[0], path, pr.returncode,
+                            pr.stderr.decode("utf-8", "replace").strip()))
+    import io
+    return io.StringIO(pr.stdout.decode("utf-8", "replace"))
+
+
 def read_pop(path, isa):
     """The population, de-duplicated, in first-seen order."""
     seen, out = set(), []
-    with open(path) as f:
+    with open_maybe_compressed(path) as f:
         for line in f:
             if line.startswith("#"):
                 continue

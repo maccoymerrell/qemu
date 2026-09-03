@@ -2405,6 +2405,50 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
     std::vector<uint64_t> wr(nw ? nw : 1);
     unsigned got;
 
+    /*
+     * THE FRAME OF A NAME, TAKEN BEFORE ANYTHING CAN REFUSE.
+     *
+     * qemu_plugin_dataflow_named_write::value_shift says what a consumer
+     * must add to a top-relative name's index to read its VALUE after the
+     * instruction -- the x87 frame rule, see FINDING 66V-A.  It is a
+     * property of the ENCODING, stated at the decode site, and it is not a
+     * claim about where the value came from.
+     *
+     * So it is collected HERE, ahead of every refusal below, and not in the
+     * named-write loop at the end of this function.  That loop is not
+     * reached on a family this function refuses, and the families this
+     * matters for are exactly the ones that get refused: `faddp` is refused
+     * for "provenance named env state with no generic word", so the first
+     * form of this fix collected `fstp`'s shift and silently missed
+     * `faddp`'s -- the value stayed one register off on precisely the
+     * instruction the finding was written about.
+     */
+    {
+        unsigned n = qemu_plugin_insn_named_writes(tb, idx, nullptr, 0);
+
+        if (n != QEMU_PLUGIN_DF_INCOMPLETE && n && n <= kMaxNamedWrites) {
+            qemu_plugin_dataflow_named_write nwr[kMaxNamedWrites];
+
+            for (unsigned i = 0; i < n; i++) {
+                nwr[i].struct_size = sizeof(nwr[i]);
+            }
+            if (qemu_plugin_insn_named_writes(tb, idx, nwr, n) == n) {
+                for (unsigned i = 0; i < n; i++) {
+                    uint8_t gen;
+
+                    if (!nwr[i].reg || nwr[i].value_shift == 0) {
+                        continue;
+                    }
+                    gen = generic_for_qemu_name(nwr[i].reg);
+                    if (gen < REG_FPR0 || gen > REG_FPR0 + 7) {
+                        continue;
+                    }
+                    out->fpr_value_shift[gen - REG_FPR0] = nwr[i].value_shift;
+                }
+            }
+        }
+    }
+
     if (g_nregs == 0) {
         out->dst_state = QDEP_R_NORECORD;
         return;
@@ -3587,6 +3631,64 @@ void dump_src_pc_row(const InsnFields *f, const QDepInsn *q,
     g_string_free(g, TRUE);
 }
 
+/*
+ * THE VALUE IS READ IN THE FRAME ITS NAME WAS STATED IN.
+ *
+ * The register PUBLISHED does not move here.  The identity is the name that
+ * instruction's own reference page uses, static at decode and
+ * invocation-invariant under R17.  What moves is the KEY the VALUE is
+ * sampled through, and only where QEMU said the two frames differ.
+ *
+ * x87 IS THE WHOLE POPULATION AND THE MECHANISM IS TWO RESOLUTIONS OF ONE
+ * TOKEN.  `REG_FPR<i>` reaches a value through the GDB spelling `st<i>`,
+ * which target/i386/gdbstub.c resolves as `fpregs[(i + env->fpstt) % 8]` --
+ * against fpstt AS IT STANDS AT THE READ, and the read is after the
+ * instruction.  The NAME is in the frame the instruction's SDM page uses.
+ * On anything that does not move TOP the two agree, which is why nothing
+ * showed until the stack-adjusting families reached the wire.
+ *
+ * MEASURED (FINDING 66V-A), on a stack holding 44/33/22/11:
+ * `faddp %st,%st(2)` published `%f2` -- correct -- carrying 11.0, which is
+ * ST(2) AFTER the pop, and 66.0, the sum it computed, was in the trace
+ * nowhere at all.  `fstp %st(1)` had the same shape.
+ *
+ * WHY THIS RUNS BEFORE THE DESTINATION-FAMILY GATE, and it is the reason
+ * the first attempt at this fix did nothing.  Seating and mask publication
+ * are gated on @wstate: an x87 destination whose provenance QEMU could not
+ * state is REFUSED there, which is exactly the population this is for.  The
+ * FRAME of a name is not a claim about where the value came from -- it is a
+ * property of the encoding, stated at the decode site -- so it is applied to
+ * every instruction QEMU named a write for, published family or refused.
+ *
+ * Matched by REGISTER, never by slot: neither list's order is the other's.
+ */
+static void reframe_dst_value_keys(InsnFields *f, InsnRegNames *rn,
+                                   const QDepInsn *q)
+{
+    if (!rn || !rn->dst_qemu_reg_keys) {
+        return;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        uint8_t g = f->dst_regs[d];
+        int8_t sh;
+
+        if (g < REG_FPR0 || g > REG_FPR0 + 7) {
+            continue;
+        }
+        sh = q->fpr_value_shift[g - REG_FPR0];
+        if (sh == 0) {
+            continue;
+        }
+        {
+            unsigned i = (unsigned)(g - REG_FPR0);
+            unsigned j = ((unsigned)((int)i + (int)sh)) & 7u;
+
+            rn->dst_qemu_reg_keys[d] =
+                qemu_reg_key_for_generic((uint8_t)(REG_FPR0 + j));
+        }
+    }
+}
+
 bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                const char *mnem, unsigned wstate, const char *why)
 {
@@ -3626,6 +3728,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * their difference is a must-be-0.  See the report block and
      * witness_completeness_selftest().
      */
+    reframe_dst_value_keys(f, rn, q);
     {
         char *key = g_strdup_printf("%08x %-26s %s", q->decode_id,
                                     q->decode_name ? q->decode_name : "?",

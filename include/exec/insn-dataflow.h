@@ -239,6 +239,15 @@ typedef struct InsnDataflowNamedWrite {
      * destination's name.
      */
     const char *reg;
+    /*
+     * WHAT A CONSUMER MUST DO TO READ @reg's VALUE, and zero for almost
+     * every name there is.  See
+     * insn_dataflow_note_stated_write_name_shift(): a name in a frame the
+     * instruction itself moves denotes different storage before and after,
+     * and @value_shift is the offset from the name's own index to the
+     * post-instruction spelling of the same physical register.
+     */
+    int8_t value_shift;
 } InsnDataflowNamedWrite;
 
 /* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
@@ -1476,6 +1485,52 @@ void insn_dataflow_note_stated_write_env(uint32_t off, uint32_t size);
 void insn_dataflow_note_stated_write_name(const char *reg);
 
 /*
+ * THE SAME STATEMENT, IN A FRAME THE INSTRUCTION ITSELF MOVES.
+ *
+ * A TOP-RELATIVE NAME IS ONLY A NAME ONCE YOU SAY WHEN IT IS READ.  x87's
+ * ST(i) is relative to env->fpstt; the GDB spelling `st<i>` a consumer reads
+ * a VALUE through resolves against fpstt AS IT STANDS AT THE READ, which is
+ * after the instruction.  The name published for an instruction is the one
+ * that instruction's own reference page uses, taken in the frame that page
+ * uses.  On any instruction that does not move TOP the two agree and nothing
+ * is needed; on one that does, they denote DIFFERENT PHYSICAL REGISTERS and
+ * the disagreement is silent.
+ *
+ * MEASURED, which is why this exists.  `faddp %st,%st(2)` on a stack holding
+ * 44/33/22/11 states `st2` -- correct, its page says "ST(2) <- ST(2)+ST(0);
+ * pop" -- and the value sampled beside it was 11.0, which is ST(2) in the
+ * frame AFTER the pop.  The result, 66.0, appeared nowhere in the trace.
+ * The eight families whose destinations became statable when the frame rule
+ * landed are exactly the eight this affects, so the change that made the
+ * names right is the change that made this reachable.
+ *
+ * @value_shift IS THE OFFSET, NOT THE ADJUSTMENT.  It is what a consumer
+ * adds to the name's own index to get the post-instruction spelling of the
+ * same physical register -- the INVERSE of the stack adjustment, and only
+ * for names stated in the pre-adjustment frame:
+ *
+ *   `fstp %st(i)`, `fxxxp %st,%st(i)`, `fyl2x`, `fyl2xp1`, `fpatan`
+ *      name their destination and then POP        -> -1
+ *   `fptan`, `fsincos`, `fxtract`
+ *      name ST(0) and then PUSH                   -> +1
+ *   `fld`, `fild`, `fbld` and the constant loads
+ *      PUSH and then name the new ST(0), so the name is already in the
+ *      post frame                                 ->  0
+ *
+ * A CONSUMER THAT IGNORES IT IS EXACTLY AS RIGHT AS IT WAS: the field is
+ * additive and zero everywhere the old behaviour was correct.
+ *
+ * @reg is taken exactly as insn_dataflow_note_stated_write_name()'s is, and
+ * the note is the same note -- this form stamps the shift onto it.  A name
+ * this instruction has already stated keeps the frame of its FIRST
+ * statement; a second statement does not redefine it.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_stated_write_name_shift(const char *reg,
+                                                int value_shift);
+
+/*
  * THE TRANSLATOR'S OWN WORD THAT WHAT IT EMITTED IS NOT THE INSTRUCTION.
  *
  * Called from the site that made the decision -- the failing arm of a
@@ -2015,6 +2070,10 @@ static inline void insn_dataflow_note_stated_write_env(uint32_t off,
 { }
 
 static inline void insn_dataflow_note_stated_write_name(const char *reg)
+{ }
+
+static inline void insn_dataflow_note_stated_write_name_shift(const char *reg,
+                                                              int value_shift)
 { }
 
 static inline void insn_dataflow_note_translation_refused(void)

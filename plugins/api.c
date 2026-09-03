@@ -685,6 +685,7 @@ unsigned qemu_plugin_insn_named_writes(const struct qemu_plugin_tb *tb,
         qemu_plugin_dataflow_named_write r = {
             .struct_size = sizeof(r),
             .reg = d->named_writes[i].reg,
+            .value_shift = d->named_writes[i].value_shift,
         };
 
         if (want == 0 || want > sizeof(r)) {

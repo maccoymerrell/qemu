@@ -3217,12 +3217,45 @@ the strand and resolve every name it meets:
    ``pop`` increments, ``FDECSTP``/``FINCSTP`` move it directly,
    ``FNINIT``/``FRSTOR`` set it) before moving to the next record.
 
-Two consequences are worth stating outright.  ``FRSTOR`` names all eight
-registers, and needs no frame at all: the set ``{ST(0)..ST(7)}`` is closed
-under the rotation, so it denotes the same eight registers whatever TOP is.
-And an instruction that only moves TOP — ``FDECSTP``, ``FINCSTP`` — names no
-data register, because it writes none; it changes what later names mean, and
-step 3 is where that is accounted for.
+**A PUSHING LOAD IS NAMED AFTER ITS PUSH, AND STEPS 2 AND 3 MUST NOT BE RUN
+LITERALLY OVER IT.**  ``fld m64``, ``fild``, ``fbld``, ``fld %st(i)`` and the
+seven constant loads have no pre-adjustment name for their destination at
+all: the storage they write only becomes ``ST(0)`` once TOP has moved, and
+*"push; ST(0) ← src"* is what their own pages say.  So the general rule
+above states their SOURCE in the arriving frame — ``fld %st(3)``'s ``ST(3)``
+is resolved at step 2 like any other — while their DESTINATION ``ST(0)`` is
+named in the frame the push leaves.  A consumer applying step 3 after
+step 2 uniformly puts every one of those results one register low.  The two
+halves of such a record are resolved in different frames, and the
+destination's is the later one.
+
+This is a carve-out in the rule's WORDING and not in its principle: every
+name is still the name that instruction's own page uses, which is exactly
+why the destination is the post-push one.  It applies only to forms whose
+page pushes *before* naming the destination.  ``fptan``, ``fsincos`` and
+``fxtract`` are the other order — they name ``ST(0)``, write it, and push —
+so their destination is resolved at step 2 like every non-loading form.
+
+**THE VALUE BESIDE A NAME IS IN THE NAME'S OWN FRAME.**  Where a record
+carries a register's value (``regdata``), the value published beside a
+stack-relative destination is the content of the register that destination's
+NAME denotes, in the frame that name is in.  It is not the content of
+whatever that spelling denotes after the instruction: on ``faddp
+%st,%st(2)`` the wire carries the sum the instruction computed into
+``ST(2)``, not the value ``ST(2)`` happens to hold once the pop has moved
+TOP under it.  A consumer needs no correction of its own, and applying one
+would undo this.
+
+Two more consequences are worth stating outright.  ``FRSTOR`` names all
+eight registers, and needs no frame at all *for its names*: the set
+``{ST(0)..ST(7)}`` is closed under the rotation, so it denotes the same
+eight registers whatever TOP is.  Its VALUES are the one place the paragraph
+above does not reach — ``FRSTOR`` loads TOP from memory, so the frame it
+leaves is a property of the data and not of the encoding, and the values
+beside its eight names are read in that loaded frame.  And an instruction
+that only moves TOP — ``FDECSTP``, ``FINCSTP`` — names no data register,
+because it writes none; it changes what later names mean, and step 3 is
+where that is accounted for.
 
 No other register file in the format is stack-relative, and the rule is
 inert everywhere else.

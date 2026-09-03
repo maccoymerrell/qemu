@@ -307,6 +307,22 @@ typedef struct DfEncReadNote {
      * an instruction that reads a range and writes it states two facts.
      */
     uint8_t write;
+    /*
+     * THE FRAME THE NAME IS IN, expressed as what a consumer must do to
+     * READ ITS VALUE.  Zero for every name whose spelling denotes the same
+     * storage before and after the instruction, which is almost all of them.
+     *
+     * A top-relative name -- x87's ST(i), relative to env->fpstt -- denotes
+     * different storage in the two frames an instruction that adjusts the
+     * stack has.  The NAME published is the one that instruction's own
+     * reference page uses; the VALUE is sampled after the instruction has
+     * run.  When those are different frames the two disagree silently, so
+     * the decode site that knows the adjustment states the offset here: add
+     * @value_shift to the name's index to get the post-instruction spelling
+     * of the SAME physical register.  See
+     * insn_dataflow_note_stated_write_name_shift() in the header.
+     */
+    int8_t value_shift;
 } DfEncReadNote;
 
 /*
@@ -1562,7 +1578,8 @@ static void df_add_named_read(InsnDataflow *d, const char *reg)
  * short, and a destination missing from a list is the error direction this
  * file treats as the worse one.
  */
-static void df_add_named_write(InsnDataflow *d, const char *reg)
+static void df_add_named_write(InsnDataflow *d, const char *reg,
+                               int8_t value_shift)
 {
     unsigned i;
 
@@ -1578,6 +1595,7 @@ static void df_add_named_write(InsnDataflow *d, const char *reg)
         return;
     }
     d->named_writes[d->n_named_writes].reg = reg;
+    d->named_writes[d->n_named_writes].value_shift = value_shift;
     df_ord_write(d, INSN_DF_ORD_NAME, d->n_named_writes);
     d->n_named_writes++;
 }
@@ -3716,7 +3734,8 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
              * happened and where it landed, not what fed it.
              */
             if (df_encread[i].write) {
-                df_add_named_write(d, df_encread[i].name);
+                df_add_named_write(d, df_encread[i].name,
+                                   df_encread[i].value_shift);
             } else {
                 df_add_named_read(d, df_encread[i].name);
             }
@@ -4410,6 +4429,7 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
     df_encread[df_n_encread].write = 0;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
 }
 
@@ -4474,6 +4494,7 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
     df_encread[df_n_encread].write = 0;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
 }
 
@@ -4513,6 +4534,7 @@ void insn_dataflow_note_translation_refused(void)
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 1;
     df_encread[df_n_encread].write = 0;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
 }
 
@@ -4565,6 +4587,7 @@ void insn_dataflow_note_stated_read_name(const char *reg)
     df_encread[df_n_encread].name = reg;
     df_encread[df_n_encread].refused = 0;
     df_encread[df_n_encread].write = 0;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
 }
 
@@ -4614,6 +4637,7 @@ void insn_dataflow_note_stated_write_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
     df_encread[df_n_encread].write = 1;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
 }
 
@@ -4655,7 +4679,40 @@ void insn_dataflow_note_stated_write_name(const char *reg)
     df_encread[df_n_encread].name = reg;
     df_encread[df_n_encread].refused = 0;
     df_encread[df_n_encread].write = 1;
+    df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
+}
+
+/*
+ * THE SAME STATEMENT, PLUS THE FRAME THE NAME IS IN.  See
+ * insn_dataflow_note_stated_write_name_shift() in the header for what
+ * @value_shift means and why a name alone was not enough.
+ *
+ * Written as a wrapper that stamps the shift onto the note the plain form
+ * just made, so there is ONE place that builds these notes and one dedup
+ * rule over them.  A second, nearly identical body is how the two forms
+ * would drift.
+ */
+void insn_dataflow_note_stated_write_name_shift(const char *reg,
+                                                int value_shift)
+{
+    unsigned before;
+
+    if (df_disabled()) {
+        return;
+    }
+    before = df_n_encread;
+    insn_dataflow_note_stated_write_name(reg);
+    if (df_n_encread == before + 1) {
+        df_encread[before].value_shift = (int8_t)value_shift;
+    }
+    /*
+     * df_n_encread unchanged means the plain form deduped against a note
+     * this instruction already made or refused the name outright.  Neither
+     * case has a new note to stamp, and OVERWRITING the existing one would
+     * let the second statement of a name silently redefine the first's
+     * frame.  The first statement stands, exactly as the name does.
+     */
 }
 
 /* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */

@@ -3053,6 +3053,11 @@ static void gen_note_fstat_read(void)
  *
  * Capture only; no op is emitted, altered or suppressed.
  */
+/* The GDB stub's own top-relative spelling, shared by both directions. */
+static const char *const st_names[8] = {
+    "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+};
+
 static void gen_note_st0_read(void)
 {
     insn_dataflow_note_stated_read_name("st0");
@@ -3089,10 +3094,6 @@ static void gen_note_st0_read(void)
  */
 static void gen_note_sti_read(int i)
 {
-    static const char *const st_names[8] = {
-        "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
-    };
-
     insn_dataflow_note_stated_read_name(st_names[i & 7]);
 }
 
@@ -3172,11 +3173,52 @@ static void gen_note_st0_write(void)
 
 static void gen_note_sti_write(int i)
 {
-    static const char *const st_names[8] = {
-        "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
-    };
-
     insn_dataflow_note_stated_write_name(st_names[i & 7]);
+}
+
+/*
+ * THE SHIFTED FORMS -- AND THE FRAME RULE'S SECOND HALF.
+ *
+ * The block above settles which NAME an x87 destination gets: the one that
+ * instruction's own SDM page uses, in that page's frame.  It does not settle
+ * what a consumer must do to read that name's VALUE, and the two are not the
+ * same question, because the value is sampled AFTER the instruction and
+ * `st<i>` resolves against env->fpstt at the read.
+ *
+ * MEASURED (FINDING 66V-A).  On a stack holding 44/33/22/11,
+ * `faddp %st,%st(2)` states `st2` -- right, its page says "ST(2) <-
+ * ST(2)+ST(0); pop" -- and the value published beside it was 11.0, which is
+ * ST(2) in the frame after the pop.  The result, 66.0, was in the trace
+ * nowhere at all.  `fstp %st(1)` had the same shape.  These are the eight
+ * families whose destinations became statable when the frame rule landed, so
+ * the change that made the names right is the change that made this
+ * reachable, and it is closed here rather than left for the consumer to
+ * infer from an opcode table it would have to keep in step with this file.
+ *
+ * The shift is the offset from the stated name's index to the
+ * POST-instruction spelling of the same physical register -- the inverse of
+ * the adjustment, and only where the name is in the PRE-adjustment frame.
+ * See insn_dataflow_note_stated_write_name_shift().
+ *
+ * TWO FORMS TAKE NO SHIFT HERE AND THE REASON IS THE SAME ONE.  `fptan` and
+ * `fsincos` push only on the arm where |ST(0)| is in range; the C2 arm sets
+ * the exception bit and writes no data register at all.  Their adjustment is
+ * therefore a property of the OPERAND and not of the encoding, and R20 asks
+ * this site for static facts.  A static -1 or +1 would be wrong on one of
+ * the two arms, and wrong is worse than absent because absent is visible.
+ * They keep the frame they had.  `frstor` is left alone for the neighbouring
+ * reason: it loads TOP from memory, so no static answer exists there either,
+ * and it states all eight names, which is closed under the rotation as a
+ * SET even though the pairing inside it is not.
+ */
+static void gen_note_st0_write_shift(int value_shift)
+{
+    insn_dataflow_note_stated_write_name_shift("st0", value_shift);
+}
+
+static void gen_note_sti_write_shift(int i, int value_shift)
+{
+    insn_dataflow_note_stated_write_name_shift(st_names[i & 7], value_shift);
 }
 
 /*
@@ -3751,7 +3793,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
-                gen_note_sti_write(1);
+                /* "ST(1) <- ST(1)*log2 ST(0); pop": named pre-pop. */
+                gen_note_sti_write_shift(1, -1);
                 gen_helper_fyl2x(tcg_env);
                 break;
             case 2: /* fptan */
@@ -3764,12 +3807,19 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
-                gen_note_sti_write(1);
+                /* "ST(1) <- arctan(ST(1)/ST(0)); pop": named pre-pop. */
+                gen_note_sti_write_shift(1, -1);
                 gen_helper_fpatan(tcg_env);
                 break;
             case 4: /* fxtract */
                 gen_note_st0_read();
-                gen_note_st0_write();
+                /*
+                 * "ST(0) <- exponent; push; ST(0) <- significand": the
+                 * exponent is named in the pre-push frame.  Every arm of
+                 * helper_fxtract() pushes, so the adjustment is static --
+                 * which is what separates it from fptan and fsincos below.
+                 */
+                gen_note_st0_write_shift(+1);
                 gen_helper_fxtract(tcg_env);
                 break;
             case 5: /* fprem1 */
@@ -3804,7 +3854,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  * dividend / scale, and several of these write it. */
                 gen_note_st0_read();
                 gen_note_sti_read(1);
-                gen_note_sti_write(1);
+                /* "ST(1) <- ST(1)*log2(ST(0)+1.0); pop": named pre-pop. */
+                gen_note_sti_write_shift(1, -1);
                 gen_helper_fyl2xp1(tcg_env);
                 break;
             case 2: /* fsqrt */
@@ -3861,7 +3912,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                      * does not change what is stated.  See
                      * gen_note_sti_write() for the rule.
                      */
-                    gen_note_sti_write(opreg);
+                    gen_note_sti_write_shift(opreg,
+                                             op >= 0x30 ? -1 : 0);
                     gen_helper_fp_arith_STN_ST0(op1, opreg);
                     if (op >= 0x30) {
                         gen_helper_fpop(tcg_env);
@@ -3961,7 +4013,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x3a: /* fstp8 sti, undocumented op */
         case 0x3b: /* fstp9 sti, undocumented op */
             gen_note_st0_read();
-            gen_note_sti_write(opreg);
+            /* "ST(i) <- ST(0); pop": the destination is named pre-pop. */
+            gen_note_sti_write_shift(opreg, -1);
             gen_helper_fmov_STN_ST0(tcg_env, tcg_constant_i32(opreg));
             gen_helper_fpop(tcg_env);
             break;

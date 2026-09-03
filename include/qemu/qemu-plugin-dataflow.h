@@ -557,6 +557,23 @@ unsigned qemu_plugin_insn_named_reads(const struct qemu_plugin_tb *tb,
 typedef struct qemu_plugin_dataflow_named_write {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */
     const char *reg;            /* the architectural name */
+    /*
+     * WHAT TO ADD TO @reg's INDEX TO READ ITS VALUE, and 0 for almost every
+     * name there is.
+     *
+     * A name in a frame the instruction itself moves -- x87's ST(i), which
+     * is relative to env->fpstt -- denotes different storage before and
+     * after.  @reg is the name the instruction's own reference page uses,
+     * in that page's frame; a value read after the instruction resolves the
+     * spelling against the frame the instruction LEFT.  Where those differ,
+     * this is the offset between them: `fstp %st(3)` names st3 and carries
+     * -1, because after its pop the same physical register is st2.
+     *
+     * A consumer that does not read this field is exactly as correct as it
+     * was before the field existed; every name for which the two frames
+     * agree carries 0.  Present only when @struct_size covers it.
+     */
+    int8_t value_shift;
 } qemu_plugin_dataflow_named_write;
 
 QEMU_PLUGIN_API

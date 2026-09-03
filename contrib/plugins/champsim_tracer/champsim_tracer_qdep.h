@@ -570,6 +570,22 @@ struct QDepInsn {
     uint8_t dst_state;
     uint8_t n_dst;
     uint8_t dst_reg[QDEP_MAX_DST];              /* generic id written */
+    /*
+     * THE FRAME AN x87 DESTINATION'S NAME IS IN, as the offset a VALUE read
+     * needs -- qemu_plugin_dataflow_named_write::value_shift, indexed by the
+     * ST(i) the name carries.  Zero everywhere the two frames agree, which
+     * is every register outside this file.  See FINDING 66V-A.
+     *
+     * KEYED BY REGISTER RATHER THAN BY DESTINATION SLOT, and that is not a
+     * convenience.  dst_reg[] is only filled on the paths that reach the end
+     * of note_dst(); a family refused before then -- `faddp` is refused for
+     * "provenance named env state with no generic word" -- has no slot for a
+     * shift to sit in, and the frame of a name is not a claim about
+     * provenance.  A fixed eight-entry array is filled from QEMU's named
+     * writes BEFORE any refusal can return, so the fact survives every one
+     * of them.
+     */
+    int8_t fpr_value_shift[8];
     uint8_t n_dst_dep_regs[QDEP_MAX_DST];
     uint8_t dst_dep_regs[QDEP_MAX_DST][QDEP_MAX_ADDR_REGS];
     uint64_t dst_dep_load_slots[QDEP_MAX_DST]; /* by LOAD ordinal; see

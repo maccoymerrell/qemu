@@ -140,9 +140,26 @@ def classify_joined(row, refused):
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 
 #: state_name(QDEP_OK) -- the only WSTQ under which QEMU has stated a write
-#: list at all.  Every other value is a refusal, and a refusal is not an
+#: list COMPLETELY.  Most other values are a refusal, and a refusal is not an
 #: empty list.
 OKW = "PUBLISHED from QEMU's emitters"
+
+#: state_name(QDEP_W_SHORT) -- the extraction reported itself incomplete and
+#: QEMU stated a write list anyway.  IT IS NOT A REFUSAL AND IT IS NOT OKW,
+#: and this scorer has to hold both halves of that at once:
+#:
+#:   THE GAIN SIDE IS SCORABLE.  QEMU-ONLY = WR - PUBD asks what the WIRE
+#:   does not carry, and the wire's list is fully known.  Every member of a
+#:   short list is a write QEMU's own emitters stated, so a gain counted here
+#:   is a real destination the wire is missing -- the count can only be LOW.
+#:
+#:   THE COST SIDE IS NOT.  WALK-ONLY = PUBD - WR asks what QEMU does not
+#:   state, which is precisely the sentence a short list is not entitled to:
+#:   a register missing from the shortfall would be scored as a published
+#:   destination QEMU disowns.  That is the direction that turns an absent
+#:   measurement into a loss, which is the shape #231's 219x overstatement
+#:   had, so these rows stay out of the loss bar and are reported apart.
+WSHORT = "LOWER BOUND: extraction incomplete, QEMU's write list taken anyway"
 
 
 def regs(s):
@@ -216,6 +233,8 @@ def main():
         outbarreg = collections.Counter(); outbarrule = collections.Counter()
         outbar_enc = outbar_reg = 0
         unscorable = collections.Counter()
+        wsreg = collections.Counter(); wsrule = collections.Counter()
+        ws_rows = ws_enc = ws_reg = 0
         ins = 0; scor = 0
         for enc, row in M.items():
             reach, sub, _ = classify_joined(row, REFUSED)
@@ -247,6 +266,20 @@ def main():
             # statement nobody made turns an absent measurement into a loss.
             if row["WSTQ"] != OKW:
                 unscorable[row["WSTQ"][:64]] += 1
+                if row["WSTQ"] == WSHORT:
+                    # GAIN ONLY -- see WSHORT for why the loss side may not
+                    # be scored from a list that is a lower bound.
+                    q = regs(row["WR"]) - regs(row["PUBD"])
+                    if "REG_PC" in q and "REG_PC" not in regs(row["PUBD"]):
+                        q = q - {"REG_PC"}
+                    ws_rows += 1
+                    if q:
+                        ws_enc += 1
+                        ws_reg += len(q)
+                        for r in q:
+                            wsreg[r] += 1
+                            wsrule[(row.get("rule", "?"),
+                                    row.get("mnem", "?"), r)] += 1
                 continue
             scor += 1
             published = row["wstate"] == OKW    # the family reached the wire
@@ -284,6 +317,9 @@ def main():
         G["gpr"] = G.get("gpr", 0) + gain_pub_reg
         G["obe"] = G.get("obe", 0) + outbar_enc
         G["obr"] = G.get("obr", 0) + outbar_reg
+        G["wse"] = G.get("wse", 0) + ws_enc
+        G["wsr"] = G.get("wsr", 0) + ws_reg
+        G["wsrows"] = G.get("wsrows", 0) + ws_rows
 
         print("=== %s ===" % isa)
         print("  rows=%d  wp-merge conflicts=%d  REACH=INSTRUCTION=%d  "
@@ -308,6 +344,12 @@ def main():
         print_regtable(outbarreg, "      ", a.regtop)
         for k, n in outbarrule.most_common(6):
             print("      *%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
+        print("  ON A LOWER-BOUND WRITE LIST (QDEP_W_SHORT), GAIN ONLY: "
+              "%d row(s), of which %d encoding(s) / %d register(s) name a "
+              "destination the wire lacks" % (ws_rows, ws_enc, ws_reg))
+        print_regtable(wsreg, "      ", a.regtop)
+        for k, n in wsrule.most_common(a.top):
+            print("      >%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
         print("  QEMU-ONLY DESTINATIONS (the flip's GAIN): %d encodings / "
               "%d registers   [R10.1 block-pc carve-outs: %d]"
               % (gain_enc, gain_reg, pc_carve))
@@ -338,6 +380,9 @@ def main():
           % (G.get("gpe", 0), G.get("gpr", 0)))
     print("  ADMITTED OUTSIDE THE REACH CLASS : %d encodings / %d registers"
           % (G.get("obe", 0), G.get("obr", 0)))
+    print("  ON A LOWER-BOUND WRITE LIST     : %d row(s), %d encodings / "
+          "%d registers  <-- GAIN ONLY, never scored as a loss"
+          % (G.get("wsrows", 0), G.get("wse", 0), G.get("wsr", 0)))
     print("  R10.1 block-pc carve-outs       : %d encodings" % G["pc_carve"])
     print("  rows read %d, REACH=INSTRUCTION %d, QEMU-STATED WRITE SIDE %d"
           % (G["rows"], G["ins"], G.get("scor", 0)))

@@ -310,6 +310,42 @@ enum QDepState : uint8_t {
      * nothing the census CONCLUDES.
      */
     QDEP_R_SHORT,
+    /*
+     * QDEP_W_SHORT -- THE WRITE LIST IS A LOWER BOUND, NOT A REFUSAL.
+     *
+     * The twin of QDEP_R_SHORT one direction over, and it exists for the
+     * same reason: the status word and the write list are not the same
+     * fact, and until this state the second was thrown away with the
+     * first.  qdep_note_insn() returned on the status word before it ever
+     * asked what QEMU said this instruction WRITES, so an instruction
+     * lowered through an unbounded helper published no destination
+     * statement from QEMU no matter what QEMU said about it -- and it
+     * scored as though QEMU had been asked and had said nothing.
+     *
+     * WHY THE LIST IS STILL USABLE.  Every flag that reaches this state
+     * makes the write list SHORT, and each of them says so in those words:
+     * @writes_truncated is "more writes than could carry provenance",
+     * @n_helper_unbounded's contract is that "the reported read and write
+     * sets are then SHORT, not merely coarse".  Short is a bound in ONE
+     * direction.  Every member that IS there is a write QEMU's own
+     * emitters stated, so the list can only ADD a destination the census
+     * had no statement for; it can never remove one.  QEMU draws exactly
+     * this line itself for @helper_writes_unbounded: "a consumer that
+     * FILLS its own destination list from these rows is unaffected --
+     * every name it does get is real."
+     *
+     * WHAT IT MAY NOT DO, and this is why it is a separate state and not
+     * QDEP_OK.  A short list cannot adjudicate ABSENCE.  "QEMU does not
+     * write this register" is the one sentence it is not entitled to, so
+     * the destination LOSS bar -- published-minus-stated -- still scores
+     * QDEP_OK alone, and the dependency-mask family stays refused exactly
+     * as before: dst_precheck() returns this state unchanged, no mask is
+     * written from a provenance the same flags may have shortened, and the
+     * wire is byte-for-byte what it was.  What moves is the census: 2.8
+     * million x86_64 encodings stop reading as "QEMU was never asked" and
+     * start carrying the answer it gave.
+     */
+    QDEP_W_SHORT,
     QDEP_R_NORECORD,     /* qemu withheld the access list or a provenance */
     /*
      * QDEP_R_MULTI AND QDEP_R_SHAPE STOOD HERE, and are deleted rather than
@@ -570,6 +606,17 @@ struct QDepInsn {
     uint8_t dst_state;
     uint8_t n_dst;
     uint8_t dst_reg[QDEP_MAX_DST];              /* generic id written */
+    /*
+     * note_dst()'s RAW verdict for the write list, kept beside the state
+     * the gate then chose -- the mirror of @srcx_state.  On the clean path
+     * the two are equal.  At the status gate they differ, and the
+     * difference is the only thing that can tell a reader whether a
+     * refused instruction had a write list to refuse: "QEMU stated no
+     * writes" and "the extraction was short before it could say" print
+     * identically in a census keyed on the composite and want opposite
+     * remedies.
+     */
+    uint8_t dstx_state;
     /*
      * THE FRAME AN x87 DESTINATION'S NAME IS IN, as the offset a VALUE read
      * needs -- qemu_plugin_dataflow_named_write::value_shift, indexed by the

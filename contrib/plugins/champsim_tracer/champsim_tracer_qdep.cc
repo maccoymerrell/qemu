@@ -863,6 +863,17 @@ std::atomic<uint64_t> g_addr_slot_default{0};
 std::atomic<uint64_t> g_status_count_admitted{0};
 std::atomic<uint64_t> g_status_count_slots{0};
 /*
+ * The WRITE LIST past the same refusal (QDEP_W_SHORT).  Three counters and
+ * not one, because "the list was taken", "how many registers it held" and
+ * "there was nothing to take" are three different answers and the third is
+ * the one a single counter would hide: an instruction QEMU states no writes
+ * for and an instruction whose extraction was short before it could say
+ * both print as an empty WR column, and they want opposite remedies.
+ */
+std::atomic<uint64_t> g_wshort_admitted{0};
+std::atomic<uint64_t> g_wshort_regs{0};
+std::atomic<uint64_t> g_wshort_nothing{0};
+/*
  * The address side's must-be-0, and it is a difference for the same reason
  * the register side's is: @g_addr_fact_stated counts an address QEMU stated
  * where it is ESTABLISHED, in qdep_apply()'s per-access loop, and
@@ -4385,6 +4396,7 @@ const char *state_name(unsigned s)
     case QDEP_OK:               return "PUBLISHED from QEMU's emitters";
     case QDEP_R_STATUS:         return "refused: extraction reported itself incomplete";
     case QDEP_R_SHORT:          return "LOWER BOUND: extraction incomplete, QEMU's read list taken anyway";
+    case QDEP_W_SHORT:          return "LOWER BOUND: extraction incomplete, QEMU's write list taken anyway";
     case QDEP_R_NORECORD:       return "refused: qemu withheld the access list or a provenance";
     case QDEP_R_FIELD:          return "refused: provenance named env state with no generic word";
     case QDEP_R_UNMAPPED:       return "refused: provenance named a global with no generic word";
@@ -4970,6 +4982,19 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
                   (st.n_helper_unbounded? 0x20 : 0));
     if (out->status_flags) {
         /*
+         * The load-ordinal translation for the access list this gate is
+         * about to admit, built here for the same reason the clean path
+         * builds one: QEMU numbers the accesses in a single list and the
+         * wire numbers loads and stores separately.  The write list taken
+         * at the end of this block is extracted against it, so a
+         * destination whose value came from a loaded datum is a row this
+         * gate can carry rather than one it has to refuse for a reason
+         * that is about bookkeeping.
+         */
+        uint8_t gate_load_ord[kMaxMemops];
+
+        memset(gate_load_ord, 0xFF, sizeof(gate_load_ord));
+        /*
          * REFUSED, exactly as before -- and MEASURED on the way out.
          *
          * The read list is taken here and parked in @srcx, which nothing on
@@ -5074,6 +5099,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
                     out->store_addr_state[a] = QDEP_R_STATUS;
                 } else {
                     out->load_addr_state[a] = QDEP_R_STATUS;
+                    gate_load_ord[i] = a;
                 }
             }
             if (room) {
@@ -5087,6 +5113,55 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
                 memset(out->load_addr_state, 0, sizeof(out->load_addr_state));
                 memset(out->store_addr_state, 0,
                        sizeof(out->store_addr_state));
+                memset(gate_load_ord, 0xFF, sizeof(gate_load_ord));
+            }
+        }
+        /*
+         * AND THE WRITE LIST IS STILL QEMU'S WHERE QEMU STILL STATES IT --
+         * the twin of QDEP_R_SHORT above, one direction over.  See
+         * QDEP_W_SHORT for why a short list is usable and for the sentence
+         * it is not entitled to.
+         *
+         * TAKEN INTO A SCRATCH, and that is the whole of the containment.
+         * note_dst() decides several things at once: the write list, the
+         * per-destination dependency masks, the x87 frame a destination's
+         * NAME is in.  Only the LIST is admitted here, because only the
+         * list is a set whose members are each individually stated.  A mask
+         * is written from a provenance the same status flags may have
+         * shortened (@prov_truncated says so in those words), and the frame
+         * is a separate finding with its own subject (66V-A).  Copying the
+         * three fields the list consists of, out of a scratch that is then
+         * dropped, is what makes "the list, and nothing else" a property of
+         * the code rather than a claim in a comment.
+         *
+         * THE WIRE DOES NOT MOVE.  @dst_state is QDEP_W_SHORT or
+         * QDEP_R_STATUS and neither is QDEP_OK, so dst_precheck() returns
+         * it unchanged, the destination family is refused exactly as
+         * before, and every published mask is still the one the refiner
+         * wrote.  What changes is that the census can now tell a refusal
+         * apart from an absence.
+         */
+        {
+            QDepInsn probe;
+
+            memset(&probe, 0, sizeof(probe));
+            note_dst(tb, idx, &probe,
+                     gate_load_ord, out->have_list ? n : 0);
+            out->dstx_state = probe.dst_state;
+            if (probe.dst_state == QDEP_OK && probe.n_dst) {
+                out->dst_state = QDEP_W_SHORT;
+                out->n_dst = probe.n_dst;
+                memcpy(out->dst_reg, probe.dst_reg, sizeof(out->dst_reg));
+                g_wshort_admitted.fetch_add(1, std::memory_order_relaxed);
+                g_wshort_regs.fetch_add(probe.n_dst,
+                                        std::memory_order_relaxed);
+            } else {
+                /*
+                 * Empty-with-a-reason, exactly as the read side is where
+                 * note_src() itself refused: the state stays QDEP_R_STATUS
+                 * and @dstx_state carries which of the two it was.
+                 */
+                g_wshort_nothing.fetch_add(1, std::memory_order_relaxed);
             }
         }
         return;
@@ -5953,6 +6028,43 @@ void qdep_report(GString *report)
                 " reporting a refusal\n"
                 "               for a list QEMU had stated as empty\n",
                 sca, scs);
+        }
+        {
+            uint64_t wa = g_wshort_admitted.load(std::memory_order_relaxed);
+            uint64_t wr_ = g_wshort_regs.load(std::memory_order_relaxed);
+            uint64_t wn = g_wshort_nothing.load(std::memory_order_relaxed);
+
+            if (wa || wn) {
+                g_string_append_printf(report,
+                    "\nthe WRITE LIST PAST A STATUS REFUSAL"
+                    " (QDEP_W_SHORT):\n"
+                    "  %10" G_GUINT64_FORMAT "  instructions whose extraction"
+                    " reported itself incomplete and\n"
+                    "               whose WRITE LIST QEMU stated anyway,"
+                    " carrying %" G_GUINT64_FORMAT " register(s).\n"
+                    "               Every flag that reaches here makes the"
+                    " list SHORT and none of\n"
+                    "               them makes a member of it wrong, so the"
+                    " list is a LOWER BOUND:\n"
+                    "               it can add a destination the census had"
+                    " no statement for and\n"
+                    "               can never remove one.  It may not"
+                    " adjudicate ABSENCE, so the\n"
+                    "               destination LOSS bar still scores"
+                    " QDEP_OK alone and no mask is\n"
+                    "               published from it -- the wire on these"
+                    " rows is unmoved\n"
+                    "  %10" G_GUINT64_FORMAT "  the same refusal with NOTHING"
+                    " to take: QEMU stated no write,\n"
+                    "               or note_dst() refused the list on its"
+                    " own terms.  Counted\n"
+                    "               apart because an empty WR column that"
+                    " means 'nothing was\n"
+                    "               written' and one that means 'nobody"
+                    " asked' are different\n"
+                    "               facts with opposite remedies\n",
+                    wa, wr_, wn);
+            }
         }
     }
 

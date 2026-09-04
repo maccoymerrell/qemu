@@ -30,7 +30,7 @@
 
 /* aarch64: 118 QEMU registers, 116 reachable from
  * Capstone, 2 reachable only by QEMU identity,
- * 116 carrying a generic id. */
+ * 117 carrying a generic id. */
 static const QemuRegRow qemu_regs_aarch64[] = {
     { .feature = "org.gnu.gdb.aarch64.core", .name = "cpsr", .reg_id = REG_FLAGS, .is_int_flags = true, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
     { .feature = "org.gnu.gdb.aarch64.core", .name = "pc", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
@@ -67,7 +67,7 @@ static const QemuRegRow qemu_regs_aarch64[] = {
     { .feature = "org.gnu.gdb.aarch64.core", .name = "x8", .reg_id = REG_GPR8, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.core", .name = "x9", .reg_id = REG_GPR9, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr", .reg_id = REG_FPCW, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
-    { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpsr", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
+    { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpsr", .reg_id = REG_FCSR, .cap_rows = 0, .tier = QREG_UNNAMED },  /* AArch64 FP STATUS word S3_3_C4_C4_1 (env->vfp.fpsr); OBSERVED as the destination of every FP arithmetic decode -- the control half is fpcr/REG_FPCW */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v0", .reg_id = REG_VEC0, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v1", .reg_id = REG_VEC1, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v10", .reg_id = REG_VEC10, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */

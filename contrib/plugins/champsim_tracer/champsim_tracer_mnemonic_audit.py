@@ -5597,6 +5597,31 @@ class QemuRegRow:
 # Rows are keyed (feature, name) in QEMU's GDB-stub namespace, which is the
 # same key the table is sorted on.
 QEMU_ONLY_REG_IDS: dict[str, dict[tuple[str, str], tuple[str, str]]] = {
+    "aarch64": {
+        # FPSR, THE FP STATUS WORD, WITH NO GENERIC WORD AT ALL.  Capstone's
+        # AArch64 enum has a constant for FPCR and none for FPSR, so the row
+        # was emitted REG_NONE -- the same "true about the ROUTE, false about
+        # the REGISTER" shape as x86's fctrl below.
+        #
+        # It is not a cosmetic gap.  bad95750f4 measured `fadd d0, d0, d0` at
+        # this tip publishing DST{REG_VEC0, REG_FCSR}, so EVERY aarch64 FP
+        # arithmetic instruction names REG_FCSR as a destination -- and no
+        # aarch64 row carried REG_FCSR, so the class had no QEMU key and its
+        # VALUE could not be published.  x86 seats it on mxcsr, mipsel on
+        # fcr31 and riscv64 on fcsr; aarch64 alone published the name of a
+        # register whose contents nothing could read.
+        #
+        # generic_ids.h states the answer directly -- FPCR is the control
+        # word (REG_FPCW) and FPSR is the status word (REG_FCSR) -- and
+        # bad95750f4 routed the control half while the status half stayed at
+        # REG_NONE because Capstone could not reach it.
+        ("org.gnu.gdb.aarch64.fpu", "fpsr"): (
+            "REG_FCSR",
+            "AArch64 FP STATUS word S3_3_C4_C4_1 (env->vfp.fpsr); OBSERVED "
+            "as the destination of every FP arithmetic decode -- the "
+            "control half is fpcr/REG_FPCW",
+        ),
+    },
     "x86": {
         # The SEGMENT-REGISTER BASES.  QEMU's namespace carries `fs`/`gs` (the
         # selector) and `fs_base`/`gs_base` (the hidden descriptor's base)

@@ -8,9 +8,9 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/verify51/snapre/snapU, 402 sidecar(s):
+ * is /mnt/md0/QEMU/cst_runs/exec124/rt/snap, 402 sidecar(s):
  *   x86_64   115 sidecar(s), 9 row(s), 7 REFUSED (reason on each row below)
- *   aarch64  149 sidecar(s), 9 row(s), 17 REFUSED (reason on each row below)
+ *   aarch64  149 sidecar(s), 8 row(s), 18 REFUSED (reason on each row below)
  *   riscv64  69 sidecar(s), 25 row(s), 6 REFUSED (reason on each row below)
  *   mipsel   69 sidecar(s), 5 row(s)
  * Nothing here says anything about an instruction no sidecar executed.
@@ -99,15 +99,16 @@ typedef struct {
  * CORRECTION under R15/R16: a register the instruction
  * cannot read was never information. */
 /* REFUSED, not carried: 0x44ae204eu decode-new/x87@1101110111000... REG_FPR1 (ffree x7) --
- * QEMU'S OWN DECODE SITE REFUTES THIS READ.  The operand
- * walk still supplies the register, so this is not the
- * boundary case above -- carrying the row would make this
- * table the PERMANENT supplier of a dependency the
- * emulator's translator states the instruction does not
- * have.  The site and its own words:
- *   gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep mark the tag word and never look at the value
+ * a FROZEN ENCODED OPERAND, measured against the deriving
+ * corpus rather than against this table's shape
+ * (FINDING 71-B).  The rule's own instances publish this
+ * register on EVERY one of them while the same numbered
+ * file supplies a VARYING register beside it, so the file
+ * is what the encoding selects from and the constant is
+ * the corpus's operand.  What was measured:
+ *   constant on 744 of 744 instances while the REG_FPR file varies over 7 other register(s): REG_FPR0,REG_FPR2,REG_FPR3,REG_FPR4,REG_FPR5,REG_FPR6...
  * An ADJUDICATED CORRECTION under R15/R16, not a loss
- * under R12.1: a source the encoding does not read was
+ * under R12.1: a register the encoding does not name was
  * never information. */
 /* REFUSED, not carried: 0xa459584bu decode-new/x87@11011101..111... REG_SEG0 (fnstsw x7) --
  * disas/capstone.c already DROPS this register for this
@@ -130,7 +131,7 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
     { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
 };
 
-/* aarch64 -- 9 rows, 279 census entries, from 149 sidecar(s) */
+/* aarch64 -- 8 rows, 264 census entries, from 149 sidecar(s) */
 /* REFUSED, not carried: 0x48fe989eu disas_a64/SYS@1101010100.11................... REG_FCSR (mrs x33) --
  * the census shows this decode id carrying more than one
  * instruction, so an id-keyed row would fire on the others
@@ -178,6 +179,18 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
  * instruction, so an id-keyed row would fire on the others
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
+/* REFUSED, not carried: 0x8e2f807fu disas_a64/NOP@11111000100.........00.......... REG_SP (prfum x15) --
+ * a FROZEN ENCODED OPERAND, measured against the deriving
+ * corpus rather than against this table's shape
+ * (FINDING 71-B).  The rule's own instances publish this
+ * register on EVERY one of them while the same numbered
+ * file supplies a VARYING register beside it, so the file
+ * is what the encoding selects from and the constant is
+ * the corpus's operand.  What was measured:
+ *   constant on 1536 of 1536 instances while the REG_GPR file varies over 31 other register(s): REG_FP_REG,REG_GPR0,REG_GPR1,REG_GPR10,REG_GPR11,REG_GPR12...
+ * An ADJUDICATED CORRECTION under R15/R16, not a loss
+ * under R12.1: a register the encoding does not name was
+ * never information. */
 /* REFUSED, not carried: 0xf38c59fcu disas_a64/ST_mult@0.001100.00.....0000............ REG_GPR22 (st4 x22) --
  * this decode id carries another FIXED row from the SAME
  * NUMBERED BANK, so the pair claims one rule reads two
@@ -295,7 +308,6 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
     { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x2 */
     { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@1111100110......................" },   /* prfm x26 */
     { 0x81b1e8f0u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x32 */
-    { 0x8e2f807fu, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@11111000100.........00.........." },   /* prfum x15 */
     { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FNEG_s" },   /* fneg x55 */
     { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x32 */
 };
@@ -383,6 +395,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 48 rows over the four ISAs. */
+/* 47 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

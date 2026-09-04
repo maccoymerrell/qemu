@@ -304,6 +304,138 @@ def bank_of(reg):
     return None
 
 
+# Members of a numbered file that the VOCABULARY gives a name outside that
+# file's stem.  These are not aliases of convenience: each is a register the
+# ISA encodes in the same numbered field as its bank, which the tracer's own
+# per-ISA table maps to a distinct generic word --
+#
+#   aarch64  sp = x31 in the SP-form, x29 = REG_FP_REG, x30 = REG_LR
+#   riscv64  sp = x2,  fp = x8,  ra = x1
+#   mipsel   sp = $29, s8 = $30, ra = $31
+#   x86_64   rsp and rbp are the 4th and 5th slots of the same file
+#
+# read off champsim_tracer_qemu_regs_<isa>.h, where every one of them sits in
+# the same GDB core feature as the numbered registers beside it.  A rule that
+# freezes ONE of these has frozen a member of the general file exactly as a
+# rule that freezes REG_GPR7 has, and bank_of() cannot see it because the
+# name carries no digits.
+BANK_ALIASES = {"REG_SP": "REG_GPR", "REG_LR": "REG_GPR",
+                "REG_FP_REG": "REG_GPR"}
+
+
+def bank_family(reg):
+    """The numbered file @reg belongs to, counting the aliases above.
+
+    Used by the RUNTIME arm only.  bank_of() is left alone because it keys
+    the STATIC arm, whose subject is two rows of one bank colliding under one
+    id -- a different question, with its own landed row set.
+    """
+    return bank_of(reg) or BANK_ALIASES.get(reg)
+
+
+def read_corpus(path):
+    """{decode_id: [set-of-published-source-registers, per instance]}.
+
+    The mechanism corpus srcenc_sled.py writes: one row per encoding, with
+    the decode identity in column `decode_id` and the wire's published source
+    list in column `PUB`.  Read by NAME from the header row, never by index,
+    because a column added to the middle of that corpus would otherwise
+    silently re-point this at another column's contents.
+    """
+    out, cols = {}, None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            v = line.rstrip("\n").split("\t")
+            if cols is None:
+                if not v or not v[0].startswith("#"):
+                    sys.exit("FAIL %s: no header row; the columns cannot be "
+                             "named" % path)
+                cols = [c.lstrip("#") for c in v]
+                for need in ("decode_id", "PUB"):
+                    if need not in cols:
+                        sys.exit("FAIL %s: corpus has no %r column -- this is "
+                                 "not the mechanism corpus (--mech)"
+                                 % (path, need))
+                di, pi = cols.index("decode_id"), cols.index("PUB")
+                continue
+            if len(v) <= max(di, pi):
+                continue
+            did = v[di].strip()
+            if not did or did == "-":
+                continue
+            pub = set()
+            for r in v[pi].split(","):
+                r = r.strip()
+                if r.startswith("REG_"):
+                    pub.add(r)
+            out.setdefault(int(did, 16), []).append(pub)
+    if not out:
+        sys.exit("FAIL %s: corpus carries no decode identity -- an empty "
+                 "corpus cannot be told from a complete one, so it is "
+                 "refused rather than read as 'nothing varies'" % path)
+    return out
+
+
+def merged_corpus(paths):
+    """One {decode_id: [pub-sets]} over every corpus file of an ISA.
+
+    Several corpora merge by CONCATENATING the instance lists: each file is a
+    set of encodings that were run, and the arm's question -- does this file
+    vary across the rule's instances -- is asked of all of them at once.  A
+    register constant across two corpora and varying within neither is still
+    not varying.
+    """
+    out = {}
+    for p in paths:
+        for did, inst in read_corpus(p).items():
+            out.setdefault(did, []).extend(inst)
+    return out
+
+
+def frozen_runtime(did, reg, corpus):
+    """Is @reg a FROZEN OPERAND of @did, measured against the corpus?
+
+    FINDING 71-B.  The STATIC arm (REFUSAL 6) fires when two FIXED rows of
+    one bank collide under one decode id, so it can only see a frozen operand
+    that happened to be frozen TWICE.  `prfum` was frozen once -- one row,
+    REG_SP, on a rule whose base register is encoded -- and passed.
+
+    The question this asks instead is about the rule's INSTANCES: does the
+    same numbered file supply a VARYING register beside the constant one?  If
+    it does, the file is what the encoding selects from and a constant member
+    of it is the deriving corpus's own operand, not a property of the rule.
+
+    Returns (True, why) or (False, why-not); the reason is carried either way
+    so the header can say what was measured rather than that something was
+    not refused.
+    """
+    fam = bank_family(reg)
+    if not fam:
+        return False, "not a member of a numbered file"
+    inst = corpus.get(did)
+    if not inst:
+        return False, "no instance of this id in the corpus"
+    n = len(inst)
+    if not all(reg in pub for pub in inst):
+        return False, ("published on %d of %d instances, so it is not a "
+                       "constant of the rule" % (
+                           sum(1 for pub in inst if reg in pub), n))
+    others = set()
+    for pub in inst:
+        for r in pub:
+            if r != reg and bank_family(r) == fam:
+                others.add(r)
+    if len(others) < 2:
+        return False, ("the %s file supplies %d other register(s) beside it "
+                       "(%s), which is not variation"
+                       % (fam, len(others), ",".join(sorted(others)) or "none"))
+    return True, ("constant on %d of %d instances while the %s file varies "
+                  "over %d other register(s): %s"
+                  % (n, n, fam, len(others),
+                     ",".join(sorted(others)[:6])
+                     + ("..." if len(others) > 6 else "")))
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -404,7 +536,7 @@ def parse(path):
     return rows, split_ids, owed, (none_a and not any_b)
 
 
-def make_snapshot(dest, inputs):
+def make_snapshot(dest, inputs, corpora=None):
     """Copy every input under @dest and record its sha256.  The copies are
     what the emit mode reads, so a gate re-running underneath cannot move the
     table's inputs out from under it."""
@@ -418,23 +550,39 @@ def make_snapshot(dest, inputs):
             shutil.copyfile(path, os.path.join(dest, name))
             lines.append("%s  %s  %s" % (sha256(path), name, os.path.abspath(path)))
             n += 1
+    # The corpora go in under the SAME manifest and the same hash, because
+    # REFUSAL 6b reads them and an input a gate can move under us is exactly
+    # what the snapshot rule exists to forbid.  Named `<isa>.corpus.NN.` so
+    # the ISA is still the first component read_snapshot() keys on.
+    nc = 0
+    for isa in ISAS:
+        for i, path in enumerate((corpora or {}).get(isa, [])):
+            if not os.path.isfile(path):
+                sys.exit("FAIL: no such corpus: %s" % path)
+            name = "%s.corpus.%02d.%s" % (isa, i, os.path.basename(path))
+            shutil.copyfile(path, os.path.join(dest, name))
+            lines.append("%s  %s  %s"
+                         % (sha256(path), name, os.path.abspath(path)))
+            nc += 1
     if not n:
         sys.exit("FAIL: --snapshot with no inputs; a snapshot of nothing is "
                  "not a corpus")
     with open(os.path.join(dest, MANIFEST), "w") as f:
         f.write("\n".join(lines) + "\n")
-    print("snapshot %s: %d sidecar(s), manifest %s" % (dest, n, MANIFEST))
+    print("snapshot %s: %d sidecar(s), %d corpus file(s), manifest %s"
+          % (dest, n, nc, MANIFEST))
     return 0
 
 
 def read_snapshot(src):
-    """Verify @src against its manifest and return {isa: [paths]}."""
+    """Verify @src against its manifest; return ({isa: [sidecars]},
+    {isa: [corpora]})."""
     man = os.path.join(src, MANIFEST)
     if not os.path.isfile(man):
         sys.exit("FAIL: %s has no %s -- emitting is only allowed from a "
                  "snapshot this tool made (a live path races the gate that "
                  "writes it)" % (src, MANIFEST))
-    out, n = {}, 0
+    out, cor, n, nc = {}, {}, 0, 0
     for line in open(man):
         line = line.rstrip("\n")
         if not line:
@@ -451,18 +599,25 @@ def read_snapshot(src):
         isa = name.split(".", 1)[0]
         if isa not in ISAS:
             sys.exit("FAIL: snapshot %s: %s names no known ISA" % (src, name))
-        out.setdefault(isa, []).append(path)
-        n += 1
+        if name.split(".")[1:2] == ["corpus"]:
+            cor.setdefault(isa, []).append(path)
+            nc += 1
+        else:
+            out.setdefault(isa, []).append(path)
+            n += 1
     if sorted(out) != sorted(ISAS):
         sys.exit("FAIL: snapshot %s covers %s; all four ISAs are required "
                  "(a table missing an ISA reads as 'this ISA has no "
                  "survivors', which is the falsehood this refuses to emit)"
                  % (src, sorted(out)))
-    print("snapshot %s verified: %d sidecar(s), all four ISAs" % (src, n))
-    return out
+    print("snapshot %s verified: %d sidecar(s), %d corpus file(s), all four "
+          "ISAs%s" % (src, n, nc,
+                      "" if nc else
+                      " -- NO CORPUS, so REFUSAL 6b's runtime arm cannot run"))
+    return out, cor
 
 
-def emit(out, inputs, src):
+def emit(out, inputs, src, corpora=None):
     per, splits, seen, clean, owed = {}, {}, {}, {}, {}
     for isa in ISAS:
         merged, sp, ow, files, all_none = {}, set(), set(), 0, True
@@ -510,6 +665,47 @@ def emit(out, inputs, src):
             b = bank_of(reg)
             if b and len(banked.get((did, b), ())) > 1:
                 refused[isa].append((key, per[isa].pop(key), "FROZEN"))
+
+    # REFUSAL 6b -- THE RUNTIME ARM.  FINDING 71-B.
+    #
+    # REFUSAL 6 above is a question about the TABLE'S SHAPE: two FIXED rows
+    # of one numbered bank under one decode id.  That only catches a frozen
+    # operand the deriving corpus happened to freeze TWICE.  aarch64 `prfum`
+    # was frozen once -- a single FIXED REG_SP row on
+    # `disas_a64/NOP@11111000100.........00..........`, a rule whose base
+    # register is ENCODED -- and walked straight through, so all 1,536 prfum
+    # encodings published a stack pointer none of them names.
+    #
+    # This arm asks the corpus instead of the table: for a FIXED row naming a
+    # member of a numbered file, do the rule's own instances supply a VARYING
+    # register of that same file beside the constant?  Where they do, the
+    # file is what the encoding selects from and the constant is the deriving
+    # corpus's operand, frozen into a compiled table.  prfum answers yes on
+    # 1,536 of 1,536.
+    #
+    # IT NEEDS THE ALIASES (bank_family, not bank_of): the register prfum
+    # froze is spelled REG_SP, which carries no digits and so is in no bank
+    # by the static arm's reading, while the registers it varies over are
+    # REG_GPR0..REG_GPR9 and REG_LR.  A file member the vocabulary names
+    # outside the stem is still a file member.
+    #
+    # NOT MEASURABLE IS NOT ZERO.  Without a corpus in the snapshot this arm
+    # does not run, and the header says so by name; it never reports that
+    # nothing was frozen.
+    rt_refused = {isa: [] for isa in ISAS}
+    rt_ran = {isa: (corpora or {}).get(isa) is not None for isa in ISAS}
+    for isa in ISAS:
+        if not rt_ran[isa]:
+            continue
+        corpus = corpora[isa]
+        for key in list(per[isa]):
+            did, role, reg = key
+            if role != "FIXED":
+                continue
+            hit, why = frozen_runtime(did, reg, corpus)
+            if hit:
+                rt_refused[isa].append((key, per[isa][key], why))
+                refused[isa].append((key, per[isa].pop(key), "FROZEN-RT"))
 
     # REFUSAL 7, applied last so a row already refused for a structural
     # reason keeps that reason: THE DECODE BOUNDARY ALREADY DROPS THIS
@@ -653,6 +849,20 @@ def emit(out, inputs, src):
                 a(" * An ADJUDICATED CORRECTION under R15/R16, not a loss")
                 a(" * under R12.1: a source the encoding does not read was")
                 a(" * never information. */")
+            elif why == "FROZEN-RT":
+                a(" * a FROZEN ENCODED OPERAND, measured against the deriving")
+                a(" * corpus rather than against this table's shape")
+                a(" * (FINDING 71-B).  The rule's own instances publish this")
+                a(" * register on EVERY one of them while the same numbered")
+                a(" * file supplies a VARYING register beside it, so the file")
+                a(" * is what the encoding selects from and the constant is")
+                a(" * the corpus's operand.  What was measured:")
+                for k2, _v2, why2 in rt_refused[isa]:
+                    if k2 == (did, role, reg):
+                        a(" *   %s" % why2)
+                a(" * An ADJUDICATED CORRECTION under R15/R16, not a loss")
+                a(" * under R12.1: a register the encoding does not name was")
+                a(" * never information. */")
             elif why == "FROZEN":
                 a(" * this decode id carries another FIXED row from the SAME")
                 a(" * NUMBERED BANK, so the pair claims one rule reads two")
@@ -728,6 +938,9 @@ def emit(out, inputs, src):
                      "a FROZEN ENCODED OPERAND: the id carries another FIXED "
                      "row from the same numbered bank"
                      if why == "FROZEN" else
+                     "a FROZEN ENCODED OPERAND measured on the corpus: the "
+                     "rule's instances vary this file (FINDING 71-B)"
+                     if why == "FROZEN-RT" else
                      "the DECODE BOUNDARY already drops this register for "
                      "this instruction class"
                      if why == "BOUNDARY" else
@@ -738,6 +951,15 @@ def emit(out, inputs, src):
         if not per[isa]:
             print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "
                   "about those sidecars, not about the ISA" % (isa, seen[isa]))
+    for isa in ISAS:
+        if rt_ran[isa]:
+            print("  RUNTIME-ARM %-8s: ran over %d decode id(s), %d row(s) "
+                  "refused as frozen operands"
+                  % (isa, len(corpora[isa]), len(rt_refused[isa])))
+        else:
+            print("  RUNTIME-ARM %-8s: DID NOT RUN -- no corpus in the "
+                  "snapshot.  This is NOT a measurement that nothing is "
+                  "frozen; REFUSAL 6b had no subject to ask about." % isa)
     return 0
 
 
@@ -974,6 +1196,125 @@ def selftest():
     chk("ARM G: emitting from LIVE paths is refused",
         rc.returncode != 0 and not os.path.exists(h + ".2"), rc.stdout.strip())
 
+    # --------------------------------------------------------------- 6b
+    # THE RUNTIME ARM, with its negative controls.  A rule that refused
+    # everything would make its refusal vacuous, so the arms that must NOT
+    # fire are what give the one that must its meaning.
+    #
+    # PRFUM is the shape FINDING 71-B measured: one FIXED row naming REG_SP,
+    # on a rule whose instances publish REG_GPR0/1/2 and REG_LR beside it.
+    # RTFIX is a genuine fixed source: the same register on every instance
+    # and NOTHING else of its file varies.
+    # RTONE varies over exactly ONE other member, which is not variation --
+    # a two-register rule is not a file being selected from.
+    # RTSOME publishes the candidate on only some instances, so it is not a
+    # constant of the rule at all.
+    rt_rows = [
+        "      1536  8e2f807f PRFUMRULE                  REG_SP"
+        "        FIXED   prfum",
+        "        10  0000b1b1 RTFIXRULE                  REG_GPR7"
+        "      FIXED   rtfix",
+        "        10  0000b2b2 RTONERULE                  REG_GPR7"
+        "      FIXED   rtone",
+        "        10  0000b3b3 RTSOMERULE                 REG_GPR7"
+        "      FIXED   rtsome",
+    ]
+    rt_witness = [
+        "      1536  8e2f807f PRFUMRULE                  prfum",
+        "        10  0000b1b1 RTFIXRULE                  rtfix",
+        "        10  0000b2b2 RTONERULE                  rtone",
+        "        10  0000b3b3 RTSOMERULE                 rtsome",
+    ]
+    r2 = os.path.join(d, "riscv64.rt.log")
+    _sidecar(r2, rt_rows, [], rt_witness)
+    corp = os.path.join(d, "riscv64.corpus.tsv")
+    with open(corp, "w") as f:
+        f.write("#isa\tencoding\tmnem\tdecode_id\tPUB\n")
+        # prfum: REG_SP on every instance, GPR file varies over four others
+        for i, other in enumerate(["REG_GPR0", "REG_GPR1", "REG_GPR2",
+                                   "REG_LR"]):
+            f.write("riscv64\t%08x\tprfum\t8e2f807f\tREG_SP,%s\n"
+                    % (i, other))
+        # rtfix: REG_GPR7 constant and nothing else of the file at all
+        for i in range(4):
+            f.write("riscv64\t%08x\trtfix\t0000b1b1\tREG_GPR7,REG_FCSR\n"
+                    % (0x100 + i))
+        # rtone: REG_GPR7 constant, exactly ONE other member beside it
+        for i in range(4):
+            f.write("riscv64\t%08x\trtone\t0000b2b2\tREG_GPR7,REG_GPR3\n"
+                    % (0x200 + i))
+        # rtsome: REG_GPR7 on half the instances only
+        for i, pub in enumerate(["REG_GPR7,REG_GPR0", "REG_GPR1,REG_GPR2",
+                                 "REG_GPR7,REG_GPR4", "REG_GPR5,REG_GPR6"]):
+            f.write("riscv64\t%08x\trtsome\t0000b3b3\t%s\n"
+                    % (0x300 + i, pub))
+    snap2 = os.path.join(d, "snap_rt")
+    rc = subprocess.run(me + ["--snapshot", snap2, "x86_64=" + x,
+                              "aarch64=" + a_, "riscv64=" + r2,
+                              "mipsel=" + m, "--corpus", "riscv64=" + corp],
+                        capture_output=True, text=True)
+    chk("ARM R0: a snapshot carries the corpus too", rc.returncode == 0,
+        rc.stderr.strip())
+    chk("ARM R0a: and says how many corpus files it took",
+        "1 corpus file(s)" in rc.stdout, rc.stdout.strip())
+
+    h2 = os.path.join(d, "out_rt.h")
+    rc = subprocess.run(me + ["--out", h2, "--from-snapshot", snap2],
+                        capture_output=True, text=True)
+    txt2 = open(h2).read() if os.path.exists(h2) else ""
+    chk("ARM R1: emit with a corpus present", rc.returncode == 0,
+        rc.stderr.strip())
+    chk("ARM R2: the FROZEN OPERAND (prfum/REG_SP) is NOT carried",
+        "0x8e2f807fu, SRC_SURV" not in txt2, txt2[:0])
+    chk("ARM R3: and it is REPORTED with what was measured -- the counts and "
+        "the registers the file varied over, not a bare verdict",
+        "REFUSED, not carried: 0x8e2f807f" in txt2
+        and "constant on 4 of 4 instances" in txt2
+        and "REG_GPR0,REG_GPR1,REG_GPR2,REG_LR" in txt2,
+        [L for L in txt2.split("\n") if "8e2f807f" in L or "constant on" in L])
+    chk("ARM R4 (NEGATIVE): a genuine FIXED source IS carried",
+        "0x0000b1b1u, SRC_SURV" in txt2)
+    chk("ARM R5 (NEGATIVE): ONE other member is not variation",
+        "0x0000b2b2u, SRC_SURV" in txt2)
+    chk("ARM R6 (NEGATIVE): a register on only SOME instances is not a "
+        "constant of the rule", "0x0000b3b3u, SRC_SURV" in txt2)
+    chk("ARM R7: the arm reports that it RAN, per ISA",
+        "RUNTIME-ARM riscv64 : ran over" in rc.stdout
+        or "RUNTIME-ARM riscv64" in rc.stdout and "ran over" in rc.stdout,
+        rc.stdout.strip())
+    chk("ARM R8: an ISA with NO corpus says the arm DID NOT RUN, never zero",
+        "RUNTIME-ARM x86_64" in rc.stdout and "DID NOT RUN" in rc.stdout,
+        rc.stdout.strip())
+
+    # Without the corpus, the SAME sidecar carries the frozen row -- which is
+    # what makes the arm's effect a measurement rather than a coincidence of
+    # some other refusal.
+    snap3 = os.path.join(d, "snap_nort")
+    subprocess.run(me + ["--snapshot", snap3, "x86_64=" + x, "aarch64=" + a_,
+                         "riscv64=" + r2, "mipsel=" + m],
+                   capture_output=True, text=True)
+    h3 = os.path.join(d, "out_nort.h")
+    rc = subprocess.run(me + ["--out", h3, "--from-snapshot", snap3],
+                        capture_output=True, text=True)
+    txt3 = open(h3).read() if os.path.exists(h3) else ""
+    chk("ARM R9: WITHOUT the corpus the same row IS carried -- the arm is "
+        "what removes it", "0x8e2f807fu, SRC_SURV" in txt3, rc.stdout.strip())
+
+    # A corpus that is not the mechanism corpus is refused, not read as empty.
+    bad = os.path.join(d, "riscv64.badcorpus.tsv")
+    open(bad, "w").write("#isa\tencoding\tmnem\tsrc\nriscv64\t0\tx\t-\n")
+    snap4 = os.path.join(d, "snap_bad")
+    subprocess.run(me + ["--snapshot", snap4, "x86_64=" + x, "aarch64=" + a_,
+                         "riscv64=" + r2, "mipsel=" + m,
+                         "--corpus", "riscv64=" + bad],
+                   capture_output=True, text=True)
+    rc = subprocess.run(me + ["--out", h + ".4", "--from-snapshot", snap4],
+                        capture_output=True, text=True)
+    chk("ARM R10: a corpus with no decode_id column is REFUSED, not read as "
+        "'nothing varies'",
+        rc.returncode != 0 and "not the mechanism corpus"
+        in (rc.stdout + rc.stderr), (rc.stdout + rc.stderr).strip())
+
     open(os.path.join(snap, "x86_64.00.x86_64.log"), "a").write("tamper\n")
     rc = subprocess.run(me + ["--out", h + ".3", "--from-snapshot", snap],
                         capture_output=True, text=True)
@@ -990,7 +1331,7 @@ def main(argv):
     if argv[:1] == ["--selftest"]:
         return selftest()
     out = snapshot = from_snapshot = None
-    inputs, i = {}, 0
+    inputs, corpora, i = {}, {}, 0
     while i < len(argv):
         if argv[i] == "--out":
             out = argv[i + 1]; i += 2; continue
@@ -998,6 +1339,12 @@ def main(argv):
             snapshot = argv[i + 1]; i += 2; continue
         if argv[i] == "--from-snapshot":
             from_snapshot = argv[i + 1]; i += 2; continue
+        if argv[i] == "--corpus":
+            c_isa, _, c_path = argv[i + 1].partition("=")
+            if c_isa not in ISAS:
+                sys.exit("unknown isa %r" % c_isa)
+            corpora.setdefault(c_isa, []).append(c_path)
+            i += 2; continue
         isa, _, path = argv[i].partition("=")
         if isa not in ISAS:
             sys.exit("unknown isa %r" % isa)
@@ -1010,7 +1357,7 @@ def main(argv):
         if sorted(inputs) != sorted(ISAS):
             sys.exit("--snapshot needs at least one sidecar for each of %s"
                      % ", ".join(ISAS))
-        return make_snapshot(snapshot, inputs)
+        return make_snapshot(snapshot, inputs, corpora)
 
     if not out:
         sys.exit(__doc__)
@@ -1020,10 +1367,12 @@ def main(argv):
                  "it, and reading one live gave this table a corpus that no "
                  "single run ever had.  Run --snapshot DIR <isa>=<path>... "
                  "first, then emit from DIR.")
-    if inputs:
+    if inputs or corpora:
         sys.exit("REFUSING: --from-snapshot and bare <isa>=<path> inputs "
                  "together; the snapshot is the corpus or nothing is")
-    return emit(out, read_snapshot(from_snapshot), from_snapshot)
+    sidecars, cor = read_snapshot(from_snapshot)
+    return emit(out, sidecars, from_snapshot,
+                {isa: merged_corpus(paths) for isa, paths in cor.items()})
 
 
 if __name__ == "__main__":

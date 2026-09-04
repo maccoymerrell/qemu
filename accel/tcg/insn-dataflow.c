@@ -805,6 +805,15 @@ struct InsnDataflowScratch {
     bool value_overflow;
 
     /*
+     * The (temp, op-range) pairs an emitter marked as writing the value the
+     * ARCHITECTURE DEFINES, as a constant.  Same note shape as the two above
+     * and read the same way; see insn_dataflow_note_defined_const().
+     */
+    DfPreserveNote aconst[DF_MAX_VALUE_NOTES];
+    unsigned n_aconst;
+    bool aconst_overflow;
+
+    /*
      * The temps a target declared as carrying a lowered register's value.
      * No overflow flag: the array is sized above what any target in the tree
      * declares, and a declaration that did not fit would be reported by the
@@ -875,6 +884,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_value            (df->value)
 #define df_n_value          (df->n_value)
 #define df_value_overflow   (df->value_overflow)
+#define df_aconst           (df->aconst)
+#define df_n_aconst         (df->n_aconst)
+#define df_aconst_overflow  (df->aconst_overflow)
 #define df_carrier          (df->carrier)
 #define df_n_carrier        (df->n_carrier)
 #define df_helper           (df->helper)
@@ -939,7 +951,7 @@ static int df_intern(uint32_t off, uint32_t size)
         }
     }
     if (df_nslots >= INSN_DF_MAX_FIELD_SLOTS ||
-        base + df_nslots >= INSN_DF_IMM_PROV_BIT) {
+        base + df_nslots >= INSN_DF_ARCHCONST_PROV_BIT) {
         df_slots_overflow = true;
         return -1;
     }
@@ -1077,6 +1089,13 @@ static void df_emit_prov(FILE *f, const uint64_t *pv, unsigned nregs)
              * `from=x10/a0`, naming one of two sources.
              */
             fprintf(f, "%sZERO", k++ ? "," : "");
+        } else if (b == INSN_DF_ARCHCONST_PROV_BIT) {
+            /*
+             * The architecture's own constant.  Rendered for the reason ZERO
+             * and IMM are: a dump that cannot show a fact the record carries
+             * reads as the record not carrying it.
+             */
+            fprintf(f, "%sARCHCONST", k++ ? "," : "");
         } else if (b == INSN_DF_IMM_PROV_BIT) {
             /*
              * The instruction's own encoded immediate.  Rendered for the
@@ -1937,6 +1956,8 @@ void insn_dataflow_note_reset(void)
     df_preserve_overflow = false;
     df_n_value = 0;
     df_value_overflow = false;
+    df_n_aconst = 0;
+    df_aconst_overflow = false;
     df_n_carrier = 0;
     df_n_fold = 0;
     df_fold_overflow = false;
@@ -2582,6 +2603,34 @@ static bool df_preserve_read(const void *ts, const TCGOp *op)
                 return true;
             }
             if (o == df_preserve[i].end) {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Did an emitter mark the write this op performs as writing the value the
+ * ARCHITECTURE DEFINES, as a constant?  The same lookup as
+ * df_supplied_value() and for the same reason.
+ */
+static bool df_defined_const(const void *ts, const TCGOp *op)
+{
+    for (unsigned i = df_n_aconst; i-- > 0; ) {
+        const TCGOp *o;
+        unsigned n;
+
+        if (df_aconst[i].ts != ts) {
+            continue;
+        }
+        o = df_aconst[i].mark ? QTAILQ_NEXT(df_aconst[i].mark, link)
+                              : QTAILQ_FIRST(&tcg_ctx->ops);
+        for (n = 0; o != NULL && n < 64; o = QTAILQ_NEXT(o, link), n++) {
+            if (o == op) {
+                return true;
+            }
+            if (o == df_aconst[i].end) {
                 break;
             }
         }
@@ -3287,9 +3336,24 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                 TCGTemp *ts = arg_temp(op->args[i]);
 
                 if (df_reg(ts, &idx)) {
+                    uint64_t cprov[INSN_DF_REG_WORDS];
+
                     df_bit(d->wr, idx);
                     df_ord_write(d, INSN_DF_ORD_GLOBAL, idx);
-                    df_add_write(d, idx, prov, df_supplied_value(ts, op));
+                    /*
+                     * THE ARCHITECTURE'S OWN CONSTANT, where the emitter
+                     * stated it.  Added to a COPY: the provenance being
+                     * accumulated belongs to the op and its other outputs,
+                     * and this fact is about one written global.
+                     */
+                    if (df_defined_const(ts, op)) {
+                        memcpy(cprov, prov, sizeof(cprov));
+                        df_bit(cprov, INSN_DF_ARCHCONST_PROV_BIT);
+                        df_add_write(d, idx, cprov,
+                                     df_supplied_value(ts, op));
+                    } else {
+                        df_add_write(d, idx, prov, df_supplied_value(ts, op));
+                    }
                 } else {
                     size_t ti = ts - s->temps;
 
@@ -3582,9 +3646,18 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             TCGTemp *ts = arg_temp(op->args[i]);
 
             if (df_reg(ts, &idx)) {
+                uint64_t cprov[INSN_DF_REG_WORDS];
+
                 df_bit(d->wr, idx);
                 df_ord_write(d, INSN_DF_ORD_GLOBAL, idx);
-                df_add_write(d, idx, prov, df_supplied_value(ts, op));
+                /* See the sibling site above. */
+                if (df_defined_const(ts, op)) {
+                    memcpy(cprov, prov, sizeof(cprov));
+                    df_bit(cprov, INSN_DF_ARCHCONST_PROV_BIT);
+                    df_add_write(d, idx, cprov, df_supplied_value(ts, op));
+                } else {
+                    df_add_write(d, idx, prov, df_supplied_value(ts, op));
+                }
             } else {
                 size_t ti = ts - s->temps;
                 uint64_t *dp = df_prov_of(ti);
@@ -4038,6 +4111,37 @@ void insn_dataflow_note_supplied_value(const void *ts, const void *mark)
     df_value[df_n_value].mark = mark;
     df_value[df_n_value].end = op;
     df_n_value++;
+}
+
+/*
+ * The architecture-defined-constant half.  See
+ * insn_dataflow_note_defined_const() in the header for the one shape it
+ * exists for, and for why its absence leaves the write exactly as refused as
+ * it was.
+ */
+void insn_dataflow_note_defined_const(const void *ts, const void *mark)
+{
+    const TCGOp *op;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_aconst >= DF_MAX_VALUE_NOTES) {
+        df_aconst_overflow = true;
+        return;
+    }
+    op = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_aconst; i-- > 0; ) {
+        if (df_aconst[i].ts == ts && df_aconst[i].end == op) {
+            return;
+        }
+        break;
+    }
+    df_aconst[df_n_aconst].ts = ts;
+    df_aconst[df_n_aconst].mark = mark;
+    df_aconst[df_n_aconst].end = op;
+    df_n_aconst++;
 }
 
 /*

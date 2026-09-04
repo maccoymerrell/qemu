@@ -870,6 +870,13 @@ std::atomic<uint64_t> g_status_count_slots{0};
  * for and an instruction whose extraction was short before it could say
  * both print as an empty WR column, and they want opposite remedies.
  */
+/*
+ * Destinations published with an EMPTY dependency set because an emitter
+ * stated the value is the architecture's own constant.  A counter and not a
+ * silence: the whole point of the bit is that an empty set means something
+ * here, so how often it is read that way has to be visible.
+ */
+std::atomic<uint64_t> g_dst_arch_const{0};
 std::atomic<uint64_t> g_wshort_admitted{0};
 std::atomic<uint64_t> g_wshort_regs{0};
 std::atomic<uint64_t> g_wshort_nothing{0};
@@ -1402,7 +1409,7 @@ bool is_monitor_value(const char *nm)
  * there and a recorded slot here.
  */
 QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
-                    uint64_t *load_slots, uint8_t *saw_imm)
+                    uint64_t *load_slots, uint8_t *saw_imm, uint8_t *saw_const)
 {
     for (unsigned b = 0; b < g_prov_words * 64; b++) {
         unsigned slot;
@@ -1435,6 +1442,18 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
              */
             if (!add_reg(regs, n, (uint8_t)REG_ZERO)) {
                 return QDEP_R_WIDE;
+            }
+        } else if (qemu_plugin_dataflow_prov_arch_const(b)) {
+            /*
+             * THE VALUE THE ARCHITECTURE DEFINES, stated as a constant by
+             * the emitter that wrote it.  Not a register, so nothing is
+             * added to @regs -- the point of the bit is that the register
+             * set is EMPTY and that emptiness is the answer.  Reported
+             * through @saw_const to the destination family, which is the
+             * only one whose empty-set refusal it discharges.
+             */
+            if (saw_const) {
+                *saw_const = 1;
             }
         } else if (qemu_plugin_dataflow_prov_encoded_imm(b)) {
             /*
@@ -2475,7 +2494,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
         uint8_t gen, k;
         uint64_t memop_slots = 0;
         uint8_t sregs[QDEP_MAX_ADDR_REGS];
-        uint8_t sn = 0, simm = 0;
+        uint8_t sn = 0, simm = 0, sconst = 0;
         QDepState rc;
 
         if (!(wr[r / 64] & (1ULL << (r % 64)))) {
@@ -2514,7 +2533,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
          * leave an empty one behind that the wire comparison then reports as
          * a register QEMU wrote and the wire does not carry.
          */
-        rc = fold_prov(w.data(), sregs, &sn, &memop_slots, &simm);
+        rc = fold_prov(w.data(), sregs, &sn, &memop_slots, &simm, &sconst);
         if (rc != QDEP_OK) {
             out->dst_state = rc;
             return;
@@ -2563,6 +2582,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             }
         }
         out->dst_dep_imm[k] |= simm;
+        out->dst_arch_const[k] |= sconst;
         /*
          * MEMOP ordinals into LOAD ordinals, exactly as the store-data
          * arm does it and for the same reason: QEMU numbers the load-data
@@ -2677,7 +2697,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             }
             rc = fold_prov(w.data(), out->dst_dep_regs[k],
                            &out->n_dst_dep_regs[k], &memop_slots,
-                           &out->dst_dep_imm[k]);
+                           &out->dst_dep_imm[k], &out->dst_arch_const[k]);
             if (rc == QDEP_OK) {
                 for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
                     if (!(memop_slots & (1ULL << m))) {
@@ -2803,7 +2823,7 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             }
             rc = fold_prov(w.data(), out->dst_dep_regs[k],
                            &out->n_dst_dep_regs[k], &memop_slots,
-                           &out->dst_dep_imm[k]);
+                           &out->dst_dep_imm[k], &out->dst_arch_const[k]);
             if (rc == QDEP_OK) {
                 for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
                     if (!(memop_slots & (1ULL << m))) {
@@ -3113,6 +3133,25 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
                            generic_reg_name_or_unknown(q->dst_reg[k]));
                 g_dst_prov_unstated.fetch_add(1, std::memory_order_relaxed);
                 return QDEP_R_DST_PROV_UNSTATED;
+            }
+            /*
+             * AND THE FIFTH SHAPE, which is the one the empty set was
+             * refused for having no word for: the value is the constant THE
+             * ARCHITECTURE DEFINES, and the emitter said so.  `axflag` sets
+             * PSTATE.N and PSTATE.V to zero because that is what AXFLAG
+             * means, and the zeros are carried by no encoding -- every
+             * `axflag` has the same ones -- so the immediate reading above
+             * does not reach them and never could.
+             *
+             * The empty set IS the answer here: the destination waits on
+             * nothing.  Publishing it is not the fabrication the refusal
+             * guards against, because the emptiness is stated rather than
+             * left over -- and a write no emitter reached carries no bit and
+             * still refuses below, so nothing is read out of a silence.
+             */
+            if (q->dst_arch_const[k]) {
+                g_dst_arch_const.fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
             if (!f->has_immediate ||
                 (q->imm_non_dataflow && !q->imm_reached)) {
@@ -5303,9 +5342,11 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         } else {
             rc = store
                 ? fold_prov(w.data(), out->store_addr_regs[a],
-                            &out->n_store_addr_regs[a], nullptr, nullptr)
+                            &out->n_store_addr_regs[a], nullptr, nullptr,
+                            nullptr)
                 : fold_prov(w.data(), out->load_addr_regs[a],
-                            &out->n_load_addr_regs[a], nullptr, nullptr);
+                            &out->n_load_addr_regs[a], nullptr, nullptr,
+                            nullptr);
         }
         /*
          * The verdict lands on THIS access.  @state still takes the first
@@ -5345,7 +5386,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         }
         uint64_t memop_slots = 0;
         rc = fold_prov(w.data(), out->store_data_regs[a],
-                       &out->n_store_data_regs[a], &memop_slots, nullptr);
+                       &out->n_store_data_regs[a], &memop_slots, nullptr,
+                       nullptr);
         if (rc == QDEP_OK) {
             /*
              * Translate MEMOP ordinals into LOAD ordinals.  A bit naming an
@@ -6369,6 +6411,30 @@ void qdep_report(GString *report)
         g_dst_repr_selector.load(std::memory_order_relaxed),
         g_dst_repr_change.load(std::memory_order_relaxed),
         g_dst_repr_refused.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  destination SLOTS published with an EMPTY mask"
+        " because an emitter\n"
+        "              STATED the value is the ARCHITECTURE'S OWN CONSTANT"
+        " (INSN_DF_ARCHCONST_PROV_BIT).\n"
+        "               `axflag` sets PSTATE.N and PSTATE.V to zero because"
+        " that is what\n"
+        "               AXFLAG MEANS -- no encoding carries the zeros, every"
+        " `axflag` has\n"
+        "               the same ones -- so the immediate reading cannot"
+        " reach them and the\n"
+        "               empty set IS the answer: the destination waits on"
+        " nothing.  A write\n"
+        "               no emitter reached carries no bit and still refuses"
+        " under\n"
+        "               QDEP_R_DST_UNSTATED_CONST, so nothing is read out of"
+        " a silence.\n"
+        "               A ZERO here is not a defect: on a target whose flag"
+        " file is\n"
+        "               LOWERED the generic register folds four globals, so"
+        " the set is\n"
+        "               non-empty from its siblings and this branch has no"
+        " subject\n",
+        g_dst_arch_const.load(std::memory_order_relaxed));
     g_string_append_printf(report,
         "  %10" G_GUINT64_FORMAT "  DISCARDED destination rows an emitter stated"
         " (#260):\n"

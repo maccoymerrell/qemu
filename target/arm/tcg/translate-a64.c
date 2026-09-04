@@ -2628,7 +2628,7 @@ static bool trans_XAFLAG(DisasContext *s, arg_XAFLAG *a)
 
 static bool trans_AXFLAG(DisasContext *s, arg_AXFLAG *a)
 {
-    const void *mark;
+    const void *mark, *mark2;
 
     if (!dc_isar_feature(aa64_condm_5, s)) {
         return false;
@@ -2641,19 +2641,47 @@ static bool trans_AXFLAG(DisasContext *s, arg_AXFLAG *a)
     /* !(Z | V) -> !(!ZF | V) -> ZF & !V -> ZF & ~VF */
     tcg_gen_andc_i32(cpu_ZF, cpu_ZF, cpu_VF);
 
+    /*
+     * A SECOND MARK, and it is load-bearing.  A note's range runs from its
+     * mark to the last op emitted when the note is taken, and a note is
+     * keyed on (temp, range) -- so a VF note anchored at the top of this
+     * function would also match the `sari cpu_VF` above, putting the
+     * architecture's constant on a write that computes V from V.  Worse, it
+     * would then travel: `andc cpu_CF, cpu_CF, cpu_VF` reads VF's row, so CF
+     * and Z would inherit a claim that their values are constants, which is
+     * exactly the false statement this bit exists to avoid.  Measured that
+     * way round before this mark existed -- CF's provenance read
+     * `CF,VF,ARCHCONST`.
+     */
+    mark2 = insn_dataflow_mark();
     tcg_gen_movi_i32(cpu_NF, 0);
     tcg_gen_movi_i32(cpu_VF, 0);
 
     /*
      * The C and Z writes are definitions computed from the flags, on
-     * trans_CFINV()'s rule.  N and V are set to a translator CONSTANT, so
-     * their provenance is empty rather than mistakable, and they refuse
-     * under a different rule -- the empty-set one -- which this note does
-     * not and should not reach.  Stated here so the remaining half of
-     * `axflag` is a named question and not a silence.
+     * trans_CFINV()'s rule.
+     *
+     * N AND V ARE THE OTHER HALF, and it is no longer a named question.
+     * AXFLAG's definition sets PSTATE.N = 0 and PSTATE.V = 0 -- the zeros
+     * ARE the instruction, not an artefact of how it is lowered -- so their
+     * writes have an empty provenance, and an empty provenance is the one
+     * thing a consumer cannot read: it means "waits on nothing" here and
+     * "nobody said" on a write no emitter described, and the op stream shows
+     * the same `movi` for both.  insn_dataflow_note_defined_const() is the
+     * emitter saying which one this is, and the emitter is the only place
+     * that can: a `movi` into a flag global is whatever the lowering that
+     * emitted it meant by it.
+     *
+     * BOTH notes on both, and both are true: the write is a DEFINITION
+     * rather than a change of representation, and the definition is a
+     * constant the architecture states.
      */
     insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_CF), mark);
     insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_ZF), mark);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_NF), mark2);
+    insn_dataflow_note_supplied_value(tcgv_i32_temp(cpu_VF), mark2);
+    insn_dataflow_note_defined_const(tcgv_i32_temp(cpu_NF), mark2);
+    insn_dataflow_note_defined_const(tcgv_i32_temp(cpu_VF), mark2);
 
     return true;
 }

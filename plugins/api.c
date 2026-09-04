@@ -791,6 +791,11 @@ bool qemu_plugin_dataflow_prov_encoded_imm(unsigned bit)
     return bit == INSN_DF_IMM_PROV_BIT;
 }
 
+bool qemu_plugin_dataflow_prov_arch_const(unsigned bit)
+{
+    return bit == INSN_DF_ARCHCONST_PROV_BIT;
+}
+
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
                                       size_t idx,
                                       qemu_plugin_dataflow_status *out)

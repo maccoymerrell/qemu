@@ -645,6 +645,18 @@ struct QDepInsn {
      */
     uint8_t dst_dep_imm[QDEP_MAX_DST];
     /*
+     * Did an emitter state that this destination's value is the one the
+     * ARCHITECTURE DEFINES, as a constant?  One per destination, because the
+     * question is asked per written register: `axflag` states it for the N
+     * and V it zeroes and not for the C and Z it computes from the flags.
+     *
+     * It is the fourth candidate in the empty-set rule (see dst_precheck()):
+     * an empty register set with this bit is the ANSWER -- the destination
+     * waits on nothing -- where the same empty set without it is a write
+     * nobody described and refuses.
+     */
+    uint8_t dst_arch_const[QDEP_MAX_DST];
+    /*
      * A WRITE INTO THIS DESTINATION SAID NOTHING ABOUT WHERE ITS VALUE CAME
      * FROM -- qemu_plugin_dataflow_field::prov_stated clear on the field row
      * that filled it.

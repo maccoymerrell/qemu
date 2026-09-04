@@ -375,6 +375,40 @@ typedef struct InsnDataflowNamedWrite {
  */
 #define INSN_DF_IMM_PROV_BIT     (INSN_DF_ZERO_PROV_BIT - 1)
 
+/*
+ * The sixth region: a value THE ARCHITECTURE DEFINES, stated as a constant.
+ *
+ * THE SHAPE.  AArch64's `axflag` sets PSTATE.N and PSTATE.V to zero -- the
+ * instruction's definition IS those two constants -- and QEMU emits it as
+ * `movi cpu_NF, 0`, an op with no input.  The write's provenance is
+ * therefore EMPTY, and empty has meant two irreconcilable things: "the value
+ * waits on nothing", which is the answer here, and "nobody stated where the
+ * value came from", which is the shape a consumer must refuse on.  Nothing
+ * distinguishes them from the op stream, so a consumer that publishes the
+ * empty set fabricates an answer on every unstated write, and one that
+ * refuses -- as the tracer does -- refuses an instruction whose dataflow the
+ * architecture states in full.
+ *
+ * WHY IT IS NOT INSN_DF_IMM_PROV_BIT.  That bit is the instruction's own
+ * ENCODED immediate, and `axflag`'s zeros are not encoded anywhere: every
+ * `axflag` has the same value in the same bits.  The encoding does not carry
+ * the constant, the DEFINITION does.
+ *
+ * AND WHY IT IS NOT "a translation-time constant", which the imm region's
+ * comment rules out in those words.  QEMU synthesises those everywhere and
+ * for its own reasons, and a bit that meant that would say nothing about the
+ * machine.  This bit is narrower by construction: it is set only where an
+ * emitter STATES that the constant is the architecture's answer for that
+ * destination, which is a claim about the ISA and one only the emitter is
+ * positioned to make.  R15 keeps it honest -- a note nobody wrote leaves the
+ * write refused exactly as it is today, so the absence of the bit is never
+ * read as "the value came from somewhere else".
+ *
+ * It sits directly below the immediate bit for that bit's reason: the
+ * interning bound moves by one and no new arithmetic is needed.
+ */
+#define INSN_DF_ARCHCONST_PROV_BIT (INSN_DF_IMM_PROV_BIT - 1)
+
 typedef struct InsnDataflowField {
     uint32_t off;
     uint16_t size;
@@ -1736,6 +1770,44 @@ void insn_dataflow_note_preserve_read(const void *ts, const void *mark);
 void insn_dataflow_note_supplied_value(const void *ts, const void *mark);
 
 /*
+ * The write just emitted puts into @ts the value the ARCHITECTURE DEFINES
+ * for that destination, and that value is a constant.
+ *
+ * WHAT THIS IS FOR.  `axflag` is the whole of the shape: AXFLAG's definition
+ * sets PSTATE.N = 0 and PSTATE.V = 0, and QEMU emits `movi cpu_NF, 0` and
+ * `movi cpu_VF, 0`.  The provenance of both writes is empty, and a consumer
+ * cannot tell that empty from the empty of a write nobody described.  The
+ * first means the destination waits on nothing, which is a complete answer;
+ * the second means nothing was said, which is not an answer at all, and a
+ * consumer that reads them alike is either fabricating dependencies or
+ * refusing instructions the architecture states in full.
+ *
+ * WHERE IT IS STATED, AND WHY NOWHERE ELSE.  At the emitter, because the
+ * claim is about the ISA: `movi` into a flag global appears wherever a
+ * lowering found it convenient, and only the emitter knows whether the zero
+ * it is writing is the instruction's DEFINITION or an intermediate value the
+ * next op will overwrite.  A structural test on the op cannot stand in for
+ * it, exactly as insn_dataflow_note_preserve_read()'s header records for
+ * `deposit`.
+ *
+ * ITS ABSENCE IS NOT AN ANSWER AND IS NOT USED AS ONE.  A write nobody marked
+ * keeps the empty provenance it has, and a consumer keeps refusing it -- the
+ * behaviour before this call existed.  Adding the note can only turn a
+ * refusal into an answer, never a published dependency into a missing one,
+ * which is the direction R15 asks a new statement to run in.
+ *
+ * It is orthogonal to insn_dataflow_note_supplied_value(): that one says the
+ * write is a DEFINITION rather than a change of representation, this one
+ * says what the definition IS.  `axflag` states both about its N and V
+ * writes, and both are true of them.
+ *
+ * @ts is the global written; @mark bounds the note to the ops this emitter
+ * produced, taken with insn_dataflow_mark() before the write is emitted.
+ * Capture only: no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_defined_const(const void *ts, const void *mark);
+
+/*
  * Temp @ts is a REPRESENTATION CARRIER for the lowered register that TCG
  * global @stands_for_ts belongs to: a redundant spelling of a value that
  * register already holds, kept in a temp because it is only live inside one
@@ -2094,6 +2166,11 @@ static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
 static inline void insn_dataflow_note_preserve_read(const void *ts,
                                                     const void *mark)
 { }
+
+static inline void insn_dataflow_note_defined_const(const void *ts,
+                                                   const void *mark)
+{
+}
 
 static inline void insn_dataflow_note_supplied_value(const void *ts,
                                                      const void *mark)

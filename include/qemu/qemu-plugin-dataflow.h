@@ -778,6 +778,41 @@ QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_encoded_imm(unsigned bit);
 
 /*
+ * Is @bit the value THE ARCHITECTURE DEFINES for this destination, stated as
+ * a constant?
+ *
+ * An empty provenance has meant two irreconcilable things.  "The value waits
+ * on nothing" is a complete answer -- AArch64 `axflag` sets PSTATE.N and
+ * PSTATE.V to zero, and zero is the whole of what the instruction's
+ * definition says they become.  "Nobody stated where the value came from" is
+ * not an answer at all, and a consumer that published the empty set for it
+ * would state that a destination depends on nothing on the strength of
+ * nobody having looked.  The op stream cannot separate them: both are a
+ * write with no named input.
+ *
+ * So the emitter that supplied the constant says which one this is, and the
+ * fact travels as a provenance bit like the zero register's and the encoded
+ * immediate's.  A destination whose provenance is EXACTLY this bit waits on
+ * nothing, and a consumer may publish that as the answer it is.
+ *
+ * WHAT IT IS NOT: a bit for "a translation-time constant".  Same line the
+ * encoded-immediate accessor draws, and for the same reason -- QEMU makes
+ * those everywhere and for its own purposes.  This bit is set only where an
+ * emitter states that the constant is the ARCHITECTURE's answer, which is a
+ * claim about the machine.
+ *
+ * Its ABSENCE is not an answer either: a write no emitter has reached keeps
+ * the bare empty provenance it always had, and a consumer must keep refusing
+ * it.  Adding a note can only turn a refusal into an answer.
+ *
+ * A consumer that does not ask is not misled, on the same rule as the memop,
+ * zero-register and immediate regions: a bit it cannot resolve is one it
+ * must not attribute to a register.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_arch_const(unsigned bit);
+
+/*
  * Anything the extraction could not represent.
  *
  * A consumer is never left to infer completeness from silence, and it is not

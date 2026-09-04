@@ -2137,6 +2137,7 @@ static DfHelperCensus *df_census_row(const char *name, uint32_t flags,
 static void df_census_dump_locked(void)
 {
     FILE *f;
+    char *tmp;
 
     if (!df_census_on || !df_census_path) {
         return;
@@ -2147,8 +2148,25 @@ static void df_census_dump_locked(void)
         df_census_file = g_strdup_printf("%s.%d", df_census_path,
                                          (int)df_census_file_pid);
     }
-    f = fopen(df_census_file, "w");
+    /*
+     * WRITTEN ASIDE AND RENAMED, never in place.
+     *
+     * fopen(..., "w") truncates first, so a process killed between the
+     * truncate and the last fprintf leaves a SHORT OR EMPTY part -- and this
+     * dump is rewritten on every helper-call translation, so that window is
+     * open almost continuously.  Measured: four aarch64 census parts, all
+     * zero bytes, from chunk processes stopped mid-run; the chunks they
+     * stood for were simply gone, and an empty file is exactly what a
+     * chunk that reached no helper would also look like.
+     *
+     * rename(2) over the same directory is atomic, so a part is either the
+     * previous complete dump or the new complete one.  There is no state in
+     * which it is half of either.
+     */
+    tmp = g_strdup_printf("%s.tmp", df_census_file);
+    f = fopen(tmp, "w");
     if (!f) {
+        g_free(tmp);
         return;
     }
     fprintf(f, "# qemu insn-dataflow CP-H helper census\n");
@@ -2166,7 +2184,14 @@ static void df_census_dump_locked(void)
                 c->ptr_args, c->env_args, c->unknown_args, c->stated_args,
                 c->unknown_pairs);
     }
-    fclose(f);
+    if (fclose(f) == 0) {
+        if (rename(tmp, df_census_file) != 0) {
+            unlink(tmp);
+        }
+    } else {
+        unlink(tmp);
+    }
+    g_free(tmp);
 }
 
 /* Fold @n consecutive temps' provenance -- and their own bits -- into @dst. */

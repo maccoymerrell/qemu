@@ -38,14 +38,39 @@ DECLARED = ('nargs', 'flags')
 
 
 def parts_for(spec):
-    """Every part file named by @spec: a directory, a base path, or a part."""
+    """Every part file named by @spec: a directory, a base path, or a part.
+
+    AN EMPTY PART IS A REFUSAL, not something to skip.  A part exists because
+    a process created it, and QEMU writes each one by rename(2) from a
+    complete temporary -- so a zero-byte part cannot be a process that
+    reached no helper (that one would still carry the header).  It is a
+    process that died mid-write under an older build, or a truncated file,
+    and the chunk it stands for is GONE.  Skipping it merges the survivors
+    and reports a total, which is precisely the silent shortfall this whole
+    tool exists to prevent.  Measured: four aarch64 parts, all zero bytes,
+    from chunk processes stopped by a host stall.
+
+    `.tmp` files are ignored rather than refused -- those are the in-flight
+    half of the rename and belong to a process that is still running.
+    """
     if os.path.isdir(spec):
         cand = sorted(glob.glob(os.path.join(spec, '*_helpers.tsv.*')) +
                       glob.glob(os.path.join(spec, '*_helpers.tsv')))
     else:
         cand = sorted(set(glob.glob(spec + '.*')) | ({spec}
                       if os.path.exists(spec) else set()))
-    return [c for c in cand if os.path.isfile(c) and os.path.getsize(c)]
+    cand = [c for c in cand if os.path.isfile(c) and not c.endswith('.tmp')]
+    empty = [c for c in cand if not os.path.getsize(c)]
+    if empty:
+        raise SystemExit(
+            'census_merge: %d part(s) named by %s are EMPTY -- REFUSING.\n'
+            '  %s\n'
+            '  A part is written by rename(2) from a complete temporary, so '
+            'an empty one is\n  a chunk whose census was lost, not a chunk '
+            'that reached no helper.  Merging\n  the rest would report a '
+            'total that is short by however many chunks these were.'
+            % (len(empty), spec, '\n  '.join(empty)))
+    return cand
 
 
 def read_part(path):

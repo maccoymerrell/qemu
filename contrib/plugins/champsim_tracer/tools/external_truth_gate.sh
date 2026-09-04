@@ -70,7 +70,43 @@ selftest() {
     # two isax reports MEASURED AT THAT TIP by isax_srcenc_gate.sh -- the
     # bare eight and the --srcenc eight, which is what the isaxdead rows
     # need and what no older root has.
+    #
+    # AND A ROOT CARRYING A RED NO LIVE ROOT REPRODUCES IS NOT ELIGIBLE.
+    # That is a SECOND eligibility rule beside completeness, and it exists
+    # because the two can disagree: a root may carry every report the
+    # manifest names and still carry a NUMBER nothing at the tip produces.
+    # `verify55/.../evroot` is the standing case -- its `gem5wp/aarch64`
+    # report reads 30, and the leg reads 0 over 40,798 scored at verify56,
+    # at verify57 and again at exec127.  Three independent runs, one
+    # unexplained report.
+    #
+    # WHY THAT DISQUALIFIES IT RATHER THAN MERELY DATING IT.  Arm A of this
+    # selftest requires the UNMODIFIED reports to PASS, and arm B requires a
+    # PLANTED disagreement to fail.  A fixture whose numbers no run
+    # reproduces makes arm A's pass a statement about an artefact: the arm
+    # would be green because the ceiling happens to cover the unreproduced
+    # 30, not because the gate reads reports correctly.  A gate proved
+    # against evidence nobody can regenerate is proved against nothing.
+    #
+    # THE RULE, stated where the fixture is chosen so it cannot be applied
+    # by memory: an evidence root is fixture-eligible when it is COMPLETE
+    # (every report the manifest names -- refused above) AND every headline
+    # it carries is one a live leg reproduces at the tip that produced it.
+    # A root failing the second test is RETIRED from this default and from
+    # ETG_SELFTEST_ROOT; it stays on disk as the record of the run that
+    # wrote it, which is a different thing from a fixture.  The verify55
+    # root is retired under this rule and the 30 remains OWED as a finding
+    # about that run -- retiring the fixture does not close the question.
     SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/exec126/r13/evroot}
+    case $SRC in
+        */verify55/*)
+            echo "SELFTEST REFUSES the verify55 evidence root: it carries a" >&2
+            echo "gem5wp/aarch64 headline of 30 that no live leg reproduces" >&2
+            echo "(0 over 40,798 scored at verify56, verify57 and exec127)." >&2
+            echo "A fixture whose numbers cannot be regenerated proves" >&2
+            echo "nothing about the gate.  See the rule above this line." >&2
+            exit 1 ;;
+    esac
     if [ ! -d "$SRC" ]; then
         echo "SELFTEST CANNOT RUN: no evidence root at $SRC." >&2
         echo "Set ETG_SELFTEST_ROOT.  A selftest with no subject FAILS." >&2

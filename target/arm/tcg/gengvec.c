@@ -32,21 +32,25 @@ static void gen_gvec_fn3_qc(uint32_t rd_ofs, uint32_t rn_ofs, uint32_t rm_ofs,
     tcg_debug_assert(opr_sz <= sizeof_field(CPUARMState, vfp.qc));
     tcg_gen_addi_ptr(qc_ptr, tcg_env, offsetof(CPUARMState, vfp.qc));
     /*
-     * FPSR.QC, WRITTEN.  These helpers are handed a POINTER to vfp.qc and
-     * raise the saturation bit through it, so the ops name an address
-     * computed from tcg_env and never a write of the bytes it addresses --
-     * the same shape fpstatus_ptr() is in on the other status word, and
-     * answered the same way.  The range is named by the
-     * insn_dataflow_declare_regfile("fpsr_qc", ...) in translate-a64.c.
+     * FPSR.QC, READ AND WRITTEN.  These helpers are handed a POINTER to
+     * vfp.qc and raise the saturation bit through it, so the ops name an
+     * address computed from tcg_env and never an access of the bytes it
+     * addresses -- the same shape fpstatus_ptr() is in on the other status
+     * word, and answered the same way.
+     *
+     * BOTH DIRECTIONS, where this used to state the write alone.  The
+     * helper sets the bit only on the lanes that clip and leaves it as it
+     * found it otherwise, so the value it writes depends on the value it
+     * was handed: R17's merging partial write, and the ground 93247f8507
+     * gave for the softfloat status word's source.  Stating the write alone
+     * published a destination with no input on every encoding this expander
+     * serves.  See note_fpsr_qc() in translate.h.
      *
      * The sibling expanders below pass vfp.qc as a gvec OPERAND rather than
-     * as a pointer, and the expander states its direction itself; only this
-     * one owes a statement.
-     *
-     * Capture only; no op is emitted, altered or suppressed.
+     * as a pointer, and the expander states both directions itself; only
+     * this one owes a statement.
      */
-    insn_dataflow_note_stated_write_env(offsetof(CPUARMState, vfp.qc),
-                                        sizeof_field(CPUARMState, vfp.qc));
+    note_fpsr_qc();
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, qc_ptr,
                        opr_sz, max_sz, 0, fn);
 }
@@ -1289,6 +1293,13 @@ void gen_neon_sqshl(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_neon_sqshl_s, gen_helper_neon_sqshl_d,
     };
     tcg_debug_assert(vece <= MO_64);
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, tcg_env,
                        opr_sz, max_sz, 0, fns[vece]);
 }
@@ -1301,6 +1312,13 @@ void gen_neon_uqshl(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_neon_uqshl_s, gen_helper_neon_uqshl_d,
     };
     tcg_debug_assert(vece <= MO_64);
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, tcg_env,
                        opr_sz, max_sz, 0, fns[vece]);
 }
@@ -1313,6 +1331,13 @@ void gen_neon_sqrshl(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_neon_sqrshl_s, gen_helper_neon_sqrshl_d,
     };
     tcg_debug_assert(vece <= MO_64);
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, tcg_env,
                        opr_sz, max_sz, 0, fns[vece]);
 }
@@ -1325,6 +1350,13 @@ void gen_neon_uqrshl(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_neon_uqrshl_s, gen_helper_neon_uqrshl_d,
     };
     tcg_debug_assert(vece <= MO_64);
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_3_ptr(rd_ofs, rn_ofs, rm_ofs, tcg_env,
                        opr_sz, max_sz, 0, fns[vece]);
 }
@@ -1338,6 +1370,13 @@ void gen_neon_sqshli(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
     };
     tcg_debug_assert(vece <= MO_64);
     tcg_debug_assert(c >= 0 && c <= (8 << vece));
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_2_ptr(rd_ofs, rn_ofs, tcg_env, opr_sz, max_sz, c, fns[vece]);
 }
 
@@ -1350,6 +1389,13 @@ void gen_neon_uqshli(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
     };
     tcg_debug_assert(vece <= MO_64);
     tcg_debug_assert(c >= 0 && c <= (8 << vece));
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_2_ptr(rd_ofs, rn_ofs, tcg_env, opr_sz, max_sz, c, fns[vece]);
 }
 
@@ -1362,6 +1408,13 @@ void gen_neon_sqshlui(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
     };
     tcg_debug_assert(vece <= MO_64);
     tcg_debug_assert(c >= 0 && c <= (8 << vece));
+    /*
+     * FPSR.QC, READ AND WRITTEN inside the helper, which reaches it through
+     * the tcg_env pointer it is handed -- so no op names the bytes and the
+     * statement is the only thing that puts the register on the wire.  See
+     * note_fpsr_qc() in translate.h for why the sticky bit is a source too.
+     */
+    note_fpsr_qc();
     tcg_gen_gvec_2_ptr(rd_ofs, rn_ofs, tcg_env, opr_sz, max_sz, c, fns[vece]);
 }
 

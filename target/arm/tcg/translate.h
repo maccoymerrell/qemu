@@ -754,6 +754,64 @@ static inline void note_fpstatus_write(ARMFPStatusFlavour flavour)
         sizeof(((CPUARMState *)0)->vfp.fp_status[0]));
 }
 
+/*
+ * FPSR.QC, THE CUMULATIVE SATURATION BIT, IN BOTH DIRECTIONS.
+ *
+ * The saturating integer vector instructions raise FPSR.QC when a lane
+ * clips.  QEMU keeps the bit in vfp.qc[] apart from the rest of the status
+ * word, and reaches it three different ways: as a gvec OPERAND (the
+ * expander states its own direction and owes nothing), as a POINTER handed
+ * to a gvec helper, and from inside an env-taking helper.  The last two
+ * emit no op that names the bytes, so without a statement here the register
+ * the instruction exists to update is missing from the wire entirely --
+ * measured at PASS 69 as 9,408 aarch64 encodings over 35 saturating
+ * mnemonics publishing QC as a destination with QEMU stating neither
+ * direction.
+ *
+ * IT IS A READ AS WELL AS A WRITE, and that is R17 rather than a judgement
+ * made here.  QC is STICKY: a lane that does not saturate leaves the bit
+ * exactly as it found it, so the value the instruction leaves behind
+ * depends on the value it was handed.  93247f8507 ruled that shape a
+ * merging partial write in its own words -- "the value written depends on
+ * the value held" -- and stated the source for the softfloat status word on
+ * the same ground.  The saturating forms are the same shape and get the
+ * same answer.
+ *
+ * THE RANGE IS THE REGISTER, named by the
+ * insn_dataflow_declare_regfile("fpsr_qc", ...) in translate-a64.c, so one
+ * declaration names the read, the write and every ordinary access alike.
+ *
+ * WHAT IT DOES NOT SAY.  Nothing about the VALUE: whether an execution
+ * actually clipped is a property of the operands, not of the encoding, and
+ * this is the STATIC fact that the encoding reads and updates the register
+ * (R20).
+ *
+ * STATED ONCE PER INSTRUCTION, by the emitter that runs once -- a gvec
+ * constructor, or the wrapper around an element loop -- never from inside
+ * the loop body.  A note per element would say the same thing N times and
+ * spend the translation's note budget saying it.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static inline void note_fpsr_qc_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUARMState, vfp.qc),
+                                       sizeof(((CPUARMState *)0)->vfp.qc));
+}
+
+static inline void note_fpsr_qc_write(void)
+{
+    insn_dataflow_note_stated_write_env(offsetof(CPUARMState, vfp.qc),
+                                        sizeof(((CPUARMState *)0)->vfp.qc));
+}
+
+/* Both halves of the sticky bit, which is what a saturating form owes. */
+static inline void note_fpsr_qc(void)
+{
+    note_fpsr_qc_read();
+    note_fpsr_qc_write();
+}
+
 static inline TCGv_ptr fpstatus_ptr(ARMFPStatusFlavour flavour)
 {
     TCGv_ptr statusptr = tcg_temp_new_ptr();

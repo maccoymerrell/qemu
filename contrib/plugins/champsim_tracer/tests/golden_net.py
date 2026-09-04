@@ -98,8 +98,16 @@ WORKLOADS = [
     # but contains no REP at all, and w3_coverage fans out 175 rep movsq
     # with no register data -- so before this cell existed the byte net
     # returned GREEN against a change that rewrote how REP registers are
-    # published, because nothing it traced had both.  x86_64 gives rep
-    # movsq (8- and 20-iteration), aarch64 the FEAT_MOPS triple.
+    # published, because nothing it traced had both.
+    #
+    # ON x86_64 ONLY, and this used to say otherwise.  The claim that the
+    # aarch64 arm carries "the FEAT_MOPS triple" was never true: the only
+    # coverage probe that fans out is X86RepIterationFanout, whose
+    # supported_isas is ("x86_64",), and FEAT_MOPS arrived at R22 as an
+    # OPT-IN GROUP (fca0db0384) precisely so that adding it would not move
+    # this cell's bytes.  So the aarch64 arm of w8_repregs is a
+    # coverage+regdata cell with no repeating instruction in it, and the
+    # aarch64 subject for the REP register contract is w10_mops.
     #
     # This is the SMALL coverage+regdata shape, measured non-flushing
     # (1263 architectural instructions, 26 fan-outs); the exclusion below
@@ -176,11 +184,21 @@ WORKLOADS = [
          # the bit they may set -- the source 93247f8507 added.
          r"vadd\s+%v0, %v1, %fcsr, %sysfpen -> %fcsr, %v2",
          r"vsub\s+%v0, %v1, %fcsr, %sysfpen -> %fcsr, %v4",
-         # The two QEMU sites that state QC differently, side by side:
-         # gen_gvec_fn3_qc() passes a POINTER (the vector form states the
-         # write alone) and do_int3_qc_vector_idx() passes qc as a gvec
-         # OPERAND (the indexed form states the read as well).
-         r"vmul\s+%v6, %v0, %v1, %sysfpen -> %v6, %fcsr",
+         # The two QEMU sites that state QC, side by side.  They no longer
+         # disagree about WHETHER, and the cell is why: at PASS 69 the
+         # POINTER form (gen_gvec_fn3_qc) stated the write alone and this
+         # line read `%v6, %v0, %v1, %sysfpen -> %v6, %fcsr` -- a sticky
+         # destination with no source, on 9,408 encodings over 35 saturating
+         # mnemonics.  Both forms now state both directions.
+         #
+         # They still disagree about WHERE, and that is a fact rather than a
+         # defect: the pointer form's read is stated by the gvec constructor,
+         # which runs after fp_access_check has already stated the
+         # access-enable read, so %fcsr lands AFTER %sysfpen; the operand
+         # form's read is stated by tcg_gen_gvec_4_ool()'s own role list and
+         # lands before it.  The ordered source list is QEMU's read order
+         # (94dc9e649c), so the two orders are what the two lowerings are.
+         r"vmul\s+%v6, %v0, %v1, %sysfpen, %fcsr -> %v6, %fcsr",
          r"vmul\s+%v7, %v0, %v1, %fcsr, %sysfpen -> %v7, %fcsr",
      ], "x86_64": [
          # The contrast arm: the same instruction CLASS on an ISA whose

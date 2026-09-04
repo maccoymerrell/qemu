@@ -6535,6 +6535,14 @@ static bool do_env_scalar2(DisasContext *s, arg_rrr_e *a, const ENVScalar2 *f)
     if (!fp_access_check(s)) {
         return true;
     }
+    /*
+     * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves
+     * is a saturating form, and the bit is raised inside an env-taking
+     * helper: no op names the bytes, so the statement is the only thing
+     * that puts the register on either list.  Stated here, once, rather
+     * than in the element loop below.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     if (a->esz == MO_64) {
         TCGv_i64 t0 = read_fp_dreg(s, a->rn);
         TCGv_i64 t1 = read_fp_dreg(s, a->rm);
@@ -6618,6 +6626,13 @@ static bool do_env_scalar3_hs(DisasContext *s, arg_rrr_e *a,
     if (!fp_access_check(s)) {
         return true;
     }
+    /*
+     * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves is
+     * a saturating form and raises the bit inside an env-taking helper: no
+     * op names the bytes, so the statement is the only thing that puts the
+     * register on either list.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
 
     t0 = tcg_temp_new_i32();
     t1 = tcg_temp_new_i32();
@@ -7116,7 +7131,7 @@ static bool trans_FCMLA_v(DisasContext *s, arg_FCMLA_v *a)
 /* For low half, iterating up. */
 static bool do_3op_widening(DisasContext *s, MemOp memop, int top,
                             int rd, int rn, int rm, int idx,
-                            NeonGenTwo64OpFn *fn, bool acc)
+                            NeonGenTwo64OpFn *fn, bool acc, bool qc)
 {
     TCGv_i64 tcg_op0 = tcg_temp_new_i64();
     TCGv_i64 tcg_op1 = tcg_temp_new_i64();
@@ -7131,6 +7146,20 @@ static bool do_3op_widening(DisasContext *s, MemOp memop, int top,
     }
     if (!fp_access_check(s)) {
         return true;
+    }
+    /*
+     * FPSR.QC, READ AND WRITTEN, when @qc says this encoding is a saturating
+     * form.  The wrapper serves saturating and non-saturating instructions
+     * alike, so the fact belongs to the CALLER and is passed rather than
+     * inferred: stating it for `xtn` or `shrn` would put a register on the
+     * wire that those do not touch.  Stated HERE, once, rather than in the
+     * element loop -- the loop would state the same fact once per lane and
+     * spend the translation's note budget on it.  See note_fpsr_qc() in
+     * translate.h for why the sticky bit is a source as well as a
+     * destination.
+     */
+    if (qc) {
+        note_fpsr_qc();
     }
 
     if (idx >= 0) {
@@ -7179,41 +7208,41 @@ static void gen_mulsub_i64(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m)
 
 TRANS(SMULL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_mul_i64, false)
+      tcg_gen_mul_i64, false, false)
 TRANS(UMULL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_mul_i64, false)
+      tcg_gen_mul_i64, false, false)
 TRANS(SMLAL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      gen_muladd_i64, true)
+      gen_muladd_i64, true, false)
 TRANS(UMLAL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      gen_muladd_i64, true)
+      gen_muladd_i64, true, false)
 TRANS(SMLSL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      gen_mulsub_i64, true)
+      gen_mulsub_i64, true, false)
 TRANS(UMLSL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      gen_mulsub_i64, true)
+      gen_mulsub_i64, true, false)
 
 TRANS(SMULL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      tcg_gen_mul_i64, false)
+      tcg_gen_mul_i64, false, false)
 TRANS(UMULL_vi, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, a->idx,
-      tcg_gen_mul_i64, false)
+      tcg_gen_mul_i64, false, false)
 TRANS(SMLAL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      gen_muladd_i64, true)
+      gen_muladd_i64, true, false)
 TRANS(UMLAL_vi, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, a->idx,
-      gen_muladd_i64, true)
+      gen_muladd_i64, true, false)
 TRANS(SMLSL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      gen_mulsub_i64, true)
+      gen_mulsub_i64, true, false)
 TRANS(UMLSL_vi, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, a->idx,
-      gen_mulsub_i64, true)
+      gen_mulsub_i64, true, false)
 
 static void gen_sabd_i64(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m)
 {
@@ -7251,28 +7280,28 @@ static void gen_uaba_i64(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m)
 
 TRANS(SADDL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_add_i64, false)
+      tcg_gen_add_i64, false, false)
 TRANS(UADDL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_add_i64, false)
+      tcg_gen_add_i64, false, false)
 TRANS(SSUBL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_sub_i64, false)
+      tcg_gen_sub_i64, false, false)
 TRANS(USUBL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      tcg_gen_sub_i64, false)
+      tcg_gen_sub_i64, false, false)
 TRANS(SABDL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      gen_sabd_i64, false)
+      gen_sabd_i64, false, false)
 TRANS(UABDL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      gen_uabd_i64, false)
+      gen_uabd_i64, false, false)
 TRANS(SABAL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      gen_saba_i64, true)
+      gen_saba_i64, true, false)
 TRANS(UABAL_v, do_3op_widening,
       a->esz, a->q, a->rd, a->rn, a->rm, -1,
-      gen_uaba_i64, true)
+      gen_uaba_i64, true, false)
 
 static void gen_sqdmull_h(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m)
 {
@@ -7326,23 +7355,23 @@ static void gen_sqdmlsl_s(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m)
 
 TRANS(SQDMULL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      a->esz == MO_16 ? gen_sqdmull_h : gen_sqdmull_s, false)
+      a->esz == MO_16 ? gen_sqdmull_h : gen_sqdmull_s, false, true)
 TRANS(SQDMLAL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      a->esz == MO_16 ? gen_sqdmlal_h : gen_sqdmlal_s, true)
+      a->esz == MO_16 ? gen_sqdmlal_h : gen_sqdmlal_s, true, true)
 TRANS(SQDMLSL_v, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, -1,
-      a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true)
+      a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true, true)
 
 TRANS(SQDMULL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      a->esz == MO_16 ? gen_sqdmull_h : gen_sqdmull_s, false)
+      a->esz == MO_16 ? gen_sqdmull_h : gen_sqdmull_s, false, true)
 TRANS(SQDMLAL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      a->esz == MO_16 ? gen_sqdmlal_h : gen_sqdmlal_s, true)
+      a->esz == MO_16 ? gen_sqdmlal_h : gen_sqdmlal_s, true, true)
 TRANS(SQDMLSL_vi, do_3op_widening,
       a->esz | MO_SIGN, a->q, a->rd, a->rn, a->rm, a->idx,
-      a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true)
+      a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true, true)
 
 static bool do_addsub_wide(DisasContext *s, arg_qrrr_e *a,
                            MemOp sign, bool sub)
@@ -7565,6 +7594,13 @@ static bool do_env_scalar2_idx_hs(DisasContext *s, arg_rrx_e *a,
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves is
+         * a saturating form and raises the bit inside an env-taking helper: no
+         * op names the bytes, so the statement is the only thing that puts the
+         * register on either list.  See note_fpsr_qc() in translate.h.
+         */
+        note_fpsr_qc();
         TCGv_i32 t0 = tcg_temp_new_i32();
         TCGv_i32 t1 = tcg_temp_new_i32();
 
@@ -7586,6 +7622,13 @@ static bool do_env_scalar3_idx_hs(DisasContext *s, arg_rrx_e *a,
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves is
+         * a saturating form and raises the bit inside an env-taking helper: no
+         * op names the bytes, so the statement is the only thing that puts the
+         * register on either list.  See note_fpsr_qc() in translate.h.
+         */
+        note_fpsr_qc();
         TCGv_i32 t0 = tcg_temp_new_i32();
         TCGv_i32 t1 = tcg_temp_new_i32();
         TCGv_i32 t2 = tcg_temp_new_i32();
@@ -7753,15 +7796,13 @@ static bool do_int3_qc_vector_idx(DisasContext *s, arg_qrrx_e *a,
     if (fp_access_check(s)) {
         /*
          * FPSR.QC, WRITTEN.  vfp.qc is passed here as the FOURTH gvec
-         * operand rather than as the destination, so the expander states it
-         * as a read and the helper raises the saturation bit through the
-         * pointer it was handed.  The sibling expanders in gengvec.c pass it
-         * as the operand a tcg_gen_gvec_4() writes and owe nothing; this
-         * one, and gen_gvec_fn3_qc()'s pointer form, do.
+         * operand rather than as the destination, so the expander states
+         * the READ itself and this site owes only the write.  The sibling
+         * expanders in gengvec.c pass it as the operand a tcg_gen_gvec_4()
+         * writes and owe nothing; this one owes half, and
+         * gen_gvec_fn3_qc()'s pointer form owes both.
          */
-        insn_dataflow_note_stated_write_env(offsetof(CPUARMState, vfp.qc),
-                                            sizeof_field(CPUARMState,
-                                                         vfp.qc));
+        note_fpsr_qc_write();
         tcg_gen_gvec_4_ool(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm),
@@ -8595,7 +8636,8 @@ static void gen_sli_d(TCGv_i64 dst, TCGv_i64 src, int64_t shift)
 }
 
 static bool do_vec_shift_imm_narrow(DisasContext *s, arg_qrri_e *a,
-                                    WideShiftImmFn * const fns[3], MemOp sign)
+                                    WideShiftImmFn * const fns[3], MemOp sign,
+                                    bool qc)
 {
     TCGv_i64 tcg_rn, tcg_rd;
     int esz = a->esz;
@@ -8606,6 +8648,20 @@ static bool do_vec_shift_imm_narrow(DisasContext *s, arg_qrri_e *a,
 
     if (!fp_access_check(s)) {
         return true;
+    }
+    /*
+     * FPSR.QC, READ AND WRITTEN, when @qc says this encoding is a saturating
+     * form.  The wrapper serves saturating and non-saturating instructions
+     * alike, so the fact belongs to the CALLER and is passed rather than
+     * inferred: stating it for `xtn` or `shrn` would put a register on the
+     * wire that those do not touch.  Stated HERE, once, rather than in the
+     * element loop -- the loop would state the same fact once per lane and
+     * spend the translation's note budget on it.  See note_fpsr_qc() in
+     * translate.h for why the sticky bit is a source as well as a
+     * destination.
+     */
+    if (qc) {
+        note_fpsr_qc();
     }
 
     tcg_rn = tcg_temp_new_i64();
@@ -8754,56 +8810,56 @@ static WideShiftImmFn * const shrn_fns[] = {
     tcg_gen_shri_i64,
     gen_ushr_d,
 };
-TRANS(SHRN_v, do_vec_shift_imm_narrow, a, shrn_fns, 0)
+TRANS(SHRN_v, do_vec_shift_imm_narrow, a, shrn_fns, 0, false)
 
 static WideShiftImmFn * const rshrn_fns[] = {
     gen_urshr_bhs,
     gen_urshr_bhs,
     gen_urshr_d,
 };
-TRANS(RSHRN_v, do_vec_shift_imm_narrow, a, rshrn_fns, 0)
+TRANS(RSHRN_v, do_vec_shift_imm_narrow, a, rshrn_fns, 0, false)
 
 static WideShiftImmFn * const sqshrn_fns[] = {
     gen_sqshrn_b,
     gen_sqshrn_h,
     gen_sqshrn_s,
 };
-TRANS(SQSHRN_v, do_vec_shift_imm_narrow, a, sqshrn_fns, MO_SIGN)
+TRANS(SQSHRN_v, do_vec_shift_imm_narrow, a, sqshrn_fns, MO_SIGN, true)
 
 static WideShiftImmFn * const uqshrn_fns[] = {
     gen_uqshrn_b,
     gen_uqshrn_h,
     gen_uqshrn_s,
 };
-TRANS(UQSHRN_v, do_vec_shift_imm_narrow, a, uqshrn_fns, 0)
+TRANS(UQSHRN_v, do_vec_shift_imm_narrow, a, uqshrn_fns, 0, true)
 
 static WideShiftImmFn * const sqshrun_fns[] = {
     gen_sqshrun_b,
     gen_sqshrun_h,
     gen_sqshrun_s,
 };
-TRANS(SQSHRUN_v, do_vec_shift_imm_narrow, a, sqshrun_fns, MO_SIGN)
+TRANS(SQSHRUN_v, do_vec_shift_imm_narrow, a, sqshrun_fns, MO_SIGN, true)
 
 static WideShiftImmFn * const sqrshrn_fns[] = {
     gen_sqrshrn_b,
     gen_sqrshrn_h,
     gen_sqrshrn_s,
 };
-TRANS(SQRSHRN_v, do_vec_shift_imm_narrow, a, sqrshrn_fns, MO_SIGN)
+TRANS(SQRSHRN_v, do_vec_shift_imm_narrow, a, sqrshrn_fns, MO_SIGN, true)
 
 static WideShiftImmFn * const uqrshrn_fns[] = {
     gen_uqrshrn_b,
     gen_uqrshrn_h,
     gen_uqrshrn_s,
 };
-TRANS(UQRSHRN_v, do_vec_shift_imm_narrow, a, uqrshrn_fns, 0)
+TRANS(UQRSHRN_v, do_vec_shift_imm_narrow, a, uqrshrn_fns, 0, true)
 
 static WideShiftImmFn * const sqrshrun_fns[] = {
     gen_sqrshrun_b,
     gen_sqrshrun_h,
     gen_sqrshrun_s,
 };
-TRANS(SQRSHRUN_v, do_vec_shift_imm_narrow, a, sqrshrun_fns, MO_SIGN)
+TRANS(SQRSHRUN_v, do_vec_shift_imm_narrow, a, sqrshrun_fns, MO_SIGN, true)
 
 /*
  * Advanced SIMD Scalar Shift by Immediate
@@ -8843,6 +8899,12 @@ TRANS(SLI_s, do_scalar_shift_imm, a, gen_sli_d, true, 0)
 static void trunc_i64_env_imm(TCGv_i64 d, TCGv_i64 s, int64_t i,
                               NeonGenTwoOpEnvFn *fn)
 {
+    /*
+     * FPSR.QC, READ AND WRITTEN by the helper below through the tcg_env it
+     * is handed.  One statement per instruction: this generator is reached
+     * once per scalar shift.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     TCGv_i32 t = tcg_temp_new_i32();
     tcg_gen_extrl_i64_i32(t, s);
     fn(t, tcg_env, t, tcg_constant_i32(i));
@@ -8866,6 +8928,12 @@ static void gen_sqshli_s(TCGv_i64 d, TCGv_i64 s, int64_t i)
 
 static void gen_sqshli_d(TCGv_i64 d, TCGv_i64 s, int64_t i)
 {
+    /*
+     * FPSR.QC, READ AND WRITTEN by the helper below through the tcg_env it
+     * is handed.  One statement per instruction: this generator is reached
+     * once per scalar shift.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     gen_helper_neon_qshl_s64(d, tcg_env, s, tcg_constant_i64(i));
 }
 
@@ -8886,6 +8954,12 @@ static void gen_uqshli_s(TCGv_i64 d, TCGv_i64 s, int64_t i)
 
 static void gen_uqshli_d(TCGv_i64 d, TCGv_i64 s, int64_t i)
 {
+    /*
+     * FPSR.QC, READ AND WRITTEN by the helper below through the tcg_env it
+     * is handed.  One statement per instruction: this generator is reached
+     * once per scalar shift.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     gen_helper_neon_qshl_u64(d, tcg_env, s, tcg_constant_i64(i));
 }
 
@@ -8906,6 +8980,12 @@ static void gen_sqshlui_s(TCGv_i64 d, TCGv_i64 s, int64_t i)
 
 static void gen_sqshlui_d(TCGv_i64 d, TCGv_i64 s, int64_t i)
 {
+    /*
+     * FPSR.QC, READ AND WRITTEN by the helper below through the tcg_env it
+     * is handed.  One statement per instruction: this generator is reached
+     * once per scalar shift.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     gen_helper_neon_qshlu_s64(d, tcg_env, s, tcg_constant_i64(i));
 }
 
@@ -8935,6 +9015,13 @@ static bool do_scalar_shift_imm_narrow(DisasContext *s, arg_rri_e *a,
     tcg_debug_assert(esz >= MO_8 && esz <= MO_32);
 
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves is
+         * a saturating form and raises the bit inside an env-taking helper: no
+         * op names the bytes, so the statement is the only thing that puts the
+         * register on either list.  See note_fpsr_qc() in translate.h.
+         */
+        note_fpsr_qc();
         TCGv_i64 rd = tcg_temp_new_i64();
         TCGv_i64 rn = tcg_temp_new_i64();
 
@@ -10502,6 +10589,14 @@ static bool do_env_scalar1(DisasContext *s, arg_rr_e *a, const ENVScalar1 *f)
     if (!fp_access_check(s)) {
         return true;
     }
+    /*
+     * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves
+     * is a saturating form, and the bit is raised inside an env-taking
+     * helper: no op names the bytes, so the statement is the only thing
+     * that puts the register on either list.  Stated here, once, rather
+     * than in the element loop below.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     if (a->esz == MO_64) {
         TCGv_i64 t = read_fp_dreg(s, a->rn);
         f->gen_d(t, tcg_env, t);
@@ -10524,6 +10619,14 @@ static bool do_env_vector1(DisasContext *s, arg_qrr_e *a, const ENVScalar1 *f)
     if (!fp_access_check(s)) {
         return true;
     }
+    /*
+     * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves
+     * is a saturating form, and the bit is raised inside an env-taking
+     * helper: no op names the bytes, so the statement is the only thing
+     * that puts the register on either list.  Stated here, once, rather
+     * than in the element loop below.  See note_fpsr_qc() in translate.h.
+     */
+    note_fpsr_qc();
     if (a->esz == MO_64) {
         TCGv_i64 t = tcg_temp_new_i64();
 
@@ -10600,6 +10703,13 @@ static bool do_2misc_narrow_scalar(DisasContext *s, arg_rr_e *a,
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, READ AND WRITTEN.  Every instruction this wrapper serves is
+         * a saturating form and raises the bit inside an env-taking helper: no
+         * op names the bytes, so the statement is the only thing that puts the
+         * register on either list.  See note_fpsr_qc() in translate.h.
+         */
+        note_fpsr_qc();
         TCGv_i64 t = tcg_temp_new_i64();
 
         read_vec_element(s, t, a->rn, 0, a->esz + 1);
@@ -10710,12 +10820,26 @@ TRANS(SADALP_v, do_gvec_fn2_bhs, a, gen_gvec_sadalp)
 TRANS(UADALP_v, do_gvec_fn2_bhs, a, gen_gvec_uadalp)
 
 static bool do_2misc_narrow_vector(DisasContext *s, arg_qrr_e *a,
-                                   ArithOneOp * const fn[3])
+                                   ArithOneOp * const fn[3], bool qc)
 {
     if (a->esz == MO_64) {
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * FPSR.QC, READ AND WRITTEN, when @qc says this encoding is a saturating
+         * form.  The wrapper serves saturating and non-saturating instructions
+         * alike, so the fact belongs to the CALLER and is passed rather than
+         * inferred: stating it for `xtn` or `shrn` would put a register on the
+         * wire that those do not touch.  Stated HERE, once, rather than in the
+         * element loop -- the loop would state the same fact once per lane and
+         * spend the translation's note budget on it.  See note_fpsr_qc() in
+         * translate.h for why the sticky bit is a source as well as a
+         * destination.
+         */
+        if (qc) {
+            note_fpsr_qc();
+        }
         TCGv_i64 t0 = tcg_temp_new_i64();
         TCGv_i64 t1 = tcg_temp_new_i64();
 
@@ -10735,10 +10859,10 @@ static ArithOneOp * const f_scalar_xtn[] = {
     gen_helper_neon_narrow_u16,
     tcg_gen_ext32u_i64,
 };
-TRANS(XTN, do_2misc_narrow_vector, a, f_scalar_xtn)
-TRANS(SQXTUN_v, do_2misc_narrow_vector, a, f_scalar_sqxtun)
-TRANS(SQXTN_v, do_2misc_narrow_vector, a, f_scalar_sqxtn)
-TRANS(UQXTN_v, do_2misc_narrow_vector, a, f_scalar_uqxtn)
+TRANS(XTN, do_2misc_narrow_vector, a, f_scalar_xtn, false)
+TRANS(SQXTUN_v, do_2misc_narrow_vector, a, f_scalar_sqxtun, true)
+TRANS(SQXTN_v, do_2misc_narrow_vector, a, f_scalar_sqxtn, true)
+TRANS(UQXTN_v, do_2misc_narrow_vector, a, f_scalar_uqxtn, true)
 
 static void gen_fcvtn_hs(TCGv_i64 d, TCGv_i64 n)
 {
@@ -10784,8 +10908,8 @@ static ArithOneOp * const f_scalar_fcvtxn[] = {
     NULL,
     gen_fcvtxn_sd,
 };
-TRANS(FCVTN_v, do_2misc_narrow_vector, a, f_vector_fcvtn)
-TRANS(FCVTXN_v, do_2misc_narrow_vector, a, f_scalar_fcvtxn)
+TRANS(FCVTN_v, do_2misc_narrow_vector, a, f_vector_fcvtn, false)
+TRANS(FCVTXN_v, do_2misc_narrow_vector, a, f_scalar_fcvtxn, false)
 
 static void gen_bfcvtn_hs(TCGv_i64 d, TCGv_i64 n)
 {
@@ -10815,7 +10939,7 @@ static ArithOneOp * const f_vector_bfcvtn[2][3] = {
     }
 };
 TRANS_FEAT(BFCVTN_v, aa64_bf16, do_2misc_narrow_vector, a,
-           f_vector_bfcvtn[s->fpcr_ah])
+           f_vector_bfcvtn[s->fpcr_ah], false)
 
 static bool trans_SHLL_v(DisasContext *s, arg_qrr_e *a)
 {

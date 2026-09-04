@@ -1265,6 +1265,53 @@ static void note_gpr_folded_read(int reg)
 }
 
 /*
+ * `move rd,rd` -- THE ELIDED MOVE, BOTH ENDS OF IT.
+ *
+ * The three-register logical and arithmetic forms spell `move rd,rX` as
+ * `addu/or/xor rd,rX,$zero`, and their emitters lower that to
+ * tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rX]).  When rd == rX that call emits
+ * NOTHING AT ALL: TCG's mov is a no-op for ret == arg.  The instruction then
+ * leaves no op behind naming either end, so the walk reports a READ LIST
+ * holding only the zero register and a WRITE LIST that is EMPTY -- a
+ * consumer cannot tell `move $t0,$t0` from an instruction that writes no
+ * register.
+ *
+ * BOTH ENDS, and that is what this function exists to keep together.  The
+ * read half has been stated since the fold notes landed; the write half was
+ * not, and the destination census measured the difference: 64 mipsel rows on
+ * the w3_coverage cell alone, every one of them `move`, published by the
+ * wire and stated by nobody.  R7.3/R15 rule the absence a lowering choice
+ * rather than the machine's answer, and R16 records the dependency because
+ * the ISA defines it -- a register written with its own value is still
+ * written.
+ *
+ * The destination is stated as the env RANGE: active_tc.gpr[] IS the
+ * register's storage and this file's own regfile declaration names it
+ * downstream, so there is no second spelling to keep in step.
+ *
+ * GUARDED ON THE ELISION.  Every other path through those emitters -- the
+ * two-operand form, the both-$zero form, `not rd,rs` -- emits an op that
+ * reads rX and defines cpu_gpr[rd], and the op walk states both.  rd == 0 is
+ * refused here as well: those encodings take their emitter's NOP arm, which
+ * has its own statement (note_gpr_zero_dest()).
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_gpr_move_elided(int rd, int rs, int rt)
+{
+    if (rd == 0) {
+        return;
+    }
+    if (!((rs == 0 && rt == rd) || (rt == 0 && rs == rd))) {
+        return;
+    }
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rd]));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUMIPSState, active_tc.gpr[rd]),
+        sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
+}
+
+/*
  * THE DESTINATION THE SAME FOLD ERASES.
  *
  * The three "If no destination, treat it as a NOP" early returns above
@@ -3237,12 +3284,7 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
          *
          * Capture only; no op is emitted, altered or suppressed.
          */
-        if (rd != 0 && rs == 0 && rt == rd) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
-        }
-        if (rd != 0 && rt == 0 && rs == rd) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
-        }
+        note_gpr_move_elided(rd, rs, rt);
         if (rs != 0 && rt != 0) {
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -3585,12 +3627,7 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
          *
          * Capture only; no op is emitted, altered or suppressed.
          */
-        if (rd != 0 && rs == 0 && rt == rd) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rt]));
-        }
-        if (rd != 0 && rt == 0 && rs == rd) {
-            insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rs]));
-        }
+        note_gpr_move_elided(rd, rs, rt);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_or_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -3609,6 +3646,12 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         if (rs == 0 || rt == 0) {
             insn_dataflow_note_folded_read_zero();
         }
+        /*
+         * ...and `xor rd,rd,$zero` is `move rd,rd`, which the mov arm below
+         * erases entirely.  The third spelling of the idiom, and it never had
+         * either half stated; see note_gpr_move_elided().
+         */
+        note_gpr_move_elided(rd, rs, rt);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_xor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {

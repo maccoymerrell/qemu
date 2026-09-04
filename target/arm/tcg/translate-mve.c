@@ -498,7 +498,7 @@ static bool trans_VDUP(DisasContext *s, arg_VDUP *a)
 }
 
 static bool do_1op_vec(DisasContext *s, arg_1op *a, MVEGenOneOpFn fn,
-                       GVecGen2Fn vecfn)
+                       GVecGen2Fn vecfn, bool qc)
 {
     TCGv_ptr qd, qm;
 
@@ -510,6 +510,19 @@ static bool do_1op_vec(DisasContext *s, arg_1op *a, MVEGenOneOpFn fn,
 
     if (!mve_eci_check(s) || !vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing.
+         */
+        note_fpsr_qc();
     }
 
     if (vecfn && mve_no_predication(s)) {
@@ -525,10 +538,10 @@ static bool do_1op_vec(DisasContext *s, arg_1op *a, MVEGenOneOpFn fn,
 
 static bool do_1op(DisasContext *s, arg_1op *a, MVEGenOneOpFn fn)
 {
-    return do_1op_vec(s, a, fn, NULL);
+    return do_1op_vec(s, a, fn, NULL, false);
 }
 
-#define DO_1OP_VEC(INSN, FN, VECFN)                             \
+#define DO_1OP_VEC_QC(INSN, FN, VECFN, QC)                      \
     static bool trans_##INSN(DisasContext *s, arg_1op *a)       \
     {                                                           \
         static MVEGenOneOpFn * const fns[] = {                  \
@@ -537,17 +550,19 @@ static bool do_1op(DisasContext *s, arg_1op *a, MVEGenOneOpFn fn)
             gen_helper_mve_##FN##w,                             \
             NULL,                                               \
         };                                                      \
-        return do_1op_vec(s, a, fns[a->size], VECFN);           \
+        return do_1op_vec(s, a, fns[a->size], VECFN, QC);       \
     }
 
-#define DO_1OP(INSN, FN) DO_1OP_VEC(INSN, FN, NULL)
+#define DO_1OP_VEC(INSN, FN, VECFN) DO_1OP_VEC_QC(INSN, FN, VECFN, false)
+#define DO_1OP(INSN, FN)    DO_1OP_VEC_QC(INSN, FN, NULL, false)
+#define DO_1OP_QC(INSN, FN) DO_1OP_VEC_QC(INSN, FN, NULL, true)
 
 DO_1OP(VCLZ, vclz)
 DO_1OP(VCLS, vcls)
 DO_1OP_VEC(VABS, vabs, tcg_gen_gvec_abs)
 DO_1OP_VEC(VNEG, vneg, tcg_gen_gvec_neg)
-DO_1OP(VQABS, vqabs)
-DO_1OP(VQNEG, vqneg)
+DO_1OP_QC(VQABS, vqabs)
+DO_1OP_QC(VQNEG, vqneg)
 DO_1OP(VMAXA, vmaxa)
 DO_1OP(VMINA, vmina)
 
@@ -692,7 +707,7 @@ static bool trans_VRINTX(DisasContext *s, arg_1op *a)
 }
 
 /* Narrowing moves: only size 0 and 1 are valid */
-#define DO_VMOVN(INSN, FN) \
+#define DO_VMOVN_QC(INSN, FN, QC) \
     static bool trans_##INSN(DisasContext *s, arg_1op *a)       \
     {                                                           \
         static MVEGenOneOpFn * const fns[] = {                  \
@@ -701,17 +716,20 @@ static bool trans_VRINTX(DisasContext *s, arg_1op *a)
             NULL,                                               \
             NULL,                                               \
         };                                                      \
-        return do_1op(s, a, fns[a->size]);                      \
+        return do_1op_vec(s, a, fns[a->size], NULL, QC);         \
     }
+
+#define DO_VMOVN(INSN, FN)     DO_VMOVN_QC(INSN, FN, false)
+#define DO_VMOVN_SAT(INSN, FN) DO_VMOVN_QC(INSN, FN, true)
 
 DO_VMOVN(VMOVNB, vmovnb)
 DO_VMOVN(VMOVNT, vmovnt)
-DO_VMOVN(VQMOVUNB, vqmovunb)
-DO_VMOVN(VQMOVUNT, vqmovunt)
-DO_VMOVN(VQMOVN_BS, vqmovnbs)
-DO_VMOVN(VQMOVN_TS, vqmovnts)
-DO_VMOVN(VQMOVN_BU, vqmovnbu)
-DO_VMOVN(VQMOVN_TU, vqmovntu)
+DO_VMOVN_SAT(VQMOVUNB, vqmovunb)
+DO_VMOVN_SAT(VQMOVUNT, vqmovunt)
+DO_VMOVN_SAT(VQMOVN_BS, vqmovnbs)
+DO_VMOVN_SAT(VQMOVN_TS, vqmovnts)
+DO_VMOVN_SAT(VQMOVN_BU, vqmovnbu)
+DO_VMOVN_SAT(VQMOVN_TU, vqmovntu)
 
 static bool trans_VREV16(DisasContext *s, arg_1op *a)
 {
@@ -748,7 +766,7 @@ static bool trans_VREV64(DisasContext *s, arg_1op *a)
 
 static bool trans_VMVN(DisasContext *s, arg_1op *a)
 {
-    return do_1op_vec(s, a, gen_helper_mve_vmvn, tcg_gen_gvec_not);
+    return do_1op_vec(s, a, gen_helper_mve_vmvn, tcg_gen_gvec_not, false);
 }
 
 static bool trans_VABS_fp(DisasContext *s, arg_1op *a)
@@ -780,7 +798,7 @@ static bool trans_VNEG_fp(DisasContext *s, arg_1op *a)
 }
 
 static bool do_2op_vec(DisasContext *s, arg_2op *a, MVEGenTwoOpFn fn,
-                       GVecGen3Fn *vecfn)
+                       GVecGen3Fn *vecfn, bool qc)
 {
     TCGv_ptr qd, qn, qm;
 
@@ -791,6 +809,19 @@ static bool do_2op_vec(DisasContext *s, arg_2op *a, MVEGenTwoOpFn fn,
     }
     if (!mve_eci_check(s) || !vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing.
+         */
+        note_fpsr_qc();
     }
 
     if (vecfn && mve_no_predication(s)) {
@@ -808,13 +839,13 @@ static bool do_2op_vec(DisasContext *s, arg_2op *a, MVEGenTwoOpFn fn,
 
 static bool do_2op(DisasContext *s, arg_2op *a, MVEGenTwoOpFn *fn)
 {
-    return do_2op_vec(s, a, fn, NULL);
+    return do_2op_vec(s, a, fn, NULL, false);
 }
 
 #define DO_LOGIC(INSN, HELPER, VECFN)                           \
     static bool trans_##INSN(DisasContext *s, arg_2op *a)       \
     {                                                           \
-        return do_2op_vec(s, a, HELPER, VECFN);                 \
+        return do_2op_vec(s, a, HELPER, VECFN, false);           \
     }
 
 DO_LOGIC(VAND, gen_helper_mve_vand, tcg_gen_gvec_and)
@@ -830,7 +861,7 @@ static bool trans_VPSEL(DisasContext *s, arg_2op *a)
     return do_2op(s, a, gen_helper_mve_vpsel);
 }
 
-#define DO_2OP_VEC(INSN, FN, VECFN)                             \
+#define DO_2OP_VEC_QC(INSN, FN, VECFN, QC)                      \
     static bool trans_##INSN(DisasContext *s, arg_2op *a)       \
     {                                                           \
         static MVEGenTwoOpFn * const fns[] = {                  \
@@ -839,10 +870,12 @@ static bool trans_VPSEL(DisasContext *s, arg_2op *a)
             gen_helper_mve_##FN##w,                             \
             NULL,                                               \
         };                                                      \
-        return do_2op_vec(s, a, fns[a->size], VECFN);           \
+        return do_2op_vec(s, a, fns[a->size], VECFN, QC);       \
     }
 
-#define DO_2OP(INSN, FN) DO_2OP_VEC(INSN, FN, NULL)
+#define DO_2OP_VEC(INSN, FN, VECFN) DO_2OP_VEC_QC(INSN, FN, VECFN, false)
+#define DO_2OP(INSN, FN)    DO_2OP_VEC_QC(INSN, FN, NULL, false)
+#define DO_2OP_QC(INSN, FN) DO_2OP_VEC_QC(INSN, FN, NULL, true)
 
 DO_2OP_VEC(VADD, vadd, tcg_gen_gvec_add)
 DO_2OP_VEC(VSUB, vsub, tcg_gen_gvec_sub)
@@ -865,28 +898,28 @@ DO_2OP(VMULL_BS, vmullbs)
 DO_2OP(VMULL_BU, vmullbu)
 DO_2OP(VMULL_TS, vmullts)
 DO_2OP(VMULL_TU, vmulltu)
-DO_2OP(VQDMULH, vqdmulh)
-DO_2OP(VQRDMULH, vqrdmulh)
-DO_2OP(VQADD_S, vqadds)
-DO_2OP(VQADD_U, vqaddu)
-DO_2OP(VQSUB_S, vqsubs)
-DO_2OP(VQSUB_U, vqsubu)
+DO_2OP_QC(VQDMULH, vqdmulh)
+DO_2OP_QC(VQRDMULH, vqrdmulh)
+DO_2OP_QC(VQADD_S, vqadds)
+DO_2OP_QC(VQADD_U, vqaddu)
+DO_2OP_QC(VQSUB_S, vqsubs)
+DO_2OP_QC(VQSUB_U, vqsubu)
 DO_2OP(VSHL_S, vshls)
 DO_2OP(VSHL_U, vshlu)
 DO_2OP(VRSHL_S, vrshls)
 DO_2OP(VRSHL_U, vrshlu)
-DO_2OP(VQSHL_S, vqshls)
-DO_2OP(VQSHL_U, vqshlu)
-DO_2OP(VQRSHL_S, vqrshls)
-DO_2OP(VQRSHL_U, vqrshlu)
-DO_2OP(VQDMLADH, vqdmladh)
-DO_2OP(VQDMLADHX, vqdmladhx)
-DO_2OP(VQRDMLADH, vqrdmladh)
-DO_2OP(VQRDMLADHX, vqrdmladhx)
-DO_2OP(VQDMLSDH, vqdmlsdh)
-DO_2OP(VQDMLSDHX, vqdmlsdhx)
-DO_2OP(VQRDMLSDH, vqrdmlsdh)
-DO_2OP(VQRDMLSDHX, vqrdmlsdhx)
+DO_2OP_QC(VQSHL_S, vqshls)
+DO_2OP_QC(VQSHL_U, vqshlu)
+DO_2OP_QC(VQRSHL_S, vqrshls)
+DO_2OP_QC(VQRSHL_U, vqrshlu)
+DO_2OP_QC(VQDMLADH, vqdmladh)
+DO_2OP_QC(VQDMLADHX, vqdmladhx)
+DO_2OP_QC(VQRDMLADH, vqrdmladh)
+DO_2OP_QC(VQRDMLADHX, vqrdmladhx)
+DO_2OP_QC(VQDMLSDH, vqdmlsdh)
+DO_2OP_QC(VQDMLSDHX, vqdmlsdhx)
+DO_2OP_QC(VQRDMLSDH, vqrdmlsdh)
+DO_2OP_QC(VQRDMLSDHX, vqrdmlsdhx)
 DO_2OP(VRHADD_S, vrhadds)
 DO_2OP(VRHADD_U, vrhaddu)
 /*
@@ -911,7 +944,7 @@ static bool trans_VQDMULLB(DisasContext *s, arg_2op *a)
         /* UNPREDICTABLE; we choose to undef */
         return false;
     }
-    return do_2op(s, a, fns[a->size]);
+    return do_2op_vec(s, a, fns[a->size], NULL, true);
 }
 
 static bool trans_VQDMULLT(DisasContext *s, arg_2op *a)
@@ -926,7 +959,7 @@ static bool trans_VQDMULLT(DisasContext *s, arg_2op *a)
         /* UNPREDICTABLE; we choose to undef */
         return false;
     }
-    return do_2op(s, a, fns[a->size]);
+    return do_2op_vec(s, a, fns[a->size], NULL, true);
 }
 
 static bool trans_VMULLP_B(DisasContext *s, arg_2op *a)
@@ -1031,7 +1064,7 @@ DO_2OP_FP(VMAXNMA, vmaxnma)
 DO_2OP_FP(VMINNMA, vminnma)
 
 static bool do_2op_scalar(DisasContext *s, arg_2scalar *a,
-                          MVEGenTwoOpScalarFn fn)
+                          MVEGenTwoOpScalarFn fn, bool qc)
 {
     TCGv_ptr qd, qn;
     TCGv_i32 rm;
@@ -1049,6 +1082,19 @@ static bool do_2op_scalar(DisasContext *s, arg_2scalar *a,
         return true;
     }
 
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing.
+         */
+        note_fpsr_qc();
+    }
+
     qd = mve_qreg_ptr(a->qd);
     qn = mve_qreg_ptr(a->qn);
     rm = load_reg(s, a->rm);
@@ -1057,7 +1103,7 @@ static bool do_2op_scalar(DisasContext *s, arg_2scalar *a,
     return true;
 }
 
-#define DO_2OP_SCALAR(INSN, FN)                                 \
+#define DO_2OP_SCALAR_QC_(INSN, FN, QC)                         \
     static bool trans_##INSN(DisasContext *s, arg_2scalar *a)   \
     {                                                           \
         static MVEGenTwoOpScalarFn * const fns[] = {            \
@@ -1066,8 +1112,11 @@ static bool do_2op_scalar(DisasContext *s, arg_2scalar *a,
             gen_helper_mve_##FN##w,                             \
             NULL,                                               \
         };                                                      \
-        return do_2op_scalar(s, a, fns[a->size]);               \
+        return do_2op_scalar(s, a, fns[a->size], QC);           \
     }
+
+#define DO_2OP_SCALAR(INSN, FN)    DO_2OP_SCALAR_QC_(INSN, FN, false)
+#define DO_2OP_SCALAR_QC(INSN, FN) DO_2OP_SCALAR_QC_(INSN, FN, true)
 
 DO_2OP_SCALAR(VADD_scalar, vadd_scalar)
 DO_2OP_SCALAR(VSUB_scalar, vsub_scalar)
@@ -1076,19 +1125,19 @@ DO_2OP_SCALAR(VHADD_S_scalar, vhadds_scalar)
 DO_2OP_SCALAR(VHADD_U_scalar, vhaddu_scalar)
 DO_2OP_SCALAR(VHSUB_S_scalar, vhsubs_scalar)
 DO_2OP_SCALAR(VHSUB_U_scalar, vhsubu_scalar)
-DO_2OP_SCALAR(VQADD_S_scalar, vqadds_scalar)
-DO_2OP_SCALAR(VQADD_U_scalar, vqaddu_scalar)
-DO_2OP_SCALAR(VQSUB_S_scalar, vqsubs_scalar)
-DO_2OP_SCALAR(VQSUB_U_scalar, vqsubu_scalar)
-DO_2OP_SCALAR(VQDMULH_scalar, vqdmulh_scalar)
-DO_2OP_SCALAR(VQRDMULH_scalar, vqrdmulh_scalar)
+DO_2OP_SCALAR_QC(VQADD_S_scalar, vqadds_scalar)
+DO_2OP_SCALAR_QC(VQADD_U_scalar, vqaddu_scalar)
+DO_2OP_SCALAR_QC(VQSUB_S_scalar, vqsubs_scalar)
+DO_2OP_SCALAR_QC(VQSUB_U_scalar, vqsubu_scalar)
+DO_2OP_SCALAR_QC(VQDMULH_scalar, vqdmulh_scalar)
+DO_2OP_SCALAR_QC(VQRDMULH_scalar, vqrdmulh_scalar)
 DO_2OP_SCALAR(VBRSR, vbrsr)
 DO_2OP_SCALAR(VMLA, vmla)
 DO_2OP_SCALAR(VMLAS, vmlas)
-DO_2OP_SCALAR(VQDMLAH, vqdmlah)
-DO_2OP_SCALAR(VQRDMLAH, vqrdmlah)
-DO_2OP_SCALAR(VQDMLASH, vqdmlash)
-DO_2OP_SCALAR(VQRDMLASH, vqrdmlash)
+DO_2OP_SCALAR_QC(VQDMLAH, vqdmlah)
+DO_2OP_SCALAR_QC(VQRDMLAH, vqrdmlah)
+DO_2OP_SCALAR_QC(VQDMLASH, vqdmlash)
+DO_2OP_SCALAR_QC(VQRDMLASH, vqrdmlash)
 
 static bool trans_VQDMULLB_scalar(DisasContext *s, arg_2scalar *a)
 {
@@ -1102,7 +1151,7 @@ static bool trans_VQDMULLB_scalar(DisasContext *s, arg_2scalar *a)
         /* UNPREDICTABLE; we choose to undef */
         return false;
     }
-    return do_2op_scalar(s, a, fns[a->size]);
+    return do_2op_scalar(s, a, fns[a->size], true);
 }
 
 static bool trans_VQDMULLT_scalar(DisasContext *s, arg_2scalar *a)
@@ -1117,7 +1166,7 @@ static bool trans_VQDMULLT_scalar(DisasContext *s, arg_2scalar *a)
         /* UNPREDICTABLE; we choose to undef */
         return false;
     }
-    return do_2op_scalar(s, a, fns[a->size]);
+    return do_2op_scalar(s, a, fns[a->size], true);
 }
 
 
@@ -1133,7 +1182,7 @@ static bool trans_VQDMULLT_scalar(DisasContext *s, arg_2scalar *a)
         if (!dc_isar_feature(aa32_mve_fp, s)) {                 \
             return false;                                       \
         }                                                       \
-        return do_2op_scalar(s, a, fns[a->size]);               \
+        return do_2op_scalar(s, a, fns[a->size], false);        \
     }
 
 DO_2OP_FP_SCALAR(VADD_fp_scalar, vfadd_scalar)
@@ -1551,7 +1600,7 @@ static bool trans_Vimm_1r(DisasContext *s, arg_1imm *a)
 }
 
 static bool do_2shift_vec(DisasContext *s, arg_2shift *a, MVEGenTwoOpShiftFn fn,
-                          bool negateshift, GVecGen2iFn vecfn)
+                          bool negateshift, GVecGen2iFn vecfn, bool qc)
 {
     TCGv_ptr qd, qm;
     int shift = a->shift;
@@ -1563,6 +1612,19 @@ static bool do_2shift_vec(DisasContext *s, arg_2shift *a, MVEGenTwoOpShiftFn fn,
     }
     if (!mve_eci_check(s) || !vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing.
+         */
+        note_fpsr_qc();
     }
 
     /*
@@ -1589,10 +1651,10 @@ static bool do_2shift_vec(DisasContext *s, arg_2shift *a, MVEGenTwoOpShiftFn fn,
 static bool do_2shift(DisasContext *s, arg_2shift *a, MVEGenTwoOpShiftFn fn,
                       bool negateshift)
 {
-    return do_2shift_vec(s, a, fn, negateshift, NULL);
+    return do_2shift_vec(s, a, fn, negateshift, NULL, false);
 }
 
-#define DO_2SHIFT_VEC(INSN, FN, NEGATESHIFT, VECFN)                     \
+#define DO_2SHIFT_VEC_QC(INSN, FN, NEGATESHIFT, VECFN, QC)              \
     static bool trans_##INSN(DisasContext *s, arg_2shift *a)            \
     {                                                                   \
         static MVEGenTwoOpShiftFn * const fns[] = {                     \
@@ -1601,11 +1663,16 @@ static bool do_2shift(DisasContext *s, arg_2shift *a, MVEGenTwoOpShiftFn fn,
             gen_helper_mve_##FN##w,                                     \
             NULL,                                                       \
         };                                                              \
-        return do_2shift_vec(s, a, fns[a->size], NEGATESHIFT, VECFN);   \
+        return do_2shift_vec(s, a, fns[a->size], NEGATESHIFT,           \
+                             VECFN, QC);                                \
     }
 
+#define DO_2SHIFT_VEC(INSN, FN, NEGATESHIFT, VECFN)     \
+    DO_2SHIFT_VEC_QC(INSN, FN, NEGATESHIFT, VECFN, false)
 #define DO_2SHIFT(INSN, FN, NEGATESHIFT)        \
-    DO_2SHIFT_VEC(INSN, FN, NEGATESHIFT, NULL)
+    DO_2SHIFT_VEC_QC(INSN, FN, NEGATESHIFT, NULL, false)
+#define DO_2SHIFT_QC(INSN, FN, NEGATESHIFT)     \
+    DO_2SHIFT_VEC_QC(INSN, FN, NEGATESHIFT, NULL, true)
 
 static void do_gvec_shri_s(unsigned vece, uint32_t dofs, uint32_t aofs,
                            int64_t shift, uint32_t oprsz, uint32_t maxsz)
@@ -1637,9 +1704,9 @@ static void do_gvec_shri_u(unsigned vece, uint32_t dofs, uint32_t aofs,
 }
 
 DO_2SHIFT_VEC(VSHLI, vshli_u, false, tcg_gen_gvec_shli)
-DO_2SHIFT(VQSHLI_S, vqshli_s, false)
-DO_2SHIFT(VQSHLI_U, vqshli_u, false)
-DO_2SHIFT(VQSHLUI, vqshlui_s, false)
+DO_2SHIFT_QC(VQSHLI_S, vqshli_s, false)
+DO_2SHIFT_QC(VQSHLI_U, vqshli_u, false)
+DO_2SHIFT_QC(VQSHLUI, vqshlui_s, false)
 /* These right shifts use a left-shift helper with negated shift count */
 DO_2SHIFT_VEC(VSHRI_S, vshli_s, true, do_gvec_shri_s)
 DO_2SHIFT_VEC(VSHRI_U, vshli_u, true, do_gvec_shri_u)
@@ -1668,7 +1735,7 @@ DO_2SHIFT_FP(VCVT_FS_fixed, vcvt_fs)
 DO_2SHIFT_FP(VCVT_FU_fixed, vcvt_fu)
 
 static bool do_2shift_scalar(DisasContext *s, arg_shl_scalar *a,
-                             MVEGenTwoOpShiftFn *fn)
+                             MVEGenTwoOpShiftFn *fn, bool qc)
 {
     TCGv_ptr qda;
     TCGv_i32 rm;
@@ -1683,6 +1750,19 @@ static bool do_2shift_scalar(DisasContext *s, arg_shl_scalar *a,
         return true;
     }
 
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing.
+         */
+        note_fpsr_qc();
+    }
+
     qda = mve_qreg_ptr(a->qda);
     rm = load_reg(s, a->rm);
     fn(tcg_env, qda, qda, rm);
@@ -1690,7 +1770,7 @@ static bool do_2shift_scalar(DisasContext *s, arg_shl_scalar *a,
     return true;
 }
 
-#define DO_2SHIFT_SCALAR(INSN, FN)                                      \
+#define DO_2SHIFT_SCALAR_QC_(INSN, FN, QC)                              \
     static bool trans_##INSN(DisasContext *s, arg_shl_scalar *a)        \
     {                                                                   \
         static MVEGenTwoOpShiftFn * const fns[] = {                     \
@@ -1699,17 +1779,20 @@ static bool do_2shift_scalar(DisasContext *s, arg_shl_scalar *a,
             gen_helper_mve_##FN##w,                                     \
             NULL,                                                       \
         };                                                              \
-        return do_2shift_scalar(s, a, fns[a->size]);                    \
+        return do_2shift_scalar(s, a, fns[a->size], QC);                \
     }
+
+#define DO_2SHIFT_SCALAR(INSN, FN)    DO_2SHIFT_SCALAR_QC_(INSN, FN, false)
+#define DO_2SHIFT_SCALAR_QC(INSN, FN) DO_2SHIFT_SCALAR_QC_(INSN, FN, true)
 
 DO_2SHIFT_SCALAR(VSHL_S_scalar, vshli_s)
 DO_2SHIFT_SCALAR(VSHL_U_scalar, vshli_u)
 DO_2SHIFT_SCALAR(VRSHL_S_scalar, vrshli_s)
 DO_2SHIFT_SCALAR(VRSHL_U_scalar, vrshli_u)
-DO_2SHIFT_SCALAR(VQSHL_S_scalar, vqshli_s)
-DO_2SHIFT_SCALAR(VQSHL_U_scalar, vqshli_u)
-DO_2SHIFT_SCALAR(VQRSHL_S_scalar, vqrshli_s)
-DO_2SHIFT_SCALAR(VQRSHL_U_scalar, vqrshli_u)
+DO_2SHIFT_SCALAR_QC(VQSHL_S_scalar, vqshli_s)
+DO_2SHIFT_SCALAR_QC(VQSHL_U_scalar, vqshli_u)
+DO_2SHIFT_SCALAR_QC(VQRSHL_S_scalar, vqrshli_s)
+DO_2SHIFT_SCALAR_QC(VQRSHL_U_scalar, vqrshli_u)
 
 #define DO_VSHLL(INSN, FN)                                              \
     static bool trans_##INSN(DisasContext *s, arg_2shift *a)            \
@@ -1718,7 +1801,8 @@ DO_2SHIFT_SCALAR(VQRSHL_U_scalar, vqrshli_u)
             gen_helper_mve_##FN##b,                                     \
             gen_helper_mve_##FN##h,                                     \
         };                                                              \
-        return do_2shift_vec(s, a, fns[a->size], false, do_gvec_##FN);  \
+        return do_2shift_vec(s, a, fns[a->size], false,                 \
+                             do_gvec_##FN, false);                      \
     }
 
 /*
@@ -1777,32 +1861,36 @@ DO_VSHLL(VSHLL_BU, vshllbu)
 DO_VSHLL(VSHLL_TS, vshllts)
 DO_VSHLL(VSHLL_TU, vshlltu)
 
-#define DO_2SHIFT_N(INSN, FN)                                   \
+#define DO_2SHIFT_N_QC(INSN, FN, QC)                            \
     static bool trans_##INSN(DisasContext *s, arg_2shift *a)    \
     {                                                           \
         static MVEGenTwoOpShiftFn * const fns[] = {             \
             gen_helper_mve_##FN##b,                             \
             gen_helper_mve_##FN##h,                             \
         };                                                      \
-        return do_2shift(s, a, fns[a->size], false);            \
+        return do_2shift_vec(s, a, fns[a->size], false,         \
+                             NULL, QC);                         \
     }
+
+#define DO_2SHIFT_N(INSN, FN)     DO_2SHIFT_N_QC(INSN, FN, false)
+#define DO_2SHIFT_N_SAT(INSN, FN) DO_2SHIFT_N_QC(INSN, FN, true)
 
 DO_2SHIFT_N(VSHRNB, vshrnb)
 DO_2SHIFT_N(VSHRNT, vshrnt)
 DO_2SHIFT_N(VRSHRNB, vrshrnb)
 DO_2SHIFT_N(VRSHRNT, vrshrnt)
-DO_2SHIFT_N(VQSHRNB_S, vqshrnb_s)
-DO_2SHIFT_N(VQSHRNT_S, vqshrnt_s)
-DO_2SHIFT_N(VQSHRNB_U, vqshrnb_u)
-DO_2SHIFT_N(VQSHRNT_U, vqshrnt_u)
-DO_2SHIFT_N(VQSHRUNB, vqshrunb)
-DO_2SHIFT_N(VQSHRUNT, vqshrunt)
-DO_2SHIFT_N(VQRSHRNB_S, vqrshrnb_s)
-DO_2SHIFT_N(VQRSHRNT_S, vqrshrnt_s)
-DO_2SHIFT_N(VQRSHRNB_U, vqrshrnb_u)
-DO_2SHIFT_N(VQRSHRNT_U, vqrshrnt_u)
-DO_2SHIFT_N(VQRSHRUNB, vqrshrunb)
-DO_2SHIFT_N(VQRSHRUNT, vqrshrunt)
+DO_2SHIFT_N_SAT(VQSHRNB_S, vqshrnb_s)
+DO_2SHIFT_N_SAT(VQSHRNT_S, vqshrnt_s)
+DO_2SHIFT_N_SAT(VQSHRNB_U, vqshrnb_u)
+DO_2SHIFT_N_SAT(VQSHRNT_U, vqshrnt_u)
+DO_2SHIFT_N_SAT(VQSHRUNB, vqshrunb)
+DO_2SHIFT_N_SAT(VQSHRUNT, vqshrunt)
+DO_2SHIFT_N_SAT(VQRSHRNB_S, vqrshrnb_s)
+DO_2SHIFT_N_SAT(VQRSHRNT_S, vqrshrnt_s)
+DO_2SHIFT_N_SAT(VQRSHRNB_U, vqrshrnb_u)
+DO_2SHIFT_N_SAT(VQRSHRNT_U, vqrshrnt_u)
+DO_2SHIFT_N_SAT(VQRSHRUNB, vqrshrunb)
+DO_2SHIFT_N_SAT(VQRSHRUNT, vqrshrunt)
 
 static bool trans_VSHLC(DisasContext *s, arg_VSHLC *a)
 {

@@ -1107,7 +1107,7 @@ DO_2SH(VQSHL_S, gen_neon_sqshli)
 
 static bool do_2shift_narrow_64(DisasContext *s, arg_2reg_shift *a,
                                 NeonGenTwo64OpFn *shiftfn,
-                                NeonGenOne64OpEnvFn *narrowfn)
+                                NeonGenOne64OpEnvFn *narrowfn, bool qc)
 {
     /* 2-reg-and-shift narrowing-shift operations, size == 3 case */
     TCGv_i64 constimm, rm1, rm2, rd;
@@ -1128,6 +1128,21 @@ static bool do_2shift_narrow_64(DisasContext *s, arg_2reg_shift *a,
 
     if (!vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
     }
 
     /*
@@ -1156,7 +1171,7 @@ static bool do_2shift_narrow_64(DisasContext *s, arg_2reg_shift *a,
 
 static bool do_2shift_narrow_32(DisasContext *s, arg_2reg_shift *a,
                                 NeonGenTwoOpFn *shiftfn,
-                                NeonGenOne64OpEnvFn *narrowfn)
+                                NeonGenOne64OpEnvFn *narrowfn, bool qc)
 {
     /* 2-reg-and-shift narrowing-shift operations, size < 3 case */
     TCGv_i32 constimm, rm1, rm2, rm3, rm4;
@@ -1179,6 +1194,21 @@ static bool do_2shift_narrow_32(DisasContext *s, arg_2reg_shift *a,
 
     if (!vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
     }
 
     /*
@@ -1224,16 +1254,30 @@ static bool do_2shift_narrow_32(DisasContext *s, arg_2reg_shift *a,
     return true;
 }
 
-#define DO_2SN_64(INSN, FUNC, NARROWFUNC)                               \
+#define DO_2SN_64_QC(INSN, FUNC, NARROWFUNC, QC)                        \
     static bool trans_##INSN##_2sh(DisasContext *s, arg_2reg_shift *a)  \
     {                                                                   \
-        return do_2shift_narrow_64(s, a, FUNC, NARROWFUNC);             \
+        return do_2shift_narrow_64(s, a, FUNC, NARROWFUNC, QC);         \
     }
-#define DO_2SN_32(INSN, FUNC, NARROWFUNC)                               \
+#define DO_2SN_32_QC(INSN, FUNC, NARROWFUNC, QC)                        \
     static bool trans_##INSN##_2sh(DisasContext *s, arg_2reg_shift *a)  \
     {                                                                   \
-        return do_2shift_narrow_32(s, a, FUNC, NARROWFUNC);             \
+        return do_2shift_narrow_32(s, a, FUNC, NARROWFUNC, QC);         \
     }
+
+/*
+ * The narrowing shifts come in a saturating and a non-saturating flavour and
+ * share both emitters, so the flavour is passed rather than inferred: stating
+ * FPSR.QC for VSHRN would put a register on the wire it does not touch.
+ */
+#define DO_2SN_64(INSN, FUNC, NARROWFUNC)     \
+    DO_2SN_64_QC(INSN, FUNC, NARROWFUNC, false)
+#define DO_2SN_32(INSN, FUNC, NARROWFUNC)     \
+    DO_2SN_32_QC(INSN, FUNC, NARROWFUNC, false)
+#define DO_2SN_64_SAT(INSN, FUNC, NARROWFUNC) \
+    DO_2SN_64_QC(INSN, FUNC, NARROWFUNC, true)
+#define DO_2SN_32_SAT(INSN, FUNC, NARROWFUNC) \
+    DO_2SN_32_QC(INSN, FUNC, NARROWFUNC, true)
 
 static void gen_neon_narrow_u32(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src)
 {
@@ -1258,28 +1302,39 @@ DO_2SN_64(VRSHRN_64, gen_helper_neon_rshl_u64, gen_neon_narrow_u32)
 DO_2SN_32(VRSHRN_32, gen_helper_neon_rshl_u32, gen_neon_narrow_u16)
 DO_2SN_32(VRSHRN_16, gen_helper_neon_rshl_u16, gen_neon_narrow_u8)
 
-DO_2SN_64(VQSHRUN_64, gen_sshl_i64, gen_helper_neon_unarrow_sat32)
-DO_2SN_32(VQSHRUN_32, gen_sshl_i32, gen_helper_neon_unarrow_sat16)
-DO_2SN_32(VQSHRUN_16, gen_helper_neon_shl_s16, gen_helper_neon_unarrow_sat8)
+DO_2SN_64_SAT(VQSHRUN_64, gen_sshl_i64, gen_helper_neon_unarrow_sat32)
+DO_2SN_32_SAT(VQSHRUN_32, gen_sshl_i32, gen_helper_neon_unarrow_sat16)
+DO_2SN_32_SAT(VQSHRUN_16, gen_helper_neon_shl_s16, gen_helper_neon_unarrow_sat8)
 
-DO_2SN_64(VQRSHRUN_64, gen_helper_neon_rshl_s64, gen_helper_neon_unarrow_sat32)
-DO_2SN_32(VQRSHRUN_32, gen_helper_neon_rshl_s32, gen_helper_neon_unarrow_sat16)
-DO_2SN_32(VQRSHRUN_16, gen_helper_neon_rshl_s16, gen_helper_neon_unarrow_sat8)
-DO_2SN_64(VQSHRN_S64, gen_sshl_i64, gen_helper_neon_narrow_sat_s32)
-DO_2SN_32(VQSHRN_S32, gen_sshl_i32, gen_helper_neon_narrow_sat_s16)
-DO_2SN_32(VQSHRN_S16, gen_helper_neon_shl_s16, gen_helper_neon_narrow_sat_s8)
+DO_2SN_64_SAT(VQRSHRUN_64, gen_helper_neon_rshl_s64,
+              gen_helper_neon_unarrow_sat32)
+DO_2SN_32_SAT(VQRSHRUN_32, gen_helper_neon_rshl_s32,
+              gen_helper_neon_unarrow_sat16)
+DO_2SN_32_SAT(VQRSHRUN_16, gen_helper_neon_rshl_s16,
+              gen_helper_neon_unarrow_sat8)
+DO_2SN_64_SAT(VQSHRN_S64, gen_sshl_i64, gen_helper_neon_narrow_sat_s32)
+DO_2SN_32_SAT(VQSHRN_S32, gen_sshl_i32, gen_helper_neon_narrow_sat_s16)
+DO_2SN_32_SAT(VQSHRN_S16, gen_helper_neon_shl_s16,
+              gen_helper_neon_narrow_sat_s8)
 
-DO_2SN_64(VQRSHRN_S64, gen_helper_neon_rshl_s64, gen_helper_neon_narrow_sat_s32)
-DO_2SN_32(VQRSHRN_S32, gen_helper_neon_rshl_s32, gen_helper_neon_narrow_sat_s16)
-DO_2SN_32(VQRSHRN_S16, gen_helper_neon_rshl_s16, gen_helper_neon_narrow_sat_s8)
+DO_2SN_64_SAT(VQRSHRN_S64, gen_helper_neon_rshl_s64,
+              gen_helper_neon_narrow_sat_s32)
+DO_2SN_32_SAT(VQRSHRN_S32, gen_helper_neon_rshl_s32,
+              gen_helper_neon_narrow_sat_s16)
+DO_2SN_32_SAT(VQRSHRN_S16, gen_helper_neon_rshl_s16,
+              gen_helper_neon_narrow_sat_s8)
 
-DO_2SN_64(VQSHRN_U64, gen_ushl_i64, gen_helper_neon_narrow_sat_u32)
-DO_2SN_32(VQSHRN_U32, gen_ushl_i32, gen_helper_neon_narrow_sat_u16)
-DO_2SN_32(VQSHRN_U16, gen_helper_neon_shl_u16, gen_helper_neon_narrow_sat_u8)
+DO_2SN_64_SAT(VQSHRN_U64, gen_ushl_i64, gen_helper_neon_narrow_sat_u32)
+DO_2SN_32_SAT(VQSHRN_U32, gen_ushl_i32, gen_helper_neon_narrow_sat_u16)
+DO_2SN_32_SAT(VQSHRN_U16, gen_helper_neon_shl_u16,
+              gen_helper_neon_narrow_sat_u8)
 
-DO_2SN_64(VQRSHRN_U64, gen_helper_neon_rshl_u64, gen_helper_neon_narrow_sat_u32)
-DO_2SN_32(VQRSHRN_U32, gen_helper_neon_rshl_u32, gen_helper_neon_narrow_sat_u16)
-DO_2SN_32(VQRSHRN_U16, gen_helper_neon_rshl_u16, gen_helper_neon_narrow_sat_u8)
+DO_2SN_64_SAT(VQRSHRN_U64, gen_helper_neon_rshl_u64,
+              gen_helper_neon_narrow_sat_u32)
+DO_2SN_32_SAT(VQRSHRN_U32, gen_helper_neon_rshl_u32,
+              gen_helper_neon_narrow_sat_u16)
+DO_2SN_32_SAT(VQRSHRN_U16, gen_helper_neon_rshl_u16,
+              gen_helper_neon_narrow_sat_u8)
 
 static bool do_vshll_2sh(DisasContext *s, arg_2reg_shift *a,
                          NeonGenWidenFn *widenfn, bool u)
@@ -1666,7 +1721,7 @@ DO_NARROW_3D(VRSUBHN, sub, narrow_round, gen_narrow_round_high_u32)
 
 static bool do_long_3d(DisasContext *s, arg_3diff *a,
                        NeonGenTwoOpWidenFn *opfn,
-                       NeonGenTwo64OpFn *accfn)
+                       NeonGenTwo64OpFn *accfn, bool qc)
 {
     /*
      * 3-regs different lengths, long operations.
@@ -1698,6 +1753,21 @@ static bool do_long_3d(DisasContext *s, arg_3diff *a,
 
     if (!vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
     }
 
     rd0 = tcg_temp_new_i64();
@@ -1737,7 +1807,7 @@ static bool trans_VABDL_S_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], NULL);
+    return do_long_3d(s, a, opfn[a->size], NULL, false);
 }
 
 static bool trans_VABDL_U_3d(DisasContext *s, arg_3diff *a)
@@ -1749,7 +1819,7 @@ static bool trans_VABDL_U_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], NULL);
+    return do_long_3d(s, a, opfn[a->size], NULL, false);
 }
 
 static bool trans_VABAL_S_3d(DisasContext *s, arg_3diff *a)
@@ -1767,7 +1837,7 @@ static bool trans_VABAL_S_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], addfn[a->size]);
+    return do_long_3d(s, a, opfn[a->size], addfn[a->size], false);
 }
 
 static bool trans_VABAL_U_3d(DisasContext *s, arg_3diff *a)
@@ -1785,7 +1855,7 @@ static bool trans_VABAL_U_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], addfn[a->size]);
+    return do_long_3d(s, a, opfn[a->size], addfn[a->size], false);
 }
 
 static void gen_mull_s32(TCGv_i64 rd, TCGv_i32 rn, TCGv_i32 rm)
@@ -1815,7 +1885,7 @@ static bool trans_VMULL_S_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], NULL);
+    return do_long_3d(s, a, opfn[a->size], NULL, false);
 }
 
 static bool trans_VMULL_U_3d(DisasContext *s, arg_3diff *a)
@@ -1827,7 +1897,7 @@ static bool trans_VMULL_U_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], NULL);
+    return do_long_3d(s, a, opfn[a->size], NULL, false);
 }
 
 #define DO_VMLAL(INSN,MULL,ACC)                                         \
@@ -1845,7 +1915,7 @@ static bool trans_VMULL_U_3d(DisasContext *s, arg_3diff *a)
             tcg_gen_##ACC##_i64,                                        \
             NULL,                                                       \
         };                                                              \
-        return do_long_3d(s, a, opfn[a->size], accfn[a->size]);         \
+        return do_long_3d(s, a, opfn[a->size], accfn[a->size], false);         \
     }
 
 DO_VMLAL(VMLAL_S,mull_s,add)
@@ -1874,7 +1944,7 @@ static bool trans_VQDMULL_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], NULL);
+    return do_long_3d(s, a, opfn[a->size], NULL, true);
 }
 
 static void gen_VQDMLAL_acc_16(TCGv_i64 rd, TCGv_i64 rn, TCGv_i64 rm)
@@ -1902,7 +1972,7 @@ static bool trans_VQDMLAL_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], accfn[a->size]);
+    return do_long_3d(s, a, opfn[a->size], accfn[a->size], true);
 }
 
 static void gen_VQDMLSL_acc_16(TCGv_i64 rd, TCGv_i64 rn, TCGv_i64 rm)
@@ -1932,7 +2002,7 @@ static bool trans_VQDMLSL_3d(DisasContext *s, arg_3diff *a)
         NULL,
     };
 
-    return do_long_3d(s, a, opfn[a->size], accfn[a->size]);
+    return do_long_3d(s, a, opfn[a->size], accfn[a->size], true);
 }
 
 static bool trans_VMULL_P_3d(DisasContext *s, arg_3diff *a)
@@ -2011,7 +2081,8 @@ static inline TCGv_i32 neon_get_scalar(int size, int reg)
 }
 
 static bool do_2scalar(DisasContext *s, arg_2scalar *a,
-                       NeonGenTwoOpFn *opfn, NeonGenTwoOpFn *accfn)
+                       NeonGenTwoOpFn *opfn, NeonGenTwoOpFn *accfn,
+                       bool qc)
 {
     /*
      * Two registers and a scalar: perform an operation between
@@ -2045,6 +2116,21 @@ static bool do_2scalar(DisasContext *s, arg_2scalar *a,
         return true;
     }
 
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
+    }
+
     scalar = neon_get_scalar(a->size, a->vm);
     tmp = tcg_temp_new_i32();
 
@@ -2070,7 +2156,7 @@ static bool trans_VMUL_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar(s, a, opfn[a->size], NULL);
+    return do_2scalar(s, a, opfn[a->size], NULL, false);
 }
 
 static bool trans_VMLA_2sc(DisasContext *s, arg_2scalar *a)
@@ -2088,7 +2174,7 @@ static bool trans_VMLA_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar(s, a, opfn[a->size], accfn[a->size]);
+    return do_2scalar(s, a, opfn[a->size], accfn[a->size], false);
 }
 
 static bool trans_VMLS_2sc(DisasContext *s, arg_2scalar *a)
@@ -2106,7 +2192,7 @@ static bool trans_VMLS_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar(s, a, opfn[a->size], accfn[a->size]);
+    return do_2scalar(s, a, opfn[a->size], accfn[a->size], false);
 }
 
 static bool do_2scalar_fp_vec(DisasContext *s, arg_2scalar *a,
@@ -2187,7 +2273,7 @@ static bool trans_VQDMULH_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar(s, a, opfn[a->size], NULL);
+    return do_2scalar(s, a, opfn[a->size], NULL, true);
 }
 
 static bool trans_VQRDMULH_2sc(DisasContext *s, arg_2scalar *a)
@@ -2199,11 +2285,11 @@ static bool trans_VQRDMULH_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar(s, a, opfn[a->size], NULL);
+    return do_2scalar(s, a, opfn[a->size], NULL, true);
 }
 
 static bool do_vqrdmlah_2sc(DisasContext *s, arg_2scalar *a,
-                            NeonGenThreeOpEnvFn *opfn)
+                            NeonGenThreeOpEnvFn *opfn, bool qc)
 {
     /*
      * VQRDMLAH/VQRDMLSH: this is like do_2scalar, but the opfn
@@ -2240,6 +2326,21 @@ static bool do_vqrdmlah_2sc(DisasContext *s, arg_2scalar *a,
         return true;
     }
 
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
+    }
+
     scalar = neon_get_scalar(a->size, a->vm);
     rn = tcg_temp_new_i32();
     rd = tcg_temp_new_i32();
@@ -2261,7 +2362,7 @@ static bool trans_VQRDMLAH_2sc(DisasContext *s, arg_2scalar *a)
         gen_helper_neon_qrdmlah_s32,
         NULL,
     };
-    return do_vqrdmlah_2sc(s, a, opfn[a->size]);
+    return do_vqrdmlah_2sc(s, a, opfn[a->size], true);
 }
 
 static bool trans_VQRDMLSH_2sc(DisasContext *s, arg_2scalar *a)
@@ -2272,12 +2373,12 @@ static bool trans_VQRDMLSH_2sc(DisasContext *s, arg_2scalar *a)
         gen_helper_neon_qrdmlsh_s32,
         NULL,
     };
-    return do_vqrdmlah_2sc(s, a, opfn[a->size]);
+    return do_vqrdmlah_2sc(s, a, opfn[a->size], true);
 }
 
 static bool do_2scalar_long(DisasContext *s, arg_2scalar *a,
                             NeonGenTwoOpWidenFn *opfn,
-                            NeonGenTwo64OpFn *accfn)
+                            NeonGenTwo64OpFn *accfn, bool qc)
 {
     /*
      * Two registers and a scalar, long operations: perform an
@@ -2309,6 +2410,21 @@ static bool do_2scalar_long(DisasContext *s, arg_2scalar *a,
 
     if (!vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
     }
 
     scalar = neon_get_scalar(a->size, a->vm);
@@ -2345,7 +2461,7 @@ static bool trans_VMULL_S_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar_long(s, a, opfn[a->size], NULL);
+    return do_2scalar_long(s, a, opfn[a->size], NULL, false);
 }
 
 static bool trans_VMULL_U_2sc(DisasContext *s, arg_2scalar *a)
@@ -2357,7 +2473,7 @@ static bool trans_VMULL_U_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar_long(s, a, opfn[a->size], NULL);
+    return do_2scalar_long(s, a, opfn[a->size], NULL, false);
 }
 
 #define DO_VMLAL_2SC(INSN, MULL, ACC)                                   \
@@ -2375,7 +2491,7 @@ static bool trans_VMULL_U_2sc(DisasContext *s, arg_2scalar *a)
             tcg_gen_##ACC##_i64,                                        \
             NULL,                                                       \
         };                                                              \
-        return do_2scalar_long(s, a, opfn[a->size], accfn[a->size]);    \
+        return do_2scalar_long(s, a, opfn[a->size], accfn[a->size], false);    \
     }
 
 DO_VMLAL_2SC(VMLAL_S, mull_s, add)
@@ -2392,7 +2508,7 @@ static bool trans_VQDMULL_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar_long(s, a, opfn[a->size], NULL);
+    return do_2scalar_long(s, a, opfn[a->size], NULL, true);
 }
 
 static bool trans_VQDMLAL_2sc(DisasContext *s, arg_2scalar *a)
@@ -2410,7 +2526,7 @@ static bool trans_VQDMLAL_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar_long(s, a, opfn[a->size], accfn[a->size]);
+    return do_2scalar_long(s, a, opfn[a->size], accfn[a->size], true);
 }
 
 static bool trans_VQDMLSL_2sc(DisasContext *s, arg_2scalar *a)
@@ -2428,7 +2544,7 @@ static bool trans_VQDMLSL_2sc(DisasContext *s, arg_2scalar *a)
         NULL,
     };
 
-    return do_2scalar_long(s, a, opfn[a->size], accfn[a->size]);
+    return do_2scalar_long(s, a, opfn[a->size], accfn[a->size], true);
 }
 
 static bool trans_VEXT(DisasContext *s, arg_VEXT *a)
@@ -2638,7 +2754,7 @@ static bool trans_VZIP(DisasContext *s, arg_2misc *a)
 }
 
 static bool do_vmovn(DisasContext *s, arg_2misc *a,
-                     NeonGenOne64OpEnvFn *narrowfn)
+                     NeonGenOne64OpEnvFn *narrowfn, bool qc)
 {
     TCGv_i64 rm, rd0, rd1;
 
@@ -2664,6 +2780,21 @@ static bool do_vmovn(DisasContext *s, arg_2misc *a,
         return true;
     }
 
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
+    }
+
     rm = tcg_temp_new_i64();
     rd0 = tcg_temp_new_i64();
     rd1 = tcg_temp_new_i64();
@@ -2677,7 +2808,7 @@ static bool do_vmovn(DisasContext *s, arg_2misc *a,
     return true;
 }
 
-#define DO_VMOVN(INSN, FUNC)                                    \
+#define DO_VMOVN_QC(INSN, FUNC, QC)                             \
     static bool trans_##INSN(DisasContext *s, arg_2misc *a)     \
     {                                                           \
         static NeonGenOne64OpEnvFn * const narrowfn[] = {       \
@@ -2686,13 +2817,16 @@ static bool do_vmovn(DisasContext *s, arg_2misc *a,
             FUNC##32,                                           \
             NULL,                                               \
         };                                                      \
-        return do_vmovn(s, a, narrowfn[a->size]);               \
+        return do_vmovn(s, a, narrowfn[a->size], QC);           \
     }
 
+#define DO_VMOVN(INSN, FUNC)     DO_VMOVN_QC(INSN, FUNC, false)
+#define DO_VMOVN_SAT(INSN, FUNC) DO_VMOVN_QC(INSN, FUNC, true)
+
 DO_VMOVN(VMOVN, gen_neon_narrow_u)
-DO_VMOVN(VQMOVUN, gen_helper_neon_unarrow_sat)
-DO_VMOVN(VQMOVN_S, gen_helper_neon_narrow_sat_s)
-DO_VMOVN(VQMOVN_U, gen_helper_neon_narrow_sat_u)
+DO_VMOVN_SAT(VQMOVUN, gen_helper_neon_unarrow_sat)
+DO_VMOVN_SAT(VQMOVN_S, gen_helper_neon_narrow_sat_s)
+DO_VMOVN_SAT(VQMOVN_U, gen_helper_neon_narrow_sat_u)
 
 static bool trans_VSHLL(DisasContext *s, arg_2misc *a)
 {
@@ -3004,7 +3138,8 @@ DO_2M_CRYPTO(SHA1H, aa32_sha1, 2)
 DO_2M_CRYPTO(SHA1SU1, aa32_sha1, 2)
 DO_2M_CRYPTO(SHA256SU0, aa32_sha2, 2)
 
-static bool do_2misc(DisasContext *s, arg_2misc *a, NeonGenOneOpFn *fn)
+static bool do_2misc(DisasContext *s, arg_2misc *a, NeonGenOneOpFn *fn,
+                     bool qc)
 {
     TCGv_i32 tmp;
     int pass;
@@ -3030,6 +3165,21 @@ static bool do_2misc(DisasContext *s, arg_2misc *a, NeonGenOneOpFn *fn)
 
     if (!vfp_access_check(s)) {
         return true;
+    }
+
+    if (qc) {
+        /*
+         * FPSR.QC, READ AND WRITTEN by the saturating forms this emitter
+         * serves.  The helper reaches the bit through the tcg_env pointer it
+         * is handed, so no op names the bytes and the statement is the only
+         * thing that puts the register on the wire; and the bit is STICKY, so
+         * it is a source as well as a destination.  See note_fpsr_qc() in
+         * translate.h.  Stated HERE, after the checks, because an encoding
+         * this emitter refuses is not this instruction and owes nothing; and
+         * ONCE, by the emitter rather than by the per-element function it
+         * calls, which runs as many times as there are lanes.
+         */
+        note_fpsr_qc();
     }
 
     tmp = tcg_temp_new_i32();
@@ -3102,7 +3252,7 @@ static bool trans_VQABS(DisasContext *s, arg_2misc *a)
         gen_VQABS_s32,
         NULL,
     };
-    return do_2misc(s, a, fn[a->size]);
+    return do_2misc(s, a, fn[a->size], true);
 }
 
 static bool trans_VQNEG(DisasContext *s, arg_2misc *a)
@@ -3113,7 +3263,7 @@ static bool trans_VQNEG(DisasContext *s, arg_2misc *a)
         gen_VQNEG_s32,
         NULL,
     };
-    return do_2misc(s, a, fn[a->size]);
+    return do_2misc(s, a, fn[a->size], true);
 }
 
 #define DO_2MISC_FP_VEC(INSN, HFUNC, SFUNC)                             \

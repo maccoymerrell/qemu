@@ -28,6 +28,7 @@ never raise a false alarm).
 """
 
 import argparse
+import copy
 import datetime
 import hashlib
 import json
@@ -905,6 +906,269 @@ def capture_add(build: Path, root: Path, waivers: dict,
     print(f"\nadded {len(added)} cell(s) to {MANIFEST}; "
           f"{len(manifest['cells']) - len(added)} existing cell(s) untouched")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# MOVING ONE CELL, and why the net needed a path for it.
+#
+# A golden reference has exactly two legitimate transitions: a NEW cell is
+# added (capture --add), or the WHOLE reference is replaced (capture).  R22
+# produced a third that neither could express -- a single named cell whose
+# bytes move for a reason the tree has already adjudicated, while the other
+# thirty are correct and must not be re-measured from today's build.
+#
+# capture --add refuses a recorded name by design, and a full capture would
+# rewrite every cell from whatever is in the tree now, discarding the only
+# record of what the wire used to say.  So a legitimately-moved cell could
+# not reach green at all: the net stayed red on a cell everyone agreed about,
+# and a permanently-red net is one nobody reads.
+#
+# THE MOVEMENT IS THE PRODUCT, not a side effect of writing the new hash.
+# Every move records what the cell said before, what it says now, the tip it
+# was measured at, the build's provenance and the written reason, and it
+# APPENDS -- a cell moved twice has both movements, because the second one
+# erasing the first is how an audit trail becomes a rumour.
+#
+# AND IT CANNOT REACH A SECOND CELL, structurally rather than by intention.
+# _apply_move() below builds the new manifest and then DIFFS it against the
+# old one, refusing unless the difference is exactly the one named cell plus
+# its ledger entry.  The check is on the RESULT, so it holds regardless of
+# what the measurement did, and `selftest` exercises it directly.
+MOVE_LEDGER = "moved_cells"
+
+
+def _apply_move(manifest: dict, cell: str, new: dict, meta: dict
+                ) -> tuple[dict | None, str | None]:
+    """Return (new_manifest, None) or (None, refusal).
+
+    Pure: no I/O, no measurement.  The one-cell invariant is enforced here,
+    on the RESULT, which is what lets `selftest` prove it without a build.
+    """
+    cells = manifest.get("cells") or {}
+    if cell not in cells:
+        return None, (f"{cell!r} is not a recorded cell.  This path MOVES a "
+                      f"reference that exists; use capture --add for a new "
+                      f"one.")
+    old = cells[cell]
+    if not isinstance(new, dict) or not new:
+        return None, f"{cell!r}: nothing was measured to move it to."
+    if old == new:
+        return None, (f"{cell!r} did not move: the measured hashes are the "
+                      f"recorded ones.  Recording a movement that did not "
+                      f"happen puts a claim in the ledger with nothing "
+                      f"behind it.")
+    out = copy.deepcopy(manifest)
+    out["cells"][cell] = copy.deepcopy(new)
+    out.setdefault(MOVE_LEDGER, {}).setdefault(cell, []).append(
+        {**meta, "from": copy.deepcopy(old), "to": copy.deepcopy(new)})
+
+    err = _verify_move(manifest, out, cell)
+    return (None, err) if err else (out, None)
+
+
+def _verify_move(before: dict, after: dict, cell: str) -> str | None:
+    """The guarantee, as a check ON THE RESULT.
+
+    Split out from _apply_move deliberately: a guarantee that only exists
+    inside the function that produces the value cannot be tested against a
+    value produced any other way, and "this code does not do that" is not
+    the same claim as "this manifest does not say that".  `selftest` hands
+    it hand-built AFTER manifests -- one that took a second cell, one that
+    dropped a cell, one that rewrote a top-level key -- and requires a
+    refusal for each.  Returns None when the move is exactly one cell.
+    """
+    b = before.get("cells") or {}
+    a = after.get("cells") or {}
+    if set(a) != set(b):
+        return ("the cell set changed; a move adds and drops nothing "
+                f"(added {sorted(set(a) - set(b))}, "
+                f"dropped {sorted(set(b) - set(a))}).")
+    moved = sorted(k for k in a if b.get(k) != a[k])
+    if moved != [cell]:
+        return (f"REFUSING: this would move {moved} -- a move touches "
+                f"exactly the one cell it names.")
+    for k in set(before) | set(after):
+        if k in ("cells", MOVE_LEDGER):
+            continue
+        if before.get(k) != after.get(k):
+            return (f"REFUSING: top-level key {k!r} changed; a move "
+                    f"rewrites one cell and its ledger, nothing else.")
+    return None
+
+
+def capture_move_one(build: Path, root: Path, waivers: dict, cell: str) -> int:
+    """Re-reference exactly one recorded cell, with the movement recorded."""
+    if not MANIFEST.exists():
+        print(f"no manifest at {MANIFEST}; there is nothing to move",
+              file=sys.stderr)
+        return 2
+    manifest = json.loads(MANIFEST.read_text())
+    if cell not in (manifest.get("cells") or {}):
+        print(f"REFUSING: {cell!r} is not a recorded cell.  Recorded cells "
+              f"are:\n  " + "\n  ".join(sorted(manifest.get("cells") or {})),
+              file=sys.stderr)
+        return 2
+    if ":" not in cell:
+        print(f"REFUSING: {cell!r} is not <workload>:<isa>.", file=sys.stderr)
+        return 2
+    name, isa = cell.split(":", 1)
+    wl = next((w for w in WORKLOADS if w["name"] == name), None)
+    if wl is None or isa not in wl["isas"]:
+        print(f"REFUSING: {cell!r} names no workload/ISA in WORKLOADS.",
+              file=sys.stderr)
+        return 2
+    prov, rc = gate_build(build, system=False, waivers=waivers, mode="capture")
+    if rc:
+        return rc
+    cap_root = manifest.get("work_root")
+    if cap_root is not None and cap_root != str(root):
+        print(f"work-root mismatch: manifest captured under {cap_root}, "
+              f"move invoked under {root}.", file=sys.stderr)
+        return 2
+
+    # The same discipline a full capture uses, because a moved reference is
+    # a reference: traced twice for determinism, and refused if it cannot
+    # witness its own subject.
+    out = root / name
+    if out.exists():
+        shutil.rmtree(out)
+    runs, rc0 = [], 0
+    for i in range(2):
+        rcx = run_all(build, wl, out)
+        if i == 0:
+            rc0 = rcx
+        cst = cst_path(out, isa)
+        runs.append(triple_hash(build, cst) if cst.exists() else None)
+    if any(h is None for h in runs):
+        print(f"REFUSE {cell}: trace not produced", file=sys.stderr)
+        return 1
+    if runs[0] != runs[1]:
+        moved = sorted({k for k in runs[1] if runs[1][k] != runs[0][k]})
+        print(f"REFUSE {cell}: NONDETERMINISTIC {moved}", file=sys.stderr)
+        return 1
+    miss = witness_failures(build, cst_path(out, isa), wl, isa)
+    if miss:
+        for m in miss:
+            print(f"REFUSE {cell}: {m}", file=sys.stderr)
+        return 1
+
+    meta = {"reason": CAPTURE_REASON, "provenance": prov,
+            "tip": _git("rev-parse", "HEAD"),
+            "moved_at": datetime.datetime.now().astimezone()
+            .isoformat(timespec="seconds")}
+    new = {**runs[0], "validate_rc": rc0}
+    updated, err = _apply_move(manifest, cell, new, meta)
+    if err:
+        print(f"golden_net: {err}", file=sys.stderr)
+        return 1
+    MANIFEST.write_text(json.dumps(updated, indent=2, sort_keys=True))
+    old = manifest["cells"][cell]
+    print(f"moved {cell}")
+    for k in sorted(set(old) | set(new)):
+        if old.get(k) != new.get(k):
+            print(f"    {k}: {old.get(k)} -> {new.get(k)}")
+    print(f"  tip {meta['tip']}\n  reason: {CAPTURE_REASON}")
+    print(f"  {len(updated['cells']) - 1} other cell(s) untouched")
+    return 0
+
+
+def move_selftest() -> int:
+    """Prove the one-cell invariant without a build, a trace or a manifest.
+
+    A guarantee stated in a docstring is a guarantee nobody has watched fail.
+    """
+    n, fails = 0, 0
+
+    def t(label, got, want):
+        nonlocal n, fails
+        n += 1
+        if got == want:
+            print(f"PASS  {label}")
+        else:
+            fails += 1
+            print(f"FAIL  {label} (got {got!r} want {want!r})")
+
+    base = {"work_root": "/w", "cells": {
+        "a:x86_64": {"legacy": "L1", "templates": "T1", "svg": "S1"},
+        "b:aarch64": {"legacy": "L2", "templates": "T2", "svg": "S2"},
+    }, "capture_reason": "original"}
+    meta = {"reason": "r", "tip": "deadbeef"}
+
+    out, err = _apply_move(base, "a:x86_64",
+                           {"legacy": "L9", "templates": "T1", "svg": "S1"},
+                           meta)
+    t("A a recorded cell moves", err, None)
+    t("B ...and only that cell moved",
+      [k for k in out["cells"] if out["cells"][k] != base["cells"][k]],
+      ["a:x86_64"])
+    t("C ...the other cell is byte-identical",
+      out["cells"]["b:aarch64"], base["cells"]["b:aarch64"])
+    t("D ...the movement is recorded from AND to",
+      (out[MOVE_LEDGER]["a:x86_64"][0]["from"]["legacy"],
+       out[MOVE_LEDGER]["a:x86_64"][0]["to"]["legacy"]), ("L1", "L9"))
+    t("E ...and the input manifest was not mutated",
+      base["cells"]["a:x86_64"]["legacy"], "L1")
+
+    out2, err2 = _apply_move(out, "a:x86_64",
+                             {"legacy": "LA", "templates": "T1", "svg": "S1"},
+                             meta)
+    t("F a second movement APPENDS rather than replacing",
+      len(out2[MOVE_LEDGER]["a:x86_64"]), 2)
+    t("G ...and the first movement is still readable",
+      out2[MOVE_LEDGER]["a:x86_64"][0]["from"]["legacy"], "L1")
+
+    _, err3 = _apply_move(base, "c:mipsel", {"legacy": "L"}, meta)
+    t("H an unrecorded cell is REFUSED", err3 is not None, True)
+    _, err4 = _apply_move(base, "a:x86_64", base["cells"]["a:x86_64"], meta)
+    t("I a cell that did not move is REFUSED", err4 is not None, True)
+    _, err5 = _apply_move(base, "a:x86_64", {}, meta)
+    t("J an empty measurement is REFUSED", err5 is not None, True)
+
+    # THE ARMS THE PATH EXISTS FOR.  Each hands _verify_move an AFTER
+    # manifest built by hand -- not by _apply_move -- so the refusal is a
+    # property of the manifest rather than of the code that happened to
+    # write it.
+    good = copy.deepcopy(base)
+    good["cells"]["a:x86_64"] = {"legacy": "L9", "templates": "T1",
+                                 "svg": "S1"}
+    t("K a correct one-cell result is accepted",
+      _verify_move(base, good, "a:x86_64"), None)
+
+    two = copy.deepcopy(good)
+    two["cells"]["b:aarch64"] = {"legacy": "XX"}
+    e = _verify_move(base, two, "a:x86_64")
+    t("L a result that took a SECOND cell is REFUSED",
+      e is not None and "exactly the one cell" in e, True)
+
+    dropped = copy.deepcopy(good)
+    del dropped["cells"]["b:aarch64"]
+    e = _verify_move(base, dropped, "a:x86_64")
+    t("M a result that DROPPED a cell is REFUSED",
+      e is not None and "adds and drops nothing" in e, True)
+
+    added = copy.deepcopy(good)
+    added["cells"]["c:mipsel"] = {"legacy": "L3"}
+    e = _verify_move(base, added, "a:x86_64")
+    t("N a result that ADDED a cell is REFUSED",
+      e is not None and "adds and drops nothing" in e, True)
+
+    rooted = copy.deepcopy(good)
+    rooted["work_root"] = "/somewhere/else"
+    e = _verify_move(base, rooted, "a:x86_64")
+    t("O a result that rewrote a top-level key is REFUSED",
+      e is not None and "top-level key" in e, True)
+
+    wrong = copy.deepcopy(good)
+    e = _verify_move(base, wrong, "b:aarch64")
+    t("P a result that moved a cell OTHER than the one named is REFUSED",
+      e is not None and "exactly the one cell" in e, True)
+
+    e = _verify_move(base, copy.deepcopy(base), "a:x86_64")
+    t("Q a result that moved NOTHING is REFUSED",
+      e is not None and "exactly the one cell" in e, True)
+
+    print(f"arms={n} failures={fails}")
+    return 1 if fails else 0
 
 
 def check(build: Path, root: Path, waivers: dict,
@@ -2085,19 +2349,24 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=("capture", "check", "validate"),
+    ap.add_argument("mode", choices=("capture", "check", "validate",
+                                     "selftest"),
                     help="capture/check drive the hash reference; `validate` "
                          "runs the VALIDATOR arm alone (no hash comparison), "
                          "which is the only arm with call_return_store "
                          "coverage and is safe to run while the hash arm is "
-                         "held")
+                         "held.  `selftest` proves the single-cell move's "
+                         "one-cell invariant with no build and no trace")
     ap.add_argument("--only", action="append", default=None,
                     help="check/validate modes: restrict the run to these "
                          "workload names.  A subset verdict says so and "
                          "names what it did NOT compare; a subset matching "
                          "no workload REFUSES.  Ignored by capture, which "
                          "writes the whole reference or none of it")
-    ap.add_argument("--build-dir", type=Path, required=True)
+    # NOT required, because `selftest` has no build: it exercises the
+    # manifest-mutation invariant as a pure function.  Every other mode
+    # refuses without one, two lines below.
+    ap.add_argument("--build-dir", type=Path, default=None)
     ap.add_argument("--system", action="store_true",
                     help="operate on the SYSTEM-mode cells (separate manifest "
                          "manifest_system.json): the frozen-fixture decoder "
@@ -2144,12 +2413,25 @@ def main() -> int:
                          "leaving every recorded cell untouched.  Refuses a "
                          "name that already has cells: this path adds, it "
                          "never replaces.")
+    ap.add_argument("--move-one", default=None, metavar="WORKLOAD:ISA",
+                    help="capture mode: RE-REFERENCE exactly one RECORDED "
+                         "cell and record the movement (old hashes, new "
+                         "hashes, tip, reason) in the manifest's move "
+                         "ledger.  Every other cell is left byte-identical, "
+                         "and the write is refused if it would not be.  "
+                         "Needs --reason like any recapture.")
     ap.add_argument("--reason", default=None,
                     help="REQUIRED for capture: why the reference is being "
                          "replaced -- name the defect the old bytes carried, "
                          "or the intended wire change.  Recorded in the "
                          "manifest alongside the hashes.")
     args = ap.parse_args()
+    if args.mode == "selftest":
+        return move_selftest()
+    if args.build_dir is None:
+        print("golden_net: --build-dir is required for %s" % args.mode,
+              file=sys.stderr)
+        return 2
     build = args.build_dir
     if args.mode == "validate" and args.system:
         print("golden_net: --system has no validate arm (the system net has "
@@ -2210,6 +2492,12 @@ def main() -> int:
         return net_validate(build, args.work_root / "netval", waivers,
                             only=args.only)
     if args.mode == "capture":
+        if args.move_one:
+            if args.add or args.only:
+                print("REFUSING: --move-one is its own request; do not pair "
+                      "it with --add or --only.", file=sys.stderr)
+                return 2
+            return capture_move_one(build, shared, waivers, args.move_one)
         if args.add:
             if args.only:
                 print("REFUSING: --only and --add are different requests; "

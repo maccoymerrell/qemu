@@ -441,6 +441,19 @@ static const SrcAdjRow g_src_adj_ledger[] = {
       "INTO THE TRACE.\"  menvcfg.FIOM decides what a fence ORDERS, Sail "
       "states ref_src=REG_SYS, and QEMU's empty read list at trans_fence "
       "is the statement gap, not the architecture" },
+    { TRACE_ISA_X86,   0xeec05966u, "rstorssp", REG_SSP, SRC_ADJ_R16,
+      "ADJUDICATED-KEEP-R16, on `rdsspq`'s ruling and the same register.  "
+      "RSTORSSP restores the shadow-stack pointer from the token it names, "
+      "so the ISA defines the form as READING SSP as well as writing it; "
+      "QEMU models no CET at all -- `F3 0F 01 /5` reaches gen_multi0F's "
+      "`default: goto illegal_op`, there is no `ssp` in CPUX86State, and "
+      "there is therefore no read for QEMU to state.  R16: \"A NOP SEMANTIC "
+      "STILL HAS REAL DEPENDENCIES IN THE CHOSEN REGISTER.\"  #UD ON THIS "
+      "MACHINE IS NOT A REASON EITHER: the encoding is #UD because "
+      "CPUID.(EAX=07H,ECX=0):ECX.CET_SS reads 0, which is MACHINE STATE, "
+      "and is not the ARCHITECTURAL-UD of `ud2`.  The id is the carved arm "
+      "decode-new/multi0F@f3=1,modrm=..101...,mem, not the 0F 01 group's "
+      "shared slot 0x000004ae, which carried thirty-three mnemonics" },
     { TRACE_ISA_X86,   0xdb9bac2bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
       "ADJUDICATED-KEEP-R16.  R16 verbatim: \"IF THE DEPENDENCY EXISTS IN "
       "THE ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  ... "
@@ -464,10 +477,104 @@ static const SrcAdjRow *src_adj_row(uint32_t decode_id, const char *mnem,
     }
     return nullptr;
 }
+/*
+ * PER-ROW FIRING COUNTS FOR BOTH ADJUDICATION LEDGERS, and the reason they
+ * exist is the one 474a32ec7c named: a row nobody can see fire is a row
+ * nobody can check.  A ledger row whose subject the corpus never reaches
+ * reads as "adjudicated and quiet", which is indistinguishable from
+ * "adjudicated and DEAD" -- the id moved, the mnemonic changed spelling, or
+ * the population never contained the instruction.  Every one of those has
+ * happened in this tree; the qdep ledger's own comment records the id-change
+ * case firing on the very first battery after the CET carve.
+ *
+ * So the report prints, for each table, the rows that fired AND the rows
+ * that did not, by name.  A row in the second list is not automatically
+ * wrong -- an instruction no workload ran is a fact about the workload --
+ * but it is a fact the reader is told rather than one the report hides.
+ */
+static std::atomic<uint64_t> g_src_adj_fired[G_N_ELEMENTS(g_src_adj_ledger)];
 std::atomic<uint64_t> g_src_adj_owed_n{0};
 GHashTable *g_src_adj_owed_sig = nullptr;
 std::atomic<uint64_t> g_src_adj_r16_n{0};
 GHashTable *g_src_adj_r16_sig = nullptr;
+
+/*
+ * THE DESTINATION TWIN OF THE SOURCE ADJUDICATION LEDGER.
+ *
+ * WHY IT HAD TO EXIST SEPARATELY.  The source ledger is consulted where the
+ * flip's COST is counted -- a published source QEMU's read list does not
+ * contain.  The destination side had the mirror question and no counter at
+ * all: the only destination-side census in this file, g_dst_wire_missing,
+ * runs in the OTHER direction (a register QEMU states that the wire lacks),
+ * which is the flip's GAIN.  The cost direction -- a published destination
+ * QEMU's write list does not state -- was scored only OFFLINE, out of the
+ * mech corpus's PUBD and WR columns, so the plugin could not say whether a
+ * row in it was adjudicated or merely unexamined.  A population nobody can
+ * quote is one nobody can say is bounded; this is the same argument
+ * g_dst_wire_missing's own comment makes about its half.
+ *
+ * IT IS A LEDGER AND NOT AN INPUT, exactly as the source table is.  Nothing
+ * on the wire is decided by a row here.  A row REDIRECTS a count into a
+ * column that says WHY the register is there, and an OWED row still blocks:
+ * it is counted, printed with its decode id, its register and its mnemonic,
+ * and named as a question nobody has answered.
+ *
+ * KEYED ON (isa, decode id, MNEMONIC) for the source table's reason and with
+ * the same evidence behind it: one decode id routinely carries several
+ * instructions, and a row keyed on the id alone silences a population it was
+ * never adjudicated for.
+ *
+ * R10.1 IS NOT ADJUDICATED HERE.  A block-final REG_PC write is a QEMU
+ * artifact, not an architectural destination, and it is excluded upstream
+ * rather than being given a ledger row -- an artifact is not a question.
+ */
+struct DstAdjRow {
+    unsigned    isa;          /* TraceISA */
+    uint32_t    decode_id;
+    const char *mnem;
+    uint8_t     reg;
+    unsigned    state;        /* SrcAdjState -- the same two states */
+    const char *text;
+};
+static const DstAdjRow g_dst_adj_ledger[] = {
+    { TRACE_ISA_X86,   0xeec05966u, "rstorssp", REG_SSP, SRC_ADJ_R16,
+      "ADJUDICATED-KEEP-R16, the write twin of this instruction's REG_SSP "
+      "source row.  RSTORSSP's whole effect is to make the token it names "
+      "the current shadow stack: the ISA defines the form as WRITING SSP, "
+      "and XED reports it as a destination.  QEMU models no CET, has no "
+      "`ssp` in CPUX86State and decodes `F3 0F 01 /5` to `illegal_op`, so "
+      "its write list is empty for the same reason its read list is -- a "
+      "statement gap, not an architectural fact.  R16 records the "
+      "dependency regardless of the modelled machine's CET state, and R16 "
+      "does not stop at the read side" },
+};
+static const DstAdjRow *dst_adj_row(uint32_t decode_id, const char *mnem,
+                                    uint8_t reg)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(g_dst_adj_ledger); i++) {
+        if (g_dst_adj_ledger[i].isa == (unsigned)trace_isa &&
+            g_dst_adj_ledger[i].decode_id == decode_id &&
+            g_dst_adj_ledger[i].reg == reg &&
+            mnem && strcmp(g_dst_adj_ledger[i].mnem, mnem) == 0) {
+            return &g_dst_adj_ledger[i];
+        }
+    }
+    return nullptr;
+}
+/*
+ * The destination-side COST, the direction nothing counted: a published
+ * destination QEMU's write list does not state.  _walkonly is the whole
+ * population, _adj_r16 and _adj_owed the two adjudicated columns, and the
+ * three are never netted -- see g_src_flip_missing for why one number
+ * covering two questions is readable as neither.
+ */
+static std::atomic<uint64_t> g_dst_adj_fired[G_N_ELEMENTS(g_dst_adj_ledger)];
+std::atomic<uint64_t> g_dst_walkonly{0};
+GHashTable *g_dst_walkonly_sig = nullptr;
+std::atomic<uint64_t> g_dst_adj_owed_n{0};
+GHashTable *g_dst_adj_owed_sig = nullptr;
+std::atomic<uint64_t> g_dst_adj_r16_n{0};
+GHashTable *g_dst_adj_r16_sig = nullptr;
 /*
  * The two remaining ways an ENV BYTE RANGE stays refused (#226).
  *
@@ -4135,6 +4242,8 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                     q->decode_id, mnem, f->src_regs[i]);
                 if (adj) {
                     bool ruled = adj->state == SRC_ADJ_R16;
+                    g_src_adj_fired[adj - g_src_adj_ledger].fetch_add(
+                        1, std::memory_order_relaxed);
                     char *okey = g_strdup_printf(
                         "%08x %-26s %-14s %-10s %s %s", q->decode_id,
                         q->decode_name ? q->decode_name : "?",
@@ -4299,6 +4408,68 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             tally(&g_dst_wire_missing, key);
             g_free(key);
             g_dst_wire_missing_other.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    /*
+     * AND THE OTHER DIRECTION, which is the one a flip has to justify: a
+     * destination the WIRE publishes that QEMU's write list does not state.
+     * Counted here, beside its mirror, off the same two lists at the same
+     * moment -- and BEFORE seat_dst_for_qemu() runs, because the seat is a
+     * permutation of the wire's list and reading after it would score the
+     * reindex rather than the disagreement.
+     *
+     * REG_PC IS EXCLUDED IN BOTH DIRECTIONS, on R10.1: the wire publishes
+     * REG_PC on every instruction the ISA defines as writing it, and QEMU
+     * charges the block-final pc write to whichever instruction the block
+     * ended on.  Neither fact makes a branch's own REG_PC a walk-only
+     * destination, and counting it here would put an artifact's mirror into
+     * a must-be-argued column.
+     */
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        bool stated = false;
+
+        if (f->dst_regs[d] == REG_PC) {
+            continue;
+        }
+        for (uint8_t k = 0; k < q->n_dst; k++) {
+            if (q->dst_reg[k] == f->dst_regs[d]) {
+                stated = true;
+                break;
+            }
+        }
+        if (stated) {
+            continue;
+        }
+        {
+            const DstAdjRow *adj = dst_adj_row(q->decode_id, mnem,
+                                               f->dst_regs[d]);
+            char *key = g_strdup_printf(
+                "%08x %-26s %-14s %s", q->decode_id,
+                q->decode_name ? q->decode_name : "?",
+                generic_reg_name_or_unknown(f->dst_regs[d]),
+                mnem ? mnem : "?");
+
+            if (adj) {
+                bool ruled = adj->state == SRC_ADJ_R16;
+                char *okey;
+
+                g_dst_adj_fired[adj - g_dst_adj_ledger].fetch_add(
+                    1, std::memory_order_relaxed);
+                okey = g_strdup_printf("%s %s %s", key,
+                                       ruled ? "R16:" : "Q:", adj->text);
+                if (ruled) {
+                    g_dst_adj_r16_n.fetch_add(1, std::memory_order_relaxed);
+                    tally(&g_dst_adj_r16_sig, okey);
+                } else {
+                    g_dst_adj_owed_n.fetch_add(1, std::memory_order_relaxed);
+                    tally(&g_dst_adj_owed_sig, okey);
+                }
+                g_free(okey);
+            } else {
+                g_dst_walkonly.fetch_add(1, std::memory_order_relaxed);
+                tally(&g_dst_walkonly_sig, key);
+            }
+            g_free(key);
         }
     }
     unsigned admitted = 0;
@@ -6330,6 +6501,23 @@ void qdep_report(GString *report)
         g_src_flip_no_row.load(std::memory_order_relaxed),
         g_src_adj_owed_n.load(std::memory_order_relaxed),
         g_src_adj_r16_n.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  DESTINATION FLIP COST, the loss direction: published"
+        " destinations\n"
+        "              QEMU's write list does not state.  MUST BE 0 for a"
+        " destination-list\n"
+        "               flip to land carrying nothing new; the rows are"
+        " listed below\n"
+        "  %10" G_GUINT64_FORMAT "  of those, ADJUDICATION-OWED -- a question is on file"
+        " and the row\n"
+        "               BLOCKS until it is ruled\n"
+        "  %10" G_GUINT64_FORMAT "  of those, RULED (R16) -- the wire is right and the"
+        " ruling says why;\n"
+        "               a flip must CARRY these, and the rows and their"
+        " rulings are below\n",
+        g_dst_walkonly.load(std::memory_order_relaxed),
+        g_dst_adj_owed_n.load(std::memory_order_relaxed),
+        g_dst_adj_r16_n.load(std::memory_order_relaxed));
     g_string_append(report,
         "\ndestination family (the HAS_REG block's dst_dep[]);\n"
         "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
@@ -6685,6 +6873,56 @@ void qdep_report(GString *report)
                "ADJUDICATION-OWED -- published sources the union does not\ncontain that are NOT counted as MISSING, because their deletion was\nalready written, landed, measured against the external references and\nREVERTED when the references contradicted it (PASS 29).  Columns: decode\nid, rule, register, mnemonic, and the QUESTION the row is waiting on.\nThe full evidence both ways is in exec55/QUESTIONS.md.  This block is a\nLEDGER, not a survivor table: it is keyed on the mnemonic as well as the\ndecode id (x86 0x0000054b is QEMU's NOP slot and carries endbr64 beside\nrdsspq), so no flip can look it up, and no flip may land while it has\nrows.  A row leaves this block by being RULED, never by being deleted:\nthe ruled rows are in the R16 block below, with their counts intact:");
     dump_tally(report, g_src_adj_r16_sig,
                "JUSTIFIED BY ADJUDICATION (R16) -- the same ledger, the rows\na RULING has closed.  Columns: decode id, rule, register, mnemonic, and\nthe RULING the row closed under, quoted rather than referenced so the\nreason travels with the sidecar.  These are NOT counted as MISSING and\nare NOT folded into JUSTIFIED: JUSTIFIED means QEMU's ordered read list\ncontains the register, which for these rows it does not, and a census\nthat spent a ruling and a read-list hit into one column could no longer\nsay which of its rows rest on a measurement.  A source-list flip MAY\nland with this block non-empty, and must carry every register in it:");
+    dump_tally(report, g_dst_walkonly_sig,
+               "DESTINATION FLIP COST, THE LOSS DIRECTION -- published\ndestinations QEMU's write list does NOT state, by decode id, rule,\nregister and mnemonic.  The write-side twin of the block above, and it\nis new: the only destination census this file used to carry ran in the\nOTHER direction, so this population was scored offline out of the mech\ncorpus's PUBD and WR columns and the plugin could not say whether a row\nin it was adjudicated or merely unexamined.  REG_PC is excluded in both\ndirections on R10.1 -- a block-final pc write is a QEMU artifact and an\nartifact is not a question:");
+    dump_tally(report, g_dst_adj_owed_sig,
+               "DESTINATION ADJUDICATION-OWED -- published destinations QEMU\ndoes not state that are NOT counted above, because a question is on\nfile against them.  Columns: decode id, rule, register, mnemonic, and\nthe QUESTION.  A LEDGER, not an input: nothing on the wire is decided\nby a row here, and a row leaves this block by being RULED, never by\nbeing deleted:");
+    dump_tally(report, g_dst_adj_r16_sig,
+               "DESTINATION JUSTIFIED BY ADJUDICATION (R16) -- the same\nledger, the rows a RULING has closed, with the ruling quoted so the\nreason travels with the sidecar.  A destination-list flip MAY land with\nthis block non-empty, and must carry every register in it:");
+    /*
+     * AND THE ROWS THAT DID NOT FIRE, by name, for both ledgers.  See
+     * g_src_adj_fired for why: a quiet row and a dead row read the same, and
+     * only one of them is fine.
+     */
+    {
+        GString *live = g_string_new(nullptr);
+        GString *dead = g_string_new(nullptr);
+
+        for (unsigned i = 0; i < G_N_ELEMENTS(g_src_adj_ledger); i++) {
+            uint64_t n = g_src_adj_fired[i].load(std::memory_order_relaxed);
+            g_string_append_printf(n ? live : dead,
+                                   "    src  %08x %-10s %-14s %"
+                                   G_GUINT64_FORMAT "\n",
+                                   g_src_adj_ledger[i].decode_id,
+                                   g_src_adj_ledger[i].mnem,
+                                   generic_reg_name_or_unknown(
+                                       g_src_adj_ledger[i].reg), n);
+        }
+        for (unsigned i = 0; i < G_N_ELEMENTS(g_dst_adj_ledger); i++) {
+            uint64_t n = g_dst_adj_fired[i].load(std::memory_order_relaxed);
+            g_string_append_printf(n ? live : dead,
+                                   "    dst  %08x %-10s %-14s %"
+                                   G_GUINT64_FORMAT "\n",
+                                   g_dst_adj_ledger[i].decode_id,
+                                   g_dst_adj_ledger[i].mnem,
+                                   generic_reg_name_or_unknown(
+                                       g_dst_adj_ledger[i].reg), n);
+        }
+        g_string_append(report,
+            "\nADJUDICATION LEDGER ROWS, BY WHETHER THIS RUN REACHED THEM.\n"
+            "A row nobody can see fire is a row nobody can check: a ledger\n"
+            "row whose subject the corpus never reached reads exactly like\n"
+            "one whose decode id has moved out from under it, and this tree\n"
+            "has had the second happen.  Both lists are printed, and a row\n"
+            "in the DID NOT FIRE list is a fact about this run's corpus\n"
+            "until someone shows it is a fact about the row:\n");
+        g_string_append(report, "  FIRED:\n");
+        g_string_append(report, live->len ? live->str : "    (none)\n");
+        g_string_append(report, "  DID NOT FIRE:\n");
+        g_string_append(report, dead->len ? dead->str : "    (none)\n");
+        g_string_free(live, TRUE);
+        g_string_free(dead, TRUE);
+    }
     /*
      * THE SURVIVOR-ROW REFUTATION, printed as the JOIN of the two tallies
      * rather than as either of them.  Runs with @g_tally_lock HELD, so it

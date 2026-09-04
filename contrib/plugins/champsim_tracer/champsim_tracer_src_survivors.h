@@ -99,16 +99,15 @@ typedef struct {
  * CORRECTION under R15/R16: a register the instruction
  * cannot read was never information. */
 /* REFUSED, not carried: 0x44ae204eu decode-new/x87@1101110111000... REG_FPR1 (ffree x7) --
- * a FROZEN ENCODED OPERAND, measured against the deriving
- * corpus rather than against this table's shape
- * (FINDING 71-B).  The rule's own instances publish this
- * register on EVERY one of them while the same numbered
- * file supplies a VARYING register beside it, so the file
- * is what the encoding selects from and the constant is
- * the corpus's operand.  What was measured:
- *   constant on 744 of 744 instances while the REG_FPR file varies over 7 other register(s): REG_FPR0,REG_FPR2,REG_FPR3,REG_FPR4,REG_FPR5,REG_FPR6...
+ * QEMU'S OWN DECODE SITE REFUTES THIS READ.  The operand
+ * walk still supplies the register, so this is not the
+ * boundary case above -- carrying the row would make this
+ * table the PERMANENT supplier of a dependency the
+ * emulator's translator states the instruction does not
+ * have.  The site and its own words:
+ *   gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep mark the tag word and never look at the value
  * An ADJUDICATED CORRECTION under R15/R16, not a loss
- * under R12.1: a register the encoding does not name was
+ * under R12.1: a source the encoding does not read was
  * never information. */
 /* REFUSED, not carried: 0xa459584bu decode-new/x87@11011101..111... REG_SEG0 (fnstsw x7) --
  * disas/capstone.c already DROPS this register for this

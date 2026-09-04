@@ -260,6 +260,15 @@ DECODE_SITE_REFUTED = (
      "gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep "
      "mark the tag word and never look at the value"),
 )
+
+#: THE DEAD-REFUSAL-RULE DETECTOR'S FIRING CONTROL.  A detector nobody can
+#: watch convict is not a detector, and both tables above are one row long, so
+#: there is no natural population to plant into.  With this set, ONE entry
+#: that cannot match anything is appended to BOUNDARY_DROPS and the emit must
+#: REFUSE and name it.  Used by ARM S4 of the selftest and by nothing else.
+if os.environ.get("CST_SURV_PLANT_DEAD_RULE"):
+    BOUNDARY_DROPS = BOUNDARY_DROPS + (
+        ("x86_64", "@@planted-rule-that-matches-nothing@@", "REG_"),)
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
 # The SECOND survivor block, same columns and same role measurement, and a
 # DIFFERENT CLAIM: a published source on an instruction whose read list QEMU
@@ -638,6 +647,16 @@ def emit(out, inputs, src, corpora=None):
     # REFUSAL 5 is checked FIRST: a row with no decode identity at all cannot
     # be qualified by any of the tests below, because they all take the id as
     # a key and it has none.
+    # ONE COUNTER PER TABLE ENTRY, because a refusal category that matches
+    # nothing is the dead-allowlist-rule class this tree has a standing
+    # tripwire for everywhere else and had none for here (FINDING 72-C).  The
+    # comment above BOUNDARY_DROPS has always claimed the detector exists --
+    # "a boundary repair that is retired on a Capstone bump leaves a row here
+    # with nothing to match and the dead-rule detector can see it" -- and it
+    # did not.  Counted here, scored below, before a byte of the header is
+    # written.
+    boundary_hits = [0] * len(BOUNDARY_DROPS)
+    refuted_hits = [0] * len(DECODE_SITE_REFUTED)
     refused = {isa: [] for isa in ISAS}
     for isa in ISAS:
         for key in list(per[isa]):
@@ -647,6 +666,54 @@ def emit(out, inputs, src, corpora=None):
                 refused[isa].append((key, per[isa].pop(key), "AMBIGUOUS"))
             elif (key[0], key[2]) in owed[isa]:
                 refused[isa].append((key, per[isa].pop(key), "OWED"))
+    # REFUSAL 8, applied FIRST of the four REGISTER refusals -- ahead of 6,
+    # 6b and 7.  QEMU'S OWN DECODE SITE SAYS THIS INSTRUCTION DOES NOT READ
+    # THIS REGISTER.
+    #
+    # THE ORDER IS DERIVED FROM THIS FILE'S OWN TWO WRITTEN GROUNDS
+    # (FINDING 72-C), and it used to contradict them.  Ground one is the
+    # sentence repeated at every refusal below: a row already refused keeps
+    # the WORSE of the reasons that apply, "worse" being spelled out at
+    # REFUSAL 6 as the reason that disqualifies more -- an id with no
+    # identity "is not merely a frozen operand".  Ground two is
+    # DECODE_SITE_REFUTED's own header, which ranks this category against
+    # REFUSAL 7 in as many words: a boundary row says the register has
+    # already stopped arriving, a refuted row says it is STILL arriving and
+    # the emulator denies it, and "that is the worse of the two".  The file
+    # nevertheless applied 8 last, so 8's only member left under a different
+    # reason and the category matched nothing -- the two statements exec123
+    # wrote about it were false at the tip and nothing could see that.
+    #
+    # THE TWO KINDS OF REFUSAL ARE NOT COMPARABLE, which is what keeps this
+    # from over-reaching.  NOIDENT / AMBIGUOUS / OWED are KEY refusals: they
+    # disqualify the ROW, and an id carrying three instructions cannot make
+    # any per-register statement at all, so a per-register refutation of one
+    # of them is not even well formed.  Those stay first, exactly as ground
+    # one reads.  FROZEN, FROZEN-RT, BOUNDARY and REFUTED are REGISTER
+    # refusals -- all four say this register does not belong on this row --
+    # and ground two ranks one of them above the rest.
+    #
+    # AGAINST 6 AND 6b the ranking is the same sentence read against what
+    # they argue from: REFUSAL 6 is an argument about THE TABLE'S SHAPE and
+    # REFUSAL 6b about THE CORPUS'S SHAPE, and this tree's standing position
+    # is that QEMU's decode site is truth and a shape argument is not.  The
+    # register is not lost under R12.1 either way: a source the encoding does
+    # not read was never information, and the removal is an ADJUDICATED
+    # CORRECTION under R15/R16 exactly as 6's, 6b's and 7's are.  Both
+    # refusals REMOVE the row, so which one publishes it moves header text
+    # and no wire content.
+    for isa in ISAS:
+        for key in list(per[isa]):
+            did, role, reg = key
+            rule = per[isa][key][0]
+            for ri, (r_isa, r_rule, r_pfx, _site) in enumerate(
+                    DECODE_SITE_REFUTED):
+                if isa == r_isa and r_rule in rule and (reg or "").startswith(
+                        r_pfx):
+                    refuted_hits[ri] += 1
+                    refused[isa].append((key, per[isa].pop(key), "REFUTED"))
+                    break
+
     # REFUSAL 6, applied after the three above so that a row already refused
     # for a worse reason keeps that reason: an id with no identity, or one
     # carrying several instructions, is not merely a frozen operand.
@@ -723,34 +790,78 @@ def emit(out, inputs, src, corpora=None):
         for key in list(per[isa]):
             did, role, reg = key
             rule = per[isa][key][0]
-            for b_isa, b_rule, b_pfx in BOUNDARY_DROPS:
+            for bi, (b_isa, b_rule, b_pfx) in enumerate(BOUNDARY_DROPS):
                 if isa == b_isa and b_rule in rule and (reg or "").startswith(
                         b_pfx):
+                    boundary_hits[bi] += 1
                     refused[isa].append((key, per[isa].pop(key), "BOUNDARY"))
                     break
 
-    # REFUSAL 8, applied after REFUSAL 7 for the same reason REFUSAL 7 is
-    # applied after 6: a row already refused keeps the reason it was first
-    # refused for.  QEMU'S OWN DECODE SITE SAYS THIS INSTRUCTION DOES NOT
-    # READ THIS REGISTER.
+    # ---------------------------------------------------------------------
+    # THE DEAD-REFUSAL-RULE DETECTOR, and the refusal-category census.
     #
-    # REFUSAL 7's subject is a register the DISASSEMBLER has stopped
-    # supplying.  This one's subject is a register the disassembler is STILL
-    # supplying and the EMULATOR denies -- so carrying it would make this
-    # table the permanent supplier of a dependency QEMU's translator states,
-    # in its own comment, that the instruction does not have.  The register
-    # is not lost under R12.1: a source the encoding does not read was never
-    # information, and the removal is an ADJUDICATED CORRECTION under R15/R16
-    # exactly as REFUSAL 6's and REFUSAL 7's are.
+    # TWO DIFFERENT THINGS, and they are scored differently on purpose.
+    #
+    # A DEAD TABLE ENTRY IS A REFUSAL TO EMIT.  BOUNDARY_DROPS and
+    # DECODE_SITE_REFUTED are hand-written rows, each naming a decode rule and
+    # a register prefix and each carrying a written justification.  An entry
+    # that matches nothing has outlived the behaviour it describes -- the
+    # Capstone bump retired the boundary repair, or a row moved to another
+    # refusal -- and an unaudited row that excuses nothing is exactly the
+    # amnesty this tree removes elsewhere.  So the header is not written and
+    # the entry is named.  It is a source edit to fix, never a runtime
+    # decision, which is why this refuses rather than skipping.
+    #
+    # A CATEGORY WITH NO LIVE MEMBER IS A NAMED REPORT, not a refusal.  The
+    # KEY refusals (NOIDENT / AMBIGUOUS / OWED) and the shape refusals
+    # (FROZEN / FROZEN-RT) have no table to go stale: their subject is
+    # whatever the census contained, and a corpus that happens to contain no
+    # ambiguous id is a fact about that corpus.  Reporting a zero there as a
+    # defect would be the confusion isaxcheck's own dead-rule comment warns
+    # about -- a rule going dead and a question never asked look identical.
+    # So every category prints its live count, and a zero prints as a zero
+    # with the reason it may legitimately be one.
+    dead_rules = []
+    for bi, (b_isa, b_rule, b_pfx) in enumerate(BOUNDARY_DROPS):
+        if not boundary_hits[bi]:
+            dead_rules.append(("BOUNDARY_DROPS", bi, b_isa, b_rule, b_pfx))
+    for ri, (r_isa, r_rule, r_pfx, _site) in enumerate(DECODE_SITE_REFUTED):
+        if not refuted_hits[ri]:
+            dead_rules.append(("DECODE_SITE_REFUTED", ri, r_isa, r_rule,
+                               r_pfx))
+    cat_counts = {}
     for isa in ISAS:
-        for key in list(per[isa]):
-            did, role, reg = key
-            rule = per[isa][key][0]
-            for r_isa, r_rule, r_pfx, _site in DECODE_SITE_REFUTED:
-                if isa == r_isa and r_rule in rule and (reg or "").startswith(
-                        r_pfx):
-                    refused[isa].append((key, per[isa].pop(key), "REFUTED"))
-                    break
+        for _k, _v, why in refused[isa]:
+            cat_counts[why] = cat_counts.get(why, 0) + 1
+    for cat, what in (("NOIDENT", "row with no decode identity at all"),
+                      ("AMBIGUOUS", "id carrying several instructions"),
+                      ("OWED", "row under an open maintainer question"),
+                      ("FROZEN", "frozen operand visible in the TABLE"),
+                      ("FROZEN-RT", "frozen operand visible in the CORPUS"),
+                      ("BOUNDARY", "register the boundary already drops"),
+                      ("REFUTED", "register QEMU's decode site denies")):
+        n = cat_counts.get(cat, 0)
+        if n:
+            print("  REFUSAL-CATEGORY %-10s %d live member(s)  (%s)"
+                  % (cat, n, what))
+        else:
+            print("  REFUSAL-CATEGORY %-10s ZERO LIVE MEMBERS -- these "
+                  "sidecars contained no %s.  A category with no member is a "
+                  "fact about THIS CENSUS, not a defect; a dead TABLE ENTRY "
+                  "is the defect and is refused separately." % (cat, what))
+    for tbl, i, t_isa, t_rule, t_pfx in dead_rules:
+        print("  DEAD-REFUSAL-RULE %s[%d]  %s  rule~%s  reg~%s  -- matched "
+              "NOTHING in this census" % (tbl, i, t_isa, t_rule, t_pfx))
+    if dead_rules:
+        sys.stderr.write(
+            "REFUSING to emit %s: %d refusal-table entr%s matched nothing "
+            "(named above).  A hand-written refusal row that excuses no row "
+            "has outlived the behaviour it describes; retire it in the table "
+            "with the reason written next to it, or find out why its subject "
+            "stopped arriving.  This is the dead-rule detector the comment "
+            "above BOUNDARY_DROPS has always promised.\n"
+            % (out, len(dead_rules), "y" if len(dead_rules) == 1 else "ies"))
+        return 1
 
     w = []
     a = w.append
@@ -1092,7 +1203,22 @@ def selftest():
                  "       FIXED   ctrlmn",
                  "         7  0000feed CTRLRULE                   REG_VCTRL"
                  "     FIXED   ctrlmn"]
+    # THE TWO REFUSAL TABLES GET AN OCCUPANT IN THE FIXTURE, which is what
+    # lets the dead-rule detector be ON by default: an entry that matches
+    # nothing REFUSES the emit, so every arm here has to keep both tables
+    # live.  They are also the only POSITIVE controls REFUSAL 7 and REFUSAL 8
+    # have ever had -- before this, neither category was exercised by a single
+    # selftest arm, and 72-C's dead REFUSAL 8 is what that cost.
+    #
+    # Each is on its OWN decode id with ONE mnemonic in the witness, so the
+    # KEY refusals cannot claim it first and the arm measures what it says.
+    tables = ["         7  11a75e40 decode-new/x87@11011001..111... REG_SEG0"
+              "     FIXED   fnstcw",
+              "         7  44ae204e decode-new/x87@1101110111000... REG_FPR1"
+              "     FIXED   ffree"]
     witness = witness + [
+        "         7  11a75e40 decode-new/x87@11011001..111... fnstcw",
+        "         7  44ae204e decode-new/x87@1101110111000... ffree",
         "         3  000002e0 VFMADD132Sx                vfmadd132sd",
         "         4  0000abcd SOMERULE                   somemn",
         "         5  0000dcba OTHERRULE                  othermn",
@@ -1100,7 +1226,7 @@ def selftest():
         "         7  0000feed CTRLRULE                   ctrlmn"]
     x = os.path.join(d, "x86_64.log")
     _sidecar(x, good + split + owedsurv + ruledsurv + noident + frozen
-             + notfrozen, splitline, witness, owedrow + ruledrow)
+             + notfrozen + tables, splitline, witness, owedrow + ruledrow)
     # aarch64 carries the SECOND claim and NOTHING in the first: its
     # survivor block reads `(none)` and its NOT-SCORED block carries two
     # rows, one on an id the witness shows colliding.  This is the exact
@@ -1129,6 +1255,7 @@ def selftest():
     rc = subprocess.run(me + ["--out", h, "--from-snapshot", snap],
                         capture_output=True, text=True)
     txt = open(h).read() if os.path.exists(h) else ""
+    txt_s2a = rc.stdout
     chk("ARM B: emit from a verified snapshot", rc.returncode == 0,
         rc.stderr.strip())
     chk("ARM C: the QID_SPLIT row is NOT carried",
@@ -1314,6 +1441,80 @@ def selftest():
         "'nothing varies'",
         rc.returncode != 0 and "not the mechanism corpus"
         in (rc.stdout + rc.stderr), (rc.stdout + rc.stderr).strip())
+
+    # -------------------------------------------------- REFUSALS 7 and 8
+    # The two hand-written refusal TABLES, and the order they are applied in
+    # (FINDING 72-C).  Before this pass neither category had a single arm.
+    chk("ARM S1: a BOUNDARY_DROPS row is refused with the boundary reason",
+        "0x11a75e40u, SRC_SURV" not in txt
+        and "REFUSED, not carried: 0x11a75e40" in txt
+        and "already DROPS this register" in txt,
+        [L for L in txt.split("\n") if "11a75e40" in L])
+    chk("ARM S2: a DECODE_SITE_REFUTED row leaves REFUTED, with QEMU's own "
+        "site quoted",
+        "0x44ae204eu, SRC_SURV" not in txt
+        and "REFUSED, not carried: 0x44ae204e" in txt
+        and "gen_note_sti_read()" in txt,
+        [L for L in txt.split("\n") if "44ae204e" in L])
+    chk("ARM S2a: and the emit log names it as REFUTED BY QEMU'S OWN DECODE "
+        "SITE, which is the sentence 72-C found unreachable",
+        "REFUTED BY QEMU'S OWN DECODE SITE" in txt_s2a, txt_s2a[:400])
+
+    # ARM S3 -- THE ORDERING, measured rather than asserted.  The same row is
+    # handed a corpus in which it is ALSO a frozen operand by REFUSAL 6b's
+    # test: REG_FPR1 constant on every instance of the id while the FPR file
+    # varies over four others.  Both refusals remove it; the derived order
+    # says the reason PUBLISHED is the emulator's, not the corpus's shape.
+    xcorp = os.path.join(d, "x86_64.corpus.tsv")
+    with open(xcorp, "w") as f:
+        f.write("#isa\tencoding\tmnem\tdecode_id\tPUB\n")
+        for i, other in enumerate(["REG_FPR0", "REG_FPR2", "REG_FPR3",
+                                   "REG_FPR4"]):
+            f.write("x86_64\t%08x\tffree\t44ae204e\tREG_FPR1,%s\n"
+                    % (0x40ddc0 + i, other))
+    snap5 = os.path.join(d, "snap_ord")
+    subprocess.run(me + ["--snapshot", snap5, "x86_64=" + x, "aarch64=" + a_,
+                         "riscv64=" + r, "mipsel=" + m,
+                         "--corpus", "x86_64=" + xcorp],
+                   capture_output=True, text=True)
+    h5 = os.path.join(d, "out_ord.h")
+    rc = subprocess.run(me + ["--out", h5, "--from-snapshot", snap5],
+                        capture_output=True, text=True)
+    txt5 = open(h5).read() if os.path.exists(h5) else ""
+    chk("ARM S3: with BOTH refusals applying, the row leaves as REFUTED and "
+        "not as the corpus-shape FROZEN-RT",
+        rc.returncode == 0 and "gen_note_sti_read()" in txt5
+        and "REFUTED BY QEMU'S OWN DECODE SITE" in rc.stdout
+        and "FINDING 71-B" not in
+            txt5.split("0x44ae204e")[-1].split("*/")[0],
+        (rc.stdout + rc.stderr).strip())
+    chk("ARM S3a: the runtime arm still RAN on that ISA -- the reorder took "
+        "the row from it, it did not disable it",
+        "RUNTIME-ARM x86_64" in rc.stdout and "ran over" in rc.stdout,
+        rc.stdout.strip())
+
+    # ARM S4 -- THE DETECTOR ITSELF.  A planted table entry that cannot match
+    # anything must REFUSE the emit and name the entry.  Without this the
+    # detector is another instrument nobody has watched convict.
+    env = dict(os.environ, CST_SURV_PLANT_DEAD_RULE="1")
+    dead_h = os.path.join(d, "out_dead.h")
+    rc = subprocess.run(me + ["--out", dead_h, "--from-snapshot", snap],
+                        capture_output=True, text=True, env=env)
+    chk("ARM S4: a refusal-table entry that matches nothing REFUSES the emit",
+        rc.returncode != 0 and not os.path.exists(dead_h),
+        (rc.stdout + rc.stderr).strip())
+    chk("ARM S4a: and the dead entry is NAMED, table and index",
+        "DEAD-REFUSAL-RULE BOUNDARY_DROPS[1]" in rc.stdout
+        and "@@planted-rule-that-matches-nothing@@" in rc.stdout,
+        rc.stdout.strip())
+    chk("ARM S4b (NEGATIVE): without the plant the same snapshot emits",
+        os.path.exists(h), "")
+    chk("ARM S5: every refusal category prints a live count, and a zero "
+        "prints as a zero rather than being absent",
+        "REFUSAL-CATEGORY BOUNDARY" in txt_s2a
+        and "REFUSAL-CATEGORY REFUTED" in txt_s2a
+        and "REFUSAL-CATEGORY FROZEN-RT  ZERO LIVE MEMBERS" in txt_s2a,
+        [L for L in txt_s2a.split("\n") if "REFUSAL-CATEGORY" in L])
 
     open(os.path.join(snap, "x86_64.00.x86_64.log"), "a").write("tamper\n")
     rc = subprocess.run(me + ["--out", h + ".3", "--from-snapshot", snap],

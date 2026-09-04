@@ -9964,6 +9964,27 @@ static bool do_fp1_scalar_int_2fn(DisasContext *s, arg_rr_e *a,
                                   const FPScalar1Int *fnormal,
                                   const FPScalar1Int *fah)
 {
+    /*
+     * FPCR IS READ HERE AND NOWHERE ELSE FOR THESE FORMS.  This function's
+     * entire body is a choice made on FPCR.AH, and it is the only route by
+     * which `fabs` and `fneg` consult the control word: they are sign-bit
+     * operations, so they never take a status pointer and never reach
+     * fpstatus_ptr()'s note.  FPCR.AH == 1 makes them leave a NaN's sign
+     * alone, which is a different result from the same operands -- an
+     * architectural source by any reading, and R17's as well, since the
+     * instruction reads the bit whichever way the bit answers.
+     *
+     * MEASURED, not assumed: with the read stated only at the status sites,
+     * the aarch64 deletion excursion still lost REG_FPCW on exactly 192
+     * encodings, and they were exactly `disas_a64/FABS_s` (96) and
+     * `disas_a64/FNEG_s` (96) -- the two rules this function serves.
+     *
+     * STATED BEFORE THE CHOICE, on fp_access_check_only()'s rule: stating it
+     * only on one arm would make the read a function of the value read.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    note_fpcr_read_direct();
     return do_fp1_scalar_int(s, a, s->fpcr_ah ? fah : fnormal, true);
 }
 

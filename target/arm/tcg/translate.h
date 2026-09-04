@@ -766,13 +766,29 @@ static inline CPUARMTBFlags arm_tbflags_from_tb(const TranslationBlock *tb)
  * Capture only; no op is emitted, altered or suppressed, and the generated
  * code is byte-identical with the note present or absent.
  */
+/*
+ * THE SAME READ WITH NO STATUS WORD IN SIGHT.
+ *
+ * Split out because a handful of FP instructions consult FPCR and never touch
+ * vfp.fp_status[] at all: `fabs` and `fneg` are bit operations on the sign,
+ * so no softfloat call and no status pointer is involved, and yet
+ * FPCR.AH == 1 changes what they do to a NaN -- which QEMU implements by
+ * SELECTING A DIFFERENT EMITTER on `s->fpcr_ah`.  Those sites call this
+ * directly; note_fpcr_read() below is the flavour-gated wrapper for the ones
+ * that operate under a status word.
+ */
+static inline void note_fpcr_read_direct(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUARMState, vfp.fpcr),
+                                       sizeof(((CPUARMState *)0)->vfp.fpcr));
+}
+
 static inline void note_fpcr_read(ARMFPStatusFlavour flavour)
 {
     if (flavour == FPST_STD) {
         return;
     }
-    insn_dataflow_note_stated_read_env(offsetof(CPUARMState, vfp.fpcr),
-                                       sizeof(((CPUARMState *)0)->vfp.fpcr));
+    note_fpcr_read_direct();
 }
 
 static inline void note_fpstatus_read(ARMFPStatusFlavour flavour)

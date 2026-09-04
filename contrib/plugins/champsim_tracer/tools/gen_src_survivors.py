@@ -210,6 +210,56 @@ BOUNDARY_DROPS = (
     # update the FPU instruction pointer.
     ("x86_64", "x87", "REG_SEG"),
 )
+
+#: REGISTERS QEMU'S OWN DECODE SITE SAYS THE INSTRUCTION DOES NOT READ, by
+#: (isa, decode-rule substring, register-name prefix).  See REFUSAL 8.  Each
+#: row cites the site and quotes what it says, because the whole force of the
+#: category is that the emulator's translator states the refutation itself --
+#: not that this file has an opinion about the encoding.
+#:
+#: DIFFERENT FROM BOUNDARY_DROPS ABOVE, and the difference is which decoder
+#: made the ruling.  A BOUNDARY row says `disas/capstone.c` has already
+#: stopped supplying the register, so a survivor row would re-add it one layer
+#: up.  A REFUTED row says the register is still arriving from the operand
+#: walk and QEMU's translator contradicts it -- so the survivor table would
+#: not merely re-add a removed dependency, it would make this table the
+#: PERMANENT supplier of one the emulator denies.  That is the worse of the
+#: two, and it is why the category is separate rather than folded in: a reader
+#: has to be able to tell "already removed" from "still published and wrong".
+DECODE_SITE_REFUTED = (
+    # `ffree %st(i)` / `ffreep %st(i)`, ModRM.reg = 4 in the DD and DF
+    # escapes.  Capstone-6.0.0-Alpha7 reports the explicit ST(i) operand of
+    # `ffree` with READ access; QEMU's x87 translation refutes it at the
+    # decode site, in its own words, at gen_note_sti_read() in
+    # target/i386/tcg/translate.c:
+    #
+    #   "`ffree %st(i)` and `ffreep %st(i)` are NOT annotated: they mark the
+    #    tag word empty and never look at the value, so ST(i) is not a source
+    #    of theirs and stating it would fabricate."
+    #
+    # helper_ffree_STN() is the whole execution and it is one statement,
+    # `env->fptags[(env->fpstt + st_index) & 7] = 1` -- the tag, and nothing
+    # that reads the register.  The SDM agrees: FFREE "sets the tag ...
+    # associated with register ST(i) to empty", and lists no source operand.
+    #
+    # CAPSTONE CONTRADICTS ITSELF HERE, which is the defect witness rather
+    # than an argument: `ffreep` publishes no FP register at all on the same
+    # sled (PUB REG_FCSR,REG_SEG0), while `ffree` publishes ST(i).  Two
+    # encodings of one operation, decoded two different ways.
+    #
+    # WHAT THE ROW WAS DOING.  The refused row is FIXED REG_FPR1 on decode id
+    # 0x44ae204e, whose rule `x87@1101110111000...` covers all EIGHT ffree
+    # encodings -- so the table supplied REG_FPR1 on `ffree %st(0)`,
+    # `%st(2)`, `%st(3)` and the rest, a register those encodings do not
+    # name.  Measured on the exec123 sled: `40ddc0` (ffree %st(0)) publishes
+    # SURV REG_FPR1 beside the walk's REG_FPR0, and `40ddc2` publishes
+    # REG_FPR1 beside REG_FPR2.  It is a FROZEN ENCODED OPERAND that
+    # REFUSAL 6 cannot see, because REFUSAL 6 needs two FIXED rows of one
+    # bank to collide and this id carries only one.
+    ("x86_64", "x87@1101110111000", "REG_FPR",
+     "gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep "
+     "mark the tag word and never look at the value"),
+)
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
 # The SECOND survivor block, same columns and same role measurement, and a
 # DIFFERENT CLAIM: a published source on an instruction whose read list QEMU
@@ -483,6 +533,29 @@ def emit(out, inputs, src):
                     refused[isa].append((key, per[isa].pop(key), "BOUNDARY"))
                     break
 
+    # REFUSAL 8, applied after REFUSAL 7 for the same reason REFUSAL 7 is
+    # applied after 6: a row already refused keeps the reason it was first
+    # refused for.  QEMU'S OWN DECODE SITE SAYS THIS INSTRUCTION DOES NOT
+    # READ THIS REGISTER.
+    #
+    # REFUSAL 7's subject is a register the DISASSEMBLER has stopped
+    # supplying.  This one's subject is a register the disassembler is STILL
+    # supplying and the EMULATOR denies -- so carrying it would make this
+    # table the permanent supplier of a dependency QEMU's translator states,
+    # in its own comment, that the instruction does not have.  The register
+    # is not lost under R12.1: a source the encoding does not read was never
+    # information, and the removal is an ADJUDICATED CORRECTION under R15/R16
+    # exactly as REFUSAL 6's and REFUSAL 7's are.
+    for isa in ISAS:
+        for key in list(per[isa]):
+            did, role, reg = key
+            rule = per[isa][key][0]
+            for r_isa, r_rule, r_pfx, _site in DECODE_SITE_REFUTED:
+                if isa == r_isa and r_rule in rule and (reg or "").startswith(
+                        r_pfx):
+                    refused[isa].append((key, per[isa].pop(key), "REFUTED"))
+                    break
+
     w = []
     a = w.append
     a("/*")
@@ -566,6 +639,20 @@ def emit(out, inputs, src):
                 a(" * it at its own decode site as well.  An ADJUDICATED")
                 a(" * CORRECTION under R15/R16: a register the instruction")
                 a(" * cannot read was never information. */")
+            elif why == "REFUTED":
+                a(" * QEMU'S OWN DECODE SITE REFUTES THIS READ.  The operand")
+                a(" * walk still supplies the register, so this is not the")
+                a(" * boundary case above -- carrying the row would make this")
+                a(" * table the PERMANENT supplier of a dependency the")
+                a(" * emulator's translator states the instruction does not")
+                a(" * have.  The site and its own words:")
+                for r_isa, r_rule, r_pfx, site in DECODE_SITE_REFUTED:
+                    if r_isa == isa and r_rule in rule and \
+                            (reg or "").startswith(r_pfx):
+                        a(" *   %s" % site)
+                a(" * An ADJUDICATED CORRECTION under R15/R16, not a loss")
+                a(" * under R12.1: a source the encoding does not read was")
+                a(" * never information. */")
             elif why == "FROZEN":
                 a(" * this decode id carries another FIXED row from the SAME")
                 a(" * NUMBERED BANK, so the pair claims one rule reads two")
@@ -644,6 +731,9 @@ def emit(out, inputs, src):
                      "the DECODE BOUNDARY already drops this register for "
                      "this instruction class"
                      if why == "BOUNDARY" else
+                     "REFUTED BY QEMU'S OWN DECODE SITE: the translator "
+                     "states the instruction does not read it"
+                     if why == "REFUTED" else
                      "ADJUDICATION-OWED, an open maintainer question"))
         if not per[isa]:
             print("  EMPTY %-8s: %d sidecar(s) contributed no row -- a fact "

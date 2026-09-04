@@ -156,6 +156,27 @@
  * a source that goes missing, which is the direction this file may not take.
  */
 #define DF_MAX_PRESERVE_NOTES 1024
+/*
+ * Supplied values (insn_dataflow_note_supplied_value) and
+ * architecture-defined constants (insn_dataflow_note_defined_const), which
+ * share a cap because they share a shape: one note per write an emitter has
+ * something extra to say about, per instruction.
+ *
+ * PAST THE CAP THE NOTES STOP, AND THAT IS NOT SAFE THE WAY THE CAPS ABOVE
+ * ARE.  A dropped preserve-read costs an edge nothing needs; a dropped
+ * SUPPLIED-VALUE note costs the opposite -- InsnDataflowWrite.supplies_value
+ * reads 0, so a write that really put a value in a register is published as
+ * a lowering that only re-expressed it, and a consumer using that flag to
+ * decide whether the instruction defines the register drops a destination.
+ * A dropped ARCHCONST note loses the bit dd8ae12f49 published, so a constant
+ * the architecture defines reads as a computed value.  Neither degradation
+ * announces itself.
+ *
+ * So the overflow REFUSES, on the discipline df_encread_overflow already
+ * uses: writes_overflow is raised block-wide, because a dropped note cannot
+ * say which instruction lost it and a short-but-silent write table is the
+ * error direction this file does not take.
+ */
 #define DF_MAX_VALUE_NOTES    1024
 /*
  * Representation carriers.  One per lowered register a target caches in a
@@ -3782,6 +3803,18 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
          */
         d->rd_ord_overflow = 1;
         d->wr_ord_overflow = 1;
+    }
+    if (df_value_overflow || df_aconst_overflow) {
+        /*
+         * THE SAME REFUSAL FOR THE WRITE-SIDE NOTES, and for the reason
+         * DF_MAX_VALUE_NOTES states: past the cap a write that supplies a
+         * value reports supplies_value = 0 and a write of an
+         * architecture-defined constant loses its ARCHCONST provenance bit.
+         * Both read downstream as ordinary facts rather than as absent ones,
+         * which is what makes them worth refusing over.  Block-wide, because
+         * nothing here can say which instruction lost the note.
+         */
+        d->writes_overflow = 1;
     }
     for (unsigned i = encread_lo; i < *encread_cursor; i++) {
         unsigned idx;

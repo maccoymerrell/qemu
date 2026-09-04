@@ -542,6 +542,21 @@ typedef struct DfHelperNote {
     unsigned gvec_n;
     uint32_t gvec_off[INSN_DF_MAX_GVEC_OPERANDS];
     uint8_t gvec_dir[INSN_DF_MAX_GVEC_OPERANDS];
+    /*
+     * THE EXTENT PER OPERAND, not per call.  @gvec_oprsz is the
+     * constructor's own oprsz and is the right width for the vector
+     * operands, which is every operand of an ordinary gvec op.  It is NOT
+     * right for an operand that is a DIFFERENT KIND of register passed
+     * through the same constructor: SVE's governing predicate arrives as
+     * pred_full_reg_offset(s, pg) alongside vectors of oprsz bytes, and its
+     * own width is oprsz/8.  Taking oprsz for it states a read of eight
+     * times the bytes the helper touches -- at a 64-byte vector length that
+     * is 64 bytes of a 32-byte predicate slot, which reaches into the NEXT
+     * predicate register and would publish a dependency on a register the
+     * instruction does not name.  The emitter that knows the operand is a
+     * predicate says so; everyone else leaves this at @gvec_oprsz.
+     */
+    uint32_t gvec_size[INSN_DF_MAX_GVEC_OPERANDS];
     uint32_t gvec_oprsz;
 } DfHelperNote;
 
@@ -749,6 +764,15 @@ struct InsnDataflowScratch {
     DfGvecNote gvec[DF_MAX_GVEC_NOTES];
     unsigned n_gvec;
     bool gvec_overflow;
+    /*
+     * Operand extents an emitter restated for the gvec call it is ABOUT to
+     * make.  Consumed by the next insn_dataflow_note_gvec_ool() and cleared
+     * there, so the window is the single statement between the restatement
+     * and the constructor -- see insn_dataflow_note_gvec_operand_size().
+     */
+    uint32_t gvec_osz_off[INSN_DF_MAX_GVEC_OPERANDS];
+    uint32_t gvec_osz_size[INSN_DF_MAX_GVEC_OPERANDS];
+    unsigned n_gvec_osz;
 
     DfMemopNote memop[DF_MAX_MEMOP_NOTES];
     unsigned n_memop;
@@ -875,6 +899,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_gvec             (df->gvec)
 #define df_n_gvec           (df->n_gvec)
 #define df_gvec_overflow    (df->gvec_overflow)
+#define df_gvec_osz_off     (df->gvec_osz_off)
+#define df_gvec_osz_size    (df->gvec_osz_size)
+#define df_n_gvec_osz       (df->n_gvec_osz)
 #define df_memop            (df->memop)
 #define df_n_memop          (df->n_memop)
 #define df_memop_overflow   (df->memop_overflow)
@@ -1962,6 +1989,7 @@ void insn_dataflow_note_reset(void)
     df_bind();
     df_n_gvec = 0;
     df_gvec_overflow = false;
+    df_n_gvec_osz = 0;
     df_n_memop = 0;
     df_memop_overflow = false;
     df_alt_open = false;
@@ -2045,6 +2073,22 @@ static bool df_census_overflow;
 static QemuMutex df_census_lock;
 static bool df_census_on, df_census_read;
 static const char *df_census_path;
+/*
+ * THE FILE THIS PROCESS WRITES, which is not the file that was asked for.
+ *
+ * The dump is a full rewrite (see df_census_dump_locked), so two processes
+ * pointed at one path do not accumulate: the second erases the first's
+ * answer and the census reports the helpers of the LAST process as though
+ * they were the helpers of the run.  A sled that has to be cut into chunks
+ * is exactly that shape -- one QEMU per chunk -- and it loses every chunk
+ * but the last, silently, because a short census and a complete one look
+ * alike.  So each process owns a part file named for its pid, and the parts
+ * are summed afterwards (census_merge.py).  A guest fork gets the same
+ * treatment for the same reason, which is why the pid is re-read at dump
+ * time rather than cached from the first call.
+ */
+static char *df_census_file;
+static pid_t df_census_file_pid;
 
 static void df_census_dump_locked(void);
 
@@ -2097,12 +2141,19 @@ static void df_census_dump_locked(void)
     if (!df_census_on || !df_census_path) {
         return;
     }
-    f = fopen(df_census_path, "w");
+    if (df_census_file_pid != getpid()) {
+        g_free(df_census_file);
+        df_census_file_pid = getpid();
+        df_census_file = g_strdup_printf("%s.%d", df_census_path,
+                                         (int)df_census_file_pid);
+    }
+    f = fopen(df_census_file, "w");
     if (!f) {
         return;
     }
     fprintf(f, "# qemu insn-dataflow CP-H helper census\n");
     fprintf(f, "# target=%s\n", TARGET_NAME);
+    fprintf(f, "# pid=%d\n", (int)df_census_file_pid);
     fprintf(f, "# overflow=%d rows=%u\n", (int)df_census_overflow, df_n_census);
     fprintf(f, "# name\tcalls\tnargs\tflags\treasons\tptr_args\tenv_args\t"
                "unknown_args\tstated_args\tunknown_pairs\n");
@@ -3215,7 +3266,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                             }
                         } else {
                             dir = hn->gvec_dir[k];
-                            extent = hn->gvec_oprsz;
+                            extent = hn->gvec_size[k];
                         }
                     }
                     if (dir == 0 && !df_helper_usage_of(hn->name, k, &dir)) {
@@ -5062,7 +5113,46 @@ void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
     for (unsigned i = 0; i < n; i++) {
         h->gvec_off[i] = off[i];
         h->gvec_dir[i] = dir[i];
+        h->gvec_size[i] = oprsz;
+        for (unsigned j = 0; j < df_n_gvec_osz; j++) {
+            if (df_gvec_osz_off[j] == off[i]) {
+                h->gvec_size[i] = df_gvec_osz_size[j];
+                break;
+            }
+        }
     }
+    /*
+     * CONSUMED HERE, whether or not any operand matched.  A restatement that
+     * outlived its constructor would re-describe the next call's operand at
+     * the same offset, which is a different instruction's register.
+     */
+    df_n_gvec_osz = 0;
+}
+
+/*
+ * An operand of the gvec call about to be made is not @oprsz bytes wide.
+ * See DfHelperNote::gvec_size for what this is for and why the constructor
+ * cannot work it out.
+ */
+void insn_dataflow_note_gvec_operand_size(uint32_t off, uint32_t size)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (size == 0 || df_n_gvec_osz >= INSN_DF_MAX_GVEC_OPERANDS) {
+        /*
+         * Dropped rather than partially applied: a restatement that does not
+         * fit would leave SOME operands corrected and others not, and a
+         * half-corrected call is harder to read than an uncorrected one.
+         * The uncorrected width is the constructor's own and is what this
+         * code did before the restatement existed.
+         */
+        return;
+    }
+    df_gvec_osz_off[df_n_gvec_osz] = off;
+    df_gvec_osz_size[df_n_gvec_osz] = size;
+    df_n_gvec_osz++;
 }
 
 static const DfHelperNote *df_find_helper(const TCGOp *op)

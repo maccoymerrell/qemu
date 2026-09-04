@@ -7802,3 +7802,4026 @@ x86_64 SR-rd-missing xorw +REG_SEG2
 # =====================================================================
 x86_64 FU-unclassified ud1
 x86_64 FU-unclassified ud2
+
+# =====================================================================
+# THE FIELDS LAYER'S `SR-rd-*` FAMILY -- ALL FOUR ISAs (exec121)
+#
+# WHAT THIS FAMILY IS.  A `--srcenc` arm scores the source list the WIRE
+# PUBLISHES -- QEMU's ordered read list, stated at translation time inside
+# the emulator, plus the survivor rows for what QEMU does not state --
+# against LLVM MC's operand description of the same bytes.  Its read
+# findings key on `SR-` where a bare arm's key on `R-` / `FR-`, so nothing
+# in this file answered them: before this block the fields allowlist carried
+# `SR-` rows for exactly ONE family (the x86 zero-base segment overrides,
+# 327 rows) and the other eight arms scored a residue the file could not
+# speak to.  That is the last isax layer that had no rows.
+#
+# THE ROWS ARE GENERATED, AND THAT IS THE POINT.  Every row below was
+# EMITTED FROM a signature the arms at this tip reported, by
+# tools/isax_srcenc_rows.py, which refuses to emit while any signature is
+# unclassified.  Two properties follow that hand-editing cannot give:
+#
+#   * A DEAD ROW IS IMPOSSIBLE BY CONSTRUCTION.  The arm that will score a
+#     row is the arm that produced it, so it has an occupant on the day it
+#     lands.  PASS 66 / FINDING 65-D had to learn this the other way: two
+#     rows landed with a REGCOV justification (llvm_rd=0 llvm_wr=0
+#     REFERENCE-HAS-NO-OPERAND) that was NECESSARY AND NOT SUFFICIENT --
+#     the qualifier is the WHOLE difference set, and on those two mipsel
+#     registers it never was -- so the rows matched nothing and the
+#     detector that named them was read by nobody.
+#
+#   * THE PARTITION IS TOTAL.  Every signature lands in exactly one NAMED
+#     class.  A catch-all is not a class: X-MISC exists in the generator
+#     and is EMPTY here, because each time it filled the contents were read
+#     and given their own name and citation.
+#
+# AND THE CORPUS IS THIS TIP'S, WHICH IS WHY THE ROWS ARE ONLY LANDING NOW.
+# This residue was measured twice before against a corpus captured at
+# exec104's tip (SO 9bd4a8b9cc12) while the plugin moved 317 commits.  Rows
+# written from that measurement would have described a wire that no longer
+# existed -- every aarch64 ld4/st4 row in it carried REG_GPR9, a fabricated
+# FIXED survivor row the survivor table had ALREADY refused by the time the
+# rows would have landed.  The corpus below is re-derived at the tip the
+# rows are scored on:
+#
+#   corpus  exec121/srcencorp/tipB, sled at f6736da64350ba81f2d5c458baa8d11cdfc88e4a
+#     x86_64  6416527 rows md5 afc3d22561fed6b8b3092f7b04423fbd
+#     aarch64 1408171 rows md5 9e27782a2b25c3bfaaf4814868e01050
+#     riscv64   86889 rows md5 587be690d1329ca667ebd0b49834a7dc
+#     mipsel   548886 rows md5 a630d6a80e1fc161e0d5560de3b1ff8c
+#
+# FOUR CLASSES GET NO ROWS, AND ARE LISTED WITH THEIR SIGNATURES ANYWAY.
+# An allowlist row asserts that the reference is wrong or silent and the
+# TRACER IS RIGHT.  Where the tracer is the one that is wrong, a row would
+# launder a defect, so those signatures stay UNALLOWED with a named blocker
+# and the arms stay red on them:
+#
+#   mipsel  M-DSPIMM  31 sigs  FINDING 71-A  QEMU's MIPS DSP dispatchers
+#                              hoist gen_load_gpr above the opcode switch,
+#                              so an IMMEDIATE field is read as a GPR
+#   mipsel  M-LSA      1 sig   FINDING 70-A  an R6 mnemonic carrying the
+#                              24Kf PMON translation's dataflow
+#   aarch64 A-FROZEN   1 sig   FINDING 71-B  a FIXED survivor row froze the
+#                              deriving corpus's own base register
+#   x86_64  X-SELFRELOAD 4 sigs             QEMU re-reads the control word
+#                              the instruction just wrote, to re-derive its
+#                              softfloat state; the edge is on the PREVIOUS
+#                              value and the architecture has no such input
+#
+# HOW TO REGENERATE:
+#   isax_srcenc_gate.sh run <build> <out> <corpus>
+#   isax_srcenc_rows.py --arms <out> > <this block>
+# =====================================================================
+# --- X-FIP: every x87 instruction reads the CS SELECTOR, to save it as the FPU code segment.
+#     206 signature(s), 395053 encodings at this tip.
+#
+# The x87 state includes the FPU Instruction Pointer and the FPU Code Segment
+# selector -- the pair FSTENV / FSAVE / FXSAVE publish (Intel SDM Vol. 1
+# sec. 8.1.8) -- and the instruction that updates FIP must read CS to do it.
+# QEMU does exactly that, in one place, for the whole x87 population:
+#
+#     target/i386/tcg/translate.c, `if (update_fip)`:
+#         tcg_gen_ld32u_tl(..., offsetof(CPUX86State, segs[R_CS].selector));
+#         tcg_gen_st_tl (..., offsetof(CPUX86State, fpcs));
+#
+# so REG_SEG0 reaches the wire's read list on every x87 form that updates FIP,
+# including the register-only ones with no memory operand at all.  LLVM's
+# MCInstrDesc names no segment register on any of them.  This is NOT the
+# zero-base segment-override family below: that one is about an override
+# prefix the reference reports and 64-bit mode ignores, this one is a real read
+# the reference does not report.  Where the qualifier names REG_FCSR beside it
+# the register is FPSW, read-modify-written for the condition codes and the
+# stack top, and where it names REG_FPR# it is the stack slot ST(0) resolves
+# to.
+x86_64 SR-rd-phantom f2xm1 +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fabs +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fadd +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fadd +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom faddl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom faddl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom faddp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom faddp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fadds +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fadds +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fbld +REG_FCSR,REG_FPCW,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fbld +REG_FCSR,REG_FPCW,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fbstp +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fbstp +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fchs +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovb +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovb +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovbe +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovbe +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmove +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmove +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovnb +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovnb +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovnbe +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovnbe +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovne +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovne +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovnu +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovnu +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fcom +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcom +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcomi +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fcomp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcomp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcompi +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fcompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fcompp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcomps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fcomps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fcoms +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fcoms +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fcoms +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fcos +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fdecstp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fdiv +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fdiv +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fdivl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fdivl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fdivp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fdivp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fdivr +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fdivr +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fdivrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fdivrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fdivrp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fdivrp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fdivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fdivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fdivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fdivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ffree +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom ffree +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom ffreep +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fiaddl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fiaddl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fiadds +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fiadds +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ficoml +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom ficoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom ficoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ficompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom ficompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ficomps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom ficomps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ficoms +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom ficoms +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom ficoms +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fidivl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fidivl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fidivrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fidivrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fidivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fidivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fidivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fidivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fildl +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fildl +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fildll +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fildll +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom filds +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom filds +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fimull +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fimull +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fimuls +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fimuls +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fincstp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fistl +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fistl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fistl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fistpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fistpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fistpll +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fistpll +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fistps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fistps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fists +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fists +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fists +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisttpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisttpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisttpll +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisttpll +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisttps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisttps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisubl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisubl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisubrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisubrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisubrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisubrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fisubs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fisubs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fld +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fld1 +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fldl +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fldl +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fldl2e +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fldl2t +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fldlg2 +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fldln2 +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fldpi +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom flds +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom flds +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fldt +REG_FCSR,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fldt +REG_FCSR,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fldz +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fmul +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fmul +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fmull +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fmull +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fmulp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fmulp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fmuls +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fmuls +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fnstsw +REG_GPR#,REG_SEG0
+x86_64 SR-rd-phantom fpatan +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fprem +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fprem1 +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fptan +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom frndint +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fscale +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsin +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsincos +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsqrt +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fst +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fst +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fstl +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fstl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fstl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fstp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fstp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fstpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fstpl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fstps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fstps +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fstpt +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fstpt +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fsts +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsts +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fsts +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fsub +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsub +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fsubl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fsubl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fsubp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsubp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fsubr +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsubr +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fsubrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fsubrl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fsubrp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fsubrp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fsubrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fsubrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom fsubs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
+x86_64 SR-rd-phantom fsubs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
+x86_64 SR-rd-phantom ftst +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fucom +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fucomi +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fucomp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fucompi +REG_FCSR,REG_FLAGS,REG_SEG0
+x86_64 SR-rd-phantom fucompp +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fxam +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fxch +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fxch +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fxtract +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fyl2x +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom fyl2xp1 +REG_FCSR,REG_FPR#,REG_SEG0
+x86_64 SR-rd-phantom int +REG_FLAGS,REG_SEG0,REG_SP
+x86_64 SR-rd-phantom int3 +REG_FLAGS,REG_SEG0,REG_SP
+
+# --- X-IOPL: IN and OUT read EFLAGS.IOPL to decide whether they are allowed to run.
+#     6 signature(s), 289974 encodings at this tip.
+#
+# The I/O instructions are permitted by CPL and EFLAGS.IOPL, and outside ring 0
+# by the I/O permission bitmap (Intel SDM Vol. 2A, IN / OUT: "protected mode
+# ... IOPL").  QEMU states that check at translation (gen_check_io), so the
+# flag register reaches the read list.  LLVM's MCInstrDesc models the data
+# movement and no permission check, so it names no flag use.
+x86_64 SR-rd-phantom inb +REG_FLAGS
+x86_64 SR-rd-phantom inl +REG_FLAGS
+x86_64 SR-rd-phantom inw +REG_FLAGS
+x86_64 SR-rd-phantom outb +REG_FLAGS
+x86_64 SR-rd-phantom outl +REG_FLAGS
+x86_64 SR-rd-phantom outw +REG_FLAGS
+
+# --- X-REP: the REP prefix reads the count register, which is not part of the opcode LLVM describes.
+#     57 signature(s), 1348191 encodings at this tip.
+#
+# REP / REPE / REPNE make the string operation iterate on RCX, so RCX is a true
+# source of the prefixed form.  LLVM's MCInstrDesc describes the BASE OPCODE --
+# MOVSB, STOSB, INSB -- and the prefix is a separate MCInst feature, so its
+# read set is short by the count register on every prefixed encoding.  The
+# tracer's subject is the instruction QEMU translated, prefix included.
+x86_64 SR-rd-phantom loop +REG_GPR#
+x86_64 SR-rd-phantom loope +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom loopne +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom rep insb +REG_GPR#
+x86_64 SR-rd-phantom rep insl +REG_GPR#
+x86_64 SR-rd-phantom rep insw +REG_GPR#
+x86_64 SR-rd-phantom rep lodsb +REG_GPR#
+x86_64 SR-rd-phantom rep lodsl +REG_GPR#
+x86_64 SR-rd-phantom rep lodsq +REG_GPR#
+x86_64 SR-rd-phantom rep lodsw +REG_GPR#
+x86_64 SR-rd-phantom rep movsb +REG_GPR#
+x86_64 SR-rd-phantom rep movsl +REG_GPR#
+x86_64 SR-rd-phantom rep movsq +REG_GPR#
+x86_64 SR-rd-phantom rep movsw +REG_GPR#
+x86_64 SR-rd-phantom rep outsb +REG_GPR#
+x86_64 SR-rd-phantom rep outsl +REG_GPR#
+x86_64 SR-rd-phantom rep outsw +REG_GPR#
+x86_64 SR-rd-phantom rep stosb +REG_GPR#
+x86_64 SR-rd-phantom rep stosl +REG_GPR#
+x86_64 SR-rd-phantom rep stosq +REG_GPR#
+x86_64 SR-rd-phantom rep stosw +REG_GPR#
+x86_64 SR-rd-phantom repe cmpsb +REG_GPR#
+x86_64 SR-rd-phantom repe cmpsl +REG_GPR#
+x86_64 SR-rd-phantom repe cmpsq +REG_GPR#
+x86_64 SR-rd-phantom repe cmpsw +REG_GPR#
+x86_64 SR-rd-phantom repe scasb +REG_GPR#
+x86_64 SR-rd-phantom repe scasl +REG_GPR#
+x86_64 SR-rd-phantom repe scasq +REG_GPR#
+x86_64 SR-rd-phantom repe scasw +REG_GPR#
+x86_64 SR-rd-phantom repne cmpsb +REG_GPR#
+x86_64 SR-rd-phantom repne cmpsl +REG_GPR#
+x86_64 SR-rd-phantom repne cmpsq +REG_GPR#
+x86_64 SR-rd-phantom repne cmpsw +REG_GPR#
+x86_64 SR-rd-phantom repne insb +REG_GPR#
+x86_64 SR-rd-phantom repne insl +REG_GPR#
+x86_64 SR-rd-phantom repne insw +REG_GPR#
+x86_64 SR-rd-phantom repne lodsb +REG_GPR#
+x86_64 SR-rd-phantom repne lodsl +REG_GPR#
+x86_64 SR-rd-phantom repne lodsq +REG_GPR#
+x86_64 SR-rd-phantom repne lodsw +REG_GPR#
+x86_64 SR-rd-phantom repne movsb +REG_GPR#
+x86_64 SR-rd-phantom repne movsl +REG_GPR#
+x86_64 SR-rd-phantom repne movsq +REG_GPR#
+x86_64 SR-rd-phantom repne movsw +REG_GPR#
+x86_64 SR-rd-phantom repne outsb +REG_GPR#
+x86_64 SR-rd-phantom repne outsl +REG_GPR#
+x86_64 SR-rd-phantom repne outsw +REG_GPR#
+x86_64 SR-rd-phantom repne scasb +REG_GPR#
+x86_64 SR-rd-phantom repne scasl +REG_GPR#
+x86_64 SR-rd-phantom repne scasq +REG_GPR#
+x86_64 SR-rd-phantom repne scasw +REG_GPR#
+x86_64 SR-rd-phantom repne stosb +REG_GPR#
+x86_64 SR-rd-phantom repne stosl +REG_GPR#
+x86_64 SR-rd-phantom repne stosq +REG_GPR#
+x86_64 SR-rd-phantom repne stosw +REG_GPR#
+x86_64 SR-rd-phantom repz retq +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom repz retw +REG_SEG5,REG_SP
+
+# --- X-PARTIAL: an instruction that writes PART of a register must carry the rest forward, and the reference has one operand.
+#     108 signature(s), 445305 encodings at this tip.
+#
+# BT / BTS / BTR / BTC write CF and leave OF, SF, ZF, AF and PF UNCHANGED
+# (Intel SDM Vol. 2A, BT); SAHF writes five flags and leaves OF and the
+# reserved bits; LAHF writes AH and leaves the other 56 bits of RAX; POPF
+# restores some flags and preserves others by privilege.  At the granularity a
+# register file schedules on, each of those is a PARTIAL WRITE, which is a
+# read-modify-write: the instruction must carry the untouched part forward, and
+# QEMU's lazy-flag machinery states the read.  LLVM's MCInstrDesc carries ONE
+# operand for EFLAGS and one for the GPR and marks it Def, so it has no way to
+# express a partial write and reports no use.
+x86_64 SR-rd-phantom bsfl +REG_FP_REG
+x86_64 SR-rd-phantom bsfl +REG_GPR#
+x86_64 SR-rd-phantom bsfl +REG_SP
+x86_64 SR-rd-phantom bsfq +REG_FP_REG
+x86_64 SR-rd-phantom bsfq +REG_GPR#
+x86_64 SR-rd-phantom bsfq +REG_SP
+x86_64 SR-rd-phantom bsfw +REG_FP_REG
+x86_64 SR-rd-phantom bsfw +REG_GPR#
+x86_64 SR-rd-phantom bsfw +REG_SP
+x86_64 SR-rd-phantom bsrl +REG_FP_REG
+x86_64 SR-rd-phantom bsrl +REG_GPR#
+x86_64 SR-rd-phantom bsrl +REG_SP
+x86_64 SR-rd-phantom bsrq +REG_FP_REG
+x86_64 SR-rd-phantom bsrq +REG_GPR#
+x86_64 SR-rd-phantom bsrq +REG_SP
+x86_64 SR-rd-phantom bsrw +REG_FP_REG
+x86_64 SR-rd-phantom bsrw +REG_GPR#
+x86_64 SR-rd-phantom bsrw +REG_SP
+x86_64 SR-rd-phantom btcl +REG_FLAGS
+x86_64 SR-rd-phantom btcq +REG_FLAGS
+x86_64 SR-rd-phantom btcw +REG_FLAGS
+x86_64 SR-rd-phantom btl +REG_FLAGS
+x86_64 SR-rd-phantom btq +REG_FLAGS
+x86_64 SR-rd-phantom btrl +REG_FLAGS
+x86_64 SR-rd-phantom btrq +REG_FLAGS
+x86_64 SR-rd-phantom btrw +REG_FLAGS
+x86_64 SR-rd-phantom btsl +REG_FLAGS
+x86_64 SR-rd-phantom btsq +REG_FLAGS
+x86_64 SR-rd-phantom btsw +REG_FLAGS
+x86_64 SR-rd-phantom btw +REG_FLAGS
+x86_64 SR-rd-phantom cmpxchg16b +REG_FLAGS
+x86_64 SR-rd-phantom cmpxchg8b +REG_FLAGS
+x86_64 SR-rd-phantom cmpxchgb +REG_FP_REG
+x86_64 SR-rd-phantom cmpxchgb +REG_GPR#
+x86_64 SR-rd-phantom cmpxchgb +REG_SP
+x86_64 SR-rd-phantom cmpxchgl +REG_FP_REG
+x86_64 SR-rd-phantom cmpxchgl +REG_GPR#
+x86_64 SR-rd-phantom cmpxchgl +REG_SP
+x86_64 SR-rd-phantom cmpxchgq +REG_FP_REG
+x86_64 SR-rd-phantom cmpxchgq +REG_GPR#
+x86_64 SR-rd-phantom cmpxchgq +REG_SP
+x86_64 SR-rd-phantom cmpxchgw +REG_FP_REG
+x86_64 SR-rd-phantom cmpxchgw +REG_GPR#
+x86_64 SR-rd-phantom cmpxchgw +REG_SP
+x86_64 SR-rd-phantom decb +REG_FLAGS
+x86_64 SR-rd-phantom decl +REG_FLAGS
+x86_64 SR-rd-phantom decq +REG_FLAGS
+x86_64 SR-rd-phantom decw +REG_FLAGS
+x86_64 SR-rd-phantom incb +REG_FLAGS
+x86_64 SR-rd-phantom incl +REG_FLAGS
+x86_64 SR-rd-phantom incq +REG_FLAGS
+x86_64 SR-rd-phantom incsspd +REG_SSP
+x86_64 SR-rd-phantom incsspq +REG_SSP
+x86_64 SR-rd-phantom incw +REG_FLAGS
+x86_64 SR-rd-phantom lahf +REG_GPR#
+x86_64 SR-rd-phantom larl +REG_FLAGS
+x86_64 SR-rd-phantom larl +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom larl +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom larl +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom larq +REG_FLAGS
+x86_64 SR-rd-phantom larq +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom larq +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom larq +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom larw +REG_FLAGS
+x86_64 SR-rd-phantom larw +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom larw +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom larw +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom lsll +REG_FLAGS
+x86_64 SR-rd-phantom lsll +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom lsll +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom lsll +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom lslq +REG_FLAGS
+x86_64 SR-rd-phantom lslq +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom lslq +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom lslq +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom lslw +REG_FLAGS
+x86_64 SR-rd-phantom lslw +REG_FLAGS,REG_FP_REG
+x86_64 SR-rd-phantom lslw +REG_FLAGS,REG_GPR#
+x86_64 SR-rd-phantom lslw +REG_FLAGS,REG_SP
+x86_64 SR-rd-phantom popfq +REG_FLAGS
+x86_64 SR-rd-phantom popfw +REG_FLAGS
+x86_64 SR-rd-phantom rolb +REG_FLAGS
+x86_64 SR-rd-phantom roll +REG_FLAGS
+x86_64 SR-rd-phantom rolq +REG_FLAGS
+x86_64 SR-rd-phantom rolw +REG_FLAGS
+x86_64 SR-rd-phantom rorb +REG_FLAGS
+x86_64 SR-rd-phantom rorl +REG_FLAGS
+x86_64 SR-rd-phantom rorq +REG_FLAGS
+x86_64 SR-rd-phantom rorw +REG_FLAGS
+x86_64 SR-rd-phantom sahf +REG_FLAGS
+x86_64 SR-rd-phantom sarb +REG_FLAGS
+x86_64 SR-rd-phantom sarl +REG_FLAGS
+x86_64 SR-rd-phantom sarq +REG_FLAGS
+x86_64 SR-rd-phantom sarw +REG_FLAGS
+x86_64 SR-rd-phantom shlb +REG_FLAGS
+x86_64 SR-rd-phantom shldl +REG_FLAGS
+x86_64 SR-rd-phantom shldq +REG_FLAGS
+x86_64 SR-rd-phantom shldw +REG_FLAGS
+x86_64 SR-rd-phantom shll +REG_FLAGS
+x86_64 SR-rd-phantom shlq +REG_FLAGS
+x86_64 SR-rd-phantom shlw +REG_FLAGS
+x86_64 SR-rd-phantom shrb +REG_FLAGS
+x86_64 SR-rd-phantom shrdl +REG_FLAGS
+x86_64 SR-rd-phantom shrdq +REG_FLAGS
+x86_64 SR-rd-phantom shrdw +REG_FLAGS
+x86_64 SR-rd-phantom shrl +REG_FLAGS
+x86_64 SR-rd-phantom shrq +REG_FLAGS
+x86_64 SR-rd-phantom shrw +REG_FLAGS
+
+# --- X-STACK: the implicit stack access reads SS and RSP, and LLVM names neither.
+#     19 signature(s), 339935 encodings at this tip.
+#
+# RET, CALL, PUSH, POP, LEAVE and ENTER address memory through RSP with SS as
+# the segment, and neither register appears in the encoding.  QEMU computes the
+# effective address from both, so both reach the read list.  LLVM's
+# MCInstrDesc leaves the implicit stack operands to the target's own lowering
+# and names no register here.
+x86_64 SR-rd-phantom bnd lretl +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom bnd lretq +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom bnd lretw +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom bnd retq +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom bnd retw +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom enter +REG_FP_REG,REG_SP
+x86_64 SR-rd-phantom iretl +REG_FLAGS,REG_SEG5,REG_SP
+x86_64 SR-rd-phantom iretq +REG_FLAGS,REG_SEG5,REG_SP
+x86_64 SR-rd-phantom iretw +REG_FLAGS,REG_SEG5,REG_SP
+x86_64 SR-rd-phantom lretl +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom lretq +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom lretw +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom popq +REG_SP
+x86_64 SR-rd-phantom popw +REG_SP
+x86_64 SR-rd-phantom pushq +REG_SEG3,REG_SP
+x86_64 SR-rd-phantom pushq +REG_SEG4,REG_SP
+x86_64 SR-rd-phantom pushw +REG_SEG3,REG_SP
+x86_64 SR-rd-phantom retq +REG_SEG5,REG_SP
+x86_64 SR-rd-phantom retw +REG_SEG5,REG_SP
+
+# --- X-CR: a control register that gates whether the instruction runs at all.
+#     7 signature(s), 70075 encodings at this tip.
+#
+# FWAIT checks CR0.TS, CR0.MP and CR0.EM before it looks at the x87 status
+# word, and the SSE and XSAVE forms check CR4.OSFXSR / CR4.OSXSAVE the same
+# way.  QEMU states those reads at translation.  LLVM's MCInstrDesc models no
+# control register on any instruction, which is the same structural silence
+# REG_SYSFPEN meets on AArch64.
+x86_64 SR-rd-phantom cpuid +REG_CTRL4
+x86_64 SR-rd-phantom fnop +REG_CTRL0,REG_FCSR
+x86_64 SR-rd-phantom smswl +REG_CTRL0
+x86_64 SR-rd-phantom smswq +REG_CTRL0
+x86_64 SR-rd-phantom smsww +REG_CTRL0
+x86_64 SR-rd-phantom wait +REG_CTRL0,REG_FCSR
+x86_64 SR-rd-phantom xgetbv +REG_CTRL4,REG_SYS
+
+# --- X-FSGS: the FS and GS BASES, which are the only segment bases that are live in 64-bit mode.
+#     9 signature(s), 7200 encodings at this tip.
+#
+# The phantom direction of the segment family: the tracer reads the live base
+# register -- `swapgs`, `rdfsbase`, `wrgsbase`, `maskmovq` -- and LLVM's
+# MCInstrDesc has no operand for the hidden descriptor base.  This is the
+# counterpart to the zero-base override family below, and the discriminator
+# between them is checked: NOT ONE row here is REG_SEG0 / REG_SEG1 / REG_SEG2 /
+# REG_SEG5, and not one row there is REG_SEG3 or REG_SEG4.
+x86_64 SR-rd-phantom maskmovq +REG_SEG3
+x86_64 SR-rd-phantom maskmovq +REG_SEG4
+x86_64 SR-rd-phantom rdfsbasel +REG_SEG3
+x86_64 SR-rd-phantom rdfsbaseq +REG_SEG3
+x86_64 SR-rd-phantom rdgsbasel +REG_SEG4
+x86_64 SR-rd-phantom rdgsbaseq +REG_SEG4
+x86_64 SR-rd-phantom swapgs +REG_SEG4
+x86_64 SR-rd-phantom xlatb +REG_SEG3
+x86_64 SR-rd-phantom xlatb +REG_SEG4
+
+# --- X-UPPERLANE: a legacy scalar or unary SSE form preserves the upper lanes of its destination, so the destination is read.
+#     4 signature(s), 22111 encodings at this tip.
+#
+# R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
+# form survives above the element the instruction writes, so it is an input.
+# LLVM models the preserve as a tied operand on the forms whose assembly
+# repeats the register and not on the rest, so its read set is short by the
+# destination exactly where the tie is absent.
+x86_64 SR-rd-phantom vcvtsi2sdl +REG_VEC#
+x86_64 SR-rd-phantom vcvtsi2sdq +REG_VEC#
+x86_64 SR-rd-phantom vmovhpd +REG_VEC#
+x86_64 SR-rd-phantom vmovhps +REG_VEC#
+
+# --- X-CONSTCOUNT: a rotate-through-carry by an immediate ZERO reads nothing, and LLVM's description is per-opcode.
+#     8 signature(s), 10730 encodings at this tip.
+#
+# RCL and RCR with a masked count of zero do not rotate and do not touch the
+# flags (Intel SDM Vol. 2B, RCL/RCR), so QEMU's translator folds the whole
+# operation away at translation time and reads no flag.  Measured on the same
+# tool: `rclb $3, (%rdx)` (--hex=c01203) DOES read REG_FLAGS on both sides, so
+# the disagreement is confined to the immediate-zero encodings.  LLVM's
+# MCInstrDesc is keyed on the OPCODE and cannot say "reads CF unless the
+# immediate is zero", so it names the use unconditionally.
+x86_64 SR-rd-missing rclb +REG_FLAGS
+x86_64 SR-rd-missing rcll +REG_FLAGS
+x86_64 SR-rd-missing rclq +REG_FLAGS
+x86_64 SR-rd-missing rclw +REG_FLAGS
+x86_64 SR-rd-missing rcrb +REG_FLAGS
+x86_64 SR-rd-missing rcrl +REG_FLAGS
+x86_64 SR-rd-missing rcrq +REG_FLAGS
+x86_64 SR-rd-missing rcrw +REG_FLAGS
+
+# --- X-X87OPERAND: the x87 operand LLVM attaches and the hardware does not consult.
+#     11 signature(s), 14230 encodings at this tip.
+#
+# FFREE / FFREEP mark a stack slot EMPTY in the tag word; they do not read the
+# value in it.  FLD / FST / FSTP / FXCH between registers, FLD1 / FLDZ and the
+# m80 FLDT / FSTPT pair move a bit pattern without rounding it, so they do not
+# consult the control word either -- the same sixteen pure moves 0acd1e32e5
+# resolved through QEMU's call graph and left OUT of the x87 control-word read
+# set on purpose.  LLVM attaches the use anyway, uniformly across the x87
+# tables.  The tracer's set is the derived one.
+x86_64 SR-rd-missing ffreep +REG_FPR#
+x86_64 SR-rd-missing fld +REG_FPCW
+x86_64 SR-rd-missing fld1 +REG_FPCW
+x86_64 SR-rd-missing fldt +REG_FPCW
+x86_64 SR-rd-missing fldz +REG_FPCW
+x86_64 SR-rd-missing fst +REG_FPCW
+x86_64 SR-rd-missing fst +REG_FPCW,REG_FPR#
+x86_64 SR-rd-missing fstp +REG_FPCW
+x86_64 SR-rd-missing fstp +REG_FPCW,REG_FPR#
+x86_64 SR-rd-missing fstpt +REG_FPCW
+x86_64 SR-rd-missing fxch +REG_FPCW
+
+# --- X-IMPLICITGPR: the implicit GPR operands of the monitor / wait / key family.
+#     16 signature(s), 28790 encodings at this tip.
+#
+# MONITORX, MWAITX, PCONFIG, RDPKRU, WRPKRU, TPAUSE and UMWAIT take implicit
+# operands in fixed GPRs, and which of those the instruction READS depends on
+# the leaf the register selects.  QEMU implements the leaf it models and reads
+# what that leaf needs; LLVM's MCInstrDesc names the whole implicit set for the
+# opcode.  The residue is the difference between a modelled leaf and a named
+# one, and the tracer's is the read that happens.
+x86_64 SR-rd-missing monitorx +REG_GPR#
+x86_64 SR-rd-missing mwaitx +REG_GPR#
+x86_64 SR-rd-missing pconfig +REG_GPR#
+x86_64 SR-rd-missing rdpkru +REG_GPR#
+x86_64 SR-rd-missing tpause +REG_GPR#
+x86_64 SR-rd-missing umwait +REG_GPR#
+x86_64 SR-rd-missing wrpkru +REG_GPR#
+x86_64 SR-rd-phantom encls +REG_GPR#
+x86_64 SR-rd-phantom enclu +REG_GPR#
+x86_64 SR-rd-phantom enclv +REG_GPR#
+x86_64 SR-rd-phantom sysexitl +REG_GPR#
+x86_64 SR-rd-phantom sysexitq +REG_GPR#
+x86_64 SR-rd-phantom sysretl +REG_GPR#
+x86_64 SR-rd-phantom sysretq +REG_GPR#
+x86_64 SR-rd-phantom vmfunc +REG_GPR#
+x86_64 SR-rd-phantom xgetbv +REG_SYS
+
+# --- X-SSP: the shadow-stack pointer, which the reference names as a GPR or not at all.
+#     11 signature(s), 5134 encodings at this tip.
+#
+# RDSSPD / RDSSPQ read SSP into a GPR; with CET off they are NOPs, which is why
+# LLVM models the destination as SURVIVING and therefore read, while the
+# tracer names the architectural source.  The remaining SSP rows are the CET
+# instructions whose shadow-stack access the encoding does not name.  This is
+# the `SR-` face of family (g) in the FR block above.
+x86_64 SR-rd-missing rdsspd +REG_FP_REG
+x86_64 SR-rd-missing rdsspd +REG_GPR#
+x86_64 SR-rd-missing rdsspd +REG_SP
+x86_64 SR-rd-missing rdsspq +REG_FP_REG
+x86_64 SR-rd-missing rdsspq +REG_GPR#
+x86_64 SR-rd-missing rdsspq +REG_SP
+x86_64 SR-rd-phantom rdsspd +REG_SSP
+x86_64 SR-rd-phantom rdsspq +REG_SSP
+x86_64 SR-rd-phantom rstorssp +REG_SSP
+x86_64 SR-rd-phantom saveprevssp +REG_SSP
+x86_64 SR-rd-phantom setssbsy +REG_SSP,REG_SYS
+
+# --- X-MSR: the model-specific or descriptor-table register an INDEX selects.
+#     27 signature(s), 86866 encodings at this tip.
+#
+# RDMSR / WRMSR address a register by an index in ECX and LLVM's description
+# says only that they move EDX:EAX; LLDT / LTR / SGDT / SIDT reach the
+# descriptor-table registers the same way.  There is no register operand for
+# the reference to name.  This is the boundary file's own
+# `x86_64 SR-rd-phantom * +REG_SYS*` argument at this layer.
+x86_64 SR-rd-phantom lldtw +REG_SYSMMU
+x86_64 SR-rd-phantom ltrw +REG_SYSMMU
+x86_64 SR-rd-phantom rdmsr +REG_SYS
+x86_64 SR-rd-phantom rdpid +REG_SYS
+x86_64 SR-rd-phantom rdpmc +REG_SYS
+x86_64 SR-rd-phantom rdtsc +REG_SYSTIMER
+x86_64 SR-rd-phantom rdtscp +REG_SYS,REG_SYSTIMER
+x86_64 SR-rd-phantom sgdtq +REG_SYSMMU
+x86_64 SR-rd-phantom sidtq +REG_SYSMMU
+x86_64 SR-rd-phantom sldtl +REG_SYSMMU
+x86_64 SR-rd-phantom sldtq +REG_SYSMMU
+x86_64 SR-rd-phantom sldtw +REG_SYSMMU
+x86_64 SR-rd-phantom strl +REG_SYSMMU
+x86_64 SR-rd-phantom strq +REG_SYSMMU
+x86_64 SR-rd-phantom strw +REG_SYSMMU
+x86_64 SR-rd-phantom xrstor +REG_SYS
+x86_64 SR-rd-phantom xrstor64 +REG_SYS
+x86_64 SR-rd-phantom xrstors +REG_SYS
+x86_64 SR-rd-phantom xrstors64 +REG_SYS
+x86_64 SR-rd-phantom xsave +REG_SYS
+x86_64 SR-rd-phantom xsave64 +REG_SYS
+x86_64 SR-rd-phantom xsavec +REG_SYS
+x86_64 SR-rd-phantom xsavec64 +REG_SYS
+x86_64 SR-rd-phantom xsaveopt +REG_SYS
+x86_64 SR-rd-phantom xsaveopt64 +REG_SYS
+x86_64 SR-rd-phantom xsaves +REG_SYS
+x86_64 SR-rd-phantom xsaves64 +REG_SYS
+
+# --- X-SELFRELOAD: QEMU re-reads the control word the instruction just WROTE, to re-derive its softfloat state.
+#     4 signature(s), 21952 encodings, NOT ALLOWLISTED.
+#     An allowlist row asserts the tracer is right; these stay red.
+#     x86_64 SR-rd-phantom fldcw +REG_FPCW
+#     x86_64 SR-rd-phantom fldenv +REG_FCSR,REG_FPCW
+#     x86_64 SR-rd-phantom ldmxcsr +REG_FCSR
+#     x86_64 SR-rd-phantom vldmxcsr +REG_FCSR
+
+# --- X-ADDRONLY: a hint whose memory operand is an ADDRESS the instruction computes and does not dereference.
+#     6 signature(s), 9622 encodings at this tip.
+#
+# CLDEMOTE, PREFETCH* and the multi-byte NOP r/m all carry a ModRM memory
+# operand whose EFFECTIVE ADDRESS is formed -- that is what the base register
+# is for -- and whose contents are never touched.  QEMU forms the address, so
+# the base register reaches the read list.  LLVM's MCInstrDesc models the
+# operand as ignored and names no use, which is true of the DATA and false of
+# the ADDRESS.
+x86_64 SR-rd-phantom cldemote +REG_GPR#
+x86_64 SR-rd-phantom nopl +REG_GPR#
+x86_64 SR-rd-phantom nopq +REG_FP_REG
+x86_64 SR-rd-phantom nopq +REG_GPR#
+x86_64 SR-rd-phantom nopq +REG_SP
+x86_64 SR-rd-phantom nopw +REG_GPR#
+
+# --- X-X87STATE: the x87 status word and the stack slot ST(0) resolves to, neither of which the reference names.
+#     10 signature(s), 9712 encodings at this tip.
+#
+# The x87 status word carries the condition codes AND the stack top, so an
+# instruction that sets C0-C3 read-modify-writes it and an instruction that
+# names ST(i) must read the top to resolve i to a physical slot.  QEMU does
+# both.  LLVM's MCInstrDesc names the architectural ST register and no status
+# word at all.  STMXCSR and VSTMXCSR are the same silence from the other end:
+# they STORE MXCSR, so reading it is the whole instruction, and LLVM still
+# carries no use for it.
+x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom fcoms +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom ficoml +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom ficoms +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom fistl +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom fists +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom fstl +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom fsts +REG_FCSR,REG_FPR#
+x86_64 SR-rd-phantom stmxcsr +REG_FCSR
+x86_64 SR-rd-phantom vstmxcsr +REG_FCSR
+
+# --- A-FROZEN: a FIXED survivor row froze the deriving corpus's own base register -- FINDING 71-B.
+#     1 signature(s), 1456 encodings, NOT ALLOWLISTED.
+#     An allowlist row asserts the tracer is right; these stay red.
+#     aarch64 SR-rd-phantom prfum +REG_SP
+
+# --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
+#     1062 signature(s), 710456 encodings at this tip.
+#
+# Every FP, AdvSIMD, SVE and SME instruction runs an architectural enable check
+# before it does anything -- CheckFPAdvSIMDEnabled, CheckSVEEnabled,
+# CheckSMEEnabled (Arm ARM DDI 0487) -- and that check READS CPACR_EL1.FPEN and
+# the CPTR_EL{2,3} traps.  QEMU states the read at translation time
+# (fp_access_check() / sve_access_check() in target/arm/tcg/translate-a64.c),
+# so it reaches the wire's ordered read list on the whole FP population.
+# REG_SYSFPEN exists because that population is every FP instruction in the
+# ISA: folded into the residual REG_SYS, one TTBR write would order all of them
+# behind it.  LLVM's MCInstrDesc models no enable check on any instruction, so
+# this is a phantom by construction and not a disagreement about dataflow.
+#
+# Where the qualifier names REG_VEC# beside the gate, the extra register is the
+# instruction's own DESTINATION, read for the same reason the RVV block above
+# gives: the predicated and merging forms leave the inactive elements of Zd
+# standing, so Zd is a source.  Where it names REG_FCSR the register is FPSR,
+# whose QC bit these forms make STICKY -- read-modify-written, not written --
+# and where it names REG_FPCW it is FPCR, the control word every FP instruction
+# reads.
+aarch64 SR-rd-phantom abs +REG_SYSFPEN
+aarch64 SR-rd-phantom adclb +REG_SYSFPEN
+aarch64 SR-rd-phantom adclt +REG_SYSFPEN
+aarch64 SR-rd-phantom add +REG_SYSFPEN
+aarch64 SR-rd-phantom addha +REG_SYSFPEN
+aarch64 SR-rd-phantom addhn +REG_SYSFPEN
+aarch64 SR-rd-phantom addhn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom addhnb +REG_SYSFPEN
+aarch64 SR-rd-phantom addhnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom addhnt +REG_SYSFPEN
+aarch64 SR-rd-phantom addp +REG_SYSFPEN
+aarch64 SR-rd-phantom addp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom addpl +REG_SYSFPEN
+aarch64 SR-rd-phantom addpt +REG_SYSFPEN
+aarch64 SR-rd-phantom addqv +REG_SYSFPEN
+aarch64 SR-rd-phantom addspl +REG_SYSFPEN
+aarch64 SR-rd-phantom addsvl +REG_SYSFPEN
+aarch64 SR-rd-phantom addv +REG_SYSFPEN
+aarch64 SR-rd-phantom addva +REG_SYSFPEN
+aarch64 SR-rd-phantom addvl +REG_SYSFPEN
+aarch64 SR-rd-phantom adr +REG_SYSFPEN
+aarch64 SR-rd-phantom adr +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom aesd +REG_SYSFPEN
+aarch64 SR-rd-phantom aese +REG_SYSFPEN
+aarch64 SR-rd-phantom aesimc +REG_SYSFPEN
+aarch64 SR-rd-phantom aesimc +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom aesmc +REG_SYSFPEN
+aarch64 SR-rd-phantom aesmc +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom and +REG_SYSFPEN
+aarch64 SR-rd-phantom andqv +REG_SYSFPEN
+aarch64 SR-rd-phantom ands +REG_SYSFPEN
+aarch64 SR-rd-phantom andv +REG_SYSFPEN
+aarch64 SR-rd-phantom asr +REG_SYSFPEN
+aarch64 SR-rd-phantom asrd +REG_SYSFPEN
+aarch64 SR-rd-phantom asrr +REG_SYSFPEN
+aarch64 SR-rd-phantom bcax +REG_SYSFPEN
+aarch64 SR-rd-phantom bdep +REG_SYSFPEN
+aarch64 SR-rd-phantom bdep +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom bext +REG_SYSFPEN
+aarch64 SR-rd-phantom bext +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom bf1cvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf1cvtl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf1cvtl2 +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf1cvtlt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf2cvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf2cvtl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf2cvtl2 +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bf2cvtlt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfadd +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfclamp +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvtn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvtn +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvtn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom bfcvtnt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfdot +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfdot +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmax +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmaxnm +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmin +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfminnm +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmla +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlalb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlalb +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlalt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlalt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmls +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlsl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlslb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmlslt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmmla +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmopa +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfmul +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfsub +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bfvdot +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom bgrp +REG_SYSFPEN
+aarch64 SR-rd-phantom bgrp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom bic +REG_SYSFPEN
+aarch64 SR-rd-phantom bics +REG_SYSFPEN
+aarch64 SR-rd-phantom bif +REG_SYSFPEN
+aarch64 SR-rd-phantom bit +REG_SYSFPEN
+aarch64 SR-rd-phantom brka +REG_SYSFPEN
+aarch64 SR-rd-phantom brkas +REG_SYSFPEN
+aarch64 SR-rd-phantom brkb +REG_SYSFPEN
+aarch64 SR-rd-phantom brkbs +REG_SYSFPEN
+aarch64 SR-rd-phantom brkn +REG_SYSFPEN
+aarch64 SR-rd-phantom brkns +REG_SYSFPEN
+aarch64 SR-rd-phantom brkpa +REG_SYSFPEN
+aarch64 SR-rd-phantom brkpas +REG_SYSFPEN
+aarch64 SR-rd-phantom brkpb +REG_SYSFPEN
+aarch64 SR-rd-phantom brkpbs +REG_SYSFPEN
+aarch64 SR-rd-phantom bsl +REG_SYSFPEN
+aarch64 SR-rd-phantom bsl1n +REG_SYSFPEN
+aarch64 SR-rd-phantom bsl2n +REG_SYSFPEN
+aarch64 SR-rd-phantom cadd +REG_SYSFPEN
+aarch64 SR-rd-phantom cdot +REG_SYSFPEN
+aarch64 SR-rd-phantom clasta +REG_SYSFPEN
+aarch64 SR-rd-phantom clastb +REG_SYSFPEN
+aarch64 SR-rd-phantom cls +REG_SYSFPEN
+aarch64 SR-rd-phantom clz +REG_SYSFPEN
+aarch64 SR-rd-phantom cmeq +REG_SYSFPEN
+aarch64 SR-rd-phantom cmge +REG_SYSFPEN
+aarch64 SR-rd-phantom cmgt +REG_SYSFPEN
+aarch64 SR-rd-phantom cmhi +REG_SYSFPEN
+aarch64 SR-rd-phantom cmhs +REG_SYSFPEN
+aarch64 SR-rd-phantom cmla +REG_SYSFPEN
+aarch64 SR-rd-phantom cmle +REG_SYSFPEN
+aarch64 SR-rd-phantom cmlt +REG_SYSFPEN
+aarch64 SR-rd-phantom cmpeq +REG_SYSFPEN
+aarch64 SR-rd-phantom cmpge +REG_SYSFPEN
+aarch64 SR-rd-phantom cmpgt +REG_SYSFPEN
+aarch64 SR-rd-phantom cmphi +REG_SYSFPEN
+aarch64 SR-rd-phantom cmphs +REG_SYSFPEN
+aarch64 SR-rd-phantom cmple +REG_SYSFPEN
+aarch64 SR-rd-phantom cmplo +REG_SYSFPEN
+aarch64 SR-rd-phantom cmpls +REG_SYSFPEN
+aarch64 SR-rd-phantom cmplt +REG_SYSFPEN
+aarch64 SR-rd-phantom cmpne +REG_SYSFPEN
+aarch64 SR-rd-phantom cmtst +REG_SYSFPEN
+aarch64 SR-rd-phantom cnot +REG_SYSFPEN
+aarch64 SR-rd-phantom cnt +REG_SYSFPEN
+aarch64 SR-rd-phantom cnt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom cntb +REG_SYSFPEN
+aarch64 SR-rd-phantom cntd +REG_SYSFPEN
+aarch64 SR-rd-phantom cnth +REG_SYSFPEN
+aarch64 SR-rd-phantom cntp +REG_SYSFPEN
+aarch64 SR-rd-phantom cntw +REG_SYSFPEN
+aarch64 SR-rd-phantom compact +REG_SYSFPEN
+aarch64 SR-rd-phantom compact +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ctermeq +REG_FLAGS,REG_SYSFPEN
+aarch64 SR-rd-phantom decb +REG_SYSFPEN
+aarch64 SR-rd-phantom decd +REG_SYSFPEN
+aarch64 SR-rd-phantom dech +REG_SYSFPEN
+aarch64 SR-rd-phantom decp +REG_SYSFPEN
+aarch64 SR-rd-phantom decw +REG_SYSFPEN
+aarch64 SR-rd-phantom dup +REG_SYSFPEN
+aarch64 SR-rd-phantom dupm +REG_SYSFPEN
+aarch64 SR-rd-phantom dupq +REG_SYSFPEN
+aarch64 SR-rd-phantom eor +REG_SYSFPEN
+aarch64 SR-rd-phantom eor3 +REG_SYSFPEN
+aarch64 SR-rd-phantom eorbt +REG_SYSFPEN
+aarch64 SR-rd-phantom eorqv +REG_SYSFPEN
+aarch64 SR-rd-phantom eors +REG_SYSFPEN
+aarch64 SR-rd-phantom eortb +REG_SYSFPEN
+aarch64 SR-rd-phantom eorv +REG_SYSFPEN
+aarch64 SR-rd-phantom ext +REG_SYSFPEN
+aarch64 SR-rd-phantom extq +REG_SYSFPEN
+aarch64 SR-rd-phantom f1cvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f1cvtl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f1cvtl2 +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f1cvtlt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f2cvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f2cvtl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f2cvtl2 +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom f2cvtlt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fabd +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fabd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fabd +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fabs +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fabs +REG_SYSFPEN
+aarch64 SR-rd-phantom facge +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom facge +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom facge +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom facgt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom facgt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom facgt +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fadd +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fadd +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fadd +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fadd +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fadda +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom faddp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom faddp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom faddp +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom faddqv +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom faddv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom famax +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom famax +REG_SYSFPEN
+aarch64 SR-rd-phantom famin +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom famin +REG_SYSFPEN
+aarch64 SR-rd-phantom fcadd +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcadd +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fccmp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fccmpe +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fclamp +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmeq +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmeq +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmeq +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcmge +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmge +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmge +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcmgt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmgt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmgt +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcmla +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmla +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmle +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmle +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmle +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcmlt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmlt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmlt +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcmne +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcmuo +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcsel +REG_SYSFPEN
+aarch64 SR-rd-phantom fcvt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtas +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtas +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtau +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtau +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtl +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtl2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtlt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtms +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtms +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtmu +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtmu +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtn +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtn2 +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtnb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtns +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtns +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtnt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtnt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtnu +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtnu +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtps +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtps +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtpu +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtpu +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtx +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtxn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtxn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtxnt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtzs +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtzs +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtzs +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fcvtzs +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fcvtzu +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fdiv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fdiv +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fdiv +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fdivr +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fdot +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fexpa +REG_SYSFPEN
+aarch64 SR-rd-phantom fexpa +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fjcvtzs +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom flogb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmad +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmax +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmax +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmax +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmaxnm +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnm +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnm +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmaxnmp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnmp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnmp +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmaxnmqv +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnmv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxnmv +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxp +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmaxqv +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmaxv +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmin +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmin +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmin +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmin +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnm +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnm +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnm +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fminnm +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnmp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnmp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnmp +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fminnmqv +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnmv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminnmv +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fminp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fminp +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fminqv +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminv +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fminv +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmla +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmla +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmla +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlal +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlal +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlal2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlall +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlallbb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlallbt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalltb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalltt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlalt +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmls +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmls +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmls +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlsl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlsl2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlslb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmlslt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmmla +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmopa +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmov +REG_SYSFPEN
+aarch64 SR-rd-phantom fmsb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmsub +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmul +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmul +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmul +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmul +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fmulx +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fmulx +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fmulx +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fneg +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fneg +REG_SYSFPEN
+aarch64 SR-rd-phantom fnmad +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmla +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmls +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmsb +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmsub +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fnmul +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frecpe +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frecpe +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frecpe +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frecpe +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frecps +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frecps +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frecps +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frecps +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frecpx +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frecpx +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frint32x +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frint32z +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frint64x +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frint64z +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frinta +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frinta +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frinta +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frinti +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frinti +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frintm +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintm +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frintm +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintn +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frintn +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintp +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintp +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frintp +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintx +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintx +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frintz +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frintz +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frsqrte +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frsqrte +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frsqrte +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frsqrte +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frsqrts +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom frsqrts +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom frsqrts +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom frsqrts +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fscale +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fscale +REG_SYSFPEN
+aarch64 SR-rd-phantom fsqrt +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fsqrt +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fsub +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fsub +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fsub +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom fsub +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fsubr +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom ftmad +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom ftsmul +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom ftsmul +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ftssel +REG_SYSFPEN
+aarch64 SR-rd-phantom ftssel +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom fvdot +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fvdotb +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom fvdott +REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom histcnt +REG_SYSFPEN
+aarch64 SR-rd-phantom histcnt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom histseg +REG_SYSFPEN
+aarch64 SR-rd-phantom histseg +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom incb +REG_SYSFPEN
+aarch64 SR-rd-phantom incd +REG_SYSFPEN
+aarch64 SR-rd-phantom inch +REG_SYSFPEN
+aarch64 SR-rd-phantom incp +REG_SYSFPEN
+aarch64 SR-rd-phantom incw +REG_SYSFPEN
+aarch64 SR-rd-phantom index +REG_SYSFPEN
+aarch64 SR-rd-phantom insr +REG_SYSFPEN
+aarch64 SR-rd-phantom lasta +REG_SYSFPEN
+aarch64 SR-rd-phantom lastb +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1 +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1b +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1d +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1h +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1q +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1r +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1rb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rd +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rob +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rod +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1roh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1row +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rqb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rqd +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rqh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rqw +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rsb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rsh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rsw +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1rw +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ld1sb +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1sh +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1sw +REG_SYSFPEN
+aarch64 SR-rd-phantom ld1w +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2 +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2b +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2d +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2h +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2q +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2r +REG_SYSFPEN
+aarch64 SR-rd-phantom ld2w +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3 +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3b +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3d +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3h +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3q +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3r +REG_SYSFPEN
+aarch64 SR-rd-phantom ld3w +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4 +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4b +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4d +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4h +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4q +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4r +REG_SYSFPEN
+aarch64 SR-rd-phantom ld4w +REG_SYSFPEN
+aarch64 SR-rd-phantom ldap1 +REG_SYSFPEN
+aarch64 SR-rd-phantom ldapur +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1b +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1d +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1h +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1sb +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1sh +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1sw +REG_SYSFPEN
+aarch64 SR-rd-phantom ldff1w +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1b +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1d +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1h +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1sb +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1sh +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1sw +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnf1w +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1b +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1d +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1h +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1sb +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1sh +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1sw +REG_SYSFPEN
+aarch64 SR-rd-phantom ldnt1w +REG_SYSFPEN
+aarch64 SR-rd-phantom ldur +REG_SYSFPEN
+aarch64 SR-rd-phantom lsl +REG_SYSFPEN
+aarch64 SR-rd-phantom lslr +REG_SYSFPEN
+aarch64 SR-rd-phantom lsr +REG_SYSFPEN
+aarch64 SR-rd-phantom lsrr +REG_SYSFPEN
+aarch64 SR-rd-phantom luti2 +REG_SYSFPEN
+aarch64 SR-rd-phantom luti2 +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom luti4 +REG_SYSFPEN
+aarch64 SR-rd-phantom luti4 +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom mad +REG_SYSFPEN
+aarch64 SR-rd-phantom madpt +REG_SYSFPEN
+aarch64 SR-rd-phantom match +REG_SYSFPEN
+aarch64 SR-rd-phantom mla +REG_SYSFPEN
+aarch64 SR-rd-phantom mlapt +REG_SYSFPEN
+aarch64 SR-rd-phantom mls +REG_SYSFPEN
+aarch64 SR-rd-phantom mov +REG_SYSFPEN
+aarch64 SR-rd-phantom mov +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom movaz +REG_SYSFPEN
+aarch64 SR-rd-phantom movi +REG_SYSFPEN
+aarch64 SR-rd-phantom movprfx +REG_SYSFPEN
+aarch64 SR-rd-phantom movprfx +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom movs +REG_SYSFPEN
+aarch64 SR-rd-phantom movt +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom mrs +REG_SYSFPEN
+aarch64 SR-rd-phantom msb +REG_SYSFPEN
+aarch64 SR-rd-phantom mul +REG_SYSFPEN
+aarch64 SR-rd-phantom mul +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom mvni +REG_SYSFPEN
+aarch64 SR-rd-phantom nand +REG_SYSFPEN
+aarch64 SR-rd-phantom nands +REG_SYSFPEN
+aarch64 SR-rd-phantom nbsl +REG_SYSFPEN
+aarch64 SR-rd-phantom neg +REG_SYSFPEN
+aarch64 SR-rd-phantom nmatch +REG_SYSFPEN
+aarch64 SR-rd-phantom nor +REG_SYSFPEN
+aarch64 SR-rd-phantom nors +REG_SYSFPEN
+aarch64 SR-rd-phantom not +REG_SYSFPEN
+aarch64 SR-rd-phantom nots +REG_SYSFPEN
+aarch64 SR-rd-phantom orn +REG_SYSFPEN
+aarch64 SR-rd-phantom orns +REG_SYSFPEN
+aarch64 SR-rd-phantom orqv +REG_SYSFPEN
+aarch64 SR-rd-phantom orr +REG_SYSFPEN
+aarch64 SR-rd-phantom orrs +REG_SYSFPEN
+aarch64 SR-rd-phantom orv +REG_SYSFPEN
+aarch64 SR-rd-phantom pext +REG_SYSFPEN
+aarch64 SR-rd-phantom pfalse +REG_SYSFPEN
+aarch64 SR-rd-phantom pfirst +REG_SYSFPEN
+aarch64 SR-rd-phantom pmov +REG_SYSFPEN
+aarch64 SR-rd-phantom pmul +REG_SYSFPEN
+aarch64 SR-rd-phantom pmul +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom pmull +REG_SYSFPEN
+aarch64 SR-rd-phantom pmull +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom pmull2 +REG_SYSFPEN
+aarch64 SR-rd-phantom pmull2 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom pmullb +REG_SYSFPEN
+aarch64 SR-rd-phantom pmullb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom pmullt +REG_SYSFPEN
+aarch64 SR-rd-phantom pmullt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom pnext +REG_SYSFPEN
+aarch64 SR-rd-phantom prfb +REG_SYSFPEN
+aarch64 SR-rd-phantom prfd +REG_SYSFPEN
+aarch64 SR-rd-phantom prfh +REG_SYSFPEN
+aarch64 SR-rd-phantom prfw +REG_SYSFPEN
+aarch64 SR-rd-phantom psel +REG_SYSFPEN
+aarch64 SR-rd-phantom ptest +REG_SYSFPEN
+aarch64 SR-rd-phantom ptrue +REG_SYSFPEN
+aarch64 SR-rd-phantom ptrues +REG_SYSFPEN
+aarch64 SR-rd-phantom punpkhi +REG_SYSFPEN
+aarch64 SR-rd-phantom punpklo +REG_SYSFPEN
+aarch64 SR-rd-phantom raddhn +REG_SYSFPEN
+aarch64 SR-rd-phantom raddhn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom raddhnb +REG_SYSFPEN
+aarch64 SR-rd-phantom raddhnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom raddhnt +REG_SYSFPEN
+aarch64 SR-rd-phantom rax1 +REG_SYSFPEN
+aarch64 SR-rd-phantom rbit +REG_SYSFPEN
+aarch64 SR-rd-phantom rbit +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom rdffr +REG_SYSFPEN
+aarch64 SR-rd-phantom rdffrs +REG_SYSFPEN
+aarch64 SR-rd-phantom rdsvl +REG_SYSFPEN
+aarch64 SR-rd-phantom rdvl +REG_SYSFPEN
+aarch64 SR-rd-phantom rev +REG_SYSFPEN
+aarch64 SR-rd-phantom rev +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom rev16 +REG_SYSFPEN
+aarch64 SR-rd-phantom rev32 +REG_SYSFPEN
+aarch64 SR-rd-phantom rev64 +REG_SYSFPEN
+aarch64 SR-rd-phantom revb +REG_SYSFPEN
+aarch64 SR-rd-phantom revd +REG_SYSFPEN
+aarch64 SR-rd-phantom revh +REG_SYSFPEN
+aarch64 SR-rd-phantom revw +REG_SYSFPEN
+aarch64 SR-rd-phantom rshrn +REG_SYSFPEN
+aarch64 SR-rd-phantom rshrn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom rshrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom rshrnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom rshrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom rsubhn +REG_SYSFPEN
+aarch64 SR-rd-phantom rsubhn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom rsubhnb +REG_SYSFPEN
+aarch64 SR-rd-phantom rsubhnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom rsubhnt +REG_SYSFPEN
+aarch64 SR-rd-phantom saba +REG_SYSFPEN
+aarch64 SR-rd-phantom sabal +REG_SYSFPEN
+aarch64 SR-rd-phantom sabal2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sabalb +REG_SYSFPEN
+aarch64 SR-rd-phantom sabalt +REG_SYSFPEN
+aarch64 SR-rd-phantom sabd +REG_SYSFPEN
+aarch64 SR-rd-phantom sabdl +REG_SYSFPEN
+aarch64 SR-rd-phantom sabdl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sabdlb +REG_SYSFPEN
+aarch64 SR-rd-phantom sabdlb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sabdlt +REG_SYSFPEN
+aarch64 SR-rd-phantom sabdlt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sadalp +REG_SYSFPEN
+aarch64 SR-rd-phantom saddl +REG_SYSFPEN
+aarch64 SR-rd-phantom saddl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom saddlb +REG_SYSFPEN
+aarch64 SR-rd-phantom saddlb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom saddlbt +REG_SYSFPEN
+aarch64 SR-rd-phantom saddlbt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom saddlp +REG_SYSFPEN
+aarch64 SR-rd-phantom saddlt +REG_SYSFPEN
+aarch64 SR-rd-phantom saddlt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom saddlv +REG_SYSFPEN
+aarch64 SR-rd-phantom saddv +REG_SYSFPEN
+aarch64 SR-rd-phantom saddw +REG_SYSFPEN
+aarch64 SR-rd-phantom saddw2 +REG_SYSFPEN
+aarch64 SR-rd-phantom saddwb +REG_SYSFPEN
+aarch64 SR-rd-phantom saddwb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom saddwt +REG_SYSFPEN
+aarch64 SR-rd-phantom saddwt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sbclb +REG_SYSFPEN
+aarch64 SR-rd-phantom sbclt +REG_SYSFPEN
+aarch64 SR-rd-phantom sclamp +REG_SYSFPEN
+aarch64 SR-rd-phantom scvtf +REG_FCSR,REG_FPCW,REG_SYSFPEN
+aarch64 SR-rd-phantom scvtf +REG_FCSR,REG_FPCW,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom scvtf +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom scvtf +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sdiv +REG_SYSFPEN
+aarch64 SR-rd-phantom sdivr +REG_SYSFPEN
+aarch64 SR-rd-phantom sdot +REG_SYSFPEN
+aarch64 SR-rd-phantom sel +REG_SYSFPEN
+aarch64 SR-rd-phantom sel +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom setffr +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1c +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1h +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1h +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sha1m +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1p +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1su0 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha1su1 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha256h +REG_SYSFPEN
+aarch64 SR-rd-phantom sha256h2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha256su0 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha256su1 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha512h +REG_SYSFPEN
+aarch64 SR-rd-phantom sha512h2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha512su0 +REG_SYSFPEN
+aarch64 SR-rd-phantom sha512su1 +REG_SYSFPEN
+aarch64 SR-rd-phantom shadd +REG_SYSFPEN
+aarch64 SR-rd-phantom shl +REG_SYSFPEN
+aarch64 SR-rd-phantom shll +REG_SYSFPEN
+aarch64 SR-rd-phantom shll2 +REG_SYSFPEN
+aarch64 SR-rd-phantom shrn +REG_SYSFPEN
+aarch64 SR-rd-phantom shrn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom shrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom shrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom shsub +REG_SYSFPEN
+aarch64 SR-rd-phantom shsubr +REG_SYSFPEN
+aarch64 SR-rd-phantom sli +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3partw1 +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3partw2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3ss1 +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3tt1a +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3tt1b +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3tt2a +REG_SYSFPEN
+aarch64 SR-rd-phantom sm3tt2b +REG_SYSFPEN
+aarch64 SR-rd-phantom sm4e +REG_SYSFPEN
+aarch64 SR-rd-phantom sm4ekey +REG_SYSFPEN
+aarch64 SR-rd-phantom sm4ekey +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom smax +REG_SYSFPEN
+aarch64 SR-rd-phantom smaxp +REG_SYSFPEN
+aarch64 SR-rd-phantom smaxp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom smaxqv +REG_SYSFPEN
+aarch64 SR-rd-phantom smaxv +REG_SYSFPEN
+aarch64 SR-rd-phantom smin +REG_SYSFPEN
+aarch64 SR-rd-phantom sminp +REG_SYSFPEN
+aarch64 SR-rd-phantom sminp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sminqv +REG_SYSFPEN
+aarch64 SR-rd-phantom sminv +REG_SYSFPEN
+aarch64 SR-rd-phantom smlal +REG_SYSFPEN
+aarch64 SR-rd-phantom smlal2 +REG_SYSFPEN
+aarch64 SR-rd-phantom smlalb +REG_SYSFPEN
+aarch64 SR-rd-phantom smlall +REG_SYSFPEN
+aarch64 SR-rd-phantom smlalt +REG_SYSFPEN
+aarch64 SR-rd-phantom smlsl +REG_SYSFPEN
+aarch64 SR-rd-phantom smlsl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom smlslb +REG_SYSFPEN
+aarch64 SR-rd-phantom smlslt +REG_SYSFPEN
+aarch64 SR-rd-phantom smmla +REG_SYSFPEN
+aarch64 SR-rd-phantom smopa +REG_SYSFPEN
+aarch64 SR-rd-phantom smov +REG_SYSFPEN
+aarch64 SR-rd-phantom smstart +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom smstop +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom smulh +REG_SYSFPEN
+aarch64 SR-rd-phantom smulh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom smull +REG_SYSFPEN
+aarch64 SR-rd-phantom smull2 +REG_SYSFPEN
+aarch64 SR-rd-phantom smullb +REG_SYSFPEN
+aarch64 SR-rd-phantom smullb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom smullt +REG_SYSFPEN
+aarch64 SR-rd-phantom smullt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom splice +REG_SYSFPEN
+aarch64 SR-rd-phantom splice +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqabs +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqabs +REG_SYSFPEN
+aarch64 SR-rd-phantom sqadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqadd +REG_SYSFPEN
+aarch64 SR-rd-phantom sqcadd +REG_SYSFPEN
+aarch64 SR-rd-phantom sqcvt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqcvtn +REG_SYSFPEN
+aarch64 SR-rd-phantom sqcvtu +REG_SYSFPEN
+aarch64 SR-rd-phantom sqcvtun +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdecb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdecd +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdech +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdecp +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdecw +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlal +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlal2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlalb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlalbt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlalt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlsl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlsl2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlslb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlslbt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmlslt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmulh +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmulh +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqdmulh +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmulh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqdmull +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmull2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmullb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmullb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqdmullt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqdmullt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqincb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqincd +REG_SYSFPEN
+aarch64 SR-rd-phantom sqinch +REG_SYSFPEN
+aarch64 SR-rd-phantom sqincp +REG_SYSFPEN
+aarch64 SR-rd-phantom sqincw +REG_SYSFPEN
+aarch64 SR-rd-phantom sqneg +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqneg +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdcmlah +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmlah +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmlah +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmlsh +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmlsh +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmulh +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmulh +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqrdmulh +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrdmulh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqrshl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshl +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqrshl +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshr +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrn +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqrshrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshru +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrun +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrun +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrun2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrunb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqrshrunb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqrshrunt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshl +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqshl +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshlu +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshlu +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sqshlu +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrun +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrun2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrunb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqshrunt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqsub +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqsub +REG_SYSFPEN
+aarch64 SR-rd-phantom sqsubr +REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtnb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtnt +REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtun +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtun2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtunb +REG_SYSFPEN
+aarch64 SR-rd-phantom sqxtunt +REG_SYSFPEN
+aarch64 SR-rd-phantom srhadd +REG_SYSFPEN
+aarch64 SR-rd-phantom sri +REG_SYSFPEN
+aarch64 SR-rd-phantom srshl +REG_SYSFPEN
+aarch64 SR-rd-phantom srshl +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom srshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom srshr +REG_SYSFPEN
+aarch64 SR-rd-phantom srsra +REG_SYSFPEN
+aarch64 SR-rd-phantom sshl +REG_SYSFPEN
+aarch64 SR-rd-phantom sshl +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sshll +REG_SYSFPEN
+aarch64 SR-rd-phantom sshll2 +REG_SYSFPEN
+aarch64 SR-rd-phantom sshllb +REG_SYSFPEN
+aarch64 SR-rd-phantom sshllt +REG_SYSFPEN
+aarch64 SR-rd-phantom sshr +REG_SYSFPEN
+aarch64 SR-rd-phantom ssra +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubl +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom ssublb +REG_SYSFPEN
+aarch64 SR-rd-phantom ssublb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ssublbt +REG_SYSFPEN
+aarch64 SR-rd-phantom ssublbt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ssublt +REG_SYSFPEN
+aarch64 SR-rd-phantom ssublt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ssubltb +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubltb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ssubw +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubw2 +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubwb +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubwb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ssubwt +REG_SYSFPEN
+aarch64 SR-rd-phantom ssubwt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom st1 +REG_SYSFPEN
+aarch64 SR-rd-phantom st1b +REG_SYSFPEN
+aarch64 SR-rd-phantom st1d +REG_SYSFPEN
+aarch64 SR-rd-phantom st1h +REG_SYSFPEN
+aarch64 SR-rd-phantom st1q +REG_SYSFPEN
+aarch64 SR-rd-phantom st1w +REG_SYSFPEN
+aarch64 SR-rd-phantom st2 +REG_SYSFPEN
+aarch64 SR-rd-phantom st2b +REG_SYSFPEN
+aarch64 SR-rd-phantom st2d +REG_SYSFPEN
+aarch64 SR-rd-phantom st2h +REG_SYSFPEN
+aarch64 SR-rd-phantom st2q +REG_SYSFPEN
+aarch64 SR-rd-phantom st2w +REG_SYSFPEN
+aarch64 SR-rd-phantom st3 +REG_SYSFPEN
+aarch64 SR-rd-phantom st3b +REG_SYSFPEN
+aarch64 SR-rd-phantom st3d +REG_SYSFPEN
+aarch64 SR-rd-phantom st3h +REG_SYSFPEN
+aarch64 SR-rd-phantom st3q +REG_SYSFPEN
+aarch64 SR-rd-phantom st3w +REG_SYSFPEN
+aarch64 SR-rd-phantom st4 +REG_SYSFPEN
+aarch64 SR-rd-phantom st4b +REG_SYSFPEN
+aarch64 SR-rd-phantom st4d +REG_SYSFPEN
+aarch64 SR-rd-phantom st4h +REG_SYSFPEN
+aarch64 SR-rd-phantom st4q +REG_SYSFPEN
+aarch64 SR-rd-phantom st4w +REG_SYSFPEN
+aarch64 SR-rd-phantom stl1 +REG_SYSFPEN
+aarch64 SR-rd-phantom stlur +REG_SYSFPEN
+aarch64 SR-rd-phantom stnt1b +REG_SYSFPEN
+aarch64 SR-rd-phantom stnt1d +REG_SYSFPEN
+aarch64 SR-rd-phantom stnt1h +REG_SYSFPEN
+aarch64 SR-rd-phantom stnt1w +REG_SYSFPEN
+aarch64 SR-rd-phantom str +REG_SYSFPEN
+aarch64 SR-rd-phantom stur +REG_SYSFPEN
+aarch64 SR-rd-phantom sub +REG_SYSFPEN
+aarch64 SR-rd-phantom subhn +REG_SYSFPEN
+aarch64 SR-rd-phantom subhn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom subhnb +REG_SYSFPEN
+aarch64 SR-rd-phantom subhnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom subhnt +REG_SYSFPEN
+aarch64 SR-rd-phantom subpt +REG_SYSFPEN
+aarch64 SR-rd-phantom subr +REG_SYSFPEN
+aarch64 SR-rd-phantom sudot +REG_SYSFPEN
+aarch64 SR-rd-phantom sumopa +REG_SYSFPEN
+aarch64 SR-rd-phantom sunpk +REG_SYSFPEN
+aarch64 SR-rd-phantom sunpkhi +REG_SYSFPEN
+aarch64 SR-rd-phantom sunpkhi +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom sunpklo +REG_SYSFPEN
+aarch64 SR-rd-phantom sunpklo +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom suqadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom suqadd +REG_SYSFPEN
+aarch64 SR-rd-phantom suvdot +REG_SYSFPEN
+aarch64 SR-rd-phantom svdot +REG_SYSFPEN
+aarch64 SR-rd-phantom sxtb +REG_SYSFPEN
+aarch64 SR-rd-phantom sxth +REG_SYSFPEN
+aarch64 SR-rd-phantom sxtw +REG_SYSFPEN
+aarch64 SR-rd-phantom tbl +REG_SYSFPEN
+aarch64 SR-rd-phantom tbl +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom tblq +REG_SYSFPEN
+aarch64 SR-rd-phantom tbx +REG_SYSFPEN
+aarch64 SR-rd-phantom tbxq +REG_SYSFPEN
+aarch64 SR-rd-phantom trn1 +REG_SYSFPEN
+aarch64 SR-rd-phantom trn1 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom trn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom trn2 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uaba +REG_SYSFPEN
+aarch64 SR-rd-phantom uabal +REG_SYSFPEN
+aarch64 SR-rd-phantom uabal2 +REG_SYSFPEN
+aarch64 SR-rd-phantom uabalb +REG_SYSFPEN
+aarch64 SR-rd-phantom uabalt +REG_SYSFPEN
+aarch64 SR-rd-phantom uabd +REG_SYSFPEN
+aarch64 SR-rd-phantom uabdl +REG_SYSFPEN
+aarch64 SR-rd-phantom uabdl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom uabdlb +REG_SYSFPEN
+aarch64 SR-rd-phantom uabdlb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uabdlt +REG_SYSFPEN
+aarch64 SR-rd-phantom uabdlt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uadalp +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddl +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddlb +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddlb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uaddlp +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddlt +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddlt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uaddlv +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddv +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddw +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddw2 +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddwb +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddwb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uaddwt +REG_SYSFPEN
+aarch64 SR-rd-phantom uaddwt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uclamp +REG_SYSFPEN
+aarch64 SR-rd-phantom ucvtf +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom udiv +REG_SYSFPEN
+aarch64 SR-rd-phantom udivr +REG_SYSFPEN
+aarch64 SR-rd-phantom udot +REG_SYSFPEN
+aarch64 SR-rd-phantom uhadd +REG_SYSFPEN
+aarch64 SR-rd-phantom uhsub +REG_SYSFPEN
+aarch64 SR-rd-phantom uhsubr +REG_SYSFPEN
+aarch64 SR-rd-phantom umax +REG_SYSFPEN
+aarch64 SR-rd-phantom umaxp +REG_SYSFPEN
+aarch64 SR-rd-phantom umaxp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom umaxqv +REG_SYSFPEN
+aarch64 SR-rd-phantom umaxv +REG_SYSFPEN
+aarch64 SR-rd-phantom umin +REG_SYSFPEN
+aarch64 SR-rd-phantom uminp +REG_SYSFPEN
+aarch64 SR-rd-phantom uminp +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uminqv +REG_SYSFPEN
+aarch64 SR-rd-phantom uminv +REG_SYSFPEN
+aarch64 SR-rd-phantom umlal +REG_SYSFPEN
+aarch64 SR-rd-phantom umlal2 +REG_SYSFPEN
+aarch64 SR-rd-phantom umlalb +REG_SYSFPEN
+aarch64 SR-rd-phantom umlalt +REG_SYSFPEN
+aarch64 SR-rd-phantom umlsl +REG_SYSFPEN
+aarch64 SR-rd-phantom umlsl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom umlslb +REG_SYSFPEN
+aarch64 SR-rd-phantom umlsll +REG_SYSFPEN
+aarch64 SR-rd-phantom umlslt +REG_SYSFPEN
+aarch64 SR-rd-phantom ummla +REG_SYSFPEN
+aarch64 SR-rd-phantom umopa +REG_SYSFPEN
+aarch64 SR-rd-phantom umov +REG_SYSFPEN
+aarch64 SR-rd-phantom umulh +REG_SYSFPEN
+aarch64 SR-rd-phantom umulh +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom umull +REG_SYSFPEN
+aarch64 SR-rd-phantom umull2 +REG_SYSFPEN
+aarch64 SR-rd-phantom umullb +REG_SYSFPEN
+aarch64 SR-rd-phantom umullb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom umullt +REG_SYSFPEN
+aarch64 SR-rd-phantom umullt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uqadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqadd +REG_SYSFPEN
+aarch64 SR-rd-phantom uqcvt +REG_SYSFPEN
+aarch64 SR-rd-phantom uqcvtn +REG_SYSFPEN
+aarch64 SR-rd-phantom uqdecb +REG_SYSFPEN
+aarch64 SR-rd-phantom uqdecd +REG_SYSFPEN
+aarch64 SR-rd-phantom uqdech +REG_SYSFPEN
+aarch64 SR-rd-phantom uqdecp +REG_SYSFPEN
+aarch64 SR-rd-phantom uqdecw +REG_SYSFPEN
+aarch64 SR-rd-phantom uqincb +REG_SYSFPEN
+aarch64 SR-rd-phantom uqincd +REG_SYSFPEN
+aarch64 SR-rd-phantom uqinch +REG_SYSFPEN
+aarch64 SR-rd-phantom uqincp +REG_SYSFPEN
+aarch64 SR-rd-phantom uqincw +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshl +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uqrshl +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshr +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshrn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshrn +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshrn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom uqrshrnb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uqrshrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom uqshl +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqshl +REG_FCSR,REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uqshl +REG_SYSFPEN
+aarch64 SR-rd-phantom uqshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom uqshrn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqshrn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqshrnb +REG_SYSFPEN
+aarch64 SR-rd-phantom uqshrnt +REG_SYSFPEN
+aarch64 SR-rd-phantom uqsub +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqsub +REG_SYSFPEN
+aarch64 SR-rd-phantom uqsubr +REG_SYSFPEN
+aarch64 SR-rd-phantom uqxtn +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqxtn2 +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom uqxtnb +REG_SYSFPEN
+aarch64 SR-rd-phantom uqxtnt +REG_SYSFPEN
+aarch64 SR-rd-phantom urecpe +REG_SYSFPEN
+aarch64 SR-rd-phantom urecpe +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom urhadd +REG_SYSFPEN
+aarch64 SR-rd-phantom urshl +REG_SYSFPEN
+aarch64 SR-rd-phantom urshl +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom urshlr +REG_SYSFPEN
+aarch64 SR-rd-phantom urshr +REG_SYSFPEN
+aarch64 SR-rd-phantom ursqrte +REG_SYSFPEN
+aarch64 SR-rd-phantom ursqrte +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ursra +REG_SYSFPEN
+aarch64 SR-rd-phantom usdot +REG_SYSFPEN
+aarch64 SR-rd-phantom ushl +REG_SYSFPEN
+aarch64 SR-rd-phantom ushl +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom ushll +REG_SYSFPEN
+aarch64 SR-rd-phantom ushll2 +REG_SYSFPEN
+aarch64 SR-rd-phantom ushllb +REG_SYSFPEN
+aarch64 SR-rd-phantom ushllt +REG_SYSFPEN
+aarch64 SR-rd-phantom ushr +REG_SYSFPEN
+aarch64 SR-rd-phantom usmlall +REG_SYSFPEN
+aarch64 SR-rd-phantom usmmla +REG_SYSFPEN
+aarch64 SR-rd-phantom usmopa +REG_SYSFPEN
+aarch64 SR-rd-phantom usqadd +REG_FCSR,REG_SYSFPEN
+aarch64 SR-rd-phantom usqadd +REG_SYSFPEN
+aarch64 SR-rd-phantom usra +REG_SYSFPEN
+aarch64 SR-rd-phantom usubl +REG_SYSFPEN
+aarch64 SR-rd-phantom usubl2 +REG_SYSFPEN
+aarch64 SR-rd-phantom usublb +REG_SYSFPEN
+aarch64 SR-rd-phantom usublb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom usublt +REG_SYSFPEN
+aarch64 SR-rd-phantom usublt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom usubw +REG_SYSFPEN
+aarch64 SR-rd-phantom usubw2 +REG_SYSFPEN
+aarch64 SR-rd-phantom usubwb +REG_SYSFPEN
+aarch64 SR-rd-phantom usubwb +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom usubwt +REG_SYSFPEN
+aarch64 SR-rd-phantom usubwt +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uunpk +REG_SYSFPEN
+aarch64 SR-rd-phantom uunpkhi +REG_SYSFPEN
+aarch64 SR-rd-phantom uunpkhi +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uunpklo +REG_SYSFPEN
+aarch64 SR-rd-phantom uunpklo +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uvdot +REG_SYSFPEN
+aarch64 SR-rd-phantom uxtb +REG_SYSFPEN
+aarch64 SR-rd-phantom uxth +REG_SYSFPEN
+aarch64 SR-rd-phantom uxtw +REG_SYSFPEN
+aarch64 SR-rd-phantom uzp +REG_SYSFPEN
+aarch64 SR-rd-phantom uzp1 +REG_SYSFPEN
+aarch64 SR-rd-phantom uzp1 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uzp2 +REG_SYSFPEN
+aarch64 SR-rd-phantom uzp2 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom uzpq1 +REG_SYSFPEN
+aarch64 SR-rd-phantom uzpq2 +REG_SYSFPEN
+aarch64 SR-rd-phantom whilege +REG_SYSFPEN
+aarch64 SR-rd-phantom whilegt +REG_SYSFPEN
+aarch64 SR-rd-phantom whilehi +REG_SYSFPEN
+aarch64 SR-rd-phantom whilehs +REG_SYSFPEN
+aarch64 SR-rd-phantom whilele +REG_SYSFPEN
+aarch64 SR-rd-phantom whilelo +REG_SYSFPEN
+aarch64 SR-rd-phantom whilels +REG_SYSFPEN
+aarch64 SR-rd-phantom whilelt +REG_SYSFPEN
+aarch64 SR-rd-phantom whilerw +REG_SYSFPEN
+aarch64 SR-rd-phantom whilewr +REG_SYSFPEN
+aarch64 SR-rd-phantom wrffr +REG_SYSFPEN
+aarch64 SR-rd-phantom xar +REG_SYSFPEN
+aarch64 SR-rd-phantom xtn +REG_SYSFPEN
+aarch64 SR-rd-phantom xtn2 +REG_SYSFPEN
+aarch64 SR-rd-phantom zero +REG_MATRIX,REG_SYSFPEN
+aarch64 SR-rd-phantom zero +REG_SYSFPEN
+aarch64 SR-rd-phantom zero +REG_SYSFPEN,REG_VCTRL
+aarch64 SR-rd-phantom zip +REG_SYSFPEN
+aarch64 SR-rd-phantom zip1 +REG_SYSFPEN
+aarch64 SR-rd-phantom zip1 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom zip2 +REG_SYSFPEN
+aarch64 SR-rd-phantom zip2 +REG_SYSFPEN,REG_VEC#
+aarch64 SR-rd-phantom zipq1 +REG_SYSFPEN
+aarch64 SR-rd-phantom zipq2 +REG_SYSFPEN
+
+# --- A-GCS: the guarded control stack pointer, which the reference names on nothing.
+#     10 signature(s), 51 encodings at this tip.
+#
+# The GCS instructions push to, pop from and switch the guarded control stack,
+# all through GCSPR_ELx, and none of them names it in the encoding.  LLVM's
+# MCInstrDesc has no operand for it.  REG_SSP is its own dependency population
+# -- neither the data stack pointer nor the link register -- so the read is
+# recorded there.
+aarch64 SR-rd-phantom gcspopcx +REG_SSP
+aarch64 SR-rd-phantom gcspopm +REG_SSP
+aarch64 SR-rd-phantom gcspopx +REG_SSP
+aarch64 SR-rd-phantom gcspushm +REG_SSP
+aarch64 SR-rd-phantom gcspushx +REG_SSP
+aarch64 SR-rd-phantom gcsss1 +REG_SSP
+aarch64 SR-rd-phantom gcsss2 +REG_SSP
+aarch64 SR-rd-phantom mrs +REG_SSP
+aarch64 SR-rd-phantom sys +REG_SSP
+aarch64 SR-rd-phantom sysl +REG_SSP
+
+# --- A-SYSSEL: the system register an (op0, op1, CRn, CRm, op2) tuple selects, which LLVM models as an immediate.
+#     29 signature(s), 19829 encodings at this tip.
+#
+# MRS / MSR / MRRS / MSRR / SYS / SYSL address a system register by an ENCODED
+# TUPLE, and LLVM's MCInstrDesc carries that tuple as immediates: there is no
+# register operand for the reference to name.  The tracer names the register,
+# in the dependence-behaviour group cap_aarch64_sysreg_class puts it in, so
+# MRS produces one signature per group where it produced one in total.  The
+# `SR-rd-missing sysl +REG_GPR#` companion is the same operand read the other
+# way: LLVM names the destination GPR of SYSL as a USE.
+#
+# `msr +REG_FPCW` and `msrr +REG_FPCW` are the WRITE half, new at this tip
+# because FPCR moved off REG_FCSR (the control word is not the status word);
+# LLVM models no system register write on MSR either.
+aarch64 FR-wr-phantom msr +REG_FPCW
+aarch64 FR-wr-phantom msrr +REG_FPCW
+aarch64 SR-rd-missing sysl +REG_GPR#
+aarch64 SR-rd-missing tlbi +REG_GPR#
+aarch64 SR-rd-phantom mrrs +REG_FCSR
+aarch64 SR-rd-phantom mrrs +REG_FPCW
+aarch64 SR-rd-phantom mrrs +REG_SYS
+aarch64 SR-rd-phantom mrrs +REG_SYSCACHE
+aarch64 SR-rd-phantom mrrs +REG_SYSDBG
+aarch64 SR-rd-phantom mrrs +REG_SYSEXC
+aarch64 SR-rd-phantom mrrs +REG_SYSID
+aarch64 SR-rd-phantom mrrs +REG_SYSMMU
+aarch64 SR-rd-phantom mrrs +REG_SYSPERF
+aarch64 SR-rd-phantom mrrs +REG_SYSTIMER
+aarch64 SR-rd-phantom mrs +REG_FCSR
+aarch64 SR-rd-phantom mrs +REG_FPCW
+aarch64 SR-rd-phantom mrs +REG_SYS
+aarch64 SR-rd-phantom mrs +REG_SYSCACHE
+aarch64 SR-rd-phantom mrs +REG_SYSDBG
+aarch64 SR-rd-phantom mrs +REG_SYSEXC
+aarch64 SR-rd-phantom mrs +REG_SYSID
+aarch64 SR-rd-phantom mrs +REG_SYSMMU
+aarch64 SR-rd-phantom mrs +REG_SYSPERF
+aarch64 SR-rd-phantom mrs +REG_SYSTIMER
+aarch64 SR-rd-phantom mrs +REG_VCTRL
+aarch64 SR-rd-phantom sysl +REG_SYS
+aarch64 SR-rd-phantom sysl +REG_SYSCACHE
+aarch64 SR-rd-phantom sysl +REG_SYSDBG
+aarch64 SR-rd-phantom sysl +REG_SYSMMU
+
+# --- A-MTE: the MTE tag-control registers, read implicitly.
+#     7 signature(s), 3357 encodings at this tip.
+#
+# IRG, ADDG, SUBG, LDGM, STGM and STZGM take their behaviour from GCR_EL1 (the
+# tag-exclusion mask) and GMID_EL1 (the tag-granule size), and ST64BV0 from
+# ACCDATA_EL1.  All are implicit reads the encoding does not name and LLVM's
+# MCInstrDesc does not model.
+aarch64 SR-rd-phantom addg +REG_SYS
+aarch64 SR-rd-phantom irg +REG_SYS
+aarch64 SR-rd-phantom ldgm +REG_SYSID
+aarch64 SR-rd-phantom st64bv0 +REG_SYS
+aarch64 SR-rd-phantom stgm +REG_SYSID
+aarch64 SR-rd-phantom stzgm +REG_SYSID
+aarch64 SR-rd-phantom subg +REG_SYS
+
+# --- A-ERET: exception return reads the state exception entry wrote.
+#     5 signature(s), 5 encodings at this tip.
+#
+# ERET, ERETAA and ERETAB restore PC and PSTATE from ELR_ELx and SPSR_ELx, so
+# both are true sources; the authenticated forms additionally read the stack
+# pointer as the PAC modifier, which is what the wire records and what LLVM
+# spells as a read of the link register instead.  LLVM models no exception
+# state on any of the three.
+aarch64 SR-rd-missing eretaa +REG_LR
+aarch64 SR-rd-missing eretab +REG_LR
+aarch64 SR-rd-phantom eret +REG_SYSEXC
+aarch64 SR-rd-phantom eretaa +REG_SYSEXC
+aarch64 SR-rd-phantom eretab +REG_SYSEXC
+
+# --- A-SATQC: the saturating forms read FPSR.QC because QC is STICKY, and LLVM names FPCR instead.
+#     2 signature(s), 192 encodings at this tip.
+#
+# SQDMULH and SQRDMULH set FPSR.QC on saturation, and QC is a STICKY bit: the
+# instruction must read the accumulated value to OR into it, so FPSR is
+# read-modify-written and the read is real.  LLVM instead attaches a use of
+# FPCR to these opcodes -- the control word, which a fixed-point saturating
+# multiply does not consult -- so the two sides name two different registers
+# and neither names the other's.  The wire is right on both counts, and the
+# disagreement is only VISIBLE now because FPCR and FPSR stopped sharing an id
+# at this tip.
+aarch64 SR-rd-missing sqdmulh +REG_FPCW
+aarch64 SR-rd-missing sqrdmulh +REG_FPCW
+
+# --- A-MISC: the remaining single-signature reference gaps.
+#     2 signature(s), 6232 encodings at this tip.
+#
+# `bc.nv` is the never-taken consistent branch: LLVM names a condition-flag
+# read for the whole BC.cond family, and QEMU reads nothing because the NV
+# condition is resolved at translation time.  `tlbi` with a register argument
+# LLVM names as a GPR use on the forms that take none.  `zero za...` LLVM names
+# as a read of the ZA array it only writes.  Each is one signature and each is
+# the reference over-naming an operand its per-opcode description carries.
+aarch64 SR-rd-missing bc.nv +REG_FLAGS
+aarch64 SR-rd-missing zero +REG_MATRIX
+
+# --- R-HINT: an RV128 mnemonic decoded on RV64, where the encoding is a HINT that reads nothing.
+#     8 signature(s), 12335 encodings at this tip.
+#
+# C.SLLI64 / C.SRLI64 / C.SRAI64 are the RV128 spellings of the compressed
+# shifts with shamt == 0.  On RV64 that encoding is not those instructions:
+# the unprivileged spec (Ch. 16, "C" extension) makes shamt == 0 a HINT, and
+# QEMU implements the hint -- nothing is read and nothing is written.  LLVM's
+# RV64 decoder still resolves the RV128 opcode and names its register operand,
+# so the reference names a read the architecture does not perform on this
+# target.  The wire is right.
+riscv64 SR-rd-missing c.slli64 +REG_FP_REG
+riscv64 SR-rd-missing c.slli64 +REG_GPR#
+riscv64 SR-rd-missing c.slli64 +REG_LR
+riscv64 SR-rd-missing c.slli64 +REG_SP
+riscv64 SR-rd-missing c.srai64 +REG_FP_REG
+riscv64 SR-rd-missing c.srai64 +REG_GPR#
+riscv64 SR-rd-missing c.srli64 +REG_FP_REG
+riscv64 SR-rd-missing c.srli64 +REG_GPR#
+
+# --- R-ZIMOP: Zimop may-be-operations write zero and read nothing.
+#     174 signature(s), 856 encodings at this tip.
+#
+# `mop.r.N rd, rs1` and `mop.rr.N rd, rs1, rs2` are Zimop's "may be operations":
+# when no extension has claimed the encoding they are defined to write ZERO to
+# rd, and their source registers are architecturally unread.  QEMU implements
+# exactly that.  LLVM's MCInstrDesc names the source operands because the
+# encoding HAS them, which is a statement about the syntax and not about the
+# dataflow.  The wire is right.
+riscv64 SR-rd-missing mop.r.0 +REG_GPR#
+riscv64 SR-rd-missing mop.r.0 +REG_LR
+riscv64 SR-rd-missing mop.r.0 +REG_SP
+riscv64 SR-rd-missing mop.r.1 +REG_GPR#
+riscv64 SR-rd-missing mop.r.1 +REG_LR
+riscv64 SR-rd-missing mop.r.1 +REG_SP
+riscv64 SR-rd-missing mop.r.10 +REG_GPR#
+riscv64 SR-rd-missing mop.r.10 +REG_LR
+riscv64 SR-rd-missing mop.r.10 +REG_SP
+riscv64 SR-rd-missing mop.r.11 +REG_GPR#
+riscv64 SR-rd-missing mop.r.11 +REG_LR
+riscv64 SR-rd-missing mop.r.11 +REG_SP
+riscv64 SR-rd-missing mop.r.12 +REG_GPR#
+riscv64 SR-rd-missing mop.r.12 +REG_LR
+riscv64 SR-rd-missing mop.r.12 +REG_SP
+riscv64 SR-rd-missing mop.r.13 +REG_GPR#
+riscv64 SR-rd-missing mop.r.13 +REG_LR
+riscv64 SR-rd-missing mop.r.13 +REG_SP
+riscv64 SR-rd-missing mop.r.14 +REG_GPR#
+riscv64 SR-rd-missing mop.r.14 +REG_LR
+riscv64 SR-rd-missing mop.r.14 +REG_SP
+riscv64 SR-rd-missing mop.r.15 +REG_GPR#
+riscv64 SR-rd-missing mop.r.15 +REG_LR
+riscv64 SR-rd-missing mop.r.15 +REG_SP
+riscv64 SR-rd-missing mop.r.16 +REG_GPR#
+riscv64 SR-rd-missing mop.r.16 +REG_LR
+riscv64 SR-rd-missing mop.r.16 +REG_SP
+riscv64 SR-rd-missing mop.r.17 +REG_GPR#
+riscv64 SR-rd-missing mop.r.17 +REG_LR
+riscv64 SR-rd-missing mop.r.17 +REG_SP
+riscv64 SR-rd-missing mop.r.18 +REG_GPR#
+riscv64 SR-rd-missing mop.r.18 +REG_LR
+riscv64 SR-rd-missing mop.r.18 +REG_SP
+riscv64 SR-rd-missing mop.r.19 +REG_GPR#
+riscv64 SR-rd-missing mop.r.19 +REG_LR
+riscv64 SR-rd-missing mop.r.19 +REG_SP
+riscv64 SR-rd-missing mop.r.2 +REG_GPR#
+riscv64 SR-rd-missing mop.r.2 +REG_LR
+riscv64 SR-rd-missing mop.r.2 +REG_SP
+riscv64 SR-rd-missing mop.r.20 +REG_GPR#
+riscv64 SR-rd-missing mop.r.20 +REG_LR
+riscv64 SR-rd-missing mop.r.20 +REG_SP
+riscv64 SR-rd-missing mop.r.21 +REG_GPR#
+riscv64 SR-rd-missing mop.r.21 +REG_LR
+riscv64 SR-rd-missing mop.r.21 +REG_SP
+riscv64 SR-rd-missing mop.r.22 +REG_GPR#
+riscv64 SR-rd-missing mop.r.22 +REG_LR
+riscv64 SR-rd-missing mop.r.22 +REG_SP
+riscv64 SR-rd-missing mop.r.23 +REG_GPR#
+riscv64 SR-rd-missing mop.r.23 +REG_LR
+riscv64 SR-rd-missing mop.r.23 +REG_SP
+riscv64 SR-rd-missing mop.r.24 +REG_GPR#
+riscv64 SR-rd-missing mop.r.24 +REG_LR
+riscv64 SR-rd-missing mop.r.24 +REG_SP
+riscv64 SR-rd-missing mop.r.25 +REG_GPR#
+riscv64 SR-rd-missing mop.r.25 +REG_LR
+riscv64 SR-rd-missing mop.r.25 +REG_SP
+riscv64 SR-rd-missing mop.r.26 +REG_GPR#
+riscv64 SR-rd-missing mop.r.26 +REG_LR
+riscv64 SR-rd-missing mop.r.26 +REG_SP
+riscv64 SR-rd-missing mop.r.27 +REG_GPR#
+riscv64 SR-rd-missing mop.r.27 +REG_LR
+riscv64 SR-rd-missing mop.r.27 +REG_SP
+riscv64 SR-rd-missing mop.r.28 +REG_GPR#
+riscv64 SR-rd-missing mop.r.28 +REG_SP
+riscv64 SR-rd-missing mop.r.29 +REG_GPR#
+riscv64 SR-rd-missing mop.r.29 +REG_LR
+riscv64 SR-rd-missing mop.r.29 +REG_SP
+riscv64 SR-rd-missing mop.r.3 +REG_GPR#
+riscv64 SR-rd-missing mop.r.3 +REG_LR
+riscv64 SR-rd-missing mop.r.3 +REG_SP
+riscv64 SR-rd-missing mop.r.30 +REG_GPR#
+riscv64 SR-rd-missing mop.r.30 +REG_LR
+riscv64 SR-rd-missing mop.r.30 +REG_SP
+riscv64 SR-rd-missing mop.r.31 +REG_GPR#
+riscv64 SR-rd-missing mop.r.31 +REG_LR
+riscv64 SR-rd-missing mop.r.31 +REG_SP
+riscv64 SR-rd-missing mop.r.4 +REG_GPR#
+riscv64 SR-rd-missing mop.r.4 +REG_LR
+riscv64 SR-rd-missing mop.r.4 +REG_SP
+riscv64 SR-rd-missing mop.r.5 +REG_GPR#
+riscv64 SR-rd-missing mop.r.5 +REG_LR
+riscv64 SR-rd-missing mop.r.5 +REG_SP
+riscv64 SR-rd-missing mop.r.6 +REG_GPR#
+riscv64 SR-rd-missing mop.r.6 +REG_LR
+riscv64 SR-rd-missing mop.r.6 +REG_SP
+riscv64 SR-rd-missing mop.r.7 +REG_GPR#
+riscv64 SR-rd-missing mop.r.7 +REG_LR
+riscv64 SR-rd-missing mop.r.7 +REG_SP
+riscv64 SR-rd-missing mop.r.8 +REG_GPR#
+riscv64 SR-rd-missing mop.r.8 +REG_LR
+riscv64 SR-rd-missing mop.r.8 +REG_SP
+riscv64 SR-rd-missing mop.r.9 +REG_GPR#
+riscv64 SR-rd-missing mop.r.9 +REG_LR
+riscv64 SR-rd-missing mop.r.9 +REG_SP
+riscv64 SR-rd-missing mop.rr.0 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.0 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.0 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.0 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.0 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.0 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.0 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.0 +REG_LR
+riscv64 SR-rd-missing mop.rr.0 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.0 +REG_SP
+riscv64 SR-rd-missing mop.rr.1 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.1 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.1 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.1 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.1 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.1 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.1 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.1 +REG_LR
+riscv64 SR-rd-missing mop.rr.1 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.1 +REG_SP
+riscv64 SR-rd-missing mop.rr.2 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.2 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.2 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.2 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.2 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.2 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.2 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.2 +REG_LR
+riscv64 SR-rd-missing mop.rr.2 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.2 +REG_SP
+riscv64 SR-rd-missing mop.rr.3 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.3 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.3 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.3 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.3 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.3 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.3 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.3 +REG_LR
+riscv64 SR-rd-missing mop.rr.3 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.3 +REG_SP
+riscv64 SR-rd-missing mop.rr.4 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.4 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.4 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.4 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.4 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.4 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.4 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.4 +REG_LR
+riscv64 SR-rd-missing mop.rr.4 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.4 +REG_SP
+riscv64 SR-rd-missing mop.rr.5 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.5 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.5 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.5 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.5 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.5 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.5 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.5 +REG_LR
+riscv64 SR-rd-missing mop.rr.5 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.5 +REG_SP
+riscv64 SR-rd-missing mop.rr.6 +REG_FP_REG
+riscv64 SR-rd-missing mop.rr.6 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.6 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.6 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.6 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.6 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.6 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.6 +REG_LR
+riscv64 SR-rd-missing mop.rr.6 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.6 +REG_SP
+riscv64 SR-rd-missing mop.rr.7 +REG_FP_REG,REG_GPR#
+riscv64 SR-rd-missing mop.rr.7 +REG_FP_REG,REG_LR
+riscv64 SR-rd-missing mop.rr.7 +REG_FP_REG,REG_SP
+riscv64 SR-rd-missing mop.rr.7 +REG_GPR#
+riscv64 SR-rd-missing mop.rr.7 +REG_GPR#,REG_LR
+riscv64 SR-rd-missing mop.rr.7 +REG_GPR#,REG_SP
+riscv64 SR-rd-missing mop.rr.7 +REG_LR
+riscv64 SR-rd-missing mop.rr.7 +REG_LR,REG_SP
+riscv64 SR-rd-missing mop.rr.7 +REG_SP
+
+# --- R-PAIR: AMOCAS.Q's even-odd register PAIR, of which LLVM names only the even half.
+#     6 signature(s), 121 encodings at this tip.
+#
+# Zacas AMOCAS.Q on RV64 compares and swaps 128 bits, so its compare value and
+# its swap value are each an EVEN-ODD REGISTER PAIR -- rd/rd+1 and rs2/rs2+1 --
+# and QEMU reads both halves.  LLVM's MCInst carries one operand for the pair,
+# spelled with the even register, so the odd half is a read it structurally
+# cannot name.  The wire is right, and the pair is the whole difference.
+riscv64 SR-rd-phantom amocas.q +REG_GPR#
+riscv64 SR-rd-phantom amocas.q +REG_GPR#,REG_LR
+riscv64 SR-rd-phantom amocas.q +REG_LR
+riscv64 SR-rd-phantom amocas.q.aq +REG_GPR#
+riscv64 SR-rd-phantom amocas.q.aqrl +REG_GPR#
+riscv64 SR-rd-phantom amocas.q.rl +REG_GPR#
+
+# --- R-LPAD: Zicfilp's landing-pad label check reads x7.
+#     1 signature(s), 96 encodings at this tip.
+#
+# `lpad` compares the encoded label against the low bits of x7 and traps on a
+# mismatch, so x7 is a true source and the landing-pad state is read beside it.
+# LLVM models the label as an immediate and names no register at all.
+riscv64 SR-rd-phantom lpad +REG_GPR#,REG_SYS
+
+# --- R-VTAIL: RVV reads its own destination: prestart, masked-off and tail elements are UNDISTURBED.
+#     569 signature(s), 30953 encodings at this tip.
+#
+# Under the tail-undisturbed and mask-undisturbed policies -- the reset state
+# of vtype and the one QEMU's helpers implement unconditionally -- the elements
+# of vd before vstart, the elements a mask bit turns off, and the elements past
+# vl all RETAIN THE VALUE vd ALREADY HELD ("V" spec v1.0, sec. 5.3 and 5.4).
+# The destination is therefore a genuine source of every vector instruction
+# that does not write all VLEN bits, which is why QEMU passes vd into the gvec
+# helper and reads it.  LLVM's MCInstrDesc carries a tied operand only on the
+# forms whose ASSEMBLY repeats the register, so on the rest its read set is
+# short by exactly vd.  This is the same disagreement MIPS lwl/lwr already
+# carries in this file, and the fields side is again the correct one.
+riscv64 SR-rd-phantom vaadd.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vaadd.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vaaddu.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vaaddu.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vadc.vim +REG_VEC#
+riscv64 SR-rd-phantom vadc.vvm +REG_VEC#
+riscv64 SR-rd-phantom vadc.vxm +REG_VEC#
+riscv64 SR-rd-phantom vadd.vi +REG_VEC#
+riscv64 SR-rd-phantom vadd.vv +REG_VEC#
+riscv64 SR-rd-phantom vadd.vx +REG_VEC#
+riscv64 SR-rd-phantom vaesdf.vs +REG_VEC#
+riscv64 SR-rd-phantom vaesdf.vv +REG_VEC#
+riscv64 SR-rd-phantom vaesdm.vs +REG_VEC#
+riscv64 SR-rd-phantom vaesdm.vv +REG_VEC#
+riscv64 SR-rd-phantom vaesem.vs +REG_VEC#
+riscv64 SR-rd-phantom vaesem.vv +REG_VEC#
+riscv64 SR-rd-phantom vaeskf1.vi +REG_VEC#
+riscv64 SR-rd-phantom vaeskf2.vi +REG_VEC#
+riscv64 SR-rd-phantom vand.vi +REG_VEC#
+riscv64 SR-rd-phantom vand.vv +REG_VEC#
+riscv64 SR-rd-phantom vand.vx +REG_VEC#
+riscv64 SR-rd-phantom vandn.vv +REG_VEC#
+riscv64 SR-rd-phantom vandn.vx +REG_VEC#
+riscv64 SR-rd-phantom vasub.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vasub.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vasubu.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vasubu.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vclmul.vv +REG_VEC#
+riscv64 SR-rd-phantom vclmul.vx +REG_VEC#
+riscv64 SR-rd-phantom vclmulh.vv +REG_VEC#
+riscv64 SR-rd-phantom vclmulh.vx +REG_VEC#
+riscv64 SR-rd-phantom vcompress.vm +REG_VEC#
+riscv64 SR-rd-phantom vdiv.vv +REG_VEC#
+riscv64 SR-rd-phantom vdiv.vx +REG_VEC#
+riscv64 SR-rd-phantom vdivu.vv +REG_VEC#
+riscv64 SR-rd-phantom vdivu.vx +REG_VEC#
+riscv64 SR-rd-phantom vfabs.v +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfadd.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfadd.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfcvt.f.xu.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfcvt.rtz.xu.f.v +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfcvt.x.f.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfcvt.xu.f.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfdiv.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfdiv.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfmax.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfmax.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfmerge.vfm +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfmin.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfmin.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfmul.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfmul.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfmv.v.f +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfneg.v +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfrdiv.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfredmax.vs +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfredmin.vs +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfredosum.vs +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfredusum.vs +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfrsub.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfsgnj.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsgnj.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsgnjn.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsgnjn.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsgnjx.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsgnjx.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfslide1down.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfslide1up.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vfsqrt.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfsub.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfsub.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwadd.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwadd.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwadd.wf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwadd.wv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwmul.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwmul.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwredosum.vs +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwredusum.vs +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwsub.vf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwsub.vv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwsub.wf +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vfwsub.wv +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vghsh.vv +REG_VEC#
+riscv64 SR-rd-phantom vl1r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl1re16.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl1re32.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl1re64.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl2r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl2re16.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl2re32.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl2re64.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl4r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl4re16.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl4re32.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl4re64.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl8r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl8re16.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl8re32.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vl8re64.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vle16.v +REG_VEC#
+riscv64 SR-rd-phantom vle16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vle32.v +REG_VEC#
+riscv64 SR-rd-phantom vle32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vle64.v +REG_VEC#
+riscv64 SR-rd-phantom vle64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vle8.v +REG_VEC#
+riscv64 SR-rd-phantom vle8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlm.v +REG_VEC#
+riscv64 SR-rd-phantom vloxei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg2ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg2ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg2ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg2ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg3ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg3ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg3ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg3ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg4ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg4ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg4ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg4ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg5ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg5ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg5ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg5ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg6ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg6ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg6ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg6ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg7ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg7ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg7ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg7ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg8ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg8ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg8ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vloxseg8ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vlse16.v +REG_VEC#
+riscv64 SR-rd-phantom vlse32.v +REG_VEC#
+riscv64 SR-rd-phantom vlse64.v +REG_VEC#
+riscv64 SR-rd-phantom vlse8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg2e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg3e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg4e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg5e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg6e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg7e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e16ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e32ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e64ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlseg8e8ff.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg2e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg2e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg2e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg2e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg3e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg3e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg3e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg3e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg4e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg4e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg4e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg4e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg5e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg5e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg5e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg5e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg6e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg6e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg6e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg6e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg7e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg7e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg7e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg7e8.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg8e16.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg8e32.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg8e64.v +REG_VEC#
+riscv64 SR-rd-phantom vlsseg8e8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg2ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg2ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg2ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg2ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg3ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg3ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg3ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg3ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg4ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg4ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg4ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg4ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg5ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg5ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg5ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg5ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg6ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg6ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg6ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg6ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg7ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg7ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg7ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg7ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg8ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg8ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg8ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vluxseg8ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vi +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vim +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vv +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vvm +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vx +REG_VEC#
+riscv64 SR-rd-phantom vmadc.vxm +REG_VEC#
+riscv64 SR-rd-phantom vmand.mm +REG_VEC#
+riscv64 SR-rd-phantom vmandn.mm +REG_VEC#
+riscv64 SR-rd-phantom vmax.vv +REG_VEC#
+riscv64 SR-rd-phantom vmax.vx +REG_VEC#
+riscv64 SR-rd-phantom vmaxu.vv +REG_VEC#
+riscv64 SR-rd-phantom vmaxu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmerge.vim +REG_VEC#
+riscv64 SR-rd-phantom vmerge.vvm +REG_VEC#
+riscv64 SR-rd-phantom vmerge.vxm +REG_VEC#
+riscv64 SR-rd-phantom vmfeq.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfeq.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfge.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfgt.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfle.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfle.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmflt.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmflt.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfne.vf +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmfne.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vmin.vv +REG_VEC#
+riscv64 SR-rd-phantom vmin.vx +REG_VEC#
+riscv64 SR-rd-phantom vminu.vv +REG_VEC#
+riscv64 SR-rd-phantom vminu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmmv.m +REG_VEC#
+riscv64 SR-rd-phantom vmnand.mm +REG_VEC#
+riscv64 SR-rd-phantom vmnor.mm +REG_VEC#
+riscv64 SR-rd-phantom vmnot.m +REG_VEC#
+riscv64 SR-rd-phantom vmor.mm +REG_VEC#
+riscv64 SR-rd-phantom vmorn.mm +REG_VEC#
+riscv64 SR-rd-phantom vmsbc.vv +REG_VEC#
+riscv64 SR-rd-phantom vmsbc.vvm +REG_VEC#
+riscv64 SR-rd-phantom vmsbc.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsbc.vxm +REG_VEC#
+riscv64 SR-rd-phantom vmsbf.m +REG_VEC#
+riscv64 SR-rd-phantom vmseq.vi +REG_VEC#
+riscv64 SR-rd-phantom vmseq.vv +REG_VEC#
+riscv64 SR-rd-phantom vmseq.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsgt.vi +REG_VEC#
+riscv64 SR-rd-phantom vmsgt.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsgtu.vi +REG_VEC#
+riscv64 SR-rd-phantom vmsgtu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsle.vi +REG_VEC#
+riscv64 SR-rd-phantom vmsle.vv +REG_VEC#
+riscv64 SR-rd-phantom vmsle.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsleu.vi +REG_VEC#
+riscv64 SR-rd-phantom vmsleu.vv +REG_VEC#
+riscv64 SR-rd-phantom vmsleu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmslt.vv +REG_VEC#
+riscv64 SR-rd-phantom vmslt.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsltu.vv +REG_VEC#
+riscv64 SR-rd-phantom vmsltu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsne.vi +REG_VEC#
+riscv64 SR-rd-phantom vmsne.vv +REG_VEC#
+riscv64 SR-rd-phantom vmsne.vx +REG_VEC#
+riscv64 SR-rd-phantom vmsof.m +REG_VEC#
+riscv64 SR-rd-phantom vmul.vv +REG_VEC#
+riscv64 SR-rd-phantom vmul.vx +REG_VEC#
+riscv64 SR-rd-phantom vmulh.vv +REG_VEC#
+riscv64 SR-rd-phantom vmulh.vx +REG_VEC#
+riscv64 SR-rd-phantom vmulhsu.vv +REG_VEC#
+riscv64 SR-rd-phantom vmulhsu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmulhu.vv +REG_VEC#
+riscv64 SR-rd-phantom vmulhu.vx +REG_VEC#
+riscv64 SR-rd-phantom vmv.v.i +REG_VEC#
+riscv64 SR-rd-phantom vmv.v.v +REG_VEC#
+riscv64 SR-rd-phantom vmv.v.x +REG_VEC#
+riscv64 SR-rd-phantom vmv1r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vmv2r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vmxnor.mm +REG_VEC#
+riscv64 SR-rd-phantom vmxor.mm +REG_VEC#
+riscv64 SR-rd-phantom vnclip.wi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vnclip.wv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vnclip.wx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vnclipu.wi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vnclipu.wv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vnclipu.wx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vncvt.x.x.w +REG_VEC#
+riscv64 SR-rd-phantom vneg.v +REG_VEC#
+riscv64 SR-rd-phantom vnsra.wi +REG_VEC#
+riscv64 SR-rd-phantom vnsra.wv +REG_VEC#
+riscv64 SR-rd-phantom vnsra.wx +REG_VEC#
+riscv64 SR-rd-phantom vnsrl.wi +REG_VEC#
+riscv64 SR-rd-phantom vnsrl.wv +REG_VEC#
+riscv64 SR-rd-phantom vnsrl.wx +REG_VEC#
+riscv64 SR-rd-phantom vor.vi +REG_VEC#
+riscv64 SR-rd-phantom vor.vv +REG_VEC#
+riscv64 SR-rd-phantom vor.vx +REG_VEC#
+riscv64 SR-rd-phantom vredand.vs +REG_VEC#
+riscv64 SR-rd-phantom vredmax.vs +REG_VEC#
+riscv64 SR-rd-phantom vredmaxu.vs +REG_VEC#
+riscv64 SR-rd-phantom vredmin.vs +REG_VEC#
+riscv64 SR-rd-phantom vredminu.vs +REG_VEC#
+riscv64 SR-rd-phantom vredor.vs +REG_VEC#
+riscv64 SR-rd-phantom vredsum.vs +REG_VEC#
+riscv64 SR-rd-phantom vredxor.vs +REG_VEC#
+riscv64 SR-rd-phantom vrem.vv +REG_VEC#
+riscv64 SR-rd-phantom vrem.vx +REG_VEC#
+riscv64 SR-rd-phantom vremu.vv +REG_VEC#
+riscv64 SR-rd-phantom vremu.vx +REG_VEC#
+riscv64 SR-rd-phantom vrgather.vi +REG_VEC#
+riscv64 SR-rd-phantom vrgather.vv +REG_VEC#
+riscv64 SR-rd-phantom vrgather.vx +REG_VEC#
+riscv64 SR-rd-phantom vrgatherei16.vv +REG_VEC#
+riscv64 SR-rd-phantom vrol.vv +REG_VEC#
+riscv64 SR-rd-phantom vrol.vx +REG_VEC#
+riscv64 SR-rd-phantom vror.vi +REG_VEC#
+riscv64 SR-rd-phantom vror.vv +REG_VEC#
+riscv64 SR-rd-phantom vror.vx +REG_VEC#
+riscv64 SR-rd-phantom vrsub.vi +REG_VEC#
+riscv64 SR-rd-phantom vrsub.vx +REG_VEC#
+riscv64 SR-rd-phantom vs2r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vs4r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vs8r.v +REG_VCTRL,REG_VEC#
+riscv64 SR-rd-phantom vsadd.vi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsadd.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsadd.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsaddu.vi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsaddu.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsaddu.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsbc.vvm +REG_VEC#
+riscv64 SR-rd-phantom vsbc.vxm +REG_VEC#
+riscv64 SR-rd-phantom vsha2ch.vv +REG_VEC#
+riscv64 SR-rd-phantom vsha2cl.vv +REG_VEC#
+riscv64 SR-rd-phantom vsha2ms.vv +REG_VEC#
+riscv64 SR-rd-phantom vslide1down.vx +REG_VEC#
+riscv64 SR-rd-phantom vslide1up.vx +REG_VEC#
+riscv64 SR-rd-phantom vslidedown.vi +REG_VEC#
+riscv64 SR-rd-phantom vslidedown.vx +REG_VEC#
+riscv64 SR-rd-phantom vslideup.vi +REG_VEC#
+riscv64 SR-rd-phantom vslideup.vx +REG_VEC#
+riscv64 SR-rd-phantom vsll.vi +REG_VEC#
+riscv64 SR-rd-phantom vsll.vv +REG_VEC#
+riscv64 SR-rd-phantom vsll.vx +REG_VEC#
+riscv64 SR-rd-phantom vsm3c.vi +REG_VEC#
+riscv64 SR-rd-phantom vsm3me.vv +REG_VEC#
+riscv64 SR-rd-phantom vsm4k.vi +REG_VEC#
+riscv64 SR-rd-phantom vsmul.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsmul.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsoxseg2ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg2ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg2ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg2ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg3ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg3ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg3ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg3ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg4ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg4ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg4ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg4ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg5ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg5ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg5ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg5ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg6ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg6ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg6ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg6ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg7ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg7ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg7ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg7ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg8ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg8ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg8ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsoxseg8ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsra.vi +REG_VEC#
+riscv64 SR-rd-phantom vsra.vv +REG_VEC#
+riscv64 SR-rd-phantom vsra.vx +REG_VEC#
+riscv64 SR-rd-phantom vsrl.vi +REG_VEC#
+riscv64 SR-rd-phantom vsrl.vv +REG_VEC#
+riscv64 SR-rd-phantom vsrl.vx +REG_VEC#
+riscv64 SR-rd-phantom vsseg2e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg2e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg2e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg2e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg3e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg3e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg3e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg3e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg4e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg4e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg4e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg4e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg5e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg5e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg5e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg5e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg6e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg6e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg6e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg6e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg7e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg7e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg7e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg7e8.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg8e16.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg8e32.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg8e64.v +REG_VEC#
+riscv64 SR-rd-phantom vsseg8e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssra.vi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssra.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssra.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssrl.vi +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssrl.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssrl.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssseg2e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg2e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg2e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg2e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg3e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg3e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg3e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg3e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg4e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg4e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg4e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg4e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg5e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg5e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg5e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg5e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg6e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg6e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg6e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg6e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg7e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg7e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg7e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg7e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg8e16.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg8e32.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg8e64.v +REG_VEC#
+riscv64 SR-rd-phantom vssseg8e8.v +REG_VEC#
+riscv64 SR-rd-phantom vssub.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssub.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssubu.vv +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vssubu.vx +REG_FCSR,REG_VEC#
+riscv64 SR-rd-phantom vsub.vv +REG_VEC#
+riscv64 SR-rd-phantom vsub.vx +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg2ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg2ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg2ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg2ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg3ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg3ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg3ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg3ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg4ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg4ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg4ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg4ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg5ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg5ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg5ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg5ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg6ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg6ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg6ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg6ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg7ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg7ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg7ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg7ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg8ei16.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg8ei32.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg8ei64.v +REG_VEC#
+riscv64 SR-rd-phantom vsuxseg8ei8.v +REG_VEC#
+riscv64 SR-rd-phantom vwadd.vv +REG_VEC#
+riscv64 SR-rd-phantom vwadd.vx +REG_VEC#
+riscv64 SR-rd-phantom vwadd.wv +REG_VEC#
+riscv64 SR-rd-phantom vwadd.wx +REG_VEC#
+riscv64 SR-rd-phantom vwaddu.vv +REG_VEC#
+riscv64 SR-rd-phantom vwaddu.vx +REG_VEC#
+riscv64 SR-rd-phantom vwaddu.wv +REG_VEC#
+riscv64 SR-rd-phantom vwaddu.wx +REG_VEC#
+riscv64 SR-rd-phantom vwcvt.x.x.v +REG_VEC#
+riscv64 SR-rd-phantom vwcvtu.x.x.v +REG_VEC#
+riscv64 SR-rd-phantom vwmul.vv +REG_VEC#
+riscv64 SR-rd-phantom vwmul.vx +REG_VEC#
+riscv64 SR-rd-phantom vwmulsu.vv +REG_VEC#
+riscv64 SR-rd-phantom vwmulsu.vx +REG_VEC#
+riscv64 SR-rd-phantom vwmulu.vv +REG_VEC#
+riscv64 SR-rd-phantom vwmulu.vx +REG_VEC#
+riscv64 SR-rd-phantom vwredsum.vs +REG_VEC#
+riscv64 SR-rd-phantom vwredsumu.vs +REG_VEC#
+riscv64 SR-rd-phantom vwsll.vi +REG_VEC#
+riscv64 SR-rd-phantom vwsll.vv +REG_VEC#
+riscv64 SR-rd-phantom vwsll.vx +REG_VEC#
+riscv64 SR-rd-phantom vwsub.vv +REG_VEC#
+riscv64 SR-rd-phantom vwsub.vx +REG_VEC#
+riscv64 SR-rd-phantom vwsub.wv +REG_VEC#
+riscv64 SR-rd-phantom vwsub.wx +REG_VEC#
+riscv64 SR-rd-phantom vwsubu.vv +REG_VEC#
+riscv64 SR-rd-phantom vwsubu.vx +REG_VEC#
+riscv64 SR-rd-phantom vwsubu.wv +REG_VEC#
+riscv64 SR-rd-phantom vwsubu.wx +REG_VEC#
+riscv64 SR-rd-phantom vxor.vi +REG_VEC#
+riscv64 SR-rd-phantom vxor.vv +REG_VEC#
+riscv64 SR-rd-phantom vxor.vx +REG_VEC#
+riscv64 SR-rd-phantom vzext.vf2 +REG_VEC#
+riscv64 SR-rd-phantom vzext.vf8 +REG_VEC#
+
+# --- R-CSRIMM: the CSR a number selects, which LLVM models as an IMMEDIATE.
+#     299 signature(s), 22749 encodings at this tip.
+#
+# A CSR instruction addresses its register by a 12-bit NUMBER, and LLVM's
+# MCInstrDesc carries that number as an immediate operand: there is no register
+# operand for the reference to name, whatever the number selects.  The tracer
+# names the register, in the behaviour class the CSR table (371 entries) puts
+# it in -- REG_FCSR for the FP control-and-status file, REG_VCTRL for the
+# vector configuration, REG_SSP for Zicfiss ssp, REG_SYS for the long tail.
+# This is the boundary file's own `riscv64 SR-rd-phantom * +REG_SYS` row seen
+# per-family at this layer.  R16: the dependency is the ISA's, and a reference
+# that does not model the register cannot refute it.
+riscv64 SR-rd-phantom cbo.clean +REG_SYS
+riscv64 SR-rd-phantom cbo.flush +REG_SYS
+riscv64 SR-rd-phantom cbo.inval +REG_SYS
+riscv64 SR-rd-phantom cbo.zero +REG_SYS
+riscv64 SR-rd-phantom csrc +REG_FCSR
+riscv64 SR-rd-phantom csrc +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrc +REG_SYS
+riscv64 SR-rd-phantom csrc +REG_VCTRL
+riscv64 SR-rd-phantom csrci +REG_FCSR
+riscv64 SR-rd-phantom csrci +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrci +REG_SYS
+riscv64 SR-rd-phantom csrci +REG_VCTRL
+riscv64 SR-rd-phantom csrr +REG_FCSR
+riscv64 SR-rd-phantom csrr +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrr +REG_SYS
+riscv64 SR-rd-phantom csrr +REG_VCTRL
+riscv64 SR-rd-phantom csrrc +REG_FCSR
+riscv64 SR-rd-phantom csrrc +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrc +REG_SYS
+riscv64 SR-rd-phantom csrrc +REG_VCTRL
+riscv64 SR-rd-phantom csrrci +REG_FCSR
+riscv64 SR-rd-phantom csrrci +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrci +REG_SYS
+riscv64 SR-rd-phantom csrrci +REG_VCTRL
+riscv64 SR-rd-phantom csrrs +REG_FCSR
+riscv64 SR-rd-phantom csrrs +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrs +REG_SYS
+riscv64 SR-rd-phantom csrrs +REG_VCTRL
+riscv64 SR-rd-phantom csrrsi +REG_FCSR
+riscv64 SR-rd-phantom csrrsi +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrsi +REG_SYS
+riscv64 SR-rd-phantom csrrsi +REG_VCTRL
+riscv64 SR-rd-phantom csrrw +REG_FCSR
+riscv64 SR-rd-phantom csrrw +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrw +REG_SYS
+riscv64 SR-rd-phantom csrrw +REG_VCTRL
+riscv64 SR-rd-phantom csrrwi +REG_FCSR
+riscv64 SR-rd-phantom csrrwi +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrrwi +REG_SYS
+riscv64 SR-rd-phantom csrrwi +REG_VCTRL
+riscv64 SR-rd-phantom csrs +REG_FCSR
+riscv64 SR-rd-phantom csrs +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrs +REG_SYS
+riscv64 SR-rd-phantom csrs +REG_VCTRL
+riscv64 SR-rd-phantom csrsi +REG_FCSR
+riscv64 SR-rd-phantom csrsi +REG_SSP,REG_SYS
+riscv64 SR-rd-phantom csrsi +REG_SYS
+riscv64 SR-rd-phantom csrsi +REG_VCTRL
+riscv64 SR-rd-phantom fadd.d +REG_FCSR
+riscv64 SR-rd-phantom fadd.h +REG_FCSR
+riscv64 SR-rd-phantom fadd.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.bf16.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.l +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.lu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.w +REG_FCSR
+riscv64 SR-rd-phantom fcvt.d.wu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.l +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.lu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.w +REG_FCSR
+riscv64 SR-rd-phantom fcvt.h.wu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.l.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.l.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.l.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.lu.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.lu.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.lu.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.bf16 +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.l +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.lu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.w +REG_FCSR
+riscv64 SR-rd-phantom fcvt.s.wu +REG_FCSR
+riscv64 SR-rd-phantom fcvt.w.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.w.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.w.s +REG_FCSR
+riscv64 SR-rd-phantom fcvt.wu.d +REG_FCSR
+riscv64 SR-rd-phantom fcvt.wu.h +REG_FCSR
+riscv64 SR-rd-phantom fcvt.wu.s +REG_FCSR
+riscv64 SR-rd-phantom fcvtmod.w.d +REG_FCSR
+riscv64 SR-rd-phantom fdiv.d +REG_FCSR
+riscv64 SR-rd-phantom fdiv.h +REG_FCSR
+riscv64 SR-rd-phantom fdiv.s +REG_FCSR
+riscv64 SR-rd-phantom fence +REG_SYS
+riscv64 SR-rd-phantom fence.tso +REG_SYS
+riscv64 SR-rd-phantom feq.d +REG_FCSR
+riscv64 SR-rd-phantom feq.h +REG_FCSR
+riscv64 SR-rd-phantom feq.s +REG_FCSR
+riscv64 SR-rd-phantom fle.d +REG_FCSR
+riscv64 SR-rd-phantom fle.h +REG_FCSR
+riscv64 SR-rd-phantom fle.s +REG_FCSR
+riscv64 SR-rd-phantom fleq.d +REG_FCSR
+riscv64 SR-rd-phantom fleq.h +REG_FCSR
+riscv64 SR-rd-phantom fleq.s +REG_FCSR
+riscv64 SR-rd-phantom flt.d +REG_FCSR
+riscv64 SR-rd-phantom flt.h +REG_FCSR
+riscv64 SR-rd-phantom flt.s +REG_FCSR
+riscv64 SR-rd-phantom fltq.d +REG_FCSR
+riscv64 SR-rd-phantom fltq.h +REG_FCSR
+riscv64 SR-rd-phantom fltq.s +REG_FCSR
+riscv64 SR-rd-phantom fmadd.d +REG_FCSR
+riscv64 SR-rd-phantom fmadd.h +REG_FCSR
+riscv64 SR-rd-phantom fmadd.s +REG_FCSR
+riscv64 SR-rd-phantom fmax.d +REG_FCSR
+riscv64 SR-rd-phantom fmax.h +REG_FCSR
+riscv64 SR-rd-phantom fmax.s +REG_FCSR
+riscv64 SR-rd-phantom fmaxm.d +REG_FCSR
+riscv64 SR-rd-phantom fmaxm.h +REG_FCSR
+riscv64 SR-rd-phantom fmaxm.s +REG_FCSR
+riscv64 SR-rd-phantom fmin.d +REG_FCSR
+riscv64 SR-rd-phantom fmin.h +REG_FCSR
+riscv64 SR-rd-phantom fmin.s +REG_FCSR
+riscv64 SR-rd-phantom fminm.d +REG_FCSR
+riscv64 SR-rd-phantom fminm.h +REG_FCSR
+riscv64 SR-rd-phantom fminm.s +REG_FCSR
+riscv64 SR-rd-phantom fmsub.d +REG_FCSR
+riscv64 SR-rd-phantom fmsub.h +REG_FCSR
+riscv64 SR-rd-phantom fmsub.s +REG_FCSR
+riscv64 SR-rd-phantom fmul.d +REG_FCSR
+riscv64 SR-rd-phantom fmul.h +REG_FCSR
+riscv64 SR-rd-phantom fmul.s +REG_FCSR
+riscv64 SR-rd-phantom fnmadd.d +REG_FCSR
+riscv64 SR-rd-phantom fnmadd.h +REG_FCSR
+riscv64 SR-rd-phantom fnmadd.s +REG_FCSR
+riscv64 SR-rd-phantom fnmsub.d +REG_FCSR
+riscv64 SR-rd-phantom fnmsub.h +REG_FCSR
+riscv64 SR-rd-phantom fnmsub.s +REG_FCSR
+riscv64 SR-rd-phantom frcsr +REG_FCSR
+riscv64 SR-rd-phantom frflags +REG_FCSR
+riscv64 SR-rd-phantom fround.d +REG_FCSR
+riscv64 SR-rd-phantom fround.h +REG_FCSR
+riscv64 SR-rd-phantom fround.s +REG_FCSR
+riscv64 SR-rd-phantom froundnx.d +REG_FCSR
+riscv64 SR-rd-phantom froundnx.h +REG_FCSR
+riscv64 SR-rd-phantom froundnx.s +REG_FCSR
+riscv64 SR-rd-phantom frrm +REG_FCSR
+riscv64 SR-rd-phantom fscsr +REG_FCSR
+riscv64 SR-rd-phantom fsflags +REG_FCSR
+riscv64 SR-rd-phantom fsflagsi +REG_FCSR
+riscv64 SR-rd-phantom fsqrt.d +REG_FCSR
+riscv64 SR-rd-phantom fsqrt.h +REG_FCSR
+riscv64 SR-rd-phantom fsqrt.s +REG_FCSR
+riscv64 SR-rd-phantom fsrm +REG_FCSR
+riscv64 SR-rd-phantom fsrmi +REG_FCSR
+riscv64 SR-rd-phantom fsub.d +REG_FCSR
+riscv64 SR-rd-phantom fsub.h +REG_FCSR
+riscv64 SR-rd-phantom fsub.s +REG_FCSR
+riscv64 SR-rd-phantom hfence.gvma +REG_SYS
+riscv64 SR-rd-phantom hfence.vvma +REG_SYS
+riscv64 SR-rd-phantom hinval.gvma +REG_SYS
+riscv64 SR-rd-phantom hinval.vvma +REG_SYS
+riscv64 SR-rd-phantom hlv.b +REG_SYS
+riscv64 SR-rd-phantom hlv.bu +REG_SYS
+riscv64 SR-rd-phantom hlv.d +REG_SYS
+riscv64 SR-rd-phantom hlv.h +REG_SYS
+riscv64 SR-rd-phantom hlv.hu +REG_SYS
+riscv64 SR-rd-phantom hlv.w +REG_SYS
+riscv64 SR-rd-phantom hlv.wu +REG_SYS
+riscv64 SR-rd-phantom hlvx.hu +REG_SYS
+riscv64 SR-rd-phantom hlvx.wu +REG_SYS
+riscv64 SR-rd-phantom hsv.b +REG_SYS
+riscv64 SR-rd-phantom hsv.d +REG_SYS
+riscv64 SR-rd-phantom hsv.h +REG_SYS
+riscv64 SR-rd-phantom hsv.w +REG_SYS
+riscv64 SR-rd-phantom mret +REG_SYS
+riscv64 SR-rd-phantom rdcycle +REG_SYS,REG_SYSTIMER
+riscv64 SR-rd-phantom rdinstret +REG_SYS,REG_SYSPERF
+riscv64 SR-rd-phantom rdtime +REG_SYS,REG_SYSTIMER
+riscv64 SR-rd-phantom sfence.vma +REG_SYS
+riscv64 SR-rd-phantom sinval.vma +REG_SYS
+riscv64 SR-rd-phantom sret +REG_SYS
+riscv64 SR-rd-phantom sspopchk +REG_SYS
+riscv64 SR-rd-phantom sspush +REG_SYS
+riscv64 SR-rd-phantom vaadd.vv +REG_FCSR
+riscv64 SR-rd-phantom vaadd.vx +REG_FCSR
+riscv64 SR-rd-phantom vaaddu.vv +REG_FCSR
+riscv64 SR-rd-phantom vaaddu.vx +REG_FCSR
+riscv64 SR-rd-phantom vasub.vv +REG_FCSR
+riscv64 SR-rd-phantom vasub.vx +REG_FCSR
+riscv64 SR-rd-phantom vasubu.vv +REG_FCSR
+riscv64 SR-rd-phantom vasubu.vx +REG_FCSR
+riscv64 SR-rd-phantom vfabs.v +REG_FCSR
+riscv64 SR-rd-phantom vfadd.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfadd.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfcvt.f.xu.v +REG_VCTRL
+riscv64 SR-rd-phantom vfcvt.rtz.xu.f.v +REG_FCSR
+riscv64 SR-rd-phantom vfcvt.x.f.v +REG_VCTRL
+riscv64 SR-rd-phantom vfcvt.xu.f.v +REG_VCTRL
+riscv64 SR-rd-phantom vfdiv.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfdiv.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmacc.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfmacc.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmadd.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfmadd.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmax.vf +REG_FCSR
+riscv64 SR-rd-phantom vfmax.vv +REG_FCSR
+riscv64 SR-rd-phantom vfmerge.vfm +REG_FCSR
+riscv64 SR-rd-phantom vfmin.vf +REG_FCSR
+riscv64 SR-rd-phantom vfmin.vv +REG_FCSR
+riscv64 SR-rd-phantom vfmsac.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfmsac.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmsub.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfmsub.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmul.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfmul.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfmv.f.s +REG_FCSR
+riscv64 SR-rd-phantom vfmv.s.f +REG_FCSR
+riscv64 SR-rd-phantom vfneg.v +REG_FCSR
+riscv64 SR-rd-phantom vfnmacc.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfnmacc.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfnmadd.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfnmadd.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfnmsac.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfnmsac.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfnmsub.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfnmsub.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfrdiv.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfredmax.vs +REG_FCSR
+riscv64 SR-rd-phantom vfredmin.vs +REG_FCSR
+riscv64 SR-rd-phantom vfredosum.vs +REG_VCTRL
+riscv64 SR-rd-phantom vfredusum.vs +REG_VCTRL
+riscv64 SR-rd-phantom vfrsub.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfsgnj.vf +REG_FCSR
+riscv64 SR-rd-phantom vfsgnj.vv +REG_FCSR
+riscv64 SR-rd-phantom vfsgnjn.vf +REG_FCSR
+riscv64 SR-rd-phantom vfsgnjn.vv +REG_FCSR
+riscv64 SR-rd-phantom vfsgnjx.vf +REG_FCSR
+riscv64 SR-rd-phantom vfsgnjx.vv +REG_FCSR
+riscv64 SR-rd-phantom vfslide1down.vf +REG_FCSR
+riscv64 SR-rd-phantom vfslide1up.vf +REG_FCSR
+riscv64 SR-rd-phantom vfsqrt.v +REG_VCTRL
+riscv64 SR-rd-phantom vfsub.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfsub.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwadd.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwadd.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwadd.wf +REG_VCTRL
+riscv64 SR-rd-phantom vfwadd.wv +REG_VCTRL
+riscv64 SR-rd-phantom vfwmacc.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwmacc.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwmaccbf16.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwmaccbf16.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwmsac.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwmsac.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwmul.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwmul.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwnmacc.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwnmacc.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwnmsac.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwnmsac.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwredosum.vs +REG_VCTRL
+riscv64 SR-rd-phantom vfwredusum.vs +REG_VCTRL
+riscv64 SR-rd-phantom vfwsub.vf +REG_VCTRL
+riscv64 SR-rd-phantom vfwsub.vv +REG_VCTRL
+riscv64 SR-rd-phantom vfwsub.wf +REG_VCTRL
+riscv64 SR-rd-phantom vfwsub.wv +REG_VCTRL
+riscv64 SR-rd-phantom vmfeq.vf +REG_FCSR
+riscv64 SR-rd-phantom vmfeq.vv +REG_FCSR
+riscv64 SR-rd-phantom vmfge.vf +REG_FCSR
+riscv64 SR-rd-phantom vmfgt.vf +REG_FCSR
+riscv64 SR-rd-phantom vmfle.vf +REG_FCSR
+riscv64 SR-rd-phantom vmfle.vv +REG_FCSR
+riscv64 SR-rd-phantom vmflt.vf +REG_FCSR
+riscv64 SR-rd-phantom vmflt.vv +REG_FCSR
+riscv64 SR-rd-phantom vmfne.vf +REG_FCSR
+riscv64 SR-rd-phantom vmfne.vv +REG_FCSR
+riscv64 SR-rd-phantom vmv1r.v +REG_VCTRL
+riscv64 SR-rd-phantom vnclip.wi +REG_FCSR
+riscv64 SR-rd-phantom vnclip.wv +REG_FCSR
+riscv64 SR-rd-phantom vnclip.wx +REG_FCSR
+riscv64 SR-rd-phantom vnclipu.wi +REG_FCSR
+riscv64 SR-rd-phantom vnclipu.wv +REG_FCSR
+riscv64 SR-rd-phantom vnclipu.wx +REG_FCSR
+riscv64 SR-rd-phantom vs1r.v +REG_VCTRL
+riscv64 SR-rd-phantom vsadd.vi +REG_FCSR
+riscv64 SR-rd-phantom vsadd.vv +REG_FCSR
+riscv64 SR-rd-phantom vsadd.vx +REG_FCSR
+riscv64 SR-rd-phantom vsaddu.vi +REG_FCSR
+riscv64 SR-rd-phantom vsaddu.vv +REG_FCSR
+riscv64 SR-rd-phantom vsaddu.vx +REG_FCSR
+riscv64 SR-rd-phantom vsetivli +REG_VCTRL
+riscv64 SR-rd-phantom vsetvl +REG_VCTRL
+riscv64 SR-rd-phantom vsetvli +REG_VCTRL
+riscv64 SR-rd-phantom vsmul.vv +REG_FCSR
+riscv64 SR-rd-phantom vsmul.vx +REG_FCSR
+riscv64 SR-rd-phantom vssra.vi +REG_FCSR
+riscv64 SR-rd-phantom vssra.vv +REG_FCSR
+riscv64 SR-rd-phantom vssra.vx +REG_FCSR
+riscv64 SR-rd-phantom vssrl.vi +REG_FCSR
+riscv64 SR-rd-phantom vssrl.vv +REG_FCSR
+riscv64 SR-rd-phantom vssrl.vx +REG_FCSR
+riscv64 SR-rd-phantom vssub.vv +REG_FCSR
+riscv64 SR-rd-phantom vssub.vx +REG_FCSR
+riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
+riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
+riscv64 SR-rd-phantom wfi +REG_SYS
+
+# --- M-DSPIMM: QEMU's MIPS DSP translators read the IMMEDIATE FIELD as a GPR -- FINDING 71-A.
+#     31 signature(s), 1373 encodings, NOT ALLOWLISTED.
+#     An allowlist row asserts the tracer is right; these stay red.
+#     mipsel SR-rd-phantom extp +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom extpdp +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom extr.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom extr_r.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom extr_rs.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom extr_s.h +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom precr_sra.ph.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom precr_sra_r.ph.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.ph +REG_FP_REG,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.ph +REG_LR,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.ph +REG_SP,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.qb +REG_FP_REG,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.qb +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.qb +REG_LR,REG_SYSEXC
+#     mipsel SR-rd-phantom repl.qb +REG_SP,REG_SYSEXC
+#     mipsel SR-rd-phantom shilo +REG_FP_REG,REG_SYSEXC
+#     mipsel SR-rd-phantom shilo +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shilo +REG_LR,REG_SYSEXC
+#     mipsel SR-rd-phantom shilo +REG_SP,REG_SYSEXC
+#     mipsel SR-rd-phantom shll.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shll_s.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shll_s.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shra.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shra.qb +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shra_r.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shra_r.qb +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shra_r.w +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shrl.ph +REG_GPR#,REG_SYSEXC
+#     mipsel SR-rd-phantom shrl.qb +REG_GPR#,REG_SYSEXC
+
+# --- M-LSA: an R6 mnemonic carrying the 24Kf PMON translation's dataflow -- FINDING 70-A.
+#     1 signature(s), 89 encodings, NOT ALLOWLISTED.
+#     An allowlist row asserts the tracer is right; these stay red.
+#     mipsel SR-rd-phantom lsa +REG_GPR#
+
+# --- M-MERGE: the unaligned loads merge into their destination, so the destination is a source.
+#     8 signature(s), 8064 encodings at this tip.
+#
+# LWL / LWR / LWLE / LWRE write only the bytes their address selects and leave
+# the rest of $rt standing, so the old $rt is a true source.  LLVM's
+# MCInstrDesc agrees and its MCInst drops the tie, which is the same shape the
+# boundary block for lwl/lwr in this file already carries.
+mipsel SR-rd-phantom lwl +REG_GPR#
+mipsel SR-rd-phantom lwle +REG_GPR#,REG_SYSEXC
+mipsel SR-rd-phantom lwle +REG_SYSEXC
+mipsel SR-rd-phantom lwr +REG_GPR#
+mipsel SR-rd-phantom lwre +REG_GPR#,REG_SYSEXC
+mipsel SR-rd-phantom lwre +REG_SYSEXC
+mipsel SR-rd-phantom swle +REG_SYSEXC
+mipsel SR-rd-phantom swre +REG_SYSEXC
+
+# --- M-MT: the MT ASE far operand, reported in the file the (u, sel) pair selects.
+#     13 signature(s), 8448 encodings at this tip.
+#
+# MFTR / MTTR move between thread contexts and the (u, sel) pair chooses WHICH
+# FILE the far operand lives in -- GPR, FPR, accumulator, CP0, the DSP control
+# word.  The tracer reports the register in the file the pair selects; LLVM
+# models the pair as immediates and names the GPR encoding regardless.  The
+# paired phantom and missing entries are ONE operand reclassified, not two
+# findings, exactly as the boundary block for this family already states.
+mipsel SR-rd-missing mftr +REG_GPR#
+mipsel SR-rd-phantom mftr +REG_ACC#,REG_ACCHI#,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_COPROC0,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_FPR#,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_SYS,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_SYSDBG,REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_SYSEXC
+mipsel SR-rd-phantom mftr +REG_SYSEXC,REG_SYSID
+mipsel SR-rd-phantom mftr +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom mftr +REG_SYSEXC,REG_SYSTIMER
+mipsel SR-rd-phantom mttr +REG_SYSEXC
+
+# --- M-CP0: the CP0 register an instruction owns, in the class the split put it in.
+#     20 signature(s), 3299 encodings at this tip.
+#
+# The TLB maintenance instructions, the exception returns and the COP0 moves
+# name their coprocessor-0 registers through a (rd, sel) pair or implicitly;
+# QEMU's helpers name them one at a time and the tracer records the class --
+# REG_SYSMMU for the TLB file, REG_SYSEXC for Status/Cause/EPC, REG_SYSDBG for
+# the EJTAG file, REG_SYSID for the read-only identification registers.  LLVM's
+# MIPS tables model no CP0 register on any of these forms.
+mipsel SR-rd-missing ctcmsa +REG_COPROC0
+mipsel SR-rd-missing ctcmsa +REG_SYSMMU
+mipsel SR-rd-phantom cfcmsa +REG_SYSEXC
+mipsel SR-rd-phantom ctcmsa +REG_SYSEXC
+mipsel SR-rd-phantom deret +REG_SYSDBG,REG_SYSEXC
+mipsel SR-rd-phantom dvpe +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom eret +REG_SYSEXC
+mipsel SR-rd-phantom evpe +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom mfc0 +REG_SYSEXC
+mipsel SR-rd-phantom mfc2 +REG_FPR#,REG_SYSEXC
+mipsel SR-rd-phantom mtc0 +REG_SYSEXC
+mipsel SR-rd-phantom mtc2 +REG_FPR#,REG_SYSEXC
+mipsel SR-rd-phantom sdbbp +REG_SYSDBG,REG_SYSEXC
+mipsel SR-rd-phantom tlbinv +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom tlbinvf +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom tlbp +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom tlbr +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom tlbwi +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom tlbwr +REG_SYSEXC,REG_SYSMMU
+mipsel SR-rd-phantom wait +REG_SYSEXC
+
+# --- M-FCSR: FCR31 / MSACSR is read-modify-written by every COP1 and MSA arithmetic instruction.
+#     200 signature(s), 39384 encodings at this tip.
+#
+# QEMU's update_fcr31() read-modify-writes the word on every call -- it
+# SET_FP_CAUSEs into it and reads GET_FP_ENABLE out of it -- and update_msacsr()
+# is the same shape, so the register is a true source of the instruction that
+# updates it.  LLVM's MIPS tables model no FP status register at all.  This is
+# the fields-layer face of the same fact the FR block above already carries;
+# what is new is the SIGNATURE, not the argument.
+mipsel SR-rd-phantom add.d +REG_FCSR
+mipsel SR-rd-phantom add.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom add.s +REG_FCSR
+mipsel SR-rd-phantom addr.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom bc1f +REG_FCSR
+mipsel SR-rd-phantom bc1fl +REG_FCSR
+mipsel SR-rd-phantom bc1t +REG_FCSR
+mipsel SR-rd-phantom bc1tl +REG_FCSR
+mipsel SR-rd-phantom c.eq.d +REG_FCSR
+mipsel SR-rd-phantom c.eq.s +REG_FCSR
+mipsel SR-rd-phantom c.f.d +REG_FCSR
+mipsel SR-rd-phantom c.f.s +REG_FCSR
+mipsel SR-rd-phantom c.le.d +REG_FCSR
+mipsel SR-rd-phantom c.le.s +REG_FCSR
+mipsel SR-rd-phantom c.lt.d +REG_FCSR
+mipsel SR-rd-phantom c.lt.s +REG_FCSR
+mipsel SR-rd-phantom c.nge.d +REG_FCSR
+mipsel SR-rd-phantom c.nge.s +REG_FCSR
+mipsel SR-rd-phantom c.ngl.d +REG_FCSR
+mipsel SR-rd-phantom c.ngl.s +REG_FCSR
+mipsel SR-rd-phantom c.ngle.d +REG_FCSR
+mipsel SR-rd-phantom c.ngle.s +REG_FCSR
+mipsel SR-rd-phantom c.ngt.d +REG_FCSR
+mipsel SR-rd-phantom c.ngt.s +REG_FCSR
+mipsel SR-rd-phantom c.ole.d +REG_FCSR
+mipsel SR-rd-phantom c.ole.s +REG_FCSR
+mipsel SR-rd-phantom c.olt.d +REG_FCSR
+mipsel SR-rd-phantom c.olt.s +REG_FCSR
+mipsel SR-rd-phantom c.seq.d +REG_FCSR
+mipsel SR-rd-phantom c.seq.s +REG_FCSR
+mipsel SR-rd-phantom c.sf.d +REG_FCSR
+mipsel SR-rd-phantom c.sf.s +REG_FCSR
+mipsel SR-rd-phantom c.ueq.d +REG_FCSR
+mipsel SR-rd-phantom c.ueq.s +REG_FCSR
+mipsel SR-rd-phantom c.ule.d +REG_FCSR
+mipsel SR-rd-phantom c.ule.s +REG_FCSR
+mipsel SR-rd-phantom c.ult.d +REG_FCSR
+mipsel SR-rd-phantom c.ult.s +REG_FCSR
+mipsel SR-rd-phantom c.un.d +REG_FCSR
+mipsel SR-rd-phantom c.un.s +REG_FCSR
+mipsel SR-rd-phantom ceil.l.d +REG_FCSR
+mipsel SR-rd-phantom ceil.l.s +REG_FCSR
+mipsel SR-rd-phantom ceil.w.d +REG_FCSR
+mipsel SR-rd-phantom ceil.w.s +REG_FCSR
+mipsel SR-rd-phantom ctc1 +REG_FCSR,REG_SYSEXC,REG_SYSID
+mipsel SR-rd-phantom cvt.d.l +REG_FCSR
+mipsel SR-rd-phantom cvt.d.s +REG_FCSR
+mipsel SR-rd-phantom cvt.d.w +REG_FCSR
+mipsel SR-rd-phantom cvt.l.d +REG_FCSR
+mipsel SR-rd-phantom cvt.l.s +REG_FCSR
+mipsel SR-rd-phantom cvt.ps.pw +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom cvt.pw.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom cvt.s.d +REG_FCSR
+mipsel SR-rd-phantom cvt.s.l +REG_FCSR
+mipsel SR-rd-phantom cvt.s.pl +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom cvt.s.pu +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom cvt.s.w +REG_FCSR
+mipsel SR-rd-phantom cvt.w.d +REG_FCSR
+mipsel SR-rd-phantom cvt.w.s +REG_FCSR
+mipsel SR-rd-phantom div.d +REG_FCSR
+mipsel SR-rd-phantom div.s +REG_FCSR
+mipsel SR-rd-phantom fadd.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fadd.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcaf.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcaf.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fceq.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fceq.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcle.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcle.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fclt.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fclt.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcne.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcne.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcor.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcor.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcueq.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcueq.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcule.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcule.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcult.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcult.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcun.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcun.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcune.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fcune.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fdiv.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fdiv.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexdo.h +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexdo.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexp2.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexp2.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexupl.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexupl.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexupr.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fexupr.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffint_s.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffint_s.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffint_u.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffint_u.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffql.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffql.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffqr.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ffqr.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom flog2.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom flog2.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom floor.l.d +REG_FCSR
+mipsel SR-rd-phantom floor.l.s +REG_FCSR
+mipsel SR-rd-phantom floor.w.d +REG_FCSR
+mipsel SR-rd-phantom floor.w.s +REG_FCSR
+mipsel SR-rd-phantom fmadd.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmadd.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmax.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmax.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmax_a.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmax_a.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmin.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmin.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmin_a.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmin_a.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmsub.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmsub.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmul.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fmul.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frcp.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frcp.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frint.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frint.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frsqrt.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom frsqrt.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsaf.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsaf.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fseq.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fseq.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsle.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsle.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fslt.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fslt.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsne.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsne.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsor.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsor.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsqrt.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsqrt.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsub.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsub.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsueq.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsueq.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsule.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsule.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsult.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsult.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsun.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsun.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsune.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom fsune.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftint_s.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftint_s.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftint_u.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftint_u.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftq.h +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftq.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftrunc_s.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftrunc_s.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftrunc_u.d +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom ftrunc_u.w +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom madd.d +REG_FCSR
+mipsel SR-rd-phantom madd.s +REG_FCSR
+mipsel SR-rd-phantom movf +REG_FCSR
+mipsel SR-rd-phantom movf.d +REG_FCSR
+mipsel SR-rd-phantom movf.s +REG_FCSR
+mipsel SR-rd-phantom movt +REG_FCSR
+mipsel SR-rd-phantom movt.d +REG_FCSR
+mipsel SR-rd-phantom movt.s +REG_FCSR
+mipsel SR-rd-phantom msub.d +REG_FCSR
+mipsel SR-rd-phantom msub.s +REG_FCSR
+mipsel SR-rd-phantom mul.d +REG_FCSR
+mipsel SR-rd-phantom mul.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom mul.s +REG_FCSR
+mipsel SR-rd-phantom mulr.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom nmadd.d +REG_FCSR
+mipsel SR-rd-phantom nmadd.s +REG_FCSR
+mipsel SR-rd-phantom nmsub.d +REG_FCSR
+mipsel SR-rd-phantom nmsub.s +REG_FCSR
+mipsel SR-rd-phantom recip.d +REG_FCSR
+mipsel SR-rd-phantom recip.s +REG_FCSR
+mipsel SR-rd-phantom round.l.d +REG_FCSR
+mipsel SR-rd-phantom round.l.s +REG_FCSR
+mipsel SR-rd-phantom round.w.d +REG_FCSR
+mipsel SR-rd-phantom round.w.s +REG_FCSR
+mipsel SR-rd-phantom rsqrt.d +REG_FCSR
+mipsel SR-rd-phantom rsqrt.s +REG_FCSR
+mipsel SR-rd-phantom sqrt.d +REG_FCSR
+mipsel SR-rd-phantom sqrt.s +REG_FCSR
+mipsel SR-rd-phantom sub.d +REG_FCSR
+mipsel SR-rd-phantom sub.ps +REG_FCSR,REG_SYSEXC
+mipsel SR-rd-phantom sub.s +REG_FCSR
+mipsel SR-rd-phantom trunc.l.d +REG_FCSR
+mipsel SR-rd-phantom trunc.l.s +REG_FCSR
+mipsel SR-rd-phantom trunc.w.d +REG_FCSR
+mipsel SR-rd-phantom trunc.w.s +REG_FCSR
+
+# --- M-EXC: the footprint of the exception an instruction RAISES.
+#     622 signature(s), 190266 encodings at this tip.
+#
+# R7.6: syscall, break, the twelve conditional traps, the overflow-checking
+# arithmetic and the DSP forms whose availability is gated all reach QEMU's
+# exception path, which read-modify-writes Status and Cause and writes EPC
+# (tlb_helper.c).  The tracer records that footprint; LLVM MC models no
+# exception entry on any instruction, so it is a phantom on both the read and
+# the write because the model is a read-modify-write.  Again the fields-layer
+# face of the FR block above, under the `SR-` key.
+mipsel SR-rd-phantom absq_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom absq_s.qb +REG_SYSEXC
+mipsel SR-rd-phantom absq_s.w +REG_SYSEXC
+mipsel SR-rd-phantom add +REG_SYSEXC
+mipsel SR-rd-phantom add_a.b +REG_SYSEXC
+mipsel SR-rd-phantom add_a.d +REG_SYSEXC
+mipsel SR-rd-phantom add_a.h +REG_SYSEXC
+mipsel SR-rd-phantom add_a.w +REG_SYSEXC
+mipsel SR-rd-phantom addi +REG_SYSEXC
+mipsel SR-rd-phantom addq.ph +REG_SYSEXC
+mipsel SR-rd-phantom addq_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom addq_s.w +REG_SYSEXC
+mipsel SR-rd-phantom addqh.ph +REG_SYSEXC
+mipsel SR-rd-phantom addqh.w +REG_SYSEXC
+mipsel SR-rd-phantom addqh_r.ph +REG_SYSEXC
+mipsel SR-rd-phantom addqh_r.w +REG_SYSEXC
+mipsel SR-rd-phantom adds_a.b +REG_SYSEXC
+mipsel SR-rd-phantom adds_a.d +REG_SYSEXC
+mipsel SR-rd-phantom adds_a.h +REG_SYSEXC
+mipsel SR-rd-phantom adds_a.w +REG_SYSEXC
+mipsel SR-rd-phantom adds_s.b +REG_SYSEXC
+mipsel SR-rd-phantom adds_s.d +REG_SYSEXC
+mipsel SR-rd-phantom adds_s.h +REG_SYSEXC
+mipsel SR-rd-phantom adds_s.w +REG_SYSEXC
+mipsel SR-rd-phantom adds_u.b +REG_SYSEXC
+mipsel SR-rd-phantom adds_u.d +REG_SYSEXC
+mipsel SR-rd-phantom adds_u.h +REG_SYSEXC
+mipsel SR-rd-phantom adds_u.w +REG_SYSEXC
+mipsel SR-rd-phantom addsc +REG_SYSEXC
+mipsel SR-rd-phantom addu.ph +REG_SYSEXC
+mipsel SR-rd-phantom addu.qb +REG_SYSEXC
+mipsel SR-rd-phantom addu_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom addu_s.qb +REG_SYSEXC
+mipsel SR-rd-phantom adduh.qb +REG_SYSEXC
+mipsel SR-rd-phantom adduh_r.qb +REG_SYSEXC
+mipsel SR-rd-phantom addv.b +REG_SYSEXC
+mipsel SR-rd-phantom addv.d +REG_SYSEXC
+mipsel SR-rd-phantom addv.h +REG_SYSEXC
+mipsel SR-rd-phantom addv.w +REG_SYSEXC
+mipsel SR-rd-phantom addvi.b +REG_SYSEXC
+mipsel SR-rd-phantom addvi.d +REG_SYSEXC
+mipsel SR-rd-phantom addvi.h +REG_SYSEXC
+mipsel SR-rd-phantom addvi.w +REG_SYSEXC
+mipsel SR-rd-phantom addwc +REG_SYSEXC
+mipsel SR-rd-phantom and.v +REG_SYSEXC
+mipsel SR-rd-phantom andi.b +REG_SYSEXC
+mipsel SR-rd-phantom append +REG_SYSEXC
+mipsel SR-rd-phantom asub_s.b +REG_SYSEXC
+mipsel SR-rd-phantom asub_s.d +REG_SYSEXC
+mipsel SR-rd-phantom asub_s.h +REG_SYSEXC
+mipsel SR-rd-phantom asub_s.w +REG_SYSEXC
+mipsel SR-rd-phantom asub_u.b +REG_SYSEXC
+mipsel SR-rd-phantom asub_u.d +REG_SYSEXC
+mipsel SR-rd-phantom asub_u.h +REG_SYSEXC
+mipsel SR-rd-phantom asub_u.w +REG_SYSEXC
+mipsel SR-rd-phantom ave_s.b +REG_SYSEXC
+mipsel SR-rd-phantom ave_s.d +REG_SYSEXC
+mipsel SR-rd-phantom ave_s.h +REG_SYSEXC
+mipsel SR-rd-phantom ave_s.w +REG_SYSEXC
+mipsel SR-rd-phantom ave_u.b +REG_SYSEXC
+mipsel SR-rd-phantom ave_u.d +REG_SYSEXC
+mipsel SR-rd-phantom ave_u.h +REG_SYSEXC
+mipsel SR-rd-phantom ave_u.w +REG_SYSEXC
+mipsel SR-rd-phantom aver_s.b +REG_SYSEXC
+mipsel SR-rd-phantom aver_s.d +REG_SYSEXC
+mipsel SR-rd-phantom aver_s.h +REG_SYSEXC
+mipsel SR-rd-phantom aver_s.w +REG_SYSEXC
+mipsel SR-rd-phantom aver_u.b +REG_SYSEXC
+mipsel SR-rd-phantom aver_u.d +REG_SYSEXC
+mipsel SR-rd-phantom aver_u.h +REG_SYSEXC
+mipsel SR-rd-phantom aver_u.w +REG_SYSEXC
+mipsel SR-rd-phantom balign +REG_SYSEXC
+mipsel SR-rd-phantom bclr.b +REG_SYSEXC
+mipsel SR-rd-phantom bclr.d +REG_SYSEXC
+mipsel SR-rd-phantom bclr.h +REG_SYSEXC
+mipsel SR-rd-phantom bclr.w +REG_SYSEXC
+mipsel SR-rd-phantom bclri.b +REG_SYSEXC
+mipsel SR-rd-phantom bclri.d +REG_SYSEXC
+mipsel SR-rd-phantom bclri.h +REG_SYSEXC
+mipsel SR-rd-phantom bclri.w +REG_SYSEXC
+mipsel SR-rd-phantom binsl.b +REG_SYSEXC
+mipsel SR-rd-phantom binsl.d +REG_SYSEXC
+mipsel SR-rd-phantom binsl.h +REG_SYSEXC
+mipsel SR-rd-phantom binsl.w +REG_SYSEXC
+mipsel SR-rd-phantom binsli.b +REG_SYSEXC
+mipsel SR-rd-phantom binsli.d +REG_SYSEXC
+mipsel SR-rd-phantom binsli.h +REG_SYSEXC
+mipsel SR-rd-phantom binsli.w +REG_SYSEXC
+mipsel SR-rd-phantom binsr.b +REG_SYSEXC
+mipsel SR-rd-phantom binsr.d +REG_SYSEXC
+mipsel SR-rd-phantom binsr.h +REG_SYSEXC
+mipsel SR-rd-phantom binsr.w +REG_SYSEXC
+mipsel SR-rd-phantom binsri.b +REG_SYSEXC
+mipsel SR-rd-phantom binsri.d +REG_SYSEXC
+mipsel SR-rd-phantom binsri.h +REG_SYSEXC
+mipsel SR-rd-phantom binsri.w +REG_SYSEXC
+mipsel SR-rd-phantom bitrev +REG_SYSEXC
+mipsel SR-rd-phantom bmnz.v +REG_SYSEXC
+mipsel SR-rd-phantom bmnzi.b +REG_SYSEXC
+mipsel SR-rd-phantom bmz.v +REG_SYSEXC
+mipsel SR-rd-phantom bmzi.b +REG_SYSEXC
+mipsel SR-rd-phantom bneg.b +REG_SYSEXC
+mipsel SR-rd-phantom bneg.d +REG_SYSEXC
+mipsel SR-rd-phantom bneg.h +REG_SYSEXC
+mipsel SR-rd-phantom bneg.w +REG_SYSEXC
+mipsel SR-rd-phantom bnegi.b +REG_SYSEXC
+mipsel SR-rd-phantom bnegi.d +REG_SYSEXC
+mipsel SR-rd-phantom bnegi.h +REG_SYSEXC
+mipsel SR-rd-phantom bnegi.w +REG_SYSEXC
+mipsel SR-rd-phantom bnz.b +REG_SYSEXC
+mipsel SR-rd-phantom bnz.d +REG_SYSEXC
+mipsel SR-rd-phantom bnz.h +REG_SYSEXC
+mipsel SR-rd-phantom bnz.v +REG_SYSEXC
+mipsel SR-rd-phantom bnz.w +REG_SYSEXC
+mipsel SR-rd-phantom bposge32 +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom break +REG_SYSEXC
+mipsel SR-rd-phantom bsel.v +REG_SYSEXC
+mipsel SR-rd-phantom bseli.b +REG_SYSEXC
+mipsel SR-rd-phantom bset.b +REG_SYSEXC
+mipsel SR-rd-phantom bset.d +REG_SYSEXC
+mipsel SR-rd-phantom bset.h +REG_SYSEXC
+mipsel SR-rd-phantom bset.w +REG_SYSEXC
+mipsel SR-rd-phantom bseti.b +REG_SYSEXC
+mipsel SR-rd-phantom bseti.d +REG_SYSEXC
+mipsel SR-rd-phantom bseti.h +REG_SYSEXC
+mipsel SR-rd-phantom bseti.w +REG_SYSEXC
+mipsel SR-rd-phantom bz.b +REG_SYSEXC
+mipsel SR-rd-phantom bz.d +REG_SYSEXC
+mipsel SR-rd-phantom bz.h +REG_SYSEXC
+mipsel SR-rd-phantom bz.v +REG_SYSEXC
+mipsel SR-rd-phantom bz.w +REG_SYSEXC
+mipsel SR-rd-phantom cache +REG_SYSEXC
+mipsel SR-rd-phantom cachee +REG_SYSEXC
+mipsel SR-rd-phantom ceq.b +REG_SYSEXC
+mipsel SR-rd-phantom ceq.d +REG_SYSEXC
+mipsel SR-rd-phantom ceq.h +REG_SYSEXC
+mipsel SR-rd-phantom ceq.w +REG_SYSEXC
+mipsel SR-rd-phantom ceqi.b +REG_SYSEXC
+mipsel SR-rd-phantom ceqi.d +REG_SYSEXC
+mipsel SR-rd-phantom ceqi.h +REG_SYSEXC
+mipsel SR-rd-phantom ceqi.w +REG_SYSEXC
+mipsel SR-rd-phantom cfc1 +REG_SYSEXC
+mipsel SR-rd-phantom cle_s.b +REG_SYSEXC
+mipsel SR-rd-phantom cle_s.d +REG_SYSEXC
+mipsel SR-rd-phantom cle_s.h +REG_SYSEXC
+mipsel SR-rd-phantom cle_s.w +REG_SYSEXC
+mipsel SR-rd-phantom cle_u.b +REG_SYSEXC
+mipsel SR-rd-phantom cle_u.d +REG_SYSEXC
+mipsel SR-rd-phantom cle_u.h +REG_SYSEXC
+mipsel SR-rd-phantom cle_u.w +REG_SYSEXC
+mipsel SR-rd-phantom clei_s.b +REG_SYSEXC
+mipsel SR-rd-phantom clei_s.d +REG_SYSEXC
+mipsel SR-rd-phantom clei_s.h +REG_SYSEXC
+mipsel SR-rd-phantom clei_s.w +REG_SYSEXC
+mipsel SR-rd-phantom clei_u.b +REG_SYSEXC
+mipsel SR-rd-phantom clei_u.d +REG_SYSEXC
+mipsel SR-rd-phantom clei_u.h +REG_SYSEXC
+mipsel SR-rd-phantom clei_u.w +REG_SYSEXC
+mipsel SR-rd-phantom clt_s.b +REG_SYSEXC
+mipsel SR-rd-phantom clt_s.d +REG_SYSEXC
+mipsel SR-rd-phantom clt_s.h +REG_SYSEXC
+mipsel SR-rd-phantom clt_s.w +REG_SYSEXC
+mipsel SR-rd-phantom clt_u.b +REG_SYSEXC
+mipsel SR-rd-phantom clt_u.d +REG_SYSEXC
+mipsel SR-rd-phantom clt_u.h +REG_SYSEXC
+mipsel SR-rd-phantom clt_u.w +REG_SYSEXC
+mipsel SR-rd-phantom clti_s.b +REG_SYSEXC
+mipsel SR-rd-phantom clti_s.d +REG_SYSEXC
+mipsel SR-rd-phantom clti_s.h +REG_SYSEXC
+mipsel SR-rd-phantom clti_s.w +REG_SYSEXC
+mipsel SR-rd-phantom clti_u.b +REG_SYSEXC
+mipsel SR-rd-phantom clti_u.d +REG_SYSEXC
+mipsel SR-rd-phantom clti_u.h +REG_SYSEXC
+mipsel SR-rd-phantom clti_u.w +REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.eq.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.le.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.lt.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpgu.eq.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpgu.le.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpgu.lt.qb +REG_SYSEXC
+mipsel SR-rd-phantom cmpu.eq.qb +REG_SYSEXC
+mipsel SR-rd-phantom copy_s.b +REG_SYSEXC
+mipsel SR-rd-phantom copy_s.h +REG_SYSEXC
+mipsel SR-rd-phantom copy_s.w +REG_SYSEXC
+mipsel SR-rd-phantom copy_u.b +REG_SYSEXC
+mipsel SR-rd-phantom copy_u.h +REG_SYSEXC
+mipsel SR-rd-phantom cvt.ps.s +REG_SYSEXC
+mipsel SR-rd-phantom div_s.b +REG_SYSEXC
+mipsel SR-rd-phantom div_s.d +REG_SYSEXC
+mipsel SR-rd-phantom div_s.h +REG_SYSEXC
+mipsel SR-rd-phantom div_s.w +REG_SYSEXC
+mipsel SR-rd-phantom div_u.b +REG_SYSEXC
+mipsel SR-rd-phantom div_u.d +REG_SYSEXC
+mipsel SR-rd-phantom div_u.h +REG_SYSEXC
+mipsel SR-rd-phantom div_u.w +REG_SYSEXC
+mipsel SR-rd-phantom dotp_s.d +REG_SYSEXC
+mipsel SR-rd-phantom dotp_s.h +REG_SYSEXC
+mipsel SR-rd-phantom dotp_s.w +REG_SYSEXC
+mipsel SR-rd-phantom dotp_u.d +REG_SYSEXC
+mipsel SR-rd-phantom dotp_u.h +REG_SYSEXC
+mipsel SR-rd-phantom dotp_u.w +REG_SYSEXC
+mipsel SR-rd-phantom dpa.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_s.d +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_s.h +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_s.w +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_u.d +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_u.h +REG_SYSEXC
+mipsel SR-rd-phantom dpadd_u.w +REG_SYSEXC
+mipsel SR-rd-phantom dpaq_s.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpaq_sa.l.w +REG_SYSEXC
+mipsel SR-rd-phantom dpaqx_s.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpaqx_sa.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpau.h.qbl +REG_SYSEXC
+mipsel SR-rd-phantom dpau.h.qbr +REG_SYSEXC
+mipsel SR-rd-phantom dpax.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dps.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpsq_s.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpsq_sa.l.w +REG_SYSEXC
+mipsel SR-rd-phantom dpsqx_s.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpsqx_sa.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom dpsu.h.qbl +REG_SYSEXC
+mipsel SR-rd-phantom dpsu.h.qbr +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_s.d +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_s.h +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_s.w +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_u.d +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_u.h +REG_SYSEXC
+mipsel SR-rd-phantom dpsub_u.w +REG_SYSEXC
+mipsel SR-rd-phantom dpsx.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom ext +REG_SYSEXC
+mipsel SR-rd-phantom extp +REG_SYSEXC
+mipsel SR-rd-phantom extpdp +REG_SYSEXC
+mipsel SR-rd-phantom extpdpv +REG_SYSEXC
+mipsel SR-rd-phantom extpv +REG_SYSEXC
+mipsel SR-rd-phantom extr.w +REG_SYSEXC
+mipsel SR-rd-phantom extr_r.w +REG_SYSEXC
+mipsel SR-rd-phantom extr_rs.w +REG_SYSEXC
+mipsel SR-rd-phantom extr_s.h +REG_SYSEXC
+mipsel SR-rd-phantom extrv.w +REG_SYSEXC
+mipsel SR-rd-phantom extrv_r.w +REG_SYSEXC
+mipsel SR-rd-phantom extrv_rs.w +REG_SYSEXC
+mipsel SR-rd-phantom extrv_s.h +REG_SYSEXC
+mipsel SR-rd-phantom fclass.d +REG_SYSEXC
+mipsel SR-rd-phantom fclass.w +REG_SYSEXC
+mipsel SR-rd-phantom fill.b +REG_SYSEXC
+mipsel SR-rd-phantom fill.h +REG_SYSEXC
+mipsel SR-rd-phantom fill.w +REG_SYSEXC
+mipsel SR-rd-phantom fork +REG_SYSEXC
+mipsel SR-rd-phantom hadd_s.d +REG_SYSEXC
+mipsel SR-rd-phantom hadd_s.h +REG_SYSEXC
+mipsel SR-rd-phantom hadd_s.w +REG_SYSEXC
+mipsel SR-rd-phantom hadd_u.d +REG_SYSEXC
+mipsel SR-rd-phantom hadd_u.h +REG_SYSEXC
+mipsel SR-rd-phantom hadd_u.w +REG_SYSEXC
+mipsel SR-rd-phantom hsub_s.d +REG_SYSEXC
+mipsel SR-rd-phantom hsub_s.h +REG_SYSEXC
+mipsel SR-rd-phantom hsub_s.w +REG_SYSEXC
+mipsel SR-rd-phantom hsub_u.d +REG_SYSEXC
+mipsel SR-rd-phantom hsub_u.h +REG_SYSEXC
+mipsel SR-rd-phantom hsub_u.w +REG_SYSEXC
+mipsel SR-rd-phantom ilvev.b +REG_SYSEXC
+mipsel SR-rd-phantom ilvev.d +REG_SYSEXC
+mipsel SR-rd-phantom ilvev.h +REG_SYSEXC
+mipsel SR-rd-phantom ilvev.w +REG_SYSEXC
+mipsel SR-rd-phantom ilvl.b +REG_SYSEXC
+mipsel SR-rd-phantom ilvl.d +REG_SYSEXC
+mipsel SR-rd-phantom ilvl.h +REG_SYSEXC
+mipsel SR-rd-phantom ilvl.w +REG_SYSEXC
+mipsel SR-rd-phantom ilvod.b +REG_SYSEXC
+mipsel SR-rd-phantom ilvod.d +REG_SYSEXC
+mipsel SR-rd-phantom ilvod.h +REG_SYSEXC
+mipsel SR-rd-phantom ilvod.w +REG_SYSEXC
+mipsel SR-rd-phantom ilvr.b +REG_SYSEXC
+mipsel SR-rd-phantom ilvr.d +REG_SYSEXC
+mipsel SR-rd-phantom ilvr.h +REG_SYSEXC
+mipsel SR-rd-phantom ilvr.w +REG_SYSEXC
+mipsel SR-rd-phantom ins +REG_SYSEXC
+mipsel SR-rd-phantom insert.b +REG_SYSEXC
+mipsel SR-rd-phantom insert.h +REG_SYSEXC
+mipsel SR-rd-phantom insert.w +REG_SYSEXC
+mipsel SR-rd-phantom insv +REG_SYSEXC
+mipsel SR-rd-phantom insve.b +REG_SYSEXC
+mipsel SR-rd-phantom insve.d +REG_SYSEXC
+mipsel SR-rd-phantom insve.h +REG_SYSEXC
+mipsel SR-rd-phantom insve.w +REG_SYSEXC
+mipsel SR-rd-phantom lbe +REG_SYSEXC
+mipsel SR-rd-phantom lbue +REG_SYSEXC
+mipsel SR-rd-phantom lbux +REG_SYSEXC
+mipsel SR-rd-phantom ld.b +REG_SYSEXC
+mipsel SR-rd-phantom ld.d +REG_SYSEXC
+mipsel SR-rd-phantom ld.h +REG_SYSEXC
+mipsel SR-rd-phantom ld.w +REG_SYSEXC
+mipsel SR-rd-phantom ldc2 +REG_SYSEXC
+mipsel SR-rd-phantom ldi.b +REG_SYSEXC
+mipsel SR-rd-phantom ldi.d +REG_SYSEXC
+mipsel SR-rd-phantom ldi.h +REG_SYSEXC
+mipsel SR-rd-phantom ldi.w +REG_SYSEXC
+mipsel SR-rd-phantom lhe +REG_SYSEXC
+mipsel SR-rd-phantom lhue +REG_SYSEXC
+mipsel SR-rd-phantom lhx +REG_SYSEXC
+mipsel SR-rd-phantom lle +REG_SYSEXC
+mipsel SR-rd-phantom lwc2 +REG_SYSEXC
+mipsel SR-rd-phantom lwe +REG_SYSEXC
+mipsel SR-rd-phantom lwx +REG_SYSEXC
+mipsel SR-rd-phantom madd +REG_SYSEXC
+mipsel SR-rd-phantom madd_q.h +REG_SYSEXC
+mipsel SR-rd-phantom madd_q.w +REG_SYSEXC
+mipsel SR-rd-phantom maddr_q.h +REG_SYSEXC
+mipsel SR-rd-phantom maddr_q.w +REG_SYSEXC
+mipsel SR-rd-phantom maddu +REG_SYSEXC
+mipsel SR-rd-phantom maddv.b +REG_SYSEXC
+mipsel SR-rd-phantom maddv.d +REG_SYSEXC
+mipsel SR-rd-phantom maddv.h +REG_SYSEXC
+mipsel SR-rd-phantom maddv.w +REG_SYSEXC
+mipsel SR-rd-phantom maq_s.w.phl +REG_SYSEXC
+mipsel SR-rd-phantom maq_s.w.phr +REG_SYSEXC
+mipsel SR-rd-phantom maq_sa.w.phl +REG_SYSEXC
+mipsel SR-rd-phantom maq_sa.w.phr +REG_SYSEXC
+mipsel SR-rd-phantom max_a.b +REG_SYSEXC
+mipsel SR-rd-phantom max_a.d +REG_SYSEXC
+mipsel SR-rd-phantom max_a.h +REG_SYSEXC
+mipsel SR-rd-phantom max_a.w +REG_SYSEXC
+mipsel SR-rd-phantom max_s.b +REG_SYSEXC
+mipsel SR-rd-phantom max_s.d +REG_SYSEXC
+mipsel SR-rd-phantom max_s.h +REG_SYSEXC
+mipsel SR-rd-phantom max_s.w +REG_SYSEXC
+mipsel SR-rd-phantom max_u.b +REG_SYSEXC
+mipsel SR-rd-phantom max_u.d +REG_SYSEXC
+mipsel SR-rd-phantom max_u.h +REG_SYSEXC
+mipsel SR-rd-phantom max_u.w +REG_SYSEXC
+mipsel SR-rd-phantom maxi_s.b +REG_SYSEXC
+mipsel SR-rd-phantom maxi_s.d +REG_SYSEXC
+mipsel SR-rd-phantom maxi_s.h +REG_SYSEXC
+mipsel SR-rd-phantom maxi_s.w +REG_SYSEXC
+mipsel SR-rd-phantom maxi_u.b +REG_SYSEXC
+mipsel SR-rd-phantom maxi_u.d +REG_SYSEXC
+mipsel SR-rd-phantom maxi_u.h +REG_SYSEXC
+mipsel SR-rd-phantom maxi_u.w +REG_SYSEXC
+mipsel SR-rd-phantom mfhi +REG_SYSEXC
+mipsel SR-rd-phantom mflo +REG_SYSEXC
+mipsel SR-rd-phantom min_a.b +REG_SYSEXC
+mipsel SR-rd-phantom min_a.d +REG_SYSEXC
+mipsel SR-rd-phantom min_a.h +REG_SYSEXC
+mipsel SR-rd-phantom min_a.w +REG_SYSEXC
+mipsel SR-rd-phantom min_s.b +REG_SYSEXC
+mipsel SR-rd-phantom min_s.d +REG_SYSEXC
+mipsel SR-rd-phantom min_s.h +REG_SYSEXC
+mipsel SR-rd-phantom min_s.w +REG_SYSEXC
+mipsel SR-rd-phantom min_u.b +REG_SYSEXC
+mipsel SR-rd-phantom min_u.d +REG_SYSEXC
+mipsel SR-rd-phantom min_u.h +REG_SYSEXC
+mipsel SR-rd-phantom min_u.w +REG_SYSEXC
+mipsel SR-rd-phantom mini_s.b +REG_SYSEXC
+mipsel SR-rd-phantom mini_s.d +REG_SYSEXC
+mipsel SR-rd-phantom mini_s.h +REG_SYSEXC
+mipsel SR-rd-phantom mini_s.w +REG_SYSEXC
+mipsel SR-rd-phantom mini_u.b +REG_SYSEXC
+mipsel SR-rd-phantom mini_u.d +REG_SYSEXC
+mipsel SR-rd-phantom mini_u.h +REG_SYSEXC
+mipsel SR-rd-phantom mini_u.w +REG_SYSEXC
+mipsel SR-rd-phantom mod_s.b +REG_SYSEXC
+mipsel SR-rd-phantom mod_s.d +REG_SYSEXC
+mipsel SR-rd-phantom mod_s.h +REG_SYSEXC
+mipsel SR-rd-phantom mod_s.w +REG_SYSEXC
+mipsel SR-rd-phantom mod_u.b +REG_SYSEXC
+mipsel SR-rd-phantom mod_u.d +REG_SYSEXC
+mipsel SR-rd-phantom mod_u.h +REG_SYSEXC
+mipsel SR-rd-phantom mod_u.w +REG_SYSEXC
+mipsel SR-rd-phantom modsub +REG_SYSEXC
+mipsel SR-rd-phantom move.v +REG_SYSEXC
+mipsel SR-rd-phantom msub +REG_SYSEXC
+mipsel SR-rd-phantom msub_q.h +REG_SYSEXC
+mipsel SR-rd-phantom msub_q.w +REG_SYSEXC
+mipsel SR-rd-phantom msubr_q.h +REG_SYSEXC
+mipsel SR-rd-phantom msubr_q.w +REG_SYSEXC
+mipsel SR-rd-phantom msubu +REG_SYSEXC
+mipsel SR-rd-phantom msubv.b +REG_SYSEXC
+mipsel SR-rd-phantom msubv.d +REG_SYSEXC
+mipsel SR-rd-phantom msubv.h +REG_SYSEXC
+mipsel SR-rd-phantom msubv.w +REG_SYSEXC
+mipsel SR-rd-phantom mthi +REG_SYSEXC
+mipsel SR-rd-phantom mthlip +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom mtlo +REG_SYSEXC
+mipsel SR-rd-phantom mul.ph +REG_SYSEXC
+mipsel SR-rd-phantom mul_q.h +REG_SYSEXC
+mipsel SR-rd-phantom mul_q.w +REG_SYSEXC
+mipsel SR-rd-phantom mul_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom muleq_s.w.phl +REG_SYSEXC
+mipsel SR-rd-phantom muleq_s.w.phr +REG_SYSEXC
+mipsel SR-rd-phantom muleu_s.ph.qbl +REG_SYSEXC
+mipsel SR-rd-phantom muleu_s.ph.qbr +REG_SYSEXC
+mipsel SR-rd-phantom mulq_rs.ph +REG_SYSEXC
+mipsel SR-rd-phantom mulq_rs.w +REG_SYSEXC
+mipsel SR-rd-phantom mulq_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom mulq_s.w +REG_SYSEXC
+mipsel SR-rd-phantom mulr_q.h +REG_SYSEXC
+mipsel SR-rd-phantom mulr_q.w +REG_SYSEXC
+mipsel SR-rd-phantom mulsa.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom mulsaq_s.w.ph +REG_SYSEXC
+mipsel SR-rd-phantom mult +REG_SYSEXC
+mipsel SR-rd-phantom multu +REG_SYSEXC
+mipsel SR-rd-phantom mulv.b +REG_SYSEXC
+mipsel SR-rd-phantom mulv.d +REG_SYSEXC
+mipsel SR-rd-phantom mulv.h +REG_SYSEXC
+mipsel SR-rd-phantom mulv.w +REG_SYSEXC
+mipsel SR-rd-phantom neg +REG_SYSEXC
+mipsel SR-rd-phantom nloc.b +REG_SYSEXC
+mipsel SR-rd-phantom nloc.d +REG_SYSEXC
+mipsel SR-rd-phantom nloc.h +REG_SYSEXC
+mipsel SR-rd-phantom nloc.w +REG_SYSEXC
+mipsel SR-rd-phantom nlzc.b +REG_SYSEXC
+mipsel SR-rd-phantom nlzc.d +REG_SYSEXC
+mipsel SR-rd-phantom nlzc.h +REG_SYSEXC
+mipsel SR-rd-phantom nlzc.w +REG_SYSEXC
+mipsel SR-rd-phantom nor.v +REG_SYSEXC
+mipsel SR-rd-phantom nori.b +REG_SYSEXC
+mipsel SR-rd-phantom or.v +REG_SYSEXC
+mipsel SR-rd-phantom ori.b +REG_SYSEXC
+mipsel SR-rd-phantom packrl.ph +REG_SYSEXC
+mipsel SR-rd-phantom pckev.b +REG_SYSEXC
+mipsel SR-rd-phantom pckev.d +REG_SYSEXC
+mipsel SR-rd-phantom pckev.h +REG_SYSEXC
+mipsel SR-rd-phantom pckev.w +REG_SYSEXC
+mipsel SR-rd-phantom pckod.b +REG_SYSEXC
+mipsel SR-rd-phantom pckod.d +REG_SYSEXC
+mipsel SR-rd-phantom pckod.h +REG_SYSEXC
+mipsel SR-rd-phantom pckod.w +REG_SYSEXC
+mipsel SR-rd-phantom pcnt.b +REG_SYSEXC
+mipsel SR-rd-phantom pcnt.d +REG_SYSEXC
+mipsel SR-rd-phantom pcnt.h +REG_SYSEXC
+mipsel SR-rd-phantom pcnt.w +REG_SYSEXC
+mipsel SR-rd-phantom pick.ph +REG_SYSEXC
+mipsel SR-rd-phantom pick.qb +REG_SYSEXC
+mipsel SR-rd-phantom pll.ps +REG_SYSEXC
+mipsel SR-rd-phantom plu.ps +REG_SYSEXC
+mipsel SR-rd-phantom preceq.w.phl +REG_SYSEXC
+mipsel SR-rd-phantom preceq.w.phr +REG_SYSEXC
+mipsel SR-rd-phantom precequ.ph.qbl +REG_SYSEXC
+mipsel SR-rd-phantom precequ.ph.qbla +REG_SYSEXC
+mipsel SR-rd-phantom precequ.ph.qbr +REG_SYSEXC
+mipsel SR-rd-phantom precequ.ph.qbra +REG_SYSEXC
+mipsel SR-rd-phantom preceu.ph.qbl +REG_SYSEXC
+mipsel SR-rd-phantom preceu.ph.qbla +REG_SYSEXC
+mipsel SR-rd-phantom preceu.ph.qbr +REG_SYSEXC
+mipsel SR-rd-phantom preceu.ph.qbra +REG_SYSEXC
+mipsel SR-rd-phantom precr.qb.ph +REG_SYSEXC
+mipsel SR-rd-phantom precr_sra.ph.w +REG_SYSEXC
+mipsel SR-rd-phantom precr_sra_r.ph.w +REG_SYSEXC
+mipsel SR-rd-phantom precrq.ph.w +REG_SYSEXC
+mipsel SR-rd-phantom precrq.qb.ph +REG_SYSEXC
+mipsel SR-rd-phantom precrq_rs.ph.w +REG_SYSEXC
+mipsel SR-rd-phantom precrqu_s.qb.ph +REG_SYSEXC
+mipsel SR-rd-phantom prefe +REG_SYSEXC
+mipsel SR-rd-phantom prepend +REG_SYSEXC
+mipsel SR-rd-phantom pul.ps +REG_SYSEXC
+mipsel SR-rd-phantom puu.ps +REG_SYSEXC
+mipsel SR-rd-phantom raddu.w.qb +REG_SYSEXC
+mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom repl.ph +REG_SYSEXC
+mipsel SR-rd-phantom repl.qb +REG_SYSEXC
+mipsel SR-rd-phantom replv.ph +REG_SYSEXC
+mipsel SR-rd-phantom replv.qb +REG_SYSEXC
+mipsel SR-rd-phantom sat_s.b +REG_SYSEXC
+mipsel SR-rd-phantom sat_s.d +REG_SYSEXC
+mipsel SR-rd-phantom sat_s.h +REG_SYSEXC
+mipsel SR-rd-phantom sat_s.w +REG_SYSEXC
+mipsel SR-rd-phantom sat_u.b +REG_SYSEXC
+mipsel SR-rd-phantom sat_u.d +REG_SYSEXC
+mipsel SR-rd-phantom sat_u.h +REG_SYSEXC
+mipsel SR-rd-phantom sat_u.w +REG_SYSEXC
+mipsel SR-rd-phantom sbe +REG_SYSEXC
+mipsel SR-rd-phantom sce +REG_SYSEXC
+mipsel SR-rd-phantom sdc2 +REG_SYSEXC
+mipsel SR-rd-phantom she +REG_SYSEXC
+mipsel SR-rd-phantom shf.b +REG_SYSEXC
+mipsel SR-rd-phantom shf.h +REG_SYSEXC
+mipsel SR-rd-phantom shf.w +REG_SYSEXC
+mipsel SR-rd-phantom shilo +REG_SYSEXC
+mipsel SR-rd-phantom shilov +REG_SYSEXC
+mipsel SR-rd-phantom shll.ph +REG_SYSEXC
+mipsel SR-rd-phantom shll.qb +REG_SYSEXC
+mipsel SR-rd-phantom shll_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom shll_s.w +REG_SYSEXC
+mipsel SR-rd-phantom shllv.ph +REG_SYSEXC
+mipsel SR-rd-phantom shllv.qb +REG_SYSEXC
+mipsel SR-rd-phantom shllv_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom shllv_s.w +REG_SYSEXC
+mipsel SR-rd-phantom shra.ph +REG_SYSEXC
+mipsel SR-rd-phantom shra.qb +REG_SYSEXC
+mipsel SR-rd-phantom shra_r.ph +REG_SYSEXC
+mipsel SR-rd-phantom shra_r.qb +REG_SYSEXC
+mipsel SR-rd-phantom shra_r.w +REG_SYSEXC
+mipsel SR-rd-phantom shrav.ph +REG_SYSEXC
+mipsel SR-rd-phantom shrav.qb +REG_SYSEXC
+mipsel SR-rd-phantom shrav_r.ph +REG_SYSEXC
+mipsel SR-rd-phantom shrav_r.qb +REG_SYSEXC
+mipsel SR-rd-phantom shrav_r.w +REG_SYSEXC
+mipsel SR-rd-phantom shrl.ph +REG_SYSEXC
+mipsel SR-rd-phantom shrl.qb +REG_SYSEXC
+mipsel SR-rd-phantom shrlv.ph +REG_SYSEXC
+mipsel SR-rd-phantom shrlv.qb +REG_SYSEXC
+mipsel SR-rd-phantom sld.b +REG_SYSEXC
+mipsel SR-rd-phantom sld.d +REG_SYSEXC
+mipsel SR-rd-phantom sld.h +REG_SYSEXC
+mipsel SR-rd-phantom sld.w +REG_SYSEXC
+mipsel SR-rd-phantom sldi.b +REG_SYSEXC
+mipsel SR-rd-phantom sldi.d +REG_SYSEXC
+mipsel SR-rd-phantom sldi.h +REG_SYSEXC
+mipsel SR-rd-phantom sldi.w +REG_SYSEXC
+mipsel SR-rd-phantom sll.b +REG_SYSEXC
+mipsel SR-rd-phantom sll.d +REG_SYSEXC
+mipsel SR-rd-phantom sll.h +REG_SYSEXC
+mipsel SR-rd-phantom sll.w +REG_SYSEXC
+mipsel SR-rd-phantom slli.b +REG_SYSEXC
+mipsel SR-rd-phantom slli.d +REG_SYSEXC
+mipsel SR-rd-phantom slli.h +REG_SYSEXC
+mipsel SR-rd-phantom slli.w +REG_SYSEXC
+mipsel SR-rd-phantom splat.b +REG_SYSEXC
+mipsel SR-rd-phantom splat.d +REG_SYSEXC
+mipsel SR-rd-phantom splat.h +REG_SYSEXC
+mipsel SR-rd-phantom splat.w +REG_SYSEXC
+mipsel SR-rd-phantom splati.b +REG_SYSEXC
+mipsel SR-rd-phantom splati.d +REG_SYSEXC
+mipsel SR-rd-phantom splati.h +REG_SYSEXC
+mipsel SR-rd-phantom splati.w +REG_SYSEXC
+mipsel SR-rd-phantom sra.b +REG_SYSEXC
+mipsel SR-rd-phantom sra.d +REG_SYSEXC
+mipsel SR-rd-phantom sra.h +REG_SYSEXC
+mipsel SR-rd-phantom sra.w +REG_SYSEXC
+mipsel SR-rd-phantom srai.b +REG_SYSEXC
+mipsel SR-rd-phantom srai.d +REG_SYSEXC
+mipsel SR-rd-phantom srai.h +REG_SYSEXC
+mipsel SR-rd-phantom srai.w +REG_SYSEXC
+mipsel SR-rd-phantom srar.b +REG_SYSEXC
+mipsel SR-rd-phantom srar.d +REG_SYSEXC
+mipsel SR-rd-phantom srar.h +REG_SYSEXC
+mipsel SR-rd-phantom srar.w +REG_SYSEXC
+mipsel SR-rd-phantom srari.b +REG_SYSEXC
+mipsel SR-rd-phantom srari.d +REG_SYSEXC
+mipsel SR-rd-phantom srari.h +REG_SYSEXC
+mipsel SR-rd-phantom srari.w +REG_SYSEXC
+mipsel SR-rd-phantom srl.b +REG_SYSEXC
+mipsel SR-rd-phantom srl.d +REG_SYSEXC
+mipsel SR-rd-phantom srl.h +REG_SYSEXC
+mipsel SR-rd-phantom srl.w +REG_SYSEXC
+mipsel SR-rd-phantom srli.b +REG_SYSEXC
+mipsel SR-rd-phantom srli.d +REG_SYSEXC
+mipsel SR-rd-phantom srli.h +REG_SYSEXC
+mipsel SR-rd-phantom srli.w +REG_SYSEXC
+mipsel SR-rd-phantom srlr.b +REG_SYSEXC
+mipsel SR-rd-phantom srlr.d +REG_SYSEXC
+mipsel SR-rd-phantom srlr.h +REG_SYSEXC
+mipsel SR-rd-phantom srlr.w +REG_SYSEXC
+mipsel SR-rd-phantom srlri.b +REG_SYSEXC
+mipsel SR-rd-phantom srlri.d +REG_SYSEXC
+mipsel SR-rd-phantom srlri.h +REG_SYSEXC
+mipsel SR-rd-phantom srlri.w +REG_SYSEXC
+mipsel SR-rd-phantom st.b +REG_SYSEXC
+mipsel SR-rd-phantom st.d +REG_SYSEXC
+mipsel SR-rd-phantom st.h +REG_SYSEXC
+mipsel SR-rd-phantom st.w +REG_SYSEXC
+mipsel SR-rd-phantom sub +REG_SYSEXC
+mipsel SR-rd-phantom subq.ph +REG_SYSEXC
+mipsel SR-rd-phantom subq_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom subq_s.w +REG_SYSEXC
+mipsel SR-rd-phantom subqh.ph +REG_SYSEXC
+mipsel SR-rd-phantom subqh.w +REG_SYSEXC
+mipsel SR-rd-phantom subqh_r.ph +REG_SYSEXC
+mipsel SR-rd-phantom subqh_r.w +REG_SYSEXC
+mipsel SR-rd-phantom subs_s.b +REG_SYSEXC
+mipsel SR-rd-phantom subs_s.d +REG_SYSEXC
+mipsel SR-rd-phantom subs_s.h +REG_SYSEXC
+mipsel SR-rd-phantom subs_s.w +REG_SYSEXC
+mipsel SR-rd-phantom subs_u.b +REG_SYSEXC
+mipsel SR-rd-phantom subs_u.d +REG_SYSEXC
+mipsel SR-rd-phantom subs_u.h +REG_SYSEXC
+mipsel SR-rd-phantom subs_u.w +REG_SYSEXC
+mipsel SR-rd-phantom subsus_u.b +REG_SYSEXC
+mipsel SR-rd-phantom subsus_u.d +REG_SYSEXC
+mipsel SR-rd-phantom subsus_u.h +REG_SYSEXC
+mipsel SR-rd-phantom subsus_u.w +REG_SYSEXC
+mipsel SR-rd-phantom subsuu_s.b +REG_SYSEXC
+mipsel SR-rd-phantom subsuu_s.d +REG_SYSEXC
+mipsel SR-rd-phantom subsuu_s.h +REG_SYSEXC
+mipsel SR-rd-phantom subsuu_s.w +REG_SYSEXC
+mipsel SR-rd-phantom subu.ph +REG_SYSEXC
+mipsel SR-rd-phantom subu.qb +REG_SYSEXC
+mipsel SR-rd-phantom subu_s.ph +REG_SYSEXC
+mipsel SR-rd-phantom subu_s.qb +REG_SYSEXC
+mipsel SR-rd-phantom subuh.qb +REG_SYSEXC
+mipsel SR-rd-phantom subuh_r.qb +REG_SYSEXC
+mipsel SR-rd-phantom subv.b +REG_SYSEXC
+mipsel SR-rd-phantom subv.d +REG_SYSEXC
+mipsel SR-rd-phantom subv.h +REG_SYSEXC
+mipsel SR-rd-phantom subv.w +REG_SYSEXC
+mipsel SR-rd-phantom subvi.b +REG_SYSEXC
+mipsel SR-rd-phantom subvi.d +REG_SYSEXC
+mipsel SR-rd-phantom subvi.h +REG_SYSEXC
+mipsel SR-rd-phantom subvi.w +REG_SYSEXC
+mipsel SR-rd-phantom swc2 +REG_SYSEXC
+mipsel SR-rd-phantom swe +REG_SYSEXC
+mipsel SR-rd-phantom syscall +REG_SYSEXC
+mipsel SR-rd-phantom teq +REG_SYSEXC
+mipsel SR-rd-phantom teqi +REG_SYSEXC
+mipsel SR-rd-phantom tge +REG_SYSEXC
+mipsel SR-rd-phantom tgei +REG_SYSEXC
+mipsel SR-rd-phantom tgeiu +REG_SYSEXC
+mipsel SR-rd-phantom tgeu +REG_SYSEXC
+mipsel SR-rd-phantom tlt +REG_SYSEXC
+mipsel SR-rd-phantom tlti +REG_SYSEXC
+mipsel SR-rd-phantom tltiu +REG_SYSEXC
+mipsel SR-rd-phantom tltu +REG_SYSEXC
+mipsel SR-rd-phantom tne +REG_SYSEXC
+mipsel SR-rd-phantom tnei +REG_SYSEXC
+mipsel SR-rd-phantom vshf.b +REG_SYSEXC
+mipsel SR-rd-phantom vshf.d +REG_SYSEXC
+mipsel SR-rd-phantom vshf.h +REG_SYSEXC
+mipsel SR-rd-phantom vshf.w +REG_SYSEXC
+mipsel SR-rd-phantom wrdsp +REG_SYSEXC
+mipsel SR-rd-phantom xor.v +REG_SYSEXC
+mipsel SR-rd-phantom xori.b +REG_SYSEXC
+mipsel SR-rd-phantom yield +REG_SYSEXC

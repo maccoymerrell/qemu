@@ -195,10 +195,27 @@ def _m_dspimm(s):
     return s.mnem.split()[0] in MIPS_DSP_IMM and _gpr(s.regs)
 
 
-@cls("mipsel", "M-LSA", "an R6 mnemonic carrying the 24Kf PMON "
-     "translation's dataflow -- FINDING 70-A", "", defect=True)
+@cls("mipsel", "M-LSA", "Capstone answers an R6-only mnemonic in a pre-R6 "
+     "mode, over QEMU's PMON dataflow -- FINDING 70-A", """
+LSA and DLSA are MIPS Release 6 (and MSA) instructions.  On MIPS32 and
+MIPS32R2, SPECIAL function 0x05 is unallocated, and QEMU's translator
+dispatches it as the PMON monitor entry point -- `case OPC_PMON:` ->
+gen_helper_pmon(), commented "Pmon entry point, also R4010 selsl".  QEMU
+reaches LSA only through the R6 or MSA decoders (rel6.decode:21,
+msa.decode:51).
+
+THE MODE WAS NOT THE DISAGREEMENT.  The sled image declares no MIPS arch
+level, so cs_mips_mode_from_eflags() selects CS_MODE_MIPS32R2 -- and
+Capstone 6.0.0 answers `lsa` in CS_MODE_MIPS32 and CS_MODE_MIPS32R2 alike.
+Both decoders were asked for the same architecture; one answered outside it.
+That makes this an UPSTREAM DECODER DEFECT rather than a per-model scope
+question, and the standing arm for it is in capstone_workaround_probe.cc.
+
+The rows are a UNION of two instructions' lists: the mnemonic is R6's, the
+dataflow is what the emulated machine executed.  QEMU's is the correct half.""",
+     defect=True)
 def _m_lsa(s):
-    return s.mnem.split()[0] == "lsa"
+    return s.mnem.split()[0] in ("lsa", "dlsa")
 
 
 @cls("mipsel", "M-MERGE", "the unaligned loads merge into their destination, "

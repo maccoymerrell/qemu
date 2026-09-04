@@ -8195,20 +8195,41 @@ QEMU_STATEMENT_DISAGREEMENTS: dict[tuple[str, str], str] = {
         "encodings itself, and scripts/mips_ident_instrument.py qualifies "
         "this one as `NOP -- SLL r0,r0,0`",
 
-    # translate.c:16573 case OPC_PMON.  QEMU decodes SPECIAL function
-    # 0x05 as the PMON monitor entry point and emits gen_helper_pmon();
-    # MIPS Release 6 reuses the same encoding for LSA, and the
-    # disassembler this corpus was joined through reads it that way, so
-    # the observation says GEN_OP_INT_ADD.  The two are reading different
-    # architectures out of one word.  Under R20 the row states what the
-    # rule QEMU DISPATCHED does, and the disagreement is recorded rather
-    # than resolved by preference: it is a QEMU-versus-disassembler
-    # architecture-level disagreement, and it belongs in the open ledger
-    # for the admission wave rather than in a silent choice here.
+    # translate.c case OPC_PMON.  QEMU decodes SPECIAL function 0x05 as
+    # the PMON monitor entry point and emits gen_helper_pmon(); MIPS
+    # Release 6 reuses the same encoding for LSA, and the disassembler
+    # this corpus was joined through reads it that way, so the observation
+    # says GEN_OP_INT_ADD.
+    #
+    # THE EARLIER JUSTIFICATION HERE WAS FALSE, and it was hiding a real
+    # defect.  It said the two were "reading different architectures out
+    # of one word" and filed the row as a QEMU-versus-disassembler
+    # architecture-level disagreement.  They were not asked for different
+    # architectures.  The sled image declares no MIPS arch level, so
+    # cs_mips_mode_from_eflags() selects CS_MODE_MIPS32R2 -- and Capstone
+    # 6.0.0 answers `lsa` in CS_MODE_MIPS32 and CS_MODE_MIPS32R2 alike,
+    # where LSA does not exist.  Probed directly; the arm is now standing
+    # in capstone_workaround_probe.cc.
+    #
+    # QEMU gates the two readings and Capstone gates neither:
+    #   pre-R6   target/mips/tcg/translate.c `case OPC_PMON:` ->
+    #            gen_helper_pmon(), "Pmon entry point, also R4010 selsl"
+    #   R6       target/mips/tcg/rel6.decode:21  LSA
+    #   MSA      target/mips/tcg/msa.decode:51   LSA
+    #
+    # So this is an UPSTREAM DECODER DEFECT, not a scope question about
+    # which MIPS models are in play -- per the all-models ruling a
+    # per-model difference may be stated as a QEMU-modelling or
+    # guest-image fact and never as tracer scope, and here neither
+    # applies: one decoder answered outside the mode it was given.  Under
+    # R20 the row states what the rule QEMU DISPATCHED does, which is the
+    # correct answer for the machine that ran.
     ("mips", "translate_mips/OPC_PMON"):
-        "translate.c:16582 gen_helper_pmon() -- QEMU's SPECIAL 0x05 arm "
-        "is the PMON monitor entry; the observed X86-style INT_ADD comes "
-        "from the disassembler reading the same encoding as MIPS R6 LSA",
+        "QEMU's SPECIAL 0x05 arm is the PMON monitor entry "
+        "(translate.c `case OPC_PMON:` -> gen_helper_pmon); the observed "
+        "INT_ADD is Capstone answering `lsa` in CS_MODE_MIPS32R2, where "
+        "LSA does not exist -- an upstream decoder defect, probed in "
+        "capstone_workaround_probe.cc, not an architecture disagreement",
 
     # --- x86 ----------------------------------------------------------
     # THE GROUP ROWS A NAME MATCH REACHED.  Both of these are decode

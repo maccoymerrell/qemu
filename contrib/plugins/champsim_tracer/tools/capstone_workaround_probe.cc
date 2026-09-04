@@ -346,6 +346,27 @@ bool StillBuggy_MipsLwlPartialWrite(const cs_insn &insn)
      * value is also an input. Bug: Capstone reports WRITE only. */
     return OpAccess_mips(insn, 0) == CS_AC_WRITE;
 }
+bool StillBuggy_MipsLsaNotGatedOnR6(const cs_insn &insn)
+{
+    /*
+     * FINDING 70-A's ROOT CAUSE.  LSA/DLSA are MIPS RELEASE 6 (and MSA)
+     * instructions.  On MIPS32 and MIPS32R2, SPECIAL function 0x05 is not
+     * LSA at all -- QEMU's translator dispatches it as the PMON monitor
+     * entry point (target/mips/tcg/translate.c: `case OPC_PMON:` ->
+     * gen_helper_pmon(), commented "Pmon entry point, also R4010 selsl"),
+     * and it reaches LSA only through the R6 or MSA decoder
+     * (target/mips/tcg/rel6.decode:21, msa.decode:51).
+     *
+     * Capstone applies no such gate: asked for CS_MODE_MIPS32R2 it still
+     * answers `lsa`.  The mnemonic is then an R6 spelling of a word the
+     * emulated machine executed as something else, and a corpus that joins
+     * QEMU's dataflow to Capstone's mnemonic carries the union of two
+     * instructions -- measured as 96 mipsel encodings at PASS 70.
+     *
+     * The bug is present when the decode SUCCEEDS in a pre-R6 mode.
+     */
+    return insn.mnemonic[0] != '\0';
+}
 bool StillBuggy_MipsScPartialRead(const cs_insn &insn)
 {
     /* sc $t0,0($a0): $t0 (index 0) is overwritten with the
@@ -548,6 +569,14 @@ const std::vector<Case> &Cases()
          CS_ARCH_MIPS, cs_mode(CS_MODE_MIPS64 | CS_MODE_LITTLE_ENDIAN),
          {0x00, 0x00, 0x88, 0xe0},
          StillBuggy_MipsScPartialRead},
+        {"(none -- reported, not worked around)", "cap_mode_mips",
+         "6.0.0",
+         "LSA is decoded in MIPS32/MIPS32R2 mode, where it does not exist: "
+         "SPECIAL function 0x05 is pre-R6 unallocated and QEMU dispatches "
+         "it as the PMON entry point",
+         CS_ARCH_MIPS, cs_mode(CS_MODE_MIPS32R2 | CS_MODE_LITTLE_ENDIAN),
+         {0x45, 0x20, 0x22, 0x00},
+         StillBuggy_MipsLsaNotGatedOnR6},
     };
     return cases;
 }

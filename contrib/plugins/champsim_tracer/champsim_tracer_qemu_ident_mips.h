@@ -920,7 +920,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x56742982u, "translate_mips/OPC_CMP_SEQ_D", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56a43d41u, "translate_mips/OPC_PMON", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },  /* RULED over the older payload -- translate.c:16582 gen_helper_pmon() -- QEMU's SPECIAL 0x05 arm is the PMON monitor entry; the observed X86-style INT_ADD comes from the disassembler reading the same encoding as MIPS R6 LSA */
+      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },  /* RULED over the older payload -- QEMU's SPECIAL 0x05 arm is the PMON monitor entry (translate.c `case OPC_PMON:` -> gen_helper_pmon); the observed INT_ADD is Capstone answering `lsa` in CS_MODE_MIPS32R2, where LSA does not exist -- an upstream decoder defect, probed in capstone_workaround_probe.cc, not an architecture disagreement */
     { 0x56bf3397u, "translate_mips/OPC_PADDSH", QID_STATED, false,
       { .opcode = GEN_OP_VEC_ADD, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56f2fd2eu, "translate_mips/R6_OPC_CMP_UN_S", QID_STATED, false,

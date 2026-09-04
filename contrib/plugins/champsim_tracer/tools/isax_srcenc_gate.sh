@@ -118,8 +118,18 @@ run_arms() {
             # rc=2 dominates rc=1: "could not look" is never a mere failure.
             [ "$r" = 2 ] && worst=2
             [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
-            grep -hE '^# srcenc=|^# srcenc_join ' "$out/${layer:0:1}_$isa.txt" \
-                >> "$out/rc.txt" 2>/dev/null
+            # THE ARM'S OWN SUMMARY LINE GOES IN THE ROLL-UP, and it is not
+            # decoration: `dead_allow_rules=` lives on it, and FINDING 72-F
+            # is what a detector nobody reads costs.  isaxcheck itself has
+            # exited 1 on a dead rule since the detector landed, so the ARM
+            # goes red -- but the R13 gate scored `rc=` on the BARE half
+            # alone, the dead row was in a `--srcenc` arm, and the gate
+            # passed 17 of 17 at a tip with a dead row in the allowlist.  It
+            # was right to: the population it scored did not contain it.
+            # Copying the line here is what lets the gate score the fact
+            # rather than the exit code, on both arm shapes.
+            grep -hE '^# isa=|^# srcenc=|^# srcenc_join ' \
+                "$out/${layer:0:1}_$isa.txt" >> "$out/rc.txt" 2>/dev/null
             # THE PARTIALITY OF AN ARM IS STATED, NOT INFERRED, AND IT IS
             # NOT A PROPERTY OF ONE ARM SHAPE.
             #

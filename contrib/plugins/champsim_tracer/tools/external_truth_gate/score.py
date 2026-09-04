@@ -42,6 +42,24 @@ HEADLINE = {
     # the eight-arm Capstone-as-external-reference gate: count the arms that
     # did NOT exit 0, so the ceiling of 0 means "every arm passed"
     'isax':    (re.compile(r'^(?:boundary|fields)\s+(\S+)\s+rc=(\d+)', re.M), 'isax'),
+    # THE DEAD-ALLOWLIST-RULE FACT, scored on BOTH arm shapes (FINDING
+    # 72-F).  `isax` above scores the arms' EXIT CODES, and it can only ever
+    # be asked of the bare half: a `--srcenc` arm carries the boundary
+    # residue as `unallowed`, so it exits 1 by construction and an exit-code
+    # ceiling over it would be a number about the residue, not about the
+    # allowlist.  The dead-rule question is different -- every arm answers it
+    # for the families IT scores, and the two shapes are partial in
+    # COMPLEMENTARY families -- so it gets its own leg, one row per shape,
+    # and both reports must be present for the union to cover the allowlist.
+    #
+    # MEASURED, and this is why the row exists: at PASS 72 one
+    # `SR-rd-phantom ffree` row went dead two commits after it landed, the
+    # `--srcenc` x86_64 fields arm PRINTED `dead_allow_rules=1`, and the gate
+    # passed 17 of 17 -- correctly, because the eight arms it scored were the
+    # bare ones and the `SR-` family is exempt from the detector there.  A
+    # detector nobody reads is not a detector.
+    'isaxdead': (re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=(\d+)',
+                            re.M), 'isaxdead'),
     # the four-ISA cross-tabulation is the ONE static report that carries the
     # headline AND its denominator AND the reachability hole on the same row,
     # so the static leg reads that rather than the per-ISA compare files (two
@@ -68,6 +86,8 @@ HEADLINE = {
 # disagreements over zero comparisons is survivorship bias, not coverage.
 FLOOR = {
     'isax':    re.compile(r'^(?:boundary|fields)\s+\S+\s+rc=\d+', re.M),
+    'isaxdead': re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=\d+',
+                           re.M),
     'static':  None,
     'gem5cp':  re.compile(r'^TOTAL\s+(\d+)', re.M),
     'spikecp': re.compile(r'^\s*aligned\s+(\d+)', re.M),
@@ -228,6 +248,25 @@ def score_one(row, root, binary_mtime):
                     'INERT AXES = %s.  An axis that compared nothing reports '
                     'no disagreement for the wrong reason; it is a demand for '
                     'a better probe, never a pass.' % im.group(1))
+    elif kind == 'isaxdead':
+        arms = pat.findall(text)
+        if not arms:
+            return (False, None, None,
+                    'NO ARM SUMMARY LINES PARSED out of %s.  The dead-rule '
+                    'fact lives on isaxcheck\'s own `# isa=` line; a report '
+                    'without one cannot answer this question and must not '
+                    'read as a zero.' % path)
+        headline = sum(int(n) for n in arms)
+        scored = len(arms)
+        if headline:
+            dead = [n for n in arms if n != '0']
+            return (False, headline, scored,
+                    'DEAD ALLOWLIST RULE(S): %d across %d arm(s) (%s).  A '
+                    'rule that excuses no signature has outlived the '
+                    'disagreement it was written for; the arm names it on a '
+                    'DEAD line.  Retire it in the allowlist with the reason '
+                    'written next to it.' % (headline, len(dead),
+                                             ', '.join(dead)))
     elif kind == 'isax':
         arms = pat.findall(text)
         if not arms:

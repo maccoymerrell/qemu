@@ -62,7 +62,15 @@ selftest() {
     # not to relax the ceiling.  It has now happened twice, so the rule is
     # working: exec38/green/evroot carries the 261 the pin row no longer
     # adjudicates, and the default moves to the newest COMPLETE root instead.
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/exec72/r13/evroot}
+    # MOVED AGAIN AT PASS 73, and the move is the rule working a third
+    # time.  exec72's root predates the two `depmap` rows entirely and
+    # predates the two `isaxdead` rows this pass adds, so it is no longer
+    # a COMPLETE root and the refusal below names the missing reports.
+    # exec126's root carries every report the manifest names, with the
+    # two isax reports MEASURED AT THAT TIP by isax_srcenc_gate.sh -- the
+    # bare eight and the --srcenc eight, which is what the isaxdead rows
+    # need and what no older root has.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/exec126/r13/evroot}
     if [ ! -d "$SRC" ]; then
         echo "SELFTEST CANNOT RUN: no evidence root at $SRC." >&2
         echo "Set ETG_SELFTEST_ROOT.  A selftest with no subject FAILS." >&2

@@ -7975,7 +7975,6 @@ x86_64 SR-rd-phantom fdivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
 x86_64 SR-rd-phantom fdivrs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
 x86_64 SR-rd-phantom fdivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
 x86_64 SR-rd-phantom fdivs +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
-x86_64 SR-rd-phantom ffree +REG_FCSR,REG_FPR#,REG_SEG0
 x86_64 SR-rd-phantom ffree +REG_FCSR,REG_SEG0
 x86_64 SR-rd-phantom ffreep +REG_FCSR,REG_SEG0
 x86_64 SR-rd-phantom fiaddl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
@@ -8414,7 +8413,7 @@ x86_64 SR-rd-missing rcrq +REG_FLAGS
 x86_64 SR-rd-missing rcrw +REG_FLAGS
 
 # --- X-X87OPERAND: the x87 operand LLVM attaches and the hardware does not consult.
-#     11 signature(s), 14230 encodings at this tip.
+#     12 signature(s), 14974 encodings at this tip.
 #
 # FFREE / FFREEP mark a stack slot EMPTY in the tag word; they do not read the
 # value in it.  FLD / FST / FSTP / FXCH between registers, FLD1 / FLDZ and the
@@ -8423,6 +8422,7 @@ x86_64 SR-rd-missing rcrw +REG_FLAGS
 # resolved through QEMU's call graph and left OUT of the x87 control-word read
 # set on purpose.  LLVM attaches the use anyway, uniformly across the x87
 # tables.  The tracer's set is the derived one.
+x86_64 SR-rd-missing ffree +REG_FPR#
 x86_64 SR-rd-missing ffreep +REG_FPR#
 x86_64 SR-rd-missing fld +REG_FPCW
 x86_64 SR-rd-missing fld1 +REG_FPCW

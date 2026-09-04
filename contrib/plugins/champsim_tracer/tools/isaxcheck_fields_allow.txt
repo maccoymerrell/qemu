@@ -2683,6 +2683,21 @@ x86_64 FR-wr-missing fnstenv +REG_FCSR
 # The register rows that ride along (`+REG_SP`, `+REG_FLAGS` on int / iret)
 # are the implicit stack and flag traffic of a trap, which the tracer
 # records and LLVM's MCInstrDesc does not name.
+#
+# A HOST/GUEST TRANSITION IS THE SAME DECISION, IN BOTH DIRECTIONS.  The
+# guest-to-host half has been here since this block was written: `vmcall`
+# and `vmmcall` cause a VM exit, the BB must seal, and LLVM's per-opcode
+# flags say nothing about it.  The host-to-guest half -- `vmlaunch`,
+# `vmresume` and `vmrun` -- is the identical transition read the other way:
+# a VM entry loads the guest RIP out of the VMCS/VMCB, so the instruction
+# after the entry is not the instruction after the encoding, and a chain
+# that does not seal there runs a host block on into guest text.  They were
+# missing from this file only because 235bc1bf04 gave them their
+# BRANCH_SYSCALL_TYPE without re-running the gate that scores it (PASS 70,
+# FINDING 70-B); the classification they were given is the one this block
+# already describes.  iced-x86 agrees and calls all three FlowControl=CALL
+# (exec120/vmx/iced.tsv); LLVM's MCInstrDesc does not, which is the
+# `llvm-no` on every row here.
 x86_64 FB-flow-presence int cs-yes llvm-no
 x86_64 FB-flow-presence int3 cs-yes llvm-no
 x86_64 FB-flow-presence rep insb cs-yes llvm-no
@@ -2744,7 +2759,10 @@ x86_64 FB-flow-presence sysexitq cs-yes llvm-no
 x86_64 FB-flow-presence sysretl cs-yes llvm-no
 x86_64 FB-flow-presence sysretq cs-yes llvm-no
 x86_64 FB-flow-presence vmcall cs-yes llvm-no
+x86_64 FB-flow-presence vmlaunch cs-yes llvm-no
 x86_64 FB-flow-presence vmmcall cs-yes llvm-no
+x86_64 FB-flow-presence vmresume cs-yes llvm-no
+x86_64 FB-flow-presence vmrun cs-yes llvm-no
 x86_64 FB-flow-presence xbegin cs-no llvm-yes
 x86_64 FM-cs-mem-llvm-none iretl
 x86_64 FM-cs-mem-llvm-none iretq

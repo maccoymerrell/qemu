@@ -53,11 +53,16 @@ import compare_wp_mipsel as C                                # noqa: E402
 
 
 def mutations(ex):
-    """[(axis, description, mutated excursion)] -- one per axis, on real data.
+    """[(axis, description, mutated excursion, index)] -- one per axis.
 
     Every mutation is applied to a REAL excursion's real record; none of them
     invents an instruction.  A control built on synthetic data proves the
     comparator can read a synthetic record, which is not the question.
+
+    THE INDEX IS PART OF THE MUTATION.  Every damage below lands on ONE
+    instruction, and the axis that owns the fact is required to report it AT
+    THAT INSTRUCTION -- see ``run()`` for why "somewhere in the excursion" is
+    not good enough once an excursion can carry a green row on the same axis.
     """
     out = []
 
@@ -66,18 +71,18 @@ def mutations(ex):
 
     m = clone()
     m.insns[0].pc ^= 0x10
-    out.append(('pc-sequence', 'move the first WP PC by 0x10', m))
+    out.append(('pc-sequence', 'move the first WP PC by 0x10', m, 0))
 
     m = clone()
     m.insns[0].bits ^= 0xff
-    out.append(('insn-bits', 'flip the low byte of the first encoding', m))
+    out.append(('insn-bits', 'flip the low byte of the first encoding', m, 0))
 
     for i, ins in enumerate(ex.insns):
         if ins.writes:
             m = clone()
             m.insns[i].writes = []
             out.append(('reg-dst-set', 'drop the destination of insn %d' % i,
-                        m))
+                        m, i))
             break
 
     # A VALUED destination is needed for the value axes, and a destination
@@ -92,19 +97,19 @@ def mutations(ex):
         m = clone()
         n_, v_, w_ = m.insns[i].writes[k]
         m.insns[i].writes[k] = (n_, v_ ^ 0x5a5a, w_)
-        out.append(('reg-dst-value', 'corrupt the value of insn %d' % i, m))
+        out.append(('reg-dst-value', 'corrupt the value of insn %d' % i, m, i))
         m = clone()
         n_, v_, w_ = m.insns[i].writes[k]
         m.insns[i].writes[k] = (n_, v_, 0)
         out.append(('reg-dst-valued',
-                    'publish insn %d\'s destination with no value' % i, m))
+                    'publish insn %d\'s destination with no value' % i, m, i))
         break
 
     for i, ins in enumerate(ex.insns):
         if ins.srcs:
             m = clone()
             m.insns[i].srcs = ins.srcs[1:]
-            out.append(('reg-src-set', 'drop a source of insn %d' % i, m))
+            out.append(('reg-src-set', 'drop a source of insn %d' % i, m, i))
             break
 
     # Loads and stores are walked SEPARATELY.  Taking "the first instruction
@@ -119,36 +124,71 @@ def mutations(ex):
             m = clone()
             getattr(m.insns[i], which).pop()
             out.append(('memop-count',
-                        'drop the %s of insn %d' % (which[:-1], i), m))
+                        'drop the %s of insn %d' % (which[:-1], i), m, i))
             m = clone()
             a, d, sz = getattr(m.insns[i], which)[0]
             getattr(m.insns[i], which)[0] = (a + 8, d, sz)
             out.append(('memop-addr',
-                        'move the %s address of insn %d' % (which[:-1], i), m))
+                        'move the %s address of insn %d' % (which[:-1], i),
+                        m, i))
             if sz:
                 m = clone()
                 a, d, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d, max(1, sz2 // 2))
                 out.append(('memop-width',
                             'halve the %s width of insn %d' % (which[:-1], i),
-                            m))
+                            m, i))
             if d is not None:
                 m = clone()
                 a, d2, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d2 ^ 0xff, sz2)
                 out.append((axis, 'corrupt the %s datum of insn %d'
-                            % (which[:-1], i), m))
+                            % (which[:-1], i), m, i))
             break
     return out
 
 
-def _subjects(args, binary, cfg, env, guest, limit):
-    """[(guest, excursion, reference, axes already dirty)].
+#: the verdicts that count as the axis REPORTING something.  A row an
+#: adjudication has already settled is not the axis firing.
+RED = (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)
 
-    A mutation proves nothing against a pair that already disagrees on the
-    axis it targets: the axis would have fired anyway.  Cleanliness is judged
-    PER AXIS rather than globally -- an excursion whose `jal` already reports
-    a reg-dst-valued row is still a sound subject for a memop mutation.
+
+def rowkey(r):
+    """What makes two comparison rows the SAME row.
+
+    The instruction, the axis, the verdict and both sides' values.  A
+    mutation has moved an axis when it produces a red row this key says the
+    unmutated pair did not already produce.
+    """
+    return (r.idx, r.axis, r.verdict, repr(r.ref), repr(r.trc), r.detail)
+
+
+def _subjects(args, binary, cfg, env, guest, limit):
+    """[(guest, excursion, reference, the pair's own comparison rows)].
+
+    A mutation proves nothing against a pair that ALREADY REPORTS THE ROW the
+    mutation is supposed to produce, so the baseline comparison is carried
+    with the subject and the mutation is required to produce a row the
+    baseline does not have.
+
+    THIS USED TO BE A PER-AXIS CLEANLINESS FLAG AND THE FLAG TOOK THE LEG
+    DOWN.  `set(r.axis for r in base)` marked an axis unusable on the WHOLE
+    excursion as soon as ANY instruction in it produced ANY row on that axis
+    -- including a row an adjudication had already ruled fine.  When mipsel
+    `nop` began publishing its `$zero` read, every excursion in the probe set
+    acquired an adjudicated `reg-src-set` row (SUPERSET_OK,
+    REF-ZERO-OPERAND-AS-INVALID), the axis went dirty on all 19 subjects, its
+    mutation was never attempted, and the control reported NO MUTATION
+    AVAILABLE and exited 1 -- which `set -e` turned into a leg that never ran
+    its comparison at all (FINDING 73-C).  The subject was never the problem:
+    insn 0 of `p_flow` still had the sources the mutation needed.
+
+    The replacement is STRICTER, not looser.  The old bar was "this axis
+    reports a red row anywhere in the excursion" on a subject that reported
+    nothing on the axis to begin with.  The new bar is "this axis reports a
+    red row AT THE INSTRUCTION THE MUTATION DAMAGED, and the unmutated pair
+    did not report that row" -- which no pre-existing row can satisfy, on a
+    clean subject or a dirty one.
     """
     image, _xr, _e, is64 = wp_image.load(guest)
     if is64:
@@ -179,8 +219,7 @@ def _subjects(args, binary, cfg, env, guest, limit):
         gi = C.excursion_gaps(ex, [])
         base, _n, _sub = C.compare_excursion(guest, ex, ref, gi,
                                        stopped=run.stopped)
-        out.append((guest, ex, ref, set(r.axis for r in base),
-                    elf, npro, boot))
+        out.append((guest, ex, ref, base, elf, npro, boot))
     return out
 
 
@@ -196,24 +235,29 @@ def run(args, binary, cfg, env):
     fired = collections.Counter()
     attempted = set()
     lines = []
-    for guest, ex, ref, dirty, _elf, _npro, _boot in subjects:
-        for axis, what, m in mutations(ex):
-            if fired[axis] or axis in dirty:
+    for guest, ex, ref, base, _elf, _npro, _boot in subjects:
+        base_red = set(rowkey(r) for r in base if r.verdict in RED)
+        base_axes = set(r.axis for r in base)
+        for axis, what, m, idx in mutations(ex):
+            if fired[axis]:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
             rows, _n, _sub = C.compare_excursion(guest, m, ref,
                                            C.excursion_gaps(m, []))
-            hit = [r for r in rows if r.axis == axis and
-                   r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
+            hit = [r for r in rows if r.axis == axis and r.idx == idx
+                   and r.verdict in RED and rowkey(r) not in base_red]
             fired[axis] += bool(hit)
             lines.append('  %-16s %-10s %-46s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit else 'DID NOT FIRE'))
+                            ('FIRED' if hit else 'DID NOT FIRE')
+                            + (' (subject already reports this axis'
+                               ' elsewhere)'
+                               if axis in base_axes else '')))
 
     # ---- wp-entry-state.  Scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be the
     # zero of a check nobody made fire.
-    guest, ex, ref, _dirty, _elf, _npro, _boot = subjects[0]
+    guest, ex, ref, _base, _elf, _npro, _boot = subjects[0]
     truth = dict((n, v) for n, (v, _w) in ex.regs.items()
                  if wp_seed.reg_to_mips(n))
     m = copy.deepcopy(ex)
@@ -233,7 +277,7 @@ def run(args, binary, cfg, env):
     inj_ok = False
     inj_line = ('  injection        -- no source register to perturb'
                 '                            UNPROVEN')
-    for guest, ex, ref, _dirty, _elf, _npro, boot in subjects:
+    for guest, ex, ref, _base, _elf, _npro, boot in subjects:
         victim = None
         for ins in ex.insns:
             for sname in ins.srcs:

@@ -706,11 +706,88 @@ static inline CPUARMTBFlags arm_tbflags_from_tb(const TranslationBlock *tb)
  * the helper -- can state the same fact in the same terms.  For those, the
  * pointer the walk would have followed does not exist at all.
  */
+/*
+ * THE FP CONTROL WORD THE INSTRUCTION OPERATES UNDER -- FPCR itself.
+ *
+ * THE FACT.  An FP instruction reads FPCR: the rounding mode, the
+ * flush-to-zero and default-NaN controls and the alternate-handling bit are
+ * inputs to its result, and a pending write to FPCR must resolve before the
+ * instruction may proceed.  That is an architectural source, and it is the
+ * one the wire publishes as REG_FPCW.
+ *
+ * QEMU CANNOT BE WALKED FOR IT, for exactly the reason CPACR_EL1 cannot be
+ * walked for in fp_access_check_only().  QEMU DECODES FPCR ONCE, at the
+ * point it is written: vfp_set_fpcr_to_host() turns the control bits into
+ * softfloat settings inside vfp.fp_status[], and the FPCR.AH and FPCR.NEP
+ * bits are folded further into the TB flags (`s->fpcr_ah`, `s->fpcr_nep`,
+ * which select which status flavour and which expander this very
+ * translation uses).  By translation time the answer is a decoded status
+ * word and a C field, and the instruction's op stream contains no read of
+ * vfp.fpcr anywhere.  Caching a decode is a lowering choice, and a lowering
+ * choice is not architectural truth (R15) -- so the fact is STATED here
+ * rather than inferred from an op that does not exist.
+ *
+ * WHY IT IS NOT ALREADY SAID BY note_fpstatus_read().  The status file and
+ * the control word are two different architectural registers -- FPSR
+ * (S3_3_C4_C4_1) and FPCR (S3_3_C4_C4_0) -- and the wire has carried them as
+ * two words since the FP control word was given its own generic id.  The
+ * status read states the register the instruction ACCUMULATES INTO and reads
+ * back; this states the register that CONFIGURES it.  Folding them would put
+ * a read-after-write edge between consecutive unrelated FP instructions
+ * through a register neither of them modifies, which is the defect that
+ * split them.
+ *
+ * WHICH FLAVOURS, and it is QEMU's own answer rather than a judgement made
+ * here -- the same shape as note_fpstatus_write() one function below, which
+ * takes its refusal from vfp_get_fpsr_from_host().  Here the authority is
+ * vfp_set_fpcr_to_host(), the function that decodes FPCR into the file: it
+ * writes settings into seven of the eight flavours, and never once into
+ * FPST_STD.  That is not an omission, it is the ARM "Standard FPSCR Value" --
+ * a FIXED default-NaN, flush-to-zero, round-to-nearest configuration the
+ * architecture defines for the operations (generally Neon integer-adjacent
+ * forms) that are DEFINED not to be controlled by FPCR.  cpu.c sets it once
+ * at reset and no FPCR write ever touches it again.  An instruction operating
+ * under FPST_STD therefore does not read FPCR, and stating one for it would
+ * be a source the encoding does not have -- the direction the x87 `fnop` arm
+ * was caught in at PASS 57.  FPST_STD_F16 is NOT refused with it: the
+ * standard value tracks FPCR.FZ16 rather than fixing it, which is the whole
+ * reason QEMU keeps a second standard flavour, and vfp_set_fpcr_to_host()
+ * writes to it on an FZ16 change.
+ *
+ * BY RANGE, on the neighbouring notes' rule: the range IS the register,
+ * named by the insn_dataflow_declare_regfile("fpcr", ...) in
+ * translate-a64.c, so one declaration names this and every other access to
+ * these bytes alike.
+ *
+ * READ ONLY, no write twin.  No FP arithmetic instruction writes FPCR; the
+ * register is written by MSR and by nothing else on this path, so a write
+ * note here would fabricate a destination.
+ *
+ * Capture only; no op is emitted, altered or suppressed, and the generated
+ * code is byte-identical with the note present or absent.
+ */
+static inline void note_fpcr_read(ARMFPStatusFlavour flavour)
+{
+    if (flavour == FPST_STD) {
+        return;
+    }
+    insn_dataflow_note_stated_read_env(offsetof(CPUARMState, vfp.fpcr),
+                                       sizeof(((CPUARMState *)0)->vfp.fpcr));
+}
+
 static inline void note_fpstatus_read(ARMFPStatusFlavour flavour)
 {
     insn_dataflow_note_stated_read_env(
         offsetof(CPUARMState, vfp.fp_status[flavour]),
         sizeof(((CPUARMState *)0)->vfp.fp_status[0]));
+    /*
+     * STATED HERE, at the one function every reader of the status file
+     * already passes through, so the control word and the status word cannot
+     * drift apart: fpstatus_ptr() and the four emitters that hand a helper
+     * tcg_env instead of a pointer all reach this line, and they are exactly
+     * the sites at which an instruction operates under a flavour.
+     */
+    note_fpcr_read(flavour);
 }
 
 /*

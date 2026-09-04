@@ -178,6 +178,38 @@ void a64_translate_init(void)
                                   ARRAY_SIZE(((CPUARMState *)0)->vfp.fp_status));
 
     /*
+     * FPCR, the FP CONTROL word -- the rounding mode, the flush-to-zero and
+     * default-NaN controls and the alternate-handling bit that every FP and
+     * AdvSIMD arithmetic instruction operates under.
+     *
+     * A DIFFERENT REGISTER from the status file declared above: FPCR is
+     * S3_3_C4_C4_0 and FPSR is S3_3_C4_C4_1, and the wire carries them as two
+     * words -- the control word the instruction READS, the status word it
+     * WRITES.  QEMU keeps them in two fields for the same reason.
+     *
+     * Declared for the reason CPACR_EL1 is: the bytes have no TCG global and
+     * no row in the GDB stub's env-offset namespace, so an access to them
+     * would arrive downstream as an anonymous range.  And, like CPACR_EL1, it
+     * is not read by an op the walk could find -- vfp_set_fpcr_to_host()
+     * decodes FPCR into vfp.fp_status[] when it is WRITTEN, and the AH and
+     * NEP bits are folded into the TB flags, so at translation time the
+     * control word has already become a status word and a C field.
+     * note_fpcr_read() in translate.h states the read; this declaration is
+     * what gives the range its name.
+     *
+     * THE SPELLING IS THE STUB'S.  `fpcr` is what the AArch64 GDB stub's FPU
+     * feature calls this register, so the name resolves through the
+     * consumer's generated GDB-namespace table rather than needing a fold of
+     * its own -- unlike `cpacr_el1` and `tpidr_el0` above, which the stub does
+     * not carry at all.
+     */
+    insn_dataflow_declare_regfile("fpcr", NULL,
+                                  offsetof(CPUARMState, vfp.fpcr),
+                                  sizeof(((CPUARMState *)0)->vfp.fpcr),
+                                  sizeof(((CPUARMState *)0)->vfp.fpcr),
+                                  1);
+
+    /*
      * FPSR.QC, the CUMULATIVE SATURATION bit, which the saturating vector
      * integer instructions write.
      *

@@ -682,16 +682,30 @@ uint8_t fold_nonarch(const char *name)
      *
      * DCZID_EL0 is a read-only implementation constant -- the DC ZVA block
      * size -- which is what REG_SYSID names, and REG_SYSID is what the wire
-     * has always published for `mrs xN, dczid_el0`.  FPCR is the FP
-     * control-and-status file, REG_FCSR, which is both what the wire
-     * publishes for `mrs xN, fpcr` and what the table's own `fpcr` row
-     * carries.  Two spellings meeting words that exist.
+     * has always published for `mrs xN, dczid_el0`.  FPCR is the FP CONTROL
+     * word, REG_FPCW, which is what the wire publishes for `mrs xN, fpcr` and
+     * what the table's own `fpcr` row carries.  Two spellings meeting words
+     * that exist.
+     *
+     * THE CLAIM THAT NEITHER SPELLING CAN REACH THE TABLE IS TRUE OF ONE OF
+     * THEM AND FALSE OF THE OTHER, and it is corrected here rather than left
+     * standing.  generic_for_qemu_name() matches through name_matches(),
+     * which is strcasecmp -- so `FPCR` DOES match the stub's `fpcr` row and
+     * is answered before this function is ever called; DCZID_EL0 has no row
+     * in any feature and genuinely arrives here.  The FPCR arm is therefore
+     * a FALLBACK that must AGREE with the table rather than the only route,
+     * and it is written to agree: bad95750f4 moved the `fpcr` row from
+     * REG_FCSR to REG_FPCW when it split the control word off the status
+     * word on aarch64, and an arm left saying REG_FCSR would be a second
+     * answer for one register waiting for the first route to change.  A fold
+     * that disagrees with the table is a bug whether or not it is reached
+     * today.
      */
     if (!strcmp(name, "DCZID_EL0")) {
         return REG_SYSID;
     }
     if (!strcmp(name, "FPCR")) {
-        return REG_FCSR;
+        return REG_FPCW;
     }
     /*
      * The MIPS FP CONDITION CODES.  QEMU keeps all eight as bits of the

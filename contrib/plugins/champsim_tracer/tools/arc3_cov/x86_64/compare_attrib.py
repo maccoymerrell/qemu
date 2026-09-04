@@ -409,16 +409,26 @@ def adjudicate(hexs, xsrc, xdst):
             src.discard('RCX')
             ADJ['ADJ-9 the single-shot XSTORE has no ECX counter '
                 '(iced+LLVM over XED)'] += 1
-    # ADJ-10: FFREEP tags ST(i) empty and pops.  It reads no data from the
-    # register it names, which is why disas/capstone.c drops the operand
-    # (cap_x86_is_x87_tag_only).  XED and LLVM MC both name it anyway
-    # because it is spelled as an operand; the dependency a renaming
+    # ADJ-10: FFREE / FFREEP tag ST(i) empty (and pop).  Neither reads data
+    # from the register it names, which is why disas/capstone.c drops the
+    # operand (cap_x86_is_x87_tag_only).  XED and LLVM MC both name it
+    # anyway because it is spelled as an operand; the dependency a renaming
     # machine must respect is the tag word, and that is recorded.
-    if xmn == 'FFREEP':
+    #
+    # FFREE JOINED FFREEP HERE WHEN THE BOUNDARY RULING WAS EXTENDED TO IT.
+    # f04c6cfee1 widened cap_x86_is_x87_tag_only() from FFREEP to FFREE on
+    # the evidence of FINDING 72-E, and this rule -- the reference-side twin
+    # of that exact ruling -- was left matching FFREEP alone.  The reference
+    # then kept an ST(i) read the tracer had stopped naming, and the row went
+    # SRC-MISS{REG_FPR#}: not a new disagreement, the same ruling applied on
+    # one side only.  Both forms run the SAME helper (gen_helper_ffree_STN,
+    # target/i386/tcg/translate.c cases 0x28 and 0x38), so a rule that split
+    # them was describing one instruction two ways.
+    if xmn in ('FFREE', 'FFREEP'):
         for r in sorted(src):
             if re.fullmatch(r'ST[0-7]', r):
                 src.discard(r)
-                ADJ['ADJ-10 FFREEP names a tag entry, not a value '
+                ADJ['ADJ-10 FFREE/FFREEP name a tag entry, not a value '
                     '(the operand is not read)'] += 1
     if _is_3dnow(hexs) and iced and iced['ok'] and llvm and llvm['ok']:
         for r in sorted(src & dst):

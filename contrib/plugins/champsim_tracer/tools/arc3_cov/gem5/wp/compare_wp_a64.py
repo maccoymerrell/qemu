@@ -80,7 +80,7 @@ import wp_seed_a64                                           # noqa: E402
 import gem5_ref                                              # noqa: E402
 import gem5_env                                              # noqa: E402
 from arc3_taxonomy import (set_relation, EQUAL, SUPERSET,
-                           SUBSET)                           # noqa: E402
+                           SUBSET, ORTHOGONAL)               # noqa: E402
 from gem5_rules import gem5_exec_rule                        # noqa: E402
 from axis_subjects import Subjects                           # noqa: E402
 
@@ -122,11 +122,27 @@ _SR = re.compile(r'\sSR=\[([^\]]*)\]')
 FLAG_IDS = frozenset(('REG_FLAGS',))
 FPSR_IDS = frozenset(('REG_FCSR',))
 
+#: The FP CONTROL word.  gem5 keeps `fpcr` in its MISC file (index 568 of
+#: miscRegName on this build) and ``gem5_ref._ARM_MISC_RULES`` already maps it
+#: to REG_FPCW, so by this module's own partition rule -- "a fact gem5 keeps in
+#: its MISC file" -- it belongs on the sys axis and not in the register FILE.
+#:
+#: It was absent because until `bad95750f4` routed AArch64 FPCR to
+#: QEMU_PLUGIN_SYSREG_FPCW the id never appeared on the aarch64 wire at all, so
+#: the omission had no occupant to expose it.  The moment it did, every FP
+#: instruction's control-word read was bucketed with the vector register file
+#: and compared against gem5's ARCHITECTURAL source list, where a MISC-file
+#: register can never appear -- so the rows could not have agreed even had the
+#: reference named FPCR.  Keeping it out of FPSR_IDS is deliberate: FPSR_IDS is
+#: also the `fpsr-dst-set` axis membership, and the control word and the status
+#: word are the two halves the wire went to some trouble to separate.
+FPCW_IDS = frozenset(('REG_FPCW',))
+
 
 def _is_sys(name):
     """A fact gem5 keeps in its MISC file, or an id no vocabulary rule reached."""
     return (name.startswith('MISC:') or name.startswith('REG_SYS') or
-            name in FPSR_IDS or name == 'REG_TLS')
+            name in FPSR_IDS or name in FPCW_IDS or name == 'REG_TLS')
 
 
 # --------------------------------------------- reference sources, BY CLASS
@@ -377,6 +393,50 @@ _WP_RULES = {
         'gem5 resolves a zero-register source into its `invalid` class and '
         'names no source; the tracer names REG_ZERO'),
 
+    # gem5 MODELS fpcr -- it is misc register 568, `gem5_ref` maps it to
+    # REG_FPCW, and gem5's own disassembly names it on the instructions that
+    # move it.  What its ExeTracer does NOT do is declare the IMPLICIT read
+    # every FP instruction performs to learn its rounding mode, FTZ and DN
+    # controls, so the reference cannot state that architectural read set.
+    #
+    # MEASURED on this build, over the whole aarch64 WP population rather than
+    # over the probes that fail: `miscellaneous:568` appears 47 times in DR=,
+    # 47 in RW= and ONCE in SR= -- the writes are `msr fpcr, xN` and the single
+    # source is `mrs x3, fpcr`, an explicit transfer.  Not one FP ARITHMETIC
+    # micro-op names it.  So the gap is exactly "the implicit read is not
+    # declared", and it is the source-side twin of the correct-path leg's
+    # reference gaps rather than a disagreement about dataflow.
+    #
+    # HELD TO THE MEASURED SET, and to the SUPERSET direction with an EMPTY
+    # only_ref: a rule that fired whenever REG_FPCW was merely PRESENT would
+    # swallow the case that matters -- the tracer DROPPING a control-word read
+    # the reference states, which arrives as only_ref and can never match here.
+    # Watched by the same control that watches REF-READS-MACHINE-STATE.
+    'REF-NO-IMPLICIT-FPCR-READ': _Rule(
+        'REF-NO-IMPLICIT-FPCR-READ', 'reference-gap', {SUPERSET},
+        'gem5 names fpcr only on an explicit msr/mrs transfer and never in '
+        'the implicit source list of an FP arithmetic micro-op'),
+
+    # THE TWO GAPS MEET ON ONE ROW, and a row is adjudicated per SIDE.
+    # On an FP arithmetic micro-op gem5's misc source list is {cpsr,
+    # cpacr_el1} and the tracer's is {REG_SYSFPEN, REG_FPCW}: the reference
+    # names machine state the tracer does not (REF-READS-MACHINE-STATE) AND
+    # fails to name the control word the tracer does (REF-NO-IMPLICIT-FPCR-
+    # READ).  Neither surplus is empty, so the measured relation is
+    # ORTHOGONAL and neither single-direction rule can reach it -- yet both
+    # halves are separately adjudicated and nothing about the row is
+    # unexplained.
+    #
+    # This composition is the WHOLE licence: the row is covered only when
+    # EVERY member of each surplus is covered by the corresponding standing
+    # rule.  One unexplained register on either side and the row stays red,
+    # which is what keeps the case that matters -- the tracer dropping a
+    # source -- reachable.
+    'REF-MACHINE-STATE-AND-NO-FPCR': _Rule(
+        'REF-MACHINE-STATE-AND-NO-FPCR', 'reference-gap', {ORTHOGONAL},
+        'both halves separately adjudicated: gem5 names cpsr as a source of '
+        'every micro-op and names no implicit fpcr read'),
+
     # gem5's LSE atomic micro-op names its own DESTINATION in its source list.
     'REF-ATOMIC-DEST-AS-SRC': _Rule(
         'REF-ATOMIC-DEST-AS-SRC', 'reference-defect', {SUBSET},
@@ -519,6 +579,18 @@ def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
         if only_ref and not only_trc and \
                 frozenset(only_ref) <= REF_MACHINE_STATE:
             return 'REF-READS-MACHINE-STATE'
+        # The implicit FP control-word read.  SUPERSET direction only, and the
+        # surplus must be EXACTLY the control word: a row that also carried a
+        # dropped reference source has an unexplained half and stays red.
+        if only_trc and not only_ref and frozenset(only_trc) <= FPCW_IDS:
+            return 'REF-NO-IMPLICIT-FPCR-READ'
+        # Both halves at once, each against its OWN standing rule.  Every
+        # member of both surpluses must be covered; one register neither rule
+        # names and the row is UNACCOUNTED, as it should be.
+        if only_ref and only_trc and \
+                frozenset(only_ref) <= REF_MACHINE_STATE and \
+                frozenset(only_trc) <= FPCW_IDS:
+            return 'REF-MACHINE-STATE-AND-NO-FPCR'
     # NOTE on the flag and FP-status partitions: the correct-path leg needs
     # FLAGS-GRANULARITY and FPSR-GRANULARITY because it compares gem5's
     # sub-field registers against the tracer's whole word.  Here both sides

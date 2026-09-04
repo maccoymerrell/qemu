@@ -5677,6 +5677,22 @@ X86_IDENT_3DNOW = "target/i386/tcg/threednow_ident.c.inc"
 # template they do not have.
 X86_IDENT_MULTI0F = "target/i386/tcg/multi0f_ident.c.inc"
 
+# AND THE UNCONVERTED 0F 01 ROW ALSO ANSWERS FOR THE ENCODINGS QEMU HAS
+# NO CASE FOR.  gen_multi0F()'s 0F 01 switch labels 202 of the 256 modrm
+# bytes; the other 54 reach `default: goto illegal_op`, which is BEFORE
+# the returning-path publish the multi0F instrument inserted, so they keep
+# the shared slot id.  Thirty-three mnemonics land on it in the exec118
+# sled corpus and 63% of the census is `rstorssp`, whose ISA dependency on
+# the shadow-stack pointer R16 has already ruled on for `rdsspq` -- and
+# which has nowhere to be keyed while `xtest`, `vmcall` and thirty others
+# share its id.  scripts/x86_0f01_ident_instrument.py states the finer
+# identity for the STRUCTURAL holes only: an arm for a feature-gated
+# encoding that DOES have a case label would make the published identity a
+# function of CPUID and CPL, which R16 forbids.  These ARE table-row
+# carves, so they take their base row's macro suffix by the reader the
+# VEX, CET and prefetch rows use.
+X86_IDENT_GRP0F01 = "target/i386/tcg/grp0f01_ident.c.inc"
+
 # The emitter fact for a qualified multi0F arm.  As with the x87 leaves it
 # is not an X86_OP_* macro suffix: the arm is a case label inside
 # gen_multi0F, there is no operand template to read, and naming the kind
@@ -5850,7 +5866,8 @@ def parse_x86_identities() -> list[QemuIdent]:
                  + parse_x86_cet_identities(rows)
                  + parse_x86_prefetch_identities(rows)
                  + parse_x86_3dnow_identities(rows)
-                 + parse_x86_multi0f_identities())
+                 + parse_x86_multi0f_identities()
+                 + parse_x86_grp0f01_identities(rows))
     slots = {r.ident for r in rows}
     collide = [q for q in qualified if q.ident in slots]
     seen_q: dict[int, str] = {}
@@ -6053,6 +6070,60 @@ def parse_x86_prefetch_identities(base: list[QemuIdent]) -> list[QemuIdent]:
             f"{path}: no identity rows matched -- the reader does not fit "
             f"this table, and reporting an empty universe would read as "
             f"'the prefetch groups carry only a NOP'")
+    return rows
+
+
+def parse_x86_grp0f01_identities(base: list[QemuIdent]) -> list[QemuIdent]:
+    """The ENCODING-QUALIFIED holes of the row the whole 0F 01 group shares.
+
+    Same shape and the same checks as parse_x86_cet_identities(): the row's
+    provenance names the base slot, the base row's macro suffix supplies the
+    kind rather than this function inventing one, and a carve whose slot no
+    longer exists or now names a different rule is REFUSED rather than aged
+    out.
+
+    WHAT AN EMPTY TABLE WOULD COST.  Without these rows `rstorssp`,
+    `setssbsy`, `saveprevssp`, `xtest`, `vmcall` and twenty-eight others all
+    report as one rule named `multi0F` -- a placeholder that classifies as
+    none of them -- and the adjudication R16 already made for the shadow-
+    stack pointer has no key it can be written on.  That is the position the
+    census measured, not a hypothetical.
+    """
+    path = ROOT / X86_IDENT_GRP0F01
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} does not exist -- run "
+            f"scripts/x86_0f01_ident_instrument.py.  Without it the 0F 01 "
+            f"encodings QEMU has no case for report as unqualified and "
+            f"publish the placeholder `multi0F` their row is named for, "
+            f"which classifies as none of them.")
+    by_slot = {r.ident: r for r in base}
+    rows: list[QemuIdent] = []
+    stale: list[str] = []
+    for r in _read_qualified_table(path, ""):
+        b = by_slot.get(r.src_line)
+        if b is None:
+            stale.append(f"{r.name}: base slot {r.src_line} carries no "
+                         f"X86_OP_* row")
+            continue
+        if b.name != r.pattern:
+            stale.append(f"{r.name}: base slot {r.src_line} now names "
+                         f"{b.name!r}")
+            continue
+        rows.append(dataclasses.replace(r, kind=b.kind))
+    if stale:
+        for why in stale:
+            print(f"  STALE 0F01 ROW {why}")
+        raise SystemExit(
+            f"x86: {len(stale)} 0F01-qualified row(s) no longer match the "
+            f"decode table they were carved from -- re-run "
+            f"scripts/x86_0f01_ident_instrument.py rather than joining an "
+            f"old carve to a new rule")
+    if not rows:
+        raise SystemExit(
+            f"{path}: no identity rows matched -- the reader does not fit "
+            f"this table, and reporting an empty universe would read as "
+            f"'the 0F 01 row carries only one instruction'")
     return rows
 
 

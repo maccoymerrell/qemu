@@ -2658,6 +2658,32 @@ illegal:
 #include "threednow_ident.c.inc"
 
 /*
+ * THE 0F 01 GROUP'S UNDECODED ENCODINGS SHARE ITS ROW.
+ * The group's `[0x01]` row is one slot for the whole of it, and
+ * gen_multi0F() has case labels for 202 of the 256
+ * modrm bytes.  The other 54 reach `default: goto illegal_op`, which
+ * is BEFORE the returning-path publish
+ * scripts/x86_multi0f_ident_instrument.py inserted -- so they keep
+ * the shared slot id.  Measured on the exec118 sled corpus that slot
+ * carries thirty-three mnemonics, 63% of them `rstorssp`, whose
+ * dependency on the shadow-stack pointer R16 has already ruled on
+ * and which has nowhere to be keyed while the id is shared.
+ *
+ * The discriminator is not missing: `s->prefix` and `s->modrm` are
+ * both facts decode_insn() holds before the row is published, and
+ * which modrm values have no case is a fact of gen_multi0F's own
+ * source, which the generator reads rather than restates.
+ *
+ * scripts/x86_0f01_ident_instrument.py states the finer identity for
+ * the STRUCTURAL holes only -- the feature-gated encodings that DO
+ * have case labels keep the shared row, because an arm for them would
+ * make the published identity a function of CPUID and CPL.  THE BASE
+ * ROW DOES NOT MOVE: no X86_OP_* row is edited and no line is
+ * inserted above one, so every slot keeps its number.
+ */
+#include "grp0f01_ident.c.inc"
+
+/*
  * The operands the reserved-NOP, prefetch and UD0/UD1 rows name and never
  * load.  Included below every X86_OP_* site in this file -- last site line
  * 1932 -- so no slot is renumbered, and after the two ident files because
@@ -3005,6 +3031,8 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
                       (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
     prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
     threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
+    grp0f01_ident_publish(decode.e.slot,
+                          (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* grp0f01_ident */
     nop_operands_note(s, &decode);  /* nop_operands */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&

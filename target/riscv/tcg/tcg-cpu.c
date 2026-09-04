@@ -33,6 +33,7 @@
 #include "accel/accel-cpu-target.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tcg/tcg.h"
+#include "exec/insn-dataflow.h"
 #ifndef CONFIG_USER_ONLY
 #include "hw/boards.h"
 #endif
@@ -1163,6 +1164,42 @@ void riscv_tcg_cpu_finalize_features(RISCVCPU *cpu, Error **errp)
         }
     }
 #endif
+
+    /*
+     * THE VECTOR REGISTER FILE, for the dataflow extraction.
+     *
+     * No TCG global names it -- every v<n> access is a gvec op or a helper
+     * pointer at a constant env offset -- so without this declaration the
+     * extractor sees an anonymous byte range where a register belongs, and
+     * every published REG_VEC destination it should have justified was
+     * counted unjustified.  MEASURED on the PASS 72 shadow root: the whole
+     * riscv64 vector destination population, `vmv.v.v` on all 32 registers
+     * and the `vadd.vv`/`vsub.vv`/`vmul.vv` destinations beside them, read
+     * `reg=?` in the extractor's own dump.
+     *
+     * DECLARED HERE AND NOT IN riscv_translate_init(), and that is the whole
+     * reason this call is in a realize path.  The stride of the file is
+     * cfg.vlenb, a per-CPU property that does not exist when the target
+     * builds its TCG globals; a declaration made there would have to invent
+     * one, and a stride that is not the layout names the WRONG register.
+     * This site is the one that runs after the vector length is final, once
+     * per CPU, on the main thread, before any translation -- the same
+     * ordering every *_translate_init() declaration relies on, reached the
+     * only way this file's layout allows.  The declaration is idempotent on
+     * (offset, count), so a second CPU re-stating it is a no-op.
+     *
+     * A LMUL > 1 GROUP IS DELIBERATELY NOT NAMED BY THIS.  A gvec op over a
+     * register group writes vlenb*LMUL bytes from v<n>, which reaches past
+     * the slot, and insn_dataflow_field_reg() declines rather than calling
+     * the span by its first register's name.  That refusal is the correct
+     * one -- naming a group after one member publishes a set short by the
+     * rest -- and the group case is a separate question from this one.
+     */
+    if (cpu->cfg.vlenb) {
+        insn_dataflow_declare_regfile("v", NULL,
+                                      offsetof(CPURISCVState, vreg),
+                                      cpu->cfg.vlenb, cpu->cfg.vlenb, 32);
+    }
 }
 
 void riscv_tcg_cpu_finalize_dynamic_decoder(RISCVCPU *cpu)

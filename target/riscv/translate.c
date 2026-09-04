@@ -785,9 +785,45 @@ static void mark_vs_dirty(DisasContext *ctx)
 static inline void mark_vs_dirty(DisasContext *ctx) { }
 #endif
 
+/*
+ * vstart, WHICH EVERY VECTOR INSTRUCTION WRITES AND NO OP NAMES.
+ *
+ * The V extension resets vstart to zero at the end of every vector
+ * instruction (RVV spec, "Vector Start Index CSR vstart": "the vstart CSR is
+ * reset to zero at the end of execution of a vector instruction").  QEMU
+ * performs it two ways and STATES it in neither:
+ *
+ *   - the helper path writes `env->vstart = 0` in C, at the end of each of
+ *     the 46 vext helpers, where the op walk cannot see it;
+ *   - the gvec fast path writes NOTHING, because the translator already
+ *     knows vstart is zero (`vstart_eq_zero`) and elides the store.
+ *
+ * The second is an emulator optimisation and R7.3/R15 rule it a lowering
+ * choice rather than the machine's answer; the first is the CP-H write-side
+ * shape.  Either way the register the ISA says the instruction writes was
+ * missing from QEMU's ordered write list -- measured on the PASS 72 shadow
+ * root as 70 published REG_VCTRL destinations over `vmv.v.v`, `vadd.vv`,
+ * `vsub.vv` and `vmul.vv`, stated by nobody.
+ *
+ * SAID HERE, once, because this is the one site every vector instruction
+ * passes through on its way out, and it is the site that already asserts the
+ * fact in the DisasContext.  A per-emitter statement would be the same
+ * sentence a few hundred times and would be forgotten by the next emitter
+ * added.
+ *
+ * BY RANGE, through the cpu_vstart TCG global that names exactly these
+ * bytes, so no declaration is added.
+ *
+ * R20: which register a vector instruction resets is a STATIC property of
+ * the encoding -- it is vstart for every one of them, in every mode.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
 static void finalize_rvv_inst(DisasContext *ctx)
 {
     mark_vs_dirty(ctx);
+    insn_dataflow_note_stated_write_env(offsetof(CPURISCVState, vstart),
+                                        sizeof(((CPURISCVState *)0)->vstart));
     ctx->vstart_eq_zero = true;
 }
 

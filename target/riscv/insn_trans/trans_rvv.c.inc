@@ -2317,6 +2317,18 @@ static bool trans_vmv_v_v(DisasContext *s, arg_vmv_v_v *a)
          */
         if (a->rd == a->rs1) {
             insn_dataflow_note_stated_read_env(vreg_ofs(s, a->rs1), MAXSZ(s));
+            /*
+             * AND vd, WHICH THE SAME ELISION TAKES.  The comment above says
+             * "and no write of the destination" and then states only the
+             * read, so QEMU's ordered WRITE list for `vmv.v.v vd,vd` was
+             * EMPTY and a consumer could not tell it from an instruction
+             * that writes no register: 64 published destinations over the
+             * PASS 72 shadow root, REG_VEC0 through REG_VEC31, stated by
+             * nobody.  Same range, same accessor, opposite direction.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_note_stated_write_env(vreg_ofs(s, a->rd), MAXSZ(s));
         }
         if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
             tcg_gen_gvec_mov(s->sew, vreg_ofs(s, a->rd),

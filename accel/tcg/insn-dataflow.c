@@ -558,6 +558,16 @@ typedef struct DfHelperNote {
      */
     uint32_t gvec_size[INSN_DF_MAX_GVEC_OPERANDS];
     uint32_t gvec_oprsz;
+    /*
+     * OPERAND POINTERS THE CALL PASSES AND THE HELPER DOES NOT TOUCH.
+     *
+     * See insn_dataflow_note_helper_operand_absent() in the header for what
+     * this states and why only the call site can state it.  Kept as env
+     * OFFSETS rather than argument indices because that is what the argument
+     * loop has resolved by the time it asks.
+     */
+    uint32_t absent_off[INSN_DF_MAX_GVEC_OPERANDS];
+    uint8_t  n_absent;
 } DfHelperNote;
 
 /*
@@ -3246,6 +3256,27 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         continue;
                     }
                     eo = df_envoff_of(ts - s->temps);
+                    if (eo != INSN_DF_NOT_ENV && eo >= 0) {
+                        bool absent = false;
+
+                        for (unsigned q = 0; q < hn->n_absent; q++) {
+                            if (hn->absent_off[q] == (uint32_t)eo) {
+                                absent = true;
+                                break;
+                            }
+                        }
+                        if (absent) {
+                            /*
+                             * The CALL SITE stated that this pointer is
+                             * passed and not touched.  Skipped with NO model
+                             * downgrade and no field: an absence the emitter
+                             * STATED is a fact, not the "nobody looked" the
+                             * OPAQUE and APPROX labels stand for.  See
+                             * insn_dataflow_note_helper_operand_absent().
+                             */
+                            continue;
+                        }
+                    }
                     if (eo == INSN_DF_NOT_ENV || eo < 0) {
                         /*
                          * A pointer whose value is not tcg_env plus a
@@ -5152,6 +5183,53 @@ void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
      * the same offset, which is a different instruction's register.
      */
     df_n_gvec_osz = 0;
+}
+
+/*
+ * A POINTER THE CALL JUST MADE PASSES AND THE HELPER DOES NOT TOUCH.
+ *
+ * See insn_dataflow_note_helper_operand_absent() in the header for what this
+ * states and why the usage table cannot.  Taken AFTER the call, on
+ * insn_dataflow_note_gvec_ool()'s discipline and for its reason: the note
+ * belongs to the call that was emitted, and anchoring it on the last op is
+ * what keeps it there.
+ */
+void insn_dataflow_note_helper_operand_absent(uint32_t off)
+{
+    const TCGOp *last;
+    DfHelperNote *h;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_helper == 0) {
+        df_helper_overflow = true;
+        return;
+    }
+    last = QTAILQ_LAST(&tcg_ctx->ops);
+    h = &df_helper[df_n_helper - 1];
+    if (h->anchor != last) {
+        /*
+         * The call this note is about is not the last op emitted, so the
+         * note cannot be shown to belong to it.  Recorded as an overflow
+         * rather than attached to whatever call IS last: describing one
+         * instruction with another's operand is the failure both the
+         * gvec-role note and this one refuse.
+         */
+        df_helper_overflow = true;
+        return;
+    }
+    if (h->n_absent >= INSN_DF_MAX_GVEC_OPERANDS) {
+        df_helper_overflow = true;
+        return;
+    }
+    for (unsigned q = 0; q < h->n_absent; q++) {
+        if (h->absent_off[q] == off) {
+            return;                     /* the same statement twice */
+        }
+    }
+    h->absent_off[h->n_absent++] = off;
 }
 
 /*

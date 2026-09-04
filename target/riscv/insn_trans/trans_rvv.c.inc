@@ -320,6 +320,39 @@ static void note_vreg_mask_read(uint32_t vm)
 }
 
 /*
+ * THE SAME BIT, THE OTHER WAY ROUND: the mask pointer the call PASSED and
+ * the helper will not touch.
+ *
+ * The constructors below hand vreg_ofs(s, 0) to the helper on every form,
+ * masked or not, because the mask bit travels in the VDATA word rather than
+ * in the argument list.  The helper's CP-H usage row is keyed on the helper
+ * NAME and one row has to answer for both encodings, so whatever it says is
+ * wrong for one of them: `vmadc.vvm` reads v0 and `vmadc.vv` does not, and
+ * they call the same helper.  With the vector file undeclared the argument
+ * resolved to an anonymous range and was dropped, which was accidentally
+ * right for the unmasked forms and wrong for the masked ones; declaring the
+ * file made the row REACH the wire, and `vmadc.vv` published a read of v0 it
+ * does not perform.  The probe written for exactly this -- the validator's
+ * probe_rv_v0_carry_mask, whose last two rows are the unmasked negative
+ * controls -- is what caught it.
+ *
+ * So the decode site says it, because the decode site is the only place the
+ * bit is known.  A STATED absence, not an unknown: see
+ * insn_dataflow_note_helper_operand_absent() for why the two must not be
+ * spelled the same way.
+ *
+ * TAKEN AFTER THE CONSTRUCTOR, on that note's anchoring rule.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_vreg_mask_absent(DisasContext *s, uint32_t vm)
+{
+    if (vm) {
+        insn_dataflow_note_helper_operand_absent(vreg_ofs(s, 0));
+    }
+}
+
+/*
  * THE DESTINATION VECTOR REGISTER, WHICH IS ALSO A SOURCE.
  *
  * A vector instruction does not necessarily write the whole destination
@@ -1437,6 +1470,8 @@ do_opivv_gvec(DisasContext *s, arg_rmrr *a, GVecGen3Fn *gvec_fn,
                            vreg_ofs(s, a->rs1), vreg_ofs(s, a->rs2),
                            tcg_env, s->cfg_ptr->vlenb,
                            s->cfg_ptr->vlenb, data, fn);
+        /* The mask pointer this call passed and will not use. */
+        note_vreg_mask_absent(s, a->vm);
     }
     finalize_rvv_inst(s);
     return true;
@@ -1497,6 +1532,8 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
     tcg_gen_addi_ptr(mask, tcg_env, vreg_ofs(s, 0));
 
     fn(dest, mask, src1, src2, tcg_env, desc);
+    /* The mask pointer this call passed and will not use. */
+    note_vreg_mask_absent(s, vm);
 
     finalize_rvv_inst(s);
     return true;
@@ -1679,6 +1716,8 @@ static bool opivi_trans(uint32_t vd, uint32_t imm, uint32_t vs2, uint32_t vm,
     tcg_gen_addi_ptr(mask, tcg_env, vreg_ofs(s, 0));
 
     fn(dest, mask, src1, src2, tcg_env, desc);
+    /* The mask pointer this call passed and will not use. */
+    note_vreg_mask_absent(s, vm);
 
     finalize_rvv_inst(s);
     return true;
@@ -1919,6 +1958,8 @@ static bool opivv_trans(uint32_t vd, uint32_t vs1, uint32_t vs2, uint32_t vm,
     tcg_gen_gvec_4_ptr(vreg_ofs(s, vd), vreg_ofs(s, 0), vreg_ofs(s, vs1),
                        vreg_ofs(s, vs2), tcg_env, s->cfg_ptr->vlenb,
                        s->cfg_ptr->vlenb, data, fn);
+    /* The mask pointer this call passed and will not use. */
+    note_vreg_mask_absent(s, vm);
     finalize_rvv_inst(s);
     return true;
 }
@@ -2578,6 +2619,8 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
                            s->cfg_ptr->vlenb,                      \
                            s->cfg_ptr->vlenb, data,                \
                            fns[s->sew - 1]);                       \
+        /* The mask pointer this call passed and will not use. */  \
+        note_vreg_mask_absent(s, a->vm);                           \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -2779,6 +2822,8 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
                            s->cfg_ptr->vlenb,                      \
                            s->cfg_ptr->vlenb, data,                \
                            fns[s->sew - 1]);                       \
+        /* The mask pointer this call passed and will not use. */  \
+        note_vreg_mask_absent(s, a->vm);                           \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3073,6 +3118,8 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
                            s->cfg_ptr->vlenb,                      \
                            s->cfg_ptr->vlenb, data,                \
                            fns[s->sew - 1]);                       \
+        /* The mask pointer this call passed and will not use. */  \
+        note_vreg_mask_absent(s, a->vm);                           \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3185,6 +3232,8 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
                            s->cfg_ptr->vlenb,                      \
                            s->cfg_ptr->vlenb, data,                \
                            fns[s->sew - 1]);                       \
+        /* The mask pointer this call passed and will not use. */  \
+        note_vreg_mask_absent(s, a->vm);                           \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \

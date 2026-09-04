@@ -1972,6 +1972,43 @@ void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
 void insn_dataflow_note_gvec_operand_size(uint32_t off, uint32_t size);
 
 /*
+ * A POINTER THE CALL JUST MADE PASSES AND THE HELPER DOES NOT TOUCH.
+ *
+ * WHY THE USAGE TABLE CANNOT SAY THIS.  A helper's usage row is keyed on the
+ * helper NAME and states, per argument, which direction it is reached in.
+ * That is exactly right when the answer is a property of the helper.  It is
+ * wrong when one helper serves two encodings that reach the same argument
+ * differently, and RISC-V's V extension is the case that forces it: every
+ * masked-form constructor passes vreg_ofs(s, 0) -- the v0 governing mask --
+ * as an operand pointer WHETHER OR NOT the encoding is masked, because the
+ * mask bit travels separately in the VDATA word.  `vmadc.vvm` reads v0 and
+ * `vmadc.vv` does not, and they call the SAME helper, so one usage row has
+ * to answer for both and whichever answer it gives is wrong for one of them.
+ *
+ * WHAT IT MEANS, and the distinction is the point.  This says the pointer is
+ * PASSED AND NOT TOUCHED, which is a fact the decode site holds (R20: the
+ * encoding's mask bit decides it, statically, once).  It is not "nobody
+ * looked": an argument nothing states is described as both directions and
+ * the instruction is labelled APPROX, which is the honest treatment of an
+ * unknown and the wrong treatment of a known absence.  So a stated absence
+ * takes NO model downgrade -- the operand simply is not in the footprint.
+ *
+ * WHAT IT DOES NOT MEAN.  Nothing about any other call: the note is
+ * anchored on the call that has just been emitted, exactly as
+ * insn_dataflow_note_gvec_ool() is, and for the same reason -- a statement
+ * that outlived its call would describe the next helper's argument at the
+ * same offset, which is a different instruction's register.  Taken AFTER
+ * the constructor returns.
+ *
+ * @off is the env offset the constructor built the pointer from, matched
+ * against the argument's own resolved offset.  Restating an offset the call
+ * does not pass is a no-op.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_helper_operand_absent(uint32_t off);
+
+/*
  * Drop every emitter note.
  *
  * Called from tcg_func_start(), which is where the op list is emptied and so
@@ -2195,6 +2232,9 @@ static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
 static inline void insn_dataflow_note_gvec_operand_size(uint32_t off,
                                                         uint32_t size)
 { }
+static inline void insn_dataflow_note_helper_operand_absent(uint32_t off)
+{ }
+
 
 static inline void insn_dataflow_note_preserve_read(const void *ts,
                                                     const void *mark)

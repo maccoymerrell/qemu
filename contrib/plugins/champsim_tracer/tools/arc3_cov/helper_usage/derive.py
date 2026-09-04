@@ -153,6 +153,15 @@ if __name__ == '__main__':
     ap.add_argument('--ppdir', required=True)
     ap.add_argument('-o', required=True)
     args = ap.parse_args()
+    # AN ABSOLUTE PPDIR, because the preprocessor does not run here.
+    # preprocess() invokes the compile command with the BUILD DIRECTORY as its
+    # working directory, so a relative --ppdir is created next to the caller
+    # and then handed to cc1 as an output path that does not exist there.
+    # Every TU fails, and what came out was not an error: it was a normal
+    # result line reading '140 helpers, 0 bounded, 140 refused/undefined',
+    # which is indistinguishable from a target whose helpers genuinely cannot
+    # be bounded.  Resolving it here costs nothing and removes the trap.
+    args.ppdir = os.path.abspath(args.ppdir)
     cen = json.load(open(args.census))
     helpers = list(cen[args.isa].keys())
     res, failed = derive(args.isa, helpers, args.ppdir)
@@ -161,3 +170,17 @@ if __name__ == '__main__':
     ok = sum(1 for v in res.values() if v['status'] == 'OK')
     print('%s: %d helpers, %d bounded, %d refused/undefined, %d TUs failed to '
           'preprocess' % (args.isa, len(res), ok, len(res) - ok, len(failed)))
+    # A TU THAT DID NOT PREPROCESS IS NOT A HELPER THAT COULD NOT BE BOUNDED.
+    # The rows this writes are read as a MEASUREMENT of what QEMU's source
+    # says; a row refused because its defining unit was never parsed says
+    # nothing about the helper, and downstream cannot tell the two apart.  A
+    # check that cannot find its subject fails.
+    if failed:
+        sys.stderr.write(
+            '\nREFUSING: %d translation unit(s) did not preprocess, so the '
+            'rows above are\nnot a statement about %s -- they are a statement '
+            'about a reader that never\nsaw the source.  First few:\n'
+            % (len(failed), args.isa))
+        for f, why in failed[:5]:
+            sys.stderr.write('  %s\n    %s\n' % (f, why.strip()[:200]))
+        sys.exit(2)

@@ -2122,10 +2122,45 @@ static void gen_CMPXCHG8B(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_deposit_tl(cpu_cc_src, cpu_cc_src, Z, ctz32(CC_Z), 1);
 }
 
+/*
+ * CPUID'S FOUR DESTINATIONS, WHICH ONLY THE CALL SITE CAN NAME.
+ *
+ * helper_cpuid() ends in four assignments -- env->regs[R_EAX], R_EBX, R_ECX
+ * and R_EDX -- and the translation emits nothing but the call, so QEMU's
+ * ordered write list for `cpuid` is EMPTY.  Every reference the tree checks
+ * against reports all four as destinations (Intel SDM vol.2 "CPUID", AMD APM
+ * vol.3), and the wire publishes all four; measured on the PASS 72 shadow
+ * root, 468 published destinations across the 80 golden cells with QEMU
+ * stating none of them.  This is the CP-H write-side shape the note API was
+ * added for: a destination a HELPER performs is a destination the op walk
+ * cannot find.
+ *
+ * WHY THE EMITTER MAY SAY IT (R20).  Which registers the helper writes is a
+ * STATIC property of the encoding -- it is the same four for every execution
+ * of these bytes, in every mode, on every model -- so nothing is observed and
+ * nothing is derived.
+ *
+ * STATED AS ENV RANGES, which resolve through the cpu_regs[] TCG globals that
+ * already name those exact bytes; no new declaration and no second spelling.
+ *
+ * NOT THE READS.  cpu_x86_cpuid() takes env->regs[R_EAX] and env->regs[R_ECX]
+ * as its leaf and subleaf, and the source census reports no loss for this
+ * instruction, so nothing here is owed on that side.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
 static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
 {
+    static const int cpuid_dst[] = { R_EAX, R_EBX, R_ECX, R_EDX };
+
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+    for (unsigned i = 0; i < ARRAY_SIZE(cpuid_dst); i++) {
+        insn_dataflow_note_stated_write_env(
+            offsetof(CPUX86State, regs[0]) +
+                cpuid_dst[i] * sizeof(((CPUX86State *)0)->regs[0]),
+            sizeof(((CPUX86State *)0)->regs[0]));
+    }
     gen_helper_cpuid(tcg_env);
 }
 
@@ -4496,6 +4531,52 @@ static void gen_SYSCALL(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+#ifdef TARGET_X86_64
+#if !defined(CONFIG_USER_ONLY) || defined(CONFIG_LINUX_USER)
+    /*
+     * SYSCALL'S TWO GENERAL-PURPOSE DESTINATIONS, WHICH THE HELPER PERFORMS.
+     *
+     * Long-mode SYSCALL writes RCX <- the RIP after the instruction and
+     * R11 <- RFLAGS before it transfers control (Intel SDM vol.2 "SYSCALL",
+     * AMD APM vol.3), and both stores happen inside helper_syscall() -- in
+     * target/i386/tcg/system/seg_helper.c for softmmu, and in
+     * target/i386/tcg/user/seg_helper.c for *-linux-user, where the comment
+     * above the stores gives the measurement that put them there.  The
+     * translation emits only the call, so QEMU's ordered write list for
+     * `syscall` was EMPTY: measured on the PASS 72 shadow root, 350 published
+     * destinations over the 80 golden cells, RCX and R11, stated by nobody.
+     *
+     * THE GUARDS ARE THE HELPER'S OWN, restated here because the note is a
+     * statement about what that helper will do:
+     *
+     *   - LMA(s).  Legacy-mode SYSCALL takes neither store on either side.
+     *   - *-linux-user, not bsd-user.  The user helper's scope comment names
+     *     the reason -- bsd-user's amd64 dispatcher reads env->regs[R_ECX]
+     *     as a syscall argument, so that build's helper does not write it,
+     *     and a note here would claim a write its emulator does not perform.
+     *
+     * The wrong-path carve-out both helpers apply is deliberately NOT a
+     * guard: it is a per-EXECUTION decision about a speculative path, and
+     * this is the STATIC fact about the encoding (R20).  The correct path --
+     * the one a trace publishes and a reference measures -- takes the stores.
+     *
+     * RFLAGS is not stated here.  Only the system helper writes it (masking
+     * by env->fmask), it does so through env->eflags rather than the lazy
+     * cc_* quartet, and *-linux-user deliberately leaves the word alone; the
+     * destination adjudication ledger carries that register with its ruling.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (LMA(s)) {
+        insn_dataflow_note_stated_write_env(
+            offsetof(CPUX86State, regs[R_ECX]),
+            sizeof(((CPUX86State *)0)->regs[0]));
+        insn_dataflow_note_stated_write_env(
+            offsetof(CPUX86State, regs[11]),
+            sizeof(((CPUX86State *)0)->regs[0]));
+    }
+#endif
+#endif
     gen_helper_syscall(tcg_env, cur_insn_len_i32(s));
     if (LMA(s)) {
         assume_cc_op(s, CC_OP_EFLAGS);

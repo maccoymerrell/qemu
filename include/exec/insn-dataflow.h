@@ -1943,6 +1943,35 @@ void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
                                  unsigned n, uint32_t oprsz);
 
 /*
+ * ONE OPERAND OF THE GVEC CALL ABOUT TO BE MADE IS NOT @oprsz BYTES WIDE.
+ *
+ * The constructors above state one width for the whole call, which is right
+ * for a vector op: every operand is a vector of oprsz bytes.  It is wrong
+ * for an operand that is a different KIND of register reached through the
+ * same constructor, and SVE's governing predicate is exactly that -- a
+ * predicated form passes pred_full_reg_offset(s, pg) as an ordinary gvec
+ * operand, and the predicate's own width is oprsz/8.
+ *
+ * WHY THE CONSTRUCTOR CANNOT WORK THIS OUT: it is handed offsets into
+ * CPUArchState and a size, and nothing in that says which file an offset
+ * belongs to.  The target does know, at the site that chose the offset, so
+ * the target says so.
+ *
+ * IT IS NOT COSMETIC.  The extent is what insn_dataflow_field_reg() resolves
+ * a range with, and a range wider than the register it starts in is refused
+ * as a name -- correctly, since it covers bytes belonging to another
+ * register.  Taking the vector width for a predicate at a 64-byte vector
+ * length asks about 64 bytes of a 32-byte predicate slot: it spans the NEXT
+ * predicate register entirely, so any answer at all would be a dependency
+ * on a register the instruction never names.
+ *
+ * SCOPE: from this call to the next gvec constructor, which consumes it.
+ * Call it immediately before the constructor, matched by the operand's env
+ * offset.  Restating an offset the call does not pass is a no-op.
+ */
+void insn_dataflow_note_gvec_operand_size(uint32_t off, uint32_t size);
+
+/*
  * Drop every emitter note.
  *
  * Called from tcg_func_start(), which is where the op list is emptied and so
@@ -2161,6 +2190,10 @@ static inline void insn_dataflow_note_helper(const void *call_op,
 static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
                                                const uint8_t *dir,
                                                unsigned n, uint32_t oprsz)
+{ }
+
+static inline void insn_dataflow_note_gvec_operand_size(uint32_t off,
+                                                        uint32_t size)
 { }
 
 static inline void insn_dataflow_note_preserve_read(const void *ts,

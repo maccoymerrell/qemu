@@ -445,6 +445,10 @@ static bool gen_gvec_fpst_zzzzp(DisasContext *s, gen_helper_gvec_5_ptr *fn,
         note_sve_pred_read(pg);
         status = fpstatus_ptr(flavour);
 
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, pg), pred_full_reg_size(s));
         tcg_gen_gvec_5_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            vec_full_reg_offset(s, rm),
@@ -467,6 +471,10 @@ static bool gen_gvec_ool_zzp(DisasContext *s, gen_helper_gvec_3 *fn,
 
         /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
         note_sve_pred_read(pg);
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, pg), pred_full_reg_size(s));
         tcg_gen_gvec_3_ool(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            pred_full_reg_offset(s, pg),
@@ -502,6 +510,10 @@ static bool gen_gvec_fpst_zzp(DisasContext *s, gen_helper_gvec_3_ptr *fn,
         note_sve_pred_read(pg);
         status = fpstatus_ptr(flavour);
 
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, pg), pred_full_reg_size(s));
         tcg_gen_gvec_3_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            pred_full_reg_offset(s, pg),
@@ -529,6 +541,10 @@ static bool gen_gvec_ool_zzzp(DisasContext *s, gen_helper_gvec_4 *fn,
 
         /* The GOVERNING PREDICATE; see note_sve_pred_read(). */
         note_sve_pred_read(pg);
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, pg), pred_full_reg_size(s));
         tcg_gen_gvec_4_ool(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            vec_full_reg_offset(s, rm),
@@ -560,6 +576,10 @@ static bool gen_gvec_fpst_zzzp(DisasContext *s, gen_helper_gvec_4_ptr *fn,
         note_sve_pred_read(pg);
         status = fpstatus_ptr(flavour);
 
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, pg), pred_full_reg_size(s));
         tcg_gen_gvec_4_ptr(vec_full_reg_offset(s, rd),
                            vec_full_reg_offset(s, rn),
                            vec_full_reg_offset(s, rm),
@@ -1278,6 +1298,10 @@ static bool do_zpzzz_ool(DisasContext *s, arg_rprrr_esz *a,
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
         note_sve_pred_read(a->pg);
+        /* The PREDICATE operand is not vsz wide: see
+         * insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, a->pg), pred_full_reg_size(s));
         tcg_gen_gvec_5_ool(vec_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->ra),
                            vec_full_reg_offset(s, a->rn),
@@ -4068,6 +4092,12 @@ static bool do_ppz_fp(DisasContext *s, arg_rpr_esz *a,
 
         note_sve_pred_read(a->pg);
         note_sve_pred_write(a->rd);
+        /* EVERY predicate operand, destination included: not vsz
+         * wide.  See insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, a->rd), pred_full_reg_size(s));
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, a->pg), pred_full_reg_size(s));
         tcg_gen_gvec_3_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            pred_full_reg_offset(s, a->pg),
@@ -4317,6 +4347,12 @@ static bool do_fp_cmp(DisasContext *s, arg_rprr_esz *a,
         TCGv_ptr status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
         note_sve_pred_read(a->pg);
         note_sve_pred_write(a->rd);
+        /* EVERY predicate operand, destination included: not vsz
+         * wide.  See insn_dataflow_note_gvec_operand_size(). */
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, a->rd), pred_full_reg_size(s));
+        insn_dataflow_note_gvec_operand_size(
+            pred_full_reg_offset(s, a->pg), pred_full_reg_size(s));
         tcg_gen_gvec_4_ptr(pred_full_reg_offset(s, a->rd),
                            vec_full_reg_offset(s, a->rn),
                            vec_full_reg_offset(s, a->rm),
@@ -4478,6 +4514,10 @@ static bool do_frint_mode(DisasContext *s, arg_rpr_esz *a,
     status = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
     tmode = gen_set_rmode(mode, status);
 
+    /* The PREDICATE operand is not vsz wide: see
+     * insn_dataflow_note_gvec_operand_size(). */
+    insn_dataflow_note_gvec_operand_size(
+        pred_full_reg_offset(s, a->pg), pred_full_reg_size(s));
     tcg_gen_gvec_3_ptr(vec_full_reg_offset(s, a->rd),
                        vec_full_reg_offset(s, a->rn),
                        pred_full_reg_offset(s, a->pg),

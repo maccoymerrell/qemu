@@ -360,6 +360,24 @@ enum QDepState : uint8_t {
      * direction QEMU did not emit; that claim was Capstone's and is no
      * longer made.
      */
+    /*
+     * TWO CAUSES, TWO WORDS.  Both refuse an env byte range and they close
+     * in different places, so one word for the pair is a word that cannot
+     * answer the only question a reader has.  It was not a theoretical
+     * hazard: a whole pass was scoped against "the vfp.qc range needs its
+     * generic word" when the measured cause of those refusals was that
+     * nothing declares the range at all -- the SVE predicate file, which
+     * target/arm deliberately leaves undeclared (see note_sve_pred_read()
+     * in translate-sve.c, where declaring it was measured to fabricate
+     * `whilelo` sources).  The tallies had always been separate;
+     * the STATE was not, and the state is what the census keys on.
+     *
+     * UNDECLARED closes in QEMU: a target has not said which register
+     * those bytes are, and only the target can.
+     * FIELD closes in the generator: QEMU named the range and the register
+     * table has no row for that name.
+     */
+    QDEP_R_FIELD_UNDECLARED, /* no target declared a file covering the range */
     QDEP_R_FIELD,        /* provenance named env state with no generic word */
     QDEP_R_UNMAPPED,     /* provenance named a global with no generic word */
     QDEP_R_WIDE,         /* more regs than QDEP_MAX_ADDR_REGS */

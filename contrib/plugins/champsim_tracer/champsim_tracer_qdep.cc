@@ -1655,7 +1655,7 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
             qemu_plugin_dataflow_prov_field(b, &foff);
             if (!qemu_plugin_dataflow_prov_field_reg(b, fnm, sizeof(fnm))) {
                 tally_field_off(&g_field_unnamed, foff);
-                return QDEP_R_FIELD;
+                return QDEP_R_FIELD_UNDECLARED;
             }
             if (is_monitor_value(fnm)) {
                 tally(&g_monitor_name, fnm);
@@ -4693,6 +4693,7 @@ const char *state_name(unsigned s)
     case QDEP_R_SHORT:          return "LOWER BOUND: extraction incomplete, QEMU's read list taken anyway";
     case QDEP_W_SHORT:          return "LOWER BOUND: extraction incomplete, QEMU's write list taken anyway";
     case QDEP_R_NORECORD:       return "refused: qemu withheld the access list or a provenance";
+    case QDEP_R_FIELD_UNDECLARED: return "refused: provenance named an env byte range no target declared";
     case QDEP_R_FIELD:          return "refused: provenance named env state with no generic word";
     case QDEP_R_UNMAPPED:       return "refused: provenance named a global with no generic word";
     case QDEP_R_WIDE:           return "refused: more address registers than the record holds";

@@ -13853,8 +13853,6 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
     v1_t = tcg_temp_new();
     v2_t = tcg_temp_new();
 
-    gen_load_gpr(v1_t, v1);
-    gen_load_gpr(v2_t, v2);
 
     switch (op1) {
     case OPC_ADDUH_QB_DSP:
@@ -13864,72 +13862,96 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
         check_dsp_r2(ctx);
         switch (op2) {
         case OPC_ADDUH_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDUH_QB ? MIPS_ID_OPC_ADDUH_QB :
                 MIPS_ID_NONE);
             gen_helper_adduh_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDUH_R_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDUH_R_QB ? MIPS_ID_OPC_ADDUH_R_QB :
                 MIPS_ID_NONE);
             gen_helper_adduh_r_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQH_PH ? MIPS_ID_OPC_ADDQH_PH :
                 MIPS_ID_NONE);
             gen_helper_addqh_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_R_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQH_R_PH ? MIPS_ID_OPC_ADDQH_R_PH :
                 MIPS_ID_NONE);
             gen_helper_addqh_r_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQH_W ? MIPS_ID_OPC_ADDQH_W :
                 MIPS_ID_NONE);
             gen_helper_addqh_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_R_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQH_R_W ? MIPS_ID_OPC_ADDQH_R_W :
                 MIPS_ID_NONE);
             gen_helper_addqh_r_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBUH_QB ? MIPS_ID_OPC_SUBUH_QB :
                 MIPS_ID_NONE);
             gen_helper_subuh_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_R_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBUH_R_QB ? MIPS_ID_OPC_SUBUH_R_QB :
                 MIPS_ID_NONE);
             gen_helper_subuh_r_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQH_PH ? MIPS_ID_OPC_SUBQH_PH :
                 MIPS_ID_NONE);
             gen_helper_subqh_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_R_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQH_R_PH ? MIPS_ID_OPC_SUBQH_R_PH :
                 MIPS_ID_NONE);
             gen_helper_subqh_r_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQH_W ? MIPS_ID_OPC_SUBQH_W :
                 MIPS_ID_NONE);
             gen_helper_subqh_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_R_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQH_R_W ? MIPS_ID_OPC_SUBQH_R_W :
                 MIPS_ID_NONE);
@@ -13943,6 +13965,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_ABSQ_S_QB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_QB ? MIPS_ID_OPC_ABSQ_S_QB :
                 MIPS_ID_NONE);
@@ -13950,6 +13973,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_absq_s_qb(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_PH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_PH ? MIPS_ID_OPC_ABSQ_S_PH :
                 MIPS_ID_NONE);
@@ -13957,6 +13981,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_absq_s_ph(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_W:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_W ? MIPS_ID_OPC_ABSQ_S_W :
                 MIPS_ID_NONE);
@@ -13964,6 +13989,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_absq_s_w(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_PRECEQ_W_PHL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_W_PHL ? MIPS_ID_OPC_PRECEQ_W_PHL :
                 MIPS_ID_NONE);
@@ -13972,6 +13998,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_ext32s_tl(cpu_gpr[ret], cpu_gpr[ret]);
             break;
         case OPC_PRECEQ_W_PHR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_W_PHR ? MIPS_ID_OPC_PRECEQ_W_PHR :
                 MIPS_ID_NONE);
@@ -13981,6 +14008,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_ext32s_tl(cpu_gpr[ret], cpu_gpr[ret]);
             break;
         case OPC_PRECEQU_PH_QBL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_PH_QBL ? MIPS_ID_OPC_PRECEQU_PH_QBL :
                 MIPS_ID_NONE);
@@ -13988,6 +14016,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_ph_qbl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_PH_QBR ? MIPS_ID_OPC_PRECEQU_PH_QBR :
                 MIPS_ID_NONE);
@@ -13995,6 +14024,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_ph_qbr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBLA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_PH_QBLA ? MIPS_ID_OPC_PRECEQU_PH_QBLA :
                 MIPS_ID_NONE);
@@ -14002,6 +14032,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_ph_qbla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBRA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_PH_QBRA ? MIPS_ID_OPC_PRECEQU_PH_QBRA :
                 MIPS_ID_NONE);
@@ -14009,6 +14040,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_ph_qbra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_PH_QBL ? MIPS_ID_OPC_PRECEU_PH_QBL :
                 MIPS_ID_NONE);
@@ -14016,6 +14048,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_ph_qbl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_PH_QBR ? MIPS_ID_OPC_PRECEU_PH_QBR :
                 MIPS_ID_NONE);
@@ -14023,6 +14056,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_ph_qbr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBLA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_PH_QBLA ? MIPS_ID_OPC_PRECEU_PH_QBLA :
                 MIPS_ID_NONE);
@@ -14030,6 +14064,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_ph_qbla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBRA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_PH_QBRA ? MIPS_ID_OPC_PRECEU_PH_QBRA :
                 MIPS_ID_NONE);
@@ -14044,6 +14079,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_ADDQ_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_PH ? MIPS_ID_OPC_ADDQ_PH :
                 MIPS_ID_NONE);
@@ -14051,6 +14088,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_S_PH ? MIPS_ID_OPC_ADDQ_S_PH :
                 MIPS_ID_NONE);
@@ -14058,6 +14097,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_S_W ? MIPS_ID_OPC_ADDQ_S_W :
                 MIPS_ID_NONE);
@@ -14065,6 +14106,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_QB ? MIPS_ID_OPC_ADDU_QB :
                 MIPS_ID_NONE);
@@ -14072,6 +14115,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_S_QB ? MIPS_ID_OPC_ADDU_S_QB :
                 MIPS_ID_NONE);
@@ -14079,6 +14124,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_s_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_PH ? MIPS_ID_OPC_ADDU_PH :
                 MIPS_ID_NONE);
@@ -14086,6 +14133,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_S_PH ? MIPS_ID_OPC_ADDU_S_PH :
                 MIPS_ID_NONE);
@@ -14093,6 +14142,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_PH ? MIPS_ID_OPC_SUBQ_PH :
                 MIPS_ID_NONE);
@@ -14100,6 +14151,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_S_PH ? MIPS_ID_OPC_SUBQ_S_PH :
                 MIPS_ID_NONE);
@@ -14107,6 +14160,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_S_W ? MIPS_ID_OPC_SUBQ_S_W :
                 MIPS_ID_NONE);
@@ -14114,6 +14169,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_QB ? MIPS_ID_OPC_SUBU_QB :
                 MIPS_ID_NONE);
@@ -14121,6 +14178,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_S_QB ? MIPS_ID_OPC_SUBU_S_QB :
                 MIPS_ID_NONE);
@@ -14128,6 +14187,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_s_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_PH ? MIPS_ID_OPC_SUBU_PH :
                 MIPS_ID_NONE);
@@ -14135,6 +14196,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_S_PH ? MIPS_ID_OPC_SUBU_S_PH :
                 MIPS_ID_NONE);
@@ -14142,6 +14205,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDSC:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDSC ? MIPS_ID_OPC_ADDSC :
                 MIPS_ID_NONE);
@@ -14149,6 +14214,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addsc(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDWC:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDWC ? MIPS_ID_OPC_ADDWC :
                 MIPS_ID_NONE);
@@ -14156,6 +14223,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addwc(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MODSUB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_MODSUB ? MIPS_ID_OPC_MODSUB :
                 MIPS_ID_NONE);
@@ -14163,6 +14232,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_modsub(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_RADDU_W_QB:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_RADDU_W_QB ? MIPS_ID_OPC_RADDU_W_QB :
                 MIPS_ID_NONE);
@@ -14177,6 +14247,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECR_QB_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECR_QB_PH ? MIPS_ID_OPC_PRECR_QB_PH :
                 MIPS_ID_NONE);
@@ -14184,6 +14256,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precr_qb_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_QB_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_QB_PH ? MIPS_ID_OPC_PRECRQ_QB_PH :
                 MIPS_ID_NONE);
@@ -14191,6 +14265,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_qb_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECR_SRA_PH_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_PRECR_SRA_PH_W ? MIPS_ID_OPC_PRECR_SRA_PH_W :
                 MIPS_ID_NONE);
@@ -14202,6 +14277,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECR_SRA_R_PH_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_PRECR_SRA_R_PH_W ? MIPS_ID_OPC_PRECR_SRA_R_PH_W :
                 MIPS_ID_NONE);
@@ -14213,6 +14289,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECRQ_PH_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_PH_W ? MIPS_ID_OPC_PRECRQ_PH_W :
                 MIPS_ID_NONE);
@@ -14220,6 +14298,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_ph_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_RS_PH_W:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_RS_PH_W ? MIPS_ID_OPC_PRECRQ_RS_PH_W :
                 MIPS_ID_NONE);
@@ -14227,6 +14307,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_rs_ph_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PRECRQU_S_QB_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQU_S_QB_PH ? MIPS_ID_OPC_PRECRQU_S_QB_PH :
                 MIPS_ID_NONE);
@@ -14242,6 +14324,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECEQ_L_PWL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_L_PWL ? MIPS_ID_OPC_PRECEQ_L_PWL :
                 MIPS_ID_NONE);
@@ -14249,6 +14332,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_andi_tl(cpu_gpr[ret], v2_t, 0xFFFFFFFF00000000ull);
             break;
         case OPC_PRECEQ_L_PWR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_L_PWR ? MIPS_ID_OPC_PRECEQ_L_PWR :
                 MIPS_ID_NONE);
@@ -14256,6 +14340,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_shli_tl(cpu_gpr[ret], v2_t, 32);
             break;
         case OPC_PRECEQ_PW_QHL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_PW_QHL ? MIPS_ID_OPC_PRECEQ_PW_QHL :
                 MIPS_ID_NONE);
@@ -14263,6 +14348,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceq_pw_qhl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_PW_QHR ? MIPS_ID_OPC_PRECEQ_PW_QHR :
                 MIPS_ID_NONE);
@@ -14270,6 +14356,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceq_pw_qhr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHLA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_PW_QHLA ? MIPS_ID_OPC_PRECEQ_PW_QHLA :
                 MIPS_ID_NONE);
@@ -14277,6 +14364,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceq_pw_qhla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHRA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQ_PW_QHRA ? MIPS_ID_OPC_PRECEQ_PW_QHRA :
                 MIPS_ID_NONE);
@@ -14284,6 +14372,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceq_pw_qhra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_QH_OBL ? MIPS_ID_OPC_PRECEQU_QH_OBL :
                 MIPS_ID_NONE);
@@ -14291,6 +14380,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_qh_obl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_QH_OBR ? MIPS_ID_OPC_PRECEQU_QH_OBR :
                 MIPS_ID_NONE);
@@ -14298,6 +14388,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_qh_obr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBLA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_QH_OBLA ? MIPS_ID_OPC_PRECEQU_QH_OBLA :
                 MIPS_ID_NONE);
@@ -14305,6 +14396,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_qh_obla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBRA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEQU_QH_OBRA ? MIPS_ID_OPC_PRECEQU_QH_OBRA :
                 MIPS_ID_NONE);
@@ -14312,6 +14404,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precequ_qh_obra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBL:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_QH_OBL ? MIPS_ID_OPC_PRECEU_QH_OBL :
                 MIPS_ID_NONE);
@@ -14319,6 +14412,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_qh_obl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBR:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_QH_OBR ? MIPS_ID_OPC_PRECEU_QH_OBR :
                 MIPS_ID_NONE);
@@ -14326,6 +14420,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_qh_obr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBLA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_QH_OBLA ? MIPS_ID_OPC_PRECEU_QH_OBLA :
                 MIPS_ID_NONE);
@@ -14333,6 +14428,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_qh_obla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBRA:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECEU_QH_OBRA ? MIPS_ID_OPC_PRECEU_QH_OBRA :
                 MIPS_ID_NONE);
@@ -14340,6 +14436,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_preceu_qh_obra(cpu_gpr[ret], v2_t);
             break;
         case OPC_ABSQ_S_OB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_OB ? MIPS_ID_OPC_ABSQ_S_OB :
                 MIPS_ID_NONE);
@@ -14347,6 +14444,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_absq_s_ob(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_PW:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_PW ? MIPS_ID_OPC_ABSQ_S_PW :
                 MIPS_ID_NONE);
@@ -14354,6 +14452,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_absq_s_pw(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ABSQ_S_QH ? MIPS_ID_OPC_ABSQ_S_QH :
                 MIPS_ID_NONE);
@@ -14368,6 +14467,7 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_RADDU_L_OB:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_RADDU_L_OB ? MIPS_ID_OPC_RADDU_L_OB :
                 MIPS_ID_NONE);
@@ -14375,6 +14475,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_raddu_l_ob(cpu_gpr[ret], v1_t);
             break;
         case OPC_SUBQ_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_PW ? MIPS_ID_OPC_SUBQ_PW :
                 MIPS_ID_NONE);
@@ -14382,6 +14484,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_S_PW ? MIPS_ID_OPC_SUBQ_S_PW :
                 MIPS_ID_NONE);
@@ -14389,6 +14493,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_s_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_QH ? MIPS_ID_OPC_SUBQ_QH :
                 MIPS_ID_NONE);
@@ -14396,6 +14502,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBQ_S_QH ? MIPS_ID_OPC_SUBQ_S_QH :
                 MIPS_ID_NONE);
@@ -14403,6 +14511,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subq_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_OB ? MIPS_ID_OPC_SUBU_OB :
                 MIPS_ID_NONE);
@@ -14410,6 +14520,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_S_OB ? MIPS_ID_OPC_SUBU_S_OB :
                 MIPS_ID_NONE);
@@ -14417,6 +14529,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_s_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_QH ? MIPS_ID_OPC_SUBU_QH :
                 MIPS_ID_NONE);
@@ -14424,6 +14538,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBU_S_QH ? MIPS_ID_OPC_SUBU_S_QH :
                 MIPS_ID_NONE);
@@ -14431,6 +14547,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subu_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBUH_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBUH_OB ? MIPS_ID_OPC_SUBUH_OB :
                 MIPS_ID_NONE);
@@ -14438,6 +14556,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subuh_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_R_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SUBUH_R_OB ? MIPS_ID_OPC_SUBUH_R_OB :
                 MIPS_ID_NONE);
@@ -14445,6 +14565,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_subuh_r_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQ_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_PW ? MIPS_ID_OPC_ADDQ_PW :
                 MIPS_ID_NONE);
@@ -14452,6 +14574,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_S_PW ? MIPS_ID_OPC_ADDQ_S_PW :
                 MIPS_ID_NONE);
@@ -14459,6 +14583,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_s_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_QH ? MIPS_ID_OPC_ADDQ_QH :
                 MIPS_ID_NONE);
@@ -14466,6 +14592,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDQ_S_QH ? MIPS_ID_OPC_ADDQ_S_QH :
                 MIPS_ID_NONE);
@@ -14473,6 +14601,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addq_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_OB ? MIPS_ID_OPC_ADDU_OB :
                 MIPS_ID_NONE);
@@ -14480,6 +14610,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_S_OB ? MIPS_ID_OPC_ADDU_S_OB :
                 MIPS_ID_NONE);
@@ -14487,6 +14619,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_s_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_QH ? MIPS_ID_OPC_ADDU_QH :
                 MIPS_ID_NONE);
@@ -14494,6 +14628,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDU_S_QH ? MIPS_ID_OPC_ADDU_S_QH :
                 MIPS_ID_NONE);
@@ -14501,6 +14637,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_addu_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDUH_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDUH_OB ? MIPS_ID_OPC_ADDUH_OB :
                 MIPS_ID_NONE);
@@ -14508,6 +14646,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_adduh_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDUH_R_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_ADDUH_R_OB ? MIPS_ID_OPC_ADDUH_R_OB :
                 MIPS_ID_NONE);
@@ -14522,6 +14662,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECR_OB_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECR_OB_QH ? MIPS_ID_OPC_PRECR_OB_QH :
                 MIPS_ID_NONE);
@@ -14529,6 +14671,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precr_ob_qh(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECR_SRA_QH_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECR_SRA_QH_PW ? MIPS_ID_OPC_PRECR_SRA_QH_PW :
                 MIPS_ID_NONE);
@@ -14539,6 +14683,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECR_SRA_R_QH_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECR_SRA_R_QH_PW ? MIPS_ID_OPC_PRECR_SRA_R_QH_PW :
                 MIPS_ID_NONE);
@@ -14549,6 +14695,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECRQ_OB_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_OB_QH ? MIPS_ID_OPC_PRECRQ_OB_QH :
                 MIPS_ID_NONE);
@@ -14556,6 +14704,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_ob_qh(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_PW_L:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_PW_L ? MIPS_ID_OPC_PRECRQ_PW_L :
                 MIPS_ID_NONE);
@@ -14563,6 +14713,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_pw_l(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_QH_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_QH_PW ? MIPS_ID_OPC_PRECRQ_QH_PW :
                 MIPS_ID_NONE);
@@ -14570,6 +14722,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_qh_pw(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_RS_QH_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQ_RS_QH_PW ? MIPS_ID_OPC_PRECRQ_RS_QH_PW :
                 MIPS_ID_NONE);
@@ -14577,6 +14731,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_precrq_rs_qh_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PRECRQU_S_OB_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PRECRQU_S_OB_QH ? MIPS_ID_OPC_PRECRQU_S_OB_QH :
                 MIPS_ID_NONE);
@@ -14607,8 +14763,6 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
     v2_t = tcg_temp_new();
 
     tcg_gen_movi_tl(t0, v1);
-    gen_load_gpr(v1_t, v1);
-    gen_load_gpr(v2_t, v2);
 
     switch (opc) {
     case OPC_SHLL_QB_DSP:
@@ -14619,6 +14773,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             op2 = MASK_SHLL_QB(ctx->opcode);
             switch (op2) {
             case OPC_SHLL_QB:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLL_QB ? MIPS_ID_OPC_SHLL_QB :
                     MIPS_ID_NONE);
@@ -14626,6 +14781,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_qb(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_QB:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLLV_QB ? MIPS_ID_OPC_SHLLV_QB :
                     MIPS_ID_NONE);
@@ -14633,6 +14790,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_PH:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLL_PH ? MIPS_ID_OPC_SHLL_PH :
                     MIPS_ID_NONE);
@@ -14640,6 +14798,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_ph(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_PH:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLLV_PH ? MIPS_ID_OPC_SHLLV_PH :
                     MIPS_ID_NONE);
@@ -14647,6 +14807,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_S_PH:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLL_S_PH ? MIPS_ID_OPC_SHLL_S_PH :
                     MIPS_ID_NONE);
@@ -14654,6 +14815,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_s_ph(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_S_PH:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLLV_S_PH ? MIPS_ID_OPC_SHLLV_S_PH :
                     MIPS_ID_NONE);
@@ -14661,6 +14824,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_S_W:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLL_S_W ? MIPS_ID_OPC_SHLL_S_W :
                     MIPS_ID_NONE);
@@ -14668,6 +14832,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_s_w(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_S_W:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHLLV_S_W ? MIPS_ID_OPC_SHLLV_S_W :
                     MIPS_ID_NONE);
@@ -14675,6 +14841,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shll_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHRL_QB:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRL_QB ? MIPS_ID_OPC_SHRL_QB :
                     MIPS_ID_NONE);
@@ -14682,6 +14849,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shrl_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRLV_QB:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRLV_QB ? MIPS_ID_OPC_SHRLV_QB :
                     MIPS_ID_NONE);
@@ -14689,6 +14858,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shrl_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRL_PH:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRL_PH ? MIPS_ID_OPC_SHRL_PH :
                     MIPS_ID_NONE);
@@ -14696,6 +14866,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shrl_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRLV_PH:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRLV_PH ? MIPS_ID_OPC_SHRLV_PH :
                     MIPS_ID_NONE);
@@ -14703,6 +14875,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shrl_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_QB:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRA_QB ? MIPS_ID_OPC_SHRA_QB :
                     MIPS_ID_NONE);
@@ -14710,6 +14883,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRA_R_QB:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRA_R_QB ? MIPS_ID_OPC_SHRA_R_QB :
                     MIPS_ID_NONE);
@@ -14717,6 +14891,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_r_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_QB:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRAV_QB ? MIPS_ID_OPC_SHRAV_QB :
                     MIPS_ID_NONE);
@@ -14724,6 +14900,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRAV_R_QB:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRAV_R_QB ? MIPS_ID_OPC_SHRAV_R_QB :
                     MIPS_ID_NONE);
@@ -14731,6 +14909,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_r_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_PH:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRA_PH ? MIPS_ID_OPC_SHRA_PH :
                     MIPS_ID_NONE);
@@ -14738,6 +14917,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRA_R_PH:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRA_R_PH ? MIPS_ID_OPC_SHRA_R_PH :
                     MIPS_ID_NONE);
@@ -14745,6 +14925,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_r_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_PH:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRAV_PH ? MIPS_ID_OPC_SHRAV_PH :
                     MIPS_ID_NONE);
@@ -14752,6 +14934,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRAV_R_PH:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRAV_R_PH ? MIPS_ID_OPC_SHRAV_R_PH :
                     MIPS_ID_NONE);
@@ -14759,6 +14943,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_r_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_R_W:
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRA_R_W ? MIPS_ID_OPC_SHRA_R_W :
                     MIPS_ID_NONE);
@@ -14766,6 +14951,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
                 gen_helper_shra_r_w(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_R_W:
+                gen_load_gpr(v1_t, v1);
+                gen_load_gpr(v2_t, v2);
                 mips_ident(ctx,
                     op2 == OPC_SHRAV_R_W ? MIPS_ID_OPC_SHRAV_R_W :
                     MIPS_ID_NONE);
@@ -14787,6 +14974,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
         op2 = MASK_SHLL_OB(ctx->opcode);
         switch (op2) {
         case OPC_SHLL_PW:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLL_PW ? MIPS_ID_OPC_SHLL_PW :
                 MIPS_ID_NONE);
@@ -14794,6 +14982,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_pw(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLLV_PW ? MIPS_ID_OPC_SHLLV_PW :
                 MIPS_ID_NONE);
@@ -14801,6 +14991,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_pw(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_S_PW:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLL_S_PW ? MIPS_ID_OPC_SHLL_S_PW :
                 MIPS_ID_NONE);
@@ -14808,6 +14999,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_s_pw(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_S_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLLV_S_PW ? MIPS_ID_OPC_SHLLV_S_PW :
                 MIPS_ID_NONE);
@@ -14815,6 +15008,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_s_pw(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_OB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLL_OB ? MIPS_ID_OPC_SHLL_OB :
                 MIPS_ID_NONE);
@@ -14822,6 +15016,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_ob(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLLV_OB ? MIPS_ID_OPC_SHLLV_OB :
                 MIPS_ID_NONE);
@@ -14829,6 +15025,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_ob(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLL_QH ? MIPS_ID_OPC_SHLL_QH :
                 MIPS_ID_NONE);
@@ -14836,6 +15033,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_qh(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLLV_QH ? MIPS_ID_OPC_SHLLV_QH :
                 MIPS_ID_NONE);
@@ -14843,6 +15042,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_qh(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_S_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLL_S_QH ? MIPS_ID_OPC_SHLL_S_QH :
                 MIPS_ID_NONE);
@@ -14850,6 +15050,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_s_qh(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_S_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHLLV_S_QH ? MIPS_ID_OPC_SHLLV_S_QH :
                 MIPS_ID_NONE);
@@ -14857,6 +15059,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shll_s_qh(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHRA_OB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_OB ? MIPS_ID_OPC_SHRA_OB :
                 MIPS_ID_NONE);
@@ -14864,6 +15067,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_OB ? MIPS_ID_OPC_SHRAV_OB :
                 MIPS_ID_NONE);
@@ -14871,6 +15076,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_OB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_R_OB ? MIPS_ID_OPC_SHRA_R_OB :
                 MIPS_ID_NONE);
@@ -14878,6 +15084,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_R_OB ? MIPS_ID_OPC_SHRAV_R_OB :
                 MIPS_ID_NONE);
@@ -14885,6 +15093,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_PW:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_PW ? MIPS_ID_OPC_SHRA_PW :
                 MIPS_ID_NONE);
@@ -14892,6 +15101,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_pw(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_PW ? MIPS_ID_OPC_SHRAV_PW :
                 MIPS_ID_NONE);
@@ -14899,6 +15110,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_pw(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_PW:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_R_PW ? MIPS_ID_OPC_SHRA_R_PW :
                 MIPS_ID_NONE);
@@ -14906,6 +15118,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_pw(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_R_PW ? MIPS_ID_OPC_SHRAV_R_PW :
                 MIPS_ID_NONE);
@@ -14913,6 +15127,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_pw(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_QH ? MIPS_ID_OPC_SHRA_QH :
                 MIPS_ID_NONE);
@@ -14920,6 +15135,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_QH ? MIPS_ID_OPC_SHRAV_QH :
                 MIPS_ID_NONE);
@@ -14927,6 +15144,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_qh(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRA_R_QH ? MIPS_ID_OPC_SHRA_R_QH :
                 MIPS_ID_NONE);
@@ -14934,6 +15152,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRAV_R_QH ? MIPS_ID_OPC_SHRAV_R_QH :
                 MIPS_ID_NONE);
@@ -14941,6 +15161,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shra_r_qh(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRL_OB:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRL_OB ? MIPS_ID_OPC_SHRL_OB :
                 MIPS_ID_NONE);
@@ -14948,6 +15169,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shrl_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRLV_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRLV_OB ? MIPS_ID_OPC_SHRLV_OB :
                 MIPS_ID_NONE);
@@ -14955,6 +15178,7 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shrl_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRL_QH:
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRL_QH ? MIPS_ID_OPC_SHRL_QH :
                 MIPS_ID_NONE);
@@ -14962,6 +15186,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
             gen_helper_shrl_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRLV_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_SHRLV_QH ? MIPS_ID_OPC_SHRLV_QH :
                 MIPS_ID_NONE);
@@ -15498,7 +15724,6 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     t0 = tcg_temp_new();
     val_t = tcg_temp_new();
-    gen_load_gpr(val_t, val);
 
     switch (op1) {
     case OPC_ABSQ_S_PH_DSP:
@@ -15507,6 +15732,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_BITREV:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_BITREV ? MIPS_ID_OPC_BITREV :
                 MIPS_ID_NONE);
@@ -15530,6 +15756,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             }
             break;
         case OPC_REPLV_QB:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_REPLV_QB ? MIPS_ID_OPC_REPLV_QB :
                 MIPS_ID_NONE);
@@ -15555,6 +15782,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             }
             break;
         case OPC_REPLV_PH:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_REPLV_PH ? MIPS_ID_OPC_REPLV_PH :
                 MIPS_ID_NONE);
@@ -15621,6 +15849,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_REPLV_OB:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_REPLV_OB ? MIPS_ID_OPC_REPLV_OB :
                 MIPS_ID_NONE);
@@ -15634,6 +15863,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_or_tl(cpu_gpr[ret], cpu_gpr[ret], t0);
             break;
         case OPC_REPLV_PW:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_REPLV_PW ? MIPS_ID_OPC_REPLV_PW :
                 MIPS_ID_NONE);
@@ -15643,6 +15873,7 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_or_tl(cpu_gpr[ret], cpu_gpr[ret], t0);
             break;
         case OPC_REPLV_QH:
+            gen_load_gpr(val_t, val);
             mips_ident(ctx,
                 op2 == OPC_REPLV_QH ? MIPS_ID_OPC_REPLV_QH :
                 MIPS_ID_NONE);
@@ -15676,8 +15907,6 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
     v1_t = tcg_temp_new();
     v2_t = tcg_temp_new();
 
-    gen_load_gpr(v1_t, v1);
-    gen_load_gpr(v2_t, v2);
 
     switch (op1) {
     case OPC_CMPU_EQ_QB_DSP:
@@ -15686,6 +15915,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_CMPU_EQ_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_EQ_QB ? MIPS_ID_OPC_CMPU_EQ_QB :
                 MIPS_ID_NONE);
@@ -15693,6 +15924,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_eq_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LT_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_LT_QB ? MIPS_ID_OPC_CMPU_LT_QB :
                 MIPS_ID_NONE);
@@ -15700,6 +15933,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_lt_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LE_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_LE_QB ? MIPS_ID_OPC_CMPU_LE_QB :
                 MIPS_ID_NONE);
@@ -15707,6 +15942,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_le_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGU_EQ_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_EQ_QB ? MIPS_ID_OPC_CMPGU_EQ_QB :
                 MIPS_ID_NONE);
@@ -15714,6 +15951,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_eq_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LT_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_LT_QB ? MIPS_ID_OPC_CMPGU_LT_QB :
                 MIPS_ID_NONE);
@@ -15721,6 +15960,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_lt_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LE_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_LE_QB ? MIPS_ID_OPC_CMPGU_LE_QB :
                 MIPS_ID_NONE);
@@ -15728,6 +15969,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_le_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGDU_EQ_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_EQ_QB ? MIPS_ID_OPC_CMPGDU_EQ_QB :
                 MIPS_ID_NONE);
@@ -15739,6 +15982,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMPGDU_LT_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_LT_QB ? MIPS_ID_OPC_CMPGDU_LT_QB :
                 MIPS_ID_NONE);
@@ -15750,6 +15995,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMPGDU_LE_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_LE_QB ? MIPS_ID_OPC_CMPGDU_LE_QB :
                 MIPS_ID_NONE);
@@ -15761,6 +16008,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMP_EQ_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_EQ_PH ? MIPS_ID_OPC_CMP_EQ_PH :
                 MIPS_ID_NONE);
@@ -15768,6 +16017,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_eq_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LT_PH ? MIPS_ID_OPC_CMP_LT_PH :
                 MIPS_ID_NONE);
@@ -15775,6 +16026,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_lt_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LE_PH ? MIPS_ID_OPC_CMP_LE_PH :
                 MIPS_ID_NONE);
@@ -15782,6 +16035,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_le_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_QB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PICK_QB ? MIPS_ID_OPC_PICK_QB :
                 MIPS_ID_NONE);
@@ -15789,6 +16044,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_pick_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PICK_PH ? MIPS_ID_OPC_PICK_PH :
                 MIPS_ID_NONE);
@@ -15796,6 +16053,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_pick_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PACKRL_PH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PACKRL_PH ? MIPS_ID_OPC_PACKRL_PH :
                 MIPS_ID_NONE);
@@ -15811,6 +16070,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             MIPS_ID_NONE);
         switch (op2) {
         case OPC_CMP_EQ_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_EQ_PW ? MIPS_ID_OPC_CMP_EQ_PW :
                 MIPS_ID_NONE);
@@ -15818,6 +16079,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_eq_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LT_PW ? MIPS_ID_OPC_CMP_LT_PW :
                 MIPS_ID_NONE);
@@ -15825,6 +16088,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_lt_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LE_PW ? MIPS_ID_OPC_CMP_LE_PW :
                 MIPS_ID_NONE);
@@ -15832,6 +16097,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_le_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_EQ_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_EQ_QH ? MIPS_ID_OPC_CMP_EQ_QH :
                 MIPS_ID_NONE);
@@ -15839,6 +16106,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_eq_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LT_QH ? MIPS_ID_OPC_CMP_LT_QH :
                 MIPS_ID_NONE);
@@ -15846,6 +16115,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_lt_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMP_LE_QH ? MIPS_ID_OPC_CMP_LE_QH :
                 MIPS_ID_NONE);
@@ -15853,6 +16124,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmp_le_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_EQ_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_EQ_OB ? MIPS_ID_OPC_CMPGDU_EQ_OB :
                 MIPS_ID_NONE);
@@ -15860,6 +16133,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgdu_eq_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_LT_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_LT_OB ? MIPS_ID_OPC_CMPGDU_LT_OB :
                 MIPS_ID_NONE);
@@ -15867,6 +16142,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgdu_lt_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_LE_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGDU_LE_OB ? MIPS_ID_OPC_CMPGDU_LE_OB :
                 MIPS_ID_NONE);
@@ -15874,6 +16151,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgdu_le_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGU_EQ_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_EQ_OB ? MIPS_ID_OPC_CMPGU_EQ_OB :
                 MIPS_ID_NONE);
@@ -15881,6 +16160,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_eq_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LT_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_LT_OB ? MIPS_ID_OPC_CMPGU_LT_OB :
                 MIPS_ID_NONE);
@@ -15888,6 +16169,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_lt_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LE_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPGU_LE_OB ? MIPS_ID_OPC_CMPGU_LE_OB :
                 MIPS_ID_NONE);
@@ -15895,6 +16178,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpgu_le_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPU_EQ_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_EQ_OB ? MIPS_ID_OPC_CMPU_EQ_OB :
                 MIPS_ID_NONE);
@@ -15902,6 +16187,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_eq_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LT_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_LT_OB ? MIPS_ID_OPC_CMPU_LT_OB :
                 MIPS_ID_NONE);
@@ -15909,6 +16196,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_lt_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LE_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_CMPU_LE_OB ? MIPS_ID_OPC_CMPU_LE_OB :
                 MIPS_ID_NONE);
@@ -15916,6 +16205,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_cmpu_le_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_PACKRL_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PACKRL_PW ? MIPS_ID_OPC_PACKRL_PW :
                 MIPS_ID_NONE);
@@ -15923,6 +16214,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_packrl_pw(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PICK_OB:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PICK_OB ? MIPS_ID_OPC_PICK_OB :
                 MIPS_ID_NONE);
@@ -15930,6 +16223,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_pick_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_PW:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PICK_PW ? MIPS_ID_OPC_PICK_PW :
                 MIPS_ID_NONE);
@@ -15937,6 +16232,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             gen_helper_pick_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_QH:
+            gen_load_gpr(v1_t, v1);
+            gen_load_gpr(v2_t, v2);
             mips_ident(ctx,
                 op2 == OPC_PICK_QH ? MIPS_ID_OPC_PICK_QH :
                 MIPS_ID_NONE);
@@ -16085,7 +16382,6 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
     t1 = tcg_temp_new();
     v1_t = tcg_temp_new();
 
-    gen_load_gpr(v1_t, v1);
 
     switch (op1) {
     case OPC_EXTR_W_DSP:
@@ -16127,6 +16423,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extr_s_h(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTRV_S_H:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTRV_S_H ? MIPS_ID_OPC_EXTRV_S_H :
                 MIPS_ID_NONE);
@@ -16134,6 +16431,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extr_s_h(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTRV_W ? MIPS_ID_OPC_EXTRV_W :
                 MIPS_ID_NONE);
@@ -16141,6 +16439,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extr_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_R_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTRV_R_W ? MIPS_ID_OPC_EXTRV_R_W :
                 MIPS_ID_NONE);
@@ -16148,6 +16447,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extr_r_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_RS_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTRV_RS_W ? MIPS_ID_OPC_EXTRV_RS_W :
                 MIPS_ID_NONE);
@@ -16163,6 +16463,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTPV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTPV ? MIPS_ID_OPC_EXTPV :
                 MIPS_ID_NONE);
@@ -16178,6 +16479,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_extpdp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTPDPV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_EXTPDPV ? MIPS_ID_OPC_EXTPDPV :
                 MIPS_ID_NONE);
@@ -16194,6 +16496,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_shilo(t0, t1, tcg_env);
             break;
         case OPC_SHILOV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_SHILOV ? MIPS_ID_OPC_SHILOV :
                 MIPS_ID_NONE);
@@ -16201,6 +16504,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_shilo(t0, v1_t, tcg_env);
             break;
         case OPC_MTHLIP:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_MTHLIP ? MIPS_ID_OPC_MTHLIP :
                 MIPS_ID_NONE);
@@ -16208,6 +16512,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_mthlip(t0, v1_t, tcg_env);
             break;
         case OPC_WRDSP:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_WRDSP ? MIPS_ID_OPC_WRDSP :
                 MIPS_ID_NONE);
@@ -16233,6 +16538,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
         check_dsp(ctx);
         switch (op2) {
         case OPC_DMTHLIP:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DMTHLIP ? MIPS_ID_OPC_DMTHLIP :
                 MIPS_ID_NONE);
@@ -16252,6 +16558,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_DSHILOV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DSHILOV ? MIPS_ID_OPC_DSHILOV :
                 MIPS_ID_NONE);
@@ -16271,6 +16578,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTPV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTPV ? MIPS_ID_OPC_DEXTPV :
                 MIPS_ID_NONE);
@@ -16286,6 +16594,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextpdp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTPDPV:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTPDPV ? MIPS_ID_OPC_DEXTPDPV :
                 MIPS_ID_NONE);
@@ -16349,6 +16658,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_s_h(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTRV_S_H:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_S_H ? MIPS_ID_OPC_DEXTRV_S_H :
                 MIPS_ID_NONE);
@@ -16356,6 +16666,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_s_h(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_L:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_L ? MIPS_ID_OPC_DEXTRV_L :
                 MIPS_ID_NONE);
@@ -16363,6 +16674,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_R_L:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_R_L ? MIPS_ID_OPC_DEXTRV_R_L :
                 MIPS_ID_NONE);
@@ -16370,6 +16682,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_r_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_RS_L:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_RS_L ? MIPS_ID_OPC_DEXTRV_RS_L :
                 MIPS_ID_NONE);
@@ -16377,6 +16690,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_rs_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_W ? MIPS_ID_OPC_DEXTRV_W :
                 MIPS_ID_NONE);
@@ -16384,6 +16698,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_R_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_R_W ? MIPS_ID_OPC_DEXTRV_R_W :
                 MIPS_ID_NONE);
@@ -16391,6 +16706,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             gen_helper_dextr_r_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_RS_W:
+            gen_load_gpr(v1_t, v1);
             mips_ident(ctx,
                 op2 == OPC_DEXTRV_RS_W ? MIPS_ID_OPC_DEXTRV_RS_W :
                 MIPS_ID_NONE);

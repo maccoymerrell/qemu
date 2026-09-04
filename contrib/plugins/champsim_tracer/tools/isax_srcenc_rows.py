@@ -150,18 +150,41 @@ def _r_lpad(s):
     return s.mnem.split()[0] == "lpad"
 
 
-@cls("riscv64", "R-VTAIL", "RVV reads its own destination: prestart, "
-     "masked-off and tail elements are UNDISTURBED", """
-Under the tail-undisturbed and mask-undisturbed policies -- the reset state
-of vtype and the one QEMU's helpers implement unconditionally -- the elements
-of vd before vstart, the elements a mask bit turns off, and the elements past
-vl all RETAIN THE VALUE vd ALREADY HELD ("V" spec v1.0, sec. 5.3 and 5.4).
-The destination is therefore a genuine source of every vector instruction
-that does not write all VLEN bits, which is why QEMU passes vd into the gvec
-helper and reads it.  LLVM's MCInstrDesc carries a tied operand only on the
-forms whose ASSEMBLY repeats the register, so on the rest its read set is
-short by exactly vd.  This is the same disagreement MIPS lwl/lwr already
-carries in this file, and the fields side is again the correct one.""")
+@cls("riscv64", "R-VTAIL", "RVV reads its own destination under a policy "
+     "the ENCODING does not carry", """
+Under the tail-undisturbed and mask-undisturbed policies the elements of vd
+before vstart, the elements a mask bit turns off, and the elements past vl
+all RETAIN THE VALUE vd ALREADY HELD ("V" spec v1.0, sec. 5.3 and 5.4).  On
+those instructions vd is a genuine source.
+
+WHICH POLICY IS IN FORCE IS NOT A PROPERTY OF THE INSTRUCTION.  It is vtype's
+vta/vma, set by a vset*vli that may be arbitrarily far away, so the encoding
+this row describes does not determine it and NO static description of that
+encoding can.  That is the whole of the argument, and it is the reason the
+row is about a static model rather than about a run: for one encoding there
+are two architecturally-defined behaviours, one of which reads vd, and the
+encoding does not say which.  A description that omits vd is therefore wrong
+under a state the architecture permits, while one that carries it is a
+superset -- an edge that is sometimes inert, never an edge that is missing.
+A missing dependency is the error direction this project treats as a defect;
+an inert one costs precision.
+
+WHAT WAS PREVIOUSLY WRITTEN HERE WAS FALSE and is recorded so the same
+reasoning is not rebuilt: this row used to justify itself by calling
+tail/mask-undisturbed "the reset state of vtype and the one QEMU's helpers
+implement unconditionally".  Neither is true.  riscv_cpu_reset_hold() sets
+env->vill, not a tu/mu vtype; and target/riscv/vector_helper.c implements
+BOTH policies -- vext_set_elems_1s() is called exactly when vta/vma is set,
+which is the agnostic case overwriting the elements the old text claimed were
+always preserved.  The rows this class emits do not change: they never rested
+on that claim, only on the argument above.
+
+LLVM's MCInstrDesc carries a tied operand only on the forms whose ASSEMBLY
+repeats the register, so on the rest its read set is short by exactly vd --
+it is a per-encoding description facing the same missing fact, and it
+resolves it the other way.  This is the same disagreement MIPS lwl/lwr
+already carries in this file, and the fields side is again the correct
+one.""")
 def _r_vtail(s):
     return s.mnem.startswith("v") and any(r.startswith("REG_VEC")
                                           for r in s.regs)

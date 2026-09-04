@@ -602,6 +602,15 @@ static const DstAdjRow *dst_adj_row(uint32_t decode_id, const char *mnem,
  * covering two questions is readable as neither.
  */
 static std::atomic<uint64_t> g_dst_adj_fired[G_N_ELEMENTS(g_dst_adj_ledger)];
+
+/*
+ * ROWS THE DESTINATION FLIP-COST CENSUS COULD NOT SCORE: QEMU's own
+ * write-side extraction produced no list, so "the wire publishes a
+ * destination QEMU does not state" has no second term.  Counted rather than
+ * silently folded into the loss direction -- an absent measurement is not a
+ * loss, and it is NOT a must-be-0 row.
+ */
+static std::atomic<uint64_t> g_dst_flip_not_scorable;
 std::atomic<uint64_t> g_dst_walkonly{0};
 GHashTable *g_dst_walkonly_sig = nullptr;
 std::atomic<uint64_t> g_dst_adj_owed_n{0};
@@ -4401,6 +4410,111 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * must0_scan.py does not score it -- and a reader who calls its non-zero
      * red is reading the pre-hoist censored zero back in.
      */
+    /*
+     * HOISTED ABOVE THE REFUSAL RETURN BELOW, and it is the DESTINATION TWIN
+     * of the hoist #327/#328 made on the read side.
+     *
+     * WHAT WAS WRONG.  This census sat under `if (wstate != QDEP_OK) return
+     * false;`, so it looked only at instructions whose destination FAMILY
+     * could be seated -- and every instruction it was written to find is one
+     * whose family cannot be.  `rstorssp` is the whole demonstration:
+     * 4,726 encodings publishing REG_SSP that QEMU's write list does not
+     * state, which the OFFLINE scorer reads off the corpus's PUBD and WR
+     * columns and which this block reported as `(none)`, because
+     * dst_precheck() refuses the family first (#218, a wire destination QEMU
+     * named only as env state) and the return took the census with it.  The
+     * g_dst_adj_ledger row ruling that register R16 could therefore never
+     * FIRE: measured on a 200-slot rstorssp sled, `src eec05966 rstorssp
+     * REG_SSP 200` in the FIRED list and `dst eec05966 rstorssp REG_SSP 0`
+     * in the DID NOT FIRE list -- a live ledger row and a dead one, on one
+     * instruction, for want of a place to be read from.
+     *
+     * GATED ON WSTQ, NOT ON THE COMPOSITE, which is the distinction WSTQ was
+     * added to the corpus to make.  `wstate` is dst_precheck()'s composite:
+     * it mixes QEMU's extraction verdict with a question about the WIRE's
+     * slot list, and a refusal of the second kind leaves QEMU's write list a
+     * perfectly good fact to score against.  `q->dst_state` is QEMU's own
+     * write-side verdict alone.  So the census runs whenever QEMU STATED a
+     * write list -- `rstorssp` reads WSTQ "PUBLISHED from QEMU's emitters"
+     * even under the #218 refusal -- and a row whose extraction never
+     * produced one is counted apart, as NOT SCORABLE, instead of being read
+     * as a loss.  Scoring an absent measurement as a loss is the direction
+     * this tree treats as a defect, and it is the mistake the read side's
+     * NOT-SCORED column exists to avoid making.
+     *
+     * THE OTHER DIRECTION STAYS BELOW.  The QEMU-named-but-not-on-the-wire
+     * loop feeds seat_dst_for_qemu() and is only meaningful where the seat
+     * can happen; it is not moved.
+     */
+    if (q->dst_state != QDEP_OK) {
+        g_dst_flip_not_scorable.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        /*
+         * THE DIRECTION A FLIP HAS TO JUSTIFY: a destination the WIRE
+         * publishes that QEMU's write list does not state.
+         *
+         * It used to sit beside its mirror, below the refusal return; the
+         * mirror is still there and this is not, for the reason the block
+         * comment above gives.  What has NOT changed is that both are read
+         * off the same two lists BEFORE seat_dst_for_qemu() runs -- the seat
+         * is a permutation of the wire's list, and reading after it would
+         * score the reindex rather than the disagreement.
+         *
+         * REG_PC IS EXCLUDED IN BOTH DIRECTIONS, on R10.1: the wire publishes
+         * REG_PC on every instruction the ISA defines as writing it, and QEMU
+         * charges the block-final pc write to whichever instruction the block
+         * ended on.  Neither fact makes a branch's own REG_PC a walk-only
+         * destination, and counting it here would put an artifact's mirror into
+         * a must-be-argued column.
+         */
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            bool stated = false;
+
+            if (f->dst_regs[d] == REG_PC) {
+                continue;
+            }
+            for (uint8_t k = 0; k < q->n_dst; k++) {
+                if (q->dst_reg[k] == f->dst_regs[d]) {
+                    stated = true;
+                    break;
+                }
+            }
+            if (stated) {
+                continue;
+            }
+            {
+                const DstAdjRow *adj = dst_adj_row(q->decode_id, mnem,
+                                                   f->dst_regs[d]);
+                char *key = g_strdup_printf(
+                    "%08x %-26s %-14s %s", q->decode_id,
+                    q->decode_name ? q->decode_name : "?",
+                    generic_reg_name_or_unknown(f->dst_regs[d]),
+                    mnem ? mnem : "?");
+
+                if (adj) {
+                    bool ruled = adj->state == SRC_ADJ_R16;
+                    char *okey;
+
+                    g_dst_adj_fired[adj - g_dst_adj_ledger].fetch_add(
+                        1, std::memory_order_relaxed);
+                    okey = g_strdup_printf("%s %s %s", key,
+                                           ruled ? "R16:" : "Q:", adj->text);
+                    if (ruled) {
+                        g_dst_adj_r16_n.fetch_add(1, std::memory_order_relaxed);
+                        tally(&g_dst_adj_r16_sig, okey);
+                    } else {
+                        g_dst_adj_owed_n.fetch_add(1, std::memory_order_relaxed);
+                        tally(&g_dst_adj_owed_sig, okey);
+                    }
+                    g_free(okey);
+                } else {
+                    g_dst_walkonly.fetch_add(1, std::memory_order_relaxed);
+                    tally(&g_dst_walkonly_sig, key);
+                }
+                g_free(key);
+            }
+        }
+    }
     if (wstate != QDEP_OK) {
         if (wstate != QDEP_NONE) {
             note_refusal(mnem, wstate, "dst  ", why);
@@ -4441,68 +4555,6 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             tally(&g_dst_wire_missing, key);
             g_free(key);
             g_dst_wire_missing_other.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    /*
-     * AND THE OTHER DIRECTION, which is the one a flip has to justify: a
-     * destination the WIRE publishes that QEMU's write list does not state.
-     * Counted here, beside its mirror, off the same two lists at the same
-     * moment -- and BEFORE seat_dst_for_qemu() runs, because the seat is a
-     * permutation of the wire's list and reading after it would score the
-     * reindex rather than the disagreement.
-     *
-     * REG_PC IS EXCLUDED IN BOTH DIRECTIONS, on R10.1: the wire publishes
-     * REG_PC on every instruction the ISA defines as writing it, and QEMU
-     * charges the block-final pc write to whichever instruction the block
-     * ended on.  Neither fact makes a branch's own REG_PC a walk-only
-     * destination, and counting it here would put an artifact's mirror into
-     * a must-be-argued column.
-     */
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        bool stated = false;
-
-        if (f->dst_regs[d] == REG_PC) {
-            continue;
-        }
-        for (uint8_t k = 0; k < q->n_dst; k++) {
-            if (q->dst_reg[k] == f->dst_regs[d]) {
-                stated = true;
-                break;
-            }
-        }
-        if (stated) {
-            continue;
-        }
-        {
-            const DstAdjRow *adj = dst_adj_row(q->decode_id, mnem,
-                                               f->dst_regs[d]);
-            char *key = g_strdup_printf(
-                "%08x %-26s %-14s %s", q->decode_id,
-                q->decode_name ? q->decode_name : "?",
-                generic_reg_name_or_unknown(f->dst_regs[d]),
-                mnem ? mnem : "?");
-
-            if (adj) {
-                bool ruled = adj->state == SRC_ADJ_R16;
-                char *okey;
-
-                g_dst_adj_fired[adj - g_dst_adj_ledger].fetch_add(
-                    1, std::memory_order_relaxed);
-                okey = g_strdup_printf("%s %s %s", key,
-                                       ruled ? "R16:" : "Q:", adj->text);
-                if (ruled) {
-                    g_dst_adj_r16_n.fetch_add(1, std::memory_order_relaxed);
-                    tally(&g_dst_adj_r16_sig, okey);
-                } else {
-                    g_dst_adj_owed_n.fetch_add(1, std::memory_order_relaxed);
-                    tally(&g_dst_adj_owed_sig, okey);
-                }
-                g_free(okey);
-            } else {
-                g_dst_walkonly.fetch_add(1, std::memory_order_relaxed);
-                tally(&g_dst_walkonly_sig, key);
-            }
-            g_free(key);
         }
     }
     unsigned admitted = 0;
@@ -6980,6 +7032,19 @@ void qdep_report(GString *report)
                "JUSTIFIED BY ADJUDICATION (R16) -- the same ledger, the rows\na RULING has closed.  Columns: decode id, rule, register, mnemonic, and\nthe RULING the row closed under, quoted rather than referenced so the\nreason travels with the sidecar.  These are NOT counted as MISSING and\nare NOT folded into JUSTIFIED: JUSTIFIED means QEMU's ordered read list\ncontains the register, which for these rows it does not, and a census\nthat spent a ruling and a read-list hit into one column could no longer\nsay which of its rows rest on a measurement.  A source-list flip MAY\nland with this block non-empty, and must carry every register in it:");
     dump_tally(report, g_dst_walkonly_sig,
                "DESTINATION FLIP COST, THE LOSS DIRECTION -- published\ndestinations QEMU's write list does NOT state, by decode id, rule,\nregister and mnemonic.  The write-side twin of the block above, and it\nis new: the only destination census this file used to carry ran in the\nOTHER direction, so this population was scored offline out of the mech\ncorpus's PUBD and WR columns and the plugin could not say whether a row\nin it was adjudicated or merely unexamined.  REG_PC is excluded in both\ndirections on R10.1 -- a block-final pc write is a QEMU artifact and an\nartifact is not a question:");
+    g_string_append_printf(report,
+        "\n  %10" G_GUINT64_FORMAT "  rows the block above COULD NOT SCORE:\n"
+        "              QEMU's own write-side extraction produced no list, so\n"
+        "              \"the wire publishes a destination QEMU does not\n"
+        "              state\" has no second term.  NOT a must-be-0 row and\n"
+        "              NOT a loss -- an absent measurement is neither, and\n"
+        "              counting it as one is the mistake the read side's\n"
+        "              NOT-SCORED column exists to avoid.  The census above\n"
+        "              is gated on q->dst_state, QEMU's own verdict, and no\n"
+        "              longer on dst_precheck()'s composite, which used to\n"
+        "              hide the whole population behind a refusal of the\n"
+        "              WIRE's slot list rather than of the extraction.\n",
+        g_dst_flip_not_scorable.load(std::memory_order_relaxed));
     dump_tally(report, g_dst_adj_owed_sig,
                "DESTINATION ADJUDICATION-OWED -- published destinations QEMU\ndoes not state that are NOT counted above, because a question is on\nfile against them.  Columns: decode id, rule, register, mnemonic, and\nthe QUESTION.  A LEDGER, not an input: nothing on the wire is decided\nby a row here, and a row leaves this block by being RULED, never by\nbeing deleted:");
     dump_tally(report, g_dst_adj_r16_sig,

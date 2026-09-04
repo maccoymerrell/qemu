@@ -2186,8 +2186,17 @@ def classify_aarch64_reg(name: str) -> RegEntry:
         return reg_ent("REG_FP_REG")
     if name == "NZCV":
         return RegEntry("REG_FLAGS", is_int_flags=True)
+    # FPCR is the FP CONTROL word and FPSR is the accrued-STATUS word:
+    # two different architectural registers (S3_3_C4_C4_0 and _1), and
+    # every FP / AdvSIMD arithmetic instruction READS the first while
+    # WRITING the second.  On one id that is a read-modify-write of a
+    # register nothing modified, so consecutive unrelated FP instructions
+    # serialise -- the mapping defect champsim_tracer_generic_ids.h states
+    # under REG_FPCW (R8.1), and whose own text names "AArch64 FPCR" as
+    # that id's occupant.  0acd1e32e5 split the id and routed only x86;
+    # this is the AArch64 half.  FPSR keeps REG_FCSR.
     if name == "FPCR":
-        return reg_ent("REG_FCSR")
+        return reg_ent("REG_FPCW")
     # VG is the vector-granule count -- the current SVE vector length,
     # which SMSTART/SMSTOP change.  That is vector CONFIGURATION, the
     # role REG_VCTRL carries for RISC-V vl/vtype, so it keeps the ID.

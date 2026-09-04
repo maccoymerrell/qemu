@@ -151,7 +151,14 @@ _ARM_MISC_INTERNAL = frozenset((
 _ARM_MISC_RULES = (
     ('nzcv', 'REG_FLAGS'), ('cpsr', 'REG_FLAGS'), ('spsr', 'REG_FLAGS'),
     ('daif', 'REG_FLAGS'), ('pan', 'REG_FLAGS'), ('uao', 'REG_FLAGS'),
-    ('fpcr', 'REG_FCSR'), ('fpsr', 'REG_FCSR'), ('fpscr', 'REG_FCSR'),
+    # THE FP CONTROL WORD IS ITS OWN ID ON THE WIRE, on AArch64 exactly as
+    # on x86 (see wp/x86_vocab.py).  FPCR holds the rounding mode, the
+    # exception masks and the FTZ/DN controls and every FP instruction READS
+    # it; FPSR holds the accrued flags and QC and those same instructions
+    # WRITE it.  Mapping both onto REG_FCSR here would score the wire's
+    # split as a disagreement with the reference when the reference agrees
+    # -- gem5 keeps Fpcr and Fpsr as separate misc registers too.
+    ('fpcr', 'REG_FPCW'), ('fpsr', 'REG_FCSR'), ('fpscr', 'REG_FCSR'),
     ('fpexc', 'REG_FCSR'),
     ('cpacr', 'REG_SYSFPEN'), ('cptr', 'REG_SYSFPEN'),
     ('tpidrro_el0', 'REG_TLS'), ('tpidr_el0', 'REG_TLS'),

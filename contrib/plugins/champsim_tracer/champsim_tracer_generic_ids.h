@@ -305,7 +305,24 @@ enum GenericRegId {
      * aarch64 `fadd d0, d0, d0` recorded SRC{REG_VEC0,REG_FCSR} and
      * DST{REG_VEC0,REG_FCSR} -- FPCR read and FPSR written, both
      * REG_FCSR -- and riscv64 `fadd.s ft0, ft0, ft0` the same with frm
-     * and fflags.
+     * and fflags.  Only x86 was ROUTED when the id landed, so the
+     * aarch64 half of that measurement stayed live for eleven passes;
+     * it is closed now (cap_aarch64_sysreg_class routes FPCR to
+     * QEMU_PLUGIN_SYSREG_FPCW), and the same decode reads
+     * SRC{REG_SYSFPEN,REG_FPCW,REG_VEC0} DST{REG_VEC0,REG_FCSR}.
+     *
+     * RISC-V IS NOT THE SAME CASE AND DOES NOT MOVE, which the sentence
+     * above about `fadd.s` reads as if it were.  fflags (0x001) and frm
+     * (0x002) are not two registers: they are read/write MIRRORS of
+     * fields of fcsr (0x003), one architectural word, which the guest
+     * reads back whole.  champsim_tracer_decode.cc measures exactly this
+     * -- a field's published VALUE is its CONTAINER's, because the wire
+     * has no discriminator for which member a snapshot was taken at --
+     * so splitting frm off would give ONE architectural register two
+     * wire names carrying the same content.  The MXCSR rule below
+     * governs: they keep REG_FCSR, and the read-modify-write they record
+     * is the one the architecture actually has.  The same reading
+     * applies to vxrm / vxsat inside vcsr.
      *
      * MXCSR is NOT here: it is one register that is control and status
      * together, like MIPS fcr31 and RISC-V fcsr, and a register the
@@ -314,8 +331,9 @@ enum GenericRegId {
      * the one the architecture actually has.
      */
     REG_FPCW     = 111,  /* FP control word: rounding mode, precision,
-                          * exception masks (x86 FPCW, AArch64 FPCR,
-                          * RISC-V frm) */
+                          * exception masks (x86 FPCW, AArch64 FPCR).
+                          * NOT RISC-V frm -- see above: frm is a field
+                          * of fcsr, which the hardware does not split */
     /* 112-128 unallocated — reserve for further behaviour classes. */
     /* Vector/SIMD registers: 129-192 */
     REG_VEC0 = 129,

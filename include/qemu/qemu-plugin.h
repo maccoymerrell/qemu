@@ -1414,8 +1414,16 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
 #define QEMU_PLUGIN_SYSREG_FPCW     14  /* the FP CONTROL word, where the
                                          * architecture keeps it in a
                                          * register DISTINCT from the
-                                         * accrued-status word: x86 FPCW,
-                                         * AArch64 FPCR, RISC-V frm.  It
+                                         * accrued-status word: x86 FPCW
+                                         * and AArch64 FPCR.  NOT RISC-V
+                                         * frm, which this line used to
+                                         * name: frm and fflags are
+                                         * read/write mirrors of FIELDS
+                                         * of one register, fcsr, and a
+                                         * register the hardware does not
+                                         * split may not be split here --
+                                         * it stays on FPCTRL with its
+                                         * container.  It
                                          * holds the rounding mode, the
                                          * precision control and the
                                          * exception masks, and every FP

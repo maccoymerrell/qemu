@@ -4126,6 +4126,26 @@ static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
     case AARCH64_SYSREG_NZCV:
         return QEMU_PLUGIN_SYSREG_FLAGS;
     case AARCH64_SYSREG_FPCR:
+        /*
+         * THE CONTROL WORD IS NOT THE STATUS WORD, and on AArch64 the two
+         * are different architectural registers: FPCR (S3_3_C4_C4_0) holds
+         * the rounding mode, the FP exception masks and the flush-to-zero
+         * and default-NaN controls; FPSR (S3_3_C4_C4_1) holds the accrued
+         * exception flags and QC.  Every FP and AdvSIMD arithmetic
+         * instruction READS FPCR and WRITES FPSR, so one role for both
+         * gives each one a read-after-write edge from the one before it
+         * through a register nothing modified -- the defect
+         * QEMU_PLUGIN_SYSREG_FPCW was added to remove, and whose own
+         * definition (qemu-plugin.h) already names "AArch64 FPCR" as its
+         * occupant.  Only x86 was routed when the role landed; this is
+         * the AArch64 half of the same repair.
+         *
+         * FPMR stays on FPCTRL.  It is the FP8 mode register, written by
+         * MSR and read by the FP8 forms, and the ABI's own text assigns
+         * it there; it takes no false edge from FPSR because no FP
+         * instruction writes it.
+         */
+        return QEMU_PLUGIN_SYSREG_FPCW;
     case AARCH64_SYSREG_FPSR:
     case AARCH64_SYSREG_FPMR:
         return QEMU_PLUGIN_SYSREG_FPCTRL;
@@ -4197,7 +4217,10 @@ static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
             return QEMU_PLUGIN_SYSREG_EXC;        /* the AArch32 banked SPSRs */
         }
         if (crm == 4) {
-            return QEMU_PLUGIN_SYSREG_FPCTRL;     /* FPCR/FPSR/FPMR aliases */
+            /* The FPCR/FPSR/FPMR alias encodings, split the same way the
+             * canonical ones are above: op2 0 is the CONTROL word. */
+            return op2 == 0 ? QEMU_PLUGIN_SYSREG_FPCW
+                            : QEMU_PLUGIN_SYSREG_FPCTRL;
         }
         if (crm == 5) {
             return QEMU_PLUGIN_SYSREG_DBG;        /* DSPSR_EL0 / DLR_EL0 */

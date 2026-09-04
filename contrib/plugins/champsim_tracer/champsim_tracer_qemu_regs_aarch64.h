@@ -66,7 +66,7 @@ static const QemuRegRow qemu_regs_aarch64[] = {
     { .feature = "org.gnu.gdb.aarch64.core", .name = "x7", .reg_id = REG_GPR7, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.core", .name = "x8", .reg_id = REG_GPR8, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.core", .name = "x9", .reg_id = REG_GPR9, .cap_rows = 2, .tier = QREG_ROUTED },  /* 2 capstone rows */
-    { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr", .reg_id = REG_FCSR, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
+    { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr", .reg_id = REG_FPCW, .cap_rows = 1, .tier = QREG_ROUTED },  /* 1 capstone row */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpsr", .reg_id = REG_NONE, .cap_rows = 0, .tier = QREG_UNNAMED },
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v0", .reg_id = REG_VEC0, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */
     { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v1", .reg_id = REG_VEC1, .cap_rows = 5, .tier = QREG_ROUTED },  /* 5 capstone rows */

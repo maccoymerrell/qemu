@@ -49,6 +49,12 @@ def canon_gpr(n):
 #        lookup-table register: separate state, not a view of ZA.
 TRC_MAP = {
     'REG_FLAGS': 'FLAGS', 'REG_FCSR': 'FCSR', 'REG_SYS': 'SYS', 'REG_TLS': 'TLS',
+    # FPCR moved off REG_FCSR: it is the CONTROL word every FP instruction
+    # reads, REG_FCSR is the STATUS word they write, and one id for both
+    # manufactured a read-after-write edge between consecutive unrelated FP
+    # instructions.  The reference's token space still spells both 'FCSR',
+    # so both generic ids resolve to it here.
+    'REG_FPCW': 'FCSR',
     'REG_SP': 'SP', 'REG_LR': 'LR', 'REG_FP_REG': 'FP_REG', 'REG_ZERO': 'ZERO',
     'REG_PC': 'PC', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'VCTRL',
     'REG_PRED16': 'FFR', 'REG_VEC32': 'ZT0',

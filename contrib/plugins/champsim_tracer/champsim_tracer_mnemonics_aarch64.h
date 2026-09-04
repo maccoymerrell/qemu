@@ -130,7 +130,7 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_INVALID] = {},
     [AARCH64_REG_FFR] = { .reg_id = REG_PRED16, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.sve", .name = "ffr" } },  /* ffr */
     [AARCH64_REG_FP] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x29" } },  /* fp */
-    [AARCH64_REG_FPCR] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr" } },  /* fpcr */
+    [AARCH64_REG_FPCR] = { .reg_id = REG_FPCW, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr" } },  /* fpcr */
     [AARCH64_REG_LR] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x30" } },  /* lr */
     [AARCH64_REG_NZCV] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "cpsr" }, .is_int_flags = true },  /* nzcv */
     [AARCH64_REG_SP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "sp" } },  /* sp */

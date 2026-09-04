@@ -1438,6 +1438,21 @@ def classify_x86_lane(const_name: str,
                       by_canon: dict,
                       gen_op: str) -> tuple[str, bool] | None:
     name = const_name.removeprefix("X86_INS_")
+    # THE SAME LEADING-`V` CONFLATION THE OPCODE CLASSIFIER HAD, one level
+    # down.  The variant gate below reads `X86_V...` as the VEX/EVEX marker,
+    # and Capstone spells VMXOFF's variant `X86_VMXOFF` -- a V that is part
+    # of the mnemonic.  With no exclusion these seventeen were given
+    # LANE_MASK_KIND_STATIC and lane_parallel=true: lanes the machine does
+    # not have, published on fifteen system-control instructions and two
+    # segment verifies (FINDING 119-B).  The demotion arm further down
+    # cannot reach them -- it needs a legacy twin (`X86_INS_MXOFF`) and
+    # there is none.
+    #
+    # None of the seventeen has an element structure at all, so the answer
+    # is not a different lane model but NO lane model, which is what None
+    # means here and what every other scalar row carries.
+    if name.lower() in X86_NON_VEX_V_OPCODE:
+        return None
     # (a) Capstone variant gate: AVX/EVEX width markers,
     #     MMX_ prefix, or AVX V<mnemonic>...  (canonical names
     #     starting with "V" cover the entire AVX/EVEX family).
@@ -2744,6 +2759,44 @@ ISA_DEP_PASSTHROUGH_STORE_INSNS: dict[str, set[str]] = {
 }
 
 
+# The x86 mnemonics that begin with `v` and are NOT VEX-encoded.  See the
+# comment at the use site in classify_x86() for the derivation and for each
+# class's reference.  `vmcall`/`vmmcall` are listed for completeness of the
+# PREDICATE -- an earlier exact-match rule already classifies them, and the
+# entries here restate that answer rather than a new one, so the two cannot
+# drift apart.
+#
+# A name here that Capstone's enum does not carry is a DEAD RULE: it can
+# never fire and reads as coverage.  x86_non_vex_v_dead_rules() is the
+# check, and the census refuses on a non-empty result.
+X86_NON_VEX_V_OPCODE: dict[str, tuple[str, str | None]] = {
+    "vmlaunch": ("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+    "vmresume": ("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+    "vmrun":    ("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+    "vmcall":   ("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+    "vmmcall":  ("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"),
+    "vmxon":    ("GEN_OP_LOAD", None),
+    "vmclear":  ("GEN_OP_LOAD", None),
+    "vmptrld":  ("GEN_OP_LOAD", None),
+    "vmload":   ("GEN_OP_LOAD", None),
+    "vmptrst":  ("GEN_OP_STORE", None),
+    "vmsave":   ("GEN_OP_STORE", None),
+    "vmread":   ("GEN_OP_MOV", None),
+    "vmwrite":  ("GEN_OP_MOV", None),
+    "verr":     ("GEN_OP_CMP", None),
+    "verw":     ("GEN_OP_CMP", None),
+    "vmxoff":   ("GEN_OP_NOP", None),
+    "vmfunc":   ("GEN_OP_NOP", None),
+}
+
+
+def x86_non_vex_v_dead_rules() -> list[str]:
+    """Members of X86_NON_VEX_V_OPCODE Capstone's x86 enum does not name."""
+    live = {name[len("X86_INS_"):].lower()
+            for name in enum_constants(ISAS["x86"])}
+    return sorted(m for m in X86_NON_VEX_V_OPCODE if m not in live)
+
+
 def classify_x86(m: str) -> Entry:
     jcc = {
         "ja", "jae", "jb", "jbe", "jc", "je", "jecxz", "jg", "jge",
@@ -3030,6 +3083,54 @@ def classify_x86(m: str) -> Entry:
         if m.startswith(("fild", "fist", "fbld", "fbstp")):
             return ent("GEN_OP_FP_CVT")
         return ent("GEN_OP_FP_MOV")
+
+    # THE LEADING `v` IS NOT ALWAYS THE VEX PREFIX.  The branch below reads
+    # it as one -- correct for the ~700 VEX/EVEX mnemonics it was written
+    # for, and wrong for the seventeen x86 instructions that begin with `v`
+    # for an unrelated reason.  With no exclusion those seventeen fell
+    # through the vector arms to the GEN_OP_VEC_LOGIC tail, and fifteen
+    # system-control instructions were published as LANE-PARALLEL VECTOR
+    # LOGIC with a static lane mask -- lanes the machine does not have
+    # (FINDING 119-B).  `vmcall`/`vmmcall` escaped only because an earlier
+    # exact-match rule catches them first.
+    #
+    # The set is closed and REFERENCE-DERIVED, not guessed.  XED puts every
+    # one of them in category VTX, SYSTEM or VMFUNC and none in any vector
+    # category; iced-x86 reports the same operand shapes.  The two
+    # references and the derivation are banked at exec120/vmx.
+    #
+    # The classes below are those references' answers, mapped onto rules
+    # this table already applies to the same shapes:
+    #
+    #   VMLAUNCH/VMRESUME/VMRUN  iced FlowControl=CALL -- a transfer into
+    #                            guest context.  `vmcall`/`vmmcall` are the
+    #                            other direction of the same transition and
+    #                            are already GEN_OP_SYSCALL.
+    #   VMXON/VMCLEAR/VMPTRLD    XED and iced: one memory operand, READ.
+    #                            `lgdt`/`lidt`'s shape -> GEN_OP_LOAD.  (For
+    #                            VMCLEAR the write to the VMCS region is not
+    #                            an architectural memory operand; the stated
+    #                            operand is the read of the pointer.)
+    #   VMPTRST                  one memory operand, WRITE.  `sgdt`'s shape.
+    #   VMLOAD/VMSAVE            no architectural memory operand; iced shows
+    #                            the direction (FS/GS WRITE vs READ).  Bulk
+    #                            system-state restore/save -- `xrstor`/
+    #                            `xsave`, and `rdmsr` for the memop-less
+    #                            LOAD precedent.
+    #   VMREAD/VMWRITE           register<->register data motion in this
+    #                            form.  `rdpkru`/`wrmsr`'s rule, GEN_OP_MOV.
+    #   VERR/VERW                one memory operand READ, and the only
+    #                            destination is ZF.  A compare that produces
+    #                            a flag -- `arpl`/`bound`'s rule.
+    #   VMXOFF/VMFUNC            processor-state change with no data motion
+    #                            the vocabulary names; `clts`/`stgi`/`clgi`/
+    #                            `swapgs`/`rsm` already sit on GEN_OP_NOP.
+    #
+    # `vmpsadbw` and the `v4f*madd*` forms are NOT here: they really are
+    # VEX/EVEX vector instructions and belong in the branch below.
+    if m in X86_NON_VEX_V_OPCODE:
+        opcode, branch = X86_NON_VEX_V_OPCODE[m]
+        return ent(opcode, branch) if branch else ent(opcode)
 
     if m.startswith("v"):
         core = m[1:]
@@ -5192,6 +5293,16 @@ def targeted_fix(isa: str, const_name: str, old: Entry, new: Entry) -> bool:
 def audit_one(info: IsaInfo, *, max_lines: int) -> int:
     constants = enum_constants(info)
     print_noop_refiner_census(info)
+    if info.key == "x86":
+        # A rule naming no instruction in Capstone's enum can never fire and
+        # reads as coverage -- the same failure QEMU_ONLY_REG_IDS' dead-rule
+        # check exists for.  The leading-`v` exclusion is a LIST, so it is
+        # exactly the shape that rots silently on a Capstone bump.
+        dead = x86_non_vex_v_dead_rules()
+        if dead:
+            print(f"x86: X86_NON_VEX_V_OPCODE names {len(dead)} instruction(s) "
+                  f"Capstone does not carry: {', '.join(dead)}")
+            return len(dead)
     existing = parse_existing(info)
     missing: list[tuple[str, Entry]] = []
     mismatched: list[tuple[str, Entry, Entry]] = []

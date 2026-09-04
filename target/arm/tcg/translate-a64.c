@@ -9485,6 +9485,36 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
          */
         if (!a->n && a->sf && a->rd == a->rm && a->rm != 31) {
             insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_X[a->rm]));
+            /*
+             * AND Rd, IN THE SAME BREATH AND FOR THE SAME REASON.
+             *
+             * The elision the comment above describes takes BOTH ends of the
+             * move, and only the read end was ever stated.  `mov x5,x5` is
+             * `orr x5,xzr,x5`: the encoding names Rd as a destination as
+             * plainly as it does on `mov x5,x6`, and the architecture writes
+             * it -- with its own value, which is still a write.  Because
+             * tcg_gen_mov_i64() emits nothing when ret == arg, QEMU's ordered
+             * write list for this instruction was EMPTY, so a consumer could
+             * not tell `mov x5,x5` from an instruction that writes no
+             * register at all.
+             *
+             * R16: the dependency exists in the ISA, so it is recorded, and a
+             * lowering choice is not the machine's answer (R7.3/R15).  Stated
+             * as the env RANGE rather than a name because xregs[] IS the
+             * register's storage and translate-a64.c's own
+             * insn_dataflow_declare_regfile() names it downstream -- no
+             * second spelling to keep in step.
+             *
+             * Guarded on the elision exactly as the read is: every other path
+             * through here (`mvn`, the 32-bit ext32u form, rd != rm) emits an
+             * op that DEFINES cpu_X[rd] and the op walk states it.  Rd == 31
+             * cannot reach here -- rd == rm and rm != 31.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_note_stated_write_env(
+                offsetof(CPUARMState, xregs[a->rd]),
+                sizeof(((CPUARMState *)0)->xregs[0]));
         }
 
         if (a->n) {

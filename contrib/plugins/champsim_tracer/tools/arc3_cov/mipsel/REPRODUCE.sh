@@ -64,6 +64,31 @@ $PY adjudicate.py
 CST_ISAXCHECK="$ISAX" $PY emit.py        # -> ../attrib.tsv, ../attrib_signatures.tsv
 cp ../attrib.tsv attrib.clean.tsv
 
+# THE CLEAN BASELINE IS A MEASUREMENT, NOT THE LITERAL ZERO.
+#
+# The two control arms below used to assert `dis == 0` for the inert arm and
+# `dis > 0` for the firing one, which is the same test only while the clean
+# table happens to carry no disagreement.  It stopped being true the day an
+# ADJUDICATED reference defect landed: 8a1829235d dropped `jalr`'s phantom $ra
+# write -- LLVM's MCInstrDesc carries Defs=[RA] on the JALR opcode whatever rd
+# says, Capstone's MIPS tables are generated from LLVM, and the ISA manual and
+# QEMU both refute them -- so the clean table reads ONE DISAGREE and the inert
+# arm failed with "the shim is not matching what it claims to match" while the
+# shim was behaving perfectly.
+#
+# A control that reads a baseline as damage is a control that convicts the
+# tree for being correct.  Both arms are compared against THIS run's own clean
+# figure, taken here, from the table just published.
+BASE_DIS=$($PY - <<'PYEOF'
+import csv, collections, os
+d = os.environ.get('CST_COV_DIR', '/mnt/md0/QEMU/cst_runs/_arc3_cov') + '/mipsel'
+c = collections.Counter(r['verdict'] for r in
+                        csv.DictReader(open(d + '/attrib.tsv'), delimiter='\t'))
+print(c['DISAGREE'])
+PYEOF
+)
+echo "clean baseline: DISAGREE = $BASE_DIS (the figure both control arms move from)"
+
 # ---- the firing control, BOTH WAYS ----------------------------------------
 # ARM A damages a mnemonic that IS in the 977 and requires exactly one row to
 # fall out of agreement.  ARM B names one that is ABSENT and requires the run
@@ -91,16 +116,18 @@ PYEOF
 )
   echo "falsify $1: shim damaged $dmg probe(s), table DISAGREE = $dis"
   case "$2" in
-    some) [ "$dmg" -gt 0 ] && [ "$dis" -gt 0 ] || {
+    some) [ "$dmg" -gt 0 ] && [ "$dis" -gt "$BASE_DIS" ] || {
             echo "CONTROL INERT: '$1' damaged $dmg probes and moved the table" >&2
-            echo "  to $dis disagreements.  A zero here means the control" >&2
-            echo "  never reached its subject, so the clean zero is not a" >&2
+            echo "  to $dis disagreements, from a clean baseline of" >&2
+            echo "  $BASE_DIS.  No MOVEMENT here means the control never" >&2
+            echo "  reached its subject, so the clean figure is not a" >&2
             echo "  measurement.  NAME A MNEMONIC THAT IS IN THE 977." >&2
             return 1; } ;;
-    none) [ "$dmg" -eq 0 ] && [ "$dis" -eq 0 ] || {
+    none) [ "$dmg" -eq 0 ] && [ "$dis" -eq "$BASE_DIS" ] || {
             echo "INERT ARM IS NOT INERT: '$1' is not in the denominator yet" >&2
-            echo "  damaged $dmg probes / moved the table to $dis.  The shim" >&2
-            echo "  is not matching what it claims to match." >&2
+            echo "  damaged $dmg probes / moved the table to $dis from a" >&2
+            echo "  clean baseline of $BASE_DIS.  The shim is not matching" >&2
+            echo "  what it claims to match." >&2
             return 1; } ;;
   esac
 }

@@ -97,6 +97,23 @@ typedef struct {
 enum QemuRegTier {
     QREG_UNNAMED = 0,   /* QEMU carries it; no Capstone id names it */
     QREG_ROUTED,        /* at least one Capstone register id maps here */
+    /*
+     * QEMU carries it only when a run-time predicate admits it, and no
+     * Capstone id names it.  The RISC-V CSR space is the live case:
+     * target/riscv/gdbstub.c builds "org.gnu.gdb.riscv.csr" at
+     * CPU-realize time by walking csr_ops[] and keeping the rows whose
+     * predicate passes for THIS cpu, so which of the 371 named CSRs
+     * exist is a property of the machine, not of the table.
+     *
+     * The row still answers what generic word the NAME is -- that is
+     * what generic_for_qemu_name() reads it for, and why the rows are
+     * here at all.  What it must not do is stand for its class's VALUE
+     * in the reverse index: a register the running CPU does not expose
+     * resolves to a null handle and publishes a width-0 field, and one
+     * such row winning the class would displace a member that the CPU
+     * does expose.
+     */
+    QREG_PREDICATED,
 };
 
 typedef struct {

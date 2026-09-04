@@ -231,7 +231,7 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_INVALID] = {},
     [RISCV_REG_FFLAGS] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "fflags" } },  /* fflags */
     [RISCV_REG_FRM] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "frm" } },  /* frm */
-    [RISCV_REG_SSP] = { .reg_id = REG_SSP },  /* ssp */
+    [RISCV_REG_SSP] = { .reg_id = REG_SSP, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "ssp" } },  /* ssp */
     [RISCV_REG_VL] = { .reg_id = REG_VCTRL, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "vl" } },  /* vl */
     [RISCV_REG_VLENB] = { .reg_id = REG_SYSID, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "vlenb" } },  /* vlenb */
     [RISCV_REG_VTYPE] = { .reg_id = REG_VCTRL, .qemu_reg = { .feature = "org.gnu.gdb.riscv.csr", .name = "vtype" } },  /* vtype */

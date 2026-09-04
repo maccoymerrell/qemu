@@ -18,6 +18,11 @@
  *                 has no id for it, so no Capstone-fed operand
  *                 can ever name it.  These rows are reachable
  *                 only by QEMU identity.
+ *   QREG_PREDICATED  QEMU carries it only when a run-time
+ *                 predicate admits it (the RISC-V CSR space,
+ *                 filtered through csr_ops[].predicate).  The
+ *                 row answers what generic word the NAME is;
+ *                 it does not stand for its class's VALUE.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  * Author: Maccoy Merrell

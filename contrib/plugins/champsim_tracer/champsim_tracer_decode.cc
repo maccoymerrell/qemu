@@ -183,6 +183,19 @@ void build_qemu_reg_reverse_index(void)
         if (row->reg_id == REG_NONE || row->reg_id >= REG_ID_COUNT) {
             continue;
         }
+        if (row->tier == QREG_PREDICATED) {
+            /*
+             * A register the running CPU may not expose at all cannot
+             * stand for its class's value: it resolves to a null handle,
+             * publishes a width-0 field that reads back as zero, and --
+             * because the index keeps at most one member per class --
+             * would displace a member that IS exposed.  RISC-V's 363
+             * predicate-gated CSRs would otherwise take REG_SYSID from
+             * `vlenb` and hand it to `marchid`.  The row is still read
+             * by generic_for_qemu_name(), which is what it is for.
+             */
+            continue;
+        }
         QemuRegKey key = { row->feature, row->name };
         if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[row->reg_id])) {
             g_qemu_reg_by_gen[row->reg_id] = key;

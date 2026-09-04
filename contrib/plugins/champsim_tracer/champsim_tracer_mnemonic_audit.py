@@ -4641,29 +4641,179 @@ def qemu_aarch64_reg_keys() -> dict[str, QemuRegKey]:
 # The Zicsr control and status registers QEMU exposes.  Unlike the GPR
 # and FPR files these have no static GDB XML: target/riscv/gdbstub.c
 # builds "org.gnu.gdb.riscv.csr" at CPU-realize time from csr_ops[],
-# naming each register the way the ISA does, so the names are listed
-# here rather than parsed out of gdb-xml/.
+# naming each register the way the ISA does.
 #
-# Only the ones Capstone gives a register id (riscv.h: RISCV_REG_FFLAGS
-# .. RISCV_REG_VXSAT) can be reached from this table; the rest of the
-# CSR space arrives as a QEMU_PLUGIN_OP_SYSREG operand and is resolved
-# from the operand's own name at decode time.  RISCV_REG_SSP is absent
-# on purpose: Zicfiss's `ssp` is not in the predicate-gated CSR list
-# QEMU registers, so there is no register to read and the row stays
-# unmapped rather than borrowing another CSR's content.
+# csr_ops[] IS THE NAMESPACE, so it is what is read.  This used to be a
+# hand-written seven-name tuple -- the CSRs Capstone happens to give a
+# register id -- and the consequence was not a narrower table but a
+# WRONG one.  `gen_note_csr_read()` (target/riscv/insn_trans/
+# trans_rvi.c.inc) resolves a CSR number through riscv_get_csr_ops() and
+# states the READ by that name; generic_for_qemu_name() answers from
+# this table; and a name with no row here got no answer, so the member
+# was dropped with a `name-word` tally.  Measured at exec119: 1,817
+# encodings published REG_SYS for a CSR read and QEMU's own read list
+# justified 96 of them, with `fcsr`, `vcsr`, `vstart`, `ssp`, `jvt` and
+# `seed` all falling out by name.  Four of those six already had a word
+# in the vocabulary; only the QEMU-NAME route to it was missing.
 QEMU_RISCV_CSR_FEATURE = "org.gnu.gdb.riscv.csr"
-QEMU_RISCV_CSR_NAMES = (
-    "fflags", "frm", "vl", "vtype", "vxrm", "vxsat", "vlenb",
-)
+RISCV_CSR_C = ROOT / "target" / "riscv" / "csr.c"
+
+# `[CSR_MSTATUS] = { "mstatus", ...` -- the only shape csr_ops[] uses for
+# a NAMED row.  A row with a NULL name is a number the stub spells
+# "csr%03x"; those carry no architectural identity and are not rows here.
+_RISCV_CSR_OPS_RE = re.compile(
+    r'^\s*\[CSR_[A-Z0-9_]+\]\s*=\s*\{\s*"([a-z0-9_]+)"', re.MULTILINE)
+
+
+@lru_cache(maxsize=None)
+def qemu_riscv_csr_names() -> tuple[str, ...]:
+    """Every named CSR in QEMU's csr_ops[], in table order."""
+    try:
+        text = RISCV_CSR_C.read_text()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"could not read {RISCV_CSR_C}") from exc
+    names = _RISCV_CSR_OPS_RE.findall(text)
+    if not names:
+        raise SystemExit(f"no csr_ops[] rows parsed out of {RISCV_CSR_C}")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name in seen:
+            raise SystemExit(f"csr_ops[] names {name} twice")
+        seen.add(name)
+        ordered.append(name)
+    return tuple(ordered)
 
 
 @lru_cache(maxsize=None)
 def qemu_riscv_reg_keys() -> dict[str, QemuRegKey]:
     regs = dict(gdb_xml_reg_key_map(("riscv-64bit-cpu.xml", "riscv-64bit-fpu.xml")))
     add_sequential_qemu_reg_keys(regs, "v", 32, "org.gnu.gdb.riscv.vector")
-    for name in QEMU_RISCV_CSR_NAMES:
+    for name in qemu_riscv_csr_names():
         add_qemu_reg_key(regs, name, QEMU_RISCV_CSR_FEATURE)
     return regs
+
+
+# ---------------------------------------------------------------------
+# THE RISC-V CSR ADJUDICATION
+#
+# One generic word per named CSR, chosen by the register's DEPENDENCE
+# BEHAVIOUR -- the same question MIPS_CP0_NUM_GROUP answers for CP0 and
+# for the same reason: one ID for a whole privileged file makes every
+# exception-raising instruction depend on every unrelated system access,
+# and a false edge misleads a consumer exactly as badly as a missing one.
+#
+# THESE ARE ADJUDICATIONS, NOT A DEFAULT.  A family that has no honest
+# word does not get REG_SYS because REG_SYS is what is left; it gets
+# REG_SYS because REG_SYS is the vocabulary's word for "scratch,
+# permission and virtualisation control", which is what that family IS.
+# A CSR matching no rule below is a CONFLICT and refuses the table --
+# adding a CSR upstream must force the adjudication, not inherit one.
+#
+# The eight CSRs a Capstone register id reaches (fflags, frm, ssp, vl,
+# vlenb, vtype, vxrm, vxsat) are deliberately absent: their word comes
+# from the Capstone row that routes to them, and a second opinion about
+# the same row is the disagreement keying on QEMU was meant to make
+# impossible (qemu_reg_rows() raises it as a conflict).
+RISCV_CSR_GROUPS: tuple[tuple[str, str, str], ...] = (
+    # --- the FP and vector control files --------------------------------
+    (r"fcsr|vcsr", "REG_FCSR",
+     "the FP (fcsr) and vector (vcsr) control-and-status files addressed "
+     "WHOLE; frm/fflags and vxrm/vxsat are their fields and already carry "
+     "REG_FCSR, so the container meets the word its members have"),
+    (r"vstart", "REG_VCTRL",
+     "the vector element start index: read and written by every vector "
+     "instruction alongside vl and vtype, which are REG_VCTRL"),
+    # --- counters -------------------------------------------------------
+    (r"m?(cycle|time)h?", "REG_SYSTIMER",
+     "a counter that advances on its own -- MIPS Count's group.  A read "
+     "of it depends on nothing in the instruction stream"),
+    (r"(s|vs)timecmph?|htimedeltah?", "REG_SYSTIMER",
+     "the compare value that fires against the free-running counter, and "
+     "the guest offset applied to it"),
+    (r"m?instreth?|m?hpmcounter\d+h?|mhpmevent\d+h?", "REG_SYSPERF",
+     "counters that advance on hardware events and the event selectors "
+     "that say which -- MIPS PerfCnt/PerfCtl's group"),
+    (r"[ms]countinhibit|scountovf|(mcyclecfg|minstretcfg)h?", "REG_SYSPERF",
+     "the performance counters' own control: inhibit, overflow status and "
+     "the Smcntrpmf privilege filter.  REG_SYSPERF is 'counters AND their "
+     "control'"),
+    (r"[msh]counteren", "REG_SYS",
+     "a PERMISSION mask -- which counters a lower privilege level may "
+     "read -- not counter state.  MIPS HWREna is the same register in the "
+     "same role and sits on REG_SYS"),
+    # --- read-only implementation identification ------------------------
+    (r"mvendorid|marchid|mimpid|mhartid|mconfigptr|misa", "REG_SYSID",
+     "read-only implementation identification and configuration; a read "
+     "of one can depend on nothing, so it must not share an ID with "
+     "writable state"),
+    # --- trap state -----------------------------------------------------
+    (r"(m|s|vs|mn)statush?|hstatus", "REG_SYSEXC",
+     "the status word a trap writes and an *ret restores"),
+    (r"(m|s|vs)tvec|(m|s|vs|mn)(epc|cause)|(m|s|vs)tval2?|(m|h)tinst|htval",
+     "REG_SYSEXC",
+     "written together BY the trap and read by its handler -- the vector "
+     "base, the return PC, the cause and the faulting value"),
+    (r"[mh](e|i)delegh?", "REG_SYSEXC",
+     "which traps are delegated: read on the same event that writes the "
+     "rest of the trap file"),
+    (r"(m|s|vs|h)i[ep]h?|(m|h)v?i[ep]h?|mvienh?|mviph?|hvienh?|hviph?"
+     r"|hgei[ep]|(m|s|vs)top(i|ei)|hvictl|hviprio[12]h?", "REG_SYSEXC",
+     "the interrupt file -- pending, enable, virtual-interrupt injection "
+     "and the AIA top-interrupt views.  An interrupt IS a trap in this "
+     "ISA, and these are written and read on the same event as mepc and "
+     "mcause"),
+    # --- address checking -----------------------------------------------
+    (r"satp|vsatp|hgatp|pmpcfg\d+|pmpaddr\d+|mseccfg", "REG_SYSMMU",
+     "the address-check machinery consulted on every access: the "
+     "translation roots and the physical-memory-protection rules.  A "
+     "write to either invalidates the same checks, which is the edge "
+     "REG_SYSMMU exists to carry"),
+    # --- debug, trace and control-transfer records ----------------------
+    (r"tselect|tdata[123]|tinfo|mcontext"
+     r"|(m|s|vs)ctrctl|sctrdepth|sctrstatus", "REG_SYSDBG",
+     "the trigger module and the control-transfer-record buffer: debug, "
+     "watchpoint and trace state"),
+    # --- the residual, each for its own stated reason --------------------
+    (r"(m|s|vs|mn)scratch", "REG_SYS",
+     "scratch -- REG_SYS names scratch explicitly.  The architecture "
+     "gives these no role beyond holding whatever the handler put there"),
+    (r"[msh]envcfgh?|[msh]stateen[0-3]h?", "REG_SYS",
+     "permission and enable masks (Zicboz/Svpbmt/pointer-masking gating, "
+     "Smstateen).  Not the FP/vector execution gate REG_SYSFPEN names -- "
+     "these admit unrelated extensions one bit each"),
+    (r"(m|s|vs)iselect|(m|s|vs)ireg[2-6]?", "REG_SYS",
+     "an indirect access WINDOW whose content the companion *iselect "
+     "chooses at run time.  No one behaviour group holds for every "
+     "selectable target, so the window register itself -- not a guessed "
+     "target -- is what the guest orders against"),
+    (r"seed", "REG_SYS",
+     "the Zkr entropy source: a read with a side effect whose value "
+     "depends on nothing architectural.  Not REG_SYSID -- it is not a "
+     "constant"),
+    (r"jvt", "REG_SYS",
+     "the Zcmt jump-vector-table base: a control register the table jump "
+     "reads, with no MMU, trap or counter role"),
+)
+
+# fullmatch, not match: every pattern above is an alternation, and an
+# anchor appended to one binds to its LAST branch only.
+_RISCV_CSR_GROUP_RE = tuple(
+    (re.compile(pattern), reg_id, reason)
+    for pattern, reg_id, reason in RISCV_CSR_GROUPS)
+
+
+def riscv_csr_entry(name: str) -> tuple[RegEntry | None, str]:
+    """The adjudicated word for a CSR no Capstone constant names."""
+    hits = [(reg_id, reason) for pattern, reg_id, reason in _RISCV_CSR_GROUP_RE
+            if pattern.fullmatch(name)]
+    if len(hits) != 1:
+        # Two rules claiming one CSR is two adjudications of the same
+        # register, which is the disagreement this table exists to
+        # prevent; zero is an unadjudicated CSR.  Either way: no answer,
+        # and qemu_reg_rows() raises it.
+        return None, ""
+    return RegEntry(hits[0][0]), hits[0][1]
 
 
 # MIPS' whole GDB-stub namespace is one feature and one XML file, so
@@ -4764,7 +4914,7 @@ def qemu_riscv_reg_key(name: str) -> QemuRegKey | None:
         return None
     if name == "X0_PAIR":
         return None
-    if name.lower() in QEMU_RISCV_CSR_NAMES:
+    if name.lower() in qemu_riscv_csr_names():
         return qemu_reg_key_by_name("riscv", name.lower())
     if match := re.fullmatch(r"X(\d+)", name):
         num = int(match.group(1))
@@ -5262,6 +5412,7 @@ def apply_regs_one(info: IsaInfo) -> None:
 
 QREG_UNNAMED = 0
 QREG_ROUTED = 1
+QREG_PREDICATED = 2
 
 
 @dataclass(frozen=True)
@@ -5270,13 +5421,23 @@ class QemuRegRow:
     name: str
     entry: RegEntry | None
     cap_rows: tuple[str, ...]
-    # Non-empty only on a row whose ID came from QEMU_ONLY_REG_IDS: why that
-    # role dictates that ID, and whether the register is reachable at all.
+    # Non-empty only on a row whose ID came from QEMU_ONLY_REG_IDS or from
+    # the RISC-V CSR adjudication: why that role dictates that ID, and
+    # whether the register is reachable at all.
     reason: str = ""
+    # True on a row QEMU carries only when a run-time predicate admits it
+    # -- the RISC-V CSR space, which target/riscv/gdbstub.c filters through
+    # csr_ops[].predicate at CPU-realize time.  The row still ANSWERS "what
+    # generic word is this name"; what it must not do is stand for its
+    # class's VALUE, because a register the running CPU does not expose
+    # reads back as a width-0 field and would displace a member that does.
+    predicated: bool = False
 
     @property
     def tier(self) -> int:
-        return QREG_ROUTED if self.cap_rows else QREG_UNNAMED
+        if self.cap_rows:
+            return QREG_ROUTED
+        return QREG_PREDICATED if self.predicated else QREG_UNNAMED
 
 
 # ---------------------------------------------------------------------------
@@ -5450,9 +5611,22 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
                     f"but is reachable from {len(routed)} Capstone row(s)")
         else:
             entry, reason = qemu_only_reg_entry(info, key)
+        predicated = (info.key == "riscv" and
+                      key.feature == QEMU_RISCV_CSR_FEATURE)
+        if predicated and not routed:
+            # The CSR space is adjudicated by its own table, not by
+            # QEMU_ONLY_REG_IDS: there are 363 of them and they are
+            # classified by family, with the family's reason on the row.
+            entry, reason = riscv_csr_entry(key.name)
+            if entry is None:
+                conflicts.append(
+                    f"{key.feature}:{key.name} is a named CSR in "
+                    f"csr_ops[] that RISCV_CSR_GROUPS does not adjudicate "
+                    f"(or adjudicates twice)")
         qemu_only.pop((key.feature, key.name), None)
         rows.append(QemuRegRow(key.feature, key.name, entry,
-                               tuple(sorted(c for c, _ in routed)), reason))
+                               tuple(sorted(c for c, _ in routed)), reason,
+                               predicated))
     # A rule naming no register in the namespace is dead: it can never fire,
     # and a dead rule that reads as coverage is how an allowlist lies.
     for feature, name in sorted(qemu_only):
@@ -5462,7 +5636,8 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
 
 
 def format_qemu_reg_row(row: QemuRegRow) -> str:
-    tier = "QREG_ROUTED" if row.tier == QREG_ROUTED else "QREG_UNNAMED"
+    tier = {QREG_ROUTED: "QREG_ROUTED",
+            QREG_PREDICATED: "QREG_PREDICATED"}.get(row.tier, "QREG_UNNAMED")
     if row.entry is None:
         body = ".reg_id = REG_NONE"
     elif row.entry.aliases:
@@ -5511,6 +5686,11 @@ def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
         " *                 has no id for it, so no Capstone-fed operand",
         " *                 can ever name it.  These rows are reachable",
         " *                 only by QEMU identity.",
+        " *   QREG_PREDICATED  QEMU carries it only when a run-time",
+        " *                 predicate admits it (the RISC-V CSR space,",
+        " *                 filtered through csr_ops[].predicate).  The",
+        " *                 row answers what generic word the NAME is;",
+        " *                 it does not stand for its class's VALUE.",
         " *",
         " * SPDX-License-Identifier: GPL-2.0-or-later",
         " * Author: Maccoy Merrell",
@@ -5536,10 +5716,12 @@ def qemu_regs_census(info: IsaInfo, rows: list[QemuRegRow],
                      conflicts: list[str], max_lines: int = 40) -> int:
     routed = [r for r in rows if r.tier == QREG_ROUTED]
     unnamed = [r for r in rows if r.tier == QREG_UNNAMED]
+    predicated = [r for r in rows if r.tier == QREG_PREDICATED]
     print(f"===== {info.key}: QEMU-indexed registers =====")
     print(f"QEMU namespace: {len(rows)} registers")
     print(f"  reachable from a Capstone operand: {len(routed)}")
     print(f"  reachable ONLY by QEMU identity:   {len(unnamed)}")
+    print(f"  predicate-gated (name -> word only): {len(predicated)}")
     for row in unnamed[:max_lines]:
         print(f"      {row.feature}:{row.name}")
     if len(unnamed) > max_lines:

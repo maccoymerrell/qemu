@@ -1340,6 +1340,33 @@ static void note_gpr_zero_dest(int src, target_ulong imm)
     }
 }
 
+/*
+ * THE SAME STATEMENT FOR THE TWO-REGISTER NOP ARMS.
+ *
+ * note_gpr_zero_dest()'s comment says "the three ... early returns above" and
+ * three is what it covers: the immediate forms.  Six more take the identical
+ * arm -- gen_arith(), gen_logic(), gen_cond_move(), gen_slt(), gen_shift() and
+ * gen_bshfl() -- and every one of them states the READS the NOP erases and
+ * not the DESTINATION.  `addu $zero,$a0,$a1` therefore reached a consumer
+ * with two sources and no destination at all, while the wire published
+ * REG_ZERO from the rd field the encoding carries.  Measured on the PASS 72
+ * shadow root: 4 walk-only REG_ZERO destinations under OPC_ADDU, which is
+ * every instance the corpus contains.
+ *
+ * @rs and @rt are the two source fields; the discarded write's provenance is
+ * taken from the first one the encoding names, which is the same account the
+ * immediate form gives (it names @src and lets the immediate stand in when
+ * the encoding names no register).  A discarded write states an OPERAND
+ * RELATIONSHIP and not a value, so one anchor is the shape, and taking two
+ * would put the register on the list twice.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_gpr_zero_dest_rr(int rs, int rt)
+{
+    note_gpr_zero_dest(rs != 0 ? rs : rt, 0);
+}
+
 #if defined(TARGET_MIPS64)
 void gen_load_gpr_hi(TCGv_i64 t, int reg)
 {
@@ -3075,7 +3102,18 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     TCGv t0;
 
     if (rt == 0) {
-        /* If no destination, treat it as a NOP. */
+        /*
+         * If no destination, treat it as a NOP.
+         *
+         * The operand and the destination the NOP erases; see
+         * note_gpr_folded_read() and note_gpr_zero_dest_rr().  This arm
+         * stated NEITHER, so `sll $zero,$t0,3` reached a consumer with no
+         * dataflow at all while the wire published both fields the encoding
+         * carries.  The shift amount is an immediate, not a register, so
+         * only @rs is a folded read.
+         */
+        note_gpr_folded_read(rs);
+        note_gpr_zero_dest_rr(rs, 0);
         return;
     }
 
@@ -3212,6 +3250,8 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
          */
         note_gpr_folded_read(rs);
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rs, rt);
         return;
     }
 
@@ -3460,6 +3500,8 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rs, rt);
         return;
     }
 
@@ -3540,6 +3582,8 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
          */
         note_gpr_folded_read(rs);
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rs, rt);
         return;
     }
 
@@ -3676,6 +3720,8 @@ static void gen_slt(DisasContext *ctx, uint32_t opc,
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rs, rt);
         return;
     }
 
@@ -3713,6 +3759,8 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rs, rt);
         return;
     }
 
@@ -6447,6 +6495,8 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
         /* If no destination, treat it as a NOP. */
         /* The operands the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rt);
+        /* And the destination it erases; see note_gpr_zero_dest_rr(). */
+        note_gpr_zero_dest_rr(rt, 0);
         return;
     }
 

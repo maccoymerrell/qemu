@@ -3823,17 +3823,42 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         if mnem in _A64_ZERO_MODIFIER:
             add(exp_src, _a64.AARCH64_REG_XZR)
         # The FP status/control contract (cap_aarch64_fp_status_contract).
-        # FPCR is the FP datapath's INPUT and FPSR its OUTPUT; the
-        # generic space folds both onto REG_FCSR and Capstone has no id
-        # for FPSR, so both halves ride AARCH64_REG_FPCR.
+        # FPCR is the FP datapath's INPUT and FPSR its OUTPUT.
+        #
+        # THE TWO HALVES ARE TWO GENERIC IDS AND THIS MIRROR WAS WRITTEN
+        # BEFORE THEY WERE.  It used to say "the generic space folds both
+        # onto REG_FCSR ... so both halves ride AARCH64_REG_FPCR", and
+        # that was true until 0acd1e32e5 gave the CONTROL word its own id.
+        # After the split the boundary names them separately --
+        #
+        #     isaxcheck --isa=aarch64 --hex=2028621e   (fadd d0, d1, d2)
+        #       RD{fpcr,sysfpen,v1,v2}  ->  REG_FPCW REG_SYSFPEN VEC1 VEC2
+        #       WR{fcsr,v0}             ->  REG_FCSR REG_VEC0
+        #
+        # -- while this mirror kept putting AARCH64_REG_FPCR (which now
+        # resolves to REG_FPCW) on BOTH sides.  The expectation therefore
+        # carried a WRITE of the control word that the wire does not have
+        # and lacked the WRITE of the status word that it does, so the
+        # destination sets were not in a superset relation at all and the
+        # oracle's gain-forgiveness could not apply: every IEEE FP row
+        # scored as an ERROR.  Measured on the net-validator w3_coverage
+        # aarch64 arm: errors=16, every one an FP mnemonic (fadd, fsub,
+        # fmul, fdiv, fsqrt, fcmp, scvtf, fmla, fmadd, and their vector
+        # forms), with the wire's sets a strict SUPERSET of the reference
+        # on both sides and NOTHING lost in either direction.
+        #
+        # The three `exp_src.discard("REG_FCSR")` lines below were dead
+        # for the same reason -- the control-word read they mean to
+        # remove has been REG_FPCW since the split -- and each now names
+        # the register it is actually about.
         _files = _a64_reg_files(d, ops, op_reg_kind, op_mem_kind, _a64)
         if _a64_is_saturating_int(mnem):
             # Integer saturating arithmetic reads no control word; the
             # Advanced SIMD forms write FPSR.QC and the SVE / SME
             # spellings of the same mnemonics write nothing.
-            exp_src.discard("REG_FCSR")
+            exp_src.discard("REG_FPCW")
             if _files["advsimd"] and not _files["sve"] and not _files["za"]:
-                add(exp_dst, _a64.AARCH64_REG_FPCR)
+                exp_dst.add("REG_FCSR")
         else:
             if _a64_is_ieee_fp_op(mnem) or _a64_is_bf16_nonieee(mnem):
                 add(exp_src, _a64.AARCH64_REG_FPCR)
@@ -3849,16 +3874,16 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 # with no conversion, so there is no rounding mode to
                 # read.  Unconditional on the operand form, unlike the
                 # two below.
-                exp_src.discard("REG_FCSR")
+                exp_src.discard("REG_FPCW")
             elif mnem.startswith(("fabs", "fneg")):
                 # Scalar float form only: the vector and SVE forms clear
                 # or flip bits and consult nothing.
                 if not _files["arranged"] and not _files["sve"]:
                     add(exp_src, _a64.AARCH64_REG_FPCR)
                 else:
-                    exp_src.discard("REG_FCSR")
+                    exp_src.discard("REG_FPCW")
             if _a64_is_ieee_fp_op(mnem) and not _files["za"]:
-                add(exp_dst, _a64.AARCH64_REG_FPCR)
+                exp_dst.add("REG_FCSR")
 
         # R7.4's FP / SIMD / SVE / SME enable gate
         # (cap_aarch64_add_fp_enable_gate).  CPACR_EL1.FPEN,
@@ -4061,6 +4086,23 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                     add(exp_src, rs2 + 1)
 
     elif isa == "mipsel":
+        # `nop` IS `sll $zero, $zero, 0`, and Capstone's alias erases both
+        # operand fields (disas/capstone.c, the MIPS_INS_NOP arm keyed on
+        # the four zero bytes).  LLVM MC names r0 read and r0 written,
+        # Capstone's own neighbours on the same two zero fields keep
+        # theirs -- `srl $zero,$zero,0` and `sra $zero,$zero,0` both
+        # report r0/r0 -- and QEMU's gen_shift_imm() states both halves.
+        # Mirrored here rather than skipped, for this function's standing
+        # reason: an unmirrored repair is reported as a defect, and a
+        # dropped repair would go quiet.
+        #
+        # SCOPED TO THE ENCODING, like the boundary: `ssnop`, `ehb` and
+        # `pause` are also SLL r0,r0,sa words and BOTH decoders name no
+        # operand for them, so the boundary leaves them alone and so does
+        # this.
+        if bytes(getattr(d, "bytes", b"") or b"")[:4] == b"\x00\x00\x00\x00":
+            exp_src.add("REG_ZERO")
+            exp_dst.add("REG_ZERO")
         # `mfhi` reads only the HIGH half of the accumulator and `mflo`
         # only the LOW half -- two different registers, REG_ACCHI<n> and
         # REG_ACC<n>.  Capstone names the WHOLE pair (MIPS_REG_AC<n>)

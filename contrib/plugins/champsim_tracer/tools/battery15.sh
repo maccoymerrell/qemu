@@ -28,6 +28,11 @@
 #                                    the R13 evidence root and any
 #                                    --must0-root.  A declared root with no
 #                                    census is REFUSED, never skipped
+#    6s   ... THE CONDITION-ASSERTED  the same scan over a population whose
+#           POPULATION                SUBJECT is asserted too: a zero from a
+#                                    seed that never reached the instruction
+#                                    is not closure (FINDING 69-B / 73-E).
+#                                    Declaring none is RED
 #    6b   ... PLANTED FIRE            a synthetic non-zero row under a
 #                                    declared root; row 6w must go red
 #    7-10 val_gate x4 ISAs           the seed-driven validator, per ISA
@@ -566,6 +571,105 @@ that declares none has not closed it"
     record 6w $rc "must0_scan WIDE -- ${#roots[@]} declared population(s)"
 }
 
+# ---- ROW 6s: THE CONDITION-ASSERTED POPULATION ---------------------------
+#
+# FINDING 73-E.  Row 6w reads the populations the wave DECLARES, and reads
+# them honestly, but a declared root that never reached the instruction the
+# row is about answers 0 for a reason that is not closure.  That is FINDING
+# 69-B's own lesson -- 53 quiet seeds were read as a pass because nobody
+# asked whether the subject was there -- and the arm that found the 72-G
+# class asserts BOTH halves by hand:
+#
+#     seed  sidecars  files with a non-zero must-be-0 row
+#       9      18        0        <- and 18 of 18 NAME sdc2
+#      13      18        1
+#      32      18        1
+#      54      18        1
+#
+# Three non-zero rows, live at the tip, on a population the standing bar
+# does not scan: rows 6 / 6w.1 / 6w.2 / 6w all read 0 over 896 + 41 + 80
+# sidecars while these three existed the whole time.  What separates them is
+# the SEED, and a fixed corpus cannot bound a class that appears at 3 of 7
+# seeds in one cell.  So the assertion moves out of a wave-local script and
+# into the battery, GENERICALLY: a root declared here must satisfy the
+# must-be-0 rows AND must be shown to have reached its subject.
+#
+#   --must0-seedroot <dir>=<token>
+#
+# The token is grepped in the sidecars themselves, so a population that
+# stopped reaching the instruction goes RED rather than quietly green -- the
+# 69-B hole, closed by construction instead of by an agent remembering.
+#
+# NOT DECLARING ONE IS RED.  A battery whose must-be-0 scope is the fixed
+# corpora only may say so -- by declaring the fixed corpora as seed roots and
+# naming what they reach -- but it may not say nothing.  That is row 6w's own
+# rule ("a declared root with no census is REFUSED, never skipped") applied
+# to the half of the scope 73-E found missing.
+#
+# THIS ROW IS RED AT THE TIP AND THAT IS THE FINDING.  The three rows above
+# are the MSA identity-less class (STATUS.md open item 7): `ori.b`,
+# `xori.b`, `nori.b` reached on a WRONG PATH with decode_id 0x00000000 and
+# rule `?`, so QEMU exported no identity, no survivor row can be keyed on
+# them and no R16 ledger row can carry them.  Both directions are open at
+# once on the same instruction.  Making the row BLOCK is the 72-G treatment
+# for a class that can be neither stated nor ruled yet; it goes green when
+# the identity exists.
+run_row6s() {
+    local spec r tok n rc=0 i=0 hit
+    if [ ${#MUST0_SEEDROOTS[@]} -eq 0 ]; then
+        record 6s 2 "must0_scan CONDITION-ASSERTED -- no population declared \
+(--must0-seedroot <dir>=<token>).  FINDING 73-E is that the must-be-0 scope \
+excluded the only population where the class fires; a battery that declares \
+none has not closed it"
+        return
+    fi
+    for spec in "${MUST0_SEEDROOTS[@]}"; do
+        i=$((i+1))
+        r=${spec%%=*}
+        tok=${spec#*=}
+        if [ "$tok" = "$spec" ] || [ -z "$tok" ]; then
+            record 6s.$i 2 "must0_scan CONDITION-ASSERTED -- '$spec' names no \
+subject token; the form is <dir>=<token> and a root with no asserted subject \
+is exactly the zero 69-B was misread on"
+            rc=1
+            continue
+        fi
+        if [ ! -d "$r" ]; then
+            record 6s.$i 2 "must0_scan CONDITION-ASSERTED -- declared root \
+'$r' is not a directory"
+            rc=1
+            continue
+        fi
+        mapfile -t MS < <(find "$r" -name '*.stats.log' -type f | sort)
+        n=${#MS[@]}
+        if [ "$n" -eq 0 ]; then
+            record 6s.$i 2 "must0_scan CONDITION-ASSERTED -- no sidecar under \
+declared root '$r'"
+            rc=1
+            continue
+        fi
+        # THE CONDITION FIRST.  A zero from a population that never reached
+        # the subject is not closure, and it is checked before the outcome so
+        # the record cannot show a green outcome over an empty subject.
+        hit=$(grep -l -F -- "$tok" "${MS[@]}" 2>/dev/null | wc -l)
+        if [ "$hit" -eq 0 ]; then
+            record 6s.$i 1 "must0_scan CONDITION-ASSERTED -- 0 of $n \
+sidecar(s) under '$r' NAME '$tok'.  The population does not reach its \
+subject, so its must-be-0 zero proves nothing (FINDING 69-B)"
+            rc=1
+            continue
+        fi
+        "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 1 \
+              "${MS[@]}" > "$O/MUST0_SEED_$i.txt" 2>&1
+        local one=$?
+        [ "$one" -eq 0 ] || rc=$one
+        record 6s.$i $one "must0_scan over $n sidecar(s) under '$r', \
+$hit of them naming '$tok'"
+    done
+    record 6s $rc "must0_scan CONDITION-ASSERTED -- ${#MUST0_SEEDROOTS[@]} \
+declared population(s)"
+}
+
 # ---- ROW 6b: THE PLANTED FIRE FOR THE WIDE SCOPE -------------------------
 #
 # A scope that has never been seen to fire is not evidence that the
@@ -615,6 +719,14 @@ MUST0_ROOTS=()
 if [ -n "${CST_MUST0_ROOTS:-}" ]; then
     IFS=':' read -r -a MUST0_ROOTS <<< "$CST_MUST0_ROOTS"
 fi
+# Sidecar populations whose SUBJECT is asserted as well as their outcome.
+# See run_row6s(): a root here is a <dir>=<subject-token> pair, and the row
+# is red when the token is absent from the census as well as when a
+# must-be-0 row is non-zero.
+MUST0_SEEDROOTS=()
+if [ -n "${CST_MUST0_SEEDROOTS:-}" ]; then
+    IFS=':' read -r -a MUST0_SEEDROOTS <<< "$CST_MUST0_SEEDROOTS"
+fi
 ROWS=all
 SEED=4242
 WP=16
@@ -629,6 +741,7 @@ while [ $# -gt 0 ]; do
         --rows)         ROWS=$2; shift 2 ;;
         --r13-root)     R13_ROOT=$2; shift 2 ;;
         --must0-root)   MUST0_ROOTS+=("$2"); shift 2 ;;
+        --must0-seedroot) MUST0_SEEDROOTS+=("$2"); shift 2 ;;
         --seed)         SEED=$2; shift 2 ;;
         --wp)           WP=$2; shift 2 ;;
         --no-plants)    PLANTS=0; shift ;;
@@ -1033,6 +1146,7 @@ done
 if selected 6; then
     run_row6
     run_row6w
+    run_row6s
     if [ "$PLANTS" -eq 1 ]; then
         run_row6b
     else

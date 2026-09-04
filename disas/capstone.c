@@ -9875,6 +9875,66 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * `nop` IS `sll $zero, $zero, 0`, AND CAPSTONE'S ALIAS ERASES BOTH
+         * OPERAND FIELDS.
+         *
+         * The MIPS assembly idiom NOP is the SPECIAL/SLL encoding with
+         * rd = rt = sa = 0; the architecture gives it no encoding of its
+         * own.  Capstone prints the idiom and hands the boundary an
+         * operand list of length zero -- `RD{-} WR{-}` -- where LLVM MC
+         * names both fields, `RD{r0} WR{r0}`, and Capstone itself keeps
+         * them on every neighbour that has no idiom to print:
+         * `srl $zero,$zero,0` and `sra $zero,$zero,0` are the SAME two
+         * register fields on the SAME two zeros and both report r0/r0.
+         * So this is a rendering choice inside one alias, not a statement
+         * about the instruction, and it is the shape of the DSPControl
+         * omission below: a table that names the register everywhere
+         * except where the mnemonic changed.
+         *
+         * QEMU AGREES WITH LLVM, at the decode site, in both directions:
+         * gen_shift_imm()'s "If no destination, treat it as a NOP" arm
+         * takes note_gpr_folded_read(rs) for the read and
+         * note_gpr_zero_dest_rr(rs, 0) for the write, and the block walk
+         * carries both out (measured: 200 `sll $zero,$zero,0` add 600
+         * DISCARDED-destination rows to QEMU's own write list, exactly as
+         * 200 `addu $zero,$zero,$zero` do).  R7.3 and R15 settle it the
+         * same way they settled the zero-register write at 9fa9914421 --
+         * a register the encoding names is not the emulator's, or the
+         * disassembler's, to drop.
+         *
+         * SCOPED TO THIS ONE ENCODING, and the scope is the references'
+         * own.  `ssnop`, `ehb` and `pause` are also SLL r0,r0,sa words,
+         * and Capstone AND LLVM MC both name no operand for all three --
+         * the architecture describes them as instructions in their own
+         * right rather than as an idiom for a shift -- so there is no
+         * disagreement to repair and none is invented.  The word is
+         * tested rather than the id alone, so a future Capstone that
+         * routes another encoding through MIPS_INS_NOP cannot silently
+         * acquire this repair.
+         *
+         * KEYED ON THE EXACT SHAPE, not on the id.  `insn->id` is the
+         * BASE instruction here -- Capstone carries the idiom in
+         * `alias_id`, and the AArch64 `ret` workaround above records why
+         * that field may not be consulted (Capstone leaves it stale
+         * across decodes on a reused handle).  The four zero bytes
+         * determine the encoding completely: SPECIAL with function SLL
+         * and rd = rt = sa = 0 is the only instruction they can be.  The
+         * `n == 0` term is what makes the repair SELF-RETIRING -- a
+         * Capstone that starts printing the operands supplies them
+         * itself and this arm stops firing.
+         *
+         * Verify with `isaxcheck --isa=mipsel --hex=00000000`, whose
+         * `RD{}` and `WR{}` must both name r0 and whose `SRC{}` and
+         * `DST{}` must both name REG_ZERO; and with `--hex=40000000`
+         * (`ssnop`), which must stay empty on both sides.
+         */
+        if (n == 0 && insn->size == 4 &&
+            insn->bytes[0] == 0 && insn->bytes[1] == 0 &&
+            insn->bytes[2] == 0 && insn->bytes[3] == 0) {
+            cap_mips_add_implicit(out, handle, MIPS_REG_ZERO, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_ZERO, true);
+        }
+        /*
          * DSPControl on the four instructions that exist to move it.
          *
          * Capstone's DSP table names DSPControl on most of the ASE --

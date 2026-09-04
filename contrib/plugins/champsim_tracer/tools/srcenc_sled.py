@@ -542,9 +542,33 @@ def main():
           % (merged, len(seen), rows, len(pop), inc_rows, len(incidental),
              inc_conflicts))
     if len(seen) < len(pop):
+        # THE CAUSE IS NOT KNOWN HERE AND THIS LINE USED TO CLAIM IT WAS.
+        # It read "(QEMU read a different length, or declined the slot)",
+        # which names two causes the sled has no evidence for, and exec119
+        # measured a third that it fits neither: eight encodings absent from
+        # a 200,000-slot sweep were PRESENT, on the SAME BUILD, in a
+        # 10,000-slot tail of the same population and in a 9-slot population.
+        # Whether an encoding produces a row is in part a function of the
+        # SLOT LAYOUT, and a sentence that explains it away as the guest's
+        # answer cost that finding a day.
+        #
+        # So the count is reported as a count and the cause is left open,
+        # with the one thing the sled DOES know printed beside it: which
+        # chunk each missing encoding was laid out in.  A layout-dependent
+        # drop clusters; a per-encoding one does not.
+        missing = [e for e in pop if e not in seen]
+        by_chunk = {}
+        for i, e in enumerate(pop):
+            if e in seen:
+                continue
+            by_chunk[i // a.chunk] = by_chunk.get(i // a.chunk, 0) + 1
         print("  population encodings the sled did NOT produce a row for: %d "
-              "(QEMU read a different length, or declined the slot)"
-              % (len(pop) - len(seen)))
+              "-- CAUSE NOT DETERMINED HERE" % len(missing))
+        print("    by chunk (chunk size %d, %d chunk(s)): %s"
+              % (a.chunk, (len(pop) + a.chunk - 1) // a.chunk,
+                 ", ".join("%d=%d" % (c, n)
+                           for c, n in sorted(by_chunk.items()))))
+        print("    first 8: %s" % " ".join(missing[:8]))
 
 
 if __name__ == "__main__":

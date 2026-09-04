@@ -81,6 +81,23 @@
 # different pc sets and a gate correctly refuses on coverage instead of
 # reporting what the plant did.
 #
+# NOTHING ELSE MAY RUN WHILE THIS RUNS, AND THE SCRIPT NOW REFUSES RATHER
+# THAN ASKING.  Rows 15b and 15c PLANT a class into a tracked header, rebuild
+# the plugin, and revert -- so for part of this script's life the tree's .so
+# is a deliberately wrong one.  Any other job that starts a capture in that
+# window captures the plant.  It has happened: a validator arm was
+# contaminated exactly this way.  The build directory is shared state and a
+# second champsim process is a second writer of it, so the guard below looks
+# for one and refuses to start.  --allow-concurrent overrides it, prints a
+# banner, and marks the close NOT A CLEAN BATTERY.
+#
+# SETTLE THE BUILD WITH A FULL `ninja` RUN TWICE BEFORE STARTING.  Not
+# `ninja <target>`: a partial build leaves other targets stale, row 11's build
+# gate refuses on them, and a pass has already lost its gate to exactly that.
+# Twice, because the first run can itself regenerate an input (meson
+# reconfigure, a generated header) and leave a second round of work to do; a
+# settled tree is one where the SECOND run says "no work to do".
+#
 # Author: Maccoy Merrell.
 set -u
 
@@ -107,6 +124,9 @@ options:
   --no-plants          skip 12b/14b/15b/15c.  The banner says so and the
                        close is marked NOT A FULL BATTERY: without the
                        planted fires the loss rows' zeros are unfalsified.
+  --allow-concurrent   start even though another champsim process is
+                       running.  The plants make this UNSAFE; the banner
+                       says so and the close is marked NOT A CLEAN BATTERY.
   --python PATH        interpreter (default: $CST_PYTHON or python3)
 EOF
 }
@@ -421,6 +441,7 @@ ROWS=all
 SEED=4242
 WP=16
 PLANTS=1
+CONCURRENT=0
 PY=${CST_PYTHON:-python3}
 while [ $# -gt 0 ]; do
     case $1 in
@@ -433,6 +454,7 @@ while [ $# -gt 0 ]; do
         --seed)         SEED=$2; shift 2 ;;
         --wp)           WP=$2; shift 2 ;;
         --no-plants)    PLANTS=0; shift ;;
+        --allow-concurrent) CONCURRENT=1; shift ;;
         --python)       PY=$2; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *) echo "battery15: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -451,6 +473,60 @@ RED=0
     echo "battery15: '$Q' is not a build directory with the tools in it" \
          "-- REFUSING" >&2; exit 2; }
 
+# ---- THE ISOLATION GUARD -------------------------------------------------
+# Rows 15b/15c compile a wrong class into the plugin and rebuild, so while
+# this script runs the build tree's .so is, for a while, a planted one.  A
+# capture started by anything else in that window silently gets the plant.
+# The guard names the processes it found and refuses; it does not wait, and
+# it does not kill anything, because both of those are decisions about
+# someone else's job.
+#
+# WHAT COUNTS AS A CONCURRENT CHAMPSIM PROCESS: an emulator loaded with the
+# plugin, or one of the tree's own harnesses.  Matched on the COMMAND LINE
+# rather than on a process name, because the emulator is `qemu-x86_64` and
+# what makes it ours is `-plugin .../libchampsim_tracer.so`.  This script's
+# own pid and its ancestors are excluded, and so is the grep itself.
+concurrent_champsim() {
+    local self=$$ mine="" anc p pg
+    # OUR OWN PROCESS GROUP, not just our pid.  A command substitution runs in
+    # a SUBSHELL with a pid of its own and this script's command line, so a
+    # guard keyed on `$$` reports the guard as the thing it is guarding
+    # against -- measured, on the first run of this check.  The process group
+    # covers this shell, its subshells and everything it spawns.
+    mine=" $(ps -o pgid= -p $self 2>/dev/null | tr -d ' ') "
+    # ...and every ancestor's group, so a wrapper that invoked us (and that
+    # carries our name on its command line) does not trip the guard either.
+    anc=$(ps -o ppid= -p "$self" 2>/dev/null | tr -d ' ')
+    while [ -n "$anc" ] && [ "$anc" != 0 ] && [ "$anc" != 1 ]; do
+        mine="$mine$(ps -o pgid= -p "$anc" 2>/dev/null | tr -d ' ') "
+        anc=$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d ' ')
+    done
+    ps -eo pid=,pgid=,args= 2>/dev/null | while read -r p pg rest; do
+        case "$mine" in *" $pg "*) continue ;; esac
+        case $rest in
+            *libchampsim_tracer.so*|*srcenc_sled.py*|*champsim_tracer_validator*|\
+            *battery15.sh*|*cst_decode*|*cst_audit*|*isaxcheck*)
+                printf '%s %s\n' "$p" "$rest" ;;
+        esac
+    done
+}
+CONCUR=$(concurrent_champsim)
+if [ -n "$CONCUR" ]; then
+    if [ "$CONCURRENT" -eq 1 ]; then
+        echo "*** battery15: --allow-concurrent, and these were running:" >&2
+        echo "$CONCUR" >&2
+    else
+        {
+          echo "battery15: REFUSING to start -- another champsim process is"
+          echo "  running, and rows 15b/15c plant a wrong class into the"
+          echo "  plugin and rebuild.  Anything capturing in that window gets"
+          echo "  the plant.  Wait for these, or pass --allow-concurrent:"
+          echo "$CONCUR"
+        } >&2
+        exit 2
+    fi
+fi
+
 {
   echo "battery15  build=$Q  out=$O"
   echo "HARNESS_CWD=$PWD"
@@ -460,6 +536,10 @@ RED=0
   echo "WP=$WP SEED=$SEED ROWS=$ROWS PLANTS=$PLANTS"
   [ "$ROWS" = all ] || echo "*** PARTIAL BATTERY -- rows=$ROWS.  This is NOT the acceptance bar. ***"
   [ "$PLANTS" -eq 1 ] || echo "*** NO PLANTED FIRES -- the loss rows' zeros are UNFALSIFIED here. ***"
+  if [ -n "$CONCUR" ]; then
+      echo "*** NOT A CLEAN BATTERY -- these ran alongside it: ***"
+      echo "$CONCUR"
+  fi
 } >> "$RCFILE"
 SO0=$(so_hash)
 

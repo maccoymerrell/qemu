@@ -9,6 +9,37 @@ together they answer most "why does my trace look like X" questions.
 Build and install
 -----------------
 
+.. _settle-the-build:
+
+**A measurement disagrees with a standalone check run minutes earlier**
+
+Settle the build before capturing anything: run a **full** ``ninja -C
+build`` — not ``ninja -C build <target>`` — and run it **twice**.
+
+A per-target build leaves the other targets stale.  The harness gates
+that compare a capture against the tree refuse when they would have to
+rebuild, on the correct ground that a capture taken before that rebuild
+ran old code, so a partial build turns into a refused gate rather than a
+wrong number — but only if the gate is reached at all.  The second run
+is not superstition: the first can regenerate one of its own inputs (a
+meson reconfigure, a generated header) and leave a second round of work
+behind it.  A settled tree is one where the **second** ``ninja`` says
+``no work to do``.
+
+``git commit -o <paths>`` — a partial commit — rewrites the mtimes of
+the paths it names even when their content did not change, so a capture
+started straight after one sees stale emulators.  Settle again after
+committing.
+
+**A capture disagrees with the tree it was supposedly taken from**
+
+Nothing else may run while the acceptance battery runs.  Two of its rows
+compile a deliberately wrong class into the plugin, rebuild, and revert;
+anything that captures in that window captures the plant.
+``battery15.sh`` refuses to start when it finds another champsim process
+and prints what it found; ``--allow-concurrent`` overrides it and marks
+the close **not a clean battery**.
+
 **``configure`` complains about Capstone**
 
 The plugin requires Capstone built with detail mode and links

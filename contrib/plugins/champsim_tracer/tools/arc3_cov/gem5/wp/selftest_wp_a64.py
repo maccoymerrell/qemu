@@ -45,11 +45,13 @@ RED = (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)
 
 
 def mutations(ex):
-    """[(axis, description, mutated excursion)] -- one per axis, on real data.
+    """[(axis, description, mutated excursion, index)] -- one per axis.
 
-    Every mutation is applied to the TRACER's side of a pair whose baseline
-    comparison is clean on that axis, so a firing row can only come from the
-    mutation.
+    Every mutation is applied to the TRACER's side of a real pair, and lands
+    on exactly ONE instruction.  ``run()`` requires the owning axis to report
+    a row AT THAT INSTRUCTION that the unmutated pair did not produce, so a
+    firing row can only come from the mutation -- which is what the discarded
+    index was needed for.
     """
     out = []
 
@@ -58,11 +60,11 @@ def mutations(ex):
 
     m = clone()
     m.insns[0].pc ^= 0x10
-    out.append(('pc-sequence', 'move the first WP PC by 0x10', m))
+    out.append(('pc-sequence', 'move the first WP PC by 0x10', m, 0))
 
     m = clone()
     m.insns[0].bits ^= 0xff
-    out.append(('insn-bits', 'flip the low byte of the first encoding', m))
+    out.append(('insn-bits', 'flip the low byte of the first encoding', m, 0))
 
     # The three write partitions are walked SEPARATELY.  Taking "the first
     # instruction with a write" left the flag and FP-status axes with no
@@ -79,13 +81,13 @@ def mutations(ex):
             m = clone()
             del m.insns[i].writes[hit[0]]
             out.append((axis, 'drop the %s destination of insn %d'
-                        % (axis.split('-')[0], i), m))
+                        % (axis.split('-')[0], i), m, i))
             if axis == 'reg-dst-set':
                 m = clone()
                 n, v, w = m.insns[i].writes[hit[0]]
                 m.insns[i].writes[hit[0]] = (n, v ^ 0x5a5a, w)
                 out.append(('reg-dst-value',
-                            'corrupt the value of insn %d' % i, m))
+                            'corrupt the value of insn %d' % i, m, i))
             break
 
     for axis, pred in (
@@ -99,7 +101,7 @@ def mutations(ex):
             m = clone()
             del m.insns[i].srcs[hit[0]]
             out.append((axis, 'drop a %s source of insn %d'
-                        % (axis.split('-')[0], i), m))
+                        % (axis.split('-')[0], i), m, i))
             break
 
     # Loads and stores are walked separately for the same reason.
@@ -111,38 +113,53 @@ def mutations(ex):
             m = clone()
             getattr(m.insns[i], which).pop()
             out.append(('memop-count',
-                        'drop the %s of insn %d' % (which[:-1], i), m))
+                        'drop the %s of insn %d' % (which[:-1], i), m, i))
             m = clone()
             a, d, sz = getattr(m.insns[i], which)[0]
             getattr(m.insns[i], which)[0] = (a + 64, d, sz)
             out.append(('memop-addr',
-                        'move the %s address of insn %d' % (which[:-1], i), m))
+                        'move the %s address of insn %d' % (which[:-1], i),
+                        m, i))
             if sz and sz > 1:
                 m = clone()
                 a, d, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d, max(1, sz2 // 2))
                 out.append(('memop-width',
                             'halve the %s width of insn %d' % (which[:-1], i),
-                            m))
+                            m, i))
             if d is not None:
                 m = clone()
                 a, d2, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d2 ^ 0xff, sz2)
                 out.append((axis, 'corrupt the %s datum of insn %d'
-                            % (which[:-1], i), m))
+                            % (which[:-1], i), m, i))
             break
     return out
 
 
-def _pairs(args, binary, cfg, env, guest, limit):
-    """[(guest, excursion, reference rows, axes already dirty)].
+def rowkey(r):
+    """What makes two comparison rows the SAME row: the instruction, the
+    axis, the verdict and both sides' values.  A mutation has moved an axis
+    when it produces a red row this key says the unmutated pair did not."""
+    return (r.idx, r.axis, r.verdict, repr(r.ref), repr(r.trc), r.detail)
 
-    A mutation proves nothing against a pair that already disagrees on the
-    axis it targets: that axis would have fired anyway.  Cleanliness is judged
-    PER AXIS rather than globally -- an excursion whose store-exclusive
-    already reports a named row on memop-count is still a sound subject for a
-    reg-dst-value mutation, and refusing it outright is how the memop axes
-    ended up with no mutation at all on the riscv64 leg.
+
+def _pairs(args, binary, cfg, env, guest, limit):
+    """[(guest, excursion, reference rows, reason, the pair's own rows)].
+
+    A mutation proves nothing against a pair that ALREADY REPORTS THE ROW the
+    mutation is supposed to produce, so the baseline comparison is carried
+    with the pair and the mutation must produce a row the baseline does not
+    have.
+
+    THIS USED TO BE A PER-AXIS CLEANLINESS FLAG, and on the mipsel twin of
+    this control the flag took the whole leg off the air (FINDING 73-C): a
+    red row anywhere in an excursion disqualified the axis for the entire
+    excursion, so the mutation was never attempted and the axis reported NO
+    MUTATION AVAILABLE.  The replacement is STRICTER, not looser -- a red row
+    AT THE INSTRUCTION THE MUTATION DAMAGED that the unmutated pair did not
+    already produce.  No pre-existing row can satisfy that, on a clean pair
+    or a dirty one, and no dirty pair is thrown away unexamined.
     """
     image, _xr, _e = elfimage.load(guest)
     stem = os.path.join(args.outdir, os.path.basename(guest))
@@ -161,8 +178,7 @@ def _pairs(args, binary, cfg, env, guest, limit):
             continue
         gi = C.excursion_gaps(ex, [])
         base = C.compare_excursion(guest, ex, refrows, gi, reason)[0]
-        out.append((guest, ex, refrows, reason,
-                    set(r.axis for r in base if r.verdict in RED)))
+        out.append((guest, ex, refrows, reason, base))
     return out
 
 
@@ -178,14 +194,17 @@ def run(args, binary, cfg, env):
     attempted = set()
     seen = set()
     lines = []
-    for guest, ex, refrows, reason, dirty in pairs:
-        for axis, what, m in mutations(ex):
-            if fired[axis] or axis in dirty:
+    for guest, ex, refrows, reason, base in pairs:
+        base_red = set(rowkey(r) for r in base if r.verdict in RED)
+        base_axes = set(r.axis for r in base)
+        for axis, what, m, idx in mutations(ex):
+            if fired[axis]:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
             rows = C.compare_excursion(guest, m, refrows,
                                        C.excursion_gaps(m, []), reason)[0]
-            hit = [r for r in rows if r.axis == axis and r.verdict in RED]
+            hit = [r for r in rows if r.axis == axis and r.idx == idx
+                   and r.verdict in RED and rowkey(r) not in base_red]
             fired[axis] += bool(hit)
             key = (axis, os.path.basename(guest), what)
             if key in seen:
@@ -193,12 +212,14 @@ def run(args, binary, cfg, env):
             seen.add(key)
             lines.append('  %-15s %-11s %-42s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit else 'DID NOT FIRE'))
+                            ('FIRED' if hit else 'DID NOT FIRE')
+                            + (' (pair already reports this axis elsewhere)'
+                               if axis in base_axes else '')))
 
     # ---- wp-entry-state.  It is scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be
     # the zero of a check nobody made fire.
-    guest, ex, refrows, _reason, _dirty = pairs[0]
+    guest, ex, refrows, _reason, _base = pairs[0]
     truth = dict((n, v) for n, (v, _w) in ex.regs.items()
                  if wp_seed_a64.reg_to_a64(n) and n not in C.FLAG_IDS
                  and n not in C.FPSR_IDS)

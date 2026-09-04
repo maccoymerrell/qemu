@@ -160,14 +160,33 @@ def mutations(ex):
     return out
 
 
-def _pairs(args, envx, guest, limit):
-    """[(excursion, reference, axes already disagreeing)] for real excursions.
+#: the verdicts that count as the axis REPORTING something.
+RED = (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)
 
-    A mutation proves nothing against a pair that already disagrees on the
-    axis being mutated: it would have fired anyway.  Cleanliness is judged
-    PER AXIS rather than globally -- an excursion whose `dec` already reports
-    a reg-src-set row is still a sound subject for a memop-addr mutation, and
-    refusing it outright is how the memory axes end up with no mutation.
+
+def rowkey(r):
+    """What makes two comparison rows the SAME row: the instruction, the
+    axis, the verdict and both sides' values.  A mutation has moved an axis
+    when it produces a red row this key says the unmutated pair did not."""
+    return (r.idx, r.axis, r.verdict, repr(r.ref), repr(r.trc), r.detail)
+
+
+def _pairs(args, envx, guest, limit):
+    """[(excursion, reference, the pair's own comparison rows)].
+
+    A mutation proves nothing against a pair that ALREADY REPORTS THE ROW the
+    mutation is supposed to produce, so the baseline comparison is carried
+    with the pair and the mutation must produce a row the baseline does not
+    have.
+
+    THIS USED TO BE A PER-AXIS CLEANLINESS FLAG, and on the mipsel twin of
+    this control the flag took the whole leg off the air (FINDING 73-C): a
+    red row anywhere in an excursion disqualified the axis for the entire
+    excursion, so the mutation was never attempted and the axis reported NO
+    MUTATION AVAILABLE.  The replacement is STRICTER, not looser -- a red row
+    AT THE INSTRUCTION THE MUTATION DAMAGED that the unmutated pair did not
+    already produce.  No pre-existing row can satisfy that, on a clean pair
+    or a dirty one, and no dirty pair is thrown away unexamined.
     """
     image, xranges, _e = elfimage.load(guest)
     stem = os.path.join(args.outdir, os.path.basename(guest))
@@ -195,9 +214,7 @@ def _pairs(args, envx, guest, limit):
         gi = C.excursion_gaps(ex, [])
         base, _n, _t, _sub = C.compare_excursion(guest, ex, ref, gi,
                                                  run.tail)
-        dirty = set(r.axis for r in base
-                    if r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED))
-        out.append((ex, ref, dirty, seed, run))
+        out.append((ex, ref, base, seed, run))
     return out
 
 
@@ -237,25 +254,29 @@ def run(args, envx):
     fired = collections.Counter()
     attempted = set()
     lines = []
-    for guest, ex, ref, dirty, _seed, run_ in pairs:
+    for guest, ex, ref, base, _seed, run_ in pairs:
+        base_red = set(rowkey(r) for r in base if r.verdict in RED)
+        base_axes = set(r.axis for r in base)
         for axis, what, m, idx in mutations(ex):
-            if fired[axis] or axis in dirty:
+            if fired[axis]:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
             rows, _n, _t, msub = C.compare_excursion(
                 guest, m, ref, C.excursion_gaps(m, []), run_.tail)
-            hit = [r for r in rows if r.axis == axis and
-                   r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
+            hit = [r for r in rows if r.axis == axis and r.idx == idx
+                   and r.verdict in RED and rowkey(r) not in base_red]
             fired[axis] += bool(hit)
             lines.append('  %-14s %-12s %-44s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit
-                            else why_not(msub, axis, m.insns[idx])))
+                            ('FIRED' if hit
+                             else why_not(msub, axis, m.insns[idx]))
+                            + (' (pair already reports this axis elsewhere)'
+                               if axis in base_axes else '')))
 
     # ---- wp-entry-state.  It is scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be
     # the zero of a check nobody made fire.
-    guest, ex, ref, _dirty, _seed, _run = pairs[0]
+    guest, ex, ref, _base, _seed, _run = pairs[0]
     truth = dict((n, v) for n, (v, _w) in ex.regs.items()
                  if wp_seed_x86.V.install_class(n) == 'gpr')
     m = copy.deepcopy(ex)

@@ -50,7 +50,11 @@ def _pick(exc, pred):
 
 
 def mutations(ex, ref):
-    """[(axis, description, mutated excursion)] -- one per axis, on real data."""
+    """[(axis, description, mutated excursion, index)] -- one per axis.
+
+    THE INDEX IS PART OF THE MUTATION.  Every damage below lands on ONE
+    instruction, and ``run()`` requires the owning axis to report it AT THAT
+    INSTRUCTION."""
     out = []
 
     def clone():
@@ -58,30 +62,30 @@ def mutations(ex, ref):
 
     m = clone()
     m.insns[0].pc ^= 0x10
-    out.append(('pc-sequence', 'move the first WP PC by 0x10', m))
+    out.append(('pc-sequence', 'move the first WP PC by 0x10', m, 0))
 
     m = clone()
     m.insns[0].bits ^= 0xff
-    out.append(('insn-bits', 'flip the low byte of the first encoding', m))
+    out.append(('insn-bits', 'flip the low byte of the first encoding', m, 0))
 
     for i, ins in enumerate(ex.insns):
         if ins.writes:
             m = clone()
             m.insns[i].writes = []
             out.append(('reg-dst-set', 'drop the destination of insn %d' % i,
-                        m))
+                        m, i))
             m = clone()
             n, v, w = m.insns[i].writes[0]
             m.insns[i].writes[0] = (n, v ^ 0x5a5a, w)
             out.append(('reg-dst-value', 'corrupt the value of insn %d' % i,
-                        m))
+                        m, i))
             break
 
     for i, ins in enumerate(ex.insns):
         if ins.srcs:
             m = clone()
             m.insns[i].srcs = ins.srcs[1:]
-            out.append(('reg-src-set', 'drop a source of insn %d' % i, m))
+            out.append(('reg-src-set', 'drop a source of insn %d' % i, m, i))
             break
 
     # loads and stores are walked SEPARATELY.  Taking "the first instruction
@@ -96,33 +100,63 @@ def mutations(ex, ref):
             m = clone()
             getattr(m.insns[i], which).pop()
             out.append(('memop-count',
-                        'drop the %s of insn %d' % (which[:-1], i), m))
+                        'drop the %s of insn %d' % (which[:-1], i), m, i))
             m = clone()
             a, d, sz = getattr(m.insns[i], which)[0]
             getattr(m.insns[i], which)[0] = (a + 8, d, sz)
             out.append(('memop-addr',
-                        'move the %s address of insn %d' % (which[:-1], i), m))
+                        'move the %s address of insn %d' % (which[:-1], i),
+                        m, i))
             if sz:
                 m = clone()
                 a, d, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d, max(1, sz2 // 2))
                 out.append(('memop-width',
                             'halve the %s width of insn %d' % (which[:-1], i),
-                            m))
+                            m, i))
             if d is not None:
                 m = clone()
                 a, d2, sz2 = getattr(m.insns[i], which)[0]
                 getattr(m.insns[i], which)[0] = (a, d2 ^ 0xff, sz2)
                 out.append((axis, 'corrupt the %s datum of insn %d'
-                            % (which[:-1], i), m))
+                            % (which[:-1], i), m, i))
             break
     return out
 
 
+#: the verdicts that count as the axis REPORTING something.  A row an
+#: adjudication has already settled is not the axis firing.
+RED = (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)
+
+
+def rowkey(r):
+    """What makes two comparison rows the SAME row: the instruction, the
+    axis, the verdict and both sides' values.  A mutation has moved an axis
+    when it produces a red row this key says the unmutated pair did not."""
+    return (r.idx, r.axis, r.verdict, repr(r.ref), repr(r.trc), r.detail)
+
+
 def _clean_pairs(args, guest, limit):
-    """[(excursion, reference)] for excursions whose baseline comparison is
-    clean.  A mutation proves nothing against a pair that already disagrees:
-    the axis would have fired anyway."""
+    """[(excursion, reference, the pair's own comparison rows)].
+
+    A mutation proves nothing against a pair that ALREADY REPORTS THE ROW the
+    mutation is supposed to produce, so the baseline comparison is carried
+    with the pair and the mutation is required to produce a row the baseline
+    does not have.
+
+    THIS USED TO BE A PER-AXIS CLEANLINESS FLAG, and on the mipsel twin of
+    this control the flag took the whole leg off the air (FINDING 73-C).
+    `set(r.axis for r in base)` disqualified an axis for the WHOLE excursion
+    as soon as ANY instruction produced ANY row on it -- including rows an
+    adjudication had already ruled fine -- so a single adjudicated
+    TRACER-SUPERSET anywhere in the shadow made the axis unprovable, the
+    control reported NO MUTATION AVAILABLE, and `set -e` stopped the leg
+    before its comparison ran.  riscv64 carried the identical unfiltered
+    expression and was one wire change away from the same outcome.
+
+    The replacement is STRICTER, not looser: a red row AT THE INSTRUCTION THE
+    MUTATION DAMAGED that the unmutated pair did not already produce.  No
+    pre-existing row can satisfy that, on a clean pair or a dirty one."""
     image, xranges, _e = elfimage.load(guest)
     stem = os.path.join(args.outdir, os.path.basename(guest))
     trace = C.run_tracer(args.qemu, args.plugin, guest, stem, args.wpdepth)
@@ -151,12 +185,7 @@ def _clean_pairs(args, guest, limit):
         # memop axes with no subject at all.
         if len(ref) >= 4:
             base, _cmp, _sub = C.compare_excursion(guest, ex, ref, gi)
-            # Cleanliness is judged PER AXIS, not globally: an excursion whose
-            # store-conditional already reports a named TRACER-SUPERSET on
-            # memop-count is still a sound subject for a reg-dst-value
-            # mutation, and refusing it outright is how the memop axes ended
-            # up with no mutation at all.
-            out.append((ex, ref, set(r.axis for r in base)))
+            out.append((ex, ref, base))
     return out
 
 
@@ -182,8 +211,8 @@ def why_not(sub, axis):
 def run(args):
     pairs = []
     for g in args.guest:
-        pairs.extend((g, ex, ref, dirty)
-                     for ex, ref, dirty in _clean_pairs(args, g, 6))
+        pairs.extend((g, ex, ref, base)
+                     for ex, ref, base in _clean_pairs(args, g, 6))
     if not pairs:
         raise RuntimeError('no clean aligned excursion to mutate: the control '
                            'cannot prove anything against a pair that already '
@@ -192,24 +221,28 @@ def run(args):
     fired = collections.Counter()
     attempted = set()
     lines = []
-    for guest, ex, ref, dirty in pairs:
-        for axis, what, m in mutations(ex, ref):
-            if fired[axis] or axis in dirty:
+    for guest, ex, ref, base in pairs:
+        base_red = set(rowkey(r) for r in base if r.verdict in RED)
+        base_axes = set(r.axis for r in base)
+        for axis, what, m, idx in mutations(ex, ref):
+            if fired[axis]:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
             rows, _cmp, msub = C.compare_excursion(
                 guest, m, ref, C.excursion_gaps(m, []))
-            hit = [r for r in rows if r.axis == axis and
-                   r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
+            hit = [r for r in rows if r.axis == axis and r.idx == idx
+                   and r.verdict in RED and rowkey(r) not in base_red]
             fired[axis] += bool(hit)
             lines.append('  %-14s %-14s %-40s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit else why_not(msub, axis)))
+                            ('FIRED' if hit else why_not(msub, axis))
+                            + (' (pair already reports this axis elsewhere)'
+                               if axis in base_axes else '')))
 
     # ---- wp-entry-state.  It is scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be
     # the zero of a check nobody made fire.
-    guest, ex, ref, _dirty = pairs[0]
+    guest, ex, ref, _base = pairs[0]
     truth = dict((n, v) for n, (v, _w) in ex.regs.items()
                  if wp_seed.reg_to_riscv(n))
     m = copy.deepcopy(ex)

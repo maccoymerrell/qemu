@@ -24,6 +24,24 @@ allowlist row asserts the tracer is right, so laundering a tracer defect
 through one is the failure this file's own header warns against.  Those
 signatures stay red with a named blocker.
 
+TWO ARMS REPORT THIS FAMILY, AND THE CLASS SET IS ONE SET (--layer).
+`SR-rd-*` is a claim about the WIRE's published source list against LLVM's,
+and isaxcheck states in its own `--srcenc` comment that the family is
+LAYER-INDEPENDENT: "the wire's source list is one list; it is not a property
+of which decoder view this tool happens to be holding, and giving the
+boundary and fields runs separate read signatures would assert a difference
+that no longer exists."  The BOUNDARY arm therefore scores the same claims
+and reports them into `b_<isa>.txt`, against `isaxcheck_allow.txt`.
+
+What differs between the arms is not the adjudication -- it is REACH.  The
+two arms decode with different views, so they cover different encodings and
+each reports the subset of the family its own sweep reached.  That is why the
+layer selects the ARM FILE and nothing else: the class predicates, their
+justifications and their DEFECT verdicts are shared, and each allowlist gets
+rows for the signatures ITS OWN arm reported.  Emitting the fields block into
+the boundary file instead would land rows with no occupant, which is the
+first property this generator exists to make impossible.
+
 Author: Maccoy Merrell.
 SPDX-License-Identifier: GPL-2.0-or-later
 """
@@ -679,8 +697,14 @@ def classify(isa, sigs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", required=True,
-                    help="directory holding f_<isa>.txt from the --srcenc "
-                         "fields arms")
+                    help="directory holding the --srcenc arm output: "
+                         "f_<isa>.txt for the fields layer, b_<isa>.txt for "
+                         "the boundary layer")
+    ap.add_argument("--layer", choices=("fields", "boundary"),
+                    default="fields",
+                    help="which arm's signatures to emit rows from; the "
+                         "class set is shared because the SR- family is "
+                         "layer-independent (see the module docstring)")
     ap.add_argument("--isa", action="append", choices=ISAS)
     ap.add_argument("--census", action="store_true",
                     help="print the partition and exit")
@@ -689,7 +713,8 @@ def main():
 
     blocks = []
     for isa in isas:
-        path = os.path.join(args.arms, f"f_{isa}.txt")
+        pre = "f" if args.layer == "fields" else "b"
+        path = os.path.join(args.arms, f"{pre}_{isa}.txt")
         if not os.path.exists(path):
             raise SystemExit(f"no arm output at {path}")
         sigs = read_arm(path)

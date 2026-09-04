@@ -556,10 +556,14 @@ def main():
         # with the one thing the sled DOES know printed beside it: which
         # chunk each missing encoding was laid out in.  A layout-dependent
         # drop clusters; a per-encoding one does not.
-        missing = [e for e in pop if e not in seen]
+        # `pop` holds the encodings as BYTES (build_elf lays them out) and
+        # `seen` is keyed on the corpus's HEX spelling, so the membership test
+        # is done in hex.  The first cut compared the two directly, every test
+        # said "missing", and the arm reported the whole population absent.
+        missing = [e.hex() for e in pop if e.hex() not in seen]
         by_chunk = {}
         for i, e in enumerate(pop):
-            if e in seen:
+            if e.hex() in seen:
                 continue
             by_chunk[i // a.chunk] = by_chunk.get(i // a.chunk, 0) + 1
         print("  population encodings the sled did NOT produce a row for: %d "

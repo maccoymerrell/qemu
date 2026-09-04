@@ -260,6 +260,81 @@ selftest() {
     t "U2 ... and it was recorded as a PASSING control arm" "$?" 0
     n=$((n+1))
 
+    # ---- V/W/X/Y: THE ISOLATION GUARD, BOTH DIRECTIONS (FINDING 70-D) ----
+    #
+    # The guard was rewritten from matching command lines to reading the
+    # kernel's record, and BOTH directions of that change need proving: it
+    # must still catch a process argv cannot describe, and it must no longer
+    # refuse over one that is none of this build's business.  A guard nobody
+    # has watched fire, and nobody has watched stay quiet, is a guard whose
+    # zero means nothing.
+    #
+    # EACH ARM ASSERTS ON THE PROBE'S OWN PID, not on a string in the output.
+    # The first version of these arms grepped for the fake path, and passed
+    # against the SHELL THAT LAUNCHED THE SELFTEST -- whose command line
+    # contained the path because the invocation did.  A probe that never ran
+    # would have read as a probe that was found.
+    #
+    # setsid puts each probe in its OWN process group.  A background job
+    # started from here shares this script's group and the guard excludes its
+    # own group by design, so without setsid every arm below would "pass" by
+    # never being looked at.
+    #
+    # AND EACH PROBE REPORTS THAT IT IS ALIVE.  `sleep 47 /some/path` is not a
+    # sleeping process: GNU sleep sums its arguments as durations and exits
+    # immediately on a path.  The second arm was that command, so it died
+    # before it could be looked for, and the arm asserting the guard IGNORED
+    # it passed for the wrong reason.  Each probe now writes its own pid after
+    # `exec` has given it the command line under test, and the arms REFUSE if
+    # a pid file does not appear.
+    local fb=$scratch/fakebuild vp wp fakearg
+    fakearg="cst_decode /some/other/checkout/build/libchampsim_tracer.so"
+    mkdir -p "$fb/contrib/plugins" "$fb/bin"
+    cp "$(command -v sleep)" "$fb/bin/zzz_not_a_tracer_name" 2>/dev/null
+    if [ -x "$fb/bin/zzz_not_a_tracer_name" ] && command -v setsid >/dev/null
+    then
+        # V: EXE under the build dir, with an argv that names nothing of ours.
+        setsid bash -c 'echo $$ > "$2"; exec -a totally-innocuous-name "$1" 47' \
+               _ "$fb/bin/zzz_not_a_tracer_name" "$scratch/v.pid" \
+               >/dev/null 2>&1 &
+        # W: an argv naming another checkout's plugin, on a stock binary.
+        setsid bash -c 'echo $$ > "$2"; exec -a "$1" sleep 47' \
+               _ "$fakearg" "$scratch/w.pid" >/dev/null 2>&1 &
+        local i=0
+        while [ $i -lt 50 ] && { [ ! -s "$scratch/v.pid" ] || \
+                                 [ ! -s "$scratch/w.pid" ]; }; do
+            sleep 0.1; i=$((i+1))
+        done
+        vp=$(cat "$scratch/v.pid" 2>/dev/null)
+        wp=$(cat "$scratch/w.pid" 2>/dev/null)
+        if [ -z "$vp" ] || [ -z "$wp" ] || [ ! -d "/proc/$vp" ] || \
+           [ ! -d "/proc/$wp" ]; then
+            bad "V-Y the guard probes did not start (v='$vp' w='$wp') -- \
+REFUSING to report these arms as passed"
+            n=$((n+3))
+        else
+            local hard soft
+            hard=$(concurrent_champsim "$fb" | cut -d' ' -f1 | tr '\n' ' ')
+            soft=$(nearby_champsim "$fb" | cut -d' ' -f1 | tr '\n' ' ')
+            printf '%s\n' "$hard" > "$scratch/guard_hard.txt"
+            printf '%s\n' "$soft" > "$scratch/guard_soft.txt"
+            t "V the guard CATCHES a process argv cannot describe" \
+              "$(case " $hard " in *" $vp "*) echo y ;; *) echo n ;; esac)" y
+            t "W ...and does NOT refuse over another tree's command line" \
+              "$(case " $hard " in *" $wp "*) echo y ;; *) echo n ;; esac)" n
+            t "X ...which is reported as an ADVISORY rather than dropped" \
+              "$(case " $soft " in *" $wp "*) echo y ;; *) echo n ;; esac)" y
+            t "Y the guard never reports this script's own process" \
+              "$(case " $hard " in *" $$ "*) echo y ;; *) echo n ;; esac)" n
+            kill "$vp" "$wp" 2>/dev/null
+        fi
+        wait 2>/dev/null
+    else
+        bad "V-Y the isolation guard arms could not run (no setsid or no \
+sleep to copy) -- REFUSING to report them as passed"
+        n=$((n+3))
+    fi
+
     echo "arms=$n failures=$fails"
     [ "$fails" -eq 0 ]
 }
@@ -311,6 +386,109 @@ restore_and_touch() {
 }
 
 so_hash() { sha256sum "$Q/contrib/plugins/libchampsim_tracer.so" | cut -c1-12; }
+
+# ---- WHO ELSE IS USING THIS BUILD ----------------------------------------
+#
+# FINDING 70-D.  This guard used to answer the question by matching COMMAND
+# LINES: anything whose argv mentioned libchampsim_tracer.so, srcenc_sled.py,
+# cst_decode and so on.  argv is neither necessary nor sufficient for the
+# question actually being asked, which is "will this process be affected by,
+# or interfere with, a plant in THIS build tree".
+#
+#   NOT SUFFICIENT -- argv is what a process SAYS it is.  An emulator started
+#   through a wrapper, re-exec'd, or invoked with a changed argv[0] loads the
+#   plugin and says nothing about it.  So does a tool run from a shell whose
+#   own command line the kernel has since rewritten.
+#
+#   NOT NECESSARY -- a `cst_decode` belonging to a DIFFERENT build tree is
+#   matched by the old rule and is not a hazard: rows 15b/15c plant into
+#   THIS tree's .so and nothing else's.  So is a text editor holding the
+#   string, and so is a report that quotes it.
+#
+# The question is answered from the kernel's own record instead:
+#
+#   EXE      /proc/<pid>/exe resolved -- the file the process is RUNNING,
+#            whatever argv says.  Under this build dir, it is one of ours.
+#   MAPPED   /proc/<pid>/maps names THIS build's libchampsim_tracer.so.  An
+#            emulator with the plugin loaded is caught here however it was
+#            started, which is the case argv could not answer.
+#   HARNESS  the command line, kept for the one case where the exe is an
+#            interpreter and tells us nothing: a python or shell harness
+#            under THIS repo's champsim_tracer tree.  Scoped to the repo
+#            path, so another checkout's harness is not this run's problem.
+#
+# This script's own process group and its ancestors' groups are excluded: a
+# command substitution runs in a SUBSHELL with a pid of its own and this
+# script's command line, so a guard keyed on `$$` reports the guard as the
+# thing it is guarding against -- measured, on the first run of this check.
+#
+# WHAT IT CANNOT SEE, said plainly: another user's processes.  /proc/<pid>/exe
+# and /proc/<pid>/maps are unreadable across users, so a concurrent capture
+# run by somebody else is invisible to EXE and MAPPED and reaches only the
+# advisory below.  The battery is a single-operator bar and that is the
+# boundary of this guard, not a claim it does not have one.
+concurrent_champsim() {
+    local build=${1:-$Q} self=$$ mine="" anc d p pg st rest exe cmd why
+    mine=" $(ps -o pgid= -p $self 2>/dev/null | tr -d ' ') "
+    anc=$(ps -o ppid= -p "$self" 2>/dev/null | tr -d ' ')
+    while [ -n "$anc" ] && [ "$anc" != 0 ] && [ "$anc" != 1 ]; do
+        mine="$mine$(ps -o pgid= -p "$anc" 2>/dev/null | tr -d ' ') "
+        anc=$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d ' ')
+    done
+    local QR SO RR
+    QR=$(cd "$build" 2>/dev/null && pwd -P) || return 0
+    SO=$QR/contrib/plugins/libchampsim_tracer.so
+    RR=$(cd "$T/../../../.." 2>/dev/null && pwd -P)
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$self" ] && continue
+        # A process can exit between the glob and the read; the redirect's
+        # own failure message is bash's, so the group is what silences it.
+        { read -r st < "$d/stat"; } 2>/dev/null || continue
+        rest=${st#*') '}
+        # stat after the comm field: state ppid pgrp ...
+        set -- $rest
+        pg=$3
+        case "$mine" in *" $pg "*) continue ;; esac
+        cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
+        why=""
+        exe=$(readlink -f "$d/exe" 2>/dev/null)
+        case "$exe" in "$QR"/*) why="EXE under the build dir: $exe" ;; esac
+        if [ -z "$why" ] && grep -qsF "$SO" "$d/maps"; then
+            why="MAPPED this build's plugin"
+        fi
+        if [ -z "$why" ] && [ -n "$RR" ]; then
+            case "$cmd" in
+                *"$RR/contrib/plugins/champsim_tracer/tools/"*|\
+                *"$RR/contrib/plugins/champsim_tracer/validator/"*)
+                    why="HARNESS from this repo" ;;
+            esac
+        fi
+        [ -n "$why" ] && printf '%s  [%s]  %s\n' "$p" "$why" "$cmd"
+    done
+    return 0
+}
+
+# The old rule, kept as an ADVISORY and never as a refusal.  Narrowing a guard
+# can drop a real hazard as easily as a false alarm, so everything the command
+# line rule used to catch and the kernel-backed one does not is still NAMED in
+# the transcript -- it just no longer stops the run.
+nearby_champsim() {
+    local build=${1:-$Q} d p cmd exe hard
+    hard=$(concurrent_champsim "$build" | cut -d' ' -f1 | tr '\n' ' ')
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        case " $hard " in *" $p "*) continue ;; esac
+        cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
+        case $cmd in
+            *libchampsim_tracer.so*|*srcenc_sled.py*|*champsim_tracer_validator*|\
+            *battery15.sh*|*cst_decode*|*cst_audit*|*isaxcheck*)
+                printf '%s  %s\n' "$p" "$cmd" ;;
+        esac
+    done
+    return 0
+}
 
 # The harness root and the interpreter are needed by the rows AND by the
 # selftest, which runs before the option parser; a row that cannot find
@@ -479,38 +657,10 @@ RED=0
 # capture started by anything else in that window silently gets the plant.
 # The guard names the processes it found and refuses; it does not wait, and
 # it does not kill anything, because both of those are decisions about
-# someone else's job.
-#
-# WHAT COUNTS AS A CONCURRENT CHAMPSIM PROCESS: an emulator loaded with the
-# plugin, or one of the tree's own harnesses.  Matched on the COMMAND LINE
-# rather than on a process name, because the emulator is `qemu-x86_64` and
-# what makes it ours is `-plugin .../libchampsim_tracer.so`.  This script's
-# own pid and its ancestors are excluded, and so is the grep itself.
-concurrent_champsim() {
-    local self=$$ mine="" anc p pg
-    # OUR OWN PROCESS GROUP, not just our pid.  A command substitution runs in
-    # a SUBSHELL with a pid of its own and this script's command line, so a
-    # guard keyed on `$$` reports the guard as the thing it is guarding
-    # against -- measured, on the first run of this check.  The process group
-    # covers this shell, its subshells and everything it spawns.
-    mine=" $(ps -o pgid= -p $self 2>/dev/null | tr -d ' ') "
-    # ...and every ancestor's group, so a wrapper that invoked us (and that
-    # carries our name on its command line) does not trip the guard either.
-    anc=$(ps -o ppid= -p "$self" 2>/dev/null | tr -d ' ')
-    while [ -n "$anc" ] && [ "$anc" != 0 ] && [ "$anc" != 1 ]; do
-        mine="$mine$(ps -o pgid= -p "$anc" 2>/dev/null | tr -d ' ') "
-        anc=$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d ' ')
-    done
-    ps -eo pid=,pgid=,args= 2>/dev/null | while read -r p pg rest; do
-        case "$mine" in *" $pg "*) continue ;; esac
-        case $rest in
-            *libchampsim_tracer.so*|*srcenc_sled.py*|*champsim_tracer_validator*|\
-            *battery15.sh*|*cst_decode*|*cst_audit*|*isaxcheck*)
-                printf '%s %s\n' "$p" "$rest" ;;
-        esac
-    done
-}
+# someone else's job.  concurrent_champsim() is defined with the other
+# helpers above, so --selftest can exercise it.
 CONCUR=$(concurrent_champsim)
+NEARBY=$(nearby_champsim)
 if [ -n "$CONCUR" ]; then
     if [ "$CONCURRENT" -eq 1 ]; then
         echo "*** battery15: --allow-concurrent, and these were running:" >&2
@@ -539,6 +689,13 @@ fi
   if [ -n "$CONCUR" ]; then
       echo "*** NOT A CLEAN BATTERY -- these ran alongside it: ***"
       echo "$CONCUR"
+  fi
+  # The advisory: what the old command-line rule would have refused over and
+  # this one does not.  Recorded, never acted on, so narrowing the guard
+  # cannot silently drop a hazard nobody thought of.
+  if [ -n "$NEARBY" ]; then
+      echo "NEARBY (advisory, not a refusal -- command line only):"
+      echo "$NEARBY"
   fi
 } >> "$RCFILE"
 SO0=$(so_hash)

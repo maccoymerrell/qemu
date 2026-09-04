@@ -957,8 +957,8 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x0000053au, "NOP", QID_STATED, false,
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
-    { 0x0000053bu, "UD", QID_VERIFIED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+    { 0x0000053bu, "UD", QID_STATED, false,
+      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
     { 0x0000053cu, "NOP", QID_STATED, false,
       { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- target/i386/tcg/decode-new.c.inc:1340 [0x0d] = X86_OP_ENTRY1(NOP, M,v) -- the 3DNow! group's residue after the carve: ModRM.reg 0, 1 and 2 publish PREFETCH under qualified ids and reg 3..7 is a reserved encoding Capstone does not name.  The PREFETCH observation is the pre-carve census of the reg=0/1 encodings */
     { 0x0000053du, "EMMS", QID_STATED, false,
@@ -1112,7 +1112,7 @@ static const QemuIdentRow qemu_ident_x86[] = {
     { 0x0000059bu, "0FB8", QID_STATED, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* NOT PUBLISHABLE -- target/i386/tcg/decode-new.c.inc:1435 is an X86_OP_GROUP* row -- decode_0FB8() replaces the entry and restamps .slot with the leaf's own __LINE__, so the only encoding that keeps this id is one no leaf claimed; that encoding leaves through `if (!decode.e.gen) goto unknown_op`, which is UPSTREAM of the identity publish, so the id reaches no plugin on any path and there is no instruction here to classify */
     { 0x0000059du, "UD", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
     { 0x0000059eu, "group8", QID_STATED, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* NOT PUBLISHABLE -- target/i386/tcg/decode-new.c.inc:1438 is an X86_OP_GROUP* row -- decode_group8() replaces the entry and restamps .slot with the leaf's own __LINE__, so the only encoding that keeps this id is one no leaf claimed; that encoding leaves through `if (!decode.e.gen) goto unknown_op`, which is UPSTREAM of the identity publish, so the id reaches no plugin on any path and there is no instruction here to classify */
     { 0x0000059fu, "BTC", QID_STATED, false,
@@ -1188,7 +1188,7 @@ static const QemuIdentRow qemu_ident_x86[] = {
     { 0x000005c7u, "PADDD", QID_VERIFIED, false,
       { .opcode = GEN_OP_VEC_ADD, .branch_type = BRANCH_NONE, .flags = MF_NONE, .lane_mask_kind = LANE_MASK_KIND_STATIC, .lane_parallel = true } },
     { 0x000005c8u, "UD", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
     { 0x000005d8u, "ARPL", QID_STATED, false,
       { .opcode = GEN_OP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x000005d9u, "MOV", QID_STATED, false,

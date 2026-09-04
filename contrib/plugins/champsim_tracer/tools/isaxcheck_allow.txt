@@ -1240,6 +1240,7 @@ x86_64 R-rd-missing cvtsi2sdq +v#
 x86_64 R-rd-missing cvtsi2ssl +v#
 x86_64 R-rd-missing cvtsi2ssq +v#
 x86_64 R-rd-missing cvtss2sd +v#
+x86_64 R-rd-missing ffree +st#
 x86_64 R-rd-missing ffreep +st#
 x86_64 R-rd-missing fxsave64 +fpsw
 x86_64 R-rd-missing fxsave +fpsw
@@ -1289,6 +1290,19 @@ x86_64 R-wr-missing ffree +fpsw
 # data; the boundary drops the operand outright (cap_x86_is_x87_tag_only,
 # disas/capstone.c), which the checker classes as an unmodelled operand.
 # Deletable when the tracer models the x87 tag word, which it does not.
+#
+# FFREE JOINED FFREEP AT PASS 72 (FINDING 72-E).  The boundary used to drop
+# the operand for FFREEP alone, "until proven mis-repaired"; the deletion
+# excursion is the proof, losing the REG_FPR of all 744 `ffree` encodings
+# because the repaired READ was its only supplier.  Asked directly for
+# ddc1: iced-x86 names ST1 as the explicit OPERAND and records NO access
+# (and gives `fadd`/`fld` real ST accesses on the same probe, so it models
+# x87 access and declines here), Capstone reports access == 0 for both
+# forms, and the SDM says the contents of ST(i) are not affected.  XED (R)
+# and LLVM MC (USE) dissent, recorded rather than resolved by silence:
+# neither model has a value for "named but not accessed".  The derivation
+# is in cap_x86_is_x87_tag_only()'s own comment.
+x86_64 Z-unmodelled-op ffree
 x86_64 Z-unmodelled-op ffreep
 x86_64 R-wr-missing fxrstor64 +fpsw
 x86_64 R-wr-missing fxrstor +fpsw

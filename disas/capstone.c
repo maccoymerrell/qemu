@@ -2729,13 +2729,68 @@ static bool cap_x86_is_ssp_dest(const char *mnem)
                     strcmp(mnem, "rdsspq") == 0);
 }
 
-/* FFREEP: tags st(i) empty and pops — the named register is neither
- * read nor written as data.  (FFREE reports the same access == 0 but
- * is untouched here until proven mis-repaired: the fields sweep that
- * established this family only ever observed FFREEP.) */
+/*
+ * FFREE / FFREEP: tags st(i) empty (and pops) — the named register is
+ * neither read nor written as data.  Capstone reports access == 0 for
+ * both, which downstream would repair into a fabricated access; drop
+ * the operand instead (the multi-byte-NOP treatment, for a register).
+ *
+ * FFREE WAS LEFT OUT, PROVISIONALLY, AND THE PROOF ARRIVED.  The line
+ * here used to read "FFREE reports the same access == 0 but is
+ * untouched until proven mis-repaired: the fields sweep that
+ * established this family only ever observed FFREEP."  FINDING 72-E is
+ * the proof: on the deletion excursion all 744 `ffree` encodings lose
+ * their REG_FPR, because the repaired READ is the ONLY supplier of it
+ * and the survivor table's own row for the register was withdrawn as a
+ * frozen-operand fabrication (24513de116).  93 of those are
+ * `ffree %st(1)`, whose loss the withdrawn row had been masking.
+ *
+ * THE REFERENCES, asked directly for DD C0+i (R13, ffree %st(1) =
+ * ddc1):
+ *
+ *   iced-x86   names ST1 as the explicit OPERAND and records NO
+ *              register access at all.  That is a POSITIVE statement,
+ *              not a gap: the same probe gives `fadd %st(1),%st`
+ *              ST0=READ_WRITE / ST1=READ and `fld %st(1)` ST1=READ, so
+ *              iced models x87 access and declines it here.
+ *   Capstone   access == 0, for ffree exactly as for ffreep.
+ *   XED        operand[0] ST(1) EXPLICIT with action R.
+ *   LLVM MC    operand[0] USE, numDefs=0.
+ *
+ * The dissent is recorded rather than resolved by silence, in the
+ * rdsspq row's practice.  It does not carry the decision, for two
+ * reasons the split itself shows: neither XED's action field nor
+ * LLVM's MCInstrDesc has a value for "named but not accessed", so R is
+ * what an unwritten explicit operand gets in both; and this tree has
+ * already ruled LLVM's uniform x87 operand attachment a modelling
+ * artifact (isax_srcenc_rows.py, X-X87OPERAND, "LLVM attaches the use
+ * anyway, uniformly across the x87 tables.  The tracer's set is the
+ * derived one.").
+ *
+ * What decides it is the architecture and the emulator, agreeing with
+ * the two decoders that record access per x87 register.  SDM, FFREE:
+ * "Sets the tag ... associated with register ST(i) to empty.  The
+ * contents of ST(i) and the FPU stack-top pointer (TOP) are not
+ * affected."  QEMU: helper_ffree_STN() writes env->fptags[] and reads
+ * nothing, and translate.c's own x87 classification says so twice --
+ * "`ffree` marks a tag word and never touches the value" and "`ffree`
+ * ... do not read an element at all.  Stating ST(0) for any of those
+ * would fabricate a source."
+ *
+ * So the register leaves the wire, and the 744 leave the bar with it:
+ * an ADJUDICATED CORRECTION under R15/R16, not a loss under R12.1 --
+ * a register the instruction does not access was never information.
+ * The st(i) field remains what the allowlist already calls it, a
+ * tag-word selector, and becomes a dependency again on the day the
+ * tracer models the x87 tag word.
+ *
+ * Revisit when Capstone starts reporting a real access for either
+ * form; verify with `capstone_workaround_probe` on ddc1 and dfc1.
+ */
 static bool cap_x86_is_x87_tag_only(const char *mnem)
 {
-    return mnem && strcmp(mnem, "ffreep") == 0;
+    return mnem && (strcmp(mnem, "ffree") == 0 ||
+                    strcmp(mnem, "ffreep") == 0);
 }
 
 /* Append @reg to the implicit write (@is_write) or read list of an x86

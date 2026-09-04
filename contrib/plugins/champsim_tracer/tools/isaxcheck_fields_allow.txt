@@ -3437,6 +3437,11 @@ x86_64 FM-miss-load fxsave
 x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
+# FFREE joined FFREEP at the boundary at PASS 72 (FINDING 72-E); the row
+# below gained its twin with it.  Boundary twins and the full derivation:
+# `x86_64 R-rd-missing ffree +st#` in isaxcheck_allow.txt and
+# cap_x86_is_x87_tag_only() in disas/capstone.c.
+x86_64 FR-rd-missing ffree +REG_FPR#
 x86_64 FR-rd-missing ffreep +REG_FPR#
 x86_64 FR-rd-phantom f2xm1 +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fabs +REG_FCSR,REG_FPR#

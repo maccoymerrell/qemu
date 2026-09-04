@@ -74,6 +74,17 @@ mipsel FB-flow-presence sdbbp cs-yes llvm-no
 mipsel FB-flow-presence syscall cs-yes llvm-no
 mipsel FB-ret-mismatch jr cs-ret
 
+# `jalr rd, rs` WITH AN EXPLICIT rd: the fields-layer twin of the boundary
+# row `mipsel R-wr-missing jalr +r#`, and it carries that row's whole
+# derivation.  MIPS32 writes GPR[rd] and nothing else; LLVM's JALR
+# MCInstrDesc carries `Defs = [RA]` for the one-operand spelling and
+# Capstone's MIPS tables come from LLVM, so the pair is one source, refuted
+# by the ISA manual and by QEMU's own `blink = rt`.  disas/capstone.c drops
+# the phantom, gated on the operand list naming a link target other than
+# $ra, so `jalr $t9` keeps its REG_LR write and `jalr $sp,$v0` does not.
+# Removable with its boundary twin.
+mipsel FR-wr-missing jalr +REG_LR
+
 # LLVM's LUXC1 / SUXC1 descriptions carry neither mayLoad nor mayStore;
 # the instructions are the unaligned-indexed FP load and store, and the
 # fields side records exactly one load / one store slot for them.  LLVM

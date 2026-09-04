@@ -9987,6 +9987,59 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * `subprojects/capstone`, not a system package, or run
          * `capstone_workaround_probe`; see docs/troubleshooting.rst.
          */
+        /*
+         * `jalr rd, rs` WITH AN EXPLICIT rd CARRIES A PHANTOM $ra WRITE.
+         *
+         * MIPS32 defines JALR as `GPR[rd] <- return_addr; PC <- GPR[rs]`,
+         * and rd defaults to 31 only when the assembly omits it.  The
+         * two-operand form names a different register outright:
+         * `jalr $t8,$t9` links into $t8 and leaves $ra alone.  QEMU says
+         * exactly that -- gen_compute_branch() sets `blink = rt` and the
+         * only link store it emits is `tcg_gen_movi_tl(cpu_gpr[blink],..)`,
+         * measured in the extractor's own dump on the sled encoding
+         * 0320c009 as `w reg=t8` with no `ra` beside it.
+         *
+         * LLVM's MCInstrDesc for the JALR opcode carries `Defs = [RA]`
+         * regardless, because the one-operand spelling is what its pattern
+         * is written for, and Capstone's MIPS tables are GENERATED FROM
+         * LLVM -- so the two decoders agreeing here is one source counted
+         * twice, not two references.  Both are refuted by the ISA manual
+         * and by QEMU at its own decode site, which is the same three-way
+         * standing the `bc1t` phantom $at write below was dropped on.
+         *
+         * Left in, it publishes a destination the instruction does not
+         * write, fabricating a WAW hazard on the return-address register
+         * across every hand-written indirect call that links elsewhere.
+         *
+         * GATED ON THE EXPLICIT rd, which is what tells the two spellings
+         * apart: `jalr $t9` decodes with rd == $ra and the implicit write
+         * is then the SAME register the encoding names, so it stays.  The
+         * write is dropped only when Capstone's own operand list says the
+         * link target is some other register.
+         *
+         * Revisit when LLVM stops modelling the default-rd spelling in the
+         * opcode's Defs, which is not expected; verify with `cstool -d
+         * mips32r2 09c02003` (bytes `09 c0 20 03`, `jalr $t8,$t9`) --
+         * fixed, $ra must NOT appear as a written register.
+         */
+        if (insn->id == MIPS_INS_JALR && n >= 2
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG
+            && out->operands[0].reg_id != MIPS_REG_RA
+            && (out->operands[0].access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+            uint8_t keep = 0;
+            for (uint8_t i = 0; i < out->n_regs_write; i++) {
+                if (out->regs_write_id[i] == MIPS_REG_RA) {
+                    continue;
+                }
+                if (keep != i) {
+                    memcpy(out->regs_write[keep], out->regs_write[i],
+                           QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                    out->regs_write_id[keep] = out->regs_write_id[i];
+                }
+                keep++;
+            }
+            out->n_regs_write = keep;
+        }
         {
             bool is_fp_cmp = g_str_has_prefix(insn->mnemonic, "c.");
             bool is_fp_br = insn->id == MIPS_INS_BC1T

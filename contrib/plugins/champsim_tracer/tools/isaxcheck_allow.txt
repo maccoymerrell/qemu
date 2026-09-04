@@ -44,6 +44,25 @@
 # MCInstrDesc, which is not expected.
 mipsel R-wr-missing bc1* +r#
 
+# `jalr rd, rs` WITH AN EXPLICIT rd.  MIPS32 defines JALR as
+# `GPR[rd] <- return_addr; PC <- GPR[rs]` and rd defaults to 31 only when
+# the assembly omits it, so `jalr $sp,$v0` links into $sp and leaves $ra
+# alone.  LLVM's MCInstrDesc carries `Defs = [RA]` on the JALR opcode
+# regardless -- its pattern is written for the one-operand spelling -- and
+# Capstone's MIPS tables are GENERATED FROM LLVM, so the two decoders
+# agreeing is one source counted twice rather than two references.  Both
+# are refuted by the ISA manual and by QEMU at its own decode site:
+# gen_compute_branch() sets `blink = rt` and emits exactly one link store,
+# measured in the extractor's own dump on 0320c009 as `w reg=t8` with no
+# `ra` beside it.  disas/capstone.c now drops the phantom, gated on
+# Capstone's own operand list naming a link target other than $ra -- so
+# `jalr $t9`, whose rd IS $ra, keeps the write.  Same class and same
+# disposition as the bc1* row above: keeping it would fabricate a WAW
+# hazard on the return-address register across every indirect call that
+# links elsewhere.  Removable when LLVM stops modelling the default-rd
+# spelling in the opcode's Defs, which is not expected.
+mipsel R-wr-missing jalr +r#
+
 # (The MIPS branch-and-link and JR / JALR target-read entries that used to
 # sit here were an artifact of this tool, not a disagreement.  Its call-site
 # suppression of LLVM's AArch64 ABI stack-pointer use spelled the non-

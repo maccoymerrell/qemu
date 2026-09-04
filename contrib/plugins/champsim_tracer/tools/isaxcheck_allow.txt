@@ -2244,12 +2244,23 @@ aarch64 R-wr-phantom msr +sysid
 aarch64 R-wr-phantom msrr +sysid
 
 # The FP control/status register the tracer models specifically (REG_FCSR):
-# AArch64 FPSR/FPCR reached through MSR/MRS, RISC-V fflags / frm / fcsr and
-# the FP-alias CSR forms.
+# AArch64 FPSR reached through MSR/MRS, RISC-V fflags / frm / fcsr and the
+# FP-alias CSR forms.
+#
+# FPCR IS A SECOND REGISTER AND NOW HAS A SECOND KEY.  It is the CONTROL
+# word, distinct from the accrued-status word FPSR, and it stopped sharing a
+# generic id with it when cap_aarch64_sysreg_class began routing it to
+# QEMU_PLUGIN_SYSREG_FPCW.  The argument is unchanged and is the block's own:
+# LLVM's MRS/MSR descriptions carry the system register as an IMMEDIATE, so
+# whichever register the tuple selects is a phantom to the reference.
 aarch64 R-rd-phantom mrrs +fcsr
 aarch64 R-rd-phantom mrs +fcsr
 aarch64 R-wr-phantom msr +fcsr
 aarch64 R-wr-phantom msrr +fcsr
+aarch64 R-rd-phantom mrrs +fpcw
+aarch64 R-rd-phantom mrs +fpcw
+aarch64 R-wr-phantom msr +fpcw
+aarch64 R-wr-phantom msrr +fpcw
 
 # The other two system registers the tracer models specifically, reached by
 # the same MRS/MSR pair once the sweep covered the sysreg selector in [9:5]

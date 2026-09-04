@@ -4853,7 +4853,8 @@ EncCorpus g_src_enc{"CST_SRC_ENC_DUMP", "#isa\tencoding\tmnem\tsrc\n"};
 EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
-    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ\n"};
+    "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ"
+    "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -4951,7 +4952,8 @@ void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
  * encoding UNREACHED downstream, which is the honest reading.
  */
 void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
-                       uint8_t size, const char *mnem)
+                       uint8_t size, const char *mnem,
+                       const struct qemu_plugin_insn_info *info)
 {
     if (!f || !bytes || !size || !g_src_mech.live()) {
         return;
@@ -5088,6 +5090,76 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
      */
     g_string_append_c(g, '\t');
     g_string_append(g, state_name(m->wstate_q));
+    /*
+     * THE CLASSIFICATION, six columns, and why a corpus without them
+     * cannot answer a containment question.
+     *
+     * Every column to the left of these describes the REGISTERS an
+     * encoding names -- what QEMU stated, what the wire published, what
+     * survived.  A commit that changes what an encoding IS moves none of
+     * them: give `vmcall` a generic opcode it did not have, or a branch
+     * type, or a lane-mask kind, and its source and destination lists
+     * are the same lists they were.  FINDING 70-C measured exactly that
+     * -- 25,216 encodings whose classification moved, read back through
+     * this corpus as MOVED=0, because the corpus had no column that
+     * could hold the change.  A containment claim over a population is
+     * only as wide as its widest column, and "nothing moved" from a
+     * corpus blind to the field that moved is the silent false success
+     * this tree keeps relearning.
+     *
+     * CFLAGS is the classification's MnemonicFlags AS THE ENCODING
+     * CARRIES THEM -- the booleans the flags word set on this insn --
+     * rather than the table's raw bits, because the table is keyed on a
+     * Capstone id and the row is keyed on an encoding, and a refiner
+     * runs in between.
+     *
+     * REFINE is the .dep_refine classifier's NAME, read through
+     * dep_refine_name_for(): a table lookup with no side effect, which
+     * is what makes it safe on the translation path.
+     */
+    g_string_append_c(g, '\t');
+    g_string_append(g, generic_opcode_name_or_unknown(f->opcode));
+    g_string_append_c(g, '\t');
+    g_string_append(g, branch_type_name_or_unknown(f->branch_type));
+    g_string_append_c(g, '\t');
+    {
+        const char *sep = "";
+        /*
+         * NOT `static`.  A function-local static with runtime initializers
+         * is initialized ONCE, on the first call, and every later row then
+         * reports the FIRST instruction's flags.  Measured before this
+         * comment existed: 6,416,527 x86_64 rows, every one of them
+         * `imm,regdeps`, from a column whose whole purpose is to vary.
+         */
+        const struct { bool on; const char *name; } cf[] = {
+            { f->branch_conditional, "cond"     },
+            { f->writes_int_flags,   "wrflags"  },
+            { f->is_atomic,          "atomic"   },
+            { f->has_immediate,      "imm"      },
+            { f->has_vec_lanes,      "veclanes" },
+            { f->has_reg_deps,       "regdeps"  },
+            { f->has_addr_deps,      "addrdeps" },
+            { f->refiner_dep_stated, "refstated"},
+        };
+        for (unsigned k = 0; k < G_N_ELEMENTS(cf); k++) {
+            if (cf[k].on) {
+                g_string_append_printf(g, "%s%s", sep, cf[k].name);
+                sep = ",";
+            }
+        }
+        if (!*sep) {
+            g_string_append_c(g, '-');
+        }
+    }
+    g_string_append_c(g, '\t');
+    {
+        const char *r = info ? dep_refine_name_for(info) : nullptr;
+        g_string_append(g, r ? r : "-");
+    }
+    g_string_append_c(g, '\t');
+    g_string_append_printf(g, "%u", (unsigned)f->lane_mask_kind);
+    g_string_append_c(g, '\t');
+    g_string_append_c(g, f->lane_parallel ? '1' : '0');
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);

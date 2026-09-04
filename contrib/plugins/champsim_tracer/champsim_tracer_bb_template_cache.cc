@@ -1707,7 +1707,8 @@ BBTemplate *TemplateStore::create_tb_template(
             dump_src_mech_row(tmpl->insn_pcs[i], &scratch[i].f,
                               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
                               insn_sizes[i],
-                              insn_info ? insn_info[i].mnemonic : nullptr);
+                              insn_info ? insn_info[i].mnemonic : nullptr,
+                              insn_info ? &insn_info[i] : nullptr);
             srcs[i] = &scratch[i].f;
             name_srcs[i] = with_names ? &nscratch[i].rn : nullptr;
         }

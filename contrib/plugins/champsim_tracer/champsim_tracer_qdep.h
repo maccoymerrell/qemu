@@ -1050,7 +1050,8 @@ void dump_opc_enc_row(const InsnFields *f, const uint8_t *bytes,
 bool src_mech_corpus_live(void);
 
 void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
-                       uint8_t size, const char *mnem);
+                       uint8_t size, const char *mnem,
+                       const struct qemu_plugin_insn_info *info);
 
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the

@@ -659,6 +659,28 @@ static bool trans_addi(DisasContext *ctx, arg_addi *a)
      */
     if (a->imm == 0 && a->rd == a->rs1 && a->rs1 != 0) {
         insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[a->rs1]));
+        /*
+         * AND rd, WHICH THE SAME ELISION TAKES.
+         *
+         * The comment above says the read "goes with the write" and then
+         * states only the read.  `mv a0,a0` writes a0 -- with its own value,
+         * which is still a write the encoding names in rd -- and because the
+         * whole chain dest_gpr() -> tcg_gen_addi_tl(dest,src,0) ->
+         * gen_set_gpr() collapses to a mov of a register onto itself, TCG
+         * emits nothing and QEMU's ordered WRITE list for the instruction is
+         * EMPTY.  A consumer cannot tell `mv a0,a0` from an instruction that
+         * writes no register at all.  R7.3/R15 rule the absence a lowering
+         * choice; R16 records the dependency because the ISA defines it.
+         *
+         * Stated as the env RANGE -- gpr[] IS the register's storage and
+         * translate.c's own regfile declaration names it downstream.  rd == 0
+         * cannot reach here: rd == rs1 and rs1 != 0.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_stated_write_env(
+            offsetof(CPURISCVState, gpr[a->rd]),
+            sizeof(((CPURISCVState *)0)->gpr[0]));
     }
     return gen_arith_imm_fn(ctx, a, EXT_NONE, tcg_gen_addi_tl, gen_addi2_i128);
 }

@@ -294,6 +294,21 @@ static bool trans_fsgnj_d(DisasContext *ctx, arg_fsgnj_d *a)
          */
         if (a->rd == a->rs1) {
             insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_fpr[a->rs1]));
+            /*
+             * AND fd, WHICH THE SAME ELISION TAKES.  The comment above says
+             * "and no write either" and then states only the read: QEMU's
+             * ordered WRITE list for `fmv.d f0,f0` is EMPTY, so a consumer
+             * cannot tell it from an instruction that writes no register.
+             * R7.3/R15 rule the absence a lowering choice; R16 records the
+             * dependency because the ISA defines it.  Stated as the env
+             * RANGE -- fpr[] IS the register's storage and translate.c's own
+             * regfile declaration names it downstream.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_note_stated_write_env(
+                offsetof(CPURISCVState, fpr[a->rd]),
+                sizeof(((CPURISCVState *)0)->fpr[0]));
         }
     } else {
         TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);

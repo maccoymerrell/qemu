@@ -91,7 +91,16 @@ def load(path):
                 continue
             isa, enc, mnem = f[0], f[1].strip().lower(), f[2]
             src = f[3] if len(f) > 3 else ""
-            regs = frozenset(r for r in src.replace(" ", "").split(",") if r)
+            # `-` IS THE CORPUS'S SPELLING OF "NO SOURCES", NOT A REGISTER.
+            # Read as a name it became a member of the set, so an encoding
+            # that went from publishing nothing to publishing something
+            # scored as having LOST the register `-` -- and the report
+            # printed `LOST=-`, which is the same eight characters this file
+            # prints for "lost nothing".  The x86_64 whole-population fold
+            # made 1,179 of them at once; before it, no arm had ever moved an
+            # encoding off the empty set and the defect had no occupant.
+            regs = frozenset(r for r in src.replace(" ", "").split(",")
+                             if r and r != "-")
             key = (isa, enc)
             if key in per and per[key][1] != regs:
                 conflicts.append("CONFLICT %s %s: two disagreeing rows"

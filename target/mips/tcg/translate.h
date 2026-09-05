@@ -60,6 +60,14 @@ typedef struct DisasContext {
      * See mips_ident() in translate.c.
      */
     uint16_t decode_ident;
+    /*
+     * The identity above is the emulator's OWN STATED DECISION, and so it
+     * survives the raise that follows it.  Set only by
+     * mips_ident_declined(), beside the three
+     * insn_dataflow_note_translation_refused() sites.  See mips_ident_fault()
+     * in translate.c for why the general case is the opposite.
+     */
+    bool decode_ident_stated;
 } DisasContext;
 
 #define DISAS_STOP       DISAS_TARGET_0

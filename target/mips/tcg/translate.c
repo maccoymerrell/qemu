@@ -1524,8 +1524,55 @@ static void mips_ident(DisasContext *ctx, MipsIdent id)
  * is what a correctly decoded instruction DOES: EXCP_SYSCALL,
  * EXCP_BREAK, EXCP_TRAP, EXCP_OVERFLOW, EXCP_SEMIHOST, EXCP_DBp.
  */
+/*
+ * A REFUSAL IS A DECISION, AND A DECISION HAS A NAME.
+ *
+ * mips_ident_fault() below poisons the identity slot on the exceptions
+ * QEMU raises because an encoding is unavailable, and that is right for
+ * the case it was written for: a MIPS availability check -- check_insn()
+ * and its siblings -- generates the exception and translation CONTINUES,
+ * so a label committed to further in would name a decision the emulator
+ * never took.
+ *
+ * THREE SITES ARE NOT THAT CASE, and they are the three that already say
+ * so out loud.  The OPC_MDMX arm and the two COP2 arms do not fail a check
+ * on their way somewhere; the arm IS the decision, it is terminal, and it
+ * states the decision to the dataflow corpus in the very next line via
+ * insn_dataflow_note_translation_refused().  Poisoning those left the
+ * consumer with a fact stated on one channel and withheld on the other:
+ * `refused=1` in the corpus and `decode_id=0x00000000 rule ?` on the wire,
+ * for the same instruction, from the same arm.
+ *
+ * MEASURED, one encoding on a CPU without the ASE:
+ *     qemu-mipsel -cpu 24Kf, word 0x7810c85e
+ *     decode_id=0x00000000 insn_id=152 and.v publishes=GEN_OP_VEC_LOGIC
+ *                                            <- NO IDENTITY EXPORTED
+ * QEMU had committed to `translate_mips/OPC_MDMX` before raising, and the
+ * plugin's identity table has carried a row for it (0x18c27403) all along;
+ * nothing was missing but the permission to publish it.
+ *
+ * WHAT THIS DOES NOT DO.  It does not make the raise's dataflow into the
+ * instruction's, and it does not weaken the poison anywhere else: an arm
+ * that has not called this keeps the old behaviour exactly.  It says only
+ * that a translator which DECLINED an encoding decided something, and that
+ * the name of that decision is publishable -- which is what makes the
+ * withheld dataflow readable as an unavailable ASE rather than as an
+ * instruction nobody can key on.
+ */
+static void mips_ident_declined(DisasContext *ctx)
+{
+    if (ctx->decode_ident != MIPS_ID_NONE &&
+        ctx->decode_ident != MIPS_ID_FAULTED) {
+        ctx->decode_ident_stated = true;
+    }
+}
+
 static void mips_ident_fault(DisasContext *ctx, int excp)
 {
+    /* A stated refusal outranks the poison; see mips_ident_declined(). */
+    if (ctx->decode_ident_stated) {
+        return;
+    }
     switch (excp) {
     case EXCP_RI:
     case EXCP_CpU:
@@ -19636,6 +19683,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
                 sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
             insn_dataflow_note_translation_refused();
+            mips_ident_declined(ctx);
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
@@ -19665,6 +19713,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
                 sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
             insn_dataflow_note_translation_refused();
+            mips_ident_declined(ctx);
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
@@ -19902,6 +19951,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
          * Capture only; the note emits, alters and suppresses no op.
          */
         insn_dataflow_note_translation_refused();
+        mips_ident_declined(ctx);
         MIPS_INVAL("major opcode");
         gen_reserved_instruction(ctx);
         break;
@@ -20065,6 +20115,7 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
      */
     was_slot = is_slot != 0;
     ctx->decode_ident = MIPS_ID_NONE;
+    ctx->decode_ident_stated = false;
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = decode_isa_nanomips(env, ctx);

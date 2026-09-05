@@ -316,6 +316,45 @@
 
 #define UNKNOWN_OPCODE ((X86OpEntry) {})
 
+/*
+ * THE SAME "NOT IMPLEMENTED HERE", BUT SAYING HOW LONG THE INSTRUCTION IS.
+ *
+ * UNKNOWN_OPCODE names no operands, so decode_insn() decodes none, so a
+ * ModRM byte's SIB and displacement are never fetched and s->pc stops at
+ * the ModRM.  The translation is still refused -- .gen is NULL and the
+ * caller goes to unknown_op exactly as before -- but everything that reads
+ * the instruction's LENGTH afterwards reads a short one: the ILLOPC log
+ * line, the translator's insn record, and every TCG plugin, which is handed
+ * a truncated copy of the instruction's own bytes.
+ *
+ * MEASURED (FINDING 77-A / 80-D).  `0F C7` group 9 sends every `vmptrst`,
+ * `vmxon`, `xsaves` and `clrssbsy` encoding to decode_group9()'s unknown
+ * arm.  Of the thirty ModRM shapes that reach it, the six with mod=00 and
+ * rm not 4 or 5 -- the only ones whose whole instruction IS opcode plus
+ * ModRM -- were reported at their true length and the other twenty-four
+ * short, by one SIB byte, one disp8 or four disp32 bytes.  QEMU's own
+ * `-d unimp` line is the witness: `40 0f c7 78 00` logs as
+ * `ILLOPC: ... 40 0f c7 78`.
+ *
+ * X86_TYPE_nop is the type that already means "modrm operand decoded but
+ * not fetched", and NoLoadEA keeps the address from being materialised, so
+ * this consumes the address bytes and emits nothing.  The three groups
+ * using it are the three whose unknown arm is reached with a ModRM byte in
+ * hand: every encoding under them addresses an operand through it, whether
+ * or not this build implements the opcode.  gen_lea_modrm_0() parses; it
+ * does not emit, and X86_SPECIAL_NoLoadEA says so for the path that would.
+ *
+ * NOT A CHANGE OF BEHAVIOUR THE GUEST CAN OBSERVE: #UD is raised at the
+ * same RIP either way -- gen_exception() uses eip_cur, the address of the
+ * faulting instruction, and the fault does not report a length.  What
+ * changes is what QEMU says the instruction WAS.
+ */
+#define UNKNOWN_OPCODE_MODRM ((X86OpEntry) {                      \
+    .op0 = X86_TYPE_nop, .s0 = X86_SIZE_v,                        \
+    .special = X86_SPECIAL_NoLoadEA,                              \
+    .slot = __LINE__,                                             \
+})
+
 static uint8_t get_modrm(DisasContext *s, CPUX86State *env)
 {
     if (!s->has_modrm) {
@@ -379,7 +418,13 @@ static void decode_group9(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
     } else if (op == 1) {
         *entry = REX_W(s) ? cmpxchg16b : cmpxchg8b;
     } else {
-        *entry = UNKNOWN_OPCODE;
+        /*
+         * mod != 3 here -- the first arm took the register forms -- so the
+         * ModRM byte addresses memory in every encoding that reaches this,
+         * and the address bytes are part of the instruction whether or not
+         * this build implements the opcode.
+         */
+        *entry = UNKNOWN_OPCODE_MODRM;
     }
 }
 
@@ -1535,7 +1580,7 @@ static void decode_group1A(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
     int op = (get_modrm(s, env) >> 3) & 7;
     if (op != 0) {
         /* could be XOP prefix too */
-        *entry = UNKNOWN_OPCODE;
+        *entry = UNKNOWN_OPCODE_MODRM;
     } else {
         X86_OP_SET_GEN(entry, POP);
         /* The address must use the value of ESP after the pop.  */
@@ -1620,7 +1665,7 @@ static void decode_group11(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 {
     int op = (get_modrm(s, env) >> 3) & 7;
     if (op != 0) {
-        *entry = UNKNOWN_OPCODE;
+        *entry = UNKNOWN_OPCODE_MODRM;
     } else {
         X86_OP_SET_GEN(entry, MOV);
     }

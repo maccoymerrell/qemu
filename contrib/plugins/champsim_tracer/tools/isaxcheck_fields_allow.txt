@@ -7866,7 +7866,13 @@ x86_64 FU-unclassified ud2
 #     riscv64   86889 rows md5 587be690d1329ca667ebd0b49834a7dc
 #     mipsel   548886 rows md5 a630d6a80e1fc161e0d5560de3b1ff8c
 #
-# FOUR CLASSES GET NO ROWS, AND ARE LISTED WITH THEIR SIGNATURES ANYWAY.
+# FOUR CLASSES GOT NO ROWS WHEN THIS BLOCK WAS LAST GENERATED, AND ARE LISTED
+# WITH THEIR SIGNATURES ANYWAY.  Two of the four are since RESOLVED, marked
+# below; the two corrections are BY HAND, because regenerating this block
+# needs all eight `--srcenc` arms over a corpus captured at THIS tip and the
+# banked corpus predates the CP-H fold.  The counts and md5s above are the
+# banked corpus's and are unchanged by the correction; a full regeneration is
+# owed at the next tip-captured corpus.
 # An allowlist row asserts that the reference is wrong or silent and the
 # TRACER IS RIGHT.  Where the tracer is the one that is wrong, a row would
 # launder a defect, so those signatures stay UNALLOWED with a named blocker
@@ -7875,14 +7881,18 @@ x86_64 FU-unclassified ud2
 #   mipsel  M-DSPIMM  31 sigs  FINDING 71-A  QEMU's MIPS DSP dispatchers
 #                              hoist gen_load_gpr above the opcode switch,
 #                              so an IMMEDIATE field is read as a GPR
-#   mipsel  M-LSA      1 sig   FINDING 70-A  an R6 mnemonic carrying the
-#                              24Kf PMON translation's dataflow
+#   mipsel  M-LSA      1 sig   RESOLVED, FINDING 70-A -- the four bytes are
+#                              TWO INSTRUCTIONS.  On a model that is neither
+#                              R6 nor MSA-bearing, SPECIAL-0x05 is not `lsa`
+#                              at all: QEMU dispatches it to PMON, whose
+#                              helper reads $a0, and the surplus register IS
+#                              that read.  The tracer is the right side, so
+#                              the row is allowlisted with its citations --
+#                              see the M-LSA block below
 #   aarch64 A-FROZEN   1 sig   FINDING 71-B  a FIXED survivor row froze the
 #                              deriving corpus's own base register
-#   x86_64  X-SELFRELOAD 4 sigs             QEMU re-reads the control word
-#                              the instruction just wrote, to re-derive its
-#                              softfloat state; the edge is on the PREVIOUS
-#                              value and the architecture has no such input
+#   x86_64  X-SELFRELOAD 4 sigs  RESOLVED at cb26c3e774 -- a read of bytes the
+#                              same call unconditionally wrote is not an input
 #
 # HOW TO REGENERATE:
 #   isax_srcenc_gate.sh run <build> <out> <corpus>
@@ -10901,10 +10911,51 @@ riscv64 SR-rd-phantom wfi +REG_SYS
 #     mipsel SR-rd-phantom shrl.ph +REG_GPR#,REG_SYSEXC
 #     mipsel SR-rd-phantom shrl.qb +REG_GPR#,REG_SYSEXC
 
-# --- M-LSA: an R6 mnemonic carrying the 24Kf PMON translation's dataflow -- FINDING 70-A.
-#     1 signature(s), 89 encodings, NOT ALLOWLISTED.
-#     An allowlist row asserts the tracer is right; these stay red.
-#     mipsel SR-rd-phantom lsa +REG_GPR#
+# --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs
+#     the other one -- FINDING 70-A, RESOLVED.
+#     1 signature(s), 89 encodings at this tip.
+#
+#     SR-rd-phantom lsa +REG_GPR#     n=89     representative 05000200
+#       cs{lsa $zero, $zero, $v0, 1}  llvm{lsa $zero, $zero, $2, 1}
+#       wireRD{REG_GPR2,REG_GPR4}     llvmRD{REG_GPR2}
+#
+# THE SURPLUS IS ONE REGISTER, $a0, AND IT IS QEMU'S OWN STATEMENT.  SPECIAL
+# function 0x05 is decoded in three different places depending on the model:
+# rel6.decode:21 and msa.decode:51 both spell it LSA, and a model that is
+# NEITHER R6 nor MSA-bearing reaches translate.c:17241 `case OPC_PMON` -- the
+# PMON entry point, marked "unofficial" at translate.c:253, which emits
+# gen_helper_pmon().  That helper's body reads env->active_tc.gpr[4] on three
+# of its arms (op_helper.c:238, :247, :253).  REG_GPR4 is that read.  The
+# tracer publishes what the emulator executes.
+#
+# WHY THE REFERENCE DISAGREES, AND WHY THAT IS NOT A TRACER FINDING.  LLVM MC
+# decodes the word as `lsa` because `lsa` is what SPECIAL-0x05 is in MIPS32R6,
+# and it is not asked which model the corpus was captured on.  The two sides
+# are describing DIFFERENT INSTRUCTIONS at the same address, which this gate
+# already has a name for -- a JOIN FAILURE, "not a tracer finding", and a row
+# "no dataflow change can close" (see the join commentary in
+# isax_srcenc_gate.sh).  The join test does not catch this one because it
+# compares the two decoders' MNEMONICS and Capstone is the defective side:
+# Capstone 6.0 prints `lsa` in MIPS32 and MIPS32R2 mode too, where SPECIAL-0x05
+# is unallocated (exec122/CAPSTONE_PROBE.txt, reported upstream and not worked
+# around).  With both decoders saying `lsa` the join succeeds and the register
+# difference is scored as dataflow.
+#
+# THE DIRECTION IS DECIDED BY CONSULTING THE MODEL, NOT BY REFUSING THE ROW.
+# The row was left NOT ALLOWLISTED for four passes on the reasoning that "an
+# allowlist row asserts the tracer is right" -- written before anyone had
+# checked whether it is.  It is: op_helper.c:233 is the witness.  Refusing the
+# row instead would assert a permanent tracer defect that no dataflow change
+# can ever close, and it would state a per-model difference as tracer scope,
+# which the all-MIPS-models ruling forbids.  The difference is a QEMU-modelling
+# fact and it is recorded here as one, with the model named.
+#
+# SELF-RETIRING FROM EITHER END.  A Capstone that stops decoding SPECIAL-0x05
+# in a pre-R6 mode makes the join fail on the mnemonic and this row goes dead;
+# so does a corpus captured on an R6 or MSA-bearing model, where the word IS
+# `lsa` and gpr[4] is never read.  Both are the dead-allowlist-rule detector's
+# business, and it is watching this row.
+mipsel SR-rd-phantom lsa +REG_GPR#
 
 # --- M-MERGE: the unaligned loads merge into their destination, so the destination is a source.
 #     8 signature(s), 8064 encodings at this tip.

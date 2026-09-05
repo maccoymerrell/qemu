@@ -9680,12 +9680,24 @@ mipsel SR-rd-phantom * +REG_SYSEXC
 #   aarch64    8  A-SYSSEL (2), A-ERET (2), A-SATQC (2), A-MISC (2)
 #   mipsel     3  M-MT (1), M-CP0 (2)
 #
-# TWO CLASSES GET NO ROWS AND STAY RED, with the blocker named -- the same
-# two the fields block leaves red, seen through the other arm:
+# THE CLASSES THAT USED TO GET NO ROWS.  Both are now resolved and both have
+# rows; the line is kept rather than deleted because a class that was red for
+# several passes and then went green is worth being able to find:
 #
-#   x86_64  X-SELFRELOAD  4 sigs  QEMU re-reads the control word the
-#                                 instruction just wrote
-#   mipsel  M-LSA         1 sig   FINDING 70-A
+#   x86_64  X-SELFRELOAD  4 sigs  RESOLVED at cb26c3e774 -- a read of bytes
+#                                 the same call unconditionally wrote is not
+#                                 an input
+#   mipsel  M-LSA         1 sig   RESOLVED, FINDING 70-A -- the four bytes are
+#                                 two instructions and on a model that is
+#                                 neither R6 nor MSA-bearing QEMU runs PMON,
+#                                 whose helper reads $a0.  See the M-LSA block
+#                                 below for the citations
+#
+# THIS HEADER IS GENERATOR-PRODUCED and the two lines above were corrected by
+# hand, because regenerating it needs all eight `--srcenc` arms over a corpus
+# captured at THIS tip and the banked corpus predates the CP-H fold.  The
+# counts and md5s below are the banked corpus's and are unchanged by that
+# correction; a full regeneration is owed at the next tip-captured corpus.
 #
 # CORPUS: exec128/srcencorp/tip128, sled at
 #         74012e5de41db3bab12d9d7aa3fa361da62c8445
@@ -12627,10 +12639,51 @@ riscv64 SR-rd-phantom vssub.vx +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
 
-# --- M-LSA: Capstone answers an R6-only mnemonic in a pre-R6 mode, over QEMU's PMON dataflow -- FINDING 70-A.
-#     1 signature(s), 89 encodings, NOT ALLOWLISTED.
-#     An allowlist row asserts the tracer is right; these stay red.
-#     mipsel SR-rd-phantom lsa +REG_GPR#
+# --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs
+#     the other one -- FINDING 70-A, RESOLVED.
+#     1 signature(s), 89 encodings at this tip.
+#
+#     SR-rd-phantom lsa +REG_GPR#     n=89     representative 05000200
+#       cs{lsa $zero, $zero, $v0, 1}  llvm{lsa $zero, $zero, $2, 1}
+#       wireRD{REG_GPR2,REG_GPR4}     llvmRD{REG_GPR2}
+#
+# THE SURPLUS IS ONE REGISTER, $a0, AND IT IS QEMU'S OWN STATEMENT.  SPECIAL
+# function 0x05 is decoded in three different places depending on the model:
+# rel6.decode:21 and msa.decode:51 both spell it LSA, and a model that is
+# NEITHER R6 nor MSA-bearing reaches translate.c:17241 `case OPC_PMON` -- the
+# PMON entry point, marked "unofficial" at translate.c:253, which emits
+# gen_helper_pmon().  That helper's body reads env->active_tc.gpr[4] on three
+# of its arms (op_helper.c:238, :247, :253).  REG_GPR4 is that read.  The
+# tracer publishes what the emulator executes.
+#
+# WHY THE REFERENCE DISAGREES, AND WHY THAT IS NOT A TRACER FINDING.  LLVM MC
+# decodes the word as `lsa` because `lsa` is what SPECIAL-0x05 is in MIPS32R6,
+# and it is not asked which model the corpus was captured on.  The two sides
+# are describing DIFFERENT INSTRUCTIONS at the same address, which this gate
+# already has a name for -- a JOIN FAILURE, "not a tracer finding", and a row
+# "no dataflow change can close" (see the join commentary in
+# isax_srcenc_gate.sh).  The join test does not catch this one because it
+# compares the two decoders' MNEMONICS and Capstone is the defective side:
+# Capstone 6.0 prints `lsa` in MIPS32 and MIPS32R2 mode too, where SPECIAL-0x05
+# is unallocated (exec122/CAPSTONE_PROBE.txt, reported upstream and not worked
+# around).  With both decoders saying `lsa` the join succeeds and the register
+# difference is scored as dataflow.
+#
+# THE DIRECTION IS DECIDED BY CONSULTING THE MODEL, NOT BY REFUSING THE ROW.
+# The row was left NOT ALLOWLISTED for four passes on the reasoning that "an
+# allowlist row asserts the tracer is right" -- written before anyone had
+# checked whether it is.  It is: op_helper.c:233 is the witness.  Refusing the
+# row instead would assert a permanent tracer defect that no dataflow change
+# can ever close, and it would state a per-model difference as tracer scope,
+# which the all-MIPS-models ruling forbids.  The difference is a QEMU-modelling
+# fact and it is recorded here as one, with the model named.
+#
+# SELF-RETIRING FROM EITHER END.  A Capstone that stops decoding SPECIAL-0x05
+# in a pre-R6 mode makes the join fail on the mnemonic and this row goes dead;
+# so does a corpus captured on an R6 or MSA-bearing model, where the word IS
+# `lsa` and gpr[4] is never read.  Both are the dead-allowlist-rule detector's
+# business, and it is watching this row.
+mipsel SR-rd-phantom lsa +REG_GPR#
 
 # --- M-MERGE: the unaligned loads merge into their destination, so the destination is a source.
 #     4 signature(s), 7832 encodings at this tip.

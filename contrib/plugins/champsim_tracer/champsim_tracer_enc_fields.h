@@ -31,6 +31,19 @@
  * field this table does not define is refused by the generator, which parses
  * THIS FILE for the legal names so the two cannot drift.
  *
+ * A FIELD'S POSITION IS NOT ITS LEGALITY.  Where `ws` sits is one question
+ * and whether the word in hand PUTS A REGISTER THERE is another, and this
+ * file used to answer only the first.  Every MSA instruction reaches QEMU
+ * through the single decode rule `translate_mips/OPC_MDMX`, so a row keyed
+ * on that rule fires on every MSA instruction there is -- and across the I5,
+ * I8, I10, BIT, ELM, 2R and MI10 formats bits 20:16 hold an IMMEDIATE, a df
+ * selector or an opcode subfield.  14,975 mipsel encodings published a
+ * vector register no field of theirs selects, and LLVM refutes every one.
+ * The second question is answered by champsim_tracer_enc_formats_mips.h,
+ * generated from QEMU's own `target/mips/tcg/msa.decode`, and @qual is how a
+ * field row reaches it: a field with no qualifier is legal NOWHERE, so a
+ * field cannot be added here without one.
+ *
  * A FIELD IS DEFINED ONLY AT ONE INSTRUCTION WIDTH.  @insn_bytes is part of
  * the definition, not a guard bolted on: `ws` is bits 15:11 OF A 32-BIT MIPS
  * WORD, and extracting those bits from a 2-byte or 6-byte encoding is reading
@@ -65,6 +78,14 @@ typedef enum {
 } SrcEncFieldId;
 
 /*
+ * The per-ISA format tables, which say which of those fields a given
+ * instruction word actually encodes a register of the field's bank in.
+ * Generated from the target's own decodetree by tools/gen_enc_formats.py;
+ * included AFTER the ids because a row's answer is a mask over them.
+ */
+#include "champsim_tracer_enc_formats_mips.h"
+
+/*
  * ONE INSTRUCTION'S ENCODING, carried down to the dependency model.
  *
  * The model is handed FIELDS, never the instruction -- that is deliberate and
@@ -91,6 +112,15 @@ typedef struct {
     uint8_t     width;
     uint8_t     bank_base;   /* the generic id the field's value indexes  */
     uint8_t     bank_n;      /* how many registers that bank has          */
+    /*
+     * THE FORMAT QUESTION, and every field must answer it.  Given the
+     * instruction word, which fields does THIS pattern encode a register of
+     * the field's own bank in?  One bit per SrcEncFieldId.  A field with no
+     * qualifier is legal nowhere -- a position whose formats are unstated is
+     * a position no register may be read out of, which is a refusal and not
+     * a guess.
+     */
+    uint8_t   (*qual)(uint32_t word);
     const char *name;        /* the spelling the ROLE column prints       */
 } SrcEncFieldDef;
 
@@ -100,19 +130,29 @@ typedef struct {
  *
  *     wt = 20:16    ws = 15:11    wd = 10:6
  *
- * verified against the tree's own MSA fixture, `nori.b $w1,$w25,0x10` =
- * 0x7810c85e: bits 15:11 = 25 ($w25, the source), bits 10:6 = 1 ($w1, the
- * destination), bits 23:16 = 0x10 (the immediate).  The I8 formats have no
- * wt -- their bits 23:16 are the immediate -- so a role naming `wt` on an I8
- * encoding is a numeric coincidence and the census's ambiguity report is what
- * catches it, not a per-format table here: the census scores a field against
- * an OBSERVED register number, and a format table would let this file decide
- * an answer the measurement is supposed to give.
+ * verified against the tree's own MSA fixture 0x7810c85e, which LLVM MC
+ * names `and.v $w1,$w25,$w16`: bits 20:16 = 16 ($w16), bits 15:11 = 25
+ * ($w25), bits 10:6 = 1 ($w1).  It was cited here as `nori.b $w1,$w25,0x10`
+ * -- an I8 mnemonic read off a VEC encoding, which is the very confusion the
+ * qualifier below exists to remove: `nori.b $w1,$w25,16` is 0x7a10c840 and
+ * its bits 20:16 are four bits of the immediate and one bit of the opcode.
+ *
+ * WHICH FIELDS ARE REGISTERS IS A FORMAT FACT, and it is taken from the
+ * format table rather than deferred to the census.  The deferral was written
+ * down here -- "a format table would let this file decide an answer the
+ * measurement is supposed to give" -- and it cannot work, because no
+ * measurement over encodings can separate the two cases: an I8 immediate
+ * that spells 14 is bit-for-bit a 3R naming $w14.  The census's ambiguity
+ * report catches `ws == wd` coincidences and never asks whether the position
+ * holds a register at all.
  */
 static const SrcEncFieldDef g_src_enc_fields[] = {
-    { SRC_ENC_FIELD_MIPS_WT, TRACE_ISA_MIPS, 4, 16, 5, REG_VEC0, 32, "wt" },
-    { SRC_ENC_FIELD_MIPS_WS, TRACE_ISA_MIPS, 4, 11, 5, REG_VEC0, 32, "ws" },
-    { SRC_ENC_FIELD_MIPS_WD, TRACE_ISA_MIPS, 4,  6, 5, REG_VEC0, 32, "wd" },
+    { SRC_ENC_FIELD_MIPS_WT, TRACE_ISA_MIPS, 4, 16, 5, REG_VEC0, 32,
+      src_enc_format_legal_mips, "wt" },
+    { SRC_ENC_FIELD_MIPS_WS, TRACE_ISA_MIPS, 4, 11, 5, REG_VEC0, 32,
+      src_enc_format_legal_mips, "ws" },
+    { SRC_ENC_FIELD_MIPS_WD, TRACE_ISA_MIPS, 4,  6, 5, REG_VEC0, 32,
+      src_enc_format_legal_mips, "wd" },
 };
 
 /* The little-endian word an @n-byte encoding spells, or false if @n is not
@@ -146,8 +186,9 @@ static inline const SrcEncFieldDef *src_enc_field_def(uint8_t id)
 /*
  * The generic register @d's field selects out of THIS encoding, or REG_NONE.
  * REG_NONE is returned for every reason a caller must not distinguish by
- * guessing: the wrong ISA, the wrong width, no bytes, or a field value past
- * the end of the bank.
+ * guessing: the wrong ISA, the wrong width, no bytes, a format that does not
+ * put a register of @d's bank at @d's position, or a field value past the
+ * end of the bank.
  */
 static inline uint8_t src_enc_field_reg(const SrcEncFieldDef *d,
                                         unsigned isa,
@@ -156,6 +197,18 @@ static inline uint8_t src_enc_field_reg(const SrcEncFieldDef *d,
     uint32_t w;
 
     if (!d || d->isa != isa || !src_enc_word(bytes, n, d->insn_bytes, &w)) {
+        return REG_NONE;
+    }
+    /*
+     * THE FORMAT, BEFORE THE BITS.  `bclri.b $w5,$w3,1` = 0x79f11949 has 17
+     * in bits 20:16 and no $w17 anywhere in it: those bits are the shift
+     * immediate.  Reading them as `wt` published REG_VEC17 on 14,975 mipsel
+     * encodings, and no measurement over encodings could tell -- the number
+     * is a perfectly good register number.  A word the table cannot place in
+     * a format qualifies nothing, which is the answer an unknown encoding
+     * has to have.
+     */
+    if (!d->qual || !((d->qual(w) >> d->id) & 1u)) {
         return REG_NONE;
     }
     uint32_t v = (w >> d->lsb) & ((1u << d->width) - 1u);

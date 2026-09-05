@@ -140,6 +140,12 @@ def derive(isa, helpers, ppdir, verbose=False):
                       env=envf,
                       self_reloaded=sorted('%s:%s' % (c, n)
                                            for c, n in reloaded),
+                      # SITE_DIR: the statements that fired on this row, and
+                      # the ones that fired and changed nothing.  A dead
+                      # statement is carried in the row so the caller can
+                      # count it rather than discover it years later.
+                      stated=list(a.stated),
+                      stated_dead=list(a.stated_dead),
                       env_where=a.where,
                       # Members whose ARRAY INDEX the reader could not read
                       # off the source: the range is the whole file and names
@@ -186,8 +192,18 @@ if __name__ == '__main__':
     json.dump(dict(isa=args.isa, rows=res, pp_failed=failed),
               open(args.o, 'w'), indent=1)
     ok = sum(1 for v in res.values() if v['status'] == 'OK')
+    stated = sum(len(v.get('stated', ())) for v in res.values())
+    dead = sorted({t for v in res.values() for t in v.get('stated_dead', ())})
     print('%s: %d helpers, %d bounded, %d refused/undefined, %d TUs failed to '
-          'preprocess' % (args.isa, len(res), ok, len(res) - ok, len(failed)))
+          'preprocess, %d site statement(s) applied'
+          % (args.isa, len(res), ok, len(res) - ok, len(failed), stated))
+    # A DEAD SITE STATEMENT IS REPORTED WHERE IT CAN BE SEEN.  It is not an
+    # error -- an entry is dead on the three targets it does not name -- but a
+    # statement that changed nothing on the target it WAS written for has
+    # either lost its defect or never had one, and this is the only place that
+    # difference is visible.
+    for t in dead:
+        print('  SITE_DIR dead on %s: %s' % (args.isa, t))
     # A TU THAT DID NOT PREPROCESS IS NOT A HELPER THAT COULD NOT BE BOUNDED.
     # The rows this writes are read as a MEASUREMENT of what QEMU's source
     # says; a row refused because its defining unit was never parsed says

@@ -233,6 +233,20 @@ class Unit:
             i += 1
         return -1
 
+    def _match_bwd(self, i, open_t, close_t):
+        """Index of the OPENING token matching the closer at @i, or -1."""
+        d = 0
+        while i >= 0:
+            t = self.toks[i][1]
+            if t == close_t:
+                d += 1
+            elif t == open_t:
+                d -= 1
+                if d == 0:
+                    return i
+            i -= 1
+        return -1
+
     def _index_enums(self):
         """Bind enumeration constants to the integers QEMU gave them.
 
@@ -494,6 +508,70 @@ MEM_PRIM = {
 }
 
 
+#
+# THE DIRECTION A FUNCTION'S OWN BODY STATES, WRITTEN DOWN AT THE SITE.
+#
+# MEM_PRIM above is the same idea with the C standard as its authority.  This
+# table's authority is QEMU's source, quoted: an entry names the function, the
+# parameter, the direction, and the LINES that state it, and it is accepted
+# only where the mechanical walk already reached a SUPERSET of it.  It can
+# therefore delete an over-approximation and can never invent an access.
+#
+# It exists because two shapes defeat a reader that works one token at a time,
+# and both of them assemble a WHOLE-REGISTER WRITE OUT OF PIECES:
+#
+#   HELPER(sve_whileg) writes its predicate with three loops that between
+#   them cover every word of it, and predtest_ones() then reads it whole.  No
+#   single store states an extent, so the read cannot be recognised as a read
+#   of what this same call just wrote, and WHILEGE published Pd as a source of
+#   itself.
+#
+#   sve_ldff1_z writes its destination on every path before it returns -- the
+#   all-false predicate path memsets the register whole; every other path
+#   loads one element and swap_memzero()s the prefix and the suffix around it
+#   -- but the memset is inside an `if`, and a conditional whole-pointee write
+#   keeps its widening for the reason MEM_PRIM's own comment gives.
+#
+# In both the register is a DESTINATION and nothing else, which is what the
+# architecture says too: SVE first-fault gather loads are ZEROING-predicated,
+# so the inactive elements of Zt are zeroed rather than preserved and no value
+# of Zt can reach the result.  QEMU's helper reads the POINTER (the `vd == vm`
+# overlap check) and never the pointee.
+#
+# A STATEMENT THAT CHANGES NOTHING IS REPORTED, NOT KEPT QUIETLY.  If the walk
+# already derived exactly what the entry states, the entry is DEAD -- either
+# the defect it was written for is gone or it never fired -- and it is named
+# in the row and counted by the caller, which is the same treatment the
+# allowlists' dead-rule detector gives.
+_INDEX = (
+    {0: WR},
+    '../target/arm/tcg/sve_helper.c:2385-2423',
+    'The whole body is `for (i = 0; i < opr_sz; i += 1) d[H1(i)] = start + '
+    'i * incr;` over the destination\'s own element type, so every element '
+    'of Zd is assigned and none of them is read.  INDEX is unpredicated.')
+
+SITE_DIR = {
+    'sve_ldff1_z': (
+        {1: WR},
+        '../target/arm/tcg/sve_helper.c:6946-6976',
+        'Every path through the body writes the whole of vd before it '
+        'returns: the empty-predicate path memsets reg_max bytes, and on '
+        'every other path tlb_fn() writes the first active element while '
+        'swap_memzero() zeroes the prefix below it and the suffix above it. '
+        'The only use of vd that is not a write is the pointer comparison '
+        '`vd == vm`, which reads the pointer and not the register.'),
+    'helper_sve_whileg': (
+        {0: WR},
+        '../target/arm/tcg/sve_helper.c:4177-4199',
+        'count == 0 zeroes the predicate whole; otherwise the three loops '
+        'cover every word of it -- `for (i = (oprsz-1)/8; i > invcount/64; '
+        '--i)`, the single word at i, and `while (--i >= 0)` -- so the '
+        'predtest_ones() that follows reads only what this call just wrote.'),
+    'helper_sve_index_b': _INDEX, 'helper_sve_index_h': _INDEX,
+    'helper_sve_index_s': _INDEX, 'helper_sve_index_d': _INDEX,
+}
+
+
 def _acc_of(name):
     """(direction, width) for a guest-access primitive, or None.
 
@@ -590,6 +668,9 @@ class Analysis:
         # execution.  The whole dominance question is then refused.
         self.order_refused = False
         self._pending_fnroots = None
+        # SITE_DIR's ledger: what fired, and what fired but changed nothing.
+        self.stated = []
+        self.stated_dead = []
 
     def lookup(self, name):
         for u in self.units:
@@ -653,6 +734,17 @@ class Analysis:
         self._sframe.append(sframe)
         self._fnframe.append(fnframe)
         self._defer.append([])
+        # A STATED DIRECTION IS SCOPED TO THE FRAME IT IS A STATEMENT ABOUT.
+        # What the root already carried when the walk entered here is kept,
+        # so an access made somewhere else in the helper is never deleted by
+        # a statement about this body.
+        stated = SITE_DIR.get(fname)
+        before = {}
+        if stated:
+            for pi in stated[0]:
+                r = roots.get(pi)
+                if r is not None and r not in ('env', 'cpu', 'carrier'):
+                    before[pi] = (r, self.arg_dir.get(r, 0))
         try:
             self._scan(u, brace, end, taint, depth, fname)
         finally:
@@ -660,6 +752,28 @@ class Analysis:
             self._defer.pop()
             self._sframe.pop()
             self._fnframe.pop()
+        if stated:
+            self._apply_stated(fname, stated, before)
+
+    def _apply_stated(self, fname, stated, before):
+        dirs, where, why = stated
+        for pi, (r, prior) in sorted(before.items()):
+            got = self.arg_dir.get(r, 0)
+            reached = got & ~prior
+            want = dirs[pi]
+            if want & ~reached:
+                # The entry claims an access the walk never reached.  It is
+                # not a narrowing of a measurement, it is an assertion over
+                # one, and this reader does not make those.
+                raise Refusal('SITE_DIR %s param %d states %d, which the walk '
+                              'did not reach (%d)' % (fname, pi, want, reached),
+                              fname)
+            self.arg_dir[r] = prior | want
+            tag = '%s:%d=%d @%s' % (fname, pi, want, where)
+            if reached == want:
+                self.stated_dead.append(tag)
+            else:
+                self.stated.append(tag)
 
     def _scan(self, u, brace, end, taint, depth, fname):
         toks, loc = u.toks, u.loc
@@ -834,7 +948,7 @@ class Analysis:
         # `CPUState *cs = env_cpu(env);`
         if prev == '=' and nxt == ';' and lo - 2 >= 0 and \
                 toks[lo - 2][0] == 'id':
-            taint[toks[lo - 2][1]] = (newroot, None)
+            self._rebind(taint, toks[lo - 2][1], newroot, u, lo, fname)
             return j
         # `f(env_cpu(env), ...)` -- the call's own handling maps it.
         if prev in ('(', ',') and nxt in (')', ','):
@@ -881,6 +995,89 @@ class Analysis:
                           'reader does not follow', fname)
         return j
 
+    def _cast_deref(self, u, lo, j):
+        """`*(T *)root` and `*(T *)(root + off)` -- an ACCESS OF THE POINTEE.
+
+        Returns the index just past the whole dereference, or None.
+
+        THE POINTER IS NOT WHAT IS BEING ASSIGNED.  `*(uint64_t *)vd = l` has
+        the token shape of `vd = l` once the cast is skipped, and the rule
+        that ends a taint on `p = ...` claimed it: HELPER(sve_rev_p) reassigns
+        nothing and writes its whole destination predicate through that line
+        (../target/arm/tcg/sve_helper.c:3325), and the row came out with NO
+        ACCESS TO vd AT ALL -- a destination deleted, silently, by a rule
+        meant for a different statement.
+
+        The offset form is how QEMU writes one element of a vector register:
+        `*(TYPEE *)(vd + H(reg_off)) = val` is the body of every SVE load
+        primitive (../target/arm/tcg/sve_ldst_internal.h:44), and reading it
+        as an escape widened the destination of every one of them to a source
+        as well.
+        """
+        toks = u.toks
+        # * ( T * ) root
+        if lo > 0 and toks[lo - 1][1] == ')':
+            m = u._match_bwd(lo - 1, '(', ')')
+            if m > 0 and toks[m - 1][1] == '*':
+                return j
+        # * ( T * ) ( root <op> ... )   -- the root inside the operand.
+        # Walked OUTWARD through the nesting, because H1_4(x) expands to (x)
+        # and puts a second pair of parentheses between the cast and the root.
+        at = lo
+        for _ in range(4):
+            k, d = at - 1, 0
+            while k >= 0:
+                t = toks[k][1]
+                if t in (';', '{', '}', ','):
+                    return None
+                if t == ')':
+                    d += 1
+                elif t == '(':
+                    if d == 0:
+                        break
+                    d -= 1
+                k -= 1
+            if k < 1:
+                return None
+            if toks[k - 1][1] == ')':
+                m = u._match_bwd(k - 1, '(', ')')
+                if m > 0 and toks[m - 1][1] == '*':
+                    cl = u._match_fwd(k, '(', ')')
+                    if cl > 0:
+                        return cl + 1
+                return None
+            if toks[k - 1][1] != '(':
+                return None
+            at = k
+        return None
+
+    def _rebind(self, taint, name, newroot, u, i, fname):
+        """`x = <root>` -- x designates @newroot from here on.
+
+        A NAME THAT MAY STILL DESIGNATE THE ROOT IT HELD IS NOT FOLLOWED.
+        The taint map gives a name one root, so a CONDITIONAL rebinding --
+
+            if (unlikely(vd == vn0)) {
+                vn0 = memcpy(&scratch, vn0, oprsz);
+                if (vd == vn1) { vn1 = vn0; }
+            }
+
+        at ../target/arm/tcg/sve_helper.c:3008 -- cannot be represented: on
+        the path that did not take it, `vn1` is still the second table
+        register, and every access do_tb_b() then makes through that name was
+        being recorded against the FIRST one alone.  The root that may still
+        be there is widened to read-and-written, which is this reader saying
+        it does not know, and is the direction it says it in everywhere else.
+        """
+        old = taint.get(name)
+        if old is not None and old[0] != newroot and \
+                not self._uncond(u, i, fname):
+            r = old[0]
+            if r not in ('env', 'cpu', 'carrier'):
+                self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
+                self._note_order(('arg', r), RD | WR, False)
+        taint[name] = (newroot, None)
+
     def _access(self, u, i, end, taint, fname):
         toks, loc = u.toks, u.loc
         root, off = taint[toks[i][1]]
@@ -907,11 +1104,55 @@ class Analysis:
         prev = toks[lo - 1][1] if lo > 0 else ''
         nxt = toks[j][1] if j < end else ''
 
+        # `*(T *)p = v` / `x = *(T *)(p + off)` -- through the pointer, and
+        # therefore an access of what it designates.  Checked BEFORE the
+        # reassignment rule below, whose token shape it otherwise matches.
+        cd = None
+        if field is None and root not in ('env', 'cpu', 'carrier'):
+            cd = self._cast_deref(u, lo, j)
+        if cd is not None:
+            nx = toks[cd][1] if cd < end else ''
+            if nx == '=':
+                dd = WR
+            elif nx in ASSIGN_OPS and nx != '==' or nx in ('++', '--'):
+                dd = RD | WR
+            else:
+                dd = RD
+            if prev == '&':
+                dd = RD | WR
+            if dd & WR:
+                # A PREDICATED OR NARROWING STORE LEAVES THE REGISTER
+                # STANDING: every SVE merging form is
+                # `if (pg & 1) *(TYPE *)(vd + H(i)) = ...` and the elements
+                # the predicate did not select keep the value Zd had, which is
+                # a read of it.  Same reason as the subscript form above.
+                dd = RD | WR
+            self.arg_dir[root] = self.arg_dir.get(root, 0) | dd
+            # ONE ELEMENT OF A REGISTER: it names no extent, so it does not
+            # dominate, for the same reason the member form does not.
+            self._note_order(('arg', root), dd, False)
+            return j
+
         # `p = <something>` -- an assignment to the tainted local itself.
         if field is None and j == i + 1 and nxt == '=':
             if root == 'env':
                 raise Refusal('env reassigned', fname)
-            taint.pop(toks[i][1], None)
+            # ONLY AN UNCONDITIONAL REASSIGNMENT ENDS THE TAINT.  On a path
+            # that does not take the assignment the name still designates the
+            # root, so dropping it there loses every access made through it
+            # afterwards.  SVE's gather loads are the shape:
+            #
+            #     if (unlikely(vd == vm)) { vm = memcpy(&scratch, vm, reg_max); }
+            #     ...
+            #     addr = base + (off_fn(vm, reg_off) << scale);
+            #
+            # -- and with the taint dropped at the `vm =` the INDEX VECTOR's
+            # own reads, every one of them after that line, were recorded
+            # against nothing.  Keeping it is also the over-approximating
+            # direction: where the assignment did happen the name designates
+            # a copy of the same bytes.
+            if self._uncond(u, i, fname):
+                taint.pop(toks[i][1], None)
             return j + 1
 
         # &root->field ... : the address escapes; it is read AND written
@@ -942,6 +1183,56 @@ class Analysis:
                 m += 1
             return self._derived(u, lo, m + 2, end, taint, 'env', fname)
 
+        if field is None and root not in ('env', 'cpu', 'carrier') \
+                and j > i + 1 and toks[i + 1][1] == '[':
+            # `d[i] = v` -- A SUBSCRIPT OF THE ROOT IS AN ACCESS OF THE ROOT.
+            #
+            # _path_end() consumes the subscript and reports no member, which
+            # is right -- there is no member -- and the escape rule below then
+            # read the absence of a name as "this reader does not know what
+            # happened".  It does know: `d[i]` designates bytes of the
+            # pointee, exactly as `d->p[i]` does, and the operator that
+            # follows states the direction the same way.  Reading it as an
+            # escape widened every one of them to READ AND WRITTEN, and
+            # HELPER(sve_index_b) -- whose whole body is
+            #
+            #     uint8_t *d = vd;
+            #     for (i = 0; i < opr_sz; i += 1) { d[H1(i)] = start + i * incr; }
+            #
+            # -- published the register it fills as one of its own sources.
+            # The subscript's own reads are already recorded by _path_end();
+            # what is added here is the access through it.
+            #
+            # THE WRITE STILL DOES NOT DOMINATE.  It names one element and the
+            # key is the pointer, which is the reason the member form carries
+            # the same False below.
+            if d & WR:
+                # A STORE THROUGH THE POINTER KEEPS ITS WIDENING.  It names
+                # bytes, not a register, and nothing here measures how many:
+                # `d[H1(i)] = v` under a loop may cover the register and
+                # `*(TYPEN *)(vd + HN(i + sizeof(TYPEN)))` -- SVE2's narrowing
+                # TOP forms, ../target/arm/tcg/sve_helper.c:2280 -- covers
+                # exactly half of it and leaves the other half standing.  The
+                # reader cannot tell the two apart, so the write stays a read
+                # as well and the difference is stated per site by SITE_DIR.
+                d = RD | WR
+            self.arg_dir[root] = self.arg_dir.get(root, 0) | d
+            self._note_order(('arg', root), d, False)
+            return j
+
+        if field is None and not escaped and root != 'env' \
+                and (nxt in ('==', '!=') or prev in ('==', '!=')):
+            # `if (vd == vm)` -- A POINTER COMPARISON IS NOT AN ACCESS.
+            #
+            # It reads the POINTER, which is a value the caller passed by
+            # register, and never the pointee.  The escape rule below counted
+            # it as both a read and a write of the register the pointer
+            # designates, and SVE's overlap check --
+            # `if (unlikely(vd == vm)) { vm = memcpy(&scratch, vm, reg_max); }`
+            # at ../target/arm/tcg/sve_helper.c:6958 -- put the destination of
+            # every first-fault gather load on its own source list.
+            return j
+
         if field is None:
             # The ROOT itself, not a member of it.
             #
@@ -962,7 +1253,7 @@ class Analysis:
             if prev == '=' and nxt == ';' and lo - 2 >= 0 and \
                     toks[lo - 2][0] == 'id' and \
                     (lo - 3 < 0 or toks[lo - 3][1] not in ('->', '.')):
-                taint[toks[lo - 2][1]] = (root, None)
+                self._rebind(taint, toks[lo - 2][1], root, u, lo, fname)
                 return j
             # `ac->env = env` -- stored into a member that IS the env view.
             # Benign: any later read of that member is recognised as the env
@@ -1306,8 +1597,8 @@ class Analysis:
         # inside an `if` went the same way.  A conditional primitive
         # therefore keeps the widening it would otherwise replace.
         if prim is not None and pass_roots and \
-                'env' not in pass_roots.values() and \
-                self._uncond(u, i, fname):
+                'env' not in pass_roots.values():
+            uncond = self._uncond(u, i, fname)
             for ai, r in pass_roots.items():
                 if r in ('cpu', 'carrier'):
                     continue
@@ -1316,9 +1607,28 @@ class Analysis:
                     self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
                     self._note_order(('arg', r), RD | WR, False)
                     continue
+                if (d & WR) and not uncond:
+                    # A CONDITIONAL WRITE DOES NOT COVER THE POINTEE, which is
+                    # the whole of the argument above: on the path that did
+                    # not take it the register keeps the value it had, and
+                    # that is a read of it.
+                    self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
+                    self._note_order(('arg', r), RD | WR, False)
+                    continue
                 if d:
+                    # A CONDITIONAL READ IS STILL ONLY A READ.  The argument
+                    # for widening is about a register whose old value
+                    # survives the call; it has nothing to say about a
+                    # parameter the standard declares READ-ONLY, where not
+                    # taking the branch means the call did not happen and no
+                    # value was written by anyone.  Widening those made the
+                    # SOURCE of every conditional memcpy a destination too --
+                    # `if (unlikely(vd == vm)) { vm = memcpy(&scratch, vm,
+                    # reg_max); }` at ../target/arm/tcg/sve_helper.c:6959 put
+                    # the INDEX VECTOR of every SVE first-fault gather load on
+                    # its own destination list.
                     self.arg_dir[r] = self.arg_dir.get(r, 0) | d
-                    self._note_order(('arg', r), d, bool(d & WR))
+                    self._note_order(('arg', r), d, bool(d & WR) and uncond)
             return
         if pass_roots:
             if cf is None:
@@ -1464,13 +1774,55 @@ _SELFTEST = [
     ('undefined_callee_still_widens',
      'void helper_t(void *vd) { P *d = vd; opaque(d); f(d->p[0]); }',
      {}, {0: RD | WR}),
+    # -- the pointer's own vocabulary -----------------------------------
+    ('subscript_read_of_the_root_is_a_read',
+     'void helper_t(void *vd) { unsigned char *d = vd; f(d[0]); }',
+     {}, {0: RD}),
+    ('subscript_write_of_the_root_keeps_the_widening',
+     'void helper_t(void *vd) { unsigned char *d = vd; d[0] = 1; }',
+     {}, {0: RD | WR}),
+    ('store_through_a_cast_is_not_a_reassignment',
+     'void helper_t(void *vd) { *(unsigned long *)vd = 1; }',
+     {}, {0: RD | WR}),
+    ('cast_deref_read_at_an_offset_is_a_read',
+     'void helper_t(void *vn) { f(*(unsigned long *)(vn + 8)); }',
+     {}, {0: RD}),
+    ('pointer_comparison_is_not_an_access',
+     'void helper_t(void *vd, void *vm) { if (vd == vm) { f(); } }',
+     {}, {}),
+    ('conditional_reassignment_keeps_the_taint',
+     'void helper_t(void *vm) { char s[8]; if (g()) { vm = memcpy(s, vm, 8); }'
+     ' f(*(unsigned long *)vm); }',
+     {}, {0: RD}),
+    ('conditional_rebind_widens_the_root_it_may_still_be',
+     'void helper_t(void *vn0, void *vn1) { if (g()) { vn1 = vn0; }'
+     ' f(*(unsigned long *)vn1); }',
+     {}, {0: RD, 1: RD | WR}),
+    ('conditional_read_only_primitive_is_still_a_read',
+     'void helper_t(void *vs) { char s[8]; if (g()) { memcpy(s, vs, 8); } }',
+     {}, {0: RD}),
+    # -- SITE_DIR -------------------------------------------------------
+    ('site_direction_narrows_what_the_walk_reached',
+     'static void w(void *d) { opaque(d); }\n'
+     'void helper_t(void *vd) { w(vd); }',
+     {}, {0: WR}, {'w': ({0: WR}, 'test', 'test')}),
+    ('site_direction_is_scoped_to_its_own_frame',
+     'static void w(void *d) { opaque(d); }\n'
+     'void helper_t(void *vd) { P *d = vd; f(d->p[0]); w(vd); }',
+     {}, {0: RD | WR}, {'w': ({0: WR}, 'test', 'test')}),
+    ('site_direction_cannot_invent_an_access',
+     'static void w(void *d) { f(*(unsigned long *)d); }\n'
+     'void helper_t(void *vd) { w(vd); }',
+     {}, 'REFUSED', {'w': ({0: WR}, 'test', 'test')}),
 ]
 
 
 def _selftest():
     import tempfile
     bad = 0
-    for name, body, want_env, want_arg in _SELFTEST:
+    for arm in _SELFTEST:
+        name, body, want_env, want_arg = arm[:4]
+        site = arm[4] if len(arm) > 4 else None
         with tempfile.NamedTemporaryFile('w', suffix='.i', delete=False) as fh:
             fh.write(body + '\n')
             path = fh.name
@@ -1482,7 +1834,22 @@ def _selftest():
                 if star:
                     roots[k] = 'env' if 'CPUArchState' in text else k
             a = Analysis(u)
-            a.run('helper_t', roots)
+            if site:
+                SITE_DIR.update(site)
+            try:
+                a.run('helper_t', roots)
+            except Refusal as e:
+                if want_arg == 'REFUSED':
+                    print('ok   %s' % name)
+                    continue
+                raise
+            finally:
+                for k in (site or ()):
+                    SITE_DIR.pop(k, None)
+            if want_arg == 'REFUSED':
+                bad += 1
+                print('FAIL %-36s expected a refusal' % name)
+                continue
             rel = a.self_reloaded()
             got_env = {}
             for f, d in a.env_fields.items():

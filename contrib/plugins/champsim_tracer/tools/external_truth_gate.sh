@@ -75,38 +75,77 @@ selftest() {
     # That is a SECOND eligibility rule beside completeness, and it exists
     # because the two can disagree: a root may carry every report the
     # manifest names and still carry a NUMBER nothing at the tip produces.
-    # `verify55/.../evroot` is the standing case -- its `gem5wp/aarch64`
-    # report reads 30, and the leg reads 0 over 40,798 scored at verify56,
-    # at verify57 and again at exec127.  Three independent runs, one
-    # unexplained report.
+    # `verify55/r13/evroot` is the case it was written for -- its
+    # `gem5wp/aarch64` report reads 30, and the leg reads 0 at verify56, at
+    # verify57, at exec126 and at verify58.  Four independent runs, one
+    # unreproduced report.  Arm A requires the UNMODIFIED reports to PASS, so
+    # such a fixture would make arm A green because the ceiling happens to
+    # cover an unreproduced number, not because the gate reads reports
+    # correctly.  A gate proved against evidence nobody can regenerate is
+    # proved against nothing.
     #
-    # WHY THAT DISQUALIFIES IT RATHER THAN MERELY DATING IT.  Arm A of this
-    # selftest requires the UNMODIFIED reports to PASS, and arm B requires a
-    # PLANTED disagreement to fail.  A fixture whose numbers no run
-    # reproduces makes arm A's pass a statement about an artefact: the arm
-    # would be green because the ceiling happens to cover the unreproduced
-    # 30, not because the gate reads reports correctly.  A gate proved
-    # against evidence nobody can regenerate is proved against nothing.
+    # THE RULE IS EXECUTED HERE, NOT RECITED.  It used to be applied by NAME:
+    # a `*/verify55/*` path match, which is the rule applied from memory --
+    # it says nothing about the next root, and the next root is the one
+    # nobody has checked.  `fixture_eligibility.py` runs both halves of the
+    # rule against whatever root is actually chosen, and it is the same
+    # script that has to be run before this default MOVES.  Its refusal on
+    # verify55 is a MEASUREMENT: test 2 names gem5wp/aarch64 30 against four
+    # corroborators reading 0, and test 1 names the absent
+    # statics/isax_srcenc/rc.txt beside it.
     #
-    # THE RULE, stated where the fixture is chosen so it cannot be applied
-    # by memory: an evidence root is fixture-eligible when it is COMPLETE
-    # (every report the manifest names -- refused above) AND every headline
-    # it carries is one a live leg reproduces at the tip that produced it.
-    # A root failing the second test is RETIRED from this default and from
-    # ETG_SELFTEST_ROOT; it stays on disk as the record of the run that
-    # wrote it, which is a different thing from a fixture.  The verify55
-    # root is retired under this rule and the 30 remains OWED as a finding
-    # about that run -- retiring the fixture does not close the question.
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/exec126/r13/evroot}
-    case $SRC in
-        */verify55/*)
-            echo "SELFTEST REFUSES the verify55 evidence root: it carries a" >&2
-            echo "gem5wp/aarch64 headline of 30 that no live leg reproduces" >&2
-            echo "(0 over 40,798 scored at verify56, verify57 and exec127)." >&2
-            echo "A fixture whose numbers cannot be regenerated proves" >&2
-            echo "nothing about the gate.  See the rule above this line." >&2
-            exit 1 ;;
-    esac
+    # THE DEFAULT MOVED TO verify58/r13b AT PASS 74 BY RUNNING IT:
+    #     TEST 1 COMPLETE    19 of 19 present
+    #     TEST 2 REPRODUCED  19 of 19, 0 uncorroborated
+    #     ELIGIBLE (rc=0)
+    # against verify58/r13a, verify57/r13b, verify57/r13a, verify56/r13b and
+    # exec126/r13 as corroborators.  Two rows differ from SOME corroborator
+    # and are reproduced by others, which is the rule working rather than a
+    # blemish: `static/x86_64` 47 differs from verify57's 48 and
+    # `static/mipsel` 1 differs from the pre-PASS-73 roots' 0 -- both are
+    # adjudicated ceiling movements, and the rule asks for ONE run that reads
+    # the same number, not unanimity across tips it predates.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/verify58/r13b/evroot}
+    # THE CORROBORATORS ARE NAMED, AND TOO FEW IS A REFUSAL.  Test 2 cannot
+    # run against nothing: a root with no corroborator comes back
+    # "uncorroborated" on every row and would be adopted by SILENCE, which is
+    # the exact shape of green this rule exists to forbid.  Fewer than two
+    # readable corroborators is therefore a failure that names what to set.
+    if [ -n "$ETG_FIXTURE_CORROBORATORS" ]; then
+        CORROB=$ETG_FIXTURE_CORROBORATORS
+    else
+        CORROB="/mnt/md0/QEMU/cst_runs/verify58/r13a/evroot
+/mnt/md0/QEMU/cst_runs/verify57/r13b/evroot
+/mnt/md0/QEMU/cst_runs/verify57/r13a/evroot
+/mnt/md0/QEMU/cst_runs/verify56/r13b/evroot
+/mnt/md0/QEMU/cst_runs/exec126/r13/evroot"
+    fi
+    ELIG_ARGS=
+    NCORROB=0
+    for c in $CORROB; do
+        [ -d "$c" ] || continue
+        if [ "$c" = "$SRC" ]; then continue; fi
+        ELIG_ARGS="$ELIG_ARGS --against $c"
+        NCORROB=$((NCORROB + 1))
+    done
+    if [ "$NCORROB" -lt 2 ]; then
+        echo "SELFTEST CANNOT RUN: $NCORROB corroborating evidence root(s)" >&2
+        echo "readable, and the reproduction half of the eligibility rule" >&2
+        echo "needs at least two.  With none, every row reads UNCORROBORATED" >&2
+        echo "and the fixture would be adopted by silence.  Set" >&2
+        echo "ETG_FIXTURE_CORROBORATORS to roots that exist." >&2
+        exit 1
+    fi
+    echo "=== FIXTURE ELIGIBILITY: the rule of 70f56eff3a, EXECUTED"
+    if "$PY" "$HERE/external_truth_gate/fixture_eligibility.py" \
+            "$SRC" $ELIG_ARGS; then
+        echo "    ELIGIBLE, as required"
+    else
+        echo "    THIS ROOT IS NOT FIXTURE-ELIGIBLE -- reasons above.  A" >&2
+        echo "    selftest over it would prove nothing about the gate, so it" >&2
+        echo "    refuses.  Point ETG_SELFTEST_ROOT at a root that passes." >&2
+        exit 1
+    fi
     if [ ! -d "$SRC" ]; then
         echo "SELFTEST CANNOT RUN: no evidence root at $SRC." >&2
         echo "Set ETG_SELFTEST_ROOT.  A selftest with no subject FAILS." >&2

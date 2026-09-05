@@ -1081,6 +1081,8 @@ class Analysis:
     def _access(self, u, i, end, taint, fname):
         toks, loc = u.toks, u.loc
         root, off = taint[toks[i][1]]
+        if root == 'env' and off is not None:
+            return self._env_ptr_access(u, i, end, taint, off, fname)
         j, first, field, var_index = self._path_end(u, i, end)
         lo = i
         # A macro that parenthesises its result -- x86's CC_SRC expands to
@@ -1275,6 +1277,39 @@ class Analysis:
             self._note_order(('arg', root), RD | WR, False)
             return j
         if root == 'env':
+            # `uint64_t *ffr = env->vfp.pregs[16].p;` -- A LOCAL POINTER BOUND
+            # TO AN ENV MEMBER STILL DESIGNATES THAT MEMBER.
+            #
+            # abff4724d4 taught this reader `d[i]` for a helper PARAMETER and
+            # left the same subscript unread when the pointer is a LOCAL bound
+            # here.  record_fault() (../target/arm/tcg/sve_helper.c:6160) is
+            # the worked example and it is not a corner:
+            #
+            #     uint64_t *ffr = env->vfp.pregs[FFR_PRED_NUM].p;   <- 6162
+            #     ffr[i / 64] &= MAKE_64BIT_MASK(0, i & 63);        <- RMW
+            #     ffr[i / 64] = 0;                                  <- WRITE
+            #
+            # The binding line is the only one the reader saw, it is a READ,
+            # and so 38 rows over eleven SVE first-fault and non-fault load
+            # mnemonics stated the FFR READ-ONLY -- while the wire correctly
+            # published it as a destination of every one of them.  8,448
+            # encodings were scored as walk-only cost against a write list
+            # that was missing the write.
+            #
+            # THE BINDING LINE'S OWN READ IS KEPT.  For an ARRAY member the
+            # expression yields an address and reads nothing, but for a
+            # POINTER member it reads the pointer, and this reader has no
+            # types to tell them apart; the read is the over-approximating
+            # direction and it is the one taken everywhere else here.
+            #
+            # SCOPED TO A DECLARATION.  `T *name = env-><path>;` and nothing
+            # else: a bare assignment to an existing name cannot be told from
+            # an integer one without types, and a name that already designates
+            # something is what _rebind() is for.
+            if d == RD and field and prev == '=' and nxt == ';' and \
+                    lo - 4 >= 0 and toks[lo - 2][0] == 'id' and \
+                    toks[lo - 3][1] == '*' and toks[lo - 4][0] == 'id':
+                taint[toks[lo - 2][1]] = ('env', field)
             self._note_env(field, d, '%s:%d' % loc[i], var_index,
                            self._uncond(u, i, fname), u, i, fname)
         elif root in ('cpu', 'carrier'):
@@ -1291,6 +1326,66 @@ class Analysis:
             # EXTENT can cover the pointee, which is what MEM_PRIM does and
             # nothing here does.
             self._note_order(('arg', root), d, False)
+        return j
+
+    def _env_ptr_access(self, u, i, end, taint, field, fname):
+        """A use of a local pointer that designates the env member @field.
+
+        Same vocabulary as the parameter case in _access(), keyed on the
+        MEMBER instead of on the pointer, because the member is what the
+        wire publishes.  The directions are the same ones and for the same
+        reasons:
+
+          `p[x] = v`    a store through a pointer names bytes and no extent,
+                        so it stays a read as well and does not dominate --
+                        the reason SITE_DIR exists for the parameter form.
+          `p == q`      a pointer comparison reads the pointer, never the
+                        pointee, and is not an access at all.
+          `p = ...`     an UNCONDITIONAL reassignment ends the binding; a
+                        conditional one leaves the name possibly designating
+                        the member still, so it is kept.
+          anything else the pointer escapes into an expression this reader
+                        does not follow, and an escape is read AND written.
+
+        The index is a variable at every site this reaches, so the write is
+        recorded as not covering: `ffr[i / 64] = 0` under a loop may cover
+        the predicate and the reader cannot say that it does.
+        """
+        toks = u.toks
+        j, _first, _f, var_index = self._path_end(u, i, end)
+        prev = toks[i - 1][1] if i > 0 else ''
+        nxt = toks[j][1] if j < end else ''
+        bare = (j == i + 1)
+
+        if bare and nxt == '=':
+            if self._uncond(u, i, fname):
+                taint.pop(toks[i][1], None)
+            return j + 1
+        if bare and prev != '&' and (nxt in ('==', '!=')
+                                     or prev in ('==', '!=')):
+            return j
+
+        if nxt in ASSIGN_OPS and nxt != '==':
+            d = WR if nxt == '=' else (RD | WR)
+        elif nxt in ('++', '--') or prev in ('++', '--'):
+            d = RD | WR
+        else:
+            d = RD
+        if prev == '&' or bare:
+            d = RD | WR
+            var_index = True
+        if d & WR:
+            # A WRITE THROUGH A POINTER NAMES ONE ELEMENT AND NO EXTENT, so
+            # it stays a read as well and it may not cover the member --
+            # `ffr[i / 64] = 0` under a loop might and the reader cannot say
+            # that it does.  Same reason the parameter form does not dominate.
+            d = RD | WR
+            var_index = True
+        # A READ KEEPS THE INDEX THE PATH STATED.  `cr[1]` in
+        # sve_vqm1_for_el_sm() is a constant subscript and forcing it unstated
+        # would widen four vfp.zcr_el rows for no reason this rule has.
+        self._note_env(field, d, '%s:%d' % u.loc[i], var_index,
+                       self._uncond(u, i, fname), u, i, fname)
         return j
 
     def _uncond(self, u, i, fname):
@@ -1536,6 +1631,15 @@ class Analysis:
             texts = [toks[k][1] for k in grp]
             # a bare tainted root passed straight through
             if len(texts) == 1 and texts[0] in taint:
+                # A LOCAL BOUND TO AN ENV MEMBER IS NOT THE ENV VIEW.  Its
+                # taint says 'env' so the member can be named, but what is
+                # passed here is a pointer to some bytes of one member, not
+                # the whole CPUArchState -- and handing it on as the env root
+                # reaches the refusal written for the view and aborts the
+                # whole helper.  Left to _scan's own walk, which reads the
+                # bare occurrence as an escape and widens the member.
+                if taint[texts[0]][1] is not None:
+                    continue
                 pass_roots[ai] = taint[texts[0]][0]
                 continue
             if grp[0] in self.pending_derived:
@@ -1814,6 +1918,46 @@ _SELFTEST = [
      'static void w(void *d) { f(*(unsigned long *)d); }\n'
      'void helper_t(void *vd) { w(vd); }',
      {}, 'REFUSED', {'w': ({0: WR}, 'test', 'test')}),
+    # -- a local pointer bound to an env member -------------------------
+    # record_fault(), ../target/arm/tcg/sve_helper.c:6160, reduced.
+    ('env_member_pointer_carries_its_writes',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'p[i] = 0; }',
+     {'fptags': RD | WR}, {}),
+    ('env_member_pointer_rmw',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'p[i] &= m; }',
+     {'fptags': RD | WR}, {}),
+    ('env_member_pointer_read_only_stays_a_read',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'f(p[i]); }',
+     {'fptags': RD}, {}),
+    # NEGATIVE: a value assignment is not a binding, or every scalar read
+    # into a local would become a write of the member.
+    ('env_member_value_is_not_a_pointer_binding',
+     'void helper_t(CPUArchState *env) { unsigned long v = env->fpuc; '
+     'v = 3; f(v); }',
+     {'fpuc': RD}, {}),
+    # NEGATIVE: the reader has no types, so only a DECLARATION binds.
+    ('env_member_bare_assignment_does_not_bind',
+     'void helper_t(CPUArchState *env) { p = env->fptags; p[i] = 0; }',
+     {'fptags': RD}, {}),
+    # The pointer escaping is read AND written, the direction this reader
+    # uses for everything it does not follow.
+    ('env_member_pointer_escape_widens',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'opaque(p); }',
+     {'fptags': RD | WR}, {}),
+    ('env_member_pointer_comparison_is_not_an_access',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'if (p == q) { f(); } }',
+     {'fptags': RD}, {}),
+    # An UNCONDITIONAL reassignment ends the binding; the access after it
+    # belongs to whatever the name designates then, which is not the member.
+    ('env_member_pointer_reassignment_ends_the_binding',
+     'void helper_t(CPUArchState *env) { unsigned long *p = env->fptags; '
+     'p = other; p[i] = 0; }',
+     {'fptags': RD}, {}),
 ]
 
 

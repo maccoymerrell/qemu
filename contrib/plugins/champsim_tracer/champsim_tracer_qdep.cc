@@ -3743,6 +3743,8 @@ struct SrcMechStage {
     uint8_t     srcx_state;
     uint8_t     status_flags;
     uint8_t     wstate;
+    /* q->writes_unbounded, staged for the WRU column; see the row writer. */
+    uint8_t     writes_unbounded;
     uint8_t     n_qn;
     uint8_t     qn[MAX_SRC_REGS];
     uint8_t     n_sv;
@@ -4046,6 +4048,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         m->srcx_state   = q->srcx_state;
         m->status_flags = q->status_flags;
         m->wstate       = (uint8_t)wstate;
+        m->writes_unbounded = q->writes_unbounded;
         m->n_qn = qemu_named_regs(q, m->qn, f, wstate == QDEP_OK);
         m->n_sv = src_survivor_regs(q->decode_id, f, m->sv,
                                     (uint8_t)MAX_SRC_REGS);
@@ -4512,7 +4515,39 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * loop feeds seat_dst_for_qemu() and is only meaningful where the seat
      * can happen; it is not moved.
      */
-    if (q->dst_state != QDEP_OK) {
+    /*
+     * AND A CONTAINER WRITE WHOSE INDEX IS NOT STATED CANNOT REFUTE A
+     * MEMBER WRITE.  FINDING 75-C.
+     *
+     * `helper_load_seg` reaches cpu_x86_load_seg_cache(env, seg_reg, ...),
+     * whose target is `&env->segs[seg_reg]` with seg_reg a PARAMETER, so the
+     * CP-H row for it states the WHOLE array and says the index is not a
+     * static fact:
+     *
+     *   { offsetof(CPUArchState, segs), sizeof(...->segs),
+     *     INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 }   / * INDEX NOT STATED * /
+     *
+     * That is the honest answer -- QEMU knows it wrote a segment descriptor
+     * and does not know which one from the source alone.  What it is NOT is
+     * a statement that `lfs`'s REG_SEG3 destination is absent, and the loop
+     * below reads any register missing from q->dst_reg[] as exactly that.
+     * 37,448 encodings were scored as walk-only cost on the strength of a
+     * write list that says, in its own row, that it is short: 36,000
+     * lfs/lgs x REG_SEG3/REG_SEG4 and 1,416 movw into REG_SEG1..5.
+     *
+     * The conservative treatment already exists three lines up and is what
+     * an unstated index reaches: NOT SCORABLE.  A member that the container
+     * write may or may not have named is an ABSENT MEASUREMENT, not a loss,
+     * and this is the same ruling the read side's NOT-SCORED column carries.
+     *
+     * SAME PREDICATE AS THE FLIP'S REFUSE ROUTE, deliberately: the #236 flip
+     * must refuse exactly these instructions because publishing QEMU's short
+     * list would DELETE an architectural destination, and it would be
+     * incoherent for the census to charge the wire for the register the flip
+     * is forbidden to drop.  q->writes_unbounded is that predicate and it is
+     * counted, unchanged, a few lines above.
+     */
+    if (q->dst_state != QDEP_OK || q->writes_unbounded) {
         g_dst_flip_not_scorable.fetch_add(1, std::memory_order_relaxed);
     } else {
         /*
@@ -5006,7 +5041,7 @@ EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
     "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ"
-    "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\n"};
+    "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -5312,6 +5347,23 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
     g_string_append_printf(g, "%u", (unsigned)f->lane_mask_kind);
     g_string_append_c(g, '\t');
     g_string_append_c(g, f->lane_parallel ? '1' : '0');
+    /*
+     * WRU -- QEMU WROTE A CONTAINER AND COULD NOT STATE THE INDEX.
+     *
+     * q->writes_unbounded, on the row, for the reason WSTQ is on the row:
+     * an offline scorer reading WR against PUBD cannot otherwise tell a
+     * write list that is COMPLETE from one that says, in its own CP-H row,
+     * that it is SHORT by a member it cannot name.  Scored as the first,
+     * `helper_load_seg`'s whole-`segs` write refuted `lfs`'s REG_SEG3
+     * destination and 37,448 encodings were charged as walk-only cost
+     * against a statement that never denied them (FINDING 75-C).
+     *
+     * The plugin's own destination census is gated on the same bit; this
+     * column is what lets the offline bar reach the same answer from the
+     * corpus alone.
+     */
+    g_string_append_c(g, '\t');
+    g_string_append_c(g, m->writes_unbounded ? '1' : '0');
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);
@@ -7110,7 +7162,12 @@ void qdep_report(GString *report)
         "              is gated on q->dst_state, QEMU's own verdict, and no\n"
         "              longer on dst_precheck()'s composite, which used to\n"
         "              hide the whole population behind a refusal of the\n"
-        "              WIRE's slot list rather than of the extraction.\n",
+        "              WIRE's slot list rather than of the extraction.\n"
+        "              IT IS ALSO GATED ON q->writes_unbounded (75-C): a\n"
+        "              container write whose INDEX QEMU could not state --\n"
+        "              `&env->segs[seg_reg]`, seg_reg a parameter -- says\n"
+        "              its own list is short by a member it cannot name, so\n"
+        "              it cannot refute a destination naming one member.\n",
         g_dst_flip_not_scorable.load(std::memory_order_relaxed));
     dump_tally(report, g_dst_adj_owed_sig,
                "DESTINATION ADJUDICATION-OWED -- published destinations QEMU\ndoes not state that are NOT counted above, because a question is on\nfile against them.  Columns: decode id, rule, register, mnemonic, and\nthe QUESTION.  A LEDGER, not an input: nothing on the wire is decided\nby a row here, and a row leaves this block by being RULED, never by\nbeing deleted:");

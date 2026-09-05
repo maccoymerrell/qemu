@@ -223,6 +223,16 @@ def main():
         if hdr is None or "PUBD" not in hdr or "WSTQ" not in hdr:
             sys.exit("bardst: %s has no PUBD/WSTQ column -- REFUSING (the arm "
                      "predates the columns and cannot answer)" % pm[0])
+        # WRU IS REQUIRED, NOT OPTIONAL.  An arm captured before the column
+        # existed cannot say which rows carry a container write with an
+        # unstated index, and reading its absence as "none of them" is the
+        # silent false success this file's own WSTQ refusal exists against:
+        # the number it would print is the 6.7x bar FINDING 75-C explained.
+        if "WRU" not in hdr:
+            sys.exit("bardst: %s has no WRU column -- REFUSING (the arm "
+                     "predates it, so a container write whose index QEMU "
+                     "could not state is indistinguishable from a complete "
+                     "write list; see FINDING 75-C)" % pm[0])
 
         costreg = collections.Counter(); costrule = collections.Counter()
         gainreg = collections.Counter(); gainrule = collections.Counter()
@@ -264,6 +274,24 @@ def main():
             # QEMU'S OWN WRITE VERDICT GATES THE SCORE.  A refused extraction
             # states nothing, and scoring a published destination against a
             # statement nobody made turns an absent measurement into a loss.
+            # A CONTAINER WRITE WHOSE INDEX IS NOT STATED CANNOT REFUTE A
+            # MEMBER WRITE (FINDING 75-C).  QEMU's CP-H row for
+            # cpu_x86_load_seg_cache() states the WHOLE `segs` array and
+            # says the index is not a static fact -- `&env->segs[seg_reg]`
+            # with seg_reg a parameter -- so the list it produces is short
+            # by a member it cannot name.  A destination naming ONE member
+            # is then an ABSENT MEASUREMENT, not a loss, and it reaches the
+            # same NOT SCORABLE bucket a refused extraction does.  Scored as
+            # a loss it was 37,448 encodings: 36,000 lfs/lgs x
+            # REG_SEG3/REG_SEG4 and 1,416 movw into REG_SEG1..5.
+            #
+            # THE GAIN SIDE GOES WITH IT.  WR is a lower bound here in
+            # exactly the WSHORT sense, and the same argument that forbids
+            # scoring the loss forbids reading its complement as a gain.
+            if row["WRU"] == "1":
+                unscorable["INDEX NOT STATED: a container write cannot "
+                           "refute a member write"] += 1
+                continue
             if row["WSTQ"] != OKW:
                 unscorable[row["WSTQ"][:64]] += 1
                 if row["WSTQ"] == WSHORT:

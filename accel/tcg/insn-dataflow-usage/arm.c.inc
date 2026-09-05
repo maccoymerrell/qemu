@@ -1321,7 +1321,7 @@ static const DfHelperField dfu_sve_ldff1bds_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1341,7 +1341,7 @@ static const DfHelperField dfu_sve_ldff1dd_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1361,7 +1361,7 @@ static const DfHelperField dfu_sve_ldff1hds_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1381,7 +1381,7 @@ static const DfHelperField dfu_sve_ldff1sds_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1400,7 +1400,7 @@ static const DfHelperField dfu_sve_ldffbss_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1419,7 +1419,7 @@ static const DfHelperField dfu_sve_ldffbsu_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1438,7 +1438,7 @@ static const DfHelperField dfu_sve_ldffdd_le_zd_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1457,7 +1457,7 @@ static const DfHelperField dfu_sve_ldffhss_le_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1476,7 +1476,7 @@ static const DfHelperField dfu_sve_ldffhsu_le_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1495,7 +1495,7 @@ static const DfHelperField dfu_sve_ldffsds_le_zd_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1514,7 +1514,7 @@ static const DfHelperField dfu_sve_ldffsds_le_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1533,7 +1533,7 @@ static const DfHelperField dfu_sve_ldffss_le_zsu_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND, 1 },   /* ../target/arm/internals.h:459, INDEX NOT STATED */
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 static const DfHelperField dfu_sve_ldhss_le_zsu_env[] = {
@@ -1585,7 +1585,7 @@ static const DfHelperField dfu_sve_ldnf1bb_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1605,7 +1605,7 @@ static const DfHelperField dfu_sve_ldnf1bds_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1625,7 +1625,7 @@ static const DfHelperField dfu_sve_ldnf1dd_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1645,7 +1645,7 @@ static const DfHelperField dfu_sve_ldnf1hds_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1665,7 +1665,7 @@ static const DfHelperField dfu_sve_ldnf1hh_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1685,7 +1685,7 @@ static const DfHelperField dfu_sve_ldnf1sds_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 #if defined(TARGET_AARCH64)
@@ -1705,7 +1705,7 @@ static const DfHelperField dfu_sve_ldnf1ss_le_r_env[] = {
     { offsetof(CPUArchState, v7m.exception), sizeof(((CPUArchState *)0)->v7m.exception), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/cpu.h:2676 */
     { offsetof(CPUArchState, v7m.secure), sizeof(((CPUArchState *)0)->v7m.secure), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/internals.h:459 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6185, INDEX NOT STATED */
-    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/arm/tcg/sve_helper.c:6163 */
+    { offsetof(CPUArchState, vfp.pregs[16].p), sizeof(((CPUArchState *)0)->vfp.pregs[16].p), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 1 },   /* ../target/arm/tcg/sve_helper.c:6163, INDEX NOT STATED */
 };
 #endif
 static const DfHelperField dfu_sve_ldsds_le_zd_env[] = {

@@ -2880,7 +2880,22 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
 # not listed folds to REG_SYS.
 _AARCH64_SYSREG_GENERIC = {
     0xda10: "REG_FLAGS",                                      # NZCV
-    0xda20: "REG_FCSR", 0xda21: "REG_FCSR", 0xda22: "REG_FCSR",
+    # S3_3_C4_C4_C0 is FPCR, the FP CONTROL word, and it has had its own
+    # generic id since bad95750f4 split the control word off the status word
+    # -- the same split 74012e5de4 mirrored in the FP contract and did not
+    # reach here.  The three encodings were one entry when they were one
+    # register; they are three registers and the boundary names them apart:
+    #
+    #   isaxcheck --isa=aarch64 --hex=00443bd5   mrs x0, FPCR   RD{fpcw}
+    #   isaxcheck --isa=aarch64 --hex=20443bd5   mrs x0, FPSR   RD{fcsr}
+    #   isaxcheck --isa=aarch64 --hex=40443bd5   mrs x0, FPMR   RD{fcsr}
+    #
+    # An expectation naming REG_FCSR where the wire names REG_FPCW is not a
+    # surplus the oracle can forgive -- neither set contains the other -- so
+    # `mrs xN, fpcr` scored as an error while nothing was lost in either
+    # direction.  FPSR and FPMR are checked here too rather than assumed.
+    0xda20: "REG_FPCW",                                       # FPCR
+    0xda21: "REG_FCSR", 0xda22: "REG_FCSR",                   # FPSR, FPMR
     0xde82: "REG_TLS", 0xde83: "REG_TLS",                     # TPIDR*_EL0
 }
 _RISCV_CSR_GENERIC = {

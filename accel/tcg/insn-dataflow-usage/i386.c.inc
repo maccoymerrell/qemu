@@ -13,6 +13,11 @@
  * Every field name was accepted on EVERY configured target that
  * compiles this file (they define TARGET_I386): i386-linux-user, i386-softmmu, x86_64-linux-user, x86_64-softmmu.
  *
+ * Rows emitted under a DERIVED guard -- the field is a member on
+ * only part of that family, and the macro named is the one whose
+ * truth set over the family is exactly the set that has it:
+ *   syscall                defined(TARGET_X86_64)     regs[11]
+ *
  * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,
  * enumerated, and marked DF_HF_XLAT so the footprint is complete
  * and the OPERAND set is not.  Selected by the SOURCE LINE the
@@ -427,11 +432,22 @@ static const DfHelperField dfu_subsd_env[] = {
 static const DfHelperField dfu_subss_env[] = {
     { offsetof(CPUArchState, sse_status), sizeof(((CPUArchState *)0)->sse_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/ops_sse.h:530 */
 };
+#if defined(TARGET_X86_64)
 static const DfHelperField dfu_syscall_env[] = {
-    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:36 */
-    { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:35 */
-    { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:36 */
+    { offsetof(CPUArchState, cc_dst), sizeof(((CPUArchState *)0)->cc_dst), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/cc_helper.c:211 */
+    { offsetof(CPUArchState, cc_op), sizeof(((CPUArchState *)0)->cc_op), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/cc_helper.c:211 */
+    { offsetof(CPUArchState, cc_src), sizeof(((CPUArchState *)0)->cc_src), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/cc_helper.c:211 */
+    { offsetof(CPUArchState, cc_src2), sizeof(((CPUArchState *)0)->cc_src2), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/cc_helper.c:211 */
+    { offsetof(CPUArchState, df), sizeof(((CPUArchState *)0)->df), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/cpu.h:2659 */
+    { offsetof(CPUArchState, eflags), sizeof(((CPUArchState *)0)->eflags), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/cpu.h:2657 */
+    { offsetof(CPUArchState, eip), sizeof(((CPUArchState *)0)->eip), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:108 */
+    { offsetof(CPUArchState, exception_is_int), sizeof(((CPUArchState *)0)->exception_is_int), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:114 */
+    { offsetof(CPUArchState, exception_next_eip), sizeof(((CPUArchState *)0)->exception_next_eip), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:115 */
+    { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:103 */
+    { offsetof(CPUArchState, regs[11]), sizeof(((CPUArchState *)0)->regs[11]), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:109 */
+    { offsetof(CPUArchState, regs[1]), sizeof(((CPUArchState *)0)->regs[1]), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/tcg/user/seg_helper.c:108 */
 };
+#endif
 static const DfHelperField dfu_ucomisd_env[] = {
     { offsetof(CPUArchState, cc_op), sizeof(((CPUArchState *)0)->cc_op), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/ops_sse.h:1139 */
     { offsetof(CPUArchState, cc_src), sizeof(((CPUArchState *)0)->cc_src), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/i386/ops_sse.h:1138 */
@@ -764,10 +780,12 @@ static const DfHelperUsage df_helper_usage[] = {
       dfu_subss_env, ARRAY_SIZE(dfu_subss_env), true,
       "../target/i386/ops_sse.h:530",
       NULL, 0 },
+#if defined(TARGET_X86_64)
     { "syscall", { 0 }, { 0 },
       dfu_syscall_env, ARRAY_SIZE(dfu_syscall_env), true,
       "../target/i386/tcg/user/seg_helper.c:30",
       NULL, 0 },
+#endif
     { "ucomisd", { 0, 1, 1 }, { 0, 64, 64 },
       dfu_ucomisd_env, ARRAY_SIZE(dfu_ucomisd_env), true,
       "../target/i386/ops_sse.h:1130",

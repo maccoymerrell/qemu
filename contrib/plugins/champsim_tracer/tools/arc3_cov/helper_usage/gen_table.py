@@ -90,6 +90,19 @@ def derive_guard(isa, libs, present):
     return out
 
 
+def _parent(expr):
+    """The access one constant subscript shorter, or None.
+
+    `regs[11]` -> `regs`, `cp15.sctlr_el[1]` -> `cp15.sctlr_el`.  It is the
+    ARRAY the element has to lie inside, and the two offsetofs are the whole
+    bounds check.
+    """
+    if not expr.endswith(']'):
+        return None
+    i = expr.rfind('[')
+    return expr[:i] if i > 0 else None
+
+
 def _components(expr):
     """Every member identifier in an access expression.
 
@@ -168,6 +181,23 @@ def check_fields(isa, fields, workdir, lib=None):
     subscript -- `regs[0]`.  The expression is what is offsetof'd, because
     the element is what the helper wrote and a range spanning the whole file
     reaches past every register in it and can be named as none of them.
+
+    AND THE SUBSCRIPT IS CHECKED, NOT ONLY THE MEMBER NAME.  The probe used
+    to ask one question -- does the compiler know this member -- and answer
+    it with `-w` and no `-Werror`, which is a question `regs[11]` PASSES on
+    i386 where `regs` is `target_ulong[8]`: an out-of-range subscript in an
+    offsetof is not a missing member, it is a computed offset, and the only
+    thing that objects is the -Warray-bounds this probe switched off.  So
+    the cross-target partition below -- the machinery whose whole job is to
+    guard a field that exists on some targets and not others -- never saw
+    the fact, and helper_syscall's write of R11 reached the emitted file for
+    all four TARGET_I386 configurations.  The build is what caught it.
+
+    The bounds question is asked here, exactly, by offsetof arithmetic
+    against the element's own parent: an element is in range when it lies
+    wholly inside the array that contains it.  A field that fails is
+    reported as absent on that target, which is the input the guard
+    derivation already knows how to use.
     """
     e = probe_cmd(isa, lib)
     os.makedirs(workdir, exist_ok=True)
@@ -175,11 +205,14 @@ def check_fields(isa, fields, workdir, lib=None):
     src = os.path.join(workdir, 'probe_%s.c' % tag)
     good = set()
     remaining = sorted(fields)
+    parents = {fl: _parent(fl) for fl in fields}
     while True:
+        probe = sorted(set(remaining) |
+                       {parents[x] for x in remaining if parents[x]})
         with open(src, 'w') as f:
             f.write('#include "qemu/osdep.h"\n#include "cpu.h"\n')
             f.write('#include <stdio.h>\nint main(void){\n')
-            for i, fl in enumerate(remaining):
+            for i, fl in enumerate(probe):
                 f.write('  printf("%s %zu %zu\\n", "{n}", '
                         '(size_t)offsetof(CPUArchState, {n}), '
                         'sizeof(((CPUArchState *)0)->{n}));\n'.format(n=fl))
@@ -204,7 +237,22 @@ def check_fields(isa, fields, workdir, lib=None):
             for line in run.stdout.splitlines():
                 n, off, sz = line.split()
                 res[n] = (int(off), int(sz))
-            return res
+            out_of_range = []
+            for fl in remaining:
+                par = parents.get(fl)
+                if not par or fl not in res or par not in res:
+                    continue
+                off, sz = res[fl]
+                poff, psz = res[par]
+                if off < poff or off + sz > poff + psz:
+                    out_of_range.append(fl)
+            if out_of_range:
+                for fl in out_of_range:
+                    print('%s (%s): %s lies outside %s -- reported ABSENT'
+                          % (isa, lib or LIB[isa], fl, parents[fl]))
+                remaining = [x for x in remaining if x not in out_of_range]
+                continue
+            return {k: v for k, v in res.items() if k in set(remaining)}
         # gcc quotes the name with U+2018/U+2019 under a UTF-8 locale and
         # with ASCII apostrophes otherwise, and clang uses ASCII.  Matching
         # only the ASCII form made this branch unreachable in practice: the

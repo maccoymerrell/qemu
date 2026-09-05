@@ -377,6 +377,37 @@ GHashTable *g_surv_ref_short_sig = nullptr;
  *     state -- a NOP SEMANTIC STILL HAS REAL DEPENDENCIES IN THE CHOSEN
  *     REGISTER.  ADJUDICATED-KEEP-R16.
  *
+ *   mipsel `sdc2` and `swc2`, REG_COPROC0 -- RETIRED FROM THIS TABLE, and
+ *     the reason is that the sentence their own rows rested on stopped
+ *     being true.  They said: "NO SURVIVOR ROW CAN CARRY IT and that is why
+ *     the ledger has to -- QEMU withholds a decode identity for a
+ *     translation that only raises, the id is 0, and gen_src_survivors.py
+ *     refuses identity-less rows BY DESIGN."  90bfb1ac0a gave the two
+ *     translations decode identities of their own -- 0x6670d869 for
+ *     OPC_SDC2 and 0x018b909c for OPC_SWC2 -- and the generator then minted
+ *     exactly the rows the text said could not exist:
+ *
+ *         { 0x6670d869u, SRC_SURV_FIXED, REG_COPROC0, ... OPC_SDC2 }
+ *         { 0x018b909cu, SRC_SURV_FIXED, REG_COPROC0, ... OPC_SWC2 }
+ *
+ *     src_survivor_regs() feeds qemu_named_regs(), so REG_COPROC0 is now
+ *     INSIDE the union the must-be-0 loop skips, and the loop cannot reach
+ *     a ledger row for it however the row is keyed.  Both rows were dead
+ *     TWICE OVER -- the ruling is carried by the survivor table, and the id
+ *     they were keyed on (0x00000000) had moved out from under them --
+ *     which is why they were reported under DID NOT FIRE by a guest that
+ *     executes both instructions.  R16's ruling on the two is not
+ *     withdrawn; it is DELIVERED, by the mechanism the rows were a
+ *     stand-in for.
+ *
+ *     DELETED RATHER THAN RE-KEYED, on the `rdsspq` REG_GPR0 precedent
+ *     below and for its reason: if the survivor rows ever stop reaching --
+ *     a decode-id move, a generator refusal, a corpus that no longer
+ *     carries the mnemonic -- REG_COPROC0 reappears as a published source
+ *     with no ledger row and reads MISSING, loudly, on a must-be-0 line.
+ *     A KEEP row keyed on the new ids would silence exactly that alarm,
+ *     and it is the alarm that caught this.
+ *
  *   x86_64 `rdsspq`, REG_GPR0 -- RETIRED FROM THIS TABLE, and the reason is
  *     the one thing here that is not a keep.  R16's second consequence is
  *     that the GPR is the architectural DESTINATION (XED `SRC {SSP} DST
@@ -454,39 +485,6 @@ static const SrcAdjRow g_src_adj_ledger[] = {
       "and is not the ARCHITECTURAL-UD of `ud2`.  The id is the carved arm "
       "decode-new/multi0F@f3=1,modrm=..101...,mem, not the 0F 01 group's "
       "shared slot 0x000004ae, which carried thirty-three mnemonics" },
-    { TRACE_ISA_MIPS,  0x00000000u, "sdc2", REG_COPROC0, SRC_ADJ_R16,
-      "ADJUDICATED-KEEP-R16, and it is `rstorssp`'s ruling on a different "
-      "coprocessor.  MIPS64 Vol II defines SDC2 as storing the doubleword "
-      "held in COP2 register rt, so the coprocessor register is a SOURCE of "
-      "the encoding.  QEMU MODELS NO COPROCESSOR 2 on these models: the "
-      "LDC2/SDC2 arm of translate.c states the BASE register and then calls "
-      "insn_dataflow_note_translation_refused() and raises Coprocessor "
-      "Unusable, so the op stream carries the raise's dataflow and none of "
-      "the instruction's.  There is no env storage for a COP2 register to "
-      "name and no accessor to walk, which is a STATEMENT GAP and not an "
-      "architectural fact.  R16: the ISA dependency is recorded whatever "
-      "Status.CU2 says, and R15: the emulator's decision to raise instead "
-      "is a lowering fact.  NO SURVIVOR ROW CAN CARRY IT and that is why "
-      "the ledger has to -- QEMU withholds a decode identity for a "
-      "translation that only raises, the id is 0, and "
-      "gen_src_survivors.py refuses identity-less rows BY DESIGN (its ARM "
-      "C3 selftest asserts the refusal).  FINDING 69-B measured the "
-      "consequence: the must-be-0 row fired on 7 of 60 seeds -- 9, 13, 32, "
-      "45, 47, 49 and 54 -- and read 0 on the other 53 only because the "
-      "wrong path happened not to translate these bytes" },
-    { TRACE_ISA_MIPS,  0x00000000u, "swc2", REG_COPROC0, SRC_ADJ_R16,
-      "ADJUDICATED-KEEP-R16, the same site and the same ruling as `sdc2` "
-      "above -- SWC2 stores the word held in COP2 register rt, and the "
-      "LWC2/SWC2 arm QEMU decodes it at is the one the SDC2 arm's comment "
-      "points to.  MEASURED, not widened: 6,144 encodings on the mipsel "
-      "sled corpus publish REG_COPROC0 outside QEMU's union under this "
-      "mnemonic, exactly as many as `sdc2` does.  `mfc2` (768) and `mftr` "
-      "(384) publish it too and get NO ROW HERE: OPC_CP2 reaches "
-      "gen_loongson_multimedia() past an ASE_LMMI check and OPC_MFTR is "
-      "the MT ASE's thread-register move, two different decode sites with "
-      "two different questions, and each owes its own derivation.  They "
-      "read MISSING, loudly, which is what the no-silent-widening rule "
-      "above asks for" },
     { TRACE_ISA_X86,   0xdb9bac2bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
       "ADJUDICATED-KEEP-R16.  R16 verbatim: \"IF THE DEPENDENCY EXISTS IN "
       "THE ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  ... "

@@ -77,8 +77,23 @@ selftest() {
     # manifest names and still carry a NUMBER nothing at the tip produces.
     # `verify55/r13/evroot` is the case it was written for -- its
     # `gem5wp/aarch64` report reads 30, and the leg reads 0 at verify56, at
-    # verify57, at exec126 and at verify58.  Four independent runs, one
-    # unreproduced report.  Arm A requires the UNMODIFIED reports to PASS, so
+    # verify57, at exec126 and at verify58.
+    #
+    # THAT 30 IS CAUSED, and the cause is worth carrying here because it is
+    # the shape to look for next time.  It is not a stale binary and not a
+    # transient: it is a REAL RED that verify55 itself found and repaired.
+    # `r13` is that wave's OPENING measurement and reads 30; the same wave's
+    # `r13b` and `r13c` read 0, and between them sits ac8a254e38 -- REG_FPCW,
+    # newly on the aarch64 wire at bad95750f4, arriving at a comparator whose
+    # `_is_sys()` partition did not name it, so a misc-file register was
+    # compared against gem5's architectural source list where it cannot
+    # appear.  Thirty rows, one surplus register, every time the same one.
+    # Nothing moved on the wire.  So the report reproduces nowhere for the
+    # most ordinary reason available: the comparator that produced it does
+    # not exist at any later tip.  An OPENING measurement was mistaken for a
+    # wave result.  The refusal stands regardless -- a number no later
+    # comparator can produce proves nothing about the gate whatever its
+    # reason -- but it is no longer an unexplained one.  Arm A requires the UNMODIFIED reports to PASS, so
     # such a fixture would make arm A green because the ceiling happens to
     # cover an unreproduced number, not because the gate reads reports
     # correctly.  A gate proved against evidence nobody can regenerate is

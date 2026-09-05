@@ -7869,7 +7869,7 @@ x86_64 FU-unclassified ud2
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
 #   fields        661     1115     1059      864     3699
-#   boundary      638     1115     1017      233     3003
+#   boundary      638     1115     1016      233     3002
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -7901,14 +7901,14 @@ x86_64 FU-unclassified ud2
 #   mipsel   M-DSPIMM
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/exec132/srcencorp/tip132
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec133/srcencorp/tip133
 #   x86_64    6416527 rows md5 53f4eef64f63d7537462e406cb87851b
 #   aarch64   1408171 rows md5 d407a13138a9281cb541393508f20c98
 #   riscv64     86889 rows md5 baf8571353b1e382588425d728c090ad
-#   mipsel     548886 rows md5 7c5d6f1bdbdf7a3b43d0ad2aa4af321f
+#   mipsel     548886 rows md5 9a73d0219983be6ce43a88aaac968bf4
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
-#   SO_SHA=419e0c74b3755d13
+#   SO_SHA=b5b342f62494c103
 #   ISAX_SHA=1d0ad8137585bc36
 #   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #

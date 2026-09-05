@@ -64,8 +64,28 @@ import argparse, collections, os, sys
 #: default is ALL OF IT.  `--regtop N` caps it, and a capped table prints
 #: what it dropped, by count and by sum, so a reader can always tell a zero
 #: from a cut.
+#: A TIE MUST NOT DEPEND ON WHICH RUN THIS IS.
+#:
+#: `walk_only` and `qemu_only` are frozenset differences, and iterating a set
+#: of strings visits them in an order that changes with the interpreter's hash
+#: seed -- so the Counters below were filled in a different order every run,
+#: and `most_common()` (a stable sort) carried that order into every tie.
+#: Measured: two runs of this scorer over ONE unchanged corpus differ, at
+#: `REG_ACC0`/`REG_ACCHI0` both reading 24 and at two `addu_s.qb` rule rows.
+#: Nothing about the BAR moves -- every count is identical -- but a bar whose
+#: text is not reproducible cannot be diffed against the bar of another arm,
+#: which is the only way this scorer is ever used.
+#:
+#: Both ends are closed: the set iterations are sorted at the point of
+#: counting, and every table below orders by (-count, key) so a tie is
+#: settled by the name and never by insertion history.
+def ordered(counter, cap=0):
+    rows = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return rows[:cap] if cap else rows
+
+
 def print_regtable(counter, indent, cap):
-    rows = counter.most_common()
+    rows = ordered(counter)
     shown = rows if not cap else rows[:cap]
     for r, n in shown:
         print("%s%-16s %8d" % (indent, r, n))
@@ -80,6 +100,15 @@ def print_regtable(counter, indent, cap):
 sys.path.insert(0, "/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/"
                    "arc3_cov/instruments")
 import srcenc_reach
+# THE MECH CORPUS MAY BE COMPRESSED, AND THIS SCORER USED TO CALL THAT
+# MISSING.  A mech corpus is 12G of text per pass and the disk rule says
+# archive it; `open()` on the uncompressed name then finds nothing and the
+# arm refuses with "corpus_mech_<isa>.tsv missing", which is the right
+# behaviour and the wrong capability -- the evidence a bar was derived from
+# becomes unreadable the moment it is stored the way it must be stored.
+# `bar.py` has read through a sweep since evopen landed; this one did not,
+# and the two read the same files.
+from evopen import evopen, resolve
 
 
 #: THE REFUSAL SET, joined from an arm that carries it.
@@ -101,9 +130,10 @@ def load_refused(arm, isa, wps):
     can_answer = False
     for w in wps:
         p = os.path.join(arm, "%s.wp%s" % (isa, w), "corpus_mech_%s.tsv" % isa)
-        if not os.path.exists(p):
-            sys.exit("refused-arm: %s missing -- REFUSING" % p)
-        with open(p, errors="replace") as f:
+        if not os.path.exists(resolve(p)):
+            sys.exit("refused-arm: %s missing -- REFUSING (no compressed "
+                     "sibling either)" % p)
+        with evopen(p, errors="replace") as f:
             hdr = None
             for line in f:
                 if line.startswith("#"):
@@ -171,8 +201,7 @@ def read_mech_merged(paths):
     d, conf, confex = {}, 0, []
     hdr = None
     for p in paths:
-        opener = open
-        with opener(p, errors="replace") as f:
+        with evopen(p, errors="replace") as f:
             for line in f:
                 if line.startswith("#"):
                     if hdr is None:
@@ -217,8 +246,9 @@ def main():
         pm = [os.path.join(a.a, "%s.wp%s" % (isa, w),
                            "corpus_mech_%s.tsv" % isa) for w in wps]
         for p in pm:
-            if not os.path.exists(p):
-                sys.exit("bardst: %s missing -- REFUSING" % p)
+            if not os.path.exists(resolve(p)):
+                sys.exit("bardst: %s missing -- REFUSING (no compressed "
+                         "sibling either)" % p)
         M, cm, cex, hdr = read_mech_merged(pm)
         if hdr is None or "PUBD" not in hdr or "WSTQ" not in hdr:
             sys.exit("bardst: %s has no PUBD/WSTQ column -- REFUSING (the arm "
@@ -321,7 +351,7 @@ def main():
                 cost_enc += 1; cost_reg += len(walk_only)
                 if published:
                     cost_pub_enc += 1; cost_pub_reg += len(walk_only)
-                for r in walk_only:
+                for r in sorted(walk_only):
                     costreg[r] += 1
                     costrule[(row.get("rule", "?"), row.get("mnem", "?"), r)] += 1
                     gcostreg[r] += 1
@@ -329,7 +359,7 @@ def main():
                 gain_enc += 1; gain_reg += len(qemu_only)
                 if published:
                     gain_pub_enc += 1; gain_pub_reg += len(qemu_only)
-                for r in qemu_only:
+                for r in sorted(qemu_only):
                     gainreg[r] += 1
                     gainrule[(row.get("rule", "?"), row.get("mnem", "?"), r)] += 1
                     ggainreg[r] += 1
@@ -352,9 +382,9 @@ def main():
         print("=== %s ===" % isa)
         print("  rows=%d  wp-merge conflicts=%d  REACH=INSTRUCTION=%d  "
               "QEMU-STATED WRITE SIDE=%d" % (len(M), cm, ins, scor))
-        for k, v in unscorable.most_common():
+        for k, v in ordered(unscorable):
             print("     not scorable  %-8d %s" % (v, k))
-        for k, v in byreach.most_common():
+        for k, v in ordered(byreach):
             print("     reach %-16s %d" % (k, v))
         if cex:
             for e in cex:
@@ -362,7 +392,7 @@ def main():
         print("  WALK-ONLY DESTINATIONS (the flip's COST): %d encodings / "
               "%d registers" % (cost_enc, cost_reg))
         print_regtable(costreg, "      ", a.regtop)
-        for k, n in costrule.most_common(a.top):
+        for k, n in ordered(costrule, a.top):
             print("      -%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
         print("     of which the destination FAMILY PUBLISHED: %d enc / "
               "%d regs" % (cost_pub_enc, cost_pub_reg))
@@ -370,13 +400,13 @@ def main():
               "(admitted all the same): %d encodings / %d registers"
               % (outbar_enc, outbar_reg))
         print_regtable(outbarreg, "      ", a.regtop)
-        for k, n in outbarrule.most_common(6):
+        for k, n in ordered(outbarrule, 6):
             print("      *%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
         print("  ON A LOWER-BOUND WRITE LIST (QDEP_W_SHORT), GAIN ONLY: "
               "%d row(s), of which %d encoding(s) / %d register(s) name a "
               "destination the wire lacks" % (ws_rows, ws_enc, ws_reg))
         print_regtable(wsreg, "      ", a.regtop)
-        for k, n in wsrule.most_common(a.top):
+        for k, n in ordered(wsrule, a.top):
             print("      >%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
         print("  QEMU-ONLY DESTINATIONS (the flip's GAIN): %d encodings / "
               "%d registers   [R10.1 block-pc carve-outs: %d]"
@@ -385,7 +415,7 @@ def main():
               "%d regs   <-- what the ADMISSION seats today"
               % (gain_pub_enc, gain_pub_reg))
         print_regtable(gainreg, "      ", a.regtop)
-        for k, n in gainrule.most_common(a.top):
+        for k, n in ordered(gainrule, a.top):
             print("      +%7d  %-46s %-12s %s" % (n, k[0][:46], k[1][:12], k[2]))
         print()
 

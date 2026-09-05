@@ -2794,8 +2794,9 @@ static void note_src(const struct qemu_plugin_tb *tb, size_t idx,
  * instruction rather than leaving one slot to be filled from the answer this
  * flip replaces.
  */
-void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
-              const uint8_t *load_ord, unsigned n_memops)
+static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
+                           QDepInsn *out, const uint8_t *load_ord,
+                           unsigned n_memops)
 {
     const unsigned nw = (g_nregs + 63) / 64;
     std::vector<uint64_t> wr(nw ? nw : 1);
@@ -3287,6 +3288,50 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
         }
     }
     out->dst_state = QDEP_OK;
+}
+
+/*
+ * THE LIST WAS ABANDONED, AND THE COLUMN THAT PRINTS IT HAS TO SAY SO.
+ *
+ * note_dst_build() appends a row to `dst_reg[]` the moment a write's NAME
+ * resolves, and refuses AFTERWARDS -- when that row's provenance turns out
+ * to name a range no target declared, when the record is withheld, when a
+ * later row is too wide.  Every one of those refusals is a `return` from
+ * inside the enumeration, so what `dst_reg[]` holds is a PREFIX of the list
+ * QEMU stated, ending wherever the walk stopped.
+ *
+ * The wire cannot see it: dst_precheck() returns any non-OK @dst_state
+ * unchanged and the destination family is refused, so no mask is ever
+ * seated from a prefix.  THE MECHANISM CORPUS CAN, and until this flag
+ * existed a prefix printed in the WR column exactly like a complete list.
+ *
+ * FINDING 80-B is what that costs.  `smstart` read WR = REG_PC,REG_FCSR
+ * before `svcr` was declared and REG_PC,REG_VCTRL after, and the reading
+ * on offer was that naming one written member had DISPLACED another -- a
+ * cap, or a dedup, or a bug in the fold.  It is none of those.  Before the
+ * declaration the SVCR row's name did not resolve, so the loop `continue`d
+ * past it and reached the fp_status write behind it; after, the row
+ * resolved, joined the list, and its own provenance -- an env range still
+ * undeclared -- refused and returned.  REG_FCSR was never reached.  Two
+ * prefixes of two different lengths, both printed as though complete.
+ *
+ * Measured over the four banked wp0 corpora at a1f36fbb94: 2,765,765
+ * x86_64 rows, 182,482 aarch64, 50 riscv64 and 3,196 mipsel print a WR
+ * value under a refusing WSTQ.  (The QDEP_W_SHORT rows in the same
+ * population are NOT these: that state is only ever reached from a probe
+ * whose own verdict was QDEP_OK, so its list is complete and its "LOWER
+ * BOUND" name is about the STATUS FLAGS, not about the walk.)
+ *
+ * The flag is set HERE, at the one return the build has, rather than at
+ * each of its twenty-three: "the enumeration returned early with rows
+ * already in the list" is exactly the fact a reader needs, and stating it
+ * in one place is what stops the twenty-fourth return from being silent.
+ */
+void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
+              const uint8_t *load_ord, unsigned n_memops)
+{
+    note_dst_build(tb, idx, out, load_ord, n_memops);
+    out->dst_trunc = (out->dst_state != QDEP_OK && out->n_dst > 0) ? 1 : 0;
 }
 
 /*
@@ -3915,6 +3960,7 @@ struct SrcMechStage {
     uint8_t     x_mem_writes;
     uint8_t     x_refused;      /* the translator declined the body */
     uint8_t     n_wr;
+    uint8_t     wr_trunc;       /* the list was abandoned; see QDepInsn */
     uint8_t     wstate_q;       /* QEMU's write-side verdict, q->dst_state */
     uint8_t     wr[QDEP_MAX_DST];
 };
@@ -4228,6 +4274,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          */
         m->n_wr = q->n_dst;
         memcpy(m->wr, q->dst_reg, q->n_dst);
+        m->wr_trunc = q->dst_trunc;
         m->wstate_q = (uint8_t)q->dst_state;
     }
     /*
@@ -5367,6 +5414,16 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
     }
     g_string_append_c(g, '\t');
     reglist_str(g, m->wr, m->n_wr);
+    /*
+     * ...ABANDONED, and the ellipsis is the whole point: a prefix and a
+     * complete list print identically without it.  See QDepInsn::dst_trunc
+     * and FINDING 80-B.  It can only ever appear beside a refusing WSTQ,
+     * so no instrument that gates on QDEP_OK -- which is all of them --
+     * can see a column it did not see before.
+     */
+    if (m->wr_trunc) {
+        g_string_append(g, "...ABANDONED");
+    }
     /*
      * PUBD -- THE WIRE'S DESTINATION DICTIONARY, beside the write list QEMU
      * states, and read off @f at the same moment PUB is.

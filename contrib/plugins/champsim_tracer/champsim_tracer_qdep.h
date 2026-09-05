@@ -640,6 +640,19 @@ struct QDepInsn {
      */
     uint8_t dstx_state;
     /*
+     * The write list was ABANDONED mid-enumeration: note_dst() returned a
+     * refusal with rows already appended, so `dst_reg[]` is a PREFIX of
+     * what QEMU stated and may be short by anything the walk had not
+     * reached.  Set at note_dst()'s one return, never inside the build.
+     *
+     * Nothing on the wire reads it -- a non-OK @dst_state already refuses
+     * the destination family -- and the mechanism corpus does, because a
+     * prefix in the WR column prints exactly like a complete list and the
+     * `smstart` REG_FCSR -> REG_VCTRL move was read as a displacement for
+     * exactly that reason (FINDING 80-B).
+     */
+    uint8_t dst_trunc;
+    /*
      * THE FRAME AN x87 DESTINATION'S NAME IS IN, as the offset a VALUE read
      * needs -- qemu_plugin_dataflow_named_write::value_shift, indexed by the
      * ST(i) the name carries.  Zero everywhere the two frames agree, which

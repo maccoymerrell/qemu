@@ -110,18 +110,36 @@ def derive(isa, helpers, ppdir, verbose=False):
         except RecursionError:
             out[h] = dict(status='REFUSED', why='recursion', defined_at='%s:%d' % loc)
             continue
+        # THE SELF-RELOAD NARROWING.  A read of bytes this same call
+        # unconditionally wrote before reading them is not an input: no value
+        # of that register can change the helper's answer.  Applied here,
+        # once, to both channels the shape reaches -- the env field and the
+        # pointer argument -- because it is one fact about one body and
+        # splitting it would leave whichever channel was not named standing.
+        # Canalyze.self_reloaded() states the rule and its refusals.
+        reloaded = a.self_reloaded()
         argdir = {}
         for i, (nm, star, nmi, text) in enumerate(params):
             if roots.get(i) == 'env':
                 argdir[i] = 'env'
             elif star:
-                argdir[i] = a.arg_dir.get(i, 0)
+                d = a.arg_dir.get(i, 0)
+                if ('arg', i) in reloaded:
+                    d &= ~1     # canalyze.RD
+                argdir[i] = d
+        envf = {}
+        for k, v in sorted(a.env_fields.items()):
+            if ('env', k) in reloaded:
+                v &= ~1         # canalyze.RD
+            envf[k] = v
         out[h] = dict(status='OK',
                       escapes=sorted(set(a.cpu_escapes)),
                       defined_at='%s:%d' % loc,
                       params=[(t[0], t[3]) for t in params],
                       argdir=argdir,
-                      env={k: v for k, v in sorted(a.env_fields.items())},
+                      env=envf,
+                      self_reloaded=sorted('%s:%s' % (c, n)
+                                           for c, n in reloaded),
                       env_where=a.where,
                       # Members whose ARRAY INDEX the reader could not read
                       # off the source: the range is the whole file and names

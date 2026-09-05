@@ -21,7 +21,7 @@ treats as disqualifying.  So every uncertainty widens the answer (an escaped
 address is read AND written, an indexed array member is the whole array) or
 refuses outright.
 """
-import re, sys
+import os, re, sys
 
 TOK = re.compile(r"""
     (?P<ws>\s+)
@@ -63,6 +63,146 @@ class Unit:
         self._index_functions()
         self.enums = {}
         self._index_enums()
+        self._guard = None
+        self._has_goto = None
+
+    # -- CONTROL, and the one question asked of it ------------------------
+    #
+    # THE ONLY THING THIS ANSWERS is "does this token stand on the function's
+    # straight line, or under a condition".  It is asked of WRITES and of
+    # nothing else, because the fact it supports is a DOMINATING write -- a
+    # store that every path through the body performs before the read that
+    # follows it.  A read needs no such property: a read is recorded wherever
+    # it appears.
+    #
+    # It answers CONSERVATIVELY IN THE DIRECTION THAT KEEPS SOURCES.  Every
+    # construct that can skip a statement marks the statement guarded, and a
+    # construct this reader does not recognise leaves the token unmarked ONLY
+    # when nothing in the scan could have put it under one -- `goto` and
+    # labels defeat that reasoning entirely, so a body containing either is
+    # reported and the dominance question is refused for the whole walk.
+    # Losing a dominating write costs a source that is inert; inventing one
+    # deletes a real dependency, which is the error direction this file
+    # treats as disqualifying.
+    def _stmt_end(self, k, n):
+        """Index of the last token of the statement beginning at @k."""
+        if k >= n:
+            return n - 1
+        if self.toks[k][1] == '{':
+            m = self._match_fwd(k, '{', '}')
+            return m if m >= 0 else n - 1
+        d = 0
+        while k < n:
+            t = self.toks[k][1]
+            if t in '([{':
+                d += 1
+            elif t in ')]}':
+                if d == 0:
+                    return k - 1
+                d -= 1
+            elif t == ';' and d == 0:
+                return k
+            k += 1
+        return n - 1
+
+    def _expr_end(self, k, n):
+        """Index of the last token of the expression @k stands in."""
+        d = 0
+        while k < n:
+            t = self.toks[k][1]
+            if t in '([{':
+                d += 1
+            elif t in ')]}':
+                if d == 0:
+                    return k - 1
+                d -= 1
+            elif t == ';' and d == 0:
+                return k
+            k += 1
+        return n - 1
+
+    def _build_guard(self):
+        toks = self.toks
+        n = len(toks)
+        marks = [0] * (n + 1)
+
+        def mark(lo, hi):
+            if lo <= hi and lo < n:
+                marks[max(lo, 0)] += 1
+                marks[min(hi + 1, n)] -= 1
+
+        i = 0
+        while i < n:
+            t = toks[i][1]
+            if t in ('if', 'while', 'for', 'switch') and \
+                    i + 1 < n and toks[i + 1][1] == '(':
+                cp = self._match_fwd(i + 1, '(', ')')
+                if cp > 0:
+                    se = self._stmt_end(cp + 1, n)
+                    mark(cp + 1, se)
+                    # ... and the `else` clause of an `if`, which is guarded
+                    # by the negation of the same condition.
+                    k = se + 1
+                    if k < n and toks[k][1] == 'else':
+                        mark(k, self._stmt_end(k + 1, n))
+                    # AND KEEP SCANNING THE CONDITION ITSELF.  Jumping past
+                    # the closing paren skipped every `&&`, `||` and `?:`
+                    # inside a control expression, so a write in a
+                    # short-circuit right-hand side -- `if (g() && (env->fpuc
+                    # = 5))` -- was left unmarked and read as unconditional.
+                    # Marks are counted, so a nested construct marking the
+                    # same span again is harmless.
+                    i += 1
+                    continue
+            if t == 'do':
+                # The body runs at least once, but the reader does not follow
+                # `continue`, so it is marked like any other controlled
+                # statement.  Conservative in the keeping direction.
+                mark(i + 1, self._stmt_end(i + 1, n))
+            elif t == '?' or t == '&&' or t == '||':
+                # The right-hand side of a short-circuit, and both arms of a
+                # conditional expression, are evaluated conditionally.
+                mark(i, self._expr_end(i, n))
+            i += 1
+        run = 0
+        g = [False] * n
+        for k in range(n):
+            run += marks[k]
+            g[k] = run > 0
+        self._guard = g
+
+    def stmt_end_from(self, i):
+        """Index of the last token of the statement token @i is inside."""
+        return self._stmt_end(i, len(self.toks))
+
+    def guarded(self, i):
+        if self._guard is None:
+            self._build_guard()
+        return self._guard[i] if 0 <= i < len(self._guard) else True
+
+    def has_goto(self, fname):
+        """A body with a `goto` or a label: the straight line is not one."""
+        if self._has_goto is None:
+            self._has_goto = {}
+        if fname in self._has_goto:
+            return self._has_goto[fname]
+        _params, brace, end, _loc = self.funcs[fname]
+        toks = self.toks
+        bad = False
+        for k in range(brace + 1, end):
+            if toks[k][1] == 'goto':
+                bad = True
+                break
+            # `name :` at statement position is a label.  A `case`/`default`
+            # colon and the `?:` colon are excluded by their own keywords and
+            # by the preceding token.
+            if toks[k][1] == ':' and k > brace + 1 and toks[k - 1][0] == 'id' \
+                    and toks[k - 2][1] in (';', '{', '}', ':') \
+                    and toks[k - 1][1] not in ('default',):
+                bad = True
+                break
+        self._has_goto[fname] = bad
+        return bad
 
     # -- function indexing ------------------------------------------------
     def _match_back(self, i, open_t, close_t):
@@ -304,6 +444,56 @@ ACC_WIDTH = [
 ]
 
 
+#
+# THE THREE STANDARD FUNCTIONS WHOSE POINTER DIRECTIONS ARE WRITTEN DOWN.
+#
+# An undefined callee makes this reader widen every pointer it was handed to
+# READ AND WRITTEN, because it cannot see what the callee does.  For memset,
+# memcpy and memmove it does not have to see: C 7.24.6 states the direction
+# of each parameter, and the statement is as much a fact about the source as
+# a definition would be.  QEMU's own SVE predicate writer is the reason this
+# is not a convenience --
+#
+#     static uint32_t do_zero(ARMPredicateReg *d, intptr_t oprsz)
+#     { memset(d, 0, sizeof(ARMPredicateReg)); return PREDTEST_INIT; }
+#
+# -- so every helper that begins by zeroing its destination predicate had
+# that destination widened to a READ by the widening alone, and HELPER(sve_
+# whilel) then published the register it overwrites as one of its sources.
+# The widening is this reader saying it does not know; here it does.
+#
+# NOTHING ELSE IS ADDED.  A function whose direction is not stated by the
+# standard keeps the widening, which is the safe answer.
+# AND IT IS DECIDED BY THE NAME, BEFORE ANY BODY IS LOOKED UP.  On a host
+# with _FORTIFY_SOURCE the preprocessed unit CARRIES a body for memset --
+# /usr/include/.../bits/string_fortified.h:58 --
+#
+#     memset(void *__dest, int __ch, size_t __len)
+#     { return __builtin___memset_chk(__dest, __ch, __len,
+#                                     __builtin_dynamic_object_size(__dest, 0)); }
+#
+# and walking it hands __dest to two undefined builtins, which widens the
+# pointer straight back to READ AND WRITTEN.  That body is the HOST's libc
+# headers, not QEMU's source, and following it puts the build machine's
+# fortify implementation into the emulator's dataflow model.  The standard's
+# statement is the fact; the wrapper is not.
+MEM_PRIM = {
+    'memset':  {0: WR},
+    'memcpy':  {0: WR, 1: RD},
+    'memmove': {0: WR, 1: RD},
+    '__builtin_memset':  {0: WR},
+    '__builtin_memcpy':  {0: WR, 1: RD},
+    '__builtin_memmove': {0: WR, 1: RD},
+    '__builtin___memset_chk':  {0: WR},
+    '__builtin___memcpy_chk':  {0: WR, 1: RD},
+    '__builtin___memmove_chk': {0: WR, 1: RD},
+    # Neither a load nor a store: these ask how large the object a pointer
+    # designates is, which is answered from the pointer's provenance.
+    '__builtin_object_size':         {0: 0},
+    '__builtin_dynamic_object_size': {0: 0},
+}
+
+
 def _acc_of(name):
     """(direction, width) for a guest-access primitive, or None.
 
@@ -385,6 +575,20 @@ class Analysis:
         # `ri->accessfn`, whose table has hundreds of entries -- has no such
         # site and stays refused.
         self._fnframe = [{}]    # parameter name -> concrete function name
+        # THE SELF-RELOAD LEDGER.  One entry per recorded access, in the
+        # order the walk reached it, keyed by the same name the footprint is
+        # keyed by: ('env', field) or ('arg', root).  See _dominated_writes().
+        self._seq = 0
+        self.order = {}
+        # A frame reached under a condition: everything it records is
+        # conditional, whatever the callee's own body looks like.
+        self._fguard = [False]
+        # WRITES WAITING FOR THEIR OWN RIGHT-HAND SIDE.  See _defer_write().
+        self._defer = [[]]
+        # Set when any body in the walk carries a `goto` or a label, which
+        # makes "before" a statement about token order and not about
+        # execution.  The whole dominance question is then refused.
+        self.order_refused = False
         self._pending_fnroots = None
 
     def lookup(self, name):
@@ -448,9 +652,12 @@ class Analysis:
                 fnframe[params[pi][0]] = callee
         self._sframe.append(sframe)
         self._fnframe.append(fnframe)
+        self._defer.append([])
         try:
             self._scan(u, brace, end, taint, depth, fname)
         finally:
+            self._flush_defer(len(u.toks) + 1)
+            self._defer.pop()
             self._sframe.pop()
             self._fnframe.pop()
 
@@ -458,6 +665,7 @@ class Analysis:
         toks, loc = u.toks, u.loc
         i = brace + 1
         while i < end:
+            self._flush_defer(i)
             kind, txt = toks[i]
             if kind != 'id':
                 i += 1
@@ -661,7 +869,8 @@ class Analysis:
             if prev2 == '&':
                 d = RD | WR
             if field:
-                self._note_env(field, d, '%s:%d' % u.loc[j - 1], var_index)
+                self._note_env(field, d, '%s:%d' % u.loc[j - 1], var_index,
+                               self._uncond(u, j - 1, fname), u, j - 1, fname)
             return k
         # `env_cpu(env)->field` -- a CPUState member, outside this model.
         if nxt in ('->', '.'):
@@ -772,16 +981,81 @@ class Analysis:
             if root in ('cpu', 'carrier'):
                 return j
             self.arg_dir[root] = self.arg_dir.get(root, 0) | (RD | WR)
+            self._note_order(('arg', root), RD | WR, False)
             return j
         if root == 'env':
-            self._note_env(field, d, '%s:%d' % loc[i], var_index)
+            self._note_env(field, d, '%s:%d' % loc[i], var_index,
+                           self._uncond(u, i, fname), u, i, fname)
         elif root in ('cpu', 'carrier'):
             pass            # not a CPUArchState member: outside the universe
         else:
             self.arg_dir[root] = self.arg_dir.get(root, 0) | d
+            # A WRITE THROUGH A POINTER MEMBER NEVER DOMINATES.  An env field
+            # is keyed by its whole path, so a write and a read under the same
+            # key are the same bytes; a pointer argument is keyed by the
+            # POINTER, and `d->p[i] = bits` writes one element of a register
+            # that predtest_ones() then reads whole.  HELPER(sve_whileg) is
+            # exactly that shape and would come out written-only on the
+            # strength of a single-element store.  Only a call that states an
+            # EXTENT can cover the pointee, which is what MEM_PRIM does and
+            # nothing here does.
+            self._note_order(('arg', root), d, False)
         return j
 
-    def _note_env(self, field, d, where, var_index=False):
+    def _uncond(self, u, i, fname):
+        """Does this access stand on the straight line of the whole walk?"""
+        if self._fguard[-1]:
+            return False
+        if u.has_goto(fname):
+            self.order_refused = True
+            return False
+        return not u.guarded(i)
+
+    def _defer_write(self, u, i, key, uncond, fname):
+        """Sequence an assignment's WRITE after its own right-hand side.
+
+        THE ORDER THE TOKENS ARE IN IS NOT THE ORDER THEY RUN IN.  A scan
+        reaches the destination of `env->fpstt = (env->fpstt - 1) & 7` first
+        and the source second, and C evaluates them the other way round.
+        Recording the write at the token it appears on therefore made it
+        DOMINATE a read that in fact happens before it, and the dominance
+        rule then deleted a real dependency: FDECSTP, FINCSTP and fpush()
+        each read the x87 stack-top pointer to step it, and each came out
+        write-only.  That is the error direction this reader treats as
+        disqualifying, and it was caught by the whole-table A/B rather than
+        by inspection, which is why the check is here and not in a comment.
+
+        So the entry is held until the scan has passed the end of the
+        statement, and it is held PER FRAME: the callee a right-hand side
+        calls runs before the assignment completes, and its own accesses
+        must land first.
+        """
+        self._defer[-1].append((u.stmt_end_from(i), key, uncond))
+
+    def _flush_defer(self, upto):
+        lst = self._defer[-1]
+        if not lst:
+            return
+        keep = []
+        for end, key, uncond in lst:
+            if end < upto:
+                self._note_order(key, WR, uncond)
+            else:
+                keep.append((end, key, uncond))
+        self._defer[-1] = keep
+
+    def _note_order(self, key, d, uncond):
+        """One access, in walk order, for the dominance question.
+
+        @uncond says the access stands on the straight line of every body
+        that leads to it.  It is meaningful only for a WRITE; a read is
+        recorded wherever it appears and its own guard is irrelevant.
+        """
+        self.order.setdefault(key, []).append((self._seq, d, bool(uncond)))
+        self._seq += 1
+
+    def _note_env(self, field, d, where, var_index=False, uncond=False,
+                  u=None, i=None, fname=None):
         """Record one CPUArchState access, at the one place they are recorded.
 
         @field is either a member name or `member[N]` with N the constant the
@@ -795,6 +1069,65 @@ class Analysis:
         self.where.setdefault(field, where)
         if var_index:
             self.env_unbounded.add(field)
+        key = ('env', field)
+        cover = uncond and not var_index
+        if (d & WR) and u is not None:
+            # The read half lands now; the write half waits for the
+            # right-hand side it is the destination of.
+            if d & RD:
+                self._note_order(key, RD, False)
+            self._defer_write(u, i, key, cover, fname)
+        else:
+            self._note_order(key, d, cover)
+
+    def self_reloaded(self):
+        """The names whose every READ is of bytes this call already WROTE.
+
+        A published source is a claim that the instruction's result can be
+        changed by changing that register.  It cannot be, when every read of
+        the register in the closed body is preceded on every path by a write
+        of the same bytes by the same call: overwrite the register with
+        anything and the helper's answer is identical, because the value it
+        reads is the one it just stored.  QEMU writes exactly that shape in
+        two independent places --
+
+            cpu_set_fpuc(): `env->fpuc = fpuc` and then update_fp_status(),
+            which re-derives the softfloat rounding mode by READING
+            env->fpuc (target/i386/cpu.h:2730-2731);
+
+            cpu_set_fpus(): `env->fpus = fpus & ~0x3800 & ~FPUS_B` and then
+            `env->fpus |= env->fpus & FPUS_SE ? FPUS_B : 0`
+            (target/i386/tcg/fpu_helper.c:2519-2520)
+
+        -- and both put a register on the wire as a source of an instruction
+        that overwrites it: FLDCW, FLDENV, LDMXCSR, VLDMXCSR.
+
+        THE RULE IS ORDER PLUS DOMINANCE, and both halves are load-bearing.
+        The dominating write must stand on the straight line of every body
+        that led to it (see Unit.guarded and the frame guard), and it must
+        come BEFORE the read in walk order -- a write after a read does not
+        dominate it, and a write inside a loop whose read precedes it does
+        not either.
+
+        REFUSED WHOLESALE when any body in the walk carries a `goto` or a
+        label: "before" is then a fact about tokens and not about execution.
+        An unbounded array write is not a dominating write either -- it names
+        no element, so it cannot be said to cover the element that is read.
+        """
+        if self.order_refused:
+            return set()
+        out = set()
+        for key, entries in self.order.items():
+            dom = None
+            for seq, d, uncond in entries:
+                if (d & WR) and uncond:
+                    dom = seq
+                    break
+            if dom is None:
+                continue
+            if all(seq > dom for seq, d, _u in entries if d & RD):
+                out.add(key)
+        return out
 
     def _scalar_roots(self, u, args):
         """Actual arguments that are a bare scalar this frame can name."""
@@ -902,6 +1235,7 @@ class Analysis:
         if cur:
             args.append(cur)
 
+        prim = MEM_PRIM.get(callee)
         cu, cf = self.lookup(callee)
         pass_roots = {}
         acc = _acc_of(callee)
@@ -950,6 +1284,42 @@ class Analysis:
                 pass_roots[ai] = 'carrier'
         if acc and pass_roots.get(0) == 'env':
             self._guest_access(u, i, acc, args, fname)
+        # A STATED DIRECTION SETTLES THE CALL.  Checked before the callee's
+        # body, for the reason MEM_PRIM's own comment gives -- and never for
+        # the env view, whose whole-struct footprint the name does not bound,
+        # so that case falls through to the refusal it already had.
+        # AND ONLY WHERE THE CALL ITSELF IS UNCONDITIONAL.  A memset the body
+        # performs on ONE PATH says the bytes are written on that path; it
+        # says nothing about the others, and on those the pointee keeps the
+        # value it had -- which is a read of it.  HELPER(sve_brkn) is the
+        # whole argument:
+        #
+        #     if (!last_active_pred(vn, vg, oprsz)) { do_zero(vd, oprsz); }
+        #
+        # BRKN zeroes its destination or LEAVES IT STANDING, and R17 states
+        # what that is: "a merging form writes its destination whether or not
+        # the governing predicate selects any element, because the
+        # architecture defines the unselected elements as retaining their
+        # previous value, which is a read-modify-write of the same register
+        # and not an absence of one."  Narrowing it to write-only deleted
+        # that dependency, and eight SVE gather loads whose every memset is
+        # inside an `if` went the same way.  A conditional primitive
+        # therefore keeps the widening it would otherwise replace.
+        if prim is not None and pass_roots and \
+                'env' not in pass_roots.values() and \
+                self._uncond(u, i, fname):
+            for ai, r in pass_roots.items():
+                if r in ('cpu', 'carrier'):
+                    continue
+                d = prim.get(ai)
+                if d is None:
+                    self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
+                    self._note_order(('arg', r), RD | WR, False)
+                    continue
+                if d:
+                    self.arg_dir[r] = self.arg_dir.get(r, 0) | d
+                    self._note_order(('arg', r), d, bool(d & WR))
+            return
         if pass_roots:
             if cf is None:
                 if 'env' in pass_roots.values():
@@ -965,16 +1335,179 @@ class Analysis:
                     # hand rather than assumed harmless.
                     self.cpu_escapes.append((callee, '%s:%d' % u.loc[i]))
                 for r in pass_roots.values():
-                    if r not in ('env', 'cpu', 'carrier'):
-                        self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
+                    if r in ('env', 'cpu', 'carrier'):
+                        continue
+                    self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
+                    # An ESCAPE is not a stated direction.  The widening
+                    # above is this reader saying it does not know, so it can
+                    # neither dominate a later read nor be dominated by an
+                    # earlier write: it is recorded conditional and carries a
+                    # read, which keeps the source.
+                    self._note_order(('arg', r), RD | WR, False)
                 return
             self._pending_sroots = self._scalar_roots(u, args)
             self._pending_fnroots = self._fn_roots(u, args, taint)
             if acc:
                 self._in_acc += 1
+            # A CALL UNDER A CONDITION MAKES ITS WHOLE BODY CONDITIONAL.
+            # cpu_set_fpuc() writes env->fpuc on its straight line and then
+            # calls update_fp_status() from inside `if (tcg_enabled())`; the
+            # reads in that callee are conditional even though they sit on
+            # the callee's own straight line, and a write there could not
+            # dominate anything.  The guard travels with the frame.
+            self._fguard.append(self._fguard[-1] or u.guarded(i)
+                                or u.has_goto(fname))
             try:
                 self._walk(cu, callee, pass_roots, depth + 1)
             finally:
+                self._fguard.pop()
                 self._pending_sroots = None
                 if acc:
                     self._in_acc -= 1
+
+
+# ---------------------------------------------------------------------------
+# SELFTEST -- the dominance rule, on bodies whose answer is written down.
+#
+# The rule deletes published sources, so every arm below states the shape and
+# the answer it must give, and the SHAPES THAT MUST NOT NARROW outnumber the
+# ones that must.  Two of them are here because the first cut got them wrong:
+# `x = x - 1` (an assignment's destination is scanned BEFORE its source and
+# runs after it -- FDECSTP, FINCSTP and fpush() each came out write-only) and
+# a write through a pointer member (one element of a register does not cover
+# the register HELPER(sve_whileg) then reads whole).
+# ---------------------------------------------------------------------------
+_SELFTEST = [
+    # (name, body, expected env dirs, expected arg dirs)
+    ('write_then_read_same_body',
+     'void helper_t(CPUArchState *env) { env->fpuc = 5; f(env->fpuc); }',
+     {'fpuc': WR}, {}),
+    ('read_on_own_rhs',
+     'void helper_t(CPUArchState *env) { env->fpstt = (env->fpstt - 1) & 7; }',
+     {'fpstt': RD | WR}, {}),
+    ('read_before_write',
+     'void helper_t(CPUArchState *env) { f(env->fpuc); env->fpuc = 5; }',
+     {'fpuc': RD | WR}, {}),
+    ('write_guarded_by_if',
+     'void helper_t(CPUArchState *env) { if (g()) { env->fpuc = 5; } '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('read_guarded_after_write',
+     'void helper_t(CPUArchState *env) { env->fpuc = 5; if (g()) '
+     '{ f(env->fpuc); } }',
+     {'fpuc': WR}, {}),
+    ('write_in_else',
+     'void helper_t(CPUArchState *env) { if (g()) h(); else env->fpuc = 5; '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('write_in_loop',
+     'void helper_t(CPUArchState *env) { for (i = 0; i < 4; i++) '
+     '{ env->fpuc = 5; } f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('write_in_shortcircuit_rhs',
+     'void helper_t(CPUArchState *env) { if (g() && (env->fpuc = 5)) h(); '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('write_in_conditional_arm',
+     'void helper_t(CPUArchState *env) { x = g() ? (env->fpuc = 5) : 0; '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('write_then_read_across_call',
+     'static void inner(CPUArchState *e) { f(e->fpuc); }\n'
+     'void helper_t(CPUArchState *env) { env->fpuc = 5; inner(env); }',
+     {'fpuc': WR}, {}),
+    ('write_then_guarded_call_reads',
+     'static void inner(CPUArchState *e) { f(e->fpuc); }\n'
+     'void helper_t(CPUArchState *env) { env->fpuc = 5; if (g()) inner(env); }',
+     {'fpuc': WR}, {}),
+    ('call_under_if_writes',
+     'static void inner(CPUArchState *e) { e->fpuc = 5; }\n'
+     'void helper_t(CPUArchState *env) { if (g()) inner(env); '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('goto_refuses',
+     'void helper_t(CPUArchState *env) { env->fpuc = 5; goto out; out: '
+     'f(env->fpuc); }',
+     {'fpuc': RD | WR}, {}),
+    ('unbounded_index_does_not_cover',
+     'void helper_t(CPUArchState *env) { env->fptags[i] = 0; '
+     'f(env->fptags[j]); }',
+     {'fptags': RD | WR}, {}),
+    ('rmw_alone',
+     'void helper_t(CPUArchState *env) { env->fpuc |= 1; }',
+     {'fpuc': RD | WR}, {}),
+    ('memset_arg_is_write_only',
+     'static void z(P *d) { memset(d, 0, sizeof(P)); }\n'
+     'void helper_t(void *vd) { P *d = vd; z(d); f(d->p[0]); }',
+     {}, {0: WR}),
+    ('memset_under_if_does_not_cover',
+     'static void z(P *d) { memset(d, 0, sizeof(P)); }\n'
+     'void helper_t(void *vd) { P *d = vd; if (g()) z(d); f(d->p[0]); }',
+     {}, {0: RD | WR}),
+    # HELPER(sve_brkn): the ONLY write is conditional and there is no read
+    # after it, so nothing else can put the read back.  The unwritten path
+    # leaves the register standing, which is a read of it.
+    ('conditional_memset_only_keeps_the_read',
+     'static void z(P *d) { memset(d, 0, sizeof(P)); }\n'
+     'void helper_t(void *vd) { if (g()) z(vd); }',
+     {}, {0: RD | WR}),
+    ('conditional_memset_in_else_keeps_the_read',
+     'static void z(P *d) { memset(d, 0, sizeof(P)); }\n'
+     'void helper_t(void *vd) { if (g()) h(); else z(vd); }',
+     {}, {0: RD | WR}),
+    ('member_write_does_not_cover_pointee',
+     'void helper_t(void *vd) { P *d = vd; d->p[i] = 1; f(d->p[j]); }',
+     {}, {0: RD | WR}),
+    ('memcpy_directions',
+     'void helper_t(void *vd, void *vs) { memcpy(vd, vs, 8); }',
+     {}, {0: WR, 1: RD}),
+    ('undefined_callee_still_widens',
+     'void helper_t(void *vd) { P *d = vd; opaque(d); f(d->p[0]); }',
+     {}, {0: RD | WR}),
+]
+
+
+def _selftest():
+    import tempfile
+    bad = 0
+    for name, body, want_env, want_arg in _SELFTEST:
+        with tempfile.NamedTemporaryFile('w', suffix='.i', delete=False) as fh:
+            fh.write(body + '\n')
+            path = fh.name
+        try:
+            u = Unit(path)
+            params = u.funcs['helper_t'][0]
+            roots = {}
+            for k, (nm, star, _ni, text) in enumerate(params):
+                if star:
+                    roots[k] = 'env' if 'CPUArchState' in text else k
+            a = Analysis(u)
+            a.run('helper_t', roots)
+            rel = a.self_reloaded()
+            got_env = {}
+            for f, d in a.env_fields.items():
+                got_env[f] = d & ~RD if ('env', f) in rel else d
+            got_arg = {}
+            for r, d in a.arg_dir.items():
+                got_arg[r] = d & ~RD if ('arg', r) in rel else d
+            ok = got_env == want_env and got_arg == want_arg
+            if not ok:
+                bad += 1
+                print('FAIL %-36s env=%s want=%s  arg=%s want=%s'
+                      % (name, got_env, want_env, got_arg, want_arg))
+            else:
+                print('ok   %s' % name)
+        except Exception as e:                    # noqa: BLE001
+            bad += 1
+            print('FAIL %-36s raised %s: %s' % (name, type(e).__name__, e))
+        finally:
+            os.unlink(path)
+    print('%d arm(s), %d failure(s)' % (len(_SELFTEST), bad))
+    return 1 if bad else 0
+
+
+if __name__ == '__main__':
+    import os
+    if '--selftest' in sys.argv:
+        sys.exit(_selftest())
+    sys.exit('usage: canalyze.py --selftest')

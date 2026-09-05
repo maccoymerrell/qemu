@@ -645,7 +645,7 @@ static const DfHelperUsage df_helper_usage[] = {
       dfu_sve_st1bb_r_env, ARRAY_SIZE(dfu_sve_st1bb_r_env), true,
       "../target/arm/tcg/sve_helper.c:6681",
       dfu_sve_st1bb_r_acc, ARRAY_SIZE(dfu_sve_st1bb_r_acc) },
-    { "sve_whilel", { 3 }, { 1 },
+    { "sve_whilel", { 2 }, { 1 },
       NULL, 0, true,
       "../target/arm/tcg/sve_helper.c:4143",
       NULL, 0 },

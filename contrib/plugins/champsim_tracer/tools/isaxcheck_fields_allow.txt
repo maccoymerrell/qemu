@@ -9268,7 +9268,6 @@ aarch64 SR-rd-phantom smlslt +REG_SYSFPEN
 aarch64 SR-rd-phantom smmla +REG_SYSFPEN
 aarch64 SR-rd-phantom smopa +REG_SYSFPEN
 aarch64 SR-rd-phantom smov +REG_SYSFPEN
-aarch64 SR-rd-phantom smstart +REG_SYSFPEN,REG_VCTRL
 aarch64 SR-rd-phantom smstop +REG_SYSFPEN,REG_VCTRL
 aarch64 SR-rd-phantom smulh +REG_SYSFPEN
 aarch64 SR-rd-phantom smulh +REG_SYSFPEN,REG_VEC#
@@ -11864,3 +11863,37 @@ mipsel SR-rd-phantom yield +REG_SYSEXC
 # superset of the reference's, which is the direction this file exists to
 # record.
 x86_64 SR-rd-phantom syscall +REG_FLAGS
+
+
+# --- ADDENDUM (exec129): the CP-H fold re-pointed the SME enable-gate row.
+#
+# Landing the whole-population aarch64 usage table moved exactly THREE
+# encodings on the wire, all `smstart`, all in one direction: the table now
+# states helper_set_svcr()'s read of the FP status file, so the gate row's
+# qualifier GREW by REG_FCSR and the old row stopped matching anything.
+# It is emitted here by the generator from the arm's own residue, and the row
+# it replaces is deleted in the same commit -- a dead row and a missing row are
+# the two failures this family's generator exists to make impossible.
+
+# --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
+#     1 signature(s), 3 encodings at this tip.
+#
+# Every FP, AdvSIMD, SVE and SME instruction runs an architectural enable check
+# before it does anything -- CheckFPAdvSIMDEnabled, CheckSVEEnabled,
+# CheckSMEEnabled (Arm ARM DDI 0487) -- and that check READS CPACR_EL1.FPEN and
+# the CPTR_EL{2,3} traps.  QEMU states the read at translation time
+# (fp_access_check() / sve_access_check() in target/arm/tcg/translate-a64.c),
+# so it reaches the wire's ordered read list on the whole FP population.
+# REG_SYSFPEN exists because that population is every FP instruction in the
+# ISA: folded into the residual REG_SYS, one TTBR write would order all of them
+# behind it.  LLVM's MCInstrDesc models no enable check on any instruction, so
+# this is a phantom by construction and not a disagreement about dataflow.
+#
+# Where the qualifier names REG_VEC# beside the gate, the extra register is the
+# instruction's own DESTINATION, read for the same reason the RVV block above
+# gives: the predicated and merging forms leave the inactive elements of Zd
+# standing, so Zd is a source.  Where it names REG_FCSR the register is FPSR,
+# whose QC bit these forms make STICKY -- read-modify-written, not written --
+# and where it names REG_FPCW it is FPCR, the control word every FP instruction
+# reads.
+aarch64 SR-rd-phantom smstart +REG_FCSR,REG_SYSFPEN,REG_VCTRL

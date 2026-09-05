@@ -4736,6 +4736,184 @@ def qemu_x86_reg_keys() -> dict[str, QemuRegKey]:
     return gdb_xml_reg_key_map(("i386-64bit.xml",))
 
 
+# ---------------------------------------------------------------------
+# THE SECOND ROW SOURCE: the register files a TARGET DECLARES.
+#
+# The GDB stub's namespace is not the whole of what QEMU can name.  A
+# target also says, at the place it registers its TCG globals, which
+# CPUArchState byte ranges ARE architectural registers --
+# insn_dataflow_declare_regfile(base, names, off, stride, elem, n) -- and
+# insn_dataflow_field_reg() answers with those spellings.  Six of
+# AArch64's eight declared files name registers the stub does not carry
+# at all: TPIDR_EL0 and GCR_EL1 live in cp15, CPACR_EL1 is resolved into
+# the TB flags, the softfloat status array and FPSR.QC are QEMU's split
+# of the FP status word, and SVCR is SME's mode control.
+#
+# THIS IS THE csr_ops[] SHAPE, ONE TARGET OVER.  RISC-V's CSR space had
+# the same defect for the same reason: gen_note_csr_read() stated a READ
+# by a name the QEMU-indexed table had no row for, generic_for_qemu_name()
+# returned REG_ID_COUNT, and the member was dropped with a `name-word`
+# tally (e27aa69cc9 measured 1,817 encodings on it).  The answer there was
+# that csr_ops[] IS the namespace, so csr_ops[] is what is read.  The
+# answer here is the same: the DECLARATIONS are a namespace QEMU answers
+# in, so the declarations are what is read.
+#
+# The names have been ANSWERED all along -- by fold_nonarch() in
+# champsim_tracer_irdf.cc, a hand-written spelling->word map whose every
+# arm for one of these six said, in writing, that the generated table
+# "cannot carry a row" for a declared name.  That sentence is what stops
+# being true here, so those arms go with the change rather than staying as
+# a second authority for a question this table now answers.
+ARM_DECLARED_FEATURE = "qemu.declared-regfile"
+ARM_TRANSLATE_A64_C = ROOT / "target" / "arm" / "tcg" / "translate-a64.c"
+ARM_CPU_H = ROOT / "target" / "arm" / "cpu.h"
+
+# insn_dataflow_declare_regfile("base", <names>, <off>, <stride>, <elem>,
+#                               <n>);
+# Only the base, the names argument and the count are read here: the
+# offsets are the compiler's business and nothing in this file could check
+# them anyway.
+_ARM_DECLARE_RE = re.compile(
+    r'insn_dataflow_declare_regfile\(\s*"([a-z0-9_]+)"\s*,\s*'
+    r'([A-Za-z0-9_]+)\s*,'
+    r'(?:[^;]*?),\s*([^,;]+?)\s*\)\s*;', re.DOTALL)
+
+# ARRAY_SIZE(((CPUARMState *)0)->vfp.zregs) -- the only count expression
+# the declarations use besides a literal.
+_ARM_ARRAY_SIZE_RE = re.compile(
+    r'^ARRAY_SIZE\(\s*\(\(CPUARMState\s*\*\)0\)->([A-Za-z0-9_.]+)\s*\)$')
+
+
+def _arm_array_dim(member: str) -> int:
+    """The declared dimension of a CPUARMState array, from cpu.h."""
+    leaf = member.rsplit(".", 1)[-1]
+    text = ARM_CPU_H.read_text()
+    hits = re.findall(rf'^\s*\w[\w ]*\s{re.escape(leaf)}\[([A-Za-z0-9_]+)\]',
+                      text, re.MULTILINE)
+    if len(hits) != 1:
+        raise SystemExit(f"{ARM_CPU_H}: {leaf}[] declared {len(hits)} times")
+    dim = hits[0]
+    if dim.isdigit():
+        return int(dim)
+    defines = re.findall(rf'^#define\s+{re.escape(dim)}\s+(\d+)\s*$',
+                         text, re.MULTILINE)
+    if len(defines) != 1:
+        raise SystemExit(f"{ARM_CPU_H}: {leaf}[{dim}] -- {dim} is not one "
+                         f"integer #define ({len(defines)} found)")
+    return int(defines[0])
+
+
+@lru_cache(maxsize=None)
+def qemu_arm_declared_names() -> tuple[tuple[str, str], ...]:
+    """(base, runtime name) for every register translate-a64.c declares.
+
+    The runtime spelling is insn_dataflow_field_reg()'s: the base alone
+    for a file of one, "base<idx>" otherwise.  A declaration passing an
+    explicit name table would need that table parsed instead of pasted
+    onto, so it REFUSES rather than guessing -- AArch64 passes NULL for
+    all eight and a target that stops doing so must be read, not assumed.
+    """
+    try:
+        text = ARM_TRANSLATE_A64_C.read_text()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"could not read {ARM_TRANSLATE_A64_C}") from exc
+    found = _ARM_DECLARE_RE.findall(text)
+    if not found:
+        raise SystemExit(f"no insn_dataflow_declare_regfile() calls parsed "
+                         f"out of {ARM_TRANSLATE_A64_C}")
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for base, names_arg, count_expr in found:
+        if names_arg != "NULL":
+            raise SystemExit(
+                f"{ARM_TRANSLATE_A64_C}: regfile \"{base}\" declares an "
+                f"explicit name table ({names_arg}); this parser pastes an "
+                f"index onto the base and must not guess at one")
+        count_expr = count_expr.strip()
+        if count_expr.isdigit():
+            count = int(count_expr)
+        else:
+            m = _ARM_ARRAY_SIZE_RE.match(count_expr)
+            if not m:
+                raise SystemExit(
+                    f"{ARM_TRANSLATE_A64_C}: regfile \"{base}\" has count "
+                    f"expression {count_expr!r}, which this parser cannot "
+                    f"resolve")
+            count = _arm_array_dim(m.group(1))
+        if count < 1:
+            raise SystemExit(f"{ARM_TRANSLATE_A64_C}: regfile \"{base}\" "
+                             f"declares {count} registers")
+        if base in seen:
+            raise SystemExit(f"{ARM_TRANSLATE_A64_C}: regfile \"{base}\" "
+                             f"declared twice")
+        seen.add(base)
+        if count == 1:
+            out.append((base, base))
+        else:
+            out.extend((base, f"{base}{idx}") for idx in range(count))
+    return tuple(out)
+
+
+# One generic word per DECLARED register the stub does not carry, chosen
+# by the register's role and by the word the wire already publishes for
+# it.  Every one of these six is a spelling meeting a word that exists --
+# nothing new is minted here, which is the same discipline
+# RISCV_CSR_GROUPS applies to the CSR space.  A declared name matching no
+# rule is a CONFLICT that refuses the table: declaring a regfile upstream
+# must force the adjudication, never inherit one.
+ARM_DECLARED_GROUPS: tuple[tuple[str, str, str], ...] = (
+    (r"tpidr_el0", "REG_TLS",
+     "the THREAD POINTER, cp15.tpidr_el[0].  REG_TLS is the vocabulary's "
+     "own word for this register and names it outright (\"AArch64 "
+     "TPIDR_EL0 / MIPS CP0_UserLocal\")"),
+    (r"cpacr_el1", "REG_SYSFPEN",
+     "the FP/SIMD EXECUTION-ENABLE GATE, a source of every instruction it "
+     "gates (R7.4).  REG_SYSFPEN is the vocabulary's word for it and "
+     "names it in those terms; CPTR_EL2/EL3 are the same gate at the "
+     "higher exception levels and the declaration names EL1 alone"),
+    (r"fp_status\d+", "REG_FCSR",
+     "the SOFTFLOAT STATUS FILE: QEMU's split of the architectural FP "
+     "control-and-status file by operating regime.  The generator's "
+     "standing rule for a control-and-status file that cannot be split "
+     "into control and status halves is REG_FCSR, and the element number "
+     "is a storage fact, not an architectural one"),
+    (r"fpsr_qc", "REG_FCSR",
+     "FPSR.QC, the cumulative saturation bit, held in vfp.qc[] so a gvec "
+     "op can OR into it.  The SAME architectural register as the status "
+     "file above -- FPSR bit 27 -- reaching the same word by the same "
+     "rule; the two spellings exist because the two byte ranges do"),
+    (r"gcr_el1", "REG_SYS",
+     "the tag-generation control `irg` reads.  REG_SYS is the "
+     "vocabulary's residual privileged-file word, it has no finer class "
+     "for a tag-generation control, and REG_SYS is what the wire already "
+     "publishes for this register"),
+    (r"svcr", "REG_VCTRL",
+     "SME's streaming-mode and ZA-enable control.  REG_VCTRL is the word "
+     "for the state that says how wide a vector operation is and how much "
+     "of it is active -- SVE's `vg` and RISC-V's `vl`/`vtype` seat there "
+     "-- and SVCR.SM selects between the non-streaming and the streaming "
+     "vector length while SVCR.ZA gates the ZA array.  BY ROLE, not by "
+     "elimination, and it is what the boundary already publishes from the "
+     "AARCH64_OP_SVCR sysop operand"),
+)
+
+_ARM_DECLARED_RE = tuple(
+    (re.compile(pattern), reg_id, reason)
+    for pattern, reg_id, reason in ARM_DECLARED_GROUPS)
+
+
+def arm_declared_entry(name: str) -> tuple[RegEntry | None, str]:
+    """The adjudicated word for a declared register the stub omits."""
+    hits = [(reg_id, reason) for pattern, reg_id, reason in _ARM_DECLARED_RE
+            if pattern.fullmatch(name)]
+    if len(hits) != 1:
+        # Two rules claiming one register is two adjudications of the
+        # same row; zero is an unadjudicated declaration.  Either way no
+        # answer, and qemu_reg_rows() raises it.
+        return None, ""
+    return RegEntry(hits[0][0]), hits[0][1]
+
+
 @lru_cache(maxsize=None)
 def qemu_aarch64_reg_keys() -> dict[str, QemuRegKey]:
     regs = dict(gdb_xml_reg_key_map(("aarch64-core.xml", "aarch64-fpu.xml")))
@@ -4745,6 +4923,13 @@ def qemu_aarch64_reg_keys() -> dict[str, QemuRegKey]:
     add_sequential_qemu_reg_keys(regs, "p", 16, sve_feature)
     add_qemu_reg_key(regs, "ffr", sve_feature)
     add_qemu_reg_key(regs, "vg", sve_feature)
+    # The declared files LAST and only where the stub is silent: `v<n>`
+    # and `fpcr` are declared under the stub's own spellings (the sites
+    # say so), and re-keying either into a synthetic feature would move a
+    # register out of the namespace whose handle reads its VALUE.
+    for _base, name in qemu_arm_declared_names():
+        if name not in regs:
+            add_qemu_reg_key(regs, name, ARM_DECLARED_FEATURE)
     return regs
 
 
@@ -5533,6 +5718,7 @@ def apply_regs_one(info: IsaInfo) -> None:
 QREG_UNNAMED = 0
 QREG_ROUTED = 1
 QREG_PREDICATED = 2
+QREG_DECLARED = 3
 
 
 @dataclass(frozen=True)
@@ -5552,12 +5738,22 @@ class QemuRegRow:
     # class's VALUE, because a register the running CPU does not expose
     # reads back as a width-0 field and would displace a member that does.
     predicated: bool = False
+    # True on a row whose register QEMU names only through a TARGET
+    # DECLARATION -- insn_dataflow_declare_regfile() -- and not through
+    # its GDB stub.  Same division of labour as `predicated`: the row
+    # ANSWERS what generic word the name is, and must not stand for its
+    # class's VALUE, because qemu_plugin_get_registers() has no handle
+    # for a register outside the stub's namespace and one such row
+    # winning the class would displace a member that can be read.
+    declared: bool = False
 
     @property
     def tier(self) -> int:
         if self.cap_rows:
             return QREG_ROUTED
-        return QREG_PREDICATED if self.predicated else QREG_UNNAMED
+        if self.predicated:
+            return QREG_PREDICATED
+        return QREG_DECLARED if self.declared else QREG_UNNAMED
 
 
 # ---------------------------------------------------------------------------
@@ -5756,6 +5952,20 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
                     f"but is reachable from {len(routed)} Capstone row(s)")
         else:
             entry, reason = qemu_only_reg_entry(info, key)
+        declared = key.feature == ARM_DECLARED_FEATURE
+        if declared and not routed:
+            # The declarations are their own namespace and are adjudicated
+            # by their own table, for the reason the CSR space is: the
+            # question "what generic word is this register" is the same one
+            # either way, and a QEMU_ONLY_REG_IDS rule cannot be keyed on a
+            # register the stub's namespace does not contain.
+            entry, reason = arm_declared_entry(key.name)
+            if entry is None:
+                conflicts.append(
+                    f"{key.feature}:{key.name} is a register "
+                    f"insn_dataflow_declare_regfile() names that "
+                    f"ARM_DECLARED_GROUPS does not adjudicate (or "
+                    f"adjudicates twice)")
         predicated = (info.key == "riscv" and
                       key.feature == QEMU_RISCV_CSR_FEATURE)
         if predicated and not routed:
@@ -5771,7 +5981,7 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
         qemu_only.pop((key.feature, key.name), None)
         rows.append(QemuRegRow(key.feature, key.name, entry,
                                tuple(sorted(c for c, _ in routed)), reason,
-                               predicated))
+                               predicated, declared))
     # A rule naming no register in the namespace is dead: it can never fire,
     # and a dead rule that reads as coverage is how an allowlist lies.
     for feature, name in sorted(qemu_only):
@@ -5782,7 +5992,8 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
 
 def format_qemu_reg_row(row: QemuRegRow) -> str:
     tier = {QREG_ROUTED: "QREG_ROUTED",
-            QREG_PREDICATED: "QREG_PREDICATED"}.get(row.tier, "QREG_UNNAMED")
+            QREG_PREDICATED: "QREG_PREDICATED",
+            QREG_DECLARED: "QREG_DECLARED"}.get(row.tier, "QREG_UNNAMED")
     if row.entry is None:
         body = ".reg_id = REG_NONE"
     elif row.entry.aliases:
@@ -5810,6 +6021,7 @@ def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
     guard = f"CHAMPSIM_TRACER_QEMU_REGS_{info.key.upper()}_H"
     routed = sum(1 for r in rows if r.tier == QREG_ROUTED)
     classified = sum(1 for r in rows if r.entry is not None)
+    declared = sum(1 for r in rows if r.tier == QREG_DECLARED)
     lines = [
         f"#ifndef {guard}",
         f"#define {guard}",
@@ -5818,9 +6030,13 @@ def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
         f" * QEMU-indexed register table for {info.key} -- auto-generated by",
         f" * {Path(__file__).name} --qemu-regs.  Do not hand-edit a row.",
         " *",
-        " * One row per register in QEMU's GDB-stub namespace -- the",
-        " * namespace qemu_plugin_get_registers() reports -- sorted by",
-        " * (feature, name) so a consumer can bisect.  This is the",
+        " * One row per register QEMU can NAME: its GDB-stub",
+        " * namespace -- what qemu_plugin_get_registers() reports --",
+        " * plus the register files the target DECLARES to the",
+        " * dataflow extractor (insn_dataflow_declare_regfile), which",
+        " * insn_dataflow_field_reg() answers in and the stub need not",
+        " * carry.  Sorted by (feature, name) so a consumer can",
+        " * bisect.  This is the",
         " * authority for what generic dependency slot a register is;",
         " * the Capstone-keyed table is a route to these rows and is",
         " * cross-checked against them at install.",
@@ -5836,6 +6052,11 @@ def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
         " *                 filtered through csr_ops[].predicate).  The",
         " *                 row answers what generic word the NAME is;",
         " *                 it does not stand for its class's VALUE.",
+        " *   QREG_DECLARED  QEMU names it only through a target",
+        " *                 declaration and its GDB stub does not carry",
+        " *                 it, so no handle can read the register.",
+        " *                 Same division as QREG_PREDICATED: the row",
+        " *                 answers the NAME, never the VALUE.",
         " *",
         " * SPDX-License-Identifier: GPL-2.0-or-later",
         " * Author: Maccoy Merrell",
@@ -5843,7 +6064,8 @@ def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
         "",
         f"/* {info.key}: {len(rows)} QEMU registers, {routed} reachable from",
         f" * Capstone, {len(rows) - routed} reachable only by QEMU identity,",
-        f" * {classified} carrying a generic id. */",
+        f" * {declared} of those named by a target declaration rather than by",
+        f" * the GDB stub, {classified} carrying a generic id. */",
         f"static const QemuRegRow qemu_regs_{info.key}[] = {{",
     ]
     lines.extend(format_qemu_reg_row(row) for row in rows)
@@ -5862,11 +6084,29 @@ def qemu_regs_census(info: IsaInfo, rows: list[QemuRegRow],
     routed = [r for r in rows if r.tier == QREG_ROUTED]
     unnamed = [r for r in rows if r.tier == QREG_UNNAMED]
     predicated = [r for r in rows if r.tier == QREG_PREDICATED]
+    declared = [r for r in rows if r.tier == QREG_DECLARED]
     print(f"===== {info.key}: QEMU-indexed registers =====")
     print(f"QEMU namespace: {len(rows)} registers")
     print(f"  reachable from a Capstone operand: {len(routed)}")
     print(f"  reachable ONLY by QEMU identity:   {len(unnamed)}")
     print(f"  predicate-gated (name -> word only): {len(predicated)}")
+    print(f"  target-declared (name -> word only):  {len(declared)}")
+    if info.key == "aarch64":
+        pairs = qemu_arm_declared_names()
+        bases = list(dict.fromkeys(base for base, _ in pairs))
+        by_stub = sum(1 for _, name in pairs
+                      if qemu_reg_key_by_name(info.key, name).feature
+                      != ARM_DECLARED_FEATURE)
+        print(f"  THE DECLARED UNION: {len(bases)} declarations in "
+              f"{ARM_TRANSLATE_A64_C.name} naming {len(pairs)} registers; "
+              f"{by_stub} of them the GDB stub already carries, "
+              f"{len(pairs) - by_stub} it does not")
+        for base in bases:
+            names = [n for b, n in pairs if b == base]
+            new = [n for n in names
+                   if qemu_reg_key_by_name(info.key, n).feature
+                   == ARM_DECLARED_FEATURE]
+            print(f"      {base}: {len(names)} name(s), {len(new)} new")
     for row in unnamed[:max_lines]:
         print(f"      {row.feature}:{row.name}")
     if len(unnamed) > max_lines:

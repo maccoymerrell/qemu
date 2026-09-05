@@ -468,42 +468,43 @@ uint8_t fold_nonarch(const char *name)
         return REG_LR;
     }
     /*
-     * The THREAD POINTER, on the two targets that hold it in a place no
-     * name reaches.
+     * THE SIX AARCH64 ARMS THAT USED TO BE HERE ARE GONE, AND WHY THEY
+     * WERE HERE IS WHY THEY ARE NOT.
      *
-     * Both are DECLARED REGFILE names rather than TCG globals -- aarch64's
-     * TPIDR_EL0 lives in cp15 and mipsel's is active_tc.CP0_UserLocal --
-     * and neither appears in its target's GDB-stub namespace (#240), so the
-     * generated QEMU-indexed table cannot carry a row for either: a
-     * QEMU_ONLY_REG_IDS rule naming a register the namespace does not
-     * contain is dead by construction and the generator rejects it.  This
-     * map is the place a QEMU spelling with no table row meets its word,
-     * which is exactly what it already does for "lr" and "x8/s0" above.
+     * `tpidr_el0`, `cpacr_el1`, `fpsr_qc`, `gcr_el1`, `svcr` and the
+     * `fp_status<n>` file each had an arm whose written justification was
+     * the same sentence: the register is a DECLARED REGFILE name rather
+     * than a TCG global, its target's GDB stub does not carry it, and "the
+     * generated QEMU-indexed table cannot carry a row" for it -- so this
+     * hand-written map was the only place the spelling could meet its word.
      *
-     * REG_TLS is the vocabulary's own word for this register and names both
-     * of them by name (champsim_tracer_generic_ids.h: "the thread pointer
-     * -- AArch64 TPIDR_EL0 / MIPS CP0_UserLocal"), so nothing is invented
-     * here; the spelling is being connected to a word that already exists.
+     * That sentence stopped being true.  The generated table's namespace is
+     * now the stub's namespace PLUS the files the target declares
+     * (insn_dataflow_declare_regfile), because those declarations are a
+     * namespace QEMU answers in -- the csr_ops[] shape one target over, and
+     * for the identical reason.  All six are rows in
+     * champsim_tracer_qemu_regs_aarch64.h, adjudicated at
+     * ARM_DECLARED_GROUPS with the words this map gave them, and
+     * generic_for_qemu_name() answers before this function is ever
+     * consulted.
+     *
+     * They are DELETED rather than kept as agreeing fallbacks.  An arm
+     * whose stated reason for existing is false is the shape a dead
+     * allowlist rule takes: it reads as coverage, it can never fire, and
+     * the next reader has no way to tell which of the two authorities
+     * answered.  The `FPCR` arm below is the case that IS kept, and the
+     * difference is that it arrives by a different door -- an
+     * ARMCPRegInfo::name, not a declaration -- so it is a real fallback
+     * that must agree with a real route.
+     *
+     * `userlocal` stays: mipsel's thread pointer is declared the same way,
+     * but the MIPS namespace has no declared rows and this map is still the
+     * only place its spelling meets REG_TLS
+     * (champsim_tracer_generic_ids.h: "the thread pointer -- AArch64
+     * TPIDR_EL0 / MIPS CP0_UserLocal").
      */
-    if (!strcmp(name, "tpidr_el0") ||    /* aarch64, cp15.tpidr_el0   */
-        !strcmp(name, "userlocal")) {    /* mipsel, CP0_UserLocal     */
+    if (!strcmp(name, "userlocal")) {    /* mipsel, CP0_UserLocal     */
         return REG_TLS;
-    }
-    /*
-     * The FP/SIMD EXECUTION-ENABLE GATE, which is a source of every
-     * instruction it gates (R7.4) and which QEMU resolves at translation
-     * time -- so it arrives as a DECLARED RANGE stated by
-     * fp_access_check_only(), never as a global an op walk could find.
-     *
-     * REG_SYSFPEN is the vocabulary's existing word for it and names it in
-     * those terms already (champsim_tracer_generic_ids.h: "FP / vector
-     * execution-enable gate"), so this connects a spelling to a word rather
-     * than inventing either.  CPTR_EL2 and CPTR_EL3 are the same gate at the
-     * higher exception levels and would reach the same word; the statement
-     * names CPACR_EL1 alone and says why at the site.
-     */
-    if (!strcmp(name, "cpacr_el1")) {
-        return REG_SYSFPEN;
     }
     /*
      * XCR0, x86's extended control register, DECLARED by
@@ -620,7 +621,7 @@ uint8_t fold_nonarch(const char *name)
         }
     }
     /*
-     * The SOFTFLOAT STATUS FILE, one spelling on both targets that have one.
+     * THE SOFTFLOAT STATUS FILE, and now on ONE target rather than two.
      *
      * `float_status` is QEMU's own container for the rounding mode, the
      * accrued exception flags and the NaN rules -- the contents of the
@@ -629,62 +630,25 @@ uint8_t fold_nonarch(const char *name)
      * regime and RISC-V keeps one; both are the same architectural file, and
      * the generator's standing rule for a control-and-status file that
      * cannot be split into control and status halves is REG_FCSR.
+     *
+     * AArch64's eight elements arrive as "fp_status0".."fp_status7" and are
+     * ROWS now, adjudicated at ARM_DECLARED_GROUPS, together with `fpsr_qc`
+     * -- the cumulative saturation bit, the same architectural register
+     * seen through a second byte range, which had an arm of its own here
+     * for the same retired reason.  RISC-V's single element arrives as the
+     * bare "fp_status", the RISC-V table has no declared rows, and this arm
+     * is what still answers it.
+     *
+     * STILL A PREFIX MATCH, and deliberately: it is the shape that would
+     * answer a future multi-element RISC-V file too, and nothing else in
+     * either target's namespace begins with these nine characters.  On
+     * aarch64 it can no longer be reached -- generic_for_qemu_name()
+     * answers first -- which is a fact about which authority is consulted,
+     * not about which answer is given: both say REG_FCSR, by the same rule,
+     * and the row carries that rule as its reason.
      */
-    /*
-     * FPSR.QC, the cumulative saturation bit, DECLARED by translate-a64.c as
-     * a range of its own because QEMU stores it apart from the rest of the
-     * status word.  It is the same architectural register as the file below
-     * -- FPSR bit 27 -- and reaches the same word by the same rule; the two
-     * spellings exist because the two byte ranges do.
-     */
-    if (!strcmp(name, "fpsr_qc")) {
-        return REG_FCSR;
-    }
     if (!strncmp(name, "fp_status", 9)) {
-        /*
-         * A PREFIX, because a declared file of more than one element is
-         * spelled base-plus-index: AArch64's eight elements arrive as
-         * "fp_status0".."fp_status7" and RISC-V's single one as "fp_status".
-         * Every one of them is the same architectural register, so the
-         * element number is not a discriminator here and matching the base
-         * is matching the register.  Nothing else in either target's
-         * namespace begins with these nine characters.
-         */
         return REG_FCSR;
-    }
-    /*
-     * GCR_EL1, the tag-generation control.  REG_SYS is the word the wire
-     * already publishes for it; the declaration is what lets QEMU's own read
-     * of the range say the same thing.
-     */
-    /*
-     * SVCR, SME's streaming-mode and ZA-enable control, DECLARED by
-     * target/arm/tcg/translate-a64.c and absent from the AArch64 GDB stub's
-     * namespace -- the fifth register of this exact shape, after
-     * `tpidr_el0`, `cpacr_el1`, `gcr_el1` and riscv's `elp`.
-     *
-     * REG_VCTRL, AND BY ROLE RATHER THAN BY ELIMINATION.  REG_VCTRL is the
-     * vocabulary's word for the state that says how wide a vector operation
-     * is and how much of it is active -- SVE's `vg` granule seats there, and
-     * so do RISC-V's `vl` and `vtype`.  SVCR.SM is precisely that fact for
-     * SME: it selects between the non-streaming and the streaming vector
-     * length, so every instruction whose behaviour depends on the current VL
-     * depends on SVCR, and SVCR.ZA gates the ZA array the same way.  It is
-     * the register's role, not the residue after the other words were tried.
-     *
-     * It is also what the wire already publishes: the boundary reads the
-     * AARCH64_OP_SVCR sysop operand and answers REG_VCTRL, so this connects
-     * QEMU's statement to the word the other decoder was already producing,
-     * which is the whole point of the fold.  A generic id of its own would
-     * split one dependence class in two and make an SME instruction's read
-     * of the effective vector length a different register from an SVE
-     * instruction's read of the same thing.
-     */
-    if (!strcmp(name, "svcr")) {
-        return REG_VCTRL;
-    }
-    if (!strcmp(name, "gcr_el1")) {
-        return REG_SYS;
     }
     /*
      * MIDR_EL1, the main ID register.
@@ -752,7 +716,11 @@ uint8_t fold_nonarch(const char *name)
      * fpu_fcr31 global and gen_compute_branch1() states the one the branch
      * tests by name; the GDB-stub namespace carries only the container
      * (`fcr31`), so the generated table cannot hold a row for a member --
-     * the same position tpidr_el0 and userlocal are in above.
+     * the same position `userlocal` is in above.  NOT the position the six
+     * retired aarch64 arms were in: a MIPS FP condition code is a FIELD of
+     * a register the namespace already carries, not a register the target
+     * declares, so no declaration can mint a row for it and this map stays
+     * the only route.
      *
      * REG_PRED<n> is the vocabulary's own word for a one-bit predicate and
      * REG_PRED0/REG_PRED1 are what the wire publishes for `bc1t $fcc0` and

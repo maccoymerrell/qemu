@@ -183,7 +183,7 @@ void build_qemu_reg_reverse_index(void)
         if (row->reg_id == REG_NONE || row->reg_id >= REG_ID_COUNT) {
             continue;
         }
-        if (row->tier == QREG_PREDICATED) {
+        if (row->tier == QREG_PREDICATED || row->tier == QREG_DECLARED) {
             /*
              * A register the running CPU may not expose at all cannot
              * stand for its class's value: it resolves to a null handle,
@@ -193,6 +193,13 @@ void build_qemu_reg_reverse_index(void)
              * predicate-gated CSRs would otherwise take REG_SYSID from
              * `vlenb` and hand it to `marchid`.  The row is still read
              * by generic_for_qemu_name(), which is what it is for.
+             *
+             * QREG_DECLARED is the same exclusion for the same reason one
+             * step earlier: the register is outside the stub's namespace
+             * ALWAYS, not just on some CPUs, so its key resolves to a
+             * null handle on every machine.  aarch64 is the live case --
+             * `fpsr_qc` and the eight `fp_status<n>` rows would otherwise
+             * take REG_FCSR from `fpsr`, and `svcr` REG_VCTRL from `vg`.
              */
             continue;
         }

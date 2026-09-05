@@ -114,6 +114,26 @@ enum QemuRegTier {
      * does expose.
      */
     QREG_PREDICATED,
+    /*
+     * QEMU names it only through a TARGET DECLARATION --
+     * insn_dataflow_declare_regfile() -- and its GDB stub does not carry
+     * it, so no Capstone id names it and no register handle can read it.
+     * AArch64's TPIDR_EL0, CPACR_EL1, GCR_EL1, SVCR, the softfloat status
+     * array and FPSR.QC are the live cases: real CPUARMState registers
+     * that translate-a64.c declares beside its TCG globals, and that
+     * insn_dataflow_field_reg() answers with, while
+     * qemu_plugin_get_registers() reports no descriptor for any of them.
+     *
+     * The division of labour is QREG_PREDICATED's exactly: the row
+     * ANSWERS what generic word the NAME is, which is what
+     * generic_for_qemu_name() reads it for and the only reason it exists;
+     * what it must not do is stand for its class's VALUE in the reverse
+     * index, because the key would resolve to a null handle and publish a
+     * width-0 field -- and, worse, displace a member that CAN be read
+     * (aarch64 seats REG_FCSR on `fpsr` and REG_VCTRL on `vg`, both of
+     * which the stub carries).
+     */
+    QREG_DECLARED,
 };
 
 typedef struct {

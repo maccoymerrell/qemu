@@ -53,6 +53,7 @@ Author: Maccoy Merrell.
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -369,15 +370,47 @@ def main():
         if not os.path.exists(p):
             raise SystemExit("srcenc_sled: %s does not exist -- REFUSING" % p)
 
-    rows, parts, mparts = 0, [], []
-    for k in range(0, len(pop), a.chunk):
-        chunk = pop[k:k + a.chunk]
-        img = os.path.join(a.out, "sled_%s_%d" % (a.isa, k // a.chunk))
-        base, stride, n = build_elf(a.isa, chunk, img,
-                                   EF_MIPS_NAN2008 if a.nan2008 else 0)
-        if a.emit_only:
-            print("emitted %s slots=%d base=0x%x stride=%d" % (img, n, base, stride))
-            continue
+    # THE DRIVER'S OWN COUNTERS, PARSED, because the cause of a short
+    # corpus was being printed to a log one directory away and thrown out.
+    #
+    # sled_run_once() ends every run with
+    #     # sled base=.. stride=.. slots=N translated=T declined=D no_chain=C
+    # and the two failure counts mean completely different things:
+    #
+    #   no_chain  QEMU translated the slot and the plugin built no template
+    #             chain for it -- a property of the ENCODING, identical in
+    #             every arm that lays it out.
+    #   declined  qemu_plugin_translate_at() returned false.  For a mapped,
+    #             executable slot the reason is the TCG CODE BUFFER: a
+    #             decode-on-demand that cannot get a TB "simply does not
+    #             happen" (accel/tcg/translate-all.c, plugin_decode_only
+    #             arm), because tb_flush there would longjmp out of the
+    #             plugin callback frame the sweep is driven from.  It is a
+    #             property of the RUN, not of the encoding.
+    #
+    # FINDING 80-C is what that cost.  200,000 slots in one process:
+    # translated=193417 declined=6583 no_chain=4494, and 11,076 population
+    # encodings with no row, reported as CAUSE NOT DETERMINED.  The same
+    # 200,000 encodings at --chunk 25000: declined=0 in all eight arms, the
+    # same 4,494 no_chain, and 4,494 missing.  `vmptrst 0fc738` and
+    # `rdrand 0fc7f0` -- one undefined, one perfectly implemented -- were in
+    # the 6,582 that differ, which is why the effect looked like a property
+    # of two encodings.
+    #
+    # THE CODE BUFFER IS PER PROCESS, SO THE LEFTOVERS GET A NEW ONE.  A
+    # chunk that declines any slot is followed by a pass over exactly the
+    # encodings it produced no row for, in a fresh process with an empty
+    # buffer, and that repeats while the set keeps shrinking.  Nothing is
+    # detected and worked around: the resource is per-process and the retry
+    # is another process, which is the only thing that replenishes it.
+    _SLED_STATS_RE = re.compile(
+        r"^# sled .* slots=(\d+) translated=(\d+) declined=(\d+) "
+        r"no_chain=(\d+)", re.MULTILINE)
+
+    def run_slots(slots, img, label):
+        """Lay @slots out, translate them, return (tsv, mtsv, rc, stats)."""
+        base, stride, n = build_elf(a.isa, slots, img,
+                                    EF_MIPS_NAN2008 if a.nan2008 else 0)
         tsv = img + ".tsv"
         env = dict(os.environ)
         if a.cpu:
@@ -398,38 +431,109 @@ def main():
                      img + ".t.unknown_warnings.log"):
             if os.path.exists(junk):
                 os.remove(junk)
-        got = 0
-        if os.path.exists(tsv):
-            with open(tsv) as f:
-                got = sum(1 for L in f if not L.startswith("#"))
-        print("chunk %d slots=%d rc=%d rows=%d" % (k // a.chunk, n, rc, got))
-        if got == 0:
+        m = _SLED_STATS_RE.search(open(log).read())
+        if not m:
             raise SystemExit(
-                "srcenc_sled: chunk %d produced no corpus row -- REFUSING.  "
-                "An empty capture is not a short one; see %s"
-                % (k // a.chunk, log))
-        if a.mech:
-            mgot = 0
-            if os.path.exists(mtsv):
-                with open(mtsv) as f:
-                    mgot = sum(1 for L in f if not L.startswith("#"))
-            # THE TWO CORPORA MUST AGREE ROW FOR ROW.  Both are written from
-            # the same loop over the same instructions and both deduplicate on
-            # the same encoding key, so a difference is a DROPPED mechanism
-            # row -- an encoding whose "why" the sweep silently does not
-            # carry, which downstream reads as UNREACHED rather than as a
-            # hole.  The plugin counts its own drops in the sidecar; this is
-            # the second, independent reading of the same fact.
-            if mgot != got:
+                "srcenc_sled: %s wrote no '# sled ... declined=' line -- "
+                "REFUSING.  Without the driver's own counters a short "
+                "corpus has no cause, which is the one thing this sweep "
+                "may not report; see %s" % (label, log))
+        stats = dict(zip(("slots", "translated", "declined", "no_chain"),
+                         (int(x) for x in m.groups())))
+        return tsv, mtsv, rc, stats
+
+    def count_rows(path):
+        if not os.path.exists(path):
+            return 0
+        with open(path) as f:
+            return sum(1 for L in f if not L.startswith("#"))
+
+    def seen_encodings(path):
+        out = set()
+        if not os.path.exists(path):
+            return out
+        with open(path) as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                c = line.split("\t")
+                if len(c) > 1:
+                    out.add(c[1])
+        return out
+
+    rows, parts, mparts = 0, [], []
+    declined_total = no_chain_total = retry_passes = 0
+    for k in range(0, len(pop), a.chunk):
+        chunk = pop[k:k + a.chunk]
+        cidx = k // a.chunk
+        img = os.path.join(a.out, "sled_%s_%d" % (a.isa, cidx))
+        if a.emit_only:
+            base, stride, n = build_elf(a.isa, chunk, img,
+                                        EF_MIPS_NAN2008 if a.nan2008 else 0)
+            print("emitted %s slots=%d base=0x%x stride=%d"
+                  % (img, n, base, stride))
+            continue
+        pending = chunk
+        pass_no = 0
+        chunk_parts, chunk_mparts = [], []
+        while True:
+            label = ("chunk %d" % cidx if pass_no == 0
+                     else "chunk %d retry %d" % (cidx, pass_no))
+            tag = img if pass_no == 0 else "%s.r%d" % (img, pass_no)
+            tsv, mtsv, rc, stats = run_slots(pending, tag, label)
+            got = count_rows(tsv)
+            print("%s slots=%d rc=%d rows=%d declined=%d no_chain=%d"
+                  % (label, stats["slots"], rc, got,
+                     stats["declined"], stats["no_chain"]))
+            if got == 0 and pass_no == 0:
                 raise SystemExit(
-                    "srcenc_sled: chunk %d wrote %d read-list rows but %d "
-                    "mechanism rows -- REFUSING.  The two corpora describe "
-                    "the same translations and a shortfall is a mechanism "
-                    "row dropped; see %s and the sidecar's MECHANISM block"
-                    % (k // a.chunk, got, mgot, log))
-            mparts.append(mtsv)
-        rows += got
-        parts.append(tsv)
+                    "srcenc_sled: chunk %d produced no corpus row -- "
+                    "REFUSING.  An empty capture is not a short one; see %s"
+                    % (cidx, tag + ".log"))
+            if a.mech:
+                mgot = count_rows(mtsv)
+                # THE TWO CORPORA MUST AGREE ROW FOR ROW.  Both are written
+                # from the same loop over the same instructions and both
+                # deduplicate on the same encoding key, so a difference is a
+                # DROPPED mechanism row -- an encoding whose "why" the sweep
+                # silently does not carry, which downstream reads as UNREACHED
+                # rather than as a hole.  The plugin counts its own drops in
+                # the sidecar; this is the second, independent reading of the
+                # same fact.
+                if mgot != got:
+                    raise SystemExit(
+                        "srcenc_sled: %s wrote %d read-list rows but %d "
+                        "mechanism rows -- REFUSING.  The two corpora "
+                        "describe the same translations and a shortfall is a "
+                        "mechanism row dropped; see %s and the sidecar's "
+                        "MECHANISM block" % (label, got, mgot,
+                                             tag + ".log"))
+                chunk_mparts.append(mtsv)
+            chunk_parts.append(tsv)
+            rows += got
+            if pass_no == 0:
+                no_chain_total += stats["no_chain"]
+            declined_total += stats["declined"]
+            if not stats["declined"]:
+                break
+            got_enc = seen_encodings(tsv)
+            left = [e for e in pending if e.hex() not in got_enc]
+            # A pass that declines and yet leaves no fewer slots than it was
+            # given cannot be retried into progress: another process would
+            # decline the same way.  Refuse rather than loop.
+            if not left or len(left) >= len(pending):
+                raise SystemExit(
+                    "srcenc_sled: %s declined %d slot(s) and a retry pass "
+                    "would not shrink the set (%d pending, %d left) -- "
+                    "REFUSING rather than reporting a corpus that is short "
+                    "for a reason the driver DID record; see %s"
+                    % (label, stats["declined"], len(pending), len(left),
+                       tag + ".log"))
+            pending = left
+            pass_no += 1
+            retry_passes += 1
+        parts.extend(chunk_parts)
+        mparts.extend(chunk_mparts)
 
     if a.emit_only:
         return
@@ -566,8 +670,25 @@ def main():
             if e.hex() in seen:
                 continue
             by_chunk[i // a.chunk] = by_chunk.get(i // a.chunk, 0) + 1
-        print("  population encodings the sled did NOT produce a row for: %d "
-              "-- CAUSE NOT DETERMINED HERE" % len(missing))
+        # THE CAUSE IS DETERMINED NOW, and it was always in reach: the
+        # driver's own counters said so and this script threw them away.
+        # A residue equal to the no_chain total is fully attributed -- QEMU
+        # translated every one of those slots and the plugin built no
+        # template chain, which is a property of the encoding.  Anything
+        # beyond it is NOT attributed and says so in those words.
+        print("  population encodings the sled did NOT produce a row for: %d"
+              % len(missing))
+        print("    the driver's own counters: no_chain=%d (translated, the "
+              "plugin built no chain -- a property of the encoding), "
+              "declined=%d over %d retry pass(es) (the per-process code "
+              "buffer; every declined slot was re-run in a fresh process)"
+              % (no_chain_total, declined_total, retry_passes))
+        if len(missing) == no_chain_total:
+            print("    ATTRIBUTED IN FULL: the residue IS the no_chain set")
+        else:
+            print("    NOT ATTRIBUTED: %d encoding(s) beyond the no_chain "
+                  "count have no cause recorded" % (len(missing)
+                                                    - no_chain_total))
         print("    by chunk (chunk size %d, %d chunk(s)): %s"
               % (a.chunk, (len(pop) + a.chunk - 1) // a.chunk,
                  ", ".join("%d=%d" % (c, n)

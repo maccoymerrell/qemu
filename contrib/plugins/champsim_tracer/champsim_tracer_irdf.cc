@@ -536,6 +536,20 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * THE CURRENT XLEN, declared by target/riscv/translate.c as `xl` and
+     * absent from the RISC-V GDB stub's namespace -- the same shape as `elp`
+     * above and for the same reason: it has no CSR address of its own.
+     * Architecturally it is `misa`.MXL and `mstatus`.UXL/SXL, and both of
+     * those land on REG_SYS, so folding the resolved member there connects a
+     * spelling to the word its own architectural homes already answer in.
+     * FINDING 75-B is the witness -- helper_vsetvl()'s only env read is
+     * riscv_cpu_xlen(env), and while the member was anonymous that read
+     * arrived as `env offset 5020 (0x139c), no target declaration`.
+     */
+    if (!strcmp(name, "xl")) {
+        return REG_SYS;
+    }
+    /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and
      * TR -- DECLARED by target/i386/tcg/translate.c and absent from the i386
      * GDB stub's namespace, the same shape as XCR0 above.
@@ -643,6 +657,32 @@ uint8_t fold_nonarch(const char *name)
      * already publishes for it; the declaration is what lets QEMU's own read
      * of the range say the same thing.
      */
+    /*
+     * SVCR, SME's streaming-mode and ZA-enable control, DECLARED by
+     * target/arm/tcg/translate-a64.c and absent from the AArch64 GDB stub's
+     * namespace -- the fifth register of this exact shape, after
+     * `tpidr_el0`, `cpacr_el1`, `gcr_el1` and riscv's `elp`.
+     *
+     * REG_VCTRL, AND BY ROLE RATHER THAN BY ELIMINATION.  REG_VCTRL is the
+     * vocabulary's word for the state that says how wide a vector operation
+     * is and how much of it is active -- SVE's `vg` granule seats there, and
+     * so do RISC-V's `vl` and `vtype`.  SVCR.SM is precisely that fact for
+     * SME: it selects between the non-streaming and the streaming vector
+     * length, so every instruction whose behaviour depends on the current VL
+     * depends on SVCR, and SVCR.ZA gates the ZA array the same way.  It is
+     * the register's role, not the residue after the other words were tried.
+     *
+     * It is also what the wire already publishes: the boundary reads the
+     * AARCH64_OP_SVCR sysop operand and answers REG_VCTRL, so this connects
+     * QEMU's statement to the word the other decoder was already producing,
+     * which is the whole point of the fold.  A generic id of its own would
+     * split one dependence class in two and make an SME instruction's read
+     * of the effective vector length a different register from an SVE
+     * instruction's read of the same thing.
+     */
+    if (!strcmp(name, "svcr")) {
+        return REG_VCTRL;
+    }
     if (!strcmp(name, "gcr_el1")) {
         return REG_SYS;
     }

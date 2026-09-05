@@ -247,6 +247,35 @@ void a64_translate_init(void)
                                   sizeof(((CPUARMState *)0)->cp15.gcr_el1),
                                   sizeof(((CPUARMState *)0)->cp15.gcr_el1),
                                   1);
+
+    /*
+     * SVCR, the SME streaming-mode and ZA-enable control.
+     *
+     * `smstart` and `smstop` are `msr SVCR<sm|za>, #imm`, and QEMU performs
+     * the write in helper_set_svcr() into env->svcr; every SME instruction
+     * and every SVE instruction executing in streaming mode reads it,
+     * because it is what says which of the two vector lengths is in effect.
+     * The CP-H row for set_svcr already states the access as
+     * INSN_DF_RD | INSN_DF_WR (accel/tcg/insn-dataflow-usage/arm.c.inc).
+     *
+     * WHAT WAS MISSING WAS THE NAME.  env->svcr has no TCG global, and
+     * until now no regfile declaration either, so the write QEMU performs
+     * arrived downstream as an anonymous byte range -- which is why the
+     * plugin's own destination ledger carried `smstop / REG_VCTRL` as an
+     * ADJUDICATION-OWED row that BLOCKED: the wire published the write from
+     * the AARCH64_OP_SVCR sysop operand, QEMU performed it, and QEMU could
+     * not say which register it was.
+     *
+     * Declared under the architecture's own spelling, in offsetof()/sizeof()
+     * beside the globals, exactly as tpidr_el0, cpacr_el1 and gcr_el1 above
+     * -- three registers with the same shape: a real env access, no TCG
+     * global, and no row in the GDB stub's namespace.
+     */
+    insn_dataflow_declare_regfile("svcr", NULL,
+                                  offsetof(CPUARMState, svcr),
+                                  sizeof(((CPUARMState *)0)->svcr),
+                                  sizeof(((CPUARMState *)0)->svcr),
+                                  1);
 }
 
 /*

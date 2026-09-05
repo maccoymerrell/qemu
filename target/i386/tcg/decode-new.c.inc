@@ -367,9 +367,9 @@ static void decode_group9(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
     static const X86OpEntry group9_reg =
         X86_OP_ENTRY0(multi0F);  /* unconverted */
     static const X86OpEntry cmpxchg8b =
-        X86_OP_ENTRY1(CMPXCHG8B,  M,q,  lock p_00 cpuid(CX8));
+        X86_OP_ENTRY1(CMPXCHG8B,  M,q,  lock cpuid(CX8));
     static const X86OpEntry cmpxchg16b =
-        X86_OP_ENTRY1(CMPXCHG16B, M,dq, lock p_00 cpuid(CX16));
+        X86_OP_ENTRY1(CMPXCHG16B, M,dq, lock cpuid(CX16));
 
     int modrm = get_modrm(s, env);
     int op = (modrm >> 3) & 7;

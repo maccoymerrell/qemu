@@ -29,14 +29,14 @@
  * THE BASE ROW DOES NOT MOVE.  decode-new.c.inc is not
  * edited apart from the one inserted call, which sits below
  * every X86_OP_* site in the file (last site line 1932, call
- * line 2972) so no slot is renumbered.  An immediate that
+ * line 3032) so no slot is renumbered.  An immediate that
  * indexes no arm -- every byte gen_3dnow() answers with
  * gen_illegal_opcode() -- publishes nothing here and keeps
  * the row's own id and name bit for bit.
  *
- * EXHAUSTIVE, not sampled: 777216 (slot, immediate) pairs --
+ * EXHAUSTIVE, not sampled: 805120 (slot, immediate) pairs --
  * every __LINE__ this file can hand out, times all 256
- * immediate bytes.  24 reach a qualified identity, 777192 do
+ * immediate bytes.  24 reach a qualified identity, 805096 do
  * not, and every arm is reachable.
  */
 

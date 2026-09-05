@@ -1842,6 +1842,31 @@ static void gen_exception(DisasContext *s, int trapno)
    the instruction is known, but it isn't allowed in the current cpu mode.  */
 static void gen_illegal_opcode(DisasContext *s)
 {
+    /*
+     * WHAT FOLLOWS IS NOT THE INSTRUCTION, and the #GP twin below has said so
+     * since it was written: "Only this function knows, so this function says
+     * it."  This one did not, and the two raises are the same shape -- no
+     * body op is emitted on either path, so the translation's read and write
+     * lists describe a raise and a consumer scoring them against the ISA is
+     * scoring the wrong subject.
+     *
+     * WHAT THE SILENCE COST, measured (FINDING 77-A).  `0F C7` group 9 sends
+     * every `vmptrst` / `vmxon` / `xsaves` encoding here through
+     * decode_group9()'s UNKNOWN_OPCODE arm.  The translation-only encoding
+     * sweep reported 692,151 x86_64 population encodings with no corpus row
+     * and could name no cause for the largest class of them, because a #GP
+     * refusal arrives as a stated refusal and a #UD refusal arrived as
+     * nothing at all.  The two are the same fact about the same kind of
+     * translation and only one of them was sayable.
+     *
+     * NOT a claim about the encoding in general: `gen_illegal_opcode()` is
+     * also reached for encodings that are illegal only in the CURRENT MODE,
+     * and the same bytes in a mode that allows them translate the body and
+     * never take this note.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_translation_refused();
     gen_exception(s, EXCP06_ILLOP);
 }
 

@@ -1120,6 +1120,23 @@ riscv64 FB-flow-presence unimp cs-yes llvm-no
 #   1 rows
 riscv64 FB-ret-mismatch jr cs-noret
 
+# `vsetivli` -- THE SAME CLASS, ON THE FAMILY THE GENERATED BLOCK AT THE FOOT
+# OF THIS FILE DOES NOT OWN.
+#
+# `vsetivli` takes its AVL and its vtype as IMMEDIATES, so the vector CSRs it
+# reads have no register operand for LLVM to name -- the class immediately
+# above, on the vector-configuration pair rather than on fcsr.  Sail states
+# the read; the deletion that took it out was landed and REVERTED when Sail
+# contradicted it (5ae4742f99).
+#
+# IT LIVES HERE AND NOT WITH THE `SR-rd-*` ROWS AT THE FOOT, and that is the
+# point of moving it (FINDING 77-B).  It was appended INSIDE the generated
+# block, whose own header said a full regeneration was owed, so the first
+# regeneration would have deleted it.  The generator owns `SR-rd-*` and
+# nothing else.
+#   1 row
+riscv64 FR-rd-phantom vsetivli +REG_VCTRL
+
 # LLVM MC does not model a CSR as a REGISTER.  In its instruction
 # descriptions the CSR is an immediate operand, so for every csr* form
 # llvmRD and llvmWR are BOTH empty and the fields side is the only one
@@ -7818,87 +7835,90 @@ x86_64 SR-rd-missing xorw +REG_SEG2
 x86_64 FU-unclassified ud1
 x86_64 FU-unclassified ud2
 
+
+# >>> BEGIN GENERATED SR-rd BLOCK -- isax_srcenc_rows.py --header --layer fields
 # =====================================================================
-# THE FIELDS LAYER'S `SR-rd-*` FAMILY -- ALL FOUR ISAs (exec121)
+# THE FIELDS LAYER'S `SR-rd-*` FAMILY -- ALL FOUR ISAs
 #
-# WHAT THIS FAMILY IS.  A `--srcenc` arm scores the source list the WIRE
-# PUBLISHES -- QEMU's ordered read list, stated at translation time inside
-# the emulator, plus the survivor rows for what QEMU does not state --
-# against LLVM MC's operand description of the same bytes.  Its read
-# findings key on `SR-` where a bare arm's key on `R-` / `FR-`, so nothing
-# in this file answered them: before this block the fields allowlist carried
-# `SR-` rows for exactly ONE family (the x86 zero-base segment overrides,
-# 327 rows) and the other eight arms scored a residue the file could not
-# speak to.  That is the last isax layer that had no rows.
+# GENERATED.  `isax_srcenc_rows.py --header --layer fields` emits this
+# block and the rows below it from the arm output named at the foot;
+# every number is read from an arm or md5summed from the corpus, and
+# nothing in it is typed.  Do not hand-correct a line here -- re-run
+# the arms and re-emit, or the block goes back to being a summary that
+# has to be patched to stay true.
 #
-# THE ROWS ARE GENERATED, AND THAT IS THE POINT.  Every row below was
-# EMITTED FROM a signature the arms at this tip reported, by
-# tools/isax_srcenc_rows.py, which refuses to emit while any signature is
-# unclassified.  Two properties follow that hand-editing cannot give:
+# WHY A SECOND BLOCK AND NOT A COPY OF THE OTHER LAYER'S.  isaxcheck
+# states in its own `--srcenc` comment that this family is
+# LAYER-INDEPENDENT: "the wire's source list is one list; it is not a
+# property of which decoder view this tool happens to be holding".
+# Both arms therefore score the SAME CLAIMS.  What differs is REACH --
+# the two decode with different views and reach different encodings --
+# so each allowlist gets rows for the signatures ITS OWN arm reported.
+# A row copied across would land with no occupant here, which is the
+# first property this generator exists to make impossible.
 #
-#   * A DEAD ROW IS IMPOSSIBLE BY CONSTRUCTION.  The arm that will score a
-#     row is the arm that produced it, so it has an occupant on the day it
-#     lands.  PASS 66 / FINDING 65-D had to learn this the other way: two
-#     rows landed with a REGCOV justification (llvm_rd=0 llvm_wr=0
-#     REFERENCE-HAS-NO-OPERAND) that was NECESSARY AND NOT SUFFICIENT --
-#     the qualifier is the WHOLE difference set, and on those two mipsel
-#     registers it never was -- so the rows matched nothing and the
-#     detector that named them was read by nobody.
+# THE POPULATION THESE ROWS CLOSE, from the arms' own summary lines.
+# Measured at this tip with BOTH generated blocks absent -- that is
+# what the regeneration procedure at the foot does, and it is the only
+# reading on which the number means "what these rows are for".  Both,
+# and not this one alone: the two layers score the same claims and
+# leaving the other in place would report this layer's residue against
+# an allowlist half of it had already been closed by.  Re-running the
+# arms WITH the blocks in place is the confirmation and belongs in the
+# pass evidence, not here: it reads 0 by construction.
 #
-#   * THE PARTITION IS TOTAL.  Every signature lands in exactly one NAMED
-#     class.  A catch-all is not a class: X-MISC exists in the generator
-#     and is EMPTY here, because each time it filled the contents were read
-#     and given their own name and citation.
+#   layer       x86_64  aarch64  riscv64   mipsel    total
+#   fields        661     1115     1059      864     3699
+#   boundary      638     1115     1017      233     3003
 #
-# AND THE CORPUS IS THIS TIP'S, WHICH IS WHY THE ROWS ARE ONLY LANDING NOW.
-# This residue was measured twice before against a corpus captured at
-# exec104's tip (SO 9bd4a8b9cc12) while the plugin moved 317 commits.  Rows
-# written from that measurement would have described a wire that no longer
-# existed -- every aarch64 ld4/st4 row in it carried REG_GPR9, a fabricated
-# FIXED survivor row the survivor table had ALREADY refused by the time the
-# rows would have landed.  The corpus below is re-derived at the tip the
-# rows are scored on:
+# THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
+# `SR-rd-missing` says LLVM names a source the wire does not, which is
+# the direction R12.1 treats as disqualifying, so none of them may be
+# excused by a row that merely records the difference.  Each lands in a
+# class whose comment quotes the reference fact that makes the
+# REFERENCE the wrong side.  This arm's, by class:
 #
-#   corpus  exec121/srcencorp/tipB, sled at f6736da64350ba81f2d5c458baa8d11cdfc88e4a
-#     x86_64  6416527 rows md5 afc3d22561fed6b8b3092f7b04423fbd
-#     aarch64 1408171 rows md5 9e27782a2b25c3bfaaf4814868e01050
-#     riscv64   86889 rows md5 587be690d1329ca667ebd0b49834a7dc
-#     mipsel   548886 rows md5 a630d6a80e1fc161e0d5560de3b1ff8c
+#   x86_64     33  X-X87OPERAND   12
+#                  X-CONSTCOUNT   8
+#                  X-IMPLICITGPR  7
+#                  X-SSP          6
+#   aarch64     8  A-SYSSEL       2
+#                  A-ERET         2
+#                  A-SATQC        2
+#                  A-MISC         2
+#   riscv64   182  R-ZIMOP        174
+#                  R-HINT         8
+#   mipsel      3  M-CP0          2
+#                  M-MT           1
 #
-# FOUR CLASSES GOT NO ROWS WHEN THIS BLOCK WAS LAST GENERATED, AND ARE LISTED
-# WITH THEIR SIGNATURES ANYWAY.  Two of the four are since RESOLVED, marked
-# below; the two corrections are BY HAND, because regenerating this block
-# needs all eight `--srcenc` arms over a corpus captured at THIS tip and the
-# banked corpus predates the CP-H fold.  The counts and md5s above are the
-# banked corpus's and are unchanged by the correction; a full regeneration is
-# owed at the next tip-captured corpus.
-# An allowlist row asserts that the reference is wrong or silent and the
-# TRACER IS RIGHT.  Where the tracer is the one that is wrong, a row would
-# launder a defect, so those signatures stay UNALLOWED with a named blocker
-# and the arms stay red on them:
+# CLASSES THIS ARM GAVE NO ROWS.  A class with no occupant is not a
+# clean class -- it is a class whose subject this arm did not
+# reach, or one whose last member was closed -- and either way the
+# name is worth being able to find:
 #
-#   mipsel  M-DSPIMM  31 sigs  FINDING 71-A  QEMU's MIPS DSP dispatchers
-#                              hoist gen_load_gpr above the opcode switch,
-#                              so an IMMEDIATE field is read as a GPR
-#   mipsel  M-LSA      1 sig   RESOLVED, FINDING 70-A -- the four bytes are
-#                              TWO INSTRUCTIONS.  On a model that is neither
-#                              R6 nor MSA-bearing, SPECIAL-0x05 is not `lsa`
-#                              at all: QEMU dispatches it to PMON, whose
-#                              helper reads $a0, and the surplus register IS
-#                              that read.  The tracer is the right side, so
-#                              the row is allowlisted with its citations --
-#                              see the M-LSA block below
-#   aarch64 A-FROZEN   1 sig   FINDING 71-B  a FIXED survivor row froze the
-#                              deriving corpus's own base register
-#   x86_64  X-SELFRELOAD 4 sigs  RESOLVED at cb26c3e774 -- a read of bytes the
-#                              same call unconditionally wrote is not an input
+#   x86_64   X-SELFRELOAD
+#   aarch64  A-FROZEN
+#   mipsel   M-DSPIMM
+#   mipsel   M-MSACTL
+#
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec132/srcencorp/tip132
+#   x86_64    6416527 rows md5 53f4eef64f63d7537462e406cb87851b
+#   aarch64   1408171 rows md5 d407a13138a9281cb541393508f20c98
+#   riscv64     86889 rows md5 baf8571353b1e382588425d728c090ad
+#   mipsel     548886 rows md5 7c5d6f1bdbdf7a3b43d0ad2aa4af321f
+#
+# THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
+#   SO_SHA=419e0c74b3755d13
+#   ISAX_SHA=1d0ad8137585bc36
+#   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #
 # HOW TO REGENERATE:
-#   isax_srcenc_gate.sh run <build> <out> <corpus>
-#   isax_srcenc_rows.py --arms <out> > <this block>
+#   isax_srcenc_gate.sh run <build> <arms> <corpus>
+#   isax_srcenc_rows.py --header --arms <arms> --layer fields \
+#       --corpus <corpus> --rc <arms>/rc.txt --replace <allowlist>
 # =====================================================================
 # --- X-FIP: every x87 instruction reads the CS SELECTOR, to save it as the FPU code segment.
-#     206 signature(s), 395053 encodings at this tip.
+#     205 signature(s), 395053 encodings at this tip.
 #
 # The x87 state includes the FPU Instruction Pointer and the FPU Code Segment
 # selector -- the pair FSTENV / FSAVE / FXSAVE publish (Intel SDM Vol. 1
@@ -7951,11 +7971,13 @@ x86_64 SR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS,REG_FPR#,REG_SEG0
 x86_64 SR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS,REG_SEG0
 x86_64 SR-rd-phantom fcom +REG_FCSR,REG_FPR#,REG_SEG0
 x86_64 SR-rd-phantom fcom +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcomi +REG_FCSR,REG_FLAGS,REG_SEG0
 x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0
 x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
 x86_64 SR-rd-phantom fcoml +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
 x86_64 SR-rd-phantom fcomp +REG_FCSR,REG_FPR#,REG_SEG0
 x86_64 SR-rd-phantom fcomp +REG_FCSR,REG_SEG0
+x86_64 SR-rd-phantom fcompi +REG_FCSR,REG_FLAGS,REG_SEG0
 x86_64 SR-rd-phantom fcompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG1
 x86_64 SR-rd-phantom fcompl +REG_FCSR,REG_FPR#,REG_SEG0,REG_SEG5
 x86_64 SR-rd-phantom fcompp +REG_FCSR,REG_FPR#,REG_SEG0
@@ -8332,9 +8354,20 @@ x86_64 SR-rd-phantom shrw +REG_FLAGS
 # effective address from both, so both reach the read list.  LLVM's
 # MCInstrDesc leaves the implicit stack operands to the target's own lowering
 # and names no register here.
+x86_64 SR-rd-phantom bnd lretl +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
+x86_64 SR-rd-phantom bnd lretq +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
+x86_64 SR-rd-phantom bnd lretw +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
 x86_64 SR-rd-phantom bnd retq +REG_SEG5,REG_SP
 x86_64 SR-rd-phantom bnd retw +REG_SEG5,REG_SP
 x86_64 SR-rd-phantom enter +REG_FP_REG,REG_SP
+x86_64 SR-rd-phantom iretl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom iretq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom iretw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom lretl +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
+x86_64 SR-rd-phantom lretq +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
+x86_64 SR-rd-phantom lretw +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
+x86_64 SR-rd-phantom popq +REG_CTRL0,REG_CTRL4,REG_SP,REG_SYS
+x86_64 SR-rd-phantom popw +REG_CTRL0,REG_CTRL4,REG_SP,REG_SYS
 x86_64 SR-rd-phantom pushq +REG_SEG3,REG_SP
 x86_64 SR-rd-phantom pushq +REG_SEG4,REG_SP
 x86_64 SR-rd-phantom pushw +REG_SEG3,REG_SP
@@ -8342,23 +8375,85 @@ x86_64 SR-rd-phantom retq +REG_SEG5,REG_SP
 x86_64 SR-rd-phantom retw +REG_SEG5,REG_SP
 
 # --- X-CR: a control register that gates whether the instruction runs at all.
-#     7 signature(s), 70075 encodings at this tip.
+#     69 signature(s), 213331 encodings at this tip.
 #
 # FWAIT checks CR0.TS, CR0.MP and CR0.EM before it looks at the x87 status
 # word, and the SSE and XSAVE forms check CR4.OSFXSR / CR4.OSXSAVE the same
 # way.  QEMU states those reads at translation.  LLVM's MCInstrDesc models no
 # control register on any instruction, which is the same structural silence
 # REG_SYSFPEN meets on AArch64.
+x86_64 SR-rd-phantom bnd lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom bnd lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
 x86_64 SR-rd-phantom cpuid +REG_CTRL4
 x86_64 SR-rd-phantom fnop +REG_CTRL0,REG_FCSR
+x86_64 SR-rd-phantom fxrstor +REG_CTRL4,REG_FCSR
+x86_64 SR-rd-phantom fxrstor64 +REG_CTRL4,REG_FCSR
+x86_64 SR-rd-phantom fxsave +REG_CTRL4
+x86_64 SR-rd-phantom fxsave64 +REG_CTRL4
+x86_64 SR-rd-phantom lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lcallq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lcallq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lcallw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lcallw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lfsl +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lfsq +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lfsw +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lgs +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lgsl +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lgsw +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom lssl +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lssq +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom lssw +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom movl +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom movw +REG_CTRL0,REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom notrack lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom notrack lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
+x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
+x86_64 SR-rd-phantom rdfsbasel +REG_CTRL4,REG_SEG3
+x86_64 SR-rd-phantom rdfsbaseq +REG_CTRL4,REG_SEG3
+x86_64 SR-rd-phantom rdgsbasel +REG_CTRL4,REG_SEG4
+x86_64 SR-rd-phantom rdgsbaseq +REG_CTRL4,REG_SEG4
+x86_64 SR-rd-phantom rdpkru +REG_CTRL4
+x86_64 SR-rd-phantom rdpmc +REG_CTRL4,REG_SYS
 x86_64 SR-rd-phantom smswl +REG_CTRL0
 x86_64 SR-rd-phantom smswq +REG_CTRL0
 x86_64 SR-rd-phantom smsww +REG_CTRL0
 x86_64 SR-rd-phantom wait +REG_CTRL0,REG_FCSR
+x86_64 SR-rd-phantom wrfsbasel +REG_CTRL4
+x86_64 SR-rd-phantom wrfsbaseq +REG_CTRL4
+x86_64 SR-rd-phantom wrgsbasel +REG_CTRL4
+x86_64 SR-rd-phantom wrgsbaseq +REG_CTRL4
+x86_64 SR-rd-phantom wrpkru +REG_CTRL4
 x86_64 SR-rd-phantom xgetbv +REG_CTRL4,REG_SYS
+x86_64 SR-rd-phantom xrstor +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
+x86_64 SR-rd-phantom xrstor64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
+x86_64 SR-rd-phantom xsave +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
+x86_64 SR-rd-phantom xsave64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
+x86_64 SR-rd-phantom xsaveopt +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
+x86_64 SR-rd-phantom xsaveopt64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
 
 # --- X-FSGS: the FS and GS BASES, which are the only segment bases that are live in 64-bit mode.
-#     9 signature(s), 7200 encodings at this tip.
+#     5 signature(s), 6944 encodings at this tip.
 #
 # The phantom direction of the segment family: the tracer reads the live base
 # register -- `swapgs`, `rdfsbase`, `wrgsbase`, `maskmovq` -- and LLVM's
@@ -8366,22 +8461,33 @@ x86_64 SR-rd-phantom xgetbv +REG_CTRL4,REG_SYS
 # counterpart to the zero-base override family below, and the discriminator
 # between them is checked: NOT ONE row here is REG_SEG0 / REG_SEG1 / REG_SEG2 /
 # REG_SEG5, and not one row there is REG_SEG3 or REG_SEG4.
+x86_64 SR-rd-phantom maskmovq +REG_FCSR,REG_SEG3
+x86_64 SR-rd-phantom maskmovq +REG_FCSR,REG_SEG4
 x86_64 SR-rd-phantom swapgs +REG_SEG4
 x86_64 SR-rd-phantom xlatb +REG_SEG3
 x86_64 SR-rd-phantom xlatb +REG_SEG4
 
 # --- X-UPPERLANE: a legacy scalar or unary SSE form preserves the upper lanes of its destination, so the destination is read.
-#     4 signature(s), 22111 encodings at this tip.
+#     13 signature(s), 64601 encodings at this tip.
 #
 # R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
 # form survives above the element the instruction writes, so it is an input.
 # LLVM models the preserve as a tied operand on the forms whose assembly
 # repeats the register and not on the rest, so its read set is short by the
 # destination exactly where the tie is absent.
+x86_64 SR-rd-phantom aesimc +REG_VEC#
+x86_64 SR-rd-phantom aeskeygenassist +REG_VEC#
+x86_64 SR-rd-phantom vaesdec +REG_VEC#
+x86_64 SR-rd-phantom vaesdeclast +REG_VEC#
+x86_64 SR-rd-phantom vaesenc +REG_VEC#
+x86_64 SR-rd-phantom vaesenclast +REG_VEC#
+x86_64 SR-rd-phantom vaesimc +REG_VEC#
+x86_64 SR-rd-phantom vaeskeygenassist +REG_VEC#
 x86_64 SR-rd-phantom vcvtsi2sdl +REG_VEC#
 x86_64 SR-rd-phantom vcvtsi2sdq +REG_VEC#
 x86_64 SR-rd-phantom vmovhpd +REG_VEC#
 x86_64 SR-rd-phantom vmovhps +REG_VEC#
+x86_64 SR-rd-phantom vpclmulqdq +REG_VEC#
 
 # --- X-CONSTCOUNT: a rotate-through-carry by an immediate ZERO reads nothing, and LLVM's description is per-opcode.
 #     8 signature(s), 10730 encodings at this tip.
@@ -8424,6 +8530,28 @@ x86_64 SR-rd-missing fstp +REG_FPCW
 x86_64 SR-rd-missing fstp +REG_FPCW,REG_FPR#
 x86_64 SR-rd-missing fstpt +REG_FPCW
 x86_64 SR-rd-missing fxch +REG_FPCW
+
+# --- X-SYSCALLFLAGS: SYSCALL reads RFLAGS because saving it into R11 is half of what the instruction does.
+#     1 signature(s), 7014 encodings at this tip.
+#
+# SYSCALL is defined as `RCX <- RIP; R11 <- RFLAGS` (Intel SDM Vol. 2B,
+# SYSCALL), so the flag register is a true source: the instruction copies it.
+# QEMU states both writes and the read in helper_syscall()
+# (target/i386/tcg/user/seg_helper.c), and the read reaches the wire's ordered
+# list through the CP-H usage table's `eflags` and `cc_*` members.
+#
+# LLVM's MCInstrDesc carries a fixed Defs/Uses pair for the SYSCALL opcode and
+# names no EFLAGS use on it at all -- the same structural silence the implicit
+# family below meets, but about the FLAG register rather than a GPR, which is
+# why it is its own row and not folded into that class.
+#
+# This signature is NEW at this tip and it is a repair, not a regression: the
+# generated usage table had been carrying helper_syscall's footprint from
+# before `ccfaf4fdc5` rewrote the helper, so the wire published nothing for
+# nine members it depends on.  Restoring them made the tracer's read set a
+# superset of the reference's, which is the direction this file exists to
+# record.
+x86_64 SR-rd-phantom syscall +REG_FLAGS
 
 # --- X-IMPLICITGPR: the implicit GPR operands of the monitor / wait / key family.
 #     16 signature(s), 28790 encodings at this tip.
@@ -8472,7 +8600,7 @@ x86_64 SR-rd-phantom saveprevssp +REG_SSP
 x86_64 SR-rd-phantom setssbsy +REG_SSP,REG_SYS
 
 # --- X-MSR: the model-specific or descriptor-table register an INDEX selects.
-#     27 signature(s), 86866 encodings at this tip.
+#     23 signature(s), 53272 encodings at this tip.
 #
 # RDMSR / WRMSR address a register by an index in ECX and LLVM's description
 # says only that they move EDX:EAX; LLDT / LTR / SGDT / SIDT reach the
@@ -8502,14 +8630,6 @@ x86_64 SR-rd-phantom xsavec64 +REG_SYS
 x86_64 SR-rd-phantom xsaveopt +REG_SYS
 x86_64 SR-rd-phantom xsaves +REG_SYS
 x86_64 SR-rd-phantom xsaves64 +REG_SYS
-
-# --- X-SELFRELOAD: QEMU re-reads the control word the instruction just WROTE, to re-derive its softfloat state.
-#     4 signature(s), 21952 encodings, NOT ALLOWLISTED.
-#     An allowlist row asserts the tracer is right; these stay red.
-#     x86_64 SR-rd-phantom fldcw +REG_FPCW
-#     x86_64 SR-rd-phantom fldenv +REG_FCSR,REG_FPCW
-#     x86_64 SR-rd-phantom ldmxcsr +REG_FCSR
-#     x86_64 SR-rd-phantom vldmxcsr +REG_FCSR
 
 # --- X-ADDRONLY: a hint whose memory operand is an ADDRESS the instruction computes and does not dereference.
 #     6 signature(s), 9622 encodings at this tip.
@@ -8548,10 +8668,106 @@ x86_64 SR-rd-phantom fsts +REG_FCSR,REG_FPR#
 x86_64 SR-rd-phantom stmxcsr +REG_FCSR
 x86_64 SR-rd-phantom vstmxcsr +REG_FCSR
 
-# --- A-FROZEN: a FIXED survivor row froze the deriving corpus's own base register -- FINDING 71-B.
-#     1 signature(s), 1456 encodings, NOT ALLOWLISTED.
-#     An allowlist row asserts the tracer is right; these stay red.
-#     aarch64 SR-rd-phantom prfum +REG_SP
+# --- X-MISC: the remaining reference gaps, one signature at a time.
+#     92 signature(s), 518683 encodings at this tip.
+#
+# What is left after the named families: forms where LLVM names an implicit
+# operand its per-opcode description carries and the instruction does not
+# consult, or where the tracer names a register the encoding implies and the
+# reference has no operand for.  They are listed one row at a time because
+# none of them generalises.
+x86_64 SR-rd-phantom cvtpd2pi +REG_FCSR
+x86_64 SR-rd-phantom cvtpi2pd +REG_FCSR
+x86_64 SR-rd-phantom cvtpi2ps +REG_FCSR
+x86_64 SR-rd-phantom cvtps2pi +REG_FCSR
+x86_64 SR-rd-phantom cvttpd2pi +REG_FCSR
+x86_64 SR-rd-phantom cvttps2pi +REG_FCSR
+x86_64 SR-rd-phantom emms +REG_FCSR
+x86_64 SR-rd-phantom femms +REG_FCSR
+x86_64 SR-rd-phantom fnclex +REG_FCSR
+x86_64 SR-rd-phantom maskmovq +REG_FCSR
+x86_64 SR-rd-phantom movd +REG_FCSR
+x86_64 SR-rd-phantom movdq2q +REG_FCSR
+x86_64 SR-rd-phantom movntq +REG_FCSR
+x86_64 SR-rd-phantom movq +REG_FCSR
+x86_64 SR-rd-phantom movq2dq +REG_FCSR
+x86_64 SR-rd-phantom pabsb +REG_FCSR
+x86_64 SR-rd-phantom pabsd +REG_FCSR
+x86_64 SR-rd-phantom pabsw +REG_FCSR
+x86_64 SR-rd-phantom packssdw +REG_FCSR
+x86_64 SR-rd-phantom packsswb +REG_FCSR
+x86_64 SR-rd-phantom packuswb +REG_FCSR
+x86_64 SR-rd-phantom paddb +REG_FCSR
+x86_64 SR-rd-phantom paddd +REG_FCSR
+x86_64 SR-rd-phantom paddq +REG_FCSR
+x86_64 SR-rd-phantom paddsb +REG_FCSR
+x86_64 SR-rd-phantom paddsw +REG_FCSR
+x86_64 SR-rd-phantom paddusb +REG_FCSR
+x86_64 SR-rd-phantom paddusw +REG_FCSR
+x86_64 SR-rd-phantom paddw +REG_FCSR
+x86_64 SR-rd-phantom palignr +REG_FCSR
+x86_64 SR-rd-phantom pand +REG_FCSR
+x86_64 SR-rd-phantom pandn +REG_FCSR
+x86_64 SR-rd-phantom pavgb +REG_FCSR
+x86_64 SR-rd-phantom pavgw +REG_FCSR
+x86_64 SR-rd-phantom pcmpeqb +REG_FCSR
+x86_64 SR-rd-phantom pcmpeqd +REG_FCSR
+x86_64 SR-rd-phantom pcmpeqw +REG_FCSR
+x86_64 SR-rd-phantom pcmpgtb +REG_FCSR
+x86_64 SR-rd-phantom pcmpgtd +REG_FCSR
+x86_64 SR-rd-phantom pcmpgtw +REG_FCSR
+x86_64 SR-rd-phantom pextrw +REG_FCSR
+x86_64 SR-rd-phantom phaddd +REG_FCSR
+x86_64 SR-rd-phantom phaddsw +REG_FCSR
+x86_64 SR-rd-phantom phaddw +REG_FCSR
+x86_64 SR-rd-phantom phsubd +REG_FCSR
+x86_64 SR-rd-phantom phsubsw +REG_FCSR
+x86_64 SR-rd-phantom phsubw +REG_FCSR
+x86_64 SR-rd-phantom pinsrw +REG_FCSR
+x86_64 SR-rd-phantom pmaddubsw +REG_FCSR
+x86_64 SR-rd-phantom pmaddwd +REG_FCSR
+x86_64 SR-rd-phantom pmaxsw +REG_FCSR
+x86_64 SR-rd-phantom pmaxub +REG_FCSR
+x86_64 SR-rd-phantom pminsw +REG_FCSR
+x86_64 SR-rd-phantom pminub +REG_FCSR
+x86_64 SR-rd-phantom pmovmskb +REG_FCSR
+x86_64 SR-rd-phantom pmulhrsw +REG_FCSR
+x86_64 SR-rd-phantom pmulhuw +REG_FCSR
+x86_64 SR-rd-phantom pmulhw +REG_FCSR
+x86_64 SR-rd-phantom pmullw +REG_FCSR
+x86_64 SR-rd-phantom pmuludq +REG_FCSR
+x86_64 SR-rd-phantom por +REG_FCSR
+x86_64 SR-rd-phantom psadbw +REG_FCSR
+x86_64 SR-rd-phantom pshufb +REG_FCSR
+x86_64 SR-rd-phantom pshufw +REG_FCSR
+x86_64 SR-rd-phantom psignb +REG_FCSR
+x86_64 SR-rd-phantom psignd +REG_FCSR
+x86_64 SR-rd-phantom psignw +REG_FCSR
+x86_64 SR-rd-phantom pslld +REG_FCSR
+x86_64 SR-rd-phantom psllq +REG_FCSR
+x86_64 SR-rd-phantom psllw +REG_FCSR
+x86_64 SR-rd-phantom psrad +REG_FCSR
+x86_64 SR-rd-phantom psraw +REG_FCSR
+x86_64 SR-rd-phantom psrld +REG_FCSR
+x86_64 SR-rd-phantom psrlq +REG_FCSR
+x86_64 SR-rd-phantom psrlw +REG_FCSR
+x86_64 SR-rd-phantom psubb +REG_FCSR
+x86_64 SR-rd-phantom psubd +REG_FCSR
+x86_64 SR-rd-phantom psubq +REG_FCSR
+x86_64 SR-rd-phantom psubsb +REG_FCSR
+x86_64 SR-rd-phantom psubsw +REG_FCSR
+x86_64 SR-rd-phantom psubusb +REG_FCSR
+x86_64 SR-rd-phantom psubusw +REG_FCSR
+x86_64 SR-rd-phantom psubw +REG_FCSR
+x86_64 SR-rd-phantom punpckhbw +REG_FCSR
+x86_64 SR-rd-phantom punpckhdq +REG_FCSR
+x86_64 SR-rd-phantom punpckhwd +REG_FCSR
+x86_64 SR-rd-phantom punpcklbw +REG_FCSR
+x86_64 SR-rd-phantom punpckldq +REG_FCSR
+x86_64 SR-rd-phantom punpcklwd +REG_FCSR
+x86_64 SR-rd-phantom pxor +REG_FCSR
+x86_64 SR-rd-phantom verr +REG_FLAGS
+x86_64 SR-rd-phantom verw +REG_FLAGS
 
 # --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
 #     1062 signature(s), 710456 encodings at this tip.
@@ -9254,6 +9470,7 @@ aarch64 SR-rd-phantom smlslt +REG_SYSFPEN
 aarch64 SR-rd-phantom smmla +REG_SYSFPEN
 aarch64 SR-rd-phantom smopa +REG_SYSFPEN
 aarch64 SR-rd-phantom smov +REG_SYSFPEN
+aarch64 SR-rd-phantom smstart +REG_FCSR,REG_SYSFPEN,REG_VCTRL
 aarch64 SR-rd-phantom smstop +REG_SYSFPEN,REG_VCTRL
 aarch64 SR-rd-phantom smulh +REG_SYSFPEN
 aarch64 SR-rd-phantom smulh +REG_SYSFPEN,REG_VEC#
@@ -9656,7 +9873,7 @@ aarch64 SR-rd-phantom sys +REG_SSP
 aarch64 SR-rd-phantom sysl +REG_SSP
 
 # --- A-SYSSEL: the system register an (op0, op1, CRn, CRm, op2) tuple selects, which LLVM models as an immediate.
-#     29 signature(s), 19829 encodings at this tip.
+#     27 signature(s), 19749 encodings at this tip.
 #
 # MRS / MSR / MRRS / MSRR / SYS / SYSL address a system register by an ENCODED
 # TUPLE, and LLVM's MCInstrDesc carries that tuple as immediates: there is no
@@ -9669,8 +9886,6 @@ aarch64 SR-rd-phantom sysl +REG_SSP
 # `msr +REG_FPCW` and `msrr +REG_FPCW` are the WRITE half, new at this tip
 # because FPCR moved off REG_FCSR (the control word is not the status word);
 # LLVM models no system register write on MSR either.
-aarch64 FR-wr-phantom msr +REG_FPCW
-aarch64 FR-wr-phantom msrr +REG_FPCW
 aarch64 SR-rd-missing sysl +REG_GPR#
 aarch64 SR-rd-missing tlbi +REG_GPR#
 aarch64 SR-rd-phantom mrrs +REG_FCSR
@@ -9980,19 +10195,42 @@ riscv64 SR-rd-phantom amocas.q.rl +REG_GPR#
 # LLVM models the label as an immediate and names no register at all.
 riscv64 SR-rd-phantom lpad +REG_GPR#,REG_SYS
 
-# --- R-VTAIL: RVV reads its own destination: prestart, masked-off and tail elements are UNDISTURBED.
+# --- R-VTAIL: RVV reads its own destination under a policy the ENCODING does not carry.
 #     569 signature(s), 30953 encodings at this tip.
 #
-# Under the tail-undisturbed and mask-undisturbed policies -- the reset state
-# of vtype and the one QEMU's helpers implement unconditionally -- the elements
-# of vd before vstart, the elements a mask bit turns off, and the elements past
-# vl all RETAIN THE VALUE vd ALREADY HELD ("V" spec v1.0, sec. 5.3 and 5.4).
-# The destination is therefore a genuine source of every vector instruction
-# that does not write all VLEN bits, which is why QEMU passes vd into the gvec
-# helper and reads it.  LLVM's MCInstrDesc carries a tied operand only on the
-# forms whose ASSEMBLY repeats the register, so on the rest its read set is
-# short by exactly vd.  This is the same disagreement MIPS lwl/lwr already
-# carries in this file, and the fields side is again the correct one.
+# Under the tail-undisturbed and mask-undisturbed policies the elements of vd
+# before vstart, the elements a mask bit turns off, and the elements past vl
+# all RETAIN THE VALUE vd ALREADY HELD ("V" spec v1.0, sec. 5.3 and 5.4).  On
+# those instructions vd is a genuine source.
+#
+# WHICH POLICY IS IN FORCE IS NOT A PROPERTY OF THE INSTRUCTION.  It is vtype's
+# vta/vma, set by a vset*vli that may be arbitrarily far away, so the encoding
+# this row describes does not determine it and NO static description of that
+# encoding can.  That is the whole of the argument, and it is the reason the
+# row is about a static model rather than about a run: for one encoding there
+# are two architecturally-defined behaviours, one of which reads vd, and the
+# encoding does not say which.  A description that omits vd is therefore wrong
+# under a state the architecture permits, while one that carries it is a
+# superset -- an edge that is sometimes inert, never an edge that is missing.
+# A missing dependency is the error direction this project treats as a defect;
+# an inert one costs precision.
+#
+# WHAT WAS PREVIOUSLY WRITTEN HERE WAS FALSE and is recorded so the same
+# reasoning is not rebuilt: this row used to justify itself by calling
+# tail/mask-undisturbed "the reset state of vtype and the one QEMU's helpers
+# implement unconditionally".  Neither is true.  riscv_cpu_reset_hold() sets
+# env->vill, not a tu/mu vtype; and target/riscv/vector_helper.c implements
+# BOTH policies -- vext_set_elems_1s() is called exactly when vta/vma is set,
+# which is the agnostic case overwriting the elements the old text claimed were
+# always preserved.  The rows this class emits do not change: they never rested
+# on that claim, only on the argument above.
+#
+# LLVM's MCInstrDesc carries a tied operand only on the forms whose ASSEMBLY
+# repeats the register, so on the rest its read set is short by exactly vd --
+# it is a per-encoding description facing the same missing fact, and it
+# resolves it the other way.  This is the same disagreement MIPS lwl/lwr
+# already carries in this file, and the fields side is again the correct
+# one.
 riscv64 SR-rd-phantom vaadd.vv +REG_FCSR,REG_VEC#
 riscv64 SR-rd-phantom vaadd.vx +REG_FCSR,REG_VEC#
 riscv64 SR-rd-phantom vaaddu.vv +REG_FCSR,REG_VEC#
@@ -10564,7 +10802,7 @@ riscv64 SR-rd-phantom vzext.vf2 +REG_VEC#
 riscv64 SR-rd-phantom vzext.vf8 +REG_VEC#
 
 # --- R-CSRIMM: the CSR a number selects, which LLVM models as an IMMEDIATE.
-#     299 signature(s), 22749 encodings at this tip.
+#     301 signature(s), 22893 encodings at this tip.
 #
 # A CSR instruction addresses its register by a 12-bit NUMBER, and LLVM's
 # MCInstrDesc carries that number as an immediate operand: there is no register
@@ -10858,6 +11096,11 @@ riscv64 SR-rd-phantom vsadd.vx +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vi +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vv +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vx +REG_FCSR
+riscv64 SR-rd-phantom vsetivli +REG_SYS,REG_VCTRL
+riscv64 SR-rd-phantom vsetvl +REG_SYS
+riscv64 SR-rd-phantom vsetvl +REG_SYS,REG_VCTRL
+riscv64 SR-rd-phantom vsetvli +REG_SYS
+riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
 riscv64 SR-rd-phantom vsmul.vv +REG_FCSR
 riscv64 SR-rd-phantom vsmul.vx +REG_FCSR
 riscv64 SR-rd-phantom vssra.vi +REG_FCSR
@@ -10871,55 +11114,9 @@ riscv64 SR-rd-phantom vssub.vx +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
 riscv64 SR-rd-phantom wfi +REG_SYS
-riscv64 SR-rd-phantom vsetvl +REG_SYS
-riscv64 SR-rd-phantom vsetvl +REG_SYS,REG_VCTRL
-riscv64 SR-rd-phantom vsetvli +REG_SYS
-riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
-riscv64 SR-rd-phantom vsetivli +REG_SYS,REG_VCTRL
-riscv64 FR-rd-phantom vsetivli +REG_VCTRL
 
-# --- M-DSPIMM: QEMU's MIPS DSP translators read the IMMEDIATE FIELD as a GPR -- FINDING 71-A.
-#     31 signature(s), 1373 encodings, NOT ALLOWLISTED.
-#     An allowlist row asserts the tracer is right; these stay red.
-#     mipsel SR-rd-phantom extp +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom extpdp +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom extr.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom extr_r.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom extr_rs.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom extr_s.h +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom precr_sra.ph.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom precr_sra_r.ph.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.ph +REG_FP_REG,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.ph +REG_LR,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.ph +REG_SP,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.qb +REG_FP_REG,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.qb +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.qb +REG_LR,REG_SYSEXC
-#     mipsel SR-rd-phantom repl.qb +REG_SP,REG_SYSEXC
-#     mipsel SR-rd-phantom shilo +REG_FP_REG,REG_SYSEXC
-#     mipsel SR-rd-phantom shilo +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shilo +REG_LR,REG_SYSEXC
-#     mipsel SR-rd-phantom shilo +REG_SP,REG_SYSEXC
-#     mipsel SR-rd-phantom shll.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shll_s.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shll_s.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shra.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shra.qb +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shra_r.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shra_r.qb +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shra_r.w +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shrl.ph +REG_GPR#,REG_SYSEXC
-#     mipsel SR-rd-phantom shrl.qb +REG_GPR#,REG_SYSEXC
-
-# --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs
-#     the other one -- FINDING 70-A, RESOLVED.
+# --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs the other one -- FINDING 70-A, RESOLVED.
 #     1 signature(s), 89 encodings at this tip.
-#
-#     SR-rd-phantom lsa +REG_GPR#     n=89     representative 05000200
-#       cs{lsa $zero, $zero, $v0, 1}  llvm{lsa $zero, $zero, $2, 1}
-#       wireRD{REG_GPR2,REG_GPR4}     llvmRD{REG_GPR2}
 #
 # THE SURPLUS IS ONE REGISTER, $a0, AND IT IS QEMU'S OWN STATEMENT.  SPECIAL
 # function 0x05 is decoded in three different places depending on the model:
@@ -10957,6 +11154,13 @@ riscv64 FR-rd-phantom vsetivli +REG_VCTRL
 # so does a corpus captured on an R6 or MSA-bearing model, where the word IS
 # `lsa` and gpr[4] is never read.  Both are the dead-allowlist-rule detector's
 # business, and it is watching this row.
+#
+# THE ADJUDICATION LIVES HERE AND NOT IN THE ALLOWLIST (FINDING 77-B).  It was
+# written into the generated block by hand in 384a50e331, which edited the two
+# allowlist files and not this one -- so the first regeneration threw the whole
+# class back to DEFECT and both mipsel arms went red again, which is how it was
+# found.  A class's verdict is the generator's; a hand-edit inside the block is
+# a verdict with a deletion date.
 mipsel SR-rd-phantom lsa +REG_GPR#
 
 # --- M-MERGE: the unaligned loads merge into their destination, so the destination is a source.
@@ -11239,7 +11443,7 @@ mipsel SR-rd-phantom trunc.w.d +REG_FCSR
 mipsel SR-rd-phantom trunc.w.s +REG_FCSR
 
 # --- M-EXC: the footprint of the exception an instruction RAISES.
-#     622 signature(s), 190266 encodings at this tip.
+#     622 signature(s), 191639 encodings at this tip.
 #
 # R7.6: syscall, break, the twelve conditional traps, the overflow-checking
 # arithmetic and the DSP forms whose availability is gated all reach QEMU's
@@ -11871,314 +12075,4 @@ mipsel SR-rd-phantom xor.v +REG_SYSEXC
 mipsel SR-rd-phantom xori.b +REG_SYSEXC
 mipsel SR-rd-phantom yield +REG_SYSEXC
 
-# --- ADDENDUM (exec128): the SYSCALL flag read the table regeneration restored.
-# --- X-SYSCALLFLAGS: SYSCALL reads RFLAGS because saving it into R11 is half of what the instruction does.
-#     1 signature(s), 7014 encodings at this tip.
-#
-# SYSCALL is defined as `RCX <- RIP; R11 <- RFLAGS` (Intel SDM Vol. 2B,
-# SYSCALL), so the flag register is a true source: the instruction copies it.
-# QEMU states both writes and the read in helper_syscall()
-# (target/i386/tcg/user/seg_helper.c), and the read reaches the wire's ordered
-# list through the CP-H usage table's `eflags` and `cc_*` members.
-#
-# LLVM's MCInstrDesc carries a fixed Defs/Uses pair for the SYSCALL opcode and
-# names no EFLAGS use on it at all -- the same structural silence the implicit
-# family below meets, but about the FLAG register rather than a GPR, which is
-# why it is its own row and not folded into that class.
-#
-# This signature is NEW at this tip and it is a repair, not a regression: the
-# generated usage table had been carrying helper_syscall's footprint from
-# before `ccfaf4fdc5` rewrote the helper, so the wire published nothing for
-# nine members it depends on.  Restoring them made the tracer's read set a
-# superset of the reference's, which is the direction this file exists to
-# record.
-x86_64 SR-rd-phantom syscall +REG_FLAGS
-
-
-# --- ADDENDUM (exec129): the CP-H fold re-pointed the SME enable-gate row.
-#
-# Landing the whole-population aarch64 usage table moved exactly THREE
-# encodings on the wire, all `smstart`, all in one direction: the table now
-# states helper_set_svcr()'s read of the FP status file, so the gate row's
-# qualifier GREW by REG_FCSR and the old row stopped matching anything.
-# It is emitted here by the generator from the arm's own residue, and the row
-# it replaces is deleted in the same commit -- a dead row and a missing row are
-# the two failures this family's generator exists to make impossible.
-
-# --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
-#     1 signature(s), 3 encodings at this tip.
-#
-# Every FP, AdvSIMD, SVE and SME instruction runs an architectural enable check
-# before it does anything -- CheckFPAdvSIMDEnabled, CheckSVEEnabled,
-# CheckSMEEnabled (Arm ARM DDI 0487) -- and that check READS CPACR_EL1.FPEN and
-# the CPTR_EL{2,3} traps.  QEMU states the read at translation time
-# (fp_access_check() / sve_access_check() in target/arm/tcg/translate-a64.c),
-# so it reaches the wire's ordered read list on the whole FP population.
-# REG_SYSFPEN exists because that population is every FP instruction in the
-# ISA: folded into the residual REG_SYS, one TTBR write would order all of them
-# behind it.  LLVM's MCInstrDesc models no enable check on any instruction, so
-# this is a phantom by construction and not a disagreement about dataflow.
-#
-# Where the qualifier names REG_VEC# beside the gate, the extra register is the
-# instruction's own DESTINATION, read for the same reason the RVV block above
-# gives: the predicated and merging forms leave the inactive elements of Zd
-# standing, so Zd is a source.  Where it names REG_FCSR the register is FPSR,
-# whose QC bit these forms make STICKY -- read-modify-written, not written --
-# and where it names REG_FPCW it is FPCR, the control word every FP instruction
-# reads.
-aarch64 SR-rd-phantom smstart +REG_FCSR,REG_SYSFPEN,REG_VCTRL
-
-
-# --- ADDENDUM (exec129): the x86_64 whole-population CP-H table.
-#
-# 506 rows where the table carried the 76 helpers four guest programs
-# happened to call.  1,232,780 encodings GAIN a published source and none
-# loses one; the residue is emitted here by the generator from the arm's own
-# output, and the 23 rows whose qualifier GREW under it are deleted in the
-# same commit.
-
-# --- X-FIP: every x87 instruction reads the CS SELECTOR, to save it as the FPU code segment.
-#     2 signature(s), 1504 encodings at this tip.
-#
-# The x87 state includes the FPU Instruction Pointer and the FPU Code Segment
-# selector -- the pair FSTENV / FSAVE / FXSAVE publish (Intel SDM Vol. 1
-# sec. 8.1.8) -- and the instruction that updates FIP must read CS to do it.
-# QEMU does exactly that, in one place, for the whole x87 population:
-#
-#     target/i386/tcg/translate.c, `if (update_fip)`:
-#         tcg_gen_ld32u_tl(..., offsetof(CPUX86State, segs[R_CS].selector));
-#         tcg_gen_st_tl (..., offsetof(CPUX86State, fpcs));
-#
-# so REG_SEG0 reaches the wire's read list on every x87 form that updates FIP,
-# including the register-only ones with no memory operand at all.  LLVM's
-# MCInstrDesc names no segment register on any of them.  This is NOT the
-# zero-base segment-override family below: that one is about an override
-# prefix the reference reports and 64-bit mode ignores, this one is a real read
-# the reference does not report.  Where the qualifier names REG_FCSR beside it
-# the register is FPSW, read-modify-written for the condition codes and the
-# stack top, and where it names REG_FPR# it is the stack slot ST(0) resolves
-# to.
-x86_64 SR-rd-phantom fcomi +REG_FCSR,REG_FLAGS,REG_SEG0
-x86_64 SR-rd-phantom fcompi +REG_FCSR,REG_FLAGS,REG_SEG0
-
-# --- X-STACK: the implicit stack access reads SS and RSP, and LLVM names neither.
-#     11 signature(s), 210388 encodings at this tip.
-#
-# RET, CALL, PUSH, POP, LEAVE and ENTER address memory through RSP with SS as
-# the segment, and neither register appears in the encoding.  QEMU computes the
-# effective address from both, so both reach the read list.  LLVM's
-# MCInstrDesc leaves the implicit stack operands to the target's own lowering
-# and names no register here.
-x86_64 SR-rd-phantom bnd lretl +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom bnd lretq +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom bnd lretw +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom iretl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom iretq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom iretw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SEG5,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom lretl +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom lretq +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom lretw +REG_CTRL0,REG_CTRL4,REG_SEG5,REG_SP,REG_SYS
-x86_64 SR-rd-phantom popq +REG_CTRL0,REG_CTRL4,REG_SP,REG_SYS
-x86_64 SR-rd-phantom popw +REG_CTRL0,REG_CTRL4,REG_SP,REG_SYS
-
-# --- X-CR: a control register that gates whether the instruction runs at all.
-#     62 signature(s), 143256 encodings at this tip.
-#
-# FWAIT checks CR0.TS, CR0.MP and CR0.EM before it looks at the x87 status
-# word, and the SSE and XSAVE forms check CR4.OSFXSR / CR4.OSXSAVE the same
-# way.  QEMU states those reads at translation.  LLVM's MCInstrDesc models no
-# control register on any instruction, which is the same structural silence
-# REG_SYSFPEN meets on AArch64.
-x86_64 SR-rd-phantom bnd lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom bnd lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom bnd ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom fxrstor +REG_CTRL4,REG_FCSR
-x86_64 SR-rd-phantom fxrstor64 +REG_CTRL4,REG_FCSR
-x86_64 SR-rd-phantom fxsave +REG_CTRL4
-x86_64 SR-rd-phantom fxsave64 +REG_CTRL4
-x86_64 SR-rd-phantom lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lcallq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lcallq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lcallw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lcallw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lfsl +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lfsq +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lfsw +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lgs +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lgsl +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lgsw +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpq +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom ljmpw +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom lssl +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lssq +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom lssw +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom movl +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom movw +REG_CTRL0,REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom notrack lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom notrack lcalll +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_FP_REG,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SP,REG_SYSMMU
-x86_64 SR-rd-phantom notrack ljmpl +REG_CTRL0,REG_CTRL4,REG_FLAGS,REG_GPR#,REG_SYSMMU
-x86_64 SR-rd-phantom rdfsbasel +REG_CTRL4,REG_SEG3
-x86_64 SR-rd-phantom rdfsbaseq +REG_CTRL4,REG_SEG3
-x86_64 SR-rd-phantom rdgsbasel +REG_CTRL4,REG_SEG4
-x86_64 SR-rd-phantom rdgsbaseq +REG_CTRL4,REG_SEG4
-x86_64 SR-rd-phantom rdpkru +REG_CTRL4
-x86_64 SR-rd-phantom rdpmc +REG_CTRL4,REG_SYS
-x86_64 SR-rd-phantom wrfsbasel +REG_CTRL4
-x86_64 SR-rd-phantom wrfsbaseq +REG_CTRL4
-x86_64 SR-rd-phantom wrgsbasel +REG_CTRL4
-x86_64 SR-rd-phantom wrgsbaseq +REG_CTRL4
-x86_64 SR-rd-phantom wrpkru +REG_CTRL4
-x86_64 SR-rd-phantom xrstor +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-x86_64 SR-rd-phantom xrstor64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-x86_64 SR-rd-phantom xsave +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-x86_64 SR-rd-phantom xsave64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-x86_64 SR-rd-phantom xsaveopt +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-x86_64 SR-rd-phantom xsaveopt64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
-
-# --- X-FSGS: the FS and GS BASES, which are the only segment bases that are live in 64-bit mode.
-#     2 signature(s), 2176 encodings at this tip.
-#
-# The phantom direction of the segment family: the tracer reads the live base
-# register -- `swapgs`, `rdfsbase`, `wrgsbase`, `maskmovq` -- and LLVM's
-# MCInstrDesc has no operand for the hidden descriptor base.  This is the
-# counterpart to the zero-base override family below, and the discriminator
-# between them is checked: NOT ONE row here is REG_SEG0 / REG_SEG1 / REG_SEG2 /
-# REG_SEG5, and not one row there is REG_SEG3 or REG_SEG4.
-x86_64 SR-rd-phantom maskmovq +REG_FCSR,REG_SEG3
-x86_64 SR-rd-phantom maskmovq +REG_FCSR,REG_SEG4
-
-# --- X-UPPERLANE: a legacy scalar or unary SSE form preserves the upper lanes of its destination, so the destination is read.
-#     9 signature(s), 42490 encodings at this tip.
-#
-# R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
-# form survives above the element the instruction writes, so it is an input.
-# LLVM models the preserve as a tied operand on the forms whose assembly
-# repeats the register and not on the rest, so its read set is short by the
-# destination exactly where the tie is absent.
-x86_64 SR-rd-phantom aesimc +REG_VEC#
-x86_64 SR-rd-phantom aeskeygenassist +REG_VEC#
-x86_64 SR-rd-phantom vaesdec +REG_VEC#
-x86_64 SR-rd-phantom vaesdeclast +REG_VEC#
-x86_64 SR-rd-phantom vaesenc +REG_VEC#
-x86_64 SR-rd-phantom vaesenclast +REG_VEC#
-x86_64 SR-rd-phantom vaesimc +REG_VEC#
-x86_64 SR-rd-phantom vaeskeygenassist +REG_VEC#
-x86_64 SR-rd-phantom vpclmulqdq +REG_VEC#
-
-# --- X-MISC: the remaining reference gaps, one signature at a time.
-#     92 signature(s), 518683 encodings at this tip.
-#
-# What is left after the named families: forms where LLVM names an implicit
-# operand its per-opcode description carries and the instruction does not
-# consult, or where the tracer names a register the encoding implies and the
-# reference has no operand for.  They are listed one row at a time because
-# none of them generalises.
-x86_64 SR-rd-phantom cvtpd2pi +REG_FCSR
-x86_64 SR-rd-phantom cvtpi2pd +REG_FCSR
-x86_64 SR-rd-phantom cvtpi2ps +REG_FCSR
-x86_64 SR-rd-phantom cvtps2pi +REG_FCSR
-x86_64 SR-rd-phantom cvttpd2pi +REG_FCSR
-x86_64 SR-rd-phantom cvttps2pi +REG_FCSR
-x86_64 SR-rd-phantom emms +REG_FCSR
-x86_64 SR-rd-phantom femms +REG_FCSR
-x86_64 SR-rd-phantom fnclex +REG_FCSR
-x86_64 SR-rd-phantom maskmovq +REG_FCSR
-x86_64 SR-rd-phantom movd +REG_FCSR
-x86_64 SR-rd-phantom movdq2q +REG_FCSR
-x86_64 SR-rd-phantom movntq +REG_FCSR
-x86_64 SR-rd-phantom movq +REG_FCSR
-x86_64 SR-rd-phantom movq2dq +REG_FCSR
-x86_64 SR-rd-phantom pabsb +REG_FCSR
-x86_64 SR-rd-phantom pabsd +REG_FCSR
-x86_64 SR-rd-phantom pabsw +REG_FCSR
-x86_64 SR-rd-phantom packssdw +REG_FCSR
-x86_64 SR-rd-phantom packsswb +REG_FCSR
-x86_64 SR-rd-phantom packuswb +REG_FCSR
-x86_64 SR-rd-phantom paddb +REG_FCSR
-x86_64 SR-rd-phantom paddd +REG_FCSR
-x86_64 SR-rd-phantom paddq +REG_FCSR
-x86_64 SR-rd-phantom paddsb +REG_FCSR
-x86_64 SR-rd-phantom paddsw +REG_FCSR
-x86_64 SR-rd-phantom paddusb +REG_FCSR
-x86_64 SR-rd-phantom paddusw +REG_FCSR
-x86_64 SR-rd-phantom paddw +REG_FCSR
-x86_64 SR-rd-phantom palignr +REG_FCSR
-x86_64 SR-rd-phantom pand +REG_FCSR
-x86_64 SR-rd-phantom pandn +REG_FCSR
-x86_64 SR-rd-phantom pavgb +REG_FCSR
-x86_64 SR-rd-phantom pavgw +REG_FCSR
-x86_64 SR-rd-phantom pcmpeqb +REG_FCSR
-x86_64 SR-rd-phantom pcmpeqd +REG_FCSR
-x86_64 SR-rd-phantom pcmpeqw +REG_FCSR
-x86_64 SR-rd-phantom pcmpgtb +REG_FCSR
-x86_64 SR-rd-phantom pcmpgtd +REG_FCSR
-x86_64 SR-rd-phantom pcmpgtw +REG_FCSR
-x86_64 SR-rd-phantom pextrw +REG_FCSR
-x86_64 SR-rd-phantom phaddd +REG_FCSR
-x86_64 SR-rd-phantom phaddsw +REG_FCSR
-x86_64 SR-rd-phantom phaddw +REG_FCSR
-x86_64 SR-rd-phantom phsubd +REG_FCSR
-x86_64 SR-rd-phantom phsubsw +REG_FCSR
-x86_64 SR-rd-phantom phsubw +REG_FCSR
-x86_64 SR-rd-phantom pinsrw +REG_FCSR
-x86_64 SR-rd-phantom pmaddubsw +REG_FCSR
-x86_64 SR-rd-phantom pmaddwd +REG_FCSR
-x86_64 SR-rd-phantom pmaxsw +REG_FCSR
-x86_64 SR-rd-phantom pmaxub +REG_FCSR
-x86_64 SR-rd-phantom pminsw +REG_FCSR
-x86_64 SR-rd-phantom pminub +REG_FCSR
-x86_64 SR-rd-phantom pmovmskb +REG_FCSR
-x86_64 SR-rd-phantom pmulhrsw +REG_FCSR
-x86_64 SR-rd-phantom pmulhuw +REG_FCSR
-x86_64 SR-rd-phantom pmulhw +REG_FCSR
-x86_64 SR-rd-phantom pmullw +REG_FCSR
-x86_64 SR-rd-phantom pmuludq +REG_FCSR
-x86_64 SR-rd-phantom por +REG_FCSR
-x86_64 SR-rd-phantom psadbw +REG_FCSR
-x86_64 SR-rd-phantom pshufb +REG_FCSR
-x86_64 SR-rd-phantom pshufw +REG_FCSR
-x86_64 SR-rd-phantom psignb +REG_FCSR
-x86_64 SR-rd-phantom psignd +REG_FCSR
-x86_64 SR-rd-phantom psignw +REG_FCSR
-x86_64 SR-rd-phantom pslld +REG_FCSR
-x86_64 SR-rd-phantom psllq +REG_FCSR
-x86_64 SR-rd-phantom psllw +REG_FCSR
-x86_64 SR-rd-phantom psrad +REG_FCSR
-x86_64 SR-rd-phantom psraw +REG_FCSR
-x86_64 SR-rd-phantom psrld +REG_FCSR
-x86_64 SR-rd-phantom psrlq +REG_FCSR
-x86_64 SR-rd-phantom psrlw +REG_FCSR
-x86_64 SR-rd-phantom psubb +REG_FCSR
-x86_64 SR-rd-phantom psubd +REG_FCSR
-x86_64 SR-rd-phantom psubq +REG_FCSR
-x86_64 SR-rd-phantom psubsb +REG_FCSR
-x86_64 SR-rd-phantom psubsw +REG_FCSR
-x86_64 SR-rd-phantom psubusb +REG_FCSR
-x86_64 SR-rd-phantom psubusw +REG_FCSR
-x86_64 SR-rd-phantom psubw +REG_FCSR
-x86_64 SR-rd-phantom punpckhbw +REG_FCSR
-x86_64 SR-rd-phantom punpckhdq +REG_FCSR
-x86_64 SR-rd-phantom punpckhwd +REG_FCSR
-x86_64 SR-rd-phantom punpcklbw +REG_FCSR
-x86_64 SR-rd-phantom punpckldq +REG_FCSR
-x86_64 SR-rd-phantom punpcklwd +REG_FCSR
-x86_64 SR-rd-phantom pxor +REG_FCSR
-x86_64 SR-rd-phantom verr +REG_FLAGS
-x86_64 SR-rd-phantom verw +REG_FLAGS
+# <<< END GENERATED SR-rd BLOCK

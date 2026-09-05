@@ -53,6 +53,17 @@ import sys
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 
+#: THE SENTINELS.  Everything between them in an allowlist is this
+#: generator's output and nothing else, so `--replace` can rewrite the block
+#: MECHANICALLY instead of by matching prose -- and so a hand-edit inside it
+#: is a hand-edit inside a region the file itself declares generated.  The
+#: block used to run from a `# ====` line to end-of-file, which made
+#: "regenerate it" mean "delete the tail and hope", and is why two of its
+#: lines were corrected in place instead.
+BEGIN_MARK = ("# >>> BEGIN GENERATED SR-rd BLOCK -- isax_srcenc_rows.py "
+              "--header --layer %s")
+END_MARK = "# <<< END GENERATED SR-rd BLOCK"
+
 _LINE = re.compile(
     r'^NEW\s+(?P<sig>(?P<cls>\S+)\s+(?P<rest>.*?))\s+n=(?P<n>\d+)\s+'
     r'(?P<enc>[0-9a-f]+)\s')
@@ -77,13 +88,40 @@ class Sig:
 
 
 def read_arm(path):
+    """This generator's OWN family from @path, and a named notice of the rest.
+
+    THE FAMILY IS `SR-rd-*` AND NOTHING ELSE.  This file emits rows about the
+    WIRE's published source list; a `R-wr-phantom` or `FB-ret-mismatch`
+    signature is a different question with a different allowlist class, and it
+    is not this generator's to classify.  Reading every NEW line and then
+    refusing on the first one outside the family made an unrelated red stop
+    the regeneration entirely -- measured at this tip, where one
+    `R-wr-phantom vsetivli +vctrl` blocked the whole block from being emitted.
+
+    NOT DROPPED, NAMED.  A signature outside the family is still a RED on that
+    arm and the arm's own exit code says so; swallowing it here would let this
+    file report a clean partition over an arm that is failing.  It is printed
+    to stderr with its arm, so a regeneration that runs beside one is a
+    regeneration whose operator was told.
+    """
     out = []
+    foreign = []
     for line in open(path):
         m = _LINE.match(line)
         if m:
-            out.append(Sig(m))
+            if m.group("cls").startswith("SR-rd-"):
+                out.append(Sig(m))
+            else:
+                foreign.append(m.group("sig"))
         elif line.startswith("NEW"):
             raise SystemExit(f"{path}: unparsed NEW line: {line!r}")
+    if foreign:
+        print("isax_srcenc_rows: %s carries %d NEW signature(s) OUTSIDE "
+              "`SR-rd-*`, which this generator does not own.  The arm is red "
+              "for them and stays red; they are not in the block below:"
+              % (path, len(foreign)), file=sys.stderr)
+        for f in sorted(set(foreign)):
+            print("    %s" % f, file=sys.stderr)
     return out
 
 
@@ -236,25 +274,51 @@ def _m_dspimm(s):
     return s.mnem.split()[0] in MIPS_DSP_IMM and _gpr(s.regs)
 
 
-@cls("mipsel", "M-LSA", "Capstone answers an R6-only mnemonic in a pre-R6 "
-     "mode, over QEMU's PMON dataflow -- FINDING 70-A", """
-LSA and DLSA are MIPS Release 6 (and MSA) instructions.  On MIPS32 and
-MIPS32R2, SPECIAL function 0x05 is unallocated, and QEMU's translator
-dispatches it as the PMON monitor entry point -- `case OPC_PMON:` ->
-gen_helper_pmon(), commented "Pmon entry point, also R4010 selsl".  QEMU
-reaches LSA only through the R6 or MSA decoders (rel6.decode:21,
-msa.decode:51).
+@cls("mipsel", "M-LSA", "the four bytes are TWO INSTRUCTIONS, and on this "
+     "model QEMU runs the other one -- FINDING 70-A, RESOLVED", """
+THE SURPLUS IS ONE REGISTER, $a0, AND IT IS QEMU'S OWN STATEMENT.  SPECIAL
+function 0x05 is decoded in three different places depending on the model:
+rel6.decode:21 and msa.decode:51 both spell it LSA, and a model that is
+NEITHER R6 nor MSA-bearing reaches translate.c:17241 `case OPC_PMON` -- the
+PMON entry point, marked "unofficial" at translate.c:253, which emits
+gen_helper_pmon().  That helper's body reads env->active_tc.gpr[4] on three
+of its arms (op_helper.c:238, :247, :253).  REG_GPR4 is that read.  The
+tracer publishes what the emulator executes.
 
-THE MODE WAS NOT THE DISAGREEMENT.  The sled image declares no MIPS arch
-level, so cs_mips_mode_from_eflags() selects CS_MODE_MIPS32R2 -- and
-Capstone 6.0.0 answers `lsa` in CS_MODE_MIPS32 and CS_MODE_MIPS32R2 alike.
-Both decoders were asked for the same architecture; one answered outside it.
-That makes this an UPSTREAM DECODER DEFECT rather than a per-model scope
-question, and the standing arm for it is in capstone_workaround_probe.cc.
+WHY THE REFERENCE DISAGREES, AND WHY THAT IS NOT A TRACER FINDING.  LLVM MC
+decodes the word as `lsa` because `lsa` is what SPECIAL-0x05 is in MIPS32R6,
+and it is not asked which model the corpus was captured on.  The two sides
+are describing DIFFERENT INSTRUCTIONS at the same address, which this gate
+already has a name for -- a JOIN FAILURE, "not a tracer finding", and a row
+"no dataflow change can close" (see the join commentary in
+isax_srcenc_gate.sh).  The join test does not catch this one because it
+compares the two decoders' MNEMONICS and Capstone is the defective side:
+Capstone 6.0 prints `lsa` in MIPS32 and MIPS32R2 mode too, where SPECIAL-0x05
+is unallocated (exec122/CAPSTONE_PROBE.txt, reported upstream and not worked
+around).  With both decoders saying `lsa` the join succeeds and the register
+difference is scored as dataflow.
 
-The rows are a UNION of two instructions' lists: the mnemonic is R6's, the
-dataflow is what the emulated machine executed.  QEMU's is the correct half.""",
-     defect=True)
+THE DIRECTION IS DECIDED BY CONSULTING THE MODEL, NOT BY REFUSING THE ROW.
+The row was left NOT ALLOWLISTED for four passes on the reasoning that "an
+allowlist row asserts the tracer is right" -- written before anyone had
+checked whether it is.  It is: op_helper.c:233 is the witness.  Refusing the
+row instead would assert a permanent tracer defect that no dataflow change
+can ever close, and it would state a per-model difference as tracer scope,
+which the all-MIPS-models ruling forbids.  The difference is a QEMU-modelling
+fact and it is recorded here as one, with the model named.
+
+SELF-RETIRING FROM EITHER END.  A Capstone that stops decoding SPECIAL-0x05
+in a pre-R6 mode makes the join fail on the mnemonic and this row goes dead;
+so does a corpus captured on an R6 or MSA-bearing model, where the word IS
+`lsa` and gpr[4] is never read.  Both are the dead-allowlist-rule detector's
+business, and it is watching this row.
+
+THE ADJUDICATION LIVES HERE AND NOT IN THE ALLOWLIST (FINDING 77-B).  It was
+written into the generated block by hand in 384a50e331, which edited the two
+allowlist files and not this one -- so the first regeneration threw the whole
+class back to DEFECT and both mipsel arms went red again, which is how it was
+found.  A class's verdict is the generator's; a hand-edit inside the block is
+a verdict with a deletion date.""")
 def _m_lsa(s):
     return s.mnem.split()[0] in ("lsa", "dlsa")
 
@@ -717,6 +781,178 @@ def classify(isa, sigs):
     return out
 
 
+
+def emit_header(arms, layer, isas, corpus, rcpath):
+    """The SUMMARY BLOCK above the class rows, FROM THE ARMS THEMSELVES.
+
+    WHY THIS IS GENERATED AND WAS NOT.  The block this replaces carried five
+    measurements -- a per-layer unallowed table, a loss-direction breakdown by
+    ISA and class, the classes that got no rows, the corpus provenance, and
+    the regeneration line -- and every one of them was typed.  Two of its
+    lines were then CORRECTED BY HAND when the arms moved, and the block said
+    so about itself: "the two lines above were corrected by hand, because
+    regenerating it needs all eight `--srcenc` arms over a corpus captured at
+    THIS tip".  A summary that has to be hand-patched to stay true is a
+    summary nobody can trust at a glance, which is the whole of what a summary
+    is for.
+
+    EVERY NUMBER HERE IS READ.  The unallowed table is each arm's own
+    `unallowed=` token, the loss breakdown is this file's own partition of the
+    arm's `SR-rd-missing` signatures, the empty classes are the partition's
+    empty buckets, and the corpus provenance is md5summed from the corpus
+    files.  Nothing is passed in as a number; the only inputs are paths.
+
+    A MISSING INPUT IS A REFUSAL.  An arm file that is not there, a corpus
+    directory with no file for an ISA, an arm whose summary line carries no
+    `unallowed=` token -- each would let this print a table with a hole in it
+    that reads exactly like a zero.  They raise instead.
+    """
+    import hashlib
+    pre = "f" if layer == "fields" else "b"
+    w = []
+    a = w.append
+
+    # --- the per-layer unallowed table, from BOTH arms' own summary lines.
+    tab = {}
+    for lay in ("fields", "boundary"):
+        p0 = "f" if lay == "fields" else "b"
+        for isa in isas:
+            path = os.path.join(arms, f"{p0}_{isa}.txt")
+            if not os.path.exists(path):
+                raise SystemExit(f"emit_header: REFUSING -- no arm output at "
+                                 f"{path}; the table would carry a hole that "
+                                 f"reads as a zero")
+            m = None
+            for line in open(path):
+                if line.startswith("# isa="):
+                    m = re.search(r"unallowed=(\d+)", line)
+                    if m:
+                        break
+            if not m:
+                raise SystemExit(f"emit_header: REFUSING -- {path} has no "
+                                 f"`unallowed=` token on its summary line")
+            tab[(lay, isa)] = int(m.group(1))
+
+    # --- the loss direction, partitioned by this file's own class set.
+    loss = {}
+    for isa in isas:
+        sigs = read_arm(os.path.join(arms, f"{pre}_{isa}.txt"))
+        parts = classify(isa, sigs)
+        loss[isa] = collections.OrderedDict()
+        for cid, (title, comment, defect, rows) in parts.items():
+            miss = [r for r in rows if r.cls.endswith("-rd-missing")]
+            if miss:
+                loss[isa][cid] = len(miss)
+
+    # --- the classes with no rows at all, from the same partition.
+    empty = {}
+    for isa in isas:
+        sigs = read_arm(os.path.join(arms, f"{pre}_{isa}.txt"))
+        parts = classify(isa, sigs)
+        e = [cid for cid, (t, c, d, rows) in parts.items() if not rows]
+        if e:
+            empty[isa] = e
+
+    a(BEGIN_MARK % layer)
+    a("# " + "=" * 69)
+    a("# THE BOUNDARY LAYER'S `SR-rd-*` FAMILY -- ALL FOUR ISAs"
+      if layer == "boundary" else
+      "# THE FIELDS LAYER'S `SR-rd-*` FAMILY -- ALL FOUR ISAs")
+    a("#")
+    a("# GENERATED.  `isax_srcenc_rows.py --header --layer %s` emits this"
+      % layer)
+    a("# block and the rows below it from the arm output named at the foot;")
+    a("# every number is read from an arm or md5summed from the corpus, and")
+    a("# nothing in it is typed.  Do not hand-correct a line here -- re-run")
+    a("# the arms and re-emit, or the block goes back to being a summary that")
+    a("# has to be patched to stay true.")
+    a("#")
+    a("# WHY A SECOND BLOCK AND NOT A COPY OF THE OTHER LAYER'S.  isaxcheck")
+    a("# states in its own `--srcenc` comment that this family is")
+    a("# LAYER-INDEPENDENT: \"the wire's source list is one list; it is not a")
+    a("# property of which decoder view this tool happens to be holding\".")
+    a("# Both arms therefore score the SAME CLAIMS.  What differs is REACH --")
+    a("# the two decode with different views and reach different encodings --")
+    a("# so each allowlist gets rows for the signatures ITS OWN arm reported.")
+    a("# A row copied across would land with no occupant here, which is the")
+    a("# first property this generator exists to make impossible.")
+    a("#")
+    a("# THE POPULATION THESE ROWS CLOSE, from the arms' own summary lines.")
+    a("# Measured at this tip with BOTH generated blocks absent -- that is")
+    a("# what the regeneration procedure at the foot does, and it is the only")
+    a("# reading on which the number means \"what these rows are for\".  Both,")
+    a("# and not this one alone: the two layers score the same claims and")
+    a("# leaving the other in place would report this layer's residue against")
+    a("# an allowlist half of it had already been closed by.  Re-running the")
+    a("# arms WITH the blocks in place is the confirmation and belongs in the")
+    a("# pass evidence, not here: it reads 0 by construction.")
+    a("#")
+    a("#   layer     " + "".join("%8s " % i for i in isas) + "   total")
+    for lay in ("fields", "boundary"):
+        tot = sum(tab[(lay, i)] for i in isas)
+        a("#   %-9s" % lay + "".join("%8d " % tab[(lay, i)] for i in isas)
+          + "%8d" % tot)
+    a("#")
+    a("# THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.")
+    a("# `SR-rd-missing` says LLVM names a source the wire does not, which is")
+    a("# the direction R12.1 treats as disqualifying, so none of them may be")
+    a("# excused by a row that merely records the difference.  Each lands in a")
+    a("# class whose comment quotes the reference fact that makes the")
+    a("# REFERENCE the wrong side.  This arm's, by class:")
+    a("#")
+    for isa in isas:
+        tot = sum(loss[isa].values())
+        if not tot:
+            a("#   %-8s %4d" % (isa, 0))
+            continue
+        first = True
+        for cid, n in sorted(loss[isa].items(), key=lambda x: -x[1]):
+            a("#   %-8s %4s  %-14s %d"
+              % (isa if first else "", tot if first else "", cid, n))
+            first = False
+    a("#")
+    if empty:
+        a("# CLASSES THIS ARM GAVE NO ROWS.  A class with no occupant is not a")
+        a("# clean class -- it is a class whose subject this arm did not")
+        a("# reach, or one whose last member was closed -- and either way the")
+        a("# name is worth being able to find:")
+        a("#")
+        for isa in isas:
+            for cid in empty.get(isa, []):
+                a("#   %-8s %s" % (isa, cid))
+        a("#")
+    else:
+        a("# EVERY CLASS IN THE SET HAS AN OCCUPANT ON THIS ARM.")
+        a("#")
+
+    # --- the corpus provenance, md5summed here and not quoted.
+    a("# CORPUS: %s" % os.path.abspath(corpus))
+    for isa in isas:
+        cp = os.path.join(corpus, f"{isa}.tsv")
+        if not os.path.exists(cp):
+            raise SystemExit(f"emit_header: REFUSING -- no corpus file {cp}")
+        h = hashlib.md5()
+        n = 0
+        with open(cp, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+                n += chunk.count(b"\n")
+        a("#   %-8s %8d rows md5 %s" % (isa, n, h.hexdigest()))
+    if rcpath and os.path.exists(rcpath):
+        a("#")
+        a("# THE ARMS THAT PRODUCED IT, from the gate's own roll-up:")
+        for line in open(rcpath):
+            if line.startswith(("SO_SHA=", "ISAX_SHA=", "ALL_ARMS_DONE")):
+                a("#   %s" % line.rstrip())
+    a("#")
+    a("# HOW TO REGENERATE:")
+    a("#   isax_srcenc_gate.sh run <build> <arms> <corpus>")
+    a("#   isax_srcenc_rows.py --header --arms <arms> --layer %s \\" % layer)
+    a("#       --corpus <corpus> --rc <arms>/rc.txt --replace <allowlist>")
+    a("# " + "=" * 69)
+    return "\n".join(w)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", required=True,
@@ -731,10 +967,35 @@ def main():
     ap.add_argument("--isa", action="append", choices=ISAS)
     ap.add_argument("--census", action="store_true",
                     help="print the partition and exit")
+    ap.add_argument("--header", action="store_true",
+                    help="ALSO emit the summary block above the rows -- the "
+                         "per-layer unallowed table, the loss-direction "
+                         "partition, the empty classes and the corpus "
+                         "provenance, every number read rather than typed")
+    ap.add_argument("--corpus",
+                    help="the --srcenc corpus directory the arms were run "
+                         "over; required by --header, which md5sums it")
+    ap.add_argument("--rc",
+                    help="the gate's rc.txt, quoted into the header so the "
+                         "binaries the arms ran are named beside the numbers")
+    ap.add_argument("--replace",
+                    help="rewrite this allowlist's generated SR-rd block in "
+                         "place instead of printing to stdout.  The block is "
+                         "delimited by the sentinels this generator emits; a "
+                         "file that has neither sentinel is spliced ONCE at "
+                         "the legacy `# ===` header naming the layer, and "
+                         "carries sentinels thereafter")
     args = ap.parse_args()
+    if args.header and not args.corpus:
+        raise SystemExit("isax_srcenc_rows: --header needs --corpus; a "
+                         "provenance line nobody measured is the line this "
+                         "mode exists to stop being typed")
     isas = args.isa or list(ISAS)
 
     blocks = []
+    if args.header and not args.census:
+        blocks.append(emit_header(args.arms, args.layer, isas, args.corpus,
+                                  args.rc))
     for isa in isas:
         pre = "f" if args.layer == "fields" else "b"
         path = os.path.join(args.arms, f"{pre}_{isa}.txt")
@@ -772,8 +1033,62 @@ def main():
                 + body + "\n"
                 + "".join(f"{isa} {r.key}\n"
                           for r in sorted(rows, key=lambda x: x.key)))
-    if not args.census:
-        sys.stdout.write("\n".join(blocks))
+    if args.census:
+        return
+    text = "\n".join(blocks)
+    if args.header:
+        text += "\n" + END_MARK + "\n"
+    if not args.replace:
+        sys.stdout.write(text)
+        return
+    if not args.header:
+        raise SystemExit("isax_srcenc_rows: --replace without --header would "
+                         "write rows with no block header and no END "
+                         "sentinel, leaving a region nothing can find again")
+    splice(args.replace, args.layer, text)
+
+
+def splice(path, layer, text):
+    """Rewrite @path's generated SR-rd block, or install one the first time.
+
+    THE FIRST INSTALL IS THE ONE THAT CAN GO WRONG, so it is the one with the
+    refusals.  A file with both sentinels is rewritten between them and
+    nothing else moves.  A file with neither is spliced at the legacy `# ===`
+    header naming this layer -- the block ran from there to end-of-file, which
+    is exactly why it was never regenerated -- and the tail it replaces is
+    the tail that header introduced.  A file with ONE sentinel is a file
+    somebody edited across the boundary, and it is refused rather than
+    guessed at.
+    """
+    old = open(path).read()
+    begin = BEGIN_MARK % layer
+    has_b, has_e = begin in old, END_MARK in old
+    if has_b != has_e:
+        raise SystemExit("isax_srcenc_rows: REFUSING -- %s carries %s of the "
+                         "two sentinels.  A half-delimited block cannot be "
+                         "rewritten mechanically and must not be guessed at."
+                         % (path, "BEGIN" if has_b else "END"))
+    if has_b:
+        head = old.split(begin, 1)[0]
+        tail = old.split(END_MARK, 1)[1]
+        tail = tail.split("\n", 1)[1] if "\n" in tail else ""
+        open(path, "w").write(head + text + tail)
+        print("isax_srcenc_rows: rewrote the generated block in %s" % path)
+        return
+    legacy = [l for l in old.splitlines()
+              if l.startswith("# THE ") and "LAYER'S `SR-rd-*` FAMILY" in l]
+    if len(legacy) != 1:
+        raise SystemExit("isax_srcenc_rows: REFUSING -- %s has no sentinels "
+                         "and %d legacy `SR-rd-*` FAMILY header(s); the first "
+                         "install needs exactly one place to cut."
+                         % (path, len(legacy)))
+    cut = old.index(legacy[0])
+    # The legacy block opens with the `# ====` rule ABOVE that header.
+    head = old[:cut].rstrip("\n")
+    head = head[:head.rindex("\n# ===")] + "\n\n" if "\n# ===" in head else head + "\n\n"
+    open(path, "w").write(head + text)
+    print("isax_srcenc_rows: installed sentinels and replaced the legacy "
+          "block in %s (it ran to end-of-file)" % path)
 
 
 if __name__ == "__main__":

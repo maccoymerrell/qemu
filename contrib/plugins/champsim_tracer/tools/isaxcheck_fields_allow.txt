@@ -7868,8 +7868,8 @@ x86_64 FU-unclassified ud2
 # pass evidence, not here: it reads 0 by construction.
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
-#   fields        661     1115     1059      864     3699
-#   boundary      638     1115     1016      233     3002
+#   fields        662     1115     1059      864     3700
+#   boundary      639     1115     1016      233     3003
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -7901,15 +7901,15 @@ x86_64 FU-unclassified ud2
 #   mipsel   M-DSPIMM
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/exec133/srcencorp/tip133
-#   x86_64    6416527 rows md5 53f4eef64f63d7537462e406cb87851b
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec135/srcencorp/tip81a
+#   x86_64    6820116 rows md5 e1ceb15a3098411c051102d0ed3f5f8a
 #   aarch64   1408171 rows md5 d407a13138a9281cb541393508f20c98
 #   riscv64     86889 rows md5 baf8571353b1e382588425d728c090ad
 #   mipsel     548886 rows md5 9a73d0219983be6ce43a88aaac968bf4
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
-#   SO_SHA=b5b342f62494c103
-#   ISAX_SHA=1d0ad8137585bc36
+#   SO_SHA=f19f2f35e390144c
+#   ISAX_SHA=e525bf9e9aa89ca5
 #   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #
 # HOW TO REGENERATE:
@@ -7918,7 +7918,7 @@ x86_64 FU-unclassified ud2
 #       --corpus <corpus> --rc <arms>/rc.txt --replace <allowlist>
 # =====================================================================
 # --- X-FIP: every x87 instruction reads the CS SELECTOR, to save it as the FPU code segment.
-#     205 signature(s), 395053 encodings at this tip.
+#     205 signature(s), 414651 encodings at this tip.
 #
 # The x87 state includes the FPU Instruction Pointer and the FPU Code Segment
 # selector -- the pair FSTENV / FSAVE / FXSAVE publish (Intel SDM Vol. 1
@@ -8160,7 +8160,7 @@ x86_64 SR-rd-phantom outl +REG_FLAGS
 x86_64 SR-rd-phantom outw +REG_FLAGS
 
 # --- X-REP: the REP prefix reads the count register, which is not part of the opcode LLVM describes.
-#     57 signature(s), 1348191 encodings at this tip.
+#     57 signature(s), 1383440 encodings at this tip.
 #
 # REP / REPE / REPNE make the string operation iterate on RCX, so RCX is a true
 # source of the prefixed form.  LLVM's MCInstrDesc describes the BASE OPCODE --
@@ -8226,7 +8226,7 @@ x86_64 SR-rd-phantom repz retq +REG_SEG5,REG_SP
 x86_64 SR-rd-phantom repz retw +REG_SEG5,REG_SP
 
 # --- X-PARTIAL: an instruction that writes PART of a register must carry the rest forward, and the reference has one operand.
-#     108 signature(s), 445305 encodings at this tip.
+#     108 signature(s), 467580 encodings at this tip.
 #
 # BT / BTS / BTR / BTC write CF and leave OF, SF, ZF, AF and PF UNCHANGED
 # (Intel SDM Vol. 2A, BT); SAHF writes five flags and leaves OF and the
@@ -8347,7 +8347,7 @@ x86_64 SR-rd-phantom shrq +REG_FLAGS
 x86_64 SR-rd-phantom shrw +REG_FLAGS
 
 # --- X-STACK: the implicit stack access reads SS and RSP, and LLVM names neither.
-#     19 signature(s), 339935 encodings at this tip.
+#     20 signature(s), 353959 encodings at this tip.
 #
 # RET, CALL, PUSH, POP, LEAVE and ENTER address memory through RSP with SS as
 # the segment, and neither register appears in the encoding.  QEMU computes the
@@ -8371,11 +8371,12 @@ x86_64 SR-rd-phantom popw +REG_CTRL0,REG_CTRL4,REG_SP,REG_SYS
 x86_64 SR-rd-phantom pushq +REG_SEG3,REG_SP
 x86_64 SR-rd-phantom pushq +REG_SEG4,REG_SP
 x86_64 SR-rd-phantom pushw +REG_SEG3,REG_SP
+x86_64 SR-rd-phantom pushw +REG_SEG4,REG_SP
 x86_64 SR-rd-phantom retq +REG_SEG5,REG_SP
 x86_64 SR-rd-phantom retw +REG_SEG5,REG_SP
 
 # --- X-CR: a control register that gates whether the instruction runs at all.
-#     69 signature(s), 213331 encodings at this tip.
+#     69 signature(s), 216976 encodings at this tip.
 #
 # FWAIT checks CR0.TS, CR0.MP and CR0.EM before it looks at the x87 status
 # word, and the SSE and XSAVE forms check CR4.OSFXSR / CR4.OSXSAVE the same
@@ -8453,7 +8454,7 @@ x86_64 SR-rd-phantom xsaveopt +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
 x86_64 SR-rd-phantom xsaveopt64 +REG_CTRL4,REG_FCSR,REG_FPCW,REG_SYS
 
 # --- X-FSGS: the FS and GS BASES, which are the only segment bases that are live in 64-bit mode.
-#     5 signature(s), 6944 encodings at this tip.
+#     5 signature(s), 6946 encodings at this tip.
 #
 # The phantom direction of the segment family: the tracer reads the live base
 # register -- `swapgs`, `rdfsbase`, `wrgsbase`, `maskmovq` -- and LLVM's
@@ -8468,7 +8469,7 @@ x86_64 SR-rd-phantom xlatb +REG_SEG3
 x86_64 SR-rd-phantom xlatb +REG_SEG4
 
 # --- X-UPPERLANE: a legacy scalar or unary SSE form preserves the upper lanes of its destination, so the destination is read.
-#     13 signature(s), 64601 encodings at this tip.
+#     13 signature(s), 69139 encodings at this tip.
 #
 # R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
 # form survives above the element the instruction writes, so it is an input.
@@ -8490,7 +8491,7 @@ x86_64 SR-rd-phantom vmovhps +REG_VEC#
 x86_64 SR-rd-phantom vpclmulqdq +REG_VEC#
 
 # --- X-CONSTCOUNT: a rotate-through-carry by an immediate ZERO reads nothing, and LLVM's description is per-opcode.
-#     8 signature(s), 10730 encodings at this tip.
+#     8 signature(s), 10968 encodings at this tip.
 #
 # RCL and RCR with a masked count of zero do not rotate and do not touch the
 # flags (Intel SDM Vol. 2B, RCL/RCR), so QEMU's translator folds the whole
@@ -8509,7 +8510,7 @@ x86_64 SR-rd-missing rcrq +REG_FLAGS
 x86_64 SR-rd-missing rcrw +REG_FLAGS
 
 # --- X-X87OPERAND: the x87 operand LLVM attaches and the hardware does not consult.
-#     12 signature(s), 14974 encodings at this tip.
+#     12 signature(s), 16200 encodings at this tip.
 #
 # FFREE / FFREEP mark a stack slot EMPTY in the tag word; they do not read the
 # value in it.  FLD / FST / FSTP / FXCH between registers, FLD1 / FLDZ and the
@@ -8554,7 +8555,7 @@ x86_64 SR-rd-missing fxch +REG_FPCW
 x86_64 SR-rd-phantom syscall +REG_FLAGS
 
 # --- X-IMPLICITGPR: the implicit GPR operands of the monitor / wait / key family.
-#     16 signature(s), 28790 encodings at this tip.
+#     16 signature(s), 28808 encodings at this tip.
 #
 # MONITORX, MWAITX, PCONFIG, RDPKRU, WRPKRU, TPAUSE and UMWAIT take implicit
 # operands in fixed GPRs, and which of those the instruction READS depends on
@@ -8600,7 +8601,7 @@ x86_64 SR-rd-phantom saveprevssp +REG_SSP
 x86_64 SR-rd-phantom setssbsy +REG_SSP,REG_SYS
 
 # --- X-MSR: the model-specific or descriptor-table register an INDEX selects.
-#     23 signature(s), 53272 encodings at this tip.
+#     23 signature(s), 90624 encodings at this tip.
 #
 # RDMSR / WRMSR address a register by an index in ECX and LLVM's description
 # says only that they move EDX:EAX; LLDT / LTR / SGDT / SIDT reach the
@@ -8648,7 +8649,7 @@ x86_64 SR-rd-phantom nopq +REG_SP
 x86_64 SR-rd-phantom nopw +REG_GPR#
 
 # --- X-X87STATE: the x87 status word and the stack slot ST(0) resolves to, neither of which the reference names.
-#     10 signature(s), 9712 encodings at this tip.
+#     10 signature(s), 9996 encodings at this tip.
 #
 # The x87 status word carries the condition codes AND the stack top, so an
 # instruction that sets C0-C3 read-modify-writes it and an instruction that
@@ -8669,7 +8670,7 @@ x86_64 SR-rd-phantom stmxcsr +REG_FCSR
 x86_64 SR-rd-phantom vstmxcsr +REG_FCSR
 
 # --- X-MISC: the remaining reference gaps, one signature at a time.
-#     92 signature(s), 518683 encodings at this tip.
+#     92 signature(s), 534429 encodings at this tip.
 #
 # What is left after the named families: forms where LLVM names an implicit
 # operand its per-opcode description carries and the instruction does not

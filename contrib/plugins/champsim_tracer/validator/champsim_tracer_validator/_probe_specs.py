@@ -613,7 +613,14 @@ _register_probe('probe_rv_v0_carry_mask', {
         # much a runtime claim as its opposite, so the vector rows now
         # record it too.)
         'reg_sets': [
-            {'src': ['REG_ZERO'],
+            # REG_SYS on the vsetvli is the CURRENT XLEN.  helper_vsetvl()'s
+            # only env read is riscv_cpu_xlen(env) (vector_helper.c:34), and
+            # CPURISCVState::xl is declared to the dataflow extraction and
+            # folded to the vocabulary's residual privileged word.  It is NOT
+            # a read of the old vector configuration: this form has rs1 == x0
+            # with rd != x0, which sets vl to VLMAX rather than preserving it,
+            # which is why REG_VCTRL stands on the destination side alone.
+            {'src': ['REG_ZERO', 'REG_SYS'],
              'dst': ['REG_GPR5', 'REG_VCTRL']},                 # vsetvli
             {'src': ['REG_VEC4', 'REG_VEC5', 'REG_VEC6', 'REG_VCTRL',
                      'REG_VEC0'],

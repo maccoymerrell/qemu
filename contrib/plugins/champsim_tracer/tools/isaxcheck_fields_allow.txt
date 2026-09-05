@@ -10871,11 +10871,12 @@ riscv64 SR-rd-phantom vssub.vx +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
 riscv64 SR-rd-phantom wfi +REG_SYS
-riscv64 SR-rd-phantom vsetivli +REG_SYS
 riscv64 SR-rd-phantom vsetvl +REG_SYS
 riscv64 SR-rd-phantom vsetvl +REG_SYS,REG_VCTRL
 riscv64 SR-rd-phantom vsetvli +REG_SYS
 riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
+riscv64 SR-rd-phantom vsetivli +REG_SYS,REG_VCTRL
+riscv64 FR-rd-phantom vsetivli +REG_VCTRL
 
 # --- M-DSPIMM: QEMU's MIPS DSP translators read the IMMEDIATE FIELD as a GPR -- FINDING 71-A.
 #     31 signature(s), 1373 encodings, NOT ALLOWLISTED.

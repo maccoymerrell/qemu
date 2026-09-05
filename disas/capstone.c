@@ -8664,40 +8664,35 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * not depend on vl or vtype at all.  cap_riscv_is_vector_encoding
          * settles it from the major opcode instead of from a name.
          *
-         * AND THE EXCLUSION IS THE WHOLE VSET FAMILY, WHICH "vsetvl" AS A
-         * PREFIX IS NOT.  RVV spells the three configuration-setting forms
+         * `vsetivli` IS DELIBERATELY NOT EXCLUDED, AND THE PREFIX THAT
+         * MISSES IT IS RIGHT BY ACCIDENT -- REFUTED, AND RECORDED SO IT IS
+         * NOT RE-TRIED.  FINDING 75-B asked for this read to be deleted:
+         * `vsetivli` takes both its AVL and its vtype as immediates, QEMU's
+         * helper_vsetvl() takes them as arguments s1/s2, and LLVM MC reads
+         * RD{-} for it while this boundary reads RD{vl,vtype}.  The
+         * deletion was written, landed and MEASURED, and the RISC-V static
+         * leg went 0 -> 1 against its adjudicated ceiling of 0:
          *
-         *     vsetvl   rd, rs1, rs2      AVL in rs1, vtype in rs2
-         *     vsetvli  rd, rs1, vtypei   AVL in rs1, vtype an immediate
-         *     vsetivli rd, uimm, vtypei  BOTH immediate
+         *     SAIL:VSETIVLI  vsetivli  DISAGREE  TRACER-GAP
+         *                              SRC-missing:REG_VCTRL
          *
-         * and only the first two begin "vsetvl".  `vsetivli` fell through
-         * into this rule and into the vstart rule below, and was given a
-         * read of vl and vtype it does not have and a write of vstart it
-         * does not make.  The spec derives the new vl from the AVL and
-         * VLMAX alone, never from the old configuration, and QEMU says the
-         * same: helper_vsetvl() takes the AVL and the new vtype as
-         * arguments s1/s2 and its only env read is riscv_cpu_xlen(env)
-         * (target/riscv/vector_helper.c:34).  The one form that DOES read
-         * the old vl is `rd == x0 && rs1 == x0`, which preserves it, and an
-         * immediate AVL cannot be x0's encoding -- `vsetivli` has no rs1
-         * field at all.
+         * SAIL STATES THE READ, so it is not the tracer's to drop.  LLVM's
+         * RD{-} was never evidence of absence and this tree already says
+         * so in its own words: isax_srcenc_rows.py's R-CSRIMM class exists
+         * because "a CSR instruction addresses its register by a 12-bit
+         * NUMBER ... there is no register operand for the reference to
+         * name", and closes "R16: the dependency is the ISA's, and a
+         * reference that does not model the register cannot refute it".
+         * Reading a disassembler's silence about implicit CSR state as a
+         * denial is the mistake that class was written against.
          *
-         * MEASURED, with the siblings as the control: LLVM MC reads RD{-}
-         * for `vsetivli` while this boundary read RD{vl,vtype}, and for
-         * `vsetvli` and `vsetvl` the two agree exactly (RD{r2} and
-         * RD{r2,r3}).  The disagreement is the one mnemonic the prefix
-         * misses and nothing else.
-         *
-         * FINDING 75-B is what it cost.  The riscv CP-H table gained a
-         * `vsetvl` row (141d7a078a) and made the encoding SCORABLE for the
-         * first time; the published REG_VCTRL source it had carried all
-         * along became that pass's one UNJUSTIFIED row.  QEMU's read list
-         * was right, the reference agreed with it, and the rule that
-         * invented the read was this one.
-         */
+         * So the two references do not disagree about the architecture:
+         * one models implicit CSR reads and one does not, and only the one
+         * that does may decide.  The exclusion stays "vsetvl", which
+         * covers `vsetvl` and `vsetvli` and leaves `vsetivli` inside the
+         * rule -- where Sail says it belongs.         */
         if (insn->mnemonic[0] == 'v'
-            && !g_str_has_prefix(insn->mnemonic, "vset")
+            && !g_str_has_prefix(insn->mnemonic, "vsetvl")
             && cap_riscv_is_vector_encoding(insn)) {
             bool has_vl = false;
             for (uint8_t i = 0; i < out->n_regs_read; i++) {
@@ -8751,7 +8746,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * touch vstart.
          */
         if (insn->mnemonic[0] == 'v'
-            && !g_str_has_prefix(insn->mnemonic, "vset")
+            && !g_str_has_prefix(insn->mnemonic, "vsetvl")
             && cap_riscv_is_vector_encoding(insn)) {
             cap_riscv_add_csr(out, 0x008 /* vstart */,
                               QEMU_PLUGIN_OP_ACC_WRITE);

@@ -12635,6 +12635,9 @@ riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
 riscv64 SR-rd-phantom vsetvl +REG_SYS,REG_VCTRL
 riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
+riscv64 SR-rd-phantom vsetivli +REG_SYS,REG_VCTRL
+riscv64 R-rd-phantom vsetivli +vl,vtype
+riscv64 R-wr-phantom vsetivli +vctrl
 
 # --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs
 #     the other one -- FINDING 70-A, RESOLVED.

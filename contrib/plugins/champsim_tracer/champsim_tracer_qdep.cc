@@ -369,6 +369,21 @@ GHashTable *g_surv_ref_short_sig = nullptr;
  *     is a QEMU statement gap and not an architectural fact.  ADJUDICATED-
  *     KEEP-R16.
  *
+ *   riscv64 `vsetivli`, REG_VCTRL -- THE ONE ROW HERE THAT IS STILL OWED,
+ *     and it is owed on purpose.  Its deletion was written (c31379cdc5),
+ *     landed, measured, and REVERTED (5ae4742f99) when Sail contradicted
+ *     it, which is word for word the case the ADJUDICATION-OWED block
+ *     describes itself as existing for -- and the block read 0 while the
+ *     register was scored as an unqualified must-be-0 failure on battery
+ *     row 6w.1.  A question that has been asked, answered against, and
+ *     re-opened is the most examined kind of row there is, and it was the
+ *     only kind this table could not represent.  What remains open is
+ *     narrow and named in the row: Sail settles that the ARCHITECTURE
+ *     reads vtype; the census's SELF@1 role cannot settle that THIS SEAT
+ *     is that read rather than the mirror of the destination REG_VCTRL
+ *     also occupies.  The coverage path is an emitter statement at
+ *     trans_vsetivli, and the row goes away when it lands.
+ *
  *   x86_64 `rdsspq`, REG_SSP.  With CET disabled -- the only machine QEMU
  *     models -- the SDM defines the instruction as a NOP.  But XED models
  *     the instruction FORM as SRC {REG_SSP} DST {GPR}, and PIN reports
@@ -485,6 +500,33 @@ static const SrcAdjRow g_src_adj_ledger[] = {
       "and is not the ARCHITECTURAL-UD of `ud2`.  The id is the carved arm "
       "decode-new/multi0F@f3=1,modrm=..101...,mem, not the 0F 01 group's "
       "shared slot 0x000004ae, which carried thirty-three mnemonics" },
+    { TRACE_ISA_RISCV, 0x4e9bb356u, "vsetivli", REG_VCTRL, SRC_ADJ_OWED,
+      "ADJUDICATION-OWED, and this block's own definition names the case: a "
+      "published source \"whose deletion was already written, landed, "
+      "measured against the external references and REVERTED when the "
+      "references contradicted it\".  c31379cdc5 deleted `vsetivli`'s read "
+      "of vl and vtype -- the instruction takes both its AVL and its vtype "
+      "as IMMEDIATES, helper_vsetvl() receives them as arguments s1/s2 and "
+      "reads no vector-control env field, and LLVM MC reads RD{-} where the "
+      "boundary read RD{vl,vtype}.  The RISC-V static leg went 0 -> 1 "
+      "against an adjudicated ceiling of 0 -- `SAIL:VSETIVLI vsetivli "
+      "DISAGREE TRACER-GAP SRC-missing:REG_VCTRL` -- and 5ae4742f99 reverted "
+      "it: SAIL STATES THE READ, and LLVM's silence was never evidence "
+      "(isax_srcenc_rows.py's R-CSRIMM class: \"a reference that does not "
+      "model the register cannot refute it\").  "
+      "WHAT IS STILL OPEN is not whether the architecture reads vtype -- "
+      "Sail settles that -- but whether THIS SEAT is that read.  The census "
+      "scores the role SELF@1: REG_VCTRL is also this instruction's "
+      "destination at slot 1, and `vsetivli` with rs1 == x0 and rd != x0 "
+      "sets vl to VLMAX rather than preserving it, which is the one form "
+      "where REG_VCTRL stands on the destination side ALONE.  A SELF role "
+      "cannot tell an architectural read from the mirror of a write, so the "
+      "row's coverage path is an emitter that STATES the read at "
+      "trans_vsetivli -- after which the seat is justified by QEMU and needs "
+      "no ledger row at all.  Until then it is a question on file and is "
+      "counted as one: it BLOCKS THE FLIP, exactly like every other OWED "
+      "row, and it is not scored as an unqualified must-be-0 failure, which "
+      "is what a reverted-and-re-examined deletion is not" },
     { TRACE_ISA_X86,   0xdb9bac2bu, "rdsspq", REG_SSP, SRC_ADJ_R16,
       "ADJUDICATED-KEEP-R16.  R16 verbatim: \"IF THE DEPENDENCY EXISTS IN "
       "THE ISA, OR THE REGISTER IS AN ISA REGISTER, THEN WE RECORD IT.  ... "

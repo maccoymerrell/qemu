@@ -369,6 +369,27 @@ RISCV_EXEC = {
                   'can order against the barrier; spike has no register '
                   'representing memory-ordering state'),
 
+    # THE CURRENT XLEN.  helper_vsetvl() reads CPURISCVState::xl to size the
+    # new vl, and that field has a declared regfile target, so the read
+    # reaches the wire as REG_SYS on every vsetvli / vsetivli / vsetvl.  Spike
+    # keeps the same fact in `state.xlen`, a machine MODE rather than a CSR or
+    # a GPR, so its commit log has no register to name it with.  A reference
+    # gap of exactly REF-NO-ORDERING-STATE's shape: the reference does not
+    # model the state at all, so it cannot report the dependence.
+    #
+    # MEASURED SUPERSET ON EVERY ROW IT LABELS.  Both branches that apply it
+    # sit inside a test that the reference's set is a SUBSET of the tracer's,
+    # so a row this rule covers can never be one where the tracer dropped
+    # something a reference stated.
+    'REF-NO-XLEN-STATE':
+        Rule('REF-NO-XLEN-STATE', 'reference-gap', {SUPERSET},
+             note='the tracer names REG_SYS as a vset source because '
+                  'helper_vsetvl() reads CPURISCVState::xl; spike keeps the '
+                  'current XLEN as a machine mode with no register standing '
+                  'for it.  Where the row also carries REG_ZERO that is the '
+                  'x0 operand the reference computes past, as '
+                  'REF-C-IMM-NO-X0-READ describes'),
+
     # The read-side twin of REF-VEC-ELEMENT-ONLY.  vectorUnit_t::elt() is
     # ELEMENT triggered on the read side too, so a fully masked-off (or
     # vl==0) vector operation reads no element of its operand registers and

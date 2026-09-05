@@ -281,6 +281,21 @@ def is_fence(bits):
     return (bits & 0x7f) == 0x0f
 
 
+def is_vset(bits):
+    """True for VSETVLI / VSETIVLI / VSETVL (opcode 1010111, funct3 111).
+
+    Tested on the ENCODING, like `is_fence` and `is_sc`, so the label below is
+    a measured property of the instruction and not a reading of a
+    disassembler.  The three forms differ only in their top bits, which is why
+    one predicate covers the family:
+
+        vsetvli   imm[10:0]  rs1 111 rd 1010111      bit31     = 0
+        vsetivli  11 imm[9:0] uimm 111 rd 1010111    bits31:30 = 11
+        vsetvl    1000000 rs2 rs1 111 rd 1010111     bits31:25 = 1000000
+    """
+    return (bits & 0x7f) == 0x57 and ((bits >> 12) & 7) == 7
+
+
 def compare_insn(r, t):
     """One aligned instruction -> its disagreeing axes (possibly none)."""
     rows = []
@@ -313,6 +328,28 @@ def compare_insn(r, t):
                 row = row._replace(label='REF-C-IMM-NO-X0-READ')
             elif is_fence(r.bits) and all(n == 'REG_SYS' for n in only_trc):
                 row = row._replace(label='REF-NO-ORDERING-STATE')
+            elif is_vset(r.bits) and 'REG_SYS' in only_trc and \
+                    only_trc <= frozenset({'REG_SYS', 'REG_ZERO'}):
+                # THE CURRENT XLEN, WHICH SPIKE HAS NO REGISTER FOR.
+                # helper_vsetvl() reads CPURISCVState::xl to size the new vl,
+                # and that field was given a declared regfile target, so the
+                # read reaches the wire as REG_SYS on every vset form.  Spike
+                # keeps the same fact in `state.xlen` -- a machine MODE, not a
+                # CSR and not a GPR -- so its commit log has nothing to name
+                # it with.  Same shape and same category as
+                # REF-NO-ORDERING-STATE above.
+                #
+                # REG_ZERO rides in the same row on the vsetvli forms whose
+                # rs1 is x0, and it is covered by REF-C-IMM-NO-X0-READ's own
+                # ground.  One row takes one label, so the label naming the
+                # register the reference genuinely CANNOT represent wins and
+                # the rule's note carries both facts.
+                #
+                # THE BRANCH SITS INSIDE `frozenset(rsa) <= tsa`, so it can
+                # only fire where the reference's set is a SUBSET of the
+                # tracer's: a row this rule covers is never one where the
+                # tracer dropped something a reference stated.
+                row = row._replace(label='REF-NO-XLEN-STATE')
             elif all(n.startswith('REG_VEC') for n in only_trc):
                 row = row._replace(label='REF-VEC-ELEMENT-READ-ONLY')
         rows.append(row)

@@ -56,7 +56,7 @@ import elfimage                                              # noqa: E402
 import wp_trace                                              # noqa: E402
 import wp_seed                                               # noqa: E402
 import spike_ref                                             # noqa: E402
-from compare_exec import is_sc, is_fence                     # noqa: E402
+from compare_exec import is_sc, is_fence, is_vset                     # noqa: E402
 from arc3_taxonomy import (set_relation, EQUAL, SUPERSET,
                            SUBSET)                           # noqa: E402
 from arc3_rules import riscv_exec_rule                       # noqa: E402
@@ -87,6 +87,17 @@ def adjudicate(rel, only_ref, only_trc, bits, side):
                 else 'REF-C-IMM-NO-X0-READ'
         elif is_fence(bits) and only_trc == {'REG_SYS'}:
             label = 'REF-NO-ORDERING-STATE'
+        elif is_vset(bits) and 'REG_SYS' in only_trc and \
+                only_trc <= {'REG_SYS', 'REG_ZERO'}:
+            # THE CURRENT XLEN, on the wrong path.  The same rule the CP leg
+            # applies, applied here for the reason this function exists: a
+            # disagreement the correct-path leg has adjudicated must not
+            # reappear as a fresh wrong-path defect.  helper_vsetvl() reads
+            # CPURISCVState::xl, spike keeps the current XLEN as a machine
+            # mode with no register standing for it.  Only reachable under
+            # rel == SUPERSET, so it can never cover a row where the tracer
+            # dropped something.
+            label = 'REF-NO-XLEN-STATE'
         elif only_trc and all(n.startswith('REG_VEC') for n in only_trc):
             label = 'REF-VEC-ELEMENT-ONLY' if side == 'dst' \
                 else 'REF-VEC-ELEMENT-READ-ONLY'

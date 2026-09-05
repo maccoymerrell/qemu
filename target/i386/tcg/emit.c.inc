@@ -5091,18 +5091,40 @@ static void gen_VPHMINPOSUW(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_phminposuw_xmm(tcg_env, OP_PTR0, OP_PTR2);
 }
 
+/*
+ * VEX.LIG: the L bit is IGNORED, so a VEX.256 encoding of a scalar opcode is
+ * a legal encoding of the 128-bit operation and not a fault.  The scalar
+ * helpers write the low 128 bits only, and gen_writeback() performs the
+ * DEST[MAXVL-1:128] := 0 that every VEX write states only for an operand
+ * size it can see is <= 128 -- which an `x'-sized operand under VEX.L=1 is
+ * not.  So a LIG row states the zeroing here instead of asserting the
+ * encoding away.
+ */
+static void gen_vex_lig_zero_upper(DisasContext *s, X86DecodedInsn *decode)
+{
+    X86DecodedOp *op = &decode->op[0];
+
+    if (!s->vex_l) {
+        return;
+    }
+    assert(op->unit == X86_OP_SSE && !op->has_ea);
+    tcg_gen_gvec_dup_imm(MO_64,
+                         offsetof(CPUX86State, xmm_regs[op->n].ZMM_X(1)),
+                         16, 16, 0);
+}
+
 static void gen_VROUNDSD(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
-    assert(!s->vex_l);
     gen_helper_roundsd_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
+    gen_vex_lig_zero_upper(s, decode);
 }
 
 static void gen_VROUNDSS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
-    assert(!s->vex_l);
     gen_helper_roundss_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
+    gen_vex_lig_zero_upper(s, decode);
 }
 
 static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)

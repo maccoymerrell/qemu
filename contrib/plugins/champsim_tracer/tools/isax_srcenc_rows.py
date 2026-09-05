@@ -591,6 +591,29 @@ def _x_x87(s):
         "fstpt", "fxch", "fxam", "fnop", "fdecstp", "fincstp")
 
 
+@cls("x86_64", "X-SYSCALLFLAGS", "SYSCALL reads RFLAGS because saving it "
+     "into R11 is half of what the instruction does", """
+SYSCALL is defined as `RCX <- RIP; R11 <- RFLAGS` (Intel SDM Vol. 2B,
+SYSCALL), so the flag register is a true source: the instruction copies it.
+QEMU states both writes and the read in helper_syscall()
+(target/i386/tcg/user/seg_helper.c), and the read reaches the wire's ordered
+list through the CP-H usage table's `eflags` and `cc_*` members.
+
+LLVM's MCInstrDesc carries a fixed Defs/Uses pair for the SYSCALL opcode and
+names no EFLAGS use on it at all -- the same structural silence the implicit
+family below meets, but about the FLAG register rather than a GPR, which is
+why it is its own row and not folded into that class.
+
+This signature is NEW at this tip and it is a repair, not a regression: the
+generated usage table had been carrying helper_syscall's footprint from
+before `ccfaf4fdc5` rewrote the helper, so the wire published nothing for
+nine members it depends on.  Restoring them made the tracer's read set a
+superset of the reference's, which is the direction this file exists to
+record.""")
+def _x_syscallflags(s):
+    return s.mnem.split()[-1] == "syscall" and s.regs == {"REG_FLAGS"}
+
+
 @cls("x86_64", "X-IMPLICITGPR", "the implicit GPR operands of the "
      "monitor / wait / key family", """
 MONITORX, MWAITX, PCONFIG, RDPKRU, WRPKRU, TPAUSE and UMWAIT take implicit

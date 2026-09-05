@@ -141,6 +141,15 @@ EOF
 # exercised without a QEMU build: the row selector, the refusal behaviour, the
 # rc bookkeeping and the restore-and-touch recipe.  Run it before believing a
 # green battery from a script nobody has falsified.
+# 74-E: are BOTH guard probes still running?  Prints two characters, one per
+# probe, so a refusal can name WHICH one went and after which scan.
+guard_probes_alive() {
+    local a=n b=n
+    [ -n "$1" ] && [ -d "/proc/$1" ] && a=y
+    [ -n "$2" ] && [ -d "/proc/$2" ] && b=y
+    printf '%s%s' "$a" "$b"
+}
+
 selftest() {
     local scratch=${1:-$(mktemp -d)}
     local fails=0 n=0
@@ -292,18 +301,56 @@ selftest() {
     # it passed for the wrong reason.  Each probe now writes its own pid after
     # `exec` has given it the command line under test, and the arms REFUSE if
     # a pid file does not appear.
+    #
+    # AND IT REPORTS THAT IT IS STILL ALIVE WHEN EACH SCAN READS IT (74-E).
+    # The probes used to live 47 seconds, and that number had to outlast
+    # however long the scans take -- which is not a constant and is not small.
+    # concurrent_champsim() reads /proc/<pid>/maps for EVERY process on the
+    # host; measured here, one scan is 25-30 s over ~1450 processes.  Arms V
+    # and W read `hard`, which is ONE scan.  Arm X reads `soft`, and
+    # nearby_champsim() runs concurrent_champsim() AGAIN before its own loop,
+    # so X is evaluated TWO whole scans later.  Timestamped, on this host:
+    #
+    #     T+0    probes launched          v alive, w alive
+    #     T+30s  hard computed            v alive, w alive   -> V, W pass
+    #     T+65s  soft computed            v DEAD,  w DEAD    -> X reads n
+    #
+    # That is exec127's flaky arm X, and it is a DEADLINE rather than a race:
+    # X and only X flips because X and only X is read after the second scan.
+    # verify58's seven clean runs were seven runs where two scans happened to
+    # fit inside 47 s; the mechanism was never absent, only unexposed, which
+    # is why the zero could not close it.
+    #
+    # FIXED AT SOURCE IN BOTH HALVES.  The lifetime no longer has to beat an
+    # unbounded amount of scanning, and -- because a bound that nothing checks
+    # is exactly how this stayed hidden -- LIVENESS IS ASSERTED AT EVERY SCAN
+    # THAT FEEDS A VERDICT.  A probe that died before the scan reading it
+    # makes these arms REFUSE, not report: a dead probe is absent from every
+    # list, so it reads as a clean `n` on X and as a clean PASS on W, and the
+    # second of those is a guard reported as correct over a subject that was
+    # not there.  The bound stays (an unbounded sleep orphaned by a killed
+    # battery is exactly the stray this project has been bitten by) but it is
+    # now a tripwire instead of a silent input.
     local fb=$scratch/fakebuild vp wp fakearg
     fakearg="cst_decode /some/other/checkout/build/libchampsim_tracer.so"
     mkdir -p "$fb/contrib/plugins" "$fb/bin"
+    # A REUSED SCRATCH MUST NOT HAND THESE ARMS A PREVIOUS RUN'"'"'S PID.  The
+    # wait below is satisfied by a NON-EMPTY pid file, so a leftover one is
+    # read instantly and names a process that exited long ago -- which the
+    # liveness check then correctly refuses, with a message blaming the probe
+    # for "not starting" when it had not yet been asked to.  Truncate first;
+    # the refusal is for a probe that really did fail, not for a stale file.
+    : > "$scratch/v.pid"
+    : > "$scratch/w.pid"
     cp "$(command -v sleep)" "$fb/bin/zzz_not_a_tracer_name" 2>/dev/null
     if [ -x "$fb/bin/zzz_not_a_tracer_name" ] && command -v setsid >/dev/null
     then
         # V: EXE under the build dir, with an argv that names nothing of ours.
-        setsid bash -c 'echo $$ > "$2"; exec -a totally-innocuous-name "$1" 47' \
+        setsid bash -c 'echo $$ > "$2"; exec -a totally-innocuous-name "$1" 900' \
                _ "$fb/bin/zzz_not_a_tracer_name" "$scratch/v.pid" \
                >/dev/null 2>&1 &
         # W: an argv naming another checkout's plugin, on a stock binary.
-        setsid bash -c 'echo $$ > "$2"; exec -a "$1" sleep 47' \
+        setsid bash -c 'echo $$ > "$2"; exec -a "$1" sleep 900' \
                _ "$fakearg" "$scratch/w.pid" >/dev/null 2>&1 &
         local i=0
         while [ $i -lt 50 ] && { [ ! -s "$scratch/v.pid" ] || \
@@ -318,11 +365,28 @@ selftest() {
 REFUSING to report these arms as passed"
             n=$((n+3))
         else
-            local hard soft
+            local hard soft t0 alive_hard alive_soft
+            t0=$(date +%s)
             hard=$(concurrent_champsim "$fb" | cut -d' ' -f1 | tr '\n' ' ')
+            alive_hard=$(guard_probes_alive "$vp" "$wp")
             soft=$(nearby_champsim "$fb" | cut -d' ' -f1 | tr '\n' ' ')
+            alive_soft=$(guard_probes_alive "$vp" "$wp")
             printf '%s\n' "$hard" > "$scratch/guard_hard.txt"
             printf '%s\n' "$soft" > "$scratch/guard_soft.txt"
+            printf 'elapsed=%ss alive_after_hard=%s alive_after_soft=%s\n' \
+                   "$(( $(date +%s) - t0 ))" "$alive_hard" "$alive_soft" \
+                   > "$scratch/guard_timing.txt"
+            if [ "$alive_hard" != yy ] || [ "$alive_soft" != yy ]; then
+                # 74-E.  A probe that is gone is absent from every list, so it
+                # reads as a clean `n` on X and a clean PASS on W -- a guard
+                # reported correct over a subject that was not there.  Refuse.
+                bad "V-Y a guard probe did not survive the scan that reads it \
+(after hard: $alive_hard, after soft: $alive_soft, elapsed \
+$(( $(date +%s) - t0 ))s) -- REFUSING to report these arms.  The scans are \
+whole-/proc walks and the probe lifetime has to outlast them; see the 74-E \
+note above."
+                n=$((n+3))
+            else
             t "V the guard CATCHES a process argv cannot describe" \
               "$(case " $hard " in *" $vp "*) echo y ;; *) echo n ;; esac)" y
             t "W ...and does NOT refuse over another tree's command line" \
@@ -331,6 +395,7 @@ REFUSING to report these arms as passed"
               "$(case " $soft " in *" $wp "*) echo y ;; *) echo n ;; esac)" y
             t "Y the guard never reports this script's own process" \
               "$(case " $hard " in *" $$ "*) echo y ;; *) echo n ;; esac)" n
+            fi
             kill "$vp" "$wp" 2>/dev/null
         fi
         wait 2>/dev/null

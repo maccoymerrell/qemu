@@ -1740,4 +1740,36 @@ void riscv_translate_init(void)
                                   sizeof(((CPURISCVState *)0)->vl),
                                   sizeof(((CPURISCVState *)0)->vl),
                                   1);
+
+    /*
+     * THE CURRENT XLEN.
+     *
+     * helper_vsetvl() reads it -- `riscv_cpu_xlen(env)` is its only env read
+     * (vector_helper.c:34) -- and so does every other helper that has to
+     * know whether the machine is running as RV32 or RV64 right now.  It is
+     * a register in the only sense the dependency model has: `mstatus`
+     * writes to UXL and SXL change it, and the instructions after read the
+     * value those writes produced.
+     *
+     * FINDING 75-B measured what it cost while it was anonymous.  The
+     * riscv table's `vsetvl` row made the encoding scorable for the first
+     * time, and its DESTINATION then moved from "extraction incomplete" to
+     *
+     *     2  field-range  off=5020 size=4 (no declared regfile)
+     *     2  env offset 5020 (0x139c), no target declaration
+     *
+     * -- a REFUSAL rather than a score, on a fact QEMU now states.  5020 is
+     * offsetof(CPURISCVState, xl).
+     *
+     * It has no CSR address of its own: architecturally it is the MXL field
+     * of `misa` and the UXL/SXL fields of `mstatus`, and QEMU keeps the
+     * resolved value as a member.  So it is declared under its own spelling
+     * and folded to the vocabulary's residual privileged word by the plugin,
+     * which is the route `elp` beside it and x86's `xcr0` already take.
+     */
+    insn_dataflow_declare_regfile("xl", NULL,
+                                  offsetof(CPURISCVState, xl),
+                                  sizeof(((CPURISCVState *)0)->xl),
+                                  sizeof(((CPURISCVState *)0)->xl),
+                                  1);
 }

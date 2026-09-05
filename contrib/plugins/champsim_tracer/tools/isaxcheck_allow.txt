@@ -714,7 +714,6 @@ riscv64 R-rd-missing ntl.pall +r#
 riscv64 R-rd-missing ntl.s1 +r#
 riscv64 R-rd-missing ret +r#
 riscv64 R-rd-phantom vmv1r.v +vl,vtype
-riscv64 R-rd-phantom vsetivli +vl,vtype
 riscv64 R-wr-missing c.addi +r#
 riscv64 R-wr-missing c.slli64 +r#
 riscv64 R-wr-missing c.srai64 +r#
@@ -7307,7 +7306,6 @@ riscv64 R-wr-phantom vse16.v +vctrl
 riscv64 R-wr-phantom vse32.v +vctrl
 riscv64 R-wr-phantom vse64.v +vctrl
 riscv64 R-wr-phantom vse8.v +vctrl
-riscv64 R-wr-phantom vsetivli +vctrl
 riscv64 R-wr-phantom vsha2ch.vv +vctrl
 riscv64 R-wr-phantom vsha2cl.vv +vctrl
 riscv64 R-wr-phantom vsha2ms.vv +vctrl
@@ -12623,9 +12621,6 @@ riscv64 SR-rd-phantom vsadd.vx +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vi +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vv +REG_FCSR
 riscv64 SR-rd-phantom vsaddu.vx +REG_FCSR
-riscv64 SR-rd-phantom vsetivli +REG_VCTRL
-riscv64 SR-rd-phantom vsetvl +REG_VCTRL
-riscv64 SR-rd-phantom vsetvli +REG_VCTRL
 riscv64 SR-rd-phantom vsmul.vv +REG_FCSR
 riscv64 SR-rd-phantom vsmul.vx +REG_FCSR
 riscv64 SR-rd-phantom vssra.vi +REG_FCSR
@@ -12638,6 +12633,8 @@ riscv64 SR-rd-phantom vssub.vv +REG_FCSR
 riscv64 SR-rd-phantom vssub.vx +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vv +REG_FCSR
 riscv64 SR-rd-phantom vssubu.vx +REG_FCSR
+riscv64 SR-rd-phantom vsetvl +REG_SYS,REG_VCTRL
+riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
 
 # --- M-LSA: the four bytes are TWO INSTRUCTIONS, and on this model QEMU runs
 #     the other one -- FINDING 70-A, RESOLVED.

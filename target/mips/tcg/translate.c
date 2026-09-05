@@ -1567,6 +1567,39 @@ static void mips_ident_declined(DisasContext *ctx)
     }
 }
 
+/*
+ * THE ARM THAT RAN, WHERE THE LABEL NAMES A SIBLING.
+ *
+ * mips_ident() above states the identity the SWITCH committed to, and the
+ * switch commits at the label -- which is right wherever the label is the
+ * decision.  MIPS R6 reuses the COP2 load/store major opcodes for the
+ * compact branches, so two case groups carry two architectural instructions
+ * apiece and decide between them on ctx->insn_flags, INSIDE the case.  At
+ * the label the model has not been consulted, so on a non-R6 model the arm
+ * that runs is the coprocessor load/store and the identity standing in the
+ * slot is the compact branch's.
+ *
+ * MEASURED, before this said anything: a mipsel run of 184,379 instructions
+ * published 1,271 `sdc2` under `translate_mips/OPC_BNEZC`, and the wire took
+ * that row's taxonomy -- a coprocessor-2 doubleword STORE published as a
+ * CONDITIONAL DIRECT BRANCH, opcode, branch class and dependency refinement
+ * all from the branch's row.
+ *
+ * So the arm states its own identity where the arm is.  This is the same
+ * publication mips_ident() performs and deliberately not a weaker one: the
+ * later statement wins, the poison still outranks both, and an arm that has
+ * not called this keeps the label's identity exactly as before.  The separate
+ * spelling is what keeps the two apart -- mips_ident_instrument.py OWNS every
+ * `mips_ident(ctx,` site in this file and rewrites them wholesale, so a
+ * hand-written statement may not wear that name.
+ */
+static void mips_ident_arm(DisasContext *ctx, MipsIdent id)
+{
+    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED) {
+        ctx->decode_ident = id;
+    }
+}
+
 static void mips_ident_fault(DisasContext *ctx, int excp)
 {
     /* A stated refusal outranks the poison; see mips_ident_declined(). */
@@ -19683,6 +19716,10 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
                 sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
             insn_dataflow_note_translation_refused();
+            mips_ident_arm(ctx,
+                op == OPC_LWC2 ? MIPS_ID_OPC_LWC2 :
+                op == OPC_SWC2 ? MIPS_ID_OPC_SWC2 :
+                MIPS_ID_NONE);
             mips_ident_declined(ctx);
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);
@@ -19706,13 +19743,17 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         } else if (ctx->insn_flags & ASE_LEXT) {
             gen_loongson_lsdc2(ctx, rt, rs, rd);
         } else {
-            /* OPC_LWC2, OPC_SWC2 */
+            /* OPC_LDC2, OPC_SDC2 */
             /* The base register and the refusal; see the LWC2 arm above. */
             insn_dataflow_note_stated_read_env(
                 offsetof(CPUMIPSState, active_tc.gpr[0]) +
                 rs * sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]),
                 sizeof(((CPUMIPSState *)0)->active_tc.gpr[0]));
             insn_dataflow_note_translation_refused();
+            mips_ident_arm(ctx,
+                op == OPC_LDC2 ? MIPS_ID_OPC_LDC2 :
+                op == OPC_SDC2 ? MIPS_ID_OPC_SDC2 :
+                MIPS_ID_NONE);
             mips_ident_declined(ctx);
             /* COP2: Not implemented. */
             generate_exception_err(ctx, EXCP_CpU, 2);

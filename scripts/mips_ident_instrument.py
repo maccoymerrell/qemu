@@ -98,6 +98,77 @@ ENCODING_QUALIFIED = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ARM-STATED IDENTITIES
+# ---------------------------------------------------------------------------
+#
+# One `case OPC_*` label, several ARCHITECTURAL INSTRUCTIONS, told apart by
+# THE CPU MODEL rather than by the encoding.  MIPS R6 reuses the COP2
+# load/store major opcodes for the compact branches, so QEMU writes one case
+# per pair and decides between them on `ctx->insn_flags`.  The generated
+# selection sits at the TOP of the case, where the only fact available is the
+# label -- so on a non-R6 model the arm that runs is the COP2 load/store and
+# the identity published is the compact branch's.  A consumer keyed on that
+# identity reads a coprocessor store as a conditional branch.
+#
+# The remedy is not to withhold the label; that returns the encoding to
+# `decode_id = 0` and re-opens the class 4337902798 closed.  It is to let the
+# ARM state its own identity where the arm is, with `mips_ident_arm()`.  The
+# generator's job here is to make those identities EXIST -- one row each, same
+# name derivation, same id derivation -- and to refuse an entry the source
+# does not actually state, so the table cannot carry a name no arm publishes.
+#
+# An entry is `enumerator -> why`.  The enumerator must be a real opcode
+# enumerator of this decoder (it is the instruction's own name), and
+# translate.c must reference `MIPS_ID_<enumerator>` outside the generated
+# selections -- that reference is the row's provenance line.
+ARM_STATED = {
+    'OPC_LWC2': 'the non-R6, non-LEXT arm of `case OPC_BC` -- QEMU decoded a '
+                'coprocessor-2 word load and declined it',
+    'OPC_SWC2': 'the non-R6, non-LEXT arm of `case OPC_BALC` -- a '
+                'coprocessor-2 word store, declined',
+    'OPC_LDC2': 'the non-R6, non-LEXT arm of `case OPC_BEQZC` -- a '
+                'coprocessor-2 doubleword load, declined',
+    'OPC_SDC2': 'the non-R6, non-LEXT arm of `case OPC_BNEZC` -- a '
+                'coprocessor-2 doubleword store, declined',
+}
+
+ARM_MARK = 'mips_ident_arm(ctx,'
+
+
+def arm_stated_lines(lines):
+    """Where PRISTINE source states each ARM_STATED identity.
+
+       `lines` is the source with the generator's own insertions already
+       stripped, so a hit is a hand-written statement and never one of this
+       script's selections.  A named identity with no statement is an ERROR:
+       a row for an arm that publishes nothing is a name the table offers and
+       the decoder never uses, which is the fabrication shape this whole
+       mechanism exists to remove."""
+    at = {}
+    n = len(lines)
+    for i, l in enumerate(lines):
+        if ARM_MARK not in l:
+            continue
+        # The statement, not the line: a selection over several arms is
+        # written one arm per line exactly as the generated ones are, so the
+        # scan runs to the statement's own terminator.
+        j = i
+        stmt = []
+        while j < n:
+            stmt.append(lines[j])
+            if ');' in lines[j]:
+                break
+            j += 1
+        else:
+            continue
+        text = '\n'.join(stmt)
+        for nm in ARM_STATED:
+            if re.search(r'\bMIPS_ID_%s\b' % re.escape(nm), text):
+                at.setdefault(nm, i + 1)
+    return at
+
+
 def qual_suffix(bits):
     """The identity-name suffix for a qualified form: `@` + its fixed bits."""
     return '@' + bits
@@ -507,6 +578,27 @@ def build(path_c, path_inc, report):
             if nxt is not None and ppd[nxt] > ppd[at]:
                 inserts.setdefault(marker_at, []).append(
                     '%sQEMU_FALLTHROUGH;%s' % (marker_ind, FT_TAG))
+
+    # ARM-STATED identities.  These are not case labels, so the scan above
+    # cannot find them; the source states them itself with mips_ident_arm()
+    # and the statement is both the provenance and the proof the row is used.
+    arm_at = arm_stated_lines(lines)
+    for nm in sorted(ARM_STATED):
+        if nm not in arm_at:
+            errors.append('ARM_STATED names %s, and no mips_ident_arm() in %s '
+                          'states MIPS_ID_%s -- a row for an arm that '
+                          'publishes nothing is a name the table offers and '
+                          'the decoder never uses' % (nm, path_c, nm))
+            continue
+        if nm in seen:
+            errors.append('ARM_STATED names %s, which is ALSO a case label '
+                          'this decoder switches on -- the label already '
+                          'carries that identity and the entry is stale'
+                          % nm)
+            continue
+        seen.add(nm)
+        names.append(nm)
+        first_line[nm] = arm_at[nm]
 
     if errors:
         for e in errors:

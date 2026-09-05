@@ -8,11 +8,11 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/exec124/rt/snap, 402 sidecar(s):
+ * is /mnt/md0/QEMU/cst_runs/exec131/regen/snap, 403 sidecar(s):
  *   x86_64   115 sidecar(s), 9 row(s), 7 REFUSED (reason on each row below)
  *   aarch64  149 sidecar(s), 8 row(s), 18 REFUSED (reason on each row below)
  *   riscv64  69 sidecar(s), 25 row(s), 6 REFUSED (reason on each row below)
- *   mipsel   69 sidecar(s), 5 row(s)
+ *   mipsel   70 sidecar(s), 7 row(s)
  * Nothing here says anything about an instruction no sidecar executed.
  *
  * Author: Maccoy Merrell.
@@ -370,10 +370,12 @@ static const SrcSurvivorRow g_src_survivors_riscv64[] = {
     { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
 };
 
-/* mipsel -- 5 rows, 680 census entries, from 69 sidecar(s) */
+/* mipsel -- 7 rows, 682 census entries, from 70 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
+    { 0x018b909cu, SRC_SURV_FIXED, REG_COPROC0   , 0, "translate_mips/OPC_SWC2" },   /* swc2 x1 */
     { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x626 */
     { 0x3e9bb316u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MADD_D" },   /* madd.d x5 */
+    { 0x6670d869u, SRC_SURV_FIXED, REG_COPROC0   , 0, "translate_mips/OPC_SDC2" },   /* sdc2 x1 */
     { 0x740ff847u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MSUB_D" },   /* msub.d x5 */
     { 0xa65bcb79u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_DIV_D" },   /* div.d x40 */
     { 0xf2e998eeu, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_CVT_S_W" },   /* cvt.s.w x4 */
@@ -394,6 +396,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 47 rows over the four ISAs. */
+/* 49 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

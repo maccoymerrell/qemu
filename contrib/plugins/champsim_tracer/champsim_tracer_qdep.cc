@@ -252,7 +252,7 @@ std::atomic<uint64_t> g_src_ident_witness_reached{0};
  * discipline the destination side's refuse route already follows.
  */
 uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
-                          uint8_t *out, uint8_t cap);
+                          uint8_t *out, uint8_t cap, InsnEnc enc);
 std::atomic<uint64_t> g_src_flip_missing{0};
 std::atomic<uint64_t> g_src_flip_extra{0};
 std::atomic<uint64_t> g_src_flip_scored{0};
@@ -2068,6 +2068,96 @@ uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
 }
 
 /*
+ * THE ROLE COLUMN of the survivor census, for published source @i.
+ *
+ * ONE function because TWO blocks print it -- the scored survivors and the
+ * NOT-SCORED population beside them -- and the generator reads the column
+ * from both.  It was written twice, and a third answer added to one copy is
+ * a role the other block can never report: the two blocks would then
+ * disagree about the same instruction for no reason a reader could find.
+ *
+ * The caller owns the returned string.
+ */
+static char *survivor_role(const InsnFields *f, uint8_t i, InsnEnc enc)
+{
+    bool self = false;
+    uint8_t self_pos = 0;
+
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        if (f->dst_regs[d] == f->src_regs[i]) {
+            self = true;
+            self_pos = d;
+            break;
+        }
+    }
+    /*
+     * ENC@<field> -- THE THIRD ANSWER, and the one the MSA class
+     * needs.  MIPS `xori.b $w16,$w14,imm` publishes REG_VEC14 as
+     * a source QEMU does not state.  It is not FIXED: the next
+     * instance of `translate_mips/OPC_MDMX` reads $w21 and the
+     * one after $w19.  It is not SELF: the instruction's own
+     * destination is $w16.  It is the value of the `ws` field of
+     * the instruction word, and with only the two answers
+     * available the census called it FIXED -- which is the shape
+     * gen_src_survivors.py's REFUSAL 6 refuses to write a row
+     * for, leaving the class with no key at all.
+     *
+     * MEASURED, not chosen: the register's number inside its own
+     * bank is compared against every field
+     * champsim_tracer_enc_fields.h defines for THIS ISA at THIS
+     * instruction width, and the field is named only if it is the
+     * register the field selects.
+     *
+     * AMBIGUITY IS PRINTED, NEVER RESOLVED.  Two fields of one
+     * word can hold the same number -- `xori.b $w14,$w14,imm` has
+     * ws == wd -- and picking the first would let a coincidence
+     * name a field.  The role then reads ENC?<a>,<b> and the
+     * generator refuses to emit a row from it: which field the
+     * rule tracks is exactly what such an instance does not say.
+     * A rule whose OTHER instances are unambiguous still resolves,
+     * because those rows carry the unambiguous role.
+     *
+     * SELF WINS OVER ENC where both hold.  SELF needs no
+     * encoding at all -- the wire already publishes the register
+     * in its own destination list -- so it is the answer with
+     * the fewer assumptions, and every SELF row that exists today
+     * keeps the role it has.
+     */
+    char *encrole = nullptr;
+
+    if (!self && enc.bytes && enc.len) {
+        const char *hit = nullptr;
+        unsigned nhit = 0;
+        GString *amb = g_string_new(nullptr);
+
+        for (unsigned e = 0; e < G_N_ELEMENTS(g_src_enc_fields);
+             e++) {
+            const SrcEncFieldDef *d = &g_src_enc_fields[e];
+
+            if (src_enc_field_reg(d, (unsigned)trace_isa,
+                                  enc.bytes, enc.len)
+                != f->src_regs[i]) {
+                continue;
+            }
+            if (nhit++) {
+                g_string_append_c(amb, ',');
+            }
+            g_string_append(amb, d->name);
+            hit = d->name;
+        }
+        if (nhit == 1) {
+            encrole = g_strdup_printf("ENC@%s", hit);
+        } else if (nhit > 1) {
+            encrole = g_strdup_printf("ENC?%s", amb->str);
+        }
+        g_string_free(amb, TRUE);
+    }
+    return self ? g_strdup_printf("SELF@%u", self_pos)
+         : encrole ? encrole
+         : g_strdup("FIXED");
+}
+
+/*
  * THE SURVIVOR ROWS FOR ONE DECODE IDENTITY, resolved to registers.
  *
  * champsim_tracer_src_survivors.h is a MEASUREMENT re-emitted as a table
@@ -2098,7 +2188,7 @@ uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
  * how often an instruction outside it turns up.
  */
 uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
-                          uint8_t *out, uint8_t cap)
+                          uint8_t *out, uint8_t cap, InsnEnc enc)
 {
     unsigned isa = (unsigned)trace_isa;
     uint8_t n = 0;
@@ -2136,6 +2226,18 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
             if (t->rows[i].dst_pos < f->n_dst_regs) {
                 take(f->dst_regs[t->rows[i].dst_pos]);
             }
+        } else if (t->rows[i].kind == SRC_SURV_ENC) {
+            /*
+             * The register the INSTRUCTION WORD names, extracted from the
+             * one field the census measured this rule's survivor to track.
+             * A row that cannot be resolved -- no encoding here, the wrong
+             * width, a field value past the end of the bank -- contributes
+             * NOTHING.  Falling back to `reg` would publish the bank BASE
+             * ($w0, %xmm0) on every unresolvable instance, which is the
+             * frozen-operand fabrication in a new spelling.
+             */
+            take(src_enc_field_reg(src_enc_field_def(t->rows[i].enc_field),
+                                   isa, enc.bytes, enc.len));
         } else {
             take(t->rows[i].reg);
         }
@@ -2175,7 +2277,7 @@ static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
 }
 
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
-                        const InsnFields *f, bool dst_ok)
+                        const InsnFields *f, bool dst_ok, InsnEnc enc)
 {
     uint8_t n = 0;
 
@@ -2356,7 +2458,7 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
     {
         uint8_t surv[MAX_SRC_REGS];
         uint8_t ns = src_survivor_regs(q->decode_id, f, surv,
-                                       (uint8_t)MAX_SRC_REGS);
+                                       (uint8_t)MAX_SRC_REGS, enc);
         take(surv, ns);
     }
     return n;
@@ -3790,7 +3892,7 @@ void reglist_str(GString *g, const uint8_t *regs, uint8_t n)
     }
 }
 
-void dump_src_pc_row(const InsnFields *f, const QDepInsn *q,
+void dump_src_pc_row(const InsnFields *f, const QDepInsn *q, InsnEnc enc,
                      const char *mnem, unsigned wstate)
 {
     int st = g_src_pc_dump_state.load(std::memory_order_relaxed);
@@ -3823,9 +3925,10 @@ void dump_src_pc_row(const InsnFields *f, const QDepInsn *q,
     }
 
     uint8_t qn[MAX_SRC_REGS];
-    uint8_t nq = qemu_named_regs(q, qn, f, wstate == QDEP_OK);
+    uint8_t nq = qemu_named_regs(q, qn, f, wstate == QDEP_OK, enc);
     uint8_t sv[MAX_SRC_REGS];
-    uint8_t ns = src_survivor_regs(q->decode_id, f, sv, (uint8_t)MAX_SRC_REGS);
+    uint8_t ns = src_survivor_regs(q->decode_id, f, sv, (uint8_t)MAX_SRC_REGS,
+                                   enc);
 
     GString *g = g_string_new(nullptr);
     g_string_append_printf(g, "0x%" PRIx64 "\t%08x\t%s\t%s\t%s\t%s\t",
@@ -3966,7 +4069,8 @@ static void reframe_dst_value_keys(InsnFields *f, InsnRegNames *rn,
 }
 
 bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
-               const char *mnem, unsigned wstate, const char *why)
+               const char *mnem, unsigned wstate, const char *why,
+               InsnEnc enc)
 {
     /*
      * The two lists' disagreement, counted in the direction dst_precheck()
@@ -4040,7 +4144,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * MEASUREMENT ONLY and OFF unless asked for: no wire field is written
      * here, and with the variable unset the site is a single relaxed load.
      */
-    dump_src_pc_row(f, q, mnem, wstate);
+    dump_src_pc_row(f, q, enc, mnem, wstate);
     /*
      * AND STAGE THE SAME ANSWER FOR THE PER-ENCODING MECHANISM CORPUS,
      * which is written one call later from the level that holds the
@@ -4058,9 +4162,9 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         m->status_flags = q->status_flags;
         m->wstate       = (uint8_t)wstate;
         m->writes_unbounded = q->writes_unbounded;
-        m->n_qn = qemu_named_regs(q, m->qn, f, wstate == QDEP_OK);
+        m->n_qn = qemu_named_regs(q, m->qn, f, wstate == QDEP_OK, enc);
         m->n_sv = src_survivor_regs(q->decode_id, f, m->sv,
-                                    (uint8_t)MAX_SRC_REGS);
+                                    (uint8_t)MAX_SRC_REGS, enc);
         m->n_rd = q->n_src;
         memcpy(m->rd, q->src_reg, q->n_src);
         m->n_rdx = q->n_srcx;
@@ -4100,7 +4204,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     {
         uint8_t sv[MAX_SRC_REGS];
         uint8_t nsv = src_survivor_regs(q->decode_id, f, sv,
-                                        (uint8_t)MAX_SRC_REGS);
+                                        (uint8_t)MAX_SRC_REGS, enc);
 
         for (uint8_t k = 0; k < nsv; k++) {
             bool stated = false;
@@ -4241,18 +4345,8 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                  * and neither supplies a register the instruction does not
                  * have in that slot.
                  */
-                bool self = false;
-                uint8_t self_pos = 0;
+                char *role = survivor_role(f, i, enc);
 
-                for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                    if (f->dst_regs[d] == f->src_regs[i]) {
-                        self = true;
-                        self_pos = d;
-                        break;
-                    }
-                }
-                char *role = self ? g_strdup_printf("SELF@%u", self_pos)
-                                  : g_strdup("FIXED");
                 char *key = g_strdup_printf(
                     "%08x %-26s %-14s %-7s %s", q->decode_id,
                     q->decode_name ? q->decode_name : "?",
@@ -4297,7 +4391,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         {
             uint8_t surv[MAX_SRC_REGS];
             uint8_t ns = src_survivor_regs(q->decode_id, f, surv,
-                                           (uint8_t)MAX_SRC_REGS);
+                                           (uint8_t)MAX_SRC_REGS, enc);
             /*
              * THE UNION IS THE PRODUCER'S OWN ANSWER, CALLED (#59-B).
              *
@@ -4333,7 +4427,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
              * landed.
              */
             uint8_t qn[MAX_SRC_REGS];
-            uint8_t nqn = qemu_named_regs(q, qn, f, wstate == QDEP_OK);
+            uint8_t nqn = qemu_named_regs(q, qn, f, wstate == QDEP_OK, enc);
             auto in_union = [&](uint8_t r) {
                 for (uint8_t k = 0; k < nqn; k++) {
                     if (qn[k] == r) {
@@ -4442,18 +4536,7 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             if (have) {
                 continue;
             }
-            bool self = false;
-            uint8_t self_pos = 0;
-
-            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                if (f->dst_regs[d] == f->src_regs[i]) {
-                    self = true;
-                    self_pos = d;
-                    break;
-                }
-            }
-            char *role = self ? g_strdup_printf("SELF@%u", self_pos)
-                              : g_strdup("FIXED");
+            char *role = survivor_role(f, i, enc);
             char *key = g_strdup_printf(
                 "%08x %-26s %-14s %-7s %s", q->decode_id,
                 q->decode_name ? q->decode_name : "?",
@@ -5911,7 +5994,7 @@ void qdep_mutate_refiner_dst(InsnFields *f)
 }
 
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
-                const char *mnem)
+                const char *mnem, InsnEnc enc)
 {
     if (!g_live || !q) {
         /*
@@ -6020,7 +6103,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     }
     {
         uint8_t qregs[MAX_SRC_REGS];
-        uint8_t nq = qemu_named_regs(q, qregs, f, wstate == QDEP_OK);
+        uint8_t nq = qemu_named_regs(q, qregs, f, wstate == QDEP_OK, enc);
 
         if (nq && !reindex_src_for_qemu(f, rn, qregs, nq)) {
             /*
@@ -6075,7 +6158,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * No store slots, so the store-data family states nothing here and
          * the destination family is the whole question.
          */
-        decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy), false, 0,
+        decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy, enc), false, 0,
                      mnem, wstate, wwhy);
         return;
     }
@@ -6278,7 +6361,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * proof that row is a measurement and not a tautology. */
         g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
             .fetch_add(1, std::memory_order_relaxed);
-        decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy), false,
+        decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy, enc), false,
                      addr_facts, mnem, wstate, wwhy);
         return;
     }
@@ -6362,7 +6445,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * `dstate` is vacuously QDEP_OK on an instruction with loads and no
      * stores, and a vacuous pass is not a fact about anything.
      */
-    decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy),
+    decide_block(f, apply_dst(f, rn, q, mnem, wstate, wwhy, enc),
                  dstate == QDEP_OK && mds_new > 0, addr_facts,
                  mnem, wstate, wwhy);
 }

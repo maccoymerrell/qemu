@@ -1666,10 +1666,24 @@ BBTemplate *TemplateStore::create_tb_template(
              */
             qdep_mutate_refiner_dst(&scratch[i].f);
             if (insn_qdep) {
+                /*
+                 * THE ENCODING TRAVELS WITH THE FIELDS, and only from here:
+                 * the dependency model is handed fields, never the
+                 * instruction, which is why the per-encoding corpora are
+                 * dumped at this level.  The ENC survivor role is the one
+                 * question the fields cannot answer -- "is this register the
+                 * value of a field of the instruction word?" has no second
+                 * term without the word -- so the bytes are passed down,
+                 * const and non-owning, beside them.
+                 */
+                InsnEnc ie = { &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                               (uint8_t)insn_sizes[i] };
+
                 qdep_apply(&scratch[i].f,
                                 with_names ? &nscratch[i].rn : nullptr,
                                 &insn_qdep[i],
-                                insn_info ? insn_info[i].mnemonic : nullptr);
+                                insn_info ? insn_info[i].mnemonic : nullptr,
+                                ie);
             }
             /*
              * THE PER-ENCODING READ-LIST CORPUS, after qdep_apply() and so

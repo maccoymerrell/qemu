@@ -214,6 +214,10 @@ extern "C" {
 #include <qemu-plugin-dataflow.h>
 }
 
+/* InsnEnc, the encoding-field table, and the extraction the ENC survivor
+ * role is measured and resolved with. */
+#include "champsim_tracer_enc_fields.h"
+
 struct qemu_plugin_tb;
 struct InsnFields;
 struct InsnRegNames;
@@ -946,7 +950,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
  * still relied on.  The one-time A/B lives in this wave's evidence.
  */
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
-                const char *mnem);
+                const char *mnem, InsnEnc enc);
 
 /* The J3 mutation arm that scores the REFINER's destination masks: run in
  * the window between the refiners and qdep_apply(), so what moves under it

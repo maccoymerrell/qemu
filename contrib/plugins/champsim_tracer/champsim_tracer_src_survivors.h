@@ -8,12 +8,21 @@
  * dropping when the source list stops being the operand walk's.
  *
  * DERIVED FROM A SNAPSHOT, and a snapshot is not a closure.  The corpus
- * is /mnt/md0/QEMU/cst_runs/exec131/regen/snap, 403 sidecar(s):
+ * is /mnt/md0/QEMU/cst_runs/exec132/regen/snap, 404 sidecar(s):
  *   x86_64   115 sidecar(s), 9 row(s), 7 REFUSED (reason on each row below)
  *   aarch64  149 sidecar(s), 8 row(s), 18 REFUSED (reason on each row below)
  *   riscv64  69 sidecar(s), 25 row(s), 6 REFUSED (reason on each row below)
- *   mipsel   70 sidecar(s), 7 row(s)
+ *   mipsel   71 sidecar(s), 9 row(s)
  * Nothing here says anything about an instruction no sidecar executed.
+ *
+ * THE ENC FOLD, every group it examined and what it decided.  A
+ * group is (decode id, encoding field) over the rows the census
+ * measured to track that field; FOLDED means the register was
+ * seen to VARY with it and one ENC row carries the group, and a
+ * demotion means the evidence did not separate ENC from FIXED and
+ * the rows went back to the role they had, REFUSAL 6 included:
+ *   mipsel   0x18c27403 ws  FOLDED    6 distinct register(s) over 6 instance(s)
+ *   mipsel   0x18c27403 wt  FOLDED    6 distinct register(s) over 6 instance(s)
  *
  * Author: Maccoy Merrell.
  */
@@ -22,20 +31,32 @@
 
 #include <stdint.h>
 
+#include "champsim_tracer_enc_fields.h"
 #include "champsim_tracer_generic_ids.h"
 
 typedef enum {
     SRC_SURV_FIXED = 0,   /* @reg, the same register on every instance */
     SRC_SURV_SELF  = 1,   /* @dst_pos, ONE slot of this instance's own  */
                           /* destination list -- never the whole list   */
+    SRC_SURV_ENC   = 2,   /* @enc_field, the register the INSTRUCTION    */
+                          /* WORD names in that field -- never a        */
+                          /* constant, never a destination              */
 } SrcSurvivorKind;
 
 typedef struct {
     uint32_t decode_id;
     uint8_t  kind;        /* SrcSurvivorKind */
-    uint8_t  reg;         /* generic id; REG_NONE for SRC_SURV_SELF */
+    uint8_t  reg;         /* generic id; REG_NONE for SRC_SURV_SELF and
+                           * for SRC_SURV_ENC -- an ENC row's register
+                           * is the encoding's, and naming a constant
+                           * beside it would give an unresolvable
+                           * instance a fallback to publish */
     uint8_t  dst_pos;     /* SRC_SURV_SELF: which destination slot;
-                           * 0 and unread for SRC_SURV_FIXED */
+                           * 0 and unread for the other kinds */
+    uint8_t  enc_field;   /* SRC_SURV_ENC: SrcEncFieldId, the field of
+                           * champsim_tracer_enc_fields.h this rule's
+                           * survivor was MEASURED to track;
+                           * SRC_ENC_FIELD_NONE for the other kinds */
     const char *rule;     /* annotation: QEMU's spelling of the rule */
 } SrcSurvivorRow;
 
@@ -119,15 +140,15 @@ typedef struct {
  * CORRECTION under R15/R16: a register the instruction
  * cannot read was never information. */
 static const SrcSurvivorRow g_src_survivors_x86_64[] = {
-    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhps x74 */
-    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, "VMOVHPx_ld" },   /* movhpd x44 */
-    { 0x000004c9u, SRC_SURV_FIXED, REG_SYSTIMER  , 0, "RDTSC" },   /* rdtsc x108 */
-    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, "CPUID" },   /* cpuid x390 */
-    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, "CPUID" },   /* cpuid x390 */
-    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, "LEAVE" },   /* leave x580 */
-    { 0x5f43c580u, SRC_SURV_FIXED, REG_GPR12     , 0, "decode-new/x87@1101111111100000" },   /* fnstsw x7 */
-    { 0xdb9bac2bu, SRC_SURV_FIXED, REG_SSP       , 0, "decode-new/NOP@f3=1,modrm=11001..." },   /* rdsspq x39 */
-    { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
+    { 0x00000419u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "VMOVHPx_ld" },   /* movhps x74 */
+    { 0x0000041au, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "VMOVHPx_ld" },   /* movhpd x44 */
+    { 0x000004c9u, SRC_SURV_FIXED, REG_SYSTIMER  , 0, SRC_ENC_FIELD_NONE    , "RDTSC" },   /* rdtsc x108 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "CPUID" },   /* cpuid x390 */
+    { 0x00000507u, SRC_SURV_SELF , REG_NONE      , 2, SRC_ENC_FIELD_NONE    , "CPUID" },   /* cpuid x390 */
+    { 0x00000767u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "LEAVE" },   /* leave x580 */
+    { 0x5f43c580u, SRC_SURV_FIXED, REG_GPR12     , 0, SRC_ENC_FIELD_NONE    , "decode-new/x87@1101111111100000" },   /* fnstsw x7 */
+    { 0xdb9bac2bu, SRC_SURV_FIXED, REG_SSP       , 0, SRC_ENC_FIELD_NONE    , "decode-new/NOP@f3=1,modrm=11001..." },   /* rdsspq x39 */
+    { 0xe3014efcu, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode-new/VCVTSI2Sx@vex=1" },   /* vcvtsi2sdl x4 */
 };
 
 /* aarch64 -- 8 rows, 264 census entries, from 149 sidecar(s) */
@@ -301,14 +322,14 @@ static const SrcSurvivorRow g_src_survivors_x86_64[] = {
  * deriving corpus's instead.  An adjudicated correction
  * under R15/R16, not a loss under R12.1. */
 static const SrcSurvivorRow g_src_survivors_aarch64[] = {
-    { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/INS_general" },   /* mov x32 */
-    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FABS_s" },   /* fabs x83 */
-    { 0x5c29c765u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x2 */
-    { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, "disas_a64/MSR_i_SVCR" },   /* smstop x2 */
-    { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, "disas_a64/NOP@1111100110......................" },   /* prfm x26 */
-    { 0x81b1e8f0u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x32 */
-    { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, "disas_a64/FNEG_s" },   /* fneg x55 */
-    { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x32 */
+    { 0x1929eab9u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "disas_a64/INS_general" },   /* mov x32 */
+    { 0x30a7252au, SRC_SURV_FIXED, REG_FCSR      , 0, SRC_ENC_FIELD_NONE    , "disas_a64/FABS_s" },   /* fabs x83 */
+    { 0x5c29c765u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, SRC_ENC_FIELD_NONE    , "disas_a64/MSR_i_SVCR" },   /* smstop x2 */
+    { 0x5c29c765u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "disas_a64/MSR_i_SVCR" },   /* smstop x2 */
+    { 0x63e69d96u, SRC_SURV_FIXED, REG_SP        , 0, SRC_ENC_FIELD_NONE    , "disas_a64/NOP@1111100110......................" },   /* prfm x26 */
+    { 0x81b1e8f0u, SRC_SURV_FIXED, REG_SYSFPEN   , 0, SRC_ENC_FIELD_NONE    , "disas_a64/LD_mult@0.001100.10.....0000............" },   /* ld4 x32 */
+    { 0xca9ff590u, SRC_SURV_FIXED, REG_FCSR      , 0, SRC_ENC_FIELD_NONE    , "disas_a64/FNEG_s" },   /* fneg x55 */
+    { 0xf38c59fcu, SRC_SURV_FIXED, REG_SYSFPEN   , 0, SRC_ENC_FIELD_NONE    , "disas_a64/ST_mult@0.001100.00.....0000............" },   /* st4 x32 */
 };
 
 /* riscv64 -- 25 rows, 553 census entries, from 69 sidecar(s) */
@@ -343,42 +364,44 @@ static const SrcSurvivorRow g_src_survivors_aarch64[] = {
  * too.  It stays in the loss direction and blocks the flip
  * until the id is qualified. */
 static const SrcSurvivorRow g_src_survivors_riscv64[] = {
-    { 0x1d7ee76bu, SRC_SURV_FIXED, REG_ZERO      , 0, "decode_insn32/vsetvli" },   /* vsetvli x15 */
-    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsub_vv" },   /* vsub.vv x2 */
-    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsub_vv" },   /* vsub.vv x2 */
-    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmv_v_v" },   /* vmv.v.v x160 */
-    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmv_v_v" },   /* vmv.v.v x64 */
-    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x5 */
-    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
-    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x5 */
-    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
-    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 2, "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x5 */
-    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadd_vv" },   /* vadd.vv x2 */
-    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadd_vv" },   /* vadd.vv x2 */
-    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
-    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
-    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmul_vv" },   /* vmul.vv x2 */
-    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmul_vv" },   /* vmul.vv x2 */
-    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
-    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
-    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, "decode_insn32/fence" },   /* fence x257 */
-    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x5 */
-    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
-    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
-    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC0      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x5 */
-    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 0, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
-    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
+    { 0x1d7ee76bu, SRC_SURV_FIXED, REG_ZERO      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vsetvli" },   /* vsetvli x15 */
+    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vsub_vv" },   /* vsub.vv x2 */
+    { 0x6832c275u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vsub_vv" },   /* vsub.vv x2 */
+    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vmv_v_v" },   /* vmv.v.v x160 */
+    { 0x7ba73b05u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vmv_v_v" },   /* vmv.v.v x64 */
+    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x5 */
+    { 0x887129a3u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vfmadd_vv" },   /* vfmadd.vv x2 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x5 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x2 */
+    { 0x9179a794u, SRC_SURV_SELF , REG_NONE      , 2, SRC_ENC_FIELD_NONE    , "decode_insn32/vfmsub_vv" },   /* vfmsub.vv x5 */
+    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vadd_vv" },   /* vadd.vv x2 */
+    { 0xd2488b0eu, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vadd_vv" },   /* vadd.vv x2 */
+    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
+    { 0xd33e245cu, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vmerge_vxm" },   /* vmerge.vxm x2 */
+    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vmul_vv" },   /* vmul.vv x2 */
+    { 0xd6082df1u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vmul_vv" },   /* vmul.vv x2 */
+    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
+    { 0xd757c28eu, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vmerge_vvm" },   /* vmerge.vvm x2 */
+    { 0xecf2c479u, SRC_SURV_FIXED, REG_SYS       , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/fence" },   /* fence x257 */
+    { 0xf9fe03f8u, SRC_SURV_FIXED, REG_VEC0      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x5 */
+    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
+    { 0xf9fe03f8u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vsbc_vvm" },   /* vsbc.vvm x2 */
+    { 0xfc9b7984u, SRC_SURV_FIXED, REG_VEC0      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vadc_vvm" },   /* vadc.vvm x5 */
+    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
+    { 0xfc9b7984u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "decode_insn32/vadc_vvm" },   /* vadc.vvm x2 */
 };
 
-/* mipsel -- 7 rows, 682 census entries, from 70 sidecar(s) */
+/* mipsel -- 9 rows, 694 census entries, from 71 sidecar(s) */
 static const SrcSurvivorRow g_src_survivors_mipsel[] = {
-    { 0x018b909cu, SRC_SURV_FIXED, REG_COPROC0   , 0, "translate_mips/OPC_SWC2" },   /* swc2 x1 */
-    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, "translate_mips/OPC_MTHC1" },   /* mthc1 x626 */
-    { 0x3e9bb316u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MADD_D" },   /* madd.d x5 */
-    { 0x6670d869u, SRC_SURV_FIXED, REG_COPROC0   , 0, "translate_mips/OPC_SDC2" },   /* sdc2 x1 */
-    { 0x740ff847u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_MSUB_D" },   /* msub.d x5 */
-    { 0xa65bcb79u, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_DIV_D" },   /* div.d x40 */
-    { 0xf2e998eeu, SRC_SURV_SELF , REG_NONE      , 1, "translate_mips/OPC_CVT_S_W" },   /* cvt.s.w x4 */
+    { 0x018b909cu, SRC_SURV_FIXED, REG_COPROC0   , 0, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_SWC2" },   /* swc2 x1 */
+    { 0x18c27403u, SRC_SURV_ENC  , REG_NONE      , 0, SRC_ENC_FIELD_MIPS_WS , "translate_mips/OPC_MDMX" },   /* and.v x6 */
+    { 0x18c27403u, SRC_SURV_ENC  , REG_NONE      , 0, SRC_ENC_FIELD_MIPS_WT , "translate_mips/OPC_MDMX" },   /* and.v x6 */
+    { 0x20e7cdf6u, SRC_SURV_SELF , REG_NONE      , 0, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_MTHC1" },   /* mthc1 x626 */
+    { 0x3e9bb316u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_MADD_D" },   /* madd.d x5 */
+    { 0x6670d869u, SRC_SURV_FIXED, REG_COPROC0   , 0, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_SDC2" },   /* sdc2 x1 */
+    { 0x740ff847u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_MSUB_D" },   /* msub.d x5 */
+    { 0xa65bcb79u, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_DIV_D" },   /* div.d x40 */
+    { 0xf2e998eeu, SRC_SURV_SELF , REG_NONE      , 1, SRC_ENC_FIELD_NONE    , "translate_mips/OPC_CVT_S_W" },   /* cvt.s.w x4 */
 };
 
 /* Indexed by TraceISA.  A null row pointer means the arrays above say
@@ -396,6 +419,6 @@ static const SrcSurvivorTable g_src_survivor_tables[] = {
                             G_N_ELEMENTS(g_src_survivors_mipsel) },
 };
 
-/* 49 rows over the four ISAs. */
+/* 51 rows over the four ISAs. */
 
 #endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */

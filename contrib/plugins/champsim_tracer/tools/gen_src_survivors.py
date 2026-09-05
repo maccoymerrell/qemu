@@ -283,7 +283,46 @@ NOSTATE_HDR = "SOURCE SURVIVORS ON THE POPULATION THE CENSUS CANNOT SCORE"
 SPLIT_HDR = "SURVIVOR rules REACHED by this run"
 WITNESS_HDR = "DECODE-IDENTITY COLLISION WITNESS"
 OWED_HDR = "ADJUDICATION-OWED -- published sources"
-ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+(SELF@\d+|FIXED)\s+(\S+)\s*$")
+# The ROLE column.  `ENC@<field>` and its ambiguous form `ENC?<f>,<f>` are
+# matched HERE and not as a bare `\S+`: a role spelling this file does not
+# know must not be read as a row it does know, and the field NAMES are
+# checked separately against champsim_tracer_enc_fields.h -- see
+# enc_field_ids(), which parses that header so the two cannot drift.
+ROW = re.compile(r"^\s*(\d+)\s+([0-9a-f]{8})\s+(\S+)\s+(REG_\S+)\s+"
+                 r"(SELF@\d+|FIXED|ENC@[a-z0-9_]+|ENC\?[a-z0-9_,]+)\s+(\S+)\s*$")
+ENC_FIELDS_H = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "champsim_tracer_enc_fields.h")
+
+
+def enc_field_ids(path=None):
+    """{field name: SrcEncFieldId enumerator} from the plugin's own header.
+
+    PARSED, NOT COPIED.  The plugin prints the field NAME in the role column
+    and this generator has to emit the ENUMERATOR; a second list here would
+    be a table that goes stale the first time a field is added, which is the
+    drift the mnemonic tables in this directory are generated to prevent.  A
+    role naming a field the header does not define is refused, and so is a
+    header this function cannot read: a generator that cannot find its own
+    vocabulary must not emit a table over it.
+    """
+    p = path or ENC_FIELDS_H
+    try:
+        txt = open(p).read()
+    except OSError as e:
+        raise SystemExit("gen_src_survivors: REFUSING -- cannot read the "
+                         "encoding-field header %s (%s).  The ENC role's "
+                         "field names live there and nowhere else." % (p, e))
+    out = {}
+    for m in re.finditer(r"\{\s*(SRC_ENC_FIELD_[A-Z0-9_]+)\s*,[^}]*?"
+                         r'"([a-z0-9_]+)"\s*\}', txt):
+        out[m.group(2)] = m.group(1)
+    if not out:
+        raise SystemExit("gen_src_survivors: REFUSING -- %s defines no "
+                         "encoding fields; the ENC role would have no "
+                         "vocabulary to be checked against." % p)
+    return out
+
+
 SPLIT_ROW = re.compile(r"^\s*0x([0-9a-f]{8})\s+QID_SPLIT\s")
 WITNESS_ROW = re.compile(r"^\s*\d+\s+([0-9a-f]{8})\s+(\S+)\s+(\S+)\s*$")
 # An OPEN ledger row, and ONLY an open one: the census marks a ruled row
@@ -529,7 +568,15 @@ def parse(path):
                 continue
             seen_any = True
             cnt, did, rule, reg, role, mnem = m.groups()
-            key = (int(did, 16), role, reg if role == "FIXED" else "")
+            # THE REGISTER IS PART OF THE KEY FOR EVERY ROLE BUT SELF.
+            # A SELF row names no register -- it names a destination slot --
+            # so carrying one would split one row into as many as the corpus
+            # ran.  An ENC row's register is dropped LATER, by the fold
+            # below, and only once the fold has COUNTED the distinct
+            # registers: that count is the evidence that the register varies
+            # with the encoding, and dropping it here would destroy it.
+            key = (int(did, 16), role,
+                   "" if role.startswith("SELF@") else reg)
             _, c, mn = rows.get(key, (rule, 0, set()))
             rows[key] = (rule, c + int(cnt), mn | {mnem})
         if not seen_any:
@@ -666,6 +713,115 @@ def emit(out, inputs, src, corpora=None):
                 refused[isa].append((key, per[isa].pop(key), "AMBIGUOUS"))
             elif (key[0], key[2]) in owed[isa]:
                 refused[isa].append((key, per[isa].pop(key), "OWED"))
+    # ------------------------------------------------------------------
+    # THE ENC FOLD -- the encoding-derived role, and the only honest key the
+    # MSA class has.
+    #
+    # THE CLASS.  MIPS `xori.b $w16,$w14,imm` publishes REG_VEC14 as a source
+    # QEMU does not state.  Keyed on `translate_mips/OPC_MDMX` the register is
+    # not a property of the rule -- the next instance reads $w21, the one
+    # after $w19 -- and it is not a destination of its own instruction, so
+    # neither FIXED nor SELF is true of it.  It is the value of the `ws` FIELD
+    # of the instruction word.  With only two roles available the census
+    # called it FIXED, three FIXED rows of one bank landed under one id, and
+    # REFUSAL 6 below refused all three: correct, and it left the class with
+    # no key at all.  A rule-keyed FIXED row for an encoding-derived register
+    # is a FABRICATION and stays refused; this is the row that is not one.
+    #
+    # THE EVIDENCE IS THE VARIATION, and it is counted, not assumed.  A group
+    # is (decode id, field) over rows whose role reads `ENC@<field>` -- the
+    # census's own measurement that the register's number inside its bank IS
+    # the value of that field, on that instance.  A group is folded into one
+    # ENC row only when it shows AT LEAST TWO DISTINCT REGISTERS: one
+    # instance matching one 5-bit field is a 1-in-32 coincidence away from a
+    # genuinely fixed register, and this generator does not resolve a
+    # coincidence by preferring the more interesting answer.  A singleton
+    # group is DEMOTED BACK TO FIXED, which is the row it would have had
+    # before this fold existed -- so REFUSAL 6 still sees it, and a class
+    # this fold cannot justify loses nothing and gains nothing.
+    #
+    # AN AMBIGUOUS INSTANCE JOINS, IT DOES NOT DECIDE.  `xori.b $w14,$w14`
+    # has ws == wd and the census prints `ENC?ws,wd` rather than picking one.
+    # Such a row joins a group whose field it names, because the instance IS
+    # consistent with that field; it can never CREATE one, because which
+    # field the rule tracks is exactly what it does not say.
+    #
+    # MIXED WITH FIXED IS REFUSED, not averaged.  If the same id also carries
+    # a FIXED row from the bank the field indexes, the corpus is saying the
+    # rule reads both a constant and an encoded register of one file, which
+    # is the frozen-operand shape again wearing the new role.  The ENC rows
+    # are demoted back to FIXED and REFUSAL 6 refuses the whole pile with the
+    # reason it already has.
+    # ------------------------------------------------------------------
+    encf = enc_field_ids()
+    for isa in ISAS:
+        for key in per[isa]:
+            role = key[1]
+            if not role.startswith("ENC"):
+                continue
+            for f in role[4:].split(","):
+                if f not in encf:
+                    raise SystemExit(
+                        "gen_src_survivors: REFUSING -- %s row %s names the "
+                        "encoding field %r, which champsim_tracer_enc_fields."
+                        "h does not define.  The census and this generator "
+                        "read one vocabulary; a role this file cannot name "
+                        "is a header change nobody carried through."
+                        % (isa, key, f))
+    enc_folded = {isa: [] for isa in ISAS}
+    for isa in ISAS:
+        groups = {}
+        amb = []
+        for key in per[isa]:
+            did, role, reg = key
+            if role.startswith("ENC@"):
+                groups.setdefault((did, role[4:]), []).append(key)
+            elif role.startswith("ENC?"):
+                amb.append(key)
+        # An ambiguous instance joins any group whose field it names.
+        for key in amb:
+            did, role, _reg = key
+            for f in role[4:].split(","):
+                if (did, f) in groups:
+                    groups[(did, f)].append(key)
+                    break
+        fixed_banks = {}
+        for (did, role, reg) in per[isa]:
+            if role == "FIXED":
+                b = bank_of(reg)
+                if b:
+                    fixed_banks.setdefault(did, set()).add(b)
+        for (did, field), keys in sorted(groups.items()):
+            regs = {k[2] for k in keys if k[1].startswith("ENC@")}
+            banks = {bank_of(r) for r in regs if bank_of(r)}
+            demote = None
+            if len(regs) < 2:
+                demote = ("SINGLETON", "only %d distinct register" % len(regs))
+            elif banks & fixed_banks.get(did, set()):
+                demote = ("MIXED", "the id also carries a FIXED row of the "
+                                   "same numbered bank")
+            if demote:
+                for k in keys:
+                    rule, cnt, mn = per[isa].pop(k)
+                    nk = (k[0], "FIXED", k[2])
+                    r0, c0, m0 = per[isa].get(nk, (rule, 0, set()))
+                    per[isa][nk] = (rule, c0 + cnt, m0 | mn)
+                enc_folded[isa].append((did, field, demote[0], demote[1],
+                                        len(regs), 0))
+                continue
+            rule = None
+            cnt = 0
+            mn = set()
+            for k in keys:
+                r, c, m = per[isa].pop(k)
+                rule = rule or r
+                cnt += c
+                mn |= m
+            per[isa][(did, "ENC@" + field, "")] = (rule, cnt, mn)
+            enc_folded[isa].append((did, field, "FOLDED",
+                                    "%d distinct register(s) over %d instance(s)"
+                                    % (len(regs), cnt), len(regs), cnt))
+
     # REFUSAL 8, applied FIRST of the four REGISTER refusals -- ahead of 6,
     # 6b and 7.  QEMU'S OWN DECODE SITE SAYS THIS INSTRUCTION DOES NOT READ
     # THIS REGISTER.
@@ -883,6 +1039,19 @@ def emit(out, inputs, src, corpora=None):
              ", %d REFUSED (reason on each row below)" % len(refused[isa])
              if refused[isa] else ""))
     a(" * Nothing here says anything about an instruction no sidecar executed.")
+    nfold = sum(len(enc_folded[i]) for i in ISAS)
+    if nfold:
+        a(" *")
+        a(" * THE ENC FOLD, every group it examined and what it decided.  A")
+        a(" * group is (decode id, encoding field) over the rows the census")
+        a(" * measured to track that field; FOLDED means the register was")
+        a(" * seen to VARY with it and one ENC row carries the group, and a")
+        a(" * demotion means the evidence did not separate ENC from FIXED and")
+        a(" * the rows went back to the role they had, REFUSAL 6 included:")
+        for isa in ISAS:
+            for did, field, what, why, nregs, cnt in sorted(enc_folded[isa]):
+                a(" *   %-8s 0x%08x %-3s %-9s %s"
+                  % (isa, did, field, what, why))
     a(" *")
     a(" * Author: Maccoy Merrell.")
     a(" */")
@@ -891,20 +1060,32 @@ def emit(out, inputs, src, corpora=None):
     a("")
     a("#include <stdint.h>")
     a("")
+    a("#include \"champsim_tracer_enc_fields.h\"")
     a("#include \"champsim_tracer_generic_ids.h\"")
     a("")
     a("typedef enum {")
     a("    SRC_SURV_FIXED = 0,   /* @reg, the same register on every instance */")
     a("    SRC_SURV_SELF  = 1,   /* @dst_pos, ONE slot of this instance's own  */")
     a("                          /* destination list -- never the whole list   */")
+    a("    SRC_SURV_ENC   = 2,   /* @enc_field, the register the INSTRUCTION    */")
+    a("                          /* WORD names in that field -- never a        */")
+    a("                          /* constant, never a destination              */")
     a("} SrcSurvivorKind;")
     a("")
     a("typedef struct {")
     a("    uint32_t decode_id;")
     a("    uint8_t  kind;        /* SrcSurvivorKind */")
-    a("    uint8_t  reg;         /* generic id; REG_NONE for SRC_SURV_SELF */")
+    a("    uint8_t  reg;         /* generic id; REG_NONE for SRC_SURV_SELF and")
+    a("                           * for SRC_SURV_ENC -- an ENC row's register")
+    a("                           * is the encoding's, and naming a constant")
+    a("                           * beside it would give an unresolvable")
+    a("                           * instance a fallback to publish */")
     a("    uint8_t  dst_pos;     /* SRC_SURV_SELF: which destination slot;")
-    a("                           * 0 and unread for SRC_SURV_FIXED */")
+    a("                           * 0 and unread for the other kinds */")
+    a("    uint8_t  enc_field;   /* SRC_SURV_ENC: SrcEncFieldId, the field of")
+    a("                           * champsim_tracer_enc_fields.h this rule's")
+    a("                           * survivor was MEASURED to track;")
+    a("                           * SRC_ENC_FIELD_NONE for the other kinds */")
     a("    const char *rule;     /* annotation: QEMU's spelling of the rule */")
     a("} SrcSurvivorRow;")
     a("")
@@ -1010,11 +1191,22 @@ def emit(out, inputs, src, corpora=None):
             continue
         a("static const SrcSurvivorRow g_src_survivors_%s[] = {" % isa)
         for (did, role, reg), (rule, cnt, mnems) in sorted(rows.items()):
-            kind = "SRC_SURV_FIXED" if role == "FIXED" else "SRC_SURV_SELF"
-            r = reg if role == "FIXED" else "REG_NONE"
-            pos = 0 if role == "FIXED" else int(role.split("@", 1)[1])
-            a("    { 0x%08xu, %-14s, %-14s, %u, \"%s\" },   /* %s x%d */"
-              % (did, kind, r, pos, rule, ",".join(sorted(mnems)), cnt))
+            fld = "SRC_ENC_FIELD_NONE"
+            pos = 0
+            if role == "FIXED":
+                kind, r = "SRC_SURV_FIXED", reg
+            elif role.startswith("SELF@"):
+                kind, r = "SRC_SURV_SELF", "REG_NONE"
+                pos = int(role.split("@", 1)[1])
+            else:
+                # An ENC row, folded above.  The register is REG_NONE on
+                # purpose: naming a constant beside the field would give an
+                # instance the field cannot resolve something to publish,
+                # which is the frozen operand this role exists to replace.
+                kind, r = "SRC_SURV_ENC", "REG_NONE"
+                fld = encf[role.split("@", 1)[1]]
+            a("    { 0x%08xu, %-14s, %-14s, %u, %-22s, \"%s\" },   /* %s x%d */"
+              % (did, kind, r, pos, fld, rule, ",".join(sorted(mnems)), cnt))
         a("};")
         a("")
         total += len(rows)
@@ -1037,7 +1229,11 @@ def emit(out, inputs, src, corpora=None):
     a("#endif /* CHAMPSIM_TRACER_SRC_SURVIVORS_H */")
     open(out, "w").write("\n".join(w) + "\n")
     nref = sum(len(refused[i]) for i in ISAS)
-    print("wrote %s: %d rows, %d refused" % (out, total, nref))
+    print("wrote %s: %d rows, %d refused, %d ENC group(s) examined"
+          % (out, total, nref, sum(len(enc_folded[i]) for i in ISAS)))
+    for isa in ISAS:
+        for did, field, what, why, nregs, cnt in sorted(enc_folded[isa]):
+            print("  ENC %-8s 0x%08x %-3s %-9s %s" % (isa, did, field, what, why))
     for isa in ISAS:
         for (did, role, reg), (rule, cnt, mn), why in sorted(refused[isa]):
             print("  REFUSED %-8s 0x%08x %s %s (%s x%d): %s"
@@ -1243,7 +1439,53 @@ def selftest():
     a_ = os.path.join(d, "aarch64.log")
     _sidecar(a_, [], [], nswitness, (), nostate)
     r = os.path.join(d, "riscv64.log"); _sidecar(r, [], [])
-    m = os.path.join(d, "mipsel.log"); _sidecar(m, [], [])
+    # mipsel carries THE ENC FOLD's fixtures, positive and negative both.
+    #
+    #   0x18c27403  the MSA class as the corpus produced it: three ENC@ws
+    #               rows naming THREE DIFFERENT vectors under one rule.
+    #               FOLDED -- and REFUSAL 6 must not see them, because after
+    #               the fold there is no FIXED bank pair left to refuse.
+    #   0x18c27404  ONE ENC@ws row and nothing else.  A single instance
+    #               matching a single 5-bit field is one coincidence away
+    #               from a genuinely fixed register, so it is DEMOTED back
+    #               to FIXED -- the role it would have had -- and carried as
+    #               one.  The negative control for "the fold does not
+    #               prefer the more interesting answer".
+    #   0x18c27405  two ENC@ws rows beside a FIXED row of the same bank.
+    #               MIXED: the corpus is claiming the rule reads both a
+    #               constant and an encoded register of one file, which is
+    #               the frozen operand wearing the new role.  Demoted, and
+    #               REFUSAL 6 then refuses all three.
+    #   0x18c27406  two ENC@ws rows and an AMBIGUOUS instance naming
+    #               `ws,wd`.  The ambiguous row JOINS the group -- it is
+    #               consistent with ws -- and cannot create one.
+    encrows = [
+        "         1  18c27403 translate_mips/OPC_MDMX    REG_VEC14"
+        "      ENC@ws  xori.b",
+        "         1  18c27403 translate_mips/OPC_MDMX    REG_VEC21"
+        "      ENC@ws  nori.b",
+        "         1  18c27403 translate_mips/OPC_MDMX    REG_VEC19"
+        "      ENC@ws  ori.b",
+        "         1  18c27404 translate_mips/OPC_ONE     REG_VEC7"
+        "       ENC@ws  onemn",
+        "         2  18c27405 translate_mips/OPC_MIX     REG_VEC3"
+        "       ENC@ws  mixmn",
+        "         2  18c27405 translate_mips/OPC_MIX     REG_VEC5"
+        "       ENC@ws  mixmn",
+        "         2  18c27405 translate_mips/OPC_MIX     REG_VEC9"
+        "       FIXED   mixmn",
+        "         1  18c27406 translate_mips/OPC_AMB     REG_VEC2"
+        "       ENC@ws  ambmn",
+        "         1  18c27406 translate_mips/OPC_AMB     REG_VEC4"
+        "       ENC@ws  ambmn",
+        "         1  18c27406 translate_mips/OPC_AMB     REG_VEC6"
+        "       ENC?ws,wd ambmn"]
+    encwitness = [
+        "         3  18c27403 translate_mips/OPC_MDMX    xori.b",
+        "         1  18c27404 translate_mips/OPC_ONE     onemn",
+        "         2  18c27405 translate_mips/OPC_MIX     mixmn",
+        "         1  18c27406 translate_mips/OPC_AMB     ambmn"]
+    m = os.path.join(d, "mipsel.log"); _sidecar(m, encrows, [], encwitness)
 
     snap = os.path.join(d, "snap")
     rc = subprocess.run(me + ["--snapshot", snap, "x86_64=" + x,
@@ -1282,6 +1524,35 @@ def selftest():
     chk("ARM D2: a RULED (R16) row in the same ledger IS carried",
         "0x30a7252au, SRC_SURV" in txt,
         "a ruling that the wire is right must not make the flip drop it")
+    # ---- THE ENC FOLD.  Four arms, and three of them are negative.
+    chk("ARM E1: a VARYING encoded register folds to ONE ENC row",
+        "0x18c27403u, SRC_SURV_ENC" in txt
+        and txt.count("0x18c27403u,") == 1
+        and "SRC_ENC_FIELD_MIPS_WS" in txt,
+        "three ENC@ws rows under one id must become one ENC row")
+    chk("ARM E1a: and the ENC row names NO register",
+        "0x18c27403u, SRC_SURV_ENC  , REG_NONE" in txt,
+        "a constant beside the field is what the role exists to replace")
+    chk("ARM E1b: REFUSAL 6 no longer sees the folded rows",
+        "REFUSED, not carried: 0x18c27403" not in txt,
+        "after the fold there is no FIXED bank pair left to refuse")
+    chk("ARM E2: a SINGLE encoded instance is DEMOTED to FIXED",
+        "0x18c27404u, SRC_SURV_FIXED, REG_VEC7" in txt,
+        "one instance matching one 5-bit field is a coincidence away from "
+        "a fixed register and must not become an ENC row")
+    chk("ARM E3: ENC rows MIXED with a FIXED row of the same bank are refused",
+        "0x18c27405u, SRC_SURV" not in txt
+        and "REFUSED, not carried: 0x18c27405" in txt,
+        "demoted, then REFUSAL 6 refuses the pile")
+    chk("ARM E4: an AMBIGUOUS instance JOINS a group and never creates one",
+        "0x18c27406u, SRC_SURV_ENC" in txt
+        and txt.count("0x18c27406u,") == 1,
+        "ENC?ws,wd is consistent with ws and must not split the group")
+    chk("ARM E5: the fold PRINTS every group it examined",
+        "ENC mipsel   0x18c27403 ws  FOLDED" in rc.stdout
+        and "0x18c27404 ws  SINGLETON" in rc.stdout
+        and "0x18c27405 ws  MIXED" in rc.stdout,
+        "a decision nobody can read is a decision nobody can check")
     chk("ARM K1: a FROZEN ENCODED OPERAND pair is NOT carried",
         "0x000002e0u, SRC_SURV" not in txt
         and "REFUSED, not carried: 0x000002e0" in txt

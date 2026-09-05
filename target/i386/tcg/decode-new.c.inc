@@ -315,46 +315,7 @@
 #define p_00_66_f3_f2 .valid_prefix = P_00 | P_66 | P_F3 | P_F2,
 
 #define UNKNOWN_OPCODE ((X86OpEntry) {})
-
-/*
- * THE SAME "NOT IMPLEMENTED HERE", BUT SAYING HOW LONG THE INSTRUCTION IS.
- *
- * UNKNOWN_OPCODE names no operands, so decode_insn() decodes none, so a
- * ModRM byte's SIB and displacement are never fetched and s->pc stops at
- * the ModRM.  The translation is still refused -- .gen is NULL and the
- * caller goes to unknown_op exactly as before -- but everything that reads
- * the instruction's LENGTH afterwards reads a short one: the ILLOPC log
- * line, the translator's insn record, and every TCG plugin, which is handed
- * a truncated copy of the instruction's own bytes.
- *
- * MEASURED (FINDING 77-A / 80-D).  `0F C7` group 9 sends every `vmptrst`,
- * `vmxon`, `xsaves` and `clrssbsy` encoding to decode_group9()'s unknown
- * arm.  Of the thirty ModRM shapes that reach it, the six with mod=00 and
- * rm not 4 or 5 -- the only ones whose whole instruction IS opcode plus
- * ModRM -- were reported at their true length and the other twenty-four
- * short, by one SIB byte, one disp8 or four disp32 bytes.  QEMU's own
- * `-d unimp` line is the witness: `40 0f c7 78 00` logs as
- * `ILLOPC: ... 40 0f c7 78`.
- *
- * X86_TYPE_nop is the type that already means "modrm operand decoded but
- * not fetched", and NoLoadEA keeps the address from being materialised, so
- * this consumes the address bytes and emits nothing.  The three groups
- * using it are the three whose unknown arm is reached with a ModRM byte in
- * hand: every encoding under them addresses an operand through it, whether
- * or not this build implements the opcode.  gen_lea_modrm_0() parses; it
- * does not emit, and X86_SPECIAL_NoLoadEA says so for the path that would.
- *
- * NOT A CHANGE OF BEHAVIOUR THE GUEST CAN OBSERVE: #UD is raised at the
- * same RIP either way -- gen_exception() uses eip_cur, the address of the
- * faulting instruction, and the fault does not report a length.  What
- * changes is what QEMU says the instruction WAS.
- */
-#define UNKNOWN_OPCODE_MODRM ((X86OpEntry) {                      \
-    .op0 = X86_TYPE_nop, .s0 = X86_SIZE_v,                        \
-    .special = X86_SPECIAL_NoLoadEA,                              \
-    .slot = __LINE__,                                             \
-})
-
+#define UNKNOWN_OPCODE_MODRM ((X86OpEntry) { .op0 = X86_TYPE_nop, .s0 = X86_SIZE_v, .special = X86_SPECIAL_NoLoadEA })  /* see EOF */
 static uint8_t get_modrm(DisasContext *s, CPUX86State *env)
 {
     if (!s->has_modrm) {
@@ -418,12 +379,6 @@ static void decode_group9(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
     } else if (op == 1) {
         *entry = REX_W(s) ? cmpxchg16b : cmpxchg8b;
     } else {
-        /*
-         * mod != 3 here -- the first arm took the register forms -- so the
-         * ModRM byte addresses memory in every encoding that reaches this,
-         * and the address bytes are part of the instruction whether or not
-         * this build implements the opcode.
-         */
         *entry = UNKNOWN_OPCODE_MODRM;
     }
 }
@@ -3141,3 +3096,49 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
  unknown_op:
     gen_unknown_opcode(env, s);
 }
+
+/*
+ * UNKNOWN_OPCODE_MODRM -- the note for the one-line #define near the top of
+ * this file, KEPT DOWN HERE BECAUSE OF WHAT A LINE IS IN THIS FILE.
+ *
+ * WHY THE COMMENT IS NOT BESIDE THE CODE.  X86_OP_ENTRY3() and its siblings
+ * set `.slot = __LINE__`, so a row's identity IS its source line, and
+ * champsim_tracer's generated x86 identity table is keyed on those numbers.
+ * Inserting anything above the last X86_OP_* row renumbers every row below
+ * it -- the whole point of the "every slot keeps its number" rule the
+ * encoding-qualified identity notes state again and again.  Measured, and
+ * that is why this is written here: a first attempt put a thirty-five-line
+ * comment beside the #define, the golden net's validator arm went from
+ * 0 to 705 `REFUSED: identity carried, row abstained` and 0 to 114
+ * `decided rows carrying UNKNOWN` on x86_64 w1_baseline, and the generator's
+ * own census named the mechanism outright -- "base slot 551 now names
+ * 'PSHUFHW'".  The #define replaced a BLANK line and the three uses are
+ * one line for one line, so this change renumbers nothing.
+ *
+ * WHAT IT IS.  UNKNOWN_OPCODE names no operands, so decode_insn() decodes
+ * none, so a ModRM byte's SIB and displacement are never fetched and s->pc
+ * stops at the ModRM.  The translation is refused either way -- .gen is
+ * NULL and the caller reaches unknown_op -- but everything downstream that
+ * reads the instruction's LENGTH reads a short one, including a TCG plugin,
+ * which is handed a truncated copy of the instruction's own bytes.
+ *
+ * MEASURED (FINDING 77-A / 80-D).  `0F C7` group 9 sends every `vmptrst`,
+ * `vmxon`, `xsaves` and `clrssbsy` encoding to decode_group9()'s unknown
+ * arm.  Of the thirty ModRM shapes that reach it, the six with mod=00 and
+ * rm not 4 or 5 -- the only ones whose whole instruction IS opcode plus
+ * ModRM -- were reported at their true length and the other twenty-four
+ * short.  QEMU's own `-d unimp` line is the witness:
+ * `40 0f c7 78 00` logged as `ILLOPC: ... 40 0f c7 78`, and now logs whole.
+ *
+ * X86_TYPE_nop already means "modrm operand decoded but not fetched" and
+ * NoLoadEA keeps the address from being materialised, so the address bytes
+ * are consumed and nothing is emitted; gen_lea_modrm_0() parses only.  The
+ * three groups that take it -- 9, 1A and 11 -- are the three whose unknown
+ * arm is reached with a ModRM byte in hand, and every encoding under them
+ * addresses an operand through it whether or not this build implements the
+ * opcode.  decode_modrm() handles a mod=11 form correctly, so group 1A's
+ * and group 11's register cases are unaffected.
+ *
+ * NOT OBSERVABLE BY THE GUEST: #UD is raised at the same RIP, because
+ * gen_exception() uses eip_cur and the fault reports no length.
+ */

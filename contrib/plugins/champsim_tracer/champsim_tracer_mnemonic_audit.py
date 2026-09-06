@@ -4812,6 +4812,16 @@ def qemu_arm_declared_names() -> tuple[tuple[str, str], ...]:
     explicit name table would need that table parsed instead of pasted
     onto, so it REFUSES rather than guessing -- AArch64 passes NULL for
     all eight and a target that stops doing so must be read, not assumed.
+
+    WHAT THE COUNT COUNTS, because two readings of it have already been
+    compared as though one were wrong.  This returns CALL SITES, and the
+    census prints `8 declarations in translate-a64.c`.  Grepping the
+    identifier in that file returns TEN: the extra two are prose, comments
+    that name the function while describing what it declares.  Both numbers
+    are right about different questions, and a reader reconciling them is
+    not looking at a defect.  The parse is anchored on the call's argument
+    shape, which is why the comments cannot enter it -- and if one ever
+    did, the NULL-name-table refusal above is what would catch it.
     """
     try:
         text = ARM_TRANSLATE_A64_C.read_text()

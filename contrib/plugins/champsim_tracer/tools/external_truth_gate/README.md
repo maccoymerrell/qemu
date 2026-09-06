@@ -69,6 +69,44 @@ repository does not carry; each leg has its own REPRODUCE script under
 pass or a failure, and the staleness guard is what stops an old run being
 quoted as a current one.
 
+## Waiting on a leg, and the waiter that never ends
+
+Because the legs take hours, a wave writes a waiter for them, and the waiter
+is almost always written the same way:
+
+```sh
+until ! pgrep -f 'sweep135.sh' >/dev/null; do sleep 30; done     # WRONG
+```
+
+`pgrep -f` matches COMMAND LINES, and the waiter's own command line contains
+the pattern — so the waiter matches itself and the loop never ends.  Measured:
+against a subject that **was never started at all**, that loop was still
+spinning when it was killed.  The failure is not "waited too long"; it is a
+wait for something that does not exist, reported as work in progress.
+
+Excluding `$$` does not fix it. A command substitution and each pipeline stage
+run in SUBSHELLS with pids of their own and the same command line, which is
+the measurement `concurrent_champsim()` in `battery15.sh` records for the
+process scanner. Neither does the `'[s]weep135.sh'` bracket trick, for a
+reason particular to how waves run: the waiter is launched by a shell whose
+argv holds the WHOLE command text, and that text quotes the pattern in both
+spellings, so the launcher matches both.
+
+Wait on the pid and on the artifact, neither of which is text:
+
+```sh
+setsid bash sweep135.sh > sweep135.log 2>&1 &
+JOB=$!
+while kill -0 "$JOB" 2>/dev/null; do sleep 30; done
+test -s "$OUT/RC.txt" || { echo "leg left no artifact -- REFUSING" >&2; exit 3; }
+```
+
+`kill -0` asks the kernel about one pid and cannot match a command line at all.
+The artifact check is the other half and is not optional: a process that is
+gone is equally consistent with "finished" and "died in its first second", and
+a waiter that reports the second as the first is the silent false success this
+project keeps finding. Absence is not completion.
+
 ## Ceilings are not targets
 
 Every ceiling above zero carries its adjudication and, where one exists, the

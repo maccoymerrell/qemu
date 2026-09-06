@@ -5192,6 +5192,63 @@ void tcg_x86_init(void)
                                   sizeof(((CPUX86State *)0)->mxcsr), 1);
 
     /*
+     * THE THREE SOFTFLOAT STATUS FILES -- the rounding mode, the accrued
+     * exception flags and the NaN rules every FP instruction on this target
+     * operates under.
+     *
+     * The READ is ordinary and always was, and QEMU already states it
+     * exactly: `dfu_addps_xmm_env` and its ~1,200 siblings in
+     * accel/tcg/insn-dataflow-usage/i386.c.inc name
+     * offsetof(CPUArchState, sse_status) with its own sizeof, because the
+     * generator read `&env->sse_status` out of ops_sse.h.  What was missing
+     * is the NAME.  Nothing declared those bytes, so the stated read arrived
+     * downstream as an anonymous CPUArchState range, and a destination whose
+     * provenance contained it could not be resolved at all -- the write list
+     * was ABANDONED at that row and the whole destination family refused.
+     *
+     * MEASURED, on a purpose-built guest that runs each of six instructions
+     * in its register and its memory form: `addps %xmm1,%xmm6` -- no memory
+     * operand, no staging, nothing else moving -- refused with
+     * `provenance named an env byte range no target declared`, and
+     * env offset 834 (0x342) is env->sse_status.  FINDING 82-A's M2, whose
+     * control is that the three INTEGER SIMD instructions beside it in the
+     * same guest refuse only in their memory form.
+     *
+     * THE aarch64 RULING APPLIES VERBATIM.  vfp.fp_status[] was declared
+     * there as an eight-element file under the same reasoning (#332), and
+     * e27aa69cc9's ruling -- the declarations are the namespace QEMU answers
+     * in, so the declarations are what is read -- does not turn on the
+     * target.  This is that statement, one target over.
+     *
+     * THREE FILES AND NOT ONE.  QEMU keeps a separate float_status per FP
+     * datapath -- x87 (fp_status), 3DNow! (mmx_status) and SSE/AVX
+     * (sse_status) -- and they are declared separately because the BYTES are
+     * separate: an access spanning two of them would land in neither extent
+     * and refuse, which is the direction this file treats as correct.
+     *
+     * THE SPELLINGS ARE QEMU'S OWN MEMBER NAMES, not a GDB-stub register.
+     * None of the three is a register the i386 stub carries, and inventing a
+     * stub spelling for them would claim they ARE the packed word the stub
+     * reports -- `fstat` and `mxcsr` are declared above, on the bytes that
+     * really are those words.  These are the run-time files those words are
+     * assembled from and decoded into, so they are named as what they are
+     * and the consumer's fold_nonarch() puts them on the one generic word
+     * the vocabulary gives an FP control-AND-status file it cannot split.
+     */
+    insn_dataflow_declare_regfile("fp_status", NULL,
+                                  offsetof(CPUX86State, fp_status),
+                                  sizeof(((CPUX86State *)0)->fp_status),
+                                  sizeof(((CPUX86State *)0)->fp_status), 1);
+    insn_dataflow_declare_regfile("mmx_status", NULL,
+                                  offsetof(CPUX86State, mmx_status),
+                                  sizeof(((CPUX86State *)0)->mmx_status),
+                                  sizeof(((CPUX86State *)0)->mmx_status), 1);
+    insn_dataflow_declare_regfile("sse_status", NULL,
+                                  offsetof(CPUX86State, sse_status),
+                                  sizeof(((CPUX86State *)0)->sse_status),
+                                  sizeof(((CPUX86State *)0)->sse_status), 1);
+
+    /*
      * The DIRECTION FLAG.
      *
      * EFLAGS.DF is the one architectural flag QEMU does not keep in the

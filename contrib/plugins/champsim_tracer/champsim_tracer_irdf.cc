@@ -651,6 +651,26 @@ uint8_t fold_nonarch(const char *name)
         return REG_FCSR;
     }
     /*
+     * THE SAME FILE ON x86, WHERE QEMU KEEPS THREE OF THEM.
+     *
+     * target/i386 declares a float_status per FP datapath -- x87, 3DNow!
+     * and SSE/AVX -- under its own member names.  `fp_status` is answered by
+     * the prefix arm above; the other two spell the SAME KIND of thing and
+     * begin with different characters, so they are named here rather than by
+     * widening that prefix into a suffix match that would also swallow any
+     * future member ending in the word.
+     *
+     * REG_FCSR by the generator's standing rule, and by agreement with the
+     * table: x86's `fstat`, `ftag` and `mxcsr` rows in the generated
+     * QEMU-indexed header all carry REG_FCSR already, so a control-and-status
+     * file that cannot be split into control and status halves lands on the
+     * one word the x86 vocabulary gives every FP status register.  Nothing
+     * new is invented; three spellings meet a word that exists.
+     */
+    if (!strcmp(name, "mmx_status") || !strcmp(name, "sse_status")) {
+        return REG_FCSR;
+    }
+    /*
      * MIDR_EL1, the main ID register.
      *
      * It arrives by a different door from every spelling above: not as a

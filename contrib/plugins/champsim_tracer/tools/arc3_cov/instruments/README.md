@@ -18,13 +18,14 @@ the one location; later waves cite these paths and nothing else.
 | `srcbar.py` | THE SOURCE BAR: the tip arm against the banked deletion arm, over `REACH=INSTRUCTION` rows only, decomposed by mechanism AND by family `(decode rule, mnemonic)` |
 | `mechclass.py` | the mechanism a source loss belongs to -- `Q-SILENT` / `R-REFUSED` / `R-SHORT` / `NO-BLOCK` / `SURV-ONLY` -- read off arm A's own row |
 | `barledger.py` | joins the bar's families to `BAR_CLASSES.tsv` and REFUSES unless EVERY family carries a disposition and a citation |
+| `famarm.py` | the ARM under a family's ruling: histogram an encoding bit-field, or split each lost register by operand SLOT, over the bar's own population |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
 fail on it.  Run them all before quoting any of them -- with the runner, not
 by hand:
 
 ```sh
-./selftest_all.sh            # 23 instruments found, 23 green, 0 RED
+./selftest_all.sh            # 24 instruments found, 24 green, 0 RED
 ```
 
 **Do not write the loop out again.**  The loop that used to stand here named
@@ -207,3 +208,12 @@ R13 legs), `RULED` (an architectural fact or standing ruling says the
 register is not a source, so the arm that drops it is right -- and the row
 must carry a WHOLE-POPULATION arm, never a sample), and `BLOCKED` (a named
 question, written out).  There is no fourth answer and no silent row.
+
+Every `RULED` row rests on a sentence of the form "100% of the N losing
+encodings carry X", and `famarm.py` is where that sentence comes from.  It
+applies the REACH filter, which the hand-written arms that preceded it did
+not: one family read 168 losing encodings where the bar holds 72, the extra
+rows being NO-DECODE encodings the bar excludes by ruling.  Nothing was
+published from that reading, but it would have been a whole-population claim
+over the wrong population, and the tool now prints the excluded count rather
+than quietly absorbing it.

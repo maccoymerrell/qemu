@@ -14,13 +14,14 @@ the one location; later waves cite these paths and nothing else.
 | `nodep_census.py` | the absolute census of slots naming no architectural register (the #230 class) |
 | `identsplit.py` | per-FIELD diff of a QID_SPLIT identity row's candidates: is the split about the INSTRUCTION, or only about which refiner is named |
 | `cph_census.py` | the CP-H write-state census over an arm root's `corpus_mech_<isa>.tsv`, and the MUST-BE-0 property that an incomplete extraction may never also claim a complete publish |
+| `abandoned_families.py` | decompose the `...ABANDONED` write-list class by `(generic opcode, shape of the named prefix)`, so one reason with millions of rows becomes families a declaration can be aimed at |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
 fail on it.  Run them all before quoting any of them:
 
 ```sh
 for t in keyfacts setproof score_families score_dst nodep_census identsplit \
-         cph_census; do
+         cph_census abandoned_families; do
     python "$t.py" --selftest || echo "SELFTEST RED: $t"
 done
 ```

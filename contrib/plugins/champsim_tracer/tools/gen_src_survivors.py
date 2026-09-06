@@ -256,19 +256,87 @@ DECODE_SITE_REFUTED = (
     # REG_FPR1 beside REG_FPR2.  It is a FROZEN ENCODED OPERAND that
     # REFUSAL 6 cannot see, because REFUSAL 6 needs two FIXED rows of one
     # bank to collide and this id carries only one.
-    ("x86_64", "x87@1101110111000", "REG_FPR",
-     "gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep "
-     "mark the tag word and never look at the value"),
+    # RETIRED at exec136, and the table SHIPS EMPTY.  The row above is kept
+    # as prose because the reason it went is the reason a future row would
+    # come back, and because a category emptied without a record reads later
+    # like a category nobody ever needed.
+    #
+    # ITS SUBJECT STOPPED ARRIVING, and this is what stopped it.  The detector
+    # below offers two remedies -- retire the entry, or find out why its
+    # subject stopped arriving -- and they are not alternatives, they are an
+    # investigation and then its verdict.  The investigation:
+    #
+    #   f04c6cfee1  extended cap_x86_is_x87_tag_only() from FFREEP to FFREE,
+    #               so `disas/capstone.c` no longer supplies the named ST(i)
+    #               operand at all.  The operand walk was this register's ONLY
+    #               supplier, so after that commit nothing publishes it and
+    #               this row has nothing to refuse.
+    #   24513de116  had already withdrawn the survivor table's own row for it
+    #               as a frozen-operand fabrication.
+    #
+    # So the register left the wire one layer BELOW this table, at the
+    # boundary, which is the stronger place for it to leave from -- and a
+    # DECODE_SITE_REFUTED row's whole distinguishing claim is that the
+    # register "is still arriving from the operand walk".  That claim is now
+    # FALSE for `ffree`, and a refusal row whose written justification is
+    # false is the dead allowlist rule this tree removes everywhere else.
+    #
+    # MEASURED, not inferred, on the SAME corpus arm across the two builds:
+    #
+    #   probes/p_x87 (byte-identical source, md5 527d9846) survivor block
+    #     banked capture, before f04c6cfee1 : 4 rows, INCLUDING
+    #                                         44ae204e REG_FPR1 FIXED ffree
+    #     re-run at 5f6907e9f7             : 3 rows, the ffree row GONE and
+    #                                         the other three byte-identical
+    #
+    # The three that stayed are the instrument's own proof it still fires:
+    # this is one row leaving, not a block going quiet.  And the population
+    # is covered rather than sampled -- a purpose-built guest running all
+    # EIGHT `ffree %st(i)` and all EIGHT `ffreep %st(i)` on a full x87 stack
+    # reaches both identities 8 times each and publishes NO survivor row on
+    # any slot.  "Dead because this corpus is narrower" is refuted for the
+    # whole rule, not argued against for one encoding of it.
+    #
+    # IT COMES BACK THE DAY ITS CLAIM IS TRUE AGAIN.  If a Capstone bump
+    # retires the boundary repair, the operand walk supplies ST(i) again and
+    # this row is the refusal that belongs in front of it.  What watches for
+    # that day is isaxcheck's dead-allow-rule detector over the fourteen
+    # boundary and five field signatures f04c6cfee1 allowlisted.
 )
 
 #: THE DEAD-REFUSAL-RULE DETECTOR'S FIRING CONTROL.  A detector nobody can
-#: watch convict is not a detector, and both tables above are one row long, so
+#: watch convict is not a detector, and BOUNDARY_DROPS is one row long, so
 #: there is no natural population to plant into.  With this set, ONE entry
 #: that cannot match anything is appended to BOUNDARY_DROPS and the emit must
 #: REFUSE and name it.  Used by ARM S4 of the selftest and by nothing else.
 if os.environ.get("CST_SURV_PLANT_DEAD_RULE"):
     BOUNDARY_DROPS = BOUNDARY_DROPS + (
         ("x86_64", "@@planted-rule-that-matches-nothing@@", "REG_"),)
+
+#: REFUSAL 8'S POSITIVE CONTROL, AND WHY IT IS A PLANT NOW.
+#:
+#: DECODE_SITE_REFUTED ships empty -- see the record in the table itself --
+#: and an empty table would take REFUSAL 8's only selftest arms down with it:
+#: S2, S2a and S3 assert that a published row on this decode identity leaves
+#: as REFUTED with QEMU's own site quoted, and they could only assert it
+#: while a SHIPPED row happened to cover the id their fixture publishes.
+#:
+#: THAT DEPENDENCY WAS ITSELF THE DEFECT.  An arm wired to a shipped row
+#: tests the machinery only for as long as some real instruction needs it,
+#: and dies -- silently, as a passing test that stopped meaning anything, or
+#: loudly, as three failures with no bug behind them -- the day that row is
+#: legitimately retired.  Which is exactly what happened here.  The arm's
+#: subject is REFUSAL 8, not `ffree`, so its row comes from the same place
+#: its sidecar does: the fixture.
+#:
+#: The planted row is the retired one, verbatim, because the hypothetical
+#: the arm exercises is a true one -- if a decoder published ST(i) as a read
+#: of `ffree`, QEMU's decode site is what would refuse it.
+if os.environ.get("CST_SURV_PLANT_REFUTED_ARM"):
+    DECODE_SITE_REFUTED = DECODE_SITE_REFUTED + (
+        ("x86_64", "x87@1101110111000", "REG_FPR",
+         "gen_note_sti_read(), target/i386/tcg/translate.c -- ffree/ffreep "
+         "mark the tag word and never look at the value"),)
 HDR = "SOURCE SURVIVORS KEYED ON QEMU'S DECODE IDENTITY"
 # The SECOND survivor block, same columns and same role measurement, and a
 # DIFFERENT CLAIM: a published source on an instruction whose read list QEMU
@@ -1326,6 +1394,13 @@ def selftest():
 
     import subprocess
     me = [sys.executable, os.path.abspath(__file__)]
+    # THE FIXTURE'S TABLE ROW TRAVELS WITH THE FIXTURE'S SIDECAR ROW.
+    # DECODE_SITE_REFUTED ships empty, so REFUSAL 8's positive control plants
+    # both halves of itself: the published row below, and the table entry that
+    # refuses it.  Planting only one half is what made these arms depend on a
+    # shipped row in the first place.  Every child process of this selftest
+    # gets it; the dead-rule arm adds its own plant on top.
+    senv = dict(os.environ, CST_SURV_PLANT_REFUTED_ARM="1")
 
     good = ["       521  000006da RET                        REG_SEG5"
             "       FIXED   retq",
@@ -1490,12 +1565,12 @@ def selftest():
     snap = os.path.join(d, "snap")
     rc = subprocess.run(me + ["--snapshot", snap, "x86_64=" + x,
                               "aarch64=" + a_, "riscv64=" + r, "mipsel=" + m],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     chk("ARM A: snapshot is created", rc.returncode == 0, rc.stderr.strip())
 
     h = os.path.join(d, "out.h")
     rc = subprocess.run(me + ["--out", h, "--from-snapshot", snap],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     txt = open(h).read() if os.path.exists(h) else ""
     txt_s2a = rc.stdout
     chk("ARM B: emit from a verified snapshot", rc.returncode == 0,
@@ -1582,7 +1657,7 @@ def selftest():
 
     rc = subprocess.run(me + ["--out", h + ".2", "x86_64=" + x,
                               "aarch64=" + a_, "riscv64=" + r, "mipsel=" + m],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     chk("ARM N: a NOT-SCORED-block row IS carried (the second claim)",
         "0x00000507u, SRC_SURV_SELF , REG_NONE      , 0," in txt,
         "the survivor block read (none); only the NOT-SCORED block has it")
@@ -1650,7 +1725,7 @@ def selftest():
     rc = subprocess.run(me + ["--snapshot", snap2, "x86_64=" + x,
                               "aarch64=" + a_, "riscv64=" + r2,
                               "mipsel=" + m, "--corpus", "riscv64=" + corp],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     chk("ARM R0: a snapshot carries the corpus too", rc.returncode == 0,
         rc.stderr.strip())
     chk("ARM R0a: and says how many corpus files it took",
@@ -1658,7 +1733,7 @@ def selftest():
 
     h2 = os.path.join(d, "out_rt.h")
     rc = subprocess.run(me + ["--out", h2, "--from-snapshot", snap2],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     txt2 = open(h2).read() if os.path.exists(h2) else ""
     chk("ARM R1: emit with a corpus present", rc.returncode == 0,
         rc.stderr.strip())
@@ -1690,10 +1765,10 @@ def selftest():
     snap3 = os.path.join(d, "snap_nort")
     subprocess.run(me + ["--snapshot", snap3, "x86_64=" + x, "aarch64=" + a_,
                          "riscv64=" + r2, "mipsel=" + m],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=senv)
     h3 = os.path.join(d, "out_nort.h")
     rc = subprocess.run(me + ["--out", h3, "--from-snapshot", snap3],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     txt3 = open(h3).read() if os.path.exists(h3) else ""
     chk("ARM R9: WITHOUT the corpus the same row IS carried -- the arm is "
         "what removes it", "0x8e2f807fu, SRC_SURV" in txt3, rc.stdout.strip())
@@ -1705,9 +1780,9 @@ def selftest():
     subprocess.run(me + ["--snapshot", snap4, "x86_64=" + x, "aarch64=" + a_,
                          "riscv64=" + r2, "mipsel=" + m,
                          "--corpus", "riscv64=" + bad],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=senv)
     rc = subprocess.run(me + ["--out", h + ".4", "--from-snapshot", snap4],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     chk("ARM R10: a corpus with no decode_id column is REFUSED, not read as "
         "'nothing varies'",
         rc.returncode != 0 and "not the mechanism corpus"
@@ -1747,10 +1822,10 @@ def selftest():
     subprocess.run(me + ["--snapshot", snap5, "x86_64=" + x, "aarch64=" + a_,
                          "riscv64=" + r, "mipsel=" + m,
                          "--corpus", "x86_64=" + xcorp],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=senv)
     h5 = os.path.join(d, "out_ord.h")
     rc = subprocess.run(me + ["--out", h5, "--from-snapshot", snap5],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     txt5 = open(h5).read() if os.path.exists(h5) else ""
     chk("ARM S3: with BOTH refusals applying, the row leaves as REFUTED and "
         "not as the corpus-shape FROZEN-RT",
@@ -1767,7 +1842,12 @@ def selftest():
     # ARM S4 -- THE DETECTOR ITSELF.  A planted table entry that cannot match
     # anything must REFUSE the emit and name the entry.  Without this the
     # detector is another instrument nobody has watched convict.
-    env = dict(os.environ, CST_SURV_PLANT_DEAD_RULE="1")
+    # ON TOP OF the fixture environment, never instead of it: the dead-rule
+    # arm must see the same table state every other arm sees, plus its own
+    # planted corpse.  Built from os.environ it would silently also empty
+    # DECODE_SITE_REFUTED, and then two rows would be dead here while the
+    # arm claims to have planted one.
+    env = dict(senv, CST_SURV_PLANT_DEAD_RULE="1")
     dead_h = os.path.join(d, "out_dead.h")
     rc = subprocess.run(me + ["--out", dead_h, "--from-snapshot", snap],
                         capture_output=True, text=True, env=env)
@@ -1789,7 +1869,7 @@ def selftest():
 
     open(os.path.join(snap, "x86_64.00.x86_64.log"), "a").write("tamper\n")
     rc = subprocess.run(me + ["--out", h + ".3", "--from-snapshot", snap],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=senv)
     chk("ARM H: a snapshot that moved under us is refused",
         rc.returncode != 0 and "changed under us" in (rc.stdout + rc.stderr))
 

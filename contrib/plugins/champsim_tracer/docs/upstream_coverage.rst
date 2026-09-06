@@ -63,6 +63,18 @@ that makes it a different defect from every other row on this page.
 INVPCID — the wrong fault class (6,000 encodings)
 --------------------------------------------------
 
+.. admonition:: Fixed in this tree
+   :class: tip
+
+   ``8cbc3bb74b`` gives ``0F 38 82`` the decode row described below.
+   ``qemu-x86_64`` now answers ``#GP(0)``, matching hardware on all four
+   arms; system-mode builds are unchanged.  The row is line-neutral —
+   854 → 855 decode slots, one new, none moved — and the encoding corpus
+   grows by exactly the 6,000 rows with no column of any other row
+   differing.  The section is kept because the *reasoning* is the report:
+   an advertised feature that refuses its own instruction is a defect
+   shape worth being able to recognise again.
+
 **Observed.**  ``66 0F 38 82 /r`` at CPL 3, on a machine that
 advertises the feature:
 
@@ -116,6 +128,13 @@ The alternative — dropping the bit from
 by making ``#UD`` correct.  It is not preferred here because it
 reverses a deliberate upstream decision and costs the ``-cpu`` model
 coverage that decision bought, where the decode row costs nothing.
+
+The decode row is the route taken.  What it does *not* do is implement
+the instruction: ``gen_INVPCID()`` is unreachable in both build shapes
+at this tip — user-only builds never reach CPL 0, system-mode builds do
+not carry the feature bit — and raises ``#UD`` so that a future change
+adding the bit to ``TCG_7_0_EBX_FEATURES`` without adding the TLB
+operation fails loudly rather than skipping a flush.
 
 .. _upstream-missing-features:
 
@@ -196,6 +215,8 @@ have been fixed in this tree:
   architecture defines, on which QEMU *asserted* and killed the
   emulator.  Fixed in ``067a5a798c``; the abort had been absorbing
   692,151 encodings of the sweep as "cause not determined".
+* ``0F 38 82`` — INVPCID's missing decode row, above.  Fixed in
+  ``8cbc3bb74b``.
 
 .. _upstream-coverage-instrument:
 

@@ -13,15 +13,38 @@ the one location; later waves cite these paths and nothing else.
 | `score_dst.py` | the destination family keyed per destination REGISTER |
 | `nodep_census.py` | the absolute census of slots naming no architectural register (the #230 class) |
 | `identsplit.py` | per-FIELD diff of a QID_SPLIT identity row's candidates: is the split about the INSTRUCTION, or only about which refiner is named |
+| `cph_census.py` | the CP-H write-state census over an arm root's `corpus_mech_<isa>.tsv`, and the MUST-BE-0 property that an incomplete extraction may never also claim a complete publish |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
 fail on it.  Run them all before quoting any of them:
 
 ```sh
-for t in keyfacts setproof score_families score_dst nodep_census identsplit; do
+for t in keyfacts setproof score_families score_dst nodep_census identsplit \
+         cph_census; do
     python "$t.py" --selftest || echo "SELFTEST RED: $t"
 done
 ```
+
+## Why `cph_census.py` is in the tree and not in a run directory
+
+It was written twice as a pass-local script, and after the second time the
+derivation was lost with the run directory that held it.  An aarch64 number
+that had already been published could then not be re-derived from the tree at
+all; the only route back to it was to write the script again from the shape of
+its own output.  A census the tree cannot reproduce is a number, not a
+measurement.
+
+The output format is unchanged from those pass-local versions on purpose, so
+every banked `CENSUS.txt` stays comparable to one produced here — the tool as
+it stands reproduces exec135's four-ISA census byte for byte from
+`sled_tip81a`.
+
+What the promotion added is the column guard.  The pass-local version reached
+its columns with `.get(name, "")`, so a corpus that renamed `WSTQ` would have
+scored every row REFUSED, and one that renamed `PUBD` and `wstate` would have
+made the MUST-BE-0 property VACUOUS — printing `: 0` and `CENSUS PASSED` while
+looking at nothing.  Each named column is now dropped in its own selftest arm
+and each drop must REFUSE.
 
 ## Why `identsplit.py` exists
 

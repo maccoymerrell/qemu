@@ -90,7 +90,122 @@ def arm(d, isa, wps):
             for w in wps]
 
 
+
+MECH_HDR = ("#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate\t"
+            "PUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\t"
+            "WSTQ\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\n")
+_OKW = "PUBLISHED from QEMU's emitters"
+_BODY = "noret=0,calls=0,memr=0,memw=0,refused=0"
+
+
+def _write_arm(root, isa, wp, rows):
+    d = os.path.join(root, "%s.wp%s" % (isa, wp))
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "corpus_mech_%s.tsv" % isa), "w") as f:
+        f.write(MECH_HDR)
+        for r in rows:
+            f.write("\t".join([
+                isa, r["enc"], r.get("mnem", "m"), r.get("did", "aa"),
+                r.get("rule", "rule_x"), _OKW, _OKW, r.get("PUB", "-"),
+                "-", "-", r.get("RD", "-"), "-", "-", "-",
+                r.get("xlat", _BODY), r.get("WR", "-"), r.get("PUBD", "-"),
+                _OKW, "-", "-", "-", "-", "0", "0", "0"]) + "\n")
+    return d
+
+
+def selftest(tmp):
+    """FINDING 83-D.  This is the tool every source-side family is argued
+    with, and the defect its own header describes -- two pasted copies
+    disagreeing about whether a row absent from the BEFORE arm counts -- is
+    exactly the kind a selftest catches and a reading never does."""
+    import shutil, subprocess
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    isa, wp = "riscv64", "0"
+    before = os.path.join(tmp, "before"); after = os.path.join(tmp, "after")
+    B = [
+        # a source gap that CLOSES: PUB names R9, QEMU does not; after, it does
+        dict(enc="01", mnem="fam_a", PUB="R1,R9", RD="R1", PUBD="R1", WR="R1"),
+        # a source gap that SURVIVES, on a second family
+        dict(enc="02", mnem="fam_b", PUB="R2,R8", RD="R2", PUBD="R2", WR="R2"),
+        # a destination gap, and the R10.1 carve-out beside it
+        dict(enc="03", mnem="fam_c", PUB="R3", RD="R3", PUBD="R3,R7",
+             WR="R3,REG_PC"),
+        # present only in the BEFORE arm
+        dict(enc="04", mnem="gone", PUB="R4", RD="R4", PUBD="R4", WR="R4"),
+    ]
+    A = [dict(r) for r in B[:3]]
+    A[0]["RD"] = "R1,R9"                       # the gap closed at the source
+    A.append(dict(enc="05", mnem="new", PUB="R5", RD="R5", PUBD="R5",
+                  WR="R5"))                    # present only in the AFTER arm
+    _write_arm(before, isa, wp, B)
+    _write_arm(after, isa, wp, A)
+
+    def run(*extra):
+        return subprocess.run([sys.executable, __file__, "--before", before,
+                               "--after", after, "--isa", isa, "--wps", wp]
+                              + list(extra), capture_output=True, text=True)
+
+    fails = 0; n = 0
+    def chk(cond, what):
+        nonlocal fails, n
+        n += 1
+        print(("PASS  " if cond else "FAIL  ") + what)
+        if not cond:
+            fails += 1
+
+    r = run(); o = r.stdout
+    chk(r.returncode == 0, "the tool runs on two well-formed arms")
+    chk("population=3  only-before=1  only-after=1" in o,
+        "rows present in ONE arm are COUNTED APART -- never dropped, and "
+        "never scored as agreement (the header's own defect)")
+    chk("SOURCE  PUB-minus-RD : 2 regs / 2 enc  ->  1 regs / 1 enc" in o,
+        "the closed source gap moves the number and the surviving one does "
+        "not")
+    chk("R10.1 REG_PC carve-out applied 2 time(s)" in o,
+        "the REG_PC carve-out is COUNTED at both ends, not silently applied")
+    chk("DEST    PUBD-minus-WR: 1 regs / 1 enc  ->  1 regs / 1 enc" in o,
+        "and the destination gap it protects is still scored")
+    chk("fam_b | R8" in o, "the SURVIVING family is named in the residue")
+    chk("fam_a | R9" not in o, "the CLOSED one is not")
+
+    # THE WIRE COLUMNS.  A published SET that moves and an ORDER that moves
+    # are different claims and must not collapse into one count.
+    A2 = [dict(r) for r in A]
+    A2[1]["PUB"] = "R8,R2"                     # same set, order reversed
+    _write_arm(after, isa, wp, A2)
+    o2 = run().stdout
+    chk("set changed=0  order changed=1" in o2,
+        "an ORDER-only wire change is order-only, never a set change")
+    A3 = [dict(r) for r in A]
+    A3[1]["PUB"] = "R2,R8,R6"
+    _write_arm(after, isa, wp, A3)
+    o3 = run().stdout
+    chk("set changed=1" in o3, "a SET change is seen")
+
+    # THE FILTERS SELECT, AND A CUT TABLE SAYS SO.
+    _write_arm(after, isa, wp, A)
+    o4 = run("--mnem", "fam_b").stdout
+    chk("population=1" in o4, "--mnem narrows the population it scores")
+    o5 = run("--top", "0").stdout
+    chk("NOT SHOWN" not in o5, "--top 0 shows the whole residue")
+
+    # A MISSING ARM REFUSES.
+    os.remove(os.path.join(after, "%s.wp%s" % (isa, wp),
+                           "corpus_mech_%s.tsv" % isa))
+    r6 = run()
+    chk(r6.returncode != 0 and "REFUSING" in (r6.stdout + r6.stderr),
+        "a missing corpus REFUSES; it is never an empty delta")
+    print("arms=%d failures=%d" % (n, fails))
+    return 0 if fails == 0 else 1
+
 def main():
+    if "--selftest" in sys.argv:
+        i = sys.argv.index("--selftest")
+        tmp = (sys.argv[i + 1] if len(sys.argv) > i + 1
+               and not sys.argv[i + 1].startswith("-")
+               else "/tmp/armdelta_st")
+        return selftest(tmp)
     ap = argparse.ArgumentParser()
     ap.add_argument("--before", required=True)
     ap.add_argument("--after", required=True)
@@ -195,8 +310,16 @@ def main():
               % (t["set_changed"], t["order_changed"]))
         if t["src_a"]:
             print("  SOURCE RESIDUE, top %d by %s:" % (a.top, a.by))
-            for k, n in resid.most_common(a.top):
+            rows = sorted(resid.items(), key=lambda kv: (-kv[1], kv[0]))
+            shown = rows[:a.top] if a.top else rows
+            for k, n in shown:
                 print("      %-60s %8d" % (k[:60], n))
+            rest = rows[len(shown):]
+            if rest:
+                print("      ... %d further key(s) totalling %d NOT SHOWN "
+                      "(--top %d); the smallest shown is %d"
+                      % (len(rest), sum(n for _, n in rest), a.top,
+                         shown[-1][1] if shown else 0))
         for k in ("src_b", "src_a", "dst_b", "dst_a", "set_changed",
                   "order_changed"):
             tot[k] += t[k]

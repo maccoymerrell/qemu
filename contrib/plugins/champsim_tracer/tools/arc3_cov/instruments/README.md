@@ -15,16 +15,32 @@ the one location; later waves cite these paths and nothing else.
 | `identsplit.py` | per-FIELD diff of a QID_SPLIT identity row's candidates: is the split about the INSTRUCTION, or only about which refiner is named |
 | `cph_census.py` | the CP-H write-state census over an arm root's `corpus_mech_<isa>.tsv`, and the MUST-BE-0 property that an incomplete extraction may never also claim a complete publish |
 | `abandoned_families.py` | decompose the `...ABANDONED` write-list class by `(generic opcode, shape of the named prefix)`, so one reason with millions of rows becomes families a declaration can be aimed at |
+| `srcbar.py` | THE SOURCE BAR: the tip arm against the banked deletion arm, over `REACH=INSTRUCTION` rows only, decomposed by mechanism AND by family `(decode rule, mnemonic)` |
+| `mechclass.py` | the mechanism a source loss belongs to -- `Q-SILENT` / `R-REFUSED` / `R-SHORT` / `NO-BLOCK` / `SURV-ONLY` -- read off arm A's own row |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
-fail on it.  Run them all before quoting any of them:
+fail on it.  Run them all before quoting any of them -- with the runner, not
+by hand:
 
 ```sh
-for t in keyfacts setproof score_families score_dst nodep_census identsplit \
-         cph_census abandoned_families; do
-    python "$t.py" --selftest || echo "SELFTEST RED: $t"
-done
+./selftest_all.sh            # 22 instruments found, 22 green, 0 RED
 ```
+
+**Do not write the loop out again.**  The loop that used to stand here named
+eight of the directory's files.  A pass ran it, reported "8 of 8", and quoted
+the instruments as verified; three of the fourteen files it did not name had
+no `--selftest` at all, and one of those three answered with an uncaught
+`IndexError` rather than a refusal (FINDING 83-D).  A hand list cannot report
+on what it does not mention -- the survivorship-bias failure this tree files
+against enumerated zeros.  `selftest_all.sh` takes the directory as its
+subject set, so a new instrument is IN the count the moment it exists, and a
+module with no `--selftest` is a FAILURE rather than an absence.
+
+It also tries both argument grammars.  Tools that plant files on disk take
+`--selftest DIR`; tools that plant them in memory take `--selftest` alone and
+refuse an extra word.  Both are legitimate, the runner prints which one
+answered, and a runner that knew only one convention reported six green tools
+as RED the first time it was pointed at the directory.
 
 ## Why `cph_census.py` is in the tree and not in a run directory
 

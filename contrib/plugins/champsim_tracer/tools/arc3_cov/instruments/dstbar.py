@@ -223,7 +223,135 @@ def read_mech_merged(paths):
     return d, conf, confex, hdr
 
 
+
+MECH_HDR = ("#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate\t"
+            "PUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\t"
+            "WSTQ\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\n")
+BODY  = "noret=0,calls=0,memr=0,memw=0,refused=0"
+
+
+def _write_arm(root, isa, wp, rows, drop=()):
+    d = os.path.join(root, "%s.wp%s" % (isa, wp))
+    os.makedirs(d, exist_ok=True)
+    hdr = MECH_HDR.lstrip("#").rstrip("\n").split("\t")
+    keep = [i for i, h in enumerate(hdr) if h not in drop]
+    with open(os.path.join(d, "corpus_mech_%s.tsv" % isa), "w") as f:
+        f.write("#" + "\t".join(hdr[i] for i in keep) + "\n")
+        for r in rows:
+            cells = [isa, r["enc"], r.get("mnem", "m"), r.get("did", "aa"),
+                     r.get("rule", "rule_x"), OKW, r.get("wstate", OKW),
+                     "-", "-", "-", "-", "-", "-", "-",
+                     r.get("xlat", BODY), r.get("WR", "-"),
+                     r.get("PUBD", "-"), r.get("WSTQ", OKW),
+                     "-", "-", "-", "-", "0", "0", r.get("WRU", "0")]
+            f.write("\t".join(cells[i] for i in keep) + "\n")
+    return d
+
+
+def selftest(tmp):
+    """FINDING 83-D.  This scorer prints the DESTINATION BAR -- a number the
+    standing records quote -- and had never been asked to fail at anything.
+    Each arm plants one defect the bar would otherwise absorb silently."""
+    import shutil, subprocess
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    isa, wp = "riscv64", "0"
+    arm = os.path.join(tmp, "arm")
+    ROWS = [
+        # the wire names a destination QEMU does not: the flip's COST
+        dict(enc="01", mnem="cost", PUBD="R1,R9", WR="R1"),
+        # QEMU names one the wire lacks: the flip's GAIN
+        dict(enc="02", mnem="gain", PUBD="R2",    WR="R2,R8"),
+        # agreement -- neither side
+        dict(enc="03", mnem="same", PUBD="R3",    WR="R3"),
+        # REG_PC on QEMU's side only: the R10.1 block-pc carve-out
+        dict(enc="04", mnem="pc",   PUBD="R4",    WR="R4,REG_PC"),
+        # a container write whose index QEMU could not state (FINDING 75-C)
+        dict(enc="05", mnem="wru",  PUBD="R5",    WR="R5,R7", WRU="1"),
+        # a lower-bound write list: GAIN ONLY, never a loss
+        dict(enc="06", mnem="short", PUBD="R6,R9", WR="R6,R8", WSTQ=WSHORT),
+        # a SECOND cost family, on a different register -- so the capped
+        # table below has something to drop and the cap arm is not vacuous
+        dict(enc="07", mnem="cost2", PUBD="R1,R10", WR="R1"),
+    ]
+    _write_arm(arm, isa, wp, ROWS)
+
+    def run(*extra, root=None):
+        return subprocess.run([sys.executable, __file__, "--a", root or arm,
+                               "--isa", isa, "--wps", wp] + list(extra),
+                              capture_output=True, text=True)
+
+    fails = 0; n = 0
+    def chk(cond, what):
+        nonlocal fails, n
+        n += 1
+        print(("PASS  " if cond else "FAIL  ") + what)
+        if not cond:
+            fails += 1
+
+    r = run()
+    o = r.stdout
+    chk(r.returncode == 0, "the scorer runs on a well-formed arm")
+    chk("WALK-ONLY DESTINATIONS (the flip's COST): 2 encodings / 2 registers"
+        in o, "COST is PUBD-minus-WR and counts the two cost rows, not the "
+              "agreeing ones")
+    chk("QEMU-ONLY DESTINATIONS (the flip's GAIN): 1 encodings / 1 registers"
+        in o, "GAIN is WR-minus-PUBD, with the PC row carved out of it")
+    chk("R10.1 block-pc carve-outs: 1]" in o,
+        "a REG_PC the wire does not publish is CARVED OUT and counted, not "
+        "scored as a gain")
+    chk("INDEX NOT STATED" in o,
+        "a container write with an unstated index is NOT SCORABLE "
+        "(FINDING 75-C)")
+    chk("R7" not in o.split("ON A LOWER-BOUND")[0],
+        "and its member does not reach the cost or gain tables")
+    chk("ON A LOWER-BOUND WRITE LIST (QDEP_W_SHORT), GAIN ONLY: 1 row(s), "
+        "of which 1 encoding(s) / 1 register(s)" in o,
+        "a lower-bound write list is scored for GAIN only")
+    chk("R9" in o.split("WALK-ONLY")[1].split("QEMU-ONLY")[0],
+        "the lower-bound row's R9 is NOT counted as a walk-only cost")
+
+    # THE COLUMN GUARDS.  Each required column dropped in its own arm; each
+    # drop must REFUSE.  A scorer that reads a renamed column as absent
+    # prints a bar over nothing.
+    for col, why in (("PUBD", "the wire's destination dictionary"),
+                     ("WSTQ", "QEMU's own write verdict"),
+                     ("WRU", "the unstated-index bit")):
+        a2 = os.path.join(tmp, "drop_" + col)
+        _write_arm(a2, isa, wp, ROWS, drop=(col,))
+        r2 = run(root=a2)
+        chk(r2.returncode != 0 and "REFUSING" in (r2.stdout + r2.stderr),
+            "a corpus without %s REFUSES -- %s" % (col, why))
+
+    # A CUT TABLE SAYS SO.
+    r3 = run("--regtop", "1")
+    chk("NOT SHOWN (--regtop 1)" in r3.stdout,
+        "a capped register table prints what it dropped (FINDING 66V-C)")
+
+    # A MISSING ARM REFUSES.
+    r4 = run(root=os.path.join(tmp, "nothing"))
+    chk(r4.returncode != 0 and "REFUSING" in (r4.stdout + r4.stderr),
+        "a missing arm REFUSES; it is never a bar of zero")
+
+    # DETERMINISM, the property the ordering comment claims.
+    import os as _os
+    e1 = dict(_os.environ, PYTHONHASHSEED="1")
+    e2 = dict(_os.environ, PYTHONHASHSEED="12345")
+    cmd = [sys.executable, __file__, "--a", arm, "--isa", isa, "--wps", wp]
+    s1 = subprocess.run(cmd, capture_output=True, text=True, env=e1).stdout
+    s2 = subprocess.run(cmd, capture_output=True, text=True, env=e2).stdout
+    chk(s1 == s2 and s1 != "",
+        "two hash seeds give ONE report, byte for byte")
+    print("arms=%d failures=%d" % (n, fails))
+    return 0 if fails == 0 else 1
+
 def main():
+    if "--selftest" in sys.argv:
+        i = sys.argv.index("--selftest")
+        tmp = (sys.argv[i + 1] if len(sys.argv) > i + 1
+               and not sys.argv[i + 1].startswith("-")
+               else "/tmp/dstbar_st")
+        return selftest(tmp)
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", required=True, help="arm dir (the tip)")
     ap.add_argument("--isa", action="append", default=None)

@@ -5,6 +5,16 @@ This page collects the things ChampSim Tracer deliberately doesn't do
 or doesn't do well.  Reaching for one of these against expectations is
 usually a sign you want a different tool, or a documented workaround.
 
+.. note::
+
+   An instruction missing from a trace because **QEMU does not execute
+   it** is not on this page and never will be.  The tracer cannot trace
+   what the emulator refuses, and a missing emulator feature is a fact
+   about QEMU with a fix path, not a category the tracer is out of.
+   Those are enumerated — family, encoding count, the fault each machine
+   actually delivers, and the change that closes it — in
+   :doc:`upstream_coverage`.
+
 Out-of-scope categories
 -----------------------
 

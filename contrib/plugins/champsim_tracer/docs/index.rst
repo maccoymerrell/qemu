@@ -90,6 +90,7 @@ as well as the tracer itself (an upcoming publication).
 
    architecture
    qemu_modifications
+   upstream_coverage
    extending
 
 .. toctree::

@@ -668,7 +668,7 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x45] = X86_OP_ENTRY3(VPSRLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x46] = X86_OP_ENTRY3(VPSRAV,      V,x,  H,x,       W,x,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
-
+    [0x82] = X86_OP_ENTRY3(INVPCID,   None,None, G,y, M,dq, chk(cpl0) cpuid(INVPCID) p_66),
     [0x90] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vpgatherdd/q */
     [0x91] = X86_OP_ENTRY3(VPGATHERQ, V,x,  H,x,  M,q,  vex12 cpuid(AVX2) p_66), /* vpgatherqd/q */
     [0x92] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vgatherdps/d */
@@ -2416,6 +2416,8 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
 
     case X86_FEAT_ADX:
         return (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_ADX);
+    case X86_FEAT_INVPCID:
+        return (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_INVPCID);
     case X86_FEAT_BMI1:
         return (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_BMI1);
     case X86_FEAT_BMI2:

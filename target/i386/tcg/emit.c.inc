@@ -2589,6 +2589,42 @@ static void gen_INSERTQ_r(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_insertq_r(tcg_env, OP_PTR0, OP_PTR2);
 }
 
+/*
+ * INVPCID -- the row exists for the FAULT, and the fault is raised before
+ * this function can be reached.
+ *
+ * The instruction is CPL0-only and QEMU-TCG implements no part of it.  What
+ * was wrong is not the absence of the operation, it is the ANSWER: at CPL 3
+ * on a machine that advertises the feature the architecture raises #GP(0),
+ * and with no decode-table row at all the decoder reached its default and
+ * raised #UD.  Measured on this host, `66 0f 38 82 /r` at CPL 3 with
+ * CPUID.(EAX=07H,ECX=0H):EBX.INVPCID = 1 on both machines:
+ *
+ *     native hardware   SIGSEGV   #GP(0)
+ *     qemu-x86_64       SIGILL    #UD
+ *
+ * and CPUID.INVPCID is 1 under qemu-x86_64 because target/i386/cpu.c sets it
+ * deliberately in user-only builds (d903259dd2), on the reasoning that a
+ * privileged-only feature "has no impact on any user-mode operation".  The
+ * FAULT is a user-mode operation, which is the part that reasoning does not
+ * reach.
+ *
+ * UNREACHABLE AT THIS TIP, BY TWO DIFFERENT ROUTES, and that is a statement
+ * rather than an assumption.  In user-only builds CPL is 3 and never 0, so
+ * X86_CHECK_cpl0 takes the #GP before any emitter runs.  In system-mode
+ * builds CPUID_7_0_EBX_KERNEL_FEATURES is 0, INVPCID is not in
+ * TCG_7_0_EBX_FEATURES, and the cpuid() check refuses the encoding with the
+ * same #UD those builds already give.  This body is therefore what happens
+ * only if a future change adds the feature to TCG_7_0_EBX_FEATURES without
+ * adding the TLB operation, and #UD is the honest answer to that: it leaves
+ * behaviour exactly as it is today rather than silently succeeding at a
+ * flush that did not happen.
+ */
+static void gen_INVPCID(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_illegal_opcode(s);
+}
+
 static void gen_INT(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_interrupt(s, decode->immediate);

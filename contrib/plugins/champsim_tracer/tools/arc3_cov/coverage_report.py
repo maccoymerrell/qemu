@@ -152,6 +152,16 @@ def refuse_if_stale(cov, allow_stale=False):
     re-probe and compare byte-for-byte, riscv64 and mipsel re-probe as part of
     their run -- so a green result here means every leg was re-run AND their
     tables post-date the build.
+
+    THIS IS THE LAST LINE, NOT THE FIRST.  Refusing here is correct and it is
+    also expensive: by the time this runs, four heterogeneous legs have taken
+    hours, and a relink anywhere in that window is discovered only once all of
+    them have been paid for.  Each REPRODUCE.sh therefore arms
+    ../settle_guard.sh before any of its own work -- it refuses to START on a
+    tree with pending build work, and hashes the subjects so a relink DURING a
+    leg is named by the leg it invalidated.  A run that came through those
+    guards cannot reach this one with a stale table; a run that did not is
+    exactly what this is still here to catch.
     """
     if not os.path.exists(ISAXCHECK):
         sys.exit('CANNOT CHECK FRESHNESS: no isaxcheck at %s.  This report '

@@ -13,6 +13,22 @@
 # Author: Maccoy Merrell.
 set -euo pipefail
 T="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # this directory, in-tree
+
+# ---- SETTLE BEFORE ANY WORK, AND STAMP FOR THE REST OF IT -------------------
+# A leg started against a tree with pending build work writes a table that is
+# stale before it is finished, and the only thing that notices is
+# coverage_report.py -- at PUBLISH, after all four legs have been paid for.
+# The same refusal is made HERE, where nothing has been spent yet, and the
+# subjects are hashed so that a relink DURING this leg is named by the leg it
+# invalidated rather than by a report four hours later.  The trap keeps this
+# leg's own exit status unless the guard has something to say.
+# See ../settle_guard.sh for the subjects and why `qemu-*` is not one.
+_SG="$T/../settle_guard.sh"
+_SG_STAMP=$(mktemp -t arc3_settle_aarch64.XXXXXX)
+"$_SG" arm "$_SG_STAMP"
+trap '_sg_rc=$?; "$_SG" check "$_SG_STAMP" || _sg_rc=3; rm -f "$_SG_STAMP"; \
+      exit $_sg_rc' EXIT
+
 D=${CST_COV_DIR:-/mnt/md0/QEMU/cst_runs/_arc3_cov}/aarch64
 Q=${CST_QEMU_ROOT:-/mnt/md0/QEMU/qemu}
 PY=${CST_PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}

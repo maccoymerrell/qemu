@@ -17,13 +17,14 @@ the one location; later waves cite these paths and nothing else.
 | `abandoned_families.py` | decompose the `...ABANDONED` write-list class by `(generic opcode, shape of the named prefix)`, so one reason with millions of rows becomes families a declaration can be aimed at |
 | `srcbar.py` | THE SOURCE BAR: the tip arm against the banked deletion arm, over `REACH=INSTRUCTION` rows only, decomposed by mechanism AND by family `(decode rule, mnemonic)` |
 | `mechclass.py` | the mechanism a source loss belongs to -- `Q-SILENT` / `R-REFUSED` / `R-SHORT` / `NO-BLOCK` / `SURV-ONLY` -- read off arm A's own row |
+| `barledger.py` | joins the bar's families to `BAR_CLASSES.tsv` and REFUSES unless EVERY family carries a disposition and a citation |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
 fail on it.  Run them all before quoting any of them -- with the runner, not
 by hand:
 
 ```sh
-./selftest_all.sh            # 22 instruments found, 22 green, 0 RED
+./selftest_all.sh            # 23 instruments found, 23 green, 0 RED
 ```
 
 **Do not write the loop out again.**  The loop that used to stand here named
@@ -188,3 +189,21 @@ correct zero about an incorrect wire — that is exactly how #230's 340 false
 call rows survived every arm.  `nodep_census.py` is absolute rather than
 differential and is the only instrument in this directory that can see such
 a fact.  Run it in every acceptance.
+
+## The bar's adjudication table
+
+`srcbar.py --tsv` turns the source bar into 170 families.  That is progress
+and it is not an answer: 170 rows nobody has ruled on is the same silence in
+a longer form.  `BAR_CLASSES.tsv` carries the disposition of each, and
+`barledger.py` makes the join TOTAL BY CONSTRUCTION -- a family matching no
+class refuses, a family matching two refuses, a class matching no family is
+reported DEAD, a `BLOCKED` row whose note asks no question refuses, and a
+disposition with no citation refuses.
+
+The three dispositions are exhaustive by rule of the program:
+`QEMU-STATES-IT` (QEMU's translation contains the read, the extraction does
+not carry it out -- a defect with a source site, and a wire change that owes
+R13 legs), `RULED` (an architectural fact or standing ruling says the
+register is not a source, so the arm that drops it is right -- and the row
+must carry a WHOLE-POPULATION arm, never a sample), and `BLOCKED` (a named
+question, written out).  There is no fourth answer and no silent row.

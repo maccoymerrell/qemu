@@ -264,8 +264,12 @@ def selftest(tmp):
     chk("THE BAR BY LOST REGISTER: 3 distinct" in out,
         "the register table enumerates the BAR's losses, not the whole "
         "losing population's")
-    chk("R2                          2" in out.replace("R2  ", "R2  "),
+    chk("R2                          2" in out,
         "and it counts encodings per register -- R2 is lost by two of them")
+    chk("decode_insn32/mul" in out.split("BY FAMILY AND LOST REGISTER")[1]
+        .split("BY LOST REGISTER")[0],
+        "each family is crossed with the register it loses, so a family "
+        "losing two registers is two adjudications and not one")
     # TRUNCATION SAYS SO
     out_t = run("--famtop", "1").stdout
     chk("NOT SHOWN (--famtop 1)" in out_t,
@@ -308,12 +312,22 @@ def main():
     #: 0 = every family.  A bar decomposed for the purpose of aiming a
     #: declaration at each row must not silently stop at the interesting ones.
     ap.add_argument("--famtop", type=int, default=0)
+    #: THE FAMILY TABLE AS DATA.  The report is for reading; the ledger that
+    #: adjudicates each family is written against a table, and re-parsing a
+    #: printed report to get one is how a column width becomes a semantic.
+    ap.add_argument("--tsv", default=None,
+                    help="write the family/register rows here as TSV")
     a = ap.parse_args()
     isas = a.isa or list(ISAS)
     wps = a.wps.split()
 
     grand = collections.Counter()
     grand_r = collections.Counter()
+    tsv = None
+    if a.tsv:
+        tsv = open(a.tsv, "w")
+        tsv.write("#isa\trule\tmnem\treg\tencodings\tfam_enc\tfam_reg\t"
+                  "mech\n")
     excl_rules = {}
     tot_all = collections.Counter()
 
@@ -413,6 +427,20 @@ def main():
                   % (n, famreg[(rule, mnem)], rule[:44], mnem[:14],
                      mechs[:46]))
         print_trunc(frows, fshown, "      ", a.famtop, "family/families")
+        if tsv is not None:
+            for (rule, mnem, r), nrow in ordered(famrow):
+                fam = (rule, mnem)
+                tsv.write("%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\n"
+                          % (isa, rule, mnem, r, nrow, famenc[fam],
+                             famreg[fam],
+                             ",".join("%s=%d" % kv
+                                      for kv in ordered(fammech[fam]))))
+        print("  THE BAR BY FAMILY AND LOST REGISTER: %d rows" % len(famrow))
+        xrows = ordered(famrow)
+        xshown = xrows[:a.famtop] if a.famtop else xrows
+        for (rule, mnem, r), n in xshown:
+            print("      %7d  %-44s %-14s %s" % (n, rule[:44], mnem[:14], r))
+        print_trunc(xrows, xshown, "      ", a.famtop, "row(s)")
         print("  THE BAR BY LOST REGISTER: %d distinct" % len(barreg))
         rrows = ordered(barreg)
         rshown = rrows[:a.famtop] if a.famtop else rrows
@@ -435,6 +463,8 @@ def main():
     print("  EXCLUDED                          : %d encodings / %d registers"
           % (tot - ins, sum(grand_r.values())
              - sum(v for k, v in grand_r.items() if k[0] == "INSTRUCTION")))
+    if tsv is not None:
+        tsv.close()
     print()
     print("=== THE EXCLUDED LOSING POPULATION, BY ISA / CLASS / RULE ===")
     for key in sorted(excl_rules):

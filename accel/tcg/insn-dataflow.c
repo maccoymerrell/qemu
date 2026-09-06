@@ -42,6 +42,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op-common.h"
@@ -5538,8 +5539,39 @@ void insn_dataflow_declare_regfile(const char *base, const char *const *names,
             return;             /* the same declaration twice */
         }
     }
+    /*
+     * A DECLARATION THAT CANNOT BE STORED IS NOT A DECLARATION THAT CANNOT BE
+     * TRUE.
+     *
+     * The two refusals above reject a declaration the target could not have
+     * meant -- an empty file, a stride that overlaps its own elements -- and
+     * returning is right for both: nothing downstream can use them and
+     * nothing downstream is worse off without them.  THIS one is different.
+     * The declaration is well formed and true, and the only reason it is not
+     * kept is that the array is full; every access to those bytes then
+     * arrives downstream as an anonymous range, and the target's source still
+     * reads as though the file were named.
+     *
+     * It is not hypothetical.  target/i386 crossed the old bound of 24 and
+     * lost `fpregs` -- the x87 container -- with no diagnostic anywhere, and
+     * the loss was found only by adding three more files and watching every
+     * MMX instruction's destination stop resolving.  A capacity that fails
+     * silently is the exact shape this tree files against: a check whose
+     * subject went missing must FAIL, not pass quietly.
+     *
+     * Aborting is proportionate because the set is STATIC.  Declarations are
+     * made once, from target init, out of a list the build fixes; an overflow
+     * is therefore reproducible on the first run of every guest and cannot be
+     * data-dependent.  There is no run in which it is survivable and no run in
+     * which it stays hidden.
+     */
     if (df_n_regfile >= INSN_DF_MAX_REGFILES) {
-        return;
+        error_report("insn-dataflow: %s declares more than %d register files; "
+                     "'%s' at env offset %u was refused.  Raise "
+                     "INSN_DF_MAX_REGFILES.",
+                     TARGET_NAME, INSN_DF_MAX_REGFILES,
+                     base ? base : (names[0] ? names[0] : "?"), off);
+        abort();
     }
     df_regfile[df_n_regfile++] = (DfRegFile){
         .base = base, .names = names, .off = off,

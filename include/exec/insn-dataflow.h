@@ -83,10 +83,25 @@
 /*
  * How many register FILES a target may declare (see
  * insn_dataflow_declare_regfile()).  One per array of architectural registers
- * that no TCG global names, plus the scalars beside them; the widest in-tree
- * target uses a handful.
+ * that no TCG global names, plus the scalars beside them.
+ *
+ * THE NUMBER IS MEASURED, not estimated.  The bound used to be 24 with a
+ * comment saying "the widest in-tree target uses a handful", and the
+ * sentence had stopped being true: target/i386 declares its files one
+ * register at a time -- four control registers, ten descriptor-table fields,
+ * two x87 status fields under one name -- and had reached TWENTY-FIVE calls,
+ * so the twenty-fifth was refused.  Silently, at target init, with the caller
+ * getting a void return.  What it cost is `fpregs`, the x87 CONTAINER whose
+ * whole documented job is to justify a published ST(i) that a helper reached
+ * through the whole array (#277): the declaration was in the source, read
+ * like it was in effect, and was not.
+ *
+ * Per target, at this tip: i386 28, aarch64 8, riscv64 7, mipsel 5.  The
+ * bound is set well above the widest so that a target adding a file is a
+ * source change and not a capacity decision, and the overflow is now an
+ * ABORT rather than a return -- see insn_dataflow_declare_regfile().
  */
-#define INSN_DF_MAX_REGFILES  24
+#define INSN_DF_MAX_REGFILES  64
 
 /*
  * Representation SELECTORS -- globals that say how a lowered register's

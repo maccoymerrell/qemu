@@ -1819,6 +1819,47 @@ static bool df_field_named(uint32_t off, uint32_t size)
     return insn_dataflow_field_reg(off, size, nm, sizeof(nm));
 }
 
+/*
+ * THE SCRATCH SLOT'S OWN ACCOUNT: an UNNAMED env range this instruction wrote
+ * before it read, whose read therefore carries the write's provenance and not
+ * a fresh anonymous bit.
+ *
+ * COVERAGE IS WHAT MAKES IT SOUND, and the `have == need` test is not a
+ * formality.  If every byte of the read was written by this instruction, the
+ * previous contents are dead and forwarding says exactly what happened.  If
+ * any byte was not, the range is carrying something from before and
+ * forwarding would publish a set SHORT by whatever fed it -- so the range is
+ * interned as itself and refuses downstream, which is the direction R7.3
+ * requires.  A range some target DECLARED is refused outright, at both ends:
+ * a named register's stale bytes are guest state and are nobody's scratch.
+ *
+ * WHAT IT DOES NOT REACH YET, and this is FINDING 82-A's M1.  Only the
+ * SCALAR env-load path consults this.  A helper's pointer ARGUMENT reaches
+ * the same kind of range by a different route -- x86 stages a memory operand
+ * into CPUX86State::xmm_t0 / mmx_t0 and hands the helper a pointer to it --
+ * and that path interns the offset directly, so `unpcklps (%rax),%xmm3`
+ * abandons its write list on a range nothing declared while the register form
+ * of the same instruction publishes.  Measured at the intern site:
+ *
+ *     helper=punpckldq_xmm arg=3 eo=2912 extent=64 named=0
+ *     helper=psignb_xmm    arg=3 eo=2912 extent=64 named=0
+ *     helper=addps_xmm     arg=3 eo=2912 extent=64 named=0
+ *
+ * DECLARING THE STAGING FILE IS REFUSED, not deferred: target/i386's own
+ * emitter states at gen_note_vector_operand_read() that "stating xmm_t0 would
+ * put a register on the wire the encoding does not name", and R15 says a
+ * lowering decision is not architectural truth.  The remedy is this rule
+ * reaching the helper path, where the true provenance is the MEMOP the
+ * staging store carried -- a fact the wire already has a bit for.
+ *
+ * The blocker is the EXTENT.  `df_helper_argsize()` answers with sizeof() the
+ * pointee the helper's C signature declares -- 64 for a `ZMMReg *` -- while
+ * the staging store wrote 16 or 32, so the coverage test above fails on the
+ * over-approximation rather than on anything about the instruction.  The
+ * extent has to become the operand's before the forward can be applied there,
+ * and loosening the coverage test instead would trade a sound rule for a
+ * convenient one on every target at once.
+ */
 static bool df_field_forward(const InsnDataflow *d, uint32_t off, uint32_t size,
                              uint64_t *out)
 {

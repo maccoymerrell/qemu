@@ -547,6 +547,31 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * THE TIME-STAMP COUNTER AND IA32_TSC_AUX, x86's two read-only MSRs with
+     * an instruction of their own -- DECLARED by target/i386/tcg/translate.c
+     * and absent from the i386 GDB stub's namespace, which carries no MSR at
+     * all.  The same shape as XCR0 above.
+     *
+     * Neither word is invented.  REG_SYSTIMER is the vocabulary's word for
+     * "a counter that advances on its own" and the wire has always published
+     * it for `rdtsc` -- it is what the survivor row for that mnemonic
+     * carries, and what PUB holds on every `rdtsc` and `rdtscp` row.
+     * IA32_TSC_AUX has no finer class than the residual privileged-file word,
+     * and REG_SYS is what the wire publishes for `rdpid`.  So both connect a
+     * spelling to a word the wire already answers in.
+     *
+     * The witness is `rdpid`: gen_note_tsc_aux_read() states the range, the
+     * declaration gives it the name `tsc_aux`, and without this fold the
+     * named read arrived with no tracer word and was dropped -- a statement
+     * that looked like it had landed and had not.
+     */
+    if (!strcmp(name, "tsc")) {
+        return REG_SYSTIMER;
+    }
+    if (!strcmp(name, "tsc_aux")) {
+        return REG_SYS;
+    }
+    /*
      * ZICFILP'S EXPECTED-LANDING-PAD STATE, declared by
      * target/riscv/translate.c as `elp` and absent from the RISC-V GDB stub's
      * namespace -- the same shape as XCR0 above.

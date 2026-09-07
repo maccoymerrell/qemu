@@ -1352,6 +1352,42 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
  * second spelling to keep in step -- the form gen_note_far_call_pushes()
  * already uses for RSP.
  */
+/*
+ * THE MSRs `rdpid`, `rdtsc` AND `rdtscp` READ.
+ *
+ * None of the three has an op that names its source.  helper_rdpid() returns
+ * env->tsc_aux -- IA32_TSC_AUX -- and helper_rdtsc() reads env->tsc behind a
+ * call the extraction cannot bound, so `rdtscp` arrives R-REFUSED with an
+ * EMPTY read list and `rdpid` arrives silent.  The bar measured 464
+ * registers across the two, REG_SYS and REG_SYSTIMER, published by the
+ * operand walk alone.
+ *
+ * R20 IS WHY THE DECODE SITE MAY SAY IT.  Which MSR each opcode reads is a
+ * STATIC fact of the opcode -- there is no ModRM to consult and no runtime
+ * index -- so the site that chose the helper knows the answer once, at
+ * translation time, for every execution of those bytes.  Nothing is
+ * observed and nothing is derived.  R7.3 says the same from the other side:
+ * the instruction names the register, and the helper's opacity is not a
+ * licence to drop it.
+ *
+ * BY RANGE, because the range IS the register: env->tsc and env->tsc_aux are
+ * declared in tcg_x86_init() under their architectural names, so the
+ * declaration naming every other access to those bytes names these too.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_tsc_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, tsc),
+                                       sizeof(((CPUX86State *)0)->tsc));
+}
+
+static void gen_note_tsc_aux_read(void)
+{
+    insn_dataflow_note_stated_read_env(offsetof(CPUX86State, tsc_aux),
+                                       sizeof(((CPUX86State *)0)->tsc_aux));
+}
+
 static void gen_note_gpr_read(int n)
 {
     insn_dataflow_note_stated_read_env(
@@ -4525,6 +4561,8 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 goto illegal_op;
             }
             if (s->prefix & PREFIX_REPZ) {
+                /* IA32_TSC_AUX; see gen_note_tsc_aux_read(). */
+                gen_note_tsc_aux_read();
                 if (!(s->cpuid_7_0_ecx_features & CPUID_7_0_ECX_RDPID)) {
                     goto illegal_op;
                 }
@@ -4961,6 +4999,8 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             gen_update_cc_op(s);
             gen_update_eip_cur(s);
             translator_io_start(&s->base);
+            gen_note_tsc_read();
+            gen_note_tsc_aux_read();
             gen_helper_rdtsc(tcg_env);
             gen_helper_rdpid(s->T0, tcg_env);
             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);
@@ -5428,6 +5468,30 @@ void tcg_x86_init(void)
                                   offsetof(CPUX86State, xcr0),
                                   sizeof(((CPUX86State *)0)->xcr0),
                                   sizeof(((CPUX86State *)0)->xcr0), 1);
+
+    /*
+     * THE TIME-STAMP COUNTER AND IA32_TSC_AUX.
+     *
+     * `rdtsc`, `rdtscp` and `rdpid` are the whole subject and none of them
+     * has an op that names either member: helper_rdtsc() reads env->tsc
+     * behind an opaque call, and helper_rdpid() returns env->tsc_aux.  The
+     * bar measured both -- 272 registers on `rdpid` and 192 on `rdtscp`,
+     * REG_SYS and REG_SYSTIMER -- with an EMPTY QEMU read list.
+     *
+     * Declared under the MSR names the architecture gives them, for the
+     * reason xcr0 above is declared under its: the read arrives as a
+     * CPUArchState byte offset and only this file knows which register that
+     * offset is.  Neither is in the GDB stub's namespace, which carries no
+     * MSR at all, so the declaration is the only route a name can take.
+     */
+    insn_dataflow_declare_regfile("tsc", NULL,
+                                  offsetof(CPUX86State, tsc),
+                                  sizeof(((CPUX86State *)0)->tsc),
+                                  sizeof(((CPUX86State *)0)->tsc), 1);
+    insn_dataflow_declare_regfile("tsc_aux", NULL,
+                                  offsetof(CPUX86State, tsc_aux),
+                                  sizeof(((CPUX86State *)0)->tsc_aux),
+                                  sizeof(((CPUX86State *)0)->tsc_aux), 1);
 
     /*
      * THE CONTROL REGISTERS.

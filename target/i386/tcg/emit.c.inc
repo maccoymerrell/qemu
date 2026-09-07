@@ -4049,8 +4049,34 @@ static void gen_RDMSR(DisasContext *s, X86DecodedInsn *decode)
 #define gen_RDMSR gen_unreachable
 #endif
 
+/*
+ * THE COUNTER SELECTOR `rdpmc` READS.
+ *
+ * `0f33` publishes REG_CTRL4, REG_SYS and REG_GPR1 and QEMU stated only the
+ * first: gen_svm_check_intercept()'s CR4.PCE gate is in the op stream and
+ * nothing else is.  The SDM defines RDPMC as selecting a performance counter
+ * with ECX and returning it in EDX:EAX, and helper_rdpmc() on this build
+ * raises #GP rather than reading a counter -- which is a MODEL fact.  R16
+ * records the ISA-defined dependency regardless of machine state, in
+ * 22d7666262's own words, so ECX is stated at the decode site where the
+ * opcode settles it (R20).
+ *
+ * THE SECOND LOST REGISTER IS NOT STATED, and that is a refusal rather than
+ * an omission: REG_SYS here is the performance counter itself, and this
+ * build has no CPUArchState member for it.  There is no range to give and no
+ * name to give, and inventing either is what the note's own header refuses.
+ * It stays on the bar with this sentence behind it.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_rdpmc_selector(void)
+{
+    gen_note_gpr_read(R_ECX);
+}
+
 static void gen_RDPMC(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_note_rdpmc_selector();
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     translator_io_start(&s->base);

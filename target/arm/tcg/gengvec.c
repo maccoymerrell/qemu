@@ -278,7 +278,45 @@ void gen_gvec_usra(unsigned vece, uint32_t rd_ofs, uint32_t rm_ofs,
     if (shift < (8 << vece)) {
         tcg_gen_gvec_2i(rd_ofs, rm_ofs, opr_sz, max_sz, shift, &ops[vece]);
     } else {
-        /* Nop, but we do need to clear the tail. */
+        /*
+         * Nop, but we do need to clear the tail.
+         *
+         * THE ACCUMULATE SOURCE STILL HAS TO BE STATED, AND THIS IS THE ONLY
+         * PLACE THAT CAN STATE IT.
+         *
+         * USRA is `Vd = Vd + (Vn >> shift)`.  At shift == esize the shifted
+         * term is all zeros, so the result IS the old Vd -- which makes Vd an
+         * architectural SOURCE of the value this instruction produces, and a
+         * renaming register file has to respect the edge from whatever last
+         * wrote it (R7).
+         *
+         * Nothing downstream can find that read, because nothing emits it.
+         * tcg_gen_gvec_mov() takes an early-out when dofs == aofs
+         * (tcg/tcg-op-gvec.c) and generates NO move: all that is left is
+         * expand_clr() writing zeros into the SVE tail, which reads nothing.
+         * Measured on `usra v0.16b, v1.16b, #8` under `-d op`: three stores of
+         * zero to v0's tail, no ld_vec at all, and no store to v0's low 128
+         * bits -- which is exactly how the old value survives.  The control is
+         * the sibling encoding in the same TB, `usra v2.16b, v1.16b, #4`,
+         * where QEMU DOES emit the accumulate and the extraction carries the
+         * Vd read perfectly well.  So the read here is ABSENT, not
+         * misclassified, and a rule that relabels an existing read has
+         * nothing at this site to relabel.
+         *
+         * AND THE ABSENCE CANNOT BE INTERPRETED.  clear_vec_high() reaches
+         * tcg_gen_gvec_mov(ofs, ofs) through the identical construct and emits
+         * the identical three stores of zero, and THERE the absence of a Vd
+         * read is correct: a narrowing write does not read the register it
+         * overwrites (R7.1).  Same source construct, same op stream, opposite
+         * correct answers -- so the op stream carries no signal either way and
+         * only a positive statement from the emitter, which knows which of the
+         * two it is emitting, can distinguish them.
+         *
+         * The extent is opr_sz and not max_sz: the operative portion is what
+         * the instruction returns unchanged, while [opr_sz, max_sz) is written
+         * zero by the tail clear and read by nothing.
+         */
+        insn_dataflow_note_stated_read_env(rd_ofs, opr_sz);
         tcg_gen_gvec_mov(vece, rd_ofs, rd_ofs, opr_sz, max_sz);
     }
 }
@@ -476,7 +514,17 @@ void gen_gvec_srsra(unsigned vece, uint32_t rd_ofs, uint32_t rm_ofs,
      * I.e. always zero.  With accumulation, this leaves D unchanged.
      */
     if (shift == (8 << vece)) {
-        /* Nop, but we do need to clear the tail. */
+        /*
+         * Nop, but we do need to clear the tail.
+         *
+         * SRSRA accumulates into Vd exactly as USRA does, and at shift ==
+         * esize the rounded signed term is always zero, so the result is the
+         * old Vd and Vd is a source of it.  tcg_gen_gvec_mov(ofs, ofs) emits
+         * no move, so the read is stated here or nowhere; see the long note
+         * in gen_gvec_usra() for the measurement and for why the identical
+         * construct in clear_vec_high() must NOT carry one.
+         */
+        insn_dataflow_note_stated_read_env(rd_ofs, opr_sz);
         tcg_gen_gvec_mov(vece, rd_ofs, rd_ofs, opr_sz, max_sz);
     } else {
         tcg_gen_gvec_2i(rd_ofs, rm_ofs, opr_sz, max_sz, shift, &ops[vece]);
@@ -770,7 +818,17 @@ void gen_gvec_sri(unsigned vece, uint32_t rd_ofs, uint32_t rm_ofs,
     if (shift < (8 << vece)) {
         tcg_gen_gvec_2i(rd_ofs, rm_ofs, opr_sz, max_sz, shift, &ops[vece]);
     } else {
-        /* Nop, but we do need to clear the tail. */
+        /*
+         * Nop, but we do need to clear the tail.
+         *
+         * SRI inserts the shifted bits of Vn into Vd and PRESERVES the bits it
+         * does not write; at shift == esize it writes none of them, so the
+         * result is the old Vd in full and Vd is a source of it.  The comment
+         * two lines up says so in the emitter's own words -- "leaves
+         * destination unchanged" -- and tcg_gen_gvec_mov(ofs, ofs) emits no
+         * move to carry it; see the long note in gen_gvec_usra().
+         */
+        insn_dataflow_note_stated_read_env(rd_ofs, opr_sz);
         tcg_gen_gvec_mov(vece, rd_ofs, rd_ofs, opr_sz, max_sz);
     }
 }

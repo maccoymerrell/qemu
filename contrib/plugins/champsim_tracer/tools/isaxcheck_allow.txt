@@ -9689,8 +9689,8 @@ mipsel SR-rd-phantom * +REG_SYSEXC
 # pass evidence, not here: it reads 0 by construction.
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
-#   fields        662     1115     1059      864     3700
-#   boundary      639     1115     1016      233     3003
+#   fields        888     1115     1059      864     3926
+#   boundary      865     1115     1016      233     3229
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -9717,21 +9717,20 @@ mipsel SR-rd-phantom * +REG_SYSEXC
 # reach, or one whose last member was closed -- and either way the
 # name is worth being able to find:
 #
-#   x86_64   X-SELFRELOAD
 #   aarch64  A-FROZEN
 #   mipsel   M-DSPIMM
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/exec135/srcencorp/tip81a
-#   x86_64    6820116 rows md5 e1ceb15a3098411c051102d0ed3f5f8a
+# CORPUS: /mnt/md0/QEMU/cst_runs/verify63/srcencorp/tip84
+#   x86_64    6826116 rows md5 3a56cc727dfe8688eaa537b6ed5ea471
 #   aarch64   1408171 rows md5 d407a13138a9281cb541393508f20c98
 #   riscv64     86889 rows md5 baf8571353b1e382588425d728c090ad
 #   mipsel     548886 rows md5 9a73d0219983be6ce43a88aaac968bf4
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
-#   SO_SHA=f19f2f35e390144c
+#   SO_SHA=9efbb8aaf16e266e
 #   ISAX_SHA=e525bf9e9aa89ca5
-#   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
+#   ALL_ARMS_DONE
 #
 # HOW TO REGENERATE:
 #   isax_srcenc_gate.sh run <build> <arms> <corpus>
@@ -10289,8 +10288,272 @@ x86_64 SR-rd-phantom swapgs +REG_SEG4
 x86_64 SR-rd-phantom xlatb +REG_SEG3
 x86_64 SR-rd-phantom xlatb +REG_SEG4
 
+# --- X-FPSTATUS: the softfloat status file the FP datapath operates under, which LLVM has no operand for.
+#     228 signature(s), 1309825 encodings at this tip.
+#
+# target/i386 keeps one `float_status` per FP datapath -- x87 `fp_status`,
+# 3DNow! `mmx_status`, SSE/AVX `sse_status` -- and it holds the rounding mode,
+# the flush-to-zero and denormals-are-zero controls and the exception masks
+# that MXCSR and the x87 control word are DECODED INTO.  An arithmetic,
+# compare or convert form reads it because the value it produces depends on
+# it: `float64_add(a, b, &env->sse_status)` rounds by what it finds there.
+#
+# QEMU STATES THE READ, per helper, in its own generated usage table --
+# `dfu_addsd_env` names offsetof(CPUArchState, sse_status) with INSN_DF_RD,
+# from ops_sse.h -- and bb24f882b2 declared the three files so the stated read
+# arrives carrying a NAME.  The consumer's fold_nonarch() puts all three on
+# REG_FCSR, the one generic word the vocabulary gives an FP control-and-status
+# file it cannot split.
+#
+# LLVM'S MCInstrDesc HAS NO OPERAND FOR IT ON THESE OPCODES.  MXCSR is not in
+# the Uses list of `addsd`, `mulps`, `cvtsi2sd` or any of their siblings; the
+# x86 backend models the control word only where the instruction NAMES it
+# (`ldmxcsr`, `stmxcsr`).  The silence is structural, the same shape as the
+# control-register family above, and the wire is the side that states the
+# dependency.
+#
+# WHERE THE DIFFERENCE SET ALSO CARRIES REG_VEC#, the second member is the
+# scalar-preserve read X-UPPERLANE justifies below on its own rows -- a legacy
+# scalar form's destination survives above the element it writes.  Two
+# independent reference gaps on one signature; both are named and neither is
+# being made to pay for the other.
+#
+# THE x87 CLASSES BELOW KEEP THEIR OWN SUBJECTS.  X-SELFRELOAD's forms write
+# the control word and re-derive this file from what they just wrote, and
+# X-X87STATE's read the status word to resolve a stack slot; both are
+# different facts about the same generic name and both are adjudicated where
+# they are, not here.
+x86_64 SR-rd-phantom addpd +REG_FCSR
+x86_64 SR-rd-phantom addps +REG_FCSR
+x86_64 SR-rd-phantom addsd +REG_FCSR
+x86_64 SR-rd-phantom addss +REG_FCSR
+x86_64 SR-rd-phantom addsubpd +REG_FCSR
+x86_64 SR-rd-phantom addsubps +REG_FCSR
+x86_64 SR-rd-phantom cmpeqpd +REG_FCSR
+x86_64 SR-rd-phantom cmpeqps +REG_FCSR
+x86_64 SR-rd-phantom cmpeqsd +REG_FCSR
+x86_64 SR-rd-phantom cmpeqss +REG_FCSR
+x86_64 SR-rd-phantom cmppd +REG_FCSR
+x86_64 SR-rd-phantom cmpps +REG_FCSR
+x86_64 SR-rd-phantom cmpsd +REG_FCSR
+x86_64 SR-rd-phantom cmpss +REG_FCSR
+x86_64 SR-rd-phantom comisd +REG_FCSR
+x86_64 SR-rd-phantom comiss +REG_FCSR
+x86_64 SR-rd-phantom cvtdq2pd +REG_FCSR
+x86_64 SR-rd-phantom cvtdq2ps +REG_FCSR
+x86_64 SR-rd-phantom cvtpd2dq +REG_FCSR
+x86_64 SR-rd-phantom cvtpd2pi +REG_FCSR
+x86_64 SR-rd-phantom cvtpd2ps +REG_FCSR
+x86_64 SR-rd-phantom cvtpi2pd +REG_FCSR
+x86_64 SR-rd-phantom cvtpi2ps +REG_FCSR
+x86_64 SR-rd-phantom cvtps2dq +REG_FCSR
+x86_64 SR-rd-phantom cvtps2pd +REG_FCSR
+x86_64 SR-rd-phantom cvtps2pi +REG_FCSR
+x86_64 SR-rd-phantom cvtsd2si +REG_FCSR
+x86_64 SR-rd-phantom cvtsd2ss +REG_FCSR
+x86_64 SR-rd-phantom cvtsi2sdl +REG_FCSR
+x86_64 SR-rd-phantom cvtsi2sdq +REG_FCSR
+x86_64 SR-rd-phantom cvtsi2ssl +REG_FCSR
+x86_64 SR-rd-phantom cvtsi2ssq +REG_FCSR
+x86_64 SR-rd-phantom cvtss2sd +REG_FCSR
+x86_64 SR-rd-phantom cvtss2si +REG_FCSR
+x86_64 SR-rd-phantom cvttpd2dq +REG_FCSR
+x86_64 SR-rd-phantom cvttpd2pi +REG_FCSR
+x86_64 SR-rd-phantom cvttps2dq +REG_FCSR
+x86_64 SR-rd-phantom cvttps2pi +REG_FCSR
+x86_64 SR-rd-phantom cvttsd2si +REG_FCSR
+x86_64 SR-rd-phantom cvttss2si +REG_FCSR
+x86_64 SR-rd-phantom divpd +REG_FCSR
+x86_64 SR-rd-phantom divps +REG_FCSR
+x86_64 SR-rd-phantom divsd +REG_FCSR
+x86_64 SR-rd-phantom divss +REG_FCSR
+x86_64 SR-rd-phantom dppd +REG_FCSR
+x86_64 SR-rd-phantom dpps +REG_FCSR
+x86_64 SR-rd-phantom haddpd +REG_FCSR
+x86_64 SR-rd-phantom haddps +REG_FCSR
+x86_64 SR-rd-phantom hsubpd +REG_FCSR
+x86_64 SR-rd-phantom hsubps +REG_FCSR
+x86_64 SR-rd-phantom maxpd +REG_FCSR
+x86_64 SR-rd-phantom maxps +REG_FCSR
+x86_64 SR-rd-phantom maxsd +REG_FCSR
+x86_64 SR-rd-phantom maxss +REG_FCSR
+x86_64 SR-rd-phantom minpd +REG_FCSR
+x86_64 SR-rd-phantom minps +REG_FCSR
+x86_64 SR-rd-phantom minsd +REG_FCSR
+x86_64 SR-rd-phantom minss +REG_FCSR
+x86_64 SR-rd-phantom mulpd +REG_FCSR
+x86_64 SR-rd-phantom mulps +REG_FCSR
+x86_64 SR-rd-phantom mulsd +REG_FCSR
+x86_64 SR-rd-phantom mulss +REG_FCSR
+x86_64 SR-rd-phantom rcpps +REG_FCSR
+x86_64 SR-rd-phantom rcpss +REG_FCSR
+x86_64 SR-rd-phantom roundpd +REG_FCSR
+x86_64 SR-rd-phantom roundps +REG_FCSR
+x86_64 SR-rd-phantom roundsd +REG_FCSR
+x86_64 SR-rd-phantom roundss +REG_FCSR
+x86_64 SR-rd-phantom rsqrtps +REG_FCSR
+x86_64 SR-rd-phantom rsqrtss +REG_FCSR
+x86_64 SR-rd-phantom sqrtpd +REG_FCSR
+x86_64 SR-rd-phantom sqrtps +REG_FCSR
+x86_64 SR-rd-phantom sqrtsd +REG_FCSR
+x86_64 SR-rd-phantom sqrtss +REG_FCSR
+x86_64 SR-rd-phantom subpd +REG_FCSR
+x86_64 SR-rd-phantom subps +REG_FCSR
+x86_64 SR-rd-phantom subsd +REG_FCSR
+x86_64 SR-rd-phantom subss +REG_FCSR
+x86_64 SR-rd-phantom ucomisd +REG_FCSR
+x86_64 SR-rd-phantom ucomiss +REG_FCSR
+x86_64 SR-rd-phantom vaddpd +REG_FCSR
+x86_64 SR-rd-phantom vaddps +REG_FCSR
+x86_64 SR-rd-phantom vaddsd +REG_FCSR
+x86_64 SR-rd-phantom vaddss +REG_FCSR
+x86_64 SR-rd-phantom vaddsubpd +REG_FCSR
+x86_64 SR-rd-phantom vaddsubps +REG_FCSR
+x86_64 SR-rd-phantom vcmpeqpd +REG_FCSR
+x86_64 SR-rd-phantom vcmpeqps +REG_FCSR
+x86_64 SR-rd-phantom vcmpeqsd +REG_FCSR
+x86_64 SR-rd-phantom vcmpeqss +REG_FCSR
+x86_64 SR-rd-phantom vcmplt_oqpd +REG_FCSR
+x86_64 SR-rd-phantom vcmplt_oqps +REG_FCSR
+x86_64 SR-rd-phantom vcmplt_oqsd +REG_FCSR
+x86_64 SR-rd-phantom vcmplt_oqss +REG_FCSR
+x86_64 SR-rd-phantom vcmppd +REG_FCSR
+x86_64 SR-rd-phantom vcmpps +REG_FCSR
+x86_64 SR-rd-phantom vcmpsd +REG_FCSR
+x86_64 SR-rd-phantom vcmpss +REG_FCSR
+x86_64 SR-rd-phantom vcomisd +REG_FCSR
+x86_64 SR-rd-phantom vcomiss +REG_FCSR
+x86_64 SR-rd-phantom vcvtdq2pd +REG_FCSR
+x86_64 SR-rd-phantom vcvtdq2ps +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2dq +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2dqx +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2dqy +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2ps +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2psx +REG_FCSR
+x86_64 SR-rd-phantom vcvtpd2psy +REG_FCSR
+x86_64 SR-rd-phantom vcvtph2ps +REG_FCSR
+x86_64 SR-rd-phantom vcvtps2dq +REG_FCSR
+x86_64 SR-rd-phantom vcvtps2pd +REG_FCSR
+x86_64 SR-rd-phantom vcvtps2ph +REG_FCSR
+x86_64 SR-rd-phantom vcvtsd2si +REG_FCSR
+x86_64 SR-rd-phantom vcvtsd2ss +REG_FCSR
+x86_64 SR-rd-phantom vcvtsi2sdl +REG_FCSR
+x86_64 SR-rd-phantom vcvtsi2sdl +REG_FCSR,REG_VEC#
+x86_64 SR-rd-phantom vcvtsi2sdq +REG_FCSR
+x86_64 SR-rd-phantom vcvtsi2sdq +REG_FCSR,REG_VEC#
+x86_64 SR-rd-phantom vcvtsi2ssl +REG_FCSR
+x86_64 SR-rd-phantom vcvtsi2ssq +REG_FCSR
+x86_64 SR-rd-phantom vcvtss2sd +REG_FCSR
+x86_64 SR-rd-phantom vcvtss2si +REG_FCSR
+x86_64 SR-rd-phantom vcvttpd2dq +REG_FCSR
+x86_64 SR-rd-phantom vcvttpd2dqx +REG_FCSR
+x86_64 SR-rd-phantom vcvttpd2dqy +REG_FCSR
+x86_64 SR-rd-phantom vcvttps2dq +REG_FCSR
+x86_64 SR-rd-phantom vcvttsd2si +REG_FCSR
+x86_64 SR-rd-phantom vcvttss2si +REG_FCSR
+x86_64 SR-rd-phantom vdivpd +REG_FCSR
+x86_64 SR-rd-phantom vdivps +REG_FCSR
+x86_64 SR-rd-phantom vdivsd +REG_FCSR
+x86_64 SR-rd-phantom vdivss +REG_FCSR
+x86_64 SR-rd-phantom vdppd +REG_FCSR
+x86_64 SR-rd-phantom vdpps +REG_FCSR
+x86_64 SR-rd-phantom vfmadd132pd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd132ps +REG_FCSR
+x86_64 SR-rd-phantom vfmadd132sd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd132ss +REG_FCSR
+x86_64 SR-rd-phantom vfmadd213pd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd213ps +REG_FCSR
+x86_64 SR-rd-phantom vfmadd213sd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd213ss +REG_FCSR
+x86_64 SR-rd-phantom vfmadd231pd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd231ps +REG_FCSR
+x86_64 SR-rd-phantom vfmadd231sd +REG_FCSR
+x86_64 SR-rd-phantom vfmadd231ss +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub132pd +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub132ps +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub213pd +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub213ps +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub231pd +REG_FCSR
+x86_64 SR-rd-phantom vfmaddsub231ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsub132pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub132ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsub132sd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub132ss +REG_FCSR
+x86_64 SR-rd-phantom vfmsub213pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub213ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsub213sd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub213ss +REG_FCSR
+x86_64 SR-rd-phantom vfmsub231pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub231ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsub231sd +REG_FCSR
+x86_64 SR-rd-phantom vfmsub231ss +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd132pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd132ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd213pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd213ps +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd231pd +REG_FCSR
+x86_64 SR-rd-phantom vfmsubadd231ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd132pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd132ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd132sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd132ss +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd213pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd213ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd213sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd213ss +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd231pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd231ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd231sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmadd231ss +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub132pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub132ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub132sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub132ss +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub213pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub213ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub213sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub213ss +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub231pd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub231ps +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub231sd +REG_FCSR
+x86_64 SR-rd-phantom vfnmsub231ss +REG_FCSR
+x86_64 SR-rd-phantom vhaddpd +REG_FCSR
+x86_64 SR-rd-phantom vhaddps +REG_FCSR
+x86_64 SR-rd-phantom vhsubpd +REG_FCSR
+x86_64 SR-rd-phantom vhsubps +REG_FCSR
+x86_64 SR-rd-phantom vmaxpd +REG_FCSR
+x86_64 SR-rd-phantom vmaxps +REG_FCSR
+x86_64 SR-rd-phantom vmaxsd +REG_FCSR
+x86_64 SR-rd-phantom vmaxss +REG_FCSR
+x86_64 SR-rd-phantom vminpd +REG_FCSR
+x86_64 SR-rd-phantom vminps +REG_FCSR
+x86_64 SR-rd-phantom vminsd +REG_FCSR
+x86_64 SR-rd-phantom vminss +REG_FCSR
+x86_64 SR-rd-phantom vmulpd +REG_FCSR
+x86_64 SR-rd-phantom vmulps +REG_FCSR
+x86_64 SR-rd-phantom vmulsd +REG_FCSR
+x86_64 SR-rd-phantom vmulss +REG_FCSR
+x86_64 SR-rd-phantom vrcpps +REG_FCSR
+x86_64 SR-rd-phantom vrcpss +REG_FCSR
+x86_64 SR-rd-phantom vroundpd +REG_FCSR
+x86_64 SR-rd-phantom vroundps +REG_FCSR
+x86_64 SR-rd-phantom vroundsd +REG_FCSR
+x86_64 SR-rd-phantom vroundss +REG_FCSR
+x86_64 SR-rd-phantom vrsqrtps +REG_FCSR
+x86_64 SR-rd-phantom vrsqrtss +REG_FCSR
+x86_64 SR-rd-phantom vsqrtpd +REG_FCSR
+x86_64 SR-rd-phantom vsqrtps +REG_FCSR
+x86_64 SR-rd-phantom vsqrtsd +REG_FCSR
+x86_64 SR-rd-phantom vsqrtss +REG_FCSR
+x86_64 SR-rd-phantom vsubpd +REG_FCSR
+x86_64 SR-rd-phantom vsubps +REG_FCSR
+x86_64 SR-rd-phantom vsubsd +REG_FCSR
+x86_64 SR-rd-phantom vsubss +REG_FCSR
+x86_64 SR-rd-phantom vucomisd +REG_FCSR
+x86_64 SR-rd-phantom vucomiss +REG_FCSR
+
 # --- X-UPPERLANE: a legacy scalar or unary SSE form preserves the upper lanes of its destination, so the destination is read.
-#     13 signature(s), 69139 encodings at this tip.
+#     11 signature(s), 57806 encodings at this tip.
 #
 # R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
 # form survives above the element the instruction writes, so it is an input.
@@ -10305,8 +10568,6 @@ x86_64 SR-rd-phantom vaesenc +REG_VEC#
 x86_64 SR-rd-phantom vaesenclast +REG_VEC#
 x86_64 SR-rd-phantom vaesimc +REG_VEC#
 x86_64 SR-rd-phantom vaeskeygenassist +REG_VEC#
-x86_64 SR-rd-phantom vcvtsi2sdl +REG_VEC#
-x86_64 SR-rd-phantom vcvtsi2sdq +REG_VEC#
 x86_64 SR-rd-phantom vmovhpd +REG_VEC#
 x86_64 SR-rd-phantom vmovhps +REG_VEC#
 x86_64 SR-rd-phantom vpclmulqdq +REG_VEC#
@@ -10430,6 +10691,43 @@ x86_64 SR-rd-phantom setssbsy +REG_SSP,REG_SYS
 # `x86_64 SR-rd-phantom * +REG_SYS*` argument at this layer.
 x86_64 SR-rd-phantom rdtscp +REG_SYS,REG_SYSTIMER
 
+# --- X-SELFRELOAD: QEMU re-derives the softfloat file from the control word the instruction has just WRITTEN, and reads the file it is in the middle of replacing.
+#     6 signature(s), 28480 encodings, NOT ALLOWLISTED.
+#     An allowlist row asserts the tracer is right; these stay red.
+#
+# THE ROUTE, in QEMU's own call chain and the same one for every mnemonic
+# here: `helper_fldcw` -> `cpu_set_fpuc(env, val)` (target/i386/cpu.h), which
+# assigns `env->fpuc` and then calls `update_fp_status(env)`
+# (target/i386/tcg/fpu_helper.c).  That function reads back the word just
+# stored and hands `&env->fp_status` to `set_x86_rounding_mode()` and
+# `set_floatx80_rounding_precision()`, each of which writes ONE field of the
+# structure -- so the access is stated as a read-modify-write and the file
+# reaches the read list.  `ldmxcsr` and `vldmxcsr` take the identical route
+# through `update_mxcsr_status()`, `fldenv` and `frstor` through the same
+# `cpu_set_fpuc()` on the word they restore, and `fninit` through
+# `do_fninit()` -> `cpu_set_fpuc(env, 0x37f)` -- an immediate CONSTANT, which
+# is the clearest statement of the shape: nothing architectural is being
+# consulted at all.
+#
+# WHY IT IS NOT X-FPSTATUS, whose rows carry the same generic name.  There the
+# file is an INPUT: the rounding mode selects which result `addsd` produces.
+# Here it is the instruction's own OUTPUT, read only because QEMU rewrites it
+# one field at a time, and the value read is either what this instruction
+# wrote a statement earlier or a constant.  A row that recorded the tracer as
+# right about that would be recording a dependency on itself.
+#
+# NOT ALLOWLISTED, AND THAT IS THE POINT.  An allowlist row asserts the tracer
+# is right; this class asserts nobody has shown that yet, so its signatures
+# stay red with a named blocker.  Retiring it means either a narrower
+# statement at the re-derivation site or a ruling that a partially-rewritten
+# derived file is a source.
+#     x86_64 SR-rd-phantom fldcw +REG_FCSR
+#     x86_64 SR-rd-phantom fldenv +REG_FCSR
+#     x86_64 SR-rd-phantom fninit +REG_FCSR
+#     x86_64 SR-rd-phantom frstor +REG_FCSR
+#     x86_64 SR-rd-phantom ldmxcsr +REG_FCSR
+#     x86_64 SR-rd-phantom vldmxcsr +REG_FCSR
+
 # --- X-ADDRONLY: a hint whose memory operand is an ADDRESS the instruction computes and does not dereference.
 #     6 signature(s), 9622 encodings at this tip.
 #
@@ -10468,19 +10766,13 @@ x86_64 SR-rd-phantom stmxcsr +REG_FCSR
 x86_64 SR-rd-phantom vstmxcsr +REG_FCSR
 
 # --- X-MISC: the remaining reference gaps, one signature at a time.
-#     92 signature(s), 534429 encodings at this tip.
+#     86 signature(s), 497561 encodings at this tip.
 #
 # What is left after the named families: forms where LLVM names an implicit
 # operand its per-opcode description carries and the instruction does not
 # consult, or where the tracer names a register the encoding implies and the
 # reference has no operand for.  They are listed one row at a time because
 # none of them generalises.
-x86_64 SR-rd-phantom cvtpd2pi +REG_FCSR
-x86_64 SR-rd-phantom cvtpi2pd +REG_FCSR
-x86_64 SR-rd-phantom cvtpi2ps +REG_FCSR
-x86_64 SR-rd-phantom cvtps2pi +REG_FCSR
-x86_64 SR-rd-phantom cvttpd2pi +REG_FCSR
-x86_64 SR-rd-phantom cvttps2pi +REG_FCSR
 x86_64 SR-rd-phantom emms +REG_FCSR
 x86_64 SR-rd-phantom femms +REG_FCSR
 x86_64 SR-rd-phantom fnclex +REG_FCSR
@@ -10569,7 +10861,7 @@ x86_64 SR-rd-phantom verr +REG_FLAGS
 x86_64 SR-rd-phantom verw +REG_FLAGS
 
 # --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
-#     1062 signature(s), 710456 encodings at this tip.
+#     1062 signature(s), 705110 encodings at this tip.
 #
 # Every FP, AdvSIMD, SVE and SME instruction runs an architectural enable check
 # before it does anything -- CheckFPAdvSIMDEnabled, CheckSVEEnabled,

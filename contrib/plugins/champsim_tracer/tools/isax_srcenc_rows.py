@@ -145,6 +145,131 @@ MIPS_DSP_IMM = {
 }
 GPRISH = {"REG_SP", "REG_LR", "REG_FP_REG", "REG_ZERO"}
 
+# --------------------------------------------------------------------------
+# X-FPSTATUS'S MEMBERSHIP IS READ OUT OF QEMU, NOT TYPED.
+#
+# The class claims that the tracer's REG_FCSR on an x86 FP form is QEMU's own
+# stated read of the datapath's `float_status`.  A claim like that is only
+# worth its row if the membership is DERIVED from the same statement: a
+# hand-written list of two hundred mnemonics would drift the day a helper's
+# usage row changed, and drift silently, because a signature that stopped
+# belonging would keep its allowlist row and simply stop matching anything.
+#
+# So the set comes from `accel/tcg/insn-dataflow-usage/i386.c.inc` -- the
+# generated table QEMU itself consults, the artifact `bb24f882b2` cites --
+# by taking every helper bound to a field array that names fp_status,
+# mmx_status or sse_status with INSN_DF_RD.  ~200 rows, and the helper's own
+# name is the mnemonic for most of them (`addsd`, `mulps_xmm`, `cvtsi2sd`).
+#
+# TWO FAMILIES THE TABLE SPELLS WITH A SHARED HELPER, and they are the only
+# two, each named with the row it resolves to and asserted to exist:
+#
+#   * the compare forms.  The disassembler prints `cmppd` with the predicate
+#     in an immediate; QEMU has one helper PER PREDICATE (`cmpeqpd_xmm`,
+#     `cmpltpd_xmm`, ...), so no row is spelled `cmppd`.  A `cmp<type>` or
+#     `vcmp*<type>` mnemonic is claimed when some `cmp*<type>` row reads the
+#     file.
+#   * the FMA forms.  `vfmadd132sd` and its 47 siblings are all lowered
+#     through `fma4sd` / `fma4pd_xmm` / `fma4ps_ymm` and so on -- one helper
+#     for the whole family, selected by flags -- so the mnemonics are matched
+#     against the `fma4<type>` rows.
+#
+# ANYTHING ELSE FALLS THROUGH.  A `+REG_FCSR` signature this derivation does
+# not reach is NOT claimed here; it keeps whatever class it had.  That is
+# what stops the class quietly absorbing the MMX tag-word family -- `emms`,
+# `movq`, `maskmovq`, `fnclex` -- whose REG_FCSR is the architectural status
+# and tag words rather than a softfloat file, and which no row of this table
+# claims.
+#: tools/ -> champsim_tracer/ -> plugins/ -> contrib/ -> the source root.
+_QEMU_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
+_DFU_TABLE = os.path.join(_QEMU_ROOT, "accel", "tcg",
+                          "insn-dataflow-usage", "i386.c.inc")
+
+#: The three per-datapath softfloat files, in QEMU's own member names.
+_FPSTATUS_MEMBERS = ("fp_status", "mmx_status", "sse_status")
+
+
+def _fpstatus_helpers(path=None):
+    """The helper names the usage table binds to a float_status READ."""
+    import re as _re
+    path = path or _DFU_TABLE
+    text = open(path).read()
+    want = set()
+    for name, body in _re.findall(
+            r"static const DfHelperField (dfu_\w+)\[\]\s*=\s*\{(.*?)\n\};",
+            text, _re.S):
+        for m, flags in _re.findall(
+                r"offsetof\(CPUArchState,\s*(\w+)\s*\)[^,]*,[^,]*,"
+                r"\s*([A-Z_|\s]+),", body):
+            if m in _FPSTATUS_MEMBERS and "INSN_DF_RD" in flags:
+                want.add(name)
+                break
+    out = set()
+    for hname, arr in _re.findall(r'\{\s*"([A-Za-z0-9_]+)"\s*,.*?\b(dfu_\w+)\b',
+                                  text, _re.S):
+        if arr in want:
+            out.add(hname)
+    if not out:
+        raise SystemExit(
+            "isax_srcenc_rows: REFUSING -- no helper in %s names a READ of "
+            "any of %s.  X-FPSTATUS would claim nothing and every FP "
+            "signature would silently fall to X-MISC, which is a partition "
+            "that looks clean and is not."
+            % (path, ", ".join(_FPSTATUS_MEMBERS)))
+    return out
+
+
+_FPSTATUS_HELPERS = None
+#: The helper-name suffixes the table uses for operand width and datapath.
+_DFU_SUFFIXES = ("_xmm", "_ymm", "_mmx", "_env")
+#: Assembler suffixes the disassembler adds and the helper name does not
+#: carry: operand size on a converting form (`cvtsi2sdl`), and the AVX
+#: length qualifiers (`vcvtpd2dqx`).
+_ASM_SUFFIXES = ("l", "q", "x", "y")
+
+
+def _fpstatus_stems():
+    global _FPSTATUS_HELPERS
+    if _FPSTATUS_HELPERS is None:
+        stems = set()
+        for h in _fpstatus_helpers():
+            for suf in _DFU_SUFFIXES:
+                if h.endswith(suf):
+                    h = h[:-len(suf)]
+                    break
+            stems.add(h)
+        _FPSTATUS_HELPERS = stems
+    return _FPSTATUS_HELPERS
+
+
+def _fpstatus_reader(mnem):
+    """Does QEMU's own usage table say this mnemonic reads a float_status?"""
+    stems = _fpstatus_stems()
+    cands = {mnem}
+    if mnem.startswith("v"):
+        cands.add(mnem[1:])
+    for c in list(cands):
+        for suf in _ASM_SUFFIXES:
+            if c.endswith(suf):
+                cands.add(c[:-len(suf)])
+    if cands & stems:
+        return True
+    # The two shared-helper families, resolved against the table rather than
+    # asserted.  `base` is the mnemonic with any leading `v` removed.
+    base = mnem[1:] if mnem.startswith("v") else mnem
+    for typ in ("pd", "ps", "sd", "ss"):
+        if not base.endswith(typ):
+            continue
+        if base.startswith("cmp") and any(
+                st.startswith("cmp") and st.endswith(typ) for st in stems):
+            return True
+        if base.startswith(("fmadd", "fmsub", "fnmadd", "fnmsub",
+                            "fmaddsub", "fmsubadd")) and any(
+                st.startswith("fma4") and st.endswith(typ) for st in stems):
+            return True
+    return False
+
 
 def _gpr(regs):
     return any(r.startswith("REG_GPR") for r in regs) or bool(regs & GPRISH)
@@ -616,6 +741,59 @@ def _x_fsgs(s):
     return bool(s.regs & {"REG_SEG3", "REG_SEG4"})
 
 
+@cls("x86_64", "X-FPSTATUS", "the softfloat status file the FP datapath "
+     "operates under, which LLVM has no operand for", """
+target/i386 keeps one `float_status` per FP datapath -- x87 `fp_status`,
+3DNow! `mmx_status`, SSE/AVX `sse_status` -- and it holds the rounding mode,
+the flush-to-zero and denormals-are-zero controls and the exception masks
+that MXCSR and the x87 control word are DECODED INTO.  An arithmetic,
+compare or convert form reads it because the value it produces depends on
+it: `float64_add(a, b, &env->sse_status)` rounds by what it finds there.
+
+QEMU STATES THE READ, per helper, in its own generated usage table --
+`dfu_addsd_env` names offsetof(CPUArchState, sse_status) with INSN_DF_RD,
+from ops_sse.h -- and bb24f882b2 declared the three files so the stated read
+arrives carrying a NAME.  The consumer's fold_nonarch() puts all three on
+REG_FCSR, the one generic word the vocabulary gives an FP control-and-status
+file it cannot split.
+
+LLVM'S MCInstrDesc HAS NO OPERAND FOR IT ON THESE OPCODES.  MXCSR is not in
+the Uses list of `addsd`, `mulps`, `cvtsi2sd` or any of their siblings; the
+x86 backend models the control word only where the instruction NAMES it
+(`ldmxcsr`, `stmxcsr`).  The silence is structural, the same shape as the
+control-register family above, and the wire is the side that states the
+dependency.
+
+WHERE THE DIFFERENCE SET ALSO CARRIES REG_VEC#, the second member is the
+scalar-preserve read X-UPPERLANE justifies below on its own rows -- a legacy
+scalar form's destination survives above the element it writes.  Two
+independent reference gaps on one signature; both are named and neither is
+being made to pay for the other.
+
+THE x87 CLASSES BELOW KEEP THEIR OWN SUBJECTS.  X-SELFRELOAD's forms write
+the control word and re-derive this file from what they just wrote, and
+X-X87STATE's read the status word to resolve a stack slot; both are
+different facts about the same generic name and both are adjudicated where
+they are, not here.""")
+def _x_fpstatus(s):
+    if "REG_FCSR" not in s.regs:
+        return False
+    # The whole difference has to be the status file, alone or beside the
+    # scalar-preserve destination.  Anything else on the row is a third
+    # fact this comment does not explain, and it goes to the class that
+    # does.
+    if any(not r.startswith("REG_VEC") for r in s.regs - {"REG_FCSR"}):
+        return False
+    # DEFERRED, not overridden.  These two are declared after this one --
+    # the narrow-first ordering puts this class ahead of X-UPPERLANE so the
+    # mixed rows get both halves named -- so the hand-off is written out
+    # rather than left to file order.  Calling their own predicates means
+    # there is one copy of each mnemonic list, not two to drift apart.
+    if _x_selfreload(s) or _x_x87state(s):
+        return False
+    return _fpstatus_reader(s.mnem.split()[-1])
+
+
 @cls("x86_64", "X-UPPERLANE", "a legacy scalar or unary SSE form preserves "
      "the upper lanes of its destination, so the destination is read", """
 R7.1-SCALAR, restated at this layer: the destination of a legacy scalar SSE
@@ -718,12 +896,39 @@ def _x_msr(s):
                           "REG_SYSID", "REG_SYSEXC"})
 
 
-@cls("x86_64", "X-SELFRELOAD", "QEMU re-reads the control word the "
-     "instruction just WROTE, to re-derive its softfloat state", "",
+@cls("x86_64", "X-SELFRELOAD", "QEMU re-derives the softfloat file from the "
+     "control word the instruction has just WRITTEN, and reads the file it "
+     "is in the middle of replacing", """
+THE ROUTE, in QEMU's own call chain and the same one for every mnemonic
+here: `helper_fldcw` -> `cpu_set_fpuc(env, val)` (target/i386/cpu.h), which
+assigns `env->fpuc` and then calls `update_fp_status(env)`
+(target/i386/tcg/fpu_helper.c).  That function reads back the word just
+stored and hands `&env->fp_status` to `set_x86_rounding_mode()` and
+`set_floatx80_rounding_precision()`, each of which writes ONE field of the
+structure -- so the access is stated as a read-modify-write and the file
+reaches the read list.  `ldmxcsr` and `vldmxcsr` take the identical route
+through `update_mxcsr_status()`, `fldenv` and `frstor` through the same
+`cpu_set_fpuc()` on the word they restore, and `fninit` through
+`do_fninit()` -> `cpu_set_fpuc(env, 0x37f)` -- an immediate CONSTANT, which
+is the clearest statement of the shape: nothing architectural is being
+consulted at all.
+
+WHY IT IS NOT X-FPSTATUS, whose rows carry the same generic name.  There the
+file is an INPUT: the rounding mode selects which result `addsd` produces.
+Here it is the instruction's own OUTPUT, read only because QEMU rewrites it
+one field at a time, and the value read is either what this instruction
+wrote a statement earlier or a constant.  A row that recorded the tracer as
+right about that would be recording a dependency on itself.
+
+NOT ALLOWLISTED, AND THAT IS THE POINT.  An allowlist row asserts the tracer
+is right; this class asserts nobody has shown that yet, so its signatures
+stay red with a named blocker.  Retiring it means either a narrower
+statement at the re-derivation site or a ruling that a partially-rewritten
+derived file is a source.""",
      defect=True)
 def _x_selfreload(s):
     return s.mnem.split()[-1] in ("fldcw", "fldenv", "ldmxcsr", "vldmxcsr",
-                                  "frstor", "fxrstor", "fxrstor64")
+                                  "frstor", "fxrstor", "fxrstor64", "fninit")
 
 
 @cls("x86_64", "X-ADDRONLY", "a hint whose memory operand is an ADDRESS the "
@@ -1015,12 +1220,23 @@ def main():
             if not rows:
                 continue
             if defect:
+                # THE BLOCKER IS WRITTEN OUT, not just named.  A defect class
+                # emits no rows, so its comment was the one thing a reader of
+                # the allowlist could not see -- and a red with no reason on
+                # the page is the shape that gets re-adjudicated from scratch
+                # every pass, or worse, laundered into an allowlist row by
+                # somebody who could not find why it was refused.
+                body = "\n".join(
+                    "#" + (" " + l if l else "")
+                    for l in comment.strip().split("\n")) + "\n" \
+                    if comment.strip() else ""
                 blocks.append(
                     f"# --- {cid}: {title}.\n"
                     f"#     {len(rows)} signature(s), "
                     f"{sum(r.n for r in rows)} encodings, NOT ALLOWLISTED.\n"
                     f"#     An allowlist row asserts the tracer is right; "
-                    f"these stay red.\n"
+                    f"these stay red.\n#\n"
+                    + body
                     + "".join(f"#     {isa} {r.key}\n"
                               for r in sorted(rows, key=lambda x: x.key)))
                 continue

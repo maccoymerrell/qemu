@@ -202,7 +202,19 @@ def roll(files, label):
     print("  tiers summed                   %10d" % tiersum)
     print("  scored == tiers summed         %10s"
           % ("YES" if t["scored"] == tiersum else "NO <<<<"))
-    print("  no identity exported (id==0)   %10d" % t["noid"])
+    # NOT A MUST-BE-0, AND THE LINE SAYS SO (FINDING 84-C).  The three rows
+    # below carry their bound in the label; this one carried nothing, and a
+    # column with no marker sitting between two that have one was read as a
+    # fourth must-be-0 and reported as a defect twice.  It is not in `bad`
+    # below either, and that was never an oversight: QEMU withholds an
+    # identity when the translation it generated is not the instruction it
+    # was asked about -- a translation that only RAISES -- so `hlt` and `udf`
+    # export none, a wrong-path walk reaches such bytes, and the count is
+    # EXPECTED non-zero on exactly the arms that walk them.  The route is
+    # named here so the number cannot be mistaken for a bound again.
+    print("  no identity exported (id==0)   %10d   "
+          "(NOT a must-be-0: a translation that only RAISES exports none)"
+          % t["noid"])
     print("  id carried, NO ROW (must be 0) %10d" % t["norow_tbl"])
     print("  row found, NAME DISAGREES (0)  %10d" % t["namedis"])
     print("  tier out of range (must be 0)  %10d" % t["OUTOFRANGE"])
@@ -262,7 +274,7 @@ GOOD = """
     branchtype      0
 --- QEMU decode identity: the rule the translator dispatched on ---
   translated instructions read              %(translated)6d
-  no identity exported (id == 0)                 0    0.0%%
+  no identity exported (id == 0)          %(noid)6d    0.0%%
   id carried, NO ROW IN TABLE                    0  <- stale table
   row found, NAME DISAGREES                      0  <- stale table
   scored against the Capstone row           %(scored)6d
@@ -272,7 +284,7 @@ GOOD = """
 
 def _sidecar(path, **kw):
     d = dict(classified=100, comparable=90, agree=80, kd=10, enumpub=7,
-             silent=7, norow=0, translated=100, scored=95,
+             silent=7, norow=0, noid=0, translated=100, scored=95,
              VERIFIED=5, STATED=10, OBSERVED=80)
     d.update(kw)
     open(path, "w").write(GOOD % d)
@@ -387,6 +399,26 @@ def selftest(scratch=None):
     check("L sidecars that PARSE and carry NOTHING refuse (rc=2), never "
           "close on 0 == 0 + 0", rcL == 2 and "CLOSES" not in outL,
           "rc=%s" % rcL)
+
+    # M/M2: FINDING 84-C.  `noid` is NOT a must-be-0 and the roll-up has
+    # never treated it as one -- but the printed line carried no marker while
+    # its three neighbours did, and the column was read as a bound and
+    # reported as a wire defect on two separate passes.  Both halves are
+    # asserted: the classification (a non-zero noid still CLOSES, beside a
+    # non-zero `norow_tbl` that must not) and the label (the line names the
+    # raise-only route, so the number cannot be re-mistaken by eye).
+    raiseonly = os.path.join(tmp, "raiseonly")
+    os.makedirs(raiseonly, exist_ok=True)
+    for arm in ("wp0", "wp16"):
+        _sidecar(os.path.join(raiseonly, "r_%s.stats.log" % arm),
+                 noid=10 if arm == "wp16" else 0)
+    rcM, outM = _run([raiseonly])
+    check("M a NON-ZERO noid still CLOSES -- it is not a must-be-0",
+          rcM == 0 and "ROLL-UP DOES NOT CLOSE" not in outM, "rc=%s" % rcM)
+    check("M2 and the line NAMES the raise-only route rather than a bound",
+          "no identity exported (id==0)" in outM
+          and "NOT a must-be-0" in outM
+          and "only RAISES" in outM)
 
     print("failures=%d" % fails)
     if scratch is None:

@@ -260,12 +260,38 @@ static_assert(QDEP_MAX_ACCESS <= 64,
 /*
  * How many DISTINCT written registers this extractor holds per instruction.
  *
- * QEMU's own cap is INSN_DF_MAX_WRITES = 8 and a translation that exceeds it
- * arrives with `writes_truncated` already set, which the status gate refuses
- * one step earlier.  Sized to match so the two caps cannot disagree about
- * which instruction was refused and why.
+ * IT USED TO BE 8, AND THE REASON WAS TRUE OF ONLY HALF THE DESTINATIONS.
+ * QEMU's own cap is INSN_DF_MAX_WRITES = 8; a translation that exceeds it
+ * arrives with `writes_truncated` already set and the status gate refuses it
+ * one step earlier, so matching the number kept the two caps from disagreeing
+ * about which instruction was refused and why.  That argument holds for
+ * destinations that are TCG GLOBALS and for no others: a destination that
+ * arrives through fields[] -- an env byte range a declared regfile names --
+ * is bounded by INSN_DF_MAX_FIELDS (64), which INSN_DF_MAX_WRITES says
+ * nothing about.  For those two the caps CAN disagree, and did.
+ *
+ * FINDING 84-D is that disagreement measured.  Declaring the x87 container
+ * gave `frstor` a write list of REG_FCSR, REG_FPCW and REG_FPR0..7 -- TEN
+ * distinct registers, every one of them field-borne -- so the union
+ * overflowed here and the whole destination row was refused.  The count went
+ * from 3 encodings to 6,033 in one pass, and the 6,030 new ones are ALL
+ * frstor.  It is a clean refusal rather than a silent drop, which is why it
+ * was an owed item and not a defect; it is closed here.
+ *
+ * SIXTEEN IS MEASURED, NOT ESTIMATED: ten is what `frstor` needs, and the
+ * headroom is there so that a form nobody enumerated is REFUSED and counted
+ * rather than truncated into a short destination list.  It deliberately does
+ * NOT cover `fxrstor`/`xrstor`, which write the whole FP and SSE state and
+ * are far wider than any cap this structure can afford; those keep refusing,
+ * visibly, which is the direction this file may fail in.
+ *
+ * THE COST IS PER TEMPLATE AND IS NAMED.  QDepInsn is held for the life of a
+ * BB template, and the eight arrays indexed by this bound come to 22 bytes
+ * per slot, so 8 -> 16 is +176 bytes per instruction.  Against the ~3.2 kB
+ * an InsnFields already carries that is about five per cent, and the heap
+ * peaks this tree measured (1.2 GB) move with it.
  */
-#define QDEP_MAX_DST 8
+#define QDEP_MAX_DST 16
 
 /*
  * How many DISTINCT generic source registers one instruction's read list may

@@ -4345,6 +4345,115 @@ static void gen_note_mpx_source(DisasContext *s, int b, int modrm,
     }
 }
 
+static void gen_note_gpr_read(int n)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[0]) + n * sizeof(((CPUX86State *)0)->regs[0]),
+        sizeof(((CPUX86State *)0)->regs[0]));
+}
+
+/*
+ * THE OPERAND `0F 1A` / `0F 1B` NAMES WHEN THIS MACHINE HAS NO MPX.
+ *
+ * gen_note_mpx_source() above states the BOUND register these encodings read
+ * with the enable bit clear.  It is not the whole of what they read, and the
+ * bar measured the rest as two classes that are one population:
+ *
+ *   480f1ac0  nopq   PUB=REG_GPR0              QN=-            (mod=3, rm=RAX)
+ *   f30f1a00  bndcl  PUB=REG_BOUND0,REG_GPR0   QN=REG_BOUND0   (mod=0, base=RAX)
+ *
+ * Both are `0F 1A`.  A disassembler reads the same bytes as a RESERVED NOP
+ * when no prefix selects an MPX form and as `bndcl`/`bndcu`/`bndcn` when one
+ * does, and what is missing on BOTH readings is the same thing: the registers
+ * the ModRM byte names.  QEMU wraps the whole arm in
+ * `if (s->flags & HF_MPX_EN_MASK)`, so with MPX off nothing reads them.
+ *
+ * TWO LANDED RULINGS COVER IT BETWEEN THEM AND THEY AGREE.
+ *
+ * 4d9ec8775e stated both ModRM operands on the NINE reserved-NOP rows of the
+ * 0F table -- "A NOP SEMANTIC STILL HAS REAL DEPENDENCIES IN THE CHOSEN
+ * REGISTER" (R16), with XED's `NOP MEMv GPRv` / `NOP GPRv GPRv` patterns and
+ * R12.1's superset direction behind it.  `0F 1A` and `0F 1B` are not among
+ * those nine because in decode-new.c.inc they are the MPX rows.
+ *
+ * 22d7666262 stated the bound register "whether or not this guest turned MPX
+ * on", because "R16 records ISA-defined dependencies regardless of machine
+ * state" and "a conditional carries all its potential sources, and the enable
+ * bit is the condition" (R17).
+ *
+ * So this is not a new ruling.  It is the intersection of two that exist,
+ * applied to the rows that fell between them.
+ *
+ * ONLY WITH MPX OFF.  With the enable bit set the arm computes the address
+ * and reads the register itself, and the op walk finds it; restating it here
+ * would say nothing new and would have to duplicate the arm's own operand
+ * discrimination to stay true.  The guard is the same flag the arm is
+ * wrapped in, read off @s.
+ *
+ * WHICH REGISTER, AND THE ANSWER FOLLOWS WHICH READING THE (opcode, prefix,
+ * mod) TRIPLE ADMITS.  The triple decides whether an MPX form exists at all:
+ *
+ *   0F 1A  F3 -> bndcl   F2 -> bndcu   66 -> bndmov   none,mod!=3 -> bndldx
+ *   0F 1B  F3,mod!=3 -> bndmk  F2 -> bndcn  66 -> bndmov  none,mod!=3 -> bndstx
+ *
+ * so the ONLY combinations with no MPX form are `0F 1A` mod=3 with no prefix
+ * and `0F 1B` mod=3 with no prefix or with F3.  There the encoding is a
+ * RESERVED NOP outright, XED's pattern is `NOP GPRv GPRv`, and BOTH ModRM
+ * operands are general registers -- which is what the wire publishes:
+ * `480f1ac5` (rm=RBP, reg=RAX) carries REG_FP_REG and REG_GPR0 both.
+ *
+ * On every other combination the `reg` field selects a BOUND register --
+ * gen_note_mpx_source() states it, and the wire agrees -- so only the r/m
+ * side is a general register here: `BNDCL/BNDCU/BNDCN bnd, r/m64` take one
+ * with mod=3, and the address base and index with mod!=3.  `BNDMOV` under 66
+ * is the one form whose r/m is a second BOUND register, and it is left alone
+ * rather than folded in, because stating a GPR for it would name a register
+ * the encoding does not carry.
+ *
+ * The result is exactly the registers the wire already publishes on each row
+ * and no more.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_multi0f_mpx_off_operands(DisasContext *s,
+                                              X86DecodedInsn *decode,
+                                              int b, int modrm, int prefixes)
+{
+    int mod = (modrm >> 6) & 3;
+    bool mpx_form;
+
+    if ((b != 0x11a && b != 0x11b) || (s->flags & HF_MPX_EN_MASK)) {
+        return;
+    }
+    if (prefixes & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA)) {
+        mpx_form = !(b == 0x11b && (prefixes & PREFIX_REPZ) && mod == 3);
+    } else {
+        mpx_form = mod != 3;
+    }
+
+    if (!mpx_form) {
+        /* A reserved NOP: both ModRM operands are general registers. */
+        gen_note_gpr_read(((modrm >> 3) & 7) | REX_R(s));
+        gen_note_gpr_read((modrm & 7) | REX_B(s));
+        return;
+    }
+    if (mod == 3) {
+        if (prefixes & PREFIX_DATA) {
+            return;         /* bndmov's r/m is a bound register */
+        }
+        gen_note_gpr_read((modrm & 7) | REX_B(s));
+    } else {
+        AddressParts a = decode->mem;
+
+        if (a.base >= 0) {
+            gen_note_gpr_read(a.base);
+        }
+        if (a.index >= 0) {
+            gen_note_gpr_read(a.index);
+        }
+    }
+}
+
 /*
  * multi0f_ident: ENCODING-QUALIFIED IDENTITY for the unconverted 0F spaces.
  *
@@ -5008,6 +5117,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
     }
     gen_note_mpx_source(s, b, modrm, prefixes);
     gen_note_mpx_dest(s, b, modrm, prefixes);
+    gen_note_multi0f_mpx_off_operands(s, decode, b, modrm, prefixes);
     multi0f_ident_publish(b, modrm, prefixes);  /* multi0f_ident */
     return;
  illegal_op:

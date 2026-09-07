@@ -3926,6 +3926,32 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
 {
     if (reg == 0 && (opc == OPC_MFHI || opc == OPC_MFLO)) {
         /* Treat as NOP. */
+        /*
+         * THE ACCUMULATOR THE NOP ERASES, and the $zero it writes.
+         *
+         * `mfhi $zero` returns before any op exists, so the read of HI --
+         * the one register the instruction is FOR -- never happens and the
+         * encoding arrives at a consumer touching nothing.  The bar measured
+         * exactly that: eight registers over `mfhi`/`mflo`, one per
+         * accumulator, and no GPR among them.  The `ac` field is bits 12:11
+         * of the encoding, so which accumulator is a STATIC fact of the
+         * encoding (R20) and cpu_HI[]/cpu_LO[] are the globals that hold it;
+         * the fold is the same "If no destination, treat it as a NOP" shape
+         * note_gpr_folded_read() already covers on the arithmetic forms.
+         *
+         * The destination half is note_gpr_zero_dest()'s, anchored on the
+         * accumulator the value would have come from -- the account the
+         * performed write would have given.
+         *
+         * check_dsp() is deliberately not hoisted: it lives after this
+         * return, so on a model without DSP `mfhi $zero,ac1` is a NOP and not
+         * a reserved instruction, and moving the test would change what the
+         * guest does.  What is stated here is the encoding's own reading.
+         */
+        TCGv acc_ts = (opc == OPC_MFHI) ? cpu_HI[acc] : cpu_LO[acc];
+
+        insn_dataflow_note_folded_read(tcgv_tl_temp(acc_ts));
+        insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(acc_ts));
         return;
     }
 
@@ -16599,6 +16625,73 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
     }
 }
 
+/*
+ * THE ACCUMULATOR AND DSPControl AN `extr`/`extp` INTO $zero NEVER READS.
+ *
+ * The ledger asked whether the DSP accumulator index is STATIC in the
+ * encoding -- in which case R20 puts the read at the decode site -- or
+ * dynamic.  It is static, and this function is where that is visible:
+ * gen_mipsdsp_accinsn()'s EXTR/EXTP arms all pass the accumulator to their
+ * helper as `tcg_gen_movi_tl(t0, v2)`, an IMMEDIATE materialised from the
+ * `rd` field's low two bits.  Nothing is observed and nothing is derived.
+ *
+ * WHAT IS MISSING WITHOUT IT.  `extr.w $zero,$ac3,4` takes the "Treat as NOP"
+ * return above before any op exists, so neither the accumulator nor
+ * DSPControl is read and the encoding reaches a consumer touching nothing.
+ * The corpus measured exactly that -- REG_ACC<n>, REG_ACCHI<n> and REG_FLAGS
+ * lost together on `extp`, `extpdp`, `extpv`, `extpdpv` and the eight `extr`
+ * forms, with an EMPTY QEMU read list.
+ *
+ * WHY ALL THREE.  MIPS DSP ASE, EXTR.W: the value comes from the 64-bit
+ * accumulator, which QEMU keeps as the cpu_HI[ac]/cpu_LO[ac] pair, and the
+ * helper's saturation path ORs into DSPControl's ouflag field -- a
+ * read-modify-write of a register whose other fields it preserves, which R17
+ * rules a merging partial write that reads itself.  EXTP and EXTPDP read
+ * DSPControl a second time and for a second reason: the `pos` field IS the
+ * bit position they extract from.
+ *
+ * ONLY THE ARMS WHOSE `v2` IS THE ACCUMULATOR.  SHILO, MTHLIP, WRDSP take the
+ * index in `ret` instead and are called with check_ret == 0, so they never
+ * reach this fold; RDDSP passes a different slot and is excluded by name
+ * rather than by assuming the shape.  The switch below is the emitter's own
+ * op2 list, not a second table.
+ *
+ * The GPR the VARIABLE forms take their shift from is NOT stated here: the
+ * remaining DSP families fold operands whose role changes per op2, and a
+ * blanket statement would name an immediate as a register.  That half stays
+ * open and is recorded as open.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
+{
+    if (op1 != OPC_EXTR_W_DSP) {
+        return;
+    }
+    switch (op2) {
+    case OPC_EXTR_W:
+    case OPC_EXTR_R_W:
+    case OPC_EXTR_RS_W:
+    case OPC_EXTR_S_H:
+    case OPC_EXTRV_S_H:
+    case OPC_EXTRV_W:
+    case OPC_EXTRV_R_W:
+    case OPC_EXTRV_RS_W:
+    case OPC_EXTP:
+    case OPC_EXTPV:
+    case OPC_EXTPDP:
+    case OPC_EXTPDPV:
+        break;
+    default:
+        return;
+    }
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_HI[ac & 3]));
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_LO[ac & 3]));
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_dspctrl));
+    /* The $zero the same fold erases; see note_gpr_zero_dest(). */
+    insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_LO[ac & 3]));
+}
+
 static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                                 int ret, int v1, int v2, int check_ret)
 
@@ -16610,6 +16703,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     if ((ret == 0) && (check_ret == 1)) {
         /* Treat as NOP. */
+        note_dsp_acc_fold(op1, op2, v2);
         return;
     }
 

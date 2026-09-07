@@ -507,6 +507,31 @@ uint8_t fold_nonarch(const char *name)
         return REG_TLS;
     }
     /*
+     * DSPControl, mipsel's DSP ASE status-and-control word -- a TCG global
+     * (`cpu_dspctrl`, mips_translate_init()) that the MIPS GDB stub's
+     * namespace does not carry, so the generated table can hold no row for
+     * it.  The same position `userlocal` is in above.
+     *
+     * REG_FLAGS is not a new word for it and not a guess.  Capstone has no
+     * id for the CONTAINER either; it spells the register's FIELDS --
+     * `dsppos`, `dspscount`, `dspcarry`, `dspoutflag`, `dspccond`, `dspefi`
+     * and the sixteen `dspoutflag<n>` -- and champsim_tracer_mnemonics_mips.h
+     * answers REG_FLAGS for EVERY ONE of them.  So the container meets the
+     * word its own members already have, which is the same trade the `fcc`
+     * rule below makes in the other direction: there a FIELD is given the
+     * word its container could not express, here a CONTAINER is given the
+     * word its fields all agree on.
+     *
+     * The witness is the DSP accumulator fold: `extr.w $zero,$ac3,4` reads
+     * the accumulator pair and DSPControl and QEMU states all three
+     * (note_dsp_acc_fold(), target/mips/tcg/translate.c), while the wire
+     * publishes REG_ACC3, REG_ACCHI3 and REG_FLAGS.  Without this fold two
+     * of the three met their word and the third arrived anonymous.
+     */
+    if (!strcmp(name, "DSPControl")) {
+        return REG_FLAGS;
+    }
+    /*
      * XCR0, x86's extended control register, DECLARED by
      * target/i386/tcg/translate.c and absent from the i386 GDB stub's
      * namespace -- the same shape as the thread pointers above, so the

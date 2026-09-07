@@ -3487,6 +3487,44 @@ static void gen_POPCNT(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_ctpop_tl(s->T0, s->T0);
 }
 
+/*
+ * THE EFLAGS `popf` MERGES INTO.
+ *
+ * `269d` (popfq) publishes REG_SP and REG_FLAGS and QEMU stated only REG_SP:
+ * gen_helper_write_eflags() reaches cpu_load_eflags(), which combines the
+ * popped word with the bits outside @update_mask that the register already
+ * held, and every access happens inside the helper.  118 registers on the
+ * bar, over popfw and popfq.
+ *
+ * THE MASK IS NEVER ALL-ONES, on either form.  It starts as
+ * TF|AC|ID|NT and gains IF and IOPL only at privilege; VM, RF and the
+ * reserved bits are outside it always, and `popfw` narrows it to sixteen
+ * bits on top of that.  So POPF is a WRITE OF PART OF ONE ARCHITECTURAL
+ * REGISTER that preserves the rest, and R17's value-read test -- the value
+ * written depends on the value held -- is met.
+ *
+ * WHY THIS IS NOT a64-rmif-flags, WHICH WAS RULED THE OTHER WAY.  That row
+ * turned on R7.1's preservation clause, and the seam between the two rules
+ * is whether the preserved bits belong to the SAME architectural register as
+ * the written ones.  RMIF assigns PSTATE.N, Z, C and V separately under
+ * per-flag mask bits, and QEMU keeps each in its own global, so a flag
+ * outside the mask is a register the instruction does not write at all.
+ * EFLAGS is ONE register and `popfw` is defined as loading its low sixteen
+ * bits and leaving 31:16 as they were.  target/mips draws the identical seam
+ * in note_fcr31_read(): `c.cond.fmt` writes one condition-code field of FCSR
+ * and is annotated, while R6's `cmp.cond.fmt` writes a whole FPR and
+ * deliberately is not.
+ *
+ * Stated under the GDB stub's name for the word, as
+ * gen_note_folded_eflags_read() already does on this target.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_popf_merges_eflags(void)
+{
+    insn_dataflow_note_stated_read_name("eflags");
+}
+
 static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot;
@@ -3502,6 +3540,7 @@ static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
     }
 
     ot = gen_pop_T0(s);
+    gen_note_popf_merges_eflags();
     gen_helper_write_eflags(tcg_env, s->T0, tcg_constant_i32(mask));
     gen_pop_update(s, ot);
     set_cc_op(s, CC_OP_EFLAGS);

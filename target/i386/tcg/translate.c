@@ -1345,6 +1345,20 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
     }
 }
 
+/*
+ * A GENERAL REGISTER READ THE OP STREAM DOES NOT CARRY, BY THE RANGE THAT IS
+ * THE REGISTER.  regs[] is where cpu_regs[] lives, so the declaration naming
+ * every ordinary access to those bytes names this one too and there is no
+ * second spelling to keep in step -- the form gen_note_far_call_pushes()
+ * already uses for RSP.
+ */
+static void gen_note_gpr_read(int n)
+{
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUX86State, regs[0]) + n * sizeof(((CPUX86State *)0)->regs[0]),
+        sizeof(((CPUX86State *)0)->regs[0]));
+}
+
 static void gen_stos(DisasContext *s, MemOp ot, TCGv dshift)
 {
     gen_string_movl_A0_EDI(s);
@@ -1354,6 +1368,39 @@ static void gen_stos(DisasContext *s, MemOp ot, TCGv dshift)
 
 static void gen_lods(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    /*
+     * THE ACCUMULATOR A `rep lods` PUBLISHES WHEN THE COUNT IS ZERO.
+     *
+     * The bar holds exactly eight LODS families and every one of them carries
+     * a REP prefix: `(rep|repne) lods[bwlq]`, 554 registers, all of them
+     * REG_GPR0.  The UNPREFIXED `lodsq` is not on the bar at all.  So the
+     * discriminator is not the width and not R18's per-iteration question --
+     * it is the prefix.
+     *
+     * do_gen_rep() branches around the whole body when the count is zero.  On
+     * that path gen_lods() never runs, nothing names RAX, and RAX keeps the
+     * value it had -- which is the value the instruction leaves behind.  R17:
+     * a conditional carries all its potential sources, and the REP count is
+     * the condition.  22d7666262 is the same shape with the MPX enable bit
+     * standing where the counter stands here.
+     *
+     * WHY LODS ALONE, and the bar containing these eight families and no
+     * other string family is that prediction measured.  MOVS, STOS, SCAS and
+     * CMPS write RSI, RDI, RCX and the flags, every one of which the body
+     * already reads for its own arithmetic, so a zero-count path costs them
+     * nothing.  LODS is the only string operation whose destination is a
+     * register the body only WRITES.
+     *
+     * The whole register is named because that is the register the encoding's
+     * accumulator operand IS; the narrow forms' preserve-read of RAX is a
+     * separate fact about a separate op and gen_op_deposit_reg_v() still owns
+     * it.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
+        gen_note_gpr_read(R_EAX);
+    }
     gen_string_movl_A0_ESI(s);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
@@ -4343,13 +4390,6 @@ static void gen_note_mpx_source(DisasContext *s, int b, int modrm,
             gen_note_bnd_ub(reg);
         }
     }
-}
-
-static void gen_note_gpr_read(int n)
-{
-    insn_dataflow_note_stated_read_env(
-        offsetof(CPUX86State, regs[0]) + n * sizeof(((CPUX86State *)0)->regs[0]),
-        sizeof(((CPUX86State *)0)->regs[0]));
 }
 
 /*

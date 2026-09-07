@@ -110,12 +110,39 @@ Every one of these was found by running gem5, not assumed:
   `-one-insn-per-tb -d op,in_asm` dumps the preserve oracle reads, with the
   stack-addressing macros EXPANDED before the walk -- unexpanded, the read is
   in no function body and the tool answers `no` on every x87 form.  A YES is
-  `REF-X87-TOP-FOLDED-AT-DECODE`, a NO is `TRACER-X87-TOP-NOT-READ` and
-  convicts, and an encoding the oracle cannot see is `REF-X87-TOP-UNDECIDED`,
-  a REFUSAL that counts against the leg.  `--inject-x87-top` plants a
-  `REG_FCSR` source on every encoding QEMU says reads no part of
-  `{fpus, fpstt, fptags}`, and `--rule-gem5-only` is the arm in which the
-  ungated rule forgives them.
+  `REF-X87-TOP-FOLDED-AT-DECODE`, and an encoding the oracle cannot see is
+  `REF-X87-TOP-UNDECIDED`, a REFUSAL that counts against the leg.
+* **The SSE forms read a DIFFERENT file, and they get their own reason.**
+  `target/i386` keeps one `float_status` per FP datapath — x87 `fp_status`,
+  3DNow! `mmx_status`, SSE/AVX `sse_status` — and `addsd` reads no part of
+  the x87 status group.  It reads `env->sse_status`: the rounding mode, the
+  flush-to-zero and denormals-are-zero controls and the exception masks
+  MXCSR decodes into.  gem5 keeps MXCSR in the misc file
+  (`MISCREG_MXCSR`) and its SSE float micro-ops name no control operand at
+  all, so the silence is STRUCTURAL, the same shape as
+  `REF-NO-RIP-OPERAND`'s.  The QEMU half is
+  `sse_status_derive.SseStatusOracle`, which reads QEMU's own generated
+  helper-usage table — `dfu_addsd_env` naming
+  `offsetof(CPUArchState, sse_status)` with `INSN_DF_RD`, from
+  `ops_sse.h:529` — the same artifact the wire consults, so the oracle and
+  the wire cannot hold separate opinions.  A YES is
+  `REF-NO-MXCSR-OPERAND`; a refusal falls through to the x87 question rather
+  than being excused.
+
+  This is asked FIRST, and the reason is a correction: the x87 oracle
+  analyses `fpu_helper.c`, cannot see an SSE helper at all, and correctly
+  refuses on `mulps` — so the `p_wpsse` rows used to land
+  `REF-X87-TOP-UNDECIDED`, an x87 reason, undecided, standing in for an SSE
+  measurement.  A plausible tag over a mechanism it does not describe is the
+  shape of this project's four false allowlist entries.
+* **A conviction needs BOTH files to say no.**  `TRACER-X87-TOP-NOT-READ` is
+  reported where the status-group derivation says the encoding reads no part
+  of `{fpus, fpstt, fptags}` AND its helper states no read of
+  `env->sse_status`; a False from one oracle only means "not this file".
+  `--inject-x87-top` plants a `REG_FCSR` source on exactly those encodings —
+  excluding the ones the SSE oracle answers YES on, where naming `REG_FCSR`
+  is not a plant but the truth — and `--rule-gem5-only` is the arm in which
+  the ungated rule forgives them.
 * **gem5 never names its own x87 control word.**  `misc_reg::Fcw` exists in
   the enumeration, one past `Mxcsr` and one before `Fsw`; over every run in
   this leg `miscellaneous:193` occurs **zero** times in any operand list, and
@@ -177,7 +204,8 @@ makes the closure a measurement rather than a claim.
 
 `--inject-x87-top` is the same shape on the SUPERSET side, for
 `REF-X87-TOP-FOLDED-AT-DECODE`.  It plants a `REG_FCSR` source on every
-encoding the QEMU status-group oracle answers NO on, and the leg must report
+encoding the QEMU status-group oracle answers NO on **and** the SSE status
+oracle does not answer YES on, and the leg must report
 `TRACER-X87-TOP-NOT-READ`; under `--rule-gem5-only` the ungated rule excuses
 every one of them, because gem5's operand text is silent about TOP on all
 encodings alike and cannot tell a planted read from a real one.

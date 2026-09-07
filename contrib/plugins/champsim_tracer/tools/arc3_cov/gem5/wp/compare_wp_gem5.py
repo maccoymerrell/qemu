@@ -71,6 +71,7 @@ import elfimage                                              # noqa: E402
 import wp_trace                                              # noqa: E402
 import qemu_preserve_oracle as QPO                           # noqa: E402
 import x87_cw_derive as X87D                                 # noqa: E402
+import sse_status_derive as SSED                             # noqa: E402
 import wp_seed_x86                                           # noqa: E402
 import gem5_wp_ref                                           # noqa: E402
 import gem5_env                                              # noqa: E402
@@ -191,6 +192,26 @@ GATE = True
 X87 = None
 X87_GATE = True
 
+#: THE SSE HALF OF THE SAME QUESTION, and it is a DIFFERENT question.
+#:
+#: The gate above answers about the x87 STATUS GROUP -- {fpus, fpstt,
+#: fptags} -- by walking fpu_helper.c.  An SSE form reads none of those: it
+#: reads `env->sse_status`, a separate `float_status` on a separate
+#: datapath, out of a file (ops_sse.h) the x87 derivation does not analyse.
+#: Asked about `mulps`, the x87 oracle correctly REFUSES -- "helper mulps_xmm
+#: has no body in the analysed sources" -- and the row lands
+#: REF-X87-TOP-UNDECIDED.
+#:
+#: That refusal is honest and it is not an adjudication, and the temptation
+#: it creates is the one this project has been burnt by four times: to let
+#: the nearest available tag stand in for the reason.  An x87 TOP label on an
+#: SSE probe is a false justification whether or not the DIRECTION it reports
+#: happens to be right.  So the SSE forms get an oracle for the file they
+#: actually read -- QEMU's own generated usage table, the same artifact the
+#: wire consults -- and it is asked FIRST, because the x87 oracle's answer
+#: about an SSE encoding is not about that encoding at all.
+SSE = None
+
 
 def set_oracle(o):
     global ORACLE
@@ -202,14 +223,41 @@ def set_x87(o):
     X87 = o
 
 
+def set_sse(o):
+    global SSE
+    SSE = o
+
+
 def _x87_top_label(enc):
     """The SOURCE-axis label for a tracer-only REG_FCSR, decided by QEMU.
 
-    Three outcomes and they must stay three.  A refusal is not a conviction
-    and a conviction is not a refusal; the report has to say which.
+    TWO FILES, ASKED IN ORDER.  gem5 names no float-control source on ANY
+    encoding, x87 or SSE, so its silence is the same text either way and
+    cannot supply the second half.  QEMU supplies it, and WHICH QEMU state
+    the instruction reads decides which reference gap the row is:
+
+      * `env->sse_status` -- the SSE/AVX datapath's rounding mode, flush-to-
+        zero and masking, the run-time file MXCSR is decoded into.  gem5
+        keeps MXCSR as MISCREG_MXCSR and its SSE micro-ops take their two
+        data operands and nothing else, so there is no control operand in
+        the reference's list to match.  REF-NO-MXCSR-OPERAND.
+      * the x87 status group -- {fpus, fpstt, fptags}, reached through the
+        ST0/ST(n) macros.  gem5 flattens the stack slot to a physical index
+        at decode and names no TOP source.  REF-X87-TOP-FOLDED-AT-DECODE.
+
+    The SSE question is asked first and its NO is not an answer to the x87
+    question: a False from one oracle only means "not this file", so the row
+    falls through to the other rather than convicting.  A conviction needs
+    BOTH files to say no, which is what `TRACER-X87-TOP-NOT-READ` now means
+    and what the injection control below plants for.
+
+    Four outcomes and they must stay four.  A refusal is not a conviction and
+    a conviction is not a refusal; the report has to say which.
     """
     if not X87_GATE:
         return 'REF-X87-TOP-FOLDED-AT-DECODE'
+    if enc is not None and SSE is not None and SSE.reads_sse_status(enc):
+        return 'REF-NO-MXCSR-OPERAND'
     if X87 is None or enc is None:
         return 'REF-X87-TOP-UNDECIDED'
     v = X87.reads_status(enc)
@@ -768,6 +816,14 @@ def inject_x87_top(exc):
     ``--rule-gem5-only`` and the ungated rule forgives them, which is what
     makes the gate a measurement rather than a decoration.
 
+    THE SUBJECT IS BOTH FILES, NOT ONE.  A planted read is a FABRICATION
+    only where QEMU reads no float-control state at all, so an encoding the
+    SSE oracle says reads `env->sse_status` is excluded: naming REG_FCSR
+    there is not a plant, it is the truth, and a control that convicts on a
+    true fact measures nothing.  This is the same widening the label above
+    took -- a conviction needs both files to say no -- applied to the arm
+    that proves the label convicts.
+
     -> Counter of encodings actually given a planted source.
     """
     hit = collections.Counter()
@@ -777,6 +833,8 @@ def inject_x87_top(exc):
             if enc is None or 'REG_FCSR' in ins.srcs:
                 continue
             if X87 is None or X87.reads_status(enc) is not False:
+                continue
+            if SSE is not None and SSE.reads_sse_status(enc):
                 continue
             ins.srcs = list(ins.srcs) + ['REG_FCSR']
             hit[enc] += 1
@@ -1098,6 +1156,18 @@ def main():
     for _l in _olog:
         x87.add_dump(_l)
     set_x87(x87)
+    # The SSE half, off the SAME dumps again -- no guest is run a third
+    # time.  It answers from QEMU's generated helper-usage table, which is
+    # the artifact the wire itself consults, so the oracle and the wire
+    # cannot hold separate opinions about which helper reads sse_status.
+    sse = SSED.SseStatusOracle()
+    for _l in _olog:
+        sse.add_dump(_l)
+    set_sse(sse)
+    envx.notes.append('SSE STATUS ORACLE: %d helper rows in %s, %d of them '
+                      'naming a read of env->sse_status'
+                      % (len(sse.helpers), SSED.TABLE,
+                         sum(1 for v in sse.helpers.values() if v)))
     if a.rule_gem5_only:
         global GATE, X87_GATE
         GATE = False

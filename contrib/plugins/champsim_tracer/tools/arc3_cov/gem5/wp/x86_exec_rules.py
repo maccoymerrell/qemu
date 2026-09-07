@@ -259,15 +259,67 @@ X86_EXEC = {
                   'through the ST0/ST(n) macros on this encoding, confirmed '
                   'per encoding by x87_cw_derive.StatusOracle'),
 
-    # The converse, and it is a TRACER defect: the tracer named the status
-    # word as a source on an encoding QEMU reads no part of the status group
-    # on.  No rule excuses it.
+    # THE SSE/AVX DATAPATH'S CONTROL AND STATUS FILE, on the SOURCE axis.
+    #
+    # This is a DIFFERENT gap from the one above and it took its own reason
+    # rather than the nearest available one.  target/i386 keeps one
+    # `float_status` per FP datapath -- x87 `fp_status`, 3DNow! `mmx_status`,
+    # SSE/AVX `sse_status` -- and an SSE form reads NO part of the x87 status
+    # group.  It reads `env->sse_status`: the rounding mode, the flush-to-zero
+    # and denormals-are-zero controls and the exception masks that MXCSR is
+    # decoded into and that select which result the operation produces.  QEMU
+    # states that read outright, per helper, in the generated usage table --
+    # `dfu_addsd_env` names offsetof(CPUArchState, sse_status) with
+    # INSN_DF_RD, from ops_sse.h:529 -- which is the same artifact the wire
+    # consults, and `bb24f882b2` declared those bytes so the stated read
+    # arrives carrying REG_FCSR.
+    #
+    # gem5 has no operand to match it with.  MXCSR lives in the misc register
+    # file (MISCREG_MXCSR, src/arch/x86/regs/misc.hh) and its SSE float
+    # micro-ops -- the `Mult`/`Add`/`Sub` fp forms in
+    # src/arch/x86/isa/microops/fpop.isa -- take their two data operands and
+    # a destination and name no control register at all.  The silence is
+    # STRUCTURAL, exactly as REF-NO-RIP-OPERAND's is: there is no place in
+    # the reference's operand list for the fact to appear.
+    #
+    # WHY IT IS NOT REF-X87-TOP-FOLDED-AT-DECODE, which is the rule these
+    # rows were previously landing beside.  That rule's mechanism is gem5
+    # flattening `%st(i)` to a physical index at decode, which is a statement
+    # about the x87 STACK and says nothing about `mulps %xmm1,%xmm3`.  Its
+    # QEMU half -- x87_cw_derive walking fpu_helper.c -- cannot see an SSE
+    # helper at all and correctly REFUSES, which is how the p_wpsse rows came
+    # to be tagged REF-X87-TOP-UNDECIDED: an x87 reason, undecided, standing
+    # in for an SSE measurement.  A plausible tag over a mechanism it does
+    # not describe is precisely the shape of this project's four false
+    # allowlist entries, so the SSE rows get the file they actually read.
+    #
+    # GATED, NOT FREE.  gem5's silence is the same text whether the tracer is
+    # right or wrong, so the rule covers a row only where
+    # sse_status_derive.SseStatusOracle answers YES for that ENCODING, off
+    # the same `-d op` dump the preserve and x87 oracles read.  An encoding
+    # the dump never carried, one QEMU lowered with no helper call, or a
+    # helper with no row in the table are all refusals and fall through to
+    # the x87 question rather than being excused here.
+    'REF-NO-MXCSR-OPERAND':
+        Rule('REF-NO-MXCSR-OPERAND', 'reference-gap', {SUPERSET},
+             note='gem5 keeps MXCSR in the misc register file and its SSE '
+                  'micro-ops name no float-control operand; QEMU states a '
+                  'read of env->sse_status for this encoding\'s helper in '
+                  'its own generated usage table'),
+
+    # The converse, and it is a TRACER defect: the tracer named a float
+    # control-and-status file as a source on an encoding QEMU reads NEITHER
+    # of them on -- no part of the x87 status group {fpus, fpstt, fptags},
+    # and no read of env->sse_status stated for its helper.  Both files have
+    # to say no, because a False from one oracle only means "not this file".
+    # No rule excuses it.
     'TRACER-X87-TOP-NOT-READ':
         Rule('TRACER-X87-TOP-NOT-READ', 'tracer-defect', {SUPERSET},
              accounts=False,
              note='the tracer names REG_FCSR as a source on an encoding the '
                   'QEMU status-group derivation says reads no part of '
-                  '{fpus, fpstt, fptags}'),
+                  '{fpus, fpstt, fptags} and whose helper states no read of '
+                  'env->sse_status'),
 
     # REFUSAL, not excuse -- the same discipline as
     # REF-PRESERVE-READ-UNDECIDED.  An encoding the op dump never carried, or

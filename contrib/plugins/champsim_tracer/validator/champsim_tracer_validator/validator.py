@@ -4779,18 +4779,12 @@ def _check_static_reg_sets(
             # is a gain:
             #
             #   a Capstone-named source the wire does NOT carry  -> ERROR
-            #   a Capstone-named destination mismatch            -> ERROR
             #   sources the wire carries and Capstone does not   -> counted
             #
             # It is counted and NAMED, per register, in the summary below,
             # so the surplus is a number that can be read and adjudicated
             # rather than a silence.  A blanket "extras are fine" would
             # retire the oracle; this does not.
-            #
-            if actual_dst == exp_dst and exp_src < actual_src:
-                n_surplus += 1
-                surplus_regs.update(actual_src - exp_src)
-                continue
             #
             # AND NEITHER IS THE DESTINATION LIST (#232).
             #
@@ -4811,13 +4805,46 @@ def _check_static_reg_sets(
             #
             # Counted and NAMED per register in the summary, so the rows this
             # stopped failing on are a number in every log rather than a
-            # silence.  The source sets must still agree exactly here: a row
-            # whose BOTH lists disagree is not a gain on one side, it is a
-            # row nobody has looked at.
+            # silence.
             #
-            if actual_src == exp_src and exp_dst < actual_dst:
-                n_dst_surplus += 1
-                dst_surplus_regs.update(actual_dst - exp_dst)
+            # AND THE TWO GAINS ARE INDEPENDENT (#341).
+            #
+            # This pair of tests used to require the OTHER list to match
+            # EXACTLY, on the reasoning that "a row whose BOTH lists disagree
+            # is not a gain on one side, it is a row nobody has looked at".
+            # The reasoning is right about DISAGREEMENT and wrong about
+            # CONTAINMENT, and one register made the difference visible:
+            # target/i386's three `float_status` files were declared, and an
+            # SSE arithmetic form now carries REG_FCSR on BOTH axes at once
+            # -- it reads env->sse_status for the rounding mode and writes it
+            # back with the accrued exception flags.  Capstone names neither.
+            # `addsd`, `mulsd`, `divsd`, `sqrtsd`, `ucomisd`, `cvtsi2sd`,
+            # `vfmadd132sd`, `vfmsub132sd`, `subsd` and `fldcw` all scored
+            # ERROR under a model that could admit a gain on one axis but not
+            # on two, while `qemu_surplus_dst` read 0 and nothing was lost on
+            # either side.
+            #
+            # So the containment is tested per axis and the ERROR keeps ALL
+            # of its power in the direction that is information loss:
+            #
+            #   a Capstone-named source the wire does NOT carry       -> ERROR
+            #   a Capstone-named destination the wire does NOT carry  -> ERROR
+            #   supersets on EITHER axis, or on both                  -> counted
+            #
+            # A row is a gain only when NEITHER list is short.  The moment
+            # one of them is -- even beside a superset on the other axis --
+            # the row falls through to the error below, which is the case the
+            # old wording was reaching for and the containment test states
+            # exactly.  Equality on both axes returned above, so reaching
+            # here means at least one axis is a strict superset.
+            #
+            if exp_src <= actual_src and exp_dst <= actual_dst:
+                if exp_src < actual_src:
+                    n_surplus += 1
+                    surplus_regs.update(actual_src - exp_src)
+                if exp_dst < actual_dst:
+                    n_dst_surplus += 1
+                    dst_surplus_regs.update(actual_dst - exp_dst)
                 continue
             n_errors += 1
             if n_errors <= err_cap:

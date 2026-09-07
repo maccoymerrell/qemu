@@ -1622,6 +1622,9 @@ void riscv_translate_init(void)
 {
     int i;
 
+    /* See gen_note_csr_read(): the spellings must outlive a translation. */
+    riscv_init_csr_number_names();
+
     /*
      * cpu_gpr[0] is a placeholder for the zero register. Do not use it.
      * Use the gen_set_gpr and get_gpr helper functions when accessing regs,

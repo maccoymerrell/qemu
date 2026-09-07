@@ -601,6 +601,31 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYS;
     }
     /*
+     * A CSR NUMBER THIS BUILD DOES NOT IMPLEMENT, spelled `csr0x<num>` by
+     * target/riscv/insn_trans/trans_rvi.c.inc's gen_note_csr_read().
+     *
+     * csr_ops[] holds a NULL name for every number no extension in the build
+     * claims, and the note refuses an empty name -- so the whole CSR class of
+     * the source bar, 892 registers, was lost for want of a SPELLING rather
+     * than for want of a statement.  The decode site has the number; the
+     * number is what it says.
+     *
+     * REG_SYS is not a new word for it.  It is the vocabulary's residual
+     * privileged-file word and it is what the wire already publishes for
+     * every one of those encodings -- `csrrs a5,0x000,x0` arrives carrying
+     * REG_SYS and nothing finer, because Capstone has no name for the number
+     * either.  So this connects a spelling to the word the wire already
+     * answers in, exactly as `xcr0`, `elp` and `xl` above do.
+     *
+     * A CSR the table DOES name never reaches here: `fflags` and `cycle`
+     * resolve through the generated table's own rows to REG_FCSR and
+     * REG_SYSTIMER, and this arm is the fallback for the numbers that have
+     * no row anywhere.
+     */
+    if (!strncmp(name, "csr0x", 5) && strlen(name) == 8) {
+        return REG_SYS;
+    }
+    /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS -- x86's GDTR, IDTR, LDTR and
      * TR -- DECLARED by target/i386/tcg/translate.c and absent from the i386
      * GDB stub's namespace, the same shape as XCR0 above.

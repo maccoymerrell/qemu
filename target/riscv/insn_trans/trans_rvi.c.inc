@@ -1140,12 +1140,56 @@ static bool do_csr_post(DisasContext *ctx)
  * a NULL name and the note refuses it at the door rather than inventing a
  * spelling.
  */
+/*
+ * THE SPELLING FOR A CSR NUMBER THIS BUILD DOES NOT IMPLEMENT.
+ *
+ * csr_ops[] holds a NULL name for every number no extension in this build
+ * claims, and insn_dataflow_note_stated_read_name() refuses an empty name at
+ * the door -- correctly, because a note that cannot be told from "no note"
+ * downstream is worse than none.  The result was that ALL 892 registers of
+ * the source bar's CSR class were lost for want of a spelling, not for want
+ * of a statement: `frflags` and `rdcycle` come through the same
+ * gen_note_csr_read() with their table names and land on the wire.
+ *
+ * REFUSING TO INVENT IS RIGHT; LETTING THE REGISTER VANISH IS NOT.  The
+ * encoding's 12-bit `csr` field NAMES the register (R7.3) and is a STATIC
+ * field of the encoding, which is exactly what R20 says a decode site may
+ * state.  R12.1 settles the direction outright: the wire publishes REG_SYS
+ * for these encodings today, the deletion must be a superset, and the
+ * pessimistic-direction discount is refused by that ruling in its own words.
+ *
+ * SO THE IDENTITY THAT IS KNOWN IS SAID, AND NO MORE.  The number is what
+ * this site has; `csr0x<num>` is that number and nothing else, and the
+ * consumer folds it to REG_SYS -- the vocabulary's residual privileged-file
+ * word and the one the wire already publishes here.  It is the same trade
+ * champsim_tracer_irdf.cc makes for `xcr0`, `elp` and `xl`: a spelling
+ * connected to a word, with neither invented.
+ *
+ * THE TABLE IS BUILT ONCE, at riscv_translate_init(), before any translation
+ * runs, because the note requires a name that outlives the translation and a
+ * per-call buffer would not.
+ */
+static char csr_number_names[CSR_TABLE_SIZE][10];
+
+static void riscv_init_csr_number_names(void)
+{
+    for (int i = 0; i < CSR_TABLE_SIZE; i++) {
+        snprintf(csr_number_names[i], sizeof(csr_number_names[i]),
+                 "csr0x%03x", i);
+    }
+}
+
 static void gen_note_csr_read(int csrno)
 {
     riscv_csr_operations ops;
 
     riscv_get_csr_ops(csrno, &ops);
-    insn_dataflow_note_stated_read_name(ops.name);
+    if (ops.name) {
+        insn_dataflow_note_stated_read_name(ops.name);
+    } else {
+        insn_dataflow_note_stated_read_name(
+            csr_number_names[csrno & (CSR_TABLE_SIZE - 1)]);
+    }
 }
 
 static bool do_csrr(DisasContext *ctx, int rd, int rc)
@@ -1264,6 +1308,15 @@ static bool trans_csrrs(DisasContext *ctx, arg_csrrs *a)
      */
     if (get_xl(ctx) < MXL_RV128) {
         if (a->rs1 == 0) {
+            /*
+             * x0 IS THE MASK OPERAND THE ARCHITECTURE NAMES.  The rs1 == 0
+             * arm exists because writing a zero mask must cause no write and
+             * no side effect, so get_gpr() -- which is where the zero
+             * register's fold is stated -- is never reached and the read of
+             * x0 disappears with the write it suppresses.  R7.3: the
+             * encoding names it exactly the way it would name x5.
+             */
+            insn_dataflow_note_folded_read_zero();
             return do_csrr(ctx, a->rd, a->csr);
         }
 
@@ -1272,6 +1325,15 @@ static bool trans_csrrs(DisasContext *ctx, arg_csrrs *a)
         return do_csrrw(ctx, a->rd, a->csr, ones, mask);
     } else {
         if (a->rs1 == 0) {
+            /*
+             * x0 IS THE MASK OPERAND THE ARCHITECTURE NAMES.  The rs1 == 0
+             * arm exists because writing a zero mask must cause no write and
+             * no side effect, so get_gpr() -- which is where the zero
+             * register's fold is stated -- is never reached and the read of
+             * x0 disappears with the write it suppresses.  R7.3: the
+             * encoding names it exactly the way it would name x5.
+             */
+            insn_dataflow_note_folded_read_zero();
             return do_csrr_i128(ctx, a->rd, a->csr);
         }
 
@@ -1293,6 +1355,15 @@ static bool trans_csrrc(DisasContext *ctx, arg_csrrc *a)
      */
     if (get_xl(ctx) < MXL_RV128) {
         if (a->rs1 == 0) {
+            /*
+             * x0 IS THE MASK OPERAND THE ARCHITECTURE NAMES.  The rs1 == 0
+             * arm exists because writing a zero mask must cause no write and
+             * no side effect, so get_gpr() -- which is where the zero
+             * register's fold is stated -- is never reached and the read of
+             * x0 disappears with the write it suppresses.  R7.3: the
+             * encoding names it exactly the way it would name x5.
+             */
+            insn_dataflow_note_folded_read_zero();
             return do_csrr(ctx, a->rd, a->csr);
         }
 
@@ -1300,6 +1371,15 @@ static bool trans_csrrc(DisasContext *ctx, arg_csrrc *a)
         return do_csrrw(ctx, a->rd, a->csr, ctx->zero, mask);
     } else {
         if (a->rs1 == 0) {
+            /*
+             * x0 IS THE MASK OPERAND THE ARCHITECTURE NAMES.  The rs1 == 0
+             * arm exists because writing a zero mask must cause no write and
+             * no side effect, so get_gpr() -- which is where the zero
+             * register's fold is stated -- is never reached and the read of
+             * x0 disappears with the write it suppresses.  R7.3: the
+             * encoding names it exactly the way it would name x5.
+             */
+            insn_dataflow_note_folded_read_zero();
             return do_csrr_i128(ctx, a->rd, a->csr);
         }
 

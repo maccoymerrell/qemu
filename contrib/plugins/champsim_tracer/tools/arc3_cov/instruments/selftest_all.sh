@@ -18,8 +18,37 @@ TMP="${1:-/tmp/arc3_instr_selftest}"
 rm -rf "$TMP"; mkdir -p "$TMP" || exit 2
 PY="${PYTHON:-python}"
 
-n=0; ok=0; nost=0
-declare -a RED=() NOST=()
+# THE ARM COUNT IS A GATE, NOT A DECORATION -- FINDING 84-A.
+#
+# The count printed beside each PASS used to be `grep -c '^PASS'`, and 14 of
+# the 24 instruments printed 0 for it.  They were checked before anything was
+# claimed and they are NOT vacuous -- ordlist_check asserts 7 things, setproof
+# 11, keyfacts 11, srcenc_ab 12 -- they simply spell their assertions in a
+# different word.  FIVE conventions live in this directory and the counter
+# knew one, so four were invisible to it.  The fifth was found BY THIS GATE
+# on its first run: abandoned_families.py and cph_census.py print `  ARM A:
+# ... ok`, asserting 9 and 12 things respectively, and both scored zero and
+# went red -- which is the gate doing its job and the one-line fix the
+# paragraph below predicts.
+#
+# What that cost is the whole point: with an unreliable count a selftest that
+# asserts twelve things and one that asserts NOTHING render identically, and a
+# module whose --selftest is `sys.exit(0)` was PROVEN by plant to score green.
+# That is the "green whose subject was never established" shape this tree
+# files against everywhere else, and must0_scan.py already carries the remedy
+# in its own words -- "A scanner that cannot find its subject FAILS."  The
+# concept was in the INSTRUMENTS and absent from the RUNNER that scores them.
+#
+# So: all four conventions are counted, and a green with ZERO counted arms is
+# a RED.  An instrument that invents a fifth spelling shows up as a red with
+# a real selftest, which is a visible, one-line fix -- and is the direction
+# this has to fail in, because the alternative is scoring silence as proof.
+count_arms() {
+    grep -c -E "^PASS|^  PASS|^ARM [0-9]+ ok:|^selftest .*-> OK|^  A .* ok|^  ARM .* ok" "$1"
+}
+
+n=0; ok=0; nost=0; vac=0
+declare -a RED=() NOST=() VAC=()
 for f in *.py; do
     case "$f" in
         _*|evopen.py) continue ;;   # library modules, not instruments
@@ -47,18 +76,26 @@ for f in *.py; do
         form=
     fi
     if [ -n "$form" ]; then
-        ok=$((ok + 1))
-        printf 'PASS  %-26s %-7s %s arm(s)\n' "$f" "$form" \
-               "$(grep -c '^PASS' "$log")"
+        arms=$(count_arms "$log")
+        if [ "$arms" -eq 0 ]; then
+            vac=$((vac + 1)); VAC+=("$f")
+            printf 'RED   %-26s %-7s 0 arm(s) -- ASSERTS NOTHING\n' \
+                   "$f" "$form"
+        else
+            ok=$((ok + 1))
+            printf 'PASS  %-26s %-7s %s arm(s)\n' "$f" "$form" "$arms"
+        fi
     else
         RED+=("$f")
         printf 'RED   %-26s see %s\n' "$f" "$log"
     fi
 done
 
-printf '\ninstruments found %d  green %d  RED %d  NO-SELFTEST %d\n' \
-       "$n" "$ok" "${#RED[@]}" "$nost"
+printf '\ninstruments found %d  green %d  RED %d  ZERO-ARM %d  NO-SELFTEST %d\n' \
+       "$n" "$ok" "${#RED[@]}" "$vac" "$nost"
 [ "${#RED[@]}" -eq 0 ] || printf 'RED: %s\n' "${RED[*]}"
+[ "$vac" -eq 0 ] || printf 'ZERO-ARM: %s\n' "${VAC[*]}"
 [ "$nost" -eq 0 ] || printf 'NO-SELFTEST: %s\n' "${NOST[*]}"
-# A module without a selftest is a failure of this script, not a silence.
-[ "${#RED[@]}" -eq 0 ] && [ "$nost" -eq 0 ]
+# A module without a selftest is a failure of this script, not a silence, and
+# a selftest that asserts nothing is the same failure one step later.
+[ "${#RED[@]}" -eq 0 ] && [ "$vac" -eq 0 ] && [ "$nost" -eq 0 ]

@@ -1398,6 +1398,31 @@ static void note_elided_addvl_write(int rd, int rn, int imm, TCGv_i64 reg)
     if (imm == 0 && rd == rn) {
         insn_dataflow_note_discarded_write(tcgv_i64_temp(reg),
                                            a64_reg_name(rd));
+        /*
+         * AND THE READ THE SAME ELISION ERASED.
+         *
+         * The write half above has been stated since the destination census
+         * measured it.  The SOURCE side is the same elision seen from the
+         * other end, and the bar measured it too: eight registers over
+         * `addvl`, `addpl`, `addsvl` and `addspl`, every losing encoding
+         * carrying imm6 == 0 AND Rd == Rn.  tcg_gen_addi_i64() with a zero
+         * constant reduces to tcg_gen_mov_i64(), which emits NOTHING when
+         * its two arguments are the same temp, so no op reads Xn either.
+         *
+         * The ledger asked whether an increment whose ADDEND is a
+         * translation-time constant still reads Xdn, and whether the answer
+         * depends on the vector length the sled ran at.  It does, and it
+         * does not: the loss is a SELF-MOVE THAT WAS ELIDED rather than a
+         * constant fold, and imm == 0 makes the product zero at every VL.
+         * 84-B's `gengvec.c` shift-by-esize branch is the same mechanism one
+         * step earlier -- there QEMU emitted a self-move the extraction did
+         * not carry out; here TCG removed it before anyone could.  R16: an
+         * emulator optimisation does not reach the trace, and R15 says the
+         * elision is a lowering decision rather than architectural truth.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_folded_read(tcgv_i64_temp(reg));
     }
 }
 
@@ -2235,9 +2260,23 @@ static bool trans_INCDEC_r(DisasContext *s, arg_incdec_cnt *a)
              */
             if (a->rd == 31) {
                 insn_dataflow_note_discarded_zero_write(tcgv_i64_temp(reg));
+                /*
+                 * AND THE READ.  The same `addi reg, reg, 0` emits nothing,
+                 * so the SOURCE side of the self-move is lost with the
+                 * destination side -- 268 registers over the eight
+                 * `incb`/`decb`..`incd`/`decd` families, every one of them
+                 * REG_ZERO because XZR is the destination.  cpu_reg()'s
+                 * zero-register note above resolves against the temp's
+                 * contents at the end of the instruction and the discarded
+                 * write claims it, so the read has to be said outright.
+                 * See note_elided_addvl_write() for the ruling.
+                 */
+                insn_dataflow_note_folded_read_zero();
             } else {
                 insn_dataflow_note_discarded_write(tcgv_i64_temp(reg),
                                                    a64_reg_name(a->rd));
+                /* The read half; see note_elided_addvl_write(). */
+                insn_dataflow_note_folded_read(tcgv_i64_temp(reg));
             }
         }
         tcg_gen_addi_i64(reg, reg, inc);

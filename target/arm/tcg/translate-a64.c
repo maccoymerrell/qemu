@@ -2306,8 +2306,21 @@ static void note_prefetch_base_read(DisasContext *s)
         { 0xffc00000u, 0xf9800000u, false },
         /* PRFUM (unscaled immediate) */
         { 0xffe00c00u, 0xf8800000u, false },
-        /* PRFM (register offset); option<1> is 1 on every defined form */
-        { 0xffe02c00u, 0xf8a02800u, true  },
+        /*
+         * PRFM / RPRFM (register offset).  a64.decode's row is
+         * `11 111 0 00 10 1 ----- -1- - 10 ----- -----`, so what it requires
+         * is option<1> -- BIT 14 -- and bits 11:10 == 10.
+         *
+         * THE MASK USED TO TEST BIT 13, which is option<0>, and the whole
+         * population says what that cost: over the 768 `rprfm` rows of the
+         * banked corpus the losing half is option 2 and 6 (bit 14 set, bit 13
+         * CLEAR) at 192 each and the clean half is option 3 and 7 (both bits
+         * set) at 192 each, with no third bin.  Half the encodings matched by
+         * accident -- because option<0> happened to be 1 as well -- and half
+         * did not, which is exactly the shape a mask written against the
+         * wrong bit takes: it looks like coverage and is half of one.
+         */
+        { 0xffe04c00u, 0xf8a04800u, true  },
     };
     uint32_t insn = s->insn;
 
@@ -2330,9 +2343,50 @@ static void note_prefetch_base_read(DisasContext *s)
     }
 }
 
+/*
+ * CHKFEAT'S REGISTER, WHICH IS NOT AN IGNORED OPERAND.
+ *
+ * `chkfeat x16` (HINT #40, CRm=0b0101 op2=0b000) is decoded through the
+ * catch-all NOP row of a64.decode, and QEMU emits nothing because this
+ * implementation supports none of the features it reports on.  The wire
+ * publishes REG_GPR16 and QEMU stated nothing.
+ *
+ * It is stronger than the prefetch case above.  ARM DDI 0487, CHKFEAT: the
+ * instruction READS X16 and WRITES it back with the bit of each IMPLEMENTED
+ * feature CLEARED -- so X16 is not an operand the architecture permits an
+ * implementation to ignore; it is the instruction's input and its result.
+ * That every bit survives on a machine implementing no feature is a property
+ * of THIS model, and R16 records the ISA-defined dependency regardless of
+ * machine state.
+ *
+ * X16 IS FIXED BY THE ENCODING, not carried in a field, which is what makes
+ * this statable here at all (R20).
+ *
+ * THE WRITE IS STATED WITH THE READ, because leaving it out would publish an
+ * instruction that reads a register and produces nothing -- and a
+ * destination that is missing is a dependency edge that does not exist,
+ * which insn_dataflow_note_stated_write_env()'s own header names as the
+ * error this side may not make.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_chkfeat_x16(DisasContext *s)
+{
+    if ((s->insn & 0xffffffffu) != 0xd503251fu) {
+        return;
+    }
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUARMState, xregs[16]),
+        sizeof(((CPUARMState *)0)->xregs[0]));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUARMState, xregs[16]),
+        sizeof(((CPUARMState *)0)->xregs[0]));
+}
+
 static bool trans_NOP(DisasContext *s, arg_NOP *a)
 {
     note_prefetch_base_read(s);
+    note_chkfeat_x16(s);
     return true;
 }
 
@@ -2399,6 +2453,28 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
     if (!dc_isar_feature(aa64_wfxt, s)) {
         return false;
     }
+
+    /*
+     * THE TIMEOUT REGISTER, WHICH THIS TRANSLATION DOES NOT READ.
+     *
+     * ARM DDI 0487, WFET: the instruction waits until the local timer
+     * reaches the value in Xt, so how long it waits is a FUNCTION OF THAT
+     * REGISTER -- Xt is an operand of the instruction's observable
+     * behaviour, not a hint field.  QEMU's WFE implementation is a NOP and
+     * the arm below never touches Xt, so no op reads it and the wire's
+     * REG_GPR<t> arrived with an empty QEMU read list.
+     *
+     * R7.3 says a register the encoding names is not the emulator's to drop
+     * and R16 records the ISA-defined dependency regardless of what the
+     * model makes of the semantics; 22d7666262 is the precedent for a
+     * register an unimplemented feature makes invisible to the op stream.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_read_env(
+        offsetof(CPUARMState, xregs[0]) +
+        a->rd * sizeof(((CPUARMState *)0)->xregs[0]),
+        sizeof(((CPUARMState *)0)->xregs[0]));
 
     /*
      * We rely here on our WFE implementation being a NOP, so we

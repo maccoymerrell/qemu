@@ -11165,6 +11165,114 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
     }
 }
 
+/*
+ * THE DESTINATION A CONDITIONAL MOVE LEAVES BEHIND.
+ *
+ * `movt $t0,$t1,$fcc0` publishes $t1 when the code is set and $t0 -- its OWN
+ * PREVIOUS VALUE -- when it is clear.  That value is the instruction's RESULT
+ * on that path, not a byte range it happened not to touch, so R7.1's
+ * preservation clause does not reach it: the clause excepts an instruction
+ * that "specifically takes it as a source", and a conditional move is the
+ * shape the exception is written for.  R17 says the same thing positively --
+ * the value written depends on the value held -- and this tree already
+ * applies it to two narrower cases in the same words:
+ * translate-a64.c's `ld1 {v0.b}[3]` ("a merging write, and R17's value-read
+ * test says a partial write reads itself when it merges") and
+ * note_fcr31_read() above, three thousand lines up, for `c.cond.fmt`.
+ *
+ * WHY ONLY THE BRANCH-AROUND FORMS.  gen_cond_move() lowers `movn`/`movz` to
+ * tcg_gen_movcond_tl(..., cpu_gpr[rd], t0, t1, t2, cpu_gpr[rd]), whose FALSE
+ * operand IS the destination global, so the op walk finds the read and
+ * nothing needs saying.  gen_movci() and the three gen_movcf_*() use a branch
+ * around a store instead, and a branch-around names nothing on the not-taken
+ * path.  One architecture, two lowerings, and only the second loses it --
+ * which is R15 in a line: the lowering is not the architectural truth.
+ *
+ * LLVM's MIPS backend models MOVZ/MOVN/MOVT/MOVF with a TIED operand
+ * ($F = $rd), which is the same statement from the reference side.
+ *
+ * Stated as a FOLDED READ of the destination's own global: there is no op to
+ * hang it on, which is exactly what that note exists for.  Capture only.
+ */
+static void note_cond_move_dest_gpr(int rd)
+{
+    if (rd != 0) {
+        insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_gpr[rd]));
+    }
+}
+
+/*
+ * The FP twin of note_cond_move_dest_gpr(), for a 32-bit destination.
+ *
+ * gen_store_fpr32() writes fpu_f64[fd] whatever MIPS_HFLAG_F64 says, so the
+ * register whose value survives the not-taken path is that same global and
+ * this mirrors the store's own choice rather than re-deriving it.
+ */
+static void note_cond_move_dest_fpr32(int fd)
+{
+    insn_dataflow_note_folded_read(tcgv_i64_temp(fpu_f64[fd]));
+}
+
+/*
+ * The same, for a 64-bit destination, mirroring gen_store_fpr64(): one global
+ * on an F64 FPU and the even/odd pair of 32-bit halves otherwise.
+ */
+static void note_cond_move_dest_fpr64(DisasContext *ctx, int fd)
+{
+    if (ctx->hflags & MIPS_HFLAG_F64) {
+        insn_dataflow_note_folded_read(tcgv_i64_temp(fpu_f64[fd]));
+    } else {
+        insn_dataflow_note_folded_read(tcgv_i64_temp(fpu_f64[fd & ~1]));
+        insn_dataflow_note_folded_read(tcgv_i64_temp(fpu_f64[fd | 1]));
+    }
+}
+
+/*
+ * THE SAME QUESTION FOR `movz.fmt` / `movn.fmt`, WHOSE CONDITION IS A GPR.
+ *
+ * Their emitters below guard the comparison with `if (ft != 0)`, because
+ * comparing $zero against zero has a known answer, and the guard costs two
+ * different reads depending on which side of the answer the mnemonic is on.
+ *
+ * THE CONDITION REGISTER, always.  `movn.s $f4,$f0,$zero` names $zero in its
+ * rt field exactly the way it would name $t0, and the guard means no op ever
+ * reads it -- note_gpr_folded_read()'s position, reached from a different
+ * emitter.
+ *
+ * THE DESTINATION, ONLY WHEN THE CONDITION IS STILL A CONDITION.  With
+ * `ft != 0` the move may or may not happen, so the old destination is one of
+ * the two values the instruction can publish and R17 carries it.  With
+ * `ft == 0` the answer is settled at translation time and
+ * `a64-ccond-always`'s reading applies -- an operand the surviving arm never
+ * uses is not a source -- so the two mnemonics part:
+ *
+ *   movz.fmt $f4,$f0,$zero   ALWAYS moves.  $f4 is overwritten and supplies
+ *                            nothing; the drop is right.
+ *   movn.fmt $f4,$f0,$zero   NEVER moves.  $f4's old value IS the published
+ *                            result, and $f0 supplies nothing.
+ *
+ * The `movn` arm is the one whose whole body QEMU elides, so it is also the
+ * one where nothing at all is stated without this.
+ *
+ * @wide selects the storage the matching gen_store_fpr{32,64}() writes.
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_fp_cond_move(DisasContext *ctx, bool move_on_nonzero,
+                              int ft, int fd, bool wide)
+{
+    if (ft == 0) {
+        insn_dataflow_note_folded_read_zero();
+        if (!move_on_nonzero) {
+            return;                     /* movz with $zero: always moves */
+        }
+    }
+    if (wide) {
+        note_cond_move_dest_fpr64(ctx, fd);
+    } else {
+        note_cond_move_dest_fpr32(fd);
+    }
+}
+
 static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
 {
     TCGLabel *l1;
@@ -11175,6 +11283,12 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
         /* Treat as NOP. */
         /* The operand the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
+        /*
+         * The condition code the NOP erases with it.  The encoding's `cc`
+         * field names it whether or not a destination exists to move into;
+         * see gen_note_fcc_read().
+         */
+        gen_note_fcc_read(cc);
         return;
     }
 
@@ -11186,10 +11300,14 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
 
     l1 = gen_new_label();
     t0 = tcg_temp_new_i32();
+    /* The condition-code BIT this move tests; see gen_note_fcc_read(). */
+    gen_note_fcc_read(cc);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc));
     tcg_gen_brcondi_i32(cond, t0, 0, l1);
     gen_load_gpr(cpu_gpr[rd], rs);
     gen_set_label(l1);
+    /* The value published when the code does not match; see above. */
+    note_cond_move_dest_gpr(rd);
 }
 
 static inline void gen_movcf_s(DisasContext *ctx, int fs, int fd, int cc,
@@ -11205,11 +11323,15 @@ static inline void gen_movcf_s(DisasContext *ctx, int fs, int fd, int cc,
         cond = TCG_COND_NE;
     }
 
+    /* The condition-code BIT this move tests; see gen_note_fcc_read(). */
+    gen_note_fcc_read(cc);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc));
     tcg_gen_brcondi_i32(cond, t0, 0, l1);
     gen_load_fpr32(ctx, t0, fs);
     gen_store_fpr32(ctx, t0, fd);
     gen_set_label(l1);
+    /* The value published when the code does not match; see above. */
+    note_cond_move_dest_fpr32(fd);
 }
 
 static inline void gen_movcf_d(DisasContext *ctx, int fs, int fd, int cc,
@@ -11226,12 +11348,16 @@ static inline void gen_movcf_d(DisasContext *ctx, int fs, int fd, int cc,
         cond = TCG_COND_NE;
     }
 
+    /* The condition-code BIT this move tests; see gen_note_fcc_read(). */
+    gen_note_fcc_read(cc);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc));
     tcg_gen_brcondi_i32(cond, t0, 0, l1);
     fp0 = tcg_temp_new_i64();
     gen_load_fpr64(ctx, fp0, fs);
     gen_store_fpr64(ctx, fp0, fd);
     gen_set_label(l1);
+    /* The value published when the code does not match; see above. */
+    note_cond_move_dest_fpr64(ctx, fd);
 }
 
 static inline void gen_movcf_ps(DisasContext *ctx, int fs, int fd,
@@ -11248,17 +11374,34 @@ static inline void gen_movcf_ps(DisasContext *ctx, int fs, int fd,
         cond = TCG_COND_NE;
     }
 
+    /*
+     * TWO condition codes, and each note sits beside the shift that performs
+     * its own bit's read -- the discipline gen_compute_branch1()'s `any2`
+     * and `any4` forms already follow, so a paired-single move states the two
+     * codes it really tests rather than one standing in for both.
+     */
+    gen_note_fcc_read(cc);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc));
     tcg_gen_brcondi_i32(cond, t0, 0, l1);
     gen_load_fpr32(ctx, t0, fs);
     gen_store_fpr32(ctx, t0, fd);
     gen_set_label(l1);
 
+    gen_note_fcc_read(cc + 1);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc + 1));
     tcg_gen_brcondi_i32(cond, t0, 0, l2);
     gen_load_fpr32h(ctx, t0, fs);
     gen_store_fpr32h(ctx, t0, fd);
     gen_set_label(l2);
+    /*
+     * The value published when a code does not match, for both halves: the
+     * low half is fpu_f64[fd] and the upper half is the same global on an F64
+     * FPU and fpu_f64[fd | 1] otherwise, mirroring gen_store_fpr32h().
+     */
+    note_cond_move_dest_fpr32(fd);
+    if (!(ctx->hflags & MIPS_HFLAG_F64)) {
+        note_cond_move_dest_fpr32(fd | 1);
+    }
 }
 
 static void gen_sel_s(DisasContext *ctx, enum fopcode op1, int fd, int ft,
@@ -11641,6 +11784,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr32(ctx, fp0, fs);
             gen_store_fpr32(ctx, fp0, fd);
             gen_set_label(l1);
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, false, ft, fd, false);
         }
         break;
     case OPC_MOVN_S:
@@ -11659,6 +11804,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
                 gen_store_fpr32(ctx, fp0, fd);
                 gen_set_label(l1);
             }
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, true, ft, fd, false);
         }
         break;
     case OPC_RECIP_S:
@@ -12251,6 +12398,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr64(ctx, fp0, fs);
             gen_store_fpr64(ctx, fp0, fd);
             gen_set_label(l1);
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, false, ft, fd, true);
         }
         break;
     case OPC_MOVN_D:
@@ -12269,6 +12418,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
                 gen_store_fpr64(ctx, fp0, fd);
                 gen_set_label(l1);
             }
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, true, ft, fd, true);
         }
         break;
     case OPC_RECIP_D:
@@ -12715,6 +12866,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr64(ctx, fp0, fs);
             gen_store_fpr64(ctx, fp0, fd);
             gen_set_label(l1);
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, false, ft, fd, true);
         }
         break;
     case OPC_MOVN_PS:
@@ -12733,6 +12886,8 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
                 gen_store_fpr64(ctx, fp0, fd);
                 gen_set_label(l1);
             }
+            /* See note_fp_cond_move(). */
+            note_fp_cond_move(ctx, true, ft, fd, true);
         }
         break;
     case OPC_ADDR_PS:

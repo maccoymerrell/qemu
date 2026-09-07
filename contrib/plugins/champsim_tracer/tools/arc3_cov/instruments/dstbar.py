@@ -342,6 +342,34 @@ def selftest(tmp):
     s2 = subprocess.run(cmd, capture_output=True, text=True, env=e2).stdout
     chk(s1 == s2 and s1 != "",
         "two hash seeds give ONE report, byte for byte")
+
+    # THE FAMILY TABLE IS barledger.py'S SHAPE, OR IT IS NOT A FAMILY TABLE.
+    tsv = os.path.join(tmp, "fam.tsv")
+    r5 = run("--tsv", tsv)
+    hdr = ok_rows = ""
+    if os.path.exists(tsv):
+        with open(tsv) as f:
+            lines = f.read().splitlines()
+        hdr = lines[0] if lines else ""
+        ok_rows = [l for l in lines[1:] if l]
+    chk(hdr == "#isa\trule\tmnem\treg\tencodings\tfam_enc\tfam_reg\tmech",
+        "--tsv writes srcbar.py's EXACT eight columns")
+    chk(bool(ok_rows) and all(len(l.split("\t")) == 8 for l in ok_rows),
+        "every family row carries all eight fields")
+    chk(any(l.split("\t")[3] == "R9" and l.split("\t")[2] == "cost"
+            for l in ok_rows),
+        "the walk-only destination is the row, keyed by (rule, mnem, reg)")
+    chk(all("PUBLISHED" in l.split("\t")[7] for l in ok_rows),
+        "the mech column says whether the family reached the wire")
+
+    # AND AN EMPTY BAR REFUSES RATHER THAN WRITING A CLOSED-LOOKING TABLE.
+    clean = os.path.join(tmp, "clean")
+    _write_arm(clean, isa, wp, [dict(enc="01", mnem="same", PUBD="R1",
+                                     WR="R1")])
+    r6 = run("--tsv", os.path.join(tmp, "empty.tsv"), root=clean)
+    chk(r6.returncode != 0 and "REFUSING" in (r6.stdout + r6.stderr)
+        and not os.path.exists(os.path.join(tmp, "empty.tsv")),
+        "an EMPTY bar REFUSES a family table; it is never a closed one")
     print("arms=%d failures=%d" % (n, fails))
     return 0 if fails == 0 else 1
 
@@ -359,12 +387,33 @@ def main():
     ap.add_argument("--top", type=int, default=14)
     #: 0 = every register.  See print_regtable() for why that is the default.
     ap.add_argument("--regtop", type=int, default=0)
+    #: THE FAMILY TABLE AS DATA, in srcbar.py --tsv's EXACT eight columns.
+    #
+    #  The source bar became arguable when it stopped being four numbers and
+    #  started being 170 families a checked-in table adjudicates
+    #  (barledger.py).  The destination bar has had the same decomposition
+    #  since exec137 -- `costrule` is keyed on (rule, mnemonic, register)
+    #  already -- and it has only ever been PRINTED.  A report cannot be
+    #  joined to an adjudication table and cannot refuse on an unadjudicated
+    #  family, so the destination side had no equivalent of "every family
+    #  carries a disposition or this refuses".
+    #
+    #  The columns are srcbar's ON PURPOSE and not merely by convention:
+    #  barledger.py is one join over one shape, so pointing it at this file
+    #  gets the destination side the same three dispositions, the same
+    #  refusal on a family matching none or two classes, and the same
+    #  dead-rule tripwire, with no second scorer to keep in step.
+    ap.add_argument("--tsv", default=None,
+                    help="write the destination bar's family table (isa, "
+                         "rule, mnem, reg, encodings, fam_enc, fam_reg, "
+                         "mech) for barledger.py")
     a = ap.parse_args()
     isas = a.isa or list(ISAS)
     wps = a.wps.split()
 
     G = dict(cost_enc=0, cost_reg=0, gain_enc=0, gain_reg=0,
              pc_carve=0, rows=0, ins=0)
+    TSV = []
     gcostreg = collections.Counter()
     ggainreg = collections.Counter()
     per_isa = {}
@@ -393,6 +442,7 @@ def main():
                      "write list; see FINDING 75-C)" % pm[0])
 
         costreg = collections.Counter(); costrule = collections.Counter()
+        costmech = collections.defaultdict(collections.Counter)
         gainreg = collections.Counter(); gainrule = collections.Counter()
         cost_enc = gain_enc = pc_carve = 0
         cost_reg = gain_reg = 0
@@ -482,6 +532,8 @@ def main():
                 for r in sorted(walk_only):
                     costreg[r] += 1
                     costrule[(row.get("rule", "?"), row.get("mnem", "?"), r)] += 1
+                    costmech[(row.get("rule", "?"), row.get("mnem", "?"), r)][
+                        "PUBLISHED" if published else "UNPUBLISHED"] += 1
                     gcostreg[r] += 1
             if qemu_only:
                 gain_enc += 1; gain_reg += len(qemu_only)
@@ -492,6 +544,9 @@ def main():
                     gainrule[(row.get("rule", "?"), row.get("mnem", "?"), r)] += 1
                     ggainreg[r] += 1
 
+        if a.tsv:
+            for k, n in costrule.items():
+                TSV.append((isa, k[0], k[1], k[2], n, costmech[k]))
         per_isa[isa] = (cost_enc, cost_reg, gain_enc, gain_reg)
         G["cost_enc"] += cost_enc; G["cost_reg"] += cost_reg
         G["gain_enc"] += gain_enc; G["gain_reg"] += gain_reg
@@ -572,6 +627,33 @@ def main():
     print("  R10.1 block-pc carve-outs       : %d encodings" % G["pc_carve"])
     print("  rows read %d, REACH=INSTRUCTION %d, QEMU-STATED WRITE SIDE %d"
           % (G["rows"], G["ins"], G.get("scor", 0)))
+    if a.tsv:
+        if not TSV:
+            sys.exit("dstbar: --tsv asked for a family table and the bar is "
+                     "EMPTY -- REFUSING, on srcbar.py's rule: an empty bar is "
+                     "a missing measurement and never a closed one")
+        with open(a.tsv, "w") as f:
+            f.write("#isa\trule\tmnem\treg\tencodings\tfam_enc\tfam_reg"
+                    "\tmech\n")
+            fam_enc = collections.Counter()
+            fam_reg = collections.Counter()
+            for isa, rule, mnem, reg, n, mech in TSV:
+                fam_enc[(isa, rule, mnem)] = max(fam_enc[(isa, rule, mnem)], n)
+                fam_reg[(isa, rule, mnem)] += n
+            #: SORTED, and by the key rather than by the count, for the
+            #: reason srcbar.py's FINDING 83-E records: a tie broken by
+            #: insertion order is a table that differs between two runs of
+            #: one measurement.
+            for isa, rule, mnem, reg, n, mech in sorted(TSV):
+                f.write("%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\n"
+                        % (isa, rule, mnem, reg, n,
+                           fam_enc[(isa, rule, mnem)],
+                           fam_reg[(isa, rule, mnem)],
+                           ",".join("%s=%d" % kv
+                                    for kv in sorted(mech.items()))))
+        print("  family table written: %s  (%d rows, %d families)"
+              % (a.tsv, len(TSV),
+                 len({(r[0], r[1], r[2]) for r in TSV})))
     return 0
 
 

@@ -4758,6 +4758,28 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
         return;
     }
     t0 = cpu_gpr[rd];
+    /*
+     * $zero, WHEN THE LOAD'S TARGET IS THE DESTINATION GLOBAL.
+     *
+     * gen_load_gpr(t, 0) states the zero register by ANCHORING a note to @t
+     * and letting the walk resolve it against that temp's contents at the end
+     * of the instruction.  Every other caller passes a fresh temp, so the
+     * resolution finds the constant zero the accessor put there.  This one
+     * passes cpu_gpr[rd] -- the DESTINATION GLOBAL -- which by the end of the
+     * instruction holds the count, not the zero, so the note cannot resolve
+     * and `clz $v1,$zero` reached a consumer reading NOTHING.  144 registers
+     * of the cross-ISA zero-register class, all of them here.
+     *
+     * The fix is at this site rather than in gen_load_gpr(), because the
+     * anchoring discipline is right for every other caller and it is this
+     * emitter's choice of target that breaks it.  R7.3: the encoding names
+     * $zero in rs exactly the way it would name $t0.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (rs == 0) {
+        insn_dataflow_note_folded_read_zero();
+    }
     gen_load_gpr(t0, rs);
 
     switch (opc) {
@@ -11330,6 +11352,10 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
     gen_note_fcc_read(cc);
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc));
     tcg_gen_brcondi_i32(cond, t0, 0, l1);
+    /* $zero into a destination global; see gen_cl(). */
+    if (rs == 0) {
+        insn_dataflow_note_folded_read_zero();
+    }
     gen_load_gpr(cpu_gpr[rd], rs);
     gen_set_label(l1);
     /* The value published when the code does not match; see above. */

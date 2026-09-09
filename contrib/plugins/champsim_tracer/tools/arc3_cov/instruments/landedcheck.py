@@ -229,6 +229,7 @@ def score(classes, arm, isas, wps, bar, qemu_root, base=None, out=sys.stdout):
                  "family instead, this instrument reports on encodings the "
                  "bar never counted, which is the shape it exists against)")
     reds, rows_out = [], []
+    unscored = 0
     per_isa, srcA, srcB = {}, {}, {}
     for isa in isas:
         per_isa[isa] = read_mech(arm, isa, wps)
@@ -238,7 +239,19 @@ def score(classes, arm, isas, wps, bar, qemu_root, base=None, out=sys.stdout):
     for k in classes:
         if k["disp"] != "QEMU-STATES-IT":
             continue
-        isa_list = ISAS if k["isa"] == "*" else [k["isa"]]
+        isa_list = [i for i in (ISAS if k["isa"] == "*" else [k["isa"]])
+                    if i in per_isa]
+        if not isa_list:
+            # NOT ITS CORPUS, SO NOT ITS VERDICT.  Run with --isa naming a
+            # subset and every row for an ISA left out has no encodings to
+            # lose -- which the EMPTIED arm would report as "this class is
+            # over", the exact reading that retires a live row.  Found by
+            # this instrument's own first partial run, on four rows.
+            rows_out.append((k["cid"], k["isa"], "NOT-SCORED", 0, 0,
+                             "%s is not in --isa; this row was not measured "
+                             "and its silence means nothing" % k["isa"]))
+            unscored += 1
+            continue
         # PASS 1 -- the LOSING set: which encodings, in which families, and
         # WHICH REGISTER NAMES.  The names matter: a class regex as wide as
         # `.` matches every register a row carries, and asking "is anything
@@ -326,6 +339,12 @@ def score(classes, arm, isas, wps, bar, qemu_root, base=None, out=sys.stdout):
     for cid, isa, verdict, losing, stated, note in sorted(rows_out):
         print("  %-28s %-9s %-8s %8d %7d  %s"
               % (cid, isa, verdict, losing, stated, note), file=out)
+    if unscored:
+        print("", file=out)
+        print("  %d row(s) NOT SCORED -- their ISA was not in --isa.  This "
+              "report is PARTIAL and no row above may be retired on it: an "
+              "unmeasured class reads exactly like a finished one." % unscored,
+              file=out)
     if not rows_out:
         print("  NO QEMU-STATES-IT ROWS -- REFUSING: this instrument's whole "
               "subject is that disposition, and a table with none of it makes "
@@ -520,6 +539,19 @@ def selftest(tmp):
         check("source bar without --b REFUSES", False)
     except SystemExit as e:
         check("source bar without --b REFUSES", "REFUSING" in str(e))
+
+    # ARM 10a -- A ROW FOR AN ISA THE RUN DID NOT MEASURE READS NOT-SCORED,
+    # not EMPTIED.  Found by this instrument's own first partial run, where
+    # four live rows read "no encoding still loses the register" because
+    # their corpora had not been loaded at all.
+    a, b = os.path.join(tmp, "armA"), os.path.join(tmp, "armB")
+    write_table([CLEAN])
+    buf = io.StringIO()
+    rc = score(barledger.load_classes(tbl), a, ["x86_64"], ["0"], "source",
+               qroot, base=b, out=buf)
+    o = buf.getvalue()
+    check("a row whose ISA was not measured reads NOT-SCORED",
+          "NOT-SCORED" in o and "EMPTIED" not in o and "PARTIAL" in o)
 
     # ARM 10 -- a row whose class no longer loses anything reads EMPTIED.
     rc, o = run([_row("mipsel", "aa", "mc", "r_c", "REG_B", "REG_B")],

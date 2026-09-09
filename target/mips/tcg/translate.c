@@ -16736,6 +16736,70 @@ static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
     insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_LO[ac & 3]));
 }
 
+/*
+ * DSPControl IS A DESTINATION OF EVERY EXTRACT, AND THE OP STREAM SAYS SO
+ * NOWHERE.
+ *
+ * The fold above covers the encodings QEMU turns into a NOP.  This covers the
+ * ones it PERFORMS, and the destination bar measured them separately: 38
+ * registers over twelve families -- `extr.w`, `extr_r.w`, `extr_rs.w`,
+ * `extr_s.h`, their four `extrv` twins, `extp`, `extpv`, `extpdp`, `extpdpv`
+ * -- every losing row REG_FLAGS and no family carrying any other.
+ *
+ * WHY THE WALK CANNOT SEE IT.  `gen_helper_extr_w(cpu_gpr[ret], t0, t1,
+ * tcg_env)` defines exactly one TCG global: the destination GPR.  DSPControl
+ * is written INSIDE the helper, in C, straight into
+ * env->active_tc.DSPControl -- helper_extr_w() calls
+ * set_DSPControl_overflow_flag(1, 23, env) on either of its two saturation
+ * tests (target/mips/tcg/dsp_helper.c), and the EXTP forms call
+ * set_DSPControl_efi() on both arms of theirs.  The op list carries the call
+ * and nothing else, so a write list built from ops is short by exactly the
+ * register the DSP ASE defines these instructions to update.
+ *
+ * IT IS NOT A CONDITIONAL WRITE IN THE SENSE THAT WOULD MATTER.  EXTP and
+ * EXTPDP write DSPControl.EFI on BOTH arms -- `set_DSPControl_efi(0, env)`
+ * when the extract fits and `(1, env)` when it does not -- so the register is
+ * written on every execution, and the saturating EXTR forms write ouflag on
+ * the arm the value takes.  R17 rules a conditional write into the write set
+ * either way; here even that is not needed for half the list.
+ *
+ * THE SAME OP2 SET as the fold above, and for the same reason: it is the
+ * emitter's own list rather than a second table, so a new EXTR arm that this
+ * function does not name goes to the bar rather than silently inheriting a
+ * statement about a helper it does not call.
+ *
+ * The RANGE form against cpu_dspctrl's own storage, so the write resolves
+ * through the global that already names this register downstream.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_dsp_acc_dspctrl_write(uint32_t op1, uint32_t op2)
+{
+    if (op1 != OPC_EXTR_W_DSP) {
+        return;
+    }
+    switch (op2) {
+    case OPC_EXTR_W:
+    case OPC_EXTR_R_W:
+    case OPC_EXTR_RS_W:
+    case OPC_EXTR_S_H:
+    case OPC_EXTRV_S_H:
+    case OPC_EXTRV_W:
+    case OPC_EXTRV_R_W:
+    case OPC_EXTRV_RS_W:
+    case OPC_EXTP:
+    case OPC_EXTPV:
+    case OPC_EXTPDP:
+    case OPC_EXTPDPV:
+        break;
+    default:
+        return;
+    }
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUMIPSState, active_tc.DSPControl),
+        sizeof(((CPUMIPSState *)0)->active_tc.DSPControl));
+}
+
 static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                                 int ret, int v1, int v2, int check_ret)
 
@@ -16762,6 +16826,8 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             op1 == OPC_EXTR_W_DSP ? MIPS_ID_OPC_EXTR_W_DSP :
             MIPS_ID_NONE);
         check_dsp(ctx);
+        /* The DSPControl the helpers below write; see the note's header. */
+        note_dsp_acc_dspctrl_write(op1, op2);
         switch (op2) {
         case OPC_EXTR_W:
             mips_ident(ctx,

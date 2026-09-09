@@ -24,13 +24,27 @@
  * for the instruction that called the helper.  Direction and the
  * ADDRESS ARGUMENT are read off the call site; a count is NOT
  * invented when the helper's access pattern is data-dependent.
+ *   fbld_ST0             read  addr=arg1 data=-    count unbounded
+ *   fbst_ST0             write addr=UNSTATED data=-    count unbounded
+ *   fldenv               read  addr=UNSTATED data=-    count unbounded
+ *   fldenv               read  addr=arg1 data=-    one access
+ *   fldt_ST0             read  addr=arg1 data=-    count unbounded
+ *   frstor               read  addr=UNSTATED data=-    count unbounded
+ *   frstor               read  addr=arg1 data=-    count unbounded
+ *   fsave                write addr=arg1 data=-    count unbounded
+ *   fstenv               write addr=arg1 data=-    count unbounded
+ *   fstt_ST0             write addr=arg1 data=-    count unbounded
+ *   fxrstor              read  addr=UNSTATED data=-    count unbounded
+ *   fxrstor              read  addr=arg1 data=-    count unbounded
+ *   fxsave               write addr=UNSTATED data=-    count unbounded
+ *   fxsave               write addr=arg1 data=-    count unbounded
  *   iret_protected       read  addr=UNSTATED data=-    count unbounded
- *   iret_protected       write addr=UNSTATED data=-    one access
+ *   iret_protected       write addr=UNSTATED data=-    count unbounded
  *   lar                  read  addr=UNSTATED data=-    count unbounded
  *   lcall_protected      read  addr=UNSTATED data=-    count unbounded
- *   lcall_protected      write addr=UNSTATED data=-    one access
+ *   lcall_protected      write addr=UNSTATED data=-    count unbounded
  *   ljmp_protected       read  addr=UNSTATED data=-    count unbounded
- *   ljmp_protected       write addr=UNSTATED data=-    one access
+ *   ljmp_protected       write addr=UNSTATED data=-    count unbounded
  *   load_seg             read  addr=UNSTATED data=-    count unbounded
  *   load_seg             write addr=UNSTATED data=-    one access
  *   lret_protected       read  addr=UNSTATED data=-    count unbounded
@@ -49,6 +63,11 @@
  *   vpgatherqq_ymm       read  addr=arg6 data=-    one access
  *   vpmaskmovd_st_xmm    write addr=arg3 data=-    one access
  *   vpmaskmovq_st_xmm    write addr=arg3 data=-    one access
+ *   xrstor               read  addr=UNSTATED data=-    count unbounded
+ *   xrstor               read  addr=arg1 data=-    count unbounded
+ *   xsave                read  addr=arg1 data=-    one access
+ *   xsave                write addr=UNSTATED data=-    count unbounded
+ *   xsave                write addr=arg1 data=-    count unbounded
  *
  * READS THE EMULATOR MAKES ON ITS OWN BEHALF -- derived,
  * enumerated, and marked DF_HF_XLAT so the footprint is complete
@@ -1741,20 +1760,54 @@ static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/cpu.h:2633 */
     { offsetof(CPUArchState, segs), sizeof(((CPUArchState *)0)->segs), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/i386/cpu.h:2639 */
 };
+static const DfHelperAccess dfu_fbld_ST0_acc[] = {
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 1, 1 },   /* ../target/i386/tcg/fpu_helper.c:852, 2 site(s) */
+};
+static const DfHelperAccess dfu_fbst_ST0_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/i386/tcg/fpu_helper.c:880, 8 site(s) */
+};
+static const DfHelperAccess dfu_fldenv_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 2, 1 },   /* ../target/i386/tcg/fpu_helper.c:2540, 2 site(s) */
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 2, 0 },   /* ../target/i386/tcg/fpu_helper.c:2539, 1 site(s) */
+};
+static const DfHelperAccess dfu_fldt_ST0_acc[] = {
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:93, 2 site(s) */
+};
+static const DfHelperAccess dfu_frstor_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 2, 1 },   /* ../target/i386/tcg/fpu_helper.c:2540, 2 site(s) */
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2539, 3 site(s) */
+};
+static const DfHelperAccess dfu_fsave_acc[] = {
+    { INSN_DF_WR, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2474, 16 site(s) */
+};
+static const DfHelperAccess dfu_fstenv_acc[] = {
+    { INSN_DF_WR, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2474, 14 site(s) */
+};
+static const DfHelperAccess dfu_fstt_ST0_acc[] = {
+    { INSN_DF_WR, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:103, 2 site(s) */
+};
+static const DfHelperAccess dfu_fxrstor_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:93, 4 site(s) */
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2838, 4 site(s) */
+};
+static const DfHelperAccess dfu_fxsave_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:103, 4 site(s) */
+    { INSN_DF_WR, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2620, 7 site(s) */
+};
 static const DfHelperAccess dfu_iret_protected_acc[] = {
-    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:2284, 6 site(s) */
-    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 0 },   /* ../target/i386/tcg/seg_helper.c:306, 1 site(s) */
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:2284, 18 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:398, 26 site(s) */
 };
 static const DfHelperAccess dfu_lar_acc[] = {
     { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 1 },   /* ../target/i386/tcg/seg_helper.c:151, 2 site(s) */
 };
 static const DfHelperAccess dfu_lcall_protected_acc[] = {
-    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:151, 14 site(s) */
-    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 0 },   /* ../target/i386/tcg/seg_helper.c:306, 1 site(s) */
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:151, 26 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:398, 26 site(s) */
 };
 static const DfHelperAccess dfu_ljmp_protected_acc[] = {
-    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 1 },   /* ../target/i386/tcg/seg_helper.c:151, 5 site(s) */
-    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 0 },   /* ../target/i386/tcg/seg_helper.c:306, 1 site(s) */
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:151, 17 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/seg_helper.c:398, 26 site(s) */
 };
 static const DfHelperAccess dfu_load_seg_acc[] = {
     { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 4, 1 },   /* ../target/i386/tcg/seg_helper.c:1439, 2 site(s) */
@@ -1807,6 +1860,15 @@ static const DfHelperAccess dfu_vpmaskmovd_st_xmm_acc[] = {
 };
 static const DfHelperAccess dfu_vpmaskmovq_st_xmm_acc[] = {
     { INSN_DF_WR, 3, DF_HA_NO_ARG, 8, 0 },   /* ../target/i386/ops_sse.h:2342, 1 site(s) */
+};
+static const DfHelperAccess dfu_xrstor_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:93, 11 site(s) */
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2997, 7 site(s) */
+};
+static const DfHelperAccess dfu_xsave_acc[] = {
+    { INSN_DF_RD, 1, DF_HA_NO_ARG, 8, 0 },   /* ../target/i386/tcg/fpu_helper.c:2786, 1 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:103, 11 site(s) */
+    { INSN_DF_WR, 1, DF_HA_NO_ARG, 0, 1 },   /* ../target/i386/tcg/fpu_helper.c:2620, 8 site(s) */
 };
 
 static const DfHelperUsage df_helper_usage[] = {
@@ -2289,11 +2351,11 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fbld_ST0", { 0 }, { 0 },
       dfu_fbld_ST0_env, ARRAY_SIZE(dfu_fbld_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:840",
-      NULL, 0 },
+      dfu_fbld_ST0_acc, ARRAY_SIZE(dfu_fbld_ST0_acc) },
     { "fbst_ST0", { 0 }, { 0 },
       dfu_fbst_ST0_env, ARRAY_SIZE(dfu_fbst_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:863",
-      NULL, 0 },
+      dfu_fbst_ST0_acc, ARRAY_SIZE(dfu_fbst_ST0_acc) },
     { "fchs_ST0", { 0 }, { 0 },
       dfu_fchs_ST0_env, ARRAY_SIZE(dfu_fchs_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:662",
@@ -2389,7 +2451,7 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fldenv", { 0 }, { 0 },
       dfu_fldenv_env, ARRAY_SIZE(dfu_fldenv_env), true,
       "../target/i386/tcg/fpu_helper.c:2550",
-      NULL, 0 },
+      dfu_fldenv_acc, ARRAY_SIZE(dfu_fldenv_acc) },
     { "fldl2e_ST0", { 0 }, { 0 },
       dfu_fldl2e_ST0_env, ARRAY_SIZE(dfu_fldl2e_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:689",
@@ -2429,7 +2491,7 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fldt_ST0", { 0 }, { 0 },
       dfu_fldt_ST0_env, ARRAY_SIZE(dfu_fldt_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:446",
-      NULL, 0 },
+      dfu_fldt_ST0_acc, ARRAY_SIZE(dfu_fldt_ST0_acc) },
     { "fldz_FT0", { 0 }, { 0 },
       dfu_fldz_FT0_env, ARRAY_SIZE(dfu_fldz_FT0_env), true,
       "../target/i386/tcg/fpu_helper.c:746",
@@ -2525,11 +2587,11 @@ static const DfHelperUsage df_helper_usage[] = {
     { "frstor", { 0 }, { 0 },
       dfu_frstor_env, ARRAY_SIZE(dfu_frstor_env), true,
       "../target/i386/tcg/fpu_helper.c:2597",
-      NULL, 0 },
+      dfu_frstor_acc, ARRAY_SIZE(dfu_frstor_acc) },
     { "fsave", { 0 }, { 0 },
       dfu_fsave_env, ARRAY_SIZE(dfu_fsave_env), true,
       "../target/i386/tcg/fpu_helper.c:2574",
-      NULL, 0 },
+      dfu_fsave_acc, ARRAY_SIZE(dfu_fsave_acc) },
     { "fscale", { 0 }, { 0 },
       dfu_fscale_env, ARRAY_SIZE(dfu_fscale_env), true,
       "../target/i386/tcg/fpu_helper.c:2333",
@@ -2549,7 +2611,7 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fstenv", { 0 }, { 0 },
       dfu_fstenv_env, ARRAY_SIZE(dfu_fstenv_env), true,
       "../target/i386/tcg/fpu_helper.c:2510",
-      NULL, 0 },
+      dfu_fstenv_acc, ARRAY_SIZE(dfu_fstenv_acc) },
     { "fstl_ST0", { 0 }, { 0 },
       dfu_fstl_ST0_env, ARRAY_SIZE(dfu_fstl_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:353",
@@ -2561,7 +2623,7 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fstt_ST0", { 0 }, { 0 },
       dfu_fstt_ST0_env, ARRAY_SIZE(dfu_fstt_ST0_env), true,
       "../target/i386/tcg/fpu_helper.c:459",
-      NULL, 0 },
+      dfu_fstt_ST0_acc, ARRAY_SIZE(dfu_fstt_ST0_acc) },
     { "fsub_ST0_FT0", { 0 }, { 0 },
       dfu_fsub_ST0_FT0_env, ARRAY_SIZE(dfu_fsub_ST0_FT0_env), true,
       "../target/i386/tcg/fpu_helper.c:591",
@@ -2601,11 +2663,11 @@ static const DfHelperUsage df_helper_usage[] = {
     { "fxrstor", { 0 }, { 0 },
       dfu_fxrstor_env, ARRAY_SIZE(dfu_fxrstor_env), true,
       "../target/i386/tcg/fpu_helper.c:2977",
-      NULL, 0 },
+      dfu_fxrstor_acc, ARRAY_SIZE(dfu_fxrstor_acc) },
     { "fxsave", { 0 }, { 0 },
       dfu_fxsave_env, ARRAY_SIZE(dfu_fxsave_env), true,
       "../target/i386/tcg/fpu_helper.c:2728",
-      NULL, 0 },
+      dfu_fxsave_acc, ARRAY_SIZE(dfu_fxsave_acc) },
     { "fxtract", { 0 }, { 0 },
       dfu_fxtract_env, ARRAY_SIZE(dfu_fxtract_env), true,
       "../target/i386/tcg/fpu_helper.c:1810",
@@ -3827,11 +3889,11 @@ static const DfHelperUsage df_helper_usage[] = {
     { "xrstor", { 0 }, { 0 },
       dfu_xrstor_env, ARRAY_SIZE(dfu_xrstor_env), true,
       "../target/i386/tcg/fpu_helper.c:3079",
-      NULL, 0 },
+      dfu_xrstor_acc, ARRAY_SIZE(dfu_xrstor_acc) },
     { "xsave", { 0 }, { 0 },
       dfu_xsave_env, ARRAY_SIZE(dfu_xsave_env), true,
       "../target/i386/tcg/fpu_helper.c:2821",
-      NULL, 0 },
+      dfu_xsave_acc, ARRAY_SIZE(dfu_xsave_acc) },
     { "lookup_tb_ptr", { 0 }, { 0 },
       dfu_lookup_tb_ptr_env, ARRAY_SIZE(dfu_lookup_tb_ptr_env), true,
       "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",

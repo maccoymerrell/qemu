@@ -87,6 +87,7 @@
 #include <vector>
 
 #include "cst_common.h"
+#include "../cst_mem_lint_exempt.h"
 
 namespace cst {
 
@@ -105,43 +106,26 @@ public:
     AttributionLint(const Header &h, const std::vector<Template> &templates)
         : reg_enabled_(h.has_reg_data())
     {
-        /* Exempt opcode classes, resolved by name from the trace's
-         * own opcode map so renumbering stays harmless.  Synthetic-EA
-         * classes (PREFETCH / CACHE_FLUSH / TLB_FLUSH) record their
-         * effective address as a load-style memop even when the
-         * operand walker minted no static load slot; PUSH / POP / RET
-         * cover the x86 implicit-stack corner encodings (see the
-         * header comment).  The explicit memory classes (LOAD / STORE
-         * / VEC_*) and atomics are NOT exempt, because a 0/0 memory
-         * insn is a real decode failure this lint must surface.
-         *
-         * THE OLD REASON FOR THAT WAS FALSE AND IS REPLACED HERE.  It
-         * said their templates "always carry static slots" after the
-         * aarch64 access-flag boundary workaround in disas/capstone.c.
-         * They do not: x86_64 `fxsave64 0x40(%rax)` is GEN_OP_STORE
-         * with max_dep_loads == max_dep_stores == 0 and 55 memops per
-         * execution (FINDING 85-A).  The conclusion survives its own
-         * refuted premise and is STRONGER for it -- a class that can
-         * come out 0/0 is exactly the class worth firing on -- but the
-         * premise had to go, because a justification that is plausible
-         * and false is the failure this tree files against.
-         *
-         * THE ONLINE MIRROR OF THIS LIST DISAGREES.  note_impossible_slot()
-         * in champsim_tracer_mem_access_recorder.cc says it mirrors this
-         * one and DOES exempt LOAD / STORE / VEC_* / atomics, so it
-         * passes what this fails -- 990 of one trace's 2,397 firings are
-         * exactly that gap.  Filed as 85-A(i); the two lists want to be
-         * one list, in one place both sides include. */
+        /* Exempt opcode classes, resolved by NAME from the trace's own
+         * opcode map so renumbering stays harmless.  The list itself is
+         * ../cst_mem_lint_exempt.h, which the plugin's online copy of
+         * this check includes too: one list, in one place both sides
+         * read, so the divergence FINDING 85-A(i) measured cannot be
+         * written again silently.  That header carries the reason each
+         * class is on it, and the reason the explicit memory classes
+         * (LOAD / STORE / VEC_*) and atomics are NOT. */
+        static const char *const exempt_names[] = {
+#define CST_EXEMPT_NAME(name) #name,
+            CST_MEM_IMPOSSIBLE_EXEMPT_OPCODES(CST_EXEMPT_NAME)
+#undef CST_EXEMPT_NAME
+        };
         std::unordered_set<uint64_t> exempt;
         for (const auto &kv : h.maps.opcode) {
-            if (kv.second == "GEN_OP_PREFETCH" ||
-                kv.second == "GEN_OP_CACHE_FLUSH" ||
-                kv.second == "GEN_OP_TLB_FLUSH" ||
-                kv.second == "GEN_OP_FENCE" ||
-                kv.second == "GEN_OP_PUSH" ||
-                kv.second == "GEN_OP_POP" ||
-                kv.second == "GEN_OP_RET") {
-                exempt.insert(kv.first);
+            for (const char *nm : exempt_names) {
+                if (kv.second == nm) {
+                    exempt.insert(kv.first);
+                    break;
+                }
             }
         }
         /* Segment-register generic ids, for the descriptor-fetch

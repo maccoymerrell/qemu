@@ -452,6 +452,29 @@ ENV_MEMBER = 'env'
 # any instruction -- no instruction records reading its own encoding -- so
 # recording one here would be an exception made for helpers alone.
 ACC_PREFIX = ('cpu_ld', 'cpu_st', 'cpu_atomic_')
+
+#
+# THE SECOND ENTRY-POINT FAMILY, AND WHY THE FIRST LIST WAS NOT THE WHOLE
+# ANSWER.  target/i386 reaches guest memory for its BLOCK operations through
+# its own declared family instead -- access_ld{b,w,l,q} / access_st{b,w,l,q},
+# declared in target/i386/tcg/access.h, taking an X86Access handle first, the
+# guest ADDRESS second and the stored VALUE third.  Same shape, same width in
+# the name, different first argument.
+#
+# Reading only cpu_* meant every x86 helper that moves a BLOCK of guest
+# memory came out with an EMPTY access list: helper_fxsave is GEN_OP_STORE
+# writing 512 bytes and its row said it performed no access at all, so the
+# instruction reached the wire with max_dep_stores == 0 while issuing 55
+# memops per execution (FINDING 85-A(i)).  fxrstor, fsave, frstor, fldenv,
+# fstenv, xsave, xsaveopt and xrstor are the same shape.
+#
+# The handle is the CARRIER this reader already follows -- access_prepare()
+# fills an X86Access from the env root and the block helpers recover the env
+# as `ac->env` -- so the argument-0 check below is against 'carrier' for this
+# family where it is against 'env' for cpu_*.  It is still CHECKED, not
+# assumed: a call whose first argument is neither is not recorded.
+#
+ACC_X86_PREFIX = ('access_ld', 'access_st')
 ACC_WIDTH = [
     ('16', 16), ('ub', 1), ('sb', 1), ('uw', 2), ('sw', 2),
     ('ul', 4), ('sl', 4), ('b', 1), ('w', 2), ('l', 4), ('q', 8), ('o', 16),
@@ -572,6 +595,18 @@ SITE_DIR = {
 }
 
 
+def _acc_root(name):
+    """Which argument-0 root a guest-access primitive must have been handed.
+
+    'env' for the cpu_ldst.h family, whose first parameter is the CPU state
+    pointer; 'carrier' for target/i386's access_* family, whose first
+    parameter is the X86Access handle a prepare call filled from the env.
+    The distinction is the whole check: a same-named function reached with
+    something else in argument 0 is not one of these.
+    """
+    return 'carrier' if name.startswith(ACC_X86_PREFIX) else 'env'
+
+
 def _acc_of(name):
     """(direction, width) for a guest-access primitive, or None.
 
@@ -588,6 +623,10 @@ def _acc_of(name):
         d, rest = RD, name[len('cpu_ld'):]
     elif name.startswith('cpu_st'):
         d, rest = WR, name[len('cpu_st'):]
+    elif name.startswith('access_ld'):
+        d, rest = RD, name[len('access_ld'):]
+    elif name.startswith('access_st'):
+        d, rest = WR, name[len('access_st'):]
     else:
         return None
     for pfx, sz in ACC_WIDTH:
@@ -1677,7 +1716,7 @@ class Analysis:
                     toks[grp[1]][0] == 'id' and \
                     taint.get(toks[grp[1]][1], (None,))[0] == 'carrier':
                 pass_roots[ai] = 'carrier'
-        if acc and pass_roots.get(0) == 'env':
+        if acc and pass_roots.get(0) == _acc_root(callee):
             self._guest_access(u, i, acc, args, fname)
         # A STATED DIRECTION SETTLES THE CALL.  Checked before the callee's
         # body, for the reason MEM_PRIM's own comment gives -- and never for

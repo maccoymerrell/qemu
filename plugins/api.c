@@ -720,7 +720,7 @@ unsigned qemu_plugin_insn_discard_prov(const struct qemu_plugin_tb *tb,
 static bool plugin_df_memops_complete(const InsnDataflow *d)
 {
     return !d->memops_overflow && !d->memops_unnoted &&
-           !insn_dataflow_prov_truncated();
+           !d->prov_truncated && !insn_dataflow_prov_truncated();
 }
 
 unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
@@ -816,7 +816,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_mem_writes = d->n_mem_wr;
     st.fields_truncated = d->fields_overflow;
     st.writes_truncated = d->writes_overflow || d->discards_overflow;
-    st.prov_truncated = insn_dataflow_prov_truncated();
+    st.prov_truncated = d->prov_truncated || insn_dataflow_prov_truncated();
     st.helper_model = d->helper_model;
     st.n_helper_unknown = d->n_helper_unknown;
     st.n_helper_unbounded = d->n_helper_unbounded;

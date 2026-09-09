@@ -42,7 +42,49 @@
  * mechanisms, and the two disagreed about idioms that differ only in which
  * register file they land in.
  */
-#define INSN_DF_MAX_FIELD_SLOTS  64
+/*
+ * RAISED 64 -> 75 at PASS 90, and the number is the namespace's own bound
+ * re-derived rather than inherited.
+ *
+ * WHAT THE CAP COSTS WHEN IT BINDS is what forced the re-derivation.  A
+ * translation that fills this table used to lose the memop LAYOUT of every
+ * instruction in it: df_intern() set a BLOCK-WIDE flag, every instruction in
+ * the TB then read as provenance-truncated, and the tracer minted no static
+ * memop slot for any of them -- sixty-three x86 kernel instructions in
+ * FINDING 85-A, whose real memops then arrived against templates saying they
+ * had none.  The refusal is now PER INSTRUCTION (see @prov_truncated), so
+ * the cap costs exactly the instruction that could not be given a slot; the
+ * value below is what that instruction's threshold is.
+ *
+ * THE BOUND, from the code that enforces it.  df_intern() refuses when
+ *
+ *     tcg_ctx->nb_globals + df_nslots >= INSN_DF_ARCHCONST_PROV_BIT
+ *
+ * so the last slot a target can be given is ARCHCONST_PROV_BIT - 1 and the
+ * count it admits is ARCHCONST_PROV_BIT - nb_globals.  With
+ * INSN_DF_MAX_REGS 256 and INSN_DF_MAX_MEMOPS 48 the region bits are
+ * MEMOP_PROV_BASE 208, ZERO 207, IMM 206, ARCHCONST 205.
+ *
+ * nb_globals is a per-target measurement, taken from the QEMU_DF_DUMP
+ * header of a run rather than from memory, on both regimes where the
+ * target has one:
+ *
+ *     mipsel   130   (user AND softmmu)
+ *     riscv64  101   (user AND softmmu)
+ *     aarch64   58   (user)
+ *     x86_64    37   (user)
+ *
+ * mipsel is the worst and 205 - 130 = 75.
+ *
+ * FINDING 85-A's OWN FIGURE OF 76 IS CORRECTED HERE.  It computed the
+ * headroom against INSN_DF_IMM_PROV_BIT (206), which was the bound before
+ * the architectural-constant bit took the slot below it; the code has
+ * guarded at ARCHCONST_PROV_BIT since, one bit lower.  Writing 76 would
+ * have put a compile-time cap one past what mipsel's runtime guard admits
+ * -- a number the arithmetic does not support, which is the class of claim
+ * this tree files bugs against.
+ */
+#define INSN_DF_MAX_FIELD_SLOTS  75
 
 /*
  * Env state no TCG global names -- x86's vector file and x87 stack, ARM's V
@@ -855,6 +897,30 @@ typedef struct InsnDataflow {
     uint8_t  memops_count_unbounded;  /* >=1 helper access of unstated count */
     uint8_t  memops_addr_unstated;    /* >=1 access whose address is unnamed */
     uint8_t  memops_data_unstated;    /* >=1 store whose value is unnamed */
+    /*
+     * A provenance bit THIS INSTRUCTION needed could not be minted.
+     *
+     * The interning table (INSN_DF_MAX_FIELD_SLOTS) is per TRANSLATION and
+     * the refusal is per INSTRUCTION, which is not a contradiction: a slot
+     * an earlier instruction interned is still there to be found, so the
+     * only instruction a full table can hurt is one asking for a range
+     * nothing has interned yet.  Recording it here says WHICH, and that is
+     * the whole difference from the flag this replaced.
+     *
+     * IT USED TO BE BLOCK-WIDE, and the note that made it so argued that
+     * "neither flag can say which instruction" and that an over-broad
+     * refusal costs a consumer precision while a per-instruction guess
+     * costs it a dependency.  The first half was false -- df_intern() is
+     * called from df_insn(), which is holding the instruction -- and the
+     * second half does not apply to a fact recorded where it happened
+     * rather than guessed.  What the over-broad refusal actually cost was
+     * measured: sixty-three instructions' memop layout for one
+     * instruction's missing slot (FINDING 85-A).
+     *
+     * The zero-register and discarded-write note caps stay block-wide
+     * because they genuinely are: see insn_dataflow_prov_truncated().
+     */
+    uint8_t  prov_truncated;
 } InsnDataflow;
 
 /*

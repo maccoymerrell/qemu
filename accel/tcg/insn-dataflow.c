@@ -770,7 +770,6 @@ struct InsnDataflowScratch {
      */
     uint32_t slot_size[INSN_DF_MAX_FIELD_SLOTS];
     unsigned nslots;
-    bool slots_overflow;
 
     DfGvecNote gvec[DF_MAX_GVEC_NOTES];
     unsigned n_gvec;
@@ -788,6 +787,12 @@ struct InsnDataflowScratch {
     DfMemopNote memop[DF_MAX_MEMOP_NOTES];
     unsigned n_memop;
     bool memop_overflow;
+    /*
+     * The op most recently emitted when the FIRST note was dropped, so the
+     * refusal can name the instruction that was being translated instead of
+     * the whole block.  Same anchor discipline the notes themselves use.
+     */
+    const TCGOp *memop_ovf_anchor;
     /*
      * The open alternate-path scope: which note the emissions inside it
      * mirror, and how many have been taken.  @alt_open is false everywhere
@@ -906,7 +911,6 @@ static __thread struct InsnDataflowScratch *df;
 #define df_slot_off         (df->slot_off)
 #define df_slot_size        (df->slot_size)
 #define df_nslots           (df->nslots)
-#define df_slots_overflow   (df->slots_overflow)
 #define df_gvec             (df->gvec)
 #define df_n_gvec           (df->n_gvec)
 #define df_gvec_overflow    (df->gvec_overflow)
@@ -916,6 +920,7 @@ static __thread struct InsnDataflowScratch *df;
 #define df_memop            (df->memop)
 #define df_n_memop          (df->n_memop)
 #define df_memop_overflow   (df->memop_overflow)
+#define df_memop_ovf_anchor (df->memop_ovf_anchor)
 #define df_alt_open         (df->alt_open)
 #define df_alt_mark         (df->alt_mark)
 #define df_alt_taken        (df->alt_taken)
@@ -978,12 +983,18 @@ static void df_bind(void)
  * which makes a value that came from this field look as though it came from
  * nowhere.  That is the direction that must never be taken lightly and is
  * taken here only because the alternative is worse: see the note on
- * df_field_prov() about which way an error in this code should fall.  With 64
- * slots against the handful of distinct fields any real instruction touches,
- * the case is not reachable in practice, and df_slots_overflow says so out
- * loud when it is.
+ * df_field_prov() about which way an error in this code should fall.  The
+ * instruction that asked is marked @prov_truncated so a consumer refuses it
+ * instead of reading the short set as an answer.
+ *
+ * "NOT REACHABLE IN PRACTICE" IS RETRACTED.  This comment used to say the
+ * case did not arise, on the ground that a real instruction touches a
+ * handful of distinct fields.  It is the TRANSLATION's table, not the
+ * instruction's: FINDING 85-A measured an ordinary x86_64 kernel block
+ * filling it at 64 and a five-line user-mode program doing the same.  The
+ * cap's own note (INSN_DF_MAX_FIELD_SLOTS) carries the re-derived bound.
  */
-static int df_intern(uint32_t off, uint32_t size)
+static int df_intern(InsnDataflow *d, uint32_t off, uint32_t size)
 {
     unsigned base = tcg_ctx->nb_globals;
     uint32_t reach = size ? size : DF_FIELD_UNBOUNDED;
@@ -1011,7 +1022,16 @@ static int df_intern(uint32_t off, uint32_t size)
     }
     if (df_nslots >= INSN_DF_MAX_FIELD_SLOTS ||
         base + df_nslots >= INSN_DF_ARCHCONST_PROV_BIT) {
-        df_slots_overflow = true;
+        /*
+         * KEEP WHAT FITS, REFUSE ONLY THE INSTRUCTION THAT DID NOT.
+         *
+         * The two bounds are different facts and both land here: the array
+         * is full, or this target's globals leave no room below the
+         * architectural-constant bit.  Either way the caller is @d and the
+         * refusal is @d's -- every instruction the table already served
+         * keeps its provenance, and its memops keep their layout.
+         */
+        d->prov_truncated = 1;
         return -1;
     }
     df_slot_size[df_nslots] = reach;
@@ -2044,6 +2064,7 @@ void insn_dataflow_note_reset(void)
     df_n_gvec_osz = 0;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_memop_ovf_anchor = NULL;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;
@@ -3277,7 +3298,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                                         (row->env[q].dir & INSN_DF_WR) != 0;
                                 }
                                 if (row->env[q].dir & INSN_DF_RD) {
-                                    int b = df_intern(row->env[q].off,
+                                    int b = df_intern(d, row->env[q].off,
                                                       row->env[q].size);
 
                                     if (b >= 0) {
@@ -3427,7 +3448,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         n_pf++;
                     }
                     if (dir & INSN_DF_RD) {
-                        bit = df_intern((uint32_t)eo, extent);
+                        bit = df_intern(d, (uint32_t)eo, extent);
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
                         }
@@ -3469,7 +3490,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     }
                     eo = df_envoff_of(ts - s->temps);
                     if (eo != INSN_DF_NOT_ENV && eo >= 0) {
-                        int bit = df_intern((uint32_t)eo, 0);
+                        int bit = df_intern(d, (uint32_t)eo, 0);
 
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
@@ -3615,7 +3636,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         if (df_field_forward(d, (uint32_t)eo, size, ld_fwd)) {
                             ld_fwd_valid = true;
                         } else {
-                            ld_field_bit = df_intern((uint32_t)eo, size);
+                            ld_field_bit = df_intern(d, (uint32_t)eo, size);
                         }
                         df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
                     }
@@ -4132,6 +4153,9 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
     }
     df_bind();
     if (df_n_memop >= DF_MAX_MEMOP_NOTES) {
+        if (!df_memop_overflow) {
+            df_memop_ovf_anchor = QTAILQ_LAST(&tcg_ctx->ops);
+        }
         df_memop_overflow = true;
         return;
     }
@@ -5336,7 +5360,6 @@ void insn_dataflow_extract(unsigned num_insns)
 
     df_gen++;
     df_nslots = 0;
-    df_slots_overflow = false;
     df_ninsns = 0;
     if (num_insns > INSN_DF_MAX_INSNS) {
         num_insns = INSN_DF_MAX_INSNS;
@@ -5412,13 +5435,40 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     if (df_memop_overflow) {
         /*
-         * The block ran out of note slots, so somewhere past that point an
-         * access has no note and the memop records are short.  Which
-         * instruction it was is not recoverable here, so every instruction
-         * in the block is marked: an over-broad refusal, never a quiet
-         * partial answer.
+         * The block ran out of note slots, so from the first drop onward an
+         * access has no note and the memop records are short.
+         *
+         * WHICH INSTRUCTION IT WAS *IS* RECOVERABLE, and this used to say it
+         * was not -- marking every instruction in the block, which is what
+         * FINDING 85-A measured costing sixty-three x86_64 kernel
+         * instructions their memop layout for the sixty-fifth's dropped
+         * note.  The drop happens inside insn_dataflow_note_memop(), during
+         * the translation of one instruction, and the op stream says which:
+         * @memop_ovf_anchor is the last op emitted at that moment, and the
+         * insn_start ops up to it count the instruction.
+         *
+         * Nothing after the first drop can be trusted either -- the note
+         * array is full from then on -- so the refusal runs from that
+         * instruction to the end of the block.  Everything the notes DID
+         * cover keeps its records: keep what fits, refuse what did not.
          */
-        for (unsigned i = 0; i < df_ninsns; i++) {
+        unsigned from = 0;
+
+        if (df_memop_ovf_anchor != NULL) {
+            const TCGOp *o;
+            unsigned k = 0;
+
+            QTAILQ_FOREACH(o, &s->ops, link) {
+                if (o->opc == INDEX_op_insn_start) {
+                    k++;
+                }
+                if (o == df_memop_ovf_anchor) {
+                    break;
+                }
+            }
+            from = k ? k - 1 : 0;
+        }
+        for (unsigned i = from; i < df_ninsns; i++) {
             df_out[i].memops_overflow = 1;
         }
     }
@@ -5426,6 +5476,7 @@ void insn_dataflow_extract(unsigned num_insns)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_memop_ovf_anchor = NULL;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;
@@ -5517,11 +5568,17 @@ bool insn_dataflow_prov_memop(unsigned bit, unsigned *slot)
 bool insn_dataflow_prov_truncated(void)
 {
     /*
-     * Block-wide, and deliberately over-broad: both flags say a provenance
-     * somewhere in this translation is missing a member it should carry, and
-     * neither can say which instruction.  An over-broad refusal is the
-     * direction that costs a consumer precision; a per-instruction guess
-     * would cost it a dependency.
+     * THE TWO CAPS THAT REALLY ARE BLOCK-WIDE.  Both are per-TRANSLATION
+     * note arrays whose entries are not keyed to the instruction that
+     * filled them, so neither can say which instruction lost a note and an
+     * over-broad refusal is the only honest answer.
+     *
+     * The interning table is NOT one of them any more, and used to be
+     * counted here.  Its refusal happens inside df_insn(), which is holding
+     * the instruction, so it is recorded on that instruction
+     * (@prov_truncated) and costs no other -- see FINDING 85-A, where the
+     * block-wide form cost sixty-three instructions their memop layout for
+     * one instruction's missing slot.
      *
      * @df_zero_overflow is the zero-register notes' cap.  A write whose
      * source operand was the architectural zero register would arrive with an
@@ -5534,8 +5591,7 @@ bool insn_dataflow_prov_truncated(void)
      * DESTINATION missing from the list, and a consumer whose list is QEMU's
      * would publish a shorter set than the instruction writes.
      */
-    return df && (df_slots_overflow || df_zero_overflow ||
-                  df_discard_overflow);
+    return df && (df_zero_overflow || df_discard_overflow);
 }
 
 /*

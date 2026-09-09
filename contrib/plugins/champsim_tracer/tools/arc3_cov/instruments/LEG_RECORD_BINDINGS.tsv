@@ -18,9 +18,25 @@
 # names a tree carrying 414a647de7's statement -- named here, and required to
 # be a descendant.
 #
-# commit	rc_path	tip_named	kind	evidence
-4bcec00e514c	cst_runs/exec146/legsA/RC.txt	5c0ae3181f93	TREE-IDENTICAL	tree 0433db190d44b96f0c53707cb9f087796537c2cd on both
-94d0331aaa3e	cst_runs/exec146/legsD/RC.txt	2d3aa6aff294	TREE-IDENTICAL	tree 48748307f6dc7fe1196bb72e20046ccaec96df72 on both
-bd8bbf063712	cst_runs/exec146/legsE/RC.txt	16ec6cf9f45d	TREE-IDENTICAL	tree 82ac96632bf407f360117c718d994031987b4d23 on both
-209963934a0b	cst_runs/exec146/legsF/RC.txt	181772640a2a	TREE-IDENTICAL	tree 07845ab9da1ad9baea0a207c38421b03f5605d1c on both; patch-id 672038e976ee on both
-414a647de745	cst_runs/exec145/legs/RC.txt	87e7391a0bbc	LEGGED-AT-PARENT	4bcec00e514c	the mipsel legs ran at the PARENT and the record did not say so; substance covered one commit later, whose legsA tree carries note_dsp_acc_dspctrl_write x3
+# EVERY ROW CARRIES `tree=<40 hex>` -- FINDING 90-B.  The two routes this
+# table used to rest on are both perishable and neither says so when it
+# perishes: C3's content route hashes build/contrib/plugins/libchampsim_tracer.so,
+# which one `ninja` replaces and one `rm -rf build` deletes, and TREE-IDENTICAL
+# reads an ORPHANED tip's tree, which `git gc` may prune.  The tree column
+# names an object reachable from the branch instead, and legcheck.py checks it
+# per kind: TREE-IDENTICAL / TREE-SHA / RECORD-COMPLETED-BY name the tree
+# their commit carries, LEGGED-AT-PARENT names the PARENT's.  A row without
+# the column FAILS.
+#
+# RECORD-COMPLETED-BY is FINDING 90-A's disposition, and it is not an amnesty
+# either: a record already in history cannot be amended without orphaning the
+# very pointers the rows above exist to keep resolvable, so the row names the
+# LATER commit that carries the rows the old one left out -- and legcheck
+# RE-READS that commit's message and requires IT to be complete.
+#
+# commit	rc_path	tip_named	kind	evidence	tree=<sha>
+4bcec00e514c	cst_runs/exec146/legsA/RC.txt	5c0ae3181f93	TREE-IDENTICAL	tree 0433db190d44b96f0c53707cb9f087796537c2cd on both	tree=0433db190d44b96f0c53707cb9f087796537c2cd
+94d0331aaa3e	cst_runs/exec146/legsD/RC.txt	2d3aa6aff294	TREE-IDENTICAL	tree 48748307f6dc7fe1196bb72e20046ccaec96df72 on both	tree=48748307f6dc7fe1196bb72e20046ccaec96df72
+bd8bbf063712	cst_runs/exec146/legsE/RC.txt	16ec6cf9f45d	TREE-IDENTICAL	tree 82ac96632bf407f360117c718d994031987b4d23 on both	tree=82ac96632bf407f360117c718d994031987b4d23
+209963934a0b	cst_runs/exec146/legsF/RC.txt	181772640a2a	TREE-IDENTICAL	tree 07845ab9da1ad9baea0a207c38421b03f5605d1c on both; patch-id 672038e976ee on both	tree=07845ab9da1ad9baea0a207c38421b03f5605d1c
+414a647de745	cst_runs/exec145/legs/RC.txt	87e7391a0bbc	LEGGED-AT-PARENT	4bcec00e514c	the mipsel legs ran at the PARENT and the record did not say so; substance covered one commit later, whose legsA tree carries note_dsp_acc_dspctrl_write x3	tree=9787a302f7df8369b9362168728f8d8c08d3bed3

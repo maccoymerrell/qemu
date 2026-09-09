@@ -18,10 +18,24 @@
 #                                    the population it is about
 #   5  legcheck                      every leg record given can be resolved
 #                                    from the commit that carries it
+#   6  legcheck --message            every in-commit leg record NAMED is
+#                                    COMPLETE: it transcribes all 19 legs
+#                                    the R13 manifest lists, its own "GATE
+#                                    PASSED -- N legs" line agrees with the
+#                                    rows it prints, and it names the tree
+#                                    it measured
 #
 # Step 4 is the one that cannot be skipped by accident any more.  A ledger row
 # is a sentence about a measurement; steps 1-3 re-take the measurement every
 # pass and step 4 re-reads the sentence against it.
+#
+# STEP 6 IS STEP 5's OWN LESSON, ONE LEVEL UP -- FINDING 90-A.  Step 5 asks
+# whether a record's POINTER resolves; nothing asked whether the record was
+# COMPLETE, and b5fa1e58be's says "GATE PASSED -- 19 legs" over FOURTEEN
+# printed rows, with the five missing legs' reports sitting in the evidence
+# root the record itself names.  The gate scores the RUN and the record is a
+# TRANSCRIPT of it, so no gate row and no battery row could ever see the gap.
+# CST_LEG_MESSAGE names the commits whose records to read; empty is PRINTED.
 #
 # STEP 5 IS HERE FOR THE REASON STEP 4 IS, and by the same lesson: PASS 89
 # found five in-commit leg records naming trees a reader cannot reach, and
@@ -98,6 +112,18 @@ if [ ${#LEGRC[@]} -gt 0 ]; then
 else
     echo "legcheck SKIPPED -- no leg RC.txt named on the command line;" \
          "this pass's in-commit leg records were NOT checked" \
+         >> "$O/BARSCORE_RC.txt"
+fi
+
+LEGMSG=${CST_LEG_MESSAGE:-}
+if [ -n "$LEGMSG" ]; then
+    msgargs=""
+    for c in $LEGMSG; do msgargs="$msgargs --message $c"; done
+    run legmessage LEGMESSAGE.txt "$PY" "$I/legcheck.py" \
+        --repo "$(cd "$I/../../../../../.." && pwd)" $msgargs
+else
+    echo "legmessage SKIPPED -- CST_LEG_MESSAGE names no commit; this pass's" \
+         "in-commit leg records were NOT read for COMPLETENESS" \
          >> "$O/BARSCORE_RC.txt"
 fi
 

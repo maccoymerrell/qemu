@@ -16771,6 +16771,18 @@ static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
  * The RANGE form against cpu_dspctrl's own storage, so the write resolves
  * through the global that already names this register downstream.
  *
+ * IT MOVES BOTH LISTS, AND THAT IS RIGHT.  MEASURED across this statement's
+ * own landing: the `--srcenc` corpus row for `extr.w` at encoding 3800007c
+ * read `REG_ACCHI0,REG_ACC0` before and reads `REG_ACCHI0,REG_ACC0,REG_FLAGS`
+ * after, so the READ list gained the register alongside the write.  R17 is
+ * why that is correct rather than a side effect to be suppressed: every
+ * update here MERGES -- set_DSPControl_overflow_flag() ORs a bit in and
+ * set_DSPControl_efi() masks one field and ORs the new value, both preserving
+ * the rest of the word -- and a merging partial write reads what it
+ * preserves.  note_dsp_acc_fold() above states exactly that, in those words,
+ * for the arm QEMU folds to a NOP; the performed arm has the same read for
+ * the same reason and now says so.
+ *
  * Capture only; no op is emitted, altered or suppressed.
  */
 static void note_dsp_acc_dspctrl_write(uint32_t op1, uint32_t op2)

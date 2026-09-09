@@ -590,6 +590,28 @@ def _m_fcsr(s):
     return "REG_FCSR" in s.regs
 
 
+@cls("mipsel", "M-DSPCTL", "DSPControl is read-modify-written by the DSP "
+     "helpers that update it", """
+The DSP ASE keeps its saturation, overflow and extract-position state in ONE
+word, active_tc.DSPControl, and every helper that updates it MERGES:
+set_DSPControl_overflow_flag() ORs a bit in, set_DSPControl_efi() masks one
+field and ORs the new value, and the extract forms' `pos` handling is the same
+shape (target/mips/tcg/dsp_helper.c).  A merging partial write reads the word
+it preserves, which R17 rules a true source, and note_dsp_acc_fold() in
+target/mips/tcg/translate.c already says so in those words for the fold arm.
+LLVM's MIPS tables model no DSP control register on any instruction, so the
+register is a phantom on the read side for the same reason M-FCSR's FCR31 is:
+the reference has no operand to put it in.
+
+MEASURED WHEN THE SIGNATURE APPEARED.  Before 26ba0eb823 the corpus row for
+`extr.w` at 3800007c read `REG_ACCHI0,REG_ACC0`; after it reads
+`REG_ACCHI0,REG_ACC0,REG_FLAGS`.  That commit states DSPControl's WRITE at the
+EXTR/EXTP decode site, and the wire's read list moved with it -- the merging
+write's own read, arriving where R17 says it belongs.""")
+def _m_dspctl(s):
+    return "REG_FLAGS" in s.regs
+
+
 @cls("mipsel", "M-EXC", "the footprint of the exception an instruction "
      "RAISES", """
 R7.6: syscall, break, the twelve conditional traps, the overflow-checking

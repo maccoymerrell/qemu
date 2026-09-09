@@ -60,6 +60,27 @@ HEADLINE = {
     # detector nobody reads is not a detector.
     'isaxdead': (re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=(\d+)',
                             re.M), 'isaxdead'),
+    # THE UNALLOWED RESIDUE, and it exists because the `--srcenc` arms had NO
+    # scored row at all -- FINDING 90-C.
+    #
+    # `isax` scores EXIT CODES and the comment above says why it can only be
+    # asked of the bare half: a `--srcenc` arm carries its residue as
+    # `unallowed` and therefore exits 1 by construction.  That is true, and
+    # the conclusion drawn from it was wrong.  What follows from "the exit
+    # code is not the number" is that the NUMBER needs its own row -- not
+    # that the arms go unscored.  They went unscored: at exec148's evidence
+    # root the eight `--srcenc` arms read `unallowed=` 6, 6, 3, 3 and 0 x4,
+    # four of them exited 1, and the gate PASSED 19 of 19 without a row that
+    # could see any of it.
+    #
+    # So the residue is scored directly, summed over the arms, exactly as the
+    # dead-rule fact is.  An `unallowed` signature is a disagreement between
+    # the wire's published source list and LLVM MC's operand description that
+    # NOTHING in the allowlist claims -- neither adjudicated tracer-right nor
+    # named as a defect -- which is the one state this gate must never read
+    # as a pass.
+    'isaxunallowed': (re.compile(r'^# isa=\S+ layer=\S+ .*unallowed=(\d+)',
+                                 re.M), 'isaxunallowed'),
     # the four-ISA cross-tabulation is the ONE static report that carries the
     # headline AND its denominator AND the reachability hole on the same row,
     # so the static leg reads that rather than the per-ISA compare files (two
@@ -88,6 +109,8 @@ FLOOR = {
     'isax':    re.compile(r'^(?:boundary|fields)\s+\S+\s+rc=\d+', re.M),
     'isaxdead': re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=\d+',
                            re.M),
+    'isaxunallowed': re.compile(r'^# isa=\S+ layer=\S+ .*unallowed=\d+',
+                                re.M),
     'static':  None,
     'gem5cp':  re.compile(r'^TOTAL\s+(\d+)', re.M),
     'spikecp': re.compile(r'^\s*aligned\s+(\d+)', re.M),
@@ -267,6 +290,33 @@ def score_one(row, root, binary_mtime):
                     'DEAD line.  Retire it in the allowlist with the reason '
                     'written next to it.' % (headline, len(dead),
                                              ', '.join(dead)))
+    elif kind == 'isaxunallowed':
+        arms = pat.findall(text)
+        if not arms:
+            return (False, None, None,
+                    'NO ARM SUMMARY LINES PARSED out of %s.  The unallowed '
+                    'count lives on isaxcheck\'s own `# isa=` line; a report '
+                    'without one cannot answer this question and must not '
+                    'read as a zero.' % path)
+        headline = sum(int(n) for n in arms)
+        scored = len(arms)
+        # THE CEILING DECIDES, not the mere presence of a residue.  The
+        # `isaxdead` branch above fails on any non-zero because ITS ceiling is
+        # 0 and always will be; this row's is adjudicated and may be above
+        # zero while a regeneration is owed, so the arm detail is attached
+        # only when the headline is actually over the line.
+        if headline > row.ceiling:
+            hot = [n for n in arms if n != '0']
+            return (False, headline, scored,
+                    'UNALLOWED SIGNATURE(S): %d across %d arm(s) (%s).  A '
+                    'signature the allowlist does not claim is a source-list '
+                    'disagreement nobody has adjudicated -- neither ruled '
+                    'tracer-right with a reason nor named as a defect.  '
+                    'Regenerate the block its family belongs to, or write '
+                    'the row with its justification; a ceiling above zero '
+                    'here needs the same per-row adjudication every other '
+                    'ceiling in this manifest carries.'
+                    % (headline, len(hot), ', '.join(hot)))
     elif kind == 'isax':
         arms = pat.findall(text)
         if not arms:

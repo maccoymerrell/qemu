@@ -14144,6 +14144,567 @@ static void gen_mips_lx(DisasContext *ctx, uint32_t opc,
     }
 }
 
+/*
+ * THE OPERANDS A DSP INSTRUCTION INTO $zero NEVER READS, AND THE DESTINATION
+ * IT NEVER WRITES -- BY ROLE, AT THE EMITTER.
+ *
+ * Every DSP emitter below opens with the same three lines:
+ *
+ *     if (ret == 0) {
+ *         "Treat as NOP", and return
+ *     }
+ *
+ * and that return is before any op exists.  So `addu_s.qb $zero,$zero,$t0`
+ * reaches a consumer touching NOTHING: an empty read list, an empty write
+ * list, and a wire that publishes the two source GPRs its encoding names and
+ * the $zero its rd field names.  The source bar measured 261 registers over
+ * fourteen families and the destination bar 326 over eight, and every one of
+ * them is this arm.
+ *
+ * WHY IT WAS NOT CLOSED BEFORE, AND WHAT CHANGES.  `mips-dsp`'s adjudication
+ * named the obstacle and refused to guess past it: `shra.qb rd,rt,sa` takes
+ * an IMMEDIATE where `addu_s.qb rd,rs,rt` takes a REGISTER in the same slot,
+ * so a blanket statement at the fold site would name an immediate as a
+ * register.  The remedy it asked for is the emitters carrying their operand
+ * ROLES, and that is what these four functions are: each mirrors ITS OWN
+ * emitter's op1/op2 nesting, arm for arm, and each arm states exactly the
+ * operands that arm's `gen_load_gpr()` calls would have loaded.
+ *
+ *   note_dsp_nop_arith         96 arms, 7 op1 groups
+ *   note_dsp_nop_shift         48 arms, 2 op1 groups
+ *   note_dsp_nop_bitinsn       11 arms, 2 op1 groups
+ *   note_dsp_nop_add_cmp_pick  34 arms, 2 op1 groups
+ *
+ * -- the same counts the emitters have, and the correspondence is checkable
+ * by counting `case OPC_` in either.  A `default: return` closes every
+ * switch, so an arm a future patch adds to an emitter and not to its note
+ * STATES NOTHING and lands on the bar, rather than silently inheriting a
+ * sentence about operands it does not have.  That is the same discipline
+ * note_dsp_acc_fold() carries for the accumulator family, in its words: the
+ * emitter's own op2 list, not a second table.
+ *
+ * THE FOUR ROLES, all read off the emitter and none of them assumed:
+ *
+ *   REGISTER   the arm calls gen_load_gpr(vN_t, vN) -- stated with
+ *              note_gpr_folded_read(), which spells $zero through
+ *              insn_dataflow_note_folded_read_zero() the way every other
+ *              fold site does.
+ *   IMMEDIATE  the arm materialises the field with tcg_gen_movi_tl(t0, v1)
+ *              or tcg_constant_i32(v2) -- `shll.qb rd,rt,sa` and its
+ *              non-`V` kin, and PRECR_SRA.PH.W's `sa`.  NOT stated as a
+ *              register, which is the whole point of the row.
+ *   ABSENT     the arm loads neither -- REPL.QB and its kin build their
+ *              result from the encoding alone.
+ *   ACCUMULATE PRECR_SRA.PH.W and PRECR_SRA_R.PH.W pass cpu_gpr[ret] as a
+ *              helper ARGUMENT as well as its destination, so the
+ *              destination register is also a source; on this arm ret == 0
+ *              and the read is of $zero.
+ *
+ * THE DESTINATION, both halves.  note_gpr_zero_dest() states the discarded
+ * write -- the same statement the six two-register NOP arms already carry --
+ * anchored on the first REGISTER-role operand the arm names, which is the
+ * account note_gpr_zero_dest_rr() gives for its own shape.
+ *
+ * AND DSPControl, on the arms that have it.  `ctrl` is set from ONE fact
+ * read off the emitter: whether the arm's helper is called with `tcg_env`.
+ * That is not a proxy for a guess -- it is checkable against the CP-H helper
+ * table, and it was checked: of the DSP helpers these four emitters call
+ * with tcg_env, every one that an observed run has censused
+ * (accel/tcg/insn-dataflow-usage/mips.c.inc: addsc, addu_ph, addu_qb,
+ * addu_s_ph, addu_s_qb, cmpu_eq_qb, shll_ph, shll_qb, shll_s_ph, shll_s_w)
+ * carries exactly one env row, `active_tc.DSPControl` with INSN_DF_RD |
+ * INSN_DF_WR, and NO helper called without tcg_env carries an env row at
+ * all.  Ten of ten, and the converse holds.  So the emitter's own argument
+ * list decides it.
+ *
+ * BOTH DIRECTIONS ON DSPControl, for the reason note_dsp_acc_dspctrl_write()
+ * records: the ASE's updates MERGE -- set_DSPControl_overflow_flag() ORs a
+ * bit in and the ccond field is masked and ORed -- and R17 rules a merging
+ * partial write a write that reads what it preserves.  The helper table says
+ * RD | WR in the same breath, so the pair is QEMU's own reading of its own
+ * C, not this file's.
+ *
+ * R16 IS WHY THE NOP ARM RECORDS ANYTHING AT ALL.  The MIPS DSP ASE gives
+ * none of these instructions a special case for rd == 0: ADDU_S.QB still
+ * tests for saturation and still ORs DSPControl.ouflag, and the operands it
+ * names are still the operands it reads.  The NOP is QEMU's, not the
+ * architecture's -- the identical sentence 22d7666262 and 414a647de7 carry
+ * for the EXTR family one emitter over, and the ruling `x86-rdpmc-dst`
+ * closed on at 7d94231be0.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_dsp_ctrl_rmw(void)
+{
+    insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_dspctrl));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUMIPSState, active_tc.DSPControl),
+        sizeof(((CPUMIPSState *)0)->active_tc.DSPControl));
+}
+
+static void note_dsp_nop_arith(uint32_t op1, uint32_t op2, int v1, int v2)
+{
+    int anchor = 0;
+    bool ctrl = false;
+
+    switch (op1) {
+    case OPC_ADDUH_QB_DSP:
+        switch (op2) {
+        case OPC_ADDUH_QB:
+        case OPC_ADDUH_R_QB:
+        case OPC_ADDQH_PH:
+        case OPC_ADDQH_R_PH:
+        case OPC_ADDQH_W:
+        case OPC_ADDQH_R_W:
+        case OPC_SUBUH_QB:
+        case OPC_SUBUH_R_QB:
+        case OPC_SUBQH_PH:
+        case OPC_SUBQH_R_PH:
+        case OPC_SUBQH_W:
+        case OPC_SUBQH_R_W:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+    case OPC_ABSQ_S_PH_DSP:
+        switch (op2) {
+        case OPC_ABSQ_S_QB:
+        case OPC_ABSQ_S_PH:
+        case OPC_ABSQ_S_W:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            ctrl = true;
+            break;
+        case OPC_PRECEQ_W_PHL:
+        case OPC_PRECEQ_W_PHR:
+        case OPC_PRECEQU_PH_QBL:
+        case OPC_PRECEQU_PH_QBR:
+        case OPC_PRECEQU_PH_QBLA:
+        case OPC_PRECEQU_PH_QBRA:
+        case OPC_PRECEU_PH_QBL:
+        case OPC_PRECEU_PH_QBR:
+        case OPC_PRECEU_PH_QBLA:
+        case OPC_PRECEU_PH_QBRA:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            break;
+        default:
+            return;
+        }
+        break;
+    case OPC_ADDU_QB_DSP:
+        switch (op2) {
+        case OPC_ADDQ_PH:
+        case OPC_ADDQ_S_PH:
+        case OPC_ADDQ_S_W:
+        case OPC_ADDU_QB:
+        case OPC_ADDU_S_QB:
+        case OPC_ADDU_PH:
+        case OPC_ADDU_S_PH:
+        case OPC_SUBQ_PH:
+        case OPC_SUBQ_S_PH:
+        case OPC_SUBQ_S_W:
+        case OPC_SUBU_QB:
+        case OPC_SUBU_S_QB:
+        case OPC_SUBU_PH:
+        case OPC_SUBU_S_PH:
+        case OPC_ADDSC:
+        case OPC_ADDWC:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_MODSUB:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        case OPC_RADDU_W_QB:
+            note_gpr_folded_read(v1);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+    case OPC_CMPU_EQ_QB_DSP:
+        switch (op2) {
+        case OPC_PRECR_QB_PH:
+        case OPC_PRECRQ_QB_PH:
+        case OPC_PRECRQ_PH_W:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        case OPC_PRECR_SRA_PH_W:
+        case OPC_PRECR_SRA_R_PH_W:
+            note_gpr_folded_read(v1);
+            insn_dataflow_note_folded_read_zero();
+            anchor = v1;
+            break;
+        case OPC_PRECRQ_RS_PH_W:
+        case OPC_PRECRQU_S_QB_PH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        default:
+            return;
+        }
+        break;
+#ifdef TARGET_MIPS64
+    case OPC_ABSQ_S_QH_DSP:
+        switch (op2) {
+        case OPC_PRECEQ_L_PWL:
+        case OPC_PRECEQ_L_PWR:
+        case OPC_PRECEQ_PW_QHL:
+        case OPC_PRECEQ_PW_QHR:
+        case OPC_PRECEQ_PW_QHLA:
+        case OPC_PRECEQ_PW_QHRA:
+        case OPC_PRECEQU_QH_OBL:
+        case OPC_PRECEQU_QH_OBR:
+        case OPC_PRECEQU_QH_OBLA:
+        case OPC_PRECEQU_QH_OBRA:
+        case OPC_PRECEU_QH_OBL:
+        case OPC_PRECEU_QH_OBR:
+        case OPC_PRECEU_QH_OBLA:
+        case OPC_PRECEU_QH_OBRA:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            break;
+        case OPC_ABSQ_S_OB:
+        case OPC_ABSQ_S_PW:
+        case OPC_ABSQ_S_QH:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            ctrl = true;
+            break;
+        default:
+            return;
+        }
+        break;
+    case OPC_ADDU_OB_DSP:
+        switch (op2) {
+        case OPC_RADDU_L_OB:
+            note_gpr_folded_read(v1);
+            anchor = v1;
+            break;
+        case OPC_SUBQ_PW:
+        case OPC_SUBQ_S_PW:
+        case OPC_SUBQ_QH:
+        case OPC_SUBQ_S_QH:
+        case OPC_SUBU_OB:
+        case OPC_SUBU_S_OB:
+        case OPC_SUBU_QH:
+        case OPC_SUBU_S_QH:
+        case OPC_ADDQ_PW:
+        case OPC_ADDQ_S_PW:
+        case OPC_ADDQ_QH:
+        case OPC_ADDQ_S_QH:
+        case OPC_ADDU_OB:
+        case OPC_ADDU_S_OB:
+        case OPC_ADDU_QH:
+        case OPC_ADDU_S_QH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_SUBUH_OB:
+        case OPC_SUBUH_R_OB:
+        case OPC_ADDUH_OB:
+        case OPC_ADDUH_R_OB:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+    case OPC_CMPU_EQ_OB_DSP:
+        switch (op2) {
+        case OPC_PRECR_OB_QH:
+        case OPC_PRECR_SRA_QH_PW:
+        case OPC_PRECR_SRA_R_QH_PW:
+        case OPC_PRECRQ_OB_QH:
+        case OPC_PRECRQ_PW_L:
+        case OPC_PRECRQ_QH_PW:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        case OPC_PRECRQ_RS_QH_PW:
+        case OPC_PRECRQU_S_OB_QH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        default:
+            return;
+        }
+        break;
+#endif
+    default:
+        return;
+    }
+    note_gpr_zero_dest(anchor, 0);
+    if (ctrl) {
+        note_dsp_ctrl_rmw();
+    }
+}
+
+static void note_dsp_nop_shift(DisasContext *ctx, uint32_t op1,
+                               int v1, int v2)
+{
+    uint32_t op2;
+    int anchor = 0;
+    bool ctrl = false;
+
+    switch (op1) {
+    case OPC_SHLL_QB_DSP:
+        op2 = MASK_SHLL_QB(ctx->opcode);
+        switch (op2) {
+        case OPC_SHLL_QB:
+        case OPC_SHLL_PH:
+        case OPC_SHLL_S_PH:
+        case OPC_SHLL_S_W:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            ctrl = true;
+            break;
+        case OPC_SHLLV_QB:
+        case OPC_SHLLV_PH:
+        case OPC_SHLLV_S_PH:
+        case OPC_SHLLV_S_W:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_SHRL_QB:
+        case OPC_SHRL_PH:
+        case OPC_SHRA_QB:
+        case OPC_SHRA_R_QB:
+        case OPC_SHRA_PH:
+        case OPC_SHRA_R_PH:
+        case OPC_SHRA_R_W:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            break;
+        case OPC_SHRLV_QB:
+        case OPC_SHRLV_PH:
+        case OPC_SHRAV_QB:
+        case OPC_SHRAV_R_QB:
+        case OPC_SHRAV_PH:
+        case OPC_SHRAV_R_PH:
+        case OPC_SHRAV_R_W:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+#ifdef TARGET_MIPS64
+    case OPC_SHLL_OB_DSP:
+        op2 = MASK_SHLL_OB(ctx->opcode);
+        switch (op2) {
+        case OPC_SHLL_PW:
+        case OPC_SHLL_S_PW:
+        case OPC_SHLL_OB:
+        case OPC_SHLL_QH:
+        case OPC_SHLL_S_QH:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            ctrl = true;
+            break;
+        case OPC_SHLLV_PW:
+        case OPC_SHLLV_S_PW:
+        case OPC_SHLLV_OB:
+        case OPC_SHLLV_QH:
+        case OPC_SHLLV_S_QH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_SHRA_OB:
+        case OPC_SHRA_R_OB:
+        case OPC_SHRA_PW:
+        case OPC_SHRA_R_PW:
+        case OPC_SHRA_QH:
+        case OPC_SHRA_R_QH:
+        case OPC_SHRL_OB:
+        case OPC_SHRL_QH:
+            note_gpr_folded_read(v2);
+            anchor = v2;
+            break;
+        case OPC_SHRAV_OB:
+        case OPC_SHRAV_R_OB:
+        case OPC_SHRAV_PW:
+        case OPC_SHRAV_R_PW:
+        case OPC_SHRAV_QH:
+        case OPC_SHRAV_R_QH:
+        case OPC_SHRLV_OB:
+        case OPC_SHRLV_QH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+#endif
+    default:
+        return;
+    }
+    note_gpr_zero_dest(anchor, 0);
+    if (ctrl) {
+        note_dsp_ctrl_rmw();
+    }
+}
+
+static void note_dsp_nop_bitinsn(uint32_t op1, uint32_t op2, int val)
+{
+    int anchor = 0;
+    bool ctrl = false;
+
+    switch (op1) {
+    case OPC_ABSQ_S_PH_DSP:
+        switch (op2) {
+        case OPC_BITREV:
+        case OPC_REPLV_QB:
+        case OPC_REPLV_PH:
+            note_gpr_folded_read(val);
+            anchor = val;
+            break;
+        case OPC_REPL_QB:
+        case OPC_REPL_PH:
+            anchor = 0;
+            break;
+        default:
+            return;
+        }
+        break;
+#ifdef TARGET_MIPS64
+    case OPC_ABSQ_S_QH_DSP:
+        switch (op2) {
+        case OPC_REPL_OB:
+        case OPC_REPL_PW:
+        case OPC_REPL_QH:
+            anchor = 0;
+            break;
+        case OPC_REPLV_OB:
+        case OPC_REPLV_PW:
+        case OPC_REPLV_QH:
+            note_gpr_folded_read(val);
+            anchor = val;
+            break;
+        default:
+            return;
+        }
+        break;
+#endif
+    default:
+        return;
+    }
+    note_gpr_zero_dest(anchor, 0);
+    if (ctrl) {
+        note_dsp_ctrl_rmw();
+    }
+}
+
+static void note_dsp_nop_add_cmp_pick(uint32_t op1, uint32_t op2, int v1, int v2)
+{
+    int anchor = 0;
+    bool ctrl = false;
+
+    switch (op1) {
+    case OPC_CMPU_EQ_QB_DSP:
+        switch (op2) {
+        case OPC_CMPU_EQ_QB:
+        case OPC_CMPU_LT_QB:
+        case OPC_CMPU_LE_QB:
+        case OPC_CMP_EQ_PH:
+        case OPC_CMP_LT_PH:
+        case OPC_CMP_LE_PH:
+        case OPC_PICK_QB:
+        case OPC_PICK_PH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_CMPGU_EQ_QB:
+        case OPC_CMPGU_LT_QB:
+        case OPC_CMPGU_LE_QB:
+        case OPC_CMPGDU_EQ_QB:
+        case OPC_CMPGDU_LT_QB:
+        case OPC_CMPGDU_LE_QB:
+        case OPC_PACKRL_PH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+#ifdef TARGET_MIPS64
+    case OPC_CMPU_EQ_OB_DSP:
+        switch (op2) {
+        case OPC_CMP_EQ_PW:
+        case OPC_CMP_LT_PW:
+        case OPC_CMP_LE_PW:
+        case OPC_CMP_EQ_QH:
+        case OPC_CMP_LT_QH:
+        case OPC_CMP_LE_QH:
+        case OPC_CMPGDU_EQ_OB:
+        case OPC_CMPGDU_LT_OB:
+        case OPC_CMPGDU_LE_OB:
+        case OPC_CMPU_EQ_OB:
+        case OPC_CMPU_LT_OB:
+        case OPC_CMPU_LE_OB:
+        case OPC_PICK_OB:
+        case OPC_PICK_PW:
+        case OPC_PICK_QH:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            ctrl = true;
+            break;
+        case OPC_CMPGU_EQ_OB:
+        case OPC_CMPGU_LT_OB:
+        case OPC_CMPGU_LE_OB:
+        case OPC_PACKRL_PW:
+            note_gpr_folded_read(v1);
+            note_gpr_folded_read(v2);
+            anchor = v1;
+            break;
+        default:
+            return;
+        }
+        break;
+#endif
+    default:
+        return;
+    }
+    note_gpr_zero_dest(anchor, 0);
+    if (ctrl) {
+        note_dsp_ctrl_rmw();
+    }
+}
+
 static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                               int ret, int v1, int v2)
 {
@@ -14151,7 +14712,8 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
     TCGv v2_t;
 
     if (ret == 0) {
-        /* Treat as NOP. */
+        /* Treat as NOP -- see note_dsp_nop_arith() for what it erases. */
+        note_dsp_nop_arith(op1, op2, v1, v2);
         return;
     }
 
@@ -15059,7 +15621,8 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
     TCGv v2_t;
 
     if (ret == 0) {
-        /* Treat as NOP. */
+        /* Treat as NOP -- see note_dsp_nop_shift() for what it erases. */
+        note_dsp_nop_shift(ctx, opc, v1, v2);
         return;
     }
 
@@ -16023,7 +16586,8 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
     TCGv val_t;
 
     if (ret == 0) {
-        /* Treat as NOP. */
+        /* Treat as NOP -- see note_dsp_nop_bitinsn() for what it erases. */
+        note_dsp_nop_bitinsn(op1, op2, val);
         return;
     }
 
@@ -16204,7 +16768,8 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
     TCGv v2_t;
 
     if ((ret == 0) && (check_ret == 1)) {
-        /* Treat as NOP. */
+        /* Treat as NOP -- see note_dsp_nop_add_cmp_pick(). */
+        note_dsp_nop_add_cmp_pick(op1, op2, v1, v2);
         return;
     }
 

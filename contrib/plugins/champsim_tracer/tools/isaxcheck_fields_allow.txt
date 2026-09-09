@@ -7868,8 +7868,8 @@ x86_64 FU-unclassified ud2
 # pass evidence, not here: it reads 0 by construction.
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
-#   fields        888     1115     1059      864     3926
-#   boundary      865     1115     1016      233     3229
+#   fields        888     1115     1059      872     3934
+#   boundary      865     1115     1016      268     3264
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -7882,10 +7882,10 @@ x86_64 FU-unclassified ud2
 #                  X-CONSTCOUNT   8
 #                  X-IMPLICITGPR  7
 #                  X-SSP          6
-#   aarch64     8  A-SYSSEL       2
-#                  A-ERET         2
+#   aarch64     7  A-ERET         2
 #                  A-SATQC        2
 #                  A-MISC         2
+#                  A-SYSSEL       1
 #   riscv64   182  R-ZIMOP        174
 #                  R-HINT         8
 #   mipsel      3  M-CP0          2
@@ -7900,16 +7900,17 @@ x86_64 FU-unclassified ud2
 #   mipsel   M-DSPIMM
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/verify63/srcencorp/tip84
-#   x86_64    6826116 rows md5 3a56cc727dfe8688eaa537b6ed5ea471
-#   aarch64   1408171 rows md5 d407a13138a9281cb541393508f20c98
-#   riscv64     86889 rows md5 baf8571353b1e382588425d728c090ad
-#   mipsel     548886 rows md5 9a73d0219983be6ce43a88aaac968bf4
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec144/corpus
+#   CAPTURED AT f21e5068963e1f2e83fba218db988331e442558d, which is this tree's HEAD (refused otherwise)
+#   x86_64    6826117 rows md5 3bcbc7cc50276342f645c86343283aef
+#   aarch64   1408172 rows md5 612ba3d17aaeb4271611e29fb4ad1e39
+#   riscv64     86890 rows md5 4482ec5473f1a5be00c01fb8fd7e92d0
+#   mipsel     548887 rows md5 9786554fe984bb30bc03998b9744fe57
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
-#   SO_SHA=9efbb8aaf16e266e
+#   SO_SHA=9711ef37932cc777
 #   ISAX_SHA=e525bf9e9aa89ca5
-#   ALL_ARMS_DONE
+#   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #
 # HOW TO REGENERATE:
 #   isax_srcenc_gate.sh run <build> <arms> <corpus>
@@ -9063,7 +9064,7 @@ x86_64 SR-rd-phantom verr +REG_FLAGS
 x86_64 SR-rd-phantom verw +REG_FLAGS
 
 # --- A-FPEN: the FP / SIMD / SVE / SME EXECUTION-ENABLE gate, which the reference models on no instruction.
-#     1062 signature(s), 705110 encodings at this tip.
+#     1062 signature(s), 710456 encodings at this tip.
 #
 # Every FP, AdvSIMD, SVE and SME instruction runs an architectural enable check
 # before it does anything -- CheckFPAdvSIMDEnabled, CheckSVEEnabled,
@@ -10166,7 +10167,7 @@ aarch64 SR-rd-phantom sys +REG_SSP
 aarch64 SR-rd-phantom sysl +REG_SSP
 
 # --- A-SYSSEL: the system register an (op0, op1, CRn, CRm, op2) tuple selects, which LLVM models as an immediate.
-#     27 signature(s), 19749 encodings at this tip.
+#     26 signature(s), 19745 encodings at this tip.
 #
 # MRS / MSR / MRRS / MSRR / SYS / SYSL address a system register by an ENCODED
 # TUPLE, and LLVM's MCInstrDesc carries that tuple as immediates: there is no
@@ -10180,7 +10181,6 @@ aarch64 SR-rd-phantom sysl +REG_SSP
 # because FPCR moved off REG_FCSR (the control word is not the status word);
 # LLVM models no system register write on MSR either.
 aarch64 SR-rd-missing sysl +REG_GPR#
-aarch64 SR-rd-missing tlbi +REG_GPR#
 aarch64 SR-rd-phantom mrrs +REG_FCSR
 aarch64 SR-rd-phantom mrrs +REG_FPCW
 aarch64 SR-rd-phantom mrrs +REG_SYS
@@ -10251,7 +10251,7 @@ aarch64 SR-rd-missing sqdmulh +REG_FPCW
 aarch64 SR-rd-missing sqrdmulh +REG_FPCW
 
 # --- A-MISC: the remaining single-signature reference gaps.
-#     2 signature(s), 6232 encodings at this tip.
+#     3 signature(s), 6233 encodings at this tip.
 #
 # `bc.nv` is the never-taken consistent branch: LLVM names a condition-flag
 # read for the whole BC.cond family, and QEMU reads nothing because the NV
@@ -10261,6 +10261,7 @@ aarch64 SR-rd-missing sqrdmulh +REG_FPCW
 # the reference over-naming an operand its per-opcode description carries.
 aarch64 SR-rd-missing bc.nv +REG_FLAGS
 aarch64 SR-rd-missing zero +REG_MATRIX
+aarch64 SR-rd-phantom wfet +REG_SP
 
 # --- R-HINT: an RV128 mnemonic decoded on RV64, where the encoding is a HINT that reads nothing.
 #     8 signature(s), 12335 encodings at this tip.
@@ -11735,8 +11736,66 @@ mipsel SR-rd-phantom trunc.l.s +REG_FCSR
 mipsel SR-rd-phantom trunc.w.d +REG_FCSR
 mipsel SR-rd-phantom trunc.w.s +REG_FCSR
 
+# --- M-DSPCTL: DSPControl is read-modify-written by the DSP helpers that update it.
+#     38 signature(s), 4940 encodings at this tip.
+#
+# The DSP ASE keeps its saturation, overflow and extract-position state in ONE
+# word, active_tc.DSPControl, and every helper that updates it MERGES:
+# set_DSPControl_overflow_flag() ORs a bit in, set_DSPControl_efi() masks one
+# field and ORs the new value, and the extract forms' `pos` handling is the same
+# shape (target/mips/tcg/dsp_helper.c).  A merging partial write reads the word
+# it preserves, which R17 rules a true source, and note_dsp_acc_fold() in
+# target/mips/tcg/translate.c already says so in those words for the fold arm.
+# LLVM's MIPS tables model no DSP control register on any instruction, so the
+# register is a phantom on the read side for the same reason M-FCSR's FCR31 is:
+# the reference has no operand to put it in.
+#
+# MEASURED WHEN THE SIGNATURE APPEARED.  Before 26ba0eb823 the corpus row for
+# `extr.w` at 3800007c read `REG_ACCHI0,REG_ACC0`; after it reads
+# `REG_ACCHI0,REG_ACC0,REG_FLAGS`.  That commit states DSPControl's WRITE at the
+# EXTR/EXTP decode site, and the wire's read list moved with it -- the merging
+# write's own read, arriving where R17 says it belongs.
+mipsel SR-rd-phantom addsc +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu_s.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu_s.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom bposge32 +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.eq.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.le.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom cmpgdu.lt.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom cmpu.eq.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom dpaq_s.w.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom dpaq_sa.l.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom dpaqx_s.w.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom extr.w +REG_FLAGS
+mipsel SR-rd-phantom extr.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom extr_r.w +REG_FLAGS
+mipsel SR-rd-phantom extr_r.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom extr_rs.w +REG_FLAGS
+mipsel SR-rd-phantom extr_s.h +REG_FLAGS
+mipsel SR-rd-phantom extrv.w +REG_FLAGS
+mipsel SR-rd-phantom extrv.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom extrv_r.w +REG_FLAGS
+mipsel SR-rd-phantom extrv_r.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom extrv_rs.w +REG_FLAGS
+mipsel SR-rd-phantom extrv_s.h +REG_FLAGS
+mipsel SR-rd-phantom maq_s.w.phl +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom maq_sa.w.phl +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom mthlip +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom muleq_s.w.phl +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shll.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shll.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shll_s.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shll_s.w +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shllv.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shllv.qb +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shllv_s.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shllv_s.w +REG_FLAGS,REG_SYSEXC
+
 # --- M-EXC: the footprint of the exception an instruction RAISES.
-#     622 signature(s), 191639 encodings at this tip.
+#     592 signature(s), 186725 encodings at this tip.
 #
 # R7.6: syscall, break, the twelve conditional traps, the overflow-checking
 # arithmetic and the DSP forms whose availability is gated all reach QEMU's
@@ -11773,11 +11832,6 @@ mipsel SR-rd-phantom adds_u.b +REG_SYSEXC
 mipsel SR-rd-phantom adds_u.d +REG_SYSEXC
 mipsel SR-rd-phantom adds_u.h +REG_SYSEXC
 mipsel SR-rd-phantom adds_u.w +REG_SYSEXC
-mipsel SR-rd-phantom addsc +REG_SYSEXC
-mipsel SR-rd-phantom addu.ph +REG_SYSEXC
-mipsel SR-rd-phantom addu.qb +REG_SYSEXC
-mipsel SR-rd-phantom addu_s.ph +REG_SYSEXC
-mipsel SR-rd-phantom addu_s.qb +REG_SYSEXC
 mipsel SR-rd-phantom adduh.qb +REG_SYSEXC
 mipsel SR-rd-phantom adduh_r.qb +REG_SYSEXC
 mipsel SR-rd-phantom addv.b +REG_SYSEXC
@@ -11859,7 +11913,6 @@ mipsel SR-rd-phantom bnz.d +REG_SYSEXC
 mipsel SR-rd-phantom bnz.h +REG_SYSEXC
 mipsel SR-rd-phantom bnz.v +REG_SYSEXC
 mipsel SR-rd-phantom bnz.w +REG_SYSEXC
-mipsel SR-rd-phantom bposge32 +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom break +REG_SYSEXC
 mipsel SR-rd-phantom bsel.v +REG_SYSEXC
 mipsel SR-rd-phantom bseli.b +REG_SYSEXC
@@ -11919,13 +11972,9 @@ mipsel SR-rd-phantom clti_u.b +REG_SYSEXC
 mipsel SR-rd-phantom clti_u.d +REG_SYSEXC
 mipsel SR-rd-phantom clti_u.h +REG_SYSEXC
 mipsel SR-rd-phantom clti_u.w +REG_SYSEXC
-mipsel SR-rd-phantom cmpgdu.eq.qb +REG_SYSEXC
-mipsel SR-rd-phantom cmpgdu.le.qb +REG_SYSEXC
-mipsel SR-rd-phantom cmpgdu.lt.qb +REG_SYSEXC
 mipsel SR-rd-phantom cmpgu.eq.qb +REG_SYSEXC
 mipsel SR-rd-phantom cmpgu.le.qb +REG_SYSEXC
 mipsel SR-rd-phantom cmpgu.lt.qb +REG_SYSEXC
-mipsel SR-rd-phantom cmpu.eq.qb +REG_SYSEXC
 mipsel SR-rd-phantom copy_s.b +REG_SYSEXC
 mipsel SR-rd-phantom copy_s.h +REG_SYSEXC
 mipsel SR-rd-phantom copy_s.w +REG_SYSEXC
@@ -11953,9 +12002,6 @@ mipsel SR-rd-phantom dpadd_s.w +REG_SYSEXC
 mipsel SR-rd-phantom dpadd_u.d +REG_SYSEXC
 mipsel SR-rd-phantom dpadd_u.h +REG_SYSEXC
 mipsel SR-rd-phantom dpadd_u.w +REG_SYSEXC
-mipsel SR-rd-phantom dpaq_s.w.ph +REG_SYSEXC
-mipsel SR-rd-phantom dpaq_sa.l.w +REG_SYSEXC
-mipsel SR-rd-phantom dpaqx_s.w.ph +REG_SYSEXC
 mipsel SR-rd-phantom dpaqx_sa.w.ph +REG_SYSEXC
 mipsel SR-rd-phantom dpau.h.qbl +REG_SYSEXC
 mipsel SR-rd-phantom dpau.h.qbr +REG_SYSEXC
@@ -11979,12 +12025,8 @@ mipsel SR-rd-phantom extp +REG_SYSEXC
 mipsel SR-rd-phantom extpdp +REG_SYSEXC
 mipsel SR-rd-phantom extpdpv +REG_SYSEXC
 mipsel SR-rd-phantom extpv +REG_SYSEXC
-mipsel SR-rd-phantom extr.w +REG_SYSEXC
-mipsel SR-rd-phantom extr_r.w +REG_SYSEXC
 mipsel SR-rd-phantom extr_rs.w +REG_SYSEXC
 mipsel SR-rd-phantom extr_s.h +REG_SYSEXC
-mipsel SR-rd-phantom extrv.w +REG_SYSEXC
-mipsel SR-rd-phantom extrv_r.w +REG_SYSEXC
 mipsel SR-rd-phantom extrv_rs.w +REG_SYSEXC
 mipsel SR-rd-phantom extrv_s.h +REG_SYSEXC
 mipsel SR-rd-phantom fclass.d +REG_SYSEXC
@@ -12059,9 +12101,7 @@ mipsel SR-rd-phantom maddv.b +REG_SYSEXC
 mipsel SR-rd-phantom maddv.d +REG_SYSEXC
 mipsel SR-rd-phantom maddv.h +REG_SYSEXC
 mipsel SR-rd-phantom maddv.w +REG_SYSEXC
-mipsel SR-rd-phantom maq_s.w.phl +REG_SYSEXC
 mipsel SR-rd-phantom maq_s.w.phr +REG_SYSEXC
-mipsel SR-rd-phantom maq_sa.w.phl +REG_SYSEXC
 mipsel SR-rd-phantom maq_sa.w.phr +REG_SYSEXC
 mipsel SR-rd-phantom max_a.b +REG_SYSEXC
 mipsel SR-rd-phantom max_a.d +REG_SYSEXC
@@ -12126,13 +12166,11 @@ mipsel SR-rd-phantom msubv.d +REG_SYSEXC
 mipsel SR-rd-phantom msubv.h +REG_SYSEXC
 mipsel SR-rd-phantom msubv.w +REG_SYSEXC
 mipsel SR-rd-phantom mthi +REG_SYSEXC
-mipsel SR-rd-phantom mthlip +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom mtlo +REG_SYSEXC
 mipsel SR-rd-phantom mul.ph +REG_SYSEXC
 mipsel SR-rd-phantom mul_q.h +REG_SYSEXC
 mipsel SR-rd-phantom mul_q.w +REG_SYSEXC
 mipsel SR-rd-phantom mul_s.ph +REG_SYSEXC
-mipsel SR-rd-phantom muleq_s.w.phl +REG_SYSEXC
 mipsel SR-rd-phantom muleq_s.w.phr +REG_SYSEXC
 mipsel SR-rd-phantom muleu_s.ph.qbl +REG_SYSEXC
 mipsel SR-rd-phantom muleu_s.ph.qbr +REG_SYSEXC
@@ -12202,7 +12240,6 @@ mipsel SR-rd-phantom prepend +REG_SYSEXC
 mipsel SR-rd-phantom pul.ps +REG_SYSEXC
 mipsel SR-rd-phantom puu.ps +REG_SYSEXC
 mipsel SR-rd-phantom raddu.w.qb +REG_SYSEXC
-mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom repl.ph +REG_SYSEXC
 mipsel SR-rd-phantom repl.qb +REG_SYSEXC
 mipsel SR-rd-phantom replv.ph +REG_SYSEXC
@@ -12224,14 +12261,6 @@ mipsel SR-rd-phantom shf.h +REG_SYSEXC
 mipsel SR-rd-phantom shf.w +REG_SYSEXC
 mipsel SR-rd-phantom shilo +REG_SYSEXC
 mipsel SR-rd-phantom shilov +REG_SYSEXC
-mipsel SR-rd-phantom shll.ph +REG_SYSEXC
-mipsel SR-rd-phantom shll.qb +REG_SYSEXC
-mipsel SR-rd-phantom shll_s.ph +REG_SYSEXC
-mipsel SR-rd-phantom shll_s.w +REG_SYSEXC
-mipsel SR-rd-phantom shllv.ph +REG_SYSEXC
-mipsel SR-rd-phantom shllv.qb +REG_SYSEXC
-mipsel SR-rd-phantom shllv_s.ph +REG_SYSEXC
-mipsel SR-rd-phantom shllv_s.w +REG_SYSEXC
 mipsel SR-rd-phantom shra.ph +REG_SYSEXC
 mipsel SR-rd-phantom shra.qb +REG_SYSEXC
 mipsel SR-rd-phantom shra_r.ph +REG_SYSEXC

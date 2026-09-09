@@ -1603,7 +1603,7 @@ uint64_t qemu_ident_adjudicated_hits(void);
  * wrong-path walk reaches such bytes, the tracer classifies them anyway,
  * and the enum row is the answer for those and for nothing else.
  */
-uint64_t qemu_ident_enum_raise_only(void);
+uint64_t qemu_ident_enum_no_ident(void);
 
 /*
  * MUST BE 0.  An identity WAS exported and its row still carries no class.

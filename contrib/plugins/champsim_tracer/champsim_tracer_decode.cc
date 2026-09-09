@@ -1324,7 +1324,18 @@ static void qid_shadow_score(const qemu_plugin_insn_info *info,
              * nothing, so classify_insn_id fell through and the enum
              * table's row is what this instruction PUBLISHES.  Delete
              * the table today and this classification does not move to
-             * the other key -- it becomes GEN_OP_UNKNOWN. */
+             * the other key -- it becomes GEN_OP_UNKNOWN.
+             *
+             * IT IS TWO CAUSES AND THEY DO NOT HAVE THE SAME REMEDY; the
+             * sidecar's SURVIVOR note carries the measurement.  Either no
+             * decode rule was selected at all (aarch64 udf reaches
+             * unallocated_encoding()), in which case there is nothing to
+             * state and this is a floor -- or a rule WAS selected and a
+             * check ahead of the publish site took the translation away
+             * from it (x86 hlt's chk(cpl0) branches to gp_fault before
+             * decode-new.c.inc reaches plugin_gen_record_insn_identity),
+             * in which case QEMU knows the answer and is simply not being
+             * asked for it at a point where it still has it. */
             g_qsh_enum_published.fetch_add(1, std::memory_order_relaxed);
             qep_record_sig(info->decode_id, info->insn_id,
                            enum_row->opcode, info->mnemonic);
@@ -1597,7 +1608,7 @@ void qemu_ident_shadow_report(GString *report)
  * else.  That is the whole live dependency on the four
  * champsim_tracer_mnemonics_<isa>.h tables.
  */
-static std::atomic<uint64_t> g_qid_enum_raise_only{0};
+static std::atomic<uint64_t> g_qid_enum_no_ident{0};
 /*
  * MUST BE 0.  An identity WAS exported, and the row for it still carries
  * no class.  Before the admission wave this was the ordinary case and the
@@ -1612,9 +1623,9 @@ static std::atomic<uint64_t> g_qid_enum_raise_only{0};
  */
 static std::atomic<uint64_t> g_qid_abstain_refused{0};
 
-uint64_t qemu_ident_enum_raise_only(void)
+uint64_t qemu_ident_enum_no_ident(void)
 {
-    return g_qid_enum_raise_only.load(std::memory_order_relaxed);
+    return g_qid_enum_no_ident.load(std::memory_order_relaxed);
 }
 
 uint64_t qemu_ident_abstain_refused(void)
@@ -1642,7 +1653,7 @@ static const InsnClassification *classify_insn_id(
     }
 
     if (info->decode_id == 0 && cap) {
-        g_qid_enum_raise_only.fetch_add(1, std::memory_order_relaxed);
+        g_qid_enum_no_ident.fetch_add(1, std::memory_order_relaxed);
         *opcode = cap->opcode;
         *branch_type = cap->branch_type;
         *flags = cap->flags;

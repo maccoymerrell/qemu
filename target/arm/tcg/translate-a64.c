@@ -3413,6 +3413,44 @@ static void handle_sys(DisasContext *s, bool isread,
 
 static bool trans_SYS(DisasContext *s, arg_SYS *a)
 {
+    /*
+     * THE OPERAND AN UNBOUNDED HELPER SWALLOWS ALONG WITH ITSELF.
+     *
+     * `CPP RCTX, X0` names X0 in its Rt field.  handle_sys() dispatches this
+     * form to a helper the extraction cannot bound, and a refused read list
+     * is refused ENTIRELY -- so the operand nobody was unsure about went out
+     * with the helper's opacity.  It is the only class on the source bar
+     * whose loss is caused by the REFUSAL rather than by silence, and the
+     * remedy is not to bound the helper: R20 puts an operand the ENCODING
+     * carries at the decode site, where `rt` is a static field and no helper
+     * is involved.  Stating it here costs the helper's opacity only what the
+     * helper genuinely reaches.
+     *
+     * ONLY WHEN L == 0, and that is the architecture's own line rather than a
+     * convenience.  `SYS #op1,Cn,Cm,#op2,Xt` passes Xt INTO the operation;
+     * `SYSL Xt,#op1,Cn,Cm,#op2` is the same encoding with L == 1 and Xt is
+     * its DESTINATION.  A blanket statement here would have published 6,146
+     * reads of a register the instruction writes.
+     *
+     * Rt == 31 GETS ITS OWN SPELLING, and it was measured rather than
+     * assumed.  cpu_reg(s, 31) mints a fresh zero constant and states the
+     * zero register on it, but that statement is ANCHORED to the temp and
+     * resolved against its contents at the END of the instruction -- and here
+     * nothing consumes the temp, so there is nothing left to resolve against
+     * and `CPP RCTX, XZR` stated NOTHING on the first attempt.  The direct
+     * form says the same fact without needing a survivor to say it through.
+     * The encoding names XZR in Rt exactly the way it names X0 (R7.3), which
+     * is the account every other decode site in this tree gives.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (!a->l) {
+        if (a->rt == 31) {
+            insn_dataflow_note_folded_read_zero();
+        } else {
+            insn_dataflow_note_folded_read(tcgv_i64_temp(cpu_X[a->rt]));
+        }
+    }
     handle_sys(s, a->l, a->op0, a->op1, a->op2, a->crn, a->crm, a->rt);
     return true;
 }

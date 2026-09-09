@@ -1350,12 +1350,62 @@ GEN_VEXT_TRANS(vle64ff_v, MO_64, r2nfvm, ldff_op, ld_us_check)
 typedef void gen_helper_ldst_whole(TCGv_ptr, TCGv, TCGv_env, TCGv_i32);
 
 static bool ldst_whole_trans(uint32_t vd, uint32_t rs1, uint32_t nf,
-                             gen_helper_ldst_whole *fn,
+                             bool is_store, gen_helper_ldst_whole *fn,
                              DisasContext *s)
 {
     TCGv_ptr dest;
     TCGv base;
     TCGv_i32 desc;
+
+    /*
+     * THE REST OF THE REGISTER GROUP, ON THE STORE FORMS ONLY.
+     *
+     * `vs4r.v v0,(a0)` names ONE register and stores FOUR, and the wire
+     * publishes all four -- v0 through v3 -- because that is what the
+     * architecture reads.  The emulator names one: the helper is handed a
+     * single pointer at vreg_ofs(s, vd) and the group size travels in the
+     * descriptor, so the op walk attributes the base and nothing after it.
+     * NF is a static field of the encoding, which is exactly what R20 says a
+     * decode site may state, and R19 already rules the same shape for the
+     * even-odd register pair: a multi-register operand named by its first
+     * member has real members after it.
+     *
+     * THE LOAD FORMS GET NOTHING, and the asymmetry is the point.  For
+     * `vl4re8.v` the other three registers are DESTINATIONS.  Capstone
+     * publishes them in the source list because its operand model marks the
+     * whole group; R7.1 says a destination is not a source, so the drop on
+     * that half is RIGHT and stating it here would fabricate three reads.
+     *
+     * ONE RANGE PER MEMBER, and both of the other two forms were WRITTEN,
+     * MEASURED AND REJECTED rather than reasoned away.
+     *
+     *   BY NAME (note_vreg_read() per member) spends one of named_reads[]'s
+     *   four slots each.  `vs8r.v` names eight, and an overflowing record
+     *   loses not the ninth entry but EVERY entry: measured, `vs8r.v` went
+     *   from three stated sources to NONE.  That is the failure mode
+     *   note_vector_config_read() documents below, reached from the other
+     *   direction.
+     *
+     *   ONE RANGE OVER THE WHOLE GROUP -- vreg_ofs(s, vd), nf * vlenb -- is
+     *   one record entry and is exactly the bytes the store reads, and it
+     *   added NOTHING: measured, `vs8r.v`'s QN was unchanged.  A span that
+     *   covers several declared registers is a CONTAINER, and #277 seats a
+     *   container apart from the members it covers rather than letting it
+     *   stand in for them.  The remedy is not to widen that rule; it is to
+     *   name the members, which is what the architecture does.
+     *
+     * A per-member range is one declared register each, so every member
+     * resolves, and it is not a named read, so the four-slot record is left
+     * for the operands with a better claim on it.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (is_store) {
+        for (uint32_t i = 0; i < nf; i++) {
+            insn_dataflow_note_stated_read_env(vreg_ofs(s, vd + i),
+                                               s->cfg_ptr->vlenb);
+        }
+    }
 
     uint32_t data = FIELD_DP32(0, VDATA, NF, nf);
     data = FIELD_DP32(data, VDATA, VM, 1);
@@ -1378,42 +1428,42 @@ static bool ldst_whole_trans(uint32_t vd, uint32_t rs1, uint32_t nf,
  * load and store whole register instructions ignore vtype and vl setting.
  * Thus, we don't need to check vill bit. (Section 7.9)
  */
-#define GEN_LDST_WHOLE_TRANS(NAME, ARG_NF)                                \
+#define GEN_LDST_WHOLE_TRANS(NAME, ARG_NF, IS_STORE)                      \
 static bool trans_##NAME(DisasContext *s, arg_##NAME * a)                 \
 {                                                                         \
     if (require_rvv(s) &&                                                 \
         QEMU_IS_ALIGNED(a->rd, ARG_NF)) {                                 \
-        return ldst_whole_trans(a->rd, a->rs1, ARG_NF,                    \
+        return ldst_whole_trans(a->rd, a->rs1, ARG_NF, IS_STORE,          \
                                 gen_helper_##NAME, s);                    \
     }                                                                     \
     return false;                                                         \
 }
 
-GEN_LDST_WHOLE_TRANS(vl1re8_v,  1)
-GEN_LDST_WHOLE_TRANS(vl1re16_v, 1)
-GEN_LDST_WHOLE_TRANS(vl1re32_v, 1)
-GEN_LDST_WHOLE_TRANS(vl1re64_v, 1)
-GEN_LDST_WHOLE_TRANS(vl2re8_v,  2)
-GEN_LDST_WHOLE_TRANS(vl2re16_v, 2)
-GEN_LDST_WHOLE_TRANS(vl2re32_v, 2)
-GEN_LDST_WHOLE_TRANS(vl2re64_v, 2)
-GEN_LDST_WHOLE_TRANS(vl4re8_v,  4)
-GEN_LDST_WHOLE_TRANS(vl4re16_v, 4)
-GEN_LDST_WHOLE_TRANS(vl4re32_v, 4)
-GEN_LDST_WHOLE_TRANS(vl4re64_v, 4)
-GEN_LDST_WHOLE_TRANS(vl8re8_v,  8)
-GEN_LDST_WHOLE_TRANS(vl8re16_v, 8)
-GEN_LDST_WHOLE_TRANS(vl8re32_v, 8)
-GEN_LDST_WHOLE_TRANS(vl8re64_v, 8)
+GEN_LDST_WHOLE_TRANS(vl1re8_v,  1, false)
+GEN_LDST_WHOLE_TRANS(vl1re16_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl1re32_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl1re64_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl2re8_v,  2, false)
+GEN_LDST_WHOLE_TRANS(vl2re16_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl2re32_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl2re64_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl4re8_v,  4, false)
+GEN_LDST_WHOLE_TRANS(vl4re16_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl4re32_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl4re64_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl8re8_v,  8, false)
+GEN_LDST_WHOLE_TRANS(vl8re16_v, 8, false)
+GEN_LDST_WHOLE_TRANS(vl8re32_v, 8, false)
+GEN_LDST_WHOLE_TRANS(vl8re64_v, 8, false)
 
 /*
  * The vector whole register store instructions are encoded similar to
  * unmasked unit-stride store of elements with EEW=8.
  */
-GEN_LDST_WHOLE_TRANS(vs1r_v, 1)
-GEN_LDST_WHOLE_TRANS(vs2r_v, 2)
-GEN_LDST_WHOLE_TRANS(vs4r_v, 4)
-GEN_LDST_WHOLE_TRANS(vs8r_v, 8)
+GEN_LDST_WHOLE_TRANS(vs1r_v, 1, true)
+GEN_LDST_WHOLE_TRANS(vs2r_v, 2, true)
+GEN_LDST_WHOLE_TRANS(vs4r_v, 4, true)
+GEN_LDST_WHOLE_TRANS(vs8r_v, 8, true)
 
 /*
  *** Vector Integer Arithmetic Instructions

@@ -1775,4 +1775,33 @@ void riscv_translate_init(void)
                                   sizeof(((CPURISCVState *)0)->xl),
                                   sizeof(((CPURISCVState *)0)->xl),
                                   1);
+
+    /*
+     * THE EXECUTION-ENVIRONMENT CONFIGURATION, `menvcfg` and `senvcfg`.
+     *
+     * note_cbo_envcfg_read() in trans_rvzicbo.c.inc states both on every
+     * cache-block operation, because the CBIE/CBCFE/CBZE fields are the gate
+     * that decides whether one executes, traps or raises -- R7.4 -- and the
+     * only reader of them, check_zicbo_envcfg(), is compiled out of a
+     * user-mode build.  Declared here so that statement arrives downstream as
+     * the register rather than as an anonymous span: a stated read of an
+     * UNDECLARED range is dropped after being made, which is a fix that looks
+     * landed and is not.
+     *
+     * Both spellings are the RISC-V GDB stub's own (org.gnu.gdb.riscv.csr),
+     * so they resolve through the register table with no fold needed.  The
+     * members sit outside cpu.h's `#ifndef CONFIG_USER_ONLY` block, so the
+     * bytes exist on every build and the declaration is not conditional
+     * either.
+     */
+    insn_dataflow_declare_regfile("menvcfg", NULL,
+                                  offsetof(CPURISCVState, menvcfg),
+                                  sizeof(((CPURISCVState *)0)->menvcfg),
+                                  sizeof(((CPURISCVState *)0)->menvcfg),
+                                  1);
+    insn_dataflow_declare_regfile("senvcfg", NULL,
+                                  offsetof(CPURISCVState, senvcfg),
+                                  sizeof(((CPURISCVState *)0)->senvcfg),
+                                  sizeof(((CPURISCVState *)0)->senvcfg),
+                                  1);
 }

@@ -507,6 +507,27 @@ uint8_t fold_nonarch(const char *name)
         return REG_TLS;
     }
     /*
+     * CP0_Debug, mipsel's EJTAG debug status-and-control register -- DECLARED
+     * by target/mips/tcg/translate.c and absent from the MIPS GDB stub's
+     * namespace, which carries only badvaddr, status and cause of CP0.  The
+     * same position `userlocal` is in above, and this map is the only place
+     * its spelling can meet a word.
+     *
+     * REG_SYSDBG is not a new word for it.  The tracer's vocabulary spells
+     * REG_SYSDBG "debug / watchpoint / trace state"
+     * (champsim_tracer_generic_ids.h), and the QEMU-indexed MIPS table
+     * already answers REG_SYSDBG for MIPS_REG_COP018 and MIPS_REG_COP019 --
+     * the coprocessor-0 registers on either side of this one in the same
+     * EJTAG file.  So the container meets the word its neighbours have, and
+     * the wire has published REG_SYSDBG for `sdbbp` all along: it is the
+     * register the destination bar recorded as lost on all 96 encodings of
+     * the family, which is what the write statement at the `sdbbp` arms
+     * exists to name.
+     */
+    if (!strcmp(name, "debug")) {        /* mipsel, CP0_Debug         */
+        return REG_SYSDBG;
+    }
+    /*
      * DSPControl, mipsel's DSP ASE status-and-control word -- a TCG global
      * (`cpu_dspctrl`, mips_translate_init()) that the MIPS GDB stub's
      * namespace does not carry, so the generated table can hold no row for

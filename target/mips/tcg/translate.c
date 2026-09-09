@@ -17203,6 +17203,46 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
 /* End MIPSDSP functions. */
 
+/*
+ * THE DEBUG REGISTER `sdbbp` WRITES.
+ *
+ * SDBBP is EJTAG's software breakpoint: it takes a debug exception, and
+ * entering debug mode is not a side effect of the instruction but the whole
+ * of what the instruction does.  The state that entry writes is CP0_Debug --
+ * mips_cpu_do_interrupt() sets Debug.DBp at tcg/system/tlb_helper.c:1203 and
+ * then replaces Debug.DExcCode with 9, the EJTAG code for "SDBBP executed",
+ * at :1205.  MIPS EJTAG Specification, SDBBP: on a debug exception the
+ * processor writes DExcCode and enters debug mode with Debug.DM set.
+ *
+ * NEITHER END OF THAT REACHES THE EXTRACTION ON ITS OWN.  generate_exception_end()
+ * calls helper_raise_exception(), which writes env->error_code and longjmps out
+ * of cpu_loop_exit_restore(); the CP0 write happens afterwards, during
+ * DELIVERY, on no path the helper returns from.  The CP-H hand row on
+ * raise_exception states the registers EVERY raise writes -- CP0_Cause and
+ * CP0_Status (98eb894d87) -- and CP0_Debug is not one of them: only the
+ * debug-exception arms write it, so putting it in that row would name a write
+ * on `syscall` and `teq` that does not happen.  It belongs to the raising
+ * instruction, which is here.
+ *
+ * R7.6 is the ruling that the state an instruction's exception writes is in
+ * that instruction's destination set, and this family is where the source
+ * side's disposition turns: `mips-sdbbp` is RULED on the source bar precisely
+ * because the Debug register is WRITTEN and not read (R7.1).  That sentence
+ * is only true if the write is stated somewhere, and until now it was stated
+ * nowhere -- 96 encodings, one family, REG_SYSDBG published by the wire and
+ * named by QEMU on none of them.
+ *
+ * The RANGE form against the declaration mips_tcg_init() makes, so the
+ * register resolves through one spelling.  Capture only; no op is emitted,
+ * altered or suppressed.
+ */
+static void note_sdbbp_debug_write(void)
+{
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUMIPSState, CP0_Debug),
+        sizeof(((CPUMIPSState *)0)->CP0_Debug));
+}
+
 static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
 {
     int rs, rt, rd, sa;
@@ -17281,6 +17321,19 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         mips_ident(ctx,
             op1 == R6_OPC_SDBBP ? MIPS_ID_R6_OPC_SDBBP :
             MIPS_ID_NONE);
+        /*
+         * ABOVE the two guards below, and for the reason the note's own
+         * header records: SDBBP takes a debug exception on every encoding
+         * the architecture defines, and both arms that do not are QEMU's.
+         * is_uhi() is the semihosting door -- a host service on one code
+         * value, off entirely in user mode -- and MIPS_HFLAG_SBRI turns the
+         * instruction into a reserved-instruction raise on a model that
+         * forbids it.  Stated below either guard the note would describe a
+         * configuration rather than the instruction, which is the asymmetry
+         * ea8a46f4db's read/write pair was moved above its own early return
+         * to avoid.  R16.
+         */
+        note_sdbbp_debug_write();
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -17864,6 +17917,8 @@ static void decode_opc_special2_legacy(CPUMIPSState *env, DisasContext *ctx)
         mips_ident(ctx,
             op1 == OPC_SDBBP ? MIPS_ID_OPC_SDBBP :
             MIPS_ID_NONE);
+        /* Above the semihosting guard, as the R6 arm is; see the note. */
+        note_sdbbp_debug_write();
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -20878,6 +20933,32 @@ void mips_tcg_init(void)
                                          ->active_tc.CP0_UserLocal),
                                   sizeof(((CPUMIPSState *)0)
                                          ->active_tc.CP0_UserLocal),
+                                  1);
+    /*
+     * CP0_Debug -- EJTAG's debug status-and-control register, and the one
+     * register `sdbbp` exists to write.
+     *
+     * The same shape as the three CP0 exception rows above and declared for
+     * the same reason: no TCG global names it, the write is not performed by
+     * translated code, and mips_cpu_do_interrupt() writes it during DELIVERY
+     * (tcg/system/tlb_helper.c:1203 sets Debug.DBp and :1205 replaces
+     * Debug.DExcCode with 9, the EJTAG code for "SDBBP executed").  Undeclared
+     * it reaches a consumer as a bare byte range, so a statement about it
+     * would name nothing.
+     *
+     * The spelling is "debug" -- the architecture's own name for CP0 register
+     * 23 -- because the MIPS GDB stub carries no row to borrow, which is the
+     * position "userlocal" is in above.  champsim_tracer's fold_nonarch() is
+     * where that spelling meets REG_SYSDBG, the same route userlocal takes to
+     * REG_TLS.
+     *
+     * Declared, not stated: this says which register the offset IS and says
+     * nothing about who writes it.  The write is stated at the `sdbbp` arms.
+     */
+    insn_dataflow_declare_regfile("debug", NULL,
+                                  offsetof(CPUMIPSState, CP0_Debug),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Debug),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Debug),
                                   1);
 }
 

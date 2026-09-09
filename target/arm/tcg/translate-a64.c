@@ -2954,6 +2954,42 @@ static bool trans_MSR_i_SVCR(DisasContext *s, arg_MSR_i_SVCR *a)
     if (!dc_isar_feature(aa64_sme, s) || a->mask == 0) {
         return false;
     }
+    /*
+     * THE WRITE SMSTART/SMSTOP EXIST TO PERFORM, stated before the emulator
+     * decides it has nothing to emit.
+     *
+     * SVCR is DECLARED above (mips_tcg_init()'s aarch64 twin, in
+     * aarch64_translate_init()) and helper_set_svcr()'s CP-H row states the
+     * access, so both halves of the machinery are in place -- and the
+     * destination bar still lost REG_VCTRL on every encoding of this family,
+     * because NEITHER HALF RUNS HERE.  Two guards stand between this point
+     * and the helper call: sme_access_check(), which is CPACR/SMCR state and
+     * not the encoding, and the `(old ^ new) & a->mask` test, which skips the
+     * call when the bits the instruction selects already hold the value it
+     * would write.  On a guest with SME present but not enabled at this EL
+     * -- which is every encoding the destination sled reaches -- the
+     * translation emits nothing at all, and PSTATE.SM/PSTATE.ZA arrived
+     * downstream written by the architecture and by no op.
+     *
+     * R16 records an ISA-defined dependency whether or not this machine
+     * state lets the model perform it, and R17 says a conditional carries
+     * what it may do rather than what this instance did.  The encoding-level
+     * refusal above is a different thing and stays above this note: a zero
+     * mask is not an `msr SVCR<sm|za>` at all, and stating a write for it
+     * would name a register an undefined encoding does not touch.
+     *
+     * The write of PSTATE.SM by SMSTART is architecturally unconditional
+     * even where it writes the value already there -- R16's own reading, and
+     * the same one note_gpr_move_elided() takes in target/mips for a
+     * register written with its own value.
+     *
+     * The RANGE form, against the declaration above, so the write resolves
+     * through the one spelling this register has.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_write_env(offsetof(CPUARMState, svcr),
+                                        sizeof(((CPUARMState *)0)->svcr));
     if (sme_access_check(s)) {
         int old = s->pstate_sm | (s->pstate_za << 1);
         int new = a->imm * 3;

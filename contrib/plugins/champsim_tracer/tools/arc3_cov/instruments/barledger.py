@@ -21,10 +21,23 @@ is TOTAL BY CONSTRUCTION:
 
 THE THREE DISPOSITIONS, and they are exhaustive by rule of the program:
 
-  QEMU-STATES-IT   QEMU's own translation contains the read and the
-                   EXTRACTION does not carry it out.  This is a defect with
-                   a source site, and the citation column names the file and
-                   function.  Closing it is a wire change and owes R13 legs.
+  QEMU-STATES-IT   the loss has a SOURCE SITE in target/: either QEMU's
+                   translation contains the access and the EXTRACTION does
+                   not carry it out, or QEMU ELIDES an access the
+                   architecture defines -- a self-move whose two operands
+                   coincide, a NOP arm that returns before the store -- and
+                   nothing was emitted for anyone to carry out.  The two are
+                   one disposition because the remedy is the same one: a
+                   statement at the site the citation names.  Closing it is a
+                   wire change and owes R13 legs.
+
+                   THE SECOND SHAPE IS WRITTEN DOWN RATHER THAN STRETCHED
+                   INTO THE FIRST.  It is the COMMONEST defect on the
+                   destination bar (a register the wire publishes as a
+                   destination that QEMU's write side does not name), and
+                   reading "the translation contains the read" loosely enough
+                   to cover an elision would be exactly the kind of stretch
+                   this tree files against.
 
   RULED            an architectural fact or a standing ruling says the
                    register is NOT a source, so the arm that drops it is
@@ -194,12 +207,22 @@ def main():
                else "/tmp/barledger_st")
         return selftest(tmp)
     ap = argparse.ArgumentParser()
-    ap.add_argument("--families", required=True, help="srcbar.py --tsv output")
+    ap.add_argument("--families", required=True,
+                    help="srcbar.py --tsv or dstbar.py --tsv output")
     ap.add_argument("--classes", default=None,
-                    help="the adjudication table (default: beside this file)")
+                    help="the adjudication table (default: the one beside "
+                         "this file for the chosen --bar)")
+    ap.add_argument("--bar", choices=("source", "destination"),
+                    default="source",
+                    help="which bar the family table measures.  Both bars "
+                         "carry the same three dispositions and the same "
+                         "total-join rule; only the default table and the "
+                         "heading differ.")
     a = ap.parse_args()
+    default_table = ("BAR_CLASSES.tsv" if a.bar == "source"
+                     else "DEST_CLASSES.tsv")
     cpath = a.classes or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      "BAR_CLASSES.tsv")
+                                      default_table)
     classes = load_classes(cpath)
 
     rows = []
@@ -237,7 +260,7 @@ def main():
         fams[k["cid"]].add((r["isa"], r["rule"], r["mnem"]))
 
     total = sum(r["enc"] for r in rows)
-    print("THE SOURCE BAR, ADJUDICATED")
+    print("THE %s BAR, ADJUDICATED" % a.bar.upper())
     print("  rows (isa/rule/mnem/register) : %d" % len(rows))
     print("  registers lost, summed        : %d" % total)
     print("  families                      : %d"

@@ -16740,8 +16740,12 @@ static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
  * DSPControl IS A DESTINATION OF EVERY EXTRACT, AND THE OP STREAM SAYS SO
  * NOWHERE.
  *
- * The fold above covers the encodings QEMU turns into a NOP.  This covers the
- * ones it PERFORMS, and the destination bar measured them separately: 38
+ * CALLED FROM BOTH ARMS, and for two different reasons that reach the same
+ * register.  On the PERFORMED arm the helper writes DSPControl in C and the
+ * op stream carries only the call.  On the arm QEMU turns into a NOP the
+ * write does not happen at all, and the ASE says it should -- see the call
+ * site in gen_mipsdsp_accinsn() for R16 and for why `$zero` changes nothing
+ * about DSPControl.  The destination bar measured the NOP arm on its own: 38
  * registers over twelve families -- `extr.w`, `extr_r.w`, `extr_rs.w`,
  * `extr_s.h`, their four `extrv` twins, `extp`, `extpv`, `extpdp`, `extpdpv`
  * -- every losing row REG_FLAGS and no family carrying any other.
@@ -16822,8 +16826,35 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
     int16_t imm;
 
     if ((ret == 0) && (check_ret == 1)) {
-        /* Treat as NOP. */
+        /*
+         * Treat as NOP.
+         *
+         * THE NOP IS QEMU'S, NOT THE ASE'S, AND DSPControl IS WRITTEN EITHER
+         * WAY.  `extr.w $zero, $ac1, 5` discards its GPR result and nothing
+         * else: the MIPS DSP ASE gives EXTR.W no special case for rt == 0,
+         * so the saturation test still runs and still ORs DSPControl.ouflag,
+         * and EXTP/EXTPDP still write DSPControl.EFI on both arms.  QEMU
+         * skips the helper entirely, so the write does not happen in this
+         * model and no op stream could carry it.
+         *
+         * R16 on 22d7666262's sentence -- an ISA-defined dependency the model
+         * does not implement is still recorded -- which is the ruling
+         * `x86-rdpmc-dst` closed on at 7d94231be0, and the same shape: a
+         * destination the architecture defines, a QEMU arm that produces it
+         * nowhere, and a consumer that has to see the edge because the
+         * machine being modelled has it.  Stated here rather than left to the
+         * bar, where it was 38 registers over twelve families, every losing
+         * row REG_FLAGS and no family carrying any other.
+         *
+         * The SAME op2 list as the two notes above, for the same reason: it
+         * is the emitter's own list, so a new EXTR arm this function does not
+         * name reaches the bar rather than inheriting a statement about a
+         * helper it does not call.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
         note_dsp_acc_fold(op1, op2, v2);
+        note_dsp_acc_dspctrl_write(op1, op2);
         return;
     }
 

@@ -152,6 +152,44 @@ survey() {
          "$P/champsim_tracer.cc" 2>/dev/null \
         | sed 's/^/             champsim_tracer.cc:/' | head -2
 
+    # The FOURTH surface, and the largest one: the FIELDS of
+    # qemu_plugin_insn_info the plugin reads out of the Capstone answer.
+    # Each is retired under R14 either by re-sourcing it from QEMU-derived
+    # state or by deleting it with its consumer's contract cited, so the
+    # number here is a work list, not a score.
+    #
+    # DELEGATED, and deliberately so: this cannot be greppped.  `.mnemonic`
+    # also names InsnClassification::mnem and a dozen locals, and only a
+    # compiler knows which receiver a member access belongs to.
+    # capfield_census.sh marks each field deprecated in a SCRATCH copy of the
+    # header and re-parses every plugin translation unit, so each row it
+    # prints is a resolved member access with a file:line.  It exits 2 when
+    # it could not look -- which is reported here as exactly that, never as
+    # a zero.
+    note "  fields   Capstone-supplied qemu_plugin_insn_info members the"
+    note "           plugin still reads, counted by the compiler:"
+    local census="$(dirname "${BASH_SOURCE[0]}")/capfield_census.sh"
+    if [ ! -x "$census" ]; then
+        note "             SURVEY CANNOT LOOK -- no capfield_census.sh at"
+        note "             $census"
+    else
+        local cdir
+        cdir=$(mktemp -d "${TMPDIR:-/tmp}/ncg_capfield.XXXXXX")
+        if "$census" --build-dir "$BUILD_DIR" --out "$cdir" --tsv \
+               > "$cdir/reads.tsv" 2> "$cdir/err"; then
+            local nsites nfields
+            nsites=$(grep -c . "$cdir/reads.tsv" || true)
+            nfields=$(cut -f1 "$cdir/reads.tsv" | sort -u | grep -c . || true)
+            note "             $nfields field(s) across $nsites read site(s)"
+            cut -f1 "$cdir/reads.tsv" | sort | uniq -c | sort -rn \
+                | sed 's/^/             /'
+        else
+            note "             SURVEY CANNOT LOOK -- capfield_census.sh" \
+                 "exited $?:"
+            sed 's/^/             /' "$cdir/err" | head -3
+        fi
+    fi
+
     if [ "$nh" = 0 ] && [ "$nr" = 0 ]; then
         note "  SURVEY FOUND NOTHING while the gate is RED -- the survey is"
         note "  broken, not the dependency gone.  Fix the survey."
@@ -242,9 +280,31 @@ EOF
     [ "$rc_clean"   = 0 ] || { note "  SELFTEST FAIL: the link stage refused a plugin with NO Capstone import"; bad=1; }
     [ "$rc_planted" = 1 ] || { note "  SELFTEST FAIL: the link stage PASSED a planted qemu_plugin_cap_decode call"; bad=1; }
     [ "$rc_absent"  = 1 ] || { note "  SELFTEST FAIL: the link stage passed with no subject to read"; bad=1; }
+    # THE FIELDS SURVEY HAS ITS OWN SELFTEST, AND NOTHING ELSE RUNS IT.
+    # The survey delegates a number to capfield_census.sh, so a survey that
+    # prints a comfortable count over a census that cannot discriminate is
+    # this gate's own false green -- the delegation moves the risk, it does
+    # not remove it.  Run it here, where the gate's discrimination is being
+    # proved, and fail together.
+    local census="$(dirname "${BASH_SOURCE[0]}")/capfield_census.sh"
+    if [ ! -x "$census" ]; then
+        note "  capfield      SELFTEST FAIL: the survey delegates to" \
+             "$census, which is not executable"
+        bad=1
+    else
+        "$census" --selftest "$scratch/capfield" > "$scratch/capfield.log" 2>&1
+        local rc_cf=$?
+        note "  capfield      capfield_census --selftest rc=$rc_cf  (expect 0)"
+        if [ "$rc_cf" != 0 ]; then
+            sed 's/^/    /' "$scratch/capfield.log" | tail -8
+            bad=1
+        fi
+    fi
+
     if [ "$bad" = 0 ]; then
         note "nocapstone_gate: SELFTEST GREEN — the link stage discriminates in"
-        note "  both directions and refuses a missing subject"
+        note "  both directions and refuses a missing subject, and the fields"
+        note "  survey's own census discriminates too"
         return 0
     fi
     note "nocapstone_gate: SELFTEST RED — this gate's verdicts cannot be trusted"

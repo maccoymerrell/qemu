@@ -420,6 +420,59 @@ static void gen_note_vector_operand_read(X86DecodedOp *op)
 }
 
 /*
+ * THE VECTOR REGISTER A SELF-MOVE WRITES AND NO OP DEFINES.
+ *
+ * `movaps %xmm0,%xmm0` writes xmm0.  QEMU emits nothing for it: gen_MOVDQ()
+ * calls gen_store_sse(), whose register arm is
+ * tcg_gen_gvec_mov(MO_64, decode->op[0].offset, src_ofs, ...), and
+ * tcg_gen_gvec_mov() is a no-op when dofs == aofs (tcg/tcg-op-gvec.c:1772,
+ * `if (dofs != aofs)`).  So on the encodings where the two operands COINCIDE
+ * the write side sees no op defining the destination at all, and the
+ * destination bar carried `x86-movdq-elided-selfmove` -- 144 registers over
+ * six families, every one of them a coinciding-operand encoding of
+ * `movaps`/`movapd`/`movdqa`/`movdqu`/`movups`/`movupd`.
+ *
+ * THE READ HALF HAS BEEN STATED SINCE 26bf685f8d, at gen_MOVDQ()'s own
+ * gen_note_vector_gvec_read(decode, 2) -- "the register it moves FROM;
+ * `movaps %xmm0,%xmm0` reads xmm0 too" -- and this is that sentence's other
+ * end.  Leaving one end stated and the other not is the asymmetry
+ * ea8a46f4db's read/write pair was landed to close on the other target.
+ *
+ * R16 AND R15 TOGETHER.  The architecture writes the destination whether or
+ * not the bytes have to move; eliding the copy is a LOWERING DECISION about
+ * how to get the right answer, not a statement that the register is
+ * untouched.  target/mips already carries exactly this shape at
+ * note_gpr_move_elided(), for `move rd,rd` and in these words.
+ *
+ * GUARDED ON THE ELISION, not on the mnemonic.  Every path through
+ * gen_store_sse() whose two offsets DIFFER emits a gvec move that defines
+ * the destination, and the op walk states it; the memory arm stores and has
+ * no register destination to state.  The note fires only where the op that
+ * would have carried the write does not exist, so it can neither duplicate a
+ * stated write nor invent one on a path that has an op.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_vector_operand_write(X86DecodedOp *op)
+{
+    if (op->has_ea) {
+        return;
+    }
+    switch (op->unit) {
+    case X86_OP_SSE:
+        insn_dataflow_note_stated_write_env(vector_reg_offset(op),
+                                            sizeof(ZMMReg));
+        break;
+    case X86_OP_MMX:
+        insn_dataflow_note_stated_write_env(vector_reg_offset(op),
+                                            sizeof(MMXReg));
+        break;
+    default:
+        break;
+    }
+}
+
+/*
  * THE SAME STATEMENT FOR A REGISTER THE ENCODING NAMES OUTSIDE THE OPERAND
  * ARRAY.  Two shapes reach a vector register by number rather than through
  * X86DecodedOp: the ternary blends' control operand -- implicitly XMM0 in
@@ -599,6 +652,14 @@ static void gen_store_sse(DisasContext *s, X86DecodedInsn *decode, int src_ofs)
     bool aligned = sse_needs_alignment(s, decode, ot);
 
     if (!decode->op[0].has_ea) {
+        if (decode->op[0].offset == src_ofs) {
+            /*
+             * The move TCG elides; see gen_note_vector_operand_write().  The
+             * gvec call below emits nothing when the two offsets coincide, so
+             * this is the only place the destination can be stated.
+             */
+            gen_note_vector_operand_write(&decode->op[0]);
+        }
         tcg_gen_gvec_mov(MO_64, decode->op[0].offset, src_ofs, vec_len, vec_len);
         return;
     }

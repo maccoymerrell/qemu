@@ -4755,6 +4755,22 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
         /* Treat as NOP. */
         /* The operand the NOP erases; see note_gpr_folded_read(). */
         note_gpr_folded_read(rs);
+        /*
+         * AND THE DESTINATION IT ERASES WITH IT.  bbbf0829b9 stated the READ
+         * half of this arm and stopped there, so `clz $zero,$rs` reached a
+         * consumer with a source and NO destination at all while the wire
+         * published a register from the encoding's rd/rt fields.  The same
+         * asymmetry the six two-register NOP arms carried until
+         * note_gpr_zero_dest_rr() closed them, and the same statement: a
+         * write to register 0 is DISCARDED, not absent (R7.3/R15).
+         *
+         * Anchored on @rs, which is the account note_gpr_zero_dest() gives
+         * for its own shape -- a discarded write states an operand
+         * relationship and not a value, so one anchor is the shape.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        note_gpr_zero_dest(rs, 0);
         return;
     }
     t0 = cpu_gpr[rd];
@@ -17265,14 +17281,19 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
  * rather than by assuming the shape.  The switch below is the emitter's own
  * op2 list, not a second table.
  *
- * The GPR the VARIABLE forms take their shift from is NOT stated here: the
- * remaining DSP families fold operands whose role changes per op2, and a
- * blanket statement would name an immediate as a register.  That half stays
- * open and is recorded as open.
+ * AND THE GPR THE VARIABLE FORMS TAKE THEIR SHIFT FROM, which this note
+ * used to leave open because "a blanket statement would name an immediate as
+ * a register".  That is exactly right and it is why the statement is not
+ * blanket: the emitter itself splits the two, and the split is visible in
+ * one line per arm.  `extr.w rt,ac,shift` materialises the shift with
+ * tcg_gen_movi_tl(t1, v1) -- an IMMEDIATE, and NOT stated as a register --
+ * while `extrv.w rt,ac,rs` calls gen_load_gpr(v1_t, v1) on the same
+ * parameter.  The second switch below is the emitter's own V-form op2 list,
+ * and the non-V forms are absent from it for the reason the row named.
  *
  * Capture only; no op is emitted, altered or suppressed.
  */
-static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
+static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac, int v1)
 {
     if (op1 != OPC_EXTR_W_DSP) {
         return;
@@ -17297,6 +17318,19 @@ static void note_dsp_acc_fold(uint32_t op1, uint32_t op2, int ac)
     insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_HI[ac & 3]));
     insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_LO[ac & 3]));
     insn_dataflow_note_folded_read(tcgv_tl_temp(cpu_dspctrl));
+    /* The V forms' shift operand is a GPR; the others' is an immediate. */
+    switch (op2) {
+    case OPC_EXTRV_S_H:
+    case OPC_EXTRV_W:
+    case OPC_EXTRV_R_W:
+    case OPC_EXTRV_RS_W:
+    case OPC_EXTPV:
+    case OPC_EXTPDPV:
+        note_gpr_folded_read(v1);
+        break;
+    default:
+        break;
+    }
     /* The $zero the same fold erases; see note_gpr_zero_dest(). */
     insn_dataflow_note_discarded_zero_write(tcgv_tl_temp(cpu_LO[ac & 3]));
 }
@@ -17418,7 +17452,7 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
          *
          * Capture only; no op is emitted, altered or suppressed.
          */
-        note_dsp_acc_fold(op1, op2, v2);
+        note_dsp_acc_fold(op1, op2, v2, v1);
         note_dsp_acc_dspctrl_write(op1, op2);
         return;
     }

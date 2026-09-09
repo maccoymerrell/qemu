@@ -16,22 +16,37 @@
 #                                    disposition and a citation
 #   4  landedcheck x2                every QEMU-STATES-IT row still describes
 #                                    the population it is about
+#   5  legcheck                      every leg record given can be resolved
+#                                    from the commit that carries it
 #
 # Step 4 is the one that cannot be skipped by accident any more.  A ledger row
 # is a sentence about a measurement; steps 1-3 re-take the measurement every
 # pass and step 4 re-reads the sentence against it.
 #
-# Usage:  ./barscore.sh TIP_ARM DELETION_ARM OUTDIR
+# STEP 5 IS HERE FOR THE REASON STEP 4 IS, and by the same lesson: PASS 89
+# found five in-commit leg records naming trees a reader cannot reach, and
+# nothing in the 19-leg gate or the battery could see it, because a leg record
+# is a POINTER and every instrument beside it scores a measurement.  Adding
+# legcheck to one pass's own runner would have made it optional from the day
+# it landed -- which is exactly what this file's first paragraph exists to
+# prevent -- so it runs here or it does not run.  It is skipped only when the
+# caller names no records, and says so out loud when it is.
+#
+# Usage:  ./barscore.sh TIP_ARM DELETION_ARM OUTDIR [LEG_RC ...]
 #
 # TIP_ARM and DELETION_ARM are sweep roots holding <isa>.wp<N>/ directories.
 # The deletion arm is required: the source bar's losing set is arm A minus arm
-# B and there is no honest one-arm form of it.
+# B and there is no honest one-arm form of it.  LEG_RC are this pass's R13 leg
+# RC.txt files; CST_LEG_COMMIT names the commit they are attached to (default
+# HEAD).
 set -u
 I="$(cd "$(dirname "$0")" && pwd)"
 PY="${PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}"
 NICE=(taskset -c 0-23 nice -n 10)
 
 A=${1:?TIP_ARM}; B=${2:?DELETION_ARM}; O=${3:?OUTDIR}
+shift 3
+LEGRC=("$@")
 mkdir -p "$O" || exit 2
 : > "$O/BARSCORE_RC.txt"
 bad=0
@@ -71,6 +86,20 @@ run landedcheck_src LANDED_SRC.txt "$PY" "$I/landedcheck.py" \
     --arm "$A" --b "$B" --bar source
 run landedcheck_dst LANDED_DST.txt "$PY" "$I/landedcheck.py" \
     --arm "$A" --bar destination
+
+# The selftest runs UNCONDITIONALLY -- a check that has not been proven able
+# to go red this pass is not evidence -- and the records are scored when the
+# caller names them.  "No records given" is PRINTED, never silent.
+run legcheck_selftest LEGCHECK_SELFTEST.txt "$PY" "$I/legcheck.py" --selftest
+if [ ${#LEGRC[@]} -gt 0 ]; then
+    run legcheck LEGCHECK.txt "$PY" "$I/legcheck.py" \
+        --repo "$(cd "$I/../../../../../.." && pwd)" \
+        --commit "${CST_LEG_COMMIT:-HEAD}" "${LEGRC[@]}"
+else
+    echo "legcheck SKIPPED -- no leg RC.txt named on the command line;" \
+         "this pass's in-commit leg records were NOT checked" \
+         >> "$O/BARSCORE_RC.txt"
+fi
 
 cat "$O/BARSCORE_RC.txt"
 if [ "$bad" != 0 ]; then

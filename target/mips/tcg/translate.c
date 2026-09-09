@@ -11337,6 +11337,24 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
          * see gen_note_fcc_read().
          */
         gen_note_fcc_read(cc);
+        /*
+         * AND $zero AS THE VALUE THE MOVE PUBLISHES WHEN IT DOES NOT MOVE.
+         *
+         * note_cond_move_dest_gpr() states this for every other destination
+         * and refuses register 0, because there is no global to name.  The
+         * fact is the same one: `movf $zero,$at,$fcc0` publishes $zero when
+         * the code is clear, and the encoding names $zero in rd exactly the
+         * way it would name $t0 (R7.3).  It is the zero register's own
+         * spelling of the read, the form gen_load_gpr() takes for the paths
+         * that call nothing.
+         */
+        insn_dataflow_note_folded_read_zero();
+        /*
+         * And the destination the NOP erases, which gen_cond_move() states
+         * for the GPR conditional moves beside this one and gen_movci() did
+         * not: see note_gpr_zero_dest_rr().
+         */
+        note_gpr_zero_dest(rs, 0);
         return;
     }
 

@@ -108,8 +108,13 @@ commit message:
   M1 CLAIMED    the record's "GATE PASSED -- N legs" line and the number of
                 rows it prints are the same number.
   M2 COMPLETE   every (leg, isa) pair in the R13 manifest appears as a row.
-                The manifest is the gate's own ADJUDICATED.tsv, so the check
-                cannot drift from what the gate scores.
+                The manifest is the gate's own ADJUDICATED.tsv AS OF THE
+                RECORD'S OWN COMMIT, so the check cannot drift from what the
+                gate scored -- and cannot convict a complete record of
+                missing a leg that did not exist when it ran.  Adding a
+                twentieth leg makes every record written AFTER it owe a
+                twentieth row, and leaves every record written before it
+                exactly as complete as it was.
   M3 TREED      the record names the tree its legs measured, as a `TREE=`
                 line, and that sha is the commit's own tree -- or, when the
                 record is a TRANSCRIPT of another commit's run and says so
@@ -145,6 +150,10 @@ TREE_RE = re.compile(r'^\s*TREE\s*=\s*([0-9a-fA-F]{40})\s*$', re.M)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.normpath(os.path.join(
     _HERE, '..', '..', 'external_truth_gate', 'ADJUDICATED.tsv'))
+#: The same file as a REPO-RELATIVE path, so the manifest can be read out of
+#: an arbitrary commit's tree rather than only out of the working copy.
+MANIFEST_REL = ('contrib/plugins/champsim_tracer/tools/external_truth_gate/'
+                'ADJUDICATED.tsv')
 
 #: A row of an in-commit leg record: `leg isa HEADLINE CEILING SCORED`,
 #: indented under the GATE line.  The `/` between headline and ceiling is
@@ -329,6 +338,28 @@ def load_manifest(path):
     return pairs or None
 
 
+def manifest_at(repo, commit):
+    """The (leg, isa) pairs the R13 gate scored AT @commit's tree, or None.
+
+    None means the commit carries no manifest -- a tree from before the gate
+    existed -- and the caller falls back to the working tree's copy.  A
+    manifest that IS there but unparsable yields an empty list, which the
+    caller treats as unreadable rather than as "no legs": a zero-leg
+    completeness check passes everything.
+    """
+    blob = git(repo, 'show', '%s:%s' % (commit, MANIFEST_REL))
+    if blob is None:
+        return None
+    pairs = []
+    for line in blob.splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        c = line.split('\t')
+        if len(c) >= 2 and c[0].strip() and c[1].strip():
+            pairs.append((c[0].strip(), c[1].strip()))
+    return pairs or None
+
+
 def check_message(repo, commit, manifest, want_tree=True, bindings=None):
     """FINDING 90-A: is the in-commit leg record COMPLETE?
 
@@ -350,9 +381,23 @@ def check_message(repo, commit, manifest, want_tree=True, bindings=None):
     text = git(repo, 'log', '-1', '--format=%B', commit)
     if text is None:
         return ['%s: does not resolve to a commit' % commit[:12]]
+    # THE MANIFEST IS READ AS OF THE RECORD'S OWN TREE, and this is the whole
+    # difference between a completeness check and an anachronism.  A record
+    # transcribes the gate AS IT RAN.  When a later pass adds a twentieth leg,
+    # the working tree's manifest lists a row the record's run could not have
+    # produced and nobody could have measured, and scoring against it would
+    # convict a complete record of missing a leg that did not exist -- which
+    # is exactly what happened the first time this check met a manifest that
+    # had moved.  So the list of legs comes from the commit's own
+    # ADJUDICATED.tsv; the working tree's copy is the fallback for a commit
+    # that does not carry one.
+    at_tree = manifest_at(repo, commit)
+    if at_tree is not None:
+        manifest = at_tree
     if manifest is None:
-        return ['the R13 manifest %s is not readable -- a completeness check '
-                'with no list of legs is not a check' % MANIFEST]
+        return ['the R13 manifest %s is not readable at %s and not readable '
+                'in the working tree -- a completeness check with no list of '
+                'legs is not a check' % (MANIFEST_REL, commit[:12])]
 
     claim = CLAIM_RE.search(text)
     rows = RECORD_ROW_RE.findall(text)
@@ -697,6 +742,53 @@ def selftest():
             fails.append('arm15 RECORD-COMPLETED-BY pointing at an incomplete '
                          'record should FAIL: %s' % r)
 
+        # ARM 16 -- THE ANACHRONISM.  A record complete at ITS OWN tree, read
+        # after a later pass added a twentieth leg, must still PASS: the
+        # manifest comes from the commit, not from the working copy.  The
+        # mirror arm proves the reading is not simply lenient -- the SAME
+        # message against a commit whose OWN manifest carries the extra leg
+        # FAILS, naming it.
+        os.makedirs(os.path.join(repo, os.path.dirname(MANIFEST_REL)),
+                    exist_ok=True)
+        mpath = os.path.join(repo, MANIFEST_REL)
+        body = ('full record\n\n'
+                '    static     x86_64      47 / 47     6225 scored\n'
+                '    pin        x86_64     259 / 259  395854\n'
+                '\n    GATE PASSED -- 2 legs, every headline at or under its '
+                'ceiling\n\nTREE=%s\n')
+
+        with open(mpath, 'w') as f:          # the OLD manifest: two legs
+            f.write('# c\nstatic\tx86_64\tr\t0\t0\t-\tj\n'
+                    'pin\tx86_64\tr\t0\t0\t-\tj\n')
+        with open(os.path.join(repo, 'f16'), 'w') as f:
+            f.write('16')
+        g('add', MANIFEST_REL, 'f16')
+        g('commit', '-q', '-m', 'old manifest')
+        old_tree = g('rev-parse', 'HEAD^{tree}')
+        g('commit', '-q', '--amend', '-m', body % old_tree)
+        old_rec = g('rev-parse', 'HEAD')
+
+        with open(mpath, 'a') as f:          # a THIRD leg lands later
+            f.write('gem5wp\tmipsel\tr\t0\t0\t-\tj\n')
+        g('add', MANIFEST_REL)
+        g('commit', '-q', '-m', 'new leg')
+        new_tree = g('rev-parse', 'HEAD^{tree}')
+        g('commit', '-q', '--amend', '-m', body % new_tree)
+        new_rec = g('rev-parse', 'HEAD')
+
+        # The working tree now carries THREE legs; both records print two.
+        r = check_message(repo, old_rec, [('static', 'x86_64'),
+                                          ('pin', 'x86_64'),
+                                          ('gem5wp', 'mipsel')])
+        if r:
+            fails.append('arm16 a record complete at its own tree should '
+                         'PASS against a later manifest: %s' % r)
+        r = check_message(repo, new_rec, [('static', 'x86_64'),
+                                          ('pin', 'x86_64')])
+        if not any('gem5wp/mipsel' in x for x in r):
+            fails.append('arm16b a record written AFTER the leg landed must '
+                         'FAIL naming it: %s' % r)
+
     # ONE LINE PER ARM, in the runner's own grammar (selftest_all.sh's
     # count_arms).  A selftest that prints only a total renders identically
     # to one that asserts nothing, and this directory's runner scores that
@@ -715,7 +807,8 @@ def selftest():
              'a pruned orphan tip still verifies on its tree column',
              'a record printing fewer legs than the manifest fails',
              'a complete record naming its own tree passes',
-             'RECORD-COMPLETED-BY pointing at an incomplete record fails']
+             'RECORD-COMPLETED-BY pointing at an incomplete record fails',
+             'the manifest is read as of the record\'s own tree']
     hit = set()
     for f in fails:
         print('SELFTEST FAIL: %s' % f)

@@ -69,6 +69,70 @@ _LINE = re.compile(
     r'(?P<enc>[0-9a-f]+)\s')
 
 
+def head_of(path):
+    """This tree's HEAD, or a string that can never equal a corpus stamp."""
+    import subprocess
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL).decode().strip()
+        dirt = subprocess.check_output(
+            ["git", "-C", path, "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "unknown"
+    if not sha:
+        return "unknown"
+    return sha if not dirt else (sha + "+dirty")
+
+
+def corpus_tip(corpus, isas):
+    """The ONE tip every corpus file agrees it was captured at.
+
+    FINDING 76-C's REMEDY, THE CONSUMER HALF.  srcenc_sled.py stamps
+    `#tip <sha> <clean|dirty>` as the first line of every corpus it writes
+    (see capture_tip_line() there for why).  This reads it back and REFUSES
+    anything that is not one clean sha shared by all four ISAs:
+
+      * a corpus file with no `#tip` line at all -- which is every corpus
+        captured before that stamp existed, and exactly the ones this guard
+        exists to keep out;
+      * a `dirty` or `unknown` stamp, because a working tree with modified
+        tracked files describes no commit;
+      * four files that do not agree, because a corpus assembled from two
+        builds is two answers and not one.
+
+    Every failure ends in a refusal.  None of them ends in a tip string that
+    reads like a clean capture, which is the silent-false-success shape this
+    file's own header warns about.
+    """
+    tips = {}
+    for isa in isas:
+        cp = os.path.join(corpus, f"{isa}.tsv")
+        if not os.path.exists(cp):
+            raise SystemExit(f"corpus_tip: REFUSING -- no corpus file {cp}")
+        with open(cp) as fh:
+            first = fh.readline()
+        if not first.startswith("#tip\t"):
+            raise SystemExit(
+                "corpus_tip: REFUSING -- %s carries no `#tip` line.  A corpus "
+                "that cannot say which build produced it cannot be checked "
+                "against this tree, and an unstamped corpus is precisely what "
+                "FINDING 76-C's dead rules came from.  Re-capture with a "
+                "srcenc_sled.py that stamps it." % cp)
+        parts = first.rstrip("\n").split("\t")
+        if len(parts) != 3 or parts[2] != "clean":
+            raise SystemExit(
+                "corpus_tip: REFUSING -- %s was captured from a tree stamped "
+                "%r; only a CLEAN tip names a commit." % (cp, parts[1:]))
+        tips[isa] = parts[1]
+    if len(set(tips.values())) != 1:
+        raise SystemExit(
+            "corpus_tip: REFUSING -- the corpus files disagree about their "
+            "capture tip: %s.  Two builds is two answers." % tips)
+    return next(iter(tips.values()))
+
+
 class Sig:
     __slots__ = ("cls", "mnem", "qual", "n", "enc", "key")
 
@@ -1130,8 +1194,20 @@ def emit_header(arms, layer, isas, corpus, rcpath):
         a("# EVERY CLASS IN THE SET HAS AN OCCUPANT ON THIS ARM.")
         a("#")
 
-    # --- the corpus provenance, md5summed here and not quoted.
+    # --- THE CORPUS MUST HAVE BEEN CAPTURED AT THE TREE THAT SHIPS THIS FILE.
+    tip = corpus_tip(corpus, isas)
+    head = head_of(os.path.dirname(os.path.abspath(__file__)))
+    if tip != head:
+        raise SystemExit(
+            "emit_header: REFUSING -- the corpus was captured at %s and this "
+            "tree is at %s.  An allowlist row asserts that the WIRE published "
+            "a particular source list; the corpus IS that wire's answer, read "
+            "out of one build.  Regenerating rows from an older build's answer "
+            "writes a file describing a tree that no longer exists, which is "
+            "FINDING 76-C and is now on its third pass (72, 76, 81).  Capture "
+            "the corpus at HEAD and run again." % (tip, head))
     a("# CORPUS: %s" % os.path.abspath(corpus))
+    a("#   CAPTURED AT %s, which is this tree's HEAD (refused otherwise)" % tip)
     for isa in isas:
         cp = os.path.join(corpus, f"{isa}.tsv")
         if not os.path.exists(cp):

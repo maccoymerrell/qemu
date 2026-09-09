@@ -80,6 +80,46 @@ import sys
 #: terminator_collisions().
 ALIGN = {"x86_64": 1, "riscv64": 2, "aarch64": 4, "mipsel": 4}
 
+
+def capture_tip_line(build_dir):
+    """The `#tip` header line: WHICH TREE'S EMULATOR PRODUCED THIS CORPUS.
+
+    FINDING 76-C, THIRD PASS, AND THIS IS THE REMEDY IT ASKED FOR.  The
+    `--srcenc` corpus is the wire's own source list for every encoding, read
+    out of a running emulator.  It is therefore a statement about ONE BUILD,
+    and the allowlist rows generated from it are statements about that same
+    build.  Regenerating those rows against a corpus captured at an older tip
+    produces a file that describes a tree that no longer exists -- which is
+    exactly how PASS 81 landed nine wire statements and left twenty-nine
+    allowlist rules matching nothing, and how PASS 76 and PASS 72 did the same
+    before it.  Three passes is a habit, not an accident, so the corpus now
+    says which tree it came from and the generator refuses one that does not
+    say HEAD.
+
+    A DIRTY TREE IS NOT A TIP.  A working tree with modified tracked files
+    describes no commit at all, so the stamp records `dirty` and the consumer
+    refuses that too rather than quoting a sha the corpus does not match.
+    Untracked files are ignored: they cannot change what the emulator does.
+
+    A tree git cannot answer for stamps `unknown`, which the consumer also
+    refuses.  Every failure mode ends in a REFUSAL and none of them ends in a
+    header line that reads like a clean capture.
+    """
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(build_dir)) or "."
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL).decode().strip()
+        dirt = subprocess.check_output(
+            ["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "#tip\tunknown\tunknown\n"
+    if not sha:
+        return "#tip\tunknown\tunknown\n"
+    return "#tip\t%s\t%s\n" % (sha, "dirty" if dirt else "clean")
+
 ISAS = {
     "x86_64": dict(
         machine=62, elfclass=64, entry_stub=bytes.fromhex("b8e700000031ff0f05"),
@@ -596,6 +636,7 @@ def main():
                          "disagrees with itself has no answer to give)"
                          % conflicts)
     with open(merged, "w") as f:
+        f.write(capture_tip_line(a.build_dir))
         f.write("#isa\tencoding\tmnem\tsrc\n")
         for line in seen.values():
             f.write(line)

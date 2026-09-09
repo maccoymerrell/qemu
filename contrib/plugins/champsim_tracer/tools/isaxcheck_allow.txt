@@ -9689,8 +9689,8 @@ mipsel SR-rd-phantom * +REG_SYSEXC
 # pass evidence, not here: it reads 0 by construction.
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
-#   fields        888     1115     1059      872     3934
-#   boundary      865     1115     1016      268     3264
+#   fields        888     1115     1059      875     3937
+#   boundary      865     1115     1016      271     3267
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -9722,15 +9722,15 @@ mipsel SR-rd-phantom * +REG_SYSEXC
 #   mipsel   M-EXC
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/exec144/corpus
-#   CAPTURED AT f21e5068963e1f2e83fba218db988331e442558d, which is this tree's HEAD (refused otherwise)
-#   x86_64    6826117 rows md5 3bcbc7cc50276342f645c86343283aef
-#   aarch64   1408172 rows md5 612ba3d17aaeb4271611e29fb4ad1e39
-#   riscv64     86890 rows md5 4482ec5473f1a5be00c01fb8fd7e92d0
-#   mipsel     548887 rows md5 9786554fe984bb30bc03998b9744fe57
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec151/c90/srcencorp/sledTIP
+#   CAPTURED AT 9f0c5a03c0db6dfba000652261b801ccad492d8f, which is this tree's HEAD (refused otherwise)
+#   x86_64    6826117 rows md5 fb4fe753235e2c85b81d1dfde2fefe17
+#   aarch64   1408172 rows md5 1572e91279569277fa219dd5787512d9
+#   riscv64     86890 rows md5 11f1ca9519141638688ddcd361f3322f
+#   mipsel     548887 rows md5 21539fb79c52898c43617eccbe953078
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
-#   SO_SHA=9711ef37932cc777
+#   SO_SHA=b4f5f9b6a7a07842
 #   ISAX_SHA=e525bf9e9aa89ca5
 #   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #
@@ -13481,7 +13481,7 @@ mipsel SR-rd-phantom trunc.w.d +REG_FCSR
 mipsel SR-rd-phantom trunc.w.s +REG_FCSR
 
 # --- M-DSPCTL: DSPControl is read-modify-written by the DSP helpers that update it.
-#     38 signature(s), 4940 encodings at this tip.
+#     41 signature(s), 5036 encodings at this tip.
 #
 # The DSP ASE keeps its saturation, overflow and extract-position state in ONE
 # word, active_tc.DSPControl, and every helper that updates it MERGES:
@@ -13501,8 +13501,10 @@ mipsel SR-rd-phantom trunc.w.s +REG_FCSR
 # write's own read, arriving where R17 says it belongs.
 mipsel SR-rd-phantom addsc +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom addu.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu.qb +REG_FLAGS
 mipsel SR-rd-phantom addu.qb +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom addu_s.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom addu_s.qb +REG_FLAGS
 mipsel SR-rd-phantom addu_s.qb +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom bposge32 +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom cmpgdu.eq.qb +REG_FLAGS,REG_SYSEXC
@@ -13530,6 +13532,7 @@ mipsel SR-rd-phantom mthlip +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom muleq_s.w.phl +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom rddsp +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom shll.ph +REG_FLAGS,REG_SYSEXC
+mipsel SR-rd-phantom shll.qb +REG_FLAGS
 mipsel SR-rd-phantom shll.qb +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom shll_s.ph +REG_FLAGS,REG_SYSEXC
 mipsel SR-rd-phantom shll_s.w +REG_FLAGS,REG_SYSEXC

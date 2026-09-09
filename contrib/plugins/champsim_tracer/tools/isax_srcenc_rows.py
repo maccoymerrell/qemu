@@ -69,8 +69,33 @@ _LINE = re.compile(
     r'(?P<enc>[0-9a-f]+)\s')
 
 
+#: The two files THIS TOOL REWRITES.  They are dirty by construction during a
+#: regeneration -- stage 1 strips the generated block before the arms run --
+#: so their modification is not evidence that the corpus is stale.  Anything
+#: else modified is.
+_SELF_WRITTEN = ("contrib/plugins/champsim_tracer/tools/isaxcheck_allow.txt",
+                 "contrib/plugins/champsim_tracer/tools/isaxcheck_fields_allow.txt")
+
+
 def head_of(path):
-    """This tree's HEAD, or a string that can never equal a corpus stamp."""
+    """This tree's HEAD, or a string that can never equal a corpus stamp.
+
+    DIRT IS PART OF THE ANSWER, WITH ONE EXEMPTION AND A REASON.  A corpus
+    describes the emulator that produced it; if tracked files have changed
+    since HEAD, the tree in front of this tool is not the tree the corpus
+    was captured from, and a sha alone would say it was.  So a modified
+    working tree resolves to `<sha>+dirty`, which no `#tip` stamp can equal.
+
+    THE EXEMPTION IS THE TWO ALLOWLISTS, and it is not a convenience.  The
+    regeneration this tool exists for STRIPS the generated block before the
+    arms run (that is the whole of exec133's stage 1 -- emitting against an
+    already-green allowlist emits nothing and deletes the block), so those two
+    files are modified at the moment `--replace` is called, every time, by
+    design.  Refusing on them would make the guard refuse its own workflow,
+    which is how a guard gets turned off.  They also cannot change what the
+    emulator does: nothing links them, and isaxcheck reads them at run time as
+    the scoring side of the comparison.
+    """
     import subprocess
     try:
         sha = subprocess.check_output(
@@ -78,12 +103,14 @@ def head_of(path):
             stderr=subprocess.DEVNULL).decode().strip()
         dirt = subprocess.check_output(
             ["git", "-C", path, "status", "--porcelain", "--untracked-files=no"],
-            stderr=subprocess.DEVNULL).decode().strip()
+            stderr=subprocess.DEVNULL).decode().strip().splitlines()
     except Exception:
         return "unknown"
     if not sha:
         return "unknown"
-    return sha if not dirt else (sha + "+dirty")
+    other = [l for l in dirt
+             if not any(l.strip().endswith(s) for s in _SELF_WRITTEN)]
+    return sha if not other else (sha + "+dirty")
 
 
 def corpus_tip(corpus, isas):

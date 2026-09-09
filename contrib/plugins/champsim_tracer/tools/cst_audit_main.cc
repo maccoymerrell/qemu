@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1412,6 +1413,68 @@ int main(int argc, char **argv)
         std::printf("\n=== ATTRIBUTION LINT ===\n");
         std::printf("  impossible attributions: %s\n",
                     lint.summary().c_str());
+        /*
+         * AND THE INSNS IT FIRED ON, BY NAME.  The count alone says THAT
+         * something is wrong and nothing about WHAT, and this lint's whole
+         * diagnostic value is in the opcode class of the offenders: the
+         * exemption list in cst_lint.h's constructor is BY OPCODE CLASS, so
+         * whether a firing is a decode defect or a class the exemptions do
+         * not yet name is decided by exactly the column printed here.
+         * Capped, because a systematically broken trace would otherwise
+         * print a page per template and bury the number above it.
+         */
+        if (lint.mem_violations()) {
+            /* GROUPED BY TEMPLATE, because that is the axis the answer
+             * lives on.  One template with every memory insn flagged is a
+             * template-minting failure; the same count spread one insn per
+             * template across the trace is a decoder-class failure, and the
+             * two have nothing in common but the number.  An ungrouped list
+             * cannot tell them apart, and the cap that keeps the list short
+             * would hide whichever shape came second. */
+            const std::vector<uint64_t> keys = lint.distinct_mem_keys();
+            std::map<uint32_t, std::vector<uint32_t>> by_tmpl;
+            for (uint64_t k : keys) {
+                by_tmpl[(uint32_t)(k >> 32)].push_back((uint32_t)k);
+            }
+            std::printf("  the memop-impossible insns, by template "
+                        "(%zu template(s)):\n", by_tmpl.size());
+            size_t shown = 0;
+            for (const auto &tv : by_tmpl) {
+                if (shown >= 16) {
+                    std::printf("    ... and %zu more template(s)\n",
+                                by_tmpl.size() - shown);
+                    break;
+                }
+                auto tit = by_id.find(tv.first);
+                size_t ninsns = (tit != by_id.end()
+                                 ? templates[tit->second].insns.size() : 0);
+                std::map<std::string, size_t> ops;
+                for (uint32_t ip : tv.second) {
+                    const char *nm = "?";
+                    if (tit != by_id.end() &&
+                        ip < templates[tit->second].insns.size()) {
+                        auto oit = h.maps.opcode.find(
+                            templates[tit->second].insns[ip].opcode);
+                        if (oit != h.maps.opcode.end()) {
+                            nm = oit->second.c_str();
+                        }
+                    }
+                    ops[nm]++;
+                }
+                uint64_t pc0 = 0;
+                if (tit != by_id.end() && !templates[tit->second].insns.empty()) {
+                    pc0 = templates[tit->second].insns[0].pc;
+                }
+                std::printf("    tmpl %-8u pc 0x%016llx  %zu of %zu insn(s):",
+                            tv.first, (unsigned long long)pc0,
+                            tv.second.size(), ninsns);
+                for (const auto &kv : ops) {
+                    std::printf(" %s=%zu", kv.first.c_str(), kv.second);
+                }
+                std::printf("\n");
+                shown++;
+            }
+        }
         if (lint.any()) {
             std::fprintf(stderr,
                          "cst_audit: FAIL: impossible attributions: %s\n",

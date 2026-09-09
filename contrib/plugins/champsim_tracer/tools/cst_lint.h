@@ -112,10 +112,26 @@ public:
          * operand walker minted no static load slot; PUSH / POP / RET
          * cover the x86 implicit-stack corner encodings (see the
          * header comment).  The explicit memory classes (LOAD / STORE
-         * / VEC_*) and atomics are NOT exempt — with the aarch64
-         * access-flag boundary workaround in disas/capstone.c their
-         * templates always carry static slots, and a 0/0 memory insn
-         * is a real decode failure this lint must surface. */
+         * / VEC_*) and atomics are NOT exempt, because a 0/0 memory
+         * insn is a real decode failure this lint must surface.
+         *
+         * THE OLD REASON FOR THAT WAS FALSE AND IS REPLACED HERE.  It
+         * said their templates "always carry static slots" after the
+         * aarch64 access-flag boundary workaround in disas/capstone.c.
+         * They do not: x86_64 `fxsave64 0x40(%rax)` is GEN_OP_STORE
+         * with max_dep_loads == max_dep_stores == 0 and 55 memops per
+         * execution (FINDING 85-A).  The conclusion survives its own
+         * refuted premise and is STRONGER for it -- a class that can
+         * come out 0/0 is exactly the class worth firing on -- but the
+         * premise had to go, because a justification that is plausible
+         * and false is the failure this tree files against.
+         *
+         * THE ONLINE MIRROR OF THIS LIST DISAGREES.  note_impossible_slot()
+         * in champsim_tracer_mem_access_recorder.cc says it mirrors this
+         * one and DOES exempt LOAD / STORE / VEC_* / atomics, so it
+         * passes what this fails -- 990 of one trace's 2,397 firings are
+         * exactly that gap.  Filed as 85-A(i); the two lists want to be
+         * one list, in one place both sides include. */
         std::unordered_set<uint64_t> exempt;
         for (const auto &kv : h.maps.opcode) {
             if (kv.second == "GEN_OP_PREFETCH" ||
@@ -207,6 +223,25 @@ public:
     size_t   distinct_reg_insns() const { return distinct_reg_.size(); }
     size_t   distinct_dangling_ids() const {
         return distinct_dangling_.size();
+    }
+
+    /*
+     * THE INSNS THE MEMOP LINT FIRED ON, so the failure can name its
+     * subject.  A count and a distinct-insn total say THAT something is
+     * wrong and nothing about WHAT, and a finding nobody can act on is
+     * one step from a finding nobody acts on: reporting "2,397 impossible
+     * memop attributions" cost a later pass a whole diagnosis it could
+     * have read off the audit.  Sorted so two runs of the same trace
+     * print the same list.
+     *
+     * Keys are (template_id << 32) | ipos, which is what the caller needs
+     * to look the instruction up in the templates section it already
+     * holds.
+     */
+    std::vector<uint64_t> distinct_mem_keys() const {
+        std::vector<uint64_t> v(distinct_mem_.begin(), distinct_mem_.end());
+        std::sort(v.begin(), v.end());
+        return v;
     }
     bool     any() const {
         return mem_memops_ || reg_records_ || dangling_refs_;

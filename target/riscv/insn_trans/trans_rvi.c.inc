@@ -75,6 +75,33 @@ static bool trans_lpad(DisasContext *ctx, arg_lpad *a)
                                        sizeof(((CPURISCVState *)0)->gpr[7]));
     insn_dataflow_note_stated_read_env(offsetof(CPURISCVState, elp),
                                        sizeof(((CPURISCVState *)0)->elp));
+    /*
+     * AND WHAT IT WRITES, stated in the same place and for the same reason.
+     *
+     * `lpad` CLEARS the expected-landing-pad state -- that is the whole of
+     * what it exists to do once the label matches, and the store is fifty
+     * lines below at the end of this function.  Only the armed guest reaches
+     * it: the early return two lines down emits nothing, so on every
+     * encoding the destination sled sees, ELP was written by the
+     * architecture and by no op, and the wire carried REG_SYS as a
+     * destination from disas/capstone.c alone.  Ninety-six encodings, one
+     * family, every one of them.
+     *
+     * The asymmetry with the read side would be the defect if it were left:
+     * the two reads above are stated ABOVE the early return precisely so
+     * they describe the instruction rather than this guest's machine state,
+     * and the write is the same fact in the other direction.  R16 records an
+     * ISA-defined dependency whether or not the model implements it here,
+     * and stating the write below the return would describe only the armed
+     * case -- which is the shape the read statement was moved up to avoid.
+     *
+     * The RANGE form, against the same declaration the read uses, so the two
+     * ends of the register resolve through one spelling.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_write_env(offsetof(CPURISCVState, elp),
+                                        sizeof(((CPURISCVState *)0)->elp));
 
     if (!ctx->fcfi_lp_expected) {
         return true;

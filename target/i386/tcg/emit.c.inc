@@ -4072,6 +4072,38 @@ static void gen_RDMSR(DisasContext *s, X86DecodedInsn *decode)
 static void gen_note_rdpmc_selector(void)
 {
     gen_note_gpr_read(R_ECX);
+    /*
+     * AND THE PAIR IT RETURNS THE COUNTER IN.
+     *
+     * The comment above states the READ half and stops there, and the
+     * destination bar measured the other half of the same sentence: `0f33`
+     * publishes REG_GPR0 and REG_GPR2 as destinations on every encoding of
+     * the family and QEMU's write list carried neither, because
+     * helper_rdpmc() on this build raises #GP before it writes anything and
+     * the translation emits no store.
+     *
+     * SAME RULING, OTHER DIRECTION.  22d7666262 is quoted above for ECX: an
+     * ISA-defined dependency the model does not implement is still recorded.
+     * EDX:EAX is where the SDM says the counter arrives, and reading that
+     * sentence for the source operand while declining it for the
+     * destination operand would be the model deciding which half of one
+     * definition to believe.
+     *
+     * NOT the third register.  The refusal above stands exactly as written:
+     * the performance counter itself has no CPUArchState member, so it has
+     * no range and no name and stays on the bar.  What is stated here is
+     * only the pair that DOES have storage -- env->regs[R_EAX] and
+     * env->regs[R_EDX], the same globals every other x86 destination
+     * resolves through.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, regs[R_EAX]),
+        sizeof(((CPUX86State *)0)->regs[0]));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, regs[R_EDX]),
+        sizeof(((CPUX86State *)0)->regs[0]));
 }
 
 static void gen_RDPMC(DisasContext *s, X86DecodedInsn *decode)

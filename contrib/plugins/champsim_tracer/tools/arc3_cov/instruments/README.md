@@ -19,6 +19,8 @@ the one location; later waves cite these paths and nothing else.
 | `mechclass.py` | the mechanism a source loss belongs to -- `Q-SILENT` / `R-REFUSED` / `R-SHORT` / `NO-BLOCK` / `SURV-ONLY` -- read off arm A's own row |
 | `barledger.py` | joins the bar's families to `BAR_CLASSES.tsv` and REFUSES unless EVERY family carries a disposition and a citation |
 | `famarm.py` | the ARM under a family's ruling: histogram an encoding bit-field, or split each lost register by operand SLOT, over the bar's own population |
+| `landedcheck.py` | re-reads every `QEMU-STATES-IT` row against the corpus it is a claim about: SPLIT when QEMU states the register elsewhere in the very families that still lose it, INERT when a statement is landed at the row's cited line and reaches no losing family at all |
+| `barscore.sh` | the whole bar-scoring step as ONE entry point -- srcbar, dstbar, both ledgers, both `landedcheck` runs -- so a step added here is a step every pass runs |
 
 Every tool takes `--selftest`, which plants a defect and requires the tool to
 fail on it.  Run them all before quoting any of them -- with the runner, not
@@ -200,6 +202,14 @@ a longer form.  `BAR_CLASSES.tsv` carries the disposition of each, and
 class refuses, a family matching two refuses, a class matching no family is
 reported DEAD, a `BLOCKED` row whose note asks no question refuses, and a
 disposition with no citation refuses.
+
+THE JOIN IS NOT THE WHOLE CHECK, and PASS 87 is why.  A row can match its
+families, carry its citation, and still be describing a population that moved
+out from under it -- the statement it asked for landed, the bar moved for part
+of the class, and the sentence was never re-read.  `barledger.py` cannot see
+that: it checks that every family HAS a disposition, not that the disposition
+is still true.  `landedcheck.py` is the second half, and `barscore.sh` runs
+both so neither can be the step a pass forgot.
 
 The three dispositions are exhaustive by rule of the program:
 `QEMU-STATES-IT` (QEMU's translation contains the read, the extraction does

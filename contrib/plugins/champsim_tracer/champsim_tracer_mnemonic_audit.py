@@ -9964,7 +9964,55 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
         mark = "  <-- EXERCISED" if r.ident.ident in obs else ""
         print(f"    {r.ident.name}  ({r.ident.src_file}:"
               f"{r.ident.src_line}){mark}")
-    return len(live)
+
+    # ---- IS THE SHIPPED HEADER THE ONE THIS TREE WOULD GENERATE?
+    #
+    # FINDING 92-A, AND THE HOLE THAT LET IT THROUGH.  Every number above
+    # is computed from `rows`, which this run just DERIVED from the tree.
+    # The plugin does not use `rows`; it uses the header committed beside
+    # it.  So the census could -- and did -- print "NO ROW ... 0 ... 0 BY
+    # CONSTRUCTION on a stated ISA" while the SHIPPED table was missing
+    # two rules, and the two it was missing were INVPCID and HLT: exactly
+    # the encodings 5d9154d8c2 had just taught QEMU to publish an identity
+    # for.  Their instructions then classified GEN_OP_UNKNOWN, the field
+    # fill returned early, and 6,000 x86 encodings reached the wire with
+    # no published source list at all.
+    #
+    # A generated file that no longer matches its generator is stale, and
+    # staleness is not visible in any number derived from the generator.
+    # It is visible HERE, in one comparison, and it counts toward the
+    # census's own return so `--diff` exits non-zero on it.
+    out = PLUGIN_DIR / f"champsim_tracer_qemu_ident_{key}.h"
+    stale = 0
+    if not out.is_file():
+        stale = 1
+        print(f"SHIPPED HEADER: {out} DOES NOT EXIST -- REFUSING (a census "
+              f"of rows nothing ships is a census of nothing)")
+    else:
+        want = qemu_ident_header_text(info, rows)
+        have = out.read_text()
+        if want == have:
+            print(f"SHIPPED HEADER: byte-identical to what this tree "
+                  f"generates ({len(rows)} row(s))")
+        else:
+            stale = 1
+            wl, hl = want.splitlines(), have.splitlines()
+            import difflib
+            print(f"SHIPPED HEADER IS STALE -- {out} is not what this tree "
+                  f"generates.  The plugin uses the SHIPPED rows, so every "
+                  f"count above describes a table that is not in the "
+                  f"binary.  Re-emit with --qemu-ident --apply.")
+            n = 0
+            for line in difflib.unified_diff(hl, wl, "shipped", "generated",
+                                             lineterm="", n=0):
+                if line.startswith(("---", "+++")):
+                    continue
+                print(f"    {line}")
+                n += 1
+                if n >= max_lines:
+                    print("    ... (truncated)")
+                    break
+    return len(live) + stale
 
 
 def main() -> int:

@@ -116,10 +116,51 @@ note()  { printf '%s\n' "$*"; }
 #   rows       table rows keyed on a Capstone enumerator.  Re-spelling these
 #              into a local copy of the same constants is REFUSED under R14;
 #              they retire when the fact each row carries comes from QEMU.
-#   gates      the admission sites: the consult that decides what an
-#              instruction IS, and the poison check that decides whether its
-#              whole basic block enters the trace.  Both read the same
-#              Capstone answer and both must move together (#317).
+#   gates      the admission sites: every place the plugin asks whether
+#              Capstone produced an answer AT ALL and changes what it does
+#              on the answer.  These decide what an instruction IS, whether
+#              its fields are decoded, whether it can be a branch, and
+#              whether its whole basic block enters the trace; they must all
+#              move together (#317), because one left behind refuses -- or
+#              silently empties -- everything on a Capstone-free build.
+#
+#              IT WAS A HAND-LIST AND THE HAND-LIST WAS SHORT.  Until this
+#              was written the survey grepped TWO literal patterns, both
+#              anchored to champsim_tracer.cc, and every R14 verdict since
+#              PASS 16 quoted the "2-3 admission gates" that produced.  The
+#              tree has FIVE, and the three the literals could not see are
+#              the wire-critical ones:
+#
+#                champsim_tracer.cc:split_tb_into_fragments   an instruction
+#                  with no Capstone answer is BRANCH_NONE, so the fragment
+#                  splitter cannot see a branch and the true-BB chain stops
+#                  being assembled;
+#                champsim_tracer_bb_template_cache.cc         an instruction
+#                  with no Capstone answer never reaches
+#                  decode_detail_to_generic(), so its whole fields row stays
+#                  zeroed;
+#                champsim_tracer_decode.cc                    and
+#                  decode_detail_to_generic() itself returns on the same
+#                  test, which is what makes the row zero rather than wrong.
+#
+#              So the search is MECHANICAL and covers the whole plugin
+#              directory: the consult by its call, and the existence test by
+#              its one idiom (`mnemonic[0]` -- the answer's first byte is
+#              what "did Capstone decode this?" is spelled as everywhere in
+#              this tree).  Comment lines are excluded because a sentence
+#              about the idiom is not a site.
+#
+#              WHAT IT DOES NOT FIND, stated so the number is not read as
+#              more than it is: an admission site keyed on some OTHER
+#              Capstone field would not match this idiom.  The FIELD census
+#              below is what bounds that -- it is compiler-derived and reads
+#              every member at every site -- and a gate can only exist where
+#              the census already counts a read.
+#
+#              The count REFUSES at zero while any Capstone read survives:
+#              a survey that finds no gate on a tree that still has fields
+#              has stopped looking, which is the failure every instrument
+#              here is built against.
 survey() {
     P="$SRC_ROOT/contrib/plugins/champsim_tracer"
     note ""
@@ -146,11 +187,30 @@ survey() {
     note "             total $nr"
 
     note "  gates    admission sites that read the Capstone answer:"
-    grep -n 'qemu_plugin_cap_decode(' "$P/champsim_tracer.cc" 2>/dev/null \
-        | sed 's/^/             champsim_tracer.cc:/;s/ *$//' | head -4
-    grep -n 'cst_cap_arch >= 0 && !insn_info\[ci\].mnemonic\[0\]' \
-         "$P/champsim_tracer.cc" 2>/dev/null \
-        | sed 's/^/             champsim_tracer.cc:/' | head -2
+    gates=$(grep -rnE 'qemu_plugin_cap_decode\(|mnemonic\[0\]' "$P" \
+                 --include='*.cc' --include='*.h' 2>/dev/null \
+              | grep -v "^$P/tools/" \
+              | grep -vE ':[[:space:]]*(\*|//|/\*)' \
+              | sed "s#^$P/##;s/[[:space:]]*$//" | sort)
+    ng=$(printf '%s\n' "$gates" | grep -c . )
+    printf '%s\n' "$gates" | grep . | sed 's/^/             /'
+    note "             total $ng"
+    #
+    # THE VACUITY GUARD.  Zero gates is the RESULT this survey exists to
+    # reach -- but only on a tree that has no Capstone reads left at all.
+    # Zero gates while the field census still counts reads means the search
+    # stopped matching, not that the sites went away, and that is the shape
+    # every instrument in this tree is built to refuse rather than report as
+    # progress.  $nh is the header count computed above; a plugin with no
+    # Capstone header and no gate is legitimately done.
+    #
+    if [ "$ng" -eq 0 ] && [ "$nh" -gt 0 ]; then
+        note "  gates    SURVEY REFUSED: no admission site matched, yet" \
+             "$nh plugin file(s) still include a Capstone header."
+        note "           A zero here is a result only when the tree is" \
+             "clean; on this tree it means the search has stopped looking."
+        return 2
+    fi
 
     # The FOURTH surface, and the largest one: the FIELDS of
     # qemu_plugin_insn_info the plugin reads out of the Capstone answer.
@@ -301,10 +361,53 @@ EOF
         fi
     fi
 
+    #
+    # THE ADMISSION-SITE SEARCH, PROVED BOTH WAYS ON FIXTURES.
+    #
+    # This is the arm the old two-literal grep could not have had: a
+    # hand-list is right by definition on the tree it was written against,
+    # so nothing could tell it from a search.  These fixtures are plugin
+    # directories with a KNOWN answer, so the search has a subject it did
+    # not choose.
+    #
+    #   sees     a Capstone header AND one existence test -> the site is
+    #            found and the survey does NOT refuse.  If this fails the
+    #            search has stopped matching the idiom, which is exactly
+    #            the failure that let three wire-critical gates -- the
+    #            fragment splitter's, the template builder's and
+    #            decode_detail_to_generic()'s own -- go uncounted through
+    #            every R14 verdict since PASS 16.
+    #   blind    a Capstone header and NO existence test -> REFUSE (2).
+    #            A survey that reports "no gates" on a tree that still
+    #            includes Capstone has stopped looking, and a work list
+    #            that shrinks for that reason is the failure this whole
+    #            file is built against.
+    #
+    local rc_sees rc_blind
+    mkdir -p "$scratch/gsees/contrib/plugins/champsim_tracer" \
+             "$scratch/gblind/contrib/plugins/champsim_tracer"
+    cat > "$scratch/gsees/contrib/plugins/champsim_tracer/f.cc" <<'EOF'
+#include <capstone/capstone.h>
+int f(const struct qemu_plugin_insn_info *i) { return i->mnemonic[0] != 0; }
+EOF
+    cat > "$scratch/gblind/contrib/plugins/champsim_tracer/f.cc" <<'EOF'
+#include <capstone/capstone.h>
+int f(const struct qemu_plugin_insn_info *i) { return i->insn_size; }
+EOF
+    ( SRC_ROOT="$scratch/gsees";  survey >"$scratch/gsees.survey"  2>&1 )
+    rc_sees=$?
+    ( SRC_ROOT="$scratch/gblind"; survey >"$scratch/gblind.survey" 2>&1 )
+    rc_blind=$?
+    note "  gates/sees    rc=$rc_sees   (expect 0)  $(grep -c 'f.cc' "$scratch/gsees.survey") site(s) found"
+    note "  gates/blind   rc=$rc_blind   (expect 2)  survey refuses a zero it did not earn"
+    [ "$rc_sees"  = 0 ] || { note "  SELFTEST FAIL: the admission search REFUSED a fixture that has a site"; bad=1; }
+    [ "$rc_blind" = 2 ] || { note "  SELFTEST FAIL: the admission search reported a comfortable zero on a fixture that still includes Capstone"; bad=1; }
+
     if [ "$bad" = 0 ]; then
         note "nocapstone_gate: SELFTEST GREEN — the link stage discriminates in"
-        note "  both directions and refuses a missing subject, and the fields"
-        note "  survey's own census discriminates too"
+        note "  both directions and refuses a missing subject, the admission"
+        note "  search finds a planted site and refuses an unearned zero, and"
+        note "  the fields survey's own census discriminates too"
         return 0
     fi
     note "nocapstone_gate: SELFTEST RED — this gate's verdicts cannot be trusted"
@@ -499,5 +602,12 @@ if [ "$FAILED" = 0 ]; then
     exit 0
 fi
 note "nocapstone_gate: RED — Capstone is still a dependency of the plugin"
-survey
+#
+# The survey's own REFUSAL outranks the RED.  RED says the dependency is
+# still there and names it; a refused survey says the instrument that was
+# supposed to name it has stopped matching, and reporting that as an
+# ordinary RED would let the work list silently shrink to nothing while the
+# verdict stayed the same.  2 is this file's "could not look" code.
+#
+survey || { [ $? -eq 2 ] && exit 2; }
 exit 1

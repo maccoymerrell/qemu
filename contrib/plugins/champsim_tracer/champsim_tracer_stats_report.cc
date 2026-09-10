@@ -396,6 +396,22 @@ void append_stats_summary(GString *report, const char *label,
         { "BBs refused, boundary could not decode (must be 0)",
                                                 stats.tb_refused_decode_fail_cp },
         { "  same on the wrong path",           stats.tb_refused_decode_fail_wp },
+        /* The QEMU-sourced answer to the same question, beside it: what
+         * the R14 replacement would decide on the same population.  See
+         * TracerStats::decode_fail_ab_*.  The correct-path cells are an
+         * invariant for the same reason the row above is; the wrong-path
+         * cells are a measurement. */
+        { "  both decoders refused (CP / must be 0)",
+                                        stats.decode_fail_ab_both_cp },
+        { "  both decoders refused (WP)", stats.decode_fail_ab_both_wp },
+        { "  Capstone alone refused, QEMU decoded (CP / must be 0)",
+                                        stats.decode_fail_ab_capfail_only_cp },
+        { "  Capstone alone refused, QEMU decoded (WP)",
+                                        stats.decode_fail_ab_capfail_only_wp },
+        { "  QEMU alone refused, Capstone named it (CP / must be 0)",
+                                        stats.decode_fail_ab_qemuonly_cp },
+        { "  QEMU alone refused, Capstone named it (WP)",
+                                        stats.decode_fail_ab_qemuonly_wp },
         { "DEVIO FIFO kicks dropped (overflow)", stats.devio_fifo_kicks_dropped },
         /* Invariant, not a measurement: a cut says the address space moved
          * away, so it cannot stand while the entry value is loaded. */

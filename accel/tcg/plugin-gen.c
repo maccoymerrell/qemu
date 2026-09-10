@@ -481,6 +481,16 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     insn->decode_id = 0;
     insn->decode_name = NULL;
     /*
+     * And the same hazard for the undecoded flag, where it bites HARDEST:
+     * the flag is only ever SET, so a struct that once held an undecodable
+     * instruction would report every later reuse as undecoded too.  Caught
+     * by its own consumer's correct-path must-be-0 row on the first
+     * measurement -- 1,595 aarch64 CORRECT-PATH instructions reported
+     * undecoded, which is impossible by construction because the CPU
+     * executed them.
+     */
+    insn->undecoded = false;
+    /*
      * Same reuse hazard again, and one more: a stale TCGOp pointer would be
      * walked into a freed op list.  Cleared here and re-taken below.
      */
@@ -525,6 +535,14 @@ void plugin_gen_record_insn_identity(uint32_t id, const char *name)
     if (insn) {
         insn->decode_id = id;
         insn->decode_name = name;
+    }
+}
+
+void plugin_gen_record_insn_undecoded(void)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn) {
+        insn->undecoded = true;
     }
 }
 

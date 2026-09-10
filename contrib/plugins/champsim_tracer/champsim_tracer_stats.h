@@ -1314,6 +1314,42 @@ struct Stats {
     uint64_t tb_refused_decode_fail_cp = 0;
     uint64_t tb_refused_decode_fail_wp = 0;
 
+    /*
+     * THE SAME REFUSAL, DECIDED FROM QEMU'S OWN DECODER, BESIDE IT.
+     *
+     * The row above is Capstone's answer: the boundary could not name
+     * these bytes.  These four are the 2x2 of that answer against QEMU's
+     * -- qemu_plugin_insn_undecoded(), which says the target's decoder
+     * ran out of rules and fell through to its illegal-instruction arm.
+     * They are the whole content of "can the R14 deletion move this
+     * gate", because a predicate the deletion replaces has to be
+     * compared to the one it replaces on the SAME population, and
+     * nothing else in the tree compares them.
+     *
+     * WHAT EACH DISAGREEMENT MEANS, and why neither is noise:
+     *
+     *   capfail_only  Capstone could not decode an instruction QEMU
+     *                 decoded through a named rule.  Today the whole
+     *                 block is refused for it -- a Capstone coverage gap
+     *                 costing real blocks.  Flipping the gate ADMITS
+     *                 these.
+     *   qemuonly      QEMU found no rule where Capstone produced a
+     *                 name.  Flipping the gate REFUSES these; a non-zero
+     *                 is the direction that can lose a block, so it is
+     *                 the number the flip has to be argued against.
+     *
+     * Counted on both paths for the reason the rows above are: the
+     * correct-path cells are an invariant (the CPU is executing these
+     * bytes, so neither decoder should be failing) and the wrong-path
+     * cells are a measurement.
+     */
+    uint64_t decode_fail_ab_both_cp = 0;
+    uint64_t decode_fail_ab_both_wp = 0;
+    uint64_t decode_fail_ab_capfail_only_cp = 0;
+    uint64_t decode_fail_ab_capfail_only_wp = 0;
+    uint64_t decode_fail_ab_qemuonly_cp = 0;
+    uint64_t decode_fail_ab_qemuonly_wp = 0;
+
     /* Guest-thread kernel-entry aliasing census (system mode; RULING 2/3's
      * primary anti-vacuity witness).  aliased: kernel task
      * values joined to the ENTERING thread's tid at a user->kernel

@@ -146,6 +146,15 @@ struct qemu_plugin_insn {
      */
     uint32_t decode_id;
     const char *decode_name;
+    /*
+     * QEMU's own word that no decode rule matched these bytes: the
+     * target's decoder fell through to its illegal-instruction arm, so
+     * what was translated is that raise and not an instruction.  Set by
+     * plugin_gen_record_insn_undecoded() from the one point in each
+     * target where decode has run out.  See include/qemu/qemu-plugin.h
+     * for why this is not the same fact as translation_refused.
+     */
+    bool undecoded;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

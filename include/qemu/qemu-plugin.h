@@ -279,6 +279,12 @@ typedef uint64_t qemu_plugin_id_t;
  *   now index the wrong array: the version moves for that, additive
  *   though the accessor is.
  *
+ * version 28:
+ * - added qemu_plugin_insn_undecoded(): QEMU's own word that the bytes
+ *   at this instruction's address matched no decode rule of this
+ *   target, so what it translated is the illegal-instruction raise and
+ *   not an instruction.  Purely additive.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -290,7 +296,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 27
+#define QEMU_PLUGIN_VERSION 28
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -835,6 +841,43 @@ uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn);
  */
 QEMU_PLUGIN_API
 uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_undecoded() - the bytes matched no decode rule
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * True when the target's decoder ran out of rules for the bytes at
+ * this address and fell through to its illegal-instruction arm, so
+ * what QEMU translated is that raise and not an instruction.
+ *
+ * IT IS NOT "THIS INSTRUCTION FAULTS", AND THE DIFFERENCE IS THE WHOLE
+ * POINT.  A privileged instruction attempted at the wrong level, an
+ * encoding a CPU model has no extension for, an operand combination a
+ * check rejects -- all of those raise, and every one of them is a real
+ * instruction that a decode rule DID match.  This says the opposite:
+ * no rule matched at all, so there is nothing for a consumer to be
+ * right or wrong about.  qemu_plugin_insn_dataflow_status()'s
+ * @translation_refused covers the first kind and reads 0 for most of
+ * this one; the two are separate facts and neither implies the other.
+ *
+ * WHERE IT IS SET, and why exactly there.  At the single point in each
+ * target where decode has run out: i386's gen_unknown_opcode() (whose
+ * own comment says "we don't decode the instruction at all"), the
+ * aarch64 unallocated_encoding() that disas_a64() reaches only after
+ * every decoder returned false, the tail of RISC-V's decode_opc(), and
+ * the tail of MIPS' decode_opc().  Not at the shared raise helpers
+ * those funnel into -- gen_illegal_opcode(), unallocated_encoding(),
+ * gen_exception_illegal(), gen_reserved_instruction() are each also
+ * called from checks on encodings that decoded fine, and a flag set
+ * there would say "undecoded" about instructions the target decoded.
+ *
+ * A target that never sets it reports false, which says nobody looked,
+ * not that everything decoded.
+ *
+ * Returns: true if no decode rule matched these bytes.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_undecoded(const struct qemu_plugin_insn *insn);
 
 /**
  * qemu_plugin_insn_decode_name() - name of the decode-table slot

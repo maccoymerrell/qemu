@@ -10475,6 +10475,7 @@ struct TbPoison {
 static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                                  const uint8_t *insn_bytes,
                                  const qemu_plugin_insn_info *insn_info,
+                                 const bool *insn_undecoded,
                                  uint32_t canonical_n_insns)
 {
     TbPoison p;
@@ -10600,6 +10601,34 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
              * correct path executes (12 on x86_64, 6 on aarch64 in the
              * same corpus), so keying on it would poison real blocks.
              */
+            /*
+             * THE QEMU-SOURCED ANSWER TO THE SAME QUESTION, MEASURED
+             * BESIDE THE ACTING ONE.  qemu_plugin_insn_undecoded() is
+             * the target decoder's own word that no rule matched these
+             * bytes.  It is the candidate replacement for the test
+             * below, and this is the 2x2 that says what replacing would
+             * cost -- see qemu_plugin_insn_undecoded() for why it is a
+             * different fact from translation_refused, and
+             * TracerStats::decode_fail_ab_* for what each cell means.
+             *
+             * SCORED, NOT ACTING.  The gate below is unchanged; the flip
+             * is a wire change and it does not get to happen as a side
+             * effect of the measurement that justifies it.
+             */
+            {
+                bool capfail = cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0];
+                bool qemufail = insn_undecoded && insn_undecoded[ci];
+                if (capfail && qemufail) {
+                    (spec ? g_stats.decode_fail_ab_both_wp
+                          : g_stats.decode_fail_ab_both_cp)++;
+                } else if (capfail) {
+                    (spec ? g_stats.decode_fail_ab_capfail_only_wp
+                          : g_stats.decode_fail_ab_capfail_only_cp)++;
+                } else if (qemufail) {
+                    (spec ? g_stats.decode_fail_ab_qemuonly_wp
+                          : g_stats.decode_fail_ab_qemuonly_cp)++;
+                }
+            }
             if (!p.poisoned &&
                 cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
                 p.poisoned = true;
@@ -10635,6 +10664,13 @@ struct TbScratch {
      * indexed against finally exists.  See champsim_tracer_qdep.h. */
     std::unique_ptr<QDepInsn[]>              insn_qdep;
     std::unique_ptr<uint8_t[]>               insn_sizes;
+    /* QEMU's own word that no decode rule matched these bytes, per
+     * canonical instruction.  Read at translation time because
+     * qemu_plugin_insn_undecoded() is keyed on the insn handle and this is
+     * the last scope in which that handle still names this instruction;
+     * consumed by detect_tb_poison(), which is the block-admission gate the
+     * R14 deletion has to move off Capstone.  See champsim_tracer.h. */
+    std::unique_ptr<bool[]>                  insn_undecoded;
     std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
     std::unique_ptr<uint32_t[]>              canonical_index;
     std::unique_ptr<bool[]>                  canonical_first;
@@ -10648,6 +10684,7 @@ struct TbScratch {
           insn_branch_target_pcs(std::make_unique<uint64_t[]>(n)),
           insn_qdep(std::make_unique<QDepInsn[]>(n)),
           insn_sizes(std::make_unique<uint8_t[]>(n)),
+          insn_undecoded(std::make_unique<bool[]>(n)),
           insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
           canonical_index(std::make_unique<uint32_t[]>(n)),
           canonical_first(std::make_unique<bool[]>(n)),
@@ -10785,6 +10822,10 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
              * keyed on the slot, not on the name.
              */
             insn_info[out].decode_id = qemu_plugin_insn_decode_id(insn);
+            /* And QEMU's own word that nothing decoded these bytes.  Read
+             * here for the same reason and at the same moment; see
+             * TbScratch::insn_undecoded. */
+            scratch.insn_undecoded[out] = qemu_plugin_insn_undecoded(insn);
         }
 
         /* Per-memop callback fires unconditionally; the cb body
@@ -10890,6 +10931,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * fragments/callbacks for a TB whose bytes don't parse as valid code
      * (see detect_tb_poison). */
     TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, insn_info,
+                                       scratch.insn_undecoded.get(),
                                        canonical_n_insns);
     if (poison.poisoned) {
         /*

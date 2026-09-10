@@ -63,6 +63,18 @@ void plugin_gen_record_branch_target(uint64_t target_pc);
 void plugin_gen_record_insn_identity(uint32_t id, const char *name);
 
 /*
+ * plugin_gen_record_insn_undecoded: the bytes at the instruction now
+ * being translated matched NO decode rule of this target, so what the
+ * translator is about to emit is the illegal-instruction raise.
+ *
+ * Called from the ONE point in each target where decode has run out --
+ * not from the shared raise helper it funnels into, which is also
+ * reached from checks on encodings that decoded perfectly well.
+ * Plugins consume it via qemu_plugin_insn_undecoded().
+ */
+void plugin_gen_record_insn_undecoded(void);
+
+/*
  * plugin_gen_record_tb_stop: close the last instruction's op range over
  * whatever ops->tb_stop() just emitted on its behalf.  Called from
  * translator_loop() immediately after tb_stop() and before gen_tb_end().
@@ -131,6 +143,9 @@ static inline void plugin_gen_record_ctrl_resume(void)
 
 static inline void plugin_gen_record_insn_identity(uint32_t id,
                                                    const char *name)
+{ }
+
+static inline void plugin_gen_record_insn_undecoded(void)
 { }
 
 #endif /* CONFIG_PLUGIN */

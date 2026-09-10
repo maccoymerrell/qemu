@@ -878,6 +878,11 @@ uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn)
     return insn->decode_id;
 }
 
+bool qemu_plugin_insn_undecoded(const struct qemu_plugin_insn *insn)
+{
+    return insn->undecoded;
+}
+
 const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn)
 {
     return insn->decode_name;

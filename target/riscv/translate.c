@@ -1471,6 +1471,17 @@ static void decode_opc(CPURISCVState *env, DisasContext *ctx, uint16_t opcode)
         }
     }
 
+    /*
+     * QEMU'S OWN WORD THAT THESE BYTES ARE NOT AN INSTRUCTION.
+     *
+     * Stated HERE, where decode has run out, and not in the raise helper
+     * below -- that helper is also reached from checks on encodings a rule
+     * DID match, and a flag set there would say "undecoded" about
+     * instructions this target decoded.  See qemu_plugin_insn_undecoded().
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    plugin_gen_record_insn_undecoded();
     gen_exception_illegal(ctx);
 }
 

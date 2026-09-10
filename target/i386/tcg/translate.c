@@ -2811,6 +2811,17 @@ static void gen_leave(DisasContext *s)
    feature, or just a bogus instruction stream.  */
 static void gen_unknown_opcode(CPUX86State *env, DisasContext *s)
 {
+    /*
+     * QEMU'S OWN WORD THAT THESE BYTES ARE NOT AN INSTRUCTION.
+     *
+     * Stated HERE, where decode has run out, and not in the raise helper
+     * below -- that helper is also reached from checks on encodings a rule
+     * DID match, and a flag set there would say "undecoded" about
+     * instructions this target decoded.  See qemu_plugin_insn_undecoded().
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    plugin_gen_record_insn_undecoded();
     gen_illegal_opcode(s);
 
     if (qemu_loglevel_mask(LOG_UNIMP)) {

@@ -2256,6 +2256,42 @@ static bool rule_superseded_by_refusal(const std::string &key)
 }
 
 /*
+ * THE SAME CATEGORY, ONE TABLE DOWN: an ALIAS FOLD whose Capstone spelling
+ * the admission gate removed.
+ *
+ * An alias row folds two decoders' spellings of one encoding together, and
+ * a row that matches nothing is reported DEAD for the reason a dead allow
+ * rule is: an unaudited fold has outlived the behaviour it describes.  But
+ * "matches nothing" has the same two causes the allowlist's own detector
+ * had to be taught apart (FINDING 93-A), and the second one is not a stale
+ * row: the gate REFUSED every encoding the fold was ever about, so the pair
+ * cannot arise and the row is SUPERSEDED, not dead.
+ *
+ * MEASURED, and this is the row that made the category: with the block
+ * admission on QEMU's own word, aarch64 `tlbip` reads DEAD -- and all 184
+ * encodings the BASE corpus spelled `tlbip` are in the HEAD refused set,
+ * none survive in the HEAD corpus, and QEMU's aarch64 target carries no
+ * TLBIP decode rule at all (only the ID_AA64MMFR3.D128 feature field).
+ * Reporting that as a stale fold would be a false justification of exactly
+ * the shape this directory keeps catching.
+ *
+ * THE TEST IS THE MNEMONIC-GRAIN ONE, deliberately: an alias row names a
+ * SPELLING, not a signature, so its subject is every encoding the sweep
+ * decoded under that spelling.  The three conditions are
+ * rule_superseded_by_refusal()'s, and the conservative direction is the
+ * same -- a spelling this arm SCORED, or one whose silence has no recorded
+ * cause, leaves the row DEAD.
+ */
+static bool alias_superseded_by_refusal(const char *cs)
+{
+    if (!refused_path) return false;
+    if (!srcenc_mnem_refused.count(cs)) return false;
+    if (srcenc_mnem_hit.count(cs)) return false;
+    if (srcenc_mnem_unrsd.count(cs)) return false;
+    return true;
+}
+
+/*
  * Is this signature key one some allow rule could be about?  Used to bound
  * the `--dump-sig-enc` domain; it must NOT mark a rule used, because the
  * dump runs during the sweep and `used` is the dead-rule detector's own
@@ -3842,6 +3878,34 @@ static int selftest_sigjoin(void)
     chk(!rule_superseded_by_sig_refusal("SR-rd-phantom fadd +REG_FPCW"),
         "with NO pair file the join answers nothing");
 
+    /*
+     * THE ALIAS-FOLD HALF, planted through the same three sets the live
+     * arm fills.  The conservative direction is tested in both senses: a
+     * spelling this arm scored, and a spelling whose silence has no
+     * recorded cause, must both leave the row DEAD.
+     */
+    sigenc_path = saved_sig;
+    refused_path = "(selftest)";
+    srcenc_mnem_refused = { "tlbip", "bfc", "pause" };
+    srcenc_mnem_hit     = { "bfc" };
+    srcenc_mnem_unrsd   = { "pause" };
+
+    chk(alias_superseded_by_refusal("tlbip"),
+        "an alias spelling wholly in the refused set SUPERSEDES");
+    chk(!alias_superseded_by_refusal("bfc"),
+        "an alias spelling this arm SCORED stays DEAD");
+    chk(!alias_superseded_by_refusal("pause"),
+        "an alias spelling silent for an UNRECORDED cause stays DEAD");
+    chk(!alias_superseded_by_refusal("nosuch"),
+        "an alias spelling in NO refused set stays DEAD");
+    refused_path = nullptr;
+    chk(!alias_superseded_by_refusal("tlbip"),
+        "with NO refused set the alias join answers nothing");
+
+    srcenc_mnem_refused.clear();
+    srcenc_mnem_hit.clear();
+    srcenc_mnem_unrsd.clear();
+
     sigenc_path = saved_sig; refused_path = saved_ref;
     sigenc_map.clear(); refused_enc.clear();
     printf("sigjoin arms=%d failures=%d\n", n, fails);
@@ -4570,10 +4634,18 @@ int main(int argc, char **argv)
              * amnesty this family exists to avoid.  Rows for other ISAs are
              * not this arm's to judge and are not counted.
              */
-            unsigned dead_alias = 0;
+            unsigned dead_alias = 0, sup_alias = 0;
             for (const auto &r : alias_rows) {
                 if (strcmp(r.isa, cfg.name)) continue;
                 if (r.hits) continue;
+                if (alias_superseded_by_refusal(r.cs)) {
+                    sup_alias++;
+                    printf("SUPERSEDED-ALIAS %s %s -> %s   (%s)\n"
+                           "    every encoding this arm decoded as `%s` is "
+                           "in the refused set\n",
+                           r.isa, r.cs, r.llvm, r.why, r.cs);
+                    continue;
+                }
                 dead_alias++;
                 printf("DEAD-ALIAS %s %s -> %s   (%s)\n",
                        r.isa, r.cs, r.llvm, r.why);
@@ -4583,8 +4655,9 @@ int main(int argc, char **argv)
                 printf("ALIAS-JOINED %-9lu %s -> %s   (%s)\n",
                        r.hits, r.cs, r.llvm, r.why);
             }
-            if (dead_alias)
-                printf("# srcenc_join dead_alias_rows=%u\n", dead_alias);
+            if (dead_alias || sup_alias)
+                printf("# srcenc_join dead_alias_rows=%u "
+                       "superseded_alias_rows=%u\n", dead_alias, sup_alias);
             if (getenv("ISAX_DUMP_REGCOV")) {
                 /* Settle this process's own tokens (a --jobs=1 run never
                  * forked, so nothing settled them on the shard path) and

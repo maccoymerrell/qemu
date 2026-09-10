@@ -1597,15 +1597,22 @@ void qemu_ident_shadow_report(GString *report)
  * With the STATED tier admitted, every reason a decode identity could
  * carry no class -- SPLIT, NAME_MATCHED, NONE, an id with no row -- reads
  * 0 on all four targets.  What is left is decode_id == 0: QEMU exported
- * NO identity, which it does deliberately when the translation it
- * generated is not the instruction it was asked about (a translation that
- * only RAISES; see the plugin-side rule).  A wrong-path walk reaches such
- * bytes and the tracer classifies them anyway, so the enum row is still
- * the answer for those and nothing else.
+ * NO identity.
  *
- * Measured at this tip over the w19 corpus, wp0 and wp16: 18 decodes on
- * two targets -- x86 `hlt` x12, aarch64 `udf` x6 -- and 0 everywhere
- * else.  That is the whole live dependency on the four
+ * THE REASON THAT USED TO STAND HERE WAS FALSE -- "a translation that
+ * only RAISES" -- and it is recorded rather than deleted because it is
+ * the shape this directory keeps catching: a justification nobody
+ * measured, sitting on top of a real defect.  A faulting translation
+ * publishes fine.  What is left after the measurement is a decode with NO
+ * ROW: aarch64 `udf` reaches unallocated_encoding() and decodetree emits
+ * plugin_gen_record_insn_identity() only at a pattern's own dispatch
+ * site, so no site is reached and nothing can be stated.
+ *
+ * Measured over the w19 corpus, wp0 and wp16, BEFORE the ordering fix: 18
+ * decodes on two targets -- x86 `hlt` x12, aarch64 `udf` x6.  The twelve
+ * were the ordering case and are gone; decode-new.c.inc now publishes at
+ * the row-selection point.  What is left is the aarch64 floor, and it is
+ * the whole live dependency on the four
  * champsim_tracer_mnemonics_<isa>.h tables.
  */
 static std::atomic<uint64_t> g_qid_enum_no_ident{0};

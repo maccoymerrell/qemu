@@ -1597,11 +1597,21 @@ uint64_t qemu_ident_adjudicated_hits(void);
  *
  * With QID_STATED admitted, every reason an identity could carry no class
  * -- SPLIT, NAME_MATCHED, NONE, an id with no row -- reads 0 on all four
- * targets.  What remains is decode_id == 0: QEMU exported NO identity,
- * which it does deliberately when the translation it generated is not the
- * instruction it was asked about, i.e. a translation that only RAISES.  A
- * wrong-path walk reaches such bytes, the tracer classifies them anyway,
- * and the enum row is the answer for those and for nothing else.
+ * targets.  What remains is decode_id == 0: QEMU exported NO identity.
+ *
+ * THE REASON THAT USED TO STAND HERE WAS FALSE and is recorded so it is
+ * not written again: "a translation that only RAISES" exports no identity.
+ * Measured, it does -- a load from an unmapped address is selected,
+ * published, and raises at execution.  What withholds an identity is a
+ * decode with NO ROW AT ALL (aarch64 `udf` falls to
+ * unallocated_encoding(), and decodetree only publishes at a pattern's own
+ * dispatch site), which is a floor no work on QEMU's side moves.  The
+ * ordering case that once shared this counter -- x86 `hlt`, whose
+ * chk(cpl0) arm jumped past the publish call -- is fixed at the source:
+ * decode-new.c.inc publishes where the row is selected.
+ *
+ * A wrong-path walk reaches rowless bytes, the tracer classifies them
+ * anyway, and the enum row is the answer for those and for nothing else.
  */
 uint64_t qemu_ident_enum_no_ident(void);
 

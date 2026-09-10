@@ -2890,6 +2890,55 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         goto unknown_op;
     }
 
+    /*
+     * THE ROW IS SELECTED HERE, AND HERE IS WHERE IT IS PUBLISHED.
+     *
+     * decode_insn() returned true and .gen is non-NULL, so QEMU has picked
+     * exactly one X86_OP_* row and is holding its slot and mnemonic.  Every
+     * check below this point is a question about the MACHINE -- CPUID
+     * features, CPL, IOPL, VM86, SMM -- and not about which instruction the
+     * bytes spell.  An encoding that fails one of them is still that
+     * instruction; it simply raises instead of executing.
+     *
+     * THIS USED TO SIT AFTER THOSE CHECKS, at the head of code generation,
+     * with the reason "doing it earlier would hand plugins an identity for
+     * an instruction that faults instead of executing".  That reason was
+     * measured and is false.  A faulting instruction publishes perfectly
+     * well: `movq (%rax),%rbx` with %rax=1 is selected, published, and
+     * raises at EXECUTION -- a two-probe A/B recorded zero withheld
+     * identities for it.  What withholds is a check sitting UPSTREAM of the
+     * publish call, and nothing else.  `hlt` is the whole population:
+     * [0xF4] = X86_OP_ENTRY0(HLT, chk(cpl0) svm(HLT)), and at CPL != 0 the
+     * chk(cpl0) arm below does `goto gp_fault` without ever reaching this
+     * line.  The same probe recorded three instructions with no identity
+     * exported -- QEMU knowing the answer and not being asked for it at a
+     * point where it still had it.
+     *
+     * The case that must NOT publish is the one where no row was selected
+     * at all: `.gen == NULL` reaches unknown_op above this comment, and a
+     * failed decode_insn() reaches illegal_op before that.  Neither passes
+     * through here, so "a row exists" and "an identity is stated" are the
+     * same condition by construction.
+     *
+     * The five qualifier publishes travel with the base row because they
+     * REFINE it -- grp0f01 in particular resolves 0F 01's shared slot into
+     * lgdt/lidt/monitor/swapgs, and those are exactly the cpl0-checked
+     * encodings whose identity would otherwise arrive unqualified on the
+     * faulting path.  They read only s->prefix, s->modrm and
+     * decode.immediate, all of them filled by decode_insn(), and they emit
+     * no TCG ops.  nop_operands_note() deliberately does NOT travel: it is
+     * a dataflow note about ops that are about to be generated, so it stays
+     * where the generation is.
+     */
+    plugin_gen_record_insn_identity(decode.e.slot, decode.e.mnemonic);
+    vex_ident_publish(decode.e.slot, (s->prefix & PREFIX_VEX) != 0);  /* vex_ident */
+    cet_ident_publish(decode.e.slot,
+                      (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
+    prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
+    threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
+    grp0f01_ident_publish(decode.e.slot,
+                          (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* grp0f01_ident */
+
     if (!has_cpuid_feature(s, decode.e.cpuid)) {
         goto illegal_op;
     }
@@ -3022,19 +3071,11 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     }
 
     /*
-     * Every #UD / #GP check is behind us and this is the row QEMU is
-     * about to generate code from, so it is the row to publish.  Doing
-     * it earlier would hand plugins an identity for an instruction that
-     * faults instead of executing.
+     * The identity was published at the row-selection point above, before
+     * the first fault arm; see the comment there for why.  What is left
+     * here is the dataflow note, which belongs beside the generation it
+     * describes.
      */
-    plugin_gen_record_insn_identity(decode.e.slot, decode.e.mnemonic);
-    vex_ident_publish(decode.e.slot, (s->prefix & PREFIX_VEX) != 0);  /* vex_ident */
-    cet_ident_publish(decode.e.slot,
-                      (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* cet_ident */
-    prefetch_ident_publish(decode.e.slot, s->modrm);  /* prefetch_ident */
-    threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
-    grp0f01_ident_publish(decode.e.slot,
-                          (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* grp0f01_ident */
     nop_operands_note(s, &decode);  /* nop_operands */
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&

@@ -206,14 +206,18 @@ def roll(files, label):
     # below carry their bound in the label; this one carried nothing, and a
     # column with no marker sitting between two that have one was read as a
     # fourth must-be-0 and reported as a defect twice.  It is not in `bad`
-    # below either, and that was never an oversight: QEMU withholds an
-    # identity when the translation it generated is not the instruction it
-    # was asked about -- a translation that only RAISES -- so `hlt` and `udf`
-    # export none, a wrong-path walk reaches such bytes, and the count is
-    # EXPECTED non-zero on exactly the arms that walk them.  The route is
-    # named here so the number cannot be mistaken for a bound again.
+    # below either, and that was never an oversight.  THE REASON PRINTED
+    # HERE USED TO BE FALSE: "a translation that only RAISES exports none".
+    # Measured, a faulting translation publishes perfectly well.  The route
+    # that genuinely exports no identity is a decode with NO ROW -- aarch64
+    # `udf` reaching unallocated_encoding(), where decodetree has no
+    # pattern dispatch site to publish from -- so a wrong-path walk over
+    # such bytes makes this count EXPECTED non-zero on exactly the arms
+    # that walk them.  (`hlt` used to be counted here too; that was an
+    # ORDERING defect in decode-new.c.inc, fixed at the source.)  The route
+    # is named here so the number cannot be mistaken for a bound again.
     print("  no identity exported (id==0)   %10d   "
-          "(NOT a must-be-0: a translation that only RAISES exports none)"
+          "(NOT a must-be-0: a decode with NO ROW exports none)"
           % t["noid"])
     print("  id carried, NO ROW (must be 0) %10d" % t["norow_tbl"])
     print("  row found, NAME DISAGREES (0)  %10d" % t["namedis"])
@@ -407,18 +411,23 @@ def selftest(scratch=None):
     # asserted: the classification (a non-zero noid still CLOSES, beside a
     # non-zero `norow_tbl` that must not) and the label (the line names the
     # raise-only route, so the number cannot be re-mistaken by eye).
-    raiseonly = os.path.join(tmp, "raiseonly")
-    os.makedirs(raiseonly, exist_ok=True)
+    norow = os.path.join(tmp, "norow")
+    os.makedirs(norow, exist_ok=True)
     for arm in ("wp0", "wp16"):
-        _sidecar(os.path.join(raiseonly, "r_%s.stats.log" % arm),
+        _sidecar(os.path.join(norow, "r_%s.stats.log" % arm),
                  noid=10 if arm == "wp16" else 0)
-    rcM, outM = _run([raiseonly])
+    rcM, outM = _run([norow])
     check("M a NON-ZERO noid still CLOSES -- it is not a must-be-0",
           rcM == 0 and "ROLL-UP DOES NOT CLOSE" not in outM, "rc=%s" % rcM)
-    check("M2 and the line NAMES the raise-only route rather than a bound",
+    # M2 GUARDS THE CORRECTION, NOT THE OLD WORDING.  The route this line
+    # must name is a decode with NO ROW; the string it must NOT carry is the
+    # refuted "only RAISES" reason, so the assertion tests both directions.
+    check("M2 and the line NAMES the no-row route rather than a bound, "
+          "and does not restate the refuted raise-only reason",
           "no identity exported (id==0)" in outM
           and "NOT a must-be-0" in outM
-          and "only RAISES" in outM)
+          and "NO ROW" in outM
+          and "only RAISES" not in outM)
 
     print("failures=%d" % fails)
     if scratch is None:

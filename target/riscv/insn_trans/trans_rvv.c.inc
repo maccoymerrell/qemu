@@ -192,6 +192,39 @@ static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
 
     dst = dest_gpr(s, rd);
 
+    /*
+     * `vsetvl` WITH rs1 == x0 READS x0, AND NEITHER ARM BELOW LOADS IT.
+     *
+     * The RISC-V V spec gives rs1 == x0 two meanings and QEMU implements
+     * both without an operand read: with rd == x0 too the AVL is "keep the
+     * current vl" and the arm copies cpu_vl, and otherwise it is "set vl to
+     * VLMAX" and the arm substitutes a constant.  get_gpr() is reached only
+     * on the third arm, so on the first two the accessor's zero-register
+     * note is never taken and QEMU's read list does not mention x0.
+     *
+     * The ENCODING names rs1 in its bit field either way -- R7.3 says a
+     * register the encoding names is not the emulator's to drop, and R15
+     * says resolving it at translation time is a lowering decision and not
+     * architectural truth.  THE PRIMITIVE IS THE ONE `mips-zero-operand-fold`
+     * IS RULED ON, at the site that ruling cites: OPC_AND and OPC_MUL take
+     * insn_dataflow_note_folded_read_zero() when the encoding names $zero and
+     * the fold means no accessor ever loads it, and the C.MV arm of
+     * trans_rvi.c.inc takes the same note on this target for the same reason.
+     * What that note states is the ZERO REGISTER READ; whether the OTHER
+     * operand of a fold survives is a separate question those classes answer
+     * separately, and no operand of this instruction is dropped here.
+     *
+     * `note_vector_config_read()`'s own header records why vsetvl/vsetvli/
+     * vsetivli are excluded from the REG_VCTRL reading, and `rv-vector-control`
+     * is RULED on exactly that -- with a lost-register regex that excludes
+     * REG_ZERO, so this read is left to be stated rather than adjudicated.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (rs1 == 0) {
+        insn_dataflow_note_folded_read_zero();
+    }
+
     if (rd == 0 && rs1 == 0) {
         s1 = tcg_temp_new();
         tcg_gen_mov_tl(s1, cpu_vl);

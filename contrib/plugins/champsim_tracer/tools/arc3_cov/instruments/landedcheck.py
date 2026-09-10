@@ -346,9 +346,47 @@ def score(classes, arm, isas, wps, bar, qemu_root, base=None, out=sys.stdout):
               "unmeasured class reads exactly like a finished one." % unscored,
               file=out)
     if not rows_out:
+        # THE ZERO-SUBJECT ARM (FINDING 91-C).  A table with no
+        # QEMU-STATES-IT row has two entirely different causes and they do not
+        # get the same answer.
+        #
+        # The one this refusal was written for: a table that is INCOMPLETE.
+        # Rows are still BLOCKED, or the dispositions do not add up, and every
+        # verdict this instrument would print below is vacuous because the
+        # population it scores has not been decided yet.  That still REFUSES,
+        # and it must: a check that cannot find its subject may not report
+        # all-clear (the standing rule, and #235/#238's vacuity guard is the
+        # same shape).
+        #
+        # The other is the ARC'S OWN GOAL STATE, and refusing it made the
+        # eight-step barscore green unreachable by construction: every class
+        # in the table is RULED, none is BLOCKED, and none says QEMU is short.
+        # There is no QEMU-STATES-IT row because there is nothing left for
+        # QEMU to state.  That is a POSITIVE ledger fact, and it is asserted
+        # positively here rather than inferred from an absence: STATES-IT == 0
+        # AND RULED == total AND BLOCKED == 0.  An absence alone proves
+        # nothing -- a table truncated to zero rows also has no STATES-IT row
+        # -- so `total` must be non-zero and must equal RULED exactly.
+        n = collections.Counter(k["disp"] for k in classes)
+        total = sum(n.values())
+        ruled, blocked = n.get("RULED", 0), n.get("BLOCKED", 0)
+        if total and ruled == total and blocked == 0:
+            print("  NO QEMU-STATES-IT ROWS, AND THE LEDGER SAYS WHY: "
+                  "%d class(es), RULED %d, BLOCKED %d, QEMU-STATES-IT 0.  "
+                  "Every class is adjudicated and none is waiting on a QEMU "
+                  "statement, so this instrument has no subject BECAUSE its "
+                  "subject is finished -- not because it could not look."
+                  % (total, ruled, blocked), file=out)
+            print("", file=out)
+            print("LANDED-STATEMENT CHECK: PASS (ZERO SUBJECT) -- the "
+                  "positive ledger statement holds", file=out)
+            return 0
         print("  NO QEMU-STATES-IT ROWS -- REFUSING: this instrument's whole "
               "subject is that disposition, and a table with none of it makes "
-              "every verdict below vacuous", file=out)
+              "every verdict below vacuous.  The zero-subject PASS needs the "
+              "POSITIVE ledger statement and this table does not carry it: "
+              "%d class(es), RULED %d, BLOCKED %d."
+              % (total, ruled, blocked), file=out)
         return 2
     print("", file=out)
     if reds:
@@ -516,12 +554,28 @@ def selftest(tmp):
     check("an unscorable WSTQ row is not a losing subject",
           rc == 0 and "EMPTIED" in o)
 
-    # ARM 7 -- a table with no QEMU-STATES-IT row REFUSES rather than passing.
+    # ARM 7 -- THE ZERO-SUBJECT SPLIT (FINDING 91-C), BOTH DIRECTIONS.  "No
+    # QEMU-STATES-IT row" is two different states and the arm has to
+    # discriminate them, or the PASS half is just the refusal with the guard
+    # removed.
+    #
+    # 7a: every class RULED, none BLOCKED -- the arc's own goal state.  The
+    #     positive ledger statement holds, so this PASSES and says so.
+    # 7b: the same table with one BLOCKED class added -- the ledger is not
+    #     finished, so the refusal stands.  Without this half, 7a alone would
+    #     accept any table whose STATES-IT column happens to be empty.
     RULED = list(CLEAN); RULED[5] = "RULED"
-    rc, o = run([_row("mipsel", "aa", "mc", "r_c", "REG_B", "REG_B")],
-                [tuple(RULED)], srcA=[("aa", "mc", "REG_A")],
-                srcB=[("aa", "mc", "")])
-    check("a table with no QEMU-STATES-IT row REFUSES", rc == 2)
+    ROWS = [_row("mipsel", "aa", "mc", "r_c", "REG_B", "REG_B")]
+    SRC = dict(srcA=[("aa", "mc", "REG_A")], srcB=[("aa", "mc", "")])
+    rc, o = run(ROWS, [tuple(RULED)], **SRC)
+    check("7a all-RULED / none-BLOCKED PASSES as a finished subject",
+          rc == 0 and "ZERO SUBJECT" in o and "RULED 1, BLOCKED 0" in o)
+    BLOCKED = list(CLEAN)
+    BLOCKED[0] = "zz-open"; BLOCKED[5] = "BLOCKED"
+    BLOCKED[7] = "what does QEMU state for this family?"
+    rc, o = run(ROWS, [tuple(RULED), tuple(BLOCKED)], **SRC)
+    check("7b one BLOCKED class still REFUSES (the ledger is not finished)",
+          rc == 2 and "does not carry it" in o)
 
     # ARM 8 -- a missing corpus REFUSES rather than scoring zero rows.
     try:

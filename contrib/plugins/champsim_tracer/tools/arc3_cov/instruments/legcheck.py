@@ -167,6 +167,29 @@ RECORD_ROW_RE = re.compile(
     r'(\d+)\s*(?:/\s*)?(\d+)\s+(\d+)\b', re.M)
 #: The record's own claim about how many legs it is transcribing.
 CLAIM_RE = re.compile(r'GATE\s+PASSED\s*--\s*(\d+)\s+legs', re.M)
+#: THE MARKER (FINDING 91-B).  A commit either DECLARES that it carries a leg
+#: record or it does not, and the declaration is this line, on its own, in the
+#: commit message:
+#:
+#:     R13-LEG-RECORD
+#:
+#: WHY A MARKER AND NOT THE GATE'S OWN VERDICT LINE.  There is no in-tree list
+#: of which commits carry a leg record, so the selection rule anyone reaches
+#: for is a grep for `GATE PASSED -- N legs` -- the same string CLAIM_RE keys
+#: on.  Measured over the four matches after 056ba4a202: two are genuine
+#: records and PASS, and two -- 9f0c5a03c0 and 5cc599d67c -- FAIL M1, M2 and
+#: M3 while being entirely honest.  Each QUOTES the gate's verdict line inside
+#: a selftest transcript, to show that a new gate row discriminates.  Neither
+#: claims a leg record and neither owes one.  A check that convicts a
+#: quotation is a check whose SUBJECT is wrong, not a check that found a
+#: defect, and `barscore` step 6 was primed to go red on exactly that.
+#:
+#: The marker makes the claim explicit, so a message can quote anything it
+#: likes.  It is required of every commit that moves the wire (the in-commit
+#: leg rule), and a commit that carries the marker is then held to all three
+#: rows.  A commit named to --message WITHOUT it is not judged as a record;
+#: it is reported as unmarked, which is a different sentence.
+MARKER_RE = re.compile(r'^\s*R13-LEG-RECORD\s*$', re.M)
 #: A record that TRANSCRIBES another commit's run rather than reporting its
 #: own.  Its TREE= is the tree that commit carries, because that is the tree
 #: the legs in the table were measured at.
@@ -408,11 +431,40 @@ def check_message(repo, commit, manifest, want_tree=True, bindings=None):
     # unknown row rather than silently matching nothing.
     known = set(l for l, _ in manifest)
     record_rows = [r for r in rows if r[0] in known]
-    if not claim and not record_rows:
-        return ['%s: carries no R13 leg record (no "GATE PASSED -- N legs" '
-                'line and no manifest leg rows).  A commit named to '
-                '--message is a commit claimed to carry one, and a check '
-                'that cannot find its subject FAILS' % commit[:12]]
+    # M0 MARKED (FINDING 91-B), AND IT RUNS FIRST BECAUSE IT DECIDES WHETHER
+    # THE OTHER THREE HAVE A SUBJECT AT ALL.  Without the marker there is
+    # nothing here claiming to be a leg record, whatever the message quotes,
+    # and M1/M2/M3 would be scoring a transcript somebody pasted to prove a
+    # selftest fires.  That is reported as UNMARKED rather than as three
+    # failures -- and it is still a failure, because --message names a commit
+    # asserted to carry a record: if it does not, the assertion was wrong and
+    # a check that cannot find its subject does not pass.
+    marked = bool(MARKER_RE.search(text))
+    if not marked and not record_rows:
+        # THE QUOTATION.  No marker, and no row naming a leg the manifest
+        # knows -- so the only thing here that looks like a record is the
+        # verdict LINE, quoted.  Scoring it on M1/M2/M3 would convict a
+        # message for being accurate about somebody else's run.
+        #
+        # This shape is also how the check stays correct over HISTORY.  The
+        # marker rule starts here, and every record written before it carries
+        # its rows; so "unmarked WITH rows" is a legacy record and is scored
+        # exactly as it always was, while "unmarked WITHOUT rows" is the
+        # quotation and is named as one.  No date, no cutoff commit, and
+        # nothing to keep in step with the branch.
+        return ['%s: UNMARKED -- no `R13-LEG-RECORD` line and no manifest '
+                'leg rows%s.  Nothing here claims to be a leg record, so '
+                'M1/M2/M3 have no subject; a commit that OWES one (every '
+                'commit that moves the wire) must carry the marker and the '
+                'rows'
+                % (commit[:12],
+                   ', though the message does quote the gate verdict line'
+                   if claim else '')]
+    if marked and not claim and not record_rows:
+        return ['%s: marked `R13-LEG-RECORD` but carries no record (no '
+                '"GATE PASSED -- N legs" line and no manifest leg rows).  '
+                'The marker is the claim, and a check that cannot find its '
+                'subject FAILS' % commit[:12]]
 
     stray = seen - want
     if stray:
@@ -725,7 +777,7 @@ def selftest():
           'full record\n\n    static     x86_64      47 / 47     6225 scored\n'
           '    pin        x86_64     259 / 259  395854\n'
           '\n    GATE PASSED -- 2 legs, every headline at or under its '
-          'ceiling\n\nTREE=%s\n' % full_tree)
+          'ceiling\n\nR13-LEG-RECORD\nTREE=%s\n' % full_tree)
         fullc = g('rev-parse', 'HEAD')
         r = check_message(repo, fullc, man)
         if r:
@@ -755,7 +807,7 @@ def selftest():
                 '    static     x86_64      47 / 47     6225 scored\n'
                 '    pin        x86_64     259 / 259  395854\n'
                 '\n    GATE PASSED -- 2 legs, every headline at or under its '
-                'ceiling\n\nTREE=%s\n')
+                'ceiling\n\nR13-LEG-RECORD\nTREE=%s\n')
 
         with open(mpath, 'w') as f:          # the OLD manifest: two legs
             f.write('# c\nstatic\tx86_64\tr\t0\t0\t-\tj\n'
@@ -789,6 +841,51 @@ def selftest():
             fails.append('arm16b a record written AFTER the leg landed must '
                          'FAIL naming it: %s' % r)
 
+        # ------------------------------------------- FINDING 91-B arms
+        # ARM 17 -- THE QUOTATION AND THE RECORD, and the whole point is that
+        # they are the SAME TEXT.  17a is a commit whose message quotes the
+        # gate's verdict line inside a selftest transcript and carries no
+        # marker: it must be reported UNMARKED, and it must NOT be convicted
+        # on M1/M2/M3, because it never claimed to be a record.  17b is the
+        # SAME body with the marker line added: now it IS a claim, so the
+        # incompleteness M1/M2 exist for has to be caught.  Without 17b the
+        # marker would just be a way to opt out of the check.
+        quote = ('a gate row that discriminates\n\n'
+                 '    transcript, quoted to show the new row fires:\n'
+                 '      GATE PASSED -- 2 legs, every headline at or under '
+                 'its ceiling\n')
+        with open(os.path.join(repo, 'q'), 'w') as f:
+            f.write('q')
+        g('add', 'q')
+        g('commit', '-q', '-m', quote)
+        quoted_c = g('rev-parse', 'HEAD')
+        r = check_message(repo, quoted_c, man)
+        if not any('UNMARKED' in x for x in r):
+            fails.append('arm17 a quotation with no marker must read '
+                         'UNMARKED: %s' % r)
+        if any(('M1 CLAIMED' in x or 'M2 COMPLETE' in x or 'M3 TREED' in x)
+               for x in r):
+            fails.append('arm17b a quotation must NOT be convicted on M1/M2/'
+                         'M3 -- it never claimed to be a record: %s' % r)
+        g('commit', '-q', '--amend', '-m', quote + '\nR13-LEG-RECORD\n')
+        marked_c = g('rev-parse', 'HEAD')
+        r = check_message(repo, marked_c, man)
+        if any('UNMARKED' in x for x in r):
+            fails.append('arm17c the same body WITH the marker is a claim '
+                         'and must be scored: %s' % r)
+        if not any('M2 COMPLETE' in x for x in r):
+            fails.append('arm17d a marked message printing no manifest row '
+                         'must FAIL M2 -- the marker is not an opt-out: %s'
+                         % r)
+        # ARM 17e -- THE LEGACY RECORD.  Every leg record written before the
+        # marker rule carries its ROWS, so an unmarked message WITH rows is
+        # scored exactly as it always was.  Without this the marker would be
+        # a retroactive conviction of every record already on the branch.
+        r = check_message(repo, short, man)
+        if any('UNMARKED' in x for x in r):
+            fails.append('arm17e an unmarked message WITH manifest rows is a '
+                         'legacy record and must still be scored: %s' % r)
+
     # ONE LINE PER ARM, in the runner's own grammar (selftest_all.sh's
     # count_arms).  A selftest that prints only a total renders identically
     # to one that asserts nothing, and this directory's runner scores that
@@ -808,7 +905,8 @@ def selftest():
              'a record printing fewer legs than the manifest fails',
              'a complete record naming its own tree passes',
              'RECORD-COMPLETED-BY pointing at an incomplete record fails',
-             'the manifest is read as of the record\'s own tree']
+             'the manifest is read as of the record\'s own tree',
+             'an unmarked quotation reads UNMARKED, and marking it makes it a claim']
     hit = set()
     for f in fails:
         print('SELFTEST FAIL: %s' % f)

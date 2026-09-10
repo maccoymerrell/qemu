@@ -400,15 +400,26 @@ void append_stats_summary(GString *report, const char *label,
          * the R14 replacement would decide on the same population.  See
          * TracerStats::decode_fail_ab_*.  The correct-path cells are an
          * invariant for the same reason the row above is; the wrong-path
-         * cells are a measurement. */
-        { "  both decoders refused (CP / must be 0)",
+         * cells are a measurement.
+         *
+         * THE SPELLING OF "(must be 0)" IS NOT FREE, and these three rows
+         * were written wrong first.  The validator's census parses a
+         * declaring label with `^(?P<label>.*\(must be 0\))\s+(\d+)$` --
+         * the marker has to be the label's LAST parenthesis and nothing
+         * else may sit inside it.  Spelled "(CP / must be 0)" they read as
+         * an invariant to a human and were invisible to the gate that
+         * enforces invariants: the promise without the enforcement, which
+         * is this tree's standing failure mode.  Keep the marker last and
+         * put the qualifier before it.
+         */
+        { "  both decoders refused, correct path (must be 0)",
                                         stats.decode_fail_ab_both_cp },
         { "  both decoders refused (WP)", stats.decode_fail_ab_both_wp },
-        { "  Capstone alone refused, QEMU decoded (CP / must be 0)",
+        { "  Capstone alone refused, QEMU decoded it, correct path (must be 0)",
                                         stats.decode_fail_ab_capfail_only_cp },
         { "  Capstone alone refused, QEMU decoded (WP)",
                                         stats.decode_fail_ab_capfail_only_wp },
-        { "  QEMU alone refused, Capstone named it (CP / must be 0)",
+        { "  QEMU alone refused, Capstone named it, correct path (must be 0)",
                                         stats.decode_fail_ab_qemuonly_cp },
         { "  QEMU alone refused, Capstone named it (WP)",
                                         stats.decode_fail_ab_qemuonly_wp },

@@ -1015,7 +1015,7 @@ separate flavour of WP non-determinism — multiple distinct
 speculator wandered into stack / heap / data and decoded *bytes*
 as "instructions" — is handled.  The translation-time
 poison detector (see :ref:`poison-detection` in the architecture
-doc) catches Capstone decode failures before any divergent fragment
+doc) catches undecodable bytes before any divergent fragment
 can reach the chain assembler, and revision minting is gated to
 correct-path-confirmed translations, so a speculative wander never
 adds a template.  The BB cache therefore stays canonical regardless

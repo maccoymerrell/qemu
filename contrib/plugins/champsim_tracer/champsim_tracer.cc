@@ -182,7 +182,7 @@ std::unordered_map<uint64_t, uint32_t> &g_first_insn_word =
     *new std::unordered_map<uint64_t, uint32_t>();
 
 /* TB start_pcs that have been detected as carrying non-stable
- * instruction bytes (Capstone decode failure — see detect_tb_poison).
+ * instruction bytes (no decode rule matched — see detect_tb_poison).
  * WP speculation refuses to enter these; subsequent translation
  * re-attempts at the same start_pc skip fragment materialization.
  * Persistent across WP simulations AND tb_flush (see vcpu_tb_flush). */
@@ -10473,9 +10473,10 @@ struct TbPoison {
 
 /*
  * Detect non-stable "instruction" memory before committing this TB as a
- * fragment.  Only one signal poisons: Capstone decode failure on any
- * canonical insn (empty mnemonic) — the bytes don't parse as a valid
- * instruction of this ISA, so they cannot be real code.  Poisoning the
+ * fragment.  Only one signal poisons: the target decoder matched no
+ * translation rule for a canonical insn (qemu_plugin_insn_undecoded) —
+ * the bytes are not a valid instruction of this ISA on the machine that
+ * would execute them, so they cannot be real code.  Poisoning the
  * TB's start_pc makes the WP walker bail before re-entering it, and
  * short-circuits fragment creation on subsequent translations.  Decode
  * failure also fires on perfectly stable .rodata that the R-E LOAD
@@ -10596,48 +10597,57 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                 g_first_insn_word.emplace(ipc, word);
             }
             /*
-             * R14's SECOND ADMISSION GATE, and the one that is easy to
-             * miss: the consult at build_canonical_insns decides what an
-             * instruction IS, and this decides whether its whole basic
-             * block enters the trace at all.  Both read the same Capstone
-             * answer, so a removal that retires the first and leaves this
-             * one reading mnemonic[0] refuses every block on a
-             * Capstone-free build, where the field is empty by
-             * construction.
+             * BLOCK ADMISSION, ON THE TARGET DECODER'S OWN WORD.  The
+             * consult at build_canonical_insns decides what an instruction
+             * IS; this decides whether its whole basic block enters the
+             * trace at all.  The question the gate asks is "did anything
+             * decode these bytes as instructions" — and the authority for
+             * that answer is the decoder that would execute them.
+             * qemu_plugin_insn_undecoded() is exactly that word: no
+             * translation rule matched.  See its declaration for why it is
+             * a different fact from translation_refused.
              *
-             * IT IS NOT DEAD, and a wpdepth=16 battery is not powerful
-             * enough to say that it is.  Measured at this tip over the
-             * four-ISA wire corpus (exec38/poison), correct-path row 0 on
-             * all four as the invariant requires, wrong-path row:
+             * The route is live and refuses real wrong-path blocks — a
+             * wpdepth=16 battery is not powerful enough to say otherwise.
+             * Measured over the four-ISA wire corpus (exec38/poison),
+             * correct-path row 0 on all four as the invariant requires,
+             * wrong-path row under the Capstone predicate:
              *
              *     wpdepth=64     aarch64 1   mipsel 3   riscv64 0   x86_64 0
              *     wpdepth=4096   aarch64 2   mipsel 0   riscv64 1   x86_64 1
              *
-             * So this route really refuses wrong-path blocks, on three of
-             * the four ISAs, and deleting it would silently admit them
-             * with no decode behind them.  It needs a QEMU-SOURCED
-             * replacement, not a deletion and not a re-spelling:
-             * decode_id == 0 is NOT that replacement, because QEMU
-             * legitimately records no identity for instructions the
+             * so a deletion — as opposed to this re-sourcing — would
+             * silently admit blocks with no decode behind them.
+             *
+             * decode_id == 0 is NOT the QEMU-sourced answer and never was:
+             * QEMU legitimately records no identity for instructions the
              * correct path executes (12 on x86_64, 6 on aarch64 in the
              * same corpus), so keying on it would poison real blocks.
-             */
-            /*
-             * THE QEMU-SOURCED ANSWER TO THE SAME QUESTION, MEASURED
-             * BESIDE THE ACTING ONE.  qemu_plugin_insn_undecoded() is
-             * the target decoder's own word that no rule matched these
-             * bytes.  It is the candidate replacement for the test
-             * below, and this is the 2x2 that says what replacing would
-             * cost -- see qemu_plugin_insn_undecoded() for why it is a
-             * different fact from translation_refused, and
-             * TracerStats::decode_fail_ab_* for what each cell means.
+             * `undecoded` is a narrower fact — not "no identity exported"
+             * but "no rule matched" — and it is 0 on the correct path on
+             * every ISA measured.
              *
-             * SCORED, NOT ACTING.  The gate below is unchanged; the flip
-             * is a wire change and it does not get to happen as a side
-             * effect of the measurement that justifies it.
+             * WHAT THE RE-SOURCING COST, ENUMERATED.  The 2x2 below ran
+             * beside the Capstone predicate for a full pass before the
+             * acting side moved, so the movement is a measurement and not
+             * a hope.  wpdepth=4096, as both / Capstone-only / QEMU-only:
              *
-             * ONE READ, TWO CONSUMERS -- and that is not tidying.  This
-             * block first shipped with its OWN copy of the acting
+             *     x86_64  0/1/0   aarch64 2/0/4   riscv64 0/1/0   mipsel 0/3/0
+             *     correct path 0/0/0 on all four
+             *
+             * Nine encodings move, and both directions move TOWARD the
+             * decoder that executes them.  The five Capstone-only refusals
+             * (x86 1, riscv 1, mipsel 3) are blocks QEMU decodes and runs;
+             * refusing them was the gate paying for a Capstone gap, and
+             * they are now admitted.  The four QEMU-only (aarch64) are
+             * bytes no aarch64 decode rule matches and Capstone renders
+             * anyway; admitting them was the gate over-trusting an
+             * offline disassembler, and they are now refused.  The
+             * correct-path row is 0 on both predicates, so no executed
+             * block changes status on any ISA.
+             *
+             * ONE READ, TWO CONSUMERS -- and that is not tidying.  The
+             * census block first shipped with its OWN copy of the acting
              * predicate's expression, and the R14 deletion census counts
              * SITES: `mnemonic[0]` is the one idiom nocapstone_gate.sh
              * greps for an admission gate, and capfield_census.sh counts
@@ -10647,16 +10657,15 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
              * BACKWARD because a measurement of that distance had been
              * added to the tree.  An instrument that changes the number it
              * reports is the shape this directory exists to refuse, so the
-             * read is taken once, here, and the acting test below consumes
-             * the same value.  Its verdict is unchanged by construction:
-             * `capfail` IS the expression the test used to spell out, and
-             * neither operand has a side effect for the short circuit to
-             * have been hiding.
+             * Capstone read is taken once, here, and the census consumes
+             * that value.  It is now scored-only: on a Capstone-free build
+             * `capfail` is false by construction and the gate is unmoved,
+             * which is the property the whole re-sourcing exists to buy.
              */
             const bool capfail =
                 cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0];
+            const bool qemufail = insn_undecoded && insn_undecoded[ci];
             {
-                bool qemufail = insn_undecoded && insn_undecoded[ci];
                 if (capfail && qemufail) {
                     (spec ? g_stats.decode_fail_ab_both_wp
                           : g_stats.decode_fail_ab_both_cp)++;
@@ -10668,11 +10677,11 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                           : g_stats.decode_fail_ab_qemuonly_cp)++;
                 }
             }
-            if (!p.poisoned && capfail) {
+            if (!p.poisoned && qemufail) {
                 p.poisoned = true;
                 p.decode_fail = true;
                 p.pc = ipc;
-                p.reason = "Capstone decode failure";
+                p.reason = "no decode rule matched";
             }
         }
         if (p.poisoned && !spec) {

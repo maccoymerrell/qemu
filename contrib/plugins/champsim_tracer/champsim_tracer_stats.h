@@ -1298,7 +1298,7 @@ struct Stats {
 
     /*
      * Basic blocks REFUSED because the boundary could not decode one of
-     * their instructions (detect_tb_poison's "Capstone decode failure").
+     * their instructions (detect_tb_poison's "no decode rule matched").
      * The refusal is whole-block: a single undecodable byte sequence
      * costs every instruction around it in the same TB, not just itself.
      * Counted because it was previously invisible -- a guest function

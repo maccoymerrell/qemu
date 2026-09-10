@@ -2359,9 +2359,13 @@ Translation-time poison detection
 Before materializing a fragment, ``vcpu_tb_trans`` runs two
 stability checks on every canonical insn in the candidate TB:
 
-* **Capstone decode failure** — an empty mnemonic means the bytes
-  do not parse as a valid instruction for the target ISA.  Real
-  code does not fail to decode.
+* **Undecoded instruction** — ``qemu_plugin_insn_undecoded()`` is
+  the target front end's own word that no translation rule matched
+  these bytes, so they are not a valid instruction for this ISA on
+  the machine that would execute them.  Real code does not fail to
+  decode.  The authority is deliberately the decoder that executes
+  the guest rather than an offline disassembler: the two disagree
+  in both directions, and only one of them is what the CPU does.
 * **Byte change since first sighting** — every per-PC 4-byte
   instruction word is memoized in ``g_first_insn_word`` on first
   observation.  A subsequent translation of the same PC whose bytes
@@ -2376,7 +2380,7 @@ stability checks on every canonical insn in the candidate TB:
   self-modification, the revision-minting seam at true-BB commit turns
   it into a new template revision (see :ref:`smc-revisions`).
 
-The **Capstone decode failure** signal poisons the TB's ``start_pc``
+The **undecoded instruction** signal poisons the TB's ``start_pc``
 (adding it to ``g_poisoned_pcs``); the fragment is *not* created and
 no exec-cb ``udata`` is registered for the TB.  Subsequent WP walks
 check ``cst_pc_is_poisoned`` at the top of each iteration (excursion

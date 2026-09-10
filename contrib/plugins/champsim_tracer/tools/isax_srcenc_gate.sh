@@ -69,13 +69,27 @@ usage() {
 }
 
 # One arm.  $1 layer tag, $2 isa, $3 build, $4 out, $5 corpus file or "",
-# $6 refused-set file or "".
+# $6 refused-set file or "", $7 (signature, encoding) pair file or "".
+#
+# THE PAIR FILE IS THE OTHER ARM'S OUTPUT (FINDING 94-A).  `--refused` says
+# which encodings QEMU refuses AT THIS BUILD; the pair file says which
+# encodings made each signature AT THE BASE BUILD, and the join of the two
+# is the only way to see a rule whose MNEMONIC survived a flip while its
+# SIGNATURE did not.  So the two files are stamped for DIFFERENT builds on
+# purpose, and `--sig-enc-so` is the caller naming which -- ISAX_SIGENC_SO
+# here, set by whoever captured the pairs.  isaxcheck refuses without it.
 arm() {
-    local layer=$1 isa=$2 build=$3 out=$4 corpus=$5 refused=${6:-}
+    local layer=$1 isa=$2 build=$3 out=$4 corpus=$5 refused=${6:-} pairs=${7:-}
     local tools; tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     local se=() extra=()
     [ -n "$corpus" ] && se=(--srcenc="$corpus")
     [ -n "$refused" ] && se+=(--refused="$refused")
+    [ -n "$pairs" ] && se+=(--sig-enc="$pairs" --sig-enc-so="${ISAX_SIGENC_SO:-}")
+    # THE BASE-ARM CAPTURE.  Same sweep, one extra output: the pairs behind
+    # every signature an allowlist rule could name.  Written per shard and
+    # merged below, because the sweep forks.
+    [ -n "${ISAX_SIGENC_DUMP:-}" ] && \
+        se+=(--dump-sig-enc="$ISAX_SIGENC_DUMP/${layer}_$isa.pairs")
     local allow
     if [ "$layer" = fields ]; then
         allow=$tools/isaxcheck_fields_allow.txt
@@ -86,7 +100,28 @@ arm() {
     "$build/contrib/plugins/isaxcheck" --isa="$isa" --check \
         --jobs="${ISAX_JOBS:-12}" "${se[@]}" "${extra[@]}" \
         --allow="$allow" > "$out/${layer:0:1}_$isa.txt" 2>&1
-    return $?
+    local r=$?
+    if [ -n "${ISAX_SIGENC_DUMP:-}" ]; then
+        # MERGE THE SHARDS, STAMP, AND COUNT.  The `#so` names the build the
+        # pairs describe and `#sigenc` the number of rows, so a truncated or
+        # appended file is a refusal on the consuming side rather than a
+        # quieter join.  A capture that produced no pairs is left EMPTY of
+        # rows with the count 0 -- isaxcheck refuses such a file, which is
+        # the right answer: a signature population that saw nothing cannot
+        # supersede anything.
+        local d=$ISAX_SIGENC_DUMP m=$ISAX_SIGENC_DUMP/$isa.$layer.sigenc.tsv
+        local bso; bso=$(sha256sum \
+            "$build/contrib/plugins/libchampsim_tracer.so" | cut -c1-16)
+        cat "$d/${layer}_$isa.pairs".* 2>/dev/null | sort -u > "$d/.merge.$$"
+        { printf '#so\t%s\n' "$bso"
+          printf '#sigenc\t%s\n' "$(wc -l < "$d/.merge.$$")"
+          cat "$d/.merge.$$"; } > "$m"
+        rm -f "$d/.merge.$$" "$d/${layer}_$isa.pairs".*
+        echo "sigenc-dump $isa $layer so=$bso pairs=$(grep -vc '^#' "$m")" \
+             "signatures=$(grep -v '^#' "$m" | cut -f1 | sort -u | wc -l)" \
+             >> "$out/rc.txt"
+    fi
+    return $r
 }
 
 run_arms() {
@@ -209,7 +244,25 @@ run_arms() {
             fi
         fi
         for layer in boundary fields; do
-            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused"; r=$?
+            # THE BASE ARM'S PAIRS FOR THIS (isa, layer), IF ONE WAS HANDED
+            # OVER.  Absent is not a failure -- the per-MNEMONIC category
+            # still runs and the finer one simply has no input, which the
+            # summary line reports as superseded_by_sig=0 rather than as a
+            # zero it earned.  A file present WITHOUT ISAX_SIGENC_SO is a
+            # refusal, and isaxcheck makes it: the caller must name the
+            # build the pairs describe, because the corpus's own stamp is
+            # the WRONG build to check them against.
+            local pairs=""
+            if [ -n "$corpusdir" ] && [ -n "$refused" ] \
+               && [ -f "$corpusdir/$isa.$layer.sigenc.tsv" ]; then
+                pairs=$corpusdir/$isa.$layer.sigenc.tsv
+                echo "sig-enc $isa $layer $(sed -n 's/^#sigenc\t/pairs=/p' \
+                     "$pairs" | head -1) so=$(sed -n 's/^#so\t//p' "$pairs" \
+                     | head -1) named=${ISAX_SIGENC_SO:-<unset>}" \
+                     >> "$out/rc.txt"
+            fi
+            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused" "$pairs"
+            r=$?
             printf '%-8s %-8s rc=%d\n' "$layer" "$isa" "$r" >> "$out/rc.txt"
             # rc=2 dominates rc=1: "could not look" is never a mere failure.
             [ "$r" = 2 ] && worst=2

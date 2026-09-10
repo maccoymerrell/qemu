@@ -1370,17 +1370,40 @@ static void ll_decode(const uint8_t *b, size_t n, LlView &v)
 // Disagreement bucketing
 // ---------------------------------------------------------------------------
 
+/* The `--dump-sig-enc` side of the per-SIGNATURE refusal join (FINDING
+ * 94-A).  Declared here because note(), a few lines down, is the only
+ * writer; the join half and the reasoning for the whole instrument are
+ * with the refused set, further down this file. */
+static const char *sigenc_dump_path = nullptr;   /* --dump-sig-enc=FILE  */
+static FILE *sigenc_file = nullptr;              /* this shard's handle  */
+static std::string sigenc_hx;                    /* encoding in compare()*/
+static std::set<std::string> sigenc_written;     /* per-shard dedup      */
+
 struct Bucket { std::string sample; unsigned long n = 0; };
 static std::map<std::string, Bucket> buckets;
 
 // A signature key is CLASS + mnemonic (+ a short qualifier).  It carries no
 // counts, so an allowlist entry can name it exactly and stay stable as the
 // sweep shape changes.
+//
+// THE (SIGNATURE, ENCODING) PAIRS ARE TAKEN HERE, AND NOWHERE ELSE.  There
+// are thirty-odd note() call sites and a per-site hook would be thirty
+// chances to miss one; taking the pair where every signature is born makes
+// the dump complete by construction.  The encoding is compare()'s own `hx`,
+// parked in a global at the top of the comparison rather than threaded
+// through every caller for the same reason.
+static bool sigenc_key_wanted(const std::string &key);   /* fwd: allowlist */
+
 static void note(const std::string &key, const std::string &sample)
 {
     auto &b = buckets[key];
     if (!b.n) b.sample = sample;
     b.n++;
+    if (sigenc_file && !sigenc_hx.empty() && sigenc_key_wanted(key)) {
+        std::string pair = key + "\t" + sigenc_hx;
+        if (sigenc_written.insert(pair).second)
+            fprintf(sigenc_file, "%s\n", pair.c_str());
+    }
 }
 
 static std::string hexbytes(const uint8_t *b, unsigned n)
@@ -1558,6 +1581,63 @@ static std::set<std::string> srcenc_mnem_refused;  /* >=1 encoding refused   */
 static std::set<std::string> srcenc_mnem_unrsd;    /* >=1 unreached, NOT that */
 /* The `#so` stamp each of the two files carries, for the binding check. */
 static std::string srcenc_so, refused_so;
+
+/*
+ * THE PER-SIGNATURE JOIN, AND THE 56 RULES THAT ASKED FOR IT (FINDING 94-A).
+ *
+ * The per-MNEMONIC test above catches 1,636 of the 1,692 rules the poison-gate
+ * flip takes dead, and REFUSES the other 56 -- correctly, on its own terms.
+ * All 56 are aarch64 and all 56 are one shape: 27 fp mnemonics carrying
+ * `+REG_FPCW,REG_SYSFPEN` and one `zero +REG_MATRIX`.  `fadd`, `fcvt`, `fmla`
+ * and the rest are STILL COVERED after the flip -- the corpus carries
+ * 1,112,737 aarch64 encodings and plenty of them are these mnemonics.  What
+ * stopped existing is the particular SIGNATURE: the encodings that produced
+ * `+REG_FPCW,REG_SYSFPEN` on that mnemonic were refused, while the mnemonic's
+ * OTHER encodings still score.
+ *
+ * Loosening the mnemonic test to "any refused mnemonic" would excuse a
+ * genuinely stale rule on a partly-refused mnemonic, which is the
+ * deleting-direction false justification the whole category exists to
+ * prevent.  So the mnemonic test stays exactly as conservative as it is, and
+ * the residue gets an instrument at its own grain:
+ *
+ *     at BASE, signature S was produced by encoding set E(S)
+ *     at HEAD, every e in E(S) is REFUSED   ->  SUPERSEDED-BY-REFUSAL
+ *
+ * A rule whose signatures are only PARTLY refused stays DEAD, and a rule that
+ * matches no BASE signature at all stays DEAD -- there is nothing for the
+ * refusal to have removed.  Both directions are in `--selftest-sigjoin`.
+ *
+ * THIS IS A TWO-ARM INSTRUMENT BY CONSTRUCTION.  It needs the BASE arm's own
+ * output, because E(S) is a fact about the tree BEFORE the flip: at HEAD the
+ * signature is gone and its encoding set with it.  `--dump-sig-enc=FILE`
+ * writes the pairs on the BASE arm; `--sig-enc=FILE` consumes them on the
+ * HEAD arm and joins them against `--refused`.
+ *
+ * AND IT IS STAMPED IN BOTH DIRECTIONS, for the reason the corpus is.  The
+ * pair file carries the `#so` of the build it was taken at, and the caller
+ * must NAME that build with `--sig-enc-so=`: a pair file cannot be checked
+ * against the corpus's own `#so` the way `--refused` is, because the two arms
+ * are DIFFERENT BUILDS on purpose, so "they must agree" is exactly the wrong
+ * test.  What can be checked is that the file is the one the harness meant to
+ * hand over, and an unstamped or mis-stamped file REFUSES rather than
+ * answering.  A stale pair file describing a signature population three
+ * builds old would otherwise retire live rules on a false reason, which is
+ * the one outcome this category may never produce.
+ *
+ * THE DUMP IS RESTRICTED TO KEYS SOME ALLOW RULE MATCHES, and that is the
+ * join's domain rather than a filter over it: a signature no rule names can
+ * supersede no rule.  Writing every (signature, encoding) pair the sweep
+ * produces would be millions of rows per ISA to answer a question about a few
+ * dozen; writing the ones a rule could possibly be about is the same answer.
+ */
+/* The DUMP side's four are declared above note(), which is their only
+ * writer; the join side's live here.  Same instrument, split by where the
+ * compiler needs the name. */
+static const char *sigenc_path = nullptr;        /* --sig-enc=FILE       */
+static const char *sigenc_so_expect = nullptr;   /* --sig-enc-so=HEX     */
+static std::string sigenc_so;
+static std::map<std::string, std::set<std::string> > sigenc_map;
 
 /*
  * THE JOIN, AND WHY IT IS REPORTED SEPARATELY FROM THE DATAFLOW.
@@ -2149,6 +2229,144 @@ static bool rule_superseded_by_refusal(const std::string &key)
     return true;
 }
 
+/*
+ * Is this signature key one some allow rule could be about?  Used to bound
+ * the `--dump-sig-enc` domain; it must NOT mark a rule used, because the
+ * dump runs during the sweep and `used` is the dead-rule detector's own
+ * state.  Deliberately a separate walk from is_allowed() for that reason.
+ */
+struct AllowRule;                                        /* fwd */
+static bool allow_rule_matches(const std::string &key);  /* fwd */
+
+static bool sigenc_key_wanted(const std::string &key)
+{
+    return allow_rule_matches(key);
+}
+
+/*
+ * THE PER-SIGNATURE JOIN ITSELF.
+ *
+ * Every BASE signature this rule names must have a NON-EMPTY encoding set and
+ * every encoding in it must be in the HEAD refused set.  Three refusals, and
+ * each one is the conservative direction:
+ *
+ *   - no BASE signature matched      -> false.  Nothing was removed, so
+ *                                       nothing was superseded; the rule
+ *                                       falls through to DEAD, which is where
+ *                                       a stale rule belongs.
+ *   - a matched signature is EMPTY   -> false.  A signature with no recorded
+ *                                       encodings answers no question; a
+ *                                       vacuous set must never read as "all
+ *                                       of it was refused".
+ *   - any encoding NOT refused       -> false.  This is the partly-refused
+ *                                       case FINDING 94-A names: the rule's
+ *                                       subject still exists at HEAD and the
+ *                                       admission gate is not what silenced
+ *                                       it.
+ */
+static bool rule_superseded_by_sig_refusal(const std::string &keypat)
+{
+    if (!sigenc_path || !refused_path) return false;
+    bool any = false;
+    for (const auto &kv : sigenc_map) {
+        if (!glob_match(keypat.c_str(), kv.first.c_str())) continue;
+        if (kv.second.empty()) return false;
+        any = true;
+        for (const auto &e : kv.second)
+            if (!refused_enc.count(e)) return false;
+    }
+    return any;
+}
+
+/*
+ * Load the BASE arm's (signature, encoding) pairs.
+ *
+ * REFUSES, never returns a partial map: an unstamped file, a file whose
+ * stamp is not the build the caller named, a caller who named no build, and
+ * a file with no pairs all exit 2.  Every one of those would otherwise let
+ * the join answer from a population it cannot vouch for, and this category's
+ * output is a DELETION -- the direction where a wrong answer costs live
+ * rules.
+ */
+static bool sigenc_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s cannot be opened: %s -- "
+                "REFUSING\n", path, strerror(errno));
+        return false;
+    }
+    char line[8192];
+    unsigned long rows = 0, declared = 0;
+    bool have_count = false;
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        if (line[0] == '#') {
+            if (!strncmp(line, "#so\t", 4)) sigenc_so = line + 4;
+            if (!strncmp(line, "#sigenc\t", 8)) {
+                declared = strtoul(line + 8, nullptr, 10);
+                have_count = true;
+            }
+            continue;
+        }
+        char *tab = strrchr(line, '\t');
+        if (!tab || tab == line) {
+            fprintf(stderr, "isaxcheck: --sig-enc=%s row `%s' is not "
+                    "`<signature> TAB <hex>' -- REFUSING\n", path, line);
+            fclose(f);
+            return false;
+        }
+        *tab = 0;
+        sigenc_map[line].insert(tab + 1);
+        rows++;
+    }
+    fclose(f);
+    if (sigenc_so.empty()) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s carries no #so stamp -- "
+                "REFUSING.  A signature population that cannot be shown to "
+                "describe a named build describes none\n", path);
+        return false;
+    }
+    if (!sigenc_so_expect) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s was given without "
+                "--sig-enc-so -- REFUSING.  The pair file is the BASE arm's "
+                "and the refused set is this arm's, so the two stamps are "
+                "MEANT to differ; the only check left is the one the caller "
+                "must make, and it has to be made out loud\n", path);
+        return false;
+    }
+    if (sigenc_so != sigenc_so_expect) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s is stamped #so=%s but the "
+                "caller named %s -- REFUSING; that file describes a "
+                "different build's signatures\n", path, sigenc_so.c_str(),
+                sigenc_so_expect);
+        return false;
+    }
+    if (!have_count) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s carries no `#sigenc <n>' "
+                "line -- REFUSING; a pair file that does not say how many "
+                "pairs it holds cannot be told from a truncated one\n", path);
+        return false;
+    }
+    if (declared != rows) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s declares %lu pairs and "
+                "carries %lu -- REFUSING (truncated or appended)\n",
+                path, declared, rows);
+        return false;
+    }
+    if (!rows) {
+        fprintf(stderr, "isaxcheck: --sig-enc=%s holds no pairs -- REFUSING; "
+                "an empty signature population would supersede nothing and "
+                "report that as an answer\n", path);
+        return false;
+    }
+    fprintf(stderr, "# sig-enc set=%s signatures=%zu pairs=%lu so=%s\n",
+            path, sigenc_map.size(), rows, sigenc_so.c_str());
+    return true;
+}
+
 static bool falsify_requested = false;
 
 /*
@@ -2408,6 +2626,10 @@ static void compare(const uint8_t *b, size_t n)
 
     unsigned bl = c.ok ? c.size : (l.ok ? l.size : (unsigned)n);
     std::string hx = hexbytes(b, bl);
+    /* note() takes the (signature, encoding) pair from here; see its
+     * comment for why the encoding travels in a global rather than through
+     * thirty call sites. */
+    if (sigenc_file) sigenc_hx = hx;
 
     /*
      * THE SLED POPULATION.  Written before any class runs and for every
@@ -3287,6 +3509,20 @@ static void run_sweep(unsigned shard, unsigned nshard)
      * shared file offset -- interleaved, torn rows, and a population file
      * that silently under-reports.  One file per shard; the caller merges.
      */
+    if (sigenc_dump_path) {
+        /* Per shard, for the reason the population file is: the sweep FORKS,
+         * and one FILE* opened before the fork would have every child
+         * appending through a shared offset. */
+        char nm[4096];
+        snprintf(nm, sizeof nm, "%s.%u", sigenc_dump_path, shard);
+        sigenc_file = fopen(nm, "w");
+        if (!sigenc_file) {
+            fprintf(stderr, "isaxcheck: --dump-sig-enc cannot write %s: %s -- "
+                    "REFUSING (a pair dump that silently writes nothing "
+                    "produces a join with no subject)\n", nm, strerror(errno));
+            _exit(2);
+        }
+    }
     if (pop_path) {
         char nm[4096];
         snprintf(nm, sizeof nm, "%s.%u", pop_path, shard);
@@ -3305,6 +3541,7 @@ static void run_sweep(unsigned shard, unsigned nshard)
     case ISA_X86_64:  sweep_x86(shard, nshard); break;
     }
     if (pop_file) { fclose(pop_file); pop_file = nullptr; }
+    if (sigenc_file) { fclose(sigenc_file); sigenc_file = nullptr; }
 }
 
 // ---------------------------------------------------------------------------
@@ -3412,6 +3649,22 @@ static bool is_allowed(const std::string &key)
     return hit;
 }
 
+/*
+ * The same match WITHOUT the side effect.  `--dump-sig-enc` runs during the
+ * sweep, long before the report decides which rules are dead, and marking a
+ * rule `used` from there would hand the dead-rule detector a rule that was
+ * never actually applied to a disagreement.  One line different, and the
+ * difference is the whole point.
+ */
+static bool allow_rule_matches(const std::string &key)
+{
+    for (const auto &r : allow_rules) {
+        if (r.isa != cfg.name && r.isa != "*") continue;
+        if (glob_match(r.key.c_str(), key.c_str())) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 
 static void usage(void)
@@ -3463,6 +3716,19 @@ static void usage(void)
         "                  encoding is reported SUPERSEDED-BY-REFUSAL, not\n"
         "                  dead: the question it answers is not being asked\n"
         "                  at this tree.  Requires --srcenc\n"
+        "  --dump-sig-enc=FILE  write the (signature, encoding) pairs this\n"
+        "                  sweep produces for keys an allowlist rule names,\n"
+        "                  to FILE.<shard>.  Taken on the BASE arm; its\n"
+        "                  merged form is --sig-enc's input\n"
+        "  --sig-enc=FILE  the BASE arm's (signature, encoding) pairs.  An\n"
+        "                  unused rule whose every BASE signature was\n"
+        "                  refused ON EVERY ENCODING is reported\n"
+        "                  SUPERSEDED-BY-REFUSAL; partly refused stays DEAD.\n"
+        "                  Requires --refused and --sig-enc-so\n"
+        "  --sig-enc-so=HEX  the build the pair file must be stamped for.\n"
+        "                  Required with --sig-enc: the two arms are\n"
+        "                  DIFFERENT builds on purpose, so the corpus's own\n"
+        "                  #so cannot check it and the caller must\n"
         "  --dump-pop=FILE write every encoding this sweep decodes to\n"
         "                  FILE.<shard>, which is the population the\n"
         "                  translate-only sled is driven over\n"
@@ -3480,6 +3746,82 @@ static void usage(void)
         "  --keep-zero     do not fold the architectural zero register out\n");
 }
 
+
+/*
+ * THE PER-SIGNATURE JOIN'S OWN SELFTEST, BOTH DIRECTIONS.
+ *
+ * FINDING 94-A's residue is a DELETION category: what it says SUPERSEDED
+ * stops being reported as a defect.  A category like that is only worth
+ * having if the direction it must not go can be shown not to go, so the
+ * fixture plants both:
+ *
+ *   FULLY refused  -> SUPERSEDED.  Every encoding behind the signature is
+ *                     in the refused set; the rule's subject is gone and
+ *                     QEMU's admission gate is what took it.
+ *   PARTLY refused -> DEAD.        One encoding survives, so the question
+ *                     the rule answers is still being asked and retiring it
+ *                     would write a false reason on a live rule.  This is
+ *                     the arm that makes the category safe.
+ *
+ * And three vacuity arms, because "nothing matched" must never read as
+ * "all of it was refused": no matching signature, an empty encoding set,
+ * and no refused set at all.
+ *
+ * It runs on the join predicate ITSELF against planted state, not through
+ * a stub isaxcheck -- the point is to test the function the report calls.
+ */
+static int selftest_sigjoin(void)
+{
+    int fails = 0, n = 0;
+    auto chk = [&](bool cond, const char *what) {
+        n++;
+        printf("%s  %s\n", cond ? "PASS" : "FAIL", what);
+        if (!cond) fails++;
+    };
+
+    const char *saved_sig = sigenc_path, *saved_ref = refused_path;
+    sigenc_path = "(selftest)";
+    refused_path = "(selftest)";
+
+    /* wholly refused */
+    sigenc_map["SR-rd-phantom fadd +REG_FPCW"] = { "aa", "bb" };
+    /* partly refused: `cc` survives */
+    sigenc_map["SR-rd-phantom fmla +REG_FPCW"] = { "aa", "cc" };
+    /* a signature with no encodings behind it at all */
+    sigenc_map["SR-rd-phantom fsub +REG_FPCW"] = { };
+    refused_enc = { "aa", "bb" };
+
+    chk(rule_superseded_by_sig_refusal("SR-rd-phantom fadd +REG_FPCW"),
+        "a signature whose EVERY encoding was refused SUPERSEDES");
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom fmla +REG_FPCW"),
+        "a PARTLY refused signature stays DEAD");
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom fsub +REG_FPCW"),
+        "a signature with an EMPTY encoding set stays DEAD");
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom nosuch +REG_FPCW"),
+        "a rule matching NO base signature stays DEAD");
+    /* A glob spanning both: one member is partly refused, so the rule as a
+     * whole is not superseded.  The conservative direction over a family. */
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom f* +REG_FPCW"),
+        "a glob over a fully AND a partly refused signature stays DEAD");
+    /* A glob spanning only fully-refused members supersedes. */
+    sigenc_map["SR-rd-phantom fadd2 +REG_FPCW"] = { "bb" };
+    chk(rule_superseded_by_sig_refusal("SR-rd-phantom fadd* +REG_FPCW"),
+        "a glob over fully refused signatures ONLY supersedes");
+
+    refused_path = nullptr;
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom fadd +REG_FPCW"),
+        "with NO refused set the join answers nothing");
+    refused_path = "(selftest)";
+    sigenc_path = nullptr;
+    chk(!rule_superseded_by_sig_refusal("SR-rd-phantom fadd +REG_FPCW"),
+        "with NO pair file the join answers nothing");
+
+    sigenc_path = saved_sig; refused_path = saved_ref;
+    sigenc_map.clear(); refused_enc.clear();
+    printf("sigjoin arms=%d failures=%d\n", n, fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *isaname = "aarch64";
@@ -3489,6 +3831,9 @@ int main(int argc, char **argv)
     const char *mattr = nullptr, *mcpu = nullptr, *allow = nullptr;
     const char *csmodeadd = nullptr;
     bool check = false, emit_raw = false, batch = false;
+
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--selftest-sigjoin")) return selftest_sigjoin();
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--isa=", 6)) isaname = argv[i] + 6;
@@ -3510,6 +3855,11 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
         else if (!strncmp(argv[i], "--srcenc=", 9)) srcenc_path = argv[i] + 9;
         else if (!strncmp(argv[i], "--refused=", 10)) refused_path = argv[i] + 10;
+        else if (!strncmp(argv[i], "--dump-sig-enc=", 15))
+            sigenc_dump_path = argv[i] + 15;
+        else if (!strncmp(argv[i], "--sig-enc=", 10)) sigenc_path = argv[i] + 10;
+        else if (!strncmp(argv[i], "--sig-enc-so=", 13))
+            sigenc_so_expect = argv[i] + 13;
         else if (!strncmp(argv[i], "--dump-pop=", 11)) pop_path = argv[i] + 11;
         else if (!strncmp(argv[i], "--pop-per-mnem=", 15)) pop_per_mnem = (unsigned)atoi(argv[i] + 15);
         else if (!strncmp(argv[i], "--falsify=", 10)) {
@@ -3662,6 +4012,25 @@ int main(int argc, char **argv)
         return 2;
     }
     if (refused_path && !refused_load(refused_path, cfg.name)) return 2;
+    /*
+     * The pair file is meaningless without the refused set it is joined
+     * against: it says which encodings made each BASE signature, and the
+     * question is whether QEMU refused all of them.  Half the join is not a
+     * degraded join, it is no join.
+     */
+    if (sigenc_path && !refused_path) {
+        fprintf(stderr, "isaxcheck: --sig-enc without --refused has no "
+                "subject -- the pair file names the encodings behind each "
+                "BASE signature and the refused set is what they are joined "
+                "against\n");
+        return 2;
+    }
+    if (sigenc_so_expect && !sigenc_path) {
+        fprintf(stderr, "isaxcheck: --sig-enc-so without --sig-enc names a "
+                "build for a file that was not given -- REFUSING\n");
+        return 2;
+    }
+    if (sigenc_path && !sigenc_load(sigenc_path)) return 2;
 
     if (hexone) {
         uint8_t b[24]; unsigned n = 0;
@@ -4037,6 +4406,7 @@ int main(int argc, char **argv)
         return k.compare(0, 6, "SR-rd-") == 0;
     };
     std::vector<const AllowRule *> dead, superseded, sup_refused;
+    size_t sup_refused_sig = 0;
     for (const auto &r : allow_rules) {
         if (r.used || r.isa != cfg.name) continue;
         if (is_superseded_key(r.key)) superseded.push_back(&r);
@@ -4049,6 +4419,20 @@ int main(int argc, char **argv)
          * Only what neither explains is dead.
          */
         else if (rule_superseded_by_refusal(r.key)) sup_refused.push_back(&r);
+        /*
+         * AND THE SAME QUESTION AT THE SIGNATURE'S OWN GRAIN (FINDING 94-A).
+         * The mnemonic test above asks whether QEMU refused every encoding
+         * of every mnemonic the rule names; this one asks whether it refused
+         * every encoding that made the rule's SIGNATURE.  A mnemonic can
+         * survive the flip while one of its signatures does not, and that
+         * is the whole of the 56-rule residue the flip was held on.  Second,
+         * because a rule the coarser test already explains needs no finer
+         * one -- and the two are counted apart on the summary line so the
+         * finer one can never be quoted as the coarser one's reach.
+         */
+        else if (rule_superseded_by_sig_refusal(r.key)) {
+            sup_refused.push_back(&r); sup_refused_sig++;
+        }
         else dead.push_back(&r);
     }
 
@@ -4086,11 +4470,12 @@ int main(int argc, char **argv)
         printf("# isa=%s layer=fixups encodings_tried=%lu "
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
                "dead_allow_rules=%zu superseded_allow_rules=%zu "
-               "superseded_by_refusal=%zu refused_reach=%s "
+               "superseded_by_refusal=%zu superseded_by_sig=%zu "
+               "refused_reach=%s "
                "unscored_family=%s\n",
                cfg.name, total_tried, buckets.size(),
                buckets.size() - unallowed, unallowed, dead.size(),
-               superseded.size(), sup_refused.size(),
+               superseded.size(), sup_refused.size(), sup_refused_sig,
                refused_path ? std::to_string(srcenc_refused).c_str() : "-",
                unscored_family);
     else
@@ -4101,7 +4486,8 @@ int main(int argc, char **argv)
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
                "subtarget_gap=%lu/%lu size_gap=%zu/%lu "
                "dead_allow_rules=%zu superseded_allow_rules=%zu "
-               "superseded_by_refusal=%zu refused_reach=%s "
+               "superseded_by_refusal=%zu superseded_by_sig=%zu "
+               "refused_reach=%s "
                "unscored_family=%s ambiguous_reg_tokens=%u\n",
                cfg.name, layer == LAYER_FIELDS ? "fields" : "boundary",
                total_tried, buckets.size(),
@@ -4109,6 +4495,7 @@ int main(int argc, char **argv)
                gap_sigs, gap_encodings,
                size_gap_by_mnem.size(), size_gap_encodings,
                dead.size(), superseded.size(), sup_refused.size(),
+               sup_refused_sig,
                refused_path ? std::to_string(srcenc_refused).c_str() : "-",
                unscored_family,
                regmap_ambiguous_tokens);

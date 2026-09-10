@@ -666,6 +666,25 @@ uint8_t fold_nonarch(const char *name)
         return REG_SYSMMU;
     }
     /*
+     * THE x86 DEBUG REGISTERS -- DR0..DR3, DR6 and DR7 -- DECLARED by
+     * target/i386/tcg/translate.c and absent from the i386 GDB stub's
+     * namespace, which carries the control registers and no debug register at
+     * all.  The same shape as the descriptor tables above.
+     *
+     * REG_DEBUG<n> is not a new word: the shipped mnemonic table already maps
+     * X86_REG_DR<n> to it, so this connects QEMU's spelling to the word the
+     * wire has always published for these registers.  DR4 and DR5 are absent
+     * from the declarations by the alias rule stated there and by R8.2 here
+     * (champsim_tracer_generic_ids.h leaves REG_DEBUG4/5 unallocated for the
+     * same reason), so this arm never sees them; the number is bounded at 7
+     * rather than trusted, because a spelling this arm cannot honour must
+     * fall through rather than be answered wrong.
+     */
+    if (name[0] == 'd' && name[1] == 'r' && name[2] >= '0' && name[2] <= '7' &&
+        name[3] == '\0' && name[2] != '4' && name[2] != '5') {
+        return (uint8_t)(REG_DEBUG0 + (name[2] - '0'));
+    }
+    /*
      * THE MPX BOUND REGISTERS.
      *
      * BND<n> is one 128-bit architectural register and QEMU keeps it as TWO

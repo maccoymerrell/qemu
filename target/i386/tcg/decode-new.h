@@ -301,6 +301,34 @@ typedef struct X86OpLeaf {
  */
 #define encops .encoded_operands = true,
 
+/*
+ * THE OPERAND STATEMENT A PRIVILEGED ROW CARRIES, per row.
+ *
+ * These are the encodings whose chk(cpl0) / chk(iopl) arm jumps past code
+ * generation on every CPL the corpus can reach, and whose gen_* body is
+ * either #ifndef CONFIG_USER_ONLY or gen_illegal_opcode() besides.  Their
+ * operands are ISA operands (R16: the dependency exists in the ISA, so it is
+ * recorded; R7.3: a register the encoding names is not the emulator's to
+ * drop), and NO op stream exists for a walk to find them in -- so the fact is
+ * stated at the row-selection point, ahead of the fault arms, exactly where
+ * plugin_gen_record_insn_identity() states the identity and for the same
+ * reason.  See cpl0_operands.c.inc for what each value names.
+ *
+ * A row without a value states nothing, so the field is the whole scope of
+ * the statement and is greppable as such.
+ */
+typedef enum X86Cpl0Ops {
+    X86_CPL0OPS_NONE = 0,
+    X86_CPL0OPS_MODRM,      /* invpcid: the reg field and the memory operand */
+    X86_CPL0OPS_CRDR,       /* mov to/from CR and DR: op[0] written, op[1] read */
+    X86_CPL0OPS_WRMSR,      /* ecx selects, edx:eax supplies */
+    X86_CPL0OPS_RDMSR,      /* ecx selects, edx:eax receives */
+    X86_CPL0OPS_SYSRET,     /* rcx carries rip, r11 carries rflags */
+    X86_CPL0OPS_IF,         /* sti / cli: EFLAGS.IF, read and written */
+} X86Cpl0Ops;
+
+#define cpl0ops(x) .cpl0_operands = X86_CPL0OPS_##x,
+
 struct X86OpEntry {
     /* Based on the is_decode flags.  */
     union {
@@ -342,6 +370,15 @@ struct X86OpEntry {
      * the statement and is greppable as such.
      */
     bool         encoded_operands:1;
+
+    /*
+     * THE OPERANDS OF A PRIVILEGED ENCODING NO REACHED EMITTER NAMES.
+     *
+     * Set by cpl0ops() on the rows whose operands cpl0_operands_note() states;
+     * X86Cpl0Ops above says which statement each value selects, and
+     * cpl0_operands.c.inc says what each one names and why.
+     */
+    X86Cpl0Ops   cpl0_operands:8;
 
     /*
      * QEMU's own identity for this table slot, handed to plugins by

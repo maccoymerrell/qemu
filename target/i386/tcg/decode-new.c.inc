@@ -668,7 +668,7 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x45] = X86_OP_ENTRY3(VPSRLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
     [0x46] = X86_OP_ENTRY3(VPSRAV,      V,x,  H,x,       W,x,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x47] = X86_OP_ENTRY3(VPSLLV,      V,x,  H,x,       W,x,  vex6 cpuid(AVX2) p_66),
-    [0x82] = X86_OP_ENTRY3(INVPCID,   None,None, G,y, M,dq, chk(cpl0) cpuid(INVPCID) p_66),
+    [0x82] = X86_OP_ENTRY3(INVPCID,   None,None, G,y, M,dq, chk(cpl0) cpuid(INVPCID) p_66 cpl0ops(MODRM)),
     [0x90] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vpgatherdd/q */
     [0x91] = X86_OP_ENTRY3(VPGATHERQ, V,x,  H,x,  M,q,  vex12 cpuid(AVX2) p_66), /* vpgatherqd/q */
     [0x92] = X86_OP_ENTRY3(VPGATHERD, V,x,  H,x,  M,d,  vex12 cpuid(AVX2) p_66), /* vgatherdps/d */
@@ -1200,7 +1200,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x03] = X86_OP_ENTRYwr(LSL,        G,v, E,w,             chk(prot)),
     [0x05] = X86_OP_ENTRY0(SYSCALL,                           chk(o64_intel)),
     [0x06] = X86_OP_ENTRY0(CLTS,                              chk(cpl0) svm(WRITE_CR0)),
-    [0x07] = X86_OP_ENTRY0(SYSRET,                            chk3(o64_intel, prot, cpl0)),
+    [0x07] = X86_OP_ENTRY0(SYSRET,                            chk3(o64_intel, prot, cpl0) cpl0ops(SYSRET)),
 
     [0x10] = X86_OP_GROUP0(0F10),
     [0x11] = X86_OP_GROUP0(0F11),
@@ -1216,14 +1216,14 @@ static const X86OpEntry opcodes_0F[256] = {
      * Incorrectly listed as using "d" operand type in the manual.  In reality
      * there's no 16-bit version (like y) and it does not use REX.W (like d64).
      */
-    [0x20] = X86_OP_GROUPwr(MOV_CR_DR,   R,y_d64, C,y_d64, chk(cpl0) svm(READ_CR0)),
-    [0x21] = X86_OP_GROUPwr(MOV_CR_DR,   R,y_d64, D,y_d64, chk(cpl0) svm(READ_DR0)),
-    [0x22] = X86_OP_GROUPwr(MOV_CR_DR,   C,y_d64, R,y_d64, zextT0 chk(cpl0) svm(WRITE_CR0)),
-    [0x23] = X86_OP_GROUPwr(MOV_CR_DR,   D,y_d64, R,y_d64, zextT0 chk(cpl0) svm(WRITE_DR0)),
+    [0x20] = X86_OP_GROUPwr(MOV_CR_DR,   R,y_d64, C,y_d64, chk(cpl0) svm(READ_CR0) cpl0ops(CRDR)),
+    [0x21] = X86_OP_GROUPwr(MOV_CR_DR,   R,y_d64, D,y_d64, chk(cpl0) svm(READ_DR0) cpl0ops(CRDR)),
+    [0x22] = X86_OP_GROUPwr(MOV_CR_DR,   C,y_d64, R,y_d64, zextT0 chk(cpl0) svm(WRITE_CR0) cpl0ops(CRDR)),
+    [0x23] = X86_OP_GROUPwr(MOV_CR_DR,   D,y_d64, R,y_d64, zextT0 chk(cpl0) svm(WRITE_DR0) cpl0ops(CRDR)),
 
-    [0x30] = X86_OP_ENTRY0(WRMSR,                             chk(cpl0)),
+    [0x30] = X86_OP_ENTRY0(WRMSR,                   chk(cpl0) cpl0ops(WRMSR)),
     [0x31] = X86_OP_ENTRY0(RDTSC),
-    [0x32] = X86_OP_ENTRY0(RDMSR,                             chk(cpl0)),
+    [0x32] = X86_OP_ENTRY0(RDMSR,                   chk(cpl0) cpl0ops(RDMSR)),
     [0x33] = X86_OP_ENTRY0(RDPMC),
     [0x34] = X86_OP_ENTRY0(SYSENTER,                          chk2(i64_amd, prot_or_vm86)),
     [0x35] = X86_OP_ENTRY0(SYSEXIT,                           chk3(i64_amd, prot, cpl0)),
@@ -1924,8 +1924,8 @@ static const X86OpEntry opcodes_root[256] = {
 
     [0xF8] = X86_OP_ENTRY0(CLC),
     [0xF9] = X86_OP_ENTRY0(STC),
-    [0xFA] = X86_OP_ENTRY0(CLI,    chk(iopl)),
-    [0xFB] = X86_OP_ENTRY0(STI,    chk(iopl)),
+    [0xFA] = X86_OP_ENTRY0(CLI,    chk(iopl) cpl0ops(IF)),
+    [0xFB] = X86_OP_ENTRY0(STI,    chk(iopl) cpl0ops(IF)),
     [0xFC] = X86_OP_ENTRY0(CLD),
     [0xFD] = X86_OP_ENTRY0(STD),
     [0xFE] = X86_OP_GROUP1(group4_5, E,b),
@@ -2693,6 +2693,15 @@ illegal:
  */
 #include "nop_operands.c.inc"
 
+/*
+ * cpl0_operands: THE OPERANDS OF A PRIVILEGED ENCODING NO REACHED EMITTER
+ * NAMES.  Ten rows whose chk(cpl0) / chk(iopl) arm jumps past code generation
+ * on every CPL the corpus reaches; see cpl0_operands.c.inc for what each one
+ * states, what two registers it refuses, and why the note is taken at the
+ * row-selection point rather than in the emitter.
+ */
+#include "cpl0_operands.c.inc"
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2938,6 +2947,18 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     threednow_ident_publish(decode.e.slot, decode.immediate);  /* threednow_ident */
     grp0f01_ident_publish(decode.e.slot,
                           (s->prefix & PREFIX_REPZ) != 0, s->modrm);  /* grp0f01_ident */
+
+    /*
+     * AND THE OPERANDS OF THE ROWS WHOSE EMITTER THE NEXT FEW LINES CAN JUMP
+     * PAST.  It travels with the identity, for the identity's own reason: the
+     * fault arms below are checks about the MACHINE, and an encoding that
+     * fails one is still that instruction with those operands.  Unlike
+     * nop_operands_note() this cannot stay beside the generation, because for
+     * these ten rows there is no generation to stay beside -- chk(cpl0) and
+     * chk(iopl) reach gp_fault, and four of the ten have no reachable body in
+     * a user build at all.  See cpl0_operands.c.inc.
+     */
+    cpl0_operands_note(s, &decode);  /* cpl0_operands */
 
     if (!has_cpuid_feature(s, decode.e.cpuid)) {
         goto illegal_op;

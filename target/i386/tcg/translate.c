@@ -5538,6 +5538,59 @@ void tcg_x86_init(void)
                                   sizeof(((CPUX86State *)0)->cr[4]), 1);
 
     /*
+     * THE DEBUG REGISTERS.
+     *
+     * Same shape as the control registers above, one row down the 0F table:
+     * `mov %dr0,%rax` and `mov %rax,%dr0` are the whole subject, their whole
+     * load and writeback arm is inside `#ifndef CONFIG_USER_ONLY`
+     * (emit.c.inc, X86_OP_DR), and cpl0_operands.c.inc states the access at
+     * the decode site so that the wire's answer does not depend on how QEMU
+     * was configured.  A stated range with no declaration behind it arrives
+     * downstream as an anonymous span, so the statement needs these rows to
+     * mean anything -- which is `smsw`'s lesson on cr[0], one file over.
+     *
+     * DR4 AND DR5 ARE NOT DECLARED, and that is the same hole cr[1] is:
+     * QEMU's own comment at the member says they are unused, and
+     * helper_get_dr() / helper_set_dr() (tcg/system/bpt_helper.c) fold
+     * reg 4 and 5 onto 6 and 7 whenever CR4.DE is clear and raise #UD when it
+     * is set -- so no instruction ever reaches env->dr[4] or env->dr[5], and
+     * naming them would give a spelling to storage nothing uses.  The plugin
+     * vocabulary made the same call under R8.2 (an alias is not an
+     * independent register) and leaves REG_DEBUG4/REG_DEBUG5 unallocated.
+     * The file is declared one register at a time so that the hole is visible
+     * rather than papered over.
+     *
+     * The names are the architecture's, as `xcr0`, `tsc` and the descriptor
+     * tables above are: the i386 GDB stub carries no debug register, so the
+     * generated QEMU-indexed table can hold no row for them and the
+     * declaration is the only route a name can take.
+     */
+    insn_dataflow_declare_regfile("dr0", NULL,
+                                  offsetof(CPUX86State, dr[0]),
+                                  sizeof(((CPUX86State *)0)->dr[0]),
+                                  sizeof(((CPUX86State *)0)->dr[0]), 1);
+    insn_dataflow_declare_regfile("dr1", NULL,
+                                  offsetof(CPUX86State, dr[1]),
+                                  sizeof(((CPUX86State *)0)->dr[1]),
+                                  sizeof(((CPUX86State *)0)->dr[1]), 1);
+    insn_dataflow_declare_regfile("dr2", NULL,
+                                  offsetof(CPUX86State, dr[2]),
+                                  sizeof(((CPUX86State *)0)->dr[2]),
+                                  sizeof(((CPUX86State *)0)->dr[2]), 1);
+    insn_dataflow_declare_regfile("dr3", NULL,
+                                  offsetof(CPUX86State, dr[3]),
+                                  sizeof(((CPUX86State *)0)->dr[3]),
+                                  sizeof(((CPUX86State *)0)->dr[3]), 1);
+    insn_dataflow_declare_regfile("dr6", NULL,
+                                  offsetof(CPUX86State, dr[6]),
+                                  sizeof(((CPUX86State *)0)->dr[6]),
+                                  sizeof(((CPUX86State *)0)->dr[6]), 1);
+    insn_dataflow_declare_regfile("dr7", NULL,
+                                  offsetof(CPUX86State, dr[7]),
+                                  sizeof(((CPUX86State *)0)->dr[7]),
+                                  sizeof(((CPUX86State *)0)->dr[7]), 1);
+
+    /*
      * THE DESCRIPTOR-TABLE AND TASK REGISTERS: GDTR, IDTR, LDTR and TR.
      *
      * `sldt` and `str` read env->ldt.selector and env->tr.selector with a

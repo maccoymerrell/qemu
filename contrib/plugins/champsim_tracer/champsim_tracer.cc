@@ -10614,9 +10614,27 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
              * SCORED, NOT ACTING.  The gate below is unchanged; the flip
              * is a wire change and it does not get to happen as a side
              * effect of the measurement that justifies it.
+             *
+             * ONE READ, TWO CONSUMERS -- and that is not tidying.  This
+             * block first shipped with its OWN copy of the acting
+             * predicate's expression, and the R14 deletion census counts
+             * SITES: `mnemonic[0]` is the one idiom nocapstone_gate.sh
+             * greps for an admission gate, and capfield_census.sh counts
+             * every resolved member access the compiler resolves.  A
+             * second copy therefore read as a fourth admission gate and an
+             * eighty-seventh field site -- the deletion distance moving
+             * BACKWARD because a measurement of that distance had been
+             * added to the tree.  An instrument that changes the number it
+             * reports is the shape this directory exists to refuse, so the
+             * read is taken once, here, and the acting test below consumes
+             * the same value.  Its verdict is unchanged by construction:
+             * `capfail` IS the expression the test used to spell out, and
+             * neither operand has a side effect for the short circuit to
+             * have been hiding.
              */
+            const bool capfail =
+                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0];
             {
-                bool capfail = cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0];
                 bool qemufail = insn_undecoded && insn_undecoded[ci];
                 if (capfail && qemufail) {
                     (spec ? g_stats.decode_fail_ab_both_wp
@@ -10629,8 +10647,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                           : g_stats.decode_fail_ab_qemuonly_cp)++;
                 }
             }
-            if (!p.poisoned &&
-                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
+            if (!p.poisoned && capfail) {
                 p.poisoned = true;
                 p.decode_fail = true;
                 p.pc = ipc;

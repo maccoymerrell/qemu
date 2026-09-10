@@ -120,6 +120,45 @@ def capture_tip_line(build_dir):
         return "#tip\tunknown\tunknown\n"
     return "#tip\t%s\t%s\n" % (sha, "dirty" if dirt else "clean")
 
+
+def capture_so_line(build_dir):
+    """The `#so` header line: WHICH PLUGIN BINARY PRODUCED THIS CORPUS.
+
+    FINDING 92-C, AND `#tip` IS NOT ENOUGH ON ITS OWN.  The corpus IS the
+    wire's source list, so scoring a build against a corpus captured from a
+    DIFFERENT build compares nothing: the gate reads the corpus's answers
+    back to itself and reports whatever the corpus already said.  That is
+    not hypothetical.  PASS 92's leg record for 5d9154d8c2 read
+    `isaxunallowed srcenc 12` on a tree whose real answer was 26, because
+    the corpus it scored against had been captured at the PARENT -- and
+    6,000 x86 encodings had lost their whole published source list in
+    between.  The gate could not see the regression it exists to catch.
+
+    `#tip` cannot close that.  Legs are run on a WORKING TREE whose HEAD is
+    still the parent -- the honest and normal order -- so the tip stamp of a
+    stale corpus and of a fresh one are the SAME sha, and the fresh one is
+    additionally marked `dirty`, which is not a difference a consumer can
+    act on.  The durable binding is the artefact the sled actually ran: the
+    plugin whose translation wrote every row.  Its sha256 prefix changes on
+    any rebuild that changes behaviour, and does not change on one that does
+    not.
+
+    A build with no plugin, or one this process cannot read, stamps
+    `unknown` -- which the consumer REFUSES, exactly as it refuses a corpus
+    that carries no stamp at all.  A check that cannot find its subject is
+    not a check.
+    """
+    import hashlib
+    so = os.path.join(build_dir, "contrib/plugins/libchampsim_tracer.so")
+    try:
+        h = hashlib.sha256()
+        with open(so, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return "#so\t%s\n" % h.hexdigest()[:16]
+    except OSError:
+        return "#so\tunknown\n"
+
 ISAS = {
     "x86_64": dict(
         machine=62, elfclass=64, entry_stub=bytes.fromhex("b8e700000031ff0f05"),
@@ -637,6 +676,7 @@ def main():
                          % conflicts)
     with open(merged, "w") as f:
         f.write(capture_tip_line(a.build_dir))
+        f.write(capture_so_line(a.build_dir))
         f.write("#isa\tencoding\tmnem\tsrc\n")
         for line in seen.values():
             f.write(line)

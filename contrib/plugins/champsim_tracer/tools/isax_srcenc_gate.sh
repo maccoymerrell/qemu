@@ -111,6 +111,49 @@ run_arms() {
             fi
             echo "corpus $isa md5=$(md5sum "$corpus" | cut -d' ' -f1)" \
                  "rows=$(grep -vc '^#' "$corpus")" >> "$out/rc.txt"
+            #
+            # THE CORPUS MUST DESCRIBE THE BUILD BEING SCORED (FINDING 92-C).
+            #
+            # A `--srcenc` corpus IS the wire's published source list, read
+            # out of a running emulator.  Scored against a DIFFERENT build,
+            # this gate reads the corpus's own answers back to itself and
+            # reports whatever the corpus already said -- it cannot see a
+            # regression that happened between the capture and the binary.
+            # That is not hypothetical: 5d9154d8c2's in-commit leg record
+            # reads `isaxunallowed srcenc 12` because the corpus it scored
+            # was captured at the PARENT, and 6,000 x86 encodings had lost
+            # their whole published source list in between.  Its own
+            # descendant read 26.
+            #
+            # `#tip` cannot decide this.  Legs run on a working tree whose
+            # HEAD is still the parent, so a stale corpus and a fresh one
+            # carry the SAME sha.  The binding is the PLUGIN BINARY the sled
+            # ran -- srcenc_sled.py stamps its sha256 prefix as `#so` -- and
+            # it is compared here against the plugin this build ships.
+            #
+            # UNSTAMPED IS A REFUSAL, not a pass.  A corpus captured before
+            # the stamp existed cannot be shown to describe this build, and
+            # a check that cannot find its subject must fail rather than
+            # report all-clear.  Re-capture it; the sled is the same run.
+            local cso bso
+            cso=$(sed -n 's/^#so\t//p' "$corpus" | head -1)
+            bso=$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" \
+                    | cut -c1-16)
+            if [ -z "$cso" ]; then
+                echo "REFUSED $isa -- corpus $corpus carries no #so stamp;" \
+                     "it cannot be shown to describe this build" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            if [ "$cso" != "$bso" ]; then
+                echo "REFUSED $isa -- corpus #so=$cso but this build's" \
+                     "plugin is $bso; the corpus describes a DIFFERENT" \
+                     "build and scoring it would report that build's" \
+                     "answers as this one's" >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            echo "corpus $isa so=$cso MATCHES the scored plugin" \
+                 >> "$out/rc.txt"
         fi
         for layer in boundary fields; do
             arm "$layer" "$isa" "$build" "$out" "$corpus"; r=$?
@@ -214,10 +257,44 @@ selftest() {
     grep -q '^REFUSED x86_64' "$t/o2/rc.txt" \
         && echo "PASS  B2 and the missing corpus file is NAMED" \
         || { echo "FAIL  B2"; f=$((f+1)); }
-    mkdir -p "$t/corpus_ok"; printf 'x86_64\t90\tnop\t-\n' > "$t/corpus_ok/x86_64.tsv"
+    #
+    # THE FIXTURE CORPUS CARRIES THE STAMP OF THE FIXTURE PLUGIN, because
+    # that is what a real corpus carries and the check below is the point.
+    # `so_of` is the same expression run_arms uses, so the two cannot drift.
+    #
+    local so_of; so_of=$(sha256sum "$t/b/contrib/plugins/libchampsim_tracer.so" \
+                           | cut -c1-16)
+    mkdir -p "$t/corpus_ok"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_ok/x86_64.tsv"
     run_arms "$t/b" "$t/o3" "$t/corpus_ok" x86_64 >/dev/null 2>&1
     [ $? = 0 ] && echo "PASS  C a green arm rolls up rc=0" \
                || { echo "FAIL  C"; f=$((f+1)); }
+    #
+    # M/N -- FINDING 92-C, BOTH DIRECTIONS.  A corpus is the wire's own
+    # source list; scored against a different build it reports that build's
+    # answers as this one's, which is how a leg record came to read 12 on a
+    # tree whose answer was 26.  So a stamp that disagrees REFUSES, and a
+    # corpus with no stamp REFUSES too -- "cannot be shown to describe this
+    # build" is not a pass.
+    #
+    mkdir -p "$t/corpus_stale"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t0123456789abcdef\n'
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_stale/x86_64.tsv"
+    run_arms "$t/b" "$t/oM" "$t/corpus_stale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  M a corpus stamped for ANOTHER build REFUSES (rc=2)" \
+               || { echo "FAIL  M"; f=$((f+1)); }
+    grep -q 'describes a DIFFERENT' "$t/oM/rc.txt" \
+        && echo "PASS  M2 and it says WHICH build the corpus describes" \
+        || { echo "FAIL  M2"; f=$((f+1)); }
+    mkdir -p "$t/corpus_unstamped"
+    printf 'x86_64\t90\tnop\t-\n' > "$t/corpus_unstamped/x86_64.tsv"
+    run_arms "$t/b" "$t/oN" "$t/corpus_unstamped" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  N an UNSTAMPED corpus REFUSES (rc=2), never passes" \
+               || { echo "FAIL  N"; f=$((f+1)); }
+    grep -q 'carries no #so stamp' "$t/oN/rc.txt" \
+        && echo "PASS  N2 and the reason names the missing stamp" \
+        || { echo "FAIL  N2"; f=$((f+1)); }
     printf '#!/bin/sh\nexit 1\n' > "$t/b/contrib/plugins/isaxcheck"
     run_arms "$t/b" "$t/o4" "$t/corpus_ok" x86_64 >/dev/null 2>&1
     [ $? = 1 ] && echo "PASS  D a failing arm rolls up rc=1" \

@@ -68,12 +68,14 @@ usage() {
     exit 2
 }
 
-# One arm.  $1 layer tag, $2 isa, $3 build, $4 out, $5 corpus file or "".
+# One arm.  $1 layer tag, $2 isa, $3 build, $4 out, $5 corpus file or "",
+# $6 refused-set file or "".
 arm() {
-    local layer=$1 isa=$2 build=$3 out=$4 corpus=$5
+    local layer=$1 isa=$2 build=$3 out=$4 corpus=$5 refused=${6:-}
     local tools; tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     local se=() extra=()
     [ -n "$corpus" ] && se=(--srcenc="$corpus")
+    [ -n "$refused" ] && se+=(--refused="$refused")
     local allow
     if [ "$layer" = fields ]; then
         allow=$tools/isaxcheck_fields_allow.txt
@@ -100,9 +102,9 @@ run_arms() {
       echo "ISAX_SHA=$(sha256sum "$build/contrib/plugins/isaxcheck" | cut -c1-16)"
       echo "CORPUS_DIR=${corpusdir:-<none>}"
     } >> "$out/rc.txt"
-    local worst=0 partial=0 isa layer corpus r
+    local worst=0 partial=0 isa layer corpus refused r
     for isa in $isas; do
-        corpus=""
+        corpus=""; refused=""
         if [ -n "$corpusdir" ]; then
             corpus=$corpusdir/$isa.tsv
             if [ ! -f "$corpus" ]; then
@@ -154,9 +156,60 @@ run_arms() {
             fi
             echo "corpus $isa so=$cso MATCHES the scored plugin" \
                  >> "$out/rc.txt"
+            #
+            # THE REFUSED SET (FINDING 93-A), WHICH IS WHAT MAKES A DEAD
+            # ROW READABLE.
+            #
+            # A corpus is silent about every encoding it does not carry, and
+            # the silence has two causes: QEMU's admission gate refused the
+            # encoding (it publishes nothing, so the read comparison has no
+            # subject), or the sweep produced no row for a reason nothing
+            # recorded.  An allow rule whose every subject encoding is in
+            # the first set is NOT dead -- and retiring it as dead writes a
+            # false reason on a rule that is right.  Measured at the
+            # poison-gate flip: 1,692 rules on three ISAs, every one of them
+            # live.
+            #
+            # srcenc_sled.py writes the set beside the corpus; the sweep
+            # assembles it as `<isa>.refused.tsv`, carrying the same `#so`.
+            # The stamp is checked HERE as well as inside isaxcheck, because
+            # a set from another build describes another admission gate and
+            # the failure is silent: rules it cannot excuse just read DEAD.
+            refused=$corpusdir/$isa.refused.tsv
+            if [ ! -f "$refused" ]; then
+                echo "NO REFUSED SET for $isa ($refused absent) --" \
+                     "superseded-by-refusal cannot be told from dead in" \
+                     "these arms" >> "$out/rc.txt"
+                refused=""
+            else
+                local rso
+                rso=$(sed -n 's/^#so\t//p' "$refused" | head -1)
+                if [ "$rso" != "$cso" ]; then
+                    echo "REFUSED $isa -- refused set $refused is stamped" \
+                         "#so=${rso:-<none>} but the corpus is #so=$cso;" \
+                         "two builds do not describe one admission gate" \
+                         >> "$out/rc.txt"
+                    worst=2; continue
+                fi
+                # BOTH SILENCES, COUNTED SEPARATELY.  The file carries
+                # REFUSED (QEMU's admission gate) and UNATTRIBUTED (a
+                # population encoding with no row and no recorded cause),
+                # and they mean opposite things to a rule: one excuses it,
+                # the other is the reason it may not be excused.  A single
+                # `rows=` would report mipsel -- 0 refused, 9,216
+                # unattributed -- as though the gate had refused 9,216
+                # encodings.
+                local nref nuna
+                nref=$(grep -v '^#' "$refused" | awk -F'\t' \
+                       '$3=="REFUSED"' | wc -l)
+                nuna=$(grep -v '^#' "$refused" | awk -F'\t' \
+                       '$3=="UNATTRIBUTED"' | wc -l)
+                echo "refused-set $isa so=$rso refused=$nref unattributed=$nuna" \
+                     >> "$out/rc.txt"
+            fi
         fi
         for layer in boundary fields; do
-            arm "$layer" "$isa" "$build" "$out" "$corpus"; r=$?
+            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused"; r=$?
             printf '%-8s %-8s rc=%d\n' "$layer" "$isa" "$r" >> "$out/rc.txt"
             # rc=2 dominates rc=1: "could not look" is never a mere failure.
             [ "$r" = 2 ] && worst=2
@@ -209,6 +262,35 @@ run_arms() {
                      "other arm: a bare arm and a \`run <build> <out>" \
                      "<corpus>\` arm are partial in COMPLEMENTARY families." \
                      >> "$out/rc.txt"
+                partial=$((partial+1))
+            fi
+            # A DEAD ROW WITH NO REFUSED SET IS AN UNREAD ROW (93-A).
+            #
+            # `dead_allow_rules` is the count this gate acts on: it is what
+            # takes an arm red, and what a wave then RETIRES from the
+            # allowlist.  Without the refused set the tool cannot separate a
+            # rule whose disagreement is gone from one whose encodings QEMU
+            # now refuses, so a nonzero count is not a finding -- it is an
+            # unanswered question, and answering it by deletion is how a
+            # correct rule gets a false reason written next to it.
+            #
+            # So: dead=0 without a refused set costs nothing and is not
+            # flagged; dead>0 without one is the gate's own "could not
+            # look".  The tool states which case it is on its summary line
+            # (`refused_encodings=-` means the question was never asked),
+            # and this reads the tool's answer rather than modelling it.
+            local dcnt rcnt
+            dcnt=$(sed -n 's/.*dead_allow_rules=\([0-9]*\).*/\1/p' \
+                   "$out/${layer:0:1}_$isa.txt" | head -1)
+            rcnt=$(sed -n 's/.*refused_reach=\([^ ]*\).*/\1/p' \
+                   "$out/${layer:0:1}_$isa.txt" | head -1)
+            if [ "${dcnt:-0}" -gt 0 ] 2>/dev/null && [ "${rcnt:-'-'}" = "-" ]
+            then
+                echo "  UNREADABLE-DEAD $layer $isa: $dcnt rule(s) report" \
+                     "DEAD and this arm has NO refused set, so a rule whose" \
+                     "encodings QEMU refuses is indistinguishable from a" \
+                     "stale one.  Capture the corpus with a sled that" \
+                     "writes refused_<isa>.tsv." >> "$out/rc.txt"
                 partial=$((partial+1))
             fi
             # Only a --srcenc arm has a reach to report.  `grep -c` exits 1
@@ -295,6 +377,58 @@ selftest() {
     grep -q 'carries no #so stamp' "$t/oN/rc.txt" \
         && echo "PASS  N2 and the reason names the missing stamp" \
         || { echo "FAIL  N2"; f=$((f+1)); }
+    #
+    # P/Q/R -- FINDING 93-A, the refused set, all three directions.
+    #
+    # P   a refused set stamped for ANOTHER build REFUSES.  It describes a
+    #     different admission gate, and the failure would otherwise be
+    #     silent: rules it cannot excuse simply read DEAD again.
+    # Q   an arm reporting DEAD rules with NO refused set is PARTIAL.  The
+    #     count is what a wave acts on, and without the set a live rule and
+    #     a stale one are the same number.
+    # R   the same arm WITH a refused set is not flagged -- the question was
+    #     asked, so the answer may be acted on.
+    #
+    mkdir -p "$t/corpus_rstale"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_rstale/x86_64.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\tfeedfacefeedface\n'
+      printf '#refused\tisa=x86_64\tencodings=1\n'
+      printf 'x86_64\t0f01c6\n'; } > "$t/corpus_rstale/x86_64.refused.tsv"
+    run_arms "$t/b" "$t/oP" "$t/corpus_rstale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  P a refused set from ANOTHER build REFUSES (rc=2)" \
+               || { echo "FAIL  P"; f=$((f+1)); }
+    grep -q 'do not describe one admission gate' "$t/oP/rc.txt" \
+        && echo "PASS  P2 and the reason names both stamps" \
+        || { echo "FAIL  P2"; f=$((f+1)); }
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+r=-
+case "$*" in *--refused=*) r=7 ;; esac
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=3 \
+superseded_allow_rules=0 superseded_by_refusal=0 refused_reach=$r \
+unscored_family=- ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/oQ" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  Q DEAD rules with no refused set are PARTIAL (rc=2)" \
+               || { echo "FAIL  Q"; f=$((f+1)); }
+    grep -q 'UNREADABLE-DEAD' "$t/oQ/rc.txt" \
+        && echo "PASS  Q2 and the reason is named, not just counted" \
+        || { echo "FAIL  Q2"; f=$((f+1)); }
+    mkdir -p "$t/corpus_r"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_r/x86_64.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf '#refused\tisa=x86_64\tencodings=1\n'
+      printf 'x86_64\t0f01c6\n'; } > "$t/corpus_r/x86_64.refused.tsv"
+    run_arms "$t/b" "$t/oR" "$t/corpus_r" x86_64 >/dev/null 2>&1
+    [ $? = 0 ] && echo "PASS  R the same DEAD count WITH a refused set is readable" \
+               || { echo "FAIL  R"; f=$((f+1)); }
+    grep -q 'refused-set x86_64 so=.*refused=' "$t/oR/rc.txt" \
+        && echo "PASS  R2 and the set the arm used is named in the roll-up" \
+        || { echo "FAIL  R2"; f=$((f+1)); }
     printf '#!/bin/sh\nexit 1\n' > "$t/b/contrib/plugins/isaxcheck"
     run_arms "$t/b" "$t/o4" "$t/corpus_ok" x86_64 >/dev/null 2>&1
     [ $? = 1 ] && echo "PASS  D a failing arm rolls up rc=1" \

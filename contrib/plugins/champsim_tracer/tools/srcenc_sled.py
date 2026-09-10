@@ -485,9 +485,19 @@ def main():
     _SLED_STATS_RE = re.compile(
         r"^# sled .* slots=(\d+) translated=(\d+) declined=(\d+) "
         r"no_chain=(\d+)", re.MULTILINE)
+    #: WHICH SLOTS, not just how many (FINDING 93-A).  sled_translate_one()
+    #: prints one of these per slot QEMU translated and the plugin built no
+    #: chain for, and the PC maps back through THIS run's own layout -- the
+    #: retry passes re-lay the leftovers, so base and stride are per-run and
+    #: the mapping has to be done where they are known.
+    _SLED_NOCHAIN_RE = re.compile(r"^# sled-nochain ([0-9a-f]+)$", re.MULTILINE)
 
     def run_slots(slots, img, label):
-        """Lay @slots out, translate them, return (tsv, mtsv, rc, stats)."""
+        """Lay @slots out, translate them, return (tsv, mtsv, rc, stats).
+
+        `stats["nochain_enc"]` is the list of ENCODINGS (hex) the driver
+        refused, recovered from its per-slot lines.
+        """
         base, stride, n = build_elf(a.isa, slots, img,
                                     EF_MIPS_NAN2008 if a.nan2008 else 0)
         tsv = img + ".tsv"
@@ -510,7 +520,8 @@ def main():
                      img + ".t.unknown_warnings.log"):
             if os.path.exists(junk):
                 os.remove(junk)
-        m = _SLED_STATS_RE.search(open(log).read())
+        logtext = open(log).read()
+        m = _SLED_STATS_RE.search(logtext)
         if not m:
             raise SystemExit(
                 "srcenc_sled: %s wrote no '# sled ... declined=' line -- "
@@ -519,6 +530,38 @@ def main():
                 "may not report; see %s" % (label, log))
         stats = dict(zip(("slots", "translated", "declined", "no_chain"),
                          (int(x) for x in m.groups())))
+        # THE NAMES, JOINED TO THIS RUN'S LAYOUT.  A PC outside the sled --
+        # the entry stub, say -- is not a slot and must not be turned into
+        # one by integer division, so the join is bounds-checked and the
+        # arithmetic is required to land exactly on a slot boundary.
+        nochain = []
+        stray = 0
+        for hx in _SLED_NOCHAIN_RE.findall(logtext):
+            pc = int(hx, 16)
+            if pc < base or (pc - base) % stride:
+                stray += 1
+                continue
+            i = (pc - base) // stride
+            if i >= n:
+                stray += 1
+                continue
+            nochain.append(slots[i].hex())
+        # THE TWO READINGS OF THE SAME FACT MUST AGREE.  The counter and the
+        # per-slot lines are written by the same branch of the same function;
+        # a disagreement means lines were lost (a truncated log, a full pipe)
+        # and a refused SET that is short is worse than none -- it would let
+        # a rule whose subject QEMU refuses be retired as dead.
+        if len(nochain) + stray != stats["no_chain"]:
+            raise SystemExit(
+                "srcenc_sled: %s counted no_chain=%d but named %d slot(s) "
+                "(+%d outside the sled) -- REFUSING.  A refused set that is "
+                "short cannot be told from a complete one, and a consumer "
+                "would read the difference as DEAD; see %s"
+                % (label, stats["no_chain"], len(nochain), stray, log))
+        if stray:
+            print("%s: %d '# sled-nochain' line(s) named a PC outside the "
+                  "sled's own slots and were NOT joined" % (label, stray))
+        stats["nochain_enc"] = nochain
         return tsv, mtsv, rc, stats
 
     def count_rows(path):
@@ -542,6 +585,12 @@ def main():
 
     rows, parts, mparts = 0, [], []
     declined_total = no_chain_total = retry_passes = 0
+    #: The union of every encoding any pass reported no_chain for.  A UNION
+    #: and not a per-pass tally: a retry re-lays the leftovers, so the same
+    #: encoding is refused again in every pass that sees it (which is why
+    #: `no_chain_total` counts pass 0 only), while a slot a first pass
+    #: DECLINED and a retry then refused is a genuine addition.
+    nochain_enc = set()
     for k in range(0, len(pop), a.chunk):
         chunk = pop[k:k + a.chunk]
         cidx = k // a.chunk
@@ -590,6 +639,7 @@ def main():
                 chunk_mparts.append(mtsv)
             chunk_parts.append(tsv)
             rows += got
+            nochain_enc.update(stats["nochain_enc"])
             if pass_no == 0:
                 no_chain_total += stats["no_chain"]
             declined_total += stats["declined"]
@@ -680,6 +730,72 @@ def main():
         f.write("#isa\tencoding\tmnem\tsrc\n")
         for line in seen.values():
             f.write(line)
+
+    # ------------------------------------------------------------------
+    # THE REFUSED SET, WRITTEN OUT (FINDING 93-A).
+    #
+    # A corpus says what the wire publishes for the encodings it carries.
+    # It is silent about the encodings it does NOT carry, and that silence
+    # has two completely different causes:
+    #
+    #   REFUSED    QEMU translated the bytes and this plugin's admission
+    #              gate built no template chain, so nothing is published.
+    #              A property of the encoding, and the answer to a
+    #              question that IS being asked.
+    #   UNREACHED  the sweep produced no row for a reason nothing recorded.
+    #
+    # A consumer that cannot tell them apart cannot adjudicate its own
+    # allowlist.  An allow rule whose every subject encoding is REFUSED is
+    # not dead -- the comparison it excuses never runs at this tree -- and
+    # retiring it as dead writes a false reason on a rule that is right.
+    # Measured at the poison-gate flip: 1,692 such rules across three ISAs.
+    #
+    # So the set is named, in a file stamped with the SAME `#tip`/`#so` as
+    # the corpus it belongs to, and the consumer binds the two by that
+    # stamp.  The header also carries the residue arithmetic, because the
+    # refused set being exact does not make the residue attributed: on
+    # x86_64 the population encodings with no row exceed the refused set,
+    # and that remainder is a separate open question, not a refusal.
+    # ------------------------------------------------------------------
+    #
+    # BOTH HALVES OF THE SILENCE ARE NAMED, and that is what makes the file
+    # usable.  A consumer deciding whether a rule's subject was removed by
+    # the admission gate needs to know not only which encodings WERE refused
+    # but which ones went missing for a reason nobody recorded -- otherwise
+    # a mnemonic with one refused representative and one unexplained hole
+    # reads as wholly refused, and the hole gets excused by a mechanism that
+    # did not cause it.
+    #
+    # Encodings OUTSIDE the population are not listed and are not the file's
+    # business: the corpus never carried them, so no comparison could ever
+    # have used them, and a consumer must ignore them rather than count them
+    # as either kind of silence.  (Measured: the riscv64 sweep decodes
+    # 16,842,752 encodings against a population of 87,657.  Treating the
+    # difference as unexplained silence vetoes every mnemonic there is.)
+    #
+    seen_hex = set(seen)
+    refused = sorted(e for e in nochain_enc if e not in seen_hex)
+    rset = set(refused)
+    unattr = sorted(e.hex() for e in pop
+                    if e.hex() not in seen_hex and e.hex() not in rset)
+    refused_path = os.path.join(a.out, "refused_%s.tsv" % a.isa)
+    missing_n = len(pop) - len(seen)
+    with open(refused_path, "w") as f:
+        f.write(capture_tip_line(a.build_dir))
+        f.write(capture_so_line(a.build_dir))
+        f.write("#refused\tisa=%s\tencodings=%d\tno_chain_pass0=%d\t"
+                "population=%d\tpopulation_without_row=%d\t"
+                "residue_unattributed=%d\n"
+                % (a.isa, len(refused), no_chain_total, len(pop), missing_n,
+                   len(unattr)))
+        f.write("#isa\tencoding\tsilence\n")
+        for e in refused:
+            f.write("%s\t%s\tREFUSED\n" % (a.isa, e))
+        for e in unattr:
+            f.write("%s\t%s\tUNATTRIBUTED\n" % (a.isa, e))
+    print("refused %s encodings=%d unattributed=%d (population %d, "
+          "population without a row %d)"
+          % (refused_path, len(refused), len(unattr), len(pop), missing_n))
     if a.mech:
         # THE SAME SCOPING as the read-list merge above, for the same reason:
         # the entry stub and the slot terminator are by-products of the

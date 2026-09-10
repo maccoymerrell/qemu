@@ -3897,6 +3897,27 @@ static void sled_translate_one(uint64_t pc, SledStats *st)
     g_mutex_unlock(&data_lock);
     if (!head) {
         st->no_chain++;
+        /*
+         * AND WHICH SLOT, not just how many (FINDING 93-A).
+         *
+         * `no_chain` is the admission gate's answer: QEMU translated the
+         * bytes and this plugin built no template chain for them, so the
+         * encoding publishes nothing and the corpus carries no row for it.
+         * The COUNT alone lets a consumer say a residue is fully attributed;
+         * it does not let one say WHICH encodings were refused, and that is
+         * the fact an allowlist needs.  A rule whose every subject encoding
+         * QEMU refuses is not dead -- the question it answers is not being
+         * asked -- and retiring it as dead writes a false reason on a rule
+         * that was right.  Without the names the two are indistinguishable,
+         * which is how 1,692 live rules came to read DEAD.
+         *
+         * One line per refused slot, on the same stream and under the same
+         * `# sled` prefix family as the summary; the consumer maps the PC
+         * back through its own layout (base + i*stride) to the encoding it
+         * put there.  The summary line is `# sled ` with a space, so a
+         * reader keying on that prefix cannot pick these up by accident.
+         */
+        fprintf(stderr, "# sled-nochain %" PRIx64 "\n", pc);
     }
 }
 

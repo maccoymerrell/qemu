@@ -1504,6 +1504,62 @@ static std::map<std::string, unsigned long> srcenc_unreached_by_mnem;
 static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
 
 /*
+ * THE REFUSED SET, AND THE THIRD THING AN UNUSED RULE CAN BE (FINDING 93-A).
+ *
+ * The dead-rule detector has always had two answers for a rule nothing
+ * matched: DEAD (the disagreement it excused is gone, or -- the case it
+ * exists for -- a decoder bump moved the signature out from under it) and
+ * SUPERSEDED (this arm does not score that read family at all).  There is a
+ * third, and it is the one the deletion produces at scale.
+ *
+ * An encoding the corpus does not carry is UNREACHED, and `--srcenc` counts
+ * it as such.  But the reason can be QEMU's own ADMISSION GATE: the bytes
+ * were translated and this plugin built no template chain for them, so the
+ * wire publishes nothing about that encoding and the read comparison has no
+ * subject.  A rule that excuses a disagreement on such an encoding is not
+ * stale -- the question it answers is not being asked at this tree -- and
+ * retiring it as dead writes a false reason on a rule that is correct.
+ *
+ * MEASURED at the poison-gate flip: the gate's own arms read 1,692 rules
+ * DEAD across three ISAs, every one of them a rule whose encodings QEMU had
+ * just begun to refuse (aarch64 +295,434 refused encodings, riscv64 +51,566,
+ * x86_64 +60,144).  At BASE, before any flip, the refused population is
+ * already 274,177 encodings -- so this category is verifiable without a wire
+ * change, which is why it lands first.
+ *
+ * THE SET IS NAMED, NOT INFERRED.  srcenc_sled.py writes `refused_<isa>.tsv`
+ * beside the corpus, carrying the encodings its driver reported no_chain
+ * for, stamped with the same `#tip`/`#so` as the corpus itself; `--refused`
+ * takes that file and the two stamps must agree, because a refused set taken
+ * from a different build describes a different admission gate.  Nothing here
+ * guesses which encodings QEMU would refuse.
+ *
+ * THE TEST IS PER MNEMONIC AND IT IS EXACT.  A rule is superseded by refusal
+ * when EVERY mnemonic its key names was refused on every encoding this sweep
+ * laid out for it: covered == 0 (nothing was scored, so the rule could not
+ * have been used), unreached-for-another-reason == 0 (the silence is the
+ * gate's, not an unexplained hole), and refused > 0 (there is a subject, and
+ * QEMU is what removed it).  Anything short of that stays DEAD, which is the
+ * direction that keeps the detector's power.
+ */
+static const char *refused_path = nullptr;
+static std::set<std::string> refused_enc, unattr_enc;
+/*
+ * COMPARISONS that landed in the refused set -- the same shape as
+ * `srcenc_covered` and `srcenc_unreached`, which are also per-compare() and
+ * not per distinct encoding (the x86_64 sweep decodes 1,248,657,408
+ * encodings against a population of 7,108,678, so one population member is
+ * reached many times).  Reported as `refused_reach=` for that reason: the
+ * SIZE of the refused set is a different number and is printed by the
+ * loader's own line, and by the gate's roll-up.
+ */
+static unsigned long srcenc_refused = 0;
+static std::set<std::string> srcenc_mnem_refused;  /* >=1 encoding refused   */
+static std::set<std::string> srcenc_mnem_unrsd;    /* >=1 unreached, NOT that */
+/* The `#so` stamp each of the two files carries, for the binding check. */
+static std::string srcenc_so, refused_so;
+
+/*
  * THE JOIN, AND WHY IT IS REPORTED SEPARATELY FROM THE DATAFLOW.
  *
  * `SR-rd-*` is a claim about DATAFLOW: these bytes read this register and
@@ -1895,7 +1951,18 @@ static bool srcenc_load(const char *path, const char *isa)
     char *line = nullptr; size_t cap = 0; ssize_t len;
     unsigned long rows = 0, conflicts = 0;
     while ((len = getline(&line, &cap, f)) > 0) {
-        if (line[0] == '#') continue;
+        if (line[0] == '#') {
+            /* The build stamp is remembered, not just skipped: `--refused`
+             * has to be shown to describe the SAME build as the corpus, and
+             * the two files are written by the same sled run. */
+            if (!strncmp(line, "#so\t", 4)) {
+                srcenc_so = line + 4;
+                while (!srcenc_so.empty() &&
+                       (srcenc_so.back() == '\n' || srcenc_so.back() == '\r'))
+                    srcenc_so.pop_back();
+            }
+            continue;
+        }
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
         if (!len) continue;
@@ -1954,6 +2021,134 @@ static bool srcenc_load(const char *path, const char *isa)
             path, isa, srcenc_map.size(), rows);
     return true;
 }
+/*
+ * Load the REFUSED set for this arm's ISA -- the encodings QEMU translated
+ * and the plugin's admission gate built no chain for.
+ *
+ * REFUSES rather than degrades, on the same rule as the corpus loader and
+ * for a sharper reason: this file's whole job is to keep a live allow rule
+ * from being retired with a false reason.  A file that is short, or that
+ * describes another build's admission gate, would do exactly that -- and
+ * silently, because a rule it fails to excuse simply reads DEAD again.
+ *
+ *   * no `#so` stamp, or one that differs from the corpus's: REFUSE.  The
+ *     admission gate is a property of the plugin binary; a set captured
+ *     from another one answers for another gate.
+ *   * no row for this ISA: REFUSE.  An empty refused set excuses nothing,
+ *     which is indistinguishable from a build that refuses nothing, and the
+ *     two have opposite meanings for every rule in the allowlist.  A build
+ *     that genuinely refuses nothing is named by its own header line, which
+ *     the sled always writes -- so the honest empty case is expressible and
+ *     the accidental one is not.
+ */
+static bool refused_load(const char *path, const char *isa)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "isaxcheck: --refused=%s cannot be opened: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    char *line = nullptr; size_t cap = 0; ssize_t len;
+    unsigned long rows = 0;
+    bool saw_header = false;
+    std::string want = std::string("isa=") + isa;
+    while ((len = getline(&line, &cap, f)) > 0) {
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (!len) continue;
+        if (line[0] == '#') {
+            if (!strncmp(line, "#so\t", 4)) refused_so = line + 4;
+            if (!strncmp(line, "#refused\t", 9) &&
+                strstr(line, want.c_str()))
+                saw_header = true;
+            continue;
+        }
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        if (strcmp(line, isa)) continue;
+        char *kind = strchr(tab + 1, '\t');
+        if (!kind) {
+            fprintf(stderr, "isaxcheck: --refused=%s row `%s' carries no "
+                    "silence column -- REFUSING.  REFUSED and UNATTRIBUTED "
+                    "mean opposite things to the rule this file exists to "
+                    "protect, and a row that does not say which is not an "
+                    "answer\n", path, tab + 1);
+            free(line); fclose(f); return false;
+        }
+        *kind++ = '\0';
+        if (!strcmp(kind, "REFUSED")) { refused_enc.insert(tab + 1); rows++; }
+        else if (!strcmp(kind, "UNATTRIBUTED")) unattr_enc.insert(tab + 1);
+        else {
+            fprintf(stderr, "isaxcheck: --refused=%s row `%s' has silence "
+                    "`%s', which this build has no meaning for -- REFUSING\n",
+                    path, tab + 1, kind);
+            free(line); fclose(f); return false;
+        }
+    }
+    free(line);
+    fclose(f);
+    if (refused_so.empty()) {
+        fprintf(stderr, "isaxcheck: --refused=%s carries no #so stamp -- "
+                "REFUSING.  A refused set that cannot be shown to describe "
+                "this build cannot excuse a rule from the dead-rule "
+                "detector\n", path);
+        return false;
+    }
+    if (!srcenc_so.empty() && refused_so != srcenc_so) {
+        fprintf(stderr, "isaxcheck: --refused=%s is stamped #so=%s but the "
+                "corpus is #so=%s -- REFUSING.  The admission gate belongs "
+                "to a plugin binary, and two files from two builds do not "
+                "describe one\n", path, refused_so.c_str(),
+                srcenc_so.c_str());
+        return false;
+    }
+    if (!saw_header) {
+        fprintf(stderr, "isaxcheck: --refused=%s carries no `#refused "
+                "isa=%s' header -- REFUSING.  Without it an absent row set "
+                "cannot be told from a file written for another ISA\n",
+                path, isa);
+        return false;
+    }
+    fprintf(stderr, "# refused set=%s isa=%s refused=%lu unattributed=%zu "
+            "so=%s\n", path, isa, rows, unattr_enc.size(),
+            refused_so.c_str());
+    return true;
+}
+
+/*
+ * Is every mnemonic this allow rule names one that QEMU refused outright?
+ *
+ * The key is `<class> <mnem> <detail...>`; the second token is the mnemonic
+ * (or a glob over mnemonics).  A key with no second token, or whose glob
+ * matches no refused mnemonic, is not this category's -- it falls through to
+ * DEAD, which is the direction that keeps the detector honest.
+ */
+static bool glob_match(const char *pat, const char *str);
+
+static bool rule_superseded_by_refusal(const std::string &key)
+{
+    if (!refused_path) return false;
+    size_t a = key.find(' ');
+    if (a == std::string::npos) return false;
+    size_t b = key.find(' ', a + 1);
+    std::string pat = key.substr(a + 1, b == std::string::npos
+                                            ? std::string::npos : b - a - 1);
+    if (pat.empty()) return false;
+    bool any = false;
+    for (const auto &m : srcenc_mnem_refused)
+        if (glob_match(pat.c_str(), m.c_str())) { any = true; break; }
+    if (!any) return false;
+    /* A mnemonic this arm SCORED, or one whose silence has no recorded
+     * cause, means the rule's subject was not wholly removed by the gate. */
+    for (const auto &m : srcenc_mnem_hit)
+        if (glob_match(pat.c_str(), m.c_str())) return false;
+    for (const auto &m : srcenc_mnem_unrsd)
+        if (glob_match(pat.c_str(), m.c_str())) return false;
+    return true;
+}
+
 static bool falsify_requested = false;
 
 /*
@@ -2245,6 +2440,31 @@ static void compare(const uint8_t *b, size_t n)
         } else {
             srcenc_unreached++;
             if (c.ok) srcenc_unreached_by_mnem[c.mnem]++;
+            /*
+             * WHY the corpus is silent about this encoding, when the sled
+             * recorded an answer.  REFUSED is QEMU's admission gate saying
+             * it publishes nothing here; anything else is a hole with no
+             * cause, and the two must not be pooled -- pooling them is what
+             * would let an unexplained hole excuse a rule.
+             */
+            if (refused_path && refused_enc.count(hx)) {
+                srcenc_refused++;
+                if (c.ok) srcenc_mnem_refused.insert(c.mnem);
+            } else if (refused_path && unattr_enc.count(hx)) {
+                if (c.ok) srcenc_mnem_unrsd.insert(c.mnem);
+            }
+            /*
+             * ANYTHING ELSE IS OUTSIDE THE CORPUS'S POPULATION, and is
+             * neither kind of silence.  This sweep decodes far more
+             * encodings than the sled laid out (riscv64: 16,842,752 against
+             * a population of 87,657), and those extra encodings were never
+             * candidates for a corpus row, so no comparison could ever have
+             * used one.  Counting them as unexplained holes vetoes every
+             * mnemonic there is; counting them as refusals excuses rules
+             * nothing removed the subject of.  They are not evidence either
+             * way, and the population partition the sled publishes is what
+             * separates them.
+             */
         }
     }
     std::string cd = c.ok ? (c.mnem + " " + c.ops) : std::string("<cs-reject>");
@@ -3000,6 +3220,12 @@ static void emit_srcenc_shard(void)
     printf("#srcencunr\t%lu\t\n", srcenc_unreached);
     for (const auto &m : srcenc_mnem_hit) printf("#srcencmh\t0\t%s\n", m.c_str());
     for (const auto &m : srcenc_mnem_all) printf("#srcencma\t0\t%s\n", m.c_str());
+    /* The refusal sets cross as SETS for the same reason the reach sets do:
+     * a union over shards, not a sum, or a mnemonic every shard saw would
+     * be counted once per shard. */
+    printf("#srcencrf\t%lu\t\n", srcenc_refused);
+    for (const auto &m : srcenc_mnem_refused) printf("#srcencmr\t0\t%s\n", m.c_str());
+    for (const auto &m : srcenc_mnem_unrsd) printf("#srcencmn\t0\t%s\n", m.c_str());
     for (const auto &kv : srcenc_unreached_by_mnem)
         printf("#srcencum\t%lu\t%s\n", kv.second, kv.first.c_str());
     /*
@@ -3230,6 +3456,13 @@ static void usage(void)
         "                  corpus does not carry is UNREACHED, counted,\n"
         "                  and never scored as agreement; the summary\n"
         "                  line prints srcenc_reach=covered/total\n"
+        "  --refused=FILE  the encodings QEMU's admission gate refused,\n"
+        "                  written beside the corpus by srcenc_sled.py and\n"
+        "                  stamped with the same #so.  An unused allowlist\n"
+        "                  rule whose every mnemonic was refused on every\n"
+        "                  encoding is reported SUPERSEDED-BY-REFUSAL, not\n"
+        "                  dead: the question it answers is not being asked\n"
+        "                  at this tree.  Requires --srcenc\n"
         "  --dump-pop=FILE write every encoding this sweep decodes to\n"
         "                  FILE.<shard>, which is the population the\n"
         "                  translate-only sled is driven over\n"
@@ -3276,6 +3509,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--cs-mode-add=", 14)) csmodeadd = argv[i] + 14;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
         else if (!strncmp(argv[i], "--srcenc=", 9)) srcenc_path = argv[i] + 9;
+        else if (!strncmp(argv[i], "--refused=", 10)) refused_path = argv[i] + 10;
         else if (!strncmp(argv[i], "--dump-pop=", 11)) pop_path = argv[i] + 11;
         else if (!strncmp(argv[i], "--pop-per-mnem=", 15)) pop_per_mnem = (unsigned)atoi(argv[i] + 15);
         else if (!strncmp(argv[i], "--falsify=", 10)) {
@@ -3415,6 +3649,19 @@ int main(int argc, char **argv)
      * isax_fields_init() has bound the tables.  An earlier draft loaded it
      * beside the --classes flags and read cfg.name before it was assigned. */
     if (srcenc_path && !srcenc_load(srcenc_path, cfg.name)) return 2;
+    /*
+     * The refused set is meaningless without the corpus it belongs to: it
+     * explains the corpus's SILENCES.  Asking for one without the other is
+     * a mistake in the invocation, not a degraded mode.
+     */
+    if (refused_path && !srcenc_path) {
+        fprintf(stderr, "isaxcheck: --refused without --srcenc has no "
+                "subject -- the refused set explains which of the CORPUS's "
+                "silences are QEMU's admission gate, and there is no corpus "
+                "here\n");
+        return 2;
+    }
+    if (refused_path && !refused_load(refused_path, cfg.name)) return 2;
 
     if (hexone) {
         uint8_t b[24]; unsigned n = 0;
@@ -3650,6 +3897,13 @@ int main(int argc, char **argv)
                 if (key == "#srcencunr") { srcenc_unreached += cnt; continue; }
                 if (key == "#srcencmh") { srcenc_mnem_hit.insert(samp); continue; }
                 if (key == "#srcencma") { srcenc_mnem_all.insert(samp); continue; }
+                if (key == "#srcencrf") { srcenc_refused += cnt; continue; }
+                if (key == "#srcencmr") {
+                    srcenc_mnem_refused.insert(samp); continue;
+                }
+                if (key == "#srcencmn") {
+                    srcenc_mnem_unrsd.insert(samp); continue;
+                }
                 if (key == "#srcencum") {
                     srcenc_unreached_by_mnem[samp] += cnt; continue;
                 }
@@ -3782,10 +4036,19 @@ int main(int argc, char **argv)
         }
         return k.compare(0, 6, "SR-rd-") == 0;
     };
-    std::vector<const AllowRule *> dead, superseded;
+    std::vector<const AllowRule *> dead, superseded, sup_refused;
     for (const auto &r : allow_rules) {
         if (r.used || r.isa != cfg.name) continue;
         if (is_superseded_key(r.key)) superseded.push_back(&r);
+        /*
+         * SUPERSEDED BY REFUSAL comes AFTER the family test and BEFORE
+         * DEAD, and the order is the classification: a rule whose family
+         * this arm never scores was never asked, whatever QEMU does with
+         * its encodings; a rule whose family IS scored and whose every
+         * subject encoding QEMU refused was asked and has no subject left.
+         * Only what neither explains is dead.
+         */
+        else if (rule_superseded_by_refusal(r.key)) sup_refused.push_back(&r);
         else dead.push_back(&r);
     }
 
@@ -3823,10 +4086,13 @@ int main(int argc, char **argv)
         printf("# isa=%s layer=fixups encodings_tried=%lu "
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
                "dead_allow_rules=%zu superseded_allow_rules=%zu "
+               "superseded_by_refusal=%zu refused_reach=%s "
                "unscored_family=%s\n",
                cfg.name, total_tried, buckets.size(),
                buckets.size() - unallowed, unallowed, dead.size(),
-               superseded.size(), unscored_family);
+               superseded.size(), sup_refused.size(),
+               refused_path ? std::to_string(srcenc_refused).c_str() : "-",
+               unscored_family);
     else
     {
         unsigned long size_gap_encodings = 0;
@@ -3835,13 +4101,16 @@ int main(int argc, char **argv)
                "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
                "subtarget_gap=%lu/%lu size_gap=%zu/%lu "
                "dead_allow_rules=%zu superseded_allow_rules=%zu "
+               "superseded_by_refusal=%zu refused_reach=%s "
                "unscored_family=%s ambiguous_reg_tokens=%u\n",
                cfg.name, layer == LAYER_FIELDS ? "fields" : "boundary",
                total_tried, buckets.size(),
                buckets.size() - unallowed, unallowed,
                gap_sigs, gap_encodings,
                size_gap_by_mnem.size(), size_gap_encodings,
-               dead.size(), superseded.size(), unscored_family,
+               dead.size(), superseded.size(), sup_refused.size(),
+               refused_path ? std::to_string(srcenc_refused).c_str() : "-",
+               unscored_family,
                regmap_ambiguous_tokens);
         if (srcenc_path) {
             unsigned long tot = srcenc_covered + srcenc_unreached;
@@ -3992,6 +4261,16 @@ int main(int argc, char **argv)
     for (const AllowRule *r : superseded)
         printf("SUPERSEDED %s:%u %s %s\n", allow ? allow : "-", r->lineno,
                r->isa.c_str(), r->key.c_str());
+    /*
+     * NAMED, WITH ITS LINE, exactly like the other two.  A category that
+     * only appears as a count on the summary line is a category nobody can
+     * audit -- and this one exists precisely so that a rule is not retired
+     * on a reason nobody checked.  Printing the row lets the next reader
+     * confirm, per rule, that QEMU is what removed its subject.
+     */
+    for (const AllowRule *r : sup_refused)
+        printf("SUPERSEDED-BY-REFUSAL %s:%u %s %s\n", allow ? allow : "-",
+               r->lineno, r->isa.c_str(), r->key.c_str());
 
     if (!falsify_mnem.empty() && falsify_refused()) return 2;
 

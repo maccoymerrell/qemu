@@ -190,6 +190,59 @@ CLAIM_RE = re.compile(r'GATE\s+PASSED\s*--\s*(\d+)\s+legs', re.M)
 #: rows.  A commit named to --message WITHOUT it is not judged as a record;
 #: it is reported as unmarked, which is a different sentence.
 MARKER_RE = re.compile(r'^\s*R13-LEG-RECORD\s*$', re.M)
+
+#: THE PATHS THAT CANNOT MOVE THE WIRE (FINDING 93-D).
+#:
+#: `--message` used to have exactly two answers for a commit carrying no
+#: record: it is complete, or it is UNMARKED and that is a failure.  There is
+#: a third, and it is the commonest kind of commit on this branch -- one that
+#: OWES no record, because it moves no wire.  Run back over the six commits
+#: before this one, four touch nothing but `tools/`, and convicting them says
+#: nothing about anything; a check whose FAIL carries no information is a
+#: check a reader learns to skip, which is how the one real failure gets
+#: missed.
+#:
+#: THE LIST IS THE NON-WIRE SIDE AND THAT DIRECTION IS THE WHOLE SAFETY OF
+#: IT.  A path nobody classified is WIRE, so the answer to an unfamiliar file
+#: is "this commit owes a record" and a new subdirectory cannot quietly
+#: acquire an exemption.  The four prefixes here are the offline half of this
+#: directory -- the instruments, the gates, the acceptance tools, the
+#: validator harness and the documentation.  None of them is linked into
+#: `libchampsim_tracer.so` and none of them is compiled into any emulator, so
+#: none can change a byte the tracer emits; what they change is what a
+#: SCORER says about those bytes, which is the subject of every other check
+#: here and not of this one.
+#:
+#: IT DOES NOT REACH INSIDE THE PLUGIN, AND THAT RESIDUE IS NAMED RATHER THAN
+#: PAPERED OVER.  `5f5aadde6b` edits champsim_tracer.cc and is NON-WIRE -- it
+#: hoists a side-effect-free predicate out of a scored 2x2 -- but only
+#: READING the diff establishes that, and no path rule can read C++.  A
+#: plugin translation unit therefore always owes a record (or a disposition
+#: in the bindings table), and this rule leaves that commit exactly as it
+#: found it.
+NON_WIRE_PREFIXES = (
+    'contrib/plugins/champsim_tracer/tools/',
+    'contrib/plugins/champsim_tracer/docs/',
+    'contrib/plugins/champsim_tracer/validator/',
+    'docs/',
+)
+
+
+def commit_wire_paths(repo, commit):
+    """Paths this commit touches that are NOT on the non-wire list.
+
+    Returns None when the diff cannot be read -- a check that cannot find
+    its subject does not get to conclude "no wire".
+    """
+    out = git(repo, 'show', '--name-only', '--format=', '--no-renames', commit)
+    if out is None:
+        return None
+    paths = [p.strip() for p in out.splitlines() if p.strip()]
+    if not paths:
+        # An empty diff is not evidence of anything.  Treated as WIRE so the
+        # commit still owes a record and the reader is told to look.
+        return []
+    return [p for p in paths if not p.startswith(NON_WIRE_PREFIXES)]
 #: A record that TRANSCRIBES another commit's run rather than reporting its
 #: own.  Its TREE= is the tree that commit carries, because that is the tree
 #: the legs in the table were measured at.
@@ -452,14 +505,36 @@ def check_message(repo, commit, manifest, want_tree=True, bindings=None):
         # exactly as it always was, while "unmarked WITHOUT rows" is the
         # quotation and is named as one.  No date, no cutoff commit, and
         # nothing to keep in step with the branch.
+        # M0b OWES (FINDING 93-D).  Before convicting, ask whether this
+        # commit owed a record at all.  A commit whose whole diff is on the
+        # non-wire side moves no byte the tracer emits, so the in-commit leg
+        # rule has no claim on it, and "UNMARKED" would be a failure that
+        # says nothing -- see NON_WIRE_PREFIXES for why the list is the
+        # non-wire side and what it deliberately does NOT reach.
+        wire = commit_wire_paths(repo, commit)
+        if wire is None:
+            return ['%s: the diff is not readable, so whether this commit '
+                    'owes a leg record cannot be decided -- a check that '
+                    'cannot find its subject FAILS' % commit[:12]]
+        if not wire:
+            return ['NOTE %s: NO-WIRE -- every path this commit touches is '
+                    'on the non-wire side (%s), so it owes no leg record and '
+                    'carries none.  Not scored on M1/M2/M3.'
+                    % (commit[:12],
+                       ', '.join(sorted(set(
+                           p.rsplit('/', 1)[0] + '/'
+                           for p in git(repo, 'show', '--name-only',
+                                        '--format=', '--no-renames',
+                                        commit).split()))[:4]))]
         return ['%s: UNMARKED -- no `R13-LEG-RECORD` line and no manifest '
-                'leg rows%s.  Nothing here claims to be a leg record, so '
+                'leg rows%s, and it touches %d path(s) on the WIRE side '
+                '(%s).  Nothing here claims to be a leg record, so '
                 'M1/M2/M3 have no subject; a commit that OWES one (every '
                 'commit that moves the wire) must carry the marker and the '
                 'rows'
                 % (commit[:12],
                    ', though the message does quote the gate verdict line'
-                   if claim else '')]
+                   if claim else '', len(wire), ', '.join(wire[:3]))]
     if marked and not claim and not record_rows:
         return ['%s: marked `R13-LEG-RECORD` but carries no record (no '
                 '"GATE PASSED -- N legs" line and no manifest leg rows).  '
@@ -886,6 +961,48 @@ def selftest():
             fails.append('arm17e an unmarked message WITH manifest rows is a '
                          'legacy record and must still be scored: %s' % r)
 
+        # ------------------------------------------- FINDING 93-D arms
+        # ARM 18 -- OWES vs HAS.  18a is a commit whose whole diff is on the
+        # non-wire side: it owes no record, so it must read NO-WIRE and must
+        # NOT be a failure.  18b is the SAME message on a commit that also
+        # touches a plugin translation unit: the exemption must not follow
+        # the message, so it has to go back to UNMARKED.  18c is 18a's body
+        # WITH the marker: owing nothing is not a licence to carry a broken
+        # claim, so a marked no-wire commit is still scored and still fails.
+        # Without 18b and 18c the path rule would be an opt-out.
+        nw = os.path.join(repo, 'contrib/plugins/champsim_tracer/tools')
+        os.makedirs(nw, exist_ok=True)
+        with open(os.path.join(nw, 'harness.sh'), 'w') as f:
+            f.write('# a gate\n')
+        g('add', 'contrib/plugins/champsim_tracer/tools/harness.sh')
+        g('commit', '-q', '-m', 'tools: a gate learns to look')
+        nowire_c = g('rev-parse', 'HEAD')
+        r = check_message(repo, nowire_c, man)
+        if not any(x.startswith('NOTE ') and 'NO-WIRE' in x for x in r):
+            fails.append('arm18 a commit touching only the non-wire side '
+                         'must read NO-WIRE: %s' % r)
+        if any('UNMARKED' in x for x in r):
+            fails.append('arm18b a NO-WIRE commit must not also be convicted '
+                         'UNMARKED: %s' % r)
+        pdir = os.path.join(repo, 'contrib/plugins/champsim_tracer')
+        with open(os.path.join(pdir, 'champsim_tracer.cc'), 'w') as f:
+            f.write('/* a plugin TU */\n')
+        g('add', 'contrib/plugins/champsim_tracer/champsim_tracer.cc')
+        g('commit', '-q', '-m', 'tools: a gate learns to look')
+        mixed_c = g('rev-parse', 'HEAD')
+        r = check_message(repo, mixed_c, man)
+        if not any('UNMARKED' in x for x in r):
+            fails.append('arm18c the SAME message on a commit that touches a '
+                         'plugin TU must go back to UNMARKED -- the '
+                         'exemption is the DIFF\'s, not the message\'s: %s'
+                         % r)
+        g('commit', '-q', '--amend', '-m',
+          'tools: a gate learns to look\n\nR13-LEG-RECORD\n')
+        r = check_message(repo, g('rev-parse', 'HEAD'), man)
+        if not r or all(x.startswith('NOTE ') for x in r):
+            fails.append('arm18d a MARKED commit must be scored whatever its '
+                         'paths -- the marker is the claim: %s' % r)
+
     # ONE LINE PER ARM, in the runner's own grammar (selftest_all.sh's
     # count_arms).  A selftest that prints only a total renders identically
     # to one that asserts nothing, and this directory's runner scores that
@@ -906,7 +1023,9 @@ def selftest():
              'a complete record naming its own tree passes',
              'RECORD-COMPLETED-BY pointing at an incomplete record fails',
              'the manifest is read as of the record\'s own tree',
-             'an unmarked quotation reads UNMARKED, and marking it makes it a claim']
+             'an unmarked quotation reads UNMARKED, and marking it makes it a claim',
+             'a commit that owes no record reads NO-WIRE, and the exemption '
+             'belongs to the diff rather than to the message']
     hit = set()
     for f in fails:
         print('SELFTEST FAIL: %s' % f)
@@ -971,11 +1090,20 @@ def main():
             bad.append('--message %s does not resolve in %s' % (c, repo))
             continue
         bad += check_message(repo, full, manifest, bindings=binds)
+    # A NOTE IS NOT A FAILURE AND IS NOT SILENCE EITHER (FINDING 93-D).  The
+    # no-wire verdict is PRINTED and COUNTED on its own line, because a
+    # commit that quietly disappears from the roll-up cannot be told from one
+    # the caller forgot to name -- which is the shape of the hole this whole
+    # instrument exists against.
+    notes = [b[len('NOTE '):] for b in bad if b.startswith('NOTE ')]
+    bad = [b for b in bad if not b.startswith('NOTE ')]
+    for n in notes:
+        print('LEGCHECK NOTE: %s' % n)
     for b in bad:
         print('LEGCHECK FAIL: %s' % b)
-    print('legcheck: %d record(s), %d in-commit record(s), %d failure(s), '
-          'commit %s, manifest %d legs'
-          % (len(a.rc), len(a.message), len(bad), commit[:12],
+    print('legcheck: %d record(s), %d in-commit record(s), %d owed no record, '
+          '%d failure(s), commit %s, manifest %d legs'
+          % (len(a.rc), len(a.message), len(notes), len(bad), commit[:12],
              len(manifest or [])))
     return 1 if bad else 0
 

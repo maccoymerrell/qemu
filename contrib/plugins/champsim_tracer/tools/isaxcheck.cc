@@ -1630,6 +1630,32 @@ static std::string srcenc_so, refused_so;
  * supersede no rule.  Writing every (signature, encoding) pair the sweep
  * produces would be millions of rows per ISA to answer a question about a few
  * dozen; writing the ones a rule could possibly be about is the same answer.
+ *
+ * AND NO ONE-BUILD RUN CAN WITNESS THIS CATEGORY FIRING ON AN `SR-` RULE.
+ * That is worth writing down because the obvious next experiment -- point the
+ * pair file and the refused set at the SAME build and look for a signature
+ * whose encodings are all refused -- cannot succeed, and its zero would be
+ * read as evidence the join is inert rather than as evidence the run was
+ * impossible.
+ *
+ * srcenc_score_reads() is the sole producer of `SR-rd-*`, and its first line
+ * is `if (!row) return;`.  A REFUSED encoding is precisely one the corpus
+ * carries no row for.  So a refused encoding produces no SR signature AT ANY
+ * TREE, and an SR signature's encoding set can never intersect the refused
+ * set taken from the SAME build.  The join is not broken by this -- it is
+ * what the two-arm shape exists for: the pairs come from BASE, where those
+ * encodings were admitted and DID make the signature, and the refused set
+ * comes from HEAD, where the flip made them refused.  One build has only
+ * half the evidence.
+ *
+ * MEASURED at 62f7693ccf on riscv64 (exec160), which is the reading that
+ * sent this paragraph looking for its cause: of 689,311 boundary and 582,913
+ * fields pair-encodings, ZERO are among the 768 encodings QEMU refuses --
+ * not one, on either layer -- while 46,774 SR pair-encodings exist, so the
+ * family is present and the intersection is empty rather than the population.
+ * The non-SR classes (D-, M-, B-, Z-) do not consult the corpus and so are
+ * not covered by the argument above; riscv64's zero for those is a fact
+ * about its 768 refusals and not a structural one.
  */
 /* The DUMP side's four are declared above note(), which is their only
  * writer; the join side's live here.  Same instrument, split by where the

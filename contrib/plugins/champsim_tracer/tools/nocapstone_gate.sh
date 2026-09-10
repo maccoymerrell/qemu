@@ -4,7 +4,7 @@
 #
 # Usage:
 #   nocapstone_gate.sh [--build-dir DIR] [--nocap-dir DIR] [--out DIR]
-#                      [--stage link|compile|battery|all] [--configure]
+#                      [--stage declare|link|compile|battery|all] [--configure]
 #   nocapstone_gate.sh --selftest [scratch-dir]
 #
 # THE RULING.  "I want the removal of Capstone enforced.  No 'one residual
@@ -16,6 +16,14 @@
 # stage it runs either passes or the gate is RED.
 #
 # WHAT EACH STAGE PROVES, and why one stage is not enough.
+#
+#   declare  The plugin's own `shared_module()` in contrib/plugins/meson.build
+#            does not name `capstone` among its dependencies.  This is the
+#            form no counted number covered (FINDING 93-C): the census counts
+#            headers, enum rows, admission gates and field reads, and a
+#            deletion that removed all four while leaving the build
+#            declaration would read zero everywhere over a plugin that still
+#            pulls Capstone's include path and library.  See stage_declare.
 #
 #   link     The built plugin's dynamic UNDEFINED symbol list names no
 #            Capstone-backed entry point.  `qemu_plugin_cap_decode` is the
@@ -340,6 +348,42 @@ EOF
     [ "$rc_clean"   = 0 ] || { note "  SELFTEST FAIL: the link stage refused a plugin with NO Capstone import"; bad=1; }
     [ "$rc_planted" = 1 ] || { note "  SELFTEST FAIL: the link stage PASSED a planted qemu_plugin_cap_decode call"; bad=1; }
     [ "$rc_absent"  = 1 ] || { note "  SELFTEST FAIL: the link stage passed with no subject to read"; bad=1; }
+    # THE BUILD-DECLARATION SCAN, PROVED BOTH WAYS ON FIXTURES (93-C).
+    # The real tree declares Capstone today, so running the stage against it
+    # can only ever show the RED half; a stage whose GREEN nobody has seen is
+    # a stage that might be reporting green for the wrong reason.  Three
+    # fixture meson.build files with a KNOWN answer, and the third is the one
+    # that matters most: a file with no champsim_tracer module in it must
+    # REFUSE, not pass for want of a match.
+    local d="$scratch/declare"
+    mkdir -p "$d"
+    cat > "$d/with.build" <<'EOF'
+  champsim_tracer_so = shared_module('champsim_tracer',
+                     champsim_tracer_sources,
+                     cpp_args: champsim_tracer_cpp_args,
+                     dependencies: [glib, capstone])
+EOF
+    cat > "$d/without.build" <<'EOF'
+  champsim_tracer_so = shared_module('champsim_tracer',
+                     champsim_tracer_sources,
+                     cpp_args: champsim_tracer_cpp_args,
+                     dependencies: [glib])
+EOF
+    cat > "$d/other.build" <<'EOF'
+  isaxcheck = executable('isaxcheck', files('isaxcheck.cc'),
+                     dependencies: [glib, capstone])
+EOF
+    declare_scan "$d/with.build"    "$d/with.blocks";    local rc_dw=$?
+    declare_scan "$d/without.build" "$d/without.blocks"; local rc_dc=$?
+    declare_scan "$d/other.build"   "$d/other.blocks";   local rc_do=$?
+    declare_scan "$d/absent.build"  "$d/absent.blocks";  local rc_da=$?
+    note "  declare       with=$rc_dw (expect 1)  without=$rc_dc (expect 0)" \
+         " reference-tool-only=$rc_do (expect 2)  missing=$rc_da (expect 2)"
+    [ "$rc_dw" = 1 ] || { note "  SELFTEST FAIL: a declared capstone dependency was NOT caught"; bad=1; }
+    [ "$rc_dc" = 0 ] || { note "  SELFTEST FAIL: a clean shared_module did not pass"; bad=1; }
+    [ "$rc_do" = 2 ] || { note "  SELFTEST FAIL: a file whose only capstone user is a REFERENCE TOOL must REFUSE, not convict"; bad=1; }
+    [ "$rc_da" = 2 ] || { note "  SELFTEST FAIL: a missing meson.build must REFUSE, not pass"; bad=1; }
+
     # THE FIELDS SURVEY HAS ITS OWN SELFTEST, AND NOTHING ELSE RUNS IT.
     # The survey delegates a number to capfield_census.sh, so a survey that
     # prints a comfortable count over a census that cannot discriminate is
@@ -412,6 +456,75 @@ EOF
     fi
     note "nocapstone_gate: SELFTEST RED — this gate's verdicts cannot be trusted"
     return 1
+}
+
+# ------------------------------------------------------------- stage declare
+#
+# THE BUILD DECLARATION, WHICH NO COUNTED NUMBER COVERED (FINDING 93-C).
+#
+# The R14 census counts headers, enum rows, admission gates and field reads.
+# `contrib/plugins/meson.build` declares `capstone` in the plugin's own
+# `shared_module(... dependencies: [glib, capstone])`, and neither this gate
+# nor capfield_census.sh read that file at all -- grep: zero hits in either.
+# So a deletion that removed the four mnemonic headers and left this line
+# would leave every counter reading zero over a plugin that still declares
+# the dependency, still gets Capstone's include path on its command line, and
+# still links its library.
+#
+# It is a HOLE IN THE INSTRUMENT rather than a new dependency, and that is
+# exactly why it belongs here: the other three stages measure what the plugin
+# DOES, and this one measures what the build system SAYS it needs.  A plugin
+# can pass `link` (it imports no cs_* symbol) and `compile` (a build with the
+# headers present never exercises their absence) while the declaration stands.
+#
+# THE SCOPE IS THE PLUGIN'S OWN shared_module AND NOTHING ELSE.  Ruling R13
+# keeps Capstone as an external reference decoder, and isaxcheck and
+# capstone_workaround_probe declare it deliberately -- naming those would make
+# this stage red forever for a reason that is not a defect.  The extraction
+# reads the `shared_module('champsim_tracer', ...)` calls, each one bounded by
+# its own parentheses, and looks only inside them.
+#
+# A STAGE THAT CANNOT FIND ITS SUBJECT FAILS.  No meson.build, or a
+# meson.build with no champsim_tracer shared_module in it, is RED and says
+# which: an empty search is not a clean result.
+#
+# THE SCAN, SEPARATED FROM THE VERDICT so the selftest can drive it on a
+# fixture.  A stage that can only be run against the real tree is a stage
+# whose GREEN nobody has ever seen -- the shape this file's own header
+# forbids.  Returns 0 clean, 1 capstone declared, 2 no subject.
+declare_scan() {
+    local mb=$1 blocks=$2
+    [ -f "$mb" ] || return 2
+    awk '
+        /shared_module\(.champsim_tracer./ { inblk = 1; depth = 0 }
+        inblk {
+            print
+            n = gsub(/\(/, "(") ; depth += n
+            n = gsub(/\)/, ")") ; depth -= n
+            if (depth <= 0) { inblk = 0 }
+        }
+    ' "$mb" > "$blocks"
+    [ -s "$blocks" ] || return 2
+    grep -qE '(^|[^_[:alnum:]])capstone([^_[:alnum:]]|$)' "$blocks" && return 1
+    return 0
+}
+
+stage_declare() {
+    local root=${1:-$SRC_ROOT}
+    local mb="$root/contrib/plugins/meson.build"
+    local blocks="$OUT_DIR/meson_shared_module.txt"
+    declare_scan "$mb" "$blocks"
+    case $? in
+      2) fail "declare: $mb has no shared_module('champsim_tracer', ...) to" \
+              "read -- the search found no subject, which is not a pass"
+         return ;;
+      1) fail "declare: the plugin's own shared_module declares Capstone:"
+         grep -nE '(^|[^_[:alnum:]])capstone([^_[:alnum:]]|$)' "$blocks" \
+             | sed 's/^/            /'
+         return ;;
+    esac
+    pass "declare: $(grep -c "shared_module(.champsim_tracer." "$blocks")" \
+         "champsim_tracer shared_module block(s), none naming capstone"
 }
 
 # ---------------------------------------------------------------- stage link
@@ -570,6 +683,7 @@ note ""
 
 case "$STAGE" in
     selftest) selftest "$SELFTEST_DIR" || FAILED=1 ;;
+    declare) stage_declare ;;
     link)    stage_link ;;
     compile) stage_compile ;;
     battery) stage_battery ;;
@@ -584,7 +698,7 @@ case "$STAGE" in
     # The verdict does not change either way (FAILED is already 1); what
     # changes is that the output now accounts for every stage it claims to
     # cover.
-    all)     stage_link; stage_compile; stage_battery ;;
+    all)     stage_declare; stage_link; stage_compile; stage_battery ;;
     *) echo "nocapstone_gate: unknown stage '$STAGE'" >&2; exit 2 ;;
 esac
 

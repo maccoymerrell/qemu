@@ -2469,12 +2469,52 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
      * model makes of the semantics; 22d7666262 is the precedent for a
      * register an unimplemented feature makes invisible to the op stream.
      *
+     * AND xregs[31] IS SP, WHICH IS WHY THIS MIRRORS cpu_reg()'s reg == 31
+     * RULE INSTEAD OF INDEXING THE ARRAY.
+     *
+     * ARM DDI 0487 gives WFET's Rt the XZR interpretation at Rt == 31, not
+     * the SP one -- the register field is `Rt`, and the only slots that read
+     * 31 as SP are the ones the manual spells `Rn|SP`.  QEMU's CPUARMState
+     * keeps the stack pointer IN xregs[31], so `offsetof(xregs[0]) + 31 *
+     * sizeof(...)` is the SP's bytes, and the statement above named SP as an
+     * operand of an instruction that does not have one.  That is a
+     * FABRICATION, and stating it is worse than saying nothing: a consumer
+     * reading this list sees a dependency on the stack pointer that the
+     * architecture does not define and the emulator never took.
+     *
+     * cpu_reg() is where the tree already decides what register 31 is in a
+     * plain register slot, and it decides XZR: it returns a fresh zero temp
+     * and takes the zero-register note rather than touching xregs[31].  This
+     * arm cannot call it -- WFET emits no op, so a returned global would be
+     * consumed by nothing and the Rt != 31 statement would be lost -- so it
+     * carries the same rule by hand, in the one shape that adds nothing:
+     * state the register for every Rt the array actually holds, and state
+     * NOTHING at Rt == 31.
+     *
+     * NOTHING IS STATED HERE AT Rt == 31 -- and that is not the same as the
+     * wire publishing an empty list, which is what this comment claimed
+     * before the whole-population arm was run and is corrected here rather
+     * than shipped.  MEASURED over the exhaustive AArch64 sweep: the
+     * published list for `1f1003d5` (`wfet xzr`) goes
+     * `REG_SP,REG_ZERO` -> `REG_ZERO`.  The REG_ZERO that remains is the
+     * tree-wide zero-register statement every Rn == 31 slot gets -- 134,342
+     * rows over 218 mnemonics carry it -- and it is not this site's to
+     * suppress.  What this guard removes is the SP, and only the SP:
+     * REG_SP-naming rows 39,996 -> 39,995 across the whole population.
+     *
+     * The reason for stating nothing rather than a zero-register note of its
+     * own is the difference this file keeps making:
+     * insn_dataflow_note_zero_reg() describes a TEMP's contents, and there
+     * is no temp here because no op is emitted.
+     *
      * Capture only; no op is emitted, altered or suppressed.
      */
-    insn_dataflow_note_stated_read_env(
-        offsetof(CPUARMState, xregs[0]) +
-        a->rd * sizeof(((CPUARMState *)0)->xregs[0]),
-        sizeof(((CPUARMState *)0)->xregs[0]));
+    if (a->rd != 31) {
+        insn_dataflow_note_stated_read_env(
+            offsetof(CPUARMState, xregs[0]) +
+            a->rd * sizeof(((CPUARMState *)0)->xregs[0]),
+            sizeof(((CPUARMState *)0)->xregs[0]));
+    }
 
     /*
      * We rely here on our WFE implementation being a NOP, so we

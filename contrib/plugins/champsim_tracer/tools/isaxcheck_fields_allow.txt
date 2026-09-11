@@ -7868,8 +7868,8 @@ x86_64 FU-unclassified ud2
 # pass evidence, not here: it reads 0 by construction.
 #
 #   layer       x86_64  aarch64  riscv64   mipsel    total
-#   fields        882      950      370      875     3077
-#   boundary      865      950      349      271     2435
+#   fields        882      949      370      875     3076
+#   boundary      865      949      349      271     2434
 #
 # THE LOSS-DIRECTION SIGNATURES ARE ADJUDICATED, NOT ALLOWLISTED AS-IS.
 # `SR-rd-missing` says LLVM names a source the wire does not, which is
@@ -7900,16 +7900,16 @@ x86_64 FU-unclassified ud2
 #   mipsel   M-DSPIMM
 #   mipsel   M-MSACTL
 #
-# CORPUS: /mnt/md0/QEMU/cst_runs/verify72/srcencorp/V72B
-#   CAPTURED AT 2ff695368a7c42ebc0b4ade278d0d53f084bf18d, which is this tree's HEAD (refused otherwise)
-#   x86_64    6765974 rows md5 00b3e3598ab8bc4638a1764589d7e600
-#   aarch64   1112739 rows md5 35eb993a00e30a0f6cf3c241a834d3f3
-#   riscv64     35325 rows md5 70223f6476e6b1fab62d6d7d13a01a56
-#   mipsel     548888 rows md5 1c687a4f7ef5c2befa8a42c9e6fa0ea3
+# CORPUS: /mnt/md0/QEMU/cst_runs/exec163/srcencorp/WFET
+#   CAPTURED AT 3641984586cda214e28c31e2d84b23405bff9df9, which is this tree's HEAD (refused otherwise)
+#   x86_64    6765974 rows md5 c17e125feb05c80411308c6ab5c3146f
+#   aarch64   1112739 rows md5 5553b72bbede64d1842c02dc1a3d4f7d
+#   riscv64     35325 rows md5 71855e837907d78e438c114208c0a31b
+#   mipsel     548888 rows md5 9a612137aefdb3647c643eeeb3eebdb7
 #
 # THE ARMS THAT PRODUCED IT, from the gate's own roll-up:
 #   SO_SHA=83639a1a52fb263b
-#   ISAX_SHA=02fc9361529080dc
+#   ISAX_SHA=6e1c14f2dd4866c1
 #   ALL_ARMS_DONE worst_rc=1 unscored_arms=8
 #
 # HOW TO REGENERATE:
@@ -10072,7 +10072,7 @@ aarch64 SR-rd-missing sqdmulh +REG_FPCW
 aarch64 SR-rd-missing sqrdmulh +REG_FPCW
 
 # --- A-MISC: the remaining single-signature reference gaps.
-#     2 signature(s), 6145 encodings at this tip.
+#     1 signature(s), 6144 encodings at this tip.
 #
 # `bc.nv` is the never-taken consistent branch: LLVM names a condition-flag
 # read for the whole BC.cond family, and QEMU reads nothing because the NV
@@ -10081,7 +10081,6 @@ aarch64 SR-rd-missing sqrdmulh +REG_FPCW
 # as a read of the ZA array it only writes.  Each is one signature and each is
 # the reference over-naming an operand its per-opcode description carries.
 aarch64 SR-rd-missing bc.nv +REG_FLAGS
-aarch64 SR-rd-phantom wfet +REG_SP
 
 # --- R-HINT: an RV128 mnemonic decoded on RV64, where the encoding is a HINT that reads nothing.
 #     8 signature(s), 12335 encodings at this tip.

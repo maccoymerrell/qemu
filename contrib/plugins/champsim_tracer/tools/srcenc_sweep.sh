@@ -218,6 +218,65 @@ assemble_isa() {
     return 0
 }
 
+# THE IDENTITY CORPUS, ASSEMBLED (98-F).
+#
+# isaxcheck's fields layer cannot classify without QEMU's decode_id, and the
+# only place that id exists is inside the emulator.  The sled's MECHANISM
+# corpus carries it per encoding; this narrows that file to the four columns
+# a consumer needs and merges the wp arms, so the gate has one file per ISA
+# beside `<isa>.tsv` and `<isa>.refused.tsv`.
+#
+# A DECODE ID IS NOT A wp-ARM PROPERTY, so the two arms must agree about one:
+# they are the same bytes through the same decodetree.  A disagreement is
+# REFUSED rather than resolved -- two answers is no answer, the rule this
+# assembler already follows for the read lists.
+#
+# The stamp travels from the mechanism corpus, which srcenc_sled.py writes it
+# into; isaxcheck REFUSES an unstamped --ident file.
+assemble_ident_isa() {
+    local S=$1 OUT=$2 isa=$3; shift 3
+    local wps=("$@") w f n=0 dup=0 stamp=""
+    w=$(mktemp -d) || return 2
+    for n in "${wps[@]}"; do
+        f=$S/$isa.wp$n/corpus_mech_$isa.tsv
+        [ -f "$f" ] || { echo "$isa ident REFUSED -- no $f"; rm -rf "$w"; \
+                         return 2; }
+        [ -n "$stamp" ] || stamp=$(sed -n 's/^#so\t//p' "$f" | head -1)
+        awk -F'\t' -v i="$isa" '!/^#/ && NF>=4 && $1==i {
+                print $2"\t"$3"\t"$4 }' "$f" >> "$w/all"
+    done
+    if [ -z "$stamp" ]; then
+        echo "$isa ident REFUSED -- the mechanism corpora carry no #so stamp"
+        rm -rf "$w"; return 2
+    fi
+    sort -u "$w/all" > "$w/u"
+    n=$(wc -l < "$w/u")
+    # One encoding, one id: compare on column 1 alone after de-duplicating
+    # the whole row, so a differing MNEMONIC spelling is caught too.
+    dup=$(cut -f1 "$w/u" | uniq -d | wc -l)
+    if [ "$dup" != 0 ]; then
+        echo "$isa ident REFUSED -- $dup encoding(s) carry two different" \
+             "decode identities across the wp arms"
+        cut -f1 "$w/u" | uniq -d | head -5 >&2
+        rm -rf "$w"; return 2
+    fi
+    if [ "$n" = 0 ]; then
+        echo "$isa ident REFUSED -- no rows; an identity corpus that carries" \
+             "nothing would leave every encoding unclassified"
+        rm -rf "$w"; return 2
+    fi
+    { printf '#tip\t%s\n' \
+             "$(sed -n 's/^#tip\t//p' "$S/$isa.wp${wps[0]}/corpus_mech_$isa.tsv" | head -1)"
+      printf '#so\t%s\n' "$stamp"
+      printf '#isa\tencoding\tmnem\tdecode_id\n'
+      awk -F'\t' -v i="$isa" '{print i"\t"$0}' "$w/u"
+    } > "$OUT/$isa.ident.tsv"
+    rm -rf "$w"
+    echo "$isa ident rows=$n so=$stamp" \
+         "md5=$(md5sum "$OUT/$isa.ident.tsv" | cut -d' ' -f1)"
+    return 0
+}
+
 cmd_assemble() {
     local S="" OUT="" isas="" wps=""
     while [ $# -gt 0 ]; do
@@ -239,6 +298,12 @@ cmd_assemble() {
     for isa in $isas; do
         # shellcheck disable=SC2086
         if line=$(assemble_isa "$S" "$OUT" "$isa" $wps); then
+            echo "$line" >> "$OUT/RC.txt"
+        else
+            echo "$line" >> "$OUT/RC.txt"; rc=2
+        fi
+        # shellcheck disable=SC2086
+        if line=$(assemble_ident_isa "$S" "$OUT" "$isa" $wps); then
             echo "$line" >> "$OUT/RC.txt"
         else
             echo "$line" >> "$OUT/RC.txt"; rc=2

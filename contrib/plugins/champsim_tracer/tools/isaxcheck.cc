@@ -1070,6 +1070,16 @@ static const char *ident_path = nullptr;
 static std::map<std::string, uint32_t> ident_map;
 static std::string ident_so;
 static unsigned long ident_covered = 0, ident_unreached = 0;
+/*
+ * Whether the LAST cs_decode() found an identity for its bytes.  Read by
+ * compare() to tell the two silences apart: an encoding QEMU HAS a rule for
+ * that the tracer still cannot classify is a finding (FU-unclassified); an
+ * encoding the corpus never carried is this instrument not having looked,
+ * and mint'ing a signature for it would publish the gate's own coverage
+ * hole as a tracer defect.  Set on every decode, so it is never read stale
+ * for an encoding the decoder rejected.
+ */
+static bool ident_hit_last = false;
 
 /*
  * Build the view the plugin's operand walker would build from the boundary's
@@ -1102,9 +1112,11 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
         auto it = ident_map.find(hx);
         if (it != ident_map.end()) {
             info.decode_id = it->second;
+            ident_hit_last = true;
             ident_covered++;
         } else {
             info.decode_id = 0;
+            ident_hit_last = false;
             ident_unreached++;
         }
     }
@@ -3122,11 +3134,21 @@ static void compare(const uint8_t *b, size_t n)
     if (layer == LAYER_FIELDS) {
         fpfx = "F";
         if (!f.ok) {
-            /* decode_detail_to_generic() bailed at GEN_OP_UNKNOWN: the
-             * mnemonic is not in the ISA table, so there is no dependency
-             * model output to compare.  The tracer already logs this to
-             * its sidecar; here it is a class of its own so the gate does
-             * not silently score an empty set against LLVM's. */
+            /*
+             * TWO SILENCES, TOLD APART.  With an identity seated for these
+             * bytes, GEN_OP_UNKNOWN means QEMU HAS a rule and the tracer
+             * still publishes no classification -- a finding, and the class
+             * this signature has always named.  With NO identity for them,
+             * it means this process could not obtain the tracer's answer at
+             * all: the corpus never carried the encoding.  That is the
+             * gate's own coverage hole, it is counted on the `ident_reach`
+             * line, and minting a signature for it would publish a hole as
+             * a tracer defect -- the shape --srcenc already refuses to take
+             * (see srcenc_unreached).
+             */
+            if (ident_path && !ident_hit_last) {
+                return;
+            }
             note("FU-unclassified " + m, sample);
             return;
         }
@@ -4522,7 +4544,17 @@ int main(int argc, char **argv)
                "l_ok\tl_sz\tl_text\tl_ld\tl_st\tl_br\tl_call\tl_ret\t"
                "l_rd\tl_wr\t"
                "f_ok\tf_opcode\tf_branch\tf_cond\tf_atomic\tf_loads\tf_stores\t"
-               "f_lanekind\tf_src\tf_dst\tf_hasaddr\tf_laddr\tf_saddr\n");
+               "f_lanekind\tf_src\tf_dst\tf_hasaddr\tf_laddr\tf_saddr\t"
+               /*
+                * THE COLUMN THAT SAYS WHICH SILENCE AN f_ok=0 IS.  A batch
+                * consumer scoring register attribution has to tell "QEMU
+                * has a rule and the tracer classified nothing" from "the
+                * identity corpus never carried this encoding", because the
+                * second is the consumer's own denominator problem and the
+                * first is a result.  Appended LAST so a consumer reading
+                * by position is unaffected.
+                */
+               "f_ident\n");
         char line[256];
         while (fgets(line, sizeof line, stdin)) {
             char *p = line;
@@ -4559,7 +4591,7 @@ int main(int argc, char **argv)
                 if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
             printf("%s\t%d\t%u\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t"
                    "%s\t%s\t%d\t%u\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t"
-                   "%d\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\t%s\t%d\t%s\t%s\n",
+                   "%d\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\t%s\t%d\t%s\t%s\t%s\n",
                    hexbytes(b, n).c_str(), c.ok, c.size, c.mnem.c_str(),
                    c.ops.c_str(), c.has_mem, c.mem_read, c.mem_write,
                    c.mem_unknown, c.reg_unknown, c.has_invalid_op,
@@ -4575,7 +4607,8 @@ int main(int argc, char **argv)
                    gensetstr(fs).c_str(), gensetstr(fd).c_str(),
                    f.has_addr_deps,
                    addrdepslots(f.load_addr_dep, f.src).c_str(),
-                   addrdepslots(f.store_addr_dep, f.src).c_str());
+                   addrdepslots(f.store_addr_dep, f.src).c_str(),
+                   ident_hit_last ? "1" : "0");
         }
         if (!falsify_mnem.empty() && falsify_refused()) return 2;
         return 0;

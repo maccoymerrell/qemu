@@ -80,10 +80,17 @@ usage() {
 # here, set by whoever captured the pairs.  isaxcheck refuses without it.
 arm() {
     local layer=$1 isa=$2 build=$3 out=$4 corpus=$5 refused=${6:-} pairs=${7:-}
+    local ident=${8:-}
     local tools; tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     local se=() extra=()
     [ -n "$corpus" ] && se=(--srcenc="$corpus")
     [ -n "$refused" ] && se+=(--refused="$refused")
+    # THE CLASSIFICATION SUBJECT (FINDING 98-F).  The fields layer asks the
+    # plugin what it makes of an encoding and the plugin answers from QEMU's
+    # decode identity; a host tool has no decode_id of its own, so without
+    # this file every encoding is unclassified.  isaxcheck REFUSES the fields
+    # layer without it rather than scoring a layer that never looked.
+    [ -n "$ident" ] && se+=(--ident="$ident")
     [ -n "$pairs" ] && se+=(--sig-enc="$pairs" --sig-enc-so="${ISAX_SIGENC_SO:-}")
     # THE BASE-ARM CAPTURE.  Same sweep, one extra output: the pairs behind
     # every signature an allowlist rule could name.  Written per shard and
@@ -137,7 +144,7 @@ run_arms() {
       echo "ISAX_SHA=$(sha256sum "$build/contrib/plugins/isaxcheck" | cut -c1-16)"
       echo "CORPUS_DIR=${corpusdir:-<none>}"
     } >> "$out/rc.txt"
-    local worst=0 partial=0 isa layer corpus refused r
+    local worst=0 partial=0 skipped_fields=0 isa layer corpus refused r
     for isa in $isas; do
         corpus=""; refused=""
         if [ -n "$corpusdir" ]; then
@@ -278,7 +285,64 @@ run_arms() {
                      >> "$out/rc.txt"
             fi
         fi
+        #
+        # THE IDENTITY CORPUS, AND WHY THE BARE ARMS LOSE THE FIELDS LAYER
+        # (FINDING 98-F).
+        #
+        # Until 2fdabefe79 the fields layer answered from
+        # `active_insn_table[insn_id]` -- the Capstone-enum classification
+        # table -- because `cap_disas_raw_detail()` leaves decode_id 0 and
+        # the identity route therefore never spoke in this process.  Every
+        # opcode, branch class and lane pair this gate scored was Capstone's.
+        # R14 deleted that table, so the layer now has no subject unless the
+        # decode identity is handed to it from a real translation.
+        #
+        # `<isa>.ident.tsv` is srcenc_sweep.sh's assembly of the sled's
+        # MECHANISM corpus: one decode_id per encoding, captured inside the
+        # emulator, stamped with the same `#so` as the read-list corpus and
+        # checked against it here for the same reason the refused set is.
+        #
+        # A BARE ARM HAS NO CORPUS, so it has no identity either, and the
+        # fields layer is SKIPPED there with the reason written down --
+        # not run to a uniform GEN_OP_UNKNOWN, which is what turned this
+        # gate from 20/20 into 8-of-20 while nothing about the wire moved.
+        local ident=""
+        if [ -n "$corpusdir" ]; then
+            ident=$corpusdir/$isa.ident.tsv
+            if [ ! -f "$ident" ]; then
+                echo "REFUSED $isa -- no identity corpus $ident; the fields" \
+                     "layer cannot classify without QEMU's decode_id" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            local iso
+            iso=$(sed -n 's/^#so\t//p' "$ident" | head -1)
+            if [ "$iso" != "$cso" ]; then
+                echo "REFUSED $isa -- identity corpus $ident is stamped" \
+                     "#so=${iso:-<none>} but the corpus is #so=$cso; a" \
+                     "decode id names a rule in ONE build's decodetree" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            echo "ident $isa so=$iso rows=$(grep -vc '^#' "$ident")" \
+                 >> "$out/rc.txt"
+        fi
         for layer in boundary fields; do
+            if [ "$layer" = fields ] && [ -z "$ident" ]; then
+                echo "SKIP     fields   $isa -- no identity corpus in this" \
+                     "arm shape; the fields layer's classification comes" \
+                     "from QEMU's decode_id and a bare arm has none" \
+                     >> "$out/rc.txt"
+                #
+                # NOT `partial`.  `partial` is an arm that scored PART of
+                # its allowlist without saying so, and it rolls up rc=2
+                # because a silent hole is the defect 65-D cost.  This hole
+                # is not silent: the layer is not run, the reason is on the
+                # line above, and the count below is on the roll-up line so
+                # a bare rc=0 cannot be read as a whole-gate green.
+                skipped_fields=$((skipped_fields + 1))
+                continue
+            fi
             # THE BASE ARM'S PAIRS FOR THIS (isa, layer), IF ONE WAS HANDED
             # OVER.  Absent is not a failure -- the per-MNEMONIC category
             # still runs and the finer one simply has no input, which the
@@ -296,7 +360,8 @@ run_arms() {
                      | head -1) named=${ISAX_SIGENC_SO:-<unset>}" \
                      >> "$out/rc.txt"
             fi
-            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused" "$pairs"
+            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused" \
+                "$pairs" "$ident"
             r=$?
             printf '%-8s %-8s rc=%d\n' "$layer" "$isa" "$r" >> "$out/rc.txt"
             # rc=2 dominates rc=1: "could not look" is never a mere failure.
@@ -403,6 +468,11 @@ run_arms() {
     # rc=2 case -- "could not look" -- not a pass.  Rolling it up as rc=0 is
     # what let 65-D's two rows through a gate built to catch them.
     [ "$partial" -gt 0 ] && [ "$worst" = 0 ] && worst=2
+    # THE LAYERS THIS ARM SHAPE DID NOT RUN, on the line a reader reads.
+    # An arm shape that skips a whole layer is not a whole gate, and the
+    # count says so next to the roll-up rather than three screens above it.
+    echo "roll-up: fields_layer_skipped=$skipped_fields (no identity corpus"\
+         " in this arm shape) worst=$worst" >> "$out/rc.txt"
     cat "$out/rc.txt"
     return $worst
 }
@@ -446,9 +516,52 @@ selftest() {
     mkdir -p "$t/corpus_ok"
     { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
       printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_ok/x86_64.tsv"
+    # The identity corpus a real capture puts beside it (98-F), same stamp.
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf '#isa\tencoding\tmnem\tdecode_id\n'
+      printf 'x86_64\t90\tnop\t0000002a\n'; } > "$t/corpus_ok/x86_64.ident.tsv"
+    #
+    # T -- FINDING 98-F.  A corpus dir with no identity file REFUSES: the
+    # fields layer's classification comes from QEMU's decode_id, and an arm
+    # that runs it without one scores a layer that never looked.  Taken
+    # BEFORE the green arm so the fixture's own completeness is the subject.
+    mkdir -p "$t/corpus_noident"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_noident/x86_64.tsv"
+    run_arms "$t/b" "$t/oT" "$t/corpus_noident" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  T a corpus with no identity file REFUSES (rc=2)" \
+               || { echo "FAIL  T"; f=$((f+1)); }
+    grep -q 'no identity corpus' "$t/oT/rc.txt" \
+        && echo "PASS  T2 and it says the fields layer needs the decode_id" \
+        || { echo "FAIL  T2"; f=$((f+1)); }
+    #
+    # U -- the identity file stamped for ANOTHER build REFUSES.  A decode id
+    # names a rule in one decodetree; joined across builds it classifies an
+    # encoding through a rule this binary does not have, silently.
+    mkdir -p "$t/corpus_identstale"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_identstale/x86_64.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t0123456789abcdef\tfedcba9876543210\n'
+      printf '#isa\tencoding\tmnem\tdecode_id\n'
+      printf 'x86_64\t90\tnop\t0000002a\n'
+    } > "$t/corpus_identstale/x86_64.ident.tsv"
+    run_arms "$t/b" "$t/oU" "$t/corpus_identstale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  U an identity stamped for ANOTHER build REFUSES" \
+               || { echo "FAIL  U"; f=$((f+1)); }
     run_arms "$t/b" "$t/o3" "$t/corpus_ok" x86_64 >/dev/null 2>&1
     [ $? = 0 ] && echo "PASS  C a green arm rolls up rc=0" \
                || { echo "FAIL  C"; f=$((f+1)); }
+    #
+    # V -- the BARE arm shape.  No corpus means no identity, so the fields
+    # layer is not run; the boundary arms still are, and the roll-up says
+    # which layer was skipped rather than leaving a reader to assume both
+    # ran.  Both halves are asserted: the SKIP line and the count.
+    run_arms "$t/b" "$t/oV" "" x86_64 >/dev/null 2>&1
+    grep -q '^SKIP     fields   x86_64' "$t/oV/rc.txt" \
+        && echo "PASS  V a bare arm SKIPS the fields layer, with its reason" \
+        || { echo "FAIL  V"; f=$((f+1)); }
+    grep -q 'fields_layer_skipped=1' "$t/oV/rc.txt" \
+        && echo "PASS  V2 and the roll-up line carries the skipped count" \
+        || { echo "FAIL  V2"; f=$((f+1)); }
     #
     # M/N -- FINDING 92-C, BOTH DIRECTIONS.  A corpus is the wire's own
     # source list; scored against a different build it reports that build's
@@ -537,6 +650,7 @@ SH
         || { echo "FAIL  Q2"; f=$((f+1)); }
     mkdir -p "$t/corpus_r"
     cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_r/x86_64.tsv"
+    cp "$t/corpus_ok/x86_64.ident.tsv" "$t/corpus_r/x86_64.ident.tsv"
     { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
       printf '#refused\tisa=x86_64\tencodings=1\n'
       printf 'x86_64\t0f01c6\n'; } > "$t/corpus_r/x86_64.refused.tsv"

@@ -216,8 +216,29 @@ def _write(path, rows, head=_HEAD):
 
 
 def selftest():
+    """Every arm prints its own line, and the count is the lines.
+
+    The instrument roll-up (`selftest_all.sh`) scores a selftest by counting
+    its arms, and it reported this one as ASSERTS NOTHING for as long as it
+    existed -- six checks, three of them REFUSE arms, none of them spelled in
+    a grammar the counter knew (FINDING 97-B).  A green whose subject was
+    never established is the failure this tree files against everywhere else,
+    so the arms say `ok` one per line, a failure says FAIL instead, and the
+    summary count is the number of arms actually run rather than a literal.
+    """
     import tempfile
     fails = []
+    arms = [0]
+
+    def ck(name, bad=None):
+        """One arm, one line.  `bad` is the message when it failed."""
+        arms[0] += 1
+        if bad:
+            fails.append(bad)
+            print("  ARM %s FAIL -- %s" % (name, bad))
+        else:
+            print("  ARM %s ok" % name)
+
     with tempfile.TemporaryDirectory() as d:
         # ARM 1 CLEAN ZERO.  Every row carries an identity, so the enum table
         # answers for nothing and the census must say 0 -- and must not
@@ -228,8 +249,8 @@ def selftest():
                    [_row("90", "nop", "00000123", "GEN_OP_NOP"),
                     _row("31c0", "xorl", "00000456", "GEN_OP_XOR")])
         rc = main(["--sled", s, "--isa", "x86_64"])
-        if rc != 0:
-            fails.append("arm1 a clean corpus must score 0, not refuse")
+        ck("1 clean-zero", None if rc == 0 else
+           "a clean corpus must score 0, not refuse (rc=%d)" % rc)
 
         # ARM 2 THE OCCUPANT.  One row with no identity and a class from the
         # enum table.  The census must NAME it; a census that cannot go
@@ -241,21 +262,22 @@ def selftest():
                     _row("45800000", "bz.v", "00000000", "GEN_OP_BRANCH")])
         o = os.path.join(d, "occout")
         rc = main(["--sled", s, "--isa", "mipsel", "--out", o])
-        if rc != 0:
-            fails.append("arm2 a corpus with an occupant must still score 0 rc")
+        ck("2a occupant-scores", None if rc == 0 else
+           "a corpus with an occupant must still score rc=0, got %d" % rc)
         got = open(os.path.join(o, "mipsel.occ.tsv")).read()
-        if "45800000" not in got or "bz.v" not in got:
-            fails.append("arm2 the occupant was not NAMED: %r" % got)
-        if "00000000\tnop" in got:
-            fails.append("arm2 a row WITH an identity was counted as an "
-                         "occupant")
+        ck("2b occupant-named",
+           None if ("45800000" in got and "bz.v" in got)
+           else "the occupant was not NAMED: %r" % got)
+        ck("2c identity-not-counted",
+           "a row WITH an identity was counted as an occupant"
+           if "00000000\tnop" in got else None)
 
         # ARM 3 THE ABSENT CORPUS.  A missing arm must REFUSE.  This is the
         # shape every zero in this tree has to survive: a census pointed at
         # nothing reads 0 unless it is built not to.
         rc = main(["--sled", os.path.join(d, "nothing"), "--isa", "x86_64"])
-        if rc != 2:
-            fails.append("arm3 a missing corpus must REFUSE, got rc=%d" % rc)
+        ck("3 absent-refuses", None if rc == 2 else
+           "a missing corpus must REFUSE, got rc=%d" % rc)
 
         # ARM 4 THE EMPTY CORPUS.  Header present, no rows: also a refusal,
         # for the same reason and by a different route.
@@ -264,8 +286,8 @@ def selftest():
             _write(os.path.join(s, "riscv64.wp%s" % wp,
                                 "corpus_mech_riscv64.tsv"), [])
         rc = main(["--sled", s, "--isa", "riscv64"])
-        if rc != 2:
-            fails.append("arm4 an empty corpus must REFUSE, got rc=%d" % rc)
+        ck("4 empty-refuses", None if rc == 2 else
+           "an empty corpus must REFUSE, got rc=%d" % rc)
 
         # ARM 5 THE WRONG FILE.  Pointed at the READ-LIST corpus -- four
         # columns, no decode id, no OPC -- the census must refuse rather than
@@ -277,8 +299,8 @@ def selftest():
                    ["aarch64\td503201f\tnop\tREG_PC\n"],
                    head="#isa\tencoding\tmnem\tsrc\n")
         rc = main(["--sled", s, "--isa", "aarch64"])
-        if rc != 2:
-            fails.append("arm5 the wrong corpus must REFUSE, got rc=%d" % rc)
+        ck("5 wrong-file-refuses", None if rc == 2 else
+           "the wrong corpus must REFUSE, got rc=%d" % rc)
 
         # ARM 6 THE BANKED CORPUS.  The same corpus as arm 2, compressed the
         # way the disk discipline compresses it once it has been scored.  It
@@ -292,20 +314,20 @@ def selftest():
                        _row("45800000", "bz.v", "00000000", "GEN_OP_BRANCH")])
             import subprocess
             if subprocess.call(["zstd", "-q", "--rm", f]) != 0:
-                fails.append("arm6 could not compress the fixture -- no zstd?")
+                ck("6a fixture-compressed",
+                   "could not compress the fixture -- no zstd?")
         o = os.path.join(d, "zstout")
         rc = main(["--sled", s, "--isa", "mipsel", "--out", o])
-        if rc != 0:
-            fails.append("arm6 a compressed corpus must score, not refuse")
-        else:
+        ck("6b banked-scores", None if rc == 0 else
+           "a compressed corpus must score, not refuse (rc=%d)" % rc)
+        if rc == 0:
             got = open(os.path.join(o, "mipsel.occ.tsv")).read()
-            if "45800000" not in got:
-                fails.append("arm6 the occupant was lost under compression: "
-                             "%r" % got)
+            ck("6c banked-occupant-kept", None if "45800000" in got else
+               "the occupant was lost under compression: %r" % got)
 
     for f in fails:
         print("enumocc SELFTEST FAIL: %s" % f)
-    print("enumocc selftest: %d check(s), %d failure(s)" % (6, len(fails)))
+    print("enumocc selftest: %d check(s), %d failure(s)" % (arms[0], len(fails)))
     return 1 if fails else 0
 
 

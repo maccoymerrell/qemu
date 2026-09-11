@@ -43,12 +43,40 @@ PY="${PYTHON:-python}"
 # a RED.  An instrument that invents a fifth spelling shows up as a red with
 # a real selftest, which is a visible, one-line fix -- and is the direction
 # this has to fail in, because the alternative is scoring silence as proof.
+# A SIXTH SPELLING, AND THE END OF COUNTING BY HAND -- FINDING 97-B.
+#
+# `^  A .* ok` matched the FIRST arm of the `  <label> <text> ok` convention
+# and none of the others, so opcenc_ab (19 checks), srcenc_ab (17) and
+# srcset_ab (9) each scored ONE; and enumocc.py, whose six arms are the census
+# the enum tables' retirement turns on, scored ZERO and stood as RED /
+# ASSERTS NOTHING from the day it was added.  The label is widened to the
+# convention it belongs to -- one short leading token, then `ok` at the end.
+#
+# But widening a hand-list only postpones the next gap, so the count is no
+# longer the only witness.  An instrument that states its own check count
+# (`<name> selftest: N check(s), M failure(s)`) is a SECOND SOURCE, and the
+# two must agree: N - M is the number of arms that passed, and the counted
+# `ok` lines must equal it.  A disagreement is reported and is RED, in both
+# directions -- a grammar this runner does not know, and a summary claiming
+# checks whose arms were never printed, are the same defect seen from two
+# sides, and neither may be silent.  Instruments that print no summary are
+# scored on the count alone, as before; that is the remaining blind spot and
+# it is named here rather than left to be discovered.
 count_arms() {
-    grep -c -E "^PASS|^  PASS|^ARM [0-9]+ ok:|^selftest .*-> OK|^  A .* ok|^  ARM .* ok" "$1"
+    grep -c -E "^PASS|^  PASS|^ARM [0-9]+ ok:|^selftest .*-> OK|^  ARM .* ok|^  [A-Z][A-Za-z0-9]{0,3} .* ok$" "$1"
 }
 
-n=0; ok=0; nost=0; vac=0
-declare -a RED=() NOST=() VAC=()
+# The instrument's own count of passing checks, or empty when it states none.
+claimed_pass() {
+    local s n m
+    s=$(grep -oE '[0-9]+ check\(s\), [0-9]+ failure\(s\)' "$1" | tail -1)
+    [ -n "$s" ] || return 0
+    n=${s%% *}; m=$(printf '%s' "$s" | sed 's/.*, \([0-9]*\) failure.*/\1/')
+    echo $((n - m))
+}
+
+n=0; ok=0; nost=0; vac=0; mis=0
+declare -a RED=() NOST=() VAC=() MIS=()
 for f in *.py; do
     case "$f" in
         _*|evopen.py) continue ;;   # library modules, not instruments
@@ -77,13 +105,19 @@ for f in *.py; do
     fi
     if [ -n "$form" ]; then
         arms=$(count_arms "$log")
+        claim=$(claimed_pass "$log")
         if [ "$arms" -eq 0 ]; then
             vac=$((vac + 1)); VAC+=("$f")
             printf 'RED   %-26s %-7s 0 arm(s) -- ASSERTS NOTHING\n' \
                    "$f" "$form"
+        elif [ -n "$claim" ] && [ "$claim" != "$arms" ]; then
+            mis=$((mis + 1)); MIS+=("$f")
+            printf 'RED   %-26s %-7s %s arm(s) counted but the instrument says %s passed -- THE TWO SOURCES DISAGREE\n' \
+                   "$f" "$form" "$arms" "$claim"
         else
             ok=$((ok + 1))
-            printf 'PASS  %-26s %-7s %s arm(s)\n' "$f" "$form" "$arms"
+            printf 'PASS  %-26s %-7s %s arm(s)%s\n' "$f" "$form" "$arms" \
+                   "${claim:+ (instrument agrees: $claim)}"
         fi
     else
         RED+=("$f")
@@ -91,11 +125,15 @@ for f in *.py; do
     fi
 done
 
-printf '\ninstruments found %d  green %d  RED %d  ZERO-ARM %d  NO-SELFTEST %d\n' \
-       "$n" "$ok" "${#RED[@]}" "$vac" "$nost"
+printf '\ninstruments found %d  green %d  RED %d  ZERO-ARM %d  ARM-COUNT-MISMATCH %d  NO-SELFTEST %d\n' \
+       "$n" "$ok" "${#RED[@]}" "$vac" "$mis" "$nost"
 [ "${#RED[@]}" -eq 0 ] || printf 'RED: %s\n' "${RED[*]}"
 [ "$vac" -eq 0 ] || printf 'ZERO-ARM: %s\n' "${VAC[*]}"
+[ "$mis" -eq 0 ] || printf 'ARM-COUNT-MISMATCH: %s\n' "${MIS[*]}"
 [ "$nost" -eq 0 ] || printf 'NO-SELFTEST: %s\n' "${NOST[*]}"
-# A module without a selftest is a failure of this script, not a silence, and
-# a selftest that asserts nothing is the same failure one step later.
-[ "${#RED[@]}" -eq 0 ] && [ "$vac" -eq 0 ] && [ "$nost" -eq 0 ]
+# A module without a selftest is a failure of this script, not a silence; a
+# selftest that asserts nothing is the same failure one step later; and a
+# count this runner cannot reconcile with the instrument's own is the same
+# failure one step later again.
+[ "${#RED[@]}" -eq 0 ] && [ "$vac" -eq 0 ] && [ "$mis" -eq 0 ] \
+    && [ "$nost" -eq 0 ]

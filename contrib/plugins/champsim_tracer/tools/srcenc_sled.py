@@ -162,6 +162,24 @@ def capture_so_line(build_dir, isa=None):
     is the parent, so both arms stamp the same sha and the second is merely
     `dirty`.
 
+    WHAT THE EMULATOR HALF IS SENSITIVE TO, MEASURED RATHER THAN ASSUMED.
+    A no-op rebuild reproduces it exactly (three settled `ninja` runs at one
+    tip, 2 edges each, identical sha), and so does a full relink: `touch
+    disas/capstone.c` + rebuild rebuilt 129 edges and produced a
+    BYTE-IDENTICAL `qemu-x86_64` -- `cmp -l` reports 0 differing bytes.  What
+    it IS sensitive to is the COMMIT, because `build/qemu-version.h` embeds
+    `git describe` and every emulator links it:
+
+        #define QEMU_PKGVERSION "v10.0.8-1707-gad76551247"
+
+    So the emulator half moves on every commit, including one that changes
+    nothing the emulator does.  That makes the stamp mean "this build, at this
+    commit" rather than "a build with this behaviour", which is STRONGER than
+    98-B asked for and is the safe direction -- a corpus from an earlier tip
+    IS from an earlier tree.  It is written down here so that a reader who
+    sees the emulator half differ across a docs-only commit diagnoses the
+    version header and not a phantom behaviour change.
+
     So the line names BOTH: `#so <plugin> <emulator>`, the emulator being
     `qemu-<isa>`, the binary this sled launches.  It stays ONE line and the
     plugin sha stays FIELD 2, so every consumer that compares the whole line

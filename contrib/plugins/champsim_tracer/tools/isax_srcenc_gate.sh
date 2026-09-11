@@ -207,6 +207,11 @@ run_arms() {
             #
             # srcenc_sled.py writes the set beside the corpus; the sweep
             # assembles it as `<isa>.refused.tsv`, carrying the same `#so`.
+            # THE ASSEMBLER IS `srcenc_sweep.sh`, IN THIS DIRECTORY, and it
+            # is in the tree for FINDING 97-A's reason: the assembly used to
+            # be a per-run copy of a script nobody could change from here,
+            # and it silently dropped a silence category the sled and this
+            # gate had both been taught to carry.
             # The stamp is checked HERE as well as inside isaxcheck, because
             # a set from another build describes another admission gate and
             # the failure is silent: rules it cannot excuse just read DEAD.

@@ -67,8 +67,37 @@ class Refused(Exception):
     """A census that cannot look reports that, never a zero."""
 
 
+def _open(path):
+    """A banked corpus is COMPRESSED, and that must not read as absent.
+
+    The mechanism corpus is gigabytes per ISA and the disk discipline
+    compresses it the moment it has been scored.  A census that refused a
+    corpus it could have read would send the next pass off to re-sweep for
+    a file that is sitting right there, so `.zst` and `.xz` are opened as
+    themselves.  `zstandard` is not a dependency: the command-line `zstd`
+    is what wrote the file and is what reads it back.
+    """
+    if path.endswith(".zst"):
+        import subprocess
+        p = subprocess.Popen(["zstd", "-dc", path], stdout=subprocess.PIPE,
+                             universal_newlines=True, errors="replace")
+        return p.stdout
+    if path.endswith(".xz"):
+        import lzma
+        return lzma.open(path, "rt", errors="replace")
+    return open(path, "r", errors="replace")
+
+
+def _resolve(path):
+    """The plain name, or the compressed one beside it.  None if neither."""
+    for p in (path, path + ".zst", path + ".xz"):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def _check_header(path):
-    with open(path, "r", errors="replace") as f:
+    with _open(path) as f:
         head = f.readline().rstrip("\n").split("\t")
     if (len(head) < 19 or head[0] != MECH_HEAD_0
             or head[3] != MECH_HEAD_3 or head[18] != MECH_HEAD_18):
@@ -78,12 +107,14 @@ def _check_header(path):
 
 def score_file(path):
     """(rows, decode_id0, enum-answered, [(enc, mnem, opc), ...])."""
-    if not os.path.isfile(path):
-        raise Refused("no corpus at %s" % path)
+    real = _resolve(path)
+    if real is None:
+        raise Refused("no corpus at %s (nor .zst / .xz beside it)" % path)
+    path = real
     _check_header(path)
     rows = zero = 0
     named = []
-    with open(path, "r", errors="replace") as f:
+    with _open(path) as f:
         f.readline()
         for line in f:
             if line.startswith("#"):
@@ -249,9 +280,32 @@ def selftest():
         if rc != 2:
             fails.append("arm5 the wrong corpus must REFUSE, got rc=%d" % rc)
 
+        # ARM 6 THE BANKED CORPUS.  The same corpus as arm 2, compressed the
+        # way the disk discipline compresses it once it has been scored.  It
+        # must read THE SAME, not refuse -- a census that cannot read the
+        # bank sends the next pass off to re-sweep a file that is right
+        # there.
+        s = os.path.join(d, "zst")
+        for wp in ("0", "16"):
+            f = os.path.join(s, "mipsel.wp%s" % wp, "corpus_mech_mipsel.tsv")
+            _write(f, [_row("00000000", "nop", "00000123", "GEN_OP_NOP"),
+                       _row("45800000", "bz.v", "00000000", "GEN_OP_BRANCH")])
+            import subprocess
+            if subprocess.call(["zstd", "-q", "--rm", f]) != 0:
+                fails.append("arm6 could not compress the fixture -- no zstd?")
+        o = os.path.join(d, "zstout")
+        rc = main(["--sled", s, "--isa", "mipsel", "--out", o])
+        if rc != 0:
+            fails.append("arm6 a compressed corpus must score, not refuse")
+        else:
+            got = open(os.path.join(o, "mipsel.occ.tsv")).read()
+            if "45800000" not in got:
+                fails.append("arm6 the occupant was lost under compression: "
+                             "%r" % got)
+
     for f in fails:
         print("enumocc SELFTEST FAIL: %s" % f)
-    print("enumocc selftest: %d check(s), %d failure(s)" % (5, len(fails)))
+    print("enumocc selftest: %d check(s), %d failure(s)" % (6, len(fails)))
     return 1 if fails else 0
 
 

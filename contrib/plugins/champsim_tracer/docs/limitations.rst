@@ -967,6 +967,33 @@ worse model of a machine that fetches and decodes down a wrong path
 before the fault resolves.  Wrong-path *instruction identity* is
 best-effort by design; wrong-path *control flow* and *addresses* are not.
 
+**One route still answers from an offline decoder's vocabulary: the
+per-ISA enum tables.**  An instruction's generic opcode and branch type
+come from QEMU's own decode identity wherever a decodetree pattern
+matched, because ``plugin_gen_record_insn_identity()`` is emitted at a
+pattern's dispatch site.  An encoding no pattern matches reaches no such
+site, exports no identity, and falls through to the
+``champsim_tracer_mnemonics_<isa>.h`` table, which answers from the
+offline decoder's name for the same bytes.  ``qemu_ident_enum_no_ident``
+counts every arrival.
+
+Block admission narrows which encodings can get that far.  A block is
+admitted on ``qemu_plugin_insn_undecoded()`` — the target decoder's own
+word that no rule matched — so on AArch64 the whole unallocated space,
+including ``udf`` at ``0x00000000``, is refused before anything
+classifies it: over the exhaustive AArch64 sweep the read-list corpus
+carries no ``udf`` row at all and ``0x00000000`` sits in the refused set,
+and the shadow roll-up reports no AArch64 arrival at this route.
+
+**The route is not empty, and its occupancy is per-target.**  MIPS
+wrong-path blocks whose bytes QEMU decodes and runs — while the offline
+decoder has no identity to export for them — do reach it, and what the
+table then supplies is that decoder's guess rather than a statement about
+the machine.  The measured arrivals are few and confined to the wrong
+path; the correct path on every target reads zero.  A reader counting
+this route's occupants should count them per target and per path rather
+than taking one target's zero for the route's.
+
 Reproducibility caveats
 -----------------------
 

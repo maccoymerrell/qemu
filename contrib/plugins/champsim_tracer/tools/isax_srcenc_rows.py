@@ -1256,7 +1256,18 @@ def emit_header(arms, layer, isas, corpus, rcpath):
             "FINDING 76-C and is now on its third pass (72, 76, 81).  Capture "
             "the corpus at HEAD and run again." % (tip, head))
     a("# CORPUS: %s" % os.path.abspath(corpus))
-    a("#   CAPTURED AT %s, which is this tree's HEAD (refused otherwise)" % tip)
+    # THE STAMP IS A POINTER, NOT A BINDING -- FINDING 97-C.  The refusal
+    # just above makes the corpus tree equal to HEAD at generation time, so
+    # the sha named here is by construction the PARENT of the commit this
+    # block ships in: it can never name that commit, and an amend or a
+    # rebase leaves it naming an object no clone will carry.  Written as
+    # "this tree's HEAD" it read as a claim about the shipped file that is
+    # false for every copy of it.  The DURABLE bindings are the content ones
+    # below -- the per-ISA corpus md5s, and SO_SHA / ISAX_SHA from the arms.
+    a("#   GENERATED AGAINST %s -- the tree the generator ran in, which is" % tip)
+    a("#   HEAD at generation time and so the PARENT of the commit this block")
+    a("#   ships in.  A pointer: an amend or rebase can leave it unreachable.")
+    a("#   The bindings are the corpus md5s and SO_SHA/ISAX_SHA below.")
     for isa in isas:
         cp = os.path.join(corpus, f"{isa}.tsv")
         if not os.path.exists(cp):

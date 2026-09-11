@@ -7901,7 +7901,10 @@ x86_64 FU-unclassified ud2
 #   mipsel   M-MSACTL
 #
 # CORPUS: /mnt/md0/QEMU/cst_runs/exec163/srcencorp/WFET
-#   CAPTURED AT 3641984586cda214e28c31e2d84b23405bff9df9, which is this tree's HEAD (refused otherwise)
+#   GENERATED AGAINST 3641984586cda214e28c31e2d84b23405bff9df9 -- the tree the generator ran in, which is
+#   HEAD at generation time and so the PARENT of the commit this block
+#   ships in.  A pointer: an amend or rebase can leave it unreachable.
+#   The bindings are the corpus md5s and SO_SHA/ISAX_SHA below.
 #   x86_64    6765974 rows md5 c17e125feb05c80411308c6ab5c3146f
 #   aarch64   1112739 rows md5 5553b72bbede64d1842c02dc1a3d4f7d
 #   riscv64     35325 rows md5 71855e837907d78e438c114208c0a31b

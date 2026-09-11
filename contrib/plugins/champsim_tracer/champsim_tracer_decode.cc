@@ -913,27 +913,6 @@ static std::atomic<uint64_t> g_qid_surv_no_ident{0};
  */
 static std::atomic<uint64_t> g_qid_decided_unknown{0};
 /*
- * The rule DECIDED and the Capstone row it was joined through says
- * something else.  MEASURED, and the reason this counter exists at all:
- * QID_OBSERVED rests on the generator's observation corpus, and a rule
- * reached by a SPELLING that corpus never saw is asserted to decide on
- * evidence that does not cover the instance.  Two were caught by the
- * golden net's coverage probes at the flip --
- *
- *   translate_mips/OPC_SLL  observed only as `sll`; MIPS `nop` is
- *                           `sll $zero,$zero,0` and reaches the same rule
- *   decode_insn32/ori       observed only as `ori`; Zicbop
- *                           `prefetch.r/w/i` are `ori x0,rs1,imm`
- *
- * -- and in both the row carries cap_split=false, so nothing in the table
- * says the join was partial.  A disagreement here is not by itself a
- * defect (the identity is RIGHT about x86 `rdsspq`, which QEMU decodes
- * through its NOP slot and Capstone names as a move); it is the exact
- * population an adjudication has to be written for, so it is counted and
- * reported rather than resolved by a rule of thumb.
- */
-static std::atomic<uint64_t> g_qid_cap_disagree{0};
-/*
  * Decodes on an ISA whose flip is HELD.  Not a silent fallback: the hold
  * is a per-ISA decision with a number beside it, and this is the number.
  */
@@ -1017,8 +996,7 @@ static const QemuIdentRow *qemu_ident_lookup(uint32_t id, unsigned *index_out)
     return &active_qemu_ident[lo];
 }
 
-const InsnClassification *qemu_ident_classify(
-    uint32_t id, const InsnClassification *cap_row)
+const InsnClassification *qemu_ident_classify(uint32_t id)
 {
     unsigned idx = 0;
 
@@ -1078,9 +1056,6 @@ const InsnClassification *qemu_ident_classify(
         g_qid_decided_unknown.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    if (cap_row && cap_row->opcode != row->cls.opcode) {
-        g_qid_cap_disagree.fetch_add(1, std::memory_order_relaxed);
-    }
     return &row->cls;
 }
 
@@ -1104,7 +1079,6 @@ void qemu_ident_survivors(QemuIdentSurvivors *out)
     out->decided_unknown =
         g_qid_decided_unknown.load(std::memory_order_relaxed);
     out->isa_held     = g_qid_isa_held.load(std::memory_order_relaxed);
-    out->cap_disagree = g_qid_cap_disagree.load(std::memory_order_relaxed);
 }
 
 uint64_t qemu_ident_adjudicated_hits(void)
@@ -1121,499 +1095,63 @@ uint64_t qemu_ident_row_hits(unsigned row_index)
 }
 
 /*
- * THE SHADOW LOOKUP -- the A/B that has to pass before the enum-keyed
- * mnemonic tables can be deleted.
+ * THE SHADOW LOOKUP IS GONE, WITH THE TABLE IT WAS WATCHING.
  *
- * R14 asks for the four champsim_tracer_mnemonics_<isa>.h tables to go,
- * and the key that replaces theirs is the decode identity.  Nothing may
- * be deleted on the strength of "the decode-identity table exists": the
- * two keys have to be shown to ANSWER THE SAME THING, per instruction,
- * on real corpora, on every column a consumer reads.  This computes both
- * answers for every instruction and scores them against each other.
+ * What stood here was the A/B that had to pass before the four
+ * champsim_tracer_mnemonics_<isa>.h classification tables could be
+ * deleted: every instruction was classified TWICE -- once by QEMU's
+ * decode identity and once by the Capstone-enum row -- and the two
+ * answers compared per column, with the disagreeing signatures named
+ * and the ENUM-PUBLISHED count carried as the deletion bar.
  *
- *   dkey   the decode-identity row's payload, admitted on EXACTLY the
- *          terms the live path admits it (qemu_ident_classify: a row
- *          exists, its tier is OBSERVED or ADJUDICATED, and its opcode
- *          is not GEN_OP_UNKNOWN).  Scoring a more generous admission
- *          would measure a key the flip would not actually use.
- *   enum   active_insn_table[info->insn_id] -- the Capstone-enum-keyed
- *          row, the thing R14 deletes.
+ * THE BAR IS MET, AND THE INSTRUMENT THAT SAYS SO IS NOT THIS ONE.
+ * `arc3_cov/instruments/enumocc.py`, over the whole enumerated encoding
+ * population on all four ISAs in both wp arms, reads
+ * `ENUM-OCCUPANCY total=0 key=STATED`: no encoding anywhere has the enum
+ * row as its published classification.  It reads the STATED key
+ * (`IDK`: QEMU / ENUM / NONE) rather than inferring it from a
+ * coincidence of two columns, and it REFUSES -- rather than reporting 0
+ * -- on a corpus that is absent, empty, or not the mechanism corpus,
+ * which is the control that makes its zero mean something.
  *
- * DISAGREEMENTS is the must-be-0 row, and it is per COLUMN, not per
- * instruction pair: `.refine`, `.dep_refine` and the lane pair are as
- * much of the classification as the opcode, and a comparison that read
- * only the opcode word would call two different classifications equal.
- *
- * AN INSTRUCTION THE dkey ROUTE CANNOT ANSWER IS NOT AN AGREEMENT.  It
- * is counted apart, under the reason it could not, because those rows
- * are exactly the ones that CANNOT flip and naming them is the result.
- * Folding them into the agree column would publish the enum table's own
- * answer as confirmation of a key that never spoke -- the shape past
- * corpora-narrowing took.
- *
- * READ-ONLY BY CONSTRUCTION.  It is called after classify_insn_id has
- * already decided what to return, is handed both answers, and returns
- * void.  No wire field is reachable from here, so the instrument cannot
- * be the thing that moves a trace.
+ * An A/B needs two answers.  With the enum key retired there is one, so
+ * this comparison is not weakened, it has no second operand: it would
+ * report "no enum row for this insn_id at all" for every instruction in
+ * every run, which reads like a measurement and is not one.  It goes
+ * with its subject.
  */
-#define CST_QSH_COLS 7
-static const char *const g_qsh_col_name[CST_QSH_COLS] = {
-    "opcode", "branch_type", "flags", "refine",
-    "dep_refine", "lane_mask_kind", "lane_parallel",
-};
-/*
- * The OPEN CLASS a column's standing disagreement belongs to, or nullptr
- * when it has none.  Printed beside the count so a number with a filed
- * question does not read as an unexplained one -- and, just as much, so a
- * column with NO entry here reads as the finding it would be.  See the
- * NAMED OPEN CLASSES block in qemu_ident_shadow_report() for the question
- * itself; this table is only the tag.
- */
-static const char *const g_qsh_col_open_class[CST_QSH_COLS] = {
-    nullptr,                       /* opcode */
-    "(a filed class covers PART of this column: #290 -- see below, and "
-    "check the subject)",
-    nullptr,                       /* flags */
-    nullptr,                       /* refine */
-    nullptr,                       /* dep_refine */
-    nullptr,                       /* lane_mask_kind */
-    nullptr,                       /* lane_parallel */
-};
-static std::atomic<uint64_t> g_qsh_insns{0};       /* classify calls */
-static std::atomic<uint64_t> g_qsh_both{0};        /* both keys answered */
-static std::atomic<uint64_t> g_qsh_agree{0};       /* ... and agreed on all */
-static std::atomic<uint64_t> g_qsh_disagree{0};    /* ... and did not */
-static std::atomic<uint64_t> g_qsh_col[CST_QSH_COLS];
-static std::atomic<uint64_t> g_qsh_no_dkey{0};     /* dkey route silent */
-static std::atomic<uint64_t> g_qsh_no_enum{0};     /* no enum row at all */
-static std::atomic<uint64_t> g_qsh_enum_published{0}; /* enum row IS the answer */
 
 /*
- * The disagreeing signatures themselves, bounded and de-duplicated.  A
- * count with no names cannot be adjudicated, and an unbounded table on a
- * translation-time path is a memory defect; the overflow is reported
- * rather than dropped silently.
- */
-#define CST_QSH_MAX_SIGS 256
-struct QshSig {
-    uint32_t decode_id;
-    uint32_t insn_id;
-    uint32_t cols;                 /* bitmask over g_qsh_col_name */
-    uint64_t count;
-    char     mnem[24];
-};
-static QshSig  g_qsh_sig[CST_QSH_MAX_SIGS];
-static unsigned g_qsh_nsig;
-static uint64_t g_qsh_sig_overflow;
-static GMutex   g_qsh_sig_lock;
-
-static void qsh_record_sig(uint32_t decode_id, uint32_t insn_id,
-                           uint32_t cols, const char *mnem)
-{
-    g_mutex_lock(&g_qsh_sig_lock);
-    for (unsigned i = 0; i < g_qsh_nsig; i++) {
-        if (g_qsh_sig[i].decode_id == decode_id &&
-            g_qsh_sig[i].insn_id == insn_id &&
-            g_qsh_sig[i].cols == cols) {
-            g_qsh_sig[i].count++;
-            g_mutex_unlock(&g_qsh_sig_lock);
-            return;
-        }
-    }
-    if (g_qsh_nsig >= CST_QSH_MAX_SIGS) {
-        g_qsh_sig_overflow++;
-        g_mutex_unlock(&g_qsh_sig_lock);
-        return;
-    }
-    QshSig *e = &g_qsh_sig[g_qsh_nsig++];
-    e->decode_id = decode_id;
-    e->insn_id = insn_id;
-    e->cols = cols;
-    e->count = 1;
-    e->mnem[0] = '\0';
-    if (mnem && mnem[0]) {
-        size_t n = strlen(mnem);
-        if (n >= sizeof(e->mnem)) {
-            n = sizeof(e->mnem) - 1;
-        }
-        memcpy(e->mnem, mnem, n);
-        e->mnem[n] = '\0';
-    }
-    g_mutex_unlock(&g_qsh_sig_lock);
-}
-
-/*
- * THE ENUM-PUBLISHED ROWS, BY NAME.
- *
- * The count above is the R14 deletion bar; a bar with no names cannot be
- * closed, because "who is still in it" is exactly the question a closure
- * has to answer.  This table carries the same population one row per
- * (decode identity, Capstone id) so each survivor can be read off the
- * sidecar and attributed to the mechanism that would retire it, instead
- * of being reported as a bucket.  A silent bucket is the failure mode
- * this tree has been bitten by; a bounded, named, overflow-reporting
- * table is the shape that is not one.
- *
- * The identity is printed EVEN WHEN IT IS 0, because 0 is itself a
- * distinct membership reason -- QEMU exported no identity for the
- * instruction at all -- and folding it in with "the id had no row" hides
- * which of the two a reader is looking at.
- */
-#define CST_QEP_MAX_SIGS 128
-struct QepSig {
-    uint32_t decode_id;
-    uint32_t insn_id;
-    uint8_t  opcode;               /* what the enum row PUBLISHES */
-    uint64_t count;
-    char     mnem[24];
-};
-static QepSig   g_qep_sig[CST_QEP_MAX_SIGS];
-static unsigned g_qep_nsig;
-static uint64_t g_qep_sig_overflow;
-static GMutex   g_qep_sig_lock;
-
-static void qep_record_sig(uint32_t decode_id, uint32_t insn_id,
-                           uint8_t opcode, const char *mnem)
-{
-    g_mutex_lock(&g_qep_sig_lock);
-    for (unsigned i = 0; i < g_qep_nsig; i++) {
-        if (g_qep_sig[i].decode_id == decode_id &&
-            g_qep_sig[i].insn_id == insn_id) {
-            g_qep_sig[i].count++;
-            g_mutex_unlock(&g_qep_sig_lock);
-            return;
-        }
-    }
-    if (g_qep_nsig >= CST_QEP_MAX_SIGS) {
-        g_qep_sig_overflow++;
-        g_mutex_unlock(&g_qep_sig_lock);
-        return;
-    }
-    QepSig *e = &g_qep_sig[g_qep_nsig++];
-    e->decode_id = decode_id;
-    e->insn_id = insn_id;
-    e->opcode = opcode;
-    e->count = 1;
-    e->mnem[0] = '\0';
-    if (mnem && mnem[0]) {
-        size_t n = strlen(mnem);
-        if (n >= sizeof(e->mnem)) {
-            n = sizeof(e->mnem) - 1;
-        }
-        memcpy(e->mnem, mnem, n);
-        e->mnem[n] = '\0';
-    }
-    g_mutex_unlock(&g_qep_sig_lock);
-}
-
-static void qid_shadow_score(const qemu_plugin_insn_info *info,
-                             const InsnClassification *dkey,
-                             const InsnClassification *enum_row)
-{
-    g_qsh_insns.fetch_add(1, std::memory_order_relaxed);
-    if (!enum_row) {
-        g_qsh_no_enum.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (!dkey) {
-        /* Why it was silent is already counted, per reason, by
-         * qemu_ident_classify's own survivor block; this row is the
-         * total so the three populations add up to g_qsh_insns. */
-        g_qsh_no_dkey.fetch_add(1, std::memory_order_relaxed);
-        if (enum_row) {
-            /* THE ROW THAT BLOCKS THE DELETION.  The identity key said
-             * nothing, so classify_insn_id fell through and the enum
-             * table's row is what this instruction PUBLISHES.  Delete
-             * the table today and this classification does not move to
-             * the other key -- it becomes GEN_OP_UNKNOWN.
-             *
-             * IT IS TWO CAUSES AND THEY DO NOT HAVE THE SAME REMEDY; the
-             * sidecar's SURVIVOR note carries the measurement.  Either no
-             * decode rule was selected at all (aarch64 udf reaches
-             * unallocated_encoding()), in which case there is nothing to
-             * state and this is a floor -- or a rule WAS selected and a
-             * check ahead of the publish site took the translation away
-             * from it (x86 hlt's chk(cpl0) branches to gp_fault before
-             * decode-new.c.inc reaches plugin_gen_record_insn_identity),
-             * in which case QEMU knows the answer and is simply not being
-             * asked for it at a point where it still has it. */
-            g_qsh_enum_published.fetch_add(1, std::memory_order_relaxed);
-            qep_record_sig(info->decode_id, info->insn_id,
-                           enum_row->opcode, info->mnemonic);
-        }
-        return;
-    }
-    if (!enum_row) {
-        return;
-    }
-    g_qsh_both.fetch_add(1, std::memory_order_relaxed);
-
-    uint32_t cols = 0;
-    if (dkey->opcode         != enum_row->opcode)         cols |= 1u << 0;
-    if (dkey->branch_type    != enum_row->branch_type)    cols |= 1u << 1;
-    if (dkey->flags          != enum_row->flags)          cols |= 1u << 2;
-    if (dkey->refine         != enum_row->refine)         cols |= 1u << 3;
-    if (dkey->dep_refine     != enum_row->dep_refine)     cols |= 1u << 4;
-    if (dkey->lane_mask_kind != enum_row->lane_mask_kind) cols |= 1u << 5;
-    if (dkey->lane_parallel  != enum_row->lane_parallel)  cols |= 1u << 6;
-
-    if (!cols) {
-        g_qsh_agree.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    g_qsh_disagree.fetch_add(1, std::memory_order_relaxed);
-    for (unsigned c = 0; c < CST_QSH_COLS; c++) {
-        if (cols & (1u << c)) {
-            g_qsh_col[c].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    qsh_record_sig(info->decode_id, info->insn_id, cols, info->mnemonic);
-}
-
-uint64_t qemu_ident_enum_published(void)
-{
-    return g_qsh_enum_published.load(std::memory_order_relaxed);
-}
-
-void qemu_ident_shadow_report(GString *report)
-{
-    uint64_t insns    = g_qsh_insns.load(std::memory_order_relaxed);
-    uint64_t both     = g_qsh_both.load(std::memory_order_relaxed);
-    uint64_t agree    = g_qsh_agree.load(std::memory_order_relaxed);
-    uint64_t disagree = g_qsh_disagree.load(std::memory_order_relaxed);
-    uint64_t no_dkey  = g_qsh_no_dkey.load(std::memory_order_relaxed);
-    uint64_t no_enum  = g_qsh_no_enum.load(std::memory_order_relaxed);
-
-    uint64_t enum_pub = g_qsh_enum_published.load(std::memory_order_relaxed);
-
-    g_string_append_printf(report,
-        "\n--- SHADOW LOOKUP: the decode-identity key against the "
-        "Capstone-enum key, per column ---\n"
-        "Both answers are computed for every instruction; the wire takes "
-        "whichever classify_insn_id() already chose and is not reachable "
-        "from here.  An instruction the identity key cannot answer is NOT "
-        "scored as agreement -- it is the population that cannot flip.\n"
-        "%12" PRIu64 "  instructions classified\n"
-        "%12" PRIu64 "  both keys answered -- the comparable population\n"
-        "%12" PRIu64 "  ... and AGREED on every column\n"
-        "%12" PRIu64 "  KEY-DISAGREE: instructions the two keys answer "
-        "differently.\n"
-        "               NOT a must-be-0 row, and deliberately does not carry "
-        "that phrase --\n"
-        "               it is honestly non-zero and reading it as a red gate "
-        "would be a false\n"
-        "               alarm, the same membership rule ADJ-OWED and "
-        "NOT-SCORED sit under.\n"
-        "               Read it exactly: it does NOT mean the wire moved.  "
-        "Where the identity\n"
-        "               key speaks it has already won, so its answer is the "
-        "published one and\n"
-        "               the enum row is dead weight.  What a non-zero says is "
-        "that the two keys\n"
-        "               are NOT interchangeable -- ONE OF THEM IS WRONG -- so "
-        "'deleting the enum\n"
-        "               table loses nothing' is a claim no run supports until "
-        "every signature\n"
-        "               below is adjudicated against the identity tiers and "
-        "the R13 references.\n"
-        "               Never assume the enum row is the right one; it is the "
-        "one under audit.\n"
-        "%12" PRIu64 "  ENUM-PUBLISHED: classifications the ENUM TABLE is "
-        "the answer for.\n"
-        "               Also NOT a must-be-0 row, for the same reason, and it "
-        "is THE R14\n"
-        "               DELETION BAR: it must reach 0 before the four\n"
-        "               champsim_tracer_mnemonics_<isa>.h tables may be "
-        "deleted.  The identity\n"
-        "               key said nothing for these, so the enum row IS the "
-        "answer on the wire\n"
-        "               and its deletion would not re-key them, it would "
-        "erase them to UNKNOWN.\n"
-        "%12" PRIu64 "  identity key SILENT (reasons in the survivor block "
-        "below)\n"
-        "%12" PRIu64 "  no enum row for this insn_id at all\n",
-        insns, both, agree, disagree, enum_pub, no_dkey, no_enum);
-
-    /*
-     * THE BAR'S OWN MEMBERSHIP, named rather than bucketed.  Printed
-     * unconditionally: a deletion bar reported only as a number is one a
-     * reader cannot close, and the population is small by construction --
-     * it is what is LEFT after the identity key answered.
-     */
-    g_mutex_lock(&g_qep_sig_lock);
-    if (enum_pub == 0) {
-        g_string_append_printf(report,
-            "  ENUM-PUBLISHED rows, by name: none -- the bar is 0 on this "
-            "run, so there is no population to name.\n");
-    } else {
-        g_string_append_printf(report,
-            "  ENUM-PUBLISHED rows, by name (%u distinct).  `decode_id=0` "
-            "is its own membership reason -- QEMU exported NO identity for "
-            "the instruction -- and is not the same population as an id "
-            "whose row is missing or silent:\n", g_qep_nsig);
-        for (unsigned i = 0; i < g_qep_nsig; i++) {
-            const QepSig *e = &g_qep_sig[i];
-            g_string_append_printf(report,
-                "    decode_id=0x%08x insn_id=%u %-16s n=%" PRIu64
-                " publishes=%s%s\n",
-                e->decode_id, e->insn_id, e->mnem[0] ? e->mnem : "-",
-                e->count, generic_opcode_name_or_unknown(e->opcode),
-                e->decode_id == 0 ? "   <- NO IDENTITY EXPORTED" : "");
-        }
-    }
-    if (g_qep_sig_overflow) {
-        g_string_append_printf(report,
-            "    signature table overflowed: %" PRIu64 " further "
-            "ENUM-PUBLISHED classifications were counted but NOT named.  "
-            "The count above is complete; this list is not.\n",
-            g_qep_sig_overflow);
-    }
-    g_mutex_unlock(&g_qep_sig_lock);
-
-    g_string_append_printf(report, "  per-column disagreements:\n");
-    for (unsigned c = 0; c < CST_QSH_COLS; c++) {
-        uint64_t n = g_qsh_col[c].load(std::memory_order_relaxed);
-        const char *cls = g_qsh_col_open_class[c];
-
-        g_string_append_printf(report, "    %-16s %10" PRIu64 "%s%s\n",
-                               g_qsh_col_name[c], n,
-                               (n && cls) ? "   " : "",
-                               (n && cls) ? cls : "");
-    }
-    /*
-     * THE NAMED OPEN CLASSES, and why a standing number gets a name here.
-     *
-     * A non-zero column with a FILED adjudication question is not an
-     * unexplained number, and printing it bare invites every reader to
-     * rediscover it: the aarch64 branch_type column has stood at ~13.6k
-     * across passes and has been re-derived as a new finding more than
-     * once.  The tag above says which class a column's rows belong to; the
-     * block below states the question, and the mnemonics measured under
-     * that column in THIS run are printed with it so the tag is checked
-     * against the data rather than asserted over it.
-     *
-     * A column with NO tag and a non-zero count has no filed question, and
-     * that is exactly the case a reader should treat as a finding.
-     */
-    g_string_append_printf(report,
-        "  NAMED OPEN CLASSES behind the columns above.  A standing\n"
-        "  disagreement with a FILED question is not an unexplained number\n"
-        "  and should stop being re-derived as a new finding; a non-zero\n"
-        "  column with NO entry here, or a row outside a named class's\n"
-        "  stated subject, IS one.  The subject is printed under each class\n"
-        "  so the tag is checked against this run's data rather than\n"
-        "  asserted over it.\n"
-        "    branch_type   #290 OPEN, and NARROW.  Its subject is the\n"
-        "                  aarch64 UDF decode rule ALONE: down a wrong-path\n"
-        "                  excursion the walker reaches bytes that decode as\n"
-        "                  `udf`, the identity key and the enum row disagree\n"
-        "                  on whether that is a control transfer, and the\n"
-        "                  adjudication rule written for `svc` is keyed on\n"
-        "                  the decode rule so it does not reach UDF.  It was\n"
-        "                  measured at 2 rows, WRONG-PATH ONLY -- the same\n"
-        "                  audit at wp=0 reads 0 for it.  #290 therefore\n"
-        "                  explains `udf` rows and NOTHING ELSE in this\n"
-        "                  column.\n");
-    g_mutex_lock(&g_qsh_sig_lock);
-    {
-        unsigned c = 1;                 /* branch_type */
-        bool any = false;
-        uint64_t named = 0, unnamed = 0;
-
-        g_string_append_printf(report,
-            "    THE COLUMN'S ACTUAL SUBJECT IN THIS RUN, so the tag above "
-            "can be checked:\n");
-        for (unsigned i = 0; i < g_qsh_nsig; i++) {
-            const char *m;
-            bool is_udf;
-
-            if (!(g_qsh_sig[i].cols & (1u << c))) {
-                continue;
-            }
-            any = true;
-            m = g_qsh_sig[i].mnem[0] ? g_qsh_sig[i].mnem : "-";
-            is_udf = (g_strcmp0(m, "udf") == 0);
-            if (is_udf) {
-                named += g_qsh_sig[i].count;
-            } else {
-                unnamed += g_qsh_sig[i].count;
-            }
-            g_string_append_printf(report,
-                "      %-16s decode_id=0x%08x n=%-8" PRIu64 " %s\n",
-                m, g_qsh_sig[i].decode_id, g_qsh_sig[i].count,
-                is_udf ? "#290" : "NOT #290 -- no filed class");
-        }
-        if (!any) {
-            g_string_append_printf(report,
-                "      (none -- the column is 0 on this target, or its rows "
-                "did not reach the signature table)\n");
-        } else {
-            g_string_append_printf(report,
-                "      attributed to #290 %" PRIu64 ", NOT attributed %"
-                PRIu64 ".\n"
-                "      A NOT-attributed count is NOT covered by the tag "
-                "above.  It is\n"
-                "      the population an adjudication still has to be "
-                "written for, and\n"
-                "      quoting #290 over it is the mis-attribution this "
-                "split exists to\n"
-                "      prevent.\n", named, unnamed);
-        }
-    }
-    g_mutex_unlock(&g_qsh_sig_lock);
-
-    g_mutex_lock(&g_qsh_sig_lock);
-    g_string_append_printf(report,
-        "  disagreeing signatures: %u distinct%s\n", g_qsh_nsig,
-        g_qsh_sig_overflow ? " (TABLE FULL -- see overflow below)" : "");
-    for (unsigned i = 0; i < g_qsh_nsig; i++) {
-        const QshSig *e = &g_qsh_sig[i];
-        char cols[128];
-        cols[0] = '\0';
-        for (unsigned c = 0; c < CST_QSH_COLS; c++) {
-            if (e->cols & (1u << c)) {
-                if (cols[0]) {
-                    g_strlcat(cols, ",", sizeof(cols));
-                }
-                g_strlcat(cols, g_qsh_col_name[c], sizeof(cols));
-            }
-        }
-        g_string_append_printf(report,
-            "    decode_id=0x%08x insn_id=%u %-16s n=%" PRIu64 " "
-            "cols=%s\n", e->decode_id, e->insn_id,
-            e->mnem[0] ? e->mnem : "-", e->count, cols);
-    }
-    if (g_qsh_sig_overflow) {
-        g_string_append_printf(report,
-            "    signature table overflowed: %" PRIu64 " further "
-            "disagreements were counted but NOT named.  The count above is "
-            "complete; this list is not.\n", g_qsh_sig_overflow);
-    }
-    g_mutex_unlock(&g_qsh_sig_lock);
-}
-
-/*
- * THE ONE REMAINING ROUTE TO THE ENUM TABLE, and it is a NAMED one.
+ * THE LAST ROUTE TO THE ENUM TABLE IS CLOSED, AND `decode_id == 0` NO
+ * LONGER HAS A SECOND ANSWER BEHIND IT.
  *
  * With the STATED tier admitted, every reason a decode identity could
  * carry no class -- SPLIT, NAME_MATCHED, NONE, an id with no row -- reads
- * 0 on all four targets.  What is left is decode_id == 0: QEMU exported
- * NO identity.
+ * 0 on all four targets.  What was left was `decode_id == 0`: QEMU
+ * exported NO identity, and the Capstone-enum row answered instead.  That
+ * route is what `enumocc.py` counts, and it counts 0 on all four ISAs in
+ * both wp arms -- so nothing is re-keyed by removing it, and nothing that
+ * was published stops being published.
  *
- * THE REASON THAT USED TO STAND HERE WAS FALSE -- "a translation that
- * only RAISES" -- and it is recorded rather than deleted because it is
- * the shape this directory keeps catching: a justification nobody
- * measured, sitting on top of a real defect.  A faulting translation
- * publishes fine.  What is left after the measurement is a decode with NO
- * ROW: aarch64 `udf` reaches unallocated_encoding() and decodetree emits
- * plugin_gen_record_insn_identity() only at a pattern's own dispatch
- * site, so no site is reached and nothing can be stated.
+ * TWO MECHANISMS EMPTIED IT, EACH AT ITS OWN SOURCE, and they are named
+ * because a zero with no cause is not a proof:
  *
- * Measured over the w19 corpus, wp0 and wp16, BEFORE the ordering fix: 18
- * decodes on two targets -- x86 `hlt` x12, aarch64 `udf` x6.  The twelve
- * were the ordering case and are gone; decode-new.c.inc now publishes at
- * the row-selection point.  What is left is the aarch64 floor, and it is
- * the whole live dependency on the four
- * champsim_tracer_mnemonics_<isa>.h tables.
+ *   mipsel  94,704 -> 0   `mips_ident_fault()` DISCARDED a committed
+ *                         identity at EXCP_RI / CpU / DSPDIS / MSADIS; a
+ *                         decline is a decision and the arm now states it
+ *                         (d8466387e9).
+ *   x86_64   1,459 -> 0   `decode_insn()` returning false is "no rule
+ *                         matched" by the other door -- validate_sse_prefix,
+ *                         X86_TYPE_C/D/S/R/M -- and it took `goto
+ *                         illegal_op`, which set no flag (cf6bf3b64f).
+ *
+ * aarch64 and riscv64 were already 0.  The aarch64 `udf` floor this note
+ * used to describe as "the whole live dependency on the four
+ * champsim_tracer_mnemonics_<isa>.h tables" is gone with D14 (7b23579707):
+ * there are no `udf` rows in the corpus and `00000000` is REFUSED.
+ *
+ * What remains, and is counted below, is a row that would once have been
+ * quietly answered by the enum table and now publishes GEN_OP_UNKNOWN.
  */
 static std::atomic<uint64_t> g_qid_enum_no_ident{0};
 /*
@@ -1659,7 +1197,6 @@ const char *qid_key_name(uint8_t key)
 {
     switch (key) {
     case QID_KEY_QEMU: return "QEMU";
-    case QID_KEY_ENUM: return "ENUM";
     case QID_KEY_NONE: return "NONE";
     default:           return "-";
     }
@@ -1670,14 +1207,7 @@ static const InsnClassification *classify_insn_id(
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags,
     uint8_t *key = nullptr)
 {
-    uint32_t id = info->insn_id;
-    const InsnClassification *cap =
-        (active_insn_table && id < active_insn_table_size)
-            ? &active_insn_table[id] : nullptr;
-
-    const InsnClassification *q = qemu_ident_classify(info->decode_id, cap);
-    /* Read-only A/B; scored for every instruction, whichever key wins. */
-    qid_shadow_score(info, q, cap);
+    const InsnClassification *q = qemu_ident_classify(info->decode_id);
     if (q) {
         *opcode = q->opcode;
         *branch_type = q->branch_type;
@@ -1688,18 +1218,18 @@ static const InsnClassification *classify_insn_id(
         return q;
     }
 
-    if (info->decode_id == 0 && cap) {
+    if (info->decode_id == 0) {
+        /*
+         * THE ROW THE ENUM TABLE USED TO ANSWER FOR.  It is still counted,
+         * under the same name, so the retirement's own cost stays visible:
+         * what used to return the Capstone row here now publishes
+         * GEN_OP_UNKNOWN.  The occupancy census reads 0 for this
+         * population over the whole enumerated encoding space, so the
+         * counter is a tripwire on a route that is measured empty rather
+         * than a running loss.
+         */
         g_qid_enum_no_ident.fetch_add(1, std::memory_order_relaxed);
-        *opcode = cap->opcode;
-        *branch_type = cap->branch_type;
-        *flags = cap->flags;
-        if (key) {
-            *key = QID_KEY_ENUM;
-        }
-        return cap;
-    }
-
-    if (info->decode_id != 0) {
+    } else {
         /*
          * Counted here and reported as a must-be-0 row; the SIDECAR line
          * comes from the caller, which already warns on every instruction

@@ -50,27 +50,25 @@
 
 TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 bool target_big_endian = false;
-const InsnClassification *active_insn_table = nullptr;
 /*
- * Bound below beside active_insn_table, and INERT here by
- * construction rather than by omission: isaxcheck decodes raw bytes
+ * INERT here by construction rather than by omission: isaxcheck decodes
+ * raw bytes
  * through cap_disas_raw_detail(), which has no insn handle, so
  * qemu_plugin_insn_info::decode_id is always 0 and
  * qemu_ident_classify() returns nullptr on every call, tallying the
  * no-identity survivor class.
  *
  * A DISCLOSED BLIND SPOT, and a widening one.  The gate compiles the
- * identity tables and links the lookup, and exercises the Capstone
- * SURVIVOR path only -- so since the identity flip it no longer scores
- * the source the live wire's opcode, branch class, refiner and lane
- * shape come from on the deciding rows.  Reaching those needs a running
- * translator, which is what the live batteries and the identity audit in
+ * identity tables and links the lookup, and exercises the survivor path
+ * only -- so since the identity flip it no longer scores the source the
+ * live wire's opcode, branch class, refiner and lane shape come from on
+ * the deciding rows.  Reaching those needs a running translator, which
+ * is what the live batteries and the identity audit in
  * champsim_tracer_qemu_ident.cc are for; this gate's zero is a statement
- * about the fallback, not about the flip.
+ * about the survivor route, not about the flip.
  */
 const QemuIdentRow *active_qemu_ident = nullptr;
 unsigned active_qemu_ident_size = 0;
-unsigned active_insn_table_size = 0;
 const RegClassification *active_reg_table = nullptr;
 unsigned active_reg_table_size = 0;
 GMutex unknown_warn_lock;
@@ -147,16 +145,14 @@ bool isax_fields_init(const char *isa_name)
      * id without a QEMU register and silently change what this tool
      * sees relative to the plugin. */
     trace_isa = isa;
-    active_insn_table = isa_insn_class[isa];
     active_qemu_ident = isa_qemu_ident[isa];
     active_qemu_ident_size = isa_qemu_ident_count[isa];
-    active_insn_table_size = isa_insn_class_size[isa];
     active_reg_table = isa_reg_class[isa];
     active_reg_table_size = isa_reg_class_size[isa];
     active_qemu_regs = isa_qemu_regs[isa];
     active_qemu_regs_count = isa_qemu_regs_count[isa];
     build_qemu_reg_reverse_index();
-    table_ready = active_insn_table && active_reg_table;
+    table_ready = active_reg_table != nullptr;
     return table_ready;
 }
 

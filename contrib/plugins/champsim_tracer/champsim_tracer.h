@@ -1498,18 +1498,15 @@ static inline bool cst_va_is_kernel_code(uint64_t pc)
     return qemu_plugin_vaddr_is_kernel(pc);
 }
 
-extern const InsnClassification *active_insn_table;
-extern unsigned active_insn_table_size;
 /*
- * The same instructions keyed on QEMU'S OWN decode-table identity; see
- * QemuIdentRow and champsim_tracer_qemu_ident_<isa>.h.  Bound beside
- * active_insn_table, at the same sites, so the two accounts of one
- * instruction can never be bound to different ISAs.
+ * The instructions keyed on QEMU'S OWN decode-table identity; see
+ * QemuIdentRow and champsim_tracer_qemu_ident_<isa>.h.
  *
- * This is the classifier's PRIMARY key: the wire's opcode taxonomy,
- * branch class and refiner selection come from the rule the translator
- * dispatched on, and fall back to the Capstone-keyed table only on the
- * rows whose rule states no classification.  Rows are sorted by id;
+ * This is the classifier's ONLY key.  It used to be the primary one,
+ * with the Capstone-enum-keyed `active_insn_table` behind it for the
+ * rows whose rule stated no classification; that table is retired and
+ * that fallback is gone, so a rule that states nothing now publishes
+ * GEN_OP_UNKNOWN and says so in the sidecar.  Rows are sorted by id;
  * bisect.
  */
 extern const QemuIdentRow *active_qemu_ident;
@@ -1537,8 +1534,7 @@ extern unsigned active_qemu_ident_size;
  * "how much of the decided population has an independent reading behind
  * it" is a question the census must keep being able to answer.
  */
-const InsnClassification *qemu_ident_classify(
-    uint32_t id, const InsnClassification *cap_row);
+const InsnClassification *qemu_ident_classify(uint32_t id);
 
 /*
  * Decodes the identity decided, on the tier whose class an independent
@@ -1576,11 +1572,6 @@ typedef struct {
      * All four targets are flipped, so this is a MUST-BE-0 row: a decode
      * counted here is a TraceISA that function does not name. */
     uint64_t isa_held;
-    /* Decided rows whose answer differs from the Capstone row they were
-     * joined through: the population an adjudication has to be written
-     * for, and the tripwire for a rule the generator's corpus covered
-     * with only one of the spellings that reach it. */
-    uint64_t cap_disagree;
 } QemuIdentSurvivors;
 void qemu_ident_survivors(QemuIdentSurvivors *out);
 
@@ -1931,28 +1922,32 @@ const QemuRegKey *qemu_reg_key_for_generic(uint8_t gen_id);
 /*
  * WHICH IDENTITY KEY DECIDED THE CLASSIFICATION, as a stated fact.
  *
- * classify_insn_id() asks QEMU's decode identity first and falls to the
- * Capstone enum row on exactly one condition -- no identity answered AND
- * the target exported no decode id AND the table holds a row.  The enum
- * table's retirement needs an occupancy count over that condition, and a
- * census reading a per-encoding corpus could only INFER it from
- * `decode_id == 0` plus a published class, which is a coincidence and not
- * the condition (see the note at qid_key_name).  These are the words the
- * per-encoding record carries so the census reads the statement.
+ * classify_insn_id() used to ask QEMU's decode identity first and FALL to
+ * the Capstone enum row on one condition -- no identity answered AND the
+ * target exported no decode id AND the table held a row.  QID_KEY_ENUM
+ * was that fall's word, and the occupancy census counted it.  The census
+ * read 0 on all four ISAs in both wp arms, the fall is deleted with the
+ * table, and the word is deleted with the fall: the value is NOT kept as
+ * an unreachable spelling, because a key nothing can produce turns its
+ * own census into a zero with no firing control.
+ *
+ * Numbering is UNCHANGED across the removal.  QID_KEY_NONE stays 3, so a
+ * corpus banked before the retirement and one taken after it mean the
+ * same thing by the same number; 2 is retired rather than reused.
  */
 enum {
     QID_KEY_UNSET = 0,   /* the classifier did not run for this insn */
     QID_KEY_QEMU  = 1,   /* QEMU's decode identity answered */
-    QID_KEY_ENUM  = 2,   /* no identity, and the enum row answered */
-    QID_KEY_NONE  = 3,   /* neither key answered; GEN_OP_UNKNOWN */
+    /* 2 was QID_KEY_ENUM -- retired with the enum table.  NOT reused. */
+    QID_KEY_NONE  = 3,   /* no key answered; GEN_OP_UNKNOWN */
 };
 const char *qid_key_name(uint8_t key);
 
 /*
  * @ident_key, when non-null, receives the QID_KEY_* word for the same
  * decode -- from the one classify_insn_id() call this already makes,
- * because that call scores the read-only QID shadow A/B and asking twice
- * would double it.
+ * because that call has observable effect (it counts the route QEMU
+ * exported no identity for) and asking twice would double it.
  */
 const char *dep_refine_name_for(const qemu_plugin_insn_info *info,
                                 uint8_t *ident_key = nullptr);

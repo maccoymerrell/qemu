@@ -220,22 +220,18 @@ survey() {
     #
     note "  occupants encodings the enum table is still the CLASSIFICATION"
     note "           for (decode_id == 0), counted per ISA:"
-    local occ="$(dirname "${BASH_SOURCE[0]}")/arc3_cov/instruments/enumocc.py"
-    if [ -z "${CST_ENUMOCC_SLED:-}" ]; then
-        note "             SURVEY CANNOT LOOK -- no CST_ENUMOCC_SLED naming a"
-        note "             sled capture (srcenc_sled.py --mech).  This is NOT"
-        note "             a zero."
-    elif [ ! -f "$occ" ]; then
-        note "             SURVEY CANNOT LOOK -- no enumocc.py at $occ"
-    else
-        local otxt orc
-        otxt=$("${CST_PYTHON:-python3}" "$occ" --sled "$CST_ENUMOCC_SLED" \
-                   2>&1); orc=$?
-        printf '%s\n' "$otxt" | grep -E 'TOTAL|REFUSED-TO-SCORE|ENUM-OCCUPANCY' \
-            | sed 's/^/             /'
-        [ "$orc" = 0 ] || note "             (enumocc exited $orc -- a row it" \
-                               "could not score is named above)"
-    fi
+    note "             RETIRED WITH ITS SUBJECT.  enumocc.py scored this"
+    note "             population from the per-encoding MECHANISM corpus'"
+    note "             stated identity key (IDK: QEMU / ENUM / NONE).  The"
+    note "             plugin can no longer state ENUM -- there is no enum"
+    note "             table and no fall to one -- so the census would read"
+    note "             a structural zero with no control behind it, which"
+    note "             is the shape this file exists to refuse.  Its last"
+    note "             reading, over the whole enumerated encoding"
+    note "             population, four ISAs x wp{0,16}, key=STATED:"
+    note "                 ENUM-OCCUPANCY total=0 inference_total=0 rc=0"
+    note "             The surviving size rows below are what R14 now"
+    note "             measures; this row is history."
 
     #
     # THE LABEL SAYS "AT OR BESIDE", AND FINDING 96-D IS WHY.  Until

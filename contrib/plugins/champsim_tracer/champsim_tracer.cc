@@ -3174,8 +3174,6 @@ static_assert(MAX_SRC_REGS <= 255,
 static_assert(MAX_DST_REGS <= 255,
               "MAX_DST_REGS no longer fits in u8");
 
-const InsnClassification *active_insn_table;
-unsigned active_insn_table_size;
 const QemuIdentRow *active_qemu_ident;
 unsigned active_qemu_ident_size;
 const RegClassification *active_reg_table;
@@ -12285,10 +12283,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_rec_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
 
-    active_insn_table = isa_insn_class[trace_isa];
     active_qemu_ident = isa_qemu_ident[trace_isa];
     active_qemu_ident_size = isa_qemu_ident_count[trace_isa];
-    active_insn_table_size = isa_insn_class_size[trace_isa];
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
     active_qemu_regs = isa_qemu_regs[trace_isa];

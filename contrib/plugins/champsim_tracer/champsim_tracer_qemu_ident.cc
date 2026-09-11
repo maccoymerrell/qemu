@@ -91,15 +91,11 @@
 #include "champsim_tracer.h"
 
 /* The per-ISA classification tables, for the Capstone half of each row. */
-extern const InsnClassification *const isa_insn_class[];
-extern const unsigned isa_insn_class_size[];
 
 namespace {
 
 const QemuIdentRow *g_rows;
 unsigned            g_nrows;
-const InsnClassification *g_cap;
-unsigned            g_cap_size;
 bool                g_have_table;      /* this ISA tabulates identities */
 bool                g_detail;          /* CST_QEMU_IDENT_AUDIT */
 
@@ -148,23 +144,20 @@ uint64_t g_n_scored;           /* row found and name agreed */
 uint64_t g_tier_seen[QID_TIER_COUNT];
 uint64_t g_tier_out_of_range;
 /*
- * TWO Capstone-side accounts of the same instruction, and the difference
- * between them is the whole point of scoring both:
+ * ONE ACCOUNT NOW, AND IT IS THE RIGHT ONE.
  *
- *   _tbl  the mnemonic TABLE row `info->insn_id` indexes.  That row is the
- *         INPUT to decode_detail_to_generic()'s per-instance refiners, so
- *         on every family a refiner touches it is not what any trace says.
- *   _wire what decode_detail_to_generic() ANSWERED for this instruction --
- *         the value the tracer publishes.  This is the account a claim
- *         about a wire defect has to be made against.
- *
- * The `_tbl` pair was the only one scored until the four-ISA audit was
- * asked to adjudicate a refiner-touched family and could not.
+ * There used to be two: `_tbl`, the enum-keyed mnemonic TABLE row
+ * `info->insn_id` indexed, and `_wire`, what decode_detail_to_generic()
+ * ANSWERED for this instruction.  The `_tbl` pair was the only one
+ * scored until the four-ISA audit was asked to adjudicate a
+ * refiner-touched family and could not -- the table row is the INPUT to
+ * the per-instance refiners, so on every family a refiner touches it is
+ * not what any trace says.  With the enum table retired the `_tbl`
+ * account has no operand, and what is left is the account a claim about
+ * a wire defect always had to be made against.
  */
 uint64_t g_op_agree, g_op_disagree;          /* wire */
 uint64_t g_br_agree, g_br_disagree;          /* wire */
-uint64_t g_op_agree_tbl, g_op_disagree_tbl;  /* pre-refinement table row */
-uint64_t g_br_agree_tbl, g_br_disagree_tbl;
 uint64_t g_op_row_unknown;     /* row says GEN_OP_UNKNOWN: nothing to check */
 uint64_t g_br_row_unknown;     /* same row, same reason, branch class */
 
@@ -484,8 +477,6 @@ GHashTable *g_id_to_caps;      /* qemu id   -> GHashTable of capstone ids */
 GHashTable *g_cap_to_ids;      /* cap id    -> GHashTable of qemu ids */
 GHashTable *g_opsig;           /* signature -> count (wire) */
 GHashTable *g_brsig;
-GHashTable *g_opsig_tbl;       /* same, scored against the table row */
-GHashTable *g_brsig_tbl;
 GHashTable *g_stalesig;
 /*
  * THE id == 0 POPULATION, BY NAME.
@@ -627,8 +618,6 @@ unsigned qemu_ident_install(TraceISA isa)
     }
     g_rows     = isa_qemu_ident[isa];
     g_nrows    = isa_qemu_ident_count[isa];
-    g_cap      = isa_insn_class[isa];
-    g_cap_size = isa_insn_class_size[isa];
     g_have_table = (g_rows != nullptr && g_nrows > 0);
     if (!g_have_table) {
         return 0;
@@ -937,17 +926,28 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
         g_tier_out_of_range++;
     }
 
-    /* The Capstone half of the same instruction, taken from the same table
-     * the wire's opcode comes from. */
-    const InsnClassification *c = nullptr;
-    if (info && g_cap && info->insn_id < g_cap_size) {
-        c = &g_cap[info->insn_id];
+    /*
+     * THE SECOND OPINION IS NOW THE WIRE'S, AND ONLY THE WIRE'S.
+     *
+     * This block used to score the identity row against TWO things: the
+     * classification the wire actually published, and the Capstone-enum
+     * table row `info->insn_id` indexed.  The enum table is retired, so
+     * the `_tbl` half has no operand; what remains is the comparison that
+     * was always the meaningful one -- QEMU's rule against what the
+     * instruction PUBLISHED.
+     *
+     * The (identity, Capstone-id) fan-out census is NOT part of that
+     * half and stays: both of its keys come from the running emulator
+     * (the id the translator exported and the id the boundary decoded),
+     * neither came from the table, and it is the `--pairs` input the
+     * identity generator reads.  It moves out of the table's gate rather
+     * than dying with it.
+     */
+    if (g_detail && info) {
+        note_pair(&g_id_to_caps, id, info->insn_id);
+        note_pair(&g_cap_to_ids, info->insn_id, id);
     }
-    if (c) {
-        if (g_detail) {
-            note_pair(&g_id_to_caps, id, info->insn_id);
-            note_pair(&g_cap_to_ids, info->insn_id, id);
-        }
+    if (info) {
         /*
          * A QID_NONE row carries GEN_OP_UNKNOWN because nothing named it,
          * not because it disagrees.  Scoring that as a disagreement would
@@ -955,7 +955,7 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
          * the enumerated-zero shape in reverse: a number that is large for
          * a reason having nothing to do with what it claims to measure.
          */
-        uint8_t cap_op = wire ? wire->opcode : c->opcode;
+        uint8_t cap_op = wire ? wire->opcode : row->cls.opcode;
         if (row->cls.opcode == GEN_OP_UNKNOWN) {
             g_op_row_unknown++;
         } else {
@@ -974,21 +974,6 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
                     tally(&g_opsig, sig);
                 }
             }
-            if (row->cls.opcode == c->opcode) {
-                g_op_agree_tbl++;
-            } else {
-                g_op_disagree_tbl++;
-                if (g_detail) {
-                    char sig[224];
-                    g_snprintf(sig, sizeof(sig),
-                               "%-34s qemu=%-18s captbl=%-18s (%s)",
-                               row->name,
-                               generic_opcode_name_or_unknown(row->cls.opcode),
-                               generic_opcode_name_or_unknown(c->opcode),
-                               info->mnemonic);
-                    tally(&g_opsig_tbl, sig);
-                }
-            }
         }
         /*
          * Same rule for the branch class, and it has to be said in terms
@@ -1000,7 +985,7 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
          * happened is that decode_insn16/jalr is a SPLIT row and the
          * rule genuinely does not say which of the three it is.
          */
-        uint8_t cap_bt = wire ? wire->branch_type : c->branch_type;
+        uint8_t cap_bt = wire ? wire->branch_type : row->cls.branch_type;
         if (row->cls.opcode == GEN_OP_UNKNOWN) {
             g_br_row_unknown++;
         } else {
@@ -1017,21 +1002,6 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
                                branch_type_name_or_unknown(cap_bt),
                                info->mnemonic);
                     tally(&g_brsig, sig);
-                }
-            }
-            if (row->cls.branch_type == c->branch_type) {
-                g_br_agree_tbl++;
-            } else {
-                g_br_disagree_tbl++;
-                if (g_detail) {
-                    char sig[224];
-                    g_snprintf(sig, sizeof(sig),
-                               "%-34s qemu=%-18s captbl=%-18s (%s)",
-                               row->name,
-                               branch_type_name_or_unknown(row->cls.branch_type),
-                               branch_type_name_or_unknown(c->branch_type),
-                               info->mnemonic);
-                    tally(&g_brsig_tbl, sig);
                 }
             }
         }
@@ -1086,8 +1056,6 @@ static void write_pair_census(GString *report)
 
 void qemu_ident_report(GString *report)
 {
-    qemu_ident_shadow_report(report);
-
     write_pair_census(report);
 
     /*
@@ -1129,7 +1097,6 @@ void qemu_ident_report(GString *report)
             PRIu64 "\n"
             "  HELD: this ISA's flip is not taken (must be 0) %5" PRIu64 "\n"
             "  decided rows carrying UNKNOWN (must be 0) %6" PRIu64 "\n"
-            "  decided rows the Capstone row disputes    %10" PRIu64 "\n"
             "  decided %" PRIu64 " of %" PRIu64 " classified\n"
             "    `no identity exported` is the ONE route left to the "
             "Capstone-enum table, and it is TWO causes, not one.  The "
@@ -1188,23 +1155,13 @@ void qemu_ident_report(GString *report)
             "decode rule, so an execution can disagree with it but cannot "
             "supply it; a rule whose statement and whose older payload "
             "disagreed carries a written ruling in the generated header "
-            "beside its row.\n"
-            "    `the Capstone row disputes` is the STANDING GUARD on one "
-            "generic exposure: a rule the generator's corpus covered "
-            "under only one of the spellings that reach it, so the row's "
-            "payload describes the spelling that was seen and not the one "
-            "executing now.  It is not a defect count -- it is the "
-            "population an adjudication has to be written for, reported "
-            "per ISA at every run.  The narrow-identity work removes rows "
-            "from it at the source instead: an encoding-qualified "
-            "identity gives each spelling its own rule, and then there is "
-            "nothing left for the two keys to disagree about.\n",
+            "beside its row.\n",
             qemu_ident_decided_observed(), qemu_ident_decided_stated(),
             qemu_ident_adjudicated_hits(),
             sv.split, sv.name_matched, sv.none,
             sv.no_row, sv.no_ident,
             qemu_ident_enum_no_ident(), qemu_ident_abstain_refused(),
-            sv.isa_held, sv.decided_unknown, sv.cap_disagree,
+            sv.isa_held, sv.decided_unknown,
             decided, decided + surv);
     }
     {
@@ -1404,31 +1361,21 @@ void qemu_ident_report(GString *report)
         "The table is champsim_tracer_qemu_ident_<isa>.h, one row per "
         "decode rule, keyed by qemu_plugin_insn_decode_id().  Under ruling "
         "J6 this identity is the INTENDED source of the wire's opcode "
-        "taxonomy, AND ON THIS RUN IT IS ALREADY THE SOURCE FOR EVERY "
-        "CLASSIFICATION BUT THE ENUM-PUBLISHED ONES, whose count is "
-        "printed below and measured rather than asserted.  Where the "
-        "identity key speaks, classify_insn_id() has already taken its "
-        "answer and the Capstone-enum row is dead weight; the enum table "
-        "is the wire's answer only where the identity key said nothing.  "
-        "That residue is the R14 deletion bar and the numbers below "
-        "measure how ready the replacement is.\n"
+        "taxonomy, and since the enum table's retirement it is the ONLY "
+        "source: there is no second key, so classify_insn_id() either "
+        "takes this answer or publishes GEN_OP_UNKNOWN and says so in the "
+        "sidecar.  The ENUM-PUBLISHED row that used to stand here was the "
+        "R14 deletion bar; it is gone with its subject, and the last "
+        "reading over the whole enumerated encoding population -- four "
+        "ISAs, both wp arms -- was `ENUM-OCCUPANCY total=0`.\n"
         "  translated instructions read           %10" PRIu64 "\n"
         "  no identity exported (id == 0)         %10" PRIu64 "  %5.1f%%\n"
         "  id carried, NO ROW IN TABLE            %10" PRIu64 "  <- stale table\n"
         "  row found, NAME DISAGREES              %10" PRIu64 "  <- stale table\n"
-        "  scored against the Capstone row        %10" PRIu64 "\n"
-        "  ENUM-PUBLISHED, this run               %10" PRIu64 "  <- the rows "
-        "the enum table IS still the answer for\n"
-        "               Counted by the shadow lookup over the same "
-        "population; read its block for the\n"
-        "               per-name partition.  It is NOT a must-be-0 row here "
-        "either -- it is the bar,\n"
-        "               and quoting it without naming the corpus it was "
-        "measured on says nothing.\n",
+        "  scored against the WIRE                %10" PRIu64 "\n",
         g_n_insns, g_n_no_identity,
         100.0 * (double)g_n_no_identity / (double)g_n_insns,
-        g_n_row_missing, g_n_name_mismatch, g_n_scored,
-        qemu_ident_enum_published());
+        g_n_row_missing, g_n_name_mismatch, g_n_scored);
 
     if (g_n_no_identity) {
         /*
@@ -1499,16 +1446,9 @@ void qemu_ident_report(GString *report)
         "   row unclassified %" PRIu64 "\n"
         "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64
         "   row unclassified %" PRIu64 "\n"
-        "  scored against the pre-refinement mnemonic TABLE ROW -- the "
-        "INPUT to those refiners, published nowhere.  A row where the two "
-        "accounts differ is a row a refiner rewrote, and only the WIRE "
-        "figure above can adjudicate it:\n"
-        "  opcode     agree %10" PRIu64 "   disagree %10" PRIu64 "\n"
-        "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64 "\n",
+        ,
         g_op_agree, g_op_disagree, g_op_row_unknown,
-        g_br_agree, g_br_disagree, g_br_row_unknown,
-        g_op_agree_tbl, g_op_disagree_tbl,
-        g_br_agree_tbl, g_br_disagree_tbl);
+        g_br_agree, g_br_disagree, g_br_row_unknown);
 
     if (!g_detail) {
         g_string_append_printf(report,
@@ -1526,8 +1466,4 @@ void qemu_ident_report(GString *report)
     dump_tally(report, g_stalesig,  "staleness signatures", 16);
     dump_tally(report, g_opsig,     "opcode disagreements (vs WIRE)", 24);
     dump_tally(report, g_brsig,     "branch-type disagreements (vs WIRE)", 24);
-    dump_tally(report, g_opsig_tbl,
-               "opcode disagreements (vs pre-refinement table row)", 24);
-    dump_tally(report, g_brsig_tbl,
-               "branch-type disagreements (vs pre-refinement table row)", 24);
 }

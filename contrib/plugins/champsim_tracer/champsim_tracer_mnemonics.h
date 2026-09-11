@@ -810,24 +810,6 @@ const unsigned isa_qemu_ident_count[] = {
     [TRACE_ISA_MIPS]    = (unsigned)qemu_ident_mips_count,
 };
 
-extern const InsnClassification *const isa_insn_class[];
-const InsnClassification *const isa_insn_class[] = {
-    [TRACE_ISA_UNKNOWN] = NULL,
-    [TRACE_ISA_X86]     = x86_insn_class,
-    [TRACE_ISA_AARCH64] = aarch64_insn_class,
-    [TRACE_ISA_RISCV]   = riscv_insn_class,
-    [TRACE_ISA_MIPS]    = mips_insn_class,
-};
-
-extern const unsigned isa_insn_class_size[];
-const unsigned isa_insn_class_size[] = {
-    [TRACE_ISA_UNKNOWN] = 0,
-    [TRACE_ISA_X86]     = X86_INS_ENDING,
-    [TRACE_ISA_AARCH64] = AARCH64_INS_ENDING,
-    [TRACE_ISA_RISCV]   = RISCV_INS_ENDING,
-    [TRACE_ISA_MIPS]    = MIPS_INS_ENDING,
-};
-
 #else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 
 extern const RegClassification *const isa_reg_class[TRACE_ISA_MIPS + 1];
@@ -836,8 +818,6 @@ extern const QemuRegRow *const isa_qemu_regs[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_qemu_regs_count[TRACE_ISA_MIPS + 1];
 extern const QemuIdentRow *const isa_qemu_ident[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_qemu_ident_count[TRACE_ISA_MIPS + 1];
-extern const InsnClassification *const isa_insn_class[TRACE_ISA_MIPS + 1];
-extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
 
 #endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 

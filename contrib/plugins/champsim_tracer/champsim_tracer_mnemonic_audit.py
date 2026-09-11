@@ -1902,6 +1902,17 @@ def print_noop_refiner_census(info: IsaInfo) -> None:
 
 
 def parse_existing(info: IsaInfo) -> dict[str, Entry]:
+    """Read the enum-keyed table out of the header.
+
+    DEAD SINCE THE R14 RETIREMENT, and kept rather than deleted only for
+    the archaeology a future reader of `table_body()` will want: this is
+    the round trip that made the generated file its own input.  There is
+    no `<isa>_insn_class[]` in any header now, so `table_body()` raises
+    and nothing calls this -- `main()` refuses the instruction-table
+    modes outright.  `full_entry()` no longer consults it either: the
+    forty-three `.refine` assignments it used to carry are stated in
+    REFINE_OVERRIDES.
+    """
     text = info.header.read_text()
     body = table_body(text, info)
     noop, _rows = noop_refiner_census(info, text, body)
@@ -10417,6 +10428,21 @@ def main() -> int:
     args = parser.parse_args()
     if not args.diff and not args.apply:
         parser.error("choose --diff and/or --apply")
+    if not (args.regs or args.qemu_regs or args.qemu_ident):
+        parser.error(
+            "the enum-keyed InsnClassification tables are RETIRED (ruling "
+            "R14): champsim_tracer_mnemonics_<isa>.h no longer carries "
+            "<isa>_insn_class[], nothing in the plugin reads one, and the "
+            "occupancy census read `ENUM-OCCUPANCY total=0 key=STATED` over "
+            "the whole enumerated encoding population on all four ISAs in "
+            "both wp arms before they were removed.  The CLASSIFIER is "
+            "not retired -- full_entry() still assembles every column and "
+            "is the single source for the QEMU-identity tables -- so use "
+            "--qemu-ident to census or regenerate those, --regs for the "
+            "register tables, or --qemu-regs for the QEMU-indexed ones.  "
+            "This refusal exists instead of an empty run because a "
+            "generator that silently writes nothing is the shape this "
+            "directory keeps being bitten by.")
     if args.qemu_ident and args.build_dir is None:
         wanted = set(args.isa or sorted(ISAS))
         if wanted - set(QEMU_IDENT_SOURCE_TABLES):
@@ -10470,7 +10496,15 @@ def main() -> int:
                 paths = [p for p in args.observed
                          if _observed_matches_isa(Path(p), key)]
                 obs = load_observed(paths) if paths else {}
-            rows = qemu_ident_rows(info, idents, obs, parse_existing(info))
+            # NO `existing` TO READ ANY MORE, and that is the point.
+            # This used to be `parse_existing(info)` -- the enum-keyed
+            # table parsed back out of the header this script writes --
+            # which is how `.refine` reached the identity rows.  The
+            # table is retired; `full_entry()` states `.refine` from
+            # REFINE_OVERRIDES and derives every other column, so the
+            # empty dict is the whole input and the headers regenerate
+            # byte-identically from it (ident_header_gate.sh).
+            rows = qemu_ident_rows(info, idents, obs, {})
             if args.diff:
                 total += qemu_ident_census(info, idents, obs, rows,
                                            max_lines=args.max_lines)

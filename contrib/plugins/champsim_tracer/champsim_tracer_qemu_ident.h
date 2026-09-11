@@ -58,22 +58,4 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
 /* Append the census to the exit report. */
 void qemu_ident_report(GString *report);
 
-/*
- * Append the SHADOW LOOKUP block: the decode-identity key scored against
- * the Capstone-enum-keyed mnemonic table, per column, for every
- * instruction this run classified.  Lives beside classify_insn_id in
- * champsim_tracer_decode.cc because that is where both answers exist at
- * the same moment; reported from here so it lands in the same sidecar
- * as the survivor block whose reasons explain its SILENT row.
- */
-void qemu_ident_shadow_report(GString *report);
-
-/*
- * The ENUM-PUBLISHED count -- classifications for which the Capstone-enum
- * table, not the decode identity, is the answer the wire carries.  It is
- * the R14 deletion bar, and the identity audit prints it so its own header
- * can state which key the wire took RATHER THAN ASSERTING ONE.
- */
-uint64_t qemu_ident_enum_published(void);
-
 #endif /* CHAMPSIM_TRACER_QEMU_IDENT_READER_H */

@@ -1928,7 +1928,34 @@ const QemuRegKey *qemu_reg_key_for_generic(uint8_t gen_id);
  * under MTTCG, so a process-wide flag could withhold a refiner from another
  * thread's real template while the measurement is open.
  */
-const char *dep_refine_name_for(const qemu_plugin_insn_info *info);
+/*
+ * WHICH IDENTITY KEY DECIDED THE CLASSIFICATION, as a stated fact.
+ *
+ * classify_insn_id() asks QEMU's decode identity first and falls to the
+ * Capstone enum row on exactly one condition -- no identity answered AND
+ * the target exported no decode id AND the table holds a row.  The enum
+ * table's retirement needs an occupancy count over that condition, and a
+ * census reading a per-encoding corpus could only INFER it from
+ * `decode_id == 0` plus a published class, which is a coincidence and not
+ * the condition (see the note at qid_key_name).  These are the words the
+ * per-encoding record carries so the census reads the statement.
+ */
+enum {
+    QID_KEY_UNSET = 0,   /* the classifier did not run for this insn */
+    QID_KEY_QEMU  = 1,   /* QEMU's decode identity answered */
+    QID_KEY_ENUM  = 2,   /* no identity, and the enum row answered */
+    QID_KEY_NONE  = 3,   /* neither key answered; GEN_OP_UNKNOWN */
+};
+const char *qid_key_name(uint8_t key);
+
+/*
+ * @ident_key, when non-null, receives the QID_KEY_* word for the same
+ * decode -- from the one classify_insn_id() call this already makes,
+ * because that call scores the read-only QID shadow A/B and asking twice
+ * would double it.
+ */
+const char *dep_refine_name_for(const qemu_plugin_insn_info *info,
+                                uint8_t *ident_key = nullptr);
 void        dep_refine_set_suppressed(bool on);
 
 /* Defined in champsim_tracer_decode.cc */

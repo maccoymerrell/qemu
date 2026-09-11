@@ -1640,9 +1640,35 @@ uint64_t qemu_ident_abstain_refused(void)
     return g_qid_abstain_refused.load(std::memory_order_relaxed);
 }
 
+/*
+ * WHICH KEY ANSWERED, as a word, for the per-encoding record -- FINDING
+ * 97 / the enum-table retirement.
+ *
+ * The occupancy census (enumocc.py) has to say who the enum table is still
+ * the classification for, and it had to INFER that from two corpus columns:
+ * `decode_id == 0` and a published opcode that is not GEN_OP_UNKNOWN.  The
+ * inference is not the condition.  The condition below is
+ * `q == nullptr && decode_id == 0 && cap != nullptr`, and a row where
+ * QEMU's identity DID answer for a zero decode id satisfies the inference
+ * while the enum table answered nothing -- counted as an occupant, it makes
+ * the retirement look more expensive than it is, and no column could tell
+ * the two apart.  So the key states itself here, where the choice is made,
+ * and the census reads a statement instead of guessing from a coincidence.
+ */
+const char *qid_key_name(uint8_t key)
+{
+    switch (key) {
+    case QID_KEY_QEMU: return "QEMU";
+    case QID_KEY_ENUM: return "ENUM";
+    case QID_KEY_NONE: return "NONE";
+    default:           return "-";
+    }
+}
+
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
-    uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
+    uint8_t *opcode, uint8_t *branch_type, uint16_t *flags,
+    uint8_t *key = nullptr)
 {
     uint32_t id = info->insn_id;
     const InsnClassification *cap =
@@ -1656,6 +1682,9 @@ static const InsnClassification *classify_insn_id(
         *opcode = q->opcode;
         *branch_type = q->branch_type;
         *flags = q->flags;
+        if (key) {
+            *key = QID_KEY_QEMU;
+        }
         return q;
     }
 
@@ -1664,6 +1693,9 @@ static const InsnClassification *classify_insn_id(
         *opcode = cap->opcode;
         *branch_type = cap->branch_type;
         *flags = cap->flags;
+        if (key) {
+            *key = QID_KEY_ENUM;
+        }
         return cap;
     }
 
@@ -1681,6 +1713,9 @@ static const InsnClassification *classify_insn_id(
     *opcode = GEN_OP_UNKNOWN;
     *branch_type = BRANCH_NONE;
     *flags = MF_NONE;
+    if (key) {
+        *key = QID_KEY_NONE;
+    }
     return nullptr;
 }
 
@@ -2509,11 +2544,25 @@ void dep_refine_set_suppressed(bool on)
     g_dep_refine_suppressed = on;
 }
 
-const char *dep_refine_name_for(const qemu_plugin_insn_info *info)
+const char *dep_refine_name_for(const qemu_plugin_insn_info *info,
+                               uint8_t *ident_key)
 {
-    uint8_t op = 0, br = 0;
+    uint8_t op = 0, br = 0, key = QID_KEY_UNSET;
     uint16_t fl = 0;
-    const InsnClassification *cls = classify_insn_id(info, &op, &br, &fl);
+    /*
+     * ONE classify_insn_id CALL, TWO ANSWERS.  The per-encoding record
+     * wants the refiner's name AND which identity key decided the class,
+     * and classify_insn_id() is not free of observable effect -- it scores
+     * the read-only QID shadow A/B on every call.  Asking twice would
+     * double that census for exactly the rows a sweep dumps, which is a
+     * measurement changing the number it reports.  So the key rides out of
+     * the call that was already being made.
+     */
+    const InsnClassification *cls =
+        classify_insn_id(info, &op, &br, &fl, &key);
+    if (ident_key) {
+        *ident_key = key;
+    }
     if (!cls || !cls->dep_refine) {
         return nullptr;
     }

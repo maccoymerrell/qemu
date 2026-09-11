@@ -5220,7 +5220,7 @@ EncCorpus g_opc_enc{"CST_OPC_ENC_DUMP", "#isa\tencoding\tmnem\topcode\n"};
 EncCorpus g_src_mech{"CST_SRC_MECH_DUMP",
     "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
     "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ"
-    "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\n"};
+    "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\tIDK\n"};
 
 /* The encoding, hex, as both corpora spell it.  @out must hold
  * 2 * MAX_INSN_BYTES + 1 bytes; returns the clamped length in BYTES. */
@@ -5528,8 +5528,10 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
         }
     }
     g_string_append_c(g, '\t');
+    uint8_t ident_key = QID_KEY_UNSET;
     {
-        const char *r = info ? dep_refine_name_for(info) : nullptr;
+        const char *r = info ? dep_refine_name_for(info, &ident_key)
+                             : nullptr;
         g_string_append(g, r ? r : "-");
     }
     g_string_append_c(g, '\t');
@@ -5553,6 +5555,38 @@ void dump_src_mech_row(uint64_t pc, const InsnFields *f, const uint8_t *bytes,
      */
     g_string_append_c(g, '\t');
     g_string_append_c(g, m->writes_unbounded ? '1' : '0');
+    /*
+     * IDK -- WHICH IDENTITY KEY DECIDED THE CLASS THIS ROW PUBLISHES.
+     *
+     * The last column, and the one the enum tables' retirement turns on.
+     * `OPC` says WHAT the wire publishes; this says WHO said so: `QEMU`
+     * when the decode identity answered, `ENUM` when it did not and the
+     * Capstone enum row did, `NONE` when neither did and the row publishes
+     * GEN_OP_UNKNOWN.  (`-` cannot occur on a dumped row: the same
+     * classify call that fills OPC fills this, so a row exists only if the
+     * classifier ran.  It is there because a default that cannot be told
+     * from a real answer is how a census reads zero without looking.)
+     *
+     * WHY IT IS A COLUMN AND NOT A JOIN.  enumocc.py scored the enum
+     * table's occupancy as `decode_id == 0 AND OPC is a class`, which is
+     * the closest a corpus without this column can get and is NOT the
+     * condition classify_insn_id() actually tests -- an encoding for which
+     * QEMU's identity answers DESPITE a zero decode id satisfies the
+     * inference and is not an occupant.  Over-counting there makes the
+     * retirement look more expensive than it is, in the direction that
+     * keeps a dead table alive.
+     *
+     * WHAT IT IS NOT, said plainly so the number is not over-read.  This
+     * is still a TRANSLATION-level fact.  The sled that produces the
+     * corpus executes nothing (srcenc_sled.py's own contract), so no
+     * column in this file can report whether an encoding's class ever
+     * reached a body record -- an executed-workload occupancy is the
+     * sidecar's ENUM-PUBLISHED row and nothing here replaces it.  What
+     * this column removes is the OTHER over-count: rows the census
+     * credited to the enum table that the enum table never answered.
+     */
+    g_string_append_c(g, '\t');
+    g_string_append(g, qid_key_name(ident_key));
     g_string_append_c(g, '\n');
     g_src_mech.write(g->str);
     g_string_free(g, TRUE);

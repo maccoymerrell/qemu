@@ -47,10 +47,13 @@ PY="${PYTHON:-python}"
 #
 # `^  A .* ok` matched the FIRST arm of the `  <label> <text> ok` convention
 # and none of the others, so opcenc_ab (19 checks), srcenc_ab (17) and
-# srcset_ab (9) each scored ONE; and enumocc.py, whose six arms are the census
-# the enum tables' retirement turns on, scored ZERO and stood as RED /
-# ASSERTS NOTHING from the day it was added.  The label is widened to the
-# convention it belongs to -- one short leading token, then `ok` at the end.
+# srcset_ab (9) each scored ONE; and enumocc.py, whose six arms were the
+# census the enum tables' retirement turned on, scored ZERO and stood as
+# RED / ASSERTS NOTHING from the day it was added.  (That instrument is
+# itself retired now, with its subject: the four enum tables are gone and
+# the plugin can no longer state the ENUM key it scored.)  The label is
+# widened to the convention it belongs to -- one short leading token, then
+# `ok` at the end.
 #
 # But widening a hand-list only postpones the next gap, so the count is no
 # longer the only witness.  An instrument that states its own check count

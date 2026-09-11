@@ -3447,6 +3447,34 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         mips_ident(ctx,
             opc == OPC_SUBU ? MIPS_ID_OPC_SUBU :
             MIPS_ID_NONE);
+        /*
+         * THE $zero OPERAND THE SPECIALISED ARM FOLDS OUT.
+         *
+         * `subu rd,rs,rt` has four lowerings and three of them drop an
+         * operand the encoding named: `negu rd,rt` is rs == $zero, `move
+         * rd,rs` is rt == $zero, and `subu rd,$zero,$zero` is a plain
+         * `movi 0` that touches neither.  The dropped operand leaves no op
+         * behind, so the read walk has nothing to attribute and QEMU's
+         * stated list comes back short by exactly the register the encoding
+         * spells.  MEASURED at 3f11049dc5, `23182000` (`subu $v1,$at,$zero`)
+         * publishes REG_GPR1,REG_ZERO on the wire while QEMU stated
+         * REG_GPR1 alone, and `23180000` (`negu $v1,$zero`) published
+         * REG_ZERO against an empty statement.
+         *
+         * The rd == 0 arm above has stated both operands since be84cc6598
+         * and measured right for the same encodings at rd == 0 -- one rule,
+         * two answers, decided by a destination that is not the subject.
+         * This is the rd != 0 half of it.  R7.3/R15: the emulator may drop
+         * the operation, not the operands.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0) {
+            note_gpr_folded_read(rs);
+        }
+        if (rt == 0) {
+            note_gpr_folded_read(rt);
+        }
         if (rs != 0 && rt != 0) {
             tcg_gen_sub_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -3990,6 +4018,20 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
         mips_ident(ctx,
             opc == OPC_MTHI ? MIPS_ID_OPC_MTHI :
             MIPS_ID_NONE);
+        /*
+         * `mthi $zero` / `mtlo $zero` NAMES ITS SOURCE and the specialised
+         * arm folds it out: the zero arm is a `movi 0` into the accumulator
+         * half and reads nothing, so the walk sees an empty read list for an
+         * instruction whose encoding spells $zero.  Same fold, same rule and
+         * same remedy as OPC_SUBU above.  MEASURED at 3f11049dc5: `11000000`
+         * (mthi) and `13000000` (mtlo) publish REG_ZERO on the wire against
+         * an empty QEMU statement.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (reg == 0) {
+            note_gpr_folded_read(reg);
+        }
         if (reg != 0) {
 #if defined(TARGET_MIPS64)
             if (acc != 0) {
@@ -4007,6 +4049,20 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
         mips_ident(ctx,
             opc == OPC_MTLO ? MIPS_ID_OPC_MTLO :
             MIPS_ID_NONE);
+        /*
+         * `mthi $zero` / `mtlo $zero` NAMES ITS SOURCE and the specialised
+         * arm folds it out: the zero arm is a `movi 0` into the accumulator
+         * half and reads nothing, so the walk sees an empty read list for an
+         * instruction whose encoding spells $zero.  Same fold, same rule and
+         * same remedy as OPC_SUBU above.  MEASURED at 3f11049dc5: `11000000`
+         * (mthi) and `13000000` (mtlo) publish REG_ZERO on the wire against
+         * an empty QEMU statement.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (reg == 0) {
+            note_gpr_folded_read(reg);
+        }
         if (reg != 0) {
 #if defined(TARGET_MIPS64)
             if (acc != 0) {
@@ -6244,6 +6300,32 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             MIPS_INVAL("jump hint");
             gen_reserved_instruction(ctx);
             goto out;
+        }
+        /*
+         * `jr $zero` / `jalr $zero` -- THE NOTE THAT IS MADE AND HAS NOTHING
+         * TO CONVERT.
+         *
+         * gen_load_gpr()'s zero arm DOES call insn_dataflow_note_zero_reg(),
+         * so unlike the folds above a statement is made here.  It is made on
+         * `btarget`, and nothing inside this instruction's op range READS
+         * btarget: the zero arm emits `movi btarget,0` and the only reader is
+         * the block-final `mov cpu_PC,btarget` the delay-slot lowering emits
+         * AFTER the instruction.  A zero-register note converts a READ; with
+         * no read in range there is nothing for it to convert.
+         *
+         * THE LOWERING-TEMP READING IS REFUTED BY MEASUREMENT.  8fd9c1da05
+         * left open whether the read is lost because btarget is QEMU's
+         * delay-slot carry temp.  It is not: at 3f11049dc5, 158,066 mipsel
+         * corpus rows carry REG_ZERO in QEMU's own read list, including
+         * `bltz`/`b`/`bnez`/`blez`/`bgtz`, whose zero read arrives through
+         * this same gen_load_gpr arm and IS converted -- because those rules
+         * read the loaded temp inside the instruction.  The note mechanism is
+         * live on mipsel; what jr/jalr lack is an in-range reader.
+         *
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        if (rs == 0) {
+            note_gpr_folded_read(rs);
         }
         gen_load_gpr(btarget, rs);
         break;

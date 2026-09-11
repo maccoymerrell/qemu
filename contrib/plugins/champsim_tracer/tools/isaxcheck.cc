@@ -1020,6 +1020,58 @@ static std::string sysreg_class_token(unsigned gen_id)
 }
 
 /*
+ * THE CLASSIFICATION SUBJECT, WHEN THE DECODER NO LONGER HOLDS IT
+ * (--ident=FILE).
+ *
+ * The fields layer asks the plugin what it makes of an encoding, and the
+ * plugin answers from QEMU's DECODE IDENTITY: classify_insn_id() calls
+ * qemu_ident_classify(info->decode_id), and `decode_id` is the id of the
+ * decodetree rule that matched inside the emulator.  A host tool has no
+ * such id -- cap_disas_raw_detail() decodes bytes in this process and
+ * leaves decode_id 0 -- so the identity route never answers here.
+ *
+ * UNTIL 2fdabefe79 THAT DID NOT SHOW, and the reason is the finding this
+ * option exists to fix.  classify_insn_id() used to fall back, at
+ * decode_id == 0, to active_insn_table[info->insn_id] -- the Capstone-enum
+ * keyed <isa>_insn_class[] row.  In this tool that fallback was not a
+ * fallback: it was the ONLY route, on every encoding, in every run.  So
+ * every opcode, branch class, flag word, refiner and lane pair this layer
+ * ever scored against LLVM or the Arm MRA was CAPSTONE'S answer, and
+ * `f_ok` was `the Capstone enum table has a row`, not `the tracer
+ * classified this`.  decode_detail_to_generic() returns early at
+ * GEN_OP_UNKNOWN, so the register sets were gated on it too.  R14 deleted
+ * that table; the layer then reported GEN_OP_UNKNOWN for every encoding on
+ * every ISA -- not a regression in the wire, the instrument's subject
+ * going away with the thing it was really measuring.
+ *
+ * THE SUBJECT IS TAKEN FROM THE PLACE THAT HOLDS IT.  srcenc_sled.py
+ * already drives QEMU to TRANSLATE a chosen population inside the
+ * emulator, and the mechanism corpus it captures (CST_SRC_MECH_DUMP)
+ * carries, per encoding, the `decode_id` of the rule QEMU matched.  This
+ * option loads that column and seats it into the insn_info before the
+ * plugin's decode runs, so the classification comes from the same identity
+ * row the wire's does.
+ *
+ * AN ENCODING THE CORPUS DOES NOT CARRY IS NOT CLASSIFIED, and says so:
+ * decode_id stays 0, the identity abstains, and the row mints
+ * FU-unclassified exactly as an encoding the tracer genuinely cannot
+ * classify does.  Those are counted apart (`ident_reach` on the summary
+ * line) so a corpus that covers nothing cannot read as a clean run -- and
+ * a corpus that covers NOTHING AT ALL refuses outright, on the rule
+ * --srcenc already follows.
+ *
+ * WHAT THIS DOES NOT MAKE THE WIRE'S.  The register SETS are still this
+ * process's operand walk over Capstone's detail; the wire's ordered read
+ * list is QEMU's and reaches this tool only through --srcenc.  That
+ * blind spot predates the deletion and is disclosed in isaxcheck_fields.cc;
+ * --ident restores the CLASSIFICATION half, from QEMU, and nothing else.
+ */
+static const char *ident_path = nullptr;
+static std::map<std::string, uint32_t> ident_map;
+static std::string ident_so;
+static unsigned long ident_covered = 0, ident_unreached = 0;
+
+/*
  * Build the view the plugin's operand walker would build from the boundary's
  * output.  Deliberately mirrors decode_detail_to_generic() in
  * champsim_tracer_decode.cc: REG operands contribute by access flag, MEM
@@ -1032,6 +1084,30 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
     qemu_plugin_insn_info info;
     if (!cap_disas_raw_detail(cfg.cs_arch, cfg.cs_mode, b, n, 0x100000, &info))
         return;
+    /*
+     * SEAT QEMU'S IDENTITY BEFORE THE PLUGIN'S DECODE SEES THE STRUCT.  The
+     * key is the bytes THIS decoder consumed (info.insn_size), which is the
+     * same key compare() joins the --srcenc corpus on, so an encoding whose
+     * length the sled read differently is a different key and reads as
+     * unreached rather than as a comparison between two instructions.
+     */
+    if (ident_path) {
+        static const char d[] = "0123456789abcdef";
+        std::string hx;
+        unsigned sz = info.insn_size <= n ? info.insn_size : (unsigned)n;
+        for (unsigned i = 0; i < sz; i++) {
+            hx += d[b[i] >> 4];
+            hx += d[b[i] & 0xf];
+        }
+        auto it = ident_map.find(hx);
+        if (it != ident_map.end()) {
+            info.decode_id = it->second;
+            ident_covered++;
+        } else {
+            info.decode_id = 0;
+            ident_unreached++;
+        }
+    }
     /* The fields layer re-runs the plugin's own decode over this same
      * struct, so the caller can ask to keep it rather than have the two
      * layers disassemble the bytes twice and risk describing different
@@ -2126,6 +2202,186 @@ static bool srcenc_load(const char *path, const char *isa)
     fprintf(stderr, "# srcenc corpus=%s isa=%s encodings=%zu rows=%lu\n",
             path, isa, srcenc_map.size(), rows);
     return true;
+}
+
+/*
+ * Load the DECODE IDENTITY for this arm's ISA -- see the --ident commentary
+ * above cs_decode() for why the fields layer cannot answer without one.
+ *
+ * The file is srcenc_sled.py's mechanism corpus (`corpus_mech_<isa>.tsv`):
+ * column 0 the ISA, column 1 the encoding, column 3 the decode_id QEMU
+ * matched, written as eight hex digits by dump_src_mech_row().  Only those
+ * three columns are read, so the same loader takes any narrower file a
+ * future capture writes in the same shape.
+ *
+ * REFUSES rather than degrades, on the same four rules as srcenc_load, and
+ * for the same reason each: an unopenable file; a file with no `#so` stamp
+ * (92-C -- a corpus answers for a BUILD, and an identity captured from a
+ * different plugin describes different rules); an encoding carrying two
+ * different ids (two answers is no answer); and a file with no row for this
+ * ISA at all, which would leave every encoding unclassified and score as a
+ * clean run of a layer that never looked.
+ */
+static bool ident_load(const char *path, const char *isa)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "isaxcheck: --ident=%s cannot be opened: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    char *line = nullptr; size_t cap = 0; ssize_t len;
+    unsigned long rows = 0, conflicts = 0, unparsable = 0;
+    while ((len = getline(&line, &cap, f)) > 0) {
+        if (line[0] == '#') {
+            if (!strncmp(line, "#so\t", 4)) {
+                ident_so = line + 4;
+                while (!ident_so.empty() &&
+                       (ident_so.back() == '\n' || ident_so.back() == '\r'))
+                    ident_so.pop_back();
+            }
+            continue;
+        }
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (!len) continue;
+        std::vector<std::string> col;
+        const char *p = line, *q;
+        while ((q = strchr(p, '\t')) != nullptr) {
+            col.push_back(std::string(p, q - p)); p = q + 1;
+        }
+        col.push_back(std::string(p));
+        if (col.size() < 4) continue;
+        if (col[0] != isa) continue;
+        char *end = nullptr;
+        unsigned long id = strtoul(col[3].c_str(), &end, 16);
+        if (!end || *end || col[3].empty()) {
+            fprintf(stderr, "isaxcheck: --ident=%s row '%s' carries "
+                    "decode_id '%s', which is not a hex id -- REFUSING\n",
+                    path, col[1].c_str(), col[3].c_str());
+            unparsable++;
+            continue;
+        }
+        auto ins = ident_map.emplace(col[1], (uint32_t)id);
+        if (!ins.second && ins.first->second != (uint32_t)id) {
+            fprintf(stderr, "isaxcheck: --ident=%s encoding %s carries two "
+                    "DIFFERENT decode ids (%08x, %08lx) -- REFUSING (a "
+                    "corpus that disagrees with itself has no answer)\n",
+                    path, col[1].c_str(), ins.first->second, id);
+            conflicts++;
+        }
+        rows++;
+    }
+    free(line);
+    fclose(f);
+    if (conflicts || unparsable) return false;
+    if (ident_so.empty()) {
+        fprintf(stderr, "isaxcheck: --ident=%s carries no `#so` stamp -- "
+                "REFUSING.  An identity corpus answers for the BUILD that "
+                "captured it; an unstamped one cannot be shown to describe "
+                "the decode rules this binary was generated against\n", path);
+        return false;
+    }
+    if (!rows) {
+        fprintf(stderr, "isaxcheck: --ident=%s carries no row for isa=%s -- "
+                "REFUSING.  Every encoding would go unclassified, and a "
+                "layer that classified nothing reports the same zero "
+                "disagreements a perfect one does\n", path, isa);
+        return false;
+    }
+    fprintf(stderr, "# ident corpus=%s isa=%s encodings=%zu rows=%lu so=%s\n",
+            path, isa, ident_map.size(), rows, ident_so.c_str());
+    return true;
+}
+
+/*
+ * --selftest-ident: the four refusals and the one acceptance, on files this
+ * process writes.  An instrument whose refusals have never been made to fire
+ * is an instrument nobody has watched fail.
+ *
+ * The SIXTH arm -- `--layer=fields` without `--ident` exiting 2 -- is a
+ * property of main()'s argument handling and cannot be reached from inside
+ * one process; tools/isax_srcenc_gate.sh --selftest drives it as a
+ * subprocess, which is where a whole-invocation arm belongs.
+ */
+static int selftest_ident(void)
+{
+    int fails = 0, n = 0;
+    auto chk = [&](bool cond, const char *what) {
+        n++;
+        printf("%s  %s\n", cond ? "PASS" : "FAIL", what);
+        if (!cond) fails++;
+    };
+    auto reset = [&]() { ident_map.clear(); ident_so.clear(); };
+    char dir[] = "/tmp/isaxident.XXXXXX";
+    if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+    auto put = [&](const char *name, const char *body) {
+        std::string pth = std::string(dir) + "/" + name;
+        FILE *f = fopen(pth.c_str(), "w");
+        if (f) { fputs(body, f); fclose(f); }
+        return pth;
+    };
+
+    reset();
+    chk(!ident_load((std::string(dir) + "/does-not-exist").c_str(), "aarch64"),
+        "a file that cannot be opened REFUSES");
+
+    reset();
+    std::string p_nostamp = put("nostamp.tsv",
+        "#isa\tencoding\tmnem\tdecode_id\n"
+        "aarch64\t4300013a\tadcs\t0000002a\n");
+    chk(!ident_load(p_nostamp.c_str(), "aarch64"),
+        "a corpus with no #so stamp REFUSES (it answers for no build)");
+
+    reset();
+    std::string p_conf = put("conflict.tsv",
+        "#so\tdeadbeefdeadbeef\tcafecafecafecafe\n"
+        "#isa\tencoding\tmnem\tdecode_id\n"
+        "aarch64\t4300013a\tadcs\t0000002a\n"
+        "aarch64\t4300013a\tadcs\t0000002b\n");
+    chk(!ident_load(p_conf.c_str(), "aarch64"),
+        "one encoding with TWO decode ids REFUSES");
+
+    reset();
+    std::string p_otherisa = put("otherisa.tsv",
+        "#so\tdeadbeefdeadbeef\tcafecafecafecafe\n"
+        "#isa\tencoding\tmnem\tdecode_id\n"
+        "mipsel\t00000000\tnop\t00000007\n");
+    chk(!ident_load(p_otherisa.c_str(), "aarch64"),
+        "a corpus with no row for THIS isa REFUSES (it would classify nothing "
+        "and report a clean run)");
+
+    reset();
+    std::string p_bad = put("badid.tsv",
+        "#so\tdeadbeefdeadbeef\tcafecafecafecafe\n"
+        "#isa\tencoding\tmnem\tdecode_id\n"
+        "aarch64\t4300013a\tadcs\tnot-a-number\n");
+    chk(!ident_load(p_bad.c_str(), "aarch64"),
+        "a decode_id that is not a hex id REFUSES");
+
+    reset();
+    std::string p_ok = put("ok.tsv",
+        "#so\tdeadbeefdeadbeef\tcafecafecafecafe\n"
+        "#isa\tencoding\tmnem\tdecode_id\n"
+        "aarch64\t4300013a\tadcs\t0000002a\n"
+        "aarch64\t854c212b\tadds\t0000002b\n"
+        "mipsel\t00000000\tnop\t00000007\n");
+    chk(ident_load(p_ok.c_str(), "aarch64"),
+        "a stamped corpus with rows for this isa LOADS");
+    chk(ident_map.size() == 2,
+        "the OTHER isa's rows are not loaded into this arm's map");
+    chk(ident_map.count("4300013a") && ident_map["4300013a"] == 0x2a,
+        "the decode id is read from column 3, hex, as the plugin prints it");
+    chk(ident_so == "deadbeefdeadbeef\tcafecafecafecafe",
+        "the #so stamp is remembered for the cross-corpus build check");
+
+    unlink(p_nostamp.c_str()); unlink(p_conf.c_str());
+    unlink(p_otherisa.c_str()); unlink(p_bad.c_str()); unlink(p_ok.c_str());
+    rmdir(dir);
+    reset();
+    printf("%s  selftest-ident: %d checks, %d failures\n",
+           fails ? "FAIL" : "PASS", n, fails);
+    return fails ? 1 : 0;
 }
 /*
  * Load the REFUSED set for this arm's ISA -- the encodings QEMU translated
@@ -3778,6 +4034,12 @@ static void usage(void)
         "                  happening fails, as does an unlisted one)\n"
         "  --allow=FILE    allowlist of justified residual signatures\n"
         "  --srcenc=FILE   take the READ subject from the per-encoding\n"
+        "  --ident=FILE    the per-encoding DECODE IDENTITY corpus\n"
+        "                  srcenc_sled.py --mech writes\n"
+        "                  (corpus_mech_<isa>.tsv).  REQUIRED by\n"
+        "                  --layer=fields, --fixups and --batch: the\n"
+        "                  tracer classifies from QEMU's decode_id and a\n"
+        "                  host tool has none of its own.\n"
         "                  corpus CST_SRC_ENC_DUMP writes (the source\n"
         "                  list the WIRE publishes) instead of from a\n"
         "                  decode performed here.  Read disagreements\n"
@@ -3939,8 +4201,10 @@ int main(int argc, char **argv)
     const char *csmodeadd = nullptr;
     bool check = false, emit_raw = false, batch = false;
 
-    for (int i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--selftest-sigjoin")) return selftest_sigjoin();
+        if (!strcmp(argv[i], "--selftest-ident")) return selftest_ident();
+    }
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--isa=", 6)) isaname = argv[i] + 6;
@@ -3961,6 +4225,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--cs-mode-add=", 14)) csmodeadd = argv[i] + 14;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
         else if (!strncmp(argv[i], "--srcenc=", 9)) srcenc_path = argv[i] + 9;
+        else if (!strncmp(argv[i], "--ident=", 8)) ident_path = argv[i] + 8;
         else if (!strncmp(argv[i], "--refused=", 10)) refused_path = argv[i] + 10;
         else if (!strncmp(argv[i], "--dump-sig-enc=", 15))
             sigenc_dump_path = argv[i] + 15;
@@ -4106,6 +4371,43 @@ int main(int argc, char **argv)
      * isax_fields_init() has bound the tables.  An earlier draft loaded it
      * beside the --classes flags and read cfg.name before it was assigned. */
     if (srcenc_path && !srcenc_load(srcenc_path, cfg.name)) return 2;
+    /*
+     * THE FIELDS LAYER MAY NOT RUN WITHOUT AN IDENTITY.  See the --ident
+     * commentary above cs_decode(): in this process decode_id is 0 unless
+     * a corpus seats it, and with the Capstone enum table retired the
+     * classification then abstains on EVERY encoding.  Every fields row
+     * would mint FU-unclassified, every fields allow rule would read dead,
+     * and the run would exit non-zero for a reason that has nothing to do
+     * with the tracer.  Worse, with --classes not naming the read family it
+     * could exit ZERO having classified nothing.  A check that cannot find
+     * its subject must fail, so it fails here, before any work is paid for.
+     */
+    if (!ident_path &&
+        (layer == LAYER_FIELDS || layer == LAYER_FIXUPS || batch)) {
+        fprintf(stderr,
+                "isaxcheck: the fields layer needs --ident=<corpus> -- the "
+                "tracer classifies an instruction from QEMU's decode "
+                "identity (qemu_ident_classify on insn_info.decode_id), and "
+                "this process has no decode_id of its own.  Capture one with "
+                "tools/srcenc_sled.py --mech (corpus_mech_<isa>.tsv) and "
+                "pass it; without it every encoding is unclassified and the "
+                "layer scores nothing while appearing to score everything\n");
+        return 2;
+    }
+    if (ident_path && !ident_load(ident_path, cfg.name)) return 2;
+    /*
+     * ONE BUILD, BOTH CORPORA.  --srcenc and --ident are two columns of the
+     * same sled capture; joined across builds they would describe one
+     * encoding through two different decoders.  The stamp is the check
+     * --refused already makes against --srcenc, for the same reason.
+     */
+    if (ident_path && srcenc_path && !ident_so.empty() && !srcenc_so.empty() &&
+        ident_so != srcenc_so) {
+        fprintf(stderr, "isaxcheck: --ident was captured from build '%s' and "
+                "--srcenc from build '%s' -- REFUSING (one encoding, two "
+                "decoders)\n", ident_so.c_str(), srcenc_so.c_str());
+        return 2;
+    }
     /*
      * The refused set is meaningless without the corpus it belongs to: it
      * explains the corpus's SILENCES.  Asking for one without the other is
@@ -4606,6 +4908,14 @@ int main(int argc, char **argv)
                refused_path ? std::to_string(srcenc_refused).c_str() : "-",
                unscored_family,
                regmap_ambiguous_tokens);
+        if (ident_path) {
+            unsigned long itot = ident_covered + ident_unreached;
+            printf("# ident=%s corpus_encodings=%zu so=%s "
+                   "ident_reach_encodings=%lu/%lu (%.4f%%)\n",
+                   ident_path, ident_map.size(), ident_so.c_str(),
+                   ident_covered, itot,
+                   itot ? 100.0 * (double)ident_covered / (double)itot : 0.0);
+        }
         if (srcenc_path) {
             unsigned long tot = srcenc_covered + srcenc_unreached;
             printf("# srcenc=%s corpus_encodings=%zu "

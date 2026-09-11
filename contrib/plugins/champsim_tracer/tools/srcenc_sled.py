@@ -994,7 +994,15 @@ def main():
             raise SystemExit(
                 "srcenc_sled: %d POPULATION encoding(s) carry two DIFFERENT "
                 "mechanism rows -- REFUSING" % mconf)
+        # STAMPED LIKE THE READ-LIST CORPUS, and for a sharper reason: the
+        # mechanism corpus is what isaxcheck --ident reads decode_id from,
+        # and a decode id names a rule in ONE build's decodetree.  Joined
+        # against a different build it would classify an encoding through a
+        # rule that binary does not have, silently.  isaxcheck REFUSES an
+        # unstamped --ident file for exactly that reason.
         with open(mmerged, "w") as f:
+            f.write(capture_tip_line(a.build_dir))
+            f.write(capture_so_line(a.build_dir, a.isa))
             f.write(mhdr or "#\n")
             for line in mseen.values():
                 f.write(line)

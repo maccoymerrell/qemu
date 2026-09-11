@@ -8054,6 +8054,141 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "translate.c:17028 case OPC_LX_DSP: MASK_LX(ctx->opcode) then a "
         "switch whose every arm re-identifies (LBUX/LHX/LWX/LDX)",
         no_class=True),
+    # THE OTHER EIGHTEEN DSP GROUP LABELS, on `lx_dsp`'s terms.
+    #
+    # The DSP ASE is decoded in two steps: `case OPC_<X>_DSP:` on the
+    # SPECIAL2/SPECIAL3 function field, then a `switch (op2)` whose every
+    # arm re-identifies.  Every one of those labels is therefore a
+    # dispatch step and not an instruction, exactly as OPC_LX_DSP above
+    # is, and its id reaches a plugin by ONE route: an availability check
+    # inside the group arm -- check_dsp(), check_dsp_r2(), check_dsp_r3()
+    # -- raises before op2 is read, and translate.c's mips_ident_fault()
+    # latches the identity the decode had committed to.  What ran is the
+    # raise, and that is the NAMED kind these rows take.
+    #
+    # WHY ONLY `lx_dsp` WAS RULED: nothing had ever reached the others.
+    # The latch (d8466387e9) is what made the group ids publishable, and
+    # its whole-population arm found the consequence immediately --
+    # `translate_mips/OPC_MUL_PH_DSP` classified 1,536 add/sub/mul-group
+    # encodings as GEN_OP_INT_MUL and `translate_mips/OPC_EXTR_W_DSP`
+    # classified 320 read/write/shift-accumulator encodings as
+    # GEN_OP_BITMANIP, each from a name-matched join to ONE member of the
+    # group the label names.  Sixteen of the eighteen had no occupant in
+    # that arm and are ruled anyway: a rule that may not be classified
+    # from its name may not be classified from its name on the day
+    # nothing happens to reach it either.
+    #
+    # The shape was verified at every site, not sampled: all nineteen
+    # `case OPC_*_DSP:` labels that carry an identity are followed by a
+    # sub-switch on op2 (APPEND/DAPPEND on MASK_APPEND/MASK_DAPPEND,
+    # SHLL_OB's second site on `opc`), and twelve of them by a check_dsp*
+    # in between.
+    ("mips", "absq_s_ph_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "absq_s_ph_dsp", "ruled",
+        "translate.c:14984 case OPC_ABSQ_S_PH_DSP: check_dsp_r2(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "absq_s_qh_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "absq_s_qh_dsp", "ruled",
+        "translate.c:15343 case OPC_ABSQ_S_QH_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "adduh_qb_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "adduh_qb_dsp", "ruled",
+        "translate.c:14880 case OPC_ADDUH_QB_DSP: check_dsp_r2(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "addu_ob_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "addu_ob_dsp", "ruled",
+        "translate.c:15486 case OPC_ADDU_OB_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "addu_qb_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "addu_qb_dsp", "ruled",
+        "translate.c:15098 case OPC_ADDU_QB_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "append_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "append_dsp", "ruled",
+        "translate.c:17290 case OPC_APPEND_DSP: a switch whose every arm "
+        "re-identifies; the id publishes only when the sub-decode declines",
+        no_class=True),
+    ("mips", "cmpu_eq_ob_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cmpu_eq_ob_dsp", "ruled",
+        "translate.c:15681 case OPC_CMPU_EQ_OB_DSP: check_dsp_r2(ctx) then "
+        "a switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "cmpu_eq_qb_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "cmpu_eq_qb_dsp", "ruled",
+        "translate.c:15266 case OPC_CMPU_EQ_QB_DSP: check_dsp_r2(ctx) then "
+        "a switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "dappend_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "dappend_dsp", "ruled",
+        "translate.c:17336 case OPC_DAPPEND_DSP: a switch whose every arm "
+        "re-identifies; the id publishes only when the sub-decode declines",
+        no_class=True),
+    ("mips", "dextr_w_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "dextr_w_dsp", "ruled",
+        "translate.c:17754 case OPC_DEXTR_W_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "dinsv_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "dinsv_dsp", "ruled",
+        "translate.c:19675 case OPC_DINSV_DSP: check_dsp(ctx) then a switch "
+        "whose every arm re-identifies; the id publishes only for the "
+        "encodings the check TRAPS",
+        no_class=True),
+    ("mips", "dpaq_w_qh_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "dpaq_w_qh_dsp", "ruled",
+        "translate.c:16445 case OPC_DPAQ_W_QH_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "dpa_w_ph_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "dpa_w_ph_dsp", "ruled",
+        "translate.c:16283 case OPC_DPA_W_PH_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "extr_w_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "extr_w_dsp", "ruled",
+        "translate.c:17605 case OPC_EXTR_W_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "insv_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "insv_dsp", "ruled",
+        "translate.c:19216 case OPC_INSV_DSP: check_dsp(ctx) then a switch "
+        "whose every arm re-identifies; the id publishes only for the "
+        "encodings the check TRAPS",
+        no_class=True),
+    ("mips", "mul_ph_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "mul_ph_dsp", "ruled",
+        "translate.c:16251 case OPC_MUL_PH_DSP: check_dsp_r2(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "shll_ob_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "shll_ob_dsp", "ruled",
+        "translate.c:15993 case OPC_SHLL_OB_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
+    ("mips", "shll_qb_dsp"): Statement(
+        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "shll_qb_dsp", "ruled",
+        "translate.c:15791 case OPC_SHLL_QB_DSP: check_dsp(ctx) then a "
+        "switch whose every arm re-identifies; the id publishes only for "
+        "the encodings the check TRAPS",
+        no_class=True),
     ("mips", "s_fmt"): Statement(
         ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "s_fmt", "ruled",
         "translate.c:18812 case OPC_S_FMT: gen_farith(), whose 101 arms "
@@ -9318,12 +9453,32 @@ def _refuse_dead_statement_rules(info: IsaInfo,
                 f"which no rule in this target's identity universe says.  "
                 f"The ruling is stale against the tree; delete it or "
                 f"re-state what it is for.")
-        if CLASSIFIERS[info.key](word).op != "GEN_OP_UNKNOWN":
+        # A DEAD RULING IS ONE THAT CHANGES NOTHING, WHICH IS NOT THE SAME
+        # AS ONE THE VOCABULARY HAS AN ANSWER FOR.
+        #
+        # The test used to be "the vocabulary answers at all", and its own
+        # message said "a ruling that changes nothing" -- two different
+        # conditions, and the stronger one locked out the case that needs a
+        # ruling MOST: a rule whose name is a GROUP's, which the vocabulary
+        # answers confidently with ONE MEMBER's class.
+        # `translate_mips/OPC_MUL_PH_DSP` is the DSP add/sub/mul group's
+        # dispatch label and the vocabulary reads `mul.ph` out of it; the
+        # ruling that says "this is a dispatch step, not an instruction"
+        # changes the row from GEN_OP_INT_MUL to the raise it actually
+        # performs, so it is the opposite of dead.
+        #
+        # The message's own condition is now the code's: refuse only where
+        # the vocabulary already says exactly what the ruling says.  A
+        # ruling that MOVES the answer still has to survive the statement
+        # disagreement route below, which will not let it move silently.
+        voc = CLASSIFIERS[info.key](word)
+        if (voc.op, voc.branch) == (st.entry.op, st.entry.branch):
             raise SystemExit(
-                f"{info.key}: QEMU_RULE_STATEMENTS rules the word {word!r}, "
-                f"which the shared vocabulary ALREADY answers for.  A "
-                f"ruling that changes nothing is written against evidence "
-                f"that has moved; delete it.")
+                f"{info.key}: QEMU_RULE_STATEMENTS rules the word {word!r} "
+                f"as {st.entry.op}/{st.entry.branch}, which is exactly what "
+                f"the shared vocabulary already answers.  A ruling that "
+                f"changes nothing is written against evidence that has "
+                f"moved; delete it.")
 
 
 @dataclass(frozen=True)

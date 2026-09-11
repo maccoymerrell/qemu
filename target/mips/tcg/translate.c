@@ -1511,7 +1511,8 @@ static inline void restore_cpu_state(CPUMIPSState *env, DisasContext *ctx)
 
 static void mips_ident(DisasContext *ctx, MipsIdent id)
 {
-    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED) {
+    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED &&
+        !ctx->decode_ident_stated) {
         ctx->decode_ident = id;
     }
 }
@@ -1587,19 +1588,71 @@ static void mips_ident_declined(DisasContext *ctx)
  *
  * So the arm states its own identity where the arm is.  This is the same
  * publication mips_ident() performs and deliberately not a weaker one: the
- * later statement wins, the poison still outranks both, and an arm that has
- * not called this keeps the label's identity exactly as before.  The separate
+ * later statement wins UNTIL a decline is stated, after which the declining
+ * arm's identity is final (see mips_ident_fault() below), the poison still
+ * outranks both, and an arm that has not called this keeps the label's
+ * identity exactly as before.  The separate
  * spelling is what keeps the two apart -- mips_ident_instrument.py OWNS every
  * `mips_ident(ctx,` site in this file and rewrites them wholesale, so a
  * hand-written statement may not wear that name.
  */
 static void mips_ident_arm(DisasContext *ctx, MipsIdent id)
 {
-    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED) {
+    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED &&
+        !ctx->decode_ident_stated) {
         ctx->decode_ident = id;
     }
 }
 
+/*
+ * A DECLINE IS A DECISION THE DECODE HAD ALREADY MADE, AND THE ARM IS IT.
+ *
+ * The poison below was written for a real hazard: a MIPS availability check
+ * -- check_insn(), check_cp1_enabled(), check_dsp(), check_msa_enabled() and
+ * their siblings -- raises and translation CONTINUES, so labels further in
+ * still run and would state a decision the emulator never took.  What the
+ * hazard argues for is refusing the LATER statements.  Discarding the one
+ * the decode had ALREADY committed to, at the moment it declined, is a
+ * different act, and it was costing the consumer the only fact the wire had.
+ *
+ * MEASURED at 1f86f05992 over the whole mipsel encoding population
+ * (548,886 corpus rows, srcenc_sled --mech, both wp arms): 94,704 encodings
+ * across 216 mnemonics published `decode_id=0`, and for every one of them
+ * the translation is the SAME three facts -- `noret=1, calls=1, memr=0,
+ * memw=0`, a write set of {REG_PC, REG_SYSEXC}: one helper call that does
+ * not return, which is the raise.  Not one of them is the instruction.  With
+ * QEMU's identity withheld the Capstone enum table was the classification
+ * that reached the wire, so on a 24Kf -- no MSA, no DSP, no MT, user mode --
+ * the trace said
+ *
+ *     bz.w      GEN_OP_BRANCH      BRANCH_COND_DIRECT  reads w0
+ *     cache     GEN_OP_CACHE_FLUSH BRANCH_NONE
+ *     swe       GEN_OP_STORE       BRANCH_NONE
+ *     mfc0      GEN_OP_MOV         BRANCH_NONE         reads CP0
+ *
+ * for four encodings that branched nothing, flushed nothing, stored nothing
+ * and moved nothing: every one of them raised.  A conditional branch that
+ * the machine never evaluated is not a degraded classification, it is a
+ * fabricated one, and it is the shape 96-B caught on the wrong path.
+ *
+ * SO THE RAISE LATCHES INSTEAD OF POISONING.  At the four exceptions QEMU
+ * raises because an encoding is unavailable in this state, the identity
+ * standing in the slot is the arm the decode committed to before it
+ * declined, and that arm is the decision: `translate_mips/OPC_CACHE` for
+ * cache, `translate_mips/OPC_MFC0` for mfc0, the enclosing
+ * `translate_mips/OPC_CP1` for an MSA branch whose rs sub-field matched no
+ * arm on a model without the ASE.  Latching it also LOCKS it -- mips_ident()
+ * and mips_ident_arm() above both refuse to write over a stated decline --
+ * which is precisely the hazard the poison existed to prevent, enforced
+ * where it belongs rather than by throwing the committed answer away.
+ *
+ * WHERE THE SITE GENUINELY CANNOT SAY, IT STILL SAYS NOTHING.  An encoding
+ * that reaches the raise with NOTHING committed keeps the poison and
+ * publishes no identity: the refusal route is not removed, it is narrowed to
+ * the case that earns it.  Nothing here changes an op, a raise, or which
+ * exception is delivered; it changes only which of QEMU's own decode-table
+ * rows the plugin is allowed to read afterwards.
+ */
 static void mips_ident_fault(DisasContext *ctx, int excp)
 {
     /* A stated refusal outranks the poison; see mips_ident_declined(). */
@@ -1611,7 +1664,11 @@ static void mips_ident_fault(DisasContext *ctx, int excp)
     case EXCP_CpU:
     case EXCP_DSPDIS:
     case EXCP_MSADIS:
-        ctx->decode_ident = MIPS_ID_FAULTED;
+        if (ctx->decode_ident != MIPS_ID_NONE) {
+            ctx->decode_ident_stated = true;
+        } else {
+            ctx->decode_ident = MIPS_ID_FAULTED;
+        }
         break;
     default:
         break;
@@ -21213,6 +21270,26 @@ static void decode_opc(CPUMIPSState *env, DisasContext *ctx)
      * Capture only; no op is emitted, altered or suppressed.
      */
     plugin_gen_record_insn_undecoded();
+    /*
+     * AND THE TWO CHANNELS MAY NOT CONTRADICT EACH OTHER.
+     *
+     * The raise below now LATCHES whatever identity the decode had committed
+     * to rather than poisoning it (see mips_ident_fault()), and two arms can
+     * reach here with one standing in the slot: OPC_BC1EQZ/OPC_BC1ANY2 and
+     * OPC_BC1ANY4 both state their label and then `return false` when the
+     * model has no MIPS-3D ASE, which is how they hand the encoding back to
+     * decode_opc() -- and decode_opc() has just said no rule matched.  A
+     * plugin reading `undecoded=1` beside `rule=translate_mips/OPC_BC1ANY4`
+     * is being told two incompatible things by the same target.
+     *
+     * The word the target chose is the one that survives: `return false` IS
+     * this decoder's spelling of "not mine", so the identity goes and the
+     * poison stands.  Neither of the two arms has an occupant in the
+     * mipsel encoding population at this tip -- the census reads 0 for every
+     * bc1any spelling -- so this changes no measured row; it is here so the
+     * pair cannot become inconsistent the moment a MIPS-3D model is swept.
+     */
+    ctx->decode_ident = MIPS_ID_NONE;
     gen_reserved_instruction(ctx);
 }
 

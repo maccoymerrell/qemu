@@ -303,8 +303,51 @@ def parse_reg_rows(text: str, prefix: str
 # RST emission.
 # ---------------------------------------------------------------------------
 
+# Both aggregate sections below index the per-ISA INSTRUCTION rows, so
+# both empty out with the R14 retirement.  An empty section that renders
+# only its own introduction reads as "the tracer classifies nothing",
+# which is false: it classifies from QEMU's decode identity, and the rows
+# that answer simply have no Capstone enumerator to group by.  Say that,
+# once, in both places.
+_RETIRED_AGGREGATE = [
+    "**Empty since the R14 retirement, and not a gap in the "
+    "classification.**  This section groups the *Capstone-enumerator-"
+    "keyed* instruction rows, and those rows are gone: an instruction's "
+    "generic opcode and branch type now come from QEMU's own decode "
+    "identity (``champsim_tracer_qemu_ident_<isa>.h``), which has no "
+    "disassembler enumerator to group under.  The ``GEN_OP_*`` and "
+    "``BRANCH_*`` vocabularies themselves are unchanged and are "
+    "described in :doc:`/reference`.",
+    "",
+]
+
+
 def _rst_table(headers: list[str], rows: Iterable[Iterable[str]],
-               widths: list[int]) -> list[str]:
+               widths: list[int], what: str = "table") -> list[str]:
+    """Render a ``list-table``, refusing an empty one.
+
+    A ``list-table`` whose only entry is its header row is not a small
+    table; docutils rejects it ("Insufficient data supplied") and the
+    whole ``make html`` fails with warnings-as-errors.  That is how the
+    R14 instruction-table retirement took the documentation build down
+    without any commit naming the docs: the extension kept asking for a
+    table over a source that had become empty.
+
+    Raising here rather than emitting the broken directive is
+    deliberate.  A caller whose rows are legitimately gone should say so
+    in prose -- see the retirement note in ``emit_per_isa_section`` --
+    and a caller whose rows went missing by accident gets a message that
+    names the table instead of a docutils error about line numbers in a
+    generated file.
+    """
+    rows = list(rows)
+    if not rows:
+        raise ValueError(
+            f"encoding_tables: refusing to emit an empty list-table for "
+            f"{what}.  Its source yielded no rows.  If the subject is "
+            f"retired, the caller must write the retirement in prose; if "
+            f"it is not, the parser above has stopped matching."
+        )
     out = [
         ".. list-table::",
         "   :header-rows: 1",
@@ -340,20 +383,46 @@ def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
     out.append(sub)
     out.append("~" * len(sub))
     out.append("")
-    out.append(
-        f"{len(insn_rows)} Capstone instruction-ids classified.  "
-        f"The ``{insn_prefix}`` prefix is dropped from the *Insn* "
-        "column, and the ``GEN_OP_`` / ``BRANCH_`` / ``MF_`` prefixes "
-        "from the value columns, for compactness.  *Dep refiner* is "
-        "the human-readable name of the intra-instruction dependency "
-        "refiner (``—`` = no HAS_REG block, consumer uses the "
-        "implicit all-to-all).  *Lanes* / *Mask src* are populated "
-        "only for vector-classified rows: *Lanes* is lane-parallel "
-        "vs cross-lane; *Mask src* is where the active-lane value is "
-        "read from (the instruction encoding, or a runtime register "
-        "such as the RISC-V ``vl`` CSR)."
-    )
-    out.append("")
+    if not insn_rows:
+        # The subject of this table is gone, and saying that is the
+        # table.  `<isa>_insn_class[]` was retired under ruling R14 and
+        # the tracer classifies from QEMU's decode identity instead, so
+        # there is no Capstone-enumerator-keyed row left to tabulate.
+        # Rendering an empty `list-table` here is what broke the docs
+        # build; rendering nothing at all would be worse, because a
+        # reader would see a heading with no explanation and conclude
+        # the classification itself had vanished.
+        out.append(
+            "**Retired (ruling R14).**  This table listed the "
+            f"``{insn_prefix}``-keyed rows of ``{name.lower()}"
+            "_insn_class[]``, the Capstone-enumerator-indexed "
+            "classification table.  That table is gone: the tracer "
+            "takes an instruction's generic opcode, branch type and "
+            "flag word from QEMU's own decode identity, through "
+            "``qemu_ident_classify()``.  The rows that answer today "
+            "live in ``champsim_tracer_qemu_ident_<isa>.h`` and are "
+            "keyed on that identity, not on a disassembler's "
+            "enumerator, so they have no ``"
+            f"{insn_prefix}`` name to index this appendix by.  The "
+            "register table below is unaffected and still Capstone-"
+            "keyed."
+        )
+        out.append("")
+    else:
+        out.append(
+            f"{len(insn_rows)} Capstone instruction-ids classified.  "
+            f"The ``{insn_prefix}`` prefix is dropped from the *Insn* "
+            "column, and the ``GEN_OP_`` / ``BRANCH_`` / ``MF_`` prefixes "
+            "from the value columns, for compactness.  *Dep refiner* is "
+            "the human-readable name of the intra-instruction dependency "
+            "refiner (``—`` = no HAS_REG block, consumer uses the "
+            "implicit all-to-all).  *Lanes* / *Mask src* are populated "
+            "only for vector-classified rows: *Lanes* is lane-parallel "
+            "vs cross-lane; *Mask src* is where the active-lane value is "
+            "read from (the instruction encoding, or a runtime register "
+            "such as the RISC-V ``vl`` CSR)."
+        )
+        out.append("")
     table = (
         (
             f"``{short_with_prefix(insn, insn_prefix)}``",
@@ -369,18 +438,20 @@ def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
         for (insn, op, branch, flags,
              dep_refine, lane_kind, lane_par) in insn_rows
     )
-    out.extend(_rst_table(
-        ["Insn", "Generic op", "Branch type", "Flags",
-         "Dep refiner", "Lanes", "Mask src"],
-        table,
-        # Insn gets the widest share: the longest x86 mnemonics
-        # (VGF2P8AFFINEINVQB, 17 chars) have no underscore to break
-        # at, so the column must hold them whole.  The value columns
-        # all break (snake_case identifiers) or wrap at spaces
-        # ("lea (addr-mode srcs + imm, no load)"), so they can be
-        # tighter.  Sums to 106.
-        widths=[27, 15, 11, 12, 16, 11, 14],
-    ))
+    if insn_rows:
+        out.extend(_rst_table(
+            ["Insn", "Generic op", "Branch type", "Flags",
+             "Dep refiner", "Lanes", "Mask src"],
+            table,
+            # Insn gets the widest share: the longest x86 mnemonics
+            # (VGF2P8AFFINEINVQB, 17 chars) have no underscore to break
+            # at, so the column must hold them whole.  The value columns
+            # all break (snake_case identifiers) or wrap at spaces
+            # ("lea (addr-mode srcs + imm, no load)"), so they can be
+            # tighter.  Sums to 106.
+            widths=[27, 15, 11, 12, 16, 11, 14],
+            what=f"{name} instruction encodings",
+        ))
 
     # ---- Registers ----
     sub = f"{name} — register encodings"
@@ -453,6 +524,8 @@ def emit_by_genop_section(per_isa_rows) -> list[str]:
         "answering *what does this opcode actually represent?*"
     )
     out.append("")
+    if not by_op:
+        out.extend(_RETIRED_AGGREGATE)
     for op in sorted(by_op):
         out.append(f"``{op}``")
         out.append("^" * (len(op) + 4))
@@ -531,6 +604,8 @@ def emit_by_branch_section(per_isa_rows) -> list[str]:
         "*table-default* branch type here, not their refined one."
     )
     out.append("")
+    if not by_branch:
+        out.extend(_RETIRED_AGGREGATE)
     for branch in sorted(by_branch):
         out.append(f"``{branch}``")
         out.append("^" * (len(branch) + 4))

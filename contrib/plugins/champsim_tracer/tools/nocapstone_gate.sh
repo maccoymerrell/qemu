@@ -194,7 +194,20 @@ survey() {
     done
     note "             total $nr"
 
-    note "  gates    admission sites that read the Capstone answer:"
+    #
+    # THE LABEL SAYS "AT OR BESIDE", AND FINDING 96-D IS WHY.  Until
+    # 2ff695368a every site this grep found DECIDED an admission: the
+    # `cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]` expression in
+    # champsim_tracer.cc WAS the poison gate's acting test.  That commit
+    # moved the decision to `qemufail` (the target decoder's own
+    # `qemu_plugin_insn_undecoded`) and left the Capstone expression as
+    # `capfail` -- SCORED ONLY, feeding the A/B counters one screen above
+    # the acting test.  The READ still has to go for R14, so counting it
+    # here is the conservative direction and the total is right; calling it
+    # an admission site is not, because that line no longer makes one.
+    #
+    note "  gates    sites that read the Capstone answer AT OR BESIDE an"
+    note "           admission decision (one is scored-only -- see 96-D):"
     gates=$(grep -rnE 'qemu_plugin_cap_decode\(|mnemonic\[0\]' "$P" \
                  --include='*.cc' --include='*.h' 2>/dev/null \
               | grep -v "^$P/tools/" \

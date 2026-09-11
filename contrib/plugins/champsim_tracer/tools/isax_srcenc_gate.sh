@@ -172,21 +172,41 @@ run_arms() {
             # the stamp existed cannot be shown to describe this build, and
             # a check that cannot find its subject must fail rather than
             # report all-clear.  Re-capture it; the sled is the same run.
-            local cso bso
+            # AND THE SLED RUNS TWO BINARIES, NOT ONE (FINDING 98-B).  Every
+            # corpus row is the plugin's callback reading facts the EMULATOR
+            # exported, so a `target/<isa>/` change moves the rows while
+            # leaving the plugin byte-identical -- measured at cf6bf3b64f,
+            # where 1,459 x86_64 encodings left the corpus with `#so`'s
+            # plugin field unchanged in both arms.  The stamp names both and
+            # this compares both; the plugin stays field 1 of the stamp so a
+            # reader of that field reads what it always read.
+            local cso bso cplug cemu
             cso=$(sed -n 's/^#so\t//p' "$corpus" | head -1)
-            bso=$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" \
-                    | cut -c1-16)
+            cplug=${cso%%$'\t'*}
+            cemu=${cso#*$'\t'}
+            [ "$cemu" = "$cso" ] && cemu=""
+            bso="$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" \
+                     | cut -c1-16)"$'\t'"$(sha256sum "$build/qemu-$isa" \
+                     | cut -c1-16)"
             if [ -z "$cso" ]; then
                 echo "REFUSED $isa -- corpus $corpus carries no #so stamp;" \
                      "it cannot be shown to describe this build" \
                      >> "$out/rc.txt"
                 worst=2; continue
             fi
+            if [ -z "$cemu" ]; then
+                echo "REFUSED $isa -- corpus #so=$cplug names only the" \
+                     "plugin; it was captured before the emulator stamp" \
+                     "existed and cannot be shown to describe THIS" \
+                     "emulator.  Re-capture it (FINDING 98-B)" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
             if [ "$cso" != "$bso" ]; then
-                echo "REFUSED $isa -- corpus #so=$cso but this build's" \
-                     "plugin is $bso; the corpus describes a DIFFERENT" \
-                     "build and scoring it would report that build's" \
-                     "answers as this one's" >> "$out/rc.txt"
+                echo "REFUSED $isa -- corpus #so=$cso but this build is" \
+                     "$bso (plugin<TAB>emulator); the corpus describes a" \
+                     "DIFFERENT build and scoring it would report that" \
+                     "build's answers as this one's" >> "$out/rc.txt"
                 worst=2; continue
             fi
             echo "corpus $isa so=$cso MATCHES the scored plugin" \
@@ -400,6 +420,10 @@ selftest() {
     printf '#!/bin/sh\nexit 0\n' > "$t/b/contrib/plugins/isaxcheck"
     chmod +x "$t/b/contrib/plugins/isaxcheck"
     : > "$t/b/contrib/plugins/libchampsim_tracer.so"
+    # The fixture build has an EMULATOR too, because a build is two binaries
+    # (98-B) and the stamp names both.  Its content differs from the
+    # plugin's so the two shas cannot coincide and hide a field mix-up.
+    printf 'fixture-emulator\n' > "$t/b/qemu-x86_64"
     mkdir -p "$t/corpus_empty"
     run_arms "$t/b" "$t/o2" "$t/corpus_empty" x86_64 >/dev/null 2>&1
     [ $? = 2 ] && echo "PASS  B a corpus with no file for the ISA REFUSES (rc=2)" \
@@ -412,8 +436,13 @@ selftest() {
     # that is what a real corpus carries and the check below is the point.
     # `so_of` is the same expression run_arms uses, so the two cannot drift.
     #
-    local so_of; so_of=$(sha256sum "$t/b/contrib/plugins/libchampsim_tracer.so" \
-                           | cut -c1-16)
+    # TWO BINARIES, NOT ONE (FINDING 98-B): the sled launches `qemu-<isa>`
+    # with the plugin loaded into it, so the stamp names both and the
+    # fixture's stamp must be the same shape a real capture carries.
+    local so_of
+    so_of="$(sha256sum "$t/b/contrib/plugins/libchampsim_tracer.so" \
+               | cut -c1-16)"$'\t'"$(sha256sum "$t/b/qemu-x86_64" \
+               | cut -c1-16)"
     mkdir -p "$t/corpus_ok"
     { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
       printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_ok/x86_64.tsv"
@@ -429,7 +458,8 @@ selftest() {
     # build" is not a pass.
     #
     mkdir -p "$t/corpus_stale"
-    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t0123456789abcdef\n'
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t0123456789abcdef\tfedcba9876543210\n'
       printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_stale/x86_64.tsv"
     run_arms "$t/b" "$t/oM" "$t/corpus_stale" x86_64 >/dev/null 2>&1
     [ $? = 2 ] && echo "PASS  M a corpus stamped for ANOTHER build REFUSES (rc=2)" \
@@ -446,6 +476,24 @@ selftest() {
         && echo "PASS  N2 and the reason names the missing stamp" \
         || { echo "FAIL  N2"; f=$((f+1)); }
     #
+    # N3 -- FINDING 98-B.  A corpus stamped with the PLUGIN ALONE was
+    # captured before the emulator stamp existed.  Its plugin field can
+    # match this build exactly while the emulator that wrote every row was
+    # a different binary -- which is the shape a `target/<isa>/` change
+    # makes, and the shape the one-field stamp could not see.  Half a
+    # binding is not a binding: REFUSE by name.
+    #
+    mkdir -p "$t/corpus_oldso"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t%s\n' "${so_of%%$'\t'*}"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_oldso/x86_64.tsv"
+    run_arms "$t/b" "$t/oN3" "$t/corpus_oldso" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  N3 a PLUGIN-ONLY stamp REFUSES (rc=2)" \
+               || { echo "FAIL  N3"; f=$((f+1)); }
+    grep -q 'names only the plugin' "$t/oN3/rc.txt" \
+        && echo "PASS  N3b and the reason names the missing emulator half" \
+        || { echo "FAIL  N3b"; f=$((f+1)); }
+    #
     # P/Q/R -- FINDING 93-A, the refused set, all three directions.
     #
     # P   a refused set stamped for ANOTHER build REFUSES.  It describes a
@@ -460,7 +508,8 @@ selftest() {
     mkdir -p "$t/corpus_rstale"
     { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
       printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_rstale/x86_64.tsv"
-    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\tfeedfacefeedface\n'
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\tfeedfacefeedface\tfeedfacefeedfacf\n'
       printf '#refused\tisa=x86_64\tencodings=1\n'
       printf 'x86_64\t0f01c6\n'; } > "$t/corpus_rstale/x86_64.refused.tsv"
     run_arms "$t/b" "$t/oP" "$t/corpus_rstale" x86_64 >/dev/null 2>&1

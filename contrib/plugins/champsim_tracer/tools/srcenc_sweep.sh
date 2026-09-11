@@ -87,12 +87,27 @@ assemble_isa() {
         corpora+=("$a"); refuseds+=("$b")
     done
 
-    # THE STAMPS.  Every arm must describe ONE tree and ONE plugin binary;
-    # two builds do not describe one admission gate (92-C).
+    # THE STAMPS.  Every arm must describe ONE tree and ONE BUILD; two builds
+    # do not describe one admission gate (92-C).
+    #
+    # AND A BUILD IS TWO BINARIES (FINDING 98-B).  The sled launches
+    # `qemu-<isa>` with `libchampsim_tracer.so` loaded into it, and every
+    # corpus row is the plugin's callback reading facts the EMULATOR
+    # exported -- so a `target/<isa>/` change moves the rows with the plugin
+    # byte-identical, and a stamp naming only the plugin cannot tell arm A
+    # from arm B.  MEASURED at cf6bf3b64f: 1,459 x86_64 encodings left the
+    # corpus while `#so`'s plugin field read 6bee8d520b02e3f3 in both arms.
+    # `#so` now carries `<plugin>\t<emulator>`; a one-field stamp is a
+    # corpus captured before that and is REFUSED rather than compared on the
+    # half it happens to have.
     t0=$(sed -n '1p' "${corpora[0]}"); s0=$(sed -n '2p' "${corpora[0]}")
     case "$t0" in '#tip'*) ;; *) echo "REFUSE: $isa has no #tip stamp"; return 2;; esac
     case "$s0" in '#so'*)  ;; *) echo "REFUSE: $isa has no #so stamp";  return 2;; esac
     case "$s0" in *unknown*) echo "REFUSE: $isa #so is unknown"; return 2;; esac
+    [ "$(printf '%s' "$s0" | awk -F'\t' '{print NF}')" -ge 3 ] \
+        || { echo "REFUSE: $isa #so names one binary, not two -- it was" \
+                  "captured before the emulator stamp (98-B) and cannot be" \
+                  "shown to describe THIS emulator"; return 2; }
     for f in "${corpora[@]}" "${refuseds[@]}"; do
         [ "$(sed -n '1p' "$f")" = "$t0" ] \
             || { echo "REFUSE: $isa $f carries a different #tip"; return 2; }
@@ -315,6 +330,10 @@ cmd_sweep() {
 # scored the defect green.
 _plant() {
     local d=$1 isa=$2 wp=$3 tip=$4 so=$5; shift 5
+    # The fixture's stamp is two-field like the real one (98-B); a caller
+    # that wants the ONE-field shape passes it whole and gets refused,
+    # which is ARM 6b's subject.
+    case "$so" in *$'\t'*) ;; *) so="$so"$'\t'"emu0000000000000" ;; esac
     mkdir -p "$d/$isa.wp$wp"
     { printf '#tip\t%s\n#so\t%s\n' "$tip" "$so"
       printf '#isa\tencoding\tsrc\n'
@@ -423,6 +442,33 @@ selftest() {
         || { echo "  ARM twoso FAIL: refused for the wrong reason"; fails=$((fails+1)); }
     n=$((n + 1))
 
+    # ARM 6b -- THE EMULATOR HALF (FINDING 98-B).  Same plugin, DIFFERENT
+    # emulator is two builds, and this is the arm the one-field stamp could
+    # not see: it is exactly the shape of a `target/<isa>/` change, whose
+    # plugin binary does not move at all.
+    d=$T/twoemu
+    _plant "$d" x86_64 0  "$TIP" "$SO"$'\t'"emuAAAAAAAAAAAAAA" 'bb\tREFUSED'
+    _plant "$d" x86_64 16 "$TIP" "$SO"$'\t'"emuBBBBBBBBBBBBBB" 'bb\tREFUSED'
+    _arm twoemu 2 "$d" x86_64 \
+        && grep -q 'different #so' "$T/twoemu.log" \
+        || { echo "  ARM twoemu FAIL: refused for the wrong reason"; fails=$((fails+1)); }
+    n=$((n + 1))
+
+    # ARM 6c -- A ONE-FIELD STAMP IS A PRE-98-B CAPTURE AND IS REFUSED, not
+    # compared on the half it happens to carry.  A check that cannot find
+    # its subject must fail.
+    d=$T/oldso
+    for wp in 0 16; do
+        _plant "$d" x86_64 "$wp" "$TIP" "$SO"$'\t'x 'bb\tREFUSED'
+        sed -i "s/^#so\t$SO\tx\$/#so\t$SO/" \
+            "$d/x86_64.wp$wp/corpus_x86_64.tsv" \
+            "$d/x86_64.wp$wp/refused_x86_64.tsv"
+    done
+    _arm oldso 2 "$d" x86_64 \
+        && grep -q 'one binary, not two' "$T/oldso.log" \
+        || { echo "  ARM oldso FAIL: refused for the wrong reason"; fails=$((fails+1)); }
+    n=$((n + 1))
+
     # ARM 7 -- AN ABSENT ARM IS A REFUSAL, NOT AN EMPTY PARTITION.  A
     # scanner that cannot find its subject FAILS.
     d=$T/missing
@@ -436,7 +482,11 @@ selftest() {
     d=$T/empty
     for wp in 0 16; do
         _plant "$d" x86_64 "$wp" "$TIP" "$SO" 'bb\tREFUSED'
-        { printf '#tip\t%s\n#so\t%s\n#isa\tencoding\tsrc\n' "$TIP" "$SO"; } \
+        # Two-field `#so` like every real capture (98-B); writing the
+        # one-field shape here would make this arm refuse for THAT reason
+        # and stop testing the empty corpus at all.
+        { printf '#tip\t%s\n#so\t%s\temu0000000000000\n#isa\tencoding\tsrc\n' \
+                 "$TIP" "$SO"; } \
             > "$d/x86_64.wp$wp/corpus_x86_64.tsv"
     done
     _arm empty 2 "$d" x86_64 \

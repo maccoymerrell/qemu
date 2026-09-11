@@ -121,7 +121,7 @@ def capture_tip_line(build_dir):
     return "#tip\t%s\t%s\n" % (sha, "dirty" if dirt else "clean")
 
 
-def capture_so_line(build_dir):
+def capture_so_line(build_dir, isa=None):
     """The `#so` header line: WHICH PLUGIN BINARY PRODUCED THIS CORPUS.
 
     FINDING 92-C, AND `#tip` IS NOT ENOUGH ON ITS OWN.  The corpus IS the
@@ -147,17 +147,44 @@ def capture_so_line(build_dir):
     `unknown` -- which the consumer REFUSES, exactly as it refuses a corpus
     that carries no stamp at all.  A check that cannot find its subject is
     not a check.
+
+    FINDING 98-B, AND THE PLUGIN BINARY IS NOT ENOUGH EITHER.  92-C's argument
+    -- "the durable binding is the artefact the sled actually ran" -- named
+    ONE artefact and the sled runs TWO.  Every row in this corpus is written
+    by the plugin's translation callback reading facts the EMULATOR exported,
+    so a change in `target/<isa>/` moves the rows while leaving
+    `libchampsim_tracer.so` byte-identical.  MEASURED this pass: the x86
+    decline-statement arm (cf6bf3b64f) removed 1,459 encodings from the
+    x86_64 corpus with `#so` reading 6bee8d520b02e3f3 in BOTH arms -- the
+    stamp the assembler and the gate compare could not tell arm A from arm B
+    for the very change the arms existed to measure.  `#tip` cannot close it
+    either, for 92-C's own reason: a leg is run on a working tree whose HEAD
+    is the parent, so both arms stamp the same sha and the second is merely
+    `dirty`.
+
+    So the line names BOTH: `#so <plugin> <emulator>`, the emulator being
+    `qemu-<isa>`, the binary this sled launches.  It stays ONE line and the
+    plugin sha stays FIELD 2, so every consumer that compares the whole line
+    gets strictly stronger and every consumer that reads field 2 reads what
+    it always read.  Either artefact missing or unreadable stamps `unknown`
+    in its own field, and `unknown` anywhere in the line is refused.
     """
     import hashlib
+
+    def _sha16(path):
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()[:16]
+        except OSError:
+            return "unknown"
+
     so = os.path.join(build_dir, "contrib/plugins/libchampsim_tracer.so")
-    try:
-        h = hashlib.sha256()
-        with open(so, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return "#so\t%s\n" % h.hexdigest()[:16]
-    except OSError:
-        return "#so\tunknown\n"
+    emu = os.path.join(build_dir, "qemu-" + isa) if isa else None
+    return "#so\t%s\t%s\n" % (_sha16(so),
+                                _sha16(emu) if emu else "unknown")
 
 ISAS = {
     "x86_64": dict(
@@ -799,7 +826,7 @@ def main():
                          % conflicts)
     with open(merged, "w") as f:
         f.write(capture_tip_line(a.build_dir))
-        f.write(capture_so_line(a.build_dir))
+        f.write(capture_so_line(a.build_dir, a.isa))
         f.write("#isa\tencoding\tmnem\tsrc\n")
         for line in seen.values():
             f.write(line)
@@ -902,7 +929,7 @@ def main():
     missing_n = len(pop) - len(seen)
     with open(refused_path, "w") as f:
         f.write(capture_tip_line(a.build_dir))
-        f.write(capture_so_line(a.build_dir))
+        f.write(capture_so_line(a.build_dir, a.isa))
         f.write("#refused\tisa=%s\tencodings=%d\tno_chain_pass0=%d\t"
                 "population=%d\tpopulation_without_row=%d\t"
                 "residue_unattributed=%d\tresidue_decoded_elsewhere=%d\n"

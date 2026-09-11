@@ -6385,6 +6385,84 @@ class QemuIdent:
         return bits if sep else ""
 
 
+#: The X86_OP_* sites parse_x86_identities() SKIPPED because they are not
+#: code -- they sit inside a comment.  Reported by the census, never
+#: silently dropped: a scanner that quietly ignores part of its own input
+#: is a scanner nobody can size (see blank_c_comments()).
+X86_COMMENTED_SITES: list[str] = []
+
+
+def blank_c_comments(text: str) -> str:
+    """The same text with every comment and string body blanked to spaces.
+
+    WHY THE SCAN CANNOT READ THE FILE AS IT STANDS.  An i386 row's identity
+    IS its source line, so the universe is built by matching `X86_OP_*` in
+    the decode table's text -- and text is text wherever it sits.  A comment
+    that QUOTES a row mints a slot no macro ever expanded, keyed on the
+    comment's own line number, and the line number of a comment moves every
+    time the comment is edited.
+
+    MEASURED at 290215f0d8: exactly one such site, decode-new.c.inc:2920,
+    the line `[0xF4] = X86_OP_ENTRY0(HLT, chk(cpl0) svm(HLT)),` inside the
+    identity-publish block's explanation of why `hlt` used to lose its
+    identity at CPL != 0.  The real `HLT` row is at 1779 and the shipped
+    header carries BOTH -- `0x000006f3` (the row) and `0x00000b5f` (the
+    comment as it stood when b947808d89 emitted the header).  The phantom
+    is keyed on a line no macro expands, so no translation can publish it
+    and no encoding can reach it; what it does do is make the generated
+    header disagree with the generator the moment the comment grows, which
+    is the 92-A staleness class arriving from the other end.
+
+    Blanking preserves every byte position, so line and column numbers --
+    which ARE the identities -- are unchanged.  Strings are blanked for the
+    same reason comments are: a `"/*"` inside a literal would otherwise open
+    a comment that the compiler never sees.
+    """
+    out = bytearray(text.encode("utf-8", "surrogateescape"))
+    i, n, state = 0, len(out), 0      # 0 code, 1 block, 2 line, 3 str, 4 chr
+    while i < n:
+        c = out[i]
+        if state == 0:
+            if c == 0x2F and i + 1 < n and out[i + 1] == 0x2A:     # /*
+                out[i] = out[i + 1] = 0x20; state = 1; i += 2; continue
+            if c == 0x2F and i + 1 < n and out[i + 1] == 0x2F:     # //
+                out[i] = out[i + 1] = 0x20; state = 2; i += 2; continue
+            if c == 0x22:
+                state = 3
+            elif c == 0x27:
+                state = 4
+            i += 1
+            continue
+        if state == 1:
+            if c == 0x2A and i + 1 < n and out[i + 1] == 0x2F:     # */
+                out[i] = out[i + 1] = 0x20; state = 0; i += 2; continue
+            if c != 0x0A:
+                out[i] = 0x20
+            i += 1
+            continue
+        if state == 2:
+            if c == 0x0A:
+                state = 0; i += 1; continue
+            out[i] = 0x20
+            i += 1
+            continue
+        # Inside a string or character literal: keep the quotes, blank the
+        # body, and honour the backslash escape so `"\\"` does not read as
+        # an unterminated literal.
+        if c == 0x5C and i + 1 < n:
+            out[i] = 0x20
+            if out[i + 1] != 0x0A:
+                out[i + 1] = 0x20
+            i += 2
+            continue
+        if (state == 3 and c == 0x22) or (state == 4 and c == 0x27):
+            state = 0; i += 1; continue
+        if c != 0x0A:
+            out[i] = 0x20
+        i += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
 def parse_x86_identities() -> list[QemuIdent]:
     """Read i386's identity universe out of the decode table's SOURCE.
 
@@ -6397,6 +6475,11 @@ def parse_x86_identities() -> list[QemuIdent]:
     Fails loudly on a line carrying two slots, because that is the one
     property the derivation depends on -- two rows on one line are one
     id, and the export would be merging two decode rules silently.
+
+    Comments are blanked before the scan (blank_c_comments()) because a
+    comment that quotes a row is not a row; the sites that blanking
+    removes are NAMED in X86_COMMENTED_SITES and printed by the census,
+    so the scanner can be sized rather than trusted.
     """
     path = ROOT / QEMU_IDENT_SOURCE_TABLES["x86"]
     if not path.is_file():
@@ -6404,7 +6487,10 @@ def parse_x86_identities() -> list[QemuIdent]:
     rows: list[QemuIdent] = []
     in_define = False
     rel = str(path.relative_to(ROOT))
-    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+    raw = path.read_text()
+    raw_lines = raw.splitlines()
+    X86_COMMENTED_SITES.clear()
+    for lineno, line in enumerate(blank_c_comments(raw).splitlines(), 1):
         cont = line.endswith("\\")
         # The macro DEFINITIONS expand X86_OP_ENTRY3 inside themselves;
         # counting those would mint slots no row ever carries.
@@ -6414,6 +6500,14 @@ def parse_x86_identities() -> list[QemuIdent]:
         if in_define:
             in_define = cont
             continue
+        # The firing control for the blanking above: anything the RAW line
+        # matches and the blanked line does not is a commented site, and it
+        # is reported by name rather than dropped in silence.
+        raw_line = raw_lines[lineno - 1]
+        for m in X86_SLOT_RE.finditer(raw_line):
+            if not X86_SLOT_RE.match(line[m.start():m.end()]):
+                X86_COMMENTED_SITES.append(
+                    f"{rel}:{lineno} {m.group(0).strip()}")
         for m in X86_SLOT_RE.finditer(line):
             kind = m.group(1)
             # X86_OP_SET_GEN(entry_, op) names the entry first and the
@@ -10119,6 +10213,21 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
         mark = "  <-- EXERCISED" if r.ident.ident in obs else ""
         print(f"    {r.ident.name}  ({r.ident.src_file}:"
               f"{r.ident.src_line}){mark}")
+
+    # ---- WHAT THE SOURCE SCAN LOOKED AT AND DID NOT COUNT.
+    #
+    # THE FIRING CONTROL FOR blank_c_comments().  The i386 universe is a
+    # text scan of the decode table, so a comment that QUOTES a row would
+    # mint a slot no macro expands -- keyed on the comment's own line, which
+    # moves whenever the comment is edited.  The blanking removes them; this
+    # line says how many it removed and where, so the removal is a measured
+    # quantity rather than a silent one.  Non-zero at 290215f0d8 (one site,
+    # decode-new.c.inc:2920), which is what proves the reporter can fire.
+    if key == "x86":
+        print(f"SOURCE SCAN -- X86_OP_* sites inside a comment, not counted "
+              f"as rows: {len(X86_COMMENTED_SITES)}")
+        for why in X86_COMMENTED_SITES:
+            print(f"    {why}")
 
     # ---- IS THE SHIPPED HEADER THE ONE THIS TREE WOULD GENERATE?
     #

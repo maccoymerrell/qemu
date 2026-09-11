@@ -1775,8 +1775,6 @@ static const QemuIdentRow qemu_ident_x86[] = {
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* NOT PUBLISHABLE -- target/i386/tcg/decode-new.c.inc:1931 is an X86_OP_GROUP* row -- decode_group4_5() replaces the entry and restamps .slot with the leaf's own __LINE__, so the only encoding that keeps this id is one no leaf claimed; that encoding leaves through `if (!decode.e.gen) goto unknown_op`, which is UPSTREAM of the identity publish, so the id reaches no plugin on any path and there is no instruction here to classify */
     { 0x0000078cu, "group4_5", QID_STATED, false,
       { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* NOT PUBLISHABLE -- target/i386/tcg/decode-new.c.inc:1932 is an X86_OP_GROUP* row -- decode_group4_5() replaces the entry and restamps .slot with the leaf's own __LINE__, so the only encoding that keeps this id is one no leaf claimed; that encoding leaves through `if (!decode.e.gen) goto unknown_op`, which is UPSTREAM of the identity publish, so the id reaches no plugin on any path and there is no instruction here to classify */
-    { 0x00000b5fu, "HLT", QID_STATED, false,
-      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x004c74f6u, "translate.c/multi0F@b=100,modrm=..011...", QID_STATED, false,
       { .opcode = GEN_OP_LOAD, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x02b2561cu, "decode-new/VMOVLPx_st@vex=1", QID_STATED, false,

@@ -18,6 +18,15 @@
 # THE FIFTEEN ROWS
 #
 #    1  plugin_abi_gate              the plugin/QEMU dataflow ABI handshake
+#    1h   ... ident_header_gate      are the four SHIPPED identity headers
+#                                    the ones this tree generates?  The
+#                                    plugin links the committed header, not
+#                                    the rows a census derives, so a stale
+#                                    one makes every identity number
+#                                    measured against this build describe a
+#                                    table that is not in the binary.  The
+#                                    detector has existed since 92-A and
+#                                    nothing ran it; that is why it is a row
 #    2-5  smoke x4 ISAs              run + strict decode + audit + vacuity,
 #                                    every trace compressed, read from
 #                                    cst_audit's own member line
@@ -882,6 +891,15 @@ SO0=$(so_hash)
 if selected 1; then
     "$T/plugin_abi_gate.sh" "$Q" > "$O/abi_gate.log" 2>&1
     record 1 $? "plugin_abi_gate"
+
+    # ROW 1h.  THE SHIPPED HEADER vs THE GENERATOR.  Run beside the ABI
+    # handshake because it asks the same kind of question about the same
+    # build: does the artefact in the binary answer for this tree?  It is
+    # cheap (four generator runs, no guest) and it is the only check that
+    # can see a generated file drift away from its generator.
+    CST_PYTHON="$PY" "$T/ident_header_gate.sh" "$Q" "$O/identhdr" \
+        > "$O/ident_header_gate.log" 2>&1
+    record 1h $? "ident_header_gate (4 shipped identity headers)"
 fi
 
 declare -A BIN=( [x86_64]=prog [aarch64]=prog.a64 \

@@ -124,6 +124,17 @@ note()  { printf '%s\n' "$*"; }
 #   rows       table rows keyed on a Capstone enumerator.  Re-spelling these
 #              into a local copy of the same constants is REFUSED under R14;
 #              they retire when the fact each row carries comes from QEMU.
+#
+#              A ROW COUNT IS A SIZE, NOT AN OCCUPANCY, and the two were
+#              being read as one thing.  8,024 says how big the four tables
+#              are; it says nothing about how many encodings the tables are
+#              still the ANSWER for, which is what a retirement argument has
+#              to be about -- and which FINDING 96-B ruled may not be
+#              asserted from a no-occupant impression.  So the occupancy is
+#              printed beside the size, from `enumocc.py` over a sled
+#              capture, and where no capture is named it says SURVEY CANNOT
+#              LOOK rather than nothing (which a reader would take for a
+#              zero).  See the `occupants` row below.
 #   gates      the admission sites: every place the plugin asks whether
 #              Capstone produced an answer AT ALL and changes what it does
 #              on the answer.  These decide what an instruction IS, whether
@@ -193,6 +204,38 @@ survey() {
         note "             $(basename "$h")  insn $ni  reg $nrg"
     done
     note "             total $nr"
+
+    #
+    # THE OCCUPANCY, BESIDE THE SIZE.  `classify_insn_id()` falls to the enum
+    # row on exactly one condition -- QEMU exported no decode identity -- so
+    # "who is the enum table still the answer for" is a property of an
+    # ENCODING and is countable over the sled's whole population.  The count
+    # is delegated for the same reason the field census is: it is a read of a
+    # capture, not a grep, and a survey that invented its own reader would be
+    # a second opinion about a number this tree already has an instrument for.
+    #
+    # NO CAPTURE NAMED IS NOT ZERO.  With CST_ENUMOCC_SLED unset there is
+    # nothing to read and the row says so; printing 0 there would be the
+    # census-that-could-not-look shape every instrument here is built against.
+    #
+    note "  occupants encodings the enum table is still the CLASSIFICATION"
+    note "           for (decode_id == 0), counted per ISA:"
+    local occ="$(dirname "${BASH_SOURCE[0]}")/arc3_cov/instruments/enumocc.py"
+    if [ -z "${CST_ENUMOCC_SLED:-}" ]; then
+        note "             SURVEY CANNOT LOOK -- no CST_ENUMOCC_SLED naming a"
+        note "             sled capture (srcenc_sled.py --mech).  This is NOT"
+        note "             a zero."
+    elif [ ! -f "$occ" ]; then
+        note "             SURVEY CANNOT LOOK -- no enumocc.py at $occ"
+    else
+        local otxt orc
+        otxt=$("${CST_PYTHON:-python3}" "$occ" --sled "$CST_ENUMOCC_SLED" \
+                   2>&1); orc=$?
+        printf '%s\n' "$otxt" | grep -E 'TOTAL|REFUSED-TO-SCORE|ENUM-OCCUPANCY' \
+            | sed 's/^/             /'
+        [ "$orc" = 0 ] || note "             (enumocc exited $orc -- a row it" \
+                               "could not score is named above)"
+    fi
 
     #
     # THE LABEL SAYS "AT OR BESIDE", AND FINDING 96-D IS WHY.  Until

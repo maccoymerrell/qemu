@@ -369,6 +369,74 @@ def open_maybe_compressed(path):
     return io.StringIO(pr.stdout.decode("utf-8", "replace"))
 
 
+def landing_key(hx, landed, term, stride):
+    """Where a slot's corpus row went, when it did not go under @hx.
+
+    FINDING 96-A.  A row is keyed on the bytes the decoder CONSUMED, so a
+    slot whose planted encoding QEMU read at a different length still
+    produced a row -- under a different key.  The key is then either
+
+      * a proper PREFIX of @hx (the decoder read SHORT and stopped inside
+        the planted bytes), or
+      * @hx followed by whole copies of the slot TERMINATOR (it read LONG,
+        on into the padding, which is the only thing that follows).
+
+    Both are looked up in @landed, the set of keys this capture actually
+    produced -- population rows AND incidental ones, because a landing key
+    that is not itself a population member is exactly what `incidental`
+    holds, and that is why joining against the merged corpus alone finds
+    nothing.
+
+    Returns the landing key, or None when nothing in this capture explains
+    the slot -- which leaves it UNATTRIBUTED, honestly.
+    """
+    for k in range(1, len(hx) // 2):
+        if hx[:2 * k] in landed:
+            return hx[:2 * k]
+    pad = term.hex()
+    for j in range(1, (stride - len(hx) // 2) // len(term) + 1):
+        cand = hx + pad * j
+        if cand in landed:
+            return cand
+    return None
+
+
+def selftest_landing_key():
+    """Both directions, and the refusal, on the x86_64 slot layout."""
+    term, stride = ISAS["x86_64"]["term"], ISAS["x86_64"]["stride"]
+    fails = []
+
+    def chk(got, want, what):
+        ok = got == want
+        print("%-5s %s (got %r)" % ("PASS" if ok else "FAIL", what, got))
+        if not ok:
+            fails.append(what)
+
+    # THE MEASURED SHAPE (2ff695368a, x86_64): the sweep planted four bytes
+    # of VMWRITE-with-SIB and QEMU consumed three.
+    chk(landing_key("0f790400", {"0f7904"}, term, stride), "0f7904",
+        "a SHORT read is named by the prefix the row landed under")
+    chk(landing_key("0f790400", {"0f790400c3"}, term, stride), "0f790400c3",
+        "a LONG read is named by the planted bytes plus terminator")
+    chk(landing_key("0f790400", set(), term, stride), None,
+        "a slot nothing in the capture explains stays UNATTRIBUTED")
+    chk(landing_key("0f790400", {"0f79040099"}, term, stride), None,
+        "an extension that is not the terminator does not count")
+    chk(landing_key("0f790400", {"1122"}, term, stride), None,
+        "an unrelated key in the capture explains nothing")
+    # The shortest prefix wins, because the decode is a function of the
+    # bytes: two prefixes cannot both be the instruction QEMU read.
+    chk(landing_key("0f790400", {"0f", "0f7904"}, term, stride), "0f",
+        "the SHORTEST prefix present is the decode")
+    # A one-byte encoding has no proper prefix; only the long route is open.
+    chk(landing_key("90", {"90c3"}, term, stride), "90c3",
+        "a one-byte slot has no prefix route and takes the long one")
+    chk(landing_key("90", {"9090"}, term, stride), None,
+        "a one-byte slot is not explained by a non-terminator extension")
+    print("landing_key arms=8 failures=%d" % len(fails))
+    return 1 if fails else 0
+
+
 def read_pop(path, isa):
     """The population, de-duplicated, in first-seen order."""
     seen, out = set(), []
@@ -410,6 +478,9 @@ def main():
                     help="set EF_MIPS_NAN2008 in the mipsel image's e_flags, "
                          "which the MSA-capable CPU models require of an ELF "
                          "before linux-user will run it at all.")
+    ap.add_argument("--selftest", action="store_true",
+                    help="exercise the FINDING 96-A landing-key join "
+                         "and exit; needs no build and no guest")
     ap.add_argument("--emit-only", action="store_true")
     ap.add_argument("--mech", action="store_true",
                     help="ALSO capture the per-encoding MECHANISM corpus "
@@ -420,6 +491,8 @@ def main():
                          "the two files describe one translation and cannot "
                          "drift apart between two sweeps.")
     a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest_landing_key())
 
     os.makedirs(a.out, exist_ok=True)
     pop = read_pop(a.pop, a.isa)
@@ -776,8 +849,55 @@ def main():
     seen_hex = set(seen)
     refused = sorted(e for e in nochain_enc if e not in seen_hex)
     rset = set(refused)
-    unattr = sorted(e.hex() for e in pop
-                    if e.hex() not in seen_hex and e.hex() not in rset)
+    #
+    # THE THIRD CAUSE OF SILENCE, AND FINDING 96-A IS WHY IT HAS A NAME
+    # (it used to be pooled into UNATTRIBUTED, whose whole definition is
+    # "a reason nothing recorded" -- and this reason IS recorded, twice
+    # over, by the two files this function already has in hand).
+    #
+    #   DECODED-AT-ANOTHER-LENGTH   QEMU translated the slot and the plugin
+    #                               DID write a row -- under a DIFFERENT
+    #                               encoding key, because the decoder
+    #                               consumed a different number of bytes
+    #                               than the sweep planted.
+    #
+    # This is the module docstring's own contract arriving at the refused
+    # set: "Where QEMU reads a different length than the sweep did, the
+    # corpus row is keyed on different bytes and the encoding reads UNREACHED
+    # downstream -- the honest answer, rather than a comparison between two
+    # different instructions."  Keying the row on the decoded length is
+    # therefore RIGHT and is not changed here; emitting a second row under
+    # the slot key would publish one instruction's source list under another
+    # instruction's name, which is the one thing the contract forbids.  What
+    # was wrong was the LABEL on the slot afterwards.
+    #
+    # THE JOIN IS EXACT AND LOCAL.  A slot's row lands under the bytes the
+    # decoder consumed, so the landing key is either a proper PREFIX of the
+    # planted encoding (it read short) or the planted encoding followed by
+    # slot terminator bytes (it read long, into the padding).  Both are
+    # looked up in the keys this capture actually produced -- `seen` for the
+    # population's own, `incidental` for everything else, which is where a
+    # landing key ends up when it is not itself a population member, and is
+    # why joining against the merged corpus alone finds nothing.
+    #
+    # MEASURED at 2ff695368a, x86_64: all 35,919 residue encodings land on a
+    # prefix, 0 on an extension, 0 unexplained -- and x86_64 is the only ISA
+    # of the four whose residue moved when block admission flipped, which is
+    # what a length-dependent mechanism can do and a length-independent one
+    # cannot.
+    #
+    landed = seen_hex | set(incidental)
+    term = ISAS[a.isa]["term"]
+    stride = ISAS[a.isa]["stride"]
+    key_of = lambda hx: landing_key(hx, landed, term, stride)
+
+    residue = [e.hex() for e in pop
+               if e.hex() not in seen_hex and e.hex() not in rset]
+    elsewhere, unattr = [], []
+    for hx in residue:
+        (elsewhere if key_of(hx) else unattr).append(hx)
+    elsewhere.sort()
+    unattr.sort()
     refused_path = os.path.join(a.out, "refused_%s.tsv" % a.isa)
     missing_n = len(pop) - len(seen)
     with open(refused_path, "w") as f:
@@ -785,17 +905,21 @@ def main():
         f.write(capture_so_line(a.build_dir))
         f.write("#refused\tisa=%s\tencodings=%d\tno_chain_pass0=%d\t"
                 "population=%d\tpopulation_without_row=%d\t"
-                "residue_unattributed=%d\n"
+                "residue_unattributed=%d\tresidue_decoded_elsewhere=%d\n"
                 % (a.isa, len(refused), no_chain_total, len(pop), missing_n,
-                   len(unattr)))
+                   len(unattr), len(elsewhere)))
         f.write("#isa\tencoding\tsilence\n")
         for e in refused:
             f.write("%s\t%s\tREFUSED\n" % (a.isa, e))
+        for e in elsewhere:
+            f.write("%s\t%s\tDECODED-AT-ANOTHER-LENGTH\t%s\n"
+                    % (a.isa, e, key_of(e)))
         for e in unattr:
             f.write("%s\t%s\tUNATTRIBUTED\n" % (a.isa, e))
-    print("refused %s encodings=%d unattributed=%d (population %d, "
-          "population without a row %d)"
-          % (refused_path, len(refused), len(unattr), len(pop), missing_n))
+    print("refused %s encodings=%d decoded-at-another-length=%d "
+          "unattributed=%d (population %d, population without a row %d)"
+          % (refused_path, len(refused), len(elsewhere), len(unattr),
+             len(pop), missing_n))
     if a.mech:
         # THE SAME SCOPING as the read-list merge above, for the same reason:
         # the entry stub and the slot terminator are by-products of the
@@ -880,12 +1004,26 @@ def main():
               "declined=%d over %d retry pass(es) (the per-process code "
               "buffer; every declined slot was re-run in a fresh process)"
               % (no_chain_total, declined_total, retry_passes))
-        if len(missing) == no_chain_total:
-            print("    ATTRIBUTED IN FULL: the residue IS the no_chain set")
+        #
+        # AND THE LENGTH JOIN, COUNTED HERE TOO (FINDING 96-A).  This block
+        # used to know only about `no_chain`, so every slot whose row landed
+        # under the bytes the decoder consumed rather than the bytes the
+        # sweep planted was printed as having "no cause recorded" -- a false
+        # negative in the honest direction, but a false one.  Measured at
+        # 2ff695368a: all 35,919 x86_64 residue encodings are this class and
+        # NONE of them was unexplained.
+        #
+        n_else = len(elsewhere)
+        if len(missing) == no_chain_total + n_else:
+            print("    ATTRIBUTED IN FULL: %d no_chain + %d decoded at "
+                  "another length (the row went to the key the decoder's "
+                  "own length names)" % (no_chain_total, n_else))
         else:
             print("    NOT ATTRIBUTED: %d encoding(s) beyond the no_chain "
-                  "count have no cause recorded" % (len(missing)
-                                                    - no_chain_total))
+                  "count (%d) and the decoded-at-another-length count (%d) "
+                  "have no cause recorded"
+                  % (len(missing) - no_chain_total - n_else,
+                     no_chain_total, n_else))
         print("    by chunk (chunk size %d, %d chunk(s)): %s"
               % (a.chunk, (len(pop) + a.chunk - 1) // a.chunk,
                  ", ".join("%d=%d" % (c, n)

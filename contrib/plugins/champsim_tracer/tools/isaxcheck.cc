@@ -1566,7 +1566,7 @@ static std::set<std::string> srcenc_mnem_hit, srcenc_mnem_all;
  * direction that keeps the detector's power.
  */
 static const char *refused_path = nullptr;
-static std::set<std::string> refused_enc, unattr_enc;
+static std::set<std::string> refused_enc, unattr_enc, elsewhere_enc;
 /*
  * COMPARISONS that landed in the refused set -- the same shape as
  * `srcenc_covered` and `srcenc_unreached`, which are also per-compare() and
@@ -2184,8 +2184,25 @@ static bool refused_load(const char *path, const char *isa)
             free(line); fclose(f); return false;
         }
         *kind++ = '\0';
+        /*
+         * A THIRD SILENCE, AND IT IS NEITHER OF THE OTHER TWO (FINDING
+         * 96-A).  `DECODED-AT-ANOTHER-LENGTH` says the sled's slot WAS
+         * translated and the plugin DID write a row -- under the bytes the
+         * decoder consumed, which were not the bytes the sweep planted.  It
+         * must not join REFUSED: nothing refused this encoding, so a rule
+         * whose subjects are all of this kind has NOT been superseded and
+         * retiring it would write a false reason.  And it must not stay
+         * pooled with UNATTRIBUTED either, whose definition is a hole with
+         * no recorded cause -- this one has one, and the row names the key
+         * the answer went to in a fourth column.  It is UNREACHED: the arm
+         * never asked about this encoding at this length.
+         */
+        char *extra = strchr(kind, '\t');
+        if (extra) *extra = '\0';
         if (!strcmp(kind, "REFUSED")) { refused_enc.insert(tab + 1); rows++; }
         else if (!strcmp(kind, "UNATTRIBUTED")) unattr_enc.insert(tab + 1);
+        else if (!strcmp(kind, "DECODED-AT-ANOTHER-LENGTH"))
+            elsewhere_enc.insert(tab + 1);
         else {
             fprintf(stderr, "isaxcheck: --refused=%s row `%s' has silence "
                     "`%s', which this build has no meaning for -- REFUSING\n",
@@ -2218,8 +2235,8 @@ static bool refused_load(const char *path, const char *isa)
         return false;
     }
     fprintf(stderr, "# refused set=%s isa=%s refused=%lu unattributed=%zu "
-            "so=%s\n", path, isa, rows, unattr_enc.size(),
-            refused_so.c_str());
+            "decoded_at_another_length=%zu so=%s\n", path, isa, rows,
+            unattr_enc.size(), elsewhere_enc.size(), refused_so.c_str());
     return true;
 }
 

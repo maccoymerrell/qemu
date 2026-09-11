@@ -234,12 +234,22 @@ run_arms() {
                 # `rows=` would report mipsel -- 0 refused, 9,216
                 # unattributed -- as though the gate had refused 9,216
                 # encodings.
-                local nref nuna
+                # THE THIRD SILENCE IS COUNTED APART TOO (FINDING 96-A).
+                # `DECODED-AT-ANOTHER-LENGTH` is neither: the slot WAS
+                # translated and DID produce a row, under the bytes the
+                # decoder consumed rather than the bytes the sweep planted.
+                # Folded into `unattributed` it would read as a hole nobody
+                # explained; folded into `refused` it would excuse rules
+                # nothing refused the subject of.
+                local nref nuna nelse
                 nref=$(grep -v '^#' "$refused" | awk -F'\t' \
                        '$3=="REFUSED"' | wc -l)
                 nuna=$(grep -v '^#' "$refused" | awk -F'\t' \
                        '$3=="UNATTRIBUTED"' | wc -l)
-                echo "refused-set $isa so=$rso refused=$nref unattributed=$nuna" \
+                nelse=$(grep -v '^#' "$refused" | awk -F'\t' \
+                        '$3=="DECODED-AT-ANOTHER-LENGTH"' | wc -l)
+                echo "refused-set $isa so=$rso refused=$nref" \
+                     "unattributed=$nuna decoded_at_another_length=$nelse" \
                      >> "$out/rc.txt"
             fi
         fi

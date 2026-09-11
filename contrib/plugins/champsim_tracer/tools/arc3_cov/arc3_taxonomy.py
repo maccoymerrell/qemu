@@ -41,15 +41,30 @@ Author: Maccoy Merrell.
 """
 import re
 import collections
+import sys
+import os
 
 # --------------------------------------------------------------- directions
 SUPERSET = 'TRACER-SUPERSET'
 SUBSET = 'TRACER-SUBSET'
 ORTHOGONAL = 'ORTHOGONAL'
 UNACCOUNTED = 'UNACCOUNTED'
+#: THE ENCODING QEMU DOES NOT DECODE (98-F).  Not a fifth kind of
+#: disagreement -- a statement that there is nothing to disagree ABOUT.  The
+#: reference names an instruction; QEMU matched no decode rule for those
+#: bytes, so it builds no dependency chain, the tracer publishes no
+#: classification, and the wire can never carry the instruction at all.
+#: Scoring such a row against the reference measures the EMULATOR's ISA
+#: coverage under the name of the tracer's dataflow model.
+#:
+#: Until 2fdabefe79 these rows scored as AGREEMENTS, because the Capstone-enum
+#: classification table answered for them where QEMU would not; that table is
+#: what R14 deletes.  They are counted here, apart and by name, rather than
+#: folded into either agreement or UNACCOUNTED.
+QEMU_NO_RULE = 'QEMU-NO-RULE'
 EQUAL = 'EQUAL'          # not a disagreement; never reported as a direction
 
-DIRECTIONS = (SUPERSET, SUBSET, ORTHOGONAL, UNACCOUNTED)
+DIRECTIONS = (SUPERSET, SUBSET, ORTHOGONAL, UNACCOUNTED, QEMU_NO_RULE)
 ANY = frozenset((SUPERSET, SUBSET, ORTHOGONAL))
 
 #: the direction axis, with the verdict each value carries
@@ -58,6 +73,7 @@ DIRECTION_VERDICT = {
     SUBSET:      'DEFECT  the reference records something we drop',
     ORTHOGONAL:  'NAMED   different vocabulary for the same fact',
     UNACCOUNTED: 'MUST BE 0  not yet interrogated',
+    QEMU_NO_RULE: 'NO SUBJECT  QEMU matched no decode rule for these bytes',
 }
 
 # --------------------------------------------------------------- categories
@@ -82,6 +98,9 @@ CATEGORIES = (
                                 # mipsel siblings).
     'needs-ruling',             # mechanism named, verdict awaiting the maintainer
     'unaccounted',              # no rule reaches this row
+    'qemu-no-rule',             # QEMU decodes no instruction at this encoding,
+                                # so there is no tracer answer to compare --
+                                # see QEMU_NO_RULE above
 )
 
 #: categories whose mechanism admits only one set relation.  A row charged to
@@ -91,6 +110,7 @@ CATEGORY_EXPECT = {
     'reference-gap':  frozenset((SUPERSET,)),   # the reference under-reports, always
     'vocabulary-gap': frozenset((SUBSET,)),     # an unmappable register is dropped
     'unaccounted':    frozenset(),
+    'qemu-no-rule':   frozenset(),
 }
 
 
@@ -145,18 +165,71 @@ def set_relation(ref_src, ref_dst, trc_src, trc_dst):
     return ORTHOGONAL
 
 
+# ------------------------------------------- the encodings QEMU has no rule for
+def load_qemu_refused(isa, ident_path=None):
+    """The set of encodings QEMU matched no decode rule for, as hex strings.
+
+    srcenc_sled.py writes `refused_<isa>.tsv` beside the identity corpus it
+    captured for this leg's own denominator; the file's REFUSED rows are the
+    population encodings QEMU translated without building a chain.
+
+    REFUSES rather than returns an empty set.  An absent file would silently
+    score every one of those rows against the reference as though the tracer
+    had answered and been wrong -- which is precisely the reading 2fdabefe79
+    made possible and this column exists to stop.  A leg that cannot find
+    the set must fail, not report a number it cannot justify.
+    """
+    ident_path = ident_path or os.environ.get('CST_ISAX_IDENT', '')
+    if not ident_path:
+        raise SystemExit(
+            'arc3_taxonomy: CST_ISAX_IDENT is unset, so the QEMU refusal set '
+            'for %s cannot be located.  REPRODUCE.sh captures both with '
+            'arc3_cov/ident_capture.sh; without them this leg would score '
+            'encodings the emulator decodes no rule for as tracer '
+            'disagreements (98-F)' % isa)
+    path = os.path.join(os.path.dirname(ident_path), 'refused_%s.tsv' % isa)
+    if not os.path.exists(path):
+        raise SystemExit(
+            'arc3_taxonomy: no QEMU refusal set at %s -- REFUSING (the '
+            'identity corpus and the refusal set are one sled capture; half '
+            'of it is not a degraded mode)' % path)
+    out = set()
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            c = line.rstrip('\n').split('\t')
+            if len(c) >= 3 and c[2] == 'REFUSED':
+                out.add(c[1])
+    if not out:
+        sys.stderr.write('# qemu-refusal set %s is EMPTY (every population '
+                         'encoding produced a chain)\n' % path)
+    return out
+
+
 # ------------------------------------------------------------- the classifier
 Row = collections.namedtuple(
     'Row', 'ident mnemonic label relation direction category accounted conflict')
 
 
-def classify(ident, mnemonic, label, relation, rule):
+def classify(ident, mnemonic, label, relation, rule, qemu_refused=False):
     """One disagreeing row -> its place in the cross-tabulation.
 
     `relation` is the measurement; `rule` is whatever the harness's own
     adjudication table returned for `label` (None when nothing matched).
+
+    `qemu_refused` says the EMULATOR matched no decode rule for this
+    encoding -- read from srcenc_sled.py's `refused_<isa>.tsv`, which names
+    every population encoding QEMU translated without building a chain.  It
+    is tested FIRST and it overrides every label, because a row with no
+    subject cannot be explained by an adjudication of the tracer's dataflow:
+    there is no tracer answer for the adjudication to be about.  It is also
+    not a defect, so it is neither UNACCOUNTED nor a silent agreement.
     """
     assert relation in (SUPERSET, SUBSET, ORTHOGONAL), relation
+    if qemu_refused:
+        return Row(ident, mnemonic, label, relation, QEMU_NO_RULE,
+                   'qemu-no-rule', True, None)
     if rule is None:
         return Row(ident, mnemonic, label, relation, UNACCOUNTED,
                    'unaccounted', False, None)
@@ -221,9 +294,9 @@ def render_crosstab(rows, title, width=26):
     out = []
     out.append(title)
     out.append('')
-    hdr = '%-*s %16s %14s %11s %12s %8s' % (
+    hdr = '%-*s %16s %14s %11s %12s %13s %8s' % (
         width, 'CATEGORY (mechanism)', SUPERSET, SUBSET, ORTHOGONAL,
-        UNACCOUNTED, 'total')
+        UNACCOUNTED, QEMU_NO_RULE, 'total')
     out.append(hdr)
     out.append('-' * len(hdr))
     tot = collections.Counter()
@@ -231,17 +304,25 @@ def render_crosstab(rows, title, width=26):
         line = [ct.get((d, c), 0) for d in DIRECTIONS]
         for d, v in zip(DIRECTIONS, line):
             tot[d] += v
-        out.append('%-*s %16d %14d %11d %12d %8d'
-                   % (width, c, line[0], line[1], line[2], line[3], sum(line)))
+        out.append('%-*s %16d %14d %11d %12d %13d %8d'
+                   % (width, c, line[0], line[1], line[2], line[3], line[4],
+                      sum(line)))
     out.append('-' * len(hdr))
-    out.append('%-*s %16d %14d %11d %12d %8d'
+    out.append('%-*s %16d %14d %11d %12d %13d %8d'
                % (width, 'TOTAL', tot[SUPERSET], tot[SUBSET], tot[ORTHOGONAL],
-                  tot[UNACCOUNTED],
+                  tot[UNACCOUNTED], tot[QEMU_NO_RULE],
                   sum(tot[d] for d in DIRECTIONS)))
     out.append('')
     out.append('  the number that matters: TRACER-SUBSET + UNACCOUNTED = %d'
                % (tot[SUBSET] + tot[UNACCOUNTED]))
     out.append('  (rows where we drop information, or do not know why we differ)')
+    # PRINTED WHETHER OR NOT IT IS ZERO.  A column that appears only when it
+    # is occupied lets a reader of a clean run believe the question was
+    # asked and answered; this says which it was.
+    out.append('  QEMU-NO-RULE = %d (the reference names an instruction the '
+               'emulator decodes no rule for;' % tot[QEMU_NO_RULE])
+    out.append('   the wire can never carry it, so there is no tracer answer '
+               'to score -- see 98-F)')
     return '\n'.join(out)
 
 

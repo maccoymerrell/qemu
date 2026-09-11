@@ -59,12 +59,54 @@ cd "$D"
 # has stopped matching rows -- a justification nobody can check is how
 # ssamoswap.w/.d stayed excluded as undecodable for as long as it took
 # CS_MODE_RISCV_ZICFISS to be switched on.
+
+# ---- the DECODE IDENTITY for this leg's denominator (98-F) ----------------
+# The tracer arm below asks the plugin what it makes of each encoding, and
+# the plugin classifies from QEMU's decode_id -- which a host tool does not
+# have.  Until 2fdabefe79 the answer came from the Capstone-enum table, so
+# what this leg scored was Capstone's classification; R14 deleted it.  The
+# identity is captured here from a real translation and handed to every
+# isaxcheck invocation in this leg through CST_ISAX_IDENT.  isaxcheck
+# REFUSES the fields layer without one, so a capture that fails stops the
+# leg rather than letting it score a layer that classified nothing.
+# THE DENOMINATOR IS rows.json, NOT opcodes.tsv: emit.py WRITES opcodes.tsv,
+# and its own first act is a fields-layer batch over these same
+# representatives.  Capturing after it would be capturing after the step
+# that needs the capture.
+# Written to a FILE, not a process substitution: the hex list is the leg's
+# denominator and a capture that silently saw an empty stream is the failure
+# mode this whole item is about.  The file is checked non-empty here and
+# ident_capture.sh REFUSES an empty one again.
+"$PY" - "$D/rows.json" > "$D/ident_pop.txt" <<'PYHEX' || exit 2
+import json, sys
+for r in json.load(open(sys.argv[1])):
+    print(r["hex"])
+PYHEX
+[ -s "$D/ident_pop.txt" ] || { echo "REFUSED: rows.json yielded no hex" >&2
+                               exit 2; }
+# THE MODEL IS PASSED, AND IT IS NOT THE CAUSE.  Measured this pass: the
+# sled produces a chain for 413 of this leg's 1093 representatives, and the
+# reading is IDENTICAL on the default model and on `max` -- so the 680 are
+# not an extension the model fails to implement, and the cause is NOT YET
+# ATTRIBUTED.  The consequence is on the record rather than papered over:
+# the leg's own negative control, drop-src:vadd.vv, goes CONTROL INERT
+# because its subject is among the 680, and a leg whose control cannot be
+# made to fail may not have its zero quoted (98-F residue, riscv64).  The
+# knob stays because the model IS part of the measurement for any ISA where
+# it turns out to matter -- mipsel MSA on 24Kf is the sled's own example.
+CST_IDENT_CPU=${CST_IDENT_CPU:-max} \
+CST_ISAX_IDENT=$("$T"/../ident_capture.sh riscv64 "$D/ident_pop.txt" \
+    "$D/ident" "$Q") || exit 2
+export CST_ISAX_IDENT
+echo "ident corpus: $CST_ISAX_IDENT"
+
 CST_ISAXCHECK="$ISAX" $PY emit.py               # -> opcodes.tsv, excluded.tsv
 $PY - <<'PYEOF'
 import sys, runpy
 sys.path.insert(0, '.')
 runpy.run_path('attrib/expand_vals.py', run_name='__main__')
 PYEOF
+
 CST_ISAXCHECK="$ISAX" $PY attrib/compare.py     # -> attrib.tsv, attrib_signatures.txt
 
 # ---- prove the comparison can go red --------------------------------------

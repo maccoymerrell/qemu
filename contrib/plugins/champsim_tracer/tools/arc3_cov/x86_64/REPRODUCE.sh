@@ -108,6 +108,20 @@ ninja -j 12 -C "$Q/build" contrib-plugins
 gcc -O2 -I"$K/include" -o xediform xediform.c "$K/lib/libxed.a"
 $PY mkprobe.py                 # -> probe_map.json, probe_uniq.hex
 
+# ---- the DECODE IDENTITY for this leg's denominator (98-F) ----------------
+# The tracer arm below asks the plugin what it makes of each encoding, and
+# the plugin classifies from QEMU's decode_id -- which a host tool does not
+# have.  Until 2fdabefe79 the answer came from the Capstone-enum table, so
+# what this leg scored was Capstone's classification; R14 deleted it.  The
+# identity is captured here from a real translation and handed to every
+# isaxcheck invocation in this leg through CST_ISAX_IDENT.  isaxcheck
+# REFUSES the fields layer without one, so a capture that fails stops the
+# leg rather than letting it score a layer that classified nothing.
+CST_ISAX_IDENT=$("$T"/../ident_capture.sh x86_64 probe_uniq.hex \
+    "$PWD/ident" "$Q") || exit 2
+export CST_ISAX_IDENT
+echo "ident corpus: $CST_ISAX_IDENT"
+
 # ---- the four arms ---------------------------------------------------------
 g++ -O2 -std=c++17 -I"$K/include" $($LC --cxxflags | sed 's/-fno-exceptions//') \
     -o xl3 xl3.cc "$K/lib/libxed.a" $($LC --ldflags) -lLLVM-18

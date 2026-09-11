@@ -66,6 +66,21 @@ awk -F'\t' 'NR>1{h=$3;print $1" "substr(h,7,2) substr(h,5,2) substr(h,3,2) subst
 "$R"/llvm_probe --cpu=mips32r2 --feats="$F" < enc_word.txt > llvm_raw.txt
 "$R"/binutils_probe                         < enc_word.txt > bu_raw.txt
 
+
+# ---- the DECODE IDENTITY for this leg's denominator (98-F) ----------------
+# The tracer arm below asks the plugin what it makes of each encoding, and
+# the plugin classifies from QEMU's decode_id -- which a host tool does not
+# have.  Until 2fdabefe79 the answer came from the Capstone-enum table, so
+# what this leg scored was Capstone's classification; R14 deleted it.  The
+# identity is captured here from a real translation and handed to every
+# isaxcheck invocation in this leg through CST_ISAX_IDENT.  isaxcheck
+# REFUSES the fields layer without one, so a capture that fails stops the
+# leg rather than letting it score a layer that classified nothing.
+CST_ISAX_IDENT=$("$T"/../ident_capture.sh mipsel \
+    <(awk -F'\t' 'NR>1{print $3}' ../opcodes.tsv) "$D/ident" "$Q") || exit 2
+export CST_ISAX_IDENT
+echo "ident corpus: $CST_ISAX_IDENT"
+
 # ---- the tracer arm, re-derived from the live binary ----------------------
 awk -F'\t' 'NR>1{print $3}' ../opcodes.tsv \
     | "$ISAX" --isa=mipsel --layer=fields --batch > batch_tip.tsv

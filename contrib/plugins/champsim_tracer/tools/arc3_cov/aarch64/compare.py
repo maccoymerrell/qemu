@@ -21,6 +21,11 @@ else:
 if _D not in sys.path:
     sys.path.insert(0, _D)
 import arc3_taxonomy as tax
+
+#: THE ENCODINGS QEMU DECODES NO RULE FOR (98-F).  Loaded once, and the
+#: loader REFUSES when the sled capture is not there: scoring those rows as
+#: tracer disagreements is what the enum table used to hide.
+QEMU_REFUSED = tax.load_qemu_refused('aarch64')
 import arc3_rules as taxrules
 # The adjudication table lives with the adjudicator; the taxonomy translates it
 # rather than restating it, so there is exactly one place a verdict is written.
@@ -371,8 +376,10 @@ def main():
                 # the verdict was taken from, so it cannot drift from it.
                 rel = tax.set_relation(rsa, rda, tsa, tda)
                 tax_sigs[sig] += 1
-                tax_rows.append(tax.classify(x['opcode_id'], x['mnemonic'],
-                                             sig, rel, TAXRULES.get(sig)))
+                tax_rows.append(tax.classify(
+                    x['opcode_id'], x['mnemonic'], sig, rel,
+                    TAXRULES.get(sig),
+                    qemu_refused=x['hex'] in QEMU_REFUSED))
                 trow = tax_rows[-1]
                 if len(sig_examples[sig]) < 8:
                     sig_examples[sig].append('%s | %s | ref S{%s} D{%s} | trc S{%s} D{%s}' % (

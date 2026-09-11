@@ -4404,6 +4404,23 @@ int main(int argc, char **argv)
      * could exit ZERO having classified nothing.  A check that cannot find
      * its subject must fail, so it fails here, before any work is paid for.
      */
+    /*
+     * THE ENVIRONMENT FORM, and why one exists.  The fields layer's batch
+     * consumers are a dozen call sites across four per-ISA harnesses
+     * (arc3_cov/<isa>/), every one of which already binds this binary
+     * through CST_ISAXCHECK rather than naming it.  Threading a new flag
+     * through all of them would put the identity in twelve places that can
+     * drift; the env var puts it in one, beside the binding that is already
+     * there.  It is NOT a quiet default: with neither form set the layer
+     * REFUSES below, so an unset variable fails loudly rather than scoring
+     * a layer that never looked.  The flag wins where both are given.
+     */
+    if (!ident_path) {
+        const char *e = getenv("CST_ISAX_IDENT");
+        if (e && *e) {
+            ident_path = e;
+        }
+    }
     if (!ident_path &&
         (layer == LAYER_FIELDS || layer == LAYER_FIXUPS || batch)) {
         fprintf(stderr,
@@ -4412,8 +4429,9 @@ int main(int argc, char **argv)
                 "identity (qemu_ident_classify on insn_info.decode_id), and "
                 "this process has no decode_id of its own.  Capture one with "
                 "tools/srcenc_sled.py --mech (corpus_mech_<isa>.tsv) and "
-                "pass it; without it every encoding is unclassified and the "
-                "layer scores nothing while appearing to score everything\n");
+                "pass it (or set CST_ISAX_IDENT); without it every encoding "
+                "is unclassified and the layer scores nothing while "
+                "appearing to score everything\n");
         return 2;
     }
     if (ident_path && !ident_load(ident_path, cfg.name)) return 2;

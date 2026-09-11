@@ -22,6 +22,9 @@ for _p in (HERE, ROOT, os.path.dirname(ROOT), _TOOLS):
 else:
     sys.exit('arc3_taxonomy.py not found (set CST_ARC3_TOOLS)')
 import arc3_taxonomy as tax
+
+#: See aarch64/compare.py -- the same set, the same reason (98-F).
+QEMU_REFUSED = tax.load_qemu_refused('riscv64')
 import arc3_rules as taxrules
 
 QEMU = '/mnt/md0/QEMU/qemu'
@@ -399,7 +402,8 @@ if __name__ == '__main__':
         lab = r.get('adjudication', '')
         tax_labels[lab] += 1
         t = tax.classify(r['opcode_id'], r['mnemonic'], lab,
-                         r['set_relation'], taxrules.riscv_rule(lab))
+                         r['set_relation'], taxrules.riscv_rule(lab),
+                         qemu_refused=r.get('hex', '') in QEMU_REFUSED)
         tax_rows.append(t)
         r['direction'] = t.direction
         r['category'] = t.category

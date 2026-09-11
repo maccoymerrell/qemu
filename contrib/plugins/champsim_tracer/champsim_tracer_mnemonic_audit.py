@@ -2709,6 +2709,112 @@ CMP_ALIAS_PROMOTE_INSNS = {
 }
 
 
+# THE PER-INSTANCE REFINERS, STATED HERE RATHER THAN READ BACK OUT OF THE
+# FILE THIS SCRIPT WRITES.
+#
+# `.refine` names a callback that repairs, per INSTANCE, a field one
+# decode key cannot settle.  Every other column of an InsnClassification
+# row is DERIVED -- opcode, branch type, flags, `.dep_refine` and the lane
+# pair are all recomputed from Capstone's source tables on every run --
+# but `.refine` was not derived by anything.  It was carried across
+# regenerations by `parse_existing()`, which reads the table in
+# champsim_tracer_mnemonics_<isa>.h.  The generated file was therefore the
+# STORE for these forty-three assignments, and the only one.
+#
+# THAT IS A LOAD-BEARING ROUND TRIP, AND IT IS MEASURED, NOT ASSERTED.
+# Rendering every table with `existing = {}` and diffing against the
+# shipped ones moves exactly these lines and nothing else:
+#
+#     x86       4 lines   CALL, JMP
+#     aarch64  50 lines   38 load/store + 2 SYS/SYSL
+#     riscv     0 lines
+#     mips      3 lines   SLL
+#
+# So a deletion of the four enum-keyed tables -- which is what R14 asks
+# for, and what an occupancy of 0 licenses -- would have silently dropped
+# `.refine` from the rows of the tables that REPLACE them: `full_entry()`
+# is the single source for the QEMU-identity payload too, and
+# champsim_tracer_qemu_ident_aarch64.h alone carries 218 rows naming
+# refine_arm64_ldst_access.  The assignments move here, where they are a
+# statement with a reason, before anything is deleted.
+#
+# WHY EACH ONE EXISTS -- one sentence per refiner, so a reader need not
+# infer the rule from the member list:
+#
+#   refine_x86_call_branch / refine_x86_jump_branch
+#       X86_INS_CALL and X86_INS_JMP each cover the direct and the
+#       indirect form; the branch type is decided by the OPERAND shape,
+#       which is per instance.
+#   refine_arm64_ldst_access
+#       one Capstone id covers the pre/post-index writeback forms and the
+#       plain form, and only the operand list says which registers the
+#       access actually reads and writes.
+#   refine_arm64_sysop
+#       SYS / SYSL cover the whole system-operation space under one id;
+#       the operation is in the CRn/CRm/op fields, which are operands.
+#   refine_mips_nop_alias
+#       `nop` and `ssnop` are MIPS_INS_SLL with a zero register field;
+#       Capstone reports the id and prints the alias, so only the printed
+#       form separates the shift from the hint.
+#
+# refine_arm64_fp_vec and refine_arm64_cmp_alias are deliberately ABSENT:
+# they are assigned by the classifier arms in `full_entry()` from
+# FP_VEC_PROMOTE_OPS and CMP_ALIAS_PROMOTE_INSNS, were never round-tripped,
+# and listing them here would move a live derivation into a frozen list.
+REFINE_OVERRIDES: dict[str, dict[str, str]] = {
+    "x86": {
+        "X86_INS_CALL": "refine_x86_call_branch",
+        "X86_INS_JMP":  "refine_x86_jump_branch",
+    },
+    "aarch64": {
+        "AARCH64_INS_LDAR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDARB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDARH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDNP":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDP":    "refine_arm64_ldst_access",
+        "AARCH64_INS_LDPSW":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDR":    "refine_arm64_ldst_access",
+        "AARCH64_INS_LDRB":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDRH":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDRSB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDRSH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDRSW":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTRB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTRH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTRSB": "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTRSH": "refine_arm64_ldst_access",
+        "AARCH64_INS_LDTRSW": "refine_arm64_ldst_access",
+        "AARCH64_INS_LDUR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_LDURB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDURH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_LDURSB": "refine_arm64_ldst_access",
+        "AARCH64_INS_LDURSH": "refine_arm64_ldst_access",
+        "AARCH64_INS_LDURSW": "refine_arm64_ldst_access",
+        "AARCH64_INS_STLR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STLRB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_STLRH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_STNP":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STP":    "refine_arm64_ldst_access",
+        "AARCH64_INS_STR":    "refine_arm64_ldst_access",
+        "AARCH64_INS_STRB":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STRH":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STTR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STTRB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_STTRH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_STUR":   "refine_arm64_ldst_access",
+        "AARCH64_INS_STURB":  "refine_arm64_ldst_access",
+        "AARCH64_INS_STURH":  "refine_arm64_ldst_access",
+        "AARCH64_INS_SYS":    "refine_arm64_sysop",
+        "AARCH64_INS_SYSL":   "refine_arm64_sysop",
+    },
+    "riscv": {},
+    "mips": {
+        "MIPS_INS_SLL": "refine_mips_nop_alias",
+    },
+}
+
+
 # Per-ISA mnemonics that the access-pattern classifier mis-classifies
 # as dep_all_to_all because Capstone's source-table operand list is
 # either uniformly under-tagged (single CS_AC_WRITE or CS_AC_READ
@@ -5367,7 +5473,13 @@ def full_entry(info: IsaInfo, const_name: str,
         return None
     elif new.op == "GEN_OP_UNKNOWN" and old is not None:
         new = old.without_refine()
-    refine = old.refine if old and old.refine else None
+    # `.refine` IS STATED, NOT READ BACK.  It used to be
+    # `old.refine if old and old.refine else None` -- the generated header
+    # was the store, and this script re-read its own last output.  See
+    # REFINE_OVERRIDES for the measurement that made that a blocker rather
+    # than a style point: it is the ONLY column the round trip carried, and
+    # it feeds the QEMU-identity tables too.
+    refine = REFINE_OVERRIDES.get(info.key, {}).get(const_name)
     # Classifier-driven .refine: AArch64 has one Capstone insn id
     # per mnemonic for both the scalar-FP and packed-vector forms
     # (FDIV Dd vs FDIV Vd.2D).  The static table classifies the

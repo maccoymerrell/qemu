@@ -2824,6 +2824,18 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
             /* 4.1.1-4.1.3: No preceding lock, 66, f2, f3, or rex prefixes. */
             if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ
                              | PREFIX_LOCK | PREFIX_DATA | PREFIX_REX)) {
+                /*
+                 * The other pre-publish decline, and it says so for the same
+                 * reason the decode_insn() one below does: the prefix stream
+                 * itself is not an encoding, no table row is ever consulted,
+                 * and #UD is raised.  Stating it here rather than leaving it
+                 * silent keeps the two arms of one fact consistent -- see the
+                 * decode_insn() site for what the silence costs.  This arm has
+                 * NO measured occupant (the 1,459 x86_64 enum-table rows at
+                 * 290215f0d8 are all the decode_insn() route), so it moves no
+                 * row today; it is here so the pair cannot drift apart.
+                 */
+                plugin_gen_record_insn_undecoded();
                 goto illegal_op;
             }
 #ifdef TARGET_X86_64
@@ -2893,6 +2905,50 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     decode.cc_op = -1;
     decode.b = b;
     if (!decode_insn(s, env, decode_func, &decode)) {
+        /*
+         * "NOT AN INSTRUCTION" HAS TWO SPELLINGS ON THIS TARGET AND ONLY
+         * ONE OF THEM USED TO SAY SO.
+         *
+         * gen_unknown_opcode() states plugin_gen_record_insn_undecoded()
+         * where `.gen == NULL` sends the bytes to unknown_op below -- "no
+         * table row claimed these bytes".  decode_insn() returning false is
+         * the SAME fact reached by the other route: the tables were walked,
+         * they produced a candidate row, and the bytes then failed to be a
+         * valid encoding OF that row -- a prefix the row does not take
+         * (validate_sse_prefix), a control register the ISA does not define
+         * (X86_TYPE_C's `n != 0,2,3,4,8`), a debug register above 7, a
+         * segment field naming CS as a destination, a register-only form
+         * given `mod != 3` or a memory-only form given `mod == 3`.  No other
+         * row covers them, nothing is generated, and #UD is raised.  QEMU has
+         * no rule for these bytes, exactly as at unknown_op.
+         *
+         * IT MATTERS BECAUSE THE SILENCE IS WHAT THE ENUM TABLE ANSWERS.  The
+         * publish call below is never reached on this path, so `decode_id`
+         * is 0, and champsim_tracer's `classify_insn_id()` falls to the
+         * Capstone enum row.  MEASURED at 290215f0d8 over the whole x86_64
+         * encoding population (6,765,972 corpus rows, srcenc_sled --mech,
+         * both wp arms): 1,459 encodings across 22 mnemonics reach the wire
+         * classified by that table, and every one of them is this route --
+         *
+         *     f30faee8  0F AE /5 reg with F3   Capstone: `incsspd`
+         *     660faef0  0F AE /6 reg with 66   Capstone: `tpause`
+         *     f30fae30  0F AE /6 mem with F3   Capstone: `clrssbsy`
+         *     0f2008    0F 20 /1               Capstone: `movq %cr1,%rax`
+         *     8ec8      8E /1                  Capstone: `movl %eax,%cs`
+         *     0f7900    0F 79 with mod != 3    Capstone: `vmwriteq`
+         *
+         * -- six shapes of one mechanism.  Not one of them executes: this
+         * machine has no CET, no WAITPKG, no PT, no VMX in TCG, no CR1, and
+         * MOV to CS is not an encoding at all.  A trace that says `tpause`
+         * names an instruction the emulator declined to have.
+         *
+         * STATED AT THE GOTO AND NOT AT THE LABEL, which is the same
+         * discipline gen_unknown_opcode()'s own comment states: `illegal_op`
+         * is also reached from has_cpuid_feature() and from the X86_CHECK_*
+         * arms BELOW the publish, and those are encodings a rule DID match.
+         * A flag set at the label would call `hlt` undecoded.
+         */
+        plugin_gen_record_insn_undecoded();
         goto illegal_op;
     }
     if (!decode.e.gen) {

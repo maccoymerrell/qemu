@@ -4805,10 +4805,24 @@ static void gen_SYSCALL(DisasContext *s, X86DecodedInsn *decode)
      * this is the STATIC fact about the encoding (R20).  The correct path --
      * the one a trace publishes and a reference measures -- takes the stores.
      *
-     * RFLAGS is not stated here.  Only the system helper writes it (masking
-     * by env->fmask), it does so through env->eflags rather than the lazy
-     * cc_* quartet, and *-linux-user deliberately leaves the word alone; the
-     * destination adjudication ledger carries that register with its ruling.
+     * AND RFLAGS, WHICH IS THE THIRD AND IS STATED FOR THE SAME REASON.
+     * Long-mode SYSCALL performs `RFLAGS <- RFLAGS AND NOT(IA32_FMASK)` with
+     * RF cleared; the write is unconditional in 64-bit mode and only the
+     * MASK's content depends on a kernel-owned MSR.  In softmmu the write
+     * HAPPENS, inside helper_syscall(), through env->eflags rather than the
+     * lazy cc_* quartet, so no op names those bytes and QEMU's ordered write
+     * list is silent; in *-linux-user the masking is deliberately not
+     * emulated at all, because IA32_FMASK belongs to a kernel this mode does
+     * not have and that mode's single `syscall` models the SYSRET return
+     * too, which reloads RFLAGS from R11 -- so its net effect on the word is
+     * a write of the value the guest already had.  Either way R15 is
+     * explicit that a lowering eliding a register the encoding names is not
+     * grounds to drop it, and the destination adjudication ledger row for
+     * this register (champsim_tracer_qdep.cc) already named exactly this
+     * statement as the change that supersedes it.  BY NAME, because
+     * env->eflags carries no insn_dataflow_declare_regfile() of its own --
+     * the route SYSRET's own write already takes at
+     * target/i386/tcg/cpl0_operands.c.inc.
      *
      * Capture only; no op is emitted, altered or suppressed.
      */
@@ -4819,6 +4833,7 @@ static void gen_SYSCALL(DisasContext *s, X86DecodedInsn *decode)
         insn_dataflow_note_stated_write_env(
             offsetof(CPUX86State, regs[11]),
             sizeof(((CPUX86State *)0)->regs[0]));
+        insn_dataflow_note_stated_write_name("eflags");
     }
 #endif
 #endif

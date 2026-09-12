@@ -229,7 +229,12 @@ _EXCARG = re.compile(r"^st(8|16|32|64)?_i(32|64) \$0x[0-9a-f]+,env,\$")
 #    which is evidence the datapath ran, whatever became of the result.  A
 #    full liveness sweep would delete that evidence and would be the
 #    over-widening this comment exists to refuse.
-_CONSTTMP = re.compile(r"^movi?_i(32|64) (loc|tmp)\d+,\$0x[0-9a-f]+$")
+_DEFTMP = re.compile(r"^([a-z0-9_]+) ((?:loc|tmp)\d+),")
+#: Ops that carry an effect no read-set can account for, and so are never
+#: eligible for the dead-value pass however unread their first operand
+#: looks: calls (live ones did something), any store, any branch, any
+#: label, and the block terminators.
+_SIDE = re.compile(r"^(call|st|qemu_st|qemu_ld|brcond|setcond|goto|exit_tb|set_label|discard|plugin)")
 
 
 def classify(op_text, entry):
@@ -287,7 +292,7 @@ def classify(op_text, entry):
     # a brcond and the code that runs instead sits after a `set_label`, so a
     # label RE-ARMS the walk.  Work BEFORE the raise counts as it always did,
     # which is what keeps "computes, then traps" reading DATAPATH.
-    work, dead = [], False
+    live, dead = [], False
     for o in ops:
         if _EXC.search(o):
             dead = True
@@ -297,10 +302,67 @@ def classify(op_text, entry):
             continue
         if dead:
             continue
-        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)
-                or _CONSTTMP.match(o)):
+        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)):
             continue
-        work.append(o)
+        live.append(o)
+
+    # A VALUE NOTHING LIVE EVER READS IS NOT WORK, AND THE ARGUMENTS OF A DEAD
+    # CALL ARE EXACTLY THAT.
+    #
+    # The rule above kills the helper call after an unguarded raise.  It does
+    # NOT kill the moves that set that call's arguments up, because those sit
+    # BEFORE the raise in the op list.  On the swept mipsel model, `dpax.w.ph
+    # $ac3,zero,zero` and `dpax.w.ph $ac3,zero,at` are the SAME trap one
+    # register field apart --
+    #
+    #     mov_i32 loc2,$0x3        mov_i32 loc2,$0x3
+    #     mov_i32 loc3,$0x0        mov_i32 loc3,$0x0
+    #     mov_i32 loc4,$0x0        mov_i32 loc4,at          <-- the only change
+    #     mov_i32 PC,$0x400074     mov_i32 PC,$0x400074
+    #     call raise_exception_err call raise_exception_err  (EXCP_RI, both)
+    #     call dpax_w_ph ...       call dpax_w_ph ...        (dead, both)
+    #
+    # -- and a filter that struck only CONSTANT argument moves gave them
+    # DIFFERENT verdicts: TRAP-ONLY for the first, DATAPATH for the second.
+    # Same instruction, same unconditional raise, same Illegal Instruction
+    # from the guest, two answers.  That is the instrument deciding a trap by
+    # which register field the sled happened to sweep.
+    #
+    # So the rule is the real one and not a spelling filter: an op is dead if
+    # every value it produces is read by nothing live.  Applied to a fixpoint,
+    # because the arguments of a dead op are themselves dead.
+    #
+    # IT CANNOT REMOVE AN ARCHITECTURAL EFFECT, BY CONSTRUCTION.  Only an op
+    # whose FIRST operand is a TEMP (`loc7`, `tmp4`) is eligible, and only
+    # when it is not a call, a store, a branch or a label.  A write to a guest
+    # register global (`mov_i32 v0,loc2`), a `qemu_st`, a live call and every
+    # env store are ineligible and stay work whatever reads them -- which is
+    # what keeps "does real work, THEN traps" reading DATAPATH.
+    #
+    # THE READ TEST IS DELIBERATELY OVER-APPROXIMATE: a temp counts as read if
+    # its name appears anywhere in any other live op, destination position
+    # included.  Over-approximating keeps ops LIVE, and live means DATAPATH,
+    # which is the conservative verdict for a probe whose whole purpose is to
+    # find traps.  An instrument that errs here should err towards saying the
+    # datapath ran.
+    changed = True
+    while changed:
+        changed = False
+        for i, o in enumerate(live):
+            if o is None or _SIDE.match(o) or o.startswith("set_label"):
+                continue
+            m = _DEFTMP.match(o)
+            if not m:
+                continue
+            name = m.group(2)
+            rx = re.compile(r"\b%s\b" % re.escape(name))
+            if any(p is not None and j != i and rx.search(p)
+                   for j, p in enumerate(live)):
+                continue
+            live[i] = None
+            changed = True
+    work = [o for o in live if o is not None and not o.startswith("set_label")]
+
     if not work and any(_EXC.search(o) for o in ops):
         return "TRAP-ONLY"
     return "DATAPATH"
@@ -405,6 +467,18 @@ def selftest(qemu):
                 probe_one((mq, "mipsel", "24Kf", "00000240", tmp)) == "TRAP-ONLY")
             # `extp at,$ac3,0x0` on a model with the DSP ASE disabled: the
             # raise is unconditional and the helper call after it is dead.
+            # THE WITNESS PAIR.  Same instruction, same unconditional RI
+            # raise, one register field apart.  Before the dead-value pass
+            # these read TRAP-ONLY and DATAPATH respectively.
+            chk("mipsel dpax.w.ph $ac3,zero,zero reads TRAP-ONLY",
+                probe_one((mq, "mipsel", "24Kf", "301a007c", tmp))
+                == "TRAP-ONLY")
+            chk("mipsel dpax.w.ph $ac3,zero,at reads TRAP-ONLY TOO",
+                probe_one((mq, "mipsel", "24Kf", "301a017c", tmp))
+                == "TRAP-ONLY")
+            chk("mipsel add v0,a0,a1 (computes, then MAY trap) reads DATAPATH",
+                probe_one((mq, "mipsel", "24Kf", "20108500", tmp))
+                == "DATAPATH")
             chk("mipsel extp on a no-DSP model reads TRAP-ONLY",
                 probe_one((mq, "mipsel", "24Kf", "b818017c", tmp))
                 == "TRAP-ONLY")
@@ -478,17 +552,58 @@ def selftest(qemu):
                  " mov_i32 loc2,$0x3\n"
                  " call extp,$0x0,$1,at,loc2,loc3,env\n"
                  " set_label $L0\n exit_tb $0x1\n", 0x400074) == "TRAP-ONLY")
+    # A LABEL AFTER THE RAISE RE-ARMS THE WALK.  The work after the label is
+    # written LIVE (its sum reaches a guest register), because a dead sum
+    # would be struck by the dead-value pass and the arm would then be
+    # passing for the wrong reason -- it would no longer be testing the
+    # label at all.
     chk("classifier: a label after the raise re-arms the walk",
         classify(" ---- 0000000000400074 0 0\n mov_i32 PC,$0x400074\n"
                  " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"
-                 " set_label $L1\n add_i32 loc2,loc3,loc4\n", 0x400074)
+                 " set_label $L1\n add_i32 loc2,loc3,loc4\n"
+                 " mov_i32 v0,loc2\n", 0x400074)
         == "DATAPATH")
-    chk("classifier: work BEFORE the raise still counts",
-        classify(" ---- 0000000000400074 0 0\n add_i32 loc2,loc3,loc4\n"
+    # WORK BEFORE THE RAISE STILL COUNTS -- and the arm is now the REAL shape.
+    # It used to plant `add_i32 loc2,loc3,loc4` + a raise, with loc2 read by
+    # nothing; no target emits that, and under the dead-value pass it is
+    # correctly dead.  The genuine "computes, then traps" lowering is mipsel
+    # `add v0,a0,a1` (QEMU, -d op, verbatim): the sum is computed, tested for
+    # overflow, the raise is GUARDED by the brcond, and the sum is written to
+    # a guest register after the label.  Every part of that is live and the
+    # verdict must stay DATAPATH.
+    chk("classifier: work BEFORE the raise still counts (real trapping add)",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc3,a0\n"
+                 " mov_i32 loc4,a1\n add_i32 loc2,loc3,loc4\n"
+                 " xor_i32 loc3,loc3,loc4\n xor_i32 loc4,loc2,loc4\n"
+                 " andc_i32 loc3,loc4,loc3\n"
+                 " brcond_i32 loc3,$0x0,ge,$L1\n"
+                 " call raise_exception,$0x8,$0,env,$0x15\n"
+                 " set_label $L1\n mov_i32 v0,loc2\n",
+                 0x400074) == "DATAPATH")
+    # ... and the same shape with the raise made UNCONDITIONAL still counts,
+    # because the sum reaches a guest register before it.  This is the arm
+    # that stops the dead-value pass from ever eating an architectural write.
+    chk("classifier: a guest-register write before an unguarded raise counts",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc3,a0\n"
+                 " add_i32 loc2,loc3,loc3\n mov_i32 v0,loc2\n"
+                 " mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0xd,$0x0\n",
+                 0x400074) == "DATAPATH")
+    chk("classifier: a store before an unguarded raise counts",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc3,a0\n"
+                 " qemu_st_a32_i32 loc3,loc4,$0x0,$0x2\n"
                  " mov_i32 PC,$0x400074\n"
                  " call raise_exception_err,$0x8,$0,env,$0xd,$0x0\n",
                  0x400074) == "DATAPATH")
     # THE CONSTANT-ARGUMENT RULE, AND THE THREE THINGS IT MAY NOT EAT.
+    chk("classifier: a REGISTER read into a dead call's argument is dead too "
+        "(the pair the constant filter answered two ways)",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc2,$0x3\n"
+                 " mov_i32 loc3,$0x0\n mov_i32 loc4,at\n"
+                 " mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"
+                 " call dpax_w_ph,$0x0,$0,loc2,loc3,loc4,env\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400074) == "TRAP-ONLY")
     chk("classifier: helper arguments materialised above an unguarded raise "
         "are not datapath work",
         classify(" ---- 0000000000400074 0 0\n mov_i32 loc2,$0x3\n"
@@ -502,11 +617,23 @@ def selftest(qemu):
                  " mov_i32 PC,$0x400074\n"
                  " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n",
                  0x400074) == "DATAPATH")
-    chk("classifier: an op that READS temps is work even if its result dies",
+    # RETIRED ARM, AND WHY.  This pass first added
+    #
+    #     "an op that READS temps is work even if its result dies" -> DATAPATH
+    #
+    # to hold the constant-only filter to a narrow scope.  The mipsel witness
+    # pair REFUTES that principle on a real encoding: `mov_i32 loc4,at` reads
+    # machine state, its result dies into an unreachable helper call, and the
+    # guest answers the instruction with SIGILL.  Calling that read "work"
+    # gave one trap two verdicts.  The arm asserted the rule, the rule is
+    # superseded, and the arm goes with it rather than being worked around.
+    # What replaces it is stronger and is the thing that was actually at
+    # stake: the pass may never eat an architectural effect (the three arms
+    # above) and may never fire where there is no raise (the arm below).
+    chk("classifier: with NO raise, a wholly dead block is still DATAPATH "
+        "-- the pass cannot invent a trap",
         classify(" ---- 0000000000400074 0 0\n mov_i32 loc2,$0x3\n"
-                 " add_i32 loc5,loc3,loc4\n mov_i32 PC,$0x400074\n"
-                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n",
-                 0x400074) == "DATAPATH")
+                 " add_i32 loc5,loc3,loc4\n", 0x400074) == "DATAPATH")
     chk("classifier: a constant into a temp a LIVE op consumes leaves the "
         "live op standing",
         classify(" ---- 0000000000400078 0 0\n mov_i64 loc0,$0x3c\n"

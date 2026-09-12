@@ -379,10 +379,72 @@ EOF_F
     fi
     sed 's/^/    /' "$FIX/mask.out"
 
+    echo "=== SELFTEST ARM G: a contract-SKIPPED arm counts, a VANISHED one does not"
+    # FINDING 99-A, both directions.  `isax_srcenc_gate.sh` runs two LAYERS
+    # per ISA, so each arm shape has eight arms and the manifest's floor of 8
+    # counts them.  Since exec170 a BARE arm SKIPS the fields layer -- the
+    # layer classifies from QEMU's decode_id, that comes from the sled's
+    # mechanism corpus, and a bare arm has no corpus -- so the bare reports
+    # carry FOUR scored arms and say `fields_layer_skipped=4` on their
+    # roll-up.  The floor read `VACUOUS: scored 4, floor 8` on a number that
+    # was right, because two harness contracts disagreed about what an arm is.
+    #
+    # The floor is NOT lowered to 4: that would buy the contract-skip at the
+    # price of the thing the floor is for.  It counts arms ACCOUNTED FOR --
+    # scored, plus skipped with the reason on the report's own line -- so
+    # 4+4 passes and 4+3 fails.  Both halves are required here, because a
+    # rule that only ever passes is not a rule.
+    G="$SCRATCH/skip"; rm -rf "$G"; mkdir -p "$G"
+    mk_isax() {   # mk_isax <file> <n_scored> <skipped>
+        local f=$1 n=$2 sk=$3 i=0
+        : > "$f"
+        while [ $i -lt "$n" ]; do
+            echo "boundary isa$i rc=0" >> "$f"
+            echo "# isa=isa$i layer=boundary dead_allow_rules=0 unallowed=0" \
+                 >> "$f"
+            i=$((i+1))
+        done
+        echo "ALL_ARMS_DONE worst_rc=0 unscored_arms=0" >> "$f"
+        [ "$sk" = "none" ] || echo "roll-up: fields_layer_skipped=$sk (no" \
+            "identity corpus in this arm shape) worst=0" >> "$f"
+    }
+    # The gate's own rc cannot decide this arm: `--only isax` leaves every
+    # other manifest row NOT RUN, which is itself a failure -- correctly, and
+    # deliberately, since a gate that scores a subset in silence is the shape
+    # this file exists against.  So the arm reads the `isax bare` ROW, which
+    # is the only thing these four fixtures move.
+    g_check() {   # g_check <label> <n> <skipped> <want: pass|vacuous|noline>
+        mkdir -p "$G/root/statics/isax"
+        mk_isax "$G/root/statics/isax/rc.txt" "$2" "$3"
+        "$PY" "$SCORE" "$G/root" --only isax > "$G/$1.out" 2>&1 || true
+        local row
+        row=$(grep -E '^isax +bare ' "$G/$1.out")
+        case $4 in
+          pass)    case "$row" in *" ok") return 0 ;; esac ;;
+          vacuous) grep -q 'VACUOUS' "$G/$1.out" && return 0 ;;
+          noline)  grep -q 'fields_layer_skipped' "$G/$1.out" && return 0 ;;
+        esac
+        echo "    ARM G FAILED at $1 (wanted $4); the isax row read: $row" >&2
+        cat "$G/$1.out" >&2
+        exit 1
+    }
+    g_check g1 4 4 pass
+    echo "    4 scored + 4 contract-skipped = 8 accounted: PASS, as required"
+    g_check g2 4 3 vacuous
+    echo "    4 scored + 3 skipped = 7: VACUOUS, as required (an arm that is"
+    echo "    neither scored nor declared skipped is the hole the floor is for)"
+    g_check g3 4 none noline
+    echo "    4 scored, NO roll-up line: red naming the missing line, not a"
+    echo "    silent skipped=0"
+    g_check g4 8 none pass
+    echo "    8 scored, no roll-up line needed: PASS (a report that met its"
+    echo "    floor is not made to produce an accounting it does not need)"
+
     echo ""
-    echo "SELFTEST PASSED -- 6 arms: clean green, planted red, missing red,"
+    echo "SELFTEST PASSED -- 7 arms: clean green, planted red, missing red,"
     echo "stale red, the staleness reference proven to cover the emulators,"
-    echo "and the behaviour digest proven to discriminate in both directions."
+    echo "the behaviour digest proven to discriminate in both directions, and"
+    echo "the contract-skip accounting proven in all four of its readings."
     echo "evidence: $SCRATCH"
     exit 0
 }

@@ -122,6 +122,58 @@ FLOOR = {
     'depmapprec': re.compile(r'^TOTAL FACTS = (\d+)', re.M),
 }
 
+# AN ARM SKIPPED BY CONTRACT IS AN ARM ACCOUNTED FOR -- FINDING 99-A.
+#
+# `isax_srcenc_gate.sh` runs two LAYERS per ISA, so the bare and the
+# `--srcenc` shapes each carry eight arms and the manifest's floor of 8 is
+# the count of them.  Since exec170 a BARE arm SKIPS the fields layer: the
+# layer's classification comes from QEMU's `decode_id`, that is read from the
+# sled's mechanism corpus, and a bare arm has no corpus and so no identity.
+# The skip is the layer's contract, not a hole -- running it without an
+# identity is what made every encoding read GEN_OP_UNKNOWN and turned this
+# gate from 20/20 into 8-of-20 while nothing on the wire moved (98-F).
+#
+# The floor then read VACUOUS at `scored 4, floor 8` on both bare rows: the
+# number was RIGHT and the leg failed anyway, because two harness contracts
+# disagreed about what an arm is.
+#
+# THE FLOOR IS NOT LOWERED.  Lowering it to 4 would buy the contract-skip at
+# the price of the thing the floor is for: a bare arm that lost its BOUNDARY
+# layer as well would still score 4 and pass.  Instead the floor counts arms
+# ACCOUNTED FOR -- scored, plus skipped with the reason on the report's own
+# roll-up line -- so 4 + 4 = 8 passes and 4 + 3 fails.  Only an arm that is
+# neither scored nor declared skipped is vacuity, which is what the floor
+# always meant.
+#
+# AND THE ACCOUNTING IS ASKED FOR ONLY WHEN IT DECIDES SOMETHING.  A report
+# that already scored its whole floor needs no skip line and is not made to
+# produce one -- the roll-up postdates several banked evidence roots, and
+# demanding it of a report whose eight arms all ran would refuse a correct
+# measurement for a reason that has nothing to do with it.  A report SHORT of
+# its floor is the case where the difference matters, and there the line's
+# ABSENCE is a refusal, never a skipped=0: a missing arm and an arm skipped
+# by contract are the two readings this distinguishes, and reading silence as
+# the second is the silent false success the rest of this file is built
+# against.
+SKIPPED = re.compile(r'^roll-up:.*fields_layer_skipped=(\d+)', re.M)
+
+
+def accounted(kind, text, path, scored, floor):
+    """-> (scored_including_contract_skips, error_or_None) for the isax legs."""
+    if not kind.startswith('isax') or scored >= floor:
+        return scored, None
+    m = SKIPPED.search(text)
+    if not m:
+        return scored, (
+            'SHORT OF FLOOR (%d of %d) AND NO `roll-up: ... '
+            'fields_layer_skipped=` LINE in %s.  isax_srcenc_gate.sh writes '
+            'that line on every run, and it is what tells an arm SKIPPED by '
+            'the fields layer\'s contract apart from an arm that vanished.  '
+            'Without it the shortfall cannot be read in either direction, '
+            'and it must not be read as a clean skipped=0 (FINDING 99-A).'
+            % (scored, floor, path))
+    return scored + int(m.group(1)), None
+
 
 class Row(object):
     __slots__ = ('leg', 'isa', 'report', 'ceiling', 'floor',
@@ -343,6 +395,9 @@ def score_one(row, root, binary_mtime):
                     'denominator cannot be believed.' % path)
         scored = int(next(g for g in fm.groups() if g))
 
+    scored, why = accounted(kind, text, path, scored, row.floor)
+    if why:
+        return (False, headline, None, why)
     if scored < row.floor:
         return (False, headline, scored,
                 'VACUOUS: scored %d, floor %d.  A leg that compared almost '

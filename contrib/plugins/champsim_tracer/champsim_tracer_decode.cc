@@ -1681,113 +1681,50 @@ void decode_detail_to_generic(uint64_t pc,
      * so it needs the explicit operands already populated. */
 
     /*
-     * Operand processing: use Capstone access flags where available
-     * (x86/AArch64); otherwise fall back to an opcode-indexed lookup
-     * where the first register operand is the destination for most
-     * opcodes (not stores/cmp/branches/ret/syscall/nop).
+     * Operand processing.  What survives the walk is the MEM operand's
+     * address-register set and the immediate; the register arms are both
+     * gone (R14.2 / J7) and so is everything that fed them.
+     *
+     * THREE DEAD THINGS LEFT WITH THE WRITE ARM and are named because each
+     * was load-bearing until it was not.  `opcode_first_is_dst[]` decided,
+     * for the ISAs whose Capstone operands carry no access flags, WHICH
+     * register operand was the destination -- the kadd/kunpck/vpermil2
+     * defect class is what getting it wrong looked like.  `have_access_info`
+     * chose between the flags and that positional fallback, excluding the
+     * boundary's own appended SYSREG operands so one of them could not
+     * switch a whole instruction out of the fallback.  `dst_reg_idx` carried
+     * the fallback's answer into the loop.  All three answer "which operand
+     * does this instruction WRITE", and QEMU answers that now.
      */
-    static const auto opcode_first_is_dst = []() {
-        std::array<bool, GEN_OP_COUNT> a{};
-        a.fill(true);
-        a[GEN_OP_STORE]   = false;
-        a[GEN_OP_CMP]     = false;
-        a[GEN_OP_BRANCH]  = false;
-        a[GEN_OP_RET]     = false;
-        a[GEN_OP_SYSCALL] = false;
-        a[GEN_OP_NOP]     = false;
-        /* TEST discards its result and writes only the flags register
-         * — it never writes an operand, so the fallback must not
-         * invent a destination (ktest* fabricated a k-register write
-         * through this hole). */
-        a[GEN_OP_TEST]    = false;
-        return a;
-    }();
-
-    /*
-     * "Does Capstone tell us the direction of this instruction's
-     * operands?"  Only the operands Capstone itself reported can
-     * answer that.  A QEMU_PLUGIN_OP_SYSREG operand is APPENDED by the
-     * boundary -- an x86 system register or a RISC-V CSR the encoding
-     * implies but the disassembler does not name -- and it always
-     * carries a boundary-derived access, so counting it here would let
-     * one appended operand switch the whole instruction out of the
-     * positional fallback and silently drop every register Capstone
-     * reported with access == 0.  Measured: without this exclusion,
-     * naming SSP on `rdsspq %rax` costs the %rax operand entirely
-     * (SRC{REG_GPR0} -> SRC{}), because Capstone reports that operand
-     * access == 0 and the fallback is what was placing it.
-     */
-    bool have_access_info = false;
-    for (uint8_t i = 0; i < info->n_operands && !have_access_info; i++) {
-        if (info->operands[i].type == QEMU_PLUGIN_OP_SYSREG) {
-            continue;
-        }
-        if (info->operands[i].access != 0) {
-            have_access_info = true;
-        }
-    }
-
-    /*
-     * Fallback destination slot: the operand ORDER is the syntax's,
-     * and QEMU runs Capstone in AT&T syntax for x86, which lists the
-     * destination LAST — so the x86 fallback destination is the last
-     * register operand.  The dest-first ISAs (MIPS / RISC-V / AArch64)
-     * keep the first register operand.  Getting this wrong assigns
-     * the write to a source and drops the true destination (the
-     * kadd/kunpck/vpermil2 defect class).
-     */
-    uint8_t dst_reg_idx = UINT8_MAX;
-    if (!have_access_info && opcode_first_is_dst[out->opcode]) {
-        for (uint8_t i = 0; i < info->n_operands; i++) {
-            if (info->operands[i].type != QEMU_PLUGIN_OP_REG) {
-                continue;
-            }
-            dst_reg_idx = i;
-            if (trace_isa != TRACE_ISA_X86) {
-                break;          /* dest-first: first REG operand */
-            }                   /* AT&T: last REG operand wins */
-        }
-    }
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const qemu_plugin_operand *op = &info->operands[i];
 
         switch (op->type) {
-        case QEMU_PLUGIN_OP_REG: {
+        case QEMU_PLUGIN_OP_REG:
             /*
-             * THE READ ARM IS GONE (R14.2 / J7).  A register operand the
-             * boundary marks READ used to be added to src_regs[] here, and
-             * that was the wire's source list.  It is not any more:
-             * qemu_named_regs() seats QEMU's own ordered read list, and the
-             * survivor rows carry what QEMU does not state, so this call
-             * added nothing the wire did not already have -- it only kept a
-             * live Capstone route into the source side, which J7 forbids
-             * ("Capstone not demoted, Capstone REMOVED ... if you leave it
-             * there, you will rely on it").
+             * BOTH ARMS ARE GONE (R14.2 / J7), and the second one is why
+             * this case still exists rather than falling to `default`: it
+             * is the one place that says so.
              *
-             * The WRITE arm stays, and that is a MEASUREMENT rather than a
-             * plan (exec184).  Removed -- here, at the SYSREG arm below and
-             * at the implicit regs_write[] fold -- x86_64 `/bin/echo hi`
-             * publishes `mov %sp` where it published `mov %sp -> %gp5`, and
-             * `jcc` with no `-> %pc`: every destination on every
-             * instruction.  The two pieces of machinery that do it are named
-             * where they live, `dst_precheck()`'s `n_dst_regs == 0` return
-             * and `dst_row_seated()`'s REG_PC discriminator, and the second
-             * of them needs a QEMU-side statement before this arm can go.
+             * The READ arm went at f9ce637d94.  qemu_named_regs() seats
+             * QEMU's own ordered read list and the survivor rows carry what
+             * QEMU does not state, so the call added nothing the wire did
+             * not already have -- it only kept a live Capstone route into
+             * the source side, which J7 forbids ("Capstone not demoted,
+             * Capstone REMOVED ... if you leave it there, you will rely on
+             * it").
              *
-             * dst_reg_idx keeps its meaning for the same reason: with no
-             * access flags the walk must still decide which register
-             * operand is the destination, and the source half of that
-             * decision simply no longer has anywhere to go.
+             * The WRITE arm went here, with the SYSREG arm below and the
+             * implicit regs_write[] fold: the wire's destination list is
+             * QEMU's write rows, built by seat_dst_for_qemu() and admitted
+             * by dst_precheck(), and R10.1's block-epilogue separation is
+             * QEMU's own statement (dst_row_seated()).  exec184 measured
+             * what removing it cost BEFORE those three existed -- `mov %sp`
+             * where the wire published `mov %sp -> %gp5`, `jcc` with no
+             * `-> %pc`, every destination on every instruction -- which is
+             * the reading that named them.
              */
-            if (have_access_info) {
-                if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                    add_dst_cap_reg(out, out_names, op->reg_id);
-                }
-            } else if (i == dst_reg_idx) {
-                add_dst_cap_reg(out, out_names, op->reg_id);
-            }
             break;
-        }
         case QEMU_PLUGIN_OP_SYSREG: {
             /*
              * A system / control register named by the encoding but
@@ -1822,23 +1759,7 @@ void decode_detail_to_generic(uint64_t pc,
              * survivor table where it does not.  The WRITE arm stays with
              * the rest of the destination walk.
              */
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                add_dst_reg(out, out_names, gen, sys_key);
-                /*
-                 * `msr nzcv, x3` really does define the arithmetic
-                 * flags, so it owes the CST_FID_METAFLAGS record an
-                 * arithmetic flag-setter emits.  The condition mirrors
-                 * the .is_int_flags marker on the reg table: REG_FLAGS
-                 * carries arithmetic condition flags only on the ISAs
-                 * that supply a metaflags mapper — on MIPS the same ID
-                 * names DSP status bits, which no mapper turns into
-                 * Z/N/C/V.
-                 */
-                if (gen == REG_FLAGS &&
-                    isa_properties[trace_isa].flags_to_metaflags) {
-                    out->writes_int_flags = true;
-                }
-            }
+            (void)gen; (void)sys_key;
             break;
         }
         case QEMU_PLUGIN_OP_IMM:
@@ -1931,59 +1852,31 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    if (isa_properties[trace_isa].include_implicit_regs) {
-        /*
-         * The implicit-READ fold is deleted with the two operand arms
-         * above.  Capstone's regs_read[] was the last route by which a
-         * register reached src_regs[] without QEMU or a survivor row
-         * saying so; every register it supplied is in one of those two
-         * now, which is what MISSING = 0 on both corpora measures.
-         *
-         * regs_write[] stays, and so does the MIPS $at correction below
-         * it: they feed the destination list, which this wave does not
-         * touch.
-         */
-        for (uint8_t i = 0; i < info->n_regs_write; i++) {
-            /*
-             * MIPS branches do not write $at, and LLVM's MIPS tables say
-             * they do.  Every conditional branch -- `bne`, `beq`, `bgez`,
-             * `bltz`, `blez`, `bgtz`, and the `b` macro -- carries an
-             * implicit definition of AT, which Capstone reports verbatim in
-             * regs_write.  Both decoders agree because both read the same
-             * table: `isaxcheck --isa=mipsel --hex=feff0915` prints WR{r1}
-             * on the Capstone line AND on the LLVM MC line, for
-             * `bne $t0, $t1`.  The implicit def is there for the
-             * long-branch expansion, where the ASSEMBLER may clobber $at
-             * while rewriting an out-of-range branch into a jump -- but
-             * that rewrite emits its own instructions, and the branch
-             * itself never touches the register.
-             *
-             * Published, this is a destination write that did not happen:
-             * it manufactures a WAW edge against every real producer of
-             * $at and a RAW edge into every consumer.  It measures as
-             * TRACER-SUPERSET, which is why nothing caught it until an
-             * execution reference was put beside the trace -- gem5 names
-             * no destination for these instructions, on all seven mipsel
-             * branch forms in `arc3_cov/gem5`.
-             *
-             * Upstream: LLVM's MIPS branch instruction definitions should
-             * not carry `Defs = [AT]`; the expansion that clobbers it is
-             * the assembler's, not the instruction's.  Dropped here, at the
-             * boundary, because the register table cannot express it -- the
-             * table is keyed by REGISTER and the discriminator is the
-             * INSTRUCTION.  Revisit on a Capstone bump.
-             */
-            if (trace_isa == TRACE_ISA_MIPS &&
-                out->branch_type != BRANCH_NONE) {
-                const RegClassification *rc =
-                    lookup_reg_class(info->regs_write_id[i]);
-                if (rc && !rc->n_regs && rc->reg_id == REG_GPR1) {
-                    continue;
-                }
-            }
-            add_dst_cap_reg(out, out_names, info->regs_write_id[i]);
-        }
-    }
+    /*
+     * THE IMPLICIT-REGISTER FOLD IS GONE, BOTH HALVES.
+     *
+     * Capstone's regs_read[] was the last route by which a register reached
+     * src_regs[] without QEMU or a survivor row saying so (f9ce637d94);
+     * regs_write[] was the same for the destination list, and it goes here
+     * with the two operand arms.
+     *
+     * ONE WORKAROUND DIES WITH IT AND IS RECORDED RATHER THAN DROPPED.  LLVM's
+     * MIPS tables give every conditional branch -- `bne`, `beq`, `bgez`,
+     * `bltz`, `blez`, `bgtz` and the `b` macro -- an implicit definition of
+     * $at, which Capstone reports verbatim; both decoders agree because both
+     * read the same table (`isaxcheck --isa=mipsel --hex=feff0915` prints
+     * WR{r1} on the Capstone line AND the LLVM MC line).  The definition is
+     * there for the long-branch expansion, where the ASSEMBLER may clobber
+     * $at while rewriting an out-of-range branch into a jump; the branch
+     * itself never touches the register, gem5 names no destination for any
+     * of the seven forms, and published it manufactured a WAW edge against
+     * every real producer of $at and a RAW edge into every consumer.  It
+     * measured as TRACER-SUPERSET, which is why nothing caught it until an
+     * execution reference was put beside the trace.  The correction was a
+     * boundary-side drop because the register table could not express it --
+     * keyed by REGISTER, discriminated by INSTRUCTION.  QEMU's write list
+     * never contained the row, so there is nothing left to drop.
+     */
 
     /* Resolve call vs jump vs return for the ISAs where one insn_id is
      * ambiguous (x86 call direct/indirect, riscv jal/jalr/j/jr/ret,

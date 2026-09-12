@@ -1028,40 +1028,18 @@ std::atomic<uint64_t> g_dst_repr_refused{0};
 GHashTable *g_dst_repr_sig = nullptr;       /* "mnem  REG" -> count */
 GHashTable *g_dst_repr_refused_sig = nullptr;
 /*
- * R10.1'S SEPARATION, SCORED AGAINST THE ANSWER IT REPLACED (exec185).
+ * R10.1'S SEPARATION IS NO LONGER A COMPARISON, SO THE COMPARISON IS GONE.
  *
- * dst_row_seated() decides whether a QEMU REG_PC write row belongs to the
- * instruction or to the translation block's epilogue.  Until exec185 it
- * asked the WIRE -- "does dst_regs[] already carry REG_PC" -- and the wire's
- * list was the Capstone operand walk's, so the predicate died with the walk.
- * It now asks QEMU (qemu_plugin_insn_ctrl_flags), and these three count the
- * whole population of REG_PC write rows the predicate ever sees:
- *
- *   @g_pcsep_agree      the two answers are the same.  Nothing moved.
- *   @g_pcsep_qemu_only  QEMU says TRANSFER, the wire had no REG_PC slot --
- *                       a destination the flip ADMITS.
- *   @g_pcsep_wire_only  the wire carried REG_PC, QEMU's ops do not say the
- *                       instruction transferred -- a destination the flip
- *                       REFUSES.
- *
- * Both disagreement directions are tallied by QEMU's own decode name and by
- * the raw ctrl flags, because "the walk and the ops disagree" is an
- * adjudication and an adjudication needs the row, not the count.
+ * Three counters and two signature tables scored dst_row_seated()'s two
+ * candidate QEMU answers -- the control-transfer flags (exec185, refuted at
+ * 4b5be8e26f) and the block epilogue (f37d8f81d0) -- against the answer the
+ * WIRE gave, because the wire's dst_regs[] was the Capstone operand walk's
+ * and the question was which of the three to take.  The epilogue answer is
+ * taken now and the walk is deleted, so "the wire's answer" names nothing:
+ * a census whose second term does not exist reports AGREE on a comparison
+ * it did not make.  Its readings are quoted at dst_row_seated(), which is
+ * where the decision they informed lives.
  */
-std::atomic<uint64_t> g_pcsep_agree{0};
-std::atomic<uint64_t> g_pcsep_qemu_only{0};
-std::atomic<uint64_t> g_pcsep_wire_only{0};
-GHashTable *g_pcsep_sig = nullptr;   /* "WHO  decode_name  ctrl" -> count */
-/*
- * AND THE SECOND CANDIDATE, scored against the same wire answer: the
- * translation block's EPILOGUE (QDepInsn::dst_epilogue_only).  Same three
- * cells, same population, so the two candidates are directly comparable and
- * the choice between them is a reading rather than an argument.
- */
-std::atomic<uint64_t> g_episep_agree{0};
-std::atomic<uint64_t> g_episep_epi_only{0};
-std::atomic<uint64_t> g_episep_wire_only{0};
-GHashTable *g_episep_sig = nullptr;
 /* The lowered registers this target has: generic name -> global count. */
 GHashTable *g_lowered_reg = nullptr;
 /*
@@ -2419,10 +2397,11 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
 /*
  * WILL QEMU'S WRITE ROW @k BE SEATED IN THE WIRE'S DESTINATION LIST?
  *
- * One predicate, consulted from the two places that must agree about it:
+ * One predicate, consulted from the three places that must agree about it:
+ * dst_precheck(), which decides whether the family exists at all,
  * seat_dst_for_qemu(), which builds the list, and qemu_named_regs(), which
  * seats the PROVENANCE of every destination that list will carry.  When the
- * two disagreed the mask loop refused the whole family -- regs_to_mask()
+ * three disagreed the mask loop refused the whole family -- regs_to_mask()
  * cannot set a bit for a provenance register nothing put in src_regs[] --
  * so the disagreement did not silently publish, it silently REFUSED, which
  * is the harder failure to see.
@@ -2430,109 +2409,37 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
  * The only row it excludes is R10.1's.  QEMU charges a translation block's
  * final pc write to whichever instruction the block ended on, so its write
  * list carries REG_PC on instructions the ISA does not define as writing
- * it; the separation is taken from whether the wire's own list already
- * carries REG_PC, which is a surviving operand-walk input on exactly one
- * register with #261/R10 as its coverage path.
+ * it, and R10.1 rules that artefact off the wire (#236).
  *
- * AND THAT INPUT IS THE SECOND THING HOLDING THE WALK'S WRITE ARM IN
- * PLACE (exec184; the first is dst_precheck()'s n_dst_regs == 0 return).
- * The wire's list is the walk's, so deleting the walk deletes the only
- * discriminator this function has: QEMU's REG_PC write row would then be
- * seated on every instruction a block happened to end on -- a delay-slot
- * `lw`, a page-final `mov` -- which is exactly the 215-slot population
- * R10.1 adjudicated an ARTIFACT and ruled off the wire (#236).  Refusing
- * every REG_PC row instead is the mirror loss: a branch's architectural
- * pc write is real and would leave.  Neither direction is available from
- * QEMU's statements as they stand, so the separation has to BECOME a
- * QEMU-side statement -- the translator's block epilogue marked as
- * lowering -- before the write arm can go.
+ * THE SEPARATION IS QEMU'S OWN STATEMENT NOW, AND THAT IS WHAT LET THE
+ * OPERAND WALK'S WRITE ARM GO.  It used to be taken from whether the WIRE's
+ * dst_regs[] already carried REG_PC -- a surviving operand-walk input, and
+ * the second of the two things exec184 measured holding the write arm in
+ * place: the wire's list was the walk's, so deleting the walk deleted the
+ * discriminator, and QEMU's REG_PC row would have seated on every
+ * instruction a block happened to end on (a delay-slot `lw`, a page-final
+ * `mov`).  insn_dataflow_note_block_epilogue() (accel/tcg/translator.c,
+ * f37d8f81d0) marks the ops the translator emits after the last
+ * instruction, insn_dataflow_note_borrow_begin()/_end() (3c3baba068) hands
+ * a delay slot's borrowed ops back to the branch that lent them, and
+ * qemu_plugin_insn_write_epilogue_only() is what this reads: a REG_PC write
+ * EVERY one of whose ops was the epilogue's is the BLOCK's, anything else
+ * the instruction emitted itself.
+ *
+ * IT WAS SCORED AGAINST THE WIRE BEFORE IT WAS TAKEN, on the census this
+ * commit retires with the comparison.  Four ISAs, validator `all` seed 4242
+ * plus `qemu-x86_64 /bin/echo hi` at wpdepth 1 and 16: WIRE-only -- the
+ * direction in which taking this answer would LOSE a pc write the wire
+ * carried -- is 0 everywhere, at every wrong-path depth.  The EPI-only
+ * direction is 4 mipsel rows, `syscall`'s own exception-delivery pc write
+ * (R7.6), which is a GAIN.
  */
-static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
+static bool dst_row_seated(const QDepInsn *q, uint8_t k)
 {
     if (q->dst_reg[k] != REG_PC) {
         return true;
     }
-
-    /*
-     * THE CANDIDATE QEMU-SIDE SEPARATION, MEASURED AND NOT TAKEN (exec185).
-     *
-     * exec184 named the prerequisite that clears this predicate: the
-     * separation has to BECOME a QEMU-side statement, because the wire's
-     * dst_regs[] is the Capstone operand walk's and dies with it.  QEMU has
-     * a statement about control transfer already -- qemu_plugin_insn_ctrl_
-     * flags(), read off the ops the translator emitted to perform the
-     * transfer -- so the obvious candidate is "seat REG_PC iff QEMU says
-     * this instruction transferred".
-     *
-     * IT DOES NOT ANSWER, AND THE REASON IS STRUCTURAL, NOT A GAP.  The
-     * classification names a SUCCESSOR: goto_tb is a compile-time successor,
-     * goto_ptr a computed one.  Every wrong-path translation carries
-     * CF_NO_GOTO_TB | CF_NO_GOTO_PTR (accel/tcg/cputlb.c, the spec-mode code
-     * cache), so the translator lowers those branches to a bare exit_tb and
-     * the walk reports NOCHAIN with TRANSFER absent -- which the header says
-     * in as many words a consumer must not read as a negative answer.  On
-     * `qemu-x86_64 /bin/echo hi` at wpdepth=16 that is 9,220 of 10,908
-     * REG_PC write rows, every one a real `Jcc` / `JMP` / `RET` / `CALL`
-     * (ctrl=0x80000080, VALID|NOCHAIN).  Taking this answer would delete a
-     * branch's architectural pc write on every wrong-path-translated
-     * instruction, which is the mirror loss the header below already names.
-     *
-     * So the predicate is UNCHANGED and the two answers are counted side by
-     * side instead.  The census is the measurement that says so, it is not a
-     * retained comparison arm for a path whose source has become QEMU (J7):
-     * the wire's answer here is still the walk's, and this is what says by
-     * how much a candidate replacement misses.
-     */
-    bool by_qemu = qemu_ctrl_states_transfer(q->ctrl_flags);
-    bool by_wire = false;
-
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        if (f->dst_regs[d] == REG_PC) {
-            by_wire = true;
-            break;
-        }
-    }
-    /*
-     * THE EPILOGUE CANDIDATE.  A REG_PC write every one of whose QEMU rows
-     * was the epilogue's is the BLOCK's pc write charged to whichever
-     * instruction the block ended on; anything else the instruction emitted
-     * itself.  Scored, not taken -- the same discipline as by_qemu above.
-     */
-    bool by_epi = !q->dst_epilogue_only[k];
-
-    if (by_epi == by_wire) {
-        g_episep_agree.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        char sig[224];
-
-        if (by_epi) {
-            g_episep_epi_only.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_episep_wire_only.fetch_add(1, std::memory_order_relaxed);
-        }
-        g_snprintf(sig, sizeof(sig), "%-7s %-16s",
-                   by_epi ? "EPI" : "WIRE",
-                   q->decode_name ? q->decode_name : "-");
-        tally(&g_episep_sig, sig);
-    }
-
-    if (by_qemu == by_wire) {
-        g_pcsep_agree.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        char sig[224];
-
-        if (by_qemu) {
-            g_pcsep_qemu_only.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_pcsep_wire_only.fetch_add(1, std::memory_order_relaxed);
-        }
-        g_snprintf(sig, sizeof(sig), "%-7s %-16s ctrl=0x%08x",
-                   by_qemu ? "QEMU" : "WIRE",
-                   q->decode_name ? q->decode_name : "-",
-                   (unsigned)q->ctrl_flags);
-        tally(&g_pcsep_sig, sig);
-    }
-    return by_wire;
+    return !q->dst_epilogue_only[k];
 }
 
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
@@ -2625,7 +2532,7 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
                     break;
                 }
             }
-            if (!on_wire && dst_row_seated(q, f, k)) {
+            if (!on_wire && dst_row_seated(q, k)) {
                 take(q->dst_dep_regs[k], q->n_dst_dep_regs[k]);
             }
         }
@@ -3674,93 +3581,51 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
                       char *why, size_t whysz)
 {
     unsigned st = q->dst_state;
+    unsigned seated = 0;
 
     /*
-     * THIS RETURN IS THE FIRST OF THE TWO THINGS THAT HOLD THE OPERAND
-     * WALK'S WRITE ARM IN PLACE, and it is named here because the R14
-     * deletion walks straight into it (exec184).
+     * THE FAMILY EXISTS BECAUSE QEMU STATED A WRITE, and that sentence is
+     * what the operand walk's write arm used to own.
      *
-     * The #232 admission (f5a5b2a33e) seats a destination QEMU states and
-     * the walk never found -- but only for a family that gets past this
-     * predicate, and this predicate asks the WALK whether there is a family
-     * at all.  So the admission can GROW the walk's list; it cannot CREATE
-     * one.  Delete the walk's write arm and every instruction arrives here
-     * with n_dst_regs == 0, the whole destination family reads QDEP_NONE,
-     * seat_dst_for_qemu() is never called, and the wire publishes NO
-     * DESTINATIONS AT ALL.
+     * This predicate used to open `if (f->n_dst_regs == 0) return
+     * QDEP_NONE`, and exec184 caught what that cost by intervention rather
+     * than by argument: with the write arms removed and nothing else
+     * changed, every instruction arrived here with an empty slot list, the
+     * whole destination family read QDEP_NONE, seat_dst_for_qemu() was
+     * never called, and `qemu-x86_64 /bin/echo hi` published `mov %sp`
+     * where it published `mov %sp -> %gp5`, `test %gp2, $0x2` with no
+     * `-> %flags`, and `jcc` with no `-> %pc`.  The #232 admission
+     * (f5a5b2a33e) could GROW the walk's list; it could not CREATE one,
+     * because this predicate asked the WALK whether there was a family at
+     * all.
      *
-     * MEASURED, not reasoned: with the three write arms removed (the REG
-     * operand's, the SYSREG operand's and the implicit regs_write[] fold)
-     * and nothing else changed, `qemu-x86_64 /bin/echo hi` publishes
-     * `mov %sp` where it published `mov %sp -> %gp5`, `test %gp2, $0x2`
-     * with no `-> %flags`, and `jcc` with no `-> %pc`.  Every destination,
-     * on every instruction.
+     * It asks QEMU now.  The count is of QEMU's own write rows, less the
+     * ones dst_row_seated() rules off as the translation block's epilogue
+     * (R10.1) -- the same predicate the seating and the source index use,
+     * so all three ask about the same set and the three cannot drift.
      *
-     * The prerequisite chain that clears it, in order:
-     *   1. QEMU-side, the block-final pc write marked as the translator's
-     *      lowering -- dst_row_seated() below takes that separation from
-     *      the WIRE's list today, so the discriminator dies with the walk
-     *      (#261 / R10 is its coverage path);
-     *   2. a DESTINATION survivor table, the twin of
-     *      champsim_tracer_src_survivors.h, carrying the rows a ruling
-     *      keeps and QEMU does not state (the R16 block in qdep_report());
-     *   3. then this return retires and seat_dst_for_qemu() builds the
-     *      list from QEMU's write rows outright.
+     * A REFUSED EXTRACTION IS A REFUSAL AND NOT AN ABSENCE.  `st != QDEP_OK`
+     * is returned before the count, where the old order returned QDEP_NONE
+     * first whenever the walk had found nothing: QEMU's write-side
+     * extraction failing is a statement that this instruction's write list
+     * is NOT KNOWN, and reporting that as "no destinations" would spend a
+     * refusal into a fact.  The wire result is the same -- no slots either
+     * way -- and the census bucket is not, which is the whole point of
+     * keeping the two apart (the mech corpus's NOT-SCORED column).
      */
-    if (f->n_dst_regs == 0) {
-        return QDEP_NONE;       /* no slot: no dst_dep[] array to write */
-    }
-    if (f->n_dst_regs > MAX_DST_REGS) {
-        return QDEP_R_WIDE;
-    }
     if (st != QDEP_OK) {
         return st;
     }
-    /*
-     * FIRST, THE WIRE'S OWN SLOTS: every one must have a QEMU write row, or
-     * the family refuses.  This direction is about the SLOT LIST and is
-     * asked of the wire's entries alone.
-     */
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        uint8_t k;
-
-        for (k = 0; k < q->n_dst; k++) {
-            if (q->dst_reg[k] == f->dst_regs[d]) {
-                break;
-            }
+    for (uint8_t k = 0; k < q->n_dst; k++) {
+        if (dst_row_seated(q, k)) {
+            seated++;
         }
-        if (k == q->n_dst) {
-            /*
-             * THE LAZY-FLAG INTERPRETATION'S ONE LOSS DIRECTION, named
-             * before it is refused (#265).  A register the wire DOES carry
-             * as a destination, whose every stated write this file struck as
-             * a change of representation, has had the only thing that could
-             * fill its slot taken away.  Refusing the family is the honest
-             * outcome -- the block keeps the answer the refiner wrote, and
-             * nothing short is published -- but it is a LOSS and so it is
-             * counted separately from a register QEMU simply never
-             * mentioned, and tallied by mnemonic so the class is a list.
-             *
-             * The shape that would land here is `stc`/`clc`/`cmc`:
-             * materialise the flags, then set one bit with a translator
-             * constant, which arrives with the same provenance the
-             * materialisation had.  Its coverage path is a QEMU-side note at
-             * those emitters saying the write SUPPLIES a value, the same
-             * shape #205 and #230 used.  It has no subject in the corpus.
-             */
-            for (uint8_t z = 0; z < q->n_repr_only; z++) {
-                if (q->repr_only[z] != f->dst_regs[d]) {
-                    continue;
-                }
-                g_dst_repr_refused.fetch_add(1, std::memory_order_relaxed);
-                tally(&g_dst_repr_refused_sig,
-                      generic_reg_name_or_unknown(f->dst_regs[d]));
-                break;
-            }
-            g_snprintf(why, whysz, "no QEMU write row for %s",
-                       generic_reg_name_or_unknown(f->dst_regs[d]));
-            return QDEP_R_DST_UNNAMED;
-        }
+    }
+    if (seated == 0) {
+        return QDEP_NONE;       /* no row: no dst_dep[] array to write */
+    }
+    if (seated > MAX_DST_REGS) {
+        return QDEP_R_WIDE;
     }
     /*
      * THEN THE VALUE CHECKS, OVER EVERY ROW THE SEATING WILL TAKE (#232).
@@ -3778,7 +3643,7 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
      * index use, so all three ask about the same set.
      */
     for (uint8_t k = 0; k < q->n_dst; k++) {
-        if (!dst_row_seated(q, f, k)) {
+        if (!dst_row_seated(q, k)) {
             continue;
         }
         /*
@@ -4053,7 +3918,7 @@ static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
  * mnemonic so the size of the decision is a measurement.
  */
 /*
- * THE DESTINATION LIST, RE-SEATED INTO QEMU'S ORDER (#232).
+ * THE DESTINATION LIST IS QEMU'S (#232).
  *
  * `dst_regs[]` is the dictionary every destination-family field is read
  * through -- docs/format.rst fixes slot d as naming dst_reg[d] -- and until
@@ -4064,144 +3929,83 @@ static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
  * inferred: riscv64 `c.mv` at 0x103ba, bytes `ae84` -- corrupt the operand
  * access flags and the wire's destination becomes x11 where QEMU says x9.
  *
- * IT IS A PERMUTATION, AND THAT IS A MEASUREMENT AND NOT A CHOICE.  Both
- * directions of the two lists' disagreement now read ZERO on all four ISAs:
- * dst_precheck() refuses the family when the wire names a destination QEMU
- * has no write row for (the #218 droppable leg, 4 -> 0 once FEAT_MOPS'
- * syndrome registers were stated at their emitter), and the mirror -- QEMU
- * naming a destination the wire's list lacks -- is the must-be-0 census row
- * and it is 0.  So for a family that reaches here the two lists are the same
- * SET, and seating QEMU's order over it drops nothing and invents nothing.
+ * IT BUILDS, IT NO LONGER PERMUTES.  This landed as a re-seating: the walk
+ * supplied the list, QEMU supplied the order, and the two were checked to be
+ * the same SET before either moved.  Both directions of that disagreement
+ * had been driven to zero -- dst_precheck() refused a wire destination QEMU
+ * had no write row for (#218's droppable leg, 4 -> 0 once FEAT_MOPS'
+ * syndrome registers were stated at their emitter), and the mirror was the
+ * must-be-0 census row -- which is what made the walk's half redundant and
+ * is why this reads only @q now.  The operand walk's write arm is deleted;
+ * `f->dst_regs[]` is EMPTY when this runs, and reading it would be reading
+ * nothing.
  *
- * THE SET IS CHECKED RATHER THAN ASSUMED.  If the two ever differ this
- * refuses the RE-SEATING for that instruction and counts it: the list stays
- * the walk's, the masks below still publish (they match by REGISTER, not by
- * slot), and the disagreement is a number instead of a silently truncated
- * or silently grown destination list.
+ * SO EVERY SLOT IS STATED AND NOTHING IS CARRIED.
  *
- * REG_PC IS THE ONE REGISTER THE WALK STILL DECIDES, and it is named rather
- * than hidden.  QEMU charges a translation block's final pc write to
- * whichever instruction the block ended on -- a delay-slot `lw`, a
- * page-final `mov` -- so QEMU's write list carries REG_PC on instructions
- * the ISA does not define as writing it, and R10.1 rules that artefact off
- * the wire.  Nothing in QEMU's statements separates that write from a
- * branch's architectural one, so the separation is taken from whether the
- * wire's list already carries REG_PC.  That is a surviving operand-walk
- * input, on exactly one register, and its coverage path is #261/R10: a
- * QEMU-side statement distinguishing the block's pc write from the
- * instruction's would retire it.
+ *   the dep mask is 0 here because apply_dst() writes EVERY slot's mask from
+ *   QEMU's own provenance immediately below -- this value is never published;
  *
- * Everything indexed by a destination slot moves in the same step --
- * dst_dep_mask[], dst_lane_mask[] and the reg-snapshot keys -- so no
- * consumer ever sees a mask, a lane set and a dictionary from two orders.
+ *   the lane mask is 0 here because a lane set belongs to a REGISTER and not
+ *   to a slot (7c9dfe83c2): assign_{src,dst}_lane() record it against the
+ *   register they name and apply_lane_carry() writes both mask arrays at the
+ *   end of qdep_apply(), after this seating exists.  The earlier form gave an
+ *   admitted slot lane 0 on the ground that "a register QEMU names as a TCG
+ *   global is a scalar destination", which was true only while the walk still
+ *   supplied every vector destination slot -- the trap that had already
+ *   sprung on the source side, closed before the flip reached it;
+ *
+ *   the value key is resolved from the generic id through the same published
+ *   accessor the source side's admission uses, so a destination's VALUE
+ *   reaches the wire like any other slot's rather than reading as absent.
+ *
+ * R10.1's REG_PC row is dropped by dst_row_seated(), which asks QEMU's
+ * block-epilogue statement -- see its header for what that replaced.
  */
-#define DST_SLOT_ADMITTED  0xffu    /* new slot with no operand-walk origin */
-
 static bool seat_dst_for_qemu(InsnFields *f, InsnRegNames *rn,
                               const QDepInsn *q, unsigned *admitted)
 {
-    uint8_t neworder[MAX_DST_REGS];
-    uint8_t from[MAX_DST_REGS];         /* new slot -> old slot, or ADMITTED */
-    unsigned n = 0, took = 0, adm = 0;
-    const unsigned ndst = f->n_dst_regs;
+    const bool have_keys = rn && rn->dst_qemu_reg_keys;
+    unsigned n = 0;
 
-    if (ndst > MAX_DST_REGS) {
-        return false;
-    }
     for (uint8_t k = 0; k < q->n_dst; k++) {
         uint8_t r = q->dst_reg[k];
-        uint8_t d;
+        bool dup = false;
 
-        if (!dst_row_seated(q, f, k)) {
+        if (!dst_row_seated(q, k)) {
             continue;               /* the BLOCK's pc write -- R10.1 */
         }
-        for (d = 0; d < ndst; d++) {
+        for (unsigned d = 0; d < n; d++) {
             if (f->dst_regs[d] == r) {
+                dup = true;
                 break;
             }
         }
+        if (dup) {
+            continue;
+        }
         if (n >= MAX_DST_REGS) {
             /*
-             * The union does not fit the record.  REFUSED rather than
+             * The list does not fit the record.  REFUSED rather than
              * truncated, because a destination list short by a register is
              * indistinguishable downstream from an instruction that does
-             * not write it.
+             * not write it.  dst_precheck() counts the same rows and returns
+             * QDEP_R_WIDE before this can be reached, so arriving here is a
+             * disagreement between the two counts and not a wide
+             * instruction.
              */
             return false;
         }
-        if (d == ndst) {
-            from[n] = DST_SLOT_ADMITTED;
-            adm++;
-        } else {
-            from[n] = d;
-            took++;
+        f->dst_regs[n]      = r;
+        f->dst_dep_mask[n]  = 0;
+        f->dst_lane_mask[n] = 0;
+        if (have_keys) {
+            rn->dst_qemu_reg_keys[n] = qemu_reg_key_for_generic(r);
         }
-        neworder[n++] = r;
+        n++;
     }
-    if (took != ndst) {
-        /*
-         * The wire names a destination QEMU does not.  dst_precheck() has
-         * already refused every such row -- it is the #218 direction -- so
-         * this is unreachable, and it stays a REFUSAL rather than a drop:
-         * seating the rest would silently take a published destination off
-         * the wire, which is the one direction R12.1 never allows.
-         */
-        return false;
-    }
-    {
-        uint64_t dep[MAX_DST_REGS], lane[MAX_DST_REGS];
-        const QemuRegKey *keys[MAX_DST_REGS];
-        const bool have_keys = rn && rn->dst_qemu_reg_keys;
-
-        for (unsigned d = 0; d < n; d++) {
-            if (from[d] == DST_SLOT_ADMITTED) {
-                /*
-                 * A slot the operand walk never made, so there is nothing to
-                 * carry and every field is stated rather than moved.
-                 *
-                 * The dep mask is left at zero because the loop in
-                 * apply_dst() writes EVERY slot's mask from QEMU's own
-                 * provenance immediately below -- this value is never the
-                 * one published.
-                 *
-                 * The lane mask is zero and that is the ANSWER, not a
-                 * default: a register QEMU names as a TCG global is a scalar
-                 * destination, and the lane-mask model gives a scalar slot
-                 * mask 0.  The registers the walk lists and QEMU does not
-                 * are the CPUArchState byte ranges (#218) -- x86's XMM and
-                 * x87 files, aarch64's V registers -- and those cannot
-                 * arrive here, because QEMU never named them.
-                 *
-                 * The value key is resolved from the generic id through the
-                 * same published accessor the source side's admission uses,
-                 * so an admitted destination's VALUE reaches the wire like
-                 * any other slot's rather than reading as absent.
-                 */
-                dep[d]  = 0;
-                lane[d] = 0;
-                if (have_keys) {
-                    keys[d] = qemu_reg_key_for_generic(neworder[d]);
-                }
-            } else {
-                dep[d]  = f->dst_dep_mask[from[d]];
-                lane[d] = f->dst_lane_mask[from[d]];
-                if (have_keys) {
-                    keys[d] = rn->dst_qemu_reg_keys[from[d]];
-                }
-            }
-        }
-        for (unsigned d = 0; d < n; d++) {
-            f->dst_regs[d]      = neworder[d];
-            f->dst_dep_mask[d]  = dep[d];
-            f->dst_lane_mask[d] = lane[d];
-            if (have_keys) {
-                rn->dst_qemu_reg_keys[d] = keys[d];
-            }
-        }
-        f->n_dst_regs = (uint8_t)n;
-    }
+    f->n_dst_regs = (uint8_t)n;
     if (admitted) {
-        *admitted = adm;
+        *admitted = n;
     }
     return true;
 }
@@ -5141,68 +4945,68 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             }
         }
     }
+    /*
+     * THE LIST IS SEATED BEFORE THE MASK VERDICT IS ACTED ON, and the order
+     * is the whole of FINDING 188-A.
+     *
+     * WHICH registers an instruction writes and WHAT FEEDS them are two
+     * facts, and only the second one can refuse.  This seat used to sit
+     * BELOW the refusal return, which cost nothing while the Capstone
+     * operand walk supplied `dst_regs[]`: a refused family kept the walk's
+     * list and the refiner's masks, so refusing the mask question took the
+     * mask and left the destination.  With the walk deleted there is no
+     * second list, and the same return took the DESTINATIONS with it.
+     *
+     * MEASURED, and it is why the two are separated rather than argued
+     * about: `qemu-x86_64 /bin/echo hi` at wpdepth=16 under `setarch -R`,
+     * the walk-deleted build against the walk-present one at matched output
+     * path length, 1,189,422 decoded lines each.  With the seat below the
+     * return, 52,614 instructions published NO destination at all and 0
+     * gained one -- `shr` 13,929, `xor` 13,063, `lea` 10,775, `vlogic`
+     * 6,983, `shl` 5,773, `nop` 1,193, `div` 469, `syscall` 317 -- every one
+     * of them an encoding whose destination family was ALREADY refused at
+     * the base arm, by a refusal about the MASK: the shift-by-immediate
+     * unstated path (#302/#253), `lea`'s translator constant, `xor`'s
+     * empty-set REG_FLAGS, `psrldq`'s undeclared env range.  The wire had
+     * been publishing `shr %gp0 -> %gp0` with no dep block and would have
+     * published `shr %gp0`.
+     *
+     * R12.1 forbids exactly that: the deletion may not degrade the trace,
+     * and "the mask refused" is not a reason to stop saying the instruction
+     * writes the register.  The honest encoding already exists -- the
+     * destination list with the HAS_REG block clear, which decide_block()
+     * owns and which the consumer reads as its own default.
+     *
+     * GATED ON q->dst_list_complete: the only question the LIST's seating
+     * may ask is whether the write-list enumeration ran to the end.
+     */
+    if (q->dst_list_complete) {
+        unsigned seated = 0;
+
+        if (seat_dst_for_qemu(f, rn, q, &seated)) {
+            g_dst_reseated.fetch_add(1, std::memory_order_relaxed);
+            if (seated) {
+                g_dst_admitted_rows.fetch_add(1, std::memory_order_relaxed);
+                g_dst_admitted_regs.fetch_add(seated,
+                                              std::memory_order_relaxed);
+            }
+        } else {
+            /*
+             * More seated rows than the record holds.  dst_precheck() counts
+             * the same rows and returns QDEP_R_WIDE before this, so reaching
+             * here is a disagreement between the two counts; the list stays
+             * EMPTY rather than truncated, and the count says it happened.
+             */
+            g_dst_reseat_refused.fetch_add(1, std::memory_order_relaxed);
+            tally(&g_dst_reseat_refused_sig, mnem ? mnem : "?");
+        }
+    }
     if (wstate != QDEP_OK) {
         if (wstate != QDEP_NONE) {
             note_refusal(mnem, wstate, "dst  ", why);
         }
         g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
         return false;
-    }
-
-    for (uint8_t k = 0; k < q->n_dst; k++) {
-        bool on_wire = false;
-
-        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-            if (f->dst_regs[d] == q->dst_reg[k]) {
-                on_wire = true;
-                break;
-            }
-        }
-        if (on_wire) {
-            continue;
-        }
-        if (q->dst_reg[k] == REG_PC) {
-            g_dst_wire_missing_pc.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            /*
-             * COUNTED HERE, SEATED BELOW.  Until the admission landed this
-             * was a must-be-0 -- "a destination the machine writes and the
-             * wire does not name" -- and it was a must-be-0 the wire had no
-             * way to satisfy: nothing could put a register on the
-             * destination list that the Capstone operand walk had not found.
-             *
-             * seat_dst_for_qemu() now seats it, so the row is a GAIN and not
-             * a loss, and it is counted BEFORE the seat because this is the
-             * level that holds the mnemonic.
-             */
-            char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
-                                        generic_reg_name_or_unknown(
-                                            q->dst_reg[k]));
-            tally(&g_dst_wire_missing, key);
-            g_free(key);
-            g_dst_wire_missing_other.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    unsigned admitted = 0;
-    if (seat_dst_for_qemu(f, rn, q, &admitted)) {
-        g_dst_reseated.fetch_add(1, std::memory_order_relaxed);
-        if (admitted) {
-            g_dst_admitted_rows.fetch_add(1, std::memory_order_relaxed);
-            g_dst_admitted_regs.fetch_add(admitted,
-                                          std::memory_order_relaxed);
-        }
-    } else {
-        /*
-         * The two lists are not the same set, so no permutation of one is
-         * the other.  The list stays the walk's and the masks below still
-         * publish -- they are matched by REGISTER and not by slot, so every
-         * slot that does exist still gets QEMU's answer -- and the row is
-         * counted, because a destination list this file could not seat is
-         * the one place the operand walk still decides the wire's
-         * dictionary.  It reads 0 on all four ISAs today.
-         */
-        g_dst_reseat_refused.fetch_add(1, std::memory_order_relaxed);
-        tally(&g_dst_reseat_refused_sig, mnem ? mnem : "?");
     }
     for (uint8_t d = 0; d < f->n_dst_regs; d++) {
         uint8_t k;
@@ -7831,35 +7635,6 @@ void qdep_report(GString *report)
                "registers whose writes were struck as a change of representation\n(#265: the lazy-flag interpretation's subject, by generic register):");
     dump_tally(report, g_dst_repr_refused_sig,
                "registers the wire carries whose every QEMU write was struck\n(the must-be-0 above, by generic register; the mnemonic is in the\nrefusal census under QDEP_R_DST_UNNAMED):");
-    g_string_append_printf(report,
-        "\nR10.1's REG_PC separation, QEMU's answer scored against the wire's\n"
-        "(exec185; see dst_row_seated()).  AGREE is the whole population minus\n"
-        "the two disagreement directions, so the three sum to every REG_PC\n"
-        "write row QEMU stated:\n"
-        "  %10" G_GUINT64_FORMAT "  AGREE      -- both answers the same\n"
-        "  %10" G_GUINT64_FORMAT "  QEMU-only  -- ops say TRANSFER, wire had no"
-        " REG_PC slot (ADMITTED)\n"
-        "  %10" G_GUINT64_FORMAT "  WIRE-only  -- wire carried REG_PC, ops do"
-        " not state a transfer (REFUSED)\n",
-        g_pcsep_agree.load(std::memory_order_relaxed),
-        g_pcsep_qemu_only.load(std::memory_order_relaxed),
-        g_pcsep_wire_only.load(std::memory_order_relaxed));
-    dump_tally(report, g_pcsep_sig,
-               "R10.1 separation disagreements, by which side said TRANSFER,\nQEMU's decode name and the raw QEMU_PLUGIN_CTRL_* flags:");
-    g_string_append_printf(report,
-        "\nThe SECOND candidate for the same separation: the translation"
-        " block's\nEPILOGUE (qemu_plugin_insn_write_epilogue_only()), scored"
-        " over the same\npopulation so the two readings are comparable:\n"
-        "  %10" G_GUINT64_FORMAT "  AGREE      -- both answers the same\n"
-        "  %10" G_GUINT64_FORMAT "  EPI-only   -- the instruction emitted a pc"
-        " write, wire had no slot\n"
-        "  %10" G_GUINT64_FORMAT "  WIRE-only  -- wire carried REG_PC, every"
-        " QEMU row was the epilogue's\n",
-        g_episep_agree.load(std::memory_order_relaxed),
-        g_episep_epi_only.load(std::memory_order_relaxed),
-        g_episep_wire_only.load(std::memory_order_relaxed));
-    dump_tally(report, g_episep_sig,
-               "epilogue-separation disagreements, by which side said the\ninstruction wrote pc, and QEMU's decode name:");
     dump_tally(report, g_dst_unmapped_name,
                "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
     dump_tally(report, g_field_unnamed,

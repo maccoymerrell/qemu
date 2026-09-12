@@ -91,6 +91,33 @@ ISAS = {
         datapath_ctl=0x00641021,   # addu $2, $3, $4
         trap_ctl=0x40020000,       # mfc0 $2, $0 -- CP0 unusable at user level
         cpu="24Kf"),
+    # x86_64.  THE SUBJECT IS A BYTE STRING, NOT A WORD, and that is the whole
+    # reason this arm did not exist: the two RISC arms above are 32 bits wide
+    # by construction and the file was written around a `word`.  Every subject
+    # here is the corpus's own hex spelling, which for the RISC arms is the
+    # little-endian image and for x86 is simply the bytes, so one code path
+    # serves all three.
+    #
+    # THE CPU MODEL IS THE EMULATOR'S DEFAULT, deliberately: `srcenc_sled.py`
+    # sweeps with QEMU_CPU unset, so a probe run at `-cpu max` would answer
+    # for a machine the corpus was never taken on -- which is the exact error
+    # (a reading of a state that was not swept) this file exists to prevent.
+    # riscv64.  Variable-length like x86 (16-bit compressed forms sit beside
+    # 32-bit ones) and served by the same byte path.  The exit stub is
+    # li a7,93; li a0,0; ecall.
+    "riscv64": dict(
+        machine=243, elfclass=64, post=[],
+        exit_bytes="9308d0051305000073000000",
+        datapath_ctl="13051500",   # addi a0,a0,1
+        trap_ctl="0000",           # c.unimp
+        cpu=None),
+    "x86_64": dict(
+        machine=62, elfclass=64, post=[],
+        # mov $60,%eax; xor %edi,%edi; syscall
+        exit_bytes="b83c00000031ff0f05",
+        datapath_ctl="0f58c0",     # addps %xmm0,%xmm0
+        trap_ctl="0f0b",           # ud2
+        cpu=None),
 }
 
 _LOAD = 0x400000
@@ -100,11 +127,25 @@ def _entry_off(isa):
     return 84 + 32 if ISAS[isa]["elfclass"] == 32 else 64 + 56
 
 
-def build_elf(path, isa, word):
+def subject_bytes(isa, enc):
+    """The corpus's hex spelling -> the bytes that go at the entry point.
+
+       For the fixed-width arms the corpus writes the LITTLE-ENDIAN image, so
+       the bytes are already in memory order and no unpack/repack is needed;
+       for x86_64 the spelling is the instruction's bytes outright.  One path,
+       and no place for an endian mistake to hide."""
+    return bytes.fromhex(enc)
+
+
+def build_elf(path, isa, enc):
     d = ISAS[isa]
     off = _entry_off(isa)
-    body = b"".join(struct.pack("<I", i)
-                    for i in [word] + d.get("post", []) + d["exit_stub"])
+    if "exit_bytes" in d:
+        tail = bytes.fromhex(d["exit_bytes"])
+    else:
+        tail = b"".join(struct.pack("<I", i)
+                        for i in d.get("post", []) + d["exit_stub"])
+    body = subject_bytes(isa, enc) + tail
     if d["elfclass"] == 32:
         e = struct.pack("<4sBBBBB7xHHIIIIIHHHHHH", b"\x7fELF", 1, 1, 1, 0, 0,
                         2, d["machine"], 1, _LOAD + off, 52, 0, 0, 52,
@@ -124,12 +165,29 @@ def build_elf(path, isa, word):
     os.chmod(path, 0o755)
 
 
-_EXC = re.compile(r"\bcall (exception|raise_exception|"
+_EXC = re.compile(r"\bcall (exception|raise_exception|raise_int|"
                   r"exception_with_syndrome|exception_internal)")
 # The PC write that accompanies an exception.  The spelling is the TARGET's:
 # aarch64 emits `mov_i64 pc,$0x...` and mipsel `mov_i32 PC,$0x...`, and a
 # filter written for one silently scores every trap on the other as DATAPATH.
-_PCSET = re.compile(r"^mov_i(32|64) (pc|PC),\$")
+_PCSET = re.compile(r"^mov_i(32|64) (pc|PC|rip|eip),\$")
+# THE EXCEPTION'S OWN ARGUMENT STORE.  riscv64's gen_exception_illegal() puts
+# the faulting instruction word into env before it raises, so the block for an
+# illegal encoding reads
+#
+#     st_i32 $0x0,env,$0x1370
+#     mov_i64 pc,$0x400078
+#     call raise_exception,$0x8,$0,env,$0x2
+#
+# and a filter that counts that store as work scores EVERY riscv trap as
+# DATAPATH -- which is what the probe's own control caught the moment the
+# riscv arm was added (c.unimp read DATAPATH).  It is trap machinery, not the
+# instruction's datapath: the value is a CONSTANT the translator already knew,
+# not anything read from the guest.  The pattern is deliberately narrow -- a
+# constant store into env -- and it can only change a verdict in a block that
+# ALSO writes the PC and calls an exception helper, which is the trap shape
+# and nothing else.
+_EXCARG = re.compile(r"^st(8|16|32|64)?_i(32|64) \$0x[0-9a-f]+,env,\$")
 
 
 def classify(op_text, entry):
@@ -167,6 +225,7 @@ def classify(op_text, entry):
             if not _PCSET.match(o)
             and not o.startswith("set_label")
             and not o.startswith("exit_tb")
+            and not _EXCARG.match(o)
             and not _EXC.search(o)]
     if not work and any(_EXC.search(o) for o in ops):
         return "TRAP-ONLY"
@@ -174,13 +233,13 @@ def classify(op_text, entry):
 
 
 def probe_one(args):
-    qemu, isa, cpu, word, d = args
-    path = os.path.join(d, "%08x.elf" % word)
-    build_elf(path, isa, word)
+    qemu, isa, cpu, enc, d = args
+    path = os.path.join(d, "%s.elf" % enc)
+    build_elf(path, isa, enc)
     entry = _LOAD + _entry_off(isa)
+    cmd = [qemu] + (["-cpu", cpu] if cpu else []) + ["-d", "op,in_asm", path]
     try:
-        p = subprocess.run([qemu, "-cpu", cpu, "-d", "op,in_asm", path],
-                           capture_output=True, text=True, timeout=60)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         return "REFUSED"
     finally:
@@ -194,6 +253,13 @@ def probe_one(args):
     return classify(txt, entry)
 
 
+def _ctl(v):
+    """A control encoding, as the corpus would spell it.  The RISC arms carry
+       theirs as a 32-bit word for readability against the ISA manual; x86
+       carries bytes."""
+    return v if isinstance(v, str) else struct.pack("<I", v).hex()
+
+
 def run(qemu, isa, cpu, words, jobs, out, control=True, log=sys.stdout):
     if not words:
         sys.exit("REFUSING: the probe has no subject")
@@ -201,10 +267,12 @@ def run(qemu, isa, cpu, words, jobs, out, control=True, log=sys.stdout):
     tmp = tempfile.mkdtemp(prefix="trapstate-")
     try:
         if control:
-            c1 = probe_one((qemu, isa, cpu, d["datapath_ctl"], tmp))
-            c2 = probe_one((qemu, isa, cpu, d["trap_ctl"], tmp))
-            print("CONTROL datapath(%08x) = %s" % (d["datapath_ctl"], c1), file=log)
-            print("CONTROL trap    (%08x) = %s" % (d["trap_ctl"], c2), file=log)
+            c1 = probe_one((qemu, isa, cpu, _ctl(d["datapath_ctl"]), tmp))
+            c2 = probe_one((qemu, isa, cpu, _ctl(d["trap_ctl"]), tmp))
+            print("CONTROL datapath(%s) = %s" % (_ctl(d["datapath_ctl"]), c1),
+                  file=log)
+            print("CONTROL trap    (%s) = %s" % (_ctl(d["trap_ctl"]), c2),
+                  file=log)
             if c1 != "DATAPATH" or c2 != "TRAP-ONLY":
                 sys.exit("REFUSING: the probe's own controls do not read "
                          "DATAPATH/TRAP-ONLY; every verdict below would be "
@@ -227,7 +295,7 @@ def run(qemu, isa, cpu, words, jobs, out, control=True, log=sys.stdout):
         with open(out, "w") as fh:
             fh.write("#enc\tverdict\n")
             for w in sorted(res):
-                fh.write("%08x\t%s\n" % (w, res[w]))
+                fh.write("%s\t%s\n" % (w, res[w]))
     return tal
 
 
@@ -244,23 +312,52 @@ def selftest(qemu):
     tmp = tempfile.mkdtemp(prefix="trapstate-st-")
     try:
         chk("fadd v0.4s reads DATAPATH",
-            probe_one((qemu, "aarch64", "max", 0x4E20D400, tmp)) == "DATAPATH")
+            probe_one((qemu, "aarch64", "max", "00d4204e", tmp)) == "DATAPATH")
         chk("fmopa (SME, ZA inactive) reads TRAP-ONLY",
-            probe_one((qemu, "aarch64", "max", 0x80800000, tmp)) == "TRAP-ONLY")
+            probe_one((qemu, "aarch64", "max", "00008080", tmp)) == "TRAP-ONLY")
         chk("add x0,x0,x0 reads DATAPATH",
-            probe_one((qemu, "aarch64", "max", 0x8B000000, tmp)) == "DATAPATH")
+            probe_one((qemu, "aarch64", "max", "0000008b", tmp)) == "DATAPATH")
         chk("an unallocated word does NOT read DATAPATH",
-            probe_one((qemu, "aarch64", "max", 0x00000000, tmp)) != "DATAPATH")
+            probe_one((qemu, "aarch64", "max", "00000000", tmp)) != "DATAPATH")
         # SVE prfb #0, p0, [x0] -- QEMU models the prefetch as a no-op, so
         # the block exists and the instruction contributes nothing.
         chk("an SVE prefetch reads NO-OPS, not TRAP-ONLY",
-            probe_one((qemu, "aarch64", "max", 0x85C00000, tmp)) == "NO-OPS")
+            probe_one((qemu, "aarch64", "max", "0000c085", tmp)) == "NO-OPS")
         mq = qemu.replace("qemu-aarch64", "qemu-mipsel")
         if os.path.exists(mq):
             chk("mipsel addu reads DATAPATH",
-                probe_one((mq, "mipsel", "24Kf", 0x00641021, tmp)) == "DATAPATH")
+                probe_one((mq, "mipsel", "24Kf", "21106400", tmp)) == "DATAPATH")
             chk("mipsel mfc0 reads TRAP-ONLY (its PC write is mov_i32 PC)",
-                probe_one((mq, "mipsel", "24Kf", 0x40020000, tmp)) == "TRAP-ONLY")
+                probe_one((mq, "mipsel", "24Kf", "00000240", tmp)) == "TRAP-ONLY")
+        rq = qemu.replace("qemu-aarch64", "qemu-riscv64")
+        if os.path.exists(rq):
+            # THE riscv64 ARM.  Its trap control is the one that found the
+            # exception-argument store: before _EXCARG existed, c.unimp read
+            # DATAPATH and every riscv verdict would have been unfalsifiable.
+            chk("riscv addi a0,a0,1 reads DATAPATH",
+                probe_one((rq, "riscv64", None, "13051500", tmp)) == "DATAPATH")
+            chk("riscv c.unimp reads TRAP-ONLY (its raise stores a constant "
+                "into env first)",
+                probe_one((rq, "riscv64", None, "0000", tmp)) == "TRAP-ONLY")
+            chk("riscv ecall reads TRAP-ONLY",
+                probe_one((rq, "riscv64", None, "73000000", tmp)) == "TRAP-ONLY")
+            chk("riscv c.andi s0,0 reads DATAPATH (a fold is not a trap)",
+                probe_one((rq, "riscv64", None, "0188", tmp)) == "DATAPATH")
+        xq = qemu.replace("qemu-aarch64", "qemu-x86_64")
+        if os.path.exists(xq):
+            # THE x86 ARM.  addps is SSE and present on the default model;
+            # ud2 is the architecture's own undefined instruction; and the
+            # third arm is the one the whole x86 population turns on -- a VEX
+            # encoding the default model refuses, which reads TRAP-ONLY while
+            # its non-VEX sibling one line above reads DATAPATH.
+            chk("x86 addps reads DATAPATH",
+                probe_one((xq, "x86_64", None, "0f58c0", tmp)) == "DATAPATH")
+            chk("x86 ud2 reads TRAP-ONLY",
+                probe_one((xq, "x86_64", None, "0f0b", tmp)) == "TRAP-ONLY")
+            chk("x86 vaddss at VEX.L=1 reads TRAP-ONLY on the default model",
+                probe_one((xq, "x86_64", None, "c5065800", tmp)) == "TRAP-ONLY")
+            chk("x86 nop reads NO-OPS, not TRAP-ONLY",
+                probe_one((xq, "x86_64", None, "90", tmp)) == "NO-OPS")
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
@@ -282,6 +379,20 @@ def selftest(qemu):
     chk("classifier: no marker for the entry is NO-TB",
         classify(work, 0x401000) == "NO-TB")
     chk("classifier: empty dump is NO-TB", classify("", 0x400078) == "NO-TB")
+    chk("classifier: the x86 PC spelling is stripped too",
+        classify(" ---- 0000000000400078 0 0\n mov_i64 rip,$0x400078\n"
+                 " call raise_exception,$0xa,$0,env,$0x6\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400078) == "TRAP-ONLY")
+    chk("classifier: an exception argument store is not datapath work",
+        classify(" ---- 0000000000400078 0 0\n st_i32 $0x0,env,$0x1370\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call raise_exception,$0x8,$0,env,$0x2\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400078) == "TRAP-ONLY")
+    chk("classifier: a store of a READ value is still datapath work",
+        classify(" ---- 0000000000400078 0 0\n st_i32 x10,env,$0x1370\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call raise_exception,$0x8,$0,env,$0x2\n", 0x400078)
+        == "DATAPATH")
     chk("classifier: a block whose entry contributes no ops is NO-OPS",
         classify(" ---- 0000000000400078 0 0\n\n add_i64 x0,x0,x0\n",
                  0x400078) == "NO-OPS")
@@ -310,7 +421,7 @@ def main():
         help="emulator to read the ops from; defaults to the canonical build's "
              "qemu-aarch64 so a bare --selftest has a subject")
     ap.add_argument("--cpu", default=None)
-    ap.add_argument("--encs", help="file of 8-hex-digit little-endian words")
+    ap.add_argument("--encs", help="file of encodings, one per line, in the corpus's own hex spelling")
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--out")
     ap.add_argument("--no-control", action="store_true")
@@ -322,17 +433,22 @@ def main():
         sys.exit(selftest(a.qemu))
     cpu = a.cpu or ISAS[a.isa]["cpu"]
     if a.selftest_nocontrol:
-        run(a.qemu, a.isa, cpu, [0x8B000000], 1, None)
+        run(a.qemu, a.isa, cpu, ["0000008b"], 1, None)
         sys.exit(0)
     if a.selftest_empty:
         run(a.qemu, a.isa, cpu, [], 1, None)
         sys.exit(0)
     words = []
     for line in open(a.encs):
-        s = line.strip()
+        s = line.strip().lower()
         if s and not s.startswith("#"):
-            # corpus spelling is little-endian byte order
-            words.append(struct.unpack("<I", bytes.fromhex(s))[0])
+            # THE SUBJECT IS THE CORPUS'S OWN SPELLING and is kept that way
+            # end to end -- through the ELF, through the verdict table, and
+            # into whatever joins the two.  The word/%08x round trip this
+            # replaced silently re-ordered the bytes on the way out, so a
+            # join against the corpus matched nothing and read MISSING.
+            bytes.fromhex(s)
+            words.append(s)
     run(a.qemu, a.isa, cpu, words, a.jobs, a.out, control=not a.no_control)
 
 

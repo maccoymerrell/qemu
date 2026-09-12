@@ -220,6 +220,24 @@ typedef struct InsnFields {
      * dst snap; the REG_FLAGS dst slot itself is unchanged.
      */
     bool    writes_int_flags;
+    /*
+     * THE ROW SAID "THIS ENCODING COULD BE THE FLAG-ONLY SHAPE"; the
+     * SEATED DESTINATION LIST SAYS WHETHER IT IS.
+     *
+     * Set by a per-ISA .refine on the rows whose family has a
+     * discard-the-result form (AArch64 SUBS/ADDS/ANDS/BICS with XZR as
+     * Rd, printed CMP/CMN/TST).  It is a SCOPE and not a verdict: the
+     * refiners run at decode time, before reindex_src_for_qemu() and
+     * seat_dst_for_qemu() have put QEMU's write rows on the slots, so a
+     * refiner asking "is every destination the flags or the zero
+     * register?" is asking the operand walk, which is the list being
+     * deleted.  The question is answered once, from the final list, in
+     * derive_flag_only_opcode() (champsim_tracer_qdep.cc).
+     *
+     * SCRATCH-LIFETIME.  Nothing copies it into a committed template:
+     * by the time one is built the answer is already in @opcode.
+     */
+    bool    flag_only_shape_candidate;
     uint8_t n_src_regs;
     uint8_t n_dst_regs;
     /*

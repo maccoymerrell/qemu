@@ -6571,6 +6571,69 @@ static void derive_writes_int_flags(InsnFields *f)
     }
 }
 
+/*
+ * THE FLAG-ONLY SHAPE, ASKED OF THE LIST THE WIRE PUBLISHES.
+ *
+ * A flag-writing form whose result register is the zero register keeps
+ * nothing in the regfile, and the opcode says so: AArch64 prints
+ * SUBS/ADDS/ANDS xzr as CMP/CMN/TST, and `bics xzr, xn, xm` has the same
+ * shape with no alias mnemonic of its own.  The predicate is the
+ * DESTINATION SET -- every destination is the flags or the zero register
+ * -- and the only list that answers it is the one seated from QEMU's
+ * write rows, which exists only here.
+ *
+ * IT CANNOT BE ASKED AT THE DECODE SITE.  refine_arm64_cmp_alias() used
+ * to decide it there, over the operand walk's dst_regs[], with an
+ * explicit "or the array is empty" clause.  An EMPTY array satisfies
+ * "every entry is FLAGS or ZERO" vacuously, so with the walk's write arm
+ * deleted the clause fired for EVERY flag-setting member of the family:
+ * `adds x9, x9, x10` at 0x400284 published opcode GEN_OP_CMP beside a
+ * destination list that still read [REG_FLAGS, REG_GPR9] -- a
+ * Substantial-op demotion of an instruction that writes a real register,
+ * and one the destination bar cannot see because only the opcode moved.
+ *
+ * SO THE EMPTY LIST REFUSES.  n_dst_regs == 0 is "QEMU stated no
+ * destination", which is not the same fact as "the destinations it
+ * stated are all discarded", and promoting on it would be reading a
+ * verdict out of an absence.  The canonical SUBS/ADDS/ANDS/BICS opcode
+ * stands in that case, which is the direction that keeps a real write
+ * visible.
+ *
+ * SCOPED BY THE ROW, not by the opcode: @flag_only_shape_candidate is
+ * set only by the per-ISA refiner attached to the family's identity
+ * rows, so an ordinary `add x0, x1, x2` -- which never sets flags and
+ * whose family has no discard form -- is not a subject even if some
+ * future seating left it destinationless.
+ */
+static void derive_flag_only_opcode(InsnFields *f)
+{
+    if (!f->flag_only_shape_candidate || f->n_dst_regs == 0) {
+        return;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        if (f->dst_regs[d] == REG_FLAGS) continue;
+        if (f->dst_regs[d] == REG_ZERO) continue;
+        /* A real register destination — the result was kept. */
+        return;
+    }
+    switch (f->opcode) {
+    case GEN_OP_INT_SUB:    /* SUBS xzr, ...  -> CMP */
+    case GEN_OP_INT_ADD:    /* ADDS xzr, ...  -> CMN; same flag-only
+                             * shape, mapped to CMP since there's no
+                             * dedicated GEN_OP_CMN. */
+        f->opcode = GEN_OP_CMP;
+        break;
+    case GEN_OP_AND:        /* ANDS xzr, ... -> TST; BICS xzr, ...
+                             * is the same discard-and-keep-flags
+                             * shape and has no alias mnemonic of its
+                             * own, so it maps here too. */
+        f->opcode = GEN_OP_TEST;
+        break;
+    default:
+        return;
+    }
+}
+
 static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,
                              const QDepInsn *q, const char *mnem,
                              InsnEnc enc);
@@ -6586,6 +6649,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      */
     apply_lane_carry(f);
     derive_writes_int_flags(f);
+    derive_flag_only_opcode(f);
 }
 
 static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,

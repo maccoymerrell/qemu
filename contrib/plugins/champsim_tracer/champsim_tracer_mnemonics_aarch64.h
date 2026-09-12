@@ -917,21 +917,21 @@ static void refine_arm64_fp_vec(
  * read one: the detection below is the DESTINATION SET, so BICS is in
  * scope too and is in CMP_ALIAS_PROMOTE_INSNS for that reason (it is
  * also the second form of QEMU's own ANDS_r rule, so gating on the
- * alias list left that rule's identity row unresolvable).  Capstone
- * returns the underlying SUBS/ADDS/ANDS/BICS insn id (the assembler
- * mnemonic alias is just the disasm string), and
- * recent Capstone versions resolve the alias by dropping XZR from
- * the explicit operand list — only the implicit NZCV write remains,
- * so the walker's dst_regs[] for a `cmp` ends up containing just
- * REG_FLAGS.  Older Capstone (and the canonical `subs xzr, ...`
- * form) instead exposes XZR explicitly and the walker adds REG_ZERO
- * to dst_regs[]; both shapes are recognised below.
+ * alias list left that rule's identity row unresolvable).
  *
- * Detection: every dst_regs[] entry must be REG_FLAGS or REG_ZERO
- * (or the array is empty if implicit-regs weren't folded in for some
- * reason).  Any other register destination means the assembler
- * wrote a real arithmetic result — keep the canonical SUBS/ADDS/ANDS
- * opcode.
+ * THIS FUNCTION DOES NOT DECIDE; IT SCOPES.  The detection is the
+ * DESTINATION SET — every destination must be REG_FLAGS or REG_ZERO,
+ * i.e. the instruction kept nothing in the regfile — and at the moment
+ * a refiner runs that set is the operand walk's, not QEMU's:
+ * reindex_src_for_qemu() and seat_dst_for_qemu() have not run yet.
+ * Asking the walk is asking the list this arc deletes, and an EMPTY
+ * list satisfies "every entry is FLAGS or ZERO" VACUOUSLY, so a refiner
+ * that decided here would promote every flag-setting SUBS/ADDS/ANDS/BICS
+ * the moment the walk's write arm went away — `adds x9, x9, x10`
+ * published as a compare while its own destination list still says
+ * REG_GPR9.  So the row only marks itself as a candidate, and
+ * derive_flag_only_opcode() (champsim_tracer_qdep.cc) asks QEMU's
+ * seated list, once, after both seatings.
  *
  * REG_ZERO is NOT stripped after promotion.  It used to be, so that
  * the per-insn shape matched the assembler-visible mnemonic — but the
@@ -949,29 +949,7 @@ static void refine_arm64_cmp_alias(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
     (void)info;
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        if (f->dst_regs[d] == REG_FLAGS) continue;
-        if (f->dst_regs[d] == REG_ZERO) continue;
-        /* A real register destination — assembler didn't use the
-         * XZR alias.  Keep the canonical SUBS/ADDS/ANDS opcode. */
-        return;
-    }
-    switch (f->opcode) {
-    case GEN_OP_INT_SUB:    /* SUBS xzr, ...  -> CMP */
-    case GEN_OP_INT_ADD:    /* ADDS xzr, ...  -> CMN; same flag-only
-                             * shape, mapped to CMP since there's no
-                             * dedicated GEN_OP_CMN. */
-        f->opcode = GEN_OP_CMP;
-        break;
-    case GEN_OP_AND:        /* ANDS xzr, ... -> TST; BICS xzr, ...
-                             * is the same discard-and-keep-flags
-                             * shape and has no alias mnemonic of its
-                             * own, so it maps here too. */
-        f->opcode = GEN_OP_TEST;
-        break;
-    default:
-        return;
-    }
+    f->flag_only_shape_candidate = true;
 }
 
 /*

@@ -626,68 +626,40 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
 }
 
 /*
- * Pointer-stable QemuRegKey identity: add_{src,dst}_reg routes through
- * qemu_reg_for_row(), which returns the g_qemu_reg_by_gen[] singleton
- * whenever every row for the generic ID holds the same (feature, name)
- * pair -- the Capstone-alias case -- and the row's own key when they
- * do not.
+ * THE ENUM TABLE'S TWO REGISTER-LIST ENTRY POINTS ARE GONE.
  *
- * Returns a mask of src_regs[] slots holding the registers behind
- * @cap_id.  One Capstone reg id can expand into multiple aliases
- * (rc->n_regs > 0), each in its own slot; the caller needs them for
- * HAS_ADDR address-dep masks.
+ * `add_src_cap_reg()` and `add_dst_cap_reg()` translated a CAPSTONE REGISTER
+ * ID, through `lookup_reg_class()` and the per-ISA `<isa>_reg_class[]` table,
+ * into generic register slots on `src_regs[]` / `dst_regs[]`.  They were the
+ * only route by which a register reached either published list without QEMU
+ * or a survivor row naming it.
+ *
+ * The write one lost its last caller at bd2848c450 (the operand walk's WRITE
+ * arm).  The read one kept ONE caller after f9ce637d94 deleted the read arm:
+ * the MEM operand's base / index / segment, folded into
+ * `load_addr_dep_mask[]` / `store_addr_dep_mask[]`.  That call is deleted
+ * with this comment, and the reason it could be is that qdep_apply() had
+ * already taken the whole family: `f->max_dep_loads` / `max_dep_stores` are
+ * QEMU's access counts (never the walk's -- see champsim_tracer_qdep.cc's
+ * "It never falls back to the operand walk's number"), and EVERY slot below
+ * those counts is written from `q->load_addr_regs[]` / `q->store_addr_regs[]`
+ * or from the format's all-inputs default.  The walk's mask was overwritten
+ * before it could be serialised; what the call still did was ADD the address
+ * registers to `src_regs[]`, where reindex_src_for_qemu() keeps a walk-only
+ * source as a trailing slot -- a Capstone-sourced register on the wire.
+ *
+ * MEASURED, both directions, before deleting it.  `qemu-x86_64 /bin/echo hi`
+ * at wpdepth=16 under `setarch -R` at matched output-path length: 309,170
+ * facts on each arm, CHANGED 0, REAL-LOST 0, REAL-GAIN 0 over 24,100 compared
+ * pcs -- so no address mask and no source list moved.  The address census on
+ * the same pair is identical to the row: 10,452 accesses with "QEMU stated
+ * every access's address and the block carries them", 0 partial, 0 refused,
+ * and "QEMU addresses STATED minus CARRIED" 0.  The other three ISAs read the
+ * same shape under `validator all --seed 4242` (a64 221, rv 221, mipsel 442,
+ * all STATED-and-CARRIED, 0 refused), which is the arm that would have to
+ * move if a walk-supplied register had been holding a mask up: a register
+ * absent from `src_regs[]` makes `regs_to_mask()` refuse the slot by name.
  */
-static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
-                                       uint16_t cap_id)
-{
-    const RegClassification *rc = lookup_reg_class(cap_id);
-    if (!rc) {
-        return 0;
-    }
-    uint64_t mask = 0;
-    if (rc->n_regs) {
-        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            uint8_t gen = rc->regs[i];
-            uint8_t slot = add_src_reg(f, refs, gen,
-                                       qemu_reg_for_generic(gen));
-            if (slot < MAX_SRC_REGS) {
-                mask |= (uint64_t)1 << slot;
-            }
-        }
-        return mask;
-    }
-    uint8_t slot = add_src_reg(f, refs, rc->reg_id, qemu_reg_for_row(rc));
-    if (slot < MAX_SRC_REGS) {
-        mask |= (uint64_t)1 << slot;
-    }
-    return mask;
-}
-
-static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
-                                   uint16_t cap_id)
-{
-    const RegClassification *rc = lookup_reg_class(cap_id);
-    if (!rc) {
-        return;
-    }
-    if (rc->n_regs) {
-        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            uint8_t gen = rc->regs[i];
-            add_dst_reg(f, refs, gen, qemu_reg_for_generic(gen));
-        }
-        return;
-    }
-    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_row(rc));
-    /*
-     * Mark integer-flags writer so the encoder emits a CST_FID_METAFLAGS
-     * record (Z/N/C/V/P from the REG_FLAGS dst snap).  Gated on the
-     * per-ISA .is_int_flags marker — set only on x86 EFLAGS / AArch64
-     * NZCV, never x86 FPSW / mips DSP-flag / flagless ISAs.
-     */
-    if (rc->is_int_flags) {
-        f->writes_int_flags = true;
-    }
-}
 
 /* OR @lane into every src_regs[] slot @cap_id maps to.  Per-operand
  * lane-mask assignment: scalar operands keep slot mask 0, only the
@@ -1790,9 +1762,6 @@ void decode_detail_to_generic(uint64_t pc,
              * addressing and always report 0 here.
              */
             uint64_t addr_mask = 0;
-            addr_mask |= add_src_cap_reg(out, out_names, op->reg_id);
-            addr_mask |= add_src_cap_reg(out, out_names, op->index_id);
-            addr_mask |= add_src_cap_reg(out, out_names, op->segment_id);
 
             /*
              * An INTERIM count, and it does not reach the wire.
@@ -1927,11 +1896,9 @@ void decode_detail_to_generic(uint64_t pc,
      */
     if (const qemu_plugin_operand *sea_op =
             synthetic_ea_slotless_mem_operand(info, out->opcode)) {
+        (void)sea_op;
         if (out->max_dep_loads < MAX_LOADS) {
             uint64_t addr_mask = 0;
-            addr_mask |= add_src_cap_reg(out, out_names, sea_op->reg_id);
-            addr_mask |= add_src_cap_reg(out, out_names, sea_op->index_id);
-            addr_mask |= add_src_cap_reg(out, out_names, sea_op->segment_id);
             out->load_addr_dep_mask[out->max_dep_loads] = addr_mask;
             out->max_dep_loads++;
             out->has_addr_deps = true;

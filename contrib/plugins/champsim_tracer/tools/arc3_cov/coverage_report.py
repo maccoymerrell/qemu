@@ -116,7 +116,18 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
                          'verdict cannot be told apart from a coverage hole, '
                          'and this report will not average over the '
                          'difference' % path)
-            unpro[r['qemu_tcg_reachable']] += 1
+            # THE LAYOUT EXCLUSION IS ITS OWN BUCKET (exec179, 179-C).  HOLE
+            # means "an opcode a QEMU guest runs and THE TRACER never decoded",
+            # and an encoding the SLED removed from its own population because
+            # the slot padding decodes as it was never put to the tracer at
+            # all.  Both are UNCOVERED and both are counted; they are not the
+            # same finding, and the headline says which is which.  Folding
+            # them made the x86_64 leg fail on `ret`, whose 3,502 classified
+            # occurrences sit in any real trace.
+            if r.get('mechanism') == 'sled-terminator-collision':
+                unpro['layout'] += 1
+            else:
+                unpro[r['qemu_tcg_reachable']] += 1
         if r[verdict_col] != disagree:
             continue
         if 'direction' not in r:
@@ -301,6 +312,7 @@ def main():
         probed = agree + len(rows)
         gcounts['hole'] += _unp['yes']
         gcounts['outofscope'] += _unp['no']
+        gcounts['layout'] += _unp['layout']
         for k in tax.DIRECTIONS:
             grand[k] += c[k]
         gcounts['agree'] += agree
@@ -341,14 +353,20 @@ def main():
     # three x86_64 reports while its composition moved 2479/234 -> 2363/349
     # reachable; a constant hid a 50% growth in the coverage hole.  Both
     # components travel together, always.
-    w('UNPROBED, counted here and nowhere else: %d = %d out-of-scope + %d'
-      % (gcounts['unprobed'], gcounts['outofscope'], gcounts['hole']))
+    w('UNPROBED, counted here and nowhere else: %d = %d out-of-scope + %d '
+      'sled-layout + %d'
+      % (gcounts['unprobed'], gcounts['outofscope'], gcounts['layout'],
+         gcounts['hole']))
     w('REACHABLE.  An opcode with no comparison has no direction; it is the')
     w('most complete form of dropped information, not a row that agreed.  The')
     w('out-of-scope component is only out of scope where the per-ISA harness')
     w('charged it to a citation from the QEMU tree -- for x86_64 that is')
     w('qemu_tcg_scope.py, which re-asserts every citation on every run and')
     w('refuses when one goes stale.  The REACHABLE component is the hole.')
+    w('The sled-layout component is neither: it is an encoding the SLED could')
+    w('not put in a slot because the slot PADDING decodes as it')
+    w('(srcenc_sled.terminator_collisions()), so the tracer was never asked.')
+    w('UNCOVERED, counted, and NOT a tracer decode gap -- 179-C.')
     w('')
 
     # ------------------------------------------------ the three-valued split
@@ -393,8 +411,10 @@ def main():
             agree = counts.get('AGREE', 0) + counts.get('agree', 0)
             cov_ = agree + c[tax.SUPERSET]
             unreach = _unp['no']
+            # `layout` is UNCOVERED, not UNREACHABLE: nobody proved the guest
+            # cannot run it, the sled simply could not put it in a slot.
             unc = (c[tax.SUBSET] + c[tax.UNACCOUNTED] + c[tax.ORTHOGONAL] +
-                   _unp['yes'])
+                   _unp['yes'] + _unp['layout'])
         cov = cov_
         g3['c'] += cov
         g3['u'] += unreach

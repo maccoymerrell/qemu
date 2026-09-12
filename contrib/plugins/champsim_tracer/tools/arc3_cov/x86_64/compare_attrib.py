@@ -44,6 +44,57 @@ import arc3_taxonomy as tax
 import qemu_tcg_scope as tcgscope
 import arc3_rules as taxrules
 
+# ------------------------------------------------- THE SLED'S OWN EXCLUSION
+#
+# WHY THIS IMPORT EXISTS (exec179, 179-C).  The tracer arm of this leg asks
+# `isaxcheck --layer=fields`, which classifies from QEMU's decode identity --
+# and that identity comes from `srcenc_sled.py`, which BUILDS A SLED: one slot
+# per encoding, `[encoding][terminator repeated to the stride]`.  Its
+# `terminator_collisions()` then REMOVES from the population every byte string
+# the padding itself decodes as, because such an encoding reaches the
+# translator in two architectural situations in one sweep and the corpus can
+# hold one row for it.  That removal is correct and deliberate.  It was also
+# announced only on stdout, to no file any downstream instrument reads.
+#
+# WHAT THAT COST.  On x86_64 the terminator is `\xc3` -- `ret` -- so the sled's
+# population loses exactly one encoding, `c3`, and the ident corpus has no
+# decode id for it.  `isaxcheck` with no identity answers
+# `fields ok=0 GEN_OP_UNKNOWN`, this file wrote
+# `mechanism=tracer-decode-gap  category=tracer-defect`, and
+# `coverage_report.py` promoted it to REACHABLE-UNPROBED HOLE = 1: the most
+# severe class it has a column for, and the condition the R13 gate fails the
+# whole x86_64 static leg on.
+#
+# IT IS NOT A TRACER DECODE GAP, and the refutation is direct rather than
+# argued.  At `9722718566` / plugin `19491c4774829082`, a 163,978-instruction
+# qemu-x86_64 user trace of a static binary emits ZERO
+# `champsim_tracer: unknown instruction` warnings, and `cst_decode` renders
+# 3,502 instruction lines whose bytes are `c3`, every one classified `ret`
+# with its dataflow: `ld[%sp](..) -> %pc ; %sp -> %sp ; %seg5`.  The sibling
+# `c20000` -- `retq $imm16`, QEMU's other `RET` entry
+# (target/i386/tcg/decode-new.c.inc:1753/1754) -- IS in the corpus and AGREES.
+#
+# So the row gets its OWN mechanism.  It is still NOT COVERED and still counted
+# -- an encoding this leg cannot probe is a real gap in the leg -- but it is a
+# gap in the SLED LAYOUT, not in the tracer, and the two are not the same
+# finding.  The set is recomputed here from `terminator_collisions()` itself
+# rather than parsed out of a log, so there is one implementation and it cannot
+# drift from the sled's.
+#
+# THE COVERAGE PATH, so this is a classification and not an excuse: a second
+# sled pass with a DIFFERENT terminator moves the collision set, and the
+# encoding the first pass could not measure is measured by the second.  Until
+# that exists the row is UNCOVERED and says which arm owes it.
+sys.path.insert(0, os.path.dirname(_TOOLS))       # .../champsim_tracer/tools
+try:
+    from srcenc_sled import terminator_collisions as _term_collisions
+except ImportError as _e:                         # pragma: no cover
+    sys.exit('compare_attrib: cannot import srcenc_sled.terminator_collisions '
+             '(%s).  The sled decides which encodings this leg can probe at '
+             'all; without that list every layout exclusion is reported as a '
+             'tracer decode gap, which is a false conviction -- REFUSING '
+             'rather than scoring blind.' % _e)
+
 # ---------------------------------------------------------------- vocabulary
 # The tracer's declared x86 register vocabulary, parsed from its own table.
 TRACER_REG = {}
@@ -839,11 +890,25 @@ mech_regs = collections.defaultdict(set)
 tax_rows = []                       # the two-axis classification, one per DISAGREE
 tax_labels = collections.Counter()  # every mechanism label seen, for rule coverage
 n_collapse_dependent = 0
+n_unprobed_layout = 0
 unprobed_by_reach = collections.Counter()
 
 with open(os.path.join(COV, 'opcodes.tsv')) as f:
     next(f)
     opcodes = [l.rstrip('\n').split('\t') for l in f]
+
+# The encodings the sled cannot probe, recomputed from the sled's own rule
+# over THIS denominator's instruction lengths.  Empty is a refusal, not a
+# pass: `terminator_collisions()` always returns the padding's own decodes,
+# so an empty set means the probe list did not reach this file.
+_probe_lens = {len(PROBE.get(o[0], o[2])) // 2 for o in opcodes}
+TERM_COLLIDE = _term_collisions('x86_64', _probe_lens)
+if not TERM_COLLIDE:
+    sys.exit('compare_attrib: terminator_collisions("x86_64") is EMPTY over '
+             '%d probe lengths.  The slot padding always decodes as SOMETHING, '
+             'so an empty set means the lengths never arrived -- REFUSING '
+             'rather than reporting every layout exclusion as a tracer decode '
+             'gap.' % len(_probe_lens))
 
 for opid, mnem, enc_hex, srctab in opcodes:
     hexs = PROBE.get(opid, enc_hex)
@@ -855,6 +920,24 @@ for opid, mnem, enc_hex, srctab in opcodes:
 
     if t is None or not t['ok']:
         n_unprobed_tracer += 1
+        # THE SLED'S OWN EXCLUSION IS NOT A TRACER DECODE GAP -- see the
+        # import block.  An encoding the slot PADDING also decodes as was
+        # removed from the sled population by terminator_collisions(), so no
+        # decode identity was ever captured for it and the fields layer has
+        # nothing to classify from.  That is a gap in THIS LEG's probe, not in
+        # the tracer, and conflating the two convicts a decoder that works.
+        if bytes.fromhex(hexs) in TERM_COLLIDE:
+            n_unprobed_layout += 1
+            unprobed_by_reach[('sled_terminator_collision', reach)] += 1
+            rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach,
+                         'UNPROBED',
+                         'leg: this encoding IS the sled terminator, so '
+                         'srcenc_sled.terminator_collisions() removed it from '
+                         'the population and no decode identity exists for it '
+                         '-- the tracer was never asked', '', '', '', '', 'na',
+                         'sled-terminator-collision', 'NOT-COMPARED',
+                         'NOT-COMPARED', 'leg-coverage', '0'))
+            continue
         unprobed_by_reach[('tracer_decode_fail', reach)] += 1
         rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'UNPROBED',
                      'tracer: decoder does not decode these bytes '
@@ -1140,6 +1223,13 @@ w('  tracer decoder rejects the bytes, not reachable      : %d' %
 w('  reference decoder rejects the bytes                  : %d' %
   sum(v for (why, rc), v in unprobed_by_reach.items()
       if why == 'reference_decode_fail'))
+w('  IS the sled terminator, so the sled could not probe it: %d' %
+  sum(v for (why, _rc), v in unprobed_by_reach.items()
+      if why == 'sled_terminator_collision'))
+w('    (srcenc_sled.terminator_collisions(); the encodings the slot PADDING')
+w('     also decodes as.  UNCOVERED by this leg and counted, but the gap is')
+w('     the LAYOUT\'s: the tracer was never asked.  Coverage path = a second')
+w('     sled pass with a different terminator.)')
 w('')
 w('')
 w('  the two legs of the exclusion, and neither is the decoder\'s opinion:')

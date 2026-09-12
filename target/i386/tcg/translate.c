@@ -1388,6 +1388,50 @@ static void gen_note_tsc_aux_read(void)
                                        sizeof(((CPUX86State *)0)->tsc_aux));
 }
 
+/*
+ * THE TWO GENERAL-PURPOSE DESTINATIONS `rdtsc` AND `rdtscp` WRITE.
+ *
+ * EDX:EAX <- the time-stamp counter (Intel SDM vol.2 "RDTSC", "RDTSCP";
+ * AMD APM vol.3), zero-extended to 64 bits in long mode -- which is exactly
+ * what helper_rdtsc() performs, `env->regs[R_EAX] = (uint32_t)val` and
+ * `env->regs[R_EDX] = (uint32_t)(val >> 32)` at
+ * target/i386/tcg/misc_helper.c.  The translation emits only the call.
+ *
+ * THE EXTRACTION CANNOT REACH THEM AND SAYS SO.  helper_rdtsc() is one of
+ * the two rows accel/tcg/insn-dataflow-usage/i386.c.inc lists under "Rows
+ * refused, and therefore still OVER-APPROXIMATED at run time": the reader
+ * cannot close the body because cpu_get_tsc() is not defined in the
+ * preprocessed unit.  A refused row is OPAQUE, not empty, so the write list
+ * for `rdtsc` carried neither register -- the same shape as SYSCALL's RCX
+ * and R11 before gen_SYSCALL() stated them, and stated here for the same
+ * reason and in the same form.
+ *
+ * R20 IS WHY THE DECODE SITE MAY SAY IT, exactly as it is for the READ two
+ * functions up: which registers the opcode writes is a STATIC fact of the
+ * opcode, known once at translation time for every execution of those bytes.
+ * Nothing is observed and nothing is derived.
+ *
+ * BY RANGE, because regs[] is where cpu_regs[] lives: the declaration that
+ * names every ordinary access to those bytes names these too, and there is
+ * no second spelling to keep in step -- gen_note_gpr_read()'s form, in the
+ * other direction.
+ *
+ * The WHOLE slot, not the low half: the helper stores a zero-extended
+ * 64-bit value, which is what the architecture defines in long mode, so the
+ * bytes the instruction leaves are the bytes the write names.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_tsc_write(void)
+{
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, regs[R_EAX]),
+        sizeof(((CPUX86State *)0)->regs[0]));
+    insn_dataflow_note_stated_write_env(
+        offsetof(CPUX86State, regs[R_EDX]),
+        sizeof(((CPUX86State *)0)->regs[0]));
+}
+
 static void gen_note_gpr_read(int n)
 {
     insn_dataflow_note_stated_read_env(
@@ -5028,6 +5072,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             translator_io_start(&s->base);
             gen_note_tsc_read();
             gen_note_tsc_aux_read();
+            gen_note_tsc_write();
             gen_helper_rdtsc(tcg_env);
             gen_helper_rdpid(s->T0, tcg_env);
             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);

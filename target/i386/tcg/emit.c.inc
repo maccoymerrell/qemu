@@ -4233,6 +4233,7 @@ static void gen_RDTSC(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     translator_io_start(&s->base);
+    gen_note_tsc_write();
     gen_helper_rdtsc(tcg_env);
 }
 

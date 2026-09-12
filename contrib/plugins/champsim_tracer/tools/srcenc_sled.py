@@ -299,6 +299,32 @@ def terminator_collisions(isa, lengths):
 #: encoding is not reachable AT ALL on the default 24Kf, so a sled that means
 #: to translate one has to say which CPU it means and carry the matching
 #: ABI flag.
+#:
+#: WHAT AN ASE-ENABLED ARM ACTUALLY MOVES (177-A, measured at exec180).  The
+#: option existed and had never been driven over a whole population, so the
+#: 493,576 TRAP-STATE instances #369 parks were un-adjudicable by
+#: construction.  Both arms over the SAME 1,290,789-encoding population, the
+#: same tip and the same plugin `19491c4774829082`:
+#:
+#:     rows whose published src names REG_SYSEXC (the raise)
+#:         24Kf (default)           855,579
+#:         P5600 --nan2008          285,509        delta -570,070
+#:     TRAP-shaped on 24Kf and REAL on P5600        576,214
+#:     REAL on 24Kf and TRAP-shaped on P5600          6,144
+#:
+#: and the freed rows are the ASE: `bz.*`/`bnz.*` 6,144 each, then the MSA
+#: load/stores.  A witness, byte for byte --
+#:
+#:     0e1ea07b  24Kf min_a.h{REG_SYSEXC,REG_VEC3,REG_VEC0}
+#:               P5600 min_a.h{REG_VEC3,REG_VEC0}
+#:
+#: -- so on the default model the wire is telling the truth about a raise,
+#: and on an MSA model the same encoding publishes its real operands.  THE
+#: 6,144 GOING THE OTHER WAY ARE NOT NOISE and are not explained here: they
+#: are encodings the 24Kf decoder resolves and P5600 does not, and they are
+#: the reason this is an A/B and not a replacement.  The two arms measure two
+#: machines; neither is "the" answer and a corpus from one may not be scored
+#: against a ceiling derived from the other.
 EF_MIPS_NAN2008 = 0x00000400
 
 

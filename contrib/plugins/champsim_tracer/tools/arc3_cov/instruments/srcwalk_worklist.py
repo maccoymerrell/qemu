@@ -94,8 +94,10 @@ Run with --selftest for the planted-fire proof in every refusal direction.
 Author: Maccoy Merrell.
 """
 import argparse
+import collections
 import os
 import re
+import struct
 import sys
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -229,6 +231,44 @@ def losses(a, b, isa):
         if lost:
             out.append((enc, mnem, lost))
     return out
+
+
+def encfield(a, b, isa, mnem_re, lo, hi):
+    """Histogram an ENCODING BIT-FIELD over the LOSING encodings of a family.
+
+       THE THIRD QUESTION.  exec177 asked "does the encoding NAME the
+       register" and answered with a disassembler.  exec181 asked "did the
+       datapath RUN" and answered with QEMU's ops.  Both can say yes while
+       the register is still not read, because a fixed-width ISA's own
+       definition can make a NAMED operand of an EXECUTING instruction
+       contribute nothing:
+
+           extr Xd,Xn,Xm,#0   ->  concat(Xn:Xm)<63:0> == Xm.  Rn is named,
+                                  the instruction runs, and Rn supplies zero
+                                  bits.  QEMU lowers it to `ext32u_i64 x0,x1`
+                                  -- one source -- and QEMU is right.
+
+       A ruling of that shape is only as good as its arm, and an arm that
+       reads four examples is an assertion.  This histograms the field over
+       the WHOLE losing family from the same two corpora the bar is scored
+       from, so "all 96 carry imms=0" is a measurement with a denominator.
+
+       Fixed-width ISAs only: the encodings are read as one little-endian
+       32-bit word, which is what the corpus's own hex spelling holds for
+       aarch64, mipsel and riscv64.  x86 has no bit-field to histogram and
+       asking for one would be pretending a decoder is a table."""
+    rx = re.compile(mnem_re)
+    hist, bad = collections.Counter(), []
+    for enc, mnem, lost in losses(a, b, isa):
+        if not rx.search(mnem):
+            continue
+        try:
+            w = struct.unpack("<I", bytes.fromhex(enc))[0]
+        except Exception:
+            bad.append(enc)
+            continue
+        hist[(w >> lo) & ((1 << (hi - lo + 1)) - 1)] += len(lost)
+    return hist, bad
 
 
 def score(a, b, rows, isas=ISAS, bar=False, trap=None):
@@ -529,6 +569,11 @@ def main():
                          "under D17 and never reaches the table")
     ap.add_argument("--bar", action="store_true",
                     help="fail unless REAL-LOST is 0 on every scored ISA")
+    ap.add_argument("--encfield", metavar="ISA:MNEM_RE:LO:HI",
+                    help="instead of scoring, histogram encoding bits LO:HI "
+                         "over the losing encodings whose mnemonic matches "
+                         "MNEM_RE -- the whole-population arm behind a "
+                         "family ruling.  Fixed-width ISAs only.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -547,6 +592,39 @@ def main():
             continue
         a.update(pa)
         b.update(pb)
+    if args.encfield:
+        try:
+            fisa, mre, lo, hi = args.encfield.rsplit(":", 3)
+            # ARM and MIPS manuals write a field high:low ("imms is 15:10");
+            # famarm.py writes it low:high.  Both spellings name the same
+            # bits, so neither is refused -- the pair is normalised instead.
+            lo, hi = sorted((int(lo), int(hi)))
+        except Exception:
+            ap.error("--encfield wants ISA:MNEM_RE:LO:HI")
+        if fisa not in ISAS:
+            ap.error("--encfield ISA must be one of %s" % (ISAS,))
+        if fisa == "x86_64":
+            print("REFUSING: x86_64 has no fixed encoding bit-field to "
+                  "histogram; a slot table for it would be a decoder.")
+            return 2
+        if not a or not b:
+            print("REFUSING: a corpus arm is empty, so the histogram would "
+                  "have no subject.")
+            return 2
+        hist, bad = encfield(a, b, fisa, mre, lo, hi)
+        tot = sum(hist.values())
+        if tot == 0:
+            print("REFUSING: no losing encoding on %s matches %s -- an arm "
+                  "with no subject abstains." % (fisa, mre))
+            return 2
+        print("encfield %s /%s/ bits %d:%d over %d losing register "
+              "instance(s)" % (fisa, mre, lo, hi, tot))
+        for v, n in sorted(hist.items()):
+            print("  0x%02x  %6d  %5.1f%%" % (v, n, 100.0 * n / tot))
+        if bad:
+            print("  UNPARSED encodings: %d (%s ...)" % (len(bad), bad[0]))
+        return 1 if bad else 0
+
     rows, et = load_table(args.table)
     errs += et
     trap, te = load_trapstate(args.trapstate)

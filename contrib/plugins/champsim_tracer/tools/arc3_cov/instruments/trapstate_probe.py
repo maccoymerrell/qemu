@@ -188,6 +188,48 @@ _PCSET = re.compile(r"^mov_i(32|64) (pc|PC|rip|eip),\$")
 # ALSO writes the PC and calls an exception helper, which is the trap shape
 # and nothing else.
 _EXCARG = re.compile(r"^st(8|16|32|64)?_i(32|64) \$0x[0-9a-f]+,env,\$")
+# A CONSTANT MATERIALISED INTO A TEMP READS NOTHING, SO IT CANNOT WITNESS AN
+# OPERAND READ.
+#
+# This probe asks one question -- did the encoding's datapath read its
+# operands? -- and answers it from the ops.  An op is evidence for YES only if
+# it reads something: a guest register global, an env field, memory, another
+# temp that traces back to one of those.  `mov_i32 loc2,$0x3` reads NONE of
+# those.  It is a number the translator already had, put somewhere the
+# translator chose.  Whatever else it is, it is not the instruction consulting
+# the machine.
+#
+# MEASURED, and it is why this rule exists.  On the swept mipsel model (24Kf,
+# no DSP ASE) `dpax.w.ph $ac3,zero,zero` translates to
+#
+#     mov_i32 loc2,$0x3          <- the ac index
+#     mov_i32 loc3,$0x0          <- rs
+#     mov_i32 loc4,$0x0          <- rt
+#     mov_i32 PC,$0x400074
+#     call raise_exception_err,$0x8,$0,env,$0x14,$0x0     <- EXCP_RI
+#     call dpax_w_ph,$0x0,$0,loc2,loc3,loc4,env           <- UNREACHABLE
+#
+# The dead-op rule already kills the helper call.  What survived was the three
+# argument moves ABOVE the raise, and a filter counting them as work called
+# this DATAPATH -- so 4,224 `$ac` register instances, mipsel's entire DSP
+# accumulate population, sat on the REAL side of the R12.1 bar as operands of
+# an instruction the machine answers with an Illegal Instruction.  The same
+# shape scored `ins` (nothing but one dead argument move) and `addwc` the same
+# way.  exec177-2's "mips-acc CONFIRMED REAL ... 6,708 DATAPATH" is that
+# reading, and it is REFUTED here by QEMU's own ops.
+#
+# THE RULE IS NARROW ON PURPOSE, IN TWO DIRECTIONS.
+#
+#  * It matches a constant into a TEMP only.  `mov_i64 x8,$0x5d` puts a
+#    constant into a guest register global -- that is an architectural WRITE
+#    and stays work.
+#  * It does NOT generalise to dead values.  `add_i32 loc2,loc3,loc4` whose
+#    loc2 nothing reads is still work, and the probe's own arm "work BEFORE
+#    the raise still counts" holds it to that: the add READS loc3 and loc4,
+#    which is evidence the datapath ran, whatever became of the result.  A
+#    full liveness sweep would delete that evidence and would be the
+#    over-widening this comment exists to refuse.
+_CONSTTMP = re.compile(r"^movi?_i(32|64) (loc|tmp)\d+,\$0x[0-9a-f]+$")
 
 
 def classify(op_text, entry):
@@ -255,7 +297,8 @@ def classify(op_text, entry):
             continue
         if dead:
             continue
-        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)):
+        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)
+                or _CONSTTMP.match(o)):
             continue
         work.append(o)
     if not work and any(_EXC.search(o) for o in ops):
@@ -445,6 +488,29 @@ def selftest(qemu):
                  " mov_i32 PC,$0x400074\n"
                  " call raise_exception_err,$0x8,$0,env,$0xd,$0x0\n",
                  0x400074) == "DATAPATH")
+    # THE CONSTANT-ARGUMENT RULE, AND THE THREE THINGS IT MAY NOT EAT.
+    chk("classifier: helper arguments materialised above an unguarded raise "
+        "are not datapath work",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc2,$0x3\n"
+                 " mov_i32 loc3,$0x0\n mov_i32 loc4,$0x0\n"
+                 " mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"
+                 " call dpax_w_ph,$0x0,$0,loc2,loc3,loc4,env\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400074) == "TRAP-ONLY")
+    chk("classifier: a constant into a GUEST REGISTER is still work",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 v0,$0xfa1\n"
+                 " mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n",
+                 0x400074) == "DATAPATH")
+    chk("classifier: an op that READS temps is work even if its result dies",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 loc2,$0x3\n"
+                 " add_i32 loc5,loc3,loc4\n mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n",
+                 0x400074) == "DATAPATH")
+    chk("classifier: a constant into a temp a LIVE op consumes leaves the "
+        "live op standing",
+        classify(" ---- 0000000000400078 0 0\n mov_i64 loc0,$0x3c\n"
+                 " ext32u_i64 rax,loc0\n", 0x400078) == "DATAPATH")
     chk("classifier: a block whose entry contributes no ops is NO-OPS",
         classify(" ---- 0000000000400078 0 0\n\n add_i64 x0,x0,x0\n",
                  0x400078) == "NO-OPS")

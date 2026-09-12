@@ -233,6 +233,26 @@ def losses(a, b, isa):
     return out
 
 
+def _enc_word(enc):
+    """The encoding's hex, little-endian, as an integer -- or None.
+
+       RISC-V's compressed encodings are TWO bytes and the rest are four, so
+       a reader that only unpacks four would silently push every c.* row into
+       the unparsed bucket and quietly shrink the denominator of any arm run
+       over a family that has compressed members.  A 16-bit encoding is
+       zero-extended, and the callers refuse a field that asks for a bit
+       above 15 of one rather than reading the padding as an answer."""
+    try:
+        b = bytes.fromhex(enc)
+    except Exception:
+        return None
+    if len(b) == 2:
+        return struct.unpack("<H", b)[0]
+    if len(b) == 4:
+        return struct.unpack("<I", b)[0]
+    return None
+
+
 def encfield(a, b, isa, mnem_re, lo, hi):
     """Histogram an ENCODING BIT-FIELD over the LOSING encodings of a family.
 
@@ -262,9 +282,8 @@ def encfield(a, b, isa, mnem_re, lo, hi):
     for enc, mnem, lost in losses(a, b, isa):
         if not rx.search(mnem):
             continue
-        try:
-            w = struct.unpack("<I", bytes.fromhex(enc))[0]
-        except Exception:
+        w = _enc_word(enc)
+        if w is None or (hi > 15 and len(enc) == 4):
             bad.append(enc)
             continue
         hist[(w >> lo) & ((1 << (hi - lo + 1)) - 1)] += len(lost)
@@ -305,9 +324,11 @@ def regfield(a, b, isa, mnem_re, lo, hi):
     for enc, mnem, lost in losses(a, b, isa):
         if not rx.search(mnem):
             continue
-        try:
-            w = struct.unpack("<I", bytes.fromhex(enc))[0]
-        except Exception:
+        w = _enc_word(enc)
+        if w is None or (hi > 15 and len(enc) == 4):
+            #: a 16-bit encoding has no bit above 15; asking for one is a
+            #: question about bits that do not exist, and the row abstains
+            #: rather than reading the zero padding as an answer.
             bad.append(enc)
             continue
         want = (w >> lo) & ((1 << (hi - lo + 1)) - 1)

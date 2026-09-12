@@ -63,6 +63,23 @@ static bool trans_c_zext_w(DisasContext *ctx, arg_c_zext_w *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_ZCB(ctx);
     REQUIRE_ZBA(ctx);
+    /*
+     * CP-M, the zero-register half.  C.ZEXT.W IS `add.uw rd, rd, x0` -- that
+     * is the Zcb specification's own definition of it, not an equivalence
+     * someone noticed -- so the encoding NAMES x0 as an operand exactly the
+     * way `mv rd,rs` names it (R7.3, and R15 verbatim: "QEMU making an
+     * optimization does not mean we accept it as architecturally correct").
+     *
+     * THE UNARY LOWERING IS WHY THIS HAS TO BE SAID HERE AND CANNOT BE SAID
+     * BY get_gpr().  add.uw reaches x0 through get_gpr(ctx, a->rs2), which
+     * already states it; gen_unary() has no second operand to fetch, so
+     * `ext32u_i64 x8/s0,x8/s0` is the whole translation and no accessor is
+     * ever asked about x0.  Measured: all eight c.zext.w encodings in the
+     * srcenc corpus lost REG_ZERO for exactly this reason.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_folded_read_zero();
     return gen_unary(ctx, a, EXT_NONE, tcg_gen_ext32u_tl);
 }
 

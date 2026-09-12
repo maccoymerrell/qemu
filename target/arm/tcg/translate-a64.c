@@ -2491,21 +2491,32 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
      * state the register for every Rt the array actually holds, and state
      * NOTHING at Rt == 31.
      *
-     * NOTHING IS STATED HERE AT Rt == 31 -- and that is not the same as the
-     * wire publishing an empty list, which is what this comment claimed
-     * before the whole-population arm was run and is corrected here rather
-     * than shipped.  MEASURED over the exhaustive AArch64 sweep: the
-     * published list for `1f1003d5` (`wfet xzr`) goes
-     * `REG_SP,REG_ZERO` -> `REG_ZERO`.  The REG_ZERO that remains is the
-     * tree-wide zero-register statement every Rn == 31 slot gets -- 134,342
-     * rows over 218 mnemonics carry it -- and it is not this site's to
-     * suppress.  What this guard removes is the SP, and only the SP:
-     * REG_SP-naming rows 39,996 -> 39,995 across the whole population.
+     * AT Rt == 31 THE REGISTER IS XZR AND IT IS STATED AS SUCH.
      *
-     * The reason for stating nothing rather than a zero-register note of its
-     * own is the difference this file keeps making:
-     * insn_dataflow_note_zero_reg() describes a TEMP's contents, and there
-     * is no temp here because no op is emitted.
+     * An earlier revision of this comment said the REG_ZERO on `1f1003d5`
+     * (`wfet xzr`) was "the tree-wide zero-register statement every Rn == 31
+     * slot gets", so this site had nothing left to do.  THAT WAS FALSE, and
+     * the arm that refutes it is the deletion pair itself: with the Capstone
+     * operand walk removed, `wfet xzr` publishes NOTHING
+     * (cst_runs/verify78/srcencorp/{V78A,sledDEL}, `aarch64 1f1003d5 wfet
+     * REG_ZERO` against `aarch64 1f1003d5 wfet -`).  The REG_ZERO was the
+     * WALK's, not QEMU's -- there is no other slot here to pick it up,
+     * because WFET emits no op at all and cpu_reg() is never called.
+     *
+     * So the zero register is stated, for the reason every other zero-named
+     * operand in this tree is stated: R7.3, and R15 verbatim -- "we express
+     * the zero register ... QEMU making an optimization does not mean we
+     * accept it as architecturally correct".  WFET's Xt is an operand of the
+     * instruction's observable behaviour at Rt == 31 exactly as it is at
+     * Rt == 5; the ARM manual gives that field the XZR reading, not the SP
+     * one, and a wire that names x5 there and nothing here is describing the
+     * emulator rather than the machine.
+     *
+     * insn_dataflow_note_folded_read_zero() and not
+     * insn_dataflow_note_zero_reg(), and the difference is the one this file
+     * keeps making: note_zero_reg() describes a TEMP's contents and there is
+     * no temp here, while the folded-read form exists for exactly this shape
+     * -- an encoding that names the zero register with no op to hang it on.
      *
      * Capture only; no op is emitted, altered or suppressed.
      */
@@ -2514,6 +2525,8 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
             offsetof(CPUARMState, xregs[0]) +
             a->rd * sizeof(((CPUARMState *)0)->xregs[0]),
             sizeof(((CPUARMState *)0)->xregs[0]));
+    } else {
+        insn_dataflow_note_folded_read_zero();
     }
 
     /*

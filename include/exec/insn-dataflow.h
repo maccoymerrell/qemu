@@ -611,11 +611,22 @@ typedef struct InsnDataflowWrite {
      */
     uint8_t  supplies_value;
     /*
-     * EVERY OP THAT WROTE THIS REGISTER WAS THE TRANSLATION BLOCK'S
-     * EPILOGUE'S -- emitted by ops->tb_stop() after the last instruction's
-     * own translate_insn() returned, and charged to that instruction only
-     * because the ops land inside its extraction window (see
-     * plugin_gen_record_tb_stop(), which says so in as many words).
+     * EVERY OP THAT WROTE THIS REGISTER WAS DOING THE BLOCK'S PC
+     * BOOKKEEPING RATHER THAN THE INSTRUCTION'S OWN WORK.
+     *
+     * TWO POSITIONS ANSWER YES AND THEY ARE ONE FACT.  The first is the
+     * TRANSLATION BLOCK'S EPILOGUE -- ops emitted by ops->tb_stop() after
+     * the last instruction's own translate_insn() returned, charged to that
+     * instruction only because they land inside its extraction window (see
+     * plugin_gen_record_tb_stop(), which says so in as many words).  The
+     * second is a LOWERING that had to emit the same bookkeeping INSIDE the
+     * instruction because it needed labels around it, and that says so with
+     * insn_dataflow_note_block_pc_begin(): x86's `rep` stores eip back to
+     * its own address to re-enter itself and to the next address to leave,
+     * and the architecture does not define a string operation as writing
+     * the pc.  The field is named for the first because that is where a
+     * target normally emits this work; both are the same statement and a
+     * consumer reads them identically.
      *
      * STICKY THE OTHER WAY from @supplies_value: it starts true for a write
      * first seen in the epilogue and is cleared the moment an op before the
@@ -1700,6 +1711,47 @@ void insn_dataflow_note_stated_write_name_shift(const char *reg,
 void insn_dataflow_note_block_epilogue(void);
 
 /*
+ * THE OPS FROM HERE TO insn_dataflow_note_block_pc_end() ARE THE BLOCK'S PC
+ * BOOKKEEPING, EMITTED INSIDE AN INSTRUCTION.
+ *
+ * The epilogue note above marks the ops a target emits to LEAVE the block.
+ * Some lowerings have to emit exactly that work from inside the instruction
+ * instead, because they need TCG labels around it -- x86's do_gen_rep()
+ * (target/i386/tcg/translate.c) is the whole of the class today.  A repeated
+ * string operation stores eip back to its OWN address so the main loop
+ * re-enters it, and to the address after it on the path that leaves; both
+ * stores sit between labels in the middle of the instruction's own op range,
+ * so position alone charges them to the instruction.
+ *
+ * NEITHER IS AN ARCHITECTURAL DESTINATION.  Intel SDM vol.2 "REP/REPE/REPZ
+ * ..." defines the repeat as a decrement of the count register and a
+ * re-execution of the string operation; the instruction pointer advancing,
+ * or not advancing, is the machine sequencing itself, exactly as it is for
+ * every other instruction, and no reference decoder reports RIP as a
+ * destination of `rep movsb`.  Publishing it would put QEMU's restart
+ * mechanism on the wire as an operand relationship: a consumer's scoreboard
+ * would see a pc-producing instruction the ISA does not have, and a later
+ * branch would appear to depend on the string copy.  That is the same
+ * artefact the epilogue note exists to keep off the wire, reached from
+ * inside the instruction rather than after it, so it is excluded on the same
+ * rule rather than given a ruling of its own.
+ *
+ * Writes recorded from ops inside the range carry
+ * InsnDataflowWrite::epilogue_only, and -- on that field's own sticky rule,
+ * which is unchanged -- one op OUTSIDE every such range writing the same
+ * register clears it.  A genuine branch is therefore unaffected: the
+ * transfer it emits itself is what decides.
+ *
+ * Nesting is refused rather than re-pointed, and the notes are per-block and
+ * reset by insn_dataflow_extract(), both for the reasons
+ * insn_dataflow_note_borrow_begin() gives.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_block_pc_begin(void);
+void insn_dataflow_note_block_pc_end(void);
+
+/*
  * THE OPS FROM HERE BELONG TO AN EARLIER INSTRUCTION.
  *
  * Called by plugin-gen at the two instants the translator states a deferred
@@ -2321,6 +2373,12 @@ static inline unsigned insn_dataflow_memop_mark(void)
 { return 0; }
 
 static inline void insn_dataflow_note_block_epilogue(void)
+{ }
+
+static inline void insn_dataflow_note_block_pc_begin(void)
+{ }
+
+static inline void insn_dataflow_note_block_pc_end(void)
 { }
 
 static inline void insn_dataflow_note_borrow_begin(unsigned lender)

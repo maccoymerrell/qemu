@@ -1790,8 +1790,21 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     }
 #endif
 
-    /* Go to the main loop but reenter the same instruction.  */
+    /*
+     * Go to the main loop but reenter the same instruction.
+     *
+     * THE BLOCK'S PC BOOKKEEPING, AND THE INSTRUCTION SAYS SO.  This store
+     * puts eip back at the string operation's OWN address so the main loop
+     * re-enters it; the architecture defines no pc write for REP, and every
+     * other instruction has the identical store emitted for it by the block
+     * EPILOGUE, where insn_dataflow_note_block_epilogue() already keeps it
+     * off the destination list.  Only the labels force it in here, so the
+     * note is what makes position stop meaning ownership.  See
+     * insn_dataflow_note_block_pc_begin().
+     */
+    insn_dataflow_note_block_pc_begin();
     gen_jmp_rel_csize(s, -cur_insn_len(s), 0);
+    insn_dataflow_note_block_pc_end();
 
     if (can_loop) {
         /*
@@ -1827,7 +1840,10 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     if (had_rf) {
         gen_reset_eflags(s, RF_MASK);
     }
+    /* The same bookkeeping on the path that leaves; see the note above. */
+    insn_dataflow_note_block_pc_begin();
     gen_jmp_rel_csize(s, 0, 1);
+    insn_dataflow_note_block_pc_end();
 }
 
 static void do_gen_string(DisasContext *s, MemOp ot,

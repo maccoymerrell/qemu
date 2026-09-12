@@ -198,6 +198,15 @@
  * silent.
  */
 #define DF_MAX_BORROW_NOTES   8
+/*
+ * The block-pc ranges one instruction's lowering emits inside itself.  Four,
+ * because the only target that states any emits two per string operation
+ * (x86's do_gen_rep: the restart edge and the fall-through edge) and a
+ * doubling leaves room for a lowering that peels one more.  Past the cap the
+ * notes stop and the writes stay the instruction's, which is the behaviour
+ * this file had before the note existed -- counted, not silent.
+ */
+#define DF_MAX_PCLOWER_NOTES  4
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -503,6 +512,21 @@ typedef struct DfBorrowNote {
     const TCGOp *last;
     unsigned     lender;
 } DfBorrowNote;
+
+/*
+ * The BLOCK'S PC BOOKKEEPING, emitted inside an instruction because the
+ * lowering had nowhere else to put it.  See
+ * insn_dataflow_note_block_pc_begin() in the header for what the range means
+ * and why it is the same fact as the epilogue's.
+ *
+ * @first and @last are read exactly as DfBorrowNote's are -- the ops
+ * STRICTLY AFTER @first through @last inclusive -- so the two ranges enter
+ * and leave on one `prev_op == anchor` discipline.
+ */
+typedef struct DfPcLowerNote {
+    const TCGOp *first;
+    const TCGOp *last;
+} DfPcLowerNote;
 
 /*
  * CP-M, the preserve-read half: one READ of a guest register that an emitter
@@ -917,6 +941,23 @@ struct InsnDataflowScratch {
     bool borrow_overflow;
 
     /*
+     * The op ranges an instruction's own lowering emitted to do the BLOCK's
+     * pc bookkeeping.  See DfPcLowerNote.  @pclower_open is the note still
+     * waiting for its end anchor, as an index, or DF_MAX_PCLOWER_NOTES when
+     * none is.
+     */
+    DfPcLowerNote pclower[DF_MAX_PCLOWER_NOTES];
+    unsigned n_pclower;
+    unsigned pclower_open;
+    bool pclower_overflow;
+    /*
+     * TRANSIENT, and it belongs to the op walk, exactly as @in_epilogue
+     * does: set while df_insn() is walking ops inside one of those ranges,
+     * read by df_add_write() through df_block_pc().
+     */
+    bool in_pclower;
+
+    /*
      * CP-M, the preserve-read half: the (temp, op) pairs a writeback emitter
      * marked as carrying only the bits its write does not reach.
      */
@@ -1015,6 +1056,11 @@ static __thread struct InsnDataflowScratch *df;
 #define df_borrow           (df->borrow)
 #define df_n_borrow         (df->n_borrow)
 #define df_borrow_open      (df->borrow_open)
+#define df_pclower          (df->pclower)
+#define df_n_pclower        (df->n_pclower)
+#define df_pclower_open     (df->pclower_open)
+#define df_pclower_overflow (df->pclower_overflow)
+#define df_in_pclower       (df->in_pclower)
 #define df_borrow_overflow  (df->borrow_overflow)
 #define df_preserve         (df->preserve)
 #define df_n_preserve       (df->n_preserve)
@@ -1826,6 +1872,21 @@ static const uint64_t *df_written_prov(const InsnDataflow *d, unsigned reg)
     return NULL;
 }
 
+/*
+ * IS THE OP BEING WALKED DOING THE BLOCK'S PC BOOKKEEPING RATHER THAN THE
+ * INSTRUCTION'S OWN WORK?
+ *
+ * Two positions answer yes and they are one fact.  The EPILOGUE is where a
+ * target normally emits it -- after the last instruction's translate_insn()
+ * returned -- and a LOWERING that had to emit it inside the instruction says
+ * so with insn_dataflow_note_block_pc_begin().  Both feed
+ * InsnDataflowWrite::epilogue_only, whose header states the union.
+ */
+static bool df_block_pc(void)
+{
+    return df_in_epilogue || df_in_pclower;
+}
+
 static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
                          bool supplies_value)
 {
@@ -1845,7 +1906,7 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
              * instruction's own, so the bit survives only while EVERY op
              * that wrote this register was the epilogue's.
              */
-            if (!df_in_epilogue) {
+            if (!df_block_pc()) {
                 d->writes[i].epilogue_only = 0;
             }
             df_or(d->writes[i].prov, prov);
@@ -1858,7 +1919,7 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
     }
     d->writes[d->n_writes].reg = (uint8_t)reg;
     d->writes[d->n_writes].supplies_value = supplies_value;
-    d->writes[d->n_writes].epilogue_only = df_in_epilogue ? 1 : 0;
+    d->writes[d->n_writes].epilogue_only = df_block_pc() ? 1 : 0;
     memcpy(d->writes[d->n_writes].prov, prov, sizeof(d->writes[0].prov));
     d->n_writes++;
 }
@@ -2187,6 +2248,11 @@ void insn_dataflow_note_reset(void)
     df_n_borrow = 0;
     df_borrow_open = DF_MAX_BORROW_NOTES;
     df_borrow_overflow = false;
+    /* And the block-pc ranges, on the same reasoning. */
+    df_n_pclower = 0;
+    df_pclower_open = DF_MAX_PCLOWER_NOTES;
+    df_pclower_overflow = false;
+    df_in_pclower = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -3011,6 +3077,7 @@ static void df_insn(InsnDataflow *d_own, unsigned self_idx,
      */
     InsnDataflow *d = d_own;
     unsigned in_borrow = DF_MAX_BORROW_NOTES;
+    unsigned in_pclower = DF_MAX_PCLOWER_NOTES;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
     uint64_t prov[INSN_DF_REG_WORDS];
     TCGOp *prev_op = NULL;
@@ -3086,6 +3153,7 @@ static void df_insn(InsnDataflow *d_own, unsigned self_idx,
      * discipline the note cursors run under.
      */
     df_in_epilogue = false;
+    df_in_pclower = false;
 
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
@@ -3124,6 +3192,32 @@ static void df_insn(InsnDataflow *d_own, unsigned self_idx,
                 }
                 in_borrow = b;
                 d = &df_out[df_borrow[b].lender];
+                break;
+            }
+        }
+        /*
+         * AND THE BLOCK-PC RANGES, on the same anchor discipline, in the
+         * same place, END FIRST, and skipping a range whose two anchors are
+         * the same op -- every word of the borrow arm above applies
+         * unchanged.  What differs is only what the range MEANS: inside it
+         * the ops are doing the block's pc bookkeeping, so df_block_pc()
+         * answers the way it answers inside the epilogue.
+         */
+        if (in_pclower < DF_MAX_PCLOWER_NOTES) {
+            if (prev_op == df_pclower[in_pclower].last) {
+                in_pclower = DF_MAX_PCLOWER_NOTES;
+                df_in_pclower = false;
+            }
+        }
+        if (in_pclower >= DF_MAX_PCLOWER_NOTES && prev_op != NULL) {
+            for (unsigned b = 0; b < df_n_pclower; b++) {
+                if (df_pclower[b].first != prev_op ||
+                    df_pclower[b].last == NULL ||
+                    df_pclower[b].last == df_pclower[b].first) {
+                    continue;
+                }
+                in_pclower = b;
+                df_in_pclower = true;
                 break;
             }
         }
@@ -4597,6 +4691,43 @@ void insn_dataflow_note_block_epilogue(void)
     df_epilogue_anchor = QTAILQ_LAST(&tcg_ctx->ops);
 }
 
+/*
+ * THE BLOCK'S PC BOOKKEEPING, EMITTED INSIDE AN INSTRUCTION.  See
+ * insn_dataflow_note_block_pc_begin() in the header for the fact and the
+ * ruling; the storage discipline is DfBorrowNote's, and the refusal is
+ * insn_dataflow_note_borrow_begin()'s for the same reason -- silently
+ * re-pointing an open note would put the range on the wrong ops.
+ */
+void insn_dataflow_note_block_pc_begin(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_pclower_open < DF_MAX_PCLOWER_NOTES ||
+        df_n_pclower >= DF_MAX_PCLOWER_NOTES) {
+        df_pclower_overflow = true;
+        return;
+    }
+    df_pclower[df_n_pclower].first = QTAILQ_LAST(&tcg_ctx->ops);
+    df_pclower[df_n_pclower].last = NULL;
+    df_pclower_open = df_n_pclower;
+    df_n_pclower++;
+}
+
+void insn_dataflow_note_block_pc_end(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_pclower_open >= DF_MAX_PCLOWER_NOTES) {
+        return;
+    }
+    df_pclower[df_pclower_open].last = QTAILQ_LAST(&tcg_ctx->ops);
+    df_pclower_open = DF_MAX_PCLOWER_NOTES;
+}
+
 void insn_dataflow_note_borrow_begin(unsigned lender)
 {
     if (df_disabled()) {
@@ -5707,6 +5838,11 @@ void insn_dataflow_extract(unsigned num_insns)
     df_n_borrow = 0;
     df_borrow_open = DF_MAX_BORROW_NOTES;
     df_borrow_overflow = false;
+    /* And the block-pc ranges, on the same reasoning. */
+    df_n_pclower = 0;
+    df_pclower_open = DF_MAX_PCLOWER_NOTES;
+    df_pclower_overflow = false;
+    df_in_pclower = false;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;

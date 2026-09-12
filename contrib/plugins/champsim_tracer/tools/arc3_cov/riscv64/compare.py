@@ -409,9 +409,38 @@ if __name__ == '__main__':
         r['category'] = t.category
         r['accounted'] = '1' if t.accounted else '0'
 
+    # ---- REACHABILITY, PUBLISHED (99-C).
+    #
+    # coverage_report.py refuses a table with UNPROBED rows and no
+    # `qemu_tcg_reachable` column, and it is right to: "an unprobed opcode
+    # without a reachability verdict cannot be told apart from a coverage
+    # hole".  This leg had the verdict all along and did not publish it --
+    # QEMU_REFUSED is loaded above and consulted by the taxonomy, and it is
+    # exactly the question the column asks: did QEMU's own riscv64 decoder
+    # match a rule for this encoding on the model the sled ran?
+    #
+    # SO THE COLUMN IS THAT SET, not a second opinion about it.  #287 caught
+    # the x86_64 column flipping run to run because it was derived from a
+    # probe whose result depended on how far an earlier iteration had got;
+    # this one is a lookup in a file the same sled capture wrote, so two
+    # readings of one capture cannot disagree, and a reading against a
+    # DIFFERENT capture is refused upstream by the corpus's own `#so` stamp.
+    #
+    # MEASURED at this tip over the leg's 1,070 rows: every AGREE (373) and
+    # every DISAGREE (16) row is `yes`, which is the consistency the column
+    # has to show -- the tracer cannot have produced fields for an encoding
+    # QEMU decoded no rule for.  Of the 681 UNPROBED, 673 are `no` and the
+    # EIGHT that are `yes` are the whole of the leg's coverage hole:
+    # cm.mva01s, cm.mvsa01, cm.pop, cm.popret, cm.popretz, cm.push, cm.jalt,
+    # cm.jt -- the Zcmp/Zcmt profile, decoded by QEMU and carrying no fields.
+    for r in out:
+        r['qemu_tcg_reachable'] = 'no' if r.get('hex', '') in QEMU_REFUSED \
+                                 else 'yes'
+
     cols = ['opcode_id', 'mnemonic', 'hex', 'profile', 'node', 'opcode',
             'ref_status', 'ref_src', 'ref_dst', 'trc_status', 'trc_src', 'trc_dst',
-            'verdict', 'adjudication', 'sig', 'adjudication_note',
+            'verdict', 'qemu_tcg_reachable', 'adjudication', 'sig',
+            'adjudication_note',
             'set_relation', 'direction', 'category', 'accounted']
     dest = os.path.join(ROOT, os.environ.get('CST_OUT', 'attrib.tsv'))
     with open(dest, 'w', newline='') as f:

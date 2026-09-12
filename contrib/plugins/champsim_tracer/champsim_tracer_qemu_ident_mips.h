@@ -156,7 +156,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x089554c4u, "translate_mips/OPC_EXTPDPV", QID_STATED, false,
       { .opcode = GEN_OP_BITMANIP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x089ff7eeu, "translate_mips/OPC_SHLL_QB_DSP", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x08c9aea2u, "translate_mips/R6_OPC_CMP_AF_S", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x08fd2fb0u, "translate_mips/OPC_ADDQH_R_W", QID_STATED, false,
@@ -486,7 +486,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x2553acccu, "decode_ase_msa/FCUN", QID_STATED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x256668b0u, "translate_mips/OPC_SHLL_OB_DSP", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },
+      { .opcode = GEN_OP_NOP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x2575dd2eu, "translate_mips/OPC_REPLV_QB", QID_STATED, false,
       { .opcode = GEN_OP_VEC_LOGIC, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x25aee6b0u, "decode_ase_msa/FTRUNC_U", QID_STATED, false,
@@ -924,7 +924,7 @@ static const QemuIdentRow qemu_ident_mips[] = {
     { 0x56742982u, "translate_mips/OPC_CMP_SEQ_D", QID_STATED, false,
       { .opcode = GEN_OP_FP_CMP, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56a43d41u, "translate_mips/OPC_PMON", QID_STATED, false,
-      { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE, .flags = MF_NONE } },  /* RULED over the older payload -- QEMU's SPECIAL 0x05 arm is the PMON monitor entry (translate.c `case OPC_PMON:` -> gen_helper_pmon); the observed INT_ADD is Capstone answering `lsa` in CS_MODE_MIPS32R2, where LSA does not exist -- an upstream decoder defect, probed in capstone_workaround_probe.cc, not an architecture disagreement */
+      { .opcode = GEN_OP_UNKNOWN, .branch_type = BRANCH_NONE, .flags = MF_NONE } },  /* RULED over the older payload -- QEMU's SPECIAL 0x05 arm is the PMON monitor entry (translate.c `case OPC_PMON:` -> gen_helper_pmon); the observed INT_ADD is Capstone answering `lsa` in CS_MODE_MIPS32R2, where LSA does not exist -- an upstream decoder defect, probed in capstone_workaround_probe.cc, not an architecture disagreement */
     { 0x56bf3397u, "translate_mips/OPC_PADDSH", QID_STATED, false,
       { .opcode = GEN_OP_VEC_ADD, .branch_type = BRANCH_NONE, .flags = MF_NONE } },
     { 0x56f2fd2eu, "translate_mips/R6_OPC_CMP_UN_S", QID_STATED, false,

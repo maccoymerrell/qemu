@@ -8271,7 +8271,7 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "translate.c:17028 case OPC_LX_DSP: MASK_LX(ctx->opcode) then a "
         "switch whose every arm re-identifies (LBUX/LHX/LWX/LDX)",
         no_class=True),
-    # THE OTHER EIGHTEEN DSP GROUP LABELS, on `lx_dsp`'s terms.
+    # THE OTHER SIXTEEN DSP GROUP LABELS, on `lx_dsp`'s terms.
     #
     # The DSP ASE is decoded in two steps: `case OPC_<X>_DSP:` on the
     # SPECIAL2/SPECIAL3 function field, then a `switch (op2)` whose every
@@ -8283,7 +8283,16 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
     # latches the identity the decode had committed to.  What ran is the
     # raise, and that is the NAMED kind these rows take.
     #
-    # WHY ONLY `lx_dsp` WAS RULED: nothing had ever reached the others.
+    # TWO OF THE EIGHTEEN ARE NOT ON THESE TERMS AND ARE RULED SEPARATELY
+    # BELOW: OPC_SHLL_QB_DSP and OPC_SHLL_OB_DSP, whose helper decodes
+    # op2 itself and returns on rd == 0 before any check runs.  The
+    # paragraph above once covered all eighteen and was FALSE for those
+    # two -- measured, not argued: 72 of 72 of their corpus occupants
+    # translate with no call and no raise.  The route is named where they
+    # are ruled.
+    #
+    # WHY ONLY `lx_dsp` WAS ORIGINALLY RULED: nothing had reached the
+    # others.
     # The latch (d8466387e9) is what made the group ids publishable, and
     # its whole-population arm found the consequence immediately --
     # `translate_mips/OPC_MUL_PH_DSP` classified 1,536 add/sub/mul-group
@@ -8299,7 +8308,13 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
     # `case OPC_*_DSP:` labels that carry an identity are followed by a
     # sub-switch on op2 (APPEND/DAPPEND on MASK_APPEND/MASK_DAPPEND,
     # SHLL_OB's second site on `opc`), and twelve of them by a check_dsp*
-    # in between.
+    # in between.  WHAT THAT SURVEY DID NOT ASK is WHERE the sub-switch
+    # lives, and that is the whole of the shift pair's difference: for
+    # the sixteen below the caller decodes op2 and states the leaf before
+    # it calls `gen_mipsdsp_arith` / `_bitinsn` / `_add_cmp_pick` (each
+    # takes `op2` as a parameter, at every one of their fourteen call
+    # sites), so the group id cannot outlive the call; `gen_mipsdsp_shift`
+    # takes no `op2` and is the exception.
     ("mips", "absq_s_ph_dsp"): Statement(
         ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "absq_s_ph_dsp", "ruled",
         "translate.c:14984 case OPC_ABSQ_S_PH_DSP: check_dsp_r2(ctx) then a "
@@ -8394,18 +8409,56 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         "switch whose every arm re-identifies; the id publishes only for "
         "the encodings the check TRAPS",
         no_class=True),
+    # THE TWO SHIFT GROUPS ARE NOT ON THE OTHER SEVENTEEN'S TERMS, and
+    # saying they were is how this pair published a trap for an encoding
+    # that takes none.  `gen_mipsdsp_shift()` is the ONE gen_mipsdsp_*
+    # helper that is called WITHOUT `op2` -- its two call sites,
+    # translate.c:19154 (OPC_SHLL_QB_DSP) and :19713 (OPC_SHLL_OB_DSP),
+    # pass `(ctx, op1, rd, rs, rt)` and state only the GROUP, leaving the
+    # sub-decode to the helper; every other caller decodes op2 and states
+    # the LEAF before it calls, so the group's id cannot survive there.
+    # And the helper's first statement is
+    #
+    #     if (ret == 0) {
+    #         /* Treat as NOP -- see note_dsp_nop_shift() ... */
+    #         note_dsp_nop_shift(ctx, opc, v1, v2);
+    #         return;
+    #     }
+    #
+    # -- ahead of the op2 switch, and ahead of every `check_dsp()`, which
+    # in this helper sit INSIDE the individual arms.  So on the rd == 0
+    # encodings the group's own id reaches a plugin with NO availability
+    # check run and NO exception raised, on a machine with the ASE and on
+    # a machine without it alike.  That is the `bshfl` shape exactly, and
+    # QEMU's own word for those encodings is "Treat as NOP".
+    #
+    # MEASURED, whole population, both wp arms of verify77's sled
+    # (#tip 4eb81d806e, #so c43d8ae33ef92f6f): every occupant of
+    # `translate_mips/OPC_SHLL_QB_DSP` -- 24 `shll.qb` + 48 `shra.qb`,
+    # 72 of 72 -- translates to `noret=0,calls=0`: no call at all and no
+    # raise, writing REG_ZERO and nothing else.  The row
+    # this replaces said "the id publishes only for the encodings the
+    # check TRAPS"; 0 of 72 trapped.  OPC_SHLL_OB_DSP has no occupant in
+    # the corpus (it is the MIPS64 width) and takes the same answer from
+    # the same two source facts, because a rule that may not be
+    # classified from a false reading may not keep that reading on the
+    # day nothing happens to reach it either.
     ("mips", "shll_ob_dsp"): Statement(
-        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "shll_ob_dsp", "ruled",
-        "translate.c:15993 case OPC_SHLL_OB_DSP: check_dsp(ctx) then a "
-        "switch whose every arm re-identifies; the id publishes only for "
-        "the encodings the check TRAPS",
-        no_class=True),
+        ent("GEN_OP_NOP"), "shll_ob_dsp", "ruled",
+        "translate.c:19709 case OPC_SHLL_OB_DSP: gen_mipsdsp_shift(ctx, "
+        "op1, rd, rs, rt) with no op2 and no check_dsp() at the call "
+        "site, and translate.c:15778 `if (ret == 0) { /* Treat as NOP. */ "
+        "... return; }` ahead of the sub-switch -- the group's own "
+        "identity is published for the rd == 0 encodings alone, which "
+        "raise nothing and write nothing"),
     ("mips", "shll_qb_dsp"): Statement(
-        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "shll_qb_dsp", "ruled",
-        "translate.c:15791 case OPC_SHLL_QB_DSP: check_dsp(ctx) then a "
-        "switch whose every arm re-identifies; the id publishes only for "
-        "the encodings the check TRAPS",
-        no_class=True),
+        ent("GEN_OP_NOP"), "shll_qb_dsp", "ruled",
+        "translate.c:19150 case OPC_SHLL_QB_DSP: gen_mipsdsp_shift(ctx, "
+        "op1, rd, rs, rt) with no op2 and no check_dsp() at the call "
+        "site, and translate.c:15778 `if (ret == 0) { /* Treat as NOP. */ "
+        "... return; }` ahead of the sub-switch -- the group's own "
+        "identity is published for the rd == 0 encodings alone; measured "
+        "72 of 72 occupants at noret=0 calls=0, none trapped"),
     ("mips", "s_fmt"): Statement(
         ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "s_fmt", "ruled",
         "translate.c:18812 case OPC_S_FMT: gen_farith(), whose 101 arms "
@@ -8462,15 +8515,54 @@ QEMU_RULE_STATEMENTS: dict[tuple[str, str], Statement] = {
         ent("GEN_OP_NOP"), "dbshfl", "ruled",
         "translate.c case OPC_DBSHFL -- as OPC_BSHFL, the 64-bit group"),
 
-    # PMON is a firmware entry point: the arm emits gen_helper_pmon(),
-    # which leaves the guest and enters the PROM monitor.  Nothing about
-    # it is arithmetic; it is a trap out of the program, which is the
-    # class every other trap-taking MIPS instruction carries.
+    # PMON IS NOT A TRAP, AND THE ROW THAT SAID IT WAS HAD READ ONLY THE
+    # CALL SITE.  The previous statement here read "the arm emits
+    # gen_helper_pmon(), which leaves the guest and enters the PROM
+    # monitor ... a trap out of the program", and op_helper.c refutes it:
+    #
+    #     void helper_pmon(CPUMIPSState *env, int function)
+    #
+    # is an ORDINARY returning helper.  It switches on the `sa` field and
+    # emulates the monitor call IN PLACE -- writes env->active_tc.gpr[2],
+    # printf()s a character, and returns; there is no
+    # generate_exception*(), no raise, and no `noreturn`.  Fetch continues
+    # at the next instruction.
+    #
+    # MEASURED, whole population, both wp arms of verify77's sled: all 96
+    # occupants of `translate_mips/OPC_PMON` translate to
+    # `noret=0,calls=1,memr=0,memw=0` and write REG_GPR2.  Zero of 96
+    # diverted.  `BRANCH_SYSCALL_TYPE` is the branch taxonomy's word for
+    # "fetch diverts to a vector, every time", and it was false here 96
+    # times out of 96, so the branch field takes BRANCH_NONE, which is
+    # what QEMU emits.
+    #
+    # THE OPCODE IS REFUSED, on the `ud` row's doctrine one block down.
+    # PMON is `Pmon entry point, also R4010 selsl` -- an unofficial
+    # firmware hook with no architectural operation at all, whose whole
+    # effect is whatever this emulator's monitor emulation does.
+    # GEN_OP_SYSCALL names a DIFFERENT thing, the deliberate entry to
+    # supervisor code, and a consumer reading it would model a system
+    # call where the machine executes a helper and walks on.  Naming the
+    # wrong operation is worse than naming none, because none is visible
+    # and wrong is not.
+    #
+    # WHY THE ENCODING IS REACHED AT ALL on a model with no PROM: SPECIAL
+    # function 0x05 is LSA on MIPS32R6 and OPC_PMON on the legacy decode,
+    # so a legacy CPU takes this arm for bytes the disassemblers spell
+    # `lsa`.  That is a decoder-vs-model disagreement about WHICH
+    # instruction the bytes are, and it is not what this row answers.
     ("mips", "pmon"): Statement(
-        ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE"), "pmon", "ruled",
-        "translate.c:16582 gen_helper_pmon(tcg_env, tcg_constant_i32(sa)) "
-        "-- `Pmon entry point, also R4010 selsl`, a trap into the PROM "
-        "monitor"),
+        refuse("BRANCH_NONE"), "pmon", "ruled",
+        "translate.c:18476 gen_helper_pmon(tcg_env, tcg_constant_i32(sa)) "
+        "and op_helper.c:233 `void helper_pmon(CPUMIPSState *env, int "
+        "function)` -- `Pmon entry point, also R4010 selsl`, a RETURNING "
+        "helper that emulates the monitor call in place (writes "
+        "active_tc.gpr[2], printf()s, returns).  No exception is "
+        "generated and fetch continues: measured 96 of 96 occupants at "
+        "noret=0, so BRANCH_NONE is the true control-flow fact.  The "
+        "OPERATION has no architectural name -- this is an unofficial "
+        "firmware hook -- and GEN_OP_SYSCALL names a different one, so "
+        "the opcode is REFUSED"),
 
     # MDMX is DECODED and NOT IMPLEMENTED, and that is an emulator gap
     # rather than a statement about the instruction.  The arm sets the
@@ -9688,6 +9780,31 @@ def _refuse_dead_statement_rules(info: IsaInfo,
         # the vocabulary already says exactly what the ruling says.  A
         # ruling that MOVES the answer still has to survive the statement
         # disagreement route below, which will not let it move silently.
+        #
+        # A WRITTEN REFUSAL IS NEVER THE VOCABULARY'S SILENCE, and reading
+        # the two as equal is how this test refused a ruling that was
+        # carrying the row.  `Entry.refused` says so on its own face:
+        # "an unmarked UNKNOWN still means silence"; a refusal "marks an
+        # Entry whose UNKNOWN is an ANSWER: the rule looked, and states
+        # that the shared vocabulary has no word for this instruction".
+        # The comparison below reads only (op, branch), so the two are
+        # indistinguishable to it, and the vocabulary answers UNKNOWN for
+        # any word it does not know -- which is most of the words a REFUSAL
+        # is ever written about.
+        #
+        # AND THE ROW IS NOT THE VOCABULARY'S ANSWER ANYWAY, which is the
+        # sharper half.  What a rule carries WITHOUT a ruling is its
+        # OBSERVED payload, and the vocabulary lookup here is by the rule's
+        # WORD.  `translate_mips/OPC_PMON` is the case that found this: the
+        # word `pmon` reads UNKNOWN, but the row without the ruling reads
+        # GEN_OP_INT_ADD, because Capstone disassembles SPECIAL 0x05 as the
+        # MIPS32R6 `lsa`.  Deleting the ruling as this test demanded would
+        # have published an add for an encoding that enters the PROM
+        # monitor.  The refusal exemption is the narrow fix; the general
+        # one -- comparing against the payload the row would otherwise
+        # carry -- needs the row, which this validation pass does not have.
+        if st.entry.refused:
+            continue
         voc = CLASSIFIERS[info.key](word)
         if (voc.op, voc.branch) == (st.entry.op, st.entry.branch):
             raise SystemExit(

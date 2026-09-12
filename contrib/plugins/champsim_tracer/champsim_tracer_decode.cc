@@ -1730,10 +1730,15 @@ void decode_detail_to_generic(uint64_t pc,
              * ("Capstone not demoted, Capstone REMOVED ... if you leave it
              * there, you will rely on it").
              *
-             * The WRITE arm stays.  The destination list is still the
-             * operand walk's; #232's replacement is the next wave and
-             * deleting half of it now would leave the wire with no
-             * destinations at all.
+             * The WRITE arm stays, and that is a MEASUREMENT rather than a
+             * plan (exec184).  Removed -- here, at the SYSREG arm below and
+             * at the implicit regs_write[] fold -- x86_64 `/bin/echo hi`
+             * publishes `mov %sp` where it published `mov %sp -> %gp5`, and
+             * `jcc` with no `-> %pc`: every destination on every
+             * instruction.  The two pieces of machinery that do it are named
+             * where they live, `dst_precheck()`'s `n_dst_regs == 0` return
+             * and `dst_row_seated()`'s REG_PC discriminator, and the second
+             * of them needs a QEMU-side statement before this arm can go.
              *
              * dst_reg_idx keeps its meaning for the same reason: with no
              * access flags the walk must still decide which register

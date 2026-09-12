@@ -156,13 +156,29 @@
  * family took.
  *
  * That flip is the admission half for this family, the analogue of what the
- * access count became for the address families, and it is not taken here
- * because taking it would LOSE rows: replacing `dst_regs[]` with QEMU's
- * write list drops every destination QEMU names only as a CPUArchState byte
- * range, which is the env-word gap, and the failure direction forbids
- * dropping a destination the machine writes.  The other direction -- what
- * QEMU writes and the wire's list does not carry -- is counted by
- * qdep_report() and is one named class, the block-final pc write.
+ * access count became for the address families.  It landed as an ADMISSION
+ * (f5a5b2a33e) and not as a replacement, and the reason first written here
+ * -- that replacing `dst_regs[]` with QEMU's write list would drop every
+ * destination QEMU names only as a CPUArchState byte range -- has since
+ * been measured and is no longer the binding one: #218 gave the env-word
+ * gap its generic word and the live population of that direction is three
+ * rows, all of them R16-ruled and listed in qdep_report().
+ *
+ * WHAT IS BINDING, MEASURED AT exec184 BY INTERVENTION, is two pieces of
+ * this file's own control flow, each named at its site:
+ *
+ *   - `dst_precheck()` returns QDEP_NONE on `n_dst_regs == 0`, so the
+ *     admission can grow the walk's list but never create one.  With the
+ *     walk's write arm removed and nothing else changed, x86_64
+ *     `/bin/echo hi` publishes `mov %sp` and `test %gp2, $0x2` -- no
+ *     destination on any instruction.
+ *   - `dst_row_seated()` separates a branch's architectural REG_PC write
+ *     from the block-final one by asking whether the WIRE's list carries
+ *     REG_PC, and the wire's list is the walk's.
+ *
+ * The other direction -- what QEMU writes and the wire's list does not
+ * carry -- is counted by qdep_report() and is one named class, the
+ * block-final pc write.
  *
  * THE HAS_REG FLAG IS SHARED, and that bounds both halves of it the same
  * way.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs `dst_dep[]` AND

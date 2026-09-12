@@ -2302,6 +2302,19 @@ uint8_t src_survivor_regs(uint32_t decode_id, const InsnFields *f,
  * it; the separation is taken from whether the wire's own list already
  * carries REG_PC, which is a surviving operand-walk input on exactly one
  * register with #261/R10 as its coverage path.
+ *
+ * AND THAT INPUT IS THE SECOND THING HOLDING THE WALK'S WRITE ARM IN
+ * PLACE (exec184; the first is dst_precheck()'s n_dst_regs == 0 return).
+ * The wire's list is the walk's, so deleting the walk deletes the only
+ * discriminator this function has: QEMU's REG_PC write row would then be
+ * seated on every instruction a block happened to end on -- a delay-slot
+ * `lw`, a page-final `mov` -- which is exactly the 215-slot population
+ * R10.1 adjudicated an ARTIFACT and ruled off the wire (#236).  Refusing
+ * every REG_PC row instead is the mirror loss: a branch's architectural
+ * pc write is real and would leave.  Neither direction is available from
+ * QEMU's statements as they stand, so the separation has to BECOME a
+ * QEMU-side statement -- the translator's block epilogue marked as
+ * lowering -- before the write arm can go.
  */
 static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
 {
@@ -3381,6 +3394,38 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
 {
     unsigned st = q->dst_state;
 
+    /*
+     * THIS RETURN IS THE FIRST OF THE TWO THINGS THAT HOLD THE OPERAND
+     * WALK'S WRITE ARM IN PLACE, and it is named here because the R14
+     * deletion walks straight into it (exec184).
+     *
+     * The #232 admission (f5a5b2a33e) seats a destination QEMU states and
+     * the walk never found -- but only for a family that gets past this
+     * predicate, and this predicate asks the WALK whether there is a family
+     * at all.  So the admission can GROW the walk's list; it cannot CREATE
+     * one.  Delete the walk's write arm and every instruction arrives here
+     * with n_dst_regs == 0, the whole destination family reads QDEP_NONE,
+     * seat_dst_for_qemu() is never called, and the wire publishes NO
+     * DESTINATIONS AT ALL.
+     *
+     * MEASURED, not reasoned: with the three write arms removed (the REG
+     * operand's, the SYSREG operand's and the implicit regs_write[] fold)
+     * and nothing else changed, `qemu-x86_64 /bin/echo hi` publishes
+     * `mov %sp` where it published `mov %sp -> %gp5`, `test %gp2, $0x2`
+     * with no `-> %flags`, and `jcc` with no `-> %pc`.  Every destination,
+     * on every instruction.
+     *
+     * The prerequisite chain that clears it, in order:
+     *   1. QEMU-side, the block-final pc write marked as the translator's
+     *      lowering -- dst_row_seated() below takes that separation from
+     *      the WIRE's list today, so the discriminator dies with the walk
+     *      (#261 / R10 is its coverage path);
+     *   2. a DESTINATION survivor table, the twin of
+     *      champsim_tracer_src_survivors.h, carrying the rows a ruling
+     *      keeps and QEMU does not state (the R16 block in qdep_report());
+     *   3. then this return retires and seat_dst_for_qemu() builds the
+     *      list from QEMU's write rows outright.
+     */
     if (f->n_dst_regs == 0) {
         return QDEP_NONE;       /* no slot: no dst_dep[] array to write */
     }

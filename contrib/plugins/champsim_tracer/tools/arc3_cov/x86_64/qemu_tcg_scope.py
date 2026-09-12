@@ -202,7 +202,6 @@ EXT_CPUID = {
     'AVX512EVEX':     'CPUID_7_0_EBX_AVX512F',
     'AVX512VEX':      'CPUID_7_0_EBX_AVX512F',
     'AMX_TILE':       'CPUID_7_0_EDX_AMX_TILE',
-    'ACE':            'CPUID_7_0_EDX_AMX_TILE',
     'AVX_VNNI':       'CPUID_7_1_EAX_AVX_VNNI',
     'AVX_IFMA':       'CPUID_7_1_EAX_AVX_IFMA',
     'AVX_VNNI_INT8':  'CPUID_7_1_EDX_AVX_VNNI_INT8',
@@ -215,7 +214,52 @@ EXT_CPUID = {
     'TSX_LDTRK':      'CPUID_7_0_EDX_TSX_LDTRK',
     'LKGS':           'CPUID_7_1_EAX_LKGS',
     'MOVDIR':         'CPUID_7_0_ECX_MOVDIR64B',
+    # THE TWENTY-FIVE UNCITED ROWS (99-B).  These extensions had no entry, so
+    # classify() returned None for every encoding in them and the report
+    # correctly refused to publish: an exclusion nothing in QEMU justifies is
+    # not an exclusion.  Each maps to a CPUID bit QEMU DOES define and which
+    # sits outside every TCG_*_FEATURES mask, so the charge is
+    # CPUID-FEATURE-OUTSIDE-TCG and selfcheck() re-asserts it every run --
+    # the day one of these reaches a TCG mask, the file says so and the rows
+    # become REACHABLE again rather than staying quietly excused.
+    #   VTX     10 rows  INVEPT INVVPID VMCLEAR VMPTRLD VMPTRST VMREAD
+    #                    VMWRITE VMXON -- QEMU has no VMX TCG front end
+    #   SMX      1       GETSEC
+    #   WAITPKG  2       TPAUSE UMWAIT
+    #   VIA      9       the PadLock engines; their whole feature word,
+    #                    FEAT_C000_0001_EDX, carries `.tcg_features =
+    #                    TCG_EXT4_FEATURES` and cpu.c:861 defines that as 0,
+    #                    so NO bit in it can reach a TCG guest
+    'VTX':            'CPUID_EXT_VMX',
+    'SMX':            'CPUID_EXT_SMX',
+    'WAITPKG':        'CPUID_7_0_ECX_WAITPKG',
+    'VIA_PADLOCK_RNG':     'CPUID_C000_0001_EDX_XSTORE',
+    'VIA_PADLOCK_AES':     'CPUID_C000_0001_EDX_XCRYPT',
+    'VIA_PADLOCK_SHA':     'CPUID_C000_0001_EDX_PHE',
+    'VIA_PADLOCK_MONTMUL': 'CPUID_C000_0001_EDX_PMM',
     # QEMU models no CPUID bit for these at all.
+    # `LWP` is the last of the 25 and is keyed on the ISA-SET, not the
+    # extension: XED files LLWPCB / LWPINS under extension XOP, and excluding
+    # all of XOP on one CPUID argument would be a wider claim than the rows
+    # support.  cpu.c names no LWP bit -- CPUID_EXT3_LWP is defined in cpu.h
+    # and never referenced in cpu.c, so no feature word carries it and no CPU
+    # model can advertise it -- which is what the `None` citation states, in
+    # cpu.c's terms, and what selfcheck() checks.
+    'LWP':            None,
+    # `ACE` HELD A CITATION THAT WAS FACTUALLY FALSE, found while adding the
+    # rows above and fixed here rather than left standing.  The entry read
+    # `'ACE': 'CPUID_7_0_EDX_AMX_TILE'`, so the one ACE row that reaches this
+    # table -- `c4e2fb49c0` BSRINIT, the VEX-encoded form; the rest are EVEX
+    # and are excluded one branch earlier -- was charged "AMX_TILE is outside
+    # every TCG_*_FEATURES mask", which says nothing about BSRINIT.  The
+    # VERDICT was right and the REASON was another instruction's.
+    #
+    # ACE here is Intel's Advanced Compute Extension (BSRINIT / BSRMOVF /
+    # BSRMOVH), not VIA's Advanced Cryptography Engine.  cpu.c names ONE
+    # symbol containing the letters -- CPUID_C000_0001_EDX_ACE2, in the
+    # Centaur leaf, a different feature of a different vendor -- and no bit
+    # for Intel ACE at all, which is what `None` states here.
+    'ACE':            None,
     'KEYLOCKER':      None,
     'KEYLOCKER_WIDE': None,
     'ENQCMD':         None,

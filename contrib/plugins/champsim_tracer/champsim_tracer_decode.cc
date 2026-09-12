@@ -1323,61 +1323,22 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
             out->branch_type = BRANCH_RETURN;
         }
         /*
-         * `mfhi rd[, ac]` reads the HIGH half of the accumulator and
-         * `mflo rd[, ac]` the LOW half -- two different registers,
-         * which is why the generic space gives them REG_ACCHI<n> and
-         * REG_ACC<n>.  Capstone reports both as reading the WHOLE
-         * pair: MIPS_REG_AC<n>, for either mnemonic.  (Measured on
-         * Capstone 6.0.0-Alpha7: `mfhi $t0` and `mflo $t0` both yield
-         * regs_read = {ac0}, while `mult` correctly writes
-         * MIPS_REG_HI0 and MIPS_REG_LO0 as separate registers, and
-         * `mthi`/`mtlo` correctly name the single half they write.)
+         * THE mfhi / mflo ACCUMULATOR-HALF COMPACTION IS GONE.
          *
-         * The register table cannot fix this -- it is keyed by
-         * REGISTER and the discriminator is the INSTRUCTION -- so the
-         * AC<n> row names both halves (which is right for the DSP
-         * DPA/EXTR family, whose operations genuinely use all 64
-         * bits) and the two move-from forms drop the half they do not
-         * read here.  Without this, every `mfhi` takes a false edge
-         * from every producer of LO, and vice versa: the exact class
-         * of manufactured dependency the split exists to remove.
+         * It walked `src_regs[]` dropping REG_ACC<n> from an `mfhi` and
+         * REG_ACCHI<n> from an `mflo`, because Capstone 6.0.0-Alpha7 reports
+         * both move-from forms as reading the WHOLE pair (MIPS_REG_AC<n>)
+         * while the generic space splits the halves.  That repair was over
+         * the walk's read list, which f9ce637d94 deleted: the loop runs over
+         * zero entries and removes nothing.
          *
-         * Upstream: Capstone's MIPS move-from-accumulator operands
-         * should name MIPS_REG_HI<n> / MIPS_REG_LO<n>, as the
-         * move-to forms already do.  Revisit on a Capstone bump.
+         * The fact it repaired belongs to QEMU now and is already right
+         * there -- `gen_HILO()` reads `cpu_HI[acc]` for an mfhi and
+         * `cpu_LO[acc]` for an mflo (target/mips/tcg/translate.c), two
+         * distinct env fields with two distinct generic words, so the read
+         * list QEMU states names one half and not the pair.  Leaving an
+         * inert repair in place would be a second opinion with no subject.
          */
-        if (!strcmp(m, "mfhi") || !strcmp(m, "mflo")) {
-            const bool want_hi = (m[2] == 'h');
-            const uint8_t lo_first = REG_ACC0, lo_last = REG_ACC3;
-            const uint8_t hi_first = REG_ACCHI0, hi_last = REG_ACCHI3;
-            const uint8_t drop_first = want_hi ? lo_first : hi_first;
-            const uint8_t drop_last  = want_hi ? lo_last  : hi_last;
-            /*
-             * Compaction shifts src slot indices, and the address-dep
-             * masks are indexed by them.  These instructions have no
-             * memory operand so the masks are never populated; refuse
-             * rather than silently renumber if that ever changes.
-             */
-            if (!out->has_addr_deps) {
-                uint8_t keep = 0;
-                for (uint8_t i = 0; i < out->n_src_regs; i++) {
-                    uint8_t id = out->src_regs[i];
-                    if (id >= drop_first && id <= drop_last) {
-                        continue;
-                    }
-                    if (keep != i) {
-                        out->src_regs[keep]      = id;
-                        out->src_lane_mask[keep] = out->src_lane_mask[i];
-                        if (out_names) {
-                            out_names->src_qemu_reg_keys[keep] =
-                                out_names->src_qemu_reg_keys[i];
-                        }
-                    }
-                    keep++;
-                }
-                out->n_src_regs = keep;
-            }
-        }
         /*
          * `bal target` is the alias of `bgezal $zero, target`, and
          * Capstone decodes it to that instruction id — so it inherits
@@ -1395,65 +1356,34 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
     case TRACE_ISA_RISCV: {
         const char *m = info->mnemonic;
         /*
-         * The C-extension HINT code points: C.ADDI with nzimm == 0, and
-         * C.SLLI / C.SRLI / C.SRAI with shamt == 0.  Capstone gives the
-         * degenerate member of each family its own mnemonic and prints the
-         * ordinary member expanded (`addi rd, rd, imm`, `slli rd, rd,
-         * shamt`), so the name alone separates them; the n_dst_regs guard
-         * is the belt to that brace.
+         * THE C-EXTENSION HINT READ-CLEAR IS GONE, AND SO IS THE
+         * ALIASED-LINK FIXUP BELOW IT.  Both asked the OPERAND WALK a
+         * question -- "did the walk put a destination here?", "did it put a
+         * source here?" -- and with the read arm deleted (f9ce637d94) and
+         * the write arm deleted (bd2848c450) the answer is NO for every
+         * instruction on every ISA.  A guard that is universally true is not
+         * a guard; `n_dst_regs == 0` had stopped meaning "Capstone named no
+         * destination" and started meaning nothing at all.
          *
-         * The unprivileged spec is explicit that a HINT does not modify
-         * architectural state, and Capstone already agrees on the write
-         * half: it reports no destination for any of them.  It leaves the
-         * READ on, and half a no-op is worse than either whole — a source
-         * with no destination is an instruction that waits for a producer
-         * and then delivers nothing.  The register field on a HINT is
-         * PAYLOAD, selecting which hint this is, not a value the
-         * instruction consumes; modelling it as a read fabricates a RAW
-         * edge onto an instruction that architecturally does nothing.
-         *
-         * The read is dropped here rather than at the decode boundary
-         * because clearing an operand's access bits there means something
-         * else: an operand with no flags is how the boundary says Capstone
-         * SUPPLIED no direction, which sends the whole instruction down
-         * the !have_access_info positional path in the operand walk above
-         * and turns the payload register into a DESTINATION — the opposite
-         * of the intent.
-         *
-         * Weight is zero on the correct path; no compiler emits these.
-         * The wrong path decodes arbitrary bytes, which is where an
-         * instruction with an unbalanced operand shape gets to matter.
+         * The HINT arm zeroed `src_regs[]` because Capstone left a READ on
+         * an encoding the unprivileged spec says modifies no architectural
+         * state.  There is no such read to clear: `src_regs[]` is empty
+         * here on every path, and QEMU's own read list -- seated later by
+         * reindex_src_for_qemu() -- is what the wire publishes.  If QEMU
+         * states a read for a HINT, THAT is the fact to argue with, at
+         * QEMU's decoder, and it is not this arm's to erase.
          */
-        if (!strcmp(m, "c.addi") || !strcmp(m, "c.slli64") ||
-            !strcmp(m, "c.srli64") || !strcmp(m, "c.srai64")) {
-            if (out->n_dst_regs == 0) {
-                for (uint8_t i = 0; i < out->n_src_regs; i++) {
-                    out->src_regs[i] = REG_NONE;
-                    if (out_names) {
-                        out_names->src_qemu_reg_keys[i] = nullptr;
-                    }
-                }
-                out->n_src_regs = 0;
-            }
-            break;
-        }
         /*
-         * Whether THIS mnemonic is one of the aliases that hides the
-         * link register.  The fixup below has to key on that and not on
-         * the resulting branch_type: the trap returns MRET / SRET /
-         * DRET are also BRANCH_RETURN and also carry no operands, but
-         * they resume from mepc / sepc / dpc and never read ra at all.
-         * Keyed on branch_type, the fixup invented a return-address
-         * dependency on every exception return in a system trace.
+         * The branch TAXONOMY stays: one Capstone id covers jal / j /
+         * call / tail and jalr / jr / ret, and the printed alias is what
+         * separates a call from a jump from a return.  It writes
+         * branch_type only, which is classification, not dataflow.
          */
-        bool aliased_link = false;
         if (!strcmp(m, "jal") || !strcmp(m, "c_jal") ||
             !strcmp(m, "call") || !strcmp(m, "tail")) {
             out->branch_type = BRANCH_DIRECT_CALL;
-            aliased_link = true;
         } else if (!strcmp(m, "jalr") || !strcmp(m, "c_jalr")) {
             out->branch_type = BRANCH_INDIRECT_CALL;
-            aliased_link = true;
         } else if (!strcmp(m, "j") || !strcmp(m, "c_j") ||
                    !strcmp(m, "jump")) {
             out->branch_type = BRANCH_DIRECT_JUMP;
@@ -1461,33 +1391,29 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
             out->branch_type = BRANCH_INDIRECT_JUMP;
         } else if (!strcmp(m, "ret")) {
             out->branch_type = BRANCH_RETURN;
-            aliased_link = true;
         }
         /*
-         * Aliased link forms hide ra COMPLETELY in Capstone 6 — it is
-         * in neither the operand list nor the (always-empty for
-         * RISC-V) implicit regs_read/regs_write — so without a fixup
-         * the call's return-address write and the return's read
-         * vanish from the dataflow.  Non-aliased forms ("jal t0, ..."
-         * / "jalr t0, t1") carry the link register explicitly, which
-         * the n_dst/n_src==0 guards leave untouched.  (Caught by
-         * probe_rv_link_dataflow.)
+         * THE LINK-REGISTER FIXUP IS GONE.  It appended REG_LR to
+         * `dst_regs[]` on a call and to `src_regs[]` on a return whenever
+         * the walk had left the list empty, because Capstone 6 hides `ra`
+         * on the aliased forms -- in neither the operand list nor the
+         * (always empty for RISC-V) implicit arrays.
+         *
+         * IT HAD BECOME UNCONDITIONAL, and that is a fabrication route, not
+         * a repair.  With both walk arms deleted the guards are true for
+         * every instruction, so every `jal`/`jalr`/`call`/`tail` appended a
+         * REG_LR destination that seat_dst_for_qemu() then has to reconcile
+         * with QEMU's write rows -- and it REFUSES the whole row when
+         * `took != ndst`.  `tail` is `jalr x0`: QEMU states no link write
+         * for it, so the fabricated REG_LR would refuse that row's entire
+         * destination list the moment a reachable encoding produced one.
+         *
+         * QEMU states both halves where they happen.  `gen_jal()` writes
+         * `gpr[rd]` and the write note names it; `ret` is `jalr x0, ra, 0`
+         * and the read of `ra` is in QEMU's ordered read list.  So the fact
+         * the fixup existed to restore is on the wire from its own source,
+         * and re-adding it here could only ever disagree.
          */
-        if (!aliased_link) {
-            break;
-        }
-        if (out->branch_type == BRANCH_DIRECT_CALL ||
-            out->branch_type == BRANCH_INDIRECT_CALL) {
-            if (out->n_dst_regs == 0) {
-                add_dst_reg(out, out_names, REG_LR,
-                            qemu_reg_for_generic(REG_LR));
-            }
-        } else if (out->branch_type == BRANCH_RETURN) {
-            if (out->n_src_regs == 0) {
-                add_src_reg(out, out_names, REG_LR,
-                            qemu_reg_for_generic(REG_LR));
-            }
-        }
         break;
     }
     default:

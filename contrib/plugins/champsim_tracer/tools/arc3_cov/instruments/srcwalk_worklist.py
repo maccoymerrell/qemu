@@ -42,6 +42,30 @@ THE DISPOSITIONS, and what each one asserts:
                     would answer it.  An OPEN row with no question is a
                     refusal wearing a row's clothes.
 
+TRAP-STATE IS MEASURED, NOT ASSERTED.  `--trapstate <isa>=<file>` takes
+`trapstate_probe.py`'s per-encoding verdict table and decides that disposition
+from QEMU's own ops rather than from a row in the table: every losing register
+on an encoding the probe read TRAP-ONLY is credited to the built-in class
+`trapstate-measured` under D17, and the table is never consulted for it.  Three
+reasons it is built in rather than written as rows:
+
+  * the split is PER ENCODING and the table's key is (isa, mnemonic,
+    register).  exec177 already met a mnemonic whose encodings split across
+    trap and execute (`append`) and had to carve it by hand; a signature-keyed
+    row cannot express the split at all, so a hand-written TRAP-STATE row is
+    always an approximation of a measurement that exists.
+  * a row asserts; the probe measures, at the same cpu model and privilege the
+    corpus was swept at, with two controls that REFUSE the whole run if they do
+    not fire.
+  * and it cannot go stale silently: an ISA given a trapstate map whose table
+    does not cover every losing encoding of that ISA is a REFUSAL, because a
+    filter that quietly scores the rows it happens to know is the silent false
+    success this file is shaped against.
+
+NO-OPS IS NOT A TRAP and is deliberately NOT credited: R16 is explicit that "a
+NOP semantic still has real dependencies", so a NO-OPS encoding goes to the
+table like any executing one.
+
 HOW IT REFUSES, in all three directions, because a join that cannot refuse is
 a join that reports whatever it was given:
 
@@ -160,6 +184,37 @@ def load_table(path):
     return rows, errs
 
 
+def load_trapstate(spec):
+    """`isa=file` -> {(isa, encoding): verdict}, merged over every --trapstate.
+
+       The verdict table is `trapstate_probe.py`'s own output and is keyed on
+       the corpus's hex spelling, which is why that probe was changed to keep
+       that spelling end to end: a %08x round trip re-orders the bytes and the
+       join then matches nothing and reads MISSING -- silently, and in the
+       direction that scores every trap as REAL."""
+    out, errs = {}, []
+    for one in spec:
+        if "=" not in one:
+            errs.append("TRAPSTATE %r: want <isa>=<file>" % one)
+            continue
+        isa, path = one.split("=", 1)
+        if not os.path.exists(path):
+            errs.append("MISSING TRAPSTATE TABLE: %s" % path)
+            continue
+        n = 0
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                f = line.split()
+                if len(f) >= 2:
+                    out[(isa, f[0].strip().lower())] = f[1].strip()
+                    n += 1
+        if n == 0:
+            errs.append("EMPTY TRAPSTATE TABLE: %s" % path)
+    return out, errs
+
+
 def losses(a, b, isa):
     """Per encoding, the registers arm A published and arm B does not.
 
@@ -176,16 +231,42 @@ def losses(a, b, isa):
     return out
 
 
-def score(a, b, rows, isas=ISAS):
+def score(a, b, rows, isas=ISAS, bar=False, trap=None):
     """Join the measured losses to the table.  Returns (report, rc)."""
     out, rc = [], 0
     unclaimed, ambiguous = {}, {}
     by_disp = {d: [0, 0] for d in DISPOSITIONS}   # [reg-instances, encodings]
+    #: REAL-LOST, per ISA.  A losing register instance whose class asserts the
+    #: register must STAY on the wire (REAL-*) or has no verdict yet (OPEN).
+    #: An UNCLAIMED or AMBIGUOUS loss is counted here too -- a loss nobody has
+    #: adjudicated is a loss, and letting the join's own refusal quietly keep
+    #: it out of the bar would be the silent false success this file is shaped
+    #: against.
+    real_lost = {isa: 0 for isa in isas}
     total_regs = total_encs = 0
+    trap = trap or {}
+    joinbad = False
+    trap_isas = {k[0] for k in trap}
+    #: the measured TRAP-STATE credit, and the encodings an ISA's map misses
+    trapped = {isa: [0, 0] for isa in isas}     # [reg-instances, encodings]
+    uncovered = []
 
     for isa in isas:
         for enc, mnem, lost in losses(a, b, isa):
             enc_counted = set()
+            if isa in trap_isas:
+                v = trap.get((isa, enc.lower()))
+                if v is None:
+                    uncovered.append((isa, enc))
+                    continue
+                if v == "TRAP-ONLY":
+                    trapped[isa][0] += len(lost)
+                    trapped[isa][1] += 1
+                    by_disp["TRAP-STATE"][0] += len(lost)
+                    by_disp["TRAP-STATE"][1] += 1
+                    total_regs += len(lost)
+                    total_encs += 1
+                    continue
             for reg in lost:
                 total_regs += 1
                 claims = [r for r in rows
@@ -193,13 +274,17 @@ def score(a, b, rows, isas=ISAS):
                           and r["reg"].search(reg)]
                 if not claims:
                     unclaimed.setdefault((isa, mnem, reg), [0, enc])[0] += 1
+                    real_lost[isa] += 1
                     continue
                 if len(claims) > 1:
                     ambiguous.setdefault(
                         (isa, mnem, reg),
                         [0, enc, ",".join(c["cid"] for c in claims)])[0] += 1
+                    real_lost[isa] += 1
                     continue
                 c = claims[0]
+                if c["disp"] in REAL or c["disp"] in UNDECIDED:
+                    real_lost[isa] += 1
                 c["hits"] += 1
                 by_disp[c["disp"]][0] += 1
                 if c["cid"] not in enc_counted:
@@ -220,6 +305,38 @@ def score(a, b, rows, isas=ISAS):
         out.append("%-18s %12d %12d" % (d, by_disp[d][0], by_disp[d][1]))
     out.append("%-18s %12d %12d" % ("TOTAL", total_regs, total_encs))
     out.append("")
+    if trap:
+        out.append("=== TRAP-STATE, MEASURED PER ENCODING (D17) ===")
+        for isa in isas:
+            if isa in trap_isas:
+                out.append("%-10s TRAP-ONLY %10d reg-inst  %8d encodings"
+                           % (isa, trapped[isa][0], trapped[isa][1]))
+        if uncovered:
+            rc = 1
+            joinbad = True
+            out.append("UNCOVERED by the trapstate map: %d encoding(s) -- "
+                       "REFUSING." % len(uncovered))
+            for k in uncovered[:8]:
+                out.append("      %-9s %s" % k)
+            out.append("      A map that does not cover the population cannot "
+                       "say whether the rows it does not name trapped.")
+        out.append("")
+    # THE BAR ITSELF.  R12.1 is REAL-LOST = 0 hard, per ISA and with no
+    # pessimistic-direction discount, so the number the deletion excursion is
+    # judged on is printed here rather than left to be re-added by hand from
+    # the disposition table.  SUPERSET and TRAP-STATE are excluded because
+    # each carries a written ruling that the register does not belong on the
+    # wire; every other outcome, INCLUDING a loss no row claims, counts.
+    out.append("=== REAL-LOST (REAL-* + OPEN + unadjudicated), PER ISA ===")
+    for isa in isas:
+        out.append("%-10s REAL-LOST %10d" % (isa, real_lost[isa]))
+    out.append("%-10s REAL-LOST %10d" % ("TOTAL", sum(real_lost.values())))
+    if bar and any(real_lost.values()):
+        rc = 1
+        out.append("BAR: FAIL -- REAL-LOST is not 0 on every ISA.")
+    elif bar:
+        out.append("BAR: PASS -- REAL-LOST = 0 on every ISA.")
+    out.append("")
     out.append("=== PER CLASS ===")
     out.append("%-26s %-9s %-17s %10s" % ("class_id", "isa", "disposition",
                                           "reg-insts"))
@@ -227,8 +344,10 @@ def score(a, b, rows, isas=ISAS):
         out.append("%-26s %-9s %-17s %10d"
                    % (r["cid"], r["isa"], r["disp"], r["hits"]))
 
+    joinbad = bool(unclaimed or ambiguous)
     stale = [r for r in rows if r["hits"] == 0]
     if stale:
+        joinbad = True
         rc = 1
         out.append("")
         out.append("STALE ROWS -- claim nothing in this measurement (%d):"
@@ -254,9 +373,19 @@ def score(a, b, rows, isas=ISAS):
             out.append("   %-9s %-16s %-18s %6d  %s" % (isa, mnem, reg, n, cids))
 
     out.append("")
-    out.append("VERDICT: %s" % ("REFUSED" if rc else
-                                "every losing register is claimed by exactly "
-                                "one adjudicated class"))
+    # THE TWO FAILURES ARE DIFFERENT AND ARE NAMED APART.  A join that cannot
+    # place a loss REFUSES; a join that places every loss and finds REAL-LOST
+    # non-zero has done its work and is reporting a bar.  Printing "REFUSED"
+    # for the second would read as an instrument that could not look, which is
+    # the misreading this tree files against.
+    if joinbad:
+        out.append("VERDICT: REFUSED -- the join could not place every loss.")
+    elif rc:
+        out.append("VERDICT: every losing register is claimed by exactly one "
+                   "adjudicated class; the BAR is what failed.")
+    else:
+        out.append("VERDICT: every losing register is claimed by exactly "
+                   "one adjudicated class")
     return out, rc
 
 
@@ -291,7 +420,8 @@ def selftest():
     n_check = [0]
     n_fail = [0]
 
-    def check(name, tbl_lines, want_rc, want_sub=None, corpB=B):
+    def check(name, tbl_lines, want_rc, want_sub=None, corpB=B,
+              trap=None, bar=False):
         nonlocal ok
         n_check[0] += 1
         a, ea = load_corpus(A)
@@ -304,7 +434,8 @@ def selftest():
         if rows is None or et:
             got_rc, rep = 1, et
         else:
-            rep, got_rc = score(a, b, rows, isas=("mipsel",))
+            rep, got_rc = score(a, b, rows, isas=("mipsel",), trap=trap,
+                                bar=bar)
         txt = "\n".join(rep)
         good = (got_rc == want_rc) and (want_sub is None or want_sub in txt)
         if good:
@@ -344,6 +475,40 @@ def selftest():
     check("empty measurement REFUSES", full, 1,
           "the measurement has no losing rows", corpB=A)
 
+    # THE BAR AND THE MEASURED TRAP-STATE, both directions.
+    #
+    # The selftest corpus loses REG_ZERO + REG_GPR1 on 00000080 and REG_ZERO
+    # on 00000084 -- three register instances, all REAL under `full`.
+    check("REAL-LOST is the bar and it FAILS when non-zero", full, 1,
+          "mipsel     REAL-LOST          3", bar=True)
+    check("a bar failure is NOT reported as a refusal", full, 1,
+          "the BAR is what failed", bar=True)
+    trap_one = {("mipsel", "00000080"): "TRAP-ONLY",
+                ("mipsel", "00000084"): "DATAPATH"}
+    # 00000080 loses REG_ZERO + REG_GPR1, 00000084 loses REG_ZERO.  Trapping
+    # the first takes TWO instances out of the bar and leaves ONE, and the
+    # table is not consulted for the trapped encoding at all -- which is why
+    # the `g` row is dropped here: its only subject was that encoding, and a
+    # row left claiming nothing is a STALE row by this file's own rule.
+    check("a TRAP-ONLY encoding leaves the bar and is counted apart",
+          full[:1], 1, "mipsel     REAL-LOST          1",
+          trap=trap_one, bar=True)
+    check("... and its registers are reported as TRAP-ONLY", full[:1], 1,
+          "TRAP-ONLY          2 reg-inst", trap=trap_one, bar=True)
+    trap_all = {("mipsel", "00000080"): "TRAP-ONLY",
+                ("mipsel", "00000084"): "TRAP-ONLY"}
+    # THE JOIN'S OWN GUARDS STAY ARMED under a trapstate map: a table whose
+    # rows now claim nothing is STALE, not quietly tolerated.
+    check("a table left behind by a wholly trapped population is STALE",
+          full, 1, "STALE ROWS", trap=trap_all, bar=True)
+    trap_half = {("mipsel", "00000080"): "TRAP-ONLY"}
+    check("a trapstate map that misses an encoding REFUSES", full, 1,
+          "UNCOVERED by the trapstate map", trap=trap_half, bar=True)
+    trap_dp = {("mipsel", "00000080"): "DATAPATH",
+               ("mipsel", "00000084"): "NO-OPS"}
+    check("NO-OPS and DATAPATH both stay REAL (R16: a NOP has dependencies)",
+          full, 1, "mipsel     REAL-LOST          3", trap=trap_dp, bar=True)
+
     print("srcwalk_worklist selftest: %d check(s), %d failure(s)"
           % (n_check[0], n_fail[0]))
     print("SELFTEST %s" % ("PASS" if ok else "FAIL"))
@@ -357,6 +522,13 @@ def main():
     ap.add_argument("--arm-b", help="corpus directory for arm B (walk deleted)")
     ap.add_argument("--table", default=os.path.join(here, "SRCWALK_CLASSES.tsv"))
     ap.add_argument("--isa", action="append", choices=ISAS)
+    ap.add_argument("--trapstate", action="append", default=[],
+                    metavar="ISA=FILE",
+                    help="trapstate_probe.py verdicts for ISA; every losing "
+                         "encoding it reads TRAP-ONLY is credited TRAP-STATE "
+                         "under D17 and never reaches the table")
+    ap.add_argument("--bar", action="store_true",
+                    help="fail unless REAL-LOST is 0 on every scored ISA")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -377,12 +549,14 @@ def main():
         b.update(pb)
     rows, et = load_table(args.table)
     errs += et
+    trap, te = load_trapstate(args.trapstate)
+    errs += te
     if errs:
         for e in errs:
             print("ERROR: %s" % e)
         if rows is None or not a or not b:
             return 1
-    rep, rc = score(a, b, rows, isas=isas)
+    rep, rc = score(a, b, rows, isas=isas, bar=args.bar, trap=trap)
     print("\n".join(rep))
     return 1 if (rc or errs) else 0
 

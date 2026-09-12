@@ -80,9 +80,14 @@ ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 REAL = ("REAL-OPERAND", "REAL-VOCAB-GAP", "REAL-QEMU-ELIDES")
 #: the disposition that asserts the wire is right to drop it
 DROP = ("SUPERSET",)
+#: the disposition that says the QUESTION DOES NOT ARISE IN THIS CORPUS --
+#: the machine did not execute the encoding's datapath in the state the sweep
+#: ran in, so the walk's operand names are not what was read and the register
+#: is neither a REAL loss nor a proven over-name.  It is a CORPUS-STATE fact.
+STATE = ("TRAP-STATE",)
 #: no verdict
 UNDECIDED = ("OPEN",)
-DISPOSITIONS = REAL + DROP + UNDECIDED
+DISPOSITIONS = REAL + DROP + STATE + UNDECIDED
 
 
 def load_corpus(path):
@@ -134,6 +139,11 @@ def load_table(path):
             if not cite.strip() or not note.strip():
                 errs.append("TABLE LINE %d (%s): a verdict with no citation or "
                             "no note is not a row" % (ln, cid))
+                continue
+            if disp in STATE and "trapstate" not in note.lower():
+                errs.append("TABLE LINE %d (%s): a TRAP-STATE row asserts what "
+                            "QEMU's own ops did, so its note must name the "
+                            "trapstate_probe evidence" % (ln, cid))
                 continue
             if disp in UNDECIDED and "?" not in note:
                 errs.append("TABLE LINE %d (%s): an OPEN row must carry the "
@@ -318,6 +328,14 @@ def selftest():
     check("OPEN row with no question REFUSES",
           ["o\tmipsel\t.*\t.*\tOPEN\tcite\tno question here"],
           1, "must carry the QUESTION")
+    check("TRAP-STATE row with no probe evidence REFUSES",
+          ["t\tmipsel\t.*\t.*\tTRAP-STATE\tcite\tit looked like a trap"],
+          1, "must name the trapstate_probe evidence")
+    check("TRAP-STATE row that names the probe is accepted",
+          ["z\tmipsel\t.*\t^REG_ZERO$\tREAL-QEMU-ELIDES\tR15\tnames it",
+           "t\tmipsel\t.*\t^REG_GPR\\d+$\tTRAP-STATE\tcite\t"
+           "trapstate_probe reads TRAP-ONLY"],
+          0, "TRAP-STATE")
     check("row with no citation REFUSES",
           ["n\tmipsel\t.*\t.*\tREAL-OPERAND\t \tnote"], 1, "no citation")
     check("unknown disposition REFUSES",

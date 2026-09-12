@@ -1719,19 +1719,33 @@ void decode_detail_to_generic(uint64_t pc,
 
         switch (op->type) {
         case QEMU_PLUGIN_OP_REG: {
+            /*
+             * THE READ ARM IS GONE (R14.2 / J7).  A register operand the
+             * boundary marks READ used to be added to src_regs[] here, and
+             * that was the wire's source list.  It is not any more:
+             * qemu_named_regs() seats QEMU's own ordered read list, and the
+             * survivor rows carry what QEMU does not state, so this call
+             * added nothing the wire did not already have -- it only kept a
+             * live Capstone route into the source side, which J7 forbids
+             * ("Capstone not demoted, Capstone REMOVED ... if you leave it
+             * there, you will rely on it").
+             *
+             * The WRITE arm stays.  The destination list is still the
+             * operand walk's; #232's replacement is the next wave and
+             * deleting half of it now would leave the wire with no
+             * destinations at all.
+             *
+             * dst_reg_idx keeps its meaning for the same reason: with no
+             * access flags the walk must still decide which register
+             * operand is the destination, and the source half of that
+             * decision simply no longer has anywhere to go.
+             */
             if (have_access_info) {
-                if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                    add_src_cap_reg(out, out_names, op->reg_id);
-                }
                 if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
                     add_dst_cap_reg(out, out_names, op->reg_id);
                 }
-            } else {
-                if (i == dst_reg_idx) {
-                    add_dst_cap_reg(out, out_names, op->reg_id);
-                } else {
-                    add_src_cap_reg(out, out_names, op->reg_id);
-                }
+            } else if (i == dst_reg_idx) {
+                add_dst_cap_reg(out, out_names, op->reg_id);
             }
             break;
         }
@@ -1762,9 +1776,13 @@ void decode_detail_to_generic(uint64_t pc,
             if (!sys_key) {
                 sys_key = qemu_reg_for_generic(gen);
             }
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                add_src_reg(out, out_names, gen, sys_key);
-            }
+            /*
+             * READ arm deleted with the register one above: a system
+             * register the encoding names and the instruction reads is in
+             * QEMU's ordered read list where QEMU states it, and in the
+             * survivor table where it does not.  The WRITE arm stays with
+             * the rest of the destination walk.
+             */
             if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
                 add_dst_reg(out, out_names, gen, sys_key);
                 /*
@@ -1875,9 +1893,17 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     if (isa_properties[trace_isa].include_implicit_regs) {
-        for (uint8_t i = 0; i < info->n_regs_read; i++) {
-            add_src_cap_reg(out, out_names, info->regs_read_id[i]);
-        }
+        /*
+         * The implicit-READ fold is deleted with the two operand arms
+         * above.  Capstone's regs_read[] was the last route by which a
+         * register reached src_regs[] without QEMU or a survivor row
+         * saying so; every register it supplied is in one of those two
+         * now, which is what MISSING = 0 on both corpora measures.
+         *
+         * regs_write[] stays, and so does the MIPS $at correction below
+         * it: they feed the destination list, which this wave does not
+         * touch.
+         */
         for (uint8_t i = 0; i < info->n_regs_write; i++) {
             /*
              * MIPS branches do not write $at, and LLVM's MIPS tables say

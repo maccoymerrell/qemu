@@ -4878,125 +4878,33 @@ static void cap_aarch64_fp_status_contract(const cs_insn *insn,
 }
 
 /*
- * The FP / SIMD / SVE / SME execution-enable gate, as a source.
+ * THE FP / SIMD / SVE / SME EXECUTION-ENABLE GATE IS GONE FROM HERE.
  *
- * R7.4: "if a write to the CSR would block that instruction due to a
- * dependency, it should be recorded".  CPACR_EL1.FPEN, CPTR_EL2.FPEN
- * and CPTR_EL3.TFP decide whether an FP, Advanced SIMD, SVE or SME
- * instruction executes or takes a trap, so a pending write to one of
- * them has to resolve before any of those instructions may proceed.
- * That is an edge a renaming regfile must respect, which is the test
- * R7 states, and it is the same fact this boundary already records on
- * RISC-V for wfi/mstatus.TW and the cbo/Zicfiss envcfg triple.
+ * It used to append CPACR_EL1 / CPTR_EL2 / CPTR_EL3 -- and SMCR_ELx on
+ * the ZT0 forms -- as READ system operands on every FP-gated encoding,
+ * and the tracer's operand walk turned those reads into wire sources.
+ * That walk no longer has a read arm (R14.2 / J7), so the operands were
+ * synthesised for a consumer that had stopped consuming them.
  *
- * ALL THREE ARE NAMED, not just the one the current exception level
- * consults, for the reason R4 gives and the RISC-V envcfg triple
- * already follows: which gate applies is a runtime value and a static
- * register set names every candidate.  They share one generic ID
- * (REG_SYSFPEN) because they are one behaviour group -- see
- * cap_aarch64_sysreg_class -- so the generic register set is the same
- * whichever of them a run actually traps on; what the three operands
- * carry that one would not is the identification, in reg_id and
- * reg_name, of which register a consumer is looking at.
+ * The FACT is unchanged and still on the wire: REG_SYSFPEN reaches
+ * src_regs[] from the emulator's own ordered read list, which is what
+ * the source list is built from now.  The R7.4 argument that put it
+ * there -- a pending write to the enable gate must resolve before a
+ * gated instruction may proceed, so it is an edge a renaming regfile
+ * must respect -- is an argument about the architecture, not about this
+ * decoder, and it is satisfied by whichever side states the read.
  *
- * WHICH INSTRUCTIONS.  The gate belongs to exactly the instructions the
- * architecture routes through CheckFPAdvSIMDEnabled / CheckSVEEnabled /
- * CheckSMEEnabled, and that population is the FP, SIMD, SVE and SME
- * extensions in their entirety.  The discriminator is Capstone's
- * per-ENCODING feature list, not the mnemonic and not the operand
- * register files: one mnemonic spans forms in different extensions
- * (`fadd d0, d1, d2` is FPARMv8, `fadd z0.d, p0/m, z0.d, z1.d` is SVE,
- * `fadd za.d[w8, 0, vgx2], {z0.d, z1.d}` is SME2), and the SVE count
- * and vector-length forms (CNTB, RDVL) are gated while naming nothing
- * but a GPR.  Feature membership is instruction TAXONOMY, which is what
- * Capstone is kept for; it is not operand or access-flag information,
- * so nothing here reaches the dependency model through a Capstone
- * decision about registers.
- *
- * The list is the FP/SIMD/vector/matrix extensions.  The integer and
- * system extensions that sit beside them in the enum -- CRC, CSSC, LSE,
- * RAS, SPE, MOPS, MTE, PAUTH -- are NOT gated and are not here.
+ * What is NOT carried forward, and is stated rather than lost: this
+ * gate named all three candidate registers (and their reg_name
+ * spellings) because which one applies is a runtime value, so a static
+ * set names every candidate.  QEMU states the gate its own translation
+ * consults.  The generic register the wire publishes is the same either
+ * way -- the three share REG_SYSFPEN, one behaviour group -- so no
+ * generic source leaves the wire; what a consumer can no longer read
+ * off a gated instruction is WHICH of the three the identification
+ * fields named.  The wire has never carried that distinction as a
+ * dependency, only as a name.
  */
-static bool cap_aarch64_feature_is_fp_gated(uint16_t g)
-{
-    switch (g) {
-    /* Scalar FP and Advanced SIMD, and the V-register crypto. */
-    case AARCH64_FEATURE_HASFPARMV8:
-    case AARCH64_FEATURE_HASNEON:
-    case AARCH64_FEATURE_HASFULLFP16:
-    case AARCH64_FEATURE_HASFP16FML:
-    case AARCH64_FEATURE_HASFUSEAES:
-    case AARCH64_FEATURE_HASAES:
-    case AARCH64_FEATURE_HASSHA2:
-    case AARCH64_FEATURE_HASSHA3:
-    case AARCH64_FEATURE_HASSM4:
-    case AARCH64_FEATURE_HASDOTPROD:
-    case AARCH64_FEATURE_HASRDM:
-    case AARCH64_FEATURE_HASCOMPLXNUM:
-    case AARCH64_FEATURE_HASJS:
-    case AARCH64_FEATURE_HASFRINT3264:
-    case AARCH64_FEATURE_HASBF16:
-    case AARCH64_FEATURE_HASB16B16:
-    case AARCH64_FEATURE_HASMATMULINT8:
-    case AARCH64_FEATURE_HASMATMULFP32:
-    case AARCH64_FEATURE_HASMATMULFP64:
-    case AARCH64_FEATURE_HASLUT:
-    case AARCH64_FEATURE_HASFAMINMAX:
-    /* FEAT_FP8 and its dot/FMA companions. */
-    case AARCH64_FEATURE_HASFP8:
-    case AARCH64_FEATURE_HASFP8FMA:
-    case AARCH64_FEATURE_HASFP8DOT2:
-    case AARCH64_FEATURE_HASFP8DOT4:
-    case AARCH64_FEATURE_HASSSVE_FP8FMA:
-    case AARCH64_FEATURE_HASSSVE_FP8DOT2:
-    case AARCH64_FEATURE_HASSSVE_FP8DOT4:
-    /* SVE. */
-    case AARCH64_FEATURE_HASSVE:
-    case AARCH64_FEATURE_HASSVE2:
-    case AARCH64_FEATURE_HASSVE2P1:
-    case AARCH64_FEATURE_HASSVE2AES:
-    case AARCH64_FEATURE_HASSVE2SM4:
-    case AARCH64_FEATURE_HASSVE2SHA3:
-    case AARCH64_FEATURE_HASSVE2BITPERM:
-    /* SME. */
-    case AARCH64_FEATURE_HASSME:
-    case AARCH64_FEATURE_HASSME2:
-    case AARCH64_FEATURE_HASSME2P1:
-    case AARCH64_FEATURE_HASSMEF64F64:
-    case AARCH64_FEATURE_HASSMEF16F16:
-    case AARCH64_FEATURE_HASSMEFA64:
-    case AARCH64_FEATURE_HASSMEI16I64:
-    case AARCH64_FEATURE_HASSMEF8F16:
-    case AARCH64_FEATURE_HASSMEF8F32:
-    case AARCH64_FEATURE_HASSME_LUTV2:
-    /* The "either extension provides it" spellings. */
-    case AARCH64_FEATURE_HASSVEORSME:
-    case AARCH64_FEATURE_HASSVE2ORSME:
-    case AARCH64_FEATURE_HASSVE2ORSME2:
-    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME:
-    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME2:
-    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME2P1:
-    case AARCH64_FEATURE_HASNEONORSME:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool cap_aarch64_is_fp_gated(const cs_insn *insn)
-{
-    const cs_detail *d = insn->detail;
-
-    if (!d) {
-        return false;
-    }
-    for (uint8_t i = 0; i < d->groups_count; i++) {
-        if (cap_aarch64_feature_is_fp_gated(d->groups[i])) {
-            return true;
-        }
-    }
-    return false;
-}
 
 /*
  * Append a system register the ENCODING implies but no operand names.
@@ -5050,65 +4958,6 @@ static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
 {
     cap_aarch64_add_sysreg_class(out, sysreg, name, access,
                                  cap_aarch64_sysreg_class(sysreg));
-}
-
-/*
- * ZT0 has a SECOND gate, and it is not CPACR.
- *
- * SMCR_ELx.EZT0 decides on its own whether an instruction that touches
- * the SME2 lookup-table register traps -- CheckSMEZT0Enabled reads it
- * after CheckSMEEnabled has already passed -- so by the same R7.4 test
- * it is a second source on exactly the ZT0 forms.  It is NOT the
- * FP-enable gate and does not share its ID: SMCR is vector
- * configuration (it also carries the streaming vector length), which is
- * the role REG_VCTRL names, and folding the two would order every FP
- * instruction behind a vector-length write.
- */
-static bool cap_aarch64_touches_zt0(const cs_arm64 *a64, uint8_t n,
-                                    const qemu_plugin_insn_info *out)
-{
-    for (uint8_t i = 0; i < n; i++) {
-        const cs_arm64_op *o = &a64->operands[i];
-
-        if ((o->type == AARCH64_OP_REG && o->reg == AARCH64_REG_ZT0) ||
-            (o->type == AARCH64_OP_SME && o->sme.tile == AARCH64_REG_ZT0)) {
-            return true;
-        }
-    }
-    for (uint8_t i = 0; i < out->n_regs_read; i++) {
-        if (out->regs_read_id[i] == AARCH64_REG_ZT0) {
-            return true;
-        }
-    }
-    for (uint8_t i = 0; i < out->n_regs_write; i++) {
-        if (out->regs_write_id[i] == AARCH64_REG_ZT0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void cap_aarch64_add_fp_enable_gate(const cs_insn *insn,
-                                           const cs_arm64 *a64, uint8_t n,
-                                           qemu_plugin_insn_info *out)
-{
-    if (!cap_aarch64_is_fp_gated(insn)) {
-        return;
-    }
-    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPACR_EL1, "cpacr_el1",
-                           QEMU_PLUGIN_OP_ACC_READ);
-    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL2, "cptr_el2",
-                           QEMU_PLUGIN_OP_ACC_READ);
-    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL3, "cptr_el3",
-                           QEMU_PLUGIN_OP_ACC_READ);
-    if (cap_aarch64_touches_zt0(a64, n, out)) {
-        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL1, "smcr_el1",
-                               QEMU_PLUGIN_OP_ACC_READ);
-        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL2, "smcr_el2",
-                               QEMU_PLUGIN_OP_ACC_READ);
-        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL3, "smcr_el3",
-                               QEMU_PLUGIN_OP_ACC_READ);
-    }
 }
 
 /* Xn as a Capstone register id.  X29 and X30 are spelled FP and LR. */
@@ -5581,10 +5430,20 @@ static void cap_aarch64_hint_contract(csh handle, const cs_insn *insn,
  *
  * The SME forms additionally carry the enable gate.  msr_imm.xml calls
  * CheckSMEAccess() before SetPSTATE_SM, and R7.4 makes that read a real
- * source -- but Capstone attaches this encoding NO feature group at all
- * ("Groups: privilege" and nothing else), so cap_aarch64_is_fp_gated,
- * which keys off the feature list, cannot see it.  The gate is added
- * from the encoding for the same reason the register is.
+ * source.  It is derived from the ENCODING here because Capstone
+ * attaches this encoding no feature group at all ("Groups: privilege"
+ * and nothing else), so a feature-list test could never have seen it --
+ * which is also why this arm outlived the feature-keyed FP-enable gate
+ * that used to sit beside it and is now deleted (R14.2 / J7).
+ *
+ * These operands no longer reach the wire's SOURCE list: the tracer's
+ * operand walk has no read arm any more.  REG_SYSFPEN reaches it for
+ * this encoding from the source-survivor table instead
+ * (disas_a64/MSR_i_SVCR), which is exactly the route that table exists
+ * to provide for a register the emulator does not state.  They are kept
+ * because this contract's subject is the WRITE -- the PSTATE field the
+ * instruction sets -- and the gate reads travel with it as the
+ * encoding's own description.
  */
 static void cap_aarch64_msr_imm_contract(const cs_insn *insn,
                                          qemu_plugin_insn_info *out)
@@ -6853,7 +6712,6 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
      * FPCR read cannot double-count.
      */
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
-    cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_msr_imm_contract(insn, out);
     cap_aarch64_implicit_sysregs(insn, out);
     cap_aarch64_hint_contract(handle, insn, out);

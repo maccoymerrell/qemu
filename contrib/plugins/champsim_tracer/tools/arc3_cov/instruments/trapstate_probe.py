@@ -188,6 +188,67 @@ _PCSET = re.compile(r"^mov_i(32|64) (pc|PC|rip|eip),\$")
 # ALSO writes the PC and calls an exception helper, which is the trap shape
 # and nothing else.
 _EXCARG = re.compile(r"^st(8|16|32|64)?_i(32|64) \$0x[0-9a-f]+,env,\$")
+
+
+#: THE GUEST'S OWN ANSWER.  qemu-user prints this line when the guest dies on
+#: a signal nothing handled, and the probe's ELF has the subject encoding AT
+#: THE ENTRY POINT with an exit(0) stub behind it -- so a run that ends this
+#: way ended at the subject, and a run that does not end this way reached the
+#: stub.  It decides ONLY a block that has no live work left (see classify);
+#: a block that does real work and then dies is DATAPATH, because the work
+#: happened.
+_GUESTSIG = re.compile(r"uncaught target signal \d+")
+
+
+def _operand_blind_call(o):
+    """True for a `call` that CANNOT SEE THE INSTRUCTION'S OPERANDS.
+
+    THE QUESTION THIS PROBE ASKS is whether the encoding's datapath read its
+    operands.  A call is evidence for YES only if an operand could reach it,
+    and the op text says exactly which values do: TCG dumps a call as
+
+        call <name>,$<flags>,$<nrets>,<rets...>,<args...>
+
+    so a call every one of whose rets and args is `env` or a `$constant` is a
+    call the register fields of the encoding never touched.  Whatever such a
+    call does, it did not compute anything from Rn, Rd or Rt, because it was
+    not given them.
+
+    MEASURED, and it is why this rule exists.  aarch64 `sysl x0, #0, c11, c0,
+    #0` (d528b000) on the swept `max` model translates to
+
+        call tidcp_el0,$0x2,$0,env,$0x62102c01
+        mov_i64 pc,$0x400078
+        call exception_with_syndrome,$0x8,$0,env,$0x1,$0x2000000   <- EC 0x00
+        exit_tb ...
+
+    and the guest answers `uncaught target signal 4 (Illegal instruction)`.
+    The raise is unconditional, the syndrome is EC 0x00 UNALLOCATED, and the
+    encoding names a system register that is read by nothing.  The 5,354
+    sibling `sysl` encodings whose blocks lack the TIDCP check already read
+    TRAP-ONLY; these 768 differed only by a call that takes `env` and one
+    constant syndrome.  That is the instrument splitting one trap into two
+    verdicts on a detail of which CHECK the translator emitted first --
+    182-A's shape exactly, a pass after that finding was landed.
+
+    IT IS NOT A HELPER ALLOWLIST and could not be one: what it tests is a
+    property of the ARGUMENTS the call was given, so `call wfe,$0x0,$0,env`
+    is operand-blind too -- and `wfet xzr` stays DATAPATH regardless, because
+    its block contains no raise at all and the verdict below requires one.
+
+    IT CANNOT EAT AN ARCHITECTURAL EFFECT THE OPERANDS CAUSED, because an
+    effect computed from an operand needs that operand as an argument, and
+    such a call is not blind.  A call that takes a temp, a guest register
+    global or a return slot fails the test and stays work.
+    """
+    if not o.startswith("call "):
+        return False
+    f = o.split(",")
+    if len(f) < 3:
+        return False
+    #: f[0] is "call <name>", f[1] the flags, f[2] the return count; the rest
+    #: are the rets and args, and every one of them must be env or a constant.
+    return all(x == "env" or x.startswith("$") for x in f[3:])
 # A CONSTANT MATERIALISED INTO A TEMP READS NOTHING, SO IT CANNOT WITNESS AN
 # OPERAND READ.
 #
@@ -302,7 +363,10 @@ def classify(op_text, entry):
             continue
         if dead:
             continue
-        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)):
+        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)
+                or _operand_blind_call(o) or _GUESTSIG.search(o)):
+            #: the guest's death line is qemu's own diagnostic, not an op --
+            #: it is READ as a witness below and must never be counted as work
             continue
         live.append(o)
 
@@ -363,7 +427,34 @@ def classify(op_text, entry):
             changed = True
     work = [o for o in live if o is not None and not o.startswith("set_label")]
 
-    if not work and any(_EXC.search(o) for o in ops):
+    # THE TRANSLATOR'S RAISE IS NOT THE ONLY WAY A MACHINE REFUSES AN
+    # ENCODING, and reading only the ops left the probe blind to the other.
+    #
+    # x86 `rdpmc` (0f33) translates to exactly one op --
+    #
+    #     mov_i64 rip,$0x400078
+    #     call rdpmc,$0xa,$0,env
+    #
+    # -- with NO exception helper anywhere in the block, because the raise is
+    # INSIDE helper_rdpmc: at CPL3 with CR4.PCE clear it delivers #GP and the
+    # guest answers `uncaught target signal 11`.  On the op text alone that
+    # reads DATAPATH, and the walk's REG_SYS for the performance counter would
+    # then be scored a real read of a counter the machine never reached.
+    #
+    # So the second witness is the GUEST'S OWN DEATH, admitted under exactly
+    # one condition: THE BLOCK HAS NO LIVE WORK LEFT.  A block that does real
+    # work and then dies is DATAPATH -- `ld x1,0(x2)` faults on a bad address
+    # having read x2, and that operand read is the fact this probe measures.
+    # Only a block whose entire contribution is already discounted -- a PC
+    # write, an exit, an exception argument, a call that cannot see the
+    # operands -- can be decided this way, and for such a block "the guest
+    # died here" and "the machine did not run this datapath" are one
+    # statement.
+    #
+    # It cannot fire where the guest survives: the sled ELF ends in an exit(0)
+    # stub, so a subject the machine executes reaches the stub and exits 0.
+    if not work and (any(_EXC.search(o) for o in ops)
+                     or _GUESTSIG.search(op_text)):
         return "TRAP-ONLY"
     return "DATAPATH"
 
@@ -546,6 +637,47 @@ def selftest(qemu):
                  " mov_i64 pc,$0x400078\n"
                  " call raise_exception,$0x8,$0,env,$0x2\n", 0x400078)
         == "DATAPATH")
+    chk("classifier: no live work + the guest died = TRAP-ONLY",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " mov_i64 rip,$0x400078\n"
+                 " call rdpmc,$0xa,$0,env\n"
+                 "qemu: uncaught target signal 11 (Segmentation fault)\n",
+                 0x400078) == "TRAP-ONLY")
+    chk("classifier: the SAME block with the guest surviving is DATAPATH",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " mov_i64 rip,$0x400078\n"
+                 " call rdpmc,$0xa,$0,env\n", 0x400078) == "DATAPATH")
+    chk("classifier: REAL WORK plus a dead guest is still DATAPATH",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " qemu_ld_i64 x1,x2,leq,0\n"
+                 "qemu: uncaught target signal 11 (Segmentation fault)\n",
+                 0x400078) == "DATAPATH")
+    # THE OPERAND-BLIND CALL, all four readings.  The rule moves 768 aarch64
+    # `sysl` register instances out of the bar, so every direction of it has
+    # to be shown firing -- and shown NOT firing where it must not.
+    chk("classifier: a call that sees only env and constants, before an "
+        "unguarded raise, is not datapath",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " call tidcp_el0,$0x2,$0,env,$0x62102c01\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call exception_with_syndrome,$0x8,$0,env,$0x1,$0x2000000\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400078) == "TRAP-ONLY")
+    chk("classifier: the SAME call with no raise in the block is DATAPATH",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call wfe,$0x0,$0,env\n", 0x400078) == "DATAPATH")
+    chk("classifier: a call given a TEMP is not blind and stays work",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " call tidcp_el0,$0x2,$0,env,loc4\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call exception_with_syndrome,$0x8,$0,env,$0x1,$0x2000000\n",
+                 0x400078) == "DATAPATH")
+    chk("classifier: a call given a RETURN slot is not blind either",
+        classify(" ---- 0000000000400078 0 0\n"
+                 " call csrr,$0x0,$1,loc3,env,$0x11\n"
+                 " mov_i64 pc,$0x400078\n"
+                 " call raise_exception,$0x8,$0,env,$0x2\n",
+                 0x400078) == "DATAPATH")
     chk("classifier: work AFTER an unguarded raise is dead, not datapath",
         classify(" ---- 0000000000400074 0 0\n mov_i32 PC,$0x400074\n"
                  " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"

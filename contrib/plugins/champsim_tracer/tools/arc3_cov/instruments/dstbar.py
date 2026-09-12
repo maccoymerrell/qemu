@@ -100,6 +100,7 @@ def print_regtable(counter, indent, cap):
 sys.path.insert(0, "/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/"
                    "arc3_cov/instruments")
 import srcenc_reach
+import mechcorpus                        # the mechanism corpus's ONE reader
 # THE MECH CORPUS MAY BE COMPRESSED, AND THIS SCORER USED TO CALL THAT
 # MISSING.  A mech corpus is 12G of text per pass and the disk rule says
 # archive it; `open()` on the uncompressed name then finds nothing and the
@@ -196,30 +197,37 @@ def regs(s):
     return frozenset(r for r in s.split(",") if r and r != "-")
 
 
+#: THE COLUMNS THIS BAR INDEXES, each with the reason its absence is a
+#: refusal rather than a zero.  These used to be checked AFTER the merge, and
+#: FINDING 99-F is what that cost: with the header bound to the `#tip` stamp
+#: the merge itself indexed `PUBD` and died on a KeyError before the checks
+#: below could say the honest sentence.  A required column is now stated to
+#: the reader, which raises before any row is touched.
+MECH_NEEDS = (
+    ("PUBD", "the arm predates the columns and cannot answer"),
+    ("WSTQ", "the arm predates the columns and cannot answer"),
+    ("WR",   "the destination bar's losing side is QEMU's write list"),
+    # WRU IS REQUIRED, NOT OPTIONAL.  An arm captured before the column
+    # existed cannot say which rows carry a container write with an unstated
+    # index, and reading its absence as "none of them" is the silent false
+    # success this file's own WSTQ refusal exists against: the number it
+    # would print is the 6.7x bar FINDING 75-C explained.
+    ("WRU",  "the arm predates it, so a container write whose index QEMU "
+             "could not state is indistinguishable from a complete write "
+             "list; see FINDING 75-C"),
+)
+
+
 def read_mech_merged(paths):
     """encoding -> row; a wp-arm disagreement on PUBD or WR is a CONFLICT."""
-    d, conf, confex = {}, 0, []
-    hdr = None
-    for p in paths:
-        with evopen(p, errors="replace") as f:
-            for line in f:
-                if line.startswith("#"):
-                    if hdr is None:
-                        hdr = line.lstrip("#").rstrip("\n").split("\t")
-                    continue
-                c = line.rstrip("\n").split("\t")
-                if hdr is None or len(c) < len(hdr):
-                    continue
-                row = dict(zip(hdr, c))
-                prev = d.get(c[1])
-                if prev is not None and (regs(prev["PUBD"]) != regs(row["PUBD"])
-                                         or regs(prev["WR"]) != regs(row["WR"])):
-                    conf += 1
-                    if len(confex) < 8:
-                        confex.append((c[1], row.get("mnem"),
-                                       prev["PUBD"], row["PUBD"],
-                                       prev["WR"], row["WR"]))
-                d[c[1]] = row
+    def differs(a, b):
+        return (regs(a["PUBD"]) != regs(b["PUBD"])
+                or regs(a["WR"]) != regs(b["WR"]))
+
+    d, conf, ex, hdr = mechcorpus.read_mech_corpus(
+        paths, need=MECH_NEEDS, differs=differs, label="bardst")
+    confex = [(enc, new.get("mnem"), prev["PUBD"], new["PUBD"],
+               prev["WR"], new["WR"]) for enc, prev, new in ex]
     return d, conf, confex, hdr
 
 
@@ -426,20 +434,11 @@ def main():
             if not os.path.exists(resolve(p)):
                 sys.exit("bardst: %s missing -- REFUSING (no compressed "
                          "sibling either)" % p)
+        # Every column this bar indexes is required of the header by
+        # MECH_NEEDS, inside the reader, before a row is parsed -- so the
+        # refusals that used to stand here fire earlier and name the same
+        # reasons.  See read_mech_merged().
         M, cm, cex, hdr = read_mech_merged(pm)
-        if hdr is None or "PUBD" not in hdr or "WSTQ" not in hdr:
-            sys.exit("bardst: %s has no PUBD/WSTQ column -- REFUSING (the arm "
-                     "predates the columns and cannot answer)" % pm[0])
-        # WRU IS REQUIRED, NOT OPTIONAL.  An arm captured before the column
-        # existed cannot say which rows carry a container write with an
-        # unstated index, and reading its absence as "none of them" is the
-        # silent false success this file's own WSTQ refusal exists against:
-        # the number it would print is the 6.7x bar FINDING 75-C explained.
-        if "WRU" not in hdr:
-            sys.exit("bardst: %s has no WRU column -- REFUSING (the arm "
-                     "predates it, so a container write whose index QEMU "
-                     "could not state is indistinguishable from a complete "
-                     "write list; see FINDING 75-C)" % pm[0])
 
         costreg = collections.Counter(); costrule = collections.Counter()
         costmech = collections.defaultdict(collections.Counter)

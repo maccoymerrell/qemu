@@ -29,6 +29,7 @@ a scorer nobody can re-run.
 import collections, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from evopen import evopen, resolve
+import mechcorpus                        # the mechanism corpus's ONE header rule
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 WPS = ("0", "16")
@@ -42,8 +43,8 @@ def rows(path):
     with evopen(path, errors="replace") as f:
         for line in f:
             if line.startswith("#"):
-                if hdr is None:
-                    hdr = line.lstrip("#").rstrip("\n").split("\t")
+                if hdr is None and mechcorpus.is_header(line):
+                    hdr = mechcorpus.parse_header(line)
                 continue
             c = line.rstrip("\n").split("\t")
             if hdr is None or len(c) < len(hdr):
@@ -66,6 +67,11 @@ def _write_arm(root, isa, wp, rows):
     d = os.path.join(root, "%s.wp%s" % (isa, wp))
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "corpus_mech_%s.tsv" % isa), "w") as f:
+        # THE FIXTURE LOOKS LIKE THE ARTEFACT -- FINDING 99-F.  The
+        # sled stamps its mechanism corpus above the header, and a
+        # fixture that omits the stamps cannot fail for the reason
+        # the real corpus failed for.
+        f.write(mechcorpus.FIXTURE_STAMP)
         f.write(MECH_HDR)
         for r in rows:
             f.write("\t".join([

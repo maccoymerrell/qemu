@@ -48,6 +48,7 @@ sys.path.insert(0, "/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/"
                    "arc3_cov/instruments")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import srcenc_reach                      # the tree's discriminator
+import mechcorpus                        # the mechanism corpus's ONE reader
 from evopen import evopen, resolve     # the tree's compressed-member reader
 
 
@@ -70,23 +71,21 @@ def load_refused(arm, isa, wps):
     can_answer = False
     for w in wps:
         p = os.path.join(arm, "%s.wp%s" % (isa, w), "corpus_mech_%s.tsv" % isa)
-        if not os.path.exists(resolve(p)):
-            sys.exit("refused-arm: %s missing -- REFUSING" % p)
-        with evopen(p, errors="replace") as f:
-            hdr = None
-            for line in f:
-                if line.startswith("#"):
-                    if hdr is None:
-                        hdr = line.lstrip("#").rstrip().split("\t")
-                    continue
-                c = line.rstrip("\n").split("\t")
-                if hdr is None or len(c) < len(hdr):
-                    continue
-                row = dict(zip(hdr, c))
-                if "refused=" in row.get("XLAT", ""):
-                    can_answer = True
-                    if "refused=1" in row["XLAT"]:
-                        out.add(c[1])
+        # THE SHARED READER HERE TOO, and this site is why the rule had to be
+        # shared rather than fixed twice: with the header bound to the `#tip`
+        # stamp no row carries an `XLAT` key at all, `can_answer` stays false,
+        # and the refusal below fires -- naming the WRONG cause.  "This arm
+        # predates the refusal note" and "this reader could not find the
+        # header" are two different facts and only one of them was sayable.
+        rows, _c, _e, _h = mechcorpus.read_mech_corpus(
+            [p], need=(("XLAT", "the refusal bit rides the translation "
+                                "summary column"),),
+            label="refused-arm")
+        for enc, row in rows.items():
+            if "refused=" in row.get("XLAT", ""):
+                can_answer = True
+                if "refused=1" in row["XLAT"]:
+                    out.add(enc)
     if not can_answer:
         # The arm predates insn_dataflow_note_translation_refused(), so its
         # rows carry no `refused` key in EITHER direction.  That is a corpus
@@ -151,24 +150,20 @@ def read_src_merged(paths):
     return d, conf
 
 
+#: THE COLUMNS THIS BAR INDEXES, with the reason each is required.  Stated
+#: here rather than discovered by KeyError three frames down -- FINDING 99-F.
+MECH_NEEDS = (
+    ("src_state", "the mechanism classifier cannot say WHY a read was lost "
+                  "without QEMU's source-state word"),
+    ("SURV",      "the survivor column is half of mech_of()'s key"),
+    ("STATUS",    "the status column is the other half"),
+)
+
+
 def read_mech_merged(paths):
-    d, conf = {}, 0
-    hdr = None
-    for p in paths:
-        with evopen(p, errors="replace") as f:
-            for line in f:
-                if line.startswith("#"):
-                    if hdr is None:
-                        hdr = line.lstrip("#").rstrip("\n").split("\t")
-                    continue
-                c = line.rstrip("\n").split("\t")
-                if hdr is None or len(c) < len(hdr):
-                    continue
-                row = dict(zip(hdr, c))
-                prev = d.get(c[1])
-                if prev is not None and prev != row:
-                    conf += 1
-                d[c[1]] = row
+    """-> (rows, conflicts, hdr).  The shared reader owns the header rule."""
+    d, conf, _ex, hdr = mechcorpus.read_mech_corpus(
+        paths, need=MECH_NEEDS, label="bar")
     return d, conf, hdr
 
 
@@ -190,6 +185,11 @@ def _arm(root, isa, rows, srcidx):
             f.write("%s\t%s\t%s\t%s\n" % (isa, r["enc"], r["mnem"],
                                             r["src"][srcidx]))
     with open(os.path.join(d, "corpus_mech_%s.tsv" % isa), "w") as f:
+        # THE FIXTURE LOOKS LIKE THE ARTEFACT -- FINDING 99-F.  The
+        # sled stamps its mechanism corpus above the header, and a
+        # fixture that omits the stamps cannot fail for the reason
+        # the real corpus failed for.
+        f.write(mechcorpus.FIXTURE_STAMP)
         f.write(MECH_HDR)
         for r in rows:
             f.write("\t".join([

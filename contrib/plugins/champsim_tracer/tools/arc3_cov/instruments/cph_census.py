@@ -45,6 +45,7 @@ _D = os.path.dirname(os.path.abspath(__file__))
 if _D not in sys.path:
     sys.path.insert(0, _D)
 from evopen import evopen, resolve                            # noqa: E402
+import mechcorpus                        # the mechanism corpus's ONE header rule
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 WPS = ("0", "16")
@@ -99,8 +100,8 @@ def one(arm, isa, wps):
             hdr = None
             for line in f:
                 if line.startswith("#"):
-                    if hdr is None:
-                        hdr = line.lstrip("#").rstrip("\n").split("\t")
+                    if hdr is None and mechcorpus.is_header(line):
+                        hdr = mechcorpus.parse_header(line)
                         need_cols(hdr, p)
                     continue
                 c = line.rstrip("\n").split("\t")

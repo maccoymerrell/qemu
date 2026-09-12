@@ -85,6 +85,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import barledger
 import srcenc_reach
 from evopen import evopen, resolve
+import mechcorpus                        # the mechanism corpus's ONE header rule
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 
@@ -140,8 +141,8 @@ def read_mech(root, isa, wps):
         with evopen(p, errors="replace") as f:
             for line in f:
                 if line.startswith("#"):
-                    if hdr is None:
-                        hdr = line.lstrip("#").rstrip("\n").split("\t")
+                    if hdr is None and mechcorpus.is_header(line):
+                        hdr = mechcorpus.parse_header(line)
                     continue
                 if hdr is None:
                     continue

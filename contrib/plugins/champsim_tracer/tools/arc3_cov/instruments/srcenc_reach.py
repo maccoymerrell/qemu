@@ -148,6 +148,7 @@ import gzip
 import lzma
 import os
 import sys
+import mechcorpus                        # the mechanism corpus's ONE header rule
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 
@@ -283,8 +284,8 @@ def read_mech(path):
     with _open(path) as fh:
         for line in fh:
             if line.startswith("#"):
-                if hdr is None:
-                    hdr = line.lstrip("#").rstrip("\n").split("\t")
+                if hdr is None and mechcorpus.is_header(line):
+                    hdr = mechcorpus.parse_header(line)
                 continue
             f = line.rstrip("\n").split("\t")
             if hdr is None or len(f) < len(hdr):

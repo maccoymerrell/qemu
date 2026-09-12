@@ -34,6 +34,7 @@ import collections, os, sys
 sys.path.insert(0, "/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/"
                    "arc3_cov/instruments")
 from evopen import evopen, resolve
+import mechcorpus                        # the mechanism corpus's ONE header rule
 
 ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 WPS = ("0", "16")
@@ -44,8 +45,8 @@ def read(path):
     with evopen(path, errors="replace") as f:
         for line in f:
             if line.startswith("#"):
-                if hdr is None:
-                    hdr = line.lstrip("#").rstrip("\n").split("\t")
+                if hdr is None and mechcorpus.is_header(line):
+                    hdr = mechcorpus.parse_header(line)
                 continue
             c = line.rstrip("\n").split("\t")
             if hdr is None or len(c) < len(hdr):

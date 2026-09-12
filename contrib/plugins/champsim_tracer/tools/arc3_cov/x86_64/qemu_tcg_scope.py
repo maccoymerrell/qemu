@@ -169,6 +169,23 @@ class QemuFacts(object):
         return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
                               self.decode))
 
+    def group3_slots(self):
+        """The ModRM /reg slots QEMU's F6 / F7 group table fills.
+
+        `decode_group3()` indexes `opcodes_grp3[(w << 3) | reg]`, so slot 1 is
+        F6 /1 and slot 9 is F7 /1.  Both are EMPTY: QEMU implements only the
+        /0 spelling of the immediate TEST and leaves the undocumented /1 alias
+        unfilled, which decodes as an unknown op and faults.  Returned as the
+        set of filled indices so a caller can assert the HOLE rather than
+        assume it.
+        """
+        body = self.decode.split('static const X86OpEntry opcodes_grp3[16]')
+        if len(body) < 2:
+            return set()
+        body = body[1].split('};')[0]
+        return {int(x, 16) for x in re.findall(r'\[0x([0-9a-fA-F]{2})\]\s*=',
+                                               body)}
+
     def ud_rows_are_ud(self):
         """UD0, UD1 and UD2 all decode to the UD entry, which raises #UD.
 
@@ -237,6 +254,26 @@ EXT_CPUID = {
     'VIA_PADLOCK_AES':     'CPUID_C000_0001_EDX_XCRYPT',
     'VIA_PADLOCK_SHA':     'CPUID_C000_0001_EDX_PHE',
     'VIA_PADLOCK_MONTMUL': 'CPUID_C000_0001_EDX_PMM',
+    # AND THE NINE THE **FRESH** TABLE ADDS.  The seven above were derived
+    # from the BANKED attrib.seed.tsv, which is the table the x86 static leg
+    # was refusing as STALE -- so "25 uncited" was a reading of exactly the
+    # artifact the leg would not publish.  Re-run at HEAD the leg regenerates
+    # both tables and the uncited population is 297 over 5,756
+    # UNPROBED-unreachable rows, in eleven buckets.  Nine of them are one
+    # more CPUID argument, all with a bit cpu.c defines and none inside a
+    # TCG_*_FEATURES mask (exec176/UNCITED_297.txt):
+    #   XOP 147 · FMA4 96 · TBM 20 -- the AMD SSE5 descendants
+    #   GFNI 12 + AVX_GFNI 6 · VPCLMULQDQ 2 · RTM 2
+    #   XSAVES 4 · XSAVEC 2 · PTWRITE 2
+    'XOP':            'CPUID_EXT3_XOP',
+    'FMA4':           'CPUID_EXT3_FMA4',
+    'TBM':            'CPUID_EXT3_TBM',
+    'GFNI':           'CPUID_7_0_ECX_GFNI',
+    'AVX_GFNI':       'CPUID_7_0_ECX_GFNI',
+    'VPCLMULQDQ':     'CPUID_7_0_ECX_VPCLMULQDQ',
+    'RTM':            'CPUID_7_0_EBX_RTM',
+    'XSAVES':         'CPUID_XSAVE_XSAVES',
+    'XSAVEC':         'CPUID_XSAVE_XSAVEC',
     # QEMU models no CPUID bit for these at all.
     # `LWP` is the last of the 25 and is keyed on the ISA-SET, not the
     # extension: XED files LLWPCB / LWPINS under extension XOP, and excluding
@@ -260,6 +297,9 @@ EXT_CPUID = {
     # Centaur leaf, a different feature of a different vendor -- and no bit
     # for Intel ACE at all, which is what `None` states here.
     'ACE':            None,
+    # PTWRITE: cpu.c names no bit for it -- checked by selfcheck's None branch,
+    # which looks for any CPUID_* symbol ending in _PTWRITE and finds none.
+    'PTWRITE':        None,
     'KEYLOCKER':      None,
     'KEYLOCKER_WIDE': None,
     'ENQCMD':         None,
@@ -299,6 +339,12 @@ _CITE = {
     'novocab': 'X86_FEAT_%s is absent from the decode tables\' feature '
                'vocabulary in %s (%d names, none of them this one), so no '
                'entry there can require it',
+    'grp3': '%s -- `static const X86OpEntry opcodes_grp3[16]` fills 0 and '
+            '2..7 (F6) and 8 and a..f (F7); slots 1 and 9, the ModRM /1 '
+            'forms, are EMPTY, and decode_group3() indexes '
+            '[(w << 3) | reg] straight into the hole.  The undocumented '
+            'TEST alias real silicon executes as /0 is not in this '
+            'decoder at all',
     'ud': '%s -- [0x0b] = X86_OP_ENTRY0(UD) (UD2), [0xb9] and [0xff] = '
           'X86_OP_ENTRYr(UD, ...) (UD1, UD0); gen_UD() in '
           'target/i386/tcg/emit.c.inc is gen_illegal_opcode().  QEMU decodes '
@@ -363,6 +409,21 @@ def classify(hexs, ext, isa_set, root=None):
                      'seal (BRANCH_SYSCALL_TYPE) and REFUSES the opcode '
                      'rather than naming a neighbouring trap')
 
+    # F6 /1 and F7 /1 -- the UNDOCUMENTED second spelling of the immediate
+    # TEST.  Real silicon executes /1 exactly as /0; QEMU's `opcodes_grp3[16]`
+    # fills 0 and 2..7 for F6 and 8 and a..f for F7 and leaves slots 1 and 9
+    # EMPTY, so `decode_group3()` hands back a zero entry and the decode ends
+    # as an unknown op.  A QEMU divergence from hardware, the same shape as
+    # the 0F 0D register form above, and the four rows it charges are
+    # f6c801 / f60801 / 66f7c80000 / 66f7080000 -- both widths, register and
+    # memory form.
+    if op in ('f6', 'f7') and i + 1 < len(b):
+        if ((int(b[i + 1], 16) >> 3) & 7) == 1 and 1 not in f.group3_slots():
+            return Scope('GROUP-SLOT-NOT-FILLED', _CITE['grp3'] % _DECODE,
+                         'nothing on this accelerator -- the /0 spelling of '
+                         'the same instruction is implemented and reachable, '
+                         'and a guest that wants an immediate TEST emits it')
+
     if op == '62':
         return Scope('EVEX-PREFIX-NOT-DECODED', _CITE['evex'], _REMEDY_ACCEL)
     if op == 'd5':
@@ -423,6 +484,19 @@ def selfcheck(root=None):
     if not f.prefetch_is_memory_only():
         bad.append('0F 0D no longer reads `X86_OP_ENTRY1(NOP, M,v)`: the '
                    'OPERAND-FORM-REFUSED citation is stale')
+    grp3 = f.group3_slots()
+    if not grp3:
+        bad.append('opcodes_grp3[16] is no longer parseable in %s: the '
+                   'GROUP-SLOT-NOT-FILLED citation cannot be checked' % _DECODE)
+    elif 1 in grp3 or 9 in grp3:
+        bad.append('opcodes_grp3 now FILLS the /1 slots (%s): F6 /1 and F7 /1 '
+                   'are decoded, so those rows are REACHABLE and the '
+                   'GROUP-SLOT-NOT-FILLED exclusion must be withdrawn'
+                   % sorted(grp3 & {1, 9}))
+    elif not {0, 2, 3, 4, 5, 6, 7, 8}.issubset(grp3):
+        bad.append('opcodes_grp3 is missing slots this citation assumes are '
+                   'filled (%s): the hole argument rests on 1 and 9 being the '
+                   'ONLY empty ones' % sorted({0,2,3,4,5,6,7,8} - grp3))
     if f.vex_maps != {1, 2, 3}:
         bad.append('the 3-byte VEX prefix now accepts maps %s, not {1,2,3}: '
                    'the VEX-MAP-RESERVED exclusion is stale' % sorted(f.vex_maps))

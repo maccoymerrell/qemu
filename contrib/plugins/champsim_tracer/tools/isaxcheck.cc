@@ -2072,11 +2072,40 @@ static bool srcenc_join_ok(const CsView &c, const LlView &l,
  * signatures.
  *
  * So the population is STRATIFIED BY MNEMONIC: at most K encodings per
- * mnemonic per shard.  The shards stripe the encoding space, so K per shard
- * over N shards spreads K*N samples across the register fields rather than
- * taking the first K opcodes and stopping.  Deterministic: the same sweep,
- * shard count and K produce the same population, which is what lets a
- * corpus be compared against one captured yesterday.
+ * mnemonic per shard.  Deterministic: the same sweep, shard count and K
+ * produce the same population, which is what lets a corpus be compared
+ * against one captured yesterday.
+ *
+ * WHICH K, AND WHY NOT THE FIRST K (FINDING 102-A).  This comment used to
+ * say that "the shards stripe the encoding space, so K per shard over N
+ * shards spreads K*N samples across the register fields rather than taking
+ * the first K opcodes and stopping."  The first half is true and the
+ * conclusion does not follow: a shard's stripe is the whole space thinned,
+ * so the FIRST K encodings a shard decodes are still the K LOWEST-numbered
+ * ones in it, and when the field that discriminates lives in the HIGH bits
+ * the sample never leaves the bottom of that field's range.
+ *
+ * MEASURED, riscv64 at the banked population: every `csr*` mnemonic carries
+ * exactly 96 encodings and their CSR selectors are 0x000..0x02f plus the
+ * handful LLVM spells by name -- the selector is `imm[11:0]` at bits 20..31,
+ * the most significant part of the word, so enumeration order visits
+ * selector 0 for every rd/rs1 pair long before selector 1.  The read-only
+ * identification CSRs (`mvendorid` 0xf11 .. `mhartid` 0xf14, `vlenb` 0xc22)
+ * are therefore absent from the corpus, and the TWELVE allowlist rules that
+ * exist for exactly those CSRs -- `FR-wr-phantom csr{c,ci,rc,rci,rs,rsi,rw,
+ * rwi,s,si,w,wi} +REG_SYSID` -- read DEAD.  They are not dead: driven over a
+ * sled built from those selectors the same build publishes
+ * `f_dst=REG_SYSID` on 180 of 240 encodings and every one of the twelve
+ * rules is USED.  A retirement taken on that DEAD reading would have deleted
+ * twelve rules whose subject the corpus had merely never asked about.
+ *
+ * So the K are chosen by RESERVOIR over the shard's whole stream rather than
+ * by truncation at its head: every encoding of a mnemonic has the same
+ * chance of being in the sample whatever its position, and the choice is a
+ * pure function of the position, so two runs of the same sweep produce the
+ * same population.  `pop_reservoir_slot()` is the whole of it and
+ * `--selftest-pop` is where it is proven, including the arm that fails on
+ * the old first-K behaviour.
  *
  * WHAT THAT COSTS IS REPORTED, NOT ABSORBED.  Every encoding outside the
  * population is UNREACHED at scoring time and counted there; the summary
@@ -2087,7 +2116,34 @@ static bool srcenc_join_ok(const CsView &c, const LlView &l,
 static const char *pop_path = nullptr;
 static unsigned pop_per_mnem = 0;
 static FILE *pop_file = nullptr;
-static std::map<std::string, unsigned> pop_seen_by_mnem;
+static std::map<std::string, unsigned long> pop_seen_by_mnem;
+/* The sample itself, held until the shard closes: a reservoir cannot be
+ * streamed, because whether row t belongs in the sample is not known until
+ * the stream ends.  One vector of at most K strings per mnemonic. */
+static std::map<std::string, std::vector<std::string> > pop_keep_by_mnem;
+
+/*
+ * RESERVOIR PLACEMENT, as a pure function of the position so the population
+ * is reproducible (FINDING 102-A).
+ *
+ * `seen` is 1-based: the count of encodings of this mnemonic INCLUDING this
+ * one.  Returns the slot this encoding takes, or K (out of range) when it is
+ * not sampled.  The first K always land, which is Algorithm R; after that a
+ * candidate lands with probability K/seen, and the "randomness" is a fixed
+ * integer mix of `seen` alone -- no state, no seed, no dependence on how the
+ * shard was scheduled.
+ */
+static unsigned pop_reservoir_slot(unsigned long seen, unsigned K)
+{
+    if (!K) return 0;                      /* K==0 means "keep everything" */
+    if (seen <= K) return (unsigned)(seen - 1);
+    uint64_t x = seen * 0x9e3779b97f4a7c15ull;
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27; x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    uint64_t j = x % seen;                 /* uniform in [0, seen) */
+    return j < K ? (unsigned)j : K;        /* K == "not sampled" */
+}
 
 /* The plugin's generic register NAMES are the corpus's vocabulary and this
  * tool's own (isax_generic_reg_name comes from the same header).  The id
@@ -2986,9 +3042,18 @@ static void compare(const uint8_t *b, size_t n)
      * files join directly.
      */
     if (pop_file) {
-        const std::string &pm = c.ok ? c.mnem : std::string("?");
-        if (!pop_per_mnem || pop_seen_by_mnem[pm]++ < pop_per_mnem)
+        const std::string pm = c.ok ? c.mnem : std::string("?");
+        if (!pop_per_mnem) {
             fprintf(pop_file, "%s\t%s\t%s\n", cfg.name, hx.c_str(), pm.c_str());
+        } else {
+            unsigned long seen = ++pop_seen_by_mnem[pm];
+            unsigned slot = pop_reservoir_slot(seen, pop_per_mnem);
+            if (slot < pop_per_mnem) {
+                std::vector<std::string> &v = pop_keep_by_mnem[pm];
+                if (slot >= v.size()) v.resize(slot + 1);
+                v[slot] = hx;
+            }
+        }
     }
 
     /*
@@ -3897,6 +3962,25 @@ static void run_sweep(unsigned shard, unsigned nshard)
     case ISA_MIPSEL:  sweep_mips(shard, nshard); break;
     case ISA_X86_64:  sweep_x86(shard, nshard); break;
     }
+    /*
+     * FLUSH THE RESERVOIRS.  Written in mnemonic order and, within a
+     * mnemonic, in slot order, so the file a shard produces is a pure
+     * function of what it decoded -- the property the population's
+     * comparability rests on.  An empty slot cannot occur: slot s is only
+     * written after slots 0..s-1 have been, because the first K candidates
+     * fill them in order.
+     */
+    if (pop_file && pop_per_mnem) {
+        size_t kept = 0;
+        for (const auto &kv : pop_keep_by_mnem) {
+            kept += kv.second.size();
+            for (const auto &hx : kv.second)
+                fprintf(pop_file, "%s\t%s\t%s\n", cfg.name, hx.c_str(),
+                        kv.first.c_str());
+        }
+        fprintf(stderr, "# pop shard=%u K=%u mnemonics=%zu kept=%zu\n",
+                shard, pop_per_mnem, pop_keep_by_mnem.size(), kept);
+    }
     if (pop_file) { fclose(pop_file); pop_file = nullptr; }
     if (sigenc_file) { fclose(sigenc_file); sigenc_file = nullptr; }
 }
@@ -4095,6 +4179,13 @@ static void usage(void)
         "  --dump-pop=FILE write every encoding this sweep decodes to\n"
         "                  FILE.<shard>, which is the population the\n"
         "                  translate-only sled is driven over\n"
+        "  --pop-per-mnem=K  keep at most K encodings per mnemonic per\n"
+        "                  shard, chosen by RESERVOIR over the shard's whole\n"
+        "                  stream so a mnemonic's sample is not confined to\n"
+        "                  the low end of whatever field discriminates it\n"
+        "                  (FINDING 102-A).  0 keeps everything\n"
+        "  --selftest-pop  prove the reservoir: fixed size, full coverage,\n"
+        "                  determinism, and that it leaves the head\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
         "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
         "  --cs-mode-add=NAME[,NAME...]  add Capstone mode bits that the\n"
@@ -4109,6 +4200,69 @@ static void usage(void)
         "  --keep-zero     do not fold the architectural zero register out\n");
 }
 
+
+/*
+ * THE POPULATION SAMPLER'S OWN SELFTEST (FINDING 102-A).
+ *
+ * The sampler decides what the gate is ABLE to see, so its defect is silent
+ * by construction: a mnemonic whose sample never leaves the low end of its
+ * discriminating field produces a corpus that answers, confidently, about a
+ * corner.  Four arms, and the third is the one the old first-K behaviour
+ * FAILS -- a selftest that only checked the size would have passed on the
+ * code this replaces.
+ */
+static int selftest_pop(void)
+{
+    int checks = 0, fails = 0;
+    auto chk = [&](bool ok, const char *what) {
+        checks++;
+        if (!ok) { fails++; printf("  FAIL %s\n", what); }
+    };
+    const unsigned long N = 4096;
+    const unsigned K = 96;
+
+    /* Replay the sampler over a stream of N candidates. */
+    auto run = [&](unsigned long n, unsigned k) {
+        std::vector<unsigned long> slot(k, ~0ul);
+        for (unsigned long t = 1; t <= n; t++) {
+            unsigned s = pop_reservoir_slot(t, k);
+            if (s < k) slot[s] = t;
+        }
+        return slot;
+    };
+    std::vector<unsigned long> a = run(N, K), b = run(N, K);
+
+    /* 1. THE SIZE IS THE SIZE, and every slot is occupied. */
+    chk(a.size() == K, "reservoir keeps exactly K slots");
+    bool full = true;
+    for (auto v : a) if (v == ~0ul) full = false;
+    chk(full, "every slot is filled when the stream is longer than K");
+
+    /* 2. DETERMINISM.  Two runs of the same stream agree slot for slot. */
+    chk(a == b, "the same stream produces the same sample");
+
+    /* 3. THE ARM THE OLD BEHAVIOUR FAILS.  First-K keeps 1..K and nothing
+     *    else; the reservoir must reach the FAR end of the stream, which is
+     *    where a high-order discriminating field's values live. */
+    unsigned long hi = 0;
+    for (auto v : a) if (v > hi) hi = v;
+    chk(hi > N / 2, "the sample reaches past the middle of the stream");
+    unsigned long beyond = 0;
+    for (auto v : a) if (v > K) beyond++;
+    chk(beyond >= K / 2, "most of the sample is drawn from beyond the head");
+
+    /* 4. A SHORT STREAM IS KEPT WHOLE -- no thinning where none is needed. */
+    std::vector<unsigned long> c = run(K - 3, K);
+    unsigned long kept = 0;
+    for (auto v : c) if (v != ~0ul) kept++;
+    chk(kept == K - 3, "a stream shorter than K is kept entire");
+    for (unsigned long t = 1; t <= K - 3; t++)
+        chk(c[t - 1] == t, "short-stream slots are the candidates in order");
+
+    printf("%s  selftest-pop: %d checks, %d failures\n",
+           fails ? "FAIL" : "ok", checks, fails);
+    return fails ? 1 : 0;
+}
 
 /*
  * THE PER-SIGNATURE JOIN'S OWN SELFTEST, BOTH DIRECTIONS.
@@ -4224,6 +4378,7 @@ int main(int argc, char **argv)
     bool check = false, emit_raw = false, batch = false;
 
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--selftest-pop")) return selftest_pop();
         if (!strcmp(argv[i], "--selftest-sigjoin")) return selftest_sigjoin();
         if (!strcmp(argv[i], "--selftest-ident")) return selftest_ident();
     }

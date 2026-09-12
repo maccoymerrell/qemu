@@ -240,8 +240,19 @@ mipsel FM-cs-mem-llvm-none prefe
 # (target/mips/tcg/translate.c:14403).  Boundary twins: the
 # `mipsel M-cs-mem-llvm-none cache*` / `synci` rows.
 mipsel FM-cs-mem-llvm-none cache
-mipsel FM-cs-mem-llvm-none cachee
 mipsel FM-cs-mem-llvm-none synci
+#
+# `cachee` RETIRED (FINDING 102-A, exec180).  It is the EVA form, and on the
+# swept model the availability check is what the decode commits to: over ALL
+# 20,480 encodings this sweep decodes as `cachee` -- the whole population, not
+# a sample; `--pop-only=cachee --pop-per-mnem=0`, sled refused=0 so every one
+# was identified -- the fields side reads `loads=0 stores=0` uniformly, so
+# there is no `cs-mem` for LLVM's silence to disagree with and the signature
+# cannot arise.  The live signature over that same population is
+# `FB-flow-presence cachee cs-yes llvm-no` (allowlisted above): the template
+# carries BRANCH_SYSCALL_TYPE because the decode committed to the raise.
+# `cache` and `synci` are NOT retired -- they are available on the swept model,
+# their rows are USED, and the paragraph above is theirs.
 
 # mayLoad / mayStore are LLVM SCHEDULING properties, not semantics, and
 # LLVM sets both across the MIPS DSP-ASE arithmetic space to pin

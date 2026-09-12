@@ -695,6 +695,21 @@ struct QDepInsn {
      */
     uint8_t dst_trunc;
     /*
+     * DID THE WRITE-LIST ENUMERATION RUN TO THE END?
+     *
+     * The complement of @dst_trunc, and it exists because the two facts
+     * stopped being complements: a PROVENANCE refusal now records its state
+     * and keeps enumerating (exec188), so `dst_state != QDEP_OK` no longer
+     * implies the list is short.  This is the flag the destination list's
+     * seating reads -- WHICH registers the instruction writes is a complete
+     * answer here, and WHAT FEEDS them is the question that refused.
+     *
+     * Set once, at the end of note_dst_build(), after every loop.  Any
+     * return before it leaves it clear, which is the honest reading: an
+     * enumeration that stopped cannot say what it did not reach.
+     */
+    uint8_t dst_list_complete;
+    /*
      * THE FRAME AN x87 DESTINATION'S NAME IS IN, as the offset a VALUE read
      * needs -- qemu_plugin_dataflow_named_write::value_shift, indexed by the
      * ST(i) the name carries.  Zero everywhere the two frames agree, which

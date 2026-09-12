@@ -3020,6 +3020,12 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
     const unsigned nw = (g_nregs + 63) / 64;
     std::vector<uint64_t> wr(nw ? nw : 1);
     unsigned got;
+    /*
+     * THE FIRST PROVENANCE REFUSAL, HELD LOCALLY UNTIL THE END -- this
+     * function's last statement assigns QDEP_OK to @out->dst_state, so a
+     * refusal that enumerates on has to survive that assignment.
+     */
+    unsigned prov_refusal = QDEP_OK;
 
     /*
      * THE FRAME OF A NAME, TAKEN BEFORE ANYTHING CAN REFUSE.
@@ -3121,8 +3127,33 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
          */
         rc = fold_prov(w.data(), sregs, &sn, &memop_slots, &simm, &sconst);
         if (rc != QDEP_OK) {
-            out->dst_state = rc;
-            return;
+            /*
+             * THE PROVENANCE REFUSED, AND THE NAME DID NOT.  Recorded and
+             * enumerated past, not returned on: this loop's subject is
+             * WHICH registers the instruction writes, and a refusal to say
+             * what fed one of them is not an answer about the others.  It
+             * used to return, which made `dst_reg[]` a PREFIX -- and once
+             * the operand walk's write arm was deleted, a prefix is what
+             * the WIRE publishes, so 1,795 destinations left the trace on
+             * one `/bin/echo hi` (exec188, FINDING 188-A).  dst_state
+             * carries the refusal, so no mask is published for any slot;
+             * dst_list_complete says the LIST is nonetheless whole.
+             */
+            if (prov_refusal == QDEP_OK) {
+                prov_refusal = rc;
+            }
+            sn = 0;
+            memop_slots = 0;
+            simm = 0;
+            sconst = 0;
+            /*
+             * And the repr-change test below is SKIPPED for this row: it
+             * reads the folded set, which is now empty because nothing
+             * folded, and an empty set looks like "this write carries
+             * nothing" -- which would drop the register from the list for
+             * the opposite reason.
+             */
+            goto seat_row;
         }
         /*
          * AND THE ONE SHAPE THE FOLD CANNOT SEE.  `clc` materialises the
@@ -3148,6 +3179,7 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
             }
             continue;
         }
+seat_row:
         for (k = 0; k < out->n_dst; k++) {
             if (out->dst_reg[k] == gen) {
                 break;
@@ -3305,8 +3337,20 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
                 }
             }
             if (rc != QDEP_OK) {
-                out->dst_state = rc;
-                return;
+                /*
+                 * Recorded, not returned on -- see the same decision in the
+                 * global-write loop above.  The row is already seated here,
+                 * so the list keeps the register and loses only the mask,
+                 * which dst_state refuses for the whole family anyway.
+                 */
+                if (prov_refusal == QDEP_OK) {
+                    prov_refusal = rc;
+                }
+                out->n_dst_dep_regs[k] = 0;
+                out->dst_dep_imm[k] = 0;
+                out->dst_arch_const[k] = 0;
+                out->dst_dep_load_slots[k] = 0;
+                continue;
             }
         }
     }
@@ -3431,8 +3475,20 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
                 }
             }
             if (rc != QDEP_OK) {
-                out->dst_state = rc;
-                return;
+                /*
+                 * Recorded, not returned on -- see the same decision in the
+                 * global-write loop above.  The row is already seated here,
+                 * so the list keeps the register and loses only the mask,
+                 * which dst_state refuses for the whole family anyway.
+                 */
+                if (prov_refusal == QDEP_OK) {
+                    prov_refusal = rc;
+                }
+                out->n_dst_dep_regs[k] = 0;
+                out->dst_dep_imm[k] = 0;
+                out->dst_arch_const[k] = 0;
+                out->dst_dep_load_slots[k] = 0;
+                continue;
             }
         }
     }
@@ -3514,7 +3570,11 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
             }
         }
     }
-    out->dst_state = QDEP_OK;
+    /*
+     * THE LIST IS COMPLETE; THE STATE IS WHATEVER THE PROVENANCES LEFT.
+     */
+    out->dst_state = prov_refusal;
+    out->dst_list_complete = 1;
 }
 
 /*
@@ -3558,7 +3618,14 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
               const uint8_t *load_ord, unsigned n_memops)
 {
     note_dst_build(tb, idx, out, load_ord, n_memops);
-    out->dst_trunc = (out->dst_state != QDEP_OK && out->n_dst > 0) ? 1 : 0;
+    /*
+     * TRUNCATED means the enumeration STOPPED, and that is no longer the
+     * same thing as a refusal.  A provenance refusal records its state and
+     * enumerates on (exec188), so the old test -- "non-OK and non-empty" --
+     * would now print a COMPLETE list as a prefix, which is the reading
+     * FINDING 80-B was about in the other direction.
+     */
+    out->dst_trunc = (!out->dst_list_complete && out->n_dst > 0) ? 1 : 0;
 }
 
 /*

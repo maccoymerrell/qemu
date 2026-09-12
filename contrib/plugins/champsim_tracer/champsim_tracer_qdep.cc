@@ -1009,6 +1009,31 @@ GHashTable *g_src_skip_sig = nullptr;    /* "reason  name" -> count */
 std::atomic<uint64_t> g_dst_repr_refused{0};
 GHashTable *g_dst_repr_sig = nullptr;       /* "mnem  REG" -> count */
 GHashTable *g_dst_repr_refused_sig = nullptr;
+/*
+ * R10.1'S SEPARATION, SCORED AGAINST THE ANSWER IT REPLACED (exec185).
+ *
+ * dst_row_seated() decides whether a QEMU REG_PC write row belongs to the
+ * instruction or to the translation block's epilogue.  Until exec185 it
+ * asked the WIRE -- "does dst_regs[] already carry REG_PC" -- and the wire's
+ * list was the Capstone operand walk's, so the predicate died with the walk.
+ * It now asks QEMU (qemu_plugin_insn_ctrl_flags), and these three count the
+ * whole population of REG_PC write rows the predicate ever sees:
+ *
+ *   @g_pcsep_agree      the two answers are the same.  Nothing moved.
+ *   @g_pcsep_qemu_only  QEMU says TRANSFER, the wire had no REG_PC slot --
+ *                       a destination the flip ADMITS.
+ *   @g_pcsep_wire_only  the wire carried REG_PC, QEMU's ops do not say the
+ *                       instruction transferred -- a destination the flip
+ *                       REFUSES.
+ *
+ * Both disagreement directions are tallied by QEMU's own decode name and by
+ * the raw ctrl flags, because "the walk and the ops disagree" is an
+ * adjudication and an adjudication needs the row, not the count.
+ */
+std::atomic<uint64_t> g_pcsep_agree{0};
+std::atomic<uint64_t> g_pcsep_qemu_only{0};
+std::atomic<uint64_t> g_pcsep_wire_only{0};
+GHashTable *g_pcsep_sig = nullptr;   /* "WHO  decode_name  ctrl" -> count */
 /* The lowered registers this target has: generic name -> global count. */
 GHashTable *g_lowered_reg = nullptr;
 /*
@@ -2321,12 +2346,63 @@ static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
     if (q->dst_reg[k] != REG_PC) {
         return true;
     }
+
+    /*
+     * THE CANDIDATE QEMU-SIDE SEPARATION, MEASURED AND NOT TAKEN (exec185).
+     *
+     * exec184 named the prerequisite that clears this predicate: the
+     * separation has to BECOME a QEMU-side statement, because the wire's
+     * dst_regs[] is the Capstone operand walk's and dies with it.  QEMU has
+     * a statement about control transfer already -- qemu_plugin_insn_ctrl_
+     * flags(), read off the ops the translator emitted to perform the
+     * transfer -- so the obvious candidate is "seat REG_PC iff QEMU says
+     * this instruction transferred".
+     *
+     * IT DOES NOT ANSWER, AND THE REASON IS STRUCTURAL, NOT A GAP.  The
+     * classification names a SUCCESSOR: goto_tb is a compile-time successor,
+     * goto_ptr a computed one.  Every wrong-path translation carries
+     * CF_NO_GOTO_TB | CF_NO_GOTO_PTR (accel/tcg/cputlb.c, the spec-mode code
+     * cache), so the translator lowers those branches to a bare exit_tb and
+     * the walk reports NOCHAIN with TRANSFER absent -- which the header says
+     * in as many words a consumer must not read as a negative answer.  On
+     * `qemu-x86_64 /bin/echo hi` at wpdepth=16 that is 9,220 of 10,908
+     * REG_PC write rows, every one a real `Jcc` / `JMP` / `RET` / `CALL`
+     * (ctrl=0x80000080, VALID|NOCHAIN).  Taking this answer would delete a
+     * branch's architectural pc write on every wrong-path-translated
+     * instruction, which is the mirror loss the header below already names.
+     *
+     * So the predicate is UNCHANGED and the two answers are counted side by
+     * side instead.  The census is the measurement that says so, it is not a
+     * retained comparison arm for a path whose source has become QEMU (J7):
+     * the wire's answer here is still the walk's, and this is what says by
+     * how much a candidate replacement misses.
+     */
+    bool by_qemu = qemu_ctrl_states_transfer(q->ctrl_flags);
+    bool by_wire = false;
+
     for (uint8_t d = 0; d < f->n_dst_regs; d++) {
         if (f->dst_regs[d] == REG_PC) {
-            return true;
+            by_wire = true;
+            break;
         }
     }
-    return false;
+    if (by_qemu == by_wire) {
+        g_pcsep_agree.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        char sig[224];
+
+        if (by_qemu) {
+            g_pcsep_qemu_only.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_pcsep_wire_only.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_snprintf(sig, sizeof(sig), "%-7s %-16s ctrl=0x%08x",
+                   by_qemu ? "QEMU" : "WIRE",
+                   q->decode_name ? q->decode_name : "-",
+                   (unsigned)q->ctrl_flags);
+        tally(&g_pcsep_sig, sig);
+    }
+    return by_wire;
 }
 
 uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
@@ -5664,6 +5740,14 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             out->decode_id = qemu_plugin_insn_decode_id(ins);
             out->decode_name = qemu_plugin_insn_decode_name(ins);
             out->insn_vaddr = qemu_plugin_insn_vaddr(ins);
+            /*
+             * Taken here, with the identity and BEFORE any refusal, for the
+             * same reason: dst_row_seated() asks this question about every
+             * instruction that reaches it, including ones whose dataflow
+             * extraction refused, and a fact only read on the clean path is
+             * absent exactly where a gate needs it.  See QDepInsn::ctrl_flags.
+             */
+            out->ctrl_flags = qemu_plugin_insn_ctrl_flags(ins);
         }
     }
 
@@ -7347,6 +7431,21 @@ void qdep_report(GString *report)
                "registers whose writes were struck as a change of representation\n(#265: the lazy-flag interpretation's subject, by generic register):");
     dump_tally(report, g_dst_repr_refused_sig,
                "registers the wire carries whose every QEMU write was struck\n(the must-be-0 above, by generic register; the mnemonic is in the\nrefusal census under QDEP_R_DST_UNNAMED):");
+    g_string_append_printf(report,
+        "\nR10.1's REG_PC separation, QEMU's answer scored against the wire's\n"
+        "(exec185; see dst_row_seated()).  AGREE is the whole population minus\n"
+        "the two disagreement directions, so the three sum to every REG_PC\n"
+        "write row QEMU stated:\n"
+        "  %10" G_GUINT64_FORMAT "  AGREE      -- both answers the same\n"
+        "  %10" G_GUINT64_FORMAT "  QEMU-only  -- ops say TRANSFER, wire had no"
+        " REG_PC slot (ADMITTED)\n"
+        "  %10" G_GUINT64_FORMAT "  WIRE-only  -- wire carried REG_PC, ops do"
+        " not state a transfer (REFUSED)\n",
+        g_pcsep_agree.load(std::memory_order_relaxed),
+        g_pcsep_qemu_only.load(std::memory_order_relaxed),
+        g_pcsep_wire_only.load(std::memory_order_relaxed));
+    dump_tally(report, g_pcsep_sig,
+               "R10.1 separation disagreements, by which side said TRANSFER,\nQEMU's decode name and the raw QEMU_PLUGIN_CTRL_* flags:");
     dump_tally(report, g_dst_unmapped_name,
                "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
     dump_tally(report, g_field_unnamed,

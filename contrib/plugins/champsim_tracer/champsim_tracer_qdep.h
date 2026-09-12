@@ -973,7 +973,74 @@ struct QDepInsn {
      * time.  See qemu_plugin_dataflow_status::translation_refused.
      */
     uint8_t x_refused;
+    /*
+     * QEMU'S OWN WORD ON WHETHER THIS INSTRUCTION PERFORMED A CONTROL
+     * TRANSFER -- qemu_plugin_insn_ctrl_flags(), read at translation time,
+     * stored raw.
+     *
+     * It is here for ONE consumer, dst_row_seated(), and it is the CANDIDATE
+     * QEMU-side statement for the separation R10.1 takes from the WIRE.
+     * MEASURED AND NOT TAKEN: nothing on the wire reads it.  The refutation
+     * is at dst_row_seated() with its numbers.
+     *
+     * The problem it answers: QEMU charges a translation block's final pc
+     * write to whichever instruction the block ended on, so its write list
+     * carries REG_PC on instructions the ISA does not define as writing it
+     * -- a delay-slot `lw`, a page-final `mov`.  Until exec185 the only
+     * discriminator was "does the wire's own dst_regs[] already carry
+     * REG_PC", and the wire's list is the Capstone operand walk's, so the
+     * separation died with the walk (exec184 measured it: with the write
+     * arms removed every instruction publishes no destination at all).
+     *
+     * The ops already answer it, and they answer it BETTER than the walk
+     * did, because the classification is stated by the translator rather
+     * than read off op position: on a delay-slot target the ops performing
+     * a branch's transfer are emitted during the SLOT's translate_insn(),
+     * and QEMU_PLUGIN_CTRL_FOREIGN marks the slot as not-the-branch while
+     * the branch keeps the ops emitted on its behalf.  That is exactly the
+     * 215-slot population R10.1 adjudicated an ARTIFACT (#236), and 207 of
+     * those 215 were delay slots.
+     *
+     * Stored RAW rather than reduced to a bool because the reduction is the
+     * consumer's and the failure directions are not symmetric: VALID says
+     * the walk ran at all, INCOMPLETE says it met an op it could not account
+     * for, and PENDING says the block ended between a branch and its slot so
+     * an ABSENT bit is not a negative answer.  See the QEMU_PLUGIN_CTRL_*
+     * block in qemu-plugin.h, and qemu_ctrl_states_transfer() below for the
+     * one reduction this file makes.
+     */
+    uint32_t ctrl_flags;
 };
+
+/*
+ * Did QEMU state that this instruction performs a control transfer?
+ *
+ * TRUE means the ops say so and the classification is complete enough to be
+ * read as a positive answer.  FALSE is deliberately the answer for BOTH "the
+ * ops say it does not" and "QEMU could not tell us", because the consumer is
+ * a destination gate: on an unreadable classification the honest outcome is
+ * to treat QEMU's REG_PC write row as the block epilogue's lowering and not
+ * seat it, which loses nothing the wire had -- the row QEMU charges to a
+ * non-branch was never on the wire to begin with.
+ *
+ * PENDING is read as TRUE when TRANSFER is set with it.  The bit means the
+ * block ended before the transfer's remaining edge was emitted, so bits that
+ * ARE set were read off real ops (a MIPS R6 compact branch reads
+ * TRANSFER | DIRECT with CONDITIONAL missing); the instruction did perform a
+ * transfer and its pc write is its own.  FOREIGN is read as FALSE: the ops
+ * are an earlier block's branch's, and the header states in as many words
+ * that "this instruction is not a branch".
+ */
+static inline bool qemu_ctrl_states_transfer(uint32_t f)
+{
+    if (!(f & QEMU_PLUGIN_CTRL_VALID)) {
+        return false;
+    }
+    if (f & (QEMU_PLUGIN_CTRL_INCOMPLETE | QEMU_PLUGIN_CTRL_FOREIGN)) {
+        return false;
+    }
+    return (f & QEMU_PLUGIN_CTRL_TRANSFER) != 0;
+}
 
 /*
  * Extract one instruction's address and store-data provenance at TRANSLATION

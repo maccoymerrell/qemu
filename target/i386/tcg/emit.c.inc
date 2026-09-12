@@ -2342,6 +2342,55 @@ static void gen_note_dividend_read(MemOp ot)
     }
 }
 
+/*
+ * CP-M, THE DISCARDED-WRITE HALF: THE FLAGS A DIVISION DESTROYS.
+ *
+ * Intel SDM vol.2 "DIV" and "IDIV" leave CF, OF, SF, ZF, AF and PF
+ * UNDEFINED, which is the architecture saying the divider ran and destroyed
+ * them.  QEMU correctly emits no write -- nothing may read the result back
+ * -- and helper_div* and helper_idiv* touch no flag field at all
+ * (target/i386/tcg/int_helper.c writes only env->regs[]), so "state it at
+ * the helper's env write" names nothing: there is no such write.  The
+ * destruction is still a WAW hazard against the next flags reader and a
+ * consumer keeping a scoreboard has to see it (R2), which is the note MIPS
+ * `mul` already carries for HI/LO at target/mips/tcg/translate.c:3651.
+ *
+ * THE PROVENANCE IS STATED ONCE PER SOURCE, AND THAT IS WHY IT IS NOT
+ * SHORT.  The note names the temp or global whose end-of-instruction
+ * provenance is where the destroyed value came from, and a division's
+ * destroyed flags come from the divisor AND the dividend -- naming s->T0
+ * alone would publish a mask short by EDX:EAX.  So the write is stated
+ * three times against the three, exactly as
+ * insn_dataflow_note_indexed_write() prescribes for the same shortfall:
+ * df_add_discard() merges the rows on the register NAME and UNIONS their
+ * provenances (accel/tcg/insn-dataflow.c), and a GLOBAL the instruction only
+ * READ resolves to the register itself.  No no-temp variant is invented for
+ * this: a note with no carrier could only publish an EMPTY provenance, and
+ * an empty-and-complete provenance is read downstream as "the datum came
+ * from the instruction's own encoding" -- an immediate, which would be a
+ * fabrication rather than a missing fact.
+ *
+ * BOTH HALVES ON THE SAME RULE gen_note_dividend_read() uses: at byte width
+ * the dividend is AX alone, so EDX is not a source of the destroyed value
+ * and is not named.
+ *
+ * TAKEN AFTER THE CALL IS EMITTED, because the note is anchored on the op
+ * its emitter had last produced and a note taken first would be resolved
+ * inside the PREVIOUS instruction's op range.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void gen_note_div_flags_destroyed(DisasContext *s, MemOp ot)
+{
+    insn_dataflow_note_discarded_write(tcgv_tl_temp(s->T0), "eflags");
+    insn_dataflow_note_discarded_write(tcgv_tl_temp(cpu_regs[R_EAX]),
+                                       "eflags");
+    if (ot != MO_8) {
+        insn_dataflow_note_discarded_write(tcgv_tl_temp(cpu_regs[R_EDX]),
+                                           "eflags");
+    }
+}
+
 static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
@@ -2364,6 +2413,7 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
         break;
 #endif
     }
+    gen_note_div_flags_destroyed(s, ot);
 }
 
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
@@ -2467,6 +2517,7 @@ static void gen_IDIV(DisasContext *s, X86DecodedInsn *decode)
         break;
 #endif
     }
+    gen_note_div_flags_destroyed(s, ot);
 }
 
 static void gen_IMUL3(DisasContext *s, X86DecodedInsn *decode)

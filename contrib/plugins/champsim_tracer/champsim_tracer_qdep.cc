@@ -728,6 +728,24 @@ static std::atomic<uint64_t> g_dst_adj_fired[G_N_ELEMENTS(g_dst_adj_ledger)];
 static std::atomic<uint64_t> g_dst_flip_not_scorable;
 std::atomic<uint64_t> g_dst_walkonly{0};
 GHashTable *g_dst_walkonly_sig = nullptr;
+/*
+ * THE SAME POPULATION, KEYED THE WAY A DESTINATION-LIST FLIP HAS TO LOOK IT
+ * UP -- the destination twin of @g_src_survivor_ident.
+ *
+ * g_dst_walkonly_sig above is keyed on the decode id and the MNEMONIC, which
+ * is what a READER needs.  After the flip the mnemonic is gone: the operand
+ * walk that produced it is the thing being deleted, so a destination
+ * survivor table has to be keyed on QEMU's own decode identity and carry the
+ * mnemonic only as an annotation.  This block is that key, plus the ROLE
+ * column (dst_survivor_role()) which says how the register is reached from
+ * the id, and it is what tools/gen_dst_survivors.py reads.
+ *
+ * IT CARRIES THE ADJUDICATED ROWS TOO, and deliberately: a ruling that the
+ * wire is right is exactly the statement that a flip MUST keep publishing
+ * the register, so the table a flip is built from has to see it.  The
+ * ledger blocks say WHY each such row is kept; this one says HOW to seat it.
+ */
+GHashTable *g_dst_survivor_ident = nullptr;
 std::atomic<uint64_t> g_dst_adj_owed_n{0};
 GHashTable *g_dst_adj_owed_sig = nullptr;
 std::atomic<uint64_t> g_dst_adj_r16_n{0};
@@ -2230,6 +2248,84 @@ static char *survivor_role(const InsnFields *f, uint8_t i, InsnEnc enc)
     return self ? g_strdup_printf("SELF@%u", self_pos)
          : encrole ? encrole
          : g_strdup("FIXED");
+}
+
+/*
+ * THE DESTINATION TWIN OF survivor_role(), AND IT HAS TWO ANSWERS, NOT
+ * THREE.
+ *
+ * A destination survivor is reachable from the decode identity the same two
+ * ways a source one is -- the register is a property of the RULE, or it is
+ * the one an encoding FIELD names -- and the measurement is the same: the
+ * register's number inside its own bank is compared against every field
+ * champsim_tracer_enc_fields.h defines for this ISA at this instruction
+ * width, ambiguity is PRINTED as ENC?<a>,<b> rather than resolved, and a
+ * rule whose other instances are unambiguous still resolves from those.
+ *
+ * WHAT IS ABSENT IS SELF, and its absence is structural rather than an
+ * omission.  The source role's SELF means "this register is also this
+ * instance's destination number p", which is a seat because the destination
+ * list exists when the source list is built.  The mirror -- "also this
+ * instance's SOURCE number p" -- is not: after the flip the source list is
+ * itself built from QEMU's read list plus the source survivors, so a
+ * destination row reading a source slot would seat one derived list out of
+ * another and the order in which the two are built would decide the
+ * answer.  A destination that varies per instance is therefore ENC or it is
+ * nothing, and a row nothing can key is REFUSED by the generator rather
+ * than guessed.
+ *
+ * AND THE FIRST THING THIS CENSUS MEASURED IS A GAP IN THE FIELD TABLE,
+ * NOT A ROW.  `qemu-x86_64 /bin/echo hi` at wpdepth=16 reports three rows,
+ * all of them x86 `rdsspq` REG_GPR0 under decode id 0xdb9bac2b, and the
+ * role reads FIXED.  IT IS NOT FIXED.  The ledger's own ruling for that
+ * row says what the instruction does -- "RDSSPQ's whole effect is to put
+ * the shadow-stack pointer INTO the GPR its ModRM names" -- so the
+ * register is an ENCODED OPERAND and the corpus simply ran `rdsspq %rax`
+ * every time.  The role reads FIXED because
+ * champsim_tracer_enc_fields.h defines THREE fields and all three are
+ * mipsel MSA (ws / wt / wd): there is no x86 ModRM-rm field for the
+ * measurement to hit, so the comparison can only fall through.
+ *
+ * A FIXED row emitted from that reading is the exact shape
+ * gen_src_survivors.py's REFUSAL 6 exists to refuse -- a register frozen
+ * at whatever the deriving corpus ran, fabricating on every `rdsspq %rbx`
+ * -- so the coverage path is an x86 ModRM-rm row in
+ * champsim_tracer_enc_fields.h (tools/gen_enc_formats.py's shape: one more
+ * (isa, width, lsb, width, bank) row), NOT a hand-written FIXED entry in
+ * the destination table.  Until that row exists this census REPORTS the
+ * gap rather than hiding it, which is what it is for.
+ *
+ * The caller owns the returned string.
+ */
+static char *dst_survivor_role(const InsnFields *f, uint8_t d, InsnEnc enc)
+{
+    const char *hit = nullptr;
+    unsigned nhit = 0;
+    GString *amb;
+    char *role;
+
+    if (!enc.bytes || !enc.len) {
+        return g_strdup("FIXED");
+    }
+    amb = g_string_new(nullptr);
+    for (unsigned e = 0; e < G_N_ELEMENTS(g_src_enc_fields); e++) {
+        const SrcEncFieldDef *def = &g_src_enc_fields[e];
+
+        if (src_enc_field_reg(def, (unsigned)trace_isa, enc.bytes, enc.len)
+            != f->dst_regs[d]) {
+            continue;
+        }
+        if (nhit++) {
+            g_string_append_c(amb, ',');
+        }
+        g_string_append(amb, def->name);
+        hit = def->name;
+    }
+    role = nhit == 1 ? g_strdup_printf("ENC@%s", hit)
+         : nhit > 1  ? g_strdup_printf("ENC?%s", amb->str)
+         :             g_strdup("FIXED");
+    g_string_free(amb, TRUE);
+    return role;
 }
 
 /*
@@ -4933,6 +5029,26 @@ bool apply_dst(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                     q->decode_name ? q->decode_name : "?",
                     generic_reg_name_or_unknown(f->dst_regs[d]),
                     mnem ? mnem : "?");
+                /*
+                 * THE SAME ROW, KEYED FOR THE FLIP, and taken BEFORE the
+                 * adjudication branch below so that a RULED row is in it too:
+                 * a ruling that the wire is right is the statement that the
+                 * flip must keep publishing the register, so the table the
+                 * flip is built from has to carry it.  See
+                 * @g_dst_survivor_ident.
+                 */
+                {
+                    char *role = dst_survivor_role(f, d, enc);
+                    char *ikey = g_strdup_printf(
+                        "%08x %-26s %-14s %-7s %s", q->decode_id,
+                        q->decode_name ? q->decode_name : "?",
+                        generic_reg_name_or_unknown(f->dst_regs[d]),
+                        role, mnem ? mnem : "?");
+
+                    tally(&g_dst_survivor_ident, ikey);
+                    g_free(ikey);
+                    g_free(role);
+                }
 
                 if (adj) {
                     bool ruled = adj->state == SRC_ADJ_R16;
@@ -7592,6 +7708,8 @@ void qdep_report(GString *report)
         "              its own list is short by a member it cannot name, so\n"
         "              it cannot refute a destination naming one member.\n",
         g_dst_flip_not_scorable.load(std::memory_order_relaxed));
+    dump_tally(report, g_dst_survivor_ident,
+               "DESTINATION SURVIVORS KEYED ON QEMU'S DECODE IDENTITY -- the\nsame rows as the two blocks above (the unadjudicated loss direction AND\nthe adjudicated one), re-keyed from the disassembler's mnemonic onto\nqemu_plugin_insn_decode_id().  Columns: decode id, decode rule name,\ngeneric register, the ROLE, and the mnemonic as an ANNOTATION.  A\ndestination-list flip looks a survivor up by the id, because after the flip\nthe mnemonic is gone.  ROLE says how the register is reached from the id:\nFIXED means the same register on every instruction the rule decodes, ENC@f\nmeans the register the instruction word names in field f.  There is no SELF\nrole on this side -- see dst_survivor_role().  This is the column\ntools/gen_dst_survivors.py reads:");
     dump_tally(report, g_dst_adj_owed_sig,
                "DESTINATION ADJUDICATION-OWED -- published destinations QEMU\ndoes not state that are NOT counted above, because a question is on\nfile against them.  Columns: decode id, rule, register, mnemonic, and\nthe QUESTION.  A LEDGER, not an input: nothing on the wire is decided\nby a row here, and a row leaves this block by being RULED, never by\nbeing deleted:");
     dump_tally(report, g_dst_adj_r16_sig,

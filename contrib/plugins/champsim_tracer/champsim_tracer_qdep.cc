@@ -6460,6 +6460,50 @@ static void apply_lane_carry(InsnFields *f)
     }
 }
 
+/*
+ * DOES THIS INSTRUCTION WRITE THE ARCHITECTURAL INTEGER FLAGS?
+ *
+ * THE THIRD PIECE OF PER-INSTRUCTION STATE THE OPERAND WALK OWNS, and the
+ * one that gates a whole wire family: @writes_int_flags is what lets the
+ * encoder emit CST_FID_METAFLAGS (the Z/N/C/V/P decomposition of the
+ * REG_FLAGS destination snapshot -- champsim_tracer_output.cc).  Both of
+ * its setters live inside the walk's WRITE arm: add_dst_cap_reg()'s
+ * `rc->is_int_flags` row and the SYSREG arm's `msr nzcv, xN` case.  Delete
+ * that arm with nothing else changed and the flag is never set, so the
+ * METAFLAGS family silently empties -- the same shape as the source lane
+ * masks, whose loss went unmeasured for exactly this reason.
+ *
+ * IT IS DERIVABLE FROM THE SEATED LIST, because that is all the predicate
+ * ever meant: the instruction writes the ISA's integer-flags register.
+ * After the flip that list is QEMU's, so the question is asked of the
+ * final destination list instead of of a Capstone row.
+ *
+ * THE ISA GATE IS NOT OPTIONAL.  REG_FLAGS is the generic word for the
+ * flags register on every ISA that has one, and on MIPS the same id names
+ * DSP status bits that no mapper turns into Z/N/C/V -- which is precisely
+ * what `rc->is_int_flags` was excluding, set only on x86 EFLAGS and
+ * AArch64 NZCV.  The surviving spelling of that exclusion is the per-ISA
+ * metaflags mapper, which is the gate the emit site already applies.
+ *
+ * IT ONLY EVER SETS.  A derivation that could CLEAR the flag would be a
+ * second opinion on a fact the walk still states while it is here; ORing
+ * makes this pass wire-neutral today by construction and load-bearing the
+ * moment the walk goes.
+ */
+static void derive_writes_int_flags(InsnFields *f)
+{
+    if (f->writes_int_flags ||
+        !isa_properties[(unsigned)trace_isa].flags_to_metaflags) {
+        return;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        if (f->dst_regs[d] == REG_FLAGS) {
+            f->writes_int_flags = true;
+            return;
+        }
+    }
+}
+
 static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,
                              const QDepInsn *q, const char *mnem,
                              InsnEnc enc);
@@ -6474,6 +6518,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * writes back what the slots already held.
      */
     apply_lane_carry(f);
+    derive_writes_int_flags(f);
 }
 
 static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,

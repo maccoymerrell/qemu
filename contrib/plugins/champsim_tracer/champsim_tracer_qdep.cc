@@ -6411,8 +6411,74 @@ void qdep_mutate_refiner_dst(InsnFields *f)
     }
 }
 
+/*
+ * THE LANE SETS, PUT ON THE SLOTS THE SEATING ACTUALLY PRODUCED.
+ *
+ * WHY IT IS HERE AND NOT AT THE DECODE SITE.  A lane set belongs to a
+ * REGISTER; the slot it lands in is decided later, by
+ * reindex_src_for_qemu() for sources and seat_dst_for_qemu() for
+ * destinations.  Those two build their lists from QEMU's ordered read and
+ * write lists and carry a mask forward only for a slot the operand walk
+ * ALSO held -- so a slot QEMU named and the walk did not gets 0, and with
+ * the walk's read arm deleted (f9ce637d94) that is every source slot.  The
+ * source lane-mask family read 0 across a whole trace: 0 annotations in
+ * 1,189,477 decoded lines against 9,682 destination ones, with
+ * `punpcklqdq %xmm2,%xmm1` publishing `vshuf %v1, %v2 -> %v1{0..1}` while
+ * its own LANE_SHAPE_UNIFORM assignment says both sources carry {0..1}.
+ * Restoring the read arm as a probe put 14,537 back and the destination
+ * count did not move, which is what names the cause.
+ *
+ * SO IT RUNS LAST, over both final lists, and it is a WRITE and not an OR:
+ * whatever a slot inherited from a permutation is replaced by the answer
+ * for the register that slot now holds.  A register with no carry entry
+ * gets 0 -- scalar operands never enter the carry -- which is its answer.
+ *
+ * This also removes the hazard from under the destination list's own flip:
+ * a destination seated from QEMU's write rows with no operand-walk origin
+ * takes lane 0 at the seat, and that is correct only for a scalar.  It is
+ * corrected here from the register, so the coming write-arm deletion
+ * cannot repeat the source side's loss.
+ */
+static void apply_lane_carry(InsnFields *f)
+{
+    if (!f->has_vec_lanes || !f->n_lane_carry || !f->lane_carry_reg) {
+        return;
+    }
+    auto look = [&](uint8_t reg, const uint64_t *from) -> uint64_t {
+        for (uint8_t i = 0; i < f->n_lane_carry; i++) {
+            if (f->lane_carry_reg[i] == reg) {
+                return from[i];
+            }
+        }
+        return 0;
+    };
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        f->src_lane_mask[i] = look(f->src_regs[i], f->lane_carry_src);
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        f->dst_lane_mask[d] = look(f->dst_regs[d], f->lane_carry_dst);
+    }
+}
+
+static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,
+                             const QDepInsn *q, const char *mnem,
+                             InsnEnc enc);
+
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 const char *mnem, InsnEnc enc)
+{
+    qdep_apply_lists(f, rn, q, mnem, enc);
+    /*
+     * Unconditional, including the no-ABI path below: there the lists are
+     * still the walk's and the carry names the same registers, so the pass
+     * writes back what the slots already held.
+     */
+    apply_lane_carry(f);
+}
+
+static void qdep_apply_lists(InsnFields *f, InsnRegNames *rn,
+                             const QDepInsn *q, const char *mnem,
+                             InsnEnc enc)
 {
     if (!g_live || !q) {
         /*

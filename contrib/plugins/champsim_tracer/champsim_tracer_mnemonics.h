@@ -414,6 +414,38 @@ typedef struct InsnFields {
      * the gate read from lane_mask_source_reg. */
     uint64_t              *src_lane_mask;  /* [n_src_regs] */
     uint64_t              *dst_lane_mask;  /* [n_dst_regs] */
+    /*
+     * THE SAME STATEMENT, KEYED ON THE REGISTER INSTEAD OF THE SLOT.
+     *
+     * A LANE SET BELONGS TO A REGISTER, NOT TO A POSITION, and writing it
+     * into a slot at decode time assumed the slot lists were final there.
+     * They are not: the source list is seated from QEMU's ordered read list
+     * in reindex_src_for_qemu() and the destination list in
+     * seat_dst_for_qemu(), both of which run AFTER the operand walk, and a
+     * slot neither of them carried from an old position gets lane 0.  With
+     * the walk's read arm deleted (f9ce637d94) that is EVERY source slot:
+     * the whole source lane-mask family read 0 on the wire, 0 annotations
+     * in 1,189,477 decoded lines of `qemu-x86_64 /bin/echo hi` against
+     * 9,682 destination ones, and `punpcklqdq %xmm2,%xmm1` published
+     * `vshuf %v1, %v2 -> %v1{0..1}` where the shape it was assigned --
+     * LANE_SHAPE_UNIFORM, src_lane = dst_lane = full_mask -- says both
+     * sources carry {0..1} too.
+     *
+     * So the assignment is recorded against the generic register it names,
+     * survives any reordering of either list by construction, and is
+     * applied to whatever slots exist once both seatings are done.  A
+     * register absent from a list contributes nothing; a scalar operand
+     * (lane_bytes == 0) never enters the carry, so its slot stays 0, which
+     * is its answer and not a default.
+     *
+     * SCRATCH-LIFETIME, NOT TEMPLATE-LIFETIME: nothing copies these spans
+     * into a cached template, because by the time one is built the masks
+     * they produced are already in src_lane_mask[] / dst_lane_mask[].
+     */
+    uint8_t               n_lane_carry;
+    uint8_t               *lane_carry_reg;  /* [n_lane_carry] generic id */
+    uint64_t              *lane_carry_src;  /* [n_lane_carry] */
+    uint64_t              *lane_carry_dst;  /* [n_lane_carry] */
     /* Capstone-side (feature, name) of the register the dynamic gate
      * reads at exec — vl CSR on RISC-V V, k1 on x86 EVEX masked,
      * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
@@ -469,6 +501,12 @@ typedef struct InsnFieldsScratch {
     uint64_t store_addr_dep_mask[MAX_STORES];
     uint64_t src_lane_mask[MAX_SRC_REGS];
     uint64_t dst_lane_mask[MAX_DST_REGS];
+    /* One entry per DISTINCT vector register the encoding names; a
+     * register cannot be named more often than it can occupy a source
+     * slot, so the source bound is the bound. */
+    uint8_t  lane_carry_reg[MAX_SRC_REGS];
+    uint64_t lane_carry_src[MAX_SRC_REGS];
+    uint64_t lane_carry_dst[MAX_SRC_REGS];
 } InsnFieldsScratch;
 
 static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
@@ -482,6 +520,9 @@ static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
     s->f.store_addr_dep_mask = s->store_addr_dep_mask;
     s->f.src_lane_mask       = s->src_lane_mask;
     s->f.dst_lane_mask       = s->dst_lane_mask;
+    s->f.lane_carry_reg      = s->lane_carry_reg;
+    s->f.lane_carry_src      = s->lane_carry_src;
+    s->f.lane_carry_dst      = s->lane_carry_dst;
 }
 
 

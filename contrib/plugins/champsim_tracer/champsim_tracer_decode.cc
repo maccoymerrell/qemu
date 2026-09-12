@@ -692,11 +692,44 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
 /* OR @lane into every src_regs[] slot @cap_id maps to.  Per-operand
  * lane-mask assignment: scalar operands keep slot mask 0, only the
  * vec-register operands the caller iterates get lanes. */
+/*
+ * RECORD ONE REGISTER'S LANE SETS, keyed on the register (see InsnFields::
+ * lane_carry_reg).  ORed, because one encoding can name the same register
+ * in two operands -- `punpcklqdq %xmm1,%xmm1` -- and each contributes.
+ *
+ * The slot writes below stay, and they are not redundant with this: the
+ * refiners that run between the walk and the seating identify vec-value
+ * operands by src/dst_lane_mask[i] != 0, and they read the slots.  The
+ * carry is what survives to the wire.
+ */
+static void lane_carry_or(InsnFields *f, uint8_t gen,
+                          uint64_t src_lane, uint64_t dst_lane)
+{
+    if (gen == REG_NONE || !f->lane_carry_reg) {
+        return;
+    }
+    for (uint8_t i = 0; i < f->n_lane_carry; i++) {
+        if (f->lane_carry_reg[i] == gen) {
+            f->lane_carry_src[i] |= src_lane;
+            f->lane_carry_dst[i] |= dst_lane;
+            return;
+        }
+    }
+    if (f->n_lane_carry >= MAX_SRC_REGS) {
+        return;
+    }
+    uint8_t k = f->n_lane_carry++;
+    f->lane_carry_reg[k] = gen;
+    f->lane_carry_src[k] = src_lane;
+    f->lane_carry_dst[k] = dst_lane;
+}
+
 static void assign_src_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
 {
     const RegClassification *rc = lookup_reg_class(cap_id);
     if (!rc) return;
     auto apply = [&](uint8_t gen) {
+        lane_carry_or(f, gen, lane, 0);
         for (uint8_t i = 0; i < f->n_src_regs; i++) {
             if (f->src_regs[i] == gen) f->src_lane_mask[i] |= lane;
         }
@@ -714,6 +747,7 @@ static void assign_dst_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
     const RegClassification *rc = lookup_reg_class(cap_id);
     if (!rc) return;
     auto apply = [&](uint8_t gen) {
+        lane_carry_or(f, gen, 0, lane);
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {
             if (f->dst_regs[d] == gen) f->dst_lane_mask[d] |= lane;
         }

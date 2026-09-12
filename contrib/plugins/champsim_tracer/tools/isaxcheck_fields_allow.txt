@@ -74,6 +74,131 @@ mipsel FB-flow-presence sdbbp cs-yes llvm-no
 mipsel FB-flow-presence syscall cs-yes llvm-no
 mipsel FB-ret-mismatch jr cs-ret
 
+# THE DECLINED ENCODINGS.  Seventy-nine more mnemonics whose fields-layer
+# answer is BRANCH_SYSCALL_TYPE while both reference decoders report no
+# flow — and the reason is the same one the block above gives, one step
+# further out: on THIS model the encoding does not execute at all.  QEMU's
+# MIPS translator dispatches on the major opcode, states the group's
+# identity, and then an availability check inside the group arm
+# (check_cp0_enabled / check_cp1_enabled / check_dsp* / check_insn) RAISES
+# because the ASE or the privilege is not there.  What runs is the raise,
+# and translate.c's mips_ident_fault() latches the identity the decode had
+# committed to (d8466387e9) so the wire says so rather than naming an
+# instruction the machine never performed.
+#
+# A STATIC DECODER CANNOT SEE THIS AND IS NOT WRONG TO MISS IT.  LLVM and
+# Capstone answer for the ENCODING; the fields layer answers for what QEMU
+# LOWERED for that encoding on the configured CPU.  Where the two differ
+# the tracer is right about the machine, which is the fact a trace records.
+#
+# VERIFIED BY WHOLE-POPULATION MEASUREMENT, not by argument and not by
+# sample (exec176/MIPS_TAXONOMY_BASE.txt, verify77's sled at #tip
+# 4eb81d806e / #so c43d8ae33ef92f6f, BOTH wp arms, identical in each):
+# of the 76,951 mipsel corpus rows carrying BRANCH_SYSCALL_TYPE, 76,783
+# translate with `noret >= 1` -- at least one call that does not return,
+# which is the raise -- and 74,250 of them write exactly
+# {REG_PC, REG_SYSEXC}.  Every row behind every mnemonic listed here is in
+# that set: per mnemonic, raise == total, with no mixture anywhere.
+#
+# THE 168 ROWS THAT WERE **NOT** IN IT WERE A DEFECT AND ARE FIXED, NOT
+# ALLOWLISTED.  `lsa` (96, translate_mips/OPC_PMON) and `shll.qb` +
+# `shra.qb` (72, translate_mips/OPC_SHLL_QB_DSP) measured `noret=0` -- they
+# executed -- and the generator rows that classified them as a trap carried
+# justifications that were false at the source.  They are corrected in
+# champsim_tracer_mnemonic_audit.py and publish BRANCH_NONE, so they do not
+# appear below.  That split is the whole point of measuring per row: an
+# allowlist row asserts the tracer is RIGHT, and for those three it was not.
+#
+# By the rule QEMU declined at (mnemonic counts sum to 79):
+#   translate_mips/OPC_CP0        13   dvpe evpe mfc0 mftr mtc0 mttr
+#                                      tlbinv tlbinvf tlbp tlbr tlbwi
+#                                      tlbwr wait
+#   translate_mips/OPC_CP2         2   mfc2 mtc2
+#   translate_mips/OPC_SPECIAL3   16   the EVA load/store/prefetch/cache set
+#   translate_mips/OPC_MUL_PH_DSP 16   the DSP add/sub/mul group
+#   translate_mips/OPC_EXTR_W_DSP 17   the DSP accumulator group
+#   translate_mips/OPC_APPEND_DSP  3   append balign prepend
+#   translate_mips/OPC_PS_FMT     12   the paired-single FP group
+mipsel FB-flow-presence add.ps cs-yes llvm-no
+mipsel FB-flow-presence addqh.ph cs-yes llvm-no
+mipsel FB-flow-presence addqh_r.ph cs-yes llvm-no
+mipsel FB-flow-presence addqh_r.w cs-yes llvm-no
+mipsel FB-flow-presence addqh.w cs-yes llvm-no
+mipsel FB-flow-presence addr.ps cs-yes llvm-no
+mipsel FB-flow-presence adduh.qb cs-yes llvm-no
+mipsel FB-flow-presence adduh_r.qb cs-yes llvm-no
+mipsel FB-flow-presence append cs-yes llvm-no
+mipsel FB-flow-presence balign cs-yes llvm-no
+mipsel FB-flow-presence cachee cs-yes llvm-no
+mipsel FB-flow-presence cvt.pw.ps cs-yes llvm-no
+mipsel FB-flow-presence cvt.s.pl cs-yes llvm-no
+mipsel FB-flow-presence cvt.s.pu cs-yes llvm-no
+mipsel FB-flow-presence dvpe cs-yes llvm-no
+mipsel FB-flow-presence evpe cs-yes llvm-no
+mipsel FB-flow-presence extp cs-yes llvm-no
+mipsel FB-flow-presence extpdp cs-yes llvm-no
+mipsel FB-flow-presence extpdpv cs-yes llvm-no
+mipsel FB-flow-presence extpv cs-yes llvm-no
+mipsel FB-flow-presence extr_rs.w cs-yes llvm-no
+mipsel FB-flow-presence extr_r.w cs-yes llvm-no
+mipsel FB-flow-presence extr_s.h cs-yes llvm-no
+mipsel FB-flow-presence extrv_rs.w cs-yes llvm-no
+mipsel FB-flow-presence extrv_r.w cs-yes llvm-no
+mipsel FB-flow-presence extrv_s.h cs-yes llvm-no
+mipsel FB-flow-presence extrv.w cs-yes llvm-no
+mipsel FB-flow-presence extr.w cs-yes llvm-no
+mipsel FB-flow-presence lbe cs-yes llvm-no
+mipsel FB-flow-presence lbue cs-yes llvm-no
+mipsel FB-flow-presence lhe cs-yes llvm-no
+mipsel FB-flow-presence lhue cs-yes llvm-no
+mipsel FB-flow-presence lle cs-yes llvm-no
+mipsel FB-flow-presence lwe cs-yes llvm-no
+mipsel FB-flow-presence lwle cs-yes llvm-no
+mipsel FB-flow-presence lwre cs-yes llvm-no
+mipsel FB-flow-presence mfc0 cs-yes llvm-no
+mipsel FB-flow-presence mfc2 cs-yes llvm-no
+mipsel FB-flow-presence mftr cs-yes llvm-no
+mipsel FB-flow-presence mtc0 cs-yes llvm-no
+mipsel FB-flow-presence mtc2 cs-yes llvm-no
+mipsel FB-flow-presence mthlip cs-yes llvm-no
+mipsel FB-flow-presence mttr cs-yes llvm-no
+mipsel FB-flow-presence mul.ph cs-yes llvm-no
+mipsel FB-flow-presence mul.ps cs-yes llvm-no
+mipsel FB-flow-presence mulq_rs.w cs-yes llvm-no
+mipsel FB-flow-presence mulq_s.w cs-yes llvm-no
+mipsel FB-flow-presence mulr.ps cs-yes llvm-no
+mipsel FB-flow-presence mul_s.ph cs-yes llvm-no
+mipsel FB-flow-presence pll.ps cs-yes llvm-no
+mipsel FB-flow-presence plu.ps cs-yes llvm-no
+mipsel FB-flow-presence prefe cs-yes llvm-no
+mipsel FB-flow-presence prepend cs-yes llvm-no
+mipsel FB-flow-presence pul.ps cs-yes llvm-no
+mipsel FB-flow-presence puu.ps cs-yes llvm-no
+mipsel FB-flow-presence rddsp cs-yes llvm-no
+mipsel FB-flow-presence sbe cs-yes llvm-no
+mipsel FB-flow-presence sce cs-yes llvm-no
+mipsel FB-flow-presence she cs-yes llvm-no
+mipsel FB-flow-presence shilo cs-yes llvm-no
+mipsel FB-flow-presence shilov cs-yes llvm-no
+mipsel FB-flow-presence sub.ps cs-yes llvm-no
+mipsel FB-flow-presence subqh.ph cs-yes llvm-no
+mipsel FB-flow-presence subqh_r.ph cs-yes llvm-no
+mipsel FB-flow-presence subqh_r.w cs-yes llvm-no
+mipsel FB-flow-presence subqh.w cs-yes llvm-no
+mipsel FB-flow-presence subuh.qb cs-yes llvm-no
+mipsel FB-flow-presence subuh_r.qb cs-yes llvm-no
+mipsel FB-flow-presence swe cs-yes llvm-no
+mipsel FB-flow-presence swle cs-yes llvm-no
+mipsel FB-flow-presence swre cs-yes llvm-no
+mipsel FB-flow-presence tlbinv cs-yes llvm-no
+mipsel FB-flow-presence tlbinvf cs-yes llvm-no
+mipsel FB-flow-presence tlbp cs-yes llvm-no
+mipsel FB-flow-presence tlbr cs-yes llvm-no
+mipsel FB-flow-presence tlbwi cs-yes llvm-no
+mipsel FB-flow-presence tlbwr cs-yes llvm-no
+mipsel FB-flow-presence wait cs-yes llvm-no
+mipsel FB-flow-presence wrdsp cs-yes llvm-no
+
 # `jalr rd, rs` WITH AN EXPLICIT rd: the fields-layer twin of the boundary
 # row `mipsel R-wr-missing jalr +r#`, and it carries that row's whole
 # derivation.  MIPS32 writes GPR[rd] and nothing else; LLVM's JALR
@@ -1113,6 +1238,26 @@ aarch64 FR-rd-missing tlbi +REG_GPR#
 riscv64 FB-flow-presence ebreak cs-yes llvm-no
 riscv64 FB-flow-presence ecall cs-yes llvm-no
 riscv64 FB-flow-presence unimp cs-yes llvm-no
+
+# THE RESERVED c.lui FORMS, which are the same fact reached from the
+# other side: the reference decoders name an instruction, and QEMU's
+# decodetree does not have one to name.  RVC requires `c.lui` to have
+# rd != 0, rd != 2 and nzimm != 0; both encodings here violate that --
+# 0x6001 is rd == x0 and 0x6201 is nzimm == 0 -- and the decoder matches
+# its own `illegal` pattern instead.  Capstone and LLVM disassemble the
+# bytes anyway and spell them `c.lui` / `lui` with no flow flag.
+#
+# VERIFIED on the corpus rather than from the manual: both rows sit on
+# rule `decode_insn16/illegal@0110.....0000001` -- the word `illegal` is
+# QEMU's, in the rule's own name -- and both translate to
+# `noret=1,calls=1,memr=0,memw=0` writing {REG_PC}: one call that does
+# not return, which is gen_exception_illegal().  Fetch diverts to a
+# vector, so BRANCH_SYSCALL_TYPE is the true control-flow fact and the
+# reference decoders' silence is a fact about an encoding rather than
+# about this machine (verify77 sled, #so c43d8ae33ef92f6f, both wp arms).
+#   2 rows
+riscv64 FB-flow-presence c.lui cs-yes llvm-no
+riscv64 FB-flow-presence lui cs-yes llvm-no
 
 # `jr 1(ra)` is not a return: a jump through ra with a NON-ZERO offset
 # does not resume the caller, and the fields side declines to call it

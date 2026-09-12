@@ -10733,7 +10733,30 @@ riscv64 SR-rd-phantom vsetvli +REG_SYS,REG_VCTRL
 # class back to DEFECT and both mipsel arms went red again, which is how it was
 # found.  A class's verdict is the generator's; a hand-edit inside the block is
 # a verdict with a deletion date.
-mipsel SR-rd-phantom lsa +REG_GPR#
+#
+# AND IT RETIRED FROM A THIRD END, WHICH THE BLOCK ABOVE DID NOT ANTICIPATE.
+# `mipsel SR-rd-phantom lsa +REG_GPR#` is DEAD at this tip, and the detector
+# caught it in the pass that killed it: the PMON ruling now REFUSES the opcode
+# (GEN_OP_UNKNOWN, written), so the wire publishes no source list for the
+# encoding at all and there is no phantom GPR read left to allow.  Measured,
+# `isaxcheck --isa=mipsel --layer=fields --hex=05000200` at #so 19491c477482:
+#
+#     boundary  lsa $zero, $zero, $v0, 1   RD{r0,r2}  WR{r0}
+#     llvm      lsa $zero, $zero, $2, 1    RD{r0,r2}  WR{r0}
+#     fields    ok=0  GEN_OP_UNKNOWN  BRANCH_NONE   SRC{-}  DST{-}
+#
+# The row is retired and its successor is below.  Everything the block above
+# says about WHY the two sides disagree still holds and is why it is kept: the
+# reference decoders name an R6 instruction, QEMU's legacy decode takes the
+# PMON arm, and the difference is a QEMU-modelling fact with the model named.
+# What changed is only the SHAPE the disagreement takes on the wire -- from a
+# register difference to a refusal -- because naming the wrong operation is
+# worse than naming none.
+#
+# `FU-unclassified` is that refusal's signature: the tracer states
+# GEN_OP_UNKNOWN where both references name an instruction.  It is the honest
+# row, and it is the one the dead-rule detector will watch from here.
+mipsel FU-unclassified lsa
 
 # --- M-MERGE: the unaligned loads merge into their destination, so the destination is a source.
 #     8 signature(s), 8064 encodings at this tip.

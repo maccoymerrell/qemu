@@ -271,6 +271,59 @@ def encfield(a, b, isa, mnem_re, lo, hi):
     return hist, bad
 
 
+#: a losing register name that carries an ARCHITECTURAL INDEX, e.g. REG_VEC31
+#: or REG_GPR7.  A name with no index (REG_FLAGS, REG_SYS...) has no encoding
+#: field to be compared against and is reported apart rather than scored.
+_REG_IDX_RX = re.compile(r"^REG_[A-Z_]*?(\d+)$")
+
+
+def regfield(a, b, isa, mnem_re, lo, hi):
+    """WHICH OPERAND SLOT is losing, over the WHOLE losing family.
+
+       `encfield` beside it answers "what shift/size did the encoding ask
+       for"; this answers the question a family ruling asks NEXT and which
+       reading four examples cannot settle: IS THE LOST REGISTER THE ONE THE
+       RULING IS ABOUT?
+
+       `a64-extr-lsb0` rules that a named operand contributing ZERO BITS is
+       not read -- but EXTR names two source registers and only Rm survives,
+       so a ruling written for Rn is worth nothing unless every losing
+       instance IS Rn.  Likewise `xtn2 v31.16b, v0.8h` and `usra v1.8b,
+       v0.8b, #8` lose a vector register apiece and they are NOT the same
+       slot: the first loses its DESTINATION (bits 4:0), the second loses its
+       SOURCE (bits 9:5).  A verdict quoted for the wrong slot is the
+       allowlist-false-justification shape with a number attached.
+
+       So: for every losing register instance of the family, compare the
+       register's architectural INDEX against encoding bits LO:HI, and report
+       MATCH / MISMATCH / NO-INDEX with a denominator.  100% MATCH is what a
+       slot-scoped ruling needs; anything else names the rows that refute it.
+
+       Fixed-width ISAs only, for encfield's reason."""
+    rx = re.compile(mnem_re)
+    hist, bad, examples = collections.Counter(), [], {}
+    for enc, mnem, lost in losses(a, b, isa):
+        if not rx.search(mnem):
+            continue
+        try:
+            w = struct.unpack("<I", bytes.fromhex(enc))[0]
+        except Exception:
+            bad.append(enc)
+            continue
+        want = (w >> lo) & ((1 << (hi - lo + 1)) - 1)
+        for reg in lost:
+            m = _REG_IDX_RX.match(reg)
+            if not m:
+                key = "NO-INDEX"
+            elif int(m.group(1)) == want:
+                key = "MATCH"
+            else:
+                key = "MISMATCH"
+            hist[key] += 1
+            examples.setdefault(key, (enc, mnem, reg, want))
+    return hist, bad, examples
+
+
 def score(a, b, rows, isas=ISAS, bar=False, trap=None):
     """Join the measured losses to the table.  Returns (report, rc)."""
     out, rc = [], 0
@@ -549,6 +602,45 @@ def selftest():
     check("NO-OPS and DATAPATH both stay REAL (R16: a NOP has dependencies)",
           full, 1, "mipsel     REAL-LOST          3", trap=trap_dp, bar=True)
 
+    # THE SLOT ARM, all four of its readings.  A whole-population slot ruling
+    # is quoted as "100% MATCH", so the arm has to be shown REFUSING a
+    # mismatch and an unindexed name, not just agreeing -- and it has to be
+    # shown reading the right bits, because reading the wrong field would
+    # agree with itself forever.
+    #
+    #   00000080 is little-endian 0x80000000: bits 4:0 = 0, bits 9:5 = 0.
+    #   00000084 is little-endian 0x84000000: bits 4:0 = 0, bits 9:5 = 0.
+    #
+    # so a corpus losing REG_GPR0 matches on either field and one losing
+    # REG_GPR1 does not.
+    def rcheck(name, mnem, lo, hi, want_key, want_n, corpA=A):
+        nonlocal ok
+        n_check[0] += 1
+        a, _ = load_corpus(corpA)
+        b, _ = load_corpus(B)
+        hist, bad, _ex = regfield(a, b, "mipsel", mnem, lo, hi)
+        got = hist.get(want_key, 0)
+        if got == want_n and not bad:
+            print("  ARM %d %s ok (%s=%d)" % (n_check[0], name, want_key, got))
+        else:
+            n_fail[0] += 1
+            ok = False
+            print("  ARM %d %s FAILED (%s=%d, wanted %d; hist=%s bad=%d)"
+                  % (n_check[0], name, want_key, got, want_n, dict(hist),
+                     len(bad)))
+
+    Aslot = corpus([("mipsel", "00000080", "lb", "REG_GPR0"),
+                    ("mipsel", "00000084", "lh", "REG_GPR1")])
+    rcheck("regfield MATCHes the slot the bits name", "^l", 0, 4,
+           "MATCH", 1, corpA=Aslot)
+    rcheck("... and MISMATCHes the register they do not", "^l", 0, 4,
+           "MISMATCH", 1, corpA=Aslot)
+    Anoidx = corpus([("mipsel", "00000080", "lb", "REG_SYSEXC")])
+    rcheck("a register name with no index is counted apart", "^lb$", 0, 4,
+           "NO-INDEX", 1, corpA=Anoidx)
+    rcheck("a pattern with no losing subject histograms nothing", "^nosuch$",
+           0, 4, "MATCH", 0, corpA=Aslot)
+
     print("srcwalk_worklist selftest: %d check(s), %d failure(s)"
           % (n_check[0], n_fail[0]))
     print("SELFTEST %s" % ("PASS" if ok else "FAIL"))
@@ -574,6 +666,12 @@ def main():
                          "over the losing encodings whose mnemonic matches "
                          "MNEM_RE -- the whole-population arm behind a "
                          "family ruling.  Fixed-width ISAs only.")
+    ap.add_argument("--regfield", metavar="ISA:MNEM_RE:LO:HI",
+                    help="instead of scoring, check the LOST REGISTER's "
+                         "architectural index against encoding bits LO:HI "
+                         "over the whole losing family -- the arm that says "
+                         "WHICH OPERAND SLOT a family ruling is about.  "
+                         "Fixed-width ISAs only.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -592,6 +690,44 @@ def main():
             continue
         a.update(pa)
         b.update(pb)
+    if args.encfield and args.regfield:
+        ap.error("--encfield and --regfield ask different questions; run one")
+    if args.regfield:
+        try:
+            fisa, mre, lo, hi = args.regfield.rsplit(":", 3)
+            lo, hi = sorted((int(lo), int(hi)))
+        except Exception:
+            ap.error("--regfield wants ISA:MNEM_RE:LO:HI")
+        if fisa not in ISAS:
+            ap.error("--regfield ISA must be one of %s" % (ISAS,))
+        if fisa == "x86_64":
+            print("REFUSING: x86_64 has no fixed encoding bit-field to read a "
+                  "register slot from; a slot table for it would be a decoder.")
+            return 2
+        if not a or not b:
+            print("REFUSING: a corpus arm is empty, so the arm would have no "
+                  "subject.")
+            return 2
+        hist, bad, ex = regfield(a, b, fisa, mre, lo, hi)
+        tot = sum(hist.values())
+        if tot == 0:
+            print("REFUSING: no losing encoding on %s matches %s -- an arm "
+                  "with no subject abstains." % (fisa, mre))
+            return 2
+        print("regfield %s /%s/ lost-register index vs bits %d:%d over %d "
+              "losing register instance(s)" % (fisa, mre, lo, hi, tot))
+        for k in ("MATCH", "MISMATCH", "NO-INDEX"):
+            if hist.get(k):
+                enc, mnem, reg, want = ex[k]
+                print("  %-9s %6d  %5.1f%%   e.g. %s %s %s (field=%d)"
+                      % (k, hist[k], 100.0 * hist[k] / tot, enc, mnem, reg,
+                         want))
+        if bad:
+            print("  UNPARSED encodings: %d (%s ...)" % (len(bad), bad[0]))
+        #: a slot ruling is only quotable at 100% MATCH, so anything else is a
+        #: non-zero exit -- the arm refuses to read as a pass.
+        return 0 if (not bad and hist.get("MATCH", 0) == tot) else 1
+
     if args.encfield:
         try:
             fisa, mre, lo, hi = args.encfield.rsplit(":", 3)

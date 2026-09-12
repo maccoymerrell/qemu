@@ -2121,6 +2121,8 @@ static std::map<std::string, unsigned long> pop_seen_by_mnem;
  * streamed, because whether row t belongs in the sample is not known until
  * the stream ends.  One vector of at most K strings per mnemonic. */
 static std::map<std::string, std::vector<std::string> > pop_keep_by_mnem;
+/* --pop-only=MNEM[,MNEM...]: confine the population to these mnemonics. */
+static std::set<std::string> pop_only;
 
 /*
  * RESERVOIR PLACEMENT, as a pure function of the position so the population
@@ -3043,7 +3045,18 @@ static void compare(const uint8_t *b, size_t n)
      */
     if (pop_file) {
         const std::string pm = c.ok ? c.mnem : std::string("?");
-        if (!pop_per_mnem) {
+        /*
+         * --pop-only NARROWS THE POPULATION TO NAMED MNEMONICS, which is how
+         * a dead allowlist rule is decided without a sample (FINDING 102-A).
+         * A rule's death is only a statement about what the corpus reached;
+         * with the cap off and the population confined to the rule's own
+         * mnemonic, the sled can be driven over EVERY encoding this sweep
+         * decodes for it, and then "no signature" is a statement about the
+         * whole swept population rather than about 512 of it.
+         */
+        if (!pop_only.empty() && !pop_only.count(pm)) {
+            /* not this rule's mnemonic; the population is not about it */
+        } else if (!pop_per_mnem) {
             fprintf(pop_file, "%s\t%s\t%s\n", cfg.name, hx.c_str(), pm.c_str());
         } else {
             unsigned long seen = ++pop_seen_by_mnem[pm];
@@ -4184,6 +4197,10 @@ static void usage(void)
         "                  stream so a mnemonic's sample is not confined to\n"
         "                  the low end of whatever field discriminates it\n"
         "                  (FINDING 102-A).  0 keeps everything\n"
+        "  --pop-only=M[,M...]  confine --dump-pop to these mnemonics.  With\n"
+        "                  --pop-per-mnem=0 that is EVERY encoding this sweep\n"
+        "                  decodes for them, which is what decides a dead\n"
+        "                  allowlist rule without a sample\n"
         "  --selftest-pop  prove the reservoir: fixed size, full coverage,\n"
         "                  determinism, and that it leaves the head\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
@@ -4411,6 +4428,15 @@ int main(int argc, char **argv)
             sigenc_so_expect = argv[i] + 13;
         else if (!strncmp(argv[i], "--dump-pop=", 11)) pop_path = argv[i] + 11;
         else if (!strncmp(argv[i], "--pop-per-mnem=", 15)) pop_per_mnem = (unsigned)atoi(argv[i] + 15);
+        else if (!strncmp(argv[i], "--pop-only=", 11)) {
+            const char *p = argv[i] + 11;
+            while (*p) {
+                const char *e = strchr(p, ',');
+                pop_only.insert(e ? std::string(p, e - p) : std::string(p));
+                if (!e) break;
+                p = e + 1;
+            }
+        }
         else if (!strncmp(argv[i], "--falsify=", 10)) {
             const char *spec = argv[i] + 10;
             const char *colon = strchr(spec, ':');

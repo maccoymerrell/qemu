@@ -22,10 +22,39 @@
 #
 # Observed against Capstone 6.0.0-Alpha7 (subprojects/capstone.wrap) and
 # LLVM 18 MC.  On a Capstone bump: rebuild, re-run
-# `python -m champsim_tracer_validator full`, and delete every entry whose
-# signature no longer appears.  `capstone_workaround_probe` answers the
-# complementary question — whether an existing disas/capstone.c workaround
-# has become unnecessary.
+# `python -m champsim_tracer_validator full`, and consider each entry whose
+# signature no longer appears — but do NOT delete it on that reading alone.
+# `capstone_workaround_probe` answers the complementary question — whether an
+# existing disas/capstone.c workaround has become unnecessary.
+#
+# A SIGNATURE THAT NO LONGER APPEARS HAS TWO CAUSES AND THEY LOOK IDENTICAL
+# (FINDING 102-A).  One is the one this instruction was written for: the
+# disagreement was repaired and the rule has outlived it.  The other is that
+# the arm never asked — the `--srcenc`/`--ident` corpus a `run` arm scores
+# against is a SAMPLE of the encoding space, and a rule whose subject lives
+# outside the sample matches nothing for a reason that has nothing to do with
+# the tracer.  isaxcheck reports both as DEAD.
+#
+# MEASURED, and this is why the instruction changed rather than being
+# annotated.  All FORTY-SIX rules that read DEAD at `9722718566` were
+# re-scored against a population re-drawn by reservoir instead of first-K
+# (8f37a23830) and, for the residue, over every encoding the sweep decodes
+# for the rule's own mnemonic (`--pop-only` with `--pop-per-mnem=0`):
+#
+#     LIVE, dead only by reach   31   riscv64 12, aarch64 7, x86_64 12
+#     unscored on the arm         3   x86_64 SR-rd-* (no --srcenc there)
+#     still dead                 12   mipsel 1, x86_64 11
+#
+# Thirty-one live allowlist rules would have been deleted by following the
+# old instruction, and each deletion asserts a decoder disagreement has gone
+# when it has not.  The riscv64 twelve are the sharpest case: their subject
+# is the read-only identification CSRs, whose selector lives in the encoding's
+# HIGH bits, and no corpus captured before 8f37a23830 reaches one.
+#
+# SO THE RULE IS: a DEAD reading is a question, not a verdict.  Answer it by
+# driving the sled over the rule's whole swept population and re-scoring; only
+# a signature absent from THAT is retired, and the retirement says which
+# population it was absent from.
 
 # =====================================================================
 # 1. Where LLVM is the one that is wrong, or models something that is not

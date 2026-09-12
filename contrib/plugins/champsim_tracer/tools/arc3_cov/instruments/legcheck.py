@@ -105,8 +105,11 @@ it, and no instrument read the transcript.
 `--message` is that reader.  Per commit, over the R13 leg record in its
 commit message:
 
-  M1 CLAIMED    the record's "GATE PASSED -- N legs" line and the number of
-                rows it prints are the same number.
+  M1 CLAIMED    the record's "GATE PASSED -- N legs" (or "GATE SCORED -- N
+                legs", for a run that did not go green) line and the number
+                of rows it prints are the same number.  See CLAIM_RE for why
+                a red run may still be transcribed and why that is not an
+                amnesty.
   M2 COMPLETE   every (leg, isa) pair in the R13 manifest appears as a row.
                 The manifest is the gate's own ADJUDICATED.tsv AS OF THE
                 RECORD'S OWN COMMIT, so the check cannot drift from what the
@@ -166,7 +169,30 @@ RECORD_ROW_RE = re.compile(
     r'^\s+([a-z][a-z0-9_]*)\s+([A-Za-z][A-Za-z0-9_]*)\s+'
     r'(\d+)\s*(?:/\s*)?(\d+)\s+(\d+)\b', re.M)
 #: The record's own claim about how many legs it is transcribing.
-CLAIM_RE = re.compile(r'GATE\s+PASSED\s*--\s*(\d+)\s+legs', re.M)
+#:
+#: `PASSED` OR `SCORED`, AND THE SECOND SPELLING IS NOT A RELAXATION.  M1 asks
+#: one question -- does the number the record CLAIMS to be transcribing equal
+#: the number of rows it PRINTS -- and that question is the same whether the
+#: run it transcribes went green or red.  Keying only on `GATE PASSED` made a
+#: passing gate a PRECONDITION of writing a record, which is a rule nobody
+#: wrote and which has exactly one outcome when the gate is red for reasons
+#: the commit did not cause: a wire commit either goes unrecorded, or its
+#: record says `GATE PASSED` over a table whose verdict column says FAIL.  The
+#: first loses the evidence; the second is a falsehood in a commit message,
+#: which is the failure this directory exists to catch.
+#:
+#: THE OCCASION.  `c0e64b09d2` moved the wire and owed twelve external legs.
+#: They were run at `9722718566` and every one came in at or under its
+#: adjudicated ceiling -- but the FULL gate is 15 of 20 there, on five rows
+#: that predate the commit (`isaxdead` 46, `isaxunallowed` 15, and three
+#: static legs).  `GATE SCORED -- 20 legs` is what actually happened, the
+#: verdict column carries `ok` or `FAIL` per row, and M1/M2/M3 judge the
+#: transcript exactly as before.
+#:
+#: A record whose rows say FAIL is not thereby excused: the ceilings live in
+#: ADJUDICATED.tsv and the gate is what enforces them.  This regex decides
+#: whether a MESSAGE is a complete transcript, and nothing else.
+CLAIM_RE = re.compile(r'GATE\s+(?:PASSED|SCORED)\s*--\s*(\d+)\s+legs', re.M)
 #: THE MARKER (FINDING 91-B).  A commit either DECLARES that it carries a leg
 #: record or it does not, and the declaration is this line, on its own, in the
 #: commit message:
@@ -859,6 +885,42 @@ def selftest():
             fails.append('arm14 a complete tree-naming record should PASS: %s'
                          % r)
 
+        # ARM 14b -- THE RED-RUN SPELLING.  The same complete transcript with
+        # `GATE SCORED` and a FAIL verdict on one row must PASS M1/M2/M3: the
+        # question is whether the message transcribes the run, not whether the
+        # run went green.  See CLAIM_RE.
+        g('commit', '-q', '--amend', '-m',
+          'full record, red run\n\n'
+          '    static     x86_64      12 / 47     3123 FAIL\n'
+          '    pin        x86_64     259 / 259  395854 ok\n'
+          '\n    GATE SCORED -- 2 legs, 1 of 2 at or under its ceiling\n'
+          '\nR13-LEG-RECORD\nTREE=%s\n' % full_tree)
+        redc = g('rev-parse', 'HEAD')
+        r = check_message(repo, redc, man)
+        if r:
+            fails.append('arm14b a complete transcript of a RED run, spelled '
+                         '`GATE SCORED`, should PASS: %s' % r)
+
+        # ARM 14c -- and the new spelling is not a hole: claiming 2 while
+        # printing 1 still FAILS M1, exactly as `GATE PASSED` does.
+        g('commit', '-q', '--amend', '-m',
+          'short record, red run\n\n'
+          '    static     x86_64      12 / 47     3123 FAIL\n'
+          '\n    GATE SCORED -- 2 legs, 0 of 2 at or under its ceiling\n'
+          '\nR13-LEG-RECORD\nTREE=%s\n' % full_tree)
+        redshort = g('rev-parse', 'HEAD')
+        r = check_message(repo, redshort, man)
+        if not any('M1 CLAIMED' in x for x in r):
+            fails.append('arm14c `GATE SCORED -- 2 legs` over ONE row must '
+                         'still fail M1: %s' % r)
+        # restore HEAD to the complete PASSED record the later arms build on
+        g('commit', '-q', '--amend', '-m',
+          'full record\n\n    static     x86_64      47 / 47     6225 scored\n'
+          '    pin        x86_64     259 / 259  395854\n'
+          '\n    GATE PASSED -- 2 legs, every headline at or under its '
+          'ceiling\n\nR13-LEG-RECORD\nTREE=%s\n' % full_tree)
+        fullc = g('rev-parse', 'HEAD')
+
         # ARM 15 -- RECORD-COMPLETED-BY is checked by RE-READING the commit it
         # names.  Pointing an incomplete record at another incomplete record
         # completes nothing.
@@ -1020,7 +1082,9 @@ def selftest():
              'a tree= naming another tree fails',
              'a pruned orphan tip still verifies on its tree column',
              'a record printing fewer legs than the manifest fails',
-             'a complete record naming its own tree passes',
+             'a complete record naming its own tree passes, in BOTH claim '
+             'spellings (`GATE PASSED` and, for a red run, `GATE SCORED`), '
+             'and a short one still fails M1 in either',
              'RECORD-COMPLETED-BY pointing at an incomplete record fails',
              'the manifest is read as of the record\'s own tree',
              'an unmarked quotation reads UNMARKED, and marking it makes it a claim',

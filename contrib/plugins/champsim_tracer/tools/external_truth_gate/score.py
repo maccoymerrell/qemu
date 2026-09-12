@@ -267,6 +267,21 @@ def score_one(row, root, binary_mtime):
 
     pat, kind = HEADLINE[row.leg]
     if kind == 'coverage':
+        # A LEG THAT BLOCKED NAMES ITSELF, AND ONLY ITSELF.  All four `static`
+        # rows read one `coverage_report.txt`, so when that report refused to
+        # publish at all -- as it did for ONE stale x86_64 leg -- every one of
+        # the four read REPORT MISSING, including three legs that had run and
+        # whose tables were fresh.  `coverage_report.py` now writes the report
+        # with a `<isa>  REFUSED  <reason>` row for each blocked leg, and this
+        # is where that row is read: the blocked ISA fails carrying its OWN
+        # reason, the others are scored normally.
+        rm = re.search(r'^%s\s+REFUSED\s+(.*)$' % re.escape(row.isa),
+                       text, re.M)
+        if rm:
+            return (False, None, None,
+                    'LEG REFUSED by coverage_report.py: %s.  This leg did not '
+                    'produce a measurement; the other legs in the same report '
+                    'are scored on their own rows.' % rm.group(1).strip())
         # "x86_64    47  (subset 37 + unaccounted 10 + hole 0)"
         hm = re.search(r'^%s\s+(\d+)\s+\(subset (\d+) \+ unaccounted (\d+) '
                        r'\+ hole (\d+)\)' % re.escape(row.isa), text, re.M)

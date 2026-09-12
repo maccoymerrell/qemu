@@ -186,10 +186,25 @@ def refuse_if_stale(cov, allow_stale=False):
     if allow_stale:
         sys.stderr.write('--allow-stale given: publishing anyway.  The '
                          'numbers below are NOT a measurement at this tip.\n')
-        return
-    sys.exit('%d of %d legs were scored before the tracer they describe was '
-             'built.  Re-run those legs; do not publish this table.'
-             % (len(stale), len(ISAS)))
+        return {}
+    #
+    # ONE STALE LEG NAMES ITSELF; IT DOES NOT BLANK THE OTHER THREE -- 99-A's
+    # sibling, and the shape verify76 measured: `coverage_report.py` exited
+    # here, wrote no `coverage_report.txt`, and all FOUR of the R13 gate's
+    # `static/<isa>` rows read REPORT MISSING -- for one x86_64 leg that had
+    # exited 1.  Three legs that ran, and whose tables are fresh, were
+    # reported as not having run at all.
+    #
+    # A leg is the unit of freshness, so it is the unit of the refusal.  The
+    # blocked ISAs are returned, the report is WRITTEN, each blocked ISA gets
+    # a `REFUSED` row carrying its own reason, every ALL-FOUR aggregate
+    # refuses rather than totalling over a subset, and the process still
+    # exits non-zero.  Nothing is published that was not measured, and
+    # nothing measured is thrown away with it.
+    return {isa: ('table %s predates the isaxcheck it describes (%s)'
+                  % (time.strftime(fmt, time.localtime(mt)),
+                     time.strftime(fmt, time.localtime(bt))))
+            for isa, _q, mt in stale}
 
 
 def main():
@@ -206,7 +221,7 @@ def main():
                          'inspecting a historical run, never for a verdict')
     a = ap.parse_args()
 
-    refuse_if_stale(a.cov, a.allow_stale)
+    blocked = refuse_if_stale(a.cov, a.allow_stale) or {}
 
     out = []
     w = out.append
@@ -217,14 +232,38 @@ def main():
         if not os.path.exists(p):
             missing.append((isa, p))
             continue
-        per_isa[isa] = read(p, vcol, dtok, mcol, lcol)
+        try:
+            per_isa[isa] = read(p, vcol, dtok, mcol, lcol)
+        except SystemExit as e:
+            # THE SECOND SOURCE OF THE SAME CASCADE.  `read()` refuses a table
+            # it cannot interpret -- a riscv64 table with UNPROBED rows and no
+            # `qemu_tcg_reachable` column is the live one -- and that refusal
+            # is correct and is ALSO about one leg.  Exiting here silenced the
+            # other three exactly as the staleness refusal did.  Same unit,
+            # same treatment: the leg is blocked, by its own message.
+            missing.append((isa, '%s: %s' % (p, e)))
 
-    if missing:
-        # A report that cannot find its subject must fail, not quietly average
-        # over what it did find.
-        for isa, p in missing:
-            sys.stderr.write('MISSING %s: %s\n' % (isa, p))
-        sys.exit('refusing to report on a partial set of ISAs')
+    # A report that cannot find a leg's subject must fail FOR THAT LEG, not
+    # quietly average over what it did find -- and not silence the legs that
+    # did run.  Same unit as the staleness refusal above.
+    for isa, p in missing:
+        sys.stderr.write('MISSING %s: %s\n' % (isa, p))
+        blocked[isa] = ('unusable table: %s' % p) if ': ' in p else \
+                       ('no table at %s -- the leg did not run, or exited '
+                        'before writing one' % p)
+    if len(blocked) == len(ISAS):
+        sys.exit('all %d legs are blocked; there is nothing to report'
+                 % len(ISAS))
+    #: The line a blocked ISA gets wherever a number would go.  The R13
+    #: gate's `coverage` scorer matches it and reports THIS leg's reason.
+    def refused_row(isa):
+        return '%-9s REFUSED  %s' % (isa, blocked[isa])
+    #: An aggregate over a subset is a number about a different population,
+    #: so there is no honest total while any leg is blocked.
+    def refused_total(what):
+        return ('%-9s REFUSED  %d of %d legs blocked (%s); a total over the '
+                'rest would be a number about a different population'
+                % (what, len(blocked), len(ISAS), ', '.join(sorted(blocked))))
 
     w('=' * 78)
     w('ARC 3 -- REGISTER ATTRIBUTION COVERAGE, ALL FOUR ISAs')
@@ -253,6 +292,8 @@ def main():
     grand = collections.Counter()
     gcounts = collections.Counter()
     for isa, _, vcol, dtok, _, _ in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
         rows, counts, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
         agree = counts.get('AGREE', 0) + counts.get('agree', 0)
@@ -270,7 +311,8 @@ def main():
           % (isa, probed, agree, len(rows), c[tax.SUPERSET], c[tax.SUBSET],
              c[tax.ORTHOGONAL], c[tax.UNACCOUNTED], _unp['yes']))
     w('-' * len(hdr))
-    w('%-9s %8d %9d %9d %11d %9d %11d %13d %10d'
+    w(refused_total('all four') if blocked else
+      '%-9s %8d %9d %9d %11d %9d %11d %13d %10d'
       % ('all four', gcounts['probed'], gcounts['agree'], gcounts['disagree'],
          grand[tax.SUPERSET], grand[tax.SUBSET], grand[tax.ORTHOGONAL],
          grand[tax.UNACCOUNTED], gcounts['hole']))
@@ -282,12 +324,15 @@ def main():
     w('')
     w('%-9s %s' % ('ISA', 'TRACER-SUBSET + UNACCOUNTED + REACHABLE-UNPROBED'))
     for isa, _, _, _, _, _ in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
         rows, _c2, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
         w('%-9s %d  (subset %d + unaccounted %d + hole %d)'
           % (isa, c[tax.SUBSET] + c[tax.UNACCOUNTED] + _unp['yes'],
              c[tax.SUBSET], c[tax.UNACCOUNTED], _unp['yes']))
-    w('%-9s %d  (subset %d + unaccounted %d + hole %d)'
+    w(refused_total('all four') if blocked else
+      '%-9s %d  (subset %d + unaccounted %d + hole %d)'
       % ('all four',
          grand[tax.SUBSET] + grand[tax.UNACCOUNTED] + gcounts['hole'],
          grand[tax.SUBSET], grand[tax.UNACCOUNTED], gcounts['hole']))
@@ -326,6 +371,8 @@ def main():
     g3 = collections.Counter()
     reach_src = {}
     for isa, _, vcol, dtok, _, _ in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
         rows, counts, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
         mpath = os.path.join(a.cov, REACH_MATRIX.get(isa, '\0'))
@@ -355,7 +402,8 @@ def main():
         w('%-9s %10d %13d %11d %11d'
           % (isa, cov, unreach, unc, cov + unreach + unc))
     w('-' * len(hdr3))
-    w('%-9s %10d %13d %11d %11d'
+    w(refused_total('all four') if blocked else
+      '%-9s %10d %13d %11d %11d'
       % ('all four', g3['c'], g3['u'], g3['x'],
          g3['c'] + g3['u'] + g3['x']))
     w('')
@@ -380,6 +428,8 @@ def main():
 
     # ------------------------------------------------- per-ISA cross-tables
     for isa, _, _, _, _, _ in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
         rows = per_isa[isa][0]
         w('=' * 78)
         w(tax.render_crosstab(
@@ -389,7 +439,8 @@ def main():
         w('')
 
     # ------------------------------------------------------ combined table
-    allrows = [r for isa, _, _, _, _, _ in ISAS for r in per_isa[isa][0]]
+    allrows = [r for isa, _, _, _, _, _ in ISAS if isa not in blocked
+               for r in per_isa[isa][0]]
     w('=' * 78)
     w(tax.render_crosstab(
         allrows, 'ALL FOUR ISAs -- CROSS-TABULATION  direction x category'))
@@ -397,6 +448,8 @@ def main():
 
     # ------------------------------------------------- unaccounted, by ISA
     for isa, _, _, _, _, _ in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
         rows = per_isa[isa][0]
         w('=' * 78)
         w('%s -- %s' % (isa, tax.render_unaccounted(rows, a.top).splitlines()[0]))
@@ -448,11 +501,22 @@ def main():
             f.write('isa\topcode_id\tmnemonic\tset_relation\tcategory\t'
                     'harness_label\n')
             for isa, _, _, _, _, _ in ISAS:
+                if isa in blocked:
+                    continue
                 for r in per_isa[isa][0]:
                     if r.direction != tax.UNACCOUNTED:
                         continue
                     f.write('\t'.join((isa, r.ident, r.mnemonic, r.relation,
                                         r.category, r.label)) + '\n')
+    # THE REPORT IS WRITTEN AND THE RUN STILL FAILS.  Publishing the legs that
+    # ran is not the same as passing; the blocked legs carry REFUSED rows that
+    # the R13 gate reads as their own failures, and this exit code is what a
+    # caller scripting the report sees.
+    if blocked:
+        sys.exit('%d of %d legs blocked: %s.  Their rows above read REFUSED '
+                 'and every all-four total is withheld; the legs that DID run '
+                 'are published beside them and are readable.'
+                 % (len(blocked), len(ISAS), ', '.join(sorted(blocked))))
 
 
 if __name__ == '__main__':

@@ -534,7 +534,17 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
     }
 
-    /* Emit code to exit the TB, as indicated by db->is_jmp.  */
+    /*
+     * Emit code to exit the TB, as indicated by db->is_jmp.
+     *
+     * The ops this emits are the BLOCK's, not the last instruction's, and
+     * they land inside the last instruction's extraction window all the same
+     * -- plugin_gen_record_tb_stop() below says so.  Mark the boundary so a
+     * consumer can tell an instruction's own write from the epilogue's: a
+     * page-final `mov` gets its pc write here and a branch does not.  See
+     * insn_dataflow_note_block_epilogue().
+     */
+    insn_dataflow_note_block_epilogue();
     ops->tb_stop(db, cpu);
     if (plugin_enabled) {
         /* Those ops belong to the last instruction; see plugin-gen.c. */

@@ -333,6 +333,34 @@ unsigned qemu_plugin_insn_reg_write_list(const struct qemu_plugin_tb *tb,
                                          unsigned nentries);
 
 /*
+ * Was EVERY op that wrote @reg the translation block's EPILOGUE'S?
+ *
+ * The epilogue is what ops->tb_stop() emits to leave the block, and those ops
+ * land inside the LAST instruction's extraction window even though they are
+ * the block's work and not that instruction's.  This separates the two: a
+ * page-final `mov` whose only pc write is i386_tr_tb_stop()'s DISAS_TOO_MANY
+ * arm answers true, and a branch that stored its target during its own
+ * translation answers false.
+ *
+ * FALSE IS THE ANSWER FOR EVERYTHING ELSE, including a register this
+ * instruction does not write and an instruction whose dataflow is incomplete.
+ * A consumer reading it as "the instruction wrote it itself" is right in
+ * every case where the write exists at all, and a consumer using it to
+ * DISCARD a write must check the write exists first.
+ *
+ * IT IS A POSITION, NOT AN OWNERSHIP STATEMENT.  On a delay-slot target the
+ * ops that perform a branch's transfer are emitted during the SLOT's
+ * translation -- not in the epilogue -- so this answers false for both the
+ * branch and the slot, and the slot's pc write looks like its own.  The
+ * translator states that ownership separately; see the WHOSE OPS ARE THEY
+ * block beside QEMU_PLUGIN_CTRL_* in qemu-plugin.h, and join against it
+ * rather than reading position as ownership.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_write_epilogue_only(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned reg);
+
+/*
  * Where a written register's value came from, as a set in the same namespace.
  *
  * This is a fact and deliberately not a verdict.  The verdict a consumer

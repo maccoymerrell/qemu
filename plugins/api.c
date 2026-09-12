@@ -537,6 +537,22 @@ bool qemu_plugin_insn_write_supplies_value(const struct qemu_plugin_tb *tb,
     return false;
 }
 
+bool qemu_plugin_insn_write_epilogue_only(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned reg)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d)) {
+        return false;
+    }
+    for (unsigned i = 0; i < d->n_writes; i++) {
+        if (d->writes[i].reg == reg) {
+            return d->writes[i].epilogue_only != 0;
+        }
+    }
+    return false;
+}
+
 unsigned qemu_plugin_insn_write_prov(const struct qemu_plugin_tb *tb,
                                      size_t idx, unsigned reg,
                                      uint64_t *words, unsigned nwords)

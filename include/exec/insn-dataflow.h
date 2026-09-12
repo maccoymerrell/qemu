@@ -610,6 +610,38 @@ typedef struct InsnDataflowWrite {
      * it.
      */
     uint8_t  supplies_value;
+    /*
+     * EVERY OP THAT WROTE THIS REGISTER WAS THE TRANSLATION BLOCK'S
+     * EPILOGUE'S -- emitted by ops->tb_stop() after the last instruction's
+     * own translate_insn() returned, and charged to that instruction only
+     * because the ops land inside its extraction window (see
+     * plugin_gen_record_tb_stop(), which says so in as many words).
+     *
+     * STICKY THE OTHER WAY from @supplies_value: it starts true for a write
+     * first seen in the epilogue and is cleared the moment an op before the
+     * epilogue anchor writes the same register.  "The instruction also wrote
+     * it itself" is the answer that wins, because the question this field
+     * exists for is whether the write belongs to the INSTRUCTION at all.
+     *
+     * The case it separates is a REG_PC destination.  QEMU charges a block's
+     * final pc write to whichever instruction the block ended on, so its
+     * write list carries pc on instructions the ISA does not define as
+     * writing it -- a page-final `mov`, whose eip store is
+     * i386_tr_tb_stop()'s DISAS_TOO_MANY arm and nothing of the `mov`'s --
+     * while a real branch stores its target during its own translation and
+     * comes out of the epilogue with nothing left to do.
+     *
+     * IT IS A POSITION, NOT AN OWNERSHIP STATEMENT, and on a delay-slot
+     * target those differ: MIPS leaves a branch's transfer to gen_branch(),
+     * which runs at the end of the DELAY SLOT's translate_insn() and is
+     * therefore NOT in the epilogue.  Position alone puts that write on the
+     * slot.  The translator states the ownership separately -- it is the
+     * only party that knows -- and a consumer that needs the delay-slot case
+     * right must join this against that statement rather than read position
+     * as ownership.  See the ctrl_borrow_first range in include/qemu/plugin.h
+     * and the WHOSE OPS ARE THEY block in qemu-plugin.h.
+     */
+    uint8_t  epilogue_only;
     uint64_t prov[INSN_DF_REG_WORDS];       /* registers the value came from */
 } InsnDataflowWrite;
 
@@ -1646,6 +1678,28 @@ void insn_dataflow_note_stated_write_name_shift(const char *reg,
                                                 int value_shift);
 
 /*
+ * THE TRANSLATION BLOCK'S EPILOGUE BEGINS HERE.
+ *
+ * Called by the generic translator loop immediately before ops->tb_stop(),
+ * so the ops that follow are the ones the target emits to LEAVE the block
+ * rather than to perform an instruction.  They land inside the last
+ * instruction's extraction window -- plugin_gen_record_tb_stop() says so in
+ * as many words -- and without this they arrive at a consumer
+ * indistinguishable from that instruction's own work.
+ *
+ * Every write recorded from an op after this point, and only from ops after
+ * this point, carries InsnDataflowWrite::epilogue_only; a register the
+ * instruction also wrote itself loses the bit.  See that field for the case
+ * it separates and for the one it does NOT: a delay-slot target's branch
+ * emits its transfer during the SLOT's translate_insn(), which is not the
+ * epilogue, so position is not ownership there.
+ *
+ * Capture only; no op is emitted, altered or suppressed.  Idempotent within
+ * a block and reset by insn_dataflow_extract().
+ */
+void insn_dataflow_note_block_epilogue(void);
+
+/*
  * THE TRANSLATOR'S OWN WORD THAT WHAT IT EMITTED IS NOT THE INSTRUCTION.
  *
  * Called from the site that made the decision -- the failing arm of a
@@ -2238,6 +2292,9 @@ static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
 
 static inline unsigned insn_dataflow_memop_mark(void)
 { return 0; }
+
+static inline void insn_dataflow_note_block_epilogue(void)
+{ }
 
 static inline void insn_dataflow_note_path_alt(unsigned mark)
 { }

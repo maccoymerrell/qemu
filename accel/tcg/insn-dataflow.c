@@ -794,6 +794,23 @@ struct InsnDataflowScratch {
      */
     const TCGOp *memop_ovf_anchor;
     /*
+     * The last op emitted before ops->tb_stop() ran, or NULL when the
+     * translator has not reached the epilogue (single-instruction probe
+     * translations, and every block until its last instruction is done).
+     * Everything strictly after it in the op list is the block's epilogue.
+     * See insn_dataflow_note_block_epilogue() and
+     * InsnDataflowWrite::epilogue_only.
+     */
+    const TCGOp *epilogue_anchor;
+    /*
+     * TRANSIENT, and it belongs to the op walk rather than to the block: set
+     * while df_insn() is walking ops that come after @epilogue_anchor, read
+     * by df_add_write().  It is in this struct rather than a local only
+     * because the two are several frames apart and threading a parameter
+     * through would put the same value in every intervening signature.
+     */
+    bool in_epilogue;
+    /*
      * The open alternate-path scope: which note the emissions inside it
      * mirror, and how many have been taken.  @alt_open is false everywhere
      * but inside the peeled copy of a self-looping string operation.
@@ -921,6 +938,8 @@ static __thread struct InsnDataflowScratch *df;
 #define df_n_memop          (df->n_memop)
 #define df_memop_overflow   (df->memop_overflow)
 #define df_memop_ovf_anchor (df->memop_ovf_anchor)
+#define df_epilogue_anchor  (df->epilogue_anchor)
+#define df_in_epilogue      (df->in_epilogue)
 #define df_alt_open         (df->alt_open)
 #define df_alt_mark         (df->alt_mark)
 #define df_alt_taken        (df->alt_taken)
@@ -1765,6 +1784,15 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
              * `clc` is exactly that pair.
              */
             d->writes[i].supplies_value |= supplies_value;
+            /*
+             * STICKY THE OTHER WAY (see InsnDataflowWrite::epilogue_only):
+             * one op before the epilogue is enough to make the write the
+             * instruction's own, so the bit survives only while EVERY op
+             * that wrote this register was the epilogue's.
+             */
+            if (!df_in_epilogue) {
+                d->writes[i].epilogue_only = 0;
+            }
             df_or(d->writes[i].prov, prov);
             return;
         }
@@ -1775,6 +1803,7 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
     }
     d->writes[d->n_writes].reg = (uint8_t)reg;
     d->writes[d->n_writes].supplies_value = supplies_value;
+    d->writes[d->n_writes].epilogue_only = df_in_epilogue ? 1 : 0;
     memcpy(d->writes[d->n_writes].prov, prov, sizeof(d->writes[0].prov));
     d->n_writes++;
 }
@@ -2065,6 +2094,13 @@ void insn_dataflow_note_reset(void)
     df_n_memop = 0;
     df_memop_overflow = false;
     df_memop_ovf_anchor = NULL;
+    /*
+     * The epilogue belonged to THIS block.  Cleared after consuming so a
+     * recycled TCGOp address in the next block cannot be matched against a
+     * stale anchor -- the same reason the note arrays are reset here.
+     */
+    df_epilogue_anchor = NULL;
+    df_in_epilogue = false;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;
@@ -2959,9 +2995,29 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         df_carrier[i].defined_here = false;
     }
 
+    /*
+     * The block's epilogue starts after @epilogue_anchor, and only the LAST
+     * instruction of a block can contain it -- every earlier instruction's
+     * range ends before ops->tb_stop() ran.  Starting false and flipping
+     * once, rather than testing every op against the anchor, is the same
+     * discipline the note cursors run under.
+     */
+    df_in_epilogue = false;
+
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
         unsigned nb_oargs, nb_iargs, idx;
+
+        /*
+         * STRICTLY AFTER: the anchor is the last op that existed when the
+         * translator was about to call ops->tb_stop(), so the anchor itself
+         * is the instruction's and everything past it is the epilogue's.
+         * Tested here rather than at the bottom because the loop body has
+         * several `continue`s and one of them would skip the flip.
+         */
+        if (df_epilogue_anchor != NULL && prev_op == df_epilogue_anchor) {
+            df_in_epilogue = true;
+        }
         bool store;
         uint32_t size;
         int ld_field_bit = -1;
@@ -4416,6 +4472,22 @@ const void *insn_dataflow_mark(void)
     return QTAILQ_LAST(&tcg_ctx->ops);
 }
 
+void insn_dataflow_note_block_epilogue(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    /*
+     * The last op that exists right now.  NULL is legitimate and means the
+     * block emitted nothing before its epilogue, which no target does but
+     * which costs nothing to allow: df_insn()'s test is `prev_op == anchor`
+     * and prev_op is NULL only before the first op, so a NULL anchor simply
+     * never matches and no write is marked.
+     */
+    df_epilogue_anchor = QTAILQ_LAST(&tcg_ctx->ops);
+}
+
 void insn_dataflow_note_zero_reg(const void *ts)
 {
     const TCGOp *anchor;
@@ -5477,6 +5549,12 @@ void insn_dataflow_extract(unsigned num_insns)
     df_n_memop = 0;
     df_memop_overflow = false;
     df_memop_ovf_anchor = NULL;
+    /*
+     * The epilogue anchor belonged to THIS block, for the same reason: a
+     * recycled TCGOp address in the next block must not match a stale one.
+     */
+    df_epilogue_anchor = NULL;
+    df_in_epilogue = false;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;

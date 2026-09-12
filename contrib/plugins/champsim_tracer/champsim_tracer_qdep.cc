@@ -1034,6 +1034,16 @@ std::atomic<uint64_t> g_pcsep_agree{0};
 std::atomic<uint64_t> g_pcsep_qemu_only{0};
 std::atomic<uint64_t> g_pcsep_wire_only{0};
 GHashTable *g_pcsep_sig = nullptr;   /* "WHO  decode_name  ctrl" -> count */
+/*
+ * AND THE SECOND CANDIDATE, scored against the same wire answer: the
+ * translation block's EPILOGUE (QDepInsn::dst_epilogue_only).  Same three
+ * cells, same population, so the two candidates are directly comparable and
+ * the choice between them is a reading rather than an argument.
+ */
+std::atomic<uint64_t> g_episep_agree{0};
+std::atomic<uint64_t> g_episep_epi_only{0};
+std::atomic<uint64_t> g_episep_wire_only{0};
+GHashTable *g_episep_sig = nullptr;
 /* The lowered registers this target has: generic name -> global count. */
 GHashTable *g_lowered_reg = nullptr;
 /*
@@ -2386,6 +2396,30 @@ static bool dst_row_seated(const QDepInsn *q, const InsnFields *f, uint8_t k)
             break;
         }
     }
+    /*
+     * THE EPILOGUE CANDIDATE.  A REG_PC write every one of whose QEMU rows
+     * was the epilogue's is the BLOCK's pc write charged to whichever
+     * instruction the block ended on; anything else the instruction emitted
+     * itself.  Scored, not taken -- the same discipline as by_qemu above.
+     */
+    bool by_epi = !q->dst_epilogue_only[k];
+
+    if (by_epi == by_wire) {
+        g_episep_agree.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        char sig[224];
+
+        if (by_epi) {
+            g_episep_epi_only.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_episep_wire_only.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_snprintf(sig, sizeof(sig), "%-7s %-16s",
+                   by_epi ? "EPI" : "WIRE",
+                   q->decode_name ? q->decode_name : "-");
+        tally(&g_episep_sig, sig);
+    }
+
     if (by_qemu == by_wire) {
         g_pcsep_agree.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -3023,12 +3057,20 @@ static void note_dst_build(const struct qemu_plugin_tb *tb, size_t idx,
                 break;
             }
         }
-        if (k == out->n_dst) {
-            if (out->n_dst >= QDEP_MAX_DST) {
-                out->dst_state = QDEP_R_WIDE;
-                return;
+        {
+            bool epi = qemu_plugin_insn_write_epilogue_only(tb, idx, r);
+
+            if (k == out->n_dst) {
+                if (out->n_dst >= QDEP_MAX_DST) {
+                    out->dst_state = QDEP_R_WIDE;
+                    return;
+                }
+                out->dst_epilogue_only[out->n_dst] = epi ? 1 : 0;
+                out->dst_reg[out->n_dst++] = gen;
+            } else if (!epi) {
+                /* AND across the rows that fold into one generic name. */
+                out->dst_epilogue_only[k] = 0;
             }
-            out->dst_reg[out->n_dst++] = gen;
         }
         for (uint8_t z = 0; z < sn; z++) {
             if (!add_reg(out->dst_dep_regs[k], &out->n_dst_dep_regs[k],
@@ -7446,6 +7488,20 @@ void qdep_report(GString *report)
         g_pcsep_wire_only.load(std::memory_order_relaxed));
     dump_tally(report, g_pcsep_sig,
                "R10.1 separation disagreements, by which side said TRANSFER,\nQEMU's decode name and the raw QEMU_PLUGIN_CTRL_* flags:");
+    g_string_append_printf(report,
+        "\nThe SECOND candidate for the same separation: the translation"
+        " block's\nEPILOGUE (qemu_plugin_insn_write_epilogue_only()), scored"
+        " over the same\npopulation so the two readings are comparable:\n"
+        "  %10" G_GUINT64_FORMAT "  AGREE      -- both answers the same\n"
+        "  %10" G_GUINT64_FORMAT "  EPI-only   -- the instruction emitted a pc"
+        " write, wire had no slot\n"
+        "  %10" G_GUINT64_FORMAT "  WIRE-only  -- wire carried REG_PC, every"
+        " QEMU row was the epilogue's\n",
+        g_episep_agree.load(std::memory_order_relaxed),
+        g_episep_epi_only.load(std::memory_order_relaxed),
+        g_episep_wire_only.load(std::memory_order_relaxed));
+    dump_tally(report, g_episep_sig,
+               "epilogue-separation disagreements, by which side said the\ninstruction wrote pc, and QEMU's decode name:");
     dump_tally(report, g_dst_unmapped_name,
                "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
     dump_tally(report, g_field_unnamed,

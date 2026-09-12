@@ -710,6 +710,21 @@ struct QDepInsn {
      * of them.
      */
     int8_t fpr_value_shift[8];
+    /*
+     * EVERY QEMU WRITE ROW THAT FOLDED INTO THIS DESTINATION WAS THE
+     * TRANSLATION BLOCK'S EPILOGUE'S -- qemu_plugin_insn_write_epilogue_only()
+     * for each, ANDed, because one row the instruction emitted itself makes
+     * the destination the instruction's.
+     *
+     * This is the QEMU-side statement R10.1's separation needs and the
+     * ctrl-flags candidate could not give (see dst_row_seated()): the ops
+     * ops->tb_stop() emits land inside the last instruction's extraction
+     * window, so a page-final `mov` arrives here carrying a REG_PC write
+     * that is the block epilogue's and not the instruction's.  Position,
+     * not ownership -- see the field's own header in insn-dataflow.h for the
+     * delay-slot case it does NOT answer.
+     */
+    uint8_t dst_epilogue_only[QDEP_MAX_DST];
     uint8_t n_dst_dep_regs[QDEP_MAX_DST];
     uint8_t dst_dep_regs[QDEP_MAX_DST][QDEP_MAX_ADDR_REGS];
     uint64_t dst_dep_load_slots[QDEP_MAX_DST]; /* by LOAD ordinal; see

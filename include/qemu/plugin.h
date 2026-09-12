@@ -277,6 +277,14 @@ struct qemu_plugin_tb {
      * See ctrl_borrow_first in struct qemu_plugin_insn.
      */
     struct qemu_plugin_insn *ctrl_deferrer;
+    /*
+     * @ctrl_deferrer's index in this block, taken when the deferral was
+     * stated.  The dataflow extraction keys on the index rather than on the
+     * pointer because its per-instruction records are an array in the same
+     * order; see insn_dataflow_note_borrow_begin().  Meaningless while
+     * @ctrl_deferrer is NULL.
+     */
+    unsigned ctrl_deferrer_idx;
 
     /* if set, the TB calls helpers that might access guest memory */
     bool mem_helper;

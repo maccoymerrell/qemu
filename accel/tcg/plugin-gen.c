@@ -29,6 +29,7 @@
 #include "exec/exec-all.h"
 #include "exec/plugin-gen.h"
 #include "exec/insn-ctrl.h"
+#include "exec/insn-dataflow.h"
 #include "exec/translator.h"
 
 enum plugin_gen_from {
@@ -570,6 +571,13 @@ void plugin_gen_record_ctrl_deferred(void)
     insn->ctrl_deferred = true;
     if (!ptb->ctrl_deferrer) {
         ptb->ctrl_deferrer = insn;
+        /*
+         * ptb->n is the 1-based count of instructions started in this block
+         * and this one is the newest, so its index is n - 1.  Taken here
+         * rather than searched for at resume time because ptb->insns is
+         * REUSED across translations and a search would match a stale entry.
+         */
+        ptb->ctrl_deferrer_idx = ptb->n ? ptb->n - 1 : 0;
     }
 }
 
@@ -606,6 +614,12 @@ void plugin_gen_record_ctrl_resume(void)
     if (ptb->ctrl_deferrer && ptb->ctrl_deferrer != insn) {
         ptb->ctrl_deferrer->ctrl_borrow_first = here;
         ptb->ctrl_deferrer->ctrl_borrow_lender = insn;
+        /*
+         * And the same statement to the dataflow extraction, which keeps its
+         * own copy: it runs whether or not a plugin is loaded and cannot
+         * read this struct.  See insn_dataflow_note_borrow_begin().
+         */
+        insn_dataflow_note_borrow_begin(ptb->ctrl_deferrer_idx);
         /*
          * The end is taken in plugin_gen_insn_end(), for the same reason the
          * own-range end is: at that instant the tail is the last op the
@@ -696,6 +710,7 @@ void plugin_gen_insn_end(void)
     if (ptb && ptb->ctrl_deferrer && ptb->ctrl_deferrer->ctrl_borrow_first &&
         !ptb->ctrl_deferrer->ctrl_borrow_last) {
         ptb->ctrl_deferrer->ctrl_borrow_last = QTAILQ_LAST(&tcg_ctx->ops);
+        insn_dataflow_note_borrow_end();
         ptb->ctrl_deferrer = NULL;
     } else if (!pinsn->ctrl_last_pinned) {
         pinsn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);

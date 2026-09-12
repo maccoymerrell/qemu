@@ -1700,6 +1700,33 @@ void insn_dataflow_note_stated_write_name_shift(const char *reg,
 void insn_dataflow_note_block_epilogue(void);
 
 /*
+ * THE OPS FROM HERE BELONG TO AN EARLIER INSTRUCTION.
+ *
+ * Called by plugin-gen at the two instants the translator states a deferred
+ * control transfer's ownership -- the same two that fill
+ * ctrl_borrow_first/_last in struct qemu_plugin_insn.  On a delay-slot
+ * target, a branch's transfer is emitted by gen_branch() at the END of the
+ * SLOT's translate_insn(), so those ops lie in the slot's extraction window
+ * and POSITION CANNOT SAY WHOSE THEY ARE.
+ *
+ * @lender is the owning instruction's index in the block, which is the index
+ * of its InsnDataflow: both are the translator's own order.  Everything
+ * emitted strictly after the _begin call, through the op current at the _end
+ * call, is recorded against THAT instruction -- its reads as well as its
+ * writes, because a MIPS branch reads its target register at the branch.
+ *
+ * Without it the block's pc write lands on a `sll`/`nop` delay slot, which
+ * is the 215-slot population R10.1 adjudicated an ARTIFACT, while the branch
+ * that performed the transfer states no write at all.
+ *
+ * Capture only; no op is emitted, altered or suppressed.  A second _begin
+ * before its _end is refused rather than re-pointed, and both are reset by
+ * insn_dataflow_extract().
+ */
+void insn_dataflow_note_borrow_begin(unsigned lender);
+void insn_dataflow_note_borrow_end(void);
+
+/*
  * THE TRANSLATOR'S OWN WORD THAT WHAT IT EMITTED IS NOT THE INSTRUCTION.
  *
  * Called from the site that made the decision -- the failing arm of a
@@ -2294,6 +2321,12 @@ static inline unsigned insn_dataflow_memop_mark(void)
 { return 0; }
 
 static inline void insn_dataflow_note_block_epilogue(void)
+{ }
+
+static inline void insn_dataflow_note_borrow_begin(unsigned lender)
+{ }
+
+static inline void insn_dataflow_note_borrow_end(void)
 { }
 
 static inline void insn_dataflow_note_path_alt(unsigned mark)

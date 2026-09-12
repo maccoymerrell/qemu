@@ -186,6 +186,18 @@
  * than one register that way.
  */
 #define DF_MAX_CARRIER_NOTES  4
+/*
+ * BORROWED OP RANGES (insn_dataflow_note_borrow_begin/_end).  One per
+ * deferred control transfer a block contains: the translator emits the ops
+ * during a LATER instruction and states, at the emission site, which
+ * instruction they belong to.  A delay-slot target's block ends at its
+ * branch, so one is the whole of what MIPS produces; eight is room for a
+ * target that defers more than once per block, and past the cap the notes
+ * stop and the ops stay with the instruction whose range they lie in -- the
+ * behaviour this file had before the note existed, counted rather than
+ * silent.
+ */
+#define DF_MAX_BORROW_NOTES   8
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -462,6 +474,35 @@ typedef struct DfImmNote {
     uint64_t value;
     uint8_t role;
 } DfImmNote;
+
+/*
+ * ONE INSTRUCTION'S OPS, EMITTED WHILE A LATER ONE WAS BEING TRANSLATED.
+ *
+ * A delay-slot target leaves a branch's transfer to gen_branch(), which runs
+ * at the END of the SLOT's translate_insn().  Those ops therefore lie inside
+ * the slot's extraction window and POSITION CANNOT SAY WHOSE THEY ARE -- the
+ * fact belongs to the translator, and the translator states it: it calls
+ * plugin_gen_record_ctrl_deferred() on the branch and
+ * plugin_gen_record_ctrl_resume() on the slot, and this note is taken at
+ * those two sites.
+ *
+ * WHY THE DATAFLOW LAYER NEEDS ITS OWN NOTE rather than reading the
+ * ctrl_borrow_first/_last range the control-transfer classification already
+ * keeps: that range lives in struct qemu_plugin_insn, which exists only in a
+ * plugins build, and the extraction here runs whether or not one is loaded.
+ * The anchors are the same two ops and are taken at the same two instants.
+ *
+ * @first is the last op that existed when the borrow opened, so the borrowed
+ * range is the ops STRICTLY AFTER it through @last inclusive -- the same
+ * half-open shape and the same `prev_op == anchor` test the epilogue anchor
+ * uses.  @lender is the borrowing instruction's index in the block, which is
+ * the index of its InsnDataflow: both are the translator's own order.
+ */
+typedef struct DfBorrowNote {
+    const TCGOp *first;
+    const TCGOp *last;
+    unsigned     lender;
+} DfBorrowNote;
 
 /*
  * CP-M, the preserve-read half: one READ of a guest register that an emitter
@@ -866,6 +907,16 @@ struct InsnDataflowScratch {
     bool imm_overflow;
 
     /*
+     * The op ranges one instruction emitted on another's behalf.  See
+     * DfBorrowNote.  @borrow_open is the note still waiting for its end
+     * anchor, as an index, or DF_MAX_BORROW_NOTES when none is.
+     */
+    DfBorrowNote borrow[DF_MAX_BORROW_NOTES];
+    unsigned n_borrow;
+    unsigned borrow_open;
+    bool borrow_overflow;
+
+    /*
      * CP-M, the preserve-read half: the (temp, op) pairs a writeback emitter
      * marked as carrying only the bits its write does not reach.
      */
@@ -961,6 +1012,10 @@ static __thread struct InsnDataflowScratch *df;
 #define df_imm              (df->imm)
 #define df_n_imm            (df->n_imm)
 #define df_imm_overflow     (df->imm_overflow)
+#define df_borrow           (df->borrow)
+#define df_n_borrow         (df->n_borrow)
+#define df_borrow_open      (df->borrow_open)
+#define df_borrow_overflow  (df->borrow_overflow)
 #define df_preserve         (df->preserve)
 #define df_n_preserve       (df->n_preserve)
 #define df_preserve_overflow (df->preserve_overflow)
@@ -2123,6 +2178,15 @@ void insn_dataflow_note_reset(void)
     df_encread_overflow = false;
     df_n_imm = 0;
     df_imm_overflow = false;
+    /*
+     * The borrowed ranges belonged to THIS block, for the epilogue anchor's
+     * reason: their anchors are TCGOp addresses and the allocator recycles
+     * them, so a note surviving into the next translation would hand an
+     * unrelated instruction's ops to whatever sat at that index.
+     */
+    df_n_borrow = 0;
+    df_borrow_open = DF_MAX_BORROW_NOTES;
+    df_borrow_overflow = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -2922,12 +2986,31 @@ static void df_carrier_defined(const void *ts)
     }
 }
 
-static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
+static void df_insn(InsnDataflow *d_own, unsigned self_idx,
+                    TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
                     unsigned *zero_cursor, unsigned *imm_cursor,
                     unsigned *disc_cursor, unsigned *encread_cursor)
 {
     TCGContext *s = tcg_ctx;
+    /*
+     * THE RECORD THE OPS ARE WRITTEN TO, which is NOT always the instruction
+     * whose window they lie in.  See DfBorrowNote: a delay-slot target's
+     * branch emits its transfer during the SLOT's translate_insn(), and the
+     * translator named the owner at the emission site.  @d is redirected to
+     * that owner's record for exactly the ops the note bounds and is the
+     * walking instruction's everywhere else, so the SET of facts extracted
+     * is unchanged and only their attribution moves.
+     *
+     * WHY THE WHOLE RECORD AND NOT THE WRITES ALONE.  A MIPS branch reads
+     * its target register at the BRANCH -- the architecture says so, and
+     * include/qemu/plugin.h's ctrl_borrow_first records the same reasoning
+     * for the control-transfer classification -- so the reads in that range
+     * are the branch's for the same reason its pc write is.  Splitting the
+     * two would publish an instruction that writes a register it never read.
+     */
+    InsnDataflow *d = d_own;
+    unsigned in_borrow = DF_MAX_BORROW_NOTES;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
     uint64_t prov[INSN_DF_REG_WORDS];
     TCGOp *prev_op = NULL;
@@ -3017,6 +3100,32 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
          */
         if (df_epilogue_anchor != NULL && prev_op == df_epilogue_anchor) {
             df_in_epilogue = true;
+        }
+        /*
+         * AND THE BORROWED RANGES, on the same anchor discipline and in the
+         * same place for the same reason.  Tested END FIRST so a note is
+         * left before another can be entered; a note whose two anchors are
+         * the SAME op bounds no ops at all and is skipped outright, which is
+         * what stops an empty range from being entered and never left.
+         */
+        if (in_borrow < DF_MAX_BORROW_NOTES) {
+            if (prev_op == df_borrow[in_borrow].last) {
+                in_borrow = DF_MAX_BORROW_NOTES;
+                d = d_own;
+            }
+        }
+        if (in_borrow >= DF_MAX_BORROW_NOTES && prev_op != NULL) {
+            for (unsigned b = 0; b < df_n_borrow; b++) {
+                if (df_borrow[b].first != prev_op ||
+                    df_borrow[b].last == NULL ||
+                    df_borrow[b].last == df_borrow[b].first ||
+                    df_borrow[b].lender >= self_idx) {
+                    continue;
+                }
+                in_borrow = b;
+                d = &df_out[df_borrow[b].lender];
+                break;
+            }
         }
         bool store;
         uint32_t size;
@@ -4488,6 +4597,45 @@ void insn_dataflow_note_block_epilogue(void)
     df_epilogue_anchor = QTAILQ_LAST(&tcg_ctx->ops);
 }
 
+void insn_dataflow_note_borrow_begin(unsigned lender)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    /*
+     * A second open borrow would mean the translator stated two deferrals
+     * without resolving the first, which plugin_gen_record_ctrl_deferred()
+     * refuses in as many words.  Refuse it here too rather than silently
+     * re-pointing the open note: the ops would land on whichever branch was
+     * named last, and attributing them to the WRONG instruction is worse
+     * than attributing them by position.
+     */
+    if (df_borrow_open < DF_MAX_BORROW_NOTES ||
+        df_n_borrow >= DF_MAX_BORROW_NOTES) {
+        df_borrow_overflow = true;
+        return;
+    }
+    df_borrow[df_n_borrow].first = QTAILQ_LAST(&tcg_ctx->ops);
+    df_borrow[df_n_borrow].last = NULL;
+    df_borrow[df_n_borrow].lender = lender;
+    df_borrow_open = df_n_borrow;
+    df_n_borrow++;
+}
+
+void insn_dataflow_note_borrow_end(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_borrow_open >= DF_MAX_BORROW_NOTES) {
+        return;
+    }
+    df_borrow[df_borrow_open].last = QTAILQ_LAST(&tcg_ctx->ops);
+    df_borrow_open = DF_MAX_BORROW_NOTES;
+}
+
 void insn_dataflow_note_zero_reg(const void *ts)
 {
     const TCGOp *anchor;
@@ -5456,8 +5604,8 @@ void insn_dataflow_extract(unsigned num_insns)
             continue;
         }
         if (first != NULL && idx > 0) {
-            df_insn(&df_out[idx - 1], first, op, marker, &memop_cursor,
-                    &zero_cursor, &imm_cursor, &disc_cursor,
+            df_insn(&df_out[idx - 1], idx - 1, first, op, marker,
+                    &memop_cursor, &zero_cursor, &imm_cursor, &disc_cursor,
                     &encread_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
@@ -5475,8 +5623,8 @@ void insn_dataflow_extract(unsigned num_insns)
         first = QTAILQ_NEXT(op, link);
     }
     if (first != NULL && idx > 0) {
-        df_insn(&df_out[idx - 1], first, NULL, marker, &memop_cursor,
-                &zero_cursor, &imm_cursor, &disc_cursor,
+        df_insn(&df_out[idx - 1], idx - 1, first, NULL, marker,
+                &memop_cursor, &zero_cursor, &imm_cursor, &disc_cursor,
                 &encread_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
@@ -5555,6 +5703,10 @@ void insn_dataflow_extract(unsigned num_insns)
      */
     df_epilogue_anchor = NULL;
     df_in_epilogue = false;
+    /* And the borrowed ranges, on the same reasoning. */
+    df_n_borrow = 0;
+    df_borrow_open = DF_MAX_BORROW_NOTES;
+    df_borrow_overflow = false;
     df_alt_open = false;
     df_alt_mark = 0;
     df_alt_taken = 0;

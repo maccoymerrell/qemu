@@ -221,12 +221,43 @@ def classify(op_text, entry):
     ops = lines
     if not ops:
         return "NO-OPS"
-    work = [o for o in ops
-            if not _PCSET.match(o)
-            and not o.startswith("set_label")
-            and not o.startswith("exit_tb")
-            and not _EXCARG.match(o)
-            and not _EXC.search(o)]
+    # OPS AFTER AN UNGUARDED RAISE ARE DEAD, AND COUNTING THEM SCORED A WHOLE
+    # DISABLED ASE AS EXECUTING.
+    #
+    # mipsel `check_dsp()` emits the raise and then KEEPS GENERATING, so on a
+    # model with DSP disabled the block for `extp at,$ac3,0x0` reads
+    #
+    #     mov_i32 PC,$0x400074
+    #     call raise_exception_err,$0x8,$0,env,$0x14,$0x0    <- EXCP_DSPDIS
+    #     mov_i32 loc2,$0x3
+    #     mov_i32 loc3,$0x0
+    #     call extp,$0x0,$1,at,loc2,loc3,env                 <- UNREACHABLE
+    #     set_label $L0
+    #
+    # and a filter that looks at the whole list finds a helper call and says
+    # DATAPATH.  The guest never reaches it: the raise is unconditional and
+    # the only label after it is the TB's own I/O-start join.  Scoring those
+    # ops as work put 7,496 register instances on the REAL side of a bar whose
+    # subject the machine does not execute.
+    #
+    # THE RULE IS NARROW AND KEEPS THE GUARDED CASE LIVE.  A conditional trap
+    # -- mipsel `teq`, an aarch64 alignment check -- reaches its raise through
+    # a brcond and the code that runs instead sits after a `set_label`, so a
+    # label RE-ARMS the walk.  Work BEFORE the raise counts as it always did,
+    # which is what keeps "computes, then traps" reading DATAPATH.
+    work, dead = [], False
+    for o in ops:
+        if _EXC.search(o):
+            dead = True
+            continue
+        if o.startswith("set_label"):
+            dead = False
+            continue
+        if dead:
+            continue
+        if (_PCSET.match(o) or o.startswith("exit_tb") or _EXCARG.match(o)):
+            continue
+        work.append(o)
     if not work and any(_EXC.search(o) for o in ops):
         return "TRAP-ONLY"
     return "DATAPATH"
@@ -329,6 +360,11 @@ def selftest(qemu):
                 probe_one((mq, "mipsel", "24Kf", "21106400", tmp)) == "DATAPATH")
             chk("mipsel mfc0 reads TRAP-ONLY (its PC write is mov_i32 PC)",
                 probe_one((mq, "mipsel", "24Kf", "00000240", tmp)) == "TRAP-ONLY")
+            # `extp at,$ac3,0x0` on a model with the DSP ASE disabled: the
+            # raise is unconditional and the helper call after it is dead.
+            chk("mipsel extp on a no-DSP model reads TRAP-ONLY",
+                probe_one((mq, "mipsel", "24Kf", "b818017c", tmp))
+                == "TRAP-ONLY")
         rq = qemu.replace("qemu-aarch64", "qemu-riscv64")
         if os.path.exists(rq):
             # THE riscv64 ARM.  Its trap control is the one that found the
@@ -393,6 +429,22 @@ def selftest(qemu):
                  " mov_i64 pc,$0x400078\n"
                  " call raise_exception,$0x8,$0,env,$0x2\n", 0x400078)
         == "DATAPATH")
+    chk("classifier: work AFTER an unguarded raise is dead, not datapath",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"
+                 " mov_i32 loc2,$0x3\n"
+                 " call extp,$0x0,$1,at,loc2,loc3,env\n"
+                 " set_label $L0\n exit_tb $0x1\n", 0x400074) == "TRAP-ONLY")
+    chk("classifier: a label after the raise re-arms the walk",
+        classify(" ---- 0000000000400074 0 0\n mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0x14,$0x0\n"
+                 " set_label $L1\n add_i32 loc2,loc3,loc4\n", 0x400074)
+        == "DATAPATH")
+    chk("classifier: work BEFORE the raise still counts",
+        classify(" ---- 0000000000400074 0 0\n add_i32 loc2,loc3,loc4\n"
+                 " mov_i32 PC,$0x400074\n"
+                 " call raise_exception_err,$0x8,$0,env,$0xd,$0x0\n",
+                 0x400074) == "DATAPATH")
     chk("classifier: a block whose entry contributes no ops is NO-OPS",
         classify(" ---- 0000000000400078 0 0\n\n add_i64 x0,x0,x0\n",
                  0x400078) == "NO-OPS")

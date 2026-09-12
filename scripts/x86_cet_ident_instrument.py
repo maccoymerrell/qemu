@@ -308,6 +308,19 @@ def build(path_dec, path_out, report):
     w(' * [0x1e] = X86_OP_ENTRY1(NOP, nop,v). */')
     w('#define CET_IDENT_SLOT %du' % slot)
     w('')
+    # ONE NAME PER ARM, because cet_ident_of()'s return value is consulted
+    # by more than the publish below.  target/i386/tcg/nop_operands.c.inc
+    # states the operands these encodings name, and the three arms do not
+    # name the same ones -- rdssp writes the GPR its ModRM selects, endbr
+    # names nothing -- so that file has to tell the arms apart.  Doing it
+    # by the literal index would put this table's ORDER into another file,
+    # where a new arm inserted above would silently re-point it; doing it
+    # by re-testing mask/value there would duplicate the discrimination
+    # this table exists to own.  A name is neither.
+    w('/* The arm indices cet_ident_of() returns, by name. */')
+    for i, (name, ident, spell, why, mask, value) in enumerate(rows, 1):
+        w('#define CET_IDENT_ARM_%-8s %du' % (spell.upper(), i))
+    w('')
     w('static const struct {')
     w('    uint8_t mask;')
     w('    uint8_t value;')

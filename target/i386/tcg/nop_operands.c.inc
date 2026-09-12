@@ -42,12 +42,36 @@
  *   owns that discrimination, bit for bit, and is asked rather than
  *   re-derived so the two cannot drift.
  *
- *   F3 0F 1E FA / FB (endbr64 / endbr32) and F3 0F 1E /1 mod=3
- *   (rdsspd / rdsspq) -- NOTHING is stated.  endbr names no operand, and
- *   rdssp's ModRM r/m register is its DESTINATION, not a source: stating it
- *   as a read would fabricate a dependency the encoding does not have.
+ *   F3 0F 1E FA / FB (endbr64 / endbr32) -- NOTHING is stated.  endbr
+ *   names no operand at all.
+ *
+ *   F3 0F 1E /1 mod=3 (rdsspd / rdsspq) -- the ModRM r/m register is
+ *   stated as a WRITE and as nothing else.  It is the instruction's
+ *   DESTINATION, so stating it as a read would fabricate a dependency the
+ *   encoding does not have; but leaving it unstated altogether says the
+ *   instruction writes nothing, and RDSSPQ's whole effect is to put the
+ *   shadow-stack pointer INTO the GPR its ModRM names.  Both reference
+ *   decoders that model x86 operand access agree on the same bytes: XED,
+ *   decoding f3480f1ec8 with CET enabled, reports `REG0 EXPLICIT W R=0
+ *   W=1 reg=RAX`, and iced-x86 reports `RAX access=WRITE`.
+ *
+ *   QEMU MODELS NO CET, which is why the encoding lands in the NOP slot
+ *   and generates no store.  That is R15's case exactly -- a lowering
+ *   decision is not architectural truth -- and R16 has already ruled the
+ *   dependency recorded REGARDLESS OF THE MODELLED MACHINE'S CET STATE,
+ *   the same way this file's read side is stated for rows whose address
+ *   nothing ever consumes.  The alternative was a destination survivor
+ *   row keyed on the decode rule, and that cannot be written honestly:
+ *   the rule `decode-new/NOP@f3=1,modrm=11001...` covers all eight r/m
+ *   encodings, so a row naming one register would publish the deriving
+ *   corpus's `%rax` on every `rdsspq %rbx` -- the frozen-operand
+ *   fabrication gen_src_survivors.py's REFUSAL 6 exists to refuse.  The
+ *   register is an ENCODED OPERAND, and the decode site is the one place
+ *   that still has the encoding in hand.
+ *
  *   cet_ident_of() already separates those three arms from the reserved NOP
- *   they share a row with, and is asked here for the same reason.
+ *   they share a row with, and is asked here rather than re-derived so the
+ *   two cannot drift.
  *
  * A MEMORY OPERAND IS ITS ADDRESS REGISTERS.  For mod!=3 the registers the
  * encoding names are the base and the index; the instruction depends on
@@ -79,20 +103,27 @@ static void nop_operands_note_gpr(int reg)
                                        sizeof(((CPUX86State *)0)->regs[reg]));
 }
 
+/*
+ * The write twin, for rdssp's destination.  The whole 64-bit register is the
+ * range in both operand sizes: RDSSPD writes a 32-bit GPR, and a 32-bit GPR
+ * write zero-extends into the full register, so the bytes that change are
+ * the same eight either way.
+ */
+static void nop_operands_note_gpr_write(int reg)
+{
+    if (reg < 0 || reg >= CPU_NB_REGS) {
+        return;
+    }
+    insn_dataflow_note_stated_write_env(offsetof(CPUX86State, regs[reg]),
+                                        sizeof(((CPUX86State *)0)->regs[reg]));
+}
+
 static void nop_operands_note(DisasContext *s, X86DecodedInsn *decode)
 {
     const X86DecodedOp *rm;
+    uint16_t cet;
 
     if (!decode->e.encoded_operands) {
-        return;
-    }
-
-    /*
-     * The three CET arms share this row and do not share its operands; see
-     * the header comment.  Nothing is stated for them here.
-     */
-    if (cet_ident_of(decode->e.slot, (s->prefix & PREFIX_REPZ) != 0,
-                     s->modrm)) {
         return;
     }
 
@@ -102,6 +133,29 @@ static void nop_operands_note(DisasContext *s, X86DecodedInsn *decode)
      * X86_OP_ENTRYr and leave op[0] absent.
      */
     rm = decode->e.op0 != X86_TYPE_None ? &decode->op[0] : &decode->op[1];
+
+    /*
+     * The three CET arms share this row and do not share its operands; see
+     * the header comment.  rdssp states its destination and no read at all;
+     * the two endbr arms state nothing.
+     */
+    cet = cet_ident_of(decode->e.slot, (s->prefix & PREFIX_REPZ) != 0,
+                       s->modrm);
+    if (cet) {
+        if (cet == CET_IDENT_ARM_RDSSP) {
+            /*
+             * mod == 3 is part of the arm's own mask, so the r/m operand is
+             * a register and has_ea is false.  Guarded anyway: a note taken
+             * off an address-form operand would name the BASE register as
+             * the destination, and being wrong here writes a register into
+             * a consumer's destination list.
+             */
+            if (!rm->has_ea) {
+                nop_operands_note_gpr_write(rm->n);
+            }
+        }
+        return;
+    }
 
     if (rm->has_ea) {
         nop_operands_note_gpr(decode->mem.base);

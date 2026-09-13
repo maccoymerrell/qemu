@@ -5812,6 +5812,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      * qemu_plugin_dataflow_status::translation_refused.
      */
     out->x_refused        = st.translation_refused;
+    out->x_atomic         = st.atomic;
 
     /*
      * memops_unnoted is the one that matters most here and it is checked

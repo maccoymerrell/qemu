@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 16
+#define QEMU_PLUGIN_DATAFLOW_VERSION 17
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -1034,6 +1034,25 @@ typedef struct qemu_plugin_dataflow_status {
      * different fact from "nothing was refused".
      */
     uint8_t  translation_refused;
+    /*
+     * THE DECODER SAID THIS INSTRUCTION'S READ-MODIFY-WRITE IS ATOMIC.
+     *
+     * Stated at the decoder arm that adjudicated it -- on x86 the locked
+     * generation path, reached only after the decoder has thrown #UD for a
+     * LOCK prefix the encoding does not accept.
+     *
+     * A CONSUMER MUST NOT DERIVE THIS FROM THE OPS, and the reason is that
+     * the ops do not carry it: TCG lowers an atomic read-modify-write to an
+     * atomic helper only under CF_PARALLEL, and otherwise to a plain load, a
+     * modify and a plain store -- so on a single-threaded run, which is what
+     * most user-mode tracing is, `lock xadd` and `xadd` emit the same op
+     * stream.  The flag is about the ARCHITECTURE's guarantee, which holds
+     * whichever way this particular translation lowered it.
+     *
+     * A 0 means nobody said so.  On a target that states nothing here every
+     * row reads 0, and that is a different fact from "nothing was atomic".
+     */
+    uint8_t  atomic;
 } qemu_plugin_dataflow_status;
 
 /*

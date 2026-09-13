@@ -948,6 +948,18 @@ typedef struct InsnDataflow {
     uint8_t  translation_refused;
 
     /*
+     * THE TRANSLATOR'S OWN WORD THAT THIS ACCESS IS ARCHITECTURALLY ATOMIC.
+     *
+     * Set by insn_dataflow_note_atomic() at the decoder site that adjudicated
+     * it.  See that function for why the op stream cannot answer this and the
+     * decoder must.
+     *
+     * A 0 means "nobody said so", which on a target that never calls the note
+     * is every instruction.  It is not a claim that the access is not atomic.
+     */
+    uint8_t  atomic_stated;
+
+    /*
      * How many reads this instruction folded onto a REPRESENTATION CARRIER's
      * register.  See insn_dataflow_note_repr_carrier().  Saturating, and
      * present so the rule's zero is a measurement rather than an assumption:
@@ -1879,6 +1891,39 @@ void insn_dataflow_note_borrow_end(void);
 void insn_dataflow_note_translation_refused(void);
 
 /*
+ * THE TRANSLATOR'S OWN WORD THAT THIS INSTRUCTION'S ACCESS IS ATOMIC.
+ *
+ * Called from the decoder arm that ADJUDICATED the atomicity -- x86's
+ * locked-generation path, taken only after the decoder has thrown #UD for a
+ * LOCK prefix the encoding does not accept -- it sets @atomic_stated on the
+ * instruction being translated.
+ *
+ * WHY THE OP STREAM CANNOT ANSWER THIS, and why that is the whole reason the
+ * note exists.  TCG lowers an atomic RMW two ways, and which one it picks is
+ * a property of the RUN and not of the instruction: with CF_PARALLEL it calls
+ * an atomic helper, and without it -- a single-threaded user-mode run, which
+ * is most of what a tracer sees -- tcg_gen_atomic_* falls straight through to
+ * do_nonatomic_op_*, a plain load, a modify and a plain store.  A reader
+ * walking ops therefore sees `lock xadd` and `xadd` emit the same thing, and
+ * a consumer deriving atomicity from the ops would publish "not atomic" for
+ * an instruction the architecture defines as atomic, on exactly the runs a
+ * single-threaded trace is taken from.  The decoder is the only party that
+ * knows, so the decoder says it.
+ *
+ * IT IS ABOUT THE ARCHITECTURE, NOT THE LOWERING.  A consumer reads it as
+ * "the ISA defines this instruction's read-modify-write as indivisible",
+ * which is true of a LOCK-prefixed x86 RMW whichever way TCG lowered it.
+ *
+ * ANCHORED, on the same discipline as the refusal above: it records the op
+ * its emitter had last produced, and the walk resolves it only inside the
+ * instruction whose op range reached it, so one instruction's statement
+ * cannot answer for the next one's.  Stating it twice is one fact.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_atomic(void);
+
+/*
  * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
  * encoding names, as it becomes a TCG value.
  *
@@ -2521,6 +2566,9 @@ static inline void insn_dataflow_note_stated_write_name_shift(const char *reg,
 { }
 
 static inline void insn_dataflow_note_translation_refused(void)
+{ }
+
+static inline void insn_dataflow_note_atomic(void)
 { }
 
 

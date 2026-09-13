@@ -3160,6 +3160,25 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_lea_modrm(s, &decode);
     }
     if (s->prefix & PREFIX_LOCK) {
+        /*
+         * THE ATOMICITY, STATED WHERE IT WAS ADJUDICATED.
+         *
+         * This arm is reached only after the decoder has thrown #UD for a
+         * LOCK prefix the encoding does not accept (the `!accept_lock` test
+         * above), so reaching it IS the decision that this instruction's
+         * read-modify-write is architecturally indivisible.
+         *
+         * Nothing downstream can recover it.  What this arm emits depends on
+         * CF_PARALLEL: with it, tcg_gen_atomic_* calls an atomic helper;
+         * without it -- a single-threaded user-mode run, which is most of
+         * what a tracer sees -- the same call falls through to
+         * do_nonatomic_op_*, a plain load, a modify and a plain store.  So
+         * the op stream for `lock xadd` and for `xadd` is the SAME on those
+         * runs, and a consumer deriving atomicity from ops would publish
+         * "not atomic" for an instruction the architecture defines as
+         * atomic.  See insn_dataflow_note_atomic().
+         */
+        insn_dataflow_note_atomic();
         assert(decode.op[0].has_ea && !decode.op[2].has_ea);
         gen_load(s, &decode, 2, s->T1);
         decode.e.gen(s, &decode);

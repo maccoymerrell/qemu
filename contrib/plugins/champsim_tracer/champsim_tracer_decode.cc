@@ -1492,7 +1492,30 @@ void decode_detail_to_generic(uint64_t pc,
     const InsnClassification *cls =
         classify_insn_id(info, &out->opcode, &out->branch_type, &flags);
 
-    if (info->has_lock || (flags & MF_ATOMIC)) {
+    /*
+     * ATOMICITY, FROM THE TWO PLACES THE ARCHITECTURE PUTS IT.
+     *
+     * MF_ATOMIC is the classification's flag, and it covers every family
+     * whose indivisibility is in the OPCODE -- aarch64 LDADD/SWP/CAS,
+     * RISC-V's AMO/LR/SC, MIPS' LL/SC.  The row is selected by QEMU's own
+     * decode identity, so that half needs no second opinion.
+     *
+     * The other half is the family where atomicity is in a PREFIX and the
+     * same mnemonic without it is not atomic: x86's LOCK.  That was
+     * `info->has_lock`, the prefix byte as Capstone reported it, and it is
+     * now QEMU's -- stated at the decoder arm that adjudicated the lock,
+     * after #UD has already been thrown for an encoding that does not accept
+     * one.  It is the better fact and not merely the allowed one, because
+     * the arm that states it is the arm that DECIDED, whereas the ops it
+     * goes on to emit do not carry the answer at all: without CF_PARALLEL
+     * TCG lowers an atomic RMW to a plain load-modify-store, so on a
+     * single-threaded run `lock xadd` and `xadd` emit the same ops.
+     *
+     * Without @q there is no statement and no promotion: the prefix-derived
+     * claim is exactly what this replaces, so a caller with no QEMU
+     * statement gets the opcode half only.
+     */
+    if ((q && q->x_atomic) || (flags & MF_ATOMIC)) {
         out->is_atomic = true;
     }
 

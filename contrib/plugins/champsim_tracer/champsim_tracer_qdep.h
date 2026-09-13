@@ -1004,6 +1004,23 @@ struct QDepInsn {
      */
     uint8_t x_refused;
     /*
+     * QEMU'S OWN WORD THAT THIS INSTRUCTION'S READ-MODIFY-WRITE IS ATOMIC,
+     * stated at the decoder arm that adjudicated it and read here beside the
+     * rest of the translation's shape.
+     *
+     * WIRE-BEARING, unlike its neighbours above: it is the source of
+     * InsnFields::is_atomic, which the format publishes.  It replaced the
+     * boundary's x86 LOCK-prefix flag, and it is the better fact for a reason
+     * the ops cannot express -- see qemu_plugin_dataflow_status::atomic.
+     *
+     * 0 means NOT STATED.  The per-ISA classification's MF_ATOMIC flag is the
+     * other half and covers the families whose atomicity is in the OPCODE
+     * (aarch64 LDADD/SWP/CAS, RISC-V AMO/LR/SC, MIPS LL/SC); this covers the
+     * one family where it is in a PREFIX and the same mnemonic without it is
+     * not atomic.
+     */
+    uint8_t x_atomic;
+    /*
      * QEMU'S OWN WORD ON WHETHER THIS INSTRUCTION PERFORMED A CONTROL
      * TRANSFER -- qemu_plugin_insn_ctrl_flags(), read at translation time,
      * stored raw.

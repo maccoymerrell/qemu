@@ -350,6 +350,14 @@ typedef struct DfEncReadNote {
      */
     uint8_t refused;
     /*
+     * THE ATOMICITY STATEMENT, and it is here for the same one property the
+     * refusal is: the anchor window that keeps one instruction's statements
+     * apart from the next one's.  Every other field is zero for it, and like
+     * the refusal it contributes nothing to any register list -- it is a fact
+     * ABOUT the access, not a name of something the access touched.
+     */
+    uint8_t atomic;
+    /*
      * THE DIRECTION of the NAME and RANGE forms.  Zero for every read form
      * and for the refusal, one for insn_dataflow_note_stated_write_env() and
      * insn_dataflow_note_stated_write_name().
@@ -4285,6 +4293,15 @@ static void df_insn(InsnDataflow *d_own, unsigned self_idx,
              * instruction that genuinely reads and writes nothing.
              */
             d->translation_refused = 1;
+        } else if (df_encread[i].atomic) {
+            /*
+             * Not a register statement either: the decoder's own word that
+             * this instruction's read-modify-write is architecturally
+             * indivisible.  It contributes nothing to any list for the same
+             * reason -- it is a fact about the ACCESS, and the registers the
+             * access touches are stated by the ordinary forms beside it.
+             */
+            d->atomic_stated = 1;
         } else if (df_encread[i].name) {
             /*
              * A register with no global and no env range: its NAME is its
@@ -5168,6 +5185,7 @@ static void df_note_encread(const void *src_ts, bool zero)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 0;
     df_encread[df_n_encread].write = 0;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
@@ -5233,6 +5251,7 @@ void insn_dataflow_note_stated_read_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].env_size = size;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 0;
     df_encread[df_n_encread].write = 0;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
@@ -5273,6 +5292,53 @@ void insn_dataflow_note_translation_refused(void)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 1;
+    df_encread[df_n_encread].atomic = 0;
+    df_encread[df_n_encread].write = 0;
+    df_encread[df_n_encread].value_shift = 0;
+    df_n_encread++;
+}
+
+/*
+ * THE TRANSLATOR'S OWN WORD THAT THIS INSTRUCTION'S ACCESS IS ATOMIC.
+ *
+ * See insn_dataflow_note_atomic() in the header for what the statement means
+ * and, more to the point, why no reader of the OPS can derive it: TCG lowers
+ * an atomic RMW to a helper only under CF_PARALLEL, and falls through to a
+ * plain load-modify-store otherwise, so the op stream a single-threaded run
+ * produces for `lock xadd` is the op stream `xadd` produces.
+ *
+ * It rides df_encread[]'s storage for the single property it needs -- the
+ * per-instruction anchor window -- and sets no register field, so the
+ * resolver picks it out beside the refusal and the register forms are
+ * untouched.
+ */
+void insn_dataflow_note_atomic(void)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_encread >= DF_MAX_ENCREAD_NOTES) {
+        df_encread_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_encread; i-- > 0; ) {
+        if (df_encread[i].atomic && df_encread[i].anchor == anchor) {
+            return;                 /* the same statement twice */
+        }
+        break;
+    }
+    df_encread[df_n_encread].src_ts = NULL;
+    df_encread[df_n_encread].anchor = anchor;
+    df_encread[df_n_encread].zero = 0;
+    df_encread[df_n_encread].env_off = 0;
+    df_encread[df_n_encread].env_size = 0;
+    df_encread[df_n_encread].name = NULL;
+    df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 1;
     df_encread[df_n_encread].write = 0;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
@@ -5326,6 +5392,7 @@ void insn_dataflow_note_stated_read_name(const char *reg)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = reg;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 0;
     df_encread[df_n_encread].write = 0;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
@@ -5376,6 +5443,7 @@ void insn_dataflow_note_stated_write_env(uint32_t off, uint32_t size)
     df_encread[df_n_encread].env_size = size;
     df_encread[df_n_encread].name = NULL;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 0;
     df_encread[df_n_encread].write = 1;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;
@@ -5418,6 +5486,7 @@ void insn_dataflow_note_stated_write_name(const char *reg)
     df_encread[df_n_encread].env_size = 0;
     df_encread[df_n_encread].name = reg;
     df_encread[df_n_encread].refused = 0;
+    df_encread[df_n_encread].atomic = 0;
     df_encread[df_n_encread].write = 1;
     df_encread[df_n_encread].value_shift = 0;
     df_n_encread++;

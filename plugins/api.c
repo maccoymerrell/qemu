@@ -873,6 +873,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.read_list_truncated = d->rd_ord_overflow;
     st.write_list_truncated = d->wr_ord_overflow;
     st.translation_refused = d->translation_refused;
+    st.atomic = d->atomic_stated;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

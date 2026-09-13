@@ -1280,6 +1280,53 @@ struct Stats {
     uint64_t unknown_insn_warnings = 0;
 
     /*
+     * CP-V COVERAGE -- how far QEMU's own vector-shape statement reaches
+     * across the instructions whose wire record carries a LANE LAYOUT.
+     *
+     * The lane layout is the last wire field still taken from Capstone's
+     * per-operand arrangement specifier (`qemu_plugin_operand::lane_bytes`
+     * and the element count derived from it).  QEMU states the same fact at
+     * its gvec expanders -- `insn_dataflow_note_vec_shape()`, the element
+     * size and the operation's byte length as the constructor received them
+     * -- and these rows say, per instruction the tracer gave lanes to,
+     * whether that statement was there and whether it AGREED.
+     *
+     * WHAT EACH ROW IS FOR, because the flip cannot be costed from one
+     * number:
+     *
+     *   @vecshape_subject   instructions the tracer published a lane layout
+     *                       for at all.  The denominator; a zero here makes
+     *                       every other row in this group vacuous and must
+     *                       be read that way rather than as agreement.
+     *   @vecshape_qemu_none of those, the ones QEMU stated NO shape for --
+     *                       the coverage hole, and the exact set a flip
+     *                       would have to refuse or lose.  A vector family
+     *                       lowered through a helper rather than through the
+     *                       gvec expanders lands here.
+     *   @vecshape_agree     QEMU stated a shape and its element size is the
+     *                       one the wire carries.
+     *   @vecshape_differ    QEMU stated a shape and its element size is NOT
+     *                       the one the wire carries.  Not automatically a
+     *                       defect on either side: a widening operation
+     *                       reads at one element size and writes at another,
+     *                       which is what @vecshape_mixed separates.
+     *   @vecshape_mixed     of the stated ones, those whose own expander
+     *                       calls disagreed about the element size.  A
+     *                       consumer needing a per-operand width must refuse
+     *                       these, so they are counted apart from @differ
+     *                       rather than folded into it.
+     *
+     * Capture only at this tip: nothing on the wire reads these, and the
+     * lane layout the trace publishes is unchanged.  They exist so that the
+     * flip is costed before it is made.
+     */
+    uint64_t vecshape_subject = 0;
+    uint64_t vecshape_qemu_none = 0;
+    uint64_t vecshape_agree = 0;
+    uint64_t vecshape_differ = 0;
+    uint64_t vecshape_mixed = 0;
+
+    /*
      * INVARIANT, not a measurement.  A register the wire publishes as a
      * FIELD of a wider one (RISC-V fflags/frm inside fcsr, vxsat/vxrm
      * inside vcsr) has its VALUE read from the container, so REG_FCSR's

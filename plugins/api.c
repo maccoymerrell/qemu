@@ -537,6 +537,30 @@ bool qemu_plugin_insn_write_supplies_value(const struct qemu_plugin_tb *tb,
     return false;
 }
 
+bool qemu_plugin_insn_vec_shape(const struct qemu_plugin_tb *tb, size_t idx,
+                                unsigned *lane_bytes, uint32_t *oprsz,
+                                bool *mixed, unsigned *n_stated)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_complete(d) || !d->vec_stated) {
+        return false;
+    }
+    if (lane_bytes) {
+        *lane_bytes = d->vec_lane_bytes;
+    }
+    if (oprsz) {
+        *oprsz = d->vec_oprsz;
+    }
+    if (mixed) {
+        *mixed = d->vec_mixed != 0;
+    }
+    if (n_stated) {
+        *n_stated = d->n_vec_stated;
+    }
+    return true;
+}
+
 bool qemu_plugin_insn_write_epilogue_only(const struct qemu_plugin_tb *tb,
                                           size_t idx, unsigned reg)
 {

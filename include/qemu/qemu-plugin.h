@@ -285,6 +285,16 @@ typedef uint64_t qemu_plugin_id_t;
  *   target, so what it translated is the illegal-instruction raise and
  *   not an instruction.  Purely additive.
  *
+ * version 29:
+ * - added qemu_plugin_insn_vec_shape(): the VECTOR LANE LAYOUT --
+ *   element size in bytes and the operation's byte length -- as the
+ *   gvec constructor that expanded the instruction received them.  It
+ *   is a fact no walk of the emitted ops can recover: two element
+ *   widths over the same byte range expand identically on a host with
+ *   no vector type.  Purely additive; an instruction no expander
+ *   stated a shape for returns false, which means NOT TOLD and not
+ *   "scalar".
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -296,7 +306,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 28
+#define QEMU_PLUGIN_VERSION 29
 
 /*
  * The two values a signed vCPU index takes when it is not an index.

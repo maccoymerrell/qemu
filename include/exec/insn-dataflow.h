@@ -878,6 +878,49 @@ typedef struct InsnDataflow {
     uint8_t  imm_non_dataflow;
 
     /*
+     * THE VECTOR LANE LAYOUT, STATED BY THE EXPANDER THAT KNEW IT.
+     *
+     * A packed vector instruction's operands are not one datum but an array
+     * of them, and the array's shape -- how wide an element is and how many
+     * of them the operation covers -- is a static fact of the OPCODE that no
+     * walk of the emitted op stream can recover.  TCG lowers a 16-byte
+     * `add v0.4s, v1.4s, v2.4s` and a 16-byte `add v0.2d, v1.2d, v2.2d` to
+     * the same shaped op sequence over the same byte ranges; the element
+     * boundary exists only in the constructor's @vece argument, and by the
+     * time the ops are in the list it is gone.
+     *
+     * So the constructors state it.  Every tcg_gen_gvec_* entry point takes
+     * @vece (log2 of the element size in bytes) and @oprsz (the operation's
+     * byte length) as explicit parameters -- they are the caller's own words,
+     * not an inference -- and says so at the same place it already validates
+     * them.  @vec_lane_bytes is 1 << vece and @vec_oprsz is oprsz.
+     *
+     * @vec_stated is the coverage bit and is the only thing that licenses
+     * reading the other two.  Its absence means NO EXPANDER ON THIS PATH
+     * STATED A SHAPE, which is a different fact from "the instruction is not
+     * a vector operation": a family QEMU lowers through a helper rather than
+     * through the gvec expanders reaches here with nothing stated, and a
+     * consumer that read the zeros as a shape would publish one-byte lanes
+     * for a four-byte operation.
+     *
+     * @vec_mixed says two statements on the same instruction disagreed about
+     * the element width.  It is a real shape, not an error: a widening or
+     * narrowing operation genuinely reads at one element size and writes at
+     * another, and QEMU expands it as two calls.  The first statement is the
+     * one kept in @vec_lane_bytes / @vec_oprsz, and a consumer that needs
+     * per-operand element widths must refuse a mixed row rather than apply
+     * the first to both sides.
+     *
+     * @n_vec_stated is how many statements arrived, so that "one" and "the
+     * first of several that happened to agree" are distinguishable.
+     */
+    uint8_t  vec_stated;
+    uint8_t  vec_mixed;
+    uint8_t  vec_lane_bytes;
+    uint8_t  n_vec_stated;
+    uint32_t vec_oprsz;
+
+    /*
      * THE TRANSLATOR DECLINED TO TRANSLATE THIS ENCODING'S BODY, and said so.
      *
      * WHAT IT SEPARATES.  @n_noreturn_calls already tells a raise from a
@@ -1056,6 +1099,37 @@ void insn_dataflow_extract(unsigned num_insns);
  */
 void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                              uint32_t oprsz);
+
+/*
+ * CP-V -- the vector-shape choke point.
+ *
+ * @vece is log2 of the element size in bytes and @oprsz is the operation's
+ * byte length, exactly as the gvec constructor received them.  Both are the
+ * CALLER'S parameters: a target's translate.c writes them out of the
+ * encoding's size field, so this records the architecture's own element
+ * boundary rather than anything reconstructed from the ops.
+ *
+ * WHY IT CANNOT BE DERIVED DOWNSTREAM.  tcg_gen_gvec_add(MO_32, ...) and
+ * tcg_gen_gvec_add(MO_64, ...) over the same offsets and the same oprsz
+ * differ in the emitted stream only by which vector opcode carries which
+ * vece argument, and on a host without the vector type they do not differ at
+ * all -- both expand to the same 64-bit integer loop, one with a carry-chain
+ * mask and one without.  The element count is a fact about the INSTRUCTION,
+ * and only the expander is holding it.
+ *
+ * It is stated where the constructors already check their arguments, so
+ * every entry point that validates a shape also publishes it, and a
+ * constructor added later that does not validate is equally not publishing
+ * -- the two cannot drift apart silently.  The paths that take no @vece at
+ * all (the _ool and _ptr helper thunks, whose element size is baked into the
+ * helper rather than passed) state nothing, and InsnDataflow::vec_stated
+ * reads 0 there so a consumer knows it was not told rather than being told
+ * zero.
+ *
+ * Capture only.  No op is emitted, altered or suppressed, so generated guest
+ * code is bit-identical with this compiled in.
+ */
+void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz);
 
 /*
  * CP-M -- the memop choke point.
@@ -2362,6 +2436,9 @@ static inline void insn_dataflow_extract(unsigned num_insns)
 
 static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
                                            uint32_t bofs, uint32_t oprsz)
+{ }
+
+static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
 { }
 
 static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,

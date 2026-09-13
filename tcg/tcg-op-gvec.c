@@ -1278,6 +1278,7 @@ void tcg_gen_gvec_2(uint32_t dofs, uint32_t aofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_2(dofs, aofs, maxsz);
 
     type = 0;
@@ -1342,6 +1343,7 @@ void tcg_gen_gvec_2i(uint32_t dofs, uint32_t aofs, uint32_t oprsz,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_2(dofs, aofs, maxsz);
 
     type = 0;
@@ -1408,6 +1410,7 @@ void tcg_gen_gvec_2s(uint32_t dofs, uint32_t aofs, uint32_t oprsz,
     TCGType type;
 
     check_size_align(oprsz, maxsz, dofs | aofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_2(dofs, aofs, maxsz);
 
     type = 0;
@@ -1488,6 +1491,7 @@ void tcg_gen_gvec_3(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
     type = 0;
@@ -1555,6 +1559,7 @@ void tcg_gen_gvec_3i(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
     type = 0;
@@ -1623,6 +1628,7 @@ void tcg_gen_gvec_4(uint32_t dofs, uint32_t aofs, uint32_t bofs, uint32_t cofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs | bofs | cofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_4(dofs, aofs, bofs, cofs, maxsz);
 
     type = 0;
@@ -1693,6 +1699,7 @@ void tcg_gen_gvec_4i(uint32_t dofs, uint32_t aofs, uint32_t bofs, uint32_t cofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs | bofs | cofs);
+    insn_dataflow_note_vec_shape(g->vece, oprsz);
     check_overlap_4(dofs, aofs, bofs, cofs, maxsz);
 
     type = 0;
@@ -1773,6 +1780,7 @@ void tcg_gen_gvec_mov(unsigned vece, uint32_t dofs, uint32_t aofs,
         tcg_gen_gvec_2(dofs, aofs, oprsz, maxsz, &g);
     } else {
         check_size_align(oprsz, maxsz, dofs);
+        insn_dataflow_note_vec_shape(vece, oprsz);
         if (oprsz < maxsz) {
             expand_clr(dofs + oprsz, maxsz - oprsz);
         }
@@ -1783,6 +1791,7 @@ void tcg_gen_gvec_dup_i32(unsigned vece, uint32_t dofs, uint32_t oprsz,
                           uint32_t maxsz, TCGv_i32 in)
 {
     check_size_align(oprsz, maxsz, dofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     tcg_debug_assert(vece <= MO_32);
     do_dup(vece, dofs, oprsz, maxsz, in, NULL, 0);
 }
@@ -1791,6 +1800,7 @@ void tcg_gen_gvec_dup_i64(unsigned vece, uint32_t dofs, uint32_t oprsz,
                           uint32_t maxsz, TCGv_i64 in)
 {
     check_size_align(oprsz, maxsz, dofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     tcg_debug_assert(vece <= MO_64);
     do_dup(vece, dofs, oprsz, maxsz, NULL, in, 0);
 }
@@ -1799,6 +1809,7 @@ void tcg_gen_gvec_dup_mem(unsigned vece, uint32_t dofs, uint32_t aofs,
                           uint32_t oprsz, uint32_t maxsz)
 {
     check_size_align(oprsz, maxsz, dofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     if (vece <= MO_64) {
         TCGType type = choose_vector_type(NULL, vece, oprsz, 0);
         if (type != 0) {
@@ -1906,6 +1917,7 @@ void tcg_gen_gvec_dup_imm(unsigned vece, uint32_t dofs, uint32_t oprsz,
                           uint32_t maxsz, uint64_t x)
 {
     check_size_align(oprsz, maxsz, dofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     do_dup(vece, dofs, oprsz, maxsz, NULL, NULL, x);
 }
 
@@ -3310,6 +3322,7 @@ do_gvec_shifts(unsigned vece, uint32_t dofs, uint32_t aofs, TCGv_i32 shift,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     check_overlap_2(dofs, aofs, maxsz);
 
     /* If the backend has a scalar expansion, great.  */
@@ -3930,6 +3943,7 @@ void tcg_gen_gvec_cmp(TCGCond cond, unsigned vece, uint32_t dofs,
     uint32_t some;
 
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
     if (cond == TCG_COND_NEVER || cond == TCG_COND_ALWAYS) {
@@ -4050,6 +4064,7 @@ void tcg_gen_gvec_cmps(TCGCond cond, unsigned vece, uint32_t dofs,
     TCGType type;
 
     check_size_align(oprsz, maxsz, dofs | aofs);
+    insn_dataflow_note_vec_shape(vece, oprsz);
     check_overlap_2(dofs, aofs, maxsz);
 
     if (cond == TCG_COND_NEVER || cond == TCG_COND_ALWAYS) {

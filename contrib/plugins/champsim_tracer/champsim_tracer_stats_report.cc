@@ -389,6 +389,15 @@ void append_stats_summary(GString *report, const char *label,
         { "WP host syscalls blocked (must be 0)",
           qemu_plugin_spec_syscall_blocked_count() },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
+        /* CP-V coverage: what a QEMU-sourced lane layout would cost.
+         * A zero SUBJECT makes the four rows under it vacuous -- read them
+         * that way rather than as agreement.  See champsim_tracer_stats.h. */
+        { "Lane-layout rows published (CP-V subject)",
+                                                stats.vecshape_subject },
+        { "  QEMU stated no vector shape",      stats.vecshape_qemu_none },
+        { "  QEMU's element size AGREES",       stats.vecshape_agree },
+        { "  QEMU's element size DIFFERS",      stats.vecshape_differ },
+        { "  QEMU's own calls disagreed (mixed)", stats.vecshape_mixed },
         /* Invariant, not a measurement: see reg_value_container_unresolved. */
         { "Reg-value container unresolved (must be 0)",
                                         stats.reg_value_container_unresolved },

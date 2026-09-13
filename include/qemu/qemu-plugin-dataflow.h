@@ -1072,6 +1072,38 @@ typedef struct qemu_plugin_dataflow_status {
  */
 #define QEMU_PLUGIN_DF_MAX_MEMOPS  48
 
+/*
+ * CP-V -- THE VECTOR LANE LAYOUT THIS INSTRUCTION'S EXPANDER STATED.
+ *
+ * Returns true when a gvec constructor on this instruction's path stated a
+ * shape, and only then are @lane_bytes and @oprsz meaningful.  FALSE MEANS
+ * NOT TOLD, NOT "SCALAR": a vector family QEMU lowers through a helper
+ * rather than through the gvec expanders reaches here with nothing stated,
+ * and a consumer that read the false as "no lanes" would publish a scalar
+ * dependency for a packed operation.
+ *
+ * @lane_bytes is the element size in bytes (1, 2, 4, 8) and @oprsz the
+ * operation's byte length, so the lane COUNT is @oprsz / @lane_bytes.  Both
+ * come from the constructor's own arguments -- a target's translate.c writes
+ * them out of the encoding's size field -- and no walk of the op stream can
+ * recover them, because two element widths over the same byte range expand
+ * to the same ops on a host without the vector type.
+ *
+ * @mixed says two statements on this instruction disagreed about the element
+ * width, which a widening or narrowing operation genuinely does: it reads at
+ * one size and writes at another and QEMU expands it as two calls.  The
+ * FIRST statement is the one returned.  A consumer that needs a per-operand
+ * element width must refuse a mixed instruction rather than apply the
+ * returned width to both sides.
+ *
+ * @n_stated is how many statements arrived, so "one" and "the first of
+ * several that agreed" are distinguishable.  Any out pointer may be NULL.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_vec_shape(const struct qemu_plugin_tb *tb, size_t idx,
+                                unsigned *lane_bytes, uint32_t *oprsz,
+                                bool *mixed, unsigned *n_stated);
+
 QEMU_PLUGIN_API
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
                                       size_t idx,

@@ -9678,6 +9678,59 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
 }
 
 /*
+ * CP-V COVERAGE, taken where both accounts of the same instruction are in
+ * hand: @f is the row decode_detail_to_generic() just built (its lane layout
+ * is Capstone's, from the operand arrangement specifier), and (tb, idx) still
+ * names the instruction QEMU can be asked about.
+ *
+ * IT MEASURES AND CHANGES NOTHING.  The lane layout on the wire is untouched
+ * by this function; what it produces is the number the flip has to be costed
+ * against -- how many of the rows that carry lanes QEMU states a shape for at
+ * all, and on how many of those the two accounts agree.  A flip made without
+ * that number would be trading a measured source for an unmeasured one.
+ *
+ * THE SUBJECT IS THE ROW THAT CARRIES LANES, not every vector instruction.
+ * `f->has_vec_lanes` is set by the lane block of decode_detail_to_generic()
+ * and is exactly the set whose wire record would move, so it is the honest
+ * denominator: counting every instruction would bury the question in scalar
+ * code, and counting only the agreeing ones is the vacuous-subset shape this
+ * project has been bitten by.
+ */
+static void vecshape_census_note(struct qemu_plugin_tb *tb, size_t idx,
+                                 const InsnFields *f)
+{
+    if (!f || !f->has_vec_lanes) {
+        return;
+    }
+    g_stats.vecshape_subject++;
+
+    unsigned lane_bytes = 0;
+    uint32_t oprsz = 0;
+    bool mixed = false;
+    unsigned n_stated = 0;
+    if (!qemu_plugin_insn_vec_shape(tb, idx, &lane_bytes, &oprsz,
+                                    &mixed, &n_stated)) {
+        g_stats.vecshape_qemu_none++;
+        return;
+    }
+    if (mixed) {
+        g_stats.vecshape_mixed++;
+    }
+    /*
+     * The comparison is on the ELEMENT SIZE and nothing else.  The lane COUNT
+     * the wire carries is derived from the Capstone operand's byte size, and
+     * on a form whose operands are not all the same width -- a widening op --
+     * the two counts differ for a reason the element size already names.
+     * Comparing the counts as well would report one disagreement twice.
+     */
+    if ((unsigned)f->lane_bytes == lane_bytes) {
+        g_stats.vecshape_agree++;
+    } else {
+        g_stats.vecshape_differ++;
+    }
+}
+
+/*
  * Synthetic-EA capture for memory-hint opcodes (prefetch / cache-flush /
  * tlb-flush) whose effective address QEMU does not surface as a memop.
  * Decode the EA per canonical insn, then arm a register-reading cb on each
@@ -11075,6 +11128,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             decode_detail_to_generic(insn_pcs[c], &insn_info[c], &bt_s->f,
                                      nullptr);
             g_unknown_warn_suppressed = false;
+            vecshape_census_note(tb, i, &bt_s->f);
             qemu_ident_note(qi, &insn_info[c], &bt_s->f);
             qemu_ident_note_ctrl(qi, &insn_info[c], bt_s->f.branch_type,
                                  qnames[c], insn_pcs[c], insn_sizes[c]);

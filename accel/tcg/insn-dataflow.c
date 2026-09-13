@@ -221,6 +221,18 @@ typedef struct DfGvecNote {
     uint32_t dofs, aofs, bofs, oprsz;
 } DfGvecNote;
 
+/*
+ * CP-V.  One per gvec constructor entered, anchored the same way the CP4
+ * notes are: the op that was last in the list when the constructor was
+ * called, so the fold can charge the statement to the instruction whose
+ * ops came after it.
+ */
+typedef struct DfVecShapeNote {
+    const TCGOp *anchor;
+    uint32_t oprsz;
+    uint8_t vece;
+} DfVecShapeNote;
+
 typedef struct DfMemopNote {
     const TCGOp *anchor;
     const void *val_ts;
@@ -840,6 +852,16 @@ struct InsnDataflowScratch {
     unsigned n_gvec;
     bool gvec_overflow;
     /*
+     * CP-V.  Sized like the CP4 notes above and for the same reason: a
+     * translation block reaching sixty-four gvec constructor entries has
+     * far more pressing problems.  Past the cap the notes stop and
+     * @vshape_overflow says so, which a consumer reads as "the shape this
+     * instruction states may not be its first one" rather than as a shape.
+     */
+    DfVecShapeNote vshape[DF_MAX_GVEC_NOTES];
+    unsigned n_vshape;
+    bool vshape_overflow;
+    /*
      * Operand extents an emitter restated for the gvec call it is ABOUT to
      * make.  Consumed by the next insn_dataflow_note_gvec_ool() and cleared
      * there, so the window is the single statement between the restatement
@@ -1023,6 +1045,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_gvec             (df->gvec)
 #define df_n_gvec           (df->n_gvec)
 #define df_gvec_overflow    (df->gvec_overflow)
+#define df_vshape           (df->vshape)
+#define df_n_vshape         (df->n_vshape)
+#define df_vshape_overflow  (df->vshape_overflow)
 #define df_gvec_osz_off     (df->gvec_osz_off)
 #define df_gvec_osz_size    (df->gvec_osz_size)
 #define df_n_gvec_osz       (df->n_gvec_osz)
@@ -2206,6 +2231,8 @@ void insn_dataflow_note_reset(void)
     df_bind();
     df_n_gvec = 0;
     df_gvec_overflow = false;
+    df_n_vshape = 0;
+    df_vshape_overflow = false;
     df_n_gvec_osz = 0;
     df_n_memop = 0;
     df_memop_overflow = false;
@@ -4362,6 +4389,58 @@ void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     df_n_gvec++;
 }
 
+void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_vshape >= DF_MAX_GVEC_NOTES) {
+        df_vshape_overflow = true;
+        return;
+    }
+    df_vshape[df_n_vshape].anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    df_vshape[df_n_vshape].oprsz = oprsz;
+    /*
+     * vece is MO_8..MO_64 at every caller (check_size_align's own callers
+     * all pass a MemOp size), so the shift below cannot overflow a uint8_t.
+     * Clamped rather than asserted: a constructor added later with a wider
+     * element would otherwise crash a running guest over a fact nothing on
+     * the guest's path depends on, and a clamped shape is visible as an
+     * impossible lane width where a wrapped one would not be.
+     */
+    df_vshape[df_n_vshape].vece = vece <= 7 ? (uint8_t)vece : 7;
+    df_n_vshape++;
+}
+
+/* Fold every vector-shape note anchored inside [first, end) into @d. */
+static void df_apply_vec_shape_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
+{
+    TCGOp *op;
+
+    if (df_n_vshape == 0) {
+        return;
+    }
+    for (op = first; op != end; op = QTAILQ_NEXT(op, link)) {
+        for (unsigned i = 0; i < df_n_vshape; i++) {
+            if (df_vshape[i].anchor != op) {
+                continue;
+            }
+            uint8_t lane_bytes = (uint8_t)(1u << df_vshape[i].vece);
+            if (!d->vec_stated) {
+                d->vec_stated = 1;
+                d->vec_lane_bytes = lane_bytes;
+                d->vec_oprsz = df_vshape[i].oprsz;
+            } else if (d->vec_lane_bytes != lane_bytes) {
+                d->vec_mixed = 1;
+            }
+            if (d->n_vec_stated < 255) {
+                d->n_vec_stated++;
+            }
+        }
+    }
+}
+
 /* Fold every note anchored inside [first, end) into this instruction. */
 static void df_apply_gvec_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
 {
@@ -5739,6 +5818,7 @@ void insn_dataflow_extract(unsigned num_insns)
                     &memop_cursor, &zero_cursor, &imm_cursor, &disc_cursor,
                     &encread_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
+            df_apply_vec_shape_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
             first = NULL;
@@ -5758,6 +5838,7 @@ void insn_dataflow_extract(unsigned num_insns)
                 &memop_cursor, &zero_cursor, &imm_cursor, &disc_cursor,
                 &encread_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
+        df_apply_vec_shape_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;
 

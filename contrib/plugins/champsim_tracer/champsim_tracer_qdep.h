@@ -1073,6 +1073,50 @@ static inline bool qemu_ctrl_states_transfer(uint32_t f)
 }
 
 /*
+ * Did QEMU state that this instruction's transfer re-enters its OWN address?
+ *
+ * This is the tracer's BRANCH_REP, spelled the way qemu-plugin.h spells it:
+ * "a REP/string continuation is DIRECT | CONDITIONAL | SELF -- one of the
+ * static successors is the instruction's own address".  The consumer is the
+ * self-loop promotion in decode_detail_to_generic(), which used the x86
+ * F2/F3 PREFIX BYTE as Capstone reported it.
+ *
+ * WHY THE STRUCTURAL FORM IS THE BETTER FACT AND NOT MERELY THE ALLOWED ONE.
+ * The prefix byte is overloaded -- BND on CALL/RET/JMP/Jcc, XACQUIRE and
+ * XRELEASE on the lock forms, `repz ret` as branch-target padding -- so it is
+ * SET on encodings that do not loop, which is a promotion the tracer then has
+ * to take back; 0be51eb312 is the commit that took it back by hand.  A
+ * successor edge equal to the instruction's own pc is emitted only where the
+ * translator really continues the instruction, so there is nothing to take
+ * back.
+ *
+ * PENDING is read as a REFUSAL here, unlike in the transfer reduction above.
+ * The bit means the block ended before the remaining edge was emitted, and
+ * the edge that is missing may be the self one -- so an ABSENT SELF bit is
+ * not a negative answer, and promoting on the bits that ARE set would publish
+ * a self-loop for an instruction whose own loop edge was never seen.  The
+ * instruction is classified from the block that holds all of its ops.
+ *
+ * INDIRECT excludes the computed-successor forms: a goto_ptr whose runtime
+ * target happens to equal this pc is not a self-loop the translator stated,
+ * and the SELF bit is about the STATIC successors.
+ */
+static inline bool qemu_ctrl_states_self_loop(uint32_t f)
+{
+    if (!qemu_ctrl_states_transfer(f)) {
+        return false;
+    }
+    if (f & QEMU_PLUGIN_CTRL_PENDING) {
+        return false;
+    }
+    if (f & QEMU_PLUGIN_CTRL_INDIRECT) {
+        return false;
+    }
+    return (f & (QEMU_PLUGIN_CTRL_SELF | QEMU_PLUGIN_CTRL_DIRECT)) ==
+           (QEMU_PLUGIN_CTRL_SELF | QEMU_PLUGIN_CTRL_DIRECT);
+}
+
+/*
  * Extract one instruction's address and store-data provenance at TRANSLATION
  * time, while @tb is live -- the dataflow accessors are keyed on (tb, idx)
  * and there is no later moment at which that pair still names anything.

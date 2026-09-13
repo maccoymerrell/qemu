@@ -9843,6 +9843,7 @@ struct TbFragmentSpec {
  * disagreement at the true-BB layer.
  */
 static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
+                                    const QDepInsn *insn_qdep,
                                     uint32_t n_insns,
                                     std::vector<TbFragmentSpec> &out)
 {
@@ -9850,7 +9851,17 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
     if (!insn_info || n_insns == 0) {
         return;
     }
-    auto insn_branch_type = [](const qemu_plugin_insn_info *info) -> uint8_t {
+    /*
+     * @insn_qdep carries QEMU's control-transfer statement, and the splitter
+     * needs it for the same reason the template builder does: a string
+     * operation that re-enters its own address is BRANCH_REP, that class
+     * ENDS a fragment, and since the self-loop stopped being read off the
+     * x86 prefix byte the only source for it is QEMU's own successor edge.
+     * Decoding without it here would split a TB differently from the way the
+     * template built from the same TB is shaped.
+     */
+    auto insn_branch_type = [&](uint32_t idx) -> uint8_t {
+        const qemu_plugin_insn_info *info = &insn_info[idx];
         if (!info->mnemonic[0]) {
             return BRANCH_NONE;
         }
@@ -9859,7 +9870,8 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
          * only branch_type is consumed here). */
         InsnFieldsScratch s;
         insn_fields_scratch_reset(&s);
-        decode_detail_to_generic(0, info, &s.f, nullptr);
+        decode_detail_to_generic(0, info, &s.f, nullptr,
+                                 insn_qdep ? &insn_qdep[idx] : nullptr);
         return s.f.branch_type;
     };
     /*
@@ -9895,7 +9907,7 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
     uint32_t frag_start = 0;
     uint32_t i = 0;
     while (i < n_insns) {
-        uint8_t bt = insn_branch_type(&insn_info[i]);
+        uint8_t bt = insn_branch_type(i);
         if (bt == BRANCH_NONE) {
             i++;
             continue;
@@ -11126,7 +11138,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
              * warning for it would double a counter a gate reads. */
             g_unknown_warn_suppressed = true;
             decode_detail_to_generic(insn_pcs[c], &insn_info[c], &bt_s->f,
-                                     nullptr);
+                                     nullptr, &insn_qdep[c]);
             g_unknown_warn_suppressed = false;
             vecshape_census_note(tb, i, &bt_s->f);
             qemu_ident_note(qi, &insn_info[c], &bt_s->f);
@@ -11144,7 +11156,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * Singleton TBs (no mid-TB branch) produce one spec, matching
      * the pre-splitter behavior. */
     std::vector<TbFragmentSpec> fragment_specs;
-    split_tb_into_fragments(insn_info, canonical_n_insns, fragment_specs);
+    split_tb_into_fragments(insn_info, insn_qdep, canonical_n_insns,
+                            fragment_specs);
 
     /* Per-raw-insn local mapping into the current fragment's canonical
      * index space.  Allocated once and reused per fragment.  For raw

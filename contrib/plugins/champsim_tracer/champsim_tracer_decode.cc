@@ -11,6 +11,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_qdep.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 
@@ -1469,7 +1470,8 @@ synthetic_ea_slotless_mem_operand(const qemu_plugin_insn_info *info,
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
-                              InsnRegNames *out_names)
+                              InsnRegNames *out_names,
+                              const QDepInsn *q)
 {
     /* CONTRACT: @out is a freshly-reset InsnFieldsScratch::f — all scalars
      * zero and every span wired to zeroed full-size backing (see
@@ -1511,44 +1513,57 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * x86 REP/REPNZ promotes the insn to a self-looping branch.  Each
-     * architectural REP iteration is a tracer-defined true-BB (chain
-     * assembler ends the BB and restarts at the same PC) so the trace
-     * structurally identifies the loop instead of one BB with a
-     * variable memop count.  Branch type is BRANCH_REP (distinct from
-     * BRANCH_COND_DIRECT) so consumers see self-loop semantics
-     * (target=self-PC, fall-through=next-PC) at template-parse time.
-     * Conditional: the loop exits when ECX==0 or the REPZ/REPNZ compare
-     * breaks.  info->has_rep is x86-only (false elsewhere → no-op).
+     * A string operation that re-enters its own address promotes the insn
+     * to a self-looping branch.  Each architectural iteration is a
+     * tracer-defined true-BB (the chain assembler ends the BB and restarts
+     * at the same PC) so the trace structurally identifies the loop instead
+     * of one BB with a variable memop count.  Branch type is BRANCH_REP
+     * (distinct from BRANCH_COND_DIRECT) so consumers see self-loop
+     * semantics (target=self-PC, fall-through=next-PC) at template-parse
+     * time.  Conditional: the loop exits when ECX==0 or the REPZ/REPNZ
+     * compare breaks.
      *
-     * rep_memops_per_iter = memops per REP iteration, counted from
-     * Capstone MEM operand access flags (mnemonic-agnostic: MOVS
-     * 1L+1S, CMPS 2L, STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).  Lets
-     * the body emitter fan one TB-exec's memop stream into N entries.
+     * BOTH HALVES ARE QEMU'S, AND THE PREFIX BYTE IS NOT CONSULTED.
      *
-     * Guarded on the mnemonic table not already naming a branch: the
-     * boundary only reports has_rep on the string family, whose rows
-     * are all BRANCH_NONE, so on correct input the guard never bites.
-     * It exists because the F2/F3 prefix byte is overloaded (BND on
-     * CALL/RET/JMP/Jcc, XACQUIRE/XRELEASE, `repz ret` padding): if a
-     * boundary regression ever reports has_rep on one of those again,
-     * the resolved CALL/RET/JUMP taxonomy must win over the REP
+     * The self-loop is `QEMU_PLUGIN_CTRL_SELF` with a static successor and
+     * no computed one -- "one of the instruction's own goto_tb edges is its
+     * own address", which is what the x86 translator emits to continue a
+     * REP and is stated in qemu-plugin.h as the structural spelling of this
+     * class.  It replaces the boundary's REP-prefix flag, which was the
+     * F2/F3 PREFIX BYTE as Capstone reported it, and it is better on
+     * the case that byte gets wrong: F2/F3 is overloaded (BND on
+     * CALL/RET/JMP/Jcc, XACQUIRE/XRELEASE, `repz ret` padding) and the
+     * prefix is present on encodings that do not loop at all.  0be51eb312
+     * is the commit that had to repair exactly that, by hand, from the
+     * mnemonic table; a successor edge equal to the instruction's own pc
+     * cannot make the same mistake, because a `repz ret` has no such edge.
+     *
+     * rep_memops_per_iter is QEMU's ACCESS COUNT for the instruction --
+     * what one translated iteration performs, which is what the body
+     * emitter fans a TB-exec's memop stream out by.  It replaces a walk
+     * over the Capstone MEM operands' access flags.
+     *
+     * THE REFUSAL IS EXPLICIT.  Without @q there is no statement, and the
+     * promotion is NOT made: a self-loop the tracer invents from a prefix
+     * byte is the fabrication this program exists to remove, and the
+     * callers that pass nullptr (the IR oracle, the census probes) do not
+     * publish a template.  Same for an access list QEMU could not give:
+     * `have_list` false leaves the fan-out at 0, which the body emitter
+     * reads as "not stated" rather than as "no accesses".
+     *
+     * Guarded on the classification not already naming a branch, which is
+     * unchanged: a resolved CALL/RET/JUMP taxonomy must win over the
      * self-loop promotion, not be overwritten by it.
      */
-    if (info->has_rep && out->branch_type == BRANCH_NONE) {
+    const bool q_self_loop =
+        q && qemu_ctrl_states_self_loop(q->ctrl_flags);
+
+    if (q_self_loop && out->branch_type == BRANCH_NONE) {
         out->branch_type        = BRANCH_REP;
         out->branch_conditional = true;
-        for (unsigned i = 0; i < info->n_operands; i++) {
-            const qemu_plugin_operand *op = &info->operands[i];
-            if (op->type != QEMU_PLUGIN_OP_MEM) {
-                continue;
-            }
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                out->rep_memops_per_iter++;
-            }
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                out->rep_memops_per_iter++;
-            }
+        if (q->have_list) {
+            unsigned n = (unsigned)q->n_loads + (unsigned)q->n_stores;
+            out->rep_memops_per_iter = (uint8_t)(n > 255u ? 255u : n);
         }
     } else if (out->branch_type == BRANCH_REP) {
         /*

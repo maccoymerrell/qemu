@@ -1641,7 +1641,8 @@ BBTemplate *TemplateStore::create_tb_template(
             if (insn_info && insn_info[i].mnemonic[0]) {
                 decode_detail_to_generic(
                     tmpl->insn_pcs[i], &insn_info[i], &scratch[i].f,
-                    with_names ? &nscratch[i].rn : nullptr);
+                    with_names ? &nscratch[i].rn : nullptr,
+                    insn_qdep ? &insn_qdep[i] : nullptr);
             }
             /*
              * Static branch target as resolved by the per-ISA

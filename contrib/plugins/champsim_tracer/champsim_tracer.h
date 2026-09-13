@@ -1885,10 +1885,28 @@ const char *nonarch_lowering_reason(TraceISA isa, const char *name);
  */
 extern thread_local bool g_unknown_warn_suppressed;
 
+/*
+ * QEMU's own per-instruction statement about the instruction being decoded:
+ * the control transfer its ops performed and the memory accesses its
+ * emitters named.  Defined in champsim_tracer_qdep.h; forward-declared here
+ * so this header does not have to pull the dependency model in.
+ */
+struct QDepInsn;
+
+/*
+ * @q is QEMU's statement about THIS instruction, or nullptr when the caller
+ * has none.  It is not an optimisation: two of the facts this function
+ * publishes -- that a transfer re-enters its own address (BRANCH_REP) and
+ * how many accesses one such iteration performs -- are QEMU's and have no
+ * other source since the Capstone operand walk was deleted.  A caller that
+ * passes nullptr gets those facts UNSTATED rather than guessed; see the
+ * self-loop block in decode_detail_to_generic().
+ */
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
-                              InsnRegNames *out_names);
+                              InsnRegNames *out_names,
+                              const QDepInsn *q = nullptr);
 
 /*
  * The QEMU register a generic slot stands for, or NULL when the generic ID

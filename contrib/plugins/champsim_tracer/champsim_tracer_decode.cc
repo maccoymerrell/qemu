@@ -697,41 +697,102 @@ static void lane_carry_or(InsnFields *f, uint8_t gen,
     f->lane_carry_dst[k] = dst_lane;
 }
 
-static void assign_src_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
+/*
+ * WHICH REGISTER FILES CARRY LANES, asked of the generic register the
+ * PUBLISHED list holds -- not of a Capstone operand.
+ *
+ * A lane set belongs to a register (7c9dfe83c2), and the register lists the
+ * wire publishes are QEMU's: `src_regs[]` is seated from QEMU's ordered read
+ * list and `dst_regs[]` from its write list, with the operand walk's three
+ * arms deleted at f9ce637d94 / bd2848c450 / 431aebed10.  So the question
+ * "does this published register hold vector elements" is answerable from the
+ * generic id the plugin itself assigned, and the answer does not need the
+ * Capstone register enumerator the per-ISA tables used to index.
+ *
+ * THE TWO FILES ARE BOTH REQUIRED, and which one an ISA uses is a fact of
+ * that ISA's register map, not a choice here: aarch64 v0-v31 / z0-z31 and
+ * x86 xmm0-15 and riscv v0-v31 are REG_VEC*, while mipsel has NO REG_VEC row
+ * at all -- MSA's W registers alias the FP file and are declared REG_FPR*
+ * (champsim_tracer_qemu_regs_mips.h), as are riscv's f0-f31 under the FP
+ * arrangement forms.  Naming only one file would silently drop every mipsel
+ * MSA lane mask.
+ *
+ * THE INSTRUCTION-LEVEL GATE IS UNCHANGED.  This predicate decides only WHO
+ * receives the shape, never WHETHER there is one: `lane_shape_from_operands()`
+ * still decides that, and on a row it answers LANE_SHAPE_NONE for -- every
+ * scalar x87 and scalar FP form, whose REG_FPR* registers would otherwise
+ * qualify here -- nothing below runs at all.
+ */
+static inline bool generic_reg_carries_lanes(uint8_t gen)
 {
-    const RegClassification *rc = lookup_reg_class(cap_id);
-    if (!rc) return;
-    auto apply = [&](uint8_t gen) {
-        lane_carry_or(f, gen, lane, 0);
-        for (uint8_t i = 0; i < f->n_src_regs; i++) {
-            if (f->src_regs[i] == gen) f->src_lane_mask[i] |= lane;
-        }
-    };
-    if (rc->n_regs) {
-        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            apply(rc->regs[i]);
-        }
-    } else {
-        apply(rc->reg_id);
-    }
+    return (gen >= REG_VEC0 && gen < REG_VEC0 + 64) ||
+           (gen >= REG_FPR0 && gen < REG_FPR0 + 32);
 }
-static void assign_dst_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
+
+/*
+ * SEAT THE SHAPE ON THE PUBLISHED LISTS, BY ROLE.
+ *
+ * The per-operand loop these replaced read `op->reg_id` -- a Capstone
+ * register enumerator -- and mapped it through `lookup_reg_class()` and the
+ * 2,043-row per-ISA tables to find which published slots to touch.  That map
+ * was the last thing keeping the operand array joined to the wire's register
+ * lists, and the join it performed is exactly the one the ROLE already makes:
+ * a register on the read list receives the shape's source mask, a register on
+ * the write list receives its destination mask.  A read-and-written vector
+ * register is on both lists and receives both, which is what the walk's
+ * `rd`/`wr` pair produced.
+ */
+static unsigned seat_src_lanes_one(InsnFields *f, uint64_t lane)
 {
-    const RegClassification *rc = lookup_reg_class(cap_id);
-    if (!rc) return;
-    auto apply = [&](uint8_t gen) {
-        lane_carry_or(f, gen, 0, lane);
-        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-            if (f->dst_regs[d] == gen) f->dst_lane_mask[d] |= lane;
+    unsigned n = 0;
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        uint8_t gen = f->src_regs[i];
+        if (!generic_reg_carries_lanes(gen)) {
+            continue;
         }
-    };
-    if (rc->n_regs) {
-        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            apply(rc->regs[i]);
-        }
-    } else {
-        apply(rc->reg_id);
+        f->src_lane_mask[i] |= lane;
+        lane_carry_or(f, gen, lane, 0);
+        n++;
     }
+    return n;
+}
+static unsigned seat_dst_lanes_one(InsnFields *f, uint64_t lane)
+{
+    unsigned n = 0;
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        uint8_t gen = f->dst_regs[d];
+        if (!generic_reg_carries_lanes(gen)) {
+            continue;
+        }
+        f->dst_lane_mask[d] |= lane;
+        lane_carry_or(f, gen, 0, lane);
+        n++;
+    }
+    return n;
+}
+
+/*
+ * THE SECOND HALF OF THE LANE PROGRAM -- run it after qdep_apply().
+ *
+ * Called from the template build loop once QEMU's read and write lists are
+ * in `f`, and doing nothing on a row whose classification produced no shape.
+ *
+ * IT DOES NOT DECIDE `has_vec_lanes`.  That flag is the CP-V census's
+ * denominator and the wire's CST_INSN_FLAG_VEC, and it answers "is this a
+ * vector row", which the classification already knew; deciding it here on
+ * whether a register happened to receive a mask would have retracted it from
+ * every structured aarch64 load whose destination list QEMU leaves empty
+ * (`ld3` / `ld4` at p_simd, measured: 12 rows losing the flag).  The flag is
+ * set where the shape is computed, from the same fact the deleted per-operand
+ * loop used.
+ */
+void seat_vec_lanes(InsnFields *f)
+{
+    if (!f || !f->lane_seed_valid) {
+        return;
+    }
+    seat_src_lanes_one(f, f->lane_seed_src);
+    seat_dst_lanes_one(f, f->lane_seed_dst);
 }
 
 /*
@@ -1892,36 +1953,55 @@ void decode_detail_to_generic(uint64_t pc,
             }
             uint64_t sel = (sh.lane_sel >= 0 && sh.lane_sel < 64)
                                ? ((uint64_t)1 << sh.lane_sel) : 0;
-            for (uint8_t k = 0; k < info->n_operands; k++) {
-                const qemu_plugin_operand *op = &info->operands[k];
-                if (op->type != QEMU_PLUGIN_OP_REG) continue;
-                /* Scalar (address / GPR) operands carry no lanes —
-                 * leave their slots at 0; only vec regs participate. */
-                if (op->lane_bytes == 0) continue;
-                bool rd = (op->access & QEMU_PLUGIN_OP_ACC_READ)  != 0;
-                bool wr = (op->access & QEMU_PLUGIN_OP_ACC_WRITE) != 0;
-                if (!rd && !wr) { rd = wr = true; }  /* no flags: both */
-                uint64_t src_lane = 0, dst_lane = 0;
-                switch (sh.kind) {
-                case LANE_SHAPE_UNIFORM:
-                    src_lane = dst_lane = sh.full_mask;
-                    break;
-                case LANE_SHAPE_INSERT:
-                    /* Only the inserted lane is produced; the same
-                     * reg read supplies the untouched pass-through
-                     * lanes (everything but the selected lane). */
-                    dst_lane = sel;
-                    src_lane = sh.full_mask & ~sel;
-                    break;
-                case LANE_SHAPE_EXTRACT:
-                    /* Only the selected lane is read; the extract
-                     * sink is a scalar (no vec dst). */
-                    src_lane = sel;
-                    dst_lane = sel;
-                    break;
-                }
-                if (rd) assign_src_lane(out, op->reg_id, src_lane);
-                if (wr) assign_dst_lane(out, op->reg_id, dst_lane);
+            /*
+             * The shape is a fact of the INSTRUCTION -- one element width,
+             * one selected lane -- and it was already computed slot-agnostic
+             * above.  The loop it replaces recomputed these same two values
+             * once per operand and differed between iterations only in which
+             * register it landed on; that join is now the role's.
+             */
+            uint64_t src_lane = 0, dst_lane = 0;
+            switch (sh.kind) {
+            case LANE_SHAPE_UNIFORM:
+                src_lane = dst_lane = sh.full_mask;
+                break;
+            case LANE_SHAPE_INSERT:
+                /* Only the inserted lane is produced; the same
+                 * reg read supplies the untouched pass-through
+                 * lanes (everything but the selected lane). */
+                dst_lane = sel;
+                src_lane = sh.full_mask & ~sel;
+                break;
+            case LANE_SHAPE_EXTRACT:
+                /* Only the selected lane is read; the extract
+                 * sink is a scalar (no vec dst). */
+                src_lane = sel;
+                dst_lane = sel;
+                break;
+            }
+            /*
+             * HELD, NOT APPLIED.  The registers this lands on are QEMU's and
+             * are not in `out` yet -- qdep_apply() fills the read and write
+             * lists after this function returns.  seat_vec_lanes() is called
+             * there with the shape these two carry.
+             */
+            out->lane_seed_valid = true;
+            out->lane_seed_src   = src_lane;
+            out->lane_seed_dst   = dst_lane;
+            /*
+             * THE ROW IS A VECTOR ROW, AND THAT IS DECIDED HERE.
+             *
+             * `sh.lane_bytes` is the element width of the FIRST vector
+             * register operand the shape walk found, and
+             * lane_shape_from_operands() leaves it 0 on exactly the path
+             * where it found none -- the runtime-SEW branch it takes for a
+             * RISC-V V form whose width is not static.  So this condition is
+             * the same one the deleted per-operand loop applied by setting
+             * the flag inside a body it only entered for an operand with a
+             * lane width, and it is written from the shape rather than from
+             * a second walk of the operand array.
+             */
+            if (sh.lane_bytes != 0) {
                 out->has_vec_lanes = true;
             }
         }

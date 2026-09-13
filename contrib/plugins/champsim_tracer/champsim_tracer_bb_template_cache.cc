@@ -1687,6 +1687,20 @@ BBTemplate *TemplateStore::create_tb_template(
                                 ie);
             }
             /*
+             * THE LANE SHAPE LANDS ON QEMU'S LISTS, AND SO IT LANDS HERE.
+             *
+             * decode_detail_to_generic() decides the layout -- element width,
+             * uniform / insert / extract, which lane is selected -- but the
+             * registers that layout belongs to are `src_regs[]` / `dst_regs[]`,
+             * and those are filled by qdep_apply() above.  Seating the shape
+             * inside the classifier would apply it to lists that are still
+             * empty: the Capstone operand walk used to populate them there and
+             * its three arms are deleted (f9ce637d94 / bd2848c450 /
+             * 431aebed10), which is why this is a second call and not a line
+             * in the first.
+             */
+            seat_vec_lanes(&scratch[i].f);
+            /*
              * THE PER-ENCODING READ-LIST CORPUS, after qdep_apply() and so
              * over the list the wire really publishes.  Env-gated and inert
              * with the variable unset; see dump_src_enc_row().

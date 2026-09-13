@@ -1909,6 +1909,14 @@ void decode_detail_to_generic(uint64_t pc,
                               const QDepInsn *q = nullptr);
 
 /*
+ * Seat the lane shape decode_detail_to_generic() held onto the register lists
+ * qdep_apply() filled.  MUST be called after qdep_apply() and not before: the
+ * lists it reads are QEMU's, and they do not exist while the instruction is
+ * being classified.  No-op on a row that carries no shape.
+ */
+void seat_vec_lanes(InsnFields *f);
+
+/*
  * The QEMU register a generic slot stands for, or NULL when the generic ID
  * folds a class with no single directly-readable QEMU register behind it.
  *

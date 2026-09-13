@@ -426,6 +426,28 @@ typedef struct InsnFields {
      * width is data-dependent (RISC-V V SEW) — emit-time falls back
      * to one-memop-per-active-lane ordering. */
     uint8_t               lane_bytes;
+    /*
+     * THE SHAPE, HELD BETWEEN THE TWO HALVES OF THE LANE PROGRAM.
+     *
+     * The lane layout is decided where the instruction is classified, but
+     * the registers it lands on are QEMU's and are seated LATER -- the
+     * read and write lists are filled by qdep_apply(), which runs after
+     * decode_detail_to_generic() returns (bb_template_cache.cc's build
+     * loop).  Before the operand walk's three arms were deleted the lists
+     * were already populated at classification time and the shape could be
+     * applied in place; with the walk gone they are empty there, so
+     * applying it there lands it on nothing.
+     *
+     * These carry the instruction-level masks across that gap, and
+     * seat_vec_lanes() below is the second half.  @lane_seed_valid is the
+     * discriminator: a row whose classification produced no shape leaves it
+     * false and seat_vec_lanes() does nothing, which is how a non-vector
+     * row and a vector row on a build with no dataflow ABI both come out
+     * carrying no lanes.
+     */
+    bool                  lane_seed_valid;
+    uint64_t              lane_seed_src;
+    uint64_t              lane_seed_dst;
     /* Per-operand STRUCTURAL lane participation, indexed parallel to
      * src_regs[] / dst_regs[].  STATIC: these are the final values.
      * Register-sourced kinds: structural pattern AND-ed at exec with

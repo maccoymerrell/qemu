@@ -3095,10 +3095,24 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         names_cc = any(op.type == op_reg_kind and fcc0 <= op.reg <= fcc7
                        for op in ops)
         is_br = mnem in ("bc1t", "bc1f", "bc1tl", "bc1fl")
-        if is_br:
-            phantom = set()
-            add(phantom, at)
-            exp_dst -= phantom
+        # THE PHANTOM $at WRITE, AND IT IS NOT ONLY THE FP BRANCH'S.
+        #
+        # Capstone reports MIPS_REG_AT in regs_write for control transfers
+        # whose encoding has no register destination field at all.  Measured
+        # over the 836 instructions of a validator mipsel cell: 64 rows carry
+        # AT in regs_write with NO $at among the printed operands -- `j` 56,
+        # `beqz` 8 -- and ZERO rows carry it WITH one, so there is no shape
+        # here where the claim could be about a real operand.  $at is the
+        # assembler's macro scratch: no MIPS machine instruction writes it
+        # unless its encoding names it, which is why the test is structural
+        # rather than a list of mnemonics that would go stale the moment a
+        # different branch turned up.  `jal`'s real link write is $ra and is
+        # untouched by this.
+        if not any(op.type == op_reg_kind and int(op.reg) == at
+                   for op in ops):
+            phantom_at = set()
+            add(phantom_at, at)
+            exp_dst -= phantom_at
         if not names_cc:
             if mnem.startswith("c."):
                 add(exp_dst, fcc0)
@@ -3481,9 +3495,22 @@ def _check_static_reg_sets(
             #     does not.  A transfer writes the PC and a conditional one
             #     reads the flags; QEMU's ops say so because the translator
             #     emitted them.  Ruled FOR QEMU.
+            #
+            #     REG_ZERO IS ADMITTED ON THE READ SIDE FOR THE SAME REASON
+            #     IT ALREADY WAS ON THE WRITE SIDE.  An architectural zero
+            #     register is an OPERAND of the encoding that an assembler's
+            #     alias hides in its printed form: riscv `li a7,0x5d` IS
+            #     `addi a7,zero,0x5d`, mipsel `beqz $t0,X` IS
+            #     `beq $t0,$zero,X`, and mipsel `lui` takes $zero through the
+            #     same operand accessor every other immediate form does
+            #     (target/mips/tcg/translate.c, gen_logic_imm's OPC_LUI arm
+            #     states it).  QEMU names the register the ENCODING names;
+            #     the operand record names the one the MNEMONIC prints.  The
+            #     ruling is FOR QEMU, and it is the same ruling the write
+            #     side already carries rather than a new one.
             if (not lost_dst and not lost_src
                     and gained_dst <= (pc_names | {"REG_ZERO"})
-                    and gained_src <= (pc_names | {"REG_FLAGS"})
+                    and gained_src <= (pc_names | {"REG_FLAGS", "REG_ZERO"})
                     and (gained_dst or gained_src)):
                 n_transfer_adjudicated += 1
                 continue

@@ -15657,13 +15657,35 @@ static void mips_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
 
     switch (ctx->base.is_jmp) {
     case DISAS_STOP:
+        /*
+         * The instruction asked for the block to end and be re-entered
+         * (a CP0 write, an interrupt-mask change).  It does not transfer
+         * control: the program counter written here is the address of the
+         * next instruction, and writing it is what lets the CPU resume
+         * there.  That makes it the block's write, not the instruction's.
+         */
+        insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
         gen_save_pc(ctx->base.pc_next);
         tcg_gen_lookup_and_goto_ptr();
+        insn_dataflow_window_end();
         break;
     case DISAS_NEXT:
     case DISAS_TOO_MANY:
+        /*
+         * save_cpu_state() is deliberately OUTSIDE the window.  It spills
+         * hflags, and btarget with it, and those are values some instruction
+         * in this block set -- the spill is deferred, not fabricated.  Which
+         * instruction it belongs to is a separate question this window does
+         * not answer, and swallowing the store would answer it with silence.
+         *
+         * gen_goto_tb() is entirely the block's exit: the program counter it
+         * writes names the next instruction, which is not in this
+         * translation.
+         */
         save_cpu_state(ctx, 0);
+        insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
         gen_goto_tb(ctx, 0, ctx->base.pc_next);
+        insn_dataflow_window_end();
         break;
     case DISAS_EXIT:
         tcg_gen_exit_tb(NULL, 0);

@@ -4239,13 +4239,37 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
          */
         break;
     case DISAS_TOO_MANY:
+        /*
+         * The block ran out and this is the jump-to-the-next-instruction
+         * QEMU emits for that.  Every op of it belongs to the BLOCK: the EIP
+         * it writes is the address after the last instruction translated,
+         * which no instruction here produces as a result.  Attributed where
+         * it is emitted it lands on whichever encoding happens to sit last,
+         * and the same encoding one slot earlier in the block publishes no
+         * such write -- which is the defect this window exists to close.
+         *
+         * gen_update_cc_op() is OUTSIDE it on purpose.  That is the DEFERRED
+         * SPILL of a flags-state change some instruction in this block really
+         * made; lazy flags is why it is late, not why it is fictional, and
+         * swallowing the store would delete a real write.
+         */
         gen_update_cc_op(dc);
+        insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
         gen_jmp_rel_csize(dc, 0, 0);
+        insn_dataflow_window_end();
         break;
     case DISAS_EOB_NEXT:
     case DISAS_EOB_INHIBIT_IRQ:
         assert(dc->base.pc_next == dc->pc);
+        /*
+         * Only the EIP write is the block's.  gen_eob() below is not: it
+         * resets RF, maintains the interrupt shadow and raises the
+         * single-step trap, and those are effects of the instruction that
+         * asked for the block to end.
+         */
+        insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
         gen_update_eip_cur(dc);
+        insn_dataflow_window_end();
         /* fall through */
     case DISAS_EOB_ONLY:
     case DISAS_EOB_RECHECK_TF:

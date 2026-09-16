@@ -10858,7 +10858,9 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
          */
         switch (dc->base.is_jmp) {
         default:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
+            insn_dataflow_window_end();
             /* fall through */
         case DISAS_EXIT:
         case DISAS_JUMP:
@@ -10868,21 +10870,50 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             break;
         }
     } else {
+        /*
+         * THE BLOCK'S EXIT IS THE BLOCK'S, AND ONLY THE BLOCK'S.
+         *
+         * Every gen_a64_update_pc(dc, 4) below writes the address of the
+         * instruction AFTER the last one translated, which is not in this
+         * block: nothing here is that instruction's architectural write, and
+         * attributing it there is what made a NOP publish `pc` as a
+         * destination when it happened to end a block and publish nothing
+         * when it did not.  Each is therefore bracketed.
+         *
+         * What is NOT bracketed is as deliberate.  The helper calls of the
+         * WFE / YIELD / WFI arms ARE those instructions' behaviour -- an
+         * instruction that reaches them is by construction the last one in
+         * its block, so the reader's default attribution is already right and
+         * a window would delete a real effect.  The bare exit_tb of
+         * DISAS_EXIT and the bare goto_ptr of DISAS_JUMP realise a transfer
+         * the instruction itself performed (it wrote the program counter in
+         * its own translate function and asked to leave), so those stay with
+         * it too, which is why the two update_pc arms no longer fall into
+         * them but emit their own copy of the one op they shared.
+         */
         switch (dc->base.is_jmp) {
         case DISAS_NEXT:
         case DISAS_TOO_MANY:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_goto_tb(dc, 1, 4);
+            insn_dataflow_window_end();
             break;
         default:
         case DISAS_UPDATE_EXIT:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
-            /* fall through */
+            tcg_gen_exit_tb(NULL, 0);
+            insn_dataflow_window_end();
+            break;
         case DISAS_EXIT:
             tcg_gen_exit_tb(NULL, 0);
             break;
         case DISAS_UPDATE_NOCHAIN:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
-            /* fall through */
+            tcg_gen_lookup_and_goto_ptr();
+            insn_dataflow_window_end();
+            break;
         case DISAS_JUMP:
             tcg_gen_lookup_and_goto_ptr();
             break;
@@ -10890,11 +10921,15 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
         case DISAS_SWI:
             break;
         case DISAS_WFE:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
+            insn_dataflow_window_end();
             gen_helper_wfe(tcg_env);
             break;
         case DISAS_YIELD:
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
+            insn_dataflow_window_end();
             gen_helper_yield(tcg_env);
             break;
         case DISAS_WFI:
@@ -10902,7 +10937,9 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
              * This is a special case because we don't want to just halt
              * the CPU if trying to debug across a WFI.
              */
+            insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
             gen_a64_update_pc(dc, 4);
+            insn_dataflow_window_end();
             gen_helper_wfi(tcg_env, tcg_constant_i32(4));
             /*
              * The helper doesn't necessarily throw an exception, but we

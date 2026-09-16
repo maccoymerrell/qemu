@@ -1495,7 +1495,20 @@ static void riscv_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 
     switch (ctx->base.is_jmp) {
     case DISAS_TOO_MANY:
+        /*
+         * The block ran out -- of its instruction budget, or at a page
+         * boundary -- and this is the exit QEMU emits for that.  Every op of
+         * it is the block's: gen_goto_tb() writes the program counter to the
+         * address of the NEXT instruction and jumps there, and the next
+         * instruction is not in this translation.  Without the window the
+         * reader attributes all of it to whichever instruction happens to sit
+         * last, which gives that encoding a program-counter write it does not
+         * perform -- measurably, since the same encoding elsewhere in the
+         * block publishes no such write.
+         */
+        insn_dataflow_window_begin(INSN_DF_W_EPILOGUE);
         gen_goto_tb(ctx, 0, 0);
+        insn_dataflow_window_end();
         break;
     case DISAS_NORETURN:
         break;

@@ -705,21 +705,28 @@ void insn_dataflow_bind(const void *ts, InsnDataflowAtom a);
 /*
  * Ops emitted between these two are QEMU's, not the instruction's.
  *
- * NOTHING OPENS ONE TODAY, AND THE COST IS MEASURED RATHER THAN ASSUMED.  The
- * reader walks the op stream after ops->tb_stop() has emitted the block's exit
- * sequence, and every op after the last insn_start is attributed to the last
- * instruction -- so the exit's program-counter write lands on whatever
- * instruction happens to end the block.  Witnessed on aarch64 with a run of
- * NOPs long enough to fill a block: encoding 1f2003d5 publishes a write set of
- * ZERO where it sits inside a block and ONE where it ends one, and the
- * register named is `pc`.  A nop does not write the program counter.  Across
- * five SPEC guests the encodings whose write-set size differs between
- * occurrences number 234 on aarch64, 272 on riscv64, 227 on mipsel and 1,739
- * on x86_64 (the x86 figure is not attributed to this cause alone).
+ * WHY ONE IS NEEDED AT ALL.  The reader walks the op stream once, in emission
+ * order, and every op after the last insn_start belongs to the last
+ * instruction -- which is right until ops->tb_stop() appends the block's exit
+ * sequence.  That sequence writes the program counter with the address of the
+ * instruction AFTER the block, and no instruction in the block produces that
+ * value as a result.  Unbracketed it lands on whichever encoding happens to
+ * sit last: on aarch64 a run of NOPs long enough to fill a block has 1f2003d5
+ * publishing a write set of ZERO where it sits inside the block and ONE, named
+ * `pc`, where it ends one.  A nop does not write the program counter.
  *
- * insn_dataflow_window_end() DOES have a caller -- insn_dataflow_borrow_end()
- * is it -- so the pair is not symmetric in use and only the opening half is
- * unwired.
+ * WHERE THE FOUR TARGETS OPEN ONE.  Each opens INSN_DF_W_EPILOGUE around the
+ * exit sequence in its own tb_stop, and around nothing else: aarch64
+ * (translate-a64.c), i386, riscv and mips each bracket the program-counter
+ * write and the goto/exit that carries it.  What sits beside those in the same
+ * function and is deliberately left attributed to the last instruction is the
+ * instruction's own late work -- aarch64's WFI/WFE/YIELD helper calls, i386's
+ * deferred flags spill and gen_eob()'s RF and interrupt-shadow maintenance,
+ * mips's hflags spill -- because a window there would delete a real effect
+ * rather than a fabricated one.
+ *
+ * insn_dataflow_window_end() also serves insn_dataflow_borrow_end(), so the
+ * pair is not symmetric in use.
  */
 void insn_dataflow_window_begin(unsigned kind);
 void insn_dataflow_window_end(void);

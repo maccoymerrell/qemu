@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""
+ARC 3 -- what a QEMU x86_64 TCG guest can execute, DERIVED FROM QEMU.
+
+An opcode the tracer cannot decode drops EVERYTHING for that instruction, so
+"the tracer never saw it, and that is fine" is the most expensive sentence in
+this arc.  It is only allowed to stand when the *reason* comes from somewhere
+other than the tracer.
+
+The reason used to come from the tracer twice over.  reach.tsv is measured --
+each encoding is executed under qemu-x86_64 and SIGILL is QEMU refusing it --
+but its INPUT set is `tracer_batch.tsv` filtered to the rows the tracer's
+decoder rejected (REPRODUCE.sh), and for a CPL0-only opcode SIGILL at CPL3
+says "privilege", not "unimplemented".  So a row could be excluded because the
+decoder failed on it and then confirmed excluded by a signal that the opcode
+never had to earn.  This module supplies the missing independent leg.
+
+The arc's thesis is that QEMU's modelling is the truth.  So the scope of a
+QEMU x86_64 guest is read off QEMU:
+
+  * target/i386/tcg/decode-new.c.inc -- the prefix loop and the feature
+    vocabulary the decode tables can gate on.  A feature the decoder cannot
+    NAME is a feature no instruction in it can require.
+  * target/i386/cpu.c -- the TCG_*_FEATURES masks.  x86_cpu_expand_features()
+    intersects a CPU model against these, so a CPUID bit outside them cannot
+    be advertised to a TCG guest by ANY model, `max` included.
+
+Both are parsed at run time from the tree, never transcribed.  selfcheck()
+re-asserts every cited fact and FAILS when one stops holding, so a QEMU rebase
+that adds AVX-512 to TCG breaks this file loudly instead of leaving 2,466 rows
+silently excused.  That is what makes the exclusion a measured boundary rather
+than a permanent one.
+
+WHAT THIS DOES NOT CLAIM.  It is a statement about a QEMU TCG guest, not about
+x86.  Every mechanism below carries a `remedy` naming what would make its rows
+reachable; where the remedy is "another accelerator", the rows leave the
+tracer's reach entirely, because KVM and HVF execute guest code on the host
+CPU and a TCG plugin observes no instruction at all.
+
+Author: Maccoy Merrell.
+SPDX-License-Identifier: GPL-2.0-or-later
+"""
+import os
+import re
+import collections
+
+QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
+_CPU_C = 'target/i386/cpu.c'
+_DECODE = 'target/i386/tcg/decode-new.c.inc'
+_TRANSLATE = 'target/i386/tcg/translate.c'
+
+Scope = collections.namedtuple('Scope', 'mechanism citation remedy')
+
+_LEGACY_PREFIX = {'66', '67', 'f0', 'f2', 'f3',
+                  '2e', '36', '3e', '26', '64', '65'}
+
+
+# --------------------------------------------------------------- QEMU facts
+class QemuFacts(object):
+    """Everything this module asserts about QEMU, read out of the tree."""
+
+    def __init__(self, root=None):
+        self.root = root or QEMU_ROOT
+        self.cpu_c = self._read(_CPU_C)
+        self.decode = self._read(_DECODE)
+        self.translate = self._read(_TRANSLATE)
+
+        # CPUID_* symbols named inside any TCG_*_FEATURES mask (and the
+        # *_KERNEL_FEATURES macros folded into them).  A feature word bit
+        # outside this set cannot reach a TCG guest's CPUID.
+        self.tcg_cpuid = (self._macro_symbols(r'TCG_\w+_FEATURES') |
+                          self._macro_symbols(r'CPUID_\w+_KERNEL_FEATURES'))
+        # Every CPUID_* symbol QEMU defines at all.  A feature absent here is
+        # one QEMU has no name for, which is a stronger exclusion still.
+        self.known_cpuid = set(re.findall(r'CPUID_[A-Za-z0-9_]+', self.cpu_c))
+        # The feature names the decode tables can gate an entry on.
+        self.decoder_feats = set(
+            re.findall(r'X86_FEAT_([A-Za-z0-9_]+)', self.decode))
+        # VEX.mmmmm values the 3-byte VEX prefix accepts.
+        self.vex_maps = self._vex_maps()
+        # 0F escape opcodes QEMU decodes as an UNGATED NOP.  A feature whose
+        # encodings live in this hint space still EXECUTES on a TCG guest --
+        # the architectural effect is absent, the instruction is not -- so no
+        # feature argument may exclude them.  ENDBR64 is the case that caught
+        # this: CET has no CPUID bit in cpu.c, and f3 0f 1e fa runs anyway.
+        self.hint_nops = self._hint_nops()
+
+    def _read(self, rel):
+        p = os.path.join(self.root, rel)
+        if not os.path.exists(p):
+            raise IOError('%s: not in the QEMU tree at %s.  The scope model '
+                          'cannot be derived and must not be guessed.'
+                          % (rel, self.root))
+        return open(p).read()
+
+    def _macro_symbols(self, name_re):
+        out = set()
+        for m in re.finditer(r'#define\s+(%s)\s' % name_re, self.cpu_c):
+            i, buf = m.end(), ''
+            while True:
+                j = self.cpu_c.index('\n', i)
+                line = self.cpu_c[i:j]
+                buf += line
+                i = j + 1
+                if not line.rstrip().endswith('\\'):
+                    break
+            out |= set(re.findall(r'CPUID_[A-Za-z0-9_]+', buf))
+        return out
+
+    def _hint_nops(self):
+        i = self.decode.index('X86OpEntry opcodes_0F[256]')
+        t = self.decode[i:self.decode.index('\n};', i)]
+        out = set()
+        # THE CITED FACT IS THE OPERAND FORM AND THE ABSENCE OF A cpuid()
+        # GATE -- not the punctuation after them.  These entries carry a FLAG
+        # LIST now (`X86_OP_ENTRY1(NOP, nop,v, encops)`, landed 4d9ec8775e so
+        # the reserved-NOP space states the ModRM register it encodes), and a
+        # pattern that required the close-paren immediately after `,v` read
+        # that as the whole scope citation going stale.  It had not: 0F 1E and
+        # 0F 0D are still ungated NOP entries.  So the flags are PARSED and the
+        # gate is asked of them, which is the fact the citation rests on.
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-f]{2})\] = X86_OP_ENTRY1\(NOP,'
+                         r'\s*(?:nop|M),v\s*(,[^)]*)?\)(.*)', line)
+            if m and 'cpuid(' not in (m.group(2) or '') \
+                 and 'cpuid(' not in m.group(3):
+                out.add(m.group(1)[2:])
+        return out
+
+    def _vex_maps(self):
+        m = re.search(r'switch \(vex2 & 0x1f\) \{(.*?)\n\s*\}',
+                      self.decode, re.S)
+        if not m:
+            raise AssertionError(
+                'the 3-byte VEX map switch is no longer written as '
+                '`switch (vex2 & 0x1f)` in %s; the map citation is stale'
+                % _DECODE)
+        return {int(v, 16) for v in re.findall(r'case (0x[0-9a-f]+):', m.group(1))}
+
+    # ------------------------------------------------------------- checkers
+    def _root_table(self):
+        i = self.decode.index('X86OpEntry opcodes_root')
+        return self.decode[i:self.decode.index('\n};', i)]
+
+    def evex_prefix_absent(self):
+        """0x62 is neither a prefix nor a 64-bit opcode in QEMU's decoder.
+
+        The prefix loop has no case for it, and the one-byte table spends the
+        byte on BOUND, which chk(i64) makes illegal in long mode.
+        """
+        root = self._root_table()
+        return ('case 0x62' not in self.decode and
+                'case 0x62' not in self.translate and
+                bool(re.search(r'\[0x62\] = X86_OP_ENTRYrr\(BOUND.*chk\(i64\)',
+                               root)))
+
+    def rex2_is_an_opcode(self):
+        """0xd5 is the AAD entry, so an APX REX2 prefix is never a prefix."""
+        return bool(re.search(r'\[0xD5\] = X86_OP_ENTRY2\(AAD', self.decode))
+
+    def prefetch_is_memory_only(self):
+        """0F 0D is implemented, ungated, and takes a memory operand only.
+
+        The assertion is on the OPERAND FORM -- `M,v`, memory only -- which is
+        what OPERAND-FORM-REFUSED cites when it declines the register form.  A
+        trailing flag list does not touch that, so the pattern stops at the
+        operand form rather than at the entry's closing paren.
+        """
+        return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
+                              self.decode))
+
+    def group3_slots(self):
+        """The ModRM /reg slots QEMU's F6 / F7 group table fills.
+
+        `decode_group3()` indexes `opcodes_grp3[(w << 3) | reg]`, so slot 1 is
+        F6 /1 and slot 9 is F7 /1.  Both are EMPTY: QEMU implements only the
+        /0 spelling of the immediate TEST and leaves the undocumented /1 alias
+        unfilled, which decodes as an unknown op and faults.  Returned as the
+        set of filled indices so a caller can assert the HOLE rather than
+        assume it.
+        """
+        body = self.decode.split('static const X86OpEntry opcodes_grp3[16]')
+        if len(body) < 2:
+            return set()
+        body = body[1].split('};')[0]
+        return {int(x, 16) for x in re.findall(r'\[0x([0-9a-fA-F]{2})\]\s*=',
+                                               body)}
+
+    def ud_rows_are_ud(self):
+        """UD0, UD1 and UD2 all decode to the UD entry, which raises #UD.
+
+        The three rows and the emitter are asserted together, because the
+        citation is the PAIR: a table entry named UD proves nothing if
+        gen_UD() ever stopped raising.
+        """
+        return (bool(re.search(r'\[0x0b\] = X86_OP_ENTRY0\(UD\)', self.decode))
+                and bool(re.search(r'\[0xb9\] = X86_OP_ENTRYr\(UD,', self.decode))
+                and bool(re.search(r'\[0xff\] = X86_OP_ENTRYr\(UD,', self.decode)))
+
+    def supports(self, cpuid_symbol):
+        return cpuid_symbol in self.tcg_cpuid
+
+
+_FACTS = None
+
+
+def facts(root=None):
+    global _FACTS
+    if _FACTS is None or (root and root != _FACTS.root):
+        _FACTS = QemuFacts(root)
+    return _FACTS
+
+
+# ------------------------------------------------------- extension -> CPUID
+# The one hand-written mapping in this file: an XED extension / isa-set name to
+# the CPUID bit QEMU would have to advertise for it.  `None` records that QEMU
+# defines no such bit at all -- checked, not assumed, by selfcheck().
+EXT_CPUID = {
+    'AVX512EVEX':     'CPUID_7_0_EBX_AVX512F',
+    'AVX512VEX':      'CPUID_7_0_EBX_AVX512F',
+    'AMX_TILE':       'CPUID_7_0_EDX_AMX_TILE',
+    'AVX_VNNI':       'CPUID_7_1_EAX_AVX_VNNI',
+    'AVX_IFMA':       'CPUID_7_1_EAX_AVX_IFMA',
+    'AVX_VNNI_INT8':  'CPUID_7_1_EDX_AVX_VNNI_INT8',
+    'AVX_VNNI_INT16': 'CPUID_7_1_EDX_AVX_VNNI_INT16',
+    'AVX_NE_CONVERT': 'CPUID_7_1_EDX_AVX_NE_CONVERT',
+    'SM3':            'CPUID_7_1_EAX_SM3',
+    'SM4':            'CPUID_7_1_EAX_SM4',
+    'SHA512':         'CPUID_7_1_EAX_SHA512',
+    'SERIALIZE':      'CPUID_7_0_EDX_SERIALIZE',
+    'TSX_LDTRK':      'CPUID_7_0_EDX_TSX_LDTRK',
+    'LKGS':           'CPUID_7_1_EAX_LKGS',
+    'MOVDIR':         'CPUID_7_0_ECX_MOVDIR64B',
+    # THE TWENTY-FIVE UNCITED ROWS (99-B).  These extensions had no entry, so
+    # classify() returned None for every encoding in them and the report
+    # correctly refused to publish: an exclusion nothing in QEMU justifies is
+    # not an exclusion.  Each maps to a CPUID bit QEMU DOES define and which
+    # sits outside every TCG_*_FEATURES mask, so the charge is
+    # CPUID-FEATURE-OUTSIDE-TCG and selfcheck() re-asserts it every run --
+    # the day one of these reaches a TCG mask, the file says so and the rows
+    # become REACHABLE again rather than staying quietly excused.
+    #   VTX     10 rows  INVEPT INVVPID VMCLEAR VMPTRLD VMPTRST VMREAD
+    #                    VMWRITE VMXON -- QEMU has no VMX TCG front end
+    #   SMX      1       GETSEC
+    #   WAITPKG  2       TPAUSE UMWAIT
+    #   VIA      9       the PadLock engines; their whole feature word,
+    #                    FEAT_C000_0001_EDX, carries `.tcg_features =
+    #                    TCG_EXT4_FEATURES` and cpu.c:861 defines that as 0,
+    #                    so NO bit in it can reach a TCG guest
+    'VTX':            'CPUID_EXT_VMX',
+    'SMX':            'CPUID_EXT_SMX',
+    'WAITPKG':        'CPUID_7_0_ECX_WAITPKG',
+    'VIA_PADLOCK_RNG':     'CPUID_C000_0001_EDX_XSTORE',
+    'VIA_PADLOCK_AES':     'CPUID_C000_0001_EDX_XCRYPT',
+    'VIA_PADLOCK_SHA':     'CPUID_C000_0001_EDX_PHE',
+    'VIA_PADLOCK_MONTMUL': 'CPUID_C000_0001_EDX_PMM',
+    # AND THE NINE THE **FRESH** TABLE ADDS.  The seven above were derived
+    # from the BANKED attrib.seed.tsv, which is the table the x86 static leg
+    # was refusing as STALE -- so "25 uncited" was a reading of exactly the
+    # artifact the leg would not publish.  Re-run at HEAD the leg regenerates
+    # both tables and the uncited population is 297 over 5,756
+    # UNPROBED-unreachable rows, in eleven buckets.  Nine of them are one
+    # more CPUID argument, all with a bit cpu.c defines and none inside a
+    # TCG_*_FEATURES mask (exec176/UNCITED_297.txt):
+    #   XOP 147 · FMA4 96 · TBM 20 -- the AMD SSE5 descendants
+    #   GFNI 12 + AVX_GFNI 6 · VPCLMULQDQ 2 · RTM 2
+    #   XSAVES 4 · XSAVEC 2 · PTWRITE 2
+    'XOP':            'CPUID_EXT3_XOP',
+    'FMA4':           'CPUID_EXT3_FMA4',
+    'TBM':            'CPUID_EXT3_TBM',
+    'GFNI':           'CPUID_7_0_ECX_GFNI',
+    'AVX_GFNI':       'CPUID_7_0_ECX_GFNI',
+    'VPCLMULQDQ':     'CPUID_7_0_ECX_VPCLMULQDQ',
+    'RTM':            'CPUID_7_0_EBX_RTM',
+    'XSAVES':         'CPUID_XSAVE_XSAVES',
+    'XSAVEC':         'CPUID_XSAVE_XSAVEC',
+    # QEMU models no CPUID bit for these at all.
+    # `LWP` is the last of the 25 and is keyed on the ISA-SET, not the
+    # extension: XED files LLWPCB / LWPINS under extension XOP, and excluding
+    # all of XOP on one CPUID argument would be a wider claim than the rows
+    # support.  cpu.c names no LWP bit -- CPUID_EXT3_LWP is defined in cpu.h
+    # and never referenced in cpu.c, so no feature word carries it and no CPU
+    # model can advertise it -- which is what the `None` citation states, in
+    # cpu.c's terms, and what selfcheck() checks.
+    'LWP':            None,
+    # `ACE` HELD A CITATION THAT WAS FACTUALLY FALSE, found while adding the
+    # rows above and fixed here rather than left standing.  The entry read
+    # `'ACE': 'CPUID_7_0_EDX_AMX_TILE'`, so the one ACE row that reaches this
+    # table -- `c4e2fb49c0` BSRINIT, the VEX-encoded form; the rest are EVEX
+    # and are excluded one branch earlier -- was charged "AMX_TILE is outside
+    # every TCG_*_FEATURES mask", which says nothing about BSRINIT.  The
+    # VERDICT was right and the REASON was another instruction's.
+    #
+    # ACE here is Intel's Advanced Compute Extension (BSRINIT / BSRMOVF /
+    # BSRMOVH), not VIA's Advanced Cryptography Engine.  cpu.c names ONE
+    # symbol containing the letters -- CPUID_C000_0001_EDX_ACE2, in the
+    # Centaur leaf, a different feature of a different vendor -- and no bit
+    # for Intel ACE at all, which is what `None` states here.
+    'ACE':            None,
+    # PTWRITE: cpu.c names no bit for it -- checked by selfcheck's None branch,
+    # which looks for any CPUID_* symbol ending in _PTWRITE and finds none.
+    'PTWRITE':        None,
+    'KEYLOCKER':      None,
+    'KEYLOCKER_WIDE': None,
+    'ENQCMD':         None,
+    'UINTR':          None,
+    'RDPRU':          None,
+    'HRESET':         None,
+    'PBNDKB':         None,
+    'MSRLIST':        None,
+    'MSR_IMM':        None,
+    'WRMSRNS':        None,
+    'RAO':            None,
+    'USER_MSR':       None,
+    'MOVRS':          None,
+    'CET':            None,
+    'SNP':            None,
+    'TDX':            None,
+    'AMD_INVLPGB':    None,
+}
+
+_CITE = {
+    'evex': '%s -- the prefix loop decodes 0xc4/0xc5 (VEX) and REX and has no '
+            'case for 0x62; the one-byte table spends the byte on '
+            '[0x62] = BOUND chk(i64), illegal in long mode.  The EVEX prefix '
+            'is not a prefix to this decoder' % _DECODE,
+    'rex2': '%s -- [0xD5] = X86_OP_ENTRY2(AAD, 0,w, I,b): 0xd5 is an OPCODE in '
+            "QEMU's one-byte table, never an APX REX2 prefix" % _DECODE,
+    'vexmap': '%s -- switch (vex2 & 0x1f) accepts maps %s and falls to '
+              '`default: goto unknown_op`' % (_DECODE, '%s'),
+    'form': '%s -- [0x0d] = X86_OP_ENTRY1(NOP, M,v): 0F 0D is implemented and '
+            'ungated, but M rejects mod==3.  Real silicon executes the '
+            'register form as a reserved NOP; QEMU refuses it.  A QEMU '
+            'divergence from hardware, not a tracer gap' % _DECODE,
+    'nofeat': '%s -- %s is outside every TCG_*_FEATURES mask, which '
+              'x86_cpu_expand_features() intersects every CPU model against; '
+              'and %s',
+    'noname': '%s defines no CPUID bit for %s at all, and %s',
+    'novocab': 'X86_FEAT_%s is absent from the decode tables\' feature '
+               'vocabulary in %s (%d names, none of them this one), so no '
+               'entry there can require it',
+    'grp3': '%s -- `static const X86OpEntry opcodes_grp3[16]` fills 0 and '
+            '2..7 (F6) and 8 and a..f (F7); slots 1 and 9, the ModRM /1 '
+            'forms, are EMPTY, and decode_group3() indexes '
+            '[(w << 3) | reg] straight into the hole.  The undocumented '
+            'TEST alias real silicon executes as /0 is not in this '
+            'decoder at all',
+    'ud': '%s -- [0x0b] = X86_OP_ENTRY0(UD) (UD2), [0xb9] and [0xff] = '
+          'X86_OP_ENTRYr(UD, ...) (UD1, UD0); gen_UD() in '
+          'target/i386/tcg/emit.c.inc is gen_illegal_opcode().  QEMU decodes '
+          'these bytes and the machine takes an invalid-opcode fault instead '
+          'of executing an instruction',
+}
+
+_REMEDY_TCG = ('a QEMU release whose x86 TCG front end implements it: no CPU '
+               'model can reach it today, because -cpu max is intersected '
+               'with the TCG_*_FEATURES masks')
+_REMEDY_ACCEL = ('another accelerator (KVM/HVF) on host silicon that has the '
+                 'feature -- but that removes the instruction from a TCG '
+                 "plugin's view entirely, so it is out of the tracer's reach "
+                 'either way')
+
+
+def _strip_prefixes(hexs):
+    """-> (list of bytes, index of the first non-legacy/non-REX byte)."""
+    b = [hexs[i:i + 2].lower() for i in range(0, len(hexs), 2)]
+    i = 0
+    while i < len(b) and b[i] in _LEGACY_PREFIX:
+        i += 1
+    if i < len(b) and len(b[i]) == 2:
+        try:
+            if 0x40 <= int(b[i], 16) <= 0x4f:
+                i += 1
+        except ValueError:
+            pass
+    return b, i
+
+
+def classify(hexs, ext, isa_set, root=None):
+    """Why no QEMU x86_64 TCG guest can execute these bytes, or None.
+
+    None is NOT 'reachable' -- it is 'this model has nothing to say', which the
+    caller must treat as an unjustified exclusion rather than a silent pass.
+    """
+    f = facts(root)
+    b, i = _strip_prefixes(hexs)
+    op = b[i] if i < len(b) else ''
+
+    # UD0, UD1, UD2.  These are DECODED -- the entry exists, the emitter is
+    # gen_illegal_opcode() -- and the machine's answer to them is a fault.
+    # No guest executes one AS AN INSTRUCTION, so there is no instruction
+    # whose register sets could be carried, and the row is out of scope for
+    # the reason the ISA gives rather than for anything the tracer did.
+    #
+    # THE MODEL DID NOT HAVE THIS MECHANISM AND THE ROWS WENT UNCITED.
+    # 7773e9a469 withdrew GEN_OP_SYSCALL from all three -- correctly, #UD is
+    # not a system call -- and they became `tracer_decode_fail` rows the
+    # reach probe measures as unreachable, which is exactly true and exactly
+    # what this classifier is asked to charge to a mechanism.  Six rows
+    # (0f0b, 0fb9c0, 0fb900, 0fffc0 twice, 0fff00) with no citation stop the
+    # report, which is the instrument working: the answer owed was a
+    # mechanism, and this is it.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in ('0b', 'b9', 'ff'):
+        return Scope('ARCHITECTURAL-UD', _CITE['ud'] % _DECODE,
+                     'nothing -- the ISA defines these encodings as raising '
+                     '#UD, so no guest ever executes one as an instruction '
+                     'and there are no register sets to carry.  The fault '
+                     'itself is on the wire: the tracer publishes the block '
+                     'seal (BRANCH_SYSCALL_TYPE) and REFUSES the opcode '
+                     'rather than naming a neighbouring trap')
+
+    # F6 /1 and F7 /1 -- the UNDOCUMENTED second spelling of the immediate
+    # TEST.  Real silicon executes /1 exactly as /0; QEMU's `opcodes_grp3[16]`
+    # fills 0 and 2..7 for F6 and 8 and a..f for F7 and leaves slots 1 and 9
+    # EMPTY, so `decode_group3()` hands back a zero entry and the decode ends
+    # as an unknown op.  A QEMU divergence from hardware, the same shape as
+    # the 0F 0D register form above, and the four rows it charges are
+    # f6c801 / f60801 / 66f7c80000 / 66f7080000 -- both widths, register and
+    # memory form.
+    if op in ('f6', 'f7') and i + 1 < len(b):
+        if ((int(b[i + 1], 16) >> 3) & 7) == 1 and 1 not in f.group3_slots():
+            return Scope('GROUP-SLOT-NOT-FILLED', _CITE['grp3'] % _DECODE,
+                         'nothing on this accelerator -- the /0 spelling of '
+                         'the same instruction is implemented and reachable, '
+                         'and a guest that wants an immediate TEST emits it')
+
+    if op == '62':
+        return Scope('EVEX-PREFIX-NOT-DECODED', _CITE['evex'], _REMEDY_ACCEL)
+    if op == 'd5':
+        return Scope('REX2-PREFIX-IS-AN-OPCODE', _CITE['rex2'], _REMEDY_ACCEL)
+    if op == 'c4' and i + 1 < len(b):
+        m = int(b[i + 1], 16) & 0x1f
+        if m not in f.vex_maps:
+            return Scope('VEX-MAP-RESERVED',
+                         _CITE['vexmap'] % sorted(f.vex_maps), _REMEDY_TCG)
+    # 0F 0D with a register operand: the opcode IS QEMU's, the FORM is not.
+    if (op == '0f' and i + 1 < len(b) and b[i + 1] == '0d' and
+            i + 2 < len(b) and int(b[i + 2], 16) >> 6 == 3):
+        return Scope('OPERAND-FORM-REFUSED', _CITE['form'],
+                     'nothing -- the memory forms of this opcode are already '
+                     'reachable and already decoded by the tracer')
+    # The hint-NOP space executes whatever the feature bits say, so nothing
+    # below may exclude it.  Declining here is the point: ENDBR64, ENDBR32,
+    # RDSSPD/Q and PREFETCHRST2 all run on a TCG guest as NOPs even though
+    # cpu.c models no CET or MOVRS bit at all.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.hint_nops:
+        return None
+
+    if isa_set.startswith('APX_') or ext.startswith('APX'):
+        return Scope('QEMU-MODELS-NO-SUCH-FEATURE',
+                     _CITE['noname'] % (_CPU_C, 'APX_F',
+                                        _CITE['novocab'] % ('APX', _DECODE,
+                                                            len(f.decoder_feats))),
+                     _REMEDY_TCG)
+
+    key = isa_set if isa_set in EXT_CPUID else ext
+    if key in EXT_CPUID:
+        sym = EXT_CPUID[key]
+        vocab = _CITE['novocab'] % (key.replace('EVEX', '').replace('LEGACY', '')
+                                    or key, _DECODE, len(f.decoder_feats))
+        if sym is None:
+            return Scope('QEMU-MODELS-NO-SUCH-FEATURE',
+                         _CITE['noname'] % (_CPU_C, key, vocab), _REMEDY_TCG)
+        if not f.supports(sym):
+            return Scope('CPUID-FEATURE-OUTSIDE-TCG',
+                         _CITE['nofeat'] % (_CPU_C, sym, vocab), _REMEDY_TCG)
+    return None
+
+
+# ------------------------------------------------------------------ selfcheck
+def selfcheck(root=None):
+    """-> list of stale citations.  Empty means every cited fact still holds."""
+    f = facts(root)
+    bad = []
+    if not f.evex_prefix_absent():
+        bad.append('0x62 now appears in the decoder: EVEX may be decoded, and '
+                   'the EVEX-PREFIX-NOT-DECODED exclusion is stale')
+    if not f.rex2_is_an_opcode():
+        bad.append('[0xD5] is no longer the AAD entry: REX2 may now be a '
+                   'prefix, and the APX-legacy exclusion is stale')
+    if not f.ud_rows_are_ud():
+        bad.append('0F 0B / 0F B9 / 0F FF no longer read as UD entries in the '
+                   'decode tables: the ARCHITECTURAL-UD exclusion is stale')
+    if not f.prefetch_is_memory_only():
+        bad.append('0F 0D no longer reads `X86_OP_ENTRY1(NOP, M,v)`: the '
+                   'OPERAND-FORM-REFUSED citation is stale')
+    grp3 = f.group3_slots()
+    if not grp3:
+        bad.append('opcodes_grp3[16] is no longer parseable in %s: the '
+                   'GROUP-SLOT-NOT-FILLED citation cannot be checked' % _DECODE)
+    elif 1 in grp3 or 9 in grp3:
+        bad.append('opcodes_grp3 now FILLS the /1 slots (%s): F6 /1 and F7 /1 '
+                   'are decoded, so those rows are REACHABLE and the '
+                   'GROUP-SLOT-NOT-FILLED exclusion must be withdrawn'
+                   % sorted(grp3 & {1, 9}))
+    elif not {0, 2, 3, 4, 5, 6, 7, 8}.issubset(grp3):
+        bad.append('opcodes_grp3 is missing slots this citation assumes are '
+                   'filled (%s): the hole argument rests on 1 and 9 being the '
+                   'ONLY empty ones' % sorted({0,2,3,4,5,6,7,8} - grp3))
+    if f.vex_maps != {1, 2, 3}:
+        bad.append('the 3-byte VEX prefix now accepts maps %s, not {1,2,3}: '
+                   'the VEX-MAP-RESERVED exclusion is stale' % sorted(f.vex_maps))
+    # An instrument that cannot fire proves nothing: the vocabulary parse must
+    # find features TCG really does have.
+    if '1e' not in f.hint_nops or '0d' not in f.hint_nops:
+        bad.append('0F 1E / 0F 0D are no longer ungated NOP entries: the '
+                   'hint-NOP space may no longer execute unconditionally, and '
+                   'declining to exclude it is no longer justified')
+    for must in ('AVX2', 'BMI1', 'SHA_NI', 'CMPCCXADD'):
+        if must not in f.decoder_feats:
+            bad.append('X86_FEAT_%s missing from the parsed decoder '
+                       'vocabulary: the parse is broken, not the decoder' % must)
+    if 'CPUID_7_0_EBX_AVX2' not in f.tcg_cpuid:
+        bad.append('the TCG_*_FEATURES parse found no AVX2: it is broken, and '
+                   'every "outside TCG" citation it produced is worthless')
+    for ext, sym in sorted(EXT_CPUID.items()):
+        if sym is None:
+            hit = [s for s in f.known_cpuid
+                   if s.endswith('_' + ext) or ext in s.split('_')[-1:]]
+            if hit:
+                bad.append('%s: recorded as unmodelled, but %s now defines %s'
+                           % (ext, _CPU_C, ', '.join(sorted(hit)[:3])))
+        elif sym not in f.known_cpuid:
+            bad.append('%s: cited %s, which %s no longer defines'
+                       % (ext, sym, _CPU_C))
+        elif f.supports(sym):
+            bad.append('%s: %s IS now inside a TCG_*_FEATURES mask -- TCG can '
+                       'advertise it, so these rows are REACHABLE and their '
+                       'exclusion must be withdrawn' % (ext, sym))
+    return bad
+
+
+if __name__ == '__main__':
+    import sys
+    f = facts()
+    print('QEMU root                       : %s' % f.root)
+    print('CPUID symbols QEMU defines      : %d' % len(f.known_cpuid))
+    print('  ... inside a TCG_*_FEATURES   : %d' % len(f.tcg_cpuid))
+    print('decode-table feature vocabulary : %d  (%s)'
+          % (len(f.decoder_feats), ' '.join(sorted(f.decoder_feats))))
+    print('3-byte VEX maps accepted        : %s' % sorted(f.vex_maps))
+    print('EVEX prefix (0x62) decoded      : %s' % (not f.evex_prefix_absent()))
+    print('REX2 (0xd5) is the AAD opcode   : %s' % f.rex2_is_an_opcode())
+    print()
+    bad = selfcheck()
+    for s in bad:
+        print('STALE: %s' % s)
+    print('selfcheck: %d stale citation(s)' % len(bad))
+    sys.exit(1 if bad else 0)

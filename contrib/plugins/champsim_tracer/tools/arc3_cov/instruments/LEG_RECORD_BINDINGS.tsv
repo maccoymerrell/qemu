@@ -1,0 +1,44 @@
+# THE FIVE LEG RECORDS PASS 89 FOUND UNRESOLVABLE, BOUND BY CONTENT.
+#
+# A row here does NOT excuse a record.  It states WHAT ties the record to the
+# tree it claims, and legcheck.py CHECKS that statement against the object
+# store rather than believing it -- a TREE-IDENTICAL row whose trees differ
+# fails, and a LEGGED-AT-PARENT row whose covering commit is not a descendant
+# fails.  The alternative to a checked binding is deleting the leg record,
+# which would delete a sound measurement to tidy a pointer.
+#
+# The four TREE-IDENTICAL rows are the AMEND shape: the legs ran, the commit
+# was amended for its message afterwards, and the sha the run wrote down
+# stopped being reachable.  The tree the legs measured is byte-identical to
+# the tree the commit carries, which is the whole of what the record claims.
+#
+# The one LEGGED-AT-PARENT row is not that, and is not smoothed into it: the
+# named tip IS in history, its tree DIFFERS, and the legs measured the commit
+# BEFORE 414a647de7.  What covers it is the later commit whose own record
+# names a tree carrying 414a647de7's statement -- named here, and required to
+# be a descendant.
+#
+# EVERY ROW CARRIES `tree=<40 hex>` -- FINDING 90-B.  The two routes this
+# table used to rest on are both perishable and neither says so when it
+# perishes: C3's content route hashes build/contrib/plugins/libchampsim_tracer.so,
+# which one `ninja` replaces and one `rm -rf build` deletes, and TREE-IDENTICAL
+# reads an ORPHANED tip's tree, which `git gc` may prune.  The tree column
+# names an object reachable from the branch instead, and legcheck.py checks it
+# per kind: TREE-IDENTICAL / TREE-SHA / RECORD-COMPLETED-BY name the tree
+# their commit carries, LEGGED-AT-PARENT names the PARENT's.  A row without
+# the column FAILS.
+#
+# RECORD-COMPLETED-BY is FINDING 90-A's disposition, and it is not an amnesty
+# either: a record already in history cannot be amended without orphaning the
+# very pointers the rows above exist to keep resolvable, so the row names the
+# LATER commit that carries the rows the old one left out -- and legcheck
+# RE-READS that commit's message and requires IT to be complete.
+#
+# commit	rc_path	tip_named	kind	evidence	tree=<sha>
+4bcec00e514c	cst_runs/exec146/legsA/RC.txt	5c0ae3181f93	TREE-IDENTICAL	tree 0433db190d44b96f0c53707cb9f087796537c2cd on both	tree=0433db190d44b96f0c53707cb9f087796537c2cd
+94d0331aaa3e	cst_runs/exec146/legsD/RC.txt	2d3aa6aff294	TREE-IDENTICAL	tree 48748307f6dc7fe1196bb72e20046ccaec96df72 on both	tree=48748307f6dc7fe1196bb72e20046ccaec96df72
+bd8bbf063712	cst_runs/exec146/legsE/RC.txt	16ec6cf9f45d	TREE-IDENTICAL	tree 82ac96632bf407f360117c718d994031987b4d23 on both	tree=82ac96632bf407f360117c718d994031987b4d23
+209963934a0b	cst_runs/exec146/legsF/RC.txt	181772640a2a	TREE-IDENTICAL	tree 07845ab9da1ad9baea0a207c38421b03f5605d1c on both; patch-id 672038e976ee on both	tree=07845ab9da1ad9baea0a207c38421b03f5605d1c
+414a647de745	cst_runs/exec145/legs/RC.txt	87e7391a0bbc	LEGGED-AT-PARENT	4bcec00e514c	the mipsel legs ran at the PARENT and the record did not say so; substance covered one commit later, whose legsA tree carries note_dsp_acc_dspctrl_write x3	tree=9787a302f7df8369b9362168728f8d8c08d3bed3
+b5fa1e58bea4	<in-commit message>	-	RECORD-COMPLETED-BY	059f0ec07a67	tree=1fc966ab39cbe41e41fff30e10d735b8d4c935a8	the record says "GATE PASSED -- 19 legs" and prints FOURTEEN rows; all five gem5 rows are absent while their reports sit in cst_runs/exec148/r13/evroot/gem5, the root the record itself names. The commit named here transcribes all nineteen from that root, and legcheck RE-READS its message rather than believing this row
+c0e64b09d25e	<in-commit message>	-	RECORD-COMPLETED-BY	cd471f70da88	tree=624445476ebd9b24d7382e0e880c9523b243dad5	the commit MOVED THE WIRE (the mipsel branch-taxonomy fix, 168 rows) and carried NO leg record at all: exec176 ran no external leg and wrote so, and verify78 reached the same verdict from the commit alone -- `LEGCHECK FAIL: c0e64b09d25e: UNMARKED -- no R13-LEG-RECORD line and no manifest leg rows, and it touches 2 path(s) on the WIRE side`. The legs were run at exec179 on 9722718566, the FIRST tree at or after this commit whose plugin is byte-identical to the one it produced (.so 19491c4774829082, and it is the ONLY wire commit in between), and all twelve external legs came in at or under ceiling. Amending this commit to carry the record would orphan its own sha, which is the failure the rows above this one exist to prevent, so the record lives in the commit named here and legcheck RE-READS that message rather than believing this row

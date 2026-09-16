@@ -1,0 +1,316 @@
+diff --git a/riscv/decode_macros.h b/riscv/decode_macros.h
+index 125a73a..134e2b1 100644
+--- a/riscv/decode_macros.h
++++ b/riscv/decode_macros.h
+@@ -10,13 +10,57 @@
+ #include "softfloat_types.h"
+ #include "specialize.h"
+ 
++/* ARC 3 (ChampSim Tracer): READ_REG now consults DECODE_MACRO_USAGE_LOGGED,
++ * so it must have a value in translation units that use the read macros
++ * outside an instruction body (interactive.cc, the disassembler helpers).
++ * Outside an instruction body nothing is being committed, hence 0.
++ * insn_template.cc redefines it to the same token before its fast variants,
++ * which is an identical redefinition and therefore well-formed; rocc.cc
++ * defines it to 1 before this header is reached. */
++#ifndef DECODE_MACRO_USAGE_LOGGED
++#define DECODE_MACRO_USAGE_LOGGED 0
++#endif
++
+ // helpful macros, etc
+ #define MMU (*p->get_mmu())
+ #define STATE (*p->get_state())
+ #define FLEN (p->get_flen())
+ #define CHECK_REG(reg) ((void) 0)
+-#define READ_REG(reg) (CHECK_REG(reg), STATE.XPR[reg])
+-#define READ_FREG(reg) STATE.FPR[reg]
++/* ARC 3 (ChampSim Tracer): the commit log is destination-oriented upstream --
++ * there is no log_reg_read at all -- so a consumer can never see which
++ * registers an instruction SOURCED.  READ_REG/READ_FREG are the decode site:
++ * every architectural source read of the integer and FP files funnels through
++ * them, so recording there costs nothing in the fast (unlogged) variant and
++ * captures name AND value in the logged one.  The key encoding is the one
++ * log_reg_write already uses ((num << 4) | bank), so the printer and every
++ * downstream parser keep a single vocabulary.
++ *
++ * These MUST stay plain expressions, not statement-expressions: READ_REG is
++ * passed to get_field(), whose decltype() lands in a template-argument list,
++ * where a ({...}) block is ill-formed.  `reg` is therefore evaluated more
++ * than once -- as it already is in WRITE_REG -- which is safe because every
++ * caller passes a pure accessor (insn.rs1(), X_SP, ...). */
++#define LOG_REG_READ(key, val) \
++  (DECODE_MACRO_USAGE_LOGGED ? (void)(STATE.log_reg_read[key] = (val)) \
++                             : (void)0)
++#define READ_REG(reg) (CHECK_REG(reg), \
++                       LOG_REG_READ((reg) << 4, (freg_t{STATE.XPR[reg], 0})), \
++                       STATE.XPR[reg])
++#define READ_FREG(reg) (LOG_REG_READ(((reg) << 4) | 1, STATE.FPR[reg]), \
++                        STATE.FPR[reg])
++
++/* ARC 3 (ChampSim Tracer): the fcsr dependence, recorded where it actually
++ * arises.  require_fp is the FS-ENABLE gate and every FP instruction passes
++ * it, including fmv/fsgnj/fclass and the FP loads and stores, which neither
++ * round nor accrue -- hooking there reported an fcsr source for eleven
++ * instructions that architecturally have none.  The two real sites are
++ * ROUNDING (the RM macro) and EXCEPTION ACCRUAL (set_fp_exceptions), and
++ * both are recorded UNCONDITIONALLY at their site: the dependence belongs to
++ * the instruction, not to whether this particular execution happened to
++ * raise a flag. */
++#define LOG_FCSR_READ \
++  LOG_REG_READ((reg_t(CSR_FCSR) << 4) | 4, \
++               (freg_t{(STATE.frm->read() << 5) | STATE.fflags->read(), 0}))
+ #define RD READ_REG(insn.rd())
+ #define RS1 READ_REG(insn.rs1())
+ #define RS2 READ_REG(insn.rs2())
+@@ -164,7 +208,11 @@ do { \
+ #define JUMP_TARGET (pc + insn.uj_imm())
+ #define validate_rm(rm) ({ require(rm < 5); rm; })
+ #define VFP_RM validate_rm(STATE.frm->read())
+-#define RM (insn.rm() == 7 ? VFP_RM : validate_rm(insn.rm()))
++/* Rounding reads frm whether the mode is dynamic or encoded: an instruction
++ * whose rm field selects a static mode still had to consult the register to
++ * know the field was not DYN.  Recorded once here for both arms. */
++#define RM (LOG_FCSR_READ, \
++            (insn.rm() == 7 ? VFP_RM : validate_rm(insn.rm())))
+ 
+ static inline bool is_aligned(const unsigned val, const unsigned pos)
+ {
+@@ -182,12 +230,23 @@ static inline bool is_aligned(const unsigned val, const unsigned pos)
+ #define require_fp          STATE.fflags->verify_permissions(insn, false)
+ #define require_accelerator require(STATE.sstatus->enabled(SSTATUS_XS))
+ #define require_vector_vs   require(p->any_vector_extensions() && STATE.sstatus->enabled(SSTATUS_VS))
++/* ARC 3 (ChampSim Tracer): a vtype-consuming vector instruction reads vl and
++ * vtype to know its own shape.  Spike reads them straight off the vector unit
++ * (v_ext_macros.h: P.VU.vl->read()), so the dependence never reaches the
++ * commit log; require_vector is the gate all of them pass, and therefore the
++ * decode site for it.  require_vector_novtype deliberately records nothing:
++ * the instructions that use it are the ones whose shape does NOT come from
++ * vtype. */
+ #define require_vector(alu) \
+   do { \
+     require_vector_vs; \
+     require(!P.VU.vill); \
+     if (alu && !P.VU.vstart_alu) \
+       require(P.VU.vstart->read() == 0); \
++    LOG_REG_READ((reg_t(CSR_VL) << 4) | 4, \
++                 (freg_t{P.VU.vl->read(), 0})); \
++    LOG_REG_READ((reg_t(CSR_VTYPE) << 4) | 4, \
++                 (freg_t{P.VU.vtype->read(), 0})); \
+     WRITE_VSTATUS; \
+   } while (0);
+ #define require_vector_novtype(is_log) \
+@@ -226,6 +285,7 @@ static inline bool is_aligned(const unsigned val, const unsigned pos)
+ #define raise_fp_exceptions(flags) do { if (flags) STATE.fflags->write(STATE.fflags->read() | (flags)); } while (0);
+ #define set_fp_exceptions \
+   do { \
++    LOG_FCSR_READ; \
+     raise_fp_exceptions(softfloat_exceptionFlags); \
+     softfloat_exceptionFlags = 0; \
+   } while (0);
+diff --git a/riscv/execute.cc b/riscv/execute.cc
+index 7925057..5d766a9 100644
+--- a/riscv/execute.cc
++++ b/riscv/execute.cc
+@@ -10,6 +10,8 @@
+ static void commit_log_reset(processor_t* p)
+ {
+   p->get_state()->log_reg_write.clear();
++  p->get_state()->log_reg_read.clear();
++  p->get_state()->log_vreg_read.clear();
+   p->get_state()->log_mem_read.clear();
+   p->get_state()->log_mem_write.clear();
+ }
+@@ -64,6 +66,8 @@ static void commit_log_print_insn(processor_t *p, reg_t pc, insn_t insn)
+   FILE *log_file = p->get_log_file();
+ 
+   auto& reg = p->get_state()->log_reg_write;
++  auto& rdreg = p->get_state()->log_reg_read;
++  auto& vrdsnap = p->get_state()->log_vreg_read;
+   auto& load = p->get_state()->log_mem_read;
+   auto& store = p->get_state()->log_mem_write;
+   int priv = p->get_state()->last_inst_priv;
+@@ -136,9 +140,51 @@ static void commit_log_print_insn(processor_t *p, reg_t pc, insn_t insn)
+     }
+   }
+ 
++  /* ARC 3 (ChampSim Tracer): the SOURCE side.  Emitted under its own `read`
++   * token so that no existing consumer of the destination-oriented log can
++   * mistake a source for a destination, and so that a token-based parser
++   * never has to infer the role from arity.  x0 IS printed: an x0 source is
++   * an architectural fact about the encoding, unlike an x0 destination
++   * (which upstream skips because the write is discarded). */
++  for (auto item : rdreg) {
++    int rs = item.first >> 4;
++    switch (item.first & 0xf) {
++    case 0:
++      fprintf(log_file, " read x%-2d ", rs);
++      commit_log_print_value(log_file, xlen, item.second.v);
++      break;
++    case 1:
++      fprintf(log_file, " read f%-2d ", rs);
++      commit_log_print_value(log_file, flen, item.second.v);
++      break;
++    case 2: {
++      /* The snapshot is taken in the same call that records the key, so it
++       * is present by construction; nothing here may call back into elt(),
++       * which would mutate the map being iterated. */
++      auto it = vrdsnap.find(rs);
++      assert(it != vrdsnap.end());
++      fprintf(log_file, " read v%-2d ", rs);
++      commit_log_print_value(log_file, p->VU.VLEN, it->second.data());
++      break;
++    }
++    case 4:
++      fprintf(log_file, " read c%d_%s ", rs, csr_name(rs));
++      commit_log_print_value(log_file, xlen, item.second.v);
++      break;
++    default:
++      assert("can't been here" && 0);
++      break;
++    }
++  }
++
++  /* ARC 3 (ChampSim Tracer): loads now carry their DATUM, under a `memr`
++   * token.  The width is recoverable from the digit count exactly as it is
++   * for a store, because the value is printed at (size << 3) bits. */
+   for (auto item : load) {
+-    fprintf(log_file, " mem ");
++    fprintf(log_file, " memr ");
+     commit_log_print_value(log_file, xlen, std::get<0>(item));
++    fprintf(log_file, " ");
++    commit_log_print_value(log_file, std::get<2>(item) << 3, std::get<1>(item));
+   }
+ 
+   for (auto item : store) {
+diff --git a/riscv/mmu.cc b/riscv/mmu.cc
+index 0a284a0..97da61d 100644
+--- a/riscv/mmu.cc
++++ b/riscv/mmu.cc
+@@ -309,8 +309,20 @@ void mmu_t::load_slow_path(reg_t original_addr, std::size_t len,
+     check_triggers(triggers::OPERATION_LOAD,
+       transformed_addr, access_info.effective_virt, len, bytes);
+ 
+-  if (unlikely(proc->get_log_commits_enabled()))
+-    proc->state.log_mem_read.push_back(std::make_tuple(original_addr, 0, len));
++  /* ARC 3 (ChampSim Tracer): upstream pushes a literal 0 in the data slot, so
++   * a load's DATA and (because the printer emits only the address) its WIDTH
++   * were both unavailable to any commit-log consumer.  `bytes` is filled by
++   * the load_slow_path_intrapage calls above, so the datum is in hand here.
++   * Chunked exactly like the store side below so a hypothetical wider access
++   * decomposes identically on both sides. */
++  if (unlikely(proc->get_log_commits_enabled())) {
++    for (size_t offset = 0; offset < len; offset += sizeof(reg_t)) {
++      auto this_size = std::min(len - offset, sizeof(reg_t));
++      auto this_data = reg_from_bytes(this_size, bytes + offset);
++      proc->state.log_mem_read.push_back(
++          std::make_tuple(original_addr + offset, this_data, this_size));
++    }
++  }
+ }
+ 
+ inline void mmu_t::perform_intrapage_store(reg_t vaddr, uintptr_t host_addr, reg_t paddr, reg_t len, const uint8_t* bytes, xlate_flags_t xlate_flags)
+diff --git a/riscv/processor.cc b/riscv/processor.cc
+index ebf3cce..bc0c0aa 100644
+--- a/riscv/processor.cc
++++ b/riscv/processor.cc
+@@ -115,6 +115,8 @@ void state_t::reset(processor_t* const proc, reg_t max_isa)
+   single_step = STEP_NONE;
+ 
+   log_reg_write.clear();
++  log_reg_read.clear();
++  log_vreg_read.clear();
+   log_mem_read.clear();
+   log_mem_write.clear();
+   last_inst_priv = 0;
+@@ -643,7 +645,15 @@ reg_t processor_t::get_csr(int which, insn_t insn, bool write, bool peek)
+   if (search != state.csrmap.end()) {
+     if (!peek)
+       search->second->verify_permissions(insn, write);
+-    return search->second->read();
++    const reg_t v = search->second->read();
++    /* ARC 3 (ChampSim Tracer): the SOURCE side for CSRs.  Only the
++     * instruction-driven path is recorded (`peek` is Spike's own internal
++     * inspection), so this names exactly the CSR a csrr* instruction
++     * addressed -- not the implicit fcsr/vl reads an arithmetic instruction
++     * makes through their csr_t objects directly. */
++    if (!peek && unlikely(log_commits_enabled))
++      state.log_reg_read[(reg_t(which) << 4) | 4] = {v, 0};
++    return v;
+   }
+   // If we get here, the CSR doesn't exist.  Unimplemented CSRs always throw
+   // illegal-instruction exceptions, not virtual-instruction exceptions.
+diff --git a/riscv/processor.h b/riscv/processor.h
+index 05d4479..16a1608 100644
+--- a/riscv/processor.h
++++ b/riscv/processor.h
+@@ -211,6 +211,15 @@ struct state_t
+   } single_step;
+ 
+   commit_log_reg_t log_reg_write;
++  /* ARC 3 (ChampSim Tracer): the SOURCE side of the commit log.  Same key
++   * encoding as log_reg_write ((num << 4) | bank), filled at the decode site
++   * (READ_REG / READ_FREG / vectorUnit_t::elt / processor_t::get_csr). */
++  commit_log_reg_t log_reg_read;
++  /* Vector source reads are snapshotted whole, AT READ TIME, because a
++   * vector register is wider than freg_t and because -- unlike a write --
++   * its content at commit time is not necessarily what the instruction
++   * sourced. */
++  std::map<reg_t, std::vector<uint8_t>> log_vreg_read;
+   commit_log_mem_t log_mem_read;
+   commit_log_mem_t log_mem_write;
+   reg_t last_inst_priv;
+diff --git a/riscv/vector_unit.cc b/riscv/vector_unit.cc
+index d0fe10a..274a511 100644
+--- a/riscv/vector_unit.cc
++++ b/riscv/vector_unit.cc
+@@ -169,3 +169,15 @@ void vectorUnit_t::log_elt_write_if_needed(reg_t vReg) const {
+   if (unlikely(p->get_log_commits_enabled()))
+     p->get_state()->log_reg_write[((vReg) << 4) | 2] = {0, 0};
+ }
++
++void vectorUnit_t::log_elt_read_if_needed(reg_t vReg) const {
++  if (unlikely(p->get_log_commits_enabled())) {
++    p->get_state()->log_reg_read[((vReg) << 4) | 2] = {0, 0};
++    auto& snap = p->get_state()->log_vreg_read;
++    if (snap.find(vReg) == snap.end()) {
++      const uint8_t* base =
++          (const uint8_t*)reg_file + vReg * (VLEN >> 3);
++      snap.emplace(vReg, std::vector<uint8_t>(base, base + (VLEN >> 3)));
++    }
++  }
++}
+diff --git a/riscv/vector_unit.h b/riscv/vector_unit.h
+index 05b910b..fef40eb 100644
+--- a/riscv/vector_unit.h
++++ b/riscv/vector_unit.h
+@@ -120,6 +120,8 @@ public:
+ #endif
+     if (is_write)
+       log_elt_write_if_needed(vReg);
++    else
++      log_elt_read_if_needed(vReg);
+ 
+     T *regStart = (T*)((char*)reg_file + vReg * (VLEN >> 3));
+     return regStart[n];
+@@ -169,6 +171,8 @@ public:
+     for (reg_t vidx = reg_first; vidx <= reg_last; ++vidx)
+       if (is_write)
+         log_elt_write_if_needed(vidx);
++      else
++        log_elt_read_if_needed(vidx);
+ 
+     return *(EG*)((char*)reg_file + vReg * (VLEN >> 3) + start_byte);
+   }
+@@ -187,6 +191,12 @@ public:
+ private:
+ 
+   void log_elt_write_if_needed(reg_t vReg) const;
++  /* ARC 3 (ChampSim Tracer): the SOURCE side for the vector file.  Every
++   * architectural read of a vector element goes through elt()/elt_group()
++   * with is_write=false, including the mask register and the
++   * tail-undisturbed read of the destination, so recording here names the
++   * vector registers the instruction actually sourced. */
++  void log_elt_read_if_needed(reg_t vReg) const;
+ 
+ public:
+ 

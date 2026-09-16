@@ -1,0 +1,357 @@
+diff --git a/src/arch/mips/isa/formats/fp.isa b/src/arch/mips/isa/formats/fp.isa
+index 267972c..d0af37f 100644
+--- a/src/arch/mips/isa/formats/fp.isa
++++ b/src/arch/mips/isa/formats/fp.isa
+@@ -101,13 +101,20 @@ output exec {{
+                   trace::InstRecord *traceData)
+     {
+         uint64_t mips_nan = 0;
+-        assert(sizeof(T) == 4);
++        // UPSTREAM BUG (gem5): this helper asserted sizeof(T) == 4, so every
++        // double-precision MIPS FP instruction aborted the simulator
++        // (`add.d`, `mul.d`, ... -> "Assertion `sizeof(T) == 4' failed").
++        // The body was already parameterised on T everywhere except the NaN
++        // width and the QNaN constant, both of which are now taken from T.
++        // Reported here with its fix rather than worked around.
++        const int nan_bits = 8 * sizeof(T);
+ 
+         for (int i = 0; i < inst->numSrcRegs(); i++) {
+             uint64_t src_bits = xc->getRegOperand(inst, 0);
+ 
+-            if (isNan(&src_bits, 32) ) {
+-                mips_nan = MIPS32_QNAN;
++            if (isNan(&src_bits, nan_bits) ) {
++                mips_nan = (sizeof(T) == 4) ? (uint64_t)MIPS32_QNAN
++                                            : MIPS64_QNAN;
+                 xc->setRegOperand(inst, 0, mips_nan);
+                 if (traceData) { traceData->setData(floatRegClass, mips_nan); }
+                 return true;
+@@ -123,10 +130,12 @@ output exec {{
+     {
+         uint64_t mips_nan = 0;
+         T src_op = dest_val;
+-        assert(sizeof(T) == 4);
++        // Same upstream bug as fpNanOperands above.
++        const int nan_bits = 8 * sizeof(T);
+ 
+-        if (isNan(&src_op, 32)) {
+-            mips_nan = MIPS32_QNAN;
++        if (isNan(&src_op, nan_bits)) {
++            mips_nan = (sizeof(T) == 4) ? (uint64_t)MIPS32_QNAN
++                                        : MIPS64_QNAN;
+ 
+             //Set value to QNAN
+             cpu->setRegOperand(inst, 0, mips_nan);
+diff --git a/src/cpu/arc3_trace.hh b/src/cpu/arc3_trace.hh
+new file mode 100644
+index 0000000..8245f6c
+--- /dev/null
++++ b/src/cpu/arc3_trace.hh
+@@ -0,0 +1,67 @@
++/*
++ * ARC 3 execution-reference sidecar (ChampSim Tracer cross-check).
++ *
++ * gem5's InstRecord carries ONE data word, written by whichever destination
++ * wrote last, so a micro-op with several destinations -- ldp, a flag-setting
++ * ALU op, an FP convert that also updates FPSR -- publishes a value for one of
++ * them and silently none for the rest.  A consumer that pairs that word with
++ * the FIRST destination, or with the last, is right some of the time and wrong
++ * the rest, and its errors read as tracer defects.
++ *
++ * This sidecar records EVERY architectural destination write with its value,
++ * plus the bytes a memory access moved, and the ExeTracer prints them.  It is
++ * a plain global rather than a member of InstRecord so that adding it does not
++ * rebuild the whole tree; that is sound only for a CPU model that executes one
++ * instruction at a time to completion, which is what this cross-check runs
++ * (AtomicSimpleCPU).  Any out-of-order model would interleave writers here.
++ *
++ * Author: Maccoy Merrell.
++ */
++#ifndef __CPU_ARC3_TRACE_HH__
++#define __CPU_ARC3_TRACE_HH__
++
++#include <cstdint>
++#include <vector>
++
++namespace gem5
++{
++namespace arc3
++{
++
++struct RegWrite
++{
++    const char *cls;
++    int idx;
++    uint64_t val;
++    bool valued;        // false when the datum is wider than 64 bits
++};
++
++extern std::vector<RegWrite> regWrites;
++extern uint64_t memData;
++extern bool memDataValid;
++
++inline void
++addRegWrite(const char *cls, int idx, uint64_t val, bool valued)
++{
++    regWrites.push_back(RegWrite{cls, idx, val, valued});
++}
++
++inline void
++setMemData(uint64_t v)
++{
++    memData = v;
++    memDataValid = true;
++}
++
++inline void
++clear()
++{
++    regWrites.clear();
++    memDataValid = false;
++    memData = 0;
++}
++
++} // namespace arc3
++} // namespace gem5
++
++#endif // __CPU_ARC3_TRACE_HH__
+diff --git a/src/cpu/exetrace.cc b/src/cpu/exetrace.cc
+index 94ec4e8..f008548 100644
+--- a/src/cpu/exetrace.cc
++++ b/src/cpu/exetrace.cc
+@@ -45,6 +45,7 @@
+ 
+ #include "arch/generic/mmu.hh"
+ #include "base/loader/symtab.hh"
++#include "cpu/arc3_trace.hh"
+ #include "cpu/base.hh"
+ #include "cpu/static_inst.hh"
+ #include "cpu/thread_context.hh"
+@@ -55,6 +56,13 @@
+ namespace gem5
+ {
+ 
++namespace arc3
++{
++std::vector<RegWrite> regWrites;
++uint64_t memData = 0;
++bool memDataValid = false;
++} // namespace arc3
++
+ namespace trace {
+ 
+ void
+@@ -128,8 +136,44 @@ ExeTracerRecord::traceInst(const StaticInstPtr &inst, bool ran)
+             }
+         }
+ 
+-        if (debug::ExecEffAddr && getMemValid())
++        if (debug::ExecEffAddr && getMemValid()) {
+             outs << " A=0x" << std::hex << addr;
++            outs << " S=" << std::dec << size;
++            outs << " MF=0x" << std::hex << flags;
++        }
++
++        // ARC 3 execution-reference addition (ChampSim Tracer cross-check):
++        // name the architectural registers this instruction reads and writes,
++        // so a consumer does not have to recover them from disassembly text.
++        // Gated on ExecRegDelta, which the ExeTracer otherwise ignores.
++        if (debug::ExecRegDelta) {
++            outs << " RW=[";
++            for (size_t i = 0; i < arc3::regWrites.size(); ++i) {
++                const arc3::RegWrite &w = arc3::regWrites[i];
++                if (i) outs << ",";
++                outs << w.cls << ":" << std::dec << w.idx << "=";
++                if (w.valued)
++                    ccprintf(outs, "0x%x", w.val);
++                else
++                    outs << "?";
++            }
++            outs << "]";
++            if (arc3::memDataValid)
++                ccprintf(outs, " MD=0x%x", arc3::memData);
++            outs << " DR=[";
++            for (int i = 0; i < inst->numDestRegs(); ++i) {
++                const RegId &r = inst->destRegIdx(i);
++                if (i) outs << ",";
++                outs << r.className() << ":" << std::dec << r.index();
++            }
++            outs << "] SR=[";
++            for (int i = 0; i < inst->numSrcRegs(); ++i) {
++                const RegId &r = inst->srcRegIdx(i);
++                if (i) outs << ",";
++                outs << r.className() << ":" << std::dec << r.index();
++            }
++            outs << "]";
++        }
+ 
+         if (debug::ExecFetchSeq && fetch_seq_valid)
+             outs << "  FetchSeq=" << std::dec << fetch_seq;
+@@ -175,6 +219,7 @@ ExeTracerRecord::dump()
+     if (debug::ExecMicro || !staticInst->isMicroop()) {
+         traceInst(staticInst, true);
+     }
++    arc3::clear();
+ }
+ 
+ } // namespace trace
+diff --git a/src/cpu/simple/atomic.cc b/src/cpu/simple/atomic.cc
+index 42c555f..0af7dfb 100644
+--- a/src/cpu/simple/atomic.cc
++++ b/src/cpu/simple/atomic.cc
+@@ -41,6 +41,10 @@
+ 
+ #include "cpu/simple/atomic.hh"
+ 
++#include "cpu/arc3_trace.hh"
++
++#include <cstring>
++
+ #include "arch/generic/decoder.hh"
+ #include "base/output.hh"
+ #include "cpu/exetrace.hh"
+@@ -59,6 +63,21 @@
+ namespace gem5
+ {
+ 
++/*
++ * ARC 3 execution-reference markers (ChampSim Tracer cross-check).
++ *
++ * The ExeTracer record carries an address, a size and the Request flags, and
++ * nothing that says which DIRECTION the access went.  Recovering it from the
++ * OpClass is not enough: a read-modify-write micro-op carries exactly one
++ * OpClass and performs both halves, so the OpClass would silently drop one of
++ * them.  These three bits are unused by Request::Flags and are set at the
++ * three call sites that know the answer.
++ */
++static constexpr Request::FlagsType ARC3_READ  = 0x4000000000000000ULL;
++static constexpr Request::FlagsType ARC3_WRITE = 0x8000000000000000ULL;
++static constexpr Request::FlagsType ARC3_AMO   = 0x2000000000000000ULL;
++
++
+ void
+ AtomicSimpleCPU::init()
+ {
+@@ -367,7 +386,7 @@ AtomicSimpleCPU::readMem(Addr addr, uint8_t *data, unsigned size,
+     const RequestPtr &req = data_read_req;
+ 
+     if (traceData)
+-        traceData->setMem(addr, size, flags);
++        traceData->setMem(addr, size, flags | ARC3_READ);
+ 
+     dcache_latency = 0;
+ 
+@@ -452,8 +471,20 @@ AtomicSimpleCPU::writeMem(uint8_t *data, unsigned size, Addr addr,
+     // use the CPU's statically allocated write request and packet objects
+     const RequestPtr &req = data_write_req;
+ 
+-    if (traceData)
+-        traceData->setMem(addr, size, flags);
++    if (traceData) {
++        traceData->setMem(addr, size, flags | ARC3_WRITE);
++        // ARC 3 execution-reference addition (ChampSim Tracer cross-check):
++        // a store micro-op has no destination register, so the ExeTracer's
++        // D= field is otherwise unset for it and the STORED VALUE never
++        // reaches the log.  Publish it here, where the bytes are in hand.
++        // Only widths the record's 64-bit data word can hold are published;
++        // a wider store leaves D= unset rather than publishing a truncation.
++        if (size <= 8) {
++            uint64_t sd = 0;
++            std::memcpy(&sd, data, size);
++            arc3::setMemData(sd);
++        }
++    }
+ 
+     dcache_latency = 0;
+ 
+@@ -553,7 +584,7 @@ AtomicSimpleCPU::amoMem(Addr addr, uint8_t* data, unsigned size,
+     const RequestPtr &req = data_amo_req;
+ 
+     if (traceData)
+-        traceData->setMem(addr, size, flags);
++        traceData->setMem(addr, size, flags | ARC3_AMO);
+ 
+     //The address of the second part of this access if it needs to be split
+     //across a cache line boundary.
+diff --git a/src/cpu/simple/exec_context.hh b/src/cpu/simple/exec_context.hh
+index c97620b..db7e656 100644
+--- a/src/cpu/simple/exec_context.hh
++++ b/src/cpu/simple/exec_context.hh
+@@ -42,6 +42,7 @@
+ #define __CPU_SIMPLE_EXEC_CONTEXT_HH__
+ 
+ #include "base/types.hh"
++#include "cpu/arc3_trace.hh"
+ #include "cpu/base.hh"
+ #include "cpu/exec_context.hh"
+ #include "cpu/reg_class.hh"
+@@ -217,6 +218,10 @@ class SimpleExecContext : public ExecContext
+     {
+         const RegId &reg = si->destRegIdx(idx);
+         (*execContextStats.numRegWrites[reg.classValue()])++;
++        // ARC 3 sidecar: a vector destination written IN PLACE through this
++        // path.  Named, with `valued=false` -- the register is identified and
++        // its content is wider than the record's 64-bit word.
++        arc3::addRegWrite(reg.className(), reg.index(), 0, false);
+         return thread->getWritableReg(reg);
+     }
+ 
+@@ -227,6 +232,10 @@ class SimpleExecContext : public ExecContext
+         if (reg.is(InvalidRegClass))
+             return;
+         (*execContextStats.numRegWrites[reg.classValue()])++;
++        // ARC 3 execution-reference sidecar: name the destination AND its
++        // value, so a multi-destination micro-op does not publish one value
++        // with nothing saying which register it belongs to.
++        arc3::addRegWrite(reg.className(), reg.index(), (uint64_t)val, true);
+         thread->setReg(reg, val);
+     }
+ 
+@@ -235,6 +244,10 @@ class SimpleExecContext : public ExecContext
+     {
+         const RegId &reg = si->destRegIdx(idx);
+         (*execContextStats.numRegWrites[reg.classValue()])++;
++        // A destination wider than 64 bits (a vector register): the register
++        // is named, its content is not, and `valued=false` says so rather
++        // than publishing a truncation that would read as a value.
++        arc3::addRegWrite(reg.className(), reg.index(), 0, false);
+         thread->setReg(reg, val);
+     }
+ 
+@@ -253,6 +266,11 @@ class SimpleExecContext : public ExecContext
+         cpu->executeStats[thread->threadId()]->numMiscRegWrites++;
+         const RegId& reg = si->destRegIdx(idx);
+         assert(reg.is(MiscRegClass));
++        // ARC 3 sidecar: a misc (system) register destination.  These do
++        // not go through setRegOperand, so without this the reference names
++        // no FPCR / FPSR / TPIDR_EL0 destination at all and the tracer's
++        // correct one reads as surplus.
++        arc3::addRegWrite(reg.className(), reg.index(), (uint64_t)val, true);
+         thread->setMiscReg(reg.index(), val);
+     }
+ 
+diff --git a/src/arch/arm/regs/misc.cc b/src/arch/arm/regs/misc.cc
+index c644737..bace743 100644
+--- a/src/arch/arm/regs/misc.cc
++++ b/src/arch/arm/regs/misc.cc
+@@ -4394,6 +4394,20 @@ ISA::initializeMiscRegMetadata()
+             sctlr.ntwi = 1;
+             sctlr.cp15ben = 1;
+             sctlr.sa0 = 1;
++            // UPSTREAM BUG (gem5): the AArch32 branch below sets UCI and DZE
++            // and this one does not, so under AArch64 every EL0 execution of
++            // DC CVAU / DC CVAC / DC CIVAC / IC IVAU takes an EL0-access trap
++            // (checkFaultAccessAArch64SysReg -> !sctlr.uci, regs/misc.cc).
++            // SE mode has no exception vectors, so the trap dies as
++            // "src/sim/faults.cc:103: panic: Page table fault when accessing
++            // virtual address 0x400" -- 0x400 being VBAR(0) + the
++            // synchronous-exception-from-a-lower-EL vector offset, not any
++            // address the program named.  Linux sets both bits at boot
++            // (arch/arm64 SCTLR_EL1 SET mask), which is why the same binary
++            // runs under QEMU linux-user, so an SE-mode reset that leaves
++            // them clear models no real system.
++            sctlr.uci = 1;
++            sctlr.dze = 1;
+         } else {
+             sctlr.u = 1;
+             sctlr.xp = 1;

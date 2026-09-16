@@ -1,0 +1,457 @@
+"""
+ARC 3 -- the rule tables that map each harness's own adjudication labels onto
+the shared two-axis taxonomy (arc3_taxonomy).
+
+One rule per label the four harnesses actually emit.  A label that names a
+MECHANISM accounts for its rows.  A label that only restates WHICH WAY the sets
+differ ("other missing register", "TRACER-GAP"), or that groups rows of more
+than one mechanism ("MIXED -- 10 rank-2 gap, 5 reference defect"), explains no
+individual row and therefore accounts for none: those rows report as
+UNACCOUNTED, which is what they are.
+
+A label present in the data with no rule here is also UNACCOUNTED, and the
+harness prints it under LABELS WITH NO RULE so the gap is never silent.
+
+Author: Maccoy Merrell.
+"""
+import os
+import re
+import sys
+
+from arc3_taxonomy import (Rule, ANY, SUPERSET, SUBSET, ORTHOGONAL,
+                           stated_rows)
+
+
+# ===========================================================================
+# x86_64 -- compare_attrib.mechanism() charges every disagreement to exactly
+# one Mn cause.  The key is the Mn token; the rest of the string is prose.
+# ===========================================================================
+def x86_key(mech):
+    return mech.split(' ', 1)[0] if mech else ''
+
+
+X86 = {
+    # The EVEX mask classes.  Root cause measured in the harness itself:
+    # Capstone 6.0-Alpha7 hands the mask operand over with access == 0, so the
+    # tracer's operand walker never sees it.  Upstream defect, same family as
+    # the PEXTR and MSA access-flag bugs already worked around at the boundary.
+    'M1':  Rule('M1', 'capstone-defect', {SUBSET},
+                note='EVEX mask not recorded as a source'),
+    'M1b': Rule('M1b', 'capstone-defect', ANY,
+                note='EVEX mask misplaced or missing, k-destination forms'),
+    'M1c': Rule('M1c', 'capstone-defect', {SUBSET, ORTHOGONAL},
+                note='EVEX mask source missing alongside another gap'),
+    'M2':  Rule('M2', 'capstone-defect', {ORTHOGONAL},
+                note='mask lands in DST and the vector destination is lost'),
+
+    # Flags.
+    'M3':  Rule('M3', 'tracer-defect', {SUBSET},
+                note='a real RFLAGS read the tracer does not name'),
+    'M3b': Rule('M3b', 'capstone-defect', ANY,
+                note='Capstone access-flag gap: cli/sti write IF and the '
+                     'tracer records nothing'),
+    'M3c': Rule('M3c', 'tracer-defect', {SUBSET},
+                note='R4 source of a conditional flag write (shift by CL)'),
+
+    'M5':  Rule('M5', 'tracer-defect', {SUBSET},
+                note='x87 implicit ST(0) / status-word dependency'),
+
+    # M5's SIBLING, and the reason it exists is recorded because the
+    # re-derivation is the finding.  0acd1e32e5 split REG_FPCW out of
+    # REG_FCSR.  Before the split the tracer's merged id AGREED with the
+    # reference's control-word claim on 31 x87 rows and MISSED a status-word
+    # claim on the rest; after it, the tracer names a control-word edge the
+    # reference names nowhere -- 112 rows, every one TRACER-SUPERSET, none
+    # TRACER-SUBSET.  Charging them to M5 asserted the tracer was DROPPING
+    # what it had in fact started NAMING.
+    #
+    # This does NOT account, and deliberately.  The direction is measured and
+    # the label is now true, but a mechanism is not named until the exclusion
+    # is DERIVED rather than enumerated: a helper reads the control word iff
+    # it consults env->fpuc or hands &env->fp_status to softfloat, decidable
+    # from target/i386/tcg/fpu_helper.c.  A rule keyed on "LLVM MC names
+    # X87CONTROL where XED does not" closed all 112 and opened 21 NEW
+    # TRACER-SUBSET rows by importing LLVM claims QEMU does not perform; it
+    # was written and reverted rather than shipped.  Until the derivation
+    # exists these rows stay UNACCOUNTED, which is the honest number.
+    'M5b': Rule('M5b', 'unaccounted', {SUPERSET}, accounts=False,
+                note='the tracer names an x87 control/status-word edge the '
+                     'reference does not, and x87_cw_derive.py has no row '
+                     'for the encoding, so no mechanism is derived'),
+
+    # M5c IS THE DERIVATION M5b SAID WAS MISSING, and it is per-row.
+    #
+    # The reference models no control-word operand on the x87 escapes at
+    # all; QEMU does, and says so in its own source.  x87_cw_derive.py reads
+    # the helper sequence for each encoding off an OBSERVED TCG op dump
+    # (qemu-x86_64 -one-insn-per-tb -d op) and then walks the call graph of
+    # target/i386/tcg/fpu_helper.c to a fixed point over four axes: does the
+    # sequence READ env->fpuc, WRITE it, READ env->fpus / fpstt / fptags,
+    # WRITE them.  A helper reads the control word when it evaluates
+    # env->fpuc undominated by a definition of it, or hands &env->fp_status
+    # to a softfloat routine that is not one of the three exception-flag
+    # accessors -- fp_status being the DECODED control word, written out of
+    # env->fpuc by update_fp_status().
+    #
+    # A row is charged here ONLY where the derivation confirms the exact
+    # register in the exact direction the tracer states it.  It is therefore
+    # not "the tracer carries more", which is a direction and not a verdict:
+    # it is the edge being TRUE, one encoding at a time.
+    #
+    # Measured over the 153-subject x87 denominator at the tip: the control
+    # word axes agree with the tracer on 153 of 153 rows -- 109 read, 12
+    # write -- with ZERO missing edges and ZERO false edges.  An independent
+    # execution differential (x87_cw_exec.c) that runs each encoding twice
+    # under two control words and compares the 108-byte FNSAVE image
+    # convicts 45 of the derived-YES rows and NONE of the derived-NO rows.
+    # It can convict and cannot acquit, which is why the 64 derived-YES rows
+    # it leaves silent are not counted against the derivation.
+    'M5c': Rule('M5c', 'reference-gap', {SUPERSET},
+                note='QEMU performs the x87 control/status-word edge in the '
+                     'direction the tracer states it, derived per encoding '
+                     'from fpu_helper.c and an observed TCG op dump; the '
+                     'reference models no such operand'),
+
+    # The tripwire, and it must stay even at zero rows.  If the tracer ever
+    # names a control- or status-word edge QEMU's helper sequence does not
+    # perform, that is a FALSE dependency edge -- the same class as the
+    # mipsel phantom $at write that hid inside TRACER-SUPERSET for the whole
+    # arc -- and it does NOT account, so the row reports UNCOVERED and the
+    # matrix exits non-zero.
+    'M5d': Rule('M5d', 'tracer-defect', ANY, accounts=False,
+                note='the tracer names an x87 edge QEMU never performs on '
+                     'that encoding: a FALSE edge, not a superset'),
+    'M6':  Rule('M6', 'vocabulary-gap', {SUBSET},
+                note='no GenericRegId exists for this register'),
+
+    # "the tracer names a register the reference does not (phantom)" asserts
+    # the extra register is FALSE.  The harness's own coverage report records
+    # that some of these rows are the MPX / NOP identity forms, where the extra
+    # register is TRUE and the row is a TRACER-SUPERSET, not a defect.  One
+    # label, two mechanisms: it cannot explain an individual row.
+    'M7':  Rule('M7', 'tracer-defect', ANY, accounts=False,
+                note='groups genuine phantoms with MPX/NOP identity rows; '
+                     'the label cannot say which a given row is'),
+
+    # "other missing register" names no mechanism.  It is the residual bucket,
+    # i.e. exactly the rows nobody has interrogated.
+    'M8':  Rule('M8', 'unaccounted', ANY, accounts=False,
+                note='residual bucket; restates the direction, names no cause'),
+
+    # ---- surpluses split out of M7, each naming ONE mechanism.  M7 does not
+    # account because it groups genuine phantoms with identity rows; these do,
+    # because each answers the R7 regfile-dependency test for its own class.
+    'M9':  Rule('M9', 'reference-gap', {SUPERSET},
+                note='a trap gate pushes SS:RSP, RFLAGS and CS:RIP before the '
+                     'handler runs, so RSP is read and written; XED\'s iform '
+                     'describes the instruction operands and models no gate '
+                     'stack traffic'),
+    'M10': Rule('M10', 'reference-gap', {SUPERSET},
+                note='the register set of a leaf-dispatched instruction '
+                     '(GETSEC, VMFUNC) depends on the leaf selector; R1 gives '
+                     'the instruction ONE set, which is the union over the '
+                     'leaves, and the reference names the dispatch registers '
+                     'only'),
+    'M11': Rule('M11', 'reference-gap', {SUPERSET},
+                note='SSP and the IA32_PLn_SSP MSRs are implicit operands of '
+                     'the CET shadow-stack instructions; the reference iform '
+                     'carries the memory operand and not the shadow-stack '
+                     'register'),
+    'M12': Rule('M12', 'reference-defect', {SUPERSET},
+                note='SYSRET loads RFLAGS from R11; XED_IFORM_SYSRET64 names '
+                     'it and AGREES with the tracer while XED_IFORM_SYSRET '
+                     'omits it against an identical tracer set, so the '
+                     'reference disagrees with itself about one instruction'),
+}
+
+
+# ===========================================================================
+# aarch64 -- adjudicate.ADJ maps a disagreement SIGNATURE to a verdict string
+# and a prose reason.  The verdict prefix carries the mechanism; the prose
+# carries a row count, which is checked.
+# ===========================================================================
+_A64_VERDICT = [
+    # (regex over the verdict string, category, accounts)
+    (r'^MIXED\b',                       'tracer-defect',           False),
+    (r'\(\d+ rows?\)\s*/',              'tracer-defect',           False),
+    (r'^TRACER DEFECT',                 'tracer-defect',           True),
+    (r'^TRACER RIGHT -- REFERENCE DEFECT', 'reference-defect',     True),
+    (r'^TRACER RIGHT -- REFERENCE-SIDE',   'reference-defect',     True),
+    (r'^REFERENCE GAP',                 'reference-gap',           True),
+    (r'^REPRESENTATIVE ARTIFACT',       'representative-artifact', True),
+    (r'^NEEDS RULING',                  'needs-ruling',            True),
+    # A signature whose adjudication says CLOSED must have no rows left.  If
+    # one matches, the close was not a close.
+    (r'^CLOSED',                        'tracer-defect',           True),
+]
+
+
+def aarch64_rules(adj):
+    """adjudicate.ADJ -> {signature: Rule}."""
+    out = {}
+    for sig, (verdict, why) in adj.items():
+        cat, accounts, expect = None, True, None
+        for rx, c, a in _A64_VERDICT:
+            if re.search(rx, verdict):
+                cat, accounts = c, a
+                break
+        if cat is None:
+            continue                      # no rule -> UNACCOUNTED, reported
+        stated = stated_rows(why)
+        if verdict.startswith('CLOSED'):
+            # A CLOSED adjudication's prose states the count the class had
+            # BEFORE it was closed, so that number is history, not a claim
+            # about the measurement.  The claim a close makes is that the class
+            # is empty, and expect=() enforces exactly that: any surviving row
+            # reports as a conflict.
+            expect, stated = frozenset(), None
+        out[sig] = Rule(sig, cat, expect, accounts=accounts,
+                        stated=stated, note=verdict)
+    return out
+
+
+# ===========================================================================
+# riscv64 -- compare.ADJUDICATED assigns a kind per signature PART; the row's
+# adjudication column is the '+'-joined set of kinds, or one of the derived
+# fallbacks.
+# ===========================================================================
+RISCV = {
+    'REF-ARTIFACT':  Rule('REF-ARTIFACT', 'reference-defect', ANY,
+                          note='the reference performs a read the ISA does '
+                               'not make this encoding depend on'),
+    'SCOPE-XLATE':   Rule('SCOPE-XLATE', 'scope-exclusion', {SUBSET},
+                          note='address translation / PMP / platform state: '
+                               'an enumerated exclusion the tracer applies '
+                               'and the reference leaks'),
+    'REF-UNDERREAD': Rule('REF-UNDERREAD', 'reference-defect', {SUPERSET},
+                          note='Sail writes a sub-range, so the preserve of '
+                               'the rest calls no read accessor'),
+    # Derived fallbacks.  They restate the set relation and name no cause.
+    'TRACER-GAP':    Rule('TRACER-GAP', 'unaccounted', ANY, accounts=False,
+                          note='derived fallback: every signature part is a '
+                               'miss and none is adjudicated'),
+    'TRACER-EXTRA':  Rule('TRACER-EXTRA', 'unaccounted', ANY, accounts=False,
+                          note='derived fallback: every part is an extra and '
+                               'none is adjudicated'),
+    'MIXED':         Rule('MIXED', 'unaccounted', ANY, accounts=False,
+                          note='derived fallback: misses and extras, none '
+                               'adjudicated'),
+}
+
+
+def riscv_rule(label):
+    """A '+'-joined label is only accounted when EVERY part is."""
+    if not label:
+        return None
+    parts = label.split('+')
+    rules = [RISCV.get(p) for p in parts]
+    if any(r is None for r in rules):
+        return None
+    if len(rules) == 1:
+        return rules[0]
+    # A compound label means the row was only PARTLY adjudicated: some
+    # signature part matched a rule and the rest fell to a derived fallback.
+    # Partly explained is not explained.
+    accounts = all(r.accounts for r in rules)
+    cats = [r.category for r in rules if r.category != 'unaccounted']
+    return Rule(label, cats[0] if len(set(cats)) == 1 else 'unaccounted',
+                ANY, accounts=accounts,
+                note='compound: ' + ' + '.join(r.note for r in rules))
+
+
+# ===========================================================================
+# mipsel -- adjudicate.RULES are applied to build the REFERENCE, not to
+# adjudicate a disagreement, so the adjudication_rules column of a DISAGREE row
+# says how the reference was formed, never why the two sides differ.  There is
+# no disagreement-adjudication table for this ISA: any mipsel disagreement is
+# UNACCOUNTED until one is written.  At HEAD there are none, and this table
+# exists so that the first one to appear reports as UNACCOUNTED rather than
+# inheriting a reference-construction rule id it has nothing to do with.
+# ===========================================================================
+MIPSEL = {}
+
+
+def mipsel_rule(label):
+    return MIPSEL.get(label)
+
+
+# ===========================================================================
+# riscv64, EXECUTION leg -- compare_exec.py against spike's commit log.
+#
+# Separate from RISCV above, which adjudicates the STATIC (Sail) leg.  The two
+# legs disagree for different reasons and must not share a rule table: a Sail
+# modelling gap says nothing about what spike's logger prints, and vice versa.
+#
+# Every rule here names a mechanism located in spike's own source, so it can be
+# rechecked when spike is bumped rather than believed.
+# ===========================================================================
+RISCV_EXEC = {
+    # riscv/execute.cc, commit_log_print_insn: the loop over log_reg_write
+    # begins `if (item.first == 0) continue;`.  item.first is (rd << 4) | kind,
+    # so the entry it skips is exactly an integer write to x0.  The reference
+    # therefore cannot ever report an x0 write; the tracer's is surplus.
+    'REF-X0-DISCARD':   Rule('REF-X0-DISCARD', 'reference-gap', {SUPERSET},
+                             note='spike suppresses x0 writes outright '
+                                  '(execute.cc); a tracer x0 write has no '
+                                  'counterpart to disagree with'),
+
+    # A CSR spike names that the tracer's GenericRegId vocabulary has no id
+    # for.  Reported as vocabulary, never as a dropped write, and never
+    # silently mapped onto a neighbouring id.
+    'REF-CSR-UNMAPPED': Rule('REF-CSR-UNMAPPED', 'vocabulary-gap', {SUBSET},
+                             note='the execution reference names a CSR no '
+                                  'GenericRegId spells'),
+
+    # riscv/csrs.cc:69 -- spike's CSR log entry is written from inside the CSR
+    # WRITE ACCESSOR.  An FP operation that raises no new exception flag never
+    # calls it, so the reference reports no fcsr destination at all, while the
+    # tracer names the architectural destination whether or not this execution
+    # changed it.  The reference under-reports by construction.
+    'REF-CSR-ACCESSOR-ONLY':
+        Rule('REF-CSR-ACCESSOR-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs a CSR write only when the write accessor ran; '
+                  'the tracer names the architectural destination'),
+
+    # riscv/vector_unit.cc:168 -- log_elt_write_if_needed() is ELEMENT
+    # triggered.  A fully masked-off vector operation writes no element and so
+    # logs no vector destination, though the opcode's destination register is
+    # architecturally exactly that register.
+    'REF-VEC-ELEMENT-ONLY':
+        Rule('REF-VEC-ELEMENT-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs vector ELEMENT writes; a fully masked-off op '
+                  'logs no destination at all'),
+
+    # riscv/vector_unit.h -- vectorUnit_t::elt() is ELEMENT triggered on the
+    # read side exactly as it is on the write side, so an instruction under a
+    # tail-undisturbed or mask-undisturbed policy READS its own destination
+    # register back to preserve the elements it does not produce.  That is a
+    # real architectural read of a real architectural source; the tracer's
+    # template names the operand registers and not the destination-as-source.
+    # It is charged to the tracer, not excused: an out-of-order model that
+    # renames vector registers needs this dependence.
+    'REF-VEC-TAIL-READ':
+        Rule('REF-VEC-TAIL-READ', 'tracer-defect', {SUBSET},
+             note='the destination vector register is architecturally a '
+                  'SOURCE under tail-/mask-undisturbed; the reference reads '
+                  'it and the tracer does not name it'),
+
+    # A vector register the reference read that is neither an operand the
+    # tracer names nor the destination -- kept as its own label so it can
+    # never be absorbed into the tail-read explanation without evidence.
+    'REF-VEC-ELEMENT-READ':
+        Rule('REF-VEC-ELEMENT-READ', 'needs-ruling', {SUBSET}, accounts=False,
+             note='the reference read a vector register the tracer does not '
+                  'name and that is not the instruction destination; kept '
+                  'separate so it can never be absorbed into the tail-read '
+                  'explanation without evidence'),
+
+    # riscv/insns/c_li.h -- `c.li rd, imm` is architecturally
+    # `addi rd, x0, imm`, but spike implements it as WRITE_RD(imm) and never
+    # touches READ_REG, so the architectural x0 operand is absent from the
+    # reference's read log.  The tracer names it.  The reference under-reports
+    # a source it does not model, which is a reference gap, not a tracer
+    # surplus of anything real.
+    'REF-C-IMM-NO-X0-READ':
+        Rule('REF-C-IMM-NO-X0-READ', 'reference-gap', {SUPERSET},
+             note='spike computes the compressed immediate forms directly '
+                  '(c_li.h: WRITE_RD(imm)) and never reads the x0 operand '
+                  'the encoding names'),
+
+    # A FENCE has no register operands; the tracer names REG_SYS -- the
+    # residual system-state id -- as its source so that a consumer can order
+    # against the barrier.  Spike models memory ordering as a property of its
+    # execution and has no register standing for it, so the reference cannot
+    # report the dependence at all.  The reference models this state not at
+    # all: a reference gap, not a tracer invention.
+    'REF-NO-ORDERING-STATE':
+        Rule('REF-NO-ORDERING-STATE', 'reference-gap', {SUPERSET},
+             note='the tracer names REG_SYS as a FENCE source so consumers '
+                  'can order against the barrier; spike has no register '
+                  'representing memory-ordering state'),
+
+    # THE CURRENT XLEN.  helper_vsetvl() reads CPURISCVState::xl to size the
+    # new vl, and that field has a declared regfile target, so the read
+    # reaches the wire as REG_SYS on every vsetvli / vsetivli / vsetvl.  Spike
+    # keeps the same fact in `state.xlen`, a machine MODE rather than a CSR or
+    # a GPR, so its commit log has no register to name it with.  A reference
+    # gap of exactly REF-NO-ORDERING-STATE's shape: the reference does not
+    # model the state at all, so it cannot report the dependence.
+    #
+    # MEASURED SUPERSET ON EVERY ROW IT LABELS.  Both branches that apply it
+    # sit inside a test that the reference's set is a SUBSET of the tracer's,
+    # so a row this rule covers can never be one where the tracer dropped
+    # something a reference stated.
+    'REF-NO-XLEN-STATE':
+        Rule('REF-NO-XLEN-STATE', 'reference-gap', {SUPERSET},
+             note='the tracer names REG_SYS as a vset source because '
+                  'helper_vsetvl() reads CPURISCVState::xl; spike keeps the '
+                  'current XLEN as a machine mode with no register standing '
+                  'for it.  Where the row also carries REG_ZERO that is the '
+                  'x0 operand the reference computes past, as '
+                  'REF-C-IMM-NO-X0-READ describes'),
+
+    # The read-side twin of REF-VEC-ELEMENT-ONLY.  vectorUnit_t::elt() is
+    # ELEMENT triggered on the read side too, so a fully masked-off (or
+    # vl==0) vector operation reads no element of its operand registers and
+    # logs no vector source, though the encoding names exactly those
+    # registers and the tracer is right to keep naming them.
+    'REF-VEC-ELEMENT-READ-ONLY':
+        Rule('REF-VEC-ELEMENT-READ-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs vector ELEMENT reads; a fully masked-off op '
+                  'reads no element and so logs no source at all'),
+
+    # A source register both sides name, whose value the tracer's own
+    # published register model does not reproduce.  The model is the one
+    # format.rst 5.4 mandates for a consumer, so a mismatch means a consumer
+    # following the spec would compute the wrong operand.
+    'SRC-VALUE-MISMATCH':
+        Rule('SRC-VALUE-MISMATCH', 'tracer-defect', {SUBSET},
+             note='the register model format.rst 5.4 defines (REGFILE seed + '
+                  'destination snapshots) does not reproduce the operand '
+                  'value the run actually read'),
+
+    # A register both sides name, with different values.  There is no
+    # vocabulary reading of this: one of the two is wrong about what the
+    # machine did, and it is not the machine.
+    'VALUE-MISMATCH':
+        Rule('VALUE-MISMATCH', 'tracer-defect', {SUBSET},
+             note='both sides name the register; the values differ, so the '
+                  'tracer carries a value the run did not produce'),
+
+    # One GenericRegId, several architectural CSR writes in one instruction
+    # (vsetvli writes vstart, vl and vtype).  The id cannot carry them, so no
+    # value comparison at this granularity would be honest.
+    'CSR-FOLD-MULTI':
+        Rule('CSR-FOLD-MULTI', 'vocabulary-gap', {SUBSET},
+             note='the reference records several CSR writes that the tracer '
+                  'folds onto one GenericRegId, which can hold one value'),
+
+    # A CSR the reference writes that the guest's architecture does not have.
+    # spike at this revision carries the matrix/Zvt extension and clears its
+    # `mtype` (0xC23) inside vectorUnit_t::set_vl (vector_unit.cc:148-152), so
+    # every vsetvl logs a write to a register RVV 1.0 vsetvli does not touch.
+    # The tracer is right to have no id for it.
+    'REF-NONARCH-CSR':
+        Rule('REF-NONARCH-CSR', 'reference-defect', {SUBSET},
+             note='the reference logs a write to a CSR outside the ISA the '
+                  'guest was built for (spike Zvt mtype on every vsetvl)'),
+
+    # target/riscv/insn_trans/trans_rva.c.inc:74 -- QEMU implements SC with
+    # tcg_gen_atomic_cmpxchg_tl, which performs a REAL load, and the memop
+    # callback delivers it.  Architecturally a store-conditional writes and
+    # returns a status bit; it does not read.  DECIDED the way #177 decided
+    # the identical AArch64 case: the load is kept, because the trace records
+    # what EXECUTED and a delivered access with no slot to land in is worse
+    # than a superset the reference explains.  Spike models the architecture
+    # and QEMU ran the emulation; neither is wrong, and the row is a named
+    # TRACER-SUPERSET rather than an open question.
+    'QEMU-SC-CMPXCHG':
+        Rule('QEMU-SC-CMPXCHG', 'emulation-artefact', {SUPERSET},
+             note='QEMU lowers store-conditional onto tcg_gen_atomic_cmpxchg, '
+                  'which really reads the line; the tracer records the access '
+                  'the guest performed, which the architecture does not have'),
+}
+
+
+def riscv_exec_rule(label):
+    return RISCV_EXEC.get(label) if label else None

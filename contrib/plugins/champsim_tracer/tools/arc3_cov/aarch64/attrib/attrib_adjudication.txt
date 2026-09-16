@@ -1,0 +1,218 @@
+AARCH64 REGISTER ATTRIBUTION -- ADJUDICATED SUMMARY
+==============================================================
+
+denominator          3920 opcode subjects (opcodes.tsv)
+probed               3920
+unprobed             0
+agree                3812
+disagree             108
+
+BY REFERENCE RANK
+  1:MRA        agree     3778
+  1:MRA        disagree  32
+  2:LLVM-MC    agree     34
+  2:LLVM-MC    disagree  76
+
+ADJUDICATION OF THE 108 DISAGREEING ROWS
+     70  REFERENCE GAP -- RANK 2 MODELS NEITHER FP STATUS NOR LEGALITY
+     10  TRACER DEFECT -- OPEN
+      7  REFERENCE GAP -- THE EXTRACTOR STOPS AT THE SYSINSTR CALL
+      6  REFERENCE GAP -- RANK 2 HAS NO LEGALITY AXIS
+      5  REFERENCE GAP -- SHARED FUNCTION THE EXTRACTOR CANNOT PARSE
+      5  REFERENCE GAP -- NOT A TRACER DEFECT
+      2  REFERENCE GAP -- SVCR SPELT AS A PSTATE BIT
+      1  TRACER RIGHT -- REFERENCE DEFECT (OPEN, NAMED)
+      1  REPRESENTATIVE ARTIFACT (OPEN, NAMED)
+      1  TRACER RIGHT -- REFERENCE-SIDE R7.1 (OPEN, NAMED)
+
+SIGNATURES, LARGEST FIRST
+
+    51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
+        verdict: REFERENCE GAP -- RANK 2 MODELS NEITHER FP STATUS NOR LEGALITY
+        the post-2022-12 FP8 and FAMINMAX additions
+        (f1cvt/f2cvt/bf1cvt/bf2cvt, fmlall*, fcvtnb, fvdotb) and the SVE2
+        quadword reductions. The tracer names the FPCR read, the FPSR
+        cumulative-exception write and the CPACR/CPTR enable gate; LLVM MC
+        names none of the three. 51 rows, all rank 2.
+
+    10  DST+trc:FCSR SRC+trc:SYSFPEN
+        verdict: REFERENCE GAP -- RANK 2 MODELS NEITHER FP STATUS NOR LEGALITY
+        famax/famin: an FPSR write and the enable gate, with no FPCR read
+        because the maximum-of-absolute-values forms consult no rounding
+        mode. 10 rows, all rank 2.
+
+     9  SRC+trc:FCSR SRC+trc:SYSFPEN
+        verdict: REFERENCE GAP -- RANK 2 MODELS NEITHER FP STATUS NOR LEGALITY
+        fmlall and the FP8 dot products: an FPCR read and the enable gate. 9
+        rows, all rank 2.
+
+     8  SRC+trc:MATRIX
+        verdict: TRACER DEFECT -- OPEN
+        the SME2 ADD/SUB "array results" forms (add_za_zzv / add_za_zzw and
+        the SUB twins). add_za_zzv.xml computes from the Z operands alone
+        and stores -- `ZAvector[vec, VL] = result` -- with no read. The
+        ACCUMULATE form add_za_zw does read ZA and there the tracer agrees.
+        Capstone reports both with the same operand types and the same
+        READ|WRITE access on the tile, and a count-based discriminator
+        collides (a 4x4 accumulate and a 2x2 results form both carry four Z
+        registers), so this waits for ARC 3's QEMU-derived dataflow. 8 rows.
+
+     6  SRC+trc:SYSFPEN
+        verdict: REFERENCE GAP -- RANK 2 HAS NO LEGALITY AXIS
+        the SVE forms of the FEAT_CPA checked-pointer-arithmetic
+        instructions -- addpt/subpt/madpt/mlapt on z registers. They are
+        integer operations, so no FP status word is involved, but they are
+        SVE encodings and go through CheckSVEEnabled, which R7.4 makes a
+        real source. Measured, not assumed: the SCALAR forms of the same
+        four mnemonics (addpt x0, sp, x0 and its ten siblings) carry no gate
+        on either side and agree, so the gate is attached to the SVE
+        encodings and not to the mnemonic. 6 rows, all rank 2.
+
+     5  DST+trc:FCSR
+        verdict: REFERENCE GAP -- SHARED FUNCTION THE EXTRACTOR CANNOT PARSE
+        no longer MIXED: the famax/famin half of this signature moved to
+        DST+trc:FCSR SRC+trc:SYSFPEN when the enable gate was given its own
+        token, leaving one mechanism. All five surviving rows are frecpe,
+        rank 1, and the reference under-reports: FPRecipEstimate is one of
+        the shared functions aslparse cannot parse -- it is in the
+        extractor's own LIMITATIONS -- so the FPSR write it performs never
+        reaches the reference, while FRECPE does raise IDC/IOC/DZC. The
+        tracer is right and records more; the fix path is the extractor, not
+        the tracer. 5 rows.
+
+     5  SRC+trc:SSP
+        verdict: REFERENCE GAP -- THE EXTRACTOR STOPS AT THE SYSINSTR CALL
+        gcspopcx / gcspopx / gcspushx / gcspushm / gcsss1. The guarded
+        control stack operations read GCSPR_ELx to find the stack before
+        they can move it, and the tracer records that read; the reference's
+        execute ASL bottoms out in AArch64.SysInstr, which the extractor
+        models as a single write and never as a read. 5 rows.
+
+     2  DST+trc:SSP
+        verdict: REFERENCE GAP -- THE EXTRACTOR STOPS AT THE SYSINSTR CALL
+        gcspopm / gcsss2, the SYSL-format half of the same class: the
+        reference records the GCSPR read and not the write back. 2 rows.
+
+     2  DST+trc:VCTRL SRC+trc:VCTRL
+        verdict: REFERENCE GAP -- SVCR SPELT AS A PSTATE BIT
+        smstart / smstop. The tracer names SVCR, the architectural register
+        whose two bits ARE PSTATE.SM and PSTATE.ZA, and records the read
+        (SetPSTATE_SM zeroes the vector state only when the mode CHANGES)
+        and the write. The reference spells the same state as PSTATE.SM,
+        which this harness classifies Tier B -- execution context the
+        comparison excludes -- so on the Tier-A axis the tracer strictly
+        adds. The same fact, named on one side only; the reference is not
+        corrected to match because PSTATE.SM is Tier B on 2,779 OTHER
+        subjects where the tracer has no counterpart, and moving the whole
+        class to Tier A to close two rows would open those. 2 rows.
+
+     2  SRC+trc:GPR# SRC+trc:GPR#
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        sysp/tlbip are the 128-bit system-instruction pair form, whose
+        execute ASL bottoms out in an operation this extractor does not
+        model. The tracer names the two X registers, which is right.
+
+     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
+        verdict: TRACER RIGHT -- REFERENCE DEFECT (OPEN, NAMED)
+        hint #35 is NOT chkfeat, which this entry used to claim. CHKFEAT is
+        CRm:op2 == '0101 000', hint #40; hint #35 is CRm:op2 == '0100 011',
+        which matches no arm of hint.xml's decode case and therefore
+        executes as a NOP. The reference gives it CHKFEAT's read and write
+        of x16 because the SystemHintOp variable the decode assigns never
+        gets a value on this path, so the execute section's `case op of`
+        sees UNKNOWN and unions EVERY arm. The tracer recording nothing is
+        right, and chkfeat itself is now recorded: isaxcheck --hex=1f2503d5
+        gives SRC{REG_GPR16} DST{REG_GPR16}, where before it gave neither.
+        WHAT IS MISSING: the decode ASL that routes an unallocated encoding
+        to EndOfInstruction() is not in the section set mra_ref runs, so
+        modelling that call cannot reach this row. MEASURED, not assumed: an
+        EndOfInstruction builtin was implemented and swept, and ZERO of the
+        3,920 subjects reached it, so the instrument was inert and was
+        reverted rather than shipped. The fix is section selection in
+        mra_ref, not a builtin. 1 row.
+
+     1  DST+trc:GPR#
+        verdict: TRACER DEFECT -- OPEN
+        ldg has no base-register writeback; the tracer records one. 1 row.
+
+     1  DST+trc:GPR# DST+trc:GPR# SRC+trc:SYS
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        mrrs, the 128-bit system-register read pair; same modelling gap.
+
+     1  DST+trc:SYS SRC+trc:GPR# SRC+trc:GPR#
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        msrr, same.
+
+     1  DST+trc:SYS SRC+trc:ZERO
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        msr <pstatefield>, #imm; the extractor produced no effect for it.
+
+     1  SRC+ref:GPR#
+        verdict: REPRESENTATIVE ARTIFACT (OPEN, NAMED)
+        tlbi vmalle1is: the chosen representative encoding carries Rt=28 in
+        a field the alias requires to be 0b11111, so the reference reads an
+        X register the real encoding does not have. The tracer is right on
+        both halves -- it names the TLBI write and does not invent the
+        register. (psel, which used to hold this key, is CLOSED: its w12
+        slice index was parked in Capstone's pred.vec_select, which the
+        operand walk dropped because the plugin operand ABI has one register
+        field per operand. It now arrives as an implicit read, and only when
+        the field holds a W register -- on the predicate-PAIR forms the same
+        field holds a second DESTINATION, and without that test the gate
+        reported a phantom predicate read on 16,384
+        whilegt/whilehi/whilele/whilels encodings and 56 pext.) WHAT IS
+        MISSING for the surviving row: the representative is picked in
+        build_opcodes.py from the encoding table without applying the
+        alias's own field constraints, so re-picking it is a generator
+        change plus a regeneration of opcodes.tsv, which re-keys every row
+        in the table. MEASUREMENT that sizes it: 1 row, and the constraint
+        class is the SYS-format aliases with a fixed Rt, of which this table
+        holds one. 1 row.
+
+     1  SRC+ref:ZT0
+        verdict: TRACER RIGHT -- REFERENCE-SIDE R7.1 (OPEN, NAMED)
+        `movt zt0[8], x2` writes 64 bits of the 512-bit SME2 lookup-table
+        register, so the reference makes the destination a source to model
+        the preserve of the other 448 -- movt_zt_r.xml is the scratch
+        writeback idiom, bits(512) result = ZT0[512]; Elem[result, offset,
+        64] = X[t, 64]; ZT0[512] = result. R7.1 settles the verdict: a write
+        narrower than the register does not acquire a source, because rename
+        does not know the data-width-scope of the next reader. WHAT IS
+        MISSING is not the verdict but a MECHANICAL criterion: partial
+        writeback coverage is the same shape for merging-predicated SVE and
+        single-lane LD1, which METHOD.md requires to KEEP their read, and
+        R7.1 separates them only as a judgement about what the INSTRUCTION
+        takes as a source. MEASUREMENT that sizes the blast radius of
+        applying it as a blanket rule: 2,096 subjects have a destination the
+        reference also calls a source, and 2,052 of them AGREE with the
+        tracer today -- so a blanket rule would close 1 row and open up to
+        2,052. 1 row.
+
+     1  SRC+trc:VEC#
+        verdict: TRACER DEFECT -- OPEN
+        pmov Zd, Pn.B with imm == 0 writes the whole destination --
+        pmov_z_pi.xml takes `result = Zeros(VL)` on that path and `result =
+        Z[d, VL]` only when imm != 0. 1 row.
+
+TIER B -- architectural state outside the tracer's register space
+(execution-context PSTATE bits and the PC; excluded from the verdict
+ above, counted here so nothing is hidden)
+  PSTATE.EL        3422 rows
+  IP               2946 rows
+  PSTATE.SM        2769 rows
+  PSTATE.ZA        364 rows
+  PSTATE.UAO       134 rows
+  PSTATE.A         2 rows
+
+BY INSTRUCTION CLASS
+  (none)           4 rows  agree     4 (100.0%)  disagree     0
+  advsimd        696 rows  agree   692 ( 99.4%)  disagree     4
+  float          218 rows  agree   218 (100.0%)  disagree     0
+  fpsimd          89 rows  agree    89 (100.0%)  disagree     0
+  general        921 rows  agree   920 ( 99.9%)  disagree     1
+  mortlach        54 rows  agree    54 (100.0%)  disagree     0
+  mortlach2      501 rows  agree   492 ( 98.2%)  disagree     9
+  post-2022-12   106 rows  agree    34 ( 32.1%)  disagree    72
+  sve            788 rows  agree   787 ( 99.9%)  disagree     1
+  sve2           459 rows  agree   454 ( 98.9%)  disagree     5
+  system          84 rows  agree    68 ( 81.0%)  disagree    16

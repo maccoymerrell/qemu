@@ -1,0 +1,4 @@
+#count	signature	rules	opcodes
+15	SRC-miss{SYS} DST-miss{SYS}	Q-TRAP	break sdbbp syscall teq teqi tge tgei tgeiu tgeu tlt tlti tltiu tltu tne tnei
+2	DST-miss{LLBIT}	Q-LLBIT	ll lle
+2	SRC-miss{LLBIT} DST-miss{LLBIT}	Q-LLBIT	sc sce

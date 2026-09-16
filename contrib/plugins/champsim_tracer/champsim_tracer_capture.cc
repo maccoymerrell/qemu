@@ -154,7 +154,20 @@ public:
                             "refusal, not an empty result\n", env_, path);
                     abort();
                 }
-                setvbuf(f_, nullptr, _IOFBF, 1 << 20);
+                /*
+                 * Line buffered, not block buffered.
+                 *
+                 * The corpora are immortal (see below): nothing closes them,
+                 * and qemu-user's exit does not come back through stdio, so a
+                 * block-buffered stream ends its file in the middle of a row.
+                 * A torn last row is worse than a missing one -- it parses,
+                 * it is short a column, and a scorer reports a bucket for an
+                 * encoding nobody wrote.  A measured riscv64 capture ended in
+                 * exactly that row, in both corpora it wrote.  A row per
+                 * write costs the capture, which is apparatus, nothing the
+                 * release build pays.
+                 */
+                setvbuf(f_, nullptr, _IOLBF, 1 << 16);
                 fprintf(f_, "#so plugin=%s emulator=%s\n",
                         build_id_of("champsim_tracer"), build_id_of(nullptr));
                 fputs(header_, f_);

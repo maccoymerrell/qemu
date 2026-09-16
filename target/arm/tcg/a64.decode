@@ -341,8 +341,12 @@ LD_lit_v        00 011 1 00 ................... ..... @ldlit sz=2 sign=0 !word=v
 LD_lit_v        01 011 1 00 ................... ..... @ldlit sz=3 sign=0 !word=vec.load
 LD_lit_v        10 011 1 00 ................... ..... @ldlit sz=4 sign=0 !word=vec.load
 
-# PRFM
-NOP             11 011 0 00 ------------------- ----- !word=nop
+# PRFM (literal).  Prefetch memory: QEMU emulates no caches and lowers this
+# to nothing, but the encoding NAMES an address and a consumer should be told
+# which one.  The rule exists so the decode site has the operand to state;
+# trans_PRFM_lit() emits no ops, exactly as the NOP rule it replaces did.
+&prfm_lit       imm
+PRFM_lit        11 011 0 00 ................... ----- &prfm_lit imm=%imm19 !word=prefetch
 
 &ldstpair       rt2 rt rn imm sz sign w p
 @ldstpair       .. ... . ... . imm:s7 rt2:5 rn:5 rt:5 &ldstpair
@@ -456,8 +460,10 @@ LDR_i           10 111 0 00 10 0 ......... 11 ..... ..... @ldst_imm_pre sign=1 e
 LDR_i           00 111 0 00 11 0 ......... 11 ..... ..... @ldst_imm_pre sign=1 ext=1 sz=0 !word=load
 LDR_i           01 111 0 00 11 0 ......... 11 ..... ..... @ldst_imm_pre sign=1 ext=1 sz=1 !word=load
 
-# PRFM : prefetch memory: a no-op for QEMU
-NOP             11 111 0 00 10 0 --------- 00 ----- ----- !word=nop
+# PRFUM: prefetch, unscaled 9-bit signed offset from a base register.
+&prfm           rn imm
+@prfm_unscaled  .. ... . .. .. . imm:s9 .. rn:5 ----- &prfm
+PRFM_i          11 111 0 00 10 0 ......... 00 ..... ----- @prfm_unscaled !word=prefetch
 
 STR_v_i         sz:2 111 1 00 00 0 ......... 00 ..... ..... @ldst_imm sign=0 ext=0 !word=vec.store
 STR_v_i         00 111 1 00 10 0 ......... 00 ..... ..... @ldst_imm sign=0 ext=0 sz=4 !word=vec.store
@@ -491,8 +497,9 @@ LDR_i           10 111 0 01 10 ............ ..... ..... @ldst_uimm sign=1 ext=0 
 LDR_i           00 111 0 01 11 ............ ..... ..... @ldst_uimm sign=1 ext=1 sz=0 !word=load
 LDR_i           01 111 0 01 11 ............ ..... ..... @ldst_uimm sign=1 ext=1 sz=1 !word=load
 
-# PRFM
-NOP             11 111 0 01 10 ------------ ----- ----- !word=nop
+# PRFM: prefetch, unsigned 12-bit offset scaled by 8 (the size field is 11 on
+# every encoding that reaches here, so the scale is fixed).
+PRFM_ui         11 111 0 01 10 imm:12 rn:5 ----- &prfm !word=prefetch
 
 STR_v_i         sz:2 111 1 01 00 ............ ..... ..... @ldst_uimm sign=0 ext=0 !word=vec.store
 STR_v_i         00 111 1 01 10 ............ ..... ..... @ldst_uimm sign=0 ext=0 sz=4 !word=vec.store
@@ -513,8 +520,11 @@ LDR             10 111 0 00 10 1 ..... ... . 10 ..... ..... @ldst sign=1 ext=0 s
 LDR             00 111 0 00 11 1 ..... ... . 10 ..... ..... @ldst sign=1 ext=1 sz=0 !word=load
 LDR             01 111 0 00 11 1 ..... ... . 10 ..... ..... @ldst sign=1 ext=1 sz=1 !word=load
 
-# PRFM
-NOP             11 111 0 00 10 1 ----- -1- - 10 ----- ----- !word=nop
+# PRFM: prefetch, register offset.  The extend and the shift are deliberately
+# not carried: they change the address's VALUE, not the set of places the
+# value came from, and the emulation computes no value to be consistent with.
+&prfm_rr        rn rm
+PRFM_rr         11 111 0 00 10 1 rm:5 -1- - 10 rn:5 ----- &prfm_rr !word=prefetch
 
 STR_v           sz:2 111 1 00 00 1 ..... ... . 10 ..... ..... @ldst sign=0 ext=0 !word=vec.store
 STR_v           00 111 1 00 10 1 ..... ... . 10 ..... ..... @ldst sign=0 ext=0 sz=4 !word=vec.store

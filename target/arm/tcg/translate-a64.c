@@ -20,6 +20,7 @@
 
 #include "exec/exec-all.h"
 #include "exec/plugin-gen.h"
+#include "exec/insn-dataflow.h"
 #include "translate.h"
 #include "translate-a64.h"
 #include "qemu/log.h"
@@ -39,6 +40,45 @@ static const char *regnames[] = {
     "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
     "x24", "x25", "x26", "x27", "x28", "x29", "lr", "sp"
 };
+
+/*
+ * The name the program counter's TCG global is registered under.
+ *
+ * Spelled once because two places need the same string: the registration in
+ * a64_translate_init(), and the decode sites that name the register in a
+ * dataflow statement where no op does.  An atom resolves by looking the name
+ * up among the globals, so the two spellings agreeing is not a nicety -- a
+ * mismatch resolves to nothing and drops the source.
+ */
+#define A64_DF_PC_NAME  "pc"
+
+/*
+ * Register 31, where the emitter folded the zero register away.
+ *
+ * XZR/WZR has no storage and no TCG global: cpu_reg() answers reg 31 with a
+ * fresh temp holding zero, so a read of it leaves `movi 0` in the op stream
+ * and a write of it leaves ops whose result nothing architectural receives.
+ * An op-stream reader sees a value that came from nothing in the first case
+ * and a temp in the second, and in neither can it name the register the
+ * encoding plainly used.  The decode site still has the field, so it says so.
+ *
+ * Which DIRECTION cannot be answered by the accessor -- cpu_reg() serves a
+ * source and a destination alike and is handed only a number -- so the
+ * statement is made where the argument's role is settled, which is the decode
+ * rule or the shared emitter it reached.  @sp_form is the encodings where
+ * register 31 means the stack pointer instead, and there the fold never
+ * happened: cpu_reg_sp() hands back the real global and the reader names it.
+ */
+static void note_zero_reg(bool sp_form, int reg, unsigned dir)
+{
+    if (reg == 31 && !sp_form) {
+        if (dir == INSN_DF_RD) {
+            insn_dataflow_state_read(insn_df_zero());
+        } else {
+            insn_dataflow_state_write(insn_df_zero());
+        }
+    }
+}
 
 enum a64_shift_type {
     A64_SHIFT_TYPE_LSL = 0,
@@ -83,7 +123,7 @@ void a64_translate_init(void)
 
     cpu_pc = tcg_global_mem_new_i64(tcg_env,
                                     offsetof(CPUARMState, pc),
-                                    "pc");
+                                    A64_DF_PC_NAME);
     for (i = 0; i < 32; i++) {
         cpu_X[i] = tcg_global_mem_new_i64(tcg_env,
                                           offsetof(CPUARMState, xregs[i]),
@@ -164,6 +204,26 @@ static void gen_pc_plus_diff(DisasContext *s, TCGv_i64 dest, target_long diff)
         tcg_gen_addi_i64(dest, cpu_pc, (s->pc_curr - s->pc_save) + diff);
     } else {
         tcg_gen_movi_i64(dest, s->pc_curr + diff);
+        /*
+         * Without CF_PCREL the translator knows this address and folds the
+         * program counter into a constant, and the fold consumes the only op
+         * that would have named cpu_pc -- an op-stream reader is left with an
+         * address that depends on nothing.  The register is still in hand
+         * here, so it is stated, and bound to the TEMP rather than to the
+         * instruction so that a later reuse of @dest cannot inherit it.
+         *
+         * Only when @dest is not cpu_pc itself.  gen_a64_update_pc() passes
+         * the global, and that is QEMU maintaining its own program counter
+         * around a block edge or an exception rather than an instruction
+         * computing a value from it; the write is already in the op stream,
+         * and a read stated there would land on whichever instruction the
+         * epilogue happened to follow.
+         */
+        if (dest != cpu_pc) {
+            insn_dataflow_bind(tcgv_i64_temp(dest),
+                               insn_df_reg(A64_DF_PC_NAME));
+            insn_dataflow_state_read(insn_df_reg(A64_DF_PC_NAME));
+        }
     }
 }
 
@@ -530,6 +590,18 @@ TCGv_i64 cpu_reg(DisasContext *s, int reg)
     if (reg == 31) {
         TCGv_i64 t = tcg_temp_new_i64();
         tcg_gen_movi_i64(t, 0);
+        /*
+         * The temp carries the zero register's value, so anything computed
+         * from it has the zero register in its provenance rather than nothing
+         * at all -- which is the difference between "this address came from
+         * XZR" and "this address came from somewhere the reader lost".
+         *
+         * The binding is direction-free and states no access: it says what
+         * the temp HOLDS, and a later op that writes the temp (register 31 as
+         * a destination) overwrites it as it would any other value.  The
+         * access itself is stated by note_zero_reg() where the role is known.
+         */
+        insn_dataflow_bind(tcgv_i64_temp(t), insn_df_zero());
         return t;
     } else {
         return cpu_X[reg];
@@ -557,6 +629,13 @@ TCGv_i64 read_cpu_reg(DisasContext *s, int reg, int sf)
         }
     } else {
         tcg_gen_movi_i64(v, 0);
+        /*
+         * This accessor is a read by construction -- it copies the register
+         * out into a temp the caller consumes and never writes back -- so
+         * unlike cpu_reg() it can state the access as well as bind the value.
+         */
+        insn_dataflow_bind(tcgv_i64_temp(v), insn_df_zero());
+        insn_dataflow_state_read(insn_df_zero());
     }
     return v;
 }
@@ -1647,6 +1726,12 @@ static inline void gen_check_sp_alignment(DisasContext *s)
 
 static bool trans_B(DisasContext *s, arg_i *a)
 {
+    /*
+     * A branch's offset is an operand of the encoding, the way x86 states a
+     * jump's rel32; the address it makes is the transfer's, not a memory
+     * access's, so it is not a displacement.
+     */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
@@ -1655,6 +1740,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
 
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
     reset_btype(s);
@@ -1668,6 +1754,7 @@ static bool trans_CBZ(DisasContext *s, arg_cbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = read_cpu_reg(s, a->rt, a->sf);
     reset_btype(s);
@@ -1686,7 +1773,9 @@ static bool trans_TBZ(DisasContext *s, arg_tbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
+    note_zero_reg(false, a->rt, INSN_DF_RD);
     tcg_cmp = tcg_temp_new_i64();
     tcg_gen_andi_i64(tcg_cmp, cpu_reg(s, a->rt), 1ULL << a->bitpos);
 
@@ -1707,6 +1796,7 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
     if (a->c && !dc_isar_feature(aa64_hbc, s)) {
         return false;
     }
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     if (a->cond < 0x0e) {
@@ -2695,6 +2785,36 @@ static void handle_sys(DisasContext *s, bool isread,
         return;
     }
     case ARM_CP_DC_ZVA:
+        /*
+         * THE SYNTHETIC ADDRESS (fact 18).  The block this clears is named by
+         * Xt and written by a helper, so the op stream carries a call and no
+         * memop at all: a consumer is handed an instruction whose encoding
+         * plainly names an address and whose record touches no memory.  The
+         * decode site still holds the register, so it says so.
+         *
+         * The SIZE is the block size, which is a runtime property of the CPU
+         * (DCZID_EL0) rather than of the encoding, so it is taken from the
+         * same field the emulation uses.  There is no displacement and no
+         * index: DC ZVA's operand is a bare pointer, which is why one shape of
+         * note serves this and x86's modrm alike.
+         *
+         * Stated for this arm alone, where QEMU's own cpreg TYPE says the
+         * instruction accesses memory.  The cache-maintenance NOPs beside it
+         * (DC CVAU, IC IVAU and the rest) name an address too and are a
+         * coverage path, not an endpoint: separating the by-VA forms from the
+         * by-set/way and "all" forms needs a rule this commit does not have a
+         * QEMU-side source for, and guessing at one from the crm field would
+         * be invention rather than report.
+         */
+        {
+            InsnDataflowAtom base = insn_df_reg(regnames[rt]);
+
+            if (rt != 31) {
+                insn_dataflow_note_synthetic_ea(INSN_DF_WR,
+                                                4 << s->dcz_blocksize,
+                                                &base, 1, 0);
+            }
+        }
         /* Writes clear the aligned block of memory which rt points into. */
         if (s->mte_active[0]) {
             int desc = 0;
@@ -2901,6 +3021,23 @@ static void gen_load_exclusive(DisasContext *s, int rt, int rt2, int rn,
     TCGv_i64 dirty_addr, clean_addr;
     MemOp memop = check_atomic_align(s, rn, size + is_pair);
 
+    /*
+     * ATOMICITY (fact 13), stated at the five emitters that hold it.
+     *
+     * The ops of an atomic read-modify-write and the ops of the same
+     * arithmetic in three steps are the same ops; what separates them is the
+     * encoding -- an LL/SC pair, an LSE form, a CAS -- and only the decoder
+     * saw it.  On aarch64 there is no prefix to read off the byte stream
+     * either, so nothing downstream can recover it.
+     *
+     * The load half of an exclusive pair is flagged alongside the store half:
+     * it is the half that takes the reservation, and an instruction that
+     * takes one is not an ordinary load however its ops read.  Flagging the
+     * instruction leaves every register it touches where it was; the flag
+     * says how the access happened, not which registers it used.
+     */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
+
     s->is_ldex = true;
     dirty_addr = cpu_reg_sp(s, rn);
     clean_addr = gen_mte_check1(s, dirty_addr, false, rn != 31, memop);
@@ -2958,6 +3095,9 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     TCGLabel *done_label = gen_new_label();
     TCGv_i64 tmp, clean_addr;
     MemOp memop;
+
+    /* Atomicity: the store half of the exclusive pair.  See fact 13 above. */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
 
     /*
      * FIXME: We are out of spec here.  We have recorded only the address
@@ -3064,6 +3204,12 @@ static void gen_compare_and_swap(DisasContext *s, int rs, int rt,
     TCGv_i64 clean_addr;
     MemOp memop;
 
+    /* Atomicity: CAS is one atomic access.  See fact 13 above. */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
+    note_zero_reg(false, rs, INSN_DF_RD);
+    note_zero_reg(false, rs, INSN_DF_WR);
+    note_zero_reg(false, rt, INSN_DF_RD);
+
     if (rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -3083,6 +3229,9 @@ static void gen_compare_and_swap_pair(DisasContext *s, int rs, int rt,
     TCGv_i64 clean_addr;
     int memidx = get_mem_index(s);
     MemOp memop;
+
+    /* Atomicity: a single atomic access, despite the "pair". */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
 
     if (rn == 31) {
         gen_check_sp_alignment(s);
@@ -3274,12 +3423,81 @@ static bool trans_CAS(DisasContext *s, arg_CAS *a)
     return true;
 }
 
+/*
+ * PRFM: the synthetic address (fact 18).
+ *
+ * A prefetch names an address and QEMU lowers it to nothing -- there is no
+ * memop, so there is nothing for the op-stream reader to walk, and a consumer
+ * is handed an instruction whose encoding plainly carries an address and
+ * whose record touches no memory.  The decode site holds the operands, so it
+ * states them; these functions emit no ops, exactly as the NOP rule they
+ * replaced did, so the emulation is unchanged.
+ *
+ * SIZE is the prefetch's own operand size, which is 8 on every aarch64 form
+ * (the rules are all in the size==11 space).  SCALE AND SHIFT ARE NOT CARRIED,
+ * per the note's own contract: they change the address's value, not the set of
+ * places the value came from, and the emulation computes no value here for
+ * them to be consistent with.
+ */
+static void note_prfm_ea(const InsnDataflowAtom *parts, unsigned nparts,
+                         int64_t disp)
+{
+    insn_dataflow_note_synthetic_ea(INSN_DF_RD, 8, parts, nparts, disp);
+}
+
+static bool trans_PRFM_lit(DisasContext *s, arg_prfm_lit *a)
+{
+    InsnDataflowAtom base = insn_df_reg(A64_DF_PC_NAME);
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    insn_dataflow_state_read(insn_df_reg(A64_DF_PC_NAME));
+    note_prfm_ea(&base, 1, a->imm);
+    return true;
+}
+
+static bool trans_PRFM_i(DisasContext *s, arg_prfm *a)
+{
+    InsnDataflowAtom base = insn_df_reg(regnames[a->rn]);
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    note_prfm_ea(&base, 1, a->imm);
+    return true;
+}
+
+static bool trans_PRFM_ui(DisasContext *s, arg_prfm *a)
+{
+    InsnDataflowAtom base = insn_df_reg(regnames[a->rn]);
+    int64_t disp = (int64_t)a->imm << 3;
+
+    insn_dataflow_note_immediate(disp, INSN_DF_IMM_DISP);
+    note_prfm_ea(&base, 1, disp);
+    return true;
+}
+
+static bool trans_PRFM_rr(DisasContext *s, arg_prfm_rr *a)
+{
+    InsnDataflowAtom parts[2];
+    unsigned n = 0;
+
+    parts[n++] = insn_df_reg(regnames[a->rn]);
+    if (a->rm != 31) {
+        parts[n++] = insn_df_reg(regnames[a->rm]);
+    } else {
+        insn_dataflow_state_read(insn_df_zero());
+    }
+    note_prfm_ea(parts, n, 0);
+    return true;
+}
+
 static bool trans_LD_lit(DisasContext *s, arg_ldlit *a)
 {
     bool iss_sf = ldst_iss_sf(a->sz, a->sign, false);
     TCGv_i64 tcg_rt = cpu_reg(s, a->rt);
     TCGv_i64 clean_addr = tcg_temp_new_i64();
     MemOp memop = finalize_memop(s, a->sz + a->sign * MO_SIGN);
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    note_zero_reg(false, a->rt, INSN_DF_WR);
 
     gen_pc_plus_diff(s, clean_addr, a->imm);
     do_gpr_ld(s, tcg_rt, clean_addr, memop,
@@ -3298,6 +3516,7 @@ static bool trans_LD_lit_v(DisasContext *s, arg_ldlit *a)
     }
     memop = finalize_memop_asimd(s, a->sz);
     clean_addr = tcg_temp_new_i64();
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
     gen_pc_plus_diff(s, clean_addr, a->imm);
     do_fp_ld(s, a->rt, clean_addr, memop);
     return true;
@@ -3310,6 +3529,8 @@ static void op_addr_ldstpair_pre(DisasContext *s, arg_ldstpair *a,
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
+
+    insn_dataflow_note_immediate(offset, INSN_DF_IMM_DISP);
 
     *dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
     if (!a->p) {
@@ -3538,6 +3759,15 @@ static void op_addr_ldst_imm_pre(DisasContext *s, arg_ldst_imm *a,
         gen_check_sp_alignment(s);
     }
 
+    /*
+     * The displacement, in the role it plays.  A zero offset IS stated here
+     * and not suppressed: unlike x86's AddressParts, the aarch64 argument set
+     * records whether the encoding has an offset field at all -- every rule
+     * that reaches this helper has one -- so "no field" and "a field holding
+     * zero" are not confusable and the honest answer is the value.
+     */
+    insn_dataflow_note_immediate(offset, INSN_DF_IMM_DISP);
+
     *dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
     if (!a->p) {
         tcg_gen_addi_i64(*dirty_addr, *dirty_addr, offset);
@@ -3722,6 +3952,10 @@ static bool do_atomic_ld(DisasContext *s, arg_atomic *a, AtomicThreeOpFn *fn,
 {
     MemOp mop = a->sz | sign;
     TCGv_i64 clean_addr, tcg_rs, tcg_rt;
+
+    /* Atomicity: the LSE read-modify-writes and SWP.  See fact 13 above. */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
+    note_zero_reg(false, a->rt, INSN_DF_WR);
 
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
@@ -4501,10 +4735,24 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
     desc = FIELD_DP32(desc, MTEDESC, MIDX, memidx);
 
     /*
-     * The helper needs the register numbers, but since they're in
-     * the syndrome anyway, we let it extract them from there rather
-     * than passing in an extra three integer arguments.
+     * THE REGISTERS THE SYNDROME CARRIES.
+     *
+     * The three register numbers reach the helper packed inside a constant,
+     * so the op stream shows a call whose arguments name env and two integers
+     * and nothing else -- an instruction that updates a destination pointer
+     * and a counter reads as touching no register at all.  The decode site
+     * has the numbers before they are packed, so it says so.
+     *
+     * SET* updates the destination pointer and the size, and reads the value:
+     * rd and rn are read-modify-write, rs is read.  Register 31 is refused
+     * above on rd and rn, so no XZR case reaches here.
      */
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rd]));
+    insn_dataflow_state_write(insn_df_reg(regnames[a->rd]));
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rn]));
+    insn_dataflow_state_write(insn_df_reg(regnames[a->rn]));
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rs]));
+
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
     gen_mops_plugin_tb_end(s);
@@ -4562,10 +4810,17 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
     wdesc = FIELD_DP32(wdesc, MTEDESC, MIDX, wmemidx);
 
     /*
-     * The helper needs the register numbers, but since they're in
-     * the syndrome anyway, we let it extract them from there rather
-     * than passing in an extra three integer arguments.
+     * The three register numbers, as do_SET() above.  CPY* advances the
+     * destination pointer, the source pointer and the size, so all three are
+     * read-modify-write; register 31 is refused above on all three.
      */
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rd]));
+    insn_dataflow_state_write(insn_df_reg(regnames[a->rd]));
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rs]));
+    insn_dataflow_state_write(insn_df_reg(regnames[a->rs]));
+    insn_dataflow_state_read(insn_df_reg(regnames[a->rn]));
+    insn_dataflow_state_write(insn_df_reg(regnames[a->rn]));
+
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),
        tcg_constant_i32(rdesc));
@@ -4609,6 +4864,16 @@ static bool gen_rri(DisasContext *s, arg_rri_sf *a,
     /* rd_sp is clear exactly on the flag-setting forms: ADDS_i / SUBS_i. */
     note_flag_only_form(!rd_sp, a->rd, INSN_DF_WORD_CMP);
 
+    /*
+     * THE ENCODED VALUE (fact 19).  The immediate is in the decoder's hand
+     * before any op consumes it, and a consumer that wants to know what an
+     * instruction added cannot get it back out of a tcg_constant whose
+     * argument the op stream carries only as a number among numbers.
+     */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(rn_sp, a->rn, INSN_DF_RD);
+    note_zero_reg(rd_sp, a->rd, INSN_DF_WR);
+
     fn(tcg_rd, tcg_rn, tcg_imm);
     if (!a->sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
@@ -4622,6 +4887,13 @@ static bool gen_rri(DisasContext *s, arg_rri_sf *a,
 
 static bool trans_ADR(DisasContext *s, arg_ri *a)
 {
+    /*
+     * A displacement and not an operand: the encoding's field is added to the
+     * program counter to make an address, which is the role x86's mem.disp
+     * plays and the same reading the two targets should give a reader.
+     */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
     gen_pc_plus_diff(s, cpu_reg(s, a->rd), a->imm);
     return true;
 }
@@ -4629,6 +4901,9 @@ static bool trans_ADR(DisasContext *s, arg_ri *a)
 static bool trans_ADRP(DisasContext *s, arg_ri *a)
 {
     int64_t offset = (int64_t)a->imm << 12;
+
+    insn_dataflow_note_immediate((uint64_t)a->imm << 12, INSN_DF_IMM_DISP);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
 
     /* The page offset is ok for CF_PCREL. */
     offset -= s->pc_curr & 0xfff;
@@ -4782,6 +5057,15 @@ static bool gen_rri_log(DisasContext *s, arg_rri_log *a, bool set_cc,
 
     note_flag_only_form(set_cc, a->rd, INSN_DF_WORD_TEST);
 
+    /*
+     * The DECODED mask, not the dbm field: the bitmask encoding is a
+     * compressed spelling of the value the instruction actually ands, and the
+     * value is what a consumer of an immediate wants.
+     */
+    insn_dataflow_note_immediate(imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(false, a->rn, INSN_DF_RD);
+    note_zero_reg(!set_cc, a->rd, INSN_DF_WR);
+
     fn(tcg_rd, tcg_rn, imm);
     if (set_cc) {
         gen_logic_CC(a->sf, tcg_rd);
@@ -4804,6 +5088,9 @@ TRANS(ANDS_i, gen_rri_log, a, true, tcg_gen_andi_i64)
 static bool trans_MOVZ(DisasContext *s, arg_movw *a)
 {
     int pos = a->hw << 4;
+
+    insn_dataflow_note_immediate((uint64_t)a->imm << pos, INSN_DF_IMM_OPERAND);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
     tcg_gen_movi_i64(cpu_reg(s, a->rd), (uint64_t)a->imm << pos);
     return true;
 }
@@ -4817,6 +5104,8 @@ static bool trans_MOVN(DisasContext *s, arg_movw *a)
     if (!a->sf) {
         imm = (uint32_t)imm;
     }
+    insn_dataflow_note_immediate(imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
     tcg_gen_movi_i64(cpu_reg(s, a->rd), imm);
     return true;
 }
@@ -4826,6 +5115,9 @@ static bool trans_MOVK(DisasContext *s, arg_movw *a)
     int pos = a->hw << 4;
     TCGv_i64 tcg_rd, tcg_im;
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(false, a->rd, INSN_DF_RD);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
     tcg_rd = cpu_reg(s, a->rd);
     tcg_im = tcg_constant_i64(a->imm);
     tcg_gen_deposit_i64(tcg_rd, tcg_rd, tcg_im, pos, 16);
@@ -8430,6 +8722,8 @@ static bool do_logic_reg(DisasContext *s, arg_logic_shift *a,
 
     tcg_rd = cpu_reg(s, a->rd);
     tcg_rn = cpu_reg(s, a->rn);
+    note_zero_reg(false, a->rn, INSN_DF_RD);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
 
     tcg_rm = read_cpu_reg(s, a->rm, a->sf);
     if (a->sa) {
@@ -8459,6 +8753,10 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
         TCGv_i64 tcg_rm = cpu_reg(s, a->rm);
 
         insn_dataflow_note_word(a->n ? INSN_DF_WORD_NOT : INSN_DF_WORD_MOV);
+        /* rn is 31 by the test above, and it is XZR here, never SP. */
+        insn_dataflow_state_read(insn_df_zero());
+        note_zero_reg(false, a->rm, INSN_DF_RD);
+        note_zero_reg(false, a->rd, INSN_DF_WR);
 
         if (a->n) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);
@@ -8499,6 +8797,7 @@ static bool do_addsub_ext(DisasContext *s, arg_addsub_ext *a,
     } else {
         tcg_rd = cpu_reg(s, a->rd);
     }
+    note_zero_reg(!setflags, a->rd, INSN_DF_WR);
     tcg_rn = read_cpu_reg_sp(s, a->rn, a->sf);
 
     tcg_rm = read_cpu_reg(s, a->rm, a->sf);
@@ -8544,6 +8843,7 @@ static bool do_addsub_reg(DisasContext *s, arg_addsub_shift *a,
     note_flag_only_form(setflags, a->rd, INSN_DF_WORD_CMP);
 
     tcg_rd = cpu_reg(s, a->rd);
+    note_zero_reg(false, a->rd, INSN_DF_WR);
     tcg_rn = read_cpu_reg(s, a->rn, a->sf);
     tcg_rm = read_cpu_reg(s, a->rm, a->sf);
 

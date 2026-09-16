@@ -97,8 +97,31 @@ static bool trans_auipc(DisasContext *ctx, arg_auipc *a)
     return true;
 }
 
+/*
+ * WHICH TRANSFER A JAL IS, FROM THE ENCODING RATHER THAN FROM A PRINTED ALIAS.
+ *
+ * One decode rule covers every JAL -- and C.J and C.JAL reach the same one
+ * with rd fixed -- so the pattern's own `!word=call` cannot separate a call
+ * from a plain jump, and every riscv64 `j` was published as a DIRECT CALL.
+ * That is not a spelling difference: it puts a return address on a consumer's
+ * return-address stack that no return will ever pop, so every `j` in a loop
+ * body pushes and the stack desynchronises.
+ *
+ * The ISA manual makes the separation in the register operand, and names the
+ * hint by name: "Plain unconditional jumps are encoded as JAL with rd=x0",
+ * and only x1 and x5 push the return-address stack.  A JAL with some other
+ * rd does write a link register, but no hardware predictor treats it as a
+ * call, so JUMP is the class a consumer must see.
+ *
+ * Stated from inside the translate function, which runs BEFORE decodetree
+ * notes the pattern's word at its dispatch site -- and the first word to
+ * arrive is the one kept, so this one wins and the pattern's is the fallback
+ * for a build that does not reach here.
+ */
 static bool trans_jal(DisasContext *ctx, arg_jal *a)
 {
+    insn_dataflow_note_word(a->rd == xRA || a->rd == xT0
+                            ? INSN_DF_WORD_CALL : INSN_DF_WORD_JUMP);
     gen_jal(ctx, a->rd, a->imm);
     return true;
 }
@@ -148,11 +171,35 @@ static void gen_ctr_jalr(DisasContext *ctx, arg_jalr *a, TCGv dest)
 }
 #endif
 
+/*
+ * AND WHICH TRANSFER A JALR IS, on the same ground and from the same two
+ * register fields.  The ISA manual's own return-address-stack hint table
+ * reads them together:
+ *
+ *     rd is a link register (x1 / x5)    -> PUSH        = an indirect CALL
+ *     rd is not, rs1 is a link register  -> POP         = a RETURN
+ *     neither is                         -> no action   = an indirect JUMP
+ *
+ * The coroutine swap (rd and rs1 both link registers, and different) pops
+ * then pushes; the wire's taxonomy has one class per transfer, and CALL is
+ * the half a predictor must not lose, so it lands there -- which is also the
+ * order the test below produces.
+ *
+ * This covers C.JR and C.JALR too: both reach this rule with rd fixed and
+ * imm = 0, so `c.jr ra` is a RETURN and `c.jalr rs` an indirect CALL without
+ * either being spelled anywhere.
+ */
 static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
 {
     TCGLabel *misaligned = NULL;
     TCGv target_pc = tcg_temp_new();
     TCGv succ_pc = dest_gpr(ctx, a->rd);
+    bool rd_link = (a->rd == xRA || a->rd == xT0);
+    bool rs1_link = (a->rs1 == xRA || a->rs1 == xT0);
+
+    insn_dataflow_note_word(rd_link ? INSN_DF_WORD_CALL_REG
+                            : rs1_link ? INSN_DF_WORD_RET
+                            : INSN_DF_WORD_JUMP_REG);
 
     /* Added to rs1 to make an address: a displacement, as AUIPC's is. */
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);

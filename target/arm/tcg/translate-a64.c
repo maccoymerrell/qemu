@@ -4582,12 +4582,32 @@ TRANS_FEAT(CPYFE, aa64_mops, do_CPY, a, true, gen_helper_cpyfe)
 
 typedef void ArithTwoOp(TCGv_i64, TCGv_i64, TCGv_i64);
 
+/*
+ * A flag-setting form whose destination is the zero register.
+ *
+ * ARM spells CMP, CMN and TST as SUBS, ADDS and ANDS into XZR: the arithmetic
+ * result is discarded and the only effect is on the condition flags.  The rule
+ * cannot tell them apart -- one pattern covers both -- but the decoder holds
+ * rd, so the statement is made here and the rule's own word (stated by
+ * decodetree after the translate function returns) carries the forms that do
+ * produce a result.  note_word() is first-wins.
+ */
+static void note_flag_only_form(bool setflags, int rd, const char *word)
+{
+    if (setflags && rd == 31) {
+        insn_dataflow_note_word(word);
+    }
+}
+
 static bool gen_rri(DisasContext *s, arg_rri_sf *a,
                     bool rd_sp, bool rn_sp, ArithTwoOp *fn)
 {
     TCGv_i64 tcg_rn = rn_sp ? cpu_reg_sp(s, a->rn) : cpu_reg(s, a->rn);
     TCGv_i64 tcg_rd = rd_sp ? cpu_reg_sp(s, a->rd) : cpu_reg(s, a->rd);
     TCGv_i64 tcg_imm = tcg_constant_i64(a->imm);
+
+    /* rd_sp is clear exactly on the flag-setting forms: ADDS_i / SUBS_i. */
+    note_flag_only_form(!rd_sp, a->rd, INSN_DF_WORD_CMP);
 
     fn(tcg_rd, tcg_rn, tcg_imm);
     if (!a->sf) {
@@ -4760,6 +4780,8 @@ static bool gen_rri_log(DisasContext *s, arg_rri_log *a, bool set_cc,
     tcg_rd = set_cc ? cpu_reg(s, a->rd) : cpu_reg_sp(s, a->rd);
     tcg_rn = cpu_reg(s, a->rn);
 
+    note_flag_only_form(set_cc, a->rd, INSN_DF_WORD_TEST);
+
     fn(tcg_rd, tcg_rn, imm);
     if (set_cc) {
         gen_logic_CC(a->sf, tcg_rd);
@@ -4817,6 +4839,38 @@ static bool trans_MOVK(DisasContext *s, arg_movw *a)
  * Bitfield
  */
 
+/*
+ * What a bitfield move actually is, from immr and imms.
+ *
+ * ARM spells the shifts and the extensions as UBFM and SBFM, and the alias is
+ * decided entirely by the two immediates: LSR and ASR when imms is the top bit
+ * position, LSL when imms + 1 == immr, and the byte/halfword/word extensions
+ * when immr is 0 and imms is 7, 15 or 31.  A rule-level word cannot see that,
+ * and calling a shift a bitfield operation loses the one thing a consumer
+ * schedules on.  The remaining genuine extracts and inserts keep the rule's
+ * own word, stated by decodetree after this returns; note_word() is
+ * first-wins, so the specific statement here is the one that survives.
+ */
+static void note_bfm_alias(bool sf, unsigned int ri, unsigned int si,
+                           bool sign)
+{
+    unsigned int bitsize = sf ? 64 : 32;
+
+    if (si == bitsize - 1) {
+        /* LSR, or ASR for the signed form. */
+        insn_dataflow_note_word(INSN_DF_WORD_SHR);
+    } else if (!sign && si + 1 == ri) {
+        insn_dataflow_note_word(INSN_DF_WORD_SHL);
+    } else if (ri == 0 && (si == 7 || si == 15 || (sign && sf && si == 31))) {
+        /* SXTB/SXTH/SXTW, UXTB/UXTH.  There is no UXTW: MOV does that. */
+        if (sign) {
+            insn_dataflow_note_word(INSN_DF_WORD_MOVSX);
+        } else if (!sf) {
+            insn_dataflow_note_word(INSN_DF_WORD_MOVZX);
+        }
+    }
+}
+
 static bool trans_SBFM(DisasContext *s, arg_SBFM *a)
 {
     TCGv_i64 tcg_rd = cpu_reg(s, a->rd);
@@ -4825,6 +4879,8 @@ static bool trans_SBFM(DisasContext *s, arg_SBFM *a)
     unsigned int ri = a->immr;
     unsigned int si = a->imms;
     unsigned int pos, len;
+
+    note_bfm_alias(a->sf, ri, si, true);
 
     if (si >= ri) {
         /* Wd<s-r:0> = Wn<s:r> */
@@ -4865,6 +4921,8 @@ static bool trans_UBFM(DisasContext *s, arg_UBFM *a)
     unsigned int ri = a->immr;
     unsigned int si = a->imms;
     unsigned int pos, len;
+
+    note_bfm_alias(a->sf, ri, si, false);
 
     tcg_rd = cpu_reg(s, a->rd);
     tcg_tmp = read_cpu_reg(s, a->rn, 1);
@@ -8367,6 +8425,8 @@ static bool do_logic_reg(DisasContext *s, arg_logic_shift *a,
         shift_reg_imm(tcg_rm, tcg_rm, a->sf, a->st, a->sa);
     }
 
+    note_flag_only_form(setflags, a->rd, INSN_DF_WORD_TEST);
+
     (a->n ? inv_fn : fn)(tcg_rd, tcg_rn, tcg_rm);
     if (!a->sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
@@ -8386,6 +8446,8 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
     if (a->sa == 0 && a->st == 0 && a->rn == 31) {
         TCGv_i64 tcg_rd = cpu_reg(s, a->rd);
         TCGv_i64 tcg_rm = cpu_reg(s, a->rm);
+
+        insn_dataflow_note_word(a->n ? INSN_DF_WORD_NOT : INSN_DF_WORD_MOV);
 
         if (a->n) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);
@@ -8417,6 +8479,8 @@ static bool do_addsub_ext(DisasContext *s, arg_addsub_ext *a,
     if (a->sa > 4) {
         return false;
     }
+
+    note_flag_only_form(setflags, a->rd, INSN_DF_WORD_CMP);
 
     /* non-flag setting ops may use SP */
     if (!setflags) {
@@ -8465,6 +8529,8 @@ static bool do_addsub_reg(DisasContext *s, arg_addsub_shift *a,
     if (a->st == 3 || (!a->sf && (a->sa & 32))) {
         return false;
     }
+
+    note_flag_only_form(setflags, a->rd, INSN_DF_WORD_CMP);
 
     tcg_rd = cpu_reg(s, a->rd);
     tcg_rn = read_cpu_reg(s, a->rn, a->sf);

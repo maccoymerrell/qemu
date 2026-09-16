@@ -33,6 +33,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_capture.h"
+#include "champsim_tracer_qdep.h"
 #include "champsim_tracer_delay.h"
 #include "champsim_tracer_marker_detect.h"
 #include "champsim_tracer_mem_access_recorder.h"
@@ -3717,22 +3718,32 @@ static uint64_t g_seg_wm_deferred_records = 0;
  * straight-line insns) cannot mint one unbounded template. */
 static constexpr uint32_t CST_ALT_BB_MAX_INSNS = 4096;
 
-/* True iff @bt is a control-transfer that carries an architectural delay
- * slot on this ISA (mirrors split_tb_into_fragments::has_delay_slot).  The
- * exception-return family (eret/eretnc/deret) is BRANCH_RETURN but has no
- * slot; QEMU ends the TB there, so exclude it. */
-static bool alt_has_delay_slot(uint8_t bt, const char *mnem)
-{
-    if (bt != BRANCH_DIRECT_JUMP && bt != BRANCH_INDIRECT_JUMP &&
-        bt != BRANCH_RETURN && bt != BRANCH_COND_DIRECT &&
-        bt != BRANCH_DIRECT_CALL && bt != BRANCH_INDIRECT_CALL) {
-        return false;
-    }
-    if (mnem[0] == 'e') {
-        return !(!strcmp(mnem, "eret") || !strcmp(mnem, "eretnc"));
-    }
-    return strcmp(mnem, "deret") != 0;
-}
+/*
+ * Set while this vCPU is driving a translation for an alternate rather than
+ * for execution.
+ *
+ * Two things read it.  The translate-time MARKER SCAN is suppressed: a marker
+ * sequence found in code the guest never ran would open -- or, worse, close --
+ * a capture window on bytes that never executed, and per the marker contract
+ * an END that closes no window invalidates the trace.  And the fragment chain
+ * the translation produced is handed back here, because that chain is the
+ * whole product: the alternate's instructions come by reference out of the
+ * templates the ordinary builder made, so they have already been through the
+ * statement seating and there is no second decode anywhere in the path.
+ */
+static thread_local bool g_alt_translating;
+static thread_local BBTemplate *g_alt_translated_head;
+
+/*
+ * The alternate path's own delay-slot predicate is DELETED, not re-pointed.
+ *
+ * It was a strcmp over "eret"/"eretnc"/"deret" -- a printed mnemonic deciding
+ * a structural question -- and it existed only because the alternate path
+ * decoded its own instructions.  It does not any more: the fragment splitter
+ * has already drawn the boundary, on QEMU's own decode rule, and the fold
+ * below reads the fragment's terminus rather than re-deriving it.  One
+ * answer, from one place.
+ */
 
 struct AltMintStats {
     uint64_t checks         = 0;  /* PCs whose coverage was tested            */
@@ -3740,6 +3751,14 @@ struct AltMintStats {
     uint64_t depth_mints    = 0;  /* subset of mints from the depth>0 walk     */
     uint64_t skips_unmapped = 0;  /* target unmapped/undecodable              */
     uint64_t budget_hits    = 0;  /* mints skipped for the per-segment budget */
+    /* The two ways a translate-on-demand comes back empty, apart because
+     * they are not the same condition: QEMU DECLINED the translation (an
+     * unreachable page, a translation-time fault, a full code buffer), or it
+     * answered from its code cache so the translation callback did not fire
+     * and the chain had to be found in the plugin's own index -- and was
+     * not.  Counted so neither hides inside the other. */
+    uint64_t xlat_declined  = 0;
+    uint64_t chain_missing  = 0;
 };
 static AltMintStats g_alt_mint;
 
@@ -3751,165 +3770,168 @@ static constexpr uint64_t CST_ALT_MINT_BUDGET = 1u << 20;   /* 1,048,576 */
 static uint64_t g_alt_mint_budget_used = 0;
 
 /*
- * Decode ONE true BB starting at @pc into the supplied scratch arrays,
- * stopping at the first branch terminator (folding a delay slot on
- * delay-slot ISAs) or CST_ALT_BB_MAX_INSNS.  Guest bytes are read in one
- * page-bounded window via the probing qemu_plugin_read_memory_vaddr (unmapped
- * -> read fails).  Returns the instruction count (0 iff the very first insn
- * could not be read/decoded — unmapped or undecodable), sets *out_ft to the
- * architectural fall-through (post-terminator PC, or the next linear PC for
- * an unterminated cap/edge stop) and *out_taken to the terminal
- * direct-branch's decoded target (0 if none).  Takes NO lock (pure guest
- * read + decode).
+ * Assemble ONE true BB starting at @pc out of REAL TRANSLATIONS.
  *
- * @fscratch / @nscratch are the CALLER-OWNED per-instruction decode backing.
- * InsnFields is a struct of SPANS (champsim_tracer_mnemonics.h) — its
- * register arrays and every dep/lane mask live in the InsnFieldsScratch that
- * produced them — so one scratch per instruction is required (a shared one
- * leaves all N entries pointing at the last instruction decoded), and it must
- * outlive commit_alt_bb's pack, which is what deep-copies out of it.  Held by
- * unique_ptr so growing the pool cannot move an already-wired element: the
- * scratch types are self-referential and must never be relocated.
+ * WHY A TRANSLATION AND NOT A DECODE.  Every fact the wire publishes about an
+ * instruction is keyed on (translation, index) and readable only while that
+ * translation is the current one, so there is no post-hoc route to any of
+ * them: the identity is the row a trans_ function accepted, which is the same
+ * event as emitting its ops.  A decoder running beside the emulator can
+ * supply a length and a name; it cannot supply those.  So the alternate path
+ * asks QEMU to translate the block -- qemu_plugin_translate_at() -- and takes
+ * the fragment chain the ordinary builder made from it.  The minted half of a
+ * templates section and the executed half then have ONE source, which is what
+ * the wire, having no flag to separate them, requires.
+ *
+ * FRAGMENTS ARE NOT BASIC BLOCKS, in either direction, and both cases are
+ * real.  A translation can end mid-BB (a page boundary) and a translation can
+ * contain several BBs (a mid-block branch terminator).  The fold here is the
+ * execution-driven chain assembler's, run over translations instead of over
+ * executions: append fragments until one SEALS -- TB_TERMINUS_COMPLETE, or a
+ * BARE_BRANCH whose delay slot arrives at the head of the next translation --
+ * following each unsealed translation's fall-through.
+ *
+ * @pcs / @fields / @regnames / @sizes / @bytes are the caller's output
+ * arrays.  The InsnFields come BY REFERENCE out of the fragment templates,
+ * whose spans live in each template's own immutable pool, so they stay valid
+ * for as long as the templates do -- which is past commit_alt_bb, where the
+ * pack deep-copies them.  There is no per-instruction scratch here at all;
+ * the seating already happened, once, where QEMU could answer.
+ *
+ * Returns the instruction count (0 when QEMU declined the translation at @pc
+ * -- an unreachable page, a translation-time fault, or a full code buffer),
+ * sets *out_ft to the architectural fall-through and *out_taken to the
+ * terminal branch's TRANSLATOR-RESOLVED target (0 when there is none).  Takes
+ * NO data_lock: it drives a translation, and vcpu_tb_trans takes that lock
+ * itself.
  */
-static uint32_t alt_decode_one_bb(uint64_t pc,
-                                  std::vector<uint64_t> &pcs,
-                                  std::vector<InsnFields> &fields,
-                                  std::vector<InsnRegNames> &regnames,
-                                  std::vector<uint8_t> &sizes,
-                                  std::vector<uint8_t> &bytes,
-                                  std::vector<std::unique_ptr<
-                                      InsnFieldsScratch>> &fscratch,
-                                  std::vector<std::unique_ptr<
-                                      InsnRegNamesScratch>> &nscratch,
-                                  bool with_names,
-                                  uint64_t *out_ft,
-                                  uint64_t *out_taken)
+static uint32_t alt_assemble_bb(uint64_t pc,
+                                std::vector<uint64_t> &pcs,
+                                std::vector<InsnFields> &fields,
+                                std::vector<InsnRegNames> &regnames,
+                                std::vector<uint8_t> &sizes,
+                                std::vector<uint8_t> &bytes,
+                                bool with_names,
+                                uint64_t *out_ft,
+                                uint64_t *out_taken)
 {
-    const bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
     *out_ft = 0;
     *out_taken = 0;
-
-    /* One page-bounded read window (a true BB never spans far); refilled if a
-     * folded delay slot crosses the initial window. */
-    GByteArray *win = g_byte_array_new();
-    uint64_t win_base = 0, win_len = 0;
-    bool     win_ok = false;
-    auto window_at = [&](uint64_t at, const uint8_t **out,
-                         uint64_t *avail) -> bool {
-        if (!win_ok || at < win_base || at >= win_base + win_len) {
-            if (!qemu_plugin_read_memory_vaddr(at, win, 4096)) {
-                win_ok = false;
-                return false;
-            }
-            win_base = at;
-            win_len  = win->len;
-            win_ok   = true;
-        }
-        *out   = win->data + (at - win_base);
-        *avail = win_base + win_len - at;
-        return *avail > 0;
-    };
-
-    /* Decode the insn at @at into slot @i; returns bytes consumed (0 on
-     * failure) and reports the branch type in @out_bt. */
-    auto decode_one = [&](uint64_t at, uint32_t i, uint8_t *out_bt,
-                          bool *out_dslot) -> uint8_t {
-        const uint8_t *p = nullptr;
-        uint64_t avail = 0;
-        if (!window_at(at, &p, &avail)) {
-            return 0;
-        }
-        qemu_plugin_insn_info info;
-        if (!qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode, p,
-                                    (size_t)avail, at, &info)) {
-            return 0;
-        }
-        uint8_t sz = info.insn_size;
-        if (sz == 0 || sz > MAX_INSN_BYTES || sz > avail) {
-            return 0;
-        }
-        /* Grow the caller's pool to cover slot @i.  Growth appends
-         * unique_ptrs, so no already-decoded element moves. */
-        while (fscratch.size() <= i) {
-            fscratch.push_back(std::make_unique<InsnFieldsScratch>());
-        }
-        InsnFieldsScratch &fs = *fscratch[i];
-        insn_fields_scratch_reset(&fs);
-        InsnRegNamesScratch *ns = nullptr;
-        if (with_names) {
-            while (nscratch.size() <= i) {
-                nscratch.push_back(std::make_unique<InsnRegNamesScratch>());
-            }
-            ns = nscratch[i].get();
-            insn_reg_names_scratch_reset(ns);
-        }
-        decode_detail_to_generic(at, p, sz, &info, &fs.f,
-                                 ns ? &ns->rn : nullptr);
-        uint8_t bt = fs.f.branch_type;
-        pcs[i]   = at;
-        sizes[i] = sz;
-        memcpy(&bytes[(size_t)i * MAX_INSN_BYTES], p, sz);
-        if (sz < MAX_INSN_BYTES) {
-            memset(&bytes[(size_t)i * MAX_INSN_BYTES + sz], 0,
-                   MAX_INSN_BYTES - sz);
-        }
-        /* Shallow copy of the descriptor: its spans stay pointed at
-         * fscratch[i] / nscratch[i], which the caller keeps alive across
-         * commit_alt_bb. */
-        fields[i] = fs.f;
-        if (with_names) {
-            regnames[i] = ns->rn;
-        }
-        *out_bt = bt;
-        *out_dslot = (delay_isa && bt != BRANCH_NONE &&
-                      alt_has_delay_slot(bt, info.mnemonic));
-        return sz;
-    };
 
     uint64_t cur = pc;
     uint32_t n = 0;
     bool sealed = false;
+    /* A BARE_BRANCH fragment's delay slot is the first instruction of the
+     * next translation, and exactly one instruction of it. */
+    bool want_delay_slot = false;
+
     while (n < CST_ALT_BB_MAX_INSNS) {
-        uint8_t bt = BRANCH_NONE;
-        bool dslot = false;
-        uint8_t sz = decode_one(cur, n, &bt, &dslot);
-        if (sz == 0) {
-            break;      /* undecodable (or unmapped at n==0) */
+        g_alt_translated_head = nullptr;
+        g_alt_translating = true;
+        bool ok = qemu_plugin_translate_at(cur);
+        g_alt_translating = false;
+
+        BBTemplate *frag = g_alt_translated_head;
+
+        g_alt_translated_head = nullptr;
+        if (!ok) {
+            g_alt_mint.xlat_declined++;
+            break;
         }
-        uint32_t branch_idx = n;
-        n++;
-        cur += sz;
-        if (bt == BRANCH_NONE) {
-            continue;
+        if (!frag) {
+            /*
+             * QEMU answered from its own code cache, so the translation
+             * callback did not fire and there is no fresh chain to take.
+             * The chain the plugin built the first time that block was
+             * translated is still the right one: the two caches move
+             * together (see lookup_tb_chain_at).
+             */
+            g_mutex_lock(&data_lock);
+            frag = g_template_store.lookup_tb_chain_at(cur);
+            g_mutex_unlock(&data_lock);
         }
-        /* Fold the delay slot, then seal. */
-        if (dslot && n < CST_ALT_BB_MAX_INSNS) {
-            uint8_t sbt = BRANCH_NONE;
-            bool sd = false;
-            uint8_t ssz = decode_one(cur, n, &sbt, &sd);
-            if (ssz != 0) {
-                n++;
-                cur += ssz;
+        if (!frag) {
+            g_alt_mint.chain_missing++;
+            break;
+        }
+
+        /* Walk this translation's fragments in order. */
+        for (; frag && n < CST_ALT_BB_MAX_INSNS; frag = frag->next_tb_fragment) {
+            uint32_t take = frag->n_insns;
+
+            if (want_delay_slot) {
+                /* Only the slot itself belongs to the sealed branch's BB. */
+                take = 1;
             }
+            if (take > CST_ALT_BB_MAX_INSNS - n) {
+                take = CST_ALT_BB_MAX_INSNS - n;
+            }
+            for (uint32_t i = 0; i < take; i++) {
+                pcs[n]   = frag->insn_pcs[i];
+                sizes[n] = frag->insn_sizes[i];
+                memcpy(&bytes[(size_t)n * MAX_INSN_BYTES],
+                       &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                       MAX_INSN_BYTES);
+                fields[n] = frag->insn_fields[i];
+                if (with_names) {
+                    regnames[n] = frag->insn_reg_names
+                                      ? frag->insn_reg_names[i]
+                                      : InsnRegNames{};
+                }
+                n++;
+            }
+            cur = frag->insn_pcs[take - 1] + frag->insn_sizes[take - 1];
+
+            if (want_delay_slot) {
+                want_delay_slot = false;
+                sealed = true;
+                break;
+            }
+            if (frag->terminus == TB_TERMINUS_COMPLETE) {
+                sealed = true;
+                break;
+            }
+            if (frag->terminus == TB_TERMINUS_BARE_BRANCH) {
+                /* The delay slot is in the NEXT translation; take one more
+                 * instruction from it and then seal. */
+                want_delay_slot = true;
+                break;
+            }
+            /* TB_TERMINUS_NONE: this fragment runs into the next one, which
+             * is either the next fragment of this translation or the head of
+             * the translation at the fall-through. */
         }
-        if ((bt == BRANCH_COND_DIRECT || bt == BRANCH_DIRECT_JUMP ||
-             bt == BRANCH_DIRECT_CALL) &&
-            fields[branch_idx].has_immediate) {
-            *out_taken = (uint64_t)fields[branch_idx].immediate;
-            /* The executed path stamps this from the per-ISA translator
-             * (create_tb_template); a never-executed block has no
-             * translation, so the decoded immediate IS its static target.
-             * Leaving it zero is what made a minted branch's declared
-             * target readable only at template level. */
-            fields[branch_idx].taken_target_pc = *out_taken;
+        if (sealed) {
+            break;
         }
-        sealed = true;
-        break;
     }
 
-    g_byte_array_free(win, TRUE);
     if (n == 0) {
         return 0;
+    }
+
+    /*
+     * The terminal branch's declared taken edge.  It is the TRANSLATOR's
+     * resolved target, carried on the instruction's own field -- not a
+     * decoded immediate.  Per-ISA encoding (PC-relative versus absolute,
+     * sign extension, delay-slot accounting, interworking) is already
+     * resolved inside the translator, and a never-executed block gets the
+     * same answer an executed one does because it came from the same
+     * translation.
+     */
+    if (sealed) {
+        /*
+         * Scan back to the block's TERMINATOR rather than assuming a
+         * position.  On a delay-slot ISA the branch is one before the slot,
+         * and a fragment that sealed on a page boundary has none at all; the
+         * branch class is what says which instruction it is.
+         */
+        for (uint32_t i = n; i-- > 0; ) {
+            if (fields[i].branch_type != BRANCH_NONE) {
+                *out_taken = fields[i].taken_target_pc;
+                break;
+            }
+        }
     }
     *out_ft = sealed ? cur : pcs[n - 1] + sizes[n - 1];
     return n;
@@ -3946,10 +3968,6 @@ static bool altmint_one(uint64_t pc, uint64_t *out_ft, uint64_t *out_taken)
         g_alt_mint.budget_hits++;
         return false;
     }
-    if (cst_cap_arch < 0) {
-        return false;   /* no Capstone arch for this ISA — cannot decode */
-    }
-
     const bool with_names = g_features.reg_data || g_features.wp_reg_data;
 
     /* Per-BB descriptor arrays (plain locals; a mint is rare after warmup —
@@ -3962,36 +3980,23 @@ static bool altmint_one(uint64_t pc, uint64_t *out_ft, uint64_t *out_taken)
     std::vector<uint8_t>       bytes((size_t)CST_ALT_BB_MAX_INSNS *
                                      MAX_INSN_BYTES);
 
-    /* Per-INSTRUCTION decode backing, one scratch per slot.  It is the
-     * register identities and every dep/lane mask — an InsnFields carries
-     * those as spans into the scratch that built them (SPAN MEMBERS,
-     * champsim_tracer_mnemonics.h), so the descriptors above are only as
-     * good as the scratch they point at.  Grown on demand and reused
-     * across mints rather than sized to CST_ALT_BB_MAX_INSNS: a full-cap
-     * preallocation would be tens of MB zeroed per mint, and a true BB is
-     * a few instructions long.  Held by unique_ptr because the scratch
-     * types are self-referential and must never be relocated; kept alive
-     * until after commit_alt_bb, which is where the pack deep-copies.
-     *
-     * Plain locals, deliberately NOT thread_local: the plugin is dlopen'd
-     * and its static TLS block is already within ~80 bytes of glibc's
-     * static-TLS surplus, so even an empty thread_local vector here makes
-     * every guest refuse to load the plugin ("cannot allocate memory in
-     * static TLS block").  A mint is rare after warmup and this function
-     * already allocates its descriptor arrays per call. */
-    std::vector<std::unique_ptr<InsnFieldsScratch>>   fscratch;
-    std::vector<std::unique_ptr<InsnRegNamesScratch>> nscratch;
-
     uint64_t ft = 0, taken = 0;
-    /* The guest read + decode runs WITHOUT data_lock: the probing read takes
-     * the mmap_lock (user) / walks the page table (system), and the
-     * translation path holds mmap_lock before data_lock — holding data_lock
-     * across the read would invert that order. */
-    uint32_t n = alt_decode_one_bb(pc, pcs, fields, regnames, sizes,
-                                   bytes, fscratch, nscratch,
-                                   with_names, &ft, &taken);
+    /*
+     * The assembly runs WITHOUT data_lock: it drives real translations, and a
+     * translation takes mmap_lock before the plugin's own data_lock -- so
+     * holding data_lock across it would invert that order.  There is no
+     * per-instruction scratch to own any more: the InsnFields come by
+     * reference out of the fragment templates the translation built, and
+     * commit_alt_bb's pack is what deep-copies them.
+     */
+    uint32_t n = alt_assemble_bb(pc, pcs, fields, regnames, sizes,
+                                 bytes, with_names, &ft, &taken);
     if (n == 0) {
-        g_alt_mint.skips_unmapped++;   /* unmapped page or undecodable head */
+        /* QEMU declined the translation: an unreachable page, a
+         * translation-time fault, or a full code buffer.  All three are
+         * counted here and the buffer-full share is separately readable
+         * through qemu_plugin_decode_only_nobuf(). */
+        g_alt_mint.skips_unmapped++;
         return false;
     }
 
@@ -4071,17 +4076,33 @@ void altmint_conditional_alternate(const InsnFields *terminal,
     if (!g_features.alt_mint || !terminal) {
         return;
     }
-    /* Only a conditional DIRECT branch has a statically-known untaken side
-     * (both edges architecturally reachable): its taken target is the decoded
-     * immediate, its not-taken edge the fall-through.  Unconditional /
-     * indirect terminators have no decodable alternate here. */
+    /*
+     * Only a conditional DIRECT branch has a statically-known untaken side --
+     * both edges architecturally reachable -- and its taken edge is the
+     * TRANSLATOR-RESOLVED target, not an encoded immediate.  Unconditional and
+     * indirect terminators have no statically-known alternate here.
+     *
+     * THIS READ WAS `terminal->immediate` AND THAT WAS A DEFECT THE STATEMENT
+     * FLIP EXPOSED.  A decoder running beside the emulator resolves a relative
+     * branch's displacement to an absolute address before it hands over an
+     * operand; QEMU states the value the ENCODING carries, which for a `jcc
+     * rel8` is the displacement itself.  Feeding that to the minter asked for
+     * translations at addresses like 0xc9 and 0x5.  InsnFields::taken_target_pc
+     * is the field that has always held the answer -- the same value the
+     * translator gave gen_goto_tb, with the per-ISA relative-versus-absolute,
+     * sign-extension and delay-slot accounting already done -- and its own
+     * comment already said a wrong-path target selection MUST consume it and
+     * not the immediate.  Measured on /bin/true with static_templates=1:
+     * 1,442 of 1,444 candidate addresses were declined by QEMU's own
+     * instruction-fetch probe because they were not addresses.
+     */
     bool direct_cond = terminal->branch_type == BRANCH_COND_DIRECT ||
                        (terminal->branch_type == BRANCH_DIRECT_JUMP &&
                         terminal->branch_conditional);
-    if (!direct_cond || !terminal->has_immediate) {
+    if (!direct_cond || terminal->taken_target_pc == 0) {
         return;
     }
-    uint64_t taken = (uint64_t)terminal->immediate;
+    uint64_t taken = terminal->taken_target_pc;
 
     uint64_t alt;
     if (followed_pc == fall_through) {
@@ -9503,7 +9524,6 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
  * raw insn whose canonical insn resolved an address.
  */
 static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
-                             const qemu_plugin_insn_info *insn_info,
                              size_t raw_n_insns,
                              const uint32_t *canonical_index,
                              const bool *canonical_first,
@@ -9512,6 +9532,12 @@ static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
     if (!new_tmpl) {
         return;
     }
+    /*
+     * The raw index of each canonical instruction: what the statement ABI
+     * answers for.  canonical_first marks the first raw occurrence, and the
+     * address is a static fact of the encoding, so the first occurrence is
+     * the one to ask.
+     */
     for (uint32_t i = 0; i < canonical_n_insns; i++) {
         uint8_t op = new_tmpl->insn_fields[i].opcode;
         if (op != GEN_OP_PREFETCH &&
@@ -9519,14 +9545,21 @@ static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
             op != GEN_OP_TLB_FLUSH) {
             continue;
         }
+        size_t raw = SIZE_MAX;
+        for (size_t r = 0; r < raw_n_insns; r++) {
+            if (canonical_first[r] && canonical_index[r] == i) {
+                raw = r;
+                break;
+            }
+        }
+        if (raw == SIZE_MAX) {
+            continue;
+        }
         if (!new_tmpl->insn_synthetic_ea) {
             new_tmpl->insn_synthetic_ea =
                 g_new0(SyntheticEAInfo, canonical_n_insns);
         }
-        decode_synthetic_ea(&insn_info[i], op,
-                            new_tmpl->insn_pcs[i],
-                            new_tmpl->insn_sizes[i],
-                            &new_tmpl->insn_synthetic_ea[i]);
+        qdep_synthetic_ea(tb, raw, op, &new_tmpl->insn_synthetic_ea[i]);
     }
     if (!new_tmpl->insn_synthetic_ea) {
         return;
@@ -9561,7 +9594,6 @@ static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
 
 static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                                     BBTemplate *new_tmpl,
-                                    const qemu_plugin_insn_info *insn_info,
                                     size_t raw_n_insns,
                                     const uint32_t *canonical_index,
                                     const bool *canonical_first,
@@ -9569,7 +9601,7 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
 {
     arm_reg_snap_cbs(tb, new_tmpl, raw_n_insns, canonical_index,
                      canonical_first, canonical_n_insns);
-    arm_synth_ea_cbs(tb, new_tmpl, insn_info, raw_n_insns, canonical_index,
+    arm_synth_ea_cbs(tb, new_tmpl, raw_n_insns, canonical_index,
                      canonical_first, canonical_n_insns);
 }
 
@@ -9607,30 +9639,30 @@ struct TbFragmentSpec {
  * conditional traps), and the splitter is what reconciles that
  * disagreement at the true-BB layer.
  */
-static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
+static void split_tb_into_fragments(const struct qemu_plugin_tb *tb,
+                                    const uint32_t *canonical_raw,
                                     uint32_t n_insns,
                                     std::vector<TbFragmentSpec> &out)
 {
     out.clear();
-    if (!insn_info || n_insns == 0) {
+    if (!tb || !canonical_raw || n_insns == 0) {
         return;
     }
-    auto insn_branch_type = [](const qemu_plugin_insn_info *info) -> uint8_t {
-        if (!info->mnemonic[0]) {
+    /*
+     * The branch class is the decode rule's own word, read through the
+     * vocabulary -- the same source the template's classification takes, so
+     * the boundary the splitter draws and the branch the template publishes
+     * can never disagree about what terminated the block.
+     */
+    auto insn_branch_type = [&](uint32_t ci) -> uint8_t {
+        uint8_t opcode = GEN_OP_UNKNOWN, bt = BRANCH_NONE;
+        const char *word =
+            qemu_plugin_insn_decode_word(tb, canonical_raw[ci]);
+
+        if (!cst_vocabulary_lookup(word, &opcode, &bt)) {
             return BRANCH_NONE;
         }
-        /* Full-size scratch backing: the decode contract requires wired
-         * spans (the dep/lane refiners write through them even though
-         * only branch_type is consumed here). */
-        InsnFieldsScratch s;
-        insn_fields_scratch_reset(&s);
-        /*
-         * A branch-type probe, not a classification of an encoding this run
-         * saw: it has no bytes to key a capture row on, and a row keyed on
-         * nothing is not a row.
-         */
-        decode_detail_to_generic(0, nullptr, 0, info, &s.f, nullptr);
-        return s.f.branch_type;
+        return bt;
     };
     /*
      * Branch families that carry an architectural delay slot — the
@@ -9647,30 +9679,54 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
      * code) as its "delay slot", welding kernel and user code into one
      * true-BB and desyncing the whole system-mode fault machinery.
      */
-    auto is_no_delay_slot_mnemonic = [](const char *m) -> bool {
-        return m[0] == 'e' ? (!strcmp(m, "eret") || !strcmp(m, "eretnc"))
-                           : !strcmp(m, "deret");
+    /*
+     * The exception-return rules, by the name QEMU's own decoder gives the
+     * row that ran -- not by a printed mnemonic.
+     *
+     * Every one of them states the word `ret`, which is right: architecturally
+     * they return.  What separates them from `jr $ra` is that they carry NO
+     * delay slot, and the vocabulary has no word for that because it is not a
+     * generic operation, it is a per-rule property of three MIPS encodings.
+     * The rule NAME is the one QEMU-side fact that tells them apart, and a
+     * rule name is the decoder's own identity for the row it took.
+     *
+     * Getting this wrong is not cosmetic: QEMU ends the TB at an exception
+     * return, so a splitter that expected a delay slot would mark the
+     * fragment BARE_BRANCH and the chain assembler would absorb the RETURN
+     * TARGET -- usually user code -- as the slot, welding kernel and user
+     * into one basic block.
+     *
+     * NAMED RESIDUE.  The statement that would replace this list is the
+     * borrow note of fact-table row 15 (`insn_dataflow_note_borrow_begin` /
+     * `_end`), which has no call site on any target at this tip.  Until it
+     * does, this is a coverage path and not an endpoint.
+     */
+    auto rule_has_no_delay_slot = [](const char *rule) -> bool {
+        if (!rule) {
+            return false;
+        }
+        return !strcmp(rule, "OPC_ERET") || !strcmp(rule, "OPC_DERET");
     };
-    auto has_delay_slot = [&](uint8_t bt,
-                              const qemu_plugin_insn_info *info) -> bool {
+    auto has_delay_slot = [&](uint8_t bt, uint32_t ci) -> bool {
         if (bt != BRANCH_DIRECT_JUMP && bt != BRANCH_INDIRECT_JUMP &&
             bt != BRANCH_RETURN && bt != BRANCH_COND_DIRECT &&
             bt != BRANCH_DIRECT_CALL && bt != BRANCH_INDIRECT_CALL) {
             return false;
         }
-        return !is_no_delay_slot_mnemonic(info->mnemonic);
+        return !rule_has_no_delay_slot(
+            qemu_plugin_insn_decode_name(tb, canonical_raw[ci]));
     };
     bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
 
     uint32_t frag_start = 0;
     uint32_t i = 0;
     while (i < n_insns) {
-        uint8_t bt = insn_branch_type(&insn_info[i]);
+        uint8_t bt = insn_branch_type(i);
         if (bt == BRANCH_NONE) {
             i++;
             continue;
         }
-        if (delay_isa && has_delay_slot(bt, &insn_info[i])) {
+        if (delay_isa && has_delay_slot(bt, i)) {
             if (i + 1 < n_insns) {
                 /* Branch + delay slot both in this TB: fragment runs
                  * through the delay slot (canonical index i+1). */
@@ -10312,7 +10368,8 @@ struct TbPoison {
  */
 static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                                  const uint8_t *insn_bytes,
-                                 const qemu_plugin_insn_info *insn_info,
+                                 const struct qemu_plugin_tb *tb,
+                                 const uint32_t *canonical_raw,
                                  uint32_t canonical_n_insns)
 {
     TbPoison p;
@@ -10411,11 +10468,18 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
             } else if (!spec) {
                 g_first_insn_word.emplace(ipc, word);
             }
-            if (!p.poisoned &&
-                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
+            /*
+             * Bytes that reached no decode rule.  QEMU translated this block,
+             * so "no rule matched" is the emulator's own verdict on these
+             * bytes rather than a second decoder's opinion about them -- and
+             * it is the one verdict that matters, because an encoding QEMU
+             * declines is one the guest cannot execute.
+             */
+            if (!p.poisoned && tb && canonical_raw &&
+                qemu_plugin_insn_undecoded(tb, canonical_raw[ci])) {
                 p.poisoned = true;
                 p.pc = ipc;
-                p.reason = "Capstone decode failure";
+                p.reason = "no decode rule matched";
             }
         }
         if (p.poisoned && !spec) {
@@ -10442,6 +10506,13 @@ struct TbScratch {
     std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
     std::unique_ptr<uint32_t[]>              canonical_index;
     std::unique_ptr<bool[]>                  canonical_first;
+    /*
+     * The RAW index of each canonical instruction: the one the statement ABI
+     * answers for.  The canonical arrays de-duplicate a repeated instruction
+     * and QEMU does not, so the first raw occurrence is what a (tb, idx)
+     * query has to name.
+     */
+    std::unique_ptr<uint32_t[]>              canonical_raw;
     /* Per-fragment local canonical mapping, reused across fragments. */
     std::unique_ptr<uint32_t[]>              local_canonical_index;
     std::unique_ptr<bool[]>                  local_canonical_first;
@@ -10454,6 +10525,7 @@ struct TbScratch {
           insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
           canonical_index(std::make_unique<uint32_t[]>(n)),
           canonical_first(std::make_unique<bool[]>(n)),
+          canonical_raw(std::make_unique<uint32_t[]>(n)),
           local_canonical_index(std::make_unique<uint32_t[]>(n)),
           local_canonical_first(std::make_unique<bool[]>(n)) {}
 };
@@ -10479,6 +10551,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     uint8_t *insn_bytes                = scratch.insn_bytes.get();
     uint32_t *canonical_index          = scratch.canonical_index.get();
     bool *canonical_first              = scratch.canonical_first.get();
+    uint32_t *canonical_raw            = scratch.canonical_raw.get();
     uint32_t canonical_n_insns = 0;
 
     /* Translate-time marker scan gate: correct-path translations only —
@@ -10490,7 +10563,8 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
      * starts mid-sequence is a jump landing inside it — NOT a marker, by
      * the deliberate-semantics ruling. */
     bool marker_scan = marker_scan_enabled() && g_marker_seq.valid &&
-                       !g_wp_in_progress && !qemu_plugin_in_spec_mode();
+                       !g_wp_in_progress && !qemu_plugin_in_spec_mode() &&
+                       !g_alt_translating;
 
     for (size_t i = 0; i < raw_n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -10550,6 +10624,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
             uint32_t out = canonical_n_insns++;
             canonical_index[i] = out;
             canonical_first[i] = true;
+            canonical_raw[out] = (uint32_t)i;
             insn_pcs[out] = raw_pc;
             insn_sizes[out] = raw_size;
             insn_branch_target_pcs[out] =
@@ -10557,6 +10632,21 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
             memcpy(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
                    raw_bytes, MAX_INSN_BYTES);
 
+#ifdef CST_CAPTURE
+            /*
+             * THE SECOND DECODER, and the only thing left that asks it
+             * anything.
+             *
+             * Nothing the wire publishes reads this: classification, the
+             * register lists, the memory operands, the lane shape and the
+             * self-loop unit are all QEMU's own statements about the ops it
+             * emitted (champsim_tracer_qdep.cc), and the fragment splitter
+             * draws its boundaries on QEMU's decode rule.  What survives is
+             * one column of the comparison corpus -- the mnemonic the other
+             * decoder printed -- which is apparatus and belongs in a build
+             * configured for apparatus.  A release object does not make this
+             * call at all.
+             */
             if (cst_cap_arch >= 0) {
                 qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode,
                                        &insn_bytes[(size_t)out *
@@ -10565,6 +10655,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
                                        insn_pcs[out],
                                        &insn_info[out]);
             }
+#endif
 
             /*
              * The comparison capture's second call site, here because this is
@@ -10686,7 +10777,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Pre-commit instruction-memory stability check: bail without creating
      * fragments/callbacks for a TB whose bytes don't parse as valid code
      * (see detect_tb_poison). */
-    TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, insn_info,
+    TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, tb,
+                                       scratch.canonical_raw.get(),
                                        canonical_n_insns);
     if (poison.poisoned) {
         /* Do not create fragments, do not arm callbacks.  vcpu_tb_exec gets
@@ -10702,7 +10794,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * Singleton TBs (no mid-TB branch) produce one spec, matching
      * the pre-splitter behavior. */
     std::vector<TbFragmentSpec> fragment_specs;
-    split_tb_into_fragments(insn_info, canonical_n_insns, fragment_specs);
+    split_tb_into_fragments(tb, scratch.canonical_raw.get(),
+                            canonical_n_insns, fragment_specs);
 
     /* Per-raw-insn local mapping into the current fragment's canonical
      * index space.  Allocated once and reused per fragment.  For raw
@@ -10728,7 +10821,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * create_tb_template (groups the six parallel per-insn arrays). */
     TbInsnView tb_view = {
         canonical_n_insns, insn_pcs, insn_info, insn_branch_target_pcs,
-        insn_sizes, insn_bytes,
+        insn_sizes, insn_bytes, tb, scratch.canonical_raw.get(),
     };
 
     uint64_t tb_start_pc = insn_pcs[0];
@@ -10806,7 +10899,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             }
         }
 
-        tb_arm_new_template_cbs(tb, frag_tmpl, &insn_info[f_first_ci],
+        tb_arm_new_template_cbs(tb, frag_tmpl,
                                 raw_n_insns, local_canonical_index,
                                 local_canonical_first, spec.n_insns);
 
@@ -10837,6 +10930,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_mutex_lock(&data_lock);
         g_template_store.register_tb_chain(tb_start_pc, head_fragment);
         g_mutex_unlock(&data_lock);
+    }
+
+    /* Hand the chain back to a translate-for-an-alternate caller.  It is the
+     * same chain an execution would walk, which is the point: a minted block
+     * and an executed one come from one builder and one set of statements. */
+    if (g_alt_translating) {
+        g_alt_translated_head = head_fragment;
     }
 
     /* Instrument the block for execution tracking.  current_pc is set
@@ -11386,10 +11486,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         g_string_append_printf(report,
             "Branch-alternate minting: checks=%" PRIu64 " mints=%" PRIu64
             " depth_mints=%" PRIu64 " (depth=%u) skips_unmapped=%" PRIu64
-            " budget_hits=%" PRIu64 "\n",
+            " budget_hits=%" PRIu64 " xlat_declined=%" PRIu64
+            " chain_missing=%" PRIu64 "\n",
             g_alt_mint.checks, g_alt_mint.mints, g_alt_mint.depth_mints,
             g_features.alt_depth, g_alt_mint.skips_unmapped,
-            g_alt_mint.budget_hits);
+            g_alt_mint.budget_hits, g_alt_mint.xlat_declined,
+            g_alt_mint.chain_missing);
     }
 
     qemu_plugin_outs(report->str);

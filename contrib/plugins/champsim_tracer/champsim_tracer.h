@@ -27,6 +27,12 @@
 
 extern "C" {
 #include <qemu-plugin.h>
+/*
+ * The statement ABI.  Its answers are what the wire's per-instruction facts
+ * are taken from, and they are readable only inside the translation callback
+ * that produced them; see champsim_tracer_qdep.h.
+ */
+#include <qemu-plugin-dataflow.h>
 }
 
 #include "cst_wire_spec.h"
@@ -665,7 +671,7 @@ typedef struct {
  * makes RegHandleCache::lookup's TLS pointer-cache hit cross-insn.
  * NULL: generic reg has no single directly-readable QEMU register.
  */
-typedef struct {
+typedef struct InsnRegNames {
     /* SPAN MEMBERS, sized by the sibling InsnFields' n_src_regs /
      * n_dst_regs and packed into the template's insn_fields_pool (see
      * champsim_tracer_mnemonics.h SPAN MEMBERS).  Empty or sentinel
@@ -710,7 +716,7 @@ static inline void insn_reg_names_scratch_reset(InsnRegNamesScratch *s)
  * Likewise for index_key.  Both are stable pointers into
  * g_qemu_reg_by_gen[].
  */
-typedef struct {
+typedef struct SyntheticEAInfo {
     const QemuRegKey *base_key;
     const QemuRegKey *index_key;
     int64_t  disp;
@@ -1716,11 +1722,26 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
                          uint8_t insn_size,
                          SyntheticEAInfo *out);
 
-/* Build the GenericRegId → QemuRegKey reverse index used by the
- * multi-reg path of add_src_cap_reg / add_dst_cap_reg.  Must run
- * after active_reg_table is set; idempotent.  Defined in
- * champsim_tracer_decode.cc. */
+/*
+ * Build the GenericRegId -> QemuRegKey reverse index: the map from a wire
+ * register id to the (feature, name) pair a VALUE read needs to find its GDB
+ * register handle.  Must run after active_reg_table is set; idempotent.
+ * Defined in champsim_tracer_decode.cc.
+ *
+ * SCOPE, because it is easy to mistake for a decode input and it is not one.
+ * This map answers "where do I READ this register's bytes", which is the
+ * regdata path; nothing about classification, dataflow or the operand lists
+ * consults it.  Its rows are still derived from the per-ISA register table,
+ * which is why it is named here as what the Capstone dependency's removal has
+ * to re-home rather than as something the statement flip already replaced.
+ */
 void build_qemu_reg_reverse_index(void);
+
+/*
+ * The (feature, name) pair for wire register @gen_id, or NULL when this build
+ * has no value-read route to it.  See build_qemu_reg_reverse_index.
+ */
+const QemuRegKey *qemu_reg_for_generic_id(uint8_t gen_id);
 
 /*
  * Wide regfile snapshot: opaque TLS scratch keyed by the active reg

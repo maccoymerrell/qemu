@@ -78,6 +78,11 @@ static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
     return qemu_reg_key_valid(k) ? k : nullptr;
 }
 
+const QemuRegKey *qemu_reg_for_generic_id(uint8_t gen_id)
+{
+    return qemu_reg_for_generic(gen_id);
+}
+
 void capture_initial_regfile(unsigned int cpu_index,
                              std::vector<InitialRegSnap> *out)
 {

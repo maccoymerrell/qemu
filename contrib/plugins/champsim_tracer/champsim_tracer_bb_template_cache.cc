@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_qdep.h"
 #include "champsim_tracer_smc_match.h"
 #include "champsim_tracer_stats.h"
 
@@ -343,6 +344,31 @@ BBTemplate *TemplateStore::lookup_tb_chain(uint64_t tb_start_pc,
     }
     return chain_index_scan(spec_chain_index_, key, total_n_insns,
                             insn_sizes, insn_bytes);
+}
+
+BBTemplate *TemplateStore::lookup_tb_chain_at(uint64_t tb_start_pc)
+{
+    BBKey key{store_live_asid_root(), tb_start_pc};
+
+    auto scan = [&](const auto &index) -> BBTemplate * {
+        auto it = index.find(key);
+
+        if (it == index.end()) {
+            return nullptr;
+        }
+        for (BBTemplate *head : it->second) {
+            if (head) {
+                return head;
+            }
+        }
+        return nullptr;
+    };
+    /* CODE index first, for the same reason lookup_tb_chain takes it first:
+     * a promoted chain's SPEC entry is left stale. */
+    if (BBTemplate *head = scan(tb_chain_dedup_)) {
+        return head;
+    }
+    return scan(spec_chain_index_);
 }
 
 void TemplateStore::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)
@@ -1545,7 +1571,6 @@ BBTemplate *TemplateStore::create_tb_template(
 {
     uint32_t n_insns                            = insns.n;
     const uint64_t *insn_pcs                    = insns.pcs;
-    const qemu_plugin_insn_info *insn_info      = insns.info;
     const uint64_t *insn_branch_target_pcs      = insns.branch_target_pcs;
     const uint8_t *insn_sizes                   = insns.sizes;
     const uint8_t *insn_bytes                   = insns.bytes;
@@ -1620,14 +1645,19 @@ BBTemplate *TemplateStore::create_tb_template(
             if (with_names) {
                 insn_reg_names_scratch_reset(&nscratch[i]);
             }
-            if (insn_info && insn_info[i].mnemonic[0]) {
-                decode_detail_to_generic(
-                    tmpl->insn_pcs[i],
-                    insn_bytes ? insn_bytes + (size_t)i * MAX_INSN_BYTES
-                               : nullptr,
-                    insn_bytes && insn_sizes ? insn_sizes[i] : 0,
-                    &insn_info[i], &scratch[i].f,
-                    with_names ? &nscratch[i].rn : nullptr);
+            /*
+             * THE FACTS COME FROM QEMU, keyed on the translation and the raw
+             * index of this instruction inside it.  Everything the wire
+             * publishes about an encoding -- what it is, which registers it
+             * reads and writes, where each address and datum came from, how
+             * it distributes across lanes, what it does per self-loop unit --
+             * is the emulator's own answer about the ops it just emitted and
+             * the rule those ops came from.
+             */
+            if (insns.tb && insns.raw_idx) {
+                qdep_apply(insns.tb, insns.raw_idx[i], tmpl->insn_pcs[i],
+                           &scratch[i].f,
+                           with_names ? &nscratch[i].rn : nullptr);
             }
             /*
              * Static branch target as resolved by the per-ISA

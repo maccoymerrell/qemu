@@ -181,6 +181,21 @@ struct TbInsnView {
     const uint64_t              *branch_target_pcs;
     const uint8_t               *sizes;
     const uint8_t               *bytes;   /* n * MAX_INSN_BYTES */
+    /*
+     * THE TRANSLATION ITSELF, and the raw index of each canonical
+     * instruction inside it.
+     *
+     * Every fact the wire publishes about an instruction is keyed (tb, idx)
+     * and readable only while that translation is the current one
+     * (qemu-plugin-dataflow.h), so a view that carries bytes and addresses
+     * and not the pair carries nothing a classifier can use.  The RAW index
+     * is the key, not the canonical one: a TB can repeat an instruction --
+     * a looping REP string operation translates its body twice -- and the
+     * canonical arrays de-duplicate that, so the two indices differ and only
+     * one of them names a row QEMU will answer for.
+     */
+    const struct qemu_plugin_tb  *tb;
+    const uint32_t               *raw_idx;   /* [n] */
 
     /* Sub-view covering canonical insns [first, first + count). */
     TbInsnView slice(uint32_t first, uint32_t count) const
@@ -192,6 +207,8 @@ struct TbInsnView {
             branch_target_pcs + first,
             sizes + first,
             bytes + (size_t)first * MAX_INSN_BYTES,
+            tb,
+            raw_idx ? raw_idx + first : nullptr,
         };
     }
 };
@@ -497,6 +514,21 @@ public:
                                 const uint8_t *insn_sizes,
                                 const uint8_t *insn_bytes);
     void        register_tb_chain(uint64_t tb_start_pc, BBTemplate *head);
+    /*
+     * The chain registered at @tb_start_pc in the live address space, with no
+     * byte comparison.
+     *
+     * For the ALTERNATE path only, and the absence of the byte check is the
+     * point rather than an omission.  That check exists so one chain is not
+     * reused for a DIFFERENT translation with the same start address; here
+     * the caller has just asked QEMU to translate at exactly this address and
+     * QEMU answered from its own code cache, which means the bytes at that
+     * address are the ones that translation was made from -- a guest write
+     * would have invalidated the block and forced a fresh translation, and a
+     * cache flush drops this index with the templates it points into.  So the
+     * two caches move together, and a hit here is the same block.
+     */
+    BBTemplate *lookup_tb_chain_at(uint64_t tb_start_pc);
 
     /* Correct-path execution notice for the chain headed by @head (the
      * per-TB exec-cb udata).  Converts every sibling fragment on the

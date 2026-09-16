@@ -19,6 +19,7 @@
 #include "champsim_tracer.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_stats_report.h"
+#include "champsim_tracer_qdep.h"
 
 static void append_branch_breakdown(GString *report, const Stats &stats)
 {
@@ -389,6 +390,53 @@ void append_stats_summary(GString *report, const char *label,
         { "WP host syscalls blocked (must be 0)",
           qemu_plugin_spec_syscall_blocked_count() },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
+        /*
+         * THE SEATING CENSUS.  Every per-instruction fact the wire publishes
+         * comes from QEMU's statements about the ops it emitted; these say how
+         * often that succeeded and, when it did not, WHICH condition it was --
+         * the three are different questions and collapsing them would let a
+         * build problem read as a decoder gap.
+         *
+         * `seated` is the vacuity guard: a zero there means nothing was
+         * classified at all, not that nothing went wrong.
+         */
+        { "QEMU-seated instructions",            qdep_counters()->seated },
+        { "  seating: bytes reached no rule",    qdep_counters()->no_rule },
+        { "  seating: instruction not recorded whole",
+                                                 qdep_counters()->incomplete },
+        /* A word this build cannot read means the emulator and the plugin
+         * were built from different vocabularies.  It is a skewed build, not
+         * an unclassifiable instruction, and must read 0. */
+        { "  seating: unreadable word (must be 0)",
+                                                 qdep_counters()->unknown_word },
+        { "  seating: no readable status (must be 0)",
+                                                 qdep_counters()->no_status },
+        /* Set members with no wire spelling.  Counted rather than dropped:
+         * a set that quietly omitted one would compare equal to a set that
+         * genuinely lacks it. */
+        { "  seating: names the map could not read (must be 0)",
+                                                 qdep_counters()->unmapped_names },
+        { "  seating: env ranges no register contains",
+                                                 qdep_counters()->unnamed_ranges },
+        { "  seating: sources past the slot ceiling",
+                                                 qdep_counters()->dropped_srcs },
+        { "  seating: destinations past the slot ceiling",
+                                                 qdep_counters()->dropped_dsts },
+        { "  seating: loads past the slot ceiling",
+                                                 qdep_counters()->dropped_loads },
+        { "  seating: stores past the slot ceiling",
+                                                 qdep_counters()->dropped_stores },
+        { "  seating: synthetic addresses published",
+                                                 qdep_counters()->synth_ea_seated },
+        { "  seating: synthetic addresses withheld whole",
+                                                 qdep_counters()->synth_ea_refused },
+        /* Translate-on-demand declines for a full code buffer: the alternate
+         * path asked QEMU to translate a block and could not get one.  The
+         * guard exists so that case declines instead of longjmping out of the
+         * plugin callback; the number is what makes it a guard that HOLDS
+         * rather than one nothing ever reached. */
+        { "alternate translations declined (code buffer full)",
+          qemu_plugin_decode_only_nobuf() },
         { "DEVIO FIFO kicks dropped (overflow)", stats.devio_fifo_kicks_dropped },
         /* Invariant, not a measurement: a cut says the address space moved
          * away, so it cannot stand while the entry value is loaded. */

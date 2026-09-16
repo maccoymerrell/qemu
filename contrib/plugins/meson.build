@@ -52,6 +52,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
       'champsim_tracer/champsim_tracer_vocabulary.cc',
       'champsim_tracer/champsim_tracer_regmap.cc',
+      'champsim_tracer/champsim_tracer_qdep.cc',
       'champsim_tracer/champsim_tracer_capture.cc',
     )
 

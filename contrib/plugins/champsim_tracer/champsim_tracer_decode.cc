@@ -810,7 +810,30 @@ void decode_detail_to_generic(uint64_t pc,
      * aarch64 b vs b.<cc>, mips jr $ra).  Runs after the operand walk
      * (the riscv arm needs n_src/n_dst populated) and before the
      * per-row .refine (whose x86 call body overrides this one). */
+    /*
+     * The refiner chain's three readings, for the comparison capture.
+     *
+     * The alias refiners key on the PRINTED MNEMONIC, so a corpus that
+     * recorded only the answer cannot say which side produced it -- and
+     * "which side produced it" is the whole question a flip to QEMU's decode
+     * rule has to be decided on.  Three snapshots make it answerable.
+     *
+     * Unconditional and unguarded, like the other two capture calls beside
+     * it: cst_capture_alias() is an empty inline in a release build, so these
+     * are dead stores the compiler discards and the CST_CAPTURE guard stays
+     * out of the decoder.
+     */
+    const InsnAliasSnap df_walk = {
+        out->branch_type, out->n_src_regs, out->n_dst_regs,
+        out->branch_conditional
+    };
+
     refine_alias_fields(info, out, out_names);
+
+    const InsnAliasSnap df_alias = {
+        out->branch_type, out->n_src_regs, out->n_dst_regs,
+        out->branch_conditional
+    };
 
     /*
      * Optional ISA-specific post-classification .refine: fixes up
@@ -820,6 +843,14 @@ void decode_detail_to_generic(uint64_t pc,
     if (cls && cls->refine) {
         cls->refine(info, out);
     }
+
+    /*
+     * Taken here rather than beside cst_capture_insn() at the end: this row
+     * is about the two refiners and nothing after them touches branch_type or
+     * the register counts, so reading `out` at the end would say the same
+     * thing while inviting a later pass to break the claim silently.
+     */
+    cst_capture_alias(bytes, nbytes, info->mnemonic, &df_walk, &df_alias, out);
 
     /*
      * Lane info populated BEFORE .dep_refine so structured-vec dep

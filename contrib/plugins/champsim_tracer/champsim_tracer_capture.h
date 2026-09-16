@@ -39,6 +39,35 @@ struct qemu_plugin_insn_info;
 struct qemu_plugin_tb;
 struct InsnFields;
 
+/*
+ * What the classification looked like at ONE point in the refiner chain.
+ *
+ * The alias refiners are the only wire-bearing Capstone reads the corpora
+ * could not score, because nothing recorded the answer they were handed.
+ * They key on the PRINTED MNEMONIC to separate what one Capstone instruction
+ * id merged -- aarch64 `b` from `b.<cc>`, mips `jr $ra` from `jr $rN`, `bal`'s
+ * false conditional, riscv's alias-hidden link register and the C-extension
+ * HINT code points -- so the question a scorer has to answer is not "what is
+ * the branch type" but "WHICH SIDE PRODUCED IT", and that needs the value
+ * before as well as after.
+ *
+ * Declared outside the CST_CAPTURE guard because the decoder takes the two
+ * snapshots either way, which is what keeps the guard out of the decoder.
+ * They cost the release build nothing, and that is MEASURED rather than
+ * assumed: the entry point below is an empty inline there, and an A/B of the
+ * shipped object with and without the snapshots leaves .text, .rodata and
+ * .data.rel.ro BYTE-IDENTICAL.  The `.so` file's own sha does move, because
+ * its build-id and debug line tables move with any source edit at all -- so
+ * the file hash is the wrong instrument for this question and the section
+ * contents are the right one.
+ */
+struct InsnAliasSnap {
+    uint8_t branch_type;
+    uint8_t n_src_regs;
+    uint8_t n_dst_regs;
+    bool    branch_conditional;
+};
+
 #ifdef CST_CAPTURE
 
 /*
@@ -95,6 +124,21 @@ void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
 void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
                          const void *bytes, size_t nbytes);
 
+/*
+ * The refiner chain's three readings of one encoding: as the operand walk and
+ * the mnemonic table left it, after refine_alias_fields(), and after the
+ * per-row .refine callback.
+ *
+ * A row where the three agree is an encoding the alias surface does not touch,
+ * and a row where they differ names exactly what would be lost if that surface
+ * went away -- which is the fact a flip to QEMU's decode rule has to be
+ * decided on, and the one no corpus carried.
+ */
+void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
+                       const struct InsnAliasSnap *walk,
+                       const struct InsnAliasSnap *alias,
+                       const struct InsnFields *f);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -110,6 +154,11 @@ static inline void cst_capture_vec_env(const struct qemu_plugin_tb *, size_t,
 { }
 static inline void cst_capture_df_stmt(const struct qemu_plugin_tb *, size_t,
                                        const void *, size_t)
+{ }
+static inline void cst_capture_alias(const void *, size_t, const char *,
+                                    const struct InsnAliasSnap *,
+                                    const struct InsnAliasSnap *,
+                                    const struct InsnFields *)
 { }
 
 #endif /* CST_CAPTURE */

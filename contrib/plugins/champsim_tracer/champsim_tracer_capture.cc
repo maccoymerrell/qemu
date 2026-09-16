@@ -207,6 +207,8 @@ Corpus *corpus_ident;    /* the decode rule QEMU reached, beside the mnemonic */
 Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
 Corpus *corpus_reg;      /* every register name QEMU used, and what it maps to */
 Corpus *corpus_set;      /* the read and write SETS, per encoding */
+Corpus *corpus_gen;      /* both decoders' sets, in the wire's own currency */
+Corpus *corpus_alias;    /* what the alias refiners moved, per encoding */
 
 void corpora_init()
 {
@@ -252,6 +254,41 @@ void corpora_init()
         corpus_set = new Corpus(
             "CST_DF_SET_DUMP",
             "#isa\tencoding\tdir\tn\tdigest\tnames\n");
+        /*
+         * BOTH DECODERS' REGISTER SETS, IN ONE CURRENCY, FROM ONE RUN.
+         *
+         * CST_DF_SET_DUMP carries QEMU's set in QEMU's own spellings, which is
+         * the right answer for comparing two BUILDS of the QEMU side and the
+         * wrong one for comparing the two DECODERS: the wire's src_regs[] and
+         * dst_regs[] are GENERIC ids, the Capstone walk produces generic ids,
+         * and a join between a TCG global's name and a generic id is not a
+         * join.  So this corpus states both sides in the currency the wire
+         * uses -- the QEMU side put through the same register map the wire
+         * would put it through, the Capstone side as the walk produced it --
+         * from the same run and the same window, keyed on the same encoding.
+         *
+         * A MEMBER THE MAP CANNOT TRANSLATE IS STILL A MEMBER.  It prints as
+         * @unmapped:<qemu name>, an atom as its index, an undeclared env range
+         * as its offset and extent.  Dropping any of them would make a set
+         * compare equal to one that genuinely lacks it, and a REAL-LOST count
+         * built on that is the discount R12.1 forbids.
+         */
+        corpus_gen = new Corpus(
+            "CST_GEN_SET_DUMP",
+            "#isa\tencoding\tside\tdir\tnraw\tnuniq\tnames\n");
+        /*
+         * WHICH SIDE OF THE REFINER CHAIN PRODUCED THE BRANCH TYPE.
+         *
+         * Three readings per encoding, so a row where they differ names the
+         * encodings the alias surface is load-bearing for.  Deduplicated on
+         * the whole row: the same bytes refine the same way every time, and a
+         * repeat is a repeat.
+         */
+        corpus_alias = new Corpus(
+            "CST_ALIAS_DUMP",
+            "#isa\tencoding\tmnem\tbr_walk\tbr_alias\tbr_final"
+            "\tcond_walk\tcond_alias\tcond_final"
+            "\tnsrc_walk\tnsrc_alias\tnsrc_final\tndst_final\tmoved\n");
     }
 }
 
@@ -643,7 +680,199 @@ void emit_reg_set(const char *isa, const char *enc, char dir,
             total > n ? ",+MORE" : "");
 }
 
+/*
+ * One member of QEMU's provenance set, in the WIRE's currency.
+ *
+ * prov_bit_label() spells a member as QEMU spells it, which is right for
+ * comparing two QEMU-side builds and wrong for comparing the two DECODERS:
+ * the Capstone walk produces generic ids and so does the wire.  This puts the
+ * member through the same register map the wire would, so both sides of the
+ * join speak generic.
+ *
+ * NOTHING IS DROPPED.  A name the map cannot translate is a real member and
+ * prints as @unmapped:<name>; an atom and an undeclared env range print as
+ * themselves.  A set that quietly omitted any of them would compare equal to
+ * one that genuinely lacks it, and REAL-LOST measured against that is exactly
+ * the discount R12.1 forbids.
+ */
+void gen_bit_label(unsigned bit, char *buf, size_t sz)
+{
+    uint32_t atom = 0, off = 0, size = 0;
+    bool is_atom = false;
+    const char *name = prov_bit_name(bit, &is_atom);
+
+    if (name) {
+        uint8_t reg = REG_NONE;
+
+        if (cst_regmap_lookup(capture_isa_id(), name, &reg)) {
+            const char *gn = generic_reg_name(reg);
+
+            if (gn) {
+                snprintf(buf, sz, "%s", gn);
+            } else {
+                snprintf(buf, sz, "REG_%u", (unsigned)reg);
+            }
+        } else {
+            snprintf(buf, sz, "@unmapped:%s", name);
+        }
+    } else if (is_atom && qemu_plugin_dataflow_prov_atom(bit, &atom)) {
+        snprintf(buf, sz, "@atom%u", (unsigned)atom);
+    } else if (qemu_plugin_dataflow_prov_field(bit, &off, &size)) {
+        snprintf(buf, sz, "@env+%u:%u", (unsigned)off, (unsigned)size);
+    } else {
+        snprintf(buf, sz, "@bit%u", bit);
+    }
+}
+
+/* Rows already written, keyed "isa enc side dir names". */
+GHashTable *seen_gen;
+
+/*
+ * One side's register set for one encoding and direction, spelled generic.
+ *
+ * @nraw is how many members the side actually produced and @nuniq how many
+ * distinct spellings survive, so a row where two members share one generic
+ * name says so instead of looking like a set that lost one.
+ */
+void emit_gen_set(const char *isa, const char *enc, char side, char dir,
+                  char labels[][40], unsigned nraw, unsigned n)
+{
+    FILE *o = corpus_gen->get();
+
+    if (!o) {
+        return;
+    }
+    qsort(labels, n, sizeof(labels[0]), label_cmp);
+
+    char names[SET_NAMES_MAX * 41];
+    size_t k = 0;
+    unsigned nuniq = 0;
+
+    names[0] = '\0';
+    for (unsigned i = 0; i < n; i++) {
+        if (i && !strcmp(labels[i], labels[i - 1])) {
+            continue;
+        }
+        nuniq++;
+        int w = snprintf(names + k, sizeof(names) - k, "%s%s",
+                         k ? "," : "", labels[i]);
+
+        if (w < 0 || (size_t)w >= sizeof(names) - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+
+    char key[256];
+
+    snprintf(key, sizeof(key), "%s %s %c %c %s", isa, enc, side, dir,
+             k ? names : "-");
+    if (seen_gen == nullptr) {
+        seen_gen = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                         g_free, nullptr);
+    }
+    if (g_hash_table_contains(seen_gen, key)) {
+        return;
+    }
+    g_hash_table_add(seen_gen, g_strdup(key));
+
+    fprintf(o, "%s\t%s\t%c\t%c\t%u\t%u\t%s%s\n", isa, enc, side, dir,
+            nraw, nuniq, k ? names : "-", nraw > n ? ",+MORE" : "");
+}
+
+/* QEMU's side: walk the provenance bits, spell each one generic. */
+void emit_gen_set_qemu(const char *isa, const char *enc, char dir,
+                       const uint64_t *set, unsigned nwords)
+{
+    char labels[SET_NAMES_MAX][40];
+    unsigned n = 0, total = 0;
+
+    for (unsigned w = 0; w < nwords; w++) {
+        uint64_t word = set[w];
+
+        while (word) {
+            unsigned b = (unsigned)__builtin_ctzll(word);
+
+            word &= word - 1;
+            total++;
+            if (n < SET_NAMES_MAX) {
+                gen_bit_label(w * 64 + b, labels[n], sizeof(labels[n]));
+                n++;
+            }
+        }
+    }
+    emit_gen_set(isa, enc, 'q', dir, labels, total, n);
+}
+
+/* The Capstone walk's side: the list the wire would publish today. */
+void emit_gen_set_cap(const char *isa, const char *enc, char dir,
+                      const uint8_t *regs, unsigned nregs)
+{
+    char labels[SET_NAMES_MAX][40];
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < nregs && n < SET_NAMES_MAX; i++) {
+        snprintf(labels[n], sizeof(labels[n]), "%s",
+                 generic_reg_name_or_unknown(regs[i]));
+        n++;
+    }
+    emit_gen_set(isa, enc, 'c', dir, labels, nregs, n);
+}
+
 } /* namespace */
+
+void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
+                       const struct InsnAliasSnap *walk,
+                       const struct InsnAliasSnap *alias,
+                       const struct InsnFields *f)
+{
+    if (!bytes || !nbytes || !walk || !alias || !f) {
+        return;
+    }
+    corpora_init();
+
+    FILE *o = corpus_alias->get();
+
+    if (!o) {
+        return;
+    }
+
+    char enc[2 * 32 + 1];
+
+    hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /*
+     * WHICH REFINER MOVED IT, not merely that something did.  A scorer joining
+     * this against the identity corpus's branch column has to be able to say
+     * whether the alias surface produced the answer -- deleting it is what a
+     * flip to QEMU's decode rule would do -- or whether the per-row .refine
+     * did, which is a different callback with a different fate.
+     */
+    const char *moved = "none";
+
+    if (walk->branch_type != alias->branch_type ||
+        walk->branch_conditional != alias->branch_conditional ||
+        walk->n_src_regs != alias->n_src_regs ||
+        walk->n_dst_regs != alias->n_dst_regs) {
+        moved = (alias->branch_type != f->branch_type ||
+                 alias->branch_conditional != f->branch_conditional)
+                ? "alias+refine" : "alias";
+    } else if (alias->branch_type != f->branch_type ||
+               alias->branch_conditional != f->branch_conditional) {
+        moved = "refine";
+    }
+
+    fprintf(o, "%s\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n",
+            isa_name(), enc, mnem && mnem[0] ? mnem : "-",
+            branch_type_name_or_unknown(walk->branch_type),
+            branch_type_name_or_unknown(alias->branch_type),
+            branch_type_name_or_unknown(f->branch_type),
+            walk->branch_conditional ? 1u : 0u,
+            alias->branch_conditional ? 1u : 0u,
+            f->branch_conditional ? 1u : 0u,
+            (unsigned)walk->n_src_regs, (unsigned)alias->n_src_regs,
+            (unsigned)f->n_src_regs, (unsigned)f->n_dst_regs, moved);
+}
 
 void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
                       const struct qemu_plugin_insn_info *info,
@@ -683,6 +912,18 @@ void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
     if (FILE *o = corpus_opc->get()) {
         fprintf(o, "%s\t%s\t%s\t%s\n", isa, enc, mnem,
                 generic_opcode_name_or_unknown(f->opcode));
+    }
+
+    /*
+     * The Capstone walk's register sets, in the currency the QEMU side is
+     * written in by cst_capture_df_stmt().  Written here, from the same run
+     * and the same window, so a scorer can join the two sides per encoding --
+     * which is the join the destination flip's REAL-LOST bar is stated over
+     * and the one no corpus carried.
+     */
+    if (corpus_gen->get()) {
+        emit_gen_set_cap(isa, enc, 'r', f->src_regs, f->n_src_regs);
+        emit_gen_set_cap(isa, enc, 'w', f->dst_regs, f->n_dst_regs);
     }
 
     if (FILE *o = corpus_mech->get()) {
@@ -796,9 +1037,27 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
     }
     corpora_init();
 
+    /*
+     * FOUR CORPORA, ONE READER, AND NO CORPUS GATED ON ANOTHER'S REQUEST.
+     *
+     * This is the only place the dataflow status and the two provenance sets
+     * are read, so the statement corpus, the register map, the QEMU-currency
+     * set corpus and the generic-currency one are all fed from here.  They are
+     * asked for independently, and the guard used to be `corpus_stmt` alone:
+     * a run that asked for CST_GEN_SET_DUMP and not CST_DF_STMT_DUMP returned
+     * before writing a single row, and got a file with a header and nothing
+     * under it.
+     *
+     * That is exactly the silent false success this file's own header warns
+     * about -- a corpus that was asked for and is not written -- and it was
+     * caught by a scorer refusing an absent side rather than by the capture.
+     * So the reader runs if ANY of its outputs was asked for, and each output
+     * is written only where it is opened.
+     */
     FILE *o = corpus_stmt->get();
 
-    if (!o) {
+    if (!o && !corpus_gen->get() && !corpus_reg->get() &&
+        !corpus_set->get()) {
         return;
     }
 
@@ -1095,19 +1354,24 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         score_reg_set(isa_name(), enc, 'w', wr, 8, &n_named, &n_map);
         emit_reg_set(isa_name(), enc, 'r', rd, 8);
         emit_reg_set(isa_name(), enc, 'w', wr, 8);
+        emit_gen_set_qemu(isa_name(), enc, 'r', rd, 8);
+        emit_gen_set_qemu(isa_name(), enc, 'w', wr, 8);
         snprintf(regs, sizeof(regs), "%u/%u", n_named, n_map);
     } else {
         snprintf(sets, sizeof(sets), "-\t-");
         snprintf(regs, sizeof(regs), "-");
     }
-    fprintf(o,
-            "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-            isa_name(),
-            enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
-            k ? imm : "-", vece, st.vec_oprsz, vkind, vlane, st.n_memops,
-            fk ? fields : "-", zero[0] ? zero : "-",
-            pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
-            ek ? ea : "-", selfloop, sets, regs);
+    if (o) {
+        fprintf(o,
+                "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t%s\t%s"
+                "\t%s\n",
+                isa_name(),
+                enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
+                k ? imm : "-", vece, st.vec_oprsz, vkind, vlane, st.n_memops,
+                fk ? fields : "-", zero[0] ? zero : "-",
+                pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
+                ek ? ea : "-", selfloop, sets, regs);
+    }
 }
 
 #endif /* CST_CAPTURE */

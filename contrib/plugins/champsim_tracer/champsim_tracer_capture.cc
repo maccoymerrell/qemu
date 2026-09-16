@@ -206,6 +206,7 @@ Corpus *corpus_vec;      /* how a helper's env pointers were recorded */
 Corpus *corpus_ident;    /* the decode rule QEMU reached, beside the mnemonic */
 Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
 Corpus *corpus_reg;      /* every register name QEMU used, and what it maps to */
+Corpus *corpus_set;      /* the read and write SETS, per encoding */
 
 void corpora_init()
 {
@@ -233,6 +234,24 @@ void corpora_init()
         corpus_reg = new Corpus(
             "CST_REGMAP_DUMP",
             "#isa\tencoding\tdir\tname\tgeneric\n");
+        /*
+         * THE SET, NOT ITS SIZE, AND KEYED ON THE ENCODING.
+         *
+         * CST_REGMAP_DUMP answers a question about the MAP, so it writes one
+         * row per distinct (direction, name) for the whole run and keeps the
+         * encoding only as a witness -- deliberately, and it says so.  That
+         * leaves no corpus in which the register set QEMU stated for a given
+         * encoding can be compared with anything: the statement corpus
+         * carries the two SIZES, and a size cannot say WHICH register left.
+         *
+         * This corpus is that join.  One row per distinct
+         * (isa, encoding, direction, set), so the same bytes decoding to two
+         * different sets keep BOTH rows, and a set that changes between two
+         * builds is a named difference rather than a count that moved.
+         */
+        corpus_set = new Corpus(
+            "CST_DF_SET_DUMP",
+            "#isa\tencoding\tdir\tn\tdigest\tnames\n");
     }
 }
 
@@ -501,6 +520,127 @@ void score_reg_set(const char *isa, const char *enc, char dir,
             score_reg_name(isa, enc, dir, name, n_named, n_mapped);
         }
     }
+}
+
+/*
+ * A LABEL FOR EVERY MEMBER OF A SET, INCLUDING THE ONES THAT HAVE NO NAME.
+ *
+ * score_reg_set() walks the same bits and skips an atom and an undeclared env
+ * range, because the question it asks is about the register MAP and neither is
+ * a row the map owes.  A SET is a different question: a member with no name is
+ * still a member, and a set printed without it would compare equal to a set
+ * that genuinely lacks it.  So an atom prints as its index and an undeclared
+ * range prints as its offset and extent -- neither is a register name, and
+ * neither is silence.
+ */
+void prov_bit_label(unsigned bit, char *buf, size_t sz)
+{
+    uint32_t atom = 0, off = 0, size = 0;
+    bool is_atom = false;
+    const char *name = prov_bit_name(bit, &is_atom);
+
+    if (name) {
+        snprintf(buf, sz, "%s", name);
+    } else if (is_atom && qemu_plugin_dataflow_prov_atom(bit, &atom)) {
+        snprintf(buf, sz, "@atom%u", (unsigned)atom);
+    } else if (qemu_plugin_dataflow_prov_field(bit, &off, &size)) {
+        snprintf(buf, sz, "@env+%u:%u", (unsigned)off, (unsigned)size);
+    } else {
+        snprintf(buf, sz, "@bit%u", bit);
+    }
+}
+
+/* Members past this are digested but not spelled; the row says how many. */
+#define SET_NAMES_MAX 64
+
+int label_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/*
+ * Rows already written, keyed on "isa enc dir digest".
+ *
+ * The same encoding decodes millions of times to the same set; one row per
+ * DISTINCT set is the whole content and the repetitions are noise.  Keyed on
+ * the digest rather than on the encoding alone precisely so that an encoding
+ * whose set DIFFERS between two occurrences keeps both rows.
+ */
+GHashTable *seen_sets;
+
+void emit_reg_set(const char *isa, const char *enc, char dir,
+                  const uint64_t *set, unsigned nwords)
+{
+    FILE *o = corpus_set->get();
+
+    if (!o) {
+        return;
+    }
+
+    char labels[SET_NAMES_MAX][40];
+    unsigned n = 0, total = 0;
+    uint64_t digest = 1469598103934665603ULL;   /* FNV-1a 64 */
+
+    for (unsigned w = 0; w < nwords; w++) {
+        uint64_t word = set[w];
+
+        while (word) {
+            unsigned b = (unsigned)__builtin_ctzll(word);
+
+            word &= word - 1;
+            total++;
+            if (n < SET_NAMES_MAX) {
+                prov_bit_label(w * 64 + b, labels[n], sizeof(labels[n]));
+                n++;
+            }
+        }
+    }
+    qsort(labels, n, sizeof(labels[0]), label_cmp);
+
+    /*
+     * The digest covers the SPELLED labels and the total.  Two sets that
+     * agree on the first SET_NAMES_MAX members and differ beyond them share a
+     * digest only if they also agree on size, which is stated in the row, so
+     * an overflowed row is comparable on what it carries and says how much it
+     * does not carry.
+     */
+    for (unsigned i = 0; i < n; i++) {
+        for (const char *p = labels[i]; *p; p++) {
+            digest = (digest ^ (unsigned char)*p) * 1099511628211ULL;
+        }
+        digest = (digest ^ ',') * 1099511628211ULL;
+    }
+    digest = (digest ^ total) * 1099511628211ULL;
+
+    char key[192];
+
+    snprintf(key, sizeof(key), "%s %s %c %016llx", isa, enc, dir,
+             (unsigned long long)digest);
+    if (seen_sets == nullptr) {
+        seen_sets = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                          g_free, nullptr);
+    }
+    if (g_hash_table_contains(seen_sets, key)) {
+        return;
+    }
+    g_hash_table_add(seen_sets, g_strdup(key));
+
+    char names[SET_NAMES_MAX * 41];
+    size_t k = 0;
+
+    names[0] = '\0';
+    for (unsigned i = 0; i < n; i++) {
+        int w = snprintf(names + k, sizeof(names) - k, "%s%s",
+                         k ? "," : "", labels[i]);
+
+        if (w < 0 || (size_t)w >= sizeof(names) - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+    fprintf(o, "%s\t%s\t%c\t%u\t%016llx\t%s%s\n", isa, enc, dir, total,
+            (unsigned long long)digest, k ? names : "-",
+            total > n ? ",+MORE" : "");
 }
 
 } /* namespace */
@@ -953,6 +1093,8 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         snprintf(sets, sizeof(sets), "%u\t%u", n_rd, n_wr);
         score_reg_set(isa_name(), enc, 'r', rd, 8, &n_named, &n_map);
         score_reg_set(isa_name(), enc, 'w', wr, 8, &n_named, &n_map);
+        emit_reg_set(isa_name(), enc, 'r', rd, 8);
+        emit_reg_set(isa_name(), enc, 'w', wr, 8);
         snprintf(regs, sizeof(regs), "%u/%u", n_named, n_map);
     } else {
         snprintf(sets, sizeof(sets), "-\t-");

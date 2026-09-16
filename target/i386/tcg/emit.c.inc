@@ -814,11 +814,36 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 UNARY_INT_GVEC(PABSB,          tcg_gen_gvec_abs, MO_8)
 UNARY_INT_GVEC(PABSW,          tcg_gen_gvec_abs, MO_16)
 UNARY_INT_GVEC(PABSD,          tcg_gen_gvec_abs, MO_32)
-UNARY_INT_GVEC(VBROADCASTx128, tcg_gen_gvec_dup_mem, MO_128)
-UNARY_INT_GVEC(VPBROADCASTB,   tcg_gen_gvec_dup_mem, MO_8)
-UNARY_INT_GVEC(VPBROADCASTW,   tcg_gen_gvec_dup_mem, MO_16)
-UNARY_INT_GVEC(VPBROADCASTD,   tcg_gen_gvec_dup_mem, MO_32)
-UNARY_INT_GVEC(VPBROADCASTQ,   tcg_gen_gvec_dup_mem, MO_64)
+
+/*
+ * A BROADCAST reads ONE element and writes every lane, and the expander it
+ * shares with the elementwise operations above cannot tell the reader which
+ * of the two it did: tcg_gen_gvec_dup_mem states the element size and the
+ * operand size, and both a packed absolute value and a broadcast state the
+ * same pair.
+ *
+ * The lane it reads is element 0 of the source when the source is a register
+ * -- decode->op[2].offset is the register's base, which is that element --
+ * and nothing when the source is memory, which has no lanes.  The kind is the
+ * fact either way, so it is stated either way and the lane follows the form.
+ */
+#define UNARY_BCAST_GVEC(uname, func, vece_)                                        \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    int vec_len = vector_len(s, decode);                                          \
+                                                                                   \
+    insn_dataflow_note_vec_shape(vece_, vec_len);                                  \
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST,                        \
+                                decode->op[2].has_ea                               \
+                                ? INSN_DF_VEC_LANE_NONE : 0);                      \
+    func(vece_, decode->op[0].offset,                                              \
+         decode->op[2].offset, vec_len, vec_len);                                  \
+}
+UNARY_BCAST_GVEC(VBROADCASTx128, tcg_gen_gvec_dup_mem, MO_128)
+UNARY_BCAST_GVEC(VPBROADCASTB,   tcg_gen_gvec_dup_mem, MO_8)
+UNARY_BCAST_GVEC(VPBROADCASTW,   tcg_gen_gvec_dup_mem, MO_16)
+UNARY_BCAST_GVEC(VPBROADCASTD,   tcg_gen_gvec_dup_mem, MO_32)
+UNARY_BCAST_GVEC(VPBROADCASTQ,   tcg_gen_gvec_dup_mem, MO_64)
 
 
 #define BINARY_INT_GVEC(uname, func, ...)                                          \
@@ -2535,6 +2560,14 @@ static void gen_MOVD_from(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[2].ot;
 
+    /*
+     * The low element of the vector source and nothing else; op[2].offset is
+     * the register's base, which is element 0.  The counterpart MOVD_to makes
+     * no lane statement on purpose -- it zeroes the lanes it does not fill,
+     * so its write covers the whole register and is not an insert.
+     */
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, 0);
+
     switch (ot) {
     case MO_32:
 #ifdef TARGET_X86_64
@@ -2865,6 +2898,19 @@ static inline void gen_pextr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
 
+    /*
+     * ONE LANE IS READ, AND THE ENCODING SAYS WHICH.
+     *
+     * What comes out below is a load from a constant byte offset into env,
+     * which is the lane and the register multiplied together: a reader of the
+     * ops cannot factor it back into "element @val of this register" and so
+     * cannot tell this from a read of the whole thing.  The decode site holds
+     * both halves -- @ot from the opcode and @val from the imm8, already
+     * reduced modulo the lane count -- so it states them.
+     */
+    insn_dataflow_note_vec_shape(ot, vec_len);
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, val);
+
     switch (ot) {
     case MO_8:
         tcg_gen_ld8u_tl(s->T0, tcg_env, vector_elem_offset(&decode->op[1], ot, val));
@@ -2906,6 +2952,18 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int vec_len = vector_len(s, decode);
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
+
+    /*
+     * ONE LANE IS WRITTEN, AND THE ENCODING SAYS WHICH.
+     *
+     * Stated before the copy below rather than after it.  The copy is a gvec
+     * move that states a shape of its own -- 64-bit elements over the whole
+     * register, which is how the lanes this instruction does not touch get
+     * across, and not what the instruction's own element size is.  Speaking
+     * first makes the encoding's vece the one that is kept.
+     */
+    insn_dataflow_note_vec_shape(ot, vec_len);
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, val);
 
     if (decode->op[1].offset != decode->op[0].offset) {
         assert(vec_len == 16);
@@ -4352,6 +4410,11 @@ static void gen_VEXTRACTx128(DisasContext *s, X86DecodedInsn *decode)
 {
     int mask = decode->immediate & 1;
     int src_ofs = vector_elem_offset(&decode->op[1], MO_128, mask);
+
+    /* One of the source's two 128-bit lanes, named by the imm8's low bit. */
+    insn_dataflow_note_vec_shape(MO_128, 32);
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, mask);
+
     if (decode->op[0].has_ea) {
         /* VEX-only instruction, no alignment requirements.  */
         gen_sto_env_A0(s, src_ofs, false);
@@ -4373,6 +4436,19 @@ static void gen_vinsertps(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = 16;
 
     assert(!s->vex_l);
+
+    /*
+     * REFUSED, and counted.
+     *
+     * INSERTPS names up to three lanes in three roles from one imm8: a source
+     * element to read, a destination element to write, and a zero mask that
+     * writes as many more.  A single kind and a single lane cannot say that,
+     * and choosing one of the three would publish a lane the instruction
+     * touches alongside lanes it also touches and did not mention.  The shape
+     * is stated -- the element size and operand size are not in doubt.
+     */
+    insn_dataflow_note_vec_shape(MO_32, vec_len);
+    insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_COMPOSITE);
 
     if (new_mask == 15) {
         /* All zeroes except possibly for the inserted element */
@@ -4415,6 +4491,11 @@ static void gen_VINSERTPS_m(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VINSERTx128(DisasContext *s, X86DecodedInsn *decode)
 {
     int mask = decode->immediate & 1;
+
+    /* One of the destination's two 128-bit lanes; the other is copied over. */
+    insn_dataflow_note_vec_shape(MO_128, 32);
+    insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, mask);
+
     tcg_gen_gvec_mov(MO_64,
                      decode->op[0].offset + offsetof(YMMReg, YMM_X(mask)),
                      decode->op[2].offset + offsetof(YMMReg, YMM_X(0)), 16, 16);

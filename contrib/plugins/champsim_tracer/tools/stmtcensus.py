@@ -29,8 +29,9 @@ import argparse
 import os
 import sys
 
-COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz', 'memops',
-           'fieldregs', 'zero', 'pcread', 'nrd', 'nwr')
+COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz',
+           'vkind', 'vlane', 'memops', 'fieldregs', 'zero', 'pcread', 'ea',
+           'nrd', 'nwr')
 
 
 def load(paths):
@@ -96,6 +97,14 @@ def census(rows):
         'imm_operand': 0,
         'imm_disp': 0,
         'vece': 0,
+        'lane_uniform': 0,
+        'lane_insert': 0,
+        'lane_extract': 0,
+        'lane_bcast': 0,
+        'lane_selected': 0,
+        'lane_refused': 0,
+        'synth_ea': 0,
+        'synth_ea_refused': 0,
         'memops': 0,
         'fieldreg_named': 0,
         'fieldreg_unnamed': 0,
@@ -120,6 +129,22 @@ def census(rows):
                 c['imm_disp'] += 1
         if row['vece'] != '-':
             c['vece'] += 1
+        # The KIND and the SELECTED LANE are counted apart, and a refusal apart
+        # from both: a kind with no lane (a packed operation) and a lane the
+        # decode site would not state are different claims, and one column
+        # could not tell them apart.
+        kind_col = {'uniform': 'lane_uniform', 'insert': 'lane_insert',
+                    'extract': 'lane_extract', 'bcast': 'lane_bcast'}
+        if row['vkind'] in kind_col:
+            c[kind_col[row['vkind']]] += 1
+        if row['vlane'].startswith('refused:'):
+            c['lane_refused'] += 1
+        elif row['vlane'] != '-':
+            c['lane_selected'] += 1
+        if row['ea'] == 'refused':
+            c['synth_ea_refused'] += 1
+        elif row['ea'] != '-':
+            c['synth_ea'] += 1
         if row['memops'] != '0':
             c['memops'] += 1
         if row['fieldregs'] != '-':
@@ -159,6 +184,14 @@ def report(tag, c, named, stamp, nfiles, show_names):
     print('     operand role       %d' % c['imm_operand'])
     print('     displacement role  %d' % c['imm_disp'])
     print('   lane shape stated    %d' % c['vece'])
+    print('   lane kind UNIFORM    %d' % c['lane_uniform'])
+    print('   lane kind INSERT     %d' % c['lane_insert'])
+    print('   lane kind EXTRACT    %d' % c['lane_extract'])
+    print('   lane kind BROADCAST  %d' % c['lane_bcast'])
+    print('   lane SELECTED        %d' % c['lane_selected'])
+    print('   lane REFUSED         %d' % c['lane_refused'])
+    print('   synthetic EA rows    %d' % c['synth_ea'])
+    print('   synthetic EA refused %d' % c['synth_ea_refused'])
     print('   memop rows           %d' % c['memops'])
     print('   env range NAMED      %d' % c['fieldreg_named'])
     print('   env range unnamed    %d' % c['fieldreg_unnamed'])

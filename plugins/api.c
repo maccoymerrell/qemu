@@ -342,6 +342,22 @@ bool qemu_plugin_dataflow_abi_ok(uint32_t plugin_version,
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_COMPUTED != INSN_DF_X_COMPUTED);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_MULTI != INSN_DF_X_MULTI);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VECE_NONE != INSN_DF_VECE_NONE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_KIND_NONE !=
+                      INSN_DF_VEC_KIND_NONE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_KIND_UNIFORM !=
+                      INSN_DF_VEC_KIND_UNIFORM);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_KIND_INSERT !=
+                      INSN_DF_VEC_KIND_INSERT);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_KIND_EXTRACT !=
+                      INSN_DF_VEC_KIND_EXTRACT);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_KIND_BROADCAST !=
+                      INSN_DF_VEC_KIND_BROADCAST);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_LANE_NONE !=
+                      INSN_DF_VEC_LANE_NONE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_REFUSE_DYNAMIC !=
+                      INSN_DF_VEC_REFUSE_DYNAMIC);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_REFUSE_COMPOSITE !=
+                      INSN_DF_VEC_REFUSE_COMPOSITE);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_OPERAND != INSN_DF_IMM_OPERAND);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_DISP != INSN_DF_IMM_DISP);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_MAX_EA_PARTS != INSN_DF_MAX_EA_PARTS);
@@ -632,6 +648,10 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_env_ptr_unbounded = d->n_env_ptr_unbounded;
     st.n_synth_ea = d->n_synth_ea;
     st.n_synth_ea_refused = d->n_synth_ea_refused;
+    st.vec_kind = d->vec_kind;
+    st.vec_lane = d->vec_lane;
+    st.vec_lane_refuse = d->vec_lane_refuse;
+    st.n_vec_lane_refused = d->n_vec_lane_refused;
     /*
      * Interning is per translation block, so a range that could not be
      * interned anywhere in the block makes a value in THIS instruction look

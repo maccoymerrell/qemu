@@ -3389,6 +3389,8 @@ static bool trans_vmv_x_s(DisasContext *s, arg_vmv_x_s *a)
          * load vreg and sign-extend to 64 bits,
          * then truncate to XLEN bits before storing to gpr.
          */
+        /* vd[0] and nothing else; the element index is in the mnemonic. */
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, 0);
         vec_element_loadi(s, t1, a->rs2, 0, true);
         tcg_gen_trunc_i64_tl(dest, t1);
         gen_set_gpr(s, a->rd, dest);
@@ -3408,6 +3410,9 @@ static bool trans_vmv_s_x(DisasContext *s, arg_vmv_s_x *a)
         TCGv_i64 t1;
         TCGv s1;
         TCGLabel *over = gen_new_label();
+
+        /* Element 0 of the destination; the rest keep what they held. */
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, 0);
 
         tcg_gen_brcond_tl(TCG_COND_GEU, cpu_vstart, cpu_vl, over);
 
@@ -3440,6 +3445,7 @@ static bool trans_vfmv_f_s(DisasContext *s, arg_vfmv_f_s *a)
         unsigned int len = 64 - ofs;
         TCGv_i64 t_nan;
 
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, 0);
         vec_element_loadi(s, cpu_fpr[a->rd], a->rs2, 0, false);
         /* NaN-box f[rd] as necessary for SEW */
         if (len) {
@@ -3468,6 +3474,8 @@ static bool trans_vfmv_s_f(DisasContext *s, arg_vfmv_s_f *a)
         TCGv_i64 t1;
         TCGLabel *over = gen_new_label();
 
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, 0);
+
         /* if vstart >= vl, skip vector register write back */
         tcg_gen_brcond_tl(TCG_COND_GEU, cpu_vstart, cpu_vl, over);
 
@@ -3488,9 +3496,20 @@ static bool trans_vfmv_s_f(DisasContext *s, arg_vfmv_s_f *a)
 /* Vector Slide Instructions */
 static bool slideup_check(DisasContext *s, arg_rmrr *a)
 {
-    return require_rvv(s) &&
-           vext_check_isa_ill(s) &&
-           vext_check_slide(s, a->rd, a->rs2, a->vm, true);
+    bool ok = require_rvv(s) &&
+              vext_check_isa_ill(s) &&
+              vext_check_slide(s, a->rd, a->rs2, a->vm, true);
+
+    if (ok) {
+        /*
+         * REFUSED, and counted.  A slide's offset IS a field of the encoding
+         * in the .vi form, but it is not a lane selector: every lane of the
+         * destination takes a different element of the source, so naming one
+         * would say the others were untouched.
+         */
+        insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_COMPOSITE);
+    }
+    return ok;
 }
 
 GEN_OPIVX_TRANS(vslideup_vx, slideup_check)
@@ -3498,9 +3517,14 @@ GEN_OPIVI_TRANS(vslideup_vi, IMM_ZX, vslideup_vx, slideup_check)
 
 static bool slidedown_check(DisasContext *s, arg_rmrr *a)
 {
-    return require_rvv(s) &&
-           vext_check_isa_ill(s) &&
-           vext_check_slide(s, a->rd, a->rs2, a->vm, false);
+    bool ok = require_rvv(s) &&
+              vext_check_isa_ill(s) &&
+              vext_check_slide(s, a->rd, a->rs2, a->vm, false);
+
+    if (ok) {
+        insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_COMPOSITE);
+    }
+    return ok;
 }
 
 GEN_OPIVX_TRANS(vslidedown_vx, slidedown_check)
@@ -3571,7 +3595,7 @@ GEN_OPFVF_TRANS(vfslide1up_vf, fslideup_check)
 GEN_OPFVF_TRANS(vfslide1down_vf, fslidedown_check)
 
 /* Vector Register Gather Instruction */
-static bool vrgather_vv_check(DisasContext *s, arg_rmrr *a)
+static bool vrgather_vv_check_raw(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
@@ -3581,6 +3605,21 @@ static bool vrgather_vv_check(DisasContext *s, arg_rmrr *a)
            require_align(a->rs2, s->lmul) &&
            (a->rd != a->rs2 && a->rd != a->rs1) &&
            require_vm(a->vm, a->rd);
+}
+
+static bool vrgather_vv_check_df(DisasContext *s, arg_rmrr *a)
+{
+    bool ok = vrgather_vv_check_raw(s, a);
+
+    if (ok) {
+        /*
+         * REFUSED, and counted.  Each destination lane takes the source
+         * element its OWN lane of vs1 names, so there is no selector in the
+         * encoding at all -- the indices are a vector register's contents.
+         */
+        insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
+    }
+    return ok;
 }
 
 static bool vrgatherei16_vv_check(DisasContext *s, arg_rmrr *a)
@@ -3601,8 +3640,18 @@ static bool vrgatherei16_vv_check(DisasContext *s, arg_rmrr *a)
            require_vm(a->vm, a->rd);
 }
 
-GEN_OPIVV_TRANS(vrgather_vv, vrgather_vv_check)
-GEN_OPIVV_TRANS(vrgatherei16_vv, vrgatherei16_vv_check)
+static bool vrgatherei16_vv_check_df(DisasContext *s, arg_rmrr *a)
+{
+    bool ok = vrgatherei16_vv_check(s, a);
+
+    if (ok) {
+        insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
+    }
+    return ok;
+}
+
+GEN_OPIVV_TRANS(vrgather_vv, vrgather_vv_check_df)
+GEN_OPIVV_TRANS(vrgatherei16_vv, vrgatherei16_vv_check_df)
 
 static bool vrgather_vx_check(DisasContext *s, arg_rmrr *a)
 {
@@ -3620,6 +3669,18 @@ static bool trans_vrgather_vx(DisasContext *s, arg_rmrr *a)
 {
     if (!vrgather_vx_check(s, a)) {
         return false;
+    }
+
+    /*
+     * Every lane takes ONE source element, and which one is x[rs1] -- a
+     * register value, read at execution.  The exception is rs1 == 0, which
+     * is the architectural zero register: that index is 0 and the encoding
+     * says so, so it is stated rather than refused.
+     */
+    if (a->rs1 == 0) {
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST, 0);
+    } else {
+        insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
     }
 
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
@@ -3651,6 +3712,16 @@ static bool trans_vrgather_vi(DisasContext *s, arg_rmrr *a)
     if (!vrgather_vx_check(s, a)) {
         return false;
     }
+
+    /*
+     * Every lane takes source element @rs1, which here is the uimm5 field of
+     * the encoding and not a register.  An index past the end of the vector
+     * reads as zero, which is a value from no lane.
+     */
+    insn_dataflow_note_vec_lane(
+        INSN_DF_VEC_KIND_BROADCAST,
+        a->rs1 >= vext_get_vlmax(s->cfg_ptr->vlenb, s->sew, s->lmul)
+        ? INSN_DF_VEC_LANE_NONE : a->rs1);
 
     if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
         int vlmax = vext_get_vlmax(s->cfg_ptr->vlenb, s->sew, s->lmul);

@@ -543,7 +543,19 @@ TRANS_DF_iii_b(DPSUB_S, trans_msa_3r,   gen_helper_msa_dpsub_s);
 TRANS_DF_iii_b(DPSUB_U, trans_msa_3r,   gen_helper_msa_dpsub_u);
 
 TRANS(SLD,              trans_msa_3rf,  gen_helper_msa_sld_df);
-TRANS(SPLAT,            trans_msa_3rf,  gen_helper_msa_splat_df);
+/*
+ * SPLAT takes the element index from a GENERAL REGISTER, not the encoding,
+ * so the lane is a value read at execution and the site refuses rather than
+ * guessing one.  Its immediate sibling SPLATI is stated above.
+ */
+static bool trans_SPLAT(DisasContext *ctx, arg_msa_r *a)
+{
+    if (!check_msa_enabled(ctx)) {
+        return true;
+    }
+    insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
+    return trans_msa_3rf(ctx, a, gen_helper_msa_splat_df);
+}
 TRANS_DF_iii(PCKEV,     trans_msa_3r,   gen_helper_msa_pckev);
 TRANS_DF_iii(PCKOD,     trans_msa_3r,   gen_helper_msa_pckod);
 TRANS_DF_iii(ILVL,      trans_msa_3r,   gen_helper_msa_ilvl);
@@ -604,8 +616,31 @@ static bool trans_CFCMSA(DisasContext *ctx, arg_msa_elm *a)
     return true;
 }
 
+/*
+ * THE LANE KIND AND THE LANE, for the element-addressed forms.
+ *
+ * @n is the element index, and it is a field of the encoding whose width the
+ * df field decides -- which is what makes it statable at all.  Everything
+ * below is a helper call taking register NUMBERS and that index as a
+ * constant, so a reader of the ops sees three integers and cannot tell an
+ * insert from a splat from a slide.  The kind is the decode rule's own
+ * static payload, so the rule says which it is.
+ *
+ * @kind is INSN_DF_VEC_KIND_NONE where the form names no single lane; the
+ * caller then passes a refusal reason in @refuse instead.
+ */
+static void note_msa_lane(unsigned kind, int n, unsigned refuse)
+{
+    if (kind == INSN_DF_VEC_KIND_NONE) {
+        insn_dataflow_refuse_vec_lane(refuse);
+    } else {
+        insn_dataflow_note_vec_lane(kind, n);
+    }
+}
+
 static bool trans_msa_elm(DisasContext *ctx, arg_msa_elm_df *a,
-                          gen_helper_piiii *gen_msa_elm_df)
+                          gen_helper_piiii *gen_msa_elm_df,
+                          unsigned lane_kind, unsigned lane_refuse)
 {
     if (a->df < 0) {
         return false;
@@ -615,6 +650,7 @@ static bool trans_msa_elm(DisasContext *ctx, arg_msa_elm_df *a,
         return true;
     }
     note_msa_shape(a->df);
+    note_msa_lane(lane_kind, a->n, lane_refuse);
 
     gen_msa_elm_df(tcg_env,
                    tcg_constant_i32(a->df),
@@ -625,12 +661,21 @@ static bool trans_msa_elm(DisasContext *ctx, arg_msa_elm_df *a,
     return true;
 }
 
-TRANS(SLDI,   trans_msa_elm, gen_helper_msa_sldi_df);
-TRANS(SPLATI, trans_msa_elm, gen_helper_msa_splati_df);
-TRANS(INSVE,  trans_msa_elm, gen_helper_msa_insve_df);
+/*
+ * SLDI slides the whole vector by @n bytes, so every lane is written from a
+ * different source element and naming one would say the rest were untouched.
+ * SPLATI puts element @n in every lane.  INSVE writes element @n alone.
+ */
+TRANS(SLDI,   trans_msa_elm, gen_helper_msa_sldi_df,
+      INSN_DF_VEC_KIND_NONE, INSN_DF_VEC_REFUSE_COMPOSITE);
+TRANS(SPLATI, trans_msa_elm, gen_helper_msa_splati_df,
+      INSN_DF_VEC_KIND_BROADCAST, 0);
+TRANS(INSVE,  trans_msa_elm, gen_helper_msa_insve_df,
+      INSN_DF_VEC_KIND_INSERT, 0);
 
 static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
-                             gen_helper_piii * const gen_msa_elm[4])
+                             gen_helper_piii * const gen_msa_elm[4],
+                             unsigned lane_kind)
 {
     if (a->df < 0 || !gen_msa_elm[a->df]) {
         return false;
@@ -640,6 +685,7 @@ static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
         return true;
     }
     note_msa_shape(a->df);
+    note_msa_lane(lane_kind, a->n, 0);
 
     gen_msa_elm[a->df](tcg_env,
                        tcg_constant_i32(a->wd),
@@ -667,7 +713,9 @@ static bool trans_COPY_U(DisasContext *ctx, arg_msa_elm_df *a)
         NULL_IF_MIPS32(gen_helper_msa_copy_u_w), NULL
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_copy_u);
+    /* COPY reads element @n of ws and nothing else. */
+    return trans_msa_elm_fn(ctx, a, gen_msa_copy_u,
+                            INSN_DF_VEC_KIND_EXTRACT);
 }
 
 static bool trans_COPY_S(DisasContext *ctx, arg_msa_elm_df *a)
@@ -682,7 +730,8 @@ static bool trans_COPY_S(DisasContext *ctx, arg_msa_elm_df *a)
         gen_helper_msa_copy_s_w, NULL_IF_MIPS32(gen_helper_msa_copy_s_d)
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_copy_s);
+    return trans_msa_elm_fn(ctx, a, gen_msa_copy_s,
+                            INSN_DF_VEC_KIND_EXTRACT);
 }
 
 static bool trans_INSERT(DisasContext *ctx, arg_msa_elm_df *a)
@@ -692,7 +741,9 @@ static bool trans_INSERT(DisasContext *ctx, arg_msa_elm_df *a)
         gen_helper_msa_insert_w, NULL_IF_MIPS32(gen_helper_msa_insert_d)
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_insert);
+    /* INSERT writes element @n of wd and leaves the other lanes alone. */
+    return trans_msa_elm_fn(ctx, a, gen_msa_insert,
+                            INSN_DF_VEC_KIND_INSERT);
 }
 
 TRANS(FCAF,     trans_msa_3rf, gen_helper_msa_fcaf_df);

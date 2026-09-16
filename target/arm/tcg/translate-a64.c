@@ -5530,6 +5530,14 @@ static bool trans_DUP_element_s(DisasContext *s, arg_DUP_element_s *a)
          * zero-extends it into the bottom of the destination register.
          */
         TCGv_i64 tmp = tcg_temp_new_i64();
+        /*
+         * One element of the source, named by imm5, which decode_esz_idx()
+         * has just split into the element size and the index.  What the ops
+         * carry afterwards is a constant byte offset that folds the two
+         * together and cannot be taken apart again.
+         */
+        insn_dataflow_note_vec_shape(esz, 16);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, idx);
         read_vec_element(s, tmp, a->rn, idx, esz);
         write_fp_dreg(s, a->rd, tmp);
     }
@@ -5548,6 +5556,9 @@ static bool trans_DUP_element_v(DisasContext *s, arg_DUP_element_v *a)
         return false;
     }
     if (fp_access_check(s)) {
+        /* Every lane takes source element @idx; imm5 names it. */
+        insn_dataflow_note_vec_shape(esz, a->q ? 16 : 8);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST, idx);
         tcg_gen_gvec_dup_mem(esz, vec_full_reg_offset(s, a->rd),
                              vec_reg_offset(s, a->rn, idx, esz),
                              a->q ? 16 : 8, vec_full_reg_size(s));
@@ -5567,6 +5578,13 @@ static bool trans_DUP_general(DisasContext *s, arg_DUP_general *a)
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * Every lane takes one value, and it comes from a general register,
+         * which has no lanes -- so the kind is stated and the lane is not.
+         */
+        insn_dataflow_note_vec_shape(esz, a->q ? 16 : 8);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST,
+                                    INSN_DF_VEC_LANE_NONE);
         tcg_gen_gvec_dup_i64(esz, vec_full_reg_offset(s, a->rd),
                              a->q ? 16 : 8, vec_full_reg_size(s),
                              cpu_reg(s, a->rn));
@@ -5593,6 +5611,9 @@ static bool do_smov_umov(DisasContext *s, arg_SMOV *a, MemOp is_signed)
     }
     if (fp_access_check(s)) {
         TCGv_i64 tcg_rd = cpu_reg(s, a->rd);
+        /* SMOV and UMOV read one element, named by imm5. */
+        insn_dataflow_note_vec_shape(esz, 16);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_EXTRACT, idx);
         read_vec_element(s, tcg_rd, a->rn, idx, esz | is_signed);
         if (is_signed && !a->q) {
             tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
@@ -5613,6 +5634,13 @@ static bool trans_INS_general(DisasContext *s, arg_INS_general *a)
         return false;
     }
     if (fp_access_check(s)) {
+        /*
+         * One element of the destination, named by imm5; the other lanes of
+         * the 128-bit register keep what they held.  (clear_vec_high zeroes
+         * the SVE bytes ABOVE the V register, not its remaining lanes.)
+         */
+        insn_dataflow_note_vec_shape(esz, 16);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, idx);
         write_vec_element(s, cpu_reg(s, a->rn), a->rd, idx, esz);
         clear_vec_high(s, true, a->rd);
     }
@@ -5631,6 +5659,13 @@ static bool trans_INS_element(DisasContext *s, arg_INS_element *a)
     if (fp_access_check(s)) {
         TCGv_i64 tmp = tcg_temp_new_i64();
 
+        /*
+         * The WRITE is the role the kind names, so the destination index is
+         * the lane; the source index stays unnarrowed, which leaves the whole
+         * of rn an input and is the coarse direction, not the missing one.
+         */
+        insn_dataflow_note_vec_shape(esz, 16);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_INSERT, didx);
         read_vec_element(s, tmp, a->rn, sidx, esz);
         write_vec_element(s, tmp, a->rd, didx, esz);
 

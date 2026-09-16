@@ -225,8 +225,8 @@ void corpora_init()
             "#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n");
         corpus_stmt = new Corpus(
             "CST_DF_STMT_DUMP",
-            "#isa\tencoding\tatomic\timm\tvece\toprsz\tmemops\tfieldregs"
-            "\tzero\tpcread\tnrd\tnwr\n");
+            "#isa\tencoding\tatomic\timm\tvece\toprsz\tvkind\tvlane"
+            "\tmemops\tfieldregs\tzero\tpcread\tea\tnrd\tnwr\n");
     }
 }
 
@@ -643,6 +643,34 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
     }
 
     /*
+     * THE LANE KIND AND THE LANE IT SELECTS, in two columns and not one.
+     *
+     * A kind with no lane (a packed operation) and a lane the site refused to
+     * state are different answers, and folding them into one column would
+     * make the refusal read as an instruction that selects nothing -- the
+     * shape this corpus exists to keep apart.  The lane column carries
+     * `refused:<why>` when the decode site said so, so a masked arm moves the
+     * refusal count and the kind column independently.
+     */
+    static const char *const kind_name[] = {
+        "-", "uniform", "insert", "extract", "bcast",
+    };
+    const char *vkind =
+        st.vec_kind < (sizeof(kind_name) / sizeof(kind_name[0]))
+        ? kind_name[st.vec_kind] : "?";
+    char vlane[24];
+
+    if (st.vec_lane_refuse == QEMU_PLUGIN_DF_VEC_REFUSE_DYNAMIC) {
+        snprintf(vlane, sizeof(vlane), "refused:dynamic");
+    } else if (st.vec_lane_refuse == QEMU_PLUGIN_DF_VEC_REFUSE_COMPOSITE) {
+        snprintf(vlane, sizeof(vlane), "refused:composite");
+    } else if (st.vec_lane == QEMU_PLUGIN_DF_VEC_LANE_NONE) {
+        snprintf(vlane, sizeof(vlane), "-");
+    } else {
+        snprintf(vlane, sizeof(vlane), "%d", st.vec_lane);
+    }
+
+    /*
      * The architectural zero register, in whichever direction it was stated.
      *
      * It is an ATOM and not a register: it has no storage, so it appears in
@@ -694,10 +722,10 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
      * reads "-" rather than 0: a refusal and an instruction that touches no
      * register are different claims.
      */
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t%s\t%s\t",
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t",
             isa_name(),
             enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
-            k ? imm : "-", vece, st.vec_oprsz, st.n_memops,
+            k ? imm : "-", vece, st.vec_oprsz, vkind, vlane, st.n_memops,
             fk ? fields : "-", zero[0] ? zero : "-",
             pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
             ek ? ea : "-");

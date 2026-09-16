@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 3
+#define QEMU_PLUGIN_DATAFLOW_VERSION 4
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -361,6 +361,35 @@ bool qemu_plugin_insn_immediate(const struct qemu_plugin_tb *tb, size_t idx,
 /* No vector expander ran; different from an element size of one byte. */
 #define QEMU_PLUGIN_DF_VECE_NONE    0xff
 
+/*
+ * How a vector operation distributes across lanes, and which lane it names.
+ *
+ *   UNIFORM    lane i of the result is a function of lane i of the sources.
+ *              A gvec expansion is this by construction.
+ *   INSERT     the write touches only the named lane; the rest of the
+ *              destination keeps what it held.
+ *   EXTRACT    the read touches only the named lane.
+ *   BROADCAST  every lane of the write takes one value; the named lane is
+ *              where it was read from, or _VEC_LANE_NONE when the source is
+ *              a general register or memory and so has no lanes.
+ */
+#define QEMU_PLUGIN_DF_VEC_KIND_NONE       0
+#define QEMU_PLUGIN_DF_VEC_KIND_UNIFORM    1
+#define QEMU_PLUGIN_DF_VEC_KIND_INSERT     2
+#define QEMU_PLUGIN_DF_VEC_KIND_EXTRACT    3
+#define QEMU_PLUGIN_DF_VEC_KIND_BROADCAST  4
+
+/* The kind selects no single lane. */
+#define QEMU_PLUGIN_DF_VEC_LANE_NONE       (-1)
+
+/*
+ * Why a lane the encoding names was not stated.  A refusal is counted rather
+ * than omitted: silence and "this instruction selects no lane" would
+ * otherwise read the same.
+ */
+#define QEMU_PLUGIN_DF_VEC_REFUSE_DYNAMIC    1  /* selector is a register */
+#define QEMU_PLUGIN_DF_VEC_REFUSE_COMPOSITE  2  /* more than one lane/role */
+
 typedef struct qemu_plugin_dataflow_status {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */
     uint32_t version;           /* QEMU sets to QEMU_PLUGIN_DATAFLOW_VERSION */
@@ -392,6 +421,18 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t n_env_ptr_unbounded; /* env pointers recorded as all of env */
     uint32_t n_synth_ea;          /* rows available from _synthetic_eas() */
     uint32_t n_synth_ea_refused;  /* addresses that could not be recorded */
+    /*
+     * The lane kind and the lane it selects.
+     *
+     * Separate from vec_vece, which says how wide a lane is and nothing about
+     * which lanes the instruction touches.  A packed add and an element
+     * insert of the same width expand into ops that look alike here and do
+     * not depend alike, so the two facts are carried apart.
+     */
+    uint32_t vec_kind;            /* QEMU_PLUGIN_DF_VEC_KIND_* */
+    int32_t  vec_lane;            /* selected lane, or _VEC_LANE_NONE */
+    uint32_t vec_lane_refuse;     /* _VEC_REFUSE_*, first stated, 0 if none */
+    uint32_t n_vec_lane_refused;  /* lanes the decode site would not state */
 } qemu_plugin_dataflow_status;
 
 QEMU_PLUGIN_API

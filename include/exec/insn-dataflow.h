@@ -323,6 +323,64 @@ typedef struct InsnDataflowSynthEa {
  */
 #define INSN_DF_VECE_NONE  0xff
 
+/*
+ * How a vector operation distributes across the lanes the shape names, and
+ * which lane an element-addressed form selects.
+ *
+ * The element size says how wide a lane is; it does not say which lanes the
+ * instruction touches, and the two are different facts.  A packed add and an
+ * element insert of the same width expand into ops that look alike at this
+ * level -- a run of loads and stores over a byte range -- while their
+ * dependence is not alike at all: the add's lane i depends on lane i of each
+ * source, and the insert's write lands on one lane and leaves the rest of the
+ * register carrying what it already held.
+ *
+ *   UNIFORM    lane i of the result is a function of lane i of the sources.
+ *              This is what a gvec expansion is: the expanders take a vece
+ *              and apply one elementwise operation across oprsz bytes, so a
+ *              shape stated by an expander is a uniform shape and says so.
+ *   INSERT     the write touches only @lane; the other lanes of the
+ *              destination come from somewhere that is not this operation.
+ *   EXTRACT    the read touches only @lane.
+ *   BROADCAST  every lane of the write takes one value.  @lane names the lane
+ *              the value was read from when the source is a vector register,
+ *              and is INSN_DF_VEC_LANE_NONE when it is a general register or
+ *              a memory operand, which have no lanes.
+ *
+ * @lane is an index into the lanes of the register the operation names, and
+ * is INSN_DF_VEC_LANE_NONE where the kind selects no single lane.
+ *
+ * The kind names ONE role: the write for INSERT, the read for EXTRACT and
+ * BROADCAST.  The other side is left unnarrowed, which is the pessimistic
+ * direction -- aarch64 INS reading one lane of a second register says INSERT
+ * of the written lane, and a consumer that keeps the whole source register as
+ * an input has an edge that is real and coarse, not one that is missing.
+ */
+#define INSN_DF_VEC_KIND_NONE       0
+#define INSN_DF_VEC_KIND_UNIFORM    1
+#define INSN_DF_VEC_KIND_INSERT     2
+#define INSN_DF_VEC_KIND_EXTRACT    3
+#define INSN_DF_VEC_KIND_BROADCAST  4
+
+#define INSN_DF_VEC_LANE_NONE       (-1)
+
+/*
+ * Why a lane an encoding names was not stated.
+ *
+ * A selector that is not a field of the encoding cannot be answered at
+ * translation, and a lane guessed at translation is a lane the instruction
+ * may never touch, so the site refuses and says which kind of refusal it is.
+ * Silence would be indistinguishable from an instruction that names no lane.
+ *
+ *   DYNAMIC    the selector is a register value, read at execution.
+ *   COMPOSITE  more than one lane is touched in the role a kind would name,
+ *              so naming one of them would say the others were left alone.
+ *              x86 INSERTPS writes an element and then zeroes up to three
+ *              more out of the same imm8; SVE INSR shifts every lane along.
+ */
+#define INSN_DF_VEC_REFUSE_DYNAMIC    1
+#define INSN_DF_VEC_REFUSE_COMPOSITE  2
+
 typedef struct InsnDataflow {
     uint64_t rd[INSN_DF_REG_WORDS];
     uint64_t wr[INSN_DF_REG_WORDS];
@@ -372,6 +430,21 @@ typedef struct InsnDataflow {
 
     uint8_t  vec_vece;          /* log2 element size, or INSN_DF_VECE_NONE */
     uint32_t vec_oprsz;         /* bytes of one vector operand, 0 if unstated */
+
+    /*
+     * The lane kind and the lane it selects.
+     *
+     * @vec_kind_stated separates a kind a decode site said out loud from the
+     * UNIFORM an expander's shape implies, and it is what lets the explicit
+     * statement win however the two arrive: an element insert runs a gvec
+     * move to copy the untouched lanes across, so the expander's shape is
+     * stated first and the insert's own kind second.
+     */
+    uint8_t  vec_kind;          /* INSN_DF_VEC_KIND_* */
+    bool     vec_kind_stated;   /* a decode site named the kind */
+    int16_t  vec_lane;          /* selected lane, or INSN_DF_VEC_LANE_NONE */
+    uint8_t  vec_lane_refuse;   /* INSN_DF_VEC_REFUSE_*, first stated */
+    uint8_t  n_vec_lane_refused;
 
     InsnDataflowVecOp vecops[INSN_DF_MAX_VECOPS];
     uint8_t  n_vecops;
@@ -608,8 +681,47 @@ void insn_dataflow_refuse(void);
 /* A value this encoding carries, in the role it plays. */
 void insn_dataflow_note_immediate(uint64_t value, unsigned role);
 
-/* The element and operand size a vector expander was called with. */
+/*
+ * The element and operand size a vector expander was called with.
+ *
+ * Also the UNIFORM statement: the gvec expanders apply one operation
+ * elementwise across oprsz bytes at this vece, so an expansion that states a
+ * shape has said how the operation distributes across lanes as well as how
+ * wide they are.  A decode site that means something else says so with
+ * insn_dataflow_note_vec_lane(), whose statement wins in either order.
+ */
 void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz);
+
+/*
+ * The lane kind this encoding carries, and the lane it selects.
+ *
+ * Stated by the decode site, which is the one place that holds it: the
+ * selector is a field of the encoding -- x86's imm8 for PINSR/PEXTR,
+ * aarch64's imm5 for INS/UMOV/DUP, the MSA element index, a RISC-V
+ * vrgather.vi immediate -- and after expansion it is gone, folded into a
+ * constant byte offset that no longer says which of the two facts, the lane
+ * or the register, it came from.
+ *
+ * @lane is INSN_DF_VEC_LANE_NONE where the kind selects no single lane.  The
+ * first explicit statement wins, for the same reason the shape's does: a
+ * later pass over the same register is QEMU's lowering of the encoding, not a
+ * second thing the encoding said.
+ */
+void insn_dataflow_note_vec_lane(unsigned kind, int lane);
+
+/*
+ * A lane this encoding names and this layer will not state.
+ *
+ * Counted rather than omitted, so a consumer can tell an instruction that
+ * selects no lane from one whose selector could not be answered here.
+ *
+ * A refusal also clears the KIND and stops a later expansion from setting
+ * one.  Every site that refuses is a site UNIFORM is wrong about: INSERTPS,
+ * SVE INSR and MSA SLDI each run an expansion to fill the lanes they do not
+ * write themselves, so the shape's implicit UNIFORM would otherwise sit
+ * beside the refused lane and say lane i came from lane i.
+ */
+void insn_dataflow_refuse_vec_lane(unsigned reason);
 
 /*
  * One operand of a vector expansion: where it lives in CPUArchState, how many
@@ -744,6 +856,10 @@ static inline void insn_dataflow_refuse(void)
 static inline void insn_dataflow_note_immediate(uint64_t value, unsigned role)
 { }
 static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
+{ }
+static inline void insn_dataflow_note_vec_lane(unsigned kind, int lane)
+{ }
+static inline void insn_dataflow_refuse_vec_lane(unsigned reason)
 { }
 static inline void insn_dataflow_note_vec_operand(uint32_t envofs,
                                                   uint32_t bytes,

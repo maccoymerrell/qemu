@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "translate.h"
 #include "translate-a64.h"
+#include "exec/insn-dataflow.h"
 #include "fpu/softfloat.h"
 
 
@@ -2159,6 +2160,10 @@ static bool trans_DUP_s(DisasContext *s, arg_DUP_s *a)
     }
     if (sve_access_check(s)) {
         unsigned vsz = vec_full_reg_size(s);
+        /* Every lane takes one value, read from a register with no lanes. */
+        insn_dataflow_note_vec_shape(a->esz, vsz);
+        insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST,
+                                    INSN_DF_VEC_LANE_NONE);
         tcg_gen_gvec_dup_i64(a->esz, vec_full_reg_offset(s, a->rd),
                              vsz, vsz, cpu_reg_sp(s, a->rn));
     }
@@ -2181,10 +2186,20 @@ static bool trans_DUP_x(DisasContext *s, arg_DUP_x *a)
         esz = ctz32(a->imm);
         index = a->imm >> (esz + 1);
 
+        insn_dataflow_note_vec_shape(esz, vsz);
         if ((index << esz) < vsz) {
             unsigned nofs = vec_reg_offset(s, a->rn, index, esz);
+            /* imm5 names the source element this splats. */
+            insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST, index);
             tcg_gen_gvec_dup_mem(esz, dofs, nofs, vsz, vsz);
         } else {
+            /*
+             * The index names an element past the end of the vector, which
+             * the architecture defines as zero -- so every lane still takes
+             * one value, and that value comes from no lane at all.
+             */
+            insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_BROADCAST,
+                                        INSN_DF_VEC_LANE_NONE);
             /*
              * While dup_mem handles 128-bit elements, dup_imm does not.
              * Thankfully element size doesn't matter for splatting zero.
@@ -2209,6 +2224,14 @@ static void do_insr_i64(DisasContext *s, arg_rrr_esz *a, TCGv_i64 val)
 
     tcg_gen_addi_ptr(t_zd, tcg_env, vec_full_reg_offset(s, a->rd));
     tcg_gen_addi_ptr(t_zn, tcg_env, vec_full_reg_offset(s, a->rn));
+
+    /*
+     * REFUSED, and counted.  INSR shifts the whole vector along by one
+     * element and puts the new value in the vacated end: every lane is
+     * written, so naming one would say the rest were left alone.
+     */
+    insn_dataflow_note_vec_shape(a->esz, vsz);
+    insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_COMPOSITE);
 
     fns[a->esz](t_zd, t_zn, val, desc);
 }
@@ -2577,6 +2600,12 @@ static void do_clast_scalar(DisasContext *s, int esz, int pg, int rm,
     TCGv_i32 last = tcg_temp_new_i32();
     TCGv_i64 ele, cmp;
 
+    /*
+     * REFUSED, and counted.  The element CLAST reads is the last one the
+     * predicate makes active, which is a register value read at execution
+     * and not a field of the encoding.
+     */
+    insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
     find_last_active(s, last, esz, pg);
 
     /* Extend the original value of last prior to incrementing.  */
@@ -2654,6 +2683,8 @@ static TCGv_i64 do_last_scalar(DisasContext *s, int esz,
 {
     TCGv_i32 last = tcg_temp_new_i32();
 
+    /* Same refusal as CLAST: the predicate decides the element, not imm. */
+    insn_dataflow_refuse_vec_lane(INSN_DF_VEC_REFUSE_DYNAMIC);
     find_last_active(s, last, esz, pg);
     if (before) {
         wrap_last_active(s, last, esz);

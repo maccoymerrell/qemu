@@ -1077,6 +1077,74 @@ void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
         d->vec_vece = (uint8_t)vece;
         d->vec_oprsz = oprsz;
     }
+    /*
+     * An expansion is elementwise, so stating a shape states a UNIFORM kind.
+     * It does not overrule a decode site: an element insert copies the lanes
+     * it does not touch with a gvec move, so the expander's UNIFORM arrives
+     * first and the insert's own statement second, and the encoding's answer
+     * is the one that has to survive.
+     */
+    if (!d->vec_kind_stated) {
+        d->vec_kind = INSN_DF_VEC_KIND_UNIFORM;
+        d->vec_lane = INSN_DF_VEC_LANE_NONE;
+    }
+}
+
+void insn_dataflow_note_vec_lane(unsigned kind, int lane)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    if (kind == INSN_DF_VEC_KIND_NONE || kind > INSN_DF_VEC_KIND_BROADCAST) {
+        return;
+    }
+    if (lane < INSN_DF_VEC_LANE_NONE || lane > INT16_MAX) {
+        return;
+    }
+    d = &df->out[df->cur];
+    if (d->vec_kind_stated) {
+        return;             /* the first statement is the encoding's */
+    }
+    d->vec_kind = (uint8_t)kind;
+    d->vec_lane = (int16_t)lane;
+    d->vec_kind_stated = true;
+}
+
+void insn_dataflow_refuse_vec_lane(unsigned reason)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    if (reason == 0 || reason > INSN_DF_VEC_REFUSE_COMPOSITE) {
+        return;
+    }
+    d = &df->out[df->cur];
+    if (d->vec_lane_refuse == 0) {
+        d->vec_lane_refuse = (uint8_t)reason;
+    }
+    if (d->n_vec_lane_refused < UINT8_MAX) {
+        d->n_vec_lane_refused++;
+    }
+    /*
+     * A REFUSAL ALSO REFUSES THE KIND, and must, because every site that
+     * refuses is a site the shape's implicit UNIFORM is wrong about.
+     *
+     * Measured on all three targets that have one: x86 INSERTPS, SVE INSR and
+     * MSA SLDI each run an expansion -- the copy that fills the lanes the
+     * instruction does not itself write -- so a shape arrives and the kind
+     * read UNIFORM beside a refused lane.  A consumer taking UNIFORM at its
+     * word would tie lane i of the result to lane i of the source, which is
+     * exactly what a slide and a zeroing insert do not do, so the pair said
+     * something false in the direction that loses an edge.  Marking the kind
+     * stated-as-NONE clears it and stops a later expansion from setting it.
+     */
+    d->vec_kind = INSN_DF_VEC_KIND_NONE;
+    d->vec_lane = INSN_DF_VEC_LANE_NONE;
+    d->vec_kind_stated = true;
 }
 
 void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
@@ -1403,6 +1471,8 @@ void insn_dataflow_insn_begin(unsigned idx)
     }
     memset(&df->out[idx], 0, sizeof(df->out[idx]));
     df->out[idx].vec_vece = INSN_DF_VECE_NONE;
+    df->out[idx].vec_kind = INSN_DF_VEC_KIND_NONE;
+    df->out[idx].vec_lane = INSN_DF_VEC_LANE_NONE;
     df->cur = idx;
     df->decoding = true;
 }

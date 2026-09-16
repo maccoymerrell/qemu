@@ -123,7 +123,17 @@ cmd_gate() {
              "vocabulary map in the plugin), not a stale header, and the" \
              "gate has nothing to compare.  It becomes live again the" \
              "moment one of the four returns."
-        return 2
+        #
+        # A DESIGNED ABSENCE AND A MISSING SUBJECT ARE DIFFERENT ANSWERS AND
+        # GET DIFFERENT CODES.  Both used to return 2, and a caller that
+        # treats 2 as a failure -- battery15.sh's `record` does -- then reads
+        # "the mirror was retired on purpose" as a RED row, which is a
+        # falsehood about the tree.  Reading it as a PASS would be the
+        # opposite falsehood, so it is neither: 3 says NO SUBJECT, 2 keeps
+        # its meaning (this gate could not look -- no build directory, no
+        # generator), and a caller must carry the distinction rather than
+        # collapse it.
+        return 3
     fi
     if [ "$absent" != 0 ]; then
         echo "row -    rc=1   PARTIAL MIRROR -- $present of 4 headers shipped;" \
@@ -180,7 +190,14 @@ selftest() {
         local rc
         cmd_gate "$build" "$T/nosubj" > "$T/nosubj.log" 2>&1
         rc=$?
-        ck "no-subject returns 2" 2 "$rc"
+        ck "no-subject returns 3 (not 2, which means could-not-look)" 3 "$rc"
+        checks=$((checks + 1))
+        cmd_gate "$T/no-such-build" "$T/nolook" > "$T/nolook.log" 2>&1
+        if [ $? -eq 2 ]; then
+            echo "  ok   a missing build dir still REFUSES with 2"
+        else
+            echo "  FAIL missing build dir did not return 2"; fails=$((fails + 1))
+        fi
         checks=$((checks + 1))
         if grep -q 'NO SUBJECT' "$T/nosubj.log"; then
             echo "  ok   no-subject says so in words"

@@ -220,18 +220,39 @@ survey() {
     #
     note "  occupants encodings the enum table is still the CLASSIFICATION"
     note "           for (decode_id == 0), counted per ISA:"
-    note "             RETIRED WITH ITS SUBJECT.  enumocc.py scored this"
-    note "             population from the per-encoding MECHANISM corpus'"
-    note "             stated identity key (IDK: QEMU / ENUM / NONE).  The"
-    note "             plugin can no longer state ENUM -- there is no enum"
-    note "             table and no fall to one -- so the census would read"
-    note "             a structural zero with no control behind it, which"
-    note "             is the shape this file exists to refuse.  Its last"
-    note "             reading, over the whole enumerated encoding"
-    note "             population, four ISAs x wp{0,16}, key=STATED:"
-    note "                 ENUM-OCCUPANCY total=0 inference_total=0 rc=0"
-    note "             The surviving size rows below are what R14 now"
-    note "             measures; this row is history."
+    #
+    # THIS ROW USED TO SAY "RETIRED WITH ITS SUBJECT", and both halves of
+    # that were false about the tree it runs on.  It claimed "there is no
+    # enum table and no fall to one" -- while the four
+    # champsim_tracer_mnemonics_<isa>.h tables are in the tree and linked
+    # into the plugin, which the `rows` census immediately above COUNTS.  A
+    # survey that prints a retirement notice over a population its own
+    # sibling row is still counting is the census-that-could-not-look shape
+    # this file exists to refuse, aimed at itself.
+    #
+    # What IS true is narrower and is said instead: the scorer is gone.
+    # enumocc.py read this population out of a per-encoding MECHANISM corpus
+    # and is not in the tree, so there is no instrument here that can look --
+    # which is reported as SURVEY CANNOT LOOK, never as a zero, and never as
+    # a retirement.  The row goes live again when a scorer for it returns.
+    #
+    if [ -x "$SRC_ROOT/contrib/plugins/champsim_tracer/tools/enumocc.py" ]; then
+        note "             (enumocc.py is present; run it against a sled"
+        note "             capture and quote its reading here)"
+    else
+        note "             SURVEY CANNOT LOOK -- enumocc.py, the scorer that"
+        note "             read this population out of a per-encoding"
+        note "             MECHANISM corpus, is not in this tree.  The"
+        note "             classification path no longer FALLS to the enum"
+        note "             table (champsim_tracer_qdep.cc seats the wire's"
+        note "             opcode from the decode rule's word), but the four"
+        note "             tables themselves are still here and still linked"
+        note "             -- the \`rows\` census above is counting them -- so"
+        note "             an occupancy of zero is not something this file"
+        note "             may assert without an instrument that measured"
+        note "             it.  R14 is scored on the size and link rows"
+        note "             below until one returns."
+    fi
 
     #
     # THE LABEL SAYS "AT OR BESIDE", AND FINDING 96-D IS WHY.  Until

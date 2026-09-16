@@ -18,8 +18,14 @@
 # THE FIFTEEN ROWS
 #
 #    1  plugin_abi_gate              the plugin/QEMU dataflow ABI handshake
-#    1h   ... ident_header_gate      are the four SHIPPED identity headers
-#                                    the ones this tree generates?  The
+#    1h   ... ident_header_gate      is every SHIPPED identity header the
+#                                    one this tree generates?  (There are
+#                                    four when the plugin-side mirror is
+#                                    shipped and NONE when it is not, which
+#                                    is CLEAN_PLAN Decision 3's end state and
+#                                    is the tree today -- the row then
+#                                    records NO SUBJECT and is not scored.)
+#                                    The
 #                                    plugin links the committed header, not
 #                                    the rows a census derives, so a stale
 #                                    one makes every identity number
@@ -899,7 +905,28 @@ if selected 1; then
     # can see a generated file drift away from its generator.
     CST_PYTHON="$PY" "$T/ident_header_gate.sh" "$Q" "$O/identhdr" \
         > "$O/ident_header_gate.log" 2>&1
-    record 1h $? "ident_header_gate (4 shipped identity headers)"
+    identhdr_rc=$?
+    #
+    # THE LABEL SAID "4 SHIPPED IDENTITY HEADERS" AND THIS TREE SHIPS NONE.
+    # CLEAN_PLAN Decision 3 retired the plugin-side identity mirror in favour
+    # of one table on the QEMU side plus a vocabulary map, so the count in the
+    # label was a fossil of the tree the row was written against -- and the
+    # gate's no-subject answer, which used to share exit code 2 with "this
+    # gate could not look", was landing here as a RED row about a state the
+    # design chose.  The gate now separates the two; this row carries the
+    # separation rather than collapsing it, because a designed absence is
+    # neither a pass nor a failure and saying either would be false.
+    #
+    if [ "$identhdr_rc" -eq 3 ]; then
+        printf 'row %-5s rc=%-3s %s\n' 1h 3 \
+            "ident_header_gate: NO SUBJECT -- this tree ships no" \
+            "champsim_tracer_qemu_ident_*.h (CLEAN_PLAN Decision 3's end" \
+            "state).  Not scored; the row goes live again when one returns" \
+            >> "$RCFILE"
+    else
+        record 1h "$identhdr_rc" \
+            "ident_header_gate (every shipped identity header vs its generator)"
+    fi
 fi
 
 declare -A BIN=( [x86_64]=prog [aarch64]=prog.a64 \

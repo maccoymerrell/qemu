@@ -761,16 +761,6 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
         return false;
     }
 
-    tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
-    if (tb == NULL) {
-        mmap_lock();
-        tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
-        mmap_unlock();
-        if (tb == NULL) {
-            return false;
-        }
-    }
-
     /*
      * Save and restore cpu->running to avoid assertion failures
      * when called from a plugin callback context.
@@ -780,11 +770,33 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     /*
      * Set up a local exception landing pad so faults during wrong-path
      * execution longjmp back here instead of the outer cpu_exec loop.
+     *
+     * TRANSLATION IS INSIDE THE PAD, NOT BEFORE IT.  tb_gen_code() can raise:
+     * translator_ld() reading the second page of a block that straddles a page
+     * boundary siglongjmps through cpu->jmp_env from inside the translator.
+     * With the codegen ahead of the sigsetjmp that fault unwound PAST this
+     * function to whatever pad the caller had installed -- and this function's
+     * caller is a plugin callback, which that pad does not know how to
+     * resume: it would continue the interrupted guest execution with the
+     * plugin's own stack frame abandoned.  Under the pad the same fault lands
+     * below, cpu->jmp_env is put back, and the caller gets false.
      */
     sigjmp_buf saved_jmp_env;
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+        if (tb == NULL) {
+            mmap_lock();
+            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+            mmap_unlock();
+            if (tb == NULL) {
+                cpu->running = saved_running;
+                memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+                return false;
+            }
+        }
+
 #ifndef CONFIG_USER_ONLY
         /* Guest-insn slice bounding: same spec-dispatch quantum rule as
          * cpu_plugin_exec_tb -- see the comment there. */
@@ -811,6 +823,19 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
             mmap_unlock();
         }
 #endif
+        /*
+         * The translation above is inside this pad, so this pad owns what
+         * tb_gen_code was holding when it unwound: the TB's PageDesc locks
+         * under softmmu, and the in-flight pointer in both modes.  The two
+         * live siblings clear exactly this, for exactly this reason, and
+         * this one could not before because its codegen ran outside.
+         */
+#ifndef CONFIG_USER_ONLY
+        if (tcg_ctx->gen_tb) {
+            tb_unlock_pages(tcg_ctx->gen_tb);
+        }
+#endif
+        tcg_ctx->gen_tb = NULL;
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return false;

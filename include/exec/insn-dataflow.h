@@ -68,6 +68,14 @@
 #define INSN_DF_MAX_WRITES  8
 
 /*
+ * Guest memory accesses recorded individually.  A string operation or a
+ * multi-register load can exceed this; the counts below stay exact when the
+ * rows run out, so a consumer is told how many accesses there were even when
+ * it cannot be told about each one.
+ */
+#define INSN_DF_MAX_MEMOPS  16
+
+/*
  * Why a set may be unavailable.
  *
  * Which way an error in this code falls is decided once, here, because every
@@ -87,6 +95,7 @@
  */
 #define INSN_DF_INCOMPLETE_WRITES   (1u << 0)   /* more writes than slots */
 #define INSN_DF_INCOMPLETE_FIELDS   (1u << 1)   /* more env ranges than slots */
+#define INSN_DF_INCOMPLETE_MEMOPS   (1u << 2)   /* more accesses than rows */
 
 /* Direction of an access. */
 #define INSN_DF_RD          1
@@ -141,6 +150,27 @@ typedef struct InsnDataflowWrite {
     uint64_t prov[INSN_DF_REG_WORDS];
 } InsnDataflowWrite;
 
+/*
+ * One guest memory access, in the order the instruction performs them.
+ *
+ * Per access, not per instruction: an instruction with two accesses computes
+ * two addresses, and a consumer modelling either one needs to know which
+ * registers that ONE address came from.  Folding them together would say that
+ * every address of a two-operand move depends on every register the move
+ * reads, which is true of neither.
+ *
+ * The address provenance is the set the address operand was computed from --
+ * the emitter's own arithmetic, followed through the temps.  The data
+ * provenance is the set the stored value came from, and is empty on a load:
+ * a load's datum comes from memory, which is not a register and has no bit.
+ */
+typedef struct InsnDataflowMemop {
+    uint8_t  dir;               /* INSN_DF_RD / _WR */
+    uint8_t  size;              /* bytes */
+    uint64_t addr_prov[INSN_DF_REG_WORDS];
+    uint64_t data_prov[INSN_DF_REG_WORDS];
+} InsnDataflowMemop;
+
 typedef struct InsnDataflow {
     uint64_t rd[INSN_DF_REG_WORDS];
     uint64_t wr[INSN_DF_REG_WORDS];
@@ -159,6 +189,9 @@ typedef struct InsnDataflow {
 
     InsnDataflowField fields[INSN_DF_MAX_FIELDS];
     uint8_t  n_fields;
+
+    InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
+    uint8_t  n_memops;
 
     /*
      * Helper calls, and guest memory accesses, counted.  What the helper did

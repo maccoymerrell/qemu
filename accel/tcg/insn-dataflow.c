@@ -45,6 +45,7 @@
 #include "tcg/tcg.h"
 #include "tcg/tcg-op-common.h"
 #include "tcg/tcg-internal.h"
+#include "exec/memopidx.h"
 #include "exec/insn-dataflow.h"
 
 /*
@@ -390,6 +391,108 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->n_fields++;
 }
 
+/*
+ * One guest memory access, recorded where the op stream performs it.
+ *
+ * The access order within an instruction is the op order, which is the order
+ * the guest performs them in: TCG emits the ops in the sequence the target's
+ * emitter wrote, and that sequence is the architectural one.  So the rows need
+ * no sorting and no note -- they are read off in the order they will happen.
+ */
+static void df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
+                         const uint64_t *addr_prov, const uint64_t *data_prov)
+{
+    InsnDataflowMemop *m;
+
+    if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    m = &d->memops[d->n_memops++];
+    m->dir = dir;
+    m->size = size > 255 ? 255 : (uint8_t)size;
+    memset(m->addr_prov, 0, sizeof(m->addr_prov));
+    memset(m->data_prov, 0, sizeof(m->data_prov));
+    if (addr_prov) {
+        memcpy(m->addr_prov, addr_prov, sizeof(m->addr_prov));
+    }
+    if (data_prov) {
+        memcpy(m->data_prov, data_prov, sizeof(m->data_prov));
+    }
+}
+
+/*
+ * A guest load or store: which way, how wide, and where its address and datum
+ * came from.
+ *
+ * The argument layout is derived from the op definition rather than from a
+ * per-opcode table, so a target or host configuration that gives an access a
+ * different number of data arguments (a 128-bit access, or a 64-bit datum on a
+ * 32-bit host) needs nothing here: a load names its data first and its address
+ * last among the inputs; a store names its data first and its address last.
+ */
+static bool df_guest_memop(InsnDataflow *d, TCGOp *op)
+{
+    TCGContext *s = tcg_ctx;
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    unsigned nb_oargs = def->nb_oargs, nb_iargs = def->nb_iargs;
+    uint64_t addr_prov[INSN_DF_REG_WORDS] = { 0 };
+    uint64_t data_prov[INSN_DF_REG_WORDS] = { 0 };
+    unsigned ndata, addr_arg;
+    TCGTemp *ts;
+    MemOpIdx oi;
+    uint8_t dir;
+
+    switch (op->opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+    case INDEX_op_qemu_ld_i128:
+        dir = INSN_DF_RD;
+        ndata = nb_oargs;
+        addr_arg = nb_oargs;        /* the one input is the address */
+        break;
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
+    case INDEX_op_qemu_st_i128:
+        dir = INSN_DF_WR;
+        ndata = nb_iargs - 1;
+        addr_arg = nb_iargs - 1;    /* the address is the last input */
+        break;
+    default:
+        return false;
+    }
+
+    ts = arg_temp(op->args[addr_arg]);
+    if (ts != NULL) {
+        df_union(addr_prov, df_prov(ts - s->temps));
+        {
+            unsigned idx;
+
+            if (df_is_reg(ts, &idx)) {
+                df_set_bit(addr_prov, idx);
+            }
+        }
+    }
+    for (unsigned i = 0; i < ndata && dir == INSN_DF_WR; i++) {
+        TCGTemp *dts = arg_temp(op->args[i]);
+        unsigned idx;
+
+        if (dts == NULL) {
+            continue;
+        }
+        df_union(data_prov, df_prov(dts - s->temps));
+        if (df_is_reg(dts, &idx)) {
+            df_set_bit(data_prov, idx);
+        }
+    }
+
+    oi = op->args[nb_oargs + nb_iargs];
+    df_add_memop(d, dir, memop_size(get_memop(oi)), addr_prov,
+                 dir == INSN_DF_WR ? data_prov : NULL);
+    return true;
+}
+
 /* Direct env access: a load or a store of how many bytes? */
 static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
 {
@@ -530,6 +633,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     case INDEX_op_qemu_ld_i64:
     case INDEX_op_qemu_ld_i128:
         d->n_mem_rd++;
+        df_guest_memop(d, op);
         break;
 
     case INDEX_op_qemu_st_i32:
@@ -537,6 +641,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     case INDEX_op_qemu_st8_i32:
     case INDEX_op_qemu_st_i128:
         d->n_mem_wr++;
+        df_guest_memop(d, op);
         break;
 
     default:

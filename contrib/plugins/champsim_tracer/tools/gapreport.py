@@ -23,6 +23,17 @@ DISAGREE row is an arbitration to be written, on the merits, against the
 precedent corpus; it is not a defect in either column and this tool never
 calls one a defect.
 
+WHAT IT CAN DO is say whether the arbitration HAS been written.  With
+--rulings it joins each disagreement class against the checked-in corpus in
+gapreport_rulings.tsv, keyed on (isa, rule, qemu opcode, capstone opcode),
+and reports ARBITRATED against UNRULED.  The key carries the RULE because a
+class keyed on the opcode pair grows silently -- x86's bitmanip-versus-test
+class was one row when it was first ruled and thirty-six at a five-times
+larger corpus -- and a new rule joining an old class is a new arbitration
+that nobody has read.  The join refuses in both directions: --require-ruled
+fails on an unruled class, and a ruling naming a class the scored corpora do
+not contain is a dead rule and fails too.
+
 Refusals, because a scorer that reports on nothing is the failure this tree
 keeps relearning:
 
@@ -82,6 +93,58 @@ def read_corpus(path, ncols):
     return stamp, rows
 
 
+RULING_COLS = 7
+
+
+class Ruling:
+    def __init__(self, verdict, state, reason):
+        self.verdict = verdict
+        self.state = state
+        self.reason = reason
+        self.used = 0
+
+
+def read_rulings(path):
+    """The checked-in arbitrations, keyed (isa, rule, qemu, capstone)."""
+    rulings = {}
+    bad = 0
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            p = line.split("\t")
+            if len(p) < RULING_COLS:
+                print("%s:%d: a ruling is isa, rule, qemu, capstone, verdict, "
+                      "state, reason" % (path, n), file=sys.stderr)
+                bad += 1
+                continue
+            isa, rule, q, c, verdict, state = [x.strip() for x in p[:6]]
+            reason = "\t".join(p[6:]).strip()
+            if verdict not in ("QEMU", "CAPSTONE"):
+                print("%s:%d: verdict %r is not QEMU or CAPSTONE"
+                      % (path, n, verdict), file=sys.stderr)
+                bad += 1
+            if state not in ("SETTLED", "COVERAGE-PATH"):
+                print("%s:%d: state %r is not SETTLED or COVERAGE-PATH"
+                      % (path, n, state), file=sys.stderr)
+                bad += 1
+            if not reason:
+                print("%s:%d: no reason; an arbitration whose merits are not "
+                      "written down is an assertion" % (path, n),
+                      file=sys.stderr)
+                bad += 1
+            key = (isa, rule, q, c)
+            if key in rulings:
+                print("%s:%d: %s already arbitrated" % (path, n, str(key)),
+                      file=sys.stderr)
+                bad += 1
+            rulings[key] = Ruling(verdict, state, reason)
+    if bad:
+        raise Refusal("%s: %d refused row(s)" % (path, bad))
+    return rulings
+
+
 def classify(ident, opc):
     """One encoding's bucket, and the pair of opcodes that decided it."""
     q_rule, q_word, q_op = ident[3], ident[4], ident[5]
@@ -98,7 +161,7 @@ def classify(ident, opc):
     return ("AGREE" if q_op == c_op else "DISAGREE"), q_op, c_op
 
 
-def report(isa, ident_path, opc_path, top, out):
+def report(isa, ident_path, opc_path, top, out, rulings=None):
     i_stamp, ident = read_corpus(ident_path, 6)
     o_stamp, opc = read_corpus(opc_path, 4)
 
@@ -118,14 +181,23 @@ def report(isa, ident_path, opc_path, top, out):
     counts = collections.Counter()
     pairs = collections.Counter()
     rules = collections.Counter()
+    classes = collections.Counter()
 
     for enc, row in ident.items():
         bucket, q_op, c_op = classify(row, opc.get(enc))
         counts[bucket] += 1
         if bucket == "DISAGREE":
             pairs[(q_op, c_op)] += 1
+            classes[(isa, row[3], q_op, c_op)] += 1
         if bucket in ("NO-RULE", "NO-WORD"):
             rules[row[3]] += 1
+        if bucket == "NO-RULE" and c_op is not None:
+            #
+            # The bytes reached no rule and the incumbent nevertheless names
+            # an opcode.  That is a class with two answers as much as a
+            # DISAGREE is, so it is keyed and arbitrated the same way.
+            #
+            classes[(isa, "#undecoded", "#no-rule", c_op)] += 1
 
     total = sum(counts.values())
     print("== %s   %d encodings, %d also in the Capstone corpus"
@@ -146,7 +218,26 @@ def report(isa, ident_path, opc_path, top, out):
         for r, n in rules.most_common(top):
             print("      %8d  %s" % (n, r), file=out)
 
-    return counts
+    unruled = collections.Counter()
+    if rulings is not None:
+        arb = cov = 0
+        for key, n in classes.items():
+            r = rulings.get(key)
+            if r is None:
+                unruled[key] = n
+            else:
+                r.used += n
+                arb += n
+                if r.state == "COVERAGE-PATH":
+                    cov += n
+        print("   -- arbitration: %d classes, %d encodings arbitrated "
+              "(%d on a coverage path), %d classes UNRULED"
+              % (len(classes), arb, cov, len(unruled)), file=out)
+        for key, n in unruled.most_common(top):
+            print("      UNRULED %8d  rule %-16s QEMU %-22s Capstone %s"
+                  % (n, key[1], key[2], key[3]), file=out)
+
+    return counts, classes, unruled
 
 
 STAMP = "#so plugin=aa emulator=bb"
@@ -188,6 +279,67 @@ SELFTEST_CASES = [
 ]
 
 
+RULING_ROW = ("q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tQEMU\tSETTLED\t"
+              "a planted arm, so the join is seen to fire")
+
+
+def selftest_rulings():
+    """Prove the arbitration join refuses in BOTH directions.
+
+    A join that only ever agrees has not been seen to work, and the two ways
+    it can be wrong are opposite: a class nobody ruled, and a ruling that
+    reaches no class.
+    """
+    import tempfile
+
+    cases = [
+        # (name, ruling rows, capstone opcode, expect)
+        ("ruled",   [RULING_ROW],                    "GEN_OP_INT_SUB", "ok"),
+        ("unruled", [],                              "GEN_OP_INT_SUB", "unruled"),
+        ("dead",    [RULING_ROW,
+                     "q\tsub\tGEN_OP_X\tGEN_OP_Y\tQEMU\tSETTLED\tno class"],
+                                                     "GEN_OP_INT_SUB", "dead"),
+        ("no-reason", ["q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tQEMU"
+                       "\tSETTLED\t"],             "GEN_OP_INT_SUB", "REFUSED"),
+        ("bad-verdict", ["q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tMAYBE"
+                         "\tSETTLED\tno"],         "GEN_OP_INT_SUB", "REFUSED"),
+    ]
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        ip = os.path.join(d, "ident_q.tsv")
+        op = os.path.join(d, "opc_q.tsv")
+        rp = os.path.join(d, "rulings.tsv")
+        for name, rows, c_op, want in cases:
+            with open(ip, "w") as f:
+                f.write(STAMP + "\n#h\n")
+                f.write("q\t01\tadd\tadd\tint.add\tGEN_OP_INT_ADD\t"
+                        "BRANCH_NONE\n")
+            with open(op, "w") as f:
+                f.write(STAMP + "\n#h\nq\t01\tadd\t%s\n" % c_op)
+            with open(rp, "w") as f:
+                f.write("\n".join(rows) + "\n")
+
+            sink = open(os.devnull, "w")
+            got = None
+            try:
+                rul = read_rulings(rp)
+                _c, _cl, unruled = report("q", ip, op, 0, sink, rul)
+                dead = [k for k, r in rul.items() if r.used == 0]
+                got = "unruled" if unruled else ("dead" if dead else "ok")
+            except Refusal:
+                got = "REFUSED"
+            finally:
+                sink.close()
+            ok = got == want
+            print("  rulings:%-12s %s" % (name, "ok" if ok else
+                                          "FAILED (%s)" % got))
+            if not ok:
+                bad += 1
+    print("gapreport ruling selftest: %d of %d arms fired as designed"
+          % (len(cases) - bad, len(cases)))
+    return 1 if bad else 0
+
+
 def selftest():
     """Prove every bucket and every refusal can fire, on planted corpora.
 
@@ -213,7 +365,7 @@ def selftest():
 
             sink = open(os.devnull, "w")
             try:
-                counts = report("q", ip, op, 0, sink)
+                counts = report("q", ip, op, 0, sink)[0]
                 refused = False
             except Refusal:
                 counts, refused = None, True
@@ -247,10 +399,15 @@ def main():
     ap.add_argument("--require-zero", action="append", default=[],
                     metavar="BUCKET",
                     help="fail unless this bucket is 0 on every ISA")
+    ap.add_argument("--rulings", default=None,
+                    help="the checked-in arbitrations to join against")
+    ap.add_argument("--require-ruled", action="store_true",
+                    help="fail unless every disagreement class is arbitrated, "
+                         "and unless every arbitration has a class")
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest()
+        return selftest() | selftest_rulings()
 
     if not args.dir or not args.isa:
         print("gapreport: --dir and at least one --isa are required",
@@ -263,13 +420,30 @@ def main():
                   file=sys.stderr)
             return 2
 
+    if args.require_ruled and not args.rulings:
+        print("gapreport: --require-ruled needs --rulings; a bar with no "
+              "corpus to read would pass by having looked at nothing",
+              file=sys.stderr)
+        return 2
+
+    rulings = None
+    if args.rulings:
+        try:
+            rulings = read_rulings(args.rulings)
+        except Refusal as e:
+            print("gapreport: REFUSED: %s" % e, file=sys.stderr)
+            return 1
+
     bad = 0
+    scored = set()
     for isa in args.isa:
         try:
-            counts = report(isa,
-                            os.path.join(args.dir, "ident_%s.tsv" % isa),
-                            os.path.join(args.dir, "opc_%s.tsv" % isa),
-                            args.top, sys.stdout)
+            counts, _classes, unruled = report(
+                isa,
+                os.path.join(args.dir, "ident_%s.tsv" % isa),
+                os.path.join(args.dir, "opc_%s.tsv" % isa),
+                args.top, sys.stdout, rulings)
+            scored.add(isa)
         except Refusal as e:
             print("gapreport: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
@@ -279,6 +453,27 @@ def main():
                 print("gapreport: %s: %s is %d, required 0"
                       % (isa, b, counts[b]), file=sys.stderr)
                 bad += 1
+        if args.require_ruled and unruled:
+            print("gapreport: %s: %d disagreement class(es) with no written "
+                  "arbitration" % (isa, len(unruled)), file=sys.stderr)
+            bad += 1
+
+    #
+    # The other direction.  A ruling that no scored corpus reaches is a dead
+    # rule: it was written for a class that has since moved or was never
+    # there, and an arbitration corpus nobody can falsify is the shape this
+    # tree keeps relearning.  Only the ISAs actually scored are judged, so a
+    # one-ISA run does not condemn the other three's rows.
+    #
+    if args.require_ruled and rulings is not None:
+        dead = [k for k, r in rulings.items()
+                if k[0] in scored and r.used == 0]
+        for k in sorted(dead):
+            print("gapreport: dead ruling: %s %s %s vs %s reaches no class "
+                  "in the scored corpora" % k, file=sys.stderr)
+        if dead:
+            print("gapreport: %d dead ruling(s)" % len(dead), file=sys.stderr)
+            bad += 1
 
     print("gapreport: %s" % ("FAIL" if bad else "PASS"))
     return 1 if bad else 0

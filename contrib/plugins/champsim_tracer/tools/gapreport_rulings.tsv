@@ -1,0 +1,129 @@
+# The arbitrations: one row per disagreement class the gap report can raise.
+#
+# Two decoders, one encoding, two answers.  The contract's step 5 says a
+# disagreement is ARBITRATED to the CORRECT output, never resolved by picking
+# a side and trusting it, so each row below decides on the merits and says
+# which side the merits went to.  A row is NOT a claim that the other side is
+# a defect: it is a claim about what the encoding does.
+#
+# Columns:
+#   isa       the ISA the class was measured on
+#   rule      the QEMU decode rule the class sits on, or #undecoded when the
+#             bytes reached no rule at all
+#   qemu      the generic opcode QEMU's word maps to
+#   capstone  the generic opcode the incumbent names
+#   verdict   QEMU | CAPSTONE -- which side the arbitration went to
+#   state     SETTLED      the tree already publishes the arbitrated answer
+#             COVERAGE-PATH the arbitrated answer is not published yet and the
+#                          remedy is named in the reason
+#   reason    the merits, in one sentence
+#
+# THE KEY INCLUDES THE RULE ON PURPOSE.  A class keyed only on the pair of
+# opcodes grows silently: x86's BITMANIP-vs-TEST class was one row when B1
+# ruled it and thirty-six at a five-times-larger corpus, and a rule joining an
+# already-ruled pair would have been counted as ruled without anyone reading
+# it.  A new rule in an old class is a new arbitration.
+#
+# Copyright (c) 2026 Maccoy Merrell
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# -- x86_64 ------------------------------------------------------------------
+x86_64	MOVQ	GEN_OP_VEC_MOV	GEN_OP_MOV	QEMU	SETTLED	movq between a GPR and an MMX or XMM register moves a vector register; the incumbent keys on the mnemonic and never looks at which file the operand is in
+x86_64	MOVD_to	GEN_OP_VEC_MOV	GEN_OP_MOV	QEMU	SETTLED	same as MOVQ: the destination is a vector register
+x86_64	MOVD_from	GEN_OP_VEC_MOV	GEN_OP_MOV	QEMU	SETTLED	same as MOVQ: the source is a vector register
+x86_64	VMOVSD_ld	GEN_OP_FP_MOV	GEN_OP_VEC_MOV	QEMU	SETTLED	vmovsd loads one scalar double; the register it lands in is wide, the operation is not
+x86_64	BTS	GEN_OP_BITMANIP	GEN_OP_TEST	QEMU	SETTLED	bts sets one bit of its destination and copies the old bit to CF; a test writes no destination
+x86_64	BTR	GEN_OP_BITMANIP	GEN_OP_TEST	QEMU	SETTLED	btr clears one bit of its destination; same reading as BTS
+x86_64	VPACKUSDW	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	a pack rearranges elements and performs no logical operation, the same reading B3 gave riscv64's vrgather and vslide
+x86_64	PACKUSWB	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	same as VPACKUSDW
+x86_64	VPERMQ	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	a permute is a shuffle by definition
+x86_64	VPERM2x128	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	same as VPERMQ
+x86_64	NOP	GEN_OP_NOP	GEN_OP_PREFETCH	CAPSTONE	COVERAGE-PATH	prefetcht0 IS a prefetch; QEMU lowers it to nothing and the identity therefore lands on the NOP rule, and the remedy is the prefetch word stated at target/i386's own prefetch decode site (CLEAN_PLAN fact 18)
+x86_64	VMOVLPx_st	GEN_OP_VEC_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	one rule covers MOVLPS, which stores a packed low half, and the MOVSD store form, which stores one scalar double; the seven measured rows are all movsd, and the remedy is the operand-dependent statement riscv64's ADDI and aarch64's four shared helpers already use
+x86_64	BSWAP	GEN_OP_BITMANIP	GEN_OP_MOV	QEMU	SETTLED	a byte swap rearranges the bytes of its operand; a move does not
+x86_64	STOS	GEN_OP_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	stos writes memory; the incumbent's int.add names the implicit index increment and not the operation
+x86_64	RDTSC	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	rdtsc writes EDX:EAX, so nop is false of it
+x86_64	CPUID	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	cpuid writes four architectural registers, so nop is false of it
+x86_64	OUTS	GEN_OP_LOAD	GEN_OP_INT_ADD	QEMU	SETTLED	outs reads memory and writes a port; the incumbent again names the index increment
+x86_64	MOVS	GEN_OP_MOV	GEN_OP_FP_MOV	QEMU	SETTLED	movsl is the string move; the incumbent's table reaches its scalar-double entry through the shared `movs` spelling
+x86_64	VZEROUPPER	GEN_OP_VEC_MOV	GEN_OP_NOP	QEMU	SETTLED	vzeroupper zeroes the upper lane of every ymm register, which is a write to sixteen registers
+x86_64	STC	GEN_OP_BITMANIP	GEN_OP_NOP	QEMU	SETTLED	stc sets CF, so nop is false of it
+
+# -- riscv64 -----------------------------------------------------------------
+riscv64	addi	GEN_OP_MOV	GEN_OP_INT_ADD	QEMU	SETTLED	li and mv are moves, and the incumbent contradicts itself about them -- it publishes mov on the two-byte encodings and int.add on the four-byte ones for identical semantics (B3, exec199)
+riscv64	sltiu	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	sltiu writes 0 or 1 into a general register; RISC-V has no flags register, so cmp names an operation the machine does not perform (B3)
+riscv64	sltu	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
+riscv64	slt	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
+riscv64	slti	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
+riscv64	addi	GEN_OP_MOV	GEN_OP_NOP	CAPSTONE	COVERAGE-PATH	c.nop is addi x0,x0,0 and does nothing; ADDI's operand-dependent statement separates li, mv and the arithmetic remainder and does not yet fire for rd == x0
+
+# -- aarch64 -----------------------------------------------------------------
+aarch64	ORR_r	GEN_OP_MOV	GEN_OP_OR	QEMU	SETTLED	MOV is ORR with XZR as the first source, and QEMU's translator already special-cases that pair by name (B2)
+aarch64	ORR_r	GEN_OP_NOT	GEN_OP_OR	QEMU	SETTLED	MVN is ORN from XZR, an inversion rather than a disjunction (B2)
+aarch64	STR_v_i	GEN_OP_VEC_STORE	GEN_OP_STORE	QEMU	SETTLED	the stored operand is a vector register
+aarch64	STP_v	GEN_OP_VEC_STORE	GEN_OP_STORE	QEMU	SETTLED	the stored operands are vector registers
+aarch64	STR_v	GEN_OP_VEC_STORE	GEN_OP_STORE	QEMU	SETTLED	the stored operand is a vector register
+aarch64	LDR_v_i	GEN_OP_VEC_LOAD	GEN_OP_LOAD	QEMU	SETTLED	the loaded operand is a vector register
+aarch64	LDP_v	GEN_OP_VEC_LOAD	GEN_OP_LOAD	QEMU	SETTLED	the loaded operands are vector registers
+aarch64	LDR_v	GEN_OP_VEC_LOAD	GEN_OP_LOAD	QEMU	SETTLED	the loaded operand is a vector register
+aarch64	UBFM	GEN_OP_BITMANIP	GEN_OP_MOVZX	QEMU	SETTLED	ubfx and ubfiz extract or insert a bitfield at an arbitrary position; a zero-extension is the special case where the field starts at bit 0 and the incumbent applies it to all of them (B2)
+aarch64	UBFM	GEN_OP_SHL	GEN_OP_MOVZX	QEMU	SETTLED	lsl is UBFM with the immediates that make it a shift, which QEMU states at the rule and the incumbent reads as an extension (B2)
+aarch64	UBFM	GEN_OP_SHR	GEN_OP_MOVZX	QEMU	SETTLED	lsr is the same shape as lsl (B2)
+aarch64	SBFM	GEN_OP_BITMANIP	GEN_OP_MOVSX	QEMU	SETTLED	sbfiz and sbfx are bitfield operations, not sign extensions (B2)
+aarch64	SBFM	GEN_OP_SHR	GEN_OP_MOVSX	QEMU	SETTLED	asr is SBFM with the shift immediates (B2)
+aarch64	BFM	GEN_OP_BITMANIP	GEN_OP_MOV	QEMU	SETTLED	bfi and bfxil insert a field into a destination that keeps its other bits; a move replaces the whole register (B2)
+aarch64	LDR_i	GEN_OP_LOAD	GEN_OP_INT_ADD	QEMU	SETTLED	the post-indexed form updates its base pointer and loads; the incumbent names the pointer update and loses the load (B2)
+aarch64	LDP	GEN_OP_LOAD	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i
+aarch64	STR_i	GEN_OP_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i, on the store side
+aarch64	STP	GEN_OP_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i, on the store side
+aarch64	STR_v_i	GEN_OP_VEC_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i, with a vector operand
+aarch64	STP_v	GEN_OP_VEC_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i, with vector operands
+aarch64	LDR_v_i	GEN_OP_VEC_LOAD	GEN_OP_INT_ADD	QEMU	SETTLED	same as LDR_i, with a vector operand
+aarch64	ANDS_r	GEN_OP_TEST	GEN_OP_AND	QEMU	SETTLED	measured: all nineteen rows encode Rd == XZR, so the AND-NOT result is discarded and only the flags survive, which is a test
+aarch64	ST2G	GEN_OP_STORE	GEN_OP_VEC_STORE	QEMU	SETTLED	ST2G stores an MTE allocation tag; the incumbent reads the leading `st2` as the structured vector store of the same spelling
+aarch64	PACIASP	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	paciasp writes the signed pointer back into X30; the incumbent reads it as a hint-space nop.  The vocabulary has no word for pointer authentication and mov is the nearest true one -- an epoch item, filed beside 199-B's vec.cvt
+aarch64	AUTIASP	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	same as PACIASP, authenticating rather than signing
+aarch64	XPACLRI	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	same as PACIASP, stripping the signature
+aarch64	FCSEL	GEN_OP_CMOV	GEN_OP_FP_MOV	QEMU	SETTLED	fcsel selects one of two source registers on a condition; the incumbent names the move and loses the condition, which is the whole of the instruction
+aarch64	IRG	GEN_OP_BITMANIP	GEN_OP_NOP	QEMU	SETTLED	irg writes a tagged pointer into a general register
+aarch64	GMI	GEN_OP_BITMANIP	GEN_OP_NOP	QEMU	SETTLED	gmi writes a tag mask into a general register
+
+# -- mipsel ------------------------------------------------------------------
+mipsel	OPC_SLTIU	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	sltiu writes 0 or 1 into a general register; MIPS has no flags register, the same reading riscv64's slt family took
+mipsel	OPC_SLTU	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
+mipsel	OPC_SLTI	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
+mipsel	OPC_SLT	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
+mipsel	OPC_NOR	GEN_OP_OR	GEN_OP_NOT	QEMU	SETTLED	measured: 0 of 113 rows encode rt == $zero, so none of them is the `not` alias the incumbent's word describes; the substantial operation of a three-operand nor is the disjunction and the inversion modifies it
+mipsel	OPC_MTC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	a move whose other end is a floating-point register is an FP move, which is the same rule that makes x86's MOVD a vector move; the remedy is the fp.mov word stated at this decode site
+mipsel	OPC_MFC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	same as OPC_MTC1, in the other direction
+mipsel	OPC_TEQ	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	a conditional trap compares in order to raise; the raise is what the instruction is for and the incumbent names only the test
+mipsel	OPC_TGEU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
+mipsel	OPC_TEQI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
+mipsel	OPC_TLT	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
+mipsel	OPC_SRL	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: the encoding is 0x00000002, rd == $zero, so the shift has no architectural effect and MIPS's own no-op is a shift into $zero
+mipsel	OPC_SRA	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000003, rd == $zero, same reading as OPC_SRL
+mipsel	OPC_SRLV	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000006, rd == $zero, same reading as OPC_SRL
+mipsel	OPC_SLLV	GEN_OP_NOP	GEN_OP_SHL	QEMU	SETTLED	measured: 0x00000004, rd == $zero, same reading as OPC_SRL
+mipsel	OPC_JR	GEN_OP_RET	GEN_OP_BRANCH	QEMU	SETTLED	jr $ra returns; B4 states it from rs == 31 rather than from the operand's printed name
+mipsel	OPC_BOVC	GEN_OP_BRANCH	GEN_OP_INT_ADD	CAPSTONE	COVERAGE-PATH	major opcode 0x08 is ADDI before Release 6 and BOVC on it, the guest's CPU is pre-R6, and B4's per-switch table is keyed by the case value so it names whichever arm the generator took; the remedy is the arm-stated identity B4's own record names as owed
+mipsel	OPC_BNEZC	GEN_OP_BRANCH	GEN_OP_STORE	CAPSTONE	COVERAGE-PATH	the same R6-versus-pre-R6 collision at major opcode 0x3E, where the pre-R6 meaning is SDC2
+
+# -- NO-RULE with a name on the other side -----------------------------------
+# An encoding the decoder refused did not reach a rule, and that is information
+# rather than absence (D14's reading of udf).  These rows say so for the
+# opcodes the incumbent nevertheless names.
+mipsel	#undecoded	#no-rule	GEN_OP_BRANCH	QEMU	SETTLED	measured: the mipsel SPEC guests carry no MIPS16 and no microMIPS symbols, and the bytes the incumbent reads as jalx are ASCII from the binaries' own string tables ("cbrt", "copy", "getc", "exit"); an encoding QEMU declined is not a fact QEMU lost
+mipsel	#undecoded	#no-rule	GEN_OP_LOAD	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_STORE	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_CMP	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_AND	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_OR	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_INT_ADD	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_SHR	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_FENCE	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_CACHE_FLUSH	QEMU	SETTLED	same population and same reading as the jalx rows
+mipsel	#undecoded	#no-rule	GEN_OP_VEC_LOGIC	QEMU	SETTLED	same population and same reading as the jalx rows
+riscv64	#undecoded	#no-rule	GEN_OP_VEC_LOAD	QEMU	SETTLED	the five rows are RVV loads (vle8.v, vluxei8.v, vlse8.v, vluxseg4ei32.v) and the configured CPU model implements no V extension, so the decoder declined them
+x86_64	#undecoded	#no-rule	GEN_OP_NOP	QEMU	SETTLED	one row, hlt at CPL 3: every route above B1's identity statement goes to illegal_op or gp_fault, so an encoding the decoder refused reads NO-RULE by design
+aarch64	#undecoded	#no-rule	GEN_OP_SYSCALL	QEMU	SETTLED	the 36 rows are udf, which reaches no rule and states nothing -- D14's settled reading; the incumbent reads a permanently-undefined encoding as an exception-raising one, which is what it does and not what it is

@@ -13,7 +13,9 @@
 
 #ifdef CST_CAPTURE
 
+#include <elf.h>
 #include <glib.h>
+#include <link.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,100 @@ extern "C" {
 #include "champsim_tracer_vocabulary.h"
 
 namespace {
+
+/*
+ * Which build produced a corpus.
+ *
+ * Two corpora are only comparable if the same pair of binaries wrote them; a
+ * join across builds is the frozen-arm failure, and it does not announce
+ * itself -- the rows look like rows.  So every corpus carries the GNU build
+ * ids of the plugin and the emulator that wrote it, and the scorer refuses a
+ * set whose stamps disagree.
+ *
+ * The ids are read out of the loaded objects' own PT_NOTE segments rather
+ * than by hashing files, so the stamp names what is RUNNING and cannot be
+ * fooled by a rebuild between the run and the read.
+ */
+/*
+ * QEMU ships its own include/elf.h, and this plugin's include path reaches it
+ * before the system's, so the note type the build id lives under may not be
+ * spelled here.  Its value is fixed by the ELF note ABI.
+ */
+#ifndef NT_GNU_BUILD_ID
+#define NT_GNU_BUILD_ID  3
+#endif
+
+struct BuildIdScan {
+    const char *want;       /* substring of the object's path; NULL = the exe */
+    char out[2 * 64 + 1];
+    bool found;
+};
+
+int build_id_cb(struct dl_phdr_info *info, size_t, void *data)
+{
+    BuildIdScan *s = static_cast<BuildIdScan *>(data);
+    const char *nm = info->dlpi_name ? info->dlpi_name : "";
+
+    if (s->want ? !strstr(nm, s->want) : nm[0] != '\0') {
+        return 0;
+    }
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+
+        if (p->p_type != PT_NOTE) {
+            continue;
+        }
+
+        const unsigned char *base =
+            reinterpret_cast<const unsigned char *>(info->dlpi_addr +
+                                                    p->p_vaddr);
+        size_t off = 0;
+
+        while (off + sizeof(ElfW(Nhdr)) <= p->p_memsz) {
+            const ElfW(Nhdr) *n =
+                reinterpret_cast<const ElfW(Nhdr) *>(base + off);
+            const char *name = reinterpret_cast<const char *>(n + 1);
+            size_t namesz = (n->n_namesz + 3) & ~3u;
+            size_t descsz = (n->n_descsz + 3) & ~3u;
+
+            if (n->n_type == NT_GNU_BUILD_ID && n->n_namesz == 4 &&
+                memcmp(name, "GNU", 4) == 0) {
+                static const char hx[] = "0123456789abcdef";
+                const unsigned char *d =
+                    reinterpret_cast<const unsigned char *>(name + namesz);
+                size_t k = 0;
+
+                for (uint32_t j = 0;
+                     j < n->n_descsz && k + 2 < sizeof(s->out); j++) {
+                    s->out[k++] = hx[d[j] >> 4];
+                    s->out[k++] = hx[d[j] & 0xf];
+                }
+                s->out[k] = '\0';
+                s->found = true;
+                return 1;
+            }
+            off += sizeof(ElfW(Nhdr)) + namesz + descsz;
+        }
+    }
+    return 1;   /* the object matched and carries no build id */
+}
+
+const char *build_id_of(const char *want)
+{
+    BuildIdScan s = { want, { 0 }, false };
+
+    dl_iterate_phdr(build_id_cb, &s);
+    if (!s.found) {
+        return "none";
+    }
+
+    static char kept[2][sizeof(s.out)];
+    static unsigned next;
+    char *slot = kept[next++ % 2];
+
+    memcpy(slot, s.out, sizeof(s.out));
+    return slot;
+}
 
 /*
  * One corpus file.
@@ -59,6 +155,8 @@ public:
                     abort();
                 }
                 setvbuf(f_, nullptr, _IOFBF, 1 << 20);
+                fprintf(f_, "#so plugin=%s emulator=%s\n",
+                        build_id_of("champsim_tracer"), build_id_of(nullptr));
                 fputs(header_, f_);
             }
         }

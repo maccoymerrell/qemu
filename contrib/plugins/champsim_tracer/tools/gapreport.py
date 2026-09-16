@@ -31,8 +31,28 @@ class keyed on the opcode pair grows silently -- x86's bitmanip-versus-test
 class was one row when it was first ruled and thirty-six at a five-times
 larger corpus -- and a new rule joining an old class is a new arbitration
 that nobody has read.  The join refuses in both directions: --require-ruled
-fails on an unruled class, and a ruling naming a class the scored corpora do
-not contain is a dead rule and fails too.
+fails on an unruled class, and on a ruling whose RULE no longer exists.
+
+THE OTHER DIRECTION IS NOT A QUESTION ABOUT THE CORPORA, and asking it of
+them was a defect.  "This ruling reaches no class in the scored corpora" is
+a property of the sample: mipsel OPC_TGE flipped UNRULED -> DEAD between two
+corpora of one tree, because the Capstone side of the join is a strict subset
+of the QEMU side on every ISA and all 27 OPC_TGE encodings are ident-only, so
+the class cannot form at all.  Nothing about the ruling or the decoder moved.
+
+So an arbitration is judged against the RULE UNIVERSE -- every rule the
+build's decoders can state, read out of that build by rule_universe.py and
+stamped with its emulator's build-id -- and gets one of three dispositions:
+
+    ARBITRATED   a class in these corpora reached it
+    RESERVED     its rule exists in the build; this sample did not reach it
+    DEAD         its rule is not in the build's universe at all
+
+Only DEAD fails.  RESERVED is the honest name for a ruling about a rule that
+is gated on a CPU feature, a privilege level or an ASE this corpus never
+touched -- an arbitration written ahead of the encodings that need it, not a
+stale one.  --require-ruled therefore needs --universe: without it the DEAD
+column would be the sample verdict again.
 
 Refusals, because a scorer that reports on nothing is the failure this tree
 keeps relearning:
@@ -53,12 +73,34 @@ import collections
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rule_universe
+
 BUCKETS = ["AGREE", "DISAGREE", "NO-RULE", "NO-WORD", "UNKNOWN-WORD",
            "CAPSTONE-BLANK"]
 
 
 class Refusal(Exception):
     pass
+
+
+#: rule_universe raises its own Refusal type; one `except Refusal` in main()
+#: has to catch both, or a universe problem would traceback instead of being
+#: reported as the refusal it is.
+REFUSALS = (Refusal, rule_universe.Refusal)
+
+
+def emulator_of(stamp):
+    """The emulator build-id out of a corpus's `#so` stamp, or None.
+
+    The stamp is `plugin=<sha> emulator=<sha>`; the universe is keyed on the
+    emulator alone, because the rules are the EMULATOR's and a plugin rebuild
+    does not move one.
+    """
+    for field in (stamp or "").split():
+        if field.startswith("emulator="):
+            return field[len("emulator="):]
+    return None
 
 
 def read_corpus(path, ncols):
@@ -161,7 +203,7 @@ def classify(ident, opc):
     return ("AGREE" if q_op == c_op else "DISAGREE"), q_op, c_op
 
 
-def report(isa, ident_path, opc_path, top, out, rulings=None):
+def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
     i_stamp, ident = read_corpus(ident_path, 6)
     o_stamp, opc = read_corpus(opc_path, 4)
 
@@ -171,6 +213,21 @@ def report(isa, ident_path, opc_path, top, out, rulings=None):
                       "answers against another's"
                       % (isa, i_stamp or "<unstamped>", o_stamp or
                          "<unstamped>"))
+
+    if universe is not None:
+        u_stamp = universe[0]
+        c_emu = emulator_of(i_stamp)
+        if c_emu is None:
+            raise Refusal("%s: the corpus stamp names no emulator, so the "
+                          "rule universe cannot be proven to describe the "
+                          "build that wrote it (%s)"
+                          % (isa, i_stamp or "<unstamped>"))
+        if c_emu != u_stamp:
+            raise Refusal("%s: the rule universe is a DIFFERENT emulator's "
+                          "(%s) from the one that wrote this corpus (%s).  A "
+                          "rule this build dropped and that one kept would "
+                          "read as alive, which is the verdict being fixed"
+                          % (isa, u_stamp, c_emu))
 
     overlap = set(ident) & set(opc)
     if not overlap:
@@ -240,6 +297,26 @@ def report(isa, ident_path, opc_path, top, out, rulings=None):
     return counts, classes, unruled
 
 
+def dispose(rulings, scored, universes):
+    """The unreached rulings, split RESERVED vs DEAD against the universes.
+
+    A ruling a class reached is neither; it is ARBITRATED and report() has
+    already counted it.  Of what is left on a SCORED ISA, the build's own rule
+    set decides: a rule it can still state is RESERVED, and a rule it cannot
+    is DEAD.  The synthetic #undecoded rule belongs to no decoder and is
+    always reserved -- gapreport, not a target, mints that class.
+    """
+    reserved, dead = [], []
+    for k, r in sorted(rulings.items()):
+        if k[0] not in scored or r.used:
+            continue
+        if k[1] == rule_universe.SYNTHETIC or k[1] in universes.get(k[0], ()):
+            reserved.append(k)
+        else:
+            dead.append(k)
+    return reserved, dead
+
+
 STAMP = "#so plugin=aa emulator=bb"
 
 SELFTEST_CASES = [
@@ -284,11 +361,13 @@ RULING_ROW = ("q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tQEMU\tSETTLED\t"
 
 
 def selftest_rulings():
-    """Prove the arbitration join refuses in BOTH directions.
+    """Prove the arbitration join sees BOTH directions.
 
     A join that only ever agrees has not been seen to work, and the two ways
-    it can be wrong are opposite: a class nobody ruled, and a ruling that
-    reaches no class.
+    it can be wrong are opposite: a class nobody ruled, and a ruling nothing
+    reached.  What an unreached ruling MEANS is the universe's question and is
+    proven in selftest_universe(); this proves the join can tell the two
+    directions apart at all.
     """
     import tempfile
 
@@ -296,9 +375,9 @@ def selftest_rulings():
         # (name, ruling rows, capstone opcode, expect)
         ("ruled",   [RULING_ROW],                    "GEN_OP_INT_SUB", "ok"),
         ("unruled", [],                              "GEN_OP_INT_SUB", "unruled"),
-        ("dead",    [RULING_ROW,
+        ("unreached", [RULING_ROW,
                      "q\tsub\tGEN_OP_X\tGEN_OP_Y\tQEMU\tSETTLED\tno class"],
-                                                     "GEN_OP_INT_SUB", "dead"),
+                                                     "GEN_OP_INT_SUB", "unreached"),
         ("no-reason", ["q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tQEMU"
                        "\tSETTLED\t"],             "GEN_OP_INT_SUB", "REFUSED"),
         ("bad-verdict", ["q\tadd\tGEN_OP_INT_ADD\tGEN_OP_INT_SUB\tMAYBE"
@@ -325,7 +404,8 @@ def selftest_rulings():
                 rul = read_rulings(rp)
                 _c, _cl, unruled = report("q", ip, op, 0, sink, rul)
                 dead = [k for k, r in rul.items() if r.used == 0]
-                got = "unruled" if unruled else ("dead" if dead else "ok")
+                got = ("unruled" if unruled else
+                       "unreached" if dead else "ok")
             except Refusal:
                 got = "REFUSED"
             finally:
@@ -338,6 +418,74 @@ def selftest_rulings():
     print("gapreport ruling selftest: %d of %d arms fired as designed"
           % (len(cases) - bad, len(cases)))
     return 1 if bad else 0
+
+
+def selftest_universe():
+    """Prove the three dispositions, and the two refusals the universe adds.
+
+    The disposition is the whole point of the universe, so all three have to
+    be seen: a ruling a class reached, a ruling whose rule the build still has
+    and this sample did not reach, and a ruling naming a rule that is gone.
+    The last one is the only failure, and a run that could not tell the middle
+    one from the last is the reading this column replaced.
+    """
+    import tempfile
+
+    scored = {"q"}
+    uni = {"q": {"add": "decodetree:x.c.inc", "sub": "decodetree:x.c.inc"}}
+    cases = []
+
+    def arm(name, rows_used, rule, want):
+        r = Ruling("QEMU", "SETTLED", "planted")
+        r.used = rows_used
+        res, dead = dispose({("q", rule, "A", "B"): r}, scored, uni)
+        got = ("arbitrated" if not res and not dead
+               else "reserved" if res else "dead")
+        ok = got == want
+        print("  universe:%-16s %s" % (name, "ok" if ok else
+                                       "FAILED (%s)" % got))
+        cases.append(ok)
+
+    arm("reached", 5, "add", "arbitrated")
+    arm("unreached, rule lives", 0, "add", "reserved")
+    arm("unreached, rule gone", 0, "cachee", "dead")
+    arm("synthetic #undecoded", 0, rule_universe.SYNTHETIC, "reserved")
+
+    # An ISA that was not scored is judged by nobody, in either direction.
+    r = Ruling("QEMU", "SETTLED", "planted")
+    ok = dispose({("other", "gone", "A", "B"): r}, scored, uni) == ([], [])
+    print("  universe:%-16s %s" % ("unscored isa", "ok" if ok else "FAILED"))
+    cases.append(ok)
+
+    # And the stamp skew: a universe from a different emulator must refuse.
+    with tempfile.TemporaryDirectory() as d:
+        ip = os.path.join(d, "ident_q.tsv")
+        op = os.path.join(d, "opc_q.tsv")
+        with open(ip, "w") as f:
+            f.write(STAMP + "\n#h\nq\t01\tadd\tadd\tint.add\t"
+                    "GEN_OP_INT_ADD\tBRANCH_NONE\n")
+        with open(op, "w") as f:
+            f.write(STAMP + "\n#h\nq\t01\tadd\tGEN_OP_INT_ADD\n")
+        sink = open(os.devnull, "w")
+        try:
+            for name, u, want in (
+                    ("matching stamp", ("bb", uni["q"]), "ok"),
+                    ("skewed stamp", ("zz", uni["q"]), "REFUSED")):
+                try:
+                    report("q", ip, op, 0, sink, None, u)
+                    got = "ok"
+                except Refusal:
+                    got = "REFUSED"
+                ok = got == want
+                print("  universe:%-16s %s" % (name, "ok" if ok else
+                                               "FAILED (%s)" % got))
+                cases.append(ok)
+        finally:
+            sink.close()
+
+    print("gapreport universe selftest: %d of %d arms fired as designed"
+          % (sum(cases), len(cases)))
+    return 0 if all(cases) else 1
 
 
 def selftest():
@@ -403,11 +551,15 @@ def main():
                     help="the checked-in arbitrations to join against")
     ap.add_argument("--require-ruled", action="store_true",
                     help="fail unless every disagreement class is arbitrated, "
-                         "and unless every arbitration has a class")
+                         "and unless every arbitration names a rule the build "
+                         "still has")
+    ap.add_argument("--universe", default=None,
+                    help="directory of rules_<isa>.tsv from rule_universe.py: "
+                         "every rule the scored build's decoders can state")
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest() | selftest_rulings()
+        return selftest() | selftest_rulings() | selftest_universe()
 
     if not args.dir or not args.isa:
         print("gapreport: --dir and at least one --isa are required",
@@ -426,6 +578,15 @@ def main():
               file=sys.stderr)
         return 2
 
+    if args.require_ruled and not args.universe:
+        print("gapreport: --require-ruled needs --universe.  Without the set "
+              "of rules the build can state, the only available test for a "
+              "stale arbitration is whether this SAMPLE reached it -- and "
+              "that verdict moves with the sample in both directions, which "
+              "is the defect being fixed rather than the bar being met",
+              file=sys.stderr)
+        return 2
+
     rulings = None
     if args.rulings:
         try:
@@ -436,15 +597,26 @@ def main():
 
     bad = 0
     scored = set()
+    universes = {}
     for isa in args.isa:
+        u = None
+        if args.universe:
+            try:
+                u = rule_universe.read(
+                    os.path.join(args.universe, "rules_%s.tsv" % isa))
+            except REFUSALS as e:
+                print("gapreport: REFUSED: %s" % e, file=sys.stderr)
+                bad += 1
+                continue
+            universes[isa] = u[1]
         try:
             counts, _classes, unruled = report(
                 isa,
                 os.path.join(args.dir, "ident_%s.tsv" % isa),
                 os.path.join(args.dir, "opc_%s.tsv" % isa),
-                args.top, sys.stdout, rulings)
+                args.top, sys.stdout, rulings, u)
             scored.add(isa)
-        except Refusal as e:
+        except REFUSALS as e:
             print("gapreport: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
             continue
@@ -459,20 +631,38 @@ def main():
             bad += 1
 
     #
-    # The other direction.  A ruling that no scored corpus reaches is a dead
-    # rule: it was written for a class that has since moved or was never
-    # there, and an arbitration corpus nobody can falsify is the shape this
-    # tree keeps relearning.  Only the ISAs actually scored are judged, so a
-    # one-ISA run does not condemn the other three's rows.
+    # The other direction, asked of the BUILD rather than of the sample.
+    #
+    # An arbitration nobody can falsify is the shape this tree keeps
+    # relearning, so the corpus of rulings has to be falsifiable -- but the
+    # falsifier used to be "did any encoding in these corpora reach it", and
+    # that is a fact about the corpora.  mipsel OPC_TGE flipped UNRULED ->
+    # DEAD between two samples of one tree without the ruling or the decoder
+    # moving at all.
+    #
+    # The subject a sample cannot move is the rule universe: the set of rules
+    # the scored build's decoders can state, derived from that build.  So an
+    # unreached ruling whose rule the build still has is RESERVED -- written
+    # ahead of the encodings that need it, which is what an arbitration for a
+    # feature-gated, privilege-gated or ASE-gated rule looks like -- and only
+    # a ruling naming a rule the build no longer has is DEAD.
+    #
+    # Only ISAs actually scored are judged, so a one-ISA run does not condemn
+    # the other three's rows.
     #
     if args.require_ruled and rulings is not None:
-        dead = [k for k, r in rulings.items()
-                if k[0] in scored and r.used == 0]
-        for k in sorted(dead):
-            print("gapreport: dead ruling: %s %s %s vs %s reaches no class "
-                  "in the scored corpora" % k, file=sys.stderr)
+        reserved, dead = dispose(rulings, scored, universes)
+        for k in reserved:
+            print("gapreport: RESERVED ruling: %s %s %s vs %s -- the rule "
+                  "exists in this build; no encoding in this sample reached "
+                  "the class" % k)
+        for k in dead:
+            print("gapreport: DEAD ruling: %s %s %s vs %s -- rule %s is not "
+                  "in this build's decoders at all"
+                  % (k[0], k[1], k[2], k[3], k[1]), file=sys.stderr)
+        print("gapreport: rulings: %d RESERVED, %d DEAD"
+              % (len(reserved), len(dead)))
         if dead:
-            print("gapreport: %d dead ruling(s)" % len(dead), file=sys.stderr)
             bad += 1
 
     print("gapreport: %s" % ("FAIL" if bad else "PASS"))

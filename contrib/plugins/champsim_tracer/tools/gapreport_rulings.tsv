@@ -133,18 +133,36 @@ mipsel	OPC_TGEU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TEQI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TLT	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TGE	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
-# THE TRAP FAMILY IS TWELVE OPCODES AND ONLY THE FIVE ABOVE HAVE A CLASS.
-# target/mips/tcg/insn-df-words.tsv states `syscall` for all twelve --
-# OPC_TEQ, OPC_TEQI, OPC_TGE, OPC_TGEI, OPC_TGEIU, OPC_TGEU, OPC_TLT,
-# OPC_TLTI, OPC_TLTIU, OPC_TLTU, OPC_TNE, OPC_TNEI -- and the incumbent
-# names the comparison for every one, so each is the same disagreement on
-# the same merits.  The remaining seven are NOT ruled here: a ruling whose
-# class is empty is a dead rule and --require-ruled fails on it, which is
-# the refusal that keeps this corpus from growing rows nobody has read.
-# They are named so the next corpus that reaches one arrives at a written
-# precedent instead of a fresh question.  OPC_TGE was exactly that: it sat
-# latent behind four ruled siblings until a corpus reached its three
-# encodings.
+# THE TRAP FAMILY IS TWELVE OPCODES AND ALL TWELVE ARE RULED, five of them
+# because a corpus reached their class and seven because the family's merits
+# do not vary.  target/mips/tcg/insn-df-words.tsv states `syscall` for every
+# one, and the incumbent names the comparison for every one, so each is the
+# same disagreement decided the same way: the test selects, the raise is the
+# instruction.  The twelve differ only in WHICH comparison and whether the
+# right-hand side is a register or a sign-extended immediate, and neither
+# distinction bears on which of the two operations the encoding IS.
+#
+# THE SEVEN BELOW WERE WITHHELD UNTIL NOW, and the reason they were withheld
+# was a defect in the checker rather than a doubt about the merits: an
+# unreached ruling used to be reported DEAD and fail --require-ruled, so a
+# precedent written ahead of the encodings that need it could not be checked
+# in.  That test is now made against the build's rule universe instead of
+# against whichever encodings a sample happened to reach, and an unreached
+# ruling whose rule the decoder still has reports RESERVED.  All twelve
+# OPC_T* rules are in the mipsel universe, so none of these can read DEAD
+# while the decoder has them, and a corpus that reaches one arrives at a
+# written precedent instead of a fresh question.
+#
+# OPC_TGE is why this matters concretely: it sat latent behind four ruled
+# siblings, was reported UNRULED by one corpus and DEAD by another of the
+# same tree, and was neither.
+mipsel	OPC_TNE	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ, on the inverse test
+mipsel	OPC_TLTU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ, unsigned
+mipsel	OPC_TGEI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ; the right-hand side is a sign-extended immediate rather than a register, which is not a difference in what the instruction does
+mipsel	OPC_TGEIU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TGEI, unsigned
+mipsel	OPC_TLTI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TGEI, on the inverse test
+mipsel	OPC_TLTIU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TLTI, unsigned
+mipsel	OPC_TNEI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TGEI, on the inequality test
 mipsel	OPC_SRL	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: the encoding is 0x00000002, rd == $zero, so the shift has no architectural effect and MIPS's own no-op is a shift into $zero
 mipsel	OPC_SRA	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000003, rd == $zero, same reading as OPC_SRL
 mipsel	OPC_SRLV	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000006, rd == $zero, same reading as OPC_SRL

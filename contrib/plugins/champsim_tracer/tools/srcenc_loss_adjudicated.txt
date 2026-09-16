@@ -1,0 +1,14 @@
+# ADJUDICATED PER-ENCODING SOURCE LOSSES -- (isa, encoding, register) triples a
+# maintainer has ruled may leave the wire, one per line, each with its reason.
+#
+#     <isa> <encoding-hex> <REG_NAME>   # reason
+#
+# A row here is COUNTED, PRINTED and excluded from the bar.  A row whose
+# subject the measurement does not contain FAILS the gate: a ledger that
+# outlives its subject is how a gate quietly stops gating, so a loss that has
+# been fixed must be deleted from this file rather than left as a comment.
+#
+# EMPTY IS THE CORRECT STATE.  R12.1 is REAL-LOST = 0 hard, with no
+# pessimistic-direction discount, so nothing belongs here unless a ruling put
+# it there.  The twenty encodings PASS 44 measured are NOT adjudicated: they
+# are open defects with named mechanisms, not losses anyone ruled removable.

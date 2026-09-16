@@ -1,0 +1,747 @@
+#!/bin/bash
+# THE EIGHT isaxcheck ARMS UNDER THE WIRE'S OWN SOURCE LIST.
+#
+#   isax_srcenc_gate.sh run  <build-dir> <out-dir> <corpus-dir> [isa...]
+#   isax_srcenc_gate.sh bare <build-dir> <out-dir>              [isa...]
+#   isax_srcenc_gate.sh --selftest
+#
+# `run` scores the read classes against the corpus (`--srcenc`); `bare` is
+# the same eight arms without it, which is what the tree has always run.
+# A corpus directory carries one file per ISA named `<isa>.tsv`, written by
+# `CST_SRC_ENC_DUMP` through tools/srcenc_sled.py.
+#
+# WHY THIS EXISTS AS A GATE AND NOT AS A ONE-OFF INVOCATION.
+#
+# isaxcheck scores the tracer's READ side by decoding an encoding in the
+# tool's own process and asking the tracer's model about that decode.  The
+# wire's sources are no longer built that way -- they are QEMU's ordered
+# read list, stated at translation time inside the emulator, plus the
+# survivor rows for what QEMU does not state -- and neither is reachable
+# from a host tool.  With the operand walk's read arm removed the read
+# classes therefore do not go RED and do not go GREEN: their SUBJECT
+# vanishes.  Measured under exec72's banked deletion at 38373b47be, the
+# bare arms read
+#
+#     dead_allow_rules  1037 (x86_64 fields)   892 (aarch64 boundary)
+#                        947 (aarch64 fields)  877 (riscv64 fields)
+#                        252 (mipsel fields)
+#
+# and 10,398 new signatures, essentially all of the form `FR-rd-missing
+# <mnem> +<regs>` with `fieldsRD{-}` -- one defect reported ten thousand
+# times.  Under `run` with a corpus captured from the same build the dead
+# count is 0 on seven arms of eight, and the eighth's 25 dead rules are
+# memory rules, not read rules.  That is the difference between an
+# instrument measuring the tracer and an instrument measuring its own
+# plumbing.
+#
+# THE JOIN IS SEPARATED FROM THE DATAFLOW.  A corpus row is keyed on bytes
+# and the reference answer is LLVM's decode of those bytes; when the two
+# decoders read the bytes as DIFFERENT INSTRUCTIONS the resulting register
+# difference is a JOIN FAILURE, not a tracer finding, and scoring it as one
+# inflates the residue with rows no dataflow change can close.  Such rows are
+# separated into their own `JOINFAIL` family, counted by ordered mnemonic
+# pair, and reported on the `# srcenc_join` line beside the scored count --
+# never dropped.  See the --srcenc commentary in isaxcheck.cc for the test.
+#
+# REACH IS PRINTED AND UNREACHED RULES ARE NAMED.  An encoding the corpus
+# does not carry is scored by nothing; `ISAX_DUMP_UNREACHED` is exported so
+# every wholly unreached mnemonic is listed with its encoding count beside
+# the arm that could not see it.  isaxcheck itself exits 2 when a corpus
+# answers nothing at all, and rc=2 is never folded into rc=0 here: an arm
+# that reaches nothing must not report all-clear.
+#
+# rc=0 every arm green, rc=1 an arm failed, rc=2 the gate could not look --
+# and "could not look" includes ANY arm over an allowlist carrying rules in
+# the read family that arm does not score.  A bare arm never scores
+# `SR-rd-*`; a `--srcenc` arm never scores `R-rd-*`/`FR-rd-*`.  Neither shape
+# is a whole gate on its own, and each is told so from its own
+# `unscored_family=` token.  See the NOT-A-FULL-GATE roll-up in run_arms(),
+# FINDING 65-D (the bare side) and FINDING 66V-D (the `--srcenc` side).
+#
+# Author: Maccoy Merrell.
+set -u
+
+ALL_ISAS="x86_64 aarch64 riscv64 mipsel"
+
+usage() {
+    sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+}
+
+# One arm.  $1 layer tag, $2 isa, $3 build, $4 out, $5 corpus file or "",
+# $6 refused-set file or "", $7 (signature, encoding) pair file or "".
+#
+# THE PAIR FILE IS THE OTHER ARM'S OUTPUT (FINDING 94-A).  `--refused` says
+# which encodings QEMU refuses AT THIS BUILD; the pair file says which
+# encodings made each signature AT THE BASE BUILD, and the join of the two
+# is the only way to see a rule whose MNEMONIC survived a flip while its
+# SIGNATURE did not.  So the two files are stamped for DIFFERENT builds on
+# purpose, and `--sig-enc-so` is the caller naming which -- ISAX_SIGENC_SO
+# here, set by whoever captured the pairs.  isaxcheck refuses without it.
+arm() {
+    local layer=$1 isa=$2 build=$3 out=$4 corpus=$5 refused=${6:-} pairs=${7:-}
+    local ident=${8:-}
+    local tools; tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    local se=() extra=()
+    [ -n "$corpus" ] && se=(--srcenc="$corpus")
+    [ -n "$refused" ] && se+=(--refused="$refused")
+    # THE CLASSIFICATION SUBJECT (FINDING 98-F).  The fields layer asks the
+    # plugin what it makes of an encoding and the plugin answers from QEMU's
+    # decode identity; a host tool has no decode_id of its own, so without
+    # this file every encoding is unclassified.  isaxcheck REFUSES the fields
+    # layer without it rather than scoring a layer that never looked.
+    [ -n "$ident" ] && se+=(--ident="$ident")
+    [ -n "$pairs" ] && se+=(--sig-enc="$pairs" --sig-enc-so="${ISAX_SIGENC_SO:-}")
+    # THE BASE-ARM CAPTURE.  Same sweep, one extra output: the pairs behind
+    # every signature an allowlist rule could name.  Written per shard and
+    # merged below, because the sweep forks.
+    [ -n "${ISAX_SIGENC_DUMP:-}" ] && \
+        se+=(--dump-sig-enc="$ISAX_SIGENC_DUMP/${layer}_$isa.pairs")
+    local allow
+    if [ "$layer" = fields ]; then
+        allow=$tools/isaxcheck_fields_allow.txt
+        extra=(--layer=fields --classes=MBR)
+    else
+        allow=$tools/isaxcheck_allow.txt
+    fi
+    "$build/contrib/plugins/isaxcheck" --isa="$isa" --check \
+        --jobs="${ISAX_JOBS:-12}" "${se[@]}" "${extra[@]}" \
+        --allow="$allow" > "$out/${layer:0:1}_$isa.txt" 2>&1
+    local r=$?
+    if [ -n "${ISAX_SIGENC_DUMP:-}" ]; then
+        # MERGE THE SHARDS, STAMP, AND COUNT.  The `#so` names the build the
+        # pairs describe and `#sigenc` the number of rows, so a truncated or
+        # appended file is a refusal on the consuming side rather than a
+        # quieter join.  A capture that produced no pairs is left EMPTY of
+        # rows with the count 0 -- isaxcheck refuses such a file, which is
+        # the right answer: a signature population that saw nothing cannot
+        # supersede anything.
+        local d=$ISAX_SIGENC_DUMP m=$ISAX_SIGENC_DUMP/$isa.$layer.sigenc.tsv
+        local bso; bso=$(sha256sum \
+            "$build/contrib/plugins/libchampsim_tracer.so" | cut -c1-16)
+        cat "$d/${layer}_$isa.pairs".* 2>/dev/null | sort -u > "$d/.merge.$$"
+        { printf '#so\t%s\n' "$bso"
+          printf '#sigenc\t%s\n' "$(wc -l < "$d/.merge.$$")"
+          cat "$d/.merge.$$"; } > "$m"
+        rm -f "$d/.merge.$$" "$d/${layer}_$isa.pairs".*
+        echo "sigenc-dump $isa $layer so=$bso pairs=$(grep -vc '^#' "$m")" \
+             "signatures=$(grep -v '^#' "$m" | cut -f1 | sort -u | wc -l)" \
+             >> "$out/rc.txt"
+    fi
+    return $r
+}
+
+run_arms() {
+    local build=$1 out=$2 corpusdir=$3; shift 3
+    local isas="${*:-$ALL_ISAS}"
+    [ -x "$build/contrib/plugins/isaxcheck" ] || {
+        echo "isax_srcenc_gate: REFUSED -- no isaxcheck in $build" >&2; return 2; }
+    mkdir -p "$out" || return 2
+    export ISAX_DUMP_UNREACHED=1
+    : > "$out/rc.txt"
+    {
+      echo "SO_SHA=$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" | cut -c1-16)"
+      echo "ISAX_SHA=$(sha256sum "$build/contrib/plugins/isaxcheck" | cut -c1-16)"
+      echo "CORPUS_DIR=${corpusdir:-<none>}"
+    } >> "$out/rc.txt"
+    local worst=0 partial=0 skipped_fields=0 isa layer corpus refused r
+    for isa in $isas; do
+        corpus=""; refused=""
+        if [ -n "$corpusdir" ]; then
+            corpus=$corpusdir/$isa.tsv
+            if [ ! -f "$corpus" ]; then
+                echo "REFUSED $isa -- no corpus file $corpus" >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            echo "corpus $isa md5=$(md5sum "$corpus" | cut -d' ' -f1)" \
+                 "rows=$(grep -vc '^#' "$corpus")" >> "$out/rc.txt"
+            #
+            # THE CORPUS MUST DESCRIBE THE BUILD BEING SCORED (FINDING 92-C).
+            #
+            # A `--srcenc` corpus IS the wire's published source list, read
+            # out of a running emulator.  Scored against a DIFFERENT build,
+            # this gate reads the corpus's own answers back to itself and
+            # reports whatever the corpus already said -- it cannot see a
+            # regression that happened between the capture and the binary.
+            # That is not hypothetical: 5d9154d8c2's in-commit leg record
+            # reads `isaxunallowed srcenc 12` because the corpus it scored
+            # was captured at the PARENT, and 6,000 x86 encodings had lost
+            # their whole published source list in between.  Its own
+            # descendant read 26.
+            #
+            # `#tip` cannot decide this.  Legs run on a working tree whose
+            # HEAD is still the parent, so a stale corpus and a fresh one
+            # carry the SAME sha.  The binding is the PLUGIN BINARY the sled
+            # ran -- srcenc_sled.py stamps its sha256 prefix as `#so` -- and
+            # it is compared here against the plugin this build ships.
+            #
+            # UNSTAMPED IS A REFUSAL, not a pass.  A corpus captured before
+            # the stamp existed cannot be shown to describe this build, and
+            # a check that cannot find its subject must fail rather than
+            # report all-clear.  Re-capture it; the sled is the same run.
+            # AND THE SLED RUNS TWO BINARIES, NOT ONE (FINDING 98-B).  Every
+            # corpus row is the plugin's callback reading facts the EMULATOR
+            # exported, so a `target/<isa>/` change moves the rows while
+            # leaving the plugin byte-identical -- measured at cf6bf3b64f,
+            # where 1,459 x86_64 encodings left the corpus with `#so`'s
+            # plugin field unchanged in both arms.  The stamp names both and
+            # this compares both; the plugin stays field 1 of the stamp so a
+            # reader of that field reads what it always read.
+            local cso bso cplug cemu
+            cso=$(sed -n 's/^#so\t//p' "$corpus" | head -1)
+            cplug=${cso%%$'\t'*}
+            cemu=${cso#*$'\t'}
+            [ "$cemu" = "$cso" ] && cemu=""
+            bso="$(sha256sum "$build/contrib/plugins/libchampsim_tracer.so" \
+                     | cut -c1-16)"$'\t'"$(sha256sum "$build/qemu-$isa" \
+                     | cut -c1-16)"
+            if [ -z "$cso" ]; then
+                echo "REFUSED $isa -- corpus $corpus carries no #so stamp;" \
+                     "it cannot be shown to describe this build" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            if [ -z "$cemu" ]; then
+                echo "REFUSED $isa -- corpus #so=$cplug names only the" \
+                     "plugin; it was captured before the emulator stamp" \
+                     "existed and cannot be shown to describe THIS" \
+                     "emulator.  Re-capture it (FINDING 98-B)" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            if [ "$cso" != "$bso" ]; then
+                echo "REFUSED $isa -- corpus #so=$cso but this build is" \
+                     "$bso (plugin<TAB>emulator); the corpus describes a" \
+                     "DIFFERENT build and scoring it would report that" \
+                     "build's answers as this one's" >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            echo "corpus $isa so=$cso MATCHES the scored plugin" \
+                 >> "$out/rc.txt"
+            #
+            # THE REFUSED SET (FINDING 93-A), WHICH IS WHAT MAKES A DEAD
+            # ROW READABLE.
+            #
+            # A corpus is silent about every encoding it does not carry, and
+            # the silence has two causes: QEMU's admission gate refused the
+            # encoding (it publishes nothing, so the read comparison has no
+            # subject), or the sweep produced no row for a reason nothing
+            # recorded.  An allow rule whose every subject encoding is in
+            # the first set is NOT dead -- and retiring it as dead writes a
+            # false reason on a rule that is right.  Measured at the
+            # poison-gate flip: 1,692 rules on three ISAs, every one of them
+            # live.
+            #
+            # srcenc_sled.py writes the set beside the corpus; the sweep
+            # assembles it as `<isa>.refused.tsv`, carrying the same `#so`.
+            # THE ASSEMBLER IS `srcenc_sweep.sh`, IN THIS DIRECTORY, and it
+            # is in the tree for FINDING 97-A's reason: the assembly used to
+            # be a per-run copy of a script nobody could change from here,
+            # and it silently dropped a silence category the sled and this
+            # gate had both been taught to carry.
+            # The stamp is checked HERE as well as inside isaxcheck, because
+            # a set from another build describes another admission gate and
+            # the failure is silent: rules it cannot excuse just read DEAD.
+            refused=$corpusdir/$isa.refused.tsv
+            if [ ! -f "$refused" ]; then
+                echo "NO REFUSED SET for $isa ($refused absent) --" \
+                     "superseded-by-refusal cannot be told from dead in" \
+                     "these arms" >> "$out/rc.txt"
+                refused=""
+            else
+                local rso
+                rso=$(sed -n 's/^#so\t//p' "$refused" | head -1)
+                if [ "$rso" != "$cso" ]; then
+                    echo "REFUSED $isa -- refused set $refused is stamped" \
+                         "#so=${rso:-<none>} but the corpus is #so=$cso;" \
+                         "two builds do not describe one admission gate" \
+                         >> "$out/rc.txt"
+                    worst=2; continue
+                fi
+                # BOTH SILENCES, COUNTED SEPARATELY.  The file carries
+                # REFUSED (QEMU's admission gate) and UNATTRIBUTED (a
+                # population encoding with no row and no recorded cause),
+                # and they mean opposite things to a rule: one excuses it,
+                # the other is the reason it may not be excused.  A single
+                # `rows=` would report mipsel -- 0 refused, 9,216
+                # unattributed -- as though the gate had refused 9,216
+                # encodings.
+                # THE THIRD SILENCE IS COUNTED APART TOO (FINDING 96-A).
+                # `DECODED-AT-ANOTHER-LENGTH` is neither: the slot WAS
+                # translated and DID produce a row, under the bytes the
+                # decoder consumed rather than the bytes the sweep planted.
+                # Folded into `unattributed` it would read as a hole nobody
+                # explained; folded into `refused` it would excuse rules
+                # nothing refused the subject of.
+                local nref nuna nelse
+                nref=$(grep -v '^#' "$refused" | awk -F'\t' \
+                       '$3=="REFUSED"' | wc -l)
+                nuna=$(grep -v '^#' "$refused" | awk -F'\t' \
+                       '$3=="UNATTRIBUTED"' | wc -l)
+                nelse=$(grep -v '^#' "$refused" | awk -F'\t' \
+                        '$3=="DECODED-AT-ANOTHER-LENGTH"' | wc -l)
+                echo "refused-set $isa so=$rso refused=$nref" \
+                     "unattributed=$nuna decoded_at_another_length=$nelse" \
+                     >> "$out/rc.txt"
+            fi
+        fi
+        #
+        # THE IDENTITY CORPUS, AND WHY THE BARE ARMS LOSE THE FIELDS LAYER
+        # (FINDING 98-F).
+        #
+        # Until 2fdabefe79 the fields layer answered from
+        # `active_insn_table[insn_id]` -- the Capstone-enum classification
+        # table -- because `cap_disas_raw_detail()` leaves decode_id 0 and
+        # the identity route therefore never spoke in this process.  Every
+        # opcode, branch class and lane pair this gate scored was Capstone's.
+        # R14 deleted that table, so the layer now has no subject unless the
+        # decode identity is handed to it from a real translation.
+        #
+        # `<isa>.ident.tsv` is srcenc_sweep.sh's assembly of the sled's
+        # MECHANISM corpus: one decode_id per encoding, captured inside the
+        # emulator, stamped with the same `#so` as the read-list corpus and
+        # checked against it here for the same reason the refused set is.
+        #
+        # A BARE ARM HAS NO CORPUS, so it has no identity either, and the
+        # fields layer is SKIPPED there with the reason written down --
+        # not run to a uniform GEN_OP_UNKNOWN, which is what turned this
+        # gate from 20/20 into 8-of-20 while nothing about the wire moved.
+        local ident=""
+        if [ -n "$corpusdir" ]; then
+            ident=$corpusdir/$isa.ident.tsv
+            if [ ! -f "$ident" ]; then
+                echo "REFUSED $isa -- no identity corpus $ident; the fields" \
+                     "layer cannot classify without QEMU's decode_id" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            local iso
+            iso=$(sed -n 's/^#so\t//p' "$ident" | head -1)
+            if [ "$iso" != "$cso" ]; then
+                echo "REFUSED $isa -- identity corpus $ident is stamped" \
+                     "#so=${iso:-<none>} but the corpus is #so=$cso; a" \
+                     "decode id names a rule in ONE build's decodetree" \
+                     >> "$out/rc.txt"
+                worst=2; continue
+            fi
+            echo "ident $isa so=$iso rows=$(grep -vc '^#' "$ident")" \
+                 >> "$out/rc.txt"
+        fi
+        for layer in boundary fields; do
+            if [ "$layer" = fields ] && [ -z "$ident" ]; then
+                echo "SKIP     fields   $isa -- no identity corpus in this" \
+                     "arm shape; the fields layer's classification comes" \
+                     "from QEMU's decode_id and a bare arm has none" \
+                     >> "$out/rc.txt"
+                #
+                # NOT `partial`.  `partial` is an arm that scored PART of
+                # its allowlist without saying so, and it rolls up rc=2
+                # because a silent hole is the defect 65-D cost.  This hole
+                # is not silent: the layer is not run, the reason is on the
+                # line above, and the count below is on the roll-up line so
+                # a bare rc=0 cannot be read as a whole-gate green.
+                skipped_fields=$((skipped_fields + 1))
+                continue
+            fi
+            # THE BASE ARM'S PAIRS FOR THIS (isa, layer), IF ONE WAS HANDED
+            # OVER.  Absent is not a failure -- the per-MNEMONIC category
+            # still runs and the finer one simply has no input, which the
+            # summary line reports as superseded_by_sig=0 rather than as a
+            # zero it earned.  A file present WITHOUT ISAX_SIGENC_SO is a
+            # refusal, and isaxcheck makes it: the caller must name the
+            # build the pairs describe, because the corpus's own stamp is
+            # the WRONG build to check them against.
+            local pairs=""
+            if [ -n "$corpusdir" ] && [ -n "$refused" ] \
+               && [ -f "$corpusdir/$isa.$layer.sigenc.tsv" ]; then
+                pairs=$corpusdir/$isa.$layer.sigenc.tsv
+                echo "sig-enc $isa $layer $(sed -n 's/^#sigenc\t/pairs=/p' \
+                     "$pairs" | head -1) so=$(sed -n 's/^#so\t//p' "$pairs" \
+                     | head -1) named=${ISAX_SIGENC_SO:-<unset>}" \
+                     >> "$out/rc.txt"
+            fi
+            arm "$layer" "$isa" "$build" "$out" "$corpus" "$refused" \
+                "$pairs" "$ident"
+            r=$?
+            printf '%-8s %-8s rc=%d\n' "$layer" "$isa" "$r" >> "$out/rc.txt"
+            # rc=2 dominates rc=1: "could not look" is never a mere failure.
+            [ "$r" = 2 ] && worst=2
+            [ "$r" = 1 ] && [ "$worst" = 0 ] && worst=1
+            # THE ARM'S OWN SUMMARY LINE GOES IN THE ROLL-UP, and it is not
+            # decoration: `dead_allow_rules=` lives on it, and FINDING 72-F
+            # is what a detector nobody reads costs.  isaxcheck itself has
+            # exited 1 on a dead rule since the detector landed, so the ARM
+            # goes red -- but the R13 gate scored `rc=` on the BARE half
+            # alone, the dead row was in a `--srcenc` arm, and the gate
+            # passed 17 of 17 at a tip with a dead row in the allowlist.  It
+            # was right to: the population it scored did not contain it.
+            # Copying the line here is what lets the gate score the fact
+            # rather than the exit code, on both arm shapes.
+            grep -hE '^# isa=|^# srcenc=|^# srcenc_join ' \
+                "$out/${layer:0:1}_$isa.txt" >> "$out/rc.txt" 2>/dev/null
+            # THE PARTIALITY OF AN ARM IS STATED, NOT INFERRED, AND IT IS
+            # NOT A PROPERTY OF ONE ARM SHAPE.
+            #
+            # isaxcheck exempts from its dead-rule detector whichever read
+            # family the arm it is running does not score -- correct, and
+            # silent.  FINDING 65-D found that on the BARE side: two mipsel
+            # `SR-rd-phantom` rows landed DEAD, the eight standing bare arms
+            # all reported `dead_allow_rules=0`, and exec110's table quoted
+            # that eight times.
+            #
+            # FINDING 66V-D IS THE SAME DEFECT FROM THE OTHER SIDE, and it
+            # got in because this test read `[ -z "$corpus" ]`.  A `--srcenc`
+            # arm does not score `R-rd-*`/`FR-rd-*`; dff6fe3242 measured a
+            # dead-rule closure on one and reported `4 -> 1 -> 0` while two
+            # `FR-rd-missing ud1 +REG_SEG{0,1}` rows sat dead in the same
+            # allowlist, where the bare arm named them.  A gate that protects
+            # one arm shape from its own blind spot and not the other has
+            # simply moved the blind spot.
+            #
+            # So the test is the TOOL's answer, not the script's model of the
+            # arm: any arm reporting `superseded_allow_rules>0` is partial,
+            # and the family it did not score is quoted from that arm's own
+            # `unscored_family=` token.  No arm shape is assumed to be whole;
+            # covering the allowlist takes both.
+            local sup fam
+            sup=$(sed -n 's/.*superseded_allow_rules=\([0-9]*\).*/\1/p' \
+                  "$out/${layer:0:1}_$isa.txt" | head -1)
+            fam=$(sed -n 's/.*unscored_family=\([^ ]*\).*/\1/p' \
+                  "$out/${layer:0:1}_$isa.txt" | head -1)
+            if [ -n "${sup:-}" ] && [ "${sup:-0}" -gt 0 ]; then
+                echo "  NOT-A-FULL-GATE $layer $isa: $sup allowlist rule(s)" \
+                     "in ${fam:-<unnamed>} are UNSCORED by this arm -- their" \
+                     "dead/live state is unknown here.  Score them on the" \
+                     "other arm: a bare arm and a \`run <build> <out>" \
+                     "<corpus>\` arm are partial in COMPLEMENTARY families." \
+                     >> "$out/rc.txt"
+                partial=$((partial+1))
+            fi
+            # A DEAD ROW WITH NO REFUSED SET IS AN UNREAD ROW (93-A).
+            #
+            # `dead_allow_rules` is the count this gate acts on: it is what
+            # takes an arm red, and what a wave then RETIRES from the
+            # allowlist.  Without the refused set the tool cannot separate a
+            # rule whose disagreement is gone from one whose encodings QEMU
+            # now refuses, so a nonzero count is not a finding -- it is an
+            # unanswered question, and answering it by deletion is how a
+            # correct rule gets a false reason written next to it.
+            #
+            # So: dead=0 without a refused set costs nothing and is not
+            # flagged; dead>0 without one is the gate's own "could not
+            # look".  The tool states which case it is on its summary line
+            # (`refused_encodings=-` means the question was never asked),
+            # and this reads the tool's answer rather than modelling it.
+            local dcnt rcnt
+            dcnt=$(sed -n 's/.*dead_allow_rules=\([0-9]*\).*/\1/p' \
+                   "$out/${layer:0:1}_$isa.txt" | head -1)
+            rcnt=$(sed -n 's/.*refused_reach=\([^ ]*\).*/\1/p' \
+                   "$out/${layer:0:1}_$isa.txt" | head -1)
+            if [ "${dcnt:-0}" -gt 0 ] 2>/dev/null && [ "${rcnt:-'-'}" = "-" ]
+            then
+                echo "  UNREADABLE-DEAD $layer $isa: $dcnt rule(s) report" \
+                     "DEAD and this arm has NO refused set, so a rule whose" \
+                     "encodings QEMU refuses is indistinguishable from a" \
+                     "stale one.  Capture the corpus with a sled that" \
+                     "writes refused_<isa>.tsv." >> "$out/rc.txt"
+                partial=$((partial+1))
+            fi
+            # Only a --srcenc arm has a reach to report.  `grep -c` exits 1
+            # on zero matches, so its status is discarded rather than turned
+            # into a second count by an `|| echo`.
+            if [ -n "$corpus" ]; then
+                local u
+                u=$(grep -c '^UNREACHED' "$out/${layer:0:1}_$isa.txt" 2>/dev/null) || true
+                echo "  unreached_mnemonics_named=${u:-0} (UNREACHED lines in" \
+                     "${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
+                # The join census is bounded by DISTINCT mnemonic pairs, so
+                # its line count is a number worth carrying beside the reach.
+                local j
+                j=$(grep -c '^JOINFAIL' "$out/${layer:0:1}_$isa.txt" 2>/dev/null) || true
+                echo "  joinfail_pairs_named=${j:-0} (JOINFAIL lines in" \
+                     "${layer:0:1}_$isa.txt)" >> "$out/rc.txt"
+            fi
+        done
+    done
+    echo "ALL_ARMS_DONE worst_rc=$worst unscored_arms=$partial" >> "$out/rc.txt"
+    # An arm that could not look at part of its allowlist is the gate's own
+    # rc=2 case -- "could not look" -- not a pass.  Rolling it up as rc=0 is
+    # what let 65-D's two rows through a gate built to catch them.
+    [ "$partial" -gt 0 ] && [ "$worst" = 0 ] && worst=2
+    # THE LAYERS THIS ARM SHAPE DID NOT RUN, on the line a reader reads.
+    # An arm shape that skips a whole layer is not a whole gate, and the
+    # count says so next to the roll-up rather than three screens above it.
+    echo "roll-up: fields_layer_skipped=$skipped_fields (no identity corpus"\
+         " in this arm shape) worst=$worst" >> "$out/rc.txt"
+    cat "$out/rc.txt"
+    return $worst
+}
+
+# The gate's own proof that it can refuse.  It does not run isaxcheck: the
+# arms take minutes each and what is under test here is this script's
+# refusal and roll-up, which is where a gate silently turns 2 into 0.
+selftest() {
+    local t f=0
+    t=$(mktemp -d) || return 2
+    run_arms "$t/nobuild" "$t/o1" "" >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  A a build dir with no isaxcheck REFUSES (rc=2)" \
+               || { echo "FAIL  A"; f=$((f+1)); }
+    mkdir -p "$t/b/contrib/plugins"
+    printf '#!/bin/sh\nexit 0\n' > "$t/b/contrib/plugins/isaxcheck"
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    : > "$t/b/contrib/plugins/libchampsim_tracer.so"
+    # The fixture build has an EMULATOR too, because a build is two binaries
+    # (98-B) and the stamp names both.  Its content differs from the
+    # plugin's so the two shas cannot coincide and hide a field mix-up.
+    printf 'fixture-emulator\n' > "$t/b/qemu-x86_64"
+    mkdir -p "$t/corpus_empty"
+    run_arms "$t/b" "$t/o2" "$t/corpus_empty" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  B a corpus with no file for the ISA REFUSES (rc=2)" \
+               || { echo "FAIL  B"; f=$((f+1)); }
+    grep -q '^REFUSED x86_64' "$t/o2/rc.txt" \
+        && echo "PASS  B2 and the missing corpus file is NAMED" \
+        || { echo "FAIL  B2"; f=$((f+1)); }
+    #
+    # THE FIXTURE CORPUS CARRIES THE STAMP OF THE FIXTURE PLUGIN, because
+    # that is what a real corpus carries and the check below is the point.
+    # `so_of` is the same expression run_arms uses, so the two cannot drift.
+    #
+    # TWO BINARIES, NOT ONE (FINDING 98-B): the sled launches `qemu-<isa>`
+    # with the plugin loaded into it, so the stamp names both and the
+    # fixture's stamp must be the same shape a real capture carries.
+    local so_of
+    so_of="$(sha256sum "$t/b/contrib/plugins/libchampsim_tracer.so" \
+               | cut -c1-16)"$'\t'"$(sha256sum "$t/b/qemu-x86_64" \
+               | cut -c1-16)"
+    mkdir -p "$t/corpus_ok"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_ok/x86_64.tsv"
+    # The identity corpus a real capture puts beside it (98-F), same stamp.
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf '#isa\tencoding\tmnem\tdecode_id\n'
+      printf 'x86_64\t90\tnop\t0000002a\n'; } > "$t/corpus_ok/x86_64.ident.tsv"
+    #
+    # T -- FINDING 98-F.  A corpus dir with no identity file REFUSES: the
+    # fields layer's classification comes from QEMU's decode_id, and an arm
+    # that runs it without one scores a layer that never looked.  Taken
+    # BEFORE the green arm so the fixture's own completeness is the subject.
+    mkdir -p "$t/corpus_noident"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_noident/x86_64.tsv"
+    run_arms "$t/b" "$t/oT" "$t/corpus_noident" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  T a corpus with no identity file REFUSES (rc=2)" \
+               || { echo "FAIL  T"; f=$((f+1)); }
+    grep -q 'no identity corpus' "$t/oT/rc.txt" \
+        && echo "PASS  T2 and it says the fields layer needs the decode_id" \
+        || { echo "FAIL  T2"; f=$((f+1)); }
+    #
+    # U -- the identity file stamped for ANOTHER build REFUSES.  A decode id
+    # names a rule in one decodetree; joined across builds it classifies an
+    # encoding through a rule this binary does not have, silently.
+    mkdir -p "$t/corpus_identstale"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_identstale/x86_64.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t0123456789abcdef\tfedcba9876543210\n'
+      printf '#isa\tencoding\tmnem\tdecode_id\n'
+      printf 'x86_64\t90\tnop\t0000002a\n'
+    } > "$t/corpus_identstale/x86_64.ident.tsv"
+    run_arms "$t/b" "$t/oU" "$t/corpus_identstale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  U an identity stamped for ANOTHER build REFUSES" \
+               || { echo "FAIL  U"; f=$((f+1)); }
+    run_arms "$t/b" "$t/o3" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 0 ] && echo "PASS  C a green arm rolls up rc=0" \
+               || { echo "FAIL  C"; f=$((f+1)); }
+    #
+    # V -- the BARE arm shape.  No corpus means no identity, so the fields
+    # layer is not run; the boundary arms still are, and the roll-up says
+    # which layer was skipped rather than leaving a reader to assume both
+    # ran.  Both halves are asserted: the SKIP line and the count.
+    run_arms "$t/b" "$t/oV" "" x86_64 >/dev/null 2>&1
+    grep -q '^SKIP     fields   x86_64' "$t/oV/rc.txt" \
+        && echo "PASS  V a bare arm SKIPS the fields layer, with its reason" \
+        || { echo "FAIL  V"; f=$((f+1)); }
+    grep -q 'fields_layer_skipped=1' "$t/oV/rc.txt" \
+        && echo "PASS  V2 and the roll-up line carries the skipped count" \
+        || { echo "FAIL  V2"; f=$((f+1)); }
+    #
+    # M/N -- FINDING 92-C, BOTH DIRECTIONS.  A corpus is the wire's own
+    # source list; scored against a different build it reports that build's
+    # answers as this one's, which is how a leg record came to read 12 on a
+    # tree whose answer was 26.  So a stamp that disagrees REFUSES, and a
+    # corpus with no stamp REFUSES too -- "cannot be shown to describe this
+    # build" is not a pass.
+    #
+    mkdir -p "$t/corpus_stale"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t0123456789abcdef\tfedcba9876543210\n'
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_stale/x86_64.tsv"
+    run_arms "$t/b" "$t/oM" "$t/corpus_stale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  M a corpus stamped for ANOTHER build REFUSES (rc=2)" \
+               || { echo "FAIL  M"; f=$((f+1)); }
+    grep -q 'describes a DIFFERENT' "$t/oM/rc.txt" \
+        && echo "PASS  M2 and it says WHICH build the corpus describes" \
+        || { echo "FAIL  M2"; f=$((f+1)); }
+    mkdir -p "$t/corpus_unstamped"
+    printf 'x86_64\t90\tnop\t-\n' > "$t/corpus_unstamped/x86_64.tsv"
+    run_arms "$t/b" "$t/oN" "$t/corpus_unstamped" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  N an UNSTAMPED corpus REFUSES (rc=2), never passes" \
+               || { echo "FAIL  N"; f=$((f+1)); }
+    grep -q 'carries no #so stamp' "$t/oN/rc.txt" \
+        && echo "PASS  N2 and the reason names the missing stamp" \
+        || { echo "FAIL  N2"; f=$((f+1)); }
+    #
+    # N3 -- FINDING 98-B.  A corpus stamped with the PLUGIN ALONE was
+    # captured before the emulator stamp existed.  Its plugin field can
+    # match this build exactly while the emulator that wrote every row was
+    # a different binary -- which is the shape a `target/<isa>/` change
+    # makes, and the shape the one-field stamp could not see.  Half a
+    # binding is not a binding: REFUSE by name.
+    #
+    mkdir -p "$t/corpus_oldso"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\t%s\n' "${so_of%%$'\t'*}"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_oldso/x86_64.tsv"
+    run_arms "$t/b" "$t/oN3" "$t/corpus_oldso" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  N3 a PLUGIN-ONLY stamp REFUSES (rc=2)" \
+               || { echo "FAIL  N3"; f=$((f+1)); }
+    grep -q 'names only the plugin' "$t/oN3/rc.txt" \
+        && echo "PASS  N3b and the reason names the missing emulator half" \
+        || { echo "FAIL  N3b"; f=$((f+1)); }
+    #
+    # P/Q/R -- FINDING 93-A, the refused set, all three directions.
+    #
+    # P   a refused set stamped for ANOTHER build REFUSES.  It describes a
+    #     different admission gate, and the failure would otherwise be
+    #     silent: rules it cannot excuse simply read DEAD again.
+    # Q   an arm reporting DEAD rules with NO refused set is PARTIAL.  The
+    #     count is what a wave acts on, and without the set a live rule and
+    #     a stale one are the same number.
+    # R   the same arm WITH a refused set is not flagged -- the question was
+    #     asked, so the answer may be acted on.
+    #
+    mkdir -p "$t/corpus_rstale"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf 'x86_64\t90\tnop\t-\n'; } > "$t/corpus_rstale/x86_64.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'
+      printf '#so\tfeedfacefeedface\tfeedfacefeedfacf\n'
+      printf '#refused\tisa=x86_64\tencodings=1\n'
+      printf 'x86_64\t0f01c6\n'; } > "$t/corpus_rstale/x86_64.refused.tsv"
+    run_arms "$t/b" "$t/oP" "$t/corpus_rstale" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  P a refused set from ANOTHER build REFUSES (rc=2)" \
+               || { echo "FAIL  P"; f=$((f+1)); }
+    grep -q 'do not describe one admission gate' "$t/oP/rc.txt" \
+        && echo "PASS  P2 and the reason names both stamps" \
+        || { echo "FAIL  P2"; f=$((f+1)); }
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+r=-
+case "$*" in *--refused=*) r=7 ;; esac
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=3 \
+superseded_allow_rules=0 superseded_by_refusal=0 refused_reach=$r \
+unscored_family=- ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/oQ" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  Q DEAD rules with no refused set are PARTIAL (rc=2)" \
+               || { echo "FAIL  Q"; f=$((f+1)); }
+    grep -q 'UNREADABLE-DEAD' "$t/oQ/rc.txt" \
+        && echo "PASS  Q2 and the reason is named, not just counted" \
+        || { echo "FAIL  Q2"; f=$((f+1)); }
+    mkdir -p "$t/corpus_r"
+    cp "$t/corpus_ok/x86_64.tsv" "$t/corpus_r/x86_64.tsv"
+    cp "$t/corpus_ok/x86_64.ident.tsv" "$t/corpus_r/x86_64.ident.tsv"
+    { printf '#tip\tdeadbeef\tclean\n'; printf '#so\t%s\n' "$so_of"
+      printf '#refused\tisa=x86_64\tencodings=1\n'
+      printf 'x86_64\t0f01c6\n'; } > "$t/corpus_r/x86_64.refused.tsv"
+    run_arms "$t/b" "$t/oR" "$t/corpus_r" x86_64 >/dev/null 2>&1
+    [ $? = 0 ] && echo "PASS  R the same DEAD count WITH a refused set is readable" \
+               || { echo "FAIL  R"; f=$((f+1)); }
+    grep -q 'refused-set x86_64 so=.*refused=' "$t/oR/rc.txt" \
+        && echo "PASS  R2 and the set the arm used is named in the roll-up" \
+        || { echo "FAIL  R2"; f=$((f+1)); }
+    printf '#!/bin/sh\nexit 1\n' > "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o4" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 1 ] && echo "PASS  D a failing arm rolls up rc=1" \
+               || { echo "FAIL  D"; f=$((f+1)); }
+    printf '#!/bin/sh\nexit 2\n' > "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o5" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  E rc=2 is NOT folded into rc=1" \
+               || { echo "FAIL  E"; f=$((f+1)); }
+    # A run whose arms disagree must report the worst, not the last.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+case "$*" in *--layer=fields*) exit 0 ;; *) exit 2 ;; esac
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o6" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  F the WORST arm decides, not the last one" \
+               || { echo "FAIL  F"; f=$((f+1)); }
+    grep -q 'ISAX_DUMP_UNREACHED' "${BASH_SOURCE[0]}" \
+        && echo "PASS  G the unreached dump is armed by the gate itself" \
+        || { echo "FAIL  G"; f=$((f+1)); }
+    # H/I: FINDING 65-D.  A bare arm over an allowlist carrying rules it
+    # never scores is not a pass, and the count has to be the tool's own.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=327 unscored_family=SR-rd-* ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o7" "" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  H a BARE arm with unscored allowlist rules is rc=2, not rc=0" \
+               || { echo "FAIL  H"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE boundary x86_64: 327 ' "$t/o7/rc.txt" \
+        && echo "PASS  I and the unscored count is NAMED with its arm" \
+        || { echo "FAIL  I"; f=$((f+1)); }
+    # J: what a WHOLE gate looks like -- an arm that scored every family it
+    # carries reports `superseded_allow_rules=0 unscored_family=-` and is the
+    # only shape that rolls up rc=0.  Having a corpus is not that property;
+    # J asserted that it was until FINDING 66V-D.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=boundary encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=0 unscored_family=- ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o8" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 0 ] && echo "PASS  J an arm that scored EVERY family rolls up rc=0" \
+               || { echo "FAIL  J"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE' "$t/o8/rc.txt" \
+        && { echo "FAIL  J2"; f=$((f+1)); } \
+        || echo "PASS  J2 and a whole arm is not slandered as partial"
+    # K/L: FINDING 66V-D.  The `--srcenc` side of the same defect.  An arm
+    # WITH a corpus does not score `R-rd-*`/`FR-rd-*`, so it is partial too,
+    # and the family it names must be ITS OWN, not the bare arm's.
+    cat > "$t/b/contrib/plugins/isaxcheck" <<'SH'
+#!/bin/sh
+echo "# isa=x86_64 layer=fields encodings_tried=1 distinct_signatures=0 \
+allowlisted=0 unallowed=0 subtarget_gap=0/0 size_gap=0/0 dead_allow_rules=0 \
+superseded_allow_rules=41 unscored_family=R-rd-*,FR-rd-* ambiguous_reg_tokens=0"
+exit 0
+SH
+    chmod +x "$t/b/contrib/plugins/isaxcheck"
+    run_arms "$t/b" "$t/o9" "$t/corpus_ok" x86_64 >/dev/null 2>&1
+    [ $? = 2 ] && echo "PASS  K a --srcenc arm with unscored rules is rc=2, not rc=0" \
+               || { echo "FAIL  K"; f=$((f+1)); }
+    grep -q 'NOT-A-FULL-GATE fields x86_64: 41 allowlist rule(s) in R-rd-\*,FR-rd-\*' \
+         "$t/o9/rc.txt" \
+        && echo "PASS  L and it names R-rd-*,FR-rd-*, the family THAT arm did not score" \
+        || { echo "FAIL  L"; f=$((f+1)); }
+    rm -rf "$t"
+    echo "isax_srcenc_gate selftest: $f failure(s)"
+    [ "$f" = 0 ] || return 1
+    return 0
+}
+
+[ $# -ge 1 ] || usage
+case "$1" in
+  --selftest) selftest ;;
+  run)  shift; [ $# -ge 3 ] || usage; b=$1 o=$2 c=$3; shift 3; run_arms "$b" "$o" "$c" "$@" ;;
+  bare) shift; [ $# -ge 2 ] || usage; b=$1 o=$2; shift 2; run_arms "$b" "$o" "" "$@" ;;
+  *) usage ;;
+esac

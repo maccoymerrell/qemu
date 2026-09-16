@@ -1,0 +1,18 @@
+# ADJUDICATED SOURCE LOSSES -- read by tools/src_loss_gate.sh.
+#
+# One line per (isa, pc, generic register) a maintainer has ruled may leave
+# the wire, with the reason on the same line after a `#`.  A line with no
+# reason is REFUSED: an adjudication whose reason is not written down is not
+# an adjudication, it is a suppression.
+#
+# A row here is COUNTED and PRINTED on every run, never silently applied, and
+# a row whose subject the measurement does not contain FAILS the gate -- a
+# ledger that outlives its subject is how a gate quietly stops gating.
+#
+# EMPTY ON PURPOSE.  The nine register-instances the Capstone read-arm
+# deletion still takes off the wire are NOT listed here.  Each has a named
+# coverage path (a QEMU-side statement or a qualified decode identity) and
+# answering an open question by making its counter read zero is the failure
+# this whole file is shaped against.
+#
+# Author: Maccoy Merrell.

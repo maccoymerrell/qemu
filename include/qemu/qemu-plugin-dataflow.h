@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 4
+#define QEMU_PLUGIN_DATAFLOW_VERSION 5
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -390,6 +390,12 @@ bool qemu_plugin_insn_immediate(const struct qemu_plugin_tb *tb, size_t idx,
 #define QEMU_PLUGIN_DF_VEC_REFUSE_DYNAMIC    1  /* selector is a register */
 #define QEMU_PLUGIN_DF_VEC_REFUSE_COMPOSITE  2  /* more than one lane/role */
 
+/*
+ * The largest fan-out unit a self-looping instruction may state.  A unit
+ * wider than this is refused rather than truncated.
+ */
+#define QEMU_PLUGIN_DF_SELF_LOOP_MAX  255
+
 typedef struct qemu_plugin_dataflow_status {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */
     uint32_t version;           /* QEMU sets to QEMU_PLUGIN_DATAFLOW_VERSION */
@@ -433,6 +439,27 @@ typedef struct qemu_plugin_dataflow_status {
     int32_t  vec_lane;            /* selected lane, or _VEC_LANE_NONE */
     uint32_t vec_lane_refuse;     /* _VEC_REFUSE_*, first stated, 0 if none */
     uint32_t n_vec_lane_refused;  /* lanes the decode site would not state */
+    /*
+     * The fan-out unit of a SELF-LOOPING instruction, in two facts.
+     *
+     * @self_loop_memops is how many guest memory accesses one unit performs,
+     * and 0 says the instruction does not self-loop at all.  It is the
+     * emulation's access count, which is what a consumer partitioning the
+     * delivered access stream needs: x86 INS stores twice per iteration, a
+     * dummy write for restartability and then the value from the port, so its
+     * unit is 2 where the architecture performs one store.
+     *
+     * @self_loop_iterated says the unit is an architectural iteration the
+     * instruction counts down -- an x86 REP-prefixed string operation, whose
+     * running count is published separately through
+     * qemu_plugin_rep_iterations().  False says the instruction has no
+     * iteration of its own and the unit is one access; AArch64 FEAT_MOPS is
+     * the whole of that family.  Without it a `rep stosb` and a `setp` would
+     * both read 1 and a consumer could not tell whether an architectural
+     * count exists to ask for.
+     */
+    uint32_t self_loop_memops;
+    uint32_t self_loop_iterated;
 } qemu_plugin_dataflow_status;
 
 QEMU_PLUGIN_API

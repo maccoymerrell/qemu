@@ -4698,6 +4698,20 @@ static void gen_mops_plugin_pc(DisasContext *s)
     }
     tcg_gen_st_i64(tcg_constant_i64(s->pc_curr), tcg_env,
                    MOPS_PLUGIN_OFF(plugin_rep_pc));
+    /*
+     * And the static half of the same fact: this instruction self-loops, and
+     * its fan-out unit is ONE memory access.
+     *
+     * Not an iteration.  A MOPS instruction has none -- the size register
+     * names bytes, and copy_step/set_step move up to a page of them per call,
+     * which is QEMU's choice and not anything the encoding says.  So there is
+     * no per-iteration access count to state and the unit is the access
+     * itself, which is also the only unit robust to the ARRIVAL ORDER: a copy
+     * delivers a run of loads followed by a run of stores, one bulk callback
+     * per step per direction, never the interleaved pairs a REP string
+     * operation produces.
+     */
+    insn_dataflow_note_self_loop(1, false);
 #endif
 }
 

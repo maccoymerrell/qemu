@@ -885,8 +885,26 @@ static bool gen_check_io(DisasContext *s, MemOp ot, TCGv_i32 port,
 #endif
 }
 
+/*
+ * The fan-out unit of a REP-prefixed string operation.
+ *
+ * Stated inside the emitter rather than at the decode rule so the number sits
+ * beside the accesses it counts and cannot drift from them, and only when a
+ * REP prefix is present: an unprefixed MOVSB runs once and is not a fan-out
+ * instruction at all.  @memops is what THIS emitter performs per iteration,
+ * which for INS is not what the architecture performs -- see
+ * INSN_DF_SELF_LOOP_MAX.
+ */
+static void gen_string_self_loop(DisasContext *s, unsigned memops)
+{
+    if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
+        insn_dataflow_note_self_loop(memops, true);
+    }
+}
+
 static void gen_movs(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 2);         /* one load, one store */
     gen_string_movl_A0_ESI(s);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_string_movl_A0_EDI(s);
@@ -1298,6 +1316,7 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
 
 static void gen_stos(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 1);         /* one store */
     gen_string_movl_A0_EDI(s);
     gen_op_st_v(s, ot, s->T0, s->A0);
     gen_op_add_reg(s, s->aflag, R_EDI, dshift);
@@ -1305,6 +1324,7 @@ static void gen_stos(DisasContext *s, MemOp ot, TCGv dshift)
 
 static void gen_lods(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 1);         /* one load */
     gen_string_movl_A0_ESI(s);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
@@ -1313,6 +1333,7 @@ static void gen_lods(DisasContext *s, MemOp ot, TCGv dshift)
 
 static void gen_scas(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 1);         /* one load */
     gen_string_movl_A0_EDI(s);
     gen_op_ld_v(s, ot, s->T1, s->A0);
     tcg_gen_mov_tl(cpu_cc_src, s->T1);
@@ -1325,6 +1346,7 @@ static void gen_scas(DisasContext *s, MemOp ot, TCGv dshift)
 
 static void gen_cmps(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 2);         /* two loads */
     gen_string_movl_A0_EDI(s);
     gen_op_ld_v(s, ot, s->T1, s->A0);
     gen_string_movl_A0_ESI(s);
@@ -1354,6 +1376,13 @@ static void gen_bpt_io(DisasContext *s, TCGv_i32 t_port, int ot)
 
 static void gen_ins(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    /*
+     * TWO stores, not one.  The dummy write below is a real guest access that
+     * a plugin is told about, and it is what makes the instruction restartable
+     * after a page fault; an architectural count of 1 would cut every
+     * iteration's access pair in half for anything partitioning the stream.
+     */
+    gen_string_self_loop(s, 2);
     gen_string_movl_A0_EDI(s);
     /* Note: we must do this dummy write first to be restartable in
        case of page fault. */
@@ -1369,6 +1398,7 @@ static void gen_ins(DisasContext *s, MemOp ot, TCGv dshift)
 
 static void gen_outs(DisasContext *s, MemOp ot, TCGv dshift)
 {
+    gen_string_self_loop(s, 1);         /* one load; the port is not memory */
     gen_string_movl_A0_ESI(s);
     gen_op_ld_v(s, ot, s->T0, s->A0);
 

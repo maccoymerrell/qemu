@@ -358,6 +358,8 @@ bool qemu_plugin_dataflow_abi_ok(uint32_t plugin_version,
                       INSN_DF_VEC_REFUSE_DYNAMIC);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VEC_REFUSE_COMPOSITE !=
                       INSN_DF_VEC_REFUSE_COMPOSITE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_SELF_LOOP_MAX !=
+                      INSN_DF_SELF_LOOP_MAX);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_OPERAND != INSN_DF_IMM_OPERAND);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_DISP != INSN_DF_IMM_DISP);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_MAX_EA_PARTS != INSN_DF_MAX_EA_PARTS);
@@ -652,6 +654,8 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.vec_lane = d->vec_lane;
     st.vec_lane_refuse = d->vec_lane_refuse;
     st.n_vec_lane_refused = d->n_vec_lane_refused;
+    st.self_loop_memops = d->self_loop_memops;
+    st.self_loop_iterated = d->self_loop_iterated ? 1u : 0u;
     /*
      * Interning is per translation block, so a range that could not be
      * interned anywhere in the block makes a value in THIS instruction look

@@ -31,7 +31,7 @@ import sys
 
 COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz',
            'vkind', 'vlane', 'memops', 'fieldregs', 'zero', 'pcread', 'ea',
-           'nrd', 'nwr')
+           'selfloop', 'nrd', 'nwr')
 
 
 def load(paths):
@@ -105,6 +105,9 @@ def census(rows):
         'lane_refused': 0,
         'synth_ea': 0,
         'synth_ea_refused': 0,
+        'selfloop_iter': 0,
+        'selfloop_access': 0,
+        'selfloop_memops': 0,
         'memops': 0,
         'fieldreg_named': 0,
         'fieldreg_unnamed': 0,
@@ -145,6 +148,19 @@ def census(rows):
             c['synth_ea_refused'] += 1
         elif row['ea'] != '-':
             c['synth_ea'] += 1
+        # The two fan-out families are counted apart because they are
+        # different claims: an ITERATED unit has an architectural iteration
+        # count a consumer can ask QEMU for, and an access-unit family has
+        # none.  The accesses column sums the stated units so a masked arm
+        # that keeps the rows but changes the number still moves something.
+        if row['selfloop'] != '-':
+            kind, _, n = row['selfloop'].partition(':')
+            if kind == 'iter':
+                c['selfloop_iter'] += 1
+            elif kind == 'access':
+                c['selfloop_access'] += 1
+            if n.isdigit():
+                c['selfloop_memops'] += int(n)
         if row['memops'] != '0':
             c['memops'] += 1
         if row['fieldregs'] != '-':
@@ -192,6 +208,9 @@ def report(tag, c, named, stamp, nfiles, show_names):
     print('   lane REFUSED         %d' % c['lane_refused'])
     print('   synthetic EA rows    %d' % c['synth_ea'])
     print('   synthetic EA refused %d' % c['synth_ea_refused'])
+    print('   self-loop ITERATED   %d' % c['selfloop_iter'])
+    print('   self-loop per-ACCESS %d' % c['selfloop_access'])
+    print('   self-loop unit sum   %d' % c['selfloop_memops'])
     print('   memop rows           %d' % c['memops'])
     print('   env range NAMED      %d' % c['fieldreg_named'])
     print('   env range unnamed    %d' % c['fieldreg_unnamed'])

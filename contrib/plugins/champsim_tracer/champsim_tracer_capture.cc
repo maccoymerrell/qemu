@@ -226,7 +226,7 @@ void corpora_init()
         corpus_stmt = new Corpus(
             "CST_DF_STMT_DUMP",
             "#isa\tencoding\tatomic\timm\tvece\toprsz\tvkind\tvlane"
-            "\tmemops\tfieldregs\tzero\tpcread\tea\tnrd\tnwr\n");
+            "\tmemops\tfieldregs\tzero\tpcread\tea\tselfloop\tnrd\tnwr\n");
     }
 }
 
@@ -712,6 +712,27 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
              z_rd ? "r" : "", z_wr ? "w" : "");
 
     /*
+     * THE SELF-LOOP FAN-OUT UNIT, in one column that spells which kind of
+     * unit it is.
+     *
+     * `iter:N` is an architectural iteration performing N accesses, `access:N`
+     * an instruction with no iteration of its own whose unit is one access.
+     * A bare N would make an x86 `rep stosb` and an AArch64 `setp` read alike
+     * while a consumer must treat them differently -- one has an iteration
+     * count to ask QEMU for and the other does not -- so the kind is spelled
+     * and the two are counted apart.
+     */
+    char selfloop[24];
+
+    if (st.self_loop_memops == 0) {
+        snprintf(selfloop, sizeof(selfloop), "-");
+    } else {
+        snprintf(selfloop, sizeof(selfloop), "%s:%u",
+                 st.self_loop_iterated ? "iter" : "access",
+                 st.self_loop_memops);
+    }
+
+    /*
      * THE SIZE OF THE READ AND WRITE SETS.
      *
      * A statement that names a register the ops do not -- the MOPS syndrome's
@@ -722,18 +743,34 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
      * reads "-" rather than 0: a refusal and an instruction that touches no
      * register are different claims.
      */
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t",
+    /*
+     * ONE WRITE PER ROW, and the row's last two columns are formatted first
+     * to make that possible.
+     *
+     * The stream is line buffered so that a capture nothing closes still ends
+     * on a whole row.  That only holds if a row is one write: with the set
+     * sizes written by a second call the buffer sat holding a headless
+     * fraction of a row between the two, and anything that flushed or
+     * duplicated it there -- the compressor fork is the one this apparatus
+     * makes -- put a bare tail in the corpus.  Measured at this tip, one such
+     * row in riscv64/502 and one in mipsel/505 out of 593,198 and 144,612;
+     * the scorer REFUSES a file containing one, which is the right answer and
+     * is also why it had to be fixed rather than tolerated.
+     */
+    char sets[32];
+
+    if (have_sets) {
+        snprintf(sets, sizeof(sets), "%u\t%u", n_rd, n_wr);
+    } else {
+        snprintf(sets, sizeof(sets), "-\t-");
+    }
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t%s\t%s\n",
             isa_name(),
             enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
             k ? imm : "-", vece, st.vec_oprsz, vkind, vlane, st.n_memops,
             fk ? fields : "-", zero[0] ? zero : "-",
             pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
-            ek ? ea : "-");
-    if (have_sets) {
-        fprintf(o, "%u\t%u\n", n_rd, n_wr);
-    } else {
-        fprintf(o, "-\t-\n");
-    }
+            ek ? ea : "-", selfloop, sets);
 }
 
 #endif /* CST_CAPTURE */

@@ -1059,6 +1059,30 @@ void insn_dataflow_note_immediate(uint64_t value, unsigned role)
     d->n_imm++;
 }
 
+void insn_dataflow_note_self_loop(unsigned memops, bool iterated)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    if (memops == 0 || memops > INSN_DF_SELF_LOOP_MAX) {
+        return;
+    }
+    d = &df->out[df->cur];
+    /*
+     * The first statement is the encoding's.  An x86 string operation states
+     * its unit once, at the emitter; a MOPS instruction states it once, beside
+     * the publication of its own address.  A second statement on the same
+     * instruction would be QEMU's lowering of the first.
+     */
+    if (d->self_loop_memops != 0) {
+        return;
+    }
+    d->self_loop_memops = (uint8_t)memops;
+    d->self_loop_iterated = iterated;
+}
+
 void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
 {
     InsnDataflow *d;

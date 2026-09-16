@@ -171,6 +171,46 @@
 #define INSN_DF_X_MULTI     (1u << 3)   /* more than one static successor */
 
 /*
+ * What one unit of a SELF-LOOPING instruction's fan-out is.
+ *
+ * Some instructions perform an unbounded run of memory accesses under one
+ * program counter: an x86 REP-prefixed string operation repeats until its
+ * counter drains, an AArch64 FEAT_MOPS bulk copy or set moves a whole
+ * register's worth of bytes.  A consumer cannot carry that as one event --
+ * a megabyte memcpy is not an instruction with 65,536 accesses -- so it
+ * divides the access stream into units and carries one event per unit.  The
+ * size of that unit is a static fact of the encoding, and nothing in the ops
+ * says it: what comes out is a run of loads and stores with no marks in it.
+ *
+ * ITERATED separates the two families, and they are not the same claim.
+ *
+ *   ITERATED   the unit is an architectural iteration the instruction counts
+ *              down, and the stated number is the accesses ONE iteration
+ *              performs.  x86 REP: MOVS 2, CMPS 2, STOS/LODS/SCAS 1.  The
+ *              iteration count itself is dynamic and published separately
+ *              (CPUState::plugin_rep_iters); this is only its width.
+ *   not        the instruction has no architectural iteration to count, so
+ *              the unit is one memory access and the stated number is 1.
+ *              AArch64 FEAT_MOPS is the whole of this family: the step
+ *              helpers move up to a page at a time, which is an
+ *              implementation choice and not something the encoding names.
+ *
+ * Folding the two into a bare count would make an x86 `rep stosb` (1 access
+ * per iteration) and a MOPS `setp` (no iterations at all) read the same, and
+ * a consumer deciding whether an architectural count exists would have
+ * nothing to decide on.
+ *
+ * THE NUMBER IS THE EMULATION'S, NOT THE ARCHITECTURE'S, and where the two
+ * differ the emulation's is the one a reader of the access stream needs.
+ * x86 INS writes its destination twice per iteration -- a dummy store first
+ * so the access is restartable after a page fault, then the value from the
+ * port -- so its unit is 2 accesses even though the instruction
+ * architecturally performs one store.  A consumer partitioning delivered
+ * accesses by an architectural 1 would cut every INS iteration in half.
+ */
+#define INSN_DF_SELF_LOOP_MAX   255
+
+/*
  * A value the encoding carries, in the role it plays.
  *
  * IMM is an operand in its own right; DISP is a displacement folded into an
@@ -418,6 +458,15 @@ typedef struct InsnDataflow {
 
     uint8_t  properties;        /* INSN_DF_P_* */
     uint8_t  xfer;              /* INSN_DF_X_* */
+
+    /*
+     * The fan-out unit of a self-looping instruction: how many guest memory
+     * accesses one unit performs, and whether that unit is an architectural
+     * iteration.  Zero accesses means the instruction does not self-loop,
+     * which is every instruction but two families.
+     */
+    uint8_t  self_loop_memops;
+    bool     self_loop_iterated;
 
     /*
      * The decode rule the bytes reached, and the generic word that rule
@@ -724,6 +773,23 @@ void insn_dataflow_note_vec_lane(unsigned kind, int lane);
 void insn_dataflow_refuse_vec_lane(unsigned reason);
 
 /*
+ * This instruction self-loops, and one unit of its fan-out performs @memops
+ * guest memory accesses.
+ *
+ * @iterated says the unit is an architectural iteration the instruction
+ * counts down; false says the instruction has no iteration of its own and the
+ * unit is one access.  See INSN_DF_SELF_LOOP_MAX for why the two are carried
+ * apart and why @memops is the emulation's access count rather than the
+ * architecture's.
+ *
+ * Stated at the emitter that performs the accesses, so the number cannot
+ * drift from the code it counts, and only for the encodings that actually
+ * loop -- an x86 string operation without a REP prefix runs once and is not
+ * a fan-out instruction.  The first statement wins, as everywhere else here.
+ */
+void insn_dataflow_note_self_loop(unsigned memops, bool iterated);
+
+/*
  * One operand of a vector expansion: where it lives in CPUArchState, how many
  * bytes of it the helper may touch, and whether it is read, written or both.
  *
@@ -854,6 +920,8 @@ static inline void insn_dataflow_note_word(const char *word)
 static inline void insn_dataflow_refuse(void)
 { }
 static inline void insn_dataflow_note_immediate(uint64_t value, unsigned role)
+{ }
+static inline void insn_dataflow_note_self_loop(unsigned memops, bool iterated)
 { }
 static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
 { }

@@ -127,6 +127,18 @@
 #define INSN_DF_WR          2
 
 /*
+ * A lender that is not in this translation.
+ *
+ * MIPS can begin a block with a delay slot whose branch was translated in the
+ * previous one: the transfer ops are emitted here and belong to an
+ * instruction with no row to receive them.  A window opened with this index
+ * makes the reader drop those ops rather than charge them to the delay slot,
+ * which is the fabrication the borrow exists to prevent.  It is above every
+ * index a TB can have -- TCG_MAX_INSNS bounds a block far below it.
+ */
+#define INSN_DF_NO_LENDER  0xffffu
+
+/*
  * Properties the decoder holds and the ops cannot show.
  *
  * Atomicity is the case in point: the ops of an atomic read-modify-write and

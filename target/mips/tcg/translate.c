@@ -44,6 +44,109 @@
  */
 #include "insn-df-ident.h.inc"
 
+/*
+ * THE ARCHITECTURAL ZERO REGISTER (fact 10).
+ *
+ * $zero is not storage, so QEMU allocates it no TCG global at all:
+ * mips_tcg_init() leaves cpu_gpr[0] NULL and every access has to be special-
+ * cased.  A read of it becomes a constant and a write of it is skipped
+ * outright, so in both directions the op stream names no register and an
+ * instruction that genuinely touches none is indistinguishable from one whose
+ * operand was $zero.  The decode site is the only place that still holds the
+ * number.
+ *
+ * Stated at the accessors, because on MIPS the accessor IS the role --
+ * gen_load_gpr() is a read, gen_store_gpr() a write, and register 0 is $zero
+ * in every form, unlike aarch64's register 31 which is sometimes SP.  The
+ * decode sites that bypass the accessors and index cpu_gpr[] directly state it
+ * where the fold happens; those are marked individually.
+ *
+ * THE FOLDED CONSTANT IS DELIBERATELY NOT BOUND to the atom, the same reading
+ * riscv64 took: the value a read of $zero produces is a plain zero that later
+ * ops cannot be distinguished from any other zero, and giving it the zero
+ * register's provenance would put $zero into the inputs of values that never
+ * read it.  The ACCESS is what the decoder holds; the provenance of a folded
+ * constant is not.
+ */
+static void note_zero_reg(int reg, unsigned dir)
+{
+    if (reg != 0) {
+        return;
+    }
+    if (dir == INSN_DF_RD) {
+        insn_dataflow_state_read(insn_df_zero());
+    } else {
+        insn_dataflow_state_write(insn_df_zero());
+    }
+}
+
+/*
+ * THE FOLDED PROGRAM COUNTER (fact 11).
+ *
+ * A branch target and a link value are computed from this instruction's own
+ * address while it is being translated and materialised as constants, so the
+ * op that would have named cpu_PC is never emitted: `bal` writes a return
+ * address that is nothing but the program counter plus eight, and a branch
+ * computes its target from the program counter and its own displacement, and
+ * an op-stream reader sees neither read.
+ *
+ * Not for gen_save_pc() and its callers: that is QEMU keeping its own program
+ * counter correct across a block edge or before a helper that may fault, not
+ * an instruction computing a value from it.
+ */
+static void note_folded_pc(void)
+{
+    insn_dataflow_state_read(insn_df_reg("PC"));
+}
+
+/*
+ * THE LINE LENGTH OF A CACHE OPERATION (part of fact 18).
+ *
+ * MIPS leaves the line length implementation-defined and QEMU models no cache
+ * hierarchy, so there is no access whose size could be read off.  What QEMU
+ * does hold is what this CPU model tells the guest: Config1.IL and Config1.DL.
+ * A field reading 0 means the model advertises no cache of that kind, and the
+ * note then carries 0 -- the length QEMU has -- rather than one invented here.
+ */
+static uint32_t mips_cache_line_bytes(DisasContext *ctx, bool icache)
+{
+    uint32_t l = ((uint32_t)ctx->CP0_Config1 >>
+                  (icache ? CP0C1_IL : CP0C1_DL)) & 7;
+
+    return l == 0 ? 0 : 2u << l;
+}
+
+/*
+ * AN ADDRESS THE EMULATION COMPUTES NOTHING FOR (fact 18).
+ *
+ * PREF, PREFX, PREFE, CACHE and SYNCI name an address in their encoding and
+ * QEMU lowers them to nothing at all -- there is no memop, so there is nothing
+ * for the op-stream reader to walk, and a consumer is handed an instruction
+ * that plainly addresses memory and whose record touches none.  The decode
+ * site holds the operands, so it states them.
+ *
+ * The direction is a READ, the reading aarch64's PRFM already gets.  MIPS's
+ * PREF carries a hint field that the architecture divides into load and store
+ * forms, but QEMU performs no access for any of them and holds no table saying
+ * which is which; a direction taken from the printed manual would be invention
+ * rather than report.
+ *
+ * SCALE AND SHIFT ARE NOT CARRIED, per the note's own contract: they change
+ * the address's value, not the set of places the value came from.
+ */
+static void note_addr_only(DisasContext *ctx, int base, int index,
+                           int64_t disp, uint32_t size)
+{
+    InsnDataflowAtom parts[2];
+    unsigned n = 0;
+
+    parts[n++] = base == 0 ? insn_df_zero() : insn_df_reg(regnames[base]);
+    if (index >= 0) {
+        parts[n++] = index == 0 ? insn_df_zero() : insn_df_reg(regnames[index]);
+    }
+    insn_dataflow_note_synthetic_ea(INSN_DF_RD, size, parts, n, disp);
+}
+
 
 /*
  * Many system-only helpers are not reachable for user-only.
@@ -1200,6 +1303,7 @@ static const char regnames_LO[][4] = {
 void gen_load_gpr(TCGv t, int reg)
 {
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
+    note_zero_reg(reg, INSN_DF_RD);
     if (reg == 0) {
         tcg_gen_movi_tl(t, 0);
     } else {
@@ -1210,6 +1314,7 @@ void gen_load_gpr(TCGv t, int reg)
 void gen_store_gpr(TCGv t, int reg)
 {
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
+    note_zero_reg(reg, INSN_DF_WR);
     if (reg != 0) {
         tcg_gen_mov_tl(cpu_gpr[reg], t);
     }
@@ -1219,6 +1324,7 @@ void gen_store_gpr(TCGv t, int reg)
 void gen_load_gpr_hi(TCGv_i64 t, int reg)
 {
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr_hi));
+    note_zero_reg(reg, INSN_DF_RD);
     if (reg == 0) {
         tcg_gen_movi_i64(t, 0);
     } else {
@@ -1229,6 +1335,7 @@ void gen_load_gpr_hi(TCGv_i64 t, int reg)
 void gen_store_gpr_hi(TCGv_i64 t, int reg)
 {
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr_hi));
+    note_zero_reg(reg, INSN_DF_WR);
     if (reg != 0) {
         tcg_gen_mov_i64(cpu_gpr_hi[reg], t);
     }
@@ -1928,12 +2035,25 @@ FOP_CONDNS(s, FMT_S, 32, gen_store_fpr32(ctx, fp0, fd))
 #undef gen_ldcmp_fpr64
 
 /* load/store instructions. */
+
+/*
+ * ATOMICITY (fact 13).
+ *
+ * The ops of a load-linked and the ops of an ordinary load are the same ops:
+ * QEMU implements LL as a plain load that records the address and the value,
+ * because the indivisibility is only tested when the matching SC runs.  What
+ * separates them is the major opcode, which only the decoder holds.  It is
+ * stated at the LL half as well as the SC half because LL is the half that
+ * takes the reservation, and a consumer looking at LL alone would otherwise
+ * see nothing to distinguish it.
+ */
 #ifdef CONFIG_USER_ONLY
 #define OP_LD_ATOMIC(insn, memop)                                          \
 static inline void op_ld_##insn(TCGv ret, TCGv arg1, int mem_idx,          \
                                 DisasContext *ctx)                         \
 {                                                                          \
     TCGv t0 = tcg_temp_new();                                              \
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);                         \
     tcg_gen_mov_tl(t0, arg1);                                              \
     tcg_gen_qemu_ld_tl(ret, arg1, ctx->mem_idx, memop);                    \
     tcg_gen_st_tl(t0, tcg_env, offsetof(CPUMIPSState, lladdr));            \
@@ -1944,6 +2064,7 @@ static inline void op_ld_##insn(TCGv ret, TCGv arg1, int mem_idx,          \
 static inline void op_ld_##insn(TCGv ret, TCGv arg1, int mem_idx,          \
                                 DisasContext *ctx)                         \
 {                                                                          \
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);                         \
     gen_helper_##insn(ret, tcg_env, arg1, tcg_constant_i32(mem_idx));      \
 }
 #endif
@@ -1955,6 +2076,22 @@ OP_LD_ATOMIC(lld, mo_endian(ctx) | MO_UQ);
 
 void gen_base_offset_addr(DisasContext *ctx, TCGv addr, int base, int offset)
 {
+    /*
+     * THE ENCODED DISPLACEMENT (fact 19).  Every base-plus-offset address on
+     * MIPS is built here -- the loads, the stores, the conditional store, the
+     * coprocessor transfers, the cache operations and MSA's LD and ST all
+     * reach this one helper -- and the offset is folded into the op that
+     * consumes it, so the op stream carries the value with nothing saying it
+     * was a field of the encoding.  A ZERO OFFSET IS STATED and not
+     * suppressed: every MIPS rule reaching here has a displacement field, so
+     * "no field" and "a field holding zero" are not confusable.
+     *
+     * The fold of $zero as the base is stated too, because the `base == 0`
+     * arm below emits a bare constant and cpu_gpr[0] does not exist.
+     */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)offset, INSN_DF_IMM_DISP);
+    note_zero_reg(base, INSN_DF_RD);
+
     if (base == 0) {
         tcg_gen_movi_tl(addr, offset);
     } else if (offset == 0) {
@@ -2231,6 +2368,14 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     TCGLabel *l1 = gen_new_label();
     TCGLabel *done = gen_new_label();
 
+    /*
+     * ATOMICITY (fact 13): the store half of the pair.  tcg_gen_atomic_cmpxchg
+     * below is not the discriminator either -- it is only what a target
+     * reaches for when it wants the host to do the access indivisibly -- so
+     * the encoding is stated where the decoder still holds it.
+     */
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
+
     t0 = tcg_temp_new();
     addr = tcg_temp_new();
     /* compare the address against that of the preceding LL */
@@ -2326,6 +2471,16 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm = (target_long)imm; /* Sign extend to 32/64 bits */
 
+    /*
+     * THE ENCODED OPERAND (fact 19) and THE DISCARDED WRITE (fact 10).  The
+     * immediate is folded into the op that consumes it, and a destination of
+     * $zero makes the whole instruction a no-op QEMU emits nothing for -- in
+     * both cases nothing downstream says the encoding carried the field or
+     * named the register.
+     */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(rt, INSN_DF_WR);
+
     if (rt == 0 && opc != OPC_ADDI && opc != OPC_DADDI) {
         /*
          * If no destination, treat it as a NOP.
@@ -2361,6 +2516,8 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
         } else {
+            /* The read of $zero folds into the constant (fact 10). */
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], uimm);
         }
         break;
@@ -2389,6 +2546,7 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
         if (rs != 0) {
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], uimm);
         }
         break;
@@ -2402,6 +2560,10 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm;
 
+    /* The encoded operand (fact 19) and a destination of $zero (fact 10). */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(rt, INSN_DF_WR);
+
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2412,6 +2574,7 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         if (likely(rs != 0)) {
             tcg_gen_andi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], 0);
         }
         break;
@@ -2419,6 +2582,7 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         if (rs != 0) {
             tcg_gen_ori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], uimm);
         }
         break;
@@ -2426,6 +2590,7 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         if (likely(rs != 0)) {
             tcg_gen_xori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], uimm);
         }
         break;
@@ -2435,6 +2600,12 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], imm << 16);
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
         } else {
+            /*
+             * LUI's source is architecturally $zero on the pre-R6 reading
+             * and the R6 AUI form with rs == $zero is the same instruction;
+             * either way the register is folded into the constant.
+             */
+            note_zero_reg(rs, INSN_DF_RD);
             tcg_gen_movi_tl(cpu_gpr[rt], imm << 16);
         }
         break;
@@ -2450,6 +2621,10 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm = (target_long)imm; /* Sign extend to 32/64 bits */
     TCGv t0;
+
+    /* The encoded operand (fact 19) and a destination of $zero (fact 10). */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)imm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(rt, INSN_DF_WR);
 
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
@@ -2473,6 +2648,14 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm = ((uint16_t)imm) & 0x1f;
     TCGv t0;
+
+    /*
+     * The shift amount is a field of the encoding that does not survive as an
+     * op argument at all (fact 19), and a shift into $zero writes the register
+     * QEMU has no global for (fact 10).
+     */
+    insn_dataflow_note_immediate((uint64_t)uimm, INSN_DF_IMM_OPERAND);
+    note_zero_reg(rt, INSN_DF_WR);
 
     if (rt == 0) {
         /*
@@ -2554,6 +2737,17 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
 static void gen_arith(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
+    /*
+     * A destination of $zero is a write QEMU emits nothing for, and a
+     * source of $zero is a read it folds into a constant -- the arms
+     * below swap the whole operation for a move or a movi when one
+     * operand is register 0.  Both are fact 10, and neither survives
+     * into the op stream.
+     */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rs, INSN_DF_RD);
+    note_zero_reg(rt, INSN_DF_RD);
+
     if (rd == 0 && opc != OPC_ADD && opc != OPC_SUB
        && opc != OPC_DADD && opc != OPC_DSUB) {
         /*
@@ -2718,6 +2912,17 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1, t2;
 
+    /*
+     * A destination of $zero is a write QEMU emits nothing for, and a
+     * source of $zero is a read it folds into a constant -- the arms
+     * below swap the whole operation for a move or a movi when one
+     * operand is register 0.  Both are fact 10, and neither survives
+     * into the op stream.
+     */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rs, INSN_DF_RD);
+    note_zero_reg(rt, INSN_DF_RD);
+
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2748,6 +2953,17 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 static void gen_logic(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
+    /*
+     * A destination of $zero is a write QEMU emits nothing for, and a
+     * source of $zero is a read it folds into a constant -- the arms
+     * below swap the whole operation for a move or a movi when one
+     * operand is register 0.  Both are fact 10, and neither survives
+     * into the op stream.
+     */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rs, INSN_DF_RD);
+    note_zero_reg(rt, INSN_DF_RD);
+
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2803,6 +3019,17 @@ static void gen_slt(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1;
 
+    /*
+     * A destination of $zero is a write QEMU emits nothing for, and a
+     * source of $zero is a read it folds into a constant -- the arms
+     * below swap the whole operation for a move or a movi when one
+     * operand is register 0.  Both are fact 10, and neither survives
+     * into the op stream.
+     */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rs, INSN_DF_RD);
+    note_zero_reg(rt, INSN_DF_RD);
+
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2827,6 +3054,17 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
     TCGv t0, t1;
+
+    /*
+     * A destination of $zero is a write QEMU emits nothing for, and a
+     * source of $zero is a read it folds into a constant -- the arms
+     * below swap the whole operation for a move or a movi when one
+     * operand is register 0.  Both are fact 10, and neither survives
+     * into the op stream.
+     */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rs, INSN_DF_RD);
+    note_zero_reg(rt, INSN_DF_RD);
 
     if (rd == 0) {
         /*
@@ -2969,6 +3207,14 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
 {
     target_long offset;
     target_long addr;
+
+    /*
+     * The Release 6 pc-relative family: the address is computed here from the
+     * program counter and the encoded field, and only the result reaches the
+     * ops (facts 11 and 19).  The displacement is stated in each arm below,
+     * where its width and shift are known.
+     */
+    note_folded_pc();
 
     insn_df_mips_ident(MIPS_DF_PCREL_TOP2, MASK_OPC_PCREL_TOP2BITS(opc));
     switch (MASK_OPC_PCREL_TOP2BITS(opc)) {
@@ -4388,6 +4634,20 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     TCGv t0 = tcg_temp_new();
     TCGv t1 = tcg_temp_new();
 
+    /*
+     * THE BRANCH'S OWN OPERAND (fact 19) and THE PROGRAM COUNTER IT IS ADDED
+     * TO (fact 11).  The target is computed here, at translation time, from
+     * this instruction's address and the encoded displacement, and reaches
+     * the op stream as a constant; a link value is the program counter plus
+     * the delay slot and reaches it as a constant too.  Neither read is
+     * visible afterwards.  The offset is an OPERAND rather than a
+     * displacement -- the jump's own argument -- which is the reading
+     * aarch64's and riscv64's branch offsets already get.
+     */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)offset,
+                                 INSN_DF_IMM_OPERAND);
+    note_folded_pc();
+
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
 #ifdef MIPS_DEBUG_DISAS
         LOG_DISAS("Branch in delay / forbidden slot at PC 0x%016"
@@ -4730,6 +4990,10 @@ fail:
 static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
 {
     TCGv t0;
+
+    /* A destination of $zero: the write QEMU emits nothing for (fact 10). */
+    note_zero_reg(rd, INSN_DF_WR);
+    note_zero_reg(rt, INSN_DF_RD);
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
@@ -11045,6 +11309,11 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
     TCGv t1 = tcg_temp_new();
     int m16_lowbit = (ctx->hflags & MIPS_HFLAG_M16) != 0;
 
+    /* Same two facts as gen_compute_branch, for the Release 6 forms. */
+    insn_dataflow_note_immediate((uint64_t)(int64_t)offset,
+                                 INSN_DF_IMM_OPERAND);
+    note_folded_pc();
+
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
 #ifdef MIPS_DEBUG_DISAS
         LOG_DISAS("Branch in delay / forbidden slot at PC 0x%016"
@@ -13533,10 +13802,13 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
             /* hint codes 24-31 are reserved and signal RI */
             gen_reserved_instruction(ctx);
         }
-        /* Treat as NOP. */
+        /* Treat as NOP -- but the encoding still names an address (fact 18). */
+        note_addr_only(ctx, rs, -1, imm, mips_cache_line_bytes(ctx, false));
         break;
     case R6_OPC_CACHE:
         check_cp0_enabled(ctx);
+        note_addr_only(ctx, rs, -1, imm,
+                       mips_cache_line_bytes(ctx, (rt & 3) == 0));
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
             gen_cache_operation(ctx, rt, rs, imm);
         }
@@ -14264,13 +14536,16 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_CACHEE:
             check_eva(ctx);
             check_cp0_enabled(ctx);
+            note_addr_only(ctx, rs, -1, imm,
+                           mips_cache_line_bytes(ctx, (rt & 3) == 0));
             if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
                 gen_cache_operation(ctx, rt, rs, imm);
             }
             return;
         case OPC_PREFE:
             check_cp0_enabled(ctx);
-            /* Treat as NOP. */
+            /* Treat as NOP -- the address is stated (fact 18). */
+            note_addr_only(ctx, rs, -1, imm, mips_cache_line_bytes(ctx, false));
             return;
         }
     }
@@ -14459,7 +14734,13 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             /*
              * Break the TB to be able to sync copied instructions
              * immediately.
+             *
+             * SYNCI names the instruction-cache line to synchronise and QEMU
+             * performs no access for it; the address is stated here (fact 18)
+             * and its length comes from Config1.IL, the instruction cache
+             * this CPU advertises.
              */
+            note_addr_only(ctx, rs, -1, imm, mips_cache_line_bytes(ctx, true));
             ctx->base.is_jmp = DISAS_STOP;
             break;
         case OPC_BPOSGE32:    /* MIPS DSP branch */
@@ -14618,12 +14899,22 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BOVC: /* OPC_BEQZALC, OPC_BEQC, OPC_ADDI */
+        /*
+         * One major opcode, two unrelated instructions: a compact branch on
+         * Release 6 and the trapping add-immediate before it.  The table this
+         * file consults is keyed by the case VALUE, so it can only name one
+         * of them; only the decoder holds the CPU's ISA revision, so each arm
+         * states its own word and OPC_BOVC's row in insn-df-words.tsv states
+         * none -- note_word() is first-wins and the table has already run.
+         */
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_BOVC, OPC_BEQZALC, OPC_BEQC */
+            insn_dataflow_note_word(INSN_DF_WORD_JUMP_COND);
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
         } else {
             /* OPC_ADDI */
             /* Arithmetic with immediate opcode */
+            insn_dataflow_note_word(INSN_DF_WORD_INT_ADD);
             gen_arith_imm(ctx, op, rt, rs, imm);
         }
         break;
@@ -14734,6 +15025,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_CACHE:
         check_cp0_enabled(ctx);
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
+        note_addr_only(ctx, rs, -1, imm,
+                       mips_cache_line_bytes(ctx, (rt & 3) == 0));
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
             gen_cache_operation(ctx, rt, rs, imm);
         }
@@ -14741,7 +15034,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_PREF:
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 | INSN_R5900);
-        /* Treat as NOP. */
+        /* Treat as NOP -- the address is stated (fact 18). */
+        note_addr_only(ctx, rs, -1, imm, mips_cache_line_bytes(ctx, false));
         break;
 
     /* Floating point (COP1). */
@@ -14915,7 +15209,16 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_BEQZC: /* OPC_JIC, OPC_LDC2 */
     case OPC_BNEZC: /* OPC_JIALC, OPC_SDC2 */
+        /*
+         * The same Release-6 collision, at two more major opcodes: 0x36 is
+         * BEQZC or JIC on R6 and the coprocessor-2 load LDC2 before it, 0x3E
+         * is BNEZC or JIALC on R6 and the coprocessor-2 store SDC2.  Each arm
+         * states its own word for the reason given at OPC_BOVC; the pre-R6
+         * word comes from the major opcode alone, which is what decides
+         * whether these bytes name a load or a store.
+         */
         if (ctx->insn_flags & ISA_MIPS_R6) {
+            insn_dataflow_note_word(INSN_DF_WORD_JUMP_COND);
             if (rs != 0) {
                 /* OPC_BEQZC, OPC_BNEZC */
                 gen_compute_compact_branch(ctx, op, rs, 0,
@@ -14925,10 +15228,14 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 gen_compute_compact_branch(ctx, op, 0, rt, imm);
             }
         } else if (ctx->insn_flags & ASE_LEXT) {
+            insn_dataflow_note_word(op == OPC_BNEZC ? INSN_DF_WORD_STORE
+                                                    : INSN_DF_WORD_LOAD);
             gen_loongson_lsdc2(ctx, rt, rs, rd);
         } else {
-            /* OPC_LWC2, OPC_SWC2 */
+            /* OPC_LDC2, OPC_SDC2 */
             /* COP2: Not implemented. */
+            insn_dataflow_note_word(op == OPC_BNEZC ? INSN_DF_WORD_STORE
+                                                    : INSN_DF_WORD_LOAD);
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
         break;
@@ -14957,7 +15264,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 break;
             case OPC_PREFX:
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
-                /* Treat as NOP. */
+                /* Treat as NOP -- base plus index, no displacement (18). */
+                note_addr_only(ctx, rs, rt, 0,
+                               mips_cache_line_bytes(ctx, false));
                 break;
             case OPC_ALNV_PS:
                 check_insn(ctx, ISA_MIPS5 | ISA_MIPS_R2);
@@ -15224,8 +15533,10 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     int insn_bytes;
     int is_slot;
+    int in_delay_slot;
 
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
+    in_delay_slot = is_slot;
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = decode_isa_nanomips(env, ctx);
@@ -15276,7 +15587,43 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         }
     }
     if (is_slot) {
+        /*
+         * THE DELAY-SLOT BORROW WINDOW (fact 15).
+         *
+         * MIPS emits a branch's transfer AFTER its delay slot has been
+         * translated, so the ops that perform the branch -- the program
+         * counter write, the conditional edge, the lookup-and-goto -- land
+         * inside the delay-slot instruction's op range.  Attributed where
+         * they were emitted they give the delay slot a program-counter write
+         * it does not perform and take one away from the branch that does.
+         *
+         * @in_delay_slot is the value sampled BEFORE this instruction was
+         * decoded: nonzero means a branch in flight from earlier, so the
+         * lender is the instruction before this one.  When it is zero the
+         * `if` above set is_slot for a Release 6 compact branch or a
+         * forbidden slot, and the transfer belongs to THIS instruction --
+         * there is nothing to borrow.
+         *
+         * When the delay slot BEGINS the block the branch is not in this
+         * translation at all and has no row to lend to.  The window is still
+         * opened, with a lender index the reader cannot resolve, because the
+         * honest answer is that these ops belong to neither instruction here:
+         * giving them to the delay slot is the fabrication this exists to
+         * prevent, and the reader drops the ops of a window whose lender is
+         * out of range.
+         */
+        unsigned lender = INSN_DF_NO_LENDER;
+
+        if (in_delay_slot && ctx->base.num_insns >= 2) {
+            lender = (unsigned)ctx->base.num_insns - 2;
+        }
+        if (in_delay_slot) {
+            insn_dataflow_borrow_begin(lender);
+        }
         gen_branch(ctx, insn_bytes);
+        if (in_delay_slot) {
+            insn_dataflow_borrow_end();
+        }
     }
     if (ctx->base.is_jmp == DISAS_SEMIHOST) {
         generate_exception_err(ctx, EXCP_SEMIHOST, insn_bytes);

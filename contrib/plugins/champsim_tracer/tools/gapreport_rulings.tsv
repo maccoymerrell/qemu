@@ -114,8 +114,20 @@ mipsel	OPC_SLTU	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
 mipsel	OPC_SLTI	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
 mipsel	OPC_SLT	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as OPC_SLTIU
 mipsel	OPC_NOR	GEN_OP_OR	GEN_OP_NOT	QEMU	SETTLED	measured: 0 of 113 rows encode rt == $zero, so none of them is the `not` alias the incumbent's word describes; the substantial operation of a three-operand nor is the disjunction and the inversion modifies it
-mipsel	OPC_MTC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	a move whose other end is a floating-point register is an FP move, which is the same rule that makes x86's MOVD a vector move; the remedy is the fp.mov word stated at this decode site
-mipsel	OPC_MFC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	same as OPC_MTC1, in the other direction
+# The MTC1/MFC1 coverage path CLOSED: target/mips now states fp.mov for the
+# whole general-to-floating transfer family, so the two rows below reach no
+# class and are kept as comments rather than deleted -- --require-ruled calls
+# a ruling whose class is empty a dead rule, and that is how the retirement
+# was found rather than assumed.
+#   mipsel	OPC_MTC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	a move whose other end is a floating-point register is an FP move
+#   mipsel	OPC_MFC1	GEN_OP_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	same as OPC_MTC1, in the other direction
+#
+# Stating it exposed the incumbent contradicting itself on its own rule: it
+# calls MTC1 an FP move and MTHC1 -- the same transfer into the upper half of
+# the same register -- a plain one, because the word comes from the mnemonic
+# and the `h` displaces the `c1` the heuristic keys on.
+mipsel	OPC_MTHC1	GEN_OP_FP_MOV	GEN_OP_MOV	QEMU	SETTLED	mthc1 writes the upper half of a floating-point register, which is the same transfer OPC_MTC1 makes and which the incumbent itself calls an FP move
+mipsel	OPC_MFHC1	GEN_OP_FP_MOV	GEN_OP_MOV	QEMU	SETTLED	same as OPC_MTHC1, in the other direction
 mipsel	OPC_TEQ	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	a conditional trap compares in order to raise; the raise is what the instruction is for and the incumbent names only the test
 mipsel	OPC_TGEU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TEQI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
@@ -125,8 +137,10 @@ mipsel	OPC_SRA	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000003, rd == $z
 mipsel	OPC_SRLV	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000006, rd == $zero, same reading as OPC_SRL
 mipsel	OPC_SLLV	GEN_OP_NOP	GEN_OP_SHL	QEMU	SETTLED	measured: 0x00000004, rd == $zero, same reading as OPC_SRL
 mipsel	OPC_JR	GEN_OP_RET	GEN_OP_BRANCH	QEMU	SETTLED	jr $ra returns; B4 states it from rs == 31 rather than from the operand's printed name
-mipsel	OPC_BOVC	GEN_OP_BRANCH	GEN_OP_INT_ADD	CAPSTONE	COVERAGE-PATH	major opcode 0x08 is ADDI before Release 6 and BOVC on it, the guest's CPU is pre-R6, and B4's per-switch table is keyed by the case value so it names whichever arm the generator took; the remedy is the arm-stated identity B4's own record names as owed
-mipsel	OPC_BNEZC	GEN_OP_BRANCH	GEN_OP_STORE	CAPSTONE	COVERAGE-PATH	the same R6-versus-pre-R6 collision at major opcode 0x3E, where the pre-R6 meaning is SDC2
+# CLOSED: the decode site states each arm's own word, so the class is empty.
+#   mipsel	OPC_BOVC	GEN_OP_BRANCH	GEN_OP_INT_ADD	CAPSTONE	COVERAGE-PATH	major opcode 0x08 is ADDI before Release 6 and BOVC on it, the guest's CPU is pre-R6, and B4's per-switch table is keyed by the case value so it names whichever arm the generator took; the remedy is the arm-stated identity B4's own record names as owed
+# CLOSED: the decode site states each arm's own word, so the class is empty.
+#   mipsel	OPC_BNEZC	GEN_OP_BRANCH	GEN_OP_STORE	CAPSTONE	COVERAGE-PATH	the same R6-versus-pre-R6 collision at major opcode 0x3E, where the pre-R6 meaning is SDC2
 
 # -- NO-RULE with a name on the other side -----------------------------------
 # An encoding the decoder refused did not reach a rule, and that is information

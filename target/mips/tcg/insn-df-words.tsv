@@ -193,21 +193,21 @@ OPC_SEL_S	cmov
 OPC_CFC1	mov
 OPC_CTC1	mov
 OPC_DMFC0	mov
-OPC_DMFC1	mov
+OPC_DMFC1	fp.mov
 OPC_DMTC0	mov
-OPC_DMTC1	mov
+OPC_DMTC1	fp.mov
 OPC_LUI	mov
 OPC_MFC0	mov
-OPC_MFC1	mov
+OPC_MFC1	fp.mov
 OPC_MFHC0	mov
-OPC_MFHC1	mov
+OPC_MFHC1	fp.mov
 OPC_MFHI	mov
 OPC_MFLO	mov
 OPC_MFTR	mov
 OPC_MTC0	mov
-OPC_MTC1	mov
+OPC_MTC1	fp.mov
 OPC_MTHC0	mov
-OPC_MTHC1	mov
+OPC_MTHC1	fp.mov
 OPC_MTHI	mov
 OPC_MTLO	mov
 OPC_MTTR	mov
@@ -316,7 +316,7 @@ OPC_BC1TANY4	jump.cond
 OPC_BC1TL	jump.cond
 OPC_BEQ	jump.cond
 OPC_BEQL	jump.cond
-OPC_BEQZC	jump.cond
+OPC_BEQZC	-	major opcode 0x36 is BEQZC or JIC on Release 6 and the coprocessor-2 load LDC2 before it; the decode site states each arm
 OPC_BGEZ	jump.cond
 OPC_BGEZL	jump.cond
 OPC_BGTZC	jump.cond
@@ -325,9 +325,9 @@ OPC_BLTZ	jump.cond
 OPC_BLTZL	jump.cond
 OPC_BNE	jump.cond
 OPC_BNEL	jump.cond
-OPC_BNEZC	jump.cond
+OPC_BNEZC	-	major opcode 0x3E is BNEZC or JIALC on Release 6 and the coprocessor-2 store SDC2 before it; the decode site states each arm
 OPC_BNVC	jump.cond
-OPC_BOVC	jump.cond
+OPC_BOVC	-	major opcode 0x08 is BOVC/BEQZALC/BEQC on Release 6 and the trapping ADDI before it; the decode site states each arm
 OPC_BPOSGE32	jump.cond
 OPC_BPOSGE64	jump.cond
 

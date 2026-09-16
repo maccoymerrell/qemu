@@ -14,6 +14,34 @@
 #include "exec/plugin-gen.h"
 #include "translate.h"
 #include "fpu_helper.h"
+#include "exec/insn-dataflow.h"
+
+/*
+ * THE LANE SHAPE (fact 17).
+ *
+ * Every MSA operation is a helper call taking register NUMBERS, so the op
+ * stream carries no element width at all -- the datum a consumer needs to
+ * know whether one vector instruction is sixteen byte operations or two
+ * doubleword ones is in the `df` field of the encoding and nowhere else.
+ * target/mips reaches none of TCG's gvec expanders, so the generic statement
+ * in tcg/tcg-op-gvec.c has no MIPS subject and this is where the shape is
+ * held.
+ *
+ * @df is a log2 element size (DF_BYTE 0 .. DF_DOUBLE 3), which is exactly the
+ * convention insn_dataflow_note_vec_shape() and TCG's vece use.  The operand
+ * size is MSA_WRLEN / 8: MSA's vector registers are 128 bits wide, and
+ * msa_translate.c's own helpers say so where they index msa_wr_d[] as a pair
+ * of 64-bit halves.
+ *
+ * Stated after check_msa_enabled() has passed, because an encoding that traps
+ * for a disabled MSA performs no vector operation and has no shape to report.
+ */
+static void note_msa_shape(int df)
+{
+    if (df >= 0) {
+        insn_dataflow_note_vec_shape((unsigned)df, MSA_WRLEN / 8);
+    }
+}
 
 static int elm_n(DisasContext *ctx, int x);
 static int elm_df(DisasContext *ctx, int x);
@@ -265,6 +293,7 @@ static bool gen_msa_BxZ(DisasContext *ctx, int df, int wt, int sa, bool if_not)
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(df);
 
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
         gen_reserved_instruction(ctx);
@@ -297,6 +326,7 @@ static bool trans_msa_i8(DisasContext *ctx, arg_msa_i *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_i8(tcg_env,
                tcg_constant_i32(a->wd),
@@ -323,6 +353,7 @@ static bool trans_SHF(DisasContext *ctx, arg_msa_i *a)
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_helper_msa_shf_df(tcg_env,
                           tcg_constant_i32(a->df),
@@ -339,6 +370,7 @@ static bool trans_msa_i5(DisasContext *ctx, arg_msa_i *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_i5(tcg_env,
                tcg_constant_i32(a->df),
@@ -366,6 +398,7 @@ static bool trans_LDI(DisasContext *ctx, arg_msa_ldi *a)
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_helper_msa_ldi_df(tcg_env,
                           tcg_constant_i32(a->df),
@@ -385,6 +418,7 @@ static bool trans_msa_bit(DisasContext *ctx, arg_msa_bit *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_bit(tcg_env,
                 tcg_constant_i32(a->df),
@@ -414,6 +448,7 @@ static bool trans_msa_3rf(DisasContext *ctx, arg_msa_r *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_3rf(tcg_env,
                 tcg_constant_i32(a->df),
@@ -434,6 +469,7 @@ static bool trans_msa_3r(DisasContext *ctx, arg_msa_r *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_3r(tcg_env,
                tcg_constant_i32(a->wd),
@@ -578,6 +614,7 @@ static bool trans_msa_elm(DisasContext *ctx, arg_msa_elm_df *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_elm_df(tcg_env,
                    tcg_constant_i32(a->df),
@@ -602,6 +639,7 @@ static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_elm[a->df](tcg_env,
                        tcg_constant_i32(a->wd),
@@ -707,6 +745,7 @@ static bool trans_msa_2r(DisasContext *ctx, arg_msa_r *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_2r(tcg_env, tcg_constant_i32(a->wd), tcg_constant_i32(a->ws));
 
@@ -727,6 +766,7 @@ static bool trans_FILL(DisasContext *ctx, arg_msa_r *a)
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_helper_msa_fill_df(tcg_env,
                            tcg_constant_i32(a->df),
@@ -742,6 +782,7 @@ static bool trans_msa_2rf(DisasContext *ctx, arg_msa_r *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     gen_msa_2rf(tcg_env,
                 tcg_constant_i32(a->df),
@@ -776,6 +817,7 @@ static bool trans_msa_ldst(DisasContext *ctx, arg_msa_i *a,
     if (!check_msa_enabled(ctx)) {
         return true;
     }
+    note_msa_shape(a->df);
 
     taddr = tcg_temp_new();
 

@@ -226,7 +226,7 @@ void corpora_init()
         corpus_stmt = new Corpus(
             "CST_DF_STMT_DUMP",
             "#isa\tencoding\tatomic\timm\tvece\toprsz\tmemops\tfieldregs"
-            "\tzero\tnrd\tnwr\n");
+            "\tzero\tpcread\tnrd\tnwr\n");
     }
 }
 
@@ -279,6 +279,48 @@ const char *isa_name()
  * that answers for no bit at all returns UINT_MAX, and the caller writes no
  * zero column rather than a false absence.
  */
+/*
+ * Which provenance bit is the target's program counter.
+ *
+ * A pc-relative value is computed at translation time and materialised as a
+ * constant on every target QEMU has -- the op that would have named the
+ * program counter is never emitted, so a read of it is a decoder-only fact
+ * exactly as the zero register is, and exactly as invisible in the read set's
+ * SIZE, which moves by one for any statement at all.  It therefore gets its
+ * own column.
+ *
+ * The bit is found by NAME over the register namespace rather than spelled,
+ * for the reason zero_atom_bit() gives: indices are the emulator's.  The name
+ * is matched case-insensitively against "pc" because the targets spell the
+ * same register differently ("PC" on MIPS, "pc" on aarch64 and RISC-V) and
+ * the spelling is the target's, not this plugin's.
+ *
+ * A TARGET WHOSE PROGRAM COUNTER IS NOT A TCG GLOBAL ANSWERS UINT_MAX and the
+ * column reads "-" -- an absence of the instrument, which is not the same
+ * claim as a measured zero.  x86 is that target: its EIP lives in
+ * CPUArchState and reaches the reader through the env-range machinery, so its
+ * fold is carried by the `fieldregs` column instead.
+ */
+unsigned pc_reg_bit()
+{
+    static unsigned bit = UINT_MAX;
+    static bool done;
+
+    if (!done) {
+        done = true;
+        for (unsigned r = 0; r < qemu_plugin_dataflow_nregs(); r++) {
+            const char *n = qemu_plugin_dataflow_reg_name(r, nullptr, nullptr);
+
+            if (n && (n[0] == 'p' || n[0] == 'P') &&
+                (n[1] == 'c' || n[1] == 'C') && n[2] == '\0') {
+                bit = r;
+                break;
+            }
+        }
+    }
+    return bit;
+}
+
 unsigned zero_atom_bit()
 {
     static unsigned bit = UINT_MAX;
@@ -553,7 +595,8 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
     char zero[4];
     uint64_t rd[8], wr[8];
     unsigned zbit = zero_atom_bit();
-    bool z_rd = false, z_wr = false;
+    unsigned pcbit = pc_reg_bit();
+    bool z_rd = false, z_wr = false, pc_rd = false;
     unsigned n_rd = 0, n_wr = 0;
     bool have_sets = false;
 
@@ -567,6 +610,9 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         if (zbit != UINT_MAX && zbit / 64 < 8) {
             z_rd = (rd[zbit / 64] >> (zbit % 64)) & 1;
             z_wr = (wr[zbit / 64] >> (zbit % 64)) & 1;
+        }
+        if (pcbit != UINT_MAX && pcbit / 64 < 8) {
+            pc_rd = (rd[pcbit / 64] >> (pcbit % 64)) & 1;
         }
     }
     snprintf(zero, sizeof(zero), "%s%s",
@@ -583,10 +629,11 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
      * reads "-" rather than 0: a refusal and an instruction that touches no
      * register are different claims.
      */
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t", isa_name(), enc,
-            (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t%s\t", isa_name(),
+            enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
             k ? imm : "-", vece, st.vec_oprsz, st.n_memops,
-            fk ? fields : "-", zero[0] ? zero : "-");
+            fk ? fields : "-", zero[0] ? zero : "-",
+            pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"));
     if (have_sets) {
         fprintf(o, "%u\t%u\n", n_rd, n_wr);
     } else {

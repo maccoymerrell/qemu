@@ -30,7 +30,7 @@ import os
 import sys
 
 COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz', 'memops',
-           'fieldregs', 'zero', 'nrd', 'nwr')
+           'fieldregs', 'zero', 'pcread', 'nrd', 'nwr')
 
 
 def load(paths):
@@ -101,6 +101,8 @@ def census(rows):
         'fieldreg_unnamed': 0,
         'zero_read': 0,
         'zero_write': 0,
+        'pc_read': 0,
+        'pc_absent': 0,
         'reg_reads': 0,
         'reg_writes': 0,
         'set_refused': 0,
@@ -136,6 +138,12 @@ def census(rows):
             c['zero_read'] += 1
         if 'w' in row['zero']:
             c['zero_write'] += 1
+        if row['pcread'] == '-':
+            # The target has no program counter in the register namespace, so
+            # this column is an ABSENT INSTRUMENT and not a measured zero.
+            c['pc_absent'] += 1
+        elif row['pcread'] == 'r':
+            c['pc_read'] += 1
         if row.get('_conflict'):
             c['conflict'] += 1
     return c, named
@@ -156,6 +164,8 @@ def report(tag, c, named, stamp, nfiles, show_names):
     print('   env range unnamed    %d' % c['fieldreg_unnamed'])
     print('   zero reg READ        %d' % c['zero_read'])
     print('   zero reg WRITTEN     %d' % c['zero_write'])
+    print('   folded pc READ       %d' % c['pc_read'])
+    print('   pc column ABSENT     %d' % c['pc_absent'])
     print('   register READS       %d' % c['reg_reads'])
     print('   register WRITES      %d' % c['reg_writes'])
     print('   set REFUSED          %d' % c['set_refused'])

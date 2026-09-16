@@ -164,6 +164,31 @@
 
 #define X86_OP_NONE { 0 },
 
+/*
+ * The generic word this rule states, from the checked-in adjudication data.
+ *
+ * A rule whose word is not adjudicated does not compile: the macro pastes
+ * X86_DF_WORD_<rule> and the generated header defines exactly the rules the
+ * table names.  NULL is a statement too -- the rule has nothing generic to
+ * say about itself -- and insn-df-words.tsv carries the reason on the row.
+ */
+#include "insn-df-words.h.inc"
+#define X86_DF_WORD(op)  glue(X86_DF_WORD_, op)
+#define X86_DF_IDENT(op) .rule = stringify(op), .word = X86_DF_WORD(op)
+/* The same statement for a handler that patches the entry in place. */
+#define X86_DF_SET(e, op) do {                                        \
+    (e)->rule = stringify(op);                                        \
+    (e)->word = X86_DF_WORD(op);                                      \
+} while (0)
+/* One row of the same, for a handler that selects from a table. */
+typedef struct X86DfIdent { const char *rule, *word; } X86DfIdent;
+#define X86_DF_ROW(op)  { stringify(op), X86_DF_WORD(op) }
+#define X86_DF_NOROW    { NULL, NULL }
+#define X86_DF_PICK(e, tbl, i) do {                                   \
+    (e)->rule = (tbl)[i].rule;                                        \
+    (e)->word = (tbl)[i].word;                                        \
+} while (0)
+
 #define X86_OP_GROUP3(op, op0_, s0_, op1_, s1_, op2_, s2_, ...) { \
     .decode = glue(decode_, op),                                  \
     .op0 = glue(X86_TYPE_, op0_),                                 \
@@ -189,6 +214,7 @@
 
 #define X86_OP_ENTRY3(op, op0_, s0_, op1_, s1_, op2_, s2_, ...) { \
     .gen = glue(gen_, op),                                        \
+    X86_DF_IDENT(op),                                             \
     .op0 = glue(X86_TYPE_, op0_),                                 \
     .s0 = glue(X86_SIZE_, s0_),                                   \
     .op1 = glue(X86_TYPE_, op1_),                                 \
@@ -224,6 +250,31 @@
     X86_OP_ENTRY3(op, op0, s0, 2op, s0, None, None, ## __VA_ARGS__)
 #define X86_OP_ENTRY0(op, ...)                                    \
     X86_OP_ENTRY3(op, None, None, None, None, None, None, ## __VA_ARGS__)
+
+/*
+ * A row whose emitter is a sibling instruction's.
+ *
+ * x86 spells CMP as a SUB whose writeback is suppressed, TEST as the same AND,
+ * and MOVZX/MOVSX as a MOV with an extension applied to the source.  QEMU
+ * shares one gen function across each pair and the row names that function, so
+ * the row's first argument is the EMITTER and not the rule the bytes reached.
+ * These spell both: @rule is what ran, @op is what emits it.  The distinction
+ * is the decoder's -- the ops the two forms emit are the same ops -- which is
+ * exactly the kind of fact this statement layer exists to carry.
+ */
+#define X86_OP_ALIAS3(rule, op, op0_, s0_, op1_, s1_, op2_, s2_, ...) { \
+    .gen = glue(gen_, op),                                        \
+    X86_DF_IDENT(rule),                                           \
+    .op0 = glue(X86_TYPE_, op0_),                                 \
+    .s0 = glue(X86_SIZE_, s0_),                                   \
+    .op1 = glue(X86_TYPE_, op1_),                                 \
+    .s1 = glue(X86_SIZE_, s1_),                                   \
+    .op2 = glue(X86_TYPE_, op2_),                                 \
+    .s2 = glue(X86_SIZE_, s2_),                                   \
+    ## __VA_ARGS__                                                \
+}
+#define X86_OP_ALIASrr(rule, op, op0, s0, op1, s1, ...)           \
+    X86_OP_ALIAS3(rule, op, None, None, op0, s0, op1, s1, ## __VA_ARGS__)
 
 #define cpuid(feat) .cpuid = X86_FEAT_##feat,
 #define nolea .special = X86_SPECIAL_NoLoadEA,
@@ -307,8 +358,13 @@ static void decode_group8(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
         NULL, NULL, NULL, NULL,
         gen_BT, gen_BTS, gen_BTR, gen_BTC,
     };
+    static const X86DfIdent group8_df[8] = {
+        X86_DF_NOROW,   X86_DF_NOROW,    X86_DF_NOROW,    X86_DF_NOROW,
+        X86_DF_ROW(BT), X86_DF_ROW(BTS), X86_DF_ROW(BTR), X86_DF_ROW(BTC),
+    };
     int op = (get_modrm(s, env) >> 3) & 7;
     entry->gen = group8_gen[op];
+    X86_DF_PICK(entry, group8_df, op);
     if (op == 4) {
         /* prevent writeback and LOCK for BT */
         entry->op1 = entry->op0;
@@ -385,8 +441,13 @@ static void decode_group17(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
     static const X86GenFunc group17_gen[8] = {
         NULL, gen_BLSR, gen_BLSMSK, gen_BLSI,
     };
+    static const X86DfIdent group17_df[8] = {
+        X86_DF_NOROW, X86_DF_ROW(BLSR), X86_DF_ROW(BLSMSK), X86_DF_ROW(BLSI),
+        X86_DF_NOROW, X86_DF_NOROW,     X86_DF_NOROW,       X86_DF_NOROW,
+    };
     int op = (get_modrm(s, env) >> 3) & 7;
     entry->gen = group17_gen[op];
+    X86_DF_PICK(entry, group17_df, op);
 }
 
 static void decode_group12(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -468,11 +529,14 @@ static void decode_0F77(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 {
     if (!(s->prefix & PREFIX_VEX)) {
         entry->gen = gen_EMMS;
+        X86_DF_SET(entry, EMMS);
     } else if (!s->vex_l) {
         entry->gen = gen_VZEROUPPER;
+        X86_DF_SET(entry, VZEROUPPER);
         entry->vex_class = 8;
     } else {
         entry->gen = gen_VZEROALL;
+        X86_DF_SET(entry, VZEROALL);
         entry->vex_class = 8;
     }
 }
@@ -492,8 +556,10 @@ static void decode_0F79(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 {
     if (s->prefix & PREFIX_REPNZ) {
         entry->gen = gen_INSERTQ_r; /* AMD extension */
+        X86_DF_SET(entry, INSERTQ_r);
     } else if (s->prefix & PREFIX_DATA) {
         entry->gen = gen_EXTRQ_r; /* AMD extension */
+        X86_DF_SET(entry, EXTRQ_r);
     } else {
         entry->gen = NULL;
     };
@@ -1076,7 +1142,13 @@ static void decode_VxCOMISx(DisasContext *s, CPUX86State *env, X86OpEntry *entry
      * which X86_VEX_REPScalar exists, but here it has to be decoded by hand.
      */
     entry->s1 = entry->s2 = (s->prefix & PREFIX_DATA ? X86_SIZE_sd : X86_SIZE_ss);
-    entry->gen = (*b == 0x2E ? gen_VUCOMI : gen_VCOMI);
+    if (*b == 0x2E) {
+        entry->gen = gen_VUCOMI;
+        X86_DF_SET(entry, VUCOMI);
+    } else {
+        entry->gen = gen_VCOMI;
+        X86_DF_SET(entry, VCOMI);
+    }
 }
 
 static void decode_sse_unary(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -1086,9 +1158,9 @@ static void decode_sse_unary(DisasContext *s, CPUX86State *env, X86OpEntry *entr
         entry->s1 = X86_SIZE_None;
     }
     switch (*b) {
-    case 0x51: entry->gen = gen_VSQRT; break;
-    case 0x52: entry->gen = gen_VRSQRT; break;
-    case 0x53: entry->gen = gen_VRCP; break;
+    case 0x51: entry->gen = gen_VSQRT;  X86_DF_SET(entry, VSQRT);  break;
+    case 0x52: entry->gen = gen_VRSQRT; X86_DF_SET(entry, VRSQRT); break;
+    case 0x53: entry->gen = gen_VRCP;   X86_DF_SET(entry, VRCP);   break;
     }
 }
 
@@ -1141,6 +1213,7 @@ static void decode_MOV_CR_DR(DisasContext *s, CPUX86State *env, X86OpEntry *entr
     s->modrm |= 0xC0;
 
     entry->gen = gen_MOV;
+    X86_DF_SET(entry, MOV);
 }
 
 static const X86OpEntry opcodes_0F[256] = {
@@ -1245,8 +1318,8 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xb3] = X86_OP_ENTRY2(BTR,    E,v, G,v,             btEvGv),
     [0xb4] = X86_OP_ENTRY3(LFS,    G,v, EM,p, None, None),
     [0xb5] = X86_OP_ENTRY3(LGS,    G,v, EM,p, None, None),
-    [0xb6] = X86_OP_ENTRY3(MOV,    G,v, E,b, None, None, zextT0), /* MOVZX */
-    [0xb7] = X86_OP_ENTRY3(MOV,    G,v, E,w, None, None, zextT0), /* MOVZX */
+    [0xb6] = X86_OP_ALIAS3(MOVZX, MOV, G,v, E,b, None, None, zextT0),
+    [0xb7] = X86_OP_ALIAS3(MOVZX, MOV, G,v, E,w, None, None, zextT0),
 
     [0xc0] = X86_OP_ENTRY2(XADD,       E,b, G,b,            lock),
     [0xc1] = X86_OP_ENTRY2(XADD,       E,v, G,v,            lock),
@@ -1389,8 +1462,8 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xbb] = X86_OP_ENTRY2(BTC,    E,v, G,v,             btEvGv),
     [0xbc] = X86_OP_GROUP0(0FBC),
     [0xbd] = X86_OP_GROUP0(0FBD),
-    [0xbe] = X86_OP_ENTRY3(MOV,    G,v, E,b, None, None, sextT0), /* MOVSX */
-    [0xbf] = X86_OP_ENTRY3(MOV,    G,v, E,w, None, None, sextT0), /* MOVSX */
+    [0xbe] = X86_OP_ALIAS3(MOVSX, MOV, G,v, E,b, None, None, sextT0),
+    [0xbf] = X86_OP_ALIAS3(MOVSX, MOV, G,v, E,w, None, None, sextT0),
 
     [0xc8] = X86_OP_ENTRY1(BSWAP,     LoBits,y),
     [0xc9] = X86_OP_ENTRY1(BSWAP,     LoBits,y),
@@ -1445,7 +1518,8 @@ static void decode_63(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint
 {
     static const X86OpEntry arpl = X86_OP_ENTRY2(ARPL, E,w, G,w, chk(prot));
     static const X86OpEntry mov = X86_OP_ENTRY3(MOV, G,v, E,v, None, None);
-    static const X86OpEntry movsxd = X86_OP_ENTRY3(MOV, G,v, E,d, None, None, sextT0);
+    static const X86OpEntry movsxd =
+        X86_OP_ALIAS3(MOVSX, MOV, G,v, E,d, None, None, sextT0);
     if (!CODE64(s)) {
         *entry = arpl;
     } else if (REX_W(s)) {
@@ -1460,8 +1534,18 @@ static void decode_group1(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
     static const X86GenFunc group1_gen[8] = {
         gen_ADD, gen_OR, gen_ADC, gen_SBB, gen_AND, gen_SUB, gen_XOR, gen_SUB,
     };
+    /*
+     * Slot 7 is CMP.  It shares gen_SUB because a compare is a subtraction
+     * whose writeback is suppressed below, but the RULE the bytes reached is
+     * CMP and that is what is stated.
+     */
+    static const X86DfIdent group1_df[8] = {
+        X86_DF_ROW(ADD), X86_DF_ROW(OR),  X86_DF_ROW(ADC), X86_DF_ROW(SBB),
+        X86_DF_ROW(AND), X86_DF_ROW(SUB), X86_DF_ROW(XOR), X86_DF_ROW(CMP),
+    };
     int op = (get_modrm(s, env) >> 3) & 7;
     entry->gen = group1_gen[op];
+    X86_DF_PICK(entry, group1_df, op);
 
     if (op == 7) {
         /* prevent writeback for CMP */
@@ -1481,6 +1565,7 @@ static void decode_group1A(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         *entry = UNKNOWN_OPCODE;
     } else {
         entry->gen = gen_POP;
+        X86_DF_SET(entry, POP);
         /* The address must use the value of ESP after the pop.  */
         s->popl_esp_hack = 1 << mo_pushpop(s, s->dflag);
     }
@@ -1492,8 +1577,13 @@ static void decode_group2(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
         gen_ROL, gen_ROR, gen_RCL, gen_RCR,
         gen_SHL, gen_SHR, gen_SHL /* SAL, undocumented */, gen_SAR,
     };
+    static const X86DfIdent group2_df[8] = {
+        X86_DF_ROW(ROL), X86_DF_ROW(ROR), X86_DF_ROW(RCL), X86_DF_ROW(RCR),
+        X86_DF_ROW(SHL), X86_DF_ROW(SHR), X86_DF_ROW(SHL), X86_DF_ROW(SAR),
+    };
     int op = (get_modrm(s, env) >> 3) & 7;
     entry->gen = group2_gen[op];
+    X86_DF_PICK(entry, group2_df, op);
     if (op == 7) {
         entry->special = X86_SPECIAL_SExtT0;
     } else {
@@ -1505,7 +1595,7 @@ static void decode_group3(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
 {
     static const X86OpEntry opcodes_grp3[16] = {
         /* 0xf6 */
-        [0x00] = X86_OP_ENTRYrr(AND, E,b, I,b),
+        [0x00] = X86_OP_ALIASrr(TEST, AND, E,b, I,b),
         [0x02] = X86_OP_ENTRY1(NOT,  E,b,      lock),
         [0x03] = X86_OP_ENTRY1(NEG,  E,b,      lock),
         [0x04] = X86_OP_ENTRYrr(MUL, E,b, 0,b, zextT0),
@@ -1514,7 +1604,7 @@ static void decode_group3(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
         [0x07] = X86_OP_ENTRYr(IDIV, E,b),
 
         /* 0xf7 */
-        [0x08] = X86_OP_ENTRYrr(AND, E,v, I,z),
+        [0x08] = X86_OP_ALIASrr(TEST, AND, E,v, I,z),
         [0x0a] = X86_OP_ENTRY1(NOT,  E,v,      lock),
         [0x0b] = X86_OP_ENTRY1(NEG,  E,v,      lock),
         [0x0c] = X86_OP_ENTRYrr(MUL, E,v, 0,v, zextT0),
@@ -1560,6 +1650,7 @@ static void decode_group11(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         *entry = UNKNOWN_OPCODE;
     } else {
         entry->gen = gen_MOV;
+        X86_DF_SET(entry, MOV);
     }
 }
 
@@ -1653,8 +1744,8 @@ static const X86OpEntry opcodes_root[256] = {
     [0x81] = X86_OP_GROUP2(group1, E,v, I,z),
     [0x82] = X86_OP_GROUP2(group1, E,b, I,b, chk(i64)),
     [0x83] = X86_OP_GROUP2(group1, E,v, I,b),
-    [0x84] = X86_OP_ENTRYrr(AND, E,b, G,b),
-    [0x85] = X86_OP_ENTRYrr(AND, E,v, G,v),
+    [0x84] = X86_OP_ALIASrr(TEST, AND, E,b, G,b),
+    [0x85] = X86_OP_ALIASrr(TEST, AND, E,v, G,v),
     [0x86] = X86_OP_ENTRY2(XCHG, E,b, G,b, xchg),
     [0x87] = X86_OP_ENTRY2(XCHG, E,v, G,v, xchg),
 
@@ -1745,12 +1836,12 @@ static const X86OpEntry opcodes_root[256] = {
     [0x2E] = {},
     [0x2F] = X86_OP_ENTRY0(DAS, chk(i64)),
 
-    [0x38] = X86_OP_ENTRYrr(SUB, E,b, G,b),
-    [0x39] = X86_OP_ENTRYrr(SUB, E,v, G,v),
-    [0x3A] = X86_OP_ENTRYrr(SUB, G,b, E,b),
-    [0x3B] = X86_OP_ENTRYrr(SUB, G,v, E,v),
-    [0x3C] = X86_OP_ENTRYrr(SUB, 0,b, I,b),   /* AL, Ib */
-    [0x3D] = X86_OP_ENTRYrr(SUB, 0,v, I,z),   /* rAX, Iz */
+    [0x38] = X86_OP_ALIASrr(CMP, SUB, E,b, G,b),
+    [0x39] = X86_OP_ALIASrr(CMP, SUB, E,v, G,v),
+    [0x3A] = X86_OP_ALIASrr(CMP, SUB, G,b, E,b),
+    [0x3B] = X86_OP_ALIASrr(CMP, SUB, G,v, E,v),
+    [0x3C] = X86_OP_ALIASrr(CMP, SUB, 0,b, I,b),   /* AL, Ib */
+    [0x3D] = X86_OP_ALIASrr(CMP, SUB, 0,v, I,z),   /* rAX, Iz */
     [0x3E] = {},
     [0x3F] = X86_OP_ENTRY0(AAS, chk(i64)),
 
@@ -1809,8 +1900,8 @@ static const X86OpEntry opcodes_root[256] = {
     [0x9E] = X86_OP_ENTRY0(SAHF),
     [0x9F] = X86_OP_ENTRY0(LAHF),
 
-    [0xA8] = X86_OP_ENTRYrr(AND, 0,b, I,b),   /* AL, Ib */
-    [0xA9] = X86_OP_ENTRYrr(AND, 0,v, I,z),   /* rAX, Iz */
+    [0xA8] = X86_OP_ALIASrr(TEST, AND, 0,b, I,b),   /* AL, Ib */
+    [0xA9] = X86_OP_ALIASrr(TEST, AND, 0,v, I,z),   /* rAX, Iz */
     [0xAA] = X86_OP_ENTRYwr(STOS, Y,b, 0,b),
     [0xAB] = X86_OP_ENTRYwr(STOS, Y,v, 0,v),
     /* Manual writeback because REP LODS (!) has to write EAX/RAX after every LODS.  */
@@ -2825,6 +2916,19 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
             }
         }
     }
+
+    /*
+     * Which rule the bytes reached, stated once the entry is final.
+     *
+     * Here and not earlier: every route above this point goes to illegal_op,
+     * gp_fault or unknown_op, and an encoding that ends there reached no rule
+     * -- the decoder declined it, which a consumer must be able to tell from
+     * a rule that ran.  Here and not at the gen call: the statement is about
+     * the rule, not about the code it emits, and the two gen call sites below
+     * would state it twice.
+     */
+    insn_dataflow_note_rule(decode.e.rule);
+    insn_dataflow_note_word(decode.e.word);
 
     if (decode.e.special == X86_SPECIAL_MMX &&
         !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {

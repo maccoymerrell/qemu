@@ -282,6 +282,19 @@ struct X86OpEntry {
         X86GenFunc gen;
         X86DecodeFunc decode;
     };
+    /*
+     * Which rule the bytes reached, and what it does.
+     *
+     * The table names its rule once, as the first argument of the row; the
+     * macros paste the name and its adjudicated generic word in here so a
+     * consumer can be told both without a second table to keep in step.  A
+     * GROUP row names a decode FUNCTION rather than an instruction and leaves
+     * both NULL: the entry it installs carries the real rule, and the nine
+     * handlers that patch this entry rather than replacing it state their own
+     * rule beside the gen function they pick.
+     */
+    const char  *rule;
+    const char  *word;
     /* op0 is always written, op1 and op2 are always read.  */
     X86OpType    op0:8;
     X86OpSize    s0:8;

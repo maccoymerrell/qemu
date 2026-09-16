@@ -50,10 +50,18 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+      'champsim_tracer/champsim_tracer_capture.cc',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',
                               '-Wno-missing-field-initializers',
                               '-Wno-pedantic']
+  # The comparison capture is apparatus and does not ship.  Without this the
+  # capture TU compiles to nothing and the object carries neither its code nor
+  # the names of the variables that would drive it -- a property nm and strings
+  # can check, which is why it is a build option and not a runtime one.
+  if get_option('cst_capture')
+    champsim_tracer_cpp_args += ['-DCST_CAPTURE']
+  endif
   if host_os == 'windows'
     champsim_tracer_so = shared_module('champsim_tracer',
                        champsim_tracer_sources + files('win32_linker.c'),
@@ -199,6 +207,7 @@ if get_option('plugins')
     'isaxcheck_fields',
     files('champsim_tracer/tools/isaxcheck_fields.cc',
           'champsim_tracer/champsim_tracer_decode.cc',
+          'champsim_tracer/champsim_tracer_capture.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
     include_directories: ['../../include/qemu', '../../include',

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_capture.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 
@@ -509,6 +510,7 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
  * mnemonic classification table.
  */
 void decode_detail_to_generic(uint64_t pc,
+                              const void *bytes, size_t nbytes,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
                               InsnRegNames *out_names)
@@ -887,6 +889,14 @@ void decode_detail_to_generic(uint64_t pc,
     if (cls && cls->dep_refine) {
         cls->dep_refine(info, out);
     }
+
+    /*
+     * The one call the comparison capture is reachable through, at the point
+     * classification is finished.  It compiles to nothing in a release build
+     * (champsim_tracer_capture.h), which is why it can sit on the hot path
+     * without a runtime guard in front of it.
+     */
+    cst_capture_insn(pc, bytes, nbytes, info, out);
 }
 
 /*

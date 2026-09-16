@@ -51,6 +51,27 @@ if [ -z "$markers" ]; then
     exit 1
 fi
 
+# THE CAPTURE MUST NOT BE IN A RELEASE PLUGIN.
+#
+# The comparison capture is apparatus: it exists to score the classifier and
+# has no business inside the object that ships.  Keeping it out is a build
+# option (-Dcst_capture), and a build option that nobody checks is a promise.
+# So the object is checked, not the option: a release plugin carries neither
+# the capture symbol nor the environment-variable names that would drive it.
+#
+# This is proven red-able by configuring the same tree with
+# -Dcst_capture=true and re-running: both counts go nonzero.
+cap_sym=$(nm -C "$plugin" 2>/dev/null | grep -c "cst_capture_insn" || :)
+cap_str=$(strings "$plugin" 2>/dev/null \
+          | grep -c "CST_SRC_ENC_DUMP\|CST_OPC_ENC_DUMP\|CST_SRC_MECH_DUMP\|CST_QEMU_IDENT_PAIRS" || :)
+if [ "${cap_sym:-0}" -ne 0 ] || [ "${cap_str:-0}" -ne 0 ]; then
+    echo "plugin_abi_gate: FAIL — $plugin was built with the comparison"
+    echo "  capture (symbols=$cap_sym capture-env-strings=$cap_str).  That is"
+    echo "  an apparatus build; it must not be the one that ships."
+    exit 1
+fi
+echo "plugin_abi_gate: capture-free plugin (0 capture symbols, 0 capture strings)"
+
 rows=0 bad=0
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT

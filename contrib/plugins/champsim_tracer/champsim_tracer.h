@@ -1710,6 +1710,7 @@ void altmint_conditional_alternate(const InsnFields *terminal,
 
 /* Defined in champsim_tracer_decode.cc */
 void decode_detail_to_generic(uint64_t pc,
+                              const void *bytes, size_t nbytes,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
                               InsnRegNames *out_names);

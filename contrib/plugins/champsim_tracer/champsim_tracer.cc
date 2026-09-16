@@ -3813,7 +3813,8 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
             ns = nscratch[i].get();
             insn_reg_names_scratch_reset(ns);
         }
-        decode_detail_to_generic(at, &info, &fs.f, ns ? &ns->rn : nullptr);
+        decode_detail_to_generic(at, p, sz, &info, &fs.f,
+                                 ns ? &ns->rn : nullptr);
         uint8_t bt = fs.f.branch_type;
         pcs[i]   = at;
         sizes[i] = sz;
@@ -9709,7 +9710,12 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
          * only branch_type is consumed here). */
         InsnFieldsScratch s;
         insn_fields_scratch_reset(&s);
-        decode_detail_to_generic(0, info, &s.f, nullptr);
+        /*
+         * A branch-type probe, not a classification of an encoding this run
+         * saw: it has no bytes to key a capture row on, and a row keyed on
+         * nothing is not a row.
+         */
+        decode_detail_to_generic(0, nullptr, 0, info, &s.f, nullptr);
         return s.f.branch_type;
     };
     /*

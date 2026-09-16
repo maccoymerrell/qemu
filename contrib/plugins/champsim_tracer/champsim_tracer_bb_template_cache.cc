@@ -1622,7 +1622,11 @@ BBTemplate *TemplateStore::create_tb_template(
             }
             if (insn_info && insn_info[i].mnemonic[0]) {
                 decode_detail_to_generic(
-                    tmpl->insn_pcs[i], &insn_info[i], &scratch[i].f,
+                    tmpl->insn_pcs[i],
+                    insn_bytes ? insn_bytes + (size_t)i * MAX_INSN_BYTES
+                               : nullptr,
+                    insn_bytes && insn_sizes ? insn_sizes[i] : 0,
+                    &insn_info[i], &scratch[i].f,
                     with_names ? &nscratch[i].rn : nullptr);
             }
             /*

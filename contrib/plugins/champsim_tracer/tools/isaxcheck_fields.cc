@@ -141,7 +141,11 @@ bool isax_fields_decode(const struct qemu_plugin_insn_info *info,
     }
     InsnFieldsScratch scratch;
     insn_fields_scratch_reset(&scratch);
-    decode_detail_to_generic(0x100000, info, &scratch.f, nullptr);
+    /*
+     * An offline scorer, not a translation: it has no encoding bytes in hand
+     * to key a capture row on, and this tool never builds with the capture.
+     */
+    decode_detail_to_generic(0x100000, nullptr, 0, info, &scratch.f, nullptr);
 
     const InsnFields &f = scratch.f;
     /* GEN_OP_UNKNOWN is decode_detail_to_generic()'s early return: the

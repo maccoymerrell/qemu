@@ -27,6 +27,7 @@
 #include "semihosting/semihost.h"
 #include "cpregs.h"
 #include "exec/helper-proto.h"
+#include "exec/insn-dataflow.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -75,6 +76,55 @@ void arm_translate_init(void)
         offsetof(CPUARMState, exclusive_addr), "exclusive_addr");
     cpu_exclusive_val = tcg_global_mem_new_i64(tcg_env,
         offsetof(CPUARMState, exclusive_val), "exclusive_val");
+
+    /*
+     * The vector file, which lives in CPUARMState and no TCG global names.
+     *
+     * Every AdvSIMD and SVE access is a load or store at an offset into
+     * env.vfp, so what the op stream carries is a byte range.  Declared here,
+     * that range resolves to the register it is part of -- "z3" for a NEON D
+     * access and for a full SVE one alike, which is what an architectural
+     * consumer means by the register.  Offsets and extents come from the
+     * compiler over this target's own structure.
+     *
+     * AArch32 sees the same storage as its Q/D/S file: zregs[n] is Qn, and the
+     * narrower views are sub-ranges of it, so one declaration covers both.
+     */
+    {
+        static const char *const z_p[] = {
+            "z0",  "z1",  "z2",  "z3",  "z4",  "z5",  "z6",  "z7",
+            "z8",  "z9",  "z10", "z11", "z12", "z13", "z14", "z15",
+            "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23",
+            "z24", "z25", "z26", "z27", "z28", "z29", "z30", "z31",
+        };
+        CPUARMState *e = NULL;
+
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(z_p) != ARRAY_SIZE(e->vfp.zregs));
+        insn_dataflow_declare_regfile(z_p, ARRAY_SIZE(e->vfp.zregs),
+                                      offsetof(CPUARMState, vfp.zregs),
+                                      sizeof(e->vfp.zregs[0]),
+                                      sizeof(e->vfp.zregs[0]));
+#ifdef TARGET_AARCH64
+        {
+            /*
+             * pregs[16] is FFR, stored with the predicates so it can be
+             * treated as one of them; it is named as itself here because a
+             * consumer reading "p16" would have no way to know that.
+             */
+            static const char *const p_p[] = {
+                "p0",  "p1",  "p2",  "p3",  "p4",  "p5",  "p6",  "p7",
+                "p8",  "p9",  "p10", "p11", "p12", "p13", "p14", "p15",
+                "ffr",
+            };
+
+            QEMU_BUILD_BUG_ON(ARRAY_SIZE(p_p) != ARRAY_SIZE(e->vfp.pregs));
+            insn_dataflow_declare_regfile(p_p, ARRAY_SIZE(e->vfp.pregs),
+                                          offsetof(CPUARMState, vfp.pregs),
+                                          sizeof(e->vfp.pregs[0]),
+                                          sizeof(e->vfp.pregs[0]));
+        }
+#endif
+    }
 
     a64_translate_init();
 }

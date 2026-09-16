@@ -1535,17 +1535,42 @@ const char *insn_dataflow_field_reg(uint32_t off, uint32_t size)
         }
         rel = off - rf->base_off;
         i = rel / rf->stride;
-        if (i >= rf->count || rel % rf->stride != 0) {
+        if (i >= rf->count) {
             continue;
         }
         /*
-         * An access narrower than the register is still that register: a
-         * 4-byte load out of a 16-byte vector reads part of it, and naming the
-         * container is the whole point of the declaration.  An access WIDER
-         * than the register is not, and is left unnamed rather than
-         * misattributed.
+         * An access narrower than the register is still that register, AT ANY
+         * OFFSET INSIDE IT: a 4-byte load of element 1 of a 16-byte vector
+         * starts four bytes past the register's base, and naming the container
+         * is the whole point of the declaration.  Requiring the access to
+         * start at the base was the earlier rule and it left every element but
+         * the first unnamed -- measured on aarch64, 61 distinct ranges inside
+         * the declared Z file answered with no name at all.
+         *
+         * The test is containment: the whole access must lie inside one
+         * register.  An access that runs off the end of one is not that
+         * register and is left unnamed rather than misattributed, which is the
+         * same rule the width test used to state and the only part of it that
+         * was right.
          */
-        if (size != DF_FIELD_UNBOUNDED && size > rf->size) {
+        rel %= rf->stride;
+        if (size == DF_FIELD_UNBOUNDED) {
+            /*
+             * The extent was not stated, so containment cannot be tested, and
+             * the range may well cover the whole file: a helper handed a
+             * pointer to vreg[0] can write every vector register through it.
+             * Naming the register the access BEGINS in would be read by a
+             * consumer as naming the only register it touched, which is the
+             * under-reporting direction -- a dependency missed, not one
+             * invented.  So an unstated extent gets no name, and the caller is
+             * left with an env range it must treat as the blob it is.
+             *
+             * Measured on riscv64 with V enabled: six of nine field rows are
+             * unbounded helper pointers into vreg, and all six begin at vreg[0].
+             */
+            return NULL;
+        }
+        if (rel + (uint64_t)size > rf->size) {
             continue;
         }
         return rf->names[i];

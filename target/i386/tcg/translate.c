@@ -3836,6 +3836,55 @@ void tcg_x86_init(void)
      */
     x86_insn_df_declare_helper_usage();
 
+    /*
+     * The register files that live in CPUArchState and no TCG global names.
+     *
+     * x86's vector and x87 state is reached by load and store at an offset
+     * into env, so the op stream shows a byte range and not a register.  A
+     * consumer handed that range can say an instruction touched SOMETHING at
+     * offset 1056 and nothing more; with these declared it is handed "xmm0",
+     * which is what the range means.  The offsets and extents come from the
+     * compiler over this target's own structure, so they cannot drift from it.
+     *
+     * The declaration names the CONTAINER: a 4-byte read out of a 64-byte ZMM
+     * is still that register, which is how a consumer sees one register and
+     * not sixteen unrelated ranges.
+     */
+    {
+        static const char *const xmm_p[] = {
+            "xmm0",  "xmm1",  "xmm2",  "xmm3",  "xmm4",  "xmm5",
+            "xmm6",  "xmm7",  "xmm8",  "xmm9",  "xmm10", "xmm11",
+            "xmm12", "xmm13", "xmm14", "xmm15", "xmm16", "xmm17",
+            "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23",
+            "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29",
+            "xmm30", "xmm31",
+        };
+        static const char *const st_p[] = {
+            "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+        };
+        static const char *const k_p[] = {
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+        };
+        CPUX86State *e = NULL;
+
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(xmm_p) < ARRAY_SIZE(e->xmm_regs));
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(st_p) != ARRAY_SIZE(e->fpregs));
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(k_p) != ARRAY_SIZE(e->opmask_regs));
+
+        insn_dataflow_declare_regfile(xmm_p, ARRAY_SIZE(e->xmm_regs),
+                                      offsetof(CPUX86State, xmm_regs),
+                                      sizeof(e->xmm_regs[0]),
+                                      sizeof(e->xmm_regs[0]));
+        insn_dataflow_declare_regfile(st_p, ARRAY_SIZE(e->fpregs),
+                                      offsetof(CPUX86State, fpregs),
+                                      sizeof(e->fpregs[0]),
+                                      sizeof(e->fpregs[0]));
+        insn_dataflow_declare_regfile(k_p, ARRAY_SIZE(e->opmask_regs),
+                                      offsetof(CPUX86State, opmask_regs),
+                                      sizeof(e->opmask_regs[0]),
+                                      sizeof(e->opmask_regs[0]));
+    }
+
     static const char reg_names[CPU_NB_REGS][4] = {
 #ifdef TARGET_X86_64
         [R_EAX] = "rax",

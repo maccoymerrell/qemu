@@ -1444,4 +1444,30 @@ void riscv_translate_init(void)
                              "load_res");
     load_val = tcg_global_mem_new(tcg_env, offsetof(CPURISCVState, load_val),
                              "load_val");
+
+    /*
+     * The vector file, which lives in CPURISCVState and no TCG global names.
+     *
+     * vreg is one flat array of 64-bit words rather than an array of
+     * registers, so the stride is computed from the width a register occupies
+     * in it -- the whole array over 32 -- which is what makes an access at any
+     * element size land on the right vN.  The extent is the same: a vector
+     * register's storage here is RV_VLEN_MAX bits however small vl is at the
+     * time, and the declaration describes the storage.
+     */
+    {
+        static const char *const v_p[] = {
+            "v0",  "v1",  "v2",  "v3",  "v4",  "v5",  "v6",  "v7",
+            "v8",  "v9",  "v10", "v11", "v12", "v13", "v14", "v15",
+            "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+            "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+        };
+        CPURISCVState *e = NULL;
+        uint32_t per_reg = sizeof(e->vreg) / ARRAY_SIZE(v_p);
+
+        QEMU_BUILD_BUG_ON(sizeof(((CPURISCVState *)0)->vreg) % 32 != 0);
+        insn_dataflow_declare_regfile(v_p, ARRAY_SIZE(v_p),
+                                      offsetof(CPURISCVState, vreg),
+                                      per_reg, per_reg);
+    }
 }

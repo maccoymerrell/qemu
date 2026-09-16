@@ -968,30 +968,22 @@ struct Stats {
      *   its own PC (the same single-iteration translation jumps back before
      *   taking the zero-count exit); the emitted terminal edge was restored
      *   to the architectural fall-through.
-     * rep_fanout_reg_iters_reconstructed — iterations rendered by a fan-out
-     *   whose per-iteration destination-register snapshots were
-     *   reconstructed (#138): the parent entry carries iteration 1's
-     *   post-state, each sub-entry its own iteration's, and the final
-     *   iteration the captured END state verbatim (CMPS flags excepted:
-     *   RF is still set after the final counted iteration, because the
-     *   instruction completes only in the unrendered trailing pass) — the
-     *   same values the single-iteration (-icount) translation captures
-     *   live.
-     * rep_fanout_reg_slots_underived — destination slots (counted once per
-     *   fan-out emission) whose non-final-iteration values no
-     *   reconstruction law covers: an accumulator-coupled family
-     *   (SCAS/LODS flags or data register), a compare without captured
-     *   memop values (memdata off), or a pointer stream the stride/END
-     *   self-check refused.  Those slots are published ABSENT (width 0) on
-     *   the non-final iterations — absence, never a guess; the final
-     *   iteration still carries the END snapshot. */
+     * rep_fanout_reg_writes_deferred — fan-out iterations that published NO
+     *   destination register write, i.e. (iterations - 1) per fanned-out
+     *   self-loop (#174).  A repeating instruction updates its
+     *   architectural registers ONCE, on completion; the fan-out renders
+     *   one entry per iteration only so the per-iteration memops have
+     *   somewhere to attach, and iteration N carries the whole
+     *   instruction's observed result.  This counts the entries that
+     *   correctly carry none — publishing intermediate values would inject
+     *   rename pressure and an N-long serial dependency chain that no real
+     *   machine has. */
     uint64_t rep_iters_architectural = 0;
     uint64_t rep_iters_inferred = 0;
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
-    uint64_t rep_fanout_reg_iters_reconstructed = 0;
-    uint64_t rep_fanout_reg_slots_underived = 0;
+    uint64_t rep_fanout_reg_writes_deferred = 0;
     /* rep_piece_table_degenerate — a fault-split REP emission arrived with a
      * per-piece prefix table it could not use, so the emission fell back to
      * the total-based split rather than mis-place slices.

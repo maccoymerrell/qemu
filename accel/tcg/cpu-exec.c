@@ -1032,6 +1032,126 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
     }
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Translate the block at @pc without executing it, so a plugin is told what
+ * QEMU makes of code the guest has not reached.
+ *
+ * Every translation-time callback fires -- vcpu_tb_trans with the whole
+ * qemu_plugin_tb, and with it the per-instruction identity, the dataflow
+ * statements and the control notes -- because this is a real translation and
+ * translator_loop() emits them.  That is the whole reason the facility
+ * exists: those facts are keyed on (tb, idx) and readable at no other moment
+ * (qemu-plugin-dataflow.h), so the only way to have QEMU's answer about a
+ * block is to have QEMU translate it.  A decoder run beside QEMU can supply a
+ * length and a name; it cannot supply the row a trans_ function accepted or
+ * the ops that row emitted.
+ *
+ * The block is KEPT rather than discarded.  A caller asks about a PC because
+ * it thinks the guest may reach it; if it does, the cached TB is a hit,
+ * vcpu_tb_trans does not fire again, and what the plugin was shown is what
+ * executes.
+ *
+ * Structure follows cpu_plugin_exec_tb() above and stops before
+ * cpu_tb_exec(): the non-faulting instruction-fetch probe that declines an
+ * unmapped, non-executable or privilege-denied page without demand-paging;
+ * the sigsetjmp guard installed BEFORE tb_gen_code, because translation can
+ * itself fault (translator_ld() reading the second page of a straddling
+ * block) and the caller is a plugin callback the outer pad cannot resume; the
+ * memory lock tb_gen_code asserts; and a landing pad that releases what the
+ * unwind skipped.
+ *
+ * cflags are curr_cflags(cpu) verbatim, with nothing added.  The TB produced
+ * here has to be the TB the executor would produce at this PC, or keeping it
+ * warms nothing and the plugin is shown a translation the guest can never
+ * take.  CF_FORCE_SLOW in particular is deliberately absent: it changes
+ * cflags, which changes the TB hash key.
+ *
+ * The translation CONTEXT (cs_base/flags) is the current vCPU state, which is
+ * right by construction for a fall-through or a same-mode branch target and
+ * wrong for a target in another mode.  Deciding that belongs to the caller,
+ * which knows which PC it asked about and why.
+ *
+ * Returns true iff a TB now exists at @pc.  False means declined -- an
+ * unreachable page, a translation-time fault, or a full code buffer -- and
+ * nothing was mutated.
+ */
+bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc)
+{
+    CPUArchState *env = cpu_env(cpu);
+    TranslationBlock *tb;
+    vaddr cur_pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+    bool saved_running;
+    bool ok;
+
+    /*
+     * A translate-on-demand runs from a vCPU EXEC callback, never from a
+     * translation callback and never off the vCPU thread.  tcg_ctx is
+     * per-thread and tcg_ctx->gen_tb names the translation in flight on it,
+     * so re-entering tb_gen_code from inside one corrupts it.  Asserted
+     * rather than commented, because the failure is silent.
+     */
+    g_assert(cpu == current_cpu);
+    g_assert(tcg_ctx->gen_tb == NULL);
+
+    cpu_get_tb_cpu_state(env, &cur_pc, &cs_base, &flags);
+    cflags = curr_cflags(cpu);
+
+    void *host;
+    int pflags = probe_access_flags(env, pc, 1, MMU_INST_FETCH,
+                                    cpu_mmu_index(cpu, true),
+                                    true, &host, 0);
+    if (pflags & TLB_INVALID_MASK) {
+        return false;
+    }
+
+    saved_running = cpu->running;
+
+    sigjmp_buf saved_jmp_env;
+    memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
+
+    cpu->plugin_decode_only = true;
+    if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+        if (tb == NULL) {
+            mmap_lock();
+            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+            mmap_unlock();
+        }
+        ok = (tb != NULL);
+    } else {
+        /*
+         * A translation-time fault landed here from inside tb_gen_code.
+         * Release what the unwind skipped, exactly as the two pads above do:
+         * the TB's PageDesc locks under softmmu, which leak permanently
+         * otherwise, and the in-flight pointer in both modes -- a stale one
+         * makes the NEXT translation on this thread look like a re-entry and
+         * trips the assert above.
+         */
+        cpu->neg.can_do_io = true;
+        qemu_plugin_disable_mem_helpers(cpu);
+#ifdef CONFIG_USER_ONLY
+        clear_helper_retaddr();
+        if (have_mmap_lock()) {
+            mmap_unlock();
+        }
+#else
+        if (tcg_ctx->gen_tb) {
+            tb_unlock_pages(tcg_ctx->gen_tb);
+        }
+#endif
+        tcg_ctx->gen_tb = NULL;
+        ok = false;
+    }
+    cpu->plugin_decode_only = false;
+    cpu->running = saved_running;
+    memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+    return ok;
+}
+#endif /* CONFIG_PLUGIN */
+
 #if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 /*
  * The mip bits a DEVICE owns outright: absent from csr.c's delegable_ints, so

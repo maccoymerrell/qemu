@@ -243,6 +243,13 @@ typedef uint64_t qemu_plugin_id_t;
  *   plugin can sample per-vCPU state (e.g. read guest memory through
  *   that vCPU's current address space) without cross-thread reads.
  *
+ * version 24:
+ * - added qemu_plugin_translate_at: translate (and keep) the block at a
+ *   given address without executing it, so the translation-time
+ *   callbacks state QEMU's answer about code the guest has not reached.
+ * - added qemu_plugin_decode_only_nobuf: how many of those translations
+ *   were declined because the code buffer was full.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -254,7 +261,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 23
+#define QEMU_PLUGIN_VERSION 24
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -2453,6 +2460,53 @@ uint64_t qemu_plugin_spec_reserve_opens(void);
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_spec_reserve_exhausted(void);
+
+/**
+ * qemu_plugin_translate_at() - translate the block at @pc without executing it
+ * @pc: the guest virtual address to translate at
+ *
+ * Every translation-time callback fires -- the translation callback with the
+ * whole qemu_plugin_tb, and with it the per-instruction identity, the
+ * dataflow statements and the control notes -- because this is a real
+ * translation.  That is the whole point: those facts are keyed on (tb, idx)
+ * and readable at no other moment, so the only way to have QEMU's answer
+ * about a block is to have QEMU translate it.  A decoder run beside QEMU can
+ * supply a length and a name; it cannot supply the decode rule that accepted
+ * or the ops that rule emitted.
+ *
+ * The block is KEPT.  If the guest later reaches @pc the cached translation
+ * is a hit and the translation callback does not fire again, so what the
+ * plugin was shown is what executes.
+ *
+ * The translation CONTEXT is the current vCPU state, which is right for a
+ * fall-through or a same-mode branch target and wrong for a target in another
+ * mode.  Deciding that belongs to the caller, which knows which address it
+ * asked about and why.
+ *
+ * Call from a vCPU EXEC callback, on that vCPU's own thread.  Calling from a
+ * translation callback re-enters the translator and is refused by assertion.
+ *
+ * Returns true iff a translation now exists at @pc.  False means declined --
+ * an unreachable page, a translation-time fault, or a full code buffer -- and
+ * nothing was mutated.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_translate_at(uint64_t pc);
+
+/**
+ * qemu_plugin_decode_only_nobuf() - translate-on-demand declines for a full
+ * code buffer
+ *
+ * qemu_plugin_translate_at() runs from inside a plugin callback, so
+ * tb_gen_code's ordinary buffer-full arm -- a flush plus a longjmp -- would
+ * abandon that callback's frame.  A translate-only translation that cannot
+ * get a block therefore declines instead, and this counts the declines.  A
+ * caller that needs to know its coverage is complete reads this: a nonzero
+ * value says some blocks were never translated and why.  Process-wide
+ * monotonic total across vCPUs.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_decode_only_nobuf(void);
 
 /**
  * qemu_plugin_spec_mem_faulted_take() - did the just-executed wrong-path memory

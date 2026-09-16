@@ -32,6 +32,7 @@ static bool trans_c64_illegal(DisasContext *ctx, arg_empty *a)
 
 static bool trans_lui(DisasContext *ctx, arg_lui *a)
 {
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     gen_set_gpri(ctx, a->rd, a->imm);
     return true;
 }
@@ -82,6 +83,15 @@ static bool trans_lpad(DisasContext *ctx, arg_lpad *a)
 static bool trans_auipc(DisasContext *ctx, arg_auipc *a)
 {
     TCGv target_pc = dest_gpr(ctx, a->rd);
+
+    /*
+     * A DISPLACEMENT, not an operand: the field is added to a base -- here the
+     * program counter -- to make an address, which is the reading x86's
+     * mem.disp and aarch64's ADR already get.  JAL's offset below is an
+     * OPERAND on the same rule: it is the jump's own argument and no address
+     * is formed from a register.
+     */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
     gen_pc_plus_diff(target_pc, ctx, a->imm);
     gen_set_gpr(ctx, a->rd, target_pc);
     return true;
@@ -144,6 +154,8 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
     TCGv target_pc = tcg_temp_new();
     TCGv succ_pc = dest_gpr(ctx, a->rd);
 
+    /* Added to rs1 to make an address: a displacement, as AUIPC's is. */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
     tcg_gen_addi_tl(target_pc, get_gpr(ctx, a->rs1, EXT_NONE), a->imm);
     tcg_gen_andi_tl(target_pc, target_pc, (target_ulong)-2);
 
@@ -273,6 +285,8 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
     TCGv src2 = get_gpr(ctx, a->rs2, EXT_SIGN);
     target_ulong orig_pc_save = ctx->pc_save;
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+
     /*
      * Direct conditional branch (BEQ/BNE/BLT/BGE/...).  Surface the
      * static taken-edge target to plugins for wrong-path tracing.
@@ -370,7 +384,10 @@ static bool trans_bgeu(DisasContext *ctx, arg_bgeu *a)
 static bool gen_load_tl(DisasContext *ctx, arg_lb *a, MemOp memop)
 {
     TCGv dest = dest_gpr(ctx, a->rd);
-    TCGv addr = get_address(ctx, a->rs1, a->imm);
+    TCGv addr;
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    addr = get_address(ctx, a->rs1, a->imm);
 
     tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);
     gen_set_gpr(ctx, a->rd, dest);
@@ -380,7 +397,10 @@ static bool gen_load_tl(DisasContext *ctx, arg_lb *a, MemOp memop)
 /* Compute only 64-bit addresses to use the address translation mechanism */
 static bool gen_load_i128(DisasContext *ctx, arg_lb *a, MemOp memop)
 {
-    TCGv src1l = get_gpr(ctx, a->rs1, EXT_NONE);
+    TCGv src1l;
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    src1l = get_gpr(ctx, a->rs1, EXT_NONE);
     TCGv destl = dest_gpr(ctx, a->rd);
     TCGv desth = dest_gprh(ctx, a->rd);
     TCGv addrl = tcg_temp_new();
@@ -477,8 +497,12 @@ static bool trans_ldu(DisasContext *ctx, arg_ldu *a)
 
 static bool gen_store_tl(DisasContext *ctx, arg_sb *a, MemOp memop)
 {
-    TCGv addr = get_address(ctx, a->rs1, a->imm);
-    TCGv data = get_gpr(ctx, a->rs2, EXT_NONE);
+    TCGv addr;
+    TCGv data;
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    addr = get_address(ctx, a->rs1, a->imm);
+    data = get_gpr(ctx, a->rs2, EXT_NONE);
 
     if (ctx->ztso) {
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
@@ -490,7 +514,10 @@ static bool gen_store_tl(DisasContext *ctx, arg_sb *a, MemOp memop)
 
 static bool gen_store_i128(DisasContext *ctx, arg_sb *a, MemOp memop)
 {
-    TCGv src1l = get_gpr(ctx, a->rs1, EXT_NONE);
+    TCGv src1l;
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
+    src1l = get_gpr(ctx, a->rs1, EXT_NONE);
     TCGv src2l = get_gpr(ctx, a->rs2, EXT_NONE);
     TCGv src2h = get_gprh(ctx, a->rs2);
     TCGv addrl = tcg_temp_new();
@@ -582,19 +609,26 @@ static void gen_addi2_i128(TCGv retl, TCGv reth,
  *
  * The base ISA spells a register move, a load-immediate and the canonical
  * no-op as add-immediate: MV is ADDI rd, rs1, 0; LI is ADDI rd, x0, imm; NOP
- * is ADDI x0, x0, 0.  A rule-level word cannot separate them, and calling all
- * of it an addition loses the one thing a consumer would act on -- a move it
- * could rename away, a no-op it need not issue.  The word is stated here,
+ * is ADDI x0, rs1, imm.  A rule-level word cannot separate them, and calling
+ * all of it an addition loses the one thing a consumer would act on -- a move
+ * it could rename away, a no-op it need not issue.  The word is stated here,
  * where rd, rs1 and imm are in hand, and the rule's own word (stated by
  * decodetree after this returns) carries the remaining, genuinely arithmetic
  * cases: first statement wins.
+ *
+ * rd == x0 IS THE NO-OP, whatever rs1 and imm hold.  ADDI has no effect but
+ * its destination, and x0 discards what it is given, so the whole encoding
+ * space with rd == 0 does nothing -- which is what the ISA means by calling
+ * those encodings HINTs, and what the canonical `c.nop` (c.addi x0, imm) is.
+ * The narrower test this replaces asked for rs1 == x0 and imm == 0 as well and
+ * so called `c.nop` with a non-zero hint immediate a MOVE.
  *
  * ADDI rd, x0, 0 with rd != 0 is LI rd, 0, not a move of x0: the value comes
  * from the encoding, so it is spelled as the load-immediate it is.
  */
 static bool trans_addi(DisasContext *ctx, arg_addi *a)
 {
-    if (a->rd == 0 && a->rs1 == 0 && a->imm == 0) {
+    if (a->rd == 0) {
         insn_dataflow_note_word(INSN_DF_WORD_NOP);
     } else if (a->rs1 == 0 || a->imm == 0) {
         insn_dataflow_note_word(INSN_DF_WORD_MOV);

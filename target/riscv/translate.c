@@ -235,6 +235,26 @@ static void gen_pc_plus_diff(TCGv target, DisasContext *ctx,
         if (get_xl(ctx) == MXL_RV32) {
             dest = (int32_t)dest;
         }
+        /*
+         * THE PROGRAM COUNTER, FOLDED AWAY.
+         *
+         * Without CF_PCREL the translator knows this block's address, so a
+         * pc-relative value is materialised as a constant and the op that
+         * would have named cpu_pc is never emitted.  AUIPC, JAL's link, JALR's
+         * link and a branch's target all compute a value FROM the program
+         * counter, and on the !CF_PCREL side of this `if` nothing in the op
+         * stream says so.  The register is still in the emitter's hand here,
+         * so it is stated.
+         *
+         * Not when @target IS cpu_pc: that is gen_update_pc(), QEMU keeping
+         * its own program counter correct across a block edge, not an
+         * instruction computing a value from it.  The CF_PCREL side above
+         * needs no statement -- there tcg_gen_addi_tl names cpu_pc and the
+         * reader sees the read for itself.
+         */
+        if (target != cpu_pc) {
+            insn_dataflow_state_read(insn_df_reg("pc"));
+        }
         tcg_gen_movi_tl(target, dest);
     }
 }
@@ -321,6 +341,37 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_long diff)
 }
 
 /*
+ * The architectural zero register, which lowers to no op at all.
+ *
+ * x0 is not storage, so QEMU allocates it no TCG global: a read of it becomes
+ * the constant zero and a write of it becomes a temp nothing consumes.  Either
+ * way there is nothing left in the op stream that names the register, and the
+ * decode site is the only place that still holds the number.
+ *
+ * Stated at the accessors, because on RISC-V the accessor IS the role.
+ * aarch64's cpu_reg() is handed a number and no role -- the same call answers
+ * a source and a destination, and register 31 is sometimes SP -- so its
+ * statement has to be made further out.  Here get_gpr() is a read, gen_set_gpr()
+ * is a write, and register 0 is x0 in every form.
+ *
+ * THE ZERO TEMP IS DELIBERATELY NOT BOUND to the atom.  ctx->zero is
+ * tcg_constant_tl(0) and TCG interns constants, so it is the same temp as every
+ * other constant zero the block builds; binding it would put the architectural
+ * zero register into the provenance of values that never read it -- the shared
+ * -temp fabrication the x86 RIP fold had to be anchored against.  The ACCESS is
+ * what the decoder holds and what this states.  The provenance of a folded
+ * constant is not, and inventing one is worse than leaving it empty.
+ */
+static void note_zero_reg(unsigned dir)
+{
+    if (dir == INSN_DF_RD) {
+        insn_dataflow_state_read(insn_df_zero());
+    } else {
+        insn_dataflow_state_write(insn_df_zero());
+    }
+}
+
+/*
  * Wrappers for getting reg values.
  *
  * The $zero register does not have cpu_gpr[0] allocated -- we supply the
@@ -333,6 +384,7 @@ static TCGv get_gpr(DisasContext *ctx, int reg_num, DisasExtend ext)
     TCGv t;
 
     if (reg_num == 0) {
+        note_zero_reg(INSN_DF_RD);
         return ctx->zero;
     }
 
@@ -366,6 +418,7 @@ static TCGv get_gprh(DisasContext *ctx, int reg_num)
 {
     assert(get_xl(ctx) == MXL_RV128);
     if (reg_num == 0) {
+        note_zero_reg(INSN_DF_RD);
         return ctx->zero;
     }
     return cpu_gprh[reg_num];
@@ -389,7 +442,9 @@ static TCGv dest_gprh(DisasContext *ctx, int reg_num)
 
 static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 {
-    if (reg_num != 0) {
+    if (reg_num == 0) {
+        note_zero_reg(INSN_DF_WR);
+    } else {
         switch (get_ol(ctx)) {
         case MXL_RV32:
             tcg_gen_ext32s_tl(cpu_gpr[reg_num], t);
@@ -410,7 +465,9 @@ static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 
 static void gen_set_gpri(DisasContext *ctx, int reg_num, target_long imm)
 {
-    if (reg_num != 0) {
+    if (reg_num == 0) {
+        note_zero_reg(INSN_DF_WR);
+    } else {
         switch (get_ol(ctx)) {
         case MXL_RV32:
             tcg_gen_movi_tl(cpu_gpr[reg_num], (int32_t)imm);
@@ -432,7 +489,9 @@ static void gen_set_gpri(DisasContext *ctx, int reg_num, target_long imm)
 static void gen_set_gpr128(DisasContext *ctx, int reg_num, TCGv rl, TCGv rh)
 {
     assert(get_ol(ctx) == MXL_RV128);
-    if (reg_num != 0) {
+    if (reg_num == 0) {
+        note_zero_reg(INSN_DF_WR);
+    } else {
         tcg_gen_mov_tl(cpu_gpr[reg_num], rl);
         tcg_gen_mov_tl(cpu_gprh[reg_num], rh);
     }
@@ -607,6 +666,14 @@ static void gen_ctr_jal(DisasContext *ctx, int rd, target_ulong imm)
 static void gen_jal(DisasContext *ctx, int rd, target_ulong imm)
 {
     TCGv succ_pc = dest_gpr(ctx, rd);
+
+    /*
+     * The jump's own argument, so an OPERAND -- the reading aarch64's branch
+     * offsets and x86's rel32 already get.  No address is formed from a
+     * register here; the offset applies to the program counter, which the
+     * transfer itself names.
+     */
+    insn_dataflow_note_immediate(imm, INSN_DF_IMM_OPERAND);
 
     /*
      * Direct unconditional jump (JAL); surface the static target to
@@ -786,6 +853,7 @@ EX_SH(1)
 EX_SH(2)
 EX_SH(3)
 EX_SH(4)
+EX_SH(5)
 EX_SH(12)
 
 #define REQUIRE_EXT(ctx, ext) do { \
@@ -860,12 +928,30 @@ static int ex_rvc_shiftri(DisasContext *ctx, int imm)
 /* Include the auto-generated decoder for 32 bit insn */
 #include "decode-insn32.c.inc"
 
+/*
+ * THE ENCODED VALUE (fact 19).
+ *
+ * An I-type immediate is folded into the op that consumes it -- addi_tl, ori_tl,
+ * shli_tl all take it as a host constant -- so the op stream carries the value
+ * but nothing says it was a field of the encoding rather than something the
+ * emitter computed.  A shift amount does not even survive as an argument once
+ * the shift is lowered.  The decoder holds it, so the decoder states it.
+ *
+ * Stated in the shared helpers rather than at each trans_ function, because
+ * that is where RISC-V's immediate-form rules already meet: every I-type
+ * arithmetic, logical and shift rule in the base ISA and in Zb* reaches one of
+ * these five, and a per-rule statement would be nine hundred copies of one
+ * line.  A ZERO VALUE IS STATED like any other: unlike x86's AddressParts, the
+ * decodetree pattern that reached here always has an immediate field, so "no
+ * field" and "a field holding zero" cannot be confused.
+ */
 static bool gen_logic_imm_fn(DisasContext *ctx, arg_i *a,
                              void (*func)(TCGv, TCGv, target_long))
 {
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, EXT_NONE);
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     func(dest, src1, a->imm);
 
     if (get_xl(ctx) == MXL_RV128) {
@@ -911,6 +997,7 @@ static bool gen_arith_imm_fn(DisasContext *ctx, arg_i *a, DisasExtend ext,
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, ext);
 
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
     if (get_ol(ctx) < MXL_RV128) {
         func(dest, src1, a->imm);
         gen_set_gpr(ctx, a->rd, dest);
@@ -934,7 +1021,10 @@ static bool gen_arith_imm_tl(DisasContext *ctx, arg_i *a, DisasExtend ext,
 {
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, ext);
-    TCGv src2 = tcg_constant_tl(a->imm);
+    TCGv src2;
+
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    src2 = tcg_constant_tl(a->imm);
 
     if (get_ol(ctx) < MXL_RV128) {
         func(dest, src1, src2);
@@ -1010,6 +1100,7 @@ static bool gen_shift_imm_fn(DisasContext *ctx, arg_shift *a, DisasExtend ext,
 
     dest = dest_gpr(ctx, a->rd);
     src1 = get_gpr(ctx, a->rs1, ext);
+    insn_dataflow_note_immediate(a->shamt, INSN_DF_IMM_OPERAND);
 
     if (max_len < 128) {
         func(dest, src1, a->shamt);
@@ -1057,6 +1148,7 @@ static bool gen_shift_imm_tl(DisasContext *ctx, arg_shift *a, DisasExtend ext,
 
     dest = dest_gpr(ctx, a->rd);
     src1 = get_gpr(ctx, a->rs1, ext);
+    insn_dataflow_note_immediate(a->shamt, INSN_DF_IMM_OPERAND);
     src2 = tcg_constant_tl(a->shamt);
 
     func(dest, src1, src2);
@@ -1138,6 +1230,20 @@ static bool gen_unary_per_ol(DisasContext *ctx, arg_r2 *a, DisasExtend ext,
     return gen_unary(ctx, a, ext, f_tl);
 }
 
+/*
+ * ATOMICITY (fact 13), stated at the five emitters that hold it.
+ *
+ * The ops of an atomic read-modify-write and the ops of the same arithmetic
+ * done in three steps are the same ops; what separates them is the encoding --
+ * an AMO major opcode, an LR/SC pair, a Zacas compare-and-swap -- and nothing
+ * downstream of the decoder can recover it.  tcg_gen_atomic_* is not the
+ * discriminator either: it is what a target reaches for when it wants the host
+ * to do the access indivisibly, and the reader sees an ordinary memop.
+ *
+ * The LR half is flagged beside the SC half because LR is the half that takes
+ * the reservation, and an instruction that takes one is not an ordinary load
+ * however its ops read.
+ */
 static bool gen_amo(DisasContext *ctx, arg_atomic *a,
                     void(*func)(TCGv, TCGv, TCGv, TCGArg, MemOp),
                     MemOp mop)
@@ -1152,6 +1258,7 @@ static bool gen_amo(DisasContext *ctx, arg_atomic *a,
         mop |= MO_ALIGN;
     }
 
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
     src1 = get_address(ctx, a->rs1, 0);
     func(dest, src1, src2, ctx->mem_idx, mop);
@@ -1166,6 +1273,7 @@ static bool gen_cmpxchg(DisasContext *ctx, arg_atomic *a, MemOp mop)
     TCGv src1 = get_address(ctx, a->rs1, 0);
     TCGv src2 = get_gpr(ctx, a->rs2, EXT_NONE);
 
+    insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
     tcg_gen_atomic_cmpxchg_tl(dest, src1, dest, src2, ctx->mem_idx, mop);
 

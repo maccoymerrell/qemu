@@ -70,7 +70,12 @@ riscv64	sltiu	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	sltiu writes 0 or 1 into a ge
 riscv64	sltu	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
 riscv64	slt	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
 riscv64	slti	GEN_OP_SETCC	GEN_OP_CMP	QEMU	SETTLED	same as sltiu
-riscv64	addi	GEN_OP_MOV	GEN_OP_NOP	CAPSTONE	COVERAGE-PATH	c.nop is addi x0,x0,0 and does nothing; ADDI's operand-dependent statement separates li, mv and the arithmetic remainder and does not yet fire for rd == x0
+# RETIRED, class empty (B3 second half).  The coverage path is walked: ADDI's
+# operand-dependent statement now answers `nop` for the whole rd == x0 space,
+# which is what the ISA means by calling those encodings HINTs, and the class
+# the incumbent disagreed on is gone.  The row is kept as a comment because a
+# ruling whose class is empty is a DEAD RULE and --require-ruled says so.
+#   riscv64	addi	GEN_OP_MOV	GEN_OP_NOP	CAPSTONE	COVERAGE-PATH	c.nop is addi x0,x0,0 and does nothing; ADDI's operand-dependent statement separates li, mv and the arithmetic remainder and does not yet fire for rd == x0
 
 # -- aarch64 -----------------------------------------------------------------
 aarch64	ORR_r	GEN_OP_MOV	GEN_OP_OR	QEMU	SETTLED	MOV is ORR with XZR as the first source, and QEMU's translator already special-cases that pair by name (B2)

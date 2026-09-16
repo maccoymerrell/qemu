@@ -528,9 +528,17 @@ typedef struct InsnDataflow {
  * A_REG names a register the target registered with TCG or declared with
  * insn_dataflow_declare_regfile(); the two namespaces are searched in that
  * order, and a name in neither is refused rather than invented.
+ *
+ * THERE IS NO BY-OFFSET ATOM.  One was declared and never used: a decode site
+ * could have named a CPUArchState byte range by its offset and extent instead
+ * of by a register's name.  Nothing states one, and nothing should -- A2's
+ * rule is that offsets come from the compiler over the target's own struct,
+ * never from a hand-written number at a decode site, and the by-name route
+ * reaches every declared range through insn_dataflow_declare_regfile().  The
+ * constructor and its two reader arms are gone rather than left as a second
+ * spelling the rule forbids using.
  */
 #define INSN_DF_A_REG    0
-#define INSN_DF_A_ENV    1      /* a CPUArchState byte range */
 #define INSN_DF_A_ZERO   2      /* the architectural zero register */
 #define INSN_DF_A_IMM    3      /* an immediate field of the encoding */
 #define INSN_DF_A_CONST  4      /* a constant that is not an encoded field */
@@ -538,19 +546,11 @@ typedef struct InsnDataflow {
 typedef struct InsnDataflowAtom {
     uint8_t kind;
     const char *name;           /* A_REG */
-    uint32_t off;               /* A_ENV */
-    uint32_t size;              /* A_ENV; DF_FIELD_UNBOUNDED if not stated */
 } InsnDataflowAtom;
 
 static inline InsnDataflowAtom insn_df_reg(const char *name)
 {
     InsnDataflowAtom a = { .kind = INSN_DF_A_REG, .name = name };
-    return a;
-}
-
-static inline InsnDataflowAtom insn_df_env(uint32_t off, uint32_t size)
-{
-    InsnDataflowAtom a = { .kind = INSN_DF_A_ENV, .off = off, .size = size };
     return a;
 }
 
@@ -566,6 +566,18 @@ static inline InsnDataflowAtom insn_df_imm(void)
     return a;
 }
 
+/*
+ * NO DECODE SITE STATES A CONSTANT YET, and the atom stays anyway.
+ *
+ * Unlike the by-offset atom above it is not a second spelling of something
+ * that has one: it feeds QEMU_PLUGIN_DF_ATOM_CONST, a value in the plugin
+ * ABI, and a consumer reading that bit is told "this value came from neither
+ * storage nor the encoding" -- an answer no other atom gives.  Its first
+ * producer is a decode site that folds such a value away, and deleting the
+ * atom would take the answer out of the ABI ahead of the consumer that reads
+ * it.  Measured at this tip: zero call sites tree-wide, so the bit cannot
+ * fire and no zero counted from it may be read as a measurement.
+ */
 static inline InsnDataflowAtom insn_df_const(void)
 {
     InsnDataflowAtom a = { .kind = INSN_DF_A_CONST };
@@ -690,7 +702,25 @@ void insn_dataflow_state_write(InsnDataflowAtom a);
  */
 void insn_dataflow_bind(const void *ts, InsnDataflowAtom a);
 
-/* Ops emitted between these two are QEMU's, not the instruction's. */
+/*
+ * Ops emitted between these two are QEMU's, not the instruction's.
+ *
+ * NOTHING OPENS ONE TODAY, AND THE COST IS MEASURED RATHER THAN ASSUMED.  The
+ * reader walks the op stream after ops->tb_stop() has emitted the block's exit
+ * sequence, and every op after the last insn_start is attributed to the last
+ * instruction -- so the exit's program-counter write lands on whatever
+ * instruction happens to end the block.  Witnessed on aarch64 with a run of
+ * NOPs long enough to fill a block: encoding 1f2003d5 publishes a write set of
+ * ZERO where it sits inside a block and ONE where it ends one, and the
+ * register named is `pc`.  A nop does not write the program counter.  Across
+ * five SPEC guests the encodings whose write-set size differs between
+ * occurrences number 234 on aarch64, 272 on riscv64, 227 on mipsel and 1,739
+ * on x86_64 (the x86 figure is not attributed to this cause alone).
+ *
+ * insn_dataflow_window_end() DOES have a caller -- insn_dataflow_borrow_end()
+ * is it -- so the pair is not symmetric in use and only the opening half is
+ * unwired.
+ */
 void insn_dataflow_window_begin(unsigned kind);
 void insn_dataflow_window_end(void);
 
@@ -724,7 +754,17 @@ void insn_dataflow_note_rule(const char *name);
 /* The generic word that rule carries, stated with the rule. */
 void insn_dataflow_note_word(const char *word);
 
-/* Do not trust this instruction's ops; say so rather than publish them. */
+/*
+ * Do not trust this instruction's ops; say so rather than publish them.
+ *
+ * NO DECODE SITE REFUSES TODAY, which makes QEMU_PLUGIN_DF_INC_REFUSED a
+ * status bit that cannot fire, and a consumer's zero for it is the absence of
+ * a producer rather than a measured absence of refusals.  The route stays
+ * because R12.1 makes refusal the only admissible interim answer where a
+ * statement would otherwise be short -- a refusal a consumer can see is what
+ * separates that from a silently short list -- and because its first producer
+ * and its first consumer arrive together.
+ */
 void insn_dataflow_refuse(void);
 
 /* A value this encoding carries, in the role it plays. */

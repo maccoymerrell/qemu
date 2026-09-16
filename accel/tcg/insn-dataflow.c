@@ -845,8 +845,6 @@ static int df_atom_bit(InsnDataflowAtom a)
         return INSN_DF_BIT_IMM;
     case INSN_DF_A_CONST:
         return INSN_DF_BIT_CONST;
-    case INSN_DF_A_ENV:
-        return df_intern(a.off, a.size);
     case INSN_DF_A_REG:
         if (a.name == NULL) {
             return -1;
@@ -887,10 +885,6 @@ static void df_state(InsnDataflowAtom a, uint8_t dir)
     switch (a.kind) {
     case INSN_DF_A_ZERO:
         df_set_bit(dir == INSN_DF_RD ? d->rd : d->wr, INSN_DF_BIT_ZERO);
-        return;
-
-    case INSN_DF_A_ENV:
-        df_add_field(d, a.off, a.size, dir, NULL);
         return;
 
     case INSN_DF_A_REG:

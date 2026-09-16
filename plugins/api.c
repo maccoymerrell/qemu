@@ -53,6 +53,8 @@
 #include "exec/cpu-common.h"
 #include "system/cpu-timers.h"
 #include "disas/disas.h"
+#include "exec/insn-dataflow.h"
+#include "qemu/qemu-plugin-dataflow.h"
 #include "plugin.h"
 
 /* Uninstall and Reset handlers */
@@ -264,6 +266,342 @@ qemu_plugin_tb_get_insn(const struct qemu_plugin_tb *tb, size_t idx)
     }
     insn = g_ptr_array_index(tb->insns, idx);
     return insn;
+}
+
+/*
+ * Per-instruction dataflow, as QEMU stated it.
+ *
+ * See include/qemu/qemu-plugin-dataflow.h for the contract; the three
+ * properties this implementation holds up are that no bitmap crosses by value,
+ * that a set is never handed back partially, and that an instruction the
+ * reading could not record in full yields nothing at all rather than a
+ * plausible subset.
+ */
+
+/*
+ * The result lives with the translation in progress, so it is readable only
+ * while that translation's callback is running.  Rather than document that and
+ * hope, every accessor checks that @tb is the block being translated now: a
+ * plugin that stashes a tb and asks later gets a refusal instead of another
+ * block's answer.
+ */
+static const InsnDataflow *plugin_df(const struct qemu_plugin_tb *tb,
+                                     size_t idx)
+{
+    if (unlikely(tb == NULL || tb != tcg_ctx->plugin_tb || idx >= tb->n)) {
+        return NULL;
+    }
+    return insn_dataflow_get(idx);
+}
+
+/* Would a set from this instruction be a whole one? */
+static const InsnDataflow *plugin_df_whole(const struct qemu_plugin_tb *tb,
+                                           size_t idx)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    return d != NULL && d->incomplete == 0 ? d : NULL;
+}
+
+static unsigned plugin_df_copy(const uint64_t *src, uint64_t *words,
+                               unsigned nwords)
+{
+    unsigned n = INSN_DF_REG_WORDS;
+
+    /*
+     * Refuse rather than truncate.  A short set is a set with dependencies
+     * missing from it, and it is the shape most likely to pass for a whole
+     * one; an empty answer is not.
+     */
+    if (nwords >= n && words != NULL) {
+        memcpy(words, src, n * sizeof(uint64_t));
+    }
+    return n;
+}
+
+bool qemu_plugin_dataflow_abi_ok(uint32_t plugin_version,
+                                 uint32_t field_struct_size,
+                                 uint32_t memop_struct_size,
+                                 uint32_t status_struct_size)
+{
+    /*
+     * The two spellings of every shared constant are bound here rather than
+     * kept in step by hand.  A renumbering on either side is a build failure
+     * and not a plugin reading the wrong bit.
+     */
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_RD != INSN_DF_RD);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_WR != INSN_DF_WR);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_UNBOUNDED != DF_FIELD_UNBOUNDED);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_INC_WRITES != INSN_DF_INCOMPLETE_WRITES);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_INC_FIELDS != INSN_DF_INCOMPLETE_FIELDS);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_INC_MEMOPS != INSN_DF_INCOMPLETE_MEMOPS);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_INC_REFUSED != INSN_DF_INCOMPLETE_REFUSED);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_P_ATOMIC != INSN_DF_P_ATOMIC);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_TRANSFER != INSN_DF_X_TRANSFER);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_STATIC != INSN_DF_X_STATIC);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_COMPUTED != INSN_DF_X_COMPUTED);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_X_MULTI != INSN_DF_X_MULTI);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VECE_NONE != INSN_DF_VECE_NONE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_OPERAND != INSN_DF_IMM_OPERAND);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_DISP != INSN_DF_IMM_DISP);
+
+    return plugin_version == QEMU_PLUGIN_DATAFLOW_VERSION &&
+           field_struct_size == sizeof(qemu_plugin_dataflow_field) &&
+           memop_struct_size == sizeof(qemu_plugin_dataflow_memop) &&
+           status_struct_size == sizeof(qemu_plugin_dataflow_status);
+}
+
+unsigned qemu_plugin_dataflow_nregs(void)
+{
+    return insn_dataflow_nregs();
+}
+
+const char *qemu_plugin_dataflow_reg_name(unsigned reg, uint32_t *env_offset,
+                                          uint32_t *size)
+{
+    return insn_dataflow_reg_name(reg, env_offset, size);
+}
+
+bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset,
+                                     uint32_t *size)
+{
+    return insn_dataflow_prov_field(bit, env_offset, size);
+}
+
+const char *qemu_plugin_dataflow_field_reg(uint32_t env_offset, uint32_t size)
+{
+    return insn_dataflow_field_reg(env_offset, size);
+}
+
+bool qemu_plugin_dataflow_prov_atom(unsigned bit, uint32_t *atom)
+{
+    uint32_t a;
+
+    switch (bit) {
+    case INSN_DF_BIT_ZERO:
+        a = QEMU_PLUGIN_DF_ATOM_ZERO;
+        break;
+    case INSN_DF_BIT_IMM:
+        a = QEMU_PLUGIN_DF_ATOM_IMM;
+        break;
+    case INSN_DF_BIT_CONST:
+        a = QEMU_PLUGIN_DF_ATOM_CONST;
+        break;
+    default:
+        return false;
+    }
+    if (atom) {
+        *atom = a;
+    }
+    return true;
+}
+
+#define PLUGIN_DF_SET(name, member)                                          \
+unsigned name(const struct qemu_plugin_tb *tb, size_t idx,                   \
+              uint64_t *words, unsigned nwords)                              \
+{                                                                            \
+    const InsnDataflow *d = plugin_df_whole(tb, idx);                        \
+                                                                             \
+    if (d == NULL) {                                                         \
+        return QEMU_PLUGIN_DF_INCOMPLETE;                                    \
+    }                                                                        \
+    return plugin_df_copy(d->member, words, nwords);                         \
+}
+
+PLUGIN_DF_SET(qemu_plugin_insn_reg_reads,  rd)
+PLUGIN_DF_SET(qemu_plugin_insn_reg_writes, wr)
+PLUGIN_DF_SET(qemu_plugin_insn_reg_kills,  kill)
+
+unsigned qemu_plugin_insn_write_prov(const struct qemu_plugin_tb *tb,
+                                     size_t idx, unsigned reg,
+                                     uint64_t *words, unsigned nwords)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    for (unsigned i = 0; i < d->n_writes; i++) {
+        if (d->writes[i].reg == reg) {
+            return plugin_df_copy(d->writes[i].prov, words, nwords);
+        }
+    }
+    /* Not a register this instruction wrote: no provenance to give. */
+    return QEMU_PLUGIN_DF_INCOMPLETE;
+}
+
+/*
+ * Copy at most the caller's own struct size.  A plugin built against an older
+ * header gets a correct prefix rather than a stomped stack.
+ */
+static void plugin_df_struct(void *dst, const void *src, uint32_t want,
+                             uint32_t have)
+{
+    memcpy(dst, src, want == 0 || want > have ? have : want);
+}
+
+unsigned qemu_plugin_insn_fields(const struct qemu_plugin_tb *tb, size_t idx,
+                                 qemu_plugin_dataflow_field *out,
+                                 unsigned nfields)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nfields < d->n_fields || out == NULL) {
+        return d->n_fields;
+    }
+    for (unsigned i = 0; i < d->n_fields; i++) {
+        qemu_plugin_dataflow_field f = {
+            .struct_size = sizeof(f),
+            .env_offset = d->fields[i].off,
+            .size = d->fields[i].size,
+            .dir = d->fields[i].dir,
+        };
+
+        plugin_df_struct(&out[i], &f, out[i].struct_size, sizeof(f));
+    }
+    return d->n_fields;
+}
+
+unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
+                                     size_t idx, unsigned field,
+                                     uint64_t *words, unsigned nwords)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL || field >= d->n_fields) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_copy(d->fields[field].prov, words, nwords);
+}
+
+unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
+                                 qemu_plugin_dataflow_memop *out,
+                                 unsigned nmemops)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nmemops < d->n_memops || out == NULL) {
+        return d->n_memops;
+    }
+    for (unsigned i = 0; i < d->n_memops; i++) {
+        qemu_plugin_dataflow_memop m = {
+            .struct_size = sizeof(m),
+            .dir = d->memops[i].dir,
+            .size = d->memops[i].size,
+        };
+
+        plugin_df_struct(&out[i], &m, out[i].struct_size, sizeof(m));
+    }
+    return d->n_memops;
+}
+
+unsigned qemu_plugin_insn_memop_addr_prov(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned memop,
+                                          uint64_t *words, unsigned nwords)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL || memop >= d->n_memops) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_copy(d->memops[memop].addr_prov, words, nwords);
+}
+
+unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned memop,
+                                          uint64_t *words, unsigned nwords)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL || memop >= d->n_memops) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    return plugin_df_copy(d->memops[memop].data_prov, words, nwords);
+}
+
+const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_tb *tb,
+                                         size_t idx)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    return d != NULL ? d->rule : NULL;
+}
+
+const char *qemu_plugin_insn_decode_word(const struct qemu_plugin_tb *tb,
+                                         size_t idx)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    return d != NULL ? d->word : NULL;
+}
+
+bool qemu_plugin_insn_undecoded(const struct qemu_plugin_tb *tb, size_t idx)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    return d == NULL || d->rule == NULL;
+}
+
+bool qemu_plugin_insn_immediate(const struct qemu_plugin_tb *tb, size_t idx,
+                                unsigned i, uint64_t *value, uint32_t *role)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || i >= d->n_imm) {
+        return false;
+    }
+    if (value) {
+        *value = d->imm[i];
+    }
+    if (role) {
+        *role = d->imm_role[i];
+    }
+    return true;
+}
+
+bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
+                                      size_t idx,
+                                      qemu_plugin_dataflow_status *out)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+    qemu_plugin_dataflow_status st = {
+        .struct_size = sizeof(st),
+        .version = QEMU_PLUGIN_DATAFLOW_VERSION,
+    };
+
+    if (d == NULL || out == NULL) {
+        return false;
+    }
+    st.incomplete = d->incomplete;
+    st.n_calls = d->n_calls;
+    st.n_mem_reads = d->n_mem_rd;
+    st.n_mem_writes = d->n_mem_wr;
+    st.n_writes = d->n_writes;
+    st.n_fields = d->n_fields;
+    st.n_memops = d->n_memops;
+    st.n_immediates = d->n_imm;
+    st.properties = d->properties;
+    st.xfer = d->xfer;
+    st.vec_vece = d->vec_vece;
+    st.vec_oprsz = d->vec_oprsz;
+    /*
+     * Interning is per translation block, so a range that could not be
+     * interned anywhere in the block makes a value in THIS instruction look
+     * sourceless.  Reported as this instruction's incompleteness, which is
+     * pessimistic and is the direction the whole layer errs in.
+     */
+    if (insn_dataflow_fields_truncated()) {
+        st.incomplete |= QEMU_PLUGIN_DF_INC_FIELDS;
+    }
+
+    plugin_df_struct(out, &st, out->struct_size, sizeof(st));
+    return true;
 }
 
 /*

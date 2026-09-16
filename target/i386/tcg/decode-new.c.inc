@@ -352,6 +352,153 @@ static inline const X86OpEntry *decode_by_prefix(DisasContext *s, const X86OpEnt
     }
 }
 
+/*
+ * VMOVLPx_st is one rule over two different operations, and the operands say
+ * which.
+ *
+ * 0F 13 stores the low half of a packed vector -- MOVLPS, MOVLPD -- and its
+ * word is the rule's own, vec.mov.  The F2-prefixed forms reaching this rule
+ * are MOVSD and MOVNTSD, which store one scalar double, and fp.mov is what
+ * that is.  Decision 3's per-rule static payload assumes one operation per
+ * rule, and here as in riscv64's ADDI and aarch64's four shared helpers the
+ * assumption does not hold: the separating fact is the operand form, which
+ * only the decoder has.  So the table row carries the word for the packed
+ * form and the prefix that selects the scalar one restates it here, before
+ * the dispatch site reads entry->word.
+ */
+static void x86_df_note_movlpx_st_word(DisasContext *s, X86OpEntry *entry)
+{
+    if (entry->gen == gen_VMOVLPx_st && (s->prefix & PREFIX_REPNZ)) {
+        entry->word = INSN_DF_WORD_FP_MOV;
+    }
+}
+
+/*
+ * The facts this decoder holds that its ops do not carry.
+ *
+ * Called once, immediately after the identity is stated and before any
+ * emitter runs, so every statement lands on the instruction being decoded and
+ * the entry it reads is the final one.
+ *
+ * ATOMICITY.  The ops of a LOCKed read-modify-write and the ops of the same
+ * arithmetic done in three steps are the same ops; what makes one atomic is
+ * the prefix, and by this point s->prefix carries it for the implicitly
+ * locked forms too (X86_SPECIAL_Locked has already set it for XCHG with a
+ * memory operand).  The flag says how the access happened and changes no
+ * register.
+ *
+ * THE ENCODED VALUES.  An immediate operand's value is in the decoder's hand
+ * before any op consumes it, and an addressing fold can consume it before any
+ * op sees it at all -- gen_lea_modrm_1() turns a RIP-relative displacement
+ * into a constant and the field is then unrecoverable from the op stream.
+ * Both roles are stated: an operand in its own right, and a displacement
+ * folded into an address.  A displacement of zero is not stated, because
+ * AddressParts does not record whether a zero displacement byte was present
+ * and "no field" and "a field holding zero" would be published alike.
+ *
+ * THE SYNTHETIC ADDRESS.  A prefetch or a cache-maintenance operation names
+ * an address and QEMU lowers it to nothing: there is no memop, so a consumer
+ * is handed an instruction whose encoding plainly carries an address and
+ * whose record touches no memory.  The word said which encodings those are;
+ * this states the address, from the components the modrm byte gave.  Keying
+ * on the word and not on the emitter is deliberate -- gen_NOP is also the
+ * multi-byte no-op's emitter, and publishing an access for `nopl (%rax)`
+ * would invent one.
+ */
+static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
+{
+    bool has_ea = decode->op[0].has_ea || decode->op[1].has_ea ||
+                  decode->op[2].has_ea;
+    const char *word = decode->e.word;
+
+    if (s->prefix & PREFIX_LOCK) {
+        insn_dataflow_note_property(INSN_DF_P_ATOMIC);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (decode->op[i].unit == X86_OP_IMM) {
+            insn_dataflow_note_immediate(decode->op[i].imm,
+                                         INSN_DF_IMM_OPERAND);
+        }
+    }
+    if (decode->e.op3 == X86_TYPE_I) {
+        /* The fourth operand's immediate has no X86DecodedOp of its own. */
+        insn_dataflow_note_immediate(decode->immediate, INSN_DF_IMM_OPERAND);
+    }
+    if (has_ea && decode->mem.disp != 0) {
+        insn_dataflow_note_immediate((uint64_t)decode->mem.disp,
+                                     INSN_DF_IMM_DISP);
+    }
+
+    if (has_ea && word != NULL &&
+        (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
+         !strcmp(word, INSN_DF_WORD_CACHEFLUSH))) {
+        InsnDataflowAtom parts[2];
+        unsigned n = 0;
+        AddressParts *a = &decode->mem;
+
+        if (a->base == -2) {
+            /*
+             * RIP-relative.  Without CF_PCREL the translator would have
+             * folded the program counter into a constant, and here it does
+             * not even do that much -- no address is computed at all -- so
+             * the register is named from the encoding.
+             */
+            parts[n++] = insn_df_reg(X86_DF_PC_NAME);
+        } else if (a->base >= 0 && a->base < CPU_NB_REGS) {
+            parts[n++] = insn_df_reg(x86_reg_names[a->base]);
+        }
+        if (a->index >= 0 && a->index < CPU_NB_REGS) {
+            parts[n++] = insn_df_reg(x86_reg_names[a->index]);
+        }
+        insn_dataflow_note_synthetic_ea(INSN_DF_RD,
+                                        1u << decode->op[0].ot,
+                                        parts, n, a->disp);
+    }
+}
+
+/*
+ * The two prefetch opcodes, which QEMU decodes as no-ops and shares with the
+ * reserved no-ops that have the same first byte.
+ *
+ * A prefetch names an address in its encoding and performs no access; the
+ * translator lowers it to nothing, so neither the rule it reached nor its op
+ * stream says it is a prefetch, and the address it named reaches a consumer
+ * from nowhere.  Only the modrm extension separates the prefetches from their
+ * neighbours, and only the decoder reads it, so both facts are stated here:
+ * the word, and -- at the dispatch site, keyed on the word -- the address.
+ *
+ * 0F 1C is left alone deliberately.  CLDEMOTE lives at /0 there, but QEMU
+ * does not separate it from the reserved no-ops around it, and stating a word
+ * for an encoding this decoder declined to distinguish would be inventing a
+ * fact rather than reporting one.
+ */
+static void decode_0F0D(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
+                        uint8_t *b)
+{
+    static const X86OpEntry e_nop = X86_OP_ENTRY1(NOP, M,v);
+    int op = (get_modrm(s, env) >> 3) & 7;
+
+    *entry = e_nop;
+    /* /0 PREFETCH, /1 PREFETCHW, /2 PREFETCHWT1; the rest are reserved. */
+    if (op <= 2) {
+        entry->word = INSN_DF_WORD_PREFETCH;
+    }
+}
+
+static void decode_0F18(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
+                        uint8_t *b)
+{
+    static const X86OpEntry e_nop = X86_OP_ENTRY1(NOP, nop,v);
+    uint8_t modrm = get_modrm(s, env);
+
+    *entry = e_nop;
+    /* /0 PREFETCHNTA, /1 PREFETCHT0, /2 PREFETCHT1, /3 PREFETCHT2. */
+    if ((modrm >> 6) != 3 && ((modrm >> 3) & 7) <= 3) {
+        entry->word = INSN_DF_WORD_PREFETCH;
+    }
+}
+
 static void decode_group8(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
     static const X86GenFunc group8_gen[8] = {
@@ -431,9 +578,26 @@ static void decode_group15(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         *entry = group15_reg[op];
     } else if (s->prefix & PREFIX_DATA) {
         *entry = group15_mem_66[op];
+        /* CLWB and CLFLUSHOPT. */
+        if (op >= 6) {
+            entry->word = INSN_DF_WORD_CACHEFLUSH;
+        }
     } else {
         *entry = group15_mem[op];
+        /* CLFLUSH. */
+        if (op == 7) {
+            entry->word = INSN_DF_WORD_CACHEFLUSH;
+        }
     }
+    /*
+     * The three cache-maintenance rows above share the NOP rule with the
+     * reserved no-ops, because QEMU lowers them all to nothing and the table
+     * row names the emitter.  What separates them is the encoding -- a modrm
+     * extension, under one opcode -- which is the decoder's own fact, so the
+     * word is stated here rather than adjudicated against a rule that answers
+     * for both.  The address they name is picked up at the dispatch site,
+     * from the word.
+     */
 }
 
 static void decode_group17(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -1027,6 +1191,7 @@ static void decode_0F11(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         *entry = *decode_by_prefix(s, opcodes_0F11_reg);
     } else {
         *entry = *decode_by_prefix(s, opcodes_0F11_mem);
+        x86_df_note_movlpx_st_word(s, entry);
     }
 }
 
@@ -1108,6 +1273,7 @@ static void decode_0F2B(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
     };
 
     *entry = *decode_by_prefix(s, opcodes_0F2B);
+    x86_df_note_movlpx_st_word(s, entry);
 }
 
 static void decode_0F2C(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -1360,7 +1526,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x08] = X86_OP_ENTRY0(NOP,           svm(INVD)),
     [0x09] = X86_OP_ENTRY0(NOP,           svm(WBINVD)),
     [0x0b] = X86_OP_ENTRY0(UD),           /* UD2 */
-    [0x0d] = X86_OP_ENTRY1(NOP,  M,v),    /* 3DNow! prefetch */
+    [0x0d] = X86_OP_GROUP1(0F0D, M,v),    /* 3DNow! prefetch */
     [0x0e] = X86_OP_ENTRY0(EMMS,                              cpuid(3DNOW)), /* femms */
     /*
      * 3DNow!'s opcode byte comes *after* modrm and displacements, making it
@@ -1369,7 +1535,7 @@ static const X86OpEntry opcodes_0F[256] = {
      */
     [0x0f] = X86_OP_ENTRY3(3dnow,       P,q, Q,q, I,b,        cpuid(3DNOW)),
 
-    [0x18] = X86_OP_ENTRY1(NOP,  nop,v),  /* prefetch/reserved NOP */
+    [0x18] = X86_OP_GROUP1(0F18, nop,v),  /* prefetch/reserved NOP */
     [0x19] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
     [0x1a] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
     [0x1b] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
@@ -2929,6 +3095,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
      */
     insn_dataflow_note_rule(decode.e.rule);
     insn_dataflow_note_word(decode.e.word);
+    x86_df_note_decoder_facts(s, &decode);
 
     if (decode.e.special == X86_SPECIAL_MMX &&
         !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {

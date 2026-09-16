@@ -52,6 +52,58 @@
 #define PREFIX_VEX    0x20
 #define PREFIX_REX    0x40
 
+/*
+ * The name the program counter's TCG global is registered under.
+ *
+ * It is spelled once because two places need the same string: the
+ * registration itself, and the decode sites that name the register in a
+ * dataflow statement where no op does.  insn_df_reg() resolves an atom by
+ * looking the name up among the globals, so the two spellings agreeing is
+ * not a nicety -- a mismatch resolves to nothing and drops the source.
+ */
+#ifdef TARGET_X86_64
+# define X86_DF_PC_NAME "rip"
+#else
+# define X86_DF_PC_NAME "eip"
+#endif
+
+/*
+ * The names the general-purpose TCG globals are registered under.
+ *
+ * At file scope because the decode sites need them too: a statement that
+ * names a register the emitter folded away resolves by NAME, and the name
+ * has to be the one the global carries.
+ */
+static const char x86_reg_names[CPU_NB_REGS][4] = {
+#ifdef TARGET_X86_64
+    [R_EAX] = "rax",
+    [R_EBX] = "rbx",
+    [R_ECX] = "rcx",
+    [R_EDX] = "rdx",
+    [R_ESI] = "rsi",
+    [R_EDI] = "rdi",
+    [R_EBP] = "rbp",
+    [R_ESP] = "rsp",
+    [8]  = "r8",
+    [9]  = "r9",
+    [10] = "r10",
+    [11] = "r11",
+    [12] = "r12",
+    [13] = "r13",
+    [14] = "r14",
+    [15] = "r15",
+#else
+    [R_EAX] = "eax",
+    [R_EBX] = "ebx",
+    [R_ECX] = "ecx",
+    [R_EDX] = "edx",
+    [R_ESI] = "esi",
+    [R_EDI] = "edi",
+    [R_EBP] = "ebp",
+    [R_ESP] = "esp",
+#endif
+};
+
 #ifdef TARGET_X86_64
 # define ctztl  ctz64
 # define clztl  clz64
@@ -2028,6 +2080,29 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
             tcg_gen_addi_tl(s->A0, cpu_eip, a.disp - s->pc_save);
         } else {
             tcg_gen_movi_tl(s->A0, a.disp);
+            /*
+             * The address came from somewhere, and which somewhere depends on
+             * a translation-time choice the encoding knows nothing about.
+             *
+             * a.base == -2 is RIP-relative: the architectural address is the
+             * next instruction's address plus the displacement, so the
+             * program counter is an input.  Without CF_PCREL the translator
+             * knows that address and folds it into a constant here, and the
+             * fold consumes the only op that would have named cpu_eip -- an
+             * op-stream reader is left with an address that depends on
+             * nothing.  The register is still in hand at the fold, so it is
+             * stated, and the statement is bound to the TEMP rather than to
+             * the instruction so that a later reuse of A0 cannot inherit it.
+             *
+             * Every other route here is a genuine absolute address, whose one
+             * input is the encoding's own displacement field.
+             */
+            insn_dataflow_bind(tcgv_tl_temp(s->A0),
+                               a.base == -2 ? insn_df_reg(X86_DF_PC_NAME)
+                                            : insn_df_imm());
+            if (a.base == -2) {
+                insn_dataflow_state_read(insn_df_reg(X86_DF_PC_NAME));
+            }
         }
         ea = s->A0;
     } else if (a.disp != 0) {
@@ -3885,42 +3960,42 @@ void tcg_x86_init(void)
                                       sizeof(e->opmask_regs[0]));
     }
 
-    static const char reg_names[CPU_NB_REGS][4] = {
-#ifdef TARGET_X86_64
-        [R_EAX] = "rax",
-        [R_EBX] = "rbx",
-        [R_ECX] = "rcx",
-        [R_EDX] = "rdx",
-        [R_ESI] = "rsi",
-        [R_EDI] = "rdi",
-        [R_EBP] = "rbp",
-        [R_ESP] = "rsp",
-        [8]  = "r8",
-        [9]  = "r9",
-        [10] = "r10",
-        [11] = "r11",
-        [12] = "r12",
-        [13] = "r13",
-        [14] = "r14",
-        [15] = "r15",
-#else
-        [R_EAX] = "eax",
-        [R_EBX] = "ebx",
-        [R_ECX] = "ecx",
-        [R_EDX] = "edx",
-        [R_ESI] = "esi",
-        [R_EDI] = "edi",
-        [R_EBP] = "ebp",
-        [R_ESP] = "esp",
-#endif
-    };
-    static const char eip_name[] = {
-#ifdef TARGET_X86_64
-        "rip"
-#else
-        "eip"
-#endif
-    };
+    /*
+     * Two architectural registers that are neither a TCG global nor part of a
+     * file: the flags word the lazy-flags scheme does not represent, and the
+     * direction flag the string operations read.
+     *
+     * Both are reached by an ordinary load or store at a fixed offset into
+     * env -- gen_read_eflags()/gen_write_eflags() for the first,
+     * gen_compute_dshift() and the CLD/STD emitters for the second -- so the
+     * op-stream reader records a byte range and a consumer is handed "four
+     * bytes at offset 1234" for the D flag.  They are registers, and a
+     * consumer should be told so.
+     *
+     * A single register is a file of ONE, which is the shape declared here
+     * rather than a second primitive: the containment rule the resolver
+     * already uses (an access wholly inside one entry names that entry) is
+     * exactly right for a scalar, and count == 1 with stride == size makes
+     * the arithmetic degenerate to that case.  The earlier reading -- that
+     * declare_regfile could not express a scalar -- was checked here and is
+     * wrong; what it could not express is an entry whose stride differs from
+     * its size, which neither of these has.
+     *
+     * eflags is a target_ulong and df an int32_t, and the extents come from
+     * the compiler for the same reason the files above do.
+     */
+    {
+        static const char *const eflags_p[] = { "eflags" };
+        static const char *const df_p[] = { "df" };
+        CPUX86State *e = NULL;
+
+        insn_dataflow_declare_regfile(eflags_p, 1,
+                                      offsetof(CPUX86State, eflags),
+                                      sizeof(e->eflags), sizeof(e->eflags));
+        insn_dataflow_declare_regfile(df_p, 1, offsetof(CPUX86State, df),
+                                      sizeof(e->df), sizeof(e->df));
+    }
+
     static const char seg_base_names[6][8] = {
         [R_CS] = "cs_base",
         [R_DS] = "ds_base",
@@ -3945,12 +4020,13 @@ void tcg_x86_init(void)
                                     "cc_src");
     cpu_cc_src2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_src2),
                                      "cc_src2");
-    cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
+    cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip),
+                                 X86_DF_PC_NAME);
 
     for (i = 0; i < CPU_NB_REGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
                                          offsetof(CPUX86State, regs[i]),
-                                         reg_names[i]);
+                                         x86_reg_names[i]);
     }
 
     for (i = 0; i < 6; ++i) {

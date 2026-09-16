@@ -28,6 +28,21 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# CLOSED COVERAGE PATHS.  Two rows stood here until the x86 hand statements
+# landed, and they are kept as comments rather than deleted so the next
+# reader can see what closed them and check it:
+#
+#   x86_64	NOP	GEN_OP_NOP	GEN_OP_PREFETCH	CAPSTONE	COVERAGE-PATH	prefetcht0 IS a prefetch; QEMU lowers it to nothing and the identity therefore lands on the NOP rule, and the remedy is the prefetch word stated at target/i386's own prefetch decode site (CLEAN_PLAN fact 18)
+#     -> CLOSED: decode_0F18() states the prefetch word from the modrm
+#        extension, so the 32 measured prefetcht0 encodings now AGREE and the
+#        class has no members.  A ruling whose class is empty is a dead rule
+#        and --require-ruled says so, which is why this is a comment.
+#
+#   x86_64	VMOVLPx_st	GEN_OP_VEC_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	one rule covers MOVLPS, which stores a packed low half, and the MOVSD store form, which stores one scalar double; the seven measured rows are all movsd, and the remedy is the operand-dependent statement riscv64's ADDI and aarch64's four shared helpers already use
+#     -> CLOSED, and it exposed the row below: with QEMU stating fp.mov for
+#        the F2-prefixed store forms, the disagreement did not vanish, it
+#        REVERSED, and the reversed pair is what is arbitrated now.
+
 # -- x86_64 ------------------------------------------------------------------
 x86_64	MOVQ	GEN_OP_VEC_MOV	GEN_OP_MOV	QEMU	SETTLED	movq between a GPR and an MMX or XMM register moves a vector register; the incumbent keys on the mnemonic and never looks at which file the operand is in
 x86_64	MOVD_to	GEN_OP_VEC_MOV	GEN_OP_MOV	QEMU	SETTLED	same as MOVQ: the destination is a vector register
@@ -39,8 +54,7 @@ x86_64	VPACKUSDW	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	a pack rearranges
 x86_64	PACKUSWB	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	same as VPACKUSDW
 x86_64	VPERMQ	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	a permute is a shuffle by definition
 x86_64	VPERM2x128	GEN_OP_VEC_SHUF	GEN_OP_VEC_LOGIC	QEMU	SETTLED	same as VPERMQ
-x86_64	NOP	GEN_OP_NOP	GEN_OP_PREFETCH	CAPSTONE	COVERAGE-PATH	prefetcht0 IS a prefetch; QEMU lowers it to nothing and the identity therefore lands on the NOP rule, and the remedy is the prefetch word stated at target/i386's own prefetch decode site (CLEAN_PLAN fact 18)
-x86_64	VMOVLPx_st	GEN_OP_VEC_MOV	GEN_OP_FP_MOV	CAPSTONE	COVERAGE-PATH	one rule covers MOVLPS, which stores a packed low half, and the MOVSD store form, which stores one scalar double; the seven measured rows are all movsd, and the remedy is the operand-dependent statement riscv64's ADDI and aarch64's four shared helpers already use
+x86_64	VMOVLPx_st	GEN_OP_FP_MOV	GEN_OP_VEC_MOV	QEMU	SETTLED	the store side of VMOVSD_ld, and the same reading: vmovsd stores one scalar double and the register it comes out of is wide, the operation is not. The incumbent contradicts itself here -- it calls the SSE spelling movsd fp.mov and the VEX spelling vmovsd vec.mov, on 7 and 38 encodings of one operation -- because it keys on the mnemonic and the VEX prefix changes the mnemonic. QEMU states the word at the decode site from the prefix that selected the scalar form, so both spellings answer alike
 x86_64	BSWAP	GEN_OP_BITMANIP	GEN_OP_MOV	QEMU	SETTLED	a byte swap rearranges the bytes of its operand; a move does not
 x86_64	STOS	GEN_OP_STORE	GEN_OP_INT_ADD	QEMU	SETTLED	stos writes memory; the incumbent's int.add names the implicit index increment and not the operation
 x86_64	RDTSC	GEN_OP_MOV	GEN_OP_NOP	QEMU	SETTLED	rdtsc writes EDX:EAX, so nop is false of it

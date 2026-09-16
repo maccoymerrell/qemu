@@ -2,12 +2,14 @@
 #
 # The decoder-only statements, counted per encoding.
 #
-# Five facts have no op stream to be read off: atomicity, the encoded
+# Six facts have no op stream to be read off: atomicity, the encoded
 # immediate's value, the vector lane shape, the synthetic address of an
-# instruction that names one and accesses nothing, and the CPUArchState ranges
-# that resolve to a register name.  A decode site states each of them, and this
-# is what says whether it did -- per ISA, over a whole guest corpus, one column
-# per fact so a zero in one cannot be read as a zero in another.
+# instruction that names one and accesses nothing, the CPUArchState ranges
+# that resolve to a register name, and the architectural zero register an
+# operand accessor folds away before any op sees it.  A decode site states
+# each of them, and this is what says whether it did -- per ISA, over a whole
+# guest corpus, one column per fact so a zero in one cannot be read as a zero
+# in another.
 #
 # WHAT MAKES A ZERO READABLE.  An arm that masks one statement must move that
 # column and no other; the report prints each column separately for exactly
@@ -28,7 +30,7 @@ import os
 import sys
 
 COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz', 'memops',
-           'fieldregs')
+           'fieldregs', 'zero', 'nrd', 'nwr')
 
 
 def load(paths):
@@ -97,6 +99,11 @@ def census(rows):
         'memops': 0,
         'fieldreg_named': 0,
         'fieldreg_unnamed': 0,
+        'zero_read': 0,
+        'zero_write': 0,
+        'reg_reads': 0,
+        'reg_writes': 0,
+        'set_refused': 0,
         'conflict': 0,
     }
     named = {}
@@ -120,6 +127,15 @@ def census(rows):
                 else:
                     c['fieldreg_named'] += 1
                     named[nm] = named.get(nm, 0) + 1
+        if row['nrd'] == '-':
+            c['set_refused'] += 1
+        else:
+            c['reg_reads'] += int(row['nrd'])
+            c['reg_writes'] += int(row['nwr'])
+        if 'r' in row['zero']:
+            c['zero_read'] += 1
+        if 'w' in row['zero']:
+            c['zero_write'] += 1
         if row.get('_conflict'):
             c['conflict'] += 1
     return c, named
@@ -138,6 +154,11 @@ def report(tag, c, named, stamp, nfiles, show_names):
     print('   memop rows           %d' % c['memops'])
     print('   env range NAMED      %d' % c['fieldreg_named'])
     print('   env range unnamed    %d' % c['fieldreg_unnamed'])
+    print('   zero reg READ        %d' % c['zero_read'])
+    print('   zero reg WRITTEN     %d' % c['zero_write'])
+    print('   register READS       %d' % c['reg_reads'])
+    print('   register WRITES      %d' % c['reg_writes'])
+    print('   set REFUSED          %d' % c['set_refused'])
     print('   per-encoding conflict %d' % c['conflict'])
     if show_names:
         for nm, n in sorted(named.items(), key=lambda kv: -kv[1]):

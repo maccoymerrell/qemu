@@ -15,6 +15,7 @@
 
 #include <elf.h>
 #include <glib.h>
+#include <limits.h>
 #include <link.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -224,7 +225,8 @@ void corpora_init()
             "#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n");
         corpus_stmt = new Corpus(
             "CST_DF_STMT_DUMP",
-            "#isa\tencoding\tatomic\timm\tvece\toprsz\tmemops\tfieldregs\n");
+            "#isa\tencoding\tatomic\timm\tvece\toprsz\tmemops\tfieldregs"
+            "\tzero\tnrd\tnwr\n");
     }
 }
 
@@ -263,6 +265,38 @@ const char *isa_name()
         }
     }
     return n;
+}
+
+/*
+ * Which provenance bit stands for the architectural zero register.
+ *
+ * The three atoms sit at the top of the register namespace and their indices
+ * are a property of the emulator, not of this plugin, so the bit is asked for
+ * rather than spelled: a build whose namespace is a different width would
+ * otherwise have a hard-coded index quietly land on a real register.
+ *
+ * The search is bounded by the widest set the reader below asks for.  A build
+ * that answers for no bit at all returns UINT_MAX, and the caller writes no
+ * zero column rather than a false absence.
+ */
+unsigned zero_atom_bit()
+{
+    static unsigned bit = UINT_MAX;
+    static bool done;
+
+    if (!done) {
+        done = true;
+        for (unsigned b = 0; b < 8 * 64; b++) {
+            uint32_t atom = 0;
+
+            if (qemu_plugin_dataflow_prov_atom(b, &atom) &&
+                atom == QEMU_PLUGIN_DF_ATOM_ZERO) {
+                bit = b;
+                break;
+            }
+        }
+    }
+    return bit;
 }
 
 } /* namespace */
@@ -501,10 +535,63 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         snprintf(vece, sizeof(vece), "%u", st.vec_vece);
     }
 
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\n", isa_name(), enc,
+    /*
+     * The architectural zero register, in whichever direction it was stated.
+     *
+     * It is an ATOM and not a register: it has no storage, so it appears in
+     * the read and write sets under a bit the namespace reserves rather than
+     * one that stands for a global.  A decoder that folds `xzr` or `$zero`
+     * away leaves nothing in the op stream at all, so an unstated zero and an
+     * instruction that genuinely touches no register look identical here --
+     * which is exactly why the column exists separately from the read list.
+     *
+     * A set that could not be recorded in full is refused whole by the ABI,
+     * and a refusal reads "-" like an absence would; the status row's
+     * `incomplete` is what separates them, and it is carried by the columns
+     * above.
+     */
+    char zero[4];
+    uint64_t rd[8], wr[8];
+    unsigned zbit = zero_atom_bit();
+    bool z_rd = false, z_wr = false;
+    unsigned n_rd = 0, n_wr = 0;
+    bool have_sets = false;
+
+    if (qemu_plugin_insn_reg_reads(tb, idx, rd, 8) <= 8 &&
+        qemu_plugin_insn_reg_writes(tb, idx, wr, 8) <= 8) {
+        have_sets = true;
+        for (unsigned w = 0; w < 8; w++) {
+            n_rd += (unsigned)__builtin_popcountll(rd[w]);
+            n_wr += (unsigned)__builtin_popcountll(wr[w]);
+        }
+        if (zbit != UINT_MAX && zbit / 64 < 8) {
+            z_rd = (rd[zbit / 64] >> (zbit % 64)) & 1;
+            z_wr = (wr[zbit / 64] >> (zbit % 64)) & 1;
+        }
+    }
+    snprintf(zero, sizeof(zero), "%s%s",
+             z_rd ? "r" : "", z_wr ? "w" : "");
+
+    /*
+     * THE SIZE OF THE READ AND WRITE SETS.
+     *
+     * A statement that names a register the ops do not -- the MOPS syndrome's
+     * three, the folded program counter, the zero register -- changes the set
+     * and nothing else this corpus carries, so without these two columns the
+     * only instrument that could score such a statement would be the wire.
+     * A set the ABI REFUSED (this instruction could not be recorded in full)
+     * reads "-" rather than 0: a refusal and an instruction that touches no
+     * register are different claims.
+     */
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t", isa_name(), enc,
             (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
             k ? imm : "-", vece, st.vec_oprsz, st.n_memops,
-            fk ? fields : "-");
+            fk ? fields : "-", zero[0] ? zero : "-");
+    if (have_sets) {
+        fprintf(o, "%u\t%u\n", n_rd, n_wr);
+    } else {
+        fprintf(o, "-\t-\n");
+    }
 }
 
 #endif /* CST_CAPTURE */

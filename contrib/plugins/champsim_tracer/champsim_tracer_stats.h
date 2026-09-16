@@ -533,11 +533,24 @@ struct Stats {
      *               split across TBs (a page-straddling block) and its
      *               continuation never came
      *
-     * _cut_frag has real occupants on every terminal-route cell measured
-     * so far.  _tb_edge was exercised end-to-end by the falsifier wave that
-     * closed this arc but has yet to see a genuine occupant, so a 0 in it
-     * says "the close did not land on a cross-TB block", not "this cannot
-     * happen".
+     * BOTH shapes have real occupants.  _tb_edge's was found in the system
+     * SMP-2 canon cell devio_sys_x86_64_smp2 (run 0 of the golden work
+     * root): closes_unsealed 1, _tb_edge 1, _cut_frag 0, alongside "peer
+     * vCPU seal slots flushed at close 1" and "close peer-slot extents from
+     * the LIVE cursor 1".  The mechanism is the peer flush, not a
+     * page-straddling block: an SMP close seals ANOTHER vCPU's slot, and
+     * that peer's chain was simply open at a TB boundary because it had not
+     * reached its branch yet.  Run 1 of the same cell reads 0, so it turns
+     * on where the peer happens to be standing when the close lands.
+     *
+     * A SINGLE-vCPU probe CANNOT produce it, and the attempt is recorded so
+     * it is not repeated: a budget close on the closing vCPU emits the block
+     * at the extent that ran (the epoch-0x1E emit-at-extent rule) and so
+     * never leaves one unsealed -- measured over eight budgets aimed by
+     * residue arithmetic at a deliberately page-straddling true BB, every
+     * one of which took the budget-cut route with both unsealed counters at
+     * 0.  The unsealed shapes need a close that seals a chain belonging to
+     * someone other than the vCPU being cut.
      *
      * _blocks is their sum.  _closes counts closes that produced at
      * least one, _contexts sums the distinct (vCPU, thread) identities

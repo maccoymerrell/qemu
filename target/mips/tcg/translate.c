@@ -26,6 +26,7 @@
 #include "translate.h"
 #include "internal.h"
 #include "exec/helper-proto.h"
+#include "exec/insn-dataflow.h"
 #include "exec/plugin-gen.h"
 #include "exec/translation-block.h"
 #include "semihosting/semihost.h"
@@ -35,6 +36,13 @@
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
+
+/*
+ * The rule each case label of each instrumented dispatch names, keyed by the
+ * value the switch dispatches on.  Generated from this file's own switches
+ * and target/mips/tcg/insn-df-words.tsv by scripts/mips-df-ident.py.
+ */
+#include "insn-df-ident.h.inc"
 
 
 /*
@@ -2467,12 +2475,21 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     TCGv t0;
 
     if (rt == 0) {
-        /* If no destination, treat it as a NOP. */
+        /*
+         * If no destination, treat it as a NOP.  MIPS spells its no-op as a
+         * shift into $zero -- 0x00000000 is sll $zero,$zero,0, and ssnop and
+         * ehb are the same rule with other shift amounts -- so the word is
+         * stated here, where the destination is in hand, and the table's own
+         * word for the rule does not reach it: note_word() is first-wins.
+         */
+        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+        insn_df_mips_ident(MIPS_DF_SHIFT_IMM, opc);
         return;
     }
 
     t0 = tcg_temp_new();
     gen_load_gpr(t0, rs);
+    insn_df_mips_ident(MIPS_DF_SHIFT_IMM, opc);
     switch (opc) {
     case OPC_SLL:
         tcg_gen_shli_tl(t0, t0, uimm);
@@ -2816,6 +2833,8 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
          * If no destination, treat it as a NOP.
          * For add & sub, we must generate the overflow exception when needed.
          */
+        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+        insn_df_mips_ident(MIPS_DF_SHIFT_REG, opc);
         return;
     }
 
@@ -2823,6 +2842,7 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
     t1 = tcg_temp_new();
     gen_load_gpr(t0, rs);
     gen_load_gpr(t1, rt);
+    insn_df_mips_ident(MIPS_DF_SHIFT_REG, opc);
     switch (opc) {
     case OPC_SLLV:
         tcg_gen_andi_tl(t0, t0, 0x1f);
@@ -2950,6 +2970,7 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
     target_long offset;
     target_long addr;
 
+    insn_df_mips_ident(MIPS_DF_PCREL_TOP2, MASK_OPC_PCREL_TOP2BITS(opc));
     switch (MASK_OPC_PCREL_TOP2BITS(opc)) {
     case OPC_ADDIUPC:
         if (rs != 0) {
@@ -2972,6 +2993,7 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
         break;
 #endif
     default:
+        insn_df_mips_ident(MIPS_DF_PCREL_TOP5, MASK_OPC_PCREL_TOP5BITS(opc));
         switch (MASK_OPC_PCREL_TOP5BITS(opc)) {
         case OPC_AUIPC:
             if (rs != 0) {
@@ -4434,6 +4456,16 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             (uint32_t)offset;
         break;
     case OPC_JR:
+        /*
+         * MIPS has no return instruction: a return is a jump to whatever
+         * register holds the link, and the calling convention makes that
+         * $ra.  Only the decoder holds rs, so the word is stated here and
+         * OPC_JR's own row in insn-df-words.tsv states none -- note_word()
+         * is first-wins and the table has already been consulted.
+         */
+        insn_dataflow_note_word(rs == 31 ? INSN_DF_WORD_RET
+                                         : INSN_DF_WORD_JUMP_REG);
+        /* fall through */
     case OPC_JALR:
         /* Jump to register */
         if (offset != 0 && offset != 16) {
@@ -4706,6 +4738,7 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
 
     t0 = tcg_temp_new();
     gen_load_gpr(t0, rt);
+    insn_df_mips_ident(MIPS_DF_BSHFL, op2);
     switch (op2) {
     case OPC_WSBH:
         {
@@ -8505,6 +8538,7 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
     const char *opn = "ldst";
 
     check_cp0_enabled(ctx);
+    insn_df_mips_ident(MIPS_DF_CP0, opc);
     switch (opc) {
     case OPC_MFC0:
         if (rt == 0) {
@@ -8701,6 +8735,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
 
     btarget = ctx->base.pc_next + 4 + offset;
 
+    insn_df_mips_ident(MIPS_DF_BC1, op);
     switch (op) {
     case OPC_BC1F:
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
@@ -8808,6 +8843,7 @@ static void gen_compute_branch1_r6(DisasContext *ctx, uint32_t op,
 
     btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
 
+    insn_df_mips_ident(MIPS_DF_BC1_R6, op);
     switch (op) {
     case OPC_BC1EQZ:
         tcg_gen_xori_i64(t0, t0, 1);
@@ -9285,6 +9321,7 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
                        int ft, int fs, int fd, int cc)
 {
     uint32_t func = ctx->opcode & 0x3f;
+    insn_df_mips_ident(MIPS_DF_FARITH, op1);
     switch (op1) {
     case OPC_ADD_S:
         {
@@ -13000,12 +13037,14 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
     sa = (ctx->opcode >> 6) & 0x1f;
 
     op1 = MASK_SPECIAL(ctx->opcode);
+    insn_df_mips_ident(MIPS_DF_SPECIAL_R6, op1);
     switch (op1) {
     case OPC_MULT:
     case OPC_MULTU:
     case OPC_DIV:
     case OPC_DIVU:
         op2 = MASK_R6_MULDIV(ctx->opcode);
+        insn_df_mips_ident(MIPS_DF_SPECIAL_R6_MULDIV, op2);
         switch (op2) {
         case R6_OPC_MUL:
         case R6_OPC_MUH:
@@ -13070,6 +13109,7 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DDIVU:
 
         op2 = MASK_R6_MULDIV(ctx->opcode);
+        insn_df_mips_ident(MIPS_DF_SPECIAL_R6_DMULDIV, op2);
         switch (op2) {
         case R6_OPC_DMUL:
         case R6_OPC_DMUH:
@@ -13103,6 +13143,7 @@ static void decode_opc_special_tx79(CPUMIPSState *env, DisasContext *ctx)
     int rd = extract32(ctx->opcode, 11, 5);
     uint32_t op1 = MASK_SPECIAL(ctx->opcode);
 
+    insn_df_mips_ident(MIPS_DF_SPECIAL_TX79, op1);
     switch (op1) {
     case OPC_MOVN:         /* Conditional move */
     case OPC_MOVZ:
@@ -13153,6 +13194,7 @@ static void decode_opc_special_legacy(CPUMIPSState *env, DisasContext *ctx)
     rd = (ctx->opcode >> 11) & 0x1f;
 
     op1 = MASK_SPECIAL(ctx->opcode);
+    insn_df_mips_ident(MIPS_DF_SPECIAL_LEGACY, op1);
     switch (op1) {
     case OPC_MOVN:         /* Conditional move */
     case OPC_MOVZ:
@@ -13227,6 +13269,7 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     sa = (ctx->opcode >> 6) & 0x1f;
 
     op1 = MASK_SPECIAL(ctx->opcode);
+    insn_df_mips_ident(MIPS_DF_SPECIAL, op1);
     switch (op1) {
     case OPC_SLL:          /* Shift with immediate */
         if (sa == 5 && rd == 0 &&
@@ -13426,6 +13469,7 @@ static void decode_opc_special2_legacy(CPUMIPSState *env, DisasContext *ctx)
     rd = (ctx->opcode >> 11) & 0x1f;
 
     op1 = MASK_SPECIAL2(ctx->opcode);
+    insn_df_mips_ident(MIPS_DF_SPECIAL2, op1);
     switch (op1) {
     case OPC_MADD: /* Multiply and add/sub */
     case OPC_MADDU:
@@ -13482,6 +13526,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
     imm = (int16_t)ctx->opcode >> 7;
 
     op1 = MASK_SPECIAL3(ctx->opcode);
+    insn_df_mips_ident(MIPS_DF_SPECIAL3_R6, op1);
     switch (op1) {
     case R6_OPC_PREF:
         if (rt >= 24) {
@@ -13509,6 +13554,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
                 break;
             }
             op2 = MASK_BSHFL(ctx->opcode);
+            insn_df_mips_ident(MIPS_DF_SPECIAL3_R6_BSHFL, op2);
             switch (op2) {
             case OPC_ALIGN:
             case OPC_ALIGN_1:
@@ -13556,6 +13602,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
                 break;
             }
             op2 = MASK_DBSHFL(ctx->opcode);
+            insn_df_mips_ident(MIPS_DF_SPECIAL3_R6_DBSHFL, op2);
             switch (op2) {
             case OPC_DALIGN:
             case OPC_DALIGN_1:
@@ -14099,6 +14146,7 @@ static void decode_mmi(CPUMIPSState *env, DisasContext *ctx)
     int rt = extract32(ctx->opcode, 16, 5);
     int rd = extract32(ctx->opcode, 11, 5);
 
+    insn_df_mips_ident(MIPS_DF_MMI, opc);
     switch (opc) {
     case MMI_OPC_MULT1:
     case MMI_OPC_MULTU1:
@@ -14188,6 +14236,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
      * EVA is absent.
      */
     if (ctx->eva) {
+        insn_df_mips_ident(MIPS_DF_SPECIAL3_EVA, op1);
         switch (op1) {
         case OPC_LWLE:
         case OPC_LWRE:
@@ -14226,6 +14275,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         }
     }
 
+    insn_df_mips_ident(MIPS_DF_SPECIAL3, op1);
     switch (op1) {
     case OPC_EXT:
     case OPC_INS:
@@ -14234,6 +14284,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_BSHFL:
         op2 = MASK_BSHFL(ctx->opcode);
+        insn_df_mips_ident(MIPS_DF_SPECIAL3_BSHFL, op2);
         switch (op2) {
         case OPC_ALIGN:
         case OPC_ALIGN_1:
@@ -14262,6 +14313,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_DBSHFL:
         op2 = MASK_DBSHFL(ctx->opcode);
+        insn_df_mips_ident(MIPS_DF_SPECIAL3_DBSHFL, op2);
         switch (op2) {
         case OPC_DALIGN:
         case OPC_DALIGN_1:
@@ -14330,6 +14382,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     rd = (ctx->opcode >> 11) & 0x1f;
     sa = (ctx->opcode >> 6) & 0x1f;
     imm = (int16_t)ctx->opcode;
+    insn_df_mips_ident(MIPS_DF_MAJOR, op);
     switch (op) {
     case OPC_SPECIAL:
         decode_opc_special(env, ctx);
@@ -14361,6 +14414,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_REGIMM:
         op1 = MASK_REGIMM(ctx->opcode);
+        insn_df_mips_ident(MIPS_DF_REGIMM, op1);
         switch (op1) {
         case OPC_BLTZL: /* REGIMM branches */
         case OPC_BGEZL:
@@ -14482,6 +14536,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 TCGv t0 = tcg_temp_new();
 
                 op2 = MASK_MFMC0(ctx->opcode);
+                insn_df_mips_ident(MIPS_DF_MFMC0, op2);
                 switch (op2) {
                 case OPC_DMT:
                     check_cp0_mt(ctx);
@@ -14700,6 +14755,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_CP1:
         op1 = MASK_CP1(ctx->opcode);
 
+        insn_df_mips_ident(MIPS_DF_CP1, op1);
         switch (op1) {
         case OPC_MFHC1:
         case OPC_MTHC1:
@@ -14773,6 +14829,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             int r6_op = ctx->opcode & FOP(0x3f, 0x1f);
             check_cp1_enabled(ctx);
             if (ctx->insn_flags & ISA_MIPS_R6) {
+                insn_df_mips_ident(MIPS_DF_CP1_R6, r6_op);
                 switch (r6_op) {
                 case R6_OPC_CMP_AF_S:
                 case R6_OPC_CMP_UN_S:
@@ -14885,6 +14942,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         if (ctx->CP0_Config1 & (1 << CP0C1_FP)) {
             check_cp1_enabled(ctx);
             op1 = MASK_CP3(ctx->opcode);
+            insn_df_mips_ident(MIPS_DF_CP3, op1);
             switch (op1) {
             case OPC_LUXC1:
             case OPC_SUXC1:
@@ -14986,7 +15044,14 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
 #endif
     case OPC_DAUI: /* OPC_JALX */
+        /*
+         * One major opcode, two unrelated instructions: an add of a shifted
+         * immediate on R6, and the call that switches ISA mode before it.
+         * Only the decoder holds the CPU's ISA revision, so the word is
+         * stated on each arm and OPC_DAUI's own row states none.
+         */
         if (ctx->insn_flags & ISA_MIPS_R6) {
+            insn_dataflow_note_word(INSN_DF_WORD_INT_ADD);
 #if defined(TARGET_MIPS64)
             /* OPC_DAUI */
             check_mips_64(ctx);
@@ -15003,6 +15068,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
 #endif
         } else {
             /* OPC_JALX */
+            insn_dataflow_note_word(INSN_DF_WORD_CALL);
             check_insn(ctx, ASE_MIPS16 | ASE_MICROMIPS);
             offset = (int32_t)(ctx->opcode & 0x3FFFFFF) << 2;
             gen_compute_branch(ctx, op, 4, rs, rt, offset, 4);

@@ -1,0 +1,609 @@
+# The generic word each MIPS decode rule carries.
+#
+# One row per case label of an instrumented dispatch switch in
+# target/mips/tcg/translate.c.  scripts/mips-df-ident.py turns the pair
+# into the per-site tables the decoder consults, and REFUSES in both
+# directions: a label with no row here does not generate, and a row that
+# names no label of any instrumented switch does not generate either.
+#
+# Column 1 is the case label, exactly as translate.c spells it.  Column 2
+# is a word from include/exec/insn-dataflow-words.h, or "-" for a rule
+# with nothing generic to say, whose reason is then column 3.
+#
+# Copyright (c) 2026 Maccoy Merrell
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# int.add
+OPC_ADD	int.add
+OPC_ADDIU	int.add
+OPC_ADDU	int.add
+OPC_DADD	int.add
+OPC_DADDIU	int.add
+OPC_DADDU	int.add
+OPC_DAHI	int.add
+OPC_DATI	int.add
+
+# int.sub
+OPC_DSUB	int.sub
+OPC_DSUBU	int.sub
+OPC_SUB	int.sub
+OPC_SUBU	int.sub
+
+# int.mul
+MMI_OPC_MULT1	int.mul
+MMI_OPC_MULTU1	int.mul
+OPC_DMULT	int.mul
+OPC_DMULTU	int.mul
+OPC_MUL	int.mul
+OPC_MULT	int.mul
+OPC_MULTU	int.mul
+R6_OPC_DMUH	int.mul
+R6_OPC_DMUHU	int.mul
+R6_OPC_DMUL	int.mul
+R6_OPC_DMULU	int.mul
+R6_OPC_MUH	int.mul
+R6_OPC_MUHU	int.mul
+R6_OPC_MUL	int.mul
+R6_OPC_MULU	int.mul
+
+# int.div
+MMI_OPC_DIV1	int.div
+MMI_OPC_DIVU1	int.div
+OPC_DDIV	int.div
+OPC_DDIVU	int.div
+OPC_DIV	int.div
+OPC_DIVU	int.div
+R6_OPC_DDIV	int.div
+R6_OPC_DDIVU	int.div
+R6_OPC_DIV	int.div
+R6_OPC_DIVU	int.div
+R6_OPC_DMOD	int.div
+R6_OPC_DMODU	int.div
+R6_OPC_MOD	int.div
+R6_OPC_MODU	int.div
+
+# int.madd
+MMI_OPC_MADD	int.madd
+MMI_OPC_MADD1	int.madd
+MMI_OPC_MADDU	int.madd
+MMI_OPC_MADDU1	int.madd
+OPC_MADD	int.madd
+OPC_MADDU	int.madd
+
+# int.msub
+OPC_MSUB	int.msub
+OPC_MSUBU	int.msub
+
+# and
+OPC_AND	and
+OPC_ANDI	and
+
+# or
+OPC_NOR	or
+OPC_OR	or
+OPC_ORI	or
+
+# xor
+OPC_XOR	xor
+OPC_XORI	xor
+
+# shl
+OPC_DSLL	shl
+OPC_DSLL32	shl
+OPC_DSLLV	shl
+OPC_SLL	shl
+OPC_SLLV	shl
+
+# shr
+OPC_DSRA	shr
+OPC_DSRA32	shr
+OPC_DSRAV	shr
+OPC_DSRL	shr
+OPC_DSRL32	shr
+OPC_DSRLV	shr
+OPC_SRA	shr
+OPC_SRAV	shr
+OPC_SRL	shr
+OPC_SRLV	shr
+
+# ror
+OPC_DROTR	ror
+OPC_DROTR32	ror
+OPC_DROTRV	ror
+OPC_ROTR	ror
+OPC_ROTRV	ror
+
+# bitmanip
+OPC_ALIGN	bitmanip
+OPC_ALIGN_1	bitmanip
+OPC_ALIGN_2	bitmanip
+OPC_ALIGN_3	bitmanip
+OPC_BITSWAP	bitmanip
+OPC_CLO	bitmanip
+OPC_CLZ	bitmanip
+OPC_DALIGN	bitmanip
+OPC_DALIGN_1	bitmanip
+OPC_DALIGN_2	bitmanip
+OPC_DALIGN_3	bitmanip
+OPC_DALIGN_4	bitmanip
+OPC_DALIGN_5	bitmanip
+OPC_DALIGN_6	bitmanip
+OPC_DALIGN_7	bitmanip
+OPC_DBITSWAP	bitmanip
+OPC_DCLO	bitmanip
+OPC_DCLZ	bitmanip
+OPC_DEXT	bitmanip
+OPC_DEXTM	bitmanip
+OPC_DEXTU	bitmanip
+OPC_DINS	bitmanip
+OPC_DINSM	bitmanip
+OPC_DINSU	bitmanip
+OPC_DSBH	bitmanip
+OPC_DSHD	bitmanip
+OPC_EXT	bitmanip
+OPC_INS	bitmanip
+OPC_WSBH	bitmanip
+R6_OPC_CLO	bitmanip
+R6_OPC_CLZ	bitmanip
+R6_OPC_DCLO	bitmanip
+R6_OPC_DCLZ	bitmanip
+
+# movsx
+OPC_SEB	movsx
+OPC_SEH	movsx
+
+# setcc
+OPC_SLT	setcc
+OPC_SLTI	setcc
+OPC_SLTIU	setcc
+OPC_SLTU	setcc
+
+# cmov
+OPC_MAXA_D	cmov
+OPC_MAXA_S	cmov
+OPC_MAX_D	cmov
+OPC_MAX_S	cmov
+OPC_MINA_D	cmov
+OPC_MINA_S	cmov
+OPC_MIN_D	cmov
+OPC_MIN_S	cmov
+OPC_MOVCF_D	cmov
+OPC_MOVCF_PS	cmov
+OPC_MOVCF_S	cmov
+OPC_MOVCI	cmov
+OPC_MOVN	cmov
+OPC_MOVN_D	cmov
+OPC_MOVN_PS	cmov
+OPC_MOVN_S	cmov
+OPC_MOVZ	cmov
+OPC_MOVZ_D	cmov
+OPC_MOVZ_PS	cmov
+OPC_MOVZ_S	cmov
+OPC_SELEQZ	cmov
+OPC_SELEQZ_D	cmov
+OPC_SELEQZ_S	cmov
+OPC_SELNEZ	cmov
+OPC_SELNEZ_D	cmov
+OPC_SELNEZ_S	cmov
+OPC_SEL_D	cmov
+OPC_SEL_S	cmov
+
+# mov
+OPC_CFC1	mov
+OPC_CTC1	mov
+OPC_DMFC0	mov
+OPC_DMFC1	mov
+OPC_DMTC0	mov
+OPC_DMTC1	mov
+OPC_LUI	mov
+OPC_MFC0	mov
+OPC_MFC1	mov
+OPC_MFHC0	mov
+OPC_MFHC1	mov
+OPC_MFHI	mov
+OPC_MFLO	mov
+OPC_MFTR	mov
+OPC_MTC0	mov
+OPC_MTC1	mov
+OPC_MTHC0	mov
+OPC_MTHC1	mov
+OPC_MTHI	mov
+OPC_MTLO	mov
+OPC_MTTR	mov
+OPC_RDHWR	mov
+
+# lea
+OPC_ADDIUPC	lea
+OPC_ALUIPC	lea
+OPC_AUIPC	lea
+
+# load
+OPC_LB	load
+OPC_LBE	load
+OPC_LBU	load
+OPC_LBUE	load
+OPC_LD	load
+OPC_LDC1	load
+OPC_LDL	load
+OPC_LDR	load
+OPC_LDXC1	load
+OPC_LH	load
+OPC_LHE	load
+OPC_LHU	load
+OPC_LHUE	load
+OPC_LL	load
+OPC_LLD	load
+OPC_LLE	load
+OPC_LUXC1	load
+OPC_LW	load
+OPC_LWC1	load
+OPC_LWE	load
+OPC_LWL	load
+OPC_LWLE	load
+OPC_LWPC	load
+OPC_LWR	load
+OPC_LWRE	load
+OPC_LWU	load
+OPC_LWUPC	load
+OPC_LWXC1	load
+R6_OPC_LDPC	load
+R6_OPC_LL	load
+R6_OPC_LLD	load
+R6_OPC_LWPC	load
+
+# store
+OPC_SB	store
+OPC_SBE	store
+OPC_SC	store
+OPC_SCD	store
+OPC_SCE	store
+OPC_SD	store
+OPC_SDC1	store
+OPC_SDL	store
+OPC_SDR	store
+OPC_SDXC1	store
+OPC_SH	store
+OPC_SHE	store
+OPC_SUXC1	store
+OPC_SW	store
+OPC_SWC1	store
+OPC_SWE	store
+OPC_SWL	store
+OPC_SWLE	store
+OPC_SWR	store
+OPC_SWRE	store
+OPC_SWXC1	store
+R6_OPC_SC	store
+R6_OPC_SCD	store
+
+# prefetch
+OPC_PREF	prefetch
+OPC_PREFE	prefetch
+OPC_PREFX	prefetch
+R6_OPC_PREF	prefetch
+
+# cacheflush
+OPC_CACHE	cacheflush
+OPC_CACHEE	cacheflush
+OPC_SYNCI	cacheflush
+R6_OPC_CACHE	cacheflush
+
+# fence
+OPC_SYNC	fence
+
+# tlbflush
+OPC_TLBINV	tlbflush
+OPC_TLBINVF	tlbflush
+OPC_TLBWI	tlbflush
+OPC_TLBWR	tlbflush
+
+# jump
+OPC_BC	jump
+OPC_J	jump
+
+# jump.cond
+OPC_BC1ANY4	jump.cond
+OPC_BC1EQZ	jump.cond
+OPC_BC1F	jump.cond
+OPC_BC1FANY2	jump.cond
+OPC_BC1FANY4	jump.cond
+OPC_BC1FL	jump.cond
+OPC_BC1NEZ	jump.cond
+OPC_BC1T	jump.cond
+OPC_BC1TANY2	jump.cond
+OPC_BC1TANY4	jump.cond
+OPC_BC1TL	jump.cond
+OPC_BEQ	jump.cond
+OPC_BEQL	jump.cond
+OPC_BEQZC	jump.cond
+OPC_BGEZ	jump.cond
+OPC_BGEZL	jump.cond
+OPC_BGTZC	jump.cond
+OPC_BLEZC	jump.cond
+OPC_BLTZ	jump.cond
+OPC_BLTZL	jump.cond
+OPC_BNE	jump.cond
+OPC_BNEL	jump.cond
+OPC_BNEZC	jump.cond
+OPC_BNVC	jump.cond
+OPC_BOVC	jump.cond
+OPC_BPOSGE32	jump.cond
+OPC_BPOSGE64	jump.cond
+
+# call
+OPC_BALC	call
+OPC_BGEZAL	call
+OPC_BGEZALL	call
+OPC_BGTZALC	call
+OPC_BLEZALC	call
+OPC_BLTZAL	call
+OPC_BLTZALL	call
+OPC_JAL	call
+
+# call.reg
+OPC_JALR	call.reg
+
+# ret
+OPC_DERET	ret
+OPC_ERET	ret
+
+# syscall
+OPC_BREAK	syscall
+OPC_SDBBP	syscall
+OPC_SIGRIE	syscall
+OPC_SYSCALL	syscall
+OPC_TEQ	syscall
+OPC_TEQI	syscall
+OPC_TGE	syscall
+OPC_TGEI	syscall
+OPC_TGEIU	syscall
+OPC_TGEU	syscall
+OPC_TLT	syscall
+OPC_TLTI	syscall
+OPC_TLTIU	syscall
+OPC_TLTU	syscall
+OPC_TNE	syscall
+OPC_TNEI	syscall
+R6_OPC_SDBBP	syscall
+
+# nop
+OPC_WAIT	nop
+
+# fp.add
+OPC_ADD_D	fp.add
+OPC_ADD_S	fp.add
+
+# fp.sub
+OPC_SUB_D	fp.sub
+OPC_SUB_S	fp.sub
+
+# fp.mul
+OPC_MUL_D	fp.mul
+OPC_MUL_S	fp.mul
+
+# fp.div
+OPC_DIV_D	fp.div
+OPC_DIV_S	fp.div
+OPC_RECIP_D	fp.div
+OPC_RECIP_S	fp.div
+
+# fp.sqrt
+OPC_RSQRT_D	fp.sqrt
+OPC_RSQRT_S	fp.sqrt
+OPC_SQRT_D	fp.sqrt
+OPC_SQRT_S	fp.sqrt
+
+# fp.mov
+OPC_ABS_D	fp.mov
+OPC_ABS_S	fp.mov
+OPC_MOV_D	fp.mov
+OPC_MOV_S	fp.mov
+OPC_NEG_D	fp.mov
+OPC_NEG_S	fp.mov
+
+# fp.cvt
+OPC_CEIL_L_D	fp.cvt
+OPC_CEIL_L_S	fp.cvt
+OPC_CEIL_W_D	fp.cvt
+OPC_CEIL_W_S	fp.cvt
+OPC_CVT_D_L	fp.cvt
+OPC_CVT_D_S	fp.cvt
+OPC_CVT_D_W	fp.cvt
+OPC_CVT_L_D	fp.cvt
+OPC_CVT_L_S	fp.cvt
+OPC_CVT_PS_PW	fp.cvt
+OPC_CVT_PS_S	fp.cvt
+OPC_CVT_PW_PS	fp.cvt
+OPC_CVT_S_D	fp.cvt
+OPC_CVT_S_L	fp.cvt
+OPC_CVT_S_PL	fp.cvt
+OPC_CVT_S_PU	fp.cvt
+OPC_CVT_S_W	fp.cvt
+OPC_CVT_W_D	fp.cvt
+OPC_CVT_W_S	fp.cvt
+OPC_FLOOR_L_D	fp.cvt
+OPC_FLOOR_L_S	fp.cvt
+OPC_FLOOR_W_D	fp.cvt
+OPC_FLOOR_W_S	fp.cvt
+OPC_RINT_D	fp.cvt
+OPC_RINT_S	fp.cvt
+OPC_ROUND_L_D	fp.cvt
+OPC_ROUND_L_S	fp.cvt
+OPC_ROUND_W_D	fp.cvt
+OPC_ROUND_W_S	fp.cvt
+OPC_TRUNC_L_D	fp.cvt
+OPC_TRUNC_L_S	fp.cvt
+OPC_TRUNC_W_D	fp.cvt
+OPC_TRUNC_W_S	fp.cvt
+
+# fp.cmp
+OPC_CLASS_D	fp.cmp
+OPC_CLASS_S	fp.cmp
+OPC_CMP_EQ_D	fp.cmp
+OPC_CMP_EQ_PS	fp.cmp
+OPC_CMP_EQ_S	fp.cmp
+OPC_CMP_F_D	fp.cmp
+OPC_CMP_F_PS	fp.cmp
+OPC_CMP_F_S	fp.cmp
+OPC_CMP_LE_D	fp.cmp
+OPC_CMP_LE_PS	fp.cmp
+OPC_CMP_LE_S	fp.cmp
+OPC_CMP_LT_D	fp.cmp
+OPC_CMP_LT_PS	fp.cmp
+OPC_CMP_LT_S	fp.cmp
+OPC_CMP_NGE_D	fp.cmp
+OPC_CMP_NGE_PS	fp.cmp
+OPC_CMP_NGE_S	fp.cmp
+OPC_CMP_NGLE_D	fp.cmp
+OPC_CMP_NGLE_PS	fp.cmp
+OPC_CMP_NGLE_S	fp.cmp
+OPC_CMP_NGL_D	fp.cmp
+OPC_CMP_NGL_PS	fp.cmp
+OPC_CMP_NGL_S	fp.cmp
+OPC_CMP_NGT_D	fp.cmp
+OPC_CMP_NGT_PS	fp.cmp
+OPC_CMP_NGT_S	fp.cmp
+OPC_CMP_OLE_D	fp.cmp
+OPC_CMP_OLE_PS	fp.cmp
+OPC_CMP_OLE_S	fp.cmp
+OPC_CMP_OLT_D	fp.cmp
+OPC_CMP_OLT_PS	fp.cmp
+OPC_CMP_OLT_S	fp.cmp
+OPC_CMP_SEQ_D	fp.cmp
+OPC_CMP_SEQ_PS	fp.cmp
+OPC_CMP_SEQ_S	fp.cmp
+OPC_CMP_SF_D	fp.cmp
+OPC_CMP_SF_PS	fp.cmp
+OPC_CMP_SF_S	fp.cmp
+OPC_CMP_UEQ_D	fp.cmp
+OPC_CMP_UEQ_PS	fp.cmp
+OPC_CMP_UEQ_S	fp.cmp
+OPC_CMP_ULE_D	fp.cmp
+OPC_CMP_ULE_PS	fp.cmp
+OPC_CMP_ULE_S	fp.cmp
+OPC_CMP_ULT_D	fp.cmp
+OPC_CMP_ULT_PS	fp.cmp
+OPC_CMP_ULT_S	fp.cmp
+OPC_CMP_UN_D	fp.cmp
+OPC_CMP_UN_PS	fp.cmp
+OPC_CMP_UN_S	fp.cmp
+R6_OPC_CMP_AF_D	fp.cmp
+R6_OPC_CMP_AF_S	fp.cmp
+R6_OPC_CMP_EQ_D	fp.cmp
+R6_OPC_CMP_EQ_S	fp.cmp
+R6_OPC_CMP_LE_D	fp.cmp
+R6_OPC_CMP_LE_S	fp.cmp
+R6_OPC_CMP_LT_D	fp.cmp
+R6_OPC_CMP_LT_S	fp.cmp
+R6_OPC_CMP_NE_D	fp.cmp
+R6_OPC_CMP_NE_S	fp.cmp
+R6_OPC_CMP_OR_D	fp.cmp
+R6_OPC_CMP_OR_S	fp.cmp
+R6_OPC_CMP_SAF_D	fp.cmp
+R6_OPC_CMP_SAF_S	fp.cmp
+R6_OPC_CMP_SEQ_D	fp.cmp
+R6_OPC_CMP_SEQ_S	fp.cmp
+R6_OPC_CMP_SEUQ_D	fp.cmp
+R6_OPC_CMP_SEUQ_S	fp.cmp
+R6_OPC_CMP_SLE_D	fp.cmp
+R6_OPC_CMP_SLE_S	fp.cmp
+R6_OPC_CMP_SLT_D	fp.cmp
+R6_OPC_CMP_SLT_S	fp.cmp
+R6_OPC_CMP_SNE_D	fp.cmp
+R6_OPC_CMP_SNE_S	fp.cmp
+R6_OPC_CMP_SOR_D	fp.cmp
+R6_OPC_CMP_SOR_S	fp.cmp
+R6_OPC_CMP_SULE_D	fp.cmp
+R6_OPC_CMP_SULE_S	fp.cmp
+R6_OPC_CMP_SULT_D	fp.cmp
+R6_OPC_CMP_SULT_S	fp.cmp
+R6_OPC_CMP_SUNE_D	fp.cmp
+R6_OPC_CMP_SUNE_S	fp.cmp
+R6_OPC_CMP_SUN_D	fp.cmp
+R6_OPC_CMP_SUN_S	fp.cmp
+R6_OPC_CMP_UEQ_D	fp.cmp
+R6_OPC_CMP_UEQ_S	fp.cmp
+R6_OPC_CMP_ULE_D	fp.cmp
+R6_OPC_CMP_ULE_S	fp.cmp
+R6_OPC_CMP_ULT_D	fp.cmp
+R6_OPC_CMP_ULT_S	fp.cmp
+R6_OPC_CMP_UNE_D	fp.cmp
+R6_OPC_CMP_UNE_S	fp.cmp
+R6_OPC_CMP_UN_D	fp.cmp
+R6_OPC_CMP_UN_S	fp.cmp
+
+# fp.madd
+OPC_MADDF_D	fp.madd
+OPC_MADDF_S	fp.madd
+OPC_MADD_D	fp.madd
+OPC_MADD_S	fp.madd
+
+# fp.msub
+OPC_MSUBF_D	fp.msub
+OPC_MSUBF_S	fp.msub
+OPC_MSUB_D	fp.msub
+OPC_MSUB_S	fp.msub
+OPC_NMADD_D	fp.msub
+OPC_NMADD_S	fp.msub
+OPC_NMSUB_D	fp.msub
+OPC_NMSUB_S	fp.msub
+
+# vec.add
+OPC_ADDR_PS	vec.add
+OPC_ADD_PS	vec.add
+
+# vec.sub
+OPC_SUB_PS	vec.sub
+
+# vec.mul
+OPC_MULR_PS	vec.mul
+OPC_MUL_PS	vec.mul
+
+# vec.div
+OPC_RECIP1_PS	vec.div
+OPC_RECIP2_PS	vec.div
+
+# vec.sqrt
+OPC_RSQRT1_PS	vec.sqrt
+OPC_RSQRT2_PS	vec.sqrt
+
+# vec.mov
+OPC_ABS_PS	vec.mov
+OPC_MOV_PS	vec.mov
+OPC_NEG_PS	vec.mov
+
+# vec.madd
+OPC_MADD_PS	vec.madd
+
+# vec.msub
+OPC_MSUB_PS	vec.msub
+OPC_NMADD_PS	vec.msub
+OPC_NMSUB_PS	vec.msub
+
+# vec.shuffle
+OPC_ALNV_PS	vec.shuffle
+OPC_PLL_PS	vec.shuffle
+OPC_PLU_PS	vec.shuffle
+OPC_PUL_PS	vec.shuffle
+OPC_PUU_PS	vec.shuffle
+
+# rules with nothing generic to say
+OPC_CP2	-	a coprocessor-2 escape; the encoding names no operation of its own and QEMU raises unless a machine implements one
+OPC_DI	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_DMT	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_DVP	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_DVPE	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_EI	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_EMT	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_EVP	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_EVPE	-	toggles interrupt enable and returns the previous CP0_Status; the vocabulary has no word for a control-state toggle
+OPC_FORK	-	MT ASE thread control: it forks or yields a hardware thread, which is not an operation on data
+OPC_JR	-	the return is the same rule as an indirect jump; gen_compute_branch states ret or jump.reg where rs is in hand
+OPC_MDMX	-	the MDMX ASE dispatcher; QEMU raises on every encoding beneath it
+OPC_PMON	-	a simulator-monitor trap from the R3000 era, not an architected operation
+OPC_SPIM	-	a simulator-monitor trap from the R3000 era, not an architected operation
+OPC_TLBP	-	probes the TLB for a match and writes CP0_Index: neither a flush nor a copy of a named register
+OPC_TLBR	-	reads one TLB entry into several CP0 registers; the vocabulary has no word for a structured read of machine state
+OPC_YIELD	-	MT ASE thread control: it forks or yields a hardware thread, which is not an operation on data
+OPC_DAUI	-	one major opcode for two unrelated instructions: DAUI on R6 and the ISA-mode-switching call JALX before it; the decode site states each arm

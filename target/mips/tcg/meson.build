@@ -1,4 +1,28 @@
+#
+# Which rule the bytes reached, for a decoder made of switches.
+#
+# translate.c decodes the base ISA in a nest of hand-written switches, so the
+# identity is keyed off each switch's own case labels; insn-df-words.tsv
+# adjudicates one generic word per label, and the generator refuses a label
+# set and a row set that do not match in either direction.
+#
+insn_df_ident_mips = custom_target('mips-insn-df-ident.h.inc',
+  output: 'insn-df-ident.h.inc',
+  input: files('insn-df-words.tsv'),
+  depend_files: files('translate.c', 'translate.h',
+                      meson.project_source_root() /
+                      'include/exec/insn-dataflow-words.h'),
+  command: [python, files(meson.project_source_root() /
+                          'scripts/mips-df-ident.py'),
+            meson.project_source_root() / 'target/mips/tcg/translate.c',
+            '@INPUT@', '-o', '@OUTPUT@',
+            '--enums', meson.project_source_root() /
+                       'target/mips/tcg/translate.h',
+            '--vocabulary', meson.project_source_root() /
+                            'include/exec/insn-dataflow-words.h'])
+
 gen = [
+  insn_df_ident_mips,
   decodetree.process('rel6.decode', extra_args: ['--decode=decode_isa_rel6']),
   decodetree.process('msa.decode', extra_args: '--decode=decode_ase_msa'),
   decodetree.process('tx79.decode', extra_args: '--static-decode=decode_tx79'),

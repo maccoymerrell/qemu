@@ -1136,6 +1136,30 @@ struct Stats {
                                     * vCPU init, peer seeds) */
     uint64_t marker_page_unreadable_at_refresh = 0;
     uint64_t refresh_evaluated_not_traced = 0;
+    /*
+     * WHY a refresh said "not the marked context", and at what privilege.
+     *
+     * The gate treats "the bytes are not what the marker is" and "I could
+     * not read the bytes at all" as the same answer -- both make it OFF --
+     * and those are different pieces of evidence.  A read that fails
+     * because the vaddr is unmapped in the live space IS evidence of a
+     * foreign context.  A read that fails because the refresh landed while
+     * the vCPU was in a privileged regime that cannot reach user memory is
+     * evidence of NOTHING, and if the gate latches OFF on it and no
+     * further root write follows, the rest of the marked process's run is
+     * classified foreign and silently dropped.
+     *
+     * These three split that answer so the question is decided by
+     * measurement.  They are the denominators for the gate-transition pair
+     * below, which is what actually names the failure: a refresh that
+     * turns the gate off and is never followed by one that turns it back
+     * on.
+     */
+    uint64_t refresh_unreadable_in_kernel = 0;
+    uint64_t refresh_unreadable_in_user = 0;
+    uint64_t refresh_content_mismatch = 0;
+    uint64_t refresh_gate_turned_off = 0;
+    uint64_t refresh_gate_turned_on = 0;
     uint64_t marker_end_no_close = 0;
         /* An END that executed on the correct path, could not be attributed to
      * any owner, and closed the capture anyway.  MAINTAINER RULING

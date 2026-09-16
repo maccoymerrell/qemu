@@ -2525,9 +2525,21 @@ The access count is anchored in architectural state: the SET/CPY
 helpers publish each execution's byte progress from the size
 register's own decrement (``qemu_plugin_rep_bytes``), and the sizes
 of the delivered accesses must sum to it.  The writer verifies this
-on every cleanly completed bulk op and reports the outcome in
-``<outfile>.stats.log`` (``MOPS bytes checked`` / ``MOPS bytes
-mismatch``).
+on every cleanly completed bulk op whose accesses it was asked to
+capture, and reports the outcome in ``<outfile>.stats.log``:
+``MOPS bytes checked`` for the ops it summed and matched, ``MOPS
+bytes mismatch`` (which must read 0) for a sum that disagreed with
+the register, and ``MOPS bytes unchecked`` for ops it could not sum
+at all.
+
+The third row is not a rounding term.  The anchor sums the DELIVERED
+accesses, so it needs their sizes, and without ``memdata=1`` there
+are none to sum: every bulk op then lands in ``unchecked``.  Measured
+on a FEAT_MOPS probe, 14 ops read checked=14 / mismatch=0 /
+unchecked=0 with ``memdata=1`` and checked=0 / mismatch=0 /
+unchecked=14 without it.  A trace taken without memory data therefore
+carries no byte-anchor evidence, and says so in its own stats rather
+than reporting a verification it did not perform.
 
 An execution that faults before moving anything — the first store of
 a ``SET`` landing on a not-yet-mapped destination page — contributes

@@ -125,6 +125,26 @@
 #define INSN_DF_P_ATOMIC    (1u << 0)
 
 /*
+ * The transfer of control this instruction performed, as the translator
+ * emitted it.
+ *
+ * QEMU's own conventions make this readable without a decoder.  goto_tb is
+ * used only for a successor whose address the translator knew, so it marks a
+ * static edge; lookup_and_goto_ptr is used when the successor is a value, so
+ * it marks a computed one; a second static edge is the shape of a conditional
+ * branch, whose taken and not-taken sides each get one.  An instruction that
+ * emitted none of them performed no transfer, whatever its mnemonic suggests.
+ *
+ * What this cannot say is what the emitter folded: a condition evaluated at
+ * translation time leaves one edge where the architecture has two.  That is
+ * why the rule's own word is stated beside this rather than derived from it.
+ */
+#define INSN_DF_X_TRANSFER  (1u << 0)   /* any transfer op */
+#define INSN_DF_X_STATIC    (1u << 1)   /* a successor known at translation */
+#define INSN_DF_X_COMPUTED  (1u << 2)   /* the successor is a value */
+#define INSN_DF_X_MULTI     (1u << 3)   /* more than one static successor */
+
+/*
  * A value the encoding carries, in the role it plays.
  *
  * IMM is an operand in its own right; DISP is a displacement folded into an
@@ -242,6 +262,17 @@ typedef struct InsnDataflow {
     uint8_t  n_memops;
 
     uint8_t  properties;        /* INSN_DF_P_* */
+    uint8_t  xfer;              /* INSN_DF_X_* */
+
+    /*
+     * The decode rule the bytes reached, and the generic word that rule
+     * carries.  Both are static strings owned by the target; NULL means no
+     * rule matched, which is a different answer from a rule that matched and
+     * has nothing to say.
+     */
+    const char *rule;
+    const char *word;
+
     uint8_t  vec_vece;          /* log2 element size, or INSN_DF_VECE_NONE */
     uint32_t vec_oprsz;         /* bytes of one vector operand, 0 if unstated */
 
@@ -389,6 +420,20 @@ void insn_dataflow_borrow_end(void);
 /* A property of this instruction the ops cannot show. */
 void insn_dataflow_note_property(unsigned prop);
 
+/*
+ * The decode rule these bytes reached.
+ *
+ * Emitted by decodetree at each pattern's own dispatch site, after the
+ * pattern's translate function has accepted it -- so the name is the rule that
+ * actually ran, not a rule that merely matched a mask.  Where decoders nest,
+ * the innermost accepts first and its name is the one kept: it is the specific
+ * rule, and the outer dispatcher is the table that reached it.
+ */
+void insn_dataflow_note_rule(const char *name);
+
+/* The generic word that rule carries, stated with the rule. */
+void insn_dataflow_note_word(const char *word);
+
 /* Do not trust this instruction's ops; say so rather than publish them. */
 void insn_dataflow_refuse(void);
 
@@ -485,6 +530,10 @@ static inline void insn_dataflow_borrow_begin(unsigned lender)
 static inline void insn_dataflow_borrow_end(void)
 { }
 static inline void insn_dataflow_note_property(unsigned prop)
+{ }
+static inline void insn_dataflow_note_rule(const char *name)
+{ }
+static inline void insn_dataflow_note_word(const char *word)
 { }
 static inline void insn_dataflow_refuse(void)
 { }

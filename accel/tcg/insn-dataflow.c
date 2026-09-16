@@ -639,6 +639,25 @@ static void df_op(InsnDataflow *d, TCGOp *op)
         }
         return;
 
+    case INDEX_op_goto_tb:
+        /*
+         * QEMU emits goto_tb only for a successor it knew at translation
+         * time, and a conditional branch materialises one for each side, so a
+         * second is the conditional shape rather than a second instruction.
+         */
+        d->xfer |= d->xfer & INSN_DF_X_STATIC
+                   ? INSN_DF_X_MULTI
+                   : INSN_DF_X_TRANSFER | INSN_DF_X_STATIC;
+        return;
+
+    case INDEX_op_goto_ptr:
+        d->xfer |= INSN_DF_X_TRANSFER | INSN_DF_X_COMPUTED;
+        break;
+
+    case INDEX_op_exit_tb:
+        d->xfer |= INSN_DF_X_TRANSFER;
+        return;
+
     case INDEX_op_qemu_ld_i32:
     case INDEX_op_qemu_ld_i64:
     case INDEX_op_qemu_ld_i128:
@@ -932,6 +951,33 @@ void insn_dataflow_note_property(unsigned prop)
         return;
     }
     df->out[df->cur].properties |= (uint8_t)prop;
+}
+
+void insn_dataflow_note_rule(const char *name)
+{
+    if (df == NULL || !df->decoding || name == NULL) {
+        return;
+    }
+    /*
+     * First wins.  Decoders nest -- a compressed-encoding table inside a
+     * width dispatcher, a prefix table inside an opcode table -- and the
+     * innermost pattern's translate function returns first, so the first name
+     * to arrive is the specific rule and every later one is a table that
+     * reached it.
+     */
+    if (df->out[df->cur].rule == NULL) {
+        df->out[df->cur].rule = name;
+    }
+}
+
+void insn_dataflow_note_word(const char *word)
+{
+    if (df == NULL || !df->decoding || word == NULL) {
+        return;
+    }
+    if (df->out[df->cur].word == NULL) {
+        df->out[df->cur].word = word;
+    }
 }
 
 void insn_dataflow_refuse(void)

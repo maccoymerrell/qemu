@@ -21,10 +21,12 @@
 
 extern "C" {
 #include <qemu-plugin.h>
+#include <qemu-plugin-dataflow.h>
 }
 
 #include "champsim_tracer_mnemonics.h"
 #include "champsim_tracer_generic_ids.h"
+#include "champsim_tracer_vocabulary.h"
 
 namespace {
 
@@ -101,8 +103,9 @@ void corpora_init()
                                 "#isa\tencoding\tmnem\topcode\n");
         corpus_mech = new Corpus("CST_SRC_MECH_DUMP",
                                  "#isa\tencoding\tmech\n");
-        corpus_ident = new Corpus("CST_QEMU_IDENT_PAIRS",
-                                  "#isa\tencoding\tmnem\trule\tword\n");
+        corpus_ident = new Corpus(
+            "CST_QEMU_IDENT_PAIRS",
+            "#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n");
     }
 }
 
@@ -197,9 +200,57 @@ void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
                                             : "walked-empty");
     }
 
-    if (FILE *o = corpus_ident->get()) {
-        fprintf(o, "%s\t%s\t%s\t%s\t%s\n", isa, enc, mnem, "-", "-");
+}
+
+void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
+                            const void *bytes, size_t nbytes, const char *mnem)
+{
+    if (!tb || !bytes || !nbytes) {
+        return;
     }
+    corpora_init();
+
+    FILE *o = corpus_ident->get();
+
+    if (!o) {
+        return;
+    }
+
+    char enc[2 * 32 + 1];
+
+    hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /*
+     * Four answers, and they are not the same answer.
+     *
+     * "undecoded" means no rule matched the bytes at all.  A rule with no word
+     * matched and had nothing generic to say about itself.  A word the
+     * vocabulary does not know is a skew between this plugin and this
+     * emulator.  Each gets its own spelling here, because collapsing any two
+     * of them would let a scorer read a build problem as a decoder gap.
+     */
+    const char *rule = qemu_plugin_insn_decode_name(tb, idx);
+    const char *word = qemu_plugin_insn_decode_word(tb, idx);
+    const char *opc;
+    const char *brn;
+    uint8_t opcode = 0;
+    uint8_t branch = 0;
+
+    if (qemu_plugin_insn_undecoded(tb, idx)) {
+        rule = "#undecoded";
+        opc = brn = "#undecoded";
+    } else if (!word) {
+        opc = brn = "#noword";
+    } else if (cst_vocabulary_lookup(word, &opcode, &branch)) {
+        opc = generic_opcode_name_or_unknown(opcode);
+        brn = branch_type_name_or_unknown(branch);
+    } else {
+        opc = brn = "#unknownword";
+    }
+
+    fprintf(o, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", isa_name(), enc,
+            mnem && mnem[0] ? mnem : "-", rule ? rule : "-",
+            word ? word : "-", opc, brn);
 }
 
 #endif /* CST_CAPTURE */

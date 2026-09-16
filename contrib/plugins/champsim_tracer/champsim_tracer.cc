@@ -32,6 +32,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_capture.h"
 #include "champsim_tracer_delay.h"
 #include "champsim_tracer_marker_detect.h"
 #include "champsim_tracer_mem_access_recorder.h"
@@ -44,6 +45,7 @@
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_stats_report.h"
 #include "champsim_tracer_trace_segment_manager.h"
+#include "champsim_tracer_vocabulary.h"
 #include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer_writer.h"
 
@@ -10651,6 +10653,17 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
                                        insn_pcs[out],
                                        &insn_info[out]);
             }
+
+            /*
+             * The comparison capture's second call site, here because this is
+             * where QEMU's own statements about these bytes are readable --
+             * the decode rule and its generic word belong to the translation
+             * block, and the block is only in hand inside this callback.  It
+             * compiles to nothing in a release build.
+             */
+            cst_capture_qemu_ident(tb, i,
+                                   &insn_bytes[(size_t)out * MAX_INSN_BYTES],
+                                   insn_sizes[out], insn_info[out].mnemonic);
         }
 
         /* Per-memop callback fires unconditionally; the cb body
@@ -11913,6 +11926,22 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&data_lock);
     g_rec_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
+
+    /*
+     * The QEMU vocabulary table is bisected, so its order is checked rather
+     * than assumed.  A defect here means the table was edited out of order or
+     * carries a value outside its enum: either way the lookup would return a
+     * plausible wrong answer for some words and the right one for others,
+     * which is the shape that gets mistaken for a decoder bug.  Refuse at
+     * install, where it costs a message instead of a trace.
+     */
+    if (unsigned bad = cst_vocabulary_selfcheck()) {
+        fprintf(stderr,
+                "champsim_tracer: the QEMU vocabulary table has %u defect%s "
+                "(%u words); it is bisected and cannot be trusted unsorted\n",
+                bad, bad == 1 ? "" : "s", cst_vocabulary_size());
+        return -1;
+    }
 
     active_insn_table = isa_insn_class[trace_isa];
     active_insn_table_size = isa_insn_class_size[trace_isa];

@@ -50,11 +50,13 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+      'champsim_tracer/champsim_tracer_vocabulary.cc',
       'champsim_tracer/champsim_tracer_capture.cc',
     )
-  champsim_tracer_cpp_args = ['-std=gnu++17',
-                              '-Wno-missing-field-initializers',
-                              '-Wno-pedantic']
+  champsim_tracer_cpp_args_base = ['-std=gnu++17',
+                                   '-Wno-missing-field-initializers',
+                                   '-Wno-pedantic']
+  champsim_tracer_cpp_args = champsim_tracer_cpp_args_base
   # The comparison capture is apparatus and does not ship.  Without this the
   # capture TU compiles to nothing and the object carries neither its code nor
   # the names of the variables that would drive it -- a property nm and strings
@@ -203,6 +205,12 @@ if get_option('plugins')
   # champsim_tracer_decode.cc is compiled in here verbatim: there is no
   # second copy of the dependency model, because a gate measuring a
   # reimplementation would measure the wrong thing.
+  #
+  # Built WITHOUT -DCST_CAPTURE even when the plugin has it: the capture reads
+  # QEMU's dataflow statement ABI, which only an emulator provides, and this
+  # library links against neither.  The gate's subject is the dependency model,
+  # not the apparatus that scores it, so the capture compiling to nothing here
+  # removes a link dependency without removing anything the gate measures.
   isaxcheck_fields = static_library(
     'isaxcheck_fields',
     files('champsim_tracer/tools/isaxcheck_fields.cc',
@@ -212,7 +220,7 @@ if get_option('plugins')
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
     include_directories: ['../../include/qemu', '../../include',
                           'champsim_tracer'],
-    cpp_args: champsim_tracer_cpp_args,
+    cpp_args: champsim_tracer_cpp_args_base,
     dependencies: [glib, cst_capstone_dep],
     install: false)
   if llvm_config.found()

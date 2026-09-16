@@ -32,6 +32,9 @@
 #ifndef EXEC_INSN_DATAFLOW_H
 #define EXEC_INSN_DATAFLOW_H
 
+/* The words insn_dataflow_note_word() takes, and the whole list of them. */
+#include "exec/insn-dataflow-words.h"
+
 /*
  * Enough bits for every TCG global any in-tree target registers -- the largest
  * is MIPS at 128 -- plus the env ranges interned per translation block and the

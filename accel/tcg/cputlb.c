@@ -527,10 +527,18 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     int k;
 
     assert_cpu_is_self(cpu);
+    /*
+     * desc->n_used_entries counts occupied slots of the MAIN table only, so
+     * clearing a victim-tlb entry does not change it.  An entry only reaches
+     * the victim table by eviction from the main table, and tlb_set_page_full
+     * decrements as it evicts, so the entry is already uncounted by the time
+     * it can be found here -- decrementing again would count it out twice.
+     * The main-table-only reading is the one the counter's sole consumer uses:
+     * tlb_mmu_resize_locked takes it as a numerator over tlb_n_entries(fast),
+     * the size of the main table.
+     */
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(cpu, mmu_idx);
-        }
+        tlb_flush_entry_mask_locked(&d->vtable[k], page, mask);
     }
 }
 
@@ -1616,6 +1624,20 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntry tmptlb, *tlb = &cpu->neg.tlb.f[mmu_idx].table[index];
 
             qemu_spin_lock(&cpu->neg.tlb.c.lock);
+            /*
+             * Promoting into an EMPTY main slot raises the main table's
+             * occupancy by one, so n_used_entries has to be told; when the
+             * slot is occupied the swap trades one tenant for another and the
+             * occupancy is unchanged.  The slot is empty whenever a page's own
+             * main entry was flushed while its victim copy survived:
+             * tlb_flush_page_locked clears main and victim copies of the page
+             * it targets, but a victim copy of a DIFFERENT page that indexes
+             * to the same main slot outlives that flush and is promoted back
+             * into the hole it left.
+             */
+            if (tlb_entry_is_empty(tlb)) {
+                tlb_n_used_entries_inc(cpu, mmu_idx);
+            }
             copy_tlb_helper_locked(&tmptlb, tlb);
             copy_tlb_helper_locked(tlb, vtlb);
             copy_tlb_helper_locked(vtlb, &tmptlb);

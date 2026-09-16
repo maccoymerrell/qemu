@@ -266,6 +266,71 @@ if get_option('plugins')
     cpp_args: champsim_tracer_cpp_args_base,
     dependencies: [glib, cst_capstone_dep],
     install: false)
+  # cst_referee: the EXTERNAL referee -- the Capstone side of the tracer's
+  # two-decoder comparison, produced offline from the encodings a QEMU-side
+  # corpus already records.
+  #
+  # Checking Capstone belongs outside QEMU.  While both columns were written
+  # from inside one running emulator, the comparison was a dependent of its
+  # own subject: the moment the wire stopped consulting the Capstone operand
+  # walk, the walk stopped being called and every Capstone row stopped being
+  # written, leaving the whole-population loss bar with no subject rather than
+  # a number.  This binary links no plugin .so and no emulator, so nothing
+  # done to the tracer's Capstone dependency can make it stop answering.
+  #
+  # It shares isaxcheck's two-include-world arrangement for the same reason:
+  # the plugin's headers need ../../include/qemu, which is exactly the
+  # directory a TU reaching for <cctype> must not have.  The library half sees
+  # the plugin world; the driver sees disas/capstone.c's.
+  #
+  # Built WITH -DCST_CAPTURE, unlike isaxcheck_fields: the corpora this writes
+  # must be the ones champsim_tracer_capture.cc writes, from the same code, or
+  # the referee would be scoring against a second implementation of the
+  # format.  The QEMU-side statement entry points that capture also declares
+  # are stubbed in cst_referee_fields.cc and every stub ABORTS -- see the note
+  # there for why a stub that answered would be the silent-false-success shape.
+  #
+  # Pinned to subprojects/capstone, and the wrap's own revision string is
+  # compiled in so a wrap bump re-stamps every corpus the tool writes.  A
+  # comparison run against a different Capstone would turn version differences
+  # into decoder disagreements, so version parity is part of the bar and the
+  # tool refuses at startup if the library it loaded is not the one its
+  # headers describe.
+  cst_capstone_pin = 'unstamped'
+  foreach l : fs.read(meson.project_source_root() /
+                      'subprojects/capstone.wrap').strip().split('\n')
+    if l.strip().startswith('revision')
+      cst_capstone_pin = l.split('=')[1].strip()
+    endif
+  endforeach
+  cst_referee_fields = static_library(
+    'cst_referee_fields',
+    files('champsim_tracer/tools/cst_referee_fields.cc',
+          'champsim_tracer/champsim_tracer_decode.cc',
+          'champsim_tracer/champsim_tracer_capture.cc',
+          'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+          'champsim_tracer/champsim_tracer_reg_handle_cache.cc',
+          'champsim_tracer/champsim_tracer_vocabulary.cc',
+          'champsim_tracer/champsim_tracer_regmap.cc') +
+    champsim_tracer_regmap_gen,
+    include_directories: ['../../include/qemu', '../../include',
+                          'champsim_tracer'],
+    cpp_args: champsim_tracer_cpp_args_base + ['-DCST_CAPTURE'],
+    dependencies: [glib, cst_capstone_dep],
+    install: false)
+  t += executable(
+    'cst_referee',
+    files('champsim_tracer/tools/cst_referee.cc') +
+    files('../../disas/capstone.c'),
+    cpp_args: cst_tools_cpp_args +
+              ['-DCST_REFEREE_CAPSTONE_PIN="' + cst_capstone_pin + '"'],
+    c_args: ['-std=gnu11'],
+    # NOTE: deliberately NOT ../../include/qemu; see isaxcheck below.
+    include_directories: ['../../include', '../..',
+                          'champsim_tracer/tools'],
+    link_with: cst_referee_fields,
+    dependencies: [glib, cst_capstone_dep],
+    install: false)
   if llvm_config.found()
     llvm_cxxflags = []
     foreach f : run_command(llvm_config, '--cxxflags',

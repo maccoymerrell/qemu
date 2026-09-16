@@ -170,8 +170,35 @@ public:
                  * release build pays.
                  */
                 setvbuf(f_, nullptr, _IOLBF, 1 << 16);
-                fprintf(f_, "#so plugin=%s emulator=%s\n",
-                        build_id_of("champsim_tracer"), build_id_of(nullptr));
+                /*
+                 * WHOSE BUILD THE CORPUS ANSWERS FOR, and it is not always
+                 * this process's.
+                 *
+                 * A corpus answers for the build whose ENCODINGS it scores.
+                 * When this code runs inside the emulator those are the same
+                 * two binaries, and reading them out of the loaded objects is
+                 * exactly right.  The external referee runs the same capture
+                 * offline over encodings a DIFFERENT pair of binaries
+                 * produced; stamping its own build ids there would make the
+                 * two sides of a matched join look like two builds and the
+                 * scorers -- which refuse a stamp mismatch, correctly --
+                 * would refuse a pair that is in fact matched.  So the
+                 * carrier may hand the stamp over, and says separately, in a
+                 * line of its own, which binary produced the column.
+                 */
+                const char *stamp = getenv("CST_CORPUS_STAMP");
+                const char *note = getenv("CST_CORPUS_NOTE");
+
+                if (stamp && *stamp) {
+                    fprintf(f_, "#so %s\n", stamp);
+                } else {
+                    fprintf(f_, "#so plugin=%s emulator=%s\n",
+                            build_id_of("champsim_tracer"),
+                            build_id_of(nullptr));
+                }
+                if (note && *note) {
+                    fprintf(f_, "%s\n", note);
+                }
                 fputs(header_, f_);
             }
         }

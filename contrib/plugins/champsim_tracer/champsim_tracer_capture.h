@@ -24,6 +24,31 @@
  * either to the other's site would mean threading apparatus data through
  * shipping structures, which is what segregating this file was for.
  *
+ * THE CAPSTONE COLUMN IS NO LONGER PRODUCED IN-PROCESS.  RETIRED DELIBERATELY.
+ * ---------------------------------------------------------------------------
+ * Checking Capstone belongs outside QEMU, and for as long as both columns were
+ * written from inside one running emulator the comparison was a dependent of
+ * its own subject.  That is not a worry, it is a measured outcome: when the
+ * wire's facts became QEMU's, the Capstone operand walk lost its last plugin
+ * caller, the two hooks below stopped being reached, and four corpora --
+ * srcenc, opcenc, src-mech and alias -- stopped being written.  The
+ * whole-population loss bar did not go red; it went to NO SUBJECT, which is
+ * worse, because a missing subject looks like nothing at all.
+ *
+ * So the in-process Capstone arm is retired rather than repaired.  The two
+ * hooks that write the Capstone side -- cst_capture_insn() and
+ * cst_capture_alias() -- are alive and unchanged, and their producer is now
+ * `cst_referee`: an offline binary that reads the (isa, encoding) keys out of
+ * a QEMU-side corpus, disassembles those bytes with its OWN copy of the pinned
+ * Capstone the tree names, and runs this same walk over the result.  It links
+ * no plugin .so and no emulator, so nothing done to the tracer's Capstone
+ * dependency can make it stop answering.  See tools/cst_referee.cc.
+ *
+ * What survives here in-process is the QEMU side: the identity, statement,
+ * register-map, generic-set and vector-env corpora, which only a running
+ * emulator can write.  Those are the corpora a run still produces, and the
+ * referee is what gives them a second column to be scored against.
+ *
  * Copyright (c) 2026 Maccoy Merrell
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -80,6 +105,14 @@ struct InsnAliasSnap {
  * silence: a short corpus reads downstream as an encoding the classifier had
  * nothing to say about, which is the silent false success this tree keeps
  * having to relearn.
+ *
+ * ITS CALLER IS OFFLINE.  decode_detail_to_generic() has no plugin caller at
+ * this tip, so in a running emulator this is dead and the corpora it writes
+ * are empty.  cst_referee drives it instead, over the encodings a QEMU-side
+ * corpus recorded.  Written from the same source either way, so the rows are
+ * the rows the in-process arm produced and not a second implementation of
+ * them -- measured: 0 differing rows against the last corpora that arm ever
+ * wrote, on all four ISAs.
  */
 void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
                       const struct qemu_plugin_insn_info *info,
@@ -133,6 +166,9 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
  * and a row where they differ names exactly what would be lost if that surface
  * went away -- which is the fact a flip to QEMU's decode rule has to be
  * decided on, and the one no corpus carried.
+ *
+ * Offline like its sibling above, and for the same reason: this is a reading
+ * of the Capstone refiner chain, and the tracer no longer walks it.
  */
 void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
                        const struct InsnAliasSnap *walk,

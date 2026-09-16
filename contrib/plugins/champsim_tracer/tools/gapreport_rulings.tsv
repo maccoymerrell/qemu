@@ -132,6 +132,19 @@ mipsel	OPC_TEQ	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	a conditional trap compare
 mipsel	OPC_TGEU	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TEQI	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
 mipsel	OPC_TLT	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
+mipsel	OPC_TGE	GEN_OP_SYSCALL	GEN_OP_CMP	QEMU	SETTLED	same as OPC_TEQ
+# THE TRAP FAMILY IS TWELVE OPCODES AND ONLY THE FIVE ABOVE HAVE A CLASS.
+# target/mips/tcg/insn-df-words.tsv states `syscall` for all twelve --
+# OPC_TEQ, OPC_TEQI, OPC_TGE, OPC_TGEI, OPC_TGEIU, OPC_TGEU, OPC_TLT,
+# OPC_TLTI, OPC_TLTIU, OPC_TLTU, OPC_TNE, OPC_TNEI -- and the incumbent
+# names the comparison for every one, so each is the same disagreement on
+# the same merits.  The remaining seven are NOT ruled here: a ruling whose
+# class is empty is a dead rule and --require-ruled fails on it, which is
+# the refusal that keeps this corpus from growing rows nobody has read.
+# They are named so the next corpus that reaches one arrives at a written
+# precedent instead of a fresh question.  OPC_TGE was exactly that: it sat
+# latent behind four ruled siblings until a corpus reached its three
+# encodings.
 mipsel	OPC_SRL	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: the encoding is 0x00000002, rd == $zero, so the shift has no architectural effect and MIPS's own no-op is a shift into $zero
 mipsel	OPC_SRA	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000003, rd == $zero, same reading as OPC_SRL
 mipsel	OPC_SRLV	GEN_OP_NOP	GEN_OP_SHR	QEMU	SETTLED	measured: 0x00000006, rd == $zero, same reading as OPC_SRL

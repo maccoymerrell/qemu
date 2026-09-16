@@ -1,5 +1,6 @@
 /*
- * Per-instruction dataflow, read off the ops the target's translator emitted.
+ * Per-instruction dataflow, read off the ops the target's translator emitted,
+ * plus the facts the decode site states because no op carries them.
  *
  * A guest instruction's register reads and writes are not something to look
  * up.  They are already written down, exactly, in the ops QEMU produced for
@@ -15,6 +16,14 @@
  * invents, and reports a write whose value equals what was already there,
  * which no comparison of state before and after can see.
  *
+ * Not every fact survives into ops, though, and the ones that do not are
+ * stated rather than guessed.  A register an addressing fold consumed is still
+ * in the emitter's hand at the fold; an architectural zero register lowers to
+ * no op at all; state that lives in CPUArchState with no TCG global naming it
+ * is reached at an offset only the target can name.  The five verbs at the
+ * bottom of this file are how a decode site says those things, and they are
+ * deliberately few: each says WHAT is true and never how to record it.
+ *
  * Copyright (c) 2026 Maccoy Merrell
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -24,12 +33,33 @@
 #define EXEC_INSN_DATAFLOW_H
 
 /*
- * Enough bits for every TCG global any in-tree target registers; the largest
- * is MIPS at 128.  A target that outgrows this would lose the globals above
- * the limit, so the reader says so rather than truncating in silence.
+ * Enough bits for every TCG global any in-tree target registers -- the largest
+ * is MIPS at 128 -- plus the env ranges interned per translation block and the
+ * three atoms at the top that do not stand for storage at all.
  */
 #define INSN_DF_REG_WORDS   4
 #define INSN_DF_MAX_REGS    (INSN_DF_REG_WORDS * 64)
+
+/*
+ * The three provenance bits that are not registers.
+ *
+ * They live at the top of the namespace, out of the way of the globals at the
+ * bottom and the interned env ranges growing up from nb_globals; interning
+ * stops below them.  A value that came from one of these came from somewhere
+ * real, so the bit is set rather than left empty -- which keeps an empty
+ * provenance meaning the one thing it should, that the dependency chain is
+ * broken.
+ */
+#define INSN_DF_BIT_ZERO    (INSN_DF_MAX_REGS - 1)  /* architectural zero reg */
+#define INSN_DF_BIT_IMM     (INSN_DF_MAX_REGS - 2)  /* an encoded immediate */
+#define INSN_DF_BIT_CONST   (INSN_DF_MAX_REGS - 3)  /* any other constant */
+#define INSN_DF_BIT_LOWEST_ATOM  INSN_DF_BIT_CONST
+
+/* How many distinct env byte ranges one translation block may intern. */
+#define INSN_DF_MAX_FIELD_SLOTS  64
+
+/* How many distinct env byte ranges one instruction may touch. */
+#define INSN_DF_MAX_FIELDS  16
 
 /*
  * An instruction writing more registers than this is vanishingly rare, and
@@ -56,6 +86,37 @@
  * nothing at all.
  */
 #define INSN_DF_INCOMPLETE_WRITES   (1u << 0)   /* more writes than slots */
+#define INSN_DF_INCOMPLETE_FIELDS   (1u << 1)   /* more env ranges than slots */
+
+/* Direction of an access. */
+#define INSN_DF_RD          1
+#define INSN_DF_WR          2
+
+/*
+ * An env byte range no TCG global names: x86's vector file and x87 stack,
+ * ARM's Z registers, every FP status word.  Carried as an offset and an extent
+ * and resolved by the consumer, which is the only side that knows what a byte
+ * range means -- except where the target declared the layout, in which case
+ * insn_dataflow_field_reg() names it here.
+ *
+ * A size of DF_FIELD_UNBOUNDED means the range was reached through a pointer
+ * built from tcg_env, so the access does not state its extent.  That is the
+ * honest answer and not a zero, which a consumer would read as "no bytes".
+ */
+#define DF_FIELD_UNBOUNDED  0xffffffffu
+
+typedef struct InsnDataflowField {
+    uint32_t off;
+    uint32_t size;              /* or DF_FIELD_UNBOUNDED */
+    uint8_t  dir;               /* INSN_DF_RD / _WR / both */
+    /*
+     * Where a written range's value came from, in the same namespace as a
+     * register write's provenance.  A field is a register no TCG global
+     * happens to name, and nothing about it is different enough to justify a
+     * second way of saying where its value came from.
+     */
+    uint64_t prov[INSN_DF_REG_WORDS];
+} InsnDataflowField;
 
 typedef struct InsnDataflowWrite {
     uint8_t  reg;                           /* index into the globals table */
@@ -71,9 +132,9 @@ typedef struct InsnDataflowWrite {
      * store into rbx whose value came from rbx is bswap, an ordinary
      * definition.  QEMU cannot tell those apart and does not try.
      *
-     * An empty provenance means the value came from nothing the instruction
-     * read.  For the program counter that is the direct-versus-indirect
-     * branch discriminator; for any register it means the dependency chain is
+     * An empty provenance means the value came from nothing at all.  For the
+     * program counter that is the direct-versus-indirect branch
+     * discriminator; for any register it means the dependency chain is
      * broken, which is what a zeroing idiom does and what hardware
      * special-cases.
      */
@@ -96,6 +157,9 @@ typedef struct InsnDataflow {
     uint8_t  n_writes;
     uint8_t  incomplete;        /* INSN_DF_INCOMPLETE_* */
 
+    InsnDataflowField fields[INSN_DF_MAX_FIELDS];
+    uint8_t  n_fields;
+
     /*
      * Helper calls, and guest memory accesses, counted.  What the helper did
      * is opaque at this level -- it is a host function, not ops -- and the
@@ -107,7 +171,79 @@ typedef struct InsnDataflow {
     uint16_t n_mem_wr;
 } InsnDataflow;
 
+/*
+ * What a value is, when a decode site has to say so because no op does.
+ *
+ * A_REG names a register the target registered with TCG or declared with
+ * insn_dataflow_declare_regfile(); the two namespaces are searched in that
+ * order, and a name in neither is refused rather than invented.
+ */
+#define INSN_DF_A_REG    0
+#define INSN_DF_A_ENV    1      /* a CPUArchState byte range */
+#define INSN_DF_A_ZERO   2      /* the architectural zero register */
+#define INSN_DF_A_IMM    3      /* an immediate field of the encoding */
+#define INSN_DF_A_CONST  4      /* a constant that is not an encoded field */
+
+typedef struct InsnDataflowAtom {
+    uint8_t kind;
+    const char *name;           /* A_REG */
+    uint32_t off;               /* A_ENV */
+    uint32_t size;              /* A_ENV; DF_FIELD_UNBOUNDED if not stated */
+} InsnDataflowAtom;
+
+static inline InsnDataflowAtom insn_df_reg(const char *name)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_REG, .name = name };
+    return a;
+}
+
+static inline InsnDataflowAtom insn_df_env(uint32_t off, uint32_t size)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_ENV, .off = off, .size = size };
+    return a;
+}
+
+static inline InsnDataflowAtom insn_df_zero(void)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_ZERO };
+    return a;
+}
+
+static inline InsnDataflowAtom insn_df_imm(void)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_IMM };
+    return a;
+}
+
+static inline InsnDataflowAtom insn_df_const(void)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_CONST };
+    return a;
+}
+
+/*
+ * Ops that are QEMU's bookkeeping rather than the instruction's behaviour.
+ *
+ * A translator emits more than the guest instruction: a block's exit writes
+ * the program counter, and a mid-block pc materialisation exists so a fault
+ * can restart.  Neither is an architectural effect of the instruction whose op
+ * range happens to contain it.  A window brackets those ops and the reader
+ * leaves them out.
+ *
+ * The two kinds are not interchangeable even though both are ignored: a
+ * consumer asking why an op was left out gets a different answer for each.
+ */
+#define INSN_DF_W_EPILOGUE  0   /* the block's exit sequence */
+#define INSN_DF_W_BLOCK_PC  1   /* a pc write that exists so a fault restarts */
+
 #ifdef CONFIG_PLUGIN
+
+/*
+ * Open instruction @idx.  Called from translator_loop() before the target
+ * decodes, so every statement below lands on the instruction being decoded
+ * and nothing has to work out afterwards which one that was.
+ */
+void insn_dataflow_insn_begin(unsigned idx);
 
 /*
  * Read the TB currently being translated and leave each instruction's result
@@ -121,27 +257,94 @@ typedef struct InsnDataflow {
  */
 void insn_dataflow_extract(unsigned num_insns);
 
+/*
+ * The instruction being decoded reads, or writes, @a -- though no op says so.
+ *
+ * This is for facts the emitter holds and the op stream does not: a register
+ * an addressing fold consumed before any op saw it, an architectural zero
+ * register that lowers to no op at all, a CPUArchState range a helper reaches
+ * that the call's arguments do not name.
+ */
+void insn_dataflow_state_read(InsnDataflowAtom a);
+void insn_dataflow_state_write(InsnDataflowAtom a);
+
+/*
+ * @ts carries the value of @a.
+ *
+ * Applied where it was made, not where the reader happens to arrive: the
+ * binding is anchored to the op most recently emitted, and the reader applies
+ * it at that point in the op stream.  Binding for the whole translation would
+ * be wrong in the one direction that matters -- a temp reused later in the
+ * block would carry the atom into accesses that never had it, which is a
+ * dependency invented out of nothing.
+ */
+void insn_dataflow_bind(const void *ts, InsnDataflowAtom a);
+
+/* Ops emitted between these two are QEMU's, not the instruction's. */
+void insn_dataflow_window_begin(unsigned kind);
+void insn_dataflow_window_end(void);
+
+/*
+ * Declare a register file that lives in CPUArchState with no TCG global naming
+ * it: @count registers named @names, @size bytes each, @stride apart, starting
+ * at @base_off.
+ *
+ * The offsets come from the compiler at the call site -- offsetof and sizeof
+ * over the target's own structure -- so they cannot drift from the layout they
+ * describe the way a hand-written table would.  A target may call this once
+ * per file it has.
+ */
+void insn_dataflow_declare_regfile(const char *const *names, unsigned count,
+                                   uint32_t base_off, uint32_t stride,
+                                   uint32_t size);
+
 /* Instruction @i of the TB just translated, or NULL if there is no answer. */
 const InsnDataflow *insn_dataflow_get(unsigned i);
 
-/* How many bits of the sets above are meaningful. */
+/* How many bits of the sets above stand for TCG globals. */
 unsigned insn_dataflow_nregs(void);
 
 /* Name and env location of global @i, for a consumer building its own map. */
 const char *insn_dataflow_reg_name(unsigned i, uint32_t *off, uint32_t *size);
 
+/* The env range a provenance bit at or above nregs stands for. */
+bool insn_dataflow_prov_field(unsigned bit, uint32_t *off, uint32_t *size);
+
+/* The declared name of an env range, or NULL if no target declared it. */
+const char *insn_dataflow_field_reg(uint32_t off, uint32_t size);
+
+/* Did interning run out of slots during this translation? */
+bool insn_dataflow_fields_truncated(void);
+
 #else /* !CONFIG_PLUGIN */
 
 /*
- * accel/tcg/insn-dataflow.c is only compiled when plugins are enabled, but
- * translator_loop() is generic code and reaches the reader behind
+ * accel/tcg/insn-dataflow.c is only compiled when plugins are enabled, but the
+ * translator and the targets reach it from plain code, some of it behind
  * @plugin_enabled -- a runtime flag, not a compile-time one.  With plugins off
- * that flag is a constant false and the call is dead, but it still has to
- * compile, so the entry point gets the same no-op stub plugin-gen.h gives
- * plugin_gen_tb_end() next to it.  Only this one needs a stub: everything else
- * above is reached from plugins/, which is not built either.
+ * those calls are dead, but they still have to compile, so every entry point a
+ * target or the translator can reach gets a no-op stub.  The read side does
+ * not need one: it is reached from plugins/, which is not built either.
  */
+static inline void insn_dataflow_insn_begin(unsigned idx)
+{ }
 static inline void insn_dataflow_extract(unsigned num_insns)
+{ }
+static inline void insn_dataflow_state_read(InsnDataflowAtom a)
+{ }
+static inline void insn_dataflow_state_write(InsnDataflowAtom a)
+{ }
+static inline void insn_dataflow_bind(const void *ts, InsnDataflowAtom a)
+{ }
+static inline void insn_dataflow_window_begin(unsigned kind)
+{ }
+static inline void insn_dataflow_window_end(void)
+{ }
+static inline void insn_dataflow_declare_regfile(const char *const *names,
+                                                 unsigned count,
+                                                 uint32_t base_off,
+                                                 uint32_t stride,
+                                                 uint32_t size)
 { }
 
 #endif /* CONFIG_PLUGIN */

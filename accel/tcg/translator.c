@@ -397,6 +397,13 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         if (plugin_enabled) {
             plugin_gen_insn_start(cpu, db);
+            /*
+             * Open this instruction for the dataflow reader before the target
+             * decodes it, so a statement made at a decode site lands on the
+             * instruction being decoded and nothing has to work out afterwards
+             * which one that was.
+             */
+            insn_dataflow_insn_begin(db->num_insns - 1);
         }
 
 #ifdef CONFIG_ORACLE

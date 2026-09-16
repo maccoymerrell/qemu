@@ -549,6 +549,35 @@ static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
  * one, rather than a guess that looks like a fact.  tcg_env itself does not
  * count -- it is the first argument of nearly every helper there is.
  */
+/*
+ * The vector-operand statement covering an env offset, if one was made.
+ *
+ * An in-place vector operation states the same offset twice, once written and
+ * once read, so every matching statement contributes: the directions are
+ * unioned and the widest extent wins.  Returns false when no statement covers
+ * the offset, which is the caller's signal to fall back and count.
+ */
+static bool df_vec_operand(const InsnDataflow *d, uint32_t off,
+                           uint32_t *size, unsigned *dir)
+{
+    bool found = false;
+
+    for (unsigned i = 0; i < d->n_vecops; i++) {
+        if (d->vecops[i].off != off) {
+            continue;
+        }
+        if (!found) {
+            *size = d->vecops[i].size;
+            *dir = d->vecops[i].dir;
+            found = true;
+        } else {
+            *size = MAX(*size, d->vecops[i].size);
+            *dir |= d->vecops[i].dir;
+        }
+    }
+    return found;
+}
+
 static void df_call(InsnDataflow *d, TCGOp *op)
 {
     TCGContext *s = tcg_ctx;
@@ -577,13 +606,27 @@ static void df_call(InsnDataflow *d, TCGOp *op)
         }
         eo = df_envoff(ts - s->temps);
         if (eo != INSN_DF_NOT_ENV && eo >= 0) {
-            int bit = df_intern((uint32_t)eo, DF_FIELD_UNBOUNDED);
+            uint32_t size = DF_FIELD_UNBOUNDED;
+            unsigned dir = INSN_DF_RD | INSN_DF_WR;
+            int bit;
 
+            /*
+             * A vector expander states each operand's extent and direction,
+             * because it is the only place that holds the offset and oprsz
+             * together.  Where it did, that is the answer; where it did not,
+             * the unbounded both-directions record stands and is counted, so
+             * a blob is never mistaken for a measurement.
+             */
+            if (df_vec_operand(d, (uint32_t)eo, &size, &dir)) {
+                d->n_env_ptr_bounded++;
+            } else {
+                d->n_env_ptr_unbounded++;
+            }
+            bit = df_intern((uint32_t)eo, size);
             if (bit >= 0) {
                 df_set_bit(prov, (unsigned)bit);
             }
-            df_add_field(d, (uint32_t)eo, DF_FIELD_UNBOUNDED,
-                         INSN_DF_RD | INSN_DF_WR, prov);
+            df_add_field(d, (uint32_t)eo, size, dir, prov);
         }
     }
     for (unsigned i = 0; i < nb_oargs; i++) {
@@ -1027,6 +1070,43 @@ void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
         d->vec_vece = (uint8_t)vece;
         d->vec_oprsz = oprsz;
     }
+}
+
+void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
+                                    unsigned dir)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding || bytes == 0) {
+        return;
+    }
+    dir &= INSN_DF_RD | INSN_DF_WR;
+    if (dir == 0) {
+        return;
+    }
+    d = &df->out[df->cur];
+
+    /*
+     * The same operand stated twice -- an in-place vector operation names one
+     * offset as both destination and source -- is one operand with both
+     * directions, not two.  Merging here keeps the reader's lookup simple and
+     * keeps the row count meaning what it says.
+     */
+    for (unsigned i = 0; i < d->n_vecops; i++) {
+        if (d->vecops[i].off == envofs) {
+            d->vecops[i].size = MAX(d->vecops[i].size, bytes);
+            d->vecops[i].dir |= (uint8_t)dir;
+            return;
+        }
+    }
+    if (d->n_vecops >= INSN_DF_MAX_VECOPS) {
+        d->n_vecops_dropped++;
+        return;
+    }
+    d->vecops[d->n_vecops].off = envofs;
+    d->vecops[d->n_vecops].size = bytes;
+    d->vecops[d->n_vecops].dir = (uint8_t)dir;
+    d->n_vecops++;
 }
 
 void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,

@@ -71,6 +71,16 @@ void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
                             const void *bytes, size_t nbytes,
                             const char *mnem);
 
+/*
+ * How the env pointers instruction @idx handed its helpers were recorded:
+ * the vector-operand statements the expanders made, and the split between
+ * pointers a statement bounded and pointers recorded as the whole of
+ * CPUArchState in both directions.  An instruction that hands no env pointer
+ * writes no row, so the corpus cannot report coverage it never measured.
+ */
+void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
+                         const void *bytes, size_t nbytes);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -80,6 +90,9 @@ static inline void cst_capture_insn(uint64_t, const void *, size_t,
 
 static inline void cst_capture_qemu_ident(const struct qemu_plugin_tb *, size_t,
                                           const void *, size_t, const char *)
+{ }
+static inline void cst_capture_vec_env(const struct qemu_plugin_tb *, size_t,
+                                       const void *, size_t)
 { }
 
 #endif /* CST_CAPTURE */

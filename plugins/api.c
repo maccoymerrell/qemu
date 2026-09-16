@@ -590,6 +590,10 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.xfer = d->xfer;
     st.vec_vece = d->vec_vece;
     st.vec_oprsz = d->vec_oprsz;
+    st.n_vec_operands = d->n_vecops;
+    st.n_vec_dropped = d->n_vecops_dropped;
+    st.n_env_ptr_bounded = d->n_env_ptr_bounded;
+    st.n_env_ptr_unbounded = d->n_env_ptr_unbounded;
     /*
      * Interning is per translation block, so a range that could not be
      * interned anywhere in the block makes a value in THIS instruction look

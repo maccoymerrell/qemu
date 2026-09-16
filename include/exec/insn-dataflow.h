@@ -65,6 +65,17 @@
 #define INSN_DF_MAX_FIELDS  16
 
 /*
+ * How many vector-operand statements one instruction may make.
+ *
+ * Five is the widest gvec expander QEMU has (tcg_gen_gvec_5_*), and an
+ * instruction that expands several of them -- a structured load, an SVE
+ * sequence -- can exceed this.  The overflow is counted rather than dropped
+ * silently, and the operands past it fall back to the unbounded record a
+ * bare pointer argument gets.
+ */
+#define INSN_DF_MAX_VECOPS  12
+
+/*
  * An instruction writing more registers than this is vanishingly rare, and
  * the one that does gets its whole answer refused rather than a prefix of it.
  */
@@ -184,6 +195,24 @@ typedef struct InsnDataflowField {
     uint64_t prov[INSN_DF_REG_WORDS];
 } InsnDataflowField;
 
+/*
+ * One operand of a vector expansion: the env range it occupies and the
+ * direction the helper uses it in.
+ *
+ * A gvec helper reaches its operands as pointers built from tcg_env, and a
+ * pointer argument says neither how many bytes it spans nor whether the
+ * helper reads or writes through it.  The expander knows both -- it computed
+ * the offset and it holds oprsz -- so it states them, and the reader uses the
+ * statement in place of the unbounded both-directions record the bare pointer
+ * would otherwise get.  An operand that is both (an in-place vector op) is
+ * stated twice and the directions accumulate.
+ */
+typedef struct InsnDataflowVecOp {
+    uint32_t off;               /* CPUArchState byte offset */
+    uint32_t size;              /* bytes of that operand */
+    uint8_t  dir;               /* INSN_DF_RD / _WR / both */
+} InsnDataflowVecOp;
+
 typedef struct InsnDataflowWrite {
     uint8_t  reg;                           /* index into the globals table */
     /*
@@ -278,6 +307,18 @@ typedef struct InsnDataflow {
 
     uint8_t  vec_vece;          /* log2 element size, or INSN_DF_VECE_NONE */
     uint32_t vec_oprsz;         /* bytes of one vector operand, 0 if unstated */
+
+    InsnDataflowVecOp vecops[INSN_DF_MAX_VECOPS];
+    uint8_t  n_vecops;
+    /*
+     * Env pointers a vector-operand statement did not cover, and vector
+     * operands that did not fit.  Both are the unbounded fallback, and both
+     * are counted so a consumer can tell a bounded answer from a blob and
+     * this file's own coverage can be measured rather than assumed.
+     */
+    uint16_t n_env_ptr_bounded;
+    uint16_t n_env_ptr_unbounded;
+    uint16_t n_vecops_dropped;
 
     uint64_t imm[INSN_DF_MAX_IMM];
     uint8_t  imm_role[INSN_DF_MAX_IMM];
@@ -447,6 +488,17 @@ void insn_dataflow_note_immediate(uint64_t value, unsigned role);
 void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz);
 
 /*
+ * One operand of a vector expansion: where it lives in CPUArchState, how many
+ * bytes of it the helper may touch, and whether it is read, written or both.
+ *
+ * Stated by the expander, which is the only place that holds the offset and
+ * oprsz together, and consumed where a helper argument that is a pointer into
+ * env would otherwise be recorded as the whole of env, in both directions.
+ */
+void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
+                                    unsigned dir);
+
+/*
  * An effective address the emulation computes no address for.
  *
  * Prefetches and cache-maintenance operations -- x86 prefetch*, aarch64 PRFM
@@ -543,6 +595,10 @@ static inline void insn_dataflow_refuse(void)
 static inline void insn_dataflow_note_immediate(uint64_t value, unsigned role)
 { }
 static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
+{ }
+static inline void insn_dataflow_note_vec_operand(uint32_t envofs,
+                                                  uint32_t bytes,
+                                                  unsigned dir)
 { }
 static inline void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
                                                    const InsnDataflowAtom *p,

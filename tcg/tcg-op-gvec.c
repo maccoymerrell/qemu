@@ -23,9 +23,30 @@
 #include "tcg/tcg-op-common.h"
 #include "tcg/tcg-op-gvec-common.h"
 #include "tcg/tcg-gvec-desc.h"
+#include "exec/insn-dataflow.h"
 #include "tcg-has.h"
 
 #define MAX_UNROLL  4
+
+/*
+ * A gvec helper reaches its operands as pointers built from tcg_env, and a
+ * pointer argument states neither how many bytes it spans nor which way the
+ * helper uses it.  Here both are known: the offsets were just computed and
+ * oprsz is in hand.  Saying so is what lets a reader of the op stream record
+ * the actual vector registers instead of "somewhere in env, both ways".
+ *
+ * The destination's extent is oprsz, not maxsz: the bytes between the two are
+ * cleared by expand_clr() with ordinary stores, which carry their own offsets
+ * and need no statement.
+ */
+static void gvec_note_operands(uint32_t dofs, uint32_t oprsz,
+                               const uint32_t *srcofs, unsigned n_src)
+{
+    insn_dataflow_note_vec_operand(dofs, oprsz, INSN_DF_WR);
+    for (unsigned i = 0; i < n_src; i++) {
+        insn_dataflow_note_vec_operand(srcofs[i], oprsz, INSN_DF_RD);
+    }
+}
 
 #ifdef CONFIG_DEBUG_TCG
 static const TCGOpcode vecop_list_empty[1] = { 0 };
@@ -134,6 +155,11 @@ void tcg_gen_gvec_2_ool(uint32_t dofs, uint32_t aofs,
     a0 = tcg_temp_ebb_new_ptr();
     a1 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
 
@@ -155,6 +181,11 @@ void tcg_gen_gvec_2i_ool(uint32_t dofs, uint32_t aofs, TCGv_i64 c,
     a0 = tcg_temp_ebb_new_ptr();
     a1 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
 
@@ -176,6 +207,11 @@ void tcg_gen_gvec_3_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a1 = tcg_temp_ebb_new_ptr();
     a2 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
@@ -200,6 +236,11 @@ void tcg_gen_gvec_4_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a2 = tcg_temp_ebb_new_ptr();
     a3 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs, cofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
@@ -227,6 +268,11 @@ void tcg_gen_gvec_5_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a3 = tcg_temp_ebb_new_ptr();
     a4 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs, cofs, xofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
@@ -254,6 +300,11 @@ void tcg_gen_gvec_2_ptr(uint32_t dofs, uint32_t aofs,
     a0 = tcg_temp_ebb_new_ptr();
     a1 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
 
@@ -276,6 +327,11 @@ void tcg_gen_gvec_3_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a1 = tcg_temp_ebb_new_ptr();
     a2 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
@@ -302,6 +358,11 @@ void tcg_gen_gvec_4_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a2 = tcg_temp_ebb_new_ptr();
     a3 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs, cofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
@@ -331,6 +392,11 @@ void tcg_gen_gvec_5_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     a3 = tcg_temp_ebb_new_ptr();
     a4 = tcg_temp_ebb_new_ptr();
 
+    {
+        const uint32_t srcofs[] = { aofs, bofs, cofs, eofs };
+
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+    }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
     tcg_gen_addi_ptr(a2, tcg_env, bofs);

@@ -200,6 +200,7 @@ private:
 Corpus *corpus_src;      /* the read list, per encoding */
 Corpus *corpus_opc;      /* the opcode and branch words, per encoding */
 Corpus *corpus_mech;     /* why the classifier said what it said */
+Corpus *corpus_vec;      /* how a helper's env pointers were recorded */
 Corpus *corpus_ident;    /* the decode rule QEMU reached, beside the mnemonic */
 
 void corpora_init()
@@ -214,6 +215,9 @@ void corpora_init()
                                 "#isa\tencoding\tmnem\topcode\n");
         corpus_mech = new Corpus("CST_SRC_MECH_DUMP",
                                  "#isa\tencoding\tmech\n");
+        corpus_vec = new Corpus(
+            "CST_VEC_ENV_DUMP",
+            "#isa\tencoding\tvecops\tdropped\tbounded\tunbounded\n");
         corpus_ident = new Corpus(
             "CST_QEMU_IDENT_PAIRS",
             "#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n");
@@ -362,6 +366,44 @@ void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
     fprintf(o, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", isa_name(), enc,
             mnem && mnem[0] ? mnem : "-", rule ? rule : "-",
             word ? word : "-", opc, brn);
+}
+
+void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
+                         const void *bytes, size_t nbytes)
+{
+    if (!tb || !bytes || !nbytes) {
+        return;
+    }
+    corpora_init();
+
+    FILE *o = corpus_vec->get();
+
+    if (!o) {
+        return;
+    }
+
+    qemu_plugin_dataflow_status st = { };
+
+    st.struct_size = sizeof(st);
+    if (!qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
+        return;
+    }
+
+    /*
+     * An instruction that hands a helper no env pointer says nothing about
+     * how env pointers are recorded, and writing a row for it would put a
+     * pair of zeros in the corpus that a scorer would read as coverage.
+     */
+    if (st.n_env_ptr_bounded == 0 && st.n_env_ptr_unbounded == 0) {
+        return;
+    }
+
+    char enc[2 * 32 + 1];
+
+    hex_bytes(bytes, nbytes, enc, sizeof(enc));
+    fprintf(o, "%s\t%s\t%u\t%u\t%u\t%u\n", isa_name(), enc,
+            st.n_vec_operands, st.n_vec_dropped,
+            st.n_env_ptr_bounded, st.n_env_ptr_unbounded);
 }
 
 #endif /* CST_CAPTURE */

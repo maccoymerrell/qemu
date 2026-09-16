@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 1
+#define QEMU_PLUGIN_DATAFLOW_VERSION 2
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -333,6 +333,20 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t xfer;              /* QEMU_PLUGIN_DF_X_* */
     uint32_t vec_vece;          /* log2 element size, or _VECE_NONE */
     uint32_t vec_oprsz;         /* bytes of one vector operand, 0 if unstated */
+    /*
+     * How the env pointers a helper was handed were recorded.
+     *
+     * A gvec expander states each operand's offset, extent and direction, so
+     * the pointer is recorded as the vector registers it actually names.
+     * Where no statement covered it the range is the whole of CPUArchState in
+     * both directions, which is honest and coarse -- and counted here, so the
+     * two are never added together and a coarse answer is never read as a
+     * measured one.
+     */
+    uint32_t n_vec_operands;    /* operand statements this instruction made */
+    uint32_t n_vec_dropped;     /* statements past the per-instruction limit */
+    uint32_t n_env_ptr_bounded;   /* env pointers a statement covered */
+    uint32_t n_env_ptr_unbounded; /* env pointers recorded as all of env */
 } qemu_plugin_dataflow_status;
 
 QEMU_PLUGIN_API

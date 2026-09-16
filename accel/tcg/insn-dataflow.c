@@ -1117,11 +1117,13 @@ void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
 }
 
 void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
-                                     const InsnDataflowAtom *parts,
+                                     const InsnDataflowEaPart *parts,
                                      unsigned nparts, int64_t disp)
 {
     uint64_t addr_prov[INSN_DF_REG_WORDS] = { 0 };
+    InsnDataflowSynthEa row = { 0 };
     InsnDataflow *d;
+    bool whole = true;
 
     if (df == NULL || !df->decoding) {
         return;
@@ -1129,22 +1131,54 @@ void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
     d = &df->out[df->cur];
 
     for (unsigned i = 0; i < nparts; i++) {
-        int bit = df_atom_bit(parts[i]);
+        int bit = df_atom_bit(parts[i].atom);
 
         if (bit >= 0) {
             df_set_bit(addr_prov, (unsigned)bit);
+        } else {
+            whole = false;
         }
         /*
          * The instruction really does read the register that names the
          * address, whether or not the emulation computes anything with it.
          */
-        df_state(parts[i], INSN_DF_RD);
+        df_state(parts[i].atom, INSN_DF_RD);
+
+        /*
+         * The components, for the consumer that recomputes the address.  An
+         * address short one of its terms is a DIFFERENT address and not an
+         * approximate one, so a component that resolved to no bit, or one
+         * more component than a row holds, voids the whole row rather than
+         * shortening it.
+         */
+        if (i < INSN_DF_MAX_EA_PARTS && bit >= 0) {
+            row.part_bit[i] = (uint8_t)bit;
+            row.part_shift[i] = parts[i].shift;
+            row.part_ext[i] = parts[i].ext;
+            row.n_parts = (uint8_t)(i + 1);
+        } else {
+            whole = false;
+        }
     }
     if (disp != 0) {
         df_set_bit(addr_prov, INSN_DF_BIT_IMM);
         insn_dataflow_note_immediate((uint64_t)disp, INSN_DF_IMM_DISP);
     }
+    row.memop = d->n_memops;
+    row.disp = disp;
     df_add_memop(d, (uint8_t)dir, size, addr_prov, NULL);
+
+    /*
+     * Recorded only if the memop it names was recorded: a row pointing at a
+     * memop that ran out of slots names nothing.
+     */
+    if (!whole || row.memop >= d->n_memops) {
+        d->n_synth_ea_refused++;
+    } else if (d->n_synth_ea >= INSN_DF_MAX_SYNTH_EA) {
+        d->n_synth_ea_refused++;
+    } else {
+        d->synth_ea[d->n_synth_ea++] = row;
+    }
 }
 
 void insn_dataflow_window_end(void)

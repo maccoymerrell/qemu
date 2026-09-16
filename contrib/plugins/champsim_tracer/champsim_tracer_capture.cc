@@ -569,6 +569,71 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         fk += (size_t)w;
     }
 
+    /*
+     * THE SYNTHETIC ADDRESS, AS ITS COMPONENTS.
+     *
+     * Rendered rather than counted, because the defect this column exists to
+     * catch is a component that is present and wrong: two prefetches whose
+     * encodings differ only in the scale field produce the same count and
+     * different addresses.  Each component reads `<name><<shift`, with the
+     * extend appended where one narrows the register, and the displacement
+     * last.  A row the emulator refused reads "refused" -- it is not "-",
+     * which means the instruction named no synthetic address at all.
+     */
+    char ea[256];
+    size_t ek = 0;
+    qemu_plugin_dataflow_ea earows[4];
+    unsigned nea;
+
+    for (unsigned i = 0; i < 4; i++) {
+        earows[i] = qemu_plugin_dataflow_ea();
+        earows[i].struct_size = sizeof(earows[i]);
+    }
+    nea = qemu_plugin_insn_synthetic_eas(tb, idx, earows, 4);
+    if (nea > 4) {
+        nea = 0;                /* more rows than asked for: nothing written */
+    }
+    ea[0] = '\0';
+    for (unsigned i = 0; i < nea; i++) {
+        for (unsigned k = 0; k < earows[i].n_parts && k < 4; k++) {
+            const char *nm =
+                qemu_plugin_dataflow_reg_name(earows[i].part_reg[k],
+                                              nullptr, nullptr);
+            uint32_t atom = 0;
+            int w;
+
+            if (!nm && qemu_plugin_dataflow_prov_atom(earows[i].part_reg[k],
+                                                      &atom)) {
+                nm = atom == QEMU_PLUGIN_DF_ATOM_ZERO ? "zero"
+                   : atom == QEMU_PLUGIN_DF_ATOM_IMM  ? "imm"
+                                                      : "const";
+            }
+            w = snprintf(ea + ek, sizeof(ea) - ek, "%s%s<<%u%s",
+                         ek ? "+" : "", nm ? nm : "?",
+                         earows[i].part_shift[k],
+                         earows[i].part_ext[k] == QEMU_PLUGIN_DF_EA_EXT_UXTW
+                             ? ":uxtw"
+                         : earows[i].part_ext[k] == QEMU_PLUGIN_DF_EA_EXT_SXTW
+                             ? ":sxtw"
+                             : "");
+            if (w < 0 || (size_t)w >= sizeof(ea) - ek) {
+                break;
+            }
+            ek += (size_t)w;
+        }
+        int w = snprintf(ea + ek, sizeof(ea) - ek, "%s0x%llx",
+                         ek ? "+" : "",
+                         (unsigned long long)earows[i].disp);
+        if (w < 0 || (size_t)w >= sizeof(ea) - ek) {
+            break;
+        }
+        ek += (size_t)w;
+    }
+    if (!ek && st.n_synth_ea_refused) {
+        snprintf(ea, sizeof(ea), "refused");
+        ek = 7;
+    }
+
     char vece[8];
 
     if (st.vec_vece == QEMU_PLUGIN_DF_VECE_NONE) {
@@ -629,11 +694,13 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
      * reads "-" rather than 0: a refusal and an instruction that touches no
      * register are different claims.
      */
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t%s\t", isa_name(),
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t%s\t%s\t",
+            isa_name(),
             enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
             k ? imm : "-", vece, st.vec_oprsz, st.n_memops,
             fk ? fields : "-", zero[0] ? zero : "-",
-            pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"));
+            pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
+            ek ? ea : "-");
     if (have_sets) {
         fprintf(o, "%u\t%u\n", n_rd, n_wr);
     } else {

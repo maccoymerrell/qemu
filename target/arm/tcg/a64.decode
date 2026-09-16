@@ -523,8 +523,13 @@ LDR             01 111 0 00 11 1 ..... ... . 10 ..... ..... @ldst sign=1 ext=1 s
 # PRFM: prefetch, register offset.  The extend and the shift are deliberately
 # not carried: they change the address's VALUE, not the set of places the
 # value came from, and the emulation computes no value to be consistent with.
-&prfm_rr        rn rm
-PRFM_rr         11 111 0 00 10 1 rm:5 -1- - 10 rn:5 ----- &prfm_rr !word=prefetch
+# sgn and w are the option field's outer bits (its middle bit is fixed at 1 by
+# the pattern), and s is the scale bit.  All three are named rather than
+# ignored because they decide the address this instruction's encoding names:
+# w selects a 64-bit index over a 32-bit one, sgn its signedness, and s whether
+# the index is scaled by the access size.
+&prfm_rr        rn rm sgn w s
+PRFM_rr         11 111 0 00 10 1 rm:5 sgn:1 1 w:1 s:1 10 rn:5 ----- &prfm_rr !word=prefetch
 
 STR_v           sz:2 111 1 00 00 1 ..... ... . 10 ..... ..... @ldst sign=0 ext=0 !word=vec.store
 STR_v           00 111 1 00 10 1 ..... ... . 10 ..... ..... @ldst sign=0 ext=0 sz=4 !word=vec.store

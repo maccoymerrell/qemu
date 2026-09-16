@@ -131,18 +131,24 @@ static uint32_t mips_cache_line_bytes(DisasContext *ctx, bool icache)
  * which is which; a direction taken from the printed manual would be invention
  * rather than report.
  *
- * SCALE AND SHIFT ARE NOT CARRIED, per the note's own contract: they change
- * the address's value, not the set of places the value came from.
+ * EVERY COMPONENT IS UNSHIFTED AND UNEXTENDED, which is a fact about MIPS and
+ * not a field left out: PREFX adds base and index directly and every other
+ * form here is base plus displacement, so there is no scale in the encoding
+ * for the row to carry.
  */
 static void note_addr_only(DisasContext *ctx, int base, int index,
                            int64_t disp, uint32_t size)
 {
-    InsnDataflowAtom parts[2];
+    InsnDataflowEaPart parts[2];
     unsigned n = 0;
 
-    parts[n++] = base == 0 ? insn_df_zero() : insn_df_reg(regnames[base]);
+    parts[n++] = insn_df_ea(base == 0 ? insn_df_zero()
+                                      : insn_df_reg(regnames[base]),
+                            0, INSN_DF_EA_EXT_NONE);
     if (index >= 0) {
-        parts[n++] = index == 0 ? insn_df_zero() : insn_df_reg(regnames[index]);
+        parts[n++] = insn_df_ea(index == 0 ? insn_df_zero()
+                                           : insn_df_reg(regnames[index]),
+                                0, INSN_DF_EA_EXT_NONE);
     }
     insn_dataflow_note_synthetic_ea(INSN_DF_RD, size, parts, n, disp);
 }

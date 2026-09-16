@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 2
+#define QEMU_PLUGIN_DATAFLOW_VERSION 3
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -265,6 +265,49 @@ unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
                                           uint64_t *words, unsigned nwords);
 
 /*
+ * An address the instruction names and the emulation computes nothing for.
+ *
+ * A prefetch or a cache-maintenance operation lowers to a NOP or a bare block
+ * exit, so its memop row exists only because the decode site stated it, and a
+ * consumer that wants the ADDRESS has no ops to read it off.  The components
+ * are therefore carried: the registers in the provenance namespace, the left
+ * shift applied to each, any narrowing extend, and the displacement.
+ *
+ * The provenance set alone is not enough and that is not a theoretical point.
+ * `prefetcht0 0x20(%rax,%rbx,8)` and `prefetcht0 0x20(%rax,%rbx,1)` have the
+ * same components and name addresses 0x77 apart; so do aarch64's `prfm [x0,
+ * x1, lsl #3]` and `prfm [x0, x1]`.  A row without the shift says which
+ * registers an address came from while leaving its reader unable to say which
+ * address.
+ *
+ * A row is present only when every component resolved and the memop it names
+ * was recorded.  An address missing one term is a different address, not an
+ * approximate one, so the whole row is withheld and counted in
+ * @n_synth_ea_refused rather than handed over short.
+ */
+#define QEMU_PLUGIN_DF_MAX_EA_PARTS  4
+
+#define QEMU_PLUGIN_DF_EA_EXT_NONE  0   /* the whole register */
+#define QEMU_PLUGIN_DF_EA_EXT_UXTW  1   /* its low 32 bits, zero-extended */
+#define QEMU_PLUGIN_DF_EA_EXT_SXTW  2   /* its low 32 bits, sign-extended */
+
+typedef struct qemu_plugin_dataflow_ea {
+    uint32_t struct_size;       /* caller sets to sizeof(*this) */
+    uint32_t memop;             /* the memop row this address belongs to */
+    uint32_t n_parts;
+    int64_t  disp;
+    uint32_t part_reg[QEMU_PLUGIN_DF_MAX_EA_PARTS];
+    uint8_t  part_shift[QEMU_PLUGIN_DF_MAX_EA_PARTS];
+    uint8_t  part_ext[QEMU_PLUGIN_DF_MAX_EA_PARTS];
+} qemu_plugin_dataflow_ea;
+
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_synthetic_eas(const struct qemu_plugin_tb *tb,
+                                        size_t idx,
+                                        qemu_plugin_dataflow_ea *out,
+                                        unsigned neas);
+
+/*
  * The decode rule these bytes reached, and the generic word that rule carries.
  *
  * NULL from _decode_name() means no rule matched -- which is a different
@@ -347,6 +390,8 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t n_vec_dropped;     /* statements past the per-instruction limit */
     uint32_t n_env_ptr_bounded;   /* env pointers a statement covered */
     uint32_t n_env_ptr_unbounded; /* env pointers recorded as all of env */
+    uint32_t n_synth_ea;          /* rows available from _synthetic_eas() */
+    uint32_t n_synth_ea_refused;  /* addresses that could not be recorded */
 } qemu_plugin_dataflow_status;
 
 QEMU_PLUGIN_API

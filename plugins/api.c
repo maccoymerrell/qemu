@@ -344,6 +344,10 @@ bool qemu_plugin_dataflow_abi_ok(uint32_t plugin_version,
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_VECE_NONE != INSN_DF_VECE_NONE);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_OPERAND != INSN_DF_IMM_OPERAND);
     QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_IMM_DISP != INSN_DF_IMM_DISP);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_MAX_EA_PARTS != INSN_DF_MAX_EA_PARTS);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_EA_EXT_NONE != INSN_DF_EA_EXT_NONE);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_EA_EXT_UXTW != INSN_DF_EA_EXT_UXTW);
+    QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_EA_EXT_SXTW != INSN_DF_EA_EXT_SXTW);
 
     return plugin_version == QEMU_PLUGIN_DATAFLOW_VERSION &&
            field_struct_size == sizeof(qemu_plugin_dataflow_field) &&
@@ -501,6 +505,38 @@ unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
     return d->n_memops;
 }
 
+unsigned qemu_plugin_insn_synthetic_eas(const struct qemu_plugin_tb *tb,
+                                        size_t idx,
+                                        qemu_plugin_dataflow_ea *out,
+                                        unsigned neas)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+
+    if (d == NULL) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (neas < d->n_synth_ea || out == NULL) {
+        return d->n_synth_ea;
+    }
+    for (unsigned i = 0; i < d->n_synth_ea; i++) {
+        const InsnDataflowSynthEa *r = &d->synth_ea[i];
+        qemu_plugin_dataflow_ea e = {
+            .struct_size = sizeof(e),
+            .memop = r->memop,
+            .n_parts = r->n_parts,
+            .disp = r->disp,
+        };
+
+        for (unsigned k = 0; k < r->n_parts; k++) {
+            e.part_reg[k] = r->part_bit[k];
+            e.part_shift[k] = r->part_shift[k];
+            e.part_ext[k] = r->part_ext[k];
+        }
+        plugin_df_struct(&out[i], &e, out[i].struct_size, sizeof(e));
+    }
+    return d->n_synth_ea;
+}
+
 unsigned qemu_plugin_insn_memop_addr_prov(const struct qemu_plugin_tb *tb,
                                           size_t idx, unsigned memop,
                                           uint64_t *words, unsigned nwords)
@@ -594,6 +630,8 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_vec_dropped = d->n_vecops_dropped;
     st.n_env_ptr_bounded = d->n_env_ptr_bounded;
     st.n_env_ptr_unbounded = d->n_env_ptr_unbounded;
+    st.n_synth_ea = d->n_synth_ea;
+    st.n_synth_ea_refused = d->n_synth_ea_refused;
     /*
      * Interning is per translation block, so a range that could not be
      * interned anywhere in the block makes a value in THIS instruction look

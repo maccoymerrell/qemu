@@ -45,14 +45,17 @@
  * likewise comes from the CPU's own configured block length rather than a
  * constant written here.
  *
- * SCALE AND SHIFT ARE NOT CARRIED, per the note's own contract; RISC-V has
- * neither here in any case, and the displacement is genuinely absent -- these
- * encodings have no offset field, so nothing is stated for one.
+ * THE COMPONENT IS UNSHIFTED AND UNEXTENDED, which RISC-V's encoding settles
+ * rather than this file: the base register is added whole, and the
+ * displacement is genuinely absent -- these encodings have no offset field, so
+ * nothing is stated for one.
  */
 static void note_cbo_ea(DisasContext *ctx, int rs1, unsigned dir, uint32_t len)
 {
-    InsnDataflowAtom base = rs1 == 0 ? insn_df_zero()
-                                     : insn_df_reg(riscv_int_regnames[rs1]);
+    InsnDataflowEaPart base =
+        insn_df_ea(rs1 == 0 ? insn_df_zero()
+                            : insn_df_reg(riscv_int_regnames[rs1]),
+                   0, INSN_DF_EA_EXT_NONE);
 
     insn_dataflow_note_synthetic_ea(dir, len, &base, 1, 0);
 }
@@ -121,8 +124,10 @@ static bool trans_prefetch_common(DisasContext *ctx, int rs1, int imm)
         return false;
     }
 
-    InsnDataflowAtom base = rs1 == 0 ? insn_df_zero()
-                                     : insn_df_reg(riscv_int_regnames[rs1]);
+    InsnDataflowEaPart base =
+        insn_df_ea(rs1 == 0 ? insn_df_zero()
+                            : insn_df_reg(riscv_int_regnames[rs1]),
+                   0, INSN_DF_EA_EXT_NONE);
 
     insn_dataflow_note_immediate(imm, INSN_DF_IMM_DISP);
     insn_dataflow_note_synthetic_ea(INSN_DF_RD, ctx->cfg_ptr->cbop_blocksize,

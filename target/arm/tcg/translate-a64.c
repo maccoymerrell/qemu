@@ -2807,7 +2807,9 @@ static void handle_sys(DisasContext *s, bool isread,
          * be invention rather than report.
          */
         {
-            InsnDataflowAtom base = insn_df_reg(regnames[rt]);
+            InsnDataflowEaPart base =
+                insn_df_ea(insn_df_reg(regnames[rt]), 0,
+                           INSN_DF_EA_EXT_NONE);
 
             if (rt != 31) {
                 insn_dataflow_note_synthetic_ea(INSN_DF_WR,
@@ -3434,20 +3436,43 @@ static bool trans_CAS(DisasContext *s, arg_CAS *a)
  * replaced did, so the emulation is unchanged.
  *
  * SIZE is the prefetch's own operand size, which is 8 on every aarch64 form
- * (the rules are all in the size==11 space).  SCALE AND SHIFT ARE NOT CARRIED,
- * per the note's own contract: they change the address's value, not the set of
- * places the value came from, and the emulation computes no value here for
- * them to be consistent with.
+ * (the rules are all in the size==11 space).  THE SHIFT AND THE EXTEND ARE
+ * CARRIED: the register-offset form scales its index by the access size when
+ * S is set, so `prfm [x0, x1, lsl #3]` and `prfm [x0, x1]` name addresses
+ * seven times the index apart while naming the same two registers, and a row
+ * that dropped the shift would answer the first question and not the second.
+ * Both are fields of the encoding, which is why the decode pattern now
+ * extracts them.
  */
-static void note_prfm_ea(const InsnDataflowAtom *parts, unsigned nparts,
+static void note_prfm_ea(const InsnDataflowEaPart *parts, unsigned nparts,
                          int64_t disp)
 {
     insn_dataflow_note_synthetic_ea(INSN_DF_RD, 8, parts, nparts, disp);
 }
 
+/*
+ * The index component of a register-offset access.
+ *
+ * @w selects a 64-bit index (LSL / SXTX) over a 32-bit one (UXTW / SXTW) and
+ * @sgn its signedness; a 64-bit index needs no extend because SXTX of a
+ * 64-bit register is the register.  @s is the scale bit, and the scale it
+ * selects is the access size's log2, 3 for every PRFM form.
+ */
+static InsnDataflowEaPart note_prfm_index(const char *name, int sgn, int w,
+                                          int s)
+{
+    unsigned ext = INSN_DF_EA_EXT_NONE;
+
+    if (!w) {
+        ext = sgn ? INSN_DF_EA_EXT_SXTW : INSN_DF_EA_EXT_UXTW;
+    }
+    return insn_df_ea(insn_df_reg(name), s ? 3 : 0, ext);
+}
+
 static bool trans_PRFM_lit(DisasContext *s, arg_prfm_lit *a)
 {
-    InsnDataflowAtom base = insn_df_reg(A64_DF_PC_NAME);
+    InsnDataflowEaPart base = insn_df_ea(insn_df_reg(A64_DF_PC_NAME), 0,
+                                         INSN_DF_EA_EXT_NONE);
 
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
     insn_dataflow_state_read(insn_df_reg(A64_DF_PC_NAME));
@@ -3457,7 +3482,8 @@ static bool trans_PRFM_lit(DisasContext *s, arg_prfm_lit *a)
 
 static bool trans_PRFM_i(DisasContext *s, arg_prfm *a)
 {
-    InsnDataflowAtom base = insn_df_reg(regnames[a->rn]);
+    InsnDataflowEaPart base = insn_df_ea(insn_df_reg(regnames[a->rn]), 0,
+                                         INSN_DF_EA_EXT_NONE);
 
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_DISP);
     note_prfm_ea(&base, 1, a->imm);
@@ -3466,7 +3492,8 @@ static bool trans_PRFM_i(DisasContext *s, arg_prfm *a)
 
 static bool trans_PRFM_ui(DisasContext *s, arg_prfm *a)
 {
-    InsnDataflowAtom base = insn_df_reg(regnames[a->rn]);
+    InsnDataflowEaPart base = insn_df_ea(insn_df_reg(regnames[a->rn]), 0,
+                                         INSN_DF_EA_EXT_NONE);
     int64_t disp = (int64_t)a->imm << 3;
 
     insn_dataflow_note_immediate(disp, INSN_DF_IMM_DISP);
@@ -3476,12 +3503,13 @@ static bool trans_PRFM_ui(DisasContext *s, arg_prfm *a)
 
 static bool trans_PRFM_rr(DisasContext *s, arg_prfm_rr *a)
 {
-    InsnDataflowAtom parts[2];
+    InsnDataflowEaPart parts[2];
     unsigned n = 0;
 
-    parts[n++] = insn_df_reg(regnames[a->rn]);
+    parts[n++] = insn_df_ea(insn_df_reg(regnames[a->rn]), 0,
+                            INSN_DF_EA_EXT_NONE);
     if (a->rm != 31) {
-        parts[n++] = insn_df_reg(regnames[a->rm]);
+        parts[n++] = note_prfm_index(regnames[a->rm], a->sgn, a->w, a->s);
     } else {
         insn_dataflow_state_read(insn_df_zero());
     }

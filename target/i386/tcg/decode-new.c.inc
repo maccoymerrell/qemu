@@ -433,7 +433,7 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
     if (has_ea && word != NULL &&
         (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
          !strcmp(word, INSN_DF_WORD_CACHEFLUSH))) {
-        InsnDataflowAtom parts[2];
+        InsnDataflowEaPart parts[2];
         unsigned n = 0;
         AddressParts *a = &decode->mem;
 
@@ -444,12 +444,21 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
              * not even do that much -- no address is computed at all -- so
              * the register is named from the encoding.
              */
-            parts[n++] = insn_df_reg(X86_DF_PC_NAME);
+            parts[n++] = insn_df_ea(insn_df_reg(X86_DF_PC_NAME), 0,
+                                    INSN_DF_EA_EXT_NONE);
         } else if (a->base >= 0 && a->base < CPU_NB_REGS) {
-            parts[n++] = insn_df_reg(x86_reg_names[a->base]);
+            parts[n++] = insn_df_ea(insn_df_reg(x86_reg_names[a->base]), 0,
+                                    INSN_DF_EA_EXT_NONE);
         }
         if (a->index >= 0 && a->index < CPU_NB_REGS) {
-            parts[n++] = insn_df_reg(x86_reg_names[a->index]);
+            /*
+             * a->scale is already the SIB scale's log2 -- gen_lea_modrm_1
+             * hands it straight to tcg_gen_shli_tl -- so it is the shift this
+             * component gets, and the address the encoding names is
+             * base + (index << scale) + disp.
+             */
+            parts[n++] = insn_df_ea(insn_df_reg(x86_reg_names[a->index]),
+                                    a->scale, INSN_DF_EA_EXT_NONE);
         }
         insn_dataflow_note_synthetic_ea(INSN_DF_RD,
                                         1u << decode->op[0].ot,

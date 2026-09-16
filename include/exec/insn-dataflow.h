@@ -270,6 +270,46 @@ typedef struct InsnDataflowMemop {
 } InsnDataflowMemop;
 
 /*
+ * How many components one synthetic effective address is built from, and how
+ * many such addresses one instruction may name.  x86's modrm reaches two (base
+ * and index) and aarch64's register-offset form the same; nothing in tree
+ * states more, and an instruction that named a third would be refused rather
+ * than recorded short.
+ */
+#define INSN_DF_MAX_EA_PARTS   4
+#define INSN_DF_MAX_SYNTH_EA   2
+
+/*
+ * What an address computation does to a component before adding it in.
+ *
+ * SXTX and a 64-bit register are the same thing, so they share _NONE: this
+ * enumerates the transforms that change the value, not the encodings that name
+ * them.
+ */
+#define INSN_DF_EA_EXT_NONE  0  /* the whole register */
+#define INSN_DF_EA_EXT_UXTW  1  /* its low 32 bits, zero-extended */
+#define INSN_DF_EA_EXT_SXTW  2  /* its low 32 bits, sign-extended */
+
+/*
+ * A synthetic address, as the components it is computed from.
+ *
+ * @memop is the row in memops[] this address belongs to, so a consumer joins
+ * the two without guessing; @part_bit indexes the provenance namespace, which
+ * is where a component's register already has a name.  A component whose atom
+ * resolves to no bit makes the whole row unrecordable -- an address missing one
+ * of its terms computes a different address, not an approximate one -- so the
+ * row is dropped and counted rather than written short.
+ */
+typedef struct InsnDataflowSynthEa {
+    uint8_t  memop;
+    uint8_t  n_parts;
+    uint8_t  part_bit[INSN_DF_MAX_EA_PARTS];
+    uint8_t  part_shift[INSN_DF_MAX_EA_PARTS];
+    uint8_t  part_ext[INSN_DF_MAX_EA_PARTS];
+    int64_t  disp;
+} InsnDataflowSynthEa;
+
+/*
  * The element size and operand size of a vector instruction.
  *
  * A static fact of the encoding: QEMU's vector expanders are called with vece
@@ -304,6 +344,19 @@ typedef struct InsnDataflow {
 
     InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
     uint8_t  n_memops;
+
+    /*
+     * The addresses an instruction names and the emulation never computes.
+     *
+     * Kept beside the memop rows rather than inside them: only a synthetic
+     * address has components to carry, and a row on every memop would be
+     * empty on almost all of them.  @n_synth_ea_refused counts the addresses
+     * that could not be recorded whole, so a consumer never reads their
+     * absence as an instruction that named none.
+     */
+    InsnDataflowSynthEa synth_ea[INSN_DF_MAX_SYNTH_EA];
+    uint8_t  n_synth_ea;
+    uint8_t  n_synth_ea_refused;
 
     uint8_t  properties;        /* INSN_DF_P_* */
     uint8_t  xfer;              /* INSN_DF_X_* */
@@ -395,6 +448,31 @@ static inline InsnDataflowAtom insn_df_const(void)
 {
     InsnDataflowAtom a = { .kind = INSN_DF_A_CONST };
     return a;
+}
+
+/*
+ * One component of a synthetic effective address.
+ *
+ * @shift is a LEFT SHIFT and not a multiplier because every form a target
+ * states here scales by a power of two -- x86's SIB scale is 1, 2, 4 or 8 and
+ * aarch64's register offset is an LSL -- so one field spells both exactly and
+ * leaves no way to state a factor the address computation cannot perform.
+ *
+ * @ext is the narrowing the computation applies first, for the aarch64 forms
+ * that index with the low half of a register.
+ */
+typedef struct InsnDataflowEaPart {
+    InsnDataflowAtom atom;
+    uint8_t shift;
+    uint8_t ext;                /* INSN_DF_EA_EXT_* */
+} InsnDataflowEaPart;
+
+static inline InsnDataflowEaPart insn_df_ea(InsnDataflowAtom atom,
+                                            unsigned shift, unsigned ext)
+{
+    InsnDataflowEaPart p = { .atom = atom, .shift = (uint8_t)shift,
+                             .ext = (uint8_t)ext };
+    return p;
 }
 
 /*
@@ -553,21 +631,30 @@ void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
  * consumer is handed an instruction that names an address in its encoding and
  * touches nothing.  The decode site still holds the operand, so it says so.
  *
- * @parts are the atoms the address is built from and @disp the displacement
- * added to them.  SCALE AND SHIFT ARE DELIBERATELY NOT CARRIED: they change
- * the address's value, not the set of places the value came from, and this
- * row exists to answer where an address came from.  The emulation never
- * computes the value, so there is no value to be consistent with, and a
- * component that could only serve a reconstruction nothing performs would be
- * a field with no reader.
+ * @parts are the components the address is built from -- each an atom, the
+ * shift the computation applies to it and any narrowing extend -- and @disp
+ * the displacement added to them.
  *
- * One shape serves all four targets -- a set of source atoms plus a
- * displacement covers x86's base/index/RIP fold, aarch64's base plus offset or
- * extended index, and MIPS's base plus displacement -- so the note does not
- * diverge per ISA.
+ * THE SCALE IS CARRIED, and the earlier contract that dropped it was wrong on
+ * its own terms.  It said the emulation computes no value here, so there was
+ * no value for a scale to be consistent with and a component serving only a
+ * reconstruction nobody performs would be a field with no reader.  The first
+ * half is true and the second does not follow: the consumer this whole layer
+ * exists to serve reconstructs exactly this address and publishes it, and two
+ * encodings that differ only in the scale field name two different addresses.
+ * Measured on both targets that have the form -- x86 `prefetcht0
+ * 0x20(%rax,%rbx,8)` against the same instruction with scale 1, and aarch64
+ * `prfm [x0, x1, lsl #3]` against `prfm [x0, x1]` -- the published addresses
+ * differ by exactly the scale, so a row without it says an address came from
+ * two registers and a displacement while leaving the reader unable to say
+ * which address.
+ *
+ * One shape serves all four targets -- components plus a displacement covers
+ * x86's base/index/RIP fold, aarch64's base plus offset or extended index, and
+ * MIPS's base plus displacement -- so the note does not diverge per ISA.
  */
 void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
-                                     const InsnDataflowAtom *parts,
+                                     const InsnDataflowEaPart *parts,
                                      unsigned nparts, int64_t disp);
 
 /*
@@ -663,7 +750,7 @@ static inline void insn_dataflow_note_vec_operand(uint32_t envofs,
                                                   unsigned dir)
 { }
 static inline void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
-                                                   const InsnDataflowAtom *p,
+                                                   const InsnDataflowEaPart *p,
                                                    unsigned nparts,
                                                    int64_t disp)
 { }

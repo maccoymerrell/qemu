@@ -234,22 +234,6 @@ void cpu_plugin_spec_ticks_freeze(int cpu_index);
 void cpu_plugin_spec_ticks_thaw(int cpu_index);
 
 /**
- * vclock_agency_consume: run due QEMU_CLOCK_VIRTUAL timers in-thread
- * @cpu: the vCPU whose slice breakout this is
- * @breakout_site: site witness -- true = the slice-breakout site in
- * cpu_loop_exec_tb(), the ONLY product site; false survives so the
- * consume_dispatch counter can prove the retired dispatch-top site
- * stays gone (it must read 0 forever)
- *
- * The event-agency discipline's consumption body (see
- * qemu/vclock-agency.h): called from a vCPU-owned slice breakout when
- * the fresh qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0 read
- * says a deadline is due.  Takes the BQL if not held; skips (and
- * counts) inside spec mode.
- */
-void vclock_agency_consume(CPUState *cpu, bool breakout_site);
-
-/**
  * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()
  * @tsc_hz: slope of the lock, in ticks per second of QEMU_CLOCK_VIRTUAL
  *
@@ -274,6 +258,29 @@ void vclock_agency_consume(CPUState *cpu, bool breakout_site);
  */
 void cpu_plugin_tsc_lock_to_vclock(double tsc_hz);
 #endif
+
+/**
+ * vclock_agency_consume: run due QEMU_CLOCK_VIRTUAL timers in-thread
+ * @cpu: the vCPU whose slice breakout this is
+ * @breakout_site: site witness -- true = the slice-breakout site in
+ * cpu_loop_exec_tb(), the ONLY product site; false survives so the
+ * consume_dispatch counter can prove the retired dispatch-top site
+ * stays gone (it must read 0 forever)
+ *
+ * The event-agency discipline's consumption body (see
+ * qemu/vclock-agency.h): called from a vCPU-owned slice breakout when
+ * the fresh qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0 read
+ * says a deadline is due.  Takes the BQL if not held; skips (and
+ * counts) inside spec mode.
+ *
+ * Declared outside the CONFIG_PLUGIN block above because neither its
+ * definition in system/cpu-timers.c nor its caller in cpu_loop_exec_tb()
+ * is plugin-conditional -- only the spec-mode skip inside its body is.
+ * Inside that block, a --disable-plugins system build compiled the
+ * definition with no prototype in scope and -Wmissing-prototypes refused
+ * it, while the caller linked against it regardless.
+ */
+void vclock_agency_consume(CPUState *cpu, bool breakout_site);
 
 /*
  * return the time elapsed in VM between vm_start and vm_stop.

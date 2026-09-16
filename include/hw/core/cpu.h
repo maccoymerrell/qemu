@@ -657,6 +657,19 @@ struct CPUState {
      */
     bool plugin_spec_mode;
 
+    /*
+     * An excursion WP-dispatch cleared a pending kick
+     * (icount_decr.u16.high was nonzero at the clear).  Consumed by the
+     * edge-semantics re-arm at the excursion's true exit.
+     *
+     * Unconditional for the same reason as plugin_spec_mode above: both
+     * of its sites are in cpu-exec.c's ordinary system-mode dispatch,
+     * guarded by !CONFIG_USER_ONLY and not by CONFIG_PLUGIN, so with the
+     * member inside the plugin block a --disable-plugins system build did
+     * not compile at all.
+     */
+    bool plugin_spec_kick_deferred;
+
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 
@@ -809,9 +822,6 @@ struct CPUState {
      * architected counters.
      */
     bool plugin_spec_vtime_paused;
-    /* An excursion WP-dispatch cleared a pending kick (icount_decr.u16.high
-     * was nonzero at the clear).  Consumed by the edge-semantics re-arm. */
-    bool plugin_spec_kick_deferred;
     /*
      * Nesting depth of qemu_plugin_vclock_pause/resume: freezes the guest
      * virtual clock while a plugin runs instrumentation work on the vCPU

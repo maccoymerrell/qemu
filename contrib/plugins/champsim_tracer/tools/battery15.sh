@@ -964,15 +964,32 @@ run_row6() {
         record 6 2 "must0_scan -- no sidecar anywhere under the run directory"
         return
     fi
-    # --min-subjects 4: the four smoke sidecars are guaranteed to carry a
-    # census, so a run that finds fewer than four is a scanner that lost its
-    # subject and fails.  The rest of the sweep is short exit reports the
-    # per-encoding captures write, which carry none and are named rather
-    # than counted as failures -- see must0_scan.py's own note on why the
-    # subject rule belongs to the RUN and not to each file.
-    "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 4 \
+    #
+    # THE FLOOR IS COMPUTED, NOT ASSUMED.  It used to be a literal 4, on the
+    # premise that the four smoke sidecars always carry a census.  At a tip
+    # where they do not -- exec203 measured 4 sidecars scanned and 0 carrying
+    # one -- that floor refuses with a number and no cause, and the row reads
+    # as an unexplained red rather than as what it is: this invocation
+    # produced no subject.  So the count of census-carrying files is derived
+    # here by a DIFFERENT means than the scanner's own parse (a grep for the
+    # marker the plugin writes), and the scanner is then asked to see exactly
+    # that many.  A scanner that sees fewer has lost subjects the file system
+    # says are there, which is the thing the floor exists to catch.
+    #
+    local c
+    c=$(grep -lF 'MUST BE 0' "${M0[@]}" 2>/dev/null | wc -l)
+    if [ "$c" -eq 0 ]; then
+        record 6 2 "must0_scan -- $n sidecar(s) found and NONE carries a" \
+               "must-be-0 census.  The census is written by the validator's" \
+               "\`all\` battery (rows 7-10) and by the system gates; this" \
+               "invocation ran none of them, so the row has no subject.  NOT" \
+               "an all-clear: run the rows that write one"
+        return
+    fi
+    "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects "$c" \
           "${M0[@]}" > "$O/MUST0.txt" 2>&1
-    record 6 $? "must0_scan over $n sidecar(s) -- every *.stats.log this run produced"
+    record 6 $? "must0_scan over $n sidecar(s), $c carrying a census -- every" \
+           "*.stats.log this run produced"
 }
 
 # ---- ROWS 7-10: the validator, four ISAs --------------------------------

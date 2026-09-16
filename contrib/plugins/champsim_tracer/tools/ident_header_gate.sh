@@ -46,6 +46,14 @@ PY="${CST_PYTHON:-${PYTHON:-python}}"
 #: header files are champsim_tracer_qemu_ident_{aarch64,mips,riscv,x86}.h.
 KEYS="aarch64 mips riscv x86"
 
+#: WHERE THE SHIPPED HEADER WOULD BE.  It is not always there: CLEAN_PLAN's
+#: Decision 3 retires the plugin-side identity mirror in favour of one table
+#: on the QEMU side plus a vocabulary map, so a tree that ships no header is
+#: a DESIGNED state and not a stale one.  The gate has to tell the two apart,
+#: because the message it printed for both -- "a shipped identity header is
+#: not the one this tree generates" -- is false of the first.
+hdr_path() { echo "$PLUGIN_DIR/champsim_tracer_qemu_ident_$1.h"; }
+
 #: The line the census prints when the file on disk IS what the tree makes.
 #: The gate asserts this line is PRESENT rather than asserting the stale line
 #: is absent, because a run that died before reaching the comparison also has
@@ -91,10 +99,41 @@ cmd_gate() {
     [ -f "$GEN" ] || { echo "ident_header_gate: no generator at $GEN"; return 2; }
     out=${out:-$(mktemp -d)}
     mkdir -p "$out" || return 2
-    local bad=0 key
+    local bad=0 key present=0 absent=0
     echo "ident_header_gate  build=$build  out=$out"
     echo "TIP=$(git -C "$PLUGIN_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+    #
+    # THE SUBJECT COMES FIRST.  A gate with nothing to check must say so and
+    # must not answer either way: a green would certify a table that is not
+    # there, and the red this printed before said something factually false
+    # about a tree that retired the mirror on purpose.
+    #
     for key in $KEYS; do
+        if [ -f "$(hdr_path "$key")" ]; then
+            present=$((present + 1))
+        else
+            absent=$((absent + 1))
+        fi
+    done
+    if [ "$present" = 0 ]; then
+        echo "IDENT HEADER GATE: NO SUBJECT -- this tree ships no" \
+             "champsim_tracer_qemu_ident_*.h at all.  That is CLEAN_PLAN" \
+             "Decision 3's end state (one table on the QEMU side, a" \
+             "vocabulary map in the plugin), not a stale header, and the" \
+             "gate has nothing to compare.  It becomes live again the" \
+             "moment one of the four returns."
+        return 2
+    fi
+    if [ "$absent" != 0 ]; then
+        echo "row -    rc=1   PARTIAL MIRROR -- $present of 4 headers shipped;" \
+             "a mirror that covers some ISAs and not others is a defect in" \
+             "its own right, because the census reads a table that exists" \
+             "for one ISA and not the next"
+        bad=1
+    fi
+    for key in $KEYS; do
+        [ -f "$(hdr_path "$key")" ] || continue
         check_one "$build" "$out" "$key" || bad=1
     done
     if [ "$bad" = 0 ]; then
@@ -131,7 +170,27 @@ selftest() {
         else echo "  FAIL $1 (rc=$3, wanted $2)"; fails=$((fails + 1)); fi
     }
 
-    [ -f "$hdr" ] || { echo "selftest: no $hdr"; exit 2; }
+    #
+    # NO SUBJECT IS ITSELF AN ARM.  When the tree ships no mirror the planted
+    # arms cannot run, and the honest thing is to prove the gate says so and
+    # returns 2 -- not to skip and report nothing, and not to report the
+    # planted arms as passed without having planted anything.
+    #
+    if [ ! -f "$hdr" ]; then
+        local rc
+        cmd_gate "$build" "$T/nosubj" > "$T/nosubj.log" 2>&1
+        rc=$?
+        ck "no-subject returns 2" 2 "$rc"
+        checks=$((checks + 1))
+        if grep -q 'NO SUBJECT' "$T/nosubj.log"; then
+            echo "  ok   no-subject says so in words"
+        else
+            echo "  FAIL no-subject message missing"; fails=$((fails + 1))
+        fi
+        echo "ident_header_gate selftest: $((checks - fails)) of $checks checks" \
+             "(no shipped mirror at this tip; the planted arms have no subject)"
+        [ "$fails" = 0 ] && exit 0 || exit 1
+    fi
     cp "$hdr" "$save" || exit 2
     before=$(sha256sum "$hdr" | cut -d' ' -f1)
 

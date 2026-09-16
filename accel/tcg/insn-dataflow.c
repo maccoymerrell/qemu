@@ -738,21 +738,60 @@ static void df_op(InsnDataflow *d, TCGOp *op)
         if (bo != INSN_DF_NOT_ENV) {
             int64_t eo = bo + (int64_t)op->args[2];
 
-            if (eo >= 0) {
-                if (store) {
-                    /*
-                     * The value's provenance is the range's provenance: this
-                     * is where a vector register's write gets the same account
-                     * of itself a GPR's write already had.
-                     */
+            if (eo < 0) {
+                /*
+                 * BELOW tcg_env IS NOT ARCHITECTURAL STATE, so an op that
+                 * reaches it is not the instruction's behaviour.
+                 *
+                 * tcg_env points at CPUArchState, and the bytes at a NEGATIVE
+                 * offset from it are the CPUState header QEMU keeps for
+                 * itself: the icount decrementer, the io permission, and the
+                 * slot the plugin memory callback reads a value out of.  No
+                 * guest register lives there.
+                 *
+                 * Attributing such an op's operands to the instruction does
+                 * not merely add noise, it INVENTS A DEPENDENCY.  The store
+                 * that carries a load's value to the plugin
+                 * (plugin_gen_mem_callbacks_i64(), tcg/tcg-op-ldst.c) names
+                 * the load's DESTINATION as its datum; on a target whose load
+                 * writes the architectural global directly -- riscv64's
+                 * dest_gpr(), aarch64's cpu_reg() -- that destination is a
+                 * TCG global, so it landed in the instruction's own READ set
+                 * and every register-offset load published a
+                 * read-after-write edge on itself.  x86 and mips never showed
+                 * it because their loads land in a temp first, which is why
+                 * the shape read as a two-ISA mystery rather than as one rule
+                 * about where the op was pointing.
+                 *
+                 * The load direction is handled too, and not by falling
+                 * through: a temp is recycled across a translation, so
+                 * leaving the destination's provenance alone would let it
+                 * keep the account of whatever the temp last held.  Clearing
+                 * it says what is true -- the value came from QEMU's own
+                 * bookkeeping and from no guest register.
+                 */
+                if (!store) {
                     TCGTemp *vts = arg_temp(op->args[0]);
 
-                    df_add_field(d, (uint32_t)eo, size, INSN_DF_WR,
-                                 df_prov(vts - s->temps));
-                } else {
-                    df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
-                    ld_field_bit = df_intern((uint32_t)eo, size);
+                    if (vts != NULL && !df_is_reg(vts, &idx)) {
+                        memset(df_prov(vts - s->temps), 0, sizeof(prov));
+                    }
                 }
+                return;
+            }
+            if (store) {
+                /*
+                 * The value's provenance is the range's provenance: this
+                 * is where a vector register's write gets the same account
+                 * of itself a GPR's write already had.
+                 */
+                TCGTemp *vts = arg_temp(op->args[0]);
+
+                df_add_field(d, (uint32_t)eo, size, INSN_DF_WR,
+                             df_prov(vts - s->temps));
+            } else {
+                df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
+                ld_field_bit = df_intern((uint32_t)eo, size);
             }
         }
     }

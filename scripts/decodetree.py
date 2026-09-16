@@ -49,6 +49,37 @@ decode_function = 'decode'
 # An identifier for C.
 re_C_ident = '[a-zA-Z][a-zA-Z0-9_]*'
 
+# The generic word a rule may carry: '!word=int.add' on a pattern or on a
+# format, the pattern's own winning over the one it inherits.  The vocabulary
+# is not spelled out here -- it is read from the one header that defines it,
+# so a typo is a build error rather than a word no consumer can read.
+re_word_tok = r'!word=[a-z][a-z0-9.]*'
+known_words = None
+
+
+def load_known_words():
+    """Read the generic-word vocabulary from the header that defines it."""
+    global known_words
+
+    if known_words is not None:
+        return known_words
+
+    hdr = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       '..', 'include', 'exec', 'insn-dataflow-words.h')
+    words = set()
+    try:
+        with open(hdr, 'r') as f:
+            for line in f:
+                m = re.match(r'\s*#define\s+INSN_DF_WORD_\w+\s+"([^"]+)"', line)
+                if m:
+                    words.add(m.group(1))
+    except OSError as e:
+        sys.exit(f'decodetree: cannot read {hdr}: {e}')
+    if not words:
+        sys.exit(f'decodetree: no words defined in {hdr}')
+    known_words = words
+    return known_words
+
 # Identifiers for Arguments, Fields, Formats and Patterns.
 re_arg_ident = '&[a-zA-Z0-9_]*'
 re_fld_ident = '%[a-zA-Z0-9_]*'
@@ -468,7 +499,8 @@ class Arguments:
 
 class General:
     """Common code between instruction formats and instruction patterns"""
-    def __init__(self, name, lineno, base, fixb, fixm, udfm, fldm, flds, w):
+    def __init__(self, name, lineno, base, fixb, fixm, udfm, fldm, flds, w,
+                 word=None):
         self.name = name
         self.file = input_file
         self.lineno = lineno
@@ -479,6 +511,7 @@ class General:
         self.fieldmask = fldm
         self.fields = flds
         self.width = w
+        self.word = word
         self.dangling = None
 
     def __str__(self):
@@ -599,6 +632,8 @@ class Pattern(General):
         output(ind, 'if (', translate_prefix, '_', self.name,
                '(ctx, &u.f_', arg, ')) {\n')
         output(ind, '    insn_dataflow_note_rule("', self.name, '");\n')
+        if self.word:
+            output(ind, '    insn_dataflow_note_word("', self.word, '");\n')
         output(ind, '    return true;\n')
         output(ind, '}\n')
 
@@ -1069,7 +1104,18 @@ def parse_generic(lineno, parent_pat, name, toks):
     flds = {}
     arg = None
     fmt = None
+    word = None
     for t in toks:
+        # '!word=foo.bar' states the rule's generic word.
+        if re.fullmatch(re_word_tok, t):
+            tt = t[len('!word='):]
+            if word:
+                error(lineno, 'multiple words')
+            if tt not in load_known_words():
+                error(lineno, 'unknown generic word', tt)
+            word = tt
+            continue
+
         # '&Foo' gives a format an explicit argument set.
         if re.fullmatch(re_arg_ident, t):
             tt = t[1:]
@@ -1181,7 +1227,7 @@ def parse_generic(lineno, parent_pat, name, toks):
         if name in formats:
             error(lineno, 'duplicate format name', name)
         fmt = Format(name, lineno, arg, fixedbits, fixedmask,
-                     undefmask, fieldmask, flds, width)
+                     undefmask, fieldmask, flds, width, word)
         formats[name] = fmt
     else:
         # Patterns can reference a format ...
@@ -1209,7 +1255,8 @@ def parse_generic(lineno, parent_pat, name, toks):
             if f not in flds.keys() and f not in fmt.fields.keys():
                 error(lineno, f'field {f} not initialized')
         pat = Pattern(name, lineno, fmt, fixedbits, fixedmask,
-                      undefmask, fieldmask, flds, width)
+                      undefmask, fieldmask, flds, width,
+                      word if word else fmt.word)
         parent_pat.pats.append(pat)
         allpatterns.append(pat)
 

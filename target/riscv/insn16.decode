@@ -113,121 +113,121 @@
 {
   # Opcode of all zeros is illegal; rd != 0, nzuimm == 0 is reserved.
   illegal         000  000 000 00 --- 00
-  addi            000  ... ... .. ... 00 @c_addi4spn
+  addi            000  ... ... .. ... 00 @c_addi4spn !word=int.add
 }
 {
-  lq              001  ... ... .. ... 00 @cl_q
-  c_fld           001  ... ... .. ... 00 @cl_d
+  lq              001  ... ... .. ... 00 @cl_q !word=load
+  c_fld           001  ... ... .. ... 00 @cl_d !word=load
 }
-lw                010  ... ... .. ... 00 @cl_w
+lw                010  ... ... .. ... 00 @cl_w !word=load
 {
-  sq              101  ... ... .. ... 00 @cs_q
-  c_fsd           101  ... ... .. ... 00 @cs_d
+  sq              101  ... ... .. ... 00 @cs_q !word=store
+  c_fsd           101  ... ... .. ... 00 @cs_d !word=store
 }
-sw                110  ... ... .. ... 00 @cs_w
+sw                110  ... ... .. ... 00 @cs_w !word=store
 
 # *** RV32C and RV64C specific Standard Extension (Quadrant 0) ***
 {
-  ld              011  ... ... .. ... 00 @cl_d
-  c_flw           011  ... ... .. ... 00 @cl_w
+  ld              011  ... ... .. ... 00 @cl_d !word=load
+  c_flw           011  ... ... .. ... 00 @cl_w !word=load
 }
 {
-  sd              111  ... ... .. ... 00 @cs_d
-  c_fsw           111  ... ... .. ... 00 @cs_w
+  sd              111  ... ... .. ... 00 @cs_d !word=store
+  c_fsw           111  ... ... .. ... 00 @cs_w !word=store
 }
 
 # *** RV32/64C Standard Extension (Quadrant 1) ***
-addi              000 .  .....  ..... 01 @ci
-addi              010 .  .....  ..... 01 @c_li
+addi              000 .  .....  ..... 01 @ci !word=int.add
+addi              010 .  .....  ..... 01 @c_li !word=int.add
 {
   # c.sspush x1 carving out of zcmops
-  sspush          011 0  00001  00000 01 &r2_s rs2=1 rs1=0
+  sspush          011 0  00001  00000 01 &r2_s rs2=1 rs1=0 !word=push
   # c.sspopchk x5 carving out of zcmops
-  sspopchk        011 0  00101  00000 01 &r2 rs1=5 rd=0
-  c_mop_n         011 0 0 n:3 1 00000 01
+  sspopchk        011 0  00101  00000 01 &r2 rs1=5 rd=0 !word=pop
+  c_mop_n         011 0 0 n:3 1 00000 01 !word=nop
   illegal         011 0  -----  00000 01 # c.addi16sp and c.lui, RES nzimm=0
-  addi            011 .  00010  ..... 01 @c_addi16sp
-  lui             011 .  .....  ..... 01 @c_lui
+  addi            011 .  00010  ..... 01 @c_addi16sp !word=int.add
+  lui             011 .  .....  ..... 01 @c_lui !word=mov
 }
-srli              100 . 00 ...  ..... 01 @c_shift
-srai              100 . 01 ...  ..... 01 @c_shift
-andi              100 . 10 ...  ..... 01 @c_andi
-sub               100 0 11 ... 00 ... 01 @cs_2
-xor               100 0 11 ... 01 ... 01 @cs_2
-or                100 0 11 ... 10 ... 01 @cs_2
-and               100 0 11 ... 11 ... 01 @cs_2
-jal               101     ........... 01 @cj    rd=0  # C.J
-beq               110  ... ...  ..... 01 @cb_z
-bne               111  ... ...  ..... 01 @cb_z
+srli              100 . 00 ...  ..... 01 @c_shift !word=shr
+srai              100 . 01 ...  ..... 01 @c_shift !word=shr
+andi              100 . 10 ...  ..... 01 @c_andi !word=and
+sub               100 0 11 ... 00 ... 01 @cs_2 !word=int.sub
+xor               100 0 11 ... 01 ... 01 @cs_2 !word=xor
+or                100 0 11 ... 10 ... 01 @cs_2 !word=or
+and               100 0 11 ... 11 ... 01 @cs_2 !word=and
+jal               101     ........... 01 @cj    rd=0 !word=call  # C.J
+beq               110  ... ...  ..... 01 @cb_z !word=jump.cond
+bne               111  ... ...  ..... 01 @cb_z !word=jump.cond
 
 # *** RV64C and RV32C specific Standard Extension (Quadrant 1) ***
 {
   c64_illegal     001 -  00000  ----- 01 # c.addiw, RES rd=0
-  addiw           001 .  .....  ..... 01 @ci
-  jal             001     ........... 01 @cj    rd=1  # C.JAL
+  addiw           001 .  .....  ..... 01 @ci !word=int.add
+  jal             001     ........... 01 @cj    rd=1 !word=call  # C.JAL
 }
-subw              100 1 11 ... 00 ... 01 @cs_2
-addw              100 1 11 ... 01 ... 01 @cs_2
+subw              100 1 11 ... 00 ... 01 @cs_2 !word=int.sub
+addw              100 1 11 ... 01 ... 01 @cs_2 !word=int.add
 
 # *** RV32/64C Standard Extension (Quadrant 2) ***
-slli              000 .  .....  ..... 10 @c_shift2
+slli              000 .  .....  ..... 10 @c_shift2 !word=shl
 {
-  lq              001  ... ... .. ... 10 @c_lqsp
-  c_fld           001 .  .....  ..... 10 @c_ldsp
+  lq              001  ... ... .. ... 10 @c_lqsp !word=load
+  c_fld           001 .  .....  ..... 10 @c_ldsp !word=load
 }
 {
   illegal         010 -  00000  ----- 10 # c.lwsp, RES rd=0
-  lw              010 .  .....  ..... 10 @c_lwsp
+  lw              010 .  .....  ..... 10 @c_lwsp !word=load
 }
 {
   illegal         100 0  00000  00000 10 # c.jr, RES rs1=0
-  jalr            100 0  .....  00000 10 @c_jalr rd=0  # C.JR
-  addi            100 0  .....  ..... 10 @c_mv
+  jalr            100 0  .....  00000 10 @c_jalr rd=0 !word=call.reg  # C.JR
+  addi            100 0  .....  ..... 10 @c_mv !word=int.add
 }
 {
-  ebreak          100 1  00000  00000 10
-  jalr            100 1  .....  00000 10 @c_jalr rd=1  # C.JALR
-  add             100 1  .....  ..... 10 @cr
+  ebreak          100 1  00000  00000 10 !word=syscall
+  jalr            100 1  .....  00000 10 @c_jalr rd=1 !word=call.reg  # C.JALR
+  add             100 1  .....  ..... 10 @cr !word=int.add
 }
 {
-  sq              101  ... ... .. ... 10 @c_sqsp
-  c_fsd           101   ......  ..... 10 @c_sdsp
+  sq              101  ... ... .. ... 10 @c_sqsp !word=store
+  c_fsd           101   ......  ..... 10 @c_sdsp !word=store
 
   # *** RV64 and RV32 Zcmp/Zcmt Extension ***
   [
-    cm_push         101  11000  .... .. 10 @cm_pp
-    cm_pop          101  11010  .... .. 10 @cm_pp
-    cm_popret       101  11110  .... .. 10 @cm_pp
-    cm_popretz      101  11100  .... .. 10 @cm_pp
-    cm_mva01s       101  011 ... 11 ... 10 @cm_mv
-    cm_mvsa01       101  011 ... 01 ... 10 @cm_mv
+    cm_push         101  11000  .... .. 10 @cm_pp !word=push
+    cm_pop          101  11010  .... .. 10 @cm_pp !word=pop
+    cm_popret       101  11110  .... .. 10 @cm_pp !word=ret
+    cm_popretz      101  11100  .... .. 10 @cm_pp !word=ret
+    cm_mva01s       101  011 ... 11 ... 10 @cm_mv !word=mov
+    cm_mvsa01       101  011 ... 01 ... 10 @cm_mv !word=mov
 
-    cm_jalt         101  000   ........ 10 @cm_jt
+    cm_jalt         101  000   ........ 10 @cm_jt !word=jump.reg
   ]
 }
-sw                110 .  .....  ..... 10 @c_swsp
+sw                110 .  .....  ..... 10 @c_swsp !word=store
 
 # *** RV32C and RV64C specific Standard Extension (Quadrant 2) ***
 {
   c64_illegal     011 -  00000  ----- 10 # c.ldsp, RES rd=0
-  ld              011 .  .....  ..... 10 @c_ldsp
-  c_flw           011 .  .....  ..... 10 @c_lwsp
+  ld              011 .  .....  ..... 10 @c_ldsp !word=load
+  c_flw           011 .  .....  ..... 10 @c_lwsp !word=load
 }
 {
-  sd              111 .  .....  ..... 10 @c_sdsp
-  c_fsw           111 .  .....  ..... 10 @c_swsp
+  sd              111 .  .....  ..... 10 @c_sdsp !word=store
+  c_fsw           111 .  .....  ..... 10 @c_swsp !word=store
 }
 
 # *** RV64 and RV32 Zcb Extension ***
-c_zext_b          100 111  ... 11 000 01 @cu
-c_sext_b          100 111  ... 11 001 01 @cu
-c_zext_h          100 111  ... 11 010 01 @cu
-c_sext_h          100 111  ... 11 011 01 @cu
-c_zext_w          100 111  ... 11 100 01 @cu
-c_not             100 111  ... 11 101 01 @cu
-c_mul             100 111  ... 10 ... 01 @cs_2
-c_lbu             100 000  ... .. ... 00 @cl_b
-c_lhu             100 001  ... 0. ... 00 @cl_h
-c_lh              100 001  ... 1. ... 00 @cl_h
-c_sb              100 010  ... .. ... 00 @cs_b
-c_sh              100 011  ... 0. ... 00 @cs_h
+c_zext_b          100 111  ... 11 000 01 @cu !word=movzx
+c_sext_b          100 111  ... 11 001 01 @cu !word=movsx
+c_zext_h          100 111  ... 11 010 01 @cu !word=movzx
+c_sext_h          100 111  ... 11 011 01 @cu !word=movsx
+c_zext_w          100 111  ... 11 100 01 @cu !word=movzx
+c_not             100 111  ... 11 101 01 @cu !word=not
+c_mul             100 111  ... 10 ... 01 @cs_2 !word=int.mul
+c_lbu             100 000  ... .. ... 00 @cl_b !word=load
+c_lhu             100 001  ... 0. ... 00 @cl_h !word=load
+c_lh              100 001  ... 1. ... 00 @cl_h !word=load
+c_sb              100 010  ... .. ... 00 @cs_b !word=store
+c_sh              100 011  ... 0. ... 00 @cs_h !word=store

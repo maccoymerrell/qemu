@@ -577,8 +577,28 @@ static void gen_addi2_i128(TCGv retl, TCGv reth,
     tcg_gen_add2_tl(retl, reth, srcl, srch, imml, immh);
 }
 
+/*
+ * ADDI's operands decide what it is, and only the decoder can see them.
+ *
+ * The base ISA spells a register move, a load-immediate and the canonical
+ * no-op as add-immediate: MV is ADDI rd, rs1, 0; LI is ADDI rd, x0, imm; NOP
+ * is ADDI x0, x0, 0.  A rule-level word cannot separate them, and calling all
+ * of it an addition loses the one thing a consumer would act on -- a move it
+ * could rename away, a no-op it need not issue.  The word is stated here,
+ * where rd, rs1 and imm are in hand, and the rule's own word (stated by
+ * decodetree after this returns) carries the remaining, genuinely arithmetic
+ * cases: first statement wins.
+ *
+ * ADDI rd, x0, 0 with rd != 0 is LI rd, 0, not a move of x0: the value comes
+ * from the encoding, so it is spelled as the load-immediate it is.
+ */
 static bool trans_addi(DisasContext *ctx, arg_addi *a)
 {
+    if (a->rd == 0 && a->rs1 == 0 && a->imm == 0) {
+        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+    } else if (a->rs1 == 0 || a->imm == 0) {
+        insn_dataflow_note_word(INSN_DF_WORD_MOV);
+    }
     return gen_arith_imm_fn(ctx, a, EXT_NONE, tcg_gen_addi_tl, gen_addi2_i128);
 }
 

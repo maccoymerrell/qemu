@@ -77,10 +77,20 @@ typedef struct DfBinding {
 } DfBinding;
 
 /* A bracket around ops that are QEMU's bookkeeping, not the instruction's. */
+/*
+ * A bracket around ops that are not the decoding instruction's own.
+ *
+ * @kind says what to do with them: the bookkeeping kinds are left out of every
+ * instruction, and the borrow kind moves them to instruction @arg -- the
+ * branch whose transfer its delay slot's op range happens to contain.
+ */
+#define DF_W_BORROW  0xff
+
 typedef struct DfWindow {
     const TCGOp *from;          /* last op before the window opened */
     const TCGOp *to;            /* last op inside the window */
     uint16_t insn;
+    uint16_t arg;               /* DF_W_BORROW: the lending instruction */
     uint8_t kind;
 } DfWindow;
 
@@ -886,7 +896,7 @@ void insn_dataflow_bind(const void *ts, InsnDataflowAtom a)
     df->nbind++;
 }
 
-void insn_dataflow_window_begin(unsigned kind)
+static void df_window_open(unsigned kind, unsigned arg)
 {
     if (df == NULL || !df->decoding || df->nwin >= INSN_DF_MAX_WINDOWS ||
         df->win_open >= 0) {
@@ -895,9 +905,113 @@ void insn_dataflow_window_begin(unsigned kind)
     df->win[df->nwin].from = tcg_last_op();
     df->win[df->nwin].to = NULL;
     df->win[df->nwin].insn = df->cur;
+    df->win[df->nwin].arg = (uint16_t)arg;
     df->win[df->nwin].kind = (uint8_t)kind;
     df->win_open = (int)df->nwin;
     df->nwin++;
+}
+
+void insn_dataflow_window_begin(unsigned kind)
+{
+    df_window_open(kind, 0);
+}
+
+void insn_dataflow_borrow_begin(unsigned lender)
+{
+    df_window_open(DF_W_BORROW, lender);
+}
+
+void insn_dataflow_borrow_end(void)
+{
+    insn_dataflow_window_end();
+}
+
+void insn_dataflow_note_property(unsigned prop)
+{
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    df->out[df->cur].properties |= (uint8_t)prop;
+}
+
+void insn_dataflow_refuse(void)
+{
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    df->out[df->cur].incomplete |= INSN_DF_INCOMPLETE_REFUSED;
+}
+
+void insn_dataflow_note_immediate(uint64_t value, unsigned role)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    d = &df->out[df->cur];
+    for (unsigned i = 0; i < d->n_imm; i++) {
+        if (d->imm[i] == value && d->imm_role[i] == role) {
+            return;             /* the same field stated twice is one field */
+        }
+    }
+    if (d->n_imm >= INSN_DF_MAX_IMM) {
+        return;
+    }
+    d->imm[d->n_imm] = value;
+    d->imm_role[d->n_imm] = (uint8_t)role;
+    d->n_imm++;
+}
+
+void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
+{
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding || vece > 7) {
+        return;
+    }
+    d = &df->out[df->cur];
+    /*
+     * One instruction can run more than one expander -- a widening operation
+     * is two passes over the same operand.  The element size that reaches the
+     * wire is the FIRST stated: it is the one the encoding names, and the
+     * later passes are QEMU's lowering of it.
+     */
+    if (d->vec_vece == INSN_DF_VECE_NONE) {
+        d->vec_vece = (uint8_t)vece;
+        d->vec_oprsz = oprsz;
+    }
+}
+
+void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
+                                     const InsnDataflowAtom *parts,
+                                     unsigned nparts, int64_t disp)
+{
+    uint64_t addr_prov[INSN_DF_REG_WORDS] = { 0 };
+    InsnDataflow *d;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    d = &df->out[df->cur];
+
+    for (unsigned i = 0; i < nparts; i++) {
+        int bit = df_atom_bit(parts[i]);
+
+        if (bit >= 0) {
+            df_set_bit(addr_prov, (unsigned)bit);
+        }
+        /*
+         * The instruction really does read the register that names the
+         * address, whether or not the emulation computes anything with it.
+         */
+        df_state(parts[i], INSN_DF_RD);
+    }
+    if (disp != 0) {
+        df_set_bit(addr_prov, INSN_DF_BIT_IMM);
+        insn_dataflow_note_immediate((uint64_t)disp, INSN_DF_IMM_DISP);
+    }
+    df_add_memop(d, (uint8_t)dir, size, addr_prov, NULL);
 }
 
 void insn_dataflow_window_end(void)
@@ -944,6 +1058,7 @@ void insn_dataflow_insn_begin(unsigned idx)
         return;
     }
     memset(&df->out[idx], 0, sizeof(df->out[idx]));
+    df->out[idx].vec_vece = INSN_DF_VECE_NONE;
     df->cur = idx;
     df->decoding = true;
 }
@@ -973,6 +1088,7 @@ void insn_dataflow_extract(unsigned num_insns)
     const TCGOp *prev = NULL;
     const TCGOp *win_to = NULL;
     TCGOp *op;
+    int win_lender = -1;
     unsigned wi = 0, bi = 0;
     int idx = -1;
 
@@ -1013,6 +1129,8 @@ void insn_dataflow_extract(unsigned num_insns)
             if (w->insn < num_insns && win_to == NULL &&
                 w->to != NULL && w->to != w->from) {
                 win_to = w->to;
+                win_lender = w->kind == DF_W_BORROW && w->arg < num_insns
+                             ? (int)w->arg : -1;
             }
             wi++;
         }
@@ -1029,11 +1147,16 @@ void insn_dataflow_extract(unsigned num_insns)
             continue;
         }
 
-        if (idx >= 0 && (unsigned)idx < num_insns && win_to == NULL) {
+        if (win_to != NULL) {
+            if (win_lender >= 0) {
+                df_op(&df->out[win_lender], op);
+            }
+        } else if (idx >= 0 && (unsigned)idx < num_insns) {
             df_op(&df->out[idx], op);
         }
         if (win_to == op) {
             win_to = NULL;
+            win_lender = -1;
         }
         prev = op;
     }

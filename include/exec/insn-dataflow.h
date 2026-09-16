@@ -75,6 +75,9 @@
  */
 #define INSN_DF_MAX_MEMOPS  16
 
+/* Immediate and displacement values one encoding may carry. */
+#define INSN_DF_MAX_IMM  4
+
 /*
  * Why a set may be unavailable.
  *
@@ -96,10 +99,41 @@
 #define INSN_DF_INCOMPLETE_WRITES   (1u << 0)   /* more writes than slots */
 #define INSN_DF_INCOMPLETE_FIELDS   (1u << 1)   /* more env ranges than slots */
 #define INSN_DF_INCOMPLETE_MEMOPS   (1u << 2)   /* more accesses than rows */
+/*
+ * The decode site said not to trust this instruction's ops.  A target reaches
+ * for this where it translated something whose architectural effect its own
+ * op stream does not stand for; saying so is the only honest answer, and it is
+ * a refusal rather than a silence so that a consumer cannot mistake the empty
+ * result for an instruction that touches nothing.
+ */
+#define INSN_DF_INCOMPLETE_REFUSED  (1u << 3)
 
 /* Direction of an access. */
 #define INSN_DF_RD          1
 #define INSN_DF_WR          2
+
+/*
+ * Properties the decoder holds and the ops cannot show.
+ *
+ * Atomicity is the case in point: the ops of an atomic read-modify-write and
+ * the ops of the same arithmetic done in three steps are the same ops.  What
+ * makes one atomic is the encoding -- a LOCK prefix, an LL/SC pair, an LSE
+ * form -- which only the decoder saw.  Flagging the instruction keeps every
+ * register it touches where it was; the flag says how the access happened, not
+ * which registers it used.
+ */
+#define INSN_DF_P_ATOMIC    (1u << 0)
+
+/*
+ * A value the encoding carries, in the role it plays.
+ *
+ * IMM is an operand in its own right; DISP is a displacement folded into an
+ * address.  Both are stated by the decoder because a fold can consume the
+ * value before any op reads it, and once folded there is nothing left in the
+ * op stream to read it back from.
+ */
+#define INSN_DF_IMM_OPERAND  0
+#define INSN_DF_IMM_DISP     1
 
 /*
  * An env byte range no TCG global names: x86's vector file and x87 stack,
@@ -171,6 +205,20 @@ typedef struct InsnDataflowMemop {
     uint64_t data_prov[INSN_DF_REG_WORDS];
 } InsnDataflowMemop;
 
+/*
+ * The element size and operand size of a vector instruction.
+ *
+ * A static fact of the encoding: QEMU's vector expanders are called with vece
+ * and oprsz and lower them into ops that no longer carry either.  A consumer
+ * modelling per-lane dependence cannot recover them from the ops, so the
+ * expander states them.
+ *
+ * vece is a log2 element size, the same convention TCG uses; INSN_DF_VECE_NONE
+ * means no vector expander ran for this instruction, which is different from
+ * an element size of one byte.
+ */
+#define INSN_DF_VECE_NONE  0xff
+
 typedef struct InsnDataflow {
     uint64_t rd[INSN_DF_REG_WORDS];
     uint64_t wr[INSN_DF_REG_WORDS];
@@ -192,6 +240,14 @@ typedef struct InsnDataflow {
 
     InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
     uint8_t  n_memops;
+
+    uint8_t  properties;        /* INSN_DF_P_* */
+    uint8_t  vec_vece;          /* log2 element size, or INSN_DF_VECE_NONE */
+    uint32_t vec_oprsz;         /* bytes of one vector operand, 0 if unstated */
+
+    uint64_t imm[INSN_DF_MAX_IMM];
+    uint8_t  imm_role[INSN_DF_MAX_IMM];
+    uint8_t  n_imm;
 
     /*
      * Helper calls, and guest memory accesses, counted.  What the helper did
@@ -318,6 +374,57 @@ void insn_dataflow_window_begin(unsigned kind);
 void insn_dataflow_window_end(void);
 
 /*
+ * Ops emitted between these two belong to instruction @lender, not to the one
+ * being decoded.
+ *
+ * MIPS is the case this exists for: the branch's transfer is emitted after its
+ * delay slot has been translated, so the ops that perform the branch sit
+ * inside the delay-slot instruction's range.  Attributing them where they were
+ * emitted would give the delay slot a program-counter write it does not
+ * perform and take one away from the branch that does.
+ */
+void insn_dataflow_borrow_begin(unsigned lender);
+void insn_dataflow_borrow_end(void);
+
+/* A property of this instruction the ops cannot show. */
+void insn_dataflow_note_property(unsigned prop);
+
+/* Do not trust this instruction's ops; say so rather than publish them. */
+void insn_dataflow_refuse(void);
+
+/* A value this encoding carries, in the role it plays. */
+void insn_dataflow_note_immediate(uint64_t value, unsigned role);
+
+/* The element and operand size a vector expander was called with. */
+void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz);
+
+/*
+ * An effective address the emulation computes no address for.
+ *
+ * Prefetches and cache-maintenance operations -- x86 prefetch*, aarch64 PRFM
+ * and DC CVAU, MIPS PREF and SYNCI -- lower to a NOP or to a bare block exit.
+ * There is no memop, so there is nothing for the reader to walk, and a
+ * consumer is handed an instruction that names an address in its encoding and
+ * touches nothing.  The decode site still holds the operand, so it says so.
+ *
+ * @parts are the atoms the address is built from and @disp the displacement
+ * added to them.  SCALE AND SHIFT ARE DELIBERATELY NOT CARRIED: they change
+ * the address's value, not the set of places the value came from, and this
+ * row exists to answer where an address came from.  The emulation never
+ * computes the value, so there is no value to be consistent with, and a
+ * component that could only serve a reconstruction nothing performs would be
+ * a field with no reader.
+ *
+ * One shape serves all four targets -- a set of source atoms plus a
+ * displacement covers x86's base/index/RIP fold, aarch64's base plus offset or
+ * extended index, and MIPS's base plus displacement -- so the note does not
+ * diverge per ISA.
+ */
+void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
+                                     const InsnDataflowAtom *parts,
+                                     unsigned nparts, int64_t disp);
+
+/*
  * Declare a register file that lives in CPUArchState with no TCG global naming
  * it: @count registers named @names, @size bytes each, @stride apart, starting
  * at @base_off.
@@ -372,6 +479,23 @@ static inline void insn_dataflow_bind(const void *ts, InsnDataflowAtom a)
 static inline void insn_dataflow_window_begin(unsigned kind)
 { }
 static inline void insn_dataflow_window_end(void)
+{ }
+static inline void insn_dataflow_borrow_begin(unsigned lender)
+{ }
+static inline void insn_dataflow_borrow_end(void)
+{ }
+static inline void insn_dataflow_note_property(unsigned prop)
+{ }
+static inline void insn_dataflow_refuse(void)
+{ }
+static inline void insn_dataflow_note_immediate(uint64_t value, unsigned role)
+{ }
+static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
+{ }
+static inline void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
+                                                   const InsnDataflowAtom *p,
+                                                   unsigned nparts,
+                                                   int64_t disp)
 { }
 static inline void insn_dataflow_declare_regfile(const char *const *names,
                                                  unsigned count,

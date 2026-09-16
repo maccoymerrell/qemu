@@ -1,0 +1,142 @@
+# The QEMU register NAME -> generic wire register map for riscv64.
+#
+# name<TAB>generic<TAB>ground.  Columns are tab-separated; a row's GROUND
+# says what decided it, because a register identity chosen without a stated
+# reason is a guess that reads like a fact.
+#
+# The names are not chosen here: scripts/cst-regmap.py reads them out of the
+# target's own registration sites and REFUSES to generate if this file is
+# short a name or carries one the target never registers.
+f0/ft0	REG_FPR0	riscv_fpr_regnames[] index
+f1/ft1	REG_FPR1	riscv_fpr_regnames[] index
+f10/fa0	REG_FPR10	riscv_fpr_regnames[] index
+f11/fa1	REG_FPR11	riscv_fpr_regnames[] index
+f12/fa2	REG_FPR12	riscv_fpr_regnames[] index
+f13/fa3	REG_FPR13	riscv_fpr_regnames[] index
+f14/fa4	REG_FPR14	riscv_fpr_regnames[] index
+f15/fa5	REG_FPR15	riscv_fpr_regnames[] index
+f16/fa6	REG_FPR16	riscv_fpr_regnames[] index
+f17/fa7	REG_FPR17	riscv_fpr_regnames[] index
+f18/fs2	REG_FPR18	riscv_fpr_regnames[] index
+f19/fs3	REG_FPR19	riscv_fpr_regnames[] index
+f2/ft2	REG_FPR2	riscv_fpr_regnames[] index
+f20/fs4	REG_FPR20	riscv_fpr_regnames[] index
+f21/fs5	REG_FPR21	riscv_fpr_regnames[] index
+f22/fs6	REG_FPR22	riscv_fpr_regnames[] index
+f23/fs7	REG_FPR23	riscv_fpr_regnames[] index
+f24/fs8	REG_FPR24	riscv_fpr_regnames[] index
+f25/fs9	REG_FPR25	riscv_fpr_regnames[] index
+f26/fs10	REG_FPR26	riscv_fpr_regnames[] index
+f27/fs11	REG_FPR27	riscv_fpr_regnames[] index
+f28/ft8	REG_FPR28	riscv_fpr_regnames[] index
+f29/ft9	REG_FPR29	riscv_fpr_regnames[] index
+f3/ft3	REG_FPR3	riscv_fpr_regnames[] index
+f30/ft10	REG_FPR30	riscv_fpr_regnames[] index
+f31/ft11	REG_FPR31	riscv_fpr_regnames[] index
+f4/ft4	REG_FPR4	riscv_fpr_regnames[] index
+f5/ft5	REG_FPR5	riscv_fpr_regnames[] index
+f6/ft6	REG_FPR6	riscv_fpr_regnames[] index
+f7/ft7	REG_FPR7	riscv_fpr_regnames[] index
+f8/fs0	REG_FPR8	riscv_fpr_regnames[] index
+f9/fs1	REG_FPR9	riscv_fpr_regnames[] index
+load_res	REG_NONE	R7.7: reservation state is not a register
+load_val	REG_NONE	R7.7: reservation state is not a register
+pc	REG_IP	arch-role: the program counter
+v0	REG_VEC0	vector file index
+v1	REG_VEC1	vector file index
+v10	REG_VEC10	vector file index
+v11	REG_VEC11	vector file index
+v12	REG_VEC12	vector file index
+v13	REG_VEC13	vector file index
+v14	REG_VEC14	vector file index
+v15	REG_VEC15	vector file index
+v16	REG_VEC16	vector file index
+v17	REG_VEC17	vector file index
+v18	REG_VEC18	vector file index
+v19	REG_VEC19	vector file index
+v2	REG_VEC2	vector file index
+v20	REG_VEC20	vector file index
+v21	REG_VEC21	vector file index
+v22	REG_VEC22	vector file index
+v23	REG_VEC23	vector file index
+v24	REG_VEC24	vector file index
+v25	REG_VEC25	vector file index
+v26	REG_VEC26	vector file index
+v27	REG_VEC27	vector file index
+v28	REG_VEC28	vector file index
+v29	REG_VEC29	vector file index
+v3	REG_VEC3	vector file index
+v30	REG_VEC30	vector file index
+v31	REG_VEC31	vector file index
+v4	REG_VEC4	vector file index
+v5	REG_VEC5	vector file index
+v6	REG_VEC6	vector file index
+v7	REG_VEC7	vector file index
+v8	REG_VEC8	vector file index
+v9	REG_VEC9	vector file index
+vl	REG_VCTRL	vector length, per the incumbent row
+vstart	REG_VCTRL	vector start, per the incumbent row
+x0/zero	REG_ZERO	x0 is the architectural zero register
+x0h/zeroh	REG_ZERO	x0 is the architectural zero register
+x1/ra	REG_LR	arch-role: x1 is the return address
+x10/a0	REG_GPR10	riscv_int_regnames[] index is the register number
+x10h/a0h	REG_GPR10	rv128 high half; the composed register is the same one
+x11/a1	REG_GPR11	riscv_int_regnames[] index is the register number
+x11h/a1h	REG_GPR11	rv128 high half; the composed register is the same one
+x12/a2	REG_GPR12	riscv_int_regnames[] index is the register number
+x12h/a2h	REG_GPR12	rv128 high half; the composed register is the same one
+x13/a3	REG_GPR13	riscv_int_regnames[] index is the register number
+x13h/a3h	REG_GPR13	rv128 high half; the composed register is the same one
+x14/a4	REG_GPR14	riscv_int_regnames[] index is the register number
+x14h/a4h	REG_GPR14	rv128 high half; the composed register is the same one
+x15/a5	REG_GPR15	riscv_int_regnames[] index is the register number
+x15h/a5h	REG_GPR15	rv128 high half; the composed register is the same one
+x16/a6	REG_GPR16	riscv_int_regnames[] index is the register number
+x16h/a6h	REG_GPR16	rv128 high half; the composed register is the same one
+x17/a7	REG_GPR17	riscv_int_regnames[] index is the register number
+x17h/a7h	REG_GPR17	rv128 high half; the composed register is the same one
+x18/s2	REG_GPR18	riscv_int_regnames[] index is the register number
+x18h/s2h	REG_GPR18	rv128 high half; the composed register is the same one
+x19/s3	REG_GPR19	riscv_int_regnames[] index is the register number
+x19h/s3h	REG_GPR19	rv128 high half; the composed register is the same one
+x1h/rah	REG_LR	arch-role: x1 is the return address
+x2/sp	REG_SP	arch-role: x2 is the stack pointer
+x20/s4	REG_GPR20	riscv_int_regnames[] index is the register number
+x20h/s4h	REG_GPR20	rv128 high half; the composed register is the same one
+x21/s5	REG_GPR21	riscv_int_regnames[] index is the register number
+x21h/s5h	REG_GPR21	rv128 high half; the composed register is the same one
+x22/s6	REG_GPR22	riscv_int_regnames[] index is the register number
+x22h/s6h	REG_GPR22	rv128 high half; the composed register is the same one
+x23/s7	REG_GPR23	riscv_int_regnames[] index is the register number
+x23h/s7h	REG_GPR23	rv128 high half; the composed register is the same one
+x24/s8	REG_GPR24	riscv_int_regnames[] index is the register number
+x24h/s8h	REG_GPR24	rv128 high half; the composed register is the same one
+x25/s9	REG_GPR25	riscv_int_regnames[] index is the register number
+x25h/s9h	REG_GPR25	rv128 high half; the composed register is the same one
+x26/s10	REG_GPR26	riscv_int_regnames[] index is the register number
+x26h/s10h	REG_GPR26	rv128 high half; the composed register is the same one
+x27/s11	REG_GPR27	riscv_int_regnames[] index is the register number
+x27h/s11h	REG_GPR27	rv128 high half; the composed register is the same one
+x28/t3	REG_GPR28	riscv_int_regnames[] index is the register number
+x28h/t3h	REG_GPR28	rv128 high half; the composed register is the same one
+x29/t4	REG_GPR29	riscv_int_regnames[] index is the register number
+x29h/t4h	REG_GPR29	rv128 high half; the composed register is the same one
+x2h/sph	REG_SP	arch-role: x2 is the stack pointer
+x3/gp	REG_GPR3	riscv_int_regnames[] index is the register number
+x30/t5	REG_GPR30	riscv_int_regnames[] index is the register number
+x30h/t5h	REG_GPR30	rv128 high half; the composed register is the same one
+x31/t6	REG_GPR31	riscv_int_regnames[] index is the register number
+x31h/t6h	REG_GPR31	rv128 high half; the composed register is the same one
+x3h/gph	REG_GPR3	rv128 high half; the composed register is the same one
+x4/tp	REG_GPR4	riscv_int_regnames[] index is the register number
+x4h/tph	REG_GPR4	rv128 high half; the composed register is the same one
+x5/t0	REG_GPR5	riscv_int_regnames[] index is the register number
+x5h/t0h	REG_GPR5	rv128 high half; the composed register is the same one
+x6/t1	REG_GPR6	riscv_int_regnames[] index is the register number
+x6h/t1h	REG_GPR6	rv128 high half; the composed register is the same one
+x7/t2	REG_GPR7	riscv_int_regnames[] index is the register number
+x7h/t2h	REG_GPR7	rv128 high half; the composed register is the same one
+x8/s0	REG_FP_REG	arch-role: x8 is the frame pointer
+x8h/s0h	REG_FP_REG	arch-role: x8 is the frame pointer
+x9/s1	REG_GPR9	riscv_int_regnames[] index is the register number
+x9h/s1h	REG_GPR9	rv128 high half; the composed register is the same one

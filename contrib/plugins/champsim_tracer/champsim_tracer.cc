@@ -46,6 +46,7 @@
 #include "champsim_tracer_stats_report.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_vocabulary.h"
+#include "champsim_tracer_regmap.h"
 #include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer_writer.h"
 
@@ -11857,6 +11858,30 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "champsim_tracer: the QEMU vocabulary table has %u defect%s "
                 "(%u words); it is bisected and cannot be trusted unsorted\n",
                 bad, bad == 1 ? "" : "s", cst_vocabulary_size());
+        return -1;
+    }
+
+    /*
+     * The register map is bisected too, for the same reason and with the same
+     * consequence: a table edited out of order answers correctly for some
+     * names and confidently wrong for others, and a register the wire names
+     * wrongly is indistinguishable from a dependency the guest really had.
+     *
+     * Only the table's own invariants are checked here.  The map against the
+     * EMULATOR's live namespace cannot be checked at install: the globals are
+     * registered when a target's translate_init runs, and reading
+     * qemu_plugin_dataflow_nregs() before that would count an empty namespace
+     * and report a perfect zero -- the vacuous green this tree keeps
+     * relearning.  That check belongs at the first translation, where the
+     * namespace is complete; today the comparison capture performs it
+     * per-instruction and counts what the map could not read.
+     */
+    if (unsigned bad = cst_regmap_selfcheck()) {
+        fprintf(stderr,
+                "champsim_tracer: the QEMU register map has %u defect%s "
+                "(%u names for this ISA); it is bisected and cannot be "
+                "trusted unsorted\n",
+                bad, bad == 1 ? "" : "s", cst_regmap_size(trace_isa));
         return -1;
     }
 

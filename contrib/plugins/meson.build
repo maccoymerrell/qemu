@@ -51,8 +51,47 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
       'champsim_tracer/champsim_tracer_vocabulary.cc',
+      'champsim_tracer/champsim_tracer_regmap.cc',
       'champsim_tracer/champsim_tracer_capture.cc',
     )
+
+  # The register map: one generated table per ISA, joining the names QEMU
+  # registers its registers under to the generic ids the wire publishes.
+  #
+  # Generated rather than written because the name universe belongs to the
+  # TARGET -- it is whatever strings reach tcg_global_mem_new() and
+  # insn_dataflow_declare_regfile() -- and the generator reads that universe
+  # out of the target's own sources and refuses in BOTH directions: a
+  # registered name with no adjudicated row, or a row naming nothing the
+  # target registers, fails generation and therefore the build.  The
+  # depend_files list is what makes that refusal timely: a target that adds a
+  # register re-runs the join instead of shipping a map that is one register
+  # short.
+  champsim_tracer_regmap_gen = []
+  foreach r : [['x86_64',  ['target/i386/tcg/translate.c']],
+               ['aarch64', ['target/arm/tcg/translate.c',
+                            'target/arm/tcg/translate-a64.c']],
+               ['riscv64', ['target/riscv/translate.c',
+                            'target/riscv/cpu.c']],
+               ['mipsel',  ['target/mips/tcg/translate.c',
+                            'target/mips/tcg/msa_translate.c',
+                            'target/mips/tcg/mxu_translate.c',
+                            'target/mips/cpu.c',
+                            'target/mips/fpu.c']]]
+    champsim_tracer_regmap_deps = []
+    foreach f : r[1]
+      champsim_tracer_regmap_deps += files(meson.project_source_root() / f)
+    endforeach
+    champsim_tracer_regmap_gen += custom_target(
+      'champsim_tracer_regmap_' + r[0] + '.h',
+      output: 'champsim_tracer_regmap_' + r[0] + '.h',
+      input: files('champsim_tracer/regmap/' + r[0] + '.tsv'),
+      depend_files: champsim_tracer_regmap_deps,
+      command: [python, files(meson.project_source_root() /
+                              'scripts/cst-regmap.py'),
+                '--root', meson.project_source_root(),
+                '--isa', r[0], '--tsv', '@INPUT@', '-o', '@OUTPUT@'])
+  endforeach
   champsim_tracer_cpp_args_base = ['-std=gnu++17',
                                    '-Wno-missing-field-initializers',
                                    '-Wno-pedantic']
@@ -66,16 +105,19 @@ if get_option('plugins')
   endif
   if host_os == 'windows'
     champsim_tracer_so = shared_module('champsim_tracer',
-                       champsim_tracer_sources + files('win32_linker.c'),
-                       include_directories: ['../../include/qemu', '../../include'],
+                       champsim_tracer_sources + champsim_tracer_regmap_gen +
+                       files('win32_linker.c'),
+                       include_directories: ['../../include/qemu', '../../include',
+                                             '.'],
                        cpp_args: champsim_tracer_cpp_args,
                        link_depends: [win32_qemu_plugin_api_lib],
                        link_args: win32_qemu_plugin_api_link_flags,
                        dependencies: [glib, capstone])
   else
     champsim_tracer_so = shared_module('champsim_tracer',
-                       champsim_tracer_sources,
-                       include_directories: ['../../include/qemu', '../../include'],
+                       champsim_tracer_sources + champsim_tracer_regmap_gen,
+                       include_directories: ['../../include/qemu', '../../include',
+                                             '.'],
                        cpp_args: champsim_tracer_cpp_args,
                        dependencies: [glib, capstone])
   endif

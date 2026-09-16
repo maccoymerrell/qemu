@@ -1,0 +1,113 @@
+# The QEMU register NAME -> generic wire register map for aarch64.
+#
+# name<TAB>generic<TAB>ground.  Columns are tab-separated; a row's GROUND
+# says what decided it, because a register identity chosen without a stated
+# reason is a guess that reads like a fact.
+#
+# The names are not chosen here: scripts/cst-regmap.py reads them out of the
+# target's own registration sites and REFUSES to generate if this file is
+# short a name or carries one the target never registers.
+CF	REG_FLAGS	arch-name: a condition flag
+NF	REG_FLAGS	arch-name: a condition flag
+VF	REG_FLAGS	arch-name: a condition flag
+ZF	REG_FLAGS	arch-name: a condition flag
+exclusive_addr	REG_NONE	R7.7: reservation state is not a register
+exclusive_high	REG_NONE	R7.7: reservation state is not a register
+exclusive_val	REG_NONE	R7.7: reservation state is not a register
+ffr	REG_VCTRL	SVE first-fault register, per the incumbent row
+lr	REG_LR	regnames[30]: AArch64 spells X30 by its role
+p0	REG_PRED0	SVE predicate file index
+p1	REG_PRED1	SVE predicate file index
+p10	REG_PRED10	SVE predicate file index
+p11	REG_PRED11	SVE predicate file index
+p12	REG_PRED12	SVE predicate file index
+p13	REG_PRED13	SVE predicate file index
+p14	REG_PRED14	SVE predicate file index
+p15	REG_PRED15	SVE predicate file index
+p2	REG_PRED2	SVE predicate file index
+p3	REG_PRED3	SVE predicate file index
+p4	REG_PRED4	SVE predicate file index
+p5	REG_PRED5	SVE predicate file index
+p6	REG_PRED6	SVE predicate file index
+p7	REG_PRED7	SVE predicate file index
+p8	REG_PRED8	SVE predicate file index
+p9	REG_PRED9	SVE predicate file index
+pc	REG_IP	arch-role: the program counter
+r0	REG_GPR0	AArch32 R<n> aliases X<n>
+r1	REG_GPR1	AArch32 R<n> aliases X<n>
+r10	REG_GPR10	AArch32 R<n> aliases X<n>
+r11	REG_GPR11	AArch32 R<n> aliases X<n>
+r12	REG_GPR12	AArch32 R<n> aliases X<n>
+r13	REG_SP	AArch32 role: R13 is SP
+r14	REG_LR	AArch32 role: R14 is LR
+r2	REG_GPR2	AArch32 R<n> aliases X<n>
+r3	REG_GPR3	AArch32 R<n> aliases X<n>
+r4	REG_GPR4	AArch32 R<n> aliases X<n>
+r5	REG_GPR5	AArch32 R<n> aliases X<n>
+r6	REG_GPR6	AArch32 R<n> aliases X<n>
+r7	REG_GPR7	AArch32 R<n> aliases X<n>
+r8	REG_GPR8	AArch32 R<n> aliases X<n>
+r9	REG_GPR9	AArch32 R<n> aliases X<n>
+sp	REG_SP	regnames[31]: AArch64 spells X31/SP by its role
+x0	REG_GPR0	regnames[] index is the architectural number
+x1	REG_GPR1	regnames[] index is the architectural number
+x10	REG_GPR10	regnames[] index is the architectural number
+x11	REG_GPR11	regnames[] index is the architectural number
+x12	REG_GPR12	regnames[] index is the architectural number
+x13	REG_GPR13	regnames[] index is the architectural number
+x14	REG_GPR14	regnames[] index is the architectural number
+x15	REG_GPR15	regnames[] index is the architectural number
+x16	REG_GPR16	regnames[] index is the architectural number
+x17	REG_GPR17	regnames[] index is the architectural number
+x18	REG_GPR18	regnames[] index is the architectural number
+x19	REG_GPR19	regnames[] index is the architectural number
+x2	REG_GPR2	regnames[] index is the architectural number
+x20	REG_GPR20	regnames[] index is the architectural number
+x21	REG_GPR21	regnames[] index is the architectural number
+x22	REG_GPR22	regnames[] index is the architectural number
+x23	REG_GPR23	regnames[] index is the architectural number
+x24	REG_GPR24	regnames[] index is the architectural number
+x25	REG_GPR25	regnames[] index is the architectural number
+x26	REG_GPR26	regnames[] index is the architectural number
+x27	REG_GPR27	regnames[] index is the architectural number
+x28	REG_GPR28	regnames[] index is the architectural number
+x29	REG_FP_REG	arch-role: the frame pointer
+x3	REG_GPR3	regnames[] index is the architectural number
+x4	REG_GPR4	regnames[] index is the architectural number
+x5	REG_GPR5	regnames[] index is the architectural number
+x6	REG_GPR6	regnames[] index is the architectural number
+x7	REG_GPR7	regnames[] index is the architectural number
+x8	REG_GPR8	regnames[] index is the architectural number
+x9	REG_GPR9	regnames[] index is the architectural number
+z0	REG_VEC0	SVE/AdvSIMD file index
+z1	REG_VEC1	SVE/AdvSIMD file index
+z10	REG_VEC10	SVE/AdvSIMD file index
+z11	REG_VEC11	SVE/AdvSIMD file index
+z12	REG_VEC12	SVE/AdvSIMD file index
+z13	REG_VEC13	SVE/AdvSIMD file index
+z14	REG_VEC14	SVE/AdvSIMD file index
+z15	REG_VEC15	SVE/AdvSIMD file index
+z16	REG_VEC16	SVE/AdvSIMD file index
+z17	REG_VEC17	SVE/AdvSIMD file index
+z18	REG_VEC18	SVE/AdvSIMD file index
+z19	REG_VEC19	SVE/AdvSIMD file index
+z2	REG_VEC2	SVE/AdvSIMD file index
+z20	REG_VEC20	SVE/AdvSIMD file index
+z21	REG_VEC21	SVE/AdvSIMD file index
+z22	REG_VEC22	SVE/AdvSIMD file index
+z23	REG_VEC23	SVE/AdvSIMD file index
+z24	REG_VEC24	SVE/AdvSIMD file index
+z25	REG_VEC25	SVE/AdvSIMD file index
+z26	REG_VEC26	SVE/AdvSIMD file index
+z27	REG_VEC27	SVE/AdvSIMD file index
+z28	REG_VEC28	SVE/AdvSIMD file index
+z29	REG_VEC29	SVE/AdvSIMD file index
+z3	REG_VEC3	SVE/AdvSIMD file index
+z30	REG_VEC30	SVE/AdvSIMD file index
+z31	REG_VEC31	SVE/AdvSIMD file index
+z4	REG_VEC4	SVE/AdvSIMD file index
+z5	REG_VEC5	SVE/AdvSIMD file index
+z6	REG_VEC6	SVE/AdvSIMD file index
+z7	REG_VEC7	SVE/AdvSIMD file index
+z8	REG_VEC8	SVE/AdvSIMD file index
+z9	REG_VEC9	SVE/AdvSIMD file index

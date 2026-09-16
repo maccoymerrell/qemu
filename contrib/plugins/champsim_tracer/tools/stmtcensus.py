@@ -31,7 +31,7 @@ import sys
 
 COLUMNS = ('isa', 'encoding', 'atomic', 'imm', 'vece', 'oprsz',
            'vkind', 'vlane', 'memops', 'fieldregs', 'zero', 'pcread', 'ea',
-           'selfloop', 'nrd', 'nwr')
+           'selfloop', 'nrd', 'nwr', 'regs')
 
 
 def load(paths):
@@ -117,6 +117,9 @@ def census(rows):
         'pc_absent': 0,
         'reg_reads': 0,
         'reg_writes': 0,
+        'reg_named': 0,
+        'reg_mapped': 0,
+        'reg_unmapped_enc': 0,
         'set_refused': 0,
         'conflict': 0,
     }
@@ -175,6 +178,20 @@ def census(rows):
         else:
             c['reg_reads'] += int(row['nrd'])
             c['reg_writes'] += int(row['nwr'])
+        # NAMED is how many of this encoding's register bits resolved to a
+        # QEMU register name; MAPPED is how many of those the wire's register
+        # map translated.  They are counted apart because their difference is
+        # the only visible symptom of a plugin and an emulator built from
+        # different register namespaces, and an encoding with even one
+        # unmapped name is counted as a whole so the number is a population
+        # and not a sum a big instruction could dominate.
+        if row['regs'] != '-':
+            nm, _, mp = row['regs'].partition('/')
+            if nm.isdigit() and mp.isdigit():
+                c['reg_named'] += int(nm)
+                c['reg_mapped'] += int(mp)
+                if int(mp) < int(nm):
+                    c['reg_unmapped_enc'] += 1
         if 'r' in row['zero']:
             c['zero_read'] += 1
         if 'w' in row['zero']:
@@ -221,6 +238,9 @@ def report(tag, c, named, stamp, nfiles, show_names):
     print('   register READS       %d' % c['reg_reads'])
     print('   register WRITES      %d' % c['reg_writes'])
     print('   set REFUSED          %d' % c['set_refused'])
+    print('   reg names NAMED      %d' % c['reg_named'])
+    print('   reg names MAPPED     %d' % c['reg_mapped'])
+    print('   encodings w/ UNMAPPED %d' % c['reg_unmapped_enc'])
     print('   per-encoding conflict %d' % c['conflict'])
     if show_names:
         for nm, n in sorted(named.items(), key=lambda kv: -kv[1]):

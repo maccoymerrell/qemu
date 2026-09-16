@@ -1,0 +1,202 @@
+# The QEMU register NAME -> generic wire register map for mipsel.
+#
+# name<TAB>generic<TAB>ground.  Columns are tab-separated; a row's GROUND
+# says what decided it, because a register identity chosen without a stated
+# reason is a guess that reads like a fact.
+#
+# The names are not chosen here: scripts/cst-regmap.py reads them out of the
+# target's own registration sites and REFUSES to generate if this file is
+# short a name or carries one the target never registers.
+DSPControl	REG_FLAGS	DSP condition/carry/pos bits
+HI0	REG_ACC0	HI<n>/LO<n> are the two halves of accumulator <n>
+HI1	REG_ACC1	HI<n>/LO<n> are the two halves of accumulator <n>
+HI2	REG_ACC2	HI<n>/LO<n> are the two halves of accumulator <n>
+HI3	REG_ACC3	HI<n>/LO<n> are the two halves of accumulator <n>
+LO0	REG_ACC0	HI<n>/LO<n> are the two halves of accumulator <n>
+LO1	REG_ACC1	HI<n>/LO<n> are the two halves of accumulator <n>
+LO2	REG_ACC2	HI<n>/LO<n> are the two halves of accumulator <n>
+LO3	REG_ACC3	HI<n>/LO<n> are the two halves of accumulator <n>
+PC	REG_IP	arch-role: the program counter
+XCR	REG_VCTRL	MXU control register
+XR1	REG_VEC1	MXU register file index
+XR10	REG_VEC10	MXU register file index
+XR11	REG_VEC11	MXU register file index
+XR12	REG_VEC12	MXU register file index
+XR13	REG_VEC13	MXU register file index
+XR14	REG_VEC14	MXU register file index
+XR15	REG_VEC15	MXU register file index
+XR2	REG_VEC2	MXU register file index
+XR3	REG_VEC3	MXU register file index
+XR4	REG_VEC4	MXU register file index
+XR5	REG_VEC5	MXU register file index
+XR6	REG_VEC6	MXU register file index
+XR7	REG_VEC7	MXU register file index
+XR8	REG_VEC8	MXU register file index
+XR9	REG_VEC9	MXU register file index
+a0	REG_GPR4	regnames[] index is the architectural number
+a0[hi]	REG_GPR4	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+a1	REG_GPR5	regnames[] index is the architectural number
+a1[hi]	REG_GPR5	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+a2	REG_GPR6	regnames[] index is the architectural number
+a2[hi]	REG_GPR6	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+a3	REG_GPR7	regnames[] index is the architectural number
+a3[hi]	REG_GPR7	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+at	REG_GPR1	regnames[] index is the architectural number
+at[hi]	REG_GPR1	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+bcond	REG_NONE	lowering: QEMU carries the branch condition here
+btarget	REG_NONE	lowering: QEMU carries the delay-slot target
+f0	REG_FPR0	fregnames[] index
+f1	REG_FPR1	fregnames[] index
+f10	REG_FPR10	fregnames[] index
+f11	REG_FPR11	fregnames[] index
+f12	REG_FPR12	fregnames[] index
+f13	REG_FPR13	fregnames[] index
+f14	REG_FPR14	fregnames[] index
+f15	REG_FPR15	fregnames[] index
+f16	REG_FPR16	fregnames[] index
+f17	REG_FPR17	fregnames[] index
+f18	REG_FPR18	fregnames[] index
+f19	REG_FPR19	fregnames[] index
+f2	REG_FPR2	fregnames[] index
+f20	REG_FPR20	fregnames[] index
+f21	REG_FPR21	fregnames[] index
+f22	REG_FPR22	fregnames[] index
+f23	REG_FPR23	fregnames[] index
+f24	REG_FPR24	fregnames[] index
+f25	REG_FPR25	fregnames[] index
+f26	REG_FPR26	fregnames[] index
+f27	REG_FPR27	fregnames[] index
+f28	REG_FPR28	fregnames[] index
+f29	REG_FPR29	fregnames[] index
+f3	REG_FPR3	fregnames[] index
+f30	REG_FPR30	fregnames[] index
+f31	REG_FPR31	fregnames[] index
+f4	REG_FPR4	fregnames[] index
+f5	REG_FPR5	fregnames[] index
+f6	REG_FPR6	fregnames[] index
+f7	REG_FPR7	fregnames[] index
+f8	REG_FPR8	fregnames[] index
+f9	REG_FPR9	fregnames[] index
+fcr0	REG_FCSR	FP control/status file
+fcr31	REG_FCSR	FP control/status file
+gp	REG_GPR28	regnames[] index is the architectural number
+gp[hi]	REG_GPR28	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+hflags	REG_NONE	lowering: QEMU translation state, not guest state
+k0	REG_GPR26	regnames[] index is the architectural number
+k0[hi]	REG_GPR26	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+k1	REG_GPR27	regnames[] index is the architectural number
+k1[hi]	REG_GPR27	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+lladdr	REG_NONE	R7.7: reservation state is not a register
+llval	REG_NONE	R7.7: reservation state is not a register
+r0	REG_ZERO	r0 is the architectural zero register
+r0[hi]	REG_ZERO	r0 is the architectural zero register (MIPS64 upper half of the same register)
+ra	REG_LR	arch-role: $31 is the return address
+ra[hi]	REG_LR	arch-role: $31 is the return address (MIPS64 upper half of the same register)
+s0	REG_GPR16	regnames[] index is the architectural number
+s0[hi]	REG_GPR16	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s1	REG_GPR17	regnames[] index is the architectural number
+s1[hi]	REG_GPR17	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s2	REG_GPR18	regnames[] index is the architectural number
+s2[hi]	REG_GPR18	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s3	REG_GPR19	regnames[] index is the architectural number
+s3[hi]	REG_GPR19	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s4	REG_GPR20	regnames[] index is the architectural number
+s4[hi]	REG_GPR20	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s5	REG_GPR21	regnames[] index is the architectural number
+s5[hi]	REG_GPR21	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s6	REG_GPR22	regnames[] index is the architectural number
+s6[hi]	REG_GPR22	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s7	REG_GPR23	regnames[] index is the architectural number
+s7[hi]	REG_GPR23	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+s8	REG_FP_REG	arch-role: $30 is the frame pointer
+s8[hi]	REG_FP_REG	arch-role: $30 is the frame pointer (MIPS64 upper half of the same register)
+sp	REG_SP	arch-role: $29 is the stack pointer
+sp[hi]	REG_SP	arch-role: $29 is the stack pointer (MIPS64 upper half of the same register)
+t0	REG_GPR8	regnames[] index is the architectural number
+t0[hi]	REG_GPR8	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t1	REG_GPR9	regnames[] index is the architectural number
+t1[hi]	REG_GPR9	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t2	REG_GPR10	regnames[] index is the architectural number
+t2[hi]	REG_GPR10	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t3	REG_GPR11	regnames[] index is the architectural number
+t3[hi]	REG_GPR11	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t4	REG_GPR12	regnames[] index is the architectural number
+t4[hi]	REG_GPR12	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t5	REG_GPR13	regnames[] index is the architectural number
+t5[hi]	REG_GPR13	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t6	REG_GPR14	regnames[] index is the architectural number
+t6[hi]	REG_GPR14	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t7	REG_GPR15	regnames[] index is the architectural number
+t7[hi]	REG_GPR15	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t8	REG_GPR24	regnames[] index is the architectural number
+t8[hi]	REG_GPR24	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+t9	REG_GPR25	regnames[] index is the architectural number
+t9[hi]	REG_GPR25	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+v0	REG_GPR2	regnames[] index is the architectural number
+v0[hi]	REG_GPR2	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+v1	REG_GPR3	regnames[] index is the architectural number
+v1[hi]	REG_GPR3	regnames[] index is the architectural number (MIPS64 upper half of the same register)
+w0.d0	REG_VEC0	MSA vector register; both doublewords are one register
+w0.d1	REG_VEC0	MSA vector register; both doublewords are one register
+w1.d0	REG_VEC1	MSA vector register; both doublewords are one register
+w1.d1	REG_VEC1	MSA vector register; both doublewords are one register
+w10.d0	REG_VEC10	MSA vector register; both doublewords are one register
+w10.d1	REG_VEC10	MSA vector register; both doublewords are one register
+w11.d0	REG_VEC11	MSA vector register; both doublewords are one register
+w11.d1	REG_VEC11	MSA vector register; both doublewords are one register
+w12.d0	REG_VEC12	MSA vector register; both doublewords are one register
+w12.d1	REG_VEC12	MSA vector register; both doublewords are one register
+w13.d0	REG_VEC13	MSA vector register; both doublewords are one register
+w13.d1	REG_VEC13	MSA vector register; both doublewords are one register
+w14.d0	REG_VEC14	MSA vector register; both doublewords are one register
+w14.d1	REG_VEC14	MSA vector register; both doublewords are one register
+w15.d0	REG_VEC15	MSA vector register; both doublewords are one register
+w15.d1	REG_VEC15	MSA vector register; both doublewords are one register
+w16.d0	REG_VEC16	MSA vector register; both doublewords are one register
+w16.d1	REG_VEC16	MSA vector register; both doublewords are one register
+w17.d0	REG_VEC17	MSA vector register; both doublewords are one register
+w17.d1	REG_VEC17	MSA vector register; both doublewords are one register
+w18.d0	REG_VEC18	MSA vector register; both doublewords are one register
+w18.d1	REG_VEC18	MSA vector register; both doublewords are one register
+w19.d0	REG_VEC19	MSA vector register; both doublewords are one register
+w19.d1	REG_VEC19	MSA vector register; both doublewords are one register
+w2.d0	REG_VEC2	MSA vector register; both doublewords are one register
+w2.d1	REG_VEC2	MSA vector register; both doublewords are one register
+w20.d0	REG_VEC20	MSA vector register; both doublewords are one register
+w20.d1	REG_VEC20	MSA vector register; both doublewords are one register
+w21.d0	REG_VEC21	MSA vector register; both doublewords are one register
+w21.d1	REG_VEC21	MSA vector register; both doublewords are one register
+w22.d0	REG_VEC22	MSA vector register; both doublewords are one register
+w22.d1	REG_VEC22	MSA vector register; both doublewords are one register
+w23.d0	REG_VEC23	MSA vector register; both doublewords are one register
+w23.d1	REG_VEC23	MSA vector register; both doublewords are one register
+w24.d0	REG_VEC24	MSA vector register; both doublewords are one register
+w24.d1	REG_VEC24	MSA vector register; both doublewords are one register
+w25.d0	REG_VEC25	MSA vector register; both doublewords are one register
+w25.d1	REG_VEC25	MSA vector register; both doublewords are one register
+w26.d0	REG_VEC26	MSA vector register; both doublewords are one register
+w26.d1	REG_VEC26	MSA vector register; both doublewords are one register
+w27.d0	REG_VEC27	MSA vector register; both doublewords are one register
+w27.d1	REG_VEC27	MSA vector register; both doublewords are one register
+w28.d0	REG_VEC28	MSA vector register; both doublewords are one register
+w28.d1	REG_VEC28	MSA vector register; both doublewords are one register
+w29.d0	REG_VEC29	MSA vector register; both doublewords are one register
+w29.d1	REG_VEC29	MSA vector register; both doublewords are one register
+w3.d0	REG_VEC3	MSA vector register; both doublewords are one register
+w3.d1	REG_VEC3	MSA vector register; both doublewords are one register
+w30.d0	REG_VEC30	MSA vector register; both doublewords are one register
+w30.d1	REG_VEC30	MSA vector register; both doublewords are one register
+w31.d0	REG_VEC31	MSA vector register; both doublewords are one register
+w31.d1	REG_VEC31	MSA vector register; both doublewords are one register
+w4.d0	REG_VEC4	MSA vector register; both doublewords are one register
+w4.d1	REG_VEC4	MSA vector register; both doublewords are one register
+w5.d0	REG_VEC5	MSA vector register; both doublewords are one register
+w5.d1	REG_VEC5	MSA vector register; both doublewords are one register
+w6.d0	REG_VEC6	MSA vector register; both doublewords are one register
+w6.d1	REG_VEC6	MSA vector register; both doublewords are one register
+w7.d0	REG_VEC7	MSA vector register; both doublewords are one register
+w7.d1	REG_VEC7	MSA vector register; both doublewords are one register
+w8.d0	REG_VEC8	MSA vector register; both doublewords are one register
+w8.d1	REG_VEC8	MSA vector register; both doublewords are one register
+w9.d0	REG_VEC9	MSA vector register; both doublewords are one register
+w9.d1	REG_VEC9	MSA vector register; both doublewords are one register

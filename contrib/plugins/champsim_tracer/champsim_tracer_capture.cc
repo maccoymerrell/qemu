@@ -30,6 +30,7 @@ extern "C" {
 #include "champsim_tracer_mnemonics.h"
 #include "champsim_tracer_generic_ids.h"
 #include "champsim_tracer_vocabulary.h"
+#include "champsim_tracer_regmap.h"
 
 namespace {
 
@@ -204,6 +205,7 @@ Corpus *corpus_mech;     /* why the classifier said what it said */
 Corpus *corpus_vec;      /* how a helper's env pointers were recorded */
 Corpus *corpus_ident;    /* the decode rule QEMU reached, beside the mnemonic */
 Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
+Corpus *corpus_reg;      /* every register name QEMU used, and what it maps to */
 
 void corpora_init()
 {
@@ -226,7 +228,11 @@ void corpora_init()
         corpus_stmt = new Corpus(
             "CST_DF_STMT_DUMP",
             "#isa\tencoding\tatomic\timm\tvece\toprsz\tvkind\tvlane"
-            "\tmemops\tfieldregs\tzero\tpcread\tea\tselfloop\tnrd\tnwr\n");
+            "\tmemops\tfieldregs\tzero\tpcread\tea\tselfloop\tnrd\tnwr"
+            "\tregs\n");
+        corpus_reg = new Corpus(
+            "CST_REGMAP_DUMP",
+            "#isa\tencoding\tdir\tname\tgeneric\n");
     }
 }
 
@@ -339,6 +345,162 @@ unsigned zero_atom_bit()
         }
     }
     return bit;
+}
+
+/*
+ * Which register map to consult, from the name the run stamped its corpora
+ * with.
+ *
+ * The capture has no other handle on the guest architecture: it is reached
+ * from classification and from translation, neither of which is told.  An ISA
+ * this build does not know answers TRACE_ISA_UNKNOWN, whose table is empty,
+ * so every name reads UNMAPPED -- loudly wrong rather than quietly answered
+ * out of some other target's spelling, which is the one failure that would
+ * look like data.
+ */
+unsigned capture_isa_id()
+{
+    static unsigned id = UINT_MAX;
+
+    if (id == UINT_MAX) {
+        const char *n = isa_name();
+
+        if (!strcmp(n, "x86_64") || !strcmp(n, "i386")) {
+            id = TRACE_ISA_X86;
+        } else if (!strcmp(n, "aarch64")) {
+            id = TRACE_ISA_AARCH64;
+        } else if (!strcmp(n, "riscv64") || !strcmp(n, "riscv32")) {
+            id = TRACE_ISA_RISCV;
+        } else if (!strcmp(n, "mipsel") || !strcmp(n, "mips")) {
+            id = TRACE_ISA_MIPS;
+        } else {
+            id = TRACE_ISA_UNKNOWN;
+        }
+    }
+    return id;
+}
+
+/*
+ * The name QEMU gave provenance bit @bit, or NULL when the bit stands for
+ * something that is not storage.
+ *
+ * Three namespaces share the one index: a bit below nregs is a TCG global and
+ * carries the name the target registered it under; a bit at or above is an
+ * env byte range, which resolves to a declared register-file entry's name
+ * when the target declared its layout and to nothing when it did not; and
+ * three bits are atoms.  A range with no declared name is NOT a gap in the
+ * map -- there is no name for the map to carry a row for -- so it answers
+ * NULL and @unnamed says so, keeping it apart from a name the map failed on.
+ */
+const char *prov_bit_name(unsigned bit, bool *is_atom)
+{
+    uint32_t atom = 0, off = 0, size = 0;
+
+    if (is_atom) {
+        *is_atom = false;
+    }
+    if (qemu_plugin_dataflow_prov_atom(bit, &atom)) {
+        if (is_atom) {
+            *is_atom = true;
+        }
+        return nullptr;
+    }
+    if (bit < qemu_plugin_dataflow_nregs()) {
+        return qemu_plugin_dataflow_reg_name(bit, nullptr, nullptr);
+    }
+    if (qemu_plugin_dataflow_prov_field(bit, &off, &size)) {
+        return qemu_plugin_dataflow_field_reg(off, size);
+    }
+    return nullptr;
+}
+
+/*
+ * Score one register set against the map, and write a row for every distinct
+ * (direction, name) the run has not written yet.
+ *
+ * Deduplicated by name rather than per encoding: the map is keyed on the
+ * name, so a per-encoding row would repeat one fact a hundred thousand times
+ * and answer no question the name row does not.  The encoding is kept as the
+ * WITNESS on the first row that showed the name, which is what makes an
+ * UNMAPPED row actionable instead of merely alarming.
+ */
+struct SeenReg {
+    char name[64];
+    char dir;
+};
+
+SeenReg *seen_regs;
+unsigned n_seen_regs, cap_seen_regs;
+
+void score_reg_name(const char *isa, const char *enc, char dir,
+                    const char *name, unsigned *n_named, unsigned *n_mapped)
+{
+    unsigned isa_id = capture_isa_id();
+    FILE *o = corpus_reg->get();
+    uint8_t reg = REG_NONE;
+    bool ok = cst_regmap_lookup(isa_id, name, &reg);
+
+    (*n_named)++;
+    if (ok) {
+        (*n_mapped)++;
+    }
+    if (!o) {
+        return;
+    }
+    for (unsigned i = 0; i < n_seen_regs; i++) {
+        if (seen_regs[i].dir == dir && !strcmp(seen_regs[i].name, name)) {
+            return;
+        }
+    }
+    if (n_seen_regs == cap_seen_regs) {
+        unsigned grown = cap_seen_regs ? cap_seen_regs * 2 : 128;
+        SeenReg *p = (SeenReg *)realloc(seen_regs, grown * sizeof(*p));
+
+        if (!p) {
+            return;
+        }
+        seen_regs = p;
+        cap_seen_regs = grown;
+    }
+    snprintf(seen_regs[n_seen_regs].name,
+             sizeof(seen_regs[n_seen_regs].name), "%s", name);
+    seen_regs[n_seen_regs].dir = dir;
+    n_seen_regs++;
+
+    const char *gn = ok ? generic_reg_name(reg) : nullptr;
+    char buf[32];
+
+    if (!ok) {
+        snprintf(buf, sizeof(buf), "UNMAPPED");
+    } else if (gn) {
+        snprintf(buf, sizeof(buf), "%s", gn);
+    } else {
+        snprintf(buf, sizeof(buf), "REG_%u", (unsigned)reg);
+    }
+    fprintf(o, "%s\t%s\t%c\t%s\t%s\n", isa, enc, dir, name, buf);
+}
+
+void score_reg_set(const char *isa, const char *enc, char dir,
+                   const uint64_t *set, unsigned nwords,
+                   unsigned *n_named, unsigned *n_mapped)
+{
+    for (unsigned w = 0; w < nwords; w++) {
+        uint64_t word = set[w];
+
+        while (word) {
+            unsigned b = (unsigned)__builtin_ctzll(word);
+
+            word &= word - 1;
+
+            bool is_atom = false;
+            const char *name = prov_bit_name(w * 64 + b, &is_atom);
+
+            if (is_atom || !name) {
+                continue;
+            }
+            score_reg_name(isa, enc, dir, name, n_named, n_mapped);
+        }
+    }
 }
 
 } /* namespace */
@@ -557,12 +719,24 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
     nf = qemu_plugin_insn_fields(tb, idx, frows, 16);
 
     fields[0] = '\0';
+    unsigned n_named = 0, n_map = 0;
     for (unsigned i = 0; i < nf; i++) {
         const char *nm =
             qemu_plugin_dataflow_field_reg(frows[i].env_offset, frows[i].size);
         int w = snprintf(fields + fk, sizeof(fields) - fk, "%s%s",
                          fk ? "," : "", nm ? nm : "?");
 
+        /*
+         * The DECLARED register files reach a consumer only here.  A vector,
+         * an x87 slot and an AVX-512 mask are env byte ranges, not TCG
+         * globals, so their names never appear in the read and write
+         * bitmaps -- and a map scored on those bitmaps alone would report a
+         * clean zero while never having looked at the half of the namespace
+         * the declarations exist for.
+         */
+        if (nm) {
+            score_reg_name(isa_name(), enc, 'f', nm, &n_named, &n_map);
+        }
         if (w < 0 || (size_t)w >= sizeof(fields) - fk) {
             break;
         }
@@ -757,20 +931,41 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
      * the scorer REFUSES a file containing one, which is the right answer and
      * is also why it had to be fixed rather than tolerated.
      */
+    /*
+     * THE REGISTER NAMES QEMU USED, AND HOW MANY THE MAP COULD READ.
+     *
+     * `named/mapped` over both sets.  NAMED counts the bits that resolved to
+     * a register NAME -- a TCG global, or an env range inside a declared
+     * register file -- and MAPPED counts the ones the wire's register map
+     * translated.  The two differ exactly when this plugin and this emulator
+     * were built from different register namespaces, which is the condition
+     * a consumer must never see answered with a plausible id.
+     *
+     * An env range with no declared name is in NEITHER count: there is no
+     * name, so there is nothing the map owes a row for, and counting it would
+     * make the column report a gap no table can close.  The `fieldregs`
+     * column beside it is what measures that population.
+     */
     char sets[32];
+    char regs[24];
 
     if (have_sets) {
         snprintf(sets, sizeof(sets), "%u\t%u", n_rd, n_wr);
+        score_reg_set(isa_name(), enc, 'r', rd, 8, &n_named, &n_map);
+        score_reg_set(isa_name(), enc, 'w', wr, 8, &n_named, &n_map);
+        snprintf(regs, sizeof(regs), "%u/%u", n_named, n_map);
     } else {
         snprintf(sets, sizeof(sets), "-\t-");
+        snprintf(regs, sizeof(regs), "-");
     }
-    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t%s\t%s\n",
+    fprintf(o,
+            "%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%u\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
             isa_name(),
             enc, (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
             k ? imm : "-", vece, st.vec_oprsz, vkind, vlane, st.n_memops,
             fk ? fields : "-", zero[0] ? zero : "-",
             pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
-            ek ? ea : "-", selfloop, sets);
+            ek ? ea : "-", selfloop, sets, regs);
 }
 
 #endif /* CST_CAPTURE */

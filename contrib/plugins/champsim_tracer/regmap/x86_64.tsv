@@ -1,0 +1,103 @@
+# The QEMU register NAME -> generic wire register map for x86_64.
+#
+# name<TAB>generic<TAB>ground.  Columns are tab-separated; a row's GROUND
+# says what decided it, because a register identity chosen without a stated
+# reason is a guess that reads like a fact.
+#
+# The names are not chosen here: scripts/cst-regmap.py reads them out of the
+# target's own registration sites and REFUSES to generate if this file is
+# short a name or carries one the target never registers.
+bnd0_lb	REG_BOUND0	MPX bound register; both halves are one register
+bnd0_ub	REG_BOUND0	MPX bound register; both halves are one register
+bnd1_lb	REG_BOUND1	MPX bound register; both halves are one register
+bnd1_ub	REG_BOUND1	MPX bound register; both halves are one register
+bnd2_lb	REG_BOUND2	MPX bound register; both halves are one register
+bnd2_ub	REG_BOUND2	MPX bound register; both halves are one register
+bnd3_lb	REG_BOUND3	MPX bound register; both halves are one register
+bnd3_ub	REG_BOUND3	MPX bound register; both halves are one register
+cc_dst	REG_FLAGS	lazy-flags carrier
+cc_op	REG_FLAGS	lazy-flags carrier: the flags this insn computes
+cc_src	REG_FLAGS	lazy-flags carrier
+cc_src2	REG_FLAGS	lazy-flags carrier
+cs_base	REG_SEG0	segment base: the segment it belongs to
+df	REG_FLAGS	DF is a bit of EFLAGS; QEMU stores it apart
+ds_base	REG_SEG1	segment base: the segment it belongs to
+eax	REG_GPR0	dense-gpr: the 32-bit spelling of the same register
+ebp	REG_FP_REG	arch-role: the frame pointer
+ebx	REG_GPR3	dense-gpr: the 32-bit spelling of the same register
+ecx	REG_GPR1	dense-gpr: the 32-bit spelling of the same register
+edi	REG_GPR5	dense-gpr: the 32-bit spelling of the same register
+edx	REG_GPR2	dense-gpr: the 32-bit spelling of the same register
+eflags	REG_FLAGS	arch-name: the flags word
+eip	REG_IP	arch-role: the program counter
+es_base	REG_SEG2	segment base: the segment it belongs to
+esi	REG_GPR4	dense-gpr: the 32-bit spelling of the same register
+esp	REG_SP	arch-role: the stack pointer
+fs_base	REG_SEG3	segment base: the segment it belongs to
+gs_base	REG_SEG4	segment base: the segment it belongs to
+k0	REG_PRED0	AVX-512 mask register index
+k1	REG_PRED1	AVX-512 mask register index
+k2	REG_PRED2	AVX-512 mask register index
+k3	REG_PRED3	AVX-512 mask register index
+k4	REG_PRED4	AVX-512 mask register index
+k5	REG_PRED5	AVX-512 mask register index
+k6	REG_PRED6	AVX-512 mask register index
+k7	REG_PRED7	AVX-512 mask register index
+r10	REG_GPR8	dense-gpr: arch number less SP and BP
+r11	REG_GPR9	dense-gpr: arch number less SP and BP
+r12	REG_GPR10	dense-gpr: arch number less SP and BP
+r13	REG_GPR11	dense-gpr: arch number less SP and BP
+r14	REG_GPR12	dense-gpr: arch number less SP and BP
+r15	REG_GPR13	dense-gpr: arch number less SP and BP
+r8	REG_GPR6	dense-gpr: arch number less SP and BP
+r9	REG_GPR7	dense-gpr: arch number less SP and BP
+rax	REG_GPR0	dense-gpr: arch number less SP and BP
+rbp	REG_FP_REG	arch-role: the frame pointer
+rbx	REG_GPR3	dense-gpr: arch number less SP and BP
+rcx	REG_GPR1	dense-gpr: arch number less SP and BP
+rdi	REG_GPR5	dense-gpr: arch number less SP and BP
+rdx	REG_GPR2	dense-gpr: arch number less SP and BP
+rip	REG_IP	arch-role: the program counter
+rsi	REG_GPR4	dense-gpr: arch number less SP and BP
+rsp	REG_SP	arch-role: the stack pointer
+ss_base	REG_SEG5	segment base: the segment it belongs to
+st0	REG_FPR0	x87 stack slot index
+st1	REG_FPR1	x87 stack slot index
+st2	REG_FPR2	x87 stack slot index
+st3	REG_FPR3	x87 stack slot index
+st4	REG_FPR4	x87 stack slot index
+st5	REG_FPR5	x87 stack slot index
+st6	REG_FPR6	x87 stack slot index
+st7	REG_FPR7	x87 stack slot index
+xmm0	REG_VEC0	vector file index
+xmm1	REG_VEC1	vector file index
+xmm10	REG_VEC10	vector file index
+xmm11	REG_VEC11	vector file index
+xmm12	REG_VEC12	vector file index
+xmm13	REG_VEC13	vector file index
+xmm14	REG_VEC14	vector file index
+xmm15	REG_VEC15	vector file index
+xmm16	REG_VEC16	vector file index
+xmm17	REG_VEC17	vector file index
+xmm18	REG_VEC18	vector file index
+xmm19	REG_VEC19	vector file index
+xmm2	REG_VEC2	vector file index
+xmm20	REG_VEC20	vector file index
+xmm21	REG_VEC21	vector file index
+xmm22	REG_VEC22	vector file index
+xmm23	REG_VEC23	vector file index
+xmm24	REG_VEC24	vector file index
+xmm25	REG_VEC25	vector file index
+xmm26	REG_VEC26	vector file index
+xmm27	REG_VEC27	vector file index
+xmm28	REG_VEC28	vector file index
+xmm29	REG_VEC29	vector file index
+xmm3	REG_VEC3	vector file index
+xmm30	REG_VEC30	vector file index
+xmm31	REG_VEC31	vector file index
+xmm4	REG_VEC4	vector file index
+xmm5	REG_VEC5	vector file index
+xmm6	REG_VEC6	vector file index
+xmm7	REG_VEC7	vector file index
+xmm8	REG_VEC8	vector file index
+xmm9	REG_VEC9	vector file index

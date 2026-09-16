@@ -636,9 +636,30 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
      */
     if (tcg_ctx->gen_tb) {
         tb_unlock_pages(tcg_ctx->gen_tb);
-        tcg_ctx->gen_tb = NULL;
     }
 #endif
+    /*
+     * The pointer is cleared in BOTH modes, and only the page locks are the
+     * softmmu half.
+     *
+     * tb_gen_code sets tcg_ctx->gen_tb before generating and clears it on the
+     * way out; an unwind from inside skips that clear, so whichever landing
+     * pad catches the fault owns it.  Softmmu noticed because the TB's page
+     * locks leak with the pointer and the next translation touching that page
+     * spins forever, which is audible.  User mode has no page locks, so the
+     * clear was written into the softmmu arm and the user arm was left with a
+     * per-thread field still naming a translation that is no longer in
+     * flight -- for the rest of that thread's life.  Nothing read it that way
+     * until something asked "is a translation already running on this
+     * thread", and then it answered yes forever.
+     *
+     * It is also a pointer into the code cache, so a later tb_flush leaves it
+     * dangling; tb-maint.c's translator_access path writes THROUGH it
+     * (tb_set_page_addr1).  Only a translation reaches that write today, and
+     * a translation sets the pointer first -- but the two facts that make it
+     * harmless are not the same fact as the pointer being right.
+     */
+    tcg_ctx->gen_tb = NULL;
     if (bql_locked()) {
         bql_unlock();
     }
@@ -974,9 +995,12 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          */
         if (tcg_ctx->gen_tb) {
             tb_unlock_pages(tcg_ctx->gen_tb);
-            tcg_ctx->gen_tb = NULL;
         }
 #endif
+        /* Both modes: see cpu_exec_longjmp_cleanup.  The page locks are the
+         * softmmu half; the pointer belongs to whichever pad catches the
+         * unwind, and this pad catches the wrong path's. */
+        tcg_ctx->gen_tb = NULL;
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return false;

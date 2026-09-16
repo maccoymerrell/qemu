@@ -81,6 +81,20 @@ void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
 void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
                          const void *bytes, size_t nbytes);
 
+/*
+ * The decoder-only statements, per encoding: the facts no op stream carries
+ * and a decode site therefore has to say out loud.
+ *
+ * Atomicity, the encoded immediate's VALUE, the vector lane shape, the
+ * synthetic address of an instruction that names one and accesses nothing,
+ * and the env ranges that resolve to a register name.  Each is a column, so
+ * a scorer can read a zero as "this ISA states none" rather than as "the
+ * corpus does not carry the question", and an arm that masks one statement
+ * moves exactly its own column.
+ */
+void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
+                         const void *bytes, size_t nbytes);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -92,6 +106,9 @@ static inline void cst_capture_qemu_ident(const struct qemu_plugin_tb *, size_t,
                                           const void *, size_t, const char *)
 { }
 static inline void cst_capture_vec_env(const struct qemu_plugin_tb *, size_t,
+                                       const void *, size_t)
+{ }
+static inline void cst_capture_df_stmt(const struct qemu_plugin_tb *, size_t,
                                        const void *, size_t)
 { }
 

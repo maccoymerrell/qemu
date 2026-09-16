@@ -10667,6 +10667,9 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
             cst_capture_vec_env(tb, i,
                                 &insn_bytes[(size_t)out * MAX_INSN_BYTES],
                                 insn_sizes[out]);
+            cst_capture_df_stmt(tb, i,
+                                &insn_bytes[(size_t)out * MAX_INSN_BYTES],
+                                insn_sizes[out]);
         }
 
         /* Per-memop callback fires unconditionally; the cb body

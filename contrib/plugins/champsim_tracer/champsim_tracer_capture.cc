@@ -202,6 +202,7 @@ Corpus *corpus_opc;      /* the opcode and branch words, per encoding */
 Corpus *corpus_mech;     /* why the classifier said what it said */
 Corpus *corpus_vec;      /* how a helper's env pointers were recorded */
 Corpus *corpus_ident;    /* the decode rule QEMU reached, beside the mnemonic */
+Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
 
 void corpora_init()
 {
@@ -221,6 +222,9 @@ void corpora_init()
         corpus_ident = new Corpus(
             "CST_QEMU_IDENT_PAIRS",
             "#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n");
+        corpus_stmt = new Corpus(
+            "CST_DF_STMT_DUMP",
+            "#isa\tencoding\tatomic\timm\tvece\toprsz\tmemops\tfieldregs\n");
     }
 }
 
@@ -404,6 +408,103 @@ void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
     fprintf(o, "%s\t%s\t%u\t%u\t%u\t%u\n", isa_name(), enc,
             st.n_vec_operands, st.n_vec_dropped,
             st.n_env_ptr_bounded, st.n_env_ptr_unbounded);
+}
+
+void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
+                         const void *bytes, size_t nbytes)
+{
+    if (!tb || !bytes || !nbytes) {
+        return;
+    }
+    corpora_init();
+
+    FILE *o = corpus_stmt->get();
+
+    if (!o) {
+        return;
+    }
+
+    qemu_plugin_dataflow_status st = { };
+
+    st.struct_size = sizeof(st);
+    if (!qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
+        /*
+         * The emulator has no dataflow answer for this instruction at all.
+         * A row of zeros would read as "every statement absent", which is a
+         * different claim, so no row is written and the corpus stays a
+         * statement about instructions the reader reached.
+         */
+        return;
+    }
+
+    char enc[2 * 32 + 1];
+
+    hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /* The immediates, each with the role the decoder gave it. */
+    char imm[192];
+    size_t k = 0;
+
+    imm[0] = '\0';
+    for (unsigned i = 0; i < st.n_immediates; i++) {
+        uint64_t value = 0;
+        uint32_t role = 0;
+        int w;
+
+        if (!qemu_plugin_insn_immediate(tb, idx, i, &value, &role)) {
+            continue;
+        }
+        w = snprintf(imm + k, sizeof(imm) - k, "%s%s:0x%llx", k ? "," : "",
+                     role == QEMU_PLUGIN_DF_IMM_DISP ? "disp" : "imm",
+                     (unsigned long long)value);
+        if (w < 0 || (size_t)w >= sizeof(imm) - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+
+    /*
+     * The env ranges that resolve to a register NAME.  A range the target
+     * never declared answers "?", which is what a consumer would be handed,
+     * so the column separates "no env access" from "an env access nobody can
+     * name" rather than printing a bare count for both.
+     */
+    char fields[256];
+    size_t fk = 0;
+    qemu_plugin_dataflow_field frows[16];
+    unsigned nf;
+
+    for (unsigned i = 0; i < 16; i++) {
+        frows[i] = qemu_plugin_dataflow_field();
+        frows[i].struct_size = sizeof(frows[i]);
+    }
+    nf = qemu_plugin_insn_fields(tb, idx, frows, 16);
+
+    fields[0] = '\0';
+    for (unsigned i = 0; i < nf; i++) {
+        const char *nm =
+            qemu_plugin_dataflow_field_reg(frows[i].env_offset, frows[i].size);
+        int w = snprintf(fields + fk, sizeof(fields) - fk, "%s%s",
+                         fk ? "," : "", nm ? nm : "?");
+
+        if (w < 0 || (size_t)w >= sizeof(fields) - fk) {
+            break;
+        }
+        fk += (size_t)w;
+    }
+
+    char vece[8];
+
+    if (st.vec_vece == QEMU_PLUGIN_DF_VECE_NONE) {
+        snprintf(vece, sizeof(vece), "-");
+    } else {
+        snprintf(vece, sizeof(vece), "%u", st.vec_vece);
+    }
+
+    fprintf(o, "%s\t%s\t%u\t%s\t%s\t%u\t%u\t%s\n", isa_name(), enc,
+            (st.properties & QEMU_PLUGIN_DF_P_ATOMIC) ? 1u : 0u,
+            k ? imm : "-", vece, st.vec_oprsz, st.n_memops,
+            fk ? fields : "-");
 }
 
 #endif /* CST_CAPTURE */

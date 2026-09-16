@@ -4148,6 +4148,49 @@ static void gen_SYSCALL(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+#ifdef TARGET_X86_64
+#if !defined(CONFIG_USER_ONLY) || defined(CONFIG_LINUX_USER)
+    /*
+     * SYSCALL'S THREE DESTINATIONS, WHICH ONLY THE CALL SITE CAN NAME.
+     *
+     * Long-mode SYSCALL writes RCX <- the RIP after the instruction,
+     * R11 <- RFLAGS with RF cleared, and RFLAGS <- RFLAGS AND NOT(IA32_FMASK)
+     * (Intel SDM vol.2 "SYSCALL", AMD APM vol.3).  All three happen inside
+     * helper_syscall() -- target/i386/tcg/system/seg_helper.c under softmmu,
+     * target/i386/tcg/user/seg_helper.c for *-linux-user, whose comment
+     * carries the hardware measurement that put the first two there -- and
+     * the translation emits nothing but the call.  So QEMU's ordered write
+     * list for `syscall` names none of them, and a consumer handed that list
+     * is told the instruction destroys nothing.
+     *
+     * WHY THE EMITTER MAY SAY IT.  Which registers the helper writes is a
+     * STATIC property of the encoding: the same three for every execution of
+     * these bytes.  Nothing is observed and nothing is derived.
+     *
+     * RFLAGS IS STATED EVEN WHERE THIS MODE ELIDES IT.  *-linux-user does not
+     * perform the FMASK masking at all -- it has no kernel to own the MSR,
+     * and its single `syscall` models the SYSRET return too, which reloads
+     * the word from R11 -- so its net effect on RFLAGS is a write of the
+     * value the guest already had.  A lowering that elides a register the
+     * ENCODING names is not grounds to drop it from the encoding's write set.
+     *
+     * THE GUARDS ARE THE HELPER'S OWN.  LMA only, and *-linux-user rather
+     * than any user build: bsd-user's amd64 dispatcher reads env->regs[R_ECX]
+     * as a syscall argument, so that build's helper does not write RCX and a
+     * statement here would claim a write its emulator does not perform.  The
+     * wrong-path carve-out both helpers apply is deliberately NOT a guard --
+     * it is a per-EXECUTION decision about a speculative path, and this is
+     * the static fact about the encoding.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    if (LMA(s)) {
+        insn_dataflow_state_write(insn_df_reg("rcx"));
+        insn_dataflow_state_write(insn_df_reg("r11"));
+        insn_dataflow_state_write(insn_df_reg("eflags"));
+    }
+#endif
+#endif
     gen_helper_syscall(tcg_env, cur_insn_len_i32(s));
     if (LMA(s)) {
         assume_cc_op(s, CC_OP_EFLAGS);

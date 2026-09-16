@@ -7547,6 +7547,17 @@ static bool trans_Vimm(DisasContext *s, arg_Vimm *a)
     if ((a->cmode & 1) && a->cmode < 12) {
         /* For op=1, the imm will be inverted, so BIC becomes AND. */
         fn = a->op ? tcg_gen_gvec_andi : tcg_gen_gvec_ori;
+        /*
+         * One rule, three operations, told apart by cmode and op -- the same
+         * shape as riscv64's ADDI.  The pattern line says vec.mov because
+         * MOVI and MVNI are what most of this encoding space is; the forms
+         * that reach here are the vector-immediate ORR and BIC, which read
+         * the destination and combine, and are not moves.  They take the
+         * words their register-form siblings AND_v and ORR_v already carry.
+         * note_word() is first-wins and this runs before decodetree's own
+         * note, so the specific statement wins.
+         */
+        insn_dataflow_note_word(a->op ? INSN_DF_WORD_AND : INSN_DF_WORD_OR);
     } else {
         /* There is one unallocated cmode/op combination in this space */
         if (a->cmode == 15 && a->op == 1 && a->q == 0) {

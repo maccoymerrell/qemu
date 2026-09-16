@@ -3829,6 +3829,13 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
 
 void tcg_x86_init(void)
 {
+    /*
+     * The helper-usage table, installed once beside the TCG globals: the
+     * reader consults it when a helper argument is a pointer into env, and
+     * the join refuses a table that does not account for every such helper.
+     */
+    x86_insn_df_declare_helper_usage();
+
     static const char reg_names[CPU_NB_REGS][4] = {
 #ifdef TARGET_X86_64
         [R_EAX] = "rax",

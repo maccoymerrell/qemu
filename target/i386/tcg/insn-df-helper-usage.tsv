@@ -1,0 +1,607 @@
+# What each x86 helper does through a pointer argument that names a register.
+#
+# Column 1 is the helper's name as DEF_HELPER spells it, suffix and all.
+# Column 2 is one character per argument: '-' the argument names no register,
+# 'r' the helper reads through it, 'w' it writes through it, 'b' both.
+# Column 3 is why, and it is not optional: a direction with no stated ground
+# is an assertion, and the generator refuses one.
+#
+# The other half of the completeness -- every helper that takes a register
+# pointer has a row, and every row names such a helper -- is enforced where
+# this table meets the compiler's view, in insn_dataflow_declare_helper_usage().
+#
+# Copyright (c) 2026 Maccoy Merrell
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+addpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addsubpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addsubpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addsubps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+addsubps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesdec_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesdec_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesdeclast_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesdeclast_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesenc_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesenc_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesenclast_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesenclast_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+aesimc_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+aeskeygenassist_xmm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+blendpd_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendpd_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendps_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendps_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendvpd_xmm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendvpd_ymm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendvps_xmm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+blendvps_ymm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqspd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqspd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqsps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqsps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqssd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpeqsss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequspd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequspd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequsps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequsps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequssd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpequsss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalseps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalseps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsespd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsespd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsesps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsesps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsess	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsessd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpfalsesss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgeqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgess	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpgtss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmplepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmplepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpleqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmplesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpless	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpltss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpneqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequspd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequspd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequsps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequsps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequssd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnequsss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngeqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngess	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpngtss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnlepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnlepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnleqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnlesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnless	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltqss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpnltss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordspd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordspd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordsps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordsps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordssd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpordsss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruepd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruepd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptrueps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptrueps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruesd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruespd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruespd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruesps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruesps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruess	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruessd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmptruesss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordspd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordspd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordsps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordsps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordssd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cmpunordsss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+comisd	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+comiss	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+cvtdq2pd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtdq2pd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtdq2ps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtdq2ps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpd2dq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpd2dq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpd2pi	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpd2ps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpd2ps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtph2ps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtph2ps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpi2pd	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtpi2ps	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2dq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2dq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2pd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2pd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2ph_xmm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2ph_ymm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtps2pi	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvtsd2si	-r	the helper's answer is its return value; the pointer is its source
+cvtsd2sq	-r	the helper's answer is its return value; the pointer is its source
+cvtsd2ss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cvtsi2sd	-b-	writes the low element and leaves the rest of the register standing, so the register is read as well as written
+cvtsi2ss	-b-	writes the low element and leaves the rest of the register standing, so the register is read as well as written
+cvtsq2sd	-b-	writes the low element and leaves the rest of the register standing, so the register is read as well as written
+cvtsq2ss	-b-	writes the low element and leaves the rest of the register standing, so the register is read as well as written
+cvtss2sd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+cvtss2si	-r	the helper's answer is its return value; the pointer is its source
+cvtss2sq	-r	the helper's answer is its return value; the pointer is its source
+cvttpd2dq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttpd2dq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttpd2pi	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttps2dq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttps2dq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttps2pi	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+cvttsd2si	-r	the helper's answer is its return value; the pointer is its source
+cvttsd2sq	-r	the helper's answer is its return value; the pointer is its source
+cvttss2si	-r	the helper's answer is its return value; the pointer is its source
+cvttss2sq	-r	the helper's answer is its return value; the pointer is its source
+divpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+divpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+divps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+divps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+divsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+divss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+dppd_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+dpps_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+dpps_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+extrq_i	-b--	writes the low element and leaves the rest of the register standing, so the register is read as well as written
+extrq_r	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+fma4pd_xmm	-wrrr--	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+fma4pd_ymm	-wrrr--	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+fma4ps_xmm	-wrrr--	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+fma4ps_ymm	-wrrr--	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+fma4sd	-wrrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+fma4ss	-wrrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+haddpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+haddpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+haddps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+haddps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+hsubpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+hsubpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+hsubps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+hsubps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+insertq_i	-br--	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+insertq_r	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+maskmov_mmx	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+maskmov_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+maxpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+maxpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+maxps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+maxps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+maxsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+maxss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+minss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+movmskpd_xmm	-r	the helper's answer is its return value; the pointer is its source
+movmskpd_ymm	-r	the helper's answer is its return value; the pointer is its source
+movmskps_xmm	-r	the helper's answer is its return value; the pointer is its source
+movmskps_ymm	-r	the helper's answer is its return value; the pointer is its source
+mpsadbw_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mpsadbw_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+mulss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packssdw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packssdw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packssdw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packsswb_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packsswb_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packsswb_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packusdw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packusdw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packuswb_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packuswb_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+packuswb_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+palignr_mmx	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+palignr_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+palignr_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgb_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgb_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgb_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pavgw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pblendvb_xmm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pblendvb_ymm	-wrrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pblendw_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pblendw_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pclmulqdq_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pclmulqdq_ymm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pcmpestri_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+pcmpestrm_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+pcmpistri_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+pcmpistrm_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+pf2id	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pf2iw	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfacc	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfadd	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfcmpeq	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfcmpge	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfcmpgt	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfmax	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfmin	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfmul	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfnacc	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfpnacc	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfrcp	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfrsqrt	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfsub	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pfsubr	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+phaddd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddsw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddsw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddsw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phaddw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phminposuw_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+phsubd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubsw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubsw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubsw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+phsubw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pi2fd	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pi2fw	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmaddubsw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmaddubsw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmaddubsw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmaddwd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmaddwd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmaddwd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmovdldup_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovdldup_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovshdup_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovshdup_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsldup_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsldup_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbw_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxbw_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxdq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxdq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxwd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxwd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxwq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovsxwq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbw_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxbw_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxdq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxdq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxwd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxwd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxwq_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmovzxwq_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmuldq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmuldq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhrsw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhrsw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhrsw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhrw_mmx	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pmulhuw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhuw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhuw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmulhw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmuludq_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmuludq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pmuludq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psadbw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psadbw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psadbw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pshufb_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pshufb_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pshufb_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pshufd_xmm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshufd_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshufhw_xmm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshufhw_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshuflw_xmm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshuflw_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+pshufw_mmx	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+psignb_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignb_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignb_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psignw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pslld_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pslld_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pslld_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pslldq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pslldq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllq_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psllw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrad_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrad_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrad_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psraw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psraw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psraw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrld_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrld_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrld_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrldq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrldq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlq_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+psrlw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+pswapd	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+ptest_xmm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+ptest_ymm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+punpckhbw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhbw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhbw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhdq_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhdq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhdq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhqdq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhqdq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhwd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhwd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckhwd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklbw_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklbw_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklbw_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckldq_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckldq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpckldq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklqdq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklqdq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklwd_mmx	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklwd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+punpcklwd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+rcpps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+rcpps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+rcpss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+roundpd_xmm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+roundpd_ymm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+roundps_xmm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+roundps_ymm	-br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+roundsd_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+roundss_xmm	-wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+rsqrtps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+rsqrtps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+rsqrtss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1msg1	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1msg2	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1nexte	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1rnds4_f0	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1rnds4_f1	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1rnds4_f2	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha1rnds4_f3	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha256msg1	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha256msg2	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sha256rnds2	wrr--	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+shufpd_xmm	wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+shufpd_ymm	wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+shufps_xmm	wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+shufps_ymm	wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sqrtpd_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+sqrtpd_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+sqrtps_xmm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+sqrtps_ymm	-br	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+sqrtsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+sqrtss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subsd	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+subss	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+ucomisd	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+ucomiss	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vpermd_ymm	wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermdq_ymm	wrr-	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermilpd_imm_xmm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+vpermilpd_imm_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+vpermilpd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermilpd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermilps_imm_xmm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+vpermilps_imm_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+vpermilps_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermilps_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpermq_ymm	br-	the two-operand form: the destination is read as well as written -- QEMU spells it `d` and the helper combines it with `s`
+vpgatherdd_xmm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherdd_ymm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherdq_xmm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherdq_ymm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherqd_xmm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherqd_ymm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherqq_xmm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpgatherqq_ymm	-wrr---	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpmaskmovd_st_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vpmaskmovd_st_ymm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vpmaskmovd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpmaskmovd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpmaskmovq_st_xmm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vpmaskmovq_st_ymm	-rr-	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vpmaskmovq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpmaskmovq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsllvd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsllvd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsllvq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsllvq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsravd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsravd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsravq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsravq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsrlvd_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsrlvd_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsrlvq_xmm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vpsrlvq_ymm	-wrr	the three-operand form: the first pointer is the destination the helper writes whole, the others are the sources it reads
+vtestpd_xmm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vtestpd_ymm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vtestps_xmm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory
+vtestps_ymm	-rr	reads through both pointers and writes through neither: its answer leaves through env (the flags, ECX, XMM0) or through memory

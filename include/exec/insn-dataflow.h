@@ -400,6 +400,40 @@ static inline InsnDataflowAtom insn_df_const(void)
 #define INSN_DF_W_EPILOGUE  0   /* the block's exit sequence */
 #define INSN_DF_W_BLOCK_PC  1   /* a pc write that exists so a fault restarts */
 
+/*
+ * The most arguments a DEF_HELPER line can carry.
+ */
+#define INSN_DF_MAX_HELPER_ARGS 7
+
+/*
+ * One helper's argument shape, taken from the target's own DEF_HELPER line.
+ *
+ * @argsize[i] is the bytes of CPUArchState argument i names when its declared
+ * type is a pointer to one register -- x86's `Reg *`, and whatever a target
+ * spells for the same thing -- and 0 when the type names none.  The numbers
+ * come from the compiler (sizeof of the declared pointee), so they cannot
+ * drift from the structure they describe.
+ */
+typedef struct InsnDfHelperArgs {
+    const char *name;
+    uint8_t nargs;
+    uint16_t argsize[INSN_DF_MAX_HELPER_ARGS];
+} InsnDfHelperArgs;
+
+/*
+ * One helper's adjudicated argument directions.
+ *
+ * @dirs carries one character per argument: '-' the argument names no
+ * register, 'r' the helper reads through it, 'w' it writes through it, 'b'
+ * both.  A type cannot say this -- a pointer is a pointer -- so it is
+ * adjudicated in the target's checked-in usage data, one reviewable row per
+ * helper, and this is the only place that answer comes from.
+ */
+typedef struct InsnDfHelperDir {
+    const char *name;
+    const char *dirs;
+} InsnDfHelperDir;
+
 #ifdef CONFIG_PLUGIN
 
 /*
@@ -525,6 +559,22 @@ void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
                                      unsigned nparts, int64_t disp);
 
 /*
+ * Install a target's helper-usage table.
+ *
+ * @args is the shape the compiler derived, @dirs the adjudication.  The two
+ * are joined here and the join REFUSES IN BOTH DIRECTIONS: a helper whose
+ * declared arguments include a register pointer and that has no adjudicated
+ * row is a gap, and a row naming a helper with no register pointer is a dead
+ * rule.  Either aborts with the offending names, because a table that is
+ * quietly short answers with the pessimistic blob it exists to replace and
+ * nothing would say so.
+ */
+void insn_dataflow_declare_helper_usage(const InsnDfHelperArgs *args,
+                                        unsigned nargs,
+                                        const InsnDfHelperDir *dirs,
+                                        unsigned ndirs);
+
+/*
  * Declare a register file that lives in CPUArchState with no TCG global naming
  * it: @count registers named @names, @size bytes each, @stride apart, starting
  * at @base_off.
@@ -610,6 +660,10 @@ static inline void insn_dataflow_declare_regfile(const char *const *names,
                                                  uint32_t base_off,
                                                  uint32_t stride,
                                                  uint32_t size)
+{ }
+static inline void insn_dataflow_declare_helper_usage(
+    const InsnDfHelperArgs *args, unsigned nargs,
+    const InsnDfHelperDir *dirs, unsigned ndirs)
 { }
 
 #endif /* CONFIG_PLUGIN */

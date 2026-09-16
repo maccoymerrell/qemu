@@ -23,12 +23,29 @@ insn_df_words_i386 = custom_target('i386-insn-df-words.h.inc',
 
 i386_ss.add(when: 'CONFIG_TCG', if_true: [insn_df_words_i386])
 
+#
+# What x86's helpers do through the pointers they are handed.
+#
+# insn-df-helper-usage.tsv adjudicates one direction per pointer argument; the
+# generator turns the rows into the table target/i386/tcg/insn-df-usage.c
+# installs beside the argument shapes the compiler derives from helper.h.
+#
+insn_df_usage_i386 = custom_target('i386-insn-df-usage.h.inc',
+  output: 'insn-df-usage.h.inc',
+  input: files('insn-df-helper-usage.tsv'),
+  command: [python, files(meson.project_source_root() /
+                          'scripts/insn-df-usage.py'),
+            '@INPUT@', '-o', '@OUTPUT@'])
+
+i386_ss.add(when: 'CONFIG_TCG', if_true: [insn_df_usage_i386])
+
 i386_ss.add(when: 'CONFIG_TCG', if_true: files(
   'access.c',
   'bpt_helper.c',
   'cc_helper.c',
   'excp_helper.c',
   'fpu_helper.c',
+  'insn-df-usage.c',
   'int_helper.c',
   'mem_helper.c',
   'misc_helper.c',

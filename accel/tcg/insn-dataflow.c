@@ -47,6 +47,7 @@
 #include "tcg/tcg-internal.h"
 #include "exec/memopidx.h"
 #include "exec/insn-dataflow.h"
+#include "qemu/error-report.h"
 
 /*
  * TCG's own cap on instructions per TB.  A TB cannot hold more, so the result
@@ -578,6 +579,10 @@ static bool df_vec_operand(const InsnDataflow *d, uint32_t off,
     return found;
 }
 
+/* Defined below, beside the table it reads. */
+static bool df_helper_usage(TCGOp *op, unsigned argidx,
+                            uint32_t *size, unsigned *dir);
+
 static void df_call(InsnDataflow *d, TCGOp *op)
 {
     TCGContext *s = tcg_ctx;
@@ -618,6 +623,8 @@ static void df_call(InsnDataflow *d, TCGOp *op)
              * a blob is never mistaken for a measurement.
              */
             if (df_vec_operand(d, (uint32_t)eo, &size, &dir)) {
+                d->n_env_ptr_bounded++;
+            } else if (df_helper_usage(op, i, &size, &dir)) {
                 d->n_env_ptr_bounded++;
             } else {
                 d->n_env_ptr_unbounded++;
@@ -1147,6 +1154,183 @@ void insn_dataflow_window_end(void)
     }
     df->win[df->win_open].to = tcg_last_op();
     df->win_open = -1;
+}
+
+/*
+ * The target's helper-usage table, installed once by the target.
+ *
+ * A helper call is one edge at this level, and an argument that is a pointer
+ * built from tcg_env is how a register with no TCG global reaches it.  The
+ * pointer alone says neither extent nor direction, so the reader used to
+ * record the whole of CPUArchState in both directions.  That is honest and it
+ * is a loss: a consumer handed one unbounded blob in place of the two or three
+ * registers the instruction touched has been told less than QEMU knew.
+ *
+ * The extent comes from the declared pointee type (the compiler's sizeof) and
+ * the direction from the target's adjudicated rows; the join below refuses
+ * unless both sides account for each other exactly.
+ */
+static const InsnDfHelperArgs *df_hu_args;
+static unsigned df_hu_nargs;
+static const InsnDfHelperDir *df_hu_dirs;
+static unsigned df_hu_ndirs;
+
+static const InsnDfHelperDir *df_hu_find_dir(const char *name)
+{
+    for (unsigned i = 0; i < df_hu_ndirs; i++) {
+        if (strcmp(df_hu_dirs[i].name, name) == 0) {
+            return &df_hu_dirs[i];
+        }
+    }
+    return NULL;
+}
+
+static const InsnDfHelperArgs *df_hu_find_args(const char *name)
+{
+    for (unsigned i = 0; i < df_hu_nargs; i++) {
+        if (strcmp(df_hu_args[i].name, name) == 0) {
+            return &df_hu_args[i];
+        }
+    }
+    return NULL;
+}
+
+/* Does this helper name any register through a pointer argument? */
+static bool df_hu_has_regptr(const InsnDfHelperArgs *a)
+{
+    for (unsigned k = 0; k < a->nargs && k < INSN_DF_MAX_HELPER_ARGS; k++) {
+        if (a->argsize[k]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void insn_dataflow_declare_helper_usage(const InsnDfHelperArgs *args,
+                                        unsigned nargs,
+                                        const InsnDfHelperDir *dirs,
+                                        unsigned ndirs)
+{
+    unsigned missing = 0, dead = 0, shape = 0;
+
+    if (args == NULL || nargs == 0) {
+        return;
+    }
+
+    /*
+     * Both directions, and both are printed in full rather than counted: a
+     * table that is quietly short falls back to the unbounded blob it exists
+     * to replace, which is exactly the shape nothing else would report.
+     */
+    for (unsigned i = 0; i < nargs; i++) {
+        const InsnDfHelperDir *d;
+
+        if (!df_hu_has_regptr(&args[i])) {
+            continue;
+        }
+        d = NULL;
+        for (unsigned j = 0; j < ndirs; j++) {
+            if (strcmp(dirs[j].name, args[i].name) == 0) {
+                d = &dirs[j];
+                break;
+            }
+        }
+        if (d == NULL) {
+            {
+                char sh[INSN_DF_MAX_HELPER_ARGS + 1];
+                unsigned k;
+
+                for (k = 0; k < args[i].nargs &&
+                            k < INSN_DF_MAX_HELPER_ARGS; k++) {
+                    sh[k] = args[i].argsize[k] ? 'R' : '-';
+                }
+                sh[k] = '\0';
+                error_report("insn-dataflow: helper %s takes a register "
+                             "pointer and has no adjudicated usage row "
+                             "(shape %s)", args[i].name, sh);
+            }
+            missing++;
+        } else if (strlen(d->dirs) != args[i].nargs) {
+            error_report("insn-dataflow: helper %s has %u arguments and its "
+                         "usage row states %zu directions", args[i].name,
+                         args[i].nargs, strlen(d->dirs));
+            shape++;
+        }
+    }
+    for (unsigned j = 0; j < ndirs; j++) {
+        const InsnDfHelperArgs *a = NULL;
+
+        for (unsigned i = 0; i < nargs; i++) {
+            if (strcmp(args[i].name, dirs[j].name) == 0) {
+                a = &args[i];
+                break;
+            }
+        }
+        if (a == NULL || !df_hu_has_regptr(a)) {
+            error_report("insn-dataflow: usage row %s names no helper that "
+                         "takes a register pointer", dirs[j].name);
+            dead++;
+        }
+    }
+    if (missing || dead || shape) {
+        error_report("insn-dataflow: helper usage table refused "
+                     "(%u unadjudicated, %u dead, %u mis-shaped)",
+                     missing, dead, shape);
+        exit(1);
+    }
+
+    df_hu_args = args;
+    df_hu_nargs = nargs;
+    df_hu_dirs = dirs;
+    df_hu_ndirs = ndirs;
+}
+
+/*
+ * The extent and direction of a helper call's pointer argument @argidx, if
+ * the target adjudicated one.  False means no answer, and the caller then
+ * keeps the unbounded record and counts it.
+ */
+static bool df_helper_usage(TCGOp *op, unsigned argidx,
+                            uint32_t *size, unsigned *dir)
+{
+    const TCGHelperInfo *hi;
+    const InsnDfHelperArgs *a;
+    const InsnDfHelperDir *d;
+    unsigned nb_iargs = TCGOP_CALLI(op);
+
+    if (df_hu_args == NULL) {
+        return false;
+    }
+    hi = tcg_call_info(op);
+    if (hi == NULL || hi->name == NULL) {
+        return false;
+    }
+    a = df_hu_find_args(hi->name);
+    d = df_hu_find_dir(hi->name);
+    if (a == NULL || d == NULL) {
+        return false;
+    }
+    /*
+     * The declared argument count and the emitted one must agree before an
+     * index means the same thing on both sides.  A by-reference type occupies
+     * two call slots, and reading a direction off a shifted index would put a
+     * different operand's answer on this one; no target in this table has
+     * one, and if one arrives the row is declined rather than mis-applied.
+     */
+    if (nb_iargs != a->nargs || strlen(d->dirs) != a->nargs) {
+        return false;
+    }
+    if (argidx >= a->nargs || a->argsize[argidx] == 0) {
+        return false;
+    }
+    switch (d->dirs[argidx]) {
+    case 'r': *dir = INSN_DF_RD; break;
+    case 'w': *dir = INSN_DF_WR; break;
+    case 'b': *dir = INSN_DF_RD | INSN_DF_WR; break;
+    default:  return false;
+    }
+    *size = a->argsize[argidx];
+    return true;
 }
 
 void insn_dataflow_declare_regfile(const char *const *names, unsigned count,

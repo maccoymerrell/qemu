@@ -59,6 +59,12 @@ static inline target_long lshift(target_long x, int n)
 
 /* translate.c */
 void tcg_x86_init(void);
+
+/*
+ * Install the helper-usage table: what each helper does through a pointer
+ * argument that names a register.  Called once, from tcg_x86_init().
+ */
+void x86_insn_df_declare_helper_usage(void);
 void x86_translate_code(CPUState *cs, TranslationBlock *tb,
                         int *max_insns, vaddr pc, void *host_pc);
 

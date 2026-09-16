@@ -609,7 +609,18 @@ enum {
 static TCGv mxu_gpr[NUMBER_OF_MXU_REGISTERS - 1];
 static TCGv mxu_CR;
 
-static const char mxuregnames[NUMBER_OF_MXU_REGISTERS][4] = {
+/*
+ * Five characters, not four: "XR10" is four and a terminator makes five.
+ *
+ * At four the last seven rows held no terminator, and tcg_global_mem_new()
+ * takes a C string -- so XR10 was registered under the name "XR10XR11XR12"
+ * and so on down the array, XCR under a name whose end was whatever followed
+ * the table.  It is a register's NAME, which is what a consumer asking QEMU
+ * what an instruction touched is handed, so a register with the wrong name is
+ * a register that cannot be identified; it also reads past the object, which
+ * is the same defect in its other aspect.
+ */
+static const char mxuregnames[NUMBER_OF_MXU_REGISTERS][5] = {
     "XR1",  "XR2",  "XR3",  "XR4",  "XR5",  "XR6",  "XR7",  "XR8",
     "XR9",  "XR10", "XR11", "XR12", "XR13", "XR14", "XR15", "XCR",
 };

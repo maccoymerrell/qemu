@@ -1744,6 +1744,20 @@ void build_qemu_reg_reverse_index(void);
 const QemuRegKey *qemu_reg_for_generic_id(uint8_t gen_id);
 
 /*
+ * Which source supplied each generic register's value-read route, recorded
+ * by build_qemu_reg_reverse_index() so the census below can name the rows
+ * rather than only count them.  Indexed by GenericRegId.
+ */
+enum {
+    CST_REG_ROUTE_NONE = 0,      /* no route: no value read is possible */
+    CST_REG_ROUTE_GDBMAP = 1,    /* generated regmap/<isa>.gdb.tsv */
+    CST_REG_ROUTE_REG_TABLE = 2, /* per-ISA register-classification table */
+};
+extern uint8_t g_qemu_reg_route_src[REG_ID_COUNT];
+extern unsigned g_qemu_reg_routes_from_gdbmap;
+extern unsigned g_qemu_reg_routes_from_reg_table;
+
+/*
  * Wide regfile snapshot: opaque TLS scratch keyed by the active reg
  * table's QEMU descriptors.  RegSnapCollector::capture_wide() builds one
  * (a single upfront snapshot of every readable register); unused by the

@@ -107,6 +107,60 @@ static void append_unsealed_at_close(GString *report)
     }
 }
 
+/*
+ * Where each generic register's VALUE-READ route came from.
+ *
+ * build_qemu_reg_reverse_index() fills the GenericRegId -> QemuRegKey map
+ * from two sources in order: the generated gdbstub table (regmap/<isa>.gdb.tsv,
+ * derived from the target's own CORE feature XML) first, then the per-ISA
+ * register-classification table for any id the first source left without a
+ * route.  Only the counts existed; this reads them, and names the individual
+ * registers the second source supplied so the surviving routes can be
+ * re-homed one by one rather than argued about as a total.
+ *
+ * The second row is the one the register table's removal turns on: while it
+ * reads 0 the table supplies no value-read route on this target, so deleting
+ * it cannot change a published register value.  The row is printed on every
+ * run, including when it is zero, because a row that only appears when it is
+ * non-zero cannot be quoted as a measured zero.
+ */
+static void append_reg_route_census(GString *report)
+{
+    unsigned unrouted = 0;
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        if (g_qemu_reg_route_src[i] == CST_REG_ROUTE_NONE) {
+            unrouted++;
+        }
+    }
+    g_string_append_printf(report,
+        "Generic-register value-read routes (install-time):\n"
+        "  from the generated gdbstub table %14u\n"
+        "  from the per-ISA register table  %14u   (must be 0)\n"
+        "  no route (no value read possible)%14u\n"
+        "  generic register ids             %14u\n",
+        g_qemu_reg_routes_from_gdbmap,
+        g_qemu_reg_routes_from_reg_table,
+        unrouted,
+        (unsigned)REG_ID_COUNT);
+
+    if (g_qemu_reg_routes_from_reg_table == 0) {
+        return;
+    }
+    g_string_append_printf(report,
+        "  registers routed from the per-ISA register table:\n");
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        if (g_qemu_reg_route_src[i] != CST_REG_ROUTE_REG_TABLE) {
+            continue;
+        }
+        const QemuRegKey *k = qemu_reg_for_generic_id((uint8_t)i);
+        g_string_append_printf(report,
+            "    %-14s feature=%-16s name=%s\n",
+            generic_reg_name_or_unknown(i),
+            (k && k->feature) ? k->feature : "-",
+            (k && k->name) ? k->name : "-");
+    }
+}
+
 /* Generic opcode breakdown, CP and WP side-by-side.  Sorted by
  * (CP+WP) total so the busiest opcodes come first regardless of
  * which path drives them. */
@@ -691,6 +745,7 @@ void append_stats_summary(GString *report, const char *label,
     print_reg_table("Dst register attribution",
                     stats.cp_dst_reg_writes, stats.wp_dst_reg_writes);
     append_unsealed_at_close(report);
+    append_reg_route_census(report);
 
     g_string_append_printf(report,
         "==========================================\n");

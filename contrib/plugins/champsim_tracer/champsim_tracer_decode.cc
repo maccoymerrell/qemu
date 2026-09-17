@@ -40,11 +40,13 @@ static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
 
 unsigned g_qemu_reg_routes_from_gdbmap;
 unsigned g_qemu_reg_routes_from_reg_table;
+uint8_t g_qemu_reg_route_src[REG_ID_COUNT];
 
 void build_qemu_reg_reverse_index(void)
 {
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         g_qemu_reg_by_gen[i] = QemuRegKey{};
+        g_qemu_reg_route_src[i] = CST_REG_ROUTE_NONE;
     }
     g_qemu_reg_routes_from_gdbmap = 0;
     g_qemu_reg_routes_from_reg_table = 0;
@@ -73,6 +75,7 @@ void build_qemu_reg_reverse_index(void)
                                    &feature, &name)) {
             g_qemu_reg_by_gen[i].feature = feature;
             g_qemu_reg_by_gen[i].name = name;
+            g_qemu_reg_route_src[i] = CST_REG_ROUTE_GDBMAP;
             g_qemu_reg_routes_from_gdbmap++;
         }
     }
@@ -100,6 +103,7 @@ void build_qemu_reg_reverse_index(void)
          * correct for value reads. */
         if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
             g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
+            g_qemu_reg_route_src[rc->reg_id] = CST_REG_ROUTE_REG_TABLE;
             g_qemu_reg_routes_from_reg_table++;
         }
     }

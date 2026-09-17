@@ -299,7 +299,7 @@ OPC_TLBWI	tlbflush
 OPC_TLBWR	tlbflush
 
 # jump
-OPC_BC	jump
+OPC_BC	-	major opcode 0x32 is BC on Release 6 and the coprocessor-2 load LWC2 before it; the decode site states each arm
 OPC_J	jump
 
 # jump.cond
@@ -332,7 +332,7 @@ OPC_BPOSGE32	jump.cond
 OPC_BPOSGE64	jump.cond
 
 # call
-OPC_BALC	call
+OPC_BALC	-	major opcode 0x3A is BALC on Release 6 and the coprocessor-2 store SWC2 before it; the decode site states each arm
 OPC_BGEZAL	call
 OPC_BGEZALL	call
 OPC_BGTZALC	call
@@ -544,8 +544,8 @@ OPC_MSUBF_D	fp.msub
 OPC_MSUBF_S	fp.msub
 OPC_MSUB_D	fp.msub
 OPC_MSUB_S	fp.msub
-OPC_NMADD_D	fp.msub
-OPC_NMADD_S	fp.msub
+OPC_NMADD_D	fp.madd
+OPC_NMADD_S	fp.madd
 OPC_NMSUB_D	fp.msub
 OPC_NMSUB_S	fp.msub
 
@@ -578,7 +578,7 @@ OPC_MADD_PS	vec.madd
 
 # vec.msub
 OPC_MSUB_PS	vec.msub
-OPC_NMADD_PS	vec.msub
+OPC_NMADD_PS	vec.madd
 OPC_NMSUB_PS	vec.msub
 
 # vec.shuffle

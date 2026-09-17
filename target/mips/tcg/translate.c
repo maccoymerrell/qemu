@@ -15230,15 +15230,30 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     /* Compact branches [R6] and COP2 [non-R6] */
     case OPC_BC: /* OPC_LWC2 */
     case OPC_BALC: /* OPC_SWC2 */
+        /*
+         * THE SAME RELEASE-6 COLLISION the OPC_BEQZC pair below carries, at
+         * major opcodes 0x32 and 0x3A: BC and BALC on Release 6, the
+         * coprocessor-2 word load LWC2 and word store SWC2 before it.  A word
+         * keyed on the major opcode alone would state the Release-6 reading
+         * for every CPU model, including the Release-2 models these bytes
+         * actually decode to a coprocessor access on, so each arm states its
+         * own and the table row for the pair says nothing.
+         */
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_BC, OPC_BALC */
+            insn_dataflow_note_word(op == OPC_BALC ? INSN_DF_WORD_CALL
+                                                   : INSN_DF_WORD_JUMP);
             gen_compute_compact_branch(ctx, op, 0, 0,
                                        sextract32(ctx->opcode << 2, 0, 28));
         } else if (ctx->insn_flags & ASE_LEXT) {
+            insn_dataflow_note_word(op == OPC_BALC ? INSN_DF_WORD_STORE
+                                                   : INSN_DF_WORD_LOAD);
             gen_loongson_lswc2(ctx, rt, rs, rd);
         } else {
             /* OPC_LWC2, OPC_SWC2 */
             /* COP2: Not implemented. */
+            insn_dataflow_note_word(op == OPC_BALC ? INSN_DF_WORD_STORE
+                                                   : INSN_DF_WORD_LOAD);
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
         break;

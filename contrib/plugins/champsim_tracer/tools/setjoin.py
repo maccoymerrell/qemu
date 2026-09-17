@@ -118,6 +118,10 @@ def score(rows, strict=True):
                       "exists for")
 
     lost = collections.Counter()      # name -> how many encodings lost it
+    lost_dir = collections.Counter()  # (name, direction) -> the same, keyed
+                                      # by direction, because the read and
+                                      # the write halves of one register are
+                                      # separate arbitrations
     gain = collections.Counter()
     lost_enc = collections.defaultdict(list)
     gain_enc = collections.defaultdict(list)
@@ -133,6 +137,7 @@ def score(rows, strict=True):
         changed += 1
         for nm in c - q:
             lost[nm] += 1
+            lost_dir[(nm, key[1])] += 1
             if len(lost_enc[nm]) < 8:
                 lost_enc[nm].append(key)
         for nm in q - c:
@@ -147,13 +152,83 @@ def score(rows, strict=True):
 
     return {
         "both": len(both), "changed": changed,
-        "lost": lost, "gain": gain,
+        "lost": lost, "lost_dir": lost_dir, "gain": gain,
         "lost_enc": lost_enc, "gain_enc": gain_enc,
         "q_named": q_named, "c_named": c_named,
     }
 
 
-def report(isa, path, top, out, strict=True):
+RULING_COLS = 7
+
+
+def read_rulings(path):
+    """{(isa, name, dir): (verdict, state, third, reason)} from the TSV.
+
+    REFUSES an absent or empty file rather than scoring everything UNRULED
+    against nothing: "I could not find the rulings" is not "there are none",
+    and a --require-ruled that failed for that reason would be naming the
+    wrong defect.
+    """
+    if not os.path.exists(path):
+        raise Refusal("%s: no such rulings file -- a ruling join that was "
+                      "asked for and is absent is a refusal, not an empty "
+                      "verdict set" % path)
+    out = {}
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            p = line.split("\t")
+            if len(p) < RULING_COLS:
+                continue
+            isa, name, direction, verdict, state, third = \
+                [x.strip() for x in p[:6]]
+            out[(isa, name, direction)] = (verdict, state, third,
+                                           "\t".join(p[6:]).strip())
+    if not out:
+        raise Refusal("%s: parsed 0 rulings -- an empty join marks every "
+                      "class UNRULED for a reason that is about the file"
+                      % path)
+    return out
+
+
+def join_rulings(isa, s, rulings, out):
+    """Report UNRULED classes and DEAD rulings for one ISA.
+
+    A class with REAL-LOST rows and no ruling is UNRULED.  A ruling whose
+    class has no rows in THIS corpus is DEAD -- the same discipline the gap
+    report uses, and for the same reason: an arbitration nothing can reach
+    has stopped being checked by anything.
+    """
+    live = set()
+    unruled = []
+    for (nm, direction), n in sorted(
+            (((nm, d), n) for (nm, d), n in s["lost_dir"].items()),
+            key=lambda x: -x[1]):
+        key = (isa, nm, direction)
+        if key in rulings:
+            live.add(key)
+        else:
+            unruled.append((nm, direction, n))
+
+    dead = [k for k in rulings if k[0] == isa and k not in live]
+
+    kinds = collections.Counter(rulings[k][0] for k in live)
+    print("   -- arbitration: %d classes live, %s; %d UNRULED, %d DEAD"
+          % (len(live),
+             ", ".join("%s %d" % (v, n) for v, n in sorted(kinds.items()))
+             or "none",
+             len(unruled), len(dead)), file=out)
+    for nm, direction, n in unruled[:20]:
+        print("      UNRULED %8d  %s %s" % (n, nm, direction), file=out)
+    for k in sorted(dead)[:20]:
+        print("      DEAD        %s %s  (%s)"
+              % (k[1], k[2], rulings[k][0]), file=out)
+    return unruled, dead
+
+
+def report(isa, path, top, out, strict=True, rulings=None):
     stamp, rows = read_gen(path)
     s = score(rows, strict)
 
@@ -178,6 +253,9 @@ def report(isa, path, top, out, strict=True):
             e = wit[nm][0]
             print("      %8d  %-22s  e.g. %s %s" % (n, nm, e[0], e[1]),
                   file=out)
+
+    if rulings is not None:
+        s["unruled"], s["dead"] = join_rulings(isa, s, rulings, out)
     return s
 
 
@@ -254,6 +332,82 @@ def selftest():
     return 1 if bad else 0
 
 
+
+def ruling_selftest():
+    """Prove the ruling join's three verdicts fire on planted data.
+
+    A --require-ruled that has never been seen to FAIL is not a check, and a
+    ruling file this cannot prove it reads is the silent-false-success shape.
+    """
+    import tempfile
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        corpus = os.path.join(d, "gen_q.tsv")
+        with open(corpus, "w") as f:
+            f.write("#so plugin=aa emulator=bb\n" + SIDES)
+            # TWO lost classes, so "one ruled and one not" is expressible
+            # without an empty rulings file (which refuses, correctly, for a
+            # different reason).
+            f.write("q\t01\tq\tr\t1\t1\tREG_GPR0\n")
+            f.write("q\t01\tc\tr\t2\t2\tREG_GPR0,REG_FLAGS\n")
+            f.write("q\t02\tq\tw\t1\t1\tREG_GPR0\n")
+            f.write("q\t02\tc\tw\t2\t2\tREG_GPR0,REG_VEC1\n")
+
+        def run(rows):
+            rp = os.path.join(d, "r.tsv")
+            with open(rp, "w") as f:
+                f.write("# planted\n")
+                for r in rows:
+                    f.write("\t".join(r) + "\n")
+            sink = open(os.devnull, "w")
+            try:
+                st = report("q", corpus, 0, sink, rulings=read_rulings(rp))
+                return len(st["unruled"]), len(st["dead"])
+            finally:
+                sink.close()
+
+        FL = ("q", "REG_FLAGS", "r", "QEMU", "SETTLED", "LLVM-WITH-QEMU", "b")
+        V1 = ("q", "REG_VEC1", "w", "REAL", "COVERAGE-PATH", "x", "y")
+        cases = [
+            ("both classes ruled: neither unruled nor dead", [FL, V1], (0, 0)),
+            ("an UNRULED class FIRES", [FL], (1, 0)),
+            ("a ruling whose class this corpus cannot reach is DEAD",
+             [FL, V1, ("q", "REG_VEC9", "w", "REAL", "COVERAGE-PATH",
+                       "x", "y")], (0, 1)),
+            ("the DIRECTION is part of the key: a w ruling does not cover "
+             "an r class",
+             [("q", "REG_FLAGS", "w", "QEMU", "SETTLED", "x", "y"), V1],
+             (1, 1)),
+        ]
+        for name, rows, want in cases:
+            got = run(rows)
+            ok = got == want
+            print("  %-58s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
+            bad += 0 if ok else 1
+
+        # a rulings file that is not there must REFUSE, not read as empty
+        try:
+            read_rulings(os.path.join(d, "absent.tsv"))
+            print("  %-58s FAILED (returned)" % "an absent rulings file REFUSES")
+            bad += 1
+        except Refusal:
+            print("  %-58s ok" % "an absent rulings file REFUSES")
+        # and so must one with no parsable rows
+        ep = os.path.join(d, "empty.tsv")
+        open(ep, "w").write("# only a comment\n")
+        try:
+            read_rulings(ep)
+            print("  %-58s FAILED (returned)" % "an empty rulings file REFUSES")
+            bad += 1
+        except Refusal:
+            print("  %-58s ok" % "an empty rulings file REFUSES")
+
+    print("setjoin ruling-join selftest: %d of 6 arms fired as designed"
+          % (6 - bad))
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--selftest", action="store_true",
@@ -264,20 +418,36 @@ def main():
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--require-no-loss", action="store_true",
                     help="fail unless REAL-LOST is 0 on every scored ISA")
+    ap.add_argument("--rulings", default=None,
+                    help="the checked-in REAL-LOST arbitrations to join against")
+    ap.add_argument("--require-ruled", action="store_true",
+                    help="fail unless every surviving REAL-LOST class is "
+                         "arbitrated, and unless every arbitration still has "
+                         "a class in this corpus")
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest()
+        return selftest() or ruling_selftest()
     if not args.dir or not args.isa:
         print("setjoin: --dir and at least one --isa are required",
               file=sys.stderr)
         return 2
 
+    rulings = None
+    if args.rulings or args.require_ruled:
+        path = args.rulings or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "setjoin_rulings.tsv")
+        try:
+            rulings = read_rulings(path)
+        except Refusal as e:
+            print("setjoin: REFUSED: %s" % e, file=sys.stderr)
+            return 2
+
     bad = 0
     for isa in args.isa:
         try:
             s = report(isa, os.path.join(args.dir, "gen_%s.tsv" % isa),
-                       args.top, sys.stdout)
+                       args.top, sys.stdout, rulings=rulings)
         except Refusal as e:
             print("setjoin: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
@@ -286,6 +456,18 @@ def main():
             print("setjoin: %s: REAL-LOST is %d, required 0"
                   % (isa, sum(s["lost"].values())), file=sys.stderr)
             bad += 1
+        if args.require_ruled:
+            if s.get("unruled"):
+                print("setjoin: %s: %d REAL-LOST classes (%d rows) have no "
+                      "arbitration, required 0"
+                      % (isa, len(s["unruled"]),
+                         sum(n for _, _, n in s["unruled"])), file=sys.stderr)
+                bad += 1
+            if s.get("dead"):
+                print("setjoin: %s: %d arbitrations name a class this corpus "
+                      "cannot reach, required 0"
+                      % (isa, len(s["dead"])), file=sys.stderr)
+                bad += 1
 
     print("setjoin: %s" % ("FAIL" if bad else "PASS"))
     return 1 if bad else 0

@@ -203,8 +203,15 @@ static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
     }
 
     gen_helper_vsetvl(dst, tcg_env, s1, s2);
+    /*
+     * The helper writes env->vl and env->vtype.  Both are the vector
+     * configuration and the wire spells them REG_VCTRL; vl is the name the
+     * vocabulary carries, so the write is stated on it.  Stated here because
+     * the store happens inside the helper, where the op walk cannot see it.
+     */
+    insn_dataflow_state_write(insn_df_reg("vl"));
     gen_set_gpr(s, rd, dst);
-    finalize_rvv_inst(s);
+    finalize_vset_inst(s);
 
     gen_update_pc(s, s->cur_insn_len);
     lookup_and_goto_ptr(s);
@@ -223,8 +230,10 @@ static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
     dst = dest_gpr(s, rd);
 
     gen_helper_vsetvl(dst, tcg_env, s1, s2);
+    /* See do_vsetvl(): the configuration write lives inside the helper. */
+    insn_dataflow_state_write(insn_df_reg("vl"));
     gen_set_gpr(s, rd, dst);
-    finalize_rvv_inst(s);
+    finalize_vset_inst(s);
     gen_update_pc(s, s->cur_insn_len);
     lookup_and_goto_ptr(s);
     s->base.is_jmp = DISAS_NORETURN;
@@ -1295,6 +1304,32 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
 GEN_OPIVV_GVEC_TRANS(vadd_vv, add)
 GEN_OPIVV_GVEC_TRANS(vsub_vv, sub)
 
+/*
+ * State the vector registers a hand-built helper call operates on.
+ *
+ * The gvec expanders state the env range of every pointer they build, so a
+ * trans function that goes through tcg_gen_gvec_*_ptr() needs nothing here.
+ * The families below do not: they allocate a TCGv_ptr, add vreg_ofs() to
+ * tcg_env themselves and hand the result to the helper, and the pointer's
+ * provenance is then a temp the reader will not follow back to a declared
+ * register.  Every one of those instructions came out with an empty or
+ * partial register set -- vmerge.vxm named its scalar operand and nothing
+ * else, destination included.
+ *
+ * @vd is written, @vs2 read.  The mask register is v0 by architecture and is
+ * read only when the instruction is masked (vm == 0); an unmasked
+ * instruction is handed the same pointer and never looks at it, so it is
+ * stated on the vm == 0 side only.
+ */
+static void rvv_state_vreg_ops(uint32_t vd, uint32_t vs2, uint32_t vm)
+{
+    insn_dataflow_state_write(insn_df_reg(riscv_vec_regnames[vd]));
+    insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[vs2]));
+    if (vm == 0) {
+        insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[0]));
+    }
+}
+
 typedef void gen_helper_opivx(TCGv_ptr, TCGv_ptr, TCGv, TCGv_ptr,
                               TCGv_env, TCGv_i32);
 
@@ -1325,6 +1360,7 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
 
     fn(dest, mask, src1, src2, tcg_env, desc);
 
+    rvv_state_vreg_ops(vd, vs2, vm);
     finalize_rvv_inst(s);
     return true;
 }
@@ -1483,6 +1519,7 @@ static bool opivi_trans(uint32_t vd, uint32_t imm, uint32_t vs2, uint32_t vm,
 
     fn(dest, mask, src1, src2, tcg_env, desc);
 
+    rvv_state_vreg_ops(vd, vs2, vm);
     finalize_rvv_inst(s);
     return true;
 }
@@ -2382,6 +2419,11 @@ static bool opfvf_trans(uint32_t vd, uint32_t rs1, uint32_t vs2,
 
     fn(dest, mask, t1, src2, tcg_env, desc);
 
+    /*
+     * FIELD_EX32(data, VDATA, VM) rather than a vm argument: this family's
+     * callers have already folded the mask bit into @data.
+     */
+    rvv_state_vreg_ops(vd, vs2, FIELD_EX32(data, VDATA, VM));
     finalize_rvv_inst(s);
     return true;
 }

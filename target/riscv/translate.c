@@ -820,10 +820,40 @@ static void mark_vs_dirty(DisasContext *ctx)
 static inline void mark_vs_dirty(DisasContext *ctx) { }
 #endif
 
-static void finalize_rvv_inst(DisasContext *ctx)
+/*
+ * The half of finalize_rvv_inst() that is emulation state, shared with the
+ * vset family -- which finishes a vector instruction without consuming the
+ * configuration it is in the middle of replacing.
+ */
+static void finalize_vset_inst(DisasContext *ctx)
 {
     mark_vs_dirty(ctx);
     ctx->vstart_eq_zero = true;
+}
+
+static void finalize_rvv_inst(DisasContext *ctx)
+{
+    finalize_vset_inst(ctx);
+
+    /*
+     * EVERY vector instruction reads the vector configuration.  vl says how
+     * many elements execute; vtype says how wide each one is and what the
+     * tail and mask policies leave behind.  Change either and the same
+     * encoding computes something else, so both are architectural inputs.
+     *
+     * The ops do not show it.  vl reaches the helper inside `desc`, built
+     * from translate-time fields, and vtype is baked into which helper the
+     * decoder picked -- so the op walk sees a constant where an input was,
+     * and the read is stated here instead.  vl is the name the wire's
+     * vocabulary maps to REG_VCTRL, the one word it has for the
+     * configuration; vtype has no TCG global and rides the same word.
+     *
+     * NOT stated for the vset family: vsetvl/vsetvli/vsetivli WRITE the
+     * configuration from their operands, and the one case that also reads
+     * the old vl (rd == 0 && rs1 == 0) reads cpu_vl as a TCG global, which
+     * the op walk records without help.
+     */
+    insn_dataflow_state_read(insn_df_reg("vl"));
 }
 
 static void gen_set_rm(DisasContext *ctx, int rm)

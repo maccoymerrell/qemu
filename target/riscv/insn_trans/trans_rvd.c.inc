@@ -267,6 +267,19 @@ static bool trans_fsgnj_d(DisasContext *ctx, arg_fsgnj_d *a)
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     if (a->rs1 == a->rs2) { /* FMOV */
+        /*
+         * `fmv.d fN, fN` ERASES ITSELF.  The FMOV path hands the SOURCE
+         * register's global straight to gen_set_fpr_d(), so with rd == rs1
+         * that becomes a tcg_gen_mov_i64() onto itself and no op is emitted
+         * -- not the read the encoding names and not the write.  Both are
+         * real accesses; what is missing is QEMU's lowering of them.  The
+         * rd != rs1 case emits the mov and the op walk reports both, so the
+         * statement is guarded rather than unconditional.
+         */
+        if (a->rd == a->rs1) {
+            insn_dataflow_state_read(insn_df_reg(riscv_fpr_regnames[a->rs1]));
+            insn_dataflow_state_write(insn_df_reg(riscv_fpr_regnames[a->rd]));
+        }
         dest = get_fpr_d(ctx, a->rs1);
     } else {
         TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);

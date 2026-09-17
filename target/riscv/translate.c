@@ -42,6 +42,22 @@
 
 /* global register indices */
 static TCGv cpu_gpr[32], cpu_gprh[32], cpu_pc, cpu_vl, cpu_vstart;
+
+/*
+ * The names the VECTOR file is declared under.
+ *
+ * File scope rather than local to riscv_translate_init() because a decode
+ * site that states an access to a vector register has to spell the register
+ * the same way the declaration did: an atom resolves by name, and a spelling
+ * that disagrees resolves to nothing and drops the operand silently.  One
+ * array, one spelling, both users.
+ */
+static const char *const riscv_vec_regnames[] = {
+    "v0",  "v1",  "v2",  "v3",  "v4",  "v5",  "v6",  "v7",
+    "v8",  "v9",  "v10", "v11", "v12", "v13", "v14", "v15",
+    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+    "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+};
 static TCGv_i64 cpu_fpr[32]; /* assume F and D extensions */
 static TCGv load_res;
 static TCGv load_val;
@@ -1577,17 +1593,12 @@ void riscv_translate_init(void)
      * time, and the declaration describes the storage.
      */
     {
-        static const char *const v_p[] = {
-            "v0",  "v1",  "v2",  "v3",  "v4",  "v5",  "v6",  "v7",
-            "v8",  "v9",  "v10", "v11", "v12", "v13", "v14", "v15",
-            "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
-            "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
-        };
         CPURISCVState *e = NULL;
-        uint32_t per_reg = sizeof(e->vreg) / ARRAY_SIZE(v_p);
+        uint32_t per_reg = sizeof(e->vreg) / ARRAY_SIZE(riscv_vec_regnames);
 
         QEMU_BUILD_BUG_ON(sizeof(((CPURISCVState *)0)->vreg) % 32 != 0);
-        insn_dataflow_declare_regfile(v_p, ARRAY_SIZE(v_p),
+        insn_dataflow_declare_regfile(riscv_vec_regnames,
+                                      ARRAY_SIZE(riscv_vec_regnames),
                                       offsetof(CPURISCVState, vreg),
                                       per_reg, per_reg);
     }

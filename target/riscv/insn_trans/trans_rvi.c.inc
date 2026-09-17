@@ -680,6 +680,23 @@ static bool trans_addi(DisasContext *ctx, arg_addi *a)
     } else if (a->rs1 == 0 || a->imm == 0) {
         insn_dataflow_note_word(INSN_DF_WORD_MOV);
     }
+    /*
+     * `mv rN, rN` -- `addi rN, rN, 0` -- ERASES ITSELF.
+     *
+     * tcg_gen_addi_tl() with a zero immediate is a tcg_gen_mov_tl(), and that
+     * emits nothing when destination and source are the same TCG global,
+     * which they are when rd == rs1 and neither is x0.  The instruction still
+     * reads the register and still writes it; the op stream is short of both
+     * because of how QEMU lowers it, not because the machine skipped them.
+     *
+     * rd == 0 and rs1 == 0 are excluded because they are a different fact --
+     * the hardwired zero, which has no global and is stated by the zero-reg
+     * route -- and because gen_arith_imm_fn takes a separate path for them.
+     */
+    if (a->imm == 0 && a->rd != 0 && a->rd == a->rs1) {
+        insn_dataflow_state_read(insn_df_reg(riscv_int_regnames[a->rs1]));
+        insn_dataflow_state_write(insn_df_reg(riscv_int_regnames[a->rd]));
+    }
     return gen_arith_imm_fn(ctx, a, EXT_NONE, tcg_gen_addi_tl, gen_addi2_i128);
 }
 

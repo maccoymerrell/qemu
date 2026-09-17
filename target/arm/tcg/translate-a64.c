@@ -42,6 +42,23 @@ static const char *regnames[] = {
 };
 
 /*
+ * The names the vector file is DECLARED under, spelled to match
+ * arm_translate_init()'s insn_dataflow_declare_regfile() exactly.
+ *
+ * An atom resolves by looking its name up among the TCG globals and then
+ * among the declared ranges, so a spelling that disagrees with the
+ * declaration resolves to nothing and silently drops the operand.  The two
+ * arrays are the same strings for the same reason A64_DF_PC_NAME is one
+ * macro: there is no build-time link between them, only this note.
+ */
+static const char *zregnames[] = {
+    "z0",  "z1",  "z2",  "z3",  "z4",  "z5",  "z6",  "z7",
+    "z8",  "z9",  "z10", "z11", "z12", "z13", "z14", "z15",
+    "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23",
+    "z24", "z25", "z26", "z27", "z28", "z29", "z30", "z31",
+};
+
+/*
  * The name the program counter's TCG global is registered under.
  *
  * Spelled once because two places need the same string: the registration in
@@ -6515,7 +6532,35 @@ TRANS(UMINP_v, do_gvec_fn3_no64, a, gen_gvec_uminp)
 
 TRANS(AND_v, do_gvec_fn3, a, tcg_gen_gvec_and)
 TRANS(BIC_v, do_gvec_fn3, a, tcg_gen_gvec_andc)
-TRANS(ORR_v, do_gvec_fn3, a, tcg_gen_gvec_or)
+/*
+ * `mov Vd.T, Vn.T` IS `orr Vd.T, Vn.T, Vn.T`, AND WITH d == n IT ERASES
+ * ITSELF.
+ *
+ * tcg_gen_gvec_or() sees aofs == bofs and swaps the whole operation for
+ * tcg_gen_gvec_mov(), which with dofs == aofs emits ops only for the part of
+ * the register the operation does not cover -- the upper half on a 64-bit
+ * form, nothing at all when oprsz == maxsz.  So the read of Vn is lost on
+ * every such encoding, and on the full-width form the write of Vd goes with
+ * it.  Both are the emulator's lowering choice and neither is the machine's,
+ * so they are stated here, guarded on exactly the elision that loses them.
+ *
+ * The vector file has no TCG global; it is the declared CPUArchState range
+ * named "zN" (target/arm/tcg/translate.c), which is the name an
+ * architectural consumer means whether the access was a NEON D or a full SVE
+ * one.
+ */
+static bool trans_ORR_v(DisasContext *s, arg_qrrr_e *a)
+{
+    if (a->rd == a->rn && a->rn == a->rm && a->rd < 32) {
+        unsigned oprsz = a->q ? 16 : 8;
+
+        insn_dataflow_state_read(insn_df_reg(zregnames[a->rn]));
+        if (oprsz == vec_full_reg_size(s)) {
+            insn_dataflow_state_write(insn_df_reg(zregnames[a->rd]));
+        }
+    }
+    return do_gvec_fn3(s, a, tcg_gen_gvec_or);
+}
 TRANS(ORN_v, do_gvec_fn3, a, tcg_gen_gvec_orc)
 TRANS(EOR_v, do_gvec_fn3, a, tcg_gen_gvec_xor)
 
@@ -8834,6 +8879,25 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
         insn_dataflow_state_read(insn_df_zero());
         note_zero_reg(false, a->rm, INSN_DF_RD);
         note_zero_reg(false, a->rd, INSN_DF_WR);
+        /*
+         * `mov xN, xN` ERASES ITSELF.  The 64-bit MOV arm below is a single
+         * tcg_gen_mov_i64(), and that emits NOTHING when its two arguments
+         * are the same TCG global -- which they are exactly when rd == rm.
+         * The instruction still reads xN and still writes it; what is absent
+         * is the emulator's lowering, not the machine's access, so the two
+         * facts are stated here where the encoding's fields are still in
+         * hand.  Every other route through this fast path emits an op that
+         * names the register, so a statement there would duplicate what the
+         * op walk already reports rather than restore something lost.
+         *
+         * Register 31 cannot reach this: cpu_reg(s, 31) mints a FRESH temp
+         * per call, so tcg_rd and tcg_rm differ and the mov is emitted --
+         * and note_zero_reg above has already said what that encoding means.
+         */
+        if (!a->n && a->sf && a->rd == a->rm && a->rd != 31) {
+            insn_dataflow_state_read(insn_df_reg(regnames[a->rm]));
+            insn_dataflow_state_write(insn_df_reg(regnames[a->rd]));
+        }
 
         if (a->n) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);

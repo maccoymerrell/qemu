@@ -2739,6 +2739,29 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     }
 }
 
+/*
+ * `move $rX, $rX` -- assembled as `addu $rX,$rX,$zero` or `or $rX,$rX,$zero`
+ * -- ERASES ITSELF.
+ *
+ * Both arms below swap the whole operation for a tcg_gen_mov_tl() when one
+ * source is register 0, and that emits NOTHING when its destination and its
+ * source are the same TCG global.  The instruction still reads the register
+ * and still writes it; the op stream is short of both because of QEMU's
+ * lowering, not because the machine skipped them.  note_zero_reg() above has
+ * already said what register 0 means here, which is a different fact.
+ *
+ * Guarded on exactly the elision: every other route through these arms emits
+ * an op naming the register, and a statement there would duplicate the walk
+ * rather than restore a lost operand.
+ */
+static void note_identity_move(int rd, int src)
+{
+    if (rd != 0 && src != 0 && rd == src) {
+        insn_dataflow_state_read(insn_df_reg(regnames[src]));
+        insn_dataflow_state_write(insn_df_reg(regnames[rd]));
+    }
+}
+
 /* Arithmetic */
 static void gen_arith(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
@@ -2790,8 +2813,10 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
         } else if (rs == 0 && rt != 0) {
+            note_identity_move(rd, rt);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rt]);
         } else if (rs != 0 && rt == 0) {
+            note_identity_move(rd, rs);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rs]);
         } else {
             tcg_gen_movi_tl(cpu_gpr[rd], 0);
@@ -2998,8 +3023,10 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_or_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
+            note_identity_move(rd, rt);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rt]);
         } else if (rs != 0 && rt == 0) {
+            note_identity_move(rd, rs);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rs]);
         } else {
             tcg_gen_movi_tl(cpu_gpr[rd], 0);
@@ -3009,8 +3036,10 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_xor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
+            note_identity_move(rd, rt);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rt]);
         } else if (rs != 0 && rt == 0) {
+            note_identity_move(rd, rs);
             tcg_gen_mov_tl(cpu_gpr[rd], cpu_gpr[rs]);
         } else {
             tcg_gen_movi_tl(cpu_gpr[rd], 0);

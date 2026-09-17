@@ -2091,6 +2091,20 @@ static bool trans_vmv_v_v(DisasContext *s, arg_vmv_v_v *a)
         /* vmv.v.v has rs2 = 0 and vm = 1 */
         vext_check_sss(s, a->rd, a->rs1, 0, 1)) {
         if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
+            /*
+             * `vmv.v.v vN, vN` ERASES ITSELF on this arm.  oprsz == maxsz
+             * here, so tcg_gen_gvec_mov() with dofs == aofs emits nothing at
+             * all -- not even the tail clear the narrower shapes leave.  The
+             * other arm calls a helper that reaches both ranges, so the walk
+             * sees them there and needs no statement; this one is stated.
+             *
+             * The vector file has no TCG global: it is the CPUArchState range
+             * declared as "vN" in riscv_translate_init().
+             */
+            if (a->rd == a->rs1) {
+                insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[a->rs1]));
+                insn_dataflow_state_write(insn_df_reg(riscv_vec_regnames[a->rd]));
+            }
             tcg_gen_gvec_mov(s->sew, vreg_ofs(s, a->rd),
                              vreg_ofs(s, a->rs1),
                              MAXSZ(s), MAXSZ(s));

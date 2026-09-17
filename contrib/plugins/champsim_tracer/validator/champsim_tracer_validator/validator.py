@@ -38,6 +38,7 @@ import bisect
 import dataclasses
 import importlib.util
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -3241,353 +3242,298 @@ def _check_call_return_store(
     return issues
 
 
+def _sha16_file(p) -> str:
+    """Sixteen hex digits of a file's SHA-256, or "absent"."""
+    import hashlib
+
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except OSError:
+        return "absent"
+
+
+def _find_cst_referee() -> Path:
+    """The EXTERNAL referee binary, or a refusal.
+
+    Located the way cst_decode is: an explicit CST_REFEREE, then PATH, then
+    the tree's conventional build directory.  A check that cannot find its
+    comparand FAILS; it never reports a zero.
+    """
+    import shutil
+
+    explicit = os.environ.get("CST_REFEREE")
+    if explicit:
+        p = Path(explicit)
+        if p.is_file():
+            return p
+        raise FileNotFoundError("CST_REFEREE=%r does not exist" % explicit)
+    on_path = shutil.which("cst_referee")
+    if on_path:
+        return Path(on_path)
+    here = Path(__file__).resolve().parent
+    in_tree = (here.parent.parent.parent.parent.parent
+               / "build" / "contrib" / "plugins" / "cst_referee")
+    if in_tree.is_file():
+        return in_tree.resolve()
+    raise FileNotFoundError(
+        "cst_referee binary not found; build it with "
+        "`ninja contrib/plugins/cst_referee`, or set CST_REFEREE")
+
+
+_REF_RULINGS = (Path(__file__).resolve().parent.parent.parent /
+                "tools" / "setjoin_rulings.tsv")
+
+
+def _load_setjoin_rulings() -> dict:
+    """The checked-in REAL-LOST arbitrations, keyed (isa, name, direction).
+
+    REFUSES an absent or unparsable file.  "I could not find the rulings" is
+    not "there are none", and a check that treated it as the latter would
+    report every settled arbitration as a fresh error.
+    """
+    if not _REF_RULINGS.is_file():
+        raise FileNotFoundError(
+            "%s: the arbitration corpus is missing; without it a settled "
+            "disagreement cannot be told from a new one" % _REF_RULINGS)
+    out: dict = {}
+    for line in _REF_RULINGS.read_text(errors="replace").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        p = line.split("\t")
+        if len(p) < 7:
+            continue
+        out[(p[0].strip(), p[1].strip(), p[2].strip())] = (
+            p[3].strip(), p[4].strip(), "\t".join(p[6:]).strip())
+    if not out:
+        raise ValueError("%s: parsed 0 arbitrations" % _REF_RULINGS)
+    return out
+
+
+def _referee_reg_sets(isa: str, encodings: list[str],
+                      stamp: str) -> tuple[dict, str]:
+    """{(encoding, direction): set(REG_* names)} from the EXTERNAL referee.
+
+    The referee links the pinned Capstone the wrap names, compiles
+    disas/capstone.c so the boundary workarounds are exactly the ones the
+    tree ships, refuses to run if the library it loaded is not the one its
+    headers describe, and links no plugin and no emulator.  Returns the
+    corpus and the note it stamped it with.
+    """
+    import subprocess
+    import tempfile
+
+    ref = _find_cst_referee()
+    with tempfile.TemporaryDirectory(prefix="cstref_") as d:
+        src = Path(d) / ("ident_%s.tsv" % isa)
+        with src.open("w") as f:
+            f.write("#so %s\n" % stamp)
+            f.write("#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n")
+            for e in encodings:
+                f.write("%s\t%s\t-\t-\t-\t-\t-\n" % (isa, e))
+        r = subprocess.run([str(ref), "--isa", isa, "--in", str(src),
+                            "--out-dir", d],
+                           capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            raise RuntimeError("cst_referee rc=%d: %s"
+                               % (r.returncode, (r.stderr or "").strip()))
+        out: dict = {}
+        note = ""
+        gen = Path(d) / ("gen_c_%s.tsv" % isa)
+        if not gen.is_file():
+            raise RuntimeError("cst_referee wrote no %s" % gen.name)
+        for line in gen.read_text(errors="replace").splitlines():
+            if line.startswith("#referee"):
+                note = line[1:].strip()
+                continue
+            if line.startswith("#"):
+                continue
+            p = line.split("\t")
+            if len(p) < 7 or p[2] != "c":
+                continue
+            names = {n.strip() for n in p[6].split(",")
+                     if n.strip() and n.strip() not in ("-", "+MORE")}
+            out.setdefault((p[1], p[3]), set()).update(names)
+    return out, note
+
+
 def _check_static_reg_sets(
     templates: list[dict],
     isa: str,
     reg_id_to_name: dict[int, str],
+    stamp: str = "",
 ) -> list[Issue]:
-    """Compare the wire's src/dst register sets against a second decoder.
+    """Compare the wire's src/dst register sets against the EXTERNAL referee.
 
-    NOT AN ORACLE, and the old summary line calling the comparand
-    "ground truth" was wrong about what this can decide.  The wire's
-    lists are QEMU's statements about the ops the instruction emitted;
-    the expectation built below is Capstone's operand record.  Both
-    sides are decoders, so a difference is a DISAGREEMENT to arbitrate,
-    and the arbitration for the one settled class -- a control transfer
-    writing the program counter, which an operand record for a near
-    branch does not name -- is made inline and counted.
+    218-A: THIS CHECK USED TO BUILD ITS COMPARAND FROM IN-PROCESS CAPSTONE --
+    the `capstone` Python module, whatever version happened to be installed
+    beside the validator, walked with a private copy of the operand rules.
+    That is disqualified twice over.  It is an in-process Capstone comparand,
+    which no longer scores anything in this tree; and it was never the same
+    Capstone the wire's boundary is pinned to, so a version difference
+    between the module and subprojects/capstone read as a decoder
+    disagreement and was counted as an error against the wire.  118 of the
+    168 deep-flag errors this cell reported were scored by it.
+    The comparand is now cst_referee: the pinned wrap Capstone, with
+    disas/capstone.c compiled in so the PEXTR / MSA / store-move workarounds
+    are the tree's own, refusing to run at all if the library it loaded is
+    not the one its headers describe.  It is the SAME comparand setjoin
+    scores REAL-LOST with, so this check and the series can no longer
+    disagree about what Capstone said.
 
-    Comparison is **by symbolic name** (REG_FLAGS, REG_IP, …) rather
-    than numeric GenericRegId.  The trace's own ENCODINGS section
-    supplies the per-trace `gen_id → name` mapping in
-    @reg_id_to_name; the validator translates the trace's numeric
-    `src_regs`/`dst_regs` into name sets and compares against the
-    name set the validator builds from Capstone + the per-ISA reg-
-    class table.  This is the design the trace's self-describing
-    format intends — numeric ids may shift as new register banks land
-    but names are stable.
+    WHAT IS AN ERROR, AND WHAT IS NOT.
+      * A name the referee states and the wire does not is a LOSS.  It is an
+        error UNLESS the (isa, name, direction) class carries a written
+        arbitration in tools/setjoin_rulings.tsv -- a settled arbitration is
+        not an error, and re-reporting one here would make this cell
+        contradict the series' own scored verdict.  Adjudicated losses are
+        COUNTED, per ruling, so they cannot quietly grow.
+      * A name the wire states and the referee does not is a GAIN.  The wire's
+        lists are QEMU's since the D1 flip and the contract is equal-or-
+        better, so a superset is permitted; gains are counted and reported,
+        never failed.  The series scores REAL-GAIN separately.
 
-    The C decoder's static discovery rules are otherwise unchanged:
-    explicit register operands use access flags when available,
-    otherwise the first register operand is treated as the
-    destination for opcodes where that convention is valid; memory
-    base/index registers are sources; RISC-V/MIPS Capstone access
-    flags and implicit regs_read/regs_write are skipped because they
-    disagree with the tracer detail path for common pseudos and
-    control-flow forms.  The comparison is set-based because the
-    trace format promises operand identity, not a consumer-visible
-    semantic ordering guarantee.
+    Refusals: no referee binary, no arbitration corpus, a referee that
+    decodes nothing, or zero instructions checked.  A check that cannot find
+    its subject must fail rather than report a clean zero.
     """
-    md, _op_mem_kind = _make_capstone(isa)
-    kinds = _capstone_operand_kinds(isa)
-    if md is None or kinds is None:
-        return [Issue(
-            "static_reg_sets", "error",
-            f"static register-set check cannot run for isa={isa}",
-        )]
-    op_reg_kind, op_imm_kind, op_mem_kind = kinds
-    reg_class = _capstone_reg_class_for_isa(isa)
-    opcode_names, _ = _load_name_tables()
-
-    first_reg_is_not_dst = {
-        "STORE", "CMP", "BRANCH", "RET", "SYSCALL", "NOP",
-    }
-
     issues: list[Issue] = []
-    n_checked = 0
-    n_errors = 0
+
+    try:
+        rulings = _load_setjoin_rulings()
+    except Exception as e:       # noqa: BLE001 - reported, not swallowed
+        return [Issue("static_reg_sets", "error",
+                      "static register-set check cannot run: %s" % e)]
+
+    def _name(rid: int) -> str:
+        return reg_id_to_name.get(int(rid)) or ("REG_%d" % int(rid))
+
+    # One pass to collect the encodings, so the referee is run ONCE per ISA
+    # rather than once per instruction.
+    subjects: list[tuple[int, int, dict, str]] = []
     n_skipped = 0
-    # Disagreements ruled FOR QEMU at the transfer class; see the
-    # adjudication beside the comparison.  Counted, never silent.
-    n_transfer_adjudicated = 0
-    # Direct branches whose PC-relative target QEMU folded to a constant, so
-    # the program counter is not a read; see the arbitration.
-    n_pcfold_adjudicated = 0
-
-    def add(out: set[str], cap_id: int) -> None:
-        entry = reg_class.get(int(cap_id))
-        if entry is None:
-            return
-        for reg_name in entry.names:
-            if reg_name and reg_name != "REG_NONE":
-                out.add(reg_name)
-
     for tmpl in templates:
-        # Kernel (CST_INSN_FLAG_SYSTEM) templates of a system-mode trace
-        # are not in the compiled binary, so there is no ground truth to
-        # compare their register sets against — skip them, matching the
-        # user-subsequence alignment the rest of the validator performs.
+        # Kernel (CST_INSN_FLAG_SYSTEM) templates of a system-mode trace are
+        # not in the compiled binary, so there is no image to decode them
+        # from -- the same user-subsequence alignment the rest of the
+        # validator performs.
         if tmpl.get("is_system"):
             continue
         tid = int(tmpl["template_id"])
-        for idx, ins in enumerate(tmpl.get("insns", [])):
+        for idx, ins in enumerate(tmpl.get("insns", []) or []):
             raw = ins.get("raw_bytes")
             if not raw:
                 n_skipped += 1
                 continue
-            decoded = list(md.disasm(bytes(raw), int(ins["pc"])))
-            if not decoded:
-                n_skipped += 1
-                continue
-            d = decoded[0]
-            ops = getattr(d, "operands", []) or []
-            have_access_info = any(
-                int(getattr(op, "access", 0) or 0) != 0 for op in ops
-            )
-            # Match the tracer's behavior: use Capstone's per-operand
-            # access flags when present, falling back to the
-            # opcode-indexed first_reg_is_not_dst heuristic only when
-            # the disasm carries no access info.  Previously the
-            # validator blanket-disabled access info for RISC-V / MIPS
-            # because of disagreements on pseudos and control-flow
-            # forms; those specific cases are now caught by the
-            # per-mnemonic skip block further down.
-            opcode_name = opcode_names.get(int(ins.get("opcode", 0)), "?")
-            first_is_dst = opcode_name not in first_reg_is_not_dst
-            seen_first_reg = False
-            exp_src: set[str] = set()
-            exp_dst: set[str] = set()
+            subjects.append((tid, idx, ins, bytes(raw).hex()))
 
-            for op in ops:
-                if op.type == op_reg_kind:
-                    if have_access_info:
-                        access = int(getattr(op, "access", 0) or 0)
-                        if access & 1:
-                            add(exp_src, op.reg)
-                        if access & 2:
-                            add(exp_dst, op.reg)
-                    else:
-                        if first_is_dst and not seen_first_reg:
-                            add(exp_dst, op.reg)
-                        else:
-                            add(exp_src, op.reg)
-                        seen_first_reg = True
-                elif op.type == op_mem_kind:
-                    add(exp_src, getattr(op.mem, "base", 0) or 0)
-                    add(exp_src, getattr(op.mem, "index", 0) or 0)
-                elif op.type == op_imm_kind:
-                    continue
+    if not subjects:
+        return [Issue("static_reg_sets", "error",
+                      "no template instruction carried raw bytes; the "
+                      "comparand has nothing to decode and a zero measured "
+                      "that way is not a measurement")]
 
-            # Implicit regs (regs_read[]/regs_write[]) fold in for every
-            # ISA — matches decode.cc's
-            # `isa_properties[..].include_implicit_regs` gate, which is
-            # now true everywhere.  MIPS needs it for the HI:LO
-            # accumulator and RISC-V for the vector-configuration CSRs
-            # (`vl`/`vtype`) and the FP rounding mode (`frm`), none of
-            # which appear in an operand field.
-            for cap_id in getattr(d, "regs_read", []) or []:
-                add(exp_src, cap_id)
-            for cap_id in getattr(d, "regs_write", []) or []:
-                add(exp_dst, cap_id)
+    encodings = sorted({e for _, _, _, e in subjects})
+    try:
+        ref, note = _referee_reg_sets(isa, encodings, stamp or "validator")
+    except Exception as e:       # noqa: BLE001 - reported, not swallowed
+        return [Issue("static_reg_sets", "error",
+                      "external referee did not answer for isa=%s: %s"
+                      % (isa, e))]
+    if not ref:
+        return [Issue("static_reg_sets", "error",
+                      "the external referee produced no register sets for "
+                      "any of %d encodings on %s" % (len(encodings), isa))]
 
-            _apply_boundary_corrections(isa, d, ops, op_reg_kind,
-                                        op_mem_kind, add, exp_src, exp_dst)
+    n_checked = 0
+    n_errors = 0
+    n_blank = 0
+    gains: Counter = Counter()
+    adjudicated: Counter = Counter()
 
-            # Translate trace's numeric reg ids → symbolic names via
-            # the trace's own ENCODINGS reg map.  Unknown ids (no entry
-            # in the map) get a "REG_<id>" placeholder so the diff is
-            # still legible — but in practice the trace always carries
-            # every id it emits.
-            def _name(rid: int) -> str:
-                name = reg_id_to_name.get(int(rid))
-                if name:
-                    return name
-                return f"REG_{int(rid)}"
+    for tid, idx, ins, enc in subjects:
+        exp_src = ref.get((enc, "r"))
+        exp_dst = ref.get((enc, "w"))
+        if exp_src is None and exp_dst is None:
+            # Capstone declined these bytes.  That is an ANSWER -- the
+            # column is "the referee has nothing here" -- and it is counted,
+            # not silently dropped.
+            n_blank += 1
+            continue
+        exp_src = exp_src or set()
+        exp_dst = exp_dst or set()
 
-            actual_src = {_name(r) for r in ins.get("src_regs", []) or []
-                          if int(r) != 0}
-            actual_dst = {_name(r) for r in ins.get("dst_regs", []) or []
-                          if int(r) != 0}
+        act_src = {_name(r) for r in ins.get("src_regs", []) or []
+                   if int(r) != 0}
+        act_dst = {_name(r) for r in ins.get("dst_regs", []) or []
+                   if int(r) != 0}
+        n_checked += 1
 
-            mnemonic = (getattr(d, "mnemonic", "") or "").lower()
-            op_str = (getattr(d, "op_str", "") or "").lower()
-            # Known Capstone-vs-QEMU detail mismatches.  These are not
-            # useful src/dst-reg oracle cases: x87 stack operands are
-            # renumbered differently for FXCH, RISC-V `j` pseudos can
-            # surface a spurious source register in QEMU detail, and
-            # MIPS FP pair operands do not agree between the two APIs.
-            if (isa == "x86_64" and "st(" in op_str):
-                n_skipped += 1
-                continue
-            if (isa == "riscv64" and opcode_name == "BRANCH"
-                    and not exp_src and not exp_dst and actual_src
-                    and not actual_dst):
-                n_skipped += 1
-                continue
-            if isa == "riscv64" and mnemonic in ("beqz", "bnez", "ecall"):
-                n_skipped += 1
-                continue
-            if isa == "riscv64" and mnemonic in ("auipc", "lui"):
-                n_skipped += 1
-                continue
-            # Aliased link forms hide ra completely in Capstone 6 (not
-            # in operands NOR the always-empty riscv implicit arrays);
-            # the tracer re-adds REG_LR in refine_alias_fields.  Assert
-            # that restoration positively instead of skipping: raw
-            # Capstone's sets plus the link register ARE the expected
-            # truth.  Plain "jal imm" / 1-reg "jalr rs" write ra;
-            # "ret" reads it.  Non-aliased forms carry the link reg
-            # explicitly and need no fixup.
-            if isa == "riscv64":
-                if mnemonic == "jal" and not exp_dst:
-                    exp_dst.add("REG_LR")
-                elif mnemonic == "jalr" and not exp_dst:
-                    exp_dst.add("REG_LR")
-                elif mnemonic == "ret" and not exp_src:
-                    exp_src.add("REG_LR")
-            if isa == "riscv64" and mnemonic.startswith("v"):
-                n_skipped += 1
-                continue
-            if (isa == "mipsel" and ("$f" in op_str
-                                      or mnemonic.endswith((".s", ".d")))):
-                n_skipped += 1
-                continue
-            if isa == "mipsel" and mnemonic == "sc":
-                n_skipped += 1
-                continue
-            # lwl/lwr (and 64-bit ldl/ldr) partially write the dst, so
-            # the tracer promotes it to READ|WRITE (disas/capstone.c
-            # workaround); raw Capstone says WRITE-only.  The corrected
-            # behaviour is pinned exactly by probe_mips_lwl_lwr.
-            if isa == "mipsel" and mnemonic in ("lwl", "lwr",
-                                                "ldl", "ldr"):
-                n_skipped += 1
-                continue
-            if isa == "mipsel" and mnemonic in ("madd", "msub"):
-                n_skipped += 1
-                continue
-            if isa == "mipsel" and mnemonic.startswith(("jalr", "jr")):
-                n_skipped += 1
-                continue
-            n_checked += 1
-            if actual_src == exp_src and actual_dst == exp_dst:
-                continue
+        unruled = []
+        for direction, lost in (("r", exp_src - act_src),
+                                ("w", exp_dst - act_dst)):
+            for nm in sorted(lost):
+                key = (isa, nm, direction)
+                if key in rulings:
+                    adjudicated["%s %s (%s)" % (nm, direction,
+                                                rulings[key][0])] += 1
+                else:
+                    unruled.append((nm, direction))
+        for nm in sorted((act_src - exp_src) | (act_dst - exp_dst)):
+            gains[nm] += 1
 
-            # ------------------------------------------------------------
-            # THE TWO DECODERS DISAGREE, AND THIS CHECK IS NOT AN ORACLE.
-            #
-            # The wire's register lists are QEMU's statements about the ops
-            # the instruction emitted; the expectation above is a second
-            # decoder's OPERAND RECORD.  Where they differ the question is
-            # which one is right, and one class has a settled answer.
-            #
-            # A control transfer WRITES THE PROGRAM COUNTER, and a
-            # conditional one READS THE FLAGS.  QEMU's ops say so because
-            # that is what the translator emitted; Capstone's x86 operand
-            # record for a near `jmp rel`/`jcc rel` carries one immediate
-            # operand, no register operand, and an empty implicit list, so
-            # neither name appears on the expectation side.  The instruction
-            # plainly does both things, so the disagreement is ruled FOR
-            # QEMU -- the same ground as the flags write a decoder drops
-            # from TEST's memory-operand form.
-            #
-            # It is ADJUDICATED, not skipped: the wire must be a strict
-            # SUPERSET of the expectation by exactly those two names and
-            # nothing else, and the count is reported, so this cannot
-            # quietly absorb a real loss.
-            gained_dst = actual_dst - exp_dst
-            gained_src = actual_src - exp_src
-            lost_dst = exp_dst - actual_dst
-            lost_src = exp_src - actual_src
-            has_mem_operand = any(op.type == op_mem_kind for op in ops)
-            # The wire's own encoding map spells the program counter REG_IP
-            # on some traces and REG_PC on others; both name the same
-            # register and the arbitration is about the register, not the
-            # spelling.
-            pc_names = {"REG_PC", "REG_IP"}
-            writes_pc = bool(actual_dst & pc_names)
+        if not unruled:
+            continue
 
-            # (a) The wire NAMES the program counter where the operand record
-            #     does not.  A transfer writes the PC and a conditional one
-            #     reads the flags; QEMU's ops say so because the translator
-            #     emitted them.  Ruled FOR QEMU.
-            #
-            #     REG_ZERO IS ADMITTED ON THE READ SIDE FOR THE SAME REASON
-            #     IT ALREADY WAS ON THE WRITE SIDE.  An architectural zero
-            #     register is an OPERAND of the encoding that an assembler's
-            #     alias hides in its printed form: riscv `li a7,0x5d` IS
-            #     `addi a7,zero,0x5d`, mipsel `beqz $t0,X` IS
-            #     `beq $t0,$zero,X`, and mipsel `lui` takes $zero through the
-            #     same operand accessor every other immediate form does
-            #     (target/mips/tcg/translate.c, gen_logic_imm's OPC_LUI arm
-            #     states it).  QEMU names the register the ENCODING names;
-            #     the operand record names the one the MNEMONIC prints.  The
-            #     ruling is FOR QEMU, and it is the same ruling the write
-            #     side already carries rather than a new one.
-            if (not lost_dst and not lost_src
-                    and gained_dst <= (pc_names | {"REG_ZERO"})
-                    and gained_src <= (pc_names | {"REG_FLAGS", "REG_ZERO"})
-                    and (gained_dst or gained_src)):
-                n_transfer_adjudicated += 1
-                continue
+        n_errors += 1
+        issues.append(Issue(
+            "static_reg_sets", "error",
+            "template t%d insn #%d pc=0x%x enc=%s: the referee names "
+            "%s and the wire does not, and no arbitration covers "
+            "%s -- wire src %s dst %s, referee src %s dst %s"
+            % (tid, idx, int(ins["pc"]), enc,
+               ", ".join("%s (%s)" % (n, d) for n, d in unruled),
+               "it" if len(unruled) == 1 else "them",
+               sorted(act_src), sorted(act_dst),
+               sorted(exp_src), sorted(exp_dst)),
+            {
+                "template_id": tid,
+                "insn_index": idx,
+                "pc": int(ins["pc"]),
+                "encoding": enc,
+                "unruled_losses": ["%s %s" % (n, d) for n, d in unruled],
+                "expected_src": sorted(exp_src),
+                "actual_src": sorted(act_src),
+                "expected_dst": sorted(exp_dst),
+                "actual_dst": sorted(act_dst),
+            },
+        ))
 
-            # (b) The wire DROPS the program counter as a SOURCE of a direct
-            #     branch, which the operand record names.  Also ruled FOR
-            #     QEMU, and it is the same ruling as (a) rather than its
-            #     opposite: a PC-relative branch's target is a constant the
-            #     translator computed, so no op reads the program counter and
-            #     the dependency chain genuinely breaks there.  Naming it a
-            #     read would tie every direct branch to whatever instruction
-            #     last "wrote" the PC -- which is every instruction -- and
-            #     serialise a chain hardware does not have.  The ABI's own
-            #     header makes the same point from the other side: an empty
-            #     provenance on the program counter is what tells a direct
-            #     branch from an indirect one.
-            #
-            #     NARROW ON PURPOSE.  It applies only to an instruction that
-            #     WRITES the program counter and has NO memory operand, so it
-            #     cannot absorb an x86 RIP-relative ADDRESS whose fold is
-            #     stated at gen_lea_modrm and belongs in the read set.
-            if (writes_pc and not has_mem_operand
-                    and not lost_dst and not gained_dst and not gained_src
-                    and lost_src and lost_src <= pc_names):
-                n_pcfold_adjudicated += 1
-                continue
-
-            n_errors += 1
-            issues.append(Issue(
-                "static_reg_sets", "error",
-                f"template t{tid} insn #{idx} pc=0x{int(ins['pc']):x} "
-                f"{getattr(d, 'mnemonic', '')} {getattr(d, 'op_str', '')}: "
-                f"src/dst reg set mismatch — "
-                f"wire src {sorted(actual_src)} dst {sorted(actual_dst)}, "
-                f"comparand src {sorted(exp_src)} dst {sorted(exp_dst)}",
-                {
-                    "template_id": tid,
-                    "insn_index": idx,
-                    "pc": int(ins["pc"]),
-                    "mnemonic": getattr(d, "mnemonic", ""),
-                    "op_str": getattr(d, "op_str", ""),
-                    "expected_src": sorted(exp_src),
-                    "actual_src": sorted(actual_src),
-                    "expected_dst": sorted(exp_dst),
-                    "actual_dst": sorted(actual_dst),
-                },
-            ))
+    if n_checked == 0:
+        return issues + [Issue(
+            "static_reg_sets", "error",
+            "the referee answered for no encoding this trace carries "
+            "(%d subjects, %d referee-blank); a check with no subject "
+            "fails" % (len(subjects), n_blank))]
 
     issues.append(Issue(
         "static_reg_sets", "info",
-        f"static register sets: ok={n_checked - n_errors} "
-        f"checked={n_checked} skipped={n_skipped} errors={n_errors} "
-        f"transfer_adjudicated={n_transfer_adjudicated} "
-        f"pcfold_adjudicated={n_pcfold_adjudicated}",
+        "static register sets vs the EXTERNAL referee: ok=%d checked=%d "
+        "skipped=%d referee-blank=%d errors=%d adjudicated=%d gains=%d  "
+        "[%s]"
+        % (n_checked - n_errors, n_checked, n_skipped, n_blank, n_errors,
+           sum(adjudicated.values()), sum(gains.values()), note or "-"),
         {"checked": n_checked, "skipped": n_skipped,
-         "errors": n_errors,
-         "transfer_adjudicated": n_transfer_adjudicated,
-         "pcfold_adjudicated": n_pcfold_adjudicated},
+         "referee_blank": n_blank, "errors": n_errors,
+         "adjudicated": dict(adjudicated),
+         "gains": dict(gains),
+         "referee": note},
     ))
     return issues
 
-
-# ---------------------------------------------------------------------------
-# Address-recompute check — uses captured §5.2 reg-snaps + Capstone python
-# to verify that each runtime memop's recorded VA matches the effective
-# address computed from base/index/disp/scale of the issuing insn.
-# ---------------------------------------------------------------------------
-
-# GenericRegId numbering (must match build_reg_names() in
-# champsim_tracer_decode.py): REG_NONE=0, GPRn=1+n, SP=250, FLAGS=251,
-# IP=252, LR=253, FP_REG=254.
 
 def _x86_64_name_to_genid() -> dict[str, int]:
     m: dict[str, int] = {}
@@ -7368,110 +7314,18 @@ def _is_reducer_opcode(opcode_name: str) -> bool:
     return False
 
 
-# ---- Per-ISA expected-lane-count derivation from Capstone disasm ---------
-# These helpers re-run Capstone on the raw insn bytes to recover the
-# operand-level lane shape used by the plugin's lane_baseline_from_
-# operands().  Returning None means "can't classify" — the caller
-# treats the ground-truth check as vacuous for that insn (e.g.
-# scalar-only forms with no per-element semantics).
-
-# Whole-register opaque moves — match the mnemonic exactly (and the
-# VEX/EVEX-prefixed `v…` form) so we don't trip the size-suffix matcher
-# on coincidental "...dq" tails.
-_X86_WHOLE_REG_MNEMS = {
-    "movdqa", "movdqu", "lddqu",
-    "vmovdqa", "vmovdqu", "vlddqu",
-    "vmovdqa32", "vmovdqa64", "vmovdqu32", "vmovdqu64",
-    "vmovdqu8", "vmovdqu16",
-}
-
-# Scalar-FP suffixes — these only write the low element.  Tracked
-# separately because their natural lane count is always 1 regardless
-# of register width (xmm/ymm/zmm).
-_X86_SCALAR_SUFFIXES = ("ss", "sd")
-
-
-def _x86_lane_bytes_for_mnem(mnem: str) -> int | None:
-    m = mnem.lower()
-    if m in _X86_WHOLE_REG_MNEMS:
-        # 1 "lane" semantics — caller squashes to a 1-bit mask
-        # regardless of register width via the scalar code path.
-        return None
-    # Packed FP — order matters: check 2-char suffix before 1-char int
-    # suffix to avoid matching "ps" as suffix "s" then unknown.
-    if m.endswith("ps"): return 4
-    if m.endswith("pd"): return 8
-    # Plain int element-size suffix.  Single-char last-letter lookup
-    # so "paddq" -> 'q' -> 8 (NOT "dq" -> 16, which would mis-detect
-    # the whole-reg-move path).
-    return {"b": 1, "w": 2, "d": 4, "q": 8}.get(m[-1])
-
-
-def _x86_op_width_from_str(op_str: str) -> int | None:
-    s = op_str.lower()
-    if "zmm" in s:  return 64
-    if "ymm" in s:  return 32
-    if "xmm" in s:  return 16
-    return None
-
-
-def _x86_expected_lane_count(mnem: str, op_str: str) -> int | None:
-    m = mnem.lower()
-    width = _x86_op_width_from_str(op_str)
-    if width is None:
-        return None
-    # Whole-register opaque moves: one "lane" by convention — the
-    # plugin's lane_baseline_from_operands typically reports
-    # lane_bytes == size for these, giving mask = 1.
-    if m in _X86_WHOLE_REG_MNEMS:
-        return 1
-    # Scalar SS/SD: only the low element is the active result.  Other
-    # lanes are passed through unchanged from src1 — but for a per-
-    # instruction "active lanes" view, only lane 0 matters.
-    if any(m.endswith(suf) for suf in _X86_SCALAR_SUFFIXES):
-        return 1
-    lb = _x86_lane_bytes_for_mnem(mnem)
-    if lb is None:
-        return None
-    return max(1, width // lb)
-
-
-_AARCH64_VAS_RE = __import__("re").compile(r"\.(\d+)([bhsdq])")
-
-
-def _aarch64_expected_lane_count(mnem: str, op_str: str) -> int | None:
-    m = _AARCH64_VAS_RE.search(op_str.lower())
-    if not m:
-        return None
-    return int(m.group(1))
-
-
-_MIPS_MSA_SUFFIX_TO_LANES = {
-    ".b": 16, ".h": 8, ".w": 4, ".d": 2, ".v": 1,
-}
-
-
-def _mips_expected_lane_count(mnem: str, op_str: str) -> int | None:
-    m = mnem.lower()
-    for suf, lanes in _MIPS_MSA_SUFFIX_TO_LANES.items():
-        if m.endswith(suf):
-            return lanes
-    return None
-
-
-def _expected_lane_count(isa: str, mnem: str, op_str: str) -> int | None:
-    if not mnem:
-        return None
-    if isa == "x86_64":
-        return _x86_expected_lane_count(mnem, op_str)
-    if isa == "aarch64":
-        return _aarch64_expected_lane_count(mnem, op_str)
-    if isa == "mipsel":
-        return _mips_expected_lane_count(mnem, op_str)
-    # RISC-V V lane count depends on vl at runtime (vsetvli /
-    # vsetvl) — checking it would require replaying CSR writes from
-    # the trace.  Skip until we plumb that.
-    return None
+# ---- The per-ISA expected-lane-count derivation is GONE (218-A) ----------
+#
+# _x86_lane_bytes_for_mnem, the aarch64 .<n><T> regex and the MIPS MSA
+# suffix table used to turn an instruction's PRINTED FORM -- rendered by
+# the analyzer's in-process Capstone -- back into a lane count, and
+# _check_lane_masks scored the wire's lane masks against it.  That made a
+# hand-written third decoder, riding on a Capstone the wire's boundary is
+# not pinned to, the judge of a wire fact.  Ruling (c) disqualifies the
+# comparand and the external referee cannot stand in for it, because its
+# own lane facts come from the tracer's classification -- see the retirement
+# note at check 5.  Deleted rather than left unreferenced, so nothing can
+# quietly acquire a second user.
 
 
 def _is_contiguous_prefix_mask(mask: int) -> bool:
@@ -7504,25 +7358,10 @@ def _accumulate_lane_records(entries: list[dict]) -> dict:
     return out
 
 
-def _build_pc_to_gt_insn(meta_blocks: list[dict]) -> dict[int, dict]:
-    """Flatten every block's ground_truth.insns into a PC-keyed map.
-    Used by checks that need the Capstone disassembly of an
-    instruction at a specific PC (mnemonic, op_str, raw_bytes_hex)."""
-    out: dict[int, dict] = {}
-    for b in meta_blocks:
-        gt = b.get("ground_truth")
-        if not gt:
-            continue
-        for ins in gt.get("insns") or []:
-            out[int(ins["pc"])] = ins
-    return out
-
-
 def _check_lane_masks(cp_entries: list[dict],
                       templates_by_id: dict[int, dict],
                       opcode_names: dict[int, str],
-                      isa: str,
-                      pc_to_gt: dict[int, dict] | None = None) -> list[Issue]:
+                      isa: str) -> list[Issue]:
     """Validate per-instance lane-mask FIDs against the trace's own
     classification metadata.  Runs four invariant checks for every
     instance carrying any lane-mask record:
@@ -7548,9 +7387,10 @@ def _check_lane_masks(cp_entries: list[dict],
         "parallel_mismatch": 0,
         "reducer_widen":  0,
         "parallel_on_reducer": 0,
-        "gt_checked":     0,
-        "gt_mismatch":    0,
-        "gt_unclassified": 0,
+        # Check 5 was RETIRED under 218-A (see the note at its site).
+        # The population it used to score is still counted so the
+        # retirement is a number on the record, not a silence.
+        "gt_retired_218a": 0,
     }
     issues: list[Issue] = []
 
@@ -7719,49 +7559,39 @@ def _check_lane_masks(cp_entries: list[dict],
                              "src_pop": src_pop, "dst_pop": dst_pop},
                         ))
 
-        # Check 5: ground-truth lane SPAN bound from Capstone disasm.
-        # _expected_lane_count gives the register's full lane count
-        # (size / element-bytes).  No operand's lane mask may exceed
-        # that span — but it is correct (and required) for it to be
-        # NARROWER: element insert produces 1 dst lane, its pass-
-        # through src reads total-1, extract reads 1, reductions
-        # collapse.  So the invariant is observed <= expected; only an
-        # over-span (observed > expected) is a real bug (wrong
-        # lane_bytes / a memop->lane association past the register).
-        # Unclassifiable insns (scalar-only, unsupported ISA, RISC-V V
-        # runtime vl) are counted, not flagged.
-        if pc_to_gt is not None and all_masks:
-            gt_ins = pc_to_gt.get(int(I.get("pc", 0)))
-            if gt_ins is not None:
-                expected = _expected_lane_count(
-                    isa, gt_ins.get("mnemonic", ""),
-                    gt_ins.get("op_str", ""))
-                if expected is None:
-                    counts["gt_unclassified"] += 1
-                else:
-                    counts["gt_checked"] += 1
-                    observed = max(bin(m).count("1") for m in all_masks)
-                    if observed > expected:
-                        counts["gt_mismatch"] += 1
-                        if counts["gt_mismatch"] <= 5:
-                            issues.append(Issue(
-                                "lane_masks", "error",
-                                f"lane mask exceeds register span vs "
-                                f"Capstone disasm at seq={seq} tid={tid} "
-                                f"insn[{insn_idx}] "
-                                f"pc=0x{int(I.get('pc', 0)):x} "
-                                f"{gt_ins.get('mnemonic', '?')} "
-                                f"{gt_ins.get('op_str', '')}: "
-                                f"span={expected} observed={observed} "
-                                f"masks={fams}",
-                                {"seq": seq, "tid": tid,
-                                 "insn_index": insn_idx,
-                                 "pc": int(I.get("pc", 0)),
-                                 "mnemonic": gt_ins.get("mnemonic"),
-                                 "op_str": gt_ins.get("op_str"),
-                                 "span": expected,
-                                 "observed": observed},
-                            ))
+        # Check 5 -- RETIRED, 218-A.  It bounded the observed lane span by
+        # an "expected" lane count derived from the instruction's PRINTED
+        # FORM: the analyzer's in-process Capstone rendered a mnemonic and
+        # an op_str, and _x86_lane_bytes_for_mnem / the aarch64 .<n><T>
+        # regex / the MIPS MSA suffix table turned those strings back into
+        # a lane count.  Two things disqualify it and one makes it
+        # unrepairable in place.
+        #
+        #   * The comparand was IN-PROCESS CAPSTONE -- the `capstone`
+        #     Python module, whatever version is installed beside the
+        #     validator, not subprojects/capstone, which is the Capstone
+        #     the wire's boundary is pinned to.  Ruling (c): no in-process
+        #     Capstone comparand scores anything in this tree.
+        #   * Underneath it was a THIRD hand-written decoder -- a private
+        #     per-ISA suffix heuristic -- that nobody arbitrates, nobody
+        #     versions, and no external reference agrees or disagrees
+        #     with.  A disagreement with it was reported as a wire defect.
+        #   * The external referee cannot replace it as a comparand.  Its
+        #     lane facts (facts_<isa>.tsv lanekind/lanebytes) come from
+        #     cstref_decode -- the tracer's OWN lane classification -- so
+        #     scoring the wire's lane mask against them would be the wire
+        #     checked against itself.  There is no external subject here,
+        #     and the honest disposition is retirement, not a re-point.
+        #
+        # WHAT SURVIVES IS NOT WEAKENED.  Checks 1-4 and the containment
+        # rule below are invariants of the wire's OWN content -- mask
+        # shape, cross-family containment, the lane-parallel flag, the
+        # reducer narrowing rule -- and none of them consults a decoder.
+        # The population this check used to cover is still COUNTED, so the
+        # retirement is visible and its size is on the record rather than
+        # disappearing into a smaller number.
+        if all_masks:
+            counts["gt_retired_218a"] += 1
 
     if not counts["instances"]:
         return [Issue(
@@ -8892,13 +8722,21 @@ def validate(meta_path: Path, trace_path: Path,
     isa = meta.get("isa", "x86_64")
 
     # Static register identity check: verify the template's src_regs and
-    # dst_regs agree with Capstone operand detail and the active tracer
-    # per-ISA register classification table.  Comparison is by REG_*
-    # symbolic name; the trace's own ENCODINGS section supplies the
+    # dst_regs against the EXTERNAL referee's operand record (218-A --
+    # the in-process Capstone comparand this used to build is retired),
+    # joined against the checked-in arbitrations so a settled
+    # disagreement is not re-reported as a fresh error.  Comparison is by
+    # REG_* symbolic name; the trace's own ENCODINGS section supplies the
     # gen_id → name mapping so the validator tracks the plugin's
     # GenericRegId enum automatically.
+    #
+    # The referee corpus is STAMPED with the trace it was built for, per
+    # the 219-B rule: the comparand is a property of (this trace, this
+    # referee), and an unstamped one would be a corpus nothing can name.
     reg_id_to_name = dict(trace_meta.get("encoding_maps", {}).get("reg", {}))
-    issues += _check_static_reg_sets(templates, isa, reg_id_to_name)
+    _ref_stamp = "trace=%s" % _sha16_file(trace_path)
+    issues += _check_static_reg_sets(templates, isa, reg_id_to_name,
+                                     _ref_stamp)
     issues += _check_call_return_store(templates, isa, reg_id_to_name)
 
     # Per-instruction memop attribution: ensure every dyn_param's
@@ -9074,9 +8912,8 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_regdata_reconstruction(cp_entries, templates_by_id,
                                              opcode_names, reg_id_to_name,
                                              has_reg_data, isa)
-    pc_to_gt = _build_pc_to_gt_insn(meta["blocks"])
     issues += _check_lane_masks(cp_entries, templates_by_id, opcode_names,
-                                isa, pc_to_gt)
+                                isa)
     issues += _check_dep_refine_coverage(templates, blocks_by_id, cp_set)
 
     return Report(issues=issues, stats=stats)

@@ -207,12 +207,24 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
     i_stamp, ident = read_corpus(ident_path, 6)
     o_stamp, opc = read_corpus(opc_path, 4)
 
+    #
+    # THE 219-B RULE, ahead of the skew check.  Two unstamped corpora COMPARE
+    # EQUAL, so a skew check alone passes them both and the verdict goes out
+    # naming no corpus at all -- which is how two passes of this report read
+    # green on samples that differed.  A verdict is a property of
+    # (commit, corpus); a corpus that cannot name its build cannot carry one.
+    #
+    for what, st in (("identity", i_stamp), ("opcode", o_stamp)):
+        if not st:
+            raise Refusal("%s: the %s corpus has no #so stamp.  A bucket "
+                          "verdict is a property of (commit, corpus), and an "
+                          "unstamped corpus cannot say which build wrote it"
+                          % (isa, what))
     if i_stamp != o_stamp:
         raise Refusal("%s: the two corpora were written by different builds "
                       "(%s vs %s); joining them would score one build's "
                       "answers against another's"
-                      % (isa, i_stamp or "<unstamped>", o_stamp or
-                         "<unstamped>"))
+                      % (isa, i_stamp, o_stamp))
 
     if universe is not None:
         u_stamp = universe[0]
@@ -259,7 +271,7 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
     total = sum(counts.values())
     print("== %s   %d encodings, %d also in the Capstone corpus"
           % (isa, total, len(overlap)), file=out)
-    print("   stamp %s" % (i_stamp or "<unstamped>"), file=out)
+    print("   corpus stamp %s" % i_stamp, file=out)
     for b in BUCKETS:
         n = counts[b]
         print("   %-15s %8d  %5.1f%%"
@@ -294,7 +306,7 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
             print("      UNRULED %8d  rule %-16s QEMU %-22s Capstone %s"
                   % (n, key[1], key[2], key[3]), file=out)
 
-    return counts, classes, unruled
+    return counts, classes, unruled, i_stamp
 
 
 def dispose(rulings, scored, universes):
@@ -353,6 +365,20 @@ SELFTEST_CASES = [
     ("disjoint-keys",
      [("q", "01", "add", "add", "int.add", "GEN_OP_INT_ADD", "BRANCH_NONE")],
      [("q", "99", "add", "GEN_OP_INT_ADD")], STAMP, STAMP, "REFUSED"),
+    #
+    # The 219-B arms.  Two UNSTAMPED corpora compare EQUAL, so the skew check
+    # passes them and the bucket verdict goes out naming no corpus at all.
+    # Both directions must refuse, or the sample stops being nameable.
+    #
+    ("ident-unstamped",
+     [("q", "01", "add", "add", "int.add", "GEN_OP_INT_ADD", "BRANCH_NONE")],
+     [("q", "01", "add", "GEN_OP_INT_ADD")], "", STAMP, "REFUSED"),
+    ("opc-unstamped",
+     [("q", "01", "add", "add", "int.add", "GEN_OP_INT_ADD", "BRANCH_NONE")],
+     [("q", "01", "add", "GEN_OP_INT_ADD")], STAMP, "", "REFUSED"),
+    ("both-unstamped",
+     [("q", "01", "add", "add", "int.add", "GEN_OP_INT_ADD", "BRANCH_NONE")],
+     [("q", "01", "add", "GEN_OP_INT_ADD")], "", "", "REFUSED"),
 ]
 
 
@@ -402,7 +428,7 @@ def selftest_rulings():
             got = None
             try:
                 rul = read_rulings(rp)
-                _c, _cl, unruled = report("q", ip, op, 0, sink, rul)
+                _c, _cl, unruled, _st = report("q", ip, op, 0, sink, rul)
                 dead = [k for k, r in rul.items() if r.used == 0]
                 got = ("unruled" if unruled else
                        "unreached" if dead else "ok")
@@ -598,6 +624,7 @@ def main():
     bad = 0
     scored = set()
     universes = {}
+    stamps = {}
     for isa in args.isa:
         u = None
         if args.universe:
@@ -610,12 +637,13 @@ def main():
                 continue
             universes[isa] = u[1]
         try:
-            counts, _classes, unruled = report(
+            counts, _classes, unruled, stamp = report(
                 isa,
                 os.path.join(args.dir, "ident_%s.tsv" % isa),
                 os.path.join(args.dir, "opc_%s.tsv" % isa),
                 args.top, sys.stdout, rulings, u)
             scored.add(isa)
+            stamps[isa] = stamp
         except REFUSALS as e:
             print("gapreport: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
@@ -665,6 +693,14 @@ def main():
         if dead:
             bad += 1
 
+    #
+    # The verdict carries its corpus (219-B).  A "gapreport: PASS"
+    # pasted into a report without the stamp beside it is the same
+    # failure in prose form.
+    #
+    for isa in args.isa:
+        print("gapreport: %s read on corpus %s"
+              % (isa, stamps.get(isa) or "<REFUSED, not read>"))
     print("gapreport: %s" % ("FAIL" if bad else "PASS"))
     return 1 if bad else 0
 

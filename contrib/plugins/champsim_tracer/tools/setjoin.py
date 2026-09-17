@@ -100,6 +100,19 @@ def read_gen(path):
     if ndata == 0:
         raise Refusal("%s: no data rows -- the run produced no corpus, and a "
                       "score over nothing is not a score" % path)
+    #
+    # THE 219-B RULE.  A verdict is a property of (commit, corpus), never of
+    # a commit alone -- two passes of this scorer read green on corpora that
+    # differed, and the green was the sample.  So a reading has to be able to
+    # say WHICH corpus it read, and a corpus that cannot say which build
+    # produced it cannot support one.  Printing "<unstamped>" beside the
+    # number was not enough: the number still travelled.  This refuses.
+    #
+    if not stamp:
+        raise Refusal("%s: no #so stamp.  A REAL-LOST reading is a property "
+                      "of (commit, corpus); an unstamped corpus cannot name "
+                      "the build it came from, so no verdict read on it can "
+                      "be quoted against a commit" % path)
     for side, what in (("q", "QEMU"), ("c", "the Capstone walk")):
         if not sides[side]:
             raise Refusal("%s: no rows from %s at all.  A join with one arm "
@@ -234,7 +247,8 @@ def report(isa, path, top, out, strict=True, rulings=None):
 
     print("== %s   %d (encoding, direction) keys in BOTH sides" % (isa, s["both"]),
           file=out)
-    print("   stamp %s" % (stamp or "<unstamped>"), file=out)
+    print("   corpus stamp %s" % stamp, file=out)
+    s["stamp"] = stamp
     print("   names stated: QEMU %d, Capstone walk %d"
           % (s["q_named"], s["c_named"]), file=out)
     print("   CHANGED   %8d  encodings whose two sides differ at all"
@@ -290,6 +304,13 @@ SELFTEST_CASES = [
      "REFUSED"),
     ("both sides empty",
      [("01", "q", "r", "-"), ("01", "c", "r", "-")], "REFUSED"),
+    # The 219-B arm.  Written with NOSTAMP as the first element so the
+    # writer below leaves the #so line out entirely; a corpus that cannot
+    # name its build must refuse, not read as a clean zero.
+    ("an UNSTAMPED corpus REFUSES",
+     [("NOSTAMP", "", "", ""),
+      ("01", "q", "r", "REG_GPR0"), ("01", "c", "r", "REG_GPR0")],
+     "REFUSED"),
 ]
 
 
@@ -301,9 +322,14 @@ def selftest():
     with tempfile.TemporaryDirectory() as d:
         for name, rows, want in SELFTEST_CASES:
             p = os.path.join(d, "gen_q.tsv")
+            stamped = not (rows and rows[0][0] == "NOSTAMP")
             with open(p, "w") as f:
-                f.write("#so plugin=aa emulator=bb\n" + SIDES)
+                if stamped:
+                    f.write("#so plugin=aa emulator=bb\n")
+                f.write(SIDES)
                 for enc, side, direction, names in rows:
+                    if enc == "NOSTAMP":
+                        continue
                     n = 0 if names == "-" else len(names.split(","))
                     f.write("q\t%s\t%s\t%s\t%d\t%d\t%s\n"
                             % (enc, side, direction, n, n, names))
@@ -444,6 +470,7 @@ def main():
             return 2
 
     bad = 0
+    stamps = {}
     for isa in args.isa:
         try:
             s = report(isa, os.path.join(args.dir, "gen_%s.tsv" % isa),
@@ -452,6 +479,7 @@ def main():
             print("setjoin: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
             continue
+        stamps[isa] = s.get("stamp")
         if args.require_no_loss and s["lost"]:
             print("setjoin: %s: REAL-LOST is %d, required 0"
                   % (isa, sum(s["lost"].values())), file=sys.stderr)
@@ -469,6 +497,13 @@ def main():
                       % (isa, len(s["dead"])), file=sys.stderr)
                 bad += 1
 
+    #
+    # The verdict carries its corpus.  A "setjoin: PASS" line pasted into a
+    # report without the stamp beside it is the 219-B failure in prose form.
+    #
+    for isa in args.isa:
+        print("setjoin: %s read on corpus %s"
+              % (isa, stamps.get(isa) or "<REFUSED, not read>"))
     print("setjoin: %s" % ("FAIL" if bad else "PASS"))
     return 1 if bad else 0
 

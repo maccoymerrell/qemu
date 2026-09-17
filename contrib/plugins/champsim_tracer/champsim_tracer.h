@@ -1502,11 +1502,6 @@ static inline bool cst_va_is_kernel_code(uint64_t pc)
     return qemu_plugin_vaddr_is_kernel(pc);
 }
 
-extern const InsnClassification *active_insn_table;
-extern unsigned active_insn_table_size;
-extern const RegClassification *active_reg_table;
-extern unsigned active_reg_table_size;
-
 /* Plugin configuration: parsed from -plugin args, immutable after
  * qemu_plugin_install. */
 extern int max_wrong_path_depth;
@@ -1706,32 +1701,23 @@ void altmint_conditional_alternate(const InsnFields *terminal,
                                    uint64_t fall_through,
                                    uint64_t followed_pc);
 
-/* Defined in champsim_tracer_decode.cc */
-void decode_detail_to_generic(uint64_t pc,
-                              const void *bytes, size_t nbytes,
-                              const qemu_plugin_insn_info *info,
-                              InsnFields *out,
-                              InsnRegNames *out_names);
-
-/* Defined in champsim_tracer_decode.cc */
-bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
-                         uint8_t opcode,
-                         uint64_t pc,
-                         uint8_t insn_size,
-                         SyntheticEAInfo *out);
+/*
+ * decode_detail_to_generic() and decode_synthetic_ea() are the Capstone
+ * operand walk.  They are not in the plugin: they are declared in
+ * champsim_tracer_capstone_tables.h and built into the two offline tools.
+ */
 
 /*
  * Build the GenericRegId -> QemuRegKey reverse index: the map from a wire
  * register id to the (feature, name) pair a VALUE read needs to find its GDB
- * register handle.  Must run after active_reg_table is set; idempotent.
- * Defined in champsim_tracer_decode.cc.
+ * register handle.  Idempotent.
+ * Defined in champsim_tracer_gdbmap.cc.
  *
  * SCOPE, because it is easy to mistake for a decode input and it is not one.
  * This map answers "where do I READ this register's bytes", which is the
  * regdata path; nothing about classification, dataflow or the operand lists
- * consults it.  Its rows are still derived from the per-ISA register table,
- * which is why it is named here as what the Capstone dependency's removal has
- * to re-home rather than as something the statement flip already replaced.
+ * consults it.  Its rows come from the generated gdbstub table, which is
+ * generated from the register files the target itself declares.
  */
 void build_qemu_reg_reverse_index(void);
 

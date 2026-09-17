@@ -22,7 +22,7 @@ extern "C" {
 #include "champsim_marker.h"
 
 #define CHAMPSIM_MNEMONIC_TABLES_IMPL 1
-#include "champsim_tracer_mnemonics.h"
+#include "champsim_tracer_capstone_tables.h"
 
 /* ====================================================================
  * Shared dependency refiners

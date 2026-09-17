@@ -3172,11 +3172,6 @@ static_assert(MAX_SRC_REGS <= 255,
 static_assert(MAX_DST_REGS <= 255,
               "MAX_DST_REGS no longer fits in u8");
 
-const InsnClassification *active_insn_table;
-unsigned active_insn_table_size;
-const RegClassification *active_reg_table;
-unsigned active_reg_table_size;
-
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
@@ -11954,10 +11949,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         return -1;
     }
 
-    active_insn_table = isa_insn_class[trace_isa];
-    active_insn_table_size = isa_insn_class_size[trace_isa];
-    active_reg_table = isa_reg_class[trace_isa];
-    active_reg_table_size = isa_reg_class_size[trace_isa];
 
     /* Build the GenericRegId → QemuRegKey reverse index (needs the
      * per-ISA reg table).  The multi-reg path (RISC-V V*M* tuples,

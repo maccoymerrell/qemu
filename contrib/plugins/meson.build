@@ -28,7 +28,6 @@ if get_option('plugins')
   if has_cpp
     champsim_tracer_sources = files(
       'champsim_tracer/champsim_tracer.cc',
-      'champsim_tracer/champsim_tracer_decode.cc',
       'champsim_tracer/champsim_tracer_wp.cc',
       'champsim_tracer/champsim_tracer_delay.cc',
       'champsim_tracer/champsim_tracer_output.cc',
@@ -49,7 +48,6 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_path_builder.cc',
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
-      'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
       'champsim_tracer/champsim_tracer_isa_properties.cc',
       'champsim_tracer/champsim_tracer_vocabulary.cc',
       'champsim_tracer/champsim_tracer_regmap.cc',
@@ -127,9 +125,19 @@ if get_option('plugins')
   # the names of the variables that would drive it -- a property nm and strings
   # can check, which is why it is a build option and not a runtime one.
   #
-  champsim_tracer_deps = [glib, capstone]
+  #
+  # Capstone rides the same switch, and that is the point of the switch.  The
+  # classification tables and the operand walk that read them are no longer
+  # built into the plugin at all -- they are apparatus, and they live in the
+  # two offline tool libraries.  What is left in-process is one column of the
+  # comparison corpus, the mnemonic the other decoder printed, reached through
+  # cst_capture_cap_decode(), which exists only in a capture build.  So the
+  # SHIPPED plugin does not link libcapstone: not "links it and declines to
+  # call it" -- does not link it, which ldd and nm both say out loud.
+  champsim_tracer_deps = [glib]
   if get_option('cst_capture')
     champsim_tracer_cpp_args += ['-DCST_CAPTURE']
+    champsim_tracer_deps += capstone
   endif
   if host_os == 'windows'
     champsim_tracer_so = shared_module('champsim_tracer',

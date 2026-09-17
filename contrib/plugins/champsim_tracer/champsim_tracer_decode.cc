@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_capstone_tables.h"
 #include "champsim_tracer_regmap.h"
 #include "champsim_tracer_capture.h"
 #include "champsim_tracer_reg_handle_cache.h"
@@ -23,52 +24,6 @@ static const RegClassification *lookup_reg_class(uint16_t cap_id)
     return &active_reg_table[cap_id];
 }
 
-void capture_initial_regfile(unsigned int cpu_index,
-                             std::vector<InitialRegSnap> *out)
-{
-    if (!out) {
-        return;
-    }
-    out->clear();
-    g_autoptr(GByteArray) buf = g_byte_array_new();
-    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
-        const QemuRegKey *key = qemu_reg_for_generic_id((uint8_t)i);
-        if (!key) {
-            continue;
-        }
-        InitialRegSnap snap;
-        snap.gen_id = (uint8_t)i;
-        snap.width_bytes = 0;
-        memset(snap.bytes, 0, sizeof(snap.bytes));
-
-        /* No vCPU context yet (install-time start_trace_segment): pin
-         * the generic ID with width_bytes=0 (no live value). */
-        if (cpu_index != (unsigned int)-1) {
-            struct qemu_plugin_register *handle =
-                g_reg_handle_cache.lookup(cpu_index, key);
-            if (handle) {
-                g_byte_array_set_size(buf, 0);
-                int n = qemu_plugin_read_register(handle, buf);
-                if (n > 0) {
-                    size_t w = (size_t)n;
-                    if (w > CST_MAX_WIDE_BYTES) {
-                        w = CST_MAX_WIDE_BYTES;
-                    }
-                    cst_normalize_reg_bytes_to_le(buf->data, w);
-                    snap.width_bytes = (uint8_t)w;
-                    memcpy(snap.bytes, buf->data, w);
-                }
-            }
-        }
-        out->push_back(snap);
-    }
-}
-
-/*
- * Returns the src_regs[] slot holding @reg_id (existing on dedup, else
- * newly allocated), or UINT8_MAX when skipped (REG_NONE / table full).
- * The slot index feeds HAS_ADDR address-dep masks.
- */
 static inline uint8_t add_src_reg(InsnFields *f, InsnRegNames *refs,
                                   uint8_t reg_id, const QemuRegKey *qemu_reg)
 {

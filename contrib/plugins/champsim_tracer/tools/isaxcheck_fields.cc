@@ -36,6 +36,7 @@
  */
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_capstone_tables.h"
 #include "champsim_tracer_mnemonics.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"

@@ -93,6 +93,29 @@ struct InsnAliasSnap {
     bool    branch_conditional;
 };
 
+/*
+ * WHY AN INSTRUCTION HAS NO PUBLISHED REGISTER LISTS.
+ *
+ * The seating can decline, and when it does the template keeps the zeroed
+ * lists it was reset with -- so the trace publishes an instruction naming no
+ * register, which is also what an instruction that genuinely touches none
+ * looks like.  The comparison corpus is read to decide whether a name was
+ * LOST, so it has to be told which of the two it is looking at.
+ *
+ * The first five values mirror QdepRefusal; the last is for a caller that did
+ * not run the seating at all, which is a third claim again.  Declared outside
+ * the capture guard because the caller passes one either way, and checked
+ * against QdepRefusal at the call site so the two cannot drift apart.
+ */
+enum {
+    CST_WIRE_SEATED       = 0,
+    CST_WIRE_NO_RULE      = 1,
+    CST_WIRE_INCOMPLETE   = 2,
+    CST_WIRE_UNKNOWN_WORD = 3,
+    CST_WIRE_NO_STATUS    = 4,
+    CST_WIRE_NOT_ASKED    = 5,
+};
+
 #ifdef CST_CAPTURE
 
 /*
@@ -175,6 +198,26 @@ void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
                        const struct InsnAliasSnap *alias,
                        const struct InsnFields *f);
 
+/*
+ * The register lists the trace PUBLISHES for these bytes: @f's src_regs[] and
+ * dst_regs[], as the seating just produced them.
+ *
+ * Called from the one site that runs the seating, and handed its result, so
+ * the corpus carries the wire's own lists rather than a re-derivation of them.
+ * The alternative -- running the seating a second time from inside the capture
+ * -- would double every refusal tally its census reads, which is a corrupted
+ * instrument in exchange for a column that is already in hand.
+ *
+ * THIS IS THE JOIN'S QEMU SIDE.  What used to fill it was
+ * qemu_plugin_insn_reg_reads/writes, the raw provenance bit sets the seating
+ * works FROM; those are still written, under side 'p', because they answer a
+ * different question and the difference between the two columns is itself a
+ * reading.  See the 'p' comment in champsim_tracer_capture.cc.
+ */
+void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
+                           const void *bytes, size_t nbytes,
+                           const struct InsnFields *f, int refusal);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -195,6 +238,10 @@ static inline void cst_capture_alias(const void *, size_t, const char *,
                                     const struct InsnAliasSnap *,
                                     const struct InsnAliasSnap *,
                                     const struct InsnFields *)
+{ }
+static inline void cst_capture_wire_sets(const struct qemu_plugin_tb *, size_t,
+                                         const void *, size_t,
+                                         const struct InsnFields *, int)
 { }
 
 #endif /* CST_CAPTURE */

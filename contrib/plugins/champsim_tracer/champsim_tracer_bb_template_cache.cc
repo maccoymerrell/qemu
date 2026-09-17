@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_capture.h"
 #include "champsim_tracer_qdep.h"
 #include "champsim_tracer_smc_match.h"
 #include "champsim_tracer_stats.h"
@@ -1654,11 +1655,22 @@ BBTemplate *TemplateStore::create_tb_template(
              * is the emulator's own answer about the ops it just emitted and
              * the rule those ops came from.
              */
+            int seated = CST_WIRE_NOT_ASKED;
+
             if (insns.tb && insns.raw_idx) {
-                qdep_apply(insns.tb, insns.raw_idx[i], tmpl->insn_pcs[i],
-                           &scratch[i].f,
-                           with_names ? &nscratch[i].rn : nullptr);
+                seated = (int)qdep_apply(insns.tb, insns.raw_idx[i],
+                                         tmpl->insn_pcs[i], &scratch[i].f,
+                                         with_names ? &nscratch[i].rn
+                                                    : nullptr);
             }
+            /* The comparison capture's two spellings of a refusal must not
+             * drift from the seating's own.  Checked, not assumed. */
+            static_assert((int)QDEP_OK == CST_WIRE_SEATED &&
+                          (int)QDEP_NO_RULE == CST_WIRE_NO_RULE &&
+                          (int)QDEP_INCOMPLETE == CST_WIRE_INCOMPLETE &&
+                          (int)QDEP_UNKNOWN_WORD == CST_WIRE_UNKNOWN_WORD &&
+                          (int)QDEP_NO_STATUS == CST_WIRE_NO_STATUS,
+                          "QdepRefusal and the capture's spelling disagree");
             /*
              * Static branch target as resolved by the per-ISA
              * translator, not Capstone.  See
@@ -1669,6 +1681,18 @@ BBTemplate *TemplateStore::create_tb_template(
             if (insn_branch_target_pcs) {
                 scratch[i].f.taken_target_pc = insn_branch_target_pcs[i];
             }
+            /*
+             * The comparison capture's wire-side column, written HERE because
+             * this is the one place the published register lists exist: the
+             * seating that produces them has just run, and asking for them
+             * anywhere else would mean running it a second time and doubling
+             * the refusal tallies its own census reads.  Compiles to nothing
+             * in a release build.
+             */
+            cst_capture_wire_sets(insns.tb,
+                                  insns.raw_idx ? insns.raw_idx[i] : 0,
+                                  &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                                  tmpl->insn_sizes[i], &scratch[i].f, seated);
             srcs[i] = &scratch[i].f;
             name_srcs[i] = with_names ? &nscratch[i].rn : nullptr;
         }

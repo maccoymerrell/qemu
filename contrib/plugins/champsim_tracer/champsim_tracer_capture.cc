@@ -290,9 +290,23 @@ void corpora_init()
          * dst_regs[] are GENERIC ids, the Capstone walk produces generic ids,
          * and a join between a TCG global's name and a generic id is not a
          * join.  So this corpus states both sides in the currency the wire
-         * uses -- the QEMU side put through the same register map the wire
-         * would put it through, the Capstone side as the walk produced it --
-         * from the same run and the same window, keyed on the same encoding.
+         * uses, from the same run and the same window, keyed on the encoding.
+         *
+         * THREE SIDES, AND THE JOIN IS TWO OF THEM.
+         *
+         *   q  the WIRE: src_regs[] / dst_regs[] as the seating published
+         *      them.  This is what a consumer of the trace receives, so it is
+         *      the arm a loss is measured on.
+         *   c  the other decoder's operand walk, as it produced it.
+         *   p  the raw provenance bit sets the seating works FROM, put
+         *      through the wire's register map.  NOT the wire: the seating
+         *      adds to them from the vector-operand statements, the
+         *      store-data dependency family and the write notes, so a
+         *      register the wire publishes through one of those is absent
+         *      here.  Scored as the QEMU arm it reported losses that were
+         *      never losses; kept as its own column because the difference
+         *      between p and q is the only reading that separates a
+         *      provenance gap from a seating gap.
          *
          * A MEMBER THE MAP CANNOT TRANSLATE IS STILL A MEMBER.  It prints as
          * @unmapped:<qemu name>, an atom as its index, an undeclared env range
@@ -832,8 +846,29 @@ void emit_gen_set(const char *isa, const char *enc, char side, char dir,
             nraw, nuniq, k ? names : "-", nraw > n ? ",+MORE" : "");
 }
 
-/* QEMU's side: walk the provenance bits, spell each one generic. */
-void emit_gen_set_qemu(const char *isa, const char *enc, char dir,
+/*
+ * THE RAW PROVENANCE SET, WHICH IS NOT THE WIRE.  Side 'p'.
+ *
+ * `qemu_plugin_insn_reg_reads/writes` are the bit sets the emulator recorded
+ * while the ops were emitted.  They are the INPUT the seating works from, not
+ * the lists the trace publishes: qdep_apply() turns them into src_regs[] and
+ * dst_regs[] and adds to them from the other statement channels -- the vector
+ * operand statements, the store-data dependency family, the write notes -- so
+ * a register the wire publishes through one of those is absent here while
+ * nothing was lost.
+ *
+ * Measured on this tree, two of them: `dup v0.16b, w1` hands this side an
+ * EMPTY write set and publishes `-> %v0`; `str q0, [x0]` names no vector
+ * register here and publishes `vstore %v0`.  Scoring REAL-LOST against this
+ * side counted both as losses.
+ *
+ * So it is no longer the join's QEMU arm.  It is kept, under its own side
+ * letter, because it is the only reading that can say whether a difference
+ * between the wire and the other decoder came from the provenance bits or
+ * from the seating on top of them -- and because a column that is deleted
+ * when it turns out to answer a different question cannot be re-read later.
+ */
+void emit_gen_set_prov(const char *isa, const char *enc, char dir,
                        const uint64_t *set, unsigned nwords)
 {
     char labels[SET_NAMES_MAX][40];
@@ -853,11 +888,17 @@ void emit_gen_set_qemu(const char *isa, const char *enc, char dir,
             }
         }
     }
-    emit_gen_set(isa, enc, 'q', dir, labels, total, n);
+    emit_gen_set(isa, enc, 'p', dir, labels, total, n);
 }
 
-/* The Capstone walk's side: the list the wire would publish today. */
-void emit_gen_set_cap(const char *isa, const char *enc, char dir,
+/*
+ * A LIST OF GENERIC IDS, AS EITHER DECODER PUBLISHES ONE.
+ *
+ * Both the wire's src_regs[]/dst_regs[] and the Capstone walk's lists are
+ * arrays of generic register ids, so one spelling serves both and the two
+ * sides cannot drift apart in how they are rendered.
+ */
+void emit_gen_set_ids(const char *isa, const char *enc, char side, char dir,
                       const uint8_t *regs, unsigned nregs)
 {
     char labels[SET_NAMES_MAX][40];
@@ -868,10 +909,107 @@ void emit_gen_set_cap(const char *isa, const char *enc, char dir,
                  generic_reg_name_or_unknown(regs[i]));
         n++;
     }
-    emit_gen_set(isa, enc, 'c', dir, labels, nregs, n);
+    emit_gen_set(isa, enc, side, dir, labels, nregs, n);
+}
+
+/* The Capstone walk's side: the list that decoder would publish. */
+void emit_gen_set_cap(const char *isa, const char *enc, char dir,
+                      const uint8_t *regs, unsigned nregs)
+{
+    emit_gen_set_ids(isa, enc, 'c', dir, regs, nregs);
 }
 
 } /* namespace */
+
+/*
+ * THE WIRE'S OWN LISTS.  Side 'q'.
+ *
+ * Handed the InsnFields the seating just produced, at the one call that
+ * produces them, so this side is the trace's published register lists and not
+ * a second derivation of them.  Reading them anywhere else would mean calling
+ * qdep_apply() a second time, which would double every refusal tally the
+ * census reads.
+ *
+ * The key is the encoding, as everywhere else in these corpora, and the row is
+ * deduplicated on (encoding, side, direction, names) -- so an encoding that
+ * seats two different lists in one run keeps both rows and an encoding that
+ * seats the same list a million times writes one.
+ */
+void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
+                           const void *bytes, size_t nbytes,
+                           const struct InsnFields *f, int refusal)
+{
+    if (!bytes || !nbytes || !f) {
+        return;
+    }
+    corpora_init();
+    if (!corpus_gen->get()) {
+        return;
+    }
+
+    char enc[2 * 32 + 1];
+
+    hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /*
+     * A SEATING THAT WAS REFUSED IS NOT A SET WITH NOTHING IN IT.
+     *
+     * When the seating declines, the template keeps the zeroed lists it was
+     * reset with, and the trace publishes an instruction that names no
+     * register.  Written as "-" that is indistinguishable from an encoding
+     * which genuinely touches none -- and this corpus is read to decide
+     * whether a name was LOST, so the two have to be told apart or the
+     * commonest question it answers is answered wrong in both directions.
+     *
+     * So a refusal prints as a member: @refused:<why>, in the same shape as
+     * the @unmapped: and @env+ members the corpus already carries for things
+     * that are not register names.  It compares as itself, which is right:
+     * the other decoder named registers here and the wire named a refusal,
+     * and that is a difference in both columns rather than a silence in one.
+     */
+    if (refusal != CST_WIRE_SEATED) {
+        static const char *const why[] = {
+            "seated", "no-rule", "incomplete", "unknown-word", "no-status",
+            "not-asked",
+        };
+        char lab[40];
+        unsigned k = (unsigned)refusal;
+        const char *w = k < (sizeof(why) / sizeof(why[0])) ? why[k] : "?";
+
+        /*
+         * "incomplete" alone does not say WHAT overflowed, and the four
+         * causes are four different remedies -- more write slots, more env
+         * range slots, more memop rows, or a decode site that declined.  The
+         * emulator records which, so the row carries it.
+         */
+        if (refusal == CST_WIRE_INCOMPLETE && tb) {
+            qemu_plugin_dataflow_status st = qemu_plugin_dataflow_status();
+
+            st.struct_size = sizeof(st);
+            if (qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
+                snprintf(lab, sizeof(lab), "@refused:%s:%s%s%s%s", w,
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES) ? "W" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_FIELDS) ? "F" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS) ? "M" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED) ? "D" : "");
+            } else {
+                snprintf(lab, sizeof(lab), "@refused:%s:?", w);
+            }
+        } else {
+            snprintf(lab, sizeof(lab), "@refused:%s", w);
+        }
+
+        char labels[1][40];
+
+        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
+        emit_gen_set(isa_name(), enc, 'q', 'r', labels, 1, 1);
+        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
+        emit_gen_set(isa_name(), enc, 'q', 'w', labels, 1, 1);
+        return;
+    }
+    emit_gen_set_ids(isa_name(), enc, 'q', 'r', f->src_regs, f->n_src_regs);
+    emit_gen_set_ids(isa_name(), enc, 'q', 'w', f->dst_regs, f->n_dst_regs);
+}
 
 void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
                        const struct InsnAliasSnap *walk,
@@ -1406,8 +1544,8 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
         score_reg_set(isa_name(), enc, 'w', wr, 8, &n_named, &n_map);
         emit_reg_set(isa_name(), enc, 'r', rd, 8);
         emit_reg_set(isa_name(), enc, 'w', wr, 8);
-        emit_gen_set_qemu(isa_name(), enc, 'r', rd, 8);
-        emit_gen_set_qemu(isa_name(), enc, 'w', wr, 8);
+        emit_gen_set_prov(isa_name(), enc, 'r', rd, 8);
+        emit_gen_set_prov(isa_name(), enc, 'w', wr, 8);
         snprintf(regs, sizeof(regs), "%u/%u", n_named, n_map);
     } else {
         snprintf(sets, sizeof(sets), "-\t-");

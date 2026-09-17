@@ -213,7 +213,14 @@ _register_probe('probe_x86_fp_sqrt_cmp', {'x86_64': {'asm': '"sqrtsd %%xmm1, %%x
 _register_probe('probe_x86_fp_mov_cvt', {'x86_64': {'asm': '"movsd %%xmm1, %%xmm0\\n\\t"\n'
                    '    "cvtsi2sd %%rax, %%xmm2"',
             'clobbers': '"xmm0","xmm2"',
-            'opcodes': ['FP_MOV', 'FP_CVT']}})
+            # `movsd %xmm1,%xmm0` register-to-register is NOT a scalar FP
+            # move: it writes the destination's low lane and PRESERVES the
+            # upper lane, so the instruction reads its own destination and
+            # carries a RAW edge on it.  FP_MOV would say a whole scalar
+            # datum was written and would lose that edge; VEC_MOV is the
+            # merge-move the hardware performs.  (cvtsi2sd is a genuine
+            # conversion and stays FP_CVT.)
+            'opcodes': ['VEC_MOV', 'FP_CVT']}})
 
 _register_probe('probe_x86_fma', {'x86_64': {'asm': '"vfmadd132sd %%xmm1, %%xmm2, %%xmm0\\n\\t"\n'
                    '    "vfmsub132sd %%xmm4, %%xmm5, %%xmm3"',
@@ -432,19 +439,35 @@ _register_probe('probe_mips_fp_mov_cvt', {'mipsel': {'asm': '"mov.d    $f0, $f2\
             'clobbers': '"$f0","$f4"',
             'opcodes': ['FP_MOV', 'FP_CVT']}})
 
+# MIPS `nop` assembles to sll $zero,$zero,0 -- the canonical member of the
+# hint code-point space (rd == rs == rt == 0), where sa 0 is NOP, 1 SSNOP,
+# 3 EHB, 5 PAUSE and the remaining sa values are reserved hints.  This probe
+# declared SHL, which is false of every one of them: nothing is read, nothing
+# is written, and no shifter is occupied.  The arbitration is written down --
+# mipsel OPC_SLL, GEN_OP_NOP over the incumbent's GEN_OP_SHL, in
+# tools/gapreport_rulings.tsv -- and QEMU states the word at the gate that
+# owns exactly that code-point space (target/mips/tcg/translate.c:13683).
 _register_probe('probe_mips_nop', {'mipsel': {'asm': '"nop\\n\\t"\n    "nop"',
             'clobbers': '"memory"',
-            'opcodes': ['SHL']}})
+            'opcodes': ['NOP']}})
 
 _register_probe('probe_x86_mov', {'x86_64': {'asm': '"mov %%rbx, %%rax"',
             'clobbers': '"rax"',
             'opcodes': ['MOV']}})
 
+# All three of these are A64 aliases whose base encodings are ORR/ORN/SUB
+# against the zero register.  The probe used to declare the BASE encodings'
+# words (OR, INT_SUB), which is what a decoder says when it reads the
+# encoding and stops there.  The wire words the ALIAS: `mov x0,x1` is a
+# register move, `mvn x2,x3` is a complement, and only `neg x4,x5` is
+# genuinely a subtract.  Those are strictly more specific and each is true
+# of the instruction, so the declaration follows them; OR was true only of
+# the spelling.
 _register_probe('probe_arm_mov_not_neg', {'aarch64': {'asm': '"mov x0, x1\\n\\t"\n'
                     '    "mvn x2, x3\\n\\t"\n'
                     '    "neg x4, x5"',
              'clobbers': '"x0","x2","x4"',
-             'opcodes': ['OR', 'INT_SUB']}})
+             'opcodes': ['MOV', 'NOT', 'INT_SUB']}})
 
 _register_probe('probe_arm_cmp_test', {'aarch64': {'asm': '"cmp x0, x1\\n\\t"\n    "tst x2, x3"',
              'clobbers': '"cc"',
@@ -501,7 +524,16 @@ _register_probe('probe_arm_msub_cmp_neg_not', {'aarch64': {'asm': '"ccmp x0, x1,
                     '    "abs  v0.16b, v1.16b\\n\\t"\n'
                     '    "not  v2.16b, v3.16b"',
              'clobbers': '"x2","v0","v2","cc"',
-             'opcodes': ['CMP', 'INT_MSUB', 'NEG', 'NOT']}})
+             # The declaration used to say NEG, and this probe contains no
+             # negate: `abs v0.16b, v1.16b` is an absolute value, which
+             # differs from a negate on every non-negative lane.  The word
+             # is whatever the vector vocabulary has for an elementwise
+             # unary on integer lanes, and that is VEC_LOGIC -- there is no
+             # GEN_OP_VEC_ABS in champsim_tracer_generic_ids.h.  Whether abs
+             # deserves its own word is a vocabulary question filed against
+             # the table, not a reason to keep asserting a word that is
+             # false of the instruction.
+             'opcodes': ['CMP', 'INT_MSUB', 'VEC_LOGIC', 'NOT']}})
 
 _register_probe('probe_arm_fp_madd_msub', {'aarch64': {'asm': '"fmadd d0, d1, d2, d3\\n\\t"\n'
                     '    "fmsub d4, d5, d6, d7"',
@@ -1078,11 +1110,12 @@ _register_probe('probe_exact_xor_rr', {
                                 dst=["REG_GPR8"])]},
 })
 
-# Logical shift-left reg, imm → reg.  AArch64 omitted intentionally:
-# `lsl reg, reg, #imm` encodes as UBFM (the LSL alias is just a
-# disasm hint), so Capstone returns AARCH64_INS_UBFM → GEN_OP_MOVZX
-# rather than GEN_OP_SHL.  That divergence is locked in by the
-# dedicated probe_exact_aarch64_ubfm probe below.
+# Logical shift-left reg, imm → reg.  AArch64 is carried by its own probe
+# below rather than here, because its immediate is not yet reported; the
+# WORD is the same SHL as the other three.  (This comment used to say the
+# aarch64 arm was omitted because "Capstone returns AARCH64_INS_UBFM →
+# GEN_OP_MOVZX".  Since the words became QEMU's, that is no longer how the
+# aarch64 arm is classified at all.)
 _register_probe('probe_exact_shl_ri', {
     'x86_64':  {'asm': '"shlq $3, %%rax"', 'clobbers': '"rax","cc"',
                 'opcodes': ['SHL'],
@@ -1104,29 +1137,39 @@ _register_probe('probe_exact_shl_ri', {
                                 insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
 })
 
-# AArch64 UBFM — the encoding LSL #imm / LSR #imm / UBFIZ / UBFX
-# all alias to.  Tracer classifies AARCH64_INS_UBFM → MOVZX (which is
-# arguably a misclassification of LSL #imm but matches the current
-# table; that classification is a separate fix).  HAS_IMM is asserted
-# SET because the source instruction does carry an immediate (the
-# shift amount); if the tracer's operand walker doesn't currently
-# expose UBFM's immr/imms as QEMU_PLUGIN_OP_IMM the probe will fail
-# here — which is the intent: a probe surfaces the gap so the tracer
-# learns to report it.
+# AArch64 UBFM -- the encoding LSL #imm / LSR #imm / UBFIZ / UBFX all
+# alias to.  THE DECLARED WORD USED TO BE MOVZX, and the comment that
+# stood here admitted it was "arguably a misclassification of LSL #imm
+# but matches the current table".  It matched a table that no longer
+# decides this: since the words became QEMU's, `lsl x0,x0,#3` is worded
+# SHL, which is what the instruction does -- it shifts, it does not
+# zero-extend a narrower value, and the two have different dataflow.  A
+# probe may not keep asserting a word its own comment calls wrong.
+#
+# HAS_IMM IS STILL ASSERTED AND STILL FAILS, deliberately.  The shift
+# amount IS an immediate; the aarch64 decode site does not state it, so
+# this cell reads flags=0x40 and errors.  That is a real, narrow wire gap
+# (the x86, riscv64 and mipsel arms of probe_exact_shl_ri all state
+# theirs), it is filed as such, and weakening the assertion would hide
+# it.  This one row is expected RED until the statement lands.
 _register_probe('probe_exact_aarch64_ubfm', {
     'aarch64': {'asm': '"lsl x0, x0, #3"', 'clobbers': '"x0"',
-                'opcodes': ['MOVZX'],
-                'insns': [_insn("MOVZX", branch_type="NONE",
+                'opcodes': ['SHL'],
+                'insns': [_insn("SHL", branch_type="NONE",
                                 src=["REG_GPR0"],
                                 dst=["REG_GPR0"],
                                 insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
 })
 
 
-# Compare reg, reg.  x86 / aarch64 CMP writes flags only; RISC-V SLT
-# and MIPS SLT write rd alongside reading rs1/rs2 — both classify as
-# GEN_OP_CMP in the tracer but have different reg-set shapes, so the
-# probe declares ISA-specific specs.
+# Compare reg, reg.  x86 / aarch64 CMP writes FLAGS and nothing else, so
+# CMP is exactly what it is.  RISC-V SLT and MIPS SLT do something
+# different: they write the boolean result into a general register.  That
+# is a set-on-condition, not a compare, and the B4 arbitration settled it
+# as GEN_OP_SETCC -- the word that says a register receives the comparison's
+# answer.  This comment used to read "both classify as GEN_OP_CMP in the
+# tracer", which stopped being true when that arbitration landed and left
+# two permanently red cells behind it.
 _register_probe('probe_exact_cmp_rr', {
     'x86_64':  {'asm': '"cmpq %%rbx, %%rax"', 'clobbers': '"cc"',
                 'opcodes': ['CMP'],
@@ -1139,13 +1182,13 @@ _register_probe('probe_exact_cmp_rr', {
                                 src=["REG_GPR0", "REG_GPR1"],
                                 dst=["REG_FLAGS"])]},
     'riscv64': {'asm': '"slt t0, t1, t2"', 'clobbers': '"t0"',
-                'opcodes': ['CMP'],
-                'insns': [_insn("CMP", branch_type="NONE",
+                'opcodes': ['SETCC'],
+                'insns': [_insn("SETCC", branch_type="NONE",
                                 src=["REG_GPR6", "REG_GPR7"],
                                 dst=["REG_GPR5"])]},
     'mipsel':  {'asm': '"slt $t0, $t1, $t2"', 'clobbers': '"$t0"',
-                'opcodes': ['CMP'],
-                'insns': [_insn("CMP", branch_type="NONE",
+                'opcodes': ['SETCC'],
+                'insns': [_insn("SETCC", branch_type="NONE",
                                 src=["REG_GPR9", "REG_GPR10"],
                                 dst=["REG_GPR8"])]},
 })

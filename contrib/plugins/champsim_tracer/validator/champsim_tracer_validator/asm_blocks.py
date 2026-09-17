@@ -2858,13 +2858,21 @@ class MipsInlineConditionalTrap(CodeBlock):
                 ExpectedMemOp("load",  s_load,  8, a),
                 ExpectedMemOp("store", s_store, 8, _u32(a + 17)),
             ],
+            # The conditional trap is worded SYSCALL, not CMP.  A trap
+            # compares IN ORDER TO RAISE, and the raise is what the
+            # instruction exists for; naming only the test describes the
+            # means and drops the end.  That arbitration is written down
+            # for the whole family -- mipsel OPC_TEQ and its fifteen
+            # siblings, GEN_OP_SYSCALL over GEN_OP_CMP, SETTLED, in
+            # tools/gapreport_rulings.tsv -- and this declaration was left
+            # behind when it landed.
             coarse_opcodes={"LOAD": 1, "STORE": 2, "INT_ADD": 2,
-                             "CMP": 1, "BRANCH": 1},
+                             "SYSCALL": 1, "BRANCH": 1},
             # BRANCH_DIRECT_JUMP alone: the terminating jump is the block's
             # ONLY branch.  A conditional trap that regressed to a transfer
             # type would seal the block early and split these apart.
             asserted_branch_types=["BRANCH_DIRECT_JUMP"],
-            asserted_opcodes=["CMP", "LOAD", "STORE", "INT_ADD",
+            asserted_opcodes=["SYSCALL", "LOAD", "STORE", "INT_ADD",
                               "BRANCH"],
         )
 

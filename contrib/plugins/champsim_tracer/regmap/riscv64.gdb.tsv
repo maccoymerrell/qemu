@@ -48,3 +48,35 @@ t5	REG_GPR30	incumbent: the per-ISA table routed this gdb name here
 t6	REG_GPR31	incumbent: the per-ISA table routed this gdb name here
 tp	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
 zero	REG_ZERO	incumbent: the per-ISA table routed this gdb name here
+ft0	REG_FPR0	incumbent: the per-ISA table routed this gdb name here; ft0 is f0 in the riscv FPU feature
+ft1	REG_FPR1	incumbent: the per-ISA table routed this gdb name here; ft1 is f1 in the riscv FPU feature
+ft2	REG_FPR2	incumbent: the per-ISA table routed this gdb name here; ft2 is f2 in the riscv FPU feature
+ft3	REG_FPR3	incumbent: the per-ISA table routed this gdb name here; ft3 is f3 in the riscv FPU feature
+ft4	REG_FPR4	incumbent: the per-ISA table routed this gdb name here; ft4 is f4 in the riscv FPU feature
+ft5	REG_FPR5	incumbent: the per-ISA table routed this gdb name here; ft5 is f5 in the riscv FPU feature
+ft6	REG_FPR6	incumbent: the per-ISA table routed this gdb name here; ft6 is f6 in the riscv FPU feature
+ft7	REG_FPR7	incumbent: the per-ISA table routed this gdb name here; ft7 is f7 in the riscv FPU feature
+fs0	REG_FPR8	incumbent: the per-ISA table routed this gdb name here; fs0 is f8 in the riscv FPU feature
+fs1	REG_FPR9	incumbent: the per-ISA table routed this gdb name here; fs1 is f9 in the riscv FPU feature
+fa0	REG_FPR10	incumbent: the per-ISA table routed this gdb name here; fa0 is f10 in the riscv FPU feature
+fa1	REG_FPR11	incumbent: the per-ISA table routed this gdb name here; fa1 is f11 in the riscv FPU feature
+fa2	REG_FPR12	incumbent: the per-ISA table routed this gdb name here; fa2 is f12 in the riscv FPU feature
+fa3	REG_FPR13	incumbent: the per-ISA table routed this gdb name here; fa3 is f13 in the riscv FPU feature
+fa4	REG_FPR14	incumbent: the per-ISA table routed this gdb name here; fa4 is f14 in the riscv FPU feature
+fa5	REG_FPR15	incumbent: the per-ISA table routed this gdb name here; fa5 is f15 in the riscv FPU feature
+fa6	REG_FPR16	incumbent: the per-ISA table routed this gdb name here; fa6 is f16 in the riscv FPU feature
+fa7	REG_FPR17	incumbent: the per-ISA table routed this gdb name here; fa7 is f17 in the riscv FPU feature
+fs2	REG_FPR18	incumbent: the per-ISA table routed this gdb name here; fs2 is f18 in the riscv FPU feature
+fs3	REG_FPR19	incumbent: the per-ISA table routed this gdb name here; fs3 is f19 in the riscv FPU feature
+fs4	REG_FPR20	incumbent: the per-ISA table routed this gdb name here; fs4 is f20 in the riscv FPU feature
+fs5	REG_FPR21	incumbent: the per-ISA table routed this gdb name here; fs5 is f21 in the riscv FPU feature
+fs6	REG_FPR22	incumbent: the per-ISA table routed this gdb name here; fs6 is f22 in the riscv FPU feature
+fs7	REG_FPR23	incumbent: the per-ISA table routed this gdb name here; fs7 is f23 in the riscv FPU feature
+fs8	REG_FPR24	incumbent: the per-ISA table routed this gdb name here; fs8 is f24 in the riscv FPU feature
+fs9	REG_FPR25	incumbent: the per-ISA table routed this gdb name here; fs9 is f25 in the riscv FPU feature
+fs10	REG_FPR26	incumbent: the per-ISA table routed this gdb name here; fs10 is f26 in the riscv FPU feature
+fs11	REG_FPR27	incumbent: the per-ISA table routed this gdb name here; fs11 is f27 in the riscv FPU feature
+ft8	REG_FPR28	incumbent: the per-ISA table routed this gdb name here; ft8 is f28 in the riscv FPU feature
+ft9	REG_FPR29	incumbent: the per-ISA table routed this gdb name here; ft9 is f29 in the riscv FPU feature
+ft10	REG_FPR30	incumbent: the per-ISA table routed this gdb name here; ft10 is f30 in the riscv FPU feature
+ft11	REG_FPR31	incumbent: the per-ISA table routed this gdb name here; ft11 is f31 in the riscv FPU feature

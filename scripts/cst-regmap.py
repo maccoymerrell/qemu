@@ -77,16 +77,28 @@ TARGETS = {
 #
 # So the map is read out of the target's own registration site again, and for
 # the gdbstub that site is the feature XML the target hands gdb: every
-# <reg name="..."> inside the <feature name="..."> the CORE file declares.
-# Scope is the CORE feature per target and is stated here rather than
-# discovered: the optional features (FPU, SVE, MTE, the RISC-V CSR set) are
-# registered dynamically and per-CPU, and a namespace whose membership
-# depends on the CPU model cannot be joined at BUILD time.  A register in one
-# of those keeps whatever route it already had; nothing here removes one.
+# <reg name="..."> inside the <feature name="..."> each listed file declares.
+#
+# SCOPE, and why it is these files and not "the core feature".  The membership
+# of a feature is decided at CPU-realize time, but the file that DECLARES the
+# names is a build-time artifact wherever one exists, and a row for a feature
+# the running CPU does not register is inert rather than wrong: the name is
+# never published by qemu_plugin_get_registers(), the handle lookup misses, and
+# the read reports no value -- exactly what happens today for a register with
+# no row at all.  So every feature QEMU declares in an XML FILE is in scope.
+#
+# What is genuinely out of scope is the feature with no file: AArch64 SVE
+# (target/arm/gdbstub64.c, arm_gen_dynamic_svereg_feature) and RISC-V vector
+# (target/riscv/gdbstub.c, ricsv_gen_dynamic_vector_feature) build their
+# <feature> in C because the register WIDTH depends on the CPU's vector
+# length.  Their names are still fixed, but there is no file to read them out
+# of, so this generator cannot join them and says so rather than guessing.
 GDB_TARGETS = {
     'x86_64':  {'files': ['gdb-xml/i386-64bit.xml']},
-    'aarch64': {'files': ['gdb-xml/aarch64-core.xml']},
-    'riscv64': {'files': ['gdb-xml/riscv-64bit-cpu.xml']},
+    'aarch64': {'files': ['gdb-xml/aarch64-core.xml',
+                          'gdb-xml/aarch64-fpu.xml']},
+    'riscv64': {'files': ['gdb-xml/riscv-64bit-cpu.xml',
+                          'gdb-xml/riscv-64bit-fpu.xml']},
     'mipsel':  {'files': ['gdb-xml/mips-cpu.xml']},
 }
 

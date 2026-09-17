@@ -410,15 +410,17 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
  * emitter wrote, and that sequence is the architectural one.  So the rows need
  * no sorting and no note -- they are read off in the order they will happen.
  */
-static void df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
-                         const uint64_t *addr_prov, const uint64_t *data_prov)
+static int df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
+                        const uint64_t *addr_prov, const uint64_t *data_prov)
 {
     InsnDataflowMemop *m;
+    int k;
 
     if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
         d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
-        return;
+        return -1;
     }
+    k = (int)d->n_memops;
     m = &d->memops[d->n_memops++];
     m->dir = dir;
     m->size = size > 255 ? 255 : (uint8_t)size;
@@ -430,6 +432,7 @@ static void df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
     if (data_prov) {
         memcpy(m->data_prov, data_prov, sizeof(m->data_prov));
     }
+    return k;
 }
 
 /*
@@ -442,7 +445,7 @@ static void df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
  * 32-bit host) needs nothing here: a load names its data first and its address
  * last among the inputs; a store names its data first and its address last.
  */
-static bool df_guest_memop(InsnDataflow *d, TCGOp *op)
+static int df_guest_memop(InsnDataflow *d, TCGOp *op)
 {
     TCGContext *s = tcg_ctx;
     const TCGOpDef *def = &tcg_op_defs[op->opc];
@@ -471,7 +474,7 @@ static bool df_guest_memop(InsnDataflow *d, TCGOp *op)
         addr_arg = nb_iargs - 1;    /* the address is the last input */
         break;
     default:
-        return false;
+        return -1;
     }
 
     ts = arg_temp(op->args[addr_arg]);
@@ -499,9 +502,8 @@ static bool df_guest_memop(InsnDataflow *d, TCGOp *op)
     }
 
     oi = op->args[nb_oargs + nb_iargs];
-    df_add_memop(d, dir, memop_size(get_memop(oi)), addr_prov,
-                 dir == INSN_DF_WR ? data_prov : NULL);
-    return true;
+    return df_add_memop(d, dir, memop_size(get_memop(oi)), addr_prov,
+                        dir == INSN_DF_WR ? data_prov : NULL);
 }
 
 /* Direct env access: a load or a store of how many bytes? */
@@ -660,6 +662,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
     unsigned nb_oargs, nb_iargs, idx;
     int ld_field_bit = -1;
+    int ld_memop_bit = -1;
     bool store;
     uint32_t size;
 
@@ -712,7 +715,13 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     case INDEX_op_qemu_ld_i64:
     case INDEX_op_qemu_ld_i128:
         d->n_mem_rd++;
-        df_guest_memop(d, op);
+        {
+            int k = df_guest_memop(d, op);
+
+            if (k >= 0) {
+                ld_memop_bit = INSN_DF_BIT_MEMOP0 + k;
+            }
+        }
         break;
 
     case INDEX_op_qemu_st_i32:
@@ -807,6 +816,29 @@ static void df_op(InsnDataflow *d, TCGOp *op)
             df_set_bit(d->rd, idx);
             df_set_bit(prov, idx);
         }
+    }
+
+    /*
+     * A GUEST LOAD'S RESULT CAME FROM MEMORY, NOT FROM THE POINTER.
+     *
+     * The loop above has just done its real work -- the address register is in
+     * the instruction's read set, where it belongs, and in the memop's own
+     * address provenance.  What it must not do is hand that account on to the
+     * VALUE: `mov (%r15),%rax` does not compute rax from r15, it computes an
+     * address from r15 and takes rax from whatever that address held.  Leaving
+     * the union in place published the pointer as the datum's source and left
+     * the wire's load-data bits -- specified since the format's first epoch --
+     * with no producer at all, which is how a uniformly false fact survives.
+     *
+     * The replacement is total rather than additive on purpose.  Naming both
+     * would say the value depends on the register AND on the access, and a
+     * consumer scheduling on that would let rax issue as soon as r15 was
+     * ready.  The address dependency is a fact about the ACCESS and is
+     * published as one, in load_addr_dep.
+     */
+    if (ld_memop_bit >= 0) {
+        memset(prov, 0, sizeof(prov));
+        df_set_bit(prov, (unsigned)ld_memop_bit);
     }
 
     for (unsigned i = 0; i < nb_oargs; i++) {
@@ -1681,6 +1713,18 @@ bool insn_dataflow_prov_field(unsigned bit, uint32_t *off, uint32_t *size)
     }
     if (size) {
         *size = df->slot_size[bit - base];
+    }
+    return true;
+}
+
+bool insn_dataflow_prov_memop(unsigned bit, uint32_t *index)
+{
+    if (bit < INSN_DF_BIT_MEMOP0 ||
+        bit >= INSN_DF_BIT_MEMOP0 + INSN_DF_MAX_MEMOPS) {
+        return false;
+    }
+    if (index) {
+        *index = bit - INSN_DF_BIT_MEMOP0;
     }
     return true;
 }

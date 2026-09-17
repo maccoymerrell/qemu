@@ -84,16 +84,34 @@ unsigned read_set(F fn)
  * wire could not carry.
  */
 enum BitKind {
-    BIT_REG,        /* a register the wire can name */
+    BIT_REG,        /* a register the wire can name  */
+    BIT_LOAD,       /* the value a guest load returned */
     BIT_IMM,        /* the encoding's own value      */
     BIT_CONST,      /* any other constant            */
     BIT_NOTHING,    /* counted, not publishable      */
 };
 
+/*
+ * The load-data slot a memop index occupies, for the translation in hand.
+ *
+ * The wire numbers LOADS; QEMU numbers ACCESSES, loads and stores together in
+ * program order.  `movq %rax,(%rdi)` followed by a load in the same
+ * instruction makes those two numberings differ, so the map is built from the
+ * same walk that assigns the wire's load slots and never assumed to be the
+ * identity.  0xff means the access is not a load this template publishes --
+ * a store, or a load past the template's slot ceiling.
+ */
+thread_local uint8_t tls_load_slot[QEMU_PLUGIN_DF_MAX_MEMOPS];
+
 BitKind classify_bit(unsigned bit, uint8_t *reg_out)
 {
     uint32_t atom = 0, off = 0, size = 0;
 
+    if (qemu_plugin_dataflow_prov_memop(bit, &atom)) {
+        *reg_out = atom < QEMU_PLUGIN_DF_MAX_MEMOPS
+                   ? tls_load_slot[atom] : (uint8_t)0xff;
+        return BIT_LOAD;
+    }
     if (qemu_plugin_dataflow_prov_atom(bit, &atom)) {
         uint8_t reg = REG_NONE;
         bool is_reg = false;
@@ -240,6 +258,14 @@ SeatedSet seat_set_as_src(InsnFields *f, InsnRegNames *rn, unsigned nwords)
             case BIT_IMM:
                 out.has_imm = true;
                 break;
+            case BIT_LOAD:
+                /* A READ SET holds registers, never the value one of this
+                 * instruction's own accesses returned.  Reaching here would
+                 * mean the emulator had named a load's datum as an input to
+                 * the instruction that performs it; there is no src_reg[]
+                 * slot for such a thing and inventing one would put a
+                 * non-register in the wire's register list. */
+                break;
             case BIT_CONST:
             case BIT_NOTHING:
                 break;
@@ -283,6 +309,14 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
                     }
                 }
                 break;
+            case BIT_LOAD:
+                /* The value came out of one of this instruction's own loads;
+                 * @reg carries that load's wire slot. */
+                if (reg < f->max_dep_loads) {
+                    mask |= (uint64_t)1 << (f->n_src_regs + reg);
+                    g_qdep.load_datum_seated++;
+                }
+                break;
             case BIT_IMM:
                 mask |= (uint64_t)1 << (f->n_src_regs + f->max_dep_loads);
                 break;
@@ -319,6 +353,14 @@ uint64_t prov_to_addr_mask(const InsnFields *f, unsigned nwords)
                         break;
                     }
                 }
+                break;
+            case BIT_LOAD:
+                /* An address computed from a datum this same instruction
+                 * loaded.  The address layout reserves no load-data bits --
+                 * addresses compute before any load of the instruction fires
+                 * -- so there is nothing to set; it is counted so the absence
+                 * is a measured zero rather than an unasked question. */
+                g_qdep.load_datum_in_addr++;
                 break;
             case BIT_IMM:
                 mask |= (uint64_t)1 << f->n_src_regs;
@@ -467,6 +509,10 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
     g_assert(!out_names || out_names->src_qemu_reg_keys);
 
     qemu_plugin_dataflow_status st;
+
+    /* No load slot is known until the memop walk below assigns them; a stale
+     * map from the previous instruction must never be readable. */
+    memset(tls_load_slot, 0xff, sizeof(tls_load_slot));
 
     memset(&st, 0, sizeof(st));
     st.struct_size = sizeof(st);
@@ -666,9 +712,13 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
      * loads and stores in two families and each keeps its own order. */
     std::vector<unsigned> load_rows, store_rows;
 
+    memset(tls_load_slot, 0xff, sizeof(tls_load_slot));
     for (unsigned m = 0; m < memops.size(); m++) {
         if (memops[m].dir & QEMU_PLUGIN_DF_RD) {
             if (out->max_dep_loads < MAX_LOADS) {
+                if (m < QEMU_PLUGIN_DF_MAX_MEMOPS) {
+                    tls_load_slot[m] = (uint8_t)load_rows.size();
+                }
                 out->max_dep_loads++;
                 load_rows.push_back(m);
                 out->has_addr_deps = true;

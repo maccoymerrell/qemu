@@ -56,7 +56,24 @@
 #define INSN_DF_BIT_ZERO    (INSN_DF_MAX_REGS - 1)  /* architectural zero reg */
 #define INSN_DF_BIT_IMM     (INSN_DF_MAX_REGS - 2)  /* an encoded immediate */
 #define INSN_DF_BIT_CONST   (INSN_DF_MAX_REGS - 3)  /* any other constant */
-#define INSN_DF_BIT_LOWEST_ATOM  INSN_DF_BIT_CONST
+
+/*
+ * The value a guest load returned, one bit per recorded access.
+ *
+ * WHY THIS IS NOT THE ADDRESS REGISTER.  A load op names its address among its
+ * inputs and nothing else, so propagating an op's inputs to its output makes
+ * the loaded value look as though it came from the base pointer.  It did not:
+ * the pointer chose WHICH memory, and the memory supplied the value.  The two
+ * are different dependencies with different timing -- the address is ready
+ * when the register is, the datum only when the access completes -- and the
+ * wire has always had a slot for each (the address masks, and the load-data
+ * bits of the register masks).  Only the producer was missing.
+ *
+ * The block sits below the three atoms and above the interned env ranges, so
+ * interning still stops below every bit that does not stand for storage.
+ */
+#define INSN_DF_BIT_MEMOP0  (INSN_DF_MAX_REGS - 3 - INSN_DF_MAX_MEMOPS)
+#define INSN_DF_BIT_LOWEST_ATOM  INSN_DF_BIT_MEMOP0
 
 /* How many distinct env byte ranges one translation block may intern. */
 #define INSN_DF_MAX_FIELD_SLOTS  64
@@ -923,6 +940,9 @@ const char *insn_dataflow_reg_name(unsigned i, uint32_t *off, uint32_t *size);
 
 /* The env range a provenance bit at or above nregs stands for. */
 bool insn_dataflow_prov_field(unsigned bit, uint32_t *off, uint32_t *size);
+
+/* The recorded guest access a provenance bit in the memop block stands for. */
+bool insn_dataflow_prov_memop(unsigned bit, uint32_t *index);
 
 /* The declared name of an env range, or NULL if no target declared it. */
 const char *insn_dataflow_field_reg(uint32_t off, uint32_t size);

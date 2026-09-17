@@ -418,6 +418,18 @@ bool qemu_plugin_dataflow_prov_atom(unsigned bit, uint32_t *atom)
     return true;
 }
 
+/*
+ * The ABI's memop-block width and the reader's access-row ceiling are the same
+ * number seen from two sides; a consumer sizes its map by the first and is
+ * handed indices bounded by the second.
+ */
+QEMU_BUILD_BUG_ON(QEMU_PLUGIN_DF_MAX_MEMOPS != INSN_DF_MAX_MEMOPS);
+
+bool qemu_plugin_dataflow_prov_memop(unsigned bit, uint32_t *index)
+{
+    return insn_dataflow_prov_memop(bit, index);
+}
+
 #define PLUGIN_DF_SET(name, member)                                          \
 unsigned name(const struct qemu_plugin_tb *tb, size_t idx,                   \
               uint64_t *words, unsigned nwords)                              \

@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 5
+#define QEMU_PLUGIN_DATAFLOW_VERSION 6
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -135,12 +135,35 @@ QEMU_PLUGIN_API
 const char *qemu_plugin_dataflow_field_reg(uint32_t env_offset, uint32_t size);
 
 /* The three provenance bits that do not stand for storage. */
+/*
+ * The most guest accesses one instruction can be recorded for, and so the
+ * width of the memop provenance block qemu_plugin_dataflow_prov_memop()
+ * reports an index into.  A consumer sizes its own memop-to-slot map by it.
+ */
+#define QEMU_PLUGIN_DF_MAX_MEMOPS  16
+
 #define QEMU_PLUGIN_DF_ATOM_ZERO   0    /* the architectural zero register */
 #define QEMU_PLUGIN_DF_ATOM_IMM    1    /* a value the encoding carries */
 #define QEMU_PLUGIN_DF_ATOM_CONST  2    /* any other constant */
 
 QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_atom(unsigned bit, uint32_t *atom);
+
+/*
+ * The guest access a provenance bit stands for: true, with @index set to the
+ * memop's position in qemu_plugin_insn_memops(), when the bit names the VALUE
+ * that access returned.
+ *
+ * A load's result is not its address register.  The pointer selects which
+ * memory is read and is published as the access's own address provenance; the
+ * datum comes from the memory and is published here.  A consumer seating a
+ * register mask maps this to the load-data bits the format reserves; one
+ * seating an ADDRESS mask must count it rather than drop it, because an
+ * address computed from a datum this instruction loaded is a shape the
+ * address masks have no slot for.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_memop(unsigned bit, uint32_t *index);
 
 /*
  * Register sets, copied into @words as a bitmap of @nwords 64-bit words.

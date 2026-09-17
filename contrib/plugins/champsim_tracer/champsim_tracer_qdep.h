@@ -95,6 +95,15 @@ struct QdepCounters {
     uint64_t dropped_dsts;
     uint64_t dropped_loads;
     uint64_t dropped_stores;
+    /* A destination or a stored datum whose value came from a guest load
+     * this instruction performed, seated on the wire's load-data bit; and
+     * the same provenance reaching an ADDRESS mask, which the format's
+     * address layout has no slot for.  The second is counted rather than
+     * dropped because an address computed from a datum the same instruction
+     * loaded is a real shape and a silent zero would read as no dependency
+     * at all.  It is 0 on every ISA measured so far. */
+    uint64_t load_datum_seated;
+    uint64_t load_datum_in_addr;
     /* Synthetic addresses seated, and those withheld whole because the
      * descriptor cannot express one of their terms. */
     uint64_t synth_ea_seated;

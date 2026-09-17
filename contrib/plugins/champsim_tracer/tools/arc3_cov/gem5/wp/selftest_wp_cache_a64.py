@@ -22,7 +22,23 @@ and is never counted as a pass.
 Exit codes are the tool's own, taken from the process:
     0  every mutation that CAN fire did
     1  a mutation did not fire -- a rule is too broad
-    3  REFUSED: no maintenance instruction to mutate, or gem5 did not run
+    2  NO SUBJECT: this run produced no clean excursion carrying a
+       cache-maintenance rule, so there is no row for a too-broad rule to
+       launder and nothing here to prove.  A STATED COVERAGE GAP, carried
+       into the report by REPRODUCE_aarch64.sh -- not a pass, and closed by
+       writing a probe that reaches the maintenance path, never by widening
+       a ceiling.
+    3  REFUSED: gem5 did not run (a missing prerequisite)
+
+WHY 2 AND 3 ARE NOT THE SAME CODE ANY MORE.  They were, and `set -e` in
+REPRODUCE_aarch64.sh then killed the leg on either, so a run whose axis
+control was wholly green produced no comparison and no report at all; the
+R13 gate read REPORT MISSING, which is a reading about this exit code and
+not about the tracer.  Measured at exec239: `AXES WITH A FIRING MUTATION:
+13 of 13`, `INJECTION CONTROL: FIRED`, then `REFUSED: no clean excursion
+carrying a cache-maintenance rule was found to mutate` and rc=3, with
+`final/` never created.  A missing PREREQUISITE is still a hard stop --
+nothing was measured at all -- and keeps 3.
 
 Author: Maccoy Merrell.
 """
@@ -258,9 +274,13 @@ def main():
             break
 
     if not subjects:
-        sys.stderr.write('REFUSED: no clean excursion carrying a '
-                         'cache-maintenance rule was found to mutate.\n')
-        return 3
+        sys.stderr.write('NO SUBJECT: no clean excursion carrying a '
+                         'cache-maintenance rule was found to mutate.  '
+                         'The rules under test accounted for nothing in '
+                         'this run, so there is no row for a too-broad one '
+                         'to launder; this is a coverage gap in the PROBE '
+                         'SET, and the caller carries it into the report.\n')
+        return 2
 
     print('MUTATION                RULE UNDER TEST                  AXIS'
           '          RESULT')

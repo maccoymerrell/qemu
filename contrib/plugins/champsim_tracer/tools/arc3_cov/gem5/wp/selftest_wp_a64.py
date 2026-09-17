@@ -9,6 +9,38 @@ with no firing mutation reports UNPROVEN and its zero is NOT counted as a pass;
 an axis with no instance of its fact anywhere in the probe set reports NO
 MUTATION AVAILABLE, which is a demand for a better probe rather than a result.
 
+THE TWO SHORTFALLS EXIT DIFFERENTLY, BECAUSE THEY ARE NOT THE SAME FACT
+======================================================================
+An axis that was ATTEMPTED and did not fire is a comparator that cannot see
+what it claims to score: its zero is worthless and the leg must not be read.
+An axis with NO INSTANCE of its fact in the probe set is a different claim
+entirely -- the comparison scores nothing on that axis either, so there is no
+number for a broken comparator to falsify, and what the run is short of is a
+PROBE.
+
+Both used to return 1, and `set -e` in REPRODUCE_aarch64.sh then killed the
+leg before the comparison ran, so a run whose every attempted axis FIRED and
+whose injection control FIRED produced no report at all and the R13 gate read
+REPORT MISSING -- a reading about this exit code and not about the tracer.
+Measured at exec237: `AXES WITH A FIRING MUTATION: 13 of 13 attempted`,
+`INJECTION CONTROL: FIRED`, `NO MUTATION AVAILABLE: fpsr-dst-set,
+sys-src-set`, rc=1, no `final/REPORT.txt` on disk.
+
+So:
+
+    0   every attempted axis fired, the injection control fired, and every
+        axis this leg scores had a subject
+    2   the same, EXCEPT that some axis had no instance in the probe set --
+        a STATED COVERAGE GAP.  The caller may score the comparison, and
+        REPRODUCE_aarch64.sh carries the gap's own line into the report so
+        the gap travels with the number rather than staying in a file the
+        gate does not read.
+    1   an attempted axis did not fire, or the injection control did not --
+        the comparison may NOT be read, and the caller must stop.
+
+A 2 is not a pass with an excuse: the axis names are printed, they reach the
+report, and closing the gap means writing the probe, not lowering the bar.
+
 TWO KINDS OF CONTROL, AND BOTH ARE NEEDED
 =========================================
 1. COMPARATOR controls.  Perturb the tracer's record of one instruction and
@@ -298,7 +330,15 @@ def run(args, binary, cfg, env):
     txt = '\n'.join(out) + '\n'
     sys.stdout.write(txt)
     open(os.path.join(args.outdir, 'SELFTEST.txt'), 'w').write(txt)
-    return 0 if (not unproven and inj_ok and not nomut) else 1
+    #: THE CALLER HAS TO BE ABLE TO TELL THE TWO SHORTFALLS APART -- see the
+    #: module docstring.  A comparator that could not be made to fire
+    #: disqualifies the run (1).  An axis with no instance of its fact in the
+    #: probe set is a stated coverage gap over a column the comparison also
+    #: scores nothing on (2), and the caller carries the gap's own line into
+    #: the report rather than discarding the whole leg.
+    if unproven or not inj_ok:
+        return 1
+    return 2 if nomut else 0
 
 
 def main():

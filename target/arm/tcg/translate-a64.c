@@ -1741,6 +1741,29 @@ static inline void gen_check_sp_alignment(DisasContext *s)
  * match up with those in the manual.
  */
 
+/*
+ * THE PROGRAM COUNTER, READ BY A PC-RELATIVE BRANCH.
+ *
+ * The target is this instruction's own address plus the encoded displacement,
+ * folded to a constant at translation time, so no op names cpu_pc and the
+ * transfer would otherwise publish no source at all.  gen_pc_plus_diff()
+ * already states this read wherever it materialises a value into something
+ * other than cpu_pc -- an ADR, a link register -- and deliberately does not
+ * when the destination IS cpu_pc, because that call is also QEMU maintaining
+ * its own program counter across a block edge.  A branch target goes to
+ * cpu_pc, so it fell into that exclusion and the read went unstated.
+ *
+ * It is stated here, at the branch's own decode rule, where there is no
+ * ambiguity about whose read it is.  mipsel has stated it for every branch all
+ * along and riscv64 states it for every branch that also computes a link; this
+ * brings aarch64 to the same reading, and PIN's reference agrees with all
+ * three.
+ */
+static void note_branch_reads_pc(void)
+{
+    insn_dataflow_state_read(insn_df_reg(A64_DF_PC_NAME));
+}
+
 static bool trans_B(DisasContext *s, arg_i *a)
 {
     /*
@@ -1749,6 +1772,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
      * access's, so it is not a displacement.
      */
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_branch_reads_pc();
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
@@ -1758,6 +1782,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_branch_reads_pc();
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
     reset_btype(s);
@@ -1772,6 +1797,7 @@ static bool trans_CBZ(DisasContext *s, arg_cbz *a)
     TCGv_i64 tcg_cmp;
 
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_branch_reads_pc();
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = read_cpu_reg(s, a->rt, a->sf);
     reset_btype(s);
@@ -1791,6 +1817,7 @@ static bool trans_TBZ(DisasContext *s, arg_tbz *a)
     TCGv_i64 tcg_cmp;
 
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_branch_reads_pc();
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     note_zero_reg(false, a->rt, INSN_DF_RD);
     tcg_cmp = tcg_temp_new_i64();
@@ -1814,6 +1841,7 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
         return false;
     }
     insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
+    note_branch_reads_pc();
     plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     if (a->cond < 0x0e) {

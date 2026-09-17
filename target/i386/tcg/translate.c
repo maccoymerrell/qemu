@@ -2321,6 +2321,38 @@ static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
      * see plugin_gen_record_branch_target() docs.  Indirect branches
      * (JMP_m / CALL_m) take a different path and never reach here.
      */
+/*
+ * THE PROGRAM COUNTER, READ BY A PC-RELATIVE TRANSFER.
+ *
+ * A direct branch's target is this instruction's own address plus the
+ * displacement its encoding carries.  The translator knows the address, so it
+ * computes the target at translation time and the op stream carries a
+ * constant; nothing in the ops says the program counter was read, and without
+ * a statement the wire publishes a transfer whose only input is the condition.
+ *
+ * It IS an input.  The reference simulators say so -- PIN reports rip among a
+ * relative branch's sources on every one of them -- and so do two of this
+ * tree's own four targets: mipsel states it for every branch (note_folded_pc),
+ * and riscv64 states it wherever gen_pc_plus_diff materialises a value that is
+ * not cpu_pc itself.  Leaving x86_64 and aarch64 silent made one architectural
+ * fact publish three different ways across four machines.
+ *
+ * The objection this replaces was that naming the read ties a direct branch to
+ * whatever last wrote the program counter, which is every preceding transfer.
+ * That is true and it is the machine: the next pc is computed from this pc,
+ * which the last transfer produced.  R10 already settled what a consumer does
+ * with it -- "consumers understand pc writes as control flow and drop pc as a
+ * destination register when consuming" -- and a consumer that drops the write
+ * has nothing left to chain the read to.  Nor does the read carry the
+ * direct/indirect distinction it was said to: branch_type carries that, and
+ * carried it before this statement existed.
+ *
+ * Stated at the branch decode sites and not inside the transfer helper,
+ * because that helper also ends a block that merely ran out of room, and a
+ * read stated there would land on whichever instruction happened to sit last.
+ */
+    insn_dataflow_state_read(insn_df_reg(X86_DF_PC_NAME));
+
     plugin_gen_record_branch_target((uint64_t)(s->pc + diff));
     if (not_taken) {
         gen_set_label(not_taken);

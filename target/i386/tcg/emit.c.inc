@@ -2332,6 +2332,9 @@ static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
     /* Direct unconditional JMP (and its CALL-decorated form via
      * gen_CALL) — surface the static target to plugins.  Indirect
      * forms (JMP_m, CALL_m) take a separate path. */
+    /* The target is this instruction's pc plus its displacement; see
+     * gen_jcc()'s note on why the read is stated at the decode site. */
+    insn_dataflow_state_read(insn_df_reg(X86_DF_PC_NAME));
     plugin_gen_record_branch_target(
         (uint64_t)(s->pc + decode->immediate));
     gen_update_cc_op(s);

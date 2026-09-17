@@ -52,6 +52,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
       'champsim_tracer/champsim_tracer_vocabulary.cc',
       'champsim_tracer/champsim_tracer_regmap.cc',
+                              'champsim_tracer/champsim_tracer_gdbmap.cc',
       'champsim_tracer/champsim_tracer_qdep.cc',
       'champsim_tracer/champsim_tracer_capture.cc',
     )
@@ -69,16 +70,20 @@ if get_option('plugins')
   # register re-runs the join instead of shipping a map that is one register
   # short.
   champsim_tracer_regmap_gen = []
-  foreach r : [['x86_64',  ['target/i386/tcg/translate.c']],
+  foreach r : [['x86_64',  ['target/i386/tcg/translate.c'],
+                            ['gdb-xml/i386-64bit.xml']],
                ['aarch64', ['target/arm/tcg/translate.c',
-                            'target/arm/tcg/translate-a64.c']],
+                            'target/arm/tcg/translate-a64.c'],
+                            ['gdb-xml/aarch64-core.xml']],
                ['riscv64', ['target/riscv/translate.c',
-                            'target/riscv/cpu.c']],
+                            'target/riscv/cpu.c'],
+                            ['gdb-xml/riscv-64bit-cpu.xml']],
                ['mipsel',  ['target/mips/tcg/translate.c',
                             'target/mips/tcg/msa_translate.c',
                             'target/mips/tcg/mxu_translate.c',
                             'target/mips/cpu.c',
-                            'target/mips/fpu.c']]]
+                            'target/mips/fpu.c'],
+                            ['gdb-xml/mips-cpu.xml']]]
     champsim_tracer_regmap_deps = []
     foreach f : r[1]
       champsim_tracer_regmap_deps += files(meson.project_source_root() / f)
@@ -91,6 +96,23 @@ if get_option('plugins')
       command: [python, files(meson.project_source_root() /
                               'scripts/cst-regmap.py'),
                 '--root', meson.project_source_root(),
+                '--isa', r[0], '--tsv', '@INPUT@', '-o', '@OUTPUT@'])
+    champsim_tracer_gdbmap_deps = []
+    foreach g : r[2]
+      champsim_tracer_gdbmap_deps += files(meson.project_source_root() / g)
+    endforeach
+    # The SECOND namespace: the gdbstub spelling, joined from the target's
+    # own CORE feature XML.  Same generator, same both-directions refusal;
+    # a different registration site because the value-read route goes
+    # through qemu_plugin_get_registers(), not through a TCG global.
+    champsim_tracer_regmap_gen += custom_target(
+      'champsim_tracer_gdbmap_' + r[0] + '.h',
+      output: 'champsim_tracer_gdbmap_' + r[0] + '.h',
+      input: files('champsim_tracer/regmap/' + r[0] + '.gdb.tsv'),
+      depend_files: champsim_tracer_gdbmap_deps,
+      command: [python, files(meson.project_source_root() /
+                              'scripts/cst-regmap.py'),
+                '--root', meson.project_source_root(), '--namespace', 'gdb',
                 '--isa', r[0], '--tsv', '@INPUT@', '-o', '@OUTPUT@'])
   endforeach
   champsim_tracer_cpp_args_base = ['-std=gnu++17',
@@ -260,7 +282,9 @@ if get_option('plugins')
           'champsim_tracer/champsim_tracer_decode.cc',
           'champsim_tracer/champsim_tracer_capture.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
-          'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
+          'champsim_tracer/champsim_tracer_gdbmap.cc',
+          'champsim_tracer/champsim_tracer_reg_handle_cache.cc')
+    + champsim_tracer_regmap_gen,
     include_directories: ['../../include/qemu', '../../include',
                           'champsim_tracer'],
     cpp_args: champsim_tracer_cpp_args_base,
@@ -311,7 +335,8 @@ if get_option('plugins')
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc',
           'champsim_tracer/champsim_tracer_vocabulary.cc',
-          'champsim_tracer/champsim_tracer_regmap.cc') +
+          'champsim_tracer/champsim_tracer_regmap.cc',
+          'champsim_tracer/champsim_tracer_gdbmap.cc') +
     champsim_tracer_regmap_gen,
     include_directories: ['../../include/qemu', '../../include',
                           'champsim_tracer'],

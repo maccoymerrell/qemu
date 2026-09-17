@@ -83,4 +83,30 @@ unsigned cst_regmap_walk_globals(unsigned isa, unsigned *n_walked);
  * vacuous. */
 unsigned cst_regmap_size(unsigned isa);
 
+/*
+ * The gdbstub namespace's route: the (feature, name) pair
+ * qemu_plugin_get_registers() publishes for @reg_id on @isa.
+ *
+ * This is the VALUE-READ route, and it is a different question from
+ * cst_regmap_lookup()'s.  That one answers "QEMU's ops named this TCG global;
+ * which register is it"; this one answers "the wire wants this register's
+ * value; which descriptor do I read".  The two namespaces disagree on real
+ * registers -- AArch64 X30 is `lr` to TCG and `x30` to gdb, and the program
+ * counter is a TCG global on neither target while gdb names it on both --
+ * which is why the join is generated twice from two registration sites
+ * rather than once from a spelling that happens to match.
+ *
+ * Returns false when this build's table carries NO row for @reg_id, and also
+ * when it carries MORE THAN ONE: several gdb names can name parts of one
+ * generic register (MIPS `lo`/`hi` are accumulator 0's halves), and reading
+ * one of them would publish a partial value under a whole register's name.
+ * A caller must treat false as "no route", never as "no such register".
+ */
+bool cst_gdbmap_unique_name(unsigned isa, uint8_t reg_id,
+                            const char **feature, const char **name);
+
+/* How many gdb names this build knows for @isa, so a census cannot be
+ * vacuous. */
+unsigned cst_gdbmap_size(unsigned isa);
+
 #endif /* CHAMPSIM_TRACER_REGMAP_H */

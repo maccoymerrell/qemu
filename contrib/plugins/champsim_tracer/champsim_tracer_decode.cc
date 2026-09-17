@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_regmap.h"
 #include "champsim_tracer_capture.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
@@ -37,11 +38,45 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  */
 static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
 
+unsigned g_qemu_reg_routes_from_gdbmap;
+unsigned g_qemu_reg_routes_from_reg_table;
+
 void build_qemu_reg_reverse_index(void)
 {
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         g_qemu_reg_by_gen[i] = QemuRegKey{};
     }
+    g_qemu_reg_routes_from_gdbmap = 0;
+    g_qemu_reg_routes_from_reg_table = 0;
+
+    /*
+     * THE GENERATED gdbstub TABLE IS THE FIRST SOURCE, and it is the right
+     * one: this index answers "which descriptor do I read for this generic
+     * register", and qemu_plugin_get_registers() publishes exactly the
+     * (feature, name) pairs the target's gdbstub declares.  The per-ISA
+     * classification table below is a Capstone-shaped structure that happens
+     * to carry a gdb key on its rows, and it is short where Capstone's
+     * register enum is: neither its ARM64 nor its RISCV enum has a program
+     * counter, so REG_IP had NO route on those two targets and a branch's
+     * published PC destination came out width 0 with a live value beside it.
+     *
+     * The gdb table is generated from the target's own CORE feature XML with
+     * a both-directions refusal (scripts/cst-regmap.py --namespace gdb), so a
+     * register the target declares cannot be missing from it without failing
+     * the build.  Both counts are kept because a zero in either column is
+     * only readable beside the other.
+     */
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        const char *feature = nullptr;
+        const char *name = nullptr;
+        if (cst_gdbmap_unique_name((unsigned)trace_isa, (uint8_t)i,
+                                   &feature, &name)) {
+            g_qemu_reg_by_gen[i].feature = feature;
+            g_qemu_reg_by_gen[i].name = name;
+            g_qemu_reg_routes_from_gdbmap++;
+        }
+    }
+
     if (!active_reg_table || active_reg_table_size == 0) {
         return;
     }
@@ -65,6 +100,7 @@ void build_qemu_reg_reverse_index(void)
          * correct for value reads. */
         if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
             g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
+            g_qemu_reg_routes_from_reg_table++;
         }
     }
 }

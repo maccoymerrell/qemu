@@ -1,0 +1,50 @@
+# The gdbstub register NAME -> generic wire register map for riscv64.
+#
+# name<TAB>generic<TAB>ground.  This is the SECOND namespace: the spelling
+# qemu_plugin_get_registers() hands a plugin, which is the namespace a VALUE
+# READ resolves through.  It is not the TCG-global namespace riscv64.tsv
+# carries, and the two disagree on real registers -- which is the whole reason
+# both exist.
+#
+# The names are not chosen here: scripts/cst-regmap.py --namespace gdb reads
+# them out of the target's own CORE feature XML and REFUSES to generate if
+# this file is short a name or carries one the feature never declares.
+#
+# A row whose ground begins "incumbent:" was already adjudicated on the
+# Capstone-era per-ISA table, which keyed its value-read route on this same
+# gdb (feature, name) pair; those rows carry that adjudication forward
+# unchanged so E1's deletion of that table loses nothing.
+
+a0	REG_GPR10	incumbent: the per-ISA table routed this gdb name here
+a1	REG_GPR11	incumbent: the per-ISA table routed this gdb name here
+a2	REG_GPR12	incumbent: the per-ISA table routed this gdb name here
+a3	REG_GPR13	incumbent: the per-ISA table routed this gdb name here
+a4	REG_GPR14	incumbent: the per-ISA table routed this gdb name here
+a5	REG_GPR15	incumbent: the per-ISA table routed this gdb name here
+a6	REG_GPR16	incumbent: the per-ISA table routed this gdb name here
+a7	REG_GPR17	incumbent: the per-ISA table routed this gdb name here
+fp	REG_FP_REG	incumbent: the per-ISA table routed this gdb name here
+gp	REG_GPR3	incumbent: the per-ISA table routed this gdb name here
+pc	REG_IP	the program counter; Capstone's RISCV register enum has no PC row, so the incumbent table never named it
+ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
+s1	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
+s10	REG_GPR26	incumbent: the per-ISA table routed this gdb name here
+s11	REG_GPR27	incumbent: the per-ISA table routed this gdb name here
+s2	REG_GPR18	incumbent: the per-ISA table routed this gdb name here
+s3	REG_GPR19	incumbent: the per-ISA table routed this gdb name here
+s4	REG_GPR20	incumbent: the per-ISA table routed this gdb name here
+s5	REG_GPR21	incumbent: the per-ISA table routed this gdb name here
+s6	REG_GPR22	incumbent: the per-ISA table routed this gdb name here
+s7	REG_GPR23	incumbent: the per-ISA table routed this gdb name here
+s8	REG_GPR24	incumbent: the per-ISA table routed this gdb name here
+s9	REG_GPR25	incumbent: the per-ISA table routed this gdb name here
+sp	REG_SP	incumbent: the per-ISA table routed this gdb name here
+t0	REG_GPR5	incumbent: the per-ISA table routed this gdb name here
+t1	REG_GPR6	incumbent: the per-ISA table routed this gdb name here
+t2	REG_GPR7	incumbent: the per-ISA table routed this gdb name here
+t3	REG_GPR28	incumbent: the per-ISA table routed this gdb name here
+t4	REG_GPR29	incumbent: the per-ISA table routed this gdb name here
+t5	REG_GPR30	incumbent: the per-ISA table routed this gdb name here
+t6	REG_GPR31	incumbent: the per-ISA table routed this gdb name here
+tp	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
+zero	REG_ZERO	incumbent: the per-ISA table routed this gdb name here

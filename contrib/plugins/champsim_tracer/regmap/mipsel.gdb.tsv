@@ -1,0 +1,90 @@
+# The gdbstub register NAME -> generic wire register map for mipsel.
+#
+# name<TAB>generic<TAB>ground.  This is the SECOND namespace: the spelling
+# qemu_plugin_get_registers() hands a plugin, which is the namespace a VALUE
+# READ resolves through.  It is not the TCG-global namespace mipsel.tsv
+# carries, and the two disagree on real registers -- which is the whole reason
+# both exist.
+#
+# The names are not chosen here: scripts/cst-regmap.py --namespace gdb reads
+# them out of the target's own CORE feature XML and REFUSES to generate if
+# this file is short a name or carries one the feature never declares.
+#
+# A row whose ground begins "incumbent:" was already adjudicated on the
+# Capstone-era per-ISA table, which keyed its value-read route on this same
+# gdb (feature, name) pair; those rows carry that adjudication forward
+# unchanged so E1's deletion of that table loses nothing.
+
+a0	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
+a1	REG_GPR5	incumbent: the per-ISA table routed this gdb name here
+a2	REG_GPR6	incumbent: the per-ISA table routed this gdb name here
+a3	REG_GPR7	incumbent: the per-ISA table routed this gdb name here
+at	REG_GPR1	incumbent: the per-ISA table routed this gdb name here
+badvaddr	REG_SYS	CP0 BadVAddr is a system control register
+cause	REG_SYS	CP0 Cause is a system control register
+f0	REG_FPR0	incumbent: the per-ISA table routed this gdb name here
+f1	REG_FPR1	incumbent: the per-ISA table routed this gdb name here
+f10	REG_FPR10	incumbent: the per-ISA table routed this gdb name here
+f11	REG_FPR11	incumbent: the per-ISA table routed this gdb name here
+f12	REG_FPR12	incumbent: the per-ISA table routed this gdb name here
+f13	REG_FPR13	incumbent: the per-ISA table routed this gdb name here
+f14	REG_FPR14	incumbent: the per-ISA table routed this gdb name here
+f15	REG_FPR15	incumbent: the per-ISA table routed this gdb name here
+f16	REG_FPR16	incumbent: the per-ISA table routed this gdb name here
+f17	REG_FPR17	incumbent: the per-ISA table routed this gdb name here
+f18	REG_FPR18	incumbent: the per-ISA table routed this gdb name here
+f19	REG_FPR19	incumbent: the per-ISA table routed this gdb name here
+f2	REG_FPR2	incumbent: the per-ISA table routed this gdb name here
+f20	REG_FPR20	incumbent: the per-ISA table routed this gdb name here
+f21	REG_FPR21	incumbent: the per-ISA table routed this gdb name here
+f22	REG_FPR22	incumbent: the per-ISA table routed this gdb name here
+f23	REG_FPR23	incumbent: the per-ISA table routed this gdb name here
+f24	REG_FPR24	incumbent: the per-ISA table routed this gdb name here
+f25	REG_FPR25	incumbent: the per-ISA table routed this gdb name here
+f26	REG_FPR26	incumbent: the per-ISA table routed this gdb name here
+f27	REG_FPR27	incumbent: the per-ISA table routed this gdb name here
+f28	REG_FPR28	incumbent: the per-ISA table routed this gdb name here
+f29	REG_FPR29	incumbent: the per-ISA table routed this gdb name here
+f3	REG_FPR3	incumbent: the per-ISA table routed this gdb name here
+f30	REG_FPR30	incumbent: the per-ISA table routed this gdb name here
+f31	REG_FPR31	incumbent: the per-ISA table routed this gdb name here
+f4	REG_FPR4	incumbent: the per-ISA table routed this gdb name here
+f5	REG_FPR5	incumbent: the per-ISA table routed this gdb name here
+f6	REG_FPR6	incumbent: the per-ISA table routed this gdb name here
+f7	REG_FPR7	incumbent: the per-ISA table routed this gdb name here
+f8	REG_FPR8	incumbent: the per-ISA table routed this gdb name here
+f9	REG_FPR9	incumbent: the per-ISA table routed this gdb name here
+fcr0	REG_FCSR	incumbent: the per-ISA table routed this gdb name here
+fcr31	REG_FCSR	incumbent: the per-ISA table routed this gdb name here
+fp	REG_FP_REG	gdb spells $30 by its frame-pointer role; the s8 row names the same register
+gp	REG_GPR28	incumbent: the per-ISA table routed this gdb name here
+hi	REG_ACC0	MIPS HI is the high half of accumulator 0; same container as lo
+k0	REG_GPR26	incumbent: the per-ISA table routed this gdb name here
+k1	REG_GPR27	incumbent: the per-ISA table routed this gdb name here
+lo	REG_ACC0	MIPS LO is the low half of accumulator 0; the ac0 row names REG_ACC0 and a field publishes its container
+pc	REG_IP	incumbent: the per-ISA table routed this gdb name here
+ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
+s0	REG_GPR16	incumbent: the per-ISA table routed this gdb name here
+s1	REG_GPR17	incumbent: the per-ISA table routed this gdb name here
+s2	REG_GPR18	incumbent: the per-ISA table routed this gdb name here
+s3	REG_GPR19	incumbent: the per-ISA table routed this gdb name here
+s4	REG_GPR20	incumbent: the per-ISA table routed this gdb name here
+s5	REG_GPR21	incumbent: the per-ISA table routed this gdb name here
+s6	REG_GPR22	incumbent: the per-ISA table routed this gdb name here
+s7	REG_GPR23	incumbent: the per-ISA table routed this gdb name here
+s8	REG_FP_REG	incumbent: the per-ISA table routed this gdb name here
+sp	REG_SP	incumbent: the per-ISA table routed this gdb name here
+status	REG_SYS	CP0 Status is a system control register
+t0	REG_GPR8	incumbent: the per-ISA table routed this gdb name here
+t1	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
+t2	REG_GPR10	incumbent: the per-ISA table routed this gdb name here
+t3	REG_GPR11	incumbent: the per-ISA table routed this gdb name here
+t4	REG_GPR12	incumbent: the per-ISA table routed this gdb name here
+t5	REG_GPR13	incumbent: the per-ISA table routed this gdb name here
+t6	REG_GPR14	incumbent: the per-ISA table routed this gdb name here
+t7	REG_GPR15	incumbent: the per-ISA table routed this gdb name here
+t8	REG_GPR24	incumbent: the per-ISA table routed this gdb name here
+t9	REG_GPR25	incumbent: the per-ISA table routed this gdb name here
+v0	REG_GPR2	incumbent: the per-ISA table routed this gdb name here
+v1	REG_GPR3	incumbent: the per-ISA table routed this gdb name here
+zero	REG_ZERO	incumbent: the per-ISA table routed this gdb name here

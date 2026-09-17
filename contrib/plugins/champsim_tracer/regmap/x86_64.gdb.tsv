@@ -1,0 +1,86 @@
+# The gdbstub register NAME -> generic wire register map for x86_64.
+#
+# name<TAB>generic<TAB>ground.  This is the SECOND namespace: the spelling
+# qemu_plugin_get_registers() hands a plugin, which is the namespace a VALUE
+# READ resolves through.  It is not the TCG-global namespace x86_64.tsv
+# carries, and the two disagree on real registers -- which is the whole reason
+# both exist.
+#
+# The names are not chosen here: scripts/cst-regmap.py --namespace gdb reads
+# them out of the target's own CORE feature XML and REFUSES to generate if
+# this file is short a name or carries one the feature never declares.
+#
+# A row whose ground begins "incumbent:" was already adjudicated on the
+# Capstone-era per-ISA table, which keyed its value-read route on this same
+# gdb (feature, name) pair; those rows carry that adjudication forward
+# unchanged so E1's deletion of that table loses nothing.
+
+cr0	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cr2	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cr3	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cr4	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cr8	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cs	REG_SEG0	incumbent: the per-ISA table routed this gdb name here
+ds	REG_SEG1	incumbent: the per-ISA table routed this gdb name here
+ds_base	REG_SEG1	the hidden descriptor base of DS; same container as the ds row
+efer	REG_CTRL	the extended feature enable register is a control register; the CR rows carry REG_CTRL
+eflags	REG_FLAGS	incumbent: the per-ISA table routed this gdb name here
+es	REG_SEG2	incumbent: the per-ISA table routed this gdb name here
+es_base	REG_SEG2	the hidden descriptor base of ES; same container as the es row
+fctrl	REG_FCSR	the x87 control word; REG_FCSR is this wire's one floating-point control/status name
+fioff	REG_NONE	the x87 last-instruction offset is saved environment, as fiseg
+fiseg	REG_NONE	the x87 last-instruction segment is saved environment no instruction reads as a dataflow operand
+fooff	REG_NONE	the x87 last-operand offset is saved environment, as fiseg
+fop	REG_NONE	the x87 last-opcode word is saved environment, as fiseg
+foseg	REG_NONE	the x87 last-operand segment is saved environment, as fiseg
+fs	REG_SEG3	incumbent: the per-ISA table routed this gdb name here
+fs_base	REG_TLS	the generic-id header names x86-64 FS.base as REG_TLS's own third subject
+fstat	REG_FLAGS	incumbent: the per-ISA table routed this gdb name here
+ftag	REG_FCSR	the x87 tag word is x87 environment; same container as fctrl on this wire
+gs	REG_SEG4	incumbent: the per-ISA table routed this gdb name here
+gs_base	REG_SEG4	the hidden descriptor base of GS; same container as the gs row
+k_gs_base	REG_SYS	IA32_KERNEL_GS_BASE is an MSR swapgs exchanges with the GS base; it is not GS
+mxcsr	REG_FCSR	the SSE control and status register
+r10	REG_GPR8	incumbent: the per-ISA table routed this gdb name here
+r11	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
+r12	REG_GPR10	incumbent: the per-ISA table routed this gdb name here
+r13	REG_GPR11	incumbent: the per-ISA table routed this gdb name here
+r14	REG_GPR12	incumbent: the per-ISA table routed this gdb name here
+r15	REG_GPR13	incumbent: the per-ISA table routed this gdb name here
+r8	REG_GPR6	incumbent: the per-ISA table routed this gdb name here
+r9	REG_GPR7	incumbent: the per-ISA table routed this gdb name here
+rax	REG_GPR0	incumbent: the per-ISA table routed this gdb name here
+rbp	REG_FP_REG	incumbent: the per-ISA table routed this gdb name here
+rbx	REG_GPR3	incumbent: the per-ISA table routed this gdb name here
+rcx	REG_GPR1	incumbent: the per-ISA table routed this gdb name here
+rdi	REG_GPR5	incumbent: the per-ISA table routed this gdb name here
+rdx	REG_GPR2	incumbent: the per-ISA table routed this gdb name here
+rip	REG_IP	incumbent: the per-ISA table routed this gdb name here
+rsi	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
+rsp	REG_SP	incumbent: the per-ISA table routed this gdb name here
+ss	REG_SEG5	incumbent: the per-ISA table routed this gdb name here
+ss_base	REG_SEG5	the hidden descriptor base of SS; the selector row already names REG_SEG5 and a field publishes its container
+st0	REG_FPR0	incumbent: the per-ISA table routed this gdb name here
+st1	REG_FPR1	incumbent: the per-ISA table routed this gdb name here
+st2	REG_FPR2	incumbent: the per-ISA table routed this gdb name here
+st3	REG_FPR3	incumbent: the per-ISA table routed this gdb name here
+st4	REG_FPR4	incumbent: the per-ISA table routed this gdb name here
+st5	REG_FPR5	incumbent: the per-ISA table routed this gdb name here
+st6	REG_FPR6	incumbent: the per-ISA table routed this gdb name here
+st7	REG_FPR7	incumbent: the per-ISA table routed this gdb name here
+xmm0	REG_VEC0	incumbent: the per-ISA table routed this gdb name here
+xmm1	REG_VEC1	incumbent: the per-ISA table routed this gdb name here
+xmm10	REG_VEC10	incumbent: the per-ISA table routed this gdb name here
+xmm11	REG_VEC11	incumbent: the per-ISA table routed this gdb name here
+xmm12	REG_VEC12	incumbent: the per-ISA table routed this gdb name here
+xmm13	REG_VEC13	incumbent: the per-ISA table routed this gdb name here
+xmm14	REG_VEC14	incumbent: the per-ISA table routed this gdb name here
+xmm15	REG_VEC15	incumbent: the per-ISA table routed this gdb name here
+xmm2	REG_VEC2	incumbent: the per-ISA table routed this gdb name here
+xmm3	REG_VEC3	incumbent: the per-ISA table routed this gdb name here
+xmm4	REG_VEC4	incumbent: the per-ISA table routed this gdb name here
+xmm5	REG_VEC5	incumbent: the per-ISA table routed this gdb name here
+xmm6	REG_VEC6	incumbent: the per-ISA table routed this gdb name here
+xmm7	REG_VEC7	incumbent: the per-ISA table routed this gdb name here
+xmm8	REG_VEC8	incumbent: the per-ISA table routed this gdb name here
+xmm9	REG_VEC9	incumbent: the per-ISA table routed this gdb name here

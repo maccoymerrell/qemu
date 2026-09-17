@@ -527,11 +527,18 @@ _register_probe('probe_rv_xchg', {'riscv64': {'asm': '"addi sp, sp, -16\\n\\t"\n
              'clobbers': '"t0","t1","memory"',
              'opcodes': ['XCHG']}})
 
+# The expectation is SETCC, and the name is historical.  `slt`/`sltu`/`slti`
+# write 0 or 1 into a general register, and RISC-V has no flags register, so
+# `cmp` names an operation the machine does not perform: that disagreement
+# was arbitrated FOR QEMU in tools/gapreport_rulings.tsv rows 69-72 and is
+# SETTLED.  The probe's registered name is left alone on purpose -- it names
+# a generated block whose label reaches the guest binary, so renaming it
+# would move the golden net's bytes for a reason that is not the wire's.
 _register_probe('probe_rv_cmp', {'riscv64': {'asm': '"slt   t0, t1, t2\\n\\t"\n'
                     '    "sltu  t3, t4, t5\\n\\t"\n'
                     '    "slti  a0, a1, 5"',
              'clobbers': '"t0","t3","a0"',
-             'opcodes': ['CMP']}})
+             'opcodes': ['SETCC']}})
 
 _register_probe('probe_rv_fp_madd_msub', {'riscv64': {'asm': '"fmadd.d ft0, ft1, ft2, ft3\\n\\t"\n'
                     '    "fmsub.d ft4, ft5, ft6, ft7"',
@@ -636,11 +643,14 @@ _register_probe('probe_mips_rotate', {'mipsel': {'asm': '"rotr  $t0, $t1, 5\\n\\
 
 _register_probe('probe_mips_fence', {'mipsel': {'asm': '"sync"', 'clobbers': '"memory"', 'opcodes': ['FENCE']}})
 
+# SETCC for the same settled reason as probe_rv_cmp above, rows 112-115 of
+# tools/gapreport_rulings.tsv; the registered name is left alone for the
+# same reason too.
 _register_probe('probe_mips_cmp', {'mipsel': {'asm': '"slt   $t0, $t1, $t2\\n\\t"\n'
                    '    "sltu  $t3, $t4, $t5\\n\\t"\n'
                    '    "slti  $t6, $t7, 5"',
             'clobbers': '"$t0","$t3","$t6"',
-            'opcodes': ['CMP']}})
+            'opcodes': ['SETCC']}})
 
 _register_probe('probe_mips_madd_msub', {'mipsel': {'asm': '"li    $t0, 3\\n\\t"\n'
                    '    "li    $t1, 5\\n\\t"\n'

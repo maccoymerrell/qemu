@@ -835,9 +835,20 @@ _INTENT_OPCODE: dict[str, dict[str, str]] = {
         # false positives surfaced by many-block "breadth" generation:
         # blk_* insn #1 pc=... 'INT_ADD' vs expected 'MOV').
         "lui": "GEN_OP_MOV",
-        "seqz": "GEN_OP_CMP", "snez": "GEN_OP_CMP",
-        "slt": "GEN_OP_CMP", "sltu": "GEN_OP_CMP",
-        "slti": "GEN_OP_CMP", "sltiu": "GEN_OP_CMP",
+        # THE SET-ON-LESS-THAN FAMILY IS SETCC, NOT CMP, AND THAT IS A
+        # SETTLED ARBITRATION RATHER THAN A PREFERENCE.
+        # tools/gapreport_rulings.tsv rows 69-72 (riscv64 sltiu / sltu /
+        # slt / slti) rule the QEMU word FOR QEMU: these instructions write
+        # 0 or 1 into a general register, and RISC-V has no flags register,
+        # so `cmp` names an operation the machine does not perform.  The
+        # probe expectation used to carry `CMP` -- the losing side of that
+        # arbitration -- which reads as a permanent regression on every
+        # run.  `seqz rd,rs` IS `sltiu rd,rs,1` and `snez rd,rs` IS
+        # `sltu rd,zero,rs`: assembler alias text over the same two
+        # encodings, so the same ruling decides them.
+        "seqz": "GEN_OP_SETCC", "snez": "GEN_OP_SETCC",
+        "slt": "GEN_OP_SETCC", "sltu": "GEN_OP_SETCC",
+        "slti": "GEN_OP_SETCC", "sltiu": "GEN_OP_SETCC",
         "nop": "GEN_OP_NOP",
         "ecall": "GEN_OP_SYSCALL",
     },
@@ -852,8 +863,12 @@ _INTENT_OPCODE: dict[str, dict[str, str]] = {
         "xor": "GEN_OP_XOR", "xori": "GEN_OP_XOR",
         "and": "GEN_OP_AND", "andi": "GEN_OP_AND",
         "or": "GEN_OP_OR", "ori": "GEN_OP_OR",
-        "slt": "GEN_OP_CMP", "sltu": "GEN_OP_CMP",
-        "slti": "GEN_OP_CMP", "sltiu": "GEN_OP_CMP",
+        # Rows 112-115 of tools/gapreport_rulings.tsv (mipsel OPC_SLTIU /
+        # OPC_SLTU / OPC_SLTI / OPC_SLT) take the same reading riscv64's
+        # slt family took, FOR QEMU, and for the same reason: the result is
+        # 0 or 1 in a general register and MIPS has no flags register.
+        "slt": "GEN_OP_SETCC", "sltu": "GEN_OP_SETCC",
+        "slti": "GEN_OP_SETCC", "sltiu": "GEN_OP_SETCC",
         "syscall": "GEN_OP_SYSCALL",
         # NOTE: `nop` (== `sll $0,$0,0`) and `move` (addu/or alias) are
         # deliberately omitted — see the module comment above.

@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
 """Per encoding and direction: which registers does each decoder name?
 
-The wire's src_regs[] and dst_regs[] are the Capstone operand walk's.  A flip
-to QEMU's stated sets has one bar -- REAL-LOST=0, no pessimistic-direction
-discount -- and until CST_GEN_SET_DUMP existed that bar had no subject.  The
-statement corpus carried the two set SIZES, and a size cannot say WHICH
-register left; the register-map corpus is keyed on the NAME for a whole run,
-so it cannot be joined per encoding; and CST_DF_SET_DUMP spells QEMU's set in
-QEMU's own currency, which is right for comparing two QEMU-side BUILDS and not
-a join between two DECODERS.
+The wire's src_regs[] and dst_regs[] are QEMU's stated sets, and the bar on
+that flip is REAL-LOST=0 with no pessimistic-direction discount.  Until
+CST_GEN_SET_DUMP existed the bar had no subject: the statement corpus carried
+the two set SIZES, and a size cannot say WHICH register left; the register-map
+corpus is keyed on the NAME for a whole run, so it cannot be joined per
+encoding; and CST_DF_SET_DUMP spells QEMU's set in QEMU's own currency, which
+is right for comparing two QEMU-side BUILDS and not a join between two
+DECODERS.
 
 This reads the corpus that is that join: one run, one window, both sides, the
-generic names the wire itself publishes.  For every (encoding, direction) that
-BOTH sides answered for it reports the three columns this tree scores flips in:
+generic names the wire itself publishes.
+
+THE QEMU ARM IS THE WIRE, and that is a correction.  This scorer used to read
+side 'q' as qemu_plugin_insn_reg_reads/writes -- the raw provenance bit sets
+the seating works FROM -- and the seating adds to them from the vector-operand
+statements, the store-data dependency family and the write notes.  So a
+register the trace publishes through any of those scored as a LOSS while
+nothing was lost: `dup v0.16b, w1` published `-> %v0` against an empty write
+set, and `str q0, [x0]` published `vstore %v0` while naming no vector register
+at all.  Side 'q' is now the published lists; the provenance sets are side 'p'
+and are reported beside the bar, from the same corpus, so the change of
+comparand is a measured difference rather than a claim.
+
+For every (encoding, direction) that BOTH sides answered for it reports the
+three columns this tree scores flips in:
 
     REAL-LOST    Capstone named it; QEMU does not.  The bar.
     REAL-GAIN    QEMU names it; Capstone does not.
@@ -79,7 +92,7 @@ def read_gen(path):
             if len(p) < 7:
                 continue
             _isa, enc, side, direction, _nraw, _nuniq, names = p[:7]
-            if side not in ("q", "c"):
+            if side not in ("q", "c", "p"):
                 continue
             ndata += 1
             sides[side] += 1
@@ -121,9 +134,16 @@ def read_gen(path):
     return stamp, rows
 
 
-def score(rows, strict=True):
-    """The three columns, per name and per encoding."""
-    both = [k for k, v in rows.items() if "q" in v and "c" in v]
+def score(rows, strict=True, qside="q"):
+    """The three columns, per name and per encoding.
+
+    @qside picks which QEMU-side column is scored: "q" is the WIRE's published
+    src_regs[]/dst_regs[] and is the bar; "p" is the raw provenance bit sets
+    the seating works from, which is the comparand this scorer used until the
+    wire column existed and is kept so the two readings can be taken from one
+    corpus and the difference between them attributed rather than guessed.
+    """
+    both = [k for k, v in rows.items() if qside in v and "c" in v]
     if not both:
         raise Refusal("the two sides share no (encoding, direction) key at "
                       "all -- they are keyed on different things, and the "
@@ -142,7 +162,7 @@ def score(rows, strict=True):
     q_named = c_named = 0
 
     for key in both:
-        q, c = rows[key]["q"], rows[key]["c"]
+        q, c = rows[key][qside], rows[key]["c"]
         q_named += len(q)
         c_named += len(c)
         if q == c:
@@ -324,6 +344,8 @@ def report(isa, path, top, out, strict=True, rulings=None,
           file=out)
     print("   corpus stamp %s" % stamp, file=out)
     s["stamp"] = stamp
+    print("   the QEMU arm is the WIRE: src_regs[]/dst_regs[] as published",
+          file=out)
     print("   names stated: QEMU %d, Capstone walk %d"
           % (s["q_named"], s["c_named"]), file=out)
     print("   CHANGED   %8d  encodings whose two sides differ at all"
@@ -342,6 +364,39 @@ def report(isa, path, top, out, strict=True, rulings=None,
             e = wit[nm][0]
             print("      %8d  %-22s  e.g. %s %s" % (n, nm, e[0], e[1]),
                   file=out)
+
+    #
+    # THE RETIRED COMPARAND, BESIDE THE LIVE ONE.
+    #
+    # Side 'p' is the raw provenance bit sets, which is what this scorer read
+    # as the QEMU arm before the wire column existed.  Reporting it from the
+    # SAME corpus is what makes the change of comparand attributable: the two
+    # numbers come from one run, one window and one build, so the difference
+    # between them is the instrument and nothing else.  A corpus with no 'p'
+    # rows says so rather than printing a zero.
+    #
+    if any("p" in v for v in rows.values()):
+        try:
+            sp = score(rows, strict, qside="p")
+        except Refusal as e:
+            print("   -- provenance-side reading REFUSED: %s" % e, file=out)
+        else:
+            s["prov"] = sp
+            print("   -- side p, the RETIRED comparand (raw provenance sets, "
+                  "not the wire):", file=out)
+            print("      %d keys in both sides; REAL-LOST %d names / %d rows, "
+                  "REAL-GAIN %d names / %d rows, CHANGED %d"
+                  % (sp["both"], len(sp["lost"]), sum(sp["lost"].values()),
+                     len(sp["gain"]), sum(sp["gain"].values()),
+                     sp["changed"]), file=out)
+            print("      DELTA wire-minus-provenance: REAL-LOST rows %+d, "
+                  "REAL-GAIN rows %+d, CHANGED %+d"
+                  % (sum(s["lost"].values()) - sum(sp["lost"].values()),
+                     sum(s["gain"].values()) - sum(sp["gain"].values()),
+                     s["changed"] - sp["changed"]), file=out)
+    else:
+        print("   -- side p absent from this corpus: the retired comparand "
+              "cannot be read here, and no delta is claimed", file=out)
 
     if rulings is not None:
         s["unruled"], s["dead"] = join_rulings(isa, s, rulings, out,
@@ -433,6 +488,90 @@ def selftest():
           % (len(SELFTEST_CASES) - bad, len(SELFTEST_CASES)))
     return 1 if bad else 0
 
+
+
+def prov_selftest():
+    """Prove the two comparands are read apart, and that each can move alone.
+
+    The change this exists for is a change of COMPARAND, and a change of
+    comparand that cannot be shown to alter a reading is indistinguishable
+    from no change at all.  Each arm plants a corpus where the wire side and
+    the provenance side disagree in a known way, and asserts both readings.
+    """
+    import tempfile
+
+    def plant(d, rows):
+        p = os.path.join(d, "gen_q.tsv")
+        with open(p, "w") as f:
+            f.write("#so plugin=aa emulator=bb\n" + SIDES)
+            for enc, side, direction, names in rows:
+                n = 0 if names == "-" else len(names.split(","))
+                f.write("q\t%s\t%s\t%s\t%d\t%d\t%s\n"
+                        % (enc, side, direction, n, n, names))
+        return p
+
+    #
+    # Arm 1 is the 220-B witness in miniature: `dup v0.16b, w1` publishes a
+    # vector destination on the wire and names NOTHING to the provenance sets.
+    # The old comparand calls that a loss; the wire does not.
+    # Arm 2 is its mirror: a member the provenance sets carry and the wire
+    # does not, which the wire reading must still call a loss -- so the new
+    # comparand is not simply a quieter one.
+    # Arm 3 is the control on the control: identical sides read zero on both,
+    # so a nonzero delta is never the instrument talking to itself.
+    #
+    cases = [
+        # The second encoding keeps the provenance side non-empty overall, so
+        # the arm measures a difference and not the strict-mode refusal a
+        # wholly blank side would (correctly) raise.
+        ("a wire-published member the provenance set lacks",
+         [("01", "q", "w", "REG_VEC0"), ("01", "p", "w", "-"),
+          ("01", "c", "w", "REG_VEC0"),
+          ("02", "q", "r", "REG_GPR0"), ("02", "p", "r", "REG_GPR0"),
+          ("02", "c", "r", "REG_GPR0")],
+         (0, 1)),
+        ("a member BOTH sides lack is lost on both readings",
+         [("01", "q", "r", "REG_GPR0"), ("01", "p", "r", "REG_GPR0"),
+          ("01", "c", "r", "REG_GPR0,REG_FLAGS")],
+         (1, 1)),
+        ("identical sides: zero on both readings",
+         [("01", "q", "r", "REG_GPR0"), ("01", "p", "r", "REG_GPR0"),
+          ("01", "c", "r", "REG_GPR0")],
+         (0, 0)),
+    ]
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        for name, rows, want in cases:
+            p = plant(d, rows)
+            sink = open(os.devnull, "w")
+            try:
+                s = report("q", p, 0, sink)
+                got = (sum(s["lost"].values()),
+                       sum(s["prov"]["lost"].values()))
+            except (Refusal, KeyError) as e:
+                got = "REFUSED (%s)" % e
+            finally:
+                sink.close()
+            ok = got == want
+            print("  %-52s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
+            bad += 0 if ok else 1
+
+        # A corpus with no provenance side must SAY SO rather than report a
+        # zero delta: an absent column is not a measured agreement.
+        p = plant(d, [("01", "q", "r", "REG_GPR0"),
+                      ("01", "c", "r", "REG_GPR0")])
+        import io
+        buf = io.StringIO()
+        report("q", p, 0, buf)
+        ok = "side p absent" in buf.getvalue()
+        print("  %-52s %s" % ("a corpus with no provenance side says so",
+                              "ok" if ok else "FAILED"))
+        bad += 0 if ok else 1
+
+    print("setjoin comparand selftest: %d of %d arms fired as designed"
+          % (len(cases) + 1 - bad, len(cases) + 1))
+    return 1 if bad else 0
 
 
 def ruling_selftest():
@@ -572,7 +711,7 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest() or ruling_selftest()
+        return selftest() or prov_selftest() or ruling_selftest()
     if not args.dir or not args.isa:
         print("setjoin: --dir and at least one --isa are required",
               file=sys.stderr)

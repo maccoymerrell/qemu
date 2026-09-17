@@ -3159,6 +3159,26 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     tcg_gen_brcond_i64(TCG_COND_NE, clean_addr, cpu_exclusive_addr, fail_label);
 
     /*
+     * THE STORE'S ADDRESS IS Xn, WHICH THE MONITOR CHECK FOLDS AWAY.
+     *
+     * The access below addresses cpu_exclusive_addr -- the address the
+     * matching load-exclusive reserved -- because the branch above has just
+     * proved the two are equal.  That is right for emulation and wrong for
+     * the account: exclusive_addr is a reservation global no architecture
+     * names, so the store's address provenance resolved to a register the
+     * wire cannot spell and was published EMPTY.  gem5 names Xn on all four
+     * of STXR, STLXR, STXRB and STXRH, and it is right: the instruction's
+     * address operand is Xn and the equality is what lets QEMU substitute.
+     *
+     * So the fold is stated where it happens.  The binding attaches to the
+     * VALUE exclusive_addr holds from here on and dies with the next write to
+     * it -- which is the matching load-exclusive's own store -- so a later
+     * exclusive in the same block cannot inherit this one's base register.
+     */
+    insn_dataflow_bind(tcgv_i64_temp(cpu_exclusive_addr),
+                       insn_df_reg(regnames[rn]));
+
+    /*
      * The write, and any associated faults, only happen if the virtual
      * and physical addresses pass the exclusive monitor check.  These
      * faults are exceedingly unlikely, because normally the guest uses

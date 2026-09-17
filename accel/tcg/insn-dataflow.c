@@ -427,6 +427,18 @@ static void df_write_global(InsnDataflow *d, unsigned idx,
     df_set_bit(d->wr, idx);
     df_set_bit(d->opwr, idx);
     df_add_write(d, idx, prov);
+    /*
+     * A GLOBAL AN OP HAS JUST WRITTEN CARRIES NO INHERITED ACCOUNT.
+     *
+     * A decode site may bind a register atom to a global to say which
+     * register a fold consumed -- aarch64's store-exclusive names the base
+     * register that reached the monitor, which no op mentions.  Such a
+     * binding describes the value that was there, and the next op to write
+     * that global replaces the value, so the binding has to die with it or
+     * it would attach to whatever comes after.  Clearing here is what bounds
+     * a fold note to the value it was made about.
+     */
+    memset(df_prov(idx), 0, sizeof(uint64_t) * INSN_DF_REG_WORDS);
 }
 
 /*

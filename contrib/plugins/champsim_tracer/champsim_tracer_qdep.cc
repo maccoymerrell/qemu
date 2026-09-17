@@ -498,6 +498,39 @@ unsigned qdep_selfcheck(void)
     return cst_vocabulary_selfcheck() + cst_regmap_selfcheck();
 }
 
+/*
+ * The instruction's generic identity, and nothing else: the rule's own word
+ * read through the vocabulary.
+ *
+ * Split out of the classification block because a refused SET does not refuse
+ * the word -- see the incompleteness branch in qdep_apply().
+ *
+ * Returns false only for the skewed-build case: a word this build cannot
+ * read means the emulator and the plugin came from different vocabularies,
+ * and publishing a plausible classification for that hides the skew.  A rule
+ * that states NO word is a different answer and returns true with the unknown
+ * opcode -- aarch64 SYS dispatches over four different things and one word
+ * would be wrong for three of them.
+ */
+static bool qdep_classify_word(const struct qemu_plugin_tb *tb, size_t idx,
+                               InsnFields *out)
+{
+    const char *word = qemu_plugin_insn_decode_word(tb, idx);
+    uint8_t opcode = GEN_OP_UNKNOWN, branch_type = BRANCH_NONE;
+
+    if (!cst_vocabulary_lookup(word, &opcode, &branch_type)) {
+        if (word) {
+            g_qdep.unknown_word++;
+            return false;
+        }
+        opcode = GEN_OP_UNKNOWN;
+        branch_type = BRANCH_NONE;
+    }
+    out->opcode = opcode;
+    out->branch_type = branch_type;
+    return true;
+}
+
 QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
                        uint64_t pc, InsnFields *out, InsnRegNames *out_names)
 {
@@ -531,36 +564,34 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         /* QEMU could not record this instruction whole, so the set accessors
          * refuse to hand anything back.  Publishing a partial set would be a
          * dependency missed, which is the failure direction the ABI is built
-         * to prevent. */
+         * to prevent.
+         *
+         * WHAT IS REFUSED IS THE SET, NOT THE INSTRUCTION'S IDENTITY.  The
+         * rule matched and stated its word; incompleteness is a property of
+         * how many operand ranges or accesses QEMU could record, and it says
+         * nothing about WHAT the instruction is.  Dropping the word here cost
+         * three separate facts and bought nothing: the opcode (an aarch64
+         * ST2/ST3/ST4 read UNKNOWN instead of a vector store), the branch
+         * class (a plain `b` in the same block published no terminator at
+         * all, so the true BB lost its edge on the wire), and the consumer's
+         * ability to tell an encoding nothing decoded from one whose
+         * dependency set was withheld.
+         *
+         * Publishing it is not a partial set.  A missing dependency block
+         * means the consumer falls back to the all-to-all default, which is
+         * the conservative reading either way; the word only adds what the
+         * rule already said.  So classify, then refuse. */
         g_qdep.incomplete++;
+        qdep_classify_word(tb, idx, out);
         return QDEP_INCOMPLETE;
     }
 
     /* ---- classification ------------------------------------------------ */
 
-    const char *word = qemu_plugin_insn_decode_word(tb, idx);
-    uint8_t opcode = GEN_OP_UNKNOWN, branch_type = BRANCH_NONE;
-
-    if (!cst_vocabulary_lookup(word, &opcode, &branch_type)) {
-        /*
-         * Two conditions reach here and they are not the same.  A rule that
-         * states NO word has nothing generic to say about itself -- SYS on
-         * aarch64 dispatches over four different things, and one word would
-         * be wrong for three of them -- and the honest answer is the unknown
-         * opcode with the instruction still admitted.  A word this build
-         * cannot READ means the emulator and the plugin were built from
-         * different vocabularies, and publishing a plausible classification
-         * for that hides a skewed build.
-         */
-        if (word) {
-            g_qdep.unknown_word++;
-            return QDEP_UNKNOWN_WORD;
-        }
-        opcode = GEN_OP_UNKNOWN;
-        branch_type = BRANCH_NONE;
+    if (!qdep_classify_word(tb, idx, out)) {
+        return QDEP_UNKNOWN_WORD;
     }
-    out->opcode = opcode;
-    out->branch_type = branch_type;
+    const uint8_t branch_type = out->branch_type;
 
     /*
      * Conditional-ness is the ops', not the word's.  The rule says what kind

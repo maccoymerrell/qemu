@@ -158,6 +158,25 @@ CSTREF_STUB(bool, qemu_plugin_cap_decode,
 
 } /* extern "C" */
 
+/*
+ * THE SLED'S TRANSLATION PRIMITIVE, and it is the clearest case in this file.
+ *
+ * `cst_capture_sled_run()` in champsim_tracer_capture.cc drives QEMU through
+ * one translation per sled slot; the primitive that performs it lives in
+ * champsim_tracer.cc, which this library does not link.  A stub returning
+ * "translated, no chain" would hand the sweep a full run of fabricated
+ * counters and a corpus of nothing, which is exactly the silence the note
+ * above is about -- and worse here, because the sled's whole product is the
+ * rows a REAL translation writes.
+ *
+ * It is unreachable in practice: the referee drives the Capstone side and
+ * never calls the sweep.  The stub exists so the library LINKS and so that
+ * any future path which did reach it would die naming this entry point.
+ * Not `extern "C"` -- capture.h declares it as C++, and the two spellings
+ * have to agree or the link fails for a second, unrelated reason.
+ */
+CSTREF_STUB(bool, cst_sled_translate_slot, (uint64_t, bool *))
+
 /* ------------------------------------------------------------------ */
 
 static bool table_ready;

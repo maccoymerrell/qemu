@@ -240,6 +240,59 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
 void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
                             struct qemu_plugin_insn_info *info);
 
+/*
+ * THE SLED DRIVER.  The corpus every per-encoding instrument reads is
+ * produced HERE, and it could not be produced anywhere else.
+ *
+ * `tools/srcenc_sled.py` writes a guest whose text is a run of fixed-stride
+ * SLOTS, one encoding per slot followed by a terminator, and hands this
+ * plugin `CST_SLED=<base hex>:<stride>:<slots>`.  The driver asks QEMU to
+ * TRANSLATE each slot and to execute none of them.  Translation is the whole
+ * point: it is what runs vcpu_tb_trans -> create_tb_template -> qdep_apply,
+ * which is where the capture hooks above write the row the wire publishes.
+ * An arbitrary word is not a runnable program, so a sled that EXECUTED its
+ * slots could only ever reach the encodings that happen not to fault -- a
+ * biased sample of exactly the wrong shape, because the undefined and
+ * privileged space is where decoder disagreements live.
+ *
+ * WHAT IT WAS COSTING TO NOT HAVE IT.  Measured at exec239, before this
+ * landed: three of the four `static` R13 legs -- aarch64, riscv64, mipsel --
+ * refused with `srcenc_sled: chunk 0 wrote no '# sled ... declined=' line`
+ * and `REFUSED: the sled could not capture an identity`, and both `--srcenc`
+ * isax arms had no corpus to score.  Five R13 rows, blocked on one absent
+ * driver.  (The x86_64 static leg refuses on a DIFFERENT and unrelated
+ * condition, the binutils >= 2.45 objdump of #286.)
+ *
+ * IT IS DRIVEN FROM AN EXECUTION CALLBACK, NOT FROM PLUGIN INSTALL.
+ * qemu_plugin_translate_at() must run from inside a plugin callback with a
+ * live vCPU -- see its contract in qemu-plugin.h -- so the guest's job is to
+ * give the driver one and then exit.  It runs ONCE, on the first TB the
+ * guest executes.
+ *
+ * THE TWO FAILURE COUNTS MEAN DIFFERENT THINGS AND ARE REPORTED SEPARATELY,
+ * because the sweep's caller acts on the difference:
+ *
+ *   declined   qemu_plugin_translate_at() returned false.  For a mapped,
+ *              executable slot the reason is the TCG code buffer, which is
+ *              a property of the RUN; srcenc_sled.py re-lays the leftovers
+ *              in a fresh process, whose buffer is empty.
+ *   no_chain   QEMU translated the slot and the plugin built no template
+ *              chain -- a property of the ENCODING, identical in every arm.
+ *              Each one is named on its own line so the caller can join it
+ *              back to the encoding through that run's own layout.
+ */
+void cst_capture_sled_run(void);
+
+/*
+ * The one primitive the sweep cannot own.  Defined in champsim_tracer.cc,
+ * under this same guard, because the translate-and-keep machinery
+ * (`qemu_plugin_translate_at` plus the chain the translation callback hands
+ * back) and the template store are file-static there.  Returns whether QEMU
+ * TRANSLATED the block at @pc, and sets *@out_chain to whether the plugin
+ * has a template chain for it -- the two facts the sweep reports separately.
+ */
+bool cst_sled_translate_slot(uint64_t pc, bool *out_chain);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -267,6 +320,8 @@ static inline void cst_capture_wire_sets(const struct qemu_plugin_tb *, size_t,
 { }
 static inline void cst_capture_cap_decode(const void *, size_t, uint64_t,
                                           struct qemu_plugin_insn_info *)
+{ }
+static inline void cst_capture_sled_run(void)
 { }
 
 #endif /* CST_CAPTURE */

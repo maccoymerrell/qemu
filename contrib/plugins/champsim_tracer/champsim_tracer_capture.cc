@@ -15,6 +15,7 @@
 
 #include <elf.h>
 #include <glib.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <link.h>
 #include <stdint.h>
@@ -1595,6 +1596,79 @@ void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
     }
     qemu_plugin_cap_decode(arch, mode, (const uint8_t *)bytes, nbytes, pc,
                            info);
+}
+
+/*
+ * THE SLED DRIVER.  Contract, rationale and the cost of its absence are in
+ * champsim_tracer_capture.h; what is here is the loop.
+ *
+ * cst_sled_translate_slot() is the one thing this file cannot do for itself:
+ * the translate-and-keep machinery and the template store are file-static in
+ * champsim_tracer.cc, so that side owns the primitive and this side owns the
+ * sweep.  It is declared under the same CST_CAPTURE guard as everything else
+ * here, so the release object carries neither the loop nor the primitive --
+ * nm and strings can check that rather than take it on trust.
+ */
+void cst_capture_sled_run(void)
+{
+    static bool done;
+
+    if (done) {
+        return;
+    }
+    done = true;
+
+    const char *spec = getenv("CST_SLED");
+    if (!spec || !*spec) {
+        return;
+    }
+
+    /*
+     * `base:stride:slots` -- base in hex, the other two decimal.  A spec
+     * this cannot read is a REFUSAL and not a silent no-op: the caller is
+     * waiting for a corpus, and a run that quietly produced none reads
+     * downstream as an encoding whose source list is empty.
+     */
+    unsigned long long base = 0;
+    unsigned long stride = 0, slots = 0;
+    if (sscanf(spec, "%llx:%lu:%lu", &base, &stride, &slots) != 3
+        || stride == 0 || slots == 0) {
+        fprintf(stderr,
+                "champsim_tracer: CST_SLED=\"%s\" is not "
+                "<base-hex>:<stride>:<slots> with a non-zero stride and "
+                "slot count -- REFUSING to sweep.\n", spec);
+        return;
+    }
+
+    uint64_t translated = 0, declined = 0, no_chain = 0;
+
+    for (unsigned long i = 0; i < slots; i++) {
+        uint64_t pc = (uint64_t)base + (uint64_t)i * stride;
+        bool chain = false;
+
+        if (!cst_sled_translate_slot(pc, &chain)) {
+            declined++;
+            continue;
+        }
+        translated++;
+        if (!chain) {
+            no_chain++;
+            /*
+             * NAMED, not just counted (FINDING 93-A).  The caller maps the
+             * PC back through THIS run's own layout -- the retry passes
+             * re-lay the leftovers, so base and stride are per-run -- and
+             * it cross-checks the count against the number of these lines,
+             * which is why both are written from this one branch.
+             */
+            fprintf(stderr, "# sled-nochain %" PRIx64 "\n", pc);
+        }
+    }
+
+    fprintf(stderr,
+            "# sled base=%llx stride=%lu slots=%lu translated=%" PRIu64
+            " declined=%" PRIu64 " no_chain=%" PRIu64 "\n",
+            base, stride, slots, translated, declined, no_chain);
+    fflush(stderr);
 }
 
 #endif /* CST_CAPTURE */

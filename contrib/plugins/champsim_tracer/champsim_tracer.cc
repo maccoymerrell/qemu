@@ -3714,6 +3714,52 @@ static constexpr uint32_t CST_ALT_BB_MAX_INSNS = 4096;
 static thread_local bool g_alt_translating;
 static thread_local BBTemplate *g_alt_translated_head;
 
+#ifdef CST_CAPTURE
+/*
+ * ONE SLOT OF THE ENCODING SLED, translated and never executed.
+ *
+ * The sweep itself lives in champsim_tracer_capture.cc, which is where all
+ * apparatus lives; what it cannot own is this, because the two things it
+ * needs -- the translate-and-keep handshake above and the template store --
+ * are file-static here.  So the sweep is there and the primitive is here,
+ * both under CST_CAPTURE, and the release object carries neither.
+ *
+ * It is `alt_assemble_bb`'s first loop body and nothing more: drive the
+ * translation, take the chain the callback handed back, and fall back to the
+ * store when QEMU answered out of its own code cache and the callback
+ * therefore did not fire (the two caches move together -- see
+ * lookup_tb_chain_at).  It does NOT assemble a BB: the sled asks only whether
+ * the encoding translated and whether a chain exists for it, and walking the
+ * fragments would add a second reading of facts the capture hooks have
+ * already written during the translation this call performs.
+ *
+ * Takes no data_lock of its own around the translation, for the same reason
+ * alt_assemble_bb does not: vcpu_tb_trans takes that lock itself.
+ */
+bool cst_sled_translate_slot(uint64_t pc, bool *out_chain)
+{
+    g_alt_translated_head = nullptr;
+    g_alt_translating = true;
+    bool ok = qemu_plugin_translate_at(pc);
+    g_alt_translating = false;
+
+    BBTemplate *frag = g_alt_translated_head;
+    g_alt_translated_head = nullptr;
+
+    if (!ok) {
+        *out_chain = false;
+        return false;
+    }
+    if (!frag) {
+        g_mutex_lock(&data_lock);
+        frag = g_template_store.lookup_tb_chain_at(pc);
+        g_mutex_unlock(&data_lock);
+    }
+    *out_chain = (frag != nullptr);
+    return true;
+}
+#endif /* CST_CAPTURE */
+
 /*
  * The alternate path's own delay-slot predicate is DELETED, not re-pointed.
  *
@@ -9243,6 +9289,22 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * Both CP-mode and WP-mode (qemu_plugin_exec_tb) invocations
      * deliver the executing TB through the same pointer. */
     BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
+
+    /*
+     * THE SLED SWEEP, IF THIS RUN IS ONE.  Empty in a release build -- the
+     * declaration is an empty inline there, so the call, the loop and the
+     * name `CST_SLED` are all absent from the shipped object.
+     *
+     * It runs HERE because qemu_plugin_translate_at() must be driven from
+     * inside a plugin callback with a live vCPU, and the sled's guest exists
+     * to provide exactly one: its entry stub is an immediate exit(0), so the
+     * first TB it executes is the sweep's only opportunity.  Before the WP
+     * early-out and before exec_lock, because the sweep translates and never
+     * executes -- it has no path of its own through either.  It runs once
+     * (its own static guard) and returns immediately when CST_SLED is unset,
+     * which is every run that is not a sweep.
+     */
+    cst_capture_sled_run();
 
     /* WP-mode early-out runs BEFORE exec_lock acquisition.  The CP
      * thread that triggered this WP simulation already holds

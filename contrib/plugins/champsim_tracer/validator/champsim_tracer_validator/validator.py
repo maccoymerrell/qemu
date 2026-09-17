@@ -7998,6 +7998,14 @@ def _check_regdata_reconstruction(
         "GEN_OP_AND":     (lambda a, b, m: (a & b) & m, True),
         "GEN_OP_OR":      (lambda a, b, m: (a | b) & m, True),
         "GEN_OP_XOR":     (lambda a, b, m: (a ^ b) & m, True),
+        # A two-source `not` is NOR.  Both sites in the tree that carry
+        # the word with two sources compute the same function: MIPS
+        # OPC_NOR is ~(rs|rt) outright, and aarch64's MVN is ORN with
+        # rn == XZR, whose decode site states the zero register as a
+        # source (translate-a64.c trans_ORR_r), so it arrives here as
+        # ~(0|rm) == ~rm.  x86's NOT names one source and is left to
+        # the arity guard below.  Commutative, as NOR is.
+        "GEN_OP_NOT":     (lambda a, b, m: ~(a | b) & m, True),
     }
 
     # Per-thread current register state.
@@ -8094,10 +8102,29 @@ def _check_regdata_reconstruction(
                     if snap is not None:
                         reg_state[(tid, r)] = _reg_snap_value(snap)
                 continue
-            width = 64  # GP-default; could refine per-insn but the
-                       # GPR snap is always 64-bit-padded on the wire.
+            # The architectural width of the general register, which is
+            # NOT what the snap's wire encoding says: the snap is padded
+            # to 64 bits on every target, and reading that padding as the
+            # operand width made every complementing or borrowing result
+            # on 32-bit mipsel differ from the trace in its top 32 bits
+            # (`not $t2,$t3` reconstructing 0xffffffffffffff71 against a
+            # correct wire value of 0xffffff71).
+            width = 32 if isa == "mipsel" else 64
             mask  = (1 << width) - 1
-            expected_alu = compute(a & mask, b & mask, mask)
+            # WHICH SOURCE IS THE MINUEND IS NOT ON THE WIRE.  src_regs[]
+            # is the coordinate system the dep masks index by bit
+            # position (format.rst step 4.5); the spec nowhere promises
+            # it is in the ISA's textual operand order, and it is not --
+            # mipsel `neg $t0,$t1' (= subu $t0,$zero,$t1) publishes
+            # [REG_GPR9, REG_ZERO] while the ISA reads (rs=$zero,
+            # rt=$t1).  So for a non-commutative op on a 3-operand ISA
+            # both readings are admissible and the value is wrong only
+            # if NEITHER explains it.  x86's 2-operand form keeps its
+            # exact test above, where the dst-also-src alias settles the
+            # roles from the encoding itself.
+            cands = [compute(a & mask, b & mask, mask)]
+            if not commutative and isa not in ("x86_64", "i386"):
+                cands.append(compute(b & mask, a & mask, mask))
             for r in gpr_dsts:
                 snap = snap_idx.get((ipos, r))
                 if snap is None:
@@ -8106,10 +8133,11 @@ def _check_regdata_reconstruction(
                 # The hardwired zero register (riscv x0 / mips $zero /
                 # aarch64 xzr) discards writes — its architectural
                 # value is always 0, not the ALU result.
-                expected = 0 if r == name_to_id.get("REG_ZERO") \
-                    else expected_alu
+                ok_values = [0] if r == name_to_id.get("REG_ZERO") \
+                    else cands
+                expected = ok_values[0]
                 n_checked += 1
-                if got != expected:
+                if got not in ok_values:
                     n_errors += 1
                     issues.append(Issue(
                         "regdata_reconstruction", "error",

@@ -285,6 +285,22 @@ def _fpstatus_helpers(path=None):
     """The helper names the usage table binds to a float_status READ."""
     import re as _re
     path = path or _DFU_TABLE
+    if not os.path.exists(path):
+        # THE TABLE IS A DROPPED GENERATED ARTIFACT, AND THE REFUSAL SAYS SO.
+        # `accel/tcg/insn-dataflow-usage/i386.c.inc` came out of the
+        # helper-usage census (4ec775b9db..f05e0515f1) and the clean restart's
+        # baseline reset did not carry it.  The in-tree successor,
+        # target/i386/tcg/insn-df-helper-usage.tsv, states one DIRECTION
+        # character per pointer argument and names no env member at all, so
+        # it cannot answer which helpers read a softfloat file.  Said here
+        # rather than left as a FileNotFoundError inside a regex loop.
+        raise SystemExit(
+            "isax_srcenc_rows: REFUSING -- %s does not exist.  It is a "
+            "GENERATED artifact of the helper-usage census "
+            "(4ec775b9db..f05e0515f1) that this tree does not carry, and "
+            "target/i386/tcg/insn-df-helper-usage.tsv names no env member, "
+            "so X-FPSTATUS's membership cannot be derived.  The class is "
+            "BLOCKED on that census." % path)
     text = open(path).read()
     want = set()
     for name, body in _re.findall(

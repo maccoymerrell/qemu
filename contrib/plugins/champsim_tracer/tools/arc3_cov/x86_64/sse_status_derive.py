@@ -51,7 +51,28 @@ import re
 Q = '/mnt/md0/QEMU/qemu'
 
 #: The generated usage table, per target.  Only i386 has an `sse_status`.
+#:
+#: THIS FILE IS NOT IN THE TREE, AND SAYING SO PRECISELY IS THE POINT.
+#: `accel/tcg/insn-dataflow-usage/i386.c.inc` was a GENERATED artifact of the
+#: helper-usage census programme (4ec775b9db .. f05e0515f1: 506 helpers,
+#: 11,318,473 calls, one `static const DfHelperField dfu_<helper>[]` per
+#: helper with `offsetof(CPUArchState, member)` and an access-flag word).  The
+#: clean restart's baseline reset did not carry it, and it cannot be
+#: regenerated from anything this tree holds.
+#:
+#: THE SUCCESSOR IS NOT A PATH CHANGE.  `target/i386/tcg/insn-df-helper-usage.
+#: tsv` states the same programme's surviving half -- one DIRECTION character
+#: per pointer argument -- and NAMES NO ENV MEMBER at all (`grep -c status`
+#: reads 0 over its 607 rows).  So the question this oracle asks, "which
+#: helpers read env->sse_status", has no answer in the successor table's
+#: SHAPE, and re-homing it is a table-shape change rather than a repointing.
+#: The refusal below says that rather than dying on a FileNotFoundError three
+#: frames inside a leg, which is how exec237 met it.
 TABLE = 'accel/tcg/insn-dataflow-usage/i386.c.inc'
+
+#: The in-tree table that states the other half, quoted by the refusal so a
+#: reader can check the claim above without archaeology.
+SUCCESSOR = 'target/i386/tcg/insn-df-helper-usage.tsv'
 
 #: The member this oracle answers about, spelled as the table spells it.
 MEMBER = 'sse_status'
@@ -80,8 +101,19 @@ class SseStatusOracle(object):
 
     def __init__(self, root=Q, table=TABLE, member=MEMBER):
         self.member = member
-        self.arrays, self.helpers = self._load(os.path.join(root, table),
-                                               member)
+        path = os.path.join(root, table)
+        if not os.path.exists(path):
+            raise SystemExit(
+                'sse_status_derive: REFUSING -- %s does not exist.\n'
+                '  It is a GENERATED artifact of the helper-usage census\n'
+                '  (4ec775b9db..f05e0515f1) that the clean restart did not\n'
+                '  carry, and nothing in this tree regenerates it.\n'
+                '  The in-tree successor %s states one DIRECTION character\n'
+                '  per pointer argument and names no env member, so it\n'
+                '  cannot answer "which helpers read env->%s".\n'
+                '  This leg is BLOCKED on that census, not on the tracer.'
+                % (path, os.path.join(root, SUCCESSOR), member))
+        self.arrays, self.helpers = self._load(path, member)
         if not self.helpers:
             # A table with no occupant would answer False everywhere, which
             # reads exactly like "QEMU reads no float status anywhere" --

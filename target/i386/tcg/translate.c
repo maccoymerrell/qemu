@@ -651,16 +651,65 @@ static TCGv_i32 eip_next_i32(DisasContext *s)
 
 static TCGv eip_next_tl(DisasContext *s)
 {
+    TCGv ret;
+
     assert(s->pc_save != -1);
     if (tb_cflags(s->base.tb) & CF_PCREL) {
-        TCGv ret = tcg_temp_new();
+        ret = tcg_temp_new();
         tcg_gen_addi_tl(ret, cpu_eip, s->pc - s->pc_save);
-        return ret;
     } else if (CODE64(s)) {
-        return tcg_constant_tl(s->pc);
+        ret = tcg_constant_tl(s->pc);
     } else {
-        return tcg_constant_tl((uint32_t)(s->pc - s->cs_base));
+        ret = tcg_constant_tl((uint32_t)(s->pc - s->cs_base));
     }
+    /*
+     * THE VALUE IS THE INSTRUCTION POINTER PLUS THIS INSTRUCTION'S LENGTH,
+     * whichever of the three ways above produced it.
+     *
+     * gen_CALL and gen_CALL_m push it, so it reaches the wire as a store's
+     * data operand -- and without CF_PCREL the two constant arms have folded
+     * the whole computation at translation time, leaving a value that came
+     * from nothing in the op stream.  A store datum with an empty and
+     * complete provenance is what the format spells "the instruction's
+     * immediate", so a direct `callq` published the IMMEDIATE bit and every
+     * indirect form published the EMPTY mask.  Both say the pushed value came
+     * from the encoding.  It did not: the ISA defines it as RIP plus the
+     * instruction's length.
+     *
+     * Stated in the CF_PCREL arm too, where the add above already carries the
+     * read.  That costs one deduplicated entry and makes the two translation
+     * regimes publish the same set BY CONSTRUCTION rather than by
+     * coincidence.
+     *
+     * BOUND TO THE TEMP, not to the instruction, so that nothing else can
+     * inherit it.  Without CF_PCREL the temp is the interned
+     * tcg_constant_tl(s->pc), so a second route to the same statement would
+     * be a store whose data operand is that same interned constant: x86 has
+     * none, because an immediate operand is materialised with
+     * tcg_gen_movi_tl() into a temp of its own (emit.c.inc, X86_OP_IMM) and
+     * is never handed to a store emitter as a shared constant.
+     *
+     * Capture only; no op is emitted, altered or suppressed.
+     *
+     * THE BIND ALONE IS INERT AND THAT IS WHY THE READ IS STATED TOO.  A
+     * binding puts the atom in the TEMP's provenance, which is what a store's
+     * data-dependency mask is resolved from -- but the mask's bits INDEX the
+     * instruction's read list, so a register that is in no read set has no
+     * bit to point at and the mask comes out empty anyway.  Measured, not
+     * assumed: with only the bind, `call_return_store` still read 4 of 4 with
+     * `store_data_dep_mask` 0x0 and `src_regs` [REG_SP].  Both halves, or
+     * neither.
+     *
+     * The read is stated only where the fold consumed it.  Under CF_PCREL the
+     * add above genuinely reads cpu_eip and the walk names it, so a statement
+     * there would be a duplicate; the bind is taken in that arm regardless so
+     * that the two regimes publish the same set by construction.
+     */
+    insn_dataflow_bind(tcgv_tl_temp(ret), insn_df_reg(X86_DF_PC_NAME));
+    if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+        insn_dataflow_state_read(insn_df_reg(X86_DF_PC_NAME));
+    }
+    return ret;
 }
 
 static TCGv eip_cur_tl(DisasContext *s)

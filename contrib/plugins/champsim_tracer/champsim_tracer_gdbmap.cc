@@ -39,6 +39,14 @@ struct CstGdbMapRow {
     const char *feature;
     const char *name;
     uint8_t reg;                /* GenericRegId */
+    /*
+     * Whether a VALUE READ for @reg resolves through THIS name.  Several
+     * names can carry one generic id, and the pick between them is an
+     * adjudication written in the TSV, not a property of the row -- see
+     * check_route_adjudications() in scripts/cst-regmap.py, which refuses
+     * to generate an ambiguous id that nobody has decided.
+     */
+    bool route;
 };
 
 #include "champsim_tracer_gdbmap_x86_64.h"
@@ -72,7 +80,7 @@ const unsigned n_gdb_tables =
 
 } /* namespace */
 
-bool cst_gdbmap_unique_name(unsigned isa, uint8_t reg_id,
+bool cst_gdbmap_value_route(unsigned isa, uint8_t reg_id,
                             const char **feature, const char **name)
 {
     if (isa >= n_gdb_tables) {
@@ -86,16 +94,23 @@ bool cst_gdbmap_unique_name(unsigned isa, uint8_t reg_id,
         return false;
     }
     /*
-     * UNIQUE, and that is the whole contract.  Several gdb names can carry
-     * one generic id -- MIPS `lo` and `hi` are the two halves of accumulator
-     * 0, and `fp` and `s8` are two spellings of $30 -- and reading ONE of
-     * them would publish a partial value under a name that promises the
-     * whole register.  So an id with more than one name gets no route from
-     * here and keeps whatever route it already had; the caller counts both
-     * outcomes rather than letting the ambiguous ones read as absent.
+     * THE ADJUDICATED ROUTE, and that is the whole contract.  Several gdb
+     * names can carry one generic id -- MIPS `lo` and `hi` are the two halves
+     * of accumulator 0, `fp` and `s8` are two spellings of $30, and x86's
+     * REG_CTRL is carried by every CR plus EFER -- and reading the wrong one
+     * publishes another register's bytes, or half a container, under a name
+     * that promises the whole register.  Which name a read goes through is
+     * therefore decided per id in regmap/<isa>.gdb.tsv with a ground behind
+     * it; the generator refuses to emit an ambiguous id that carries no
+     * verdict, so at most one row here can be the route and an id whose rows
+     * all decline leaves it correctly unrouted.
+     *
+     * Exactly one route is still asserted rather than assumed: two would mean
+     * the table and the generator disagree, and the honest answer to that is
+     * no route, not the first one found.
      */
     for (unsigned i = 0; i < n; i++) {
-        if (rows[i].reg != reg_id) {
+        if (rows[i].reg != reg_id || !rows[i].route) {
             continue;
         }
         if (hit) {

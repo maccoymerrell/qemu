@@ -96,13 +96,18 @@ unsigned cst_regmap_size(unsigned isa);
  * which is why the join is generated twice from two registration sites
  * rather than once from a spelling that happens to match.
  *
- * Returns false when this build's table carries NO row for @reg_id, and also
- * when it carries MORE THAN ONE: several gdb names can name parts of one
- * generic register (MIPS `lo`/`hi` are accumulator 0's halves), and reading
- * one of them would publish a partial value under a whole register's name.
- * A caller must treat false as "no route", never as "no such register".
+ * Returns the ADJUDICATED route: the one gdb name a value read for @reg_id
+ * goes through.  Several gdb names can name parts of one generic register
+ * (MIPS `lo`/`hi` are accumulator 0's halves) or different registers folded
+ * onto one wire id (every x86 CR plus EFER is REG_CTRL), so which one a read
+ * resolves through is written down per id in regmap/<isa>.gdb.tsv and the
+ * generator refuses an ambiguous id that carries no verdict.
+ *
+ * Returns false when this build's table carries no row for @reg_id and when
+ * every row it carries declines the route.  A caller must treat false as
+ * "no route", never as "no such register".
  */
-bool cst_gdbmap_unique_name(unsigned isa, uint8_t reg_id,
+bool cst_gdbmap_value_route(unsigned isa, uint8_t reg_id,
                             const char **feature, const char **name);
 
 /* How many gdb names this build knows for @isa, so a census cannot be

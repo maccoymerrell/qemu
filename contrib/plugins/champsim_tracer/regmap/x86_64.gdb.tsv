@@ -15,19 +15,19 @@
 # gdb (feature, name) pair; those rows carry that adjudication forward
 # unchanged so E1's deletion of that table loses nothing.
 
-cr0	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
-cr2	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
-cr3	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
-cr4	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
-cr8	REG_CTRL	incumbent: the per-ISA table routed this gdb name here
+cr0	REG_CTRL	route: the incumbent per-ISA table routed REG_CTRL here, and this preserves the published value exactly; the wire folds six distinct control registers onto one id, which is the open member-discriminator item, not a choice this table can make
+cr2	REG_CTRL	noroute: CR2 is a distinct control register sharing REG_CTRL with CR0; cr0 carries the route
+cr3	REG_CTRL	noroute: CR3 is a distinct control register sharing REG_CTRL with CR0; cr0 carries the route
+cr4	REG_CTRL	noroute: CR4 is a distinct control register sharing REG_CTRL with CR0; cr0 carries the route
+cr8	REG_CTRL	noroute: CR8 is a distinct control register sharing REG_CTRL with CR0; cr0 carries the route
 cs	REG_SEG0	incumbent: the per-ISA table routed this gdb name here
-ds	REG_SEG1	incumbent: the per-ISA table routed this gdb name here
-ds_base	REG_SEG1	the hidden descriptor base of DS; same container as the ds row
-efer	REG_CTRL	the extended feature enable register is a control register; the CR rows carry REG_CTRL
-eflags	REG_FLAGS	incumbent: the per-ISA table routed this gdb name here
-es	REG_SEG2	incumbent: the per-ISA table routed this gdb name here
-es_base	REG_SEG2	the hidden descriptor base of ES; same container as the es row
-fctrl	REG_FCSR	the x87 control word; REG_FCSR is this wire's one floating-point control/status name
+ds	REG_SEG1	route: the segment SELECTOR is the register the wire names; ds_base is the hidden descriptor half of the same container
+ds_base	REG_SEG1	noroute: the hidden descriptor base of DS; reading it would publish the base under the selector's name
+efer	REG_CTRL	noroute: the extended feature enable register is a control register and shares REG_CTRL; cr0 carries the route
+eflags	REG_FLAGS	route: the incumbent per-ISA table routed REG_FLAGS here, and this preserves the published value exactly; EFLAGS is the architectural condition-code register
+es	REG_SEG2	route: the segment SELECTOR is the register the wire names; es_base is the hidden descriptor half of the same container
+es_base	REG_SEG2	noroute: the hidden descriptor base of ES; reading it would publish the base under the selector's name
+fctrl	REG_FCSR	noroute: the x87 control word shares REG_FCSR with the tag word and MXCSR, and the incumbent table routed none of the three; REG_FCSR has no value read on x86_64
 fioff	REG_NONE	the x87 last-instruction offset is saved environment, as fiseg
 fiseg	REG_NONE	the x87 last-instruction segment is saved environment no instruction reads as a dataflow operand
 fooff	REG_NONE	the x87 last-operand offset is saved environment, as fiseg
@@ -35,12 +35,12 @@ fop	REG_NONE	the x87 last-opcode word is saved environment, as fiseg
 foseg	REG_NONE	the x87 last-operand segment is saved environment, as fiseg
 fs	REG_SEG3	incumbent: the per-ISA table routed this gdb name here
 fs_base	REG_TLS	the generic-id header names x86-64 FS.base as REG_TLS's own third subject
-fstat	REG_FLAGS	incumbent: the per-ISA table routed this gdb name here
-ftag	REG_FCSR	the x87 tag word is x87 environment; same container as fctrl on this wire
-gs	REG_SEG4	incumbent: the per-ISA table routed this gdb name here
-gs_base	REG_SEG4	the hidden descriptor base of GS; same container as the gs row
+fstat	REG_FLAGS	noroute: the x87 status word shares REG_FLAGS with EFLAGS; eflags carries the route
+ftag	REG_FCSR	noroute: the x87 tag word shares REG_FCSR with fctrl and MXCSR; REG_FCSR has no value read on x86_64
+gs	REG_SEG4	route: the segment SELECTOR is the register the wire names; gs_base is the hidden descriptor half of the same container
+gs_base	REG_SEG4	noroute: the hidden descriptor base of GS; reading it would publish the base under the selector's name
 k_gs_base	REG_SYS	IA32_KERNEL_GS_BASE is an MSR swapgs exchanges with the GS base; it is not GS
-mxcsr	REG_FCSR	the SSE control and status register
+mxcsr	REG_FCSR	noroute: the SSE control and status register shares REG_FCSR with the x87 pair; REG_FCSR has no value read on x86_64
 r10	REG_GPR8	incumbent: the per-ISA table routed this gdb name here
 r11	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
 r12	REG_GPR10	incumbent: the per-ISA table routed this gdb name here
@@ -58,8 +58,8 @@ rdx	REG_GPR2	incumbent: the per-ISA table routed this gdb name here
 rip	REG_IP	incumbent: the per-ISA table routed this gdb name here
 rsi	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
 rsp	REG_SP	incumbent: the per-ISA table routed this gdb name here
-ss	REG_SEG5	incumbent: the per-ISA table routed this gdb name here
-ss_base	REG_SEG5	the hidden descriptor base of SS; the selector row already names REG_SEG5 and a field publishes its container
+ss	REG_SEG5	route: the segment SELECTOR is the register the wire names; ss_base is the hidden descriptor half of the same container
+ss_base	REG_SEG5	noroute: the hidden descriptor base of SS; reading it would publish the base under the selector's name
 st0	REG_FPR0	incumbent: the per-ISA table routed this gdb name here
 st1	REG_FPR1	incumbent: the per-ISA table routed this gdb name here
 st2	REG_FPR2	incumbent: the per-ISA table routed this gdb name here

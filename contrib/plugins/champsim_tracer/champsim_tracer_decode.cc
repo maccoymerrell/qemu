@@ -71,7 +71,7 @@ void build_qemu_reg_reverse_index(void)
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         const char *feature = nullptr;
         const char *name = nullptr;
-        if (cst_gdbmap_unique_name((unsigned)trace_isa, (uint8_t)i,
+        if (cst_gdbmap_value_route((unsigned)trace_isa, (uint8_t)i,
                                    &feature, &name)) {
             g_qemu_reg_by_gen[i].feature = feature;
             g_qemu_reg_by_gen[i].name = name;

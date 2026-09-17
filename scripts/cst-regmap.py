@@ -419,7 +419,24 @@ def read_tsv(path):
             if not ground:
                 raise SystemExit('%s:%d: %s has no stated ground'
                                  % (path, lineno, name))
-            rows.append((name, reg, ground, lineno))
+            # A ground may open with a VALUE-READ ADJUDICATION token.  Several
+            # gdb names can carry one generic id, and reading the wrong one
+            # publishes a different register's bytes under the id's name, so
+            # which name the read goes through is a decision and is written
+            # down per row rather than inferred.  "route:" is the row a value
+            # read resolves through; "noroute:" says this row is not it (and,
+            # when every row of an id says it, that the id has no value read
+            # at all).  An id with one row needs no token.
+            route = None
+            for tok, val in (('route:', True), ('noroute:', False)):
+                if ground.startswith(tok):
+                    route = val
+                    ground = ground[len(tok):].strip()
+                    break
+            if route is not None and not ground:
+                raise SystemExit('%s:%d: %s states a route verdict with no '
+                                 'ground behind it' % (path, lineno, name))
+            rows.append((name, reg, ground, lineno, route))
     return rows
 
 
@@ -442,7 +459,8 @@ def emit(isa, rows, out):
     lines.append('#define %s' % guard)
     lines.append('')
     lines.append('static const CstRegMapRow cst_regmap_%s[] = {' % isa)
-    for name, reg, ground, _ in sorted(rows, key=lambda r: r[0]):
+    for name, reg, ground, _lineno, _route in sorted(rows,
+                                                     key=lambda r: r[0]):
         lines.append('    { %s, %s },  /* %s */' % (c_string(name), reg, ground))
     lines.append('};')
     lines.append('')
@@ -451,6 +469,61 @@ def emit(isa, rows, out):
     text = '\n'.join(lines)
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)
+
+
+def check_route_adjudications(path, isa, rows):
+    """Every generic id with more than one gdb name must say which one a
+    VALUE READ goes through -- or say, on every one of its rows, that none
+    of them does.
+
+    An id with several names is not a spelling choice.  x86's REG_CTRL is
+    carried by cr0, cr2, cr3, cr4, cr8 and efer; MIPS's REG_ACC0 by hi and
+    lo.  Reading the wrong one publishes a different register's bytes under
+    the id's name, and reading half a container publishes a partial value as
+    a whole one.  Neither is something a generator may pick, so the pick is
+    a row in the table with a ground behind it, and this refuses the build
+    when an ambiguous id has not been adjudicated.
+
+    REG_NONE is exempt: it is the table's own "no generic register" marker
+    and never routes a read.
+    """
+    by_reg = {}
+    for name, reg, ground, lineno, route in rows:
+        by_reg.setdefault(reg, []).append((name, lineno, route))
+
+    msg = []
+    for reg in sorted(by_reg):
+        members = by_reg[reg]
+        if reg == 'REG_NONE' or len(members) == 1:
+            # A single-row id needs no verdict, but must not contradict
+            # itself by writing one that says it is not the route.
+            for name, lineno, route in members:
+                if route is False:
+                    msg.append('  %s:%d: %s is the only row for %s and says '
+                               'it is not the value-read route, which leaves '
+                               'the id no route at all -- state the ground on '
+                               'its own row or drop the token'
+                               % (path, lineno, name, reg))
+            continue
+        routes = [m for m in members if m[2] is True]
+        unstated = [m for m in members if m[2] is None]
+        if len(routes) == 1 and not unstated:
+            continue
+        if not routes and not unstated:
+            continue            # every row says noroute: the id has none
+        msg.append('  %s: %s is carried by %d names (%s) and is not '
+                   'adjudicated: %d row(s) claim the value-read route and '
+                   '%d state no verdict'
+                   % (path, reg, len(members),
+                      ', '.join(m[0] for m in members),
+                      len(routes), len(unstated)))
+        for name, lineno, route in members:
+            if route is None:
+                msg.append('    %s:%d: %s states no route verdict'
+                           % (path, lineno, name))
+    if msg:
+        raise SystemExit('\n'.join(
+            ['cst-regmap: %s: ambiguous value-read routes.' % isa] + msg))
 
 
 def emit_gdb(isa, rows, feature_of, out):
@@ -470,10 +543,19 @@ def emit_gdb(isa, rows, feature_of, out):
     lines.append('#define %s' % guard)
     lines.append('')
     lines.append('static const CstGdbMapRow cst_gdbmap_%s[] = {' % isa)
-    for name, reg, ground, _ in sorted(rows, key=lambda r: r[0]):
-        lines.append('    { %s, %s, %s },  /* %s */'
+    # An id named by exactly one row routes through it without needing a
+    # verdict; check_route_adjudications() has already refused anything else.
+    n_rows_for = {}
+    for _n, reg, _g, _l, _r in rows:
+        n_rows_for[reg] = n_rows_for.get(reg, 0) + 1
+    for name, reg, ground, _lineno, route in sorted(rows,
+                                                    key=lambda r: r[0]):
+        is_route = (route is True or
+                    (route is None and reg != 'REG_NONE' and
+                     n_rows_for[reg] == 1))
+        lines.append('    { %s, %s, %s, %s },  /* %s */'
                      % (c_string(feature_of[name]), c_string(name), reg,
-                        ground))
+                        'true' if is_route else 'false', ground))
     lines.append('};')
     lines.append('')
     lines.append('#endif /* %s */' % guard)
@@ -508,7 +590,7 @@ def main():
     rows = read_tsv(args.tsv)
 
     seen = {}
-    for name, reg, ground, lineno in rows:
+    for name, reg, ground, lineno, route in rows:
         if name in seen:
             raise SystemExit('%s:%d: %r appears twice (first at line %d)'
                              % (args.tsv, lineno, name, seen[name]))
@@ -528,8 +610,15 @@ def main():
         raise SystemExit('\n'.join(msg))
 
     if args.namespace == 'gdb':
+        check_route_adjudications(args.tsv, args.isa, rows)
         emit_gdb(args.isa, rows, universe, args.output)
     else:
+        for name, reg, ground, lineno, route in rows:
+            if route is not None:
+                raise SystemExit('%s:%d: %s states a route verdict; the route '
+                                 'tokens belong to the gdb namespace, which is '
+                                 'the one a value read resolves through'
+                                 % (args.tsv, lineno, name))
         emit(args.isa, rows, args.output)
     return 0
 

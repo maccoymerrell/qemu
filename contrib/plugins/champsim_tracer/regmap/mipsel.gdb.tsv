@@ -20,8 +20,8 @@ a1	REG_GPR5	incumbent: the per-ISA table routed this gdb name here
 a2	REG_GPR6	incumbent: the per-ISA table routed this gdb name here
 a3	REG_GPR7	incumbent: the per-ISA table routed this gdb name here
 at	REG_GPR1	incumbent: the per-ISA table routed this gdb name here
-badvaddr	REG_SYS	CP0 BadVAddr is a system control register
-cause	REG_SYS	CP0 Cause is a system control register
+badvaddr	REG_SYS	noroute: CP0 BadVAddr is a distinct system control register sharing REG_SYS with Cause and Status; the incumbent table routed none of the three, so REG_SYS has no value read
+cause	REG_SYS	noroute: CP0 Cause is a distinct system control register sharing REG_SYS with BadVAddr and Status; REG_SYS has no value read
 f0	REG_FPR0	incumbent: the per-ISA table routed this gdb name here
 f1	REG_FPR1	incumbent: the per-ISA table routed this gdb name here
 f10	REG_FPR10	incumbent: the per-ISA table routed this gdb name here
@@ -54,14 +54,14 @@ f6	REG_FPR6	incumbent: the per-ISA table routed this gdb name here
 f7	REG_FPR7	incumbent: the per-ISA table routed this gdb name here
 f8	REG_FPR8	incumbent: the per-ISA table routed this gdb name here
 f9	REG_FPR9	incumbent: the per-ISA table routed this gdb name here
-fcr0	REG_FCSR	incumbent: the per-ISA table routed this gdb name here
-fcr31	REG_FCSR	incumbent: the per-ISA table routed this gdb name here
-fp	REG_FP_REG	gdb spells $30 by its frame-pointer role; the s8 row names the same register
+fcr0	REG_FCSR	route: the incumbent per-ISA table routed REG_FCSR here, and this preserves the published value exactly
+fcr31	REG_FCSR	noroute: FCSR proper shares REG_FCSR with the implementation register fcr0; fcr0 carries the route
+fp	REG_FP_REG	noroute: gdb spells $30 by its frame-pointer role; the s8 row names the same register and carries the route
 gp	REG_GPR28	incumbent: the per-ISA table routed this gdb name here
-hi	REG_ACC0	MIPS HI is the high half of accumulator 0; same container as lo
+hi	REG_ACC0	noroute: MIPS HI is the high half of accumulator 0; reading one half would publish a partial value under the whole accumulator's name, so REG_ACC0 has no value read
 k0	REG_GPR26	incumbent: the per-ISA table routed this gdb name here
 k1	REG_GPR27	incumbent: the per-ISA table routed this gdb name here
-lo	REG_ACC0	MIPS LO is the low half of accumulator 0; the ac0 row names REG_ACC0 and a field publishes its container
+lo	REG_ACC0	noroute: MIPS LO is the low half of accumulator 0; reading one half would publish a partial value under the whole accumulator's name, so REG_ACC0 has no value read
 pc	REG_IP	incumbent: the per-ISA table routed this gdb name here
 ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
 s0	REG_GPR16	incumbent: the per-ISA table routed this gdb name here
@@ -72,9 +72,9 @@ s4	REG_GPR20	incumbent: the per-ISA table routed this gdb name here
 s5	REG_GPR21	incumbent: the per-ISA table routed this gdb name here
 s6	REG_GPR22	incumbent: the per-ISA table routed this gdb name here
 s7	REG_GPR23	incumbent: the per-ISA table routed this gdb name here
-s8	REG_FP_REG	incumbent: the per-ISA table routed this gdb name here
+s8	REG_FP_REG	route: the incumbent per-ISA table routed REG_FP_REG here, and this preserves the published value exactly; $30 is one register under two gdb spellings
 sp	REG_SP	incumbent: the per-ISA table routed this gdb name here
-status	REG_SYS	CP0 Status is a system control register
+status	REG_SYS	noroute: CP0 Status is a distinct system control register sharing REG_SYS with BadVAddr and Cause; REG_SYS has no value read
 t0	REG_GPR8	incumbent: the per-ISA table routed this gdb name here
 t1	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
 t2	REG_GPR10	incumbent: the per-ISA table routed this gdb name here

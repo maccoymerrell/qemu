@@ -80,9 +80,19 @@ OPC_AND	and
 OPC_ANDI	and
 
 # or
-OPC_NOR	or
 OPC_OR	or
 OPC_ORI	or
+
+# not
+#
+# NOR's distinguishing operation is the complement, not the disjunction.
+# gen_logic()'s OPC_NOR arm emits tcg_gen_nor_tl when both sources are
+# live and tcg_gen_not_tl when either is $zero -- which is the `not
+# rd,rs' idiom the assembler spells for rs == $zero -- so every arm of
+# the rule complements and only one of them also disjoins.  Wording it
+# `or' loses the complement entirely: `not $t2,$t3' published as OR
+# reconstructs to the operand instead of to its complement.
+OPC_NOR	not
 
 # xor
 OPC_XOR	xor

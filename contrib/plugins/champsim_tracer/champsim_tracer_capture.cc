@@ -716,11 +716,23 @@ void emit_reg_set(const char *isa, const char *enc, char dir,
  * member through the same register map the wire would, so both sides of the
  * join speak generic.
  *
+ * AN ATOM THAT IS A REGISTER IS SPELLED AS THE WIRE SPELLS IT.  Three of the
+ * provenance bits are atoms rather than storage, and one of them -- the
+ * architectural zero register -- IS a register: classify_bit() in
+ * champsim_tracer_qdep.cc puts it through cst_regmap_atom(), gets REG_ZERO
+ * back, and publishes it in the src or dst list like any other name.  Spelling
+ * it "@atom0" here would say the wire had no name for a register the wire
+ * names on every $zero access on three targets, so this side of the join uses
+ * the SAME map the wire uses.  The immediate and constant atoms are not
+ * registers on the wire either -- classify_bit() routes them to BIT_IMM and
+ * BIT_CONST, never into a register slot -- so they keep their atom spelling,
+ * which is what the other side has for them.
+ *
  * NOTHING IS DROPPED.  A name the map cannot translate is a real member and
- * prints as @unmapped:<name>; an atom and an undeclared env range print as
- * themselves.  A set that quietly omitted any of them would compare equal to
- * one that genuinely lacks it, and REAL-LOST measured against that is exactly
- * the discount R12.1 forbids.
+ * prints as @unmapped:<name>; a non-register atom and an undeclared env range
+ * print as themselves.  A set that quietly omitted any of them would compare
+ * equal to one that genuinely lacks it, and REAL-LOST measured against that is
+ * exactly the discount R12.1 forbids.
  */
 void gen_bit_label(unsigned bit, char *buf, size_t sz)
 {
@@ -743,7 +755,20 @@ void gen_bit_label(unsigned bit, char *buf, size_t sz)
             snprintf(buf, sz, "@unmapped:%s", name);
         }
     } else if (is_atom && qemu_plugin_dataflow_prov_atom(bit, &atom)) {
-        snprintf(buf, sz, "@atom%u", (unsigned)atom);
+        uint8_t reg = REG_NONE;
+        bool is_reg = false;
+
+        if (cst_regmap_atom(atom, &reg, &is_reg) && is_reg) {
+            const char *gn = generic_reg_name(reg);
+
+            if (gn) {
+                snprintf(buf, sz, "%s", gn);
+            } else {
+                snprintf(buf, sz, "REG_%u", (unsigned)reg);
+            }
+        } else {
+            snprintf(buf, sz, "@atom%u", (unsigned)atom);
+        }
     } else if (qemu_plugin_dataflow_prov_field(bit, &off, &size)) {
         snprintf(buf, sz, "@env+%u:%u", (unsigned)off, (unsigned)size);
     } else {

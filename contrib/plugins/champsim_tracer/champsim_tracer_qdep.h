@@ -104,6 +104,12 @@ struct QdepCounters {
      * at all.  It is 0 on every ISA measured so far. */
     uint64_t load_datum_seated;
     uint64_t load_datum_in_addr;
+    /* Destinations whose dependency mask came from a field row rather than
+     * from a TCG global's write record -- every vector and FP destination on
+     * every machine.  A zero here on a run that touched vector state means
+     * the field side is not being asked, which is how those masks were
+     * published empty. */
+    uint64_t field_dst_prov_seated;
     /* Synthetic addresses seated, and those withheld whole because the
      * descriptor cannot express one of their terms. */
     uint64_t synth_ea_seated;

@@ -208,6 +208,12 @@ static void df_set_bit(uint64_t *set, unsigned bit)
     }
 }
 
+static bool df_test_bit(const uint64_t *set, unsigned bit)
+{
+    return bit < INSN_DF_MAX_REGS &&
+           (set[bit / 64] & (1ULL << (bit % 64))) != 0;
+}
+
 static bool df_empty(const uint64_t *set)
 {
     for (unsigned i = 0; i < INSN_DF_REG_WORDS; i++) {
@@ -365,6 +371,65 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
 }
 
 /*
+ * A GLOBAL THIS INSTRUCTION'S OWN OPS HAVE ALREADY WRITTEN IS NOT AN INPUT.
+ *
+ * TCG globals are two things at once: the storage a target's registers live
+ * in, and a convenient place for a lowering to park an intermediate.  Reading
+ * one back inside the same instruction therefore has two possible meanings,
+ * and only one of them is an architectural read.
+ *
+ *   `ldp w0,w1,[x2]` loads 64 bits INTO w0 and then extracts the two halves
+ *   back out of it.  w0 at that moment holds the datum the load returned, not
+ *   the value the program left in w0, so naming w0 as a source published a
+ *   read-after-write edge on a register the instruction never read -- and the
+ *   load's own datum, which is what both halves actually depend on, reached
+ *   neither destination.
+ *
+ *   `ldxr x0,[x1]` lands its datum in exclusive_val, a global no architecture
+ *   names, and copies it out.  Naming exclusive_val gave the destination a
+ *   source the wire cannot spell, so it published an empty dependency set --
+ *   a load that depends on nothing.
+ *
+ * So a read of such a global takes the PROVENANCE OF THE WRITE instead: the
+ * account of where that value came from, which is the account the consumer
+ * needs.  The register is not added to the read set, for the same reason a
+ * read of bytes the same call wrote is not an input.
+ *
+ * The test is the ops' own write bitmap and not the write SET, because a
+ * decode site may state a write before any op runs, and a read after such a
+ * statement is a genuine architectural read.
+ */
+static void df_read_global(InsnDataflow *d, unsigned idx, uint64_t *prov)
+{
+    if (!df_test_bit(d->opwr, idx)) {
+        df_set_bit(d->rd, idx);
+        df_set_bit(prov, idx);
+        return;
+    }
+    for (unsigned i = 0; i < d->n_writes; i++) {
+        if (d->writes[i].reg == idx) {
+            df_union(prov, d->writes[i].prov);
+            return;
+        }
+    }
+    /*
+     * Written, but the write rows ran out before this one got recorded.  The
+     * instruction is already marked INCOMPLETE_WRITES; adding the register's
+     * own name here would answer the question with the one thing known to be
+     * wrong, so nothing is added and the account stays short rather than
+     * false.
+     */
+}
+
+static void df_write_global(InsnDataflow *d, unsigned idx,
+                            const uint64_t *prov)
+{
+    df_set_bit(d->wr, idx);
+    df_set_bit(d->opwr, idx);
+    df_add_write(d, idx, prov);
+}
+
+/*
  * Record an access to an env byte range, and for a write, where its value came
  * from.
  *
@@ -375,11 +440,12 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
  * simplification.
  */
 static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
-                         uint8_t dir, const uint64_t *prov)
+                         uint8_t dir, const uint64_t *prov, bool sourced)
 {
     for (unsigned i = 0; i < d->n_fields; i++) {
         if (d->fields[i].off == off && d->fields[i].size == size) {
             d->fields[i].dir |= dir;
+            d->fields[i].sourced |= sourced;
             if (prov) {
                 df_union(d->fields[i].prov, prov);
             }
@@ -393,6 +459,7 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->fields[d->n_fields].off = off;
     d->fields[d->n_fields].size = size;
     d->fields[d->n_fields].dir = dir;
+    d->fields[d->n_fields].sourced = sourced;
     memset(d->fields[d->n_fields].prov, 0,
            sizeof(d->fields[d->n_fields].prov));
     if (prov) {
@@ -605,8 +672,7 @@ static void df_call(InsnDataflow *d, TCGOp *op)
         }
         df_union(prov, df_prov(ts - s->temps));
         if (df_is_reg(ts, &idx)) {
-            df_set_bit(d->rd, idx);
-            df_set_bit(prov, idx);
+            df_read_global(d, idx, prov);
         }
         if (ts == env_ts) {
             continue;
@@ -635,7 +701,7 @@ static void df_call(InsnDataflow *d, TCGOp *op)
             if (bit >= 0) {
                 df_set_bit(prov, (unsigned)bit);
             }
-            df_add_field(d, (uint32_t)eo, size, dir, prov);
+            df_add_field(d, (uint32_t)eo, size, dir, prov, true);
         }
     }
     for (unsigned i = 0; i < nb_oargs; i++) {
@@ -645,12 +711,64 @@ static void df_call(InsnDataflow *d, TCGOp *op)
             continue;
         }
         if (df_is_reg(ts, &idx)) {
-            df_set_bit(d->wr, idx);
-            df_add_write(d, idx, prov);
+            df_write_global(d, idx, prov);
         } else {
             df_union(df_prov(ts - s->temps), prov);
         }
     }
+}
+
+/*
+ * ENV BYTES THIS INSTRUCTION ALREADY WROTE, AND WHETHER THEY COVER THE READ.
+ *
+ * A target stages a value through CPUArchState as readily as through a temp.
+ * x86's 128-bit vector moves do exactly that: the load lands in two 64-bit
+ * temps, both are stored into the scratch at xmm_t0, and the destination
+ * register is then filled by ONE 16-byte vector load out of that scratch.
+ * Nothing in the op stream connects the two halves to the whole -- interning
+ * keys a range on its offset AND its extent, on purpose, so that a 4-byte word
+ * is not confused with the vector containing it -- so the account stopped at
+ * the scratch and every 128-bit vector load published a destination that
+ * depended on nothing.
+ *
+ * The rule is the one the call side has followed since the self-reload pass: a
+ * read of bytes the same instruction wrote is not an input, and its value is
+ * whatever the writes put there.  @prov collects those writes' accounts; the
+ * return says whether they cover the range completely, which is what decides
+ * if the architectural range is still a source at all.
+ *
+ * Ranges wider than 64 bytes and pointer-reached ranges have no coverage
+ * answer here and are reported as uncovered, which leaves them exactly as they
+ * were.
+ */
+static bool df_env_writes_cover(const InsnDataflow *d, uint32_t off,
+                                uint32_t size, uint64_t *prov)
+{
+    uint64_t seen = 0;
+    bool any = false;
+
+    if (size == 0 || size > 64 || size == DF_FIELD_UNBOUNDED) {
+        return false;
+    }
+    for (unsigned i = 0; i < d->n_fields; i++) {
+        const InsnDataflowField *f = &d->fields[i];
+        uint32_t lo, hi;
+
+        if (!(f->dir & INSN_DF_WR) || f->size == DF_FIELD_UNBOUNDED) {
+            continue;
+        }
+        lo = MAX(f->off, off);
+        hi = MIN(f->off + f->size, off + size);
+        if (lo >= hi) {
+            continue;
+        }
+        any = true;
+        df_union(prov, f->prov);
+        for (uint32_t b = lo - off; b < hi - off; b++) {
+            seen |= 1ULL << b;
+        }
+    }
+    return any && seen == (size == 64 ? ~0ULL : (1ULL << size) - 1);
 }
 
 /* One op, attributed to instruction @d. */
@@ -660,9 +778,11 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
     const TCGOpDef *def = &tcg_op_defs[op->opc];
     uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
+    uint64_t ld_env_prov[INSN_DF_REG_WORDS] = { 0 };
     unsigned nb_oargs, nb_iargs, idx;
     int ld_field_bit = -1;
     int ld_memop_bit = -1;
+    bool ld_env_written = false;
     bool store;
     uint32_t size;
 
@@ -797,9 +917,18 @@ static void df_op(InsnDataflow *d, TCGOp *op)
                 TCGTemp *vts = arg_temp(op->args[0]);
 
                 df_add_field(d, (uint32_t)eo, size, INSN_DF_WR,
-                             df_prov(vts - s->temps));
+                             df_prov(vts - s->temps), true);
+            } else if (df_env_writes_cover(d, (uint32_t)eo, size,
+                                           ld_env_prov)) {
+                /*
+                 * Every byte read came from a write this same instruction
+                 * made.  The range is not an input and the interned bit is
+                 * not the value's source: the writes' own account is, and it
+                 * is carried to the destination below.
+                 */
+                ld_env_written = true;
             } else {
-                df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL);
+                df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL, true);
                 ld_field_bit = df_intern((uint32_t)eo, size);
             }
         }
@@ -813,8 +942,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
         }
         df_union(prov, df_prov(ts - s->temps));
         if (df_is_reg(ts, &idx)) {
-            df_set_bit(d->rd, idx);
-            df_set_bit(prov, idx);
+            df_read_global(d, idx, prov);
         }
     }
 
@@ -848,8 +976,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
             continue;
         }
         if (df_is_reg(ts, &idx)) {
-            df_set_bit(d->wr, idx);
-            df_add_write(d, idx, prov);
+            df_write_global(d, idx, prov);
         } else {
             uint64_t *dp = df_prov(ts - s->temps);
 
@@ -863,6 +990,9 @@ static void df_op(InsnDataflow *d, TCGOp *op)
              */
             if (ld_field_bit >= 0) {
                 df_set_bit(dp, (unsigned)ld_field_bit);
+            }
+            if (ld_env_written) {
+                df_union(dp, ld_env_prov);
             }
         }
     }
@@ -975,7 +1105,7 @@ static void df_state(InsnDataflowAtom a, uint8_t dir)
             return;
         }
         if (df_declared_by_name(a.name, &off, &size)) {
-            df_add_field(d, off, size, dir, NULL);
+            df_add_field(d, off, size, dir, NULL, false);
         }
         return;
 
@@ -1579,7 +1709,8 @@ static void df_close_unsourced(InsnDataflow *d)
         }
     }
     for (unsigned i = 0; i < d->n_fields; i++) {
-        if ((d->fields[i].dir & INSN_DF_WR) && df_empty(d->fields[i].prov)) {
+        if ((d->fields[i].dir & INSN_DF_WR) && !d->fields[i].sourced &&
+            df_empty(d->fields[i].prov)) {
             df_union(d->fields[i].prov, d->rd);
         }
     }

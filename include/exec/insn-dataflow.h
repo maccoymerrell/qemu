@@ -262,6 +262,21 @@ typedef struct InsnDataflowField {
      * second way of saying where its value came from.
      */
     uint64_t prov[INSN_DF_REG_WORDS];
+    /*
+     * True when an op in the stream SUPPLIED that provenance, as opposed to a
+     * decode-site statement that named the access and said nothing about its
+     * value.
+     *
+     * The difference decides what an empty set means.  A statement's silence
+     * is not an answer, so it is filled at close with the instruction's read
+     * set: pessimistic, and better than asserting a broken chain.  An op's
+     * answer IS an answer even when it is empty -- a vector register's high
+     * half being cleared to zero came from nothing, and that is the fact.
+     * Without the distinction the zeroing half of every widening vector load
+     * was filled with the address register, and a consumer reading the
+     * register's mask saw the pointer as a source of the datum.
+     */
+    bool     sourced;
 } InsnDataflowField;
 
 /*
@@ -449,6 +464,26 @@ typedef struct InsnDataflow {
      * consumer can use, so it is kept apart rather than folded into either.
      */
     uint64_t kill[INSN_DF_REG_WORDS];
+
+    /*
+     * The globals THIS INSTRUCTION'S OWN OPS have already written.
+     *
+     * A read of a value the same instruction just produced is not an input --
+     * the rule the env-field side has followed since the self-reload pass --
+     * and the register the value happens to be sitting in is not its source.
+     * The reader needs one bit per global to tell the two apart, because a
+     * TCG global is both storage a target names and a place a lowering parks
+     * an intermediate: `ldp w0,w1,[x2]` loads into w0 and then extracts both
+     * halves back out of it, and without this the wire said w0 was a source
+     * of itself and of w1, and the datum the load returned reached neither.
+     *
+     * It is deliberately NOT the write set: a decode site may STATE a write
+     * before any op runs (insn_dataflow_state_write), and a read after such a
+     * statement is still a genuine architectural read.  Only an op that has
+     * actually executed in program order sets a bit here.  Internal to the
+     * reader; no plugin accessor exposes it.
+     */
+    uint64_t opwr[INSN_DF_REG_WORDS];
 
     InsnDataflowWrite writes[INSN_DF_MAX_WRITES];
     uint8_t  n_writes;

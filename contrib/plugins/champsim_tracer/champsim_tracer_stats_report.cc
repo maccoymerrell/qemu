@@ -426,6 +426,15 @@ void append_stats_summary(GString *report, const char *label,
                                                  qdep_counters()->dropped_loads },
         { "  seating: stores past the slot ceiling",
                                                  qdep_counters()->dropped_stores },
+        /* The load-datum and env-field arms of the dependency masks, counted
+         * so that an empty mask on a load or on a vector destination is a
+         * measured zero rather than a question nobody asked. */
+        { "  seating: destinations depending on a load's datum",
+                                                 qdep_counters()->load_datum_seated },
+        { "  seating: load datum reaching an address mask",
+                                                 qdep_counters()->load_datum_in_addr },
+        { "  seating: destination masks taken from a field row",
+                                            qdep_counters()->field_dst_prov_seated },
         { "  seating: synthetic addresses published",
                                                  qdep_counters()->synth_ea_seated },
         { "  seating: synthetic addresses withheld whole",

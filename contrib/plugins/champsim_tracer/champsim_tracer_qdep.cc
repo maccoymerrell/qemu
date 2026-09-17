@@ -660,7 +660,18 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
             fields.resize(got);
         }
     }
-    for (const auto &fl : fields) {
+    /*
+     * A destination that reaches the wire only through a field row still has
+     * an account of where its value came from, and the row carries it.  The
+     * pairs are kept so the dependency masks below can ask for it: the write
+     * SET names only what a TCG global holds, so every vector and FP
+     * destination on every machine would otherwise publish an empty mask --
+     * a load into a vector register reporting that it depended on nothing.
+     */
+    std::vector<std::pair<uint8_t, unsigned>> field_dst;
+
+    for (unsigned fi = 0; fi < fields.size(); fi++) {
+        const auto &fl = fields[fi];
         const char *name = qemu_plugin_dataflow_field_reg(fl.env_offset,
                                                           fl.size);
         uint8_t reg = REG_NONE;
@@ -681,6 +692,7 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         }
         if (fl.dir & QEMU_PLUGIN_DF_WR) {
             seat_dst(out, out_names, reg);
+            field_dst.emplace_back(reg, fi);
         }
     }
 
@@ -800,6 +812,33 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
          * last field's inputs as the whole register's.
          */
         out->dst_dep_mask[slot] |= prov_to_mask(out, n);
+        any_prov = true;
+    }
+
+    /*
+     * The same question for a destination that lives in env storage.  A
+     * register may be reached BOTH ways -- a target that keeps the low half
+     * of a vector register in a global and the rest in env -- so the mask
+     * accumulates here too rather than overwriting, and a register written
+     * through several ranges collects every range's account.
+     */
+    for (const auto &fd : field_dst) {
+        uint8_t slot = UINT8_MAX;
+
+        for (uint8_t i = 0; i < out->n_dst_regs; i++) {
+            if (out->dst_regs[i] == fd.first) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == UINT8_MAX) {
+            continue;
+        }
+        unsigned n = read_set([&](uint64_t *w, unsigned nn) {
+            return qemu_plugin_insn_field_prov(tb, idx, fd.second, w, nn);
+        });
+        out->dst_dep_mask[slot] |= prov_to_mask(out, n);
+        g_qdep.field_dst_prov_seated++;
         any_prov = true;
     }
     if (any_prov || out->n_dst_regs || out->max_dep_stores) {

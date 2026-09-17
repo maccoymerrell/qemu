@@ -1995,9 +1995,41 @@ static void gen_DEC(DisasContext *s, X86DecodedInsn *decode)
     prepare_update_cc_incdec(decode, s, CC_OP_DECB + ot);
 }
 
+/*
+ * WHAT A ONE-OPERAND DIVIDE READS AND WRITES, WHICH ITS OPS DO NOT SAY.
+ *
+ * DIV and IDIV are the only arithmetic this target lowers entirely inside a
+ * helper: gen_helper_divq_EAX() takes tcg_env and the divisor, and the
+ * dividend and both results live in CPUX86State.regs, where no op names them.
+ * So the op stream showed a divisor read and nothing else, and the quotient
+ * and the remainder reached the wire as NO DESTINATION AT ALL -- on every DIV
+ * and IDIV on the machine.  It was caught by a consumer, not by a census: the
+ * validator reconstructs arithmetic results from the trace's own register
+ * values, and two later instructions in the same block disagreed with it by
+ * exactly the remainder this divide never published.
+ *
+ * The set is the encoding's, and its width decides it.  The byte form's
+ * dividend is AX and both results land in AX, so only the accumulator is
+ * named; every wider form reads the DX:AX pair and writes the quotient to AX
+ * and the remainder to DX.  The flags are deliberately not named: gen_DIV
+ * sets no cc_op, so the previous comparison's flags survive the divide, and
+ * saying otherwise would publish a write QEMU does not perform.
+ */
+static void note_div_regs(MemOp ot)
+{
+    insn_dataflow_state_read(insn_df_reg(x86_reg_names[R_EAX]));
+    insn_dataflow_state_write(insn_df_reg(x86_reg_names[R_EAX]));
+    if (ot != MO_8) {
+        insn_dataflow_state_read(insn_df_reg(x86_reg_names[R_EDX]));
+        insn_dataflow_state_write(insn_df_reg(x86_reg_names[R_EDX]));
+    }
+}
+
 static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
+
+    note_div_regs(ot);
 
     switch(ot) {
     case MO_8:
@@ -2072,6 +2104,8 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 static void gen_IDIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
+
+    note_div_regs(ot);
 
     switch(ot) {
     case MO_8:

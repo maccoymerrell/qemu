@@ -209,6 +209,23 @@ for _n in range(8, 16):
 
 X86_SEG = {"es": 0, "cs": 1, "ss": 2, "ds": 3, "fs": 4, "gs": 5}
 
+#
+# The integer-register numbers whose generic name is NOT REG_GPR<n>.
+# Taken from the plugin's own per-ISA tables so the two sides of the join
+# spell one register one way:
+#
+#   mipsel   $0 zero, $29 sp, $31 ra   champsim_tracer_mnemonics_mips.h
+#   riscv64  x0 zero, x2  sp, x1  ra   champsim_tracer_mnemonics_riscv.h
+#   aarch64  x30 lr                    champsim_tracer_mnemonics_aarch64.h
+#            (x31 is never spelled rN by the reference decoder -- it prints
+#             `sp` or `zr` by context, and both already map below)
+#
+ABI_FIXED_GPR = {
+    "mipsel":  {0: "REG_ZERO", 29: "REG_SP", 31: "REG_LR"},
+    "riscv64": {0: "REG_ZERO", 1: "REG_LR", 2: "REG_SP"},
+    "aarch64": {30: "REG_LR"},
+}
+
 
 def llvm_generic(regs, isa):
     """LLVM's own spellings, mapped to the generic names setjoin uses.
@@ -226,8 +243,19 @@ def llvm_generic(regs, isa):
         hit = True
         if r[:1] == "r" and r[1:].isdigit():
             n = int(r[1:])
-            out.add("REG_ZERO" if (n == 0 and isa in ("mipsel", "riscv64"))
-                    else "REG_GPR%d" % n)
+            #
+            # A NUMBER IS NOT A NAME.  LLVM spells every integer register
+            # rN; the wire's vocabulary spells the three ABI-fixed ones
+            # REG_ZERO / REG_SP / REG_LR, exactly as the plugin's own
+            # per-ISA table does (champsim_tracer_mnemonics_mips.h:129-131,
+            # _riscv.h:220-221, _aarch64.h:107).  Reading r31 as REG_GPR31
+            # on mipsel made the third decoder vote "did not name it" for a
+            # register it had just named -- the 220-A shape, one level up:
+            # a scorer refuted by its own spelling.  Mapped here, per ISA,
+            # from that table and nowhere else.
+            #
+            special = ABI_FIXED_GPR.get(isa, {}).get(n)
+            out.add(special if special else "REG_GPR%d" % n)
         elif r[:1] == "v" and r[1:].isdigit():
             out.add("REG_VEC%s" % r[1:])
             out.add("REG_FPR%s" % r[1:])
@@ -242,9 +270,16 @@ def llvm_generic(regs, isa):
             out.add("REG_VEC%s" % r[3:])
         elif isa == "x86_64" and r.startswith("mm") and r[2:].isdigit():
             out.add("REG_VEC%s" % r[2:])
-        elif isa == "mipsel" and r.startswith("r") and r[1:].isdigit():
-            n = int(r[1:])
-            out.add("REG_ZERO" if n == 0 else "REG_GPR%d" % n)
+        elif isa == "mipsel" and r[:3] == "cop" and r[3:].isdigit():
+            # Capstone's cop0..cop31 are the coprocessor register files;
+            # the plugin's table spells every one of them REG_SYS
+            # (champsim_tracer_mnemonics_mips.h:144-163).
+            out.add("REG_SYS")
+        elif isa == "riscv64" and r in ("vl", "vtype"):
+            # champsim_tracer_mnemonics_riscv.h:181,183 -- the vector
+            # configuration registers are REG_VCTRL, not an unmappable
+            # spelling.  vlenb is REG_SYS and is left to the table below.
+            out.add("REG_VCTRL")
         elif isa == "mipsel" and r.startswith(("f", "w")) and r[1:].isdigit():
             out.add("REG_VEC%s" % r[1:])
             out.add("REG_FPR%s" % r[1:])

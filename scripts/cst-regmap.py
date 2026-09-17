@@ -79,35 +79,70 @@ TARGETS = {
 # the gdbstub that site is the feature XML the target hands gdb: every
 # <reg name="..."> inside the <feature name="..."> each listed file declares.
 #
-# SCOPE, and why it is these files and not "the core feature".  The membership
-# of a feature is decided at CPU-realize time, but the file that DECLARES the
-# names is a build-time artifact wherever one exists, and a row for a feature
-# the running CPU does not register is inert rather than wrong: the name is
-# never published by qemu_plugin_get_registers(), the handle lookup misses, and
-# the read reports no value -- exactly what happens today for a register with
-# no row at all.  So every feature QEMU declares in an XML FILE is in scope.
+# SCOPE, and why it is these files.  The membership of a feature is decided at
+# CPU-realize time, but the site that DECLARES the names is a build-time
+# artifact, and a row for a feature the running CPU does not register is inert
+# rather than wrong: the name is never published by
+# qemu_plugin_get_registers(), the handle lookup misses, and the read reports
+# no value -- exactly what happens today for a register with no row at all.
 #
-# What is genuinely out of scope is the feature with no file: AArch64 SVE
-# (target/arm/gdbstub64.c, arm_gen_dynamic_svereg_feature) and RISC-V vector
-# (target/riscv/gdbstub.c, ricsv_gen_dynamic_vector_feature) build their
-# <feature> in C because the register WIDTH depends on the CPU's vector
-# length.  Their names are still fixed, but there is no file to read them out
-# of, so this generator cannot join them and says so rather than guessing.
+# A feature is declared in one of TWO shapes, and both are in scope.  Most are
+# an XML file this reads directly.  The rest QEMU builds in C, because the
+# register WIDTH is a property of the realized CPU rather than of the ISA:
+# AArch64 SVE (target/arm/gdbstub64.c) and RISC-V vector
+# (target/riscv/gdbstub.c) size their registers from the CPU's vector length.
+# Their NAMES are still fixed literals in the builder, so they are joined the
+# same way every other register file is -- read out of the target's own
+# registration site -- and scrape_gdb_c() refuses any name expression it
+# cannot expand rather than guessing at one.
 GDB_TARGETS = {
-    'x86_64':  {'files': ['gdb-xml/i386-64bit.xml']},
+    'x86_64':  {'files': ['gdb-xml/i386-64bit.xml'], 'csites': []},
     'aarch64': {'files': ['gdb-xml/aarch64-core.xml',
-                          'gdb-xml/aarch64-fpu.xml']},
+                          'gdb-xml/aarch64-fpu.xml'],
+                'csites': [('target/arm/gdbstub64.c',
+                            'arm_gen_dynamic_svereg_feature')]},
     'riscv64': {'files': ['gdb-xml/riscv-64bit-cpu.xml',
-                          'gdb-xml/riscv-64bit-fpu.xml']},
-    'mipsel':  {'files': ['gdb-xml/mips-cpu.xml']},
+                          'gdb-xml/riscv-64bit-fpu.xml'],
+                'csites': [('target/riscv/gdbstub.c',
+                            'ricsv_gen_dynamic_vector_feature')]},
+    'mipsel':  {'files': ['gdb-xml/mips-cpu.xml'], 'csites': []},
+}
+
+# The C-built features this generator deliberately does NOT read, and why.
+# The sweep in check_no_stray_gdb_sites() finds every gdb_feature_builder_init
+# in the target directory and demands that each one be either scraped above or
+# named here, so a target that grows a new dynamic feature breaks the build
+# instead of quietly dropping a register file.
+GDB_C_EXCLUDED = {
+    'arm_gen_dynamic_sysreg_feature':
+        'names come from the realized CPU\'s cp_regs hash table, not from '
+        'the source: they are not enumerable at build time',
+    'arm_gen_dynamic_m_systemreg_feature':
+        'AArch32 M-profile; never registered on an AArch64 CPU',
+    'arm_gen_dynamic_m_secextreg_feature':
+        'AArch32 M-profile; never registered on an AArch64 CPU',
+    'riscv_gen_dynamic_csr_feature':
+        'names come from csr_ops[]; joinable, but no generic id routes '
+        'through a CSR today, so reading it would add only dead rows',
 }
 
 FEATURE_RE = re.compile(r'<feature\s+name="([^"]+)"')
 XMLREG_RE = re.compile(r'<reg\s+name="([^"]+)"')
 
+BUILDER_INIT_RE = re.compile(r'\bgdb_feature_builder_init\s*\(')
+BUILDER_REG_RE = re.compile(r'\bgdb_feature_builder_append_reg\s*\(')
+
 
 def scrape_gdb(root, isa):
-    """(name -> feature) for every register the CORE feature file declares.
+    """{(feature, name) -> where} for every register this target declares.
+
+    Keyed on the PAIR because that is what qemu_plugin_get_registers()
+    keys on, and because two features genuinely spell one register the same
+    way: AArch64's fpsr and fpcr are declared by aarch64-fpu.xml and again
+    by the SVE builder, and the two are mutually exclusive at realize time
+    (target/arm/gdbstub.c registers SVE *instead of* the FPU feature).  A
+    name-keyed universe could hold only one of them and would emit a row
+    whose feature is wrong for half the CPUs.
 
     Brittle in the safe direction: a file with no <feature> line, or with
     more than one, is an ERROR rather than a partial read, because both
@@ -126,11 +161,231 @@ def scrape_gdb(root, isa):
             raise SystemExit('cst-regmap: %s: %s declares no registers'
                              % (isa, rel))
         for n in names:
-            if n in universe:
+            if (feats[0], n) in universe:
                 raise SystemExit('cst-regmap: %s: %s names %r twice'
                                  % (isa, rel, n))
-            universe[n] = feats[0]
+            universe[(feats[0], n)] = rel
+
+    for rel, fn in GDB_TARGETS[isa]['csites']:
+        for feature, name in scrape_gdb_c(root, rel, fn):
+            if (feature, name) in universe:
+                raise SystemExit('cst-regmap: %s: %s names %r twice in %s'
+                                 % (isa, fn, name, feature))
+            universe[(feature, name)] = '%s:%s' % (rel, fn)
     return universe
+
+
+def braced_body(text, start):
+    """The extent of the {...} block that opens at or after text[start]."""
+    i = text.index('{', start)
+    depth = 0
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError('unterminated block')
+
+
+def function_body(text, fn, where):
+    """The source span of @fn's body."""
+    m = re.search(r'\b%s\s*\(' % re.escape(fn), text)
+    if m is None:
+        raise SystemExit('cst-regmap: %s: no function named %s' % (where, fn))
+    open_paren = text.index('(', m.end() - 1)
+    _args, after = split_args(text, open_paren)
+    end = braced_body(text, after)
+    return text.index('{', after), end
+
+
+FOR_RE = re.compile(r'\bfor\s*\(')
+LOOP_COND_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\s*(\d+)\s*$')
+
+
+def loop_bound_at(text, lo, hi, pos, where):
+    """(var, count) of the innermost literal-bounded for-loop around @pos."""
+    best = None
+    for m in FOR_RE.finditer(text, lo, hi):
+        open_paren = text.index('(', m.end() - 1)
+        _args, after = split_args(text, open_paren)
+        # The three clauses are ';'-separated, not ','-separated.
+        clauses = text[open_paren + 1:after - 1].split(';')
+        try:
+            end = braced_body(text, after)
+        except ValueError:
+            continue
+        if not (m.start() < pos < end):
+            continue
+        if best is None or m.start() > best[0]:
+            best = (m.start(), clauses)
+    if best is None:
+        raise SystemExit(
+            'cst-regmap: %s: a register name is built from a loop variable '
+            'with no enclosing for-loop' % where)
+    if len(best[1]) != 3:
+        raise SystemExit('cst-regmap: %s: for-loop with %d clauses'
+                         % (where, len(best[1])))
+    cm = LOOP_COND_RE.match(best[1][1])
+    if cm is None:
+        raise SystemExit(
+            'cst-regmap: %s: loop condition %r is not "<var> < <literal>".\n'
+            '  A bound this generator cannot evaluate fails generation on\n'
+            '  purpose: the alternative is a register file it silently\n'
+            '  truncates.' % (where, best[1][1]))
+    return cm.group(1), int(cm.group(2))
+
+
+def expand_printf_name(text, lo, hi, call_pos, expr, where):
+    """Names a g_strdup_printf("<fmt>%d", <loopvar>) expression stands for.
+
+    Returns None when @expr is not such a call, so the caller can try the
+    next shape; raises when it IS one and cannot be expanded, because a
+    format this generator does not understand is a register file it would
+    otherwise truncate in silence.
+    """
+    expr = expr.strip()
+    if not expr.startswith('g_strdup_printf'):
+        return None
+    args, _ = split_args(expr, expr.index('('))
+    if len(args) != 2:
+        raise SystemExit('cst-regmap: %s: g_strdup_printf with %d arguments'
+                         % (where, len(args)))
+    fmt = STRING_RE.fullmatch(args[0].strip())
+    if fmt is None or fmt.group(1).count('%') != 1 or '%d' not in fmt.group(1):
+        raise SystemExit('cst-regmap: %s: register name built by a format '
+                         'this generator cannot expand: %r'
+                         % (where, args[0].strip()))
+    var, count = loop_bound_at(text, lo, hi, call_pos, where)
+    if args[1].strip() != var:
+        raise SystemExit(
+            'cst-regmap: %s: the name is built from %r but the enclosing '
+            'loop counts %r' % (where, args[1].strip(), var))
+    return [fmt.group(1).replace('%d', str(i)) for i in range(count)]
+
+
+def scrape_gdb_c(root, rel, fn, text=None):
+    """(feature, name) for every register a C feature builder declares.
+
+    The names are literals in the builder -- "ffr", "vg", or the format of a
+    literal-bounded loop -- and every other shape is refused, so a target
+    that grows a new way of naming a register fails the build rather than
+    losing the register.
+    """
+    where = '%s:%s' % (rel, fn)
+    if text is None:
+        text = read(os.path.join(root, rel))
+    lo, hi = function_body(text, fn, where)
+
+    im = BUILDER_INIT_RE.search(text, lo, hi)
+    if im is None:
+        raise SystemExit('cst-regmap: %s: builds no gdb feature' % where)
+    iargs, _ = split_args(text, text.index('(', im.end() - 1))
+    fm = STRING_RE.fullmatch(iargs[2].strip()) if len(iargs) > 2 else None
+    if fm is None:
+        raise SystemExit('cst-regmap: %s: the feature name is not a string '
+                         'literal' % where)
+    feature = fm.group(1)
+
+    out = []
+    for m in BUILDER_REG_RE.finditer(text, lo, hi):
+        open_paren = text.index('(', m.end() - 1)
+        args, _ = split_args(text, open_paren)
+        line = '%s (line %d)' % (where, text[:m.start()].count('\n') + 1)
+        if len(args) < 2:
+            raise SystemExit('cst-regmap: %s: append_reg with %d arguments'
+                             % (line, len(args)))
+        arg = args[1].strip()
+
+        sm = STRING_RE.fullmatch(arg)
+        if sm:
+            out.append((feature, sm.group(1)))
+            continue
+
+        names = expand_printf_name(text, lo, hi, m.start(), arg, line)
+        if names is not None:
+            out.extend((feature, n) for n in names)
+            continue
+
+        # A local assigned from g_strdup_printf() earlier in the body.  The
+        # NEAREST preceding assignment is the one that reaches the call: the
+        # SVE builder assigns `name` twice, "z%d" for the vector registers
+        # and "p%d" for the predicates, and taking the first would publish
+        # the z file's names under the predicate registers.
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', arg):
+            asg = None
+            for am in re.finditer(r'\b%s\s*=\s*g_strdup_printf\s*\('
+                                  % re.escape(arg), text[lo:m.start()]):
+                asg = lo + am.start()
+            if asg is not None:
+                rhs = text[text.index('=', asg) + 1:]
+                _a, after = split_args(rhs, rhs.index('('))
+                names = expand_printf_name(text, lo, hi, m.start(),
+                                           rhs[:after], line)
+                if names is not None:
+                    out.extend((feature, n) for n in names)
+                    continue
+
+        raise SystemExit(
+            'cst-regmap: %s: unrecognised register-name argument %r.\n'
+            '  A new way of naming a register fails generation on purpose:\n'
+            '  the alternative is a register the map silently cannot name.'
+            % (line, arg))
+
+    if not out:
+        raise SystemExit('cst-regmap: %s: declares no registers' % where)
+    return out
+
+
+def check_no_stray_gdb_sites(root, isa):
+    """A C-built gdb feature this generator neither reads nor excludes.
+
+    The scraped site list is this generator's own assumption, and an
+    assumption that can go stale silently is the shape this tree keeps
+    paying for -- a target that grows a dynamic feature would drop a whole
+    register file onto the per-ISA fallback with nothing saying so.
+    """
+    spec = GDB_TARGETS[isa]
+    listed = {fn for _rel, fn in spec['csites']}
+    stray = []
+    for dirpath, _dirs, files in os.walk(
+            os.path.join(root, TARGETS[isa]['dir'])):
+        for fn in files:
+            if not fn.endswith('.c'):
+                continue
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, root)
+            text = read(path)
+            for m in BUILDER_INIT_RE.finditer(text):
+                owner = enclosing_function(text, m.start())
+                if owner in listed or owner in GDB_C_EXCLUDED:
+                    continue
+                stray.append('%s:%s' % (rel, owner))
+    if stray:
+        raise SystemExit(
+            'cst-regmap: %s builds gdb features this generator neither reads '
+            'nor excludes: %s\n  Add them to GDB_TARGETS[%r][\'csites\'] or '
+            'to GDB_C_EXCLUDED with a reason.'
+            % (isa, ', '.join(sorted(set(stray))), isa))
+
+
+FNDEF_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_ \t*]*\b([A-Za-z_][A-Za-z0-9_]*)'
+                      r'\s*\([^;]*?\)\s*\{', re.M | re.S)
+
+
+def enclosing_function(text, pos):
+    """The name of the function whose body contains @pos, or '?'."""
+    best = '?'
+    for m in FNDEF_RE.finditer(text, 0, pos):
+        try:
+            end = braced_body(text, m.end() - 1)
+        except ValueError:
+            continue
+        if m.start() < pos < end:
+            best = m.group(1)
+    return best
 
 
 CALL_RE = re.compile(r'\btcg_global_mem_new(?:_i32|_i64|_ptr)?\s*\(')
@@ -452,6 +707,66 @@ def read_tsv(path):
     return rows
 
 
+def qualified_key(key):
+    """The TSV spelling of a (feature, name) pair.
+
+    A dead row has no feature -- no feature declares it, which is what makes
+    it dead -- so it is reported by the name the row actually carries rather
+    than under a fabricated qualifier.
+    """
+    feature, name = key
+    return '%s:%s' % (feature, name) if feature else name
+
+
+def resolve_gdb_keys(path, isa, rows, universe):
+    """Bind each TSV row to the (feature, name) pair it names.
+
+    A register spelled by exactly one feature is written plainly, the way
+    every row was before a second feature could declare one: `fpsr` when
+    only aarch64-fpu.xml declares it.  A register TWO features spell the
+    same way is written `feature:name`, because the two are different
+    registers to qemu_plugin_get_registers() even though gdb spells them
+    alike, and a plain row could only have named one of them.
+
+    Both directions refuse.  A plain row for an ambiguous name fails, so
+    the ambiguity cannot be resolved by whichever feature the scrape
+    happened to see first; a qualified row for an unambiguous name fails
+    too, so the qualified form cannot spread into rows that do not need it
+    and quietly outlive the ambiguity that justified it.
+    """
+    features_of = {}
+    for feature, name in universe:
+        features_of.setdefault(name, set()).add(feature)
+
+    out = []
+    msg = []
+    for name, reg, ground, lineno, route in rows:
+        feature, sep, bare = name.rpartition(':')
+        if sep and feature in {f for fs in features_of.values() for f in fs}:
+            if len(features_of.get(bare, ())) < 2:
+                msg.append('  %s:%d: %s is qualified, but %r is declared by '
+                           '%d feature(s) -- write it plainly'
+                           % (path, lineno, name, bare,
+                              len(features_of.get(bare, ()))))
+                continue
+            out.append((bare, reg, ground, lineno, route, feature))
+            continue
+
+        feats = features_of.get(name)
+        if feats and len(feats) > 1:
+            msg.append('  %s:%d: %r is declared by %d features (%s); write '
+                       'one row per feature, spelled "<feature>:%s"'
+                       % (path, lineno, name, len(feats),
+                          ', '.join(sorted(feats)), name))
+            continue
+        out.append((name, reg, ground, lineno, route,
+                    next(iter(feats)) if feats else None))
+    if msg:
+        raise SystemExit('\n'.join(
+            ['cst-regmap: %s: gdb rows and features disagree.' % isa] + msg))
+    return out
+
+
 def c_string(s):
     return '"%s"' % s.replace('\\', '\\\\').replace('"', '\\"')
 
@@ -500,7 +815,8 @@ def check_route_adjudications(path, isa, rows):
     and never routes a read.
     """
     by_reg = {}
-    for name, reg, ground, lineno, route in rows:
+    for row in rows:
+        name, reg, _ground, lineno, route = row[0], row[1], row[2], row[3], row[4]
         by_reg.setdefault(reg, []).append((name, lineno, route))
 
     msg = []
@@ -538,7 +854,7 @@ def check_route_adjudications(path, isa, rows):
             ['cst-regmap: %s: ambiguous value-read routes.' % isa] + msg))
 
 
-def emit_gdb(isa, rows, feature_of, out):
+def emit_gdb(isa, rows, out):
     guard = 'CHAMPSIM_TRACER_GDBMAP_%s_H' % isa.upper()
     lines = []
     lines.append('/*')
@@ -558,15 +874,15 @@ def emit_gdb(isa, rows, feature_of, out):
     # An id named by exactly one row routes through it without needing a
     # verdict; check_route_adjudications() has already refused anything else.
     n_rows_for = {}
-    for _n, reg, _g, _l, _r in rows:
-        n_rows_for[reg] = n_rows_for.get(reg, 0) + 1
-    for name, reg, ground, _lineno, route in sorted(rows,
-                                                    key=lambda r: r[0]):
+    for row in rows:
+        n_rows_for[row[1]] = n_rows_for.get(row[1], 0) + 1
+    for name, reg, ground, _lineno, route, feature in sorted(
+            rows, key=lambda r: (r[0], r[5] or '')):
         is_route = (route is True or
                     (route is None and reg != 'REG_NONE' and
                      n_rows_for[reg] == 1))
         lines.append('    { %s, %s, %s, %s },  /* %s */'
-                     % (c_string(feature_of[name]), c_string(name), reg,
+                     % (c_string(feature), c_string(name), reg,
                         'true' if is_route else 'false', ground))
     lines.append('};')
     lines.append('')
@@ -589,41 +905,49 @@ def main():
     args = ap.parse_args()
 
     if args.namespace == 'gdb':
+        check_no_stray_gdb_sites(args.root, args.isa)
         universe = scrape_gdb(args.root, args.isa)
     else:
         check_no_stray_sites(args.root, args.isa)
         universe = scrape(args.root, args.isa)
 
     if args.universe:
-        for name in sorted(universe):
-            print('%s\t%s' % (name, universe[name]))
+        for key in sorted(universe):
+            print('%s\t%s' % (qualified_key(key) if args.namespace == 'gdb'
+                              else key, universe[key]))
         return 0
 
     rows = read_tsv(args.tsv)
 
+    if args.namespace == 'gdb':
+        rows = resolve_gdb_keys(args.tsv, args.isa, rows, universe)
+
     seen = {}
-    for name, reg, ground, lineno, route in rows:
-        if name in seen:
+    for row in rows:
+        name, lineno = row[0], row[3]
+        key = (row[5], name) if args.namespace == 'gdb' else name
+        if key in seen:
             raise SystemExit('%s:%d: %r appears twice (first at line %d)'
-                             % (args.tsv, lineno, name, seen[name]))
-        seen[name] = lineno
+                             % (args.tsv, lineno, name, seen[key]))
+        seen[key] = lineno
 
     missing = sorted(set(universe) - set(seen))
     dead = sorted(set(seen) - set(universe))
     if missing or dead:
+        spell = (qualified_key if args.namespace == 'gdb' else (lambda k: k))
         msg = ['cst-regmap: %s: the register map and the target disagree.'
                % args.isa]
-        for name in missing:
+        for key in missing:
             msg.append('  GAP:  %s is registered at %s and has no row'
-                       % (name, universe[name]))
-        for name in dead:
+                       % (spell(key), universe[key]))
+        for key in dead:
             msg.append('  DEAD: %s:%d names %s, which the target never '
-                       'registers' % (args.tsv, seen[name], name))
+                       'registers' % (args.tsv, seen[key], spell(key)))
         raise SystemExit('\n'.join(msg))
 
     if args.namespace == 'gdb':
         check_route_adjudications(args.tsv, args.isa, rows)
-        emit_gdb(args.isa, rows, universe, args.output)
+        emit_gdb(args.isa, rows, args.output)
     else:
         for name, reg, ground, lineno, route in rows:
             if route is not None:

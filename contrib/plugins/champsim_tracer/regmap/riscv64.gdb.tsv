@@ -80,3 +80,42 @@ ft8	REG_FPR28	incumbent: the per-ISA table routed this gdb name here; ft8 is f28
 ft9	REG_FPR29	incumbent: the per-ISA table routed this gdb name here; ft9 is f29 in the riscv FPU feature
 ft10	REG_FPR30	incumbent: the per-ISA table routed this gdb name here; ft10 is f30 in the riscv FPU feature
 ft11	REG_FPR31	incumbent: the per-ISA table routed this gdb name here; ft11 is f31 in the riscv FPU feature
+
+# The RISC-V vector register file.  QEMU builds this feature in C rather
+# than declaring it in an XML file (target/riscv/gdbstub.c,
+# ricsv_gen_dynamic_vector_feature) because the register WIDTH is the
+# realized CPU's VLEN; the NAMES are fixed literals and are read out of
+# that builder the same way every other register file is read out of its
+# own registration site.
+v0	REG_VEC0	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v1	REG_VEC1	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v2	REG_VEC2	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v3	REG_VEC3	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v4	REG_VEC4	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v5	REG_VEC5	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v6	REG_VEC6	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v7	REG_VEC7	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v8	REG_VEC8	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v9	REG_VEC9	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v10	REG_VEC10	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v11	REG_VEC11	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v12	REG_VEC12	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v13	REG_VEC13	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v14	REG_VEC14	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v15	REG_VEC15	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v16	REG_VEC16	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v17	REG_VEC17	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v18	REG_VEC18	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v19	REG_VEC19	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v20	REG_VEC20	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v21	REG_VEC21	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v22	REG_VEC22	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v23	REG_VEC23	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v24	REG_VEC24	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v25	REG_VEC25	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v26	REG_VEC26	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v27	REG_VEC27	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v28	REG_VEC28	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v29	REG_VEC29	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v30	REG_VEC30	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file
+v31	REG_VEC31	incumbent: the per-ISA table routed this gdb name here; the RISC-V vector feature declares the vector register file

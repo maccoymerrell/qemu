@@ -115,18 +115,32 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
 }
 
 
+/*
+ * One snapshot of every register this build has a value-read route to.
+ *
+ * The walk is over the wire's own generic register ids, resolved through
+ * qemu_reg_for_generic_id() -- the same route the live per-instruction path
+ * uses.  It used to walk the per-ISA register-classification table's rows
+ * directly, which made this the only place outside the reverse index that read
+ * that table, and would have made the table's removal look like it reached a
+ * snapshot path.  It does not: the set of registers reached is the reverse
+ * index's, and always was, because the table rows that carry no QemuRegKey were
+ * skipped here anyway.
+ *
+ * NOTE, so a reader does not mistake this for a live path: nothing calls it.
+ * See the file header -- the wide-snapshot-then-index approach was dropped in
+ * favour of the live per-instruction destination reads, and this is kept for a
+ * future caller that wants one upfront snapshot.
+ */
 WideRegSnap *RegSnapCollector::capture_wide(unsigned int cpu_index)
 {
     if (!g_features.reg_data) {
         return nullptr;
     }
-    if (!active_reg_table || active_reg_table_size == 0) {
-        return nullptr;
-    }
 
     tls_wide_n = 0;
-    for (unsigned i = 0; i < active_reg_table_size; i++) {
-        const QemuRegKey *qemu_reg = &active_reg_table[i].qemu_reg;
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        const QemuRegKey *qemu_reg = qemu_reg_for_generic_id((uint8_t)i);
         if (!key_valid(qemu_reg) || wide_contains(qemu_reg)) {
             continue;
         }

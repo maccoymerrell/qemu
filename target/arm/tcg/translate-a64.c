@@ -5235,11 +5235,31 @@ static void note_bfm_alias(bool sf, unsigned int ri, unsigned int si,
 {
     unsigned int bitsize = sf ? 64 : 32;
 
+    /*
+     * THE IMMEDIATE THE INSTRUCTION CARRIES, IN THE FORM THE WORD JUST GAVE.
+     *
+     * A bitfield move's operands are immr and imms, and nothing downstream can
+     * turn those into the shift amount without knowing which alias they spell
+     * -- which is the decision this function has already made.  So the
+     * statement is made here, beside the word, rather than at each caller:
+     * where the word says SHL or SHR the immediate is the shift the assembler
+     * wrote, and where it says nothing the two encoded fields are the operands
+     * and both are stated.
+     *
+     * `lsl x0,x0,#3` is UBFM with immr=61, imms=60.  Publishing 61 for it
+     * would be the encoding's field and not the instruction's operand, and a
+     * consumer comparing it against any other machine's shift would be
+     * comparing two different numbers.  The extensions -- SXTB, UXTH and kin
+     * -- take no immediate operand at all, so none is stated for them and the
+     * flag correctly stays clear.
+     */
     if (si == bitsize - 1) {
-        /* LSR, or ASR for the signed form. */
+        /* LSR, or ASR for the signed form; the shift amount is immr. */
         insn_dataflow_note_word(INSN_DF_WORD_SHR);
+        insn_dataflow_note_immediate(ri, INSN_DF_IMM_OPERAND);
     } else if (!sign && si + 1 == ri) {
         insn_dataflow_note_word(INSN_DF_WORD_SHL);
+        insn_dataflow_note_immediate(bitsize - 1 - si, INSN_DF_IMM_OPERAND);
     } else if (ri == 0 && (si == 7 || si == 15 || (sign && sf && si == 31))) {
         /* SXTB/SXTH/SXTW, UXTB/UXTH.  There is no UXTW: MOV does that. */
         if (sign) {
@@ -5247,6 +5267,10 @@ static void note_bfm_alias(bool sf, unsigned int ri, unsigned int si,
         } else if (!sf) {
             insn_dataflow_note_word(INSN_DF_WORD_MOVZX);
         }
+    } else {
+        /* A genuine extract or insert: both encoded fields are operands. */
+        insn_dataflow_note_immediate(ri, INSN_DF_IMM_OPERAND);
+        insn_dataflow_note_immediate(si, INSN_DF_IMM_OPERAND);
     }
 }
 
@@ -5328,6 +5352,14 @@ static bool trans_BFM(DisasContext *s, arg_BFM *a)
     unsigned int si = a->imms;
     unsigned int pos, len;
 
+    /*
+     * BFI and BFXIL are insertions, not shifts, so this encoding is not routed
+     * through note_bfm_alias and states its own operands: immr and imms, which
+     * is what the encoding carries.
+     */
+    insn_dataflow_note_immediate(ri, INSN_DF_IMM_OPERAND);
+    insn_dataflow_note_immediate(si, INSN_DF_IMM_OPERAND);
+
     tcg_rd = cpu_reg(s, a->rd);
     tcg_tmp = read_cpu_reg(s, a->rn, 1);
 
@@ -5352,6 +5384,9 @@ static bool trans_BFM(DisasContext *s, arg_BFM *a)
 static bool trans_EXTR(DisasContext *s, arg_extract *a)
 {
     TCGv_i64 tcg_rd, tcg_rm, tcg_rn;
+
+    /* The bit position the double-width extract starts at. */
+    insn_dataflow_note_immediate(a->imm, INSN_DF_IMM_OPERAND);
 
     tcg_rd = cpu_reg(s, a->rd);
 

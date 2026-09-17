@@ -95,6 +95,18 @@ class Report:
         return [i for i in self.issues if i.severity == "error"]
 
     def summary(self) -> str:
+        """Render the report.
+
+        THE ONLY TRUNCATION IN THIS FILE IS THE DISPLAY ONE BELOW.  Checks
+        raise one Issue per error and count every one of them, so the
+        `errors=` figure on the total line is the POPULATION.  Several
+        checks used to stop RAISING at a per-check ceiling while their own
+        info line carried the true figure, which made the headline the
+        ceiling rather than the count -- a reading of 215 where the
+        population was 1,111.  A cap on what is printed is a courtesy; a cap
+        on what is counted is a false number, and a check that reports fewer
+        errors than it found is the silent-false-success shape.
+        """
         by_sev = {"error": 0, "warning": 0, "info": 0}
         by_check: dict[str, dict[str, int]] = {}
         for i in self.issues:
@@ -2119,7 +2131,6 @@ def _check_expected_reg_sets(
     n_blocks = 0
     n_insns_checked = 0
     n_errors = 0
-    err_cap = 20
 
     # Walk every CP entry once, indexing by block_id.
     blocks_by_bid = {int(b["block_id"]): b for b in blocks}
@@ -2154,16 +2165,15 @@ def _check_expected_reg_sets(
             trailer = _TRAILER_INSNS_BY_ISA.get(isa, 1)
             expected_total = len(specs) + trailer
             if len(idxs) != expected_total:
-                if n_errors < err_cap:
-                    issues.append(Issue(
-                        "expected_reg_sets", "error",
-                        f"blk_{bid} ({block.get('class','?')}): declared "
-                        f"{len(specs)} insn reg-sets + {trailer} trailer "
-                        f"insn(s) = {expected_total}, but trace template "
-                        f"contains {len(idxs)} insns mapped to this block",
-                        {"block_id": bid, "declared": len(specs),
-                         "trailer": trailer, "trace": len(idxs)},
-                    ))
+                issues.append(Issue(
+                    "expected_reg_sets", "error",
+                    f"blk_{bid} ({block.get('class','?')}): declared "
+                    f"{len(specs)} insn reg-sets + {trailer} trailer "
+                    f"insn(s) = {expected_total}, but trace template "
+                    f"contains {len(idxs)} insns mapped to this block",
+                    {"block_id": bid, "declared": len(specs),
+                     "trailer": trailer, "trace": len(idxs)},
+                ))
                 n_errors += 1
                 continue
             for spec, idx in zip(specs, idxs[:len(specs)]):
@@ -2206,19 +2216,20 @@ def _check_expected_reg_sets(
                 if actual_src == exp_src and actual_dst == exp_dst:
                     continue
                 n_errors += 1
-                if n_errors <= err_cap:
-                    issues.append(Issue(
-                        "expected_reg_sets", "error",
-                        f"blk_{bid} ({block.get('class','?')}) insn #{idx} "
-                        f"pc=0x{int(ins['pc']):x}: declared src/dst regs "
-                        f"don't match the trace",
-                        {"block_id": bid, "insn_index": idx,
-                         "pc": int(ins["pc"]),
-                         "expected_src": sorted(exp_src),
-                         "actual_src": sorted(actual_src),
-                         "expected_dst": sorted(exp_dst),
-                         "actual_dst": sorted(actual_dst)},
-                    ))
+                issues.append(Issue(
+                    "expected_reg_sets", "error",
+                    f"blk_{bid} ({block.get('class','?')}) insn #{idx} "
+                    f"pc=0x{int(ins['pc']):x}: declared src/dst regs "
+                    f"don't match the trace: "
+                    f"src {sorted(actual_src)} vs declared {sorted(exp_src)}, "
+                    f"dst {sorted(actual_dst)} vs declared {sorted(exp_dst)}",
+                    {"block_id": bid, "insn_index": idx,
+                     "pc": int(ins["pc"]),
+                     "expected_src": sorted(exp_src),
+                     "actual_src": sorted(actual_src),
+                     "expected_dst": sorted(exp_dst),
+                     "actual_dst": sorted(actual_dst)},
+                ))
 
     issues.append(Issue(
         "expected_reg_sets", "info",
@@ -2397,14 +2408,12 @@ def _check_expected_insns(
     n_blocks = 0
     n_insns_checked = 0
     n_errors = 0
-    err_cap = 30
 
     def err(cat: str, msg: str, meta: dict) -> None:
         nonlocal n_errors
         n_errors += 1
-        if n_errors <= err_cap:
-            issues.append(Issue("expected_insns", "error",
-                                f"[{cat}] {msg}", meta))
+        issues.append(Issue("expected_insns", "error",
+                            f"[{cat}] {msg}", meta))
 
     blocks_by_bid = {int(b["block_id"]): b for b in blocks}
     trailer = _TRAILER_INSNS_BY_ISA.get(isa, 1)
@@ -3184,7 +3193,6 @@ def _check_call_return_store(
     issues: list[Issue] = []
     n_checked = 0
     n_errors = 0
-    err_cap = 20
 
     for tmpl in templates:
         for idx, ins in enumerate(tmpl.get("insns", [])):
@@ -3204,21 +3212,20 @@ def _check_call_return_store(
             if not bad:
                 continue
             n_errors += 1
-            if n_errors <= err_cap:
-                issues.append(Issue(
-                    "call_return_store", "error",
-                    f"template t{tmpl['template_id']} insn #{idx} "
-                    f"pc=0x{int(ins['pc']):x}: a call's store-data "
-                    f"dependency must name the return address (REG_IP) "
-                    f"and only that",
-                    {"template_id": int(tmpl["template_id"]),
-                     "insn_index": idx,
-                     "pc": int(ins["pc"]),
-                     "store_data_dep_mask": [hex(v) for v in sd],
-                     "expected_mask": hex(ip_bits),
-                     "src_regs": [reg_id_to_name.get(int(r), str(r))
-                                  for r in srcs]},
-                ))
+            issues.append(Issue(
+                "call_return_store", "error",
+                f"template t{tmpl['template_id']} insn #{idx} "
+                f"pc=0x{int(ins['pc']):x}: a call's store-data "
+                f"dependency must name the return address (REG_IP) "
+                f"and only that",
+                {"template_id": int(tmpl["template_id"]),
+                 "insn_index": idx,
+                 "pc": int(ins["pc"]),
+                 "store_data_dep_mask": [hex(v) for v in sd],
+                 "expected_mask": hex(ip_bits),
+                 "src_regs": [reg_id_to_name.get(int(r), str(r))
+                              for r in srcs]},
+            ))
 
     stores_expected = isa == "x86_64"
     issues.append(Issue(
@@ -3296,7 +3303,6 @@ def _check_static_reg_sets(
     # Direct branches whose PC-relative target QEMU folded to a constant, so
     # the program counter is not a read; see the arbitration.
     n_pcfold_adjudicated = 0
-    err_cap = 20
 
     def add(out: set[str], cap_id: int) -> None:
         entry = reg_class.get(int(cap_id))
@@ -3539,23 +3545,25 @@ def _check_static_reg_sets(
                 continue
 
             n_errors += 1
-            if n_errors <= err_cap:
-                issues.append(Issue(
-                    "static_reg_sets", "error",
-                    f"template t{tid} insn #{idx} pc=0x{int(ins['pc']):x}: "
-                    f"src/dst reg set mismatch",
-                    {
-                        "template_id": tid,
-                        "insn_index": idx,
-                        "pc": int(ins["pc"]),
-                        "mnemonic": getattr(d, "mnemonic", ""),
-                        "op_str": getattr(d, "op_str", ""),
-                        "expected_src": sorted(exp_src),
-                        "actual_src": sorted(actual_src),
-                        "expected_dst": sorted(exp_dst),
-                        "actual_dst": sorted(actual_dst),
-                    },
-                ))
+            issues.append(Issue(
+                "static_reg_sets", "error",
+                f"template t{tid} insn #{idx} pc=0x{int(ins['pc']):x} "
+                f"{getattr(d, 'mnemonic', '')} {getattr(d, 'op_str', '')}: "
+                f"src/dst reg set mismatch — "
+                f"wire src {sorted(actual_src)} dst {sorted(actual_dst)}, "
+                f"comparand src {sorted(exp_src)} dst {sorted(exp_dst)}",
+                {
+                    "template_id": tid,
+                    "insn_index": idx,
+                    "pc": int(ins["pc"]),
+                    "mnemonic": getattr(d, "mnemonic", ""),
+                    "op_str": getattr(d, "op_str", ""),
+                    "expected_src": sorted(exp_src),
+                    "actual_src": sorted(actual_src),
+                    "expected_dst": sorted(exp_dst),
+                    "actual_dst": sorted(actual_dst),
+                },
+            ))
 
     issues.append(Issue(
         "static_reg_sets", "info",
@@ -3929,7 +3937,6 @@ def _check_address_recompute(
     n_checked = 0
     n_skipped = 0
     n_errors = 0
-    err_cap = 20
 
     def _decode_insn(tid: int, idx: int, raw: bytes, pc: int):
         key = (tid, idx)
@@ -4103,26 +4110,25 @@ def _check_address_recompute(
             recorded = int(dp.value) & mask64
             if ea != recorded:
                 n_errors += 1
-                if n_errors <= err_cap:
-                    issues.append(Issue(
-                        "addr_recompute", "error",
-                        f"template t{tid} insn #{i} pc=0x{ins['pc']:x}: "
-                        f"{dp.type_name} VA=0x{recorded:x} but "
-                        f"recomputed EA=0x{ea:x} from "
-                        f"base={base_name}=0x{base_val:x} "
-                        f"+ index={index_name}*{scale}=0x{idx_val * scale:x} "
-                        f"+ disp=0x{disp & mask64:x}",
-                        {"template_id": tid, "insn_index": i,
-                         "pc": int(ins["pc"]),
-                         "kind": dp.type_name,
-                         "recorded_va": recorded,
-                         "computed_ea": ea,
-                         "base_reg": base_name,
-                         "base_val": base_val,
-                         "index_reg": index_name,
-                         "index_val": idx_val,
-                         "scale": scale, "disp": disp},
-                    ))
+                issues.append(Issue(
+                    "addr_recompute", "error",
+                    f"template t{tid} insn #{i} pc=0x{ins['pc']:x}: "
+                    f"{dp.type_name} VA=0x{recorded:x} but "
+                    f"recomputed EA=0x{ea:x} from "
+                    f"base={base_name}=0x{base_val:x} "
+                    f"+ index={index_name}*{scale}=0x{idx_val * scale:x} "
+                    f"+ disp=0x{disp & mask64:x}",
+                    {"template_id": tid, "insn_index": i,
+                     "pc": int(ins["pc"]),
+                     "kind": dp.type_name,
+                     "recorded_va": recorded,
+                     "computed_ea": ea,
+                     "base_reg": base_name,
+                     "base_val": base_val,
+                     "index_reg": index_name,
+                     "index_val": idx_val,
+                     "scale": scale, "disp": disp},
+                ))
                 continue
             n_checked += 1
 
@@ -6369,13 +6375,9 @@ def _check_range_invocations(entries: list[dict],
     # ctx -> {template_id -> {"stop", "depth", "seq", "excursion_seen"}}
     open_by_ctx: dict[tuple, dict[int, dict]] = {}
     n_split = n_continued = 0
-    err_cap = 5
 
     def _err(msg: str, **detail):
-        if len(issues) < err_cap:
-            issues.append(Issue("range_continuity", "error", msg, detail))
-        else:
-            issues.append(Issue("range_continuity", "error", msg))
+        issues.append(Issue("range_continuity", "error", msg, detail))
 
     for e in entries:
         t = templates_by_id.get(e["template_id"])
@@ -6455,7 +6457,7 @@ def _check_range_invocations(entries: list[dict],
 
     errors = [i for i in issues if i.severity == "error"]
     if errors:
-        return errors[: err_cap + 1]
+        return errors
     return [Issue(
         "range_continuity", "info",
         f"{n_split} split invocation(s) opened, {n_continued} "
@@ -8002,7 +8004,6 @@ def _check_metaflags(
     issues: list[Issue] = []
     n_checked = 0
     n_errors  = 0
-    err_cap   = 20
 
     for e in cp_entries:
         tmpl = templates_by_id.get(int(e["template_id"]))
@@ -8096,32 +8097,26 @@ def _check_metaflags(
             if mf_z != exp_z or mf_n != exp_n or (
                     isa == "x86_64" and mf_p != exp_p):
                 n_errors += 1
-                if n_errors <= err_cap:
-                    issues.append(Issue(
-                        "metaflags", "error",
-                        f"BB{tmpl['template_id']} insn[{ipos}] "
-                        f"(0x{int(I.get('pc', 0)):x}): "
-                        f"trace mflags=0x{mf:02x} "
-                        f"Z={mf_z}/N={mf_n}/P={mf_p}, expected "
-                        f"Z={exp_z}/N={exp_n}/P={exp_p} from "
-                        f"{reg_id_to_name.get(result_reg, result_reg)}="
-                        f"0x{r_low:x} ({width}-bit)",
-                        {"template_id": tmpl["template_id"], "insn": ipos,
-                         "trace_mflags": mf, "expected_znp":
-                            {"Z": exp_z, "N": exp_n, "P": exp_p},
-                         "result": r_low, "width": width},
-                    ))
+                issues.append(Issue(
+                    "metaflags", "error",
+                    f"BB{tmpl['template_id']} insn[{ipos}] "
+                    f"(0x{int(I.get('pc', 0)):x}): "
+                    f"trace mflags=0x{mf:02x} "
+                    f"Z={mf_z}/N={mf_n}/P={mf_p}, expected "
+                    f"Z={exp_z}/N={exp_n}/P={exp_p} from "
+                    f"{reg_id_to_name.get(result_reg, result_reg)}="
+                    f"0x{r_low:x} ({width}-bit)",
+                    {"template_id": tmpl["template_id"], "insn": ipos,
+                     "trace_mflags": mf, "expected_znp":
+                        {"Z": exp_z, "N": exp_n, "P": exp_p},
+                     "result": r_low, "width": width},
+                ))
 
     if n_errors == 0:
         issues.append(Issue(
             "metaflags", "info",
             f"{n_checked} flag-writing insn(s) had Z/N/P bits matching "
             f"the trace's metaflags byte",
-        ))
-    elif n_errors > err_cap:
-        issues.append(Issue(
-            "metaflags", "info",
-            f"... {n_errors - err_cap} additional metaflags errors suppressed",
         ))
     return issues
 
@@ -8160,7 +8155,6 @@ def _check_regdata_reconstruction(
     issues: list[Issue] = []
     n_checked = 0
     n_errors  = 0
-    err_cap   = 20
 
     # Each handler is (compute, commutative).  Commutative ops can
     # ignore operand order; non-commutative (SUB) need to know which
@@ -8287,23 +8281,22 @@ def _check_regdata_reconstruction(
                 n_checked += 1
                 if got != expected:
                     n_errors += 1
-                    if n_errors <= err_cap:
-                        issues.append(Issue(
-                            "regdata_reconstruction", "error",
-                            f"BB{tmpl['template_id']} insn[{ipos}] "
-                            f"(0x{int(I.get('pc', 0)):x}) {op_name}: "
-                            f"trace dst="
-                            f"{reg_id_to_name.get(r, r)}=0x{got:x}, "
-                            f"expected 0x{expected:x} from "
-                            f"{reg_id_to_name.get(ordered_srcs[0], ordered_srcs[0])}"
-                            f"=0x{a & mask:x}, "
-                            f"{reg_id_to_name.get(ordered_srcs[1], ordered_srcs[1])}"
-                            f"=0x{b & mask:x}",
-                            {"template_id": tmpl["template_id"],
-                             "insn": ipos, "opcode": op_name,
-                             "got": got, "expected": expected,
-                             "a": a & mask, "b": b & mask},
-                        ))
+                    issues.append(Issue(
+                        "regdata_reconstruction", "error",
+                        f"BB{tmpl['template_id']} insn[{ipos}] "
+                        f"(0x{int(I.get('pc', 0)):x}) {op_name}: "
+                        f"trace dst="
+                        f"{reg_id_to_name.get(r, r)}=0x{got:x}, "
+                        f"expected 0x{expected:x} from "
+                        f"{reg_id_to_name.get(ordered_srcs[0], ordered_srcs[0])}"
+                        f"=0x{a & mask:x}, "
+                        f"{reg_id_to_name.get(ordered_srcs[1], ordered_srcs[1])}"
+                        f"=0x{b & mask:x}",
+                        {"template_id": tmpl["template_id"],
+                         "insn": ipos, "opcode": op_name,
+                         "got": got, "expected": expected,
+                         "a": a & mask, "b": b & mask},
+                    ))
                 # Update state regardless — the chain continues.
                 reg_state[(tid, r)] = _reg_snap_value(snap)
 
@@ -8312,11 +8305,6 @@ def _check_regdata_reconstruction(
             "regdata_reconstruction", "info",
             f"reconstructed {n_checked} arithmetic dst value(s) "
             f"matched the trace's regdata snaps",
-        ))
-    elif n_errors > err_cap:
-        issues.append(Issue(
-            "regdata_reconstruction", "info",
-            f"... {n_errors - err_cap} additional regdata errors suppressed",
         ))
     return issues
 

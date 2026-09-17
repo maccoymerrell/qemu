@@ -81,6 +81,30 @@ static void note_zero_reg(int reg, unsigned dir)
 }
 
 /*
+ * A GENERAL-PURPOSE READ THE OP STREAM WILL NOT SHOW.
+ *
+ * Several arms of this translator take a "destination is $zero, so emit
+ * nothing" shortcut.  The shortcut is correct emulation -- the result is
+ * discarded, so producing it is wasted work -- but it also skips the
+ * gen_load_gpr() calls that would have named the SOURCES, and an instruction
+ * that architecturally reads $t1 reads it whether or not the answer is kept.
+ * R3 and J2.3 have ruled that shape: a QEMU optimisation is not the machine.
+ *
+ * So the read is stated here, from the register NUMBER the decode site still
+ * holds.  Register 0 goes through the zero atom for the reason note_zero_reg()
+ * gives (there is no TCG global for it); every other number names its global.
+ * Capture only: no op is emitted, altered or suppressed.
+ */
+static void note_gpr_read(int reg)
+{
+    if (reg == 0) {
+        insn_dataflow_state_read(insn_df_zero());
+    } else {
+        insn_dataflow_state_read(insn_df_reg(regnames[reg]));
+    }
+}
+
+/*
  * THE FOLDED PROGRAM COUNTER (fact 11).
  *
  * A branch target and a link value are computed from this instruction's own
@@ -2492,6 +2516,13 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
          * If no destination, treat it as a NOP.
          * For addi, we must generate the overflow exception when needed.
          */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
         return;
     }
     switch (opc) {
@@ -2572,6 +2603,13 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
 
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
         return;
     }
     uimm = (uint16_t)imm;
@@ -2634,6 +2672,13 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
 
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
         return;
     }
     t0 = tcg_temp_new();
@@ -2665,13 +2710,23 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
 
     if (rt == 0) {
         /*
-         * If no destination, treat it as a NOP.  MIPS spells its no-op as a
-         * shift into $zero -- 0x00000000 is sll $zero,$zero,0, and ssnop and
-         * ehb are the same rule with other shift amounts -- so the word is
-         * stated here, where the destination is in hand, and the table's own
-         * word for the rule does not reach it: note_word() is first-wins.
+         * QEMU TREATS A SHIFT WITH NO DESTINATION AS A NO-OP AND EMITS
+         * NOTHING, and that is an emulation shortcut rather than a statement
+         * about the encoding.  MIPS defines only the sll $zero,$zero,sa code
+         * points as hints; `sra $zero,$t1,3` is a shift whose result is
+         * discarded, and R3/J2.3 have ruled that shape -- the operation
+         * happens, only the destination is architecturally inert.  So the word
+         * is the SHIFT, which insn_df_mips_ident() below states from the rule,
+         * and the discard is carried by the zero-destination note above; the
+         * hint code points state their own word at the OPC_SLL decode arm,
+         * before the dispatch-site rule word is taken.
+         *
+         * THE SOURCE IS STILL READ.  The shortcut skips gen_load_gpr(), so no
+         * op names rs, but the instruction reads it in every architecture
+         * these bytes belong to.  note_gpr_read() states the access without
+         * emitting anything.
          */
-        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+        note_gpr_read(rs);
         insn_df_mips_ident(MIPS_DF_SHIFT_IMM, opc);
         return;
     }
@@ -2783,6 +2838,14 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
          * If no destination, treat it as a NOP.
          * For add & sub, we must generate the overflow exception when needed.
          */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
+        note_gpr_read(rt);
         return;
     }
 
@@ -2956,6 +3019,14 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
+        note_gpr_read(rt);
         return;
     }
 
@@ -2997,6 +3068,14 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rs);
+        note_gpr_read(rt);
         return;
     }
 
@@ -3103,10 +3182,18 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
 
     if (rd == 0) {
         /*
-         * If no destination, treat it as a NOP.
-         * For add & sub, we must generate the overflow exception when needed.
+         * QEMU TREATS A SHIFT WITH NO DESTINATION AS A NO-OP AND EMITS
+         * NOTHING.  MIPS does not define srav/rotrv/sllv with rd=$0 as a hint
+         * -- unlike RISC-V's ADDI, where the spec says so -- so the shift
+         * happens and only the destination is architecturally inert.  The word
+         * is therefore the SHIFT, stated by insn_df_mips_ident() from the rule
+         * below, and the discard is carried by the zero-destination note
+         * above; and the two SOURCES are read whether or not the result is
+         * kept, so they are stated without emitting the loads the shortcut
+         * skipped.
          */
-        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+        note_gpr_read(rs);
+        note_gpr_read(rt);
         insn_df_mips_ident(MIPS_DF_SHIFT_REG, opc);
         return;
     }
@@ -5032,6 +5119,13 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
 
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
+        /*
+         * THE SOURCE IS STILL READ.  The shortcut skips the
+         * gen_load_gpr() calls that would have named it, but the
+         * instruction reads it whether or not the result is kept --
+         * R3/J2.3: a QEMU optimisation is not the machine.
+         */
+        note_gpr_read(rt);
         return;
     }
 
@@ -13573,6 +13667,22 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     sa = (ctx->opcode >> 6) & 0x1f;
 
     op1 = MASK_SPECIAL(ctx->opcode);
+    /*
+     * THE sll $zero,$zero,sa HINT CODE POINTS, before the rule's own word.
+     *
+     * MIPS spells its no-operation as a shift into $zero from $zero: sa 0 is
+     * nop, 1 is ssnop, 3 is ehb and 5 is pause, and QEMU itself prints those
+     * names.  A hazard barrier and a superscalar no-op perform no shift and
+     * occupy no shifter, so "shl" -- which is the right word for every OTHER
+     * sll -- is false of them.
+     *
+     * The statement has to be made HERE, ahead of insn_df_mips_ident(), and
+     * not where gen_shift_imm() has the destination in hand: note_word() is
+     * first-wins and the dispatch site's rule word is taken first.
+     */
+    if (op1 == OPC_SLL && rd == 0 && rs == 0 && rt == 0) {
+        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+    }
     insn_df_mips_ident(MIPS_DF_SPECIAL, op1);
     switch (op1) {
     case OPC_SLL:          /* Shift with immediate */

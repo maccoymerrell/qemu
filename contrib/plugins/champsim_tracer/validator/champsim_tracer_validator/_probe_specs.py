@@ -1191,11 +1191,15 @@ _register_probe('probe_exact_cmp_rr', {
                 'insns': [_insn("CMP", branch_type="NONE",
                                 src=["REG_GPR0", "REG_GPR3"],
                                 dst=["REG_FLAGS"])]},
+    # aarch64 `cmp x0, x1` IS `subs xzr, x0, x1`: the encoding names XZR
+    # as the destination register and the instruction writes it, with the
+    # value discarded.  The wire publishes that write (the zero-register
+    # destination note), so REG_ZERO belongs in the expectation.
     'aarch64': {'asm': '"cmp x0, x1"', 'clobbers': '"cc"',
                 'opcodes': ['CMP'],
                 'insns': [_insn("CMP", branch_type="NONE",
                                 src=["REG_GPR0", "REG_GPR1"],
-                                dst=["REG_FLAGS"])]},
+                                dst=["REG_FLAGS", "REG_ZERO"])]},
     'riscv64': {'asm': '"slt t0, t1, t2"', 'clobbers': '"t0"',
                 'opcodes': ['SETCC'],
                 'insns': [_insn("SETCC", branch_type="NONE",
@@ -1397,17 +1401,27 @@ _register_probe('probe_arm_writeback_addr', {'aarch64': {
            '    "ldp x2, x3, [x9], #16\\n\\t"\n'
            '    "add sp, sp, #64"',
     'clobbers': '"x0","x1","x2","x3","x9","memory"',
-    'opcodes': ['INT_ADD'],
+    'opcodes': ['INT_ADD', 'LOAD', 'STORE'],
     'insns': [
         {}, {},
-        _insn("GEN_OP_INT_ADD",
+        # Writeback addressing does not change what the instruction IS.
+        # The substantial operation of `ldr x0, [x9], #8` is the load;
+        # the base-register increment is the addressing mode's own
+        # bookkeeping, and the wire carries it where it belongs -- in the
+        # destination list, beside the loaded register.  Nothing is lost
+        # by calling these LOAD and STORE, and calling them INT_ADD would
+        # hide a memory access from every consumer that partitions on the
+        # opcode.  (The rule that forbids demoting an opcode to LOAD or
+        # STORE is about an instruction whose arithmetic is the point --
+        # an atomic read-modify-write -- not about an address increment.)
+        _insn("GEN_OP_LOAD",
               src=["REG_GPR9"],
               dst=["REG_GPR0", "REG_GPR9"],
               load_addr_deps=[["src_reg[0]"]]),
-        _insn("GEN_OP_INT_ADD",
+        _insn("GEN_OP_STORE",
               src=["REG_GPR1", "REG_GPR9"],
               dst=["REG_GPR9"]),
-        _insn("GEN_OP_INT_ADD",
+        _insn("GEN_OP_LOAD",
               src=["REG_GPR9"],
               dst=["REG_GPR2", "REG_GPR3", "REG_GPR9"]),
         {},
@@ -1448,9 +1462,14 @@ _register_probe('probe_zero_reg', {
                '    "add x9, sp, #16"',
         'clobbers': '"x9"',
         'insns': [
-            # Capstone prints the alias (mov x9, x10): the XZR source
-            # disappears.  Pin it — XZR is constant zero, nothing lost.
-            {"src": ["REG_GPR10"], "dst": ["REG_GPR9"]},
+            # `orr x9, xzr, x10` reads XZR.  The row used to expect the
+            # alias Capstone prints (mov x9, x10), where the XZR source
+            # disappears, with "nothing lost" written beside it.  The
+            # wire names the zero register at QEMU's own operand
+            # accessors now: a consumer that partitions reads by register
+            # gets the encoding's real read set, and an operand that is
+            # architecturally constant is still an operand.
+            {"src": ["REG_GPR10", "REG_ZERO"], "dst": ["REG_GPR9"]},
             {"src": ["REG_SP"], "dst": ["REG_GPR9"]},
         ]},
     'riscv64': {
@@ -1490,14 +1509,29 @@ _register_probe('probe_implicit_acc', {
         'opcodes': ['INT_MUL', 'SHL'],
         'insns': [
             {},
-            # Capstone marks RAX written too (conservative rw on the
-            # implicit pair); the trace follows Capstone.
-            {"src": ["REG_GPR0"], "dst": ["REG_GPR0", "REG_GPR2"]},
+            # cqto sign-extends RAX into RDX and writes NOTHING else.
+            # This row used to declare a RAX destination as well, with
+            # "the trace follows Capstone" written beside it -- an
+            # access-flag conservatism (rw on the implicit pair) that the
+            # tracer inherited and the probe then pinned.  The wire takes
+            # its destination list from QEMU now, and QEMU's cqto emitter
+            # writes cpu_regs[R_EDX] alone, which is also what the SDM
+            # says.  Ledger #51's wire half is this row: it closes here.
+            {"src": ["REG_GPR0"], "dst": ["REG_GPR2"]},
             {},
             {"src": ["REG_GPR0", "REG_GPR3"],
              "dst": ["REG_GPR0", "REG_GPR2", "REG_FLAGS"]},
             {},
-            {"src": ["REG_GPR1", "REG_GPR3"],
+            # A shift by CL READS the old flags.  "If the count is 0 the
+            # flags are not affected" makes the result a function of the
+            # previous flag state, and QEMU implements exactly that:
+            # gen_shift_dynamic_flags() movcond-selects cpu_cc_dst /
+            # cpu_cc_src / cpu_cc_op against the shift's own result on
+            # count == 0 (target/i386/tcg/emit.c.inc).  It is an
+            # architectural input, not a lazy-flag artifact -- which is
+            # why variable shifts carry a partial-flags penalty on real
+            # hardware.  The row previously omitted it.
+            {"src": ["REG_FLAGS", "REG_GPR1", "REG_GPR3"],
              "dst": ["REG_GPR3", "REG_FLAGS"]},
         ]},
     'mipsel': {

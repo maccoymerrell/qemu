@@ -26,7 +26,7 @@
     {                                                        \
         if (CHECK(s, a)) {                                   \
             return opivv_trans(a->rd, a->rs1, a->rs2, a->vm, \
-                               gen_helper_##NAME, s);        \
+                               false, gen_helper_##NAME, s); \
         }                                                    \
         return false;                                        \
     }
@@ -46,7 +46,7 @@ GEN_VV_MASKED_TRANS(vclmulh_vv, vclmul_vv_check)
     {                                                        \
         if (CHECK(s, a)) {                                   \
             return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, \
-                               gen_helper_##NAME, s);        \
+                               false, gen_helper_##NAME, s); \
         }                                                    \
         return false;                                        \
     }
@@ -170,10 +170,12 @@ GEN_OPIVX_GVEC_TRANS_CHECK(vandn_vx, andcs, zvkb_vx_check)
             data = FIELD_DP32(data, VDATA, VTA, s->vta);                   \
             data = FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s); \
             data = FIELD_DP32(data, VDATA, VMA, s->vma);                   \
-            tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),         \
-                               vreg_ofs(s, a->rs2), tcg_env,               \
-                               s->cfg_ptr->vlenb, s->cfg_ptr->vlenb,       \
-                               data, fns[s->sew]);                         \
+            tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),                   \
+                                     vreg_ofs(s, 0),                       \
+                                     vreg_ofs(s, a->rs2), tcg_env,         \
+                                     s->cfg_ptr->vlenb,                    \
+                                     s->cfg_ptr->vlenb, data,              \
+                                     rvv_srcrd(data, 2), fns[s->sew]);     \
             finalize_rvv_inst(s);                                          \
             return true;                                                   \
         }                                                                  \
@@ -223,7 +225,7 @@ static bool vwsll_vx_check(DisasContext *s, arg_rmrr *a)
                 gen_helper_##OPIVX##_h,                                      \
                 gen_helper_##OPIVX##_w,                                      \
             };                                                               \
-            return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s, \
+            return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, false, fns[s->sew], s, \
                                IMM_MODE);                                    \
         }                                                                    \
         return false;                                                        \

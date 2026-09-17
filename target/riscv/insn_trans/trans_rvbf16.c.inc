@@ -78,11 +78,12 @@ static bool trans_vfncvtbf16_f_f_w(DisasContext *ctx, arg_vfncvtbf16_f_f_w *a)
         data = FIELD_DP32(data, VDATA, LMUL, ctx->lmul);
         data = FIELD_DP32(data, VDATA, VTA, ctx->vta);
         data = FIELD_DP32(data, VDATA, VMA, ctx->vma);
-        tcg_gen_gvec_3_ptr(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
-                           vreg_ofs(ctx, a->rs2), tcg_env,
-                           ctx->cfg_ptr->vlenb,
-                           ctx->cfg_ptr->vlenb, data,
-                           gen_helper_vfncvtbf16_f_f_w);
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
+                                 vreg_ofs(ctx, a->rs2), tcg_env,
+                                 ctx->cfg_ptr->vlenb,
+                                 ctx->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 2),
+                                 gen_helper_vfncvtbf16_f_f_w);
         finalize_rvv_inst(ctx);
         return true;
     }
@@ -103,11 +104,12 @@ static bool trans_vfwcvtbf16_f_f_v(DisasContext *ctx, arg_vfwcvtbf16_f_f_v *a)
         data = FIELD_DP32(data, VDATA, LMUL, ctx->lmul);
         data = FIELD_DP32(data, VDATA, VTA, ctx->vta);
         data = FIELD_DP32(data, VDATA, VMA, ctx->vma);
-        tcg_gen_gvec_3_ptr(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
-                           vreg_ofs(ctx, a->rs2), tcg_env,
-                           ctx->cfg_ptr->vlenb,
-                           ctx->cfg_ptr->vlenb, data,
-                           gen_helper_vfwcvtbf16_f_f_v);
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
+                                 vreg_ofs(ctx, a->rs2), tcg_env,
+                                 ctx->cfg_ptr->vlenb,
+                                 ctx->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 2),
+                                 gen_helper_vfwcvtbf16_f_f_v);
         finalize_rvv_inst(ctx);
         return true;
     }
@@ -132,12 +134,13 @@ static bool trans_vfwmaccbf16_vv(DisasContext *ctx, arg_vfwmaccbf16_vv *a)
         data = FIELD_DP32(data, VDATA, LMUL, ctx->lmul);
         data = FIELD_DP32(data, VDATA, VTA, ctx->vta);
         data = FIELD_DP32(data, VDATA, VMA, ctx->vma);
-        tcg_gen_gvec_4_ptr(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
-                           vreg_ofs(ctx, a->rs1),
-                           vreg_ofs(ctx, a->rs2), tcg_env,
-                           ctx->cfg_ptr->vlenb,
-                           ctx->cfg_ptr->vlenb, data,
-                           gen_helper_vfwmaccbf16_vv);
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(ctx, a->rd), vreg_ofs(ctx, 0),
+                                 vreg_ofs(ctx, a->rs1),
+                                 vreg_ofs(ctx, a->rs2), tcg_env,
+                                 ctx->cfg_ptr->vlenb,
+                                 ctx->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 3),
+                                 gen_helper_vfwmaccbf16_vv);
         finalize_rvv_inst(ctx);
         return true;
     }

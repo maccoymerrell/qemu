@@ -71,6 +71,29 @@ void tcg_gen_gvec_4_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                         uint32_t maxsz, int32_t data,
                         gen_helper_gvec_4_ptr *fn);
 
+/*
+ * The same expansions for a helper that is handed a pointer it does not read.
+ * Bit i of @src_rd_mask says whether the helper reads source i, counting aofs
+ * as source 0; the forms above are these with every bit set.
+ *
+ * The generated code is identical either way.  The mask changes only what the
+ * expansion states about its operands, and it exists because the expander is
+ * handed offsets, not the helper's body: a target whose helper consults a
+ * pointer only under a condition it decided at decode time -- a RISC-V vector
+ * instruction is handed v0 whether or not it is masked -- is the only place
+ * that knows, and an operand stated as read when it is not puts a dependence
+ * on the wire that the machine does not have.
+ */
+void tcg_gen_gvec_3_ptr_srcrd(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                              TCGv_ptr ptr, uint32_t oprsz, uint32_t maxsz,
+                              int32_t data, unsigned src_rd_mask,
+                              gen_helper_gvec_3_ptr *fn);
+void tcg_gen_gvec_4_ptr_srcrd(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                              uint32_t cofs, TCGv_ptr ptr, uint32_t oprsz,
+                              uint32_t maxsz, int32_t data,
+                              unsigned src_rd_mask,
+                              gen_helper_gvec_4_ptr *fn);
+
 typedef void gen_helper_gvec_5_ptr(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr,
                                    TCGv_ptr, TCGv_ptr, TCGv_i32);
 void tcg_gen_gvec_5_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,

@@ -38,13 +38,23 @@
  * The destination's extent is oprsz, not maxsz: the bytes between the two are
  * cleared by expand_clr() with ordinary stores, which carry their own offsets
  * and need no statement.
+ *
+ * @src_rd_mask says which of @srcofs the helper actually reads, bit i for
+ * srcofs[i].  A pointer the helper is handed and never dereferences is not an
+ * input, and saying it is would put an edge on the wire the machine does not
+ * have.  This layer cannot tell the difference -- it is handed offsets, not
+ * the helper's body -- so the caller that knows says so; the entry points
+ * without the mask pass all-read, which is what a plain expansion does.
  */
 static void gvec_note_operands(uint32_t dofs, uint32_t oprsz,
-                               const uint32_t *srcofs, unsigned n_src)
+                               const uint32_t *srcofs, unsigned n_src,
+                               unsigned src_rd_mask)
 {
     insn_dataflow_note_vec_operand(dofs, oprsz, INSN_DF_WR);
     for (unsigned i = 0; i < n_src; i++) {
-        insn_dataflow_note_vec_operand(srcofs[i], oprsz, INSN_DF_RD);
+        if (src_rd_mask & (1u << i)) {
+            insn_dataflow_note_vec_operand(srcofs[i], oprsz, INSN_DF_RD);
+        }
     }
 }
 
@@ -183,7 +193,7 @@ void tcg_gen_gvec_2_ool(uint32_t dofs, uint32_t aofs,
     {
         const uint32_t srcofs[] = { aofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -209,7 +219,7 @@ void tcg_gen_gvec_2i_ool(uint32_t dofs, uint32_t aofs, TCGv_i64 c,
     {
         const uint32_t srcofs[] = { aofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -235,7 +245,7 @@ void tcg_gen_gvec_3_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -264,7 +274,7 @@ void tcg_gen_gvec_4_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs, cofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -296,7 +306,7 @@ void tcg_gen_gvec_5_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs, cofs, xofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -328,7 +338,7 @@ void tcg_gen_gvec_2_ptr(uint32_t dofs, uint32_t aofs,
     {
         const uint32_t srcofs[] = { aofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -345,6 +355,22 @@ void tcg_gen_gvec_3_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                         TCGv_ptr ptr, uint32_t oprsz, uint32_t maxsz,
                         int32_t data, gen_helper_gvec_3_ptr *fn)
 {
+    tcg_gen_gvec_3_ptr_srcrd(dofs, aofs, bofs, ptr, oprsz, maxsz, data,
+                             ~0u, fn);
+}
+
+/*
+ * As tcg_gen_gvec_3_ptr(), for a helper that does not read every pointer it
+ * is handed: bit i of @src_rd_mask says whether it reads source i, counting
+ * aofs as 0.  The generated code is the same either way -- the mask decides
+ * only what this expansion states about the operands, and a pointer the
+ * helper never dereferences is not an input.
+ */
+void tcg_gen_gvec_3_ptr_srcrd(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                              TCGv_ptr ptr, uint32_t oprsz, uint32_t maxsz,
+                              int32_t data, unsigned src_rd_mask,
+                              gen_helper_gvec_3_ptr *fn)
+{
     TCGv_ptr a0, a1, a2;
     TCGv_i32 desc = tcg_constant_i32(simd_desc(oprsz, maxsz, data));
 
@@ -355,7 +381,8 @@ void tcg_gen_gvec_3_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs),
+                           src_rd_mask);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -375,6 +402,17 @@ void tcg_gen_gvec_4_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                         uint32_t maxsz, int32_t data,
                         gen_helper_gvec_4_ptr *fn)
 {
+    tcg_gen_gvec_4_ptr_srcrd(dofs, aofs, bofs, cofs, ptr, oprsz, maxsz, data,
+                             ~0u, fn);
+}
+
+/* As tcg_gen_gvec_3_ptr_srcrd(), with three sources.  */
+void tcg_gen_gvec_4_ptr_srcrd(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                              uint32_t cofs, TCGv_ptr ptr, uint32_t oprsz,
+                              uint32_t maxsz, int32_t data,
+                              unsigned src_rd_mask,
+                              gen_helper_gvec_4_ptr *fn)
+{
     TCGv_ptr a0, a1, a2, a3;
     TCGv_i32 desc = tcg_constant_i32(simd_desc(oprsz, maxsz, data));
 
@@ -386,7 +424,8 @@ void tcg_gen_gvec_4_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs, cofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs),
+                           src_rd_mask);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
@@ -420,7 +459,7 @@ void tcg_gen_gvec_5_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     {
         const uint32_t srcofs[] = { aofs, bofs, cofs, eofs };
 
-        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs));
+        gvec_note_operands(dofs, oprsz, srcofs, ARRAY_SIZE(srcofs), ~0u);
     }
     tcg_gen_addi_ptr(a0, tcg_env, dofs);
     tcg_gen_addi_ptr(a1, tcg_env, aofs);

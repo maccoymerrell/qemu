@@ -266,6 +266,48 @@ static uint32_t vreg_ofs(DisasContext *s, int reg)
     return offsetof(CPURISCVState, vreg) + reg * s->cfg_ptr->vlenb;
 }
 
+/*
+ * Which source pointers of a vector expansion the helper actually reads.
+ *
+ * Every masked-capable RVV helper is handed a pointer to v0 whether or not it
+ * looks at one, and the expander is handed offsets, not the helper's body, so
+ * it cannot tell.  An operand stated as read when the helper never
+ * dereferences it puts a dependence edge on the wire the machine does not
+ * have; one left out when the helper does read it drops a real edge.  Three
+ * answers, in three shapes:
+ *
+ *  - rvv_srcrd(), for the ordinary masked families, whose helpers guard the
+ *    read as `!vm && vext_elem_mask(v0, i)'.  The answer is read back out of
+ *    @data -- the same word the helper takes vm from -- so the statement
+ *    cannot drift from the test it describes.
+ *
+ *  - RVV_SRCRD_V0_UNREAD(), for the families whose encoding has no vm field
+ *    at all: the mask-register logical instructions and vcompress.  Their
+ *    helpers are handed v0 and never dereference it (GEN_VEXT_MASK_VV, and
+ *    GEN_VEXT_VCOMPRESS_VM whose mask operand is vs1), and their @data
+ *    carries no VM bit to read back.
+ *
+ *  - RVV_SRCRD_V0_DATA(), for vadc/vsbc, where v0 is the carry-in: a
+ *    MANDATORY DATA OPERAND, not a write mask.  Those five encodings pin the
+ *    mask bit to 0 and insn32.decode hands the trans function vm = 1 anyway
+ *    (@r_vm_1), because the VDATA VM bit tells the helper whether to mask the
+ *    WRITE -- which vadc does not -- while its carry read
+ *    (`carry = vext_elem_mask(v0, i)', GEN_VEXT_VADC_VVM) is unconditional.
+ *    So for these the VM bit answers a different question and is not usable.
+ *
+ * Bit 0 is the mask pointer, which these expansions pass first; the @nsrc - 1
+ * data operands above it are always read.
+ */
+static unsigned rvv_srcrd(uint32_t data, unsigned nsrc)
+{
+    unsigned all = (1u << nsrc) - 1;
+
+    return FIELD_EX32(data, VDATA, VM) ? (all & ~1u) : all;
+}
+
+#define RVV_SRCRD_V0_UNREAD(nsrc)   ((((1u << (nsrc)) - 1)) & ~1u)
+#define RVV_SRCRD_V0_DATA(nsrc)     ((1u << (nsrc)) - 1)
+
 /* check functions */
 
 /*
@@ -1278,10 +1320,11 @@ do_opivv_gvec(DisasContext *s, arg_rmrr *a, GVecGen3Fn *gvec_fn,
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);
         data = FIELD_DP32(data, VDATA, VMA, s->vma);
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs1), vreg_ofs(s, a->rs2),
-                           tcg_env, s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb, data, fn);
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs1), vreg_ofs(s, a->rs2),
+                                 tcg_env, s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 3), fn);
     }
     finalize_rvv_inst(s);
     return true;
@@ -1316,25 +1359,53 @@ GEN_OPIVV_GVEC_TRANS(vsub_vv, sub)
  * partial register set -- vmerge.vxm named its scalar operand and nothing
  * else, destination included.
  *
- * @vd is written, @vs2 read.  The mask register is v0 by architecture and is
- * read only when the instruction is masked (vm == 0); an unmasked
- * instruction is handed the same pointer and never looks at it, so it is
- * stated on the vm == 0 side only.
+ * @vd is written, @vs2 read.  The mask register is v0 by architecture; for an
+ * ordinary masked family the helper looks at it only when vm == 0, and an
+ * unmasked instruction is handed the same pointer and never dereferences it.
+ * @v0_data says the family reads v0 whatever vm says, which is vadc/vsbc:
+ * there v0 is the carry-in, a data operand, and insn32.decode hands those
+ * five encodings vm = 1 to keep the helper from masking the write.
  */
-static void rvv_state_vreg_ops(uint32_t vd, uint32_t vs2, uint32_t vm)
+static void rvv_state_vreg_ops(uint32_t vd, uint32_t vs2, uint32_t vm,
+                               bool v0_data)
 {
     insn_dataflow_state_write(insn_df_reg(riscv_vec_regnames[vd]));
     insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[vs2]));
-    if (vm == 0) {
+    if (vm == 0 || v0_data) {
         insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[0]));
     }
+}
+
+/*
+ * A MASK destination is a read-modify-write of the destination register.
+ *
+ * QEMU writes every mask result one bit at a time through
+ * vext_set_elem_mask() (vector_helper.c), which loads the 64-bit word holding
+ * the bit, deposits into it and stores it back.  What survives that is the
+ * elements this instruction does not write: the tail above vl, which a mask
+ * destination leaves UNDISTURBED unless the CPU sets rvv_ta_all_1s, and the
+ * prefix below vstart, which is never written at all.  Those bits reach the
+ * result from vd's previous contents, so vd is an input of its own
+ * instruction.
+ *
+ * When the tail IS overwritten with ones and vstart is known zero, this same
+ * call writes every bit of the register, and a read of bytes the call itself
+ * wrote is not an input -- so nothing is stated.  Both conditions are
+ * translate-time facts, which is why the decision can be made here.
+ */
+static void rvv_state_mask_dest(DisasContext *s, uint32_t vd)
+{
+    if (s->cfg_vta_all_1s && s->vstart_eq_zero) {
+        return;
+    }
+    insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[vd]));
 }
 
 typedef void gen_helper_opivx(TCGv_ptr, TCGv_ptr, TCGv, TCGv_ptr,
                               TCGv_env, TCGv_i32);
 
 static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
-                        gen_helper_opivx *fn, DisasContext *s)
+                        bool v0_data, gen_helper_opivx *fn, DisasContext *s)
 {
     TCGv_ptr dest, src2, mask;
     TCGv src1;
@@ -1360,7 +1431,7 @@ static bool opivx_trans(uint32_t vd, uint32_t rs1, uint32_t vs2, uint32_t vm,
 
     fn(dest, mask, src1, src2, tcg_env, desc);
 
-    rvv_state_vreg_ops(vd, vs2, vm);
+    rvv_state_vreg_ops(vd, vs2, vm, v0_data);
     finalize_rvv_inst(s);
     return true;
 }
@@ -1389,7 +1460,7 @@ do_opivx_gvec(DisasContext *s, arg_rmrr *a, GVecGen2sFn *gvec_fn,
         finalize_rvv_inst(s);
         return true;
     }
-    return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fn, s);
+    return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fn, s);
 }
 
 /* OPIVX with GVEC IR */
@@ -1492,7 +1563,7 @@ static int64_t extract_imm(DisasContext *s, uint32_t imm, imm_mode_t imm_mode)
 }
 
 static bool opivi_trans(uint32_t vd, uint32_t imm, uint32_t vs2, uint32_t vm,
-                        gen_helper_opivx *fn, DisasContext *s,
+                        bool v0_data, gen_helper_opivx *fn, DisasContext *s,
                         imm_mode_t imm_mode)
 {
     TCGv_ptr dest, src2, mask;
@@ -1519,7 +1590,7 @@ static bool opivi_trans(uint32_t vd, uint32_t imm, uint32_t vs2, uint32_t vm,
 
     fn(dest, mask, src1, src2, tcg_env, desc);
 
-    rvv_state_vreg_ops(vd, vs2, vm);
+    rvv_state_vreg_ops(vd, vs2, vm, v0_data);
     finalize_rvv_inst(s);
     return true;
 }
@@ -1537,7 +1608,7 @@ do_opivi_gvec(DisasContext *s, arg_rmrr *a, GVecGen2iFn *gvec_fn,
         finalize_rvv_inst(s);
         return true;
     }
-    return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, fn, s, imm_mode);
+    return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, false, fn, s, imm_mode);
 }
 
 /* OPIVI with GVEC IR */
@@ -1597,12 +1668,12 @@ static bool do_opivv_widen(DisasContext *s, arg_rmrr *a,
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);
         data = FIELD_DP32(data, VDATA, VMA, s->vma);
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs1),
-                           vreg_ofs(s, a->rs2),
-                           tcg_env, s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb,
-                           data, fn);
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs1),
+                                 vreg_ofs(s, a->rs2),
+                                 tcg_env, s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb,
+                                 data, rvv_srcrd(data, 3), fn);
         finalize_rvv_inst(s);
         return true;
     }
@@ -1650,7 +1721,7 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                    \
             gen_helper_##NAME##_h,                                        \
             gen_helper_##NAME##_w                                         \
         };                                                                \
-        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s); \
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fns[s->sew], s); \
     }                                                                     \
     return false;                                                         \
 }
@@ -1678,11 +1749,12 @@ static bool do_opiwv_widen(DisasContext *s, arg_rmrr *a,
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);
         data = FIELD_DP32(data, VDATA, VMA, s->vma);
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs1),
-                           vreg_ofs(s, a->rs2),
-                           tcg_env, s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb, data, fn);
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs1),
+                                 vreg_ofs(s, a->rs2),
+                                 tcg_env, s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 3), fn);
         finalize_rvv_inst(s);
         return true;
     }
@@ -1717,7 +1789,7 @@ static bool do_opiwx_widen(DisasContext *s, arg_rmrr *a,
                            gen_helper_opivx *fn)
 {
     if (opiwx_widen_check(s, a)) {
-        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fn, s);
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fn, s);
     }
     return false;
 }
@@ -1739,7 +1811,8 @@ GEN_OPIWX_WIDEN_TRANS(vwsubu_wx)
 GEN_OPIWX_WIDEN_TRANS(vwsub_wx)
 
 static bool opivv_trans(uint32_t vd, uint32_t vs1, uint32_t vs2, uint32_t vm,
-                        gen_helper_gvec_4_ptr *fn, DisasContext *s)
+                        bool v0_data, gen_helper_gvec_4_ptr *fn,
+                        DisasContext *s)
 {
     uint32_t data = 0;
 
@@ -1748,16 +1821,17 @@ static bool opivv_trans(uint32_t vd, uint32_t vs1, uint32_t vs2, uint32_t vm,
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
-    tcg_gen_gvec_4_ptr(vreg_ofs(s, vd), vreg_ofs(s, 0), vreg_ofs(s, vs1),
-                       vreg_ofs(s, vs2), tcg_env, s->cfg_ptr->vlenb,
-                       s->cfg_ptr->vlenb, data, fn);
+    tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, vd), vreg_ofs(s, 0), vreg_ofs(s, vs1),
+                             vreg_ofs(s, vs2), tcg_env, s->cfg_ptr->vlenb,
+                             s->cfg_ptr->vlenb, data, v0_data ? RVV_SRCRD_V0_DATA(3)
+                                         : rvv_srcrd(data, 3), fn);
     finalize_rvv_inst(s);
     return true;
 }
 
 /* Vector Integer Add-with-Carry / Subtract-with-Borrow Instructions */
 /* OPIVV without GVEC IR */
-#define GEN_OPIVV_TRANS(NAME, CHECK)                                     \
+#define GEN_OPIVV_TRANS_(NAME, CHECK, MASKDST, V0DATA)                           \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
 {                                                                        \
     if (CHECK(s, a)) {                                                   \
@@ -1765,10 +1839,20 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
             gen_helper_##NAME##_b, gen_helper_##NAME##_h,                \
             gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
         };                                                               \
-        return opivv_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+        if (MASKDST) {                                                   \
+            rvv_state_mask_dest(s, a->rd);                               \
+        }                                                                \
+        return opivv_trans(a->rd, a->rs1, a->rs2, a->vm, V0DATA, fns[s->sew], s);\
     }                                                                    \
     return false;                                                        \
 }
+
+#define GEN_OPIVV_TRANS(NAME, CHECK) \
+    GEN_OPIVV_TRANS_(NAME, CHECK, false, false)
+#define GEN_OPIVV_MASKDST_TRANS(NAME, CHECK) \
+    GEN_OPIVV_TRANS_(NAME, CHECK, true, false)
+#define GEN_OPIVV_V0DATA_TRANS(NAME, CHECK) \
+    GEN_OPIVV_TRANS_(NAME, CHECK, false, true)
 
 /*
  * For vadc and vsbc, an illegal instruction exception is raised if the
@@ -1782,8 +1866,8 @@ static bool opivv_vadc_check(DisasContext *s, arg_rmrr *a)
            vext_check_sss(s, a->rd, a->rs1, a->rs2, a->vm);
 }
 
-GEN_OPIVV_TRANS(vadc_vvm, opivv_vadc_check)
-GEN_OPIVV_TRANS(vsbc_vvm, opivv_vadc_check)
+GEN_OPIVV_V0DATA_TRANS(vadc_vvm, opivv_vadc_check)
+GEN_OPIVV_V0DATA_TRANS(vsbc_vvm, opivv_vadc_check)
 
 /*
  * For vmadc and vmsbc, an illegal instruction exception is raised if the
@@ -1796,8 +1880,8 @@ static bool opivv_vmadc_check(DisasContext *s, arg_rmrr *a)
            vext_check_mss(s, a->rd, a->rs1, a->rs2);
 }
 
-GEN_OPIVV_TRANS(vmadc_vvm, opivv_vmadc_check)
-GEN_OPIVV_TRANS(vmsbc_vvm, opivv_vmadc_check)
+GEN_OPIVV_MASKDST_TRANS(vmadc_vvm, opivv_vmadc_check)
+GEN_OPIVV_MASKDST_TRANS(vmsbc_vvm, opivv_vmadc_check)
 
 static bool opivx_vadc_check(DisasContext *s, arg_rmrr *a)
 {
@@ -1808,7 +1892,7 @@ static bool opivx_vadc_check(DisasContext *s, arg_rmrr *a)
 }
 
 /* OPIVX without GVEC IR */
-#define GEN_OPIVX_TRANS(NAME, CHECK)                                     \
+#define GEN_OPIVX_TRANS_(NAME, CHECK, MASKDST, V0DATA)                           \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
 {                                                                        \
     if (CHECK(s, a)) {                                                   \
@@ -1817,13 +1901,23 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
             gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
         };                                                               \
                                                                          \
-        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+        if (MASKDST) {                                                   \
+            rvv_state_mask_dest(s, a->rd);                               \
+        }                                                                \
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, V0DATA, fns[s->sew], s);\
     }                                                                    \
     return false;                                                        \
 }
 
-GEN_OPIVX_TRANS(vadc_vxm, opivx_vadc_check)
-GEN_OPIVX_TRANS(vsbc_vxm, opivx_vadc_check)
+#define GEN_OPIVX_TRANS(NAME, CHECK) \
+    GEN_OPIVX_TRANS_(NAME, CHECK, false, false)
+#define GEN_OPIVX_MASKDST_TRANS(NAME, CHECK) \
+    GEN_OPIVX_TRANS_(NAME, CHECK, true, false)
+#define GEN_OPIVX_V0DATA_TRANS(NAME, CHECK) \
+    GEN_OPIVX_TRANS_(NAME, CHECK, false, true)
+
+GEN_OPIVX_V0DATA_TRANS(vadc_vxm, opivx_vadc_check)
+GEN_OPIVX_V0DATA_TRANS(vsbc_vxm, opivx_vadc_check)
 
 static bool opivx_vmadc_check(DisasContext *s, arg_rmrr *a)
 {
@@ -1832,11 +1926,11 @@ static bool opivx_vmadc_check(DisasContext *s, arg_rmrr *a)
            vext_check_ms(s, a->rd, a->rs2);
 }
 
-GEN_OPIVX_TRANS(vmadc_vxm, opivx_vmadc_check)
-GEN_OPIVX_TRANS(vmsbc_vxm, opivx_vmadc_check)
+GEN_OPIVX_MASKDST_TRANS(vmadc_vxm, opivx_vmadc_check)
+GEN_OPIVX_MASKDST_TRANS(vmsbc_vxm, opivx_vmadc_check)
 
 /* OPIVI without GVEC IR */
-#define GEN_OPIVI_TRANS(NAME, IMM_MODE, OPIVX, CHECK)                    \
+#define GEN_OPIVI_TRANS_(NAME, IMM_MODE, OPIVX, CHECK, MASKDST, V0DATA)          \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
 {                                                                        \
     if (CHECK(s, a)) {                                                   \
@@ -1844,14 +1938,24 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
             gen_helper_##OPIVX##_b, gen_helper_##OPIVX##_h,              \
             gen_helper_##OPIVX##_w, gen_helper_##OPIVX##_d,              \
         };                                                               \
-        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm,                 \
+        if (MASKDST) {                                                   \
+            rvv_state_mask_dest(s, a->rd);                               \
+        }                                                                \
+        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, V0DATA,         \
                            fns[s->sew], s, IMM_MODE);                    \
     }                                                                    \
     return false;                                                        \
 }
 
-GEN_OPIVI_TRANS(vadc_vim, IMM_SX, vadc_vxm, opivx_vadc_check)
-GEN_OPIVI_TRANS(vmadc_vim, IMM_SX, vmadc_vxm, opivx_vmadc_check)
+#define GEN_OPIVI_TRANS(NAME, IMM_MODE, OPIVX, CHECK) \
+    GEN_OPIVI_TRANS_(NAME, IMM_MODE, OPIVX, CHECK, false, false)
+#define GEN_OPIVI_MASKDST_TRANS(NAME, IMM_MODE, OPIVX, CHECK) \
+    GEN_OPIVI_TRANS_(NAME, IMM_MODE, OPIVX, CHECK, true, false)
+#define GEN_OPIVI_V0DATA_TRANS(NAME, IMM_MODE, OPIVX, CHECK) \
+    GEN_OPIVI_TRANS_(NAME, IMM_MODE, OPIVX, CHECK, false, true)
+
+GEN_OPIVI_V0DATA_TRANS(vadc_vim, IMM_SX, vadc_vxm, opivx_vadc_check)
+GEN_OPIVI_MASKDST_TRANS(vmadc_vim, IMM_SX, vmadc_vxm, opivx_vmadc_check)
 
 /* Vector Bitwise Logical Instructions */
 GEN_OPIVV_GVEC_TRANS(vand_vv, and)
@@ -1887,7 +1991,7 @@ do_opivx_gvec_shift(DisasContext *s, arg_rmrr *a, GVecGen2sFn32 *gvec_fn,
         finalize_rvv_inst(s);
         return true;
     }
-    return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fn, s);
+    return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fn, s);
 }
 
 #define GEN_OPIVX_GVEC_SHIFT_TRANS(NAME, SUF) \
@@ -1935,12 +2039,14 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs1),                    \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew]);                           \
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs1),              \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 3),               \
+                                 fns[s->sew]);                     \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -1966,7 +2072,7 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
             gen_helper_##NAME##_h,                                       \
             gen_helper_##NAME##_w,                                       \
         };                                                               \
-        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fns[s->sew], s);\
     }                                                                    \
     return false;                                                        \
 }
@@ -1984,7 +2090,7 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
             gen_helper_##OPIVX##_h,                                      \
             gen_helper_##OPIVX##_w,                                      \
         };                                                               \
-        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm,                 \
+        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, false,         \
                            fns[s->sew], s, IMM_MODE);                    \
     }                                                                    \
     return false;                                                        \
@@ -2006,12 +2112,12 @@ static bool opivv_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_mss(s, a->rd, a->rs1, a->rs2);
 }
 
-GEN_OPIVV_TRANS(vmseq_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsne_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsltu_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmslt_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsleu_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsle_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmseq_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmsne_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmsltu_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmslt_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmsleu_vv, opivv_cmp_check)
+GEN_OPIVV_MASKDST_TRANS(vmsle_vv, opivv_cmp_check)
 
 static bool opivx_cmp_check(DisasContext *s, arg_rmrr *a)
 {
@@ -2020,21 +2126,21 @@ static bool opivx_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_ms(s, a->rd, a->rs2);
 }
 
-GEN_OPIVX_TRANS(vmseq_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsne_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsltu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmslt_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsleu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsle_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsgtu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsgt_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmseq_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsne_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsltu_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmslt_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsleu_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsle_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsgtu_vx, opivx_cmp_check)
+GEN_OPIVX_MASKDST_TRANS(vmsgt_vx, opivx_cmp_check)
 
-GEN_OPIVI_TRANS(vmseq_vi, IMM_SX, vmseq_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsne_vi, IMM_SX, vmsne_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsleu_vi, IMM_SX, vmsleu_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsle_vi, IMM_SX, vmsle_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsgtu_vi, IMM_SX, vmsgtu_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsgt_vi, IMM_SX, vmsgt_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmseq_vi, IMM_SX, vmseq_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmsne_vi, IMM_SX, vmsne_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmsleu_vi, IMM_SX, vmsleu_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmsle_vi, IMM_SX, vmsle_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmsgtu_vi, IMM_SX, vmsgtu_vx, opivx_cmp_check)
+GEN_OPIVI_MASKDST_TRANS(vmsgt_vi, IMM_SX, vmsgt_vx, opivx_cmp_check)
 
 /* Vector Integer Min/Max Instructions */
 GEN_OPIVV_GVEC_TRANS(vminu_vv, umin)
@@ -2361,7 +2467,7 @@ static bool opfvv_check(DisasContext *s, arg_rmrr *a)
 }
 
 /* OPFVV without GVEC IR */
-#define GEN_OPFVV_TRANS(NAME, CHECK)                               \
+#define GEN_OPFVV_TRANS_(NAME, CHECK, MASKDST)                     \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
 {                                                                  \
     if (CHECK(s, a)) {                                             \
@@ -2379,17 +2485,26 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
         data =                                                     \
             FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s);\
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs1),                    \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew - 1]);                       \
+        if (MASKDST) {                                             \
+            rvv_state_mask_dest(s, a->rd);                         \
+        }                                                          \
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs1),              \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 3),               \
+                                 fns[s->sew - 1]);                 \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
     return false;                                                  \
 }
+#define GEN_OPFVV_TRANS(NAME, CHECK)      GEN_OPFVV_TRANS_(NAME, CHECK, false)
+#define GEN_OPFVV_MASKDST_TRANS(NAME, CHECK) \
+    GEN_OPFVV_TRANS_(NAME, CHECK, true)
+
 GEN_OPFVV_TRANS(vfadd_vv, opfvv_check)
 GEN_OPFVV_TRANS(vfsub_vv, opfvv_check)
 
@@ -2423,7 +2538,7 @@ static bool opfvf_trans(uint32_t vd, uint32_t rs1, uint32_t vs2,
      * FIELD_EX32(data, VDATA, VM) rather than a vm argument: this family's
      * callers have already folded the mask bit into @data.
      */
-    rvv_state_vreg_ops(vd, vs2, FIELD_EX32(data, VDATA, VM));
+    rvv_state_vreg_ops(vd, vs2, FIELD_EX32(data, VDATA, VM), false);
     finalize_rvv_inst(s);
     return true;
 }
@@ -2441,7 +2556,7 @@ static bool opfvf_check(DisasContext *s, arg_rmrr *a)
 }
 
 /* OPFVF without GVEC IR */
-#define GEN_OPFVF_TRANS(NAME, CHECK)                              \
+#define GEN_OPFVF_TRANS_(NAME, CHECK, MASKDST)                    \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)            \
 {                                                                 \
     if (CHECK(s, a)) {                                            \
@@ -2458,11 +2573,18 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)            \
         data = FIELD_DP32(data, VDATA, VTA_ALL_1S,                \
                           s->cfg_vta_all_1s);                     \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);              \
+        if (MASKDST) {                                            \
+            rvv_state_mask_dest(s, a->rd);                        \
+        }                                                         \
         return opfvf_trans(a->rd, a->rs1, a->rs2, data,           \
                            fns[s->sew - 1], s);                   \
     }                                                             \
     return false;                                                 \
 }
+
+#define GEN_OPFVF_TRANS(NAME, CHECK)      GEN_OPFVF_TRANS_(NAME, CHECK, false)
+#define GEN_OPFVF_MASKDST_TRANS(NAME, CHECK) \
+    GEN_OPFVF_TRANS_(NAME, CHECK, true)
 
 GEN_OPFVF_TRANS(vfadd_vf,  opfvf_check)
 GEN_OPFVF_TRANS(vfsub_vf,  opfvf_check)
@@ -2504,12 +2626,14 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)           \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);           \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);             \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);             \
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),   \
-                           vreg_ofs(s, a->rs1),                  \
-                           vreg_ofs(s, a->rs2), tcg_env,         \
-                           s->cfg_ptr->vlenb,                    \
-                           s->cfg_ptr->vlenb, data,              \
-                           fns[s->sew - 1]);                     \
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd),             \
+                                 vreg_ofs(s, 0),                 \
+                                 vreg_ofs(s, a->rs1),            \
+                                 vreg_ofs(s, a->rs2), tcg_env,   \
+                                 s->cfg_ptr->vlenb,              \
+                                 s->cfg_ptr->vlenb, data,        \
+                                 rvv_srcrd(data, 3),             \
+                                 fns[s->sew - 1]);               \
         finalize_rvv_inst(s);                                    \
         return true;                                             \
     }                                                            \
@@ -2585,12 +2709,14 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs1),                    \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew - 1]);                       \
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs1),              \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 3),               \
+                                 fns[s->sew - 1]);                 \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -2699,10 +2825,11 @@ static bool do_opfv(DisasContext *s, arg_rmr *a,
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);
         data = FIELD_DP32(data, VDATA, VMA, s->vma);
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs2), tcg_env,
-                           s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb, data, fn);
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs2), tcg_env,
+                                 s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 2), fn);
         finalize_rvv_inst(s);
         return true;
     }
@@ -2747,10 +2874,10 @@ static bool opfvv_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_mss(s, a->rd, a->rs1, a->rs2);
 }
 
-GEN_OPFVV_TRANS(vmfeq_vv, opfvv_cmp_check)
-GEN_OPFVV_TRANS(vmfne_vv, opfvv_cmp_check)
-GEN_OPFVV_TRANS(vmflt_vv, opfvv_cmp_check)
-GEN_OPFVV_TRANS(vmfle_vv, opfvv_cmp_check)
+GEN_OPFVV_MASKDST_TRANS(vmfeq_vv, opfvv_cmp_check)
+GEN_OPFVV_MASKDST_TRANS(vmfne_vv, opfvv_cmp_check)
+GEN_OPFVV_MASKDST_TRANS(vmflt_vv, opfvv_cmp_check)
+GEN_OPFVV_MASKDST_TRANS(vmfle_vv, opfvv_cmp_check)
 
 static bool opfvf_cmp_check(DisasContext *s, arg_rmrr *a)
 {
@@ -2760,12 +2887,12 @@ static bool opfvf_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_ms(s, a->rd, a->rs2);
 }
 
-GEN_OPFVF_TRANS(vmfeq_vf, opfvf_cmp_check)
-GEN_OPFVF_TRANS(vmfne_vf, opfvf_cmp_check)
-GEN_OPFVF_TRANS(vmflt_vf, opfvf_cmp_check)
-GEN_OPFVF_TRANS(vmfle_vf, opfvf_cmp_check)
-GEN_OPFVF_TRANS(vmfgt_vf, opfvf_cmp_check)
-GEN_OPFVF_TRANS(vmfge_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmfeq_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmfne_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmflt_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmfle_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmfgt_vf, opfvf_cmp_check)
+GEN_OPFVF_MASKDST_TRANS(vmfge_vf, opfvf_cmp_check)
 
 /* Vector Floating-Point Classify Instruction */
 GEN_OPFV_TRANS(vfclass_v, opfv_check, RISCV_FRM_DYN)
@@ -2880,11 +3007,13 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew - 1]);                       \
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 2),               \
+                                 fns[s->sew - 1]);                 \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -2928,11 +3057,13 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew]);                           \
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 2),               \
+                                 fns[s->sew]);                     \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -2992,11 +3123,13 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew - 1]);                       \
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 2),               \
+                                 fns[s->sew - 1]);                 \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3038,11 +3171,13 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data = FIELD_DP32(data, VDATA, VTA, s->vta);               \
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data,                \
-                           fns[s->sew]);                           \
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 2),               \
+                                 fns[s->sew]);                     \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3124,11 +3259,14 @@ static bool trans_##NAME(DisasContext *s, arg_r *a)                \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data =                                                     \
             FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s);\
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),     \
-                           vreg_ofs(s, a->rs1),                    \
-                           vreg_ofs(s, a->rs2), tcg_env,           \
-                           s->cfg_ptr->vlenb,                      \
-                           s->cfg_ptr->vlenb, data, fn);           \
+        rvv_state_mask_dest(s, a->rd);                             \
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs1),              \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 RVV_SRCRD_V0_UNREAD(3), fn);       \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3218,16 +3356,18 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)              \
         uint32_t data = 0;                                         \
         gen_helper_gvec_3_ptr *fn = gen_helper_##NAME;             \
                                                                    \
+        rvv_state_mask_dest(s, a->rd);                             \
         data = FIELD_DP32(data, VDATA, VM, a->vm);                 \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data =                                                     \
             FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s);\
         data = FIELD_DP32(data, VDATA, VMA, s->vma);               \
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd),                     \
-                           vreg_ofs(s, 0), vreg_ofs(s, a->rs2),    \
-                           tcg_env, s->cfg_ptr->vlenb,             \
-                           s->cfg_ptr->vlenb,                      \
-                           data, fn);                              \
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd),               \
+                                 vreg_ofs(s, 0),                   \
+                                 vreg_ofs(s, a->rs2), tcg_env,     \
+                                 s->cfg_ptr->vlenb,                \
+                                 s->cfg_ptr->vlenb, data,          \
+                                 rvv_srcrd(data, 2), fn);          \
         finalize_rvv_inst(s);                                      \
         return true;                                               \
     }                                                              \
@@ -3263,10 +3403,11 @@ static bool trans_viota_m(DisasContext *s, arg_viota_m *a)
             gen_helper_viota_m_b, gen_helper_viota_m_h,
             gen_helper_viota_m_w, gen_helper_viota_m_d,
         };
-        tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs2), tcg_env,
-                           s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb, data, fns[s->sew]);
+        tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs2), tcg_env,
+                                 s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb, data,
+                                 rvv_srcrd(data, 2), fns[s->sew]);
         finalize_rvv_inst(s);
         return true;
     }
@@ -3757,7 +3898,7 @@ static bool trans_vrgather_vx(DisasContext *s, arg_rmrr *a)
             gen_helper_vrgather_vx_b, gen_helper_vrgather_vx_h,
             gen_helper_vrgather_vx_w, gen_helper_vrgather_vx_d
         };
-        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, false, fns[s->sew], s);
     }
     return true;
 }
@@ -3795,7 +3936,7 @@ static bool trans_vrgather_vi(DisasContext *s, arg_rmrr *a)
             gen_helper_vrgather_vx_b, gen_helper_vrgather_vx_h,
             gen_helper_vrgather_vx_w, gen_helper_vrgather_vx_d
         };
-        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew],
+        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm, false, fns[s->sew],
                            s, IMM_ZX);
     }
     return true;
@@ -3829,11 +3970,11 @@ static bool trans_vcompress_vm(DisasContext *s, arg_r *a)
 
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);
-        tcg_gen_gvec_4_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                           vreg_ofs(s, a->rs1), vreg_ofs(s, a->rs2),
-                           tcg_env, s->cfg_ptr->vlenb,
-                           s->cfg_ptr->vlenb, data,
-                           fns[s->sew]);
+        tcg_gen_gvec_4_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                                 vreg_ofs(s, a->rs1), vreg_ofs(s, a->rs2),
+                                 tcg_env, s->cfg_ptr->vlenb,
+                                 s->cfg_ptr->vlenb, data,
+                                 RVV_SRCRD_V0_UNREAD(3),fns[s->sew]);
         finalize_rvv_inst(s);
         return true;
     }
@@ -3927,10 +4068,10 @@ static bool int_ext_op(DisasContext *s, arg_rmr *a, uint8_t seq)
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
 
-    tcg_gen_gvec_3_ptr(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
-                       vreg_ofs(s, a->rs2), tcg_env,
-                       s->cfg_ptr->vlenb,
-                       s->cfg_ptr->vlenb, data, fn);
+    tcg_gen_gvec_3_ptr_srcrd(vreg_ofs(s, a->rd), vreg_ofs(s, 0),
+                             vreg_ofs(s, a->rs2), tcg_env,
+                             s->cfg_ptr->vlenb,
+                             s->cfg_ptr->vlenb, data, rvv_srcrd(data, 2), fn);
 
     finalize_rvv_inst(s);
     return true;

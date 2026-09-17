@@ -10,17 +10,6 @@
 #include <capstone/capstone.h>
 #include <capstone/x86.h>
 
-static unsigned int cap_mode_x86(const char *target_name)
-{
-    (void)target_name;
-    /*
-     * The Capstone decode of i386 instructions in 64-bit mode covers
-     * the same encodings; we don't currently distinguish 32-vs-64-bit
-     * instruction streams here.
-     */
-    return CS_MODE_64;
-}
-
 /*
  * x86 EFLAGS → canonical CST_METAFLAGS layout.  Mapping table:
  *   bit  0  CF -> CST_METAFLAGS_C

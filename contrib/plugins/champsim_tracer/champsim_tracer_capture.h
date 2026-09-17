@@ -218,6 +218,28 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
                            const void *bytes, size_t nbytes,
                            const struct InsnFields *f, int refusal);
 
+/*
+ * Ask Capstone what these bytes are, and write the answer into @info.
+ *
+ * ONE COLUMN, AND IT IS APPARATUS.  The only field any caller reads back is
+ * the mnemonic -- the word the other decoder printed -- which is a column of
+ * the identity corpus and nothing the wire publishes.  It is here, and not at
+ * the translation callback that needs it, because this is the file that does
+ * not exist in a release build: with the call on this side, the shipped
+ * plugin has no Capstone dependency at all, not a dependency it declines to
+ * use.  The build proves it -- the plugin links libcapstone only when
+ * -Dcst_capture=true.
+ *
+ * The arch/mode pair comes from champsim_tracer_capstone_mode.h and is
+ * resolved once, lazily, on the first call: the RISC-V and MIPS resolvers
+ * read the guest ELF through qemu_plugin_path_to_binary(), which needs a live
+ * vCPU, and every call site is inside a translation callback where there is
+ * one.  An ISA Capstone does not cover leaves @info untouched, and the
+ * identity corpus then writes "-" for the column rather than a guess.
+ */
+void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
+                            struct qemu_plugin_insn_info *info);
+
 #else
 
 static inline void cst_capture_insn(uint64_t, const void *, size_t,
@@ -242,6 +264,9 @@ static inline void cst_capture_alias(const void *, size_t, const char *,
 static inline void cst_capture_wire_sets(const struct qemu_plugin_tb *, size_t,
                                          const void *, size_t,
                                          const struct InsnFields *, int)
+{ }
+static inline void cst_capture_cap_decode(const void *, size_t, uint64_t,
+                                          struct qemu_plugin_insn_info *)
 { }
 
 #endif /* CST_CAPTURE */

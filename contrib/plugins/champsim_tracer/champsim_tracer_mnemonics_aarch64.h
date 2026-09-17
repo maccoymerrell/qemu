@@ -10,13 +10,6 @@
 #include <capstone/capstone.h>
 #include <capstone/aarch64.h>
 
-static unsigned int cap_mode_aarch64(const char *target_name)
-{
-    (void)target_name;
-    /* Capstone has no separate LE flag; 0 == little endian. */
-    return CS_MODE_LITTLE_ENDIAN;
-}
-
 /*
  * AArch64 reg-alias inserter (used by RegHandleCache via
  * IsaProperties.reg_alias_inserter).  QEMU's gdbstub registers SVE

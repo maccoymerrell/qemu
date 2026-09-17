@@ -16,6 +16,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_mnemonics.h"
+#include "champsim_tracer_capstone_mode.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 
@@ -30,6 +31,13 @@
 /* ------------------------------------------------------------------ */
 
 TraceISA trace_isa = TRACE_ISA_UNKNOWN;
+/*
+ * The QEMU target name.  The plugin fills it from the emulator it is loaded
+ * into; there is no emulator here, and cstref_init() resolves the Capstone
+ * mode from the ISA name it was given instead, so this exists only to satisfy
+ * the capture TU's link and is never read.
+ */
+const char *target_name = nullptr;
 bool target_big_endian = false;
 const InsnClassification *active_insn_table = nullptr;
 unsigned active_insn_table_size = 0;
@@ -137,6 +145,15 @@ CSTREF_STUB(bool, qemu_plugin_insn_immediate,
 CSTREF_STUB(bool, qemu_plugin_insn_dataflow_status,
             (const struct qemu_plugin_tb *, size_t,
              qemu_plugin_dataflow_status *))
+/*
+ * QEMU's in-process Capstone consult, which this tool must never reach: it
+ * disassembles with its OWN pinned Capstone through cap_disas_raw_detail(),
+ * and a stub that quietly answered here would make the referee score a second
+ * decode path while its report named the first.
+ */
+CSTREF_STUB(bool, qemu_plugin_cap_decode,
+            (int, unsigned int, const uint8_t *, size_t, uint64_t,
+             qemu_plugin_insn_info *))
 
 } /* extern "C" */
 
@@ -176,16 +193,16 @@ bool cstref_init(const char *isa_name)
     build_qemu_reg_reverse_index();
 
     /*
-     * The arch/mode pair comes from the ISA's own property row rather than
-     * from a table this tool keeps, because a mirror of that row is a second
-     * place for it to be wrong.  cap_mode_for_target() resolves the extension
-     * set from the guest ELF when there is one; there is none here, so it
-     * returns the documented fallback set, and the driver stamps which.
+     * The arch/mode pair comes from champsim_tracer_capstone_mode.h -- the
+     * one place either apparatus arm gets it, so a mirror of it cannot drift.
+     * The mode resolvers read the extension set out of the guest ELF when
+     * there is one; there is none here, so each returns its documented
+     * fallback set, and the driver stamps which.
      */
-    const IsaProperties *p = &isa_properties[isa];
-
-    g_cap_arch = p->cap_arch;
-    g_cap_mode = p->cap_mode_for_target ? p->cap_mode_for_target(isa_name) : 0;
+    g_cap_arch = cst_capstone_arch_for_isa(isa);
+    g_cap_mode = (g_cap_arch >= 0)
+               ? cst_capstone_mode_for_isa(isa, isa_name)
+               : 0;
 
     table_ready = active_insn_table && active_reg_table && g_cap_arch >= 0;
     return table_ready;

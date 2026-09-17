@@ -1466,8 +1466,6 @@ typedef struct {
 extern std::atomic<uint64_t> g_tb_flush_count;
 
 extern TraceISA trace_isa;
-extern int cst_cap_arch;
-extern unsigned int cst_cap_mode;
 extern const char *target_name;
 /* Privilege level (normalized, 0 = user) at which the target executes
  * WITHOUT translating through the address-space register that

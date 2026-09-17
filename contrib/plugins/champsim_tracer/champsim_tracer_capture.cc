@@ -28,9 +28,19 @@ extern "C" {
 }
 
 #include "champsim_tracer_mnemonics.h"
+#include "champsim_tracer_capstone_mode.h"
 #include "champsim_tracer_generic_ids.h"
 #include "champsim_tracer_vocabulary.h"
 #include "champsim_tracer_regmap.h"
+
+/*
+ * Two plugin globals, declared rather than included: champsim_tracer.h drags
+ * the whole tracer in, and this file is meant to be severable from it.  The
+ * Capstone column needs to know which target is running and what it is
+ * called, and nothing else here does.
+ */
+extern TraceISA trace_isa;
+extern const char *target_name;
 
 namespace {
 
@@ -1562,6 +1572,29 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
                 pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
                 ek ? ea : "-", selfloop, sets, regs);
     }
+}
+
+/*
+ * The Capstone column of the identity corpus.  See champsim_tracer_capture.h
+ * for why the call lives on this side of the segregation line.
+ */
+void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
+                            struct qemu_plugin_insn_info *info)
+{
+    static int arch = -2;               /* -2 = not resolved yet */
+    static unsigned int mode;
+
+    if (arch == -2) {
+        arch = cst_capstone_arch_for_isa(trace_isa);
+        mode = (arch >= 0)
+             ? cst_capstone_mode_for_isa(trace_isa, target_name)
+             : 0;
+    }
+    if (arch < 0) {
+        return;
+    }
+    qemu_plugin_cap_decode(arch, mode, (const uint8_t *)bytes, nbytes, pc,
+                           info);
 }
 
 #endif /* CST_CAPTURE */

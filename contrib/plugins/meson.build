@@ -125,6 +125,8 @@ if get_option('plugins')
   # capture TU compiles to nothing and the object carries neither its code nor
   # the names of the variables that would drive it -- a property nm and strings
   # can check, which is why it is a build option and not a runtime one.
+  #
+  champsim_tracer_deps = [glib, capstone]
   if get_option('cst_capture')
     champsim_tracer_cpp_args += ['-DCST_CAPTURE']
   endif
@@ -137,14 +139,14 @@ if get_option('plugins')
                        cpp_args: champsim_tracer_cpp_args,
                        link_depends: [win32_qemu_plugin_api_lib],
                        link_args: win32_qemu_plugin_api_link_flags,
-                       dependencies: [glib, capstone])
+                       dependencies: champsim_tracer_deps)
   else
     champsim_tracer_so = shared_module('champsim_tracer',
                        champsim_tracer_sources + champsim_tracer_regmap_gen,
                        include_directories: ['../../include/qemu', '../../include',
                                              '.'],
                        cpp_args: champsim_tracer_cpp_args,
-                       dependencies: [glib, capstone])
+                       dependencies: champsim_tracer_deps)
   endif
   t += champsim_tracer_so
 

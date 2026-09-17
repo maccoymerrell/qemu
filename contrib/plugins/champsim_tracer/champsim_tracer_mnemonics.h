@@ -524,12 +524,12 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  *                            implicit-only register (HI:LO) would
  *                            otherwise vanish from the dependency chain.
  *   target_prefixes        — QEMU target_name prefixes for this ISA
- *   cap_arch               — Capstone CS_ARCH_*, or -1 if unsupported
- *   cap_mode_for_target    — derives the Capstone cs_mode bitmask
- *                            from target_name (RISC-V 32/64, MIPS
- *                            endianness)
+ *
+ * The Capstone arch/mode pair is deliberately NOT a row here: it is
+ * apparatus for the comparison and lives in
+ * champsim_tracer_capstone_mode.h, which the shipped plugin does not
+ * include.
  */
-typedef unsigned int (*CapModeForTargetFn)(const char *target_name);
 
 /*
  * Optional per-ISA hook called by RegHandleCache for every QEMU
@@ -609,8 +609,6 @@ typedef struct {
     uint8_t               branch_delay_slots;
     bool                  include_implicit_regs;
     const char *const    *target_prefixes;
-    int                   cap_arch;
-    CapModeForTargetFn    cap_mode_for_target;
     RegAliasInserterFn    reg_alias_inserter;
     MetaFlagsMapperFn     flags_to_metaflags;
     AddrCanonicalizeFn    canonicalize_addr;
@@ -648,8 +646,6 @@ const IsaProperties isa_properties[] = {
     [TRACE_ISA_X86]     = {
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_x86,
-        .cap_arch = CS_ARCH_X86,
-        .cap_mode_for_target = cap_mode_x86,
         .flags_to_metaflags = x86_flags_to_metaflags,
         .canonicalize_addr = x86_canonicalize_addr,
         .marker_encode_seq = cst_marker_x86_encode_seq_imm,
@@ -659,8 +655,6 @@ const IsaProperties isa_properties[] = {
     [TRACE_ISA_AARCH64] = {
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_aarch64,
-        .cap_arch = CS_ARCH_AARCH64,
-        .cap_mode_for_target = cap_mode_aarch64,
         .reg_alias_inserter = insert_aarch64_reg_aliases,
         .flags_to_metaflags = aarch64_flags_to_metaflags,
         .canonicalize_addr = aarch64_canonicalize_addr,
@@ -683,8 +677,6 @@ const IsaProperties isa_properties[] = {
          * slot. */
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_riscv,
-        .cap_arch = CS_ARCH_RISCV,
-        .cap_mode_for_target = cap_mode_riscv,
         .canonicalize_addr = riscv_canonicalize_addr,
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
@@ -701,8 +693,6 @@ const IsaProperties isa_properties[] = {
          * by probe_implicit_acc.) */
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_mips,
-        .cap_arch = CS_ARCH_MIPS,
-        .cap_mode_for_target = cap_mode_mips,
         .canonicalize_addr = mips_canonicalize_addr,
         /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
         .has_be_variant = true,

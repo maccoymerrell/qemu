@@ -3159,8 +3159,6 @@ static uint64_t simpoint_interval_insns = 100000000ULL;
 /* ========================= Decode / ISA ========================= */
 
 TraceISA trace_isa = TRACE_ISA_UNKNOWN;
-int cst_cap_arch = -1;
-unsigned int cst_cap_mode;
 bool target_big_endian = false;
 
 static_assert(TRACE_ISA_MIPS < 256,
@@ -3182,19 +3180,6 @@ unsigned active_reg_table_size;
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
-
-    /*
-     * Resolve cap_mode lazily on first vCPU init: the per-ISA mode
-     * resolvers may call qemu_plugin_path_to_binary(), which needs a
-     * live vCPU context.
-     */
-    if (cst_cap_arch >= 0 && cst_cap_mode == 0
-            && trace_isa != TRACE_ISA_UNKNOWN) {
-        const IsaProperties *p = &isa_properties[trace_isa];
-        if (p->cap_mode_for_target) {
-            cst_cap_mode = p->cap_mode_for_target(target_name);
-        }
-    }
 
     if (g_features.reg_data) {
         g_reg_handle_cache.ensure_initialized(cpu_index);
@@ -10632,7 +10617,6 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
             memcpy(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
                    raw_bytes, MAX_INSN_BYTES);
 
-#ifdef CST_CAPTURE
             /*
              * THE SECOND DECODER, and the only thing left that asks it
              * anything.
@@ -10644,18 +10628,16 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
              * draws its boundaries on QEMU's decode rule.  What survives is
              * one column of the comparison corpus -- the mnemonic the other
              * decoder printed -- which is apparatus and belongs in a build
-             * configured for apparatus.  A release object does not make this
-             * call at all.
+             * configured for apparatus.
+             *
+             * It compiles to nothing in a release build, like the three
+             * capture calls below it, and the arch/mode pair it needs lives
+             * with it on the capture side: the shipped plugin does not link
+             * Capstone at all.
              */
-            if (cst_cap_arch >= 0) {
-                qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode,
-                                       &insn_bytes[(size_t)out *
-                                                   MAX_INSN_BYTES],
-                                       insn_sizes[out],
-                                       insn_pcs[out],
-                                       &insn_info[out]);
-            }
-#endif
+            cst_capture_cap_decode(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
+                                   insn_sizes[out], insn_pcs[out],
+                                   &insn_info[out]);
 
             /*
              * The comparison capture's second call site, here because this is
@@ -11591,21 +11573,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * The MIPS encoding is little-endian — mipsel only, matching the
      * supported targets. */
     marker_seq_init();
-
-    /*
-     * Map ISA to Capstone arch/mode.  arch is determined by
-     * target_name and set here; the mode resolver may introspect the
-     * guest binary via qemu_plugin_path_to_binary() (live-vCPU only),
-     * so cap_mode is deferred to the first vcpu_init_cb.
-     */
-    if (trace_isa != TRACE_ISA_UNKNOWN) {
-        const IsaProperties *p = &isa_properties[trace_isa];
-        cst_cap_arch = p->cap_arch;
-        cst_cap_mode = 0;  /* deferred — resolved in vcpu_init_cb */
-    } else {
-        cst_cap_arch = -1;
-        cst_cap_mode = 0;
-    }
 
     /* Best-effort capture of the full QEMU command line. */
     {

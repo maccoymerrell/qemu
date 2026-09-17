@@ -58,6 +58,7 @@ static const char *const riscv_vec_regnames[] = {
     "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
     "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
 };
+static void riscv_df_declare_vecfile(uint32_t vlenb);
 static TCGv_i64 cpu_fpr[32]; /* assume F and D extensions */
 static TCGv load_res;
 static TCGv load_val;
@@ -1410,6 +1411,7 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->misa_ext = env->misa_ext;
     ctx->frm = -1;  /* unknown rounding mode */
     ctx->cfg_ptr = &(cpu->cfg);
+    riscv_df_declare_vecfile(cpu->cfg.vlenb);
     ctx->vill = FIELD_EX32(tb_flags, TB_FLAGS, VILL);
     ctx->sew = FIELD_EX32(tb_flags, TB_FLAGS, SEW);
     ctx->lmul = sextract32(FIELD_EX32(tb_flags, TB_FLAGS, LMUL), 0, 3);
@@ -1583,23 +1585,63 @@ void riscv_translate_init(void)
                              "load_val");
 
     /*
-     * The vector file, which lives in CPURISCVState and no TCG global names.
-     *
-     * vreg is one flat array of 64-bit words rather than an array of
-     * registers, so the stride is computed from the width a register occupies
-     * in it -- the whole array over 32 -- which is what makes an access at any
-     * element size land on the right vN.  The extent is the same: a vector
-     * register's storage here is RV_VLEN_MAX bits however small vl is at the
-     * time, and the declaration describes the storage.
+     * The vector file is NOT declared here.  Its stride is the configured
+     * vlenb, which this function -- called once, before any CPU is on the
+     * CPU list -- cannot see.  riscv_df_declare_vecfile() does it from the
+     * first translation instead, where cpu->cfg is in hand.
      */
-    {
-        CPURISCVState *e = NULL;
-        uint32_t per_reg = sizeof(e->vreg) / ARRAY_SIZE(riscv_vec_regnames);
+}
 
-        QEMU_BUILD_BUG_ON(sizeof(((CPURISCVState *)0)->vreg) % 32 != 0);
-        insn_dataflow_declare_regfile(riscv_vec_regnames,
-                                      ARRAY_SIZE(riscv_vec_regnames),
-                                      offsetof(CPURISCVState, vreg),
-                                      per_reg, per_reg);
+/*
+ * Declare the vector file to the dataflow layer.
+ *
+ * vreg is one flat array of 64-bit words rather than an array of registers,
+ * and the stride a decode site actually indexes it by is vreg_ofs()'s:
+ * @vlenb, the CONFIGURED vector register width in bytes.  It is NOT
+ * sizeof(vreg)/32, which is RV_VLEN_MAX/8 -- the width the array reserves
+ * for the largest vlen the build can be configured for.  On a CPU whose
+ * vlenb is smaller than that maximum the two disagree, the declared extent
+ * swallows its neighbours, and insn_dataflow_field_reg()'s rel/stride lands
+ * every one of them on a lower-numbered register: at the default vlenb of
+ * 16 against a reserved 128, v0..v7 all answer "v0".
+ *
+ * The extent is vlenb for the same reason.  A vector register's live storage
+ * is vlenb bytes; the rest of its reserved slot is not part of it, and
+ * declaring it as such is what made the containment test accept an access to
+ * the NEXT register as an access inside this one.
+ *
+ * Called from riscv_tr_init_disas_context(), the first place cpu->cfg is
+ * reachable.  One declaration for the machine: every vCPU in it shares the
+ * vector configuration, and the compare-and-swap makes concurrent
+ * translation threads agree on who does it.
+ */
+static void riscv_df_declare_vecfile(uint32_t vlenb)
+{
+    static uint32_t declared_vlenb;
+    uint32_t prev;
+
+    if (vlenb == 0) {
+        return;
     }
+    prev = qatomic_cmpxchg(&declared_vlenb, 0, vlenb);
+    if (prev != 0) {
+        /*
+         * Already declared.  A second machine with a different vlenb in the
+         * same process would need a second declaration this table has no way
+         * to carry, so say so rather than let the first one answer for both.
+         */
+        if (prev != vlenb) {
+            warn_report_once("champsim dataflow: vector file declared at "
+                             "vlenb=%u, this CPU has vlenb=%u; vector "
+                             "register names are the first machine's",
+                             prev, vlenb);
+        }
+        return;
+    }
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPURISCVState *)0)->vreg) % 32 != 0);
+    insn_dataflow_declare_regfile(riscv_vec_regnames,
+                                  ARRAY_SIZE(riscv_vec_regnames),
+                                  offsetof(CPURISCVState, vreg),
+                                  vlenb, vlenb);
 }

@@ -206,13 +206,77 @@ def read_rulings(path):
     return out
 
 
-def join_rulings(isa, s, rulings, out):
-    """Report UNRULED classes and DEAD rulings for one ISA.
+GENERIC_IDS_H = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..",
+    "champsim_tracer_generic_ids.h")
 
-    A class with REAL-LOST rows and no ruling is UNRULED.  A ruling whose
-    class has no rows in THIS corpus is DEAD -- the same discipline the gap
-    report uses, and for the same reason: an arbitration nothing can reach
-    has stopped being checked by anything.
+
+def name_universe(path=None):
+    """Every generic register name this BUILD's vocabulary can spell.
+
+    THE DEAD COLUMN IS NOT A QUESTION ABOUT THE SAMPLE, and asking it of
+    the sample was the same defect the gap report already had fixed.  A
+    class with no rows in THESE corpora is a fact about the corpora:
+    aarch64 and riscv64 REG_ZERO w flipped from a live class to an empty
+    one at 22cf161b5f without the ruling, the decoder or the wire moving
+    -- the scorer had simply stopped mis-spelling the name.  Condemning
+    the arbitration for that would retire a reading that is still correct
+    and still reachable.
+
+    The subject a sample cannot move is the VOCABULARY: the names
+    champsim_tracer_generic_ids.h defines.  A ruling naming one of them is
+    RESERVED when this corpus did not reach it -- written ahead of the
+    encodings that need it.  Only a ruling naming a register this build
+    can no longer spell at all is DEAD.
+    """
+    p = path or GENERIC_IDS_H
+    if not os.path.exists(p):
+        raise Refusal("%s: no vocabulary header -- without it the DEAD "
+                      "column would be the sample verdict again, which is "
+                      "the reading being fixed" % p)
+    #
+    # COMMENTS ARE STRIPPED FIRST, and that is load-bearing: the header's
+    # own prose NAMES the identifiers it retired (REG_DSPCTRL, REG_VSTART,
+    # REG_VCSR) to explain why they are gone.  Scraping the file as flat
+    # text would put a deleted register back in the vocabulary and let a
+    # ruling about it read RESERVED forever.
+    #
+    src = open(p, errors="replace").read()
+    out = []
+    i = 0
+    while True:
+        j = src.find("/*", i)
+        if j < 0:
+            out.append(src[i:])
+            break
+        out.append(src[i:j])
+        k = src.find("*/", j + 2)
+        if k < 0:
+            break
+        i = k + 2
+    body = "".join(out)
+
+    names = set()
+    for tok in body.replace(",", " ").replace("=", " ").split():
+        if tok.startswith("REG_") and tok.replace("_", "").isalnum():
+            names.add(tok)
+    names.discard("REG_ID_COUNT")   # the sentinel, not a register
+    names.discard("REG_NONE")       # the absence of one
+    if len(names) < 32:
+        raise Refusal("%s: parsed only %d register names; a universe that "
+                      "small is a parse failure, not a small vocabulary"
+                      % (p, len(names)))
+    return names
+
+
+def join_rulings(isa, s, rulings, out, universe=None):
+    """Report UNRULED classes and the disposition of every ruling.
+
+    A class with REAL-LOST rows and no ruling is UNRULED.  In the other
+    direction a ruling this corpus did not reach is RESERVED when its
+    register name is one the build's vocabulary still has, and DEAD only
+    when the name is gone -- see name_universe() for why the sample is the
+    wrong subject for that question.  Only DEAD fails.
     """
     live = set()
     unruled = []
@@ -225,23 +289,34 @@ def join_rulings(isa, s, rulings, out):
         else:
             unruled.append((nm, direction, n))
 
-    dead = [k for k in rulings if k[0] == isa and k not in live]
+    unreached = [k for k in rulings if k[0] == isa and k not in live]
+    if universe is None:
+        reserved, dead = [], unreached
+    else:
+        reserved = [k for k in unreached if k[1] in universe]
+        dead = [k for k in unreached if k[1] not in universe]
 
     kinds = collections.Counter(rulings[k][0] for k in live)
-    print("   -- arbitration: %d classes live, %s; %d UNRULED, %d DEAD"
+    print("   -- arbitration: %d classes live, %s; %d UNRULED, "
+          "%d RESERVED, %d DEAD"
           % (len(live),
              ", ".join("%s %d" % (v, n) for v, n in sorted(kinds.items()))
              or "none",
-             len(unruled), len(dead)), file=out)
+             len(unruled), len(reserved), len(dead)), file=out)
     for nm, direction, n in unruled[:20]:
         print("      UNRULED %8d  %s %s" % (n, nm, direction), file=out)
-    for k in sorted(dead)[:20]:
-        print("      DEAD        %s %s  (%s)"
+    for k in sorted(reserved)[:20]:
+        print("      RESERVED    %s %s  (%s) -- the name is in this build's "
+              "vocabulary; this corpus did not reach the class"
               % (k[1], k[2], rulings[k][0]), file=out)
+    for k in sorted(dead)[:20]:
+        print("      DEAD        %s %s  (%s) -- no such register name in "
+              "this build" % (k[1], k[2], rulings[k][0]), file=out)
     return unruled, dead
 
 
-def report(isa, path, top, out, strict=True, rulings=None):
+def report(isa, path, top, out, strict=True, rulings=None,
+           universe=None):
     stamp, rows = read_gen(path)
     s = score(rows, strict)
 
@@ -269,7 +344,8 @@ def report(isa, path, top, out, strict=True, rulings=None):
                   file=out)
 
     if rulings is not None:
-        s["unruled"], s["dead"] = join_rulings(isa, s, rulings, out)
+        s["unruled"], s["dead"] = join_rulings(isa, s, rulings, out,
+                                               universe)
     return s
 
 
@@ -380,7 +456,7 @@ def ruling_selftest():
             f.write("q\t02\tq\tw\t1\t1\tREG_GPR0\n")
             f.write("q\t02\tc\tw\t2\t2\tREG_GPR0,REG_VEC1\n")
 
-        def run(rows):
+        def run(rows, universe=None):
             rp = os.path.join(d, "r.tsv")
             with open(rp, "w") as f:
                 f.write("# planted\n")
@@ -388,7 +464,8 @@ def ruling_selftest():
                     f.write("\t".join(r) + "\n")
             sink = open(os.devnull, "w")
             try:
-                st = report("q", corpus, 0, sink, rulings=read_rulings(rp))
+                st = report("q", corpus, 0, sink, rulings=read_rulings(rp),
+                            universe=universe)
                 return len(st["unruled"]), len(st["dead"])
             finally:
                 sink.close()
@@ -398,7 +475,7 @@ def ruling_selftest():
         cases = [
             ("both classes ruled: neither unruled nor dead", [FL, V1], (0, 0)),
             ("an UNRULED class FIRES", [FL], (1, 0)),
-            ("a ruling whose class this corpus cannot reach is DEAD",
+            ("with no universe, an unreached ruling is DEAD",
              [FL, V1, ("q", "REG_VEC9", "w", "REAL", "COVERAGE-PATH",
                        "x", "y")], (0, 1)),
             ("the DIRECTION is part of the key: a w ruling does not cover "
@@ -411,6 +488,44 @@ def ruling_selftest():
             ok = got == want
             print("  %-58s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
             bad += 0 if ok else 1
+
+        #
+        # The RESERVED/DEAD split, both directions, against a planted
+        # vocabulary.  A name the build still has is RESERVED (0 dead); a
+        # name it does not have is DEAD (1 dead).  Without both arms the
+        # split is an assertion.
+        #
+        UNREACHED = ("q", "REG_VEC9", "w", "REAL", "COVERAGE-PATH", "x", "y")
+        GONE = ("q", "REG_DSPCTRL", "w", "REAL", "COVERAGE-PATH", "x", "y")
+        uni = {"REG_FLAGS", "REG_VEC1", "REG_VEC9"}
+        for name, rows, want in (
+                ("a ruling the build can still spell is RESERVED, not DEAD",
+                 [FL, V1, UNREACHED], (0, 0)),
+                ("a ruling naming a RETIRED register is DEAD",
+                 [FL, V1, GONE], (0, 1))):
+            got = run(rows, universe=uni)
+            ok = got == want
+            print("  %-58s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
+            bad += 0 if ok else 1
+
+        # and the vocabulary reader itself must refuse rather than return a
+        # short set that would mark live rulings DEAD
+        vp = os.path.join(d, "tiny.h")
+        open(vp, "w").write("enum { REG_ZERO = 1, REG_SP = 2 };\n")
+        try:
+            name_universe(vp)
+            print("  %-58s FAILED (returned)"
+                  % "a too-small vocabulary REFUSES")
+            bad += 1
+        except Refusal:
+            print("  %-58s ok" % "a too-small vocabulary REFUSES")
+        try:
+            name_universe(os.path.join(d, "absent.h"))
+            print("  %-58s FAILED (returned)"
+                  % "an absent vocabulary header REFUSES")
+            bad += 1
+        except Refusal:
+            print("  %-58s ok" % "an absent vocabulary header REFUSES")
 
         # a rulings file that is not there must REFUSE, not read as empty
         try:
@@ -429,8 +544,8 @@ def ruling_selftest():
         except Refusal:
             print("  %-58s ok" % "an empty rulings file REFUSES")
 
-    print("setjoin ruling-join selftest: %d of 6 arms fired as designed"
-          % (6 - bad))
+    print("setjoin ruling-join selftest: %d of 10 arms fired as designed"
+          % (10 - bad))
     return 1 if bad else 0
 
 
@@ -446,6 +561,10 @@ def main():
                     help="fail unless REAL-LOST is 0 on every scored ISA")
     ap.add_argument("--rulings", default=None,
                     help="the checked-in REAL-LOST arbitrations to join against")
+    ap.add_argument("--name-universe", default=None,
+                    help="champsim_tracer_generic_ids.h of the build whose "
+                         "vocabulary decides RESERVED from DEAD "
+                         "(default: this tree's)")
     ap.add_argument("--require-ruled", action="store_true",
                     help="fail unless every surviving REAL-LOST class is "
                          "arbitrated, and unless every arbitration still has "
@@ -458,6 +577,14 @@ def main():
         print("setjoin: --dir and at least one --isa are required",
               file=sys.stderr)
         return 2
+
+    universe = None
+    if args.require_ruled:
+        try:
+            universe = name_universe(args.name_universe)
+        except Refusal as e:
+            print("setjoin: REFUSED: %s" % e, file=sys.stderr)
+            return 2
 
     rulings = None
     if args.rulings or args.require_ruled:
@@ -474,7 +601,8 @@ def main():
     for isa in args.isa:
         try:
             s = report(isa, os.path.join(args.dir, "gen_%s.tsv" % isa),
-                       args.top, sys.stdout, rulings=rulings)
+                       args.top, sys.stdout, rulings=rulings,
+                       universe=universe)
         except Refusal as e:
             print("setjoin: REFUSED: %s" % e, file=sys.stderr)
             bad += 1
@@ -492,8 +620,8 @@ def main():
                          sum(n for _, _, n in s["unruled"])), file=sys.stderr)
                 bad += 1
             if s.get("dead"):
-                print("setjoin: %s: %d arbitrations name a class this corpus "
-                      "cannot reach, required 0"
+                print("setjoin: %s: %d arbitrations name a register this "
+                      "build cannot spell at all, required 0"
                       % (isa, len(s["dead"])), file=sys.stderr)
                 bad += 1
 

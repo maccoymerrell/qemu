@@ -9640,7 +9640,32 @@ static void split_tb_into_fragments(const struct qemu_plugin_tb *tb,
             qemu_plugin_insn_decode_word(tb, canonical_raw[ci]);
 
         if (!cst_vocabulary_lookup(word, &opcode, &bt)) {
-            return BRANCH_NONE;
+            bt = BRANCH_NONE;
+        }
+        /*
+         * A self-looping instruction terminates its fragment, and the word
+         * does not say so: the vocabulary has no generic term for "repeats
+         * until a register runs out", because that is not an operation --
+         * it is a property of how the emulation performs one.  QEMU states
+         * it separately, and the template's classification reads it from
+         * exactly here (champsim_tracer_qdep.cc, the self_loop_memops
+         * branch), which is why the splitter has to read the same statement:
+         * the two would otherwise disagree about what ended the block, and
+         * the whole fan-out contract (:ref:`fanout-self-loop-bbs`) rests on
+         * the true BB ending AT the fan-out instruction.
+         *
+         * The precedence is the template's: a word that already named a
+         * transfer wins, so a REP-prefixed branch stays the branch it is.
+         */
+        if (bt == BRANCH_NONE) {
+            qemu_plugin_dataflow_status st;
+
+            memset(&st, 0, sizeof(st));
+            st.struct_size = sizeof(st);
+            if (qemu_plugin_insn_dataflow_status(tb, canonical_raw[ci], &st)
+                && st.self_loop_memops != 0) {
+                bt = BRANCH_REP;
+            }
         }
         return bt;
     };

@@ -1235,9 +1235,14 @@ _register_probe('probe_exact_load_rm', {
                                 dst_deps=[["load_data[0]"]])]},
 })
 
-# Plain register-base + zero-offset store.  Walker operand order
-# across all four ISAs is REG-src first, MEM-base added second, so
-# src_regs[] = [VALUE, BASE].  store_addr_deps points at index 1
+# Plain register-base + zero-offset store.
+#
+# THE ROLES ARE NAMED, NOT INDEXED.  src_regs[] is the coordinate system the
+# dep masks index by bit position; it is NOT promised to be the ISA's textual
+# operand order, and it is not: riscv64's compressed `c.sdsp` seats
+# [REG_SP, REG_GPR5] while the other three seat the value first.  The old
+# positional form asserted [VALUE, BASE] everywhere and failed riscv64 on a
+# wire that was right -- the same shape #224 corrected once already.  store_addr_deps points at index 1
 # (the base); store_data_deps points at index 0 (the value).
 _register_probe('probe_exact_store_rm', {
     'x86_64':  {'asm': '"movq %%rax, (%%rsp)"', 'clobbers': '"memory"',
@@ -1245,29 +1250,29 @@ _register_probe('probe_exact_store_rm', {
                 'insns': [_insn("MOV", branch_type="NONE",
                                 src=["REG_GPR0", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR0"]])]},
     'aarch64': {'asm': '"str x0, [sp]"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR0", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR0"]])]},
     'riscv64': {'asm': '"sd t0, 0(sp)"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR5", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR5"]])]},
     'mipsel':  {'asm': '"sw $t0, 0($sp)"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR8", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR8"]])]},
 })
 
 # ============================================================================
@@ -1327,14 +1332,17 @@ _register_probe('probe_x86_rmw_direction', {'x86_64': {
         _insn("GEN_OP_INT_ADD",
               src=["REG_GPR0", "REG_SP"],
               dst=["REG_FLAGS"],
-              load_addr_deps=[["src_reg[1]"]],
-              store_addr_deps=[["src_reg[1]"]]),
-        # Load form: the MEM base walks first, so SP is src_reg[0]
-        # (the store form above walks the value reg first).
+              load_addr_deps=[["REG_SP"]],
+              store_addr_deps=[["REG_SP"]]),
+        # Load form.  THE BASE IS NAMED, NOT INDEXED: the comment that stood
+        # here said "the MEM base walks first, so SP is src_reg[0]", which was
+        # the Capstone operand walk's order and stopped being true when the
+        # source list became QEMU's -- both forms now seat [REG_GPR0, REG_SP]
+        # and the load's address is SP wherever the seating puts it.
         _insn("GEN_OP_INT_ADD",
               src=["REG_GPR0", "REG_SP"],
               dst=["REG_GPR0", "REG_FLAGS"],
-              load_addr_deps=[["src_reg[0]"]],
+              load_addr_deps=[["REG_SP"]],
               store_addr_deps=[],
               store_data_deps=[]),
     ]}})

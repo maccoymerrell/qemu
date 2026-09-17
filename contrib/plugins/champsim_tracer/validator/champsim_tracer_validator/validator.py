@@ -2285,14 +2285,30 @@ def _reconstruct_insn_flags(ins: dict,
 
 def _resolve_dep_input_bit(name: str, n_src: int,
                            max_dep_loads: int,
-                           layout: str) -> int | None:
-    """Map an author dep-input name (\"src_reg[i]\", \"load_data[k]\",
-    \"imm\") to its bit position inside a dep mask.  @layout selects
-    the bit shape — REG-mask layouts (dst_dep / store_data_dep)
-    include the load_data range; ADDR-mask layouts (load_addr_dep /
-    store_addr_dep) omit it because addresses compute before any
-    load fires.  Returns None on unknown names so the caller can
-    surface a "typo in spec" error."""
+                           layout: str,
+                           src_names: list[str] | None = None) -> int | None:
+    """Map an author dep-input name (\"src_reg[i]\", \"REG_SP\",
+    \"load_data[k]\", \"imm\") to its bit position inside a dep mask.
+    @layout selects the bit shape — REG-mask layouts (dst_dep /
+    store_data_dep) include the load_data range; ADDR-mask layouts
+    (load_addr_dep / store_addr_dep) omit it because addresses compute
+    before any load fires.  Returns None on unknown names so the caller
+    can surface a "typo in spec" error.
+
+    A REG_* NAME SAYS THE ROLE; AN INDEX SAYS THE SEAT.  src_regs[] is the
+    coordinate system the masks index by position, and the spec nowhere
+    promises that position is the ISA's textual operand order -- riscv64's
+    compressed `c.sdsp` seats [REG_SP, REG_GPR5] where the uncompressed
+    stores seat the value first.  An author who writes src_reg[0] is
+    asserting a seating; one who writes REG_SP is asserting the dependency,
+    which is what the check is for.  Both are accepted, and the name form
+    resolves through the trace's own list so a re-seating cannot make a
+    correct declaration read as a wire defect (#224's shape)."""
+    if src_names and name.startswith("REG_"):
+        try:
+            return src_names.index(name)
+        except ValueError:
+            return None
     if name == "imm":
         if layout == "reg":
             return n_src + max_dep_loads
@@ -2311,7 +2327,8 @@ def _resolve_dep_input_bit(name: str, n_src: int,
 
 
 def _names_to_dep_mask(names: list[str], n_src: int,
-                       max_dep_loads: int, layout: str
+                       max_dep_loads: int, layout: str,
+                       src_names: list[str] | None = None
                        ) -> tuple[int, list[str]]:
     """Build a dep-mask integer from a list of input-name strings.
     Returns (mask, unknown_names).  Unknown names are surfaced so the
@@ -2319,7 +2336,8 @@ def _names_to_dep_mask(names: list[str], n_src: int,
     mask = 0
     unknown: list[str] = []
     for n in names:
-        bit = _resolve_dep_input_bit(n, n_src, max_dep_loads, layout)
+        bit = _resolve_dep_input_bit(n, n_src, max_dep_loads, layout,
+                                     src_names)
         if bit is None:
             unknown.append(n)
         else:
@@ -2572,7 +2590,9 @@ def _check_expected_insns(
                                  "flags": flags})
 
                 # --- dependency masks ---
-                n_src = len(ins.get("src_regs") or [])
+                src_names = [reg_id_to_name.get(int(r), str(r))
+                             for r in (ins.get("src_regs") or [])]
+                n_src = len(src_names)
                 n_dst = len(ins.get("dst_regs") or [])
                 mdl   = int(ins.get("n_loads", 0))
                 for field, wire_field, per_count, layout in (
@@ -2618,7 +2638,7 @@ def _check_expected_insns(
                             continue
                     for j, names in enumerate(declared):
                         exp_mask, unknown = _names_to_dep_mask(
-                            names or [], n_src, mdl, layout)
+                            names or [], n_src, mdl, layout, src_names)
                         if unknown:
                             err("dep_input_name",
                                 f"blk_{bid} insn #{idx}: {field}[{j}] "

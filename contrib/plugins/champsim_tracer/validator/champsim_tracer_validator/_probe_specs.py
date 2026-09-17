@@ -633,8 +633,23 @@ _register_probe('probe_rv_v0_carry_mask', {
         # vmerge write full vectors, whose tail policy is a runtime CSR
         # the instruction word cannot decide, so they do not.
         'reg_sets': [
-            {'src': ['REG_ZERO'],
-             'dst': ['REG_GPR5', 'REG_VCTRL']},                 # vsetvli
+            # vsetvli t0, zero, e64, m1, ta, ma
+            #
+            # NO SOURCE.  `rs1 = x0' is an ENCODING in RVV v1.0 (§6.1), not a
+            # read of x0: do_vsetvl() takes the rs1 == 0 branch, builds a
+            # constant and never calls get_gpr().  The earlier declaration of
+            # REG_ZERO here was the probe's error, not the wire's.
+            #
+            # REG_IP IS A DESTINATION, per RULING 210-J (see
+            # docs/limitations.rst, "A translator-forced TB exit"):  vsetvl
+            # must end the translation block, so QEMU emits gen_update_pc() +
+            # lookup_and_goto_ptr() INSIDE this instruction's dataflow window.
+            # Every instruction advances the PC architecturally; QEMU
+            # materialises that advance only where control must leave the TB,
+            # so the wire UNDER-reports the PC destination elsewhere and never
+            # reports one the machine does not perform.
+            {'src': [],
+             'dst': ['REG_GPR5', 'REG_IP', 'REG_VCTRL']},       # vsetvli
             {'src': ['REG_VEC5', 'REG_VEC6', 'REG_VCTRL', 'REG_VEC0'],
              'dst': ['REG_VEC4']},                              # vadc.vvm
             {'src': ['REG_VEC8', 'REG_VEC9', 'REG_VCTRL', 'REG_VEC0'],

@@ -1966,7 +1966,15 @@ class IndirectJump(CodeBlock):
                 "  br x9",
             ]
         elif ctx.isa == "riscv64":
-            lines += [f"  la t0, {target}", "  jr t0"]
+            # t1 (x6), NOT t0.  t0 IS x5, and RISC-V makes `jalr x0, x5' a
+            # RETURN, not an indirect jump: the return-address-prediction
+            # convention (Unprivileged ISA v20191213 §2.5.1, Table 2.1) pops
+            # the return-address stack when rd is not a link register and rs1
+            # is x1 or x5, and QEMU implements exactly that rule at
+            # target/riscv/insn_trans/trans_rvi.c.inc:161.  The block wants an
+            # indirect jump, so it must not hold its target in a link
+            # register.
+            lines += [f"  la t1, {target}", "  jr t1"]
         else:
             lines += [
                 f"  lui $t9, %hi({target})",

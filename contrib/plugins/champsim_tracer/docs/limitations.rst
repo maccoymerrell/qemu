@@ -963,3 +963,47 @@ correct-path self-modifying code, which mints a byte-distinct
 code** above); those revisions are still deterministic — one per
 distinct executed state — and are distinguished on the wire by
 ``template_id``, not by ``start_pc``.
+
+.. _translator-forced-tb-exit:
+
+A translator-forced TB exit writes the PC, and the wire says so
+--------------------------------------------------------------
+
+A handful of instructions force the translation block to end
+because what follows must be translated under the new state they
+install: RISC-V ``vsetvl`` / ``vsetvli`` / ``vsetivli`` (the vector
+configuration decides which helper every later vector instruction
+picks), ``fence.i`` and ``sfence.vma``.  At those decode sites QEMU
+emits the block epilogue — ``gen_update_pc()`` followed by
+``lookup_and_goto_ptr()`` — *inside* the instruction's own dataflow
+window, so the store to the PC is attributed to the instruction and
+reaches the wire as a destination.
+
+An ordinary instruction that happens to sit at the end of a block
+gets the same store from ``riscv_tr_tb_stop()``, which runs outside
+any instruction's window and is charged to none.
+
+**The wire keeps the write.**  Every instruction advances the PC
+architecturally; QEMU materialises that advance only where control
+must leave the block.  So the trace *under-reports* the PC
+destination in general and reports it exactly where the emulation
+performs it — it never names a PC write the machine does not
+perform, which is the direction that would be a fabrication.
+
+The alternative was to bracket the epilogue out of the window at
+every forced-exit site.  It was rejected on cost: it buys a wire
+that denies a store QEMU executes, it needs suppression machinery
+threaded through every such site on every target, and a suppression
+that is one predicate too wide silently deletes the PC destination
+of a genuine jump or branch — a real loss, to remove a statement
+that is true.
+
+**What a consumer must not read into it.**  Whether an instruction
+names the PC as a destination is a fact about where QEMU placed the
+block epilogue, not a property of the encoding.  A consumer that
+partitions instructions into "writes the PC" and "does not" on this
+evidence is reading QEMU's block-splitting policy.  The
+non-uniformity composes with the one recorded under
+**Architectural PC destinations** — riscv64 and mipsel carry no
+architectural PC destination of their own — and neither is a
+statement about the guest architecture.

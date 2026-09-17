@@ -111,18 +111,19 @@ static void append_unsealed_at_close(GString *report)
  * Where each generic register's VALUE-READ route came from.
  *
  * build_qemu_reg_reverse_index() fills the GenericRegId -> QemuRegKey map
- * from two sources in order: the generated gdbstub table (regmap/<isa>.gdb.tsv,
- * derived from the target's own CORE feature XML) first, then the per-ISA
- * register-classification table for any id the first source left without a
- * route.  Only the counts existed; this reads them, and names the individual
- * registers the second source supplied so the surviving routes can be
- * re-homed one by one rather than argued about as a total.
+ * from the generated gdbstub table (regmap/<isa>.gdb.tsv, derived from the
+ * register files the target declares).  It used to fall back to the per-ISA
+ * register-classification table for any id that table left unrouted, and
+ * that fallback is what had to read 0 before the classification tables could
+ * be removed: while it reads 0 the table supplies no value-read route on this
+ * target, so deleting it cannot change a published register value.
  *
- * The second row is the one the register table's removal turns on: while it
- * reads 0 the table supplies no value-read route on this target, so deleting
- * it cannot change a published register value.  The row is printed on every
- * run, including when it is zero, because a row that only appears when it is
- * non-zero cannot be quoted as a measured zero.
+ * It read 0 live on all four targets, the fallback was removed with the
+ * tables, and the row is STILL PRINTED -- as is the per-register enumeration
+ * behind it, which now cannot fire.  A zero that stops being printed stops
+ * being a measurement, and the number it replaced (122 routes when the column
+ * was first read, 49 after the generator's first widening) is only readable
+ * next to a row that is still there.
  */
 static void append_reg_route_census(GString *report)
 {
@@ -135,7 +136,8 @@ static void append_reg_route_census(GString *report)
     g_string_append_printf(report,
         "Generic-register value-read routes (install-time):\n"
         "  from the generated gdbstub table %14u\n"
-        "  from the per-ISA register table  %14u   (must be 0)\n"
+        "  from the per-ISA register table  %14u   (source removed;"
+        " must be 0)\n"
         "  no route (no value read possible)%14u\n"
         "  generic register ids             %14u\n",
         g_qemu_reg_routes_from_gdbmap,

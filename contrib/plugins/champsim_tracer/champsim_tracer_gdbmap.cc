@@ -26,6 +26,7 @@
 
 #include "champsim_tracer_generic_ids.h"
 #include "champsim_tracer_regmap.h"
+#include "champsim_tracer.h"
 
 namespace {
 
@@ -135,3 +136,79 @@ unsigned cst_gdbmap_size(unsigned isa)
     return isa < n_gdb_tables ? gdb_tables[isa].n : 0;
 }
 
+/* ==================================================================
+ * The value-read reverse index: GenericRegId -> the (feature, name) pair
+ * a value read goes through.  It lives here because this file owns the
+ * namespace it is built from.
+ * ================================================================== */
+
+/*
+ * Reverse index GenericRegId → QemuRegKey, built once at install by
+ * walking active_reg_table.  Recovers the per-element QemuRegKey for
+ * multi-reg encodings (RISC-V V*M* tuples) so each constituent reg's
+ * value is captured under regdata=1 — without it multi-reg operands
+ * land in src/dst correctly but their values aren't read (the multi-reg
+ * path passed nullptr for the QemuRegKey).
+ */
+static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
+
+unsigned g_qemu_reg_routes_from_gdbmap;
+/*
+ * Kept, and permanently zero: the second source it counted is gone.  See
+ * build_qemu_reg_reverse_index() -- the census prints this column so the
+ * zero has its comparand beside it rather than vanishing from the report.
+ */
+unsigned g_qemu_reg_routes_from_reg_table;
+uint8_t g_qemu_reg_route_src[REG_ID_COUNT];
+
+void build_qemu_reg_reverse_index(void)
+{
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        g_qemu_reg_by_gen[i] = QemuRegKey{};
+        g_qemu_reg_route_src[i] = CST_REG_ROUTE_NONE;
+    }
+    g_qemu_reg_routes_from_gdbmap = 0;
+    g_qemu_reg_routes_from_reg_table = 0;
+
+    /*
+     * THE GENERATED gdbstub TABLE IS THE ONLY SOURCE.
+     *
+     * This index answers "which descriptor do I read for this generic
+     * register", and qemu_plugin_get_registers() publishes exactly the
+     * (feature, name) pairs the target's gdbstub declares.  The table is
+     * generated from those declarations -- the feature XML the target ships,
+     * plus the two register files it builds in C -- with a both-directions
+     * refusal (scripts/cst-regmap.py --namespace gdb), so a register the
+     * target declares cannot go missing from it without failing the build.
+     *
+     * There used to be a second source behind this one: the per-ISA
+     * classification table, a Capstone-shaped structure that happened to
+     * carry a gdb key on its rows.  It supplied 122 routes when it was first
+     * counted and 0 once the generator's scope was widened to cover every
+     * register file the target declares, measured live on all four targets
+     * before this arm was removed.  Both counters are kept, and the reg-route
+     * census still prints both columns, because a zero is only readable
+     * beside the number it replaced.
+     */
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        const char *feature = nullptr;
+        const char *name = nullptr;
+        if (cst_gdbmap_value_route((unsigned)trace_isa, (uint8_t)i,
+                                   &feature, &name)) {
+            g_qemu_reg_by_gen[i].feature = feature;
+            g_qemu_reg_by_gen[i].name = name;
+            g_qemu_reg_route_src[i] = CST_REG_ROUTE_GDBMAP;
+            g_qemu_reg_routes_from_gdbmap++;
+        }
+    }
+
+}
+
+const QemuRegKey *qemu_reg_for_generic_id(uint8_t gen_id)
+{
+    if (gen_id >= REG_ID_COUNT) {
+        return nullptr;
+    }
+    const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
+    return qemu_reg_key_valid(k) ? k : nullptr;
+}

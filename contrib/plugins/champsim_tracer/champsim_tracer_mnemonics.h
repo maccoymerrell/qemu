@@ -54,6 +54,12 @@ typedef struct {
     const char *name;
 } QemuRegKey;
 
+/* A key with no name routes nowhere: the register has no value read. */
+static inline bool qemu_reg_key_valid(const QemuRegKey *key)
+{
+    return key && key->name;
+}
+
 typedef struct {
     uint8_t reg_id;                    /* GenericRegId */
     uint8_t n_regs;                    /* non-zero for composite aliases */
@@ -632,79 +638,6 @@ typedef struct {
     uint8_t               marker_seq_insns;
 } IsaProperties;
 
-#ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
-
-static const char *const isa_prefixes_x86[]     = { "x86_64", "i386", NULL };
-static const char *const isa_prefixes_aarch64[] = { "aarch64", NULL };
-static const char *const isa_prefixes_riscv[]   = { "riscv64", "riscv32", NULL };
-static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
-                                                    "mipsel", "mips", NULL };
-
-extern const IsaProperties isa_properties[];
-const IsaProperties isa_properties[] = {
-    [TRACE_ISA_UNKNOWN] = {},
-    [TRACE_ISA_X86]     = {
-        .include_implicit_regs = true,
-        .target_prefixes = isa_prefixes_x86,
-        .flags_to_metaflags = x86_flags_to_metaflags,
-        .canonicalize_addr = x86_canonicalize_addr,
-        .marker_encode_seq = cst_marker_x86_encode_seq_imm,
-        .marker_insn_bytes = CST_MARKER_X86_INSN_BYTES,
-        .marker_seq_insns  = CST_MARKER_SEQ_LEN,
-    },
-    [TRACE_ISA_AARCH64] = {
-        .include_implicit_regs = true,
-        .target_prefixes = isa_prefixes_aarch64,
-        .reg_alias_inserter = insert_aarch64_reg_aliases,
-        .flags_to_metaflags = aarch64_flags_to_metaflags,
-        .canonicalize_addr = aarch64_canonicalize_addr,
-        .marker_encode_seq = cst_marker_a64_encode_seq_imm,
-        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
-        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
-    },
-    [TRACE_ISA_RISCV]   = {
-        /* RISC-V MUST fold implicit regs too.  The vector-configuration
-         * CSRs are the reason: `vl` and `vtype` never appear in an
-         * operand field — `vsetvli` names only its GPR destination and a
-         * vector op names only its vector registers — so without the
-         * fold the edge every RVV instruction has on the `vsetvli` that
-         * configured it does not exist, and a vector kernel's ops float
-         * free of their own configuration.  The same applies to the FP
-         * rounding mode `frm` on scalar and vector FP.  The historical
-         * double-count worry is moot for the same reason it is on MIPS:
-         * add_src/dst_cap_reg dedup by generic reg id, so a register
-         * named both by an operand and by the implicit list occupies one
-         * slot. */
-        .include_implicit_regs = true,
-        .target_prefixes = isa_prefixes_riscv,
-        .canonicalize_addr = riscv_canonicalize_addr,
-        .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
-        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
-        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
-    },
-    [TRACE_ISA_MIPS]    = {
-        .branch_delay_slots = 1,
-        /* MIPS MUST fold implicit regs: the HI:LO accumulator never
-         * appears in MULT / DIV / MFHI / MFLO operand fields — only in
-         * Capstone's implicit regs_read/regs_write — so without the
-         * fold the whole accumulator dependency chain vanishes (mfhi
-         * appears input-less).  The historical double-count worry is
-         * moot: add_src/dst_cap_reg dedup by generic reg id.  (Caught
-         * by probe_implicit_acc.) */
-        .include_implicit_regs = true,
-        .target_prefixes = isa_prefixes_mips,
-        .canonicalize_addr = mips_canonicalize_addr,
-        /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
-        .has_be_variant = true,
-        .marker_encode_seq = cst_marker_mips_encode_seq_imm,
-        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
-        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
-    },
-};
-
-#else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
-
 extern const IsaProperties isa_properties[TRACE_ISA_MIPS + 1];
 
-#endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 

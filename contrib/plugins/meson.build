@@ -50,6 +50,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+      'champsim_tracer/champsim_tracer_isa_properties.cc',
       'champsim_tracer/champsim_tracer_vocabulary.cc',
       'champsim_tracer/champsim_tracer_regmap.cc',
                               'champsim_tracer/champsim_tracer_gdbmap.cc',
@@ -286,6 +287,7 @@ if get_option('plugins')
           'champsim_tracer/champsim_tracer_decode.cc',
           'champsim_tracer/champsim_tracer_capture.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+          'champsim_tracer/champsim_tracer_isa_properties.cc',
           'champsim_tracer/champsim_tracer_gdbmap.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc')
     + champsim_tracer_regmap_gen,
@@ -337,6 +339,7 @@ if get_option('plugins')
           'champsim_tracer/champsim_tracer_decode.cc',
           'champsim_tracer/champsim_tracer_capture.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+          'champsim_tracer/champsim_tracer_isa_properties.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc',
           'champsim_tracer/champsim_tracer_vocabulary.cc',
           'champsim_tracer/champsim_tracer_regmap.cc',

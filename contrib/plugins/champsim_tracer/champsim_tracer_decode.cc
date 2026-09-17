@@ -23,106 +23,6 @@ static const RegClassification *lookup_reg_class(uint16_t cap_id)
     return &active_reg_table[cap_id];
 }
 
-static inline bool qemu_reg_key_valid(const QemuRegKey *key)
-{
-    return key && key->name;
-}
-
-/*
- * Reverse index GenericRegId → QemuRegKey, built once at install by
- * walking active_reg_table.  Recovers the per-element QemuRegKey for
- * multi-reg encodings (RISC-V V*M* tuples) so each constituent reg's
- * value is captured under regdata=1 — without it multi-reg operands
- * land in src/dst correctly but their values aren't read (the multi-reg
- * path passed nullptr for the QemuRegKey).
- */
-static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
-
-unsigned g_qemu_reg_routes_from_gdbmap;
-unsigned g_qemu_reg_routes_from_reg_table;
-uint8_t g_qemu_reg_route_src[REG_ID_COUNT];
-
-void build_qemu_reg_reverse_index(void)
-{
-    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
-        g_qemu_reg_by_gen[i] = QemuRegKey{};
-        g_qemu_reg_route_src[i] = CST_REG_ROUTE_NONE;
-    }
-    g_qemu_reg_routes_from_gdbmap = 0;
-    g_qemu_reg_routes_from_reg_table = 0;
-
-    /*
-     * THE GENERATED gdbstub TABLE IS THE FIRST SOURCE, and it is the right
-     * one: this index answers "which descriptor do I read for this generic
-     * register", and qemu_plugin_get_registers() publishes exactly the
-     * (feature, name) pairs the target's gdbstub declares.  The per-ISA
-     * classification table below is a Capstone-shaped structure that happens
-     * to carry a gdb key on its rows, and it is short where Capstone's
-     * register enum is: neither its ARM64 nor its RISCV enum has a program
-     * counter, so REG_IP had NO route on those two targets and a branch's
-     * published PC destination came out width 0 with a live value beside it.
-     *
-     * The gdb table is generated from the target's own CORE feature XML with
-     * a both-directions refusal (scripts/cst-regmap.py --namespace gdb), so a
-     * register the target declares cannot be missing from it without failing
-     * the build.  Both counts are kept because a zero in either column is
-     * only readable beside the other.
-     */
-    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
-        const char *feature = nullptr;
-        const char *name = nullptr;
-        if (cst_gdbmap_value_route((unsigned)trace_isa, (uint8_t)i,
-                                   &feature, &name)) {
-            g_qemu_reg_by_gen[i].feature = feature;
-            g_qemu_reg_by_gen[i].name = name;
-            g_qemu_reg_route_src[i] = CST_REG_ROUTE_GDBMAP;
-            g_qemu_reg_routes_from_gdbmap++;
-        }
-    }
-
-    if (!active_reg_table || active_reg_table_size == 0) {
-        return;
-    }
-    for (unsigned i = 0; i < active_reg_table_size; i++) {
-        const RegClassification *rc = &active_reg_table[i];
-        if (rc->n_regs != 0) {
-            /* Multi-reg rows don't carry a singleton QemuRegKey
-             * themselves — their constituent generic IDs are
-             * supplied by other rows that have the matching
-             * .reg_id with .qemu_reg set. */
-            continue;
-        }
-        if (!qemu_reg_key_valid(&rc->qemu_reg)) {
-            continue;
-        }
-        if (rc->reg_id >= REG_ID_COUNT) {
-            continue;
-        }
-        /* First singleton row wins — Capstone aliases (x86
-         * AH/AL/AX/EAX/RAX → REG_GPR0) share one QemuRegKey; any is
-         * correct for value reads. */
-        if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
-            g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
-            g_qemu_reg_route_src[rc->reg_id] = CST_REG_ROUTE_REG_TABLE;
-            g_qemu_reg_routes_from_reg_table++;
-        }
-    }
-}
-
-static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
-{
-    if (gen_id >= REG_ID_COUNT) {
-        return nullptr;
-    }
-    const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
-    return qemu_reg_key_valid(k) ? k : nullptr;
-}
-
-const QemuRegKey *qemu_reg_for_generic_id(uint8_t gen_id)
-{
-    return qemu_reg_for_generic(gen_id);
-}
-
 void capture_initial_regfile(unsigned int cpu_index,
                              std::vector<InitialRegSnap> *out)
 {
@@ -132,7 +32,7 @@ void capture_initial_regfile(unsigned int cpu_index,
     out->clear();
     g_autoptr(GByteArray) buf = g_byte_array_new();
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
-        const QemuRegKey *key = qemu_reg_for_generic((uint8_t)i);
+        const QemuRegKey *key = qemu_reg_for_generic_id((uint8_t)i);
         if (!key) {
             continue;
         }
@@ -216,7 +116,7 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
 
 /*
  * Pointer-stable QemuRegKey identity: add_{src,dst}_reg routes through
- * qemu_reg_for_generic(), returning the g_qemu_reg_by_gen[] singleton
+ * qemu_reg_for_generic_id(), returning the g_qemu_reg_by_gen[] singleton
  * (RegClassification's own .qemu_reg may differ in address but holds an
  * identical (feature, name) pair).
  *
@@ -237,7 +137,7 @@ static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
             uint8_t gen = rc->regs[i];
             uint8_t slot = add_src_reg(f, refs, gen,
-                                       qemu_reg_for_generic(gen));
+                                       qemu_reg_for_generic_id(gen));
             if (slot < MAX_SRC_REGS) {
                 mask |= (uint64_t)1 << slot;
             }
@@ -245,7 +145,7 @@ static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
         return mask;
     }
     uint8_t slot = add_src_reg(f, refs, rc->reg_id,
-                               qemu_reg_for_generic(rc->reg_id));
+                               qemu_reg_for_generic_id(rc->reg_id));
     if (slot < MAX_SRC_REGS) {
         mask |= (uint64_t)1 << slot;
     }
@@ -262,11 +162,11 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
             uint8_t gen = rc->regs[i];
-            add_dst_reg(f, refs, gen, qemu_reg_for_generic(gen));
+            add_dst_reg(f, refs, gen, qemu_reg_for_generic_id(gen));
         }
         return;
     }
-    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
+    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic_id(rc->reg_id));
     /*
      * Mark integer-flags writer so the encoder emits a CST_FID_METAFLAGS
      * record (Z/N/C/V/P from the REG_FLAGS dst snap).  Gated on the
@@ -533,12 +433,12 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
             out->branch_type == BRANCH_INDIRECT_CALL) {
             if (out->n_dst_regs == 0) {
                 add_dst_reg(out, out_names, REG_LR,
-                            qemu_reg_for_generic(REG_LR));
+                            qemu_reg_for_generic_id(REG_LR));
             }
         } else if (out->branch_type == BRANCH_RETURN) {
             if (out->n_src_regs == 0) {
                 add_src_reg(out, out_names, REG_LR,
-                            qemu_reg_for_generic(REG_LR));
+                            qemu_reg_for_generic_id(REG_LR));
             }
         }
         break;
@@ -757,10 +657,10 @@ void decode_detail_to_generic(uint64_t pc,
                 break;
             }
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                add_src_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+                add_src_reg(out, out_names, gen, qemu_reg_for_generic_id(gen));
             }
             if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                add_dst_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+                add_dst_reg(out, out_names, gen, qemu_reg_for_generic_id(gen));
                 /*
                  * `msr nzcv, x3` really does define the arithmetic
                  * flags, so it owes the CST_FID_METAFLAGS record an
@@ -1013,12 +913,12 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
             out->disp = (int64_t)((uint64_t)pc + insn_size + (uint64_t)op->imm);
         } else {
             if (base_rc) {
-                out->base_key = qemu_reg_for_generic(base_rc->reg_id);
+                out->base_key = qemu_reg_for_generic_id(base_rc->reg_id);
             }
             out->disp = op->imm;
         }
         if (index_rc) {
-            out->index_key = qemu_reg_for_generic(index_rc->reg_id);
+            out->index_key = qemu_reg_for_generic_id(index_rc->reg_id);
         }
         out->scale = op->scale;
         out->shift_type = op->shift_type;

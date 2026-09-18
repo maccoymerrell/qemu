@@ -132,6 +132,20 @@ static TCGv cpu_eip;
 static TCGv_i32 cpu_cc_op;
 static TCGv cpu_regs[CPU_NB_REGS];
 static TCGv cpu_seg_base[6];
+/*
+ * The names cpu_seg_base[] is registered under, at file scope because two
+ * places need them: tcg_x86_init, which registers the globals, and
+ * gen_movl_seg(), which states the write a helper hides.  One table so the
+ * statement cannot drift from the registration.
+ */
+static const char seg_base_names[6][8] = {
+    [R_CS] = "cs_base",
+    [R_DS] = "ds_base",
+    [R_ES] = "es_base",
+    [R_FS] = "fs_base",
+    [R_GS] = "gs_base",
+    [R_SS] = "ss_base",
+};
 static TCGv_i64 cpu_bndl[4];
 static TCGv_i64 cpu_bndu[4];
 
@@ -2387,6 +2401,25 @@ static void gen_op_movl_seg_real(DisasContext *s, X86Seg seg_reg, TCGv seg)
    call this function with seg_reg == R_CS */
 static void gen_movl_seg(DisasContext *s, X86Seg seg_reg, TCGv src, bool inhibit_irq)
 {
+    /*
+     * THE SEGMENT REGISTER IS A DESTINATION, AND ON THE PROTECTED-MODE PATH
+     * NO OP SAYS SO.
+     *
+     * helper_load_seg() reads the descriptor and installs the base, limit and
+     * flags inside CPUArchState, so the call is the whole of the write and
+     * tcg_env is its only pointer argument: the op stream shows a call and
+     * names nothing.  Measured on an x86_64 system trace, `8e e0`
+     * (mov %eax,%fs) and `8e ef` (mov %edi,%gs) published NO destination
+     * register at all -- an instruction that writes FS or GS and names
+     * nothing is a write missing from the wire.
+     *
+     * Stated on both paths.  The real-mode lowering does write the base
+     * global with an op, and saying so again is the same fact twice rather
+     * than a second one; keeping the statement unconditional is what makes
+     * the destination independent of the mode the guest happens to be in.
+     */
+    insn_dataflow_state_write(insn_df_reg(seg_base_names[seg_reg]));
+
     if (PE(s) && !VM86(s)) {
         TCGv_i32 sel = tcg_temp_new_i32();
 
@@ -4923,14 +4956,6 @@ void tcg_x86_init(void)
                                       sizeof(e->df), sizeof(e->df));
     }
 
-    static const char seg_base_names[6][8] = {
-        [R_CS] = "cs_base",
-        [R_DS] = "ds_base",
-        [R_ES] = "es_base",
-        [R_FS] = "fs_base",
-        [R_GS] = "gs_base",
-        [R_SS] = "ss_base",
-    };
     static const char bnd_regl_names[4][8] = {
         "bnd0_lb", "bnd1_lb", "bnd2_lb", "bnd3_lb"
     };

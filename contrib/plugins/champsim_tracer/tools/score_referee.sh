@@ -31,7 +31,12 @@ CAPBUILD="${4:-$Q/build-cap212}"
 
 T="$Q/contrib/plugins/champsim_tracer/tools"
 PY="${PY:-/home/maccoy-merrell/anaconda3/bin/python}"
-REF="$BUILD/contrib/plugins/cst_referee"
+# The referee is an OFFLINE python producer over the recorded encodings:
+# the repository carries no Capstone, and the Capstone side of the
+# comparison is written through the Python bindings, exactly the way the
+# retired mnemonic-table generator always reached Capstone.  $BUILD is
+# still an argument because every other stage below reads that build.
+REF=("$PY" "$T/cst_referee.py")
 ISAS="x86_64 aarch64 riscv64 mipsel"
 
 # The rulings files are arguments the tools REFUSE without.  Named here, once,
@@ -39,7 +44,7 @@ ISAS="x86_64 aarch64 riscv64 mipsel"
 GAP_RULINGS="$T/gapreport_rulings.tsv"
 SET_RULINGS="$T/setjoin_rulings.tsv"
 
-for f in "$REF" "$T/gapreport.py" "$T/setjoin.py" "$T/rule_universe.py" \
+for f in "$T/cst_referee.py" "$T/gapreport.py" "$T/setjoin.py" "$T/rule_universe.py" \
          "$GAP_RULINGS" "$ROOT/merge.py"; do
     if [ ! -e "$f" ]; then
         echo "score_referee: REFUSING -- missing $f" >&2
@@ -54,12 +59,12 @@ echo "== merge"
 tail -6 "$ROOT/logs/MERGE.txt"
 
 echo "== referee selftest"
-"$REF" --selftest > "$ROOT/logs/REF_SELFTEST.txt" 2>&1; echo "selftest rc=$?"
+"${REF[@]}" --selftest > "$ROOT/logs/REF_SELFTEST.txt" 2>&1; echo "selftest rc=$?"
 tail -2 "$ROOT/logs/REF_SELFTEST.txt"
 
 echo "== referee, one run per ISA"
 for isa in $ISAS; do
-    "$REF" --isa "$isa" --in "$ROOT/merged/ident_$isa.tsv" --out-dir "$ROOT/ref" \
+    "${REF[@]}" --isa "$isa" --in "$ROOT/merged/ident_$isa.tsv" --out-dir "$ROOT/ref" \
         > "$ROOT/logs/REF_$isa.txt" 2>&1
     echo "referee $isa rc=$?"
 done

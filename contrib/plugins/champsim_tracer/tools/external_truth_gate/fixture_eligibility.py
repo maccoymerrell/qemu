@@ -132,8 +132,13 @@ def main():
         agree, differ, silent = [], [], []
         for o in others:
             theirs, _n = headline_of(r, o)
-            tag = os.path.basename(os.path.dirname(os.path.dirname(o))) + \
-                '/' + os.path.basename(os.path.dirname(o))
+            # THE TAG MUST NAME ONE ROOT.  It used to drop the last path
+            # component, so `exec245/gate/legs` and `exec245/gate/legs3` both
+            # printed `exec245/gate` and a row read "reproduced by 4
+            # (exec245/gate, ..., exec245/gate, ...)" -- two different runs
+            # rendered as one, which is exactly the misreading this test
+            # exists to prevent.
+            tag = '/'.join(os.path.abspath(o).split(os.sep)[-2:])
             if theirs is None:
                 silent.append(tag)
             elif theirs == mine:

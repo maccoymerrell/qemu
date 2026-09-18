@@ -47,9 +47,12 @@ usage() {
 
 # --------------------------------------------------------------- selftest
 # A gate is only a gate if it can go red.  The selftest builds a copy of a
-# real evidence root, plants ONE disagreement above a ceiling, and requires
-# the gate to fail on it and to pass without it.  Both directions, because a
-# gate that always fails is as useless as one that always passes.
+# real evidence root, requires the gate's reading of the UNMODIFIED reports to
+# be exactly what that root was adopted reading, then plants ONE disagreement
+# above a ceiling and requires the gate to fail on it -- and on nothing else.
+# Both directions, because a gate that always fails is as useless as one that
+# always passes, and the recorded expectation carries both verdicts so neither
+# constant can satisfy it.
 selftest() {
     SCRATCH=${1:-${TMPDIR:-/tmp}/etg_selftest.$$}
     # THE DEFAULT FIXTURE MOVES WITH THE CEILINGS (#305).  Arm A requires the
@@ -133,21 +136,38 @@ selftest() {
     #       ceiling, and an open harness item), so the reds are correct and
     #       the fixture cannot be made green by relaxing them.
     #
-    # THE RULE ABOVE -- "re-point at the newest COMPLETE root" -- IS THEREFORE
-    # NOT EXECUTABLE AT THIS TIP, and that is stated rather than worked
-    # around.  Two things are NOT done here because both would be worse than
-    # the red: a fixture is not hand-edited to fit (that is fabricating
-    # evidence, and arm A would then prove the gate against a number nothing
-    # measured), and no ceiling is relaxed to make arm A green (the merits
-    # decide ceilings, never the selftest's convenience).
+    # 245-C IS CLOSED, AND BY THE ROUTE ITS OWN TEXT NAMED.  Neither thing it
+    # refused to do was done: no fixture was hand-edited and no ceiling was
+    # relaxed.  What changed is ARM A's QUESTION, which was always "does the
+    # gate read unmodified reports correctly" and had been written as "is the
+    # project green" -- a strictly stronger demand the arm never needed.  Arm A
+    # now asserts the gate's verdict PER ROW against the root's OWN RECORDED
+    # EXPECTATION (external_truth_gate/expected_verdicts.py), so a complete
+    # root carrying adjudicated reds is a perfectly good fixture: the arm
+    # requires exactly those reds, with exactly those headlines, populations
+    # and refusal classes.  Relaxing a ceiling would now BREAK arm A rather
+    # than satisfy it, which is the right way round.
     #
-    # WHAT WOULD CLOSE IT: arm A's question is "does the gate read unmodified
-    # reports correctly", and that does not require a gate-GREEN root -- it
-    # requires the gate's verdict over unmodified reports to be the EXPECTED
-    # one.  An arm A that asserts the expected verdict per row, against a
-    # root's own recorded expectation, works on any complete root and is the
-    # shape this needs.  Arms B and C (planted red, missing red) are
-    # unaffected and still prove the gate can go red.
+    # AND THE EXPECTATION MAY NOT BE CONSTANT.  A recorded expectation that is
+    # all `ok` or all `FAIL` is refused by the checker, because a gate stuck at
+    # one answer would satisfy it -- so the fixture must carry both verdicts,
+    # and this one does (17 ok, 3 FAIL).
+    #
+    # THE DEFAULT THEREFORE MOVES TO exec245/gate/legs2, which is the root
+    # 245-C(b) already named ELIGIBLE and whose three reds are the ones held on
+    # written merits.  #305's rule is unchanged and is what moved it: the
+    # fixture moves with the ceilings.  What moves with it now is its recorded
+    # expectation.
+    #
+    # ARMS B AND C MOVED WITH IT, AND THAT IS NOT COSMETIC.  Both used to plant
+    # on `gem5cp/aarch64`, whose ceiling is 22 and whose reading at this tip is
+    # 51.  On this fixture the old arm B's `sed` would have matched nothing --
+    # the plant would not have taken -- and had it taken it would have flipped
+    # a row that was ALREADY red, proving nothing about whether the gate can go
+    # red.  Both arms now derive their target from the recorded expectation:
+    # the first row recorded `ok` whose headline is a single integer the
+    # scorer's own pattern captures.  A hard-coded target goes stale silently
+    # every time a ceiling or a reading moves; a derived one cannot.
     #
     # THE DEFAULT MOVED TO verify58/r13b AT PASS 74 BY RUNNING IT:
     #     TEST 1 COMPLETE    19 of 19 present
@@ -171,21 +191,20 @@ selftest() {
     # every older default now fails test 1 as INCOMPLETE, which is the rule
     # working and not a defect in it.
     #
-    # The default is therefore a COMPOSITE and says so: the twelve execution
-    # reports are verify58/r13b's, unchanged and still at or under their
-    # ceilings, and the three referee reports are REGENERATED AT THIS TIP by
-    # arc3_cov/referee/REPRODUCE.sh.  That is #305's rule applied one level
-    # up: the fixture moves with the manifest, whether what moved was a
-    # ceiling or the producer behind the row.  It carried the stale
-    # `static/x86_64` 47 against a ceiling of 11 until this move, and that
-    # row's successor is measured here instead of inherited.
+    # That composite (exec243/b3/fixture, twelve verify58/r13b execution
+    # reports plus three referee reports regenerated at the exec243 tip) is
+    # SUPERSEDED here, and by the same rule that built it.  exec246 lowered two
+    # ceilings -- gem5wp/mipsel 10 -> 4 and spikecp/riscv64 5 -> 4, both
+    # re-derived from fresh readings -- and the composite's banked reports read
+    # 8 and 5, so it went red for the reason #305 exists to describe.  The
+    # fixture moves with the ceilings; the ceilings do not move back.
     #
-    # ELIGIBILITY WAS RUN, NOT ASSUMED: fixture_eligibility.py reads
-    # 20 of 20 present, every headline reproduced, 0 uncorroborated --
-    # the eight referee rows against a SECOND independent run at the same
-    # tip (b3/evroot2, byte-identical reports) and the twelve execution rows
-    # against verify58/r13a, verify57/r13b, verify57/r13a and verify56/r13b.
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/fixture}
+    # THE DEFAULT IS NOW ONE WHOLE ROOT AGAIN, exec245/gate/legs2, all twenty
+    # reports from one 20-leg run at one tip.  ELIGIBILITY WAS RUN, NOT
+    # ASSUMED, at exec246: 20 of 20 present, every headline reproduced, 0
+    # uncorroborated, against exec245/gate/legs3, exec245/gate/legs,
+    # arc3/exec244/legs and exec243/b3/evroot.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec245/gate/legs2}
     # THE CORROBORATORS ARE NAMED, AND TOO FEW IS A REFUSAL.  Test 2 cannot
     # run against nothing: a root with no corroborator comes back
     # "uncorroborated" on every row and would be adopted by SILENCE, which is
@@ -194,12 +213,11 @@ selftest() {
     if [ -n "$ETG_FIXTURE_CORROBORATORS" ]; then
         CORROB=$ETG_FIXTURE_CORROBORATORS
     else
-        CORROB="/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/evroot2
-/mnt/md0/QEMU/cst_runs/verify58/r13a/evroot
-/mnt/md0/QEMU/cst_runs/verify57/r13b/evroot
-/mnt/md0/QEMU/cst_runs/verify57/r13a/evroot
-/mnt/md0/QEMU/cst_runs/verify56/r13b/evroot
-/mnt/md0/QEMU/cst_runs/exec126/r13/evroot"
+        CORROB="/mnt/md0/QEMU/cst_runs/p3/arc3/exec245/gate/legs3
+/mnt/md0/QEMU/cst_runs/p3/arc3/exec245/gate/legs
+/mnt/md0/QEMU/cst_runs/p3/arc3/exec244/legs
+/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/evroot
+/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/evroot2"
     fi
     ELIG_ARGS=
     NCORROB=0
@@ -262,26 +280,54 @@ selftest() {
         echo "newest wave's evroot -- and run it again." >&2
         exit 1
     fi
+    # THE RECORDED EXPECTATION TRAVELS WITH THE REPORTS.  Arm A compares the
+    # gate's verdicts against it, so a fixture that does not carry one has no
+    # arm A -- and that is a refusal, named here rather than as a confusing
+    # failure three arms later.
+    EXPECT=EXPECTED_VERDICTS.tsv
+    if [ ! -f "$SRC/$EXPECT" ]; then
+        echo "SELFTEST CANNOT RUN: $SRC carries no recorded expectation" >&2
+        echo "($EXPECT).  Arm A asks whether the gate's verdict over these" >&2
+        echo "unmodified reports is the one this root was ADOPTED saying; with" >&2
+        echo "no record there is nothing to compare against.  Record it once," >&2
+        echo "when adopting the root:" >&2
+        echo "    external_truth_gate/expected_verdicts.py --record $SRC" >&2
+        exit 1
+    fi
+    cp -p "$SRC/$EXPECT" "$SCRATCH/clean/$EXPECT"
     cp -a "$SCRATCH/clean" "$SCRATCH/planted"
+    cp -a "$SCRATCH/clean" "$SCRATCH/absent"
+    EV="$HERE/external_truth_gate/expected_verdicts.py"
+    PLANT="$HERE/external_truth_gate/plant.py"
 
-    echo "=== SELFTEST ARM A: the unmodified reports must PASS"
-    if "$PY" "$SCORE" "$SCRATCH/clean" > "$SCRATCH/a.out" 2>&1; then
+    echo "=== SELFTEST ARM A: the unmodified reports must read EXACTLY what"
+    echo "===              this root was adopted reading"
+    if "$PY" "$EV" --check "$SCRATCH/clean" > "$SCRATCH/a.out" 2>&1; then
+        sed 's/^/    /' "$SCRATCH/a.out"
         echo "    PASS (rc=0), as required"
     else
-        echo "    ARM A FAILED -- the gate went red on unmodified evidence:" >&2
+        echo "    ARM A FAILED -- the gate's reading of unmodified evidence" >&2
+        echo "    deviates from what this root was adopted saying:" >&2
         cat "$SCRATCH/a.out" >&2
         exit 1
     fi
 
     echo "=== SELFTEST ARM B: one planted disagreement must FAIL"
-    # aarch64's gem5 correct-path leg is adjudicated at 22; plant 23.
-    TARGET="$SCRATCH/planted/gem5/rc_aarch64.log"
-    sed -i 's/the number that matters: TRACER-SUBSET + UNACCOUNTED = 22/the number that matters: TRACER-SUBSET + UNACCOUNTED = 23/' "$TARGET"
-    if grep -q 'UNACCOUNTED = 23' "$TARGET"; then
-        :
-    else
-        echo "    PLANT DID NOT TAKE -- the selftest could not create its own" >&2
-        echo "    subject, so it proves nothing.  FAIL." >&2
+    # The target is DERIVED, not named: the first row the expectation records
+    # as `ok` whose headline is a single integer the scorer's own pattern
+    # captures, rewritten to ceiling + 1.  See plant.py for why a hard-coded
+    # target went stale silently.
+    if ! "$PY" "$PLANT" "$SCRATCH/planted" > "$SCRATCH/plant.out" 2>&1; then
+        echo "    ARM B CANNOT RUN -- nothing plantable:" >&2
+        cat "$SCRATCH/plant.out" >&2
+        exit 1
+    fi
+    sed 's/^/    /' "$SCRATCH/plant.out"
+    PLANTED_LEG=$(awk '/^PLANTED /{print $2}' "$SCRATCH/plant.out")
+    PLANTED_ISA=$(awk '/^PLANTED /{print $3}' "$SCRATCH/plant.out")
+    PLANTED_REL=$(awk '/^PLANTED /{print $4}' "$SCRATCH/plant.out")
+    if [ -z "$PLANTED_LEG" ] || [ -z "$PLANTED_REL" ]; then
+        echo "    ARM B FAILED -- the planter did not name what it planted." >&2
         exit 1
     fi
     if "$PY" "$SCORE" "$SCRATCH/planted" > "$SCRATCH/b.out" 2>&1; then
@@ -290,27 +336,61 @@ selftest() {
         cat "$SCRATCH/b.out" >&2
         exit 1
     fi
-    if grep -q 'UNADJUDICATED DISAGREEMENT: 23 > adjudicated 22' "$SCRATCH/b.out"; then
-        echo "    FAIL (rc!=0) naming the planted row, as required"
-    else
-        echo "    ARM B went red for the WRONG REASON -- it must name the" >&2
-        echo "    planted row, not fail for some unrelated cause:" >&2
+    if ! grep -q "^  $PLANTED_LEG/$PLANTED_ISA " "$SCRATCH/b.out" ||
+       ! grep -q 'UNADJUDICATED DISAGREEMENT' "$SCRATCH/b.out"; then
+        echo "    ARM B went red for the WRONG REASON -- it must name" >&2
+        echo "    $PLANTED_LEG/$PLANTED_ISA as an unadjudicated disagreement:" >&2
         cat "$SCRATCH/b.out" >&2
         exit 1
     fi
+    # AND EXACTLY ONE ROW MAY HAVE MOVED.  A plant that also disturbed a
+    # neighbouring row would still produce the line above; the expectation
+    # check is what says the damage is confined to the row that was damaged.
+    "$PY" "$EV" --check "$SCRATCH/planted" > "$SCRATCH/b.check" 2>&1 && {
+        echo "    ARM B FAILED -- the expectation check saw no deviation" >&2
+        echo "    after a plant, so it cannot see one." >&2
+        cat "$SCRATCH/b.check" >&2
+        exit 1
+    }
+    # The planted row must deviate, and nothing else may -- except the gate's
+    # own exit status, which deviates only when the clean root was GREEN and
+    # the plant turned it red.  On a fixture carrying adjudicated reds the
+    # status was already 1 and does not move, so that row is permitted rather
+    # than required.
+    if ! grep -q "^    $PLANTED_LEG/$PLANTED_ISA  DEVIATES" "$SCRATCH/b.check"; then
+        echo "    ARM B FAILED -- the expectation check did not name the" >&2
+        echo "    planted row $PLANTED_LEG/$PLANTED_ISA as deviating:" >&2
+        cat "$SCRATCH/b.check" >&2
+        exit 1
+    fi
+    OTHER=$(sed -n '/^CHECK FAILED/,$p' "$SCRATCH/b.check" |
+            grep '^    [^ ]*/' |
+            grep -v "^    $PLANTED_LEG/$PLANTED_ISA  " |
+            grep -vc '^    score\.py/exit ' || true)
+    if [ "${OTHER:-1}" != "0" ]; then
+        echo "    ARM B FAILED -- the plant moved $OTHER row(s) other than the" >&2
+        echo "    one it damaged:" >&2
+        cat "$SCRATCH/b.check" >&2
+        exit 1
+    fi
+    echo "    FAIL (rc!=0) naming $PLANTED_LEG/$PLANTED_ISA, and ONLY that row"
+    echo "    deviates from the recorded expectation, as required"
 
     echo "=== SELFTEST ARM C: a missing report must FAIL, not pass by absence"
-    rm -f "$SCRATCH/planted/gem5/rc_aarch64.log"
-    sed -i 's/UNACCOUNTED = 23/UNACCOUNTED = 22/' "$SCRATCH/planted/gem5/rc_mipsel.log" 2>/dev/null || true
-    if "$PY" "$SCORE" "$SCRATCH/planted" > "$SCRATCH/c.out" 2>&1; then
+    # The report removed is the one arm B proved was GREEN, so the flip to
+    # REPORT MISSING is an observable change rather than a repaint of a row
+    # that was already red.
+    rm -f "$SCRATCH/absent/$PLANTED_REL"
+    if "$PY" "$SCORE" "$SCRATCH/absent" > "$SCRATCH/c.out" 2>&1; then
         echo "    ARM C FAILED -- a missing leg report passed the gate:" >&2
         cat "$SCRATCH/c.out" >&2
         exit 1
     fi
-    if grep -q 'REPORT MISSING' "$SCRATCH/c.out"; then
-        echo "    FAIL (rc!=0) naming the absent report, as required"
+    if grep -q "REPORT MISSING: .*/$PLANTED_REL" "$SCRATCH/c.out"; then
+        echo "    FAIL (rc!=0) naming $PLANTED_REL absent, as required"
     else
-        echo "    ARM C went red for the WRONG REASON:" >&2
+        echo "    ARM C went red for the WRONG REASON -- it must name" >&2
+        echo "    $PLANTED_REL as the missing report:" >&2
         cat "$SCRATCH/c.out" >&2
         exit 1
     fi
@@ -514,11 +594,14 @@ EOF_F
     echo "    fixture's 900-encoding population, which is the floor working)"
 
     echo ""
-    echo "SELFTEST PASSED -- 7 arms: clean green, planted red, missing red,"
-    echo "stale red, the staleness reference proven to cover the emulators,"
-    echo "the behaviour digest proven to discriminate in both directions, and"
-    echo "the offline-referee rows proven to refuse a report that lost an ISA"
-    echo "and one whose detail list was truncated."
+    echo "SELFTEST PASSED -- 7 arms: the unmodified reports read exactly what"
+    echo "this root was adopted reading (verdict, headline, population and"
+    echo "refusal class, per row, both verdicts present); one planted"
+    echo "disagreement red and NOTHING ELSE moved; that same row's report"
+    echo "removed red; a year-old report red; the staleness reference proven"
+    echo "to cover the emulators; the behaviour digest proven to discriminate"
+    echo "in both directions; and the offline-referee rows proven to refuse a"
+    echo "report that lost an ISA and one whose detail list was truncated."
     echo "evidence: $SCRATCH"
     exit 0
 }

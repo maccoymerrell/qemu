@@ -124,6 +124,27 @@ struct InsnDataflowScratch {
     uint64_t prov[TCG_MAX_TEMPS][INSN_DF_REG_WORDS];
     int64_t  envoff[TCG_MAX_TEMPS];
 
+    /*
+     * Is this temp's provenance KNOWN INCOMPLETE?
+     *
+     * The interning table below is per BLOCK, so the instruction that fills it
+     * is not necessarily the instruction that loses a source: a range that
+     * could not be interned gives the value read out of it an account with a
+     * member missing, and that value then travels through temps into whatever
+     * reads it next.  Carrying the fact on the VALUE is what lets the reader
+     * say which instructions actually lost something -- one bit per temp,
+     * unioned along the same edges the provenance sets are, and cleared when
+     * an op writes the temp a fresh value.
+     *
+     * The alternative, a block-wide flag, is what this replaces, and it was
+     * wrong in the only direction that matters: an instruction WALKED BEFORE
+     * the table filled cannot have lost anything to it -- ops are read in
+     * emission order, which is program order -- yet a block-wide flag
+     * convicted it anyway, and a consumer that refuses a set on any
+     * incompleteness then dropped that instruction's whole dependency block.
+     */
+    bool     trunc[TCG_MAX_TEMPS];
+
     InsnDataflow out[INSN_DF_MAX_INSNS];
     unsigned ninsns;
     unsigned cur;               /* the instruction being decoded */
@@ -135,12 +156,12 @@ struct InsnDataflowScratch {
      * distinct ones; running out stops interning, which is recorded rather
      * than hidden -- a range that could not be interned makes a value look as
      * though it came from nowhere, and that is the direction this file does
-     * not take quietly.
+     * not take quietly.  Where it is recorded is @trunc above, on the value,
+     * and from there in the incompleteness of the instructions that read it.
      */
     uint32_t slot_off[INSN_DF_MAX_FIELD_SLOTS];
     uint32_t slot_size[INSN_DF_MAX_FIELD_SLOTS];
     unsigned nslots;
-    bool     slots_full;
 
     DfBinding bind[INSN_DF_MAX_BINDINGS];
     unsigned nbind;
@@ -238,6 +259,7 @@ static void df_touch(size_t temp)
         df->stamp[temp] = df->gen;
         memset(df->prov[temp], 0, sizeof(df->prov[temp]));
         df->envoff[temp] = INSN_DF_NOT_ENV;
+        df->trunc[temp] = false;
     }
 }
 
@@ -259,6 +281,19 @@ static void df_set_envoff(size_t temp, int64_t v)
     df->envoff[temp] = v;
 }
 
+/* Is this temp's account of itself known to be missing a member? */
+static bool df_trunc(size_t temp)
+{
+    df_touch(temp);
+    return df->trunc[temp];
+}
+
+static void df_set_trunc(size_t temp, bool v)
+{
+    df_touch(temp);
+    df->trunc[temp] = v;
+}
+
 /*
  * Give an env byte range a provenance bit, above the globals and below the
  * three atoms at the top.
@@ -266,10 +301,12 @@ static void df_set_envoff(size_t temp, int64_t v)
  * Interning keys on the offset AND the extent: a 16-byte vector register and
  * the 4-byte word at its base are different storage and a consumer that
  * conflated them would see a dependency between instructions that share only
- * an address.  When the table is full this returns -1, the caller records
- * nothing, and slots_full says so -- a value whose source could not be
- * interned looks as though it came from nowhere, which is the one direction
- * this file does not take in silence.
+ * an address.  When the table is full this returns -1 and the caller records
+ * nothing -- a value whose source could not be interned looks as though it
+ * came from nowhere, which is the one direction this file does not take in
+ * silence.  Saying so is the CALLER'S job, because only the caller knows
+ * which value lost the member, and the table is shared by the whole block
+ * while the answer is owed per instruction.
  */
 static int df_intern(uint32_t off, uint32_t size)
 {
@@ -282,7 +319,6 @@ static int df_intern(uint32_t off, uint32_t size)
     }
     if (df->nslots >= INSN_DF_MAX_FIELD_SLOTS ||
         base + df->nslots >= INSN_DF_BIT_LOWEST_ATOM) {
-        df->slots_full = true;
         return -1;
     }
     df->slot_off[df->nslots] = off;
@@ -672,6 +708,7 @@ static void df_call(InsnDataflow *d, TCGOp *op)
     unsigned nb_iargs = TCGOP_CALLI(op);
     uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
     unsigned idx;
+    bool trunc = false;
 
     d->n_calls++;
 
@@ -683,6 +720,10 @@ static void df_call(InsnDataflow *d, TCGOp *op)
             continue;
         }
         df_union(prov, df_prov(ts - s->temps));
+        if (df_trunc(ts - s->temps)) {
+            trunc = true;
+            d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
+        }
         if (df_is_reg(ts, &idx)) {
             df_read_global(d, idx, prov);
         }
@@ -712,6 +753,9 @@ static void df_call(InsnDataflow *d, TCGOp *op)
             bit = df_intern((uint32_t)eo, size);
             if (bit >= 0) {
                 df_set_bit(prov, (unsigned)bit);
+            } else {
+                trunc = true;
+                d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
             }
             df_add_field(d, (uint32_t)eo, size, dir, prov, true);
         }
@@ -724,8 +768,12 @@ static void df_call(InsnDataflow *d, TCGOp *op)
         }
         if (df_is_reg(ts, &idx)) {
             df_write_global(d, idx, prov);
+            df_set_trunc(idx, trunc);
         } else {
             df_union(df_prov(ts - s->temps), prov);
+            if (trunc) {
+                df_set_trunc(ts - s->temps, true);
+            }
         }
     }
 }
@@ -795,6 +843,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
     int ld_field_bit = -1;
     int ld_memop_bit = -1;
     bool ld_env_written = false;
+    bool trunc = false;
     bool store;
     uint32_t size;
 
@@ -916,6 +965,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
 
                     if (vts != NULL && !df_is_reg(vts, &idx)) {
                         memset(df_prov(vts - s->temps), 0, sizeof(prov));
+                        df_set_trunc(vts - s->temps, false);
                     }
                 }
                 return;
@@ -942,6 +992,16 @@ static void df_op(InsnDataflow *d, TCGOp *op)
             } else {
                 df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL, true);
                 ld_field_bit = df_intern((uint32_t)eo, size);
+                if (ld_field_bit < 0) {
+                    /*
+                     * The range this value came out of could not be interned,
+                     * so the value below will be handed an account that is
+                     * missing its one real member.  Said here, about THIS
+                     * instruction, and carried on the value from here.
+                     */
+                    trunc = true;
+                    d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
+                }
             }
         }
     }
@@ -953,6 +1013,10 @@ static void df_op(InsnDataflow *d, TCGOp *op)
             continue;
         }
         df_union(prov, df_prov(ts - s->temps));
+        if (df_trunc(ts - s->temps)) {
+            trunc = true;
+            d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
+        }
         if (df_is_reg(ts, &idx)) {
             df_read_global(d, idx, prov);
         }
@@ -989,10 +1053,12 @@ static void df_op(InsnDataflow *d, TCGOp *op)
         }
         if (df_is_reg(ts, &idx)) {
             df_write_global(d, idx, prov);
+            df_set_trunc(idx, trunc);
         } else {
             uint64_t *dp = df_prov(ts - s->temps);
 
             memcpy(dp, prov, sizeof(prov));
+            df_set_trunc(ts - s->temps, trunc);
             /*
              * A load's value came from the range it loaded, which the op's own
              * inputs do not say -- they name the base pointer.  Without this a
@@ -1690,7 +1756,6 @@ void insn_dataflow_insn_begin(unsigned idx)
     if (idx == 0) {
         df->gen++;
         df->nslots = 0;
-        df->slots_full = false;
         df->nbind = 0;
         df->nwin = 0;
         df->win_open = -1;
@@ -1926,7 +1991,3 @@ const char *insn_dataflow_field_reg(uint32_t off, uint32_t size)
     return NULL;
 }
 
-bool insn_dataflow_fields_truncated(void)
-{
-    return df != NULL && df->slots_full;
-}

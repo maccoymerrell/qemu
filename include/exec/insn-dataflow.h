@@ -982,9 +982,6 @@ bool insn_dataflow_prov_memop(unsigned bit, uint32_t *index);
 /* The declared name of an env range, or NULL if no target declared it. */
 const char *insn_dataflow_field_reg(uint32_t off, uint32_t size);
 
-/* Did interning run out of slots during this translation? */
-bool insn_dataflow_fields_truncated(void);
-
 #else /* !CONFIG_PLUGIN */
 
 /*

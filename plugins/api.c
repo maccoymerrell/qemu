@@ -669,15 +669,26 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.self_loop_memops = d->self_loop_memops;
     st.self_loop_iterated = d->self_loop_iterated ? 1u : 0u;
     /*
-     * Interning is per translation block, so a range that could not be
-     * interned anywhere in the block makes a value in THIS instruction look
-     * sourceless.  Reported as this instruction's incompleteness, which is
-     * pessimistic and is the direction the whole layer errs in.
+     * @incomplete is this instruction's own, and nothing is added to it here.
+     *
+     * It used to be OR'd with a translation-block-wide "interning ran out of
+     * slots" flag, on the reasoning that a range nothing in the block could
+     * intern makes a value in THIS instruction look sourceless.  That is true
+     * of the instruction that READ the range and of whatever consumes the
+     * value afterwards; it is not true of an instruction the reader walked
+     * BEFORE the table filled, and not true of one that touches no env range
+     * at all.  A consumer that refuses the whole dependency set on any
+     * incompleteness -- which is what the tracer does, because a partial set
+     * is a dependency missed -- then dropped those instructions' dependency
+     * blocks for something another instruction did.
+     *
+     * Measured on aarch64 at this tip: a five-instruction block of
+     * `mov x9,sp; st2; st3; st4; b` reported ALL FIVE not-recorded-whole,
+     * while the same `st4` alone in a five-instruction block reported ONE.
+     * accel/tcg/insn-dataflow.c now carries the fact on the VALUE whose
+     * account lost a member, so the instructions that actually lost
+     * something are the ones that say so.
      */
-    if (insn_dataflow_fields_truncated()) {
-        st.incomplete |= QEMU_PLUGIN_DF_INC_FIELDS;
-    }
-
     plugin_df_struct(out, &st, out->struct_size, sizeof(st));
     return true;
 }

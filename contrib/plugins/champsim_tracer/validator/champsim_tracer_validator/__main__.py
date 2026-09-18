@@ -1249,6 +1249,55 @@ def cmd_validate(args, isa: str | None = None) -> int:
     return rc
 
 
+# Machine-readable per-ISA verdict emitted by cmd_all, one line per
+# requested ISA.  A consumer scoring a multi-ISA run (tests/golden_net.py is
+# the one in tree) needs to know WHICH ISA failed: the process exit status is
+# a single number for the whole run, so attributing it to every ISA in the
+# run both hides the guilty one and convicts the innocent ones.  Worse, a
+# consumer that banks that shared status as a per-cell baseline then accepts
+# a NEW failure on a different ISA of the same run as "the known baseline".
+# The line is the contract; VERDICT_STAGE names where the ISA stopped so the
+# reader does not have to re-derive it from the log.
+ALL_VERDICT_PREFIX = "[all] isa="
+
+
+def _all_one_isa(args, isa: str, traced_bases: list) -> tuple:
+    """Run the whole generate/build/trace/analyze/validate ladder for ONE
+    ISA.  Returns (rc, stage) where rc is 0, 1 or RC_SKIP and stage names the
+    step that decided it."""
+    cmd_generate(args, isa)
+    if cmd_build(args, isa) != 0:
+        return 1, "build"
+    rc_trace = cmd_trace(args, isa)
+    # RC_SKIP means the host could not host this run at all.  Carry it
+    # through as a skip rather than letting the downstream analyze/
+    # validate steps "succeed" on absent inputs -- that laundering is
+    # exactly how a check with no trace reported PASS.
+    if rc_trace == RC_SKIP:
+        return RC_SKIP, "trace"
+    if rc_trace != 0:
+        return 1, "trace"
+    traced_bases.append(_trace_base(args.out_dir,
+                                    _prog_base(args.out_dir, args.prog),
+                                    isa))
+    # System-mode traces interleave the pinned process's kernel calls,
+    # which carry CST_INSN_FLAG_SYSTEM and have no workload ground truth.
+    # analyze maps only the user blocks (kernel PCs aren't in the binary,
+    # so they get no ground-truth spans); validate aligns the user
+    # subsequence against correct_path and structurally checks the
+    # syscall->kernel->user transitions.
+    # analyze's verdict GATES.  It used to be discarded, so a refused
+    # or failed annotation left validate to score the trace against a
+    # meta file with no ground truth in it -- a check laundering its
+    # own missing subject.  A failure here fails this ISA and moves to
+    # the next one; it does not end the run.
+    if cmd_analyze(args, isa) != 0:
+        return 1, "analyze"
+    if cmd_validate(args, isa) != 0:
+        return 1, "validate"
+    return 0, "ok"
+
+
 def cmd_all(args) -> int:
     rc_total = 0
     skipped = False
@@ -1258,39 +1307,27 @@ def cmd_all(args) -> int:
     traced_bases: list[Path] = []
     for isa in args.isa:
         print(f"\n==== {isa} ====")
-        cmd_generate(args, isa)
-        if cmd_build(args, isa) != 0:
-            rc_total = 1
-            continue
-        rc_trace = cmd_trace(args, isa)
-        # RC_SKIP means the host could not host this run at all.  Carry it
-        # through as a skip rather than letting the downstream analyze/
-        # validate steps "succeed" on absent inputs -- that laundering is
-        # exactly how a check with no trace reported PASS.
-        if rc_trace == RC_SKIP:
+        before = len(traced_bases)
+        rc_isa, stage = _all_one_isa(args, isa, traced_bases)
+        # The "(must be 0)" census, attributed to the ISA whose stats.log
+        # broke it.  The run-wide roll-up below still reads every base, but
+        # the per-ISA verdict must carry the same fact: a consumer reading
+        # only the verdict lines would otherwise bank rc=0 for a cell whose
+        # own invariant census failed, and the process status would say 1
+        # with nothing naming the ISA.
+        if len(traced_bases) > before:
+            if _must0.gate_out_bases(traced_bases[before:], isa):
+                stage = "must0" if rc_isa == 0 else f"{stage}+must0"
+                rc_isa = 1
+        # Printed for EVERY requested ISA, on every path out of the ladder,
+        # so a consumer can tell a missing verdict (the run died before this
+        # ISA ran) from a passing one.  A consumer that cannot find this line
+        # for an ISA it asked for must fail, not assume 0.
+        print(f"{ALL_VERDICT_PREFIX}{isa} rc={rc_isa} stage={stage}",
+              flush=True)
+        if rc_isa == RC_SKIP:
             skipped = True
-            continue
-        if rc_trace != 0:
-            rc_total = 1
-            continue
-        traced_bases.append(_trace_base(args.out_dir,
-                                        _prog_base(args.out_dir, args.prog),
-                                        isa))
-        # System-mode traces interleave the pinned process's kernel calls,
-        # which carry CST_INSN_FLAG_SYSTEM and have no workload ground truth.
-        # analyze maps only the user blocks (kernel PCs aren't in the binary,
-        # so they get no ground-truth spans); validate aligns the user
-        # subsequence against correct_path and structurally checks the
-        # syscall->kernel->user transitions.
-        # analyze's verdict GATES.  It used to be discarded, so a refused
-        # or failed annotation left validate to score the trace against a
-        # meta file with no ground truth in it -- a check laundering its
-        # own missing subject.  A failure here fails this ISA and moves to
-        # the next one; it does not end the run.
-        if cmd_analyze(args, isa) != 0:
-            rc_total = 1
-            continue
-        if cmd_validate(args, isa) != 0:
+        elif rc_isa != 0:
             rc_total = 1
     # THE "(must be 0)" CENSUS.  Every counter the plugin labels "(must be 0)"
     # is an invariant it asserts about the very trace this run just produced,

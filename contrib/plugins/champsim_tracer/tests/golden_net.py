@@ -172,9 +172,30 @@ def sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def run_all(build: Path, wl: dict, out_dir: Path) -> int:
+# The per-ISA verdict line cmd_all prints, one per requested ISA:
+#   [all] isa=aarch64 rc=1 stage=validate
+# run_all reads these instead of the process exit status.  The process status
+# is ONE number for a run that covers up to four ISAs, so attributing it to
+# every cell of the workload named no guilty ISA and convicted three innocent
+# ones -- and, worse, capture banked that shared number as each cell's
+# baseline, so a LATER failure on a different ISA of the same workload read as
+# "the known baseline" and passed.  A missing verdict line is a failure, never
+# an assumed 0: the run may have died before that ISA ran at all.
+_VERDICT_RE = re.compile(r"^\[all\] isa=(\S+) rc=(-?\d+) stage=(\S+)\s*$",
+                         re.M)
+# Sentinel rc for "the validator produced no verdict for this ISA".  Distinct
+# from every rc the validator itself returns (0, 1, 77) so a manifest baseline
+# can never equal it and launder the absence into a pass.
+RC_NO_VERDICT = 254
+
+
+def run_all(build: Path, wl: dict, out_dir: Path) -> dict:
     """generate+build+trace+analyze+validate for one workload (all its ISAs).
-    Returns the validator exit code (0 == errors=0)."""
+
+    Returns {isa: rc} parsed from cmd_all's per-ISA verdict lines, with
+    RC_NO_VERDICT for any requested ISA the run did not report on.  The
+    captured output is printed for any ISA that is not clean, so a red cell
+    carries its own diagnosis instead of being silently swallowed."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # setarch -R disables ASLR (ADDR_NO_RANDOMIZE, inherited by the qemu
     # child) so guest stack/mmap bases are fixed -> recorded memory
@@ -194,7 +215,20 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     proc = subprocess.run(cmd, cwd=VALIDATOR_DIR, env=PINNED_ENV,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True)
-    return proc.returncode
+    seen = {isa: int(rc) for isa, rc, _stage in
+            _VERDICT_RE.findall(proc.stdout or "")}
+    per_isa = {isa: seen.get(isa, RC_NO_VERDICT) for isa in wl["isas"]}
+    # The captured output used to be discarded outright, so a red cell said
+    # only "validator rc=1" with the diagnosis thrown away.  Print it once,
+    # for any run that is not clean on every requested ISA.
+    if any(rc != 0 for rc in per_isa.values()):
+        bad = ", ".join(f"{isa}=rc{rc}" for isa, rc in sorted(per_isa.items())
+                        if rc != 0)
+        print(f"  [{wl['name']}] validator not clean: {bad}"
+              f" (process rc={proc.returncode})")
+        for line in (proc.stdout or "").splitlines():
+            print(f"    | {line}")
+    return per_isa
 
 
 def cst_path(out_dir: Path, isa: str) -> Path:
@@ -577,11 +611,11 @@ def capture(build: Path, root: Path, waivers: dict) -> int:
         name = wl["name"]
         out = root / name          # identical path in capture and check
         runs = []
-        rc0 = 0
+        rc0 = {}
         for i in range(N_DET):
-            rc = run_all(build, wl, out)
+            rcs = run_all(build, wl, out)
             if i == 0:
-                rc0 = rc
+                rc0 = rcs
             runs.append({isa: (triple_hash(build, cst_path(out, isa))
                                if cst_path(out, isa).exists() else None)
                          for isa in wl["isas"]})
@@ -597,8 +631,12 @@ def capture(build: Path, root: Path, waivers: dict) -> int:
                 manifest["excluded"][cell] = f"nondeterministic over {N_DET} runs: {moved}"
                 print(f"  EXCLUDE {cell}: NONDETERMINISTIC {moved}"); bad += 1
                 continue
-            manifest["cells"][cell] = {**hs[0], "validate_rc": rc0}
-            tag = "ok" if rc0 == 0 else f"VALIDATE_RC={rc0}"
+            # THIS ISA's rc, not the run's.  Banking one shared number here
+            # is what let a later red on a different ISA of the same workload
+            # read as "the known baseline" and pass.
+            rc_cell = rc0.get(isa, RC_NO_VERDICT)
+            manifest["cells"][cell] = {**hs[0], "validate_rc": rc_cell}
+            tag = "ok" if rc_cell == 0 else f"VALIDATE_RC={rc_cell}"
             print(f"  {cell}: deterministic {tag}")
         out_a = out
         # SVG goldens.  Freeze the trace as a renderer-golden input, then
@@ -672,7 +710,7 @@ def check(build: Path, root: Path, waivers: dict) -> int:
     for wl in WORKLOADS:
         name = wl["name"]
         out = root / name
-        rc = run_all(build, wl, out)
+        rcs = run_all(build, wl, out)
         for isa in wl["isas"]:
             cell = f"{name}:{isa}"
             if cell not in manifest["cells"]:
@@ -693,7 +731,15 @@ def check(build: Path, root: Path, waivers: dict) -> int:
             # stride's wrong_path_chains budget boundary).  Flag only a
             # REGRESSION (rc worse than baseline).
             base_rc = manifest["cells"][cell].get("validate_rc", 0)
-            if rc != base_rc:
+            rc = rcs.get(isa, RC_NO_VERDICT)
+            if rc == RC_NO_VERDICT:
+                # The run reported no verdict for an ISA this cell needs.
+                # That is a failure of the check, never a pass: the subject
+                # was not found.
+                validate_fails.append(
+                    f"{cell}: validator printed NO per-ISA verdict "
+                    f"(baseline {base_rc})")
+            elif rc != base_rc:
                 validate_fails.append(
                     f"{cell}: validator rc={rc} (baseline {base_rc})")
     # SVG goldens: render the FROZEN golden trace, never a re-traced .cst,

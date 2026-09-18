@@ -163,6 +163,22 @@ MIPSEL_WP = {
     # `swl`/`swr` forms onto per-byte accesses; gem5 issues one sized request.
     # Neither is wrong about what the instruction touched, and the memop-addr
     # axis proves it by not firing.
+    # THE REFERENCE HAS NO NAME FOR THE PROGRAM COUNTER, AND IT IS ASKED,
+    # NOT ASSUMED.  QEMU states a program-counter write on every mipsel
+    # branch and jump and the tracer publishes it on both the destination
+    # and the source side; gem5 keeps the PC in the PCState and its MIPS
+    # register mapper produces no such name at any class and index, which
+    # `gem5_ref.ref_can_name('mipsel', ...)` RUNS and checks.  The rule is
+    # emitted only where that answer is False and the whole surplus is the
+    # program counter, so the day the mapper learns the register the rows
+    # stop being excused instead of quietly staying excused.
+    'REF-MAPPER-HAS-NO-PC':
+        Rule('REF-MAPPER-HAS-NO-PC', 'reference-gap', {SUPERSET},
+             note="the reference's register mapper for this ISA cannot "
+                  'produce the program counter at any class and index, so a '
+                  'tracer PC write or read has no counterpart to disagree '
+                  'with'),
+
     'SAME-BYTES-DIFFERENT-SPLIT':
         Rule('SAME-BYTES-DIFFERENT-SPLIT', 'vocabulary-difference',
              {SUPERSET, SUBSET, ORTHOGONAL},

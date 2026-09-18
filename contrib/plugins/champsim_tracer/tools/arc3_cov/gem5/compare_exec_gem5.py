@@ -48,6 +48,13 @@ sys.path.insert(0, os.path.join(HERE, '..', 'riscv64', 'spike'))
 
 import gem5_ref
 import gem5_env
+import wire_vocab
+
+#: the name the WIRE prints for the program counter, READ from the header
+#: that defines it.  Hardcoded here as `REG_PC` until this pass, which is a
+#: spelling this branch has never shipped, so every rule keyed on it matched
+#: nothing -- see wire_vocab's own header.
+PC_NAME = wire_vocab.pc_name()
 import tracer_log
 from arc3_taxonomy import (set_relation, classify, render_crosstab,
                            render_conflicts, render_unaccounted, EQUAL,
@@ -430,9 +437,13 @@ def _x86_dst_label(r, only_ref, only_trc):
     logs, and each is shared with the wrong-path leg's rule table rather than
     restated here.
     """
-    if not only_ref and only_trc == frozenset(('REG_PC',)):
+    if not only_ref and only_trc == frozenset((PC_NAME,)):
         # gem5 keeps the instruction pointer in the PCState; no operand list
-        # on any control transfer names it.
+        # on any control transfer names it.  Witnessed on this leg's own
+        # exec.log: JMP_I lowers to `rdip t1,t1 ; limm t2,0 ; wrip t1,t2`
+        # and the wrip micro-op reports `RW=[] DR=[]` -- no destination
+        # register at all -- while rdip's only stated source is
+        # `miscellaneous:153`, the CS effective base, not the pointer.
         return 'REF-NO-RIP-OPERAND'
     if not only_ref and r.uops == 1 and '(unimplemented)' in r.disas:
         # gem5 warns once and retires the instruction with no effects at all.
@@ -482,6 +493,16 @@ def compare_insn(r, t, isa, sub=None):
             row = row._replace(label=x86lab)
         elif maint is not None:
             row = row._replace(label=maint)
+        elif (only_trc == frozenset((PC_NAME,)) and not only_ref
+              and not gem5_ref.ref_can_name(isa, PC_NAME)):
+            # THE REFERENCE HAS NO NAME FOR THE PROGRAM COUNTER, asked of
+            # the mapper rather than assumed.  x86_64 never reaches here --
+            # `_x86_dst_label` names its own witnessed mechanism first --
+            # so this row is the same fact on the ISAs that had no rule at
+            # all.  Measured on mipsel: every branch and jump publishes the
+            # program counter QEMU states it writes, and `_mips_reg`
+            # produces no such name at any class and index.
+            row = row._replace(label='REF-MAPPER-HAS-NO-PC')
         elif only_ref and not only_trc and \
                 all(n == 'REG_ZERO' for n in only_ref):
             row = row._replace(label='REF-NAMES-ZERO-DEST')

@@ -67,6 +67,7 @@ for _p in (_HERE, _COV, os.path.join(_COV, 'gem5'),
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import wire_vocab                                            # noqa: E402
 import elfimage                                              # noqa: E402
 import wp_trace                                              # noqa: E402
 import qemu_preserve_oracle as QPO                           # noqa: E402
@@ -105,7 +106,11 @@ Row = collections.namedtuple(
 #: the tracer ids no gem5 register can ever match, because gem5 models the
 #: state somewhere that is not a register operand.  Named here so that their
 #: appearance in a tracer set is adjudicated by RULE and not by a guess.
-_RIP = 'REG_PC'
+#: READ from champsim_tracer_generic_ids.h, not spelled here.  It was
+#: hardcoded `REG_PC` until this pass -- a name this branch's wire has never
+#: printed -- so REF-NO-RIP-OPERAND matched nothing and 152 rows that the
+#: rule exists to name were reported UNACCOUNTED instead.
+_RIP = wire_vocab.pc_name()
 _SEGS = frozenset('REG_SEG%d' % i for i in range(6))
 _SYSCALL_BYTES = 0x050f          # `0f 05`, little-endian in the tracer's word
 

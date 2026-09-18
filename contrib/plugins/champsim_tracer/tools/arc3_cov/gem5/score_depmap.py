@@ -241,7 +241,7 @@ def score_pair(t, g, att, tallies, per_family, imm_masks, notes):
         if v == 'AGREE':
             return None
         if (axis in ('load-addr-dep', 'store-addr-dep')
-                and (tt - gg) == {'REG_PC'}):
+                and (tt - gg) == {C.PC_NAME}):
             # gem5's x86 decoder resolves RIP-relative addressing at DECODE
             # time -- the displacement is folded against the instruction's
             # own PC and length -- so its address micro-op names no register

@@ -336,6 +336,54 @@ def _x86_reg(cls, idx):
 
 REGMAP = {'aarch64': _arm_reg, 'mipsel': _mips_reg, 'x86_64': _x86_reg}
 
+#: every gem5 register-class name the mappers above branch on.  A class
+#: absent from this tuple is one no mapper tests, so it falls out of each
+#: mapper's own `return None` tail and can produce no name -- which is why
+#: probing these is a COMPLETE probe of a mapper's output vocabulary and not
+#: a sample of it.
+_PROBE_CLASSES = ('integer', 'floating_point', 'vector', 'vector_element',
+                  'vector_predicate', 'condition_code', 'miscellaneous',
+                  'invalid')
+
+#: gem5 prints small indices; 1024 is far past the largest any of the three
+#: files defines (aarch64's misc file is the widest at ~200 entries).
+_PROBE_LIMIT = 1024
+
+_NAMEABLE = {}
+
+
+def ref_nameable(isa):
+    """{name} -- every generic id this ISA's reference mapper can PRODUCE.
+
+    Computed by running the mapper, not asserted.  A rule that says "the
+    reference cannot state X on this ISA" is only honest if something
+    checked, and this is the check: if a later mapper learns X, the rule
+    stops applying by itself instead of quietly excusing a real loss.
+    """
+    if isa in _NAMEABLE:
+        return _NAMEABLE[isa]
+    fn = REGMAP.get(isa)
+    if fn is None:
+        raise SystemExit('gem5_ref: no register mapper for ISA %r' % isa)
+    out = set()
+    for cls in _PROBE_CLASSES:
+        for idx in range(_PROBE_LIMIT):
+            n = fn(cls, idx)
+            if isinstance(n, str) and n.startswith('REG_'):
+                out.add(n)
+    if not out:
+        raise SystemExit('gem5_ref: the %s mapper produced no register name '
+                         'over %d indices of %d classes; it cannot be probed '
+                         'and no rule may rest on its silence'
+                         % (isa, _PROBE_LIMIT, len(_PROBE_CLASSES)))
+    _NAMEABLE[isa] = out
+    return out
+
+
+def ref_can_name(isa, name):
+    """Can this ISA's reference mapper ever produce ``name``?"""
+    return name in ref_nameable(isa)
+
 
 def exec_ranges(path):
     """Executable PT_LOAD ranges of an ELF, 32- or 64-bit little-endian."""

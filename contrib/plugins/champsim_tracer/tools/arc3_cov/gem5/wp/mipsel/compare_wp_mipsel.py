@@ -86,6 +86,7 @@ import wp_image32 as wp_image                                # noqa: E402
 import wp_seed_mipsel as wp_seed                             # noqa: E402
 import wp_trace                                              # noqa: E402
 import gem5_ref                                              # noqa: E402
+import wire_vocab                                            # noqa: E402
 import gem5_env                                              # noqa: E402
 from arc3_taxonomy import set_relation, EQUAL, SUPERSET, SUBSET  # noqa: E402
 from wp_rules_mipsel import mipsel_wp_rule                   # noqa: E402
@@ -357,6 +358,18 @@ def mips32_acc(mn, a, b, hi=None, lo=None):
     return None
 
 
+#: the name the WIRE prints for the program counter, READ from
+#: champsim_tracer_generic_ids.h.  Not spelled here: the comparators that
+#: DID spell it hardcoded `REG_PC`, which this branch has never shipped, and
+#: their PC rules matched nothing for it.
+_PC = wire_vocab.pc_name()
+
+#: and whether gem5's own mipsel mapper can ever produce that name, asked by
+#: RUNNING the mapper over its whole class/index domain.  False here is what
+#: makes REF-MAPPER-HAS-NO-PC honest rather than convenient.
+_REF_HAS_PC = gem5_ref.ref_can_name('mipsel', _PC)
+
+
 _FPR_RE = re.compile(r'^REG_FPR(\d+)$')
 
 
@@ -400,6 +413,8 @@ def label_dst(only_ref, only_trc, ref, trc):
             return 'REF-NO-FCSR-TRAFFIC'
         if only_trc == frozenset(('REG_GPR1',)) and ref.ctrl:
             return 'TRC-INVENTED-BRANCH-DEST'
+        if only_trc == frozenset((_PC,)) and not _REF_HAS_PC:
+            return 'REF-MAPPER-HAS-NO-PC'
         if all(n == REF_ZERO_INVISIBLE for n in only_trc):
             return 'REF-ZERO-OPERAND-AS-INVALID'
         if only_trc == frozenset(('REG_PRED0',)) and \
@@ -421,6 +436,8 @@ def label_src(only_ref, only_trc, ref):
             return 'REF-ZERO-OPERAND-AS-INVALID'
         if only_trc == frozenset(('REG_FCSR',)):
             return 'REF-NO-FCSR-TRAFFIC'
+        if only_trc == frozenset((_PC,)) and not _REF_HAS_PC:
+            return 'REF-MAPPER-HAS-NO-PC'
         if _odd_halves_of_named_pairs(only_trc, set(ref.srcs)):
             return 'REF-NAMES-EVEN-OF-PAIR'
     return None

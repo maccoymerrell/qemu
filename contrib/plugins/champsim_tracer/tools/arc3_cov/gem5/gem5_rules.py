@@ -290,6 +290,28 @@ GEM5_EXEC = {
                   'no architectural effects; the tracer records what the '
                   'instruction really does'),
 
+    # THE REFERENCE HAS NO NAME FOR THE PROGRAM COUNTER, AND THAT IS
+    # MEASURED, NOT ASSERTED.  The tracer publishes the program counter as a
+    # destination (and a source) on every control transfer, because QEMU
+    # states that write; gem5 keeps the PC in the PCState and no operand list
+    # reaches it.  Witnessed on this leg's own exec.log for x86_64 -- JMP_I
+    # lowers to `rdip t1,t1 ; limm t2,0 ; wrip t1,t2` and the wrip micro-op
+    # prints `RW=[] DR=[]`, no destination register at all.
+    #
+    # The row is emitted only where ``gem5_ref.ref_can_name(isa, PC_NAME)``
+    # is FALSE: the ISA's own mapper is RUN over its whole class/index domain
+    # and asked whether any index produces the wire's PC name.  So the rule
+    # rests on a property of the reference that something checked, and the
+    # day a mapper learns the register the rule stops applying by itself
+    # rather than excusing a real loss.  A row whose surplus is anything more
+    # than the program counter does not reach it.
+    'REF-MAPPER-HAS-NO-PC':
+        Rule('REF-MAPPER-HAS-NO-PC', 'reference-gap', {SUPERSET},
+             note="the reference's register mapper for this ISA cannot "
+                  'produce the program counter at any class and index, so a '
+                  'tracer PC write or read has no counterpart to disagree '
+                  'with'),
+
     # gem5 keeps the MIPS FP condition-code bit inside FCSR and reports an
     # FCSR write; the tracer gives the condition code an id of its own.  Same
     # bit, two spellings.

@@ -53,6 +53,7 @@ for _p in (HERE, os.path.join(HERE, '..'),
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import wire_vocab                                               # noqa: E402
 import gem5_ref                                                 # noqa: E402
 import gem5_env                                                 # noqa: E402
 import tracer_log                                               # noqa: E402
@@ -73,7 +74,7 @@ PIN_TO_GENERIC = {}
 for _i, _n in enumerate(_GPR):
     PIN_TO_GENERIC[_n] = 'REG_GPR%d' % _i
 PIN_TO_GENERIC.update({'rsp': 'REG_SP', 'rbp': 'REG_FP_REG',
-                       'rip': 'REG_PC', 'flags': 'REG_FLAGS',
+                       'rip': wire_vocab.pc_name(), 'flags': 'REG_FLAGS',
                        'rflags': 'REG_FLAGS', 'eflags': 'REG_FLAGS'})
 for _i in range(32):
     PIN_TO_GENERIC['vec%d' % _i] = 'REG_VEC%d' % _i

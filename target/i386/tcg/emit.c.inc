@@ -4610,6 +4610,30 @@ static void gen_VMOVHPx_ld(DisasContext *s, X86DecodedInsn *decode)
     if (decode->op[0].offset != decode->op[1].offset) {
         tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[1].offset + offsetof(XMMReg, XMM_Q(0)));
         tcg_gen_st_i64(s->tmp1_i64, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
+    } else if (decode->op[0].n >= 0 &&
+               decode->op[0].n < (int)ARRAY_SIZE(x86_xmm_names)) {
+        /*
+         * THE LOW HALF SURVIVES, SO THE DESTINATION IS ITS OWN SOURCE.
+         *
+         * `movhps m64,%xmm0` writes the high quadword and leaves DEST[63:0]
+         * exactly as it was, which makes the register's new value a function
+         * of the datum AND of its old value.  The three-operand VEX form
+         * copies that half from op[1] with an op the reader walks; the
+         * two-operand legacy form needs no copy because the bytes are already
+         * in place, so NOTHING in the op stream reads the destination and the
+         * wire published `ld[%gp4] -> %v0` -- the merge input missing from
+         * both the read set and the destination's account.  Measured on a
+         * freestanding probe: `0f 16 46 08` and `0f 16 45 a0` published
+         * src=[REG_GPR4] and src=[REG_FP_REG], the address base alone.
+         *
+         * Stated only on the form that elides the copy: saying it on the VEX
+         * form would name a register the instruction genuinely does not read.
+         */
+        InsnDataflowAtom dst = insn_df_reg(x86_xmm_names[decode->op[0].n]);
+        InsnDataflowAtom src[2] = { insn_df_loaded(), dst };
+
+        insn_dataflow_state_read(dst);
+        insn_dataflow_state_write_from(dst, src, 2);
     }
 }
 

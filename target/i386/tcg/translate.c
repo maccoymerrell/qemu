@@ -146,6 +146,19 @@ static const char seg_base_names[6][8] = {
     [R_GS] = "gs_base",
     [R_SS] = "ss_base",
 };
+/*
+ * The names the vector register file is declared under, at file scope for the
+ * same reason: tcg_x86_init declares the file, and the emitter of a
+ * partial-width move states the read of the half it leaves alone.
+ */
+static const char *const x86_xmm_names[] = {
+    "xmm0",  "xmm1",  "xmm2",  "xmm3",  "xmm4",  "xmm5",
+    "xmm6",  "xmm7",  "xmm8",  "xmm9",  "xmm10", "xmm11",
+    "xmm12", "xmm13", "xmm14", "xmm15", "xmm16", "xmm17",
+    "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23",
+    "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29",
+    "xmm30", "xmm31",
+};
 static TCGv_i64 cpu_bndl[4];
 static TCGv_i64 cpu_bndu[4];
 
@@ -4830,25 +4843,17 @@ void tcg_x86_init(void)
      * not sixteen unrelated ranges.
      */
     {
-        static const char *const xmm_p[] = {
-            "xmm0",  "xmm1",  "xmm2",  "xmm3",  "xmm4",  "xmm5",
-            "xmm6",  "xmm7",  "xmm8",  "xmm9",  "xmm10", "xmm11",
-            "xmm12", "xmm13", "xmm14", "xmm15", "xmm16", "xmm17",
-            "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23",
-            "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29",
-            "xmm30", "xmm31",
-        };
         static const char *const k_p[] = {
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
         };
         CPUX86State *e = NULL;
 
-        QEMU_BUILD_BUG_ON(ARRAY_SIZE(xmm_p) < ARRAY_SIZE(e->xmm_regs));
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(x86_xmm_names) < ARRAY_SIZE(e->xmm_regs));
         QEMU_BUILD_BUG_ON(ARRAY_SIZE(x86_x87_st_names) !=
                           ARRAY_SIZE(e->fpregs));
         QEMU_BUILD_BUG_ON(ARRAY_SIZE(k_p) != ARRAY_SIZE(e->opmask_regs));
 
-        insn_dataflow_declare_regfile(xmm_p, ARRAY_SIZE(e->xmm_regs),
+        insn_dataflow_declare_regfile(x86_xmm_names, ARRAY_SIZE(e->xmm_regs),
                                       offsetof(CPUX86State, xmm_regs),
                                       sizeof(e->xmm_regs[0]),
                                       sizeof(e->xmm_regs[0]));

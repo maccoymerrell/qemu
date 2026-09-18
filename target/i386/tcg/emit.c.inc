@@ -1957,8 +1957,61 @@ static void gen_CMPXCHG8B(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_deposit_tl(cpu_cc_src, cpu_cc_src, Z, ctz32(CC_Z), 1);
 }
 
+/*
+ * WHAT CPUID READS AND WRITES, WHICH ITS OPS DO NOT SAY.
+ *
+ * The whole instruction lowers to `gen_helper_cpuid(tcg_env)`.  Every
+ * register it touches lives in CPUX86State.regs and is reached through that
+ * one env pointer, so the op stream names none of them and the reader has
+ * nothing to walk: QEMU's answer for `0f a2` is an EMPTY source list and a
+ * destination list holding only the PC.  MEASURED on a freestanding probe at
+ * this tip, a `cpuid` with leaf in EAX and subleaf in ECX rendered
+ * `0f a2   mov  -> %ip[.../w8]` -- no source, none of the four results.
+ *
+ * WHAT THE HELPER DOES, from target/i386/tcg/misc_helper.c:
+ *
+ *     cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX],
+ *                        (uint32_t)env->regs[R_ECX], &eax,&ebx,&ecx,&edx);
+ *     env->regs[R_EAX] = eax;  env->regs[R_EBX] = ebx;
+ *     env->regs[R_ECX] = ecx;  env->regs[R_EDX] = edx;
+ *
+ * Two reads, four writes, and BOTH reads feed EVERY write: the leaf selects
+ * the answer and the subleaf selects within it, and cpu_x86_cpuid() consults
+ * both before filling any of the four outputs.  So each destination's
+ * provenance is {EAX, ECX}, which is what state_write_from() says -- naming
+ * only EAX there would publish a chain that the subleaf does not reach.
+ *
+ * WHY THE EMITTER MAY SAY IT.  Which registers this helper reads and writes
+ * is a STATIC property of the encoding: the same two in and the same four out
+ * for every execution of these bytes.  Nothing is observed and nothing is
+ * derived from a run.
+ *
+ * THE INTERCEPT IS NOT A GUARD.  Under softmmu cpu_svm_check_intercept_param()
+ * can longjmp out before the four writes land, exactly as a fault can leave
+ * any instruction's writes unperformed.  That is a per-EXECUTION outcome; the
+ * write set is the encoding's, and the same reasoning already governs the
+ * `syscall` statement above.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+static void note_cpuid_regs(void)
+{
+    InsnDataflowAtom leaf = insn_df_reg(x86_reg_names[R_EAX]);
+    InsnDataflowAtom sub = insn_df_reg(x86_reg_names[R_ECX]);
+    InsnDataflowAtom src[2] = { leaf, sub };
+    static const int out[4] = { R_EAX, R_EBX, R_ECX, R_EDX };
+
+    insn_dataflow_state_read(leaf);
+    insn_dataflow_state_read(sub);
+    for (unsigned i = 0; i < ARRAY_SIZE(out); i++) {
+        insn_dataflow_state_write_from(insn_df_reg(x86_reg_names[out[i]]),
+                                       src, 2);
+    }
+}
+
 static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
 {
+    note_cpuid_regs();
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_cpuid(tcg_env);

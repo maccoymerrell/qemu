@@ -45,12 +45,25 @@
  * have.  This layer cannot tell the difference -- it is handed offsets, not
  * the helper's body -- so the caller that knows says so; the entry points
  * without the mask pass all-read, which is what a plain expansion does.
+ *
+ * THE DESTINATION IS BOTH DIRECTIONS, AND THAT IS NOT A HEDGE.  Every caller
+ * of this function is an out-of-line form -- _ool or _ptr -- that hands the
+ * destination's address to a helper whose body this layer never sees, and a
+ * helper is free to leave bytes of it alone.  RISC-V's vector helpers do
+ * exactly that: under the undisturbed policies vext_set_elems_1s() returns
+ * without storing, so the masked-off and tail elements of vd keep the value
+ * they had, and vd's new contents are a function of its old ones.  Saying
+ * write-only here would delete that edge.  The inline expansions this file
+ * generates do write the whole destination, but they do not come through
+ * here -- all nine call sites are helper calls -- so the read half costs
+ * precision only where a helper happens to overwrite everything, and the
+ * pessimistic direction is the one this machinery keeps.
  */
 static void gvec_note_operands(uint32_t dofs, uint32_t oprsz,
                                const uint32_t *srcofs, unsigned n_src,
                                unsigned src_rd_mask)
 {
-    insn_dataflow_note_vec_operand(dofs, oprsz, INSN_DF_WR);
+    insn_dataflow_note_vec_operand(dofs, oprsz, INSN_DF_RD | INSN_DF_WR);
     for (unsigned i = 0; i < n_src; i++) {
         if (src_rd_mask & (1u << i)) {
             insn_dataflow_note_vec_operand(srcofs[i], oprsz, INSN_DF_RD);

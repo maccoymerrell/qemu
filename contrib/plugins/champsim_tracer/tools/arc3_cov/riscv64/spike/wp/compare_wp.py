@@ -85,6 +85,19 @@ def adjudicate(rel, only_ref, only_trc, bits, side):
         if only_trc and all(n == 'REG_ZERO' for n in only_trc):
             label = 'REF-X0-DISCARD' if side == 'dst' \
                 else 'REF-C-IMM-NO-X0-READ'
+        elif only_trc and 'REG_IP' in only_trc and \
+                only_trc <= {'REG_IP', 'REG_ZERO'}:
+            # THE PROGRAM COUNTER, on the wrong path.  The same rule the CP
+            # leg applies, applied here for the reason this function exists.
+            # execute.cc's log maps are keyed by a kind field whose switch
+            # enumerates x / f / v / vstatus / csr and asserts on anything
+            # else; there is no kind for the PC on either side, so the
+            # reference cannot state the read auipc/jal/jalr/branch perform
+            # or the write jal/jalr/a taken branch perform.  Only reachable
+            # under rel == SUPERSET, so it can never cover a row where the
+            # tracer dropped something.  A REG_ZERO riding along is the
+            # rd == x0 form, REF-X0-DISCARD's ground.
+            label = 'REF-NO-PC-REGISTER'
         elif is_fence(bits) and only_trc == {'REG_SYS'}:
             label = 'REF-NO-ORDERING-STATE'
         elif is_vset(bits) and 'REG_SYS' in only_trc and \

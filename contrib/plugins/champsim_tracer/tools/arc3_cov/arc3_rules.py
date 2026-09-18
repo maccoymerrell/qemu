@@ -390,6 +390,44 @@ RISCV_EXEC = {
                   'x0 operand the reference computes past, as '
                   'REF-C-IMM-NO-X0-READ describes'),
 
+    # THE PROGRAM COUNTER, WHICH SPIKE'S COMMIT LOG HAS NO REGISTER FOR.
+    #
+    # riscv/execute.cc commit_log_print_insn() prints exactly two register
+    # maps: state.log_reg_write and state.log_reg_read.  Both are keyed
+    # (reg << 4) | kind, and the switch over `item.first & 0xf` enumerates
+    # every kind there is -- 0 x, 1 f, 2 v, 3 vstatus, 4 c(sr) -- with
+    # `assert("can't been here" && 0)` on anything else.  There is no kind
+    # for the PC, on either side.  What the log prints of the PC is the
+    # instruction's own ADDRESS field, which is the position of the
+    # instruction and not a register it read or wrote.  So the reference
+    # cannot state a PC read or a PC write at all: an auipc's read of the
+    # PC, a jal's write of the link-relative next address, a branch's write
+    # of its own target.
+    #
+    # The wire does state them, because QEMU does: the PC has a declared
+    # regfile target and the decode sites note it, so it reaches the trace
+    # as REG_IP.  Exactly REF-NO-ORDERING-STATE's and REF-NO-XLEN-STATE's
+    # shape -- the reference does not model the fact as a register, so it
+    # cannot report the dependence -- and it is charged the same way.
+    #
+    # REG_ZERO rides in the same DESTINATION row on the forms whose rd is
+    # x0.  One row takes one label, so the label naming the register the
+    # reference structurally cannot represent wins, and the x0 half is
+    # covered by REF-X0-DISCARD's own ground (execute.cc skips item.first
+    # == 0, which is precisely an integer write to x0).
+    #
+    # MEASURED SUPERSET ON EVERY ROW IT LABELS.  Both branches that apply it
+    # sit inside a test that the reference's set is a SUBSET of the tracer's,
+    # so a row this rule covers can never be one where the tracer dropped
+    # something the reference stated.
+    'REF-NO-PC-REGISTER':
+        Rule('REF-NO-PC-REGISTER', 'reference-gap', {SUPERSET},
+             note='spike logs register reads and writes by kind (x/f/v/'
+                  'vstatus/csr) and has no kind for the program counter; the '
+                  'address it prints is the instruction position, not a '
+                  'register access.  Where the row also carries REG_ZERO '
+                  'that is the discarded x0 write REF-X0-DISCARD describes'),
+
     # The read-side twin of REF-VEC-ELEMENT-ONLY.  vectorUnit_t::elt() is
     # ELEMENT triggered on the read side too, so a fully masked-off (or
     # vl==0) vector operation reads no element of its operand registers and

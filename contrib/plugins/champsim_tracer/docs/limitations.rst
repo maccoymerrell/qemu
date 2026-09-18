@@ -967,7 +967,7 @@ distinct executed state — and are distinguished on the wire by
 .. _translator-forced-tb-exit:
 
 A translator-forced TB exit writes the PC, and the wire says so
---------------------------------------------------------------
+---------------------------------------------------------------
 
 A handful of instructions force the translation block to end
 because what follows must be translated under the new state they

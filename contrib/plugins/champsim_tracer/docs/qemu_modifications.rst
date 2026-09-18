@@ -1558,7 +1558,7 @@ Wrong-path syscalls: fetched, never performed
    instruction's destinations.
 
 AArch64: PAN does not apply to a debug read
-------------------------------------------
+-------------------------------------------
 
 The content gate that decides whether the currently-executing address space
 is the marked process reads the marker bytes at their pinned virtual address

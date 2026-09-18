@@ -33,6 +33,18 @@
  * bare `ptr` whose pointee this file cannot know -- it is not a claim that the
  * helper touches nothing, it is this file declining to guess, and the caller
  * then keeps the unbounded record and counts it.
+ *
+ * `fpst` IS A TYPED POINTEE AND WAS BEING TREATED AS A BARE ONE.  It spells
+ * `float_status *`, and a target builds one only by pointing into its own
+ * CPUArchState -- aarch64's fpstatus_ptr() adds offsetof(CPUARMState,
+ * vfp.fp_status[flavour]) to tcg_env and hands the result over.  So the
+ * extent is exactly what this file says it supplies for `Reg *`: the
+ * compiler's sizeof of the declared pointee.  Reading 0 here was not this
+ * file declining to guess, it was this file dropping an answer it had, and
+ * the cost was measured: with no extent the range is recorded as
+ * DF_FIELD_UNBOUNDED, insn_dataflow_field_reg() deliberately refuses to name
+ * an unstated extent, and every aarch64 FP instruction reached the wire
+ * naming no FP status register at all.
  */
 #define df_argsize_void      0
 #define df_argsize_noreturn  0
@@ -48,7 +60,7 @@
 #define df_argsize_ptr       0
 #define df_argsize_cptr      0
 #define df_argsize_env       0
-#define df_argsize_fpst      0
+#define df_argsize_fpst      sizeof(float_status)
 #define df_argsize_tl        0
 #define df_argsize(t)        df_argsize_##t
 

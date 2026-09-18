@@ -331,6 +331,12 @@ static inline int curr_insn_len(DisasContext *s)
 
 #ifdef TARGET_AARCH64
 void a64_translate_init(void);
+/*
+ * Install arm's helper-usage table.  The reader consults it when a helper
+ * argument is a pointer into env -- every `fpst' is one -- and the join
+ * refuses a table that does not account for every such helper.
+ */
+void arm_insn_df_declare_helper_usage(void);
 void gen_a64_update_pc(DisasContext *s, target_long diff);
 extern const TranslatorOps aarch64_translator_ops;
 #else

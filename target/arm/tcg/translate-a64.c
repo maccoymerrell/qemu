@@ -138,6 +138,13 @@ void a64_translate_init(void)
 {
     int i;
 
+    /*
+     * The helper-usage table, installed once beside the TCG globals: the
+     * reader consults it when a helper argument is a pointer into env, and
+     * the join refuses a table that does not account for every such helper.
+     */
+    arm_insn_df_declare_helper_usage();
+
     cpu_pc = tcg_global_mem_new_i64(tcg_env,
                                     offsetof(CPUARMState, pc),
                                     A64_DF_PC_NAME);
@@ -190,6 +197,50 @@ void a64_translate_init(void)
                                       offsetof(CPUARMState, cp15.tpidrro_el),
                                       sizeof(e->cp15.tpidrro_el[0]),
                                       sizeof(e->cp15.tpidrro_el[0]));
+    }
+
+    /*
+     * THE FP STATUS WORD, WHICH NO TCG GLOBAL NAMES.
+     *
+     * Every FP and SIMD helper reaches it as a pointer fpstatus_ptr() built
+     * by adding offsetof(CPUARMState, vfp.fp_status[flavour]) to tcg_env, so
+     * the op stream carries a call and a byte range.  With the range's extent
+     * now supplied by the helper-usage table, declaring it here is what turns
+     * that range into a register a consumer can name -- and until both were
+     * in place `fadd d6, d4, d5' published no FP status read and no FP status
+     * write, while the architecture says it reads FPCR's rounding mode and
+     * accumulates into FPSR's exception bits.
+     *
+     * ONE RANGE OVER THE WHOLE ARRAY, and that is the composed-register
+     * contract rather than a convenience.  QEMU keeps ONE architectural pair
+     * -- FPCR's controls and FPSR's accrued exceptions -- split across eight
+     * float_status flavours because A32, A64, half-precision, the FEAT_AFP
+     * alternate-handling forms and the Standard FPSCR Value need different
+     * softfloat configurations of the same architectural state;
+     * vfp_get_fpsr() reads the accrued bits back out of them together.  They
+     * are pieces of one register, so they intern as one, and an access to any
+     * flavour resolves to the container the wire's vocabulary has a word for.
+     *
+     * vfp.fpsr and vfp.fpcr -- the bits QEMU does NOT keep inside
+     * float_status -- are deliberately NOT in this span.  They are not
+     * adjacent to the array (xregs[] and the aa32 expansion scratch lie
+     * between), so a range that reached them would swallow storage belonging
+     * to other registers, and a declared range that gives one byte two names
+     * is the defect this declaration exists to avoid.  Nothing reaches those
+     * two words through a typed pointer anyway: their accesses go through
+     * env and are the helper-opacity class, not this one.
+     *
+     * The base and extent come from the compiler over this target's own
+     * structure, so they cannot drift from the layout they describe.
+     */
+    {
+        static const char *const fpst_p[] = { "fp_status" };
+        CPUARMState *e = NULL;
+
+        insn_dataflow_declare_regfile(fpst_p, 1,
+                                      offsetof(CPUARMState, vfp.fp_status),
+                                      sizeof(e->vfp.fp_status),
+                                      sizeof(e->vfp.fp_status));
     }
 }
 

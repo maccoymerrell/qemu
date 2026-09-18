@@ -15,6 +15,7 @@ exclusive_addr	REG_NONE	R7.7: reservation state is not a register
 exclusive_high	REG_NONE	R7.7: reservation state is not a register
 exclusive_val	REG_NONE	R7.7: reservation state is not a register
 ffr	REG_VCTRL	SVE first-fault register, per the incumbent row
+fp_status	REG_FCSR	the storage QEMU keeps the FP control and status register's live fields in: the rounding mode and the flush-to-zero, default-NaN and AFP controls it configures softfloat with, and the exception bits vfp_get_fpsr reads back out.  REG_FCSR is the wire's word for a rounding-mode-and-status register, which is what this is
 lr	REG_LR	regnames[30]: AArch64 spells X30 by its role
 p0	REG_PRED0	SVE predicate file index
 p1	REG_PRED1	SVE predicate file index

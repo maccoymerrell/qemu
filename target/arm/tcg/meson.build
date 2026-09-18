@@ -22,6 +22,29 @@ gen_a32 = [
 arm_ss.add(gen_a32)
 arm_ss.add(when: 'TARGET_AARCH64', if_true: gen_a64)
 
+#
+# What arm's helpers do through the pointers they are handed.
+#
+# insn-df-helper-usage.tsv adjudicates one direction per pointer argument; the
+# generator turns the rows into the table target/arm/tcg/insn-df-usage.c
+# installs beside the argument shapes the compiler derives from helper.h.
+#
+# AARCH64 ONLY, AND THE GATE IS THE TABLE'S OWN COMPLETENESS.  helper.h pulls
+# in helper-a64.h, helper-sve.h and helper-sme.h behind `#ifdef
+# TARGET_AARCH64', so a 32-bit arm target expands a strictly smaller helper
+# list -- and insn_dataflow_declare_helper_usage() aborts on a row that names
+# no helper this build has, which is the check working.  The table is the
+# AArch64 expansion's; 32-bit arm keeps the unbounded record it had.
+#
+insn_df_usage_arm = custom_target('arm-insn-df-usage.h.inc',
+  output: 'insn-df-usage.h.inc',
+  input: files('insn-df-helper-usage.tsv'),
+  command: [python, files(meson.project_source_root() /
+                          'scripts/insn-df-usage.py'),
+            '@INPUT@', '-o', '@OUTPUT@'])
+
+arm_ss.add(when: 'TARGET_AARCH64', if_true: [insn_df_usage_arm])
+
 arm_ss.add(files(
   'cpu32.c',
   'gengvec.c',
@@ -45,6 +68,7 @@ arm_ss.add(files(
 ))
 
 arm_ss.add(when: 'TARGET_AARCH64', if_true: files(
+  'insn-df-usage.c',
   'cpu64.c',
   'gengvec64.c',
   'translate-a64.c',

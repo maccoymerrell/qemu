@@ -3667,7 +3667,7 @@ static uint64_t g_seg_wm_deferred_records = 0;
  * enumerate the whole executable footprint up front, the plugin mints that
  * side exactly when a branch is evaluated: at every branch the correct path
  * or a wrong-path excursion resolves, the UNTAKEN side's true BB is decoded
- * (through the same Capstone -> decode_detail_to_generic -> fragment-splitter
+ * (through the same translate-and-keep -> qdep -> fragment-splitter
  * machinery the dynamic path uses) and minted as an ordinary never-executed
  * dictionary template — unless it is already covered.  Coverage is therefore
  * CONVERGENT (the dictionary fills as branches are seen) and mode-independent

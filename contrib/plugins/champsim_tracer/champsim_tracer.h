@@ -1702,9 +1702,21 @@ void altmint_conditional_alternate(const InsnFields *terminal,
                                    uint64_t followed_pc);
 
 /*
- * decode_detail_to_generic() and decode_synthetic_ea() are the Capstone
- * operand walk.  They are not in the plugin: they are declared in
- * champsim_tracer_capstone_tables.h and built into the two offline tools.
+ * THERE IS NO OPERAND WALK HERE, AND NO HEADER DECLARING ONE.
+ *
+ * This block used to point at decode_detail_to_generic() and
+ * decode_synthetic_ea() in champsim_tracer_capstone_tables.h.  Both functions
+ * and that header are gone with Capstone, and a pointer to a file the tree
+ * does not contain is worse than no pointer at all.
+ *
+ * What fills an InsnFields now is champsim_tracer_qdep.cc: it reads the facts
+ * QEMU's own decode and op walk state through qemu_plugin_insn_* (the
+ * register sets, the per-access rows and their address and datum provenance,
+ * the lane shape, the immediate), maps the names through
+ * champsim_tracer_regmap.cc, and seats them.  The reference decoder the
+ * acceptance comparison scores that against is OFFLINE and out of process --
+ * tools/cst_referee.py, over recorded bytes -- so nothing it says can reach
+ * the wire.
  */
 
 /*

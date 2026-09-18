@@ -609,8 +609,8 @@ int TemplateStore::template_branch_index(const BBTemplate *tmpl)
  * alias the shared zero arrays below so an out-of-count read still returns
  * 0 (bit-identical to the old fixed-array g_new0 semantics).  The arrays
  * are non-const only to keep the span pointer type uniform; nothing writes
- * spans after commit (verified: every writer runs inside
- * decode_detail_to_generic or a .dep_refine it calls, on scratch backing).
+ * spans after commit (verified: every writer runs inside the qdep seating
+ * pass, on scratch backing, before the fields are committed here).
  */
 static uint64_t g_zero_mask64[MAX_SRC_REGS];
 static uint8_t  g_zero_reg8[MAX_SRC_REGS];

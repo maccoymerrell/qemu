@@ -649,11 +649,12 @@ without implying any particular numeric base.
 Atomic flag (``CST_INSN_FLAG_ATOMIC``)
 --------------------------------------
 
-Single bit in the per-instruction template flags byte.  Set in
-``decode.cc::decode_detail_to_generic`` when either (a) Capstone
-reports the x86 ``LOCK`` prefix on this instruction
-(``info->has_lock``), or (b) the per-ISA classifier row has the
-``MF_ATOMIC`` flag.  In practice this fires on every
+Single bit in the per-instruction template flags byte.  QEMU's own
+translator states the fact — ``insn_dataflow_note_property``
+(``INSN_DF_P_ATOMIC``) at the emitter of each atomic family, and at
+x86's decoder for any instruction carrying the ``LOCK`` prefix — and
+the plugin's qdep seating pass reads it back through
+``QEMU_PLUGIN_DF_P_ATOMIC``.  In practice this fires on every
 ``GEN_OP_XCHG`` (the ``cmpxchg`` / ``xadd`` / ``xchg`` / AArch64
 ``cas`` / RISC-V ``amo*`` / MIPS ``ll`` family) and on every
 ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` row (``clflush``,

@@ -1535,8 +1535,8 @@ other approaches would force does not arise.
 At every branch the correct path or a wrong-path excursion resolves, the
 plugin checks whether the side NOT followed already has a template and,
 on a miss, decodes that one true BB through the same
-``qemu_plugin_cap_decode`` -> ``decode_detail_to_generic`` ->
-fragment-splitter path the dynamic path uses, then mints it.  The
+``qemu_plugin_translate_at`` -> qdep-seating -> fragment-splitter path
+the dynamic path uses, then mints it.  The
 alternate is dictionary-only: no :class:`WPBBEntry`, no dynamic state,
 no body record, and no wire flag at all — a minted alternate is
 indistinguishable from any other block that simply never executed,

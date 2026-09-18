@@ -51,7 +51,15 @@ set -u
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLS=$(cd "$HERE/../.." && pwd)
-QEMU_ROOT=$(cd "$TOOLS/../../.." && pwd)
+# FOUR LEVELS, NOT THREE.  FINDING 244-B.  $TOOLS is
+# contrib/plugins/champsim_tracer/tools, so three `..` reach `contrib` and the
+# default capture build resolved to contrib/build-cap212, which does not
+# exist.  The error never showed because r13_legs.sh always passed
+# --build-dir, so the default was dead code until 244-A stopped it doing that;
+# with the default finally live, rule_universe refused "no emulator" on all
+# four ISAs.  The same directory is what --spec, --corpus and the capture arm
+# are all measured against, so getting it wrong is not cosmetic.
+QEMU_ROOT=$(cd "$TOOLS/../../../.." && pwd)
 PY=${CST_PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}
 ISAS="x86_64 aarch64 riscv64 mipsel"
 

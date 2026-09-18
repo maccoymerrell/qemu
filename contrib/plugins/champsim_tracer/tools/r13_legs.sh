@@ -219,9 +219,23 @@ run_leg pin "$HERE/arc3_pinexec/run_reg_arm.sh" "$ROOT/_work/pin" "$BUILD" &
 #     names a SPEC tree.  With neither it refuses and writes no report, which
 #     the gate then reads as REPORT MISSING: correct, because that is what a
 #     leg that did not run has earned.
-run_leg referee env CST_REF_CORPUS="${CST_REF_CORPUS:-}" \
-        CST_CAPTURE_BUILD="$BUILD" \
-        "$T/referee/REPRODUCE.sh" "$ROOT" --build-dir "$BUILD" &
+#
+# ITS BUILD DIRECTORY IS NOT THIS DRIVER'S.  FINDING 244-A.  `--build-dir`
+# here names the build whose TRACER the other ten legs measure; the referee's
+# names the CAPTURE build (-Dcst_capture=true) that wrote the corpus, and the
+# two are different trees on this host.  rule_universe.py reads that build's
+# own decode rules and gapreport refuses when the universe's emulator is not
+# the one stamped into the corpus -- correctly, because a rule the release
+# build dropped and the capture build kept would read as alive.  Passing the
+# release build to both made all four `refopc` rows plus `refopcdead` read
+# REFUSED on every pass: five red rows about the apparatus, not the trace.
+# So the referee's build is taken from CST_CAPTURE_BUILD alone, passed
+# through unchanged, and an unset value leaves REPRODUCE.sh on its own
+# default rather than silently inheriting this driver's.
+REFENV=(CST_REF_CORPUS="${CST_REF_CORPUS:-}")
+[ -n "${CST_CAPTURE_BUILD:-}" ] &&
+    REFENV+=(CST_CAPTURE_BUILD="$CST_CAPTURE_BUILD")
+run_leg referee env "${REFENV[@]}" "$T/referee/REPRODUCE.sh" "$ROOT" &
 
 wait
 

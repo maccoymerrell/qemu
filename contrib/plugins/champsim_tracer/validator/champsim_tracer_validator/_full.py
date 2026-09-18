@@ -299,6 +299,7 @@ def _classify_cli_failure(tail: str) -> str:
     Prefer the sub-check's own verdict line, then a recognised stall,
     then the last non-empty line, which is where a CLI puts its
     complaint when it has no structured verdict to offer.
+
     """
     lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
     for ln in lines:
@@ -444,7 +445,10 @@ def _chk_symbol(ctx: Ctx) -> Outcome:
                        f"({traced or 'no stats'}) — symbol-trigger regression")
     args2 = _mk(out_dir=d, isa="x86_64", build_dir=ctx.build_dir,
                 prog="sym", start_symbol="blk_1", stop=100_000)
-    M.cmd_analyze(args2, "x86_64")
+    if M.cmd_analyze(args2, "x86_64") != 0:
+        return Outcome("fail", "blk_1 symbol window opened but the ground "
+                               "truth could not be annotated; validate would "
+                               "have scored against an un-annotated meta")
     rc = M.cmd_validate(args2, "x86_64")
     if rc != 0:
         return _rc_outcome(rc, "blk_1 symbol window opened but validation "

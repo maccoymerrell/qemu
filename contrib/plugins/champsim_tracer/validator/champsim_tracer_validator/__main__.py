@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import generator as G
 from . import analyzer as A
+from . import classify as CLASSIFY
 from . import validator as V
 from . import _system as SYS
 from . import _full as FULL
@@ -1129,7 +1130,17 @@ def cmd_analyze(args, isa: str | None = None) -> int:
     if not bin_path.is_file() or not meta.is_file():
         print(f"analyze[{isa}]: SKIP  missing inputs")
         return 0
-    A.analyze(bin_path, meta)
+    try:
+        A.analyze(bin_path, meta)
+    except CLASSIFY.ClassifierUnavailable as exc:
+        # ONE NAMED, COUNTED, PER-ISA FAILURE -- never a process exit.
+        # The classification population lives in one file shared by every
+        # ISA, so a refusal here would otherwise be identical for all four;
+        # reporting it per ISA and returning keeps the caller free to run
+        # the remaining ISAs and every other check, which is the whole
+        # point of refusing rather than guessing.
+        print(f"analyze[{isa}]: FAIL  classifier unavailable: {exc}")
+        return 1
     print(f"analyze[{isa}]: annotated {meta.name}")
     return 0
 
@@ -1271,7 +1282,14 @@ def cmd_all(args) -> int:
         # so they get no ground-truth spans); validate aligns the user
         # subsequence against correct_path and structurally checks the
         # syscall->kernel->user transitions.
-        cmd_analyze(args, isa)
+        # analyze's verdict GATES.  It used to be discarded, so a refused
+        # or failed annotation left validate to score the trace against a
+        # meta file with no ground truth in it -- a check laundering its
+        # own missing subject.  A failure here fails this ISA and moves to
+        # the next one; it does not end the run.
+        if cmd_analyze(args, isa) != 0:
+            rc_total = 1
+            continue
         if cmd_validate(args, isa) != 0:
             rc_total = 1
     # THE "(must be 0)" CENSUS.  Every counter the plugin labels "(must be 0)"
@@ -1639,7 +1657,11 @@ def mt_content_cell(args, isa: str, seed: int, out_dir: Path,
     # mutation: an oracle re-derived from a mutated binary would agree
     # with it and prove nothing.
     for t in index["threads"]:
-        A.analyze(bin_path, out_dir / t["meta"])
+        try:
+            A.analyze(bin_path, out_dir / t["meta"])
+        except CLASSIFY.ClassifierUnavailable as exc:
+            print(f"mt_content[{isa}]: FAIL  classifier unavailable: {exc}")
+            return 1
 
     cst_path = Path(f"{bin_path}.cst")
     depth = int(getattr(args, "depth", 64))

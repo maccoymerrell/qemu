@@ -389,6 +389,36 @@ def cap_x86_is_x87_tag_only(m):
     return m == "ffreep"
 
 
+_FCMOV = ("fcmovb", "fcmovbe", "fcmove", "fcmovu",
+          "fcmovnb", "fcmovnbe", "fcmovne", "fcmovnu")
+
+
+def cap_x86_is_fcmov(m):
+    """
+    FCMOVcc: Capstone's two access flags are the wrong way round.
+
+    Intel's Operation for `FCMOVcc ST(0), ST(i)` is `IF condition THEN
+    ST(0) <- ST(i)`, so ST(0) is the destination -- read as well as
+    written, because the false condition leaves it as it was -- and ST(i)
+    is a pure source.  Measured on the pinned build (capstone 6.0.0a7,
+    `da c1` = fcmovb, Intel syntax): operand 0 is st(0) with access
+    CS_AC_READ and operand 1 is st(1) with access CS_AC_WRITE.  The ROLES
+    are inverted, which makes the reference name a destination the
+    instruction never writes and miss the one it does.
+
+    This decoder runs in AT&T syntax, which reverses the operand array,
+    so ST(0) is the LAST operand here and that is the one corrected to
+    read-and-write.
+
+    Same family as the PEXTR and store-move entries above: a Capstone
+    access-flag defect, corrected where the referee reads it rather than
+    excused in the arbitration table -- an arbitration row keyed on
+    (isa, name, direction) would also cover every future REG_FPR1 write
+    loss, and this defect is not that broad.
+    """
+    return m in _FCMOV
+
+
 def cap_x86_skip_rep(m):
     for p in ("rep ", "repe ", "repz ", "repne ", "repnz "):
         if m.startswith(p):
@@ -498,6 +528,7 @@ def fill_x86(isa, insn, out):
     ktest_op = cap_x86_is_ktest(m)
     ssp_read = cap_x86_is_ssp_read(m)
     tag_only = cap_x86_is_x87_tag_only(m)
+    fcmov = cap_x86_is_fcmov(m)
 
     if ktest_op:
         _implicit_add(out.regs_write_id, XC.X86_REG_EFLAGS)
@@ -510,6 +541,10 @@ def fill_x86(isa, insn, out):
             op.access = ACC_READ
         if dest_last and cop.type != XC.X86_OP_IMM:
             op.access = ACC_WRITE if i == n - 1 else ACC_READ
+        if fcmov and cop.type == XC.X86_OP_REG:
+            # This decoder runs in AT&T syntax, so the destination ST(0)
+            # is the LAST operand, not the first.
+            op.access = (ACC_READ | ACC_WRITE) if i == n - 1 else ACC_READ
         if tag_only:
             op.kind = OP_INVALID
             op.access = 0

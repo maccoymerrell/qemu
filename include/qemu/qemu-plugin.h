@@ -79,8 +79,6 @@ typedef uint64_t qemu_plugin_id_t;
  *   the one below — see version 6.
  *
  * version 6:
- * - added qemu_plugin_insn_detail (structured Capstone detail for
- *   instruction operands, groups, and implicit registers)
  * - INCOMPATIBLE: qemu_plugin_spec_mode_begin() gained @saved_state
  *   while the version constant still read 5, so 5 names both the
  *   no-argument and the one-argument spelling and cannot be honoured
@@ -1210,56 +1208,6 @@ typedef struct qemu_plugin_insn_info {
     uint16_t regs_read_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
     uint16_t regs_write_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
 } qemu_plugin_insn_info;
-
-/**
- * qemu_plugin_insn_detail() - get structured instruction details
- * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
- * @info: output structure filled with Capstone detail fields
- *
- * Decodes the instruction using Capstone with detail mode enabled
- * and fills @info with operand types, access modes, implicit register
- * names, instruction groups, and prefix information.
- *
- * Register names are ISA-native strings from Capstone (e.g. "rax",
- * "xmm0" for x86; "x0", "sp" for AArch64).
- *
- * Returns true on success, false if Capstone is unavailable or the
- * instruction could not be decoded.
- */
-QEMU_PLUGIN_API
-bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
-                             qemu_plugin_insn_info *info);
-
-/**
- * qemu_plugin_cap_decode() - decode raw instruction bytes via Capstone
- * @cap_arch: Capstone architecture — pass a Capstone ``cs_arch`` enum value
- *            (e.g. CS_ARCH_X86, CS_ARCH_AARCH64, CS_ARCH_RISCV, CS_ARCH_MIPS).
- * @cap_mode: Capstone mode flags — pass a bitmask of Capstone ``cs_mode``
- *            enum values (e.g. CS_MODE_64, CS_MODE_RISCV64 | CS_MODE_RISCV_C).
- * @data: pointer to raw instruction bytes
- * @size: number of bytes available at @data
- * @pc: virtual address of the instruction
- * @info: output structure filled with Capstone detail fields
- *
- * Opens a standalone Capstone handle with the requested architecture
- * and mode, enables detail mode, and decodes the first instruction
- * from @data.  Unlike qemu_plugin_insn_detail(), this function does
- * not depend on QEMU's per-target disassembler — it works for any
- * ISA that Capstone supports, given the correct arch/mode.
- *
- * The @cap_arch and @cap_mode arguments are forwarded verbatim to
- * cs_open(), so plugins should include <capstone/capstone.h> and
- * use the canonical Capstone enum values rather than shadow constants.
- * This insulates plugins from any future renumbering inside Capstone.
- *
- * x86 automatically uses AT&T syntax.
- *
- * Returns true on success, false if Capstone cannot open or decode.
- */
-QEMU_PLUGIN_API
-bool qemu_plugin_cap_decode(int cap_arch, unsigned int cap_mode,
-                            const uint8_t *data, size_t size,
-                            uint64_t pc, qemu_plugin_insn_info *info);
 
 /**
  * qemu_plugin_insn_symbol() - best effort symbol lookup

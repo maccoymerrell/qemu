@@ -119,6 +119,32 @@ _IN = re.compile(r'^0x0*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)(\S.*)?$')
 _CONT = re.compile(r'^\s*((?:[0-9a-fA-F]{2}\s*)+)$')
 _MARK = re.compile(r'^\s*----\s+([0-9a-fA-F]+)\s')
 
+#
+# THE SECOND SHAPE `-d in_asm` PRINTS, AND WHY THIS READER MUST KNOW BOTH.
+#
+# With a disassembler configured for the target, each instruction arrives as
+# `0x<addr>:  <byte> <byte> ...  <mnemonic> <operands>` and `_IN` above reads
+# all three parts off one line.  With none configured -- which is this tree
+# after the Capstone exit -- disas/objdump.c takes the fallback route and
+# prints the address line with NOTHING after the colon, then the encoding on
+# its own `OBJD-T:` line as one unbroken hex string.
+#
+# `_IN` cannot match an address line with no bytes, so on that shape the
+# reader saw no instructions at all and `parse_dump` returned an EMPTY table.
+# Every caller then asked `Oracle.ask` about an encoding the table did not
+# hold and got UNKNOWN, which the comparison correctly treats as a refusal --
+# so the x86 wrong-path leg reported REF-PRESERVE-READ-UNDECIDED on every row
+# where gem5 named a preserve-read, and the refusal said "QEMU has no answer"
+# when the truth was "this reader could not read the file".
+#
+# Both shapes are accepted here rather than one being normalised into the
+# other, because a tree with a disassembler still prints the first and a
+# reader that handled only the second would have the same blindness pointed
+# the other way.
+#
+_IN_BARE = re.compile(r'^0x0*([0-9a-fA-F]+):\s*$')
+_OBJD = re.compile(r'^\s*OBJD-[TH]:\s*([0-9a-fA-F]+)\s*$')
+
 
 class ParseError(RuntimeError):
     pass
@@ -222,7 +248,15 @@ def parse_dump(path):
             by = m.group(2).split()
             pend = (pc, by, (m.group(3) or '').strip())
             continue
+        m = _IN_BARE.match(line.strip())
+        if m and not in_ops:
+            pend = (int(m.group(1), 16), [], '')
+            continue
         if pend is not None and not in_ops:
+            m = _OBJD.match(line)
+            if m:
+                pend[1].append(m.group(1).lower())
+                continue
             m = _CONT.match(line)
             if m:
                 pend[1].extend(m.group(1).split())
@@ -239,6 +273,12 @@ def parse_dump(path):
                 continue
             pc, by, disas = pend
             if int(m.group(1), 16) != pc:
+                cur = None
+                continue
+            if not by:
+                # An address line whose encoding never arrived.  Keying an
+                # Encoding on the empty string would make one bucket that
+                # every unreadable instruction falls into and answers for.
                 cur = None
                 continue
             enc = ''.join(by).lower()
@@ -369,7 +409,27 @@ class Oracle(object):
         self.refused = collections.Counter()
 
     def add_dump(self, path):
-        for enc, e in parse_dump(path).items():
+        #
+        # A DUMP THAT YIELDS NOTHING IS A READER FAULT, NOT AN ANSWER.
+        #
+        # `ask` returns UNKNOWN for an encoding the table does not hold, and
+        # every caller treats UNKNOWN as a refusal -- so an empty table makes
+        # the oracle refuse every row while reporting no error at all.  That
+        # is exactly what happened when `-d in_asm` changed shape: the leg
+        # printed REF-PRESERVE-READ-UNDECIDED and nothing said the file had
+        # not been read.  A dump QEMU wrote ops into and this reader found no
+        # instruction in is now loud.
+        #
+        found = parse_dump(path)
+        if not found:
+            with open(path, 'r', errors='replace') as fh:
+                has_ops = any(l.strip() == 'OP:' for l in fh)
+            if has_ops:
+                raise RuntimeError(
+                    'preserve oracle read no instruction out of %s, which '
+                    'does contain op blocks -- the dump shape is one this '
+                    'reader does not know' % path)
+        for enc, e in found.items():
             if enc in self.table:
                 continue
             try:

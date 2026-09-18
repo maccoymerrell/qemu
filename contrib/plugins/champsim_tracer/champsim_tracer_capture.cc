@@ -960,8 +960,9 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
     char enc[2 * 32 + 1];
 
     hex_bytes(bytes, nbytes, enc, sizeof(enc));
+}
 
-    void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
+void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
                             const void *bytes, size_t nbytes)
 {
     if (!tb || !bytes || !nbytes) {

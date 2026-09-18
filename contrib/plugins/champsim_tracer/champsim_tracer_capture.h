@@ -129,8 +129,7 @@ enum {
  * so a release plugin does not so much as reference it.
  */
 void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
-                            const void *bytes, size_t nbytes,
-                            const char *mnem);
+                            const void *bytes, size_t nbytes);
 
 /*
  * How the env pointers instruction @idx handed its helpers were recorded:

@@ -4325,6 +4325,24 @@ static bool trans_LD_mult(DisasContext *s, arg_ldst_mult *a)
 
     elements = (a->q ? 16 : 8) >> size;
     tcg_ebytes = tcg_constant_i64(1 << size);
+    if (a->selem != 1) {
+        /*
+         * DE-INTERLEAVING: ONE ACCESS OF @total BYTES, EMITTED ELEMENT BY
+         * ELEMENT.  The promotion above is what keeps `ld1' honest -- its
+         * bytes reach one register in order, so consecutive elements become
+         * one wider access and the rows the reader sees are the accesses the
+         * architecture names.  LD2/LD3/LD4 cannot take it: element e of each
+         * of the selem registers is interleaved in memory, so the loop below
+         * emits one access per element and the reader, which may record
+         * INSN_DF_MAX_MEMOPS of them, saw sixty-four for `ld4 {v0.16b-v3.16b}'
+         * and refused the whole instruction -- destinations included.
+         *
+         * The extent stated here is the one gen_mte_checkN was just given:
+         * @total bytes from the same base, which is the region this
+         * instruction reads whichever way the elements are distributed.
+         */
+        insn_dataflow_note_split_access();
+    }
     for (r = 0; r < a->rpt; r++) {
         int e;
         for (e = 0; e < elements; e++) {
@@ -4416,6 +4434,10 @@ static bool trans_ST_mult(DisasContext *s, arg_ldst_mult *a)
 
     elements = (a->q ? 16 : 8) >> size;
     tcg_ebytes = tcg_constant_i64(1 << size);
+    if (a->selem != 1) {
+        /* The store side of the same fact; see trans_LD_mult. */
+        insn_dataflow_note_split_access();
+    }
     for (r = 0; r < a->rpt; r++) {
         int e;
         for (e = 0; e < elements; e++) {

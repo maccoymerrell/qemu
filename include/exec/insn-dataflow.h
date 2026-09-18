@@ -545,6 +545,14 @@ typedef struct InsnDataflow {
     bool     self_loop_iterated;
 
     /*
+     * The emitter said its lowering split this instruction's guest access.
+     * Consecutive same-direction accesses then fold into one row at the
+     * extent the architecture names; see insn_dataflow_note_split_access().
+     * Internal to the reader -- what a consumer sees is the folded row.
+     */
+    bool     split_access;
+
+    /*
      * The decode rule the bytes reached, and the generic word that rule
      * carries.  Both are static strings owned by the target; NULL means no
      * rule matched, which is a different answer from a rule that matched and
@@ -1001,6 +1009,41 @@ void insn_dataflow_refuse_vec_lane(unsigned reason);
 void insn_dataflow_note_self_loop(unsigned memops, bool iterated);
 
 /*
+ * THE LOWERING SPLIT THIS INSTRUCTION'S ACCESS; THE ARCHITECTURE DID NOT.
+ *
+ * aarch64 `ld4 {v20.16b-v23.16b},[x21]' reads ONE contiguous sixty-four byte
+ * region and de-interleaves it into four registers.  The elements of each
+ * register are not contiguous in memory, so the emitter cannot promote the
+ * run the way it promotes `ld1', and it emits sixty-four one-byte accesses to
+ * put each element where it belongs.  Sixty-four rows do not fit in
+ * INSN_DF_MAX_MEMOPS, and the reader then correctly refuses an instruction it
+ * cannot record whole -- so the encoding published no destination register at
+ * all, which is worse than publishing the access at the extent the
+ * architecture names.
+ *
+ * WHAT THIS STATES, AND WHY IT IS NOT A CAP BUMP IN DISGUISE.  Raising
+ * INSN_DF_MAX_MEMOPS to sixty-four costs forty-eight more rows on EVERY
+ * instruction of the per-translation scratch -- about 1.7 MiB per thread on
+ * top of the allocation that already has an open item against it -- to
+ * record, one byte at a time, an access QEMU's own emitter already knows the
+ * whole extent of: trans_LD_mult computes `total' and hands it to
+ * gen_mte_checkN as one region before the element loop runs.  This says that
+ * out loud instead.  The consecutive same-direction accesses emitted by the
+ * instruction that states this fold into ONE row whose size is their sum,
+ * whose address account is their union and whose datum account is their
+ * union.  A direction change starts a new row, so a load run and a store run
+ * stay two accesses.
+ *
+ * IT IS THE EMITTER'S TO STATE AND NOBODY ELSE'S.  Contiguity alone is not a
+ * licence: `ldp q26,q27,[x20,#128]' also loads thirty-two adjacent bytes, and
+ * those ARE two architectural accesses, one per destination register.  Only
+ * the code that chose the granule knows which it is, which is why this is a
+ * statement at the emitter rather than a rule the reader infers from
+ * addresses.
+ */
+void insn_dataflow_note_split_access(void);
+
+/*
  * One operand of a vector expansion: where it lives in CPUArchState, how many
  * bytes of it the helper may touch, and whether it is read, written or both.
  *
@@ -1152,6 +1195,8 @@ static inline void insn_dataflow_refuse(void)
 static inline void insn_dataflow_note_immediate(uint64_t value, unsigned role)
 { }
 static inline void insn_dataflow_note_self_loop(unsigned memops, bool iterated)
+{ }
+static inline void insn_dataflow_note_split_access(void)
 { }
 static inline void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)
 { }

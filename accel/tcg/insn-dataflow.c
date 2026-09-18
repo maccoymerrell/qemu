@@ -660,6 +660,60 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
             return;
         }
     }
+
+    /*
+     * TWO WRITES THAT TOUCH ARE ONE WRITE, AND THIS IS EXACT.
+     *
+     * `ld4 {v20.16b-v23.16b}' writes its four destinations one byte at a
+     * time -- sixty-four rows against sixteen slots -- and the same shape
+     * reaches any register a lowering fills piecewise.  Merging two adjacent
+     * WRITE rows of one declared register gives a row covering exactly the
+     * bytes those two covered: df_env_writes_cover() answers identically for
+     * every offset, so the rule the write side exists to serve is untouched.
+     *
+     * WHY THE MERGE IS THIS NARROW.  The write row carries an account of
+     * where its bytes came from, and merging rows with DIFFERENT accounts
+     * would hand a later read inside the same instruction the union instead
+     * of the bytes' own source -- a source it did not have.  So the accounts
+     * must be identical, which is what makes this a re-spelling of the same
+     * rows rather than an approximation of them.  A row that is also read is
+     * left alone for the same reason: its RD half was canonicalised to the
+     * whole register above, and growing it would move the read.
+     */
+    if (dir == INSN_DF_WR && df_container(off, size, &c_off, &c_size)) {
+        static const uint64_t no_prov[INSN_DF_REG_WORDS];
+
+        for (unsigned i = 0; i < d->n_fields; i++) {
+            InsnDataflowField *f = &d->fields[i];
+            uint32_t f_coff, f_csize;
+
+            if (f->dir != INSN_DF_WR || f->sourced != sourced ||
+                f->from_loads != from_loads ||
+                f->size == DF_FIELD_UNBOUNDED) {
+                continue;
+            }
+            if (!df_container(f->off, f->size, &f_coff, &f_csize) ||
+                f_coff != c_off) {
+                continue;
+            }
+            if (off + size < f->off || f->off + f->size < off) {
+                continue;       /* disjoint, and not even touching */
+            }
+            if (memcmp(f->prov, prov ? prov : no_prov,
+                       sizeof(f->prov)) != 0) {
+                continue;
+            }
+            {
+                uint32_t lo = MIN(f->off, off);
+                uint32_t hi = MAX(f->off + f->size, off + size);
+
+                f->off = lo;
+                f->size = hi - lo;
+            }
+            return;
+        }
+    }
+
     if (d->n_fields >= INSN_DF_MAX_FIELDS) {
         d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
         return;
@@ -691,6 +745,32 @@ static int df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
 {
     InsnDataflowMemop *m;
     int k;
+
+    /*
+     * THE EMITTER SAID THIS RUN IS ONE ACCESS, SO IT GETS ONE ROW.
+     *
+     * The fold is bounded by the direction because that is the one thing a
+     * run cannot cross and still be one access: a load run and a store run
+     * are two accesses however adjacent their addresses are.  Size adds --
+     * the run covers a contiguous region and its extent is the sum -- and
+     * both accounts union, because the address every element was computed
+     * from and the datum they carry between them are the access's own.
+     */
+    if (d->split_access && d->n_memops > 0 &&
+        d->memops[d->n_memops - 1].dir == dir) {
+        uint32_t grown;
+
+        m = &d->memops[d->n_memops - 1];
+        grown = (uint32_t)m->size + size;
+        m->size = grown > UINT16_MAX ? UINT16_MAX : (uint16_t)grown;
+        if (addr_prov) {
+            df_union(m->addr_prov, addr_prov);
+        }
+        if (data_prov) {
+            df_union(m->data_prov, data_prov);
+        }
+        return (int)(d->n_memops - 1);
+    }
 
     if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
         d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
@@ -1661,6 +1741,14 @@ void insn_dataflow_note_self_loop(unsigned memops, bool iterated)
     }
     d->self_loop_memops = (uint8_t)memops;
     d->self_loop_iterated = iterated;
+}
+
+void insn_dataflow_note_split_access(void)
+{
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    df->out[df->cur].split_access = true;
 }
 
 void insn_dataflow_note_vec_shape(unsigned vece, uint32_t oprsz)

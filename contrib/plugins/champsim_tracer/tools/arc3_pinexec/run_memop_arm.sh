@@ -78,7 +78,15 @@ ENV=(env -i HOME=/tmp LANG=C)
     ./w >q.stdout 2>q.err
 [ $? -eq 0 ] || fail "tracer run (see $OUT/q.err)"
 
-"$QB"/contrib/plugins/cst_decode --format=disasm --objdump q.cst > q.disasm 2>q.dec.err
+# THE REFERENCE-MNEMONIC COLUMN IS GONE AND THAT IS THE DESIGN.
+# `--objdump` rendered a Capstone column beside the generic one and
+# retired with the tables at c32824defa; the comparison's Capstone
+# side is an OFFLINE producer now (tools/cst_referee.py).  The column
+# was a LABEL on report rows and never a term in the criterion -- the
+# row keys carry the ENCODING, which is strictly finer than any
+# mnemonic -- so dropping it costs the report a word per row and the
+# scoring nothing.  qextract_mem.py fills `c` with "-" and says so.
+"$QB"/contrib/plugins/cst_decode --format=disasm q.cst > q.disasm 2>q.dec.err
 [ $? -eq 0 ] || fail "cst_decode (see $OUT/q.dec.err)"
 PYTHONPATH=$HERE "$PY" "$HERE"/qextract_mem.py q.disasm $N > qm.jsonl 2>q.ext.err
 [ $? -eq 0 ] || fail "qextract_mem (see $OUT/q.ext.err)"

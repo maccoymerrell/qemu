@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse `cst_decode --format=disasm --objdump` into the linear CORRECT-PATH
+"""Parse `cst_decode --format=disasm` into the linear CORRECT-PATH
 instruction stream, one JSON object per line, carrying every field the PIN
 cross-check needs.
 
@@ -10,7 +10,18 @@ Per record:
          cst_decode's 9-byte column width (a 10..15-byte x86 instruction is
          glued to the mnemonic) -- see syncexp/README.md.
     m    generic opcode mnemonic (the plugin's own classification)
-    c    Capstone mnemonic (the --objdump column)
+    c    the REFERENCE decoder's mnemonic, or '-'.  It was the
+         `--objdump` column until c32824defa retired that flag with the
+         Capstone tables; the reference side of this comparison is an
+         OFFLINE producer now (tools/cst_referee.py), so the column
+         arrives empty and this reader writes '-' rather than a blank.
+         IT IS A LABEL AND NEVER A TERM IN THE CRITERION: every row key
+         that carries it also carries `b`, the ENCODING, which is
+         strictly finer than any mnemonic, so no two rows can merge for
+         want of it.  The parser already tolerated the column's absence
+         (`bar < 0` below); what changed is that the absence is now
+         SPELLED, so a report cannot read a missing reference as a
+         nameless instruction.
     nl   number of LOAD dynamic memops on the wire   (= `ld=` columns)
     ns   number of STORE dynamic memops on the wire  (= `st=` columns)
     la   load effective addresses that the renderer could place
@@ -227,7 +238,7 @@ def main():
                 in_cp = False
             continue
         rec = {'i': n - skip, 'pc': mh.group(1), 'b': b, 'm': mnem,
-               'c': cap.split(' ')[0] if cap else '',
+               'c': cap.split(' ')[0] if cap else '-',
                'nl': len(lw), 'ns': len(sw),
                'la': la, 'sa': sa, 'lw': lw, 'sw': sw,
                'lv': lv, 'sv': sv,

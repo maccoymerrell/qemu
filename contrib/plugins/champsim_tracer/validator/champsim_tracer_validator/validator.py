@@ -116,6 +116,25 @@ class Report:
                                                "info": 0})
             bc[i.severity] += 1
 
+        # A CHECK'S SUBJECT COUNT LIVES IN ITS SUMMARY INFO MESSAGE, AND THE
+        # COUNT ALONE HIDES IT.  Most checks close with exactly one info
+        # Issue whose text carries the population they scored ("verified 4
+        # memop and 91 dst-register widths", "lane masks validated: 12 vec
+        # instances").  Several of those same checks have a VACUOUS branch
+        # that also emits exactly one info ("no vec-classified insns
+        # observed; lane-mask checks vacuously pass").  Printing only
+        # `info=1` makes the two indistinguishable, so a reader quoting
+        # "[lane_masks] info=1, errors=0" as a green cannot tell whether the
+        # check validated a population or found no subject at all -- the zero
+        # over an empty population that the standing rule calls a gap, not a
+        # pass.  So when a check's whole output is ONE info, its message is
+        # printed beside the count.  Multi-issue checks keep the count form;
+        # their detail is not a single reading.
+        one_info = {}
+        for i in self.issues:
+            if i.severity == "info":
+                one_info.setdefault(i.check, []).append(i.message)
+
         lines = ["=== champsim_tracer_genval validation report ==="]
         lines.append(f"  stats: {self.stats}")
         lines.append(f"  total: {len(self.issues)} issues "
@@ -125,7 +144,13 @@ class Report:
         for chk in sorted(by_check):
             parts = ", ".join(f"{k}={v}" for k, v in by_check[chk].items()
                               if v)
-            lines.append(f"    [{chk}] {parts}")
+            msgs = one_info.get(chk, [])
+            if len(msgs) == 1 and len(self.issues) and \
+                    by_check[chk]["error"] == 0 and \
+                    by_check[chk]["warning"] == 0:
+                lines.append(f"    [{chk}] {parts}  -- {msgs[0]}")
+            else:
+                lines.append(f"    [{chk}] {parts}")
         if by_sev["error"]:
             lines.append("")
             lines.append("  first errors:")
@@ -4158,12 +4183,22 @@ def _check_opcode_coverage(templates: list[dict],
         reachable = clf.reachable_opcodes(isa)
         reachable -= _unsupported_opcode_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
-    except Exception as exc:  # pragma: no cover - diagnostic path
+    except Exception as exc:
+        # A COVERAGE CHECK THAT CANNOT LOAD ITS REACHABLE SET FOUND NO
+        # SUBJECT, AND THAT IS NOT AN "info".  The seen= half still ran, so
+        # this is not an error about the trace; but reporting it at info
+        # buried it under a bare `[opcode_coverage] info=1` in a report whose
+        # headline reads "errors=0, warnings=0" -- and a reader quoting that
+        # headline as a green would be quoting a check that never compared
+        # anything.  warning is the honest severity: it is counted in the
+        # quoted warnings= column, so the green cannot be quoted without it,
+        # and it does not change the run's exit status, which stays a
+        # question about the TRACE.
         reachable_unseen = []
         return [Issue(
-            "opcode_coverage", "info",
-            f"opcode coverage: seen={len(seen_names)}; "
-            f"reachable-set lookup failed: {exc!r}",
+            "opcode_coverage", "warning",
+            f"opcode coverage: seen={len(seen_names)}; NO REACHABLE SET -- "
+            f"the reachable_unseen bullet did not run: {exc!r}",
             {"seen": seen_names, "asserted_unseen": asserted_unseen},
         )]
 
@@ -4224,11 +4259,13 @@ def _check_branch_coverage(templates: list[dict],
         reachable = {_norm(b) for b in clf.reachable_branches(isa)}
         reachable -= _unsupported_branch_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
-    except Exception as exc:  # pragma: no cover - diagnostic path
+    except Exception as exc:
+        # Same rule as opcode_coverage above: no reachable set, no subject,
+        # and a warning rather than an info so the quoted headline carries it.
         return [Issue(
-            "branch_coverage", "info",
-            f"branch coverage: seen={len(seen_names)}; "
-            f"reachable-set lookup failed: {exc!r}",
+            "branch_coverage", "warning",
+            f"branch coverage: seen={len(seen_names)}; NO REACHABLE SET -- "
+            f"the reachable_unseen bullet did not run: {exc!r}",
             {"seen": seen_names, "asserted_unseen": asserted_unseen},
         )]
 
@@ -4353,11 +4390,22 @@ def _check_reg_coverage(templates: list[dict], isa: str,
     try:
         reachable = _reachable_reg_names_for_isa(isa)
         reachable -= _unsupported_reg_coverage(isa)
-    except Exception as exc:  # pragma: no cover - diagnostic path
+    except Exception as exc:
+        # THIS PATH IS LIVE ON ALL FOUR ISAs AT THIS TIP, AND WAS INVISIBLE.
+        # _reachable_reg_names_for_isa reads champsim_tracer_mnemonics_<isa>.h
+        # as the reachable universe, and c32824defa deleted those headers with
+        # the Capstone tables.  Every run since has reported
+        # `[reg_coverage] info=1` with a FileNotFoundError inside it, inside a
+        # report headline of "errors=0, warnings=0" that four ISAs' worth of
+        # readings have been quoted from.  The register-coverage bullet has
+        # not been computed since that commit; saying so at warning is the
+        # minimum.  Re-homing the reachable set onto a surviving source is a
+        # separate change and a maintainer's call about what the universe
+        # should now be.
         return [Issue(
-            "reg_coverage", "info",
-            f"reg coverage: seen={len(seen_names)}; "
-            f"reachable-set lookup failed: {exc!r}",
+            "reg_coverage", "warning",
+            f"reg coverage: seen={len(seen_names)}; NO REACHABLE SET -- "
+            f"the reachable_unseen bullet did not run: {exc!r}",
             {"seen": seen_names},
         )]
 

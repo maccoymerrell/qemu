@@ -482,7 +482,7 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
         }
         if (helper_area) {
             /*
-             * THE DATUM IS NOT NAMED, AND THAT IS A CAP AND NOT A CHOICE.
+             * THE DATUM IS NOT NAMED, AND THE TWO WAYS OUT ARE PRICED.
              *
              * The area's bytes are the x87 and SSE register state, so FXSAVE's
              * stored datum comes from those 32 registers and FXRSTOR writes
@@ -492,9 +492,41 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
              * writes, the area names 32, and the reader correctly refuses an
              * instruction it cannot record in full -- so both encodings came
              * back with src=[], dst=[] and no access at all, which is worse
-             * than the state this fixes.  The access is stated; the register
-             * set it moves is a named residue, and the blocker is those two
-             * caps against a 32-name area.
+             * than the state this fixes.
+             *
+             * WHY THE COUNT IS 32 AND NOT A SMALLER NUMBER: st0..st7 and
+             * xmm0..xmm15 are DECLARED regfiles, not TCG globals, so
+             * df_state() spends a FIELD slot on each of them in either
+             * direction (accel/tcg/insn-dataflow.c, the A_REG arm) -- the
+             * 256-bit register bitmap that makes a GPR read free is not
+             * available to them.
+             *
+             * ROUTE (a), RAISE THE CAPS, IS PRICED AND REJECTED.  The scratch
+             * is one InsnDataflow per instruction over INSN_DF_MAX_INSNS
+             * (512), in static TLS, charged to every QEMU thread.  Taking
+             * fields 16 -> 32 and writes 8 -> 32 adds 16 field slots and 24
+             * write slots per instruction; at the current shapes that is
+             * roughly 448 KiB + 576 KiB = about 1 MiB per thread, on top of
+             * the 385 KiB that allocation already costs and already has an
+             * open item against it.  Near four times the per-thread footprint,
+             * for two encodings, is the wrong trade.
+             *
+             * ROUTE (b), A WIDE-STATE STATEMENT, IS THE PICK AND IS NOT BUILT.
+             * One statement naming a register RANGE is the right shape: the
+             * area is two contiguous declared files plus the control words, so
+             * it is a handful of statements rather than 32 whatever the caps
+             * are.  It is NOT a cap bump wearing a different name.
+             * insn_dataflow_field_reg() resolves a range to exactly ONE
+             * declared register and only when the access lies wholly inside
+             * it -- deliberately, so an access that runs off the end is left
+             * unnamed rather than misattributed -- so a range covering a whole
+             * file resolves to no name at all today.  Making it resolve to the
+             * SET it overlaps is new reader behaviour and a new shape on the
+             * wire, with its own golden account and its own gate, and it is a
+             * wave rather than a tail item.
+             *
+             * Until it is built the access is stated and the register set it
+             * moves is a named residue.
              */
             insn_dataflow_note_synthetic_ea(decode->e.gen == gen_FXSAVE
                                             ? INSN_DF_WR : INSN_DF_RD,

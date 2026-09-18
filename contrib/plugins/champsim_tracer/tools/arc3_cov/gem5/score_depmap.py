@@ -557,6 +557,16 @@ def report(a, tallies, per_family, imm_masks, notes, fam_seen, fam_smaller,
              len(fam_seen.get(fam, ())), len(fam_smaller.get(fam, ())),
              len(fam_missing.get(fam, ()))))
     w('')
+    if att.now_absent:
+        w('The `rows in table` column is read from the tables as they\n'
+          'stood at the REFINER RETIREMENT\'s parent, and there is no\n'
+          'at-HEAD column beside it: `champsim_tracer_mnemonics_<isa>.h`\n'
+          'was deleted outright at c32824defa, so NO refiner family\n'
+          'survives in the shipped plugin.  The families below are what\n'
+          'the encodings USED TO carry, which is what makes them a\n'
+          'grouping for this report; they are not a claim about what the\n'
+          'tracer consults now, and nothing here reads as a miss.')
+        w('')
     w('## reference-side and harness notes (every one counted)')
     w('')
     for k, v in sorted(notes.items()):

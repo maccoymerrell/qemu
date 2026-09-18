@@ -162,13 +162,52 @@ def render(isa, capture_dir, encodings, falsify=None):
 
 
 def main():
+    # THE RETIRED BINARY'S COMMAND LINE, ON PURPOSE.  Four legs and five of
+    # their python helpers shell out to `<bin> --isa=X --layer=fields --batch`
+    # with the encodings on stdin, some of them adding `--falsify=`.  Presenting
+    # that interface makes the re-point one line per leg instead of surgery in
+    # every helper, and it keeps the legs' own record of what they ran honest:
+    # the command in the log is the command that produced the table.
     ap = argparse.ArgumentParser()
     ap.add_argument("--isa", required=True)
-    ap.add_argument("--capture", required=True,
+    ap.add_argument("--capture", default=os.environ.get("CST_SLED_CAPTURE"),
                     help="directory srcenc_sled.py wrote gen_<isa>.tsv and "
-                         "ident_<isa>.tsv into")
+                         "ident_<isa>.tsv into; defaults to CST_SLED_CAPTURE")
+    # NO DEFAULT LAYER.  The retired binary's default was BOUNDARY, and the
+    # aarch64 leg relies on that default for its LLVM cross-check cache
+    # (`--isa=aarch64 --batch`, no --layer).  Defaulting to fields here would
+    # answer that call with the QEMU column under a name the caller reads as
+    # the other decoder's -- the leg would then score QEMU against QEMU and
+    # report agreement.  Absent means boundary, and boundary refuses.
+    ap.add_argument("--layer", default=None)
+    ap.add_argument("--batch", action="store_true")
     ap.add_argument("--falsify", default=os.environ.get("CST_FALSIFY"))
     a = ap.parse_args()
+
+    # THE OTHER LAYER HAS NO SUCCESSOR AND IS NOT FAKED.  `--layer=boundary`
+    # asked the retired binary for a SECOND DECODER's view -- LLVM MC beside
+    # the Capstone boundary -- and that binary is gone.  Nothing in this
+    # directory can answer it: the emulator states what QEMU decoded, which is
+    # the arm this module serves, and a cross-check against QEMU by QEMU
+    # proves provenance and nothing else.  The one surviving reference arm of
+    # that shape is the x86_64 leg's own xl3 (XED + LLVM MC), which is a
+    # different program with a different interface.  So this REFUSES, by name,
+    # rather than returning the fields columns under a boundary flag and
+    # letting a leg score one decoder against itself.
+    if a.layer != "fields":
+        sys.exit(
+            "sled_fields: --layer=%s has no producer in this tree -- "
+            % (a.layer or "boundary (the retired default, no --layer given)") +
+            "REFUSING.  That layer was the retired isaxcheck's second-decoder "
+            "view; the reference side now runs OFFLINE over recorded "
+            "encodings (tools/cst_referee.py) or through a leg's own "
+            "reference binary (x86_64/xl3, mipsel llvm_probe and "
+            "binutils_probe).  A leg that needs it needs one of those wired "
+            "in, not this module answering for it.")
+    if not a.capture:
+        sys.exit("sled_fields: no --capture and no CST_SLED_CAPTURE -- "
+                 "REFUSING.  The tracer arm is read out of a sled capture; "
+                 "name the directory ident_capture.sh wrote it into.")
 
     encodings = []
     for line in sys.stdin:

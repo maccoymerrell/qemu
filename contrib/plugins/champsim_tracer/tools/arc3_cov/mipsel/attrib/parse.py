@@ -19,7 +19,7 @@ BASE = os.environ.get("CST_ARC3_ATTRIB_DIR", os.getcwd()).rstrip("/") + "/"
 # cannot go stale is the only kind worth quoting, so the probe runs here.
 ISAXCHECK = os.environ.get(
     "CST_ISAXCHECK",
-    "/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck")
+    "/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov/sled_fields.py")
 
 
 def probe_tracer(path):

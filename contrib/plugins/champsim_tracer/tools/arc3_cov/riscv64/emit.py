@@ -23,7 +23,7 @@ import zcmp_profile as ZC
 rows = json.load(open(os.path.join(ROOT, 'rows.json')))
 SAIL_SHA = 'ac2a585506aad46b088b3594e56b8c21c52e297e'
 ISAX = os.environ.get('CST_ISAXCHECK',
-                      '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+                      '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov/sled_fields.py')
 
 
 def reprobe(rows):

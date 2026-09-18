@@ -540,7 +540,7 @@ def _is_3dnow(hexs):
 # checked against a live probe too, so the control is not a hole in this.
 ISAXCHECK = os.environ.get(
     'CST_ISAXCHECK',
-    '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+    '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov/sled_fields.py')
 
 
 def _probe_argv(falsify):

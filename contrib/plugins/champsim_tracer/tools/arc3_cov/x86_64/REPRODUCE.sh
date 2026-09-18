@@ -120,12 +120,22 @@ $PY mkprobe.py                 # -> probe_map.json, probe_uniq.hex
 CST_ISAX_IDENT=$("$T"/../ident_capture.sh x86_64 probe_uniq.hex \
     "$PWD/ident" "$Q") || exit 2
 export CST_ISAX_IDENT
+# THE TRACER ARM READS THE SAME CAPTURE.  ident_capture.sh prints the mechanism
+# corpus; the register-set and identity corpora the arm needs sit beside it, in
+# the directory the sled wrote into.  Deriving the directory from the printed
+# path rather than re-spelling it keeps the two from ever naming different
+# captures (FINDING 244-H).
+CST_SLED_CAPTURE=$(dirname "$CST_ISAX_IDENT")
+export CST_SLED_CAPTURE
 echo "ident corpus: $CST_ISAX_IDENT"
 
 # ---- the four arms ---------------------------------------------------------
 g++ -O2 -std=c++17 -I"$K/include" $($LC --cxxflags | sed 's/-fno-exceptions//') \
     -o xl3 xl3.cc "$K/lib/libxed.a" $($LC --ldflags) -lLLVM-18
-"$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields --batch \
+# THE TRACER ARM (FINDING 244-H): isaxcheck linked Capstone and was deleted
+# with it, so this arm had no producer.  ../sled_fields.py answers the same
+# command line from the sled capture taken above.
+"$T"/../sled_fields.py --isa=x86_64 --layer=fields --batch \
     < probe_uniq.hex > tracer_batch.tsv
 PROBE_FEAT="$(cat "$R/llvm_features.txt")" ./xl3 probe_uniq.hex \
     > xl3.tsv 2> xl3.err                      # XED (primary) + LLVM MC
@@ -402,7 +412,7 @@ echo -n "falsify baseline -> "
 $PY compare_attrib.py | grep -m1 '  AGREE  '
 for M in movq vmovq vpsadbw sqrtsd xlatb smswl lmsww \
          rdfsbasel lfsl cmpxchg8b; do
-  "$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields \
+  "$T"/../sled_fields.py --isa=x86_64 --layer=fields \
       --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv \
       || { echo "falsify drop-src:$M did not reach its subject"; exit 1; }
   echo -n "falsify drop-src:$M -> "

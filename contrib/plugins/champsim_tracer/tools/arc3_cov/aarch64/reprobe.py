@@ -10,7 +10,7 @@ BASE = os.environ.get('CST_COV_DIR',
                       '/mnt/md0/QEMU/cst_runs/_arc3_cov') + '/aarch64'
 BIN = sys.argv[1] if len(sys.argv) > 1 else \
     os.environ.get('CST_ISAXCHECK',
-                   '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+                   '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov/sled_fields.py')
 
 # THE FIRING CONTROL'S CHANNEL, and it has to be the ENVIRONMENT.
 #

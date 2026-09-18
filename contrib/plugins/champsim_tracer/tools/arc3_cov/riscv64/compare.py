@@ -28,7 +28,13 @@ QEMU_REFUSED = tax.load_qemu_refused('riscv64')
 import arc3_rules as taxrules
 
 QEMU = '/mnt/md0/QEMU/qemu'
-ISAX = os.path.join(QEMU, 'build/contrib/plugins/isaxcheck')
+# THE ARM THE LEG CHOSE, not a path spelled here (FINDING 244-H).  This
+# read a fixed build/contrib/plugins/isaxcheck, so REPRODUCE.sh's own
+# choice of tracer arm could not reach it and the scorer would probe a
+# binary that no longer exists while the leg thought it had one.
+ISAX = os.environ.get('CST_ISAXCHECK',
+                      os.path.join(QEMU, 'contrib/plugins/champsim_tracer'
+                                         '/tools/arc3_cov/sled_fields.py'))
 SAIL = os.path.join(ROOT, 'ref/sail-riscv')
 
 # ------------------------------------------------- canonical register naming

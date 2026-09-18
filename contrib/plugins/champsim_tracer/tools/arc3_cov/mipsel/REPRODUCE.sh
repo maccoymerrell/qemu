@@ -36,7 +36,13 @@ D=${CST_COV_DIR:-/mnt/md0/QEMU/cst_runs/_arc3_cov}/mipsel
 R=${CST_REF_DIR:-/mnt/md0/QEMU/cst_runs/_arc3_refs}/mipsel/work
 Q=${CST_QEMU_ROOT:-/mnt/md0/QEMU/qemu}
 PY=${CST_PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}
-ISAX=${CST_ISAXCHECK:-$Q/build/contrib/plugins/isaxcheck}
+ISAX=${CST_ISAXCHECK:-$T/../sled_fields.py}
+# EVERY HELPER IN THIS LEG READS THE SAME ARM.  Five python helpers
+# across the four legs resolve the tracer binary from CST_ISAXCHECK with
+# a deleted path as their fallback; exporting it here means the arm this
+# script checked is the arm they run, rather than each one silently
+# falling back to a binary that is not there (FINDING 244-H).
+export CST_ISAXCHECK="$ISAX"
 F='+mips32r2,+msa,+dsp,+dspr2,+dspr3,+fp64,+eva,+virt,+ginv,+crc,+abs2008,+nan2008,+mt,+mips3d'
 
 # ---- PREREQUISITES, CHECKED BEFORE ANY WORK -------------------------------
@@ -50,7 +56,7 @@ for p in llvm_probe binutils_probe; do
 done
 
 ninja -j "${CST_JOBS:-12}" -C "$Q/build" contrib-plugins
-[ -x "$ISAX" ] || { echo "REFUSED: no isaxcheck at $ISAX" >&2; exit 2; }
+[ -x "$ISAX" ] || { echo "REFUSED: no tracer arm at $ISAX" >&2; exit 2; }
 
 # The harness is the TREE's copy; the working directory only holds evidence.
 mkdir -p "$D/attrib"
@@ -79,6 +85,13 @@ awk -F'\t' 'NR>1{h=$3;print $1" "substr(h,7,2) substr(h,5,2) substr(h,3,2) subst
 CST_ISAX_IDENT=$("$T"/../ident_capture.sh mipsel \
     <(awk -F'\t' 'NR>1{print $3}' ../opcodes.tsv) "$D/ident" "$Q") || exit 2
 export CST_ISAX_IDENT
+# THE TRACER ARM READS THE SAME CAPTURE.  ident_capture.sh prints the mechanism
+# corpus; the register-set and identity corpora the arm needs sit beside it, in
+# the directory the sled wrote into.  Deriving the directory from the printed
+# path rather than re-spelling it keeps the two from ever naming different
+# captures (FINDING 244-H).
+CST_SLED_CAPTURE=$(dirname "$CST_ISAX_IDENT")
+export CST_SLED_CAPTURE
 echo "ident corpus: $CST_ISAX_IDENT"
 
 # ---- the tracer arm, re-derived from the live binary ----------------------

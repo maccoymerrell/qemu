@@ -7830,6 +7830,17 @@ def _check_metaflags(
     # Look up REG_FLAGS' numeric id from the trace's own reg map.
     name_to_id = {v: int(k) for k, v in reg_id_to_name.items()}
     flags_id = name_to_id.get("REG_FLAGS")
+    # The program counter is never an ALU result, and it is a destination of
+    # the instruction a block exits from -- QEMU states that write since
+    # 12d94ec903.  Excluding only REG_FLAGS below therefore let REG_PC be
+    # picked as "the result" of an ordinary flag-writing ALU instruction
+    # that happened to sit at a block exit, and the check then predicted
+    # Z/N/P from the instruction's ADDRESS.  Measured face: an ALU insn at
+    # 0x401ffc, the last before a 0x402000 page boundary, whose low byte
+    # 0xff has even parity -- so the check demanded P=1 and called the
+    # wire's correct P=0 an error.  None by name, not by value: the numeric
+    # id moves, the name does not.
+    pc_id = name_to_id.get("REG_PC")
     if flags_id is None:
         return [Issue(
             "metaflags", "info",
@@ -7889,8 +7900,12 @@ def _check_metaflags(
             # case: add/sub/and/or/xor), the GPR snap *is* the result.
             # CMP/TEST write only flags, so there's no GPR snap to
             # check against — Z/N/P verification is skipped.
-            gpr_dsts = [r for r in dsts if r != flags_id]
+            gpr_dsts = [r for r in dsts
+                        if r != flags_id and (pc_id is None or r != pc_id)]
             if not gpr_dsts:
+                # Flags plus nothing but the program counter: there is no
+                # result to predict from, which is the same position CMP and
+                # TEST are already in.  Skip, do not guess.
                 continue
             result_reg = gpr_dsts[0]
             snap = snap_idx.get((ipos, result_reg))

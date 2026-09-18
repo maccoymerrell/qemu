@@ -1057,6 +1057,18 @@ _A64_STORE_W = {"str": None, "strh": 2, "strb": 1}
 _RV_LOAD_W = {"ld": 8, "lwu": 4, "lw": 4, "lhu": 2, "lh": 2,
               "lbu": 1, "lb": 1}
 _RV_STORE_W = {"sd": 8, "sw": 4, "sh": 2, "sb": 1}
+# RVV unit-stride accesses.  The span is not in the mnemonic: it is
+# vl * SEW/8, both set by the vsetivli that precedes them, so the
+# parser carries the configuration forward instead of tabulating a
+# width here.  Element width IS in the mnemonic and is checked against
+# the configured SEW, so a mismatched pair yields no static identity
+# rather than a wrong one.
+_RV_VEC_LOAD_SEW = {"vle8.v": 8, "vle16.v": 16, "vle32.v": 32,
+                    "vle64.v": 64}
+_RV_VEC_STORE_SEW = {"vse8.v": 8, "vse16.v": 16, "vse32.v": 32,
+                     "vse64.v": 64}
+_RV_VSETIVLI_SEW_RE = re.compile(r"^e(8|16|32|64)$")
+_RV_VEC_MEM_RE = re.compile(r"^\((\w+)\)$")
 _MIPS_LOAD_W = {"lw": 4, "lhu": 2, "lh": 2, "lbu": 1, "lb": 1}
 _MIPS_STORE_W = {"sw": 4, "sh": 2, "sb": 1}
 
@@ -1095,6 +1107,7 @@ def _parse_block_mem_insns(body: str, isa: str) -> list[list[tuple]]:
     mem_insns: list[list[tuple]] = []
     tracked: dict[str, int] = {}    # computed-base / setup registers
     li_vals: dict[str, int] = {}    # riscv `li` staging values
+    rvv_cfg: tuple[int, int] | None = None   # riscv (vl, SEW) in effect
 
     for raw in body.split("\n"):
         line = raw.strip()
@@ -1161,6 +1174,32 @@ def _parse_block_mem_insns(body: str, isa: str) -> list[list[tuple]]:
             if mnem == "add" and len(ops) == 3 and ops[1] == "t6" \
                     and ops[2] in li_vals:
                 tracked[ops[0]] = li_vals[ops[2]]
+                continue
+            if mnem == "vsetivli" and len(ops) >= 3:
+                m = _RV_VSETIVLI_SEW_RE.match(ops[2])
+                try:
+                    avl = int(ops[1], 0)
+                except ValueError:
+                    avl = None
+                # Only the immediate-AVL form is read: `vsetvli`'s AVL
+                # is a register and its value is not in the text.
+                rvv_cfg = ((avl, int(m.group(1))) if m and avl is not None
+                           else None)
+                continue
+            vec_load = mnem in _RV_VEC_LOAD_SEW
+            vec_store = mnem in _RV_VEC_STORE_SEW
+            if (vec_load or vec_store) and len(ops) == 2 and rvv_cfg:
+                m = _RV_VEC_MEM_RE.match(ops[1])
+                sew = (_RV_VEC_LOAD_SEW if vec_load
+                       else _RV_VEC_STORE_SEW)[mnem]
+                if m and sew == rvv_cfg[1]:
+                    base = m.group(1)
+                    off = (0 if base == "t6"
+                           else tracked.get(base))
+                    accesses.append(("load" if vec_load else "store", off,
+                                     rvv_cfg[0] * sew // 8))
+                if accesses:
+                    mem_insns.append(accesses)
                 continue
             is_load = mnem in _RV_LOAD_W
             is_store = mnem in _RV_STORE_W
@@ -2942,6 +2981,85 @@ class X87Sweep(CodeBlock):
         lines += _jump(ctx.isa, ctx.successor_labels[0])
         return "\n".join(lines) + "\n"
 
+
+@register
+class RvvMemData(CodeBlock):
+    """
+    The RVV MEMORY subject: a vector load and a vector store over the
+    arena.
+
+    WHY IT EXISTS.  `regid_sweep` already runs the RVV REGISTER forms
+    (a `vsetvli` and thirty-two `vmv.v.v`), so the riscv64 programs
+    carry vector arithmetic -- but not one vector ACCESS.  Measured on
+    all six riscv64 golden cells, the count of RVV load/store
+    mnemonics was 0, against 8 vector-memory instructions in the same
+    workload's aarch64 program and 5 in its x86_64 one.  Every check
+    that reads a memop's width, address or value on a vector access
+    was therefore passing over nothing on this ISA.
+
+    `vsetivli t0, 2, e64` pins vl to 2 regardless of the
+    implementation's VLEN: AVL is the encoded 2 and VLMAX is
+    VLEN/SEW * LMUL = 2 at the 128-bit VLEN the V extension's own
+    minimum guarantees, so a wider machine still clamps to the AVL and
+    the access pattern -- two 8-byte elements, the two declared arena
+    slots -- does not move with the host's vector length.  That is
+    what makes the memops declarable at all: an `e32` form would touch
+    four 4-byte elements at byte offsets 0/4/8/12, and half of those
+    are not at a u64 slot boundary, which is the only address an
+    ExpectedMemOp can name.
+
+    `vadd.vv` between the load and the store keeps the loaded register
+    live across a real consumer, so the load is not a dead access a
+    later pass could argue away; the store publishes v8 unchanged so
+    the stored bytes are the loaded bytes and the check has a value to
+    be right about.
+    """
+
+    name = "rvv_mem_data"
+    scratch_slots = 4
+    supported_isas = ("riscv64",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s = ctx.scratch_slots
+        d0 = _byte_pattern(0x57, 8)
+        d1 = _byte_pattern(0x6B, 8)
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[
+                ExpectedMemOp("load", s[0], 8, d0),
+                ExpectedMemOp("load", s[1], 8, d1),
+                ExpectedMemOp("store", s[2], 8, d0),
+                ExpectedMemOp("store", s[3], 8, d1),
+            ],
+            coarse_opcodes={"LOAD": 1, "STORE": 1},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        src = plan.memops[0].arena_u64_index * 8
+        dst = plan.memops[2].arena_u64_index * 8
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            f"  li t5, {src}",
+            f"  li t4, {dst}",
+            "  .option push",
+            "  .option norvc",
+            "  add t5, t6, t5",
+            "  add t4, t6, t4",
+            "  .option pop",
+            "  .option push",
+            "  .option arch, +v",
+            "  vsetivli t0, 2, e64, m1, ta, ma",
+            "  vle64.v v8, (t5)",
+            "  vadd.vv v9, v8, v8",
+            "  vse64.v v8, (t4)",
+            "  .option pop",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
 
 
 @register

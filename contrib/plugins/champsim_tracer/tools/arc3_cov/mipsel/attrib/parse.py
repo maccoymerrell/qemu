@@ -149,7 +149,7 @@ def parse_tracer(path):
             cur = dict(id=name, hex=hexs, src=[], dst=[], b_rd=[], b_wr=[],
                        gen_rd=[], gen_wr=[], opcode=None, branch=None,
                        loads=None, stores=None, mnem=None, ops=None,
-                       l_rd=[], l_wr=[])
+                       l_rd=[], l_wr=[], ident="absent")
             out[name] = cur
             continue
         if cur is None: continue
@@ -162,6 +162,18 @@ def parse_tracer(path):
         if m:
             cur["opcode"] = m.group(2); cur["branch"] = m.group(3)
             cur["sect"] = "f"; continue
+        # WHAT THE TRACER ARM HAD TO SAY ABOUT THIS ENCODING, KEPT (246-C).
+        # sled_fields.py prints `ident=seated`, `ident=refused:<why>` or
+        # `ident=unreached`, and this parser used to drop the line.  A row the
+        # sled never reached then arrived downstream as SRC{} DST{} -- an
+        # instruction that touches no register -- and the scorer counted it as
+        # a DISAGREEMENT with the whole reference set missing.  MEASURED before
+        # this line existed: 733 of the leg's 906 disagreements carried two
+        # empty tracer sets.  A silence is not an attribution, in either
+        # direction, so it is carried and emit.py gives it its own verdict.
+        m = re.match(r"ident=(\S+)", s)
+        if m:
+            cur["ident"] = m.group(1); continue
         if s.startswith("boundary-in-generic"):
             cur["sect"] = "g"; continue
         m = re.match(r"loads=(\d+) stores=(\d+)", s)

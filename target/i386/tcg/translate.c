@@ -3090,6 +3090,36 @@ static void x87_c1_clear(void)
 }
 
 /*
+ * ST(0) <- f(ST(0)), for the two arms whose result is the operand's own bits
+ * with the sign changed.
+ *
+ * x87_wr_st() names the destination and stops there, so the destination's
+ * provenance is empty and a consumer reads "nothing computes this".  That is
+ * false for fchs and fabs: neither rounds, neither raises, neither consults
+ * the control word, and the new ST(0) is the old ST(0) with bit 79 cleared or
+ * toggled.  The edge is ST(0) -> ST(0) and nothing else.
+ *
+ * FOUND BY A REFERENCE.  gem5's intra-instruction dependency map gives the
+ * ST(0) destination of `fabs` and `fchs` an incoming set, and this tree gave
+ * it none -- depmap/x86_64, mechanism REF-FP-CONTROL-UNMODELLED, two rows.
+ * The reference names the status word there because its x87 model reaches
+ * ST(0) through the TOP field; that half is addressing and stays refused.
+ * What the wire was missing is the datum edge, and this states it.
+ *
+ * CONFINED ON PURPOSE.  The register arms' value half is open in general --
+ * see x87_wr_from() -- and this closes only the two arms whose result is a
+ * function of one named operand and of nothing else.  An arm that rounds, or
+ * that reads a second stack slot, is a different question with a different
+ * answer and is not decided here.
+ */
+static void x87_wr_st0_from_st0(void)
+{
+    InsnDataflowAtom src[1] = { insn_df_reg(x86_x87_st_names[0]) };
+
+    x87_wr_from(x86_x87_st_names[0], src, 1);
+}
+
+/*
  * fpush()/fpop() on a memory form: the top moves on its own value, and the
  * tag word the moved-to entry lands in is a function of the tag word and of
  * the top that selected the entry.
@@ -3338,14 +3368,14 @@ static void x86_df_x87(bool mem, int op, int rm)
             insn_dataflow_note_word(INSN_DF_WORD_FP_NEG);
             x87_top();
             x87_rd_st(0);
-            x87_wr_st(0);
+            x87_wr_st0_from_st0();
             x87_c1_clear();
             break;
         case 1:                 /* fabs */
             insn_dataflow_note_word(INSN_DF_WORD_FP_ABS);
             x87_top();
             x87_rd_st(0);
-            x87_wr_st(0);
+            x87_wr_st0_from_st0();
             x87_c1_clear();
             break;
         case 4:                 /* ftst */

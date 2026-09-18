@@ -2850,6 +2850,39 @@ static void handle_sys(DisasContext *s, bool isread,
     case 0:
         break;
     case ARM_CP_NOP:
+        /*
+         * A NOP'd SYSTEM WRITE STILL READS Xt, AND THE OPS CANNOT SHOW IT.
+         *
+         * `dc civac, x21' is ARM_CP_NOP here because QEMU does not emulate
+         * caches (helper.c, "Cache ops: all NOPs since we don't emulate
+         * caches"), so this arm returns before anything reads the register
+         * and the instruction reached the wire with src=[] -- while the
+         * architecture says Xt holds the address the operation acts on.
+         *
+         * THE CONTROL IS THE INSTRUCTION NEXT TO IT.  `ic ivau, x21' is NOT
+         * a NOP -- it carries ic_ivau_write, so the generic path below reads
+         * Xt -- and it published src=[REG_GPR21] on the same trace where
+         * `dc cvau, x21' at 0x4000dc and `dc civac, x21' at 0x4000e4
+         * published nothing.  Three neighbouring cache operations, one
+         * difference between them, and it is this return.
+         *
+         * THE READ IS STATED; THE ADDRESS IS NOT.  Whether Xt holds a virtual
+         * address, a set/way encoding or nothing depends on which
+         * cache-maintenance form this is, and that distinction has no
+         * QEMU-side source here -- the same reason the DC ZVA arm below gives
+         * for not extending its synthetic address to these.  A read does not
+         * need it: Xt is an operand of every one of these encodings whatever
+         * its value means, so the read is stated and the address is left to
+         * the arm that can name it.
+         *
+         * READ SIDE ONLY.  On the isread direction the architecture writes
+         * Xt and QEMU leaves it alone; publishing a write here would name a
+         * destination the emulation never produced.
+         */
+        if (!isread) {
+            insn_dataflow_state_read(rt == 31 ? insn_df_zero()
+                                              : insn_df_reg(regnames[rt]));
+        }
         return;
     case ARM_CP_NZCV:
         tcg_rt = cpu_reg(s, rt);

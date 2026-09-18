@@ -2327,12 +2327,14 @@ Three opcodes — ``GEN_OP_PREFETCH``, ``GEN_OP_CACHE_FLUSH``, and
 ``GEN_OP_TLB_FLUSH`` — describe instructions that QEMU's TCG translates
 to no memory op (software prefetch hints, cache-line clean / flush /
 invalidate, TLB-entry invalidate). The writer synthesises a load
-memop for these by decoding the Capstone operand at translation time
-and reading base / index register values at execution time, computing
-``ea = base + index_term + disp``, where ``index_term`` is
-``index << shift_amount`` for an addressing form that shifts the index
-(the AArch64 register form) or ``index * scale`` for one that scales it
-(the x86 SIB form) — the two are mutually exclusive. The synthesized
+memop for these from the address the **decode site states**
+(``insn_dataflow_note_synthetic_ea()``, which the target calls where it
+holds the operand), reading base / index register values at execution
+time and computing ``ea = base + index_term + disp``, where
+``index_term`` is ``index << shift_amount`` for an addressing form that
+shifts the index (the AArch64 register form) or ``index * scale`` for
+one that scales it (the x86 SIB form) — the two are mutually exclusive.
+The synthesized
 EA appears in the same ``LOAD_ADDR[0]`` slot as a regular load and
 contributes to ``N_LOADS``. Opcode classification (PREFETCH / CACHE_FLUSH /
 TLB_FLUSH) carries the semantic distinction; consumers that simulate
@@ -2341,6 +2343,17 @@ dispatch on the opcode rather than treating the EA as a normal load.
 Instructions in these classes that have no memory operand (e.g. x86
 ``WBINVD``, AArch64 ``IC IALLU``) emit no synthesized address and stay
 classified under ``GEN_OP_FENCE``.
+
+**Coverage, stated rather than assumed.** The rule above is the
+contract; the statements that fill it are per decode site, and the
+AArch64 cache-maintenance operations by virtual address — ``DC CVAU``,
+``DC CVAC``, ``DC CIVAC``, ``IC IVAU`` — do not yet carry one, so those
+encodings reach the wire naming no access. That is a known loss against
+this section and not a property of the instructions: the merits, the
+measurement and the QEMU-side fact still needed are written at the
+``ARM_CP_NOP`` arm of ``handle_sys()`` in ``target/arm/tcg/translate-a64.c``.
+``DC ZVA`` is a different shape and does carry its statement: it
+transfers data, so it publishes a **store** of the block it clears.
 
 LOAD / STORE as fall-through classifications
 """"""""""""""""""""""""""""""""""""""""""""

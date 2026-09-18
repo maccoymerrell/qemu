@@ -2917,14 +2917,49 @@ static void handle_sys(DisasContext *s, bool isread,
          * published nothing.  Three neighbouring cache operations, one
          * difference between them, and it is this return.
          *
-         * THE READ IS STATED; THE ADDRESS IS NOT.  Whether Xt holds a virtual
-         * address, a set/way encoding or nothing depends on which
-         * cache-maintenance form this is, and that distinction has no
-         * QEMU-side source here -- the same reason the DC ZVA arm below gives
-         * for not extending its synthetic address to these.  A read does not
-         * need it: Xt is an operand of every one of these encodings whatever
-         * its value means, so the read is stated and the address is left to
-         * the arm that can name it.
+         * THE READ IS STATED; THE ADDRESS IS NOT, AND THAT IS A KNOWN LOSS.
+         *
+         * THE MERITS ARE DECIDED AND THEY SAY THE WIRE OWES THE ADDRESS.  A
+         * cache-maintenance operation by VA transfers no architectural data
+         * -- DC CVAU cleans a line, it does not move a byte, and nothing the
+         * program can read changes -- so it is NOT the DC ZVA shape below,
+         * which genuinely writes a block of zeroes and publishes a store.
+         * But the format's own contract puts it in the OTHER shape rather
+         * than outside the wire: format.rst 5.2 names "cache-line clean /
+         * flush / invalidate" as one of the three classes whose EA is
+         * synthesised, puts it in the same LOAD_ADDR slot a real load uses,
+         * counts it in N_LOADS, and tells the consumer to read the semantic
+         * distinction off the opcode (GEN_OP_CACHE_FLUSH) instead of
+         * treating the address as a data load.  It even names the exception
+         * by instruction: a form with no memory operand -- AArch64 IC IALLU,
+         * x86 WBINVD -- synthesises nothing.  insn_dataflow_note_synthetic_ea
+         * says the same from the other side and names DC CVAU in the shape
+         * that "performs no access"; aarch64 PRFM and MIPS PREF already use
+         * it.  So the absence here is a LOSS the wire owes, not a reference
+         * artefact, and calling it one in a comparator rule would contradict
+         * this project's own spec.  gem5 issues one line-sized access for
+         * these and it is right to.
+         *
+         * WHAT IS MISSING IS STILL A QEMU-SIDE SOURCE, and the candidate
+         * filed against this arm is REFUTED by enumeration.  It proposed
+         * that the by-VA forms are the PL0_W ones; over all 51 crn==7
+         * ARM_CP_NOP cpregs target/arm declares that is false three ways --
+         * DC IVAC is by-VA and PL1_W; CFP/DVP/CPP RCTX are PL0_W and their
+         * Xt is a prediction context, not an address; and the cp15 crm=10
+         * opc2=4/5 encodings at PL0_W are DSB and DMB, which have no operand
+         * at all.  .accessfn does not separate them either: access_tocu
+         * covers ICIALLU (an "all" form) together with IC IVAU and DC CVAU
+         * (both by VA).  What WOULD separate them is a per-operation fact
+         * QEMU states in its own declaration -- an ARM_CP_* type bit set on
+         * the by-VA cpregs, one reviewable line each, with the executions of
+         * an unmarked crn==7 NOP counted so a missed one is visible -- plus
+         * the line size from the same CTR_EL0 field the emulation reads.
+         * That is the mechanism this arm is waiting on, and it is a wave of
+         * its own.
+         *
+         * A read does not need any of it: Xt is an operand of every one of
+         * these encodings whatever its value means, so the read is stated
+         * here and the address is left to the commit that can name it.
          *
          * READ SIDE ONLY.  On the isread direction the architecture writes
          * Xt and QEMU leaves it alone; publishing a write here would name a
@@ -2970,12 +3005,13 @@ static void handle_sys(DisasContext *s, bool isread,
          * note serves this and x86's modrm alike.
          *
          * Stated for this arm alone, where QEMU's own cpreg TYPE says the
-         * instruction accesses memory.  The cache-maintenance NOPs beside it
-         * (DC CVAU, IC IVAU and the rest) name an address too and are a
-         * coverage path, not an endpoint: separating the by-VA forms from the
-         * by-set/way and "all" forms needs a rule this commit does not have a
-         * QEMU-side source for, and guessing at one from the crm field would
-         * be invention rather than report.
+         * instruction accesses memory.  DC ZVA IS NOT THE CACHE-MAINTENANCE
+         * SHAPE and the two must not be conflated: this one transfers data,
+         * so it publishes a WRITE of the block it zeroes, while DC CVAU and
+         * its neighbours transfer none and are owed an address with no datum.
+         * They are owed one -- see the ARM_CP_NOP arm above for the merits
+         * and for the QEMU-side source that is still missing -- and this arm
+         * is not where that lands.
          */
         {
             InsnDataflowEaPart base =

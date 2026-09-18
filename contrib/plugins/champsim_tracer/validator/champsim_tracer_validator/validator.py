@@ -4148,21 +4148,14 @@ def _check_opcode_coverage(templates: list[dict],
             asserted.add(op)
     asserted_unseen = sorted(asserted - set(seen_names))
 
-    # Reachable-on-ISA set: read it lazily from the survey tables so
-    # we don't duplicate the per-ISA opcode lists here.  Failure is
-    # non-fatal — we just skip the third bullet.
+    # Reachable-on-ISA set: read it lazily from the classifier so we don't
+    # duplicate the per-ISA opcode lists here.  Failure is non-fatal — we
+    # just skip the third bullet.
     reachable_unseen: list[str] = []
     try:
         from . import classify as C
         clf = C.get_classifier()
-        _, id_to_class, _ = clf._table_for(isa)
-        reachable: set[str] = set()
-        for triple in id_to_class.values():
-            if not triple:
-                continue
-            gen_op = triple[0]
-            if isinstance(gen_op, str) and gen_op.startswith("GEN_OP_"):
-                reachable.add(gen_op[len("GEN_OP_"):])
+        reachable = clf.reachable_opcodes(isa)
         reachable -= _unsupported_opcode_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
     except Exception as exc:  # pragma: no cover - diagnostic path
@@ -4228,14 +4221,7 @@ def _check_branch_coverage(templates: list[dict],
     try:
         from . import classify as C
         clf = C.get_classifier()
-        _, id_to_class, _ = clf._table_for(isa)
-        reachable: set[str] = set()
-        for triple in id_to_class.values():
-            if not triple or len(triple) < 2:
-                continue
-            br = triple[1]
-            if isinstance(br, str) and br.startswith("BRANCH_"):
-                reachable.add(_norm(br[len("BRANCH_"):]))
+        reachable = {_norm(b) for b in clf.reachable_branches(isa)}
         reachable -= _unsupported_branch_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
     except Exception as exc:  # pragma: no cover - diagnostic path

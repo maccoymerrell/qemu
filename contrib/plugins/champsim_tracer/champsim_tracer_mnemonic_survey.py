@@ -98,9 +98,16 @@ def parse_header(path):
             # An absent table is a REFUSAL, never an empty one.  Substituting
             # an empty set here used to let every caller carry on and compare
             # its answers against nothing -- a zero over an empty population,
-            # which reads exactly like agreement.  The validator's Classifier
-            # is one of those callers, and it describes itself as matching
-            # "exactly what the plugin does in C".
+            # which reads exactly like agreement.
+            #
+            # This refusal is now this script's own, and this script is a
+            # command-line coverage analyzer, so SystemExit is its idiom.
+            # The validator's Classifier was the other caller and is no
+            # longer one: it classifies against champsim_tracer_vocabulary.cc
+            # through the same rules that generated these tables, and raises
+            # classify.ClassifierUnavailable -- an ordinary exception -- so
+            # that a missing subject there costs one named per-ISA check
+            # rather than the whole suite.
             #
             # The per-ISA classification tables were retired with the rest of
             # the Capstone tables: the plugin no longer classifies from a

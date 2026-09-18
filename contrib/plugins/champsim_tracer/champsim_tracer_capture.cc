@@ -922,13 +922,6 @@ void emit_gen_set_ids(const char *isa, const char *enc, char side, char dir,
     emit_gen_set(isa, enc, side, dir, labels, nregs, n);
 }
 
-/* The Capstone walk's side: the list that decoder would publish. */
-void emit_gen_set_cap(const char *isa, const char *enc, char dir,
-                      const uint8_t *regs, unsigned nregs)
-{
-    emit_gen_set_ids(isa, enc, 'c', dir, regs, nregs);
-}
-
 } /* namespace */
 
 /*
@@ -960,6 +953,65 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
     char enc[2 * 32 + 1];
 
     hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /*
+     * A SEATING THAT WAS REFUSED IS NOT A SET WITH NOTHING IN IT.
+     *
+     * When the seating declines, the template keeps the zeroed lists it was
+     * reset with, and the trace publishes an instruction that names no
+     * register.  Written as "-" that is indistinguishable from an encoding
+     * which genuinely touches none -- and this corpus is read to decide
+     * whether a name was LOST, so the two have to be told apart or the
+     * commonest question it answers is answered wrong in both directions.
+     *
+     * So a refusal prints as a member: @refused:<why>, in the same shape as
+     * the @unmapped: and @env+ members the corpus already carries for things
+     * that are not register names.  It compares as itself, which is right:
+     * the other decoder named registers here and the wire named a refusal,
+     * and that is a difference in both columns rather than a silence in one.
+     */
+    if (refusal != CST_WIRE_SEATED) {
+        static const char *const why[] = {
+            "seated", "no-rule", "incomplete", "unknown-word", "no-status",
+            "not-asked",
+        };
+        char lab[40];
+        unsigned k = (unsigned)refusal;
+        const char *w = k < (sizeof(why) / sizeof(why[0])) ? why[k] : "?";
+
+        /*
+         * "incomplete" alone does not say WHAT overflowed, and the four
+         * causes are four different remedies -- more write slots, more env
+         * range slots, more memop rows, or a decode site that declined.  The
+         * emulator records which, so the row carries it.
+         */
+        if (refusal == CST_WIRE_INCOMPLETE && tb) {
+            qemu_plugin_dataflow_status st = qemu_plugin_dataflow_status();
+
+            st.struct_size = sizeof(st);
+            if (qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
+                snprintf(lab, sizeof(lab), "@refused:%s:%s%s%s%s", w,
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES) ? "W" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_FIELDS) ? "F" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS) ? "M" : "",
+                         (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED) ? "D" : "");
+            } else {
+                snprintf(lab, sizeof(lab), "@refused:%s:?", w);
+            }
+        } else {
+            snprintf(lab, sizeof(lab), "@refused:%s", w);
+        }
+
+        char labels[1][40];
+
+        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
+        emit_gen_set(isa_name(), enc, 'q', 'r', labels, 1, 1);
+        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
+        emit_gen_set(isa_name(), enc, 'q', 'w', labels, 1, 1);
+        return;
+    }
+    emit_gen_set_ids(isa_name(), enc, 'q', 'r', f->src_regs, f->n_src_regs);
+    emit_gen_set_ids(isa_name(), enc, 'q', 'w', f->dst_regs, f->n_dst_regs);
 }
 
 void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,

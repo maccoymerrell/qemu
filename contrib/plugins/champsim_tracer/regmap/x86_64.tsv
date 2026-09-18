@@ -77,6 +77,7 @@ st4	REG_FPR4	x87 stack slot index
 st5	REG_FPR5	x87 stack slot index
 st6	REG_FPR6	x87 stack slot index
 st7	REG_FPR7	x87 stack slot index
+xcr0	REG_SYS	the extended-control register XGETBV returns and XSETBV writes; an OS-owned enable mask, not a value the program computes with
 xmm0	REG_VEC0	vector file index
 xmm1	REG_VEC1	vector file index
 xmm10	REG_VEC10	vector file index

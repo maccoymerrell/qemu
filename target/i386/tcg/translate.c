@@ -4473,6 +4473,33 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 || (s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
                 goto illegal_op;
             }
+            /*
+             * THE DATUM XGETBV RETURNS IS XCR0, AND NO OP SAYS SO.
+             *
+             * The ops name ECX going in and EAX:EDX coming out; the value
+             * itself is read inside helper_xgetbv(), which answers
+             * `env->xcr0` for leaf 0 and `env->xcr0 & get_xinuse(env)` for
+             * leaf 1 (target/i386/tcg/fpu_helper.c).  So the wire published
+             * EAX and EDX as produced from ECX alone, with the register the
+             * result actually came out of missing from the read set.
+             *
+             * MEASURED: the PIN register leg's `0f01d0` row read
+             * ref_only={sys} -- the reference naming XCR0, the tracer naming
+             * nothing.  exec246 adjudicated that as "machine state this
+             * emulator does not model at all"; that is FALSE and is
+             * corrected here.  CPUX86State carries `uint64_t xcr0` and this
+             * helper returns it.
+             *
+             * THE CR4 TEST IS NOT STATED, and deliberately.  The helper also
+             * reads env->cr[4] to decide whether to raise #UD.  That is a
+             * fault predicate, not a producer of the result, and this target
+             * already declines to name such reads -- gen_RDxxBASE() calls
+             * gen_helper_cr4_testbit() and states nothing.  A row naming it
+             * would read TRACER-SUPERSET rather than a loss either way.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            insn_dataflow_state_read(insn_df_reg("xcr0"));
             tcg_gen_trunc_tl_i32(s->tmp2_i32, cpu_regs[R_ECX]);
             gen_helper_xgetbv(s->tmp1_i64, tcg_env, s->tmp2_i32);
             tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], s->tmp1_i64);
@@ -4486,6 +4513,35 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             gen_svm_check_intercept(s, SVM_EXIT_XSETBV);
             if (!check_cpl0(s)) {
                 break;
+            }
+            /*
+             * THE MATCHING WRITE, AND IT HAS NO WITNESS IN THIS CORPUS.
+             *
+             * helper_xsetbv() ends in cpu_x86_update_xcr0(env, mask), which
+             * assigns env->xcr0 (target/i386/tcg/fpu_helper.c) -- the write
+             * side of the pair whose read side is stated at 0xd0 above, and
+             * equally invisible to the op stream because it happens inside
+             * the helper.  EDX:EAX is where the value comes from and ECX
+             * selects which register, so the statement names both.
+             *
+             * SAID PLAINLY: unlike the xgetbv read, this write has NO row in
+             * the PIN leg and no measurement behind it.  It is CPL0 and
+             * qemu-user never executes it, so nothing in this project's
+             * corpus has ever exercised it.  It is stated from the helper's
+             * own source because leaving the read side named and the write
+             * side silent would be a gap with no reason behind it, and the
+             * fact is checkable by reading the function.
+             *
+             * Capture only; no op is emitted, altered or suppressed.
+             */
+            {
+                InsnDataflowAtom src[3] = {
+                    insn_df_reg(x86_reg_names[R_EAX]),
+                    insn_df_reg(x86_reg_names[R_EDX]),
+                    insn_df_reg(x86_reg_names[R_ECX]),
+                };
+
+                insn_dataflow_state_write_from(insn_df_reg("xcr0"), src, 3);
             }
             tcg_gen_concat_tl_i64(s->tmp1_i64, cpu_regs[R_EAX],
                                   cpu_regs[R_EDX]);
@@ -5049,6 +5105,7 @@ void tcg_x86_init(void)
     {
         static const char *const eflags_p[] = { "eflags" };
         static const char *const df_p[] = { "df" };
+        static const char *const xcr0_p[] = { "xcr0" };
         CPUX86State *e = NULL;
 
         insn_dataflow_declare_regfile(eflags_p, 1,
@@ -5056,6 +5113,19 @@ void tcg_x86_init(void)
                                       sizeof(e->eflags), sizeof(e->eflags));
         insn_dataflow_declare_regfile(df_p, 1, offsetof(CPUX86State, df),
                                       sizeof(e->df), sizeof(e->df));
+        /*
+         * XCR0 IS MODELLED STATE AND IT NEEDED A NAME.
+         *
+         * `xgetbv` returns it -- helper_xgetbv() answers `env->xcr0` for
+         * leaf 0 (target/i386/tcg/fpu_helper.c) -- and `xsetbv` writes it.
+         * Both reach it inside the helper, so the op stream names neither,
+         * and until this row existed the byte range had no name for the
+         * emitter's statement to resolve against.  It is a real extended
+         * control register this target keeps in CPUArchState, not machine
+         * state the emulator declines to model.
+         */
+        insn_dataflow_declare_regfile(xcr0_p, 1, offsetof(CPUX86State, xcr0),
+                                      sizeof(e->xcr0), sizeof(e->xcr0));
     }
 
     static const char bnd_regl_names[4][8] = {

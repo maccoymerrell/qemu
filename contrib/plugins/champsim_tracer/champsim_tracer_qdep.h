@@ -78,6 +78,19 @@ struct QdepCounters {
     uint64_t seated;
     uint64_t no_rule;
     uint64_t incomplete;
+    /*
+     * WHICH CEILING, not just that one was hit.  `incomplete' is the union of
+     * four different conditions with four different remedies -- more write
+     * slots, more env-range slots, more memop rows, or a decode site that
+     * declined -- and a capacity comment that wants to say a ceiling is never
+     * reached needs the count for THAT ceiling, not for the union.  The four
+     * are not exclusive: one instruction can raise more than one, and each
+     * counter counts the instructions that raised its own bit.
+     */
+    uint64_t inc_writes;
+    uint64_t inc_fields;
+    uint64_t inc_memops;
+    uint64_t inc_refused;
     uint64_t unknown_word;
     uint64_t no_status;
     /* Members of a set that QEMU named and the register map could not read.

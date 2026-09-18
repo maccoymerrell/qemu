@@ -582,6 +582,24 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
          * the conservative reading either way; the word only adds what the
          * rule already said.  So classify, then refuse. */
         g_qdep.incomplete++;
+        /*
+         * WHICH CEILING.  The union tells a reader that something overflowed
+         * and not what, and the four causes have four different remedies.
+         * A capacity comment in accel/tcg that wants to say a particular
+         * ceiling is not reached needs the count for THAT ceiling.
+         */
+        if (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES) {
+            g_qdep.inc_writes++;
+        }
+        if (st.incomplete & QEMU_PLUGIN_DF_INC_FIELDS) {
+            g_qdep.inc_fields++;
+        }
+        if (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS) {
+            g_qdep.inc_memops++;
+        }
+        if (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED) {
+            g_qdep.inc_refused++;
+        }
         qdep_classify_word(tb, idx, out);
         return QDEP_INCOMPLETE;
     }

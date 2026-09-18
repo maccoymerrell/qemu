@@ -460,6 +460,18 @@ void append_stats_summary(GString *report, const char *label,
         { "  seating: bytes reached no rule",    qdep_counters()->no_rule },
         { "  seating: instruction not recorded whole",
                                                  qdep_counters()->incomplete },
+        /*
+         * The four causes of that refusal, separately.  They are what a
+         * capacity claim about one slot ceiling is checkable against; the
+         * union above cannot tell a write overflow from a memop one, and the
+         * two are different remedies.  Not must-be-0 rows: a decode site that
+         * declines (the last) is a stated refusal, not a shortfall.
+         */
+        { "    cause: more writes than slots",   qdep_counters()->inc_writes },
+        { "    cause: more env ranges than slots",
+                                                 qdep_counters()->inc_fields },
+        { "    cause: more accesses than rows",  qdep_counters()->inc_memops },
+        { "    cause: decode site declined",     qdep_counters()->inc_refused },
         /* A word this build cannot read means the emulator and the plugin
          * were built from different vocabularies.  It is a skewed build, not
          * an unclassifiable instruction, and must read 0. */

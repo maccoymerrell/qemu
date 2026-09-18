@@ -62,7 +62,7 @@ separate program run after the fact and it is not part of building
 or running the tracer.
 
 ``ninja`` is the build command, not ``make``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Both invocations above drive ``ninja`` directly, and that is
 deliberate.  ``make`` in a configured build directory is a thin

@@ -1068,6 +1068,50 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
     }
 }
 
+/*
+ * A FLAG THE LAZY-FLAGS STATE MAKES CONSTANT IS STILL A FLAG THE
+ * INSTRUCTION READS.
+ *
+ * After a logic operation CF and OF are architecturally zero, and after
+ * POPCNT every flag but ZF is.  The lazy-flags scheme knows that statically,
+ * so the arms below hand back TCG_COND_NEVER and the whole read folds to a
+ * constant: no op names cc_src, cc_dst or anything else, and an op-stream
+ * reader is left with an `adc` that reads two GPRs and nothing more.
+ *
+ * That is a REAL EDGE LOST.  `xor %si,%di ; adc %di,%r10w` has the adc
+ * consuming the flags word the xor produced -- a renamer builds that
+ * dependency, and the consumer this trace feeds has to model it -- and the
+ * fact that the value is derivable at translate time says nothing about
+ * whether the architecture reads it.  The same argument the folded
+ * addressing register got at gen_lea_modrm: QEMU's optimisation is QEMU's,
+ * and the wire owes the architecture's answer.
+ *
+ * MEASURED, and that is how it was found: gem5's X86 model names its Cfof
+ * register as a source of `adc %dil,%r8b` / `adc %di,%r10w` /
+ * `adc %di,0x10a(%r15)` on the wrong-path probe, and this tree's trace named
+ * only the two GPRs.  Every one of those three sits behind a logic
+ * instruction; the 64-bit `adc %rbx,%rdi` two probes over, which follows an
+ * `add`, agreed on both sides all along -- because there the carrier is live
+ * and the ops name it.
+ *
+ * THE NAME IS `eflags` AND NOT A cc CARRIER, deliberately.  cc_src/cc_dst
+ * hold whatever the PREVIOUS instruction left for a later computation, and
+ * on this path they hold nothing this instruction consulted; naming one
+ * would point at storage the fold did not read.  `eflags` is the
+ * architectural flags word -- declared as its own one-entry file, mapped by
+ * the tracer's register map with the reason "arch-name: the flags word" --
+ * and it is the register the SDM says the instruction reads.
+ *
+ * ONLY THE FOLDING ARMS STATE IT.  Where the flag is computed from a live
+ * carrier the ops already name it, and a statement there would be a second
+ * spelling of a fact the reader has.
+ */
+static CCPrepare gen_flag_folded_const(void)
+{
+    insn_dataflow_state_read(insn_df_reg("eflags"));
+    return (CCPrepare) { .cond = TCG_COND_NEVER };
+}
+
 /* compute eflags.C, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
@@ -1092,7 +1136,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
-        return (CCPrepare) { .cond = TCG_COND_NEVER };
+        return gen_flag_folded_const();
 
     case CC_OP_INCB ... CC_OP_INCQ:
     case CC_OP_DECB ... CC_OP_DECQ:
@@ -1163,7 +1207,7 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
         return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
                              .imm = CC_S };
     case CC_OP_POPCNT:
-        return (CCPrepare) { .cond = TCG_COND_NEVER };
+        return gen_flag_folded_const();
     default:
         return gen_prepare_sign_nz(cpu_cc_dst, cc_op_size(s->cc_op));
     }
@@ -1179,7 +1223,7 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
                              .no_setcond = true };
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
-        return (CCPrepare) { .cond = TCG_COND_NEVER };
+        return gen_flag_folded_const();
     case CC_OP_MULB ... CC_OP_MULQ:
         return (CCPrepare) { .cond = TCG_COND_NE, .reg = cpu_cc_src };
     default:

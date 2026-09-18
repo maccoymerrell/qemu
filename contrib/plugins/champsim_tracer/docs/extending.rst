@@ -24,19 +24,20 @@ A new target ISA comes up one subsystem at a time, in the order below.
 Each step is independently testable, so the port stays green as it
 grows: correct-path tracing is functional after step 2 and complete
 after step 5, and wrong-path simulation follows in
-*Wrong-path in system mode*.  Two prerequisites come first — Capstone
-must disassemble the target, and ``TraceISA`` in
-``champsim_tracer_generic_ids.h`` gets the new enumerator (the value
-the header's ``isa`` byte carries).
+*Wrong-path in system mode*.  Two prerequisites come first — the
+target's own decode rules must state their generic words through
+``qemu-plugin-dataflow.h`` (see :doc:`qemu_modifications`), and
+``TraceISA`` in ``champsim_tracer_generic_ids.h`` gets the new
+enumerator (the value the header's ``isa`` byte carries).
 
 The declarative hub for everything below is **one row** in the
 ``isa_properties[]`` table in ``champsim_tracer_mnemonics.h``, keyed by
 the new ``TraceISA`` enumerator.  The plugin never branches on
 ``trace_isa`` in its shared paths; it reads that row.  A row carries the
 target-name prefixes that resolve the ISA (``target_prefixes``), the
-Capstone arch and mode resolver (``cap_arch`` / ``cap_mode_for_target``),
-the operand-walk and branch-delay convention
-(``include_implicit_regs``, ``branch_delay_slots``), the value-shaping hooks
+branch-delay convention (``branch_delay_slots``) and the referee's
+implicit-register convention (``include_implicit_regs``, read offline,
+not by the plugin), the value-shaping hooks
 (``flags_to_metaflags``, ``canonicalize_addr``, ``reg_alias_inserter``),
 the install-time behaviour flags (``xlate_bypass_priv`` for a
 translation-bypass privilege level, ``pin_reuse_asid`` for a narrow
@@ -46,31 +47,36 @@ the guest window-marker descriptor (``marker_encode_seq`` /
 is the port's spine; the steps below fill in the tables and hooks it
 names.
 
-1. **Classify instructions — the mnemonic table.**
-   ``champsim_tracer_mnemonic_audit.py --isa <isa> --apply`` emits
-   ``champsim_tracer_mnemonics_<isa>.h``, one ``InsnClassification``
-   row per Capstone insn ID carrying the generic ``opcode``,
-   ``branch_type``, ``flags``, the ``dep_refine`` classifier, and the
-   ``lane_mask_kind``.  Teach the generator's rules, never the rows.
-   *Verify:* ``--isa <isa> --diff`` prints every Capstone mnemonic with
-   no row (a silent ``GEN_OP_UNKNOWN``); a clean diff plus the
-   exit-time "Generic opcode breakdown" on a sample workload confirms
-   coverage.
+1. **Say what each instruction does — the words at the decode sites.**
+   Every decode rule in the target's own translator states a generic
+   word (``int.add``, ``fp.mul``, ``branch.cond`` ...) beside the
+   registers it reads and writes.  The word set is closed: a word this
+   build cannot read is refused, because it means the emulator and the
+   plugin disagree about the vocabulary rather than that an
+   instruction is unclassifiable.  New words are added to the one
+   table in ``champsim_tracer_vocabulary.cc`` with their
+   ``GenericOpcode`` / ``BranchType``, never per ISA.
+   *Verify:* the exit-time "Generic opcode breakdown" on a sample
+   workload, cross-read against the offline referee
+   (``tools/cst_referee.py --isa <isa>``), whose vocabulary comes from
+   ``champsim_tracer_mnemonic_audit.py``.  Rows the two disagree on
+   are what ``tools/score_referee.sh`` reports.
 
-2. **Classify registers — the register table.**
-   ``champsim_tracer_mnemonic_audit.py --regs --isa <isa> --apply``
-   emits the ``RegClassification`` rows in the same header: each
-   Capstone register ID maps to a ``GenericRegId`` plus the QEMU
-   GDB-stub feature/name the register-handle cache reads to snapshot
-   the value.
-   *Verify:* ``champsim_tracer_mnemonic_survey.py`` lists the Capstone
-   register names the disassembler actually emits on a workload; the
-   exit-time register-attribution tables should show no unmapped
-   register.
+2. **Reach the register values — the generated regmap.**
+   ``scripts/cst-regmap.py`` joins the names the target registers its
+   registers under to the generic ids the wire publishes, emitting
+   ``champsim_tracer_regmap_<isa>.h`` (the TCG-global spelling) and
+   ``champsim_tracer_gdbmap_<isa>.h`` (the gdbstub spelling the
+   register-handle cache reads values through).  The TSVs under
+   ``champsim_tracer/regmap/`` carry the adjudicated rows; the
+   generator refuses in both directions, so a registered name with no
+   row, or a row naming nothing the target registers, fails the build.
+   *Verify:* the build itself, plus the exit-time
+   register-attribution tables showing no unmapped register.
 
 3. **Assign lane-mask kinds — vector instructions.**
-   Each vector row's ``lane_mask_kind`` (``LaneMaskKind`` in
-   ``champsim_tracer_mnemonics.h``) tells the decoder *where* to read
+   Each vector encoding's ``lane_mask_kind`` (``LaneMaskKind`` in
+   ``champsim_tracer_mnemonics.h``) tells the reader *where* to read
    the active-lane count: ``LANE_MASK_KIND_STATIC`` for an
    encoding-fixed width, or an ISA-specific kind (e.g.
    ``LANE_MASK_KIND_RISCV_VTYPE``, which reads ``vl`` at run time).
@@ -148,32 +154,30 @@ there's room up to 255 entries before the format itself has to change.
 
       case GEN_OP_AES_ENC:    return "GEN_OP_AES_ENC";
 
-3. **Classify the instruction.**  This is the only ISA-aware step.
-   At runtime, ``champsim_tracer_decode.cc``'s
-   ``decode_detail_to_generic`` indexes the per-ISA classification
-   table by Capstone insn ID and writes the opcode into
-   ``InsnFields.opcode``.  Those tables — ``x86_insn_class[]`` and its
-   ``aarch64`` / ``mips`` / ``riscv`` counterparts — are
-   **auto-generated**: each carries an
-   ``/* Auto-generated by champsim_tracer_mnemonic_audit.py. */``
-   header and lives in ``champsim_tracer_mnemonics_<isa>.h``.  Do not
-   hand-edit the table rows.  A classification change goes through
-   ``champsim_tracer_mnemonic_audit.py``'s regeneration path: teach the
-   script's classification rules the new mnemonic, then re-emit the
-   tables with ``champsim_tracer_mnemonic_audit.py --isa <isa>
-   --apply``.  An ``InsnClassification`` row is a designated-initializer
-   entry indexed by Capstone insn ID, emitted by the generator:
+3. **Give the word a meaning.**  Two edits, in two places, and
+   neither of them is per-ISA.
+
+   At the decode site, the target's own rule states the word — this is
+   the ISA-aware half, and it lives in the target's translator, beside
+   the encoding:
 
    .. code-block:: c
 
-      [X86_INS_AESENC] = { .opcode = GEN_OP_AES_ENC, .branch_type = BRANCH_NONE,
-                           .flags = MF_NONE,
-                           .dep_refine = dep_all_to_all },
+      insn_dataflow_set_opcode(ctx, "vec.aes.enc");
 
-   Running ``champsim_tracer_mnemonic_audit.py --isa <isa> --diff``
-   reports any Capstone mnemonic missing a classification row — it
-   diffs the union of mnemonics Capstone has emitted on a sample
-   workload against the static table and prints the unclassified set.
+   In ``champsim_tracer_vocabulary.cc``, one row says what that word
+   means on the wire.  The rows are a sorted array and a bisection;
+   keep them sorted:
+
+   .. code-block:: c
+
+      { "vec.aes.enc", GEN_OP_AES_ENC, BRANCH_NONE },
+
+   A word with no row is **refused**, not guessed: the lookup returns
+   false and writes nothing, so a build whose emulator and plugin
+   disagree about the vocabulary says so instead of silently
+   publishing ``GEN_OP_UNKNOWN``.  That refusal is the coverage check —
+   there is no separate diff to run.
 
 4. **Update the generic-id name lookup.**  Both the plugin's writer
    and the offline tools share ``champsim_tracer_generic_ids.h``;
@@ -229,29 +233,26 @@ new singleton, or extend a dense bank cleanly.
       } else if (id >= REG_NEW_BANK0 && id < REG_NEW_BANK0 + 16) {
           snprintf(buf, sizeof(buf), "REG_NEW_BANK%u", id - REG_NEW_BANK0);
 
-3. **Map ISA registers to it.**  Each ISA's register classification
-   table — ``x86_reg_class[]`` and its ``aarch64`` / ``mips`` /
-   ``riscv`` counterparts in ``champsim_tracer_mnemonics_<isa>.h`` —
-   maps a Capstone register ID to a ``GenericRegId`` plus the QEMU
-   GDB-stub feature/name the register-handle cache reads.  These
-   tables are auto-generated and carry the same
-   ``/* Auto-generated by champsim_tracer_mnemonic_audit.py. */``
-   header as the instruction tables.  A ``RegClassification`` row is a
-   designated-initializer entry indexed by Capstone register ID,
-   emitted by the generator:
+3. **Map the target's registers to it.**  Add the row to the ISA's
+   TSV under ``champsim_tracer/regmap/`` — ``<isa>.tsv`` for the
+   spelling the target registers TCG globals under, ``<isa>.gdb.tsv``
+   for the gdbstub feature/name the register-handle cache reads values
+   through — and rebuild.  ``scripts/cst-regmap.py`` re-emits
+   ``champsim_tracer_regmap_<isa>.h`` and
+   ``champsim_tracer_gdbmap_<isa>.h`` from them:
 
-   .. code-block:: c
+   .. code-block:: text
 
-      [X86_REG_BP] = { .reg_id = REG_NEW_THING,
-                       .qemu_reg = { .feature = "org.gnu.gdb.i386.core",
-                                     .name = "rbp" } },
+      # <isa>.gdb.tsv
+      rbp    REG_NEW_THING    org.gnu.gdb.i386.core
 
-   The mapping change goes through the audit script's register path:
-   ``champsim_tracer_mnemonic_audit.py --regs --isa <isa> --apply``
-   re-emits the register tables.  The
-   ``champsim_tracer_mnemonic_survey.py`` helper prints
-   per-Capstone-name hit counts on a workload, which is the easiest
-   way to discover what name the disassembler is actually emitting.
+   Do not hand-edit the generated headers.  The generator refuses in
+   both directions — a name the target registers with no adjudicated
+   row, or a row naming nothing the target registers — so a missing or
+   misspelled row fails the build rather than shipping a map one
+   register short.  The ``depend_files`` list in
+   ``contrib/plugins/meson.build`` is what makes that refusal timely:
+   a target that adds a register re-runs the join.
 
 4. **Mirror the addition in the generic-id table.**
    ``generic_reg_name`` in ``champsim_tracer_generic_ids.h`` covers
@@ -283,13 +284,10 @@ trap-style branch that you want to model differently from a syscall.
 
 2. **Name it** in ``branch_type_name``.
 
-3. **Wire ISAs into it.**  The relevant mnemonic's
-   ``InsnClassification`` row gets the new ``BranchType`` in its
-   ``.branch_type`` field.  The classification tables in
-   ``champsim_tracer_mnemonics_<isa>.h`` are auto-generated, so this
-   change goes through ``champsim_tracer_mnemonic_audit.py``'s
-   classification rules and an ``--apply`` regeneration, not a hand
-   edit of the row.
+3. **Wire ISAs into it.**  The word the decode rule states carries the
+   branch type: give the branching word its ``BranchType`` in the
+   ``champsim_tracer_vocabulary.cc`` row, and state that word at the
+   target's decode site.  Nothing per-ISA is generated for this.
 
 4. **Teach the WP target resolver** in
    ``champsim_tracer.cc::resolve_wrong_target`` how to choose the WP
@@ -458,9 +456,11 @@ After any of the above, two scripts give you fast confidence:
   A field-format mistake shows up either as a decode error or as the
   "section overhead" line going wildly negative.
 
-* ``champsim_tracer_mnemonic_audit.py`` walks a sample workload and
-  reports any Capstone mnemonic with no ``insn_classification`` row,
-  flagging silent ``GEN_OP_UNKNOWN`` regressions.
+* ``tools/score_referee.sh`` runs the offline referee
+  (``tools/cst_referee.py``, the Python Capstone bindings) over the
+  corpora a ``CST_CAPTURE`` build records and reports every row where
+  the two decoders disagree — the check that a newly stated word means
+  on the wire what the encoding actually does.
 
 Committing a change
 -------------------
@@ -469,7 +469,7 @@ The tracer is developed in one shared working tree, and more than one
 session edits it at a time — each on its own files, each expecting its
 commit to carry those files and no others.  Stage by explicit path::
 
-    $ git add contrib/plugins/champsim_tracer/champsim_tracer_decode.cc \
+    $ git add contrib/plugins/champsim_tracer/champsim_tracer_vocabulary.cc \
               contrib/plugins/champsim_tracer/docs/decoder.rst
     $ git diff --cached --stat
 

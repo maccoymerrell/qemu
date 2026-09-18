@@ -3332,6 +3332,28 @@ def _referee_argv() -> list:
 _REF_RULINGS = (Path(__file__).resolve().parent.parent.parent /
                 "tools" / "setjoin_rulings.tsv")
 
+# WHERE THE REFEREE'S SCRATCH CORPUS GOES, AND WHY NOT /tmp.
+#
+# _referee_reg_sets() writes the encoding list it hands cst_referee, and
+# reads back the corpus the referee writes, through a temporary directory.
+# It used to take tempfile's default, which is /tmp on this host, on all
+# four ISAs -- against the standing rule that run outputs live on /mnt/md0.
+# /tmp here is small and shared, and a referee corpus for a whole trace's
+# encodings is not a couple of kilobytes; a run that fills it fails in a way
+# that looks like a referee defect.  So the base is /mnt/md0 by default and
+# CST_VALIDATOR_SCRATCH overrides it for a caller that wants the scratch
+# beside its own run directory.  Named, created on demand, and still removed
+# when the referee is done -- only the parent moves.
+_SCRATCH_BASE_DEFAULT = Path("/mnt/md0/QEMU/cst_runs/_scratch")
+
+
+def _scratch_base() -> Path:
+    import os
+    b = Path(os.environ.get("CST_VALIDATOR_SCRATCH")
+             or _SCRATCH_BASE_DEFAULT)
+    b.mkdir(parents=True, exist_ok=True)
+    return b
+
 
 def _load_setjoin_rulings() -> dict:
     """The checked-in REAL-LOST arbitrations, keyed (isa, name, direction).
@@ -3372,7 +3394,8 @@ def _referee_reg_sets(isa: str, encodings: list[str],
     import tempfile
 
     ref = _referee_argv()
-    with tempfile.TemporaryDirectory(prefix="cstref_") as d:
+    with tempfile.TemporaryDirectory(prefix="cstref_",
+                                     dir=str(_scratch_base())) as d:
         src = Path(d) / ("ident_%s.tsv" % isa)
         with src.open("w") as f:
             f.write("#so %s\n" % stamp)

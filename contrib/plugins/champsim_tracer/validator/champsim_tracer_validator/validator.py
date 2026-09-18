@@ -8007,6 +8007,17 @@ def _check_regdata_reconstruction(
 
     name_to_id = {v: int(k) for k, v in reg_id_to_name.items()}
     flags_id = name_to_id.get("REG_FLAGS")
+    # The program counter is a destination of EVERY instruction on this
+    # wire, and it is not an ALU result.  Reconstructing a SUB against it
+    # asks the arithmetic to produce the next instruction's address, which
+    # it never will -- the same wrong subject the metaflags check carried
+    # (see pc_ids there), on the same instruction, surfacing here only once
+    # metaflags stopped failing first:
+    #   "BB244 insn[5] (0x401ffc) GEN_OP_INT_SUB: trace dst=REG_IP=0x401fff,
+    #    expected 0xc4 from REG_GPR6=0xc5, REG_GPR7=0x1"
+    # 0x401fff is the next pc, not 0xc5 - 0x1.  Excluded by NAME and by
+    # BOTH spellings for the reason recorded at pc_ids.
+    pc_ids = {name_to_id[n] for n in ("REG_PC", "REG_IP") if n in name_to_id}
 
     # Inverse opcode-name map: numeric id → name.
     issues: list[Issue] = []
@@ -8074,7 +8085,7 @@ def _check_regdata_reconstruction(
             srcs = [int(r) for r in (I.get("src_regs") or [])]
             dsts = [int(r) for r in (I.get("dst_regs") or [])]
             gpr_dsts = [r for r in dsts
-                        if flags_id is None or r != flags_id]
+                        if r != flags_id and r not in pc_ids]
             # Atomic RMW (lock xadd, ldadd, amoadd, ll/sc, …) has the
             # dst-reg semantically loaded from memory rather than
             # computed from src operands.  The is_atomic marker is

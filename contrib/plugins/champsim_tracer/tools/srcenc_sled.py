@@ -525,6 +525,111 @@ def read_pop(path, isa):
     return out
 
 
+def _read_corpus(path, want_cols):
+    """-> (stamp_lines, [row-as-list]) for one capture corpus.
+
+    A corpus that does not exist is NOT an empty corpus.  The emulator creates
+    the file on the first row it writes, so absence means the capture never
+    reached this corpus at all -- a different fact from "it reached it and had
+    nothing to say", and the one that has to stop the sweep.  Returning an
+    empty list here would let the caller write a short read list with no cause
+    recorded, which is the silent false success this whole file exists to
+    avoid.
+    """
+    if not os.path.exists(path):
+        raise SystemExit(
+            "srcenc_sled: the capture wrote no %s -- REFUSING.  The emulator "
+            "creates a corpus on its first row, so a missing file means the "
+            "run never reached that corpus; a read list derived from it would "
+            "be short for a reason nothing records.  Check that the build was "
+            "configured with -Dcst_capture=true." % path)
+    stamp, rows = [], []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#so") or line.startswith("#tip"):
+                stamp.append(line.rstrip("\n"))
+                continue
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= want_cols:
+                rows.append(c)
+    return stamp, rows
+
+
+def derive_read_list(isa, gen_path, ident_path, out_tsv, out_mech):
+    """Write the per-encoding READ LIST from the corpora that carry it.
+
+    FINDING 244-H.  `CST_SRC_ENC_DUMP` and `CST_SRC_MECH_DUMP` have no writer
+    at this tip -- see the block in run_slots() -- so the two files this sweep
+    used to consume are never created and the sweep refuses on every run.  The
+    same two facts are live in corpora that DO have writers, and this function
+    is the join:
+
+      read list   CST_GEN_SET_DUMP, side `q`, direction `r`.  The wire's own
+                  src_regs[], in the generic names the trace publishes.  The
+                  `p` side (raw provenance) and the `c` side (the offline
+                  referee's) are deliberately NOT read here: the read list
+                  this corpus is asked for is what a consumer of the trace
+                  receives, and that is the seating's output, not its input.
+      mechanism   CST_QEMU_IDENT_PAIRS.  `stated` where the wire seated a
+                  list, and the recorded refusal where it did not -- the
+                  seating writes `@refused:<why>` as a set MEMBER precisely so
+                  a refusal is not confused with an instruction that reads
+                  nothing, and that distinction is carried through to here
+                  rather than flattened.
+
+    THE MNEMONIC COLUMN IS QEMU'S DECODE RULE.  The identity corpus's own
+    `mnem` column reads "-" since the other decoder was retired, so the rule
+    name -- the thing QEMU's decoder actually reached -- is what goes in the
+    column downstream reads as the mnemonic.  An encoding with a set but no
+    identity row keeps its row and spells the rule `-`, because dropping it
+    would under-report the read list the wire genuinely publishes.
+
+    THE TWO OUTPUT FILES CARRY THE SAME ENCODINGS, ROW FOR ROW.  The caller
+    asserts that, and the assertion is only worth anything if it is not made
+    true by construction from one side; both are built from the same q/r key
+    set, and an encoding present in one and not the other is impossible here
+    for the same reason it was impossible before -- one run, one loop.
+    """
+    gstamp, grows = _read_corpus(gen_path, 7)
+    istamp, irows = _read_corpus(ident_path, 7)
+
+    rule = {}
+    for c in irows:
+        rule.setdefault(c[1], c[3] or "-")
+
+    src, refused = {}, {}
+    for c in grows:
+        if c[2] != "q" or c[3] != "r":
+            continue
+        enc, names = c[1], c[6]
+        if enc in src:
+            continue
+        src[enc] = names
+        why = [m for m in names.split(",") if m.startswith("@refused:")]
+        refused[enc] = why[0][len("@refused:"):] if why else ""
+
+    stamp = gstamp or istamp
+    with open(out_tsv, "w") as f:
+        for s in stamp:
+            f.write(s + "\n")
+        f.write("#isa\tencoding\tmnem\tsrc\n")
+        for enc in sorted(src):
+            f.write("%s\t%s\t%s\t%s\n"
+                    % (isa, enc, rule.get(enc, "-"), src[enc]))
+    if out_mech:
+        with open(out_mech, "w") as f:
+            for s in stamp:
+                f.write(s + "\n")
+            f.write("#isa\tencoding\tmech\n")
+            for enc in sorted(src):
+                f.write("%s\t%s\t%s\n"
+                        % (isa, enc,
+                           "refused:" + refused[enc] if refused[enc]
+                           else "stated"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--isa", required=True, choices=sorted(ISAS))
@@ -648,10 +753,42 @@ def main():
         env = dict(os.environ)
         if a.cpu:
             env["QEMU_CPU"] = a.cpu
-        env["CST_SRC_ENC_DUMP"] = tsv
+        env["CST_CAPTURE_ISA"] = a.isa
+        #
+        # THE CORPORA THIS SWEEP ASKS FOR, AND WHY THEY ARE NOT THE TWO IT
+        # USED TO ASK FOR (FINDING 244-H).
+        #
+        # This driver asked the emulator for CST_SRC_ENC_DUMP and
+        # CST_SRC_MECH_DUMP.  NEITHER HAS A WRITER.  Both Corpus objects are
+        # still declared and initialised in champsim_tracer_capture.cc, so the
+        # environment variable is still read and the file is still opened on
+        # first use -- but no call site ever reaches them, so first use never
+        # happens and the file is never created.  The sweep then refused on
+        # its own guard ("chunk 0 produced no corpus row"), which is the
+        # honest outcome and also a total blockage: ident_capture.sh requires
+        # a non-empty mechanism corpus, and all four arc3_cov legs call
+        # ident_capture.sh before they do anything else.
+        #
+        # MEASURED, exec245/cov/probe, three riscv64 encodings on
+        # build-cap212: CST_SRC_ENC_DUMP and CST_SRC_MECH_DUMP produce no file
+        # at all, while CST_GEN_SET_DUMP writes 28 rows, CST_QEMU_IDENT_PAIRS
+        # 9, CST_DF_SET_DUMP 14 and CST_DF_STMT_DUMP 9 over the same seven
+        # encodings the sled translated.
+        #
+        # So the read list is taken from where it now lives.  The `q` side of
+        # CST_GEN_SET_DUMP is the WIRE's own src_regs[] / dst_regs[], written
+        # by cst_capture_wire_sets() at the one call that produces them -- the
+        # same list a consumer of the trace receives, in the generic names the
+        # wire uses.  CST_QEMU_IDENT_PAIRS carries the decode rule QEMU
+        # reached and its generic word, which is what the mechanism column
+        # meant.  Both are captured in the SAME run as before, so the two
+        # files still describe one translation and cannot drift apart.
+        #
+        gtsv = img + ".gen.tsv"
+        itsv = img + ".ident.tsv"
+        env["CST_GEN_SET_DUMP"] = gtsv
+        env["CST_QEMU_IDENT_PAIRS"] = itsv
         mtsv = img + ".mech.tsv"
-        if a.mech:
-            env["CST_SRC_MECH_DUMP"] = mtsv
         env["CST_SLED"] = "%x:%d:%d" % (base, stride, n)
         log = img + ".log"
         with open(log, "w") as lf:
@@ -664,6 +801,7 @@ def main():
                      img + ".t.unknown_warnings.log"):
             if os.path.exists(junk):
                 os.remove(junk)
+        derive_read_list(a.isa, gtsv, itsv, tsv, mtsv if a.mech else None)
         logtext = open(log).read()
         m = _SLED_STATS_RE.search(logtext)
         if not m:
@@ -674,6 +812,13 @@ def main():
                 "may not report; see %s" % (label, log))
         stats = dict(zip(("slots", "translated", "declined", "no_chain"),
                          (int(x) for x in m.groups())))
+        # THE TWO SOURCE CORPORA TRAVEL WITH THE PASS THAT WROTE THEM.  The
+        # read list above is DERIVED from them, and a consumer that wants the
+        # destination list, the generic word or the branch class needs the
+        # originals -- which are per-pass, because a retry re-lays the
+        # leftovers in a fresh process with its own files.
+        stats["gen_tsv"] = gtsv
+        stats["ident_tsv"] = itsv
         # THE NAMES, JOINED TO THIS RUN'S LAYOUT.  A PC outside the sled --
         # the entry stub, say -- is not a slot and must not be turned into
         # one by integer division, so the join is bounds-checked and the
@@ -728,6 +873,12 @@ def main():
         return out
 
     rows, parts, mparts = 0, [], []
+    #: The corpora the read list was derived from, one entry per PASS.  Merged
+    #: into the output directory at the end so a leg's tracer arm can read the
+    #: destination list and the generic word out of the same capture that
+    #: produced the read list, rather than running a second sled and comparing
+    #: two different translations.
+    gparts, iparts = [], []
     declined_total = no_chain_total = retry_passes = 0
     #: The union of every encoding any pass reported no_chain for.  A UNION
     #: and not a per-pass tally: a retry re-lays the leftovers, so the same
@@ -782,6 +933,8 @@ def main():
                                              tag + ".log"))
                 chunk_mparts.append(mtsv)
             chunk_parts.append(tsv)
+            gparts.append(stats["gen_tsv"])
+            iparts.append(stats["ident_tsv"])
             rows += got
             nochain_enc.update(stats["nochain_enc"])
             if pass_no == 0:
@@ -1004,10 +1157,24 @@ def main():
             with open(t) as f:
                 for line in f:
                     if line.startswith("#"):
-                        mhdr = mhdr or line
+                        # THE COLUMN HEADER, NOT WHICHEVER COMMENT CAME
+                        # FIRST.  The capture writes its `#so` stamp above the
+                        # column line, so `the first # line` is the stamp and
+                        # the merged file was losing the column names --
+                        # which a consumer reads to find its columns by name.
+                        if line.startswith("#isa"):
+                            mhdr = mhdr or line
                         continue
-                    c = line.split("\t")
-                    if len(c) < 4 or c[1] not in wanted:
+                    c = line.rstrip("\n").split("\t")
+                    # THREE COLUMNS, BECAUSE THE CORPUS HAS THREE (244-H).
+                    # This guard read `len(c) < 4` against a corpus whose own
+                    # header declares `#isa encoding mech`, so it discarded
+                    # EVERY row and the merged mechanism corpus could only
+                    # ever be a header.  Nothing noticed, because the only
+                    # consumer -- ident_capture.sh -- tested the file for
+                    # non-emptiness and for a `#so` line, both of which a
+                    # header-only file passes.
+                    if len(c) < 3 or c[1] not in wanted:
                         continue
                     prev = mseen.get(c[1])
                     if prev is None:
@@ -1039,6 +1206,49 @@ def main():
                 "encodings and the merged mechanism corpus %d -- REFUSING "
                 "(one encoding, two files, one row each)"
                 % (len(seen), len(mseen)))
+
+    # THE CORPORA THE READ LIST WAS DERIVED FROM, KEPT (FINDING 244-H).
+    #
+    # A leg's tracer arm wants more than the read list: the DESTINATION list,
+    # the generic word and the branch class.  Those are in the same two
+    # captures the read list came from, and re-running a second sled to get
+    # them would compare two different translations of the same encoding --
+    # which is precisely the mistake the sled's own INCIDENTAL-CONFLICT note
+    # says the corpus is sensitive to.  So the sources are merged here, in the
+    # output directory, beside the read list they produced.
+    #
+    # DEDUPLICATED ON THE WHOLE ROW, not on the encoding: the capture already
+    # deduplicates per (encoding, side, direction, names), and an encoding
+    # that seats two different lists in one run keeps both rows there.  Losing
+    # the second here would hide exactly the context dependence the read-list
+    # merge above reports.
+    for name, src_parts in (("gen", gparts), ("ident", iparts)):
+        path = os.path.join(a.out, "%s_%s.tsv" % (name, a.isa))
+        head, body = [], []
+        for t in src_parts:
+            if not os.path.exists(t):
+                continue
+            with open(t) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        # EVERY distinct comment line, stamp AND column
+                        # header.  A consumer finds its columns by name, so a
+                        # merge that keeps the stamp and drops the `#isa` line
+                        # hands it a file it cannot read.
+                        if line not in head:
+                            head.append(line)
+                        continue
+                    if line not in body:
+                        body.append(line)
+        if not body:
+            raise SystemExit(
+                "srcenc_sled: merged %s corpus is empty -- REFUSING.  The "
+                "read list above was derived from it, so an empty source and "
+                "a non-empty derivative cannot both be true." % path)
+        with open(path, "w") as f:
+            f.writelines(head)
+            f.writelines(body)
+        print("source-corpus %s rows=%d" % (path, len(body)))
 
     print("corpus %s encodings=%d (raw rows %d) population=%d "
           "incidental_rows=%d incidental_encodings=%d "

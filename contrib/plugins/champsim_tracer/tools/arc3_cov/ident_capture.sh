@@ -61,13 +61,55 @@ fi
 # were captured with.
 CPU=()
 [ -n "${CST_IDENT_CPU:-}" ] && CPU=(--cpu "$CST_IDENT_CPU")
+# THE SLED NEEDS A CAPTURE BUILD, AND THE CANONICAL ONE IS NOT (FINDING
+# 244-H).  Every corpus the sled drives is written by champsim_tracer_capture,
+# which is compiled in only under -Dcst_capture=true; in the shipped object the
+# entry points are inline no-ops, so a sled run against build/ produces no file
+# at all and the failure reads like an empty population.  The driver loop and
+# the CST_SLED name are compiled under the same guard, so the object itself can
+# be asked which kind of build it is rather than the question being answered by
+# a path convention.
+CAPB=${CST_CAPTURE_BUILD:-}
+if [ -z "$CAPB" ]; then
+    for cand in "$Q/build" "$Q/build-cap212" "$Q/build-cap"; do
+        if [ -f "$cand/contrib/plugins/libchampsim_tracer.so" ] &&
+           grep -qa CST_SLED "$cand/contrib/plugins/libchampsim_tracer.so"; then
+            CAPB=$cand; break
+        fi
+    done
+fi
+if [ -z "$CAPB" ]; then
+    echo "REFUSED: no capture build found for the sled." >&2
+    echo "  The per-encoding corpora are written by code compiled only" >&2
+    echo "  under -Dcst_capture=true; a shipped build writes none, and a" >&2
+    echo "  run against one is not a short capture but no capture." >&2
+    echo "  Configure one (../configure -Dcst_capture=true ...) and name" >&2
+    echo "  it in CST_CAPTURE_BUILD." >&2
+    exit 2
+fi
+echo "ident_capture $ISA capture build: $CAPB" >&2
 ionice -c3 nice -n 10 "$PY" "$SLED" --isa "$ISA" --pop "$OUT/pop_$ISA.tsv" \
-    --out "$OUT" --build-dir "$Q/build" --mech "${CPU[@]}" >&2 || {
+    --out "$OUT" --build-dir "$CAPB" --mech "${CPU[@]}" >&2 || {
     echo "REFUSED: the sled could not capture an identity for $ISA" >&2
     exit 2; }
 
 C=$OUT/corpus_mech_$ISA.tsv
 [ -s "$C" ] || { echo "REFUSED: the sled wrote no $C" >&2; exit 2; }
 grep -q '^#so' "$C" || { echo "REFUSED: $C carries no #so stamp" >&2; exit 2; }
-echo "ident_capture $ISA population=$n rows=$(grep -vc '^#' "$C")" >&2
+# A HEADER IS NOT A CORPUS (FINDING 244-H).  `-s` and a `#so` line are both
+# satisfied by a file that carries nothing but its stamp and its column names,
+# and that is exactly what the sled produced for as long as its mechanism
+# merge tested `len(c) < 4` against a three-column corpus: every row was
+# discarded, the file was written, both guards above passed, and the leg went
+# on to classify an encoding set the corpus said nothing about.  Count the
+# rows and refuse a zero.
+rows=$(grep -vc '^#' "$C")
+if [ "$rows" = 0 ]; then
+    echo "REFUSED: $C carries a header and no row.  A check that cannot" >&2
+    echo "  find its subject must fail: the identity this leg classifies" >&2
+    echo "  from would be empty, and every encoding would read unclassified" >&2
+    echo "  for a reason that has nothing to do with the tracer." >&2
+    exit 2
+fi
+echo "ident_capture $ISA population=$n rows=$rows" >&2
 echo "$C"

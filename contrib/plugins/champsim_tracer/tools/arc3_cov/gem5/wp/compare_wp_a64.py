@@ -79,6 +79,7 @@ import wp_trace                                              # noqa: E402
 import wp_seed_a64                                           # noqa: E402
 import gem5_ref                                              # noqa: E402
 import gem5_env                                              # noqa: E402
+import wire_vocab                                            # noqa: E402
 from arc3_taxonomy import (set_relation, EQUAL, SUPERSET,
                            SUBSET, ORTHOGONAL)               # noqa: E402
 from gem5_rules import gem5_exec_rule                        # noqa: E402
@@ -373,13 +374,74 @@ _WP_RULES = {
     #
     # The exemption is held to EXACTLY the registers measured to behave that
     # way, and to nothing else.  A blanket "the misc file does not count"
-    # would swallow cpacr_el1 and fpscr -- both of which the tracer and gem5
-    # already AGREE on -- and with them any future row where the tracer really
+    # would swallow fpscr and with it any future row where the tracer really
     # did drop a system source.  Watched: the control drops a REG_SYSFPEN
-    # source and this rule does not reach it, so the axis fires.
+    # source and the composed rule below is the only thing that may reach it.
+    #
+    # CORRECTION, 2026-09-18.  This comment used to say the exemption must
+    # stay narrow because "cpacr_el1 and fpscr -- both of which the tracer and
+    # gem5 already AGREE on".  MEASURED on the exec244 leg at 02d2e16c44, the
+    # cpacr_el1 half of that was FALSE: 130 p_wpmem rows read
+    # ref={REG_FLAGS, REG_SYSFPEN} against trc={}, so the two did not agree on
+    # it anywhere in that probe.  The claim stood while the rows it described
+    # were being reported as tracer defects.  cpacr_el1 now has its own rule
+    # below, with its own reason, rather than being folded into this one.
     'REF-READS-MACHINE-STATE': _Rule(
         'REF-READS-MACHINE-STATE', 'reference-gap', {SUBSET},
         'gem5 names cpsr as a source of essentially every micro-op'),
+
+    # THE FP TRAP GATE, WHICH QEMU DECIDES AT TRANSLATION AND NEVER READS.
+    #
+    # gem5 threads `cpacr_el1` -- the FP/SIMD access-trap control, mapped to
+    # REG_SYSFPEN -- through the source list of the micro-ops of every FP and
+    # SIMD instruction.  What that register decides is whether the instruction
+    # TRAPS, not what it computes, and QEMU decides it at TRANSLATION:
+    # fp_access_check() reads s->fp_excp_el, which comes out of the hflags
+    # computed for the block, so the generated code contains either the
+    # instruction or the trap and no executed op reads the register.  A change
+    # to cpacr_el1 reaches the guest through a hflags rebuild and a TB flush,
+    # not through a register dependency, so under R7 a renaming regfile does
+    # not have to respect it for the instruction to compute correctly.
+    #
+    # Same family as REF-READS-MACHINE-STATE and deliberately NOT the same
+    # rule: the reason is different (translation-time gating, not per-micro-op
+    # threading), and one label covering both would explain neither row.
+    #
+    # HELD TO THE SUBSET DIRECTION AND TO THIS ONE REGISTER.  A row where the
+    # TRACER names a system source the reference does not is a different fact
+    # and cannot reach here.
+    'REF-READS-FP-TRAP-GATE': _Rule(
+        'REF-READS-FP-TRAP-GATE', 'reference-gap', {SUBSET},
+        'gem5 names cpacr_el1 as a source of every FP/SIMD micro-op; QEMU '
+        'decides the FP trap at translation and no executed op reads it'),
+
+    # The two SUBSET-side gaps meet on one row, and a row is adjudicated per
+    # MEMBER.  gem5's misc source list for an FP micro-op inside a wrong-path
+    # excursion is {cpsr, cpacr_el1} and the tracer's is empty, so neither
+    # single-register rule covers the surplus on its own.  This label is
+    # earned only when EVERY member of the surplus is covered by one of the
+    # two standing sets; one register neither names and the row stays red.
+    'REF-MACHINE-STATE-AND-FP-TRAP-GATE': _Rule(
+        'REF-MACHINE-STATE-AND-FP-TRAP-GATE', 'reference-gap', {SUBSET},
+        'both members separately adjudicated: gem5 names cpsr on every '
+        'micro-op and cpacr_el1 on every FP one'),
+
+    # THE REFERENCE HAS NO NAME FOR THE PROGRAM COUNTER.  Asked of the mapper
+    # rather than assumed -- gem5_ref.ref_can_name() runs the aarch64 mapper
+    # over every class and index it branches on, and the wire's PC spelling is
+    # not in the answer -- so the rule stops applying by itself the day a
+    # later mapper learns it.  This is the same fact, and the same rule, the
+    # CORRECT-PATH leg already applies on mipsel (REF-MAPPER-HAS-NO-PC in
+    # compare_exec_gem5.py); the wrong-path leg had no rule at all and
+    # reported every such row UNACCOUNTED.
+    #
+    # It reaches BOTH register axes because the gap is the MAPPER's, which has
+    # no direction: gem5 keeps the PC in its PCState and names it in neither
+    # a source list nor a destination list.
+    'REF-MAPPER-HAS-NO-PC': _Rule(
+        'REF-MAPPER-HAS-NO-PC', 'reference-gap', {SUPERSET},
+        "gem5's aarch64 register mapper can produce no name for the program "
+        'counter at any class or index'),
 
     # gem5's AArch64 decoder resolves a zero-register SOURCE operand into its
     # `invalid` register class, so `cset x9, lt` -- architecturally
@@ -453,6 +515,18 @@ _WP_RULES = {
 #: the tracer names REG_SYSFPEN on exactly those 46 and REG_FCSR on exactly
 #: those 3.  Only cpsr is unmatched, so only cpsr is exempt.
 REF_MACHINE_STATE = frozenset(('REG_FLAGS',))
+
+#: the FP/SIMD access-trap control, as the wire spells it.  Its own set, not
+#: a member of REF_MACHINE_STATE, because the reason it appears in gem5's
+#: source list and not the tracer's is a different reason -- see
+#: REF-READS-FP-TRAP-GATE.
+REF_FP_TRAP_GATE = frozenset(('REG_SYSFPEN',))
+
+#: the name the WIRE prints for the program counter, READ from the header
+#: that defines it rather than copied -- the spelling has been both REG_IP
+#: and REG_PC across this tree's history, and a constant copied into a
+#: comparator goes stale without anything failing.
+PC_NAME = wire_vocab.pc_name()
 
 
 def _rule(label):
@@ -547,11 +621,23 @@ def _atomic_dest_as_src(r, only_ref):
     return rmw and bool(only_ref) and frozenset(only_ref) <= wrote
 
 
+def _no_pc_in_mapper(only_ref, only_trc):
+    """The whole disagreement is the program counter the reference cannot name.
+
+    Direction-free by construction: `ref_can_name` runs the mapper, and a
+    mapper that produces no such name produces it in neither role.
+    """
+    return (not only_ref and frozenset(only_trc) == frozenset((PC_NAME,))
+            and not gem5_ref.ref_can_name('aarch64', PC_NAME))
+
+
 def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
     """The MECHANISM, chosen from the two records -- never from a mnemonic."""
     if axis == 'reg-dst-set':
         if only_trc and not only_ref and all(n == 'REG_ZERO' for n in only_trc):
             return 'REF-DISCARDS-ZERO-DEST'
+        if _no_pc_in_mapper(only_ref, only_trc):
+            return 'REF-MAPPER-HAS-NO-PC'
         if (only_ref and not only_trc and
                 all(n.startswith('REG_VEC') for n in only_ref) and
                 _neon_pairwise(ref_ins, trc_ins)):
@@ -559,6 +645,8 @@ def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
     elif axis == 'reg-src-set':
         if only_trc and not only_ref and all(n == 'REG_ZERO' for n in only_trc):
             return 'REF-DISCARDS-ZERO-SRC'
+        if _no_pc_in_mapper(only_ref, only_trc):
+            return 'REF-MAPPER-HAS-NO-PC'
         if only_ref and not only_trc and _atomic_dest_as_src(ref_ins, only_ref):
             return 'REF-ATOMIC-DEST-AS-SRC'
     elif axis in ('fpsr-dst-set', 'reg-dst-set'):
@@ -579,6 +667,17 @@ def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
         if only_ref and not only_trc and \
                 frozenset(only_ref) <= REF_MACHINE_STATE:
             return 'REF-READS-MACHINE-STATE'
+        # The FP trap gate alone.
+        if only_ref and not only_trc and \
+                frozenset(only_ref) <= REF_FP_TRAP_GATE:
+            return 'REF-READS-FP-TRAP-GATE'
+        # BOTH subset-side gaps on one row, adjudicated per MEMBER.  The
+        # surplus must be covered by the UNION and must draw from BOTH sets;
+        # a surplus lying wholly in one of them has already been named above,
+        # and a surplus with a member in neither falls through to red.
+        if only_ref and not only_trc and \
+                frozenset(only_ref) <= (REF_MACHINE_STATE | REF_FP_TRAP_GATE):
+            return 'REF-MACHINE-STATE-AND-FP-TRAP-GATE'
         # The implicit FP control-word read.  SUPERSET direction only, and the
         # surplus must be EXACTLY the control word: a row that also carried a
         # dropped reference source has an unexplained half and stays red.

@@ -1222,9 +1222,21 @@ def main():
     # that seats two different lists in one run keeps both rows there.  Losing
     # the second here would hide exactly the context dependence the read-list
     # merge above reports.
+    #
+    # THE MEMBERSHIP TEST IS A SET, AND IT HAS TO BE.  This loop used to ask
+    # `line not in body' against the LIST it was appending to, which is a
+    # linear scan of everything already kept -- quadratic in the corpus, and
+    # the corpus is the whole reachable-encoding population.  Measured: 246k
+    # rows (riscv64) finished in minutes and 2.2M (mipsel) had not finished in
+    # 45, with x86_64 an order of magnitude past that, so a whole-population
+    # census across all four ISAs could not be run at all.  The set carries
+    # the membership and the list carries the ORDER, which is the property the
+    # paragraph above depends on; the output is byte-for-byte what the slow
+    # form produced.
     for name, src_parts in (("gen", gparts), ("ident", iparts)):
         path = os.path.join(a.out, "%s_%s.tsv" % (name, a.isa))
         head, body = [], []
+        head_seen, body_seen = set(), set()
         for t in src_parts:
             if not os.path.exists(t):
                 continue
@@ -1235,10 +1247,12 @@ def main():
                         # header.  A consumer finds its columns by name, so a
                         # merge that keeps the stamp and drops the `#isa` line
                         # hands it a file it cannot read.
-                        if line not in head:
+                        if line not in head_seen:
+                            head_seen.add(line)
                             head.append(line)
                         continue
-                    if line not in body:
+                    if line not in body_seen:
+                        body_seen.add(line)
                         body.append(line)
         if not body:
             raise SystemExit(

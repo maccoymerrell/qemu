@@ -2814,76 +2814,6 @@ def _generic_reg_name_to_id() -> dict[str, int]:
     return {name: rid for rid, name in dec.build_reg_names().items()}
 
 
-def _capstone_reg_module(isa: str):
-    import capstone as cs
-    if isa == "x86_64":
-        return cs.x86
-    if isa == "aarch64":
-        return cs.aarch64
-    if isa == "riscv64":
-        return cs.riscv
-    if isa == "mipsel":
-        return cs.mips
-    raise ValueError(f"unsupported isa {isa!r}")
-
-
-@dataclasses.dataclass
-class _RegClassEntry:
-    """Per-Capstone-reg generic-name mapping.
-
-    `names` are the GenericRegId names the tracer emits for any
-    operand-access of this Capstone register.  The integer-flags byte
-    rides a side-channel FID (CST_FID_METAFLAGS), not a synthetic
-    dst-register slot, so write-side operand walks compare the same
-    name set as the read side.
-    """
-    names: tuple[str, ...]
-
-
-def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
-    """Return {Capstone reg enum value: _RegClassEntry}.
-
-    The tracer's C decoder indexes these same per-ISA reg tables by
-    Capstone enum value.  Parsing them here keeps static register-set
-    validation tied to the active tracer tables.
-
-    Values are **symbolic name strings** rather than numeric ids — the
-    trace is self-describing (every ENCODINGS section carries its own
-    {gen_id ↔ name} mapping), and a previous numeric-id version of
-    this validator silently broke when the plugin's GenericRegId
-    layout shifted (REG_FLAGS, REG_IP, etc. moved by 25 slots when
-    new register banks landed).  Comparing by name lets the validator
-    track header changes automatically and lets multiple trace
-    versions coexist with no per-version translation table.
-    """
-    header = _ISA_TO_REG_TABLE.get(isa)
-    if header is None:
-        raise ValueError(f"unsupported isa {isa!r}")
-    cap_mod = _capstone_reg_module(isa)
-    text = (_PLUGIN_SOURCE_DIR / header).read_text()
-    out: dict[int, _RegClassEntry] = {}
-    entry_re = re.compile(r"\[([A-Z0-9_]+)\]\s*=\s*\{([^\n]*)\},")
-    for match in entry_re.finditer(text):
-        cap_name = match.group(1)
-        cap_id = getattr(cap_mod, cap_name, None)
-        if cap_id is None:
-            continue
-        body = match.group(2)
-        alias_match = re.search(r"\.regs\s*=\s*\{([^}]*)\}", body)
-        if alias_match:
-            reg_names = re.findall(r"REG_[A-Z0-9_]+", alias_match.group(1))
-        else:
-            reg_match = re.search(
-                r"(?:\.reg_id\s*=\s*)?(REG_[A-Z0-9_]+)", body)
-            if not reg_match:
-                continue
-            reg_names = [reg_match.group(1)]
-        names = tuple(n for n in reg_names if n != "REG_NONE")
-        if names:
-            out[int(cap_id)] = _RegClassEntry(names=names)
-    return out
-
-
 # Raw system-register encoding -> generic register name.  Derived
 # INDEPENDENTLY of the decode boundary that classifies these at run
 # time (cap_aarch64_sysreg_class / cap_riscv_csr_class in
@@ -3646,7 +3576,10 @@ def _aarch64_name_to_genid() -> dict[str, int]:
 
 
 def _riscv64_name_to_genid() -> dict[str, int]:
-    # Table mirrors champsim_tracer_mnemonics_riscv.h.
+    # Table mirrors regmap/riscv64.tsv, whose generator joins it against
+    # target/riscv's own registration sites.  (It named
+    # champsim_tracer_mnemonics_riscv.h until that header was deleted with
+    # the Capstone tables; the rows did not move, the source of truth did.)
     base = {
         "zero": 0, "ra": 253, "sp": 250,
         "gp": 4, "tp": 5,
@@ -4307,12 +4240,24 @@ def _check_branch_coverage(templates: list[dict],
     )]
 
 
-_ISA_TO_REG_TABLE = {
-    "x86_64": "champsim_tracer_mnemonics_x86.h",
-    "aarch64": "champsim_tracer_mnemonics_aarch64.h",
-    "riscv64": "champsim_tracer_mnemonics_riscv.h",
-    "mipsel": "champsim_tracer_mnemonics_mips.h",
+#: Where the reachable-register universe comes from.  Per ISA, the two
+#: checked-in regmap tables scripts/cst-regmap.py generates and validates:
+#: `<isa>.tsv` is the TCG-global namespace (every name a target passes to
+#: tcg_global_mem_new*() or insn_dataflow_declare_regfile()) and
+#: `<isa>.gdb.tsv` is the gdbstub namespace (every name the target's own
+#: CORE feature XML declares, the namespace a VALUE READ resolves through).
+#: Both are joined against the target's sources by that generator, which
+#: REFUSES in both directions -- a registered name with no row is a gap, a
+#: row naming nothing registered is a dead rule -- so their union is the
+#: complete set of generic registers this ISA can ever publish.
+_ISA_TO_REGMAP = {
+    "x86_64": ("x86_64.tsv", "x86_64.gdb.tsv"),
+    "aarch64": ("aarch64.tsv", "aarch64.gdb.tsv"),
+    "riscv64": ("riscv64.tsv", "riscv64.gdb.tsv"),
+    "mipsel": ("mipsel.tsv", "mipsel.gdb.tsv"),
 }
+
+_REGMAP_DIR = _PLUGIN_SOURCE_DIR / "regmap"
 
 
 def _unsupported_opcode_coverage(isa: str) -> set[str]:
@@ -4366,33 +4311,51 @@ def _unsupported_reg_coverage(isa: str) -> set[str]:
 
 
 def _reachable_reg_names_for_isa(isa: str) -> set[str]:
-    """Return GenericRegId names present in the ISA reg table.
+    """Return the GenericRegId names this ISA can publish.
 
-    This intentionally uses the tracer's generated C tables as the
-    reachable universe, not a hand-maintained Python list. Composite
-    aliases contribute each member register so coverage of wide register
-    groups is accounted for by the IDs actually emitted in templates.
+    The universe is read from the live sources, not from a hand-maintained
+    Python list: the two `regmap/<isa>*.tsv` tables, whose generator joins
+    them against the target's own registration sites and its CORE feature
+    XML and fails the build in either direction.  A register QEMU can name
+    is therefore in one of these two files by construction, and a name in
+    them that QEMU no longer registers cannot survive a regeneration.
+
+    The two namespaces are UNIONED rather than intersected.  They disagree
+    on real registers -- that disagreement is the reason both files exist --
+    and a register reachable through either route is reachable.
+
+    Raises rather than returning a short set.  A reachable universe that
+    silently loses a file is a coverage claim about a population nobody
+    measured; the previous version of this function read the per-ISA
+    Capstone mnemonic headers, and when `c32824defa` deleted those the
+    FileNotFoundError was swallowed into an `info` line for four ISAs'
+    worth of quoted readings.
     """
-    header = _ISA_TO_REG_TABLE.get(isa)
-    if header is None:
+    names = _ISA_TO_REGMAP.get(isa)
+    if names is None:
         raise ValueError(f"unsupported isa {isa!r}")
-    path = _PLUGIN_SOURCE_DIR / header
-    text = path.read_text()
     out: set[str] = set()
-    entry_re = re.compile(
-        r"\[[A-Z0-9_]+\]\s*=\s*\{\s*"
-        r"(REG_[A-Z0-9_]+)"
-        r"(?:\s*,\s*\d+\s*,\s*\{([^}]*)\})?\s*\}"
-    )
-    for m in entry_re.finditer(text):
-        alias_text = m.group(2)
-        if alias_text:
-            regs = re.findall(r"REG_[A-Z0-9_]+", alias_text)
-        else:
-            regs = [m.group(1)]
-        for reg in regs:
-            if reg != "REG_NONE":
-                out.add(reg)
+    for name in names:
+        path = _REGMAP_DIR / name
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"no regmap table at {path}: the reachable-register "
+                f"universe has no source for {isa}")
+        found = set()
+        for line in path.read_text().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) < 2:
+                continue
+            reg = cols[1].strip()
+            if reg.startswith("REG_") and reg != "REG_NONE":
+                found.add(reg)
+        if not found:
+            raise ValueError(
+                f"{path} yielded no REG_* rows: a reachable universe read "
+                f"out of an empty table is not a measurement")
+        out |= found
     return out
 
 
@@ -4414,21 +4377,20 @@ def _check_reg_coverage(templates: list[dict], isa: str,
         reachable = _reachable_reg_names_for_isa(isa)
         reachable -= _unsupported_reg_coverage(isa)
     except Exception as exc:
-        # THIS PATH IS LIVE ON ALL FOUR ISAs AT THIS TIP, AND WAS INVISIBLE.
-        # _reachable_reg_names_for_isa reads champsim_tracer_mnemonics_<isa>.h
-        # as the reachable universe, and c32824defa deleted those headers with
-        # the Capstone tables.  Every run since has reported
-        # `[reg_coverage] info=1` with a FileNotFoundError inside it, inside a
-        # report headline of "errors=0, warnings=0" that four ISAs' worth of
-        # readings have been quoted from.  The register-coverage bullet has
-        # not been computed since that commit; saying so at warning is the
-        # minimum.  Re-homing the reachable set onto a surviving source is a
-        # separate change and a maintainer's call about what the universe
-        # should now be.
+        # A CHECK THAT CANNOT FIND ITS SUBJECT FAILS.  This path was live on
+        # all four ISAs from c32824defa -- which deleted the Capstone mnemonic
+        # headers the old universe was read from -- until the regmap re-home,
+        # and for most of that time it was an `info` inside a headline of
+        # "errors=0, warnings=0".  Four ISAs' worth of readings were quoted
+        # from reports in which the register-coverage bullet had not been
+        # computed at all.  Warning was the visible half of the same mistake:
+        # a battery that exits 0 is a battery that passed, and this one had
+        # measured nothing.
         return [Issue(
-            "reg_coverage", "warning",
-            f"reg coverage: seen={len(seen_names)}; NO REACHABLE SET -- "
-            f"the reachable_unseen bullet did not run: {exc!r}",
+            "reg_coverage", "error",
+            f"reg coverage [{isa}]: seen={len(seen_names)}; NO REACHABLE "
+            f"SET -- the reachable_unseen bullet could not run, so this "
+            f"check measured nothing: {exc!r}",
             {"seen": seen_names},
         )]
 

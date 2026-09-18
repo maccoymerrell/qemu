@@ -708,6 +708,22 @@ static bool df_vec_operand(const InsnDataflow *d, uint32_t off,
 static bool df_helper_usage(TCGOp *op, unsigned argidx,
                             uint32_t *size, unsigned *dir);
 
+/*
+ * The pointer arguments of one call, held until the read side is complete.
+ *
+ * A helper takes at most a handful -- x86's SSE form is destination, src1,
+ * src2; aarch64's widest gvec expansion is four -- so a small array covers
+ * every call in tree, and a call that overran it would be recorded short
+ * rather than wrong.
+ */
+#define DF_CALL_MAX_PTR_ARGS 8
+
+typedef struct DfCallPtrArg {
+    uint32_t off;
+    uint32_t size;
+    unsigned dir;
+} DfCallPtrArg;
+
 static void df_call(InsnDataflow *d, TCGOp *op)
 {
     TCGContext *s = tcg_ctx;
@@ -715,6 +731,8 @@ static void df_call(InsnDataflow *d, TCGOp *op)
     unsigned nb_oargs = TCGOP_CALLO(op);
     unsigned nb_iargs = TCGOP_CALLI(op);
     uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
+    DfCallPtrArg ptr_args[DF_CALL_MAX_PTR_ARGS];
+    unsigned n_ptr_args = 0;
     unsigned idx;
     bool trunc = false;
 
@@ -760,13 +778,55 @@ static void df_call(InsnDataflow *d, TCGOp *op)
             }
             bit = df_intern((uint32_t)eo, size);
             if (bit >= 0) {
-                df_set_bit(prov, (unsigned)bit);
+                /*
+                 * A RANGE THE HELPER ONLY WRITES IS NOT AN INPUT.  The bit
+                 * exists so a result can name where its value came from, and
+                 * a destination buffer supplies none of it; setting the bit
+                 * for a write-only pointer would publish every result of the
+                 * call as depending on its own destination.  Where the
+                 * direction is the unbounded both-ways fallback the read half
+                 * stands, which is the pessimistic direction this file keeps.
+                 */
+                if (dir & INSN_DF_RD) {
+                    df_set_bit(prov, (unsigned)bit);
+                }
             } else {
                 trunc = true;
                 d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
             }
-            df_add_field(d, (uint32_t)eo, size, dir, prov, true, false);
+            if (n_ptr_args < DF_CALL_MAX_PTR_ARGS) {
+                ptr_args[n_ptr_args].off = (uint32_t)eo;
+                ptr_args[n_ptr_args].size = size;
+                ptr_args[n_ptr_args].dir = dir;
+                n_ptr_args++;
+            } else {
+                d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
+                df_add_field(d, (uint32_t)eo, size, dir, prov, true, false);
+            }
         }
+    }
+    /*
+     * THE ROWS LAND AFTER THE WHOLE READ SIDE, AND THAT IS THE FIX.
+     *
+     * This function's contract is one edge: every result depends on every
+     * argument.  Adding each pointer argument's row inside the walk broke it
+     * in one direction -- the row carried only the provenance accumulated up
+     * to that argument's position, so a row early in the list could not name
+     * a source that came later.  QEMU's SSE calling shape puts the
+     * destination FIRST and its sources after it, so every helper-implemented
+     * vector operation published a destination whose account named the
+     * operands before it and nothing else.  Measured on x86_64:
+     * `punpcklqdq %xmm1,%xmm0` published dst=%xmm0 depending on %xmm0 alone,
+     * with %xmm1 in the read set and out of the account, and the same for
+     * punpckldq, punpckhdq and every sibling of theirs.
+     *
+     * The rows are held and added here instead, where @prov is the whole read
+     * side, so the contract the comment above states is the one the code
+     * keeps.
+     */
+    for (unsigned k = 0; k < n_ptr_args; k++) {
+        df_add_field(d, ptr_args[k].off, ptr_args[k].size, ptr_args[k].dir,
+                     prov, true, false);
     }
     for (unsigned i = 0; i < nb_oargs; i++) {
         TCGTemp *ts = arg_temp(op->args[i]);

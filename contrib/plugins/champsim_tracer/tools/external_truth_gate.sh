@@ -109,6 +109,46 @@ selftest() {
     # corroborators reading 0, and test 1 names the absent
     # statics/isax_srcenc/rc.txt beside it.
     #
+    # FINDING 245-C, exec245: NO ROOT ON THIS HOST CAN SATISFY ARM A, AND THE
+    # TWO REASONS ARE OPPOSITE ONES.  Arm A requires the UNMODIFIED reports to
+    # PASS, which is a STRICTER demand than fixture-eligibility, and the two
+    # populations that could meet each half no longer intersect.
+    #
+    #   (a) EVERY ROOT OLD ENOUGH TO BE GATE-GREEN IS NOW INCOMPLETE.  The
+    #       default verify58/r13b was measured before the offline referee
+    #       existed, so eight manifest rows -- the four `refopc`, plus
+    #       refopcdead, refsrcdead, refsrc and refstage -- have NO REPORT in
+    #       it.  Scored at exec245 it reads REPORT MISSING on all eight and
+    #       FAILs on two more (gem5wp/mipsel 8 > 4, spikecp 5 > 4, both
+    #       ceilings lowered since it was made): 10 red rows, 8 of them for
+    #       absence.  It is no longer a fixture; it is an old record.
+    #
+    #   (b) EVERY ROOT NEW ENOUGH TO BE COMPLETE CARRIES THIS TIP'S THREE
+    #       HELD REDS.  exec245/gate/legs2 is ELIGIBLE -- 20 of 20 present,
+    #       every headline reproduced, corroborated by legs3 and by
+    #       arc3/exec244 -- and arm A over it reads GATE FAILED, 3 of 20:
+    #       gem5cp/aarch64 51 > 22, gem5wp/aarch64 114 > 0, pin/x86_64
+    #       364 > 259.  Those three ceilings are held on written merits
+    #       (a real p_simd destination loss, apparatus debt that earns no
+    #       ceiling, and an open harness item), so the reds are correct and
+    #       the fixture cannot be made green by relaxing them.
+    #
+    # THE RULE ABOVE -- "re-point at the newest COMPLETE root" -- IS THEREFORE
+    # NOT EXECUTABLE AT THIS TIP, and that is stated rather than worked
+    # around.  Two things are NOT done here because both would be worse than
+    # the red: a fixture is not hand-edited to fit (that is fabricating
+    # evidence, and arm A would then prove the gate against a number nothing
+    # measured), and no ceiling is relaxed to make arm A green (the merits
+    # decide ceilings, never the selftest's convenience).
+    #
+    # WHAT WOULD CLOSE IT: arm A's question is "does the gate read unmodified
+    # reports correctly", and that does not require a gate-GREEN root -- it
+    # requires the gate's verdict over unmodified reports to be the EXPECTED
+    # one.  An arm A that asserts the expected verdict per row, against a
+    # root's own recorded expectation, works on any complete root and is the
+    # shape this needs.  Arms B and C (planted red, missing red) are
+    # unaffected and still prove the gate can go red.
+    #
     # THE DEFAULT MOVED TO verify58/r13b AT PASS 74 BY RUNNING IT:
     #     TEST 1 COMPLETE    19 of 19 present
     #     TEST 2 REPRODUCED  19 of 19, 0 uncorroborated

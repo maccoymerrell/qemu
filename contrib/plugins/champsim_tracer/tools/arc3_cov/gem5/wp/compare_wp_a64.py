@@ -504,6 +504,30 @@ _WP_RULES = {
         'REF-ATOMIC-DEST-AS-SRC', 'reference-defect', {SUBSET},
         'ldadd/swp/cas name Xt in SR= although Xt is written with the '
         'pre-image of memory and nothing of its previous content survives'),
+
+    # A REGISTER THAT EXISTS ONLY INSIDE gem5.
+    #
+    # `ic ivau, x21' publishes ref=[MISC:ic_ivau_xt] against trc=[].  The
+    # `MISC:' prefix is this leg's own spelling for a gem5 misc register the
+    # reference mapper produced NO generic id for -- and that is the whole
+    # fact: MISCREG_IC_IVAU_Xt (gem5 src/arch/arm/regs/misc.hh, spelled
+    # "ic_ivau_xt") is the slot gem5's decoder parks the operation's operand
+    # in so its own execute method can read it back.  The architecture gives
+    # IC IVAU no destination register at all, so there is no architectural
+    # write for the tracer to have dropped, and no wire name it could be
+    # dropped UNDER.
+    #
+    # THE BASIS IS CHECKABLE AND IS NOT THE PREFIX ALONE.  The mapper is
+    # asked: a name it CAN produce is a name the two sides could have
+    # disagreed about, and such a row does not reach here.  This is the same
+    # shape as REF-MAPPER-HAS-NO-PC, one direction over.
+    #
+    # HELD TO THE SUBSET DIRECTION.  A row where the TRACER names something
+    # the reference does not is a different fact and cannot reach here.
+    'REF-MISC-HAS-NO-GENERIC-ID': _Rule(
+        'REF-MISC-HAS-NO-GENERIC-ID', 'reference-gap', {SUBSET},
+        "gem5 names its own misc register, which the reference mapper "
+        'produces no wire id for and the architecture does not have'),
 }
 
 
@@ -659,6 +683,14 @@ def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
             if len(only_ref) == 1 and \
                     next(iter(only_ref)).startswith('MISC:'):
                 return 'CACHE-MAINT-DEST-SPELLING'
+        # The same gem5-only register with NOTHING on the tracer's side to
+        # spell it against.  Every member of the surplus must be a name the
+        # mapper could not produce; one name it CAN produce and the row is a
+        # disagreement the two sides could have had, and stays red.
+        if only_ref and not only_trc and all(
+                n.startswith('MISC:') and
+                not gem5_ref.ref_can_name('aarch64', n) for n in only_ref):
+            return 'REF-MISC-HAS-NO-GENERIC-ID'
     elif axis == 'sys-src-set':
         # Held to the measured set.  A label applied to a whole AXIS rather
         # than to a measured shape is the kind arc3_taxonomy declares

@@ -149,6 +149,48 @@ void a64_translate_init(void)
 
     cpu_exclusive_high = tcg_global_mem_new_i64(tcg_env,
         offsetof(CPUARMState, exclusive_high), "exclusive_high");
+
+    /*
+     * THE SOFTWARE THREAD POINTERS, WHICH NO TCG GLOBAL NAMES.
+     *
+     * `mrs x3, tpidr_el0` and `msr tpidr_el0, x3` reach cp15.tpidr_el[0]
+     * through a plain env load and store -- the register descriptor carries a
+     * fieldoffset and handle_sys() emits the access inline -- so what the op
+     * stream carries is a byte range and nothing more.  Undeclared, that
+     * range resolves to no register, and both halves of the pair published an
+     * empty set where the architecture plainly names one: the read named no
+     * source and the write named no destination.
+     *
+     * TPIDRRO_EL0 is declared beside them because it is the same thread
+     * pointer seen read-only from EL0, and it lives in its own field rather
+     * than in the array.
+     *
+     * The strides and extents come from the compiler over this target's own
+     * structure, and the names are the architecture's own spellings, so the
+     * adjudication table that maps them to wire registers keys on what the
+     * ARM manual calls them.
+     */
+    {
+        static const char *const tpidr_p[] = {
+            "tpidr_el0", "tpidr_el1", "tpidr_el2", "tpidr_el3",
+        };
+        static const char *const tpidrro_p[] = { "tpidrro_el0" };
+        CPUARMState *e = NULL;
+
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(tpidr_p) != ARRAY_SIZE(e->cp15.tpidr_el));
+        insn_dataflow_declare_regfile(tpidr_p, ARRAY_SIZE(e->cp15.tpidr_el),
+                                      offsetof(CPUARMState, cp15.tpidr_el),
+                                      sizeof(e->cp15.tpidr_el[0]),
+                                      sizeof(e->cp15.tpidr_el[0]));
+
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(tpidrro_p) !=
+                          ARRAY_SIZE(e->cp15.tpidrro_el));
+        insn_dataflow_declare_regfile(tpidrro_p,
+                                      ARRAY_SIZE(e->cp15.tpidrro_el),
+                                      offsetof(CPUARMState, cp15.tpidrro_el),
+                                      sizeof(e->cp15.tpidrro_el[0]),
+                                      sizeof(e->cp15.tpidrro_el[0]));
+    }
 }
 
 /*

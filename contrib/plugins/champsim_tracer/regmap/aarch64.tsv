@@ -49,6 +49,11 @@ r7	REG_GPR7	AArch32 R<n> aliases X<n>
 r8	REG_GPR8	AArch32 R<n> aliases X<n>
 r9	REG_GPR9	AArch32 R<n> aliases X<n>
 sp	REG_SP	regnames[31]: AArch64 spells X31/SP by its role
+tpidr_el0	REG_TLS	arch-role: the EL0 software thread pointer; the vocabulary's own word names TPIDR_EL0
+tpidr_el1	REG_SYS	the EL1 software thread ID: kernel per-CPU state, not the guest thread pointer
+tpidr_el2	REG_SYS	the EL2 software thread ID: hypervisor per-CPU state
+tpidr_el3	REG_SYS	the EL3 software thread ID: monitor per-CPU state
+tpidrro_el0	REG_TLS	the same thread pointer read-only from EL0; the vocabulary's own word names TPIDRRO_EL0 beside TPIDR_EL0
 x0	REG_GPR0	regnames[] index is the architectural number
 x1	REG_GPR1	regnames[] index is the architectural number
 x10	REG_GPR10	regnames[] index is the architectural number

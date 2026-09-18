@@ -1359,6 +1359,25 @@ int main(int argc, char **argv)
         std::printf("\n=== ATTRIBUTION LINT ===\n");
         std::printf("  impossible attributions: %s\n",
                     lint.summary().c_str());
+        /* A count is not an answer.  Name every flagged instruction --
+         * there are only ever a handful, because the rule flags the
+         * 0/0-memop templates and only those -- so the reader can go
+         * straight to the encoding instead of reconstructing the
+         * template table to find out what "3 distinct insns" were. */
+        for (const cst::AttributionLint::MemSubject &m : lint.mem_subjects()) {
+            std::string hex;
+            for (uint8_t b : m.bytes) {
+                char t[3];
+                std::snprintf(t, sizeof(t), "%02x", b);
+                hex += t;
+            }
+            auto on = h.maps.opcode.find(m.opcode);
+            std::printf("    memop-impossible: template=BB%u ipos=%u "
+                        "pc=0x%llx opcode=%s bytes=%s\n",
+                        m.template_id, m.ipos, (unsigned long long)m.pc,
+                        on == h.maps.opcode.end() ? "?" : on->second.c_str(),
+                        hex.empty() ? "-" : hex.c_str());
+        }
         if (lint.any()) {
             std::fprintf(stderr,
                          "cst_audit: FAIL: impossible attributions: %s\n",

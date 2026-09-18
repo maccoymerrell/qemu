@@ -36,11 +36,25 @@
  *       fall through (`pop %rsp` — dep_x86_stack_pop emits slots per
  *       NON-SP dst, and here SP is the only dst; `iretq` — no
  *       Capstone MEM operand for the frame pops).
- *     - segment-register writers (x86 mov %eax, %ss / %fs / %gs):
- *       the descriptor fetch QEMU's segment-load helper performs is a
- *       real load correctly attributed to the mov, with no Capstone
- *       MEM operand to mint a slot from.  Detected by a REG_SEG* id
- *       among the insn's dst_regs.
+ *     - segment-register writers, detected by a REG_SEG* id among the
+ *       insn's dst_regs.  THIS RULE DOES NOT REACH THE `mov r/m16,
+ *       Sreg` FORM IT WAS WRITTEN FOR, and the claim that it did was
+ *       never checked.  Measured on an x86_64 system trace: `8e e0`
+ *       (mov %eax,%fs) and `8e ef` (mov %edi,%gs) publish NO
+ *       destination register at all -- the disassembly renders them
+ *       `mov %gp0` and `mov %gp5`, with nothing after the arrow -- so
+ *       there is no REG_SEG id for the predicate to find and the
+ *       exemption cannot fire.  It is reachable: `0f 01 f8` (swapgs)
+ *       in the same trace publishes `%seg4 -> %seg4` and would be
+ *       exempted.  The rule is therefore kept AS IT IS rather than
+ *       widened, because the thing it fails to reach is a real defect
+ *       and not a lint artefact: an instruction that writes FS or GS
+ *       and names no destination is a write missing from the wire,
+ *       and its descriptor fetch is a memop missing from the
+ *       template.  Widening the exemption would hide both.  The fix
+ *       belongs at QEMU's gen_movl_seg() -- state the write, and
+ *       state the descriptor fetch as a synthetic EA -- after which
+ *       this predicate starts matching on its own.
  *
  *   REG: flagged only when a dst-register value record lands on an
  *   operand slot >= the insn's static dst count (any slot when the
@@ -150,6 +164,15 @@ public:
                 if (I.max_dep_loads == 0 && I.max_dep_stores == 0 &&
                     !writes_seg && !exempt.count(I.opcode)) {
                     b |= MEM_IMPOSSIBLE;
+                    uint32_t ipos = (uint32_t)row.size();
+                    MemSubject s;
+                    s.template_id = t.template_id;
+                    s.ipos        = ipos;
+                    s.pc          = I.pc;
+                    s.opcode      = I.opcode;
+                    s.bytes       = I.raw_bytes;
+                    mem_flagged_.emplace(insn_key(t.template_id, ipos),
+                                         std::move(s));
                 }
                 row.push_back(b);
             }
@@ -171,6 +194,49 @@ public:
     const std::vector<uint8_t> *row(uint32_t template_id) const {
         auto it = rows_.find(template_id);
         return it == rows_.end() ? nullptr : &it->second;
+    }
+
+    /*
+     * WHICH instruction, not just how many.
+     *
+     * "1299 memop (3 distinct insns)" tells a reader that something is
+     * wrong and nothing about what to go and look at, and the answer is
+     * a fixed, tiny set: the flagged insns are exactly the ones whose
+     * template says 0/0 memops.  So the lint keeps their identity --
+     * template id, insn position, pc, opcode id and encoding bytes --
+     * for every instruction it marks impossible, and reports the ones
+     * that actually violated.  The cost is one small record per flagged
+     * insn per trace, paid whether or not the trace is clean; the
+     * alternative is a count nobody can act on without re-deriving the
+     * template table by hand.
+     */
+    struct MemSubject {
+        uint32_t template_id = 0;
+        uint32_t ipos        = 0;
+        uint64_t pc          = 0;
+        uint8_t  opcode      = 0;
+        std::vector<uint8_t> bytes;
+    };
+
+    /* The flagged insns that were actually violated, template id then
+     * insn position -- a stable order, so two runs over one trace print
+     * the same list. */
+    std::vector<MemSubject> mem_subjects() const {
+        std::vector<MemSubject> out;
+        out.reserve(distinct_mem_.size());
+        for (uint64_t k : distinct_mem_) {
+            auto it = mem_flagged_.find(k);
+            if (it != mem_flagged_.end()) {
+                out.push_back(it->second);
+            }
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const MemSubject &a, const MemSubject &b) {
+                      return a.template_id != b.template_id
+                                 ? a.template_id < b.template_id
+                                 : a.ipos < b.ipos;
+                  });
+        return out;
     }
 
     bool reg_check_enabled() const { return reg_enabled_; }
@@ -313,6 +379,9 @@ private:
     }
 
     std::unordered_map<uint32_t, std::vector<uint8_t>> rows_;
+    /* Identity of every insn the MEM rule marked impossible, keyed the
+     * same way distinct_mem_ is, so a violation can be named. */
+    std::unordered_map<uint64_t, MemSubject> mem_flagged_;
     std::vector<int16_t> dst_slot_;
     bool reg_enabled_;
 

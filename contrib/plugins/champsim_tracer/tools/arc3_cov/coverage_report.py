@@ -140,47 +140,122 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
     return rows, counts, unpro
 
 
-ISAXCHECK = os.environ.get(
-    'CST_ISAXCHECK',
-    '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+BUILD_DIR = os.environ.get('CST_BUILD', '/mnt/md0/QEMU/qemu/build')
+
+#: The offline reference.  Everything that used to run inside the traced
+#: process now runs here, over encodings a capture build recorded, so the
+#: file that decides the reference side of every attribution is a Python
+#: source and not a binary.  It is a freshness subject for exactly that
+#: reason: a change to it changes what "disagree" means.
+REFEREE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+    __file__))), 'cst_referee.py')
+
+#: The tracer side.  These two carry the behaviour the tables describe: the
+#: plugin publishes the wire and the offline decoder reads it back.
+TRACER_BINARIES = (
+    'contrib/plugins/libchampsim_tracer.so',
+    'contrib/plugins/cst_decode',
+)
 
 
-def refuse_if_stale(cov, allow_stale=False):
+def freshness_reference(build_dir):
+    """-> (time, what, rows) -- the newest time a SUBJECT's behaviour moved.
+
+    THE SUBJECTS ARE THE THING MEASURED AND THE INSTRUMENT THAT MEASURED IT.
+    A table is stale if the tracer changed after it was written (it describes
+    a binary that no longer exists) or if the offline referee changed after it
+    was written (it was scored against a reference that no longer exists).
+    Nothing else qualifies: the capture corpora are INPUTS a leg consumed, and
+    a corpus regenerated afterwards does not invalidate a table built from the
+    one it had.
+
+    THE TRACER SIDE IS HELD AT A BEHAVIOUR TIME, NOT A LINK TIME.  QEMU
+    regenerates `qemu-version.h` from `git describe`, so every commit relinks
+    every binary and moves every mtime; a link-time reference would report
+    every table stale after a comment-only commit.  behavior_digest.py hashes
+    only the bytes that can change behaviour and remembers when each digest
+    FIRST appeared, which is what #292 built for the R13 gate and what this
+    now shares with it.  The referee is a Python source with no such
+    structure, so it is held at its plain mtime.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'external_truth_gate'))
+    import behavior_digest                                   # noqa: E402
+
+    missing = [p for p in
+               [os.path.join(build_dir, b) for b in TRACER_BINARIES]
+               if not os.path.exists(p)]
+    if not os.path.exists(REFEREE):
+        missing.append(REFEREE)
+    if missing:
+        sys.exit('CANNOT CHECK FRESHNESS: no subject at %s.  This report '
+                 'scores tables it did not build; without the tracer it '
+                 'measures and the referee that measured it, it cannot tell '
+                 'a current table from a stale one, and a check that cannot '
+                 'find its subject must fail.  Build them, or point --build-'
+                 'dir / CST_BUILD at a build that has them.'
+                 % ', '.join(missing))
+
+    since, which, rows = behavior_digest.behaviour_reference(
+        build_dir, [os.path.join(build_dir, b) for b in TRACER_BINARIES])
+    out = [(p, mt, sn, 'behaviour: ' + note) for p, mt, sn, _d, note in rows]
+    rt = os.path.getmtime(REFEREE)
+    out.append((REFEREE, rt, rt, 'offline referee (mtime: a source file has '
+                                 'no behaviour digest)'))
+    if rt > since:
+        since, which = rt, REFEREE
+    return since, which, out
+
+
+def refuse_if_stale(cov, allow_stale=False, build_dir=None, out=None):
     """Refuse to publish a headline computed before the tracer it scores.
 
     THE FAILURE THIS EXISTS FOR: `12149 COVERED / 2698 UNREACHABLE / 0
     UNCOVERED` was published and relayed to the maintainer, and at the tip it
     read `12034 / 2698 / 115`.  The table was built four hours before the two
-    commits it claimed to measure, the isaxcheck GATE was green throughout --
+    commits it claimed to measure, the gate was green throughout --
     correctly, it reads a different thing -- and nothing anywhere noticed.
     This report cannot re-derive four heterogeneous legs in process (aarch64
     walks the Arm MRA, riscv64 the Sail model, x86_64 four reachability legs
     under qemu-system), so it does the other half of the maintainer's ruling:
-    it REFUSES, by name, when a per-ISA table is older than the binary whose
-    behaviour it describes.
+    it REFUSES, by name, when a per-ISA table is older than the apparatus
+    whose behaviour it describes.
+
+    WHAT THE SUBJECT IS NOW.  It was `build/contrib/plugins/isaxcheck`, a
+    binary that linked Capstone into the build and was deleted with it; this
+    report then refused on every run for a reason about the apparatus and not
+    about a single table, and the four percentages could not be re-derived at
+    any tip after that deletion.  Under the standing external-comparison
+    ruling the reference runs OFFLINE, so the subject follows it: the tracer
+    binaries the tables describe, and `tools/cst_referee.py`, the referee that
+    scored them.  See freshness_reference().
 
     The per-ISA harnesses hold the stronger check -- x86_64 and aarch64 each
     re-probe and compare byte-for-byte, riscv64 and mipsel re-probe as part of
     their run -- so a green result here means every leg was re-run AND their
-    tables post-date the build.
+    tables post-date the apparatus.
 
     THIS IS THE LAST LINE, NOT THE FIRST.  Refusing here is correct and it is
     also expensive: by the time this runs, four heterogeneous legs have taken
-    hours, and a relink anywhere in that window is discovered only once all of
-    them have been paid for.  Each REPRODUCE.sh therefore arms
+    hours, and a rebuild anywhere in that window is discovered only once all
+    of them have been paid for.  Each REPRODUCE.sh therefore arms
     ../settle_guard.sh before any of its own work -- it refuses to START on a
-    tree with pending build work, and hashes the subjects so a relink DURING a
-    leg is named by the leg it invalidated.  A run that came through those
+    tree with pending build work, and hashes the subjects so a rebuild DURING
+    a leg is named by the leg it invalidated.  A run that came through those
     guards cannot reach this one with a stale table; a run that did not is
     exactly what this is still here to catch.
     """
-    if not os.path.exists(ISAXCHECK):
-        sys.exit('CANNOT CHECK FRESHNESS: no isaxcheck at %s.  This report '
-                 'scores tables it did not build; without the binary it '
-                 'cannot tell a current table from a stale one, and a check '
-                 'that cannot find its subject must fail.  Build it or set '
-                 'CST_ISAXCHECK.' % ISAXCHECK)
-    bt = os.path.getmtime(ISAXCHECK)
+    bt, which, rows = freshness_reference(build_dir or BUILD_DIR)
+    if out is not None:
+        fmt = '%Y-%m-%d %H:%M:%S'
+        out.append('FRESHNESS REFERENCE: %s' % which)
+        for p, mt, sn, note in rows:
+            out.append('  %-58s mtime %s  since %s  %s'
+                       % (os.path.basename(p),
+                          time.strftime(fmt, time.localtime(mt)),
+                          time.strftime(fmt, time.localtime(sn)), note))
+        out.append('')
     stale = []
     for isa, rel, _v, _d, _m, _l in ISAS:
         q = os.path.join(cov, rel)
@@ -190,10 +265,11 @@ def refuse_if_stale(cov, allow_stale=False):
         return
     fmt = '%Y-%m-%d %H:%M:%S'
     for isa, q, mt in stale:
-        sys.stderr.write('STALE LEG  %-8s %s\n            table  %s\n'
-                         '            binary %s\n'
+        sys.stderr.write('STALE LEG  %-8s %s\n            table     %s\n'
+                         '            apparatus %s (%s)\n'
                          % (isa, q, time.strftime(fmt, time.localtime(mt)),
-                            time.strftime(fmt, time.localtime(bt))))
+                            time.strftime(fmt, time.localtime(bt)),
+                            os.path.basename(which)))
     if allow_stale:
         sys.stderr.write('--allow-stale given: publishing anyway.  The '
                          'numbers below are NOT a measurement at this tip.\n')
@@ -212,8 +288,9 @@ def refuse_if_stale(cov, allow_stale=False):
     # refuses rather than totalling over a subset, and the process still
     # exits non-zero.  Nothing is published that was not measured, and
     # nothing measured is thrown away with it.
-    return {isa: ('table %s predates the isaxcheck it describes (%s)'
+    return {isa: ('table %s predates the apparatus it describes -- %s at %s'
                   % (time.strftime(fmt, time.localtime(mt)),
+                     os.path.basename(which),
                      time.strftime(fmt, time.localtime(bt))))
             for isa, _q, mt in stale}
 
@@ -228,14 +305,18 @@ def main():
                          'top-N above never stands in for the full list')
     ap.add_argument('--allow-stale', action='store_true',
                     help='print the table even when a leg predates the '
-                         'binary, having said so on stderr first.  For '
+                         'apparatus, having said so on stderr first.  For '
                          'inspecting a historical run, never for a verdict')
+    ap.add_argument('--build-dir', default=BUILD_DIR,
+                    help='the build whose tracer binaries the tables '
+                         'describe (default $CST_BUILD or %s)' % BUILD_DIR)
     a = ap.parse_args()
-
-    blocked = refuse_if_stale(a.cov, a.allow_stale) or {}
 
     out = []
     w = out.append
+    blocked = refuse_if_stale(a.cov, a.allow_stale,
+                              build_dir=a.build_dir, out=out) or {}
+
     per_isa = {}
     missing = []
     for isa, rel, vcol, dtok, mcol, lcol in ISAS:

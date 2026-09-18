@@ -72,12 +72,16 @@ shift 2 || true
 : "${CST_QEMU_DIR:=/mnt/md0/QEMU/qemu}"
 : "${CST_BUILD:=$CST_QEMU_DIR/build}"
 
-# The subjects, in the build's own target spelling.  isaxcheck is first
-# because it is the binary coverage_report.py measures freshness against, so
-# a leg that passes this guard cannot fail that one for a reason this guard
-# could have seen.
-SUBJECTS=(contrib/plugins/isaxcheck
-          contrib/plugins/libchampsim_tracer.so
+# The subjects, in the build's own target spelling.  These are exactly the
+# binaries coverage_report.py measures freshness against, so a leg that
+# passes this guard cannot fail that one for a reason this guard could have
+# seen.  `contrib/plugins/isaxcheck` used to head the list and was deleted
+# with Capstone; stamp_one() then died on every arm, so every leg refused to
+# start -- a guard that cannot find its subject correctly failing, about a
+# subject that no longer exists.  The reference moved offline with the rest
+# of it (tools/cst_referee.py is a checked-in source, not a build product,
+# and is versioned rather than stamped here).
+SUBJECTS=(contrib/plugins/libchampsim_tracer.so
           contrib/plugins/cst_decode
           "$@")
 

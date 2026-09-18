@@ -54,9 +54,22 @@ done
 ninja -j "${CST_JOBS:-12}" -C "$Q/build" contrib-plugins
 [ -x "$ISAX" ] || { echo "REFUSED: no tracer arm at $ISAX" >&2; exit 2; }
 
+# THE SECOND DECODER IS A PREREQUISITE, CHECKED WITH THE REST (FINDING 246-C).
+# This leg's reference side is the Arm MRA with LLVM MC behind it, and the LLVM
+# arm used to arrive through the retired isaxcheck's boundary layer.  It now
+# comes from the same probe binary the aarch64 reference corpus was built with,
+# driven by llvm_arm.py.  A leg that cannot reach it must FAIL here rather than
+# score QEMU against QEMU further down.
+A64_LLVMREF=${CST_A64_LLVMREF:-/mnt/md0/QEMU/cst_runs/_arc3_refs/aarch64/probes/llvmref}
+[ -x "$A64_LLVMREF" ] || { echo "REFUSED: no LLVM MC probe at $A64_LLVMREF." >&2
+    echo "  The reference side of this leg is a SECOND DECODER; without one" >&2
+    echo "  the cross-check has nothing to check against.  Build it:" >&2
+    echo "  /mnt/md0/QEMU/cst_runs/_arc3_refs/aarch64/REPRODUCE.sh" >&2; exit 2; }
+export CST_A64_LLVMREF="$A64_LLVMREF"
+
 # The harness is the TREE's copy; the working directory only holds evidence.
 cp "$T"/reprobe.py "$T"/sweep.py "$T"/compare.py "$T"/adjudicate.py \
-   "$T"/mra_ref.py "$T"/mra_sweep.py "$T"/census.py "$D"/
+   "$T"/mra_ref.py "$T"/mra_sweep.py "$T"/census.py "$T"/llvm_arm.py "$D"/
 cd "$D"
 
 
@@ -88,7 +101,15 @@ $PY reprobe.py "$ISAX"          # tracer arm  -> tracer_fields.tsv
 # did: a representative that moves loses its row and the column reads blank.
 # compare.py refuses on an uncovered denominator; this is what keeps it
 # covered.
-tail -n +2 opcodes.tsv | cut -f3 | "$ISAX" --isa=aarch64 --batch > fields_all.txt
+#
+# IT IS THE SECOND DECODER, NOT THE TRACER.  This call used to be
+# `isaxcheck --isa=aarch64 --batch` with no --layer, which meant the retired
+# binary's BOUNDARY layer; that binary went with Capstone.  Answering it with
+# the fields layer would put QEMU's own columns under a name compare.py reads
+# as the other decoder's and score QEMU against QEMU on every row the MRA has
+# no entry for, so the arm is re-pointed at LLVM MC itself.  llvm_arm.py's
+# --selfcheck scores it against the retired tool's own banked table.
+$PY llvm_arm.py < <(tail -n +2 opcodes.tsv | cut -f3) > fields_all.txt
 $PY sweep.py                    # MRA         -> ref_mra.json  (~135 s)
 $PY compare.py                  # both + LLVM -> attrib.tsv, attrib_signatures.txt
 $PY adjudicate.py               # -> attrib_adjudication.txt
@@ -104,6 +125,17 @@ $PY adjudicate.py               # -> attrib_adjudication.txt
 # that: compare.py re-derives the arm with no arguments and would refuse the
 # damaged file instead of reporting off it.
 #
+# THE ARMS NAME QEMU DECODE RULES, NOT ASSEMBLY MNEMONICS (FINDING 246-C).
+# They used to read `add`, `ldr`, `fmla` -- the retired isaxcheck keyed its
+# falsifier on the mnemonic ITS decoder printed.  The successor is the sled,
+# and what the sled records per encoding is the rule QEMU's decodetree
+# reached, so `add` matches nothing and sled_fields.py REFUSES rather than
+# damaging nothing quietly.  The three below are rules this leg's own
+# denominator carries WITH ROWS THAT CURRENTLY AGREE -- measured here:
+# LDR_i 45, STR_i 20, CAS 16 -- because an arm aimed at rows that already
+# disagree cannot move the agreement and would be inert for a reason that
+# says nothing about the tracer.
+#
 # THE COSTS ARE THE CONTROL; THE BASELINE IS NOT.  A baseline written here
 # goes stale the moment the decode moves, and a stale one invites reading an
 # unchanged number as a passing control.  So this run's own baseline is taken
@@ -118,7 +150,7 @@ print(c['agree'])
 PYEOF
 )
 echo "falsify baseline agree = $BASE_AGREE"
-for M in add ldr fmla; do
+for M in LDR_i STR_i CAS; do
   CST_FALSIFY=drop-src:$M $PY reprobe.py "$ISAX"
   CST_FALSIFY=drop-src:$M $PY compare.py > falsify_$M.txt 2>&1 || {
       echo "falsify drop-src:$M: compare.py refused" >&2; exit 1; }
@@ -133,8 +165,9 @@ PYEOF
   echo "falsify drop-src:$M -> agree $NOW (was $BASE_AGREE)"
   [ "$NOW" -lt "$BASE_AGREE" ] || {
       echo "CONTROL INERT: drop-src:$M did not move the agreement." >&2
-      echo "  Either the mnemonic is absent from the 3,920 subjects -- in" >&2
-      echo "  which case NAME ONE THAT IS PRESENT -- or the comparison is" >&2
+      echo "  Either the RULE is absent from the 3,920 subjects, or its" >&2
+      echo "  rows already disagree -- in either case NAME A QEMU DECODE" >&2
+      echo "  RULE THAT HAS AGREEING ROWS -- or the comparison is" >&2
       echo "  not reading the tracer arm it just damaged.  Either way the" >&2
       echo "  zero above is not a measurement." >&2
       cp tracer_fields.good.tsv tracer_fields.tsv; exit 1; }

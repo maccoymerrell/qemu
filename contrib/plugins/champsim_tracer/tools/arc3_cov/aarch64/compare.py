@@ -304,8 +304,8 @@ def main():
                  'fields_all.txt -- the LLVM cross-check cache does not cover '
                  'the denominator and those rows would read as "LLVM says '
                  'nothing" when nothing asked LLVM.  Re-derive it:\n'
-                 "  cut -f3 opcodes.tsv | tail -n +2 | isaxcheck "
-                 '--isa=aarch64 --batch > fields_all.txt\n  first missing: %s'
+                 '  tail -n +2 opcodes.tsv | cut -f3 | '
+                 'llvm_arm.py > fields_all.txt\n  first missing: %s'
                  % (len(uncov), len(rows), ' '.join(uncov[:8])))
 
     out = open(BASE + '/attrib.tsv', 'w')

@@ -846,11 +846,53 @@ UNARY_BCAST_GVEC(VPBROADCASTD,   tcg_gen_gvec_dup_mem, MO_32)
 UNARY_BCAST_GVEC(VPBROADCASTQ,   tcg_gen_gvec_dup_mem, MO_64)
 
 
+/*
+ * A VECTOR SOURCE THE SAME-OPERAND FOLD ERASES IS STILL A SOURCE.
+ *
+ * Four of tcg-op-gvec.c's three-operand constructors answer `aofs == bofs`
+ * with a constant fill instead of an operation -- xor and andc produce zero,
+ * orc and eqv produce all-ones -- and the operand register then appears in
+ * NO op at all.  `pxor %xmm2,%xmm2` lowers to `dup_imm 0` and the wire
+ * published src=[] against a reference that names the register twice.
+ *
+ * The others do not need this and are not harmed by it: `and`/`or` with
+ * aofs == bofs fold to a MOVE, which reads the register through an op the
+ * walker sees, and every non-folding constructor names both operands
+ * outright.  Stating the read on the whole family therefore adds a fact
+ * exactly where one is missing and repeats one the reader already has
+ * everywhere else -- a set, so the repeat costs nothing.
+ *
+ * WHETHER A CONSUMER BREAKS THE DEPENDENCY IS THE CONSUMER'S QUESTION.  Real
+ * x86 parts do treat `pxor same,same` as a zeroing idiom and cut the input
+ * edge; a consumer that models one can recognise the idiom from the opcode
+ * and the operand names.  It cannot recover a register the trace never
+ * named, so the trace states the architecture's answer and leaves the
+ * micro-architectural one where it belongs.
+ *
+ * Only a register operand is named.  A memory source has no register to
+ * state, and the offsets cannot collide with a register's in that case.
+ */
+static void gen_gvec_same_operand_read(X86DecodedInsn *decode)
+{
+    if (decode->op[1].offset != decode->op[2].offset) {
+        return;
+    }
+    if (decode->op[2].unit != X86_OP_SSE || decode->op[2].has_ea) {
+        return;
+    }
+    if (decode->op[2].n < 0 ||
+        decode->op[2].n >= (int)ARRAY_SIZE(x86_xmm_names)) {
+        return;
+    }
+    insn_dataflow_state_read(insn_df_reg(x86_xmm_names[decode->op[2].n]));
+}
+
 #define BINARY_INT_GVEC(uname, func, ...)                                          \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
     int vec_len = vector_len(s, decode);                                          \
                                                                                    \
+    gen_gvec_same_operand_read(decode);                                            \
     func(__VA_ARGS__,                                                              \
          decode->op[0].offset, decode->op[1].offset,                               \
          decode->op[2].offset, vec_len, vec_len);                                  \

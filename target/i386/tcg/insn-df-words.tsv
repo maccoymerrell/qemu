@@ -269,6 +269,7 @@ RCR	ror
 RDMSR	mov
 RDPMC	mov
 RDTSC	mov
+RDSSP	mov
 RDxxBASE	mov
 RET	ret
 RETF	ret

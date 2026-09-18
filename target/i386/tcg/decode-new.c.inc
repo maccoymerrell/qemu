@@ -549,6 +549,30 @@ static void decode_0F18(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
     }
 }
 
+/*
+ * 0F 1E: the reserved NOPs, and RDSSPD / RDSSPQ hiding among them.
+ *
+ * With an F3 prefix, a register operand and modrm reg == 1, these bytes are
+ * RDSSP and not a no-op.  Nothing else in the row changes: every other
+ * combination keeps the NOP entry it has always had, and RDSSP itself emits no
+ * ops, so this separates the rule without moving any behaviour.  ENDBR64 and
+ * ENDBR32 (modrm fa / fb) are reg == 7 and are untouched.
+ */
+static void decode_0F1E(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
+                        uint8_t *b)
+{
+    static const X86OpEntry e_nop = X86_OP_ENTRY1(NOP, nop,v);
+    static const X86OpEntry e_rdssp = X86_OP_ENTRYw(RDSSP, R,y, p_f3);
+    uint8_t modrm = get_modrm(s, env);
+
+    if ((s->prefix & PREFIX_REPZ) && (modrm >> 6) == 3 &&
+        ((modrm >> 3) & 7) == 1) {
+        *entry = e_rdssp;
+    } else {
+        *entry = e_nop;
+    }
+}
+
 static void decode_group8(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
     static const X86GenFunc group8_gen[8] = {
@@ -1591,7 +1615,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x1b] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
     [0x1c] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
     [0x1d] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
-    [0x1e] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
+    [0x1e] = X86_OP_GROUP1(0F1E, nop,v),  /* reserved NOP / RDSSPD,RDSSPQ */
     [0x1f] = X86_OP_ENTRY1(NOP,  nop,v),  /* NOP/reserved NOP */
 
     [0x28] = X86_OP_ENTRY3(MOVDQ,      V,x,  None,None, W,x, vex1 p_00_66), /* MOVAPS */

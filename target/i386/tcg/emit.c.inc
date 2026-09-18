@@ -3668,6 +3668,52 @@ static void gen_RDTSC(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_rdtsc(tcg_env);
 }
 
+/*
+ * RDSSPD / RDSSPQ -- F3 0F 1E /1 with a register operand.
+ *
+ * QEMU DID NOT DECODE THIS AT ALL.  Its encoding lives in the reserved-NOP
+ * space at 0F 1E, and with no rule of its own it reached the NOP row and was
+ * published as `nop` with no operand: the register the encoding names reached
+ * a consumer from nowhere.  Measured on a freestanding probe, `f3 48 0f 1e c8`
+ * and `f3 0f 1e c8` both decoded as `op=GEN_OP_NOP src=[] dst=[]`.
+ *
+ * The lowering is UNCHANGED -- this emits no ops, which is exactly what the
+ * NOP row emitted for these bytes, so no architectural behaviour moves.  What
+ * is new is the statement: the named GPR is this instruction's architectural
+ * DESTINATION, which is what XED (SRC {SSP} DST {RAX}), iced-x86 (DST {RAX})
+ * and PIN (dstset ref_only=rax) all report, and what the repo's R16
+ * adjudication ruled when the same register was being published on the wrong
+ * side of the arrow.
+ *
+ * TWO READINGS ARE RECORDED RATHER THAN SILENCED.
+ *
+ * The write is CONDITIONAL on the machine: with shadow stacks disabled the
+ * architecture makes RDSSP a no-op that leaves the register unmodified, and
+ * this CPU model has no CET state at all, so the destination is one this
+ * machine never actually stores to.  It is published anyway because the wire's
+ * destination list is the instruction's static write set and not a per-
+ * execution record, and because R16 ruled that the modelled machine's CET
+ * state does not remove an ISA fact.
+ *
+ * The SSP source is NOT stated.  The architecture makes SSP the value's
+ * origin, and the reference decoders name it, but QEMU models no shadow stack
+ * pointer -- there is no register here to read -- and the wire's generic id
+ * space forbids minting an id for a register that exists in a single ISA
+ * (champsim_tracer_generic_ids.h states the rule).  Stating nothing is the
+ * recoverable answer; naming some other register as the origin would not be.
+ */
+static void gen_RDSSP(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (decode->op[0].n >= 0 && decode->op[0].n < CPU_NB_REGS) {
+        insn_dataflow_state_write(insn_df_reg(x86_reg_names[decode->op[0].n]));
+    }
+    /*
+     * No value is produced, so nothing may be written back: the generic
+     * writeback would store an uninitialised T0 into the guest register.
+     */
+    decode->op[0].unit = X86_OP_SKIP;
+}
+
 static void gen_RDxxBASE(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv base = cpu_seg_base[s->modrm & 8 ? R_GS : R_FS];

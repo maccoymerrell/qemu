@@ -96,13 +96,69 @@ except ImportError as _e:                         # pragma: no cover
              'rather than scoring blind.' % _e)
 
 # ---------------------------------------------------------------- vocabulary
-# The tracer's declared x86 register vocabulary, parsed from its own table.
-TRACER_REG = {}
-hdr = '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/champsim_tracer_mnemonics_x86.h'
-for line in open(hdr):
-    m = re.match(r'\s+\[X86_REG_([A-Z0-9_]+)\]\s*=\s*\{\s*\.reg_id\s*=\s*(REG_[A-Z0-9_]+)', line)
-    if m:
-        TRACER_REG[m.group(1)] = m.group(2)
+# The tracer's x86 register vocabulary, read from the map the BUILD enforces.
+#
+# THIS WAS A CAPSTONE TABLE AND THE TABLE IS GONE (FINDING 246-C, x86 half 2).
+# It used to be parsed out of `champsim_tracer_mnemonics_x86.h`, the
+# `[X86_REG_<NAME>] = { .reg_id = REG_<X> }` array -- keyed on CAPSTONE's
+# register enum, which is what made it a reasonable join with XED's and LLVM's
+# spellings and also what made it die with Capstone.  The leg has been opening
+# a file that does not exist ever since; it never reported that because it
+# refused earlier, on CST_OBJDUMP_NEW, and the traceback only became visible
+# once that refusal was cleared.
+#
+# THE SUCCESSOR IS BETTER SOURCED, not merely different.  regmap/x86_64.tsv and
+# regmap/x86_64.gdb.tsv are QEMU's own register names against the generic wire
+# id, one row per name with a WRITTEN GROUND, and scripts/cst-regmap.py refuses
+# to generate the shipped header if either file is short a name the target
+# registers or carries one it does not.  So the vocabulary this comparison
+# joins on is the vocabulary the tracer actually publishes, checked in both
+# directions by the build, rather than a third party's enum.
+#
+# TWO NAMESPACES, AND THE ORDER IS A STATEMENT.  The `.tsv` is the TCG-global
+# namespace the wire's src/dst lists are published from, so where the two
+# disagree the TCG row is the one this comparison is about; the `.gdb.tsv`
+# adds only names the TCG namespace does not carry (the control registers,
+# the segment SELECTORS as opposed to their bases, mxcsr, efer).  MEASURED at
+# this tip: 102 TCG rows, 69 gdb rows, 22 gdb-only, and exactly ONE
+# disagreement -- fs_base, REG_SEG3 in TCG and REG_TLS in gdb.  It is printed
+# rather than resolved quietly, and the reference's own FSBASE spelling is
+# routed through ALIAS below in either case.
+#   _TOOLS = .../champsim_tracer/tools/arc3_cov, so the plugin root is two up.
+_REGMAP = os.path.join(os.path.dirname(os.path.dirname(_TOOLS)), 'regmap')
+
+
+def _read_regmap(path):
+    d = {}
+    if not os.path.exists(path):
+        sys.exit('compare_attrib: %s is missing -- REFUSING.  That file is '
+                 'the tracer\'s own register vocabulary; without it every '
+                 'reference register would score UNMAPPED and the leg would '
+                 'report a total vocabulary gap that is entirely its own '
+                 '(FINDING 246-C).' % path)
+    for line in open(path):
+        if line.startswith('#'):
+            continue
+        c = line.rstrip('\n').split('\t')
+        if len(c) >= 2 and c[0] and c[1]:
+            d[c[0].upper()] = c[1]
+    if not d:
+        sys.exit('compare_attrib: %s carries a header and no row -- REFUSING. '
+                 'A header is not a vocabulary.' % path)
+    return d
+
+
+TRACER_REG = _read_regmap(os.path.join(_REGMAP, 'x86_64.tsv'))
+_GDB_REG = _read_regmap(os.path.join(_REGMAP, 'x86_64.gdb.tsv'))
+for _n, _g in sorted(_GDB_REG.items()):
+    if _n not in TRACER_REG:
+        TRACER_REG[_n] = _g
+    elif TRACER_REG[_n] != _g:
+        sys.stderr.write('compare_attrib: %s is %s in the TCG namespace and '
+                         '%s in the gdb namespace; the TCG row is used '
+                         'because that is the namespace the wire publishes '
+                         'its register lists from\n'
+                         % (_n.lower(), TRACER_REG[_n], _g))
 
 # Reference-name -> tracer-table-name, where the two spell the same
 # architectural register differently.

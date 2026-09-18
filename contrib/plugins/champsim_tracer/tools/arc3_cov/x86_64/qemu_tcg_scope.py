@@ -107,10 +107,62 @@ class QemuFacts(object):
             out |= set(re.findall(r'CPUID_[A-Za-z0-9_]+', buf))
         return out
 
+    def _group_default_nop(self, tag):
+        """-> True when decode_<tag>()'s DEFAULT arm is an ungated NOP entry.
+
+        A row that reads `X86_OP_GROUP1(0F1E, nop,v)` does not state its
+        operand form in the table; the group function does, one level down, and
+        that is where the citation's fact now lives.  MEASURED at this tip:
+        `decode_0F0D` assigns `X86_OP_ENTRY1(NOP, M,v)` unconditionally, and
+        `decode_0F1E` assigns `X86_OP_ENTRY1(NOP, nop,v)` on every path except
+        the REPZ + mod==3 + reg==1 one that is RDSSP.  So the DEFAULT is the
+        NOP either way, and the narrow arm is asserted separately in selfcheck
+        rather than papered over here.
+        """
+        m = re.search(r'static void decode_%s\(.*?\n\}\n' % tag, self.decode,
+                      re.S)
+        if not m:
+            return None
+        body = m.group(0)
+        if 'cpuid(' in body:
+            return False
+        return bool(re.search(r'e_nop = X86_OP_ENTRY1\(NOP,\s*(?:nop|M),v\s*[,)]',
+                              body))
+
+    def rdssp_arm(self):
+        """-> the condition text of 0F 1E's one non-NOP arm, or None.
+
+        0F 1E stopped being an unconditional NOP when RDSSPD/RDSSPQ were
+        separated out of the reserved-NOP row.  The hint-NOP declination still
+        holds -- both arms execute on a TCG guest, so neither is excluded --
+        but the citation may not go on saying the whole byte is a NOP, and if
+        that arm ever grows a cpuid() gate the declination stops being free.
+        """
+        m = re.search(r'static void decode_0F1E\(.*?\n\}\n', self.decode, re.S)
+        if not m:
+            return None
+        body = m.group(0)
+        if 'X86_OP_ENTRYw(RDSSP, R,y, p_f3)' not in body:
+            return None
+        c = re.search(r'if \(\(s->prefix & PREFIX_REPZ\).*?\{', body, re.S)
+        return c.group(0) if c else None
+
     def _hint_nops(self):
         i = self.decode.index('X86OpEntry opcodes_0F[256]')
         t = self.decode[i:self.decode.index('\n};', i)]
         out = set()
+        # A GROUP DISPATCH IS STILL A ROW, and its operand form is one level
+        # down.  `[0x0d]` and `[0x1e]` became `X86_OP_GROUP1(...)` entries, and
+        # a pattern that only matched the direct `X86_OP_ENTRY1` form read that
+        # as the whole hint-NOP citation going stale.  It had not: both rows
+        # still reach an ungated NOP by default, which is the fact the
+        # declination rests on.  The group's own body is what is read.
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-f]{2})\] = X86_OP_GROUP1\((\w+),'
+                         r'\s*(?:nop|M),v\s*\)(.*)', line)
+            if m and 'cpuid(' not in m.group(3) \
+                 and self._group_default_nop(m.group(2)):
+                out.add(m.group(1)[2:])
         # THE CITED FACT IS THE OPERAND FORM AND THE ABSENCE OF A cpuid()
         # GATE -- not the punctuation after them.  These entries carry a FLAG
         # LIST now (`X86_OP_ENTRY1(NOP, nop,v, encops)`, landed 4d9ec8775e so
@@ -162,12 +214,26 @@ class QemuFacts(object):
         """0F 0D is implemented, ungated, and takes a memory operand only.
 
         The assertion is on the OPERAND FORM -- `M,v`, memory only -- which is
-        what OPERAND-FORM-REFUSED cites when it declines the register form.  A
-        trailing flag list does not touch that, so the pattern stops at the
-        operand form rather than at the entry's closing paren.
+        what OPERAND-FORM-REFUSED cites when it declines the register form.
+
+        THE FACT MOVED ONE LEVEL DOWN, AND THE TEST FOLLOWS IT.  The row now
+        reads `[0x0d] = X86_OP_GROUP1(0F0D, M,v)`, a dispatch, and `M,v` is
+        restated inside `decode_0F0D` as `X86_OP_ENTRY1(NOP, M,v)` with no
+        condition on it -- the group function exists to attach the PREFETCH
+        word to /0../2, not to change the operand form.  Both halves are
+        asserted: the dispatch's own `M,v`, and the unconditional `M,v` in the
+        function it names.  A test spelled only against the old direct-entry
+        form read the citation as stale while the cited fact still held.
         """
-        return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
-                              self.decode))
+        m = re.search(r'\[0x0d\] = X86_OP_GROUP1\((\w+),\s*M,v\s*[,)]',
+                      self.decode)
+        if not m:
+            return bool(re.search(r'\[0x0d\] = X86_OP_ENTRY1\(NOP,\s+M,v\s*[,)]',
+                                  self.decode))
+        body = re.search(r'static void decode_%s\(.*?\n\}\n' % m.group(1),
+                         self.decode, re.S)
+        return bool(body) and bool(
+            re.search(r'e_nop = X86_OP_ENTRY1\(NOP,\s*M,v\s*[,)]', body.group(0)))
 
     def group3_slots(self):
         """The ModRM /reg slots QEMU's F6 / F7 group table fills.
@@ -503,9 +569,20 @@ def selfcheck(root=None):
     # An instrument that cannot fire proves nothing: the vocabulary parse must
     # find features TCG really does have.
     if '1e' not in f.hint_nops or '0d' not in f.hint_nops:
-        bad.append('0F 1E / 0F 0D are no longer ungated NOP entries: the '
-                   'hint-NOP space may no longer execute unconditionally, and '
-                   'declining to exclude it is no longer justified')
+        bad.append('0F 1E / 0F 0D no longer reach an ungated NOP by default: '
+                   'the hint-NOP space may no longer execute unconditionally, '
+                   'and declining to exclude it is no longer justified')
+    # 0F 1E IS NOT AN UNCONDITIONAL NOP ANY MORE, AND THE CITATION SAYS SO.
+    # `decode_0F1E` hands back RDSSP on REPZ + mod==3 + reg==1.  That does not
+    # move the declination -- RDSSP runs on a TCG guest exactly as the NOP does,
+    # so nothing is excluded either way -- but it is a second arm, and it is
+    # asserted here so that the day it grows a cpuid() gate the declination
+    # goes stale loudly instead of quietly.
+    arm = f.rdssp_arm()
+    if arm is None:
+        bad.append("0F 1E's RDSSP arm is no longer `X86_OP_ENTRYw(RDSSP, R,y, "
+                   'p_f3)` under a REPZ test in decode_0F1E: the hint-NOP '
+                   'citation is written against a decoder that has moved')
     for must in ('AVX2', 'BMI1', 'SHA_NI', 'CMPCCXADD'):
         if must not in f.decoder_feats:
             bad.append('X86_FEAT_%s missing from the parsed decoder '

@@ -48,13 +48,31 @@ shared object and the offline tools (``cst_decode``, ``cst_audit``)
 in one shot.  Output lands under ``build/contrib/plugins/``.
 
 A full configure (system mode included) also works; the user-mode
-restriction above just trims build time.  Capstone is downloaded
-and built automatically the first time you ``configure`` for a
-target that needs it.
+restriction above just trims build time.
 
-If your distribution ships a stale Capstone (some do), the meson
-wrap takes precedence — the plugin always builds against the wrap
-copy under ``subprojects/capstone/``.
+Capstone is not involved.  Earlier revisions of this page said the
+build downloaded and built a pinned Capstone through a meson wrap,
+and that the plugin linked the wrap copy in preference to any
+system one.  Both sentences described a tree that no longer exists:
+there is no ``subprojects/capstone.wrap``, the plugin links no
+disassembler, and the shipped object names no Capstone symbol.  The
+offline referee still consults Capstone, through the Python
+bindings, over encodings a trace already recorded — but that is a
+separate program run after the fact and it is not part of building
+or running the tracer.
+
+``ninja`` is the build command, not ``make``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both invocations above drive ``ninja`` directly, and that is
+deliberate.  ``make`` in a configured build directory is a thin
+wrapper that first rebuilds ``config-host.mak``, and that rule
+requires a Rust toolchain to be present even for a configuration
+that enables nothing written in Rust — so on a host without
+``rustc`` it fails before reaching any target the tracer needs.
+``ninja -C build <targets>`` has no such step and builds the same
+things.  Prefer it; if you see ``make`` fail complaining about
+``rustc``, that is this, and it says nothing about the tracer.
 
 Running the tracer
 ------------------

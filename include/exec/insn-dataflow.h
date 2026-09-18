@@ -799,6 +799,37 @@ void insn_dataflow_state_read(InsnDataflowAtom a);
 void insn_dataflow_state_write(InsnDataflowAtom a);
 
 /*
+ * The ops about to run read @a ONLY to carry across the bits this instruction
+ * does not modify.  That read is not an input.
+ *
+ * R7.1, verbatim: "the fact that a register's upper contents may not be
+ * modified does not imply it is a source AND a destination for the
+ * instruction unless the instruction specifically takes it as a source."
+ * Width is carried at execution; it is not a static set question.
+ *
+ * TCG has no way to write part of a global, so a target that must write part
+ * of a register lowers the write as a read-modify-write of the whole one --
+ * MIPS's gen_store_fpr32() deposits 32 bits into fpu_f64[reg] with fpu_f64[reg]
+ * as the merge's other operand.  The op stream cannot tell that merge apart
+ * from an architectural read, and taking it for one publishes a
+ * read-after-write edge on a register the instruction never read: a consumer
+ * modelling rename sees a false dependency on the instruction's own result.
+ *
+ * Called at the decode site IMMEDIATELY BEFORE the merge it describes, and
+ * ANCHORED THERE: the note applies from the op most recently emitted onwards,
+ * so a read earlier in the same instruction -- `mov.s $f0,$f0` loading f0 as
+ * its operand, `add.s $f0,$f0,$f1` likewise -- is not touched by it.  The note
+ * is spent when an op writes that register, which is the merge landing, so a
+ * later genuine read is not touched either.  Both ends are load-bearing: an
+ * unanchored first cut deleted 32 mipsel operand reads whose fd equalled fs,
+ * and the static register-set check caught it.
+ *
+ * A name that is not a TCG global is a no-op: the note has nothing to attach
+ * to and the read stands, which is the pessimistic direction.
+ */
+void insn_dataflow_note_preserve_read(InsnDataflowAtom a);
+
+/*
  * The instruction writes @a, and @src is where that value came from.
  *
  * insn_dataflow_state_write() records the access and says nothing about the
@@ -1093,6 +1124,8 @@ static inline void insn_dataflow_extract(unsigned num_insns)
 static inline void insn_dataflow_state_read(InsnDataflowAtom a)
 { }
 static inline void insn_dataflow_state_write(InsnDataflowAtom a)
+{ }
+static inline void insn_dataflow_note_preserve_read(InsnDataflowAtom a)
 { }
 static inline void insn_dataflow_state_write_from(InsnDataflowAtom a,
                                                   const InsnDataflowAtom *src,

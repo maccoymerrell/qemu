@@ -77,6 +77,23 @@ typedef struct DfBinding {
     uint16_t bit;
 } DfBinding;
 
+/*
+ * A preserve-read note, anchored the same way a binding is.
+ *
+ * The anchor is what makes the note honest.  The reader walks ops in emission
+ * order, so a note that applied to the whole instruction would suppress a
+ * read that happened BEFORE it: `mov.s $f0,$f0` loads f0 as its operand and
+ * then merges into f0, and an unanchored note deleted the operand read as
+ * well as the merge's.  MEASURED, and the reason this field exists: the
+ * mipsel static register-set check reported 32 encodings whose source the
+ * referee named and the wire did not, all of them fd == fs.
+ */
+typedef struct DfPreserve {
+    const TCGOp *anchor;        /* NULL: before this translation's first op */
+    uint16_t insn;
+    uint16_t bit;
+} DfPreserve;
+
 /* A bracket around ops that are QEMU's bookkeeping, not the instruction's. */
 /*
  * A bracket around ops that are not the decoding instruction's own.
@@ -151,6 +168,30 @@ struct InsnDataflowScratch {
     bool     decoding;          /* insn_begin seen since the last extract */
 
     /*
+     * Globals whose next read is a PRESERVE READ, per instruction.
+     *
+     * R7.1: a narrow write does not acquire a source.  When a target has to
+     * write part of a register it lowers the write as a read-modify-write of
+     * the whole one, and the read of the container that merge performs is the
+     * lowering's, not the instruction's -- the instruction did not take that
+     * register as an operand, and a consumer handed it as a source sees a
+     * read-after-write edge the machine does not have.
+     *
+     * Kept HERE rather than in InsnDataflow because it is scratch the reader
+     * consumes, not a fact the wire publishes: adding a field to the published
+     * per-instruction record would move the plugin ABI for a bitmap no
+     * consumer ever sees.
+     *
+     * NOTED at the decode site against the op most recently emitted, ARMED
+     * when the walk reaches that op, consumed by df_read_global(), and cleared
+     * when an op writes the register -- which is the merge landing.  The two
+     * ends together bound the note to the one merge it was made about: an
+     * operand read earlier in the same instruction is before the anchor, and
+     * anything after the merge is past the clear.
+     */
+    uint64_t preserve[INSN_DF_MAX_INSNS][INSN_DF_REG_WORDS];
+
+    /*
      * Env byte ranges no TCG global names, interned for the block so they can
      * carry provenance bits alongside the globals.  A block touches very few
      * distinct ones; running out stops interning, which is recorded rather
@@ -165,6 +206,9 @@ struct InsnDataflowScratch {
 
     DfBinding bind[INSN_DF_MAX_BINDINGS];
     unsigned nbind;
+
+    DfPreserve pres[INSN_DF_MAX_BINDINGS];
+    unsigned npres;
 
     DfWindow win[INSN_DF_MAX_WINDOWS];
     unsigned nwin;
@@ -233,6 +277,13 @@ static bool df_test_bit(const uint64_t *set, unsigned bit)
 {
     return bit < INSN_DF_MAX_REGS &&
            (set[bit / 64] & (1ULL << (bit % 64))) != 0;
+}
+
+static void df_clear_bit(uint64_t *set, unsigned bit)
+{
+    if (bit < INSN_DF_MAX_REGS) {
+        set[bit / 64] &= ~(1ULL << (bit % 64));
+    }
 }
 
 static bool df_empty(const uint64_t *set)
@@ -506,6 +557,16 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
 static void df_read_global(InsnDataflow *d, unsigned idx, uint64_t *prov)
 {
     if (!df_test_bit(d->opwr, idx)) {
+        /*
+         * A PRESERVE READ IS NOT AN INPUT (R7.1).  The decode site said this
+         * read exists only to carry across the bits the instruction does not
+         * modify; the register is therefore neither a source nor a
+         * contributor to the merged value's account, and the merge's result
+         * depends on what the instruction actually computed.
+         */
+        if (df_test_bit(df->preserve[d - df->out], idx)) {
+            return;
+        }
         df_set_bit(d->rd, idx);
         df_set_bit(prov, idx);
         return;
@@ -530,6 +591,12 @@ static void df_write_global(InsnDataflow *d, unsigned idx,
 {
     df_set_bit(d->wr, idx);
     df_set_bit(d->opwr, idx);
+    /*
+     * The merge has landed, so the preserve note is spent.  Bounding it to
+     * the write it was made about is what keeps it from swallowing a later,
+     * genuine read of the same register inside the same instruction.
+     */
+    df_clear_bit(df->preserve[d - df->out], idx);
     df_add_write(d, idx, prov, false, false);
     /*
      * A GLOBAL AN OP HAS JUST WRITTEN CARRIES NO INHERITED ACCOUNT.
@@ -1357,6 +1424,32 @@ void insn_dataflow_state_read(InsnDataflowAtom a)
     df_state(a, INSN_DF_RD);
 }
 
+void insn_dataflow_note_preserve_read(InsnDataflowAtom a)
+{
+    int g;
+
+    if (df == NULL || !df->decoding || a.kind != INSN_DF_A_REG ||
+        a.name == NULL) {
+        return;
+    }
+    g = df_global_by_name(a.name);
+    if (g < 0 || df->npres >= INSN_DF_MAX_BINDINGS) {
+        /*
+         * Only a TCG global can carry the note: a declared env range is
+         * recorded per byte range by df_add_field(), which the merge case
+         * this exists for does not go through.  A name that resolves to
+         * nothing -- or a block that has made more notes than there is room
+         * for -- leaves the read exactly as it was: the register stays in the
+         * read set, which is the pessimistic direction and visible there.
+         */
+        return;
+    }
+    df->pres[df->npres].anchor = tcg_last_op();
+    df->pres[df->npres].insn = df->cur;
+    df->pres[df->npres].bit = (uint16_t)g;
+    df->npres++;
+}
+
 void insn_dataflow_state_write(InsnDataflowAtom a)
 {
     df_state(a, INSN_DF_WR);
@@ -1971,6 +2064,7 @@ void insn_dataflow_insn_begin(unsigned idx)
         df->gen++;
         df->nslots = 0;
         df->nbind = 0;
+        df->npres = 0;
         df->nwin = 0;
         df->win_open = -1;
         df->ninsns = 0;
@@ -2053,13 +2147,18 @@ void insn_dataflow_extract(unsigned num_insns)
     const TCGOp *win_to = NULL;
     TCGOp *op;
     int win_lender = -1;
-    unsigned wi = 0, bi = 0;
+    unsigned wi = 0, bi = 0, pi = 0;
     int idx = -1;
 
     if (df == NULL) {
         return;
     }
     df->decoding = false;
+    /*
+     * The preserve bits are armed by the cursor below as the walk reaches each
+     * note's anchor, so the walk starts with none of them set.
+     */
+    memset(df->preserve, 0, sizeof(df->preserve));
     if (num_insns > INSN_DF_MAX_INSNS) {
         num_insns = INSN_DF_MAX_INSNS;
     }
@@ -2103,6 +2202,18 @@ void insn_dataflow_extract(unsigned num_insns)
                 df_set_bit(df_prov(df->bind[bi].temp), df->bind[bi].bit);
             }
             bi++;
+        }
+        /*
+         * A preserve-read note arms HERE, at the op it was anchored to, and
+         * not before: the merge it describes is the next op, and any read of
+         * the same register earlier in this instruction was the instruction's
+         * own operand.
+         */
+        while (pi < df->npres && df->pres[pi].anchor == prev) {
+            if (df->pres[pi].insn < num_insns) {
+                df_set_bit(df->preserve[df->pres[pi].insn], df->pres[pi].bit);
+            }
+            pi++;
         }
 
         if (op->opc == INDEX_op_insn_start) {

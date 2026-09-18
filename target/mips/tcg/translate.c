@@ -1498,6 +1498,27 @@ void gen_load_fpr32(DisasContext *ctx, TCGv_i32 t, int reg)
     tcg_gen_extrl_i64_i32(t, fpu_f64[reg]);
 }
 
+/*
+ * WRITING 32 BITS OF A 64-BIT GLOBAL IS A MERGE, AND THE MERGE'S READ OF THE
+ * DESTINATION IS NOT AN INPUT (R7.1).
+ *
+ * TCG cannot write part of a global, so every narrow FP write below lowers to
+ * a deposit whose other operand is the destination itself.  Read as an
+ * ordinary operand that publishes the register as a SOURCE of an instruction
+ * that only writes it -- a read-after-write edge on the instruction's own
+ * result, which a consumer modelling register rename must not see.
+ *
+ * Under FR=0 the bits being preserved are not even architectural: the odd
+ * halves of fpu_f64[] are unused there (gen_load_fpr64 builds a 64-bit value
+ * from the LOW halves of the even/odd pair), so the merge carries emulator
+ * padding across.  Under FR=1 they are the register's own upper half, which
+ * R7.1 rules is still not a source: the instruction did not take it as one.
+ *
+ * The note is ANCHORED at the op before the deposit and spent by the deposit's
+ * write, so an operand load earlier in the same instruction is untouched --
+ * which `mov.s $f0,$f0` needs, because there fd and fs are the same register
+ * and only the second read is the merge's.
+ */
 void gen_store_fpr32(DisasContext *ctx, TCGv_i32 t, int reg)
 {
     TCGv_i64 t64;
@@ -1506,6 +1527,7 @@ void gen_store_fpr32(DisasContext *ctx, TCGv_i32 t, int reg)
     }
     t64 = tcg_temp_new_i64();
     tcg_gen_extu_i32_i64(t64, t);
+    insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg]));
     tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 0, 32);
 }
 
@@ -1523,6 +1545,7 @@ static void gen_store_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg)
     if (ctx->hflags & MIPS_HFLAG_F64) {
         TCGv_i64 t64 = tcg_temp_new_i64();
         tcg_gen_extu_i32_i64(t64, t);
+        insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg]));
         tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 32, 32);
     } else {
         gen_store_fpr32(ctx, t, reg | 1);
@@ -1544,9 +1567,11 @@ void gen_store_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
         tcg_gen_mov_i64(fpu_f64[reg], t);
     } else {
         TCGv_i64 t0;
+        insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg & ~1]));
         tcg_gen_deposit_i64(fpu_f64[reg & ~1], fpu_f64[reg & ~1], t, 0, 32);
         t0 = tcg_temp_new_i64();
         tcg_gen_shri_i64(t0, t, 32);
+        insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg | 1]));
         tcg_gen_deposit_i64(fpu_f64[reg | 1], fpu_f64[reg | 1], t0, 0, 32);
     }
 }
@@ -4303,6 +4328,13 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
 
             tcg_gen_setcond_i64(cond, t64, t0, t1);
             tcg_gen_extrl_i64_i32(t32, t64);
+            /*
+             * Writing ONE condition-code bit is a merge, and the merge's read
+             * of fcr31 is not an input (R7.1) -- the instruction takes two
+             * vector operands and a condition, not the control register it
+             * deposits into.
+             */
+            insn_dataflow_note_preserve_read(insn_df_reg("fcr31"));
             tcg_gen_deposit_i32(fpu_fcr31, fpu_fcr31, t32,
                                 get_fp_bit(cc), 1);
         }

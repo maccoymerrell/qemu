@@ -430,9 +430,29 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
                                      INSN_DF_IMM_DISP);
     }
 
-    if (has_ea && word != NULL &&
-        (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
-         !strcmp(word, INSN_DF_WORD_CACHEFLUSH))) {
+    /*
+     * THE ACCESS A HELPER PERFORMS AND NO OP NAMES.
+     *
+     * Two arms reach the same statement.  The prefetch and cache-maintenance
+     * words touch no guest memory at all and name an address anyway.  FXSAVE
+     * and FXRSTOR do touch it: gen_FXSAVE hands tcg_env and s->A0 to
+     * helper_fxsave, which moves the whole 512-byte area itself, so the op
+     * stream shows a call and no qemu_st -- and the template then declared
+     * that the instruction cannot touch memory while the runtime delivered
+     * hundreds of accesses per execution against it.  Measured on an x86_64
+     * system trace: 990 impossible memop attributions on `48 0f ae 40 40`
+     * (fxsave64 0x40(%rax)), the whole of cst_audit's surviving
+     * memop-impossible population.  The area is 512 bytes in every form the
+     * architecture has, which is why the size is written here and not derived
+     * from the operand's encoded width.
+     */
+    bool helper_area = !decode->e.is_decode &&
+        (decode->e.gen == gen_FXSAVE || decode->e.gen == gen_FXRSTOR);
+
+    if (has_ea && (helper_area ||
+                   (word != NULL &&
+                    (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
+                     !strcmp(word, INSN_DF_WORD_CACHEFLUSH))))) {
         InsnDataflowEaPart parts[2];
         unsigned n = 0;
         AddressParts *a = &decode->mem;
@@ -460,9 +480,30 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
             parts[n++] = insn_df_ea(insn_df_reg(x86_reg_names[a->index]),
                                     a->scale, INSN_DF_EA_EXT_NONE);
         }
-        insn_dataflow_note_synthetic_ea(INSN_DF_RD,
-                                        1u << decode->op[0].ot,
-                                        parts, n, a->disp);
+        if (helper_area) {
+            /*
+             * THE DATUM IS NOT NAMED, AND THAT IS A CAP AND NOT A CHOICE.
+             *
+             * The area's bytes are the x87 and SSE register state, so FXSAVE's
+             * stored datum comes from those 32 registers and FXRSTOR writes
+             * every one of them.  Stating that was WRITTEN, BUILT AND
+             * MEASURED here, and REVERTED: an instruction may carry
+             * INSN_DF_MAX_FIELDS (16) env ranges and INSN_DF_MAX_WRITES (8)
+             * writes, the area names 32, and the reader correctly refuses an
+             * instruction it cannot record in full -- so both encodings came
+             * back with src=[], dst=[] and no access at all, which is worse
+             * than the state this fixes.  The access is stated; the register
+             * set it moves is a named residue, and the blocker is those two
+             * caps against a 32-name area.
+             */
+            insn_dataflow_note_synthetic_ea(decode->e.gen == gen_FXSAVE
+                                            ? INSN_DF_WR : INSN_DF_RD,
+                                            512, parts, n, a->disp);
+        } else {
+            insn_dataflow_note_synthetic_ea(INSN_DF_RD,
+                                            1u << decode->op[0].ot,
+                                            parts, n, a->disp);
+        }
     }
 }
 

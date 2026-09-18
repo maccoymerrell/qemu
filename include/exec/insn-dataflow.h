@@ -354,7 +354,13 @@ typedef struct InsnDataflowWrite {
  */
 typedef struct InsnDataflowMemop {
     uint8_t  dir;               /* INSN_DF_RD / _WR */
-    uint8_t  size;              /* bytes */
+    /*
+     * Bytes.  Wide enough for an area access an instruction performs inside a
+     * helper: x86's FXSAVE moves 512 bytes and a byte field would have had to
+     * clamp it, publishing a size the instruction does not touch through an
+     * API (qemu_plugin_dataflow_memop::size) that is already uint32_t.
+     */
+    uint16_t size;
     uint64_t addr_prov[INSN_DF_REG_WORDS];
     uint64_t data_prov[INSN_DF_REG_WORDS];
 } InsnDataflowMemop;
@@ -975,13 +981,26 @@ void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
                                     unsigned dir);
 
 /*
- * An effective address the emulation computes no address for.
+ * An access the op stream does not carry, and the address it is made at.
  *
- * Prefetches and cache-maintenance operations -- x86 prefetch*, aarch64 PRFM
- * and DC CVAU, MIPS PREF and SYNCI -- lower to a NOP or to a bare block exit.
- * There is no memop, so there is nothing for the reader to walk, and a
- * consumer is handed an instruction that names an address in its encoding and
- * touches nothing.  The decode site still holds the operand, so it says so.
+ * Two shapes reach this, and the difference between them is whether the guest
+ * memory is touched -- not whether the reader can see it, which is the same
+ * answer for both: nothing in the op stream to walk.
+ *
+ * The first performs no access.  Prefetches and cache-maintenance operations
+ * -- x86 prefetch*, aarch64 PRFM and DC CVAU, MIPS PREF and SYNCI -- lower to
+ * a NOP or to a bare block exit, so a consumer is handed an instruction that
+ * names an address in its encoding and touches nothing.
+ *
+ * The second performs a REAL one, inside a helper.  RISC-V's CBO.ZERO memsets
+ * a cache block through a host pointer and x86's FXSAVE / FXRSTOR move the
+ * 512-byte area, and in both the helper takes tcg_env and an address and does
+ * the work itself: no qemu_ld/qemu_st op exists for the reader to attribute,
+ * so the template would say the instruction cannot touch memory while the
+ * runtime callbacks deliver the accesses.  @dir and @size are the helper's
+ * own reading of what it does, never a guess.
+ *
+ * The decode site holds the operand in both shapes, so it says so.
  *
  * @parts are the components the address is built from -- each an atom, the
  * shift the computation applies to it and any narrowing extend -- and @disp

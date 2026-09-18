@@ -546,7 +546,7 @@ static int df_add_memop(InsnDataflow *d, uint8_t dir, uint32_t size,
     k = (int)d->n_memops;
     m = &d->memops[d->n_memops++];
     m->dir = dir;
-    m->size = size > 255 ? 255 : (uint8_t)size;
+    m->size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size;
     memset(m->addr_prov, 0, sizeof(m->addr_prov));
     memset(m->data_prov, 0, sizeof(m->data_prov));
     if (addr_prov) {

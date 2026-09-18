@@ -52,9 +52,22 @@ done
 ninja -j "${CST_JOBS:-12}" -C "$Q/build" contrib-plugins
 [ -x "$ISAX" ] || { echo "REFUSED: no tracer arm at $ISAX" >&2; exit 2; }
 
+# THE DECODE-BOUNDARY ARM IS A SECOND DECODER, CHECKED HERE (FINDING 246-C).
+# emit.py used to get it from `isaxcheck --layer=boundary`, which answered with
+# Capstone and LLVM MC together and went with Capstone at c32824defa.  The
+# surviving half is LLVM MC, from the probe binary this leg's reference corpus
+# was built with, and a leg that cannot reach it must FAIL here.
+RV_LLVMOPS=${CST_RV_LLVMOPS:-/mnt/md0/QEMU/cst_runs/_arc3_refs/riscv64/bin_llvm_ops}
+[ -x "$RV_LLVMOPS" ] || { echo "REFUSED: no LLVM MC probe at $RV_LLVMOPS." >&2
+    echo "  The decode-boundary cross-check is a SECOND DECODER; without" >&2
+    echo "  one there is nothing to cross-check the Sail model against." >&2
+    echo "  Build it: /mnt/md0/QEMU/cst_runs/_arc3_refs/riscv64/reproduce.sh" >&2
+    exit 2; }
+export CST_RV_LLVMOPS="$RV_LLVMOPS"
+
 # The harness is the TREE's copy; the working directory only holds evidence.
 mkdir -p "$D/attrib"
-cp "$T"/emit.py "$D"/
+cp "$T"/emit.py "$T"/llvm_arm.py "$D"/
 cp "$T"/compare.py "$T"/expand_vals.py "$T"/sail_effects.py \
    "$T"/zcmp_profile.py "$D"/attrib/
 cd "$D"
@@ -112,6 +125,61 @@ export CST_ISAX_IDENT
 CST_SLED_CAPTURE=$(dirname "$CST_ISAX_IDENT")
 export CST_SLED_CAPTURE
 echo "ident corpus: $CST_ISAX_IDENT"
+
+# ---- THE SECOND CAPTURE: the Zcmp/Zcmt profile (FINDING 246-C) ------------
+# Zcmp and Zcmt occupy the compressed FP-store encoding space and QEMU refuses
+# to build a CPU carrying both them and Zcd, so ONE capture cannot answer for
+# both profiles -- zcmp_profile.py holds the measurement and the QEMU source
+# citation.  The eight encodings therefore get their own sled run on their own
+# guest CPU, and compare.py's Zcmp arm reads THIS directory.
+#
+# It was not always a capture.  Until this pass the arm was
+# `isaxcheck --cs-mode-add=zcmp`, a flag on a host decoder that no longer
+# exists; the call returned nothing and all eight rows published
+# `trc_status=no-fields`, i.e. the leg's ENTIRE coverage hole was the harness
+# asking a retired binary.  A missing second decoder is a refusal, not a hole.
+ZC_CPU=$($PY - "$T/zcmp_profile.py" <<'PYEOF'
+import runpy, sys
+print(runpy.run_path(sys.argv[1])['QEMU_CPU'])
+PYEOF
+)
+$PY - "$T/zcmp_profile.py" > "$D/ident_pop_zcmp.txt" <<'PYEOF'
+import runpy, sys
+for r in runpy.run_path(sys.argv[1])['ROWS']:
+    print(r['hex'])
+PYEOF
+[ -s "$D/ident_pop_zcmp.txt" ] || { echo "REFUSED: zcmp_profile.py yielded no hex" >&2
+                                    exit 2; }
+CST_RV_ZCMP_CAPTURE=$(dirname "$(CST_IDENT_CPU="$ZC_CPU" \
+    "$T"/../ident_capture.sh riscv64 "$D/ident_pop_zcmp.txt" \
+        "$D/ident_zcmp" "$Q")") || exit 2
+export CST_RV_ZCMP_CAPTURE
+echo "zcmp ident corpus: $CST_RV_ZCMP_CAPTURE  (cpu $ZC_CPU)"
+# AND IT MUST HAVE DECODED THEM AS Zcmp.  A capture taken on a model where C
+# is still on comes back full of `c_fsd` rows -- the failure this whole block
+# exists for -- and every downstream number would then be about c.fsdsp.  The
+# capture's own rule column is asked, here, before anything reads it.
+$PY - "$CST_RV_ZCMP_CAPTURE/ident_riscv64.tsv" "$D/ident_pop_zcmp.txt" <<'PYEOF' || exit 2
+import sys
+rule = {}
+for l in open(sys.argv[1]):
+    if l.startswith('#'):
+        continue
+    c = l.rstrip('\n').split('\t')
+    if len(c) >= 4:
+        rule[c[1].lower()] = c[3]
+bad = [(h, rule.get(h, '(no row)')) for h in
+       (x.strip().lower() for x in open(sys.argv[2]) if x.strip())
+       if not rule.get(h, '').startswith('cm_')]
+if bad:
+    sys.exit('REFUSED: the zcmp capture did not decode %d of its own '
+             'encodings as Zcmp/Zcmt:\n  ' % len(bad)
+             + '\n  '.join('%s -> %s' % b for b in bad)
+             + '\n  The CPU model reached the sled but the Zcmp patterns did '
+               'not win the\n  decode; see zcmp_profile.QEMU_CPU for why plain '
+               'C has to be off.')
+print('zcmp capture: all %d encodings decoded as Zcmp/Zcmt rules' % len(rule))
+PYEOF
 
 CST_ISAXCHECK="$ISAX" $PY emit.py               # -> opcodes.tsv, excluded.tsv
 $PY - <<'PYEOF'

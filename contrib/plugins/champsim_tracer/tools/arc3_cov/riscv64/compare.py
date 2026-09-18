@@ -182,8 +182,24 @@ def opcode_id(r):
     if c: bits.append(c)
     return ':'.join(bits)
 
-def batch(hexes, extra):
+def batch(hexes, extra, capture=None):
+    """-> {hex: fields row} from the tracer arm, over ONE sled capture.
+
+    `capture` names the capture directory to read; None means the leg's own
+    CST_SLED_CAPTURE, which is the base profile's.  A PROFILE IS A CAPTURE
+    AND NOT A FLAG (FINDING 246-C): `extra` used to carry
+    `--cs-mode-add=zcmp --mattr=...`, which told the retired isaxcheck to
+    switch its own host decoder.  That binary went with Capstone, and the
+    successor reads a real QEMU translation -- so the Zcmp arm is a second
+    sled run on a Zcmp-configured guest CPU, and this passes the directory it
+    wrote.  The flags were not merely inert once the binary changed: argparse
+    rejected them, the call returned nothing, and all eight Zcmp rows read
+    `trc_status=no-fields` -- an UNPROBED verdict produced by the harness and
+    published as a coverage hole.
+    """
     argv = [ISAX, '--isa=riscv64', '--layer=fields', '--batch'] + extra
+    if capture:
+        argv.append('--capture=' + capture)
     fals = os.environ.get('CST_FALSIFY')
     if fals: argv.append('--falsify=' + fals)
     proc = subprocess.run(argv, input='\n'.join(hexes) + '\n',
@@ -191,8 +207,10 @@ def batch(hexes, extra):
     tr = {}
     for row in csv.DictReader(proc.stdout.splitlines(), delimiter='\t'):
         tr[row['hex']] = row
-    sys.stderr.write('isaxcheck %s rows=%d rc=%d\n'
-                     % (' '.join(extra) or 'base', len(tr), proc.returncode))
+    sys.stderr.write('sled_fields %s rows=%d rc=%d\n'
+                     % (capture or 'base capture', len(tr), proc.returncode))
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-1200:])
     return tr
 
 
@@ -256,8 +274,21 @@ def main():
 
     # ---- tracer side, one --batch pass per profile
     tr = batch([base[k]['hex'] for k in base], [])
-    tr_zc = batch([zcmp[k]['hex'] for k in zcmp],
-                  ['--cs-mode-add=' + ZC.CS_MODE_ADD, '--mattr=' + ZC.LLVM_MATTR]) \
+    # The Zcmp arm reads the SECOND capture, taken on ZC.QEMU_CPU by
+    # REPRODUCE.sh.  A leg that cannot reach it must say so by name rather
+    # than fall back on the base capture, where these encodings are c.fsdsp
+    # and the comparison would be about a different instruction.
+    zc_cap = os.environ.get('CST_RV_ZCMP_CAPTURE')
+    if zcmp and not zc_cap:
+        raise SystemExit(
+            'REFUSED: %d %s-profile row(s) to score and no CST_RV_ZCMP_CAPTURE.\n'
+            '  These encodings decode as c.fsdsp on the base profile\'s CPU '
+            '(zcmp_profile.py\n  carries the measurement), so the base capture '
+            'would answer about a DIFFERENT\n  instruction and the rows would '
+            'publish as a coverage hole the harness created.\n'
+            '  REPRODUCE.sh takes that capture; run the leg through it.'
+            % (len(zcmp), ZC.PROFILE))
+    tr_zc = batch([zcmp[k]['hex'] for k in zcmp], [], capture=zc_cap) \
             if zcmp else {}
 
     out = []
@@ -432,13 +463,18 @@ if __name__ == '__main__':
     # readings of one capture cannot disagree, and a reading against a
     # DIFFERENT capture is refused upstream by the corpus's own `#so` stamp.
     #
-    # MEASURED at this tip over the leg's 1,070 rows: every AGREE (373) and
-    # every DISAGREE (16) row is `yes`, which is the consistency the column
-    # has to show -- the tracer cannot have produced fields for an encoding
-    # QEMU decoded no rule for.  Of the 681 UNPROBED, 673 are `no` and the
-    # EIGHT that are `yes` are the whole of the leg's coverage hole:
-    # cm.mva01s, cm.mvsa01, cm.pop, cm.popret, cm.popretz, cm.push, cm.jalt,
-    # cm.jt -- the Zcmp/Zcmt profile, decoded by QEMU and carrying no fields.
+    # Every AGREE and every DISAGREE row reads `yes`, which is the consistency
+    # the column has to show -- the tracer cannot have produced fields for an
+    # encoding QEMU decoded no rule for.  The UNPROBED rows are QEMU_REFUSED
+    # and read `no`.
+    #
+    # THE EIGHT Zcmp/Zcmt ROWS ARE NO LONGER A HOLE (FINDING 246-C).  They read
+    # `yes` + UNPROBED for as long as their tracer arm was a flag on a retired
+    # binary; they are now probed on their own sled capture (see batch() and
+    # REPRODUCE.sh), so they carry a real comparison and land in AGREE or
+    # DISAGREE with everything else.  A hole the harness made is not a hole in
+    # the tracer, and the difference is visible here: the reachability verdict
+    # never moved, only whether anything had asked.
     for r in out:
         r['qemu_tcg_reachable'] = 'no' if r.get('hex', '') in QEMU_REFUSED \
                                  else 'yes'

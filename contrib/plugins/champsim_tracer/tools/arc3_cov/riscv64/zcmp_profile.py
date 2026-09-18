@@ -46,7 +46,7 @@ translator emits.
 """
 
 # Representative encodings, little-endian bytes, verified by decoding each one
-# with `isaxcheck --isa=riscv64 --cs-mode-add=zcmp`.  rlist=4 is the shortest
+# on a QEMU guest configured as QEMU_CPU below.  rlist=4 is the shortest
 # legal list ({ra}); the list width is the C3 generic field of these opcodes
 # (one row covers every rlist), and spimm likewise.
 ROWS = [
@@ -130,10 +130,33 @@ ROWS = [
     ),
 ]
 
-# The two decoder legs have to be told the same thing or the pass compares
-# one ISA against another.  Capstone: one mode bit.  LLVM: the RV64 base
-# without the +c that would imply Zcd, plus the Zc* subsets that Zcmp needs.
-CS_MODE_ADD = 'zcmp'
+# THE TRACER ARM NEEDS A SECOND SLED CAPTURE, ON THIS CPU MODEL.
+#
+# The tracer arm used to be `isaxcheck --cs-mode-add=zcmp`: one Capstone mode
+# bit, set on a host decoder.  That binary is gone, and the successor reads a
+# real QEMU translation out of a sled capture -- so the configuration that used
+# to be a decoder flag is now a GUEST CPU, and the eight encodings have to be
+# translated by an emulator that decodes them as Zcmp.
+#
+# `zcd=false` ALONE IS NOT ENOUGH, and the reason is in QEMU's source rather
+# than in anything this file can assert.  `trans_c_fsd` guards on
+# REQUIRE_ZCD_OR_DC (target/riscv/insn_trans/trans_rvd.c.inc:34-40), which
+# accepts ext_zcd OR (RVD and RVC together); insn16.decode:191-205 puts
+# `c_fsd` ahead of the Zcmp group in the same overlap group, so on any model
+# that still has plain C, c.fsdsp answers first and cm.push is never reached.
+# MEASURED on this host at 4922233d5f, sled capture over the eight
+# representatives: with `rv64,zcmp=true,zcmt=true,zcd=false` all eight came
+# back `c_fsd`/GEN_OP_STORE; with the model below all eight came back as their
+# own rules -- cm_push, cm_pop, cm_popret, cm_popretz, cm_mva01s, cm_mvsa01
+# and cm_jalt (twice, cm.jt being the index < 32 arm of the same rule).
+#
+# So C is dropped and Zca named directly, which is what the extension's own
+# prerequisite is, and what leaves the Zcmp patterns reachable.
+QEMU_CPU = 'rv64,c=false,zca=true,zcmp=true,zcmt=true,zcd=false'
+
+# The reference decoder is told the same thing, or the pass compares one ISA
+# against another: the RV64 base without the +c that would imply Zcd, plus the
+# Zc* subsets Zcmp needs.
 LLVM_MATTR = ('+64bit,+i,+m,+a,+f,+d,+zca,+zcb,+zcmp,+zcmt,'
               '+zicsr,+zifencei')
 

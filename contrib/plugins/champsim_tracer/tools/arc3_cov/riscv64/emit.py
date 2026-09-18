@@ -19,47 +19,70 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, 'attrib'))
 import zcmp_profile as ZC
+import llvm_arm as LLVM
 
 rows = json.load(open(os.path.join(ROOT, 'rows.json')))
 SAIL_SHA = 'ac2a585506aad46b088b3594e56b8c21c52e297e'
 ISAX = os.environ.get('CST_ISAXCHECK',
                       '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov/sled_fields.py')
+LLVMOPS = os.environ.get('CST_RV_LLVMOPS', LLVM.DEFAULT_PROBE)
 
 
 def reprobe(rows):
-    """Re-decode every representative encoding with the tool as it is now.
+    """Re-decode every representative encoding with the tools as they are now.
 
     Returns the list of rows whose decode status moved since rows.json, which
     the caller prints: a silent refresh would replace one invisible staleness
-    with another."""
-    inp = '\n'.join(r['hex'] for r in rows) + '\n'
-    seen = {}
-    for layer in ('boundary', 'fields'):
-        p = subprocess.run([ISAX, '--isa=riscv64', '--layer=' + layer, '--batch'],
-                           input=inp, capture_output=True, text=True)
-        if p.returncode != 0:
-            raise SystemExit('isaxcheck --layer=%s failed rc=%d\n%s'
-                             % (layer, p.returncode, p.stderr[-2000:]))
-        for row in csv.DictReader(p.stdout.splitlines(), delimiter='\t'):
-            seen.setdefault(row['hex'], {}).update(row)
+    with another.
+
+    TWO ARMS, TWO SOURCES, AND NEITHER IS CAPSTONE ANY MORE (FINDING 246-C).
+    This used to be one call -- `isaxcheck --layer=boundary` then
+    `--layer=fields` -- and the boundary layer carried Capstone's columns
+    (`b_*`) beside LLVM MC's (`l_*`).  isaxcheck went with Capstone at
+    c32824defa and the leg has refused ever since.  The decode-boundary arm is
+    now LLVM MC itself (llvm_arm.py over the reference corpus's own probe
+    binary) and the tracer arm is the sled (sled_fields.py over a real QEMU
+    translation), which is what the `b_*` columns now mean:
+
+        hex_ok / b_ok  -- LLVM MC decoded the encoding
+        hex_sz         -- the length LLVM MC decoded
+        b_mnem         -- the mnemonic LLVM MC printed
+        b_ops          -- the operand text LLVM MC printed
+
+    The names are kept because six downstream readers spell them, and what
+    they now hold is stated here and in opcodes_full.tsv's own column header.
+    """
+    hexes = [r['hex'] for r in rows]
+    boundary = LLVM.run(LLVMOPS, hexes)
+    inp = '\n'.join(hexes) + '\n'
+    p = subprocess.run([ISAX, '--isa=riscv64', '--layer=fields', '--batch'],
+                       input=inp, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit('sled_fields --layer=fields failed rc=%d\n%s'
+                         % (p.returncode, p.stderr[-2000:]))
+    fields = {row['hex']: row
+              for row in csv.DictReader(p.stdout.splitlines(), delimiter='\t')}
     moved = []
     for r in rows:
-        d = seen.get(r['hex'])
-        if d is None:
-            raise SystemExit('isaxcheck returned no row for %s' % r['hex'])
+        b = boundary.get(r['hex'].lower())
+        f = fields.get(r['hex'])
+        if b is None or f is None:
+            raise SystemExit('no %s row for %s'
+                             % ('boundary' if b is None else 'fields', r['hex']))
+        text = b['text']
+        mnem = text.split(' ', 1)[0] if text else ''
+        ops = text.split(' ', 1)[1] if ' ' in text else ''
         was = (int(bool(r['b_ok'])), int(bool(r['l_ok'])), int(r['fields_ok']))
-        now = (1 if d['b_ok'] == '1' else 0,
-               1 if d['l_ok'] == '1' else 0,
-               1 if d.get('f_ok') == '1' else 0)
+        now = (b['ok'], b['ok'], 1 if f.get('f_ok') == '1' else 0)
         if was != now:
             moved.append((r['node'], r['mnemonic'], r['hex'], was, now,
-                          d['b_mnem'], d['l_text']))
+                          mnem, text))
         r['b_ok'] = bool(now[0]); r['l_ok'] = bool(now[1])
         r['hex_ok'] = now[0]; r['fields_ok'] = now[2]
-        r['hex_sz'] = int(d['b_sz'] or 0)
-        r['b_mnem'] = d['b_mnem']; r['l_text'] = d['l_text']
-        if d.get('b_ops'):
-            r['b_ops'] = d['b_ops']
+        r['hex_sz'] = b['sz']
+        r['b_mnem'] = mnem; r['l_text'] = text
+        if ops:
+            r['b_ops'] = ops
     return moved
 
 
@@ -103,30 +126,30 @@ def reseat_vm(rows):
     if not cand:
         return [], []
     want = [(r, r['word'] & ~(1 << VM_BIT)) for r in cand]
-    inp = '\n'.join(w.to_bytes(4, 'little').hex() for _, w in want) + '\n'
-    p = subprocess.run([ISAX, '--isa=riscv64', '--layer=boundary', '--batch'],
-                       input=inp, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise SystemExit('isaxcheck refused the vm re-seat batch rc=%d\n%s'
-                         % (p.returncode, p.stderr[-2000:]))
-    got = {row['hex']: row
-           for row in csv.DictReader(p.stdout.splitlines(), delimiter='\t')}
+    # THE ACCEPTANCE RULE IS THE REFERENCE DECODER'S, AND IT IS LLVM MC's.
+    # This asked the retired isaxcheck's boundary layer, which answered with
+    # Capstone and LLVM together; the binary is gone (FINDING 246-C) and the
+    # rule quoted above -- "the variant is taken only when LLVM reads it as
+    # the SAME MNEMONIC at the SAME LENGTH" -- was always LLVM's alone, so it
+    # is asked of LLVM directly.
+    got = LLVM.run(LLVMOPS,
+                   [w.to_bytes(4, 'little').hex() for _, w in want])
     moved, refused = [], []
     for r, w in want:
         h = w.to_bytes(4, 'little').hex()
         d = got.get(h)
         if d is None:
-            raise SystemExit('isaxcheck returned no row for %s' % h)
-        same = (d['l_ok'] == '1'
-                and d['l_text'].split()[:1] == r['l_text'].split()[:1]
-                and int(d['l_sz'] or 0) == 4)
+            raise SystemExit('the LLVM arm returned no row for %s' % h)
+        same = (d['ok'] == 1
+                and d['text'].split()[:1] == r['l_text'].split()[:1]
+                and d['sz'] == 4)
         if not same:
             refused.append((r['node'], r['mnemonic'], h,
-                            d['l_text'] or '(no LLVM decode)'))
+                            d['text'] or '(no LLVM decode)'))
             continue
         r['word'] = w
         r['hex'] = h
-        moved.append((r['node'], r['mnemonic'], r['hex'], d['l_text']))
+        moved.append((r['node'], r['mnemonic'], r['hex'], d['text']))
     return moved, refused
 
 
@@ -217,9 +240,10 @@ for r in rows:
         if 'Zabha' in e or (r['node'] == 'AMO'):
             excl.append(excluded(r, 'zabha',
                         'Zabha (byte/halfword AMO): QEMU implements it '
-                        '(target/riscv/insn_trans/trans_rvzabha.c.inc) but neither the '
-                        'Capstone 6.0.0-Alpha7 RISCV mode set nor the LLVM-18 mattr list '
-                        'in isaxcheck carries Zabha -- decode-boundary gap, not an ISA gap'))
+                        '(target/riscv/insn_trans/trans_rvzabha.c.inc) but the '
+                        'reference decoder does not -- LLVM 18 names no Zabha '
+                        'feature at all, so llvm_arm.py cannot ask for one -- '
+                        'decode-boundary gap, not an ISA gap'))
         elif 'Zvabd' in e:
             excl.append(excluded(r, 'zvabd',
                         'Zvabd (draft vector abs-diff): not in QEMU, not in either decoder'))
@@ -272,15 +296,18 @@ with open(os.path.join(ROOT, 'opcodes.tsv'), 'w') as fh:
 
 with open(os.path.join(ROOT, 'opcodes_full.tsv'), 'w') as fh:
     fh.write('opcode_id\tmnemonic\thex\tsource_table\textension\tsail_node\t'
-             'decoded_size\tcapstone_mnemonic\tllvm_text\tfields_layer_ok\tfamily\t'
+             'decoded_size\tllvm_mnemonic\tllvm_text\tfields_layer_ok\tfamily\t'
              'profile\tnote\n')
     for r in incl:
         note = ''
         if r['b_mnem'].strip().lower() != r['mnemonic'].lower():
             note = 'decoder prints alias/base form'
         if r['node'] in ('SSPUSH', 'SSPOPCHK', 'SSRDP', 'C_SSPUSH', 'C_SSPOPCHK'):
-            note = ('decode boundary resolves this to its Zimop/Zcmop base encoding: '
-                    'Zicfiss is not enabled in the Capstone mode set / LLVM mattr list')
+            note = ('decode boundary resolves this to its Zimop/Zcmop base '
+                    'encoding: Zicfiss IS in llvm_arm.py\'s feature string '
+                    '(+experimental-zicfiss) and LLVM 18 still prints the base '
+                    'form, so the resolution is the reference decoder\'s and '
+                    'not a feature this leg forgot to enable')
         if r['node'] in ('ZIMOP_MOP_R', 'ZIMOP_MOP_RR', 'ZCMOP'):
             note = 'hint-number field is generic (C3): one row covers all mop numbers'
         fh.write('%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%d\t%s\t%s\t%s\n' % (
@@ -335,15 +362,17 @@ man = {
     'opcodes_excluded_rows': len(excl),
     'exclusion_reason_counts': dict(RCOUNT),
     'profiles': {
-        ZC.BASE_PROFILE: {'cs_mode_add': None, 'llvm_mattr': 'kIsaTable riscv64 row',
+        ZC.BASE_PROFILE: {'qemu_cpu': 'the sled default (CST_IDENT_CPU)',
+                          'llvm_mattr': 'the llvm_arm.py riscv64 feature string',
                           'reference': 'Sail-RISCV'},
-        ZC.PROFILE: {'cs_mode_add': ZC.CS_MODE_ADD, 'llvm_mattr': ZC.LLVM_MATTR,
+        ZC.PROFILE: {'qemu_cpu': ZC.QEMU_CPU, 'llvm_mattr': ZC.LLVM_MATTR,
                      'reference': 'QEMU target/riscv translation (R6); Sail has '
                                   'no clause for Zcmp/Zcmt and LLVM MC models no '
                                   'register traffic for them'},
     },
     'rv32_only_clauses': len(rv32),
-    'verification': 'isaxcheck --isa=riscv64 --hex=<bytes> run once per row, plus --batch',
+    'verification': 'llvm_arm.py over bin_llvm_ops (LLVM MC 18) for the decode\n'
+                    'boundary, plus sled_fields.py --layer=fields for the tracer arm',
     'ext_histogram': dict(collections.Counter(ext_of(r) for r in incl).most_common()),
     'family_histogram': dict(collections.Counter(family_of(r) for r in incl).most_common()),
 }

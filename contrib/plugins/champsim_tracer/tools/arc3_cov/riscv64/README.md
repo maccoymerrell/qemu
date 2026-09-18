@@ -37,22 +37,23 @@ no row ends the run: a justification nobody can check is how `ssamoswap.w` and
 
 ## Profiles
 
-The riscv64 opcode space is not enumerable in one decoder configuration.
-Zcmp and Zcmt occupy the compressed FP-store encodings, so they are mutually
-exclusive with the Zcd that C+D implies -- QEMU refuses to build a CPU with
-both (`target/riscv/tcg/tcg-cpu.c:767`) and forcing Capstone's
-`CS_MODE_RISCV_ZCMP_ZCMT_ZCE` on top of the RV64GC mode rewrites 331 correct
-decodes.  They are not out of the tracer's scope either: `cap_mode_riscv()`
-turns a `zcmp` / `zcmt` / `zce` token in the guest ELF's `Tag_RISCV_arch` into
-exactly that mode bit.
+The riscv64 opcode space is not enumerable on one CPU model.  Zcmp and Zcmt
+occupy the compressed FP-store encodings, so they are mutually exclusive with
+the Zcd that C+D implies, and QEMU refuses to build a CPU with both
+(`target/riscv/tcg/tcg-cpu.c:767`).  Turning Zcd off is not enough on its own:
+`trans_c_fsd` guards on `REQUIRE_ZCD_OR_DC`
+(`target/riscv/insn_trans/trans_rvd.c.inc:34`), which also accepts plain C
+with D, and `insn16.decode` puts `c_fsd` ahead of the Zcmp group -- so the
+model has to drop C and name Zca directly.
 
-So `opcodes.tsv` carries a `profile` column and `compare.py` runs one
-`--batch` pass per profile:
+So `opcodes.tsv` carries a `profile` column, each profile gets its OWN sled
+capture on its own guest CPU, and `compare.py` runs one `--batch` pass per
+capture:
 
-| profile | rows | decoder | reference |
+| profile | rows | tracer arm | reference |
 | --- | ---: | --- | --- |
-| `rv64gc` | 1062 | the shipped `kIsaTable` riscv64 row | Sail-RISCV |
-| `zcmp` | 8 | `--cs-mode-add=zcmp` plus the matching `--mattr` | QEMU's own translation (R6) |
+| `rv64gc` | 1062 | the leg's base sled capture | Sail-RISCV |
+| `zcmp` | 8 | a second capture on `rv64,c=false,zca=true,zcmp=true,zcmt=true,zcd=false` | QEMU's own translation (R6) |
 
 Sail has no clause for either extension and LLVM MC, though it decodes all
 eight once told `+zcmp,+zcmt`, models none of their register traffic -- its

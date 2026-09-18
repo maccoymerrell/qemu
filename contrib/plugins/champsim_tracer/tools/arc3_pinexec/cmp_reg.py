@@ -488,6 +488,198 @@ def has_seg_prefix(enc):
     return enc.startswith('64') or enc.startswith('65')
 
 
+# --------------------------------------------------- SET ADJUDICATION RULES
+#
+# A SET row where the two instruments name different registers is a
+# DISAGREEMENT by default and is counted.  A rule may take one out of the
+# count, and only on a basis this file can CHECK from the row itself -- the
+# encoding's own bytes and the two sets -- plus a stated fact about the
+# architecture or about this emulator that a reader can go and verify.
+#
+# WHAT A RULE IS NOT.  It is not a family sweep and it is not an allowlist.
+# Each rule below names ONE shape, tests that shape exactly, and REFUSES the
+# moment the row is a hair different: a DIV row whose reference-only set is
+# {flags, rax} is not this rule's subject and stays counted.  A rule that
+# claimed a family would hide the next real defect in it, which is the
+# failure this project has met before.
+#
+# The rules are applied BEFORE the direction is decided, and a row a rule
+# claims is reported with the rule's NAME in its own column, so a reader sees
+# which rows left the count and why rather than seeing them vanish.
+
+
+def _x86_split(enc):
+    """(rex, opcode bytes, modrm) for @enc, or None if the shape is not one
+    this file decodes.
+
+    Deliberately narrow: legacy prefixes, one optional REX, then either a
+    one-byte opcode or the 0F escape and a second byte, then modrm.  Anything
+    else -- VEX, EVEX, a second escape, a truncated string -- returns None and
+    the caller's rule does not fire.  Refusing to decode is the safe
+    direction: the row stays counted."""
+    LEGACY = {0x66, 0x67, 0x2e, 0x36, 0x3e, 0x26, 0x64, 0x65, 0xf0, 0xf2, 0xf3}
+    try:
+        b = bytes.fromhex(enc)
+    except ValueError:
+        return None
+    i = 0
+    while i < len(b) and b[i] in LEGACY:
+        i += 1
+    rex = 0
+    if i < len(b) and 0x40 <= b[i] <= 0x4f:
+        rex = b[i]
+        i += 1
+    if i >= len(b):
+        return None
+    if b[i] == 0x0f:
+        if i + 1 >= len(b):
+            return None
+        op = (0x0f, b[i + 1])
+        i += 2
+    else:
+        op = (b[i],)
+        i += 1
+    if i >= len(b):
+        return None
+    return (rex, op, b[i])
+
+
+def _x86_prefixes(enc):
+    """The legacy prefix bytes at the head of @enc, as a set."""
+    LEGACY = {0x66, 0x67, 0x2e, 0x36, 0x3e, 0x26, 0x64, 0x65, 0xf0, 0xf2, 0xf3}
+    try:
+        b = bytes.fromhex(enc)
+    except ValueError:
+        return set()
+    out = set()
+    for x in b:
+        if x not in LEGACY:
+            break
+        out.add(x)
+    return out
+
+
+def rule_div_undefined_flags(enc, only_p, only_q):
+    """DIV/IDIV: the reference names a flags DESTINATION the architecture
+    leaves undefined and this emulator does not write.
+
+    THE SHAPE, tested exactly: the reference's unmatched destination set is
+    {flags} and nothing else, the tracer's is empty, and the encoding is
+    group 3 -- opcode F6 or F7 -- with modrm.reg 6 (DIV) or 7 (IDIV).  The
+    modrm test is what separates DIV from the seven other instructions that
+    share those two opcode bytes; NOT, NEG, MUL and IMUL all define their
+    flags and none of them may reach this rule.
+
+    THE BASIS, both halves checkable:
+
+      * THE ARCHITECTURE.  Intel SDM Vol. 2A, DIV and IDIV: "The CF, OF, SF,
+        ZF, AF, and PF flags are undefined."  There is no architectural value
+        for either instrument to be right or wrong about.  PIN reports what
+        the silicon left behind, which is a fact about this host's CPU and
+        not about the program.
+
+      * THIS EMULATOR, in its own words.  target/i386/tcg/emit.c.inc,
+        note_div_regs(): "The flags are deliberately not named: gen_DIV sets
+        no cc_op, so the previous comparison's flags survive the divide, and
+        saying otherwise would publish a write QEMU does not perform."  The
+        tracer names no flags destination because QEMU performs no flags
+        write, which is a correct account of this emulator's execution.
+
+    So the two instruments disagree about a field the architecture declines
+    to define.  That is not a dependency the trace is missing.
+
+    Returns the rule name when it fires, else None."""
+    if only_p != ['flags'] or only_q:
+        return None
+    sp = _x86_split(enc)
+    if sp is None:
+        return None
+    _rex, op, modrm = sp
+    if op not in ((0xf6,), (0xf7,)):
+        return None
+    if ((modrm >> 3) & 7) not in (6, 7):
+        return None
+    return 'R-DIV-UNDEF-FLAGS'
+
+
+#: The one self-zeroing encoding this corpus contains, and the operand-name
+#: prefix its register is published under.  ONE opcode, named here rather
+#: than a family: `xor r,r`, `sub r,r` and `pcmpeq x,x` are the same idiom
+#: and are NOT covered, because none of them has a row in this leg and a rule
+#: written for rows that do not exist cannot be checked against anything.
+#: A future row on one of them is UNACCOUNTED and gets its own merits read.
+SELFZERO_OPS = {(0x0f, 0xef): ('vec', 0x66)}      # 66 0F EF: PXOR
+
+
+def rule_selfzero_operand(enc, only_p, only_q):
+    """PXOR with one register written twice: the operand supplies no bit of
+    the result, so it is not a source.
+
+    THE SHAPE, tested exactly: the reference's unmatched source set is one
+    register name, the tracer's is empty, the encoding is 66 0F EF in
+    register form (modrm.mod == 3), the two register operands are the SAME
+    register once REX.R and REX.B are applied, and the name the reference is
+    missing is that register's.  Any other operand pair, any other opcode,
+    any second unmatched name, and the rule does not fire.
+
+    THE BASIS.  PXOR computes a bitwise exclusive-or of its two operands.
+    With both operands the same register every result bit is x ^ x = 0 for
+    every x, so no bit of the destination is a function of the register's
+    contents and the register is not an input to the value produced.  A
+    consumer told it were one would build a read-after-write edge on a value
+    that does not flow, and would serialise against a producer this
+    instruction does not wait for.
+
+    The reference lists it because its operand list is the ENCODING's operand
+    positions, which is a different question from what the result depends on.
+    Naming both is right for a disassembler and wrong for a dependence graph.
+
+    Returns the rule name when it fires, else None."""
+    if only_q or len(only_p) != 1:
+        return None
+    sp = _x86_split(enc)
+    if sp is None:
+        return None
+    rex, op, modrm = sp
+    ent = SELFZERO_OPS.get(op)
+    if ent is None:
+        return None
+    prefix, need_pfx = ent
+    if need_pfx not in _x86_prefixes(enc):
+        return None
+    if (modrm >> 6) != 3:
+        return None
+    reg = ((rex >> 2) & 1) << 3 | ((modrm >> 3) & 7)
+    rm = (rex & 1) << 3 | (modrm & 7)
+    if reg != rm:
+        return None
+    if only_p[0] != '%s%d' % (prefix, reg):
+        return None
+    return 'R-SELFZERO-OPERAND'
+
+
+#: The SET rules, in the order they are tried.  Each takes (enc, only_p,
+#: only_q) and answers its own name or None.  `axis` selects which side of
+#: the comparison a rule may speak for: a destination rule must never be
+#: consulted about a source row.
+SET_RULES = {
+    'srcset': (rule_selfzero_operand,),
+    'dstset': (rule_div_undefined_flags,),
+}
+#: Every row a rule claimed, keyed by (rule, axis, enc, ref_only).  Printed
+#: whole: a rule whose firings are not enumerated is an allowlist.
+ruled = collections.Counter()
+
+
+def set_rule_for(axis, enc, only_p, only_q):
+    for fn in SET_RULES.get(axis, ()):
+        name = fn(enc, only_p, only_q)
+        if name:
+            ruled[(name, axis, enc, ','.join(only_p))] += 1
+            return name
+    return None
+
+
 #: Registers the KERNEL wrote across a syscall and no instruction published.
 #: qemu-user performs the write in the CPU loop, outside the translated
 #: instruction stream, so the tracer has no observation point for it and the
@@ -874,9 +1066,15 @@ for pos, (pi, qj) in enumerate(pairs):
             direction = 'TRACER-SUPERSET'
         else:
             direction = 'UNACCOUNTED'
+        # A rule may take a row out of the count, and only on the exact shape
+        # it tested.  Applied after the difference is computed, so what a
+        # rule sees is the same set difference the report prints.
+        rule = set_rule_for(axis, q['b'], only_p, only_q) or ''
+        if rule:
+            direction = 'ORTHOGONAL'
         note(setsig, axis,
              (q['b'], q['c'], 'ref_only=' + ','.join(only_p),
-              'tracer_only=' + ','.join(only_q), direction), qj)
+              'tracer_only=' + ','.join(only_q), direction, rule), qj)
 
     # ---- axis 4: SOURCE VALUES, against the tracer's own shadow file ----
     # Scored FIRST: whether this instruction's inputs already differed
@@ -966,6 +1164,21 @@ for pos, (pi, qj) in enumerate(pairs):
                 st['dstval_rep_deferred'] += 1
                 note(valsig, 'dstval_rep', (q['b'], q['c'], c,
                                             'REP-DEFERRED-WRITE',
+                                            'ORTHOGONAL'), qj)
+            elif rule_div_undefined_flags(q['b'], [c], []):
+                # THE SAME FACT AS THE SET ROW, NOT A SECOND ONE.
+                #
+                # A destination the tracer does not name has no value to
+                # compare, so DIV's undefined flags arrive here a second time:
+                # once as a set difference and once as "reference has a value,
+                # tracer has none".  Ruling the set row and counting this one
+                # would keep half of one fact in the criterion.  The rule is
+                # re-tested here on THIS register alone, so the shape it
+                # convicted on above is the shape it convicts on here.
+                st['dstval_undefined_field'] += 1
+                ruled[('R-DIV-UNDEF-FLAGS', 'dstval', q['b'], c)] += 1
+                note(valsig, 'dstval_rep', (q['b'], q['c'], c,
+                                            'ARCH-UNDEFINED-FIELD-NO-WRITE',
                                             'ORTHOGONAL'), qj)
             else:
                 st['dstval_tracer_absent'] += 1
@@ -1084,6 +1297,8 @@ say("    reference named the register but captured no value : %d src / %d dst"
     % (st['srcval_ref_absent'], st['dstval_ref_absent']))
 say("    tracer named the destination without a value       : %d"
     % st['dstval_tracer_absent'])
+say("    architecturally UNDEFINED field, no write performed : %d"
+    % st['dstval_undefined_field'])
 say("    REP iteration 1..N-1, write deferred by contract    : %d"
     % st['dstval_rep_deferred'])
 say("    source had no producer on the compared path        : %d"
@@ -1103,10 +1318,11 @@ for kind in ('srcset', 'dstset'):
         continue
     say("  -- %s --" % kind)
     for sig, n in setsig[kind].most_common(A.maxreport):
-        enc, cap, only_p, only_q, direction = sig
+        enc, cap, only_p, only_q, direction, rule = sig
         roll[direction] += n
-        say("    %-18s %-10s %-34s %-34s %-16s %8d"
-            % (enc[:18], cap[:10], only_p[:34], only_q[:34], direction, n))
+        say("    %-18s %-10s %-34s %-34s %-16s %8d  %s"
+            % (enc[:18], cap[:10], only_p[:34], only_q[:34], direction, n,
+               rule))
 for kind in ('refdecode', 'refcap'):
     for sig, n in setsig[kind].most_common(A.maxreport):
         say("    %-18s %-10s %s  %8d" % (sig[0][:18], sig[2][:10], kind, n))
@@ -1126,6 +1342,27 @@ for kind in ('dstval', 'srcval', 'ripsrc', 'dstval_rep'):
 for sig, n in valsig['dstval_absent'].most_common(A.maxreport):
     say("    %-18s %-10s %-10s reference has a value, tracer has none %8d"
         % (sig[0][:18], sig[1][:10], sig[2], n))
+
+say("")
+say("=== EVERY ROW A SET RULE CLAIMED ===")
+say("  A rule takes a row out of the criterion.  Every row it took is")
+say("  printed here, by rule, with the encoding and the reference-only set")
+say("  the rule was shown -- so what left the count can be checked against")
+say("  the rule's own stated shape rather than taken on trust.  A rule with")
+say("  no rows below is INERT on this corpus and proves nothing.")
+say("")
+say("  %-22s %-8s %-18s %-24s %8s"
+    % ('RULE', 'AXIS', 'ENCODING', 'REF-ONLY', 'ROWS'))
+for (rname, raxis, renc, rref), n in sorted(ruled.items()):
+    say("  %-22s %-8s %-18s %-24s %8d"
+        % (rname, raxis, renc[:18], rref[:24], n))
+if not ruled:
+    say("  (no rule fired)")
+say("")
+say("  rules DEFINED and how many rows each claimed:")
+for rname in sorted(set(['R-DIV-UNDEF-FLAGS', 'R-SELFZERO-OPERAND'])):
+    tot = sum(n for k, n in ruled.items() if k[0] == rname)
+    say("    %-22s %8d%s" % (rname, tot, '   INERT' if not tot else ''))
 
 say("")
 say("=== SYSCALL REGISTER EFFECTS, PER INSTANCE ===")

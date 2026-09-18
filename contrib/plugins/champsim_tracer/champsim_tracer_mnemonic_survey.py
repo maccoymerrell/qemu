@@ -95,9 +95,28 @@ def parse_header(path):
         )
         m = pat.search(text)
         if not m:
-            print(f"WARNING: could not find table {tname}", file=sys.stderr)
-            tables[isa] = (set(), {}, id_to_name)
-            continue
+            # An absent table is a REFUSAL, never an empty one.  Substituting
+            # an empty set here used to let every caller carry on and compare
+            # its answers against nothing -- a zero over an empty population,
+            # which reads exactly like agreement.  The validator's Classifier
+            # is one of those callers, and it describes itself as matching
+            # "exactly what the plugin does in C".
+            #
+            # The per-ISA classification tables were retired with the rest of
+            # the Capstone tables: the plugin no longer classifies from a
+            # Capstone instruction id at all.  The word comes from the
+            # target's own decode rule and is given meaning by
+            # champsim_tracer_vocabulary.cc; the Capstone side of the
+            # comparison is the offline referee, tools/cst_referee.py.  So
+            # there is no table to find and no honest empty answer either.
+            raise SystemExit(
+                f"{tname} does not exist in this tree: the per-ISA Capstone "
+                f"classification tables were retired.  The plugin's word "
+                f"comes from the target's decode rule via "
+                f"champsim_tracer_vocabulary.cc, and the Capstone column of "
+                f"the comparison is tools/cst_referee.py.  Refusing rather "
+                f"than returning an empty classification set."
+            )
 
         body = m.group(1)
         known_ids = set()

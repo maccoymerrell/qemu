@@ -131,12 +131,19 @@ enum GenericOpcode {
     GEN_OP_TLB_FLUSH = 61,
     GEN_OP_VEC_PREFETCH = 62,
     /*
-     * Coarse fallback latency buckets for external trace writers
-     * lacking ISA-specific opcode metadata.  The in-tree tracer never
-     * emits these (every Capstone-classified insn gets a specific
-     * opcode above), but consumers should handle them so foreign
-     * traces decode.  SHORT = single-cycle ALU; LONG = long-latency
+     * Coarse latency buckets: the home for an operation that runs on a
+     * named unit and is none of the named operations on it, and the
+     * fallback an external trace writer without per-instruction opcode
+     * metadata can emit.  SHORT = single-cycle ALU; LONG = long-latency
      * unit (multiplier, divider, vector pipe, ...).
+     *
+     * THE IN-TREE TRACER DOES EMIT TWO OF THESE, and the earlier note
+     * here saying it never emits any is corrected rather than left:
+     * the vocabulary's fp.neg and fp.abs (x87 FCHS/FABS -- a sign edit
+     * in the FP unit, which is not a move and not one of the FP
+     * arithmetic classes) carry FP_ALU_SHORT, and fp.transcendental
+     * (F2XM1, FYL2X, FYL2XP1, FPTAN, FPATAN, FSIN, FCOS, FSINCOS)
+     * carries FP_ALU_LONG.  The other four have no in-tree producer.
      */
     GEN_OP_INT_ALU_SHORT = 63,
     GEN_OP_INT_ALU_LONG  = 64,

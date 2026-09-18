@@ -33,6 +33,14 @@ eip	REG_IP	arch-role: the program counter
 es_base	REG_SEG2	segment base: the segment it belongs to
 esi	REG_GPR4	dense-gpr: the 32-bit spelling of the same register
 esp	REG_SP	arch-role: the stack pointer
+fpcs	REG_SYS	x87 exception pointer: machine state saved for a handler, not a value the program computes with
+fpdp	REG_SYS	x87 exception pointer: machine state saved for a handler, not a value the program computes with
+fpds	REG_SYS	x87 exception pointer: machine state saved for a handler, not a value the program computes with
+fpip	REG_SYS	x87 exception pointer: machine state saved for a handler, not a value the program computes with
+fpstt	REG_FCSR	x87 control/status file: TOP is FSW bits 13:11, which QEMU keeps in its own word
+fptag	REG_FCSR	x87 control/status file: FTW, one register the architecture spells as two bits per slot
+fpuc	REG_FCSR	x87 control/status file: the control word
+fpus	REG_FCSR	x87 control/status file: the status word
 fs_base	REG_SEG3	segment base: the segment it belongs to
 gs_base	REG_SEG4	segment base: the segment it belongs to
 k0	REG_PRED0	AVX-512 mask register index

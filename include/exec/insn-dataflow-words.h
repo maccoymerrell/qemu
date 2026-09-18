@@ -90,6 +90,24 @@
 #define INSN_DF_WORD_FP_CMP       "fp.cmp"
 #define INSN_DF_WORD_FP_MADD      "fp.madd"
 #define INSN_DF_WORD_FP_MSUB      "fp.msub"
+/*
+ * A sign edit, and the long-latency operations that are none of the above.
+ *
+ * fp.neg and fp.abs are separate words rather than one "fp.signop" because
+ * they compute different values and every target that has one has both --
+ * aarch64 FNEG/FABS, RISC-V fneg.d/fabs.d (the fsgnj family), MIPS neg.d/
+ * abs.d, x87 FCHS/FABS.  Neither is a move: the value changes.
+ *
+ * fp.transcendental is one word for a family whose members differ in what
+ * they compute and agree in everything a consumer schedules on -- they run
+ * on the same unit, for tens to hundreds of cycles, over the same operands.
+ * Splitting it per function would put fsin, fcos, f2xm1 and fyl2x in the
+ * vocabulary as four rows that no consumer distinguishes, which is the
+ * fragmentation this list is kept short to avoid.
+ */
+#define INSN_DF_WORD_FP_NEG       "fp.neg"
+#define INSN_DF_WORD_FP_ABS       "fp.abs"
+#define INSN_DF_WORD_FP_TRANSCENDENTAL "fp.transcendental"
 
 #define INSN_DF_WORD_VEC_ADD      "vec.add"
 #define INSN_DF_WORD_VEC_SUB      "vec.sub"

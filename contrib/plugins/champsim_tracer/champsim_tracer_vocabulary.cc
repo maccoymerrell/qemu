@@ -71,6 +71,19 @@ const VocabularyRow rows[] = {
     { INSN_DF_WORD_CMOV,         GEN_OP_CMOV,         BRANCH_NONE },
     { INSN_DF_WORD_CMP,          GEN_OP_CMP,          BRANCH_NONE },
     { INSN_DF_WORD_FENCE,        GEN_OP_FENCE,        BRANCH_NONE },
+    /*
+     * fp.abs and fp.neg land on the coarse short-latency FP bucket, and
+     * fp.transcendental on the long one.  Those two opcodes were minted for
+     * an external trace writer with no per-instruction metadata, and the
+     * enum's comment said the in-tree tracer never emits them; it does now,
+     * and the comment is corrected where it stands.  They are the right
+     * homes: a sign edit is a single-cycle operation in the FP unit that is
+     * none of the named arithmetic classes, and an x87 transcendental is a
+     * long-latency one that is none of them either.  Minting a new opcode
+     * for either would add a wire value for a distinction only one ISA
+     * makes.
+     */
+    { INSN_DF_WORD_FP_ABS,       GEN_OP_FP_ALU_SHORT, BRANCH_NONE },
     { INSN_DF_WORD_FP_ADD,       GEN_OP_FP_ADD,       BRANCH_NONE },
     { INSN_DF_WORD_FP_CMP,       GEN_OP_FP_CMP,       BRANCH_NONE },
     { INSN_DF_WORD_FP_CVT,       GEN_OP_FP_CVT,       BRANCH_NONE },
@@ -79,8 +92,11 @@ const VocabularyRow rows[] = {
     { INSN_DF_WORD_FP_MOV,       GEN_OP_FP_MOV,       BRANCH_NONE },
     { INSN_DF_WORD_FP_MSUB,      GEN_OP_FP_MSUB,      BRANCH_NONE },
     { INSN_DF_WORD_FP_MUL,       GEN_OP_FP_MUL,       BRANCH_NONE },
+    { INSN_DF_WORD_FP_NEG,       GEN_OP_FP_ALU_SHORT, BRANCH_NONE },
     { INSN_DF_WORD_FP_SQRT,      GEN_OP_FP_SQRT,      BRANCH_NONE },
     { INSN_DF_WORD_FP_SUB,       GEN_OP_FP_SUB,       BRANCH_NONE },
+    { INSN_DF_WORD_FP_TRANSCENDENTAL,
+                                 GEN_OP_FP_ALU_LONG,  BRANCH_NONE },
     { INSN_DF_WORD_INT_ADD,      GEN_OP_INT_ADD,      BRANCH_NONE },
     { INSN_DF_WORD_INT_DEC,      GEN_OP_DEC,          BRANCH_NONE },
     { INSN_DF_WORD_INT_DIV,      GEN_OP_INT_DIV,      BRANCH_NONE },

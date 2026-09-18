@@ -2809,6 +2809,622 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
 
 #include "emit.c.inc"
 
+/*
+ * The x87 state, named.
+ *
+ * WHAT ST(i) IS, AND WHY THE NAME IS THE STACK-RELATIVE ONE.  QEMU models the
+ * x87 data registers exactly as the hardware does: fpregs[8] is a physical
+ * file and fpstt is the top-of-stack pointer, so `ST(n)` is the macro
+ * `fpregs[(fpstt + n) & 7]` (fpu_helper.c) -- an element chosen by a register
+ * VALUE at execution, not by the encoding.  The encoding carries n.
+ *
+ * So a decode site has two candidate names and can only supply one of them.
+ * The physical slot is the one a consumer would rather join on, and it is not
+ * available here: it is a function of fpstt, which no translation knows, and
+ * the wire's templates are per-encoding and invariant across executions, so a
+ * field that varies per execution cannot live in one.  The stack-relative
+ * name IS available, is what the encoding says, is what the SDM's own
+ * Operation sections say -- FLD's destination is ST(0) AFTER the push, which
+ * is why the FLD arm below names 0 and not the (opreg + 1) QEMU passes the
+ * helper -- and is what every reference decoder publishes, so the external
+ * comparison is against the same name rather than against a spelling nothing
+ * else uses.
+ *
+ * THE COST IS REAL AND IT IS NOT HIDDEN.  A consumer that joins ST names
+ * without tracking the top of stack joins the wrong producer across a push or
+ * a pop: two `fld`s both write "st0" and are not a WAW, and a value parked in
+ * ST(0) before a push is read as ST(1) after it.  What makes that recoverable
+ * rather than lost is that the selector is on the wire too: every arm below
+ * that indexes the stack names fpstt as a source, and every arm that moves
+ * the top names it as a destination, so the top-of-stack chain a consumer
+ * needs in order to resolve the names the way hardware's rename stage does is
+ * published beside them.  Naming the whole file instead would be sound and
+ * would serialise every x87 instruction against every other one; that is a
+ * coarser answer, not a truer one.
+ *
+ * THE MMX ALIAS IS EXACT, NOT A CONFLATION.  MM(i) is the same storage --
+ * emit.c.inc reaches it at offsetof(CPUX86State, fpregs[reg].mmx) -- and MM(i)
+ * is the PHYSICAL slot i, which would be a second meaning for the same name
+ * if the two could ever disagree.  They cannot: every MMX-unit instruction is
+ * preceded by helper_enter_mmx(), which sets fpstt = 0, and at fpstt == 0
+ * ST(i) and MM(i) are the same register by construction.
+ */
+static const char *const x86_x87_st_names[] = {
+    "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+};
+static const char *const x86_x87_fpstt_names[] = { "fpstt" };
+static const char *const x86_x87_fpus_names[]  = { "fpus" };
+static const char *const x86_x87_fpuc_names[]  = { "fpuc" };
+static const char *const x86_x87_fptag_names[] = { "fptag" };
+static const char *const x86_x87_fpip_names[]  = { "fpip" };
+static const char *const x86_x87_fpcs_names[]  = { "fpcs" };
+static const char *const x86_x87_fpdp_names[]  = { "fpdp" };
+static const char *const x86_x87_fpds_names[]  = { "fpds" };
+
+static void x87_rd(const char *name)
+{
+    insn_dataflow_state_read(insn_df_reg(name));
+}
+
+static void x87_wr(const char *name)
+{
+    insn_dataflow_state_write(insn_df_reg(name));
+}
+
+/* ST(i), in the frame the SDM's Operation section for the instruction uses. */
+static void x87_rd_st(int i)
+{
+    x87_rd(x86_x87_st_names[i & 7]);
+}
+
+static void x87_wr_st(int i)
+{
+    x87_wr(x86_x87_st_names[i & 7]);
+}
+
+/*
+ * The top-of-stack pointer every stack reference is indexed through.
+ *
+ * Stated as a READ on every arm that names an ST operand, because ST(n) is
+ * fpregs[(fpstt + n) & 7] and the instruction genuinely consumes fpstt to
+ * reach its operand.  Without it a consumer has the names and no way to
+ * resolve them.
+ */
+static void x87_top(void)
+{
+    x87_rd("fpstt");
+}
+
+/*
+ * An operation whose helper ends in merge_exception_flags().
+ *
+ * That path is fpu_set_exception(), which ORs the new flags into fpus and
+ * consults fpuc's exception masks to decide whether to raise SE/B -- so the
+ * status word is read-modify-written and the control word is read.  Both are
+ * behind a helper call whose only argument is tcg_env, so neither is visible
+ * in the op stream and both are stated here.
+ */
+static void x87_exc(void)
+{
+    x87_rd("fpuc");
+    x87_rd("fpus");
+    x87_wr("fpus");
+}
+
+/* fpush(): fpstt -= 1, and the entry it lands on is tagged valid. */
+static void x87_push(void)
+{
+    x87_rd("fpstt");
+    x87_wr("fpstt");
+    x87_rd("fptag");
+    x87_wr("fptag");
+}
+
+/* fpop(): the current entry is tagged empty, then fpstt += 1. */
+static void x87_pop(void)
+{
+    x87_push();
+}
+
+/*
+ * The x87 facts the ops cannot carry, stated once per instruction.
+ *
+ * Every effect of an x87 instruction except its memory access is behind a
+ * helper call taking tcg_env and nothing else, so the op stream shows a call
+ * and no operands at all: undeclared and unstated, `faddp %st,%st(1)` reaches
+ * a consumer reading nothing and writing nothing.  These are the facts, taken
+ * from what the helpers in fpu_helper.c actually do.
+ *
+ * THIS MIRRORS gen_x87's OWN SWITCH and must move with it.  It is one table
+ * rather than forty statements scattered through the emitter because what a
+ * reviewer has to check is that each encoding's row is right, and that check
+ * is only possible when the rows sit together.  It is called once, at the end
+ * of gen_x87 and only on the paths that did not goto illegal_op, so an
+ * encoding the decoder declined states nothing.
+ */
+static void x86_df_x87(bool mem, int op, int rm)
+{
+    /* Which of the eight arithmetic forms an fxxx encoding selects. */
+    static const char *const arith_word[8] = {
+        [0] = INSN_DF_WORD_FP_ADD,      /* fadd  */
+        [1] = INSN_DF_WORD_FP_MUL,      /* fmul  */
+        [2] = INSN_DF_WORD_FP_CMP,      /* fcom  */
+        [3] = INSN_DF_WORD_FP_CMP,      /* fcomp */
+        [4] = INSN_DF_WORD_FP_SUB,      /* fsub  */
+        [5] = INSN_DF_WORD_FP_SUB,      /* fsubr */
+        [6] = INSN_DF_WORD_FP_DIV,      /* fdiv  */
+        [7] = INSN_DF_WORD_FP_DIV,      /* fdivr */
+    };
+
+    if (mem) {
+        int op1 = op & 7;
+
+        switch (op) {
+        case 0x00 ... 0x07:     /* fxxxs   m32fp   */
+        case 0x10 ... 0x17:     /* fixxxl  m32int  */
+        case 0x20 ... 0x27:     /* fxxxl   m64fp   */
+        case 0x30 ... 0x37:     /* fixxx   m16int  */
+            /*
+             * The memory operand is converted into QEMU's ft0 scratch and
+             * combined with ST(0).  ft0 is not a register: it is the
+             * emulation's carrier for an operand the architecture never
+             * names, so it is not stated.
+             */
+            insn_dataflow_note_word(arith_word[op1]);
+            x87_top();
+            x87_rd_st(0);
+            x87_exc();
+            if (op1 != 2 && op1 != 3) {
+                x87_wr_st(0);
+            }
+            if (op1 == 3) {     /* fcomp pops */
+                x87_pop();
+            }
+            break;
+
+        case 0x08:              /* flds    m32fp   */
+        case 0x18:              /* fildl   m32int  */
+        case 0x28:              /* fldl    m64fp   */
+        case 0x38:              /* filds   m16int  */
+        case 0x1d:              /* fldt    m80fp   */
+        case 0x3c:              /* fbld    m80bcd  */
+        case 0x3d:              /* fildll  m64int  */
+            /*
+             * A load with the format widening every x87 memory form performs.
+             * The widening is implicit in the access and does not distinguish
+             * these encodings from each other, so the access is the word.
+             */
+            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+            x87_push();
+            x87_wr_st(0);
+            x87_exc();
+            break;
+
+        case 0x19: case 0x1a: case 0x1b:   /* fisttpl, fistl,  fistpl  */
+        case 0x29: case 0x2a: case 0x2b:   /* fisttpll, fstl,  fstpl   */
+        case 0x39: case 0x3a: case 0x3b:   /* fisttps, fists,  fistps  */
+        case 0x0a: case 0x0b:              /* fsts,             fstps  */
+        case 0x1f:                         /* fstpt   m80fp            */
+        case 0x3e:                         /* fbstp   m80bcd           */
+        case 0x3f:                         /* fistpll m64int           */
+            insn_dataflow_note_word(INSN_DF_WORD_STORE);
+            x87_top();
+            x87_rd_st(0);
+            x87_exc();
+            /*
+             * The popping forms: every `p` suffix, plus fisttp, which pops
+             * unconditionally.  0x1f/0x3e/0x3f are fstpt/fbstp/fistpll.
+             */
+            if (op1 == 1 || op1 == 3 || op == 0x1f || op == 0x3e ||
+                op == 0x3f) {
+                x87_pop();
+            }
+            break;
+
+        case 0x0c:              /* fldenv  m14/28byte */
+            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+            x87_wr("fpuc");
+            x87_wr("fpus");
+            x87_wr("fpstt");
+            x87_wr("fptag");
+            break;
+
+        case 0x0d:              /* fldcw   m16 */
+            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+            x87_wr("fpuc");
+            break;
+
+        case 0x0e:              /* fnstenv m14/28byte */
+            insn_dataflow_note_word(INSN_DF_WORD_STORE);
+            x87_rd("fpuc");
+            x87_rd("fpus");
+            x87_rd("fpstt");
+            x87_rd("fptag");
+            break;
+
+        case 0x0f:              /* fnstcw  m16 */
+            insn_dataflow_note_word(INSN_DF_WORD_STORE);
+            x87_rd("fpuc");
+            break;
+
+        case 0x2c:              /* frstor  m94/108byte */
+            /*
+             * The whole file is restored, and stating that costs more
+             * destination slots than the reader has.  It is stated anyway:
+             * the reader's answer to more writes than it can hold is a
+             * refusal a consumer can see, which is the honest result for a
+             * state-restore instruction, and a short list that looked
+             * complete would be the one outcome this layer must not produce.
+             */
+            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+            for (int i = 0; i < 8; i++) {
+                x87_wr_st(i);
+            }
+            x87_wr("fpuc");
+            x87_wr("fpus");
+            x87_wr("fpstt");
+            x87_wr("fptag");
+            break;
+
+        case 0x2e:              /* fnsave  m94/108byte */
+            insn_dataflow_note_word(INSN_DF_WORD_STORE);
+            for (int i = 0; i < 8; i++) {
+                x87_rd_st(i);
+            }
+            x87_rd("fpuc");
+            x87_rd("fpus");
+            x87_rd("fpstt");
+            x87_rd("fptag");
+            /* fsave reinitialises the FPU after writing it out. */
+            x87_wr("fpuc");
+            x87_wr("fpus");
+            x87_wr("fpstt");
+            x87_wr("fptag");
+            break;
+
+        case 0x2f:              /* fnstsw  m16 */
+            insn_dataflow_note_word(INSN_DF_WORD_STORE);
+            x87_rd("fpus");
+            x87_rd("fpstt");
+            break;
+
+        default:
+            break;
+        }
+        return;
+    }
+
+    switch (op) {
+    case 0x08:                  /* fld  st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_MOV);
+        x87_rd_st(rm);          /* the SDM's frame: ST(i) before the push */
+        x87_push();
+        x87_wr_st(0);
+        break;
+
+    case 0x09: case 0x29: case 0x39:    /* fxch st(i), and its two aliases */
+        insn_dataflow_note_word(INSN_DF_WORD_XCHG);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_wr_st(0);
+        x87_wr_st(rm);
+        break;
+
+    case 0x0a:                  /* fnop */
+        insn_dataflow_note_word(INSN_DF_WORD_NOP);
+        x87_rd("fpuc");
+        x87_rd("fpus");
+        break;
+
+    case 0x0c:                  /* d9/4 */
+        switch (rm) {
+        case 0:                 /* fchs */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_NEG);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            break;
+        case 1:                 /* fabs */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_ABS);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            break;
+        case 4:                 /* ftst */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+            x87_top();
+            x87_rd_st(0);
+            x87_exc();
+            break;
+        default:                /* fxam */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd("fptag");
+            x87_rd("fpus");
+            x87_wr("fpus");
+            break;
+        }
+        break;
+
+    case 0x0d:                  /* d9/5: the seven constant loads */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_MOV);
+        x87_push();
+        x87_wr_st(0);
+        x87_exc();
+        break;
+
+    case 0x0e:                  /* d9/6 */
+        switch (rm) {
+        case 0:                 /* f2xm1 */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        case 1:                 /* fyl2x: ST(1) *= log2(ST(0)), then pop */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(1);
+            x87_exc();
+            x87_pop();
+            break;
+        case 2:                 /* fptan: ST(0) = tan(ST(0)), then push 1.0 */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            x87_push();
+            break;
+        case 3:                 /* fpatan: ST(1) = atan(ST(1)/ST(0)), pop */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(1);
+            x87_exc();
+            x87_pop();
+            break;
+        case 4:                 /* fxtract: exponent into ST(0), push sig. */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_CVT);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            x87_push();
+            x87_wr_st(0);
+            break;
+        case 5:                 /* fprem1 */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_DIV);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        case 6:                 /* fdecstp */
+            insn_dataflow_note_word(INSN_DF_WORD_INT_DEC);
+            x87_rd("fpstt");
+            x87_wr("fpstt");
+            x87_rd("fpus");
+            x87_wr("fpus");
+            break;
+        default:                /* fincstp */
+            insn_dataflow_note_word(INSN_DF_WORD_INT_INC);
+            x87_rd("fpstt");
+            x87_wr("fpstt");
+            x87_rd("fpus");
+            x87_wr("fpus");
+            break;
+        }
+        break;
+
+    case 0x0f:                  /* d9/7 */
+        switch (rm) {
+        case 0:                 /* fprem */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_DIV);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        case 1:                 /* fyl2xp1 */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(1);
+            x87_exc();
+            x87_pop();
+            break;
+        case 2:                 /* fsqrt */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_SQRT);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        case 3:                 /* fsincos: sin into ST(0), push cos */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            x87_push();
+            x87_wr_st(0);
+            break;
+        case 4:                 /* frndint */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_CVT);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        case 5:                 /* fscale: ST(0) *= 2^trunc(ST(1)) */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_MUL);
+            x87_top();
+            x87_rd_st(0);
+            x87_rd_st(1);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        default:                /* fsin, fcos */
+            insn_dataflow_note_word(INSN_DF_WORD_FP_TRANSCENDENTAL);
+            x87_top();
+            x87_rd_st(0);
+            x87_wr_st(0);
+            x87_exc();
+            break;
+        }
+        break;
+
+    case 0x00: case 0x01: case 0x04 ... 0x07:   /* fxxx   st(0), st(i) */
+    case 0x20: case 0x21: case 0x24 ... 0x27:   /* fxxx   st(i), st(0) */
+    case 0x30: case 0x31: case 0x34 ... 0x37:   /* fxxxp  st(i), st(0) */
+        insn_dataflow_note_word(arith_word[op & 7]);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_wr_st(op >= 0x20 ? rm : 0);
+        x87_exc();
+        if (op >= 0x30) {
+            x87_pop();
+        }
+        break;
+
+    case 0x02: case 0x22:       /* fcom  st(i), and its alias */
+    case 0x2c:                  /* fucom st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_exc();
+        break;
+
+    case 0x03: case 0x23: case 0x32:    /* fcomp  st(i), and its aliases */
+    case 0x2d:                          /* fucomp st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_exc();
+        x87_pop();
+        break;
+
+    case 0x15:                  /* da/5: fucompp */
+    case 0x33:                  /* de/3: fcompp  */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(1);
+        x87_exc();
+        x87_pop();
+        x87_pop();
+        break;
+
+    case 0x1c:                  /* db/4 */
+        switch (rm) {
+        case 2:                 /* fnclex: the exception bits are cleared */
+            insn_dataflow_note_word(INSN_DF_WORD_AND);
+            x87_rd("fpus");
+            x87_wr("fpus");
+            break;
+        case 3:                 /* fninit */
+            insn_dataflow_note_word(INSN_DF_WORD_MOV);
+            x87_wr("fpuc");
+            x87_wr("fpus");
+            x87_wr("fpstt");
+            x87_wr("fptag");
+            break;
+        default:                /* feni, fdisi, fsetpm: 287 only, no-ops */
+            insn_dataflow_note_word(INSN_DF_WORD_NOP);
+            break;
+        }
+        break;
+
+    case 0x1d:                  /* fucomi  st(0), st(i) */
+    case 0x1e:                  /* fcomi   st(0), st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_exc();
+        x87_wr("eflags");
+        break;
+
+    case 0x3d:                  /* fucomip st(0), st(i) */
+    case 0x3e:                  /* fcomip  st(0), st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);
+        x87_top();
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_exc();
+        x87_wr("eflags");
+        x87_pop();
+        break;
+
+    case 0x28:                  /* ffree st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_MOV);
+        x87_top();
+        x87_rd("fptag");
+        x87_wr("fptag");
+        break;
+
+    case 0x38:                  /* ffreep st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_MOV);
+        x87_top();
+        x87_rd("fptag");
+        x87_wr("fptag");
+        x87_pop();
+        break;
+
+    case 0x2a:                  /* fst  st(i) */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_MOV);
+        x87_top();
+        x87_rd_st(0);
+        x87_wr_st(rm);
+        break;
+
+    case 0x0b: case 0x2b: case 0x3a: case 0x3b: /* fstp st(i), and 3 aliases */
+        insn_dataflow_note_word(INSN_DF_WORD_FP_MOV);
+        x87_top();
+        x87_rd_st(0);
+        x87_wr_st(rm);
+        x87_pop();
+        break;
+
+    case 0x3c:                  /* fnstsw ax */
+        insn_dataflow_note_word(INSN_DF_WORD_MOV);
+        x87_rd("fpus");
+        x87_rd("fpstt");
+        break;
+
+    case 0x10 ... 0x13:         /* fcmovcc st(0), st(i) */
+    case 0x18 ... 0x1b:
+        /*
+         * The destination is preserved when the condition is false, so it is
+         * read as well as written -- the case the header names as one a
+         * decoder misses and the ops do not.
+         */
+        insn_dataflow_note_word(INSN_DF_WORD_CMOV);
+        x87_top();
+        x87_rd("eflags");
+        x87_rd_st(0);
+        x87_rd_st(rm);
+        x87_wr_st(0);
+        break;
+
+    default:
+        break;
+    }
+}
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -3356,6 +3972,13 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             goto illegal_op;
         }
     }
+
+    /*
+     * Reached only by an encoding the switches above accepted: every other
+     * route went to illegal_op, and an encoding the decoder declined states
+     * nothing.
+     */
+    x86_df_x87(mod != 3, op, rm);
 
     if (update_fip) {
         tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
@@ -4045,23 +4668,22 @@ void tcg_x86_init(void)
             "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29",
             "xmm30", "xmm31",
         };
-        static const char *const st_p[] = {
-            "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
-        };
         static const char *const k_p[] = {
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
         };
         CPUX86State *e = NULL;
 
         QEMU_BUILD_BUG_ON(ARRAY_SIZE(xmm_p) < ARRAY_SIZE(e->xmm_regs));
-        QEMU_BUILD_BUG_ON(ARRAY_SIZE(st_p) != ARRAY_SIZE(e->fpregs));
+        QEMU_BUILD_BUG_ON(ARRAY_SIZE(x86_x87_st_names) !=
+                          ARRAY_SIZE(e->fpregs));
         QEMU_BUILD_BUG_ON(ARRAY_SIZE(k_p) != ARRAY_SIZE(e->opmask_regs));
 
         insn_dataflow_declare_regfile(xmm_p, ARRAY_SIZE(e->xmm_regs),
                                       offsetof(CPUX86State, xmm_regs),
                                       sizeof(e->xmm_regs[0]),
                                       sizeof(e->xmm_regs[0]));
-        insn_dataflow_declare_regfile(st_p, ARRAY_SIZE(e->fpregs),
+        insn_dataflow_declare_regfile(x86_x87_st_names,
+                                      ARRAY_SIZE(e->fpregs),
                                       offsetof(CPUX86State, fpregs),
                                       sizeof(e->fpregs[0]),
                                       sizeof(e->fpregs[0]));
@@ -4069,6 +4691,63 @@ void tcg_x86_init(void)
                                       offsetof(CPUX86State, opmask_regs),
                                       sizeof(e->opmask_regs[0]),
                                       sizeof(e->opmask_regs[0]));
+    }
+
+    /*
+     * The rest of the x87 state, which no TCG global names either.
+     *
+     * The data file above is only half of what an x87 instruction touches.
+     * The other half is the control word it reads its exception masks and
+     * rounding mode from, the status word it accumulates exception flags and
+     * condition codes into, the tag word a push validates and a pop
+     * invalidates, the top-of-stack pointer every stack reference is indexed
+     * through, and the four exception pointers QEMU's own emitted epilogue
+     * stores at the end of nearly every x87 instruction.  Undeclared, each of
+     * those reaches a consumer as an anonymous byte range, and an instruction
+     * that plainly writes the status word publishes "two bytes at offset
+     * 6320" instead.
+     *
+     * fptags is eight bytes in QEMU and ONE register in the architecture --
+     * FTW, two bits per stack slot -- so it is declared as the one register
+     * it is rather than as a file of eight.  Declaring eight would invite a
+     * decode site to name one of them, and which slot an x87 instruction
+     * tags is a function of fpstt at execution, which no decode site holds.
+     *
+     * fpstt is likewise architecturally a FIELD of the status word (FSW bits
+     * 13:11, which is exactly how helper_fnstsw() reassembles it) that QEMU
+     * keeps in its own word.  It gets its own NAME because QEMU moves the two
+     * independently and a statement about one should not read as a statement
+     * about the other; what a consumer sees is a separate question, and the
+     * generic map folds both onto the FP control-and-status register the way
+     * it folds every other single-ISA register onto an existing one.
+     */
+    {
+        CPUX86State *e = NULL;
+
+        insn_dataflow_declare_regfile(x86_x87_fpstt_names, 1,
+                                      offsetof(CPUX86State, fpstt),
+                                      sizeof(e->fpstt), sizeof(e->fpstt));
+        insn_dataflow_declare_regfile(x86_x87_fpus_names, 1,
+                                      offsetof(CPUX86State, fpus),
+                                      sizeof(e->fpus), sizeof(e->fpus));
+        insn_dataflow_declare_regfile(x86_x87_fpuc_names, 1,
+                                      offsetof(CPUX86State, fpuc),
+                                      sizeof(e->fpuc), sizeof(e->fpuc));
+        insn_dataflow_declare_regfile(x86_x87_fptag_names, 1,
+                                      offsetof(CPUX86State, fptags),
+                                      sizeof(e->fptags), sizeof(e->fptags));
+        insn_dataflow_declare_regfile(x86_x87_fpip_names, 1,
+                                      offsetof(CPUX86State, fpip),
+                                      sizeof(e->fpip), sizeof(e->fpip));
+        insn_dataflow_declare_regfile(x86_x87_fpcs_names, 1,
+                                      offsetof(CPUX86State, fpcs),
+                                      sizeof(e->fpcs), sizeof(e->fpcs));
+        insn_dataflow_declare_regfile(x86_x87_fpdp_names, 1,
+                                      offsetof(CPUX86State, fpdp),
+                                      sizeof(e->fpdp), sizeof(e->fpdp));
+        insn_dataflow_declare_regfile(x86_x87_fpds_names, 1,
+                                      offsetof(CPUX86State, fpds),
+                                      sizeof(e->fpds), sizeof(e->fpds));
     }
 
     /*

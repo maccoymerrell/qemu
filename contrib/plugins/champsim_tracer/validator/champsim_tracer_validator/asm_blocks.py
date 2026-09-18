@@ -2820,6 +2820,131 @@ class RegIdSweep(CodeBlock):
 
 
 @register
+class X87Sweep(CodeBlock):
+    """
+    The x87 SUBJECT: one pass over every family gen_x87() dispatches.
+
+    WHY IT EXISTS.  target/i386 reaches the whole x87 instruction set
+    through one hand-written dispatcher, and until the per-arm statements
+    landed none of it carried a generic word or a register set.  The check
+    that would have caught that -- static_reg_sets, which scores the wire's
+    src/dst lists against the external referee -- passed anyway, because no
+    generated program contained a single x87 instruction: the pass was a
+    pass over nothing.  This block is the subject, so the same check now
+    has x87 encodings to be right or wrong about.
+
+    `fninit` between groups keeps the stack shallow, so a group's
+    behaviour is its own rather than an overflow left by the group before
+    it, and the block is straight-line with one successor so it can ride
+    the coverage-probe chain like its siblings.
+
+    REGISTER FORMS ONLY, and the reason is the harness rather than the
+    subject: this block declares no expected memops, and cp_memops counts
+    an access nobody expected as an error, so an x87 memory form here
+    would fail a check about something else.  The memory families keep
+    their witness in the standalone p_wpx87 program banked with the
+    x87 evidence; what this block is for is the register set, and the
+    register forms carry the same one.
+    """
+
+    name = "x87_sweep"
+    scratch_slots = 0
+    randomizable = False
+    coverage_probe = True
+    supported_isas = ("x86_64",)
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(block_id=ctx.block_id, name=cls.name, memops=[])
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        # The memory forms first (load, store, and arithmetic at four
+        # widths), then the register forms, the constants, the
+        # transcendentals, the stack and tag management, the control and
+        # status words, and last fcmovcc at both condition polarities.
+        lines += [
+            "  fninit",
+            "  fninit",
+            "  fld %st(0)",
+            "  fninit",
+            "  fninit",
+            "  fld1",
+            "  fldpi",
+            "  fadd %st(1), %st",
+            "  fmul %st, %st(1)",
+            "  fsub %st(1), %st",
+            "  fdiv %st(1), %st",
+            "  fxch %st(1)",
+            "  fld %st(1)",
+            "  fst %st(2)",
+            "  fstp %st(2)",
+            "  fcom %st(1)",
+            "  fucom %st(1)",
+            "  fcomi %st(1), %st",
+            "  fucomi %st(1), %st",
+            "  fcomip %st(1), %st",
+            "  fninit",
+            "  fld1",
+            "  fldl2t",
+            "  fldl2e",
+            "  fldlg2",
+            "  fldln2",
+            "  fldz",
+            "  fninit",
+            "  fld1",
+            "  fchs",
+            "  fabs",
+            "  fsqrt",
+            "  frndint",
+            "  f2xm1",
+            "  fld1",
+            "  fyl2x",
+            "  fninit",
+            "  fld1",
+            "  fld1",
+            "  fpatan",
+            "  fxtract",
+            "  fninit",
+            "  fldpi",
+            "  fsin",
+            "  fcos",
+            "  fptan",
+            "  fninit",
+            "  fld1",
+            "  fld1",
+            "  fscale",
+            "  fprem",
+            "  fprem1",
+            "  fninit",
+            "  fld1",
+            "  ftst",
+            "  fxam",
+            "  ffree %st(0)",
+            "  fdecstp",
+            "  fincstp",
+            "  fnop",
+            "  fninit",
+            "  fnstsw %ax",
+            "  fnclex",
+            "  fninit",
+            "  fld1",
+            "  fldpi",
+            "  xorl %eax, %eax",
+            "  cmpl %eax, %eax",
+            "  fcmovb %st(1), %st",
+            "  fcmove %st(1), %st",
+            "  fcmovnb %st(1), %st",
+            "  fcmovne %st(1), %st",
+            "  fninit",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+
+@register
 class MipsInlineConditionalTrap(CodeBlock):
     """
     Pins the classification of a MIPS conditional trap: `teq` must NOT

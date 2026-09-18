@@ -556,6 +556,61 @@ static void cpu_exec_exit(CPUState *cpu)
     }
 }
 
+/*
+ * Release what an unwind from inside tb_gen_code() skipped.
+ *
+ * tb_gen_code() sets tcg_ctx->gen_tb before generating and clears it on the
+ * way out; a cpu_loop_exit from inside skips that clear, so whichever landing
+ * pad catches the fault owns it.  Under softmmu the TB's PageDesc locks leak
+ * with it and the next translation touching that page spins forever, which is
+ * audible; in user mode nothing was audible, so the clear was written into
+ * the softmmu arm first and the user arm was left naming a translation that
+ * is no longer in flight.
+ *
+ * WHOSE translation the pointer names is not the same in the two modes, and
+ * that is what makes this one function rather than a rule repeated at each
+ * pad.  Under softmmu tcg_register_thread() gives every vCPU thread its own
+ * TCGContext, so gen_tb is this thread's, readable and writable here with no
+ * further qualification.  In user mode tcg_register_thread() is
+ * `tcg_ctx = &tcg_init_ctx`: every guest thread SHARES one context, and
+ * mmap_lock is the only thing serialising translation.  Clearing the shared
+ * pointer after mmap_unlock() therefore clears whatever a PEER guest thread
+ * has in flight by then -- that thread dereferences NULL the next time it
+ * reads the TB it is generating, measured as a SIGSEGV at 0x15 (the cflags
+ * field, offset 0x14) inside tcg_canonicalize_memop().  So in user mode the
+ * clear goes INSIDE the lock, and holding the lock is also the proof that
+ * the pointer is ours to clear: a pad that does not hold it must not touch
+ * the field at all.
+ *
+ * The pointer is into the code cache, so a later tb_flush leaves a surviving
+ * one dangling; tb-maint.c's translator_access path writes THROUGH it
+ * (tb_set_page_addr1).
+ */
+static void tcg_ctx_drop_gen_tb(void)
+{
+#ifdef CONFIG_USER_ONLY
+    if (have_mmap_lock()) {
+        tcg_ctx->gen_tb = NULL;
+        mmap_unlock();
+    }
+#else
+    /*
+     * Alternative 1: Install a cleanup to be called via an exception
+     * handling safe longjmp.  It seems plausible that all our hosts
+     * support such a thing.  We'd have to properly register unwind info
+     * for the JIT for EH, rather that just for GDB.
+     *
+     * Alternative 2: Set and restore cpu->jmp_env in tb_gen_code to
+     * capture the cpu_loop_exit longjmp, perform the cleanup, and
+     * jump again to arrive here.
+     */
+    if (tcg_ctx->gen_tb) {
+        tb_unlock_pages(tcg_ctx->gen_tb);
+    }
+    tcg_ctx->gen_tb = NULL;
+#endif
+}
+
 static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
@@ -615,51 +670,14 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
-    if (have_mmap_lock()) {
-        mmap_unlock();
-    }
-#else
-    /*
-     * For softmmu, a tlb_fill fault during translation will land here,
-     * and we need to release any page locks held.  In system mode we
-     * have one tcg_ctx per thread, so we know it was this cpu doing
-     * the translation.
-     *
-     * Alternative 1: Install a cleanup to be called via an exception
-     * handling safe longjmp.  It seems plausible that all our hosts
-     * support such a thing.  We'd have to properly register unwind info
-     * for the JIT for EH, rather that just for GDB.
-     *
-     * Alternative 2: Set and restore cpu->jmp_env in tb_gen_code to
-     * capture the cpu_loop_exit longjmp, perform the cleanup, and
-     * jump again to arrive here.
-     */
-    if (tcg_ctx->gen_tb) {
-        tb_unlock_pages(tcg_ctx->gen_tb);
-    }
 #endif
     /*
-     * The pointer is cleared in BOTH modes, and only the page locks are the
-     * softmmu half.
-     *
-     * tb_gen_code sets tcg_ctx->gen_tb before generating and clears it on the
-     * way out; an unwind from inside skips that clear, so whichever landing
-     * pad catches the fault owns it.  Softmmu noticed because the TB's page
-     * locks leak with the pointer and the next translation touching that page
-     * spins forever, which is audible.  User mode has no page locks, so the
-     * clear was written into the softmmu arm and the user arm was left with a
-     * per-thread field still naming a translation that is no longer in
-     * flight -- for the rest of that thread's life.  Nothing read it that way
-     * until something asked "is a translation already running on this
-     * thread", and then it answered yes forever.
-     *
-     * It is also a pointer into the code cache, so a later tb_flush leaves it
-     * dangling; tb-maint.c's translator_access path writes THROUGH it
-     * (tb_set_page_addr1).  Only a translation reaches that write today, and
-     * a translation sets the pointer first -- but the two facts that make it
-     * harmless are not the same fact as the pointer being right.
+     * For softmmu, a tlb_fill fault during translation will land here, and we
+     * need to release any page locks held; in user mode the memory lock
+     * tb_gen_code was holding is released here too.  Both modes drop the
+     * in-flight pointer -- see tcg_ctx_drop_gen_tb().
      */
-    tcg_ctx->gen_tb = NULL;
+    tcg_ctx_drop_gen_tb();
     if (bql_locked()) {
         bql_unlock();
     }
@@ -819,23 +837,16 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
         qemu_plugin_disable_mem_helpers(cpu);
 #ifdef CONFIG_USER_ONLY
         clear_helper_retaddr();
-        if (have_mmap_lock()) {
-            mmap_unlock();
-        }
 #endif
         /*
          * The translation above is inside this pad, so this pad owns what
          * tb_gen_code was holding when it unwound: the TB's PageDesc locks
-         * under softmmu, and the in-flight pointer in both modes.  The two
-         * live siblings clear exactly this, for exactly this reason, and
-         * this one could not before because its codegen ran outside.
+         * under softmmu, the memory lock in user mode, and the in-flight
+         * pointer in both.  The live siblings release exactly this, for
+         * exactly this reason, and this one could not before because its
+         * codegen ran outside.
          */
-#ifndef CONFIG_USER_ONLY
-        if (tcg_ctx->gen_tb) {
-            tb_unlock_pages(tcg_ctx->gen_tb);
-        }
-#endif
-        tcg_ctx->gen_tb = NULL;
+        tcg_ctx_drop_gen_tb();
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return false;
@@ -1001,31 +1012,23 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         qemu_plugin_disable_mem_helpers(cpu);
 #ifdef CONFIG_USER_ONLY
         clear_helper_retaddr();
-        if (have_mmap_lock()) {
-            mmap_unlock();
-        }
-#else
+#endif
         /*
          * A translation-time fault lands here from INSIDE tb_gen_code: a
          * wrong-path translator_ld() crossing into an absent page unwinds
          * via cpu_loop_exit_restore (the spec_real_access abort in
          * cputlb.c's tlb_fill_align) while tb_gen_code still holds the TB's
-         * PageDesc lock(s) and tcg_ctx->gen_tb.  The outer loop's landing
-         * pad releases those (cpu_exec_longjmp_cleanup); this pad must do
-         * the same, or the page spinlock leaks permanently and the next
-         * tb_gen_code touching that page spins forever below every plugin
-         * callback — a 100%-utime vCPU freeze (observed as the x86 -smp 2
-         * marker-window stall at segment open, where cold-branch wrong
-         * paths translate heavily and fault often).
+         * PageDesc lock(s) under softmmu, the memory lock in user mode, and
+         * tcg_ctx->gen_tb in both.  The outer loop's landing pad releases
+         * those (cpu_exec_longjmp_cleanup); this pad must do the same, or
+         * the page spinlock leaks permanently and the next tb_gen_code
+         * touching that page spins forever below every plugin callback — a
+         * 100%-utime vCPU freeze (observed as the x86 -smp 2 marker-window
+         * stall at segment open, where cold-branch wrong paths translate
+         * heavily and fault often).  The pointer belongs to whichever pad
+         * catches the unwind, and this pad catches the wrong path's.
          */
-        if (tcg_ctx->gen_tb) {
-            tb_unlock_pages(tcg_ctx->gen_tb);
-        }
-#endif
-        /* Both modes: see cpu_exec_longjmp_cleanup.  The page locks are the
-         * softmmu half; the pointer belongs to whichever pad catches the
-         * unwind, and this pad catches the wrong path's. */
-        tcg_ctx->gen_tb = NULL;
+        tcg_ctx_drop_gen_tb();
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return false;
@@ -1088,13 +1091,23 @@ bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc)
 
     /*
      * A translate-on-demand runs from a vCPU EXEC callback, never from a
-     * translation callback and never off the vCPU thread.  tcg_ctx is
-     * per-thread and tcg_ctx->gen_tb names the translation in flight on it,
-     * so re-entering tb_gen_code from inside one corrupts it.  Asserted
-     * rather than commented, because the failure is silent.
+     * translation callback and never off the vCPU thread.  Re-entering
+     * tb_gen_code from inside a translation corrupts tcg_ctx->gen_tb, which
+     * names the translation in flight.  Asserted rather than commented,
+     * because the failure is silent.
+     *
+     * WHOSE translation gen_tb names differs by mode -- see
+     * tcg_ctx_drop_gen_tb().  Under softmmu it is this thread's and can be
+     * read here.  In user mode every guest thread shares one TCGContext, so
+     * reading it here, outside mmap_lock, would be reading whichever peer
+     * thread happens to be translating right now; the assert therefore moves
+     * to the one point where it is this thread's to read, inside the lock
+     * just before tb_gen_code.
      */
     g_assert(cpu == current_cpu);
+#ifndef CONFIG_USER_ONLY
     g_assert(tcg_ctx->gen_tb == NULL);
+#endif
 
     cpu_get_tb_cpu_state(env, &cur_pc, &cs_base, &flags);
     cflags = curr_cflags(cpu);
@@ -1117,6 +1130,8 @@ bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc)
         tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
         if (tb == NULL) {
             mmap_lock();
+            /* Serialised now, so gen_tb is ours to read in either mode. */
+            g_assert(tcg_ctx->gen_tb == NULL);
             tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
             mmap_unlock();
         }
@@ -1134,15 +1149,8 @@ bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc)
         qemu_plugin_disable_mem_helpers(cpu);
 #ifdef CONFIG_USER_ONLY
         clear_helper_retaddr();
-        if (have_mmap_lock()) {
-            mmap_unlock();
-        }
-#else
-        if (tcg_ctx->gen_tb) {
-            tb_unlock_pages(tcg_ctx->gen_tb);
-        }
 #endif
-        tcg_ctx->gen_tb = NULL;
+        tcg_ctx_drop_gen_tb();
         ok = false;
     }
     cpu->plugin_decode_only = false;

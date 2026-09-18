@@ -2441,6 +2441,26 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
      */
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
 
+    /*
+     * THE STORED VALUE IS A SOURCE, AND THE TWO ARMS OF THIS LOWERING HIDE IT.
+     *
+     * `sc rt, off(base)' reads rt -- it is the datum the store writes -- and
+     * writes rt, which afterwards holds the success flag.  Both happen below,
+     * but in the order the ops are EMITTED the write comes first: the failure
+     * arm's gen_store_gpr(0, rt) is emitted before the success arm's
+     * gen_load_gpr(val, rt), because a branchy lowering lays both arms into
+     * one stream.  A reader walking that stream in order meets the write
+     * first, so when it reaches the read it charges it to this instruction's
+     * OWN RESULT and rt never enters the source set.  MEASURED against gem5:
+     * `sc $t2, 400($s0)' published sources {REG_GPR16} against the
+     * reference's {REG_GPR10, REG_GPR16} -- the base and not the datum.
+     *
+     * Stated here, before any op of either arm exists, so the order cannot
+     * decide it.  This is not the R7.1 case: rt is not being preserved across
+     * a narrow write, it is the operand the instruction was given.
+     */
+    note_gpr_read(rt);
+
     t0 = tcg_temp_new();
     addr = tcg_temp_new();
     /* compare the address against that of the preceding LL */

@@ -3025,6 +3025,27 @@ static void x87_exc_from(const InsnDataflowAtom *v, unsigned n)
 }
 
 /*
+ * C1 <- 0, with nothing else in the status word moving.
+ *
+ * FCHS and FABS do not raise and do not accumulate, so they never reach
+ * merge_exception_flags() and x87_exc() would be the wrong statement: it
+ * names the control word, which these do not read.  What they do is the
+ * clear the SDM's "FPU flags affected" section gives them -- "C1 Set to 0"
+ * -- so the status word is read-modify-written and the new word is a
+ * function of the old one alone.
+ *
+ * helper_fchs_ST0()/helper_fabs_ST0() perform that clear; before this arm
+ * existed they did not, and the two moved together.
+ */
+static void x87_c1_clear(void)
+{
+    InsnDataflowAtom src[1] = { insn_df_reg("fpus") };
+
+    x87_rd("fpus");
+    x87_wr_from("fpus", src, 1);
+}
+
+/*
  * fpush()/fpop() on a memory form: the top moves on its own value, and the
  * tag word the moved-to entry lands in is a function of the tag word and of
  * the top that selected the entry.
@@ -3274,12 +3295,14 @@ static void x86_df_x87(bool mem, int op, int rm)
             x87_top();
             x87_rd_st(0);
             x87_wr_st(0);
+            x87_c1_clear();
             break;
         case 1:                 /* fabs */
             insn_dataflow_note_word(INSN_DF_WORD_FP_ABS);
             x87_top();
             x87_rd_st(0);
             x87_wr_st(0);
+            x87_c1_clear();
             break;
         case 4:                 /* ftst */
             insn_dataflow_note_word(INSN_DF_WORD_FP_CMP);

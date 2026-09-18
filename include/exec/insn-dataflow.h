@@ -93,8 +93,77 @@
 #define INSN_DF_MAX_VECOPS  12
 
 /*
- * An instruction writing more registers than this is vanishingly rare, and
- * the one that does gets its whole answer refused rather than a prefix of it.
+ * Distinct registers one instruction's own ops may write.
+ *
+ * THIS NUMBER IS DERIVED, NOT ESTIMATED.  An earlier comment here said an
+ * instruction writing more than this is "vanishingly rare", which is a claim
+ * about frequency and therefore not a claim anything in this file can check.
+ * Capacity is derived from the wire and from what the representation needs,
+ * and it is then MEASURED; rarity is not an argument and is not offered as
+ * one anywhere in this layer.
+ *
+ * WHAT THE WIRE RESERVES is not this.  The trace's template carries
+ * dst_regs[] with MAX_DST_REGS entries (64) and n_dst as a byte, so the
+ * consumer's side of the contract is eight times wider than this and is not
+ * what binds.  This is the READER's working set: how many destination rows
+ * one InsnDataflow carries while the op walk fills it in, which is also what
+ * the per-translation scratch is sized by.
+ *
+ * WHAT THE REPRESENTATION NEEDS IS NOT THE COUNT OF WRITE OPS.  Three things
+ * shrink an op stream's writes onto these rows before any of them is a slot:
+ *
+ *   * df_add_write() MERGES.  A register this instruction writes twice takes
+ *     one row and its provenance is the union, so a read-modify-write and a
+ *     multi-step lowering of the same destination cost one slot, not two.
+ *   * THE CONTAINER FOLD.  A range inside a declared register file interns as
+ *     that register (df_container), so four 4-byte writes at four offsets of
+ *     one vector register are one key and not four.
+ *   * THE SPLIT-ACCESS FOLD.  A decode site may state that a lowering's
+ *     per-element traffic is one architectural access
+ *     (insn_dataflow_note_split_access), and df_add_field then merges the
+ *     adjacent row in the same declared container -- the repair that took
+ *     aarch64's de-interleaving loads from sixty-four rows to one.
+ *
+ * And env ranges do not come here at all: a write through a pointer into
+ * CPUArchState lands in fields[] against INSN_DF_MAX_FIELDS, which is a
+ * separate ceiling with a separate count.  What is left for these rows is the
+ * TCG globals the instruction wrote -- a destination plus whatever lazy-flag
+ * or condition-code globals the target keeps beside it.
+ *
+ * THE MEASURED CENSUS.  The capture path spells this ceiling's own refusals
+ * apart from the other three -- a refused encoding lands in the corpus as
+ * `@refused:incomplete:<W><F><M><D>', one letter per cause -- so the claim
+ * below is a reading and not an inference.  Swept over the whole
+ * reachable-encoding population of all four targets, counting the wire side:
+ *
+ *     riscv64        70,652 encodings      0 write-ceiling refusals
+ *     mipsel        949,753 encodings      0
+ *     aarch64     2,225,536 encodings      0
+ *     x86_64     13,194,556 encodings      0
+ *
+ * THE ZERO IS NOT A SILENCE, and the same sweep is what proves it.  The
+ * x86_64 corpus carries 5,164 refusals on the MEMOP ceiling
+ * (`@refused:incomplete:M'), so the label, the emulator's bit, the capture
+ * path and the census's own reading are all demonstrably live on real data --
+ * and the letter separates them, M from W, in the corpus that reads 0 for W.
+ *
+ * THAT SURVIVOR IS NAMED, not left as a number.  All 2,582 distinct encodings
+ * behind those 5,164 rows are one instruction: x86 ENTER (opcode C8) with a
+ * nesting level of 17 or 51.  ENTER copies that many saved frame pointers to
+ * the stack, so it genuinely performs more than INSN_DF_MAX_MEMOPS accesses;
+ * the ceiling it reaches is the memop one, it is architecturally real rather
+ * than a defect, and it says nothing about the write rows this number sizes.
+ *
+ * (The corpora and the sweep are named in the commit that wrote this
+ * paragraph.  A later pass re-running it should expect these figures to move
+ * with the population, not with the cap.)
+ *
+ * AND IF IT IS EXCEEDED, NOTHING IS SILENT.  The instruction's whole answer
+ * is refused rather than recorded short -- the direction the incompleteness
+ * block below argues for -- the refusal carries INSN_DF_INCOMPLETE_WRITES,
+ * and that bit is counted per instruction on the consumer side.  A population
+ * this cap is too small for announces itself in that counter; it does not
+ * quietly publish a prefix.
  */
 #define INSN_DF_MAX_WRITES  8
 

@@ -296,6 +296,18 @@ def is_vset(bits):
     return (bits & 0x7f) == 0x57 and ((bits >> 12) & 7) == 7
 
 
+def is_csr_insn(bits):
+    """True for the Zicsr family: CSRRW/CSRRS/CSRRC and their immediate forms.
+
+    SYSTEM opcode 1110011 with a non-zero funct3; funct3 == 000 is the
+    ecall/ebreak/xret group, which names no CSR operand at all.  Tested on the
+    ENCODING for the same reason `is_fence` and `is_vset` are: the label it
+    decides is then a property of the instruction rather than a reading of a
+    disassembler's text.
+    """
+    return (bits & 0x7f) == 0x73 and ((bits >> 12) & 7) != 0
+
+
 def compare_insn(r, t):
     """One aligned instruction -> its disagreeing axes (possibly none)."""
     rows = []
@@ -385,8 +397,17 @@ def compare_insn(r, t):
     row = _set_row(r.pc, 'csr-src-set', frozenset(grouped_src), tsc)
     if row is not None:
         unmap = [k for k in grouped_src if k.startswith('CSR:')]
+        only_ref_csr = frozenset(grouped_src) - tsc
         if unmap and frozenset(grouped_src) - frozenset(unmap) <= tsc:
             row = row._replace(label='REF-CSR-UNMAPPED')
+        elif only_ref_csr and tsc <= frozenset(grouped_src):
+            # THE TRACER DROPS A CSR SOURCE, and the two routes by which it
+            # does are different defects with different fixes, so they get
+            # different labels rather than one word for both.
+            if is_csr_insn(r.bits):
+                row = row._replace(label='QEMU-CSR-ACCESS-OPAQUE')
+            else:
+                row = row._replace(label='QEMU-CSR-FIELD-UNDECLARED')
         rows.append(row)
 
     # --- reg-src-value: the operand values a conforming consumer would have.
@@ -453,6 +474,7 @@ def compare_insn(r, t):
         unmap = [k for k in grouped if k.startswith('CSR:')]
         nonarch = [k for k in unmap
                    if k[4:] in spike_ref.NONARCH_CSRS]
+        only_ref_csr = frozenset(grouped) - frozenset(tc)
         if not grouped and frozenset(tc) <= frozenset(
                 spike_ref.FOLD_MEMBERS):
             row = row._replace(label='REF-CSR-ACCESSOR-ONLY')
@@ -460,6 +482,16 @@ def compare_insn(r, t):
             row = row._replace(
                 label='REF-NONARCH-CSR' if len(nonarch) == len(unmap)
                 else 'REF-CSR-UNMAPPED')
+        elif only_ref_csr and frozenset(tc) <= frozenset(grouped):
+            # THE TRACER DROPS A CSR DESTINATION.  Three routes, and the
+            # instruction's own encoding separates the first from the other
+            # two; REG_VCTRL separates the second from the third.
+            if is_csr_insn(r.bits):
+                row = row._replace(label='QEMU-CSR-ACCESS-OPAQUE')
+            elif only_ref_csr == frozenset(('REG_VCTRL',)):
+                row = row._replace(label='QEMU-VSTART-HELPER-WRITE')
+            else:
+                row = row._replace(label='QEMU-CSR-FIELD-UNDECLARED')
         rows.append(row)
 
     for tid in frozenset(grouped) & frozenset(tc):

@@ -302,6 +302,55 @@ RISCV_EXEC = {
                              note='the execution reference names a CSR no '
                                   'GenericRegId spells'),
 
+    # THE TRACER'S THREE CSR LOSSES ON THIS ISA, one label each, because the
+    # three have three different fix sites and one word for all three would
+    # hide two of them.  All are charged to the tracer: the reference states
+    # a CSR the wire does not carry, and that is information dropped.
+    #
+    # (1) THE Zicsr FAMILY ITSELF.  `csrr s2, fflags` reaches the wire as a
+    #     bare move with no source at all.  target/riscv's do_csrr() /
+    #     do_csrrw() hand helper_csrr()/helper_csrrw() the CSR NUMBER as a
+    #     tcg constant and the helper dispatches through
+    #     csr_ops[csrno].read/.write; the op reader sees a constant where the
+    #     operand was and there is no declared field to bind.  Fix path: the
+    #     CSR number is a decode-time constant at those four trans sites, so
+    #     the access can be stated there from csr_ops[csrno].name -- the same
+    #     second source the vocabulary already uses for riscv CSR spellings.
+    'QEMU-CSR-ACCESS-OPAQUE':
+        Rule('QEMU-CSR-ACCESS-OPAQUE', 'tracer-defect', {SUBSET},
+             note='a Zicsr instruction names no CSR: the access goes through '
+                  'helper_csrr/helper_csrrw with the CSR number as a '
+                  'constant, so the op reader has no operand to bind'),
+
+    # (2) THE IMPLICIT fcsr DEPENDENCE OF FP ARITHMETIC.  An FP instruction
+    #     encoded rm == DYN consults the rounding mode, and one that can
+    #     raise consults and accrues the exception flags.  QEMU does both
+    #     through CPURISCVState::frm and ::fp_status, and neither is a TCG
+    #     global nor declared to the dataflow layer (translate.c declares the
+    #     vector file only), so helper_set_rounding_mode()'s `rm = env->frm`
+    #     names nothing.  Fix path: declare the fcsr fields, or state the
+    #     read at gen_set_rm() -- under the composed-register contract the
+    #     field's name on the wire is its CONTAINER's, REG_FCSR.
+    'QEMU-CSR-FIELD-UNDECLARED':
+        Rule('QEMU-CSR-FIELD-UNDECLARED', 'tracer-defect', {SUBSET},
+             note='an implicit fcsr dependence the wire does not carry: '
+                  'CPURISCVState::frm / ::fp_status are neither TCG globals '
+                  'nor declared, so the helper read names no register'),
+
+    # (3) vstart, WRITTEN BY EVERY VECTOR INSTRUCTION.  The architecture
+    #     resets vstart at completion and spike logs it through the CSR write
+    #     accessor.  QEMU's translator does not write it -- finalize_rvv_inst()
+    #     only sets ctx->vstart_eq_zero -- and the 46 `env->vstart = 0;` sites
+    #     that do the work live inside vector_helper.c, an env store with no
+    #     declared field behind it.  Fix path is the same shape as (2):
+    #     declare the field, or state the write where the helper family is
+    #     selected.
+    'QEMU-VSTART-HELPER-WRITE':
+        Rule('QEMU-VSTART-HELPER-WRITE', 'tracer-defect', {SUBSET},
+             note='vstart is reset by every vector instruction and the wire '
+                  'does not publish the write: QEMU does it from inside '
+                  'vector_helper.c rather than at the translator'),
+
     # riscv/csrs.cc:69 -- spike's CSR log entry is written from inside the CSR
     # WRITE ACCESSOR.  An FP operation that raises no new exception flag never
     # calls it, so the reference reports no fcsr destination at all, while the

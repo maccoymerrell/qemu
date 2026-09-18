@@ -1937,6 +1937,16 @@ static inline void gen_cmp ## type ## _ ## fmt(DisasContext *ctx, int n,      \
     }                                                                         \
     gen_ldcmp_fpr##bits(ctx, fp0, fs);                                        \
     gen_ldcmp_fpr##bits(ctx, fp1, ft);                                        \
+    /*                                                                        \
+     * A FLOATING-POINT COMPARE WRITES THE CONDITION CODE, AND THE OP STREAM  \
+     * DOES NOT SHOW IT.  The architectural destination of c.cond.fmt is      \
+     * FCC[cc], a field of FCR31 -- the wire's REG_FCSR.  Every helper below  \
+     * writes it with SET_FP_COND()/CLEAR_FP_COND() on env->active_fpu.fcr31, \
+     * inside the helper, so fpu_fcr31 is never an op's output here and the   \
+     * destination reached the wire as nothing at all.  Stated once for the   \
+     * whole family, which is the one place every form passes through.        \
+     */                                                                       \
+    insn_dataflow_state_write(insn_df_reg("fcr31"));                          \
     switch (n) {                                                              \
     case  0:                                                                  \
         gen_helper_0e2i(cmp ## type ## _ ## fmt ## _f, fp0, fp1, cc);         \

@@ -389,11 +389,14 @@ static bool df_declared_by_name(const char *name, uint32_t *off, uint32_t *size)
  * rather than recorded short: the header states why, and the flag set here is
  * what the refusal is made of.
  */
-static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
+static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov,
+                         bool sourced, bool from_loads)
 {
     for (unsigned i = 0; i < d->n_writes; i++) {
         if (d->writes[i].reg == reg) {
             df_union(d->writes[i].prov, prov);
+            d->writes[i].sourced |= sourced;
+            d->writes[i].from_loads |= from_loads;
             return;
         }
     }
@@ -403,6 +406,8 @@ static void df_add_write(InsnDataflow *d, unsigned reg, const uint64_t *prov)
     }
     d->writes[d->n_writes].reg = (uint8_t)reg;
     memcpy(d->writes[d->n_writes].prov, prov, sizeof(d->writes[0].prov));
+    d->writes[d->n_writes].sourced = sourced;
+    d->writes[d->n_writes].from_loads = from_loads;
     d->n_writes++;
 }
 
@@ -462,7 +467,7 @@ static void df_write_global(InsnDataflow *d, unsigned idx,
 {
     df_set_bit(d->wr, idx);
     df_set_bit(d->opwr, idx);
-    df_add_write(d, idx, prov);
+    df_add_write(d, idx, prov, false, false);
     /*
      * A GLOBAL AN OP HAS JUST WRITTEN CARRIES NO INHERITED ACCOUNT.
      *
@@ -488,12 +493,14 @@ static void df_write_global(InsnDataflow *d, unsigned idx,
  * simplification.
  */
 static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
-                         uint8_t dir, const uint64_t *prov, bool sourced)
+                         uint8_t dir, const uint64_t *prov, bool sourced,
+                         bool from_loads)
 {
     for (unsigned i = 0; i < d->n_fields; i++) {
         if (d->fields[i].off == off && d->fields[i].size == size) {
             d->fields[i].dir |= dir;
             d->fields[i].sourced |= sourced;
+            d->fields[i].from_loads |= from_loads;
             if (prov) {
                 df_union(d->fields[i].prov, prov);
             }
@@ -508,6 +515,7 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->fields[d->n_fields].size = size;
     d->fields[d->n_fields].dir = dir;
     d->fields[d->n_fields].sourced = sourced;
+    d->fields[d->n_fields].from_loads = from_loads;
     memset(d->fields[d->n_fields].prov, 0,
            sizeof(d->fields[d->n_fields].prov));
     if (prov) {
@@ -757,7 +765,7 @@ static void df_call(InsnDataflow *d, TCGOp *op)
                 trunc = true;
                 d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
             }
-            df_add_field(d, (uint32_t)eo, size, dir, prov, true);
+            df_add_field(d, (uint32_t)eo, size, dir, prov, true, false);
         }
     }
     for (unsigned i = 0; i < nb_oargs; i++) {
@@ -979,7 +987,7 @@ static void df_op(InsnDataflow *d, TCGOp *op)
                 TCGTemp *vts = arg_temp(op->args[0]);
 
                 df_add_field(d, (uint32_t)eo, size, INSN_DF_WR,
-                             df_prov(vts - s->temps), true);
+                             df_prov(vts - s->temps), true, false);
             } else if (df_env_writes_cover(d, (uint32_t)eo, size,
                                            ld_env_prov)) {
                 /*
@@ -990,7 +998,8 @@ static void df_op(InsnDataflow *d, TCGOp *op)
                  */
                 ld_env_written = true;
             } else {
-                df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL, true);
+                df_add_field(d, (uint32_t)eo, size, INSN_DF_RD, NULL, true,
+                             false);
                 ld_field_bit = df_intern((uint32_t)eo, size);
                 if (ld_field_bit < 0) {
                     /*
@@ -1178,12 +1187,12 @@ static void df_state(InsnDataflowAtom a, uint8_t dir)
                 uint64_t none[INSN_DF_REG_WORDS] = { 0 };
 
                 df_set_bit(d->wr, (unsigned)g);
-                df_add_write(d, (unsigned)g, none);
+                df_add_write(d, (unsigned)g, none, false, false);
             }
             return;
         }
         if (df_declared_by_name(a.name, &off, &size)) {
-            df_add_field(d, off, size, dir, NULL, false);
+            df_add_field(d, off, size, dir, NULL, false, false);
         }
         return;
 
@@ -1205,6 +1214,65 @@ void insn_dataflow_state_read(InsnDataflowAtom a)
 void insn_dataflow_state_write(InsnDataflowAtom a)
 {
     df_state(a, INSN_DF_WR);
+}
+
+void insn_dataflow_state_write_from(InsnDataflowAtom a,
+                                    const InsnDataflowAtom *src,
+                                    unsigned nsrc)
+{
+    InsnDataflow *d;
+    uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
+    bool from_loads = false;
+    bool any = false;
+    uint32_t off, size;
+    int g;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    d = &df->out[df->cur];
+
+    for (unsigned i = 0; i < nsrc; i++) {
+        int bit;
+
+        if (src[i].kind == INSN_DF_A_LOADED) {
+            from_loads = true;
+            continue;
+        }
+        bit = df_atom_bit(src[i]);
+        if (bit >= 0) {
+            df_set_bit(prov, (unsigned)bit);
+            any = true;
+        }
+        /*
+         * An atom that named nothing this build knows adds no bit.  It is not
+         * an error here: the statement's other sources still stand, and a
+         * statement left with none at all falls through to the read set
+         * below, which is where a write with no account belongs.
+         */
+    }
+
+    switch (a.kind) {
+    case INSN_DF_A_REG:
+        if (a.name == NULL) {
+            return;
+        }
+        g = df_global_by_name(a.name);
+        if (g >= 0) {
+            df_set_bit(d->wr, (unsigned)g);
+            df_add_write(d, (unsigned)g, prov, any || from_loads, from_loads);
+            return;
+        }
+        if (df_declared_by_name(a.name, &off, &size)) {
+            df_add_field(d, off, size, INSN_DF_WR, prov,
+                         any || from_loads, from_loads);
+        }
+        return;
+
+    default:
+        /* Only storage can be written; an immediate is not a destination. */
+        return;
+    }
 }
 
 void insn_dataflow_bind(const void *ts, InsnDataflowAtom a)
@@ -1780,14 +1848,53 @@ void insn_dataflow_insn_begin(unsigned idx)
  */
 static void df_close_unsourced(InsnDataflow *d)
 {
+    uint64_t loads[INSN_DF_REG_WORDS] = { 0 };
+    bool any_load = false;
+
+    /*
+     * The data every load returned, as the bits a load's own destination
+     * carries.  Built here because the access rows are what the op walk
+     * produced, and a statement made at decode time could not have named
+     * them.
+     */
+    for (unsigned i = 0; i < d->n_memops; i++) {
+        if (d->memops[i].dir == INSN_DF_RD) {
+            df_set_bit(loads, INSN_DF_BIT_MEMOP0 + i);
+            any_load = true;
+        }
+    }
+
     for (unsigned i = 0; i < d->n_writes; i++) {
-        if (df_empty(d->writes[i].prov)) {
+        if (d->writes[i].from_loads) {
+            if (any_load) {
+                df_union(d->writes[i].prov, loads);
+            } else if (df_empty(d->writes[i].prov)) {
+                /*
+                 * The arm said the value came from the access and the
+                 * instruction performed none this reader can see -- QEMU does
+                 * it inside the helper.  Publishing the empty set would say
+                 * the chain is broken, so the statement is withdrawn and the
+                 * read-set fallback below stands instead.
+                 */
+                d->writes[i].sourced = false;
+            }
+        }
+        if (!d->writes[i].sourced && df_empty(d->writes[i].prov)) {
             df_union(d->writes[i].prov, d->rd);
         }
     }
     for (unsigned i = 0; i < d->n_fields; i++) {
-        if ((d->fields[i].dir & INSN_DF_WR) && !d->fields[i].sourced &&
-            df_empty(d->fields[i].prov)) {
+        if (!(d->fields[i].dir & INSN_DF_WR)) {
+            continue;
+        }
+        if (d->fields[i].from_loads) {
+            if (any_load) {
+                df_union(d->fields[i].prov, loads);
+            } else if (df_empty(d->fields[i].prov)) {
+                d->fields[i].sourced = false;
+            }
+        }
+        if (!d->fields[i].sourced && df_empty(d->fields[i].prov)) {
             df_union(d->fields[i].prov, d->rd);
         }
     }

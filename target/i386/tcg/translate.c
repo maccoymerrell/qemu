@@ -2927,6 +2927,74 @@ static void x87_pop(void)
 }
 
 /*
+ * WHERE A MEMORY FORM'S VALUE CAME FROM, AND WHY IT HAS TO BE SAID.
+ *
+ * The statements above name the accesses and say nothing about the values.
+ * That is all the reader needs on a register form, where the fallback it
+ * applies -- the instruction's own register read set -- is empty and an empty
+ * account is what the arm would have said anyway.  On a MEMORY form the same
+ * fallback is actively wrong: the only register such an instruction reads is
+ * the one that computed the ADDRESS, so the wire named the pointer as the
+ * producer of ST(0) and of the status word.  It is not.  FLD's ST(0) and the
+ * exception bits it accumulates are functions of the DATUM the access moved
+ * and of the control word; FADD's are functions of the datum, of ST(0) and of
+ * the rounding mode; a store's are functions of ST(0).  The pointer chose
+ * which memory and supplied no part of the value.
+ *
+ * gem5 was the witness: over the six x87 memory forms of the depmap probe it
+ * routes the loaded value into the FP result and into the status word, and
+ * names the base register in neither.  The address half of the same
+ * instructions already agreed 56 of 56, which is what made the disagreement
+ * readable as a value-half defect rather than an addressing one.
+ *
+ * Only the memory arms say this.  The register arms' value half is a separate
+ * question with a separate answer -- they have no datum, and what they under-
+ * report is the stack operands themselves -- and it is not settled here.
+ */
+static void x87_wr_from(const char *name, const InsnDataflowAtom *src,
+                        unsigned n)
+{
+    insn_dataflow_state_write_from(insn_df_reg(name), src, n);
+}
+
+/*
+ * The status word an exception check accumulates into, with its value stated.
+ *
+ * @v is what the operation consumed besides the control and status words
+ * themselves: the loaded datum, ST(0), or both, depending on the form.
+ */
+static void x87_exc_from(const InsnDataflowAtom *v, unsigned n)
+{
+    InsnDataflowAtom src[4];
+    unsigned k = 0;
+
+    x87_rd("fpuc");
+    x87_rd("fpus");
+    for (unsigned i = 0; i < n && k < ARRAY_SIZE(src) - 2; i++) {
+        src[k++] = v[i];
+    }
+    src[k++] = insn_df_reg("fpuc");
+    src[k++] = insn_df_reg("fpus");
+    x87_wr_from("fpus", src, k);
+}
+
+/*
+ * fpush()/fpop() on a memory form: the top moves on its own value, and the
+ * tag word the moved-to entry lands in is a function of the tag word and of
+ * the top that selected the entry.
+ */
+static void x87_topmove_sourced(void)
+{
+    InsnDataflowAtom top = insn_df_reg("fpstt");
+    InsnDataflowAtom tag[2] = { insn_df_reg("fptag"), insn_df_reg("fpstt") };
+
+    x87_rd("fpstt");
+    x87_rd("fptag");
+    x87_wr_from("fpstt", &top, 1);
+    x87_wr_from("fptag", tag, 2);
+}
+
+/*
  * The x87 facts the ops cannot carry, stated once per instruction.
  *
  * Every effect of an x87 instruction except its memory access is behind a
@@ -2968,17 +3036,30 @@ static void x86_df_x87(bool mem, int op, int rm)
              * The memory operand is converted into QEMU's ft0 scratch and
              * combined with ST(0).  ft0 is not a register: it is the
              * emulation's carrier for an operand the architecture never
-             * names, so it is not stated.
+             * names, so it is not stated.  Its VALUE is stated, as the datum
+             * of the access that produced it.
              */
-            insn_dataflow_note_word(arith_word[op1]);
-            x87_top();
-            x87_rd_st(0);
-            x87_exc();
-            if (op1 != 2 && op1 != 3) {
-                x87_wr_st(0);
-            }
-            if (op1 == 3) {     /* fcomp pops */
-                x87_pop();
+            {
+                InsnDataflowAtom v[2] = { insn_df_loaded(),
+                                          insn_df_reg(x86_x87_st_names[0]) };
+                InsnDataflowAtom r[3] = { insn_df_loaded(),
+                                          insn_df_reg(x86_x87_st_names[0]),
+                                          insn_df_reg("fpuc") };
+
+                insn_dataflow_note_word(arith_word[op1]);
+                x87_top();
+                x87_rd_st(0);
+                x87_exc_from(v, 2);
+                if (op1 != 2 && op1 != 3) {
+                    /*
+                     * The result is the datum, ST(0) and the rounding and
+                     * precision control the control word carries.
+                     */
+                    x87_wr_from(x86_x87_st_names[0], r, 3);
+                }
+                if (op1 == 3) { /* fcomp pops */
+                    x87_topmove_sourced();
+                }
             }
             break;
 
@@ -2993,11 +3074,21 @@ static void x86_df_x87(bool mem, int op, int rm)
              * A load with the format widening every x87 memory form performs.
              * The widening is implicit in the access and does not distinguish
              * these encodings from each other, so the access is the word.
+             *
+             * fldt and fbld pass tcg_env and an address to a helper that
+             * performs the access itself, so there is no load op and no datum
+             * atom to resolve; the reader withdraws the statement for them and
+             * the pessimistic fallback stands.  That is the undeclared-access
+             * class, not a second answer to this question.
              */
-            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
-            x87_push();
-            x87_wr_st(0);
-            x87_exc();
+            {
+                InsnDataflowAtom v[1] = { insn_df_loaded() };
+
+                insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+                x87_topmove_sourced();
+                x87_wr_from(x86_x87_st_names[0], v, 1);
+                x87_exc_from(v, 1);
+            }
             break;
 
         case 0x19: case 0x1a: case 0x1b:   /* fisttpl, fistl,  fistpl  */
@@ -3007,17 +3098,26 @@ static void x86_df_x87(bool mem, int op, int rm)
         case 0x1f:                         /* fstpt   m80fp            */
         case 0x3e:                         /* fbstp   m80bcd           */
         case 0x3f:                         /* fistpll m64int           */
-            insn_dataflow_note_word(INSN_DF_WORD_STORE);
-            x87_top();
-            x87_rd_st(0);
-            x87_exc();
-            /*
-             * The popping forms: every `p` suffix, plus fisttp, which pops
-             * unconditionally.  0x1f/0x3e/0x3f are fstpt/fbstp/fistpll.
-             */
-            if (op1 == 1 || op1 == 3 || op == 0x1f || op == 0x3e ||
-                op == 0x3f) {
-                x87_pop();
+            {
+                InsnDataflowAtom v[1] = { insn_df_reg(x86_x87_st_names[0]) };
+
+                insn_dataflow_note_word(INSN_DF_WORD_STORE);
+                x87_top();
+                x87_rd_st(0);
+                /*
+                 * The conversion that produces the stored datum is what can
+                 * raise, so the status word accumulates from ST(0) and from
+                 * the control word -- and, again, not from the pointer.
+                 */
+                x87_exc_from(v, 1);
+                /*
+                 * The popping forms: every `p` suffix, plus fisttp, which pops
+                 * unconditionally.  0x1f/0x3e/0x3f are fstpt/fbstp/fistpll.
+                 */
+                if (op1 == 1 || op1 == 3 || op == 0x1f || op == 0x3e ||
+                    op == 0x3f) {
+                    x87_topmove_sourced();
+                }
             }
             break;
 
@@ -3030,8 +3130,12 @@ static void x86_df_x87(bool mem, int op, int rm)
             break;
 
         case 0x0d:              /* fldcw   m16 */
-            insn_dataflow_note_word(INSN_DF_WORD_LOAD);
-            x87_wr("fpuc");
+            {
+                InsnDataflowAtom v[1] = { insn_df_loaded() };
+
+                insn_dataflow_note_word(INSN_DF_WORD_LOAD);
+                x87_wr_from("fpuc", v, 1);
+            }
             break;
 
         case 0x0e:              /* fnstenv m14/28byte */
@@ -3425,6 +3529,27 @@ static void x86_df_x87(bool mem, int op, int rm)
     }
 }
 
+/*
+ * THE DATUM AN x87 STORE MOVES IS ST(0), AND NO OP SAYS SO.
+ *
+ * The helper that converts ST(0) into the format the store writes takes
+ * tcg_env and returns the value in a temp, so the temp's account is empty and
+ * the store published a datum that depended on nothing.  Binding the temp
+ * where the helper produced it is what the emitter knows and the op stream
+ * does not.  The two spellings differ only in the width the helper returned.
+ */
+static void x87_bind_st0_i32(DisasContext *s)
+{
+    insn_dataflow_bind(tcgv_i32_temp(s->tmp2_i32),
+                       insn_df_reg(x86_x87_st_names[0]));
+}
+
+static void x87_bind_st0_i64(DisasContext *s)
+{
+    insn_dataflow_bind(tcgv_i64_temp(s->tmp1_i64),
+                       insn_df_reg(x86_x87_st_names[0]));
+}
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -3527,17 +3652,20 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 switch (op >> 4) {
                 case 1:
                     gen_helper_fisttl_ST0(s->tmp2_i32, tcg_env);
+                    x87_bind_st0_i32(s);
                     tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                         s->mem_index, MO_LEUL);
                     break;
                 case 2:
                     gen_helper_fisttll_ST0(s->tmp1_i64, tcg_env);
+                    x87_bind_st0_i64(s);
                     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                         s->mem_index, MO_LEUQ);
                     break;
                 case 3:
                 default:
                     gen_helper_fistt_ST0(s->tmp2_i32, tcg_env);
+                    x87_bind_st0_i32(s);
                     tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                         s->mem_index, MO_LEUW);
                     break;
@@ -3548,22 +3676,26 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                 switch (op >> 4) {
                 case 0:
                     gen_helper_fsts_ST0(s->tmp2_i32, tcg_env);
+                    x87_bind_st0_i32(s);
                     tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                         s->mem_index, MO_LEUL);
                     break;
                 case 1:
                     gen_helper_fistl_ST0(s->tmp2_i32, tcg_env);
+                    x87_bind_st0_i32(s);
                     tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                         s->mem_index, MO_LEUL);
                     break;
                 case 2:
                     gen_helper_fstl_ST0(s->tmp1_i64, tcg_env);
+                    x87_bind_st0_i64(s);
                     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                         s->mem_index, MO_LEUQ);
                     break;
                 case 3:
                 default:
                     gen_helper_fist_ST0(s->tmp2_i32, tcg_env);
+                    x87_bind_st0_i32(s);
                     tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                         s->mem_index, MO_LEUW);
                     break;
@@ -3592,6 +3724,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x0f: /* fnstcw mem */
             gen_helper_fnstcw(s->tmp2_i32, tcg_env);
+            insn_dataflow_bind(tcgv_i32_temp(s->tmp2_i32),
+                               insn_df_reg("fpuc"));
             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                 s->mem_index, MO_LEUW);
             update_fip = update_fdp = false;
@@ -3615,6 +3749,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x2f: /* fnstsw mem */
             gen_helper_fnstsw(s->tmp2_i32, tcg_env);
+            insn_dataflow_bind(tcgv_i32_temp(s->tmp2_i32),
+                               insn_df_reg("fpus"));
             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                 s->mem_index, MO_LEUW);
             update_fip = update_fdp = false;
@@ -3633,6 +3769,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x3f: /* fistpll */
             gen_helper_fistll_ST0(s->tmp1_i64, tcg_env);
+            x87_bind_st0_i64(s);
             tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                 s->mem_index, MO_LEUQ);
             gen_helper_fpop(tcg_env);

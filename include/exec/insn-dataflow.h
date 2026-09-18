@@ -277,6 +277,8 @@ typedef struct InsnDataflowField {
      * register's mask saw the pointer as a source of the datum.
      */
     bool     sourced;
+    /* Plus every load's datum; see InsnDataflowWrite::from_loads. */
+    bool     from_loads;
 } InsnDataflowField;
 
 /*
@@ -318,6 +320,22 @@ typedef struct InsnDataflowWrite {
      * special-cases.
      */
     uint64_t prov[INSN_DF_REG_WORDS];
+    /*
+     * A DECODE SITE ANSWERED THE QUESTION, so the read-set fallback is not
+     * consulted for this write.  The field side carries the same distinction
+     * under the name `sourced`, for the same reason: silence and an answer of
+     * "nothing" have to stay different things.
+     */
+    bool     sourced;
+    /*
+     * Plus the data every load this instruction performed returned.
+     *
+     * Resolved at close rather than when it was stated, because the access
+     * rows do not exist until the op walk has run.  A statement that finds no
+     * load to resolve against leaves the write UNSOURCED instead of
+     * publishing an empty set -- see insn_df_loaded().
+     */
+    bool     from_loads;
 } InsnDataflowWrite;
 
 /*
@@ -594,6 +612,7 @@ typedef struct InsnDataflow {
 #define INSN_DF_A_ZERO   2      /* the architectural zero register */
 #define INSN_DF_A_IMM    3      /* an immediate field of the encoding */
 #define INSN_DF_A_CONST  4      /* a constant that is not an encoded field */
+#define INSN_DF_A_LOADED 5      /* the data this instruction's loads returned */
 
 typedef struct InsnDataflowAtom {
     uint8_t kind;
@@ -633,6 +652,37 @@ static inline InsnDataflowAtom insn_df_imm(void)
 static inline InsnDataflowAtom insn_df_const(void)
 {
     InsnDataflowAtom a = { .kind = INSN_DF_A_CONST };
+    return a;
+}
+
+/*
+ * THE DATA THIS INSTRUCTION'S GUEST LOADS RETURNED.
+ *
+ * It has no register name, so it cannot be spelled with insn_df_reg(), and it
+ * is not one access either: a state-restore reads a structure through a run
+ * of them and its whole result is a function of all of it.  So the atom means
+ * EVERY load the instruction performed, and the reader resolves it after the
+ * op walk, when the access rows exist -- one bit per access, the same bits a
+ * load's own destination already carries.
+ *
+ * A DECODE SITE NAMES IT WHEN THE VALUE IS BEHIND A HELPER.  `fld m32fp`
+ * loads the datum into a temp and hands it to a helper that writes ST(0)
+ * inside CPUArchState: no op writes the register, so the write is stated, and
+ * a stated write with no stated source is filled with the instruction's
+ * register read set -- which on a memory form holds the ADDRESS BASE and
+ * nothing else.  The pointer chose which memory; the memory supplied the
+ * value.  This atom is how the arm says so.
+ *
+ * Where QEMU performs the access INSIDE the helper -- fldt, fbld and their
+ * store twins pass tcg_env and an address and emit no load op at all -- there
+ * are no access rows to resolve against.  The reader leaves such a write
+ * unsourced rather than publishing an empty set, so the pessimistic fallback
+ * stands and the missing declaration stays one item rather than becoming a
+ * fabricated broken chain.
+ */
+static inline InsnDataflowAtom insn_df_loaded(void)
+{
+    InsnDataflowAtom a = { .kind = INSN_DF_A_LOADED };
     return a;
 }
 
@@ -741,6 +791,31 @@ void insn_dataflow_extract(unsigned num_insns);
  */
 void insn_dataflow_state_read(InsnDataflowAtom a);
 void insn_dataflow_state_write(InsnDataflowAtom a);
+
+/*
+ * The instruction writes @a, and @src is where that value came from.
+ *
+ * insn_dataflow_state_write() records the access and says nothing about the
+ * value, and the reader then answers with the instruction's whole register
+ * read set: pessimistic, and the only answer available when the emitter said
+ * nothing.  On a memory form that set is the ADDRESS BASE and nothing else,
+ * which is not merely imprecise -- it names the pointer as the producer of a
+ * value the pointer did not supply.  An arm that knows the answer says it
+ * here, and the fallback is not consulted for that destination.
+ *
+ * The sources ACCUMULATE: an arm may say a destination takes its value from
+ * several places, and calling this twice for one destination unions them, the
+ * same way a register written twice unions its accounts.
+ *
+ * An atom that names nothing this build knows -- a register no target
+ * registered, or insn_df_loaded() on an instruction whose access QEMU
+ * performs inside the helper -- contributes no bit, and a statement left with
+ * no bits at all leaves the write unsourced rather than publishing an empty
+ * set.  Silence is recoverable; a fabricated broken chain is not.
+ */
+void insn_dataflow_state_write_from(InsnDataflowAtom a,
+                                    const InsnDataflowAtom *src,
+                                    unsigned nsrc);
 
 /*
  * @ts carries the value of @a.
@@ -999,6 +1074,10 @@ static inline void insn_dataflow_extract(unsigned num_insns)
 static inline void insn_dataflow_state_read(InsnDataflowAtom a)
 { }
 static inline void insn_dataflow_state_write(InsnDataflowAtom a)
+{ }
+static inline void insn_dataflow_state_write_from(InsnDataflowAtom a,
+                                                  const InsnDataflowAtom *src,
+                                                  unsigned nsrc)
 { }
 static inline void insn_dataflow_bind(const void *ts, InsnDataflowAtom a)
 { }

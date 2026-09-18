@@ -23,6 +23,17 @@ DISAGREE row is an arbitration to be written, on the merits, against the
 precedent corpus; it is not a defect in either column and this tool never
 calls one a defect.
 
+TWO BUCKETS ALSO MINT CLASSES, because a bucket is not always the end of the
+question.  NO-RULE and NO-WORD both mean "QEMU named nothing"; when the
+reference names an opcode anyway, that encoding has two answers exactly as a
+DISAGREE does, and it is keyed and arbitrated the same way -- `#no-rule` and
+`#no-word` standing in for the missing QEMU word.  When the reference is also
+silent no class is minted, because there is nothing to arbitrate.  That split
+matters: measured on the tip corpora the NO-WORD bucket is 2 / 29 / 18 / 380
+and the half a reference actually names is 2 / 29 / 1 / 26, so a reading that
+took the bucket whole would convict on hundreds of encodings nobody states
+anything about.
+
 WHAT IT CAN DO is say whether the arbitration HAS been written.  With
 --rulings it joins each disagreement class against the checked-in corpus in
 gapreport_rulings.tsv, keyed on (isa, rule, qemu opcode, capstone opcode),
@@ -187,6 +198,18 @@ def read_rulings(path):
     return rulings
 
 
+#: The words that mean "the reference said nothing here".  One test, used
+#: everywhere a class is minted, because a reference that names nothing states
+#: nothing to arbitrate -- and a class minted over its silence would be an
+#: arbitration between one answer and no answer.
+BLANK_WORDS = ("", "-", "GEN_OP_UNKNOWN", "GEN_OP_???")
+
+
+def ref_named(c_op):
+    """Did the reference actually name an opcode for this encoding?"""
+    return c_op is not None and c_op not in BLANK_WORDS
+
+
 def classify(ident, opc):
     """One encoding's bucket, and the pair of opcodes that decided it."""
     q_rule, q_word, q_op = ident[3], ident[4], ident[5]
@@ -198,7 +221,7 @@ def classify(ident, opc):
         return "NO-WORD", q_op, c_op
     if q_op == "#unknownword":
         return "UNKNOWN-WORD", q_op, c_op
-    if c_op is None or c_op in ("", "-", "GEN_OP_UNKNOWN", "GEN_OP_???"):
+    if not ref_named(c_op):
         return "CAPSTONE-BLANK", q_op, c_op
     return ("AGREE" if q_op == c_op else "DISAGREE"), q_op, c_op
 
@@ -260,13 +283,39 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
             classes[(isa, row[3], q_op, c_op)] += 1
         if bucket in ("NO-RULE", "NO-WORD"):
             rules[row[3]] += 1
-        if bucket == "NO-RULE" and c_op is not None:
+        if bucket == "NO-RULE" and ref_named(c_op):
             #
             # The bytes reached no rule and the incumbent nevertheless names
             # an opcode.  That is a class with two answers as much as a
             # DISAGREE is, so it is keyed and arbitrated the same way.
             #
             classes[(isa, "#undecoded", "#no-rule", c_op)] += 1
+        if bucket == "NO-WORD" and ref_named(c_op):
+            #
+            # A RULE MATCHED, THE WIRE HAS NO WORD FOR IT, AND THE REFERENCE
+            # NAMES ONE.  Exactly the shape above, one step further in: the
+            # bytes reached a decoder rule, so the identity is not in doubt,
+            # and the generic vocabulary still has nothing to publish while
+            # the incumbent does.  Two answers, one encoding; it is keyed and
+            # arbitrated like any other.
+            #
+            # IT WAS INVISIBLE BEFORE THIS, and invisible in the one direction
+            # that matters.  `NO-WORD` is a single bucket count, and it adds
+            # together two facts that are not the same: an encoding the
+            # reference also cannot name (nothing is lost -- nobody states
+            # anything) and an encoding the reference names while the wire is
+            # silent (information the trace does not carry).  Measured on the
+            # tip corpora the split is 2 of 2 / 29 of 29 / 1 of 18 / 26 of
+            # 380 -- so on riscv64 and mipsel the collapsed count is mostly
+            # the harmless half, and a gate reading the bucket would have
+            # convicted on rows where no reference says anything at all.
+            #
+            # `#no-word` is the qemu-side key, parallel to `#no-rule`, and the
+            # RULE is carried in the key for the reason the header gives: a
+            # class keyed on the opcode pair alone grows silently as new rules
+            # join it.
+            #
+            classes[(isa, row[3], "#no-word", c_op)] += 1
 
     total = sum(counts.values())
     print("== %s   %d encodings, %d also in the Capstone corpus"
@@ -514,6 +563,55 @@ def selftest_universe():
     return 0 if all(cases) else 1
 
 
+def selftest_noword():
+    """Prove the `#no-word` class is minted, and ONLY where it should be.
+
+    Both directions, because the whole value of the class is the split it
+    makes: a rule that matched with no generic word is an arbitration when the
+    reference names an opcode and is NOTHING when the reference is silent.  An
+    arm that only ever mints would put every unnamed encoding in the gate's
+    criterion; an arm that never mints is the invisibility this class replaces.
+    """
+    import tempfile
+
+    cases = [
+        # (name, capstone opcode, expect a class?)
+        ("reference names one", "GEN_OP_INT_ADD", True),
+        ("reference blank word", "GEN_OP_UNKNOWN", False),
+        ("reference empty",      "-",             False),
+        ("reference absent",     None,            False),
+    ]
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        ip = os.path.join(d, "ident_q.tsv")
+        op = os.path.join(d, "opc_q.tsv")
+        for name, c_op, want in cases:
+            with open(ip, "w") as f:
+                f.write(STAMP + "\n#h\n")
+                # one AGREE row so the join is never empty, then the subject
+                f.write("q\t01\tadd\tadd\tint.add\tGEN_OP_INT_ADD\t"
+                        "BRANCH_NONE\n")
+                f.write("q\t02\tsys\tSYS\t-\t#noword\t#noword\n")
+            with open(op, "w") as f:
+                f.write(STAMP + "\n#h\nq\t01\tadd\tGEN_OP_INT_ADD\n")
+                if c_op is not None:
+                    f.write("q\t02\tsys\t%s\n" % c_op)
+            sink = open(os.devnull, "w")
+            try:
+                _c, classes, _u, _s = report("q", ip, op, 0, sink)
+            finally:
+                sink.close()
+            got = ("q", "SYS", "#no-word", c_op) in classes
+            ok = got == want
+            print("  no-word:%-22s %s" % (name, "ok" if ok else
+                                          "FAILED (minted=%s)" % got))
+            if not ok:
+                bad += 1
+    print("gapreport no-word selftest: %d of %d arms fired as designed"
+          % (len(cases) - bad, len(cases)))
+    return 1 if bad else 0
+
+
 def selftest():
     """Prove every bucket and every refusal can fire, on planted corpora.
 
@@ -585,7 +683,8 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest() | selftest_rulings() | selftest_universe()
+        return (selftest() | selftest_rulings() | selftest_universe()
+                | selftest_noword())
 
     if not args.dir or not args.isa:
         print("gapreport: --dir and at least one --isa are required",

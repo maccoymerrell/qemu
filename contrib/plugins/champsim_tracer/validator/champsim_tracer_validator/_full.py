@@ -286,6 +286,10 @@ def _run_cli(argv: list, timeout: int, log_path: Path,
     return rc, tail
 
 
+#: "stall"/"stalled"/"stalls" as a WORD -- never the tail of "install".
+_STALL_WORD_RE = re.compile(r"\bstall(?:s|ed|ing)?\b")
+
+
 def _classify_cli_failure(tail: str) -> str:
     """Name the cause on the summary line.
 
@@ -307,7 +311,8 @@ def _classify_cli_failure(tail: str) -> str:
             return ln[2:].strip()
     for ln in lines:
         low = ln.lower()
-        if "stall" in low or "clock" in low and "progress" in low:
+        if (_STALL_WORD_RE.search(low)
+                or ("clock" in low and "progress" in low)):
             return ln
     return lines[-1] if lines else "no output"
 

@@ -200,7 +200,7 @@ enum BranchType {
  */
 enum GenericRegId {
     REG_NONE = 0,
-    /* General-purpose integer registers: 1-64 */
+    /* General-purpose integer registers: 1-60 */
     REG_GPR0 = 1,
     REG_GPR1, REG_GPR2, REG_GPR3, REG_GPR4, REG_GPR5, REG_GPR6, REG_GPR7,
     REG_GPR8, REG_GPR9, REG_GPR10, REG_GPR11, REG_GPR12, REG_GPR13,
@@ -211,8 +211,26 @@ enum GenericRegId {
     REG_GPR38, REG_GPR39, REG_GPR40, REG_GPR41, REG_GPR42, REG_GPR43,
     REG_GPR44, REG_GPR45, REG_GPR46, REG_GPR47, REG_GPR48, REG_GPR49,
     REG_GPR50, REG_GPR51, REG_GPR52, REG_GPR53, REG_GPR54, REG_GPR55,
-    REG_GPR56, REG_GPR57, REG_GPR58, REG_GPR59, REG_GPR60, REG_GPR61,
-    REG_GPR62, REG_GPR63,
+    REG_GPR56, REG_GPR57, REG_GPR58, REG_GPR59,
+    /*
+     * Accumulator HIGH halves: 61-64.  MIPS `mfhi` and `mflo` read
+     * DIFFERENT hardware, so HI<n> and LO<n> are two architecturally
+     * distinct registers and may not share one id: sharing one manufactures
+     * a dependency between every `mthi` and every later `mflo`, and it
+     * forbids either half a VALUE, because publishing 32 bits under a name
+     * that means the whole 64-bit accumulator publishes a partial value as
+     * a whole one.  REG_ACC<n> below is the LOW half; this is the high one.
+     *
+     * The four ids come out of the top of the integer block, which is
+     * dead space: no ISA this tracer targets has more than 32 GPRs, so
+     * REG_GPR32..REG_GPR63 had no occupant on any of the four generated
+     * tables and never could acquire one.  Nothing renumbers — every id
+     * that carries a register keeps the value it had — and the space the
+     * four came from is the space the register-assignment ruling measured
+     * and named first when it recorded that room is not the constraint.
+     */
+    REG_ACCHI0 = 61,
+    REG_ACCHI1, REG_ACCHI2, REG_ACCHI3,
     /* Floating-point registers: 65-128 */
     REG_FPR0 = 65,
     REG_FPR1, REG_FPR2, REG_FPR3, REG_FPR4, REG_FPR5, REG_FPR6, REG_FPR7,
@@ -254,6 +272,7 @@ enum GenericRegId {
     REG_DEBUG = 232,
     REG_BOUND0 = 233,
     REG_BOUND1, REG_BOUND2, REG_BOUND3,
+    /* Accumulator LOW halves; REG_ACCHI0..3 above carry the high ones. */
     REG_ACC0 = 237,
     REG_ACC1, REG_ACC2, REG_ACC3,
     REG_ZERO = 241,
@@ -270,12 +289,22 @@ enum GenericRegId {
      * and a register that exists in a SINGLE ISA never qualifies.  Fold
      * it onto whichever existing ID roughly matches its role.
      *
-     * A fold can manufacture a dependency the guest does not have, and
-     * that is a real cost.  It is not, on its own, grounds for a new
-     * ID: it is the ordinary price of a generic format, paid so that a
-     * consumer sees one register model instead of four.  Precision is
-     * bought back through the refiners, which are per-behaviour rather
-     * than per-ISA.
+     * A FOLD THAT MANUFACTURES A DEPENDENCY IS A MAPPING DEFECT, not an
+     * accepted cost.  Two ARCHITECTURALLY DISTINCT registers sharing one
+     * id give a consumer an edge the guest does not have, and the remedy
+     * is to separate them, not to price the error.  Two spellings of the
+     * SAME hardware register — v0 and z0, rax and eax, a register-list or
+     * LMUL-group form and its base — are aliases and belong on one id;
+     * only distinct hardware sharing an id is a collision.
+     *
+     * Room is not the constraint and may not be offered as one.  No ISA
+     * this tracer targets has more than 32 GPRs, 32 FP registers or 32
+     * vector registers, so the upper halves of those three blocks are
+     * space that can be reclaimed for a register that needs its own id;
+     * REG_ACCHI0..3 came from the integer block's, and 247-249 are still
+     * unallocated on top of that.  What DOES constrain a new id is the
+     * behaviour argument: a register that exists in a SINGLE ISA and
+     * whose fold costs a consumer nothing still does not earn one.
      *
      *   REG_TLS     the thread pointer — AArch64 TPIDR_EL0 /
      *               TPIDRRO_EL0, the MIPS CP0 UserLocal word that
@@ -448,8 +477,10 @@ static inline const char *generic_reg_name(unsigned id)
     }
     /* Dense bank ranges — index relative to bank base. */
     static __thread char buf[24];
-    if (id >= REG_GPR0 && id < REG_GPR0 + 64) {
+    if (id >= REG_GPR0 && id < REG_GPR0 + 60) {
         snprintf(buf, sizeof(buf), "REG_GPR%u", id - REG_GPR0);
+    } else if (id >= REG_ACCHI0 && id < REG_ACCHI0 + 4) {
+        snprintf(buf, sizeof(buf), "REG_ACCHI%u", id - REG_ACCHI0);
     } else if (id >= REG_FPR0 && id < REG_FPR0 + 64) {
         snprintf(buf, sizeof(buf), "REG_FPR%u", id - REG_FPR0);
     } else if (id >= REG_VEC0 && id < REG_VEC0 + 64) {

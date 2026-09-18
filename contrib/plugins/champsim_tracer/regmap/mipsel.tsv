@@ -8,14 +8,14 @@
 # target's own registration sites and REFUSES to generate if this file is
 # short a name or carries one the target never registers.
 DSPControl	REG_FLAGS	DSP condition/carry/pos bits
-HI0	REG_ACC0	HI<n>/LO<n> are the two halves of accumulator <n>
-HI1	REG_ACC1	HI<n>/LO<n> are the two halves of accumulator <n>
-HI2	REG_ACC2	HI<n>/LO<n> are the two halves of accumulator <n>
-HI3	REG_ACC3	HI<n>/LO<n> are the two halves of accumulator <n>
-LO0	REG_ACC0	HI<n>/LO<n> are the two halves of accumulator <n>
-LO1	REG_ACC1	HI<n>/LO<n> are the two halves of accumulator <n>
-LO2	REG_ACC2	HI<n>/LO<n> are the two halves of accumulator <n>
-LO3	REG_ACC3	HI<n>/LO<n> are the two halves of accumulator <n>
+HI0	REG_ACCHI0	HI<n> is the high half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+HI1	REG_ACCHI1	HI<n> is the high half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+HI2	REG_ACCHI2	HI<n> is the high half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+HI3	REG_ACCHI3	HI<n> is the high half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+LO0	REG_ACC0	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+LO1	REG_ACC1	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+LO2	REG_ACC2	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
+LO3	REG_ACC3	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
 PC	REG_IP	arch-role: the program counter
 XCR	REG_VCTRL	MXU control register
 XR1	REG_VEC1	MXU register file index

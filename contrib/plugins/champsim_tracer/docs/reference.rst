@@ -521,8 +521,14 @@ without implying any particular numeric base.
        written into a template's ``src_regs`` / ``dst_regs`` and
        consumers will not see it on the wire.  The decoder reserves
        the name purely as a debugging fallback.
-   * - ``REG_GPR0`` .. ``REG_GPR63``
-     - General-purpose integer registers.
+   * - ``REG_GPR0`` .. ``REG_GPR59``
+     - General-purpose integer registers.  The band stops at 59 because
+       no supported target has more than 32, and the four ids freed at
+       its top carry ``REG_ACCHI0``..``REG_ACCHI3``.
+   * - ``REG_ACCHI0`` .. ``REG_ACCHI3``
+     - Accumulator HIGH halves — MIPS ``HI0``..``HI3``, the half
+       ``mfhi`` reads and ``mthi`` writes.  Paired with ``REG_ACC0``..
+       ``REG_ACC3`` below, which are the low halves.
    * - ``REG_FPR0`` .. ``REG_FPR63``
      - Scalar floating-point registers.
    * - ``REG_VEC0`` .. ``REG_VEC63``
@@ -558,8 +564,11 @@ without implying any particular numeric base.
    * - ``REG_BOUND0`` .. ``REG_BOUND3``
      - x86 MPX bound registers.
    * - ``REG_ACC0`` .. ``REG_ACC3``
-     - Accumulator-style architectural registers (MIPS HI/LO,
-       AArch64 SME accumulators).
+     - Accumulator LOW halves — MIPS ``LO0``..``LO3``, the half ``mflo``
+       reads and ``mtlo`` writes.  ``mfhi`` and ``mflo`` read different
+       hardware, so the two halves of an accumulator are two registers
+       with two ids; the DSP name ``$ac<n>`` denotes the pair and
+       therefore both ids at once.
    * - ``REG_ZERO``
      - Hardwired-zero register (RISC-V ``x0``, MIPS ``$zero``,
        aarch64 ``xzr``).

@@ -2826,7 +2826,8 @@ Current generic register layout:
    | Values      | Class              |
    +-------------+--------------------+
    | 0           | REG_NONE           |
-   | 1..64       | REG_GPR0..63       |
+   | 1..60       | REG_GPR0..59       |
+   | 61..64      | REG_ACCHI0..3      |
    | 65..128     | REG_FPR0..63       |
    | 129..192    | REG_VEC0..63       |
    | 193..224    | REG_PRED0..31      |
@@ -2846,6 +2847,16 @@ a consumer as badly as a missing one — a thread-pointer read must not
 be ordered behind an unrelated ``mrs``, and a vector op clearing
 ``vstart`` must not look like it redefined ``vl``.  :doc:`reference`
 carries the per-ID notes.
+
+``REG_ACCHI0..3`` sit outside that band, at the top of the integer
+block, because no target has more than 32 general-purpose registers and
+``REG_GPR32..63`` never acquired an occupant.  They are the accumulator
+HIGH halves; ``REG_ACC0..3`` are the low ones.  MIPS ``mfhi`` and
+``mflo`` read different hardware, so the halves are two registers and
+take two ids: one id would order every ``mflo`` behind every ``mthi``,
+and would leave neither half able to publish a value, since 32 bits
+under a name meaning the whole 64-bit accumulator is a partial value
+presented as a whole one.
 
 The header map, not this table, is authoritative for decoding names.
 

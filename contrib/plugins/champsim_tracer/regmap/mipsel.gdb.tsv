@@ -58,10 +58,10 @@ fcr0	REG_FCSR	route: the incumbent per-ISA table routed REG_FCSR here, and this 
 fcr31	REG_FCSR	noroute: FCSR proper shares REG_FCSR with the implementation register fcr0; fcr0 carries the route
 fp	REG_FP_REG	noroute: gdb spells $30 by its frame-pointer role; the s8 row names the same register and carries the route
 gp	REG_GPR28	incumbent: the per-ISA table routed this gdb name here
-hi	REG_ACC0	noroute: MIPS HI is the high half of accumulator 0; reading one half would publish a partial value under the whole accumulator's name, so REG_ACC0 has no value read
+hi	REG_ACCHI0	MIPS HI is the high half of accumulator 0 and now has an id of its own, so the read publishes a whole register's value under a name that means that register
 k0	REG_GPR26	incumbent: the per-ISA table routed this gdb name here
 k1	REG_GPR27	incumbent: the per-ISA table routed this gdb name here
-lo	REG_ACC0	noroute: MIPS LO is the low half of accumulator 0; reading one half would publish a partial value under the whole accumulator's name, so REG_ACC0 has no value read
+lo	REG_ACC0	MIPS LO is the low half of accumulator 0 and REG_ACC0 now means that half alone, so the read publishes a whole register's value under a name that means that register
 pc	REG_IP	incumbent: the per-ISA table routed this gdb name here
 ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
 s0	REG_GPR16	incumbent: the per-ISA table routed this gdb name here

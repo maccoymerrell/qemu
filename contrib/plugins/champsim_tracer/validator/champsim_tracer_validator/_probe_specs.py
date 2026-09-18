@@ -1553,9 +1553,15 @@ _register_probe('probe_implicit_acc', {
         'clobbers': '"$t1","$t2","$t3","$t4","hi","lo"',
         'opcodes': ['INT_MUL'],
         'insns': [
+            # HI0 and LO0 are two registers, so `mult` writes both and
+            # each of `mfhi`/`mflo` reads exactly the one it names.  A
+            # single accumulator id would make this row read
+            # src=[REG_ACC0] twice and hide a dependency `mflo` does not
+            # have on the half `mthi` writes.
             {}, {},
-            {"src": ["REG_GPR9", "REG_GPR10"], "dst": ["REG_ACC0"]},
-            {"src": ["REG_ACC0"], "dst": ["REG_GPR11"]},
+            {"src": ["REG_GPR9", "REG_GPR10"],
+             "dst": ["REG_ACCHI0", "REG_ACC0"]},
+            {"src": ["REG_ACCHI0"], "dst": ["REG_GPR11"]},
             {"src": ["REG_ACC0"], "dst": ["REG_GPR12"]},
         ]},
 })

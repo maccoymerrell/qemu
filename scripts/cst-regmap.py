@@ -804,10 +804,11 @@ def check_route_adjudications(path, isa, rows):
     of them does.
 
     An id with several names is not a spelling choice.  x86's REG_CTRL is
-    carried by cr0, cr2, cr3, cr4, cr8 and efer; MIPS's REG_ACC0 by hi and
-    lo.  Reading the wrong one publishes a different register's bytes under
-    the id's name, and reading half a container publishes a partial value as
-    a whole one.  Neither is something a generator may pick, so the pick is
+    carried by cr0, cr2, cr3, cr4, cr8 and efer.  Reading the wrong one
+    publishes a different register's bytes under the id's name, and reading
+    half a container publishes a partial value as a whole one -- which is
+    what MIPS hi and lo did for as long as they shared REG_ACC0, and why
+    they no longer do.  Neither is something a generator may pick, so the pick is
     a row in the table with a ground behind it, and this refuses the build
     when an ambiguous id has not been adjudicated.
 

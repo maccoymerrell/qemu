@@ -120,7 +120,32 @@ selftest() {
     # `static/mipsel` 1 differs from the pre-PASS-73 roots' 0 -- both are
     # adjudicated ceiling movements, and the rule asks for ONE run that reads
     # the same number, not unanimity across tips it predates.
-    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/verify58/r13b/evroot}
+    #
+    # MOVED AGAIN, AND THIS TIME BECAUSE A PRODUCER CHANGED RATHER THAN A
+    # CEILING.  The eight rows that used to read `statics/...` and
+    # `statics/isax*/rc.txt` were produced by `isaxcheck`, which linked
+    # Capstone into the build and was deleted with it; they are re-pointed at
+    # the offline referee, whose reports are `referee/OPCODE.txt`,
+    # `referee/REGSET.txt` and `referee/STAGES.txt`.  NO BANKED ROOT CAN
+    # CARRY THOSE -- they did not exist when any of them was written -- so
+    # every older default now fails test 1 as INCOMPLETE, which is the rule
+    # working and not a defect in it.
+    #
+    # The default is therefore a COMPOSITE and says so: the twelve execution
+    # reports are verify58/r13b's, unchanged and still at or under their
+    # ceilings, and the three referee reports are REGENERATED AT THIS TIP by
+    # arc3_cov/referee/REPRODUCE.sh.  That is #305's rule applied one level
+    # up: the fixture moves with the manifest, whether what moved was a
+    # ceiling or the producer behind the row.  It carried the stale
+    # `static/x86_64` 47 against a ceiling of 11 until this move, and that
+    # row's successor is measured here instead of inherited.
+    #
+    # ELIGIBILITY WAS RUN, NOT ASSUMED: fixture_eligibility.py reads
+    # 20 of 20 present, every headline reproduced, 0 uncorroborated --
+    # the eight referee rows against a SECOND independent run at the same
+    # tip (b3/evroot2, byte-identical reports) and the twelve execution rows
+    # against verify58/r13a, verify57/r13b, verify57/r13a and verify56/r13b.
+    SRC=${ETG_SELFTEST_ROOT:-/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/fixture}
     # THE CORROBORATORS ARE NAMED, AND TOO FEW IS A REFUSAL.  Test 2 cannot
     # run against nothing: a root with no corroborator comes back
     # "uncorroborated" on every row and would be adopted by SILENCE, which is
@@ -129,7 +154,8 @@ selftest() {
     if [ -n "$ETG_FIXTURE_CORROBORATORS" ]; then
         CORROB=$ETG_FIXTURE_CORROBORATORS
     else
-        CORROB="/mnt/md0/QEMU/cst_runs/verify58/r13a/evroot
+        CORROB="/mnt/md0/QEMU/cst_runs/p3/arc3/exec243/b3/evroot2
+/mnt/md0/QEMU/cst_runs/verify58/r13a/evroot
 /mnt/md0/QEMU/cst_runs/verify57/r13b/evroot
 /mnt/md0/QEMU/cst_runs/verify57/r13a/evroot
 /mnt/md0/QEMU/cst_runs/verify56/r13b/evroot
@@ -379,72 +405,80 @@ EOF_F
     fi
     sed 's/^/    /' "$FIX/mask.out"
 
-    echo "=== SELFTEST ARM G: a contract-SKIPPED arm counts, a VANISHED one does not"
-    # FINDING 99-A, both directions.  `isax_srcenc_gate.sh` runs two LAYERS
-    # per ISA, so each arm shape has eight arms and the manifest's floor of 8
-    # counts them.  Since exec170 a BARE arm SKIPS the fields layer -- the
-    # layer classifies from QEMU's decode_id, that comes from the sled's
-    # mechanism corpus, and a bare arm has no corpus -- so the bare reports
-    # carry FOUR scored arms and say `fields_layer_skipped=4` on their
-    # roll-up.  The floor read `VACUOUS: scored 4, floor 8` on a number that
-    # was right, because two harness contracts disagreed about what an arm is.
+    echo "=== SELFTEST ARM G: the OFFLINE-REFEREE rows refuse a report that"
+    echo "===              lost an ISA, and refuse a truncated detail list"
+    # WHAT THIS ARM REPLACES, AND WHY THE OLD ONE COULD NOT STAY.  It used to
+    # prove FINDING 99-A's contract-skip accounting -- that an arm skipped by
+    # the fields layer counts toward the floor and a vanished one does not.
+    # That rule belonged to `isax_srcenc_gate.sh`, which drove `isaxcheck`,
+    # which linked Capstone into the build and was deleted with it.  There are
+    # no layers, no arm shapes and no roll-up line at this tip, so the arm had
+    # no subject left; a check that cannot find its subject must fail, and one
+    # whose subject cannot exist is worse than a failure -- it reads as
+    # coverage forever.  It is REPLACED, not dropped, by the two refusals the
+    # successor rows depend on most, and both are proved on fixtures this arm
+    # writes itself so they stay true at any tip.
     #
-    # The floor is NOT lowered to 4: that would buy the contract-skip at the
-    # price of the thing the floor is for.  It counts arms ACCOUNTED FOR --
-    # scored, plus skipped with the reason on the report's own line -- so
-    # 4+4 passes and 4+3 fails.  Both halves are required here, because a
-    # rule that only ever passes is not a rule.
-    G="$SCRATCH/skip"; rm -rf "$G"; mkdir -p "$G"
-    mk_isax() {   # mk_isax <file> <n_scored> <skipped>
-        local f=$1 n=$2 sk=$3 i=0
+    # (1) FOUR ISAs OR NOTHING.  `refsrc`, `refopcdead` and `refsrcdead` SUM
+    #     over the four ISA blocks, so an ISA that silently stopped being
+    #     compared makes every summed headline SMALLER -- it reads as an
+    #     improvement.  A report missing a block must be refused.
+    # (2) A TRUNCATED DETAIL LIST IS A REFUSAL.  The UNRULED headline is
+    #     summed off the printed detail lines, so a list cut short by --top
+    #     would under-count in the same safe-looking direction.  The roll-up
+    #     line's own class count is compared against the lines actually
+    #     printed, and a shortfall names the flag to raise.
+    G="$SCRATCH/refarms"; rm -rf "$G"; mkdir -p "$G/root/referee"
+    mk_opcode() {   # mk_opcode <file> <isas> <unruled-classes> <detail-lines>
+        local f=$1 isas=$2 nclass=$3 nline=$4 i
         : > "$f"
-        while [ $i -lt "$n" ]; do
-            echo "boundary isa$i rc=0" >> "$f"
-            echo "# isa=isa$i layer=boundary dead_allow_rules=0 unallowed=0" \
-                 >> "$f"
-            i=$((i+1))
+        for isa in $isas; do
+            echo "== $isa   1000 encodings, 900 also in the Capstone corpus" >> "$f"
+            echo "   corpus stamp plugin=aa emulator=bb" >> "$f"
+            echo "   AGREE               900  100.0%" >> "$f"
+            echo "   DISAGREE              0    0.0%" >> "$f"
+            echo "   NO-RULE               0    0.0%" >> "$f"
+            echo "   NO-WORD               0    0.0%" >> "$f"
+            echo "   UNKNOWN-WORD          0    0.0%" >> "$f"
+            echo "   CAPSTONE-BLANK        0    0.0%" >> "$f"
+            echo "   -- arbitration: 1 classes, 0 encodings arbitrated" \
+                 "(0 on a coverage path), $nclass classes UNRULED" >> "$f"
+            i=0
+            while [ $i -lt "$nline" ]; do
+                echo "      UNRULED        1  rule R  QEMU A  Capstone B" >> "$f"
+                i=$((i+1))
+            done
         done
-        echo "ALL_ARMS_DONE worst_rc=0 unscored_arms=0" >> "$f"
-        [ "$sk" = "none" ] || echo "roll-up: fields_layer_skipped=$sk (no" \
-            "identity corpus in this arm shape) worst=0" >> "$f"
+        echo "gapreport: rulings: 0 RESERVED, 0 DEAD" >> "$f"
     }
-    # The gate's own rc cannot decide this arm: `--only isax` leaves every
-    # other manifest row NOT RUN, which is itself a failure -- correctly, and
-    # deliberately, since a gate that scores a subset in silence is the shape
-    # this file exists against.  So the arm reads the `isax bare` ROW, which
-    # is the only thing these four fixtures move.
-    g_check() {   # g_check <label> <n> <skipped> <want: pass|vacuous|noline>
-        mkdir -p "$G/root/statics/isax"
-        mk_isax "$G/root/statics/isax/rc.txt" "$2" "$3"
-        "$PY" "$SCORE" "$G/root" --only isax > "$G/$1.out" 2>&1 || true
-        local row
-        row=$(grep -E '^isax +bare ' "$G/$1.out")
-        case $4 in
-          pass)    case "$row" in *" ok") return 0 ;; esac ;;
-          vacuous) grep -q 'VACUOUS' "$G/$1.out" && return 0 ;;
-          noline)  grep -q 'fields_layer_skipped' "$G/$1.out" && return 0 ;;
-        esac
-        echo "    ARM G FAILED at $1 (wanted $4); the isax row read: $row" >&2
+    g_check() {   # g_check <label> <isas> <nclass> <nline> <want-substring>
+        mk_opcode "$G/root/referee/OPCODE.txt" "$2" "$3" "$4"
+        "$PY" "$SCORE" "$G/root" --only refopc > "$G/$1.out" 2>&1 || true
+        if grep -qF "$5" "$G/$1.out"; then
+            return 0
+        fi
+        echo "    ARM G FAILED at $1: wanted \"$5\"" >&2
         cat "$G/$1.out" >&2
         exit 1
     }
-    g_check g1 4 4 pass
-    echo "    4 scored + 4 contract-skipped = 8 accounted: PASS, as required"
-    g_check g2 4 3 vacuous
-    echo "    4 scored + 3 skipped = 7: VACUOUS, as required (an arm that is"
-    echo "    neither scored nor declared skipped is the hole the floor is for)"
-    g_check g3 4 none noline
-    echo "    4 scored, NO roll-up line: red naming the missing line, not a"
-    echo "    silent skipped=0"
-    g_check g4 8 none pass
-    echo "    8 scored, no roll-up line needed: PASS (a report that met its"
-    echo "    floor is not made to produce an accounting it does not need)"
+    g_check g1 "x86_64 aarch64 riscv64" 0 0 \
+        "THE REPORT DOES NOT CARRY ALL FOUR ISAs: mipsel"
+    echo "    a report missing one ISA: refused, naming it"
+    g_check g2 "x86_64 aarch64 riscv64 mipsel" 3 1 \
+        "UNRULED LIST TRUNCATED"
+    echo "    3 classes on the roll-up, 1 detail line printed: refused"
+    g_check g3 "x86_64 aarch64 riscv64 mipsel" 0 0 \
+        "VACUOUS"
+    echo "    all four present and consistent: the ISA and truncation"
+    echo "    refusals stand down and the row is scored (here VACUOUS on the"
+    echo "    fixture's 900-encoding population, which is the floor working)"
 
     echo ""
     echo "SELFTEST PASSED -- 7 arms: clean green, planted red, missing red,"
     echo "stale red, the staleness reference proven to cover the emulators,"
     echo "the behaviour digest proven to discriminate in both directions, and"
-    echo "the contract-skip accounting proven in all four of its readings."
+    echo "the offline-referee rows proven to refuse a report that lost an ISA"
+    echo "and one whose detail list was truncated."
     echo "evidence: $SCRATCH"
     exit 0
 }

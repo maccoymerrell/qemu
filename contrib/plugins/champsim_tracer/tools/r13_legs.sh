@@ -53,10 +53,23 @@ PY=${CST_PYTHON:-/home/maccoy-merrell/anaconda3/bin/python}
 # script sets to <root>/_work/<leg>.  An empty producer path means the leg
 # writes the manifest path itself and needs no placement (the depmap pair).
 #
-# `static` and `isaxdead`/`isaxunallowed` share a report with another row, so
-# they are not separate legs here -- the manifest has more ROWS than this
-# driver has LEGS, and that is not a mismatch: four static rows read one
-# cross-tabulation, and two isax rows read each arm shape's rc.txt.
+# EIGHT MANIFEST ROWS, ONE LEG.  `referee` writes three reports --
+# referee/OPCODE.txt, referee/REGSET.txt and referee/STAGES.txt -- and the
+# eight offline-reference rows read them: four `refopc` rows and `refopcdead`
+# on the first, `refsrc` and `refsrcdead` on the second, `refstage` on the
+# third.  Only the first is listed below, because the check under it asks
+# whether a path this driver WRITES is one the manifest READS, and the other
+# two are written by the same producer at paths of its own choosing.  So the
+# manifest has more ROWS than this driver has LEGS, and that is not a
+# mismatch.
+#
+# THE THREE ROWS THAT USED TO BE HERE ARE GONE WITH THEIR PRODUCER.
+# `statics`, `isax_bare` and `isax_srcenc` drove `arc3_cov/<isa>/REPRODUCE.sh`
+# and `isax_srcenc_gate.sh`; both fed `build/contrib/plugins/isaxcheck`, which
+# linked Capstone into the build and was deleted with it.  `isax_srcenc_gate.sh`
+# is not in the tree at all, and the four static REPRODUCE.sh scripts refuse at
+# their settle guard with `ninja: error: unknown target
+# contrib/plugins/isaxcheck`.  They are replaced by `referee`, not dropped.
 # ---------------------------------------------------------------------------
 ROWS="
 depmap_aarch64|gem5/depmap_aarch64/REPORT.md|
@@ -69,9 +82,7 @@ gem5wp_mipsel|gem5/wp_mipsel.log|final/REPORT.txt
 spikewp|spike/wp/final/REPORT.txt|final/REPORT.txt
 spikecp|spike/FINAL/REPORT.txt|final/REPORT.txt
 pin|pin/cmp_fixed_sameinput.txt|cmp_baseline.txt
-isax_bare|statics/isax/rc.txt|rc.txt
-isax_srcenc|statics/isax_srcenc/rc.txt|rc.txt
-statics|statics/coverage_report.txt|
+referee|referee/OPCODE.txt|
 "
 
 row_field() { echo "$1" | cut -d'|' -f"$2"; }
@@ -203,39 +214,16 @@ run_leg spikecp env QEMU_BUILD="$BUILD" OUT="$ROOT/_work/spikecp" \
 #     manifest is left alone because it is the one every adjudication cites.
 run_leg pin "$HERE/arc3_pinexec/run_reg_arm.sh" "$ROOT/_work/pin" "$BUILD" &
 
-# --- group 6: the four static legs, then the cross-tabulation they publish
-#     into.  coverage_report.py is the ONE report the four static rows read,
-#     and it is written after all four have been paid for.
-if wanted statics; then
-  for isa in x86_64 aarch64 riscv64 mipsel; do
-    ( env QEMU_DIR="$QEMU_ROOT" "$T/$isa/REPRODUCE.sh" ) \
-        > "$ROOT/_work/static_$isa.log" 2>&1
-    echo "static_$isa rc=$?" >> "$RC"
-  done &
-  P_ST=$!
-fi
-
-# --- group 7: the isax arms.  `bare` needs no corpus; `run` needs the sled's.
-run_leg isax_bare "$HERE/isax_srcenc_gate.sh" bare "$BUILD" \
-        "$ROOT/_work/isax_bare" &
+# --- group 6: the offline reference.  It needs a CORPUS -- a capture run's
+#     merged per-ISA tables -- and captures one itself only when CST_SPEC_DIR
+#     names a SPEC tree.  With neither it refuses and writes no report, which
+#     the gate then reads as REPORT MISSING: correct, because that is what a
+#     leg that did not run has earned.
+run_leg referee env CST_REF_CORPUS="${CST_REF_CORPUS:-}" \
+        CST_CAPTURE_BUILD="$BUILD" \
+        "$T/referee/REPRODUCE.sh" "$ROOT" --build-dir "$BUILD" &
 
 wait
-
-# The --srcenc arms need a corpus, and the corpus needs the sled driver, so
-# this one runs LAST and against whatever CST_SLED_CORPUS names.  With no
-# corpus it refuses, which is the honest answer and not a zero.
-if wanted isax_srcenc; then
-  run_leg isax_srcenc "$HERE/isax_srcenc_gate.sh" run "$BUILD" \
-          "$ROOT/_work/isax_srcenc" "${CST_SLED_CORPUS:-$ROOT/_work/nocorpus}"
-fi
-
-if wanted statics; then
-  wait ${P_ST:-} 2>/dev/null
-  mkdir -p "$ROOT/statics"
-  ( "$PY" "$T/coverage_report.py" -o "$ROOT/statics/coverage_report.txt" ) \
-      > "$ROOT/_work/coverage_report.log" 2>&1
-  echo "statics rc=$?" >> "$RC"
-fi
 
 sort "$RC" | grep -v '^ ' > "$ROOT/LEGS_RC.sorted.txt"
 cat "$RC"

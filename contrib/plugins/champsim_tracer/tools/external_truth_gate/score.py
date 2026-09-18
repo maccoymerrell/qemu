@@ -39,53 +39,24 @@ MANIFEST = os.path.join(HERE, 'ADJUDICATED.tsv')
 # matched per leg rather than by one hopeful regex over all of them.  A leg
 # whose pattern does not match is a FAILURE, never a zero.
 HEADLINE = {
-    # the eight-arm Capstone-as-external-reference gate: count the arms that
-    # did NOT exit 0, so the ceiling of 0 means "every arm passed"
-    'isax':    (re.compile(r'^(?:boundary|fields)\s+(\S+)\s+rc=(\d+)', re.M), 'isax'),
-    # THE DEAD-ALLOWLIST-RULE FACT, scored on BOTH arm shapes (FINDING
-    # 72-F).  `isax` above scores the arms' EXIT CODES, and it can only ever
-    # be asked of the bare half: a `--srcenc` arm carries the boundary
-    # residue as `unallowed`, so it exits 1 by construction and an exit-code
-    # ceiling over it would be a number about the residue, not about the
-    # allowlist.  The dead-rule question is different -- every arm answers it
-    # for the families IT scores, and the two shapes are partial in
-    # COMPLEMENTARY families -- so it gets its own leg, one row per shape,
-    # and both reports must be present for the union to cover the allowlist.
-    #
-    # MEASURED, and this is why the row exists: at PASS 72 one
-    # `SR-rd-phantom ffree` row went dead two commits after it landed, the
-    # `--srcenc` x86_64 fields arm PRINTED `dead_allow_rules=1`, and the gate
-    # passed 17 of 17 -- correctly, because the eight arms it scored were the
-    # bare ones and the `SR-` family is exempt from the detector there.  A
-    # detector nobody reads is not a detector.
-    'isaxdead': (re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=(\d+)',
-                            re.M), 'isaxdead'),
-    # THE UNALLOWED RESIDUE, and it exists because the `--srcenc` arms had NO
-    # scored row at all -- FINDING 90-C.
-    #
-    # `isax` scores EXIT CODES and the comment above says why it can only be
-    # asked of the bare half: a `--srcenc` arm carries its residue as
-    # `unallowed` and therefore exits 1 by construction.  That is true, and
-    # the conclusion drawn from it was wrong.  What follows from "the exit
-    # code is not the number" is that the NUMBER needs its own row -- not
-    # that the arms go unscored.  They went unscored: at exec148's evidence
-    # root the eight `--srcenc` arms read `unallowed=` 6, 6, 3, 3 and 0 x4,
-    # four of them exited 1, and the gate PASSED 19 of 19 without a row that
-    # could see any of it.
-    #
-    # So the residue is scored directly, summed over the arms, exactly as the
-    # dead-rule fact is.  An `unallowed` signature is a disagreement between
-    # the wire's published source list and LLVM MC's operand description that
-    # NOTHING in the allowlist claims -- neither adjudicated tracer-right nor
-    # named as a defect -- which is the one state this gate must never read
-    # as a pass.
-    'isaxunallowed': (re.compile(r'^# isa=\S+ layer=\S+ .*unallowed=(\d+)',
-                                 re.M), 'isaxunallowed'),
-    # the four-ISA cross-tabulation is the ONE static report that carries the
-    # headline AND its denominator AND the reachability hole on the same row,
-    # so the static leg reads that rather than the per-ISA compare files (two
-    # of which carry no denominator at all -- see PASS 11)
-    'static':  (None, 'coverage'),
+    # ------------------------------------------------------------------
+    # THE OFFLINE REFERENCE LEGS.  These five replace the four `static`
+    # rows and the four `isax*` rows, which drove `isaxcheck` -- a binary
+    # that linked Capstone into the build and was deleted with it.  The
+    # FUNCTION those rows served is unchanged and is served here: external
+    # static-decode agreement per ISA (`refopc`), the register-name set
+    # comparison (`refsrc`), the dead-arbitration tripwire on both
+    # (`refopcdead`, `refsrcdead`), and the producer's own arms
+    # (`refstage`).  What changed is where the reference runs: OFFLINE,
+    # over recorded encodings, never in the traced process.  Each row's
+    # manifest entry states what the row it succeeds measured, what this
+    # one measures, and where its ceiling came from.
+    # ------------------------------------------------------------------
+    'refopc':     (None, 'refopc'),
+    'refopcdead': (None, 'refopcdead'),
+    'refsrc':     (None, 'refsrc'),
+    'refsrcdead': (None, 'refsrcdead'),
+    'refstage':   (re.compile(r'^stage\s+(\S+)\s+rc=(\d+)', re.M), 'refstage'),
     'gem5cp':  (re.compile(r'the number that matters:\s*TRACER-SUBSET \+ UNACCOUNTED\s*=\s*(\d+)'), 'int'),
     'spikecp': (re.compile(r'HEADLINE\s+TRACER-SUBSET \+ UNACCOUNTED\s*=\s*(\d+)'), 'int'),
     'gem5wp':  (re.compile(r'THE NUMBER THAT MATTERS:\s*WP-DEFECT \+ RECONSTRUCTION-GAP \+\s*\n\s*UNACCOUNTED\s*=\s*(\d+)'), 'int'),
@@ -106,12 +77,16 @@ HEADLINE = {
 # The population each leg actually compared.  A leg reporting zero
 # disagreements over zero comparisons is survivorship bias, not coverage.
 FLOOR = {
-    'isax':    re.compile(r'^(?:boundary|fields)\s+\S+\s+rc=\d+', re.M),
-    'isaxdead': re.compile(r'^# isa=\S+ layer=\S+ .*dead_allow_rules=\d+',
-                           re.M),
-    'isaxunallowed': re.compile(r'^# isa=\S+ layer=\S+ .*unallowed=\d+',
-                                re.M),
-    'static':  None,
+    # The five offline reference legs carry their populations INSIDE the
+    # report blocks -- encodings joined, keys joined, rulings disposed of,
+    # stages run -- so each is read by its own branch in score_one() rather
+    # than by one regex here.  They are named anyway, so that a leg with no
+    # entry in this table is still a KeyError rather than a silent skip.
+    'refopc':     None,
+    'refopcdead': None,
+    'refsrc':     None,
+    'refsrcdead': None,
+    'refstage':   None,
     'gem5cp':  re.compile(r'^TOTAL\s+(\d+)', re.M),
     'spikecp': re.compile(r'^\s*aligned\s+(\d+)', re.M),
     'gem5wp':  re.compile(r'^TOTAL\s+(\d+)', re.M),
@@ -122,57 +97,23 @@ FLOOR = {
     'depmapprec': re.compile(r'^TOTAL FACTS = (\d+)', re.M),
 }
 
-# AN ARM SKIPPED BY CONTRACT IS AN ARM ACCOUNTED FOR -- FINDING 99-A.
+# THE CONTRACT-SKIP ACCOUNTING IS RETIRED WITH ITS SUBJECT -- FINDING 99-A.
 #
-# `isax_srcenc_gate.sh` runs two LAYERS per ISA, so the bare and the
-# `--srcenc` shapes each carry eight arms and the manifest's floor of 8 is
-# the count of them.  Since exec170 a BARE arm SKIPS the fields layer: the
-# layer's classification comes from QEMU's `decode_id`, that is read from the
-# sled's mechanism corpus, and a bare arm has no corpus and so no identity.
-# The skip is the layer's contract, not a hole -- running it without an
-# identity is what made every encoding read GEN_OP_UNKNOWN and turned this
-# gate from 20/20 into 8-of-20 while nothing on the wire moved (98-F).
+# `accounted()` and the `roll-up: ... fields_layer_skipped=` rule lived here
+# because `isax_srcenc_gate.sh` ran two LAYERS per ISA and a bare arm skipped
+# the fields layer by contract, so a floor of 8 had to count arms ACCOUNTED
+# FOR rather than arms scored.  That gate drove `isaxcheck`, which linked
+# Capstone into the build and was deleted with it; there are no layers, no arm
+# shapes and no roll-up line at this tip, and the four rows that read them are
+# re-pointed at the offline referee.
 #
-# The floor then read VACUOUS at `scored 4, floor 8` on both bare rows: the
-# number was RIGHT and the leg failed anyway, because two harness contracts
-# disagreed about what an arm is.
-#
-# THE FLOOR IS NOT LOWERED.  Lowering it to 4 would buy the contract-skip at
-# the price of the thing the floor is for: a bare arm that lost its BOUNDARY
-# layer as well would still score 4 and pass.  Instead the floor counts arms
-# ACCOUNTED FOR -- scored, plus skipped with the reason on the report's own
-# roll-up line -- so 4 + 4 = 8 passes and 4 + 3 fails.  Only an arm that is
-# neither scored nor declared skipped is vacuity, which is what the floor
-# always meant.
-#
-# AND THE ACCOUNTING IS ASKED FOR ONLY WHEN IT DECIDES SOMETHING.  A report
-# that already scored its whole floor needs no skip line and is not made to
-# produce one -- the roll-up postdates several banked evidence roots, and
-# demanding it of a report whose eight arms all ran would refuse a correct
-# measurement for a reason that has nothing to do with it.  A report SHORT of
-# its floor is the case where the difference matters, and there the line's
-# ABSENCE is a refusal, never a skipped=0: a missing arm and an arm skipped
-# by contract are the two readings this distinguishes, and reading silence as
-# the second is the silent false success the rest of this file is built
-# against.
-SKIPPED = re.compile(r'^roll-up:.*fields_layer_skipped=(\d+)', re.M)
-
-
-def accounted(kind, text, path, scored, floor):
-    """-> (scored_including_contract_skips, error_or_None) for the isax legs."""
-    if not kind.startswith('isax') or scored >= floor:
-        return scored, None
-    m = SKIPPED.search(text)
-    if not m:
-        return scored, (
-            'SHORT OF FLOOR (%d of %d) AND NO `roll-up: ... '
-            'fields_layer_skipped=` LINE in %s.  isax_srcenc_gate.sh writes '
-            'that line on every run, and it is what tells an arm SKIPPED by '
-            'the fields layer\'s contract apart from an arm that vanished.  '
-            'Without it the shortfall cannot be read in either direction, '
-            'and it must not be read as a clean skipped=0 (FINDING 99-A).'
-            % (scored, floor, path))
-    return scored + int(m.group(1)), None
+# The rule is DELETED rather than left in place, because a check that cannot
+# find its subject must fail and a check whose subject cannot exist is worse:
+# it can never fire, never be seen to fire, and reads as coverage to anyone
+# counting rules.  What the rule stood for -- a population short of its floor
+# is a refusal unless the report itself accounts for the shortfall -- is not
+# lost: every branch below refuses on a missing block, a truncated detail
+# list, or a population under the manifest's floor, and says which.
 
 
 class Row(object):
@@ -251,6 +192,154 @@ def newest_binary(build_dir):
     return behavior_digest.behaviour_reference(build_dir, paths)
 
 
+# ---------------------------------------------------------------------------
+# THE OFFLINE REFERENCE REPORTS.
+#
+# Both are written by the same producer and both are per-ISA blocks under a
+# `== <isa>` header, so the parsing is one helper with four readings.  The one
+# rule that runs before any of them: FOUR blocks or the report is refused.  A
+# report carrying three ISAs would give every row it does carry a perfectly
+# good number while one ISA silently stopped being compared, and a summed row
+# (`refsrc`, `refopcdead`, `refsrcdead`) would read LOWER for it -- the exact
+# shape of a green that means the probe stopped reaching.
+#
+# The second rule is about the DETAIL lists.  Both tools print their UNRULED
+# classes at a `--top` limit, and the summed headline is read off those
+# printed lines; if the list were truncated the headline would under-count in
+# the safe-looking direction.  So the count on the roll-up line is compared
+# against the number of lines actually printed, and a shortfall is a refusal
+# naming the flag to raise -- never a smaller number.
+# ---------------------------------------------------------------------------
+ISAS = ('x86_64', 'aarch64', 'riscv64', 'mipsel')
+
+GAP_HEAD = re.compile(r'^== (\S+)\s+(\d+) encodings, (\d+) also in the '
+                      r'Capstone corpus\s*$', re.M)
+GAP_ARB = re.compile(r'^\s+-- arbitration: (\d+) classes, (\d+) encodings '
+                     r'arbitrated \((\d+) on a coverage path\), (\d+) '
+                     r'classes UNRULED\s*$', re.M)
+GAP_UNRULED = re.compile(r'^\s+UNRULED\s+(\d+)\s+rule ', re.M)
+GAP_BUCKET = re.compile(r'^\s+(\S+)\s+(\d+)\s+[\d.]+%\s*$', re.M)
+GAP_DEAD = re.compile(r'^gapreport: rulings: (\d+) RESERVED, (\d+) DEAD\s*$',
+                      re.M)
+
+SET_HEAD = re.compile(r'^== (\S+)\s+(\d+) \(encoding, direction\) keys in '
+                      r'BOTH sides\s*$', re.M)
+SET_ARB = re.compile(r'^\s+-- arbitration: (\d+) classes live, .*?; (\d+) '
+                     r'UNRULED, (\d+) RESERVED, (\d+) DEAD\s*$', re.M)
+SET_UNRULED = re.compile(r'^\s+UNRULED\s+(\d+)\s+\S+ \S+\s*$', re.M)
+
+
+def isa_blocks(text, head):
+    """-> {isa: block text}, in the order the report wrote them."""
+    out, marks = {}, list(head.finditer(text))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out[m.group(1)] = (m, text[m.start():end])
+    return out
+
+
+def score_reference(row, kind, text, path):
+    """-> (ok, headline, scored, why) for the four offline-referee legs."""
+    head = GAP_HEAD if kind in ('refopc', 'refopcdead') else SET_HEAD
+    blocks = isa_blocks(text, head)
+    missing = [i for i in ISAS if i not in blocks]
+    if missing:
+        return (False, None, None,
+                'THE REPORT DOES NOT CARRY ALL FOUR ISAs: %s absent from %s.  '
+                'An ISA that stopped being compared contributes nothing to a '
+                'summed headline and reads as an improvement; the report is '
+                'refused rather than scored on what is left.'
+                % (', '.join(missing), path))
+
+    def arbitration(isa, pat, what):
+        m = pat.search(blocks[isa][1])
+        if not m:
+            return None, ('ARBITRATION LINE NOT FOUND for %s in %s.  %s prints '
+                          'it on every run; without it this row has no '
+                          'subject.' % (isa, path, what))
+        return m, None
+
+    def unruled_rows(isa, arb_m, line_pat, idx):
+        """Sum the printed UNRULED detail lines, refusing a truncated list."""
+        want = int(arb_m.group(idx))
+        lines = line_pat.findall(blocks[isa][1])
+        if len(lines) != want:
+            return None, ('UNRULED LIST TRUNCATED for %s in %s: the roll-up '
+                          'says %d class(es) and %d detail line(s) were '
+                          'printed.  The headline is summed off those lines, '
+                          'so a truncated list under-counts in the direction '
+                          'that looks like a pass.  Re-run the producer with a '
+                          'larger --top.' % (isa, path, want, len(lines)))
+        return sum(int(n) for n in lines), None
+
+    if kind == 'refopc':
+        m, blk = blocks[row.isa]
+        scored = int(m.group(3))            # encodings joined with the reference
+        buckets = dict((b, int(n)) for b, n in GAP_BUCKET.findall(blk))
+        if 'UNKNOWN-WORD' not in buckets:
+            return (False, None, scored,
+                    'BUCKET LINES NOT FOUND for %s in %s.  The report changed '
+                    'shape; that is a failure, not a zero.' % (row.isa, path))
+        arb, why = arbitration(row.isa, GAP_ARB, 'gapreport')
+        if why:
+            return (False, None, scored, why)
+        unruled, why = unruled_rows(row.isa, arb, GAP_UNRULED, 4)
+        if why:
+            return (False, None, scored, why)
+        headline = unruled + int(arb.group(3))
+        if buckets['UNKNOWN-WORD']:
+            return (False, headline, scored,
+                    'UNKNOWN-WORD = %d.  QEMU stated a generic word this '
+                    'referee cannot read, which is a mismatched pair of '
+                    'binaries and not a decode disagreement: the reading is '
+                    'invalid, not merely bad.' % buckets['UNKNOWN-WORD'])
+    elif kind == 'refopcdead':
+        dm = GAP_DEAD.search(text)
+        if not dm:
+            return (False, None, None,
+                    'RULING-DISPOSITION LINE NOT FOUND in %s.  gapreport '
+                    'prints `rulings: N RESERVED, M DEAD` whenever it joins '
+                    'the arbitration corpus; without it nothing here has been '
+                    'asked the dead-rule question.' % path)
+        headline = int(dm.group(2))
+        scored = int(dm.group(1)) + headline
+        for isa in ISAS:
+            arb, why = arbitration(isa, GAP_ARB, 'gapreport')
+            if why:
+                return (False, headline, None, why)
+            scored += int(arb.group(1)) - int(arb.group(4))
+        if headline:
+            return (False, headline, scored,
+                    'DEAD ARBITRATION(S): %d.  A written arbitration naming a '
+                    'decode rule this build no longer has excuses nothing and '
+                    'has outlived the disagreement it was written for; '
+                    'gapreport names each on its own DEAD line.  Retire it '
+                    'with the reason written next to it.' % headline)
+    else:                                    # refsrc / refsrcdead
+        headline = scored = 0
+        for isa in ISAS:
+            arb, why = arbitration(isa, SET_ARB, 'setjoin')
+            if why:
+                return (False, None, None, why)
+            if kind == 'refsrc':
+                n, why = unruled_rows(isa, arb, SET_UNRULED, 2)
+                if why:
+                    return (False, None, None, why)
+                headline += n
+                scored += int(blocks[isa][0].group(2))
+            else:
+                headline += int(arb.group(4))
+                scored += (int(arb.group(1)) + int(arb.group(3))
+                           + int(arb.group(4)))
+        if kind == 'refsrcdead' and headline:
+            return (False, headline, scored,
+                    'DEAD ARBITRATION(S): %d.  A written arbitration naming a '
+                    'register name this build cannot spell at all excuses '
+                    'nothing; setjoin names each on its own DEAD line.  Retire '
+                    'it with the reason written next to it.' % headline)
+    return (True, headline, scored, '')
+
+
 def score_one(row, root, binary_mtime):
     """-> (ok, headline, scored, why)"""
     path = os.path.join(root, row.report)
@@ -266,45 +355,10 @@ def score_one(row, root, binary_mtime):
     text = open(path, errors='replace').read()
 
     pat, kind = HEADLINE[row.leg]
-    if kind == 'coverage':
-        # A LEG THAT BLOCKED NAMES ITSELF, AND ONLY ITSELF.  All four `static`
-        # rows read one `coverage_report.txt`, so when that report refused to
-        # publish at all -- as it did for ONE stale x86_64 leg -- every one of
-        # the four read REPORT MISSING, including three legs that had run and
-        # whose tables were fresh.  `coverage_report.py` now writes the report
-        # with a `<isa>  REFUSED  <reason>` row for each blocked leg, and this
-        # is where that row is read: the blocked ISA fails carrying its OWN
-        # reason, the others are scored normally.
-        rm = re.search(r'^%s\s+REFUSED\s+(.*)$' % re.escape(row.isa),
-                       text, re.M)
-        if rm:
-            return (False, None, None,
-                    'LEG REFUSED by coverage_report.py: %s.  This leg did not '
-                    'produce a measurement; the other legs in the same report '
-                    'are scored on their own rows.' % rm.group(1).strip())
-        # "x86_64    47  (subset 37 + unaccounted 10 + hole 0)"
-        hm = re.search(r'^%s\s+(\d+)\s+\(subset (\d+) \+ unaccounted (\d+) '
-                       r'\+ hole (\d+)\)' % re.escape(row.isa), text, re.M)
-        if not hm:
-            return (False, None, None,
-                    'HEADLINE NOT FOUND for %s in %s.  The four-ISA '
-                    'cross-tabulation did not name this ISA; a leg the report '
-                    'does not mention has not passed.' % (row.isa, path))
-        headline = int(hm.group(1))
-        dm = re.search(r'^%s\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+'
-                       r'\d+\s+\d+\s*$' % re.escape(row.isa), text, re.M)
-        if not dm:
-            return (False, headline, None,
-                    'PROBED POPULATION NOT FOUND for %s in %s -- a headline '
-                    'with no denominator cannot be believed.'
-                    % (row.isa, path))
-        scored = int(dm.group(1))
-        if int(hm.group(4)) != 0:
-            return (False, headline, scored,
-                    'REACHABLE-UNPROBED HOLE = %s.  An opcode a QEMU guest '
-                    'runs and the tracer never decoded drops the WHOLE '
-                    'instruction; it is never folded into a rate.'
-                    % hm.group(4))
+    if kind in ('refopc', 'refopcdead', 'refsrc', 'refsrcdead'):
+        ok, headline, scored, why = score_reference(row, kind, text, path)
+        if not ok:
+            return (False, headline, scored, why)
     elif kind in ('depmap', 'depmapprec'):
         # An INERT axis is checked FIRST and on BOTH rows.  An axis that
         # compared nothing contributes 0 to the loss count and 0 to the
@@ -338,63 +392,23 @@ def score_one(row, root, binary_mtime):
                     'INERT AXES = %s.  An axis that compared nothing reports '
                     'no disagreement for the wrong reason; it is a demand for '
                     'a better probe, never a pass.' % im.group(1))
-    elif kind == 'isaxdead':
-        arms = pat.findall(text)
-        if not arms:
+    elif kind == 'refstage':
+        stages = pat.findall(text)
+        if not stages:
             return (False, None, None,
-                    'NO ARM SUMMARY LINES PARSED out of %s.  The dead-rule '
-                    'fact lives on isaxcheck\'s own `# isa=` line; a report '
-                    'without one cannot answer this question and must not '
-                    'read as a zero.' % path)
-        headline = sum(int(n) for n in arms)
-        scored = len(arms)
-        if headline:
-            dead = [n for n in arms if n != '0']
-            return (False, headline, scored,
-                    'DEAD ALLOWLIST RULE(S): %d across %d arm(s) (%s).  A '
-                    'rule that excuses no signature has outlived the '
-                    'disagreement it was written for; the arm names it on a '
-                    'DEAD line.  Retire it in the allowlist with the reason '
-                    'written next to it.' % (headline, len(dead),
-                                             ', '.join(dead)))
-    elif kind == 'isaxunallowed':
-        arms = pat.findall(text)
-        if not arms:
-            return (False, None, None,
-                    'NO ARM SUMMARY LINES PARSED out of %s.  The unallowed '
-                    'count lives on isaxcheck\'s own `# isa=` line; a report '
-                    'without one cannot answer this question and must not '
-                    'read as a zero.' % path)
-        headline = sum(int(n) for n in arms)
-        scored = len(arms)
-        # THE CEILING DECIDES, not the mere presence of a residue.  The
-        # `isaxdead` branch above fails on any non-zero because ITS ceiling is
-        # 0 and always will be; this row's is adjudicated and may be above
-        # zero while a regeneration is owed, so the arm detail is attached
-        # only when the headline is actually over the line.
-        if headline > row.ceiling:
-            hot = [n for n in arms if n != '0']
-            return (False, headline, scored,
-                    'UNALLOWED SIGNATURE(S): %d across %d arm(s) (%s).  A '
-                    'signature the allowlist does not claim is a source-list '
-                    'disagreement nobody has adjudicated -- neither ruled '
-                    'tracer-right with a reason nor named as a defect.  '
-                    'Regenerate the block its family belongs to, or write '
-                    'the row with its justification; a ceiling above zero '
-                    'here needs the same per-row adjudication every other '
-                    'ceiling in this manifest carries.'
-                    % (headline, len(hot), ', '.join(hot)))
-    elif kind == 'isax':
-        arms = pat.findall(text)
-        if not arms:
-            return (False, None, None,
-                    'NO ARMS PARSED out of %s' % path)
-        headline = sum(1 for _isa, rc in arms if rc != '0')
-        scored = len(arms)
-        bad = [i for i, rc in arms if rc != '0']
+                    'NO STAGE LINES PARSED out of %s.  The producer writes one '
+                    '`stage <name> rc=<n>` line per arm it ran; a report '
+                    'without one says the producer did not run, and that is a '
+                    'failure rather than a zero.' % path)
+        headline = sum(1 for _name, rc in stages if rc != '0')
+        scored = len(stages)
+        bad = ['%s rc=%s' % (n, rc) for n, rc in stages if rc != '0']
         if bad:
             return (False, headline, scored,
-                    'ARMS THAT DID NOT EXIT 0: %s' % ', '.join(bad))
+                    'STAGES THAT DID NOT EXIT 0: %s.  The referee\'s own arms '
+                    'are scored here and nowhere else; a stage that died did '
+                    'not measure what the rows reading its report claim.'
+                    % ', '.join(bad))
     else:
         m = pat.search(text)
         if not m:
@@ -410,9 +424,6 @@ def score_one(row, root, binary_mtime):
                     'denominator cannot be believed.' % path)
         scored = int(next(g for g in fm.groups() if g))
 
-    scored, why = accounted(kind, text, path, scored, row.floor)
-    if why:
-        return (False, headline, None, why)
     if scored < row.floor:
         return (False, headline, scored,
                 'VACUOUS: scored %d, floor %d.  A leg that compared almost '

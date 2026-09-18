@@ -9,15 +9,17 @@ rather than against the tracer's own instruments.
 
 ## What it reads
 
-Thirteen legs, one row each in `ADJUDICATED.tsv`.  The count is a fact
-about the manifest, not a round number: the `gem5wp` family gained its
+Twenty rows in `ADJUDICATED.tsv`, over eleven producers.  The count is a
+fact about the manifest, not a round number: the `gem5wp` family gained its
 `x86_64` row when that leg was built, and this file said "twelve" for a
 day afterwards.  If the two ever disagree again, the manifest is right.
 
 | leg | what it is |
 | --- | --- |
-| `isax` | the eight-arm boundary/fields gate, Capstone as an EXTERNAL reference against LLVM MC, four ISAs |
-| `static` × 4 | the whole-opcode-space register-attribution sweep — XED, iced-x86, LLVM MC, Arm MRA, Sail, binutils `mips-opc` — read off the four-ISA cross-tabulation |
+| `refopc` × 4 | the offline referee's opcode-word join, one row per ISA: every recorded encoding decoded by the reference and compared with QEMU's word, with each disagreement class arbitrated on its merits in `gapreport_rulings.tsv` |
+| `refsrc` | the offline referee's register-NAME-set join, per (encoding, direction), summed over the four ISAs — a set the wire loses with no written arbitration is what this counts |
+| `refopcdead` / `refsrcdead` | the other direction on each corpus: an arbitration naming a decode rule, or a register name, the BUILD no longer has.  A rule that excuses nothing has outlived its disagreement |
+| `refstage` | the referee's own arms — corpus, selftest, four per-ISA runs, rule universe, join.  A vacuity guard: the apparatus ran, on every ISA, and no stage died |
 | `gem5cp` × 2 | gem5 correct-path execution, aarch64 and mipsel: destination sets and VALUES, memop count / address / width, store and load data |
 | `gem5wp` × 3 | gem5 wrong-path, aarch64 / x86_64 / mipsel: every excursion rebuilt from the trace alone and re-executed |
 | `spikecp` | Spike correct-path execution, riscv64, including CSR sets and values |
@@ -115,3 +117,22 @@ this project accepts as a property of the REFERENCE — the reference under-mode
 something the tracer records correctly — not as a property of the trace.
 
 Author: Maccoy Merrell.
+
+## The reference runs OFFLINE
+
+The eight rows above replace four `static` rows and four `isax*` rows, all
+eight of which were produced by `build/contrib/plugins/isaxcheck` — a binary
+that linked Capstone into the build.  That binary is gone, and with it the
+last reference decoder inside the traced process.
+
+What the retired rows measured is unchanged and is measured here: external
+static-decode agreement per ISA, the register-set comparison, and the
+dead-rule tripwire on both corpora.  What changed is where the reference
+runs.  It reads recorded encodings, from a capture the tracer produced, in a
+separate Python process, against the same arbitration corpora a maintainer
+writes by hand — and never in the process whose answers it is checking.
+
+`arc3_cov/referee/REPRODUCE.sh` is the producer.  It needs a corpus
+(`--corpus`), or a SPEC tree to capture one from; with neither it refuses and
+writes no report, and the gate then reads REPORT MISSING, which is what a leg
+that did not run has earned.

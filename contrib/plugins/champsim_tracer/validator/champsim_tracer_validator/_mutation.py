@@ -1555,7 +1555,7 @@ def _run_oracle_mutation(m: Mutation, good_triple, gen_meta, meta_path,
                              f"The oracle tolerated this corruption."))
 
 
-def _run_devio_mutation(m: Mutation, devio_sub) -> MutResult:
+def _run_devio_mutation(m: Mutation, devio_sub, refused: str = "") -> MutResult:
     """Run a devio mutation against a dedicated real devio trace
     (devio_mutation_substrate) with _multiproc._devio_pairing_check --
     the SAME oracle run_devio_probe's own check (1) runs -- rather than
@@ -1563,6 +1563,11 @@ def _run_devio_mutation(m: Mutation, devio_sub) -> MutResult:
     decode MUST pass the pairing oracle clean (a probe substrate that
     doesn't is unfit); the mutation then drops a STOP and MUST be
     flagged by that same oracle."""
+    if refused:
+        # The substrate WAS produced and its own gating section judged it
+        # FAILING.  That is a red, not an absence: report it as a HOLE so
+        # run_mutations()'s ok and this command's exit status carry it.
+        return MutResult(m.name, m.layer, "HOLE", detail=refused)
     if devio_sub is None:
         return MutResult(m.name, m.layer, "skip",
                          detail="no devio substrate (compiler/qemu-system/"
@@ -1786,18 +1791,30 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
     # devio mutations run on a dedicated real devio trace (the diamond CFG
     # substrate carries no DEVIO records): build it once, on demand.
     devio_sub = None
+    devio_refused = ""
     if any(getattr(m, "devio", False) for m in CATALOGUE):
         try:
             devio_sub = MP.devio_mutation_substrate(build_dir,
                                                     work_root / "devio")
-        except Exception:                                  # noqa: BLE001
+        except Exception as e:                             # noqa: BLE001
+            # AN ABSENT SUBSTRATE AND A REFUSED ONE ARE NOT THE SAME THING.
+            #
+            # devio_mutation_substrate() returns None when this host cannot
+            # produce a devio trace at all (no compiler, no virtio-blk
+            # kernel) -- a legitimate skip.  It RAISES when it produced one
+            # and run_devio_probe judged it FAILING.  Catching both into
+            # `devio_sub = None` turned the second into the first, so a
+            # devio section that printed OVERALL: FAIL left this tier
+            # reporting "skipped" and exiting 0.  Keep the reason and make
+            # it a HOLE, which is what the exit status reads.
             devio_sub = None
+            devio_refused = str(e)
 
     for m in CATALOGUE:
         if getattr(m, "smc", ""):
             results.append(_run_smc_mutation(m, smc_subs))
         elif getattr(m, "devio", False):
-            results.append(_run_devio_mutation(m, devio_sub))
+            results.append(_run_devio_mutation(m, devio_sub, devio_refused))
         elif m.layer == "oracle":
             results.append(_run_oracle_mutation(
                 m, good, gen_meta, meta_path, trace_path, binary_path, vkw,

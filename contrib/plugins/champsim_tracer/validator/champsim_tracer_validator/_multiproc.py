@@ -1223,6 +1223,23 @@ def devio_mutation_substrate(build_dir: Path, work_root: Path) -> dict | None:
     cst = res.artifacts.get("cst")
     if res.skipped or not cst or not Path(cst).exists():
         return None
+    # A SECTION THAT PRINTED "OVERALL: FAIL" HAS TO REACH THE EXIT STATUS.
+    #
+    # run_devio_probe() is a gating check in its own right -- its subcheck 4
+    # runs cst_audit and cst_decode --strict over the trace -- and this
+    # caller used to read only .artifacts and .skipped.  So a devio section
+    # could print OVERALL: FAIL (measured: strict_rc=1, 1299 impossible memop
+    # attributions over 3 instructions) and the mutation tier would take that
+    # same trace as its substrate and exit 0, with the failure visible only
+    # to someone reading the log.  A check whose verdict nothing reads is not
+    # a check.  Raise, so the caller's own error path decides -- the tier
+    # already treats a missing substrate as a skip, and a FAILING substrate
+    # must not be quietly demoted to that.
+    if not res.ok:
+        bad = [s.name for s in res.subchecks if not s.ok]
+        raise RuntimeError(
+            "devio substrate refused: run_devio_probe reported OVERALL: FAIL "
+            "(" + "; ".join(bad) + ")")
     events = _decode_devio_events(cfg, Path(cst))
     if not any(e["kind"] == "stop" for e in events):
         return None

@@ -24,7 +24,7 @@
  * either to the other's site would mean threading apparatus data through
  * shipping structures, which is what segregating this file was for.
  *
- * THE CAPSTONE COLUMN IS NO LONGER PRODUCED IN-PROCESS.  RETIRED DELIBERATELY.
+ * THE CAPSTONE COLUMN IS NOT PRODUCED IN-PROCESS.  IT IS NOT IN THIS TREE.
  * ---------------------------------------------------------------------------
  * Checking Capstone belongs outside QEMU, and for as long as both columns were
  * written from inside one running emulator the comparison was a dependent of
@@ -35,14 +35,13 @@
  * whole-population loss bar did not go red; it went to NO SUBJECT, which is
  * worse, because a missing subject looks like nothing at all.
  *
- * So the in-process Capstone arm is retired rather than repaired.  The two
- * hooks that write the Capstone side -- cst_capture_insn() and
- * cst_capture_alias() -- are alive and unchanged, and their producer is now
- * `cst_referee`: an offline binary that reads the (isa, encoding) keys out of
- * a QEMU-side corpus, disassembles those bytes with its OWN copy of the pinned
- * Capstone the tree names, and runs this same walk over the result.  It links
- * no plugin .so and no emulator, so nothing done to the tracer's Capstone
- * dependency can make it stop answering.  See tools/cst_referee.cc.
+ * So the comparison moved out of the process, and then out of the repository.
+ * Its producer is tools/cst_referee.py: an offline program that reads the
+ * (isa, encoding) keys out of a QEMU-side corpus, disassembles those bytes
+ * through the Python Capstone bindings -- the same way the mnemonic tables
+ * were always generated -- and runs the same walk over the result.  It links
+ * no plugin .so and no emulator and compiles nothing, so nothing done to this
+ * tree can make it stop answering.  See tools/cst_referee.py.
  *
  * What survives here in-process is the QEMU side: the identity, statement,
  * register-map, generic-set and vector-env corpora, which only a running
@@ -118,28 +117,6 @@ enum {
 
 #ifdef CST_CAPTURE
 
-/*
- * Write this instruction's classification to whichever corpora the run asked
- * for.  Called once, at the end of classification, with everything the
- * apparatus keys on: the encoding bytes, the decoder's own words, and the
- * classification those produced.
- *
- * A corpus that was asked for and could not be written is a refusal, not a
- * silence: a short corpus reads downstream as an encoding the classifier had
- * nothing to say about, which is the silent false success this tree keeps
- * having to relearn.
- *
- * ITS CALLER IS OFFLINE.  decode_detail_to_generic() has no plugin caller at
- * this tip, so in a running emulator this is dead and the corpora it writes
- * are empty.  cst_referee drives it instead, over the encodings a QEMU-side
- * corpus recorded.  Written from the same source either way, so the rows are
- * the rows the in-process arm produced and not a second implementation of
- * them -- measured: 0 differing rows against the last corpora that arm ever
- * wrote, on all four ISAs.
- */
-void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
-                      const struct qemu_plugin_insn_info *info,
-                      const struct InsnFields *f);
 
 /*
  * Write what QEMU itself said about instruction @idx of @tb: the decode rule
@@ -180,23 +157,6 @@ void cst_capture_vec_env(const struct qemu_plugin_tb *tb, size_t idx,
 void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
                          const void *bytes, size_t nbytes);
 
-/*
- * The refiner chain's three readings of one encoding: as the operand walk and
- * the mnemonic table left it, after refine_alias_fields(), and after the
- * per-row .refine callback.
- *
- * A row where the three agree is an encoding the alias surface does not touch,
- * and a row where they differ names exactly what would be lost if that surface
- * went away -- which is the fact a flip to QEMU's decode rule has to be
- * decided on, and the one no corpus carried.
- *
- * Offline like its sibling above, and for the same reason: this is a reading
- * of the Capstone refiner chain, and the tracer no longer walks it.
- */
-void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
-                       const struct InsnAliasSnap *walk,
-                       const struct InsnAliasSnap *alias,
-                       const struct InsnFields *f);
 
 /*
  * The register lists the trace PUBLISHES for these bytes: @f's src_regs[] and
@@ -217,28 +177,6 @@ void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
 void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
                            const void *bytes, size_t nbytes,
                            const struct InsnFields *f, int refusal);
-
-/*
- * Ask Capstone what these bytes are, and write the answer into @info.
- *
- * ONE COLUMN, AND IT IS APPARATUS.  The only field any caller reads back is
- * the mnemonic -- the word the other decoder printed -- which is a column of
- * the identity corpus and nothing the wire publishes.  It is here, and not at
- * the translation callback that needs it, because this is the file that does
- * not exist in a release build: with the call on this side, the shipped
- * plugin has no Capstone dependency at all, not a dependency it declines to
- * use.  The build proves it -- the plugin links libcapstone only when
- * -Dcst_capture=true.
- *
- * The arch/mode pair comes from champsim_tracer_capstone_mode.h and is
- * resolved once, lazily, on the first call: the RISC-V and MIPS resolvers
- * read the guest ELF through qemu_plugin_path_to_binary(), which needs a live
- * vCPU, and every call site is inside a translation callback where there is
- * one.  An ISA Capstone does not cover leaves @info untouched, and the
- * identity corpus then writes "-" for the column rather than a guess.
- */
-void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
-                            struct qemu_plugin_insn_info *info);
 
 /*
  * THE SLED DRIVER.  The corpus every per-encoding instrument reads is
@@ -295,13 +233,8 @@ bool cst_sled_translate_slot(uint64_t pc, bool *out_chain);
 
 #else
 
-static inline void cst_capture_insn(uint64_t, const void *, size_t,
-                                    const struct qemu_plugin_insn_info *,
-                                    const struct InsnFields *)
-{ }
-
 static inline void cst_capture_qemu_ident(const struct qemu_plugin_tb *, size_t,
-                                          const void *, size_t, const char *)
+                                          const void *, size_t)
 { }
 static inline void cst_capture_vec_env(const struct qemu_plugin_tb *, size_t,
                                        const void *, size_t)
@@ -309,17 +242,9 @@ static inline void cst_capture_vec_env(const struct qemu_plugin_tb *, size_t,
 static inline void cst_capture_df_stmt(const struct qemu_plugin_tb *, size_t,
                                        const void *, size_t)
 { }
-static inline void cst_capture_alias(const void *, size_t, const char *,
-                                    const struct InsnAliasSnap *,
-                                    const struct InsnAliasSnap *,
-                                    const struct InsnFields *)
-{ }
 static inline void cst_capture_wire_sets(const struct qemu_plugin_tb *, size_t,
                                          const void *, size_t,
                                          const struct InsnFields *, int)
-{ }
-static inline void cst_capture_cap_decode(const void *, size_t, uint64_t,
-                                          struct qemu_plugin_insn_info *)
 { }
 static inline void cst_capture_sled_run(void)
 { }

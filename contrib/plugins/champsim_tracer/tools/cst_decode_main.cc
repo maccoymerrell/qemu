@@ -27,7 +27,6 @@
  *   §4  Name -> mnemonic / regref      (mnem_from_genop, regref_from_name)
  *   §5  Branch-type helpers            (branch_is_none, branch_mnem_from_name)
  *   §6  Per-trace lookup tables        (DisasmTables, table_lookup)
- *   §7  Capstone wrapper               (ObjdumpRenderer)
  *   §8  Disasm renderer                (per-column emitters, render_disasm)
  *   §9  Templates-only renderer
  *   §10 Legacy renderer                (Python-compat output)
@@ -53,13 +52,7 @@
 
 #include "cst_decode.h"
 #include "cst_format.h"
-#include "cst_objdump.h"
 #include "cst_raw.h"
-
-/* Pull ObjdumpRenderer into the anonymous namespace below so its
- * unqualified name works in the rest of this file — the class itself
- * lives in cst::ObjdumpRenderer (cst_objdump.h). */
-namespace { using cst::ObjdumpRenderer; }
 
 namespace {
 
@@ -146,7 +139,7 @@ void append_byte_hex(std::string *out, uint8_t b)
 /* Pad @out with spaces up to column @target for the common case.  When
  * @out has *already reached or passed* @target -- e.g. a >7-byte x86
  * instruction overflowing BYTES_COL_PAD, or a long Capstone operand
- * string overflowing OBJDUMP_COL_WIDTH -- still emit exactly one space
+ * string overflowing its column -- still emit exactly one space
  * so the next column never runs directly into this one with zero
  * separation.  Without this, a 10..15-byte x86 instruction (raw bytes
  * sized only for the <=7-byte common case) glued straight into the
@@ -473,10 +466,6 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
 }
 
 /* ====================================================================
- * §7  Capstone wrapper — ObjdumpRenderer lives in cst_objdump.{h,cc}.
- * ==================================================================== */
-
-/* ====================================================================
  * §8  Disasm renderer
  *
  * Each architectural-instance instruction renders to a single line:
@@ -486,7 +475,7 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
  * The line is composed from a sequence of per-column emit_disasm_*
  * helpers, each appending to a shared thread_local buffer.  Layout:
  *
- *     pc_prefix      | bytes_column | objdump_column? | mnemonic   |
+ *     pc_prefix      | bytes_column | mnemonic   |
  *     operands       | memops       | branch_target   | metadata
  *
  * Each helper is self-contained and only consumes the parts of the
@@ -500,8 +489,6 @@ struct DisasmContext {
     const std::unordered_map<uint32_t, size_t> *by_id;
     const std::vector<cst::Template> *templates;
     const DisasmTables *t;
-    /* Optional Capstone-backed objdump column. */
-    const ObjdumpRenderer *od;
     /* --show-deps: append intra-instruction dep-mask annotation. */
     bool show_deps = false;
     /* --show-lanes: annotate vec operands with their lane sets and
@@ -560,7 +547,6 @@ constexpr int PC_COL_WIDTH       = 12;     /* hex digits */
  * into the next column. */
 constexpr int BYTES_COL_BYTES    = 7;      /* objdump-style */
 constexpr int BYTES_COL_PAD      = BYTES_COL_BYTES * 3 + 4;
-constexpr int OBJDUMP_COL_WIDTH  = 40;
 constexpr int MNEM_COL_WIDTH     = 8;
 
 /* "0x<pc> [<symbol>]: "
@@ -609,23 +595,6 @@ void emit_disasm_bytes_column(std::string &line,
         append_byte_hex(&line, raw_bytes[b]);
     }
     append_pad_to(&line, bytes_start + BYTES_COL_PAD);
-}
-
-/* Optional Capstone disasm column, "<text>     | ". */
-void emit_disasm_objdump_column(std::string &line,
-                                const ObjdumpRenderer &od,
-                                const cst::Instruction &insn)
-{
-    size_t obj_start = line.size();
-    std::string obj;
-    if (od.render_one(insn.pc, insn.raw_bytes.data(),
-                      insn.raw_bytes.size(), &obj)) {
-        line.append(obj);
-    } else {
-        line.append("(undecoded)");
-    }
-    append_pad_to(&line, obj_start + OBJDUMP_COL_WIDTH);
-    line.append("| ");
 }
 
 /* Branch mnemonic ("jmp"/"jcc"/...) when the insn is a branch, otherwise
@@ -1449,7 +1418,6 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
 
     emit_disasm_pc_prefix(line, insn);
     emit_disasm_bytes_column(line, insn.raw_bytes);
-    if (ctx.od) emit_disasm_objdump_column(line, *ctx.od, insn);
     emit_disasm_mnemonic(line, ctx, insn);
 
     uint64_t placed_loads = 0;
@@ -1735,12 +1703,11 @@ void render_disasm(FILE *out, const cst::Header &h,
                    const std::vector<cst::Template> &templates,
                    const std::unordered_map<uint32_t, size_t> &by_id,
                    cst::BodyWalker &body,
-                   const ObjdumpRenderer *od,
                    bool show_deps, bool show_lanes)
 {
     DisasmTables dt;
     disasm_tables_build(&dt, h);
-    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps, show_lanes};
+    DisasmContext ctx{&h, &by_id, &templates, &dt, show_deps, show_lanes};
 
     emit_disasm_file_header(out, h, templates.size());
     /* Disk-I/O records surface as comment lines, in stream order with
@@ -1833,11 +1800,10 @@ void emit_template_only_operands(std::string &line,
 
 
 /* One templates-only line:
- *   "  <pc>:  <bytes...>  [objdump | ] <mnem>   <operands>\n"
+ *   "  <pc>:  <bytes...>  <mnem>   <operands>\n"
  */
 void emit_template_only_line(FILE *out, const cst::Header &h,
                              const DisasmTables &dt,
-                             const ObjdumpRenderer *od,
                              const cst::InsnTemplate &I,
                              const cst::InsnProfileInfo *ip)
 {
@@ -1854,19 +1820,6 @@ void emit_template_only_line(FILE *out, const cst::Header &h,
     append_pad_to(&line, bytes_start + 16 * 3);
     line.append("  ");
 
-    if (od) {
-        size_t obj_start = line.size();
-        std::string obj;
-        if (od->render_one(I.pc, I.raw_bytes.data(), I.raw_bytes.size(),
-                           &obj)) {
-            line.append(obj);
-        } else {
-            line.append("(undecoded)");
-        }
-        append_pad_to(&line, obj_start + OBJDUMP_COL_WIDTH);
-        line.append("| ");
-    }
-
     emit_template_only_mnemonic(line, h, dt, I);
     emit_template_only_operands(line, dt, I);
     if (ip) {
@@ -1881,24 +1834,22 @@ void emit_template_only_line(FILE *out, const cst::Header &h,
 }
 
 void emit_templates_only_file_header(FILE *out, const cst::Header &h,
-                                     size_t n_templates, bool with_objdump)
+                                     size_t n_templates)
 {
     std::fprintf(out, "\n%s:     file format trace template map\n",
                  isa_display(h));
-    std::fprintf(out, "; version=0x%08X templates=%zu%s\n\n",
-                 h.magic, n_templates,
-                 with_objdump ? " objdump_disasm=on" : "");
+    std::fprintf(out, "; version=0x%08X templates=%zu\n\n",
+                 h.magic, n_templates);
 }
 
 void render_templates_only(FILE *out, const cst::Header &h,
                            const std::vector<cst::Template> &templates,
-                           const std::unordered_map<uint32_t, size_t> &by_id,
-                           const ObjdumpRenderer *od)
+                           const std::unordered_map<uint32_t, size_t> &by_id)
 {
     (void)by_id;
     DisasmTables dt;
     disasm_tables_build(&dt, h);
-    emit_templates_only_file_header(out, h, templates.size(), od != nullptr);
+    emit_templates_only_file_header(out, h, templates.size());
 
     /* Per-BB so the run-aggregated profile can be annotated as part
      * of each block (a flat dedup'd PC dump has nowhere to hang it). */
@@ -1917,7 +1868,7 @@ void render_templates_only(FILE *out, const cst::Header &h,
         for (size_t k = 0; k < t.insns.size(); k++) {
             const cst::InsnProfileInfo *ip =
                 k < t.profile.insns.size() ? &t.profile.insns[k] : nullptr;
-            emit_template_only_line(out, h, dt, od, t.insns[k], ip);
+            emit_template_only_line(out, h, dt, t.insns[k], ip);
         }
     }
 
@@ -2511,7 +2462,6 @@ struct Options {
     const char *trace_path     = nullptr;
     const char *format         = "disasm";
     bool        templates_only = false;
-    bool        show_objdump   = false;
     bool        show_deps      = false;
     bool        show_lanes     = false;
     bool        strict         = false;
@@ -2524,15 +2474,13 @@ void print_usage(FILE *err, const char *argv0)
 {
     std::fprintf(err,
         "usage: %s [--format=disasm|legacy|raw] [--templates-only] "
-        "[--objdump] [--show-deps] [--show-lanes] [--strict] [--max N] "
+        "[--show-deps] [--show-lanes] [--strict] [--max N] "
         "<trace.cst>\n"
         "  --format=raw      pseudo-wire structural dump: every field,\n"
         "                    record, and section in decode order with\n"
         "                    byte offsets + format-spec step refs (debug)\n"
         "  --templates-only  print only the template dictionary,\n"
         "                    skip the body delta-replay\n"
-        "  --objdump         emit Capstone-rendered native disasm\n"
-        "                    of each insn alongside the generic view\n"
         "  --show-deps       append intra-instruction dep masks as a\n"
         "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
         "                    when the template carries them\n"
@@ -2573,8 +2521,6 @@ int parse_options(int argc, char **argv, Options *opts)
             opts->format = "legacy";
         } else if (std::strcmp(a, "--templates-only") == 0) {
             opts->templates_only = true;
-        } else if (std::strcmp(a, "--objdump") == 0) {
-            opts->show_objdump = true;
         } else if (std::strcmp(a, "--show-deps") == 0) {
             opts->show_deps = true;
         } else if (std::strcmp(a, "--show-lanes") == 0) {
@@ -2606,28 +2552,12 @@ int parse_options(int argc, char **argv, Options *opts)
     return 0;
 }
 
-/* Open Capstone for the trace's ISA when --objdump is set; returns
- * nullptr when objdump wasn't requested or the ISA is unsupported.
- * @od is provided as backing storage by the caller. */
-ObjdumpRenderer *open_objdump_renderer(ObjdumpRenderer *od,
-                                       const Options &opts,
-                                       const cst::Header &h)
-{
-    if (!opts.show_objdump) return nullptr;
-    if (od->open(h.isa)) return od;
-    std::fprintf(stderr,
-        "cst_decode: --objdump unsupported for ISA=%u; "
-        "continuing without the objdump column\n", (unsigned)h.isa);
-    return nullptr;
-}
-
 /* Walk the body section of @cf and dispatch to the requested
  * renderer.  Returns 0 on success, 2 on bad format string. */
 int run_body_render(const Options &opts, const cst::Header &h,
                     cst::CstFile &cf,
                     const std::vector<cst::Template> &templates,
-                    const std::unordered_map<uint32_t, size_t> &by_id,
-                    const ObjdumpRenderer *odp)
+                    const std::unordered_map<uint32_t, size_t> &by_id)
 {
     auto body_stream = cst::body_stream_open(cf);
     cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
@@ -2636,7 +2566,7 @@ int run_body_render(const Options &opts, const cst::Header &h,
     if (std::strcmp(opts.format, "legacy") == 0) {
         render_legacy(stdout, h, templates, by_id, walker);
     } else if (std::strcmp(opts.format, "disasm") == 0) {
-        render_disasm(stdout, h, templates, by_id, walker, odp,
+        render_disasm(stdout, h, templates, by_id, walker,
                       opts.show_deps, opts.show_lanes);
     } else {
         std::fprintf(stderr, "cst_decode: unknown format '%s'\n",
@@ -3224,13 +3154,10 @@ int run(const Options &opts)
     std::unordered_map<uint32_t, size_t> by_id;
     cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
-    ObjdumpRenderer od;
-    ObjdumpRenderer *odp = open_objdump_renderer(&od, opts, h);
-
     if (opts.templates_only) {
         /* No body access at all — no decompressor spawned, no body
          * bytes read off disk.  Cheap even on huge traces. */
-        render_templates_only(stdout, h, templates, by_id, odp);
+        render_templates_only(stdout, h, templates, by_id);
         return 0;
     }
     if (std::strcmp(opts.format, "raw") == 0) {
@@ -3243,7 +3170,7 @@ int run(const Options &opts)
     if (opts.verify_branch) {
         return run_verify_branch(opts, h, *cf, templates, by_id);
     }
-    return run_body_render(opts, h, *cf, templates, by_id, odp);
+    return run_body_render(opts, h, *cf, templates, by_id);
 }
 
 }  /* namespace */

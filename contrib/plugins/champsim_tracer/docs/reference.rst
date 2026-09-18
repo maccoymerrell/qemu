@@ -940,12 +940,11 @@ interpret the ``insn_bytes`` payload of each template.
 ISA coverage in detail
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Each ISA has a per-ISA classification table in
-``contrib/plugins/champsim_tracer/champsim_tracer_mnemonics_<isa>.h``
-sized to the upstream Capstone ``<ISA>_INS_ENDING`` constant.
-Every Capstone-defined mnemonic gets a designated-initializer row
-in the table, so a build of the plugin against the in-tree
-Capstone version covers Capstone's full mnemonic surface for that
+Each ISA's generic vocabulary is QEMU's own: the decode rule names
+its word at the translator, and ``champsim_tracer_vocabulary.cc``
+maps that word to the generic opcode the wire publishes.  Coverage
+is therefore the target's decode surface rather than a decoder
+library's mnemonic list, for that
 ISA.  The practical limits on coverage are:
 
 * Capstone itself doesn't model every architectural extension at

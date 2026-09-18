@@ -169,7 +169,7 @@ struct RevisionSlot {
 
 /*
  * Read-only view of a contiguous run of canonical instructions (a whole TB
- * or a fragment slice).  Groups the six parallel per-insn arrays that
+ * or a fragment slice).  Groups the parallel per-insn arrays that
  * describe a translation so they travel together rather than as a
  * six-pointer parameter clump.  Non-owning: the backing arrays must outlive
  * the view.
@@ -177,7 +177,6 @@ struct RevisionSlot {
 struct TbInsnView {
     uint32_t                     n;
     const uint64_t              *pcs;
-    const qemu_plugin_insn_info *info;
     const uint64_t              *branch_target_pcs;
     const uint8_t               *sizes;
     const uint8_t               *bytes;   /* n * MAX_INSN_BYTES */
@@ -203,7 +202,6 @@ struct TbInsnView {
         return TbInsnView{
             count,
             pcs + first,
-            info + first,
             branch_target_pcs + first,
             sizes + first,
             bytes + (size_t)first * MAX_INSN_BYTES,

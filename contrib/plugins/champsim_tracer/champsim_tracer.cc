@@ -10567,7 +10567,6 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
  */
 struct TbScratch {
     std::unique_ptr<uint64_t[]>              insn_pcs;
-    std::unique_ptr<qemu_plugin_insn_info[]> insn_info;
     std::unique_ptr<uint64_t[]>              insn_branch_target_pcs;
     std::unique_ptr<uint8_t[]>               insn_sizes;
     std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
@@ -10586,7 +10585,6 @@ struct TbScratch {
 
     explicit TbScratch(size_t n)
         : insn_pcs(std::make_unique<uint64_t[]>(n)),
-          insn_info(std::make_unique<qemu_plugin_insn_info[]>(n)),
           insn_branch_target_pcs(std::make_unique<uint64_t[]>(n)),
           insn_sizes(std::make_unique<uint8_t[]>(n)),
           insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
@@ -10612,7 +10610,6 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
                                       size_t raw_n_insns, TbScratch &scratch)
 {
     uint64_t *insn_pcs                 = scratch.insn_pcs.get();
-    qemu_plugin_insn_info *insn_info   = scratch.insn_info.get();
     uint64_t *insn_branch_target_pcs   = scratch.insn_branch_target_pcs.get();
     uint8_t *insn_sizes                = scratch.insn_sizes.get();
     uint8_t *insn_bytes                = scratch.insn_bytes.get();
@@ -10699,27 +10696,6 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
             memcpy(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
                    raw_bytes, MAX_INSN_BYTES);
 
-            /*
-             * THE SECOND DECODER, and the only thing left that asks it
-             * anything.
-             *
-             * Nothing the wire publishes reads this: classification, the
-             * register lists, the memory operands, the lane shape and the
-             * self-loop unit are all QEMU's own statements about the ops it
-             * emitted (champsim_tracer_qdep.cc), and the fragment splitter
-             * draws its boundaries on QEMU's decode rule.  What survives is
-             * one column of the comparison corpus -- the mnemonic the other
-             * decoder printed -- which is apparatus and belongs in a build
-             * configured for apparatus.
-             *
-             * It compiles to nothing in a release build, like the three
-             * capture calls below it, and the arch/mode pair it needs lives
-             * with it on the capture side: the shipped plugin does not link
-             * Capstone at all.
-             */
-            cst_capture_cap_decode(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
-                                   insn_sizes[out], insn_pcs[out],
-                                   &insn_info[out]);
 
             /*
              * The comparison capture's second call site, here because this is
@@ -10730,7 +10706,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
              */
             cst_capture_qemu_ident(tb, i,
                                    &insn_bytes[(size_t)out * MAX_INSN_BYTES],
-                                   insn_sizes[out], insn_info[out].mnemonic);
+                                   insn_sizes[out]);
             cst_capture_vec_env(tb, i,
                                 &insn_bytes[(size_t)out * MAX_INSN_BYTES],
                                 insn_sizes[out]);
@@ -10824,11 +10800,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* RAII-owned scratch; raw aliases below keep the loop body unchanged.
      * insn_branch_target_pcs is the per-canonical-insn static branch target
      * the translator resolved (qemu_plugin_insn_branch_target_pc()), parallel
-     * to insn_info[]/insn_pcs[]; zero on non-branches and indirect branches
+     * to insn_pcs[]; zero on non-branches and indirect branches
      * (which fall back to BranchHistory). */
     TbScratch scratch(raw_n_insns);
     uint64_t *insn_pcs                 = scratch.insn_pcs.get();
-    qemu_plugin_insn_info *insn_info   = scratch.insn_info.get();
     uint64_t *insn_branch_target_pcs   = scratch.insn_branch_target_pcs.get();
     uint8_t *insn_sizes                = scratch.insn_sizes.get();
     uint8_t *insn_bytes                = scratch.insn_bytes.get();
@@ -10882,9 +10857,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * JIT-level per-insn callbacks and scoreboard stores below (done
      * every translation regardless of reuse). */
     /* Whole-TB canonical view; each fragment passes a slice to
-     * create_tb_template (groups the six parallel per-insn arrays). */
+     * create_tb_template (groups the parallel per-insn arrays). */
     TbInsnView tb_view = {
-        canonical_n_insns, insn_pcs, insn_info, insn_branch_target_pcs,
+        canonical_n_insns, insn_pcs, insn_branch_target_pcs,
         insn_sizes, insn_bytes, tb, scratch.canonical_raw.get(),
     };
 

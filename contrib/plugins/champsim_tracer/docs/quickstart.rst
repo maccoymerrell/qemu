@@ -18,17 +18,17 @@ with the following toolchain and library version(s); other environments may work
   meson plumbing but is not exercised in CI.
 * **Compiler:** gcc 11+  C++17 is required.
 * **glib:** 2.66 or newer (Ubuntu 22.04 default is fine).
-* **Capstone:** auto-downloaded by meson via
-  ``subprojects/capstone.wrap``.  The plugin uses Capstone's
-  detail mode and requires the revision pinned in that wrap
-  file (currently ``6.0.0-Alpha7``); the build always links
-  against that pinned copy.
+* **Capstone:** not used.  The repository carries no Capstone source,
+  no wrap and no vendored copy, and nothing it builds links the
+  library.  The reference decoder the acceptance comparison scores
+  against runs offline, through the Python Capstone bindings —
+  ``contrib/plugins/champsim_tracer/tools/cst_referee.py``.
 * **QEMU base:** the repository is a fork of QEMU.  The plugin
   expects the base modifications described in
   :doc:`qemu_modifications`; building against an unmodified
   upstream QEMU will not work because the plugin uses
-  ``qemu_plugin_insn_detail``, ``qemu_plugin_cap_decode``, and
-  ``qemu_plugin_insn_branch_target_pc``, which this fork provides and
+  ``qemu_plugin_insn_branch_target_pc`` and the dataflow statement
+  ABI, which this fork provides and
   upstream QEMU does not.
 
 Build invocation
@@ -1098,8 +1098,8 @@ Each line is self-contained — pipe it through ``grep`` by PC,
 mnemonic, register reference (``%gp1`` etc.), memop pattern
 (``ld[`` / ``st[``), branch-target comment (``# 0x``), or the
 ``; ----- BB`` boundary markers.  See :doc:`decoder` for the
-full column reference, the ``--templates-only`` and ``--objdump``
-flags, and the block-formatted ``--format=legacy`` output.
+full column reference, the ``--templates-only`` flag, and the
+block-formatted ``--format=legacy`` output.
 
 A byte-budget audit (helpful when tuning trace size) is one command:
 

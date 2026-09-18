@@ -29,7 +29,6 @@ extern "C" {
 }
 
 #include "champsim_tracer_mnemonics.h"
-#include "champsim_tracer_capstone_mode.h"
 #include "champsim_tracer_generic_ids.h"
 #include "champsim_tracer_vocabulary.h"
 #include "champsim_tracer_regmap.h"
@@ -962,187 +961,8 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
 
     hex_bytes(bytes, nbytes, enc, sizeof(enc));
 
-    /*
-     * A SEATING THAT WAS REFUSED IS NOT A SET WITH NOTHING IN IT.
-     *
-     * When the seating declines, the template keeps the zeroed lists it was
-     * reset with, and the trace publishes an instruction that names no
-     * register.  Written as "-" that is indistinguishable from an encoding
-     * which genuinely touches none -- and this corpus is read to decide
-     * whether a name was LOST, so the two have to be told apart or the
-     * commonest question it answers is answered wrong in both directions.
-     *
-     * So a refusal prints as a member: @refused:<why>, in the same shape as
-     * the @unmapped: and @env+ members the corpus already carries for things
-     * that are not register names.  It compares as itself, which is right:
-     * the other decoder named registers here and the wire named a refusal,
-     * and that is a difference in both columns rather than a silence in one.
-     */
-    if (refusal != CST_WIRE_SEATED) {
-        static const char *const why[] = {
-            "seated", "no-rule", "incomplete", "unknown-word", "no-status",
-            "not-asked",
-        };
-        char lab[40];
-        unsigned k = (unsigned)refusal;
-        const char *w = k < (sizeof(why) / sizeof(why[0])) ? why[k] : "?";
-
-        /*
-         * "incomplete" alone does not say WHAT overflowed, and the four
-         * causes are four different remedies -- more write slots, more env
-         * range slots, more memop rows, or a decode site that declined.  The
-         * emulator records which, so the row carries it.
-         */
-        if (refusal == CST_WIRE_INCOMPLETE && tb) {
-            qemu_plugin_dataflow_status st = qemu_plugin_dataflow_status();
-
-            st.struct_size = sizeof(st);
-            if (qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
-                snprintf(lab, sizeof(lab), "@refused:%s:%s%s%s%s", w,
-                         (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES) ? "W" : "",
-                         (st.incomplete & QEMU_PLUGIN_DF_INC_FIELDS) ? "F" : "",
-                         (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS) ? "M" : "",
-                         (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED) ? "D" : "");
-            } else {
-                snprintf(lab, sizeof(lab), "@refused:%s:?", w);
-            }
-        } else {
-            snprintf(lab, sizeof(lab), "@refused:%s", w);
-        }
-
-        char labels[1][40];
-
-        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
-        emit_gen_set(isa_name(), enc, 'q', 'r', labels, 1, 1);
-        snprintf(labels[0], sizeof(labels[0]), "%s", lab);
-        emit_gen_set(isa_name(), enc, 'q', 'w', labels, 1, 1);
-        return;
-    }
-    emit_gen_set_ids(isa_name(), enc, 'q', 'r', f->src_regs, f->n_src_regs);
-    emit_gen_set_ids(isa_name(), enc, 'q', 'w', f->dst_regs, f->n_dst_regs);
-}
-
-void cst_capture_alias(const void *bytes, size_t nbytes, const char *mnem,
-                       const struct InsnAliasSnap *walk,
-                       const struct InsnAliasSnap *alias,
-                       const struct InsnFields *f)
-{
-    if (!bytes || !nbytes || !walk || !alias || !f) {
-        return;
-    }
-    corpora_init();
-
-    FILE *o = corpus_alias->get();
-
-    if (!o) {
-        return;
-    }
-
-    char enc[2 * 32 + 1];
-
-    hex_bytes(bytes, nbytes, enc, sizeof(enc));
-
-    /*
-     * WHICH REFINER MOVED IT, not merely that something did.  A scorer joining
-     * this against the identity corpus's branch column has to be able to say
-     * whether the alias surface produced the answer -- deleting it is what a
-     * flip to QEMU's decode rule would do -- or whether the per-row .refine
-     * did, which is a different callback with a different fate.
-     */
-    const char *moved = "none";
-
-    if (walk->branch_type != alias->branch_type ||
-        walk->branch_conditional != alias->branch_conditional ||
-        walk->n_src_regs != alias->n_src_regs ||
-        walk->n_dst_regs != alias->n_dst_regs) {
-        moved = (alias->branch_type != f->branch_type ||
-                 alias->branch_conditional != f->branch_conditional)
-                ? "alias+refine" : "alias";
-    } else if (alias->branch_type != f->branch_type ||
-               alias->branch_conditional != f->branch_conditional) {
-        moved = "refine";
-    }
-
-    fprintf(o, "%s\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n",
-            isa_name(), enc, mnem && mnem[0] ? mnem : "-",
-            branch_type_name_or_unknown(walk->branch_type),
-            branch_type_name_or_unknown(alias->branch_type),
-            branch_type_name_or_unknown(f->branch_type),
-            walk->branch_conditional ? 1u : 0u,
-            alias->branch_conditional ? 1u : 0u,
-            f->branch_conditional ? 1u : 0u,
-            (unsigned)walk->n_src_regs, (unsigned)alias->n_src_regs,
-            (unsigned)f->n_src_regs, (unsigned)f->n_dst_regs, moved);
-}
-
-void cst_capture_insn(uint64_t pc, const void *bytes, size_t nbytes,
-                      const struct qemu_plugin_insn_info *info,
-                      const struct InsnFields *f)
-{
-    (void)pc;
-
-    if (!bytes || !nbytes || !f) {
-        return;
-    }
-    corpora_init();
-
-    char enc[2 * 32 + 1];
-    const char *isa = isa_name();
-
-    hex_bytes(bytes, nbytes, enc, sizeof(enc));
-    const char *mnem = info && info->mnemonic[0] ? info->mnemonic : "-";
-
-    if (FILE *o = corpus_src->get()) {
-        char src[512];
-        size_t k = 0;
-
-        src[0] = '\0';
-        for (unsigned i = 0; i < f->n_src_regs; i++) {
-            const char *nm = generic_reg_name_or_unknown(f->src_regs[i]);
-            int w = snprintf(src + k, sizeof(src) - k, "%s%s",
-                             k ? "," : "", nm);
-
-            if (w < 0 || (size_t)w >= sizeof(src) - k) {
-                break;
-            }
-            k += (size_t)w;
-        }
-        fprintf(o, "%s\t%s\t%s\t%s\n", isa, enc, mnem, k ? src : "-");
-    }
-
-    if (FILE *o = corpus_opc->get()) {
-        fprintf(o, "%s\t%s\t%s\t%s\n", isa, enc, mnem,
-                generic_opcode_name_or_unknown(f->opcode));
-    }
-
-    /*
-     * The Capstone walk's register sets, in the currency the QEMU side is
-     * written in by cst_capture_df_stmt().  Written here, from the same run
-     * and the same window, so a scorer can join the two sides per encoding --
-     * which is the join the destination flip's REAL-LOST bar is stated over
-     * and the one no corpus carried.
-     */
-    if (corpus_gen->get()) {
-        emit_gen_set_cap(isa, enc, 'r', f->src_regs, f->n_src_regs);
-        emit_gen_set_cap(isa, enc, 'w', f->dst_regs, f->n_dst_regs);
-    }
-
-    if (FILE *o = corpus_mech->get()) {
-        /*
-         * The mechanism is what a reader needs to tell a list that is short
-         * because the instruction reads little from one that is short because
-         * the classifier had nothing to say.  Both look like a short list.
-         */
-        fprintf(o, "%s\t%s\t%s\n", isa, enc,
-                f->opcode == GEN_OP_UNKNOWN ? "unclassified"
-                : f->n_src_regs             ? "walked"
-                                            : "walked-empty");
-    }
-
-}
-
-void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
-                            const void *bytes, size_t nbytes, const char *mnem)
+    void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
+                            const void *bytes, size_t nbytes)
 {
     if (!tb || !bytes || !nbytes) {
         return;
@@ -1187,8 +1007,14 @@ void cst_capture_qemu_ident(const struct qemu_plugin_tb *tb, size_t idx,
         opc = brn = "#unknownword";
     }
 
+    /*
+     * The mnemonic column is the OTHER decoder's word, and no decoder but
+     * QEMU runs in this process any more.  The column keeps its place --
+     * every reader of this corpus keys on the encoding and the columns are
+     * positional -- and the referee fills it offline, from these same bytes.
+     */
     fprintf(o, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", isa_name(), enc,
-            mnem && mnem[0] ? mnem : "-", rule ? rule : "-",
+            "-", rule ? rule : "-",
             word ? word : "-", opc, brn);
 }
 
@@ -1573,29 +1399,6 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
                 pcbit == UINT_MAX ? "-" : (pc_rd ? "r" : "0"),
                 ek ? ea : "-", selfloop, sets, regs);
     }
-}
-
-/*
- * The Capstone column of the identity corpus.  See champsim_tracer_capture.h
- * for why the call lives on this side of the segregation line.
- */
-void cst_capture_cap_decode(const void *bytes, size_t nbytes, uint64_t pc,
-                            struct qemu_plugin_insn_info *info)
-{
-    static int arch = -2;               /* -2 = not resolved yet */
-    static unsigned int mode;
-
-    if (arch == -2) {
-        arch = cst_capstone_arch_for_isa(trace_isa);
-        mode = (arch >= 0)
-             ? cst_capstone_mode_for_isa(trace_isa, target_name)
-             : 0;
-    }
-    if (arch < 0) {
-        return;
-    }
-    qemu_plugin_cap_decode(arch, mode, (const uint8_t *)bytes, nbytes, pc,
-                           info);
 }
 
 /*

@@ -103,7 +103,6 @@ as well as the tracer itself (an upcoming publication).
    :maxdepth: 1
    :caption: Appendices
 
-   _generated/encoding_tables
 
 .. only:: html
 

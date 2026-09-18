@@ -52,10 +52,6 @@ extensions = [
     # wire-format spec is reStructuredText (format.rst); myst stays
     # available for incidental Markdown (e.g. README files).
     "myst_parser",
-    # Local extension that parses the per-ISA classification tables
-    # in champsim_tracer_mnemonics_*.h and emits the appendix at
-    # _generated/encoding_tables.rst before sources are read.
-    "encoding_tables",
     # Local extension that walks every parsed doctree and adds index
     # entries for well-known symbol names (GEN_OP_*, REG_*, BRANCH_*,
     # CST_FID_*, SYNC_*, BODY_TAG_*, validator subcommands, ...).

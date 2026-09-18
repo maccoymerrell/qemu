@@ -15,18 +15,6 @@ Plugin API additions
 
 ``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 12``)
 
-   * ``qemu_plugin_insn_detail`` — Capstone-detail accessor that
-     returns a structured ``qemu_plugin_insn_info`` for an
-     in-flight ``qemu_plugin_insn`` (operands with type/access/size,
-     implicit register reads/writes, instruction groups, x86
-     prefix bits).  The plugin uses this in ``vcpu_tb_trans`` to
-     classify each instruction without parsing disassembly strings.
-   * ``qemu_plugin_cap_decode`` — same shape, but accepts a raw
-     instruction byte buffer plus an explicit Capstone
-     ``cs_arch`` / ``cs_mode`` pair.  Used for re-decoding the
-     instructions of speculative basic blocks, which need the
-     same Capstone view of bytes that the in-flight TCG translator
-     does not otherwise expose.
    * ``qemu_plugin_insn_branch_target_pc`` — returns the static
      control-transfer target the per-ISA translator resolved for a
      branch instruction, or 0 for a non-branch or an indirect
@@ -363,27 +351,14 @@ hardware page-table walk
    walk reports failure and the caller keeps the plain miss.  (v4
    default #2, maintainer-vetoable.)
 
-``plugins/api.c`` and ``disas/disas-target.c``
+``disas/capstone.c``, ``include/disas/capstone.h`` and
+``include/disas/dis-asm.h``
 
-   The dispatch layer between the plugin API and the disassemblers.
-   ``qemu_plugin_insn_detail`` forwards to a new
-   ``plugin_disas_detail()`` which delegates to
-   ``cap_disas_plugin_detail()`` when Capstone is available for the
-   target ISA, and falls back to the builtin disassembler with a
-   ``mnemonic / op_str`` split otherwise (so RISC-V and MIPS still
-   produce something the plugin's MNEM-table classifier can use).
-
-``disas/capstone.c`` and ``include/disas/dis-asm.h``
-
-   Two new entry points: ``cap_disas_plugin_detail`` (uses an
-   in-flight ``disassemble_info`` and a known PC/size) and
-   ``cap_disas_raw_detail`` (opens a fresh Capstone handle from
-   ``cs_arch`` / ``cs_mode`` arguments).  Both fill the
-   ``qemu_plugin_insn_info`` structure declared in
-   ``qemu-plugin.h``.  The implementation maps Capstone's generic
-   group enum to ``QEMU_PLUGIN_GRP_*`` bits, copies operand and
-   register-name strings into the public buffers, and recovers x86
-   ``LOCK`` / ``REP`` prefix flags from the Capstone detail block.
+   Untouched, and deliberately so: the Capstone boundary this fork
+   once extended carries no fork change at all, and the meson
+   feature option that governs it is upstream's.  The tracer does
+   not consult a second decoder at run time, so nothing it builds
+   needs one.
 
    ``qemu_plugin_operand`` also carries ``segment_id``: the Capstone
    register ID of an x86 segment override on a ``MEM`` operand

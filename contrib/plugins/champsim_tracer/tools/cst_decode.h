@@ -8,8 +8,7 @@
  * Rippable bundle for consuming .cst traces elsewhere: cst_common.h
  * (wire types), cst_reader.h (pull reader + Source), cst_format.h/.cc
  * (container open + parse_header), cst_decode.h/.cc (this file:
- * BodyWalker + instructions_from_entry), cst_objdump.h/.cc (OPTIONAL
- * --objdump; no-op stub without -DCST_HAVE_CAPSTONE).  Plain C++17 +
+ * BodyWalker + instructions_from_entry).  Plain C++17 +
  * a small POSIX set for cst_format.cc; no QEMU/glib.  Consumers can
  * feed the walker from their own byte source via Reader(const
  * uint8_t *, size_t, size_t) and skip the subprocess decompressor.
@@ -188,7 +187,7 @@ public:
      * This is the batch path: it materialises a DecodedEntry (and,
      * under CST_FLAG_WP, the whole wrong-path chain) per ENTRY.  Use
      * it when the consumer wants the fully-assembled entry shape
-     * (objdump / instructions_from_entry / IFRAME validation).  For a
+     * (disasm rendering / instructions_from_entry / IFRAME validation).  For a
      * streaming consumer that processes one basic block at a time,
      * prefer walk_bb() below — it allocates no per-entry containers. */
     void walk(const Callback &cb,

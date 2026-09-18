@@ -11,9 +11,7 @@ from the file.
   objdump-style disassembly to stdout, with one line per architectural
   instruction.  ``--templates-only`` suppresses the body walk and emits
   one PC-sorted line per static template entry — the analogue of
-  ``objdump -d`` over the captured templates.  ``--objdump`` adds a
-  side-by-side Capstone disassembly column so the generic-opcode line
-  can be cross-checked against ``objdump`` output.  ``--format=raw``
+  ``objdump -d`` over the captured templates.  ``--format=raw``
   swaps the disassembly for a byte-offset-annotated pseudo-wire dump of
   the raw header and body records, for debugging the format itself.
 
@@ -32,7 +30,6 @@ cst_decode
    single: cst_decode
    single: --format
    single: --templates-only
-   single: --objdump
    single: --show-deps
    single: --show-lanes
 
@@ -44,7 +41,6 @@ the plugin shared object.  Lands in
 
    $ build/contrib/plugins/cst_decode trace.cst > trace.disasm
    $ build/contrib/plugins/cst_decode --templates-only trace.cst > trace.t.disasm
-   $ build/contrib/plugins/cst_decode --objdump trace.cst > trace.objdump.disasm
    $ build/contrib/plugins/cst_decode --format=raw trace.cst > trace.wire.txt
 
 Output format
@@ -235,7 +231,7 @@ comment prefix.
    ``ipos_delta`` / ``fid`` / signed-delta wire values (with the
    numeric ids resolved through the trace's own encoding maps), not the
    replayed absolute field value.  Honours ``--max N`` to stop after
-   ``N`` body entries; ``--objdump`` / ``--show-deps`` / ``--show-lanes``
+   ``N`` body entries; ``--show-deps`` / ``--show-lanes``
    do not apply.
 
 ``--templates-only``
@@ -270,18 +266,6 @@ comment prefix.
       0x401176: 2 revisions: BB4099 BB4119
 
    A trace with no self-modified code omits the section entirely.
-
-``--objdump``
-   Add a side-by-side Capstone-disassembly column to each printed
-   line so the generic-opcode rendering can be cross-checked
-   against the canonical ISA mnemonic.  Combines with
-   ``--templates-only`` (templates side-by-side with Capstone) and
-   with the default body walk (per-execution lines side-by-side
-   with Capstone, but only the static template half is shown on
-   the Capstone side — ``objdump`` has no notion of the captured
-   dynamic values).  Capstone is taken from the bundled
-   ``subprojects/capstone`` so both sides come from the same
-   build the plugin links against.
 
 ``--show-deps``
    Append a trailing ``; deps:`` annotation giving the
@@ -788,10 +772,6 @@ re-user must respect:
   entries for values it actually uses; the in-tree writer
   enumerates the full canonical set as a convenience, not because
   the format demands it.
-* **Capstone is optional.**  Without ``-DCST_HAVE_CAPSTONE``
-  ``cst_objdump`` compiles to a stub and ``--objdump`` simply
-  disables — downstream re-users link cleanly without bundling
-  Capstone.
 * **Bring your own byte source.**  A ``Reader`` can wrap any byte
   source; consumers may bypass ``cst_file_open`` / the ustar +
   decompressor machinery entirely.  Streaming readers pull through

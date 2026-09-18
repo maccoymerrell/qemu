@@ -796,8 +796,8 @@ way of the correction boundary in ``disas/capstone.c``.  Because every
 self-consistency check the tracer owns reads the *same* metadata, a
 decoder defect corrupts the trace and the checks agree with the
 corruption.  The independent instrument for that class is the
-``isaxcheck`` cross-check (:doc:`validator`, gating check
-``features.isa_crosscheck``), which compares the boundary's answer
+offline referee (``tools/cst_referee.py``), which compares the
+wire's answer
 against the LLVM MC layer over an exhaustive sweep of the opcode-bearing
 encoding space on all four ISAs.  What follows are the gaps it leaves
 standing, each recorded rather than fixed.

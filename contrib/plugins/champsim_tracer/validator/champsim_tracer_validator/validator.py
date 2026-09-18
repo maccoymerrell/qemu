@@ -3276,32 +3276,32 @@ def _sha16_file(p) -> str:
         return "absent"
 
 
-def _find_cst_referee() -> Path:
-    """The EXTERNAL referee binary, or a refusal.
+def _referee_argv() -> list:
+    """The EXTERNAL referee's command line, or a refusal.
 
-    Located the way cst_decode is: an explicit CST_REFEREE, then PATH, then
-    the tree's conventional build directory.  A check that cannot find its
-    comparand FAILS; it never reports a zero.
+    The referee is offline and builds nothing: it is
+    tools/cst_referee.py, reaching Capstone through the Python bindings,
+    the way the retired mnemonic-table generator always did.  CST_REFEREE
+    overrides the path (a script or any executable taking the same
+    arguments).  A check that cannot find its comparand FAILS; it never
+    reports a zero.
     """
-    import shutil
+    import sys
 
     explicit = os.environ.get("CST_REFEREE")
     if explicit:
         p = Path(explicit)
-        if p.is_file():
-            return p
-        raise FileNotFoundError("CST_REFEREE=%r does not exist" % explicit)
-    on_path = shutil.which("cst_referee")
-    if on_path:
-        return Path(on_path)
+        if not p.is_file():
+            raise FileNotFoundError("CST_REFEREE=%r does not exist" % explicit)
+        return ([sys.executable, str(p)] if p.suffix == ".py"
+                else [str(p)])
     here = Path(__file__).resolve().parent
-    in_tree = (here.parent.parent.parent.parent.parent
-               / "build" / "contrib" / "plugins" / "cst_referee")
+    in_tree = here.parent.parent / "tools" / "cst_referee.py"
     if in_tree.is_file():
-        return in_tree.resolve()
+        return [sys.executable, str(in_tree.resolve())]
     raise FileNotFoundError(
-        "cst_referee binary not found; build it with "
-        "`ninja contrib/plugins/cst_referee`, or set CST_REFEREE")
+        "tools/cst_referee.py not found, and CST_REFEREE names nothing; "
+        "the referee is an offline python program, not a build artifact")
 
 
 _REF_RULINGS = (Path(__file__).resolve().parent.parent.parent /
@@ -3337,16 +3337,16 @@ def _referee_reg_sets(isa: str, encodings: list[str],
                       stamp: str) -> tuple[dict, str]:
     """{(encoding, direction): set(REG_* names)} from the EXTERNAL referee.
 
-    The referee links the pinned Capstone the wrap names, compiles
-    disas/capstone.c so the boundary workarounds are exactly the ones the
-    tree ships, refuses to run if the library it loaded is not the one its
-    headers describe, and links no plugin and no emulator.  Returns the
-    corpus and the note it stamped it with.
+    The referee reaches Capstone through the Python bindings, carries the
+    boundary's access-flag corrections and the operand walk as a port,
+    refuses to run against bindings outside the version line those
+    corrections were written against, and links no plugin and no emulator.
+    Returns the corpus and the note it stamped it with.
     """
     import subprocess
     import tempfile
 
-    ref = _find_cst_referee()
+    ref = _referee_argv()
     with tempfile.TemporaryDirectory(prefix="cstref_") as d:
         src = Path(d) / ("ident_%s.tsv" % isa)
         with src.open("w") as f:
@@ -3354,8 +3354,8 @@ def _referee_reg_sets(isa: str, encodings: list[str],
             f.write("#isa\tencoding\tmnem\trule\tword\topcode\tbranch\n")
             for e in encodings:
                 f.write("%s\t%s\t-\t-\t-\t-\t-\n" % (isa, e))
-        r = subprocess.run([str(ref), "--isa", isa, "--in", str(src),
-                            "--out-dir", d],
+        r = subprocess.run(ref + ["--isa", isa, "--in", str(src),
+                                  "--out-dir", d],
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0:
             raise RuntimeError("cst_referee rc=%d: %s"

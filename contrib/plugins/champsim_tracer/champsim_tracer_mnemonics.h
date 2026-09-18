@@ -29,11 +29,12 @@ static inline bool cst_str_eq(const char *a, const char *b)
 
 
 /*
- * Register classification: Capstone register ID -> one generic ID (or
- * a small alias list when Capstone groups regs under one enum value).
- * Indexed by the Capstone enum value.  qemu_reg is the QEMU register
- * descriptor key, or { NULL, NULL } when there's no single readable
- * QEMU register.
+ * How a register's VALUE is reached.  A generic id says what the wire
+ * publishes; this key says which QEMU register descriptor the value is
+ * read out of -- the (feature, name) pair the gdbstub registers it
+ * under -- or { NULL, NULL } when no single QEMU register holds it.
+ * The generic-id-to-key join itself is generated per ISA into
+ * champsim_tracer_gdbmap_<isa>.h.
  */
 #define MAX_REG_ALIASES 8
 
@@ -54,10 +55,10 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  * without the rest of the tracer internals.
  */
 /*
- * Per-insn TEMPLATE-STATIC caps.  These bound what the operand walker
- * may record at translation time — the static register and memop
- * operand counts Capstone reports for one instruction encoding — and
- * they fix the dep-mask bit layout below.
+ * Per-insn TEMPLATE-STATIC caps.  These bound what may be recorded at
+ * translation time — the static register and memop operand counts one
+ * instruction encoding can state — and they fix the dep-mask bit
+ * layout below.
  *
  * They are deliberately NOT the same quantity as the wire's per-family
  * FID slot ceiling (CST_FID_SLOT_COUNT), which bounds the DYNAMIC
@@ -73,8 +74,8 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  *   - The dep masks are uint64_t.  Their bit layout stacks
  *     n_src_regs + max_dep_loads + 1 (immediate) bits into those 64
  *     bits, and the walker clamps each band independently
- *     (add_src_reg / the max_dep_loads guard in
- *     champsim_tracer_decode.cc), so the layout only has room while the
+ *     (the per-band guards in
+ *     champsim_tracer_qdep.cc), so the layout only has room while the
  *     two bands together stay under 64 — which real encodings do by a
  *     wide margin.  Raising either cap toward the wire ceiling would
  *     make the sum unrepresentable.
@@ -143,8 +144,8 @@ typedef struct InsnFields {
      * Static control-transfer target the per-ISA translator resolved
      * for this instruction (the same value handed to gen_goto_tb).
      * Sourced from QEMU's translator via
-     * qemu_plugin_insn_branch_target_pc() — NOT from Capstone's
-     * immediate operand, since per-ISA encoding (PC-relative vs
+     * qemu_plugin_insn_branch_target_pc() — never re-derived from the
+     * encoded immediate, since per-ISA encoding (PC-relative vs
      * absolute, sign extension, MIPS delay-slot accounting, ARM
      * Thumb interworking) varies and is already correctly resolved
      * inside the translator.
@@ -236,7 +237,8 @@ typedef struct InsnFields {
     bool                  has_vec_lanes;
     bool                  lane_parallel;
     uint8_t               lane_mask_kind; /* LaneMaskKind */
-    /* Vector element width in bytes (Capstone-derived).  Needed at
+    /* Vector element width in bytes, stated by the target's own decode
+     * rule alongside the lane kind and selector.  Needed at
      * emit time to map each memop's byte range onto destination /
      * source lanes for the load/store data lane masks.  0 when the
      * width is data-dependent (RISC-V V SEW) — emit-time falls back
@@ -248,7 +250,7 @@ typedef struct InsnFields {
      * the gate read from lane_mask_source_reg. */
     uint64_t              *src_lane_mask;  /* [n_src_regs] */
     uint64_t              *dst_lane_mask;  /* [n_dst_regs] */
-    /* Capstone-side (feature, name) of the register the dynamic gate
+    /* The (feature, name) key of the register the dynamic gate
      * reads at exec — vl CSR on RISC-V V, k1 on x86 EVEX masked,
      * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
     QemuRegKey            lane_mask_source_reg;
@@ -264,9 +266,9 @@ typedef struct InsnFields {
      *
      *   x86 REP / REPNZ string ops — the iteration is architectural
      *     (RCX decrements once per element), so the unit is one
-     *     element: loads + stores per iteration, counted from the
-     *     Capstone MEM operand access flags (MOVS 1L+1S, CMPS 2L,
-     *     STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).
+     *     element: loads + stores per iteration, stated by the x86
+     *     decode rule and carried through self_loop_memops
+     *     (champsim_tracer_qdep.cc).
      *
      *   AArch64 FEAT_MOPS bulk copy/set — the instruction has NO
      *     architectural iteration (QEMU's copy_step/set_step move up
@@ -329,25 +331,25 @@ static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
  *
  *   branch_delay_slots     — delay-slot insns after a branch (1 MIPS,
  *                            else 0)
- *   include_implicit_regs  — fold Capstone implicit regs_read/write
- *                            into src/dst.  False only for RISC-V,
- *                            whose operand walk already covers them
- *                            (folding would double-count); true
- *                            elsewhere, including MIPS, where an
- *                            implicit-only register (HI:LO) would
- *                            otherwise vanish from the dependency chain.
+ *   include_implicit_regs  — whether a reference decoder's implicit
+ *                            regs_read/regs_write lists have to be
+ *                            folded in to reach the set this ISA's
+ *                            QEMU rules already state.  False only for
+ *                            RISC-V, whose operand list already covers
+ *                            them; true elsewhere, including MIPS,
+ *                            where an implicit-only register (HI:LO)
+ *                            would otherwise be missing.  Nothing in
+ *                            the plugin reads it: it is the row the
+ *                            OFFLINE referee (tools/cst_referee.py)
+ *                            follows so its column is comparable with
+ *                            the wire's.
  *   target_prefixes        — QEMU target_name prefixes for this ISA
- *
- * The Capstone arch/mode pair is deliberately NOT a row here: it is
- * apparatus for the comparison and lives in
- * champsim_tracer_capstone_mode.h, which the shipped plugin does not
- * include.
  */
 
 /*
  * Optional per-ISA hook called by RegHandleCache for every QEMU
- * register descriptor.  May insert alias entries into @handles so
- * Capstone-name lookups resolve to differently-registered descriptors
+ * register descriptor.  May insert alias entries into @handles so a
+ * lookup under one name resolves to a differently-registered descriptor
  * (currently AArch64 SVE z<->v aliasing).  May be null.
  */
 typedef void (*RegAliasInserterFn)(
@@ -386,37 +388,6 @@ typedef uint64_t (*AddrCanonicalizeFn)(uint64_t addr);
  * which leaves the window-marker detector disabled.
  */
 typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
-
-/*
- * A QEMU_PLUGIN_OP_SYSREG operand's architectural role -> generic ID.
- *
- * A system register named by the encoding -- an AArch64 MRS/MSR
- * operand, a RISC-V Zicsr CSR -- arrives already classified, because
- * Capstone cannot name these as registers (2 of its 1214 AArch64
- * system registers have a register id) and disas/capstone.c is where
- * that gap is closed, alongside the rest of the per-instruction
- * register knowledge the boundary already carries.
- *
- * So there is no per-ISA branch here and nothing to keep in step with
- * an ISA table: this is a rename from QEMU's role vocabulary into the
- * generic one.  The long tail is REG_SYS; the roles with an ID of
- * their own are the ones whose dependency population is worth
- * separating -- the thread pointer, the vector configuration, the
- * arithmetic control word -- because a consumer is misled as badly by
- * an edge onto a register the instruction never touched as by a
- * missing one.
- */
-static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
-{
-    switch (sysreg_class) {
-    case QEMU_PLUGIN_SYSREG_FLAGS:     return REG_FLAGS;
-    case QEMU_PLUGIN_SYSREG_FPCTRL:    return REG_FCSR;
-    case QEMU_PLUGIN_SYSREG_VECCTRL:   return REG_VCTRL;
-    case QEMU_PLUGIN_SYSREG_THREADPTR: return REG_TLS;
-    case QEMU_PLUGIN_SYSREG_OTHER:
-    default:                           return REG_SYS;
-    }
-}
 
 typedef struct {
     uint8_t               branch_delay_slots;

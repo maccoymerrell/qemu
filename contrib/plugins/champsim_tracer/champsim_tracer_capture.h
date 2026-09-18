@@ -59,7 +59,6 @@
 #include <cstddef>
 #include <cstdint>
 
-struct qemu_plugin_insn_info;
 struct qemu_plugin_tb;
 struct InsnFields;
 

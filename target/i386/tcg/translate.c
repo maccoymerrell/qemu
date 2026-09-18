@@ -4497,11 +4497,24 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
              * gen_helper_cr4_testbit() and states nothing.  A row naming it
              * would read TRACER-SUPERSET rather than a loss either way.
              *
+             * TWO STATEMENTS, BECAUSE THE READ SET AND THE DEPENDENCY EDGE
+             * ARE SEPARATE FACTS AND ONLY THE FIRST WAS STATED BEFORE.
+             * insn_dataflow_state_read() puts xcr0 in the instruction's read
+             * set.  It does NOT tell the reader that EAX and EDX came out of
+             * it: their provenance is whatever the op walk carried through
+             * s->tmp1_i64, and the helper's result temp arrives with ECX
+             * alone.  So the binding says where the temp's value came from,
+             * exactly as the x87 store-datum sites above do -- and without it
+             * the wire named xcr0 as a source while publishing `%gp0=[%gp1]
+             * %gp2=[%gp1]', a RAW edge on the returned datum that is missing.
+             *
              * Capture only; no op is emitted, altered or suppressed.
              */
             insn_dataflow_state_read(insn_df_reg("xcr0"));
             tcg_gen_trunc_tl_i32(s->tmp2_i32, cpu_regs[R_ECX]);
             gen_helper_xgetbv(s->tmp1_i64, tcg_env, s->tmp2_i32);
+            insn_dataflow_bind(tcgv_i64_temp(s->tmp1_i64),
+                               insn_df_reg("xcr0"));
             tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], s->tmp1_i64);
             break;
 

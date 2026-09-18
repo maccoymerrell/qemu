@@ -132,6 +132,38 @@ X86_EXEC = {
                   'and the edge itself is confirmed TRUE independently by '
                   'x87_cw_derive.py on all 50 rows'),
 
+    # THE x87 EXCEPTION POINTERS, WHICH gem5's x86 VOCABULARY CANNOT SPELL.
+    #
+    # Every non-control x87 instruction updates the last-instruction pointer
+    # and, on a memory form, the last-data pointer: target/i386 stores
+    # env->fpip / env->fpcs at gen_x87's tail and env->fpdp / env->fpds on the
+    # memory arms, as ordinary TCG stores the op walk sees.  The tracer's
+    # register map sends all four to REG_SYS with its own written reason --
+    # "x87 exception pointer: machine state saved for a handler, not a value
+    # the program computes with" -- so the wire names a destination the
+    # instruction genuinely writes.
+    #
+    # THE REFERENCE HAS NO INDEX THAT PRODUCES REG_SYS.  That is not read off
+    # gem5's silence, which would prove nothing: the seed's own mapping census
+    # enumerates the generic ids gem5's x86 register space cannot reach, and
+    # this rule is allowed to account for a row only while REG_SYS is IN that
+    # measured set (compare_wp_gem5.UNMAPPED, populated per run and printed in
+    # the report as `unmappable-id:REG_SYS`).  If a future gem5 grows the
+    # index, the premise dies with it and the rows reopen rather than staying
+    # quietly excused -- the shape that produced this project's four false
+    # allowlist entries.
+    #
+    # ONE DIRECTION ONLY.  The rule covers TRACER-SUPERSET, which is the
+    # reference being unable to speak.  A row where gem5 names an x87 pointer
+    # the tracer does not is the opposite claim and gets no cover here.
+    'REF-NO-X87-POINTER-OPERAND':
+        Rule('REF-NO-X87-POINTER-OPERAND', 'reference-gap', {SUPERSET},
+             note='gem5\'s x86 register space has no index that maps to '
+                  'REG_SYS -- measured per run in the seed\'s unmappable-id '
+                  'census -- while target/i386 stores fpip/fpcs (and fpdp/'
+                  'fpds on a memory form) on every non-control x87 '
+                  'instruction, which the register map names REG_SYS'),
+
     # A vector destination gem5 wrote through the wide path is NAMED with no
     # value (`RW=[...=?]`), and a scalar SSE operation writes only the low
     # half of an XMM register, leaving the word unknowable from one line.

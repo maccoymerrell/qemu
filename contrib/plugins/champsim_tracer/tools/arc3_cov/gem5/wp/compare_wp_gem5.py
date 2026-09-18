@@ -183,6 +183,17 @@ ORACLE = None
 # it.  This is a measurement arm, never a mode to measure in.
 GATE = True
 
+#: THE GENERIC IDS gem5's x86 REGISTER SPACE CANNOT PRODUCE, measured.
+#:
+#: `wp_seed_x86` walks the reference's register enumeration and records every
+#: generic name no gem5 index maps to; the same list is printed in the report
+#: as `unmappable-id:<name>`.  REF-NO-X87-POINTER-OPERAND is allowed to cover
+#: a TRACER-SUPERSET row on REG_SYS only while REG_SYS is IN this set, so the
+#: rule's premise is a reading from this run rather than a sentence somebody
+#: once wrote.  It starts EMPTY: before a seed has been read, no row is
+#: excused by it.
+UNMAPPED = set()
+
 
 #: THE x87 TOP GATE.  Its subject is the SOURCE-axis REG_FCSR the tracer
 #: names on every form that reads the top of the x87 stack, and gem5's
@@ -303,6 +314,8 @@ def _superset_families(side, enc):
          _x87_top_label(enc) if side == 'src'
          else 'REF-X87-STATUS-NOT-PUBLISHED'),
         (lambda n: n == 'REG_FPCW', 'REF-NO-X87-CONTROL-OPERAND'),
+        (lambda n: n == 'REG_SYS' and 'REG_SYS' in UNMAPPED,
+         'REF-NO-X87-POINTER-OPERAND'),
     ]
 
 
@@ -900,6 +913,10 @@ def process_guest(args, envx, guest, out):
     for k, (ex, _mult) in enumerate(todo):
         tag = '%s.e%04d' % (os.path.basename(guest), k)
         seed = wp_seed_x86.build(out, tag, ex, args.cc)
+        # Before any row of this excursion is adjudicated: a rule that rests
+        # on "the reference cannot name this" must have the reading in hand
+        # when it answers, not after.
+        UNMAPPED.update(seed.unmapped)
         cap = args.prologue_cap + 8 * len(ex.insns) + 32
         run = gem5_wp_ref.run(envx.gem5_bin, envx.gem5_dir, envx.env,
                               seed.elf, out, tag, cap, args.timeout)

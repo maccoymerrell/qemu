@@ -54,12 +54,37 @@ The other three banks are recorded at their own decode sites:
 | --- | --- | --- |
 | `x` | `READ_REG`, `decode_macros.h` | x0 **is** recorded: an x0 source is a real fact about the encoding, unlike an x0 destination |
 | `f` | `READ_FREG`, `decode_macros.h` | |
-| `v` | `vectorUnit_t::elt` / `elt_group`, `is_write == false` | includes the mask register and the tail-undisturbed read of `vd` |
+| `v` | `vectorUnit_t::elt` / `elt_group`, `is_write == false` | includes the mask register and the datum a vector STORE sources; see the correction below |
 | CSR | `processor_t::get_csr`, `peek == false` | only the CSR a `csrr*` instruction addressed; the implicit `fcsr`/`vl` reads arithmetic makes through the `csr_t` objects directly are deliberately NOT recorded, because they are not operands |
 
 A vector register is wider than `freg_t` and -- unlike a write -- its content
 at commit time is not necessarily what was sourced, so vector reads are
 snapshotted **whole, at read time**, into `state_t::log_vreg_read`.
+
+#### 1b. The printer must not be a reader (CORRECTION)
+
+The first version of this patch made every vector instruction report a read of
+its own destination, and the note above claimed that was the
+"tail-undisturbed read of `vd`".  It was not.  `elt()` records a read only
+where an element is touched on the read path, and a tail- or mask-undisturbed
+policy preserves precisely the elements the instruction does not touch, so no
+`elt()` call is made for them and the reference states no such read.  The
+carrier was `commit_log_print_insn()` itself: it prints a vector destination
+by fetching the register's bytes and fetched them through `elt()`, whose
+`is_write` defaults to **false**.  Upstream that is free, because upstream
+records nothing on a read; with the source side in place it entered every
+vector destination into `log_reg_read`, after the write -- which is why the
+printed "read" value always equalled the result.
+
+`vectorUnit_t::reg_bytes()` gives the printer the bytes without the
+accounting, and `execute.cc` uses it.  Measured on the ARC 3 probe set and
+guests, with the printer change reverted and re-applied to show which side
+moved: the correct-path leg's `REF-VEC-TAIL-READ` rows go 15 -> 0 (headline
+66 -> 51) and the wrong-path leg's `WP-DEFECT` 30 -> 0.  One real
+disagreement the phantom read had been MASKING appears with the fix --
+`vmseq.vv v0, v1, v2`, where the tracer names `v0` as a source (QEMU's mask
+destination is a read-modify-write) and the reference does not -- and it is
+labelled `REF-VEC-ELEMENT-READ-ONLY`, reference-gap, as it should be.
 
 ### 2. Load DATA and WIDTH
 

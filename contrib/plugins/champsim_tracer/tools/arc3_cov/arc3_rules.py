@@ -321,19 +321,46 @@ RISCV_EXEC = {
              note='spike logs vector ELEMENT writes; a fully masked-off op '
                   'logs no destination at all'),
 
-    # riscv/vector_unit.h -- vectorUnit_t::elt() is ELEMENT triggered on the
-    # read side exactly as it is on the write side, so an instruction under a
+    # THERE IS NO REF-VEC-TAIL-READ RULE, AND THE ONE THAT WAS HERE WAS
+    # ANSWERING A QUESTION THE REFERENCE NEVER ASKED.
+    #
+    # It read: "vectorUnit_t::elt() is ELEMENT triggered on the read side
+    # exactly as it is on the write side, so an instruction under a
     # tail-undisturbed or mask-undisturbed policy READS its own destination
-    # register back to preserve the elements it does not produce.  That is a
-    # real architectural read of a real architectural source; the tracer's
-    # template names the operand registers and not the destination-as-source.
-    # It is charged to the tracer, not excused: an out-of-order model that
-    # renames vector registers needs this dependence.
-    'REF-VEC-TAIL-READ':
-        Rule('REF-VEC-TAIL-READ', 'tracer-defect', {SUBSET},
-             note='the destination vector register is architecturally a '
-                  'SOURCE under tail-/mask-undisturbed; the reference reads '
-                  'it and the tracer does not name it'),
+    # register back", and charged the rows to the tracer.  Every clause of
+    # that is false about this reference.  elt() records a read only where an
+    # element is accessed on the READ path, and the elements a preserving
+    # policy keeps are exactly the ones the instruction does not touch: no
+    # elt() call is made for them, so spike states no such read and the rows
+    # could not have been measuring one.  The probe that produced them ran
+    # `vsetvli t1, t0, e64, m1, ta, ma` at vl == VLMAX with vstart 0 -- tail
+    # AGNOSTIC, mask AGNOSTIC, no tail and no masked-off body to preserve --
+    # and the label still fired on 15 of its instructions, which by itself
+    # refutes the premise.
+    #
+    # THE CARRIER WAS THE COMMIT-LOG PRINTER, in the arc's own patch.
+    # execute.cc prints a vector destination by fetching its bytes, and it
+    # fetched them through elt(), whose is_write argument defaults to false.
+    # Upstream that costs nothing because upstream records nothing on a read.
+    # Once spike-patches/ added the source side, that one printer call
+    # entered EVERY vector destination into log_reg_read -- after the write,
+    # which is why the "read" value always equalled the result.  Fixed by
+    # giving the printer a non-logging accessor (vectorUnit_t::reg_bytes).
+    # Measured at this tip on the same probes and guests: correct path 15
+    # rows -> 0, wrong path 30 -> 0, with the printer change reverted and
+    # re-applied to prove which side moved them.
+    #
+    # A reference-only vector read that is also the destination now falls to
+    # REF-VEC-ELEMENT-READ, which does not account: it reports UNACCOUNTED,
+    # which is the honest answer for a row whose mechanism is not derived.
+    #
+    # The architectural dependence the retired rule named is real and is NOT
+    # dismissed with it: under vta == 0 or (vm == 0 and vma == 0), or with
+    # vstart > 0, vd's surviving elements do flow into the result.  The tracer
+    # states exactly that for a MASK destination already
+    # (rvv_state_mask_dest(), trans_rvv.c.inc).  What this reference cannot do
+    # is witness it either way, so the general case is carried as a tracer
+    # item with a QEMU-side fix path and no evidence from this leg.
 
     # A vector register the reference read that is neither an operand the
     # tracer names nor the destination -- kept as its own label so it can

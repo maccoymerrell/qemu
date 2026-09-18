@@ -313,14 +313,30 @@ def compare_insn(r, t):
     if row is not None:
         only_ref = frozenset(rsa) - tsa
         if only_ref and tsa <= frozenset(rsa):
-            if all(n.startswith('REG_VEC') for n in only_ref) and \
-                    all(n in ta for n in only_ref):
-                # spike reads the DESTINATION vector register back, element
-                # by element, to honour the tail-undisturbed policy.  It is a
-                # real architectural read, and it is a read of a register the
-                # same instruction writes.
-                row = row._replace(label='REF-VEC-TAIL-READ')
-            elif all(n.startswith('REG_VEC') for n in only_ref):
+            # THERE IS NO "TAIL-UNDISTURBED READ OF vd" BRANCH HERE, AND THE
+            # ONE THAT USED TO SIT ON THIS LINE WAS WRONG.
+            #
+            # It labelled every row whose reference-only reads were vector
+            # registers the same instruction WRITES as REF-VEC-TAIL-READ and
+            # charged it to the tracer: "spike reads the destination back,
+            # element by element, to honour the tail-undisturbed policy".
+            # Spike does no such thing.  Its elt() logs a read only when an
+            # element is actually accessed on the read path, and the elements
+            # a tail-/mask-undisturbed policy preserves are exactly the ones
+            # the instruction never touches -- no elt() call is made for them
+            # and no read is recorded.  What produced those rows was
+            # commit_log_print_insn() fetching the destination's bytes to
+            # PRINT them through elt(), whose is_write defaults to false: the
+            # printer's own read, entered into log_reg_read after the write,
+            # on every vector destination whatever its policy.  Fixed in
+            # spike-patches/ (vectorUnit_t::reg_bytes); 15 correct-path rows
+            # and 30 wrong-path rows were the printer's and are gone.
+            #
+            # A reference-only vector read that is ALSO the destination now
+            # falls through to REF-VEC-ELEMENT-READ, which does not account:
+            # it reports UNACCOUNTED and is loud, which is what a row with no
+            # derived mechanism should be.
+            if all(n.startswith('REG_VEC') for n in only_ref):
                 row = row._replace(label='REF-VEC-ELEMENT-READ')
         only_trc = tsa - frozenset(rsa)
         if only_trc and frozenset(rsa) <= tsa:

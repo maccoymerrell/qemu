@@ -108,7 +108,7 @@ index 125a73a..134e2b1 100644
      softfloat_exceptionFlags = 0; \
    } while (0);
 diff --git a/riscv/execute.cc b/riscv/execute.cc
-index 7925057..5d766a9 100644
+index 7925057..8750c99 100644
 --- a/riscv/execute.cc
 +++ b/riscv/execute.cc
 @@ -10,6 +10,8 @@
@@ -129,7 +129,18 @@ index 7925057..5d766a9 100644
    auto& load = p->get_state()->log_mem_read;
    auto& store = p->get_state()->log_mem_write;
    int priv = p->get_state()->last_inst_priv;
-@@ -136,9 +140,51 @@ static void commit_log_print_insn(processor_t *p, reg_t pc, insn_t insn)
+@@ -130,15 +134,61 @@ static void commit_log_print_insn(processor_t *p, reg_t pc, insn_t insn)
+       else
+         fprintf(log_file, " %c%-2d ", prefix, rd);
+       if (is_vreg)
+-        commit_log_print_value(log_file, size, &p->VU.elt<uint8_t>(rd, 0));
++        /* ARC 3 (ChampSim Tracer): reg_bytes(), not elt().  elt() defaults
++         * to the READ path, so printing the destination used to enter it
++         * into log_reg_read and every vector instruction reported a read of
++         * its own vd.  See vectorUnit_t::reg_bytes(). */
++        commit_log_print_value(log_file, size, p->VU.reg_bytes(rd));
+       else
+         commit_log_print_value(log_file, size, item.second.v);
      }
    }
  
@@ -280,7 +291,7 @@ index d0fe10a..274a511 100644
 +  }
 +}
 diff --git a/riscv/vector_unit.h b/riscv/vector_unit.h
-index 05b910b..fef40eb 100644
+index 05b910b..774d296 100644
 --- a/riscv/vector_unit.h
 +++ b/riscv/vector_unit.h
 @@ -120,6 +120,8 @@ public:
@@ -301,15 +312,35 @@ index 05b910b..fef40eb 100644
  
      return *(EG*)((char*)reg_file + vReg * (VLEN >> 3) + start_byte);
    }
-@@ -187,6 +191,12 @@ public:
+@@ -184,9 +188,32 @@ public:
+     e = (e & ~(1U << (n % 8))) | (value << (n % 8));
+   }
+ 
++  /* ARC 3 (ChampSim Tracer): THE COMMIT LOG'S OWN VIEW OF A REGISTER, which
++   * is not an architectural read and must not be recorded as one.
++   *
++   * commit_log_print_insn() prints a vector DESTINATION by fetching its
++   * bytes, and it used elt() to do it -- with is_write defaulted, i.e. the
++   * read path.  Upstream that is harmless because upstream records nothing
++   * on a read.  Once the source side existed, that one printer call put
++   * EVERY vector destination into log_reg_read, after the write, so every
++   * vector instruction reported a read of its own vd whatever its tail or
++   * mask policy said.  The printer needs the bytes, not the accounting. */
++  const uint8_t *reg_bytes(reg_t vReg) const {
++    return (const uint8_t *)reg_file + vReg * (VLEN >> 3);
++  }
++
  private:
  
    void log_elt_write_if_needed(reg_t vReg) const;
 +  /* ARC 3 (ChampSim Tracer): the SOURCE side for the vector file.  Every
 +   * architectural read of a vector element goes through elt()/elt_group()
-+   * with is_write=false, including the mask register and the
-+   * tail-undisturbed read of the destination, so recording here names the
-+   * vector registers the instruction actually sourced. */
++   * with is_write=false -- including the mask register and the datum a
++   * vector STORE sources -- so recording here names the vector registers
++   * the instruction actually sourced.  It does NOT name the preserved
++   * elements of a tail-/mask-undisturbed destination: those are elements
++   * the instruction never touches, so no elt() call is made for them and
++   * the reference states no such read. */
 +  void log_elt_read_if_needed(reg_t vReg) const;
  
  public:

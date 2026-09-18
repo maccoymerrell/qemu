@@ -39,6 +39,7 @@ f6/ft6	REG_FPR6	riscv_fpr_regnames[] index
 f7/ft7	REG_FPR7	riscv_fpr_regnames[] index
 f8/fs0	REG_FPR8	riscv_fpr_regnames[] index
 f9/fs1	REG_FPR9	riscv_fpr_regnames[] index
+fcsr	REG_FCSR	the architectural fcsr, declared as one container over CPURISCVState::frm and ::fp_status -- the two places QEMU keeps its rounding-mode and accrued-flag fields
 load_res	REG_NONE	R7.7: reservation state is not a register
 load_val	REG_NONE	R7.7: reservation state is not a register
 pc	REG_IP	arch-role: the program counter
@@ -76,6 +77,9 @@ v8	REG_VEC8	vector file index
 v9	REG_VEC9	vector file index
 vl	REG_VCTRL	vector length, per the incumbent row
 vstart	REG_VCTRL	vector start, per the incumbent row
+vtype	REG_VCTRL	vector type, the same configuration register vl and vstart are part of
+vxrm	REG_VCTRL	vector fixed-point rounding mode, per the incumbent vl/vstart row
+vxsat	REG_VCTRL	vector fixed-point saturation flag, per the incumbent vl/vstart row
 x0/zero	REG_ZERO	x0 is the architectural zero register
 x0h/zeroh	REG_ZERO	x0 is the architectural zero register
 x1/ra	REG_LR	arch-role: x1 is the return address

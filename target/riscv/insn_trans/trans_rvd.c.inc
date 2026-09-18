@@ -345,6 +345,7 @@ static bool trans_fmin_d(DisasContext *ctx, arg_fmin_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    gen_fcsr_access();
     gen_helper_fmin_d(dest, tcg_env, src1, src2);
     gen_set_fpr_d(ctx, a->rd, dest);
     mark_fs_dirty(ctx);
@@ -361,6 +362,7 @@ static bool trans_fmax_d(DisasContext *ctx, arg_fmax_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    gen_fcsr_access();
     gen_helper_fmax_d(dest, tcg_env, src1, src2);
     gen_set_fpr_d(ctx, a->rd, dest);
     mark_fs_dirty(ctx);
@@ -409,6 +411,7 @@ static bool trans_feq_d(DisasContext *ctx, arg_feq_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    gen_fcsr_access();
     gen_helper_feq_d(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;
@@ -424,6 +427,7 @@ static bool trans_flt_d(DisasContext *ctx, arg_flt_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    gen_fcsr_access();
     gen_helper_flt_d(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;
@@ -439,6 +443,7 @@ static bool trans_fle_d(DisasContext *ctx, arg_fle_d *a)
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
 
+    gen_fcsr_access();
     gen_helper_fle_d(dest, tcg_env, src1, src2);
     gen_set_gpr(ctx, a->rd, dest);
     return true;

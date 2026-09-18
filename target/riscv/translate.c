@@ -829,6 +829,21 @@ static void finalize_vset_inst(DisasContext *ctx)
 {
     mark_vs_dirty(ctx);
     ctx->vstart_eq_zero = true;
+
+    /*
+     * EVERY VECTOR INSTRUCTION WRITES vstart, AND THE OP STREAM DOES NOT SHOW
+     * IT.  The architecture resets vstart to zero when a vector instruction
+     * completes, so it is a destination of every one of them -- vset included,
+     * which resets it along with the configuration it sets.
+     *
+     * QEMU does the reset from inside vector_helper.c, as a plain `env->vstart
+     * = 0` in whichever helper ran, and the translator only records that it
+     * happened (ctx->vstart_eq_zero above) so a later instruction can skip a
+     * redundant clear.  cpu_vstart is a TCG global, but no op in this
+     * instruction's stream touches it, so the write is stated here, at the
+     * one function every vector form finishes through.
+     */
+    insn_dataflow_state_write(insn_df_reg("vstart"));
 }
 
 static void finalize_rvv_inst(DisasContext *ctx)
@@ -856,8 +871,39 @@ static void finalize_rvv_inst(DisasContext *ctx)
     insn_dataflow_state_read(insn_df_reg("vl"));
 }
 
+/*
+ * THIS INSTRUCTION READS fcsr AND MAY WRITE IT, AND THE OP STREAM DOES NOT
+ * SHOW EITHER.
+ *
+ * Two architectural facts about one register.  An instruction encoded
+ * rm == DYN takes its rounding mode from fcsr.frm, and an instruction that
+ * can raise a floating-point exception accrues into fcsr.fflags -- a read
+ * and a write of the same word.  Under the composed-register contract a
+ * folded field is published by its container's name, and fcsr is the
+ * container the wire's vocabulary has a word for.
+ *
+ * QEMU reaches both fields from inside the helper: frm is CPURISCVState::frm,
+ * the accrued flags live in CPURISCVState::fp_status, and every computational
+ * FP helper takes only `tcg_env`, an argument the reader skips because a bare
+ * env pointer names no storage.  So the access is stated at the decode sites
+ * that know which instructions have it: here, which every rounding form
+ * calls, and at the compare / min / max forms, which raise without rounding
+ * and so do not.
+ *
+ * NOT stated for fsgnj, fmv, fclass, fli or the FP loads and stores: they
+ * neither consult the rounding mode nor raise, and the reference agrees --
+ * spike logs no fcsr access on any of them.
+ */
+static void gen_fcsr_access(void)
+{
+    insn_dataflow_state_read(insn_df_reg("fcsr"));
+    insn_dataflow_state_write(insn_df_reg("fcsr"));
+}
+
 static void gen_set_rm(DisasContext *ctx, int rm)
 {
+    gen_fcsr_access();
+
     if (ctx->frm == rm) {
         return;
     }
@@ -875,6 +921,8 @@ static void gen_set_rm(DisasContext *ctx, int rm)
 
 static void gen_set_rm_chkfrm(DisasContext *ctx, int rm)
 {
+    gen_fcsr_access();
+
     if (ctx->frm == rm && ctx->frm_valid) {
         return;
     }
@@ -1613,6 +1661,65 @@ void riscv_translate_init(void)
                              "load_res");
     load_val = tcg_global_mem_new(tcg_env, offsetof(CPURISCVState, load_val),
                              "load_val");
+
+    /*
+     * fcsr, the floating-point control and status register, which lives in
+     * CPURISCVState and no TCG global names.
+     *
+     * The architecture spells it as one register with two fields: frm, the
+     * rounding mode, and fflags, the accrued exception flags.  QEMU keeps frm
+     * in a word of its own and the accrued flags inside fp_status, the
+     * softfloat state every FP helper computes through, and the two are
+     * adjacent -- so ONE declared range spans everything fcsr is made of, and
+     * an access to either field resolves to the container the wire's
+     * vocabulary has a word for.  That is the composed-register contract.
+     *
+     * The range and its extent come from the compiler over this target's own
+     * structure, so they cannot drift from the layout they describe; the
+     * build-time check refuses the order the fields would have to be in for
+     * the span to mean anything else.
+     */
+    {
+        static const char *const fcsr_p[] = { "fcsr" };
+        CPURISCVState *e = NULL;
+        uint32_t base = offsetof(CPURISCVState, frm);
+        uint32_t span = offsetof(CPURISCVState, fp_status)
+                        + sizeof(e->fp_status) - base;
+
+        QEMU_BUILD_BUG_ON(offsetof(CPURISCVState, fp_status) <
+                          offsetof(CPURISCVState, frm));
+        insn_dataflow_declare_regfile(fcsr_p, 1, base, span, span);
+    }
+
+    /*
+     * The three vector control words with no TCG global.
+     *
+     * vl and vstart have globals above; vtype, vxrm and vxsat do not, and a
+     * Zicsr instruction naming one of them reaches the wire through the CSR
+     * statement in trans_rvi.c.inc, which needs a name to state.  All six
+     * fold onto one generic id, so the names exist to be resolvable, not to
+     * be distinguished on the wire.
+     *
+     * Declared one at a time rather than as one span: vl and vstart sit
+     * between them in CPURISCVState, and a declared range that swallowed a
+     * TCG global's storage would give one byte two names.
+     */
+    {
+        static const char *const vtype_p[] = { "vtype" };
+        static const char *const vxrm_p[]  = { "vxrm" };
+        static const char *const vxsat_p[] = { "vxsat" };
+        CPURISCVState *e = NULL;
+
+        insn_dataflow_declare_regfile(vtype_p, 1,
+                                      offsetof(CPURISCVState, vtype),
+                                      sizeof(e->vtype), sizeof(e->vtype));
+        insn_dataflow_declare_regfile(vxrm_p, 1,
+                                      offsetof(CPURISCVState, vxrm),
+                                      sizeof(e->vxrm), sizeof(e->vxrm));
+        insn_dataflow_declare_regfile(vxsat_p, 1,
+                                      offsetof(CPURISCVState, vxsat),
+                                      sizeof(e->vxsat), sizeof(e->vxsat));
+    }
 
     /*
      * The vector file is NOT declared here.  Its stride is the configured

@@ -122,8 +122,14 @@ GDB_C_EXCLUDED = {
     'arm_gen_dynamic_m_secextreg_feature':
         'AArch32 M-profile; never registered on an AArch64 CPU',
     'riscv_gen_dynamic_csr_feature':
-        'names come from csr_ops[]; joinable, but no generic id routes '
-        'through a CSR today, so reading it would add only dead rows',
+        'the names are csr_ops[i].name for whichever CSRs the realized CPU\'s '
+        'predicates admit, with a printf fallback for the unnamed ones, so '
+        'the call site does not enumerate them and this scraper will not '
+        'guess. THE OLD REASON HERE IS NOW FALSE and is not kept: it said no '
+        'generic id routes through a CSR, and riscv64 now publishes REG_FCSR '
+        'and REG_VCTRL, which are exactly CSRs. Their VALUE therefore has no '
+        'route on this target -- both read w=0 on the wire -- and closing '
+        'that needs csr_ops[] read as a second name source here',
 }
 
 FEATURE_RE = re.compile(r'<feature\s+name="([^"]+)"')

@@ -1101,11 +1101,98 @@ static bool do_csr_post(DisasContext *ctx)
     return true;
 }
 
+/*
+ * THE CSR A Zicsr INSTRUCTION NAMES, AS A DATAFLOW ATOM -- or NULL.
+ *
+ * The access itself is invisible to the op stream.  do_csrr() and its
+ * siblings hand helper_csrr()/helper_csrw()/helper_csrrw() the CSR NUMBER as
+ * a tcg constant, and the helper dispatches through csr_ops[csrno].read and
+ * .write, function pointers the reader cannot follow.  So `csrr s2, fflags`
+ * reaches the wire as a bare move with no source at all, and every other
+ * Zicsr form the same way.
+ *
+ * The number is a DECODE-TIME CONSTANT at these four call sites, so the
+ * access can be stated here instead -- which is what the callers below do.
+ * This function answers only the naming question: which piece of
+ * CPURISCVState the dataflow layer can name for that CSR.
+ *
+ * The answer is not the CSR's spelling: it is the STORAGE QEMU keeps the CSR
+ * in, because that is what the register map joins.  fflags, frm and fcsr are
+ * three views of one word pair and resolve to the declared `fcsr` container;
+ * the vector control CSRs resolve to their own words, two of which are TCG
+ * globals already.
+ *
+ * WHAT IS STILL UNNAMED, said plainly rather than left to a silent NULL:
+ * every machine-, supervisor- and hypervisor-level CSR, and the read-only
+ * counters.  The wire's vocabulary has no generic register for any of them,
+ * so there is nothing to state; a name invented here would be a word the
+ * consumer could not use.  vlenb is unnamed for a different reason -- it is
+ * cpu->cfg.vlenb, a configuration constant, not emulated CPU state.
+ */
+static const char *riscv_csr_df_atom(int csrno)
+{
+    switch (csrno) {
+    case CSR_FFLAGS:
+    case CSR_FRM:
+    case CSR_FCSR:
+        return "fcsr";
+    case CSR_VSTART:
+        return "vstart";
+    case CSR_VXSAT:
+        return "vxsat";
+    case CSR_VXRM:
+        return "vxrm";
+    case CSR_VL:
+        return "vl";
+    case CSR_VTYPE:
+        return "vtype";
+    default:
+        return NULL;
+    }
+}
+
+/*
+ * State this instruction's access to the CSR it names.
+ *
+ * @rd and @wr are the architectural directions of the FORM being translated,
+ * not of the CSR: csrrs with rs1 == x0 only reads, csrrw with rd == x0 only
+ * writes, and the general form does both.
+ *
+ * vcsr has no storage of its own -- it is vxrm and vxsat composed -- so it is
+ * stated as an access to both, which is what the instruction really touches.
+ * Both fold to one generic id on the wire, so the pair costs nothing there.
+ */
+static void gen_csr_access(int csrno, bool rd, bool wr)
+{
+    const char *atoms[2];
+    unsigned n = 0;
+
+    if (csrno == CSR_VCSR) {
+        atoms[n++] = "vxrm";
+        atoms[n++] = "vxsat";
+    } else {
+        const char *a = riscv_csr_df_atom(csrno);
+        if (a) {
+            atoms[n++] = a;
+        }
+    }
+
+    for (unsigned i = 0; i < n; i++) {
+        if (rd) {
+            insn_dataflow_state_read(insn_df_reg(atoms[i]));
+        }
+        if (wr) {
+            insn_dataflow_state_write(insn_df_reg(atoms[i]));
+        }
+    }
+}
+
 static bool do_csrr(DisasContext *ctx, int rd, int rc)
 {
     TCGv dest = dest_gpr(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, true, false);
     translator_io_start(&ctx->base);
     gen_helper_csrr(dest, tcg_env, csr);
     gen_set_gpr(ctx, rd, dest);
@@ -1116,6 +1203,7 @@ static bool do_csrw(DisasContext *ctx, int rc, TCGv src)
 {
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, false, true);
     translator_io_start(&ctx->base);
     gen_helper_csrw(tcg_env, csr, src);
     return do_csr_post(ctx);
@@ -1126,6 +1214,7 @@ static bool do_csrrw(DisasContext *ctx, int rd, int rc, TCGv src, TCGv mask)
     TCGv dest = dest_gpr(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, true, true);
     translator_io_start(&ctx->base);
     gen_helper_csrrw(dest, tcg_env, csr, src, mask);
     gen_set_gpr(ctx, rd, dest);
@@ -1138,6 +1227,7 @@ static bool do_csrr_i128(DisasContext *ctx, int rd, int rc)
     TCGv desth = dest_gprh(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, true, false);
     translator_io_start(&ctx->base);
     gen_helper_csrr_i128(destl, tcg_env, csr);
     tcg_gen_ld_tl(desth, tcg_env, offsetof(CPURISCVState, retxh));
@@ -1149,6 +1239,7 @@ static bool do_csrw_i128(DisasContext *ctx, int rc, TCGv srcl, TCGv srch)
 {
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, false, true);
     translator_io_start(&ctx->base);
     gen_helper_csrw_i128(tcg_env, csr, srcl, srch);
     return do_csr_post(ctx);
@@ -1161,6 +1252,7 @@ static bool do_csrrw_i128(DisasContext *ctx, int rd, int rc,
     TCGv desth = dest_gprh(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+    gen_csr_access(rc, true, true);
     translator_io_start(&ctx->base);
     gen_helper_csrrw_i128(destl, tcg_env, csr, srcl, srch, maskl, maskh);
     tcg_gen_ld_tl(desth, tcg_env, offsetof(CPURISCVState, retxh));

@@ -79,15 +79,26 @@ CMP_RC=0
 
 # 2. THE CONTROL, over the artifacts the comparison just produced.  It is run
 #    on ONE guest -- the mutation is per aligned pair and the axes it proves
-#    are properties of the comparator, not of the guest -- and `p_int` is the
-#    one chosen because it carries every integer axis the leg scores.  An
-#    UNPROVEN axis is a comparator that cannot see what it claims to; the
-#    exit status below carries it.
+#    are properties of the comparator, not of the guest -- and the guest has
+#    to be one that carries a subject for every axis, because an axis with no
+#    subject reports UNPROVEN and an UNPROVEN axis fails the leg.
+#
+#    `p_int` WAS that guest and IS NOT ONE: it carries no CSR access and no
+#    load, so csr-src-set, csr-dst-set, csr-dst-value and load-data had
+#    nothing to perturb and this control has been exiting 1 on all four for
+#    as long as the CSR axes have existed.  The comparison's own per-axis
+#    control, which picks a guest per axis, proved them live in the same run
+#    -- so the leg was reporting a failure of its fixture, not of itself.
+#
+#    `p_fp` carries all twelve: GPR and FP destinations with values, a store
+#    and a load (fsw/flw) for the memop axes, and -- since the fcsr access is
+#    stated at QEMU's FP decode sites -- a CSR source, a CSR destination and a
+#    CSR destination VALUE the reference also names.
 NC_RC=0
 "$PY" "$HERE/selftest_exec.py" \
-      --commits "$OUT/final/p_int.commits.log" \
-      --trace   "$OUT/final/p_int.cst" \
-      --guest   "$OUT/cpprobes/p_int" \
+      --commits "$OUT/final/p_fp.commits.log" \
+      --trace   "$OUT/final/p_fp.cst" \
+      --guest   "$OUT/cpprobes/p_fp" \
       --decode  "$QEMU_BUILD/contrib/plugins/cst_decode" \
       > "$OUT/final/SELFTEST.txt" 2>&1 || NC_RC=$?
 

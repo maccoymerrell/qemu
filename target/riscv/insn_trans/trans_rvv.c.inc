@@ -730,6 +730,42 @@ static uint8_t vext_get_emul(DisasContext *s, uint8_t eew)
 }
 
 /*
+ * THE VECTOR REGISTER A VECTOR LOAD OR STORE TOUCHES.
+ *
+ * Every RVV load and store family hands its helper a TCGv_ptr built as
+ * tcg_env + vreg_ofs(s, vd).  That pointer's provenance is a temp the op
+ * reader will not follow back to a declared register, which is the same
+ * shape rvv_state_vreg_ops() exists for on the arithmetic families -- and
+ * the load/store families never got the equivalent statement.  The
+ * consequence is not a missing label: `vle64.v v1,(t6)` reached the wire
+ * naming its ADDRESS register and nothing else, so the destination of
+ * every vector load and the datum of every vector store were absent
+ * entirely.  Measured against Spike on this tree's own probe: 3 loads with
+ * an empty destination set and 3 stores whose stored vector register was
+ * named by the reference and not by the trace.
+ *
+ * A LOAD writes @vd; a STORE reads it.  @vm == 0 means the helper consults
+ * v0 as the mask, which is a read either way.  The register named is the
+ * BASE of the group, which is the convention rvv_state_vreg_ops() already
+ * uses for an LMUL > 1 destination: one architectural name stands for the
+ * group it heads.  A segment (nf > 1) load or store heads nf such groups
+ * and only the first is named here; that residue is stated rather than
+ * papered over, and naming the others needs the EMUL arithmetic this
+ * helper deliberately does not guess at.
+ */
+static void rvv_state_ldst_vreg(uint32_t vd, uint32_t vm, bool is_store)
+{
+    if (is_store) {
+        insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[vd]));
+    } else {
+        insn_dataflow_state_write(insn_df_reg(riscv_vec_regnames[vd]));
+    }
+    if (vm == 0) {
+        insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[0]));
+    }
+}
+
+/*
  *** unit stride load and store
  */
 typedef void gen_helper_ldst_us(TCGv_ptr, TCGv_ptr, TCGv,
@@ -775,6 +811,8 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
     if (is_store && s->ztso) {
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
     }
+
+    rvv_state_ldst_vreg(vd, FIELD_EX32(data, VDATA, VM), is_store);
 
     mark_vs_dirty(s);
 
@@ -922,7 +960,7 @@ typedef void gen_helper_ldst_stride(TCGv_ptr, TCGv_ptr, TCGv,
 
 static bool ldst_stride_trans(uint32_t vd, uint32_t rs1, uint32_t rs2,
                               uint32_t data, gen_helper_ldst_stride *fn,
-                              DisasContext *s)
+                              DisasContext *s, bool is_store)
 {
     TCGv_ptr dest, mask;
     TCGv base, stride;
@@ -937,6 +975,8 @@ static bool ldst_stride_trans(uint32_t vd, uint32_t rs1, uint32_t rs2,
 
     tcg_gen_addi_ptr(dest, tcg_env, vreg_ofs(s, vd));
     tcg_gen_addi_ptr(mask, tcg_env, vreg_ofs(s, 0));
+
+    rvv_state_ldst_vreg(vd, FIELD_EX32(data, VDATA, VM), is_store);
 
     mark_vs_dirty(s);
 
@@ -966,7 +1006,7 @@ static bool ld_stride_op(DisasContext *s, arg_rnfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, NF, a->nf);
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
-    return ldst_stride_trans(a->rd, a->rs1, a->rs2, data, fn, s);
+    return ldst_stride_trans(a->rd, a->rs1, a->rs2, data, fn, s, false);
 }
 
 static bool ld_stride_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
@@ -1000,7 +1040,7 @@ static bool st_stride_op(DisasContext *s, arg_rnfvm *a, uint8_t eew)
         return false;
     }
 
-    return ldst_stride_trans(a->rd, a->rs1, a->rs2, data, fn, s);
+    return ldst_stride_trans(a->rd, a->rs1, a->rs2, data, fn, s, true);
 }
 
 static bool st_stride_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
@@ -1023,7 +1063,7 @@ typedef void gen_helper_ldst_index(TCGv_ptr, TCGv_ptr, TCGv,
 
 static bool ldst_index_trans(uint32_t vd, uint32_t rs1, uint32_t vs2,
                              uint32_t data, gen_helper_ldst_index *fn,
-                             DisasContext *s)
+                             DisasContext *s, bool is_store)
 {
     TCGv_ptr dest, mask, index;
     TCGv base;
@@ -1039,6 +1079,10 @@ static bool ldst_index_trans(uint32_t vd, uint32_t rs1, uint32_t vs2,
     tcg_gen_addi_ptr(dest, tcg_env, vreg_ofs(s, vd));
     tcg_gen_addi_ptr(index, tcg_env, vreg_ofs(s, vs2));
     tcg_gen_addi_ptr(mask, tcg_env, vreg_ofs(s, 0));
+
+    rvv_state_ldst_vreg(vd, FIELD_EX32(data, VDATA, VM), is_store);
+    /* The offsets are a vector operand in their own right, always read. */
+    insn_dataflow_state_read(insn_df_reg(riscv_vec_regnames[vs2]));
 
     mark_vs_dirty(s);
 
@@ -1087,7 +1131,7 @@ static bool ld_index_op(DisasContext *s, arg_rnfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, NF, a->nf);
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
-    return ldst_index_trans(a->rd, a->rs1, a->rs2, data, fn, s);
+    return ldst_index_trans(a->rd, a->rs1, a->rs2, data, fn, s, false);
 }
 
 static bool ld_index_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
@@ -1140,7 +1184,7 @@ static bool st_index_op(DisasContext *s, arg_rnfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, VM, a->vm);
     data = FIELD_DP32(data, VDATA, LMUL, emul);
     data = FIELD_DP32(data, VDATA, NF, a->nf);
-    return ldst_index_trans(a->rd, a->rs1, a->rs2, data, fn, s);
+    return ldst_index_trans(a->rd, a->rs1, a->rs2, data, fn, s, true);
 }
 
 static bool st_index_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
@@ -1216,7 +1260,7 @@ typedef void gen_helper_ldst_whole(TCGv_ptr, TCGv, TCGv_env, TCGv_i32);
 
 static bool ldst_whole_trans(uint32_t vd, uint32_t rs1, uint32_t nf,
                              gen_helper_ldst_whole *fn,
-                             DisasContext *s)
+                             DisasContext *s, bool is_store)
 {
     TCGv_ptr dest;
     TCGv base;
@@ -1231,6 +1275,17 @@ static bool ldst_whole_trans(uint32_t vd, uint32_t rs1, uint32_t nf,
     base = get_gpr(s, rs1, EXT_NONE);
     tcg_gen_addi_ptr(dest, tcg_env, vreg_ofs(s, vd));
 
+    /*
+     * The whole-register form touches nf CONSECUTIVE registers and nf is a
+     * translate-time constant of the encoding, so every one of them is named
+     * -- there is no group arithmetic to guess at here.  vm is 1 by encoding
+     * (this family is never masked), so rvv_state_ldst_vreg() is called with
+     * it and states no mask read.
+     */
+    for (uint32_t k = 0; k < nf; k++) {
+        rvv_state_ldst_vreg((vd + k) % 32, 1, is_store);
+    }
+
     mark_vs_dirty(s);
 
     fn(dest, base, tcg_env, desc);
@@ -1243,42 +1298,42 @@ static bool ldst_whole_trans(uint32_t vd, uint32_t rs1, uint32_t nf,
  * load and store whole register instructions ignore vtype and vl setting.
  * Thus, we don't need to check vill bit. (Section 7.9)
  */
-#define GEN_LDST_WHOLE_TRANS(NAME, ARG_NF)                                \
+#define GEN_LDST_WHOLE_TRANS(NAME, ARG_NF, IS_STORE)                      \
 static bool trans_##NAME(DisasContext *s, arg_##NAME * a)                 \
 {                                                                         \
     if (require_rvv(s) &&                                                 \
         QEMU_IS_ALIGNED(a->rd, ARG_NF)) {                                 \
         return ldst_whole_trans(a->rd, a->rs1, ARG_NF,                    \
-                                gen_helper_##NAME, s);                    \
+                                gen_helper_##NAME, s, IS_STORE);          \
     }                                                                     \
     return false;                                                         \
 }
 
-GEN_LDST_WHOLE_TRANS(vl1re8_v,  1)
-GEN_LDST_WHOLE_TRANS(vl1re16_v, 1)
-GEN_LDST_WHOLE_TRANS(vl1re32_v, 1)
-GEN_LDST_WHOLE_TRANS(vl1re64_v, 1)
-GEN_LDST_WHOLE_TRANS(vl2re8_v,  2)
-GEN_LDST_WHOLE_TRANS(vl2re16_v, 2)
-GEN_LDST_WHOLE_TRANS(vl2re32_v, 2)
-GEN_LDST_WHOLE_TRANS(vl2re64_v, 2)
-GEN_LDST_WHOLE_TRANS(vl4re8_v,  4)
-GEN_LDST_WHOLE_TRANS(vl4re16_v, 4)
-GEN_LDST_WHOLE_TRANS(vl4re32_v, 4)
-GEN_LDST_WHOLE_TRANS(vl4re64_v, 4)
-GEN_LDST_WHOLE_TRANS(vl8re8_v,  8)
-GEN_LDST_WHOLE_TRANS(vl8re16_v, 8)
-GEN_LDST_WHOLE_TRANS(vl8re32_v, 8)
-GEN_LDST_WHOLE_TRANS(vl8re64_v, 8)
+GEN_LDST_WHOLE_TRANS(vl1re8_v,  1, false)
+GEN_LDST_WHOLE_TRANS(vl1re16_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl1re32_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl1re64_v, 1, false)
+GEN_LDST_WHOLE_TRANS(vl2re8_v,  2, false)
+GEN_LDST_WHOLE_TRANS(vl2re16_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl2re32_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl2re64_v, 2, false)
+GEN_LDST_WHOLE_TRANS(vl4re8_v,  4, false)
+GEN_LDST_WHOLE_TRANS(vl4re16_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl4re32_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl4re64_v, 4, false)
+GEN_LDST_WHOLE_TRANS(vl8re8_v,  8, false)
+GEN_LDST_WHOLE_TRANS(vl8re16_v, 8, false)
+GEN_LDST_WHOLE_TRANS(vl8re32_v, 8, false)
+GEN_LDST_WHOLE_TRANS(vl8re64_v, 8, false)
 
 /*
  * The vector whole register store instructions are encoded similar to
  * unmasked unit-stride store of elements with EEW=8.
  */
-GEN_LDST_WHOLE_TRANS(vs1r_v, 1)
-GEN_LDST_WHOLE_TRANS(vs2r_v, 2)
-GEN_LDST_WHOLE_TRANS(vs4r_v, 4)
-GEN_LDST_WHOLE_TRANS(vs8r_v, 8)
+GEN_LDST_WHOLE_TRANS(vs1r_v, 1, true)
+GEN_LDST_WHOLE_TRANS(vs2r_v, 2, true)
+GEN_LDST_WHOLE_TRANS(vs4r_v, 4, true)
+GEN_LDST_WHOLE_TRANS(vs8r_v, 8, true)
 
 /*
  *** Vector Integer Arithmetic Instructions

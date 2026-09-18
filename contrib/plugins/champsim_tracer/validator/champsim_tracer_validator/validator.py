@@ -7838,9 +7838,15 @@ def _check_metaflags(
     # Z/N/P from the instruction's ADDRESS.  Measured face: an ALU insn at
     # 0x401ffc, the last before a 0x402000 page boundary, whose low byte
     # 0xff has even parity -- so the check demanded P=1 and called the
-    # wire's correct P=0 an error.  None by name, not by value: the numeric
-    # id moves, the name does not.
-    pc_id = name_to_id.get("REG_PC")
+    # wire's correct P=0 an error.  Excluded by NAME, not by value, because
+    # the numeric id moves; and by BOTH spellings, because the name has
+    # moved too -- the wire calls it REG_IP at this tip
+    # (champsim_tracer_generic_ids.h: REG_IP = 252) and an earlier tree
+    # called it REG_PC.  Keying on one spelling alone would leave this
+    # check silently unfixed against a trace that used the other, which is
+    # exactly the shape that produced the wild failure:
+    #   "expected Z=0/N=0/P=1 from REG_IP=0x401fff".
+    pc_ids = {name_to_id[n] for n in ("REG_PC", "REG_IP") if n in name_to_id}
     if flags_id is None:
         return [Issue(
             "metaflags", "info",
@@ -7901,7 +7907,7 @@ def _check_metaflags(
             # CMP/TEST write only flags, so there's no GPR snap to
             # check against — Z/N/P verification is skipped.
             gpr_dsts = [r for r in dsts
-                        if r != flags_id and (pc_id is None or r != pc_id)]
+                        if r != flags_id and r not in pc_ids]
             if not gpr_dsts:
                 # Flags plus nothing but the program counter: there is no
                 # result to predict from, which is the same position CMP and

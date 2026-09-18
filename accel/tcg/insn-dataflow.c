@@ -295,22 +295,85 @@ static void df_set_trunc(size_t temp, bool v)
 }
 
 /*
+ * The declared register an env byte range lies inside, at the register's own
+ * offset and extent.  False when no declaration contains it.
+ *
+ * A DE-INTERLEAVING VECTOR ACCESS REACHES ONE REGISTER A BYTE AT A TIME.
+ * aarch64 `ld4 {v20.16b-v23.16b}` writes sixty-four one-byte ranges and `st4`
+ * reads sixty-four, because the elements of the structure are interleaved in
+ * memory and the lowering cannot promote them to wider accesses the way the
+ * contiguous `ld1` forms are promoted.  Every one of those is a distinct
+ * (offset, extent) key.
+ *
+ * Keyed that way one instruction exhausts the block's interning table, and
+ * from then on every value any LATER instruction reads out of env is handed
+ * an account missing its one real member -- so the later instruction is
+ * incomplete too, and the reader hands back nothing for either.
+ *
+ * A range inside a declared register resolves to that register and to nothing
+ * finer.  insn_dataflow_field_reg() already answers the container for any
+ * offset inside it, and that name is the whole of what this layer's consumers
+ * receive from a field row: the register, and the direction.  So the
+ * container is the key.  What it costs is the byte WITHIN the register, which
+ * no reader of this layer asks for; what it buys is that sixty-four keys are
+ * four.  A range no declaration contains -- a status word, a lazy-flag field,
+ * anything the target did not declare as a file -- keeps its exact extent,
+ * because there is no coarser answer that is still a register.
+ */
+static bool df_container(uint32_t off, uint32_t size,
+                         uint32_t *cont_off, uint32_t *cont_size)
+{
+    if (size == 0 || size == DF_FIELD_UNBOUNDED) {
+        return false;
+    }
+    for (unsigned f = 0; f < df_nregfiles; f++) {
+        const DfRegfile *rf = &df_regfiles[f];
+        uint32_t rel, i;
+
+        if (off < rf->base_off || rf->stride == 0) {
+            continue;
+        }
+        rel = off - rf->base_off;
+        i = rel / rf->stride;
+        if (i >= rf->count) {
+            continue;
+        }
+        rel %= rf->stride;
+        if (rel + (uint64_t)size > rf->size) {
+            continue;
+        }
+        *cont_off = rf->base_off + i * rf->stride;
+        *cont_size = rf->size;
+        return true;
+    }
+    return false;
+}
+
+/*
  * Give an env byte range a provenance bit, above the globals and below the
  * three atoms at the top.
  *
- * Interning keys on the offset AND the extent: a 16-byte vector register and
- * the 4-byte word at its base are different storage and a consumer that
- * conflated them would see a dependency between instructions that share only
- * an address.  When the table is full this returns -1 and the caller records
- * nothing -- a value whose source could not be interned looks as though it
- * came from nowhere, which is the one direction this file does not take in
- * silence.  Saying so is the CALLER'S job, because only the caller knows
- * which value lost the member, and the table is shared by the whole block
- * while the answer is owed per instruction.
+ * Interning keys on the offset AND the extent, CANONICALISED to the declared
+ * register that contains the range (see df_container): a 16-byte vector
+ * register and the 4-byte word at its base are the same storage and want one
+ * bit, while two ranges no declaration contains are different storage and a
+ * consumer that conflated them would see a dependency between instructions
+ * that share only an address.  When the table is full this returns -1 and the
+ * caller records nothing -- a value whose source could not be interned looks
+ * as though it came from nowhere, which is the one direction this file does
+ * not take in silence.  Saying so is the CALLER'S job, because only the
+ * caller knows which value lost the member, and the table is shared by the
+ * whole block while the answer is owed per instruction.
  */
 static int df_intern(uint32_t off, uint32_t size)
 {
     unsigned base = tcg_ctx->nb_globals;
+    uint32_t c_off, c_size;
+
+    if (df_container(off, size, &c_off, &c_size)) {
+        off = c_off;
+        size = c_size;
+    }
 
     for (unsigned i = 0; i < df->nslots; i++) {
         if (df->slot_off[i] == off && df->slot_size[i] == size) {
@@ -496,6 +559,29 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
                          uint8_t dir, const uint64_t *prov, bool sourced,
                          bool from_loads)
 {
+    uint32_t c_off, c_size;
+
+    /*
+     * A READ of part of a declared register is a read of that register, and
+     * the row says so at the register's own extent -- the same rule df_intern
+     * keys on, for the same reason: aarch64 `st4 {v20.16b-v23.16b}` reads
+     * sixty-four one-byte ranges out of four registers, and sixty-four rows
+     * do not fit in sixteen while four do.
+     *
+     * THE WRITE SIDE KEEPS ITS EXACT EXTENT.  df_env_writes_cover() decides
+     * from these rows whether a read inside the same instruction came out of
+     * a write the instruction itself made, and answers with the write's
+     * account instead of naming the range as a source.  A write row widened
+     * to its whole register would answer yes for bytes the instruction never
+     * wrote, and the source that read really had would vanish -- a dependency
+     * missed, which is the direction this file does not take.  So the
+     * canonical form is the read's alone.
+     */
+    if (dir == INSN_DF_RD && df_container(off, size, &c_off, &c_size)) {
+        off = c_off;
+        size = c_size;
+    }
+
     for (unsigned i = 0; i < d->n_fields; i++) {
         if (d->fields[i].off == off && d->fields[i].size == size) {
             d->fields[i].dir |= dir;

@@ -143,7 +143,46 @@ echo "clean baseline: DISAGREE = $BASE_DIS (the figure both control arms move fr
 # subprocess.run(capture_output=True), which SWALLOWS stderr, so a shim that
 # announced "reached no subject" there would announce it to nobody.  It
 # appends to CST_FALSIFY_LOG instead, and this is where that log is read.
+# THE PUBLISHED TABLE IS RESTORED ON ANY EXIT FROM HERE ON.  A control arm
+# that fails leaves `../attrib.tsv` carrying the DAMAGED scoring, and the leg
+# used to exit on that failure without putting it back -- measured at exec246,
+# where a failed arm left the bank reading 975 disagreements against a clean
+# 906 and coverage_report.py would have published the damage as a result.
+# Restoring is not optional and must not depend on reaching the restore line.
+restore_table() {
+  CST_ISAXCHECK="$ISAX" $PY parse.py >/dev/null 2>&1 || return
+  $PY build_ref.py >/dev/null 2>&1 && $PY adjudicate.py >/dev/null 2>&1 || return
+  CST_ISAXCHECK="$ISAX" $PY emit.py > /dev/null 2>&1 || return
+}
+trap 'restore_table' EXIT
+
+# THE SHIM IS TOLD WHICH ARM TO RUN AND WHICH TABLE NAMES THE MNEMONICS.
+# It cannot read CST_ISAXCHECK for the arm, because during a falsify run the
+# shim IS CST_ISAXCHECK.  Before exec246 it ran a hard-coded, deleted binary
+# and keyed its damage on a column the surviving arm does not emit; both are
+# now supplied from here.  See attrib/falsify_shim.sh.
+export CST_FALSIFY_UNDER="$ISAX"
+export CST_FALSIFY_OPCODES="$D/opcodes.tsv"
+
 run_arm() {   # $1 mnemonic  $2 expected-damage: some|none
+  # THE SELECTION IS CHECKED BEFORE THE RUN IS SPENT.  A firing arm naming a
+  # mnemonic the denominator does not carry cannot fire, and an inert arm
+  # naming one it DOES carry cannot stay inert; either way the arm would be
+  # measuring the harness instead of the tracer, and the check is a second of
+  # awk against the run that takes minutes.
+  local nsel; nsel=$(awk -F'\t' -v m="$1" 'NR>1 && $2 == m' ../opcodes.tsv | wc -l)
+  case "$2" in
+    some) [ "$nsel" -gt 0 ] || {
+            echo "CONTROL HAS NO SUBJECT: '$1' names 0 of the denominator's" >&2
+            echo "  rows in ../opcodes.tsv, so the firing arm cannot fire." >&2
+            echo "  NAME A MNEMONIC THAT IS IN THE DENOMINATOR." >&2
+            return 1; } ;;
+    none) [ "$nsel" -eq 0 ] || {
+            echo "INERT ARM HAS A SUBJECT: '$1' names $nsel row(s) of the" >&2
+            echo "  denominator, so an arm that damages nothing would prove" >&2
+            echo "  nothing about the shim's reach." >&2
+            return 1; } ;;
+  esac
   rm -f fals.log
   CST_ISAXCHECK="$PWD/falsify_shim.sh" CST_FALSIFY_MNEM="$1" \
       CST_FALSIFY_LOG="$PWD/fals.log" $PY parse.py

@@ -181,6 +181,15 @@ def main():
     # report agreement.  Absent means boundary, and boundary refuses.
     ap.add_argument("--layer", default=None)
     ap.add_argument("--batch", action="store_true")
+    # ONE ENCODING, THE BLOCK FORM.  mipsel/attrib/parse.py re-probes each
+    # opcode's representative encoding singly and parses the retired tool's
+    # human-readable block.  The FIELDS half of that block is exactly what
+    # this module has, so it is printed in the same shape; the boundary and
+    # llvm halves came from decoders that are gone, and printing an ABSENT
+    # line for them is deliberate -- the parser leaves those sets empty, which
+    # is the honest state, and a reader of the file can see WHY they are empty
+    # rather than inferring an instruction that reads nothing.
+    ap.add_argument("--hex", default=None)
     ap.add_argument("--falsify", default=os.environ.get("CST_FALSIFY"))
     a = ap.parse_args()
 
@@ -208,6 +217,33 @@ def main():
         sys.exit("sled_fields: no --capture and no CST_SLED_CAPTURE -- "
                  "REFUSING.  The tracer arm is read out of a sled capture; "
                  "name the directory ident_capture.sh wrote it into.")
+
+    if a.hex:
+        h = "".join(c for c in a.hex if c in "0123456789abcdefABCDEF").lower()
+        if not h:
+            sys.exit("sled_fields: --hex carried no hex digits -- REFUSING")
+        e = load(a.isa, a.capture).get(h)
+        if e is None:
+            # NOT AN ERROR, AND NOT A SILENCE EITHER.  The caller asked about
+            # an encoding this capture has no row for; saying so by name is
+            # the answer, and exit 0 keeps a leg's own accounting in charge of
+            # what an unreached encoding means for it.
+            sys.stdout.write("fields   ok=0  GEN_OP_UNKNOWN  BRANCH_NONE\n"
+                             "   ident=unreached (no row in the capture)\n"
+                             "   SRC{}\n   DST{}\n"
+                             "boundary ABSENT (no second decoder in this "
+                             "tree)\n")
+            return 0
+        sys.stdout.write(
+            "fields   ok=%d  %s  %s\n"
+            "   ident=%s\n"
+            "   SRC{%s}\n   DST{%s}\n"
+            "boundary ABSENT (no second decoder in this tree)\n"
+            % (1 if e["ident"] == "seated" else 0,
+               e["opcode"] or "GEN_OP_UNKNOWN",
+               e["branch"] or "BRANCH_NONE", e["ident"],
+               e["src"], e["dst"]))
+        return 0
 
     encodings = []
     for line in sys.stdin:

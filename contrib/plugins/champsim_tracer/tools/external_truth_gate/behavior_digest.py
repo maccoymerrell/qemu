@@ -244,7 +244,68 @@ def mask_stamps(data, stamps):
     return bytes(data) if out is not None else data
 
 
-def _load_cache(build_dir):
+# THE KEY IS THE FILE, NOT THE SPELLING THE CALLER USED (FINDING 248-C).
+#
+# Both callers build their subject list as os.path.join(build_dir, name), so
+# the cache key is whatever `--build-dir` was spelled as.  `--build-dir build`
+# and `--build-dir /mnt/md0/QEMU/qemu/build` are the same ten binaries, and
+# they were landing in the cache as twenty entries whose `since` times drifted
+# apart: measured 2026-09-18, libchampsim_tracer.so carried since=1789773214.8
+# under the absolute key and since=1789778662.9 under the relative one, for
+# one file with one digest.  The staleness verdict then depended on how the
+# caller typed the path -- a table fresh under one spelling and stale under
+# the other, with no difference in anything measured.  Canonicalising the key
+# makes the two spellings one entry by construction.
+#
+# realpath, not abspath: a build directory reached through a symlink is the
+# same build directory, and resolving it is what makes that true of the key.
+def canon_key(path):
+    """The cache key for a path: absolute, symlinks resolved."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def migrate_entries(ent):
+    """-> (canonical entries, [note, ...]) for a cache read off disk.
+
+    Entries written before canon_key() are keyed by caller spelling, so one
+    file can hold several.  They are folded here rather than left to collide:
+
+      * agreeing digests -> ONE entry at the EARLIEST `since`.  `since` means
+        "the mtime at which this digest was first seen", and an entry that
+        recorded this digest earlier is a record that it had already been
+        seen; the later reading is the partial history, not new information.
+      * disagreeing digests -> the entry is DROPPED.  One of the two describes
+        a binary that is gone and there is nothing here that says which, so
+        the honest move is to forget both and let the next walk re-digest the
+        file, which sets `since` to its current mtime.  That is the
+        conservative direction: it can cost a re-run, never a false green.
+    """
+    by_key = {}
+    for raw, val in ent.items():
+        if not isinstance(val, dict):
+            continue
+        by_key.setdefault(canon_key(raw), []).append((raw, val))
+    out, notes = {}, []
+    for key, group in by_key.items():
+        spellings = sorted(r for r, _v in group)
+        digests = {v.get('digest') for _r, v in group}
+        if len(digests) > 1:
+            notes.append('DROPPED %s: %d spellings disagree on the digest '
+                         '(%s)' % (key, len(group), ', '.join(spellings)))
+            continue
+        best = min(group, key=lambda rv: rv[1].get('since', float('inf')))
+        newest = max(group, key=lambda rv: rv[1].get('mtime', 0))
+        val = dict(newest[1])
+        val['since'] = best[1].get('since', val.get('mtime'))
+        out[key] = val
+        if len(group) > 1:
+            notes.append('folded %s: %d spellings (%s) -> since %s'
+                         % (key, len(group), ', '.join(spellings),
+                            val['since']))
+    return out, notes
+
+
+def _load_cache(build_dir, notes=None):
     path = os.path.join(build_dir, CACHE_NAME)
     try:
         with open(path) as fh:
@@ -254,7 +315,12 @@ def _load_cache(build_dir):
     if blob.get('version') != CACHE_VERSION:
         return {}
     ent = blob.get('entries')
-    return ent if isinstance(ent, dict) else {}
+    if not isinstance(ent, dict):
+        return {}
+    ent, said = migrate_entries(ent)
+    if notes is not None:
+        notes.extend(said)
+    return ent
 
 
 def _store_cache(build_dir, entries):
@@ -280,9 +346,15 @@ def behaviour_reference(build_dir, paths):
     per readable path so the caller can print what it held the reports
     against.  Paths that do not exist are skipped -- their absence is the
     caller's problem to report, not this function's to hide.
+
+    The cache is keyed by canon_key(), so a caller that spells `--build-dir`
+    relatively and one that spells it absolutely read and write the same
+    entry and reach the same verdict; `rows` still names each path the way
+    the caller asked for it.
     """
     stamps = version_stamps(build_dir)
-    cache = _load_cache(build_dir)
+    migrated = []
+    cache = _load_cache(build_dir, migrated)
     out = {}
     rows = []
     best, which = 0.0, None
@@ -290,7 +362,8 @@ def behaviour_reference(build_dir, paths):
         if not os.path.exists(p):
             continue
         st = os.stat(p)
-        prev = cache.get(p) or {}
+        key = canon_key(p)
+        prev = cache.get(key) or {}
         note = ''
         if (prev.get('mtime') == st.st_mtime
                 and prev.get('size') == st.st_size
@@ -316,14 +389,17 @@ def behaviour_reference(build_dir, paths):
                 since = st.st_mtime
                 note = ('behaviour CHANGED' if prev.get('digest')
                         else 'first seen')
-        out[p] = {'mtime': st.st_mtime, 'size': st.st_size,
-                  'digest': d, 'since': since}
+        out[key] = {'mtime': st.st_mtime, 'size': st.st_size,
+                    'digest': d, 'since': since}
         rows.append((p, st.st_mtime, since, d, note))
         if since > best:
             best, which = since, p
-    if out:
+    if out or migrated:
         # Keep entries for paths not walked this time: a gate run restricted
-        # to one ISA must not forget what the last full run learned.
+        # to one ISA must not forget what the last full run learned.  A walk
+        # that touched nothing still writes when the load MIGRATED something,
+        # so a dual-keyed cache is folded on first contact rather than being
+        # re-folded, identically, by every reader for ever.
         merged = dict(cache)
         merged.update(out)
         _store_cache(build_dir, merged)
@@ -374,6 +450,34 @@ def _selfcheck():
     arm('short lookalike not masked',
         b'v10.0.8-x', [s1, f1],
         b'v10.0.8-y', [s2, f2], False)
+
+    # AND THE KEY (FINDING 248-C).  The fold is what makes two spellings of
+    # one build directory reach one verdict, so it is proven here rather than
+    # asserted: agreeing digests collapse to the earliest first-seen, and
+    # disagreeing ones are dropped instead of one silently winning.
+    def karm(name, ent, want):
+        nonlocal bad
+        got, _notes = migrate_entries(ent)
+        got = {k: v.get('since') for k, v in got.items()}
+        ok = (got == want)
+        print('%-28s %s (%s, wanted: %s)'
+              % (name, 'ok' if ok else 'FAILED', got, want))
+        if not ok:
+            bad += 1
+
+    here = os.path.abspath(__file__)
+    rel = os.path.relpath(here)
+    karm('two spellings, one digest',
+         {here: {'digest': 'aa', 'mtime': 30.0, 'size': 1, 'since': 10.0},
+          rel: {'digest': 'aa', 'mtime': 30.0, 'size': 1, 'since': 20.0}},
+         {canon_key(here): 10.0})
+    karm('two spellings, digests differ',
+         {here: {'digest': 'aa', 'mtime': 30.0, 'size': 1, 'since': 10.0},
+          rel: {'digest': 'bb', 'mtime': 30.0, 'size': 1, 'since': 20.0}},
+         {})
+    karm('single entry untouched',
+         {rel: {'digest': 'aa', 'mtime': 30.0, 'size': 1, 'since': 10.0}},
+         {canon_key(here): 10.0})
     return 1 if bad else 0
 
 
@@ -386,9 +490,44 @@ def _main(argv):
     the digest, and can be proven on two thirty-byte shared objects.
 
       behavior_digest.py [--stamp S]... FILE...
+      behavior_digest.py --migrate BUILD_DIR
+
+    `--migrate` folds an existing cache's per-spelling keys onto canonical
+    ones and says what it did.  Readers migrate on their own, so this is for
+    doing it once, visibly, with the movement on the record.
     """
     if argv and argv[0] == '--selfcheck':
         return _selfcheck()
+    if argv and argv[0] == '--migrate':
+        if len(argv) != 2:
+            sys.stderr.write('--migrate takes exactly one build directory\n')
+            return 2
+        bd = argv[1]
+        path = os.path.join(bd, CACHE_NAME)
+        try:
+            with open(path) as fh:
+                blob = json.load(fh)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write('no readable cache at %s (%s)\n' % (path, exc))
+            return 2
+        if blob.get('version') != CACHE_VERSION:
+            sys.stderr.write('cache at %s is version %r, not %d\n'
+                             % (path, blob.get('version'), CACHE_VERSION))
+            return 2
+        ent = blob.get('entries')
+        if not isinstance(ent, dict):
+            sys.stderr.write('cache at %s carries no entries\n' % path)
+            return 2
+        new, notes = migrate_entries(ent)
+        for n in notes:
+            print(n)
+        print('entries %d -> %d' % (len(ent), len(new)))
+        if new != ent:
+            _store_cache(bd, new)
+            print('written: %s' % path)
+        else:
+            print('already canonical: nothing written')
+        return 0
     stamps, files = [], []
     i = 0
     while i < len(argv):

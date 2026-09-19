@@ -72,15 +72,29 @@ shift 2 || true
 : "${CST_QEMU_DIR:=/mnt/md0/QEMU/qemu}"
 : "${CST_BUILD:=$CST_QEMU_DIR/build}"
 
-# The subjects, in the build's own target spelling.  These are exactly the
-# binaries coverage_report.py measures freshness against, so a leg that
-# passes this guard cannot fail that one for a reason this guard could have
-# seen.  `contrib/plugins/isaxcheck` used to head the list and was deleted
-# with Capstone; stamp_one() then died on every arm, so every leg refused to
-# start -- a guard that cannot find its subject correctly failing, about a
-# subject that no longer exists.  The reference moved offline with the rest
-# of it (tools/cst_referee.py is a checked-in source, not a build product,
-# and is versioned rather than stamped here).
+# The subjects, in the build's own target spelling.  `contrib/plugins/isaxcheck`
+# used to head the list and was deleted with Capstone; stamp_one() then died on
+# every arm, so every leg refused to start -- a guard that cannot find its
+# subject correctly failing, about a subject that no longer exists.  The
+# reference moved offline with the rest of it (tools/cst_referee.py is a
+# checked-in source, not a build product, and is versioned rather than stamped
+# here).
+#
+# THIS LIST IS A SUBSET OF coverage_report.py's TRACER_BINARIES, AND CANNOT BE
+# THE WHOLE OF IT.  That report also holds the four `qemu-<isa>` emulators at a
+# freshness time (finding 247-C: the tracer arm reads QEMU's own translation-
+# time statements out of a capture, so a target-only commit moves what a table
+# measures).  This guard CANNOT take them: it refuses a subject with pending
+# ninja work, `build.ninja` declares `qemu-version.h` PHONY, and every emulator
+# depends on it -- so a qemu-* subject here would report pending work on every
+# arm and no leg would ever start.  See the NOTE below, which says exactly that.
+#
+# The two guards are therefore deliberately different and both are honest:
+# this one refuses an UNSETTLED TREE using targets that can settle, and
+# coverage_report.py refuses a STALE TABLE using behaviour digests, which mask
+# the version stamp and so can hold a binary that never settles.  A leg that
+# passes this guard can still fail that one -- for an emulator whose behaviour
+# moved -- and that is the correct division, not a hole.
 SUBJECTS=(contrib/plugins/libchampsim_tracer.so
           contrib/plugins/cst_decode
           "$@")

@@ -150,11 +150,42 @@ BUILD_DIR = os.environ.get('CST_BUILD', '/mnt/md0/QEMU/qemu/build')
 REFEREE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
     __file__))), 'cst_referee.py')
 
-#: The tracer side.  These two carry the behaviour the tables describe: the
-#: plugin publishes the wire and the offline decoder reads it back.
+#: The tracer side: every binary whose behaviour a coverage table describes.
+#:
+#: THE PLUGIN AND THE OFFLINE DECODER are the obvious two -- the plugin
+#: publishes the wire and cst_decode reads it back.
+#:
+#: THE FOUR EMULATORS ARE SUBJECTS TOO, and leaving them out was FINDING
+#: 247-C.  Since the tracer arm moved into the emulator there is no longer a
+#: host-side decoder to hold the register lists: srcenc_fields reads them out
+#: of a capture that `qemu-<isa>` produced, because the wire's src_regs[] and
+#: dst_regs[] ARE QEMU's own ordered statements, made at translation time by
+#: target/<arch> code that only the emulator contains (sled_fields.py's
+#: header says this, and srcenc_sled.py launches `build/qemu-<isa>` by name).
+#: So a commit that changes ONLY a target's statements -- exactly the shape
+#: of every wire change in this arc -- moves what the tables measure while
+#: leaving the plugin and cst_decode byte-identical, and with only those two
+#: as subjects the freshness reference would not advance and a table written
+#: before the change would publish as current.  That is the same false-green
+#: this guard exists to prevent, one layer down.
+#:
+#: WHY ALL FOUR RATHER THAN THE ONE AN ISA'S LEG USES: the reference is a
+#: single time over all subjects and the report publishes an ALL-FOUR
+#: aggregate, so a per-ISA reference would let an aggregate mix a fresh leg
+#: with one whose emulator moved.  Holding every leg to the newest of the
+#: four is the conservative direction -- it can cost a re-run, never a lie.
+#:
+#: The version string is masked by behavior_digest (that is what #292 built
+#: it for), so a relink that changes only `qemu-version.h` leaves all four
+#: digests unchanged and the reference does not advance.  Without that
+#: masking this list could not exist: every commit relinks every emulator.
 TRACER_BINARIES = (
     'contrib/plugins/libchampsim_tracer.so',
     'contrib/plugins/cst_decode',
+    'qemu-x86_64',
+    'qemu-aarch64',
+    'qemu-riscv64',
+    'qemu-mipsel',
 )
 
 
@@ -564,11 +595,16 @@ def main():
     w('=' * 78)
     w('')
     w('MEMOPS.  Count, address and data for every load and store are half the')
-    w('deliverable and NO harness IN THIS REPORT compares any of them.  The')
-    w('x86_64 tracer arm parses f_loads / f_stores and never uses them; the')
-    w('aarch64 reference carries mem_r / mem_w per subject and the comparison')
-    w('never reads them.  The numbers above are register attribution only and')
-    w('must not be quoted as memop coverage.')
+    w('deliverable and NO harness IN THIS REPORT compares any of them.  On')
+    w('x86_64 the hole is wider than it used to be described: this text said')
+    w('the tracer arm "parses f_loads / f_stores and never uses them", and it')
+    w('no longer parses them at all -- the arm is sled_fields.py, whose')
+    w('columns are hex / f_ok / f_opcode / f_branch / f_src / f_dst /')
+    w('f_ident, with no memop counts in them, so there is no tracer-side')
+    w('number there to compare.  The aarch64 reference carries mem_r / mem_w')
+    w('per subject and its comparison never reads them.  The numbers above')
+    w('are register attribution only and must not be quoted as memop')
+    w('coverage.')
     w('')
     w('The EXECUTION legs DO compare memops -- count, address, width and data')
     w('-- on all four ISAs, and their numbers live in their own reports, not')

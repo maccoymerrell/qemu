@@ -10,6 +10,26 @@
 # argument is not the defect; the script living only in an evidence directory
 # is, so the script lives here now and a pass copies it rather than writing it.
 #
+# WHAT THIS STAGE'S NUMBERS COUNT, AND WHAT THEY DO NOT (finding 250-E).
+#
+# The push-ready readout's C5 row is "the scorers", and it was being read as
+# "every UNRULED count in the pass".  It is not, and counting it that way
+# counts one measurement twice: the REGISTER-SET UNRULED number is the gate row
+# `refsrc/all`, which C1 already scores and already turns red on.  A pass in
+# which that row reads 17 then has one failure appearing as two, or -- worse,
+# and it happened -- as one red and one green.
+#
+#   C5 is the scorers' STRUCTURAL HEALTH: gapreport and setjoin each ran to
+#   completion over the corpora this pass produced, with every class they
+#   reach carrying a ruling and no ruling naming a class the build does not
+#   have (0 UNRULED, 0 DEAD, RESERVED counted and named).
+#
+#   C1 owns the register-set count.  `refsrc/all` is a gate row with a
+#   ceiling, it is scored there, and it is not re-counted here.
+#
+# Both halves are printed below, per stage, so the readout can quote each one
+# once from the stage that measured it.
+#
 # Every stage's rc is captured PER PROCESS.  Nothing pipes a status it needs:
 # a stage whose output cannot be read fails loudly rather than reporting a zero
 # it never measured.

@@ -1540,14 +1540,47 @@ static void gen_load_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg)
     }
 }
 
-static void gen_store_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg)
+/*
+ * @arch_merge SAYS THE ARCHITECTURE COMPOSES, WHICH IS R7.1'S OWN EXCEPTION.
+ *
+ * R7.1 suppresses the merge's read "unless the instruction specifically takes
+ * it as a source", and two instructions do.  `mthc1 rt,fs' is defined as
+ *
+ *     StoreFPR(fs, UNINTERPRETED_DOUBLEWORD,
+ *              GPR[rt]31..0 || ValueFPR(fs, UNINTERPRETED_WORD)31..0)
+ *
+ * -- the low word is READ, by name, and placed in the result, so the new value
+ * of the register is a function of GPR[rt] AND of its own previous contents.
+ * The MT ASE's `mttc1 rt,fs' with h=1 is the same sentence.  Everything else
+ * that reaches this function writes the half it writes and leaves the other
+ * one alone WITHOUT reading it: `movf.ps' branches around the write, and the
+ * paired-single shuffles and `alnv.ps' write both halves.  Those stay under
+ * R7.1 and pass false.
+ *
+ * The two regimes need opposite treatment, because they preserve in different
+ * places.  Under FR=1 the surviving half is the low half of THIS global, so
+ * the deposit's own read of it is the architectural read and the fix is to
+ * stop suppressing it: the read set and the destination's provenance then
+ * both name it, by construction, with nothing stated by hand.  Under FR=0 the
+ * write goes to the ODD register of the pair and the surviving architectural
+ * word lives in the EVEN one, which no op in this instruction touches -- so
+ * there is nothing to un-suppress and the read is stated.  The name is the
+ * even register either way, which is what the pair rule requires.
+ */
+static void gen_store_fpr32h(DisasContext *ctx, TCGv_i32 t, int reg,
+                             bool arch_merge)
 {
     if (ctx->hflags & MIPS_HFLAG_F64) {
         TCGv_i64 t64 = tcg_temp_new_i64();
         tcg_gen_extu_i32_i64(t64, t);
-        insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg]));
+        if (!arch_merge) {
+            insn_dataflow_note_preserve_read(insn_df_reg(fregnames[reg]));
+        }
         tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 32, 32);
     } else {
+        if (arch_merge) {
+            insn_dataflow_state_read(insn_df_reg(fregnames[reg & ~1]));
+        }
         gen_store_fpr32(ctx, t, reg | 1);
     }
 }
@@ -8961,8 +8994,16 @@ static void gen_mttr(CPUMIPSState *env, DisasContext *ctx, int rd, int rt,
             } else {
                 TCGv_i32 fp0 = tcg_temp_new_i32();
 
+                /*
+                 * `mttc1 rt,fs' with h=1 composes exactly as `mthc1' does --
+                 * GPR[rt]31..0 || ValueFPR(fs, UNINTERPRETED_WORD)31..0 -- so
+                 * the target thread's FPR is a source of its own new value.
+                 * Stated for the same reason and with no witness of its own:
+                 * no MT ASE encoding appears in the capture corpus, so this
+                 * arm moves nothing that has been measured.
+                 */
                 tcg_gen_trunc_tl_i32(fp0, t0);
-                gen_store_fpr32h(ctx, fp0, rd);
+                gen_store_fpr32h(ctx, fp0, rd, true);
             }
             break;
         case 3:
@@ -9601,8 +9642,19 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
+            /*
+             * THE LOW WORD SURVIVES AND THE INSTRUCTION READS IT BY NAME.
+             * `mthc1 rt,fs' is StoreFPR(fs, UNINTERPRETED_DOUBLEWORD,
+             * GPR[rt]31..0 || ValueFPR(fs, UNINTERPRETED_WORD)31..0), so FPR
+             * fs is a source of its own new value and the merge stands as an
+             * architectural read.  `mtc1' one case up is the contrast that
+             * makes this a statement and not a habit: it is
+             * StoreFPR(fs, UNINTERPRETED_WORD, GPR[rt]), which leaves the
+             * upper half UNPREDICTABLE rather than composing it, and keeps
+             * R7.1's suppression.
+             */
             tcg_gen_trunc_tl_i32(fp0, t0);
-            gen_store_fpr32h(ctx, fp0, fs);
+            gen_store_fpr32h(ctx, fp0, fs, true);
         }
         break;
     default:
@@ -9702,7 +9754,7 @@ static inline void gen_movcf_ps(DisasContext *ctx, int fs, int fd,
     tcg_gen_andi_i32(t0, fpu_fcr31, 1 << get_fp_bit(cc + 1));
     tcg_gen_brcondi_i32(cond, t0, 0, l2);
     gen_load_fpr32h(ctx, t0, fs);
-    gen_store_fpr32h(ctx, t0, fd);
+    gen_store_fpr32h(ctx, t0, fd, false);
     gen_set_label(l2);
 }
 
@@ -10978,7 +11030,7 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
 
             gen_load_fpr32(ctx, fp0, fs);
             gen_load_fpr32(ctx, fp1, ft);
-            gen_store_fpr32h(ctx, fp0, fd);
+            gen_store_fpr32h(ctx, fp0, fd, false);
             gen_store_fpr32(ctx, fp1, fd);
         }
         break;
@@ -10991,7 +11043,7 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr32(ctx, fp0, fs);
             gen_load_fpr32h(ctx, fp1, ft);
             gen_store_fpr32(ctx, fp1, fd);
-            gen_store_fpr32h(ctx, fp0, fd);
+            gen_store_fpr32h(ctx, fp0, fd, false);
         }
         break;
     case OPC_PUL_PS:
@@ -11003,7 +11055,7 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr32h(ctx, fp0, fs);
             gen_load_fpr32(ctx, fp1, ft);
             gen_store_fpr32(ctx, fp1, fd);
-            gen_store_fpr32h(ctx, fp0, fd);
+            gen_store_fpr32h(ctx, fp0, fd, false);
         }
         break;
     case OPC_PUU_PS:
@@ -11015,7 +11067,7 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
             gen_load_fpr32h(ctx, fp0, fs);
             gen_load_fpr32h(ctx, fp1, ft);
             gen_store_fpr32(ctx, fp1, fd);
-            gen_store_fpr32h(ctx, fp0, fd);
+            gen_store_fpr32h(ctx, fp0, fd, false);
         }
         break;
     case OPC_CMP_F_PS:
@@ -11143,20 +11195,20 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
             gen_load_fpr32(ctx, fp, fs);
             gen_load_fpr32h(ctx, fph, fs);
             gen_store_fpr32(ctx, fp, fd);
-            gen_store_fpr32h(ctx, fph, fd);
+            gen_store_fpr32h(ctx, fph, fd, false);
             tcg_gen_br(l2);
             gen_set_label(l1);
             tcg_gen_brcondi_tl(TCG_COND_NE, t0, 4, l2);
             if (disas_is_bigendian(ctx)) {
                 gen_load_fpr32(ctx, fp, fs);
                 gen_load_fpr32h(ctx, fph, ft);
-                gen_store_fpr32h(ctx, fp, fd);
+                gen_store_fpr32h(ctx, fp, fd, false);
                 gen_store_fpr32(ctx, fph, fd);
             } else {
                 gen_load_fpr32h(ctx, fph, fs);
                 gen_load_fpr32(ctx, fp, ft);
                 gen_store_fpr32(ctx, fph, fd);
-                gen_store_fpr32h(ctx, fp, fd);
+                gen_store_fpr32h(ctx, fp, fd, false);
             }
             gen_set_label(l2);
         }

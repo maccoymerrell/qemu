@@ -3371,16 +3371,42 @@ static inline uint64_t read_reg_u64(unsigned int cpu_index,
 
 static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
 {
-    if (g_wp_in_progress) {
-        return;
-    }
-    if (!g_trace_segments.is_active_atomic()) {
-        return;
-    }
-    /* Async-interrupt exclusion: drop synthetic-EA loads issued by a
-     * suppressed async handler (see the memop recorder rationale). */
-    if (g_capture_mute) {
-        return;
+    /*
+     * THE WRONG PATH RECORDS THIS ACCESS, ON THE SAME TERMS AS THE
+     * CORRECT PATH.  A wrong-path prefetch or cache-maintenance
+     * instruction touches the line its speculative operand register
+     * names, and that footprint is what the trace is for.
+     * MemAccessRecorder::record_synthetic_load has always had a
+     * wrong-path arm and never had a caller reaching it: the refusal was
+     * HERE, an unconditional early return that made the wrong path
+     * invisible to the one sink that can report these accesses at all.
+     *
+     * AND THE REFUSAL WAS THE ONLY GATE.  A wrong-path excursion walks
+     * blocks through qemu_plugin_exec_tb(), and cpu_plugin_exec_tb()
+     * (accel/tcg/cpu-exec.c) sets CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+     * CF_SINGLE_STEP and NOT CF_MEMI_ONLY -- so the per-instruction
+     * callbacks this file arms are planted inside an excursion like any
+     * other.  CF_MEMI_ONLY belongs to cpu_plugin_exec_inline(), the
+     * single-instruction route, which this plugin does not call.
+     * Measured, not argued: with the registration left exactly as it was
+     * and only this return removed, the wire gains the wrong-path
+     * synthetic loads (exec249/wp/localize).
+     *
+     * The two gates below are the CORRECT-PATH gates, skipped on the
+     * wrong path exactly as the recorder skips them: an excursion runs
+     * inside an active segment by construction -- it is kicked from
+     * emit_finalized_bb -- and the mute is the async-interrupt exclusion,
+     * a correct-path decision about a handler the trace omits.
+     */
+    if (!g_wp_in_progress) {
+        if (!g_trace_segments.is_active_atomic()) {
+            return;
+        }
+        /* Async-interrupt exclusion: drop synthetic-EA loads issued by a
+         * suppressed async handler (see the memop recorder rationale). */
+        if (g_capture_mute) {
+            return;
+        }
     }
     const SynthEAInsnRef *ref = (const SynthEAInsnRef *)udata;
     if (!ref || !ref->tb_tmpl ||

@@ -82,7 +82,8 @@ import gem5_env                                              # noqa: E402
 import wire_vocab                                            # noqa: E402
 from arc3_taxonomy import (set_relation, EQUAL, SUPERSET,
                            SUBSET, ORTHOGONAL)               # noqa: E402
-from gem5_rules import gem5_exec_rule                        # noqa: E402
+from gem5_rules import (gem5_exec_rule,                      # noqa: E402
+                        addr_only_mechanism)                 # noqa: E402
 from axis_subjects import Subjects                           # noqa: E402
 
 #: every fact this leg checks about a wrong-path instruction.  Named in full
@@ -591,26 +592,33 @@ def _addr_only(ins):
 
 
 def _ref_covers_same_line(r, t):
-    """The reference's accesses are ONE contiguous granule containing ours.
+    """The reference's contiguous granule containing ours, in bytes; else 0.
 
     This is the guard that keeps the address-only rules a measurement rather
     than a blanket: the reference must describe a single contiguous run of a
     power-of-two byte count, and every address the trace published must fall
     INSIDE it.  A trace that named the wrong line fails containment, earns no
     label, and stays a defect.
+
+    Returns the SPAN rather than a bare true because the span is also what
+    separates the two address-only mechanisms -- gem5's decoder constant from
+    its modelled line -- see gem5_rules.addr_only_mechanism().  Zero is falsy,
+    so every boolean caller reads unchanged.
     """
     ra = sorted(a for a, _d, _s in r.loads + r.stores)
     if not ra:
-        return False
+        return 0
     lo = min(ra)
     span = 0
     for a, _d, sz in r.loads + r.stores:
         span = max(span, a + max(sz or 0, 1) - lo)
     if span <= 0 or (span & (span - 1)) != 0:
-        return False                      # not a granule
+        return 0                          # not a granule
     if set(ra) != set(range(lo, lo + span)) and len(ra) != 1:
-        return False                      # not contiguous, and not one record
-    return all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores)
+        return 0                          # not contiguous, and not one record
+    if not all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores):
+        return 0
+    return span
 
 
 def is_svc(bits):
@@ -943,18 +951,25 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
 
         for _ax in ('memop-count', 'memop-addr', 'memop-width'):
             facts.note(_ax, t)
+        #: The reference's granule in bytes, or 0.  Measured on this pair,
+        #: consulted by the memop-width relation below as well as by the
+        #: label -- see compare_exec_gem5.py, which carries the rule's full
+        #: statement.
+        ref_granule = _addr_only(t) and _ref_covers_same_line(r, t)
+        addr_only_same_line = bool(ref_granule)
+
         mech = None
         if _addr_only(t) and not r.loads and not r.stores:
             # The reference executed the hint / maintenance operation as a
             # no-op and issued no request at all.
             mech = 'HINT-MEMOP-REF-SILENT'
-        elif _addr_only(t) and _ref_covers_same_line(r, t):
+        elif addr_only_same_line:
             # Both name the same granule; they disagree only on whether the
             # record carries the modelled cache's geometry.  WHICH mechanism
-            # is read off the trace's own write list, never off a mnemonic.
-            mech = ('MAINT-EXTENT-IS-CACHE-GEOMETRY'
-                    if any(n == MAINT_DEST for n, _v, _w in t.writes)
-                    else 'PREFETCH-SIZE-IS-REF-CHOICE')
+            # is decided by the REFERENCE'S OWN EXTENT, with the trace's
+            # write list kept as an independent positive route and NO third
+            # guess -- gem5_rules.addr_only_mechanism carries the statement.
+            mech = addr_only_mechanism(ref_granule, t.writes, MAINT_DEST)
         elif rb == tb and rcnt != tcnt:
             mech = 'SAME-BYTES-DIFFERENT-SPLIT'
         elif (not r.loads and t.loads and
@@ -989,7 +1004,16 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
                             sorted('%s:0x%x' % (tg, a) for tg, a in tb - rb),
                             mech or ''))
         if rwid != twid and rb != tb:
-            rel = SUPERSET if twid >= rwid else SUBSET
+            # Width 0 is the wire's address-only convention (format.rst
+            # 5.2), so the two sides state different KINDS of fact and
+            # neither contains the other.  Same rule, same checkable basis
+            # and same refusal route as the correct-path leg; stated once
+            # there.  It moves no verdict on this leg -- memv() already
+            # answers GEM5-LIMIT for a labelled row -- and is made here so
+            # the two instruments do not print different DIRECTIONS for one
+            # fact.
+            rel = (ORTHOGONAL if addr_only_same_line else
+                   (SUPERSET if twid >= rwid else SUBSET))
             rows.append(Row(guest, ex.seq, i, t.pc, 'memop-width', memv(rel),
                             '%dL/%dS bytes' % rwid, '%dL/%dS bytes' % twid,
                             mech or ''))

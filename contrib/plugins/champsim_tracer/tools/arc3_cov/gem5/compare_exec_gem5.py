@@ -60,7 +60,7 @@ from arc3_taxonomy import (set_relation, classify, render_crosstab,
                            render_conflicts, render_unaccounted, EQUAL,
                            SUBSET, SUPERSET, ORTHOGONAL, UNACCOUNTED)
 from axis_subjects import Subjects
-from gem5_rules import gem5_exec_rule
+from gem5_rules import gem5_exec_rule, addr_only_mechanism
 sys.path.insert(0, os.path.join(HERE, 'wp'))
 from x86_exec_rules import x86_exec_rule                        # noqa: E402
 
@@ -333,22 +333,29 @@ def _zero_block(r, t):
 
 
 def _ref_covers_same_line(r, t):
-    """The reference's accesses are ONE contiguous granule containing ours.
+    """The reference's contiguous granule containing ours, in bytes; else 0.
 
     The guard that keeps the address-only rules a measurement and not a
     blanket: a trace that named the wrong line fails containment, earns no
     label, and stays a defect.
+
+    Returns the SPAN rather than a bare true because the span is also what
+    separates the two address-only mechanisms -- gem5's decoder constant
+    from its modelled line -- see gem5_rules.addr_only_mechanism().  Zero
+    is falsy, so every boolean caller reads unchanged.
     """
     ra = [a for a, _d, _s in r.loads + r.stores]
     if not ra:
-        return False
+        return 0
     lo = min(ra)
     span = max(a + max(sz, 1) - lo for a, _d, sz in r.loads + r.stores)
     if span <= 0 or (span & (span - 1)) != 0:
-        return False
+        return 0
     if len(ra) != 1 and set(ra) != set(range(lo, lo + span)):
-        return False
-    return all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores)
+        return 0
+    if not all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores):
+        return 0
+    return span
 
 
 def split_regs(writes):
@@ -664,6 +671,15 @@ def compare_insn(r, t, isa, sub=None):
     rw = (sum(sz for _, _, sz in r.loads), sum(sz for _, _, sz in r.stores))
     tw = (sum(sz for _, _, sz in t.loads), sum(sz for _, _, sz in t.stores))
 
+    #: THE TRACE STATES AN ADDRESS AND NO EXTENT, AND THE REFERENCE'S OWN
+    #: ACCESSES CONTAIN IT -- as the reference's granule in bytes, or 0.
+    #: Both halves are measured on this pair and neither is read off a
+    #: mnemonic; the span is what the memop-width relation below consults
+    #: and what chooses between the two address-only mechanisms, so the
+    #: rule and the measurement move together.
+    ref_granule = _addr_only(t) and _ref_covers_same_line(r, t)
+    addr_only_same_line = bool(ref_granule)
+
     mech = None
     if isa == 'x86_64' and r.uops == 1 and '(unimplemented)' in r.disas \
             and not r.loads and not r.stores and (t.loads or t.stores):
@@ -684,15 +700,17 @@ def compare_insn(r, t, isa, sub=None):
         # own DCZID_EL0 defines.  Held to instructions the TRACE itself calls
         # cache operations, so an ordinary store cannot reach it.
         mech = 'DCZVA-BLOCK-IS-MACHINE-SIZE'
-    elif _addr_only(t) and _ref_covers_same_line(r, t):
+    elif addr_only_same_line:
         # Both name the same granule, and they disagree only on whether the
         # record carries the modelled cache's geometry.  WHICH of the two
-        # mechanisms is read off the trace's own write list: gem5's number
+        # mechanisms is decided by the REFERENCE'S OWN EXTENT: gem5's number
         # for a DC clean is its System::cacheLineSize(), while its number for
-        # a prefetch is a decoder constant (8).  See gem5_rules.
-        mech = ('MAINT-EXTENT-IS-CACHE-GEOMETRY'
-                if any(n == MAINT_DEST for n, _v, _w in t.writes)
-                else 'PREFETCH-SIZE-IS-REF-CHOICE')
+        # a prefetch is a decoder constant (8).  The trace's write list is
+        # kept as an independent positive route, and a row matching neither
+        # earns NO label.  gem5_rules.addr_only_mechanism carries the full
+        # statement, including why reading the write list alone stopped
+        # working on aarch64.
+        mech = addr_only_mechanism(ref_granule, t.writes, MAINT_DEST)
     elif rb == tb and rcnt != tcnt:
         # Byte-for-byte the same accesses, split into a different number of
         # requests.  Neither tool is wrong about what the instruction touched.
@@ -730,7 +748,30 @@ def compare_insn(r, t, isa, sub=None):
         rows.append(row._replace(ref=(len(rb),), trc=(len(tb),), label=mech))
 
     if rw != tw:
-        if tw[0] >= rw[0] and tw[1] >= rw[1]:
+        if addr_only_same_line:
+            # WIDTH 0 IS A DIFFERENT FACT CLASS, NOT A SMALLER NUMBER.
+            # docs/format.rst 5.2: a memop record whose size is 0 is the
+            # wire's statement that the record carries an ADDRESS and no
+            # extent -- the address-only convention, minted by
+            # record_synthetic_load and by nothing else.  On this axis the
+            # reference therefore states a number of bytes and the trace
+            # states that the extent is not the instruction's to state.
+            # Neither fact contains the other, which is what ORTHOGONAL
+            # means here; summing the two sides and comparing the totals
+            # orders an extent against the ABSENCE of one and reports the
+            # trace as having dropped a width it never claimed to carry.
+            #
+            # This is the measurement, not the label: the two halves of
+            # `addr_only_same_line` are computed from the two access lists
+            # above.  A trace whose address-only record named a line the
+            # reference does not cover fails `_ref_covers_same_line`, gets
+            # no label at all, and its width row stays TRACER-SUBSET -- so
+            # the rule cannot carry a wrong address, which is the only way
+            # this axis could hide a real loss.  The memop-count and
+            # memop-addr axes for the same instruction are untouched and
+            # still measure their own sets.
+            rel = ORTHOGONAL
+        elif tw[0] >= rw[0] and tw[1] >= rw[1]:
             rel = SUPERSET
         elif tw[0] <= rw[0] and tw[1] <= rw[1]:
             rel = SUBSET

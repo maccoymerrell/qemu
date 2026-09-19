@@ -325,3 +325,53 @@ GEM5_EXEC = {
 
 def gem5_exec_rule(label):
     return GEM5_EXEC.get(label) if label else None
+
+
+#: gem5's PRFM access size: a DECODER CONSTANT, not any geometry it models
+#: -- `LoadImm64("prfm", "PRFM64_IMM", size=8, flavor="mprefetch")`,
+#: src/arch/arm/isa/insts/ldr64.isa:428-430.  It is the number
+#: PREFETCH-SIZE-IS-REF-CHOICE's own text names, and it is what separates
+#: that rule's rows from MAINT-EXTENT-IS-CACHE-GEOMETRY's.
+REF_PREFETCH_EXTENT = 8
+
+
+def addr_only_mechanism(ref_extent, trc_writes, maint_dest='REG_SYSCACHE'):
+    """Which of the two address-only mechanisms this row is, or None.
+
+    THE SELECTOR USED TO READ A REGISTER THE WIRE NO LONGER PUBLISHES.  It
+    asked whether the trace's write list named @maint_dest and answered
+    MAINT-EXTENT-IS-CACHE-GEOMETRY if so and PREFETCH-SIZE-IS-REF-CHOICE
+    otherwise -- with no third answer.  The aarch64 `dc` family was then
+    RULED not to publish that register at all
+    (instruments/DEST_CLASSES.tsv, `a64-sys-cache-dst`: QEMU's handle_sys
+    DC arms write MEMORY through a helper and no cache register, so there
+    is nothing architectural for the wire to name).  From that ruling on,
+    the maintenance branch had no subject on aarch64 and every by-address
+    cache-maintenance row fell through to the prefetch rule, whose text
+    says gem5's number there is the decoder constant 8 -- while the
+    measured reference extent on those rows is 64, which is gem5's
+    System::cacheLineSize().  A green resting on a rule that is false of
+    the rows it covers is this project's named dominant defect class, so
+    the selector is decided by a fact that is PRESENT.
+
+    THE REFERENCE'S OWN EXTENT decides it, and each rule's own text names
+    the number it is claiming:
+
+      extent == 8                  the decoder constant -> the PREFETCH rule
+      extent a power of two >= 16  a cache LINE -> the MAINTENANCE rule
+      anything else                NEITHER, and the row is left unlabelled
+
+    @trc_writes is still consulted, as an independent POSITIVE route to the
+    maintenance rule for any ISA whose wire does name a cache register: a
+    trace that names it is stating the operation's class itself.  Nothing
+    here guesses -- a row that matches neither route earns no label and
+    stays in the criterion, which is the only reading that cannot launder
+    a mechanism nobody has checked.
+    """
+    if any(n == maint_dest for n, _v, _w in trc_writes):
+        return 'MAINT-EXTENT-IS-CACHE-GEOMETRY'
+    if ref_extent == REF_PREFETCH_EXTENT:
+        return 'PREFETCH-SIZE-IS-REF-CHOICE'
+    if ref_extent >= 16 and (ref_extent & (ref_extent - 1)) == 0:
+        return 'MAINT-EXTENT-IS-CACHE-GEOMETRY'
+    return None

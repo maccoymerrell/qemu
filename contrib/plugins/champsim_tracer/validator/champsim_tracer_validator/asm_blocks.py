@@ -3079,14 +3079,20 @@ class A64CacheMaintByVa(CodeBlock):
     cache-maintenance encoding appeared in none of them, so every byte
     of that class could have changed without a golden hash moving.
 
-    WHAT IT ASSERTS AND WHAT IT DELIBERATELY DOES NOT.  The opcode is
-    asserted, because that is the fact a consumer reads the class off.
-    No ExpectedMemOp is declared: the wire spells these as an
-    ADDRESS-ONLY access -- size 0, no value -- because the extent of an
+    WHAT IT ASSERTS AND IN WHAT SHAPE.  The opcode is asserted, because
+    that is the fact a consumer reads the class off.  FOUR ExpectedMemOps
+    are declared, one per operation, and each is declared ADDRESS-ONLY --
+    `ExpectedMemOp("load", slot, 0, 0)`, width 0 and datum 0 -- which is
+    the shape the wire spells these in, because the extent of an
     operation on a LINE belongs to the cache being modelled and not to
-    the instruction, and an ExpectedMemOp names a width and a datum
-    neither side has.  The address itself is still on the wire and the
-    net's byte identity covers it.
+    the instruction.  Width 0 is a value the suite understands rather
+    than an omission: validator.py's data-width check reads it as "a
+    synthetic address-only memop (prefetch, cache-flush, TLB-flush) with
+    no real access and so no architectural width", and flags a width-0
+    slot that carries a nonzero datum.  So the count and the place are
+    asserted here; only the width and the datum are deliberately not,
+    because neither side has one.  The address itself is on the wire and
+    the net's byte identity covers it.
 
     x20 already holds the arena base after _load_base, so the four
     operations act on a mapped, writable line the program owns.  They

@@ -691,22 +691,55 @@ for _a in sys.argv[1:]:
         sys.exit('usage: compare_attrib.py [--falsify=MODE:MNEM] [--seed-only]')
 TRACER_BATCH = reprobe_or_refuse(D, _falsify)
 
+# THE TRACER ARM'S COLUMNS ARE THE PRODUCER'S, AND THEY MOVED (finding 247-B).
+#
+# This reader asked for `hex f_ok b_ok b_mnem f_opcode f_src f_dst f_loads
+# f_stores` and died on `KeyError: 'b_ok'`.  Its producer is
+# reprobe_or_refuse() -> sled_fields.py, whose FIELDS are `hex f_ok f_opcode
+# f_branch f_src f_dst f_ident`; `b_ok` and `b_mnem` were the SECOND DECODER's
+# columns, carried by the retired `isaxcheck --layer=fields --batch` binary,
+# and `f_loads` / `f_stores` were its memop counts.  Asking the tracer arm for
+# a second decoder's verdict is the same defect the aarch64, riscv64 and mipsel
+# legs each hit and fixed; riscv64/compare.py is the pattern followed here --
+# it reads f_ok, f_opcode, f_src, f_dst and nothing else.
+#
+# NOTHING IS LOST BY THE PORT, and that is checked rather than asserted: of the
+# five retired keys, `b_ok`, `b_mnem`, `loads` and `stores` had NO reader
+# anywhere in this file -- they were built into every row and never consulted.
+# The second decoder this leg actually scores against is xl3 (XED + LLVM MC),
+# read from REF, and it is untouched.  So the comparison is the one it always
+# was; only the columns it asks its own arm for have changed.
+#
+# f_ident IS READ, and it is new information rather than a replacement: the
+# producer distinguishes an encoding QEMU built no chain for (`unreached`)
+# from one whose seating REFUSED (`refused:<why>`), and f_ok is 0 for both.
+# Collapsing them would report a refusal as a decoder that produced no
+# registers.  The rows below carry it so an UNPROBED row can name which.
+_TR_NEED = ('hex', 'f_ok', 'f_opcode', 'f_src', 'f_dst', 'f_ident')
 TR = {}
 with open(TRACER_BATCH) as f:
     cols = next(f).rstrip('\n').split('\t')
     ix = {c: i for i, c in enumerate(cols)}
+    # A column this reader needs and the producer does not emit is the failure
+    # this block exists for, and it is named here rather than raised as a
+    # KeyError two hundred lines into the first row.
+    _miss = [c for c in _TR_NEED if c not in ix]
+    if _miss:
+        sys.exit('TRACER ARM SCHEMA MISMATCH: %s carries columns %s and this '
+                 'leg needs %s.  The producer (sled_fields.py) and this '
+                 'consumer have diverged; port the consumer rather than '
+                 'scoring whatever columns happen to line up.'
+                 % (TRACER_BATCH, ' '.join(cols), ' '.join(_miss)))
     for line in f:
         p = line.rstrip('\n').split('\t')
         if len(p) < len(cols):
             continue
         TR[p[ix['hex']]] = dict(
             ok=(p[ix['f_ok']] == '1'),
-            b_ok=(p[ix['b_ok']] == '1'),
-            b_mnem=p[ix['b_mnem']],
             opcode=p[ix['f_opcode']],
             src=parse_set(p[ix['f_src']]),
             dst=parse_set(p[ix['f_dst']]),
-            loads=int(p[ix['f_loads']]), stores=int(p[ix['f_stores']]))
+            ident=p[ix['f_ident']])
 
 META = {}
 with open(os.path.join(COV, 'opcodes_meta.tsv')) as f:
@@ -994,10 +1027,20 @@ for opid, mnem, enc_hex, srctab in opcodes:
                          'sled-terminator-collision', 'NOT-COMPARED',
                          'NOT-COMPARED', 'leg-coverage', '0'))
             continue
+        # WHY THE ARM HAS NO LIST IS PART OF THE ROW.  f_ok is 0 for three
+        # different facts and the producer distinguishes them in f_ident:
+        # `unreached` (the sled placed the encoding and QEMU built no chain
+        # for it), `refused:<why>` (a chain existed and the seating declined
+        # to publish a list, which is a REFUSAL and not an empty set), and an
+        # encoding with no row in the capture at all.  All three are UNPROBED
+        # and all three are counted here, but a reader must be able to tell a
+        # refusal from a decode gap without re-deriving the corpus.
+        _why = ('no row in the capture at all' if t is None
+                else 'f_ident=%s' % (t['ident'] or '(empty)'))
         unprobed_by_reach[('tracer_decode_fail', reach)] += 1
         rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'UNPROBED',
-                     'tracer: decoder does not decode these bytes '
-                     '(no InsnFields produced)', '', '', '', '', 'na',
+                     'tracer: no seated register list for these bytes (%s)'
+                     % _why, '', '', '', '', 'na',
                      'tracer-decode-gap', 'NOT-COMPARED', 'NOT-COMPARED',
                      'tracer-defect', '0'))
         continue
@@ -1319,10 +1362,15 @@ if len(reach_conflicts) > 12:
     w('      ... and %d more' % (len(reach_conflicts) - 12))
 w('')
 w('MEMOP ATTRIBUTION  (count / address / data for every load and store) is')
-w('HALF the deliverable and this harness does not measure any of it: the')
-w('tracer arm reads f_loads / f_stores and the reference arm carries XED\'s')
-w('memop column, and neither is compared.  Reported as a hole, not implied')
-w('to be covered by the register numbers above.')
+w('HALF the deliverable and this harness does not measure any of it.  The')
+w('hole is now WIDER than the sentence that used to stand here claimed: that')
+w('sentence said "the tracer arm reads f_loads / f_stores", and it does not')
+w('-- the arm is sled_fields.py, whose columns are hex / f_ok / f_opcode /')
+w('f_branch / f_src / f_dst / f_ident, with no memop counts in them at all.')
+w('So this leg has NO tracer-side memop number to compare, not merely an')
+w('uncompared one; the reference arm still carries XED\'s memop column.')
+w('Reported as a hole, not implied to be covered by the register numbers')
+w('above.  mipsel/memop_presence.py is the leg that measures presence.')
 w('')
 w('MECHANISM ROLL-UP  (every disagreement charged to exactly one cause;')
 w('these sum to the %d disagreements above)' % n_dis)
@@ -1432,32 +1480,29 @@ for e, v in ext_dis.most_common(25):
     w('  %-22s %5d / %5d in the denominator' % (e, v, ext_tot[e]))
 
 w('')
-w('ROOT CAUSE OF M1/M1b/M1c/M2 (the EVEX mask classes, %d rows)'
-  % sum(v for m, v in mech_count.items() if m.startswith('M1') or m.startswith('M2')))
-w('The tracer\'s operand walker contributes a register by its ACCESS FLAG.')
-w('Capstone 6.0-Alpha7 hands over the EVEX mask operand with access == 0 --')
-w('neither read nor write -- so the walker drops it and the mask never')
-w('reaches InsnFields.  isaxcheck reports that condition as b_unkreg.')
-w('Correlation over this sweep:')
+_maskrows = sum(v for m, v in mech_count.items()
+                if m.startswith('M1') or m.startswith('M2'))
 mrows = [r for r in rows if r[6] == 'DISAGREE' and 'REG_PRED' in r[7]]
-arows = [r for r in rows if r[6] == 'AGREE']
-unk = {}
-with open(TRACER_BATCH) as f:
-    c2 = next(f).rstrip('\n').split('\t'); j = {c: i for i, c in enumerate(c2)}
-    for line in f:
-        q = line.rstrip('\n').split('\t')
-        if len(q) >= len(c2):
-            unk[q[j['hex']]] = q[j['b_unkreg']]
-mu = collections.Counter(unk.get(r[4]) for r in mrows)
-au = collections.Counter(unk.get(r[4]) for r in arows)
-w('  mask-loss rows with a Capstone access==0 REG operand : %d / %d'
-  % (mu['1'], len(mrows)))
-w('  agreeing rows with a Capstone access==0 REG operand  : %d / %d'
-  % (au['1'], len(arows)))
-w('This is an upstream Capstone defect of the same family as the PEXTR and')
-w('MSA access-flag bugs already worked around at the boundary in')
-w('disas/capstone.c.  Under R8 the fix belongs on the fork, at that same')
-w('boundary; it is NOT a tracer limitation to be documented away.')
+w('M1/M1b/M1c/M2 -- THE EVEX MASK CLASSES (%d rows; %d carry REG_PRED)'
+  % (_maskrows, len(mrows)))
+w('THE CAUSE THAT USED TO BE PRINTED HERE IS RETRACTED, NOT RE-STATED.  This')
+w('paragraph said the tracer\'s operand walker drops the EVEX mask because')
+w('Capstone 6.0-Alpha7 hands it over with access == 0, and it printed a')
+w('correlation against `b_unkreg`, the column in which isaxcheck reported')
+w('that condition.  Neither half survives: the operand walk is gone, the')
+w('tracer arm is QEMU\'s own translation-time statements read out of a')
+w('capture (sled_fields.py), and there is no b_unkreg column in it -- the')
+w('leg died here with a KeyError rather than print a number, which is the')
+w('correct failure.  Re-printing the correlation is impossible and asserting')
+w('the cause without it would be a claim about a decoder that no longer')
+w('participates.')
+w('')
+w('SO THE CLASS IS STATED AND NOT ATTRIBUTED.  What is true at this tip is')
+w('only the count above: these rows are where the reference names a mask')
+w('register (k0-k7) that the wire\'s lists do not, or places it differently.')
+w('Attributing them needs a fresh read of what QEMU states at the EVEX')
+w('decode site, on this corpus, and that is not done here.  It is a NAMED')
+w('HOLE in this report, not a mechanism with a cause behind it.')
 w('')
 w('LOSSY POINTS IN THE TRACER VOCABULARY ITSELF (independent of any sweep')
 w('row above): distinct architectural registers sharing one GenericRegId.')

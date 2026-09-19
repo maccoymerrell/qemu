@@ -84,6 +84,8 @@ class QemuFacts(object):
         # feature argument may exclude them.  ENDBR64 is the case that caught
         # this: CET has no CPUID bit in cpu.c, and f3 0f 1e fa runs anyway.
         self.hint_nops = self._hint_nops()
+        # 0F escape opcodes whose decode-table entry carries chk(cpl0).
+        self.cpl0_0f = self._cpl0_0f()
 
     def _read(self, rel):
         p = os.path.join(self.root, rel)
@@ -146,6 +148,44 @@ class QemuFacts(object):
             return None
         c = re.search(r'if \(\(s->prefix & PREFIX_REPZ\).*?\{', body, re.S)
         return c.group(0) if c else None
+
+    def _cpl0_0f(self):
+        """-> {second opcode byte} for 0F entries carrying chk(...cpl0...).
+
+        READ FROM THE TABLE, NOT LISTED HERE.  The set at this tip is
+        06 07 20 21 22 23 30 32 35 -- CLTS, SYSRET, MOV to/from CR and DR,
+        WRMSR, RDMSR, SYSEXIT -- and it is parsed so that an entry gaining or
+        losing the check moves this set with it instead of leaving a
+        transcribed list behind.
+
+        The check is enforced in the same file:
+
+            if (decode.e.check & X86_CHECK_cpl0) {
+                if (CPL(s) != 0) {
+                    goto gp_fault;
+                }
+            }
+
+        so on any guest running at CPL != 0 these encodings raise #GP at
+        translation and never become an executed instruction.
+        """
+        i = self.decode.index('X86OpEntry opcodes_0F[256]')
+        t = self.decode[i:self.decode.index('\n};', i)]
+        out = set()
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-f]{2})\] = X86_OP_\w+\((.*)', line)
+            if not m:
+                continue
+            rest = m.group(2)
+            if re.search(r'chk\d?\([^)]*\bcpl0\b[^)]*\)', rest):
+                out.add(m.group(1)[2:])
+        return out
+
+    def cpl0_enforced(self):
+        """-> True while X86_CHECK_cpl0 still faults a CPL != 0 guest."""
+        return bool(re.search(
+            r'decode\.e\.check & X86_CHECK_cpl0\s*\)\s*\{\s*'
+            r'if \(CPL\(s\) != 0\)\s*\{\s*goto gp_fault;', self.decode, re.S))
 
     def _hint_nops(self):
         i = self.decode.index('X86OpEntry opcodes_0F[256]')
@@ -411,6 +451,13 @@ _CITE = {
             '[(w << 3) | reg] straight into the hole.  The undocumented '
             'TEST alias real silicon executes as /0 is not in this '
             'decoder at all',
+    'cpl0': '%s -- the 0F entry for this opcode carries chk(...cpl0...), and '
+            'the same file enforces it: `if (decode.e.check & '
+            'X86_CHECK_cpl0) { if (CPL(s) != 0) { goto gp_fault; } }`.  The '
+            'set parsed out of opcodes_0F at this tip is %s.  qemu-user '
+            'x86_64 runs every guest instruction at CPL 3, so on THIS leg\'s '
+            'execution model the check faults before any chain exists and '
+            'there are no register lists to carry',
     'ud': '%s -- [0x0b] = X86_OP_ENTRY0(UD) (UD2), [0xb9] and [0xff] = '
           'X86_OP_ENTRYr(UD, ...) (UD1, UD0); gen_UD() in '
           'target/i386/tcg/emit.c.inc is gen_illegal_opcode().  QEMU decodes '
@@ -512,6 +559,29 @@ def classify(hexs, ext, isa_set, root=None):
     if op == '0f' and i + 1 < len(b) and b[i + 1] in f.hint_nops:
         return None
 
+    # CPL0-ONLY INSTRUCTIONS.  The module header has said since it was written
+    # that "for a CPL0-only opcode SIGILL at CPL3 says privilege, not
+    # unimplemented", and until now it had no mechanism for that -- so SYSRET
+    # (`0f07`) reached the report as an UNREACHABLE ROW WITH NO QEMU CITATION
+    # and stopped it, which is the instrument working: the answer owed was a
+    # mechanism, and this is it.
+    #
+    # THE REMEDY IS DELIBERATELY NOT "another accelerator".  These rows are
+    # out of scope for THIS LEG's execution model and not for QEMU TCG: a
+    # qemu-system-x86_64 guest at CPL 0 runs them, and that is an ordinary
+    # kernel doing ordinary work.  Saying so is the difference between a
+    # boundary and an excuse.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.cpl0_0f:
+        return Scope('CPL0-ONLY-AND-THIS-LEG-RUNS-AT-CPL3',
+                     _CITE['cpl0'] % (_DECODE, ' '.join(sorted(f.cpl0_0f))),
+                     'a guest at CPL 0 -- qemu-system-x86_64 in long mode, '
+                     'which this leg does NOT use for its register '
+                     'comparison.  The leg does probe CPL 0 separately '
+                     '(sysprobe_run.sh -> cpl0.tsv records the exception '
+                     'vector there), so whether a given row would run at CPL 0 '
+                     'is a measured question with its own answer; read that '
+                     'file rather than assuming this row would')
+
     if isa_set.startswith('APX_') or ext.startswith('APX'):
         return Scope('QEMU-MODELS-NO-SUCH-FEATURE',
                      _CITE['noname'] % (_CPU_C, 'APX_F',
@@ -583,6 +653,22 @@ def selfcheck(root=None):
         bad.append("0F 1E's RDSSP arm is no longer `X86_OP_ENTRYw(RDSSP, R,y, "
                    'p_f3)` under a REPZ test in decode_0F1E: the hint-NOP '
                    'citation is written against a decoder that has moved')
+    # THE CPL0 CITATION HAS TWO HALVES AND BOTH ARE ASSERTED.  The entries
+    # must still carry the check, and the check must still fault a CPL != 0
+    # guest; either one moving makes the exclusion stale in a different way,
+    # and a parse that finds nothing is broken rather than permissive.
+    if not f.cpl0_0f:
+        bad.append('no 0F entry in %s parses as carrying chk(...cpl0...): the '
+                   'CPL0-ONLY parse is broken, not the decoder, and every row '
+                   'it excused is unjustified' % _DECODE)
+    elif '07' not in f.cpl0_0f or '30' not in f.cpl0_0f:
+        bad.append('SYSRET (0F 07) or WRMSR (0F 30) no longer reads as a '
+                   'cpl0-checked entry in %s: the CPL0-ONLY citation is '
+                   'written against a decoder that has moved' % _DECODE)
+    if not f.cpl0_enforced():
+        bad.append('X86_CHECK_cpl0 no longer faults a CPL != 0 guest in %s: '
+                   'the CPL0-ONLY exclusion rests on that fault and is stale'
+                   % _DECODE)
     for must in ('AVX2', 'BMI1', 'SHA_NI', 'CMPCCXADD'):
         if must not in f.decoder_feats:
             bad.append('X86_FEAT_%s missing from the parsed decoder '

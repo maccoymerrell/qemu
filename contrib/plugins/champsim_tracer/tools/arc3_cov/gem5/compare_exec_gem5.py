@@ -316,13 +316,40 @@ def _zero_block(r, t):
     """A zero-block write both sides performed, at two block sizes.
 
     Store-only on both sides, each a contiguous power-of-two run aligned to
-    its own size, one containing the other, and the TRACE calling the
-    instruction a cache operation.  The containment is what makes it a
-    measurement: a trace that zeroed a different block fails it.
+    its own size, and one containing the other.  The containment is what makes
+    it a measurement: a trace that zeroed a different block fails it.
+
+    THE GATE USED TO BE A REGISTER THE WIRE NO LONGER PUBLISHES -- the same
+    dead predicate `addr_only_mechanism` was repaired for at exec249, left
+    standing here.  It required the trace's write list to name @MAINT_DEST,
+    and instruments/DEST_CLASSES.tsv row `a64-sys-cache-dst` RULED that the
+    aarch64 cache-operation family does not publish that register at all
+    (QEMU's handle_sys arms write MEMORY through a helper and no cache
+    register).  From that ruling on the branch had no subject on this ISA, so
+    every `dc zva' row fell through with NO LABEL and sat in the criterion as
+    UNACCOUNTED -- a rule that exists, is true of the rows, and could not
+    reach them.  MEASURED, exec250 gem5cp/aarch64 `dc zva, x21' at 0x4000cc:
+    memop-count ref (0L,1S) against trc (0L,32S), memop-width ref 64 bytes
+    against trc 512, all three axes NO-LABEL.
+
+    SO THE SHAPE DECIDES, AND IT IS ENTIRELY PRESENT: store-only both sides,
+    each run contiguous, a power of two, aligned to its own size, and one
+    block inside the other.  That is a zero-block write at two DCZID_EL0
+    sizes and nothing else produces it -- an ordinary store is one access of
+    a non-block size and fails `_contig_pow2` or the containment.  The two
+    numbers are both real machines': QEMU's user-mode `-cpu max' sets
+    dcz_blocksize = 7, 512 bytes (target/arm/tcg/cpu64.c, the CONFIG_USER_ONLY
+    arm), and helper_dc_zva zeroes `4 << dcz_blocksize' bytes; gem5's ARM
+    model uses its own 64.  Neither side dropped a fact.
+
+    THE WRITE LIST IS NOT CONSULTED HERE AT ALL any more.  Keeping it as an
+    additional route would add nothing -- every route would still have to pass
+    the containment below, so the register name could only ever narrow -- and
+    keeping it as a precondition is the defect.  A row that fails the shape
+    earns NO label and stays in the criterion, which is the only reading that
+    cannot launder a block nobody checked.
     """
     if r.loads or t.loads or not r.stores or not t.stores:
-        return False
-    if not any(n == MAINT_DEST for n, _v, _w in t.writes):
         return False
     rb, tb = _contig_pow2(r.stores), _contig_pow2(t.stores)
     if rb is None or tb is None or rb == tb:

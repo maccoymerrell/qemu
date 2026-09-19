@@ -586,11 +586,15 @@ def derive_read_list(isa, gen_path, ident_path, out_tsv, out_mech):
     identity row keeps its row and spells the rule `-`, because dropping it
     would under-report the read list the wire genuinely publishes.
 
-    THE TWO OUTPUT FILES CARRY THE SAME ENCODINGS, ROW FOR ROW.  The caller
-    asserts that, and the assertion is only worth anything if it is not made
-    true by construction from one side; both are built from the same q/r key
-    set, and an encoding present in one and not the other is impossible here
-    for the same reason it was impossible before -- one run, one loop.
+    @out_mech IS NOW ALWAYS None (FINDING 250-C).  The mechanism corpus has a
+    writer again -- cst_capture_mech(), in the emulator -- so deriving a
+    three-column stand-in here would overwrite the twenty-six-column corpus
+    the same run captured.  The parameter is kept so the call site still says
+    out loud which file this function is NOT writing, and the caller's
+    row-for-row assertion is now a check ACROSS two producers rather than a
+    property of one: both write one row per distinct encoding from the same
+    loop over the same translations, so a shortfall on either side is a
+    dropped row and not a difference in what was asked.
     """
     gstamp, grows = _read_corpus(gen_path, 7)
     istamp, irows = _read_corpus(ident_path, 7)
@@ -789,6 +793,20 @@ def main():
         env["CST_GEN_SET_DUMP"] = gtsv
         env["CST_QEMU_IDENT_PAIRS"] = itsv
         mtsv = img + ".mech.tsv"
+        #
+        # AND THE MECHANISM CORPUS IS ASKED FOR AGAIN (FINDING 250-C).
+        #
+        # The paragraph above is still true of CST_SRC_ENC_DUMP and is no
+        # longer true of CST_SRC_MECH_DUMP: cst_capture_mech() writes it, from
+        # the one site where QEMU's stated write list and the wire's published
+        # one both exist.  So the file is the EMULATOR's twenty-six-column
+        # write-state corpus -- the one the capacity census, both bars and the
+        # arm-delta/landed checks read -- rather than the three-column
+        # derivation this script used to write under the same name while the
+        # census refused at every tip.
+        #
+        if a.mech:
+            env["CST_SRC_MECH_DUMP"] = mtsv
         env["CST_SLED"] = "%x:%d:%d" % (base, stride, n)
         log = img + ".log"
         with open(log, "w") as lf:
@@ -801,7 +819,10 @@ def main():
                      img + ".t.unknown_warnings.log"):
             if os.path.exists(junk):
                 os.remove(junk)
-        derive_read_list(a.isa, gtsv, itsv, tsv, mtsv if a.mech else None)
+        # THE MECHANISM FILE IS NO LONGER DERIVED HERE (FINDING 250-C): the
+        # emulator writes it, so passing a path would overwrite a corpus this
+        # run captured with a three-column summary of a different question.
+        derive_read_list(a.isa, gtsv, itsv, tsv, None)
         logtext = open(log).read()
         m = _SLED_STATS_RE.search(logtext)
         if not m:
@@ -1166,15 +1187,31 @@ def main():
                             mhdr = mhdr or line
                         continue
                     c = line.rstrip("\n").split("\t")
-                    # THREE COLUMNS, BECAUSE THE CORPUS HAS THREE (244-H).
-                    # This guard read `len(c) < 4` against a corpus whose own
-                    # header declares `#isa encoding mech`, so it discarded
-                    # EVERY row and the merged mechanism corpus could only
-                    # ever be a header.  Nothing noticed, because the only
-                    # consumer -- ident_capture.sh -- tested the file for
-                    # non-emptiness and for a `#so` line, both of which a
-                    # header-only file passes.
-                    if len(c) < 3 or c[1] not in wanted:
+                    # THE WIDTH IS THE HEADER'S, NOT A CONSTANT (250-C).
+                    #
+                    # This guard was a literal: `len(c) < 4` while the corpus
+                    # had three columns, so it discarded EVERY row and the
+                    # merged file could only ever be a header -- and nothing
+                    # noticed, because ident_capture.sh tested only for
+                    # non-emptiness and a `#so` line, both of which a
+                    # header-only file passes.  Correcting the literal to 3
+                    # fixed that instance and left the shape: the corpus is
+                    # the emulator's twenty-six-column one now, and a literal
+                    # would be wrong again.  So the width comes from the
+                    # header this file carries, and a row narrower than its
+                    # own header is a TRUNCATED row, which is the one shape a
+                    # reader cannot tell from a complete one.
+                    need = len(mhdr.lstrip('#').rstrip('\n').split('\t')) \
+                        if mhdr else 3
+                    if len(c) < need:
+                        raise SystemExit(
+                            "srcenc_sled: %s carries a row with %d field(s) "
+                            "under a %d-column header -- REFUSING.  A "
+                            "truncated row still PARSES, as a row whose "
+                            "payload columns are empty, so a consumer would "
+                            "score that encoding on an absence and report no "
+                            "error at all." % (t, len(c), need))
+                    if c[1] not in wanted:
                         continue
                     prev = mseen.get(c[1])
                     if prev is None:

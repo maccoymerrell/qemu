@@ -257,8 +257,32 @@ void corpora_init()
                                 "#isa\tencoding\tmnem\tsrc\n");
         corpus_opc = new Corpus("CST_OPC_ENC_DUMP",
                                 "#isa\tencoding\tmnem\topcode\n");
-        corpus_mech = new Corpus("CST_SRC_MECH_DUMP",
-                                 "#isa\tencoding\tmech\n");
+        /*
+         * THE WRITE-STATE CORPUS, AND WHY ITS HEADER IS TWENTY-SIX COLUMNS
+         * (FINDING 250-C).
+         *
+         * Two different files have carried the name `corpus_mech_<isa>.tsv`.
+         * The one eight instruments in tools/arc3_cov/instruments read -- the
+         * capacity census, both bars, the arm-delta and landed checks -- has
+         * the columns below, and its subject is the WRITE-LIST EXTRACTION: did
+         * QEMU finish stating this encoding's writes, and does the row that
+         * carries the unfinished marker also claim a complete publish.  The
+         * other was a three-column derivation `srcenc_sled.py` wrote from
+         * CST_QEMU_IDENT_PAIRS when this corpus had no producer at all.
+         *
+         * It had no producer because this Corpus object was constructed and
+         * never written: the environment variable was read, the file was
+         * opened on first use, and no call site reached first use.  So the
+         * census refused at every tip, correctly -- and a refusal that stands
+         * for a year is a measurement nobody takes.  cst_capture_mech() below
+         * is the writer, and it fills every column from a fact this emulator
+         * states rather than from a second derivation.
+         */
+        corpus_mech = new Corpus(
+            "CST_SRC_MECH_DUMP",
+            "#isa\tencoding\tmnem\tdecode_id\trule\tsrc_state\twstate"
+            "\tPUB\tQN\tSURV\tRD\tSTATUS\tRDX\tCONT\tXLAT\tWR\tPUBD\tWSTQ"
+            "\tOPC\tBR\tCFLAGS\tREFINE\tLANEK\tLANEP\tWRU\tIDK\n");
         corpus_vec = new Corpus(
             "CST_VEC_ENV_DUMP",
             "#isa\tencoding\tvecops\tdropped\tbounded\tunbounded\n");
@@ -922,6 +946,394 @@ void emit_gen_set_ids(const char *isa, const char *enc, char side, char dir,
     emit_gen_set(isa, enc, side, dir, labels, nregs, n);
 }
 
+/* ---------------------------------------------------------------------
+ * THE PER-ENCODING WRITE-STATE CORPUS.  FINDING 250-C's writer.
+ *
+ * ONE ROW PER DISTINCT ENCODING, and every column is a fact this run STATES
+ * rather than one it re-derives.  The census over this corpus asks a single
+ * safety question -- a row whose extraction was incomplete must SAY SO, and
+ * must not also claim a complete publish -- so the two states that answer it
+ * are taken from two different places on purpose:
+ *
+ *   WSTQ   QEMU's own verdict on the WRITE LIST, read from the dataflow
+ *          status's `incomplete` word.  QEMU_PLUGIN_DF_INC_WRITES is
+ *          literally "more writes than slots", which is the capacity this
+ *          census is named for.
+ *   wstate the SEATING's verdict, which is a different question: whether the
+ *          wire published a destination list at all.  A reader scoring WR
+ *          against PUBD has to tell "QEMU stated no writes" from "the
+ *          extraction refused", and one column cannot.
+ *
+ * WHAT THIS TIP CAN AND CANNOT SAY, written down rather than papered over.
+ * The seating at this tip refuses an instruction WHOLE (QdepRefusal has five
+ * values and no per-destination reason), so `src_state` and `wstate` carry
+ * the same verdict for a refusal -- they are not two independent readings
+ * here, and a future per-side refusal would separate them without moving the
+ * column layout.  Three columns name a fact the dataflow ABI does not expose
+ * at this tip and say so in their own value rather than printing a plausible
+ * zero: XLAT's `noret=?` (no no-return call count), REFINE's `-` (the
+ * mnemonic refiners are the offline referee's, not this process's), and
+ * `mnem`'s `-` (no second decoder runs here -- the same `-` the identity
+ * corpus writes, and the referee fills it from these same bytes).
+ * `decode_id` is a digest OF THE RULE NAME: this ABI exposes
+ * qemu_plugin_insn_decode_name() and no numeric id, so the column is a
+ * stable key derived from the name it prints beside, not a number QEMU
+ * assigned.
+ */
+
+/* FNV-1a over the rule name.  A key, not an identity -- see above. */
+uint32_t rule_digest(const char *s)
+{
+    uint32_t h = 2166136261u;
+
+    for (; s && *s; s++) {
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    }
+    return h;
+}
+
+/* A generic-id list as the wire publishes one; "-" when the list is empty.
+ * An empty list and a refused one are told apart by the state columns, never
+ * by this one, which is why the states are on the row. */
+void reglist_generic(char *out, size_t sz, const uint8_t *regs, unsigned n)
+{
+    size_t k = 0;
+
+    out[0] = '\0';
+    for (unsigned i = 0; i < n; i++) {
+        int w = snprintf(out + k, sz - k, "%s%s", k ? "," : "",
+                         generic_reg_name_or_unknown(regs[i]));
+
+        if (w < 0 || (size_t)w >= sz - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+    if (!k) {
+        snprintf(out, sz, "-");
+    }
+}
+
+/*
+ * A provenance bitmap's members, spelled either way.
+ *
+ * @generic puts each member through the wire's register map, which is what
+ * makes QN and WR comparable with PUB and PUBD; false spells it as QEMU does,
+ * which is what RD is for.  Returns the TOTAL member count so a row whose
+ * members overflowed the label cap says so instead of reading short.
+ */
+unsigned prov_labels(const uint64_t *set, unsigned nwords, bool generic,
+                     char labels[][40], unsigned cap, unsigned *nlab)
+{
+    unsigned n = 0, total = 0;
+
+    for (unsigned w = 0; w < nwords; w++) {
+        uint64_t word = set[w];
+
+        while (word) {
+            unsigned b = (unsigned)__builtin_ctzll(word);
+
+            word &= word - 1;
+            total++;
+            if (n < cap) {
+                if (generic) {
+                    gen_bit_label(w * 64 + b, labels[n], sizeof(labels[n]));
+                } else {
+                    prov_bit_label(w * 64 + b, labels[n], sizeof(labels[n]));
+                }
+                n++;
+            }
+        }
+    }
+    qsort(labels, n, sizeof(labels[0]), label_cmp);
+    *nlab = n;
+    return total;
+}
+
+/* Join @n labels, deduplicated (the list is sorted), "-" when empty. */
+void labels_join(char *out, size_t sz, char labels[][40], unsigned n,
+                 unsigned total)
+{
+    size_t k = 0;
+
+    out[0] = '\0';
+    for (unsigned i = 0; i < n; i++) {
+        if (i && !strcmp(labels[i], labels[i - 1])) {
+            continue;
+        }
+        int w = snprintf(out + k, sz - k, "%s%s", k ? "," : "", labels[i]);
+
+        if (w < 0 || (size_t)w >= sz - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+    if (total > n && k < sz - 7) {
+        k += (size_t)snprintf(out + k, sz - k, ",+MORE");
+    }
+    if (!k) {
+        snprintf(out, sz, "-");
+    }
+}
+
+/*
+ * The SURVIVORS: members QEMU stated that the wire's published list does not
+ * carry.  It is the whole reason PUB and QN sit on one row -- the difference
+ * between what the emulator said and what the trace carries IS the
+ * measurement, and a corpus with only one of the two can report neither
+ * direction.
+ */
+void survivor_join(char *out, size_t sz, char labels[][40], unsigned n,
+                   const uint8_t *regs, unsigned nregs)
+{
+    size_t k = 0;
+
+    out[0] = '\0';
+    for (unsigned i = 0; i < n; i++) {
+        bool carried = false;
+
+        if (i && !strcmp(labels[i], labels[i - 1])) {
+            continue;
+        }
+        for (unsigned r = 0; r < nregs; r++) {
+            if (!strcmp(labels[i], generic_reg_name_or_unknown(regs[r]))) {
+                carried = true;
+                break;
+            }
+        }
+        if (carried) {
+            continue;
+        }
+        int w = snprintf(out + k, sz - k, "%s%s", k ? "," : "", labels[i]);
+
+        if (w < 0 || (size_t)w >= sz - k) {
+            break;
+        }
+        k += (size_t)w;
+    }
+    if (!k) {
+        snprintf(out, sz, "-");
+    }
+}
+
+/* Encodings that already have a mechanism row. */
+GHashTable *seen_mech;
+
+/* The one state under which QEMU has stated a thing whole.  Spelled exactly
+ * as every banked corpus and every instrument in tools/arc3_cov spells it:
+ * the string IS the join key those readers compare against. */
+const char *const MECH_OK = "PUBLISHED from QEMU's emitters";
+
+void mech_row(const struct qemu_plugin_tb *tb, size_t idx, const char *enc,
+              const struct InsnFields *f, int refusal)
+{
+    FILE *o = corpus_mech->get();
+
+    if (!o || !tb || !f) {
+        return;
+    }
+    if (seen_mech == nullptr) {
+        seen_mech = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                          g_free, nullptr);
+    }
+    if (!g_hash_table_add(seen_mech, g_strdup(enc))) {
+        return;                 /* already written; one row per encoding */
+    }
+
+    /* QEMU's decode rule, and the identity digest taken from it. */
+    const char *rule = qemu_plugin_insn_undecoded(tb, idx)
+                     ? "#undecoded" : qemu_plugin_insn_decode_name(tb, idx);
+
+    if (!rule) {
+        rule = "-";
+    }
+
+    /*
+     * THE EXTRACTION'S OWN VERDICT.  A status the ABI cannot answer is
+     * ABANDONED -- not a zero-filled row, which would read as a complete
+     * extraction that stated nothing.
+     */
+    qemu_plugin_dataflow_status st = { };
+    bool have_st;
+
+    st.struct_size = sizeof(st);
+    have_st = qemu_plugin_insn_dataflow_status(tb, idx, &st);
+
+    const char *wstq;
+    const char *src_state;
+
+    if (!have_st) {
+        wstq = "ABANDONED: the (tb, idx) pair names no dataflow status";
+        src_state = wstq;
+    } else if (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES) {
+        wstq = "LOWER BOUND: extraction incomplete, "
+               "QEMU's write list taken anyway";
+        src_state = "LOWER BOUND: extraction incomplete, "
+                    "QEMU's read list taken anyway";
+    } else if (st.incomplete) {
+        /* A different capacity ran out -- env ranges, memop rows, or the
+         * decode site's own refusal.  The WRITE list is whole, so it is not
+         * a lower bound; STATUS carries which one it was. */
+        wstq = MECH_OK;
+        src_state = MECH_OK;
+    } else {
+        wstq = MECH_OK;
+        src_state = MECH_OK;
+    }
+
+    /* The seating's verdict.  Its five values are QdepRefusal's, spelled. */
+    static const char *const seat_why[] = {
+        MECH_OK,
+        "refused: the bytes reached no decode rule",
+        "refused: QEMU could not record the instruction whole",
+        "refused: the rule's generic word is not in this vocabulary",
+        "refused: the (tb, idx) pair names no readable dataflow status",
+        "refused: the seating was not run for this instruction",
+    };
+    unsigned rk = (unsigned)refusal;
+    const char *wstate = rk < (sizeof(seat_why) / sizeof(seat_why[0]))
+                       ? seat_why[rk] : "refused: ?";
+
+    /* The four register columns. */
+    char pub[SET_NAMES_MAX * 41], pubd[SET_NAMES_MAX * 41];
+    char qn[SET_NAMES_MAX * 41], wr[SET_NAMES_MAX * 41];
+    char rd[SET_NAMES_MAX * 41], surv[SET_NAMES_MAX * 41];
+    uint64_t rdset[8], wrset[8];
+    bool have_sets = false;
+
+    reglist_generic(pub, sizeof(pub), f->src_regs, f->n_src_regs);
+    reglist_generic(pubd, sizeof(pubd), f->dst_regs, f->n_dst_regs);
+    snprintf(qn, sizeof(qn), "-");
+    snprintf(wr, sizeof(wr), "-");
+    snprintf(rd, sizeof(rd), "-");
+    snprintf(surv, sizeof(surv), "-");
+
+    if (qemu_plugin_insn_reg_reads(tb, idx, rdset, 8) <= 8 &&
+        qemu_plugin_insn_reg_writes(tb, idx, wrset, 8) <= 8) {
+        char labels[SET_NAMES_MAX][40];
+        unsigned n = 0, total;
+
+        have_sets = true;
+        total = prov_labels(rdset, 8, true, labels, SET_NAMES_MAX, &n);
+        labels_join(qn, sizeof(qn), labels, n, total);
+        survivor_join(surv, sizeof(surv), labels, n,
+                      f->src_regs, f->n_src_regs);
+        total = prov_labels(wrset, 8, true, labels, SET_NAMES_MAX, &n);
+        labels_join(wr, sizeof(wr), labels, n, total);
+        total = prov_labels(rdset, 8, false, labels, SET_NAMES_MAX, &n);
+        labels_join(rd, sizeof(rd), labels, n, total);
+    }
+
+    /*
+     * WHICH CAPACITY RAN OUT.  Four bits, four different remedies -- more
+     * write slots, more env-range slots, more memop rows, or a decode site
+     * that declined -- so they are spelled apart rather than summed.
+     */
+    char status[96];
+
+    snprintf(status, sizeof(status), "%s%s%s%s",
+             have_st && (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES)
+                 ? "writes_truncated," : "",
+             have_st && (st.incomplete & QEMU_PLUGIN_DF_INC_FIELDS)
+                 ? "fields_truncated," : "",
+             have_st && (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS)
+                 ? "memops_truncated," : "",
+             have_st && (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED)
+                 ? "site_refused," : "");
+    if (!status[0]) {
+        snprintf(status, sizeof(status), have_st ? "-" : "shape=-");
+    }
+
+    /*
+     * THE ACCESS SIDE, state and names in one column, because an instruction
+     * with no accesses and one whose accesses were refused answer the
+     * address-provenance question differently and a bare count says neither.
+     */
+    char rdx[128];
+
+    if (!have_st) {
+        snprintf(rdx, sizeof(rdx), "shape=-:-");
+    } else if (st.n_mem_reads == 0 && st.n_mem_writes == 0) {
+        snprintf(rdx, sizeof(rdx), "no accesses / no dataflow ABI:-");
+    } else {
+        snprintf(rdx, sizeof(rdx), "%s:memops=%u",
+                 (st.incomplete & QEMU_PLUGIN_DF_INC_MEMOPS)
+                     ? "LOWER BOUND: more accesses than rows" : MECH_OK,
+                 st.n_memops);
+    }
+
+    /* The self-loop unit: an architectural iteration, or one access. */
+    char cont[32];
+
+    if (!have_st || st.self_loop_memops == 0) {
+        snprintf(cont, sizeof(cont), "-");
+    } else {
+        snprintf(cont, sizeof(cont), "%s:%u",
+                 st.self_loop_iterated ? "iter" : "access",
+                 st.self_loop_memops);
+    }
+
+    /*
+     * XLAT -- THE TRANSLATION'S SHAPE.  The columns that let a reader ask
+     * whether the row describes an INSTRUCTION at all: an access trap that
+     * refused reads no accesses and no destination, and every other column
+     * still reads like an instruction QEMU stated little about.
+     *
+     * `noret=?` because this ABI's n_calls does not separate the no-return
+     * calls, and a 0 there would be a number nobody measured.
+     */
+    char xlat[96];
+
+    if (have_st) {
+        snprintf(xlat, sizeof(xlat),
+                 "noret=?,calls=%u,memr=%u,memw=%u,refused=%u",
+                 st.n_calls, st.n_mem_reads, st.n_mem_writes,
+                 (st.incomplete & QEMU_PLUGIN_DF_INC_REFUSED) ? 1u : 0u);
+    } else {
+        snprintf(xlat, sizeof(xlat), "shape=-");
+    }
+
+    /*
+     * THE CLASSIFICATION, in six columns.  Every column to their left
+     * describes the REGISTERS an encoding names; a commit that changes what
+     * an encoding IS -- its generic opcode, its branch class, its lane shape
+     * -- moves none of them, and a containment claim read from a corpus blind
+     * to the field that moved is a silent false success.
+     */
+    char cflags[64];
+
+    snprintf(cflags, sizeof(cflags), "%s%s%s%s",
+             f->writes_int_flags ? "wrflags," : "",
+             f->has_reg_deps ? "regdeps," : "",
+             f->has_addr_deps ? "addrdeps," : "",
+             f->is_atomic ? "atomic," : "");
+    if (!cflags[0]) {
+        snprintf(cflags, sizeof(cflags), "-");
+    }
+
+    fprintf(o,
+            "%s\t%s\t%s\t%08x\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
+            "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%s\n",
+            isa_name(), enc, "-", rule_digest(rule), rule,
+            src_state, wstate,
+            pub, qn, surv, rd, status, rdx, cont, xlat,
+            wr, pubd, wstq,
+            generic_opcode_name_or_unknown(f->opcode),
+            branch_type_name_or_unknown(f->branch_type),
+            cflags, "-",
+            (unsigned)f->lane_mask_kind, f->lane_parallel ? 1u : 0u,
+            (have_st && (st.incomplete & QEMU_PLUGIN_DF_INC_WRITES)) ? 1u : 0u,
+            have_sets ? "QEMU" : "-");
+    /*
+     * FLUSHED PER ROW.  Nothing closes this stream -- the plugin's exit path
+     * does not own it -- so a buffered final row reaches the file cut in
+     * half, and a truncated row still PARSES, as a row whose payload column
+     * is empty.  The cost is bounded by the deduplication above: one flush
+     * per distinct encoding, never per executed instruction.
+     */
+    fflush(o);
+}
+
 } /* namespace */
 
 /*
@@ -946,13 +1358,27 @@ void cst_capture_wire_sets(const struct qemu_plugin_tb *tb, size_t idx,
         return;
     }
     corpora_init();
-    if (!corpus_gen->get()) {
-        return;
-    }
 
     char enc[2 * 32 + 1];
 
     hex_bytes(bytes, nbytes, enc, sizeof(enc));
+
+    /*
+     * THE WRITE-STATE ROW IS WRITTEN FROM HERE, and asked for on its own.
+     *
+     * It needs both halves of the comparison at once -- QEMU's stated write
+     * list and the wire's published one -- and this is the only moment both
+     * exist: the seating has just run and its result is the @f in hand.  Its
+     * corpus is checked independently of CST_GEN_SET_DUMP's, because a run
+     * that asks for one and not the other must not silently get a header with
+     * nothing under it; that is the exact shape cst_capture_df_stmt()'s own
+     * guard was fixed for.
+     */
+    mech_row(tb, idx, enc, f, refusal);
+
+    if (!corpus_gen->get()) {
+        return;
+    }
 
     /*
      * A SEATING THAT WAS REFUSED IS NOT A SET WITH NOTHING IN IT.

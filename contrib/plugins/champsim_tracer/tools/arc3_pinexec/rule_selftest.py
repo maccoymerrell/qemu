@@ -62,6 +62,30 @@ FIRE_SELFZERO = [
     ('660fefe4', ['vec4'], []),
     ('660fefff', ['vec7'], []),
 ]
+#: Rows the BOUNDARY rule must CLAIM.  The first is the row the leg reports.
+#: The second is the same instruction writing a different destination: the
+#: basis is the ABSENCE of a shadow-stack-pointer field in CPUX86State, which
+#: does not depend on which register the value would have been written to, so
+#: the rule covers the form and the selftest says so rather than leaving a
+#: reader to wonder whether one encoding was special-cased.
+FIRE_SSP = [
+    ('f3480f1ec8', ['ssp'], []),   # F3 REX.W 0F 1E /1, mod=3 -- rdsspq %rax
+    ('f3480f1ecb', ['ssp'], []),   # the same form writing %rbx
+]
+#: Rows the BOUNDARY rule must REFUSE, each with the reason.  These are the
+#: neighbours a bare ceiling number would silently have covered.
+REFUSE_SSP = [
+    ('f30f1ec8',   ['ssp'], [], 'no REX.W: RDSSPD, and it has no row here'),
+    ('f30f1efa',   ['ssp'], [], 'modrm.reg 7 = ENDBR64, not RDSSP'),
+    ('f3480f1ef8', ['ssp'], [], 'modrm.reg 7 again, with REX.W'),
+    ('480f1ec8',   ['ssp'], [], 'no F3 prefix: 0F 1E /1 is a hint-NOP'),
+    ('f3480f1e08', ['ssp'], [], 'mod != 3: the memory form, not RDSSP'),
+    ('f3480f1ec8', ['ssp', 'rax'], [], 'a second unmatched reference name'),
+    ('f3480f1ec8', ['ssp'], ['rax'], 'the tracer names something too'),
+    ('f3480f1ec8', ['rax'], [], 'the unmatched name is not ssp'),
+    ('f3480f1ec8', [], [], 'nothing unmatched: not a difference at all'),
+    ('0fa2',       ['ssp'], [], 'cpuid: a different instruction entirely'),
+]
 #: Rows the self-zero rule must REFUSE.
 REFUSE_SELFZERO = [
     ('660fefc1', ['vec0'], [], 'xmm0,xmm1 -- two DIFFERENT registers'),
@@ -85,7 +109,8 @@ def load_rules():
     body = text[text.index(BEGIN):text.index(END)]
     mod = types.ModuleType('cmp_reg_rules')
     exec(compile(body, SRC, 'exec'), mod.__dict__)
-    for need in ('rule_div_undefined_flags', 'rule_selfzero_operand'):
+    for need in ('rule_div_undefined_flags', 'rule_selfzero_operand',
+                 'rule_absent_machine_state_ssp'):
         if need not in mod.__dict__:
             sys.exit('rule_selftest: %s is not in the slice' % need)
     return mod
@@ -98,6 +123,13 @@ def main():
          FIRE_DIV, REFUSE_DIV),
         ('R-SELFZERO-OPERAND', mod.rule_selfzero_operand,
          FIRE_SELFZERO, REFUSE_SELFZERO),
+        # A BOUNDARY rule is exercised exactly like a SET rule: what makes it
+        # a rule rather than an allowlist entry is still the set of rows it
+        # turns down.  What differs is only what the comparator does with a
+        # claim -- names the row, leaves it in the criterion -- and that is
+        # cmp_reg.py's business, not this file's.
+        ('R-ABSENT-MACHINE-STATE-SSP', mod.rule_absent_machine_state_ssp,
+         FIRE_SSP, REFUSE_SSP),
     ]
     bad = 0
     n = 0

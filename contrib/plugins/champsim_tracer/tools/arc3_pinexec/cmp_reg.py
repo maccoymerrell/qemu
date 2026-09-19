@@ -658,6 +658,69 @@ def rule_selfzero_operand(enc, only_p, only_q):
     return 'R-SELFZERO-OPERAND'
 
 
+def rule_absent_machine_state_ssp(enc, only_p, only_q):
+    """RDSSPQ: the reference names the shadow-stack pointer, which is
+    architectural state CPUX86State does not carry at all.
+
+    THIS IS A BOUNDARY RULE, NOT A SET RULE, AND THE DIFFERENCE IS THE WHOLE
+    POINT.  A SET rule says the two instruments disagree about a fact neither
+    side defines, so the row is not a difference and leaves the criterion.
+    This rule says something else: the reference is RIGHT, the tracer really
+    does not publish the register, and the row STAYS IN THE CRITERION as
+    TRACER-SUBSET.  What the rule does is NAME it -- so the accepted boundary
+    is one enumerated encoding with a checkable basis rather than a number in
+    a ceiling that nothing pins to a row.
+
+    THE SHAPE, tested exactly: F3 REX.W 0F 1E with modrm.mod == 3 and
+    modrm.reg == 1 -- RDSSPQ -- the reference's unmatched source set is
+    exactly {ssp}, and the tracer's is empty.  Anything else, including
+    RDSSPD (the same instruction without REX.W) and ENDBR64 (the same two
+    opcode bytes at modrm.reg == 7), does not fire and gets its own merits
+    read.
+
+    THE BASIS, both halves checkable in this tree:
+
+      * THE FIELD IS ABSENT.  `struct CPUX86State` (target/i386/cpu.h) has no
+        current-SSP member.  It does carry `fred_ssp1`, `fred_ssp2` and
+        `fred_ssp3`; those are the FRED ring stack-level pointers, a
+        different architectural register file, and naming them here would be
+        publishing one register's value under another's name.  (exec246 said
+        the MSR numbers "are constants"; that was wrong about those three
+        fields and is corrected rather than carried -- they are real fields,
+        and they are still not this register.)
+
+      * THE EMULATOR SAYS SO ITSELF.  gen_RDSSP() (target/i386/tcg/emit.c.inc)
+        emits no ops, produces no value and deliberately skips the writeback,
+        and its own comment states that.  There is no temp for a read to
+        attach to, so this is a modelling boundary and not a missing
+        statement: closing it needs QEMU to MODEL the shadow stack, which is
+        a decision about the emulator, not about the tracer's dataflow.
+
+    WHY NOT MINT A REGISTER ID: the wire's names are generic across four
+    ISAs, and the standing generic-id rule forbids inventing one for a single
+    ISA's register -- the dissent is recorded at the site (exec245).  A name
+    minted here would also be a name with no value behind it.
+
+    Returns the rule name when it fires, else None."""
+    if only_q or only_p != ['ssp']:
+        return None
+    sp = _x86_split(enc)
+    if sp is None:
+        return None
+    rex, op, modrm = sp
+    if op != (0x0f, 0x1e):
+        return None
+    if 0xf3 not in _x86_prefixes(enc):
+        return None
+    if not (rex & 0x08):                  # REX.W: RDSSPQ, not RDSSPD
+        return None
+    if (modrm >> 6) != 3:
+        return None
+    if ((modrm >> 3) & 7) != 1:           # /1 is RDSSP; /7 is ENDBR64
+        return None
+    return 'R-ABSENT-MACHINE-STATE-SSP'
+
+
 #: The SET rules, in the order they are tried.  Each takes (enc, only_p,
 #: only_q) and answers its own name or None.  `axis` selects which side of
 #: the comparison a rule may speak for: a destination rule must never be
@@ -666,9 +729,21 @@ SET_RULES = {
     'srcset': (rule_selfzero_operand,),
     'dstset': (rule_div_undefined_flags,),
 }
+#: The BOUNDARY rules, by axis.  Same signature, opposite effect: a row a
+#: boundary rule names keeps its DIRECTION and stays in the criterion.  The
+#: rule exists so the ceiling names the rows it accepts, per row, with a
+#: basis that can be checked -- and so a NEIGHBOURING row cannot drift in
+#: under the same allowance, which is what a bare ceiling number permits.
+BOUNDARY_RULES = {
+    'srcset': (rule_absent_machine_state_ssp,),
+}
 #: Every row a rule claimed, keyed by (rule, axis, enc, ref_only).  Printed
 #: whole: a rule whose firings are not enumerated is an allowlist.
 ruled = collections.Counter()
+#: Every row a BOUNDARY rule named, same key.  Separate counter because these
+#: rows did NOT leave the criterion and must never be totalled with the ones
+#: that did.
+bounded = collections.Counter()
 
 
 def set_rule_for(axis, enc, only_p, only_q):
@@ -676,6 +751,21 @@ def set_rule_for(axis, enc, only_p, only_q):
         name = fn(enc, only_p, only_q)
         if name:
             ruled[(name, axis, enc, ','.join(only_p))] += 1
+            return name
+    return None
+
+
+def boundary_rule_for(axis, enc, only_p, only_q):
+    """Name an ACCEPTED MODELLING BOUNDARY without removing its row.
+
+    Consulted only after set_rule_for() has declined, so a row can be one or
+    the other and never both: a row a SET rule took out of the count is not a
+    boundary, and a boundary row is still counted.
+    """
+    for fn in BOUNDARY_RULES.get(axis, ()):
+        name = fn(enc, only_p, only_q)
+        if name:
+            bounded[(name, axis, enc, ','.join(only_p))] += 1
             return name
     return None
 
@@ -1072,6 +1162,12 @@ for pos, (pi, qj) in enumerate(pairs):
         rule = set_rule_for(axis, q['b'], only_p, only_q) or ''
         if rule:
             direction = 'ORTHOGONAL'
+        else:
+            # A BOUNDARY rule names the row and changes NOTHING ELSE.  The
+            # direction it was given stands, the criterion still counts it,
+            # and the name travels into the row so a reader sees which
+            # accepted boundary this is without consulting the manifest.
+            rule = boundary_rule_for(axis, q['b'], only_p, only_q) or ''
         note(setsig, axis,
              (q['b'], q['c'], 'ref_only=' + ','.join(only_p),
               'tracer_only=' + ','.join(only_q), direction, rule), qj)
@@ -1363,6 +1459,31 @@ say("  rules DEFINED and how many rows each claimed:")
 for rname in sorted(set(['R-DIV-UNDEF-FLAGS', 'R-SELFZERO-OPERAND'])):
     tot = sum(n for k, n in ruled.items() if k[0] == rname)
     say("    %-22s %8d%s" % (rname, tot, '   INERT' if not tot else ''))
+
+say("")
+say("=== EVERY ROW A BOUNDARY RULE NAMED ===")
+say("  A BOUNDARY rule does NOT take a row out of the criterion.  The row")
+say("  keeps its direction, is counted in SUBSET + UNACCOUNTED below, and is")
+say("  named here because it is an ACCEPTED MODELLING BOUNDARY: the")
+say("  reference is right, this emulator does not model the state, and the")
+say("  adjudication says so per row with a basis that can be checked in the")
+say("  tree.  This is what a ceiling is allowed to cover.  A ceiling that")
+say("  covers anything NOT listed here is covering a row nobody adjudicated.")
+say("")
+say("  %-28s %-8s %-18s %-24s %8s"
+    % ('BOUNDARY RULE', 'AXIS', 'ENCODING', 'REF-ONLY', 'ROWS'))
+for (rname, raxis, renc, rref), n in sorted(bounded.items()):
+    say("  %-28s %-8s %-18s %-24s %8d"
+        % (rname, raxis, renc[:18], rref[:24], n))
+if not bounded:
+    say("  (no boundary rule fired)")
+say("")
+say("  boundary rules DEFINED and how many rows each named:")
+for rname in sorted(set(['R-ABSENT-MACHINE-STATE-SSP'])):
+    tot = sum(n for k, n in bounded.items() if k[0] == rname)
+    say("    %-28s %8d%s" % (rname, tot, '   INERT' if not tot else ''))
+say("  rows inside the criterion that a boundary rule named: %d"
+    % sum(bounded.values()))
 
 say("")
 say("=== SYSCALL REGISTER EFFECTS, PER INSTANCE ===")

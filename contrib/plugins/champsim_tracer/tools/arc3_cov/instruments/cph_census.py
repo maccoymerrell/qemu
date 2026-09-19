@@ -71,18 +71,56 @@ def klass(v):
     return "OK" if v == OK else "REFUSED"
 
 
+#: What a caller sees when the corpus is the THREE-COLUMN one.  The refusal
+#: below is correct and stays; what it was missing is the attribution, and a
+#: refusal a reader cannot act on gets re-diagnosed once per pass.
+_THREE_COL = """
+  THIS IS THE THREE-COLUMN MECHANISM CORPUS, AND IT IS NOT THIS CENSUS'S
+  SUBJECT (finding 250-C).  Two different files have carried the name
+  `corpus_mech_<isa>.tsv`:
+
+    * the 26-column write-state corpus this census reads, whose columns
+      include PUBD, WSTQ, wstate and WR.  It has NO PRODUCER IN THE TREE.
+      `corpus_mech` in champsim_tracer_capture.cc is constructed and never
+      written -- grep the tree for it and the constructor is the only hit --
+      so the plugin can emit its header and nothing else, and
+      `srcenc_sled.py --mech` writes the name from its own derivation
+      instead.
+    * that derivation: `#isa encoding mech`, three columns, taken from
+      CST_QEMU_IDENT_PAIRS (srcenc_sled.py derive_read_list, finding 244-H).
+      It answers "why did the classifier say what it said", which is a
+      different question from "did the write-list extraction finish".
+
+  So a fresh corpus REFUSES here and a banked 2026-09-12 one scores, and
+  neither is a defect in this census.  SEVEN OTHER INSTRUMENTS in this
+  directory read the same 26 columns -- srcbar, dstbar, famarm, wstate_ab,
+  landedcheck, armdelta and mechclass -- and none of them can run on a
+  corpus produced at this tip either.
+
+  THE READING IS OWED, and it costs a capture change and a sweep, not a
+  default: the tip's own incompleteness word is
+  `qemu_plugin_dataflow_status.incomplete` (QEMU_PLUGIN_DF_INC_WRITES is
+  literally "more writes than slots", which is the capacity this census is
+  named for) beside `n_writes`, and reaching it means emitting those fields
+  per encoding from the capture AND having srcenc_sled capture the corpus
+  that carries them.  Until then this census has no subject at this tip and
+  says so rather than scoring one it was not given."""
+
+
 def need_cols(hdr, path):
     missing = [c for c in NEEDED if c not in hdr]
     if missing:
+        three = hdr == ["isa", "encoding", "mech"]
         sys.exit("census REFUSING: %s has no %s column(s).\n%s\n"
                  "  This census scores columns it did not write.  Reaching a "
                  "missing one with a default would score the whole corpus on "
                  "an absence -- and for PUBD/wstate it would print the "
                  "MUST-BE-0 property as a satisfied 0 while looking at "
-                 "nothing."
+                 "nothing.%s"
                  % (path, ", ".join(sorted(missing)),
                     "\n".join("    %-9s %s" % (c, NEEDED[c])
-                              for c in sorted(missing))))
+                              for c in sorted(missing)),
+                    _THREE_COL if three else ""))
 
 
 def one(arm, isa, wps):

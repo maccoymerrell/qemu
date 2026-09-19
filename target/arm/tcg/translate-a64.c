@@ -2896,6 +2896,86 @@ static void handle_sys(DisasContext *s, bool isread,
         return;
     }
 
+    /*
+     * THE ADDRESS A CACHE-MAINTENANCE OPERATION ACTS ON.
+     *
+     * `dc cvau, x21' transfers no architectural data -- it cleans a line to
+     * the Point of Unification, it does not move a byte, and nothing the
+     * program can read changes -- and it is NOT the DC ZVA shape below, which
+     * genuinely writes a block of zeroes and publishes a store.  The format's
+     * own contract puts it in the OTHER shape rather than outside the wire:
+     * format.rst 5.2 names "cache-line clean / flush / invalidate" as one of
+     * the three classes whose effective address is SYNTHESISED, puts it in
+     * the same LOAD_ADDR slot a real load uses, counts it in N_LOADS, and
+     * tells the consumer to read the semantic distinction off the opcode
+     * (GEN_OP_CACHE_FLUSH) instead of treating the address as a data load.
+     * insn_dataflow_note_synthetic_ea() says the same from the other side and
+     * names DC CVAU in the shape that "performs no access".
+     *
+     * WHICH ENCODINGS THOSE ARE IS QEMU'S OWN STATEMENT, one flag per cpreg
+     * row.  Nothing else in the declaration separates them: DC IVAC is by VA
+     * and PL1_W while CFP RCTX is PL0_W with a prediction context in Xt, and
+     * .accessfn does not split them either -- access_tocu covers IC IALLU, an
+     * "all" form, together with IC IVAU and DC CVAU, both by VA.  The flag is
+     * read here and nowhere else.
+     *
+     * THE GRANULE IS THE EMULATION'S OWN.  A data-cache form acts on
+     * CTR_EL0.DMinLine bytes, which is the field dccvap_writefn() reads to
+     * decide what DC CVAP touches; an instruction-cache form acts on
+     * CTR_EL0.IMinLine, the field ic_ivau_write() reads to decide the range
+     * it invalidates.  Neither is a constant written here.
+     *
+     * STATED FOR EVERY ARM, not inside the ARM_CP_NOP case below, because the
+     * same encoding is a NOP in one build and a real writefn in another: IC
+     * IVAU carries ic_ivau_write under CONFIG_USER_ONLY and is ARM_CP_NOP in
+     * system mode, and DC CVAP/DC CVADP are never NOPs at all.  All of them
+     * owe the address, so the statement sits where every one of them passes.
+     *
+     * THE WORD TRAVELS WITH THE ADDRESS, and the address is not on the wire
+     * without it.  format.rst 5.2's rule is a pair: the synthesised EA sits
+     * in the LOAD_ADDR slot and the OPCODE carries the semantic distinction,
+     * so a consumer reading a load address off a cache-maintenance operation
+     * is told, by GEN_OP_CACHE_FLUSH, that no datum came back.  MEASURED
+     * rather than assumed: with the address stated and the word left alone,
+     * `dc cvau, x21' reached the wire with an unknown opcode and no access at
+     * all -- the reader's synthetic-EA consult is keyed on exactly that word
+     * (PREFETCH / CACHE_FLUSH / TLB_FLUSH), which is the same gate x86's
+     * prefetch and clflush statements pass through.  Stated for the by-VA
+     * forms alone: this commit's subject is the access they owe, and what
+     * word the set/way and "all" forms should carry is a separate question
+     * with no address riding on it.
+     *
+     * WRITE DIRECTION ONLY.  These encodings are write-only system registers;
+     * the isread direction does not reach a cache operation at all.
+     */
+    if (!isread) {
+        int cacheop = ri->type & ARM_CP_CACHEOP_CLASSIFIED;
+
+        if (cacheop & (ARM_CP_CACHEOP_VA_D | ARM_CP_CACHEOP_VA_I)) {
+            InsnDataflowEaPart base =
+                insn_df_ea(rt == 31 ? insn_df_zero()
+                                    : insn_df_reg(regnames[rt]),
+                           0, INSN_DF_EA_EXT_NONE);
+            uint32_t line = (cacheop & ARM_CP_CACHEOP_VA_I
+                             ? 4u << s->iminline
+                             : 4u << s->dminline);
+
+            insn_dataflow_note_word(INSN_DF_WORD_CACHEFLUSH);
+            insn_dataflow_note_synthetic_ea(INSN_DF_RD, line, &base, 1, 0);
+        } else if (cacheop == 0 && crn == 7 &&
+                   (ri->type & ARM_CP_SPECIAL_MASK) == ARM_CP_NOP) {
+            /*
+             * A crn==7 NOP nobody classified.  Its Rt may or may not be an
+             * address; what is certain is that no one said, so the absence of
+             * a published access here is an unexamined encoding rather than a
+             * stated fact.  Count its executions out loud -- see
+             * helper_cacheop_unclassified().  In a tree where every such row
+             * carries a flag this call is never generated.
+             */
+            gen_helper_cacheop_unclassified(tcg_constant_i32(key));
+        }
+    }
+
     /* Handle special cases first */
     switch (ri->type & ARM_CP_SPECIAL_MASK) {
     case 0:
@@ -2911,55 +2991,21 @@ static void handle_sys(DisasContext *s, bool isread,
          * architecture says Xt holds the address the operation acts on.
          *
          * THE CONTROL IS THE INSTRUCTION NEXT TO IT.  `ic ivau, x21' is NOT
-         * a NOP -- it carries ic_ivau_write, so the generic path below reads
-         * Xt -- and it published src=[REG_GPR21] on the same trace where
-         * `dc cvau, x21' at 0x4000dc and `dc civac, x21' at 0x4000e4
-         * published nothing.  Three neighbouring cache operations, one
-         * difference between them, and it is this return.
+         * a NOP in a user-mode build -- it carries ic_ivau_write, so the
+         * generic path below reads Xt -- and it published src=[REG_GPR21] on
+         * the same trace where `dc cvau, x21' at 0x4000dc and `dc civac, x21'
+         * at 0x4000e4 published nothing.  Three neighbouring cache
+         * operations, one difference between them, and it is this return.
          *
-         * THE READ IS STATED; THE ADDRESS IS NOT, AND THAT IS A KNOWN LOSS.
-         *
-         * THE MERITS ARE DECIDED AND THEY SAY THE WIRE OWES THE ADDRESS.  A
-         * cache-maintenance operation by VA transfers no architectural data
-         * -- DC CVAU cleans a line, it does not move a byte, and nothing the
-         * program can read changes -- so it is NOT the DC ZVA shape below,
-         * which genuinely writes a block of zeroes and publishes a store.
-         * But the format's own contract puts it in the OTHER shape rather
-         * than outside the wire: format.rst 5.2 names "cache-line clean /
-         * flush / invalidate" as one of the three classes whose EA is
-         * synthesised, puts it in the same LOAD_ADDR slot a real load uses,
-         * counts it in N_LOADS, and tells the consumer to read the semantic
-         * distinction off the opcode (GEN_OP_CACHE_FLUSH) instead of
-         * treating the address as a data load.  It even names the exception
-         * by instruction: a form with no memory operand -- AArch64 IC IALLU,
-         * x86 WBINVD -- synthesises nothing.  insn_dataflow_note_synthetic_ea
-         * says the same from the other side and names DC CVAU in the shape
-         * that "performs no access"; aarch64 PRFM and MIPS PREF already use
-         * it.  So the absence here is a LOSS the wire owes, not a reference
-         * artefact, and calling it one in a comparator rule would contradict
-         * this project's own spec.  gem5 issues one line-sized access for
-         * these and it is right to.
-         *
-         * WHAT IS MISSING IS STILL A QEMU-SIDE SOURCE, and the candidate
-         * filed against this arm is REFUTED by enumeration.  It proposed
-         * that the by-VA forms are the PL0_W ones; over all 51 crn==7
-         * ARM_CP_NOP cpregs target/arm declares that is false three ways --
-         * DC IVAC is by-VA and PL1_W; CFP/DVP/CPP RCTX are PL0_W and their
-         * Xt is a prediction context, not an address; and the cp15 crm=10
-         * opc2=4/5 encodings at PL0_W are DSB and DMB, which have no operand
-         * at all.  .accessfn does not separate them either: access_tocu
-         * covers ICIALLU (an "all" form) together with IC IVAU and DC CVAU
-         * (both by VA).  What WOULD separate them is a per-operation fact
-         * QEMU states in its own declaration -- an ARM_CP_* type bit set on
-         * the by-VA cpregs, one reviewable line each, with the executions of
-         * an unmarked crn==7 NOP counted so a missed one is visible -- plus
-         * the line size from the same CTR_EL0 field the emulation reads.
-         * That is the mechanism this arm is waiting on, and it is a wave of
-         * its own.
-         *
-         * A read does not need any of it: Xt is an operand of every one of
-         * these encodings whatever its value means, so the read is stated
-         * here and the address is left to the commit that can name it.
+         * THE ADDRESS IS STATED ABOVE, NOT HERE.  The synthesised effective
+         * address these operations owe is published before this switch, off
+         * each cpreg's own ARM_CP_CACHEOP_* flag, because the same encoding
+         * reaches different arms in different builds -- IC IVAU is this arm
+         * in system mode and the generic path in user mode -- and the
+         * statement has to sit where all of them pass.  The read below is
+         * kept: it is this arm's own answer to its own return, it says the
+         * same thing the address statement says about Xt, and an encoding
+         * that is classified as holding no address still reads the register.
          *
          * READ SIDE ONLY.  On the isread direction the architecture writes
          * Xt and QEMU leaves it alone; publishing a write here would name a
@@ -3009,9 +3055,10 @@ static void handle_sys(DisasContext *s, bool isread,
          * SHAPE and the two must not be conflated: this one transfers data,
          * so it publishes a WRITE of the block it zeroes, while DC CVAU and
          * its neighbours transfer none and are owed an address with no datum.
-         * They are owed one -- see the ARM_CP_NOP arm above for the merits
-         * and for the QEMU-side source that is still missing -- and this arm
-         * is not where that lands.
+         * Theirs is published before the switch above, as a READ of a line
+         * whose size comes from CTR_EL0 rather than DCZID_EL0; this one's
+         * direction, size and datum are all different and it keeps its own
+         * statement.
          */
         {
             InsnDataflowEaPart base =
@@ -11023,6 +11070,8 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->features = env->features;
     dc->dcz_blocksize = arm_cpu->dcz_blocksize;
     dc->gm_blocksize = arm_cpu->gm_blocksize;
+    dc->iminline = extract32(arm_cpu->ctr, 0, 4);
+    dc->dminline = extract32(arm_cpu->ctr, 16, 4);
 
 #ifdef CONFIG_USER_ONLY
     /* In sve_probe_page, we assume TBI is enabled. */

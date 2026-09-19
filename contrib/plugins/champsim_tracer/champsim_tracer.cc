@@ -3323,9 +3323,21 @@ static void vcpu_mem_cb(unsigned int cpu_index,
  * Per-insn callback for prefetch / cache-flush / TLB-flush insns
  * whose canonical TCG translation emits no memop.  Computes
  * ea = base + scaled/shifted index + disp and routes it through
- * MemAccessRecorder into the BodyEntry's load slots.  CP-path only
- * (spec-mode CF_MEMI_ONLY suppresses per-insn cbs); fine, since these
- * generate no architectural memops on either path anyway.
+ * MemAccessRecorder into the BodyEntry's load slots.
+ *
+ * CORRECT PATH ONLY, AND THAT IS A KNOWN LOSS.  The mechanism is
+ * cpu_plugin_exec_tb()'s cflags: a speculative excursion translates with
+ * CF_MEMI_ONLY (accel/tcg/cpu-exec.c), and plugins/api.c registers no
+ * per-instruction callback under that flag, so this one is never armed on
+ * the wrong path.  The justification that used to stand here -- "fine,
+ * since these generate no architectural memops on either path anyway" --
+ * is REFUTED by the wire's own contract: format.rst 5.2 says the address
+ * is owed whether or not a datum moves, and it is owed on both paths.
+ * Measured on the aarch64 wrong-path leg: gem5 issues one line-sized
+ * access for each of `dc cvau', `dc civac' and `dc cvac' inside the
+ * excursion and the trace publishes none, twelve rows per axis across
+ * three axes.  The template is right -- the excursion's entries carry the
+ * cache-flush opcode -- and only the per-execution address is missing.
  */
 
 typedef struct {

@@ -3063,6 +3063,76 @@ class RvvMemData(CodeBlock):
 
 
 @register
+class A64CacheMaintByVa(CodeBlock):
+    """
+    The AArch64 CACHE-MAINTENANCE-BY-ADDRESS subject: four operations
+    that name a virtual address and transfer no data.
+
+    WHY IT EXISTS.  `dc cvau`, `dc cvac`, `dc civac` and `ic ivau` each
+    hold an address in Xt and act on the cache line containing it.  The
+    format puts them in the synthesised-EA class of 5.2 -- the address
+    goes in the LOAD_ADDR slot, the opcode (GEN_OP_CACHE_FLUSH) carries
+    the distinction, and no datum is named -- and the aarch64 decode
+    site states both, off each cpreg's own ARM_CP_CACHEOP_* flag.
+    Before this block the net had no cell containing one: the generated
+    programs are arithmetic, memory, branch and vector shapes, and a
+    cache-maintenance encoding appeared in none of them, so every byte
+    of that class could have changed without a golden hash moving.
+
+    WHAT IT ASSERTS AND WHAT IT DELIBERATELY DOES NOT.  The opcode is
+    asserted, because that is the fact a consumer reads the class off.
+    No ExpectedMemOp is declared: the wire spells these as an
+    ADDRESS-ONLY access -- size 0, no value -- because the extent of an
+    operation on a LINE belongs to the cache being modelled and not to
+    the instruction, and an ExpectedMemOp names a width and a datum
+    neither side has.  The address itself is still on the wire and the
+    net's byte identity covers it.
+
+    x20 already holds the arena base after _load_base, so the four
+    operations act on a mapped, writable line the program owns.  They
+    are architecturally permitted from EL0 on this guest (DC CVAU / DC
+    CVAC / DC CIVAC / IC IVAU are the PL0_W forms, SCTLR_EL1.UCI being
+    set by linux-user), and none of them changes a byte the program can
+    read, so the block is inert to every other check in the suite.
+    """
+
+    name = "a64_cache_maint_by_va"
+    scratch_slots = 1
+    supported_isas = ("aarch64",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        slot = ctx.scratch_slots[0]
+        # Four ADDRESS-ONLY accesses at the block's own slot: size 0 and
+        # datum 0, which is how record_synthetic_load mints a memop that
+        # names a place and moves nothing.
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[ExpectedMemOp("load", slot, 0, 0) for _ in range(4)],
+            coarse_opcodes={"CACHE_FLUSH": 4},
+            asserted_opcodes=["CACHE_FLUSH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        off = plan.memops[0].arena_u64_index * 8
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            f"  add x9, x20, #{off}",
+            "  dc   cvau, x9",
+            "  dc   cvac, x9",
+            "  dc   civac, x9",
+            "  ic   ivau, x9",
+            "  dsb  ish",
+            "  isb",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
 class MipsInlineConditionalTrap(CodeBlock):
     """
     Pins the classification of a MIPS conditional trap: `teq` must NOT

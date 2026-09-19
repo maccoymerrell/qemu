@@ -134,7 +134,41 @@ enum {
      * identically to the normal one, other than FGT trapping handling.)
      */
     ARM_CP_ADD_TLBI_NXS          = 1 << 21,
+    /*
+     * Flags: what the Rt/Xt operand of a cache-maintenance operation IS.
+     *
+     * QEMU emulates no caches, so most of these encodings are ARM_CP_NOP and
+     * the register they name is read by nothing.  The operand still exists,
+     * and for the by-virtual-address forms it names the line the operation
+     * acts on -- which is a memory address a consumer of the translation can
+     * use, and which no other field of the declaration reveals.  Neither the
+     * access level nor the .accessfn separates the forms: DC IVAC is by VA at
+     * PL1_W, CFP RCTX is PL0_W and its Xt is a prediction context, and
+     * access_tocu covers IC IALLU (an "all" form) together with IC IVAU and
+     * DC CVAU (both by VA).  So each row says which it is.
+     *
+     *   CACHEOP_VA_D  Xt is a virtual address; the operation acts on the DATA
+     *                 cache line containing it, whose size is CTR_EL0.DMinLine.
+     *   CACHEOP_VA_I  Xt is a virtual address; the operation acts on the
+     *                 INSTRUCTION cache line containing it, CTR_EL0.IMinLine.
+     *   CACHEOP_NOT_VA  Xt is not a virtual address: a set/way encoding, a
+     *                 prediction context, a physical address, or nothing at
+     *                 all because the form takes no operand.
+     *
+     * The third spelling is not decoration.  It is what makes a crn==7
+     * ARM_CP_NOP carrying NONE of the three a MISSING classification rather
+     * than an implied "no address", and handle_sys() counts the executions of
+     * those so a new encoding that nobody classified is visible rather than
+     * silently short on the wire.
+     */
+    ARM_CP_CACHEOP_VA_D          = 1 << 22,
+    ARM_CP_CACHEOP_VA_I          = 1 << 23,
+    ARM_CP_CACHEOP_NOT_VA        = 1 << 24,
 };
+
+/* Any of the three cache-operand classifications above. */
+#define ARM_CP_CACHEOP_CLASSIFIED \
+    (ARM_CP_CACHEOP_VA_D | ARM_CP_CACHEOP_VA_I | ARM_CP_CACHEOP_NOT_VA)
 
 /*
  * Interface for defining coprocessor registers.

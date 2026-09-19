@@ -170,6 +170,15 @@ typedef struct DisasContext {
     int8_t btype;
     /* A copy of cpu->dcz_blocksize. */
     uint8_t dcz_blocksize;
+    /*
+     * CTR_EL0's two minimum-line-size fields, as the register holds them:
+     * the line is 4 << field bytes.  IMinLine (bits 3:0) is what
+     * ic_ivau_write() reads and DMinLine (bits 19:16) what dccvap_writefn()
+     * reads, so a cache-maintenance operation's granule is taken from the
+     * same place the emulation takes it.
+     */
+    uint8_t iminline;
+    uint8_t dminline;
     /* A copy of cpu->gm_blocksize. */
     uint8_t gm_blocksize;
     /* True if the current insn_start has been updated. */

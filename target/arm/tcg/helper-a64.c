@@ -23,6 +23,7 @@
 #include "gdbstub/helpers.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/bitops.h"
@@ -83,6 +84,40 @@ void HELPER(msr_set_allint_el1)(CPUARMState *env)
     }
 
     env->pstate |= PSTATE_ALLINT;
+}
+
+/*
+ * A CACHE-MAINTENANCE ENCODING NOBODY CLASSIFIED, COUNTED OUT LOUD.
+ *
+ * handle_sys() publishes the synthesised address of the by-virtual-address
+ * cache-maintenance operations, and it knows which those are only because
+ * each cpreg says so with an ARM_CP_CACHEOP_* flag.  A crn==7 ARM_CP_NOP
+ * carrying none of the three has not been declared to have no address; it
+ * has not been looked at, and if its Rt does hold one the trace is short by
+ * exactly that access with nothing to say so.
+ *
+ * So the omission is not silent.  The call this counts is emitted ONLY on
+ * that path, which means that in a tree where every such cpreg is classified
+ * -- the state this ships in -- no call is generated at all and the counter
+ * has no way to move.  That is also how it is proved able to fire: take the
+ * flag off one row, run a probe that executes it, and the line below appears.
+ *
+ * The count is reported at every power of two rather than once, so a rate is
+ * visible without a line per execution.  It is deliberately not a per-CPU
+ * counter: a lost increment under MTTCG would cost a line, never the first
+ * one, and the first is the one that matters.
+ */
+void HELPER(cacheop_unclassified)(uint32_t key)
+{
+    static uint64_t n;
+    uint64_t c = qatomic_fetch_inc(&n) + 1;
+
+    if (is_power_of_2(c)) {
+        warn_report("aarch64 cache-maintenance cpreg key 0x%08x carries no "
+                    "ARM_CP_CACHEOP_* classification: its operand is absent "
+                    "from the instruction's published access set "
+                    "(executions so far: %" PRIu64 ")", key, c);
+    }
 }
 
 static void daif_check(CPUARMState *env, uint32_t op,

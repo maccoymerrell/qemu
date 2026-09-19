@@ -2347,13 +2347,40 @@ classified under ``GEN_OP_FENCE``.
 **Coverage, stated rather than assumed.** The rule above is the
 contract; the statements that fill it are per decode site, and the
 AArch64 cache-maintenance operations by virtual address — ``DC CVAU``,
-``DC CVAC``, ``DC CIVAC``, ``IC IVAU`` — do not yet carry one, so those
-encodings reach the wire naming no access. That is a known loss against
-this section and not a property of the instructions: the merits, the
-measurement and the QEMU-side fact still needed are written at the
-``ARM_CP_NOP`` arm of ``handle_sys()`` in ``target/arm/tcg/translate-a64.c``.
-``DC ZVA`` is a different shape and does carry its statement: it
-transfers data, so it publishes a **store** of the block it clears.
+``DC CVAC``, ``DC CIVAC``, ``IC IVAU`` and their tagged and
+point-of-persistence siblings — now carry one. Which encodings those
+are is QEMU's own per-register statement: ``target/arm/cpregs.h``
+declares ``ARM_CP_CACHEOP_VA_D`` / ``_VA_I`` / ``_NOT_VA``, every
+``crn == 7`` cache-maintenance cpreg carries exactly one of the three,
+and ``handle_sys()`` reads the flag to decide whether to synthesise.
+A ``crn == 7`` NOP carrying none of the three is a MISSING
+classification rather than an implied absence, and its executions are
+counted out loud (``helper_cacheop_unclassified()``) so a new encoding
+nobody classified cannot be short on the wire in silence.
+
+The access these publish is ADDRESS-ONLY: it occupies a ``LOAD_ADDR``
+slot and counts in ``N_LOADS``, and its width is 0 with no datum,
+because an operation that acts on a LINE has an extent that belongs to
+the cache being modelled rather than to the instruction — the consumer
+applies its own geometry to the address the wire gives it. QEMU's own
+granule is stated to the reader at the decode site from the same
+``CTR_EL0`` field the emulation reads (``DMinLine`` for the data-cache
+forms, ``IMinLine`` for the instruction-cache one); the wire does not
+republish it as a width.
+
+``DC ZVA`` is a different shape and carries its own statement: it
+transfers data, so it publishes a **store** of the block it clears,
+sized from ``DCZID_EL0``.
+
+The WRONG PATH does not yet carry this access. The address is on the
+wrong-path template — the opcode is there and the statement is the same
+one — but the per-instruction callback that computes the effective
+address at execution is not armed inside a speculative excursion, which
+runs its translation with ``CF_MEMI_ONLY`` (``accel/tcg/cpu-exec.c``,
+``cpu_plugin_exec_tb()``; ``plugins/api.c`` suppresses non-memory
+instrumentation under that flag). So a wrong-path ``dc cvau`` reaches
+the wire classified and address-less. That is a known loss with a named
+mechanism, not a property of the instruction or of the excursion.
 
 LOAD / STORE as fall-through classifications
 """"""""""""""""""""""""""""""""""""""""""""

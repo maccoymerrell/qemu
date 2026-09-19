@@ -28,8 +28,22 @@ cp "$T"/sysprobe.S "$T"/sysprobe.ld "$T"/sysprobe_mkblob.py \
    "$T"/sysprobe_enables.py .
 : > enab_all.tsv
 : > enab_e.tsv
-[ -f skip.txt  ] || : > skip.txt
-[ -f eskip.txt ] || : > eskip.txt
+# skip.txt IS AN INPUT, eskip.txt IS THIS RUN'S OWN WORKING NOTE (250-F).
+#
+# skip.txt is written by the plain CPL0 leg, which runs first in the same
+# directory and puts in it exactly the encodings it CONFIRMED kill the machine
+# on their own.  Inheriting that is the point.
+#
+# eskip.txt is different: it is this loop's record of which enables it could
+# not attempt, and it was being carried from run to run by `[ -f ] ||`.  An
+# enable skipped by an older build stayed skipped under a newer one FOREVER,
+# and the leg then refused with "enables never attempted" naming enables that
+# were never re-tried.  That is what happened after the CR4 reserved-bit fix
+# (250-B): the five enables the pre-fix binary could not survive were still in
+# this file, so the fixed binary was never asked about any of them.  The list
+# is this run's, so this run starts it.
+[ -f skip.txt ] || : > skip.txt
+: > eskip.txt
 for pass in $(seq 1 60); do
   $PY sysprobe_mkblob.py reach_in.hex || exit 2
   $PY sysprobe_enables.py enabblob.S  || exit 2

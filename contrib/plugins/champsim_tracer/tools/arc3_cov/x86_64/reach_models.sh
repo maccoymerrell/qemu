@@ -31,7 +31,36 @@ cd "$E"
 gcc -O0 -Wall -static -o reach_probe "$T"/reach_probe.c || exit 2
 gcc -O2 -static -o cpuiddump "$T"/cpuiddump.c || exit 2
 
-"$U" -cpu max ./reach_probe < reach_in.hex > r_max_postfix.tsv || exit 2
+# EVERY PROBE IS BOUNDED, AND A PROBE THAT DOES NOT FINISH IS A REFUSAL
+# (finding 250-D).  reach_probe executes the whole encoding set in ONE
+# process, so an encoding that leaves the process looping takes the run with
+# it -- measured 2026-09-19: `-cpu Icelake-Server-v6` stopped after 388 of
+# 8,313 rows and sat there for 57 minutes, while every encoding around the
+# stopping point runs to completion ON ITS OWN under the same model.  The
+# hazard is not the timeout's absence alone.  Without one the loop below
+# hangs; WITH a bare `timeout` the non-zero status falls into the `else` arm
+# and the model is filed as "cannot enter long mode" -- a probe that never
+# finished, recorded as a measurement of the machine.  So 124 is separated
+# from every other status and stops the leg by name.
+RTMO=${CST_X86_REACH_TIMEOUT:-600}
+
+probe_refused() {   # $1 = cpu model, $2 = the partial output file
+  echo "reach_models REFUSING: the encoding sweep did not finish under" >&2
+  echo "  -cpu $1 within ${RTMO}s.  It stopped after" >&2
+  echo "  $(( $(wc -l < "$2") - 1 )) of $(grep -c . reach_in.hex) encodings;" >&2
+  echo "  the last one it reported is '$(tail -1 "$2" | cut -f1)', so the" >&2
+  echo "  encoding that did not return is the next one in reach_in.hex." >&2
+  echo "  A model whose probe did not finish is not a model whose results" >&2
+  echo "  may be scored, and it is NOT the same fact as a model that cannot" >&2
+  echo "  enter long mode -- which is what this would be filed as if the" >&2
+  echo "  status were merely non-zero." >&2
+  exit 5
+}
+
+timeout "$RTMO" "$U" -cpu max ./reach_probe < reach_in.hex > r_max_postfix.tsv
+rc=$?
+[ $rc -eq 124 ] && probe_refused max r_max_postfix.tsv
+[ $rc -eq 0 ] || exit 2
 
 $U -cpu help 2>&1 | sed -n '/^Available CPUs:/,/^$/p' | tail -n +2 \
     | awk '{print $1}' | grep -v '^$' | sort -u > models.txt
@@ -43,10 +72,14 @@ rm -rf permodel cpuid; mkdir -p permodel cpuid
 while read -r m; do
     # A model that cannot enter long mode is not a configuration this ISA can
     # be reached under, and it says so itself.
-    if $U -cpu "$m" ./reach_probe < reach_in.hex > permodel/"$m".tsv 2>/dev/null
-    then
+    timeout "$RTMO" "$U" -cpu "$m" ./reach_probe < reach_in.hex \
+        > permodel/"$m".tsv 2>/dev/null
+    rc=$?
+    if [ $rc -eq 0 ]; then
         echo "$m" >> models.64.txt
         $U -cpu "$m" ./cpuiddump > cpuid/"$m".tsv 2>/dev/null
+    elif [ $rc -eq 124 ]; then
+        probe_refused "$m" permodel/"$m".tsv
     else
         echo "$m" >> models.no64.txt
         rm -f permodel/"$m".tsv
@@ -56,8 +89,11 @@ echo "models: $(wc -l < models.64.txt) 64-bit-capable, \
 $(wc -l < models.no64.txt) 32-bit-only"
 
 ACC=$(sed 's/^/,+/' flags.all | tr -d '\n')
-$U -cpu "max$ACC" ./reach_probe < reach_in.hex > r_maxall_postfix.tsv \
-    2> r_maxall_postfix.err || exit 2
+timeout "$RTMO" "$U" -cpu "max$ACC" ./reach_probe < reach_in.hex \
+    > r_maxall_postfix.tsv 2> r_maxall_postfix.err
+rc=$?
+[ $rc -eq 124 ] && probe_refused "max+every-flag" r_maxall_postfix.tsv
+[ $rc -eq 0 ] || exit 2
 $U -cpu "max$ACC" ./cpuiddump > cpuid/__maxallflags.tsv 2>/dev/null
 echo "CPUID flags forced: $(wc -l < flags.all), of which TCG refuses \
 $(wc -l < r_maxall_postfix.err)"

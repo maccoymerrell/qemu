@@ -1482,27 +1482,68 @@ for e, v in ext_dis.most_common(25):
 w('')
 _maskrows = sum(v for m, v in mech_count.items()
                 if m.startswith('M1') or m.startswith('M2'))
-mrows = [r for r in rows if r[6] == 'DISAGREE' and 'REG_PRED' in r[7]]
-w('M1/M1b/M1c/M2 -- THE EVEX MASK CLASSES (%d rows; %d carry REG_PRED)'
-  % (_maskrows, len(mrows)))
-w('THE CAUSE THAT USED TO BE PRINTED HERE IS RETRACTED, NOT RE-STATED.  This')
-w('paragraph said the tracer\'s operand walker drops the EVEX mask because')
-w('Capstone 6.0-Alpha7 hands it over with access == 0, and it printed a')
-w('correlation against `b_unkreg`, the column in which isaxcheck reported')
-w('that condition.  Neither half survives: the operand walk is gone, the')
-w('tracer arm is QEMU\'s own translation-time statements read out of a')
-w('capture (sled_fields.py), and there is no b_unkreg column in it -- the')
-w('leg died here with a KeyError rather than print a number, which is the')
-w('correct failure.  Re-printing the correlation is impossible and asserting')
-w('the cause without it would be a claim about a decoder that no longer')
-w('participates.')
+# THE MASK POPULATION IS MEASURED OVER THE WHOLE TABLE, not read out of one
+# note column.  A mask register can appear on EITHER side of EITHER set, and
+# the row that matters is any row where it appears at all.
+mrows = [r for r in rows
+         if any('REG_PRED' in (r[c] or '') for c in (8, 9, 10, 11))]
+# And the EVEX population itself, from the bytes.
+def _first_opcode_byte(hexs):
+    b, i = tcgscope._strip_prefixes(hexs)
+    return b[i] if i < len(b) else ''
+_evex = [r for r in rows if _first_opcode_byte(r[4]) == '62']
+_evex_verdict = collections.Counter(r[6] for r in _evex)
+_evex_absent = tcgscope.facts().evex_prefix_absent()
+# A ZERO FROM A CLASSIFIER NOBODY HAS WATCHED FIRE IS NOT A MEASUREMENT.
+# mechanism() is asked for all four labels on constructed token sets before
+# the count below is printed; if any of them cannot be produced the class is
+# unreportable and this leg stops, because "0 rows" would then be a statement
+# about the instrument rather than about the corpus.
+_probe = {
+    'M1': mechanism('X', 'X', ['REG_PRED0'], [], [], [], '-', '-', '-'),
+    'M1b': mechanism('X', 'X', [], [], ['REG_PRED0'], [], '-', '-', '-'),
+    'M1c': mechanism('X', 'X', ['REG_PRED0', 'REG_GPR3'], [], [], [],
+                     '-', '-', '-'),
+    'M2': mechanism('X', 'X', [], [], ['REG_VEC1'], ['REG_PRED0'],
+                    '-', '-', '-'),
+}
+_dead = sorted(k for k, v in _probe.items() if not v.startswith(k + ' '))
+if _dead:
+    sys.exit('the EVEX mask classifier cannot produce %s on a constructed '
+             'input: its zero is a statement about the instrument, not about '
+             'the corpus, and may not be published' % ', '.join(_dead))
+w('M1/M1b/M1c/M2 -- THE EVEX MASK CLASSES (%d rows; %d rows name a mask '
+  'register anywhere)' % (_maskrows, len(mrows)))
+w('  classifier proven live first: all four labels returned on constructed')
+w('  token sets, so the counts above are the corpus speaking.')
 w('')
-w('SO THE CLASS IS STATED AND NOT ATTRIBUTED.  What is true at this tip is')
-w('only the count above: these rows are where the reference names a mask')
-w('register (k0-k7) that the wire\'s lists do not, or places it differently.')
-w('Attributing them needs a fresh read of what QEMU states at the EVEX')
-w('decode site, on this corpus, and that is not done here.  It is a NAMED')
-w('HOLE in this report, not a mechanism with a cause behind it.')
+w('THE CAUSE THAT USED TO BE PRINTED HERE WAS RETRACTED, AND THIS IS THE')
+w('READ THAT REPLACES IT.  The retracted paragraph said the tracer\'s operand')
+w('walker drops the EVEX mask because Capstone hands it over with access == 0.')
+w('That decoder no longer participates at all -- the tracer arm is QEMU\'s own')
+w('translation-time statements read out of a capture (sled_fields.py) -- so the')
+w('question was re-asked of QEMU, at the EVEX decode site, over this corpus.')
+w('')
+w('THERE IS NO EVEX DECODE SITE.  target/i386/tcg/decode-new.c.inc has no case')
+w('for 0x62 in its prefix loop and spends the byte on [0x62] = BOUND chk(i64),')
+w('which is illegal in long mode; qemu_tcg_scope reads that at every run and')
+w('evex_prefix_absent() reads %s at this tip.  So QEMU states NOTHING about a'
+  % _evex_absent)
+w('mask register for any encoding in this corpus -- not the wrong thing,')
+w('nothing -- and the three facts below are one fact seen three ways:')
+w('  EVEX-prefixed encodings in the denominator      : %d' % len(_evex))
+w('    their verdicts                                : %s'
+  % (', '.join('%s=%d' % kv for kv in sorted(_evex_verdict.items())) or '-'))
+w('  rows naming a mask register on any side         : %d' % len(mrows))
+w('  rows charged to M1 / M1b / M1c / M2             : %d' % _maskrows)
+w('')
+w('So the classes are EMPTY, and empty for a cause: the mask cannot be')
+w('misplaced by a decoder that never sees the prefix that carries it.  The')
+w('rows themselves are not silently dropped -- they are charged to')
+w('EVEX-PREFIX-NOT-DECODED in the out-of-scope table above, with the same')
+w('citation.  These four classes become measurable again the day QEMU decodes')
+w('0x62, and the selfcheck fails loudly on that day rather than leaving this')
+w('paragraph standing.')
 w('')
 w('LOSSY POINTS IN THE TRACER VOCABULARY ITSELF (independent of any sweep')
 w('row above): distinct architectural registers sharing one GenericRegId.')

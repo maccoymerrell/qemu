@@ -43,11 +43,12 @@ gcc -O2 -static -o cpuiddump "$T"/cpuiddump.c || exit 2
 # finished, recorded as a measurement of the machine.  So 124 is separated
 # from every other status and stops the leg by name.
 RTMO=${CST_X86_REACH_TIMEOUT:-600}
+POP=$(grep -c . reach_in.hex)
 
 probe_refused() {   # $1 = cpu model, $2 = the partial output file
   echo "reach_models REFUSING: the encoding sweep did not finish under" >&2
   echo "  -cpu $1 within ${RTMO}s.  It stopped after" >&2
-  echo "  $(( $(wc -l < "$2") - 1 )) of $(grep -c . reach_in.hex) encodings;" >&2
+  echo "  $(( $(wc -l < "$2") - 1 )) of $POP encodings;" >&2
   echo "  the last one it reported is '$(tail -1 "$2" | cut -f1)', so the" >&2
   echo "  encoding that did not return is the next one in reach_in.hex." >&2
   echo "  A model whose probe did not finish is not a model whose results" >&2
@@ -57,10 +58,34 @@ probe_refused() {   # $1 = cpu model, $2 = the partial output file
   exit 5
 }
 
+# A SHORT TABLE AND AN EXIT STATUS OF ZERO (finding 250-G).  reach_probe
+# counts its own rows, but a probe whose control flow is stolen mid-file
+# never runs its epilogue -- which is exactly what happened: `c9` (LEAVE)
+# unwound the harness's frame and returned out of main, and the leg took
+# 7,892 of 8,313 rows as a finished sweep because the status was 0.  The
+# only place that can catch that is OUT HERE, so every sweep's row count
+# is compared with the population it was given, and a model with a short
+# table stops the leg by name rather than being scored.
+rows_or_refuse() {  # $1 = label, $2 = the output file
+  local got
+  got=$(( $(wc -l < "$2") - 1 ))
+  if [ "$got" -ne "$POP" ]; then
+    echo "reach_models REFUSING: the sweep under $1 exited 0 but wrote" >&2
+    echo "  $got rows for $POP encodings, a shortfall of $(( POP - got ))." >&2
+    echo "  The last row it reported is '$(tail -1 "$2" | cut -f1)', so the" >&2
+    echo "  encoding it did not answer for is the next one in reach_in.hex." >&2
+    echo "  A probe that stopped part way through has measured part of the" >&2
+    echo "  machine; nothing downstream can tell that from a finished run," >&2
+    echo "  so the leg stops here." >&2
+    exit 6
+  fi
+}
+
 timeout "$RTMO" "$U" -cpu max ./reach_probe < reach_in.hex > r_max_postfix.tsv
 rc=$?
 [ $rc -eq 124 ] && probe_refused max r_max_postfix.tsv
 [ $rc -eq 0 ] || exit 2
+rows_or_refuse max r_max_postfix.tsv
 
 $U -cpu help 2>&1 | sed -n '/^Available CPUs:/,/^$/p' | tail -n +2 \
     | awk '{print $1}' | grep -v '^$' | sort -u > models.txt
@@ -69,22 +94,48 @@ $U -cpu help 2>&1 | sed -n '/^Recognized CPUID flags:/,$p' | tail -n +2 \
 
 rm -rf permodel cpuid; mkdir -p permodel cpuid
 : > models.64.txt; : > models.no64.txt
+# THE SWEEPS RUN SIDE BY SIDE; EVERY VERDICT IS STILL TAKEN ONE AT A TIME.
+# reach_probe forks per encoding since 250-G, so a whole-set sweep costs about
+# 50s instead of about 1s, and 153 models in series is two hours of a leg that
+# is re-run every pass.  Each model is an independent process reading the same
+# input, so they can run at once -- but a model's ANSWER is adjudicated below,
+# serially, from its recorded status, so the refusals keep working and no
+# verdict depends on what else was running.  The parallelism is bounded by
+# CST_JOBS (default 12) under the host load ceiling, the same knob the ILLOPC
+# leg uses.
+cat > .permodel.sh <<'PM'
+#!/bin/bash
+# $1 = qemu binary, $2 = timeout seconds, $3 = model
+timeout "$2" "$1" -cpu "$3" ./reach_probe < reach_in.hex \
+    > permodel/"$3".tsv 2>/dev/null
+echo $? > permodel/"$3".rc
+PM
+chmod +x .permodel.sh
+xargs -P "${CST_JOBS:-12}" -I{} ./.permodel.sh "$U" "$RTMO" {} < models.txt
 while read -r m; do
     # A model that cannot enter long mode is not a configuration this ISA can
-    # be reached under, and it says so itself.
-    timeout "$RTMO" "$U" -cpu "$m" ./reach_probe < reach_in.hex \
-        > permodel/"$m".tsv 2>/dev/null
-    rc=$?
-    if [ $rc -eq 0 ]; then
+    # be reached under, and it says so itself.  A model with NO recorded
+    # status never ran: that is a leg that did not reach its subject, not a
+    # 32-bit-only model, and it stops the leg.
+    if [ ! -f permodel/"$m".rc ]; then
+        echo "reach_models REFUSING: -cpu $m has no recorded exit status," >&2
+        echo "  so its sweep never ran.  A model that was not measured is" >&2
+        echo "  not a model that cannot enter long mode." >&2
+        exit 7
+    fi
+    rc=$(cat permodel/"$m".rc)
+    if [ "$rc" -eq 0 ]; then
+        rows_or_refuse "-cpu $m" permodel/"$m".tsv
         echo "$m" >> models.64.txt
         $U -cpu "$m" ./cpuiddump > cpuid/"$m".tsv 2>/dev/null
-    elif [ $rc -eq 124 ]; then
+    elif [ "$rc" -eq 124 ]; then
         probe_refused "$m" permodel/"$m".tsv
     else
         echo "$m" >> models.no64.txt
         rm -f permodel/"$m".tsv
     fi
 done < models.txt
+rm -f permodel/*.rc .permodel.sh
 echo "models: $(wc -l < models.64.txt) 64-bit-capable, \
 $(wc -l < models.no64.txt) 32-bit-only"
 
@@ -94,6 +145,7 @@ timeout "$RTMO" "$U" -cpu "max$ACC" ./reach_probe < reach_in.hex \
 rc=$?
 [ $rc -eq 124 ] && probe_refused "max+every-flag" r_maxall_postfix.tsv
 [ $rc -eq 0 ] || exit 2
+rows_or_refuse "max+every-flag" r_maxall_postfix.tsv
 $U -cpu "max$ACC" ./cpuiddump > cpuid/__maxallflags.tsv 2>/dev/null
 echo "CPUID flags forced: $(wc -l < flags.all), of which TCG refuses \
 $(wc -l < r_maxall_postfix.err)"

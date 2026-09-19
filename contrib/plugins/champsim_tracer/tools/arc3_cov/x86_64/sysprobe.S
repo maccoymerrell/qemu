@@ -152,6 +152,36 @@ long_entry:
     call enab_stage
 #endif
 
+    /* ---- THE BASELINE EVERY PROBE IS RESTORED TO (FINDING 250-A) --------
+     *
+     * A CPL0 probe may LOAD machine state as well as write registers, and the
+     * loop's own attribution cannot see the difference.  `0f 01 10` is
+     * `lgdt (%rax)` with %rax pointing at the scratch buffer, so it replaces
+     * the GDT with whatever a previous probe left there; the encoding itself
+     * completes and reports its vector, and the NEXT encoding to take an
+     * exception dies loading CS from a table that is no longer a table.  The
+     * loop then names that neighbour -- the last hex it printed -- skips it,
+     * and the damage moves one along.  Measured 2026-09-19: 2,652 consecutive
+     * passes, each convicting a different innocent encoding, 2,586 of them
+     * stopping at the same line; removing `0f0110` alone lets the same 455
+     * encodings run to DONE, and `62f2fd494e00` -- the row the last pass
+     * convicted -- completes on its own with vector 6.
+     *
+     * So the baseline is snapshotted HERE, after the enable stage has set
+     * whatever it sets, and restore_machine() puts it back after every probe.
+     * That is not only a cost fix: it makes each encoding's verdict a
+     * property of the encoding instead of a property of what ran before it.
+     */
+    movq %cr0, %rax
+    movq %rax, base_cr0(%rip)
+    movq %cr4, %rax
+    movq %rax, base_cr4(%rip)
+    xorl %ecx, %ecx
+    xgetbv
+    movl %eax, base_xcr0_lo(%rip)
+    movl %edx, base_xcr0_hi(%rip)
+    stmxcsr base_mxcsr(%rip)
+
     /* ---------------------------------------------------------- main loop */
     /* The probed instruction may write ANY register, so no loop state is
      * held in one: the cursor and the index live in memory and are reloaded
@@ -193,7 +223,15 @@ next_enc:
     movq %rsp, saved_rsp(%rip)
     leaq scratch(%rip), %rax
     movq %rax, %rbx
-    movq %rax, %rcx
+    /* RCX IS THE STRING COUNT, AND A POINTER IS A TERRIBLE ONE.  Seeded with
+     * the scratch address like every other register, `rep stosb` writes a
+     * megabyte from %rdi -- over the stack, the code buffer and the probe
+     * itself -- and `rep insb` does the same from an I/O port.  Measured
+     * 2026-09-19: eight REP forms (f3aa f3ab f348ab f366ab f36c f36d f3666d
+     * and their siblings) killed the machine for that reason alone and could
+     * not be measured at all.  One iteration is the smallest seed that still
+     * EXECUTES the instruction, which is the whole question this probe asks. */
+    movq $1, %rcx
     movq %rax, %rdx
     movq %rax, %rsi
     movq %rax, %rdi
@@ -209,6 +247,7 @@ next_enc:
     callq *%r10
 resume_point:
     movq saved_rsp(%rip), %rsp
+    call restore_machine
 
     movq last_vec(%rip), %rdi
     call print_dec
@@ -230,6 +269,84 @@ done:
     outw %ax, %dx
 2:  hlt
     jmp 2b
+
+/* ------------------------------------------------- the per-probe restore */
+/*
+ * Put back the machine state a probe is allowed to have replaced, so that the
+ * next encoding is measured on the machine this image booted rather than on
+ * the wreckage of its predecessor.  See the snapshot above for the measurement
+ * that made this necessary.
+ *
+ * WHAT IS RESTORED, and why each one:
+ *   GDTR   -- `lgdt` takes its table from memory the probe cannot be trusted
+ *             with.  A bad GDT is invisible until the next exception, which
+ *             is why the loop convicted neighbours.
+ *   IDT    -- rebuilt, not merely re-pointed: `lidt` moves the register and a
+ *             stray store moves the table's contents, and both end the same
+ *             way.
+ *   DS/ES/SS/FS/GS -- a probe may load any of them.  CS is deliberately not
+ *             reloaded: only a far transfer changes it, and a probe that took
+ *             one is not coming back here.
+ *   CR3    -- `mov %rax,%cr3` points the walker at scratch.
+ *   CR4/CR0 -- a probe can clear OSFXSR or set TS without killing the machine,
+ *             and every later SSE or x87 encoding would then report a fault it
+ *             does not own.  A probe that clears PG or PE is already gone and
+ *             never reaches here; that one is a genuine wedge.
+ *   XCR0   -- `xsetbv` is in the population.
+ *   x87/MXCSR -- `fxrstor`/`xrstor` load both from scratch, so an unmasked
+ *             exception or a junk control word can outlive the probe that
+ *             loaded it.
+ *
+ * Page-table CONTENTS are not rebuilt.  A probe that writes through a garbage
+ * pointer can damage them, and that is a real limitation of this probe rather
+ * than something the restore quietly papers over -- CR3 is reloaded, the
+ * tables it names are not.
+ */
+restore_machine:
+    /* A fault raised BY THE RESTORE is a harness failure, not a measurement.
+     * The resume vector still points at resume_point here, which would re-run
+     * the restore and fault again forever, so it is moved first. */
+    leaq restore_fault(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+
+    lgdt gdtr(%rip)
+    call idt_init
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw %ax, %fs
+    movw %ax, %gs
+    movq $pml4, %rax
+    movq %rax, %cr3
+    movq base_cr4(%rip), %rax
+    movq %rax, %cr4
+    movq base_cr0(%rip), %rax
+    movq %rax, %cr0
+    movl base_xcr0_lo(%rip), %eax
+    movl base_xcr0_hi(%rip), %edx
+    xorl %ecx, %ecx
+    xsetbv
+    fninit
+    ldmxcsr base_mxcsr(%rip)
+    /* `std` is in the population, and a set direction flag sends the next
+     * string operation BACKWARDS out of the scratch buffer and into the code
+     * buffer and the page tables below it. */
+    cld
+
+    leaq resume_point(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    ret
+
+restore_fault:
+    movq saved_rsp(%rip), %rsp
+    leaq msg_rfault(%rip), %rdi
+    call print_str
+    movw $0x604, %dx
+    movw $0x2000, %ax
+    outw %ax, %dx
+1:  hlt
+    jmp 1b
 
 #ifdef ENABLE_LEG
 /* ------------------------------------------------- the ENABLE-BIT stage */
@@ -643,6 +760,7 @@ msg_enab:     .asciz "ENAB\t"
 msg_enabdone: .asciz "ENABDONE\n"
 #endif
 msg_c32:   .asciz "CODE32-AAD/AAM\t"
+msg_rfault: .asciz "RESTOREFAULT\n"
 
     .align 8
 isr_table:
@@ -678,6 +796,11 @@ ebits:      .skip 8
 evec:       .skip 8
 etook:      .skip 8
 emsr_val:   .skip 8
+base_cr0:   .skip 8
+base_cr4:   .skip 8
+base_xcr0_lo: .skip 4
+base_xcr0_hi: .skip 4
+base_mxcsr: .skip 4
 decbuf:     .skip 32
 
     .section .rodata

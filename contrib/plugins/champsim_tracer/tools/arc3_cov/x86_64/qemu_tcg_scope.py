@@ -48,6 +48,7 @@ QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
 _CPU_C = 'target/i386/cpu.c'
 _DECODE = 'target/i386/tcg/decode-new.c.inc'
 _TRANSLATE = 'target/i386/tcg/translate.c'
+_SEG_HELPER = 'target/i386/tcg/seg_helper.c'
 
 Scope = collections.namedtuple('Scope', 'mechanism citation remedy')
 
@@ -85,7 +86,19 @@ class QemuFacts(object):
         # this: CET has no CPUID bit in cpu.c, and f3 0f 1e fa runs anyway.
         self.hint_nops = self._hint_nops()
         # 0F escape opcodes whose decode-table entry carries chk(cpl0).
-        self.cpl0_0f = self._cpl0_0f()
+        self.cpl0_0f = self._chk_0f('cpl0')
+        # ... chk(smm): decoded, and refused outside System Management Mode.
+        self.smm_0f = self._chk_0f('smm')
+        # ... chk(i64_amd): decoded, and refused in long mode unless the CPU
+        # model's vendor is GenuineIntel.
+        self.i64_amd_0f = self._chk_0f('i64_amd')
+        # ... and the SAME two checks in the ONE-BYTE table, which is where
+        # HLT, CLI and STI live.  The 0F parse alone could not see them.
+        self.cpl0_root = self._chk_root('cpl0')
+        self.iopl_root = self._chk_root('iopl')
+        # Filled slots of the 0F 38 table.  An empty slot is not a feature
+        # gate and not a privilege check: the decoder has no entry at all.
+        self.f38_slots = self._f38_slots()
 
     def _read(self, rel):
         p = os.path.join(self.root, rel)
@@ -149,8 +162,83 @@ class QemuFacts(object):
         c = re.search(r'if \(\(s->prefix & PREFIX_REPZ\).*?\{', body, re.S)
         return c.group(0) if c else None
 
-    def _cpl0_0f(self):
-        """-> {second opcode byte} for 0F entries carrying chk(...cpl0...).
+    def _chk_root(self, kind):
+        """-> {opcode byte} for one-byte entries carrying chk(...KIND...).
+
+        The one-byte table spells its indices in UPPER case where the 0F table
+        uses lower, so the parse is case-insensitive in both directions and
+        normalises to lower.  At this tip cpl0 is {f4} (HLT) and iopl is
+        {fa, fb} (CLI, STI) -- read, not transcribed.
+        """
+        i = self.decode.index('X86OpEntry opcodes_root[256]')
+        t = self.decode[i:self.decode.index('\n};', i)]
+        out = set()
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-fA-F]{2})\] = X86_OP_\w+\((.*)', line)
+            if not m:
+                continue
+            if re.search(r'chk\d?\([^)]*\b%s\b[^)]*\)' % kind, m.group(2)):
+                out.add(m.group(1)[2:].lower())
+        return out
+
+    def iopl_enforced(self):
+        """-> True while X86_CHECK_cpl_iopl still #GPs a CPL > IOPL guest."""
+        return bool(re.search(
+            r'decode\.e\.check & X86_CHECK_cpl_iopl\)\s*\{\s*'
+            r'if \(IOPL\(s\) < CPL\(s\)\)\s*\{\s*goto gp_fault;',
+            self.decode, re.S))
+
+    def _f38_slots(self):
+        """-> {index} of the FILLED slots of opcodes_0F38_00toEF.
+
+        A 0F 38 opcode whose slot is empty is not gated and not privileged:
+        `decode_insn` finds no entry and falls to gen_unknown_opcode(), which
+        is a different fact from every other exclusion in this file and the
+        only one the ILLOPC leg can corroborate directly.
+        """
+        i = self.decode.index('X86OpEntry opcodes_0F38_00toEF[240]')
+        t = self.decode[i:self.decode.index('\n};', i)]
+        out = set()
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-f]{2})\]\s*=\s*X86_OP_', line)
+            if m:
+                out.add(int(m.group(1), 16))
+        return out
+
+    def smm_enforced(self):
+        """-> True while X86_CHECK_smm still #UDs a guest outside SMM."""
+        return bool(re.search(
+            r'\(decode\.e\.check & X86_CHECK_smm\) && !\(s->flags & '
+            r'HF_SMM_MASK\)\)\s*\{\s*goto illegal_op;', self.decode, re.S))
+
+    def i64_amd_enforced(self):
+        """-> True while X86_CHECK_i64_amd still #UDs a non-Intel long mode."""
+        return bool(re.search(
+            r'\(decode\.e\.check & X86_CHECK_i64_amd\) && '
+            r'env->cpuid_vendor1 != CPUID_VENDOR_INTEL_1\)\s*\{\s*'
+            r'goto illegal_op;', self.decode, re.S))
+
+    def sysenter_cs_gate(self):
+        """-> True while helper_sysenter still #GPs on an unprogrammed MSR."""
+        seg = self._read(_SEG_HELPER)
+        m = re.search(r'void helper_sysenter\(CPUX86State \*env\).*?\n\}\n',
+                      seg, re.S)
+        if not m:
+            return False
+        return bool(re.search(r'if \(env->sysenter_cs == 0\)\s*\{\s*'
+                              r'raise_exception_err_ra\(env, EXCP0D_GPF',
+                              m.group(0), re.S))
+
+    def _chk_0f(self, kind):
+        """-> {second opcode byte} for 0F entries carrying chk(...KIND...).
+
+        READ FROM THE TABLE, NOT LISTED HERE.  The cpl0 set at this tip is
+        06 07 20 21 22 23 30 32 35 -- CLTS, SYSRET, MOV to/from CR and DR,
+        WRMSR, RDMSR, SYSEXIT -- and it is parsed so that an entry gaining or
+        losing the check moves this set with it instead of leaving a
+        transcribed list behind.  The same parse serves `smm` (RSM) and
+        `i64_amd` (SYSENTER, SYSEXIT), whose checks live in the same file and
+        exclude a row for their own reasons.
 
         READ FROM THE TABLE, NOT LISTED HERE.  The set at this tip is
         06 07 20 21 22 23 30 32 35 -- CLTS, SYSRET, MOV to/from CR and DR,
@@ -177,7 +265,7 @@ class QemuFacts(object):
             if not m:
                 continue
             rest = m.group(2)
-            if re.search(r'chk\d?\([^)]*\bcpl0\b[^)]*\)', rest):
+            if re.search(r'chk\d?\([^)]*\b%s\b[^)]*\)' % kind, rest):
                 out.add(m.group(1)[2:])
         return out
 
@@ -451,13 +539,47 @@ _CITE = {
             '[(w << 3) | reg] straight into the hole.  The undocumented '
             'TEST alias real silicon executes as /0 is not in this '
             'decoder at all',
-    'cpl0': '%s -- the 0F entry for this opcode carries chk(...cpl0...), and '
+    'iopl': '%s -- the one-byte entry for this opcode carries chk(...iopl...), '
+            'and the same file enforces it: `else if (decode.e.check & '
+            'X86_CHECK_cpl_iopl) { if (IOPL(s) < CPL(s)) { goto gp_fault; } }`.'
+            '  The set parsed out of opcodes_root at this tip is %s.  A '
+            'qemu-user guest runs at CPL 3 with IOPL 0, so IOPL < CPL always '
+            'holds and the check faults at translation; no instruction is '
+            'executed and there are no register lists to carry',
+    'cpl0': '%s -- the entry for this opcode carries chk(...cpl0...), and '
             'the same file enforces it: `if (decode.e.check & '
             'X86_CHECK_cpl0) { if (CPL(s) != 0) { goto gp_fault; } }`.  The '
-            'set parsed out of opcodes_0F at this tip is %s.  qemu-user '
+            'sets parsed at this tip are %s from opcodes_0F and %s from the '
+            'one-byte opcodes_root.  qemu-user '
             'x86_64 runs every guest instruction at CPL 3, so on THIS leg\'s '
             'execution model the check faults before any chain exists and '
             'there are no register lists to carry',
+    'smm': '%s -- the 0F entry for this opcode carries chk(...smm...), and '
+           'the same file enforces it: `if ((decode.e.check & X86_CHECK_smm) '
+           '&& !(s->flags & HF_SMM_MASK)) { goto illegal_op; }`.  The set '
+           'parsed out of opcodes_0F at this tip is %s.  HF_SMM_MASK is set '
+           'only while a guest is inside an SMI handler; qemu-user models no '
+           'SMM at all, so the check refuses the bytes with #UD and no '
+           'instruction is ever executed',
+    'i64amd': '%s -- the 0F entry for this opcode carries chk(...i64_amd...), '
+              'and the same file enforces it in 64-bit code: `if '
+              '((decode.e.check & X86_CHECK_i64_amd) && env->cpuid_vendor1 != '
+              'CPUID_VENDOR_INTEL_1) { goto illegal_op; }`.  The set parsed '
+              'out of opcodes_0F at this tip is %s.  qemu-x86_64 -cpu max '
+              'reports AuthenticAMD, so the #UD fires and the row measures '
+              'signal 4.  ON AN INTEL-VENDOR MODEL IT DOES NOT, and the row '
+              'is still unreachable one step later: gen_SYSENTER emits '
+              'helper_sysenter(), which opens `if (env->sysenter_cs == 0) '
+              'raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC())` in %s, '
+              'and qemu-user has no path that writes IA32_SYSENTER_CS.  Both '
+              'arms are on the model matrix: signals {4,11} across the CPU '
+              'models, and 0 models ran it',
+    'f38hole': '%s -- opcodes_0F38_00toEF[240] fills %d of its 240 slots and '
+               'this opcode (0F %s) is not one of them, so decode_insn() '
+               'finds no entry and falls to gen_unknown_opcode().  The ILLOPC '
+               'leg corroborates it directly: QEMU logs ILLOPC for this '
+               'encoding under -d unimp, which is reached ONLY when the '
+               'tables have nothing',
     'ud': '%s -- [0x0b] = X86_OP_ENTRY0(UD) (UD2), [0xb9] and [0xff] = '
           'X86_OP_ENTRYr(UD, ...) (UD1, UD0); gen_UD() in '
           'target/i386/tcg/emit.c.inc is gen_illegal_opcode().  QEMU decodes '
@@ -571,9 +693,19 @@ def classify(hexs, ext, isa_set, root=None):
     # qemu-system-x86_64 guest at CPL 0 runs them, and that is an ordinary
     # kernel doing ordinary work.  Saying so is the difference between a
     # boundary and an excuse.
-    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.cpl0_0f:
+    #
+    # THE ONE-BYTE TABLE IS THE SAME MECHANISM AND IT WAS NOT BEING READ.
+    # HLT is `[0xF4] = X86_OP_ENTRY0(HLT, chk(cpl0) svm(HLT))` in opcodes_root,
+    # not in opcodes_0F, so a parse that walked only the 0F table left it
+    # uncited.  It surfaced the moment the reachability table was complete
+    # (250-G): with 421 encodings unmeasured the row had never been measured
+    # unreachable in the first place.
+    if ((op == '0f' and i + 1 < len(b) and b[i + 1] in f.cpl0_0f) or
+            op in f.cpl0_root):
         return Scope('CPL0-ONLY-AND-THIS-LEG-RUNS-AT-CPL3',
-                     _CITE['cpl0'] % (_DECODE, ' '.join(sorted(f.cpl0_0f))),
+                     _CITE['cpl0'] % (_DECODE,
+                                      ' '.join(sorted(f.cpl0_0f)),
+                                      ' '.join(sorted(f.cpl0_root))),
                      'a guest at CPL 0 -- qemu-system-x86_64 in long mode, '
                      'which this leg does NOT use for its register '
                      'comparison.  The leg does probe CPL 0 separately '
@@ -581,6 +713,51 @@ def classify(hexs, ext, isa_set, root=None):
                      'vector there), so whether a given row would run at CPL 0 '
                      'is a measured question with its own answer; read that '
                      'file rather than assuming this row would')
+
+    # IOPL-GATED INSTRUCTIONS.  CLI and STI are not CPL0-only -- the
+    # architecture lets a task with IOPL >= CPL run them, which is what makes
+    # them different from HLT and why they need their own citation rather than
+    # being folded into the one above.  qemu-user runs at CPL 3 with IOPL 0
+    # and has no way to raise IOPL, so on THIS leg the condition IOPL >= CPL
+    # can never hold and the check faults every time.
+    if op in f.iopl_root:
+        return Scope('IOPL-GATED-AND-THIS-LEG-RUNS-AT-CPL3-WITH-IOPL-0',
+                     _CITE['iopl'] % (_DECODE, ' '.join(sorted(f.iopl_root))),
+                     'a guest whose IOPL is at least its CPL -- an ordinary '
+                     'kernel at CPL 0, or a task a kernel has granted IOPL 3.  '
+                     'qemu-user grants neither and models no path that could, '
+                     'so the row is out of scope for this leg and not for QEMU '
+                     'TCG; qemu-system-x86_64 runs both instructions')
+
+    # SMM-ONLY INSTRUCTIONS.  RSM is the whole class: the entry exists, it is
+    # not privilege-gated, and the check that refuses it is about a MODE no
+    # guest of this leg is ever in.  qemu-user has no SMM at all, and a system
+    # guest is in SMM only inside an SMI handler -- which is the one place RSM
+    # is the correct instruction and the one place it is reachable.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.smm_0f:
+        return Scope('SMM-ONLY-AND-NO-GUEST-HERE-IS-IN-SMM',
+                     _CITE['smm'] % (_DECODE, ' '.join(sorted(f.smm_0f))),
+                     'a system guest already inside System Management Mode, '
+                     'which is where RSM is the instruction that belongs.  '
+                     'qemu-user never sets HF_SMM_MASK, so on this leg the '
+                     'check faults before any chain exists')
+
+    # LONG MODE ON A NON-INTEL VENDOR.  SYSENTER carries chk2(i64_amd, ...):
+    # in 64-bit code QEMU refuses it outright unless the CPU model's vendor
+    # is GenuineIntel.  The row is unreachable on this leg for TWO reasons in
+    # sequence and both are measured, so both are cited -- on an Intel-vendor
+    # model the #UD does not fire and the instruction is decoded, and it is
+    # the ARCHITECTURE that then refuses it.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.i64_amd_0f:
+        return Scope('INTEL-VENDOR-IN-LONG-MODE-THEN-AN-UNPROGRAMMED-MSR',
+                     _CITE['i64amd'] % (_DECODE,
+                                        ' '.join(sorted(f.i64_amd_0f)),
+                                        _SEG_HELPER),
+                     'a system guest on an Intel-vendor CPU model that has '
+                     'programmed IA32_SYSENTER_CS, which is an ordinary '
+                     'kernel setting up its fast-entry path.  Neither half is '
+                     'available to a qemu-user guest: the vendor is the '
+                     'model\'s and the MSR is never written')
 
     if isa_set.startswith('APX_') or ext.startswith('APX'):
         return Scope('QEMU-MODELS-NO-SUCH-FEATURE',
@@ -600,6 +777,24 @@ def classify(hexs, ext, isa_set, root=None):
         if not f.supports(sym):
             return Scope('CPUID-FEATURE-OUTSIDE-TCG',
                          _CITE['nofeat'] % (_CPU_C, sym, vocab), _REMEDY_TCG)
+
+    # AN EMPTY SLOT IN THE 0F 38 TABLE, AND IT IS THE LAST THING ASKED.
+    # This is deliberately after the CPUID routes: a row those can charge to a
+    # feature keeps that citation, because "QEMU models no such feature" says
+    # more than "no entry".  What is left here is the case they cannot reach --
+    # INVPCID is the one at this tip -- where QEMU ADVERTISES the CPUID bit and
+    # still has no decode entry, so a guest that reads CPUID and issues the
+    # instruction takes #UD.  That is a QEMU defect, and naming it is the point;
+    # charging the row to the tracer would hide it.
+    if (op == '0f' and i + 2 < len(b) and b[i + 1] == '38' and
+            int(b[i + 2], 16) < 0xf0 and
+            int(b[i + 2], 16) not in f.f38_slots):
+        return Scope('NO-DECODE-ENTRY-IN-THE-0F38-TABLE',
+                     _CITE['f38hole'] % (_DECODE, len(f.f38_slots),
+                                         b[i + 1] + ' ' + b[i + 2]),
+                     'nothing on this accelerator: there is no entry to '
+                     'reach.  The row is QEMU\'s own gap and the fix is an '
+                     'entry in that table, not anything the tracer can do')
     return None
 
 
@@ -665,10 +860,58 @@ def selfcheck(root=None):
         bad.append('SYSRET (0F 07) or WRMSR (0F 30) no longer reads as a '
                    'cpl0-checked entry in %s: the CPL0-ONLY citation is '
                    'written against a decoder that has moved' % _DECODE)
+    if 'f4' not in f.cpl0_root:
+        bad.append('HLT (F4) no longer reads as a chk(...cpl0...) entry in the '
+                   'one-byte table of %s: the CPL0-ONLY citation no longer '
+                   'covers the row it was extended for' % _DECODE)
+    if f.iopl_root != {'fa', 'fb'}:
+        bad.append('the one-byte chk(...iopl...) set is %s, not {fa, fb}: CLI '
+                   'and STI are the citation\'s whole subject and the parse '
+                   'has moved off them' % sorted(f.iopl_root))
+    if not f.iopl_enforced():
+        bad.append('X86_CHECK_cpl_iopl no longer #GPs a guest with IOPL < CPL '
+                   'in %s: the IOPL-GATED exclusion rests on that fault and is '
+                   'stale' % _DECODE)
     if not f.cpl0_enforced():
         bad.append('X86_CHECK_cpl0 no longer faults a CPL != 0 guest in %s: '
                    'the CPL0-ONLY exclusion rests on that fault and is stale'
                    % _DECODE)
+    # THE SAME TWO HALVES FOR THE TWO CHECKS THAT JOINED IT, and a parse that
+    # finds nothing is broken rather than permissive in both cases.
+    if 'aa' not in f.smm_0f:
+        bad.append('RSM (0F AA) no longer reads as a chk(...smm...) entry in '
+                   '%s: the SMM-ONLY citation is written against a decoder '
+                   'that has moved, and the row it excused is unjustified'
+                   % _DECODE)
+    if not f.smm_enforced():
+        bad.append('X86_CHECK_smm no longer #UDs a guest outside SMM in %s: '
+                   'the SMM-ONLY exclusion rests on that fault and is stale'
+                   % _DECODE)
+    if '34' not in f.i64_amd_0f:
+        bad.append('SYSENTER (0F 34) no longer reads as a chk(...i64_amd...) '
+                   'entry in %s: the INTEL-VENDOR citation is written against '
+                   'a decoder that has moved' % _DECODE)
+    if not f.i64_amd_enforced():
+        bad.append('X86_CHECK_i64_amd no longer #UDs a non-Intel vendor in '
+                   'long mode in %s: the first half of the SYSENTER citation '
+                   'is stale' % _DECODE)
+    if not f.sysenter_cs_gate():
+        bad.append('helper_sysenter() in %s no longer raises #GP while '
+                   'env->sysenter_cs is 0: the SECOND half of the SYSENTER '
+                   'citation -- the one that covers Intel-vendor models -- is '
+                   'stale, and the row may now be reachable' % _SEG_HELPER)
+    # The 0F38 hole argument rests on the table being parsed at all, and on
+    # the slot it names still being empty.  A parse that returns nothing would
+    # excuse every 0F 38 row in the space.
+    if len(f.f38_slots) < 100:
+        bad.append('opcodes_0F38_00toEF parses as only %d filled slots: the '
+                   'parse is broken, not the decoder, and every row the '
+                   'NO-DECODE-ENTRY citation excused is unjustified'
+                   % len(f.f38_slots))
+    if 0x82 in f.f38_slots:
+        bad.append('0F 38 82 (INVPCID) now HAS a decode entry in %s: QEMU can '
+                   'decode it, the row is REACHABLE, and the '
+                   'NO-DECODE-ENTRY exclusion must be withdrawn' % _DECODE)
     for must in ('AVX2', 'BMI1', 'SHA_NI', 'CMPCCXADD'):
         if must not in f.decoder_feats:
             bad.append('X86_FEAT_%s missing from the parsed decoder '

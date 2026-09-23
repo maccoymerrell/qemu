@@ -6348,10 +6348,26 @@ static void finish_trace_segment(bool prev_executed = true,
          * by the tracer.  The occupancy delta below is still this thread's
          * (the post pass ran on it, and only on it).
          */
+        /*
+         * EVERY NAMED FATE, INCLUDING THE DIVERTED ONE.
+         *
+         * classify_fault_enter's exception-table fixup retires a frame
+         * outright — champsim_tracer_path_builder.cc counts it in
+         * census_frames_diverted and then erases it from frames_, so the
+         * frame is neither merged, unwound, orphaned nor still held.
+         * Leaving that term out of the sum made the identity read BROKEN
+         * on every run that took a fixup return, which is the one shape
+         * the identity is NOT about: the fate has a name and the report
+         * prints it one line above the verdict.  (Measured on
+         * system_thread_mipsel: opened=5, merged=1, unwound=0,
+         * orphan=0, held=0, diverted=4 — 5 != 1, and 5 == 1 + 4 with
+         * the term.)  The verdict still breaks for a fate the census
+         * cannot name, which is what it is for.
+         */
         const Stats s = stats_snapshot();
         const uint64_t frames_fated =
             s.census_frames_merged + s.census_frames_unwound_dropped +
-            s.census_frames_orphan_dropped;
+            s.census_frames_diverted + s.census_frames_orphan_dropped;
         const uint64_t frames_live =
             g_stats.census_frames_held_at_close - held_frames_before;
         const bool frames_ok =

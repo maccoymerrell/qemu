@@ -6,9 +6,10 @@
  * handle space) and per-thread (MRU per-vCPU cache in TLS so the
  * common case avoids the lock).  Entries populated lazily.
  *
- * AArch64 SVE z-registers are aliased to FPU v-registers because
- * Capstone reports v-names but QEMU may register only the SVE
- * descriptors.
+ * AArch64 SVE z-registers are aliased to FPU v-registers because the
+ * value-read route names v0..v31 while a CPU with SVE registers only
+ * the SVE descriptors, spelled z0..z31 (see insert_aarch64_reg_aliases
+ * in champsim_tracer_isa_properties.cc).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

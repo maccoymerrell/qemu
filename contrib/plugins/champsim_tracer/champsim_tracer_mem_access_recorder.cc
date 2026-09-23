@@ -370,19 +370,23 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
         return -1;
     };
     /*
-     * Impossibility check at emit, mirroring the offline lint
-     * (tools/cst_lint.h): a memop resolving to a slot whose insn has
-     * static max loads AND stores both zero cannot be that insn's own
-     * traffic.  Exempt (see cst_lint.h for the full rationale):
-     * atomics and the explicit memory classes (Capstone 6.0.0-Alpha7
-     * leaves aarch64 register-offset / LSE-atomic MEM access flags
-     * empty), PUSH / POP / RET (implicit stack traffic; corner
-     * encodings like `pop %rsp` and `iretq` carry no static slot),
-     * segment-register writers (the descriptor fetch QEMU's
-     * segment-load helper performs is that mov's own load), and the
-     * synthetic-EA classes (record_synthetic_load mints load-style
-     * memops with no static slot).  A few byte tests on the hot path,
-     * reached only for slots whose static counts are already zero.
+     * Impossibility check at emit, the runtime sibling of the offline
+     * lint (tools/cst_lint.h): a memop resolving to a slot whose static
+     * max loads AND stores are both zero cannot be that insn's own
+     * traffic.  Both counts are QEMU's — they come from the per-access
+     * rows the seating reads (champsim_tracer_qdep.cc), so a zero here
+     * is the emulator saying the instruction performs no access.
+     *
+     * The exemption list below is WIDER than the offline lint's, which
+     * deliberately does not exempt the definitionally-memory classes.
+     * Exempt here: atomics and the explicit memory classes, PUSH / POP
+     * / RET (implicit stack traffic; corner encodings like `pop %rsp`
+     * and `iretq` carry no static slot), segment-register writers (the
+     * descriptor fetch QEMU's segment-load helper performs is that
+     * mov's own load), and the synthetic-EA classes
+     * (record_synthetic_load mints load-style memops with no static
+     * slot).  A few byte tests on the hot path, reached only for slots
+     * whose static counts are already zero.
      */
     static std::atomic<uint32_t> impossible_warned_gen{0};
     auto note_impossible_slot = [&](int slot) {

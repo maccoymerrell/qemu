@@ -1673,7 +1673,8 @@ BBTemplate *TemplateStore::create_tb_template(
                           "QdepRefusal and the capture's spelling disagree");
             /*
              * Static branch target as resolved by the per-ISA
-             * translator, not Capstone.  See
+             * translator and read out through
+             * qemu_plugin_insn_branch_target_pc().  See
              * InsnFields::taken_target_pc.  0 means "no static target"
              * — non-branch or indirect; WP-resolution routes those
              * through the observed-target history instead.

@@ -706,9 +706,11 @@ static inline void insn_reg_names_scratch_reset(InsnRegNamesScratch *s)
  * Synthetic effective-address descriptor for instructions whose
  * canonical TCG translation does not emit a memory op (prefetch hints,
  * cache-line clean/flush/invalidate, TLB invalidate, ...).  Filled at
- * translation time from the Capstone memory operand; consumed at exec
- * time by a per-insn callback that reads base / index register values
- * and computes ea = base + (index << shift_amount) * scale + disp.
+ * translation time by qdep_synthetic_ea() from the synthetic-EA rows
+ * the decode site states (qemu_plugin_insn_synthetic_eas()); consumed
+ * at exec time by a per-insn callback that reads base / index register
+ * values and computes
+ * ea = base + (index << shift_amount) * scale + disp.
  *
  * has_addr is the discriminator: a zero descriptor means "no
  * synthetic EA for this insn."  base_key == NULL means the base
@@ -957,9 +959,10 @@ struct BBTemplate {
      * pool_bytes is kept for footprint accounting. */
     void *insn_fields_pool;
     uint32_t insn_fields_pool_bytes;
-    /* Optional: parallel Capstone-name array, one entry per insn.
-     * Allocated only when reg-data capture is enabled at translation
-     * time. */
+    /* Optional: parallel per-insn arrays of QEMU register keys — the
+     * (feature, name) pairs a VALUE read needs — seated alongside the
+     * generic ids by qdep_apply().  Allocated only when reg-data
+     * capture is enabled at translation time. */
     InsnRegNames *insn_reg_names;
     /* Per-insn opaque udata for the reg-snap exec callback; lifetime
      * equals the BBTemplate's.  Allocated only when reg-data is on. */

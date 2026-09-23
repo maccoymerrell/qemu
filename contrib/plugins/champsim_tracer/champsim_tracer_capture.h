@@ -63,26 +63,20 @@ struct qemu_plugin_tb;
 struct InsnFields;
 
 /*
- * What the classification looked like at ONE point in the refiner chain.
+ * What the classification looked like at ONE point in a refiner chain --
+ * HISTORY, WITH NO PRODUCER AND NO CONSUMER AT THIS TIP.
  *
- * The alias refiners are the only wire-bearing Capstone reads the corpora
- * could not score, because nothing recorded the answer they were handed.
- * They key on the PRINTED MNEMONIC to separate what one Capstone instruction
- * id merged -- aarch64 `b` from `b.<cc>`, mips `jr $ra` from `jr $rN`, `bal`'s
- * false conditional, riscv's alias-hidden link register and the C-extension
- * HINT code points -- so the question a scorer has to answer is not "what is
- * the branch type" but "WHICH SIDE PRODUCED IT", and that needs the value
- * before as well as after.
- *
- * Declared outside the CST_CAPTURE guard because the decoder takes the two
- * snapshots either way, which is what keeps the guard out of the decoder.
- * They cost the release build nothing, and that is MEASURED rather than
- * assumed: the entry point below is an empty inline there, and an A/B of the
- * shipped object with and without the snapshots leaves .text, .rodata and
- * .data.rel.ro BYTE-IDENTICAL.  The `.so` file's own sha does move, because
- * its build-id and debug line tables move with any source edit at all -- so
- * the file hash is the wrong instrument for this question and the section
- * contents are the right one.
+ * It was shaped for the mnemonic-keyed alias refiners, which were the only
+ * wire-bearing second-decoder reads the corpora could not score: nothing
+ * recorded the answer they were handed, so the question a scorer had to
+ * answer was not "what is the branch type" but "WHICH SIDE PRODUCED IT", and
+ * that needs the value before as well as after.  Those refiners are the
+ * offline referee's now (tools/cst_referee.py, refine_alias_fields), the
+ * branch class the splitter and the template read is the decode rule's own
+ * generic word, and nothing in this plugin fills or reads this type or the
+ * CST_ALIAS_DUMP corpus beside it.  Retiring both is a separate change; the
+ * shape is recorded here so a reader is not misled into looking for the
+ * writer.
  */
 struct InsnAliasSnap {
     uint8_t branch_type;

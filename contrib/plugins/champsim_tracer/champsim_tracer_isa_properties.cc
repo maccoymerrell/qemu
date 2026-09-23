@@ -215,18 +215,18 @@ const IsaProperties isa_properties[] = {
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
     },
     [TRACE_ISA_RISCV]   = {
-        /* RISC-V MUST fold implicit regs too.  The vector-configuration
-         * CSRs are the reason: `vl` and `vtype` never appear in an
-         * operand field — `vsetvli` names only its GPR destination and a
-         * vector op names only its vector registers — so without the
-         * fold the edge every RVV instruction has on the `vsetvli` that
-         * configured it does not exist, and a vector kernel's ops float
-         * free of their own configuration.  The same applies to the FP
-         * rounding mode `frm` on scalar and vector FP.  The historical
-         * double-count worry is moot for the same reason it is on MIPS:
-         * add_src/dst_cap_reg dedup by generic reg id, so a register
-         * named both by an operand and by the implicit list occupies one
-         * slot. */
+        /* The referee must fold RISC-V's implicit regs too.  The
+         * vector-configuration CSRs are the reason: `vl` and `vtype`
+         * never appear in an operand field — `vsetvli` names only its
+         * GPR destination and a vector op names only its vector
+         * registers — so a reference column built from operands alone
+         * would lack the edge every RVV instruction has on the
+         * `vsetvli` that configured it, and would score the wire's edge
+         * as a fabrication.  The same applies to the FP rounding mode
+         * `frm` on scalar and vector FP.  Double-counting is not a
+         * worry: the referee's _add() dedups by generic reg id, so a
+         * register named both by an operand and by the implicit list
+         * occupies one slot. */
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_riscv,
         .canonicalize_addr = riscv_canonicalize_addr,
@@ -236,13 +236,15 @@ const IsaProperties isa_properties[] = {
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
-        /* MIPS MUST fold implicit regs: the HI:LO accumulator never
-         * appears in MULT / DIV / MFHI / MFLO operand fields — only in
-         * Capstone's implicit regs_read/regs_write — so without the
-         * fold the whole accumulator dependency chain vanishes (mfhi
-         * appears input-less).  The historical double-count worry is
-         * moot: add_src/dst_cap_reg dedup by generic reg id.  (Caught
-         * by probe_implicit_acc.) */
+        /* The referee must fold MIPS's implicit regs: the HI:LO
+         * accumulator never appears in MULT / DIV / MFHI / MFLO operand
+         * fields — only in the reference decoder's implicit
+         * regs_read/regs_write lists — so a reference column built from
+         * operands alone would show the whole accumulator dependency
+         * chain missing (mfhi input-less) and score the wire's chain as
+         * a fabrication.  Double-counting is not a worry: the referee's
+         * _add() dedups by generic reg id.  The wire's own side of this
+         * is checked by the validator's probe_implicit_acc. */
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_mips,
         .canonicalize_addr = mips_canonicalize_addr,

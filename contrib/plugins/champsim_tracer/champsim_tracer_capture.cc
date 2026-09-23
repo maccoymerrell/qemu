@@ -33,15 +33,6 @@ extern "C" {
 #include "champsim_tracer_vocabulary.h"
 #include "champsim_tracer_regmap.h"
 
-/*
- * Two plugin globals, declared rather than included: champsim_tracer.h drags
- * the whole tracer in, and this file is meant to be severable from it.  The
- * Capstone column needs to know which target is running and what it is
- * called, and nothing else here does.
- */
-extern TraceISA trace_isa;
-extern const char *target_name;
-
 namespace {
 
 /*
@@ -245,7 +236,9 @@ Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
 Corpus *corpus_reg;      /* every register name QEMU used, and what it maps to */
 Corpus *corpus_set;      /* the read and write SETS, per encoding */
 Corpus *corpus_gen;      /* both decoders' sets, in the wire's own currency */
-Corpus *corpus_alias;    /* what the alias refiners moved, per encoding */
+/* What a refiner chain moved, per encoding.  No writer at this tip: the
+ * alias refiners are the offline referee's (see InsnAliasSnap). */
+Corpus *corpus_alias;
 
 void corpora_init()
 {
@@ -321,10 +314,11 @@ void corpora_init()
          * CST_DF_SET_DUMP carries QEMU's set in QEMU's own spellings, which is
          * the right answer for comparing two BUILDS of the QEMU side and the
          * wrong one for comparing the two DECODERS: the wire's src_regs[] and
-         * dst_regs[] are GENERIC ids, the Capstone walk produces generic ids,
-         * and a join between a TCG global's name and a generic id is not a
-         * join.  So this corpus states both sides in the currency the wire
-         * uses, from the same run and the same window, keyed on the encoding.
+         * dst_regs[] are GENERIC ids, the offline referee states its column in
+         * generic ids too (tools/cst_referee.py), and a join between a TCG
+         * global's name and a generic id is not a join.  So this corpus states
+         * the QEMU side in the currency the wire uses, keyed on the encoding,
+         * and the referee answers in the same currency from the same keys.
          *
          * THREE SIDES, AND THE JOIN IS TWO OF THEM.
          *
@@ -760,9 +754,9 @@ void emit_reg_set(const char *isa, const char *enc, char dir,
  *
  * prov_bit_label() spells a member as QEMU spells it, which is right for
  * comparing two QEMU-side builds and wrong for comparing the two DECODERS:
- * the Capstone walk produces generic ids and so does the wire.  This puts the
- * member through the same register map the wire would, so both sides of the
- * join speak generic.
+ * the wire speaks generic ids and so does the offline referee's column.  This
+ * puts the member through the same register map the wire would, so both sides
+ * of the join speak generic.
  *
  * AN ATOM THAT IS A REGISTER IS SPELLED AS THE WIRE SPELLS IT.  Three of the
  * provenance bits are atoms rather than storage, and one of them -- the
@@ -928,9 +922,12 @@ void emit_gen_set_prov(const char *isa, const char *enc, char dir,
 /*
  * A LIST OF GENERIC IDS, AS EITHER DECODER PUBLISHES ONE.
  *
- * Both the wire's src_regs[]/dst_regs[] and the Capstone walk's lists are
- * arrays of generic register ids, so one spelling serves both and the two
- * sides cannot drift apart in how they are rendered.
+ * Only the wire side is written in-process (side 'q'): the reference column
+ * is the offline referee's, produced from these same encodings by
+ * tools/cst_referee.py.  Both are arrays of generic register ids, so one
+ * spelling serves both and the two sides cannot drift apart in how they are
+ * rendered -- which is why this stays a shared renderer rather than a
+ * wire-only one.
  */
 void emit_gen_set_ids(const char *isa, const char *enc, char side, char dir,
                       const uint8_t *regs, unsigned nregs)

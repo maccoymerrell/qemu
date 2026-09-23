@@ -182,7 +182,8 @@ std::unordered_map<uint64_t, uint32_t> &g_first_insn_word =
     *new std::unordered_map<uint64_t, uint32_t>();
 
 /* TB start_pcs that have been detected as carrying non-stable
- * instruction bytes (Capstone decode failure — see detect_tb_poison).
+ * instruction bytes (bytes QEMU's own decode declined — see
+ * detect_tb_poison).
  * WP speculation refuses to enter these; subsequent translation
  * re-attempts at the same start_pc skip fragment materialization.
  * Persistent across WP simulations AND tb_flush (see vcpu_tb_flush). */
@@ -6824,10 +6825,12 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
          * CP fell through a direct conditional → the taken edge is
          * the side CP did NOT run, which the resolver also uses as
          * the wrong path.  taken_target_pc comes from QEMU's
-         * translator (the same value handed to gen_goto_tb), NOT
-         * Capstone's immediate — per-ISA encoding (PC-relative vs
-         * absolute, sign extension, MIPS delay-slot accounting, ARM
-         * Thumb interworking) is already correctly resolved there.
+         * translator (the same value handed to gen_goto_tb, read out
+         * through qemu_plugin_insn_branch_target_pc()), not from any
+         * re-reading of the encoded displacement — per-ISA encoding
+         * (PC-relative vs absolute, sign extension, MIPS delay-slot
+         * accounting, ARM Thumb interworking) is already correctly
+         * resolved there.
          */
         *taken_out = bf->taken_target_pc;
         return bf->taken_target_pc;
@@ -9714,10 +9717,13 @@ struct TbFragmentSpec {
  *   TB via the chain assembler.
  *
  * The tracer makes no assertion that a QEMU TB ends in a branch or
- * that branches only appear at the end — TCG and Capstone can
- * disagree about which insns terminate control flow (e.g. MIPS
- * conditional traps), and the splitter is what reconciles that
- * disagreement at the true-BB layer.
+ * that branches only appear at the end.  Where a TB ends is a
+ * translation decision; what terminates a true basic block is the
+ * decode rule's own generic word, read through the vocabulary by
+ * insn_branch_type() below.  The two do not have to coincide — QEMU
+ * keeps translating past a MIPS conditional trap whose word names a
+ * transfer — and the splitter is what reconciles them at the true-BB
+ * layer.
  */
 static void split_tb_into_fragments(const struct qemu_plugin_tb *tb,
                                     const uint32_t *canonical_raw,
@@ -10451,9 +10457,10 @@ struct TbPoison {
 
 /*
  * Detect non-stable "instruction" memory before committing this TB as a
- * fragment.  Only one signal poisons: Capstone decode failure on any
- * canonical insn (empty mnemonic) — the bytes don't parse as a valid
- * instruction of this ISA, so they cannot be real code.  Poisoning the
+ * fragment.  Only one signal poisons: QEMU's own decode reaching no
+ * rule for a canonical insn (qemu_plugin_insn_undecoded()) — the
+ * emulator declined to translate those bytes, so the guest cannot
+ * execute them and they cannot be real code.  Poisoning the
  * TB's start_pc makes the WP walker bail before re-entering it, and
  * short-circuits fragment creation on subsequent translations.  Decode
  * failure also fires on perfectly stable .rodata that the R-E LOAD
@@ -10557,7 +10564,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                          * resident page the CP first saw mid-refill — NOT data.
                          * Do not poison: let the fragment form so the wrong path
                          * can speculate through it (genuine WP-into-data is
-                         * still caught by the Capstone-decode check below).
+                         * still caught by the undecoded-bytes check below).
                          * Stay read-only: never mutate the CP first word. */
                     } else {
                         /* Correct-path execution is ground truth: the CPU is
@@ -10811,9 +10818,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         return;
     }
 
-    /* Translation-time template building (Capstone decode, fragment split,
-     * callback arming) is instrumentation cost, not guest execution: keep it
-     * off the guest clock (see VClockPauseGuard at vcpu_tb_exec). */
+    /* Translation-time template building (fragment split, per-insn statement
+     * seating, callback arming) is instrumentation cost, not guest
+     * execution: keep it off the guest clock (see VClockPauseGuard at
+     * vcpu_tb_exec). */
     VClockPauseGuard vclock_guard;
 
     /* Lifetime-class selection (#91): templates built for a wrong-path
@@ -10864,10 +10872,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 
     /* Partition the TB's canonical insn stream at every non-final
-     * branch terminator.  TCG and Capstone don't always agree on
-     * which insns end control flow (e.g. MIPS conditional traps:
-     * TCG keeps translating past, Capstone classifies as a branch);
-     * the splitter is what reconciles that at the true-BB layer.
+     * branch terminator.  Where TCG ends a TB and what the decode
+     * rule's generic word calls a transfer don't always agree (e.g.
+     * MIPS conditional traps: TCG keeps translating past, the word
+     * names a branch); the splitter is what reconciles that at the
+     * true-BB layer.
      * Singleton TBs (no mid-TB branch) produce one spec, matching
      * the pre-splitter behavior. */
     std::vector<TbFragmentSpec> fragment_specs;

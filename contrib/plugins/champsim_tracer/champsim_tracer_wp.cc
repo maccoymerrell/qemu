@@ -446,12 +446,14 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
     bool *first_tb_unavail  = st.first_tb_unavail;
 
         /* Refuse to speculate into a previously-poisoned PC.  A PC
-         * gets poisoned when vcpu_tb_trans detects either a Capstone
-         * decode failure or a bytes-changed-since-first-sighting at
-         * any of the TB's canonical insns — both signals that the
-         * region is dynamic data, not real code.  Drop the in-flight
-         * accumulator and end this WP simulation; chain so far is
-         * preserved.
+         * gets poisoned when vcpu_tb_trans finds that QEMU's own
+         * decode reached no rule for one of the TB's canonical insns
+         * (qemu_plugin_insn_undecoded) — the emulator declined the
+         * bytes, so the region is data, not real code.  That is the
+         * only poisoning signal: a byte change since the first
+         * sighting is tracked but does NOT poison (see the
+         * detect_tb_poison comment).  Drop the in-flight accumulator
+         * and end this WP simulation; chain so far is preserved.
          *
          * EXCEPT on the very first iteration (empty chain): the branch
          * predictor deliberately chose this wrong_target, so a stale
@@ -459,7 +461,7 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
          * because the correct path only reaches this VA mid-TB) must not
          * veto the excursion's entry and produce a 0-block truncation.
          * The per-TB detect_tb_poison in vcpu_tb_trans still refuses a
-         * genuinely-garbage first TB (Capstone-fail -> null tmpl below),
+         * genuinely-garbage first TB (undecoded bytes -> null tmpl below),
          * so dropping the global check here only recovers real code. */
         if (!(wp_chain.empty() && bb_pcs.empty()) &&
             cst_pc_is_poisoned(pre_pc)) {

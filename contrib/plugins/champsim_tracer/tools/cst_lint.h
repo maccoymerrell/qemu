@@ -24,18 +24,19 @@
  *   (GEN_OP_LOAD / STORE / VEC_* / atomics) are deliberately NOT
  *   exempt: their static memop capability is decode-critical, so a
  *   0/0 template on one of them is exactly the failure this lint
- *   exists to surface.  The Capstone 6.0.0-Alpha7 hole that used to
- *   force an exemption here — access==0 on the MEM operand of aarch64
+ *   exists to surface.  The reference-decoder hole that used to force
+ *   an exemption here — access==0 on the MEM operand of aarch64
  *   register-offset / extended-register load-stores and the LSE SWP
- *   family — is closed at the boundary (cap_aarch64_infer_mem_access
- *   in disas/capstone.c, same workaround family as the MIPS MSA / x86
- *   store-move fixes), so those insns now mint their static slots.
+ *   family — never reaches a trace any more: the static counts are
+ *   QEMU's own per-access rows, and the workaround now lives offline
+ *   in the referee (cap_aarch64_infer_mem_access,
+ *   tools/cst_referee.py), where it can only move a comparison column.
  *   Remaining narrow exemptions:
- *     - GEN_OP_PUSH / POP / RET: implicit stack traffic.  The x86
- *       stack refiners mint their static slots, but corner encodings
- *       fall through (`pop %rsp` — dep_x86_stack_pop emits slots per
- *       NON-SP dst, and here SP is the only dst; `iretq` — no
- *       Capstone MEM operand for the frame pops).
+ *     - GEN_OP_PUSH / POP / RET: implicit stack traffic, which the
+ *       encoding does not name as an operand.  The ordinary forms get
+ *       their static slots from QEMU's per-access rows, but the
+ *       exemption is kept for corner encodings (`pop %rsp`, `iretq`)
+ *       whose slots have not been shown to be minted on every target.
  *     - segment-register writers, detected by a REG_SEG* id among the
  *       insn's dst_regs.  THIS RULE DOES NOT REACH THE `mov r/m16,
  *       Sreg` FORM IT WAS WRITTEN FOR, and the claim that it did was

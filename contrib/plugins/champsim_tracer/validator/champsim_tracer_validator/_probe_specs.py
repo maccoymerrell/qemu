@@ -1148,11 +1148,12 @@ _register_probe('probe_exact_xor_rr', {
 })
 
 # Logical shift-left reg, imm → reg.  AArch64 is carried by its own probe
-# below rather than here, because its immediate is not yet reported; the
-# WORD is the same SHL as the other three.  (This comment used to say the
-# aarch64 arm was omitted because "Capstone returns AARCH64_INS_UBFM →
-# GEN_OP_MOVZX".  Since the words became QEMU's, that is no longer how the
-# aarch64 arm is classified at all.)
+# below rather than here because its encoding is UBFM and its arm asserts
+# the alias reading as well as the word; the WORD is the same SHL as the
+# other three, and since ed47cc810f its immediate is reported too.  (This
+# comment used to say the aarch64 arm was omitted because "Capstone returns
+# AARCH64_INS_UBFM → GEN_OP_MOVZX".  Since the words became QEMU's, that is
+# no longer how the aarch64 arm is classified at all.)
 _register_probe('probe_exact_shl_ri', {
     'x86_64':  {'asm': '"shlq $3, %%rax"', 'clobbers': '"rax","cc"',
                 'opcodes': ['SHL'],
@@ -1183,12 +1184,16 @@ _register_probe('probe_exact_shl_ri', {
 # zero-extend a narrower value, and the two have different dataflow.  A
 # probe may not keep asserting a word its own comment calls wrong.
 #
-# HAS_IMM IS STILL ASSERTED AND STILL FAILS, deliberately.  The shift
-# amount IS an immediate; the aarch64 decode site does not state it, so
-# this cell reads flags=0x40 and errors.  That is a real, narrow wire gap
-# (the x86, riscv64 and mipsel arms of probe_exact_shl_ri all state
-# theirs), it is filed as such, and weakening the assertion would hide
-# it.  This one row is expected RED until the statement lands.
+# HAS_IMM IS ASSERTED AND PASSES.  It did not, for as long as this probe
+# existed: `lsl x0,x0,#3` is UBFM with immr=61, imms=60, and the wire said
+# it had no immediate at all, so the cell read flags=0x40 and errored.  The
+# comment that stood here kept the assertion deliberately red and said it
+# would go green when the aarch64 decode site stated the shift.  It did, at
+# ed47cc810f: note_bfm_alias() states the immediate beside the word it
+# chooses, so where the word is SHL the published value is bitsize-1-imms
+# -- the shift the assembler wrote -- and not the encoding's immr.  The
+# cell now reads flags=0x42 (HAS_IMM | HAS_DEP_BLOCK).  This row is an
+# ordinary green cell and a red here is a regression.
 _register_probe('probe_exact_aarch64_ubfm', {
     'aarch64': {'asm': '"lsl x0, x0, #3"', 'clobbers': '"x0"',
                 'opcodes': ['SHL'],

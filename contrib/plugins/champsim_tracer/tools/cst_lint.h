@@ -38,24 +38,23 @@
  *       exemption is kept for corner encodings (`pop %rsp`, `iretq`)
  *       whose slots have not been shown to be minted on every target.
  *     - segment-register writers, detected by a REG_SEG* id among the
- *       insn's dst_regs.  THIS RULE DOES NOT REACH THE `mov r/m16,
- *       Sreg` FORM IT WAS WRITTEN FOR, and the claim that it did was
- *       never checked.  Measured on an x86_64 system trace: `8e e0`
- *       (mov %eax,%fs) and `8e ef` (mov %edi,%gs) publish NO
- *       destination register at all -- the disassembly renders them
- *       `mov %gp0` and `mov %gp5`, with nothing after the arrow -- so
- *       there is no REG_SEG id for the predicate to find and the
- *       exemption cannot fire.  It is reachable: `0f 01 f8` (swapgs)
- *       in the same trace publishes `%seg4 -> %seg4` and would be
- *       exempted.  The rule is therefore kept AS IT IS rather than
- *       widened, because the thing it fails to reach is a real defect
- *       and not a lint artefact: an instruction that writes FS or GS
- *       and names no destination is a write missing from the wire,
- *       and its descriptor fetch is a memop missing from the
- *       template.  Widening the exemption would hide both.  The fix
- *       belongs at QEMU's gen_movl_seg() -- state the write, and
- *       state the descriptor fetch as a synthetic EA -- after which
- *       this predicate starts matching on its own.
+ *       insn's dst_regs.  THE RULE COULD NOT REACH THE `mov r/m16,
+ *       Sreg` FORM IT WAS WRITTEN FOR, and the reason was upstream of
+ *       the lint, not in it.  Measured on an x86_64 system trace:
+ *       `8e e0` (mov %eax,%fs) and `8e ef` (mov %edi,%gs) published NO
+ *       destination register at all -- helper_load_seg installs the
+ *       base, limit and flags inside CPUArchState and tcg_env is the
+ *       call's only pointer argument, so the op stream named nothing
+ *       and there was no REG_SEG id for the predicate to find.
+ *       gen_movl_seg() states the write of the segment's base global
+ *       (d868a62bf1) and the predicate matches on its own now:
+ *       `8e e0` renders `mov %gp0 -> %seg3[0x0/w4]`.  `0f 01 f8`
+ *       (swapgs) publishes `%seg4 -> %seg4` and was always reachable.
+ *       The DESCRIPTOR FETCH that same instruction performs is still
+ *       not stated as a synthetic EA, so an impossible-memop firing on
+ *       one of these encodings is that gap and not attribution
+ *       corruption; the exemption covers it until the EA is stated,
+ *       and should narrow when it is.
  *
  *   REG: flagged only when a dst-register value record lands on an
  *   operand slot >= the insn's static dst count (any slot when the

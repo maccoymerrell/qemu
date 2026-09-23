@@ -236,9 +236,6 @@ Corpus *corpus_stmt;     /* the decoder-only statements, per encoding */
 Corpus *corpus_reg;      /* every register name QEMU used, and what it maps to */
 Corpus *corpus_set;      /* the read and write SETS, per encoding */
 Corpus *corpus_gen;      /* both decoders' sets, in the wire's own currency */
-/* What a refiner chain moved, per encoding.  No writer at this tip: the
- * alias refiners are the offline referee's (see InsnAliasSnap). */
-Corpus *corpus_alias;
 
 void corpora_init()
 {
@@ -345,19 +342,6 @@ void corpora_init()
         corpus_gen = new Corpus(
             "CST_GEN_SET_DUMP",
             "#isa\tencoding\tside\tdir\tnraw\tnuniq\tnames\n");
-        /*
-         * WHICH SIDE OF THE REFINER CHAIN PRODUCED THE BRANCH TYPE.
-         *
-         * Three readings per encoding, so a row where they differ names the
-         * encodings the alias surface is load-bearing for.  Deduplicated on
-         * the whole row: the same bytes refine the same way every time, and a
-         * repeat is a repeat.
-         */
-        corpus_alias = new Corpus(
-            "CST_ALIAS_DUMP",
-            "#isa\tencoding\tmnem\tbr_walk\tbr_alias\tbr_final"
-            "\tcond_walk\tcond_alias\tcond_final"
-            "\tnsrc_walk\tnsrc_alias\tnsrc_final\tndst_final\tmoved\n");
     }
 }
 

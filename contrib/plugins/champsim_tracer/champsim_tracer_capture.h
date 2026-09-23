@@ -63,29 +63,6 @@ struct qemu_plugin_tb;
 struct InsnFields;
 
 /*
- * What the classification looked like at ONE point in a refiner chain --
- * HISTORY, WITH NO PRODUCER AND NO CONSUMER AT THIS TIP.
- *
- * It was shaped for the mnemonic-keyed alias refiners, which were the only
- * wire-bearing second-decoder reads the corpora could not score: nothing
- * recorded the answer they were handed, so the question a scorer had to
- * answer was not "what is the branch type" but "WHICH SIDE PRODUCED IT", and
- * that needs the value before as well as after.  Those refiners are the
- * offline referee's now (tools/cst_referee.py, refine_alias_fields), the
- * branch class the splitter and the template read is the decode rule's own
- * generic word, and nothing in this plugin fills or reads this type or the
- * CST_ALIAS_DUMP corpus beside it.  Retiring both is a separate change; the
- * shape is recorded here so a reader is not misled into looking for the
- * writer.
- */
-struct InsnAliasSnap {
-    uint8_t branch_type;
-    uint8_t n_src_regs;
-    uint8_t n_dst_regs;
-    bool    branch_conditional;
-};
-
-/*
  * WHY AN INSTRUCTION HAS NO PUBLISHED REGISTER LISTS.
  *
  * The seating can decline, and when it does the template keeps the zeroed

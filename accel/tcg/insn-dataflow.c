@@ -1876,17 +1876,24 @@ void insn_dataflow_note_vec_operand(uint32_t envofs, uint32_t bytes,
     d->n_vecops++;
 }
 
-void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
-                                     const InsnDataflowEaPart *parts,
-                                     unsigned nparts, int64_t disp)
+/*
+ * The body of both synthetic-address notes: the general one states @offset 0
+ * and no datum; insn_dataflow_note_helper_store() a helper's own step and the
+ * register the store writes.  Returns the memop row stated, or -1.
+ */
+static int df_note_synth_ea(unsigned dir, uint32_t size,
+                            const InsnDataflowEaPart *parts,
+                            unsigned nparts, int64_t disp, int64_t offset,
+                            const uint64_t *data_prov)
 {
     uint64_t addr_prov[INSN_DF_REG_WORDS] = { 0 };
     InsnDataflowSynthEa row = { 0 };
     InsnDataflow *d;
     bool whole = true;
+    int k;
 
     if (df == NULL || !df->decoding) {
-        return;
+        return -1;
     }
     d = &df->out[df->cur];
 
@@ -1925,8 +1932,8 @@ void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
         insn_dataflow_note_immediate((uint64_t)disp, INSN_DF_IMM_DISP);
     }
     row.memop = d->n_memops;
-    row.disp = disp;
-    df_add_memop(d, (uint8_t)dir, size, addr_prov, NULL);
+    row.disp = disp + offset;
+    k = df_add_memop(d, (uint8_t)dir, size, addr_prov, data_prov);
 
     /*
      * Recorded only if the memop it names was recorded: a row pointing at a
@@ -1939,6 +1946,37 @@ void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
     } else {
         d->synth_ea[d->n_synth_ea++] = row;
     }
+    return k;
+}
+
+void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
+                                     const InsnDataflowEaPart *parts,
+                                     unsigned nparts, int64_t disp)
+{
+    df_note_synth_ea(dir, size, parts, nparts, disp, 0, NULL);
+}
+
+void insn_dataflow_note_helper_store(uint32_t size,
+                                     const InsnDataflowEaPart *parts,
+                                     unsigned nparts, int64_t disp,
+                                     int64_t offset, InsnDataflowAtom datum)
+{
+    uint64_t data_prov[INSN_DF_REG_WORDS] = { 0 };
+    int bit;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    /* The instruction really does read the register it stores. */
+    df_state(datum, INSN_DF_RD);
+    bit = df_atom_bit(datum);
+    if (bit < 0) {
+        df->out[df->cur].incomplete |= INSN_DF_INCOMPLETE_REFUSED;
+        return;
+    }
+    df_set_bit(data_prov, (unsigned)bit);
+    df_note_synth_ea(INSN_DF_WR, size, parts, nparts, disp, offset,
+                     data_prov);
 }
 
 void insn_dataflow_window_end(void)

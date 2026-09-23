@@ -439,10 +439,12 @@ typedef struct InsnDataflowMemop {
  * many such addresses one instruction may name.  x86's modrm reaches two (base
  * and index) and aarch64's register-offset form the same; nothing in tree
  * states more, and an instruction that named a third would be refused rather
- * than recorded short.
+ * than recorded short.  The address count is four because MIPS SWL/SWR state
+ * one row per byte store their helper can perform, at four distinct
+ * addresses; a fifth would be refused and counted, never recorded short.
  */
 #define INSN_DF_MAX_EA_PARTS   4
-#define INSN_DF_MAX_SYNTH_EA   2
+#define INSN_DF_MAX_SYNTH_EA   4
 
 /*
  * What an address computation does to a component before adding it in.
@@ -1172,6 +1174,31 @@ void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
                                      unsigned nparts, int64_t disp);
 
 /*
+ * A STORE a helper performs, stated the way insn_dataflow_note_synthetic_ea()
+ * states its second shape, plus the two things a store row needs that the
+ * general note cannot carry.
+ *
+ * @offset is the helper's own step from the encoded address -- MIPS SWL/SWR's
+ * helper writes up to four single bytes at EA, EA+-1, EA+-2 and EA+-3, so the
+ * row for its k-th byte is at EA + k * step.  The step is a constant of the
+ * helper, not a field of the encoding, so it moves the row's address and is
+ * NOT noted as an immediate: only @disp is, exactly as the general note
+ * notes it, and four rows of one instruction note one displacement.
+ *
+ * @datum is where the stored value came from.  A store row the op-stream
+ * reader records carries the provenance of the value its qemu_st op writes; a
+ * stated row has no op to read that off, and without it the datum reads as
+ * coming from nothing -- an empty store-data mask, the "no inputs" answer --
+ * when the helper writes a register the instruction was given.  A datum that
+ * resolves to no provenance bit refuses the instruction
+ * (INSN_DF_INCOMPLETE_REFUSED) rather than leaving it silently empty.
+ */
+void insn_dataflow_note_helper_store(uint32_t size,
+                                     const InsnDataflowEaPart *parts,
+                                     unsigned nparts, int64_t disp,
+                                     int64_t offset, InsnDataflowAtom datum);
+
+/*
  * Install a target's helper-usage table.
  *
  * @args is the shape the compiler derived, @dirs the adjudication.  The two
@@ -1281,6 +1308,13 @@ static inline void insn_dataflow_note_synthetic_ea(unsigned dir, uint32_t size,
                                                    const InsnDataflowEaPart *p,
                                                    unsigned nparts,
                                                    int64_t disp)
+{ }
+static inline void insn_dataflow_note_helper_store(uint32_t size,
+                                                   const InsnDataflowEaPart *p,
+                                                   unsigned nparts,
+                                                   int64_t disp,
+                                                   int64_t offset,
+                                                   InsnDataflowAtom datum)
 { }
 static inline void insn_dataflow_declare_regfile(const char *const *names,
                                                  unsigned count,

@@ -179,24 +179,65 @@ static void note_addr_only(DisasContext *ctx, int base, int index,
 
 /*
  * AN ACCESS A HELPER PERFORMS AND NO OP NAMES (the second shape
- * insn_dataflow_note_synthetic_ea documents).  LL's softmmu form and
- * SWL/SWR in both modes do their guest access inside a helper -- the op
- * stream shows a call and no qemu_ld/qemu_st -- so without this the
- * template says the instruction cannot touch memory while the runtime
- * callback delivers the access.  The decode site holds the operands, so
- * it states the row: LL is one 4-byte load; SWL/SWR are one store whose
- * extent is the 1..4 bytes between the effective address and its word
- * boundary, performed as byte stores inside the helper, and 4 is that
- * access's whole architectural span, not a per-execution claim.
+ * insn_dataflow_note_synthetic_ea documents).  LL's softmmu form, SWL/SWR in
+ * both modes and SC under CF_PARALLEL do their guest access inside a helper
+ * -- the op stream shows a call and no qemu_ld/qemu_st -- so without a
+ * statement the template says the instruction cannot touch memory while the
+ * runtime callback delivers the access.  The decode site holds the operands,
+ * so it states the rows, in the shape the helper really performs them.
  */
+static InsnDataflowEaPart helper_ea_base(int base)
+{
+    return insn_df_ea(base == 0 ? insn_df_zero() : insn_df_reg(regnames[base]),
+                      0, INSN_DF_EA_EXT_NONE);
+}
+
+/* One access of @size bytes at base + @disp: LL's load, SC's load. */
 static void note_helper_access(DisasContext *ctx, unsigned dir, int base,
                                int64_t disp, uint32_t size)
 {
-    InsnDataflowEaPart part =
-        insn_df_ea(base == 0 ? insn_df_zero() : insn_df_reg(regnames[base]),
-                   0, INSN_DF_EA_EXT_NONE);
+    InsnDataflowEaPart part = helper_ea_base(base);
 
     insn_dataflow_note_synthetic_ea(dir, size, &part, 1, disp);
+}
+
+/* One store of @size bytes at base + @disp whose datum is GPR @rt: SC's. */
+static void note_helper_store(int base, int64_t disp, uint32_t size, int rt)
+{
+    InsnDataflowEaPart part = helper_ea_base(base);
+
+    insn_dataflow_note_helper_store(size, &part, 1, disp, 0,
+                                    rt == 0 ? insn_df_zero()
+                                            : insn_df_reg(regnames[rt]));
+}
+
+/*
+ * SWL/SWR, AS THE HELPER PERFORMS THEM: helper_swl/helper_swr
+ * (ldst_helper.c) issue one to four SINGLE-BYTE stores, each delivered to
+ * plugins on its own, at EA, EA+s, EA+2s and EA+3s in that order, where s is
+ * +1 for SWL and -1 for SWR on a big-endian CPU and the opposite on a
+ * little-endian one.  How many of the four an execution takes depends on
+ * EA's alignment, a runtime value, so the template states the helper's
+ * MAXIMUM: four byte rows at those four addresses, each carrying rt as its
+ * datum.  A dynamic count can then be smaller than the template's maximum and
+ * never larger (format.rst's contract), every slot the wire can use has its
+ * own address and data masks, and the address the row names is the one the
+ * helper writes -- not the word the manual draws around it.
+ */
+static void note_helper_partial_word_store(DisasContext *ctx, bool left,
+                                           int base, int64_t disp, int rt)
+{
+    InsnDataflowEaPart part = helper_ea_base(base);
+    int step = disas_is_bigendian(ctx) ? 1 : -1;
+
+    if (!left) {
+        step = -step;
+    }
+    for (int k = 0; k < 4; k++) {
+        insn_dataflow_note_helper_store(1, &part, 1, disp, k * step,
+                                        rt == 0 ? insn_df_zero()
+                                                : insn_df_reg(regnames[rt]));
+    }
 }
 
 
@@ -2477,14 +2518,14 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWL:
-        note_helper_access(ctx, INSN_DF_WR, base, offset, 4);
+        note_helper_partial_word_store(ctx, true, base, offset, rt);
         gen_helper_0e2i(swl, t1, t0, mem_idx);
         break;
     case OPC_SWRE:
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWR:
-        note_helper_access(ctx, INSN_DF_WR, base, offset, 4);
+        note_helper_partial_word_store(ctx, false, base, offset, rt);
         gen_helper_0e2i(swr, t1, t0, mem_idx);
         break;
     }
@@ -2526,6 +2567,28 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
      * a narrow write, it is the operand the instruction was given.
      */
     note_gpr_read(rt);
+
+    /*
+     * THE ACCESS, UNDER CF_PARALLEL.  tcg_gen_atomic_cmpxchg_tl below is a
+     * helper call on that route (tcg/tcg-op-ldst.c) and the op stream carries
+     * no qemu_ld/qemu_st, while the helper delivers a load and a store to
+     * plugins (atomic_trace_rmw_post) -- so the template said SC cannot touch
+     * memory.  Stated here in the order the nonatomic expansion performs them,
+     * a load and then a store of the same width with rt as the store's datum,
+     * so one encoding declares one template shape in both translation
+     * regimes.  Without CF_PARALLEL that expansion IS the op stream, a real
+     * qemu_ld/qemu_st pair the reader records itself, and stating it too
+     * would declare every access twice -- the same split as LL's
+     * CONFIG_USER_ONLY one, taken on the flag that decides it here.  The
+     * address stated is base + offset: the ops address cpu_lladdr, and the
+     * access happens only on the arm where the two are equal.
+     */
+    if (tb_cflags(ctx->base.tb) & CF_PARALLEL) {
+        uint32_t size = memop_size(tcg_mo);
+
+        note_helper_access(ctx, INSN_DF_RD, base, offset, size);
+        note_helper_store(base, offset, size, rt);
+    }
 
     t0 = tcg_temp_new();
     addr = tcg_temp_new();

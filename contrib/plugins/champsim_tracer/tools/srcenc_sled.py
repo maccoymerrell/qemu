@@ -1222,21 +1222,43 @@ def main():
                         sys.stderr.write("MECH-CONFLICT %s\n  %s  %s"
                                          % (c[1], prev, line))
         if mconf:
-            # TWO NUMBERS, BECAUSE ONLY ONE OF THEM IS DURABLE (FINDING
-            # 252-B).  `mconf` counts CONFLICTING ROWS -- one encoding whose
-            # row differs in three chunks bumps it three times -- so it moves
-            # with how the population was chunked across the arm and is not
-            # a property of the corpus: the same tree read 241 on one arm and
-            # 212 on the other while the ENCODING SET was byte-identical.
-            # The set is the fact; the row count says how loud the disagreement
-            # was.  Printing one number labelled as the other is how "the same
-            # 212 encodings" got written down, so both are printed and each
-            # says what it counts.
+            # TWO NUMBERS, AND NEITHER IS AN INVARIANT (FINDING 253-E).
+            #
+            # `mconf` counts CONFLICTING ROWS -- one encoding whose row differs
+            # in three chunks bumps it three times -- and `len(mconf_enc)` the
+            # DISTINCT ENCODINGS behind them.  252-B corrected a message that
+            # printed the row count and called it encodings, and then asserted
+            # that the encoding count does not depend on the run.  THAT SECOND
+            # CLAIM IS FALSE and was refuted at c4e31d3974: four readings at
+            # one tip, one corpus stamp (#so 3b7b857f26c9b2ca), read 160/241,
+            # 160/212, 160/212 and 81/157, and the 81 is a strict SUBSET of the
+            # 160.  So both numbers are READINGS OF THIS RUN and are printed as
+            # such; neither may be quoted as the corpus's property.
+            #
+            # WHY, LOCATED (FINDING 254-A): the mechanism rows themselves are
+            # not a function of the encoding.  Chunks 0-9 of the two wp16 runs
+            # are byte-identical and chunks 10-35 differ at identical file
+            # size; over chunk 10's 184,649 differing rows, EVERY ONE of the
+            # 1,846,490 differing tokens is an `@bitN` -- zero named registers,
+            # zero `@atom`, zero `@env+off:size`.  `@bitN` is the last-resort
+            # spelling in prov_bit_label() for a provenance bit that resolved
+            # to no name, no atom and no declared env field, and the number in
+            # it is df_intern()'s slot index (accel/tcg/insn-dataflow.c:419),
+            # assigned `base + nslots++` in FIRST-SEEN order and resolvable
+            # only inside the block that minted it (insn-dataflow.c:2364).  Two
+            # runs that reach the same encoding in different block contexts
+            # therefore spell the same storage with different numbers, and this
+            # comparison reads that as a mechanism disagreement.
             raise SystemExit(
-                "srcenc_sled: %d DISTINCT POPULATION encoding(s) carry two "
-                "DIFFERENT mechanism rows (%d conflicting rows seen; the row "
-                "count depends on chunking, the encoding count does not) "
-                "-- REFUSING" % (len(mconf_enc), mconf))
+                "srcenc_sled: THIS RUN read %d DISTINCT POPULATION "
+                "encoding(s) carrying two DIFFERENT mechanism rows, over %d "
+                "conflicting row(s).  BOTH numbers are readings of this run: "
+                "the row count moves with how the population was chunked, and "
+                "the encoding count has been measured to move between runs at "
+                "one tip on one corpus stamp (FINDING 253-E/254-A -- the "
+                "@bitN spelling carries a per-block intern index).  Quote "
+                "neither as a property of the corpus -- REFUSING"
+                % (len(mconf_enc), mconf))
         # STAMPED LIKE THE READ-LIST CORPUS, and for a sharper reason: the
         # mechanism corpus is what isaxcheck --ident reads decode_id from,
         # and a decode id names a rule in ONE build's decodetree.  Joined

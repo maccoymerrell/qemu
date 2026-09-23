@@ -377,27 +377,34 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
      * rows the seating reads (champsim_tracer_qdep.cc), so a zero here
      * is the emulator saying the instruction performs no access.
      *
-     * The exemption list below is WIDER than the offline lint's, which
-     * deliberately does not exempt the definitionally-memory classes.
-     * Exempt here: atomics and the explicit memory classes, PUSH / POP
-     * / RET (implicit stack traffic; corner encodings like `pop %rsp`
-     * and `iretq` carry no static slot), segment-register writers (the
-     * descriptor fetch QEMU's segment-load helper performs is that
-     * mov's own load), and the synthetic-EA classes
-     * (record_synthetic_load mints load-style memops with no static
-     * slot).  A few byte tests on the hot path, reached only for slots
-     * whose static counts are already zero.
+     * The exemption list is the offline lint's, exactly.  It used to be
+     * wider: the explicit memory classes (LOAD / STORE / VEC_LOAD /
+     * VEC_STORE) and atomics were exempt here and never were there, and
+     * the reason was a reference decoder's -- Capstone left the MEM
+     * access flag empty on aarch64 register-offset load-stores and the
+     * LSE SWP family, so a 0/0 memory template could be the decoder's
+     * gap rather than a defect.  That decoder is gone from the tree and
+     * the static counts are QEMU's own per-access rows, so a 0/0 on a
+     * memory-class insn is the emulator saying a load performs no load.
+     * That is the failure this check exists to find, and exempting it
+     * made the counter read 0 while the offline lint read 990 on one
+     * x86_64 system trace (`fxsave64 0x40(%rax)`, GEN_OP_STORE, 990 of
+     * that trace's 2,397 firings -- see 817d21256f and d7af864320).
+     *
+     * What stays exempt, for reasons that are not a decoder's: PUSH /
+     * POP / RET (implicit stack traffic; corner encodings like `pop
+     * %rsp` and `iretq` carry no static slot), segment-register writers
+     * (the descriptor fetch QEMU's segment-load helper performs is that
+     * mov's own load, and it is not yet stated as a synthetic EA), and
+     * the synthetic-EA classes (record_synthetic_load mints load-style
+     * memops with no static slot).  A few byte tests on the hot path,
+     * reached only for slots whose static counts are already zero.
      */
     static std::atomic<uint32_t> impossible_warned_gen{0};
     auto note_impossible_slot = [&](int slot) {
         const InsnFields *f = bb_tmpl->insn_fields
             ? &bb_tmpl->insn_fields[slot] : nullptr;
         if (!f || f->max_dep_loads != 0 || f->max_dep_stores != 0 ||
-            f->is_atomic ||
-            f->opcode == GEN_OP_LOAD ||
-            f->opcode == GEN_OP_STORE ||
-            f->opcode == GEN_OP_VEC_LOAD ||
-            f->opcode == GEN_OP_VEC_STORE ||
             f->opcode == GEN_OP_PUSH ||
             f->opcode == GEN_OP_POP ||
             f->opcode == GEN_OP_RET ||

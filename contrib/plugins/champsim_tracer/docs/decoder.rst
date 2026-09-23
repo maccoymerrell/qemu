@@ -712,27 +712,35 @@ generation.
 mnemonic survey / audit
 -----------------------
 
-Two helpers tied to the disassembly classification step rather than
-the wire format:
+Two helpers that grew alongside the retired per-ISA classification
+tables.  Neither reads a ``.cst`` trace, and neither is on any live
+path: the word an instruction carries on the wire comes from the
+target's own decode rule through ``champsim_tracer_vocabulary.cc``, and
+the reference decoder is offline in ``tools/cst_referee.py``.
 
-* ``champsim_tracer_mnemonic_survey.py`` is a static mnemonic-coverage
-  analyzer.  It parses ``champsim_tracer_mnemonics.h`` to build the set
-  of known instruction IDs per ISA, disassembles one or more input ELF
-  binaries with Capstone, and reports any instruction IDs the
-  classification tables do not cover.  Useful when adding ISA support:
-  it tells you which mnemonics need rows in
-  ``champsim_tracer_mnemonic_tables.cc``.
+* ``champsim_tracer_mnemonic_survey.py`` was a static mnemonic-coverage
+  analyzer: it parsed the per-ISA ``*_insn_class`` tables out of
+  ``champsim_tracer_mnemonics.h`` and reported instruction IDs the
+  tables did not cover.  Those tables left the tree with the operand
+  walk.  The parser now **refuses** rather than returning an empty
+  classification set, and says so::
 
-* ``champsim_tracer_mnemonic_audit.py`` audits *and regenerates* the
-  classification tables.  It derives the mnemonic universe from the
-  in-tree Capstone C enum headers (not from mnemonics observed in any
-  run), checks each against the static classification table, and
-  reports any unclassified ones.  Run after adding a new opcode or ISA
-  to confirm the table covers the full Capstone surface.
+     x86_insn_class does not exist in this tree: the per-ISA Capstone
+     classification tables were retired.
 
-Neither tool reads a ``.cst`` trace: the survey works from ELF
-binaries and the Capstone tables, and the audit works from the
-Capstone C enum headers and the tables.
+* ``champsim_tracer_mnemonic_audit.py`` has a live half and a retired
+  half.  The **live** half is the rule vocabulary — ``ISAS``,
+  ``classify()`` and ``classify_reg()``, which map a reference-decoder
+  enum name to the tracer's generic classification.  ``cst_referee.py``
+  and the validator's ``classify.py`` import it, and nothing in it
+  touches the filesystem.  The **retired** half is ``--diff`` /
+  ``--apply``, which regenerated the tables from the vendored Capstone
+  C enum headers; both the headers and the tables are gone, and the two
+  flags now refuse with that explanation instead of dying on a missing
+  path.
+
+Adding ISA support therefore starts at the decode sites and the
+vocabulary table, not at a mnemonic table — see :doc:`extending`.
 
 Reusing the decoder library
 ---------------------------

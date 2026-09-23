@@ -177,6 +177,28 @@ static void note_addr_only(DisasContext *ctx, int base, int index,
     insn_dataflow_note_synthetic_ea(INSN_DF_RD, size, parts, n, disp);
 }
 
+/*
+ * AN ACCESS A HELPER PERFORMS AND NO OP NAMES (the second shape
+ * insn_dataflow_note_synthetic_ea documents).  LL's softmmu form and
+ * SWL/SWR in both modes do their guest access inside a helper -- the op
+ * stream shows a call and no qemu_ld/qemu_st -- so without this the
+ * template says the instruction cannot touch memory while the runtime
+ * callback delivers the access.  The decode site holds the operands, so
+ * it states the row: LL is one 4-byte load; SWL/SWR are one store whose
+ * extent is the 1..4 bytes between the effective address and its word
+ * boundary, performed as byte stores inside the helper, and 4 is that
+ * access's whole architectural span, not a per-execution claim.
+ */
+static void note_helper_access(DisasContext *ctx, unsigned dir, int base,
+                               int64_t disp, uint32_t size)
+{
+    InsnDataflowEaPart part =
+        insn_df_ea(base == 0 ? insn_df_zero() : insn_df_reg(regnames[base]),
+                   0, INSN_DF_EA_EXT_NONE);
+
+    insn_dataflow_note_synthetic_ea(dir, size, &part, 1, disp);
+}
+
 
 /*
  * Many system-only helpers are not reachable for user-only.
@@ -2393,6 +2415,15 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         /* fall through */
     case OPC_LL:
     case R6_OPC_LL:
+#ifndef CONFIG_USER_ONLY
+        /*
+         * The softmmu form is a helper (OP_LD_ATOMIC's #else arm), so the
+         * load is stated here; the user-only form is a real qemu_ld the
+         * op-stream reader records itself, and stating it too would
+         * declare the load twice.
+         */
+        note_helper_access(ctx, INSN_DF_RD, base, offset, 4);
+#endif
         op_ld_ll(t0, t0, mem_idx, ctx);
         gen_store_gpr(t0, rt);
         break;
@@ -2446,12 +2477,14 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWL:
+        note_helper_access(ctx, INSN_DF_WR, base, offset, 4);
         gen_helper_0e2i(swl, t1, t0, mem_idx);
         break;
     case OPC_SWRE:
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWR:
+        note_helper_access(ctx, INSN_DF_WR, base, offset, 4);
         gen_helper_0e2i(swr, t1, t0, mem_idx);
         break;
     }

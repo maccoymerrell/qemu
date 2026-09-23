@@ -19,11 +19,18 @@ them, and both are needed:
 
 Every row lands in exactly one of:
 
-  NOT-IMPLEMENTED    no decode path exists for the instruction.  The citation
-                     is the absence: either the opcode slot the instruction
-                     would occupy is not in the switch at all, or the slot
-                     holds a DIFFERENT instruction whose mandatory prefix,
-                     operand form or VEX class rejects these bytes.
+  NOT-IMPLEMENTED    QEMU does not implement the instruction, and the citation
+                     is where it says so.  Usually that is an ABSENCE: the
+                     opcode slot the instruction would occupy is not in the
+                     switch at all, or the slot holds a DIFFERENT instruction
+                     whose mandatory prefix, operand form or VEX class rejects
+                     these bytes.  It can also be a STATEMENT: a slot the
+                     decoder does reach whose emitter's whole effect is the
+                     invalid-opcode fault, which is QEMU saying in code that
+                     it has not implemented the instruction (SKINIT's
+                     "not implemented -- raise #UD", helper_vmmcall's
+                     raise_exception(EXCP06_ILLOP)).  Both are the same
+                     answer to the maintainer's question and both cite a line.
   ENABLE-GATED-OFF   a decode path exists and is gated on an enable the probe
                      can set.  Such a row must be RE-PROBED with the enable
                      held, and if it then runs it is REACHABLE and the
@@ -31,6 +38,12 @@ Every row lands in exactly one of:
   REFUSED-BY-MODEL   QEMU refuses the ENABLE itself under every CPU model,
                      which is the strongest of the three: there is no
                      configuration in which the gate could open.
+
+A row that none of the three describes HONESTLY is not given one anyway.  It
+goes in REMAINDER below, which names it, cites it, and states the question a
+maintainer has to answer before it can be adjudicated.  The set comparison
+counts REMAINDER, so such a row is visible and bounded rather than missing --
+but the table never prints a verdict it cannot support.
 
 Every citation is a LOCATOR resolved against the tree on each run, never a
 line number written down.  A locator that stops matching exits non-zero --
@@ -60,10 +73,13 @@ QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
 _DECODE = 'target/i386/tcg/decode-new.c.inc'
 _TRANSLATE = 'target/i386/tcg/translate.c'
 _CPU_H = 'target/i386/cpu.h'
+_CPU_C = 'target/i386/cpu.c'
+_SVM = 'target/i386/tcg/system/svm_helper.c'
 
 NOT_IMPL = 'NOT-IMPLEMENTED'
 ENABLE_OFF = 'ENABLE-GATED-OFF'
 REFUSED = 'REFUSED-BY-MODEL'
+UNADJ = 'UNADJUDICATED-REMAINDER'
 
 # --------------------------------------------------------------------------
 # The refusal sites.  `locator` is matched against `file`; the citation is
@@ -138,7 +154,101 @@ SITES = {
         what='0F 0D is the 3DNow! prefetch and takes a MEMORY operand only '
              '-- decode_0F0D() returns X86_OP_ENTRY1(NOP, M,v) for every '
              'modrm.reg -- so the register form matches no entry'),
+    'cmovcc-slot': dict(
+        file=_DECODE,
+        locator=r'\[0x41\] = X86_OP_ENTRY2\(CMOVcc,',
+        what='0F 41..4B is the CMOVcc block, a legacy entry with no VEX '
+             'class, so validate_vex refuses the VEX prefix the AVX-512 '
+             'mask-register opcodes carry; QEMU has no mask registers and no '
+             'entry that could hold them'),
+    'setcc-slot': dict(
+        file=_DECODE,
+        locator=r'\[0x90\] = X86_OP_ENTRYw\(SETcc, E,b\)',
+        what='0F 90..99 is the SETcc block, a legacy entry with no VEX '
+             'class, so validate_vex refuses the VEX prefix the AVX-512 '
+             'KMOV/KORTEST/KTEST opcodes carry'),
+    'lfence-p00': dict(
+        file=_DECODE,
+        locator=r'\[5\] = X86_OP_ENTRY0\(LFENCE,',
+        what='0F AE /5 reg-form is LFENCE and is p_00; the F3 form matches '
+             'no entry'),
+    'xsave-p00': dict(
+        file=_DECODE,
+        locator=r'\[4\] = X86_OP_ENTRYw\(XSAVE,',
+        what='0F AE /4 mem-form is XSAVE and is p_00; the F3 form matches no '
+             'entry'),
+    'xsaveopt-p00': dict(
+        file=_DECODE,
+        locator=r'\[6\] = X86_OP_ENTRYw\(XSAVEOPT,',
+        what='0F AE /6 mem-form is XSAVEOPT and is p_00; the F3 form matches '
+             'no entry'),
+    'svm-skinit-ud': dict(
+        file=_TRANSLATE,
+        locator=r'/\* If not intercepted, not implemented -- raise #UD\. \*/'
+                r'\n            goto illegal_op;',
+        what='0F 01 DE is decoded as SKINIT and QEMU states in this line '
+             'that it does not implement it: the case falls straight to '
+             'illegal_op whatever the SVM state'),
+    'svm-vmmcall-ud': dict(
+        file=_SVM,
+        locator=r'void helper_vmmcall\(CPUX86State \*env\)\n\{\n'
+                r'    cpu_svm_check_intercept_param\(env, SVM_EXIT_VMMCALL, '
+                r'0, GETPC\(\)\);\n    raise_exception\(env, EXCP06_ILLOP\);',
+        what='0F 01 D9 is decoded as VMMCALL and emitted; the helper it '
+             'emits raises #UD unconditionally once the intercept check is '
+             'past, so QEMU enters the instruction and then states that it '
+             'has none to run.  The EFER.SVME gate in translate.c is not '
+             'what refuses it -- the enable leg HOLDS EFER.SVME and the '
+             'CPL0+enables probe still reads #UD'),
+    'pclmulqdq-128only': dict(
+        file=_DECODE,
+        locator=r'\[0x44\] = X86_OP_ENTRY4\(PCLMULQDQ,  V,dq, H,dq, W,dq,',
+        what='0F 3A 44 is PCLMULQDQ with every operand fixed at dq '
+             '(128-bit); a dq operand under VEX.L=1 fails decode_op_size, so '
+             'the 256-bit VPCLMULQDQ form matches no entry'),
+    # ---- the REMAINDER's sites: cited, not adjudicated --------------------
+    'sysenter-entry': dict(
+        file=_DECODE,
+        locator=r'\[0x34\] = X86_OP_ENTRY0\(SYSENTER,',
+        what='0F 34 HAS a decode-table entry and a real emitter '
+             '(gen_SYSENTER -> helper_sysenter); in 64-bit mode it is refused '
+             'by chk(i64_amd), which is a CPU-VENDOR test, not an absence'),
+    'sysexit-entry': dict(
+        file=_DECODE,
+        locator=r'\[0x35\] = X86_OP_ENTRY0\(SYSEXIT,',
+        what='0F 35 HAS a decode-table entry and a real emitter '
+             '(gen_SYSEXIT -> helper_sysexit); in 64-bit mode it is refused '
+             'by chk(i64_amd), which is a CPU-VENDOR test, not an absence'),
+    'rsm-entry': dict(
+        file=_DECODE,
+        locator=r'\[0xaa\] = X86_OP_ENTRY0\(RSM,',
+        what='0F AA HAS a decode-table entry and a real emitter '
+             '(gen_RSM -> helper_rsm); it is refused by chk(smm), which asks '
+             'whether the machine is in SMM, not whether QEMU implements it'),
     # supporting mechanism citations
+    'i64-amd-check': dict(
+        file=_DECODE,
+        locator=r'if \(\(decode\.e\.check & X86_CHECK_i64_amd\) && '
+                r'env->cpuid_vendor1 != CPUID_VENDOR_INTEL_1\)',
+        what='in 64-bit mode an i64_amd entry is refused on any non-Intel '
+             'vendor'),
+    'max-vendor-is-amd': dict(
+        file=_CPU_C,
+        locator=r'object_property_set_str\(OBJECT\(cpu\), "vendor", '
+                r'CPUID_VENDOR_AMD,',
+        what='the `max` CPU model -- the one every reachability leg in this '
+             'corpus runs -- sets its vendor to AMD, so every i64_amd entry '
+             'is refused in 64-bit mode under the model the legs measured'),
+    'smm-check': dict(
+        file=_DECODE,
+        locator=r'if \(\(decode\.e\.check & X86_CHECK_smm\) && '
+                r'!\(s->flags & HF_SMM_MASK\)\)',
+        what='an smm entry is refused outside system-management mode'),
+    'dq-refuses-vex-l': dict(
+        file=_DECODE,
+        locator=r'if \(s->vex_l && e->s0 != X86_SIZE_qq && '
+                r'e->s1 != X86_SIZE_qq\)',
+        what='a 128-bit-only operand size refuses VEX.L=1'),
     'sse-prefix-check': dict(
         file=_DECODE,
         locator=r'return e->valid_prefix & \(1 << sse_prefixes\);',
@@ -320,6 +430,229 @@ ROWS = [
     # ---- 0F 0D reg form ---------------------------------------------------
     ('XED_IFORM_NOP_GPRv_GPRv_0F0D',
      'NOP', NOT_IMPL, 'prefetch-memonly', None),
+
+    # ======================================================================
+    # THE 2026-09-22 ADDITIONS.  Closing the six NOT-MEASURED CPL0 encodings
+    # is what let the leg reach this file for the first time since the table
+    # was written, and what it found was a set 115 rows short.  Thirty-three
+    # of those were a CLASSIFIER fact and are gone from this population --
+    # qemu_reach_matrix.py now labels an encoding QEMU ENTERED
+    # ENTERED-THEN-FAULTED(PROBE-STATE), because a fault that is not #UD is
+    # the probe's own operands or state and not a decode refusal.  The rest
+    # are adjudicated here, one row at a time, and three are not adjudicated
+    # at all: they are in REMAINDER below with the question each poses.
+    #
+    # Each row's SITE was checked against its OWN probe bytes -- the legacy
+    # prefixes, REX, VEX map/L/W/pp, opcode and ModRM the encoding carries --
+    # and not inferred from its mnemonic or its family.  Sixty of the rows
+    # reach an opcode slot that holds a LEGACY entry (CMOVcc, SETcc, LFENCE,
+    # MFENCE, XSAVE, XSAVEOPT, PCLMULQDQ); their refusal is that slot's own
+    # prefix, VEX-class or operand-size rule, exactly as the older rows above
+    # are refused.  Twelve fall to the 0F 01 group default.  Two are QEMU
+    # STATING in code that it has not implemented the instruction.
+    # ---- cmovcc-slot
+    ('XED_IFORM_KADDB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KADDB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KADDD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KADDD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KADDQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KADDQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KADDW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KADDW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDNB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDNB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDND_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDND', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDNQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDNQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDNW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDNW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KANDW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KANDW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KNOTB_MASKmskw_MASKmskw_AVX512',
+     'KNOTB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KNOTD_MASKmskw_MASKmskw_AVX512',
+     'KNOTD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KNOTQ_MASKmskw_MASKmskw_AVX512',
+     'KNOTQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KNOTW_MASKmskw_MASKmskw_AVX512',
+     'KNOTW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KORB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KORB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KORD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KORD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KORQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KORQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KORW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KORW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KUNPCKBW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KUNPCKBW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KUNPCKDQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KUNPCKDQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KUNPCKWD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KUNPCKWD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXNORB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXNORB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXNORD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXNORD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXNORQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXNORQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXNORW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXNORW', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXORB_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXORB', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXORD_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXORD', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXORQ_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXORQ', NOT_IMPL, 'cmovcc-slot', None),
+    ('XED_IFORM_KXORW_MASKmskw_MASKmskw_MASKmskw_AVX512',
+     'KXORW', NOT_IMPL, 'cmovcc-slot', None),
+    # ---- setcc-slot
+    ('XED_IFORM_KMOVB_GPR32u32_MASKmskw_AVX512',
+     'KMOVB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVB_MASKmskw_GPR32u32_AVX512',
+     'KMOVB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVB_MASKmskw_MASKu8_AVX512',
+     'KMOVB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVB_MASKmskw_MEMu8_AVX512',
+     'KMOVB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVB_MEMu8_MASKmskw_AVX512',
+     'KMOVB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVD_GPR32u32_MASKmskw_AVX512',
+     'KMOVD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVD_MASKmskw_GPR32u32_AVX512',
+     'KMOVD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVD_MASKmskw_MASKu32_AVX512',
+     'KMOVD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVD_MASKmskw_MEMu32_AVX512',
+     'KMOVD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVD_MEMu32_MASKmskw_AVX512',
+     'KMOVD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVQ_GPR64u64_MASKmskw_AVX512',
+     'KMOVQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVQ_MASKmskw_GPR64u64_AVX512',
+     'KMOVQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVQ_MASKmskw_MASKu64_AVX512',
+     'KMOVQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVQ_MASKmskw_MEMu64_AVX512',
+     'KMOVQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVQ_MEMu64_MASKmskw_AVX512',
+     'KMOVQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVW_GPR32u32_MASKmskw_AVX512',
+     'KMOVW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVW_MASKmskw_GPR32u32_AVX512',
+     'KMOVW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVW_MASKmskw_MASKu16_AVX512',
+     'KMOVW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVW_MASKmskw_MEMu16_AVX512',
+     'KMOVW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KMOVW_MEMu16_MASKmskw_AVX512',
+     'KMOVW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KORTESTB_MASKmskw_MASKmskw_AVX512',
+     'KORTESTB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KORTESTD_MASKmskw_MASKmskw_AVX512',
+     'KORTESTD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KORTESTQ_MASKmskw_MASKmskw_AVX512',
+     'KORTESTQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KORTESTW_MASKmskw_MASKmskw_AVX512',
+     'KORTESTW', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KTESTB_MASKmskw_MASKmskw_AVX512',
+     'KTESTB', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KTESTD_MASKmskw_MASKmskw_AVX512',
+     'KTESTD', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KTESTQ_MASKmskw_MASKmskw_AVX512',
+     'KTESTQ', NOT_IMPL, 'setcc-slot', None),
+    ('XED_IFORM_KTESTW_MASKmskw_MASKmskw_AVX512',
+     'KTESTW', NOT_IMPL, 'setcc-slot', None),
+    # ---- grp7-absent
+    ('XED_IFORM_CLZERO',
+     'CLZERO', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_ENCLS',
+     'ENCLS', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_ENCLU',
+     'ENCLU', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_ENCLV',
+     'ENCLV', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_MONITORX',
+     'MONITORX', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_MWAITX',
+     'MWAITX', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_RSTORSSP_MEMu64',
+     'RSTORSSP', REFUSED, 'grp7-absent', 'CR4.CET'),
+    ('XED_IFORM_SAVEPREVSSP',
+     'SAVEPREVSSP', REFUSED, 'grp7-absent', 'CR4.CET'),
+    ('XED_IFORM_SETSSBSY',
+     'SETSSBSY', REFUSED, 'grp7-absent', 'CR4.CET'),
+    ('XED_IFORM_VMFUNC',
+     'VMFUNC', REFUSED, 'grp7-absent', 'CR4.VMXE'),
+    ('XED_IFORM_XEND',
+     'XEND', NOT_IMPL, 'grp7-absent', None),
+    ('XED_IFORM_XTEST',
+     'XTEST', NOT_IMPL, 'grp7-absent', None),
+    # ---- xsaveopt-p00
+    ('XED_IFORM_CLRSSBSY_MEMu64',
+     'CLRSSBSY', REFUSED, 'xsaveopt-p00', 'CR4.CET'),
+    # ---- lfence-p00
+    ('XED_IFORM_INCSSPD_GPR32u8',
+     'INCSSPD', REFUSED, 'lfence-p00', 'CR4.CET'),
+    ('XED_IFORM_INCSSPQ_GPR64u8',
+     'INCSSPQ', REFUSED, 'lfence-p00', 'CR4.CET'),
+    # ---- xsave-p00
+    ('XED_IFORM_PTWRITE_MEMy',
+     'PTWRITE', NOT_IMPL, 'xsave-p00', None),
+    # ---- mfence-p00
+    ('XED_IFORM_UMONITOR_GPRa',
+     'UMONITOR', NOT_IMPL, 'mfence-p00', None),
+    # ---- svm-vmmcall-ud
+    ('XED_IFORM_VMMCALL',
+     'VMMCALL', NOT_IMPL, 'svm-vmmcall-ud', None),
+    # ---- svm-skinit-ud
+    ('XED_IFORM_SKINIT_EAX',
+     'SKINIT', NOT_IMPL, 'svm-skinit-ud', None),
+    # ---- pclmulqdq-128only
+    ('XED_IFORM_VPCLMULQDQ_YMMu128_YMMu64_MEMu64_IMM8',
+     'VPCLMULQDQ', NOT_IMPL, 'pclmulqdq-128only', None),
+    ('XED_IFORM_VPCLMULQDQ_YMMu128_YMMu64_YMMu64_IMM8',
+     'VPCLMULQDQ', NOT_IMPL, 'pclmulqdq-128only', None),
+]
+
+# THE REMAINDER -- rows this table will NOT adjudicate, and why.
+#
+# A short named remainder beats a false justification.  Each of these three
+# encodings HAS a decode-table entry and a working emitter in QEMU; what
+# refuses it is a property of the machine the probe legs happened to build,
+# not a statement that QEMU cannot run it.  Calling any of them
+# NOT-IMPLEMENTED would be false, ENABLE-GATED-OFF would promise a re-probe
+# this corpus has no leg for, and REFUSED-BY-MODEL would be the opposite of
+# the truth for two of them.  So they are printed, counted, cited, and left
+# open with the question stated -- and because the set comparison below
+# counts them, the leg cannot lose them.
+#
+# opcode_id -> (mnemonic, refusal site, the question a maintainer must answer)
+REMAINDER = [
+    ('XED_IFORM_SYSENTER', 'SYSENTER', 'sysenter-entry',
+     'every reachability leg in this corpus runs -cpu max, and QEMU sets the '
+     'max model vendor to AMD, so chk(i64_amd) refuses SYSENTER in 64-bit '
+     'mode.  Under an Intel-vendor model the same entry decodes and emits.  '
+     'Is the x86_64 corpus AMD-vendor-scoped by decision -- in which case '
+     'these rows are UNREACHABLE for the scope and should say so -- or is an '
+     'Intel-vendor CPL0 re-probe owed before any UNREACHABLE claim stands?'),
+    ('XED_IFORM_SYSEXIT', 'SYSEXIT', 'sysexit-entry',
+     'same question as SYSENTER: chk(i64_amd) against the max model vendor, '
+     'which QEMU sets to AMD; the entry and the emitter both exist'),
+    ('XED_IFORM_RSM', 'RSM', 'rsm-entry',
+     'RSM is implemented (gen_RSM -> helper_rsm) and refused by chk(smm) '
+     'because the probe boots are never in system-management mode.  SMM is '
+     'reachable in QEMU system mode, so "no configuration executes it" is '
+     'not established.  Does the tracer scope include SMM -- in which case a '
+     'CPL0 leg that enters SMM is owed -- or is SMM out of scope and the row '
+     'UNREACHABLE for that stated reason?'),
 ]
 
 # The extensions whose absence from has_cpuid_feature() is itself the proof
@@ -327,7 +660,11 @@ ROWS = [
 EXTENSIONS = ('KEYLOCKER', 'UINTR', 'WAITPKG', 'SERIALIZE', 'SHA512', 'LKGS',
               'WRMSRNS', 'TSX_LDTRK', 'HRESET', 'PCONFIG', 'RDPRU', 'MSRLIST',
               'PBNDKB', 'SNP', 'TDX', 'VTX', 'INVLPGB', 'MCOMMIT', 'VMX',
-              'SEAM')
+              'SEAM',
+              # added with the 2026-09-22 rows, each checked ABSENT from the
+              # decode-time vocabulary before it was written here
+              'CET', 'SGX', 'CLZERO', 'MONITORX', 'PTWRITE', 'RTM', 'VMFUNC',
+              'AVX512')
 
 
 def read(root, rel):
@@ -373,7 +710,10 @@ def _selftest(root):
 
     hdr = ('opcode_id\tmnemonic\tisa_set\textension\tprobe_hex\t'
            'qemu_refusal\n')
-    rows = [(i, mn) for i, mn, _, _, _ in ROWS]
+    # The synthetic matrix must carry the REMAINDER too, or arm A would fail
+    # on this file's own set comparison rather than on anything it measures.
+    rows = ([(i, mn) for i, mn, _, _, _ in ROWS]
+            + [(i, mn) for i, mn, _, _ in REMAINDER])
 
     def matrix(mut=None, drop=None, dup=None):
         out = io.StringIO()
@@ -417,7 +757,8 @@ def _selftest(root):
     stripb = [l.split('\t')[:1] + l.split('\t')[2:]
               for l in b.stdout.splitlines()]
     t('B a probe RE-SEAT moves nothing but the reported encoding',
-      stripa == stripb and len(stripa) == len(ROWS) + 1)
+      stripa == stripb
+      and len(stripa) == len(ROWS) + len(REMAINDER) + 1)
     t('C ... and the reported encoding DID move (the arm is not vacuous)',
       a.stdout != b.stdout)
     d = run(matrix(drop=ROWS[0][0]))
@@ -435,7 +776,20 @@ def _selftest(root):
     os.unlink(enab)
     t('F --cpl0-enab without --matrix REFUSES (nothing maps iform -> hex)',
       r.returncode != 0 and 'needs --matrix' in r.stderr)
-    print('arms=6 failures=%d' % fails)
+    # G PROVES THE REMAINDER IS COUNTED.  An unadjudicated row is only
+    # "named and bounded" if losing it is still a refusal; without this arm
+    # the REMAINDER list would be indistinguishable from a hole.
+    g = run(matrix(drop=REMAINDER[0][0]))
+    t('G a REMAINDER iform missing from the matrix REFUSES too',
+      g.returncode != 0 and 'disagree' in g.stderr)
+    # H the remainder rows are PRINTED, and printed without a verdict.
+    rem = set(i for i, _, _, _ in REMAINDER)
+    lines = [row for row in a.stdout.splitlines()
+             if row.split('\t')[0] in rem]
+    t('H every REMAINDER row is published, carrying %s and no verdict' % UNADJ,
+      len(lines) == len(REMAINDER)
+      and all(row.split('\t')[3] == UNADJ for row in lines))
+    print('arms=8 failures=%d' % fails)
     return 1 if fails else 0
 
 
@@ -505,7 +859,13 @@ def main():
         want = set(r['opcode_id'] for r in rows)
         for r in rows:
             hex_of[r['opcode_id']] = r['probe_hex']
-        have = set(i for i, _, _, _, _ in ROWS)
+        # THE REMAINDER COUNTS.  A row nobody could adjudicate is still a row
+        # this table has to account for, so it joins the comparison here; what
+        # it does not get is a verdict.  Keeping it out of `have` instead
+        # would make the leg refuse forever on rows whose answer is not the
+        # table's to give, and dropping it silently would be worse.
+        have = set(i for i, _, _, _, _ in ROWS) | set(i for i, _, _, _
+                                                      in REMAINDER)
         if want != have:
             # THE COUNTS ARE PART OF THE REFUSAL.  Printing two bare lists
             # leaves the reader to count 165 iforms by eye to find out
@@ -574,6 +934,17 @@ def main():
                                             ('vec=%s' % v if v is not None
                                              else 'NOT-MEASURED'))))
 
+    for opid, mn, site, question in REMAINDER:
+        h = hex_of.get(opid, '-')
+        v = vec.get(h)
+        if v == 255:
+            flips.append((h, mn))
+        out.append((opid, h, mn, UNADJ, '-', cites[site],
+                    '%s.  OPEN QUESTION: %s' % (SITES[site]['what'], question),
+                    'ran' if v == 255 else ('#UD' if v == 6 else
+                                            ('vec=%s' % v if v is not None
+                                             else 'NOT-MEASURED'))))
+
     hdr = ('opcode_id', 'probe_hex', 'mnemonic', 'adjudication',
            'gating_enable', 'qemu_citation', 'why', 'cpl0_with_enables')
     body_out = '\t'.join(hdr) + '\n' + ''.join(
@@ -582,8 +953,13 @@ def main():
         open(a.o, 'w').write(body_out)
     sys.stdout.write(body_out)
 
-    for name in ('feature-vocabulary', 'cr4-reserved'):
+    for name in ('feature-vocabulary', 'cr4-reserved', 'sse-prefix-check',
+                 'vex-class0', 'dq-refuses-vex-l', 'i64-amd-check',
+                 'max-vendor-is-amd', 'smm-check'):
         print('# %s -> %s' % (name, cites[name]), file=sys.stderr)
+    print('# adjudicated %d rows; REMAINDER %d rows carry no verdict: %s'
+          % (len(ROWS), len(REMAINDER),
+             ' '.join(m for _, m, _, _ in REMAINDER)), file=sys.stderr)
     print('# decode-time CPUID vocabulary: %d features, none of %s'
           % (len(vocab), ','.join(EXTENSIONS)), file=sys.stderr)
     if refused:

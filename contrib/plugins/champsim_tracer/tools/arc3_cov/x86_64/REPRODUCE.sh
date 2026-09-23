@@ -325,11 +325,11 @@ $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 # ran under, the all-flags signal, the CPL0 vector, where QEMU refused, the
 # gating CPUID word, whether that word is inside a TCG_*_FEATURES mask, how
 # many configurations actually advertise it, and which builtin_x86_defs[]
-# models name it.  Exits 1 while any row is UNCOVERED -- which is the point.
-# `|| true` is deliberate -- the matrix exits 1 while any row is UNCOVERED and
-# the steps below it still have to run -- but the status is NOT discarded: the
-# final gate at the bottom of this file reads the verdict back out of the
-# matrix and is this script's exit status.
+# models name it.  qemu_reach_matrix.py exits 1 while any row is UNCOVERED,
+# which is its own headline and not this leg's verdict; `|| true` keeps the
+# steps below running.  What decides THIS script's status is the scorability
+# check at the bottom -- see the note there, and coverage_report.py for where
+# the UNCOVERED remainder is published and named.
 $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
     --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
 
@@ -365,18 +365,46 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 
 # ---- prove the gate can fire ----------------------------------------------
 # An agreement rate quoted off an instrument nobody has watched fail vouches
-# for nothing.  drop-src must cost exactly the agreeing rows of the damaged
-# mnemonic.  THE COSTS ARE THE CONTROL; THE BASELINE IS NOT.  A baseline
-# figure written here goes stale the moment the decode moves -- it read 5835
-# when this list was drawn up, 6059 at 04e25599b5 and 6043 at 47bbdc2619 --
-# and a stale one invites reading an unchanged number as a passing control.
-# So compare each arm against THIS RUN's own baseline, printed above the
-# loop, and require exactly these deltas:
-#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2
-#   xlatb 1   smswl 1   lmsww 2   rdfsbasel 1   lfsl 1   cmpxchg8b 1
-# NOTE THE SPELLINGS.  --falsify matches the mnemonic EXACTLY, so `smsw`
-# matches nothing and the tool says so with exit 2 -- take the exit code,
-# never the AGREE line, or an unchanged count reads as a passing control.
+# for nothing.  Each arm damages one decode rule's source list and the
+# agreement must FALL.  THE COSTS ARE THE CONTROL; THE BASELINE IS NOT.  A
+# baseline figure written here goes stale the moment the decode moves -- it
+# read 5835 when this list was drawn up, 6059 at 04e25599b5 and 6043 at
+# 47bbdc2619 -- and a stale one invites reading an unchanged number as a
+# passing control.  So every arm is compared against THIS RUN's own baseline,
+# printed above the loop, and an arm that does not move it ends the leg.
+#
+# THE NAMES ARE QEMU'S DECODE RULES, NOT ASSEMBLER MNEMONICS (FINDING 253-B,
+# 2026-09-23).  This list used to read `movq vmovq vpsadbw sqrtsd xlatb smswl
+# lmsww rdfsbasel lfsl cmpxchg8b`, which were objdump spellings, and
+# sled_fields.py joins `--falsify drop-src:` on the identity corpus's rule
+# column.  That column carried assembler spellings only while the other
+# decoder was alive; since its retirement the corpus's `mnem` column reads
+# "-" on every row (3,395 of 3,395, measured) and the rule name is the honest
+# occupant -- sled_fields.py's own header says so.  So ALL TEN arms matched
+# nothing and the first of them ended this leg.  Nobody had seen it because
+# the leg exited at an earlier refusal; closing FINDING 252-A is what reached
+# this one.
+#
+# WHAT EACH ARM WATCHES, and the damage it did on 2026-09-23 (a READING of
+# this corpus, not a constant to assert -- the requirement below is that the
+# agreement FALLS, which cannot go stale):
+#   CMPccXADD  32 rows damaged, AGREE 564 -> 532   the VEX/APX family
+#   SHL        24 rows,              -> 540        the shift family (#302's)
+#   MOV        26 rows,              -> 550        the plainest datapath rule
+#   CMP        16 rows,              -> 548        the flags-writing compare
+#   RCL        12 rows,              -> 552        rotate-through-carry
+#   CMOVcc     32 rows,              -> 556        the slot the AVX-512
+#                                                  mask-op adjudication cites
+#   VCVTSx2SI  16 rows,              -> 556        an SSE SCALAR rule, the
+#                                                  R7.1-SCALAR watch sqrtsd
+#                                                  used to carry
+#   CMPXCHG     6 rows,              -> 558        the lock/RMW family
+#   XCHG        5 rows,              -> 559        the other RMW shape
+#   XLAT        1 row,               -> 563        one row, to prove an arm
+#                                                  this small still fires
+# A damaged count LARGER than the agreement it costs is expected and not a
+# fault: an arm damages every row of its rule, and only the rows that were
+# AGREEING can cost agreement.  What is forbidden is a cost of zero.
 #
 # ud0 AND ud1 WERE IN THIS LIST AND THE WATCH MOVED RATHER THAN ENDED.
 # They were here to watch the UD0 misdecode repair, on the rule that a
@@ -400,25 +428,43 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 #     its set comparison against the reach matrix refuses on either
 #     direction of disagreement.
 # A claim per row, re-derived per run, in place of one delta.
-# sqrtsd is in the list on purpose -- it is an R7.1-SCALAR row, so it proves
-# the rows that rule closed are watched rather than blindly agreeing.
+# VCVTSx2SI is in the list on purpose -- it is an R7.1-SCALAR rule, so it
+# proves the rows that rule closed are watched rather than blindly agreeing.
 # compare_attrib.py RE-DERIVES the tracer table from the live binary and
 # refuses to score anything else, so the damaged table has to be declared:
 # --falsify makes the report re-probe WITH the same damage.  That keeps the
 # control honest in both directions -- run the damaged table without the flag
 # and the report refuses instead of quoting a number off it.
+#
+# THE GOOD TABLE IS COPIED ASIDE FIRST AND RESTORED ON EVERY WAY OUT.  The
+# loop below redirects into tracer_batch.tsv, so the shell truncates it before
+# sled_fields.py has decided anything; an arm that refuses used to leave the
+# corpus EMPTY, and every later command then scored an empty table.  (The EXIT
+# trap is the settle guard's and is not taken over here, so each failure path
+# restores for itself.)
 cp tracer_batch.tsv tracer_batch.good.tsv
+_undamage() { cp -f tracer_batch.good.tsv tracer_batch.tsv; }
 echo -n "falsify baseline -> "
 $PY compare_attrib.py | grep -m1 '  AGREE  '
-for M in movq vmovq vpsadbw sqrtsd xlatb smswl lmsww \
-         rdfsbasel lfsl cmpxchg8b; do
+FALSIFY_BASE=$($PY compare_attrib.py 2>/dev/null \
+               | grep -m1 '  AGREE  ' | awk '{print $NF}')
+[ -n "$FALSIFY_BASE" ] || { echo "falsify: no baseline AGREE line"; exit 1; }
+for M in CMPccXADD SHL MOV CMP RCL CMOVcc VCVTSx2SI CMPXCHG XCHG XLAT; do
   "$T"/../sled_fields.py --isa=x86_64 --layer=fields \
       --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv \
-      || { echo "falsify drop-src:$M did not reach its subject"; exit 1; }
-  echo -n "falsify drop-src:$M -> "
-  $PY compare_attrib.py --falsify=drop-src:$M 2>/dev/null | grep -m1 '  AGREE  '
+      || { _undamage
+           echo "falsify drop-src:$M did not reach its subject"; exit 1; }
+  A=$($PY compare_attrib.py --falsify=drop-src:$M 2>/dev/null \
+      | grep -m1 '  AGREE  ' | awk '{print $NF}')
+  echo "falsify drop-src:$M -> AGREE $A (baseline $FALSIFY_BASE)"
+  [ -n "$A" ] || { _undamage
+                   echo "falsify drop-src:$M: no AGREE line"; exit 1; }
+  [ "$A" -lt "$FALSIFY_BASE" ] || {
+    _undamage
+    echo "falsify drop-src:$M COST NOTHING ($A of $FALSIFY_BASE) -- an arm" \
+         "that damages rows the scorer does not read is not a control"; exit 1; }
 done
-cp tracer_batch.good.tsv tracer_batch.tsv
+_undamage
 
 # ---- the determinism check, in the script that produces the table ---------
 # #287: the published qemu_tcg_reachable column used to depend on how far
@@ -459,20 +505,56 @@ $PY "$T"/illopc_audit.py --matrix ../reach_matrix.tsv \
     --allow-single-source "$T"/illopc_single_source.allow \
     -o ../illopc_audit.tsv
 
-# ---- the gate, and it is this script's exit status -------------------------
-# A reproduce script that always exits 0 is a reproduce script that cannot
-# fail.  The three-valued verdict is read back out of the matrix it just
-# wrote, printed, and turned into the status of this file.
-$PY - <<'EOF' || exit 1
-import csv, collections
-c = collections.Counter(r['verdict'] for r in
-                        csv.DictReader(open('../reach_matrix.tsv'),
-                                       delimiter='\t'))
+# ---- the exit status, and what it says -------------------------------------
+# THIS LEG'S EXIT SAYS WHETHER IT RAN AND PRODUCED SCORABLE TABLES.  It does
+# not say whether the coverage is acceptable, and it used to say both.
+#
+# The old line was `exit 1 while any row is UNCOVERED'.  UNCOVERED is 2,331
+# of 8,880 here and that is BY DESIGN: the standing bar is near-100% coverage
+# of the REACHABLE instruction space with register and immediate variants
+# deduped, and an UNCOVERED row is a named remainder in that accounting, not
+# a failure of this script.  So the old condition was true of every run there
+# has ever been -- a status with no information in it, exactly the shape
+# ITEM 3 removed from the eleven R13 comparator legs at 8a822fb3c2.  The
+# verdicts are carried where they have always been carried: coverage_report.py
+# publishes the three-valued tally per ISA with its remainders named, and
+# external_truth_gate.sh scores the headlines against their written ceilings.
+#
+#   0   every step ran and the matrix, the adjudication and the ILLOPC audit
+#       are on disk with a complete verdict column.  Any tally is possible;
+#       the report and the gate decide what it means.
+#   2   the tables are NOT scorable -- the matrix is missing or empty, a row
+#       carries no verdict or a fourth one, or a row reached the end with no
+#       reachability measurement at all.  A number read off a table in that
+#       state is not a reading.
+#
+# Nothing above this line is relaxed: `set -e` still ends the leg at the
+# first refusal, and every refusal on the way here leaves a non-zero status.
+$PY - <<'EOF' || exit $?
+import csv, collections, os, sys
+p = '../reach_matrix.tsv'
+if not os.path.exists(p) or os.path.getsize(p) == 0:
+    print('UNSCORABLE: %s is missing or empty' % p, file=sys.stderr)
+    raise SystemExit(2)
+rows = list(csv.DictReader(open(p), delimiter='\t'))
+c = collections.Counter(r['verdict'] for r in rows)
 tot = sum(c.values())
 for k in ('COVERED', 'UNREACHABLE', 'UNCOVERED'):
     print('%-12s %6d' % (k, c[k]))
 print('%-12s %6d' % ('total', tot))
+nm = sum(1 for r in rows if r['qemu_refusal'] == 'NOT-MEASURED')
+if not tot:
+    print('UNSCORABLE: the matrix has no rows', file=sys.stderr)
+    raise SystemExit(2)
 if c['COVERED'] + c['UNREACHABLE'] + c['UNCOVERED'] != tot:
-    raise SystemExit('a fourth value appeared in the verdict column')
-raise SystemExit(1 if c['UNCOVERED'] else 0)
+    print('UNSCORABLE: a fourth value appeared in the verdict column: %s'
+          % ' '.join(sorted(set(c) - {'COVERED', 'UNREACHABLE', 'UNCOVERED'})),
+          file=sys.stderr)
+    raise SystemExit(2)
+if nm:
+    print('UNSCORABLE: %d row(s) end with qemu_refusal=NOT-MEASURED' % nm,
+          file=sys.stderr)
+    raise SystemExit(2)
+print('SCORABLE: %d rows, every one carrying a verdict and a measurement'
+      % tot)
 EOF

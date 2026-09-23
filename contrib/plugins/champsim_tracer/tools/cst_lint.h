@@ -16,8 +16,9 @@
  * a legitimate encoder behaviour:
  *
  *   MEM: flagged only when the template insn's static max loads AND
- *   max stores are both zero.  Runtime counts exceeding a NON-zero
- *   static max are legal (x86 REP fan-out); synthetic-EA classes
+ *   max stores are both zero.  A runtime count exceeding a NON-zero
+ *   static max is the OVER-MAX rule's subject (below), not this one's;
+ *   synthetic-EA classes
  *   (prefetch / cache-flush / TLB-flush) record load-style memops the
  *   operand walker may not have given static slots, so those opcode
  *   classes are exempted wholesale.  Definitionally-memory classes
@@ -55,6 +56,21 @@
  *       one of these encodings is that gap and not attribution
  *       corruption; the exemption covers it until the EA is stated,
  *       and should narrow when it is.
+ *
+ *   OVER-MAX: a CP execution whose dynamic N_LOADS (N_STORES) count is
+ *   LARGER than the template's max_dep_loads (max_dep_stores), on an
+ *   insn whose static maxes are not both zero (a 0/0 insn is the MEM
+ *   rule's, and is never counted twice).  This is format.rst §4.5's
+ *   own contract -- the dynamic count "can be smaller ... but never
+ *   larger" than the template-static MAX -- and it is what the MEM
+ *   rule cannot see: a template that declares ONE store for an
+ *   instruction the emulator performs as four (MIPS SWL/SWR, whose
+ *   helper issues up to four byte stores) is not 0/0, so the MEM rule
+ *   passes it while slots 1..3 ride the wire with no dependency masks
+ *   the template could have sized.  No fan-out exemption exists: the
+ *   unbounded issuers (x86 REP, aarch64 MOPS) are fanned out into
+ *   one entry per unit before they reach the slot tables (§5.2), so
+ *   every published count is one unit's.
  *
  *   REG: flagged only when a dst-register value record lands on an
  *   operand slot >= the insn's static dst count (any slot when the
@@ -265,30 +281,107 @@ public:
         distinct_dangling_.insert(template_id);
     }
 
+    /* The OVER-MAX rule's predicate (header comment): does a CP
+     * execution publishing @n_loads / @n_stores on @I exceed the
+     * template-static maxes?  A 0/0 insn is the MEM rule's subject and
+     * answers false here, so no execution is counted by both. */
+    static bool over_max(const InsnTemplate &I, uint64_t n_loads,
+                         uint64_t n_stores) {
+        if (I.max_dep_loads == 0 && I.max_dep_stores == 0) return false;
+        return n_loads > I.max_dep_loads || n_stores > I.max_dep_stores;
+    }
+
+    /* The instruction an OVER-MAX violation landed on, named the way a
+     * MemSubject is, plus the declared maxes and the largest counts the
+     * trace published for it -- the pair a reader needs to see the
+     * contract break without re-deriving either side. */
+    struct OverSubject {
+        MemSubject id;
+        uint32_t   max_loads   = 0;
+        uint32_t   max_stores  = 0;
+        uint64_t   seen_loads  = 0;
+        uint64_t   seen_stores = 0;
+    };
+
+    /* One CP execution of insn @ipos of @t published @n_loads /
+     * @n_stores, and over_max() said that exceeds the template. */
+    void note_over_max(const Template &t, uint32_t ipos,
+                       uint64_t n_loads, uint64_t n_stores) {
+        over_records_ += 1;
+        note_over_subject(t, ipos, n_loads, n_stores);
+    }
+
+    /* The identity half alone, for a feeder that charges executions
+     * separately (OverMaxTracker). */
+    void note_over_subject(const Template &t, uint32_t ipos,
+                           uint64_t n_loads, uint64_t n_stores) {
+        uint64_t k = insn_key(t.template_id, ipos);
+        auto it = over_subjects_.find(k);
+        if (it == over_subjects_.end()) {
+            OverSubject s;
+            s.id.template_id = t.template_id;
+            s.id.ipos        = ipos;
+            if (ipos < t.insns.size()) {
+                const InsnTemplate &I = t.insns[ipos];
+                s.id.pc     = I.pc;
+                s.id.opcode = I.opcode;
+                s.id.bytes  = I.raw_bytes;
+                s.max_loads  = I.max_dep_loads;
+                s.max_stores = I.max_dep_stores;
+            }
+            it = over_subjects_.emplace(k, std::move(s)).first;
+        }
+        it->second.seen_loads  = std::max(it->second.seen_loads, n_loads);
+        it->second.seen_stores = std::max(it->second.seen_stores, n_stores);
+    }
+
+    /* The OVER-MAX subjects, template id then insn position. */
+    std::vector<OverSubject> over_subjects() const {
+        std::vector<OverSubject> out;
+        out.reserve(over_subjects_.size());
+        for (const auto &kv : over_subjects_) out.push_back(kv.second);
+        std::sort(out.begin(), out.end(),
+                  [](const OverSubject &a, const OverSubject &b) {
+                      return a.id.template_id != b.id.template_id
+                                 ? a.id.template_id < b.id.template_id
+                                 : a.id.ipos < b.id.ipos;
+                  });
+        return out;
+    }
+
     uint64_t mem_violations() const { return mem_memops_; }
     uint64_t reg_violations() const { return reg_records_; }
     uint64_t dangling_refs() const { return dangling_refs_; }
+    uint64_t over_max_violations() const { return over_records_; }
     size_t   distinct_mem_insns() const { return distinct_mem_.size(); }
     size_t   distinct_reg_insns() const { return distinct_reg_.size(); }
+    size_t   distinct_over_max_insns() const {
+        return over_subjects_.size();
+    }
     size_t   distinct_dangling_ids() const {
         return distinct_dangling_.size();
     }
     bool     any() const {
-        return mem_memops_ || reg_records_ || dangling_refs_;
+        return mem_memops_ || reg_records_ || dangling_refs_ ||
+               over_records_;
     }
 
     /* "N memop (M distinct insns), R regdata (S distinct insns),
-     *  D dangling template refs (K distinct ids)" */
+     *  D dangling template refs (K distinct ids),
+     *  O over-max executions (P distinct insns)" */
     std::string summary() const {
-        char buf[224];
+        char buf[288];
         std::snprintf(buf, sizeof(buf),
                       "%llu memop (%zu distinct insns), "
                       "%llu regdata (%zu distinct insns), "
-                      "%llu dangling template refs (%zu distinct ids)",
+                      "%llu dangling template refs (%zu distinct ids), "
+                      "%llu over-max executions (%zu distinct insns)",
                       (unsigned long long)mem_memops_, distinct_mem_.size(),
                       (unsigned long long)reg_records_, distinct_reg_.size(),
                       (unsigned long long)dangling_refs_,
-                      distinct_dangling_.size());
+                      distinct_dangling_.size(),
+                      (unsigned long long)over_records_,
+                      over_subjects_.size());
         return buf;
     }
 
@@ -373,6 +466,67 @@ public:
         bool active_ = false;
     };
 
+    /*
+     * The OVER-MAX rule's record-level feeder for cst_audit, the
+     * DeltaTracker's sibling.  It has to follow EVERY CP count cell,
+     * not only the flagged ones -- any memop-capable insn can be
+     * declared short -- so it keeps the N_LOADS/N_STORES values per
+     * CONTEXT, template and insn, and per template how many insns sit
+     * over their maxes right now.  The context is the writer's own
+     * (asid, thread) overlay key, the one the decoder's field state
+     * follows: keyed on the thread alone, two processes' cells for one
+     * template sum into one, and a multi-process trace reads thousands
+     * of false over-max insns (measured: 1737 on a clean mipsel latch
+     * trace the decoder reads 0 on).  Charged per CP entry at its end,
+     * the same way the DeltaTracker charges, because a cell persists:
+     * an over-max count keeps being published on every entry of its
+     * template until a delta brings it back under.
+     */
+    class OverMaxTracker {
+    public:
+        explicit OverMaxTracker(AttributionLint &lint) : lint_(lint) {}
+
+        void on_count_delta(uint64_t ctx, const Template &t,
+                            uint32_t ipos, bool is_stores, uint64_t d) {
+            if (ipos >= t.insns.size()) return;
+            ThreadState &ts = ctxs_[ctx];
+            uint64_t k = insn_key(t.template_id, ipos);
+            Cells &c = ts.cells[k];
+            const InsnTemplate &I = t.insns[ipos];
+            bool was = over_max(I, c.loads, c.stores);
+            (is_stores ? c.stores : c.loads) += d;   /* mod 2^64 */
+            bool now = over_max(I, c.loads, c.stores);
+            uint32_t &n_over = ts.over_per_template[t.template_id];
+            if (now && !was) {
+                n_over++;
+            } else if (was && !now) {
+                n_over--;
+            }
+            if (now) {
+                lint_.note_over_subject(t, ipos, c.loads, c.stores);
+            }
+        }
+
+        void on_cp_entry_end(uint64_t ctx, uint32_t template_id) {
+            auto ct = ctxs_.find(ctx);
+            if (ct == ctxs_.end()) return;
+            ThreadState &ts = ct->second;
+            auto it = ts.over_per_template.find(template_id);
+            if (it != ts.over_per_template.end()) {
+                lint_.over_records_ += it->second;
+            }
+        }
+
+    private:
+        struct Cells { uint64_t loads = 0, stores = 0; };
+        struct ThreadState {
+            std::unordered_map<uint64_t, Cells>    cells;
+            std::unordered_map<uint32_t, uint32_t> over_per_template;
+        };
+        AttributionLint &lint_;
+        std::unordered_map<uint64_t, ThreadState> ctxs_;
+    };
+
 private:
     static uint64_t insn_key(uint32_t template_id, uint32_t ipos) {
         return ((uint64_t)template_id << 32) | ipos;
@@ -391,6 +545,8 @@ private:
     std::unordered_set<uint64_t> distinct_mem_;
     std::unordered_set<uint64_t> distinct_reg_;
     std::unordered_set<uint32_t> distinct_dangling_;
+    uint64_t over_records_ = 0;
+    std::unordered_map<uint64_t, OverSubject> over_subjects_;
 };
 
 /*

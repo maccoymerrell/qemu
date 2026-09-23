@@ -402,19 +402,27 @@ state or wrong-path speculation.
 
 An **ATTRIBUTION LINT** verdict always closes the report:
 ``impossible attributions: <n> memop (<m> distinct insns), <n> regdata
-(<m> distinct insns), <n> dangling template refs (<m> distinct ids)``.
+(<m> distinct insns), <n> dangling template refs (<m> distinct ids),
+<n> over-max executions (<m> distinct insns)``.
 This is a structural sanity check, not a byte accounting: it flags a
 body observation landing on an instruction that statically cannot
 produce it — a memop value on an insn with zero static load/store
 slots, a destination-register value past the template's static dst
-count, or a CP/WP entry naming a ``template_id`` the templates section
-never defines — the signature of attribution corruption (records
-leaking into the wrong entry's drain) rather than a decode-quality
-nuance. It is always printed and, unlike every other line in the
-report, a nonzero count is fatal: ``cst_audit`` exits 1 instead of 0.
-A clean trace always reads ``impossible attributions: 0 memop (0
-distinct insns), 0 regdata (0 distinct insns), 0 dangling template
-refs (0 distinct ids)``.
+count, a CP/WP entry naming a ``template_id`` the templates section
+never defines, or a correct-path execution whose dynamic load or store
+count is larger than the template's ``max_dep_loads`` /
+``max_dep_stores`` (the "never larger" contract of the template header,
+:doc:`format`) — the signature of attribution corruption (records
+leaking into the wrong entry's drain) or of a template that declares
+fewer accesses than the instruction performs, rather than a
+decode-quality nuance.  Every over-max instruction is named on its own
+``memop-over-max:`` line with the maxes its template declared and the
+largest counts the trace published. It is always printed and, unlike
+every other line in the report, a nonzero count is fatal: ``cst_audit``
+exits 1 instead of 0.  A clean trace always reads ``impossible
+attributions: 0 memop (0 distinct insns), 0 regdata (0 distinct insns),
+0 dangling template refs (0 distinct ids), 0 over-max executions (0
+distinct insns)``.
 
 Conservation vs. completeness
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

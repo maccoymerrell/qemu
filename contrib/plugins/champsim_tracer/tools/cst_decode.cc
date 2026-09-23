@@ -1363,6 +1363,12 @@ void BodyWalker::decode_field_delta(Reader &outer,
             ((*lint_row)[i] & AttributionLint::MEM_IMPOSSIBLE)) {
             lint->note_mem(template_id, idx, n_loads + n_stores);
         }
+        /* Over-max: a count LARGER than the template-static max the
+         * header sized this insn's masks by (§4.5, "never larger"). */
+        if (lint && tmpl && (n_loads || n_stores) &&
+            AttributionLint::over_max(tmpl->insns[i], n_loads, n_stores)) {
+            lint->note_over_max(*tmpl, idx, n_loads, n_stores);
+        }
 
         if (n_loads || n_stores) {
             materialise_slotted_memops(idx, n_loads, DynParam::Load,

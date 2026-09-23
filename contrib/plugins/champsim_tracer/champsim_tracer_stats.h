@@ -132,6 +132,17 @@ struct Stats {
      * treatment; until then the per-template profile still carries the
      * untruncated memop totals and the full touched address extent. */
     uint64_t memops_over_slot_ceiling = 0;
+    /* Memops an emitted entry published beyond its instruction's
+     * template-static max_dep_loads / max_dep_stores -- the runtime
+     * sibling of the offline OVER-MAX lint (tools/cst_lint.h).  The
+     * template header sizes every dependency mask by those maxes and
+     * format.rst promises a dynamic count "never larger", so each memop
+     * counted here rides a slot no mask describes: a QEMU declaration
+     * that states fewer accesses than the emulation performs (MIPS
+     * SWL/SWR's byte stores stated as one word was the first measured)
+     * or attribution corruption upstream of the drain.  The entry is
+     * still emitted as observed; the offline lint is what fails it. */
+    uint64_t memops_over_template_max = 0;
     /* Emitted entries whose pending reg-snap count did not equal the
      * template's Σ n_dst_regs — the positional reg-snap invariant the wire
      * relies on (build_entry_view prefix-sums n_dst_regs).  The entry's

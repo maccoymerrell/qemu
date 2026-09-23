@@ -8783,14 +8783,20 @@ def validate(meta_path: Path, trace_path: Path,
     # memop-incapable insns, or dst-reg values on operand slots the
     # template does not carry.  Always zero on a conformant trace.
     imp = trace_meta.get("impossible_attributions") or {}
-    if imp.get("memop") or imp.get("regdata"):
+    if (imp.get("memop") or imp.get("regdata") or imp.get("dangling")
+            or imp.get("over_max") or imp.get("unparsed")):
         issues.append(Issue(
             "impossible_attribution", "error",
             f"decoder lint counted impossible attributions: "
             f"{imp.get('memop', 0)} memop "
             f"({imp.get('memop_insns', 0)} distinct insns), "
             f"{imp.get('regdata', 0)} regdata "
-            f"({imp.get('regdata_insns', 0)} distinct insns)",
+            f"({imp.get('regdata_insns', 0)} distinct insns), "
+            f"{imp.get('dangling', 0)} dangling template refs, "
+            f"{imp.get('over_max', 0)} over-max executions "
+            f"({imp.get('over_max_insns', 0)} distinct insns)"
+            + (f"; UNPARSED summary: {imp['unparsed']}"
+               if imp.get("unparsed") else ""),
             dict(imp)))
 
     arena_info = _find_arena_address(binary_path)

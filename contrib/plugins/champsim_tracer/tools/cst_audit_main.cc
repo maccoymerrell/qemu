@@ -291,8 +291,12 @@ void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
 struct LintCtx {
     cst::AttributionLint               *lint;
     cst::AttributionLint::DeltaTracker *tracker;
+    /* The OVER-MAX feeder: every CP count cell, not only flagged ones. */
+    cst::AttributionLint::OverMaxTracker *over;
     const std::vector<uint8_t>         *row;      /* template caps row */
     uint32_t                            thread;
+    /* (asid << 32) | thread: the writer's field-state overlay key. */
+    uint64_t                            ctx;
     uint32_t                            template_id;
     /* Memop bimodality lint (cst_lint.h) — null when disabled
      * (--bimodal-off) or, like @lint above, for WP sections. */
@@ -381,11 +385,15 @@ static inline void tally_fd_record(
         ((*lctx->row)[*ipos] & cst::AttributionLint::MEM_IMPOSSIBLE);
     bool want_bimodal = lctx && lctx->bimodal && is_count_fid &&
         lctx->bimodal->tracks(lctx->template_id);
+    /*   - over-max: every delta on an insn the template carries, since
+     *     any memop-capable insn can be declared short. */
+    bool want_over = lctx && lctx->over && tmpl && is_count_fid &&
+        *ipos < tmpl->insns.size();
     /* Executed-range cells (BB_START/BB_STOP at BLOCK_POS): mirrored so
      * instruction accounting sums realised ranges, not num_insns. */
     bool is_range_fid = rc && tmpl &&
         (f == ids.fid_bb_start || f == ids.fid_bb_stop);
-    if (want_impossible || want_bimodal || is_range_fid) {
+    if (want_impossible || want_bimodal || want_over || is_range_fid) {
         std::array<uint64_t, 8> wd = sec.sleb_wide();  /* same bytes */
         if (want_impossible) {
             lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
@@ -395,6 +403,10 @@ static inline void tally_fd_record(
         if (want_bimodal) {
             lctx->bimodal->on_count_delta(lctx->thread, lctx->template_id,
                                           *ipos, wd[0]);
+        }
+        if (want_over) {
+            lctx->over->on_count_delta(lctx->ctx, *tmpl, *ipos,
+                                       f == ids.fid_n_stores, wd[0]);
         }
         if (is_range_fid) {
             rc->apply(is_wp, f == ids.fid_bb_stop ? 1 : 0,
@@ -449,6 +461,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
      * cells are per-guest-thread writer state, so mirror the
      * decoder's thread tracking off the THREAD_SWITCH records. */
     cst::AttributionLint::DeltaTracker tracker(*lint);
+    cst::AttributionLint::OverMaxTracker over(*lint);
     int32_t current_thread = 0;
     /* ASID index tracking mirrors the decoder: the inline identity
      * (root_phys + sig) rides an index's FIRST sighting only. */
@@ -510,8 +523,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 lint->note_dangling((uint32_t)prev_cp_tid);
             }
             LintCtx lctx = {
-                lint, &tracker, lint->row((uint32_t)prev_cp_tid),
-                (uint32_t)current_thread, (uint32_t)prev_cp_tid,
+                lint, &tracker, &over, lint->row((uint32_t)prev_cp_tid),
+                (uint32_t)current_thread,
+                ((uint64_t)(uint32_t)current_asid << 32) |
+                    (uint32_t)current_thread,
+                (uint32_t)prev_cp_tid,
                 bimodal,
             };
             RangeCells *cp_rc = range_cells_for(prev_cp_tid);
@@ -530,6 +546,9 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * what the decoder's resolved cells would report. */
             tracker.on_cp_entry_end((uint32_t)current_thread,
                                     (uint32_t)prev_cp_tid);
+            over.on_cp_entry_end(((uint64_t)(uint32_t)current_asid << 32) |
+                                     (uint32_t)current_thread,
+                                 (uint32_t)prev_cp_tid);
 
             /* Instruction accounting sums the entry's realised range
              * (§4.2a): bb_stop - bb_start, resolved from the persistent
@@ -1377,6 +1396,28 @@ int main(int argc, char **argv)
                         m.template_id, m.ipos, (unsigned long long)m.pc,
                         on == h.maps.opcode.end() ? "?" : on->second.c_str(),
                         hex.empty() ? "-" : hex.c_str());
+        }
+        /* The over-max subjects, each with the maxes its template
+         * declared and the largest counts the trace published. */
+        for (const cst::AttributionLint::OverSubject &o :
+             lint.over_subjects()) {
+            std::string hex;
+            for (uint8_t b : o.id.bytes) {
+                char t[3];
+                std::snprintf(t, sizeof(t), "%02x", b);
+                hex += t;
+            }
+            auto on = h.maps.opcode.find(o.id.opcode);
+            std::printf("    memop-over-max: template=BB%u ipos=%u "
+                        "pc=0x%llx opcode=%s bytes=%s "
+                        "max=%u/%u seen=%llu/%llu (loads/stores)\n",
+                        o.id.template_id, o.id.ipos,
+                        (unsigned long long)o.id.pc,
+                        on == h.maps.opcode.end() ? "?" : on->second.c_str(),
+                        hex.empty() ? "-" : hex.c_str(),
+                        o.max_loads, o.max_stores,
+                        (unsigned long long)o.seen_loads,
+                        (unsigned long long)o.seen_stores);
         }
         if (lint.any()) {
             std::fprintf(stderr,

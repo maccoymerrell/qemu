@@ -2649,6 +2649,20 @@ static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
             thread_stats_get().memops_over_slot_ceiling +=
                 (actual_n_loads[i] - hi) + (actual_n_stores[i] - hs);
         }
+        /* And what the template's own maxes leave undescribed. */
+        {
+            const InsnFields *f = &tmpl->insn_fields[i];
+            uint64_t over = 0;
+            if (actual_n_loads[i] > f->max_dep_loads) {
+                over += actual_n_loads[i] - f->max_dep_loads;
+            }
+            if (actual_n_stores[i] > f->max_dep_stores) {
+                over += actual_n_stores[i] - f->max_dep_stores;
+            }
+            if (over && (f->max_dep_loads || f->max_dep_stores)) {
+                thread_stats_get().memops_over_template_max += over;
+            }
+        }
         if (hs > hi) hi = hs;
         if (hi > high_water) high_water = hi;
     }

@@ -1890,9 +1890,18 @@ def _scan_body_order(lines) -> Sequence:
     return order
 
 
+# The whole summary cst_lint.h writes -- memop, regdata, dangling template
+# refs and over-max executions.  It used to stop at the regdata group with
+# a `$` anchor, and the lint's summary had grown a dangling-ref group after
+# it (1a41d97879), so the pattern could never match: every trace parsed as
+# clean here whatever the decoder said.  Anchored on the full line now, so a
+# summary that grows again fails to parse loudly (see the parser) instead of
+# reading as zero.
 _IMPOSSIBLE_RE = re.compile(
     r"^; impossible attributions: (\d+) memop \((\d+) distinct insns\), "
-    r"(\d+) regdata \((\d+) distinct insns\)$"
+    r"(\d+) regdata \((\d+) distinct insns\), "
+    r"(\d+) dangling template refs \((\d+) distinct ids\), "
+    r"(\d+) over-max executions \((\d+) distinct insns\)$"
 )
 
 
@@ -1901,15 +1910,27 @@ def _parse_impossible_attributions(lines: list[str]) -> dict:
     (emitted only when the lint counted violations — a clean trace has
     no such line, keeping the legacy text byte-stable).  Surfaced in
     meta so the validator can fail the trace on its own terms."""
-    out = {"memop": 0, "memop_insns": 0, "regdata": 0, "regdata_insns": 0}
+    out = {"memop": 0, "memop_insns": 0, "regdata": 0, "regdata_insns": 0,
+           "dangling": 0, "dangling_ids": 0,
+           "over_max": 0, "over_max_insns": 0}
     for line in reversed(lines[-8:]):
+        if not line.startswith("; impossible attributions: "):
+            continue
         m = _IMPOSSIBLE_RE.match(line)
-        if m:
-            out = {"memop": int(m.group(1)),
-                   "memop_insns": int(m.group(2)),
-                   "regdata": int(m.group(3)),
-                   "regdata_insns": int(m.group(4))}
+        if not m:
+            # The decoder said something is wrong and this parser cannot
+            # read how much: that is a failure, never a zero.
+            out["unparsed"] = line
             break
+        out = {"memop": int(m.group(1)),
+               "memop_insns": int(m.group(2)),
+               "regdata": int(m.group(3)),
+               "regdata_insns": int(m.group(4)),
+               "dangling": int(m.group(5)),
+               "dangling_ids": int(m.group(6)),
+               "over_max": int(m.group(7)),
+               "over_max_insns": int(m.group(8))}
+        break
     return out
 
 

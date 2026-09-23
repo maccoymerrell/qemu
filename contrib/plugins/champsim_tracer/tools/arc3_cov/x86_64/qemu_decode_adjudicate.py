@@ -54,6 +54,7 @@ import re
 import csv
 import sys
 import argparse
+import collections
 
 QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
 _DECODE = 'target/i386/tcg/decode-new.c.inc'
@@ -123,9 +124,20 @@ SITES = {
              'memory modrm matches no entry'),
     'prefetch-memonly': dict(
         file=_DECODE,
-        locator=r'\[0x0d\] = X86_OP_ENTRY1\(NOP,',
-        what='0F 0D is the 3DNow! prefetch and takes a MEMORY operand only; '
-             'the register form matches no entry'),
+        # THIS LOCATOR WAS STALE AND THE REFUSAL CAUGHT IT.  9a3607dcf6 (our
+        # own, the x86 decoder-site statements) turned the table entry from
+        # `X86_OP_ENTRY1(NOP, M,v)' into `X86_OP_GROUP1(0F0D, M,v)' so the
+        # group function could set INSN_DF_WORD_PREFETCH for /0 /1 /2.  The
+        # FACT did not move: the operand spec is still `M,v', and the entry
+        # decode_0F0D() hands back is `X86_OP_ENTRY1(NOP, M,v)' -- memory
+        # only, both before the group and inside it.  Only the line changed,
+        # so only the line changes here.  (The refusal had never been SEEN
+        # because the leg exited at its NOT-MEASURED assertion first; closing
+        # that assertion is what reached this one.)
+        locator=r'\[0x0d\] = X86_OP_GROUP1\(0F0D, M,v\)',
+        what='0F 0D is the 3DNow! prefetch and takes a MEMORY operand only '
+             '-- decode_0F0D() returns X86_OP_ENTRY1(NOP, M,v) for every '
+             'modrm.reg -- so the register form matches no entry'),
     # supporting mechanism citations
     'sse-prefix-check': dict(
         file=_DECODE,
@@ -495,10 +507,29 @@ def main():
             hex_of[r['opcode_id']] = r['probe_hex']
         have = set(i for i, _, _, _, _ in ROWS)
         if want != have:
-            sys.exit('the adjudicated set and the matrix disagree.\n'
-                     '  in the matrix, not adjudicated: %s\n'
+            # THE COUNTS ARE PART OF THE REFUSAL.  Printing two bare lists
+            # leaves the reader to count 165 iforms by eye to find out
+            # whether this is one stale row or a population, and the answer
+            # changes what has to happen next.  The CPL0/CPL3 signals go
+            # with the missing ones for the same reason: a row that takes
+            # #UD everywhere is the population this table exists for, and a
+            # row that faults #DE or #GP is an encoding QEMU RAN whose
+            # refusal class is itself in question.
+            miss = sorted(want - have)
+            sig = collections.Counter(
+                '%s/%s/%s' % (r['exec_user_cpl3_max'], r['exec_sys_cpl0'],
+                              r['exec_sys_cpl0_enabled'])
+                for r in rows if r['opcode_id'] in set(miss))
+            sys.exit('the adjudicated set and the matrix disagree: the '
+                     'matrix has %d DECODED-THEN-REFUSED rows and this '
+                     'table adjudicates %d of them.\n'
+                     '  in the matrix, not adjudicated: %d -- %s\n'
+                     '  their cpl3/cpl0/cpl0+enables signals: %s\n'
                      '  adjudicated, not in the matrix: %s'
-                     % (' '.join(sorted(want - have)) or '-',
+                     % (len(want), len(want & have), len(miss),
+                        ' '.join(miss) or '-',
+                        '  '.join('%s x%d' % (k, n)
+                                  for k, n in sig.most_common()) or '-',
                         ' '.join(sorted(have - want)) or '-'))
         if len(want) != len(rows):
             sys.exit('the matrix names an opcode_id twice among its '

@@ -1173,7 +1173,7 @@ def main():
         # translation-context dependent (see above) makes its MECHANISM
         # context dependent as well, and two answers is no answer.
         mmerged = os.path.join(a.out, "corpus_mech_%s.tsv" % a.isa)
-        mseen, mhdr, mconf = {}, None, 0
+        mseen, mhdr, mconf, mconf_enc = {}, None, 0, set()
         for t in mparts:
             with open(t) as f:
                 for line in f:
@@ -1218,12 +1218,25 @@ def main():
                         mseen[c[1]] = line
                     elif prev != line:
                         mconf += 1
+                        mconf_enc.add(c[1])
                         sys.stderr.write("MECH-CONFLICT %s\n  %s  %s"
                                          % (c[1], prev, line))
         if mconf:
+            # TWO NUMBERS, BECAUSE ONLY ONE OF THEM IS DURABLE (FINDING
+            # 252-B).  `mconf` counts CONFLICTING ROWS -- one encoding whose
+            # row differs in three chunks bumps it three times -- so it moves
+            # with how the population was chunked across the arm and is not
+            # a property of the corpus: the same tree read 241 on one arm and
+            # 212 on the other while the ENCODING SET was byte-identical.
+            # The set is the fact; the row count says how loud the disagreement
+            # was.  Printing one number labelled as the other is how "the same
+            # 212 encodings" got written down, so both are printed and each
+            # says what it counts.
             raise SystemExit(
-                "srcenc_sled: %d POPULATION encoding(s) carry two DIFFERENT "
-                "mechanism rows -- REFUSING" % mconf)
+                "srcenc_sled: %d DISTINCT POPULATION encoding(s) carry two "
+                "DIFFERENT mechanism rows (%d conflicting rows seen; the row "
+                "count depends on chunking, the encoding count does not) "
+                "-- REFUSING" % (len(mconf_enc), mconf))
         # STAMPED LIKE THE READ-LIST CORPUS, and for a sharper reason: the
         # mechanism corpus is what isaxcheck --ident reads decode_id from,
         # and a decode id names a rule in ONE build's decodetree.  Joined

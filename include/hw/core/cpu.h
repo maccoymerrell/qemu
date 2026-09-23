@@ -876,10 +876,22 @@ struct CPUState {
      * departure PC, so equality is exact there, while a peer at the same VA
      * carries its own thread pointer and is skipped.  Targets without the
      * hook record 0 and the check degrades to the bare PC equality.
+     *
+     * The departure ADDRESS SPACE (TCGCPUOps::get_plugin_state's asid) is
+     * recorded and compared the same way: the thread pointer alone cannot
+     * separate two processes whose threads both read the same tp (no-TLS
+     * static twins reading a fixed value), and two such twins running the
+     * same image at the same vaddrs collide on (pc, tp) exactly — witnessed
+     * live on the multiproc_r4_concurrent cell (dep_tp == cur_tp with
+     * different roots).  The address-space root is context-switched state
+     * the kernel restores before the exception return, so a genuine resume
+     * compares equal exactly as the thread pointer does.  Without the hook
+     * both sides read 0 and the check degrades as before.
      */
     bool plugin_in_async_int;
     uint64_t plugin_async_departure_pc;
     uint64_t plugin_async_departure_tp;
+    uint64_t plugin_async_departure_asid;
     /*
      * Synchronous-fault excursion reporting for system-mode tracing.  Unlike
      * the async path above, sync faults are KEPT (the handler is real,

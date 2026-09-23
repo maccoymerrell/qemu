@@ -522,6 +522,21 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
     cpu->plugin_async_departure_tp =
         (ops && ops->get_plugin_thread_ptr) ? ops->get_plugin_thread_ptr(cpu)
                                             : 0;
+    /*
+     * The departure ADDRESS SPACE completes the context discriminator: two
+     * no-TLS twin processes can read the SAME thread-pointer value and
+     * collide on (pc, tp), but each runs on its own root, which the kernel
+     * — like the thread pointer — restores before the exception return
+     * (see cpu.h).
+     */
+    if (ops && ops->get_plugin_state) {
+        int prv;
+        bool mmu;
+        ops->get_plugin_state(cpu, &prv, &cpu->plugin_async_departure_asid,
+                              &mmu);
+    } else {
+        cpu->plugin_async_departure_asid = 0;
+    }
     cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER, departure_pc,
                         cpu->plugin_fault_depth);
 }

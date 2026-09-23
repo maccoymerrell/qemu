@@ -606,10 +606,18 @@ async-interrupt window
    *asynchronous* entry (timer / device IRQ / FIQ / SError) and
    records the interrupted guest PC — the departure point.  The
    fetch loop in ``accel/tcg/cpu-exec.c`` clears the flag when
-   execution returns to exactly that PC, which is robust to the
-   scheduler context-switching away mid-handler and to nesting (the
-   outermost departure PC is kept).  The four delivery sites mirror
-   the fault-push sites above.  Set only on the correct path.
+   execution returns to exactly that PC *in the departed context*:
+   the guest thread pointer and the address-space root are recorded
+   with the departure PC and compared at the re-fetch, because a
+   peer thread or process executing the same VA must not close
+   another context's window (no-TLS twin processes can read the
+   same thread-pointer value, so the root is the discriminator that
+   separates them; both are context-switched state the kernel
+   restores before the exception return, so a genuine resume
+   compares equal).  This is robust to the scheduler
+   context-switching away mid-handler and to nesting (the outermost
+   departure PC is kept).  The four delivery sites mirror the
+   fault-push sites above.  Set only on the correct path.
 
 ``CPUState::plugin_evq`` — the ordered per-vCPU path-event queue
 

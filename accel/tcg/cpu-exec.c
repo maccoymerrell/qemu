@@ -3594,8 +3594,28 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                     (aret_ops && aret_ops->get_plugin_thread_ptr)
                     ? aret_ops->get_plugin_thread_ptr(cpu)
                     : cpu->plugin_async_departure_tp;
+                /*
+                 * The departure ADDRESS SPACE completes the discriminator
+                 * (see cpu.h): no-TLS twin processes can read the SAME
+                 * thread-pointer value, so a twin peer resuming at the same
+                 * VA passes the (pc, tp) test — witnessed live on the
+                 * multiproc twin cell (dep_tp == cur_tp, roots differ) —
+                 * and would close the departed process's window, leaving
+                 * its held block to seal against the PEER's control flow.
+                 * The root, like the thread pointer, is context-switched
+                 * state restored before the exception return, so a genuine
+                 * resume compares equal.
+                 */
+                uint64_t cur_asid = cpu->plugin_async_departure_asid;
+                if (aret_ops && aret_ops->get_plugin_state) {
+                    int aret_prv;
+                    bool aret_mmu;
+                    aret_ops->get_plugin_state(cpu, &aret_prv, &cur_asid,
+                                               &aret_mmu);
+                }
 
-                if (cur_tp == cpu->plugin_async_departure_tp) {
+                if (cur_tp == cpu->plugin_async_departure_tp &&
+                    cur_asid == cpu->plugin_async_departure_asid) {
                     cpu_plugin_async_probe(cpu, "CLOSE", 0, false);
                     cpu->plugin_in_async_int = false;
                     cpu_plugin_evq_push(cpu,
@@ -3613,9 +3633,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                     if (aret_diag) {
                         fprintf(stderr, "[asyncret] peer-context hit "
                                 "suppressed pc=0x%" PRIx64 " dep_tp=0x%"
-                                PRIx64 " cur_tp=0x%" PRIx64 "\n",
+                                PRIx64 " cur_tp=0x%" PRIx64 " dep_asid=0x%"
+                                PRIx64 " cur_asid=0x%" PRIx64 "\n",
                                 (uint64_t)pc,
-                                cpu->plugin_async_departure_tp, cur_tp);
+                                cpu->plugin_async_departure_tp, cur_tp,
+                                cpu->plugin_async_departure_asid, cur_asid);
                     }
                 }
             }

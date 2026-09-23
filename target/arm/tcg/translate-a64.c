@@ -5083,13 +5083,16 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
      *
      * SET* updates the destination pointer and the size, and reads the value:
      * rd and rn are read-modify-write, rs is read.  Register 31 is refused
-     * above on rd and rn, so no XZR case reaches here.
+     * above on rd and rn, but rs == 31 is a valid encoding and means XZR
+     * (a zero fill value, the memset-to-zero case) -- regnames[31] is "sp",
+     * which SET* can never read.
      */
     insn_dataflow_state_read(insn_df_reg(regnames[a->rd]));
     insn_dataflow_state_write(insn_df_reg(regnames[a->rd]));
     insn_dataflow_state_read(insn_df_reg(regnames[a->rn]));
     insn_dataflow_state_write(insn_df_reg(regnames[a->rn]));
-    insn_dataflow_state_read(insn_df_reg(regnames[a->rs]));
+    insn_dataflow_state_read(a->rs == 31 ? insn_df_zero()
+                                         : insn_df_reg(regnames[a->rs]));
 
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));

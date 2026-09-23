@@ -389,7 +389,9 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
      * That is the failure this check exists to find, and exempting it
      * made the counter read 0 while the offline lint read 990 on one
      * x86_64 system trace (`fxsave64 0x40(%rax)`, GEN_OP_STORE, 990 of
-     * that trace's 2,397 firings -- see 817d21256f and d7af864320).
+     * that trace's 2,397 firings; the decode-site fix is 817d21256f, and
+     * the measurement predates the clean restart -- it lives on the
+     * demolition-era refs, not on this branch).
      *
      * What stays exempt, for reasons that are not a decoder's: PUSH /
      * POP / RET (implicit stack traffic; corner encodings like `pop

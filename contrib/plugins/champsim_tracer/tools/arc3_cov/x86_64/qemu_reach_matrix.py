@@ -50,7 +50,12 @@ carries:
                          gen_unknown_opcode() logs ILLOPC and means the decode
                          tables have no entry; its absence means QEMU decoded
                          something and refused it later (feature gate, i64
-                         check, CPL check, operand form) or ran it
+                         check, CPL check, operand form) or ran it.  A row
+                         whose measurements show a fault OTHER than #UD at any
+                         level was ENTERED and is labelled
+                         ENTERED-THEN-FAULTED(PROBE-STATE): the fault belongs
+                         to the probe's own operands or state, not to QEMU's
+                         decoder, and such a row is not adjudication debt
   models_advertising     how many of those models' CPUID actually shows the
                          gating bit, read out of the guest with CPUID rather
                          than out of cpu.c
@@ -458,6 +463,47 @@ def main():
             # QEMU decoded 0xd5 as AAD and RAN JMPABS, PUSHP and POPP, and
             # those three rows would have been laundered here.
             refusal = 'NONE-QEMU-EXECUTES-IT'
+        elif not (c3 == 4 and c0 == 6 and c0e == 6):
+            # ENTRY IS THE ANSWER, AND #UD IS THE ONLY VECTOR THAT DENIES IT.
+            #
+            # This rung applies the same reading that closed the six CPL0
+            # wedges above: reachability is settled the moment QEMU decodes
+            # the bytes and ENTERS the instruction, and what the machine does
+            # after entry is the probe's environment rather than a decode
+            # refusal.  A wedge says so by ending the boot; these rows say so
+            # by taking a fault that a decoder cannot raise.
+            #
+            # #UD -- signal SIGILL at CPL3, vector 6 at CPL0 -- is the fault
+            # QEMU raises when it refuses bytes, so a row that takes it at
+            # EVERY level measured falls through to DECODED-THEN-REFUSED and
+            # stays in the adjudication population, where a named line of the
+            # tree has to answer for it.  Any OTHER fault at ANY level
+            # requires the instruction's own semantics to have begun:
+            #   #DE   the probe's divisor is zero
+            #   #GP   the probe's selector, descriptor, stack or MSR operand
+            #   #PF   the probe's mapping
+            #   #BP / #DB / a vector the encoding itself names (INT, INT3,
+            #         INT1) -- the instruction's defined effect, delivered
+            #   SIGSEGV at CPL3 with #UD at CPL0 -- the probe's stack moved
+            #         under the sled (PUSH/POPF), or a helper raised #UD
+            #         AFTER entry (RDPMC is unimplemented in helper_rdpmc,
+            #         which is a refusal by the executing instruction, not by
+            #         the decoder)
+            # so the row is not a decode refusal and must not be filed as one.
+            #
+            # THE MEMBERSHIP IS DERIVED FROM THE ROW'S OWN SIGNALS, never
+            # from a list: the three fault measurements this matrix already
+            # carries are the whole test.  The verdict does not move -- the
+            # UNREACHABLE arm below requires exactly the #UD triple this rung
+            # excludes -- so nothing is laundered; what moves is the refusal
+            # CLASS, and with it the question the row is asked next.
+            #
+            # It is placed with the OBSERVATION rungs and ahead of the
+            # illopc/byte-shape ones for the reason the rung above states:
+            # a test read off a byte, or off a QEMU illegal-opcode signal
+            # that only fires when QEMU refuses, cannot notice that QEMU ran
+            # the encoding.
+            refusal = 'ENTERED-THEN-FAULTED(PROBE-STATE)'
         elif illopc.get(h):
             refusal = 'NO-TABLE-ENTRY(ILLOPC)'
         elif op == '62':
@@ -521,6 +567,14 @@ def main():
                 why += ('.  Measured in isolation: CPL0 %s, CPL0+enables %s'
                         % (w0 or VECNAME.get(c0, c0),
                            w0e or VECNAME.get(c0e, c0e)))
+        elif refusal == 'ENTERED-THEN-FAULTED(PROBE-STATE)' and not compared:
+            v = UNCOVERED
+            why = ('QEMU DECODES AND ENTERS these bytes -- the fault is the '
+                   'probe\'s own operands or state, not a decode refusal '
+                   '(cpl3=%s cpl0=%s cpl0+enables=%s) -- and the tracer '
+                   'decodes nothing: the whole instruction is dropped'
+                   % (SIGNAME.get(c3, c3), VECNAME.get(c0, c0),
+                      VECNAME.get(c0e, c0e)))
         elif (c3 == 4 and c0 == 6 and c0e == 6
               and mm['models_ran'] == '0' and af == 4):
             # The same four-way proof decides a COMPARED row as well as an

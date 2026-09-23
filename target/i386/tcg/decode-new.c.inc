@@ -449,7 +449,24 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
     bool helper_area = !decode->e.is_decode &&
         (decode->e.gen == gen_FXSAVE || decode->e.gen == gen_FXRSTOR);
 
-    if (has_ea && (helper_area ||
+    /*
+     * LOCK CMPXCHG under CF_PARALLEL is the same shape: gen_CMPXCHG's
+     * atomic arm calls tcg_gen_atomic_cmpxchg_tl, whose parallel route is
+     * a helper (tcg/tcg-op-ldst.c), so the op stream shows a call and no
+     * qemu_ld/qemu_st while the runtime delivers one atomic RMW access --
+     * QEMU genuinely performs the load as well as the store (the #177
+     * adjudication), and the template said the instruction cannot touch
+     * memory at all.  The rows are stated only for the invisible route:
+     * without CF_PARALLEL the same call expands to a real qemu_ld/qemu_st
+     * pair the op-stream reader records itself, and stating them here too
+     * would declare every access twice.
+     */
+    bool locked_cmpxchg = !decode->e.is_decode &&
+        decode->e.gen == gen_CMPXCHG &&
+        (s->prefix & PREFIX_LOCK) &&
+        (tb_cflags(s->base.tb) & CF_PARALLEL);
+
+    if (has_ea && (helper_area || locked_cmpxchg ||
                    (word != NULL &&
                     (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
                      !strcmp(word, INSN_DF_WORD_CACHEFLUSH))))) {
@@ -531,6 +548,19 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
             insn_dataflow_note_synthetic_ea(decode->e.gen == gen_FXSAVE
                                             ? INSN_DF_WR : INSN_DF_RD,
                                             512, parts, n, a->disp);
+        } else if (locked_cmpxchg) {
+            /*
+             * The RMW pair, in the order the nonatomic expansion performs
+             * it (qemu_ld then qemu_st), so both translation regimes of
+             * one encoding declare the same template: one load slot and
+             * one store slot at the operand width.
+             */
+            uint32_t sz = 1u << decode->op[2].ot;
+
+            insn_dataflow_note_synthetic_ea(INSN_DF_RD, sz, parts, n,
+                                            a->disp);
+            insn_dataflow_note_synthetic_ea(INSN_DF_WR, sz, parts, n,
+                                            a->disp);
         } else {
             insn_dataflow_note_synthetic_ea(INSN_DF_RD,
                                             1u << decode->op[0].ot,

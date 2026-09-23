@@ -3,8 +3,16 @@
 #
 # usage: sysprobe_enab_run.sh <evidence-dir> [cpu-model]
 # reads  <evidence-dir>/reach_in.hex
-# writes <evidence-dir>/cpl0_enab.tsv   hex -> exception vector
+# writes <evidence-dir>/cpl0_enab.tsv        hex -> exception vector
+#        <evidence-dir>/cpl0_enab_wedge.tsv  hex -> what it did instead
 #        <evidence-dir>/enables.tsv     enable -> old, new, vector, held
+#
+# A row lands in cpl0_enab_wedge.tsv when the encoding ENDED the boot it was
+# measured in.  That is a verdict, not a hole: it is derived from that
+# encoding's own isolated run (sysprobe_isolate.sh) and says which of
+# executed-and-halted, executed-and-left-CPL0-flow or
+# executed-then-machine-unusable the log shows.  This script exits non-zero
+# if any row has no verdict at all.
 #
 # The plain CPL0 leg proves a #UD is not a PRIVILEGE refusal.  It cannot
 # prove the #UD is not an ENABLE refusal: an instruction QEMU implements
@@ -78,6 +86,29 @@ for pass in $(seq 1 60); do
 done
 grep -q '^DONE' eout.txt || { echo "too many wedges"; exit 4; }
 
+# ---- EVERY ROW THIS LOOP COULD NOT MEASURE GETS ITS OWN MACHINE -----------
+# Two ways a row ends up with nothing here, and they used to look the same
+# from the output: it was in skip.txt (the plain leg proved it kills the
+# machine, so this loop never attempts it) or it ended one of this loop's own
+# passes.  Either way the encoding has no row, and six of them reached the
+# published matrix as NOT-MEASURED.  The enables are the whole point of this
+# leg, and they change the answer: with EFER.SCE held, 0f05 SYSCALL and
+# 0f07 / 480f07 SYSRET stop being #UD and start doing what the architecture
+# says, which is precisely the measurement the batch loop cannot survive.  So
+# every unmeasured row is re-run alone with the enable stage in place, under
+# an external watchdog, and read back from QEMU's own logs.
+cut -f1 enab_all.tsv | sort -u > .emeasured.hex
+comm -23 <(sort -u reach_in.hex) .emeasured.hex > .eunmeasured.hex
+iso_rc=0
+if [ -s .eunmeasured.hex ]; then
+  echo "unmeasured after the enable loop: $(wc -l < .eunmeasured.hex) -- isolating"
+  # shellcheck disable=SC2046
+  "$T"/sysprobe_isolate.sh "$E" enab "$CPU" "$E/isolate_enab.tsv" \
+      $(cat .eunmeasured.hex) || iso_rc=1
+else
+  printf 'hex\toutcome\tvector\tevidence\n' > "$E/isolate_enab.tsv"
+fi
+
 $PY - <<'PYEOF'
 import collections
 import sys
@@ -118,17 +149,52 @@ for line in open('enab_all.tsv'):
     h, v = line.split()
     d[h] = int(v)
 want = [x.strip() for x in open('reach_in.hex') if x.strip()]
-miss = [h for h in want if h not in d]
+
+iso = {}
+for i, line in enumerate(open('isolate_enab.tsv')):
+    if i == 0:
+        continue
+    f = line.rstrip('\n').split('\t', 3)
+    if len(f) != 4:
+        sys.exit('isolate_enab.tsv line %d has %d fields, not 4: a '
+                 'verdict row this reader cannot parse is a row '
+                 'it would DROP, and a dropped verdict reads '
+                 'exactly like a hole.  %r'
+                 % (i + 1, len(f), line))
+    iso[f[0]] = (f[1], f[2], f[3])
+for h, (outcome, vec, why) in iso.items():
+    if outcome == 'MEASURED':
+        d[h] = int(vec)
+
 open('cpl0_enab.tsv', 'w').write(
     'hex\tcpl0_enab_vec\n' +
     ''.join('%s\t%d\n' % (h, d[h]) for h in want if h in d))
+wedge = [(h, iso[h]) for h in want
+         if h in iso and iso[h][0] != 'MEASURED']
+with open('cpl0_enab_wedge.tsv', 'w') as f:
+    f.write('hex\toutcome\tevidence\n')
+    for h, (outcome, _v, why) in wedge:
+        f.write('%s\t%s\t%s\n' % (h, outcome, why))
+
 print('enables held %d/%d: %s'
       % (sum(held.values()), len(held),
          ' '.join(n for n in held if held[n])))
 print('enables REFUSED: %s'
       % ' '.join('%s(vec=%d)' % (r[0], r[3]) for r in rows if not r[4]))
-print('CPL0+ENABLES: %d rows, %s%s'
-      % (len(d), collections.Counter(d.values()),
-         ('  NOT MEASURED (wedged the machine): %s' % ' '.join(miss))
-          if miss else ''))
+print('CPL0+ENABLES: %d rows, %s' % (len(d), collections.Counter(d.values())))
+for h, (outcome, _v, why) in wedge:
+    print('  %s  %s -- %s' % (h, outcome, why))
+
+miss = [h for h in want if h not in d and h not in iso]
+undet = [h for h, (o, _v, _w) in wedge if o.startswith('UNDETERMINED')]
+if miss or undet:
+    sys.exit('ENABLE LEG REFUSED: %d row(s) have no verdict (%s) and %d came '
+             'back UNDETERMINED (%s).  NOT-MEASURED is not a result and does '
+             'not leave this script.'
+             % (len(miss), ' '.join(miss) or '-',
+                len(undet), ' '.join(undet) or '-'))
 PYEOF
+py_rc=$?
+[ "$iso_rc" -eq 0 ] || exit 5
+[ "$py_rc" -eq 0 ] || exit 6
+exit 0

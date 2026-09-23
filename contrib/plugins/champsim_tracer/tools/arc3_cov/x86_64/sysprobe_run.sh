@@ -2,7 +2,18 @@
 # ARC 3 -- drive the CPL0 reachability probe to completion.
 #
 # usage: sysprobe_run.sh <evidence-dir> [cpu-model]
-# reads  <evidence-dir>/reach_in.hex, writes <evidence-dir>/cpl0.tsv
+# reads  <evidence-dir>/reach_in.hex
+# writes <evidence-dir>/cpl0.tsv        hex -> exception vector
+#        <evidence-dir>/cpl0_wedge.tsv  hex -> what it did instead
+#
+# THE SECOND FILE IS WHY THIS LEG NO LONGER PUBLISHES HOLES.  A CPL0 probe
+# can legitimately halt the machine or leave ring 0, and the shard loop can
+# only skip such an encoding and move on.  Every row it skips is re-run in
+# its own bounded machine (sysprobe_isolate.sh) and comes back with a class
+# derived from that boot's own logs -- executed-and-halted,
+# executed-and-left-CPL0-flow, executed-then-machine-unusable -- or with
+# UNDETERMINED, which fails this script.  NOT-MEASURED is not an outcome
+# this leg can produce any more.
 #
 # qemu-x86_64 runs everything at CPL 3, so a #UD from a privileged opcode says
 # "privilege" and not "QEMU does not implement it".  This is the leg that
@@ -161,34 +172,82 @@ echo "shards ok=$ok incomplete=$bad"
 # timeout per row rediscovering that.
 cut -f1 wedged.tsv | sort -u > skip.txt
 
+# ---- EVERY ROW THE SHARDS COULD NOT MEASURE GETS ITS OWN MACHINE ----------
+# The shard loop's job is throughput: it skips the encoding that ended the
+# boot so the other 255 in that shard stay measurable.  What it leaves behind
+# is an encoding with no row, and "no row" used to travel all the way to the
+# published matrix as NOT-MEASURED.  It is not unmeasurable -- a CPL0 HLT
+# halts, a SYSRET leaves ring 0, a mov to CR0 turns paging off, and the boot
+# stopping IS the observation.  So each one is re-run alone, under an
+# external watchdog, with QEMU's execution and exception logs kept, and
+# sysprobe_verdict.py derives the class from what the log shows.
+cut -f1 all.tsv | sort -u > .measured.hex
+comm -23 <(sort -u reach_in.hex) .measured.hex > .unmeasured.hex
+iso_rc=0
+if [ -s .unmeasured.hex ]; then
+  echo "unmeasured after the shards: $(wc -l < .unmeasured.hex) -- isolating"
+  # shellcheck disable=SC2046
+  "$T"/sysprobe_isolate.sh "$E" plain "$CPU" "$E/isolate_plain.tsv" \
+      $(cat .unmeasured.hex) || iso_rc=1
+else
+  printf 'hex\toutcome\tvector\tevidence\n' > "$E/isolate_plain.tsv"
+fi
+
 $PY - <<'EOF'
 import collections
+import sys
 d = {}
 for line in open('all.tsv'):
     h, v = line.split()
     d[h] = int(v)
 want = [x.strip() for x in open('reach_in.hex') if x.strip()]
-wedged = set()
-try:
-    for line in open('wedged.tsv'):
-        wedged.add(line.split('\t')[0])
-except IOError:
-    pass
-miss = [h for h in want if h not in d]
+
+# The isolated arm's MEASURED rows are ordinary measurements -- the shard just
+# could not carry them -- so they join cpl0.tsv.  Everything else it returned
+# is a VERDICT about what the encoding did, and it goes in its own file with
+# the class and the evidence on the row.
+iso = {}
+for i, line in enumerate(open('isolate_plain.tsv')):
+    if i == 0:
+        continue
+    f = line.rstrip('\n').split('\t', 3)
+    if len(f) != 4:
+        sys.exit('isolate_plain.tsv line %d has %d fields, not 4: a '
+                 'verdict row this reader cannot parse is a row '
+                 'it would DROP, and a dropped verdict reads '
+                 'exactly like a hole.  %r'
+                 % (i + 1, len(f), line))
+    iso[f[0]] = (f[1], f[2], f[3])
+for h, (outcome, vec, why) in iso.items():
+    if outcome == 'MEASURED':
+        d[h] = int(vec)
+
 open('cpl0.tsv', 'w').write('hex\tcpl0_vec\n' +
     ''.join('%s\t%d\n' % (h, d[h]) for h in want if h in d))
-# A row this probe could not measure is named by WHY: an encoding that kills
-# the machine on its own was CONFIRMED to do so in isolation, and one that is
-# merely absent was not.  The two are not the same silence.
-say = 'CPL0: %d rows, %s' % (len(d), collections.Counter(d.values()))
-conf = [h for h in miss if h in wedged]
-other = [h for h in miss if h not in wedged]
-if conf:
-    say += '\n  WEDGES THE MACHINE (confirmed alone, no vector): %s' % ' '.join(conf)
-if other:
-    say += '\n  NOT MEASURED, cause not established: %s' % ' '.join(other)
-print(say)
+wedge = [(h, iso[h]) for h in want
+         if h in iso and iso[h][0] != 'MEASURED']
+with open('cpl0_wedge.tsv', 'w') as f:
+    f.write('hex\toutcome\tevidence\n')
+    for h, (outcome, _v, why) in wedge:
+        f.write('%s\t%s\t%s\n' % (h, outcome, why))
+
+miss = [h for h in want if h not in d and h not in iso]
+print('CPL0: %d rows, %s' % (len(d), collections.Counter(d.values())))
+for h, (outcome, _v, why) in wedge:
+    print('  %s  %s -- %s' % (h, outcome, why))
+# A row with NO verdict at all is the only silence left, and it stops the leg
+# rather than reaching the matrix as NOT-MEASURED.
+undet = [h for h, (o, _v, _w) in wedge if o.startswith('UNDETERMINED')]
+if miss or undet:
+    sys.exit('CPL0 LEG REFUSED: %d row(s) have no verdict (%s) and %d came '
+             'back UNDETERMINED (%s).  A reachability leg that cannot reach '
+             'its subject says so here; it does not publish a hole.'
+             % (len(miss), ' '.join(miss) or '-',
+                len(undet), ' '.join(undet) or '-'))
 EOF
+py_rc=$?
 
 [ "$bad" -eq 0 ] || exit 4
+[ "$iso_rc" -eq 0 ] || exit 5
+[ "$py_rc" -eq 0 ] || exit 6
 exit 0

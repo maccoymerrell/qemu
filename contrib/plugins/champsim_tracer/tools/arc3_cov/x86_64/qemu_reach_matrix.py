@@ -281,6 +281,26 @@ def main():
     cpl0e = load_tsv(need('cpl0_enab.tsv'), 'hex')
     enab = load_tsv(need('enables.tsv'), 'enable')
 
+    # THE CPL0 LEGS' SECOND OUTPUT, and it is a measurement, not an excuse.
+    # Some encodings END the boot they are measured in -- HLT halts, SYSRET
+    # leaves ring 0, a mov to CR0 turns paging off -- so they never report an
+    # exception vector.  Six x86_64 rows reached this matrix as NOT-MEASURED
+    # on exactly that account.  Each is now re-run in its own bounded machine
+    # and classified from that boot's own execution and exception logs
+    # (sysprobe_isolate.sh / sysprobe_verdict.py), and every class in these
+    # files begins EXECUTED-: the instruction was decoded, entered and run.
+    # That answers the only question this matrix asks of the CPL0 legs.
+    wedge0 = load_tsv(need('cpl0_wedge.tsv'), 'hex')
+    wedge0e = load_tsv(need('cpl0_enab_wedge.tsv'), 'hex')
+    for src, w in (('cpl0_wedge.tsv', wedge0),
+                   ('cpl0_enab_wedge.tsv', wedge0e)):
+        for h, r in w.items():
+            if not r['outcome'].startswith('EXECUTED-'):
+                sys.exit('%s/%s: %s is %s.  An UNDETERMINED row is a leg that '
+                         'did not reach its subject; it is not a reachability '
+                         'verdict and this matrix will not carry one.'
+                         % (E, src, h, r['outcome']))
+
     # R8.7 -- the enable leg is worth exactly the controls that convict it.
     # An enable reported as HELD by a probe that cannot tell "QEMU took it"
     # from "QEMU discarded it" would launder every row it touches.
@@ -407,12 +427,24 @@ def main():
         af = int(allfl[h]['signal']) if h in allfl else None
         c0 = int(cpl0[h]['cpl0_vec']) if h in cpl0 else None
         c0e = int(cpl0e[h]['cpl0_enab_vec']) if h in cpl0e else None
+        # The wedge classes stand in for a vector, and they say MORE than one:
+        # a vector says which fault the encoding took, and these say the
+        # encoding took none because it ran and took the machine with it.
+        w0 = wedge0.get(h, {}).get('outcome')
+        w0e = wedge0e.get(h, {}).get('outcome')
         mm = matrix.get(h)
         b, i = strip_prefixes(h)
         op = b[i] if i < len(b) else ''
 
-        if c3 is None or c0 is None or c0e is None or mm is None:
+        if (c3 is None or mm is None
+                or (c0 is None and w0 is None)
+                or (c0e is None and w0e is None)):
             refusal = 'NOT-MEASURED'
+        elif w0 is not None or w0e is not None:
+            # THE WEDGE IS THE MEASUREMENT.  Either CPL0 leg watching QEMU
+            # decode the bytes, enter them and run them settles reachability
+            # for this row, whichever way the boot then ended.
+            refusal = 'NONE-QEMU-EXECUTES-IT'
         elif c3 == 0 or c0 == 255 or c0e == 255:
             # MEASURED FIRST, and this ordering is the point.  The 0x62 and
             # 0xd5 arms below are the only two labels in this function that
@@ -456,21 +488,39 @@ def main():
 
         # ------------------------------------------------------- the verdict
         if refusal == 'NOT-MEASURED':
-            # The reachability legs are fed the encodings the TRACER's decoder
-            # rejected, so a row the tracer DOES decode never enters them.  It
-            # is uncompared for the opposite reason -- no reference decodes it
-            # -- and a reference gap is not a verdict either.
+            # WHICH LEG IS SILENT IS PART OF THE ROW.  This used to print one
+            # sentence -- "tracer decodes it, NO reference does" -- for every
+            # NOT-MEASURED row, and that sentence describes only one of the
+            # ways a row gets here: the reachability legs are fed the
+            # encodings the TRACER's decoder rejected, so a row the tracer
+            # DOES decode never enters them.  The other way is a leg that WAS
+            # fed the encoding and came back with nothing, and printing the
+            # first cause over the second is how six rows whose CPL0 boots
+            # had ended on them read as a reference gap.
+            silent = [nm for nm, have in (('cpl3', c3 is not None),
+                                          ('cpl0', c0 is not None
+                                           or w0 is not None),
+                                          ('cpl0+enables', c0e is not None
+                                           or w0e is not None),
+                                          ('models', mm is not None))
+                      if not have]
             out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-', '-',
                         refusal, t.decoder_mentions(mn), '-', '-', '-', '-',
-                        'tracer decodes it, NO reference does (%s): the row '
-                        'has no comparison and a reference gap is not a '
-                        'verdict' % r['mechanism'], UNCOVERED))
+                        'no verdict from: %s.  The row has no comparison '
+                        'either (%s), and neither a reference gap nor a '
+                        'silent leg is a verdict'
+                        % (', '.join(silent) or 'nothing', r['mechanism']),
+                        UNCOVERED))
             tally[UNCOVERED] += 1
             continue
         elif refusal == 'NONE-QEMU-EXECUTES-IT' and not compared:
             v = UNCOVERED
             why = ('QEMU EXECUTES these bytes and the tracer decodes nothing: '
                    'the whole instruction is dropped')
+            if w0 or w0e:
+                why += ('.  Measured in isolation: CPL0 %s, CPL0+enables %s'
+                        % (w0 or VECNAME.get(c0, c0),
+                           w0e or VECNAME.get(c0e, c0e)))
         elif (c3 == 4 and c0 == 6 and c0e == 6
               and mm['models_ran'] == '0' and af == 4):
             # The same four-way proof decides a COMPARED row as well as an
@@ -508,8 +558,8 @@ def main():
                     SIGNAME.get(c3, str(c3)),
                     '%s/%s ran' % (mm['models_ran'], mm['models_probed']),
                     SIGNAME.get(af, str(af)),
-                    VECNAME.get(c0, str(c0)),
-                    VECNAME.get(c0e, str(c0e)),
+                    w0 or VECNAME.get(c0, str(c0)),
+                    w0e or VECNAME.get(c0e, str(c0e)),
                     refusal, present, word, in_tcg, adv, naming, why, v))
         tally[v] += 1
 

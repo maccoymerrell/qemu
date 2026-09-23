@@ -397,6 +397,17 @@ def main():
 
     out = []
     tally = collections.Counter()
+    #: TRIPWIRE for the rung order (254-C).  The two BYTE-SHAPE labels --
+    #: NO-TABLE-ENTRY(ILLOPC) and EVEX-PREFIX-NOT-DECODED -- sit BEHIND the
+    #: observation rungs on an assumption: that a row reaching them is #UD at
+    #: every level measured, so no encoding QEMU entered can wear a label read
+    #: off a byte.  That is true of the chain as written and NOTHING CHECKS IT.
+    #: A future corpus in which an ILLOPC-flagged encoding faults some other
+    #: way, or a future edit that moves a rung, would silently launder an
+    #: executed instruction into the byte-shape bucket -- the exact failure the
+    #: rung comment above says the ordering exists to prevent.  So the
+    #: assumption is asserted after the fact, and a violation REFUSES.
+    byte_shape_not_ud = []
     for r in rows:
         opid = r['opcode_id']
         h = r['probe_hex']
@@ -513,6 +524,13 @@ def main():
         else:
             refusal = 'DECODED-THEN-REFUSED'
 
+        if (refusal in ('NO-TABLE-ENTRY(ILLOPC)', 'EVEX-PREFIX-NOT-DECODED')
+                and not (c3 == 4 and c0 == 6 and c0e == 6)):
+            byte_shape_not_ud.append(
+                '%s %s -> %s but cpl3=%s cpl0=%s cpl0+enables=%s'
+                % (opid, h, refusal, SIGNAME.get(c3, c3),
+                   VECNAME.get(c0, c0), VECNAME.get(c0e, c0e)))
+
         key = isa_set if isa_set in ext_cpuid else ext
         sym = ext_cpuid.get(key, 'unmapped')
         if key.startswith('APX') or isa_set.startswith('APX_'):
@@ -616,6 +634,17 @@ def main():
                     w0e or VECNAME.get(c0e, str(c0e)),
                     refusal, present, word, in_tcg, adv, naming, why, v))
         tally[v] += 1
+
+    if byte_shape_not_ud:
+        sys.exit('THE RUNG ORDER\'S ASSUMPTION HAS STOPPED HOLDING: %d row(s) '
+                 'carry a BYTE-SHAPE refusal while the probes measured a '
+                 'fault other than #UD at some level.  A label read off the '
+                 'first byte cannot notice that QEMU entered the encoding, '
+                 'which is why those labels sit behind the observation rungs; '
+                 'a row here means the ordering no longer delivers that and '
+                 'an executed instruction is about to be filed as one nobody '
+                 'can reach.  REFUSING.\n  %s'
+                 % (len(byte_shape_not_ud), '\n  '.join(byte_shape_not_ud)))
 
     hdr = ('opcode_id', 'mnemonic', 'isa_set', 'extension', 'probe_hex',
            'exec_user_cpl3_max', 'exec_user_models', 'exec_user_allflags',

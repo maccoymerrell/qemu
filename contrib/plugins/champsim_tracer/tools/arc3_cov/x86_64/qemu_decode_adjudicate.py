@@ -80,6 +80,17 @@ NOT_IMPL = 'NOT-IMPLEMENTED'
 ENABLE_OFF = 'ENABLE-GATED-OFF'
 REFUSED = 'REFUSED-BY-MODEL'
 UNADJ = 'UNADJUDICATED-REMAINDER'
+#: The row is REACHABLE IN QEMU and the CPL0 legs' #UD comes from the model's
+#: vendor, not from QEMU.  Measured, not asserted: sysprobe_vendor.sh runs the
+#: same encodings under `-cpu max` (whose vendor QEMU sets to AMD) and under
+#: `-cpu max,vendor=GenuineIntel`, and a row may only carry this word when the
+#: measurement shows it moving off #UD when the vendor changes.
+REACH_VENDOR = 'REACHABLE-INTEL-VENDOR'
+#: The row is reachable in QEMU and NO PROBE IN THIS CORPUS REACHES THE STATE
+#: IT NEEDS.  That is a hole in the probes, and saying so is not the same as
+#: saying the instruction cannot run -- which is why it has its own word
+#: instead of UNREACHABLE or the open-question remainder.
+PROBE_HOLE_SMM = 'PROBE-HOLE(SMM)'
 
 # --------------------------------------------------------------------------
 # The refusal sites.  `locator` is matched against `file`; the citation is
@@ -620,39 +631,48 @@ ROWS = [
      'VPCLMULQDQ', NOT_IMPL, 'pclmulqdq-128only', None),
     ('XED_IFORM_VPCLMULQDQ_YMMu128_YMMu64_YMMu64_IMM8',
      'VPCLMULQDQ', NOT_IMPL, 'pclmulqdq-128only', None),
+    # ---- sysenter-entry / sysexit-entry (253-A, closed by measurement)
+    # QEMU has the entry and the emitter for both; what refuses them in the
+    # CPL0 legs is chk(i64_amd) against the max model's AMD vendor.  The
+    # vendor arm measures the same encodings under an Intel-vendor model and
+    # both move off #UD, so the instruction is reachable in QEMU and the #UD
+    # is a CPU-MODEL fact.  --cpl0-vendor is REQUIRED for these rows.
+    ('XED_IFORM_SYSENTER',
+     'SYSENTER', REACH_VENDOR, 'sysenter-entry', None),
+    ('XED_IFORM_SYSEXIT',
+     'SYSEXIT', REACH_VENDOR, 'sysexit-entry', None),
 ]
 
-# THE REMAINDER -- rows this table will NOT adjudicate, and why.
+# THE REMAINDER -- rows this table gives a CLASS but not a reachability
+# verdict, and why.
 #
-# A short named remainder beats a false justification.  Each of these three
-# encodings HAS a decode-table entry and a working emitter in QEMU; what
-# refuses it is a property of the machine the probe legs happened to build,
-# not a statement that QEMU cannot run it.  Calling any of them
-# NOT-IMPLEMENTED would be false, ENABLE-GATED-OFF would promise a re-probe
-# this corpus has no leg for, and REFUSED-BY-MODEL would be the opposite of
-# the truth for two of them.  So they are printed, counted, cited, and left
-# open with the question stated -- and because the set comparison below
-# counts them, the leg cannot lose them.
+# A short named remainder beats a false justification.  This encoding HAS a
+# decode-table entry and a working emitter in QEMU; what refuses it is a
+# property of the machine the probe legs happened to build, not a statement
+# that QEMU cannot run it.  NOT-IMPLEMENTED would be false, ENABLE-GATED-OFF
+# would promise a re-probe this corpus has no leg for, and UNREACHABLE would
+# assert the opposite of what the tree says.
 #
-# opcode_id -> (mnemonic, refusal site, the question a maintainer must answer)
+# SYSENTER and SYSEXIT LEFT THIS LIST BY MEASUREMENT (253-A): the vendor arm
+# probes them under an Intel-vendor model and both move off #UD, so they are
+# adjudicated REACHABLE-INTEL-VENDOR in ROWS above rather than left open.
+#
+# RSM stays, and its word is now PROBE-HOLE(SMM) rather than an open question.
+# The derivation is the purpose statement plus the standing per-model ruling:
+# SMM exists in QEMU system mode, so the instruction IS reachable in QEMU; what
+# this corpus lacks is a CPL0 leg that enters SMM.  That is a hole in the
+# probes, it is named as one, and building an SMM probe is an ARC 4 candidate.
+#
+# opcode_id -> (mnemonic, refusal site, published class, what the class means)
 REMAINDER = [
-    ('XED_IFORM_SYSENTER', 'SYSENTER', 'sysenter-entry',
-     'every reachability leg in this corpus runs -cpu max, and QEMU sets the '
-     'max model vendor to AMD, so chk(i64_amd) refuses SYSENTER in 64-bit '
-     'mode.  Under an Intel-vendor model the same entry decodes and emits.  '
-     'Is the x86_64 corpus AMD-vendor-scoped by decision -- in which case '
-     'these rows are UNREACHABLE for the scope and should say so -- or is an '
-     'Intel-vendor CPL0 re-probe owed before any UNREACHABLE claim stands?'),
-    ('XED_IFORM_SYSEXIT', 'SYSEXIT', 'sysexit-entry',
-     'same question as SYSENTER: chk(i64_amd) against the max model vendor, '
-     'which QEMU sets to AMD; the entry and the emitter both exist'),
-    ('XED_IFORM_RSM', 'RSM', 'rsm-entry',
+    ('XED_IFORM_RSM', 'RSM', 'rsm-entry', PROBE_HOLE_SMM,
      'RSM is implemented (gen_RSM -> helper_rsm) and refused by chk(smm) '
-     'because the probe boots are never in system-management mode.  SMM is '
-     'reachable in QEMU system mode, so "no configuration executes it" is '
-     'not established.  Does the tracer scope include SMM -- in which case a '
-     'CPL0 leg that enters SMM is owed -- or is SMM out of scope and the row '
-     'UNREACHABLE for that stated reason?'),
+     'because no probe boot in this corpus is ever in system-management '
+     'mode.  SMM is reachable in QEMU system mode, so the instruction is '
+     'reachable in QEMU and the refusal measures THIS CORPUS\'S PROBES, not '
+     'QEMU.  The row is therefore neither UNREACHABLE nor unadjudicated: it '
+     'is a named probe-coverage hole, and an SMM-entering CPL0 leg is the '
+     'work that closes it'),
 ]
 
 # The extensions whose absence from has_cpuid_feature() is itself the proof
@@ -713,7 +733,7 @@ def _selftest(root):
     # The synthetic matrix must carry the REMAINDER too, or arm A would fail
     # on this file's own set comparison rather than on anything it measures.
     rows = ([(i, mn) for i, mn, _, _, _ in ROWS]
-            + [(i, mn) for i, mn, _, _ in REMAINDER])
+            + [(i, mn) for i, mn, _, _, _ in REMAINDER])
 
     def matrix(mut=None, drop=None, dup=None):
         out = io.StringIO()
@@ -729,13 +749,29 @@ def _selftest(root):
                           % (i, mn))
         return out.getvalue()
 
-    def run(text, extra=()):
+    # The vendor arm's own evidence, synthesised: two subjects that move off
+    # #UD and one control that does not.  Every run below carries it, because
+    # a REACHABLE-INTEL-VENDOR row without it is refused -- which is arm I.
+    def vendor_file(text):
+        with tempfile.NamedTemporaryFile('w', suffix='.tsv',
+                                         delete=False) as f:
+            f.write(text)
+            return f.name
+
+    vend_ok = vendor_file('hex\tvec_amd\tvec_intel\trole\tmoved\n'
+                          '0f34\t6\t13\tSUBJECT\t1\n'
+                          '0f35\t6\t13\tSUBJECT\t1\n'
+                          '0f0b\t6\t6\tCONTROL\t0\n')
+
+    def run(text, extra=(), vendor=None):
         with tempfile.NamedTemporaryFile('w', suffix='.tsv',
                                          delete=False) as f:
             f.write(text)
             path = f.name
         cmd = [sys.executable, os.path.abspath(__file__), '--root', root,
                '--matrix', path] + list(extra)
+        if vendor is not False:
+            cmd += ['--cpl0-vendor', vendor or vend_ok]
         r = subprocess.run(cmd, capture_output=True, text=True)
         os.unlink(path)
         return r
@@ -782,14 +818,42 @@ def _selftest(root):
     g = run(matrix(drop=REMAINDER[0][0]))
     t('G a REMAINDER iform missing from the matrix REFUSES too',
       g.returncode != 0 and 'disagree' in g.stderr)
-    # H the remainder rows are PRINTED, and printed without a verdict.
-    rem = set(i for i, _, _, _ in REMAINDER)
+    # H the remainder rows are PRINTED, each carrying the class it was filed
+    # under -- not a verdict, and not a blank.
+    rem = dict((i, label) for i, _, _, label, _ in REMAINDER)
     lines = [row for row in a.stdout.splitlines()
              if row.split('\t')[0] in rem]
-    t('H every REMAINDER row is published, carrying %s and no verdict' % UNADJ,
+    t('H every REMAINDER row is published with its own class word',
       len(lines) == len(REMAINDER)
-      and all(row.split('\t')[3] == UNADJ for row in lines))
-    print('arms=8 failures=%d' % fails)
+      and all(row.split('\t')[3] == rem[row.split('\t')[0]]
+              for row in lines))
+    # I THE VENDOR ARM IS A PREREQUISITE, NOT A DECORATION.  A
+    # REACHABLE-INTEL-VENDOR row says QEMU runs the encoding once the vendor
+    # is Intel's, and that is a MEASUREMENT.  Without the measurement the word
+    # would be an assertion, so the table refuses to print it.
+    i_ = run(matrix(), vendor=False)
+    t('I a REACHABLE-INTEL-VENDOR row without --cpl0-vendor REFUSES',
+      i_.returncode != 0 and 'vendor' in i_.stderr)
+    # J AND AN INERT ARM IS NOT EVIDENCE.  A vendor table in which nothing
+    # moved would let the word through on a run that measured nothing.
+    vend_inert = vendor_file('hex\tvec_amd\tvec_intel\trole\tmoved\n'
+                             '0f34\t6\t6\tSUBJECT\t0\n'
+                             '0f35\t6\t6\tSUBJECT\t0\n'
+                             '0f0b\t6\t6\tCONTROL\t0\n')
+    j = run(matrix(), vendor=vend_inert)
+    t('J a vendor table in which NO SUBJECT MOVED REFUSES',
+      j.returncode != 0 and 'vendor' in j.stderr)
+    # K AND A MOVING CONTROL MEANS THE TWO ARMS DIFFER FOR ANOTHER REASON.
+    vend_ctl = vendor_file('hex\tvec_amd\tvec_intel\trole\tmoved\n'
+                           '0f34\t6\t13\tSUBJECT\t1\n'
+                           '0f35\t6\t13\tSUBJECT\t1\n'
+                           '0f0b\t6\t13\tCONTROL\t1\n')
+    k = run(matrix(), vendor=vend_ctl)
+    t('K a vendor table whose CONTROL moved REFUSES', k.returncode != 0
+      and 'vendor' in k.stderr)
+    for p in (vend_ok, vend_inert, vend_ctl):
+        os.unlink(p)
+    print('arms=11 failures=%d' % fails)
     return 1 if fails else 0
 
 
@@ -804,6 +868,9 @@ def main():
                                      "row's probe encoding is resolved from")
     ap.add_argument('--enables', help='enables.tsv from the enable-bit leg')
     ap.add_argument('--cpl0-enab', help='cpl0_enab.tsv from the enable leg')
+    ap.add_argument('--cpl0-vendor',
+                    help='cpl0_vendor.tsv from sysprobe_vendor.sh; REQUIRED '
+                         'while any row is filed ' + REACH_VENDOR)
     ap.add_argument('-o', help='write the adjudication here')
     a = ap.parse_args()
 
@@ -864,7 +931,7 @@ def main():
         # it does not get is a verdict.  Keeping it out of `have` instead
         # would make the leg refuse forever on rows whose answer is not the
         # table's to give, and dropping it silently would be worse.
-        have = set(i for i, _, _, _, _ in ROWS) | set(i for i, _, _, _
+        have = set(i for i, _, _, _, _ in ROWS) | set(i for i, _, _, _, _
                                                       in REMAINDER)
         if want != have:
             # THE COUNTS ARE PART OF THE REFUSAL.  Printing two bare lists
@@ -915,6 +982,46 @@ def main():
             for r in csv.DictReader(f, delimiter='\t'):
                 vec[r['hex']] = int(r['cpl0_enab_vec'])
 
+    # ---- the vendor arm, REQUIRED while any row is filed on it -----------
+    #
+    # REACHABLE-INTEL-VENDOR is a measurement, so it is not printed unless the
+    # measurement is in hand AND says what the word claims.  Three ways for
+    # that to be false, all fatal: no file, an arm in which no subject moved
+    # (it measured nothing), and an arm whose control moved (the two boots
+    # differ for some reason other than the vendor, so the subjects' movement
+    # is not attributable to it).
+    n_vendor = sum(1 for _, _, v, _, _ in ROWS if v == REACH_VENDOR)
+    if n_vendor:
+        if not a.cpl0_vendor:
+            sys.exit('%d row(s) are filed %s and --cpl0-vendor was not given: '
+                     'the word is a MEASUREMENT (sysprobe_vendor.sh) and this '
+                     'table will not assert it'
+                     % (n_vendor, REACH_VENDOR))
+        with open(a.cpl0_vendor) as f:
+            vrows = list(csv.DictReader(f, delimiter='\t'))
+        subj = [r for r in vrows if r['role'] == 'SUBJECT']
+        ctl = [r for r in vrows if r['role'] == 'CONTROL']
+        movers = [r for r in subj if r['moved'] == '1' and r['vec_amd'] == '6']
+        moved_ctl = [r['hex'] for r in ctl if r['moved'] != '0']
+        if len(movers) < n_vendor:
+            sys.exit('the vendor arm (%s) shows %d subject(s) moving off #UD '
+                     'when the vendor changes, and %d row(s) are filed %s.  '
+                     'An arm that measured less than it is quoted for cannot '
+                     'carry the word' % (a.cpl0_vendor, len(movers), n_vendor,
+                                         REACH_VENDOR))
+        if not ctl:
+            sys.exit('the vendor arm (%s) carries no CONTROL row: an arm with '
+                     'no control cannot say the movement is the vendor\'s'
+                     % a.cpl0_vendor)
+        if moved_ctl:
+            sys.exit('the vendor arm (%s) has CONTROL row(s) that MOVED (%s): '
+                     'the two boots differ for some reason other than the '
+                     'vendor, so nothing there attributes the subjects\' '
+                     'movement to it' % (a.cpl0_vendor, ' '.join(moved_ctl)))
+        print('# vendor arm: %d subject(s) moved off #UD under an Intel '
+              'vendor, %d control(s) steady' % (len(movers), len(ctl)),
+              file=sys.stderr)
+
     flips, out = [], []
     for opid, mn, verdict, site, gate in ROWS:
         h = hex_of.get(opid, '-')
@@ -934,13 +1041,13 @@ def main():
                                             ('vec=%s' % v if v is not None
                                              else 'NOT-MEASURED'))))
 
-    for opid, mn, site, question in REMAINDER:
+    for opid, mn, site, label, question in REMAINDER:
         h = hex_of.get(opid, '-')
         v = vec.get(h)
         if v == 255:
             flips.append((h, mn))
-        out.append((opid, h, mn, UNADJ, '-', cites[site],
-                    '%s.  OPEN QUESTION: %s' % (SITES[site]['what'], question),
+        out.append((opid, h, mn, label, '-', cites[site],
+                    '%s.  %s' % (SITES[site]['what'], question),
                     'ran' if v == 255 else ('#UD' if v == 6 else
                                             ('vec=%s' % v if v is not None
                                              else 'NOT-MEASURED'))))
@@ -957,9 +1064,11 @@ def main():
                  'vex-class0', 'dq-refuses-vex-l', 'i64-amd-check',
                  'max-vendor-is-amd', 'smm-check'):
         print('# %s -> %s' % (name, cites[name]), file=sys.stderr)
-    print('# adjudicated %d rows; REMAINDER %d rows carry no verdict: %s'
+    print('# adjudicated %d rows; REMAINDER %d row(s) carry a class but no '
+          'reachability verdict: %s'
           % (len(ROWS), len(REMAINDER),
-             ' '.join(m for _, m, _, _ in REMAINDER)), file=sys.stderr)
+             ' '.join('%s=%s' % (m, lb) for _, m, _, lb, _ in REMAINDER)),
+          file=sys.stderr)
     print('# decode-time CPUID vocabulary: %d features, none of %s'
           % (len(vocab), ','.join(EXTENSIONS)), file=sys.stderr)
     if refused:

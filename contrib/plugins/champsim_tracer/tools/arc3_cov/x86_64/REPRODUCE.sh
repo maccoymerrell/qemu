@@ -315,6 +315,15 @@ echo "reach input set: $(wc -l < reach_in.hex) non-AGREE encodings"
 #    exception vector -- which is the stronger answer, because a refused
 #    enable is a gate that cannot open under any configuration.
 "$T"/sysprobe_enab_run.sh "$D" max        # -> cpl0_enab.tsv, enables.tsv
+#  * AND CPL 0 DOES NOT REMOVE THE CPU-VENDOR READING EITHER (253-A).  Every
+#    leg above runs `-cpu max`, whose vendor QEMU sets to AMD, and
+#    decode-new.c.inc refuses an i64_amd entry in 64-bit mode on any non-Intel
+#    vendor.  A #UD produced by that test is a fact about the MODEL, and the
+#    standing per-model ruling says a model difference is QEMU-modelling, not
+#    tracer scope -- so the same encodings are re-probed under an Intel-vendor
+#    model.  The subject set is derived from the tree, both directions are
+#    controlled, and the arm refuses if nothing moved or if a control did.
+"$T"/sysprobe_vendor.sh "$D"              # -> cpl0_vendor.tsv
 cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.py uses
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
@@ -361,6 +370,7 @@ this impossible"; exit 1 } }' ../reach_matrix.tsv || exit 1
 $PY "$T"/qemu_decode_adjudicate.py --selftest || exit 1
 $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
     --enables "$D"/enables.tsv --cpl0-enab "$D"/cpl0_enab.tsv \
+    --cpl0-vendor "$D"/cpl0_vendor.tsv \
     -o ../decode_adjudication.tsv
 
 # ---- prove the gate can fire ----------------------------------------------

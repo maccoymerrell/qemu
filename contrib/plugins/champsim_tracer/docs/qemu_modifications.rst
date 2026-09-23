@@ -1692,21 +1692,28 @@ Disassembly and target metadata
      extended-register load-store forms (``ldr w3, [x1, x2]``,
      ``str w3, [x1, w2, uxtw #2]``, and kin with a GPR destination)
      and the LSE ``SWP`` family report their memory operand with
-     ``access == 0`` — Capstone's generated operand table carries no
-     access for those rows, and its own per-instruction repair table
-     (``mem_acc``) is equally unpopulated in 6.0.0-Alpha7.
-     Immediate-offset, pre/post-index, exclusive, ``CAS`` /
-     ``LD<op>`` atomic, SVE, and vector-structure forms all report
-     correctly.  ``cap_fill_arm64_operands`` infers the missing
-     access from the mnemonic class (``swp`` / ``cas`` / atomic
-     ``ld<op>`` / ``st<op>`` → ``READ|WRITE``, other ``ld*`` →
-     ``READ``, other ``st*`` → ``WRITE``; see
-     ``cap_aarch64_infer_mem_access``) and applies the inference
-     only when Capstone reported ``access == 0``, so a Capstone
-     version that starts populating these rows wins automatically.
-     Upstream fixed the register-offset rows in 6.0.0-Alpha8
-     (``e5c6e09``, capstone-engine/capstone#2802); the ``SWP`` rows
-     remain unfixed upstream.
+     ``access == 0`` in Capstone 6.0.0-Alpha7 — its generated operand
+     table carries no access for those rows, and its own
+     per-instruction repair table (``mem_acc``) is equally
+     unpopulated.  Immediate-offset, pre/post-index, exclusive,
+     ``CAS`` / ``LD<op>`` atomic, SVE, and vector-structure forms all
+     report correctly.  Upstream fixed the register-offset rows in
+     6.0.0-Alpha8 (``e5c6e09``, capstone-engine/capstone#2802); the
+     ``SWP`` rows remain unfixed upstream.
+
+     None of that reaches a trace.  The wire's memop capability is
+     QEMU's own per-access rows, read through
+     ``qemu_plugin_insn_memops()``, and the defect above belongs
+     entirely to the offline referee — ``cap_aarch64_infer_mem_access``
+     in ``contrib/plugins/champsim_tracer/tools/cst_referee.py`` infers
+     the missing access from the mnemonic class (``swp`` / ``cas`` /
+     atomic ``ld<op>`` / ``st<op>`` → ``READ|WRITE``, other ``ld*`` →
+     ``READ``, other ``st*`` → ``WRITE``) and applies it only where
+     Capstone reported ``access == 0``, so a Capstone version that
+     starts populating these rows wins automatically.  It is recorded
+     here because it moves a column in the two-decoder comparison and
+     a reader of that comparison needs to know which side the repair
+     is on.
    * x86 store-form extract (``PEXTR`` / ``EXTRACTPS`` family).
      Capstone marks the ``r/m`` destination ``READ``-only;
      ``cap_fill_x86_operands`` forces ``WRITE`` on the memory

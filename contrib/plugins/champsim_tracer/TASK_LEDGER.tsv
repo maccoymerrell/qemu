@@ -38,7 +38,7 @@
 21	completed	DONE: unified tree proves the marker ruling; no interaction defects
 22	completed	cst_audit reg-snap oracle fails cross-ISA (747/20179 historical stats)
 23	completed	MERGED into #26 -- --disable-plugins build fix
-24	pending	Gate 7 perf numbers are benchmark-inflated -- re-measure on a realistic workload
+24	completed	Gate 7 perf numbers are benchmark-inflated -- the ruled docs edit is made: architecture.rst and concepts.rst present the sha256sum rows as UPPER BOUNDS with no typical figure claimed.  The re-measure half was ruled out of tree by the maintainer (PHASE1_CLOSEOUT_PLAN.md:45 "No re-measure in tree ... publish rows as upper bounds"; Q1 APPROVED at :277)
 25	completed	DISCHARGED: TLB-contents + QOM-device oracles HAVE now run on loaded STALLING cells -- clean
 26	completed	DONE: local NOTES.md + malta SMP fix + --disable-plugins fix
 27	pending	FOLLOW-UP: second snapshot region for WP fidelity of reset-surviving state

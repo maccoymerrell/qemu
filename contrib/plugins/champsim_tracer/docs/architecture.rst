@@ -59,11 +59,23 @@ three layers in series:
 The numbers below are measured tracing ``qemu-x86_64 -seed 1
 -B 0x400000 /usr/bin/sha256sum`` over a fixed 5 MiB input, 14.5 M
 architectural instructions of capture (x86_64 host, Intel Xeon
-Ice Lake-SP).  They are representative of this workload only; other
-workloads vary in both runtime and trace size.  Raw size is the
-uncompressed ``.cst`` container; the xz column recompresses the same
-members with ``xz -T0`` (the codec the tracer runs in-process when
-``compress=`` is set).
+Ice Lake-SP).  Raw size is the uncompressed ``.cst`` container; the xz
+column recompresses the same members with ``xz -T0`` (the codec the
+tracer runs in-process when ``compress=`` is set).
+
+.. important::
+
+   **Read every row as an upper bound, not as a typical cost.**
+   ``sha256sum`` over a small buffer is a tight compute kernel with a
+   very high instruction rate and almost no idle time, so it charges
+   the tracer's per-instruction cost on every cycle the guest runs.
+   Both the slowdown column and the bytes-per-instruction column are
+   inflated by that choice, in the same direction.  A workload with any
+   I/O wait, any system time, or a lower instruction rate pays less on
+   both axes.  No re-measurement on a realistic workload has been made,
+   so no lower bound and no typical figure is published here; treat
+   these as the ceiling this configuration can cost, and measure your
+   own workload before sizing anything.
 
 .. list-table::
    :header-rows: 1

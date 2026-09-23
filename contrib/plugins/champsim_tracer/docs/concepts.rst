@@ -88,9 +88,13 @@ register values compresses several times better.  The :doc:`decoder`
 ``cst_audit`` tool breaks any trace down into this byte structure
 exactly.
 
-These numbers are workload-dependent.  Run ``cst_audit`` on a
-representative slice of your own workload before sizing storage for a
-long run.
+Read these as **upper bounds**, not as typical figures.  They come
+from the same ``sha256sum`` cell as the performance table in
+:doc:`architecture`, a tight compute kernel that charges the tracer's
+per-instruction cost on every cycle the guest runs; no re-measurement
+on a realistic workload has been made, so no lower bound and no
+typical figure is published.  Run ``cst_audit`` on a representative
+slice of your own workload before sizing storage for a long run.
 
 What a body entry represents
 ----------------------------

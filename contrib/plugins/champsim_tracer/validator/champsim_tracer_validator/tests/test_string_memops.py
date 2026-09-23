@@ -196,17 +196,44 @@ EXPECT = {
     "pc_movsb":   (1, 1, 1),
 }
 
-#: label -> (n_loads, n_stores) the template must declare.  These are the
-#: static lane counts the operand walker derives from the Capstone access
-#: flags; they are what a consumer sizes its load/store queues from, and
-#: what ``cst_decode --strict`` checks each observed memop against.
+#: label -> (max_dep_loads, max_dep_stores) the template must declare.
+#: These are the template-static MAX slot counts, one per memop row QEMU
+#: declared for the instruction (champsim_tracer_qdep.cc counts them at
+#: :783 / :792 from qemu_plugin_insn_memops()).  format.rst calls them
+#: "template-static MAX counts" and says the runtime per-iteration counts
+#: on CST_FID_N_LOADS / CST_FID_N_STORES "can be smaller ... but never
+#: larger"; a consumer sizes its load/store queues from the MAX and reads
+#: the exact per-entry count off the entry.
+#:
+#: A REP-PREFIXED STRING OP DECLARES EXACTLY DOUBLE ITS PER-ITERATION
+#: ACCESSES, AND THAT IS QEMU'S TRANSLATION, NOT A DEFECT.  do_gen_rep()
+#: (target/i386/tcg/translate.c) emits the body function TWICE when it can
+#: loop: once at the @loop label and once at @last, the peeled final
+#: iteration.  Both bodies' loads and stores are declared memop rows of the
+#: one instruction, so the MAX is 2x the architectural per-iteration count.
+#: The two halves are distinguishable in the wire's own dep masks: the
+#: peeled body reads the pointer AFTER dshift advanced it, so its address
+#: mask additionally names REG_FLAGS (env->df) -- measured on cmpsb as
+#: la=0x4,0x2,0xc,0xa.  The NON-rep witness in the same fixture family
+#: separates the two: a bare `movsb` declares (1, 1) and `rep movsb`
+#: declares (2, 2) on the same bytes (exec257/attr/string_memops/probe.S).
+#:
+#: Before b32609d2fd ("the wire's facts, taken from QEMU") these counts
+#: came from a reference decoder's per-instruction MEM operand access
+#: flags, which had no notion of a twice-emitted body, so the pre-flip
+#: expectation was the per-iteration count.  That commit's own message
+#: names the shape: "a TB can repeat an instruction (a looping REP string
+#: body translates twice)".
+#:
+#: The per-ITERATION counts stay exact and are asserted separately by
+#: EXPECT above (tiling, one iteration's worth of memops per body entry).
 EXPECT_LANES = {
-    "pc_cmpsb":   (2, 0),
-    "pc_cmpsl":   (2, 0),
-    "pc_scasb":   (1, 0),
-    "pc_lodsb":   (1, 0),
-    "pc_stosb":   (0, 1),
-    "pc_movsb":   (1, 1),
+    "pc_cmpsb":   (4, 0),      # 2 loads/iter x 2 emitted bodies
+    "pc_cmpsl":   (4, 0),      # 2 loads/iter x 2
+    "pc_scasb":   (2, 0),      # 1 load/iter  x 2
+    "pc_lodsb":   (2, 0),      # 1 load/iter  x 2
+    "pc_stosb":   (0, 2),      # 1 store/iter x 2
+    "pc_movsb":   (2, 2),      # 1 load + 1 store/iter x 2
     "pc_roundss": (1, 0),
     "pc_roundsd": (1, 0),
     # The multi-byte NOP performs no memory access, so it must claim
@@ -410,36 +437,53 @@ class StringMemopsTest(unittest.TestCase):
         """The static lane model matches what the instruction really does."""
         _pcs, _found, lanes, _per_entry, _cst = self._shared()
 
+        #: Which labels QEMU emits twice (do_gen_rep's @loop body plus its
+        #: peeled @last body).  Only a REP-prefixed string op is doubled;
+        #: everything else declares exactly its architectural accesses, so
+        #: a future doubling on a NON-rep encoding still fails here.
+        rep_doubled = {"pc_cmpsb", "pc_cmpsl", "pc_scasb",
+                       "pc_lodsb", "pc_stosb", "pc_movsb"}
         why = {
-            "pc_cmpsl": "both MEM operands of the 32-bit CMPS come back "
-                        "access == 0 (cap_x86_string_mem_access)",
-            "pc_roundss": "the MEM source of the scalar ROUNDSS comes back "
-                          "access == 0 (cap_x86_is_scalar_round)",
-            "pc_roundsd": "the MEM source of the scalar ROUNDSD comes back "
-                          "access == 0 (cap_x86_is_scalar_round)",
+            "pc_roundss": "the scalar ROUNDSS performs exactly one 4-byte "
+                          "load and declares one slot",
+            "pc_roundsd": "the scalar ROUNDSD performs exactly one 8-byte "
+                          "load and declares one slot",
             "pc_nop": "the multi-byte NOP performs no memory access at all "
-                      "(Intel SDM), but its MEM operand comes back READ "
-                      "(cap_x86_mem_is_never_accessed)",
-            "pc_movsd_ld": "movsd is a scalar-FP load, not a string move; a "
-                           "prefix-matching string-op rule would give its "
-                           "(%rdi) operand the string destination's WRITE "
-                           "direction (cap_x86_is_string_op)",
-            "pc_movss_ld": "movss is a scalar-FP load, not a string move "
-                           "(cap_x86_is_string_op)",
+                      "(Intel SDM), so it must declare neither lane",
+            "pc_movsd_ld": "movsd is a scalar-FP load, not a string move: "
+                           "one load slot, no store slot, and no REP "
+                           "doubling",
+            "pc_movss_ld": "movss is a scalar-FP load, not a string move",
             "pc_cmpsd_ld": "cmpsd is a scalar-FP compare, not the 32-bit "
                            "string compare -- that one is spelled cmpsl in "
-                           "AT&T (cap_x86_is_string_op)",
-            "pc_movsd_st": "movsd is a scalar-FP store, not a string move "
-                           "(cap_x86_is_string_op)",
+                           "AT&T",
+            "pc_movsd_st": "movsd is a scalar-FP store, not a string move",
         }
+        dflt_rep = ("a REP string op declares one slot per memop row QEMU "
+                    "emitted, and do_gen_rep emits the body twice (loop + "
+                    "peeled last iteration), so the MAX is 2x the "
+                    "per-iteration access count")
+        dflt_plain = ("the template's MAX slot counts must equal the memop "
+                      "rows QEMU declared for the instruction")
         for lbl, want in EXPECT_LANES.items():
             got = lanes.get(lbl)
             self.assertEqual(
                 got, {want},
-                f"{lbl}: template declares (n_loads, n_stores) = {got}, "
+                f"{lbl}: template declares "
+                f"(max_dep_loads, max_dep_stores) = {got}, "
                 f"expected {{{want}}}.  "
-                f"{why.get(lbl, 'wrong Capstone access flags')} "
-                f"-- see disas/capstone.c.")
+                f"{why.get(lbl, dflt_rep if lbl in rep_doubled else dflt_plain)}"
+                f" -- see champsim_tracer_qdep.cc:763-795 and "
+                f"target/i386/tcg/translate.c do_gen_rep().")
+            # The doubling is REP's alone: a non-REP encoding declaring an
+            # even multiple of its per-iteration accesses would otherwise
+            # slip through the table unnoticed.
+            if lbl not in rep_doubled:
+                self.assertNotIn(
+                    lbl, EXPECT,
+                    f"{lbl} is in the per-iteration table but not in "
+                    f"rep_doubled -- the two tables disagree about whether "
+                    f"this encoding is REP-prefixed")
 
     def test_scalar_round_records_its_load(self):
         _pcs, found, _lanes, _per_entry, _cst = self._shared()

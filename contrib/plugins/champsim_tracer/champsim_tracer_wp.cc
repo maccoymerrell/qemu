@@ -125,8 +125,10 @@ struct WpWalkState {
      * assigned to an empty accumulator).  The commit site derives the
      * budget-crossing block's attributed range from it: the block's room
      * inside the wpdepth budget is depth - sim_at_block_start.  A block
-     * only ever OPENS with sim_insns < depth (the driver loop's guard),
-     * so the crossing block's room is at least 1. */
+     * only ever OPENS with sim_insns < depth — enforced at BOTH open
+     * sites (the driver loop's guard, and the fragment walk's budget
+     * gate for mid-TB re-opens) — so the crossing block's room is at
+     * least 1. */
     uint64_t     sim_at_block_start  = 0;
     bool         early_exit          = false;
     uint64_t     last_fault_pc       = UINT64_MAX;
@@ -1049,7 +1051,9 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                  * The wire's range-clamped staging then keeps every
                  * per-instruction record, the terminal-branch singletons
                  * included, off the excluded tail.  A block only opens with
-                 * sim_insns < depth, so the cut range is never empty.
+                 * sim_insns < depth — the driver loop's guard, plus the
+                 * fragment walk's budget gate on mid-TB re-opens — so the
+                 * cut range is never empty.
                  *
                  * Fault blocks are exempt (§4.4: the excursion continues
                  * past the fault insn and CST_FID_BB_FAULT_INSN must stay
@@ -1542,6 +1546,18 @@ static void wp_walk_fragments(WpWalkState &st)
 
             uint32_t bb_idx_base = (uint32_t)bb_pcs.size();
             if (bb_pcs.empty()) {
+                /* Budget gate for the ONE open site the driver loop's
+                 * sim_insns < depth guard does not cover: a mid-TB
+                 * commit empties the accumulator with more fragments
+                 * left in this exec_tb.  A block opening at or past
+                 * the wpdepth budget has room 0 — an attributed range
+                 * of [0, 0), which the wire never publishes (§5.7's
+                 * empty-range reject) — so the excursion ends here
+                 * instead of opening it. */
+                if (st.sim_insns >= (uint64_t)max_wrong_path_depth) {
+                    walk_done = true;
+                    break;
+                }
                 /* New WP BB accumulator starts at THIS fragment's
                  * start_pc.  Resetting here (not just at outer-iter
                  * top) lets mid-iter commits — when one exec_tb's

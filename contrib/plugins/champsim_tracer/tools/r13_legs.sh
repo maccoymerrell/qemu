@@ -36,6 +36,19 @@
 # process, writes one line per leg to `<root>/LEGS_RC.txt`, and exits non-zero
 # if any leg did.
 #
+# AND LEGS_RC NOW CARRIES INFORMATION, WHICH IT DID NOT.  The comparators
+# used to exit 1 on their own headline -- the very number the gate scores
+# against an adjudicated ceiling -- so a leg the gate called `ok' still
+# arrived here as rc=1.  Measured at exec251: four of eleven legs exited 1
+# (gem5cp_aarch64, gem5cp_mipsel, gem5wp_mipsel, spikecp), every one of them
+# scored `ok' by the gate against its own ceiling, and LEGS_RC=1 was then
+# true of every run whether or not anything was wrong.  Each comparator's
+# exit was re-decided on its own merits in its own header; the shared rule
+# is that the exit answers "did this run produce a scorable report" and the
+# gate answers "did it pass".  So LEGS_RC=0 now means EVERY leg ran and
+# wrote a report the gate can score, and a nonzero one names a leg that did
+# not.
+#
 # Author: Maccoy Merrell <maccoy.merrell@tamu.edu>
 #
 # SPDX-License-Identifier: GPL-2.0-or-later

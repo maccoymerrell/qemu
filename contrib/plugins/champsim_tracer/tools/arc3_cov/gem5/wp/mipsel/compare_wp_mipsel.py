@@ -65,6 +65,22 @@ so a declared-versus-compared gap can never sit unexplained.  The riscv64
 leg's 287 was exactly the tails of its named reference-limit rows; this leg
 asserts it rather than leaving it to be rediscovered.
 
+EXIT STATUS -- "did this run produce a scorable report", not "did the leg
+pass".  The pass/fail verdict is ``external_truth_gate.sh``'s: it reads the
+headline out of REPORT.txt and scores it against this leg's adjudicated
+ceiling in ADJUDICATED.tsv, and that gate is the single authority.  Exiting
+non-zero here on the same rows would put a second authority behind it with a
+hidden ceiling of zero, and the two then say opposite things about one run --
+measured at exec251, four legs exited 1 while the gate scored every one of
+them `ok', and r13_legs.sh's LEGS_RC carried that 1 with no information in it.
+
+    0   the comparison ran and REPORT.txt is written and scorable.  The
+        headline may be any number; the gate decides what it means.
+    2   the report is NOT scorable: the declared-versus-compared identity does not
+        hold, so the leg scored a subset of itself.
+    3   the run failed outright -- the execution reference's prerequisites
+        were missing, or a guest could not be processed.
+
 Author: Maccoy Merrell.
 """
 import argparse
@@ -1048,7 +1064,25 @@ def main():
                                     r.detail)) + '\n')
     bad = sum(1 for r in rows
               if r.verdict in (WP_DEFECT, RECON_GAP, UNACCOUNTED))
-    return 1 if (bad or not identity_ok) else 0
+    # THE EXIT STATUS SAYS WHETHER THIS RUN PRODUCED A SCORABLE REPORT.
+    #
+    # `bad' IS THE HEADLINE -- external_truth_gate.sh reads it out of
+    # REPORT.txt and scores it against this leg's adjudicated ceiling in
+    # ADJUDICATED.tsv, where the ceiling is a written per-row adjudication.
+    # Failing here on the same rows creates a second authority with a hidden
+    # ceiling of zero, and the two then disagree about the same run: measured
+    # at exec251, four legs exited 1 while the gate scored every one of them
+    # `ok', and r13_legs.sh's LEGS_RC carried that 1 with no information in
+    # it.  The gate keeps the verdict; this exit keeps scorability.
+    #
+    # `identity_ok' STAYS.  Declared minus compared must equal the explained
+    # tail; when it does not, the leg scored a subset of itself and its
+    # headline is over a population nobody can name.  That is not a finding
+    # about the tracer, it is a report the gate must not score -- exit 2,
+    # distinct from the 3 an outright run failure uses.
+    if not identity_ok:
+        return 2
+    return 0
 
 
 if __name__ == '__main__':

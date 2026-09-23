@@ -31,6 +31,20 @@ Every disagreeing row carries a DIRECTION and a CATEGORY through
 ``arc3_taxonomy``, so "N disagree" is never the result.  The headline is
 TRACER-SUBSET + UNACCOUNTED.
 
+EXIT STATUS -- "did this run produce a scorable report", not "did the leg
+pass".  The pass/fail verdict belongs to ``external_truth_gate.sh``, which
+reads the headline out of REPORT.txt and compares it against this leg's
+adjudicated ceiling in ADJUDICATED.tsv.  That gate is the single authority
+and always has been, so:
+
+    0   the comparison ran, every declared subject was compared, and
+        REPORT.txt is written.  The headline may be any number; the gate
+        decides what it means.
+    2   the report is NOT scorable: an axis compared nothing (its zero would
+        be survivorship bias) or the declared-versus-compared identity does
+        not hold (the leg scored a subset of itself).
+    3   the run failed outright -- a guest could not be processed.
+
 Author: Maccoy Merrell.
 """
 import argparse
@@ -1188,11 +1202,34 @@ def main():
     sys.stderr.write('SUBSET=%d UNACCOUNTED=%d INERT=%s IDENTITY=%s\n'
                      % (nsub, nun, ','.join(inert) or 'none',
                         'HOLDS' if identity_ok else 'FAILS'))
-    # An INERT axis and a broken identity are FAILURES, not footnotes.  An
-    # axis that compared nothing prints a clean zero that is survivorship
-    # bias, and a leg whose declared and compared counts do not add up has
-    # scored a subset of itself.  Both must be able to fail the run.
-    return 1 if (nsub or nun or inert or not identity_ok) else 0
+    # THE EXIT STATUS SAYS WHETHER THIS RUN PRODUCED A SCORABLE REPORT.  It
+    # does not say whether the leg passed.
+    #
+    # It used to say both, and the two answers disagreed with each other.
+    # SUBSET and UNACCOUNTED are the HEADLINE -- the number
+    # external_truth_gate.sh reads out of REPORT.txt and compares against
+    # this leg's adjudicated ceiling in ADJUDICATED.tsv, where the ceiling is
+    # a written, per-row adjudication and not a tolerance.  Failing here on
+    # the same rows makes a second, hidden authority with a ceiling of zero,
+    # and the gate and the leg then say opposite things about the same run:
+    # measured at exec251, four legs exited 1 while the gate scored every one
+    # of them `ok', and LEGS_RC carried that 1 with no information in it.
+    # The gate and its ceilings are the single authority (long-standing
+    # design), so the headline leaves this exit and the gate keeps it.
+    #
+    # WHAT STAYS, because it is not a finding about the tracer but about
+    # THIS RUN's ability to score anything:
+    #   INERT axis      -- an axis that compared nothing prints a clean zero
+    #                      that is survivorship bias.  The gate would read
+    #                      that zero as a result.
+    #   IDENTITY FAILS  -- declared and compared counts do not add up, so the
+    #                      leg scored a subset of itself and its headline is
+    #                      over a population nobody can name.
+    # Both leave the report unscorable, and both exit 2 -- distinct from the
+    # 3 an outright run failure already uses.
+    if inert or not identity_ok:
+        return 2
+    return 0
 
 
 if __name__ == '__main__':

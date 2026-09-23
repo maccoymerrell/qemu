@@ -33,6 +33,24 @@ Every disagreeing row carries a DIRECTION and a CATEGORY through
 TRACER-SUBSET + UNACCOUNTED: rows where execution information is dropped, plus
 rows nobody has interrogated.
 
+EXIT STATUS -- "did this run produce a scorable report", not "did the leg
+pass".  The pass/fail verdict is ``external_truth_gate.sh``'s: it reads the
+headline out of REPORT.txt and scores it against this leg's adjudicated
+ceiling in ADJUDICATED.tsv, and that gate is the single authority.  Exiting
+non-zero here on the same rows would put a second authority behind it with a
+hidden ceiling of zero, and the two then say opposite things about one run --
+measured at exec251, four legs exited 1 while the gate scored every one of
+them `ok', and r13_legs.sh's LEGS_RC carried that 1 with no information in it.
+
+    0   the comparison ran and REPORT.txt is written and scorable.  The
+        headline may be any number; the gate decides what it means.
+    2   the report is NOT scorable: a selftest axis is UNPROVEN, so its clean
+        zero above is survivorship bias the gate would read as a
+        result.
+    1   Python's own status for an unhandled exception -- the run failed
+        outright and the traceback names where.  This file does not catch
+        those, so it has no exit 3.
+
 Author: Maccoy Merrell.
 """
 import argparse
@@ -849,7 +867,28 @@ def main():
                     row.ref, (set, frozenset)) else repr(row.ref),
                 repr(sorted(row.trc, key=repr)) if isinstance(
                     row.trc, (set, frozenset)) else repr(row.trc)))
-    return 1 if hl else 0
+    # THE EXIT STATUS SAYS WHETHER THIS RUN PRODUCED A SCORABLE REPORT.  It
+    # does not say whether the leg passed: `hl' is the HEADLINE, which
+    # external_truth_gate.sh reads out of REPORT.txt above and scores against
+    # this leg's adjudicated ceiling in ADJUDICATED.tsv.  Failing here on the
+    # same number puts a second authority behind the gate with a ceiling of
+    # zero, and the two disagreed in practice -- at exec251 this leg exited 1
+    # on a headline of 4 while the gate scored the row `ok' against its
+    # adjudicated ceiling of 4, and r13_legs.sh's LEGS_RC carried that 1 with
+    # no information in it.  The gate keeps the verdict.
+    #
+    # WHAT STAYS IS SCORABILITY, and here that is the negative control.  An
+    # UNPROVEN axis is one the control could not make report a disagreement,
+    # so that axis's clean zero above means nothing and the gate would score
+    # it as a result.  `stale' and `bad_unaligned' do NOT stay: both are
+    # already inside the headline the gate reads, so they are scored either
+    # way, and neither leaves the report unreadable.
+    if unproven:
+        sys.stderr.write('UNPROVEN AXES: %s -- their zeros mean nothing, so '
+                         'this report is not scorable\n'
+                         % ' '.join(a for a, _ in unproven))
+        return 2
+    return 0
 
 
 if __name__ == '__main__':

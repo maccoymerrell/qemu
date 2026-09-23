@@ -31,9 +31,15 @@ COMMON="--gem5-dir $GEM5_DIR --gem5-build $GEM5_DIR/build/X86 \
 "$PY" "$HERE/selftest_wp_gem5.py" $COMMON -o "$OUT/selftest" \
       "$OUT/probes/p_wpmem" "$OUT/probes/p_wpsse" "$OUT/probes/p_wpchain"
 
-# 2. THE COMPARISON.  Exit status is non-zero when
-#    WP-DEFECT + RECONSTRUCTION-GAP + UNACCOUNTED is non-zero, or when the
-#    declared/compared identity does not hold.
+# 2. THE COMPARISON.  Exit status says whether this run produced a SCORABLE
+#    report, not whether the leg passed: 0 when the comparison ran and wrote
+#    REPORT.txt, 2 when the declared/compared identity does not hold (the leg
+#    scored a subset of itself).  An outright run failure -- gem5 or the
+#    tracer did not produce its log -- raises out of compare_wp_gem5.py and
+#    ends it with Python's own 1 plus a traceback.  The headline
+#    -- WP-DEFECT + RECONSTRUCTION-GAP + UNACCOUNTED -- is scored against this
+#    leg's adjudicated ceiling by external_truth_gate.sh, which is the single
+#    authority for pass/fail; see compare_wp_gem5.py's own note.
 "$PY" "$HERE/compare_wp_gem5.py" $COMMON --wpdepth 32 \
       -o "$OUT/final" --tsv "$OUT/final/rows.tsv" \
       "$OUT/probes/p_wpmem" "$OUT/probes/p_wpchain" "$OUT/probes/p_wpflag" \

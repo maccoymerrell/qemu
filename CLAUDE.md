@@ -2,6 +2,26 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Purpose — the statement every decision derives from
+
+The maintainer's words (2026-09-22), and nothing in this repository outranks
+them — not code, not documentation, not comments:
+
+> The purpose of the tracer is to trace qemu execution on the 4 target ISAs
+> for both correct and wrong-path. The information recorded for each
+> instruction are those necessary to simulate the microarchitecture of a
+> machine executing said instructions: opcode, registers, memops, and the
+> natural requirements of those (reg data, mem data, mem addresses) as well
+> as information necessary for proper microarchitectural simulation
+> (intra-instruction dependencies, vector lanes, memop->lane mappings).
+
+Corollaries that follow directly and have been ruled explicitly: every
+instruction reachable in QEMU must be classified — a probe-environment fault
+(bad operands, probe state) is the probe's fault and never proof of
+non-reachability; and when a design question arises, derive the answer from
+this statement before asking, because every ruling so far has been derivable
+from it.
+
 ## What this repository is
 
 This is a **fork of QEMU** whose primary in-house contribution is the **`champsim_tracer`** TCG plugin under

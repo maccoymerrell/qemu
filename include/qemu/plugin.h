@@ -340,6 +340,11 @@ void qemu_plugin_user_postfork(bool is_child);
 
 #else /* !CONFIG_PLUGIN */
 
+static inline bool qemu_plugin_any_loaded(void)
+{
+    return false;
+}
+
 #define QEMU_PLUGIN_NOSPLIT_MAX 2
 static inline size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs,
                                               size_t *seq_len)

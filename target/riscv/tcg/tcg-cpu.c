@@ -1220,7 +1220,10 @@ static bool riscv_tcg_cpu_realize(CPUState *cs, Error **errp)
 #ifndef CONFIG_USER_ONLY
     CPURISCVState *env = &cpu->env;
 
-    tcg_cflags_set(CPU(cs), CF_PCREL);
+    /* Pc-relative TBs — unless a TCG plugin is loaded (see
+     * tcg_cflags_set_pcrel: a pc-less TB identity misattributes plugin
+     * records across virtual mappings of one physical page). */
+    tcg_cflags_set_pcrel(CPU(cs));
 
     if (cpu->cfg.ext_sstc) {
         riscv_timer_init(cpu);

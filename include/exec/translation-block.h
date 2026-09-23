@@ -158,5 +158,6 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 
 bool tcg_cflags_has(CPUState *cpu, uint32_t flags);
 void tcg_cflags_set(CPUState *cpu, uint32_t flags);
+void tcg_cflags_set_pcrel(CPUState *cpu);
 
 #endif /* EXEC_TRANSLATION_BLOCK_H */

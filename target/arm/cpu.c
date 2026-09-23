@@ -1992,8 +1992,10 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     Error *local_err = NULL;
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
-    /* Use pc-relative instructions in system-mode */
-    tcg_cflags_set(cs, CF_PCREL);
+    /* Use pc-relative instructions in system-mode — unless a TCG plugin is
+     * loaded (see tcg_cflags_set_pcrel: a pc-less TB identity misattributes
+     * plugin records across virtual mappings of one physical page). */
+    tcg_cflags_set_pcrel(cs);
 #endif
 
     /* If we needed to query the host kernel for the CPU features

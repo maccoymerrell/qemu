@@ -452,6 +452,29 @@ Per-ISA translator call sites
      conditionals), using ``ctx->base.pc_next + imm``.  ``JALR``
      (indirect) is unaffected.
 
+Virtual-address TB identity under plugins (no CF_PCREL)
+-------------------------------------------------------
+
+``CF_PCREL`` drops the virtual PC from the translation-block identity
+(``tb_hash_func`` keys on the physical address alone and
+``tb_lookup_cmp`` skips the PC test), so one translated TB is
+dispatched for *every* virtual mapping of the same physical code page.
+The guest is unaffected — the generated code is pc-relative — but a
+plugin's per-instruction record is minted at translation with the
+translating mapping's virtual addresses, so an execution under a
+different mapping (a second process mapping the same shared-library
+page) is reported at the *other* process's addresses: whole blocks
+attributed to a peer mapping mid-loop, and direct-branch targets
+naming an address the branch cannot encode.  The false vaddr *is* the
+record; no downstream consumer can repair it.  The three targets that
+request ``CF_PCREL`` in system mode (i386, Arm, RISC-V) therefore
+request it through ``tcg_cflags_set_pcrel``
+(``accel/tcg/cpu-exec-common.c``), which withholds the flag once a
+plugin is loaded — TBs then carry their virtual PC in the identity
+again, exactly the pre-``CF_PCREL`` behaviour every target still
+supports.  The cost is re-translation instead of cross-mapping reuse;
+correct attribution is not negotiable for an execution tracer.
+
 Never-split code sequences
 --------------------------
 

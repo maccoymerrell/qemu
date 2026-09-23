@@ -2392,7 +2392,15 @@ def _cleanup_qemu(work_root: Path):
 # riscv64 fold over-claim stood non-zero in 9 cells scored PASS because the
 # waves ran `all`, which had no census.  A second copy of the regex would be
 # the same failure waiting on a second entrypoint.
-def _tripwire_census(work_root: Path, nongating: set[str]) -> dict:
+def _tripwire_census(work_root: Path) -> dict:
+    """Every "(must be 0)" row of every stats.log this run produced GATES,
+    known_issue or not.  A check's known_issue exempts only the check's own
+    pass/fail verdict (the XFAIL fold above): the written justifications are
+    all timing/scheduling excuses ("the peer must be scheduled inside the
+    window"), and a scheduling miss produces NO must-be-0 violation — so a
+    violated invariant in such a cell is a wire falsehood the excuse does not
+    cover, and exempting it laundered a real duplicate-instruction defect
+    (TASK_LEDGER row 493)."""
     files = sorted(work_root.rglob("*.stats.log"))
     rows: list[dict] = []
     unparsed: list[str] = []
@@ -2410,11 +2418,10 @@ def _tripwire_census(work_root: Path, nongating: set[str]) -> dict:
                 cell = ""
             rows.append({"file": str(f), "check": cell,
                          "label": label, "value": value,
-                         "gating": cell not in nongating})
+                         "gating": True})
         if seen == 0:
             unparsed.append(f"{f}: no '(must be 0)' row found")
-    gating = [r for r in rows if r["gating"]]
-    ok = bool(files) and not gating and not unparsed
+    ok = bool(files) and not rows and not unparsed
     return {"stats_files": len(files), "violations": rows,
             "unreadable": unparsed, "status": "pass" if ok else "fail"}
 
@@ -2533,10 +2540,10 @@ def run_full(args) -> int:
     summary["coverage"]["runtime_gap_gates"] = coverage_gap
 
     summary["counts"] = counts
-    # Every "(must be 0)" row of every cell this run produced.  Cells of a
-    # non-gating check report but do not gate.
-    nongating = {c.id.replace(".", "_") for c in sel if c.known_issue}
-    summary["tripwire_census"] = _tripwire_census(work_root, nongating)
+    # Every "(must be 0)" row of every cell this run produced.  These gate
+    # unconditionally — a known_issue exempts a check's pass/fail verdict,
+    # never a violated invariant (see _tripwire_census).
+    summary["tripwire_census"] = _tripwire_census(work_root)
     # Exit code: FAIL on any failed check, a registration gap, or a violated
     # "must be 0" invariant.
     hard_fail = (counts["fail"] > 0 or bool(cov["static_gap"])

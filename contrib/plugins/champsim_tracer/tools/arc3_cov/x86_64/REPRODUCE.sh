@@ -92,6 +92,7 @@ mkdir -p "$D"; cd "$D"
 cp "$T"/compare_attrib.py "$T"/qemu_tcg_scope.py "$T"/icedtsv.py \
    "$T"/mkprobe.py "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c \
    "$T"/cpuiddump.c "$T"/qemu_reach_matrix.py "$T"/sysprobe_enables.py \
+   "$T"/reach_words.py \
    "$T"/x87_cw_probe.c "$T"/x87_cw_derive.py "$T"/x87_cw_exec.c .
 ln -sfn "$R/pylib" pylib                      # iced-x86 1.21.0
 
@@ -339,8 +340,17 @@ $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 # steps below running.  What decides THIS script's status is the scorability
 # check at the bottom -- see the note there, and coverage_report.py for where
 # the UNCOVERED remainder is published and named.
+#
+# THE VENDOR ARM GOES TO BOTH TABLES (FINDING 254-D).  It used to be passed
+# only to the adjudicator below, and the two tables then published opposite
+# classifications for SYSENTER, SYSEXIT and RSM out of one run -- the matrix
+# calling them UNREACHABLE while the adjudication said QEMU runs two of them
+# under an Intel vendor.  The matrix REQUIRES the file now, and the
+# adjudicator cross-checks the matrix against its own classes, so the two
+# agreeing is asserted rather than hoped for.
 $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
-    --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
+    --meta ../opcodes_meta.tsv --cpl0-vendor "$D"/cpl0_vendor.tsv \
+    -o ../reach_matrix.tsv || true
 
 # ---- the fixpoint is gone; this is the assertion that replaced it ---------
 # The second pass used to exist because the legs had been fed only the rows

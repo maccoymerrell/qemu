@@ -64,6 +64,21 @@ carries:
                          model names but TCG filters is reachable under KVM
                          and unreachable to a TCG plugin
 
+AND THE #UD QUADRUPLE ABOVE IS NOT THE WHOLE ANSWER (FINDING 254-D).  Every
+leg listed there runs `-cpu max`, whose vendor QEMU sets to AMD, so a decode
+entry gated on chk(i64_amd) takes #UD in all four of them -- and the row
+would read UNREACHABLE on a #UD produced by a VENDOR TEST.  The vendor arm
+(sysprobe_vendor.sh) measures the same encodings under an Intel-vendor model,
+and this file is now SHOWN that measurement: a row the arm proves QEMU runs
+may not publish UNREACHABLE, whatever the AMD-vendor legs report.  The same
+correction in the other direction is the state gate: an entry behind chk(smm)
+is refused because no probe boot in this corpus is ever in system-management
+mode, which is a fact about the probes, so the row keeps the UNREACHABLE the
+D17 trap-state precedent gives an unentered machine state and CARRIES THE
+STATE on its evidence.  Both words are spelled once, in reach_words.py, and
+qemu_decode_adjudicate.py cross-checks this table against them: the two
+tables agreeing about an encoding is an asserted invariant now, not luck.
+
 Author: Maccoy Merrell.
 SPDX-License-Identifier: GPL-2.0-or-later
 """
@@ -75,6 +90,11 @@ import glob
 import argparse
 import time
 import collections
+
+_D = os.path.dirname(os.path.abspath(__file__))
+if _D not in sys.path:
+    sys.path.insert(0, _D)
+import reach_words as RW                                        # noqa: E402
 
 QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
 _CPU_C = 'target/i386/cpu.c'
@@ -248,6 +268,12 @@ def main():
     ap.add_argument('--attrib', required=True, help='the comparison table')
     ap.add_argument('--meta', required=True, help='opcodes_meta.tsv (isa_set)')
     ap.add_argument('--root', default=QEMU_ROOT)
+    ap.add_argument('--cpl0-vendor', required=True,
+                    help='cpl0_vendor.tsv from sysprobe_vendor.sh.  REQUIRED: '
+                         'every other leg runs an AMD-vendor model, so an '
+                         'UNREACHABLE verdict taken without this arm cannot '
+                         'tell QEMU refusing the bytes from the model '
+                         'refusing the vendor')
     ap.add_argument('-o', required=True, help='write the matrix here')
     a = ap.parse_args()
     E = a.evidence
@@ -354,6 +380,39 @@ def main():
     with open(a.attrib) as f:
         txt = f.read()
     rows = list(csv.DictReader(txt.lstrip('#').splitlines(), delimiter='\t'))
+
+    # ------------------------------------- the two CORRECTIONS to the #UD
+    # quadruple (FINDING 254-D), and the vacuity guard both of them need.
+    #
+    # THE VENDOR ARM is a measurement of the same encodings under a model
+    # whose vendor is Intel's; a row it shows QEMU running may not publish
+    # UNREACHABLE, whatever the AMD-vendor legs reported.  THE STATE GATE is
+    # derived from the tree: an entry behind chk(smm) is refused because no
+    # probe boot in this corpus enters system-management mode, so the row
+    # keeps its UNREACHABLE and says WHICH STATE it was never in.
+    #
+    # BOTH SUBJECT SETS MUST BE FOUND IN THIS POPULATION.  A correction that
+    # silently matched nothing would leave every row exactly as the defect
+    # left it and print a clean run, which is the failure mode this whole
+    # file is written against -- so an unmatched subject is fatal and named.
+    vend_moved, vend_steady = RW.read_vendor(a.cpl0_vendor,
+                                             'qemu_reach_matrix.py')
+    state_gate = RW.state_gated_smm(t.decode, 'qemu_reach_matrix.py')
+    _pop = collections.Counter(r['probe_hex'] for r in rows)
+    _lost = sorted(h for h in list(vend_moved) + list(state_gate)
+                   if h not in _pop)
+    if _lost:
+        sys.exit('the reachability corrections have subjects this population '
+                 'does not contain: %s.  A correction that matches no row '
+                 'changes no verdict and would be reported as a clean run; '
+                 'either the probe seating moved or the derivation did, and '
+                 'both are answers a person has to give' % ' '.join(_lost))
+    print('vendor arm: %d subject(s) run under an Intel-vendor model (%s), '
+          '%d control(s) steady (%s); state gate derived from the tree: %s'
+          % (len(vend_moved), ' '.join(sorted(vend_moved)),
+             len(vend_steady), ' '.join(sorted(vend_steady)),
+             ' '.join('%s=%s' % (h, w)
+                      for h, w in sorted(state_gate.items()))))
 
     # --------------------------------------------------- extension -> CPUID
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -594,6 +653,43 @@ def main():
                    % (SIGNAME.get(c3, c3), VECNAME.get(c0, c0),
                       VECNAME.get(c0e, c0e)))
         elif (c3 == 4 and c0 == 6 and c0e == 6
+              and mm['models_ran'] == '0' and af == 4
+              and h in vend_moved):
+            # THE VENDOR ARM OVERRIDES THE QUADRUPLE, AND IT IS PLACED HERE
+            # FOR THE REASON THE RUNGS ABOVE ARE ORDERED AS THEY ARE: a
+            # measurement that QEMU RAN the encoding outranks four legs that
+            # watched it refuse, and every one of those four ran `-cpu max`,
+            # whose vendor QEMU sets to AMD.  decode-new.c.inc refuses a
+            # chk(i64_amd) entry in 64-bit mode on any non-Intel vendor, so
+            # the #UD the quadruple reports is produced by a VENDOR TEST.
+            # Under the standing per-model ruling a difference between CPU
+            # models is a fact about QEMU's modelling, not about tracer
+            # scope, and the purpose statement classifies what is reachable
+            # IN QEMU -- so an instruction an Intel-vendor model runs is
+            # reachable, and UNREACHABLE would be the opposite of what was
+            # measured.  The row is uncompared, so what it lands on is
+            # UNCOVERED: the tracer decodes nothing for an instruction a
+            # guest can execute, which is a coverage hole and says so.
+            v = UNCOVERED
+            _vr = vend_moved[h]
+            why = ('%s -- QEMU RUNS these bytes once the model\'s vendor is '
+                   'Intel\'s: CPL0 %s under -cpu max (AMD vendor) and %s '
+                   'under -cpu max,vendor=GenuineIntel, measured, with the '
+                   'arm\'s controls steady (%s).  The #UD every other leg '
+                   'reports (cpl3=%s allflags=%s cpl0=%s cpl0+enables=%s, '
+                   '%s models ran) is a CPU-MODEL fact and not a statement '
+                   'that no guest reaches the encoding%s'
+                   % (RW.REACHABLE_INTEL_VENDOR,
+                      VECNAME.get(int(_vr['vec_amd']), _vr['vec_amd']),
+                      VECNAME.get(int(_vr['vec_intel']), _vr['vec_intel']),
+                      ' '.join(sorted(vend_steady)),
+                      SIGNAME.get(c3, c3), SIGNAME.get(af, af),
+                      VECNAME.get(c0, c0), VECNAME.get(c0e, c0e),
+                      mm['models_ran'],
+                      ('; the comparison also disagrees (%s)' % r['direction'])
+                      if compared else
+                      ', and the tracer decodes nothing for it'))
+        elif (c3 == 4 and c0 == 6 and c0e == 6
               and mm['models_ran'] == '0' and af == 4):
             # The same four-way proof decides a COMPARED row as well as an
             # uncompared one.  A disagreement about an instruction NO QEMU
@@ -610,6 +706,22 @@ def main():
                       ('; the comparison disagrees (%s) about an instruction '
                        'no guest reaches' % r['direction']) if compared
                       else ''))
+            if h in state_gate:
+                # AND THE STATE THE PROBES NEVER ENTERED IS NAMED ON THE ROW.
+                # QEMU implements the encoding and gates its decode entry on
+                # a machine state no probe boot in this corpus reaches, so
+                # the quadruple above measures THIS CORPUS'S PROBES.  The
+                # verdict does not move -- nothing measured reached it, which
+                # is the treatment D17 gives an encoding gated by state the
+                # corpus does not enter -- but the row may not read as though
+                # QEMU had no entry for the bytes, and the leg that would
+                # settle it is filed work, not a silence.
+                why += ('.  %s: the decode entry is gated on chk(smm) and no '
+                        'probe boot in this corpus is ever in system-'
+                        'management mode, so this quadruple measures the '
+                        'probes; TASK_LEDGER row 486 (ARC 4) is the SMM-'
+                        'entering CPL0 leg that would measure the encoding'
+                        % state_gate[h])
         elif compared:
             v = UNCOVERED
             why = ('compared: %s -- and the instruction IS reachable '

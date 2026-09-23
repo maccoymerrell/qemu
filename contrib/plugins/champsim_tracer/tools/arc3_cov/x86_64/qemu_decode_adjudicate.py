@@ -69,6 +69,11 @@ import sys
 import argparse
 import collections
 
+_D = os.path.dirname(os.path.abspath(__file__))
+if _D not in sys.path:
+    sys.path.insert(0, _D)
+import reach_words as RW                                        # noqa: E402
+
 QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
 _DECODE = 'target/i386/tcg/decode-new.c.inc'
 _TRANSLATE = 'target/i386/tcg/translate.c'
@@ -85,12 +90,17 @@ UNADJ = 'UNADJUDICATED-REMAINDER'
 #: same encodings under `-cpu max` (whose vendor QEMU sets to AMD) and under
 #: `-cpu max,vendor=GenuineIntel`, and a row may only carry this word when the
 #: measurement shows it moving off #UD when the vendor changes.
-REACH_VENDOR = 'REACHABLE-INTEL-VENDOR'
+REACH_VENDOR = RW.REACHABLE_INTEL_VENDOR
 #: The row is reachable in QEMU and NO PROBE IN THIS CORPUS REACHES THE STATE
-#: IT NEEDS.  That is a hole in the probes, and saying so is not the same as
-#: saying the instruction cannot run -- which is why it has its own word
-#: instead of UNREACHABLE or the open-question remainder.
-PROBE_HOLE_SMM = 'PROBE-HOLE(SMM)'
+#: ITS DECODE ENTRY IS GATED ON.  The refusal measures this corpus's probes,
+#: so the row names the state and the leg that would enter it.
+#:
+#: It was spelled PROBE-HOLE(SMM) here while qemu_reach_matrix.py published
+#: UNREACHABLE for the same encoding and said nothing about SMM at all --
+#: FINDING 254-D, two tables written by one run disagreeing about one row.
+#: Both now take the word from reach_words.py and the cross-check below
+#: asserts they carry it together.
+REFUSED_BY_STATE_SMM = RW.REFUSED_BY_STATE_SMM
 
 # --------------------------------------------------------------------------
 # The refusal sites.  `locator` is matched against `file`; the citation is
@@ -657,22 +667,38 @@ ROWS = [
 # probes them under an Intel-vendor model and both move off #UD, so they are
 # adjudicated REACHABLE-INTEL-VENDOR in ROWS above rather than left open.
 #
-# RSM stays, and its word is now PROBE-HOLE(SMM) rather than an open question.
-# The derivation is the purpose statement plus the standing per-model ruling:
-# SMM exists in QEMU system mode, so the instruction IS reachable in QEMU; what
-# this corpus lacks is a CPL0 leg that enters SMM.  That is a hole in the
-# probes, it is named as one, and building an SMM probe is an ARC 4 candidate.
+# RSM stays, and its word is REFUSED-BY-STATE(SMM) -- ONE SPELLING, CARRIED BY
+# BOTH TABLES (FINDING 254-D).  It read PROBE-HOLE(SMM) here while
+# qemu_reach_matrix.py published UNREACHABLE for 0F AA and said nothing about
+# SMM, which is two answers to one question out of a single run.
+#
+# THE VERDICT THAT GOES WITH THE WORD IS NOT THIS TABLE'S PREFERENCE, it is
+# the D17 trap-state precedent applied to an encoding gated by MACHINE STATE
+# the corpus does not enter.  D17 ruled that the operands of an encoding the
+# machine raises on are not what the machine read: what is true of the
+# non-trapping form is not evidence about the run that was measured.  The same
+# reading decides this row.  Nothing measured reached RSM, so the matrix keeps
+# UNREACHABLE -- the 23 REFUSED-BY-MODEL rows sit in that family for the same
+# reason -- and what the word adds is WHICH state was never entered, so the
+# row cannot be read as "QEMU has no entry for these bytes".  SYSENTER and
+# SYSEXIT are the contrasting case and left this list by MEASUREMENT (253-A):
+# the vendor arm RAN them, so they cannot publish UNREACHABLE at all.
+#
+# The leg that would settle RSM is filed work, not a silence: TASK_LEDGER row
+# 486, the ARC 4 SMM-entering CPL0 probe.
 #
 # opcode_id -> (mnemonic, refusal site, published class, what the class means)
 REMAINDER = [
-    ('XED_IFORM_RSM', 'RSM', 'rsm-entry', PROBE_HOLE_SMM,
+    ('XED_IFORM_RSM', 'RSM', 'rsm-entry', REFUSED_BY_STATE_SMM,
      'RSM is implemented (gen_RSM -> helper_rsm) and refused by chk(smm) '
      'because no probe boot in this corpus is ever in system-management '
-     'mode.  SMM is reachable in QEMU system mode, so the instruction is '
-     'reachable in QEMU and the refusal measures THIS CORPUS\'S PROBES, not '
-     'QEMU.  The row is therefore neither UNREACHABLE nor unadjudicated: it '
-     'is a named probe-coverage hole, and an SMM-entering CPL0 leg is the '
-     'work that closes it'),
+     'mode, so the refusal measures THIS CORPUS\'S PROBES rather than '
+     'QEMU\'s decoder.  Nothing measured entered SMM, so the reachability '
+     'matrix keeps UNREACHABLE for it -- the treatment D17 gives an encoding '
+     'gated by machine state the corpus does not enter -- and both tables '
+     'carry this class word so the state that was never entered is on the '
+     'row.  TASK_LEDGER row 486 (ARC 4) is the SMM-entering CPL0 leg that '
+     'would measure the encoding and settle it'),
 ]
 
 # The extensions whose absence from has_cpuid_feature() is itself the proof
@@ -729,24 +755,35 @@ def _selftest(root):
     import tempfile
 
     hdr = ('opcode_id\tmnemonic\tisa_set\textension\tprobe_hex\t'
-           'qemu_refusal\n')
+           'qemu_refusal\tverdict\tevidence\n')
     # The synthetic matrix must carry the REMAINDER too, or arm A would fail
     # on this file's own set comparison rather than on anything it measures.
-    rows = ([(i, mn) for i, mn, _, _, _ in ROWS]
-            + [(i, mn) for i, mn, _, _, _ in REMAINDER])
+    # It carries VERDICT and EVIDENCE as well, because the cross-check that
+    # ends FINDING 254-D reads both, and a fixture the check cannot read
+    # would let every arm below pass without exercising it.
+    rows = ([(i, mn, v) for i, mn, v, _, _ in ROWS]
+            + [(i, mn, lb) for i, mn, _, lb, _ in REMAINDER])
 
-    def matrix(mut=None, drop=None, dup=None):
+    def agreeing(cls):
+        """The matrix cells MATRIX_CONTRACT accepts for a class."""
+        rule = MATRIX_CONTRACT[cls]
+        v = 'UNREACHABLE' if 'UNREACHABLE' in rule['allow'] else 'UNCOVERED'
+        return v, ('%s; synthesised agreeing evidence' % rule['word']
+                   if rule['word'] else 'synthesised agreeing evidence')
+
+    def matrix(mut=None, drop=None, dup=None, cell=None):
         out = io.StringIO()
         out.write(hdr)
-        for i, mn in rows:
+        for i, mn, cls in rows:
             if drop and i == drop:
                 continue
             h = 'deadbeef' if mut else ('%08x' % (abs(hash(i)) & 0xffffffff))
-            out.write('%s\t%s\t-\t-\t%s\tDECODED-THEN-REFUSED\n'
-                      % (i, mn, mut(i) if mut else h))
+            v, ev = cell(i, cls) if cell else agreeing(cls)
+            out.write('%s\t%s\t-\t-\t%s\tDECODED-THEN-REFUSED\t%s\t%s\n'
+                      % (i, mn, mut(i) if mut else h, v, ev))
             if dup and i == dup:
-                out.write('%s\t%s\t-\t-\tcafe\tDECODED-THEN-REFUSED\n'
-                          % (i, mn))
+                out.write('%s\t%s\t-\t-\tcafe\tDECODED-THEN-REFUSED\t%s\t%s\n'
+                          % (i, mn, v, ev))
         return out.getvalue()
 
     # The vendor arm's own evidence, synthesised: two subjects that move off
@@ -851,10 +888,156 @@ def _selftest(root):
     k = run(matrix(), vendor=vend_ctl)
     t('K a vendor table whose CONTROL moved REFUSES', k.returncode != 0
       and 'vendor' in k.stderr)
+    # L AND M ARE THE FIRING PROOF FOR THE CROSS-CHECK THAT ENDS FINDING
+    # 254-D.  The defect was never a wrong answer -- it was TWO answers, this
+    # table and the reachability matrix classing the same three encodings
+    # differently out of one run, with nothing comparing them.  L offers a
+    # matrix that publishes UNREACHABLE for a row the vendor arm MEASURED
+    # QEMU running; M offers one whose evidence drops the state word this
+    # table prints for RSM.  Both must REFUSE, and the refusal must NAME the
+    # rows, because a cross-check that only says "they differ" leaves the
+    # reader to find out which of 133 rows it meant.
+    def unreach(i, cls):
+        v, ev = agreeing(cls)
+        return ('UNREACHABLE', ev) if cls == REACH_VENDOR else (v, ev)
+
+    l_ = run(matrix(cell=unreach))
+    _lnames = [mn for _, mn, v, _, _ in ROWS if v == REACH_VENDOR]
+    t('L a matrix publishing UNREACHABLE for a measured-reachable row '
+      'REFUSES, naming it',
+      l_.returncode != 0 and bool(_lnames)
+      and all(mn in l_.stderr for mn in _lnames))
+
+    def wordless(i, cls):
+        v, ev = agreeing(cls)
+        return (v, 'synthesised evidence carrying no class word'
+                if cls == REFUSED_BY_STATE_SMM else ev)
+
+    m_ = run(matrix(cell=wordless))
+    _mnames = [mn for _, mn, _, lb, _ in REMAINDER
+               if lb == REFUSED_BY_STATE_SMM]
+    t('M a matrix whose evidence drops the shared class word REFUSES, '
+      'naming it',
+      m_.returncode != 0 and bool(_mnames)
+      and all(mn in m_.stderr for mn in _mnames))
     for p in (vend_ok, vend_inert, vend_ctl):
         os.unlink(p)
-    print('arms=11 failures=%d' % fails)
+    print('arms=13 failures=%d' % fails)
     return 1 if fails else 0
+
+
+#: WHAT THE MATRIX MUST SAY ABOUT A ROW THIS TABLE HAS CLASSED.
+#:
+#: FINDING 254-D was not a wrong answer, it was TWO answers: the x86_64 leg
+#: wrote decode_adjudication.tsv saying SYSENTER and SYSEXIT are reachable
+#: under an Intel vendor and RSM is refused by a machine state, and wrote
+#: reach_matrix.tsv in the same run saying verdict=UNREACHABLE for all three.
+#: Nothing compared them, so the contradiction sat in two published tables
+#: until someone read both.  It is an ASSERTED INVARIANT now.
+#:
+#: Every class this table can print carries its expectation of the matrix, so
+#: a class added later without one REFUSES rather than going unchecked.
+#:   `allow` -- the verdicts the matrix may publish for a row of this class
+#:   `word`  -- a class word the matrix's evidence column must carry, for the
+#:              classes where BOTH tables have to name the same thing
+_MVER = ('COVERED', 'UNREACHABLE', 'UNCOVERED')
+MATRIX_CONTRACT = {
+    NOT_IMPL: dict(
+        allow={'UNREACHABLE'}, word=None,
+        why='no decode path exists, so no configuration executes it'),
+    ENABLE_OFF: dict(
+        allow={'COVERED', 'UNCOVERED'}, word=None,
+        why='a decode path EXISTS behind an architectural enable, so the row '
+            'is a coverage hole until it is re-probed with the enable set; '
+            'UNREACHABLE would assert the gate can never open, which is the '
+            'opposite of what this class says'),
+    REFUSED: dict(
+        allow={'UNREACHABLE'}, word=None,
+        why='QEMU refuses the ENABLE itself under every CPU model, so the '
+            'gate opens in no configuration'),
+    REACH_VENDOR: dict(
+        allow={'COVERED', 'UNCOVERED'}, word=REACH_VENDOR,
+        why='the vendor arm MEASURED QEMU running the encoding under an '
+            'Intel-vendor model; a measured-reachable instruction may not '
+            'publish UNREACHABLE'),
+    REFUSED_BY_STATE_SMM: dict(
+        allow={'UNREACHABLE'}, word=REFUSED_BY_STATE_SMM,
+        why='nothing measured entered the gating machine state, so the '
+            'verdict stays in the unreachable-in-probed-state family (D17); '
+            'what both tables must share is the WORD, so the state that was '
+            'never entered is on the row in either place'),
+}
+
+
+def _crosscheck_matrix(path):
+    """Refuse if this table and reach_matrix.tsv disagree about a row.
+
+    Runs on the matrix this table was joined against, so the two files
+    compared are the two the leg is about to publish.
+    """
+    if not path:
+        return
+    with open(path) as f:
+        rows = list(csv.DictReader(f, delimiter='\t'))
+    if not rows:
+        sys.exit('%s: the matrix is empty, so the cross-check between the two '
+                 'published tables has no subject.  A check that cannot find '
+                 'what it checks is a failure, not a pass' % path)
+    for c in ('opcode_id', 'verdict', 'evidence'):
+        if c not in rows[0]:
+            sys.exit('%s: the matrix has no %r column, so this table cannot '
+                     'be cross-checked against it.  The two tables agreeing '
+                     'is an asserted invariant and an unverifiable matrix is '
+                     'not an excuse to skip it' % (path, c))
+    by = {r['opcode_id']: r for r in rows}
+    classed = ([(i, mn, v) for i, mn, v, _, _ in ROWS]
+               + [(i, mn, lb) for i, mn, _, lb, _ in REMAINDER])
+    bad, seen = [], collections.Counter()
+    for opid, mn, cls in classed:
+        rule = MATRIX_CONTRACT.get(cls)
+        if rule is None:
+            bad.append('%s (%s) is filed %s and MATRIX_CONTRACT has no rule '
+                       'for that class: a class nobody stated an expectation '
+                       'for is a class the two tables can disagree about '
+                       'silently' % (mn, opid, cls))
+            continue
+        m = by.get(opid)
+        if m is None:
+            bad.append('%s (%s) is filed %s and the matrix carries no row for '
+                       'it at all' % (mn, opid, cls))
+            continue
+        seen[cls] += 1
+        if m['verdict'] not in _MVER:
+            bad.append('%s (%s): the matrix publishes verdict=%r, which is '
+                       'not one of the three this cross-check knows (%s).  A '
+                       'fourth verdict is a change to the taxonomy and has to '
+                       'be ruled on, not matched against'
+                       % (mn, opid, m['verdict'], '/'.join(_MVER)))
+            continue
+        if m['verdict'] not in rule['allow']:
+            bad.append('%s (%s): this table says %s, the matrix publishes '
+                       'verdict=%s.  %s -- so the matrix may publish only %s '
+                       'for this row'
+                       % (mn, opid, cls, m['verdict'], rule['why'],
+                          '/'.join(sorted(rule['allow']))))
+        if rule['word'] and rule['word'] not in m['evidence']:
+            bad.append('%s (%s): this table says %s and the matrix evidence '
+                       'does not carry that word (%r).  Both tables have to '
+                       'name the same class for the row, or the leg publishes '
+                       'two vocabularies for one fact'
+                       % (mn, opid, cls, m['evidence'][:120]))
+    if bad:
+        sys.exit('THE TWO PUBLISHED TABLES DISAGREE (FINDING 254-D\'s shape) '
+                 '-- %d row(s):\n  %s' % (len(bad), '\n  '.join(bad)))
+    if not sum(seen.values()):
+        sys.exit('%s: the cross-check matched NO row of this table against '
+                 'the matrix.  A clean run over nothing is not agreement'
+                 % path)
+    print('# matrix cross-check (%s): %d classed row(s) agree with the '
+          'matrix -- %s'
+          % (path, sum(seen.values()),
+             ' '.join('%s=%d' % (k, n) for k, n in sorted(seen.items()))),
+          file=sys.stderr)
 
 
 def main():
@@ -997,30 +1180,23 @@ def main():
                      'the word is a MEASUREMENT (sysprobe_vendor.sh) and this '
                      'table will not assert it'
                      % (n_vendor, REACH_VENDOR))
-        with open(a.cpl0_vendor) as f:
-            vrows = list(csv.DictReader(f, delimiter='\t'))
-        subj = [r for r in vrows if r['role'] == 'SUBJECT']
-        ctl = [r for r in vrows if r['role'] == 'CONTROL']
-        movers = [r for r in subj if r['moved'] == '1' and r['vec_amd'] == '6']
-        moved_ctl = [r['hex'] for r in ctl if r['moved'] != '0']
+        # The three guards -- no file, an arm that measured nothing, an arm
+        # whose control moved -- are reach_words.read_vendor's, shared with
+        # qemu_reach_matrix.py so that the two tables cannot come to apply
+        # different ones to the same file.
+        movers, ctl = RW.read_vendor(a.cpl0_vendor,
+                                     'qemu_decode_adjudicate.py')
         if len(movers) < n_vendor:
             sys.exit('the vendor arm (%s) shows %d subject(s) moving off #UD '
                      'when the vendor changes, and %d row(s) are filed %s.  '
                      'An arm that measured less than it is quoted for cannot '
                      'carry the word' % (a.cpl0_vendor, len(movers), n_vendor,
                                          REACH_VENDOR))
-        if not ctl:
-            sys.exit('the vendor arm (%s) carries no CONTROL row: an arm with '
-                     'no control cannot say the movement is the vendor\'s'
-                     % a.cpl0_vendor)
-        if moved_ctl:
-            sys.exit('the vendor arm (%s) has CONTROL row(s) that MOVED (%s): '
-                     'the two boots differ for some reason other than the '
-                     'vendor, so nothing there attributes the subjects\' '
-                     'movement to it' % (a.cpl0_vendor, ' '.join(moved_ctl)))
         print('# vendor arm: %d subject(s) moved off #UD under an Intel '
               'vendor, %d control(s) steady' % (len(movers), len(ctl)),
               file=sys.stderr)
+
+    _crosscheck_matrix(a.matrix)
 
     flips, out = [], []
     for opid, mn, verdict, site, gate in ROWS:

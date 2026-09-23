@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Audit and regenerate champsim_tracer mnemonic classification tables.
+"""The mnemonic rule vocabulary, and the retired table audit that grew it.
 
-The script intentionally derives mnemonics from the in-tree Capstone C enum
-names instead of Capstone's Python id-to-name API.  Some local Capstone Python
-bindings can drift from the rebuilt C library, while the plugin compiles
-against the C headers.
+The LIVE half of this file is the rule vocabulary -- ``ISAS``, ``classify()``
+and ``classify_reg()`` -- which maps a Capstone enum NAME string to the
+tracer's generic classification.  ``tools/cst_referee.py`` (the offline
+two-decoder referee, whose Capstone column comes from the Python bindings)
+and the validator's ``classify.py`` import it; nothing in this half touches
+the filesystem.
+
+The audit/regeneration half (``--diff`` / ``--apply``) is RETIRED: it parsed
+the vendored Capstone C headers to enumerate every enum constant and rewrote
+the per-ISA ``champsim_tracer_mnemonics_<isa>.h`` tables.  The vendored
+Capstone tree left the repository with the operand walk (ARC 3), and the
+per-ISA tables it rewrote are gone with the code that read them, so those
+modes now refuse with that explanation instead of dying on a missing path.
 """
 
 from __future__ import annotations
@@ -1637,7 +1646,23 @@ def c_mnemonic(const_name: str, prefix: str) -> str:
     return const_name.removeprefix(prefix).lower()
 
 
+def _require_vendored_capstone(info: IsaInfo) -> None:
+    """The audit/regeneration modes have no subject in this repository."""
+    if not info.capstone_header.is_file():
+        raise SystemExit(
+            "champsim_tracer_mnemonic_audit: --diff/--apply are RETIRED. "
+            "They parsed the vendored Capstone tree (%s), which left the "
+            "repository with the operand walk, and the per-ISA "
+            "champsim_tracer_mnemonics_<isa>.h tables they rewrote are gone "
+            "with the code that read them.  The live half of this file is "
+            "the rule vocabulary (ISAS/classify/classify_reg) imported by "
+            "tools/cst_referee.py and the validator; encoding-level "
+            "comparison against Capstone runs offline through the referee's "
+            "Python bindings." % info.capstone_header)
+
+
 def enum_constants(info: IsaInfo) -> list[str]:
+    _require_vendored_capstone(info)
     text = info.capstone_header.read_text()
     try:
         start = text.index(info.prefix + "INVALID")
@@ -1661,6 +1686,7 @@ def enum_constants(info: IsaInfo) -> list[str]:
 
 
 def enum_reg_constants(info: IsaInfo) -> list[str]:
+    _require_vendored_capstone(info)
     text = info.capstone_header.read_text()
     try:
         start = text.index(info.reg_prefix + "INVALID")

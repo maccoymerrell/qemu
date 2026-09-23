@@ -140,6 +140,45 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
     return rows, counts, unpro
 
 
+#: the tokens a harness writes into a cell it could not measure.  They are
+#: matched EXACTLY, on whole cells, so a sentence that merely mentions the
+#: phrase is not counted and a cell that carries it cannot hide behind a
+#: column this report does not know the name of.
+NOT_MEASURED_TOKENS = ('NOT-MEASURED', 'NOT MEASURED', 'NOT_MEASURED')
+
+
+def not_measured(path):
+    """-> (rows, {column: count}) for the cells this table could not measure.
+
+    THIS REPORT PUBLISHED TOTALS OVER ROWS THAT CARRIED NO VERDICT AND NEVER
+    SAID SO.  Six x86_64 rows sat in reach_matrix.tsv with qemu_refusal
+    NOT-MEASURED -- three reachability legs had run and one had come back
+    with nothing -- and the token appeared nowhere in the report they were
+    counted into.  A population a table admits it could not measure is a
+    NAMED line here with its own count, and a nonzero one is a nonzero exit:
+    `UNCOVERED 2331` is a different sentence when 6 of those rows have no
+    measurement behind them, and the reader is entitled to both numbers.
+
+    Every cell of every table is scanned rather than one known column, so a
+    renamed or added column cannot take a not-measured population out of
+    sight.
+    """
+    hits = collections.Counter()
+    rows = 0
+    with open(path, newline='') as f:
+        txt = f.read()
+    if txt.startswith('#'):
+        txt = txt[1:]
+    for r in csv.DictReader(txt.splitlines(), delimiter='\t'):
+        seen = False
+        for col, val in r.items():
+            if val is not None and val.strip() in NOT_MEASURED_TOKENS:
+                hits[col] += 1
+                seen = True
+        rows += bool(seen)
+    return rows, dict(hits)
+
+
 BUILD_DIR = os.environ.get('CST_BUILD', '/mnt/md0/QEMU/qemu/build')
 
 #: The offline reference.  Everything that used to run inside the traced
@@ -558,6 +597,43 @@ def main():
     w('not the same as closing it.')
     w('')
 
+    # ---------------------------------------------------- NOT-MEASURED ------
+    # Printed next to the split it qualifies, and printed even when it is 0:
+    # a line that only appears when there is something to report teaches the
+    # reader nothing when it is absent.
+    w('=' * 78)
+    w('NOT-MEASURED -- rows the tables above ADMIT they could not measure.')
+    w('A row with no measurement behind it is still counted in the split, so')
+    w('its count belongs beside the split and not in a footnote.  Every cell')
+    w('of every table is scanned for the token, so a renamed column cannot')
+    w('take a population out of sight.  A nonzero total here is a nonzero')
+    w('exit status from this report.')
+    w('')
+    hdr4 = '%-9s %14s  %s' % ('ISA', 'NOT-MEASURED', 'where')
+    w(hdr4)
+    w('-' * len(hdr4))
+    nm_total = 0
+    for isa, rel, _vc, _dt, _mc, _lc in ISAS:
+        if isa in blocked:
+            w(refused_row(isa)); continue
+        tables = [os.path.join(a.cov, rel)]
+        if isa in REACH_MATRIX:
+            tables.append(os.path.join(a.cov, REACH_MATRIX[isa]))
+        n, where = 0, []
+        for p in tables:
+            if not os.path.exists(p):
+                continue
+            rows, cols = not_measured(p)
+            n += rows
+            for col, k in sorted(cols.items()):
+                where.append('%s:%s=%d' % (os.path.basename(p), col, k))
+        nm_total += n
+        w('%-9s %14d  %s' % (isa, n, ', '.join(where) or '-'))
+    w('-' * len(hdr4))
+    w(refused_total('all four') if blocked else
+      '%-9s %14d' % ('all four', nm_total))
+    w('')
+
     # ------------------------------------------------- per-ISA cross-tables
     for isa, _, _, _, _, _ in ISAS:
         if isa in blocked:
@@ -654,6 +730,15 @@ def main():
                  'and every all-four total is withheld; the legs that DID run '
                  'are published beside them and are readable.'
                  % (len(blocked), len(ISAS), ', '.join(sorted(blocked))))
+    # AND THE SAME AGAIN FOR ROWS WITH NO VERDICT.  The report is written
+    # either way -- the NOT-MEASURED line above names the population and its
+    # count -- but publishing totals that rest on unmeasured rows is not
+    # passing, and a caller scripting this report reads the exit status.
+    if nm_total:
+        sys.exit('%d row(s) across the four legs carry NOT-MEASURED: the '
+                 'totals above are published WITH them counted, and named on '
+                 'the NOT-MEASURED line.  A coverage total resting on a row '
+                 'nobody measured is not a passing result.' % nm_total)
 
 
 if __name__ == '__main__':

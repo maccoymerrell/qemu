@@ -1,0 +1,25 @@
+# ChampSim Tracer worktree ledger -- every checkout of this repository, its
+# status, and its deletability verdict.  Companion to TASK_LEDGER.tsv.
+#
+# STANDING DIRECTIVE (maintainer, 2026-09-22): worktree DELETIONS ARE ON HOLD.
+# This file is the deletable-list the hold asks for, and the durable rule it
+# serves: no worktree may sit around with unknown status.  Every checkout has
+# a row here; an agent that creates a worktree adds its row in the same
+# session, and a sweep that changes the set updates this file in the same
+# commit.  A verdict of DELETABLE means the CLAUDE.md sec.6 proof is DONE
+# (every commit patch-identical or adjudicated landed/superseded, working
+# diff archived) -- it is a fact about the checkout, not permission to act.
+#
+# Basis: the N5 sweep at f21dbad63e (evidence + per-worktree archives at
+# /mnt/md0/QEMU/cst_runs/p3/arc3/exec252/bbatch/n5/ -- ADJUDICATION.md,
+# JOIN_patchid.tsv, archive/<name>/), re-measured 2026-09-22.  The 21 wf_*
+# worktrees that sweep removed (all proven landed, all archived first) are
+# recorded there and predate the hold.
+#
+# path	head	branch	ahead	dirty_lines	size	verdict	basis
+/mnt/md0/QEMU/cst_runs/p3/arc3/exec245/gate/bankwt	368047e67c	(detached)	0	0	593M	DELETABLE (held)	sec.6 proof complete: 0 commits ahead, clean tree, empty diff archived; removal was also permission-denied to agents -- one maintainer command when the hold lifts
+/mnt/md0/QEMU/cst_runs/p3/arc3/obs/wt	c98e43a8b4	obs-audit	206	15	1.3G	KEPT: MAINTAINER RULING OWED	206 demolition-era commits, preserved on refs/arc3/monster-tip + backup branch but NOT read on the merits; 1.79 MB working diff archived (n5/archive)
+/mnt/md0/QEMU/cst_runs/p3/arc3/w10/base_wt	e7a5309370	(detached)	191	13	1.3G	KEPT: MAINTAINER RULING OWED	191 demolition-era commits, same preservation and the same unread-merits bar; 1.78 MB working diff archived
+/mnt/md0/QEMU/qemu/.claude/worktrees/wf_7353758b-d6d-4	13670a9b3e	worktree-wf_7353758b-d6d-4	2	0	171M	KEPT: DECISION ROW C-1 (ledger 475)	x86_64 decode_census.py unique, its only consumer superseded -- land-with-a-new-consumer or retire; patches archived
+/mnt/md0/QEMU/qemu/.claude/worktrees/wf_7353758b-d6d-6	62d6c09ac6	worktree-wf_7353758b-d6d-6	8	0	171M	KEPT: DECISION ROW C-2 (ledger 475)	seven riscv64 reachability commits pointing at STILL-PENDING ledger row 376; nothing else at tip can fill that column; patches archived
+/mnt/md0/QEMU/qemu/.claude/worktrees/wf_7353758b-d6d-7	56acf5b816	worktree-wf_7353758b-d6d-7	2	0	171M	KEPT: DECISION ROW C-3 (ledger 475)	two mipsel decode-row commits, no mipsel REACH_MATRIX counterpart at tip; patches archived

@@ -1004,6 +1004,47 @@ block epilogue, not a property of the encoding.  A consumer that
 partitions instructions into "writes the PC" and "does not" on this
 evidence is reading QEMU's block-splitting policy.  The
 non-uniformity composes with the one recorded under
-**Architectural PC destinations** — riscv64 and mipsel carry no
-architectural PC destination of their own — and neither is a
-statement about the guest architecture.
+`Architectural PC destinations`_ — which mechanisms deliver a PC
+destination, and for which encodings, differs per target — and
+neither is a statement about the guest architecture.
+
+.. _Architectural PC destinations:
+
+Architectural PC destinations
+-----------------------------
+
+Every instruction changes the program counter; the wire names
+``REG_IP`` as a *destination* only where QEMU's emulation performs
+the redirect inside that instruction's own dataflow window.  On the
+whole-encoding translate-only corpus all four targets publish the
+destination, from three mechanisms:
+
+* **Taken control transfers stated at the decode site.**  A branch,
+  jump or call whose taken edge is emitted inside the instruction's
+  window carries the PC write: ``jal``/``beq``/``bne`` on riscv64,
+  the ``b.<cc>``/``cbz``/``tbz`` families on aarch64, the branch and
+  branch-likely families (and their delay-slot carry) on mipsel, and
+  the ``eip`` updates on x86_64.
+
+* **Exception delivery.**  An encoding whose execution raises —
+  an undefined encoding, a trapping compare (``teqi``/``tgei``),
+  an SME operation taken before its enabling state — publishes the
+  delivery write set, and the PC redirect is part of it.  These
+  rows carry a PC destination although nothing about the encoding
+  "is a branch"; the write is the trap's, stated where the
+  emulation performs it.
+
+* **Translator-forced TB exits** — the mechanism recorded in the
+  previous section: a decode site that must end the block emits the
+  epilogue inside its own window, so the store is attributed.
+
+**The under-report is one-directional.**  An ordinary fall-through
+instruction, and a conditional branch on its not-taken arm, advance
+the PC architecturally with no wire write — QEMU materialises the
+advance only where control leaves the block.  The trace never names
+a PC write the machine does not perform; it omits ones the machine
+performs implicitly.  A consumer must treat the presence of
+``REG_IP`` in a destination list as "the emulation redirected
+control here", never as a partition of encodings into branch and
+non-branch — the branch taxonomy on the wire is the ``BRANCH_*``
+classification, not this destination bit.

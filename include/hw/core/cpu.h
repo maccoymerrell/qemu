@@ -282,9 +282,8 @@ typedef struct CPUTLBDesc {
 #ifdef CONFIG_PLUGIN
     /*
      * The pair above, saved at wrong-path excursion entry and put back at
-     * exit -- see cpu_plugin_spec_tlb_note(), which also records why these
-     * moved here from file-scope arrays.  Per-mmu_idx AND per-vCPU because
-     * that is what they shadow.
+     * exit (see cpu_plugin_spec_tlb_note()).  Per-mmu_idx and per-vCPU
+     * because that is what they shadow.
      */
     vaddr plugin_spec_lp_addr;
     vaddr plugin_spec_lp_mask;
@@ -416,69 +415,6 @@ struct qemu_work_item;
 
 #define CPU_UNSET_NUMA_NODE_ID -1
 
-/**
- * struct CPUState - common state of one CPU core or thread.
- *
- * @cpu_index: CPU index (informative).
- * @cluster_index: Identifies which cluster this CPU is in.
- *   For boards which don't define clusters or for "loose" CPUs not assigned
- *   to a cluster this will be UNASSIGNED_CLUSTER_INDEX; otherwise it will
- *   be the same as the cluster-id property of the CPU object's TYPE_CPU_CLUSTER
- *   QOM parent.
- *   Under TCG this value is propagated to @tcg_cflags.
- *   See TranslationBlock::TCG CF_CLUSTER_MASK.
- * @tcg_cflags: Pre-computed cflags for this cpu.
- * @nr_threads: Number of threads within this CPU core.
- * @thread: Host thread details, only live once @created is #true
- * @sem: WIN32 only semaphore used only for qtest
- * @thread_id: native thread id of vCPU, only live once @created is #true
- * @running: #true if CPU is currently running (lockless).
- * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
- * valid under cpu_list_lock.
- * @created: Indicates whether the CPU thread has been successfully created.
- * @halt_cond: condition variable sleeping threads can wait on.
- * @interrupt_request: Indicates a pending interrupt request.
- * @halted: Nonzero if the CPU is in suspended state.
- * @stop: Indicates a pending stop request.
- * @stopped: Indicates the CPU has been artificially stopped.
- * @unplug: Indicates a pending CPU unplug request.
- * @crash_occurred: Indicates the OS reported a crash (panic) for this CPU
- * @singlestep_enabled: Flags for single-stepping.
- * @icount_extra: Instructions until next timer event.
- * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
- *            AddressSpaces this CPU has)
- * @num_ases: number of CPUAddressSpaces in @cpu_ases
- * @as: Pointer to the first AddressSpace, for the convenience of targets which
- *      only have a single AddressSpace
- * @gdb_regs: Additional GDB registers.
- * @gdb_num_regs: Number of total registers accessible to GDB.
- * @gdb_num_g_regs: Number of registers in GDB 'g' packets.
- * @node: QTAILQ of CPUs sharing TB cache.
- * @opaque: User data.
- * @mem_io_pc: Host Program Counter at which the memory was accessed.
- * @accel: Pointer to accelerator specific state.
- * @kvm_fd: vCPU file descriptor for KVM.
- * @work_mutex: Lock to prevent multiple access to @work_list.
- * @work_list: List of pending asynchronous work.
- * @plugin_state: per-CPU plugin state
- * @ignore_memory_transaction_failures: Cached copy of the MachineState
- *    flag of the same name: allows the board to suppress calling of the
- *    CPU do_transaction_failed hook function.
- * @kvm_dirty_gfns: Points to the KVM dirty ring for this CPU when KVM dirty
- *    ring is enabled.
- * @kvm_fetch_index: Keeps the index that we last fetched from the per-vCPU
- *    dirty ring structure.
- *
- * @neg_align: The CPUState is the common part of a concrete ArchCPU
- * which is allocated when an individual CPU instance is created. As
- * such care is taken is ensure there is no gap between between
- * CPUState and CPUArchState within ArchCPU.
- *
- * @neg: The architectural register state ("cpu_env") immediately follows
- * CPUState in ArchCPU and is passed to TCG code. The @neg structure holds
- * some common TCG CPU variables which are accessed with a negative offset
- * from cpu_env.
- */
 typedef enum QemuPluginCpuEventKind {
     QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER  = 0,
     QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN = 1,
@@ -564,6 +500,82 @@ typedef struct QemuPluginCpuEventQueue {
     uint64_t n_drain;
 } QemuPluginCpuEventQueue;
 
+/*
+ * CPUPluginIrqDelta - external interrupt-pending changes recorded during a
+ * wrong-path excursion, for the excursion-exit restore to replay over the
+ * rewound pending register.  riscv declares this type for mip; mips keeps
+ * its own 32-bit pair with the same field spelling for CP0_Cause.IP.  The
+ * two masks are complementary: a bit is in at most one of them, holding
+ * the device's last level rather than a sticky OR.
+ */
+typedef struct CPUPluginIrqDelta {
+    uint64_t set;       /* externally raised during the excursion */
+    uint64_t clear;     /* externally lowered during the excursion */
+} CPUPluginIrqDelta;
+
+/**
+ * struct CPUState - common state of one CPU core or thread.
+ *
+ * @cpu_index: CPU index (informative).
+ * @cluster_index: Identifies which cluster this CPU is in.
+ *   For boards which don't define clusters or for "loose" CPUs not assigned
+ *   to a cluster this will be UNASSIGNED_CLUSTER_INDEX; otherwise it will
+ *   be the same as the cluster-id property of the CPU object's TYPE_CPU_CLUSTER
+ *   QOM parent.
+ *   Under TCG this value is propagated to @tcg_cflags.
+ *   See TranslationBlock::TCG CF_CLUSTER_MASK.
+ * @tcg_cflags: Pre-computed cflags for this cpu.
+ * @nr_threads: Number of threads within this CPU core.
+ * @thread: Host thread details, only live once @created is #true
+ * @sem: WIN32 only semaphore used only for qtest
+ * @thread_id: native thread id of vCPU, only live once @created is #true
+ * @running: #true if CPU is currently running (lockless).
+ * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
+ * valid under cpu_list_lock.
+ * @created: Indicates whether the CPU thread has been successfully created.
+ * @halt_cond: condition variable sleeping threads can wait on.
+ * @interrupt_request: Indicates a pending interrupt request.
+ * @halted: Nonzero if the CPU is in suspended state.
+ * @stop: Indicates a pending stop request.
+ * @stopped: Indicates the CPU has been artificially stopped.
+ * @unplug: Indicates a pending CPU unplug request.
+ * @crash_occurred: Indicates the OS reported a crash (panic) for this CPU
+ * @singlestep_enabled: Flags for single-stepping.
+ * @icount_extra: Instructions until next timer event.
+ * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
+ *            AddressSpaces this CPU has)
+ * @num_ases: number of CPUAddressSpaces in @cpu_ases
+ * @as: Pointer to the first AddressSpace, for the convenience of targets which
+ *      only have a single AddressSpace
+ * @gdb_regs: Additional GDB registers.
+ * @gdb_num_regs: Number of total registers accessible to GDB.
+ * @gdb_num_g_regs: Number of registers in GDB 'g' packets.
+ * @node: QTAILQ of CPUs sharing TB cache.
+ * @opaque: User data.
+ * @mem_io_pc: Host Program Counter at which the memory was accessed.
+ * @accel: Pointer to accelerator specific state.
+ * @kvm_fd: vCPU file descriptor for KVM.
+ * @work_mutex: Lock to prevent multiple access to @work_list.
+ * @work_list: List of pending asynchronous work.
+ * @plugin_state: per-CPU plugin state
+ * @ignore_memory_transaction_failures: Cached copy of the MachineState
+ *    flag of the same name: allows the board to suppress calling of the
+ *    CPU do_transaction_failed hook function.
+ * @kvm_dirty_gfns: Points to the KVM dirty ring for this CPU when KVM dirty
+ *    ring is enabled.
+ * @kvm_fetch_index: Keeps the index that we last fetched from the per-vCPU
+ *    dirty ring structure.
+ *
+ * @neg_align: The CPUState is the common part of a concrete ArchCPU
+ * which is allocated when an individual CPU instance is created. As
+ * such care is taken is ensure there is no gap between between
+ * CPUState and CPUArchState within ArchCPU.
+ *
+ * @neg: The architectural register state ("cpu_env") immediately follows
+ * CPUState in ArchCPU and is passed to TCG code. The @neg structure holds
+ * some common TCG CPU variables which are accessed with a negative offset
+ * from cpu_env.
+ */
 struct CPUState {
     /*< private >*/
     DeviceState parent_obj;
@@ -664,9 +676,7 @@ struct CPUState {
      *
      * Unconditional for the same reason as plugin_spec_mode above: both
      * of its sites are in cpu-exec.c's ordinary system-mode dispatch,
-     * guarded by !CONFIG_USER_ONLY and not by CONFIG_PLUGIN, so with the
-     * member inside the plugin block a --disable-plugins system build did
-     * not compile at all.
+     * guarded by !CONFIG_USER_ONLY and not by CONFIG_PLUGIN.
      */
     bool plugin_spec_kick_deferred;
 
@@ -781,7 +791,6 @@ struct CPUState {
     void *plugin_spec_store_pool;             /* PluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */
-#ifdef CONFIG_PLUGIN
     /*
      * Discard target for a speculative atomic RMW that could not be given a
      * sandbox line (the line pool is at PLUGIN_SPEC_STORE_LINE_MAX and this
@@ -796,7 +805,6 @@ struct CPUState {
      * spec_atomic_shadow() in accel/tcg/internal-common.h.
      */
     PluginSpecLine plugin_spec_atomic_scratch;
-#endif
     /* Set when a single wrong-path excursion's speculative-store footprint
      * crosses PLUGIN_SPEC_STORE_SOFT_BUDGET lines — a garbage-size memop the
      * wrong path executed without faulting (it is buffered, not real).  The WP
@@ -836,13 +844,13 @@ struct CPUState {
      */
     bool plugin_decode_only;
     /*
-     * Set while the guest virtual clock is paused for a wrong-path excursion
-     * (qemu_plugin_spec_vtime_pause/resume).  Keeps the pause idempotent and
-     * balanced across a fault-skip's spec_mode teardown/re-entry, so the
-     * excursion's host wall-clock time never leaks into the guest's
-     * architected counters.
+     * Set for the whole of a wrong-path excursion, from
+     * cpu_plugin_excursion_open() to cpu_plugin_excursion_close()
+     * (qemu_plugin_spec_vtime_pause/resume).  Makes the open idempotent and
+     * covers the excursion's edges, where plugin_spec_mode is still or
+     * already clear but the register snapshot is live.
      */
-    bool plugin_spec_vtime_paused;
+    bool plugin_excursion_active;
     /*
      * Nesting depth of qemu_plugin_vclock_pause/resume: freezes the guest
      * virtual clock while a plugin runs instrumentation work on the vCPU
@@ -852,7 +860,7 @@ struct CPUState {
      * cost exceeds the tick period, the next tick is already pending when
      * the handler returns and the guest collapses into a self-sustaining
      * tick/scheduler storm (RCU stall, zero foreground progress).  Composes
-     * with plugin_spec_vtime_paused: ticks re-enable only when BOTH say so.
+     * with plugin_excursion_active: ticks re-enable only when BOTH say so.
      */
     int plugin_vclock_depth;
     /*
@@ -882,9 +890,8 @@ struct CPUState {
      * recorded and compared the same way: the thread pointer alone cannot
      * separate two processes whose threads both read the same tp (no-TLS
      * static twins reading a fixed value), and two such twins running the
-     * same image at the same vaddrs collide on (pc, tp) exactly — witnessed
-     * live on the multiproc_r4_concurrent cell (dep_tp == cur_tp with
-     * different roots).  The address-space root is context-switched state
+     * same image at the same vaddrs collide on (pc, tp) exactly.  The
+     * address-space root is context-switched state
      * the kernel restores before the exception return, so a genuine resume
      * compares equal exactly as the thread pointer does.  Without the hook
      * both sides read 0 and the check degrades as before.

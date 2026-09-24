@@ -6,7 +6,6 @@
 #include "qemu/osdep.h"
 #include "disas/disas.h"
 #include "disas/capstone.h"
-#include "qemu/qemu-plugin.h"
 #include "exec/translator.h"
 #include "disas-internal.h"
 
@@ -97,5 +96,4 @@ char *plugin_disas(CPUState *cpu, const DisasContextBase *db,
     /* Return the buffer, freeing the GString container.  */
     return g_string_free(ds, false);
 }
-
 #endif /* CONFIG_PLUGIN */

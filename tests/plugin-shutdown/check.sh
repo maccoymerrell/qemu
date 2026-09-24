@@ -187,7 +187,6 @@ if ! run_cell wedge0 8 40 \
 else
     check    "origin"        "$(field "$d" origin)" -2
     check_ge "current"       "$(field "$d" current)" 0
-    say "    ok   delivered on a live vCPU"
 fi
 
 # ========================================================= cell: wedgeall ===
@@ -195,22 +194,25 @@ fi
 # ends.  The shutdown WAITS -- there is no expiry and no vCPU-less
 # fallback; a fixed deadlock needs no chaperone -- and the callback is
 # delivered in vCPU context the moment the stall ends (the probe releases
-# its wedge after wedgecap seconds).  Under the removed bounded wait this
-# cell exited at ten seconds with origin=-1; now it must outlive that
-# bound and close with origin=-2 on the unwedged vCPU.
+# its wedge wedgecap seconds after the stall begins, at the first block).
+# The shutdown therefore completes no earlier than the stall's end:
+# elapsed time after SIGTERM must cover the stall's remaining duration,
+# wedgecap - term_at, less a slack for boot before the first block.  The
+# callback closes with origin=-2 on the unwedged vCPU.
 say "cell wedgeall: with every vCPU stalled the shutdown waits out the stall"
 d="$OUT/wedgeall"; mkdir -p "$d"
-if ! run_cell wedgeall 8 90 \
+wa_term=8; wa_cap=30; wa_slack=7
+if ! run_cell wedgeall "$wa_term" 90 \
         "$QBIN" -nographic -m 256 -smp 1 -cpu Haswell \
-        -plugin "$PROBE,out=$d/probe.txt,wedge=on,wedgeafter=1,wedgecap=30"; then
-    say "    BAD  qemu never exited although the stall ended (wedgecap=30)"
+        -plugin "$PROBE,out=$d/probe.txt,wedge=on,wedgeafter=1,wedgecap=$wa_cap"; then
+    say "    BAD  qemu never exited although the stall ended (wedgecap=$wa_cap)"
     fails=$((fails + 1))
 else
     check    "origin"        "$(field "$d" origin)" -2
     check    "in_guest_insn" "$(field "$d" in_guest_insn)" 0
     check_ge "current"       "$(field "$d" current)" 0
-    check_ge "held past the retired 10s bound (s after SIGTERM)" \
-             "$(cat "$d/elapsed" 2>/dev/null)" 15
+    check_ge "waited out the stall (s after SIGTERM)" \
+             "$(cat "$d/elapsed" 2>/dev/null)" $((wa_cap - wa_term - wa_slack))
 fi
 
 say ""

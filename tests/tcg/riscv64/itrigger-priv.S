@@ -44,8 +44,8 @@
 #define EXPECT_DIFF     (2 * (ITER_BIG - ITER_SMALL))
 /*
  * Slack for the fixed cost either side of the loop: the privilege switch, the
- * ecall back, the trap handler and the tdata1 readback.  Two orders of
- * magnitude below the loop length, so a counted level and an uncounted one
+ * ecall back, the trap handler and the tdata1 readback.  About an eighth of
+ * the loop's instruction count, so a counted level and an uncounted one
  * cannot be confused.
  */
 #define TOL             512

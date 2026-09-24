@@ -2,8 +2,8 @@
  * The same rule on the wrong path: a speculative excursion's fault is not
  * the guest's.
  *
- * The faulting cm.jalt here sits on the not-taken side of a taken branch,
- * so the correct path never executes it and a correct run must reach the
+ * The faulting cm.jalt here sits at the target of a branch the correct
+ * path does not take, so the correct path never executes it and a correct run must reach the
  * end untouched.  A plugin's wrong-path excursion does execute it, and
  * host_sigbus_handler() must leave that excursion rather than queue a
  * guest signal -- a queued signal outlives the excursion and is delivered

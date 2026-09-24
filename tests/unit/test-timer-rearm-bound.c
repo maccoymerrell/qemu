@@ -6,14 +6,13 @@
  * a timer at a deadline that is already in the past hands the loop its own
  * input back.  The loop runs on the iothread holding the BQL, so a device
  * that does that stops the whole machine, and a running clock hides it (@now
- * moves and the loop ends by accident).  hw/timer/mips_gictimer.c did
- * exactly that and wedged 9 of 33 traced boots once a TCG plugin froze
- * QEMU_CLOCK_VIRTUAL.
+ * moves and the loop ends by accident; a frozen clock does not).
  *
  * These tests hold no clock still: they arm at a FIXED PAST TIMESTAMP, which
  * is expired against any current_time whatsoever, so they reproduce the
- * shape on a clock that is running as fast as it likes.  Each one loops
- * forever on a tree without the bound.
+ * shape on a clock that is running as fast as it likes.  Each checks that
+ * a callback re-arming into the past runs a bounded number of times per
+ * pass.
  *
  * Copyright (c) 2026 Maccoy Merrell
  *
@@ -52,7 +51,7 @@ static void cb_self(void *opaque)
     timer_mod_ns(&ta, PAST_NS);
 }
 
-/* The shape the previous bound did not cover: two devices arming EACH OTHER. */
+/* Two devices arming EACH OTHER into the past: the pair is bounded too. */
 static void cb_mutual_a(void *opaque)
 {
     n_a++;
@@ -93,9 +92,10 @@ static void test_self_rearm(void)
 
     /*
      * The callback ran, so the pass really did reach the mechanism -- and it
-     * ran a bounded number of times.  Two is what the deadline test costs:
+     * ran a bounded number of times.  The deadline test admits two runs:
      * the first re-arm may land later than the deadline it fired for (the
-     * timer can be run late), and the second cannot.
+     * timer can be run late), and the second cannot.  The ceiling of 8
+     * leaves headroom over that while still failing an unbounded loop.
      */
     g_assert_cmpuint(n_a, >, 0);
     g_assert_cmpuint(n_a, <, 8);
@@ -129,9 +129,8 @@ static void test_mutual_rearm(void)
  * sorts it BEHIND the timer that was already there, that timer runs next, and
  * only then does the offender's timer reach the head.
  *
- * The report must still name the offender.  Naming the bystander repeats, one
- * level down, the failure the whole bound was rewritten for: an alarm spent on
- * a device that is behaving.
+ * The report must still name the offender: an alarm spent on the bystander
+ * is an alarm spent on a device that is behaving.
  *
  * Asserted in a subprocess because the evidence is the warning on stderr.  The
  * two cases below read OPPOSITE values out of the same assertion, so neither
@@ -198,8 +197,8 @@ static void test_creeping_rearm(void)
 /*
  * The bound must not fire on a healthy device.  hw/timer/i8254.c's
  * pit_irq_timer catches up by re-arming at fired-for + period, strictly
- * forward, and an earlier version of this bound stopped it (and burned the
- * one warning the process prints on it).  Model that: a backlog of ten
+ * forward; the bound must neither stop it nor spend a warning on it.
+ * Model that: a backlog of ten
  * periods must be delivered as ten callbacks in ONE pass.
  */
 static unsigned n_catchup;

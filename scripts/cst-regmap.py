@@ -98,14 +98,9 @@ GDB_C_EXCLUDED = {
     'arm_gen_dynamic_m_secextreg_feature':
         'AArch32 M-profile; never registered on an AArch64 CPU',
     'riscv_gen_dynamic_csr_feature':
-        'the names are csr_ops[i].name for whichever CSRs the realized CPU\'s '
-        'predicates admit, with a printf fallback for the unnamed ones, so '
-        'the call site does not enumerate them and this scraper will not '
-        'guess. THE OLD REASON HERE IS NOW FALSE and is not kept: it said no '
-        'generic id routes through a CSR, and riscv64 now publishes REG_FCSR '
-        'and REG_VCTRL, which are exactly CSRs. Their VALUE therefore has no '
-        'route on this target -- both read w=0 on the wire -- and closing '
-        'that needs csr_ops[] read as a second name source here',
+        'names come from csr_ops[] filtered by the realized CPU\'s '
+        'predicates, with a printf fallback for unnamed CSRs: they are not '
+        'enumerable from the source',
 }
 
 FEATURE_RE = re.compile(r'<feature\s+name="([^"]+)"')
@@ -324,10 +319,9 @@ def scrape_gdb_c(root, rel, fn, text=None):
 def check_no_stray_gdb_sites(root, isa):
     """A C-built gdb feature this generator neither reads nor excludes.
 
-    The scraped site list is this generator's own assumption, and an
-    assumption that can go stale silently is the shape this tree keeps
-    paying for -- a target that grows a dynamic feature would drop a whole
-    register file onto the per-ISA fallback with nothing saying so.
+    The scraped site list is this generator's own assumption.  Without this
+    check a target that grows a dynamic feature would drop a whole register
+    file onto the per-ISA fallback with nothing saying so.
     """
     spec = GDB_TARGETS[isa]
     listed = {fn for _rel, fn in spec['csites']}
@@ -508,9 +502,8 @@ def qualified_key(key):
 def resolve_gdb_keys(path, isa, rows, universe):
     """Bind each TSV row to the (feature, name) pair it names.
 
-    A register spelled by exactly one feature is written plainly, the way
-    every row was before a second feature could declare one: `fpsr` when
-    only aarch64-fpu.xml declares it.  A register TWO features spell the
+    A register spelled by exactly one feature is written plainly: `fpsr`
+    when only aarch64-fpu.xml declares it.  A register TWO features spell the
     same way is written `feature:name`, because the two are different
     registers to qemu_plugin_get_registers() even though gdb spells them
     alike, and a plain row could only have named one of them.
@@ -566,9 +559,8 @@ def check_route_adjudications(path, isa, rows):
     An id with several names is not a spelling choice.  x86's REG_CTRL is
     carried by cr0, cr2, cr3, cr4, cr8 and efer.  Reading the wrong one
     publishes a different register's bytes under the id's name, and reading
-    half a container publishes a partial value as a whole one -- which is
-    what MIPS hi and lo did for as long as they shared REG_ACC0, and why
-    they no longer do.  Neither is something a generator may pick, so the pick is
+    half a container publishes a partial value as a whole one.  Neither is
+    something a generator may pick, so the pick is
     a row in the table with a ground behind it, and this refuses the build
     when an ambiguous id has not been adjudicated.
 
@@ -623,8 +615,8 @@ def emit_gdb(isa, rows, out):
     lines.append(' * contrib/plugins/champsim_tracer/regmap/%s.gdb.tsv.' % isa)
     lines.append(' * DO NOT EDIT: change the TSV or the generator.')
     lines.append(' *')
-    lines.append(' * The gdbstub spelling of this target\'s CORE register')
-    lines.append(' * feature, joined to the wire\'s generic ids.  This is the')
+    lines.append(' * The gdbstub spelling of this target\'s register')
+    lines.append(' * features, joined to the wire\'s generic ids.  This is the')
     lines.append(' * namespace qemu_plugin_get_registers() hands a plugin, so')
     lines.append(' * it is the namespace a VALUE READ resolves through.')
     lines.append(' */')

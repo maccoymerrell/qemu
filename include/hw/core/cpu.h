@@ -702,7 +702,8 @@ struct CPUState {
      *
      * These exist because a REP is not always translated as a loop.
      * do_gen_rep() emits exactly one iteration whenever CF_USE_ICOUNT,
-     * CF_SINGLE_STEP, EFLAGS.TF or the interrupt shadow is in effect, and
+     * CF_SINGLE_ITER, CF_SINGLE_STEP, EFLAGS.TF or the interrupt shadow
+     * is in effect, and
      * a mid-instruction exception splits an already-looping REP the same
      * way.  A count inferred from delivered memory-op callbacks therefore
      * changes with the setting; these do not.  Read through

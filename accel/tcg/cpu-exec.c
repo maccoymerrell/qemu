@@ -822,6 +822,11 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
         tcg_ctx_drop_gen_tb();
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        /* A yield is a block that ran: see cpu_plugin_exec_tb. */
+        if (cpu->plugin_spec_mode && cpu->exception_index == EXCP_YIELD) {
+            cpu->exception_index = -1;
+            return true;
+        }
         return false;
     }
 }
@@ -834,9 +839,19 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
  * exec-cb udata.  The plugin is responsible for keeping its own state
  * separated (e.g. early-out for spec-mode invocations of CP-only state
  * mutations, and saving/restoring scoreboard slots clobbered by inline
- * stores around spec-mode entry).  CF_SINGLE_STEP prevents rep-prefixed
- * instructions from looping internally.  Returns true on success, false
- * on failure (e.g. unmapped PC, exception).
+ * stores around spec-mode entry).  Returns true on success, false on
+ * failure (e.g. unmapped PC, exception).
+ *
+ * The block must hand control back after bounded work, so it is built
+ * unchained (CF_NO_GOTO_TB | CF_NO_GOTO_PTR: the TB exits to this caller
+ * instead of jumping to its successor) and with CF_SINGLE_ITER, which
+ * makes a self-looping instruction (x86 REP) retire one iteration per
+ * block instead of ploughing through its whole count inside one TB.
+ * Nothing else about the translation changes: in particular it is NOT
+ * CF_SINGLE_STEP, which means "gdb is single-stepping" and which a
+ * translator may honour by relaxing rules the correct path obeys (MIPS
+ * lets such a block run on past a page boundary to keep a branch with its
+ * delay slot).  A wrong-path block ends where the correct path's would.
  */
 bool cpu_plugin_exec_tb(CPUState *cpu)
 {
@@ -852,7 +867,7 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
 
     cflags = curr_cflags(cpu);
     cflags &= ~CF_PARALLEL;
-    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP;
+    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_ITER;
 
     if (cpu->plugin_spec_mode) {
         cflags |= CF_FORCE_SLOW;
@@ -1004,6 +1019,21 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         tcg_ctx_drop_gen_tb();
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        /*
+         * EXCP_YIELD is not a fault: the instruction gave the CPU back with
+         * its architectural state consistent at the PC it restored, and
+         * there is nothing to deliver -- in the main loop it only ends the
+         * slice.  A restartable instruction bounding its own wrong-path
+         * work leaves this way (the FEAT_MOPS Main forms, see
+         * mops_spec_yield() in target/arm/tcg/helper-a64.c), so the block
+         * counts as executed and the walker continues from that PC, which
+         * re-executes the instruction.  Consume the index so nothing
+         * outlives the block.
+         */
+        if (cpu->plugin_spec_mode && cpu->exception_index == EXCP_YIELD) {
+            cpu->exception_index = -1;
+            return true;
+        }
         return false;
     }
 }

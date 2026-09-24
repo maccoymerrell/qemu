@@ -1732,7 +1732,11 @@ bool qemu_plugin_exec_inline_insn(void);
  * end of the block went.
  *
  * Returns true on success, false on failure (e.g. unmapped address,
- * exception during execution).
+ * exception during execution).  A block that ends with an internal
+ * yield (EXCP_YIELD — e.g. an AArch64 MOPS Main form reaching its
+ * per-call wrong-path bound, or a YIELD instruction) counts as a block
+ * that ran and returns true; the PC rests where a genuine partial
+ * completion would leave it.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_exec_tb(void);
@@ -2034,8 +2038,9 @@ uint32_t qemu_plugin_fault_depth(void);
  * delivered instrumentation callbacks.
  *
  * This distinction is load-bearing because a REP is not always translated as
- * a loop: exactly one iteration is generated whenever CF_USE_ICOUNT or
- * CF_SINGLE_STEP is in the TB's cflags, or EFLAGS.TF or the interrupt shadow
+ * a loop: exactly one iteration is generated whenever CF_USE_ICOUNT,
+ * CF_SINGLE_ITER or CF_SINGLE_STEP is in the TB's cflags, or EFLAGS.TF or
+ * the interrupt shadow
  * is set, and an exception or interrupt taken between iterations splits an
  * already-looping REP the same way.  A tracer that inferred the iteration
  * count from how many memory-op callbacks arrived in one execution would

@@ -1664,39 +1664,80 @@ static uint64_t arm_reg_or_xzr(CPUARMState *env, int reg)
 }
 
 /*
- * Wrong-path speculation size bound for the FEAT_MOPS bulk set/copy
- * helpers (SETP/SETM/SETE, CPYP/CPYM/CPYE).  On the plugin's
- * speculative wrong path the size register holds garbage left by the
- * mispredicted flow, so the page-at-a-time loop in do_setm()/
- * do_cpym() would iterate for billions of bytes entirely inside one
- * TCG helper — the plugin never regains control to bound it, unlike
- * x86 REP which QEMU single-steps.  (Sandboxing of the individual
- * byte accesses is handled generically by tlb_vaddr_to_host()
- * returning NULL in spec mode; this only bounds the *iteration
- * count*, which is MOPS-specific because no other ISA has a single
- * instruction looping a 64-bit register-sized memory op.)  The clamp
- * IS visible on the wire: a wrong-path MOPS triple publishes at most
- * MOPS_SPEC_MAX_BYTES of memops where the correct path at the same
- * pcs publishes the architectural size (measured: 256 B against
- * 0x2040 B).  That is an accepted WP/CP-equivalence gap, not a
- * transparent bound; the honest fix is a budget-derived or
- * page-multiple ceiling.  Sub-page also keeps do_sete()/do_cpye()'s
- * "< page" epilogue invariant intact.  No effect on the correct
- * path.
+ * Wrong-path iteration bound for the FEAT_MOPS bulk set/copy helpers.
+ * On the plugin's speculative wrong path the size register holds whatever
+ * the mispredicted flow left there, so the Main forms (SETM/SETGM, CPYM/
+ * CPYFM), which loop over every full page of the operation inside one TCG
+ * helper call, could run for billions of bytes before the plugin regains
+ * control -- unlike x86 REP, which the wrong-path block translates one
+ * iteration at a time (CF_SINGLE_ITER).  The Prologue and Epilogue forms
+ * need no bound: this implementation's prologue stops at the next page
+ * boundary and its epilogue UDEFs on a size of a page or more, so each of
+ * them already moves less than a page per execution.  (Sandboxing of the
+ * individual accesses is handled generically by tlb_vaddr_to_host()
+ * returning NULL in spec mode; this bounds only the iteration count.)
+ *
+ * The bound bounds per-call ITERATION, never the operation's size.  A Main
+ * form executing on the wrong path gives the CPU back once it has moved
+ * MOPS_SPEC_MAX_BYTES in this execution and work remains, and it leaves
+ * the way the correct path leaves when an exit is requested mid-operation:
+ * Xn already holds the true remaining size (reduced by exactly the bytes
+ * done), Xd/Xs keep the Option A final addresses so the next address is
+ * Xd + Xn, and the PC is restored to the instruction itself, which
+ * re-executes and continues.  That is an architecturally reachable partial
+ * state -- the one an interrupt taken between two steps produces -- so the
+ * rest of the excursion runs from a state real execution can be in, and
+ * each re-execution is one more block the wrong-path budget counts.  The
+ * exit is marked EXCP_YIELD ("this instruction gave the CPU back; its
+ * state is consistent at the restored PC; nothing to deliver"), which
+ * cpu_plugin_exec_tb()/cpu_plugin_exec_inline() treat as a block that ran
+ * rather than a fault.  What reaches the wire is therefore the true
+ * operation, published in execution-sized pieces; the bound's only
+ * visible effect is where the pieces are cut.  The ceiling is one page,
+ * the unit these Main forms already work in, so a wrong-path Main
+ * execution moves what a correct-path one interrupted after its first
+ * page would, and no wrong-path MOPS execution of any form moves more
+ * than a page.  The bound sits after every
+ * architectural check, so it never pre-empts a UDEF (the Epilogue size
+ * check included).  No effect on the correct path.
  */
 #ifdef CONFIG_PLUGIN
-#define MOPS_SPEC_MAX_BYTES 256
-static inline uint64_t mops_spec_clamp(CPUARMState *env, uint64_t size)
+#define MOPS_SPEC_MAX_BYTES ((uint64_t)TARGET_PAGE_SIZE)
+
+/* How much of @want this wrong-path execution may still move. */
+static inline uint64_t mops_spec_room(CPUARMState *env, uint64_t want,
+                                      uint64_t moved)
 {
     if (unlikely(env_cpu(env)->plugin_spec_mode)) {
-        return MIN(size, (uint64_t)MOPS_SPEC_MAX_BYTES);
+        return MIN(want, MOPS_SPEC_MAX_BYTES - moved);
     }
-    return size;
+    return want;
+}
+
+/*
+ * True when a wrong-path execution has used its bound and must give the
+ * CPU back; the caller then leaves through cpu_loop_exit_restore().
+ */
+static inline bool mops_spec_yield(CPUARMState *env, uint64_t moved)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (unlikely(cs->plugin_spec_mode) && moved >= MOPS_SPEC_MAX_BYTES) {
+        cs->exception_index = EXCP_YIELD;
+        return true;
+    }
+    return false;
 }
 #else
-static inline uint64_t mops_spec_clamp(CPUARMState *env, uint64_t size)
+static inline uint64_t mops_spec_room(CPUARMState *env, uint64_t want,
+                                      uint64_t moved)
 {
-    return size;
+    return want;
+}
+
+static inline bool mops_spec_yield(CPUARMState *env, uint64_t moved)
+{
+    return false;
 }
 #endif
 
@@ -1734,7 +1775,6 @@ static void do_setp(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
             setsize &= ~0xf;
         }
     }
-    setsize = mops_spec_clamp(env, setsize);
 
     if (unlikely(is_setg)) {
         check_setg_alignment(env, toaddr, setsize, memidx, ra);
@@ -1788,7 +1828,7 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     uint64_t toaddr = env->xregs[rd] + env->xregs[rn];
     uint64_t setsize = -env->xregs[rn];
     uint32_t memidx = FIELD_EX32(mtedesc, MTEDESC, MIDX);
-    uint64_t step, stagesetsize;
+    uint64_t step, stagesetsize, moved = 0;
 
     check_mops_enabled(env, ra);
 
@@ -1802,8 +1842,6 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
         mops_plugin_complete(env);
         return;
     }
-
-    setsize = mops_spec_clamp(env, setsize);
 
     check_mops_wrong_option(env, syndrome, ra);
 
@@ -1825,13 +1863,17 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     mops_plugin_entry(env);
     stagesetsize = setsize & TARGET_PAGE_MASK;
     while (stagesetsize > 0) {
-        step = stepfn(env, toaddr, stagesetsize, data, memidx, &mtedesc, ra);
+        step = stepfn(env, toaddr, mops_spec_room(env, stagesetsize, moved),
+                      data, memidx, &mtedesc, ra);
         mops_plugin_bytes(env, step);
+        moved += step;
         toaddr += step;
         setsize -= step;
         stagesetsize -= step;
         env->xregs[rn] = -setsize;
-        if (stagesetsize > 0 && unlikely(cpu_loop_exit_requested(cs))) {
+        if (stagesetsize > 0 &&
+            unlikely(cpu_loop_exit_requested(cs) ||
+                     mops_spec_yield(env, moved))) {
             /* QEMU's own re-entry of this instruction, not the guest's:
              * the next execution continues it rather than beginning it. */
             mops_plugin_reenter(env);
@@ -1876,8 +1918,6 @@ static void do_sete(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
         mops_plugin_complete(env);
         return;
     }
-
-    setsize = mops_spec_clamp(env, setsize);
 
     check_mops_wrong_option(env, syndrome, ra);
 
@@ -2243,7 +2283,6 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
             copysize = INT64_MAX;
         }
     }
-    copysize = mops_spec_clamp(env, copysize);
 
     if (!mte_checks_needed(fromaddr, rdesc)) {
         rdesc = 0;
@@ -2331,7 +2370,7 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     uint32_t rmemidx = FIELD_EX32(rdesc, MTEDESC, MIDX);
     uint32_t wmemidx = FIELD_EX32(wdesc, MTEDESC, MIDX);
     bool forwards = true;
-    uint64_t toaddr, fromaddr, copysize, step;
+    uint64_t toaddr, fromaddr, copysize, step, moved = 0;
 
     check_mops_enabled(env, ra);
 
@@ -2368,36 +2407,41 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     }
 
     /* Our implementation has no particular parameter requirements for CPYM */
-    copysize = mops_spec_clamp(env, copysize);
 
     /* Do the actual memmove */
     mops_plugin_entry(env);
     if (forwards) {
         while (copysize >= TARGET_PAGE_SIZE) {
-            step = copy_step(env, toaddr, fromaddr, copysize,
+            step = copy_step(env, toaddr, fromaddr,
+                             mops_spec_room(env, copysize, moved),
                              wmemidx, rmemidx, &wdesc, &rdesc, ra);
             mops_plugin_bytes(env, step);
+            moved += step;
             toaddr += step;
             fromaddr += step;
             copysize -= step;
             env->xregs[rn] = -copysize;
             if (copysize >= TARGET_PAGE_SIZE &&
-                unlikely(cpu_loop_exit_requested(cs))) {
+                unlikely(cpu_loop_exit_requested(cs) ||
+                         mops_spec_yield(env, moved))) {
                 mops_plugin_reenter(env);
                 cpu_loop_exit_restore(cs, ra);
             }
         }
     } else {
         while (copysize >= TARGET_PAGE_SIZE) {
-            step = copy_step_rev(env, toaddr, fromaddr, copysize,
+            step = copy_step_rev(env, toaddr, fromaddr,
+                                 mops_spec_room(env, copysize, moved),
                                  wmemidx, rmemidx, &wdesc, &rdesc, ra);
             mops_plugin_bytes(env, step);
+            moved += step;
             toaddr -= step;
             fromaddr -= step;
             copysize -= step;
             env->xregs[rn] = copysize;
             if (copysize >= TARGET_PAGE_SIZE &&
-                unlikely(cpu_loop_exit_requested(cs))) {
+                unlikely(cpu_loop_exit_requested(cs) ||
+                         mops_spec_yield(env, moved))) {
                 mops_plugin_reenter(env);
                 cpu_loop_exit_restore(cs, ra);
             }
@@ -2463,8 +2507,6 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     if (!mte_checks_needed(toaddr, wdesc)) {
         wdesc = 0;
     }
-
-    copysize = mops_spec_clamp(env, copysize);
 
     /* Check the size; we don't want to have do a check-for-interrupts */
     if (copysize >= TARGET_PAGE_SIZE) {

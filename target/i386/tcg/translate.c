@@ -1466,10 +1466,13 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
      * Check if we must translate a single iteration only.  Normally, HF_RF_MASK
      * would also limit translation blocks to one instruction, so that gen_eob
      * can reset the flag; here however RF is set throughout the repetition, so
-     * we can plow through until CX/ECX/RCX is zero.
+     * we can plow through until CX/ECX/RCX is zero.  CF_SINGLE_ITER asks
+     * for exactly this and nothing else (a wrong-path block, which must
+     * return to its caller after bounded work).
      */
     bool can_loop =
-        (!(tb_cflags(s->base.tb) & (CF_USE_ICOUNT | CF_SINGLE_STEP))
+        (!(tb_cflags(s->base.tb) &
+           (CF_USE_ICOUNT | CF_SINGLE_STEP | CF_SINGLE_ITER))
 	 && !(s->flags & (HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
     bool had_rf = s->flags & HF_RF_MASK;
 

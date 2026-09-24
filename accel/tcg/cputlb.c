@@ -1173,7 +1173,7 @@ void cpu_plugin_spec_tlb_note(CPUState *cpu)
  * Nor can the excursion's OWN jump-cache entries be served to the correct
  * path: tb_lookup() validates a jump-cache hit against pc, cs_base, flags AND
  * cflags, and every wrong-path TB carries CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
- * CF_SINGLE_STEP (plus CF_FORCE_SLOW in spec mode), a combination the correct
+ * CF_SINGLE_ITER (plus CF_FORCE_SLOW in spec mode), a combination the correct
  * path never requests -- such an entry misses and is overwritten.  Adding the
  * clear here would therefore buy nothing and would discard correct-path
  * translations on every excursion.

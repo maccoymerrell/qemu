@@ -3134,6 +3134,22 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
  * read as HF_CS64 to choose sixteen XMM registers or eight -- a translation
  * flag, so the translator holds it exactly.
  *
+ * THE DATUM IS THE REGISTER THE ACCESS MOVES, WHERE THERE IS ONE REGISTER.
+ * Each row names it (X86_AREA_DATUM_*): the control word is fpuc, the tag
+ * word fptag, an XMM half or a YMM-high half the xmm register that holds it
+ * (the declared container is the whole ZMM register, so both halves of the
+ * low 128 bits and both halves of the high 128 bits name the same register,
+ * in that order, and a consumer reads their lanes off that order), an MPX
+ * bound half its bndN_lb / bndN_ub.  The status word is fpus with TOP folded
+ * in from fpstt; the row names fpus, and both are the same wire register.
+ * A row that moves no ONE register names none, and each such row says why:
+ * the x87 data rows (ST(i) is fpregs[(fpstt + i) & 7], a register chosen by
+ * TOP at execution, so no decode site can name it), the pointer rows (the
+ * save writes constant zeros; the restore reads none), MXCSR and MXCSR_MASK
+ * and PKRU and the BNDCSR pair (fields of CPUX86State no declared register
+ * file or TCG global names), and the XSAVE header (the component bitmap, not
+ * register state).
+ *
  * Returns the number of rows written, or 0 if @max cannot hold them all: a
  * partial account would state a maximum smaller than the helper performs.
  */
@@ -3144,29 +3160,37 @@ typedef struct X86AreaRows {
     unsigned n, max;
 } X86AreaRows;
 
-static void x86_area_row(X86AreaRows *r, unsigned dir, unsigned size,
-                         unsigned offset)
+static void x86_area_row_d(X86AreaRows *r, unsigned dir, unsigned size,
+                           unsigned offset, unsigned datum)
 {
     if (r->n < r->max) {
         r->out[r->n].dir = dir;
         r->out[r->n].size = size;
         r->out[r->n].offset = offset;
+        r->out[r->n].datum = datum;
     }
     r->n++;
+}
+
+static void x86_area_row(X86AreaRows *r, unsigned dir, unsigned size,
+                         unsigned offset)
+{
+    x86_area_row_d(r, dir, size, offset, X86_AREA_DATUM_NONE);
 }
 
 /* do_xsave_fpu / do_xrstor_fpu, including do_fstt / do_fldt per register. */
 static void x86_area_fpu(X86AreaRows *r, unsigned dir)
 {
-    x86_area_row(r, dir, 2, XO(legacy.fcw));
-    x86_area_row(r, dir, 2, XO(legacy.fsw));
-    x86_area_row(r, dir, 2, XO(legacy.ftw));
+    x86_area_row_d(r, dir, 2, XO(legacy.fcw), X86_AREA_DATUM_FPUC);
+    x86_area_row_d(r, dir, 2, XO(legacy.fsw), X86_AREA_DATUM_FPUS);
+    x86_area_row_d(r, dir, 2, XO(legacy.ftw), X86_AREA_DATUM_FPTAG);
     if (dir == INSN_DF_WR) {
         /* The save writes fpip and fpdp (as zeros); the restore reads neither. */
         x86_area_row(r, dir, 8, XO(legacy.fpip));
         x86_area_row(r, dir, 8, XO(legacy.fpdp));
     }
     for (unsigned i = 0; i < 8; i++) {
+        /* ST(i): which physical register is TOP's, at execution. */
         x86_area_row(r, dir, 8, XO(legacy.fpregs) + 16 * i);
         x86_area_row(r, dir, 2, XO(legacy.fpregs) + 16 * i + 8);
     }
@@ -3181,13 +3205,26 @@ static void x86_area_mxcsr(X86AreaRows *r, unsigned dir)
     }
 }
 
-/* do_xsave_sse / do_xrstor_sse and the YMM-high halves: two quadwords each. */
+/*
+ * do_xsave_sse / do_xrstor_sse and the YMM-high halves (two quadwords of
+ * xmm register i each), and the MPX bound registers (lower then upper bound,
+ * which QEMU keeps as two registers).
+ */
 static void x86_area_regs16(X86AreaRows *r, unsigned dir, unsigned base,
                             unsigned nregs)
 {
     for (unsigned i = 0; i < nregs; i++) {
-        x86_area_row(r, dir, 8, base + 16 * i);
-        x86_area_row(r, dir, 8, base + 16 * i + 8);
+        x86_area_row_d(r, dir, 8, base + 16 * i, X86_AREA_DATUM_XMM0 + i);
+        x86_area_row_d(r, dir, 8, base + 16 * i + 8, X86_AREA_DATUM_XMM0 + i);
+    }
+}
+
+static void x86_area_bnd(X86AreaRows *r, unsigned dir, unsigned base)
+{
+    for (unsigned i = 0; i < 4; i++) {
+        x86_area_row_d(r, dir, 8, base + 16 * i, X86_AREA_DATUM_BND0 + 2 * i);
+        x86_area_row_d(r, dir, 8, base + 16 * i + 8,
+                       X86_AREA_DATUM_BND0 + 2 * i + 1);
     }
 }
 
@@ -3225,8 +3262,8 @@ unsigned x86_state_area_accesses(X86StateArea kind, bool code64,
             x86_area_regs16(&r, INSN_DF_WR, XO(avx_state), nb_xmm);
         }
         if (c & XSTATE_BNDREGS_MASK) {
-            x86_area_regs16(&r, INSN_DF_WR, XO(bndreg_state) +
-                            offsetof(XSaveBNDREG, bnd_regs), 4);
+            x86_area_bnd(&r, INSN_DF_WR, XO(bndreg_state) +
+                         offsetof(XSaveBNDREG, bnd_regs));
         }
         if (c & XSTATE_BNDCSR_MASK) {
             x86_area_row(&r, INSN_DF_WR, 8, XO(bndcsr_state) +
@@ -3257,8 +3294,8 @@ unsigned x86_state_area_accesses(X86StateArea kind, bool code64,
             x86_area_regs16(&r, INSN_DF_RD, XO(avx_state), nb_xmm);
         }
         if (c & XSTATE_BNDREGS_MASK) {
-            x86_area_regs16(&r, INSN_DF_RD, XO(bndreg_state) +
-                            offsetof(XSaveBNDREG, bnd_regs), 4);
+            x86_area_bnd(&r, INSN_DF_RD, XO(bndreg_state) +
+                         offsetof(XSaveBNDREG, bnd_regs));
         }
         if (c & XSTATE_BNDCSR_MASK) {
             x86_area_row(&r, INSN_DF_RD, 8, XO(bndcsr_state) +

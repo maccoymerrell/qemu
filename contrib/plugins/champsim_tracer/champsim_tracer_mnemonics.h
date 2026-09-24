@@ -280,6 +280,19 @@ typedef struct InsnFields {
     uint64_t *load_addr_dep_mask;   /* [max_dep_loads] */
     uint64_t *store_addr_dep_mask;  /* [max_dep_stores] */
     /*
+     * A memop's rank among the accesses that STATE the same register as
+     * their datum (qemu_plugin_insn_memop_datum): the k-th access of a
+     * register is its k-th lane in slot order.  LANE_RANK_NONE where the
+     * access states no datum, and the lane derivation falls back to the
+     * rank read off the dependency masks.  The two agree wherever every
+     * access of the register is stated and nothing else feeds it; they part
+     * where an unstated access also feeds the register -- an x86 XRSTOR's
+     * header read feeds every register it restores and is none of their
+     * lanes.
+     */
+    uint8_t  *load_lane_rank;       /* [max_dep_loads] */
+    uint8_t  *store_lane_rank;      /* [max_dep_stores] */
+    /*
      * Lane participation (CST_INSN_FLAG_VEC).  Unified runtime path:
      * the refiner picks lane_mask_kind + baseline data; the exec-time
      * FID extractor dispatches on it to compute the lane bitmap and
@@ -359,6 +372,8 @@ typedef struct InsnFields {
     uint8_t  rep_memops_per_iter;
 } InsnFields;
 
+#define LANE_RANK_NONE 0xffu
+
 /* Row @i of a register dep-mask family (dst_dep_mask / store_data_dep_mask). */
 static inline uint64_t *dep_row(uint64_t *base, const InsnFields *f, unsigned i)
 {
@@ -391,6 +406,8 @@ typedef struct InsnFieldsScratch {
     uint64_t store_addr_dep_mask[MAX_STORES];
     uint64_t src_lane_mask[MAX_SRC_REGS];
     uint64_t dst_lane_mask[MAX_DST_REGS];
+    uint8_t  load_lane_rank[MAX_LOADS];
+    uint8_t  store_lane_rank[MAX_STORES];
 } InsnFieldsScratch;
 
 static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
@@ -405,6 +422,10 @@ static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
     s->f.store_addr_dep_mask = s->store_addr_dep_mask;
     s->f.src_lane_mask       = s->src_lane_mask;
     s->f.dst_lane_mask       = s->dst_lane_mask;
+    memset(s->load_lane_rank, LANE_RANK_NONE, sizeof(s->load_lane_rank));
+    memset(s->store_lane_rank, LANE_RANK_NONE, sizeof(s->store_lane_rank));
+    s->f.load_lane_rank      = s->load_lane_rank;
+    s->f.store_lane_rank     = s->store_lane_rank;
 }
 
 

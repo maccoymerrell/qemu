@@ -531,6 +531,21 @@ naturally aligned pieces of at most 16 bytes for exactly this reason
 (``arm_plugin_bulk_mem_cb``, ``docs/qemu_modifications.rst``).  What
 those families do run into is the slot ceiling below, not this one.
 
+**x86 state saves name the XMM, control-word and bound registers, not the
+whole state.**  An ``FXSAVE``/``XSAVE`` store and an ``FXRSTOR``/
+``XRSTOR`` load name their register where the access moves one register
+QEMU declares.  Four kinds do not.  The x87 data rows move ``ST(i)``,
+which is ``fpregs[(TOP + i) & 7]`` and so depends on ``TOP`` at
+execution, where no decode site can name it.  ``MXCSR``, ``PKRU`` and the
+``BNDCSR`` pair are fields no declared register or TCG global names.  The
+pointer words are constant zeros on a save.  The ``XSAVE`` header is the
+component bitmap, not register state.  Their stores publish an empty
+store-data mask.  Their loads feed every destination the instruction
+names, with no lane.  The x87 stack registers, ``MXCSR`` and ``PKRU``
+are not among an ``FXRSTOR``/``XRSTOR``'s destinations.  The status
+word's row names ``fpus``; ``TOP`` is kept in ``fpstt``, which maps to
+the same wire register.
+
 **RISC-V V register groups are mapped through their base register.**
 A unit-stride ``vle<eew>.v`` / ``vse<eew>.v`` names the register group
 by its base, so the lane masks map the elements of the base register;

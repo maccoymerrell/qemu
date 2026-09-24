@@ -2583,7 +2583,7 @@ Guest threads in user mode
 
    The dataflow extractor's per-translation scratch — the provenance
    table, the env-offset table, the interned field slots and the
-   ``InsnDataflow`` result array, 376 KiB in total — hangs off the
+   ``InsnDataflow`` result array, about 1.5 MiB in total — hangs off the
    ``TCGContext``, allocated on that context's first translation and
    reused for every later one.  It sits beside ``plugin_tb`` in the same
    struct and on the same terms: allocated lazily, cleared but not freed
@@ -2620,6 +2620,37 @@ Guest threads in user mode
    it prevents — it leaves the great majority of a 256 KiB guest-thread
    stack for the stack — and raising it is a deliberate act that belongs
    with a re-measured multithreaded guest run.
+
+``InsnDataflow::fields`` (``include/exec/insn-dataflow.h``, ``accel/tcg/insn-dataflow.c``)
+
+   An instruction's interned field rows live inline, sixteen of them,
+   which covers everything but the x86 state saves.  ``FXSAVE`` names
+   the control and status words, the tag word and sixteen XMM registers;
+   ``XSAVE`` adds the YMM upper halves and the bound registers.  So that
+   each of those rows can name the register it moves, an instruction
+   whose rows overflow the inline array moves them into a per-block pool
+   of up to ``INSN_DF_MAX_FIELDS_WIDE`` (64) rows, drawn from
+   ``INSN_DF_MAX_WIDE_FIELD_ROWS`` (256) per translation.  The pool is
+   reset with the rest of the scratch on the block's first instruction.
+   An instruction that outgrows even the wide budget is refused exactly
+   as one that outgrew sixteen was before, so a budget that is too small
+   shows up as a refusal and never as a lost row.
+
+``x86_state_area_accesses()`` (``target/i386/tcg/fpu_helper.c``, ``decode-new.c.inc``)
+
+   Each save-area row now carries the register it moves: the
+   ``X86_AREA_DATUM_*`` value in ``helper-tcg.h`` is resolved at the
+   decode site to the interned field (``fpuc``, ``fpus``, ``fptag``,
+   ``xmm0`` .. ``xmm15``, ``bnd0_lb`` .. ``bnd3_ub``) and stated through
+   ``insn_dataflow_note_helper_accesses_datum()``.  With that
+   statement, a save's stores take their store data from that register,
+   and a restore's loads name it as their destination.  The block also
+   states its vector shape, 64-bit units with 16 or 32 lanes per
+   register, so each access maps to a lane of its register.  Rows that
+   name no register are listed in ``limitations.rst``: the ST(i) stack
+   slots, which are relative to TOP; ``MXCSR`` and its mask; ``PKRU``;
+   ``BNDCSR``; the FPU instruction and data pointers; and the XSAVE
+   header.  They stay unassociated, which is the pessimistic direction.
 
 Deterministic guest input (linux-user)
 --------------------------------------

@@ -21,6 +21,10 @@ architecture defines for it:
            belongs to the group named by vd, lane k.  Only the lanes of the
            base register are checkable, because the wire names the group by
            its base register.
+  x86_64   FXSAVE/FXRSTOR/XSAVE/XSAVEOPT/XRSTOR (x86_64 argument; not wired
+           into cmd_validate, whose generated programs carry none): the XMM
+           area's quadword at +160 + 16*i + 8*h is xmm i lane h, XSAVE's AVX
+           area's at +576 + 16*i + 8*h is xmm i lane 2 + h.
 
 Both correct-path and wrong-path renderings are scored.  An access that the
 renderer placed under no register is WRONG, not skipped: an unassociated
@@ -43,6 +47,11 @@ ISAS = ("aarch64", "riscv64")
 
 _LD = re.compile(r'ld\[[^\]]*\]\((0x[0-9a-f]+)\)(\{[0-9.,]*\})?')
 _ST = re.compile(r'st\[[^\]]*\]\((0x[0-9a-f]+)\)(\{[0-9.,]*\})?')
+# An access with no static slot renders bare: "ld(0x..,w8)" / "st(0x..)".
+# It is on the wire and associated with nothing, so it is a subject's access
+# too -- a refused instruction renders every access this way.
+_LD_BARE = re.compile(r'\bld\((0x[0-9a-f]+)')
+_ST_BARE = re.compile(r'\bst\((0x[0-9a-f]+)')
 _HEAD = re.compile(r'^0x([0-9a-f]+)(?: <[^>]*>)?:\s+((?:[0-9a-f]{2} )+)\s')
 
 
@@ -81,6 +90,36 @@ def _rv_subject(word: int) -> dict | None:
         return None
     return dict(rt=(word >> 7) & 31, selem=1, esize=eew, load=(op == 0x07),
                 rv=True)
+
+
+def _x86_subject(bs: bytes) -> dict | None:
+    """x86 FXSAVE/FXRSTOR/XSAVE/XSAVEOPT/XRSTOR with a memory operand.
+    Their XMM rows are the subject: the XMM area at +160 holds register i's
+    low and high quadwords (lanes 0, 1), and XSAVE's AVX area at +576 its
+    YMM-high quadwords (lanes 2, 3)."""
+    i = 0
+    while i < len(bs) and (bs[i] in (0x66, 0xf2, 0xf3) or
+                           0x40 <= bs[i] <= 0x4f):
+        i += 1
+    if bs[i:i + 2] != b'\x0f\xae' or i + 2 >= len(bs):
+        return None
+    modrm = bs[i + 2]
+    if modrm >> 6 == 3:
+        return None
+    op = (modrm >> 3) & 7
+    if op not in (0, 1, 4, 5, 6):
+        return None
+    return dict(x86=True, load=op in (1, 5), xsave=op in (4, 5, 6))
+
+
+def _x86_want(off: int, sub: dict):
+    """(register, lane) the architecture puts at area offset @off, or None
+    for a row that is not an XMM/YMM half."""
+    if 160 <= off < 160 + 16 * 16:
+        return (off - 160) // 16, ((off - 160) % 16) // 8
+    if sub['xsave'] and 576 <= off < 576 + 16 * 16:
+        return (off - 576) // 16, 2 + ((off - 576) % 16) // 8
+    return None
 
 
 def _groups(body: str, sub: dict) -> list[tuple[int, list]]:
@@ -123,16 +162,24 @@ def score_lines(lines, isa: str) -> LaneReport:
         if not m:
             continue
         bs = bytes.fromhex(m.group(2).replace(' ', ''))
-        if len(bs) != 4:
+        if isa == 'x86_64':
+            sub = _x86_subject(bs)
+        elif len(bs) != 4:
             continue
-        sub = subject_of(int.from_bytes(bs, 'little'))
+        else:
+            sub = subject_of(int.from_bytes(bs, 'little'))
         if not sub:
+            continue
+        if sub.get('x86'):
+            _score_x86(line, sub, m, bs, rep)
             continue
         body = line.split('  ; deps:')[0]
         gs = _groups(body, sub)
         placed = [a for _, ms in gs for a, _ in ms]
         every = {int(a, 16)
                  for a, _ in (_LD if sub['load'] else _ST).findall(body)}
+        every |= {int(a, 16) for a in
+                  (_LD_BARE if sub['load'] else _ST_BARE).findall(body)}
         if not placed and not every:
             continue
         rep.subjects += 1
@@ -172,6 +219,47 @@ def score_lines(lines, isa: str) -> LaneReport:
                         f"{sorted(ln) if ln else None} want %v{want_reg} "
                         f"lane {want_lane}")
     return rep
+
+
+def _score_x86(line: str, sub: dict, m, bs: bytes, rep: 'LaneReport') -> None:
+    body = line.split('  ; deps:')[0]
+    gs = _groups(body, sub)
+    every = {int(a, 16)
+             for a, _ in (_LD if sub['load'] else _ST).findall(body)}
+    every |= {int(a, 16) for a in
+              (_LD_BARE if sub['load'] else _ST_BARE).findall(body)}
+    if not every:
+        return
+    base = min(every)        # the area's first row is its control word at +0
+    rep.subjects += 1
+    key = bs.hex()
+    per = rep.per_encoding.setdefault(key, [0, 0, 0])
+    per[0] += 1
+    placed = {}
+    for reg, ms in gs:
+        for a, ln in ms:
+            placed.setdefault(a, []).append((reg, ln))
+
+    def bad(msg: str) -> None:
+        rep.wrong += 1
+        per[2] += 1
+        if len(rep.examples) < 20:
+            rep.examples.append(f"pc=0x{m.group(1)} bytes={key} {msg}")
+
+    for a in sorted(every):
+        want = _x86_want(a - base, sub)
+        if want is None:
+            continue
+        rep.memops += 1
+        per[1] += 1
+        got = placed.get(a, [])
+        # An unnamed row (an x87 register TOP selects, the header) may feed
+        # every register with no lane; the XMM row must reach ITS register
+        # with ITS lane, and no other register with a lane.
+        laned = [(r, ln) for r, ln in got if ln]
+        if laned != [(want[0], {want[1]})]:
+            bad(f"off=0x{a - base:x} on {laned or got or 'no register'} "
+                f"want %v{want[0]} lane {want[1]}")
 
 
 def check_trace(trace: Path, isa: str, decode: Path) -> LaneReport:

@@ -128,6 +128,21 @@ typedef enum X86StateArea {
     X86_STATE_AREA_XRSTOR,
 } X86StateArea;
 
+/*
+ * The register a state-area access moves, as the row's .datum (1 + an index
+ * into the atom list the decode site builds in this order), or 0 where the
+ * access moves no one register (see x86_state_area_accesses()).
+ */
+enum {
+    X86_AREA_DATUM_NONE = 0,
+    X86_AREA_DATUM_FPUC,            /* "fpuc"       */
+    X86_AREA_DATUM_FPUS,            /* "fpus"       */
+    X86_AREA_DATUM_FPTAG,           /* "fptag"      */
+    X86_AREA_DATUM_XMM0,            /* "xmm0".."xmm15" */
+    X86_AREA_DATUM_BND0 = X86_AREA_DATUM_XMM0 + 16,  /* bnd0_lb, bnd0_ub, ... */
+    X86_AREA_DATUM_COUNT = X86_AREA_DATUM_BND0 + 8,
+};
+
 unsigned x86_state_area_accesses(X86StateArea kind, bool code64,
                                  uint64_t xcr0_supported,
                                  InsnDataflowHelperAccess *out, unsigned max);

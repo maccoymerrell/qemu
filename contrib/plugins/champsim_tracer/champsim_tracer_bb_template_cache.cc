@@ -627,7 +627,8 @@ static size_t insn_fields_pool_size(const InsnFields *f, bool with_names)
     size_t keys = with_names
         ? ((size_t)f->n_src_regs + f->n_dst_regs) * sizeof(QemuRegKey *)
         : 0;
-    size_t u8s = (size_t)f->n_src_regs + f->n_dst_regs;
+    size_t u8s = (size_t)f->n_src_regs + f->n_dst_regs +
+                 f->max_dep_loads + f->max_dep_stores;   /* lane ranks */
     return u64s * sizeof(uint64_t) + keys + ((u8s + 7) & ~(size_t)7);
 }
 
@@ -698,6 +699,10 @@ static void insn_fields_pack(InsnFields *dst, const InsnFields *src,
     dst->dst_lane_mask       = take_u64(src->dst_lane_mask, src->n_dst_regs);
     dst->src_regs            = take_u8(src->src_regs, src->n_src_regs);
     dst->dst_regs            = take_u8(src->dst_regs, src->n_dst_regs);
+    dst->load_lane_rank      = take_u8(src->load_lane_rank,
+                                       src->max_dep_loads);
+    dst->store_lane_rank     = take_u8(src->store_lane_rank,
+                                       src->max_dep_stores);
     p = (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7);
     *cursor = p;
 }

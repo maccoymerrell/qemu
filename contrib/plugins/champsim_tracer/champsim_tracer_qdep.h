@@ -124,6 +124,11 @@ struct QdepCounters {
      * provenance.  Zero on a run with no such load means the statement was
      * never made, not that it was made and ignored. */
     uint64_t load_datum_stated;
+    /* Instructions where SOME load rows name their register and the rest do
+     * not (an x86 FXRSTOR/XRSTOR: the XMM and control words are named, the
+     * x87 data rows and the XSAVE header are not); the unnamed rows feed
+     * every destination. */
+    uint64_t load_datum_partial;
     /* A provenance member whose mask position lies past its mask's width.
      * The register masks are sized by dep_limbs_for() to the whole position
      * stack, so for them this cannot happen; an ADDRESS mask is one limb,

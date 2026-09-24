@@ -524,64 +524,68 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
         }
         if (helper_area) {
             /*
-             * THE DATUM IS NOT NAMED, AND THE TWO WAYS OUT ARE PRICED.
+             * THE DATUM IS NAMED WHERE THE ACCESS MOVES ONE REGISTER.
              *
-             * The area's bytes are the x87 and SSE register state, so FXSAVE's
-             * stored datum comes from those 32 registers and FXRSTOR writes
-             * every one of them.  Stating that was WRITTEN, BUILT AND
-             * MEASURED here, and REVERTED: an instruction may carry
-             * INSN_DF_MAX_FIELDS (16) env ranges and INSN_DF_MAX_WRITES (8)
-             * writes, the area names 32, and the reader correctly refuses an
-             * instruction it cannot record in full -- so both encodings came
-             * back with src=[], dst=[] and no access at all, which is worse
-             * than the state this fixes.
+             * x86_state_area_accesses() gives each row the register it
+             * saves or restores (X86_AREA_DATUM_*, in the atom order built
+             * here): the control, status and tag words, the XMM register
+             * whose low or high 128 bits a pair of rows moves, the MPX bound
+             * halves.  A store's datum is also the instruction's READ of
+             * that register, and each of the declared ones (fpuc, fpus,
+             * fptag, xmm0..15) is an env range with a field row of its own:
+             * nineteen of them, past the inline INSN_DF_MAX_FIELDS, which is
+             * what the block's wide-field pool is for.  A load's datum is the
+             * register the plugin seats as the access's destination.  The
+             * rows that move no single register -- ST(i), chosen by TOP at
+             * execution; the zero pointer words; MXCSR, PKRU and BNDCSR,
+             * which no declared register names; the XSAVE header -- name
+             * none, and fpu_helper.c says why for each.
              *
-             * WHY THE COUNT IS 32 AND NOT A SMALLER NUMBER: st0..st7 and
-             * xmm0..xmm15 are DECLARED regfiles, not TCG globals, so
-             * df_state() spends a FIELD slot on each of them in either
-             * direction (accel/tcg/insn-dataflow.c, the A_REG arm) -- the
-             * 256-bit register bitmap that makes a GPR read free is not
-             * available to them.
-             *
-             * ROUTE (a), RAISE THE CAPS, IS PRICED AND REJECTED.  The scratch
-             * is one InsnDataflow per instruction over INSN_DF_MAX_INSNS
-             * (512), in static TLS, charged to every QEMU thread.  Taking
-             * fields 16 -> 32 and writes 8 -> 32 adds 16 field slots and 24
-             * write slots per instruction; at the current shapes that is
-             * roughly 448 KiB + 576 KiB = about 1 MiB per thread, on top of
-             * the 385 KiB that allocation already costs and already has an
-             * open item against it.  Near four times the per-thread footprint,
-             * for two encodings, is the wrong trade.
-             *
-             * ROUTE (b), A WIDE-STATE STATEMENT, IS THE PICK AND IS NOT BUILT.
-             * One statement naming a register RANGE is the right shape: the
-             * area is two contiguous declared files plus the control words, so
-             * it is a handful of statements rather than 32 whatever the caps
-             * are.  It is NOT a cap bump wearing a different name.
-             * insn_dataflow_field_reg() resolves a range to exactly ONE
-             * declared register and only when the access lies wholly inside
-             * it -- deliberately, so an access that runs off the end is left
-             * unnamed rather than misattributed -- so a range covering a whole
-             * file resolves to no name at all today.  Making it resolve to the
-             * SET it overlaps is new reader behaviour and a new shape on the
-             * wire, with its own golden account and its own gate, and it is a
-             * wave rather than a tail item.
-             *
-             * Until it is built the access is stated and the register set it
-             * moves is a named residue.
+             * The lanes: two 8-byte halves per 128 bits, so the shape is
+             * 8-byte elements over the widest register the area moves --
+             * 32 bytes when the CPU model can enable the YMM component, else
+             * 16 -- and each row's lane is its rank among the rows naming the
+             * same register (low half, high half, YMM-high low, YMM-high
+             * high).
              */
             InsnDataflowHelperAccess rows[128];
+            InsnDataflowAtom datums[X86_AREA_DATUM_COUNT - 1];
             unsigned nrows = x86_state_area_accesses((X86StateArea)area,
                                                      CODE64(s),
                                                      s->xcr0_supported,
                                                      rows, ARRAY_SIZE(rows));
 
+            datums[X86_AREA_DATUM_FPUC - 1] = insn_df_reg("fpuc");
+            datums[X86_AREA_DATUM_FPUS - 1] = insn_df_reg("fpus");
+            datums[X86_AREA_DATUM_FPTAG - 1] = insn_df_reg("fptag");
+            for (unsigned i = 0; i < 16; i++) {
+                datums[X86_AREA_DATUM_XMM0 - 1 + i] =
+                    insn_df_reg(x86_xmm_names[i]);
+            }
+            {
+                static const char *const bnd_names[8] = {
+                    "bnd0_lb", "bnd0_ub", "bnd1_lb", "bnd1_ub",
+                    "bnd2_lb", "bnd2_ub", "bnd3_lb", "bnd3_ub",
+                };
+
+                for (unsigned i = 0; i < 8; i++) {
+                    datums[X86_AREA_DATUM_BND0 - 1 + i] =
+                        insn_df_reg(bnd_names[i]);
+                }
+            }
             if (nrows == 0) {
                 /* An account that does not fit is not recorded short. */
                 insn_dataflow_refuse();
             } else {
-                insn_dataflow_note_helper_accesses(rows, nrows, parts, n,
-                                                   a->disp);
+                insn_dataflow_note_helper_accesses_datum(
+                    rows, nrows, parts, n, a->disp, datums,
+                    ARRAY_SIZE(datums));
+                insn_dataflow_note_vec_shape(
+                    MO_64, (area == X86_STATE_AREA_XSAVE ||
+                            area == X86_STATE_AREA_XRSTOR) &&
+                           (s->xcr0_supported & XSTATE_YMM_MASK) ? 32 : 16);
+                insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_UNIFORM,
+                                            INSN_DF_VEC_LANE_NONE);
             }
         } else if (locked_cmpxchg) {
             /*

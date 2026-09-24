@@ -257,8 +257,10 @@ void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
                 p = s.pos();
                 uint8_t df = s.u8();
                 if (df & ids.dep_block_has_reg) {
-                    for (uint8_t d = 0; d < n_dst; d++) s.uleb();
-                    for (uint8_t st = 0; st < mds; st++) s.uleb();
+                    /* Register masks may pass 64 bits (a wide fan's load
+                     * positions); only their bytes are counted here. */
+                    for (uint8_t d = 0; d < n_dst; d++) s.skip_varint();
+                    for (uint8_t st = 0; st < mds; st++) s.skip_varint();
                 }
                 if (df & ids.dep_block_has_addr) {
                     for (uint8_t l = 0; l < mdl; l++) s.uleb();

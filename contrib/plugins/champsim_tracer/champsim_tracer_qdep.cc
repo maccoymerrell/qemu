@@ -851,25 +851,70 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
      * an instruction every load row names the register it fills, and that
      * statement -- not the fold's provenance, which charges the whole region
      * to every destination -- is which load slots feed which destination.
-     * All-or-nothing: an instruction with one unnamed load row keeps the
-     * provenance's account whole rather than a mixture of the two.
+     * A row that names no register -- an x86 XRSTOR's header read, the
+     * x87 rows whose register TOP chooses at execution -- still loads a value
+     * that may reach any destination, so it feeds every one of them: the
+     * pessimistic direction, never a dependency missed.  An instruction whose
+     * rows name nothing keeps the provenance's account whole.
      */
-    std::vector<uint8_t> load_datum_reg;
-    bool loads_stated = !load_rows.empty();
+    std::vector<uint8_t> load_datum_reg(load_rows.size(), REG_NONE);
+    unsigned loads_named = 0;
 
-    for (unsigned k = 0; k < load_rows.size() && loads_stated; k++) {
+    for (unsigned k = 0; k < load_rows.size(); k++) {
         unsigned bit = 0;
         uint8_t reg = REG_NONE;
 
-        if (!qemu_plugin_insn_memop_datum(tb, idx, load_rows[k], &bit) ||
-            classify_bit(bit, &reg) != BIT_REG) {
-            loads_stated = false;
-            break;
+        if (qemu_plugin_insn_memop_datum(tb, idx, load_rows[k], &bit) &&
+            classify_bit(bit, &reg) == BIT_REG && reg != REG_NONE) {
+            load_datum_reg[k] = reg;
+            loads_named++;
         }
-        load_datum_reg.push_back(reg);
     }
+    const bool loads_stated = loads_named != 0;
+
     if (loads_stated) {
-        g_qdep.load_datum_stated++;
+        if (loads_named == load_rows.size()) {
+            g_qdep.load_datum_stated++;
+        } else {
+            g_qdep.load_datum_partial++;
+        }
+    }
+    /*
+     * A stated access's lane is its rank among the accesses stating the same
+     * register (LANE_RANK_NONE where it states none), in slot order; the
+     * same for stores.
+     */
+    for (unsigned k = 0; k < load_rows.size() && k < MAX_LOADS; k++) {
+        if (load_datum_reg[k] == REG_NONE) {
+            continue;
+        }
+        unsigned r = 0;
+
+        for (unsigned j = 0; j < k; j++) {
+            r += load_datum_reg[j] == load_datum_reg[k];
+        }
+        out->load_lane_rank[k] = (uint8_t)MIN(r, LANE_RANK_NONE - 1);
+    }
+    {
+        std::vector<uint8_t> store_datum_reg(store_rows.size(), REG_NONE);
+
+        for (unsigned k = 0; k < store_rows.size(); k++) {
+            unsigned bit = 0;
+            uint8_t reg = REG_NONE;
+
+            if (!qemu_plugin_insn_memop_datum(tb, idx, store_rows[k], &bit) ||
+                classify_bit(bit, &reg) != BIT_REG || reg == REG_NONE) {
+                continue;
+            }
+            store_datum_reg[k] = reg;
+
+            unsigned r = 0;
+
+            for (unsigned j = 0; j < k; j++) {
+                r += store_datum_reg[j] == reg;
+            }
+            out->store_lane_rank[k] = (uint8_t)MIN(r, LANE_RANK_NONE - 1);
+        }
     }
     for (unsigned k = 0; k < store_rows.size(); k++) {
         unsigned n = read_set([&](uint64_t *w, unsigned nn) {
@@ -968,6 +1013,9 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
             }
         }
         for (unsigned k = 0; k < load_datum_reg.size(); k++) {
+            if (load_datum_reg[k] == REG_NONE) {
+                continue;
+            }
             uint8_t slot = seat_dst(out, out_names, load_datum_reg[k]);
 
             if (slot == UINT8_MAX) {
@@ -976,6 +1024,16 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
             row_set_at(dep_row(out->dst_dep_mask, out, slot),
                        out->dep_limbs, lo + k);
             any_prov = true;
+        }
+        /* The unnamed rows feed every destination (see above). */
+        for (unsigned k = 0; k < load_datum_reg.size(); k++) {
+            if (load_datum_reg[k] != REG_NONE) {
+                continue;
+            }
+            for (uint8_t d = 0; d < out->n_dst_regs; d++) {
+                row_set_at(dep_row(out->dst_dep_mask, out, d),
+                           out->dep_limbs, lo + k);
+            }
         }
     }
     if (any_prov || out->n_dst_regs || out->max_dep_stores) {

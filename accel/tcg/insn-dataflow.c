@@ -224,6 +224,10 @@ struct InsnDataflowScratch {
     InsnDataflowHelperAccess fan_pool[INSN_DF_MAX_FAN_ROWS];
     uint16_t fan_datum_pool[INSN_DF_MAX_FAN_ROWS];
     unsigned nfan;
+
+    /* The fields of instructions that outgrew their inline rows. */
+    InsnDataflowField wide_field_pool[INSN_DF_MAX_WIDE_FIELD_ROWS];
+    unsigned nwidefield;
 };
 
 /*
@@ -725,9 +729,23 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
         }
     }
 
-    if (d->n_fields >= INSN_DF_MAX_FIELDS) {
-        d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
-        return;
+    if (d->n_fields >= d->fields_cap) {
+        /*
+         * Outgrowing the inline rows moves the instruction's fields into the
+         * block's wide-field pool (INSN_DF_MAX_FIELDS_WIDE); only a second
+         * overflow, or a pool the block has used up, refuses.
+         */
+        if (d->fields != d->fields_inline ||
+            df->nwidefield + INSN_DF_MAX_FIELDS_WIDE >
+            INSN_DF_MAX_WIDE_FIELD_ROWS) {
+            d->incomplete |= INSN_DF_INCOMPLETE_FIELDS;
+            return;
+        }
+        memcpy(&df->wide_field_pool[df->nwidefield], d->fields_inline,
+               sizeof(d->fields_inline));
+        d->fields = &df->wide_field_pool[df->nwidefield];
+        d->fields_cap = INSN_DF_MAX_FIELDS_WIDE;
+        df->nwidefield += INSN_DF_MAX_FIELDS_WIDE;
     }
     d->fields[d->n_fields].off = off;
     d->fields[d->n_fields].size = size;
@@ -2426,12 +2444,15 @@ void insn_dataflow_insn_begin(unsigned idx)
         df->win_open = -1;
         df->ninsns = 0;
         df->nfan = 0;
+        df->nwidefield = 0;
     }
     if (idx >= INSN_DF_MAX_INSNS) {
         df->decoding = false;
         return;
     }
     memset(&df->out[idx], 0, sizeof(df->out[idx]));
+    df->out[idx].fields = df->out[idx].fields_inline;
+    df->out[idx].fields_cap = INSN_DF_MAX_FIELDS;
     df->out[idx].vec_vece = INSN_DF_VECE_NONE;
     df->out[idx].vec_kind = INSN_DF_VEC_KIND_NONE;
     df->out[idx].vec_lane = INSN_DF_VEC_LANE_NONE;

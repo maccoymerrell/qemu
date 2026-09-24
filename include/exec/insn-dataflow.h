@@ -78,8 +78,25 @@
 /* How many distinct env byte ranges one translation block may intern. */
 #define INSN_DF_MAX_FIELD_SLOTS  64
 
-/* How many distinct env byte ranges one instruction may touch. */
-#define INSN_DF_MAX_FIELDS  16
+/*
+ * How many distinct env byte ranges one instruction may touch.
+ *
+ * INSN_DF_MAX_FIELDS rows live in the instruction's own record, which is
+ * enough for every instruction whose ops read or write a handful of declared
+ * registers.  An instruction that moves a whole state file -- x86 FXSAVE
+ * reads fpuc, fpus, fptag and sixteen XMM registers, each its own declared
+ * register and so its own row -- grows past them into the block's wide-field
+ * pool, up to INSN_DF_MAX_FIELDS_WIDE rows: the budget that names the whole
+ * x86 state file (x87 control, status, tag and TOP, eight stack registers,
+ * thirty-two vector registers, MXCSR, the opmask file and PKRU) with room to
+ * spare.  The pool is per block and small, so the per-instruction scratch
+ * does not grow for the instructions that never need it; a block whose
+ * instructions exhaust it refuses the one that overflowed
+ * (INSN_DF_INCOMPLETE_FIELDS), never records it short.
+ */
+#define INSN_DF_MAX_FIELDS          16
+#define INSN_DF_MAX_FIELDS_WIDE     64
+#define INSN_DF_MAX_WIDE_FIELD_ROWS 256
 
 /*
  * How many vector-operand statements one instruction may make.
@@ -626,8 +643,16 @@ typedef struct InsnDataflow {
     uint8_t  n_writes;
     uint8_t  incomplete;        /* INSN_DF_INCOMPLETE_* */
 
-    InsnDataflowField fields[INSN_DF_MAX_FIELDS];
+    /*
+     * The instruction's env ranges: @fields points at @fields_inline until
+     * the instruction outgrows it, then at its INSN_DF_MAX_FIELDS_WIDE rows
+     * of the block's wide-field pool (see INSN_DF_MAX_FIELDS).  Readers use
+     * fields[0..n_fields) and never care which.
+     */
+    InsnDataflowField fields_inline[INSN_DF_MAX_FIELDS];
+    InsnDataflowField *fields;
     uint8_t  n_fields;
+    uint8_t  fields_cap;
 
     InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
     uint8_t  n_memops;

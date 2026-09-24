@@ -2364,6 +2364,16 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
         }
     }
     if (host_reg_idx == 0xFF || host_lane_mask == 0) return 0;
+    /* A stated access's lane rank is its rank among the accesses stating
+     * the same register, which the dependency masks cannot tell apart from
+     * an unstated access feeding the same register. */
+    {
+        const uint8_t stated = (want_type == DYN_LOAD_ADDR)
+            ? f->load_lane_rank[slot] : f->store_lane_rank[slot];
+        if (stated != LANE_RANK_NONE) {
+            slots_before = stated;
+        }
+    }
 
     uint64_t size  = dp->data_size ? dp->data_size : lane_bytes;
     uint64_t span  = size / lane_bytes;

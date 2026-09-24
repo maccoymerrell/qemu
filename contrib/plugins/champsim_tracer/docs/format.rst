@@ -3535,6 +3535,23 @@ mapped and the elements past it (``LMUL`` > 1) are counted, addressed
 and valued but carry no lane mask; a segment access (``nf`` > 1) names
 no per-slot register at all.
 
+The x86 state saves carry the same association.  ``FXSAVE`` and
+``XSAVE``/``XSAVEOPT`` name each store's register in ``store_data_dep``
+and ``FXRSTOR``/``XRSTOR`` each load's in ``dst_dep``: the control and
+tag words (``REG_FCSR``), the MPX bound halves, and the XMM register
+whose 128-bit halves a pair of accesses moves.  An XMM register's lanes
+are 8 bytes wide: the low and high quadwords of its legacy slot are
+lanes 0 and 1, and ``XSAVE``'s YMM-high quadwords of the same register
+are lanes 2 and 3.  Each access's lane is its rank among the accesses
+the decode site states for that register, not among every load bit in
+its mask: an ``XRSTOR`` destination also depends on the header loads
+that decide whether a component is restored, and those are none of its
+lanes.  The accesses that move no single register -- the x87 data
+registers, which ``TOP`` selects at execution; the zero pointer words;
+``MXCSR``, ``PKRU`` and ``BNDCSR``; the ``XSAVE`` header -- publish no
+register for a store, and a load of that kind feeds every destination
+of the instruction with no lane.
+
 A register mask is as wide as its position stack: ``n_src`` plus
 ``max_dep_loads`` plus the immediate bit, up to 511 positions, and the
 ULEB carries every one of them.  A fan wider than 64 bits is not a

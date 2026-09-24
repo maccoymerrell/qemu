@@ -1222,8 +1222,10 @@ typedef struct CPUArchState {
      * the snapshot and cannot itself be rolled back.  See the replay comment
      * in cpu_plugin_arch_state_restore.
      */
-    uint32_t plugin_ext_ip_set;      /* externally raised during excursion */
-    uint32_t plugin_ext_ip_clear;    /* externally lowered during excursion */
+    struct {
+        uint32_t set;                /* externally raised during excursion */
+        uint32_t clear;              /* externally lowered during excursion */
+    } plugin_irq_delta;
 #endif
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)

@@ -803,104 +803,39 @@ illegal_return:
 /*
  * Report a bulk guest-memory transfer to the TCG plugin layer.
  *
- * The AArch64 bulk-memory helpers (DC ZVA and the FEAT_MOPS
- * SETP/SETM/SETE and CPYP/CPYM/CPYE families) take a trapless
- * tlb_vaddr_to_host() lookup and then move the whole block with a host
- * memset()/memmove().  That bulk move never goes through a qemu_ld /
- * qemu_st TCG op, so the plugin memory instrumentation accel/tcg emits
- * around those ops never fires: to a plugin, a bulk instruction that
- * hits the host-pointer fast path performs no memory access at all.
- * Only the byte-at-a-time fallbacks (taken for I/O, watchpoints,
- * unmapped pages, and — in this tree — plugin speculative execution)
- * are instrumented, so the accesses are visible exactly on the paths a
- * plugin is least interested in and invisible on the common one.
+ * DC ZVA and the FEAT_MOPS SET and CPY step helpers move whole blocks with a
+ * host memset()/memmove() through tlb_vaddr_to_host(), which no qemu_ld /
+ * qemu_st op instruments, so without this report a plugin would see no
+ * memory access at all on the common path.  @addr / @size describe the guest
+ * range in ascending order, @host points at the host mapping of @addr (NULL
+ * if the data value is not available), @rw is the direction.  The range is
+ * decomposed into naturally aligned power-of-two pieces of at most 16 bytes
+ * (MO_128, the widest access the plugin memory API describes), one callback
+ * per piece; the value is assembled in memory order and tagged MO_LE, since
+ * a block transfer has no endianness of its own.
  *
- * The callers are the four FEAT_MOPS step helpers and HELPER(dc_zva), which
- * has the same defect on the same host-pointer fast path.
+ * Every path reports through this one reporter.  The byte-at-a-time
+ * fallbacks (I/O, watchpoints, unmapped or clean pages, plugin speculative
+ * execution) accumulate their per-byte work into contiguous runs
+ * (mops_acc_append) and flush them through the same decomposition at the
+ * same page-bounded chunk boundaries.  No such piece crosses a 16-byte
+ * boundary, so the tiling is compositional across any page, chunk or fault
+ * split, and the reported sequence is the same however QEMU moved the
+ * bytes.  Genuine device memory is the exception: the device really sees
+ * the fallback's byte accesses, so MMIO keeps its per-byte reports.  How
+ * the bytes are moved is unchanged; only the plugin report is normalized.
  *
- * @addr / @size describe the guest range in ascending order, @host
- * points at the host mapping of @addr (NULL if the data value is not
- * available), @rw is the direction.  The range is decomposed into
- * naturally aligned power-of-two accesses of at most 16 bytes and one
- * callback is emitted per piece, so every callback carries a real
- * address, a real size and the right direction.  16 bytes is the
- * ceiling because MO_128 is the widest access the plugin memory API
- * can describe (qemu_plugin_mem_get_value() asserts above it), and
- * because AArch64 already issues 16-byte accesses for LDP/STP of Q
- * registers and for the LSE 128-bit atomics — a plugin sees nothing it
- * could not see already.
+ * @count: the transfer belongs to a FEAT_MOPS step helper; each emitted
+ * piece increments cpu->plugin_rep_iters so the count do_setX/do_cpyX
+ * publishes (see mops_plugin_entry) is exactly the number of accesses
+ * reported.  DC ZVA passes false.
  *
- * The alternative — making tlb_vaddr_to_host() honour
- * cpu_plugin_mem_cbs_enabled() the way probe_access_flags() does, so
- * the bulk helpers fall back to their instrumented slow paths — is
- * rejected here: those fallbacks transfer one byte per iteration, so a
- * plugin would see a 4 KiB page-sized MOPS step as 4096 one-byte
- * accesses instead of 256 sixteen-byte ones, and every glibc memcpy
- * would become a per-byte softmmu loop.
- *
- * The value is assembled little-endian from memory order and the memop
- * is tagged MO_LE to match.  A bulk block transfer moves bytes, not
- * scalars, so it has no endianness of its own; memory order is the
- * only meaningful reading of the payload.
- *
- * REPORTING NORMALIZATION (the FEAT_MOPS fan-out contract).  The
- * byte-at-a-time fallbacks used to report through their per-byte
- * cpu_ld/st ops, so the *same* guest execution changed its reported
- * shape with every emulation artifact that forces the fallback: a
- * watchpoint anywhere on the page, a TLB_NOTDIRTY page (whose first
- * byte re-dirties it, resuming the fast path misaligned: 256 pieces
- * became 259), plugin speculative execution, and the host-page-sized
- * chunking of the helpers themselves.  A 4 KiB SETM billed 256, 259
- * or 4096 accesses for identical architectural work.  Now every path
- * reports through this one reporter: the fallbacks accumulate their
- * per-byte work into contiguous runs (mops_acc_append) and flush them
- * through the same <=16-byte naturally-aligned decomposition the fast
- * path uses, at the same page-bounded chunk boundaries the fast path
- * reports at.  Because no naturally aligned power-of-two piece of at
- * most 16 bytes can cross a 16-byte-aligned boundary, the tiling of a
- * byte range is compositional across any page/chunk split — so the
- * reported sequence is identical whether QEMU moved the bytes with one
- * host memset, per-byte stores, or any interleaving of the two, and
- * identical across cpu_loop_exit_requested / fault splits of the
- * instruction (the pending run survives the longjmp in the per-vCPU
- * accumulator and the resumed execution completes it).
- *
- * The one deliberate exception is genuine device memory (ruling:
- * "report true MMIO, don't force tiling").  On MMIO the device really
- * does see the fallback's byte accesses, so those keep their per-byte
- * reports, delivered as they happen.  Only genuine memory-type
- * differences may change the reported shape: watchpoints, clean
- * pages, unmapped-then-faulted pages and speculative execution are
- * emulation artifacts and normalize; MMIO is not and does not.
- *
- * How the bytes are MOVED is untouched everywhere: the fallbacks
- * still issue the same one-byte (or 16-byte, for tags) operations in
- * the same order with the same fault semantics.  Only the plugin
- * report is normalized.
- *
- * @count: this transfer belongs to a FEAT_MOPS SET/CPY step helper,
- * whose do_setX/do_cpyX caller publishes per-execution architectural
- * facts (see mops_plugin_entry): each emitted piece increments
- * cpu->plugin_rep_iters so the published count is exactly the number
- * of accesses reported.  DC ZVA publishes nothing and passes false.
- *
- * @ra: the step helper's return address, or 0 when @host is this
- * reporter's OWN buffer rather than guest memory.  READING THE BYTES IS
- * ITSELF A GUEST ACCESS AND CAN FAULT, and in linux-user it faults
- * often: tlb_vaddr_to_host() there is guest_base + addr with no mapping
- * check, so a MOPS copy whose size register runs off the end of a
- * mapping hands this reporter a host pointer into nothing.  The bulk
- * move that follows is bracketed by set_helper_retaddr(), so QEMU's
- * SIGSEGV handler recognises ITS fault as the guest's and unwinds; a
- * read here outside that bracket is not recognised, and QEMU dies with
- * "QEMU internal SIGSEGV" instead of delivering the guest's SIGSEGV.
- * MEASURED before this parameter existed: `cpym` at an unmapped
- * destination killed qemu-aarch64 outright with ANY plugin loaded
- * (libhotpages reproduces it) and took a clean guest SIGSEGV with none
- * -- so the emulator's fault behaviour depended on whether it was being
- * observed.  Only the value loads are bracketed: the plugin callback
- * that follows is plugin code, and a fault inside IT is not a guest
- * fault and must not be unwound as one.
+ * @ra: the step helper's return address, or 0 when @host is this reporter's
+ * own buffer rather than guest memory.  Reading the bytes is itself a guest
+ * access and can fault (in linux-user tlb_vaddr_to_host() does no mapping
+ * check), so the value loads are bracketed by set_helper_retaddr() and a
+ * fault unwinds as the guest's SIGSEGV.  The plugin callback itself is not
+ * bracketed: a fault inside plugin code is not a guest fault.
  */
 #ifdef CONFIG_PLUGIN
 static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
@@ -1192,9 +1127,6 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
         }
     }
     arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count, ra);
-#else
-    (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
-    (void)count; (void)ra;
 #endif
 }
 
@@ -1358,8 +1290,10 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
      * rounded down to the block and @blocklen comes from DCZID_EL0, so the
      * decomposition is exact rather than assuming a block size.
      *
-     * The other two paths above need no such call: they zero the block with
-     * cpu_stb_mmuidx_ra(), which is instrumented already.
+     * The byte-write paths above report through dc_zva_bytes() instead:
+     * genuine MMIO keeps the per-byte reports its cpu_stb_mmuidx_ra() stores
+     * already make, and a speculative block is normalized there to this
+     * same decomposition.
      */
     set_helper_retaddr(ra);
     memset(mem, 0, blocklen);
@@ -1505,6 +1439,8 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
         /*
          * Slow-path: just do one byte write. This will handle the
          * watchpoint, invalid page, etc handling correctly.
+         * For clean code pages, the next iteration will see
+         * the page dirty and will use the fast path.
          * In user-mode, this path is taken during plugin speculative
          * execution so stores route through the per-vCPU store buffer.
          *
@@ -1576,6 +1512,8 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
          * watchpoint, invalid page, etc handling correctly.
          * The architecture requires that we do 16 bytes at a time,
          * and we know both ptr and size are 16 byte aligned.
+         * For clean code pages, the next iteration will see
+         * the page dirty and will use the fast path.
          * In user-mode, this path is taken during plugin speculative
          * execution so stores route through the per-vCPU store buffer.
          */
@@ -2013,7 +1951,9 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
     /*
      * If we don't have host memory for both source and dest then just
      * do a single byte copy. This will handle watchpoints, invalid pages,
-     * etc correctly. In user-mode, wmem is NULL during plugin speculative
+     * etc correctly. For clean code pages, the next iteration will see
+     * the page dirty and will use the fast path.
+     * In user-mode, wmem is NULL during plugin speculative
      * execution so stores route through the per-vCPU store buffer.
      */
     if (unlikely(!rmem || !wmem)) {
@@ -2146,7 +2086,9 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
     /*
      * If we don't have host memory for both source and dest then just
      * do a single byte copy. This will handle watchpoints, invalid pages,
-     * etc correctly. In user-mode, wmem is NULL during plugin speculative
+     * etc correctly. For clean code pages, the next iteration will see
+     * the page dirty and will use the fast path.
+     * In user-mode, wmem is NULL during plugin speculative
      * execution so stores route through the per-vCPU store buffer.
      */
     if (unlikely(!rmem || !wmem)) {

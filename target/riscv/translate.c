@@ -608,10 +608,9 @@ static void gen_jal(DisasContext *ctx, int rd, target_ulong imm)
     TCGv succ_pc = dest_gpr(ctx, rd);
 
     /*
-     * Direct unconditional jump (JAL); surface the static target to
-     * plugins for wrong-path tracing.  JALR (indirect) does not go
-     * through this path and leaves branch_target_pc at 0 so the
-     * plugin's observed-target history handles it.
+     * Direct unconditional jump (JAL): record the static target for
+     * plugins.  JALR (indirect) does not go through this path, so its
+     * instruction's static target stays unknown (0).
      */
     plugin_gen_record_branch_target(
         (uint64_t)(ctx->base.pc_next + imm));

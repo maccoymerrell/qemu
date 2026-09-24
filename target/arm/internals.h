@@ -1003,10 +1003,8 @@ static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
      * the CPUArchState register snapshot the wrong-path walk rolls back.
      * A speculative `eret` (or AArch32 exception return) fires these on
      * every excursion; left live, the discarded path mutates GIC/PMU/timer
-     * device state for good.  On aarch64 system mode this corrupted the
-     * GICv3 interface so the kernel never took another timer interrupt and
-     * never returned to the traced user process (observed: user_covered=0).
-     * x86 has no analogous per-EL hook, which is why it was unaffected.
+     * device state for good (a corrupted GICv3 interface can stop timer
+     * interrupt delivery entirely).
      */
     if (unlikely(CPU(cpu)->plugin_spec_mode)) {
         return;

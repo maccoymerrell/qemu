@@ -230,11 +230,10 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
 }
 
 /*
- * Debug-read fallback through the guest page tables — v4 default #2,
- * maintainer-vetoable.
+ * Debug-read fallback through the guest page tables.
  *
- * A debug read (gdbstub, monitor, qemu_plugin_read_memory_vaddr — the
- * ChampSim Tracer's content-gate refresh) resolves through the software
+ * A debug read (gdbstub, monitor, qemu_plugin_read_memory_vaddr)
+ * resolves through the software
  * TLB matched against the live EntryHi.ASID, so immediately after a
  * switch_mm a RESIDENT page's translation is simply not in the TLB and
  * the read fails even though the guest maps the page.  When the model
@@ -247,8 +246,7 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
  * get_physical_address; entries are read from guest RAM physically.
  * Deliberately narrow: huge-page directory entries and non-4K leaf
  * configurations are not decoded — the walk reports failure and the
- * caller keeps today's behaviour (an honest gate-off, counted by the
- * plugin's unreadable-at-refresh witness).
+ * debug read fails as it would without the fallback.
  */
 static bool mips_htw_walk_debug(CPUState *cs, vaddr address, hwaddr *out)
 {

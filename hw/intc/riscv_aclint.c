@@ -77,7 +77,7 @@ static void riscv_aclint_mtimer_write_timecmp(RISCVAclintMTimerState *mtimer,
                 mtimer->hartid_base + hartid,
                 (unsigned long long)value, (unsigned long long)rtc,
                 cs ? (int)cs->plugin_spec_mode : -1,
-                cs ? (int)cs->plugin_spec_vtime_paused : -1,
+                cs ? (int)cs->plugin_excursion_active : -1,
                 value <= rtc ? "RAISE-now" : "CLEAR+arm");
     }
 #endif
@@ -136,7 +136,7 @@ static void riscv_aclint_mtimer_cb(void *opaque)
         fprintf(stderr, "[mtimer] FIRE hart=%u spec=%d vtp=%d timecmp=0x%llx\n",
                 state->s->hartid_base + state->num,
                 cs ? (int)cs->plugin_spec_mode : -1,
-                cs ? (int)cs->plugin_spec_vtime_paused : -1,
+                cs ? (int)cs->plugin_excursion_active : -1,
                 (unsigned long long)state->s->timecmp[state->num]);
     }
 #endif
@@ -145,7 +145,7 @@ static void riscv_aclint_mtimer_cb(void *opaque)
 
 #ifdef CONFIG_PLUGIN
 /*
- * Wrong-path excursion-exit reconcile (#77): recompute @hartid's MTIP level
+ * Wrong-path excursion-exit reconcile: recompute @hartid's MTIP level
  * and host QEMUTimer deadline from the architected mtimecmp.  Reuses the
  * normal mtimecmp-write path, so there is no separate deadline logic: an
  * expiry deferred by the excursion gate in riscv_aclint_mtimer_cb (the

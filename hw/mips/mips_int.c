@@ -58,15 +58,15 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
 
 #ifdef CONFIG_PLUGIN
     /*
-     * Wrong-path (speculative) or the fault-skip gap inside one: the
+     * Inside a wrong-path (speculative) excursion: the
      * CP0_Cause.IP bits above are register state that the walk-end restore
      * reverts, but driving CPU_INTERRUPT_HARD is an external side effect
      * that would escape the discarded path -- leaving the line raised from
      * an IP bit the restore then erases.  Defer the line drive; the
      * excursion-exit resync recomputes it from the restored CP0_Cause
-     * (mirror of the riscv path, #77).
+     * (mirror of the riscv path).
      */
-    if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+    if (cs->plugin_spec_mode || cs->plugin_excursion_active) {
         /*
          * A device raise is not speculative: the qatomic above just landed
          * it in a Cause word the walk-end restore is about to rewind, which
@@ -82,11 +82,11 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
         if (irq >= 2) {
             uint32_t bit = 1 << (irq + CP0Ca_IP);
             if (level) {
-                env->plugin_ext_ip_set |= bit;
-                env->plugin_ext_ip_clear &= ~bit;
+                env->plugin_irq_delta.set |= bit;
+                env->plugin_irq_delta.clear &= ~bit;
             } else {
-                env->plugin_ext_ip_clear |= bit;
-                env->plugin_ext_ip_set &= ~bit;
+                env->plugin_irq_delta.clear |= bit;
+                env->plugin_irq_delta.set &= ~bit;
             }
         }
         return;
@@ -101,7 +101,7 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
 
 #ifdef CONFIG_PLUGIN
 /* Recompute CPU_INTERRUPT_HARD from the restored CP0_Cause after a
- * wrong-path excursion suppressed a line update (#77).  Called from
+ * wrong-path excursion suppressed a line update.  Called from
  * mips_cpu_plugin_resync_timers at the excursion-exit boundary. */
 void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env)
 {

@@ -181,7 +181,7 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
      *
      * A guest that does not follow the convention (no S-mode OS below,
      * sscratch never armed, paging Bare) leaves neither register looking like
-     * a kernel address and degrades to the raw tp — the historical value.
+     * a kernel address and degrades to the raw tp.
      * M-mode firmware and H-extension virtualization are outside the
      * contract: plugin_thread_ptr_tracks_current reports false there, and
      * under virt the rule is not applied at all (vsscratch, not sscratch, is
@@ -1220,9 +1220,7 @@ static bool riscv_tcg_cpu_realize(CPUState *cs, Error **errp)
 #ifndef CONFIG_USER_ONLY
     CPURISCVState *env = &cpu->env;
 
-    /* Pc-relative TBs — unless a TCG plugin is loaded (see
-     * tcg_cflags_set_pcrel: a pc-less TB identity misattributes plugin
-     * records across virtual mappings of one physical page). */
+    /* Pc-relative TBs; see tcg_cflags_set_pcrel. */
     tcg_cflags_set_pcrel(CPU(cs));
 
     if (cpu->cfg.ext_sstc) {

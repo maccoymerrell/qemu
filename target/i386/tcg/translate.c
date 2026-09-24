@@ -1824,14 +1824,13 @@ static uint64_t advance_pc(CPUX86State *env, DisasContext *s, int num_bytes)
     if (s->base.num_insns > 1 &&
         !translator_is_same_page(&s->base, s->pc + num_bytes - 1)) {
         /*
-         * v4 repair (maintainer-vetoable): while a never-split extension
-         * is active, permit instructions whose bytes lie entirely within
-         * the TB's TWO-page window — page slot 1 is already claimed by
-         * the first crossing fetch, so page-protection tracking is
-         * intact by construction.  Never beyond page 2.  The flag is
-         * only ever set once a registered sequence's prefix has been
-         * matched at a clean stop, so ordinary translation is
-         * byte-identical.
+         * While a never-split extension is active, permit instructions
+         * whose bytes lie entirely within the TB's TWO-page window — page
+         * slot 1 is already claimed by the first crossing fetch, so
+         * page-protection tracking is intact by construction.  Never beyond
+         * page 2.  The flag is only ever set once a registered sequence's
+         * prefix has been matched at a clean stop, so ordinary translation
+         * is byte-identical.
          */
         uint64_t last = s->pc + num_bytes - 1;
         if (!s->base.nosplit_extend ||
@@ -4098,15 +4097,14 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 }
 
 /*
- * v4 repair (maintainer-vetoable): never-split RETREAT re-sync.  The
- * generic loop is ending the TB at @retreat_pc, dropping the sequence-
- * prefix insns translated beyond it (immediate moves: they never sync
- * EIP, so pc_save is stable, and they never touch the flags, so cc_op
- * is unchanged).  Re-sync the private decode pc, and conservatively
- * re-arm the cc_op spill: the first dropped insn's insn_start may have
- * flushed cc_op and its (now dropped) spill op with it.  A redundant
- * re-spill of an already-clean cc_op stores the same value again —
- * harmless.  CC_OP_DYNAMIC must never be marked dirty.
+ * Never-split retreat re-sync.  The generic loop is ending the TB at
+ * @retreat_pc, dropping the sequence-prefix insns translated beyond it
+ * (immediate moves: they never sync EIP, so pc_save is stable, and they
+ * never touch the flags, so cc_op is unchanged).  Re-sync the private
+ * decode pc, and conservatively re-arm the cc_op spill: the first dropped
+ * insn's insn_start may have flushed cc_op and its (now dropped) spill op
+ * with it.  A redundant re-spill of an already-clean cc_op stores the same
+ * value again — harmless.  CC_OP_DYNAMIC must never be marked dirty.
  */
 static bool i386_tr_nosplit_retreat(DisasContextBase *dcbase, CPUState *cpu,
                                     vaddr retreat_pc, uint64_t checkpoint)

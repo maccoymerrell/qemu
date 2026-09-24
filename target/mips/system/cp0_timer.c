@@ -29,57 +29,18 @@
 /*
  * The Count time base this VPE reads and writes.
  *
- * MIPS MT: Count belongs to the PROCESSOR, not to a VPE.  malta_mips_config()
- * advertises the vCPUs of an `-smp N` malta as the VPEs of ONE MT processor
- * (MVPConf0.PVPE), every one of them shares VPE 0's CPUMIPSMVPContext, and the
- * guest reads that single counter as the machine's clocksource -- Linux
- * registers it as "MIPS", 32 bits, and reads it with mfc0 $9 on whichever CPU
- * happens to be running.  A clocksource has to be monotonic across the CPUs
- * that read it.
- *
- * Per-VPE storage cannot be: the field is an OFFSET from the virtual clock, so
- * one instant reads as a different time on every VPE whose offset differs, and
- * the offsets do not stay equal because the guest writes Count.
- * synchronise_count_master()/_slave() has every CPU store the same value "all
- * at once", which on MT hardware is one register and is therefore exact; with
- * one field per vCPU each store landed whenever that vCPU thread happened to
- * be scheduled and moved only itself.  Measured on a Linux 6.6 malta -smp 4
- * guest that had just printed "Synchronize counters for CPU 1..3: done.", one
- * instant read 0x2e8126d5 / 0x2e8171f0 / 0x2e8128ad / 0x2e8126ca on VPEs 0..3:
- * a spread of 19,227 ticks, 120 us at the Malta 160 MHz count rate, and
- * permanent for the rest of the run.  Over 295 boots every single one was
- * incoherent, median 1,940 ticks and worst 20,833.
- *
- * What a backwards read costs the guest is a FORWARD jump of one full wrap,
- * not a stall.  Linux registers this counter with a 32-bit mask ("clocksource:
- * MIPS: mask: 0xffffffff"), so clocksource_delta() computes (now - last) &
- * 0xffffffff; the CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE guard that would
- * return 0 tests the delta as a signed 64-bit value and can never fire on a
- * 32-bit mask.  A read that lands on a VPE @skew ticks behind therefore
- * returns 2^32 - skew ticks, and at the Malta 160 MHz count rate that is
- * 4294967296 / 160e6 = 26.8435 s, or 2684.4 jiffies at HZ=100, handed to
- * timekeeping in one step.
- *
- * That quantum is what the symptom is made of.  Every malta -smp 4 RCU stall
- * captured before this change -- 5 cells across three waves in
- * /mnt/md0/QEMU/cst_runs/p1/malta3/{ab1,ab2} -- reports "rcu_sched kthread
- * timer wakeup didn't happen for" 2684, 2684, 2684, 2684 and 2686 jiffies,
- * one-hot on the wrap and nowhere near RCU's own 21 s reporting threshold.
- * With the base shared the wrap population is gone: the 3 stall cells in a
- * 120-boot wave afterwards report 2104, 2104 and 2108 jiffies, i.e. RCU
- * noticing at its bare CONFIG_RCU_CPU_STALL_TIMEOUT and carrying no wrap
- * quantum at all.  A residual stall mechanism therefore survives this fix and
- * is a different one; do not read the coherent base as closing it.  That
- * second mechanism was the wait == 0 clamp in cpu_mips_timer_update below,
- * and it is a HOST timer parked a wrap out rather than a guest clocksource
- * read jumping one -- same quantum, opposite direction.
- *
- * Storing the base once, in the shared MVP context, is what makes every VPE
- * read the same instant by construction; keeping it in step by copying between
- * per-VPE fields cannot, because two VPEs storing Count concurrently leave
- * whichever copy each wrote last (measured: a residual of up to 247 ticks).
- * CPUMIPSState::CP0_Count is still written as the migration/gdbstub view of
- * the register, and remains the storage on a CPU without the MT ASE.
+ * MIPS MT: Count belongs to the processor, not to a VPE.  malta_mips_config()
+ * advertises the vCPUs of an `-smp N` malta as the VPEs of one MT processor
+ * (MVPConf0.PVPE), every one of them shares VPE 0's CPUMIPSMVPContext, and a
+ * Linux guest reads that single counter as its clocksource on whichever CPU
+ * happens to run, so it must be monotonic across VPEs.  The stored value is
+ * an offset from the virtual clock; one offset per VPE would read one instant
+ * as a different time on each VPE once the guest writes Count, and a
+ * backwards read through Linux's 32-bit clocksource mask is a forward jump of
+ * one full wrap.  Storing the base once, in the shared MVP context, makes
+ * every VPE read the same instant by construction.  CPUMIPSState::CP0_Count
+ * is still written as the migration/gdbstub view of the register, and remains
+ * the storage on a CPU without the MT ASE.
  */
 static int32_t *mips_count_base(CPUMIPSState *env)
 {
@@ -114,56 +75,17 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     if (wait == 0 || wait > INT32_MAX) {
         op = MIPS_CP0T_ARM_BEHIND;
         /*
-         * The target is NOT IN THE FUTURE: Compare is behind Count, or it is
-         * Count exactly, and either way the next equality match is a full
-         * ~2^32 ticks away — 26.8435 s at the Malta 160 MHz count rate.  Real
-         * silicon only ever gets here transiently (a guest's next-event
-         * write races Count by nanoseconds and its -ETIME readback
-         * recovers); under TCG the guest's read-Count -> write-Compare
-         * window costs wall (= virtual) time that can exceed small deltas
-         * entirely — most of all while boot code is still being
-         * translated — so the OS's bounded retries can ALL land at or behind
-         * Count, its clockevent dies, and the CPU parks in idle until the
-         * wrap fires or a cross-CPU rescue arrives (observed on Malta SMP,
-         * Linux 6.6: a ~21 s RCU-stall-and-NMI tick outage on every boot,
-         * and a permanent-at-timescale guest wedge when both CPUs are
-         * caught at once).  Re-arm such a deadline at 2^24 ticks (~0.1 s
-         * at Malta rates) instead: every parked state — a missed program,
-         * an acknowledge rewrite awaiting its follow-up program, a stale
-         * Compare after a Count write — self-heals at a bounded, far-sub-
-         * tick-storm cadence, while every legitimate future program (OS
-         * contract: delta <= 2^31 - 1) is untouched.  A real reprogram
-         * replaces this deadline long before it fires.
-         *
-         * wait == 0 is the SAME condition and not a separate one, which is
-         * why it shares the arm.  It used to be clamped to UINT32_MAX under
-         * the justification "clamp interval to overflow if virtual time had
-         * not progressed"; virtual time progressing is not what the test
-         * measures — the guest landing its program exactly ON Count is —
-         * and the clamp parked that VPE's tick for the whole wrap with
-         * nothing scheduled to reprogram it.
-         *
-         * Measured, 120 instrumented malta -smp 4 boots, every arm tagged
-         * with its call site (no arm went untagged): 17 boots took the
-         * wait == 0 arm and all 17 came from cpu_mips_store_compare — never
-         * from the expiry re-arm, a Count store, an MT sibling re-arm or the
-         * excursion resync.  15 were Linux's c0_compare_int_usable() probe
-         * loop, which reads Count back and reprograms ~1.9 us later; those
-         * are harmless and are why merely counting the arm looks innocent.
-         * The other 2 were synchronise_count_master+0xc4, whose closing
-         * `write_c0_compare(read_c0_count() + COUNTON)` (COUNTON = 100 ticks
-         * = 625 ns of virtual time under TCG) has no readback, no -ETIME
-         * check and no retry — it is the "arrange for an interrupt in a
-         * short while" that the SMP bring-up path leaves behind.  In both,
-         * the NEXT arm on that VPE was the parked deadline firing 26.85 s
-         * later, and the measured gap between two timer deliveries was
-         * 26.853 s and 26.846 s.  No other boot in that wave had a tick gap
-         * over 1.36 s.
-         *
-         * That also explains the shape of the symptom: synchronise_count_
-         * master() runs on the boot CPU, and the surviving RCU stalls all
-         * name CPU 0 with "(0 ticks this GP)" while the other VPEs keep
-         * ticking.
+         * Compare is behind Count, or equal to it: the next equality match
+         * is a full ~2^32 ticks away (26.8 s at the Malta 160 MHz count
+         * rate).  Under TCG a guest's read-Count -> write-Compare window can
+         * exceed a small delta, and a program that lands at or behind Count
+         * with no readback-and-retry would park that VPE's tick for the whole
+         * wrap.  Such a deadline is re-armed 2^24 ticks (~0.1 s) out instead;
+         * every legitimate future program (delta <= 2^31 - 1) is untouched,
+         * and a real reprogram replaces this deadline long before it fires.
+         * When it does fire, cpu_mips_timer_expire raises the timer interrupt
+         * while Count != Compare, which the architecture would not do before
+         * the wrap.
          */
         wait = 1 << 24;
     }
@@ -193,14 +115,14 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
      * still armed, and delivered by the first timer pass after the thaw.
      * Nothing is owed, so nothing needs recording for a replay to pay back.
      *
-     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
-     * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
-     * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is
-     * still live, and a Cause.TI/IP set in that gap is erased by the final
-     * walk-end restore.
+     * Gate on plugin_excursion_active (true for the WHOLE excursion), not
+     * just plugin_spec_mode: spec mode is clear at the excursion's edges
+     * (before qemu_plugin_spec_mode_begin, and after qemu_plugin_spec_mode_end
+     * until the register restore) while the snapshot is live, and a
+     * Cause.TI/IP set there is erased by the walk-end restore.
      */
     if (env_cpu(env)->plugin_spec_mode ||
-        env_cpu(env)->plugin_spec_vtime_paused) {
+        env_cpu(env)->plugin_excursion_active) {
         return;
     }
 #endif
@@ -222,7 +144,7 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
  * Reconcile the host R4K timer with the architected CP0_Count/Compare after a
  * wrong-path excursion.  Runs on every excursion exit, including ones that
  * disturbed nothing, and is idempotent on an already consistent timer.  Called
- * from cpu_plugin_spec_vtime_resume — the true excursion-exit boundary, with
+ * from cpu_plugin_excursion_close — the true excursion-exit boundary, with
  * spec mode ended and the BQL held (a re-delivered expiry raises the timer IRQ
  * line through cpu_mips_irq_request, which expects the BQL).
  */
@@ -231,9 +153,9 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
     CPUMIPSState *env = cpu_env(cs);
 
     /* Reconcile the interrupt line from restored CP0_Cause first: an
-     * excursion (or its fault-skip gap) can suppress a line update while
+     * excursion can suppress a line update while
      * the register snapshot is live, leaving the line stuck relative to
-     * the restored IP bits (#77).  Idempotent; independent of the timer.
+     * the restored IP bits.  Idempotent; independent of the timer.
      * Unconditional, like the timer reconcile below: gating it on "a line
      * drive was observed and suppressed" misses every desync the rollback
      * produced on its own, so there is no gate. */

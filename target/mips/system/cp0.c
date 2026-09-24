@@ -180,16 +180,14 @@ void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val)
  * discards them on exactly this arm.  The ring behind the report is the
  * interleaving of reads and writes of the shared word that produced it.
  *
- * It is NOT terminal by construction, and an earlier version of this comment
- * said it was.  cs->halted can be set on a vCPU from another thread, and a
- * vCPU already inside a TB does not read it until the top of cpu_exec(), so
- * the predicate can find every VPE halted while one of them is still
- * retiring instructions and about to reach the EVPE that reopens the
- * processor.  Measured: one control boot fired MVPWEDGE (owed=0x4, the owner
- * parked in mips_mt_send_ipi) and then powered off six seconds later.  A
- * single report is therefore a necessary condition, not a proof; what makes
- * a stall a stall is that the guest never resumes, and the report says which
- * of the four gates to look at when it does not.
+ * The predicate is necessary, not sufficient.  cs->halted can be set on a
+ * vCPU from another thread, and a vCPU already inside a TB does not read it
+ * until the top of cpu_exec(), so the predicate can find every VPE halted
+ * while one of them is still retiring instructions and about to reach the
+ * EVPE that reopens the processor.  A single report is therefore not a
+ * proof of a stall; what makes a stall a stall is that the guest never
+ * resumes, and the report says which of the four gates to look at when it
+ * does not.
  */
 
 int mips_mvp_debug = -1;
@@ -557,8 +555,10 @@ static void mvp_report_cpu(const char *what, CPUState *cs)
  * distinguishes a machine that has ever been gated from one that has not.
  * It is NOT the wedge: on a healthy boot every vCPU is gated many times,
  * transiently, while a peer holds a dvpe section.  The wedge is the second
- * report, and its predicate is exact -- no VPE is executing, and none can
- * become executable, because EVP is only settable by an executing VPE.
+ * report: every VPE halted and every VPE MT-gated.  That predicate is
+ * necessary, not sufficient, for a stall (see the comment at the top of the
+ * MVPControl instrument): a VPE already inside a TB may still be retiring
+ * instructions toward the EVPE that reopens the processor.
  */
 void mips_mvp_note_gate(CPUMIPSState *env)
 {
@@ -577,11 +577,12 @@ void mips_mvp_note_gate(CPUMIPSState *env)
     }
 
     /*
-     * Terminal test.  Every vCPU halted and every vCPU MT-gated means no
-     * instruction will retire on this machine again: every one of the four
-     * gate inputs is guest state that only an executing VPE can write, and
-     * mips_cpu_has_work() discards a pending enabled interrupt on this same
-     * arm, so a device cannot break the tie either.
+     * Wedge test: every vCPU halted and every vCPU MT-gated.  Every one of
+     * the four gate inputs is guest state that only an executing VPE can
+     * write, and mips_cpu_has_work() discards a pending enabled interrupt on
+     * this same arm, so a device cannot break the tie; but a vCPU already
+     * inside a TB can still retire instructions, so this is a necessary
+     * condition for a stall, not a sufficient one.
      */
     CPU_FOREACH(other) {
         CPUMIPSState *oenv = &MIPS_CPU(other)->env;

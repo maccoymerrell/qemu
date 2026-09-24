@@ -33,7 +33,6 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-clock.h"
 #include "semihosting/semihost.h"
-#include "qemu/qemu-plugin.h"
 #include "fpu_helper.h"
 
 const char regnames[32][3] = {
@@ -593,14 +592,11 @@ static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     int ksu = env->hflags & MIPS_HFLAG_KSU;
     *priv = MIPS_HFLAG_UM - ksu;
     /*
-     * The reported address-space value is a LABEL, never an identity
-     * (content-as-gate model, RULING 1): EntryHi.ASID — the value the TLB
-     * actually tags translations with and the one r4k_map_address resolves
-     * through — on every model, walker or not.  The PWBase arm this
-     * replaces existed for identity strength alone; PWBase remains a
-     * TRANSLATION INPUT only (see the debug-walk fallback in
-     * system/physaddr.c).  Wire-visible: mipsel asid labels are now the
-     * 8-bit EntryHi field — goldens recapture.
+     * The reported address-space value is a label, not an identity:
+     * EntryHi.ASID, the value the TLB tags translations with and the one
+     * r4k_map_address resolves through, on every model, walker or not.
+     * PWBase is a translation input only (see the debug-walk fallback in
+     * system/physaddr.c).
      */
     *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     /* MIPS always translates through the TLB (mapped segments fault on a
@@ -729,10 +725,6 @@ static const TCGCPUOps mips_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
-    /* CP0 UserLocal is a dedicated TLS slot the kernel has no use of its
-     * own for: Linux/MIPS writes it from the incoming task in switch_to()
-     * and never touches it in between, so a kernel-privilege read names
-     * the current task (0 for a kernel thread). */
     .plugin_thread_ptr_tracks_current = mips_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = mips_vaddr_is_kernel,
     .spec_clock_resync = mips_spec_clock_resync,

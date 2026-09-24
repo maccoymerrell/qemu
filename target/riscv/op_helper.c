@@ -19,7 +19,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/timer.h"   /* #77 WFI diag: qemu_clock_get_ns / QEMUTimer */
+#include "qemu/timer.h"   /* WFI diagnostic: qemu_clock_get_ns / QEMUTimer */
 #include "cpu.h"
 #include "internals.h"
 #include "exec/exec-all.h"
@@ -601,8 +601,9 @@ void helper_wfi(CPURISCVState *env)
         riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, GETPC());
     } else {
 #ifdef CONFIG_PLUGIN
-        /* #77: at the moment the guest idles (WFI), is the wake stimer correctly
-         * armed?  A mis-armed/unarmed host timer here = WFI never wakes. */
+        /* WFI diagnostic: reports whether the wake stimer is armed at the
+         * moment the guest idles.  An unarmed host timer here means the WFI
+         * never wakes. */
         if (getenv("CST_TIMER_DIAG")) {
             int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             int64_t exp = env->stimer ? env->stimer->expire_time : -1;

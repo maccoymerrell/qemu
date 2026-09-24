@@ -1896,20 +1896,14 @@ target_ulong helper_dvpe(CPUMIPSState *env)
     }
 
     /*
-     * One instruction, one read-modify-write.
-     *
-     * MVPControl is a single per-processor register shared by every VPE of
-     * the processor, and the value DVPE returns is what the guest's nesting
-     * protocol tests to decide whether its matching EVPE has to restore EVP
-     * (`prev = dvpe(); ... evpe(prev);`).  Sampling it and clearing EVP must
-     * therefore be indivisible.  Walking the sibling list and clearing the
-     * bit once per sibling instead gave the instruction N-1 separate stores
-     * with the sample outside all of them, so a peer's EVPE landing in the
-     * middle was undone afterwards by this VPE's remaining stores: the peer
-     * had already spent its restore, this VPE still owed one, and EVP stayed
-     * clear.  Every VPE then failed mips_vpe_active(), mips_cpu_has_work()
-     * forced has_work false with an enabled interrupt pending, and the
-     * machine never retired another instruction.
+     * One instruction, one read-modify-write.  MVPControl is a single
+     * register shared by every VPE of the processor, and the value DVPE
+     * returns is what the guest's nesting protocol tests to decide whether
+     * its matching EVPE has to restore EVP (`prev = dvpe(); ... evpe(prev);`).
+     * Sampling it and clearing EVP must therefore be indivisible: a peer's
+     * EVPE landing between a sample and a separate store would be undone,
+     * leaving EVP clear with no restore owed by anyone, and every VPE would
+     * then fail mips_vpe_active() for good.
      */
     prev = qatomic_fetch_and(&env->mvp->CP0_MVPControl,
                              ~(int32_t)(1 << CP0MVPCo_EVP));
@@ -1920,28 +1914,15 @@ target_ulong helper_dvpe(CPUMIPSState *env)
     if (!(prev & (1 << CP0MVPCo_EVP))) {
         /*
          * The processor was already disabled, so this DVPE is nested inside
-         * another VPE's -- and on hardware it could not have been reached at
-         * all, because that other VPE's DVPE stopped this one from issuing.
-         * QEMU cannot stop a sibling mid-TB, so the instruction does get
-         * executed here; what it must not do is act as though it owned the
-         * disable.  Sleeping the siblings from a nested DVPE halts the VPE
-         * that is holding the section open -- the one VPE that will run the
-         * matching EVPE, because the guest's `evpe(prev)` restores only when
-         * its own DVPE saw EVP set.  That VPE then cannot be rescheduled,
-         * since mips_vpe_active() is false for it too, and the whole
-         * processor stops with EVP clear and the restore still owed.
-         *
-         * Sleeping siblings therefore belongs to the DVPE that performed the
-         * 1 -> 0 transition, and to no other.  With the transition itself
-         * atomic, exactly one VPE owns an open section at a time, and no peer
-         * ISSUES a halt to it while that section is open.
-         *
-         * That is not the same as the owner never being found halted, and
-         * reading it as though it were is what left this stall open.  An
-         * order issued by the PREVIOUS owner, before the EVPE that let this
-         * transition happen, is still unobserved in the target until its next
-         * trip through the top of cpu_exec(); it lands on whatever that VPE
-         * has become by then.  The claim below cancels it.
+         * another VPE's; on hardware it could not have been reached, because
+         * that VPE's DVPE stopped this one from issuing.  QEMU cannot stop a
+         * sibling mid-TB, so the instruction executes here, but it must not
+         * act as though it owned the disable: sleeping the siblings would
+         * halt the VPE holding the section open, the one VPE that will run
+         * the matching EVPE.  Sleeping siblings belongs only to the DVPE that
+         * performed the 1 -> 0 transition.  An order the previous owner
+         * issued before its EVPE may still be unobserved by this VPE; the
+         * claim below cancels it.
          */
         return prev;
     }
@@ -1958,27 +1939,16 @@ target_ulong helper_dvpe(CPUMIPSState *env)
      *
      * mips_vpe_sleep() stores into a sibling's ->halted from another thread,
      * and a sibling already inside a TB does not read that store until the
-     * top of cpu_exec().  It can therefore run on for an unbounded number of
-     * instructions after the store -- including, as measured on this guest in
-     * every one of 14 stalls, the DVPE right here.  The order was issued to
-     * stop a VPE from executing during someone else's section; that section
-     * has since ended (its EVPE is what allowed this DVPE to win), and the
-     * VPE it named is now the one VPE that architecture says must keep
-     * running.  Observing it later would park the owner with EVP clear, and
-     * nothing could ever wake it: the EVPE that would is the instruction it
-     * has not reached.
+     * top of cpu_exec(), so it can run on past the store -- as far as this
+     * DVPE.  The order belonged to a section that has since ended (its EVPE
+     * is what let this DVPE win), and the VPE it named is now the one VPE
+     * the architecture says must keep running; observing it later would park
+     * the owner with EVP clear and nothing left to wake it.  No further
+     * order can arrive while this section is open: a peer sleeps siblings
+     * only inside a section it owns, before the EVPE that ends it.
      *
-     * No further order can arrive while this section is open.  A peer's
-     * sibling-sleep loop runs only inside a section it owns, and its EVPE --
-     * the instruction that lets this DVPE win -- comes after that loop in its
-     * own program order, so every order issued by the previous owner was
-     * issued before this transition.
-     *
-     * The TC's own activation state is asked anyway rather than assumed: a
-     * halt that came from TCHalt / VPA / TCStatus.A is the thread context
-     * saying it must not execute, which is a fact about this VPE and not a
-     * stale statement about someone else's section, and nothing here may
-     * override it.
+     * The TC's own activation state is still honoured: a halt from TCHalt /
+     * VPA / TCStatus.A is a fact about this VPE, not a stale order.
      */
     if (mips_vpe_tc_activated(env)) {
         env_cpu(env)->halted = 0;
@@ -2042,27 +2012,13 @@ target_ulong helper_evpe(CPUMIPSState *env)
         /*
          * Wake every sibling, because the matching DVPE slept every sibling.
          * mips_vpe_sleep() halts a VPE that was running and clears its wake
-         * request, so nothing but this wake will schedule it again: a VPE
-         * stopped mid-computation has no pending interrupt to revive it.
-         *
-         * The old "if the VPE is WFI, don't disturb its sleep" guard could
-         * not survive here.  It asked mips_vpe_is_wfi() of the live shared
-         * word, so the first sibling's write set EVP and made the answer
-         * true for every later halted sibling: an EVPE closing a DVPE that
-         * had slept N-1 VPEs woke exactly one of them, and the rest stayed
-         * halted with the wake request DVPE cleared never reissued.  An IPI
-         * delivered into that window sets CPU_INTERRUPT_HARD on a vCPU that
-         * is never asked for work again, which is how a guest reports
-         * "Unable to send backtrace IPI to CPU0 - perhaps it hung?".
-         *
-         * Asked instead of the SAMPLED word the guard is vacuous rather than
-         * order-dependent -- an EVPE that reaches this loop sampled EVP
-         * clear, under which mips_vpe_active() is false for every VPE -- so
-         * there is no honest form of it to keep.  The cost is that a VPE
-         * that had executed WAIT before the DVPE leaves WAIT here without an
-         * interrupt; MIPS permits WAIT to terminate for implementation
-         * reasons and Linux's idle loop re-enters, and this is what the
-         * first sibling has always had done to it.
+         * request, so nothing but this wake will schedule it again.  There
+         * is no "leave a WFI VPE asleep" exception: an EVPE that reaches this
+         * loop sampled EVP clear, under which mips_vpe_active() is false for
+         * every VPE, so such a test cannot tell a waiting VPE from a stopped
+         * one.  A VPE that had executed WAIT before the DVPE leaves WAIT here
+         * without an interrupt, which MIPS permits (WAIT may terminate for
+         * implementation reasons).
          */
         if (&other_cpu->env != env) {
             mips_vpe_wake(other_cpu, MIPS_MVP_WAKE_EVPE); /* Wake it up. */

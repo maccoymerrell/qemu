@@ -130,30 +130,10 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         cpu_x86_update_cr0(env, t0);
         break;
     /*
-     * A RESERVED BIT IS A #GP ON REAL SILICON, AND VMEXIT(INVALID) ONLY
-     * INSIDE A GUEST.
-     *
-     * Both of the checks below used to take cpu_vmexit() unconditionally.
-     * cpu_vmexit() writes the VMCB through env->vm_vmcb and then reloads the
-     * machine from it, so OUTSIDE SVM guest mode -- where vm_vmcb is 0 and
-     * there is no VMCB -- the guest is reloaded from whatever sits at guest
-     * physical 0 and stops making progress.  It does not fault, and it does
-     * not stop: it hangs.
-     *
-     * MEASURED 2026-09-19, isolated to a single instruction: a long-mode
-     * CPL0 image whose only action is `mov %rax,%cr4` with CR4 bit 31 set
-     * times out under -cpu max AND under -cpu qemu64, with no other state
-     * touched and no other enable set.  The CPL0 reachability leg's enable
-     * stage is where it was caught: the leg reports CTL-CR4.RESERVED31 as
-     * an enable that "wedged the machine", and it is the harness's control
-     * for an enable QEMU MUST refuse.
-     * (evidence: cst_runs/p3/arc3/exec250/cov/enab/)
-     *
-     * AMD APM v2 and Intel SDM v3 both make a reserved-bit CR3 or CR4 write
-     * #GP(0).  The consistency-check VMEXIT is the nested-guest behaviour and
-     * belongs behind HF_GUEST_MASK -- which cpu_vmexit()'s own comment above
-     * it already assumes ("reachable in spec with HF_GUEST_MASK set").  The
-     * guard was simply missing at the call site.
+     * A reserved-bit CR3 or CR4 write is #GP(0) (AMD APM v2, Intel SDM v3).
+     * The consistency-check VMEXIT(INVALID) applies only inside an SVM guest
+     * (HF_GUEST_MASK); outside one there is no VMCB, so cpu_vmexit() must not
+     * be taken there.
      */
     case 3:
         if ((env->efer & MSR_EFER_LMA) &&
@@ -698,8 +678,8 @@ G_NORETURN void helper_hlt(CPUX86State *env)
     /*
      * Wrong-path (speculative) hlt must not actually halt the vCPU: cs->halted
      * would persist past the discarded walk and stall the VM.  Abort the
-     * wrong-path chain instead — cpu_loop_exit lands in cpu_plugin_exec_tb's
-     * spec-exec guard (tb_ok=false -> CST_WP_EVENT_FAULT + poison) — leaving
+     * wrong-path chain instead: cpu_loop_exit unwinds to the spec guard in
+     * cpu_plugin_exec_tb, which ends the wrong-path block, leaving
      * cs->halted / exception_index untouched.
      */
     if (cs->plugin_spec_mode) {

@@ -37,13 +37,13 @@ static void riscv_vstimer_cb(void *opaque)
      * by riscv_cpu_plugin_resync_timers, which re-derives the deadline and
      * re-raises on every excursion exit whether or not this gate was taken.
      *
-     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not just
-     * plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
-     * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is still
-     * live and vtime still paused.  A real IRQ set in that gap is rolled back by
-     * the final wp_end restore, so it must not be raised here at all (#77).
+     * Gate on plugin_excursion_active (true for the WHOLE excursion), not just
+     * plugin_spec_mode: spec mode is clear at the excursion's edges (before
+     * qemu_plugin_spec_mode_begin, and after qemu_plugin_spec_mode_end until
+     * the register restore) while the snapshot is live.  A real IRQ set there
+     * is rolled back by the restore, so it must not be raised here at all.
      */
-    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_excursion_active) {
         return;
     }
 #endif
@@ -58,7 +58,7 @@ static void riscv_stimer_cb(void *opaque)
     if (getenv("CST_TIMER_DIAG")) {
         fprintf(stderr, "[stimer] FIRE spec=%d vtp=%d stimecmp=0x%llx\n",
                 (int)CPU(cpu)->plugin_spec_mode,
-                (int)CPU(cpu)->plugin_spec_vtime_paused,
+                (int)CPU(cpu)->plugin_excursion_active,
                 (unsigned long long)cpu->env.stimecmp);
     }
 #endif
@@ -255,15 +255,14 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
 }
 
 /*
- * Wrong-path excursion-exit reconcile (#77).  A WP excursion can perturb the
+ * Wrong-path excursion-exit reconcile.  A WP excursion can perturb the
  * host timers — a stimer cb fires and is deferred, or stimecmp is rolled back
  * by the register-state restore.  Re-arm and re-raise once per excursion,
  * unconditionally, so a firing the cb suppressed is not lost -- correctness
  * does not depend on the cb having recorded that it suppressed one, nor on
- * every way a timer can drift having been enumerated.  Runs at the true
- * excursion-exit boundary
- * (cpu_plugin_spec_vtime_resume), after ticks are re-enabled and spec mode has
- * ended, not at an intermediate fault-skip restore.
+ * every way a timer can drift having been enumerated.  Runs at the
+ * excursion-exit boundary (cpu_plugin_excursion_close), after the register
+ * restore, after ticks are re-enabled and after spec mode has ended.
  */
 void riscv_cpu_plugin_resync_timers(CPUState *cs)
 {

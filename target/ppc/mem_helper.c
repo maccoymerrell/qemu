@@ -329,8 +329,6 @@ static void ppc_plugin_block_zero_cb(CPUPPCState *env, target_ulong addr,
         addr += bytes;
         size -= bytes;
     }
-#else
-    (void)env; (void)addr; (void)size; (void)mmu_idx;
 #endif
 }
 

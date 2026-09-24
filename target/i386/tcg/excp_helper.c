@@ -102,8 +102,8 @@ void raise_interrupt2(CPUX86State *env, int intno,
      * check_exception() into a double/triple fault -> qemu_system_reset_request
      * and reset the VM, or vector into a handler whose side effects pollute
      * the discarded path.  Abort the wrong-path chain at the first one:
-     * cpu_loop_exit lands in cpu_plugin_exec_tb's spec guard (tb_ok=false ->
-     * CST_WP_EVENT_FAULT + PC poison).  Paging faults are already aborted
+     * cpu_loop_exit unwinds to the spec guard in cpu_plugin_exec_tb, which
+     * ends the wrong-path block.  Paging faults are already aborted
      * earlier in tlb_fill_align; this catches #GP/#UD/#DE/etc. before x86's
      * synchronous double-fault escalation.
      */

@@ -157,8 +157,9 @@ static inline bool virtual_gif_set(CPUX86State *env)
  * Wrong-path (speculative): the SVM/virtualization helpers write host save
  * state to guest *physical* memory (x86_st*_phys, bypassing the sandboxed
  * softmmu store path) and mutate complex global VMM state.  None of that can
- * be rolled back, so abort the speculative walk on encountering one — caught
- * by cpu_plugin_exec_tb's guard (tb_ok=false), exactly like helper_hlt.
+ * be rolled back, so abort the speculative walk on encountering one: the
+ * unwind reaches the spec guard in cpu_plugin_exec_tb, which ends the
+ * wrong-path block, exactly like helper_hlt.
  */
 #define CST_SPEC_ABORT_VMM(env) do {                       \
     if (env_cpu(env)->plugin_spec_mode) {                  \

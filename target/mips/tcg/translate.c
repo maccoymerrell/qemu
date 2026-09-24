@@ -4592,10 +4592,9 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
 
     ctx->btarget = btgt;
     /*
-     * Surface the resolved static target to plugins for wrong-path
-     * tracing.  Indirect branches (OPC_JR/OPC_JALR) leave btgt at
-     * its -1 sentinel above — those rely on the plugin's observed-
-     * target history instead, signalled by branch_target_pc == 0.
+     * Record the resolved static target for plugins.  Indirect branches
+     * (OPC_JR/OPC_JALR) leave btgt at its -1 sentinel above and record
+     * nothing, so their instruction's static target stays unknown (0).
      */
     if (btgt != (target_ulong)-1) {
         plugin_gen_record_branch_target((uint64_t)btgt);
@@ -6064,10 +6063,6 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            /* Q13 v4 default, maintainer-vetoable: EntryHi ASID_WRITE is
-             * the sole gate-refresh event; PWBase is stored inline (its
-             * committed-write event push retired with the identity
-             * apparatus). */
             gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_PWBase));
             register_name = "PWBase";
             break;
@@ -15257,9 +15252,8 @@ static void mips_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
 }
 
 /*
- * v4 repair (maintainer-vetoable): never-split RETREAT support.  The
- * checkpoint captures hflags at each insn boundary; a retreat restores
- * it, so ending the TB at a boundary that re-opens a delay slot (the
+ * Never-split retreat support.  The checkpoint captures hflags at each
+ * insn boundary; a retreat restores it, so ending the TB at a boundary that re-opens a delay slot (the
  * dropped sequence's first insn was the slot of a kept branch) re-arms
  * the pending-branch state.  saved_hflags is poisoned so save_cpu_state
  * in tb_stop re-emits the hflags (and, under BMASK, btarget) stores —

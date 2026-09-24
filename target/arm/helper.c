@@ -3219,24 +3219,19 @@ void arm_gt_hvtimer_cb(void *opaque)
  *   - a speculative write to CNTV_CVAL/CNTV_CTL (or to CNTVOFF) reprogrammed
  *     the host timer for a deadline the correct path never asked for.
  *
- * Either way the guest's clockevent stops arriving: the aarch64 system-mode
- * storm.  gt_recalc_timer recomputes ISTATUS from the restored registers plus
- * the current (thawed, and therefore frozen-time-consistent) count and
- * re-arms or re-fires the host timer, so it is exactly the reconciliation the
- * contract asks for, for every source at once.
+ * Either way the guest's clockevent stops arriving.  gt_recalc_timer
+ * recomputes ISTATUS from the restored registers plus the current (thawed,
+ * and therefore frozen-time-consistent) count and re-arms or re-fires the
+ * host timer, which is exactly the reconciliation the contract asks for.
  *
- * Run over every present timer UNCONDITIONALLY.  This used to be gated on a
- * flag the spec gates set, i.e. on having observed one of the two mechanisms
- * above; anything that desynced a timer without tripping that flag — a
- * rolled-back CNTVOFF, an expiry racing excursion entry before the gates are
- * visible to the iothread, a timer reprogrammed from a path with no spec gate
- * — was silently missed.  gt_recalc_timer is idempotent on an already
- * consistent timer, so the only cost of dropping the gate is the recompute
- * itself; correctness no longer depends on having enumerated every way a
- * timer can drift.
+ * It runs over every present timer unconditionally, so correctness does not
+ * depend on having observed how a timer drifted (a rolled-back CNTVOFF, an
+ * expiry racing excursion entry, a reprogram from a path with no spec gate);
+ * gt_recalc_timer is idempotent on an already consistent timer.
  *
  * Called after spec mode has ended, so gt_recalc_timer's own spec gate is
- * open, and with the BQL held (it drives the timer IRQ line).
+ * open.  It drives the timer IRQ line, so it takes the BQL if the caller
+ * does not already hold it.
  */
 void arm_cpu_plugin_resync_timers(CPUState *cs)
 {
@@ -4076,7 +4071,6 @@ static void pmsav7_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                               uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4097,7 +4091,6 @@ static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void prbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4116,7 +4109,6 @@ static uint64_t prbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4135,7 +4127,6 @@ static uint64_t prlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4156,7 +4147,6 @@ static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void hprbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4175,7 +4165,6 @@ static uint64_t hprbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4194,7 +4183,6 @@ static uint64_t hprlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprenr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4235,7 +4223,6 @@ static uint64_t hprenr_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }
@@ -4256,7 +4243,6 @@ static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav8r_regn_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
-    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
     if (arm_pmsa_write_discarded(env)) {
         return;
     }

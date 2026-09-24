@@ -476,7 +476,10 @@ struct CPUArchState {
     uint64_t henvcfg;
 #endif
 
-    /* Fields up to this point are cleared by a CPU reset */
+    /*
+     * Bound of the plugin wrong-path snapshot; not used by reset on this
+     * target.
+     */
     struct {} end_reset_fields;
 
     /* Fields from here on are preserved across CPU reset. */
@@ -496,8 +499,7 @@ struct CPUArchState {
      * end_reset_fields so it is outside the snapshot and cannot itself be
      * rolled back.  See the replay comment in cpu_plugin_arch_state_restore.
      */
-    uint64_t plugin_spec_mip_set;    /* externally raised during excursion */
-    uint64_t plugin_spec_mip_clear;  /* externally lowered during excursion */
+    CPUPluginIrqDelta plugin_irq_delta;
     /* Set while the guest's own mip/sip CSR write is in flight, so its
      * (speculative, therefore discardable) effect is not mistaken for an
      * external device assertion. */

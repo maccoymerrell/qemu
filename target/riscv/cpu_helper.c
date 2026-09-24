@@ -648,9 +648,9 @@ bool riscv_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         CPURISCVState *env = &cpu->env;
         int interruptno = riscv_cpu_local_irq_pending(env);
 #ifdef CONFIG_PLUGIN
-        /* #77: why does the timer tick stop being delivered during teardown?
-         * Throttled to ~1/host-sec: is this even called (interrupt_request set?),
-         * and if so does STIP deliver or is it masked (interruptno<0)? */
+        /* Interrupt-delivery diagnostic, throttled to ~1/host-sec: reports
+         * interrupt_request and whether STIP delivers or is masked
+         * (interruptno < 0). */
         if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
             static long last;
             long now = (long)time(NULL);
@@ -843,14 +843,14 @@ void riscv_cpu_interrupt(CPURISCVState *env)
      * line.  A speculative CSR write to mip/sip/mie still updates env->mip
      * (rolled back at walk end), but the global interrupt-request side
      * effect must not escape the discarded path.  Gate on the WHOLE
-     * excursion (vtime_paused), not just spec_mode: the fault-skip gap
-     * briefly clears spec_mode while the snapshot is live, and an
+     * excursion (plugin_excursion_active), not just spec_mode: spec mode
+     * is clear at the excursion's edges while the snapshot is live, and an
      * iothread mip update landing there would drive the line from state
      * the walk-end restore erases.  The excursion-exit resync recomputes
      * the line from restored state unconditionally, so nothing has to be
      * recorded here for it.
      */
-    if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+    if (cs->plugin_spec_mode || cs->plugin_excursion_active) {
         return;
     }
 #endif
@@ -900,20 +900,20 @@ uint64_t riscv_cpu_update_mip(CPURISCVState *env, uint64_t mask, uint64_t value)
      * Record the externally-caused delta so the restore can replay it.  The
      * timer bits (MTIP/STIP/VSTIP) are excluded because the timer reconcile
      * re-derives them from the architected compare registers; carrying them
-     * here as well perturbed interrupt-delivery timing across the wrong-path
-     * merge (#77).
+     * here as well would perturb interrupt-delivery timing across the
+     * wrong-path merge.
      */
     {
         CPUState *cs = env_cpu(env);
-        if (unlikely((cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) &&
+        if (unlikely((cs->plugin_spec_mode || cs->plugin_excursion_active) &&
                      !env->plugin_mip_guest_write)) {
             uint64_t ext = ~(uint64_t)(MIP_MTIP | MIP_STIP | MIP_VSTIP);
             uint64_t raised = (env->mip & ~old) & ext;
             uint64_t lowered = (old & ~env->mip) & ext;
-            env->plugin_spec_mip_set =
-                (env->plugin_spec_mip_set & ~lowered) | raised;
-            env->plugin_spec_mip_clear =
-                (env->plugin_spec_mip_clear & ~raised) | lowered;
+            env->plugin_irq_delta.set =
+                (env->plugin_irq_delta.set & ~lowered) | raised;
+            env->plugin_irq_delta.clear =
+                (env->plugin_irq_delta.clear & ~raised) | lowered;
         }
     }
 #endif
@@ -2353,7 +2353,7 @@ void riscv_cpu_do_interrupt(CPUState *cs)
 
 #ifdef CONFIG_PLUGIN
     if (!async && cause == RISCV_EXCP_ILLEGAL_INST && getenv("CST_ILL_DIAG")) {
-        /* #77: pin down the SIGILL source. bins==0 / garbage => instruction-
+        /* Illegal-instruction diagnostic: bins==0 / garbage => instruction-
          * memory corruption (leaked store); a valid-but-misaligned encoding =>
          * bad branch IP.  spec=1 would mean WP is delivering (should never). */
         fprintf(stderr, "[ill] spec=%d pc=0x%llx bins=0x%08llx priv=%d "
@@ -2371,10 +2371,9 @@ void riscv_cpu_do_interrupt(CPUState *cs)
                 (int)async, (unsigned long long)cause,
                 (unsigned long long)cs->cc->get_pc(cs));
     }
-    /* #77: is the guest timer tick dying?  Count timer IRQs DELIVERED on the
-     * correct path; print the running total once per host-second.  If the total
-     * plateaus after "powering off", the timer tick has stopped (livelock by
-     * timer starvation, the aarch64-storm class). */
+    /* Timer-tick diagnostic: count timer IRQs delivered on the correct path
+     * and print the running total once per host-second.  A total that
+     * plateaus means the guest timer tick has stopped. */
     if (getenv("CST_TICK_DIAG") && async && !cs->plugin_spec_mode) {
         static unsigned long n_timer, n_async;
         static long last_sec;

@@ -32,51 +32,34 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
 
 #if defined(TARGET_X86_64) && defined(CONFIG_LINUX_USER)
     /*
-     * THE TWO REGISTERS SYSCALL WRITES BEFORE IT TRANSFERS CONTROL.
+     * The two registers SYSCALL writes before it transfers control.
      *
      * Long-mode SYSCALL performs, in the instruction and not in the kernel:
      *
      *     RCX <- RIP of the instruction after SYSCALL
      *     R11 <- RFLAGS, with RF cleared
      *
-     * Both stores are on the USER side of the boundary -- which is why every
-     * x86_64 psABI lists the pair as clobbered by a syscall, and why Linux's
-     * SYSRET return path can reload RFLAGS out of R11.  The system-mode
-     * helper beside this one performs them (target/i386/tcg/system/
-     * seg_helper.c, the HF_LMA_MASK arm); this one raised EXCP_SYSCALL and
-     * performed neither, so a *-linux-user guest carried its pre-SYSCALL RCX
-     * and R11 straight across the call.  That is a state no machine produces,
-     * and it is visible to the guest: a dependency chain through either
-     * register that hardware breaks at the syscall survived it here, and the
-     * stale pair reached signal frames.
+     * Both stores are on the user side of the boundary, which is why the
+     * x86_64 psABI lists the pair as clobbered by a syscall; the system-mode
+     * helper performs them in its HF_LMA_MASK arm.
      *
-     * THE THIRD ARCHITECTURAL EFFECT, `RFLAGS &= ~IA32_FMASK`, IS
-     * DELIBERATELY NOT PERFORMED, and that is the answer that matches the
-     * machine rather than a shortcut away from it: there is no kernel and no
-     * FMASK in this mode, the single modelled `syscall` stands for the whole
-     * entry-and-return, and the SYSRET the kernel returns through reloads
-     * RFLAGS from R11 -- so a Linux process observes its flags UNCHANGED
-     * across a syscall on real hardware.  Masking by an env->fmask no guest
-     * ever wrote would move this AWAY from that.
+     * The third architectural effect, `RFLAGS &= ~IA32_FMASK`, is not
+     * performed: there is no kernel and no FMASK in this mode, the modelled
+     * `syscall` stands for the whole entry-and-return, and the SYSRET the
+     * kernel returns through reloads RFLAGS from R11, so a Linux process
+     * observes its flags unchanged across a syscall.
      *
-     * SCOPE, and each boundary is here because a host dispatcher reads the
-     * register the write would destroy:
+     * Scope, each boundary set by a host dispatcher that reads the register
+     * the write would destroy:
      *
-     *   - LONG MODE ONLY.  Legacy SYSCALL is routed into cpu_loop()'s
-     *     int-0x80 arm, which reads ECX as the syscall's SECOND ARGUMENT.
-     *   - *-linux-user ONLY.  bsd-user's amd64 dispatcher
+     *   - Long mode only.  Legacy SYSCALL is routed into cpu_loop()'s
+     *     int-0x80 arm, which reads ECX as the syscall's second argument.
+     *   - *-linux-user only.  bsd-user's amd64 dispatcher
      *     (bsd-user/x86_64/target_arch_cpu.h) passes env->regs[R_ECX] as the
-     *     syscall's FOURTH argument -- its own defect against FreeBSD's
-     *     %r10 ABI, but not one this change is authorised to correct, and
-     *     clobbering RCX underneath it would turn a wrong register VALUE
-     *     into wrong syscall BEHAVIOUR.
+     *     syscall's fourth argument.
      *
-     * WRONG-PATH CARVE-OUT, the same one the system helper states: a
-     * speculative SYSCALL is fetched and executed but never performed, and
-     * the walker leaves a skipped instruction's destinations at their
-     * previous values as its deterministic placeholder.  Writing them here
-     * would make a wrong-path SYSCALL differ from a system-mode one for no
-     * architectural reason.
+     * A wrong-path (speculative) SYSCALL is not performed, so its register
+     * writes are skipped as well, as in the system-mode helper.
      */
     if ((env->hflags & HF_LMA_MASK)
 #ifdef CONFIG_PLUGIN

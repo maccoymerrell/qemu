@@ -127,20 +127,13 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
      * (PCID NOFLUSH).  Architecturally bit 63 is a command bit on the
      * MOV-to-CR3 write — "skip the TLB flush" — not state: MOV from CR3
      * always reads it as 0, so it can never distinguish address spaces
-     * and masking it is unconditionally safe.  It is also unreachable
-     * under current TCG — system emulation never advertises PCID
-     * (TCG_EXT_FEATURES), a Linux guest therefore never sets
-     * CR4.PCIDE/NOFLUSH (audited empirically: -cpu Haswell boot, 20k+
-     * committed CR3 writes, all 4 KiB-aligned, bit 63 clear), and
-     * helper_write_crN faults long-mode CR3 writes with bits above
-     * phys_bits as reserved anyway — so the mask only guards the
-     * verbatim CR3 image loads (VMRUN, SMM RSM) and any future TCG PCID
-     * support.  PCID bits [11:0] are deliberately NOT masked: with
-     * CR4.PCIDE they are a genuine component of the address-space
-     * identity (Linux PTI tags the user-half CR3 with PCID bit 11), and
-     * no PCID-capable TCG configuration exists to justify collapsing
-     * them.  Producers of ASID-change notifications must compare under
-     * this same mask (see cpu_x86_update_cr3).
+     * and masking it is unconditionally safe.  TCG does not advertise
+     * PCID (TCG_EXT_FEATURES), so the mask guards the verbatim CR3 image
+     * loads (VMRUN, SMM RSM) and any future TCG PCID support.  PCID bits
+     * [11:0] are not masked: with CR4.PCIDE they are a genuine component
+     * of the address-space identity.  Producers of ASID-change
+     * notifications must compare under this same mask (see
+     * cpu_x86_update_cr3).
      */
     *asid = env->cr[3] & ~CR3_NOFLUSH_MASK;
     /* Paging active iff CR0.PG; off in real mode / early boot. */
@@ -153,8 +146,8 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
  * Resolve the guest kernel's `current` at CPL0 through the per-CPU
  * area, for a task with no TLS identity (FS.base == 0).  Engaged only
  * when a plugin has declared the per-image current_task per-CPU offset
- * (qemu_plugin_set_current_task_offset); undeclared, the legacy
- * register-only contract is untouched byte-for-byte.
+ * (qemu_plugin_set_current_task_offset); undeclared, the thread pointer
+ * is derived from the segment bases alone.
  *
  * The contract, as the kernel source states it (Linux 6.6/6.12,
  * arch/x86/entry/entry_64.S paranoid_entry): "the kernel enforces that
@@ -186,14 +179,12 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
  *  - A loaded value that is not a kernel VA (per-CPU area not yet
  *    initialised at early boot).
  *
- * Known residual, named not hidden: TCG advertises FSGSBASE, and "with
- * FSGSBASE no assumptions can be made about the GSBASE value when
- * entering from user space" (paranoid_entry comment) — a guest thread
- * that deliberately WRGSBASEs a kernel-half VA forges the kernel-GS
- * signature for its own entry windows.  The value gate above bounds it
- * (the forged base must ALSO hold a kernel-VA-shaped word at the
- * offset); the class is the same accepted one as an AArch64 user
- * setting SP to a kernel-shaped value before trapping.
+ * Limitation: TCG advertises FSGSBASE, so a guest thread that
+ * deliberately WRGSBASEs a kernel-half VA forges the kernel-GS signature
+ * for its own entry windows.  The value gate above bounds it (the forged
+ * base must also hold a kernel-VA-shaped word at the offset); it is the
+ * same class as an AArch64 user setting SP to a kernel-shaped value before
+ * trapping.
  */
 static bool x86_kernel_current_task(CPUState *cs, uint64_t *task)
 {
@@ -328,28 +319,15 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * write to IA32_TSC_DEADLINE reaches apic_handle_tsc_deadline, but wrong-path
  * device access is sandboxed, so it never reaches the APIC model.)
  *
- * The TSC was the exception, because cpu_get_ticks() accumulated the host
- * cycle counter while everything else accumulated host CLOCK_MONOTONIC: two
- * host oscillators, sampled at four different instants by each freeze/thaw
- * pair, drifting apart by a fixed displacement per pair that a one-directional
- * correction could only rectify and never remove — until the guest's
- * clocksource watchdog marked the TSC unstable and wedged timekeeping and RCU.
- *
- * It is no longer an exception.  The hook's whole remaining job is to measure
- * the host's own cycles-per-CLOCK_MONOTONIC-second ratio and hand it to
+ * The TSC is made to follow the same clock.  This hook measures the host's
+ * own cycles-per-CLOCK_MONOTONIC-second ratio over the first ~0.2 s of
+ * emulation (both host clocks sampled over the same real intervals, so
+ * freezes inside them do not bias it) and hands it to
  * cpu_plugin_tsc_lock_to_vclock(), which makes cpu_get_ticks() an affine
- * function of QEMU_CLOCK_VIRTUAL from that instant on.  The two guest
- * clocksources are then the same oscillator, freezing one freezes both, and
- * the resync obligation is discharged structurally rather than at every thaw.
- *
- * The ratio is self-calibrated over the first ~0.2 s of emulation, both host
- * clocks sampled over the same real intervals so freezes inside them do not
- * bias it.  Arming is continuous (the line is anchored at the pair's current
- * value) and one-shot, so the guest sees neither a step nor a rate change,
- * and the displacement accumulated before arming is frozen in as a constant
- * instead of continuing to grow.  Reading the two host clocks here rather
- * than at one instant no longer matters: the difference lands in the ratio's
- * last few parts per billion, not in a term that ratchets.
+ * function of QEMU_CLOCK_VIRTUAL from that instant on.  The TSC and the
+ * virtual clock are then one oscillator, so freezing one freezes both.
+ * Arming is continuous (anchored at the current value) and one-shot, so the
+ * guest sees neither a step nor a rate change.
  *
  * BQL-serialised: both callers of this hook hold it, which is what protects
  * the calibration accumulators below and the one-shot arming.
@@ -393,10 +371,6 @@ static const TCGCPUOps x86_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
-    /* A 64-bit kernel keeps its own per-CPU base in GS (swapgs on entry)
-     * and reloads FS.base from the incoming task in __switch_to(), so the
-     * FS.base this hook reads above user privilege names the current
-     * task. */
     .plugin_thread_ptr_tracks_current = x86_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
     .spec_clock_resync = x86_spec_clock_resync,

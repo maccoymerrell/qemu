@@ -19,7 +19,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/qemu-plugin.h"
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
@@ -1992,9 +1991,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     Error *local_err = NULL;
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
-    /* Use pc-relative instructions in system-mode — unless a TCG plugin is
-     * loaded (see tcg_cflags_set_pcrel: a pc-less TB identity misattributes
-     * plugin records across virtual mappings of one physical page). */
+    /* Use pc-relative instructions in system-mode (tcg_cflags_set_pcrel). */
     tcg_cflags_set_pcrel(cs);
 #endif
 
@@ -2733,7 +2730,7 @@ static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
      *
      * env->sp_el[0] is authoritative while the banked SP_EL1 is active
      * (Linux runs EL1h); on the EL1t corner the live SP_EL0 is xregs[31].
-     * AArch32 guests keep the historical TPIDRURW-only behaviour.
+     * AArch32 guests report TPIDRURW only.
      */
     uint64_t tp = env->cp15.tpidr_el[0];
     if (!is_a64(env) || arm_current_el(env) == 0 || tp != 0) {
@@ -2808,8 +2805,8 @@ static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * on an already-correct bit is a no-op.
  *
  * This is Arm's counterpart of the RISC-V mip reconcile and the MIPS
- * CP0_Cause.IP reconcile; Arm previously had no interrupt-line reconcile at
- * all, so an excursion that raced a GIC level change left the line stuck.
+ * CP0_Cause.IP reconcile: without it, an excursion that raced a GIC level
+ * change would leave the line stuck.
  */
 static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
 {
@@ -2872,10 +2869,6 @@ static const TCGCPUOps arm_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
-    /* TPIDR_EL0 is the EL0 thread pointer; EL1 has TPIDR_EL1 for its own
-     * per-CPU use, so the kernel only ever writes TPIDR_EL0 from the
-     * incoming task (tls_thread_switch()) and a read at EL1 names the
-     * current task. */
     .plugin_thread_ptr_tracks_current = arm_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
     .spec_clock_resync = arm_spec_clock_resync,
@@ -2927,8 +2920,6 @@ static void arm_cpu_class_init(ObjectClass *oc, void *data)
     cc->gdb_stop_before_watchpoint = true;
     cc->disas_set_info = arm_disas_set_info;
 
-#if defined(CONFIG_TCG) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
-#endif
 #ifdef CONFIG_TCG
     cc->tcg_ops = &arm_tcg_ops;
 #endif /* CONFIG_TCG */

@@ -18,7 +18,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/qemu-plugin.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
 #include "qemu/qemu-print.h"
@@ -8135,9 +8134,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     unsigned requested_lbr_fmt;
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
-    /* Use pc-relative instructions in system-mode — unless a TCG plugin is
-     * loaded (see tcg_cflags_set_pcrel: a pc-less TB identity misattributes
-     * plugin records across virtual mappings of one physical page). */
+    /* Use pc-relative instructions in system-mode (tcg_cflags_set_pcrel). */
     tcg_cflags_set_pcrel(cs);
 #endif
 

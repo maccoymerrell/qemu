@@ -547,19 +547,20 @@ void riscv_pmu_timer_cb(void *priv)
      * Wrong-path (speculative): the host pmu_timer (QEMU_CLOCK_VIRTUAL) callback
      * can fire in the iothread during an excursion's wall-clock window (the
      * gt-timer precedent, accel/tcg/cpu-exec.c).  pmu_timer_trigger_irq would
-     * re-arm cpu->pmu_timer (outside the WP snapshot, not reconciled by
-     * riscv_cpu_plugin_resync_timers) and clear counter->irq_overflow_left.
-     * Bail on the discarded path; the one-shot has now fired and does not
-     * re-arm itself, so the deferred expiry is owed to the guest -- it is
-     * paid by riscv_pmu_plugin_resync below, from excursion-exit reconcile.
+     * re-arm cpu->pmu_timer, which lives outside the WP snapshot, and clear
+     * counter->irq_overflow_left.  Bail on the discarded path; the one-shot
+     * has now fired and does not re-arm itself, so the deferred expiry is
+     * owed to the guest.  It is reconciled at excursion exit by
+     * riscv_pmu_plugin_resync below.
      *
-     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
-     * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
-     * while the snapshot is still live, and a firing in that gap would set an
-     * OF bit the final restore rolls back while its LCOFIP raise is recorded
-     * and replayed -- a fabricated LCOFIP-without-OF (#77).
+     * Gate on plugin_excursion_active (true for the WHOLE excursion), not
+     * just plugin_spec_mode: spec mode is clear at the excursion's edges
+     * (before qemu_plugin_spec_mode_begin, and after qemu_plugin_spec_mode_end
+     * until the register restore) while the snapshot is live, and a firing
+     * there would set an OF bit the restore rolls back while its LCOFIP raise
+     * is recorded and replayed -- a fabricated LCOFIP-without-OF.
      */
-    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_excursion_active) {
         return;
     }
 #endif
@@ -603,12 +604,12 @@ int riscv_pmu_setup_timer(CPURISCVState *env, uint64_t value, uint32_t ctr_idx)
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path (speculative): do not arm the host PMU overflow timer.
-     * cpu->pmu_timer lives outside the WP register snapshot and is NOT
-     * reconciled by riscv_cpu_plugin_resync_timers, so a speculative
-     * mhpmcounter/mcountinhibit write would leave the real timer programmed for
-     * a discarded-path deadline (the #77 host-timer-desync class).  The
-     * speculative counter state is rolled back; leave the host timer as the
-     * correct path armed it.
+     * cpu->pmu_timer lives outside the WP register snapshot, so a speculative
+     * mhpmcounter/mcountinhibit write would leave the real timer programmed
+     * for a discarded-path deadline.  The speculative counter state is rolled
+     * back; leave the host timer as the correct path armed it.  Any expiry
+     * the excursion deferred is reconciled at excursion exit by
+     * riscv_pmu_plugin_resync.
      */
     if (env_cpu(env)->plugin_spec_mode) {
         return -1;

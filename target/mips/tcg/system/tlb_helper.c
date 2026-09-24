@@ -275,11 +275,12 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
  * Wrong-path (speculative) containment.  The emulated MIPS TLB array
  * (env->tlb->mmu...) lives PAST end_reset_fields in CPUMIPSState, so it is
  * NOT part of the register snapshot the wrong-path walk rolls back.  A
- * speculative TLBWI/TLBWR/TLBINV(F) rewrites that array (and may flush the
- * softmmu TLB), and the change survives the walk — corrupting the correct
- * path's address translation.  Suppress these on the discarded path; the
- * CP0 registers they consume (EntryHi/Lo/Index) are in the snapshot and are
- * rolled back regardless.
+ * speculative TLBWI, TLBWR, TLBINV, TLBINVF or GINVT rewrites that array,
+ * and TLBR drops the shadow entries and may flush the softmmu TLB through
+ * its EntryHi load; the change survives the walk, corrupting the correct
+ * path's address translation.  Every one of these helpers is suppressed on
+ * the discarded path; the CP0 registers they consume (EntryHi/Lo/Index) are
+ * in the snapshot and are rolled back regardless.
  */
 #ifdef CONFIG_PLUGIN
 #define MIPS_WP_TLB_GATE(env)                          \
@@ -1475,7 +1476,7 @@ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         CPUMIPSState *env = cpu_env(cs);
 
 #ifdef CONFIG_PLUGIN
-        /* #77 line-leak probe (mirror of the riscv CST_IRQ_DIAG): is the
+        /* Line-leak diagnostic (mirror of the riscv CST_IRQ_DIAG): is the
          * CPU_INTERRUPT_HARD line stuck set with no backing CP0_Cause.IP
          * (the wrong-path line leak signature)?  Throttled ~1/host-sec. */
         if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {

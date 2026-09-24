@@ -660,27 +660,11 @@ void helper_fdivr_STN_ST0(CPUX86State *env, int st_index)
 /* misc FPU operations */
 
 /*
- * FCHS and FABS clear C1, and this emulation did not.
- *
- * The SDM's "FPU flags affected" section reads, for both instructions,
- * "C1 Set to 0.  C0, C2, C3 Undefined."  Neither examines the datum beyond
- * its sign bit, so neither raises and neither accumulates an exception flag,
- * and that is presumably why the clear was never written: there is no
- * merge_exception_flags() on this path to carry it.  But C1 is a real bit of
- * a real architectural register, a following `fnstsw %ax` reads it, and
- * hardware zeroes it here.  Leaving it is an emulation gap, not a modelling
- * choice.
- *
- * FOUND BY A REFERENCE, NOT BY READING: gem5's X86 model publishes a
- * status-word destination (miscellaneous:194) for `fabs` and `fchs` on the
- * wrong-path probe, and this tree's trace did not, which is the disagreement
- * FINDING 244-D was filed on.  The trace was faithful to QEMU; QEMU was not
- * faithful to the SDM.
- *
- * C1 is bit 9 of the status word.  The other three condition codes are
- * architecturally undefined here, so they are left where they are -- an
- * undefined bit may hold anything, and inventing a value for it would be a
- * second, quieter departure from the manual.
+ * FCHS and FABS clear C1 (SDM, "FPU flags affected": "C1 Set to 0.  C0, C2,
+ * C3 Undefined.").  Neither raises an exception, so there is no
+ * merge_exception_flags() on this path to carry the clear; do it here.  C1
+ * is bit 9 of the status word.  C0, C2 and C3 are architecturally undefined
+ * and are left unchanged.
  */
 void helper_fchs_ST0(CPUX86State *env)
 {

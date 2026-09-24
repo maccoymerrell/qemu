@@ -132,10 +132,12 @@ typedef struct CPUArchState {
 
     uint64_t features;
 
-    /* End-of-execution-state marker used by the plugin spec-mode
-     * save/restore path (offsetof(CPUArchState, end_reset_fields));
-     * placed at struct end here, so the whole CPUArchState is
-     * captured under spec mode for this target. */
+    /*
+     * Bound of the plugin wrong-path snapshot
+     * (offsetof(CPUArchState, end_reset_fields)); not used by reset on
+     * this target.  Placed at the struct end, so the snapshot covers the
+     * whole CPUArchState.
+     */
     struct {} end_reset_fields;
 } CPUAVRState;
 

@@ -243,8 +243,12 @@ def _stage_and_boot(dd: Path) -> tuple[int, str]:
         ctext = console.read_text(errors="replace") if console.exists() else ""
         raise AssertionError(f"boot produced no trace (qemu_rc={rc}); "
                              f"console tail:\n{ctext[-800:]}")
-    dec = subprocess.run([str(CST_DECODE), str(cst)],
-                         check=True, capture_output=True, text=True)
+    # --strict: the decoder's lint verdict on this trace gates the probe.
+    dec = subprocess.run([str(CST_DECODE), "--strict", str(cst)],
+                         capture_output=True, text=True)
+    if dec.returncode != 0:
+        raise AssertionError(f"cst_decode --strict {cst} rc="
+                             f"{dec.returncode}: {dec.stderr[-800:]}")
     return rc, dec.stdout
 
 

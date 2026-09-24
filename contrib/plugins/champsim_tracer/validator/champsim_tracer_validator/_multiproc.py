@@ -329,15 +329,24 @@ def _strict_rc(cfg: MPConfig, cst: Path) -> int:
 def _audit_clean(cfg: MPConfig, cst: Path) -> tuple:
     rc, out = _run([_audit(cfg), str(cst)])
     rollup = re.search(r"\[rollup (\d+\.\d+)%\]", out)
-    imposs = re.search(r"impossible attributions: (\d+) memop.*?(\d+) regdata"
-                       r".*?(\d+) dangling", out)
+    # The lint's whole summary, every column: the line used to read the
+    # memop / regdata / dangling groups only, so a probe failing on
+    # over-max executions printed "impossible=(0 memop,0 regdata)" -- a
+    # red verdict whose own line named nothing wrong (row 509).
+    imposs = re.search(
+        r"impossible attributions: (\d+) memop \(\d+ distinct insns\), "
+        r"(\d+) regdata \(\d+ distinct insns\), "
+        r"(\d+) dangling template refs \(\d+ distinct ids\), "
+        r"(\d+) over-max executions \(\d+ distinct insns\)", out)
+    cols = ("memop", "regdata", "dangling", "over-max")
+    vals = [imposs.group(i + 1) if imposs else "?" for i in range(4)]
     ok = (rc == 0 and rollup is not None and rollup.group(1) == "100.00"
-          and imposs is not None and imposs.group(1) == "0"
-          and imposs.group(2) == "0" and imposs.group(3) == "0")
+          and imposs is not None and all(v == "0" for v in vals))
+    failed = [c for c, v in zip(cols, vals) if v != "0"]
     summary = (f"rc={rc} rollup={rollup.group(1) if rollup else '?'}% "
-               f"impossible=({imposs.group(1) if imposs else '?'} memop,"
-               f"{imposs.group(2) if imposs else '?'} regdata) "
-               f"dangling={imposs.group(3) if imposs else '?'}")
+               f"impossible=({vals[0]} memop,{vals[1]} regdata,"
+               f"{vals[3]} over-max) dangling={vals[2]}"
+               + (f" FAILED[{','.join(failed)}]" if failed else ""))
     return ok, summary
 
 

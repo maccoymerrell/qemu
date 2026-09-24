@@ -698,9 +698,15 @@ def run_families(build_dir: Path, work_root: Path, plugin: Path,
                              "detail": "trace failed"})
                 all_ok = False
                 continue
-            _m, templates, entries = \
-                V._load_decoder().decode_champsim_tracer(cst)
+            dec = V._load_decoder()
+            _m, templates, entries = dec.decode_champsim_tracer(cst)
             ok, detail = check_family(isa, family, templates, entries)
+            # The revision oracle reads templates and entries only; the
+            # decoder's own lint verdict on this trace gates too.
+            lint = dec.lint_failure(_m.get("impossible_attributions"))
+            if lint:
+                ok = False
+                detail += f" -- {lint}"
             stats = plugin_smc_stats(out_base)
             if ok and stats:
                 want_mints = max(0, FAMILIES[family]["revisions"] - 1)
@@ -887,10 +893,15 @@ def run_system_family(build_dir: Path, work_root: Path, plugin: Path,
                      "detail": f"boot rc={rc} / no trace"})
         return False, subs
 
-    _m, templates = V._load_decoder().decode_champsim_tracer_header(cst)
+    dec = V._load_decoder()
+    _m, templates = dec.decode_champsim_tracer_header(cst)
     # The marker program rewrites shape A into shape B at one pc: the `grow`
     # family's structure (2 revisions, the second one instruction longer).
     ok, detail = check_family(isa, "grow", templates)
+    lint = dec.lint_failure(_m.get("impossible_attributions"))
+    if lint:
+        ok = False
+        detail += f" -- {lint}"
     subs.append({"name": f"{isa}/system", "ok": ok,
                  "detail": f"(marker-window, pinned ASID, shape-changing) "
                            f"{detail}"})

@@ -310,6 +310,8 @@ class RepFanoutInvarianceTest(unittest.TestCase):
         stats = Path(f"{out}.stats.log")
         self.assertTrue(stats.is_file(), f"{tag}: tracer produced no stats log")
         _meta, templates, entries = R.decode_champsim_tracer(cst)
+        lint = R.lint_failure(_meta.get("impossible_attributions"))
+        self.assertIsNone(lint, f"{tag}: {lint} (cst_decode --strict {cst})")
         return templates, entries, stats.read_text()
 
     @staticmethod

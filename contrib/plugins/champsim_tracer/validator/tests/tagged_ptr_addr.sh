@@ -117,8 +117,9 @@ if [ ! -s "$WORK/prog.cst" ]; then
 fi
 
 DECODED="$WORK/decoded.txt"
-if ! "$CST_DECODE" --format=legacy "$WORK/prog.cst" >"$DECODED" 2>"$WORK/decode.log"; then
-    echo "FAIL: cst_decode"
+# --strict: the decoder's lint verdict on this trace gates the probe.
+if ! "$CST_DECODE" --strict --format=legacy "$WORK/prog.cst" >"$DECODED" 2>"$WORK/decode.log"; then
+    echo "FAIL: cst_decode --strict"
     cat "$WORK/decode.log"
     exit 1
 fi

@@ -196,6 +196,8 @@ class MopsMemopsTest(unittest.TestCase):
 
             _meta, templates, entries = \
                 R.decode_champsim_tracer(cst)
+            lint = R.lint_failure(_meta.get("impossible_attributions"))
+            self.assertIsNone(lint, f"{lint} (cst_decode --strict {cst})")
 
             # Gather every correct-path memop landing on each MOPS PC.
             by_id = {t["template_id"]: t for t in templates}

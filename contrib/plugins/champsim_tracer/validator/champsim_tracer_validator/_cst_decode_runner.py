@@ -1934,6 +1934,29 @@ def _parse_impossible_attributions(lines: list[str]) -> dict:
     return out
 
 
+def lint_failure(imp) -> str | None:
+    """The decoder lint's verdict on one trace, as a failure message naming
+    every column that is not zero, or None when the trace is clean.
+
+    @imp is ``meta["impossible_attributions"]`` from any decode entrypoint
+    here.  A probe that decodes its own trace already holds this verdict;
+    before this helper several discarded it, so a trace the lint called
+    wrong could still pass the probe (features.smc, TASK_LEDGER row 509).
+    An absent verdict is a failure, never a clean reading: a check that
+    cannot find its subject must not report success."""
+    if not isinstance(imp, dict):
+        return "decoder lint verdict absent (the decode carried no summary)"
+    if imp.get("unparsed"):
+        return f"decoder lint summary UNPARSED: {imp['unparsed']}"
+    cols = (("memop", "memop_insns", "impossible memop", "insns"),
+            ("regdata", "regdata_insns", "impossible regdata", "insns"),
+            ("dangling", "dangling_ids", "dangling template refs", "ids"),
+            ("over_max", "over_max_insns", "over-max executions", "insns"))
+    bad = [f"{imp.get(k, 0)} {label} ({imp.get(d, 0)} distinct {unit})"
+           for k, d, label, unit in cols if imp.get(k)]
+    return ("decoder lint: " + ", ".join(bad)) if bad else None
+
+
 def _parse_body_stats(lines) -> dict:
     """Scan for the BODY_STATS section emitted at end of legacy output."""
     stats: dict = {

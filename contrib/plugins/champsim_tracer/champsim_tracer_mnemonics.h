@@ -56,47 +56,65 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  */
 /*
  * Per-insn TEMPLATE-STATIC caps.  These bound what may be recorded at
- * translation time — the static register and memop operand counts one
- * instruction encoding can state — and they fix the dep-mask bit
- * layout below.
+ * translation time: the register lists an instruction states, and the
+ * template's max_dep_loads / max_dep_stores -- the most accesses one
+ * execution of the instruction can perform, which the wire's u8 header
+ * fields carry and which a record's dynamic CST_FID_N_LOADS/N_STORES
+ * may fall short of and never exceed (format.rst §4.5).
  *
- * They are deliberately NOT the same quantity as the wire's per-family
- * FID slot ceiling (CST_FID_SLOT_COUNT), which bounds the DYNAMIC
- * per-execution memop count.  The two diverge whenever one static memory
- * operand expands into many architectural accesses: x86 XSAVEOPT is a
- * single static store operand that issues 88 stores on a Haswell-class
- * guest, and a rep-string is one static operand with an unbounded
- * dynamic fan-out.  The wire ceiling must cover the dynamic count; the
- * static caps need only cover an encoding's operand list (the widest
- * real case is ARM LD4/ST4 at 4).
+ * THE MEMOP CAPS ARE THE WIRE FIELD'S RANGE, NOT A GUESS AT THE WIDEST
+ * ENCODING.  They were 64 on the reasoning that a static cap need only
+ * cover an encoding's operand list, with ARM LD4/ST4 at 4 as the widest
+ * -- false twice over: the maximum is a count of ACCESSES, not operands,
+ * and a helper that moves a state area performs one per field.  x86
+ * XSAVE/XSAVEOPT perform up to 100 (99 stores and the XSTATE_BV load) and
+ * XRSTOR up to 98 loads on a CPU model with MPX and PKRU; a cap of 64
+ * clamped the template below what the wire then carried, which is the
+ * over-max contract broken by construction.  255 is what max_dep_loads /
+ * max_dep_stores can hold.  An instruction that could exceed it is
+ * counted (g_qdep.dropped_loads/_stores) and reads over-max, never
+ * silently published short.
  *
- * Keeping the static caps at 64 is load-bearing, not incidental:
- *   - The dep masks are uint64_t.  Their bit layout stacks
- *     n_src_regs + max_dep_loads + 1 (immediate) bits into those 64
- *     bits, and the walker clamps each band independently
- *     (the per-band guards in
- *     champsim_tracer_qdep.cc), so the layout only has room while the
- *     two bands together stay under 64 — which real encodings do by a
- *     wide margin.  Raising either cap toward the wire ceiling would
- *     make the sum unrepresentable.
- *   - InsnFieldsScratch's build-time backing arrays are sized by these
- *     caps.  Raising them to the wire ceiling would restore exactly the
- *     fixed-64-slot-array footprint that made per-insn metadata dominate
- *     the plugin heap at 3272 B/insn.
- *
- * The invariant that DOES have to hold is static <= dynamic, asserted
+ * These stay distinct from the wire's per-family FID slot ceiling
+ * (CST_FID_SLOT_COUNT, 512), which bounds the DYNAMIC per-execution
+ * count -- a rep-string's fan-out is bounded by nothing static -- and the
+ * invariant that has to hold between them is static <= dynamic, asserted
  * below: a template-static slot must always be addressable on the wire.
+ *
+ * THE DEP MASKS ARE uint64_t, AND THAT IS A BOUND OF THIS WRITER, NOT OF
+ * THE FORMAT (the masks are ULEBs on the wire).  A register mask stacks
+ * n_src_regs + max_dep_loads + 1 (immediate) bit positions; with the
+ * memop caps above the stack can run past 64, and a position that does
+ * not fit has no bit to set.  Every producer and reader of a mask
+ * position goes through dep_bit() (below), which answers 0 for such a
+ * position rather than shifting past the width, and the producer counts
+ * the member it could not place and withdraws the instruction's HAS_REG
+ * block -- the consumer's all-to-all default is pessimistic, a mask with
+ * a dependency missing is not.  InsnFieldsScratch's build-time arrays
+ * are sized by these caps; committed templates are not (their spans are
+ * exact-count), so the cost is one scratch per translating thread.
  */
 #define MAX_SRC_REGS 64
 #define MAX_DST_REGS 64
-#define MAX_STORES   64
-#define MAX_LOADS    64
+#define MAX_STORES   255
+#define MAX_LOADS    255
 
 static_assert(MAX_SRC_REGS <= cst_wire::FID_SLOT_COUNT &&
               MAX_DST_REGS <= cst_wire::FID_SLOT_COUNT &&
               MAX_LOADS    <= cst_wire::FID_SLOT_COUNT &&
               MAX_STORES   <= cst_wire::FID_SLOT_COUNT,
               "a template-static slot must be addressable on the wire");
+static_assert(MAX_LOADS <= UINT8_MAX && MAX_STORES <= UINT8_MAX,
+              "max_dep_loads / max_dep_stores are u8 on the wire");
+
+/*
+ * Bit @pos of a uint64_t dependency mask, or 0 where the position is past
+ * the mask's width (see the caps comment above).
+ */
+static inline uint64_t dep_bit(unsigned pos)
+{
+    return pos < 64 ? (uint64_t)1 << pos : 0;
+}
 
 /*
  * Lane-mask dispatch kinds (InsnFields.lane_mask_kind).  Let the

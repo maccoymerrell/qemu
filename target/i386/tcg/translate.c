@@ -207,6 +207,12 @@ typedef struct DisasContext {
     int cpuid_7_0_ecx_features;
     int cpuid_7_1_eax_features;
     int cpuid_xsave_features;
+    /*
+     * The components XCR0 may enable on this CPU model (CPUID leaf 0xD
+     * sub-leaf 0, the mask helper_xsetbv refuses to exceed): what bounds the
+     * accesses an XSAVE or XRSTOR can perform, for the template's count.
+     */
+    uint64_t xcr0_supported;
 
     /* TCG local temps */
     TCGv cc_srcT;
@@ -5227,6 +5233,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_7_0_ecx_features = env->features[FEAT_7_0_ECX];
     dc->cpuid_7_1_eax_features = env->features[FEAT_7_1_EAX];
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
+    dc->xcr0_supported = env->features[FEAT_XSAVE_XCR0_LO] |
+                         ((uint64_t)env->features[FEAT_XSAVE_XCR0_HI] << 32);
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
 

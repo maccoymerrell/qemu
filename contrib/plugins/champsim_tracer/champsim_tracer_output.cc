@@ -2228,13 +2228,12 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
 {
     /* Per-memop lane attribution is recoverable only from the
      * TEMPLATE-STATIC dep masks, whose extent is max_dep_loads /
-     * max_dep_stores (<= MAX_LOADS / MAX_STORES).  The dynamic memop
-     * count can exceed that (one static store operand issuing many
-     * accesses: XSAVE, rep-string), and the wire's slot ceiling is far
-     * wider still, so bound the slot against the mask arrays before
-     * indexing them or shifting by the slot index.  An out-of-extent
-     * slot has no static attribution — empty mask, same answer the
-     * all-to-all case gives. */
+     * max_dep_stores (<= MAX_LOADS / MAX_STORES).  A record's dynamic
+     * count may never exceed that extent (format.rst §4.5), but one that
+     * did -- the defect the over-max oracle reports -- must not index
+     * past the mask arrays, so the slot is bounded before it is used.  An
+     * out-of-extent slot has no static attribution: empty mask, the same
+     * answer the all-to-all case gives. */
     uint8_t static_extent = (want_type == DYN_LOAD_ADDR)
         ? f->max_dep_loads : f->max_dep_stores;
     if (slot >= static_extent) return 0;
@@ -2286,8 +2285,9 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
         return 0;
     }
     if (want_type == DYN_LOAD_ADDR) {
-        const uint64_t load_bit_k = (uint64_t)1 <<
-            ((uint64_t)f->n_src_regs + (uint64_t)slot);
+        const uint64_t load_bit_k =
+            dep_bit((unsigned)f->n_src_regs + (unsigned)slot);
+        if (!load_bit_k) return 0;      /* no mask position to look up */
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {
             if (!(f->dst_dep_mask[d] & load_bit_k)) continue;
             host_reg_idx = d;
@@ -2296,7 +2296,7 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
              * dst_dep[d]'s load-bit range. */
             uint64_t load_range = f->dst_dep_mask[d]
                 >> (uint64_t)f->n_src_regs;
-            uint64_t earlier = load_range & (((uint64_t)1 << slot) - 1);
+            uint64_t earlier = load_range & (dep_bit(slot) - 1);
             slots_before = (unsigned)__builtin_popcountll(earlier);
             break;
         }
@@ -2305,7 +2305,8 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
          * Among same-slot-mask stores in store_data_dep[], rank by
          * how many earlier slots reference the same src. */
         const uint64_t this_slot_mask = f->store_data_dep_mask[slot]
-            & ((((uint64_t)1 << f->n_src_regs) - 1));
+            & (f->n_src_regs >= 64 ? ~(uint64_t)0
+                                   : dep_bit(f->n_src_regs) - 1);
         if (!this_slot_mask) return 0;
         /* Lowest set bit selects the vec-value src for this store. */
         uint8_t which = (uint8_t)__builtin_ctzll(this_slot_mask);

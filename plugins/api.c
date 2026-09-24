@@ -511,6 +511,15 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
     return plugin_df_copy(d->fields[field].prov, words, nwords);
 }
 
+/*
+ * Access rows an instruction publishes: the ones its op walk and statements
+ * recorded, then its helper fan's (InsnDataflow.fan), in that order.
+ */
+static unsigned plugin_df_n_memops(const InsnDataflow *d)
+{
+    return d->n_memops + (d->fan != NULL ? d->n_fan : 0);
+}
+
 unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
                                  qemu_plugin_dataflow_memop *out,
                                  unsigned nmemops)
@@ -520,19 +529,26 @@ unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
     if (d == NULL) {
         return QEMU_PLUGIN_DF_INCOMPLETE;
     }
-    if (nmemops < d->n_memops || out == NULL) {
-        return d->n_memops;
+    unsigned total = plugin_df_n_memops(d);
+
+    if (nmemops < total || out == NULL) {
+        return total;
     }
-    for (unsigned i = 0; i < d->n_memops; i++) {
+    for (unsigned i = 0; i < total; i++) {
         qemu_plugin_dataflow_memop m = {
             .struct_size = sizeof(m),
-            .dir = d->memops[i].dir,
-            .size = d->memops[i].size,
         };
 
+        if (i < d->n_memops) {
+            m.dir = d->memops[i].dir;
+            m.size = d->memops[i].size;
+        } else {
+            m.dir = d->fan[i - d->n_memops].dir;
+            m.size = d->fan[i - d->n_memops].size;
+        }
         plugin_df_struct(&out[i], &m, out[i].struct_size, sizeof(m));
     }
-    return d->n_memops;
+    return total;
 }
 
 unsigned qemu_plugin_insn_synthetic_eas(const struct qemu_plugin_tb *tb,
@@ -573,8 +589,13 @@ unsigned qemu_plugin_insn_memop_addr_prov(const struct qemu_plugin_tb *tb,
 {
     const InsnDataflow *d = plugin_df_whole(tb, idx);
 
-    if (d == NULL || memop >= d->n_memops) {
+    if (d == NULL || memop >= plugin_df_n_memops(d)) {
         return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (memop >= d->n_memops) {
+        /* A fan row: the named address plus a constant of the helper. */
+        return plugin_df_copy(d->memops[d->fan_anchor].addr_prov, words,
+                              nwords);
     }
     return plugin_df_copy(d->memops[memop].addr_prov, words, nwords);
 }
@@ -585,8 +606,16 @@ unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
 {
     const InsnDataflow *d = plugin_df_whole(tb, idx);
 
-    if (d == NULL || memop >= d->n_memops) {
+    if (d == NULL || memop >= plugin_df_n_memops(d)) {
         return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (memop >= d->n_memops) {
+        /*
+         * A fan row states no datum (insn_dataflow_note_helper_accesses), so
+         * its account is the empty one the fan's first row carries.
+         */
+        return plugin_df_copy(d->memops[d->fan_anchor].data_prov, words,
+                              nwords);
     }
     return plugin_df_copy(d->memops[memop].data_prov, words, nwords);
 }
@@ -650,7 +679,7 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_mem_writes = d->n_mem_wr;
     st.n_writes = d->n_writes;
     st.n_fields = d->n_fields;
-    st.n_memops = d->n_memops;
+    st.n_memops = plugin_df_n_memops(d);
     st.n_immediates = d->n_imm;
     st.properties = d->properties;
     st.xfer = d->xfer;

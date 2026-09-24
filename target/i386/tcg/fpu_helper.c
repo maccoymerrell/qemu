@@ -3110,6 +3110,172 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
     do_xrstor(&ac, ptr, rfbm, xstate_bv);
 }
 
+/*
+ * EVERY GUEST ACCESS THE STATE-AREA HELPERS ABOVE CAN PERFORM, IN THEIR ORDER.
+ *
+ * helper_fxsave, helper_fxrstor, helper_xsave (which XSAVEOPT's emitter also
+ * calls) and helper_xrstor take tcg_env and an address and move the area
+ * themselves, one access_st / access_ld per field, and every one of those is
+ * delivered to plugins as its own access.  The op stream shows a call, so a
+ * translator that wants the instruction's template to say how many accesses
+ * it performs -- the wire's max_dep_loads / max_dep_stores, which a record's
+ * count may fall short of and may never exceed (format.rst §4.5) -- has to be
+ * told by the code that performs them.  This is that code's account, written
+ * beside it, and it follows the helpers access for access: a change to one of
+ * the do_xsave_* / do_xrstor_* routines above is a change to the rows below.
+ *
+ * WHAT IS A MAXIMUM AND WHY.  An execution can take fewer: helper_fxsave
+ * skips the XMM area under fast FXSAVE, and the XSAVE family saves or loads a
+ * component only when the runtime feature mask, XCR0 and (for XRSTOR) the
+ * area's own XSTATE_BV select it -- values in registers and memory the
+ * translator does not hold.  What bounds them all is the component set this
+ * CPU model lets XCR0 enable, @xcr0_supported (CPUID leaf 0xD sub-leaf 0,
+ * the mask helper_xsetbv refuses to exceed), and @code64, which the helpers
+ * read as HF_CS64 to choose sixteen XMM registers or eight -- a translation
+ * flag, so the translator holds it exactly.
+ *
+ * Returns the number of rows written, or 0 if @max cannot hold them all: a
+ * partial account would state a maximum smaller than the helper performs.
+ */
+#define XO(X)  offsetof(X86XSaveArea, X)
+
+typedef struct X86AreaRows {
+    InsnDataflowHelperAccess *out;
+    unsigned n, max;
+} X86AreaRows;
+
+static void x86_area_row(X86AreaRows *r, unsigned dir, unsigned size,
+                         unsigned offset)
+{
+    if (r->n < r->max) {
+        r->out[r->n].dir = dir;
+        r->out[r->n].size = size;
+        r->out[r->n].offset = offset;
+    }
+    r->n++;
+}
+
+/* do_xsave_fpu / do_xrstor_fpu, including do_fstt / do_fldt per register. */
+static void x86_area_fpu(X86AreaRows *r, unsigned dir)
+{
+    x86_area_row(r, dir, 2, XO(legacy.fcw));
+    x86_area_row(r, dir, 2, XO(legacy.fsw));
+    x86_area_row(r, dir, 2, XO(legacy.ftw));
+    if (dir == INSN_DF_WR) {
+        /* The save writes fpip and fpdp (as zeros); the restore reads neither. */
+        x86_area_row(r, dir, 8, XO(legacy.fpip));
+        x86_area_row(r, dir, 8, XO(legacy.fpdp));
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        x86_area_row(r, dir, 8, XO(legacy.fpregs) + 16 * i);
+        x86_area_row(r, dir, 2, XO(legacy.fpregs) + 16 * i + 8);
+    }
+}
+
+/* do_xsave_mxcsr stores MXCSR and MXCSR_MASK; do_xrstor_mxcsr loads MXCSR. */
+static void x86_area_mxcsr(X86AreaRows *r, unsigned dir)
+{
+    x86_area_row(r, dir, 4, XO(legacy.mxcsr));
+    if (dir == INSN_DF_WR) {
+        x86_area_row(r, dir, 4, XO(legacy.mxcsr_mask));
+    }
+}
+
+/* do_xsave_sse / do_xrstor_sse and the YMM-high halves: two quadwords each. */
+static void x86_area_regs16(X86AreaRows *r, unsigned dir, unsigned base,
+                            unsigned nregs)
+{
+    for (unsigned i = 0; i < nregs; i++) {
+        x86_area_row(r, dir, 8, base + 16 * i);
+        x86_area_row(r, dir, 8, base + 16 * i + 8);
+    }
+}
+
+unsigned x86_state_area_accesses(X86StateArea kind, bool code64,
+                                 uint64_t xcr0_supported,
+                                 InsnDataflowHelperAccess *out, unsigned max)
+{
+    X86AreaRows r = { .out = out, .max = max };
+    unsigned nb_xmm = code64 ? 16 : 8;
+    uint64_t c = xcr0_supported;
+
+    switch (kind) {
+    case X86_STATE_AREA_FXSAVE:
+        /* do_fxsave, with the CR4.OSFXSR and non-fast arms both taken. */
+        x86_area_fpu(&r, INSN_DF_WR);
+        x86_area_mxcsr(&r, INSN_DF_WR);
+        x86_area_regs16(&r, INSN_DF_WR, XO(legacy.xmm_regs), nb_xmm);
+        break;
+    case X86_STATE_AREA_FXRSTOR:
+        /* do_fxrstor, likewise. */
+        x86_area_fpu(&r, INSN_DF_RD);
+        x86_area_mxcsr(&r, INSN_DF_RD);
+        x86_area_regs16(&r, INSN_DF_RD, XO(legacy.xmm_regs), nb_xmm);
+        break;
+    case X86_STATE_AREA_XSAVE:
+        /* do_xsave_access, every component XCR0 can hold selected. */
+        if (c & XSTATE_FP_MASK) {
+            x86_area_fpu(&r, INSN_DF_WR);
+        }
+        if (c & XSTATE_SSE_MASK) {
+            x86_area_mxcsr(&r, INSN_DF_WR);
+            x86_area_regs16(&r, INSN_DF_WR, XO(legacy.xmm_regs), nb_xmm);
+        }
+        if (c & XSTATE_YMM_MASK) {
+            x86_area_regs16(&r, INSN_DF_WR, XO(avx_state), nb_xmm);
+        }
+        if (c & XSTATE_BNDREGS_MASK) {
+            x86_area_regs16(&r, INSN_DF_WR, XO(bndreg_state) +
+                            offsetof(XSaveBNDREG, bnd_regs), 4);
+        }
+        if (c & XSTATE_BNDCSR_MASK) {
+            x86_area_row(&r, INSN_DF_WR, 8, XO(bndcsr_state) +
+                         offsetof(XSaveBNDCSR, bndcsr.cfgu));
+            x86_area_row(&r, INSN_DF_WR, 8, XO(bndcsr_state) +
+                         offsetof(XSaveBNDCSR, bndcsr.sts));
+        }
+        if (c & XSTATE_PKRU_MASK) {
+            x86_area_row(&r, INSN_DF_WR, 8, XO(pkru_state));
+        }
+        /* The XSTATE_BV read-modify-write that closes every save. */
+        x86_area_row(&r, INSN_DF_RD, 8, XO(header.xstate_bv));
+        x86_area_row(&r, INSN_DF_WR, 8, XO(header.xstate_bv));
+        break;
+    case X86_STATE_AREA_XRSTOR:
+        /* valid_xrstor_header, then do_xrstor with every component set. */
+        x86_area_row(&r, INSN_DF_RD, 8, XO(header.xstate_bv));
+        x86_area_row(&r, INSN_DF_RD, 8, XO(header.xcomp_bv));
+        x86_area_row(&r, INSN_DF_RD, 8, XO(header.reserve0));
+        if (c & XSTATE_FP_MASK) {
+            x86_area_fpu(&r, INSN_DF_RD);
+        }
+        if (c & XSTATE_SSE_MASK) {
+            x86_area_mxcsr(&r, INSN_DF_RD);
+            x86_area_regs16(&r, INSN_DF_RD, XO(legacy.xmm_regs), nb_xmm);
+        }
+        if (c & XSTATE_YMM_MASK) {
+            x86_area_regs16(&r, INSN_DF_RD, XO(avx_state), nb_xmm);
+        }
+        if (c & XSTATE_BNDREGS_MASK) {
+            x86_area_regs16(&r, INSN_DF_RD, XO(bndreg_state) +
+                            offsetof(XSaveBNDREG, bnd_regs), 4);
+        }
+        if (c & XSTATE_BNDCSR_MASK) {
+            x86_area_row(&r, INSN_DF_RD, 8, XO(bndcsr_state) +
+                         offsetof(XSaveBNDCSR, bndcsr.cfgu));
+            x86_area_row(&r, INSN_DF_RD, 8, XO(bndcsr_state) +
+                         offsetof(XSaveBNDCSR, bndcsr.sts));
+        }
+        if (c & XSTATE_PKRU_MASK) {
+            x86_area_row(&r, INSN_DF_RD, 8, XO(pkru_state));
+        }
+        break;
+    }
+    return r.n <= r.max ? r.n : 0;
+}
+
+#undef XO
+
 #if defined(CONFIG_USER_ONLY)
 void cpu_x86_fsave(CPUX86State *env, void *host, size_t len)
 {

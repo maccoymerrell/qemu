@@ -164,9 +164,9 @@ void append_lane_set(std::string *out, uint64_t mask)
     bool first = true;
     int i = 0;
     while (i < 64) {
-        if (!(mask & ((uint64_t)1 << i))) { i++; continue; }
+        if (!(mask & cst::cst_bit(i))) { i++; continue; }
         int lo = i;
-        while (i < 64 && (mask & ((uint64_t)1 << i))) i++;
+        while (i < 64 && (mask & cst::cst_bit(i))) i++;
         int hi = i - 1;
         if (!first) out->push_back(',');
         first = false;
@@ -656,13 +656,13 @@ std::string render_load_source(const DisasmContext &ctx,
         std::string addr_inputs;
         bool any = false;
         for (unsigned i = 0; i < n_src; i++) {
-            if (am & ((uint64_t)1 << i)) {
+            if (am & cst::cst_bit(i)) {
                 if (any) addr_inputs.push_back('+');
                 addr_inputs.append(reg_str(insn.src_regs[i]));
                 any = true;
             }
         }
-        if (am & ((uint64_t)1 << n_src)) {
+        if (am & cst::cst_bit(n_src)) {
             if (any) addr_inputs.push_back('+');
             addr_inputs.append("$0x");
             append_hex(&addr_inputs, (uint64_t)insn.immediate);
@@ -736,14 +736,14 @@ void render_input_set_laned(std::string &line, uint64_t mask,
 {
     bool any = false;
     for (size_t i = 0; i < input_names.size(); i++) {
-        if (!(mask & ((uint64_t)1 << i))) continue;
+        if (!(mask & cst::cst_bit(i))) continue;
         if (show_lanes && sink_lanes) {
             uint64_t il = in_lane(i);
             if (il && !(il & sink_lanes)) continue;  /* no shared lanes */
         }
         if (any) line.append(", ");
         line.append(input_names[i]);
-        if (placed && i < 64) *placed |= ((uint64_t)1 << i);
+        if (placed && i < 64) *placed |= cst::cst_bit(i);
         any = true;
     }
 }
@@ -769,13 +769,13 @@ std::string render_store_sink(const DisasmContext &ctx,
         std::string addr_inputs;
         bool any = false;
         for (unsigned i = 0; i < n_src; i++) {
-            if (am & ((uint64_t)1 << i)) {
+            if (am & cst::cst_bit(i)) {
                 if (any) addr_inputs.push_back('+');
                 addr_inputs.append(reg_str(insn.src_regs[i]));
                 any = true;
             }
         }
-        if (am & ((uint64_t)1 << n_src)) {
+        if (am & cst::cst_bit(n_src)) {
             if (any) addr_inputs.push_back('+');
             addr_inputs.append("$0x");
             append_hex(&addr_inputs, (uint64_t)insn.immediate);
@@ -844,7 +844,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
      * at bit n_src in HAS_ADDR layout) so we don't accidentally
      * filter out the immediate from the default. */
     uint64_t src_bits_mask = (n_src == 64) ? ~(uint64_t)0
-                                           : (((uint64_t)1 << n_src) - 1);
+                                           : (cst::cst_bit(n_src) - 1);
 
     /* Load slots occupy pool bits [n_src, n_src + max_dep_loads); shift
      * them down to slot indices for the caller.  n_src saturates at
@@ -857,7 +857,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
 
     uint64_t all_inputs = 0;
     for (size_t i = 0; i < inputs.size(); i++) {
-        all_inputs |= ((uint64_t)1 << i);
+        all_inputs |= cst::cst_bit(i);
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 
@@ -931,7 +931,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         uint64_t covered = 0;
         bool overlap = false;
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (!(m & ((uint64_t)1 << i))) continue;
+            if (!(m & cst::cst_bit(i))) continue;
             uint64_t lm = input_lane_mask(i);
             if (!lm) return false;          /* imm or scalar — bail */
             if ((lm & dst_lanes) != lm) return false; /* extends past dst */
@@ -945,7 +945,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i : contributors) {
             open_group();
             line.append(inputs[i]);
-            if (i < 64) placed |= ((uint64_t)1 << i);
+            if (i < 64) placed |= cst::cst_bit(i);
             line.append(" -> ");
             emit_dst_name(k, input_lane_mask(i));
         }
@@ -1019,7 +1019,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i = 0; i < inputs.size(); i++) {
             sep();
             line.append(inputs[i]);
-            if (i < 64) placed |= ((uint64_t)1 << i);
+            if (i < 64) placed |= cst::cst_bit(i);
         }
         if (out_placed_loads) *out_placed_loads = shift_out(placed);
         return any;
@@ -1080,7 +1080,7 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
          * loop iterates every slot up to max_dep_stores). */
         bool covered = has_slot &&
             (!is_load || (load_idx < 64 &&
-                          (placed_loads & ((uint64_t)1 << load_idx))));
+                          (placed_loads & cst::cst_bit(load_idx))));
         if (!covered && is_load && has_slot) {
             /* Slot exists but went unplaced — render it in full, with
              * its HAS_ADDR input set and address. */
@@ -1193,7 +1193,7 @@ void append_dep_mask(std::string &line, uint64_t m,
             return (in_lane & sink_lanes) != 0;
         };
         for (unsigned i = 0; i < n_src; i++) {
-            if (m & ((uint64_t)1 << i)) {
+            if (m & cst::cst_bit(i)) {
                 uint64_t il = annotate_lanes
                                   ? lane_at(insn->src_lane_mask, i) : 0;
                 if (!feeds(il)) continue;
@@ -1205,7 +1205,7 @@ void append_dep_mask(std::string &line, uint64_t m,
             }
         }
         for (unsigned i = 0; i < n_loads; i++) {
-            if (m & ((uint64_t)1 << (n_src + i))) {
+            if (m & cst::cst_bit((n_src + i))) {
                 uint64_t il = annotate_lanes
                                   ? lane_at(insn->load_data_lane_mask, i)
                                   : 0;
@@ -1218,7 +1218,7 @@ void append_dep_mask(std::string &line, uint64_t m,
                 }
             }
         }
-        if (m & ((uint64_t)1 << (n_src + n_loads))) {
+        if (m & cst::cst_bit((n_src + n_loads))) {
             sep();
             inner.append("imm");
         }
@@ -1255,12 +1255,12 @@ void append_addr_mask(std::string &line, uint64_t m,
     };
     unsigned n_src = (unsigned)src_regs.size();
     for (unsigned i = 0; i < n_src; i++) {
-        if (m & ((uint64_t)1 << i)) {
+        if (m & cst::cst_bit(i)) {
             sep();
             append_regref(&line, ctx, src_regs[i]);
         }
     }
-    if (m & ((uint64_t)1 << n_src)) {
+    if (m & cst::cst_bit(n_src)) {
         sep();
         line.append("imm");
     }
@@ -1288,17 +1288,17 @@ void emit_disasm_deps_annotation(std::string &line,
     for (uint64_t m : it.load_addr_dep_mask)  addr_only_srcs |= m;
     for (uint64_t m : it.store_addr_dep_mask) addr_only_srcs |= m;
     uint64_t src_bits = (n_src == 64) ? ~(uint64_t)0
-                                       : (((uint64_t)1 << n_src) - 1);
+                                       : (cst::cst_bit(n_src) - 1);
     addr_only_srcs &= src_bits;
 
     uint64_t all_inputs = src_bits;
     /* every load_data slot */
     for (unsigned k = 0; k < n_loads; k++) {
-        all_inputs |= ((uint64_t)1 << (n_src + k));
+        all_inputs |= cst::cst_bit((n_src + k));
     }
     /* imm bit only when the template carries an immediate. */
     if (it.has_imm) {
-        all_inputs |= ((uint64_t)1 << imm_bit);
+        all_inputs |= cst::cst_bit(imm_bit);
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 

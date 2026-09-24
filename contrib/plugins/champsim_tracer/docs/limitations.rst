@@ -398,9 +398,10 @@ links to the prose that explains the consequence of hitting it.
    * - Slotted store addresses / data per instruction
      - ``CST_FID_SLOT_COUNT`` = 512
      - ``STORE_ADDR``/``STORE_DATA`` slots 0..511; likewise no
-       overflow vector.  Sized by ``XSAVE``-family state saves — 88
-       stores from one ``XSAVEOPT`` on a Haswell-class guest, about
-       320 for a full AVX-512 area — and exceeded only by the AArch64
+       overflow vector.  The widest bounded case is an ``XSAVE``-family
+       state save — at most 99 stores from one ``XSAVE``/``XSAVEOPT``
+       over the state components QEMU's TCG implements (x87, SSE, AVX,
+       MPX, PKRU) — and the ceiling is exceeded only by the AArch64
        bulk-memory ``SETM`` / ``CPYM`` (see :ref:`bulk memory <limits-bulk-memory>`).
    * - WP-side memops captured per instruction
      - ``CST_FID_SLOT_COUNT`` = 512
@@ -493,8 +494,9 @@ section), so each entry carries at most 1 load + 1 store — the
 slotted ``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` (and matching
 ``DATA``) families cover every supported instruction; there is no
 overflow vector, and the widest *bounded* single-instruction memop
-fan-out on x86 — an ``XSAVE``-family state save, about 320 stores for
-a full AVX-512 area — sits inside the 512 slots.
+fan-out on x86 — an ``XSAVE``-family state save, at most 99 stores
+over the state components QEMU's TCG implements — sits inside the 512
+slots.
 
 .. _limits-mem-value-width:
 

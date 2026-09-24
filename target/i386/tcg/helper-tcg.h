@@ -22,6 +22,7 @@
 
 #include "exec/exec-all.h"
 #include "qemu/host-utils.h"
+#include "exec/insn-dataflow.h"
 
 /* Maximum instruction code size */
 #define TARGET_MAX_INSN_SIZE 16
@@ -118,6 +119,18 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
 void handle_even_inj(CPUX86State *env, int intno, int is_int,
                      int error_code, int is_hw, int rm);
 int exception_has_error_code(int intno);
+
+/* fpu_helper.c: the accesses a state-area helper can perform. */
+typedef enum X86StateArea {
+    X86_STATE_AREA_FXSAVE,
+    X86_STATE_AREA_FXRSTOR,
+    X86_STATE_AREA_XSAVE,       /* helper_xsave: XSAVE and XSAVEOPT */
+    X86_STATE_AREA_XRSTOR,
+} X86StateArea;
+
+unsigned x86_state_area_accesses(X86StateArea kind, bool code64,
+                                 uint64_t xcr0_supported,
+                                 InsnDataflowHelperAccess *out, unsigned max);
 
 /* smm_helper.c */
 void do_smm_enter(X86CPU *cpu);

@@ -213,6 +213,14 @@ struct InsnDataflowScratch {
     DfWindow win[INSN_DF_MAX_WINDOWS];
     unsigned nwin;
     int      win_open;          /* index of the window awaiting its end, or -1 */
+
+    /*
+     * Helper access fans, for the whole block (InsnDataflow.fan points in
+     * here).  Four bytes a row and shared by every instruction, because only
+     * the few instructions whose helper moves a state area have any.
+     */
+    InsnDataflowHelperAccess fan_pool[INSN_DF_MAX_FAN_ROWS];
+    unsigned nfan;
 };
 
 /*
@@ -1979,6 +1987,50 @@ void insn_dataflow_note_helper_store(uint32_t size,
                      data_prov);
 }
 
+void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
+                                        unsigned n,
+                                        const InsnDataflowEaPart *parts,
+                                        unsigned nparts, int64_t disp)
+{
+    InsnDataflow *d;
+    int k;
+
+    if (df == NULL || !df->decoding || rows == NULL || n == 0) {
+        return;
+    }
+    d = &df->out[df->cur];
+
+    /*
+     * The first access carries the address account and the displacement,
+     * stated exactly as a single helper row is; its offset moves the row's
+     * address and is not an encoding immediate.
+     */
+    k = df_note_synth_ea(rows[0].dir, rows[0].size, parts, nparts, disp,
+                         rows[0].offset, NULL);
+    if (k < 0) {
+        /* df_add_memop() has already refused the instruction. */
+        return;
+    }
+    if (n == 1) {
+        return;
+    }
+    if (d->fan != NULL || k > UINT8_MAX ||
+        df->nfan + (n - 1) > INSN_DF_MAX_FAN_ROWS || n - 1 > UINT16_MAX) {
+        /*
+         * A second fan, or one the block has no room for: the accesses
+         * cannot all be recorded, so the instruction is refused rather than
+         * published with a count smaller than the helper performs.
+         */
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    memcpy(&df->fan_pool[df->nfan], &rows[1], (n - 1) * sizeof(rows[0]));
+    d->fan = &df->fan_pool[df->nfan];
+    d->n_fan = (uint16_t)(n - 1);
+    d->fan_anchor = (uint8_t)k;
+    df->nfan += n - 1;
+}
+
 void insn_dataflow_window_end(void)
 {
     if (df == NULL || df->win_open < 0) {
@@ -2194,6 +2246,7 @@ void insn_dataflow_insn_begin(unsigned idx)
         df->nwin = 0;
         df->win_open = -1;
         df->ninsns = 0;
+        df->nfan = 0;
     }
     if (idx >= INSN_DF_MAX_INSNS) {
         df->decoding = false;
@@ -2364,7 +2417,19 @@ void insn_dataflow_extract(unsigned num_insns)
 
     df->ninsns = idx < 0 ? 0 : MIN((unsigned)idx + 1, num_insns);
     for (unsigned i = 0; i < df->ninsns; i++) {
-        df_close_unsourced(&df->out[i]);
+        InsnDataflow *d = &df->out[i];
+
+        df_close_unsourced(d);
+        /*
+         * A consumer numbers a fan's rows after memops[], so the fan must be
+         * the last thing the instruction accessed: its first row the last
+         * row the walk recorded.  An op-stream access after it would be
+         * numbered behind the fan it followed, and the order is the one fact
+         * about the accesses the rows exist to keep.
+         */
+        if (d->n_fan && (unsigned)d->fan_anchor + 1 != d->n_memops) {
+            d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        }
     }
 }
 

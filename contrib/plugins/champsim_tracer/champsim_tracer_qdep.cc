@@ -286,6 +286,21 @@ SeatedSet seat_set_as_src(InsnFields *f, InsnRegNames *rn, unsigned nwords)
  * nothing -- it cannot, because the wire has no slot for it -- and that is
  * counted as an unmapped name or an unnamed range where it is one.
  */
+/*
+ * Set when a provenance member's mask position lies past the mask's 64 bits
+ * (dep_bit() in champsim_tracer_mnemonics.h).  Cleared at the start of each
+ * instruction's seating and read once its masks are built.
+ */
+static thread_local bool tls_mask_unplaceable;
+
+static uint64_t mask_bit_at(unsigned pos)
+{
+    if (pos >= 64) {
+        tls_mask_unplaceable = true;
+    }
+    return dep_bit(pos);
+}
+
 uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
 {
     uint64_t mask = 0;
@@ -304,7 +319,7 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
             case BIT_REG:
                 for (uint8_t i = 0; i < f->n_src_regs; i++) {
                     if (f->src_regs[i] == reg) {
-                        mask |= (uint64_t)1 << i;
+                        mask |= mask_bit_at(i);
                         break;
                     }
                 }
@@ -313,12 +328,13 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
                 /* The value came out of one of this instruction's own loads;
                  * @reg carries that load's wire slot. */
                 if (reg < f->max_dep_loads) {
-                    mask |= (uint64_t)1 << (f->n_src_regs + reg);
+                    mask |= mask_bit_at((unsigned)f->n_src_regs + reg);
                     g_qdep.load_datum_seated++;
                 }
                 break;
             case BIT_IMM:
-                mask |= (uint64_t)1 << (f->n_src_regs + f->max_dep_loads);
+                mask |= mask_bit_at((unsigned)f->n_src_regs +
+                                    f->max_dep_loads);
                 break;
             case BIT_CONST:
             case BIT_NOTHING:
@@ -349,7 +365,7 @@ uint64_t prov_to_addr_mask(const InsnFields *f, unsigned nwords)
             case BIT_REG:
                 for (uint8_t i = 0; i < f->n_src_regs; i++) {
                     if (f->src_regs[i] == reg) {
-                        mask |= (uint64_t)1 << i;
+                        mask |= mask_bit_at(i);
                         break;
                     }
                 }
@@ -363,7 +379,7 @@ uint64_t prov_to_addr_mask(const InsnFields *f, unsigned nwords)
                 g_qdep.load_datum_in_addr++;
                 break;
             case BIT_IMM:
-                mask |= (uint64_t)1 << f->n_src_regs;
+                mask |= mask_bit_at(f->n_src_regs);
                 break;
             case BIT_CONST:
             case BIT_NOTHING:
@@ -546,6 +562,7 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
     /* No load slot is known until the memop walk below assigns them; a stale
      * map from the previous instruction must never be readable. */
     memset(tls_load_slot, 0xff, sizeof(tls_load_slot));
+    tls_mask_unplaceable = false;
 
     memset(&st, 0, sizeof(st));
     st.struct_size = sizeof(st);
@@ -892,6 +909,12 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
     }
     if (any_prov || out->n_dst_regs || out->max_dep_stores) {
         out->has_reg_deps = true;
+    }
+    if (tls_mask_unplaceable) {
+        /* A member had no bit to land on: a mask published without it would
+         * be a dependency missed, so no HAS_REG block at all. */
+        out->has_reg_deps = false;
+        g_qdep.mask_bit_unplaceable++;
     }
 
     /* ---- the lane shape and the self-loop unit -------------------------- */

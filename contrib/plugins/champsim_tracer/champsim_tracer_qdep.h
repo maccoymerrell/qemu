@@ -117,6 +117,13 @@ struct QdepCounters {
      * at all.  It is 0 on every ISA measured so far. */
     uint64_t load_datum_seated;
     uint64_t load_datum_in_addr;
+    /* A provenance member whose mask position lies past the uint64_t
+     * mask's width (n_src + max_dep_loads + imm beyond 64 -- only a
+     * helper fan's load count reaches that).  Its instruction's HAS_REG
+     * block is withdrawn, so the consumer reads the pessimistic all-to-all
+     * default instead of a mask with a dependency missing; the count is
+     * the instructions withdrawn that way. */
+    uint64_t mask_bit_unplaceable;
     /* Destinations whose dependency mask came from a field row rather than
      * from a TCG global's write record -- every vector and FP destination on
      * every machine.  A zero here on a run that touched vector state means

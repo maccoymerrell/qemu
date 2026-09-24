@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 6
+#define QEMU_PLUGIN_DATAFLOW_VERSION 7
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -136,9 +136,16 @@ const char *qemu_plugin_dataflow_field_reg(uint32_t env_offset, uint32_t size);
 
 /* The three provenance bits that do not stand for storage. */
 /*
- * The most guest accesses one instruction can be recorded for, and so the
- * width of the memop provenance block qemu_plugin_dataflow_prov_memop()
- * reports an index into.  A consumer sizes its own memop-to-slot map by it.
+ * The width of the memop provenance block qemu_plugin_dataflow_prov_memop()
+ * reports an index into: only the first this-many access rows of an
+ * instruction can be named as the source of a value.  A consumer sizes its
+ * own memop-to-slot map by it.
+ *
+ * It is NOT a bound on the rows qemu_plugin_insn_memops() hands out.  An
+ * instruction whose helper moves a state area (x86 FXSAVE, XSAVE, XRSTOR)
+ * publishes one row per access the helper can perform -- a hundred for XSAVE
+ * -- after its first sixteen; those rows share the first fan row's address
+ * account and carry no datum account, so no provenance bit ever names them.
  */
 #define QEMU_PLUGIN_DF_MAX_MEMOPS  16
 

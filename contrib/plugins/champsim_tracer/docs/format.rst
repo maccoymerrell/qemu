@@ -2708,12 +2708,21 @@ groups, and the ceiling is where the line between them falls.
 Every instruction with a *bounded* fan-out uses slots, and all of them
 fit with room to spare.  The widest is not a vector instruction but a
 processor-state save: x86 ``XSAVE``/``XSAVEOPT``/``XRSTOR`` write or
-read the whole extended state area in one instruction — 88 stores on a
-Haswell-class guest, and roughly 320 8-byte stores for a full AVX-512
-area of about 2.5 KiB.  The vector cases sit far below that: AVX-512
-gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096 is at most
-64 element loads, and RISC-V V at LMUL × VLEN/SEW is at most 64.  The
-512-slot ceiling is sized by the ~320 case.
+read the extended state area in one instruction, one access per
+field or 8-byte half the helper touches.  QEMU's TCG implements the
+x87, SSE, AVX (YMM), MPX and PKRU state components and no AVX-512
+component, so the most such a helper can perform is 99 stores (with
+the one header load ``XSAVEOPT``/``XSAVE`` read-modify-write) and 98
+loads for ``XRSTOR``; ``FXSAVE``/``FXRSTOR`` perform 55 stores / 52
+loads.  The template states exactly that most as ``max_dep_loads`` /
+``max_dep_stores`` — the decode site declares the helper's access
+list, derived from the same area layout the helper writes — and an
+execution that touches fewer components publishes a smaller
+``N_LOADS`` / ``N_STORES``.  The vector cases sit below that:
+gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096 is at
+most 64 element loads, and RISC-V V at LMUL × VLEN/SEW is at most
+64.  The template header's per-instruction maximum is a ``u8``
+(255), so every bounded case fits both it and the 512-slot ceiling.
 
 The instructions whose fan-out is *unbounded* — bounded only by a
 register value, so that no ceiling could be chosen — are not clamped at

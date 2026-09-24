@@ -54,6 +54,22 @@ inline constexpr uint32_t CST_MAGIC = cst_wire::MAGIC;
 
 namespace cst {
 
+/*
+ * Bit @pos of a uint64_t dependency mask, or 0 past the mask's width.
+ *
+ * A template's register-mask pool stacks n_src + max_dep_loads + 1 positions,
+ * and max_dep_loads is a u8 on the wire: an instruction whose helper performs
+ * a hundred loads (x86 XRSTOR) has a pool wider than the 64-bit masks this
+ * reader holds.  The wire's masks are ULEBs and never set such a position for
+ * those instructions (the writer withdraws the block instead), so a position
+ * past 64 is simply not a bit a mask can have -- and shifting by it would be
+ * undefined, not zero.
+ */
+static inline uint64_t cst_bit(unsigned pos)
+{
+    return pos < 64 ? (uint64_t)1 << pos : 0;
+}
+
 /* ===== Format-layout invariants =====
  *
  * Buffer-size limits the encoding maps cannot describe.  Everything

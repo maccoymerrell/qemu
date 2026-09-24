@@ -435,6 +435,34 @@ typedef struct InsnDataflowMemop {
 } InsnDataflowMemop;
 
 /*
+ * One access of a helper's fan, as the helper performs it: which way, how
+ * wide, and how far from the address the encoding names.
+ *
+ * A helper that moves a whole state area -- x86 FXSAVE/FXRSTOR, XSAVE,
+ * XSAVEOPT, XRSTOR -- performs one guest access per field it saves or
+ * restores, each delivered to plugins as its own access, and the fan runs to
+ * a hundred.  INSN_DF_MAX_MEMOPS rows cannot hold that and should not be
+ * widened to: each row carries two provenance sets, and the scratch holds a
+ * row array for every instruction of the block.  The fan's rows share one
+ * address account -- every access is the named address plus a constant of
+ * the helper -- and carry no datum a decode site could state, so four bytes
+ * say everything a row of this kind has to say.
+ */
+typedef struct InsnDataflowHelperAccess {
+    uint8_t  dir;               /* INSN_DF_RD / _WR */
+    uint8_t  size;              /* bytes */
+    uint16_t offset;            /* from the encoded address */
+} InsnDataflowHelperAccess;
+
+/*
+ * Fan rows one translation block may hold, across all its instructions.  The
+ * widest fan in tree is XSAVE's at one hundred accesses; a block that states
+ * more than this refuses the instruction that overflowed it
+ * (INSN_DF_INCOMPLETE_MEMOPS), never records it short.
+ */
+#define INSN_DF_MAX_FAN_ROWS  1024
+
+/*
  * How many components one synthetic effective address is built from, and how
  * many such addresses one instruction may name.  x86's modrm reaches two (base
  * and index) and aarch64's register-offset form the same; nothing in tree
@@ -614,6 +642,18 @@ typedef struct InsnDataflow {
      */
     uint8_t  self_loop_memops;
     bool     self_loop_iterated;
+
+    /*
+     * A helper's access fan (insn_dataflow_note_helper_accesses()): the
+     * accesses after the first, in the helper's order.  They follow memops[]
+     * in the row numbering a consumer sees, and each shares the address
+     * account of memops[fan_anchor] -- the fan's first access -- and has no
+     * datum account.  @fan points into the translation's own scratch and is
+     * valid exactly as long as this record is.
+     */
+    const InsnDataflowHelperAccess *fan;
+    uint16_t n_fan;
+    uint8_t  fan_anchor;
 
     /*
      * The emitter said its lowering split this instruction's guest access.
@@ -1199,6 +1239,38 @@ void insn_dataflow_note_helper_store(uint32_t size,
                                      int64_t offset, InsnDataflowAtom datum);
 
 /*
+ * EVERY access a helper performs, in the helper's order: @rows[0..@n).
+ *
+ * The count is the helper's MAXIMUM.  How many of them an execution performs
+ * can depend on state the decode site does not hold -- XSAVE saves only the
+ * components its runtime feature mask and XCR0 select, FXSAVE skips the XMM
+ * area under fast FXSAVE -- and the template's count is the ceiling the wire
+ * contract (format.rst §4.5) requires: a record's count may be smaller than
+ * the template's, never larger.  So a decode site states what the helper CAN
+ * perform, and the runtime callbacks publish what it did.
+ *
+ * The first row is stated exactly as insn_dataflow_note_synthetic_ea() states
+ * one, at @disp plus its own offset, so the address components and the
+ * displacement are noted once.  The rest are fan rows (InsnDataflow.fan),
+ * which share that row's address account; @rows need not outlive the call.
+ *
+ * NO DATUM IS STATED.  A fan row's value is a field of the saved state, and
+ * naming those registers is the wide-state statement the FXSAVE arm in
+ * target/i386 prices and has not built -- so a store row publishes an empty
+ * datum account exactly as the single area row did before, and a load row
+ * publishes nothing a destination can depend on beyond row 0.
+ *
+ * The fan must be the instruction's whole access list: an instruction whose
+ * op stream records an access after the fan's first row would number the fan
+ * out of program order, and is refused (INSN_DF_INCOMPLETE_MEMOPS) when the
+ * block closes.
+ */
+void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
+                                        unsigned n,
+                                        const InsnDataflowEaPart *parts,
+                                        unsigned nparts, int64_t disp);
+
+/*
  * Install a target's helper-usage table.
  *
  * @args is the shape the compiler derived, @dirs the adjudication.  The two
@@ -1315,6 +1387,10 @@ static inline void insn_dataflow_note_helper_store(uint32_t size,
                                                    int64_t disp,
                                                    int64_t offset,
                                                    InsnDataflowAtom datum)
+{ }
+static inline void insn_dataflow_note_helper_accesses(
+    const InsnDataflowHelperAccess *rows, unsigned n,
+    const InsnDataflowEaPart *p, unsigned nparts, int64_t disp)
 { }
 static inline void insn_dataflow_declare_regfile(const char *const *names,
                                                  unsigned count,

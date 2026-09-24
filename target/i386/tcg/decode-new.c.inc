@@ -431,23 +431,48 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
     }
 
     /*
-     * THE ACCESS A HELPER PERFORMS AND NO OP NAMES.
+     * THE ACCESSES A HELPER PERFORMS AND NO OP NAMES.
      *
-     * Two arms reach the same statement.  The prefetch and cache-maintenance
-     * words touch no guest memory at all and name an address anyway.  FXSAVE
-     * and FXRSTOR do touch it: gen_FXSAVE hands tcg_env and s->A0 to
-     * helper_fxsave, which moves the whole 512-byte area itself, so the op
-     * stream shows a call and no qemu_st -- and the template then declared
-     * that the instruction cannot touch memory while the runtime delivered
-     * hundreds of accesses per execution against it.  Measured on an x86_64
-     * system trace: 990 impossible memop attributions on `48 0f ae 40 40`
-     * (fxsave64 0x40(%rax)), the whole of cst_audit's surviving
-     * memop-impossible population.  The area is 512 bytes in every form the
-     * architecture has, which is why the size is written here and not derived
-     * from the operand's encoded width.
+     * Two arms reach a statement.  The prefetch and cache-maintenance words
+     * touch no guest memory at all and name an address anyway.  The
+     * state-area instructions do touch it: gen_FXSAVE, gen_FXRSTOR,
+     * gen_XSAVE, gen_XSAVEOPT and gen_XRSTOR hand tcg_env and s->A0 to a
+     * helper that moves the area itself, so the op stream shows a call and no
+     * qemu_ld/qemu_st.
+     *
+     * THE ACCESS IS NOT THE AREA.  The helper performs one access_st/access_ld
+     * per field, and each reaches the runtime as its own access, so what the
+     * template has to count is those, not the region they tile.  Stating the
+     * area as one 512-byte row was the defect the over-max oracle caught: the
+     * template said one store while the wire carried 55 on every
+     * `fxsave64 0x40(%rax)` (48 0f ae 40 40), 52 loads on its FXRSTOR, and
+     * XSAVEOPT/XRSTOR -- which stated nothing -- carried 100 and 89 against a
+     * template that said they could not touch memory.  The rows come from
+     * x86_state_area_accesses(), the helpers' own account written beside
+     * them, as the maximum the helper can perform on this CPU model; an
+     * execution that saves fewer components publishes fewer, and the wire
+     * allows that and nothing else.
+     *
+     * An FXSAVE or FXRSTOR under CR0.EM or CR0.TS is translated to #NM and
+     * never calls the helper, so it states nothing.
      */
-    bool helper_area = !decode->e.is_decode &&
-        (decode->e.gen == gen_FXSAVE || decode->e.gen == gen_FXRSTOR);
+    int area = -1;
+
+    if (!decode->e.is_decode) {
+        bool nm = (s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK);
+
+        if (decode->e.gen == gen_FXSAVE && !nm) {
+            area = X86_STATE_AREA_FXSAVE;
+        } else if (decode->e.gen == gen_FXRSTOR && !nm) {
+            area = X86_STATE_AREA_FXRSTOR;
+        } else if (decode->e.gen == gen_XSAVE ||
+                   decode->e.gen == gen_XSAVEOPT) {
+            area = X86_STATE_AREA_XSAVE;
+        } else if (decode->e.gen == gen_XRSTOR) {
+            area = X86_STATE_AREA_XRSTOR;
+        }
+    }
+    bool helper_area = area >= 0;
 
     /*
      * LOCK CMPXCHG under CF_PARALLEL is the same shape: gen_CMPXCHG's
@@ -545,9 +570,19 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
              * Until it is built the access is stated and the register set it
              * moves is a named residue.
              */
-            insn_dataflow_note_synthetic_ea(decode->e.gen == gen_FXSAVE
-                                            ? INSN_DF_WR : INSN_DF_RD,
-                                            512, parts, n, a->disp);
+            InsnDataflowHelperAccess rows[128];
+            unsigned nrows = x86_state_area_accesses((X86StateArea)area,
+                                                     CODE64(s),
+                                                     s->xcr0_supported,
+                                                     rows, ARRAY_SIZE(rows));
+
+            if (nrows == 0) {
+                /* An account that does not fit is not recorded short. */
+                insn_dataflow_refuse();
+            } else {
+                insn_dataflow_note_helper_accesses(rows, nrows, parts, n,
+                                                   a->disp);
+            }
         } else if (locked_cmpxchg) {
             /*
              * The RMW pair, in the order the nonatomic expansion performs

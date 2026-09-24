@@ -2394,14 +2394,30 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * block starts positionally clean.  In window mode on_segment_open ran
      * last step and armed the one-shot follow-up so the opener block's own
      * post-open leak is dropped the step after. */
+    /* The memops that block recorded are the same leak and are dropped with
+     * its snaps.  The recorder admits CP accesses from the moment is_active
+     * flips, so the block that was already running at the open (its own
+     * dispatch preceded the open) delivers them into the accumulator.
+     * Nothing publishes that block.  Its memops are keyed by PC, so the
+     * next published execution of the same template drained them as its
+     * own.  Witness: a pinned simpoint that opens at the head of a loop body
+     * publishes that body's next entry carrying two iterations' memops. */
     uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
+    bool drop_open_leak = false;
     if (seg_gen_seen_ != cur_gen) {
         seg_gen_seen_ = cur_gen;
         drop_open_leak_pending_ = false;
-        pending_reg_snaps(cpu_index_).clear();
+        drop_open_leak = true;
     } else if (drop_open_leak_pending_) {
         drop_open_leak_pending_ = false;
+        drop_open_leak = true;
+    }
+    if (drop_open_leak) {
         pending_reg_snaps(cpu_index_).clear();
+        g_stats.cp_open_leak_memops_dropped +=
+            g_mem_recorder.cp_count(cpu_index_) +
+            g_mem_recorder.cp_carry_count(cpu_index_);
+        g_mem_recorder.clear_cp(cpu_index_);
     }
 
     /* The three ordered event passes.  Shared verbatim with the light

@@ -689,6 +689,19 @@ def _chk_system_simpoint(ctx: Ctx) -> Outcome:
                        f"wire header says WARMUP_INSNS={got_w} "
                        f"TOTAL_TARGET_INSNS={got_tot}; the schedule asked "
                        f"for {warmup} and {want_tot}")
+
+    # The decoder's own lint verdict on BOTH segments gates too.  The legs
+    # above read headers only, so a segment whose body attributes a memop to
+    # an instruction that cannot perform it passed here.  Witness: row 515,
+    # where every scheduled segment's first loop-body entry carried two
+    # iterations' memops, and this check read PASS.
+    from . import validator as V
+    dmod = V._load_decoder()
+    for cl, cst in ((cluster, cst1), (cluster2, cst2)):
+        m, _t = dmod.decode_champsim_tracer_header(cst)
+        lint = dmod.lint_failure(m.get("impossible_attributions"))
+        if lint:
+            return Outcome("fail", f"cluster {cl} ({cst.name}): {lint}")
     return Outcome("pass",
                    f"both scheduled clusters captured inside the marked "
                    f"region and correctly ORDERED on the latched user clock: "

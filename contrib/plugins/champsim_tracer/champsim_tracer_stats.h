@@ -107,6 +107,11 @@ struct Stats {
      * still surfacing here indicates a leak).  Dropped at drain
      * instead of mis-slotted onto insn 0. */
     uint64_t cp_orphan_mem_accesses = 0;
+    /* CP memops a segment's opening block recorded before the first
+     * dispatch of the segment, discarded there with that block's reg snaps
+     * (PathBuilder::step_events, Case C).  The block is not published, so
+     * no entry can own them. */
+    uint64_t cp_open_leak_memops_dropped = 0;
     /* CP memops whose insn_pc DID match a template slot, but the slot's
      * instruction cannot physically touch memory (static max loads and
      * stores both zero; atomics and synthetic-EA opcode classes

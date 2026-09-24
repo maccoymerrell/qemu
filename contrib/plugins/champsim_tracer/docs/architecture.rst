@@ -780,7 +780,14 @@ load-bearing — under ``exec_lock``:
     segment-open boundary: the builder resets
     (``PathBuilder::on_segment_open``), the async state clears, and
     the queue re-enables, discarding the backlog that straddles the
-    boundary.
+    boundary.  The block that was already running when the segment
+    opened is not published, yet its instructions deliver register
+    snapshots and memops once the segment is active.  Each vCPU's
+    first step in the new segment discards both, so no later entry
+    of the same template can drain them as its own
+    (``CP segment-open memops dropped`` counts the memops).  This
+    holds for every open route: the window opener, a marker, and a
+    pinned simpoint opened from the fast-forward path.
 4.  Heartbeat and histogram-bucket selection, then the scoreboard
     reads: ``current_pc`` (the executing TB's start, a per-TB inline
     store) and the previous TB's last-executed fragment's

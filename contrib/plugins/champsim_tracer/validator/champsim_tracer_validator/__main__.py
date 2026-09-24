@@ -30,6 +30,7 @@ from . import _system as SYS
 from . import _full as FULL
 from . import _lldet as LLDET
 from . import _must0
+from . import _lanecheck
 from . import _stall_condition as STALL
 from . import _plugin_load as PLUGLOAD
 
@@ -1238,6 +1239,20 @@ def cmd_validate(args, isa: str | None = None) -> int:
                                                      False)))
     print(report.summary())
     rc = 1 if report.errors() else 0
+    # Memop -> register/lane association, scored against the architecture
+    # (_lanecheck).  No other check reads the two facts together.  A
+    # --coverage program executes every structure family the check knows,
+    # so there a zero-subject reading is a failure, not a pass.
+    if isa in _lanecheck.ISAS:
+        try:
+            from ._cst_decode_runner import _find_cst_decode
+            lrep = _lanecheck.check_trace(trace, isa, _find_cst_decode())
+            if _lanecheck.verdict(lrep, bool(getattr(args, "coverage",
+                                                     False))):
+                rc = 1
+        except (RuntimeError, FileNotFoundError, OSError) as exc:
+            print(f"lanecheck[{isa}]: FAIL  {exc}")
+            rc = 1
     if marker:
         # System-mode runs capture the guest console; the plugin's
         # segment-close line must not report an under-budget close.

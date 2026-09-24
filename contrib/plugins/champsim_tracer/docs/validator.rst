@@ -69,7 +69,18 @@ Every run follows a five-stage pipeline:
    block, the helper-leaf instruction count, and stable
    ``ground_truth`` records; annotate ``meta.json`` in place.
 #. **validate** — load the ``.cst`` and the annotated ``meta.json``,
-   run every named check, and emit a summary report.
+   run every named check, and emit a summary report.  On aarch64 and
+   riscv64 the stage also scores the memop-to-register-and-lane
+   association (``_lanecheck.py``): every access of an AArch64
+   ``LD2``/``LD3``/``LD4``/``ST2``/``ST3``/``ST4`` (multiple structures)
+   or RISC-V unit-stride ``vle``/``vse`` (``nf`` = 1) must be rendered
+   against the register and lane the architecture assigns its element
+   (element ``k`` goes to register ``rt + k mod selem``, lane
+   ``k div selem``); an access placed under no register counts as
+   wrong.  It reads the ``--show-deps --show-lanes`` disassembly
+   streamed, never the whole trace.  A ``--coverage`` program executes
+   these families, so there a run with no subject fails; elsewhere it
+   prints ``no subject`` and is not scored.
 
 The default ``all`` subcommand runs the whole pipeline end-to-end.
 Specialised sub-commands (``simpoint_test``, ``thread_test``,

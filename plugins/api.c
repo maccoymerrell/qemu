@@ -610,14 +610,46 @@ unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
         return QEMU_PLUGIN_DF_INCOMPLETE;
     }
     if (memop >= d->n_memops) {
+        unsigned j = memop - d->n_memops;
+        uint64_t prov[INSN_DF_REG_WORDS] = { 0 };
+
         /*
-         * A fan row states no datum (insn_dataflow_note_helper_accesses), so
-         * its account is the empty one the fan's first row carries.
+         * A fan row's datum account is the register its statement names for
+         * a store, and empty otherwise -- a load's datum comes from memory,
+         * and a row with no stated register has no account to give.
          */
-        return plugin_df_copy(d->memops[d->fan_anchor].data_prov, words,
-                              nwords);
+        if (d->fan_datum != NULL && d->fan_datum[j] != INSN_DF_DATUM_NONE &&
+            (d->fan[j].dir & INSN_DF_WR)) {
+            prov[d->fan_datum[j] / 64] |= 1ull << (d->fan_datum[j] % 64);
+        }
+        return plugin_df_copy(prov, words, nwords);
     }
     return plugin_df_copy(d->memops[memop].data_prov, words, nwords);
+}
+
+bool qemu_plugin_insn_memop_datum(const struct qemu_plugin_tb *tb,
+                                  size_t idx, unsigned memop, unsigned *bit)
+{
+    const InsnDataflow *d = plugin_df_whole(tb, idx);
+    uint16_t b = INSN_DF_DATUM_NONE;
+
+    if (d == NULL || d->fan == NULL || memop >= plugin_df_n_memops(d)) {
+        return false;
+    }
+    if (memop >= d->n_memops) {
+        if (d->fan_datum != NULL) {
+            b = d->fan_datum[memop - d->n_memops];
+        }
+    } else if (memop == d->fan_anchor) {
+        b = d->anchor_datum;
+    }
+    if (b == INSN_DF_DATUM_NONE) {
+        return false;
+    }
+    if (bit) {
+        *bit = b;
+    }
+    return true;
 }
 
 const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_tb *tb,

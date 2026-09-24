@@ -40,10 +40,9 @@
  *
  * @dir is QEMU's own reading of the access, not a guess.  check_zicbom_access()
  * probes MMU_DATA_LOAD and accepts a readable block, so the maintenance forms
- * are stated as reads; helper_cbo_zero() calls probe_write() and then memsets
- * cboz_blocksize bytes, so CBO.ZERO is a write of exactly that many.  The size
- * likewise comes from the CPU's own configured block length rather than a
- * constant written here.
+ * are stated as reads, a block of the CPU's own configured length rather than
+ * a constant written here.  CBO.ZERO is not this shape: its helper really
+ * stores, and states its stores below.
  *
  * THE COMPONENT IS UNSHIFTED AND UNEXTENDED, which RISC-V's encoding settles
  * rather than this file: the base register is added whole, and the
@@ -90,12 +89,51 @@ static bool trans_cbo_inval(DisasContext *ctx, arg_cbo_inval *a)
     return true;
 }
 
+/*
+ * THE STORES CBO.ZERO PERFORMS.
+ *
+ * helper_cbo_zero() probes the block for a store and then zeroes it.  Where
+ * the probe hands back a host pointer the zeroing is a memset no plugin sees;
+ * where it does not -- an I/O page, and under plugins in system mode every
+ * page, since the probe then refuses host pointers -- it is one
+ * cpu_stb_mmuidx_ra() per byte, each delivered as its own store.  The most
+ * the helper can perform is therefore cboz_blocksize one-byte stores, from
+ * the block the address is aligned down into, and that is the count the
+ * template states: an execution that delivers fewer (the memset, or the
+ * wrong path, which zeroes nothing) publishes a smaller count, never a larger
+ * one.  The address account is the base register's, as the single row's was.
+ */
+static void note_cbo_zero_stores(DisasContext *ctx, int rs1, uint32_t len)
+{
+    InsnDataflowHelperAccess rows[UINT8_MAX];
+    InsnDataflowEaPart base =
+        insn_df_ea(rs1 == 0 ? insn_df_zero()
+                            : insn_df_reg(riscv_int_regnames[rs1]),
+                   0, INSN_DF_EA_EXT_NONE);
+
+    if (len == 0 || len > ARRAY_SIZE(rows)) {
+        /*
+         * A template counts at most UINT8_MAX accesses per direction (a
+         * u8 on the wire): a wider fan is refused, not clamped.
+         */
+        insn_dataflow_refuse();
+        return;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        rows[i].dir = INSN_DF_WR;
+        rows[i].size = 1;
+        rows[i].offset = i;
+        rows[i].datum = 0;
+    }
+    insn_dataflow_note_helper_accesses(rows, len, &base, 1, 0);
+}
+
 static bool trans_cbo_zero(DisasContext *ctx, arg_cbo_zero *a)
 {
     REQUIRE_ZICBOZ(ctx);
     TCGv src = get_address(ctx, a->rs1, 0);
 
-    note_cbo_ea(ctx, a->rs1, INSN_DF_WR, ctx->cfg_ptr->cboz_blocksize);
+    note_cbo_zero_stores(ctx, a->rs1, ctx->cfg_ptr->cboz_blocksize);
     gen_helper_cbo_zero(tcg_env, src);
     return true;
 }

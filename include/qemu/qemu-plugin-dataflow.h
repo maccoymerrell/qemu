@@ -71,7 +71,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 7
+#define QEMU_PLUGIN_DATAFLOW_VERSION 8
 
 /*
  * Returned by any set accessor whose instruction could not be read in full.
@@ -293,6 +293,22 @@ QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
                                           size_t idx, unsigned memop,
                                           uint64_t *words, unsigned nwords);
+
+/*
+ * The register an access's value belongs to, where the emitter states one.
+ *
+ * A structure load or store moves each element between memory and one lane of
+ * one register, and the element order is the emitter's to know: aarch64
+ * `ld3 {v2.4h-v4.4h}' reads twelve halfwords and element i of the triple
+ * lands in v2, v3 or v4 by its place in memory.  For a load @bit is the
+ * provenance bit of the register the access fills; for a store, the register
+ * it drains (the same bit qemu_plugin_insn_memop_data_prov() reports).
+ * Returns false where no register is stated -- a state area's field, a block
+ * clear's zeros, or any access outside a stated fan.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_memop_datum(const struct qemu_plugin_tb *tb,
+                                  size_t idx, unsigned memop, unsigned *bit);
 
 /*
  * An address the instruction names and the emulation computes nothing for.

@@ -16,16 +16,17 @@ either one alone is wrong:
   ``arm_plugin_bulk_mem_cb()``, the same decomposition the FEAT_MOPS SET
   and CPY steps use.
 
-* **Classification.** Capstone folds the whole ``SYS`` alias space --
-  ``DC``, ``IC``, ``AT``, ``TLBI`` -- into one instruction id
-  (``AARCH64_INS_SYS``) and gives ``DC ZVA`` no memory operand at all, so
-  the tracer classified it ``GEN_OP_VEC_LOGIC`` with no memory lane.
-  Reported stores would then land on an instruction the template declares
-  incapable of touching memory, and every trace containing a ``dc zva``
-  would fail ``cst_decode --strict``.  ``disas/capstone.c`` now recognises
-  the block-zeroing operations from Capstone's structured sysop detail and
-  presents ``Xt`` as the written memory operand it really is;
-  ``refine_arm64_sysop`` then classifies them ``GEN_OP_STORE``.
+* **Declaration.** Every store the helper reports must land on a memop
+  slot the template declares, and the template's count is the most the
+  instruction can perform (``docs/format.rst``: a record's count may fall
+  short of the template's but never exceed it).  The decode site
+  (``a64_note_zva_stores`` in ``target/arm/tcg/translate-a64.c``) states
+  one store per piece the helper writes: in user mode the block is
+  written in 16-byte pieces, so the template declares ``blocklen / 16``
+  stores and each execution publishes exactly that many.  A template
+  declaring a single store (the block as one synthetic access) is short
+  by ``blocklen / 16 - 1`` slots, and ``cst_decode --strict`` reports
+  every execution over its maximum.
 
 The assertion is a tiling one, matching ``test_mops_memops.py``: the store
 records must cover ``[base, base + blocklen)`` exactly -- contiguous, no
@@ -35,8 +36,9 @@ guest's own ``DCZID_EL0`` rather than assumed, and the program stores it
 where the test can recover it.
 
 Against a pre-fix build the instruction records no memory accesses at all
-and the tiling is empty, so this FAILS; against a build with the
-instrumentation but not the classification, ``--strict`` FAILS instead.
+and the tiling is empty, so this FAILS; against a build whose template
+declares fewer stores than the helper performs, the declaration check and
+``--strict`` FAIL instead.
 
 Point it at any build with ``CST_BUILD_DIR=/path/to/build``.  Skips when
 the AArch64 cross toolchain or ``qemu-aarch64`` is absent.
@@ -271,20 +273,24 @@ class DcZvaMemopsTest(unittest.TestCase):
                             f"dc zva stores ({NBLOCKS} x {blocklen} bytes)")
         self.assertIsNone(err, err)
 
-    def test_dc_zva_is_classified_as_a_block_store(self):
-        _pcs, _found, lanes, opcodes, _cst = self._shared()
+    def test_dc_zva_declares_every_store_it_performs(self):
+        _pcs, found, lanes, opcodes, _cst = self._shared()
 
+        st = found["store"]
+        self.assertTrue(st, "dc zva recorded no stores; nothing to declare")
+        blocklen = sum(n for _a, n in st) // NBLOCKS
+        # User mode: the helper writes the block in 16-byte pieces.
+        want = {(0, max(1, blocklen // 16))}
         self.assertEqual(
-            lanes, {(0, 1)},
+            lanes, want,
             f"dc zva's template declares (n_loads, n_stores) = {lanes}, "
-            f"expected {{(0, 1)}}.  Capstone models no memory operand for "
-            f"DC ZVA, so without the boundary correction in "
-            f"disas/capstone.c (cap_aarch64_is_block_zero_sysop) the "
-            f"instruction claims no memory lane and every store it "
-            f"performs is an impossible attribution.")
-        # GEN_OP_STORE, via refine_arm64_sysop.  Compare by name so the
-        # test does not hard-code the numeric id.
-        from champsim_tracer_validator import _cst_decode_runner as R
+            f"expected {want} for a {blocklen}-byte block.  The decode "
+            f"site must state one store per piece the helper writes "
+            f"(a64_note_zva_stores); a shorter declaration makes every "
+            f"execution exceed its template's maximum.")
+        self.assertEqual(len(st), NBLOCKS * max(1, blocklen // 16),
+                         f"expected {NBLOCKS} x {blocklen // 16} stores, "
+                         f"recorded {len(st)}")
         self.assertEqual(len(opcodes), 1, f"dc zva got opcodes {opcodes}")
 
     def test_decode_strict_is_clean(self):

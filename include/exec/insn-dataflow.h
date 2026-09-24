@@ -445,14 +445,28 @@ typedef struct InsnDataflowMemop {
  * widened to: each row carries two provenance sets, and the scratch holds a
  * row array for every instruction of the block.  The fan's rows share one
  * address account -- every access is the named address plus a constant of
- * the helper -- and carry no datum a decode site could state, so four bytes
- * say everything a row of this kind has to say.
+ * the helper -- so a few bytes say everything a row of this kind has to say.
+ *
+ * THE DATUM IS THE REGISTER THE ACCESS'S VALUE BELONGS TO, WHERE ONE DOES.
+ * A structure load or store moves each element between memory and one lane
+ * of one register -- aarch64 `ld3 {v2.4h-v4.4h}' reads twelve halfwords and
+ * element i of the triple lands in lane i of v2, v3 or v4 by its position in
+ * memory -- and that is the memop-to-register association a consumer needs to
+ * map an access to the lanes it feeds.  @datum names it: 1 + an index into
+ * the atom list the note is handed, the register a load writes or a store
+ * reads, or 0 where the access has no single register (a state area's field,
+ * a block clear's zeros).  Stated by the emitter that chose the element
+ * order, because nothing in the ops that remain says it once they are folded.
  */
 typedef struct InsnDataflowHelperAccess {
     uint8_t  dir;               /* INSN_DF_RD / _WR */
     uint8_t  size;              /* bytes */
     uint16_t offset;            /* from the encoded address */
+    uint8_t  datum;             /* 1 + index into the note's datum atoms, or 0 */
 } InsnDataflowHelperAccess;
+
+/* A fan row's resolved datum: no register. */
+#define INSN_DF_DATUM_NONE  0xffffu
 
 /*
  * Fan rows one translation block may hold, across all its instructions.  The
@@ -654,6 +668,26 @@ typedef struct InsnDataflow {
     const InsnDataflowHelperAccess *fan;
     uint16_t n_fan;
     uint8_t  fan_anchor;
+
+    /*
+     * The register each fan row's value belongs to (InsnDataflowHelperAccess
+     * .datum, resolved to its provenance bit), parallel to @fan, and the
+     * anchor row's -- INSN_DF_DATUM_NONE where a row has none.  NULL when the
+     * fan names no datum at all.
+     */
+    const uint16_t *fan_datum;
+    uint16_t anchor_datum;
+
+    /*
+     * An element fan (insn_dataflow_note_element_accesses()) waiting for the
+     * op walk: the accesses are the ops' own, folded by split_access into one
+     * row, and the statement's first row replaces that fold once the walk has
+     * made it.  @elem_total is the extent the fold must come to.
+     */
+    bool     elem_fan;
+    uint8_t  elem_dir;
+    uint8_t  elem_size0;
+    uint32_t elem_total;
 
     /*
      * The emitter said its lowering split this instruction's guest access.
@@ -1271,6 +1305,45 @@ void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
                                         unsigned nparts, int64_t disp);
 
 /*
+ * The same, with the register each row's value belongs to.
+ *
+ * @datums are the registers the rows' .datum fields index (1-based; 0 is
+ * none).  A load row's datum is the register the access fills, a store
+ * row's the register it drains; a store's datum is also the instruction's
+ * READ of that register, stated here because the helper that performs the
+ * access hides it.  A datum that resolves to no provenance bit refuses the
+ * instruction (INSN_DF_INCOMPLETE_REFUSED), never publishes the row unnamed.
+ */
+void insn_dataflow_note_helper_accesses_datum(
+    const InsnDataflowHelperAccess *rows, unsigned n,
+    const InsnDataflowEaPart *parts, unsigned nparts, int64_t disp,
+    const InsnDataflowAtom *datums, unsigned ndatums);
+
+/*
+ * THE ELEMENT ORDER OF A SPLIT ACCESS, STATED BY THE EMITTER THAT CHOSE IT.
+ *
+ * insn_dataflow_note_split_access() folds a de-interleaving lowering's
+ * element accesses into ONE row so the reader can record the instruction at
+ * all -- and a row of the region's extent is one access where the machine
+ * performs, and delivers to plugins, one per element: `ld4 {v5.16b-v8.16b}'
+ * is sixty-four one-byte loads, and a template that says one breaks the
+ * contract that a record's count is never larger than its template's.
+ *
+ * This states the accesses themselves: @rows[0..@n) in the order the emitter
+ * performs them, each with its offset from the region's start, its width and
+ * the register it fills or drains (@datums, as for the helper form above).
+ * The op walk's fold becomes the first row -- it keeps the address account
+ * the ops computed -- and the rest are fan rows (InsnDataflow.fan).  The
+ * fold's extent must equal the rows' total, or the statement and the ops
+ * disagree and the instruction is refused (INSN_DF_INCOMPLETE_MEMOPS) rather
+ * than published with either account.  Requires the split-access statement.
+ */
+void insn_dataflow_note_element_accesses(const InsnDataflowHelperAccess *rows,
+                                         unsigned n,
+                                         const InsnDataflowAtom *datums,
+                                         unsigned ndatums);
+
+/*
  * Install a target's helper-usage table.
  *
  * @args is the shape the compiler derived, @dirs the adjudication.  The two
@@ -1391,6 +1464,15 @@ static inline void insn_dataflow_note_helper_store(uint32_t size,
 static inline void insn_dataflow_note_helper_accesses(
     const InsnDataflowHelperAccess *rows, unsigned n,
     const InsnDataflowEaPart *p, unsigned nparts, int64_t disp)
+{ }
+static inline void insn_dataflow_note_helper_accesses_datum(
+    const InsnDataflowHelperAccess *rows, unsigned n,
+    const InsnDataflowEaPart *p, unsigned nparts, int64_t disp,
+    const InsnDataflowAtom *datums, unsigned ndatums)
+{ }
+static inline void insn_dataflow_note_element_accesses(
+    const InsnDataflowHelperAccess *rows, unsigned n,
+    const InsnDataflowAtom *datums, unsigned ndatums)
 { }
 static inline void insn_dataflow_declare_regfile(const char *const *names,
                                                  unsigned count,

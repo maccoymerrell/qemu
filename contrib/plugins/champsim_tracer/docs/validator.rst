@@ -748,13 +748,14 @@ outside the repo as standalone scripts):
    block size from the guest's own ``DCZID_EL0`` rather than assuming
    64 or 512 bytes, and asserts the same *tiling* the MOPS check does
    over the whole run.  It separately asserts that the instruction's
-   template declares a store lane: Capstone gives ``DC ZVA`` no memory
-   operand at all, and without the boundary correction (see
-   :doc:`qemu_modifications`) reported stores land on an instruction
-   the trace declares incapable of touching memory.  The two halves
-   fail independently — a base with neither records no accesses at
-   all, and a base with the instrumentation but not the classification
-   fails ``cst_decode --strict`` instead.
+   template declares every store the helper performs — one per 16-byte
+   piece in user mode, ``blocklen / 16`` in all — because a record's
+   memop count may fall short of its template's maximum but never exceed
+   it.  The two halves fail independently — a base without the
+   instrumentation records no accesses at all, and a base whose decode
+   site declares fewer stores than the helper performs (the block as one
+   synthetic store) fails the declaration check and ``cst_decode
+   --strict`` instead.
 ``features.string_memops``
    x86 ``REP`` string instructions fan out per architectural iteration
    with the right per-iteration memop count, and the operand model

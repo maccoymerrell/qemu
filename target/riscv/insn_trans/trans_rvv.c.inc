@@ -766,6 +766,57 @@ static void rvv_state_ldst_vreg(uint32_t vd, uint32_t vm, bool is_store)
 }
 
 /*
+ * THE ELEMENT ACCESSES OF A UNIT-STRIDE VECTOR LOAD OR STORE.
+ *
+ * The vle/vse helpers move one element per access -- cpu_ld*_data_ra() /
+ * cpu_st*_data_ra() per element whenever plugins are watching memory, which
+ * is what the plugin is delivered -- so an execution publishes vl * nf
+ * accesses of the encoding's element width, consecutive from the base.  vl is
+ * a register value, and a template is shared by every execution of the same
+ * bytes whatever vtype it runs under, so the count stated is the most ANY
+ * vtype can reach: EMUL * NF <= 8 register groups of VLEN bits, i.e.
+ * 8 * VLENB >> eew elements.  An execution publishes its own smaller count.
+ *
+ * Each access's register is the destination (load) or source (store) group
+ * @vd, named by its base the way rvv_state_ldst_vreg() names it; the
+ * element's rank among the accesses is its lane, which is what the per-slot
+ * lane masks read.  A segment access (nf > 1) spreads its fields over nf
+ * groups whose placement depends on EMUL, which the template cannot know, so
+ * those rows name no register rather than the wrong one.  The lane width is
+ * the encoding's element width over one register, the one fact of the shape
+ * that does not depend on vtype.
+ */
+static void rvv_note_us_elements(DisasContext *s, uint32_t vd, uint32_t rs1,
+                                 uint8_t eew, uint32_t nf, bool is_store)
+{
+    InsnDataflowHelperAccess rows[UINT8_MAX];
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    uint32_t n = (8 * vlenb) >> eew;
+    InsnDataflowAtom reg = insn_df_reg(riscv_vec_regnames[vd]);
+    InsnDataflowEaPart base =
+        insn_df_ea(rs1 == 0 ? insn_df_zero()
+                            : insn_df_reg(riscv_int_regnames[rs1]),
+                   0, INSN_DF_EA_EXT_NONE);
+
+    if (n == 0 || n > ARRAY_SIZE(rows)) {
+        /*
+         * A template counts at most UINT8_MAX accesses per direction (a
+         * u8 on the wire): a wider fan is refused, not clamped.
+         */
+        insn_dataflow_refuse();
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        rows[i].dir = is_store ? INSN_DF_WR : INSN_DF_RD;
+        rows[i].size = 1u << eew;
+        rows[i].offset = i << eew;
+        rows[i].datum = nf == 1 ? 1 : 0;
+    }
+    insn_dataflow_note_vec_shape(eew, vlenb);
+    insn_dataflow_note_helper_accesses_datum(rows, n, &base, 1, 0, &reg, 1);
+}
+
+/*
  *** unit stride load and store
  */
 typedef void gen_helper_ldst_us(TCGv_ptr, TCGv_ptr, TCGv,
@@ -855,6 +906,7 @@ static bool ld_us_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, NF, a->nf);
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
+    rvv_note_us_elements(s, a->rd, a->rs1, eew, a->nf, false);
     return ldst_us_trans(a->rd, a->rs1, data, fn, s, false);
 }
 
@@ -892,6 +944,7 @@ static bool st_us_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, VM, a->vm);
     data = FIELD_DP32(data, VDATA, LMUL, emul);
     data = FIELD_DP32(data, VDATA, NF, a->nf);
+    rvv_note_us_elements(s, a->rd, a->rs1, eew, a->nf, true);
     return ldst_us_trans(a->rd, a->rs1, data, fn, s, true);
 }
 

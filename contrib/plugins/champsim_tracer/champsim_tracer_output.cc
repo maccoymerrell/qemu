@@ -2567,11 +2567,22 @@ enum FieldDescIndex {
 };
 
 /* Sort dyn_params so each insn's loads precede its stores, matching
- * the slot indexing used by find_memop_slot(). */
+ * the slot indexing used by find_memop_slot().
+ *
+ * STABLE, BECAUSE SLOT k IS THE k-TH ACCESS.  The recorder hands the memops
+ * over in execution order, and within one instruction and one direction that
+ * order is the only thing that says which access a wire slot is: a load
+ * slot's LOAD_DATA_LANE_MASK maps it to the lane its rank feeds, and an
+ * interleaving structure load (`ld3 {v2.4h-v4.4h}' -- element i of the
+ * triple is lane i of v2, v3 or v4 by its place in memory) is only mapped
+ * right if slot k is the k-th element.  An unstable sort kept the
+ * instruction/direction grouping and permuted the accesses inside each group
+ * once the entry was large enough to be partitioned: the first element of an
+ * `ld2' reached the wire as its last slot. */
 static void dyn_params_sort_template_order(std::vector<DynParam> &dyn_params)
 {
     if (dyn_params.size() < 2) return;
-    std::sort(dyn_params.begin(), dyn_params.end(),
+    std::stable_sort(dyn_params.begin(), dyn_params.end(),
               [](const DynParam &a, const DynParam &b) {
                   if (a.insn_index != b.insn_index) {
                       return a.insn_index < b.insn_index;

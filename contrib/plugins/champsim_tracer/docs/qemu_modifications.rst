@@ -2083,7 +2083,15 @@ program's bulk memory traffic.
    and leaves the rest of the ``SYS`` space as maintenance.  The block
    size is deliberately not encoded at the disassembly boundary — it is a
    runtime CPU property, not a property of the encoding — so the sizes on
-   the wire come from the helper.
+   the wire come from the helper.  The *count* is the decode site's: the
+   template must declare every store the helper can report, so
+   ``a64_note_zva_stores`` (``target/arm/tcg/translate-a64.c``) states one
+   store row per piece — ``blocklen / 16`` in user mode, and ``blocklen``
+   one-byte rows in system mode, where a block on device memory is
+   written a byte at a time — from the ``dcz_blocksize`` the translator
+   carries.  RISC-V ``CBO.ZERO`` (``note_cbo_zero_stores`` in
+   ``trans_rvzicbo.c.inc``) states ``cboz_blocksize`` one-byte rows the
+   same way.
 
    The alternative fix is to make ``tlb_vaddr_to_host()`` honour
    ``cpu_plugin_mem_cbs_enabled()`` the way ``probe_access_flags()``

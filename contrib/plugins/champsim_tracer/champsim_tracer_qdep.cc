@@ -409,8 +409,18 @@ uint64_t prov_to_addr_mask(const InsnFields *f, unsigned nwords)
 bool reg_is_vector_wide(unsigned bit_unused, uint8_t reg, unsigned oprsz)
 {
     (void)bit_unused;
-    (void)reg;
-    return oprsz > 8;
+    (void)oprsz;
+    /*
+     * THE REGISTER'S CLASS DECIDES, NOT THE OPERAND SIZE.  The rule used to
+     * be `oprsz > 8' for every register, which is wrong both ways: it gave
+     * the address base of a 16-byte vector load (`vle64.v v8,(t5)', t5) and
+     * the scalar feeding a 16-byte broadcast a full lane set, and it gave
+     * none to the destinations of an 8-byte vector operation -- `ld3
+     * {v2.4h-v4.4h}' fills four 16-bit lanes of each of three registers.
+     * Every target's vector file seats as a REG_VEC register and nothing
+     * else does, so that is the test.
+     */
+    return reg >= REG_VEC0 && reg < REG_VEC0 + 64;
 }
 
 void seat_lanes(InsnFields *f, const qemu_plugin_dataflow_status *st)
@@ -822,6 +832,35 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         });
         out->load_addr_dep_mask[k] = prov_to_addr_mask(out, n);
     }
+
+    /*
+     * THE REGISTER EACH LOAD FILLS, WHERE THE EMITTER STATED IT.
+     *
+     * A structure load's elements reach their registers through a fold the
+     * op walk cannot see into (qemu_plugin_insn_memop_datum()), so for such
+     * an instruction every load row names the register it fills, and that
+     * statement -- not the fold's provenance, which charges the whole region
+     * to every destination -- is which load slots feed which destination.
+     * All-or-nothing: an instruction with one unnamed load row keeps the
+     * provenance's account whole rather than a mixture of the two.
+     */
+    std::vector<uint8_t> load_datum_reg;
+    bool loads_stated = !load_rows.empty();
+
+    for (unsigned k = 0; k < load_rows.size() && loads_stated; k++) {
+        unsigned bit = 0;
+        uint8_t reg = REG_NONE;
+
+        if (!qemu_plugin_insn_memop_datum(tb, idx, load_rows[k], &bit) ||
+            classify_bit(bit, &reg) != BIT_REG) {
+            loads_stated = false;
+            break;
+        }
+        load_datum_reg.push_back(reg);
+    }
+    if (loads_stated) {
+        g_qdep.load_datum_stated++;
+    }
     for (unsigned k = 0; k < store_rows.size(); k++) {
         unsigned n = read_set([&](uint64_t *w, unsigned nn) {
             return qemu_plugin_insn_memop_addr_prov(tb, idx, store_rows[k],
@@ -906,6 +945,26 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         out->dst_dep_mask[slot] |= prov_to_mask(out, n);
         g_qdep.field_dst_prov_seated++;
         any_prov = true;
+    }
+    if (loads_stated) {
+        /* The load slots of every destination, from the statement alone. */
+        const unsigned lo = out->n_src_regs;
+        const unsigned hi = lo + out->max_dep_loads;
+
+        for (uint8_t d = 0; d < out->n_dst_regs; d++) {
+            for (unsigned p = lo; p < hi && p < 64; p++) {
+                out->dst_dep_mask[d] &= ~dep_bit(p);
+            }
+        }
+        for (unsigned k = 0; k < load_datum_reg.size(); k++) {
+            uint8_t slot = seat_dst(out, out_names, load_datum_reg[k]);
+
+            if (slot == UINT8_MAX) {
+                continue;
+            }
+            out->dst_dep_mask[slot] |= mask_bit_at(lo + k);
+            any_prov = true;
+        }
     }
     if (any_prov || out->n_dst_regs || out->max_dep_stores) {
         out->has_reg_deps = true;

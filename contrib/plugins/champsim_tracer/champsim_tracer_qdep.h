@@ -117,6 +117,13 @@ struct QdepCounters {
      * at all.  It is 0 on every ISA measured so far. */
     uint64_t load_datum_seated;
     uint64_t load_datum_in_addr;
+    /* Instructions whose every load row names the register it fills
+     * (qemu_plugin_insn_memop_datum(): a structure load's element order, a
+     * vector unit-stride load's destination), so the destinations' load
+     * slots came from that statement rather than from a folded row's
+     * provenance.  Zero on a run with no such load means the statement was
+     * never made, not that it was made and ignored. */
+    uint64_t load_datum_stated;
     /* A provenance member whose mask position lies past the uint64_t
      * mask's width (n_src + max_dep_loads + imm beyond 64 -- only a
      * helper fan's load count reaches that).  Its instruction's HAS_REG

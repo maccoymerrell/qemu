@@ -2707,6 +2707,10 @@ static void gen_sysreg_undef(DisasContext *s, bool isread,
  * These are all essentially the same insn in 'read' and 'write'
  * versions, with varying op0 fields.
  */
+static void a64_note_zva_stores(DisasContext *s,
+                                const InsnDataflowEaPart *parts,
+                                unsigned nparts, int64_t disp);
+
 static void handle_sys(DisasContext *s, bool isread,
                        unsigned int op0, unsigned int op1, unsigned int op2,
                        unsigned int crn, unsigned int crm, unsigned int rt)
@@ -3062,14 +3066,11 @@ static void handle_sys(DisasContext *s, bool isread,
          */
         {
             InsnDataflowEaPart base =
-                insn_df_ea(insn_df_reg(regnames[rt]), 0,
-                           INSN_DF_EA_EXT_NONE);
+                insn_df_ea(rt == 31 ? insn_df_zero()
+                                    : insn_df_reg(regnames[rt]),
+                           0, INSN_DF_EA_EXT_NONE);
 
-            if (rt != 31) {
-                insn_dataflow_note_synthetic_ea(INSN_DF_WR,
-                                                4 << s->dcz_blocksize,
-                                                &base, 1, 0);
-            }
+            a64_note_zva_stores(s, &base, 1, 0);
         }
         /* Writes clear the aligned block of memory which rt points into. */
         if (s->mte_active[0]) {
@@ -3112,6 +3113,12 @@ static void handle_sys(DisasContext *s, bool isread,
             TCGv_i64 clean_addr, tag;
 
             /* For DC_GZVA, we can rely on DC_ZVA for the proper fault. */
+            InsnDataflowEaPart gbase =
+                insn_df_ea(rt == 31 ? insn_df_zero()
+                                    : insn_df_reg(regnames[rt]),
+                           0, INSN_DF_EA_EXT_NONE);
+
+            a64_note_zva_stores(s, &gbase, 1, 0);
             tcg_rt = cpu_reg(s, rt);
             clean_addr = clean_data_tbi(s, tcg_rt);
             gen_helper_dc_zva(tcg_env, clean_addr);
@@ -4435,6 +4442,108 @@ static bool trans_STLR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     return true;
 }
 
+/*
+ * THE STORES A BLOCK ZERO PERFORMS (DC ZVA, DC GZVA, STZGM's data half).
+ *
+ * HELPER(dc_zva) zeroes the DCZID_EL0 block that contains the address and
+ * reports what it does to plugins as it does it, so the template's count is
+ * the most that helper can deliver for this CPU's block size -- never one
+ * access for a region the helper delivers as many:
+ *
+ *   RAM, and the wrong path in every mode: the block as naturally aligned
+ *     pieces of at most 16 bytes (arm_plugin_bulk_mem_cb /
+ *     arm_plugin_emit_pieces), blocklen / 16 stores.
+ *   Device memory, system mode only: one cpu_stb_mmuidx_ra() per byte, by
+ *     the standing ruling that MMIO reports the accesses the device sees --
+ *     blocklen stores.
+ *
+ * So user mode states the pieces and system mode the byte fan, the larger of
+ * its two paths; a RAM execution publishes its pieces, a count smaller than
+ * the template's and never larger.  The helper aligns the address down to
+ * the block, so the rows' offsets are from the block and the address account
+ * is the operand register's, as it was for the single synthetic row.
+ */
+static void a64_note_zva_stores(DisasContext *s,
+                                const InsnDataflowEaPart *parts,
+                                unsigned nparts, int64_t disp)
+{
+    InsnDataflowHelperAccess rows[UINT8_MAX];
+    unsigned blocklen = 4u << s->dcz_blocksize;
+#ifdef CONFIG_USER_ONLY
+    unsigned piece = MIN(blocklen, 16u);
+#else
+    unsigned piece = 1;
+#endif
+    unsigned n = blocklen / piece;
+
+    if (n == 0 || n > ARRAY_SIZE(rows)) {
+        /*
+         * A template counts at most UINT8_MAX stores (a u8 on the wire): a
+         * wider fan (a 256-byte block on the device path) is refused, not
+         * clamped.
+         */
+        insn_dataflow_refuse();
+        return;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        rows[i].dir = INSN_DF_WR;
+        rows[i].size = piece;
+        rows[i].offset = i * piece;
+        rows[i].datum = 0;
+    }
+    insn_dataflow_note_helper_accesses(rows, n, parts, nparts, disp);
+}
+
+/*
+ * THE ELEMENT ORDER OF A MULTIPLE-STRUCTURE LOAD OR STORE, STATED.
+ *
+ * LD2/LD3/LD4 and ST2/ST3/ST4 walk memory one element at a time: element e of
+ * register rt + xs sits at byte (e * selem + xs) << size of the region, so the
+ * accesses fan out across the selem registers in turn -- `ld3 {v2.4h-v4.4h}'
+ * reads twelve halfwords, v2's lane 0, v3's lane 0, v4's lane 0, v2's lane 1
+ * and so on.  insn_dataflow_note_split_access() folds them into one row so the
+ * reader can record the instruction at all; this says what the fold stands
+ * for, in the loop's own order, with the register each element fills or
+ * drains.  The lane of each element is its rank among its register's
+ * accesses, which is how the tracer's per-slot lane masks read it.
+ *
+ * The element size is the encoding's, and so is the operand size: an
+ * instruction that moves elements of 1 << size bytes into Q or D registers
+ * has lanes of that width, stated here before any expansion inside the
+ * instruction (clear_vec_high's) can state a shape of its own.
+ */
+static void a64_note_ldst_mult_elements(int rt, int selem, int rpt,
+                                        int elements, int size, bool is_q,
+                                        unsigned dir)
+{
+    InsnDataflowHelperAccess rows[64];
+    InsnDataflowAtom regs[4];
+    unsigned n = 0, off = 0;
+
+    if (rpt * selem > (int)ARRAY_SIZE(regs) ||
+        rpt * elements * selem > (int)ARRAY_SIZE(rows)) {
+        insn_dataflow_refuse();
+        return;
+    }
+    for (int i = 0; i < rpt * selem; i++) {
+        regs[i] = insn_df_reg(zregnames[(rt + i) % 32]);
+    }
+    for (int r = 0; r < rpt; r++) {
+        for (int e = 0; e < elements; e++) {
+            for (int xs = 0; xs < selem; xs++) {
+                rows[n].dir = dir;
+                rows[n].size = 1u << size;
+                rows[n].offset = off;
+                rows[n].datum = 1 + r * selem + xs;
+                off += 1u << size;
+                n++;
+            }
+        }
+    }
+    insn_dataflow_note_vec_shape(size, is_q ? 16 : 8);
+    insn_dataflow_note_element_accesses(rows, n, regs, rpt * selem);
+}
+
 static bool trans_LD_mult(DisasContext *s, arg_ldst_mult *a)
 {
     TCGv_i64 clean_addr, tcg_rn, tcg_ebytes;
@@ -4507,8 +4616,12 @@ static bool trans_LD_mult(DisasContext *s, arg_ldst_mult *a)
          * The extent stated here is the one gen_mte_checkN was just given:
          * @total bytes from the same base, which is the region this
          * instruction reads whichever way the elements are distributed.
+         * The elements themselves -- one delivered access each -- are stated
+         * beside it, so the fold is not mistaken for the access count.
          */
         insn_dataflow_note_split_access();
+        a64_note_ldst_mult_elements(a->rt, a->selem, a->rpt, elements, size,
+                                    a->q, INSN_DF_RD);
     }
     for (r = 0; r < a->rpt; r++) {
         int e;
@@ -4604,6 +4717,8 @@ static bool trans_ST_mult(DisasContext *s, arg_ldst_mult *a)
     if (a->selem != 1) {
         /* The store side of the same fact; see trans_LD_mult. */
         insn_dataflow_note_split_access();
+        a64_note_ldst_mult_elements(a->rt, a->selem, a->rpt, elements, size,
+                                    a->q, INSN_DF_WR);
     }
     for (r = 0; r < a->rpt; r++) {
         int e;
@@ -4779,6 +4894,12 @@ static bool trans_STZGM(DisasContext *s, arg_ldst_tag *a)
      * The non-tags portion of STZGM is mostly like DC_ZVA,
      * except the alignment happens before the access.
      */
+    {
+        InsnDataflowEaPart zbase =
+            insn_df_ea(insn_df_reg(regnames[a->rn]), 0, INSN_DF_EA_EXT_NONE);
+
+        a64_note_zva_stores(s, &zbase, 1, a->imm);
+    }
     clean_addr = clean_data_tbi(s, addr);
     tcg_gen_andi_i64(clean_addr, clean_addr, -size);
     gen_helper_dc_zva(tcg_env, clean_addr);

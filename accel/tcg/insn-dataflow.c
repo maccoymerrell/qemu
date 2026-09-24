@@ -215,11 +215,14 @@ struct InsnDataflowScratch {
     int      win_open;          /* index of the window awaiting its end, or -1 */
 
     /*
-     * Helper access fans, for the whole block (InsnDataflow.fan points in
-     * here).  Four bytes a row and shared by every instruction, because only
-     * the few instructions whose helper moves a state area have any.
+     * Access fans, for the whole block (InsnDataflow.fan and .fan_datum
+     * point in here).  A few bytes a row and shared by every instruction,
+     * because only the instructions whose helper moves a state area or a
+     * block, or whose lowering splits a structure access into elements, have
+     * any.
      */
     InsnDataflowHelperAccess fan_pool[INSN_DF_MAX_FAN_ROWS];
+    uint16_t fan_datum_pool[INSN_DF_MAX_FAN_ROWS];
     unsigned nfan;
 };
 
@@ -1987,12 +1990,53 @@ void insn_dataflow_note_helper_store(uint32_t size,
                      data_prov);
 }
 
-void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
-                                        unsigned n,
-                                        const InsnDataflowEaPart *parts,
-                                        unsigned nparts, int64_t disp)
+/*
+ * Resolve the rows' datum indices to provenance bits into @bits[0..n).
+ * Returns false, and refuses the instruction, if a row names an atom outside
+ * @datums or one that resolves to no bit: a datum that cannot be named is
+ * not published as a row with no register.
+ */
+static bool df_fan_datums(InsnDataflow *d, const InsnDataflowHelperAccess *rows,
+                          unsigned n, const InsnDataflowAtom *datums,
+                          unsigned ndatums, uint16_t *bits, bool *any)
 {
+    int resolved[256];
+
+    *any = false;
+    if (ndatums > ARRAY_SIZE(resolved)) {
+        d->incomplete |= INSN_DF_INCOMPLETE_REFUSED;
+        return false;
+    }
+    for (unsigned i = 0; i < ndatums; i++) {
+        resolved[i] = df_atom_bit(datums[i]);
+    }
+    for (unsigned i = 0; i < n; i++) {
+        unsigned x = datums != NULL ? rows[i].datum : 0;
+
+        if (x == 0) {
+            bits[i] = INSN_DF_DATUM_NONE;
+            continue;
+        }
+        if (x > ndatums || resolved[x - 1] < 0 ||
+            resolved[x - 1] >= (int)INSN_DF_DATUM_NONE) {
+            d->incomplete |= INSN_DF_INCOMPLETE_REFUSED;
+            return false;
+        }
+        bits[i] = (uint16_t)resolved[x - 1];
+        *any = true;
+    }
+    return true;
+}
+
+void insn_dataflow_note_helper_accesses_datum(
+    const InsnDataflowHelperAccess *rows, unsigned n,
+    const InsnDataflowEaPart *parts, unsigned nparts, int64_t disp,
+    const InsnDataflowAtom *datums, unsigned ndatums)
+{
+    uint64_t data_prov[INSN_DF_REG_WORDS] = { 0 };
+    uint16_t bit0 = INSN_DF_DATUM_NONE;
     InsnDataflow *d;
+    bool any = false;
     int k;
 
     if (df == NULL || !df->decoding || rows == NULL || n == 0) {
@@ -2000,35 +2044,170 @@ void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
     }
     d = &df->out[df->cur];
 
+    if (n - 1 > UINT16_MAX || df->nfan + (n - 1) > INSN_DF_MAX_FAN_ROWS) {
+        /*
+         * A fan the block has no room for: the accesses cannot all be
+         * recorded, so the instruction is refused rather than published with
+         * a count smaller than the helper performs.
+         */
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    /* Resolve every row's datum into the pool slot it will occupy; row 0's
+     * lands one slot early and is taken out below. */
+    {
+        uint16_t bits[INSN_DF_MAX_FAN_ROWS + 1];
+
+        if (!df_fan_datums(d, rows, n, datums, ndatums, bits, &any)) {
+            return;
+        }
+        bit0 = bits[0];
+        memcpy(&df->fan_datum_pool[df->nfan], &bits[1],
+               (n - 1) * sizeof(bits[0]));
+        if (any) {
+            /*
+             * A store drains its datum, and the helper that performs the
+             * store hides the read: say it.
+             */
+            for (unsigned i = 0; i < n; i++) {
+                if (rows[i].datum != 0 && (rows[i].dir & INSN_DF_WR)) {
+                    df_state(datums[rows[i].datum - 1], INSN_DF_RD);
+                }
+            }
+        }
+    }
+    if (bit0 != INSN_DF_DATUM_NONE && (rows[0].dir & INSN_DF_WR)) {
+        df_set_bit(data_prov, bit0);
+    }
+
     /*
      * The first access carries the address account and the displacement,
      * stated exactly as a single helper row is; its offset moves the row's
      * address and is not an encoding immediate.
      */
     k = df_note_synth_ea(rows[0].dir, rows[0].size, parts, nparts, disp,
-                         rows[0].offset, NULL);
+                         rows[0].offset,
+                         bit0 != INSN_DF_DATUM_NONE &&
+                         (rows[0].dir & INSN_DF_WR) ? data_prov : NULL);
     if (k < 0) {
         /* df_add_memop() has already refused the instruction. */
         return;
     }
+    d->anchor_datum = bit0;
     if (n == 1) {
         return;
     }
-    if (d->fan != NULL || k > UINT8_MAX ||
-        df->nfan + (n - 1) > INSN_DF_MAX_FAN_ROWS || n - 1 > UINT16_MAX) {
+    if (d->fan != NULL || k > UINT8_MAX) {
         /*
-         * A second fan, or one the block has no room for: the accesses
-         * cannot all be recorded, so the instruction is refused rather than
-         * published with a count smaller than the helper performs.
+         * A second fan: the accesses cannot all be numbered, so the
+         * instruction is refused rather than published short.
          */
         d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
         return;
     }
     memcpy(&df->fan_pool[df->nfan], &rows[1], (n - 1) * sizeof(rows[0]));
     d->fan = &df->fan_pool[df->nfan];
+    d->fan_datum = any ? &df->fan_datum_pool[df->nfan] : NULL;
     d->n_fan = (uint16_t)(n - 1);
     d->fan_anchor = (uint8_t)k;
     df->nfan += n - 1;
+}
+
+void insn_dataflow_note_helper_accesses(const InsnDataflowHelperAccess *rows,
+                                        unsigned n,
+                                        const InsnDataflowEaPart *parts,
+                                        unsigned nparts, int64_t disp)
+{
+    insn_dataflow_note_helper_accesses_datum(rows, n, parts, nparts, disp,
+                                             NULL, 0);
+}
+
+void insn_dataflow_note_element_accesses(const InsnDataflowHelperAccess *rows,
+                                         unsigned n,
+                                         const InsnDataflowAtom *datums,
+                                         unsigned ndatums)
+{
+    InsnDataflow *d;
+    uint32_t total = 0;
+    bool any = false;
+
+    if (df == NULL || !df->decoding || rows == NULL || n == 0) {
+        return;
+    }
+    d = &df->out[df->cur];
+
+    if (!d->split_access || d->fan != NULL || d->elem_fan) {
+        /*
+         * Only a split access has a fold for the rows to replace, and one
+         * instruction has one fan.
+         */
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    if (n - 1 > UINT16_MAX || df->nfan + (n - 1) > INSN_DF_MAX_FAN_ROWS) {
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (rows[i].dir != rows[0].dir) {
+            /* The fold is bounded by direction; so is what replaces it. */
+            d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+            return;
+        }
+        total += rows[i].size;
+    }
+    {
+        uint16_t bits[INSN_DF_MAX_FAN_ROWS + 1];
+
+        if (!df_fan_datums(d, rows, n, datums, ndatums, bits, &any)) {
+            return;
+        }
+        d->anchor_datum = bits[0];
+        memcpy(&df->fan_datum_pool[df->nfan], &bits[1],
+               (n - 1) * sizeof(bits[0]));
+    }
+    memcpy(&df->fan_pool[df->nfan], &rows[1], (n - 1) * sizeof(rows[0]));
+    d->fan = &df->fan_pool[df->nfan];
+    d->fan_datum = any ? &df->fan_datum_pool[df->nfan] : NULL;
+    d->n_fan = (uint16_t)(n - 1);
+    df->nfan += n - 1;
+    d->elem_fan = true;
+    d->elem_dir = rows[0].dir;
+    d->elem_size0 = rows[0].size;
+    d->elem_total = total;
+}
+
+/*
+ * An element fan meets the fold its statement replaces.  Run once the op walk
+ * has recorded the instruction's rows.
+ */
+static void df_close_elem_fan(InsnDataflow *d)
+{
+    InsnDataflowMemop *m;
+
+    if (!d->elem_fan) {
+        return;
+    }
+    if (d->n_memops == 0) {
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    m = &d->memops[d->n_memops - 1];
+    if (m->dir != d->elem_dir || m->size != d->elem_total) {
+        /* The ops and the statement disagree about what was accessed. */
+        d->incomplete |= INSN_DF_INCOMPLETE_MEMOPS;
+        return;
+    }
+    m->size = d->elem_size0;
+    if (d->anchor_datum != INSN_DF_DATUM_NONE && (m->dir & INSN_DF_WR)) {
+        /*
+         * The fold's datum account is the union of every element's register;
+         * the first access drains exactly one of them.
+         */
+        memset(m->data_prov, 0, sizeof(m->data_prov));
+        df_set_bit(m->data_prov, d->anchor_datum);
+    }
+    d->fan_anchor = (uint8_t)(d->n_memops - 1);
 }
 
 void insn_dataflow_window_end(void)
@@ -2256,6 +2435,7 @@ void insn_dataflow_insn_begin(unsigned idx)
     df->out[idx].vec_vece = INSN_DF_VECE_NONE;
     df->out[idx].vec_kind = INSN_DF_VEC_KIND_NONE;
     df->out[idx].vec_lane = INSN_DF_VEC_LANE_NONE;
+    df->out[idx].anchor_datum = INSN_DF_DATUM_NONE;
     df->cur = idx;
     df->decoding = true;
 }
@@ -2420,6 +2600,7 @@ void insn_dataflow_extract(unsigned num_insns)
         InsnDataflow *d = &df->out[i];
 
         df_close_unsourced(d);
+        df_close_elem_fan(d);
         /*
          * A consumer numbers a fan's rows after memops[], so the fan must be
          * the last thing the instruction accessed: its first row the last

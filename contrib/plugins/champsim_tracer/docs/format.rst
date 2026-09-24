@@ -2369,8 +2369,19 @@ forms, ``IMinLine`` for the instruction-cache one); the wire does not
 republish it as a width.
 
 ``DC ZVA`` is a different shape and carries its own statement: it
-transfers data, so it publishes a **store** of the block it clears,
-sized from ``DCZID_EL0``.
+transfers data, so it publishes the **stores** that clear the block
+whose size ``DCZID_EL0`` gives, one per access the helper performs.
+In user mode the helper clears the block in naturally aligned 16-byte
+pieces, so a 512-byte block is 32 stores; in system mode a block that
+lands on RAM is cleared the same way, while one that lands on MMIO is
+written a byte at a time, so the template's ``max_dep_stores`` is the
+block length in bytes and an execution against RAM publishes the
+smaller count. ``DC GZVA`` and ``STZGM`` state the same stores. RISC-V
+``CBO.ZERO`` is the same shape: its helper writes the
+``cboz_blocksize`` block one byte at a time whenever the plugin is
+attached (the direct host-page path is withheld so that the stores are
+observable), so it publishes one 1-byte store per byte of the block —
+64 at QEMU's default block size.
 
 The WRONG PATH does not yet carry this access. The address is on the
 wrong-path template — the opcode is there and the statement is the same
@@ -2718,11 +2729,28 @@ loads.  The template states exactly that most as ``max_dep_loads`` /
 ``max_dep_stores`` — the decode site declares the helper's access
 list, derived from the same area layout the helper writes — and an
 execution that touches fewer components publishes a smaller
-``N_LOADS`` / ``N_STORES``.  The vector cases sit below that:
-gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096 is at
-most 64 element loads, and RISC-V V at LMUL × VLEN/SEW is at most
-64.  The template header's per-instruction maximum is a ``u8``
-(255), so every bounded case fits both it and the 512-slot ceiling.
+``N_LOADS`` / ``N_STORES``.  The vector cases are stated the same way,
+one slot per element access: AArch64 ``LD2``/``LD3``/``LD4`` and
+``ST2``/``ST3``/``ST4`` are one access per element of every register in
+the list (at most 64, for ``LD4``/``ST4`` of four 16-byte registers of
+bytes); RISC-V V unit-stride ``vle<eew>.v`` / ``vse<eew>.v`` states
+``8 × VLEN / (8 × eew)`` accesses — the elements eight registers hold,
+the most any ``vtype`` lets the instruction perform, because a template
+is shared by every translation of the same bytes whatever ``vtype``
+the translation ran under — which is 16 for ``vle64.v`` and 128 for
+``vle8.v`` at QEMU's default ``VLEN`` of 128; ``DC ZVA`` and
+``CBO.ZERO`` are one store per piece their helpers write (above);
+gather/scatter is at most 16 lanes.  The template header's
+per-instruction maximum is a ``u8`` (255), so every bounded case at
+the default configuration fits both it and the 512-slot ceiling.  A
+configuration whose bound passes 255 — RISC-V ``vle8.v`` at
+``VLEN`` ≥ 256 or ``vle16.v`` at ``VLEN`` ≥ 512, a ``cboz_blocksize``
+above 255, a 256-byte ``DC ZVA`` block (A64FX) in system mode — is
+refused at the decode site rather than stated short, and the
+executions it then performs are reported by the impossible-attribution
+oracle (``cst_decode --strict``, ``cst_audit``).  That is a loud
+failure, not a supported configuration: the per-instruction maximum's
+width is the limit, and widening it is a format change.
 
 The instructions whose fan-out is *unbounded* — bounded only by a
 register value, so that no ceiling could be chosen — are not clamped at
@@ -3478,6 +3506,43 @@ only when they change:
   that fans into several lanes via several memops, or an
   immediate-selected single-element insert/extract, produces the
   correct per-memop lane partition.
+
+Which register and which lanes a memop feeds is read off two things the
+wire already carries, so no field of its own is needed:
+
+* **Slot order is execution order.** Load slot ``k`` is the ``k``-th
+  load the instruction performs and store slot ``k`` the ``k``-th
+  store, within each family, on every template and every execution.
+* **The register is named by the dependency block.** Load slot ``k``
+  feeds the destination ``d`` whose ``dst_dep[d]`` carries bit
+  ``n_src + k``; store slot ``k`` drains the source whose bit is set in
+  ``store_data_dep[k]``.  Among the memops that feed (or drain) the same
+  register, the ``r``-th in slot order takes that register's ``r``-th
+  active lane (the ``r``-th set bit of its ``DST_LANE_MASK`` /
+  ``SRC_LANE_MASK``) and as many following lanes as its size spans in
+  elements; this is the value ``LOAD_DATA_LANE_MASK{k}`` /
+  ``STORE_DATA_LANE_MASK{k}`` publishes.
+
+A de-interleaving structure load is where both matter.  AArch64
+``ld3 {v0.4s-v2.4s}, [x0]`` performs twelve 4-byte loads, element ``e``
+of the region going to register ``v(e mod 3)`` lane ``e div 3``: the
+template carries twelve load slots, ``dst_dep`` for ``v0`` holds the
+bits of slots 0, 3, 6 and 9, and the lane masks those slots publish
+are ``{0}``, ``{1}``, ``{2}`` and ``{3}``.  Stores mirror it through
+``store_data_dep``.  RISC-V V unit-stride accesses name the register
+group by its base register, so the lanes of the base register are
+mapped and the elements past it (``LMUL`` > 1) are counted, addressed
+and valued but carry no lane mask; a segment access (``nf`` > 1) names
+no per-slot register at all.
+
+The masks are held in 64 bits by the in-tree writer, so an
+instruction whose dependency bit positions pass 64 — ``n_src`` plus
+the load count, for example ``ld4`` of four 16-byte registers of
+bytes (64 loads) or ``vle8.v`` at ``VLEN`` = 128 (128 loads) — has its
+register dependency block withdrawn (``HAS_REG`` clear, the
+all-to-all over-approximation) and with it the per-memop lane
+association.  The wire's ULEB masks have no such width; the limit is
+the writer's.
 
 The active-lane count can be fixed by the instruction encoding
 (x86/NEON/MSA — derivable statically) or read from a register at

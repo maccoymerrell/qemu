@@ -23,6 +23,12 @@
 #include "qemu/accel.h"
 #include "accel/accel-cpu-target.h"
 #include "exec/translation-block.h"
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#include "qemu/timer.h"
+#include "system/cpu-timers.h"
+#include "qemu/plugin.h"
+#include "qemu/bswap.h"
+#endif
 
 #include "tcg-cpu.h"
 
@@ -107,6 +113,276 @@ static bool x86_debug_check_breakpoint(CPUState *cs)
 
 #include "accel/tcg/cpu-ops.h"
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                 bool *mmu_on)
+{
+    CPUX86State *env = cpu_env(cs);
+    /* CPL: 0 = kernel … 3 = user.  Normalize so 0 = user (least
+     * privileged), larger = more privileged. */
+    int cpl = (env->hflags & HF_CPL_MASK) >> HF_CPL_SHIFT;
+    *priv = 3 - cpl;
+    /*
+     * CR3 = current page-table base / address-space id, masking bit 63
+     * (PCID NOFLUSH).  Architecturally bit 63 is a command bit on the
+     * MOV-to-CR3 write — "skip the TLB flush" — not state: MOV from CR3
+     * always reads it as 0, so it can never distinguish address spaces
+     * and masking it is unconditionally safe.  It is also unreachable
+     * under current TCG — system emulation never advertises PCID
+     * (TCG_EXT_FEATURES), a Linux guest therefore never sets
+     * CR4.PCIDE/NOFLUSH (audited empirically: -cpu Haswell boot, 20k+
+     * committed CR3 writes, all 4 KiB-aligned, bit 63 clear), and
+     * helper_write_crN faults long-mode CR3 writes with bits above
+     * phys_bits as reserved anyway — so the mask only guards the
+     * verbatim CR3 image loads (VMRUN, SMM RSM) and any future TCG PCID
+     * support.  PCID bits [11:0] are deliberately NOT masked: with
+     * CR4.PCIDE they are a genuine component of the address-space
+     * identity (Linux PTI tags the user-half CR3 with PCID bit 11), and
+     * no PCID-capable TCG configuration exists to justify collapsing
+     * them.  Producers of ASID-change notifications must compare under
+     * this same mask (see cpu_x86_update_cr3).
+     */
+    *asid = env->cr[3] & ~CR3_NOFLUSH_MASK;
+    /* Paging active iff CR0.PG; off in real mode / early boot. */
+    *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
+}
+
+static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
+/*
+ * Resolve the guest kernel's `current` at CPL0 through the per-CPU
+ * area, for a task with no TLS identity (FS.base == 0).  Engaged only
+ * when a plugin has declared the per-image current_task per-CPU offset
+ * (qemu_plugin_set_current_task_offset); undeclared, the legacy
+ * register-only contract is untouched byte-for-byte.
+ *
+ * The contract, as the kernel source states it (Linux 6.6/6.12,
+ * arch/x86/entry/entry_64.S paranoid_entry): "the kernel enforces that
+ * negative GSBASE values indicate kernel GSBASE" — in-kernel, GS.base
+ * is the per-CPU base (a kernel VA), swapped in by SWAPGS at every
+ * entry from user; the user GS base is 0 or a user VA
+ * (do_arch_prctl_64 refuses ARCH_SET_GS >= TASK_SIZE_MAX, and the
+ * 32-bit GDT TLS descriptors cannot reach the kernel half).  `current`
+ * is the per-CPU variable current_task (pcpu_hot + 0 on
+ * 6.2 <= v < 6.14), so at CPL0 with kernel GS the task is one load:
+ * *(GS.base + offset).
+ *
+ * The states this helper refuses, each resolving to "cannot vouch"
+ * (tracks_current false -> the consumer inherits the entering thread,
+ * which in every refused window IS the current task):
+ *
+ *  - SWAPGS windows: entry_SYSCALL_64 before its first-instruction
+ *    swapgs; the idtentry push sequence up to error_entry's swapgs;
+ *    paranoid_entry (NMI/#DB/#MC/#DF) delivered before an entry path's
+ *    swapgs ran, until SAVE_AND_SET_GSBASE / the conditional swapgs;
+ *    the exit twins (paranoid_exit's wrgsbase/swapgs .. iret,
+ *    swapgs_restore_regs_and_return_to_usermode's tail); and
+ *    asm_load_gs_index's deliberate user-GS bracket.  GS.base holds a
+ *    user value there, fails the kernel-VA test, and no context switch
+ *    can occur inside such a window — inheritance is exact, the same
+ *    treatment the AArch64/MIPS early-entry windows get.
+ *  - A failed or unmapped load (a PTI user page table in the entry
+ *    window — canonical runs are nopti — or pre-paging early boot).
+ *  - A loaded value that is not a kernel VA (per-CPU area not yet
+ *    initialised at early boot).
+ *
+ * Known residual, named not hidden: TCG advertises FSGSBASE, and "with
+ * FSGSBASE no assumptions can be made about the GSBASE value when
+ * entering from user space" (paranoid_entry comment) — a guest thread
+ * that deliberately WRGSBASEs a kernel-half VA forges the kernel-GS
+ * signature for its own entry windows.  The value gate above bounds it
+ * (the forged base must ALSO hold a kernel-VA-shaped word at the
+ * offset); the class is the same accepted one as an AArch64 user
+ * setting SP to a kernel-shaped value before trapping.
+ */
+static bool x86_kernel_current_task(CPUState *cs, uint64_t *task)
+{
+    CPUX86State *env = cpu_env(cs);
+    bool declared;
+    uint64_t off = qemu_plugin_current_task_offset(&declared);
+    if (!declared) {
+        return false;
+    }
+    uint64_t gsbase = env->segs[R_GS].base;
+    if (!x86_vaddr_is_kernel(cs, gsbase)) {
+        return false;                        /* swapgs window / early boot */
+    }
+    uint8_t buf[8];
+    if (cpu_memory_rw_debug(cs, gsbase + off, buf, sizeof(buf), false) < 0) {
+        return false;
+    }
+    uint64_t t = ldq_le_p(buf);
+    if (!x86_vaddr_is_kernel(cs, t)) {
+        return false;
+    }
+    *task = t;
+    return true;
+}
+
+static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPUX86State *env = cpu_env(cs);
+    /*
+     * The user TLS base the kernel context-switches per thread: FS.base
+     * for a 64-bit task, GS.base for a 32-bit (compat/legacy) one — the
+     * i386 TLS ABI points GS at a set_thread_area GDT descriptor, whose
+     * base the segment cache carries.  Selected by the current CS.L, so
+     * sample at user privilege (in-kernel the bases are mid-switch and
+     * GS is swapped onto the kernel's per-CPU base).
+     *
+     * FS.base == 0 at CPL0 is a task with no TLS identity — a kernel
+     * thread, a per-CPU idle task, or a TLS-less user task's kernel
+     * excursion: distinct program paths that would otherwise all
+     * collapse onto the one identity 0.  Fall through to the kernel's
+     * own per-task contract — `current` through the kernel GS base at
+     * the plugin-declared per-image offset (x86_kernel_current_task) —
+     * exactly as AArch64 falls back to SP_EL0-as-current and MIPS to
+     * $28-as-current_thread_info.  The kernel CS is long-mode, so CPL0
+     * always takes the CS64 arm; a compat task's kernel excursion
+     * resolves its task pointer here and the plugin's kernel-entry
+     * alias joins it to the thread's user (GS.base) identity.
+     */
+    if (env->hflags & HF_CS64_MASK) {
+        uint64_t tp = env->segs[R_FS].base;
+        if (tp == 0 && (env->hflags & HF_CPL_MASK) == 0) {
+            uint64_t task;
+            if (x86_kernel_current_task(cs, &task)) {
+                return task;
+            }
+        }
+        return tp;
+    }
+    return env->segs[R_GS].base;
+}
+
+static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPUX86State *env = cpu_env(cs);
+    /* FS.base (GS.base for a compat task) is user TLS state; the kernel's
+     * own per-CPU base lives in the swapped GS, so the user register is
+     * reloaded from the incoming task at every switch and untouched in
+     * between, at any CPL.  A non-zero read therefore names the current
+     * task wherever it is taken.
+     *
+     * The one state that cannot vouch for itself is CPL0 with
+     * FS.base == 0: the register names nothing there, and whether the
+     * per-CPU fallback can answer instead is a property of THIS sample
+     * (kernel GS in, mapping readable, value task-shaped — see
+     * x86_kernel_current_task).  Mirror the get-hook exactly: true iff
+     * the value the get-hook would return actually names the task.
+     * With no declared offset this reports true and the get-hook
+     * returns 0 — the pre-hint contract, byte-for-byte, in which every
+     * TLS-less task shares the one identity 0 (honest indistinctness
+     * for lack of a per-image offset, not a fabricated identity). */
+    if ((env->hflags & HF_CS64_MASK) &&
+        (env->hflags & HF_CPL_MASK) == 0 &&
+        env->segs[R_FS].base == 0) {
+        bool declared;
+        uint64_t task;
+        qemu_plugin_current_task_offset(&declared);
+        if (declared) {
+            return x86_kernel_current_task(cs, &task);
+        }
+    }
+    return true;
+}
+
+static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPUX86State *env = cpu_env(cs);
+    /*
+     * Long mode: the linear address space is split into a low (user) and a
+     * high (kernel) canonical half with a non-canonical hole between them.
+     * The split sits at the sign bit of the paging width — 48-bit (LA48) or
+     * 57-bit (LA57, CR4.LA57) — so the kernel half is exactly the addresses
+     * whose bits above that sign bit are all ones.  Deriving the boundary
+     * from the live paging width (rather than a fixed constant) keeps the
+     * classification correct under LA57.  Outside long mode there is no such
+     * canonical kernel half (32-bit paging splits user/kernel by an
+     * OS-chosen boundary the hardware does not define), so report user.
+     */
+    if (!(env->hflags & HF_LMA_MASK)) {
+        return false;
+    }
+    unsigned va_bits = (env->cr[4] & CR4_LA57_MASK) ? 57 : 48;
+    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
+}
+
+/*
+ * TCGCPUOps::spec_clock_resync for x86 — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * x86's audit of guest-observable time sources:
+ *
+ *   TSC (and TSC_AUX/rdtscp)   cpu_get_ticks(), via cpus_get_elapsed_ticks().
+ *   LAPIC timer, TSC-deadline  QEMUTimers armed off QEMU_CLOCK_VIRTUAL
+ *   HPET, PIT (i8254), RTC     (hw/intc/apic.c, hw/timer/).
+ *
+ * Everything in the second group is armed directly from QEMU_CLOCK_VIRTUAL,
+ * which the freeze stops and the thaw resumes at the same value: a deadline
+ * expressed in frozen-clock ns is still the same deadline afterwards, so
+ * those timers need no re-arm.  None of them lives in CPUX86State either, so
+ * the wrong-path register restore cannot roll one back — x86 has no
+ * architectural compare register shadowing a host timer the way Arm's
+ * CNTV_CVAL, RISC-V's stimecmp and MIPS's CP0_Compare do.  (A speculative MSR
+ * write to IA32_TSC_DEADLINE reaches apic_handle_tsc_deadline, but wrong-path
+ * device access is sandboxed, so it never reaches the APIC model.)
+ *
+ * The TSC was the exception, because cpu_get_ticks() accumulated the host
+ * cycle counter while everything else accumulated host CLOCK_MONOTONIC: two
+ * host oscillators, sampled at four different instants by each freeze/thaw
+ * pair, drifting apart by a fixed displacement per pair that a one-directional
+ * correction could only rectify and never remove — until the guest's
+ * clocksource watchdog marked the TSC unstable and wedged timekeeping and RCU.
+ *
+ * It is no longer an exception.  The hook's whole remaining job is to measure
+ * the host's own cycles-per-CLOCK_MONOTONIC-second ratio and hand it to
+ * cpu_plugin_tsc_lock_to_vclock(), which makes cpu_get_ticks() an affine
+ * function of QEMU_CLOCK_VIRTUAL from that instant on.  The two guest
+ * clocksources are then the same oscillator, freezing one freezes both, and
+ * the resync obligation is discharged structurally rather than at every thaw.
+ *
+ * The ratio is self-calibrated over the first ~0.2 s of emulation, both host
+ * clocks sampled over the same real intervals so freezes inside them do not
+ * bias it.  Arming is continuous (the line is anchored at the pair's current
+ * value) and one-shot, so the guest sees neither a step nor a rate change,
+ * and the displacement accumulated before arming is frozen in as a constant
+ * instead of continuing to grow.  Reading the two host clocks here rather
+ * than at one instant no longer matters: the difference lands in the ratio's
+ * last few parts per billion, not in a term that ratchets.
+ *
+ * BQL-serialised: both callers of this hook hold it, which is what protects
+ * the calibration accumulators below and the one-shot arming.
+ */
+static int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
+static int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
+static bool    g_pin_locked;                  /* lock armed; nothing left */
+
+static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    int64_t ht, hm;
+
+    if (g_pin_locked) {
+        return;
+    }
+
+    ht = cpu_get_host_ticks();
+    hm = get_clock();
+
+    if (g_pin_last_hm) {
+        g_pin_cal_tsc += ht - g_pin_last_ht;
+        g_pin_cal_ns  += hm - g_pin_last_hm;
+    }
+    if (g_pin_cal_ns >= 200 * 1000 * 1000) {
+        cpu_plugin_tsc_lock_to_vclock((double)g_pin_cal_tsc /
+                                      (double)g_pin_cal_ns * 1e9);
+        g_pin_locked = true;
+    }
+    g_pin_last_ht = ht;
+    g_pin_last_hm = hm;
+}
+#endif
+
 static const TCGCPUOps x86_tcg_ops = {
     .initialize = tcg_x86_init,
     .translate_code = x86_translate_code,
@@ -114,6 +390,17 @@ static const TCGCPUOps x86_tcg_ops = {
     .restore_state_to_opc = x86_restore_state_to_opc,
     .cpu_exec_enter = x86_cpu_exec_enter,
     .cpu_exec_exit = x86_cpu_exec_exit,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = x86_get_plugin_state,
+    .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
+    /* A 64-bit kernel keeps its own per-CPU base in GS (swapgs on entry)
+     * and reloads FS.base from the incoming task in __switch_to(), so the
+     * FS.base this hook reads above user privilege names the current
+     * task. */
+    .plugin_thread_ptr_tracks_current = x86_plugin_thread_ptr_tracks_current,
+    .vaddr_is_kernel = x86_vaddr_is_kernel,
+    .spec_clock_resync = x86_spec_clock_resync,
+#endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,
     .record_sigsegv = x86_cpu_record_sigsegv,

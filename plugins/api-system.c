@@ -15,6 +15,7 @@
 #include "qapi/error.h"
 #include "migration/blocker.h"
 #include "hw/boards.h"
+#include "exec/target_page.h"
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
 
@@ -60,7 +61,17 @@ struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
 
     if (!tlb_plugin_lookup(cpu, vaddr, mmu_idx,
                            hwaddr_info.is_store, &hwaddr_info)) {
-        error_report("invalid use of qemu_plugin_get_hwaddr");
+        /*
+         * A lookup miss during a plugin speculative (wrong-path)
+         * excursion is expected, not misuse: the access address is
+         * derived from mispredicted register state, so it frequently
+         * has no TLB-resident translation.  Return NULL silently
+         * there; keep the warning for correct-path misses, which do
+         * indicate a misplaced call.
+         */
+        if (!cpu->plugin_spec_mode) {
+            error_report("invalid use of qemu_plugin_get_hwaddr");
+        }
         return NULL;
     }
 
@@ -95,6 +106,7 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
         return g_intern_static_string("RAM");
     }
 }
+
 
 /*
  * Time control

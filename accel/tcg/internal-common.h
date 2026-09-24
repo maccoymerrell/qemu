@@ -74,4 +74,225 @@ uint32_t curr_cflags(CPUState *cpu);
 
 void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
 
+/*
+ * Speculative store buffer helpers for wrong-path execution.
+ *
+ * When a plugin enters speculative mode (cpu->plugin_spec_mode == true),
+ * all guest memory writes are redirected to a per-cache-line buffer
+ * (cpu->plugin_spec_store_buf) instead of modifying real guest memory.
+ * Loads check the buffer first for store-to-load forwarding, falling
+ * back to real memory for bytes not in the buffer.
+ *
+ * The buffer is a GHashTable keyed by line_addr = addr & ~63, with
+ * value = PluginSpecLine* containing a 64-byte payload plus a 64-bit
+ * valid_mask (bit k = byte k of this line has a speculative value).
+ * Lines are bump-allocated from cpu->plugin_spec_store_pool to avoid
+ * per-line g_malloc traffic; spec_mode_end clears the hash table and
+ * resets pool_used = 0, retaining the underlying storage for reuse.
+ *
+ * Prior implementation keyed the hash table by individual byte
+ * address, costing one g_hash_table_insert per byte stored and one
+ * lookup per byte loaded.  On mcf with wp=1 wpdepth=64 memdata=1 the
+ * per-byte hash ops were ~6% of total runtime.  The cache-line layout
+ * makes a 64-byte vector store one map op + one memcpy, an 8-byte
+ * store one map op + an 8-byte memcpy, and a load within a hit line
+ * one map op + a single byte read with a bit test.
+ */
+#ifdef CONFIG_PLUGIN
+
+#include "exec/plugin-spec.h"
+
+static inline bool cpu_plugin_spec_active(CPUState *cpu)
+{
+    return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
+}
+
+/*
+ * True when a probe_access* fast-path host pointer must be suppressed.
+ * In speculative mode we return NULL so callers fall back to the
+ * cpu_ld/cpu_st slow-path helpers, where the spec store buffer and load
+ * overlay intercept the access.  Callers keep their own return shape (and
+ * any size guard); this only names the redirect decision so the rationale
+ * lives in one place rather than being copied at each probe site.
+ */
+static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
+{
+    return cpu_plugin_spec_active(cpu);
+}
+
+/* spec_line_get_or_alloc is declared in include/exec/plugin-spec.h. */
+
+static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
+{
+    /* The hash value is the line's pool index + 1, resolved against the
+     * pool base of the moment — never a stored pointer, which the pool's
+     * realloc growth would leave dangling (see spec_line_get_or_alloc). */
+    gpointer val = g_hash_table_lookup(
+        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+    if (!val) {
+        return NULL;
+    }
+    return &((PluginSpecLine *)cpu->plugin_spec_store_pool)
+                [GPOINTER_TO_SIZE(val) - 1];
+}
+
+static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
+{
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    if (!line) {
+        return;
+    }
+    line->bytes[idx] = val;
+    line->valid_mask |= (uint64_t)1 << idx;
+}
+
+static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
+{
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+    if (!line || !(line->valid_mask & ((uint64_t)1 << idx))) {
+        return false;
+    }
+    *val = line->bytes[idx];
+    return true;
+}
+
+/* Bulk store: stays within a single cache line in the common case
+ * (size <= 16 for SIMD, naturally aligned).  Cross-line stores fall
+ * back to per-line chunks; that path is rare on real workloads but
+ * still O(size / 64) hash ops, not O(size) as before. */
+static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
+                                    const void *buf, int size)
+{
+    const uint8_t *p = buf;
+    while (size > 0) {
+        vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+        unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+        unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
+        unsigned chunk   = (unsigned)size < remain ? (unsigned)size : remain;
+
+        PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+        if (!line) {
+            /* Sandbox capped — drop remaining bytes.  See header
+             * comment on PLUGIN_SPEC_STORE_LINE_MAX. */
+            return;
+        }
+        memcpy(&line->bytes[idx], p, chunk);
+        /* Set bits [idx, idx+chunk).  chunk is 1..64 inclusive so the
+         * shift is well-defined when normalised through uint64_t. */
+        uint64_t mask = chunk >= 64
+            ? ~(uint64_t)0
+            : ((((uint64_t)1 << chunk) - 1) << idx);
+        line->valid_mask |= mask;
+        addr += chunk;
+        p    += chunk;
+        size -= chunk;
+    }
+}
+
+/*
+ * Redirect an atomic read-modify-write's memory pointer into the
+ * speculative sandbox.  Atomic helpers (atomic_template.h) obtain a raw
+ * host pointer from atomic_mmu_lookup and RMW it in place with real host
+ * atomic primitives; left unsandboxed that mutates real guest memory on
+ * the discarded wrong path (kernel spinlocks, refcounts, page-table
+ * cmpxchg — and user-mode futexes / lock cmpxchg alike).
+ *
+ * We pre-fill the @size accessed bytes of the line from real memory
+ * wherever they are not already speculatively dirty (so the RMW reads
+ * the correct store-to-load-forwarded baseline), mark them valid, and
+ * return a pointer into the line.  The in-place RMW then mutates the
+ * shadow, never real memory, and later speculative loads forward from
+ * it; spec_mode_end discards the whole line.
+ *
+ * A naturally-aligned atomic of size <= 16 never crosses a 64-byte line,
+ * so idx + size <= 64 and the returned pointer carries the same
+ * alignment the guest access guaranteed (PluginSpecLine is 16-aligned
+ * with bytes[] at offset 0 — see plugin-spec.h).
+ *
+ * Never returns NULL, and deliberately offers no way for a caller to obtain
+ * the real pointer.  When the line pool is at PLUGIN_SPEC_STORE_LINE_MAX the
+ * RMW is pointed at a per-vCPU scratch line
+ * (CPUState::plugin_spec_atomic_scratch) seeded with the same @size baseline
+ * bytes, so the operation still computes and still compares against the value
+ * it would have seen — the result is simply discarded instead of being
+ * forwarded to later speculative loads.  That is a genuinely dropped atomic,
+ * degrading exactly as a store dropped by a capped pool does.
+ *
+ * Falling back to @real_host would NOT be that.  spec_store_byte and
+ * spec_store_bytes write nothing when the pool is capped; an atomic handed
+ * the real pointer performs a real read-modify-write on real guest memory
+ * from the wrong path — the precise mutation of architectural state this
+ * sandbox exists to prevent, and one no rollback undoes.  The two are not
+ * equivalent degradations, and both copies of atomic_mmu_lookup used to make
+ * that trade (fixed in 56b89345b2, which this consolidates so the choice is
+ * no longer at a caller's discretion).
+ */
+static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
+                                       const void *real_host, int size)
+{
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    if (!line) {
+        /*
+         * Capped: discard the RMW into the per-vCPU scratch line.  Only the
+         * @size accessed bytes matter — an atomic helper reads and writes
+         * exactly the object it was handed — so seed just those, at the same
+         * intra-line offset, which preserves the alignment the guest access
+         * guaranteed.  Store-to-load forwarding is lost for this one access:
+         * a later speculative load of these bytes reads real memory, the same
+         * baseline a dropped speculative store leaves behind.
+         */
+        line = &cpu->plugin_spec_atomic_scratch;
+        memcpy(&line->bytes[idx], real_host, size);
+        /*
+         * Every caller has already rejected a non-naturally-aligned @addr, so
+         * @idx is size-aligned and the result is aligned iff the scratch line
+         * is.  The 16-byte host primitives (cmpxchg16b, LDXP/STXP) fault on a
+         * misaligned operand: say so here rather than as a SIGSEGV inside the
+         * atomic helper.  Cold path — only reached with the pool capped.
+         */
+        g_assert(((uintptr_t)&line->bytes[idx] & (size - 1)) == 0);
+        return &line->bytes[idx];
+    }
+    const uint8_t *src = real_host;
+    for (int k = 0; k < size; k++) {
+        uint64_t bit = (uint64_t)1 << (idx + k);
+        if (!(line->valid_mask & bit)) {
+            line->bytes[idx + k] = src[k];
+        }
+    }
+    /* The RMW will write all @size bytes: mark them valid up front. */
+    uint64_t span = size >= 64
+        ? ~(uint64_t)0
+        : ((((uint64_t)1 << size) - 1) << idx);
+    line->valid_mask |= span;
+    return &line->bytes[idx];
+}
+
+#else /* !CONFIG_PLUGIN */
+
+/*
+ * Without plugin support there is no speculative mode, so the two predicates
+ * the accelerator's memory paths consult are compile-time false.  Defining
+ * them here rather than guarding each call site keeps cputlb.c / user-exec.c
+ * free of preprocessor conditionals in otherwise ordinary softmmu logic, and
+ * lets the compiler delete the guarded branches outright.
+ */
+static inline bool cpu_plugin_spec_active(CPUState *cpu)
+{
+    return false;
+}
+
+static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
+{
+    return false;
+}
+
+#endif /* CONFIG_PLUGIN */
+
 #endif

@@ -42,6 +42,8 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-misc.h"
+#include "qemu/error-report.h"
+#include "qemu/plugin.h"
 #include "qapi/visitor.h"
 
 //#define DEBUG_CMOS
@@ -898,6 +900,19 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
+    /*
+     * The guest-time-transparency adoption of QEMU_CLOCK_VIRTUAL used to sit
+     * here, keyed on this device's realize.  It reads and writes rtc_clock,
+     * which is one global for the whole machine that every RTC model consults
+     * (hw/rtc/pl031.c, goldfish_rtc.c, m48t59.c, ls7a_rtc.c, xlnx-zynqmp-rtc.c
+     * and this one all call qemu_clock_get_ns(rtc_clock)), so placing the
+     * decision in one device made it a property of which RTC the board
+     * happens to instantiate: it covered pc/q35 and malta, and left the
+     * aarch64 and riscv64 `virt` boards -- which have no mc146818 -- reading
+     * host wall time through every freeze.  It now lives in
+     * rtc_adopt_vm_clock_for_plugin() (system/rtc.c), called once from
+     * qemu_init_board() before any device realizes.
+     */
     rtc_set_date_from_host(isadev);
 
     switch (s->lost_tick_policy) {

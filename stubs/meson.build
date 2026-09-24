@@ -26,6 +26,15 @@ if have_block
   stub_ss.add(files('uuid.c'))
 endif
 
+if have_block and get_option('plugins')
+  # block/block-backend.c notifies the plugin devio hooks from its
+  # blk_aio_* issue/completion chokepoints.  plugins/core.c holds the real
+  # implementations and only the emulator targets link it, so the
+  # standalone block tools (qemu-io, qemu-nbd, qemu-storage-daemon) and the
+  # block unit tests need the no-op definitions.
+  stub_ss.add(files('plugin-devio.c'))
+endif
+
 if have_block or have_ga
   stub_ss.add(files('replay-tools.c'))
   # stubs for hooks in util/main-loop.c, util/async.c etc.

@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -31,17 +32,62 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qemu/seqlock.h"
+#include "qemu/timer.h"
 #include "system/replay.h"
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "system/cpu-timers.h"
 #include "system/cpu-timers-internal.h"
+#include "qemu/vclock-agency.h"
 
 /* clock and ticks */
 
+#ifdef CONFIG_PLUGIN
+/*
+ * The tick counter as a function of the virtual clock -- see
+ * cpu_plugin_tsc_lock_to_vclock().  Zero @plugin_tsc_per_ns_q32 means the
+ * lock has never been armed and cpu_get_ticks_locked() keeps its own host
+ * source.  All four are written once, under the seqlock write lock with the
+ * BQL held, and read under whichever of the two the reader already holds.
+ */
+static uint64_t plugin_tsc_per_ns_q32;      /* ticks per clock ns, 32.32 */
+static int64_t plugin_tsc_ref_ticks;        /* ticks at the arming instant */
+static int64_t plugin_tsc_ref_clk;          /* clock at the arming instant */
+
+static int64_t plugin_tsc_from_clock(int64_t clk)
+{
+    uint64_t lo, hi;
+
+    /*
+     * @clk is cpu_get_clock_locked(), which never decreases, and @ref_clk was
+     * sampled from it, so the delta cannot be negative.  The multiply is done
+     * in 128 bits because a 32.32 rate times a nanosecond count overflows 64
+     * for any run longer than a few seconds.
+     */
+    mulu64(&lo, &hi, (uint64_t)(clk - plugin_tsc_ref_clk),
+           plugin_tsc_per_ns_q32);
+    return plugin_tsc_ref_ticks + (int64_t)((hi << 32) | (lo >> 32));
+}
+#endif
+
 static int64_t cpu_get_ticks_locked(void)
 {
-    int64_t ticks = timers_state.cpu_ticks_offset;
+    int64_t ticks;
+
+#ifdef CONFIG_PLUGIN
+    if (plugin_tsc_per_ns_q32) {
+        /*
+         * One oscillator.  No monotonicity clamp is needed or wanted here:
+         * the value is an increasing function of cpu_get_clock_locked(),
+         * which is itself non-decreasing across freezes, thaws and host
+         * software suspend, so the result cannot step backwards and
+         * cpu_ticks_prev has nothing to correct.
+         */
+        return plugin_tsc_from_clock(cpu_get_clock_locked());
+    }
+#endif
+
+    ticks = timers_state.cpu_ticks_offset;
     if (timers_state.cpu_ticks_enabled) {
         ticks += cpu_get_host_ticks();
     }
@@ -133,6 +179,219 @@ void cpu_disable_ticks(void)
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Outstanding plugin clock freezes, across every vCPU.  Guarded by the BQL,
+ * which both entry points below require and which cpu_enable_ticks() and
+ * cpu_disable_ticks() already require for the seqlock they write.
+ *
+ * The count exists because the thing being counted is global while its owners
+ * are not.  timers_state is one clock for the whole machine and
+ * cpu_ticks_enabled is one boolean, while a plugin freeze is opened and
+ * closed per-vCPU: the wrong-path excursion pause in cpu_plugin_spec_vtime_
+ * pause() belongs to the excursion's vCPU, and the correct-path
+ * instrumentation window in cpu_plugin_vclock_pause() belongs to whichever
+ * vCPU is running a plugin callback -- including a translation callback,
+ * which is not serialised against a peer's excursion at all.  With both
+ * calling cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's window
+ * closing restarted the guest clock in the middle of the excursion, and the
+ * excursion's own thaw then found the clock already running and did nothing:
+ * the guest clock advanced by the excursion's remaining host wall time,
+ * which is exactly what the freeze exists to prevent.
+ *
+ * The holder array alongside it exists to MEASURE the defect this count
+ * closes, rather than assert it: each entry names the vCPU that took one
+ * outstanding reference, so a thaw can tell that the freeze it is leaving
+ * behind is held ONLY by other vCPUs.  That is exactly the predecessor's
+ * failure condition -- its own guards saw this vCPU's windows and nothing
+ * else, so it called cpu_enable_ticks() precisely then.  A residual that
+ * still includes this vCPU's own outer window is NOT counted: the
+ * predecessor handled that case correctly.  Structurally zero on a
+ * single-vCPU machine.
+ */
+#define PLUGIN_TICKS_HOLDERS_MAX 64
+static int plugin_ticks_freeze_depth;
+static int plugin_ticks_holder[PLUGIN_TICKS_HOLDERS_MAX];
+static bool plugin_ticks_holders_overflowed;
+static uint64_t plugin_ticks_peer_only_thaws;
+
+void cpu_plugin_ticks_freeze(int cpu_index)
+{
+    assert(bql_locked());
+    if (plugin_ticks_freeze_depth < PLUGIN_TICKS_HOLDERS_MAX) {
+        plugin_ticks_holder[plugin_ticks_freeze_depth] = cpu_index;
+    } else {
+        plugin_ticks_holders_overflowed = true;
+    }
+    if (plugin_ticks_freeze_depth++ == 0) {
+        cpu_disable_ticks();
+    }
+}
+
+bool cpu_plugin_ticks_thaw(int cpu_index)
+{
+    assert(bql_locked());
+    assert(plugin_ticks_freeze_depth > 0);
+
+    /* Drop one reference belonging to @cpu_index, keeping the array packed. */
+    int n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+    for (int i = n - 1; i >= 0; i--) {
+        if (plugin_ticks_holder[i] == cpu_index) {
+            plugin_ticks_holder[i] = plugin_ticks_holder[n - 1];
+            break;
+        }
+    }
+    if (--plugin_ticks_freeze_depth > 0) {
+        bool mine_remains = false;
+        n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+        for (int i = 0; i < n; i++) {
+            if (plugin_ticks_holder[i] == cpu_index) {
+                mine_remains = true;
+                break;
+            }
+        }
+        if (!mine_remains) {
+            plugin_ticks_peer_only_thaws++;
+        }
+        return false;
+    }
+    if (!runstate_is_running()) {
+        return false;
+    }
+    cpu_enable_ticks();
+    return true;
+}
+
+uint64_t cpu_plugin_ticks_peer_only_thaws(void)
+{
+    return plugin_ticks_holders_overflowed ? UINT64_MAX
+                                           : plugin_ticks_peer_only_thaws;
+}
+
+/*
+ * Outstanding SPECULATIVE freezes, across every vCPU: the count that owns the
+ * guest-visible virtual clock's PROCESSING stall.  See the contract on
+ * cpu_plugin_spec_ticks_freeze() in the header for why the stall belongs to
+ * this count and not to plugin_ticks_freeze_depth beside it.
+ *
+ * A second count next to the first is not a second answer to "is the clock
+ * frozen".  The value freeze is one question with one answer and
+ * plugin_ticks_freeze_depth is still its sole authority -- every freeze,
+ * speculative or not, goes through it.  This count answers a different
+ * question, "is a wrong path currently executing", and the two differ
+ * precisely because the correct-path window also freezes the value.  Written
+ * only under the BQL, which both entry points assert.
+ */
+static int plugin_spec_stall_depth;
+
+void cpu_plugin_spec_ticks_freeze(int cpu_index)
+{
+    assert(bql_locked());
+    /*
+     * Processing first, then the value.  The state being excluded is "the
+     * clock reads a constant while deadlines are still evaluated against that
+     * constant", so the order that must never exist is value-stopped-
+     * processing-running; taking the stall first gives that state zero width
+     * on entry, and releasing it last gives it zero width on exit.
+     */
+    if (plugin_spec_stall_depth++ == 0) {
+        qemu_clock_plugin_stall_set(true);
+    }
+    cpu_plugin_ticks_freeze(cpu_index);
+}
+
+void cpu_plugin_spec_ticks_thaw(int cpu_index)
+{
+    assert(bql_locked());
+    assert(plugin_spec_stall_depth > 0);
+
+    cpu_plugin_ticks_thaw(cpu_index);
+    /*
+     * Unconditional, including on the path where the thaw above declined to
+     * restart the clock because a vm_stop owns it.  The stall is this count's
+     * to release and nobody else will: left behind, it would outlive every
+     * freeze that justified it and hide the virtual clock's deadlines for the
+     * remainder of the run.  A stopped machine runs no guest-visible timers
+     * regardless; that is vm_stop's doing, not this stall's.
+     */
+    if (--plugin_spec_stall_depth == 0) {
+        qemu_clock_plugin_stall_set(false);
+    }
+}
+
+/*
+ * cpu_plugin_tsc_lock_to_vclock: make the tick counter a function of the
+ * virtual clock, so that one freeze stops both.
+ * @tsc_hz: the slope, in ticks per second of QEMU_CLOCK_VIRTUAL.
+ *
+ * cpu_get_ticks() and cpu_get_clock() are two independent HOST oscillators:
+ * the first accumulates cpu_get_host_ticks() (the host cycle counter), the
+ * second get_clock() (host CLOCK_MONOTONIC).  A guest built on both -- x86
+ * takes its TSC from the first and its LAPIC, HPET, PIT and ACPI PM timers
+ * from the second -- only holds together while the two agree, and a plugin
+ * freeze is where they stop agreeing:
+ *
+ *     cpu_disable_ticks()      reads the host cycle counter at instant a,
+ *                              then CLOCK_MONOTONIC at instant b > a.
+ *     cpu_enable_ticks()       reads the host cycle counter at instant c,
+ *                              then CLOCK_MONOTONIC at instant d > c.
+ *
+ * The pair subtracts [a, c] from the tick counter and [b, d] from the virtual
+ * clock.  Those are DIFFERENT REAL INTERVALS -- they differ by
+ * (d - c) - (b - a), the difference of the two functions' own read gaps --
+ * and they are subtracted in DIFFERENT UNITS, at a ratio this code never
+ * measures.  Neither term is noise: the gap is a property of the compiled
+ * shape of each function, so its sign is fixed and every freeze/thaw pair
+ * moves the guest's tick counter the same way relative to the guest's virtual
+ * clock.  A plugin that freezes once per instrumentation window performs tens
+ * of thousands of pairs per second, and nothing in the pair ever gives the
+ * displacement back.
+ *
+ * Reconciling the two afterwards cannot close this.  An architectural counter
+ * that may not run backwards -- the x86 TSC -- can only be corrected upwards,
+ * so a correction step ADDS agreement when the counter is behind and declines
+ * when it is ahead: the disagreement is rectified rather than averaged, and
+ * accumulates without bound.  Measured on the x86_64 system marker shape over
+ * 556 cells with such a correction in place: the counter stood above its own
+ * reference line at 100.00% of correction points in the median cell, by a
+ * median 0.97 ms and a maximum 11.20 ms inside a ~20 s run.
+ *
+ * So the fix is not a better correction, it is removing the second
+ * oscillator.  Once armed, cpu_get_ticks_locked() computes the tick counter
+ * from cpu_get_clock_locked() alone.  Both then stop on the same
+ * cpu_ticks_enabled and resume from the same cpu_clock_offset, so a freeze
+ * removes exactly the same real interval from both BY CONSTRUCTION, whatever
+ * either function's read gap is, and the two can no longer separate.
+ *
+ * Arming is continuous: the reference point is the pair's value at the
+ * arming instant, so the guest sees no step, and the slope is the caller's
+ * measured host ratio, so it sees no rate change either.  Idempotent -- the
+ * first caller fixes the line; a later one must not move it, since the
+ * counter would jump.  No-op for @tsc_hz <= 0.  Caller must hold the BQL.
+ */
+void cpu_plugin_tsc_lock_to_vclock(double tsc_hz)
+{
+    if (!(tsc_hz > 0)) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (!plugin_tsc_per_ns_q32) {
+        /*
+         * Order matters only for readability: the reference tick value is
+         * still taken from the host-sourced path, because the lock is not
+         * armed until the rate is stored last.
+         */
+        plugin_tsc_ref_ticks = cpu_get_ticks_locked();
+        plugin_tsc_ref_clk = cpu_get_clock_locked();
+        plugin_tsc_per_ns_q32 =
+            (uint64_t)(tsc_hz * 4294967296.0 / 1000000000.0);
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+#endif
 
 static bool icount_state_needed(void *opaque)
 {
@@ -238,7 +497,18 @@ static void do_nothing(CPUState *cpu, run_on_cpu_data unused)
 
 void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
 {
-    if (!icount_enabled() || type != QEMU_CLOCK_VIRTUAL) {
+    /*
+     * Event-agency (PRODUCT): while engaged, a main-loop VIRTUAL
+     * notify must reach the CONSUMER of VIRTUAL deadlines -- the vCPU
+     * class -- not the iothread poll loop that no longer watches
+     * VIRTUAL.  The two branches below are icount's own; the product
+     * predicate simply rides the same gate.  While LIFTED (all vCPU
+     * threads parked) vclock_agency_engaged() is false and the stock
+     * qemu_notify_event() path serves the iothread, which owns VIRTUAL
+     * again for exactly that window.
+     */
+    if (!(icount_enabled() || vclock_agency_engaged()) ||
+        type != QEMU_CLOCK_VIRTUAL) {
         qemu_notify_event();
         return;
     }
@@ -271,4 +541,63 @@ void cpu_timers_init(void)
     seqlock_init(&timers_state.vm_clock_seqlock);
     qemu_spin_init(&timers_state.vm_clock_lock);
     vmstate_register(NULL, 0, &vmstate_timers, &timers_state);
+}
+
+/*
+ * Event-agency consumption (PRODUCT; see qemu/vclock-agency.h): run
+ * due QEMU_CLOCK_VIRTUAL timers in-thread, on the vCPU, at a
+ * guest-insn slice breakout the vCPU owns.  Mirrors
+ * icount_handle_deadline / icount_notify_aio_contexts in order: take
+ * the BQL if not held (the icount_prepare_for_run bracket),
+ * qemu_clock_notify(VIRTUAL) (wakes every VIRTUAL timerlist's notifier
+ * so AioContext-attached lists run in their home context, exactly as
+ * under icount), then qemu_clock_run_timers(VIRTUAL) (the main-loop
+ * list, here, in this thread).  The caller sits inside cpu_exec's RCU
+ * read section; QEMU RCU read sections are sleepable and
+ * BQL-inside-RCU is the cpu_handle_interrupt pattern, so callbacks
+ * must not synchronize_rcu -- none of the VIRTUAL device callbacks do.
+ *
+ * THE SMP RULE: ANY vCPU may consume at its own boundary under the BQL
+ * -- the sole consumer is the vCPU CLASS, not a designated vCPU.  No
+ * ownership handoff exists to get wrong: the BQL serializes concurrent
+ * boundaries, each consumption drains whatever is due, and a peer's
+ * boundary that loses the race finds nothing due and continues.  What
+ * the design forbids is the ASYNC agent racing excursion restore
+ * edges, not multiple ordered in-thread consumers.
+ *
+ * THE WRONG-PATH RULE: device timer callbacks never run inside a
+ * spec-mode excursion.  A boundary observed with plugin_spec_mode set
+ * is skipped and counted (vagency_spec_mode_skips, expected 0 -- the
+ * CP exec loop cannot run in spec mode; nonzero is a spec-escape
+ * witness, not grounds to abort).  A deadline that comes due while an
+ * excursion is in flight is consumed at the first slice breakout after
+ * the restore: the excursion brackets a boundary, its clock freeze
+ * makes entry and exit one guest instant, and the guest-insn slice
+ * budget (saved at excursion open, restored at close) guarantees the
+ * post-restore chain presents that breakout within one quantum --
+ * before the delivery bound the quantum states is ever exceeded.
+ */
+void vclock_agency_consume(CPUState *cpu, bool breakout_site)
+{
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cpu->plugin_spec_mode)) {
+        vclock_agency_note_spec_skip();
+        return;
+    }
+#endif
+    bool unlock = false;
+
+    if (!bql_locked()) {
+        bql_lock();
+        unlock = true;
+    }
+    vclock_agency_boundary_begin();
+    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    vclock_agency_boundary_end();
+    if (unlock) {
+        bql_unlock();
+    }
+    vclock_agency_note_consume();
+    vclock_agency_note_consume_site(breakout_site);
 }

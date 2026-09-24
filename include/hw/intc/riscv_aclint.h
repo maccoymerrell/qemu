@@ -51,6 +51,17 @@ DeviceState *riscv_aclint_mtimer_create(hwaddr addr, hwaddr size,
     uint32_t timecmp_base, uint32_t time_base, uint32_t timebase_freq,
     bool provide_rdtime);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Re-derive @hartid's MTIP level and host QEMUTimer deadline from the
+ * architected mtimecmp after a wrong-path (speculative) excursion perturbed
+ * them — called from riscv_cpu_plugin_resync_timers at the excursion-exit
+ * boundary, with the BQL held.
+ */
+void riscv_aclint_mtimer_plugin_resync(RISCVAclintMTimerState *mtimer,
+                                       uint32_t hartid);
+#endif
+
 #define TYPE_RISCV_ACLINT_SWI "riscv.aclint.swi"
 
 #define RISCV_ACLINT_SWI(obj) \

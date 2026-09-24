@@ -33,6 +33,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-clock.h"
 #include "semihosting/semihost.h"
+#include "qemu/qemu-plugin.h"
 #include "fpu_helper.h"
 
 const char regnames[32][3] = {
@@ -109,6 +110,25 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->CP0_Config2, env->CP0_Config3);
     qemu_fprintf(f, "    Config4 0x%08x Config5 0x%08x\n",
                  env->CP0_Config4, env->CP0_Config5);
+#if !defined(CONFIG_USER_ONLY)
+    /*
+     * On an MT processor the run/halt state of a VPE is decided by state
+     * that none of the above shows: MVPControl.EVP gates every VPE of the
+     * processor at once (mips_cpu_has_work()), and TCStatus.A / TCHalt gate
+     * the thread context.  A dump taken to explain why a vCPU is not
+     * running has to be able to name them.
+     */
+    if (ase_mt_available(env)) {
+        qemu_fprintf(f, "    MVPControl 0x%08x MVPConf0 0x%08x "
+                     "VPEConf0 0x%08x\n",
+                     env->mvp->CP0_MVPControl, env->mvp->CP0_MVPConf0,
+                     env->CP0_VPEConf0);
+        qemu_fprintf(f, "    TCStatus 0x%08x TCHalt 0x" TARGET_FMT_lx
+                     " VPEControl 0x%08x\n",
+                     env->active_tc.CP0_TCStatus, env->active_tc.CP0_TCHalt,
+                     env->CP0_VPEControl);
+    }
+#endif
     if ((flags & CPU_DUMP_FPU) && (env->hflags & MIPS_HFLAG_FPU)) {
         fpu_dump_state(env, f, flags);
     }
@@ -164,6 +184,15 @@ static bool mips_cpu_has_work(CPUState *cs)
         }
 
         if (!mips_vpe_active(env)) {
+            /*
+             * Condition instrument: this vCPU is runnable by every
+             * architectural rule and is being held off the run queue by the
+             * processor-wide EVP gate alone.  Reported once per vCPU, and
+             * only when EVP -- not VPA -- is what closed the gate.
+             */
+            if (unlikely(mips_mvp_debug > 0)) {
+                mips_mvp_note_gate(env);
+            }
             has_work = false;
         }
     }
@@ -341,6 +370,9 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
         env->active_tc.CP0_TCHalt = 1;
         cs->halted = 1;
 
+        /* A reset leaves no DVPE section open, whichever VPE held one.  */
+        qatomic_set(&env->mvp->evp_owner, -1);
+
         if (cs->cpu_index == 0) {
             /* VPE0 starts up enabled.  */
             env->mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
@@ -489,6 +521,9 @@ static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
 #endif
     fpu_init(env, env->cpu_model);
     mvp_init(env);
+#if !defined(CONFIG_USER_ONLY)
+    mips_mvp_debug_init();
+#endif
 
     cpu_reset(cs);
     qemu_init_vcpu(cs);
@@ -548,11 +583,160 @@ static const Property mips_cpu_properties[] = {
 
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                  bool *mmu_on)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    /* KSU: 0 = kernel, 1 = supervisor, 2 (MIPS_HFLAG_UM) = user.
+     * Normalize so 0 = user (least privileged), larger = more privileged. */
+    int ksu = env->hflags & MIPS_HFLAG_KSU;
+    *priv = MIPS_HFLAG_UM - ksu;
+    /*
+     * The reported address-space value is a LABEL, never an identity
+     * (content-as-gate model, RULING 1): EntryHi.ASID — the value the TLB
+     * actually tags translations with and the one r4k_map_address resolves
+     * through — on every model, walker or not.  The PWBase arm this
+     * replaces existed for identity strength alone; PWBase remains a
+     * TRANSLATION INPUT only (see the debug-walk fallback in
+     * system/physaddr.c).  Wire-visible: mipsel asid labels are now the
+     * 8-bit EntryHi field — goldens recapture.
+     */
+    *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    /* MIPS always translates through the TLB (mapped segments fault on a
+     * TLB miss); there is no global paging-disable, so report on. */
+    *mmu_on = true;
+}
+
+static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
+static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    /*
+     * CP0 UserLocal (reg 4 sel 2, the rdhwr $29 TLS base).  A kernel
+     * writes it on every thread switch when Config3.ULRI advertises it;
+     * on models without ULRI it stays 0 and threads are architecturally
+     * indistinguishable by it (the kernel keeps the TLS pointer in RAM
+     * and trap-emulates rdhwr).  Kept whenever it is non-zero, at any
+     * privilege: it is reloaded from the incoming task at each switch,
+     * so a thread's kernel excursions stay on the SAME identity its user
+     * code carries.
+     *
+     * UserLocal == 0 in kernel mode is a task with no TLS identity — a
+     * kernel thread or per-CPU idle task, or any task on a no-ULRI model
+     * (this includes the whole 24K/34K Malta class).  Those are distinct
+     * program paths, so fall through to the kernel's own per-task
+     * contract: Linux/MIPS dedicates $28 (gp) to current_thread_info in
+     * kernel mode (arch/mips/include/asm/thread_info.h declares it
+     * register-resident in $28; stackframe.h SAVE_SOME derives it from
+     * the kernel sp — `ori $28, sp, _THREAD_MASK; xori $28,
+     * _THREAD_MASK` — on every entry from user).  MIPS keeps
+     * thread_info at the base of each task's kernel stack (no
+     * THREAD_INFO_IN_TASK), so the value is per-task and stable for the
+     * task's life.  Before SAVE_SOME runs — the exception-vector window —
+     * $28 still holds the interrupted user's gp, which on MIPS can only
+     * be a useg VA: the kernel-VA test rejects it, the tracks-current
+     * hook reports false, and the consumer inherits the entering thread
+     * (which is the interrupted thread itself).
+     */
+    uint64_t tp = env->active_tc.CP0_UserLocal;
+    if (tp != 0 || (env->hflags & MIPS_HFLAG_KSU) == MIPS_HFLAG_UM) {
+        return tp;
+    }
+    uint64_t gp = env->active_tc.gpr[28];
+    if (mips_vaddr_is_kernel(cs, gp)) {
+        return gp;
+    }
+    return tp;
+}
+
+static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    /* UserLocal is user-TLS-only state the kernel has no use of its own
+     * for; it is reloaded from the incoming task at every switch and
+     * untouched in between, at any privilege.  The state it cannot vouch
+     * for: a no-TLS task (UserLocal 0) in the exception-vector window
+     * before SAVE_SOME re-derives $28 — neither register names the task
+     * there, so the consumer inherits the entering thread. */
+    if (env->active_tc.CP0_UserLocal == 0 &&
+        (env->hflags & MIPS_HFLAG_KSU) != MIPS_HFLAG_UM) {
+        return mips_vaddr_is_kernel(cs, env->active_tc.gpr[28]);
+    }
+    return true;
+}
+
+static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    /*
+     * MIPS partitions the VA space into fixed segments by address range
+     * (see get_physical_address()): the low useg (and, on MIPS64, xuseg) is
+     * the only user-accessible region; everything above — kseg0/1/2/3 and the
+     * 64-bit xsseg/xkphys/xkseg — is kernel/supervisor.  So a code fetch is
+     * kernel-domain exactly when it falls outside useg/xuseg.  This is a pure
+     * range test on the fixed segment map (no CPU state, no TLB probe); the
+     * same USEG_LIMIT / segment boundaries the address-translation path uses
+     * are applied here.  Cast to target_ulong first so a 32-bit guest's PC
+     * (kseg0 = 0x80000000) compares in its own width rather than as a
+     * spuriously-small uint64_t.
+     */
+    (void)cs;
+    target_ulong address = (target_ulong)vaddr;
+    if (address <= USEG_LIMIT) {
+        return false;                         /* useg — user */
+    }
+#if defined(TARGET_MIPS64)
+    if (address < 0x4000000000000000ULL) {
+        return false;                         /* xuseg — user */
+    }
+#endif
+    return true;                              /* kseg / xsseg / xkphys / xkseg */
+}
+
+/*
+ * TCGCPUOps::spec_clock_resync for MIPS — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * MIPS's audit.  The only architectural time source is the CP0 Count/Compare
+ * pair (with Cause.DC as the count-disable), and Count is computed on demand
+ * from QEMU_CLOCK_VIRTUAL (cpu_mips_get_count_val), so the freeze already
+ * leaves it consistent with the frozen time.  What has to be reconciled is the
+ * R4K host QEMUTimer behind Compare -- an architectural register inside the
+ * rolled-back snapshot -- together with any expiry the excursion gate in
+ * cpu_mips_timer_expire suppressed, and the CPU_INTERRUPT_HARD line, which
+ * cpu_mips_irq_request stops driving for the whole excursion while
+ * CP0_Cause.IP is rewound underneath it.  mips_cpu_plugin_resync_timers does
+ * both, unconditionally.
+ *
+ * SPEC_CLOCK_THAW needs nothing: Count is a pure function of the virtual
+ * clock.
+ */
+static void mips_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    mips_cpu_plugin_resync_timers(cs);
+}
+#endif
+
 static const TCGCPUOps mips_tcg_ops = {
     .initialize = mips_tcg_init,
     .translate_code = mips_translate_code,
     .synchronize_from_tb = mips_cpu_synchronize_from_tb,
     .restore_state_to_opc = mips_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = mips_get_plugin_state,
+    .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
+    /* CP0 UserLocal is a dedicated TLS slot the kernel has no use of its
+     * own for: Linux/MIPS writes it from the incoming task in switch_to()
+     * and never touches it in between, so a kernel-privilege read names
+     * the current task (0 for a kernel thread). */
+    .plugin_thread_ptr_tracks_current = mips_plugin_thread_ptr_tracks_current,
+    .vaddr_is_kernel = mips_vaddr_is_kernel,
+    .spec_clock_resync = mips_spec_clock_resync,
+#endif
 
 #if !defined(CONFIG_USER_ONLY)
     .tlb_fill = mips_cpu_tlb_fill,
@@ -586,6 +770,11 @@ static void mips_cpu_class_init(ObjectClass *c, void *data)
     cc->get_pc = mips_cpu_get_pc;
     cc->gdb_read_register = mips_cpu_gdb_read_register;
     cc->gdb_write_register = mips_cpu_gdb_write_register;
+#if defined(TARGET_MIPS64)
+    cc->gdb_core_xml_file = "mips64-cpu.xml";
+#else
+    cc->gdb_core_xml_file = "mips-cpu.xml";
+#endif
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &mips_sysemu_ops;
 #endif

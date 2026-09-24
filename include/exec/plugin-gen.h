@@ -25,6 +25,25 @@ void plugin_gen_insn_end(void);
 
 void plugin_gen_disable_mem_helpers(void);
 
+/*
+ * Record the static control-transfer target the translator has just
+ * resolved for the instruction currently being translated.  Called
+ * by per-ISA translators at every direct-branch / unconditional-jump
+ * decode site, passing the same target value handed to gen_goto_tb.
+ *
+ * Plugins consume this via qemu_plugin_insn_branch_target_pc().  It
+ * is the canonical source for wrong-path target selection on direct
+ * branches: a tracer must NOT redecode the branch immediate itself,
+ * since per-ISA encoding (PC-relative vs absolute, sign extension,
+ * delay-slot accounting, Thumb interworking bit) varies and is
+ * already correctly resolved here.
+ *
+ * Indirect branches do not have a static target; translators must
+ * not call this for them, so plugins see branch_target_pc == 0 and
+ * fall back to their observed-target history.
+ */
+void plugin_gen_record_branch_target(uint64_t target_pc);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -44,6 +63,9 @@ static inline void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
 { }
 
 static inline void plugin_gen_disable_mem_helpers(void)
+{ }
+
+static inline void plugin_gen_record_branch_target(uint64_t target_pc)
 { }
 
 #endif /* CONFIG_PLUGIN */

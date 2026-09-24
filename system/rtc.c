@@ -33,6 +33,7 @@
 #include "system/system.h"
 #include "system/rtc.h"
 #include "hw/rtc/mc146818rtc.h"
+#include "qemu/plugin.h"
 
 static enum {
     RTC_BASE_UTC,
@@ -135,6 +136,64 @@ static void configure_rtc_base_datetime(const char *startdate)
     }
     rtc_host_datetime_offset = rtc_ref_start_datetime - rtc_start_datetime;
     rtc_ref_start_datetime = rtc_start_datetime;
+}
+
+void rtc_adopt_vm_clock_for_plugin(void)
+{
+#ifdef CONFIG_PLUGIN
+    /*
+     * Guest-time transparency.  A TCG plugin that freezes guest time for its
+     * own instrumentation or for a speculative excursion does so with
+     * cpu_disable_ticks(), which stops every clock gated on
+     * timers_state.cpu_ticks_enabled: QEMU_CLOCK_VIRTUAL and the VM tick
+     * counter, and with them the guest TSC, the LAPIC timer, the PIT, the
+     * HPET, the ACPI PM timer, Arm's CNTVCT/CNTPCT, MIPS's CP0 Count and the
+     * RISC-V ACLINT mtime.  It does NOT stop QEMU_CLOCK_HOST, which is raw
+     * host wall time by contract (util/qemu-timer.c, get_clock_realtime) and
+     * must stay that way.
+     *
+     * rtc_clock defaults to QEMU_CLOCK_HOST, and rtc_clock is the ONE clock
+     * selector every RTC model reads -- pl031, goldfish-rtc, mc146818,
+     * m48t59, ls7a, xlnx-zynqmp and the rest all call
+     * qemu_clock_get_ns(rtc_clock).  So with a freezing plugin loaded the
+     * board's RTC is the one guest-visible timebase still running through a
+     * freeze: its time-of-day advances at host rate while every other guest
+     * clock stands still, and its periodic / update / alarm timers keep
+     * firing on host time.  A guest that reads the RTC or uses /dev/rtc
+     * inside an instrumented window sees a timebase inconsistent with all the
+     * others, and Linux's clocksource watchdog compares exactly such pairs.
+     *
+     * QEMU_CLOCK_VIRTUAL is gated by cpu_ticks_enabled and is already a
+     * supported RTC base (-rtc clock=vm), so adopt it when a plugin is
+     * present and the user did not ask for a specific clock.  Announced
+     * rather than silent: it changes what the guest reads from the RTC.
+     *
+     * Deciding it HERE, once, off the one global, is the point.  The
+     * predecessor made this call inside mc146818rtc_realize, so the machines
+     * that get the transparency were the machines that happen to have an
+     * mc146818 -- x86 pc/q35 and mips malta.  aarch64 `virt` (pl031) and
+     * riscv64 `virt` (goldfish-rtc) instantiate neither, so on exactly those
+     * two of the four traced targets rtc_clock stayed QEMU_CLOCK_HOST and the
+     * RTC ran at host rate through every excursion.  A per-device decision
+     * about a machine-wide global can only ever cover the devices someone
+     * thought to patch; this covers every RTC model that exists, including
+     * ones not yet written, because they all read rtc_clock.
+     *
+     * Called from qemu_init_board() after qemu_plugin_load_list() and before
+     * machine_run_board_init(): that is the only window in which the plugin
+     * set is known and no device has realized yet.  configure_rtc() itself is
+     * too early -- it runs during option parsing, before any plugin is
+     * loaded.
+     */
+    if (rtc_clock == QEMU_CLOCK_HOST && qemu_plugin_any_loaded()) {
+        warn_report("a TCG plugin is loaded; moving the RTC from "
+                    "QEMU_CLOCK_HOST to QEMU_CLOCK_VIRTUAL so it is frozen "
+                    "with every other guest clock. Pass -rtc clock=host to "
+                    "keep the old behaviour (the guest will then see the RTC "
+                    "run through plugin time freezes).");
+        rtc_clock = QEMU_CLOCK_VIRTUAL;
+    }
+#endif
 }
 
 void configure_rtc(QemuOpts *opts)

@@ -67,6 +67,11 @@ void qemu_guest_getrandom_nofail(void *buf, size_t len)
     (void)qemu_guest_getrandom(buf, len, &error_fatal);
 }
 
+bool qemu_guest_random_is_deterministic(void)
+{
+    return deterministic;
+}
+
 uint64_t qemu_guest_random_seed_thread_part1(void)
 {
     if (deterministic) {

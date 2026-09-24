@@ -11,6 +11,7 @@
 #define TCG_CPU_OPS_H
 
 #include "exec/breakpoint.h"
+#include "exec/cpu-common.h"
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
 #include "exec/memop.h"
@@ -66,6 +67,127 @@ struct TCGCPUOps {
     void (*cpu_exec_exit)(CPUState *cpu);
     /** @debug_excp_handler: Callback for handling debug exceptions */
     void (*debug_excp_handler)(CPUState *cpu);
+
+#ifdef CONFIG_PLUGIN
+    /**
+     * @get_plugin_state: report current privilege + address space to plugins
+     *
+     * Optional.  Fills @priv with a normalized privilege ordinal
+     * (0 = user / least privileged, larger = more privileged) and @asid with
+     * the current address-space identifier (x86 CR3, RISC-V SATP, Arm TTBR,
+     * MIPS ASID).  Lets a plugin filter by process / privilege in system
+     * mode (and read priv=0 in user mode); see qemu_plugin_get_priv_level()
+     * and qemu_plugin_get_addr_space_id().
+     *
+     * Also fills @mmu_on with whether the guest's MMU / paging is currently
+     * enabled (x86 CR0.PG, Arm SCTLR.M, RISC-V SATP!=Bare; MIPS always has a
+     * TLB so reports true).  A plugin's speculative (wrong-path) execution
+     * relies on the MMU to fault on fetches into non-code; with paging off
+     * there is no such bound, so the plugin must not speculate.  See
+     * qemu_plugin_paging_enabled().
+     */
+    void (*get_plugin_state)(CPUState *cpu, int *priv, uint64_t *asid,
+                             bool *mmu_on);
+
+    /**
+     * @get_plugin_thread_ptr: report the guest thread-pointer register
+     *
+     * Optional.  Returns the architectural per-thread pointer the
+     * guest kernel context-switches per software thread (x86_64
+     * FS.base — GS.base for a 32-bit compat task — AArch64 TPIDR_EL0,
+     * RISC-V tp/x4, MIPS CP0 UserLocal).  Meaningful when sampled at
+     * user privilege; see qemu_plugin_get_thread_ptr().
+     */
+    uint64_t (*get_plugin_thread_ptr)(CPUState *cpu);
+
+    /**
+     * @plugin_thread_ptr_tracks_current: the thread pointer also names the
+     * current task at privileged level
+     *
+     * Optional.  Reports whether the value @get_plugin_thread_ptr returns
+     * IN THE vCPU'S CURRENT STATE still names the software thread the vCPU
+     * is executing above user privilege, so a sample taken inside the
+     * kernel identifies the task that is CURRENT rather than the one that
+     * last ran in user mode.  A function of the state, not a flat target
+     * property, because the honest answer can depend on where the sample
+     * is taken: RISC-V's current-task rule (see the RISC-V
+     * @get_plugin_thread_ptr) holds at U/S privilege but not in M-mode
+     * firmware, which runs on its own tp with the S-mode sscratch parked,
+     * and not under H-extension virtualization.
+     *
+     * Unconditionally true where the register is architecturally separate
+     * from anything the kernel needs for its own use and every mainstream
+     * kernel therefore reloads it from the incoming task at each context
+     * switch, leaving it untouched in between (MIPS CP0 UserLocal, AArch64
+     * TPIDR_EL0, x86-64 FS.base).  NULL (never trusted above user) on any
+     * target that cannot make the statement.
+     *
+     * Only meaningful alongside @get_plugin_thread_ptr; see
+     * qemu_plugin_thread_ptr_tracks_current().
+     */
+    bool (*plugin_thread_ptr_tracks_current)(CPUState *cpu);
+
+    /**
+     * @vaddr_is_kernel: classify a code virtual address's privilege domain
+     *
+     * Optional.  Returns true when @vaddr lies in the guest's KERNEL
+     * (privileged/supervisor) code region, false when it lies in the USER
+     * region, as determined by the target's own MMU / segment logic — the
+     * canonical/TTBR/sign-extension range the walker selects on, or the
+     * fixed-segment map (MIPS kuseg vs kseg).  This is a pure architectural
+     * range/bit test on the address; it does no page-table walk and cannot
+     * fault, so a plugin can call it on a speculatively-fetched wrong-path
+     * address safely.  Kernel and user virtual-address ranges are
+     * architecturally disjoint, so the classification does not depend on the
+     * current privilege level (which a wrong-path walk can mis-observe).
+     * Lets a plugin partition kernel from user code, seed a kernel/user bit
+     * without trusting a speculated privilege level, and detect a
+     * privilege-domain crossing on a control transfer.  Read priv=0 targets
+     * (user-mode QEMU) do not register this hook, so the API reports "user".
+     */
+    bool (*vaddr_is_kernel)(CPUState *cpu, uint64_t vaddr);
+
+    /**
+     * @spec_clock_resync: reconcile every guest clock with the frozen time
+     *
+     * Optional; system-mode targets only.  Called at the end of a plugin
+     * clock freeze, once the virtual clock has been thawed and (for a
+     * wrong-path excursion) the speculative register state has been rolled
+     * back.  @reason says which of the two freezes ended.
+     *
+     * The contract is a single sentence: ON RETURN, EVERY ARCHITECTURAL
+     * CLOCK OR COUNTER THE GUEST CAN OBSERVE, AND EVERY ARMED HOST
+     * QEMUTimer BACKING ONE, MUST BE CONSISTENT WITH THE FROZEN VIRTUAL
+     * TIME -- as if the freeze had consumed exactly zero guest time.  The
+     * frozen clock is authoritative: an implementation resyncs the SOURCES
+     * to it, never the other way round.  Concretely, for each time source
+     * the target exposes, an implementation must
+     *
+     *   - re-derive the architectural counter (Arm CNTVCT/CNTPCT, x86 TSC,
+     *     RISC-V time, MIPS CP0_Count) from the frozen virtual clock, so a
+     *     counter that free-runs off a different host source cannot drift
+     *     across the freeze;
+     *   - re-arm every host QEMUTimer from the (restored) architectural
+     *     compare register, so a compare rolled back by the excursion, or a
+     *     one-shot host timer that fired and was suppressed during it,
+     *     cannot leave the timer parked and never firing again;
+     *   - re-deliver any interrupt whose raise the excursion suppressed, and
+     *     re-derive the CPU interrupt-request line from the restored
+     *     architectural pending state (Arm irq_line_state, RISC-V mip, MIPS
+     *     CP0_Cause.IP), so line and register cannot disagree.
+     *
+     * Called with the BQL held and with plugin spec mode already ended, so
+     * an implementation may drive IRQ lines directly.  It must be
+     * idempotent: it runs on every excursion exit, including ones that
+     * perturbed nothing.
+     *
+     * Registering this hook is how a system-mode target opts in to
+     * wrong-path (speculative) plugin execution being time-transparent.  A
+     * target that does not register it will silently accumulate clock skew
+     * across excursions; see docs/devel/tcg-plugins.rst.
+     */
+    void (*spec_clock_resync)(CPUState *cpu, SpecClockResyncReason reason);
+#endif
 
 #ifdef CONFIG_USER_ONLY
     /**

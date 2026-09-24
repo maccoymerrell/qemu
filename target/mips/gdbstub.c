@@ -127,12 +127,14 @@ int mips_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
 #endif
         break;
     case 37:
-        env->active_tc.PC = tmp & ~(target_ulong)1;
-        if (tmp & 1) {
-            env->hflags |= MIPS_HFLAG_M16;
-        } else {
-            env->hflags &= ~(MIPS_HFLAG_M16);
-        }
+        /*
+         * Second open-coding of mips_env_set_pc()'s rule; call the one
+         * function instead, so a debugger writing an odd PC selects the
+         * MIPS16/microMIPS ISA mode only on a CPU that has one.  Without
+         * that test a "set $pc" on, say, a P5600 leaves the CPU in a mode
+         * with no decoder behind it.
+         */
+        mips_env_set_pc(env, tmp);
         break;
     case 72: /* fp, ignored */
         break;

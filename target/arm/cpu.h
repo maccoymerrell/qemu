@@ -1171,6 +1171,15 @@ void arm_gt_vtimer_cb(void *opaque);
 void arm_gt_htimer_cb(void *opaque);
 void arm_gt_stimer_cb(void *opaque);
 void arm_gt_hvtimer_cb(void *opaque);
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Re-arm the host generic-timer QEMUTimers to match the architected registers
+ * after a wrong-path speculative state restore (no-op unless the spec walk
+ * dirtied the timer).  Called from cpu_plugin_arch_state_restore.
+ */
+void arm_cpu_plugin_resync_timers(CPUState *cs);
+#endif
 void arm_gt_sel2timer_cb(void *opaque);
 void arm_gt_sel2vtimer_cb(void *opaque);
 

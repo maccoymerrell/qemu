@@ -1658,9 +1658,40 @@ static void pmintenclr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     pmu_update_irq(env);
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path (speculative) containment for the address-translation regime.
+ *
+ * A write to a system register that reconfigures address translation
+ * (TTBR/TCR/SCTLR/TTBCR) or the exception vector base (VBAR) takes effect on
+ * the QEMU translation regime *immediately*.  On the discarded wrong path that
+ * is a containment hole: a mispredicted WP that lands in the KPTI trampoline
+ * (mapped at the fixed 0xffff_fbff_… address) executes `msr TTBR1_EL1` to
+ * switch from the restricted user-time page tables to the full kernel tables,
+ * then escapes its sandbox and runs away through the exception vectors —
+ * millions of speculative insns that never return.  The register's
+ * CPUArchState backing is rolled back at walk end, so dropping the speculative
+ * reconfiguration is harmless; keeping the WP in the regime it started in is
+ * the whole point of containment.
+ */
+static inline bool arm_spec_freeze_regime(CPUARMState *env)
+{
+    return unlikely(env_cpu(env)->plugin_spec_mode);
+}
+#else
+static inline bool arm_spec_freeze_regime(CPUARMState *env)
+{
+    (void)env;
+    return false;
+}
+#endif
+
 static void vbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                        uint64_t value)
 {
+    if (arm_spec_freeze_regime(env)) {
+        return;
+    }
     /*
      * Note that even though the AArch64 view of this register has bits
      * [10:0] all RES0 we can only mask the bottom 5, to comply with the
@@ -2457,6 +2488,18 @@ uint64_t gt_get_countervalue(CPUARMState *env)
 static void gt_update_irq(ARMCPU *cpu, int timeridx)
 {
     CPUARMState *env = &cpu->env;
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) containment: never drive the generic-timer
+     * IRQ line on the discarded path.  qemu_set_irq() mutates the GIC's
+     * pending state, which lives outside the CPUArchState register snapshot
+     * the wrong-path walk rolls back, so a speculative toggle leaks into the
+     * correct path's interrupt delivery.
+     */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        return;
+    }
+#endif
     uint64_t cnthctl = env->cp15.cnthctl_el2;
     ARMSecuritySpace ss = arm_security_space(env);
     /* ISTATUS && !IMASK */
@@ -2577,7 +2620,31 @@ uint64_t gt_direct_access_timer_offset(CPUARMState *env, int timeridx)
 static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
 {
     ARMGenericTimer *gt = &cpu->env.cp15.c14_timer[timeridx];
-
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) containment: never reprogram the host
+     * QEMUTimer (timer_mod) or touch the IRQ line on the discarded path.
+     * The QEMUTimer's armed deadline is external state, not part of the
+     * CPUArchState register snapshot the walk rolls back; a single
+     * speculative reprogram (reached e.g. via an ungated CNTVOFF/CNTHCTL
+     * writefn) leaves the kernel's virtual-timer deadline wrong after the
+     * walk unwinds, which wedged the aarch64 system-mode timer subsystem
+     * (the IRQ then fired without end and the guest never returned to
+     * userspace).  The c14_timer[].ctl ISTATUS this would recompute is in
+     * CPUArchState and is restored regardless.
+     *
+     * This call may be the host timer's own (iothread) callback firing during
+     * the walk, which hits this gate and returns without re-arming, leaving
+     * the one-shot timer dead.  Nothing is recorded about that here, because
+     * nothing needs to be: arm_cpu_plugin_resync_timers() re-runs
+     * gt_recalc_timer over every present timer at excursion exit
+     * unconditionally, so the host timer is reconciled with the restored
+     * registers whether or not this gate was ever taken.
+     */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        return;
+    }
+#endif
     if (gt->ctl & 1) {
         /*
          * Timer enabled: calculate and set current ISTATUS, irq, and
@@ -3132,6 +3199,64 @@ void arm_gt_hvtimer_cb(void *opaque)
 
     gt_recalc_timer(cpu, GTIMER_HYPVIRT);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Re-synchronise the host generic-timer QEMUTimers with the architected timer
+ * registers at the end of a wrong-path (speculative) excursion.  Part of the
+ * TCGCPUOps::spec_clock_resync contract; see arm_spec_clock_resync in cpu.c.
+ *
+ * Arm's guest-observable time sources are the generic timers, and every one
+ * of them is a (ctl, cval) register pair inside CPUARMState shadowed by a
+ * host QEMUTimer outside it — plus the CNTVOFF_EL2 / CNTPOFF_EL2 offsets and
+ * CNTFRQ, also inside.  The wrong-path register restore rolls the registers
+ * back; the host timers do not follow.  Two ways that wedges the guest:
+ *
+ *   - the timer expired during the excursion's host wall-clock window and its
+ *     callback advanced ctl.ISTATUS to 1, which the restore then reverts; the
+ *     one-shot host timer has already fired and is left parked (at INT64_MAX
+ *     for a disabled/expired timer) and never fires again;
+ *   - a speculative write to CNTV_CVAL/CNTV_CTL (or to CNTVOFF) reprogrammed
+ *     the host timer for a deadline the correct path never asked for.
+ *
+ * Either way the guest's clockevent stops arriving: the aarch64 system-mode
+ * storm.  gt_recalc_timer recomputes ISTATUS from the restored registers plus
+ * the current (thawed, and therefore frozen-time-consistent) count and
+ * re-arms or re-fires the host timer, so it is exactly the reconciliation the
+ * contract asks for, for every source at once.
+ *
+ * Run over every present timer UNCONDITIONALLY.  This used to be gated on a
+ * flag the spec gates set, i.e. on having observed one of the two mechanisms
+ * above; anything that desynced a timer without tripping that flag — a
+ * rolled-back CNTVOFF, an expiry racing excursion entry before the gates are
+ * visible to the iothread, a timer reprogrammed from a path with no spec gate
+ * — was silently missed.  gt_recalc_timer is idempotent on an already
+ * consistent timer, so the only cost of dropping the gate is the recompute
+ * itself; correctness no longer depends on having enumerated every way a
+ * timer can drift.
+ *
+ * Called after spec mode has ended, so gt_recalc_timer's own spec gate is
+ * open, and with the BQL held (it drives the timer IRQ line).
+ */
+void arm_cpu_plugin_resync_timers(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    bool held;
+
+    held = bql_locked();
+    if (!held) {
+        bql_lock();
+    }
+    for (int i = 0; i < NUM_GTIMERS; i++) {
+        if (cpu->gt_timer[i]) {
+            gt_recalc_timer(cpu, i);
+        }
+    }
+    if (!held) {
+        bql_unlock();
+    }
+}
+#endif
 
 static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     /*
@@ -3906,13 +4031,40 @@ static uint64_t pmsav7_read(CPUARMState *env, const ARMCPRegInfo *ri)
     return *u32p;
 }
 
+/*
+ * Wrong-path (plugin speculative execution): the MPU and SAU register files
+ * are not rollback-eligible, so a discarded path must not write them.
+ *
+ * The plugin's speculative snapshot copies CPUArchState[0 ..
+ * end_reset_fields) -- that is what cpu_plugin_arch_state_size() returns --
+ * and every PMSAv7/PMSAv8/SAU field sits past that marker, most of them in
+ * heap arrays the struct only holds a pointer to.  It cannot move: those
+ * pointers must survive a CPU reset, which is exactly what the marker
+ * delimits.  So a speculative MPU programming write is never undone, and a
+ * discarded path would permanently rewrite the guest's memory-protection
+ * configuration -- which the correct path then keeps, with a tlb_flush()
+ * already performed against it.  Drop the write instead; the same reasoning
+ * covers every writer in this family.
+ *
+ * The reads are deliberately left alone.  A wrong path is entitled to read
+ * architectural state and act on what it finds; only the escape matters.
+ */
+static bool arm_pmsa_write_discarded(CPUARMState *env)
+{
+#ifdef CONFIG_PLUGIN
+    return env_cpu(env)->plugin_spec_mode;
+#else
+    return false;
+#endif
+}
+
 static void pmsav7_write(CPUARMState *env, const ARMCPRegInfo *ri,
                          uint64_t value)
 {
     ARMCPU *cpu = env_archcpu(env);
     uint32_t *u32p = *(uint32_t **)raw_ptr(env, ri);
 
-    if (!u32p) {
+    if (!u32p || arm_pmsa_write_discarded(env)) {
         return;
     }
 
@@ -3924,6 +4076,11 @@ static void pmsav7_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                               uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
     uint32_t nrgs = cpu->pmsav7_dregion;
 
@@ -3940,6 +4097,11 @@ static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void prbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -3954,6 +4116,11 @@ static uint64_t prbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -3968,6 +4135,11 @@ static uint64_t prlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     /*
@@ -3984,6 +4156,11 @@ static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void hprbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -3998,6 +4175,11 @@ static uint64_t hprbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -4012,6 +4194,11 @@ static uint64_t hprlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprenr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     uint32_t n;
     uint32_t bit;
     ARMCPU *cpu = env_archcpu(env);
@@ -4048,6 +4235,11 @@ static uint64_t hprenr_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     /*
@@ -4064,6 +4256,11 @@ static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav8r_regn_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
     uint8_t index = (extract32(ri->opc0, 0, 1) << 4) |
                     (extract32(ri->crm, 0, 3) << 1) | extract32(ri->opc2, 2, 1);
@@ -4278,13 +4475,38 @@ static void vmsa_tcr_el12_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+    if (arm_spec_freeze_regime(env)) {
+        return;
+    }
     /* If the ASID changes (with a 64-bit write), we must flush the TLB.  */
     if (cpreg_field_is_64bit(ri) &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
         ARMCPU *cpu = env_archcpu(env);
         tlb_flush(CPU(cpu));
     }
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Address-space switch observation.  This writefn serves several
+     * TTBR banks and aliases (TTBR0/TTBR1_EL1, their AArch32 views, and
+     * the memdup'd TTBR0_EL12 redirect), so rather than decode which
+     * cpreg is being written, bracket the write with a compare of the
+     * one backing field arm_get_plugin_state reports — TTBR0_EL1, i.e.
+     * cp15.ttbr0_el[1] — and emit only when its value changed.  The
+     * event's pc slot carries the OLD value; the push itself stamps the
+     * just-committed NEW value as the event's asid (and is a no-op on
+     * the wrong path — additionally unreachable here through the
+     * spec-freeze gate above — or while the queue is disabled).
+     */
+    uint64_t old_ttbr0_el1 = env->cp15.ttbr0_el[1];
     raw_write(env, ri, value);
+    if (env->cp15.ttbr0_el[1] != old_ttbr0_el1) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old_ttbr0_el1,
+                            env_cpu(env)->plugin_fault_depth);
+    }
+#else
+    raw_write(env, ri, value);
+#endif
 }
 
 static void vmsa_tcr_ttbr_el2_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -10951,6 +11173,59 @@ void arm_cpu_do_interrupt(CPUState *cs)
     if (cs->exception_index == EXCP_SEMIHOST) {
         tcg_handle_semihosting(cs);
         return;
+    }
+#endif
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag asynchronous-interrupt entries so the tracer
+     * can exclude the handler (OS noise at emulator cadence) while keeping
+     * synchronous syscalls/faults.  Record the interrupted PC (where the
+     * exception return will resume) as the point at which the tracer resumes
+     * emission.  Placed after the PSCI/semihosting fast-returns (no real
+     * vector entry); skipped during wrong-path so a speculative path never
+     * sets it.
+     */
+    {
+        int idx = cs->exception_index;
+        bool is_async = (idx == EXCP_IRQ || idx == EXCP_FIQ ||
+                         idx == EXCP_VIRQ || idx == EXCP_VFIQ ||
+                         idx == EXCP_VSERR || idx == EXCP_NMI ||
+                         idx == EXCP_VINMI || idx == EXCP_VFNMI);
+        /* Instrument every delivery, including the ones the gates below
+         * discard, so "no window opened" and "no interrupt arrived" are
+         * distinguishable. */
+        cpu_plugin_async_probe(cs, is_async ? "IRQ" : "EXC", idx, is_async);
+        if (cs->plugin_spec_mode) {
+            /* wrong path: no window edges, no fault events */
+        } else if (is_async) {
+            /* Enter the async excursion; record the departure context
+             * (interrupted PC + thread pointer) so the exception return
+             * that lands back there, in the departed thread, ends it.
+             * Outermost edge only: the !plugin_in_async_int guard keeps a
+             * nested async interrupt from re-entering this block, so the
+             * departure context is stamped once per window and the
+             * ASYNC_ENTER event fires once per window. */
+            if (!cs->plugin_in_async_int) {
+                cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
+            }
+        } else if (idx != EXCP_SWI && idx != EXCP_HVC && idx != EXCP_SMC) {
+            /* Synchronous FAULT (data/prefetch abort, undef, alignment, …):
+             * the handler's exception return re-executes the faulting
+             * instruction, so the resume PC is the current (trapping) PC.
+             * Deliberate calls (SVC/HVC/SMC) advance past the instruction and
+             * are left to the normal branch-into-kernel representation.
+             * Report the entry; the tracer owns the resume-PC stack.
+             *
+             * Unconditionally (no plugin_in_async_int gate): a fault
+             * delivered inside an open async window is still a real fault
+             * whose exception return re-executes its instruction, so the
+             * push keeps the resume-PC stack exactly LIFO and the event
+             * stream complete.  The consumer decides per-mode what an
+             * in-window FAULT_ENTER means (see the x86 twin in
+             * seg_helper.c). */
+            cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
+        }
     }
 #endif
 

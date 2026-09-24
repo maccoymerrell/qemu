@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 #include "qemu/osdep.h"
+#include "exec/plugin-gen.h"
 #include "translate.h"
 #include "fpu_helper.h"
 
@@ -32,7 +33,14 @@ static inline int plus_2(DisasContext *s, int x)
 /* Include the auto-generated decoder.  */
 #include "decode-msa.c.inc"
 
-static const char msaregnames[][6] = {
+/*
+ * Room for the terminating NUL: the longest entry, "w31.d1", is six
+ * characters.  These strings become TCGTemp::name, which its consumers
+ * (tcg_dump_ops and the TCG IR log) read as C strings, so a table exactly as
+ * wide as its longest entry leaves every two-digit register name
+ * unterminated and sends those readers off the end of the array.
+ */
+static const char msaregnames[][7] = {
     "w0.d0",  "w0.d1",  "w1.d0",  "w1.d1",
     "w2.d0",  "w2.d1",  "w3.d0",  "w3.d1",
     "w4.d0",  "w4.d1",  "w5.d0",  "w5.d1",
@@ -234,6 +242,7 @@ static bool gen_msa_BxZ_V(DisasContext *ctx, int wt, int sa, TCGCond cond)
     tcg_gen_trunc_i64_tl(bcond, t0);
 
     ctx->btarget = ctx->base.pc_next + (sa << 2) + 4;
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
 
     ctx->hflags |= MIPS_HFLAG_BC;
     ctx->hflags |= MIPS_HFLAG_BDS32;
@@ -265,6 +274,7 @@ static bool gen_msa_BxZ(DisasContext *ctx, int df, int wt, int sa, bool if_not)
     gen_check_zero_element(bcond, df, wt, if_not ? TCG_COND_EQ : TCG_COND_NE);
 
     ctx->btarget = ctx->base.pc_next + (sa << 2) + 4;
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
     ctx->hflags |= MIPS_HFLAG_BC;
     ctx->hflags |= MIPS_HFLAG_BDS32;
 

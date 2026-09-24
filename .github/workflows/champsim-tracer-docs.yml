@@ -1,0 +1,72 @@
+# Build the champsim_tracer Sphinx docs and deploy to GitHub Pages.
+#
+# Triggered on pushes to champsim-trace that touch the docs source or
+# the basic-block markdown next to the plugin.
+#
+# REQUIRED REPO SETTING: Settings -> Pages -> "Build and deployment"
+#                        -> "Source: GitHub Actions"
+#
+# If Pages is set to "Deploy from a branch", the upload-pages-artifact
+# / deploy-pages flow is silently ignored and the site instead serves
+# whatever is at the configured branch path (typically /docs at the
+# repo root, i.e. QEMU's own root docs/ directory — not this plugin's
+# contrib/plugins/champsim_tracer/docs/_build/html output).
+
+name: champsim_tracer docs
+
+on:
+  push:
+    branches: [champsim-trace]
+    paths:
+      - 'contrib/plugins/champsim_tracer/docs/**'
+      - 'contrib/plugins/champsim_tracer/basic_block.md'
+      - '.github/workflows/champsim-tracer-docs.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: champsim-tracer-docs
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Sphinx
+        run: pip install sphinx furo myst-parser
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build HTML
+        run: make -C contrib/plugins/champsim_tracer/docs html
+
+      # PDF builds are supported (`make latexpdf` locally — see
+      # docs/quickstart.rst) but deliberately not wired into CI: the
+      # texlive install adds several minutes per workflow run and
+      # the offline-portable PDF only matters to a small fraction of
+      # readers.  Run `make pdf` locally if you need it.
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: contrib/plugins/champsim_tracer/docs/_build/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -27,6 +27,7 @@
 #include "exec/vaddr.h"
 #include "exec/memattrs.h"
 #include "exec/mmu-access-type.h"
+#include "exec/plugin-spec.h"
 #include "exec/tlb-common.h"
 #include "qapi/qapi-types-machine.h"
 #include "qapi/qapi-types-run-state.h"
@@ -278,6 +279,16 @@ typedef struct CPUTLBDesc {
      */
     vaddr large_page_addr;
     vaddr large_page_mask;
+#ifdef CONFIG_PLUGIN
+    /*
+     * The pair above, saved at wrong-path excursion entry and put back at
+     * exit -- see cpu_plugin_spec_tlb_note(), which also records why these
+     * moved here from file-scope arrays.  Per-mmu_idx AND per-vCPU because
+     * that is what they shadow.
+     */
+    vaddr plugin_spec_lp_addr;
+    vaddr plugin_spec_lp_mask;
+#endif
     /* host time (in ns) at the beginning of the time window */
     int64_t window_begin_ns;
     /* maximum number of entries observed in the window */
@@ -311,6 +322,15 @@ typedef struct CPUTLBCommon {
     size_t full_flush_count;
     size_t part_flush_count;
     size_t elide_flush_count;
+#ifdef CONFIG_PLUGIN
+    /*
+     * True between cpu_plugin_spec_tlb_note() and
+     * cpu_plugin_spec_tlb_flush_logged() on THIS vCPU: the large-page region
+     * saved in CPUTLBDesc::plugin_spec_lp_* is valid and owed a restore.
+     * Protected by @lock, like the tables it guards.
+     */
+    bool plugin_spec_lp_saved;
+#endif
 } CPUTLBCommon;
 
 /*
@@ -459,6 +479,91 @@ struct qemu_work_item;
  * some common TCG CPU variables which are accessed with a negative offset
  * from cpu_env.
  */
+typedef enum QemuPluginCpuEventKind {
+    QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER  = 0,
+    QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN = 1,
+    QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER  = 2,
+    QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN = 3,
+    /*
+     * A committed architectural write that changed the address-space
+     * register the target's get_plugin_state hook reports (MIPS
+     * EntryHi.ASID, Arm TTBR0_EL1, RISC-V SATP, x86 CR3).  Field
+     * semantics FOR THIS KIND differ from the fault/async kinds:
+     * @asid is the NEW value just committed (the producer pushes after
+     * the commit, so the event-instant stamp reads it), @pc carries the
+     * OLD value it replaced (not a PC), @priv is the current privilege
+     * and @depth_after the live plugin_fault_depth.  Produced only in
+     * system-mode TUs, and only when the reported field's value
+     * actually changes under the same masking get_plugin_state applies
+     * (a MIPS EntryHi VPN-only write for TLB maintenance does not
+     * emit).  Values must stay aligned with the public
+     * qemu_plugin_cpu_event_kind enum: the drain passes kind through
+     * raw.
+     */
+    QEMU_PLUGIN_CPU_EVENT_ASID_WRITE   = 4,
+} QemuPluginCpuEventKind;
+
+typedef struct QemuPluginCpuEvent {
+    uint8_t  kind;          /* QemuPluginCpuEventKind */
+    uint8_t  priv;          /* privilege level at the event instant */
+    uint8_t  tp_ok;         /* @tp named the executing thread at the event
+                             * instant (user privilege, or the target's
+                             * tracks-current hook held in that state) */
+    uint32_t depth_after;   /* plugin_fault_depth after applying the event */
+    uint64_t pc;            /* resume PC (fault) / departure PC (async) */
+    uint64_t asid;          /* address-space id at the event instant */
+    uint64_t tp;            /* thread pointer at the event instant; for an
+                             * ASYNC_ENTER, the DELIVERING thread's (pushed
+                             * before any handler state switches) */
+} QemuPluginCpuEvent;
+
+/* The drain hands the buffer to plugins as struct qemu_plugin_cpu_event;
+ * the two layouts must stay identical (checked in plugins/api.c). */
+
+/*
+ * STRUCTURAL ceiling on the queue length -- not a cap, not a threshold, and
+ * nothing is ever dropped at it.  It is the value the length CANNOT reach
+ * while the consumer contract below holds, so exceeding it is a broken
+ * invariant and the producer says so loudly (cpu_plugin_evq_push).
+ *
+ * The consumer contract: the plugin registers a per-vCPU "queue non-empty"
+ * scoreboard slot (qemu_plugin_cpu_events_pending_slot) and a per-TB
+ * conditional callback on it, so EVERY translation block entry on that vCPU
+ * is a drain point.  Between two consecutive drain points the producers are:
+ *
+ *   - the guest instructions of the ONE translation block in flight, each of
+ *     which can commit at most one address-space-root write, and QEMU caps a
+ *     TB at TCG_MAX_INSNS (512) instructions;
+ *   - the exception edges that can be delivered without executing a TB in
+ *     between: a fault entry, a fault return, an async entry and an async
+ *     return.  A fault taken while delivering a fault nests, and that nesting
+ *     is architecturally bounded -- the target resets long before it could
+ *     exceed CPU_PLUGIN_FAULT_STACK_MAX (64) levels -- so at most
+ *     2 * CPU_PLUGIN_FAULT_STACK_MAX edges can pile up unexecuted.
+ *
+ * 512 + 2*64 = 640; 1024 is that rounded up to the allocator's doubling
+ * quantum, so the buffer reaches at most 1024 entries (32 KiB) per vCPU ONCE
+ * and never grows again, independently of how long the vCPU runs untraced.
+ */
+#define CPU_PLUGIN_EVQ_STRUCTURAL_MAX 1024
+
+typedef struct QemuPluginCpuEventQueue {
+    QemuPluginCpuEvent *buf;    /* grow-only; owned by the vCPU */
+    uint32_t len;
+    uint32_t cap;
+    bool enabled;
+    /*
+     * QUEUE-SIDE WITNESS.  Produced by the producer, upstream of every
+     * plugin attribution decision, so a plugin gate that refuses a context
+     * cannot suppress it.  max_len is the high-water length ever reached;
+     * n_push / n_drain count the two ends.  Reported through
+     * qemu_plugin_cpu_events_stats().
+     */
+    uint32_t max_len;
+    uint64_t n_push;
+    uint64_t n_drain;
+} QemuPluginCpuEventQueue;
+
 struct CPUState {
     /*< private >*/
     DeviceState parent_obj;
@@ -537,8 +642,332 @@ struct CPUState {
     /* Use by accel-block: CPU is executing an ioctl() */
     QemuLockCnt in_ioctl_lock;
 
+    /*
+     * True while this vCPU is executing a plugin-driven wrong-path
+     * (speculative) excursion.  Declared unconditionally, outside
+     * CONFIG_PLUGIN, because the target and accelerator side effects it
+     * suppresses are spread across ~20 translation units that read it from
+     * plain architectural code paths (IRQ-line raises, timer re-arms, FERR#
+     * assertion, TLB fills, ...).  Guarding each of those reads would put a
+     * preprocessor conditional in the middle of otherwise ordinary target
+     * logic; one always-present bool that is only ever set by the plugin
+     * layer keeps those sites readable and keeps --disable-plugins building.
+     * With CONFIG_PLUGIN undefined nothing can set it, so every such site
+     * folds to its normal behaviour.
+     */
+    bool plugin_spec_mode;
+
+    /*
+     * An excursion WP-dispatch cleared a pending kick
+     * (icount_decr.u16.high was nonzero at the clear).  Consumed by the
+     * edge-semantics re-arm at the excursion's true exit.
+     *
+     * Unconditional for the same reason as plugin_spec_mode above: both
+     * of its sites are in cpu-exec.c's ordinary system-mode dispatch,
+     * guarded by !CONFIG_USER_ONLY and not by CONFIG_PLUGIN, so with the
+     * member inside the plugin block a --disable-plugins system build did
+     * not compile at all.
+     */
+    bool plugin_spec_kick_deferred;
+
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
+
+    /*
+     * Architectural self-loop accounting for the fan-out instruction (an
+     * x86 REP-prefixed string operation) most recently executed on this
+     * vCPU.  Both fields are written by target-generated TCG from the
+     * instruction's own architectural state, never from how many
+     * instrumentation callbacks a translation happened to deliver:
+     *
+     *   plugin_rep_iters     iterations this execution completed, taken
+     *                        from the loop counter's own decrement
+     *                        (CX/ECX/RCX per the address size).  A fault
+     *                        inside an iteration leaves the count at the
+     *                        iterations that actually retired.
+     *   plugin_rep_complete  true when the repetition ended in this
+     *                        execution: the loop counter reached zero, or
+     *                        a REPZ/REPNZ flag condition broke it.  This is
+     *                        the instruction's architectural retirement.
+     *   plugin_rep_reenter   true when QEMU left this execution by jumping
+     *                        back to the instruction's own address rather
+     *                        than past it.  Unlike the two above this is an
+     *                        implementation fact, and it is the one that
+     *                        makes the artefact identifiable: a REP
+     *                        translated as a single iteration re-enters
+     *                        itself even after the iteration that retired
+     *                        it, so the next execution performs zero
+     *                        iterations and is the same instruction
+     *                        finishing rather than a new one.
+     *
+     * These exist because a REP is not always translated as a loop.
+     * do_gen_rep() emits exactly one iteration whenever CF_USE_ICOUNT,
+     * CF_SINGLE_STEP, EFLAGS.TF or the interrupt shadow is in effect, and
+     * a mid-instruction exception splits an already-looping REP the same
+     * way.  A count inferred from delivered memory-op callbacks therefore
+     * changes with the setting; these do not.  Read through
+     * qemu_plugin_rep_iterations() / qemu_plugin_rep_complete().
+     *
+     * plugin_rep_pc names the instruction the pair describes, so a consumer
+     * that reaches the accounting later than the execution it belongs to
+     * (a deferred or merged emission) can tell and fall back rather than
+     * attribute another instruction's count.  Targets with no fan-out
+     * instruction never write it, which is also how a consumer recognises
+     * that no architectural count is available at all.
+     *
+     * The name is an ADDRESS, and an address cannot say which PATH published
+     * the value beside it.  That distinction is kept where it can be kept:
+     * this whole block is saved and restored across a speculative excursion
+     * with the rest of the wrong path's rollback (qemu_plugin_cpu_state_save
+     * / _restore), so what a correct-path consumer reads was published by
+     * correct-path execution.  Without that the invariant is unavailable to
+     * any consumer at all -- an excursion is kicked from the end of the very
+     * block a fan-out instruction terminates, and a speculative re-entry of
+     * that same instruction republishes the same pc with a different count.
+     *
+     * plugin_rep_chunk qualifies plugin_rep_reenter: true when the re-enter
+     * happened at a canonical chunk boundary — the point where do_gen_rep's
+     * loop translation itself leaves the block every REP_MAX+1-and-change
+     * iterations (counter writeback of the form 65536*m + 1, m >= 1).  A
+     * loop translation only ever re-enters at such a boundary, so there the
+     * flag is a translation-time constant; a single-iteration translation
+     * computes it from the written-back counter.  It lets a consumer that
+     * counts instructions the way a per-TB-execution counter does (e.g. the
+     * bbv plugin feeding SimPoint) reproduce the canonical translation's
+     * TB-entry count from any translation: keep re-entries with the flag,
+     * discard re-entries without it.
+     */
+    uint64_t plugin_rep_iters;
+    uint64_t plugin_rep_pc;
+    bool plugin_rep_complete;
+    bool plugin_rep_reenter;
+    bool plugin_rep_chunk;
+
+    /*
+     * AArch64 FEAT_MOPS publishes through the same four fields — a
+     * translate-time store of the instruction's address into
+     * plugin_rep_pc plus the SET/CPY helpers' per-execution facts — but
+     * its fan-out unit is one memory access, not an architectural
+     * iteration, so plugin_rep_iters counts the accesses this execution
+     * reported (each derived from the helper's own byte progress; see
+     * arm_plugin_emit_pieces()).  plugin_rep_bytes is the architectural
+     * anchor for that count: the bytes this execution moved, accumulated
+     * from the step helpers' returns — the instruction's own
+     * size-register decrement — so a consumer can verify the delivered
+     * access stream against register-derived truth.  x86 REP leaves it 0.
+     *
+     * plugin_mops_report is the per-vCPU reporting-normalization
+     * accumulator the FEAT_MOPS byte fallbacks use (owned by
+     * target/arm/tcg/helper-a64.c; lazily allocated, vCPU lifetime).  It
+     * carries a pending partially-reported run across the cpu_loop_exit
+     * and fault splits of one bulk instruction, which is what keeps the
+     * reported decomposition identical however the execution was split.
+     */
+    uint64_t plugin_rep_bytes;
+    void *plugin_mops_report;
+
+    /* Wrong-path speculative execution state.  Sandbox is indexed by
+     * cache-line address (64-byte aligned) — an 8-byte store costs
+     * one hash op instead of eight, and a vector store within a line
+     * collapses to a memcpy + mask update.  Lines are bump-allocated
+     * from plugin_spec_store_pool so spec_mode_end can release
+     * entries by truncating the pool without per-line g_free traffic.
+     * Hash value type is the line's POOL INDEX + 1 (see
+     * spec_line_get_or_alloc: the pool moves when it grows, so a stored
+     * pointer would dangle; an index survives the realloc).
+     * plugin_spec_mode itself lives outside CONFIG_PLUGIN (see above). */
+    GHashTable *plugin_spec_store_buf;        /* line_addr -> pool idx + 1 */
+    void *plugin_spec_store_pool;             /* PluginSpecLine[] */
+    size_t plugin_spec_store_pool_used;       /* high water in pool */
+    size_t plugin_spec_store_pool_cap;        /* allocated slots */
+#ifdef CONFIG_PLUGIN
+    /*
+     * Discard target for a speculative atomic RMW that could not be given a
+     * sandbox line (the line pool is at PLUGIN_SPEC_STORE_LINE_MAX and this
+     * line is not already tracked).  The RMW needs somewhere real to operate
+     * — the host atomic primitives write through the pointer they are handed
+     * — and the one place it must never be is guest memory, so it is pointed
+     * at this scratch line instead and the result is dropped, which is how a
+     * capped speculative *store* already degrades.  Per-vCPU rather than
+     * thread-local: under round-robin TCG several vCPUs share one host
+     * thread, and a discard buffer that is shared across vCPUs is a fact a
+     * reader has to re-derive as harmless every time.  See
+     * spec_atomic_shadow() in accel/tcg/internal-common.h.
+     */
+    PluginSpecLine plugin_spec_atomic_scratch;
+#endif
+    /* Set when a single wrong-path excursion's speculative-store footprint
+     * crosses PLUGIN_SPEC_STORE_SOFT_BUDGET lines — a garbage-size memop the
+     * wrong path executed without faulting (it is buffered, not real).  The WP
+     * loop polls qemu_plugin_spec_store_overflowed() and terminates the
+     * excursion rather than filling the buffer to the hard cap and dropping
+     * stores.  Cleared per excursion in qemu_plugin_spec_mode_begin. */
+    bool plugin_spec_store_overflow;
+    struct qemu_plugin_cpu_state *plugin_spec_saved_state;
+    /*
+     * Set when a code-buffer overflow is detected DURING wrong-path
+     * (plugin_spec_mode) translation.  A real tb_flush there would reset the
+     * code buffer under the correct-path TB this wrong-path walk is nested
+     * inside, clobbering the host code we must return into.  Instead the
+     * overflow is deferred: the wrong-path walk ends cleanly at its current
+     * true-BB boundary and the flush is honored by cpu_exec_loop() at the
+     * next safe point, after the nested walk has fully unwound.
+     */
+    bool plugin_flush_pending;
+    /*
+     * Set while this vCPU is inside a plugin-driven TRANSLATE-ONLY
+     * translation (cpu_plugin_translate_tb): QEMU is asked to translate a
+     * block the guest has not reached, so the plugin's translation-time
+     * callbacks fire and state their facts, and nothing is executed.
+     *
+     * It exists for one reason: tb_gen_code's buffer-full arm.  A correct-path
+     * translation that cannot allocate a TB does tb_flush + cpu_loop_exit,
+     * i.e. a longjmp -- and this translation is driven from inside a plugin
+     * exec callback, so that unwind would abandon the callback frame with the
+     * plugin's own locks held.  A translate-only translation that cannot get a
+     * TB simply does not happen: tb_gen_code returns NULL and the caller
+     * declines.  Tested BEFORE plugin_spec_mode so a translate-only
+     * translation never opens the wrong path's spec reserve on its behalf.
+     *
+     * Deliberately NOT plugin_spec_mode: that flag also selects CF_FORCE_SLOW,
+     * which changes cflags, which changes the TB hash key -- the translation
+     * would then describe a block the executor will never produce.
+     */
+    bool plugin_decode_only;
+    /*
+     * Set while the guest virtual clock is paused for a wrong-path excursion
+     * (qemu_plugin_spec_vtime_pause/resume).  Keeps the pause idempotent and
+     * balanced across a fault-skip's spec_mode teardown/re-entry, so the
+     * excursion's host wall-clock time never leaks into the guest's
+     * architected counters.
+     */
+    bool plugin_spec_vtime_paused;
+    /*
+     * Nesting depth of qemu_plugin_vclock_pause/resume: freezes the guest
+     * virtual clock while a plugin runs instrumentation work on the vCPU
+     * thread (translation-time decoding, per-TB trace emission).  That work
+     * is outside guest execution, so its host wall-clock cost must not be
+     * charged to guest time: if one guest timer-tick handler's instrumented
+     * cost exceeds the tick period, the next tick is already pending when
+     * the handler returns and the guest collapses into a self-sustaining
+     * tick/scheduler storm (RCU stall, zero foreground progress).  Composes
+     * with plugin_spec_vtime_paused: ticks re-enable only when BOTH say so.
+     */
+    int plugin_vclock_depth;
+    /*
+     * Asynchronous-interrupt exclusion for system-mode tracing.  The target's
+     * exception-delivery path sets plugin_in_async_int=true on an ASYNCHRONOUS
+     * interrupt entry (timer/device IRQ/FIQ/SError), recording the interrupted
+     * guest PC (the departure point, where the handler's exception return will
+     * resume) in plugin_async_departure_pc.  The exception-return path clears
+     * the flag when it returns to exactly that PC — robust to the scheduler
+     * context-switching away and to nesting (the outermost departure PC is
+     * kept).  A tracer reads the flag (qemu_plugin_in_async_int) to drop the
+     * async handler — non-representative OS noise — while keeping synchronous
+     * syscalls/faults.  Set only on the correct path (never wrong-path).
+     *
+     * The departure CONTEXT is recorded alongside the departure PC: the
+     * guest thread-pointer register (TCGCPUOps::get_plugin_thread_ptr — the
+     * same register a tracer derives guest-thread identity from).  The
+     * return check compares it at the departure-PC re-fetch, because under
+     * SMP a PEER thread executing the same VA must not close another
+     * thread's window: a genuine resume restores the departed thread's
+     * whole context (the thread pointer included) before landing on the
+     * departure PC, so equality is exact there, while a peer at the same VA
+     * carries its own thread pointer and is skipped.  Targets without the
+     * hook record 0 and the check degrades to the bare PC equality.
+     *
+     * The departure ADDRESS SPACE (TCGCPUOps::get_plugin_state's asid) is
+     * recorded and compared the same way: the thread pointer alone cannot
+     * separate two processes whose threads both read the same tp (no-TLS
+     * static twins reading a fixed value), and two such twins running the
+     * same image at the same vaddrs collide on (pc, tp) exactly — witnessed
+     * live on the multiproc_r4_concurrent cell (dep_tp == cur_tp with
+     * different roots).  The address-space root is context-switched state
+     * the kernel restores before the exception return, so a genuine resume
+     * compares equal exactly as the thread pointer does.  Without the hook
+     * both sides read 0 and the check degrades as before.
+     */
+    bool plugin_in_async_int;
+    uint64_t plugin_async_departure_pc;
+    uint64_t plugin_async_departure_tp;
+    uint64_t plugin_async_departure_asid;
+    /*
+     * Synchronous-fault excursion reporting for system-mode tracing.  Unlike
+     * the async path above, sync faults are KEPT (the handler is real,
+     * workload-induced kernel code), but the tracer needs to know (a) that a
+     * fault detoured execution and (b) how deeply nested it is, so it can emit
+     * the handler as first-class code at a nesting depth and resume the
+     * faulting BB as a whole block afterwards.
+     *
+     * QEMU owns the resume-PC stack directly (cpu_plugin_fault_push/pop), which
+     * it can maintain ACCURATELY because it observes every entry and every
+     * exception-return synchronously and in strict LIFO order.
+     *
+     * cpu_plugin_fault_push (each target's do_interrupt, for a RE-EXECUTING
+     * fault only -- TLB/coprocessor-lazy-enable, NOT syscall/advance-past)
+     * pushes the resume PC (the faulting instruction, where the handler's
+     * exception-return lands) and bumps plugin_fault_depth.
+     * cpu_plugin_fault_pop (each target's exception-return path) pops the top
+     * IFF the return target equals it -- so syscall/async returns, which never
+     * pushed, don't disturb the stack.  Both are no-ops on the wrong path
+     * (plugin_spec_mode).  Each push/pop also appends an ordered
+     * FAULT_ENTER/FAULT_RETURN event to the queue below — the channel a
+     * plugin consumes the transitions through; plugin_fault_depth is the
+     * authoritative live nesting depth (qemu_plugin_fault_depth()).
+     */
+#define CPU_PLUGIN_FAULT_STACK_MAX 64
+    uint64_t plugin_fault_stack[CPU_PLUGIN_FAULT_STACK_MAX];
+    uint32_t plugin_fault_depth;      /* == number of live pushed faults */
+    /*
+     * Ordered per-vCPU path-event queue.  Delivers path causality as
+     * ORDERED EVENTS: each fault entry/return and async-window edge is
+     * appended at its chokepoint, with (asid, priv) stamped at the event
+     * instant.  Single producer and single consumer — the owning vCPU
+     * thread — so no locking; grow-only, never drops; spec-mode-suppressed
+     * at source like everything else here.  Disabled (and empty) unless a
+     * plugin opts in via qemu_plugin_cpu_events_set().
+     */
+    QemuPluginCpuEventQueue plugin_evq;
+    /*
+     * Wrong-path TLB-install log.  Speculative (wrong-path) accesses can
+     * install softmmu TLB entries on a miss.  Rather than a full tlb_flush()
+     * on every excursion exit — which drops the ENTIRE correct-path TLB plus
+     * the jump cache, ruinously expensive given how often WP runs — we record
+     * the pages an excursion installed (in tlb_set_page_full) and invalidate
+     * only those on exit.  When WP merely HITS existing entries (the common
+     * case) the log stays empty and no flush happens at all.  mmu_idx encodes
+     * the translation regime, so recording the actual install mmu_idx also
+     * covers the wrong-path-changed-EL (eret) concern.  A large-page install or
+     * log overflow falls back to a full flush.
+     */
+#define CPU_SPEC_TLB_LOG_MAX 64
+    struct {
+        vaddr page;
+        uint16_t mmu_idx;
+    } plugin_spec_tlb_log[CPU_SPEC_TLB_LOG_MAX];
+    uint16_t plugin_spec_tlb_log_n;
+    bool plugin_spec_tlb_log_overflow;
+    /*
+     * Wrong-path speculative absent-page sentinel (softmmu).  A speculative
+     * access to a genuinely-absent page must neither raise a guest fault nor
+     * demand-page, but it also must NOT truncate the excursion: on a
+     * mispredicted path no instruction retires, so a back-end memory fault is
+     * never taken by a real core.  tlb_fill_align sets this instead of
+     * longjmping; the immediate caller (mmu_lookup1 / atomic_mmu_lookup)
+     * consumes and clears it, substituting a deterministic placeholder value
+     * (plugin_spec_garbage_fill) and continuing.  Transient — never observed
+     * across a memory-op boundary.
+     */
+    bool plugin_spec_absent;
+    /*
+     * Set by the garbage-filling wrong-path load/store path (user-exec twin and
+     * softmmu) for the current speculative access when it landed on an
+     * absent/unreadable page and read a synthetic placeholder.  The plugin's
+     * memory callback reads and clears it (qemu_plugin_spec_mem_faulted_take)
+     * to tag that memop as a synthetic-data fault in the wrong-path trace.
+     */
+    bool plugin_spec_mem_faulted;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */
@@ -579,6 +1008,74 @@ struct CPUState {
 /* Validate placement of CPUNegativeOffsetState. */
 QEMU_BUILD_BUG_ON(offsetof(CPUState, neg) !=
                   sizeof(CPUState) - sizeof(CPUNegativeOffsetState));
+
+#ifdef CONFIG_PLUGIN
+/*
+ * System-mode synchronous-fault excursion stack (see the plugin_fault_* fields
+ * above).  Each target's do_interrupt calls _push for a RE-EXECUTING fault
+ * (the handler's ERET lands back on @resume_pc); each target's exception-return
+ * path calls _pop with the ERET target.  QEMU maintaining this synchronously
+ * is what makes the tracer's fault depth exact under dense nested faults.
+ */
+/* Append one path event to @cpu's plugin event queue (no-op while the
+ * queue is disabled or on the wrong path).  Defined in plugins/core.c,
+ * where the per-target get_plugin_state hook is reachable for stamping
+ * (asid, priv) at the event instant. */
+void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
+                         uint32_t depth_after);
+
+/* Open an asynchronous-interrupt window: set plugin_in_async_int, record
+ * the departure context (@departure_pc = where the handler's exception
+ * return resumes, plus the thread-pointer register naming the departing
+ * thread) and append the ordered ASYNC_ENTER event.  Callers gate on the
+ * edge (!plugin_in_async_int) and on the correct path (!plugin_spec_mode);
+ * defined in plugins/core.c, where the per-target hooks are reachable. */
+void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc);
+
+/* Condition instrument (CST_ASYNCPROD_DIAG), called by each target's
+ * do_interrupt for EVERY delivery it classifies, before the correct-path /
+ * outermost-edge gates: reports which vCPU received which exception in what
+ * state (spec mode, an async window already open, event queue enabled), so a
+ * window that never opens can be told apart from one that opens and is never
+ * consumed.  A no-op unless the variable is set; never changes behaviour. */
+void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
+                            bool is_async);
+
+static inline void cpu_plugin_fault_push(CPUState *cpu, uint64_t resume_pc)
+{
+    if (cpu->plugin_spec_mode) {
+        return;   /* wrong-path faults must not perturb the real stack */
+    }
+    if (cpu->plugin_fault_depth < CPU_PLUGIN_FAULT_STACK_MAX) {
+        cpu->plugin_fault_stack[cpu->plugin_fault_depth] = resume_pc;
+    }
+    cpu->plugin_fault_depth++;   /* saturating read is fine; depth caps effect */
+    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER, resume_pc,
+                        cpu->plugin_fault_depth);
+}
+
+static inline void cpu_plugin_fault_pop(CPUState *cpu, uint64_t target_pc)
+{
+    if (cpu->plugin_spec_mode || cpu->plugin_fault_depth == 0) {
+        return;
+    }
+    /*
+     * Pop only when this exception-return lands on the top frame's resume PC.
+     * A syscall/async return (which never pushed) targets somewhere else, so it
+     * leaves the fault stack untouched.  Every pushed fault re-executes its
+     * faulting instruction, so its ERET target always equals the pushed PC --
+     * the match is exact, not heuristic.
+     */
+    uint32_t top = cpu->plugin_fault_depth - 1;
+    if (top < CPU_PLUGIN_FAULT_STACK_MAX &&
+        cpu->plugin_fault_stack[top] != target_pc) {
+        return;
+    }
+    cpu->plugin_fault_depth--;
+    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN, target_pc,
+                        cpu->plugin_fault_depth);
+}
+#endif /* CONFIG_PLUGIN */
 
 static inline CPUArchState *cpu_env(CPUState *cpu)
 {

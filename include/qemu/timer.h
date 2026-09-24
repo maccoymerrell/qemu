@@ -89,6 +89,26 @@ struct QEMUTimer {
     QEMUTimer *next;
     int attributes;
     int scale;
+    /*
+     * Bookkeeping for timerlist_run_timers()'s no-progress bound, written
+     * only by that function under the list lock.  @last_run_pass is the
+     * run_pass generation this timer's callback last ran in and
+     * @last_run_expire is the deadline it ran FOR, so a timer that comes
+     * back round inside the same pass can be asked whether its new deadline
+     * moved forward.  See the bound in timerlist_run_timers().
+     */
+    uint64_t last_run_pass;
+    int64_t last_run_expire;
+    /*
+     * The callback that was running on the arming thread when this timer was
+     * last armed, or NULL if it was armed from outside any timer callback.
+     * The no-progress report needs the device that DID the arming, and that
+     * is not deducible from the run loop: the loop only notices an armed
+     * timer once it reaches the head of the list, by which point any number
+     * of unrelated timers due in the same pass have been popped in between.
+     * Written under the list lock in timer_mod_ns_locked().
+     */
+    QEMUTimerCB *armed_by;
 };
 
 extern QEMUTimerListGroup main_loop_tlg;
@@ -213,6 +233,54 @@ void qemu_clock_notify(QEMUClockType type);
  * Caller should hold BQL.
  */
 void qemu_clock_enable(QEMUClockType type, bool enabled);
+
+/**
+ * qemu_clock_plugin_stall_set:
+ * @on: true to stall guest-visible virtual-clock processing, false to resume
+ *
+ * While the stall is held, QEMU_CLOCK_VIRTUAL is not merely fixed in value:
+ * it is not EVALUATED.  No deadline derived from it is reported, no timer
+ * registered on it is found expired, and no callback registered on it is
+ * entered.  Armed timers stay armed, in their existing order, with their
+ * existing expire_time; nothing is popped, deferred or recorded.  They are
+ * evaluated exactly once after the release, against the same clock value
+ * they were armed against -- which is the same value, because the caller
+ * that holds the stall is also the one that stopped the clock.
+ *
+ * The other three clock types are untouched.  QEMU_CLOCK_REALTIME,
+ * QEMU_CLOCK_HOST and QEMU_CLOCK_VIRTUAL_RT are not guest-visible time, and
+ * the monitor, the block layer and the management plane run on them.
+ *
+ * NOT a refcount and deliberately so: the caller counts, this switch obeys.
+ * Its one caller is cpu_plugin_spec_ticks_freeze()/_thaw() in
+ * system/cpu-timers.c, which drives it from the 0<->1 transitions of the
+ * machine-wide count of outstanding SPECULATIVE freezes and is the single
+ * authority.
+ *
+ * That count is not the same as the count of outstanding clock-VALUE freezes
+ * beside it, and the difference is the point.  A plugin also freezes the
+ * clock's value around a correct-path instrumentation callback, once per
+ * translation block, and there the guest is between two of its own
+ * instructions: every guest-time event still has a legal position and only
+ * the callback's host cost must be kept out of the clock, so the value
+ * freeze alone is the whole requirement.  Only a speculative window --
+ * execution the guest never performed, with no instruction stream to place
+ * an event in -- needs the clock to stop being evaluated as well.  Riding
+ * this switch on the value count instead was measured: the guest's timer
+ * processing was suspended for most of the run rather than for the
+ * excursions, and the x86 system marker cell went from 0 stalled cells in 12
+ * to 5, with a stall cluster that had not existed before.
+ *
+ * NOT implemented as qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which has
+ * exactly the right read side and the wrong wait side: it blocks on every
+ * attached timerlist's timers_done_ev, so a vCPU taking it under the BQL
+ * waits for an iothread timerlist pass whose callback may want the BQL.
+ * This stops the NEXT callback rather than draining the current one, and
+ * never waits for anything.
+ *
+ * Caller holds the BQL.  Read without it from iothread timerlists.
+ */
+void qemu_clock_plugin_stall_set(bool on);
 
 /**
  * qemu_clock_run_timers:

@@ -1218,6 +1218,12 @@ static void gen_compute_branch_nm(DisasContext *ctx, uint32_t opc,
     }
 
     ctx->btarget = btgt;
+    /* See gen_compute_branch in translate.c: btgt stays at its -1
+     * sentinel for indirect branches; only forward real static
+     * targets to plugins. */
+    if (btgt != (target_ulong)-1) {
+        plugin_gen_record_branch_target((uint64_t)btgt);
+    }
 
  out:
     if (insn_bytes == 2) {
@@ -2291,6 +2297,7 @@ static void gen_compute_imm_branch(DisasContext *ctx, uint32_t opc,
 
     gen_load_gpr(t0, rt);
     ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
 
     /* Load needed operands and calculate btarget */
     switch (opc) {
@@ -2426,6 +2433,7 @@ static void gen_compute_compact_branch_nm(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BGEUC:
     case OPC_BLTUC:
@@ -2438,9 +2446,11 @@ static void gen_compute_compact_branch_nm(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BC:
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BEQZC:
         if (rs != 0) {
@@ -2448,6 +2458,7 @@ static void gen_compute_compact_branch_nm(DisasContext *ctx, uint32_t opc,
             gen_load_gpr(t0, rs);
             bcond_compute = 1;
             ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+            plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         } else {
             /* OPC_JIC, OPC_JIALC */
             TCGv tbase = tcg_temp_new();
@@ -2578,6 +2589,7 @@ static void gen_compute_branch_cp1_nm(DisasContext *ctx, uint32_t op,
     tcg_gen_trunc_i64_tl(bcond, t0);
 
     ctx->btarget = btarget;
+    plugin_gen_record_branch_target((uint64_t)btarget);
 }
 
 

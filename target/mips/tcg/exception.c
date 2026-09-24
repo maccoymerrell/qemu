@@ -69,6 +69,20 @@ void helper_wait(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU or clear its wake request; abort the
+     * speculative walk (caught by cpu_plugin_exec_tb's guard). */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
+#if !defined(CONFIG_USER_ONLY)
+    /* The only architecturally legitimate self-halt; see target/mips/cp0.c. */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(cs, MIPS_MVP_SLEEP_WAIT);
+    }
+#endif
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
     /*

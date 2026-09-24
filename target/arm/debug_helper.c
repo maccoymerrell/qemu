@@ -548,6 +548,20 @@ void hw_watchpoint_update(ARMCPU *cpu, int n)
 {
     CPUARMState *env = &cpu->env;
     vaddr len = 0;
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) execution: the dbgwvr/dbgwcr cp15 fields have
+     * already been raw_write()'d by the caller and live inside the rolled-back
+     * snapshot.  The host QEMU watchpoint objects (CPUState->watchpoints) and
+     * the tlb_flush triggered by cpu_watchpoint_insert/remove are NOT part of
+     * that snapshot, so mutating them here would leak speculative state past
+     * the excursion.  Skip the host-side update; register reads stay consistent
+     * because the cp15 field write is preserved.
+     */
+    if (CPU(cpu)->plugin_spec_mode) {
+        return;
+    }
+#endif
     vaddr wvr = env->cp15.dbgwvr[n];
     uint64_t wcr = env->cp15.dbgwcr[n];
     int mask;
@@ -653,6 +667,20 @@ void hw_watchpoint_update_all(ARMCPU *cpu)
 void hw_breakpoint_update(ARMCPU *cpu, int n)
 {
     CPUARMState *env = &cpu->env;
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) execution: the dbgbvr/dbgbcr cp15 fields have
+     * already been raw_write()'d by the caller and live inside the rolled-back
+     * snapshot.  The host QEMU breakpoint objects (CPUState->breakpoints) and
+     * the tlb_flush triggered by cpu_breakpoint_insert/remove are NOT part of
+     * that snapshot, so mutating them here would leak speculative state past
+     * the excursion.  Skip the host-side update; register reads stay consistent
+     * because the cp15 field write is preserved.
+     */
+    if (CPU(cpu)->plugin_spec_mode) {
+        return;
+    }
+#endif
     uint64_t bvr = env->cp15.dbgbvr[n];
     uint64_t bcr = env->cp15.dbgbcr[n];
     vaddr addr;

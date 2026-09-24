@@ -222,6 +222,14 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
                        desc->path, version, QEMU_PLUGIN_VERSION);
             goto err_symbol;
         }
+        /*
+         * Keep the number.  The range check above admits everything from
+         * QEMU_PLUGIN_MIN_VERSION up, so an entry point whose signature
+         * changed since the plugin was built is reached with no complaint
+         * unless someone can still ask what the plugin was built against.
+         */
+        ctx->version = version;
+        plugin_note_declared_version(version);
     }
 
     qemu_rec_mutex_lock(&plugin.lock);
@@ -245,6 +253,11 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     ctx->installing = true;
     rc = install(ctx->id, info, desc->argc, desc->argv);
     ctx->installing = false;
+    if (rc == 0) {
+        /* PLUGIN-ACTIVE edge: a plugin is now loaded/instrumenting
+         * (event-agency discipline; idempotent, system-mode decides) */
+        qemu_plugin_vclock_agency_mode(true);
+    }
     if (rc) {
         error_setg(errp, "Could not load plugin %s: qemu_plugin_install returned error code %d",
                    desc->path, rc);
@@ -355,6 +368,11 @@ static void plugin_reset_destroy__locked(struct qemu_plugin_reset_data *data)
     success = g_hash_table_remove(plugin.id_ht, &ctx->id);
     g_assert(success);
     QTAILQ_REMOVE(&plugin.ctxs, ctx, entry);
+    if (QTAILQ_EMPTY(&plugin.ctxs)) {
+        /* PLUGIN-ACTIVE edge: the last plugin is gone -- restore stock
+         * VIRTUAL consumption (event-agency discipline) */
+        qemu_plugin_vclock_agency_mode(false);
+    }
     if (data->cb) {
         data->cb(ctx->id);
     }

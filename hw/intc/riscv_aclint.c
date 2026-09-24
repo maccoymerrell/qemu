@@ -69,6 +69,18 @@ static void riscv_aclint_mtimer_write_timecmp(RISCVAclintMTimerState *mtimer,
     /* Compute the relative hartid w.r.t the socket */
     hartid = hartid - mtimer->hartid_base;
 
+#ifdef CONFIG_PLUGIN
+    if (getenv("CST_TIMER_DIAG")) {
+        CPUState *cs = cpu_by_arch_id(mtimer->hartid_base + hartid);
+        fprintf(stderr, "[mtimer] WTC hart=%u timecmp=0x%llx rtc=0x%llx "
+                "spec=%d vtp=%d -> %s\n",
+                mtimer->hartid_base + hartid,
+                (unsigned long long)value, (unsigned long long)rtc,
+                cs ? (int)cs->plugin_spec_mode : -1,
+                cs ? (int)cs->plugin_spec_vtime_paused : -1,
+                value <= rtc ? "RAISE-now" : "CLEAR+arm");
+    }
+#endif
     mtimer->timecmp[hartid] = value;
     if (mtimer->timecmp[hartid] <= rtc) {
         /*
@@ -117,8 +129,52 @@ static void riscv_aclint_mtimer_cb(void *opaque)
 {
     riscv_aclint_mtimer_callback *state = opaque;
 
+#ifdef CONFIG_PLUGIN
+    CPUState *cs = cpu_by_arch_id(state->s->hartid_base + state->num);
+
+    if (getenv("CST_TIMER_DIAG")) {
+        fprintf(stderr, "[mtimer] FIRE hart=%u spec=%d vtp=%d timecmp=0x%llx\n",
+                state->s->hartid_base + state->num,
+                cs ? (int)cs->plugin_spec_mode : -1,
+                cs ? (int)cs->plugin_spec_vtime_paused : -1,
+                (unsigned long long)state->s->timecmp[state->num]);
+    }
+#endif
     qemu_irq_raise(state->s->timer_irqs[state->num]);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path excursion-exit reconcile (#77): recompute @hartid's MTIP level
+ * and host QEMUTimer deadline from the architected mtimecmp.  Reuses the
+ * normal mtimecmp-write path, so there is no separate deadline logic: an
+ * expiry deferred by the excursion gate in riscv_aclint_mtimer_cb (the
+ * one-shot host timer has already fired and will not re-arm itself) — or one
+ * whose mip.MTIP raise the excursion's register restore erased — takes the
+ * "timecmp <= rtc" branch and raises MTIP now; a still-future deadline
+ * re-arms the QEMUTimer.  Idempotent, so running it on an excursion that
+ * disturbed nothing is safe.
+ * Called from riscv_cpu_plugin_resync_timers with spec mode ended (driving
+ * the IRQ line is safe) and the BQL held.
+ */
+void riscv_aclint_mtimer_plugin_resync(RISCVAclintMTimerState *mtimer,
+                                       uint32_t hartid)
+{
+    CPUState *cpu;
+
+    if (hartid < mtimer->hartid_base ||
+        hartid >= mtimer->hartid_base + mtimer->num_harts) {
+        return;
+    }
+    cpu = cpu_by_arch_id(hartid);
+    if (!cpu) {
+        return;
+    }
+    riscv_aclint_mtimer_write_timecmp(mtimer, RISCV_CPU(cpu), hartid,
+                                      mtimer->timecmp[hartid -
+                                                      mtimer->hartid_base]);
+}
+#endif
 
 /* CPU read MTIMER register */
 static uint64_t riscv_aclint_mtimer_read(void *opaque, hwaddr addr,

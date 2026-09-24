@@ -2707,6 +2707,14 @@ static void qemu_init_board(void)
     /* process plugin before CPUs are created, but once -smp has been parsed */
     qemu_plugin_load_list(&plugin_list, &error_fatal);
 
+    /*
+     * Now that the plugin set is known and before any device realizes, decide
+     * whether the RTC has to move onto the clock a plugin freeze stops.  Both
+     * halves of that ordering are load-bearing: earlier and no plugin is
+     * loaded yet, later and the board's RTC has already captured rtc_clock.
+     */
+    rtc_adopt_vm_clock_for_plugin();
+
     /* From here on we enter MACHINE_PHASE_INITIALIZED.  */
     machine_run_board_init(current_machine, mem_path, &error_fatal);
 

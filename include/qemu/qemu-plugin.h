@@ -65,11 +65,217 @@ typedef uint64_t qemu_plugin_id_t;
  *
  * version 4:
  * - added qemu_plugin_read_memory_vaddr
+ *
+ * version 5:
+ * - added qemu_plugin_write_register
+ * - added qemu_plugin_cpu_state_save, qemu_plugin_cpu_state_restore,
+ *   qemu_plugin_cpu_state_free (CPU state snapshot/rollback)
+ * - added qemu_plugin_set_pc, qemu_plugin_get_pc (program counter access)
+ * - added qemu_plugin_exec_inline_insn (execute one instruction)
+ * - added qemu_plugin_spec_mode_begin, qemu_plugin_spec_mode_end
+ *   (speculative-execution window: guest stores land in a sandbox and
+ *   are discarded at the end of the window).  Added inside this version
+ *   without a history entry; the signature it first shipped with is not
+ *   the one below — see version 6.
+ *
+ * version 6:
+ * - INCOMPATIBLE: qemu_plugin_spec_mode_begin() gained @saved_state
+ *   while the version constant still read 5, so 5 names both the
+ *   no-argument and the one-argument spelling and cannot be honoured
+ *   either way; 6 is the first version that distinguishes them, and
+ *   qemu_plugin_spec_mode_begin() refuses the run when any loaded
+ *   plugin declares less.  A caller built before the change passes
+ *   nothing, and the state qemu_plugin_spec_mode_end() later restores
+ *   the vCPU from would be whatever the first argument register held.
+ *   Rebuild the plugin against this header.
+ *
+ * version 7:
+ * - added qemu_plugin_insn_branch_target_pc (the translator-resolved
+ *   static control-transfer target of a branch instruction)
+ *
+ * version 8:
+ * - added qemu_plugin_request_tb_flush (drop the TB cache from a
+ *   plugin so a state change that gates translation-time
+ *   instrumentation can take effect on every subsequent TB)
+ *
+ * version 9:
+ * - added qemu_plugin_register_asid_write_cb (synchronous notification
+ *   at the architectural address-space-register commit points; fires
+ *   even while the per-vCPU path-event queue is disabled)
+ *
+ * version 10:
+ * - added qemu_plugin_get_thread_ptr (the kernel-maintained per-thread
+ *   pointer register; guest-thread identity independent of the vCPU a
+ *   thread happens to be scheduled on)
+ *
+ * version 11:
+ * - added qemu_plugin_vaddr_is_kernel (classify a code virtual address's
+ *   privilege domain via the target's own MMU / segment logic; a
+ *   speculation-proof kernel-vs-user split with no page-table walk)
+ *
+ * version 12:
+ * - added qemu_plugin_register_devio_cb (block-device I/O issue/complete
+ *   notifications from the block backend, for disk-request wire records).
+ *   As added, the registration took a start and a stop callback only,
+ *   and attribution was positional: a record was charged to the next
+ *   body entry.  The doorbell hook went in later, inside this version —
+ *   see version 13.
+ *
+ * version 13:
+ * - added qemu_plugin_thread_ptr_tracks_current (whether the target's
+ *   thread-pointer register still names the executing software thread
+ *   when sampled inside the kernel, so a guest task switch that happens
+ *   entirely in kernel code can be followed).
+ * - INCOMPATIBLE: qemu_plugin_register_devio_cb() gained @doorbell_cb —
+ *   the guest's virtqueue notify (kick) executes in vCPU context, so the
+ *   block backend's later (main-loop) issue notification is correlated
+ *   back to the issuing vCPU through a device token, replacing the
+ *   positional guess — and qemu_plugin_devio_start_cb_t gained
+ *   @dev_token.  Both went in while the version constant still read 12,
+ *   so 12 names two incompatible spellings and cannot be honoured
+ *   either way; 13 is the first version that distinguishes them, and
+ *   qemu_plugin_register_devio_cb() refuses a plugin declaring less.
+ *   @doorbell_cb was INSERTED, not appended: a version-12 caller's
+ *   start callback would land in the doorbell slot, its stop callback
+ *   in the start slot, and the stop slot would be filled from an
+ *   argument register that caller never wrote.  Rebuild the plugin
+ *   against this header.
+ *
+ * version 14:
+ * - struct qemu_plugin_cpu_event gained @tp/@tp_ok: the thread pointer
+ *   sampled at the event instant, so an ASYNC_ENTER names the thread the
+ *   interrupt was DELIVERED in even when that context is gone (or was
+ *   never otherwise observable) by the time the event is drained.
+ * - qemu_plugin_thread_ptr_tracks_current() became a property of the
+ *   sampling context rather than of the target: RISC-V now reports the
+ *   kernel's current-task pointer (sscratch/tp per the S-mode trap-entry
+ *   swap) and answers true at U/S privilege, false in M-mode firmware
+ *   and under H-extension virtualization.
+ *
+ * version 15:
+ * - added qemu_plugin_set_current_task_offset (declare the guest
+ *   kernel's per-image current-task location so a target whose kernel
+ *   keeps no per-task pointer in a register — x86-64, where ``current``
+ *   is a per-CPU variable behind the kernel GS base at a link-time
+ *   offset — can resolve kernel-privilege thread identity by reading
+ *   it, instead of collapsing every TLS-less task onto the value 0).
+ *
+ * version 16:
+ * - added qemu_plugin_register_vm_shutdown_cb (the machine is going
+ *   down: the last point at which a plugin can still read guest and
+ *   vCPU state, so a capture in progress is closed and finalised
+ *   instead of abandoned).  System emulation only; under user-mode
+ *   emulation the exit callback already runs on a guest thread.
+ *
+ * version 17:
+ * - added qemu_plugin_cpu_events_pending_slot: QEMU maintains a per-vCPU
+ *   "a drain is owed" scoreboard flag for the path-event queue, so a
+ *   plugin can test it from the JIT and drain at every TB entry.  This is
+ *   what makes the queue length bounded rather than a function of how long
+ *   the vCPU has run without dispatching the consuming callback.
+ * - added qemu_plugin_cpu_events_stats: queue-side max length / push /
+ *   drain counts, produced upstream of any plugin attribution decision.
+ * - qemu_plugin_cpu_events_set() no longer discards a pending backlog; a
+ *   non-empty queue at that call is a bug and QEMU says so.
+ *
+ * version 18:
+ * - (the identity interning APIs added here and in 19 were retired with
+ *   no consumers: the ChampSim Tracer's content-as-gate model stores and
+ *   compares no process identity.)
+ *
+ * version 20:
+ * - added qemu_plugin_spec_reserve_opens / _exhausted: how hard a
+ *   plugin's wrong-path (speculative) walking is leaning on the shared
+ *   TCG code buffer.  A walk may not tb_flush, so TCG hands it a reserve
+ *   and owes a flush; when even the reserve runs out, tb_gen_code
+ *   declines and the walk is cut at a depth set by host buffer occupancy.
+ *   Without these the cut is indistinguishable, at the plugin, from the
+ *   guest simply not having the code.
+ * - INCOMPATIBLE: qemu_plugin_vm_shutdown_cb_t gained a third argument,
+ *   @in_guest_insn.  The change itself went in while the version
+ *   constant still read 19, so 19 names two incompatible callback
+ *   types and cannot be honoured either way; 20 is the first version
+ *   that distinguishes them, and a plugin declaring 16 through 19 is
+ *   now refused at qemu_plugin_register_vm_shutdown_cb() rather than
+ *   called through a function pointer whose type no longer matches its
+ *   definition.  Rebuild the plugin against this header.
+ *
+ * version 21:
+ * - added qemu_plugin_current_vcpu_index: the vCPU whose thread the
+ *   calling code is running on, which is what the state APIs that take
+ *   no vCPU argument (the register and memory readers) resolve through.
+ *   QEMU_PLUGIN_VCPU_NONE outside vCPU context.
+ * - INCOMPATIBLE: the @vcpu_index of qemu_plugin_vm_shutdown_cb_t now
+ *   names the vCPU the shutdown CAME FROM and nothing else.  It used to
+ *   name the vCPU the callback was placed on, which on the monitor /
+ *   QMP / host-signal route is a vCPU QEMU picked to have a thread to
+ *   run on -- so the argument read as a fact about the guest while
+ *   carrying a fact about QEMU's own scheduling.  That route now passes
+ *   QEMU_PLUGIN_VCPU_UNNAMED, and a plugin that wants to know whose
+ *   registers it is about to read asks qemu_plugin_current_vcpu_index().
+ *   A plugin declaring 16 through 20 is refused at
+ *   qemu_plugin_register_vm_shutdown_cb().
+ *
+ * version 22:
+ * - added qemu_plugin_register_vm_reset_cb: a guest-initiated (or
+ *   monitor/QMP/watchdog) machine RESET tears the machine down and
+ *   boots it again inside the same QEMU process, so it never reaches
+ *   the shutdown callback or atexit — yet everything a plugin has been
+ *   recording about the running machine (open captures, address-space
+ *   pins, guest-derived state) stops being true at that boundary.
+ *   Dispatched from the reset request, before the machine is torn
+ *   down, with the same vCPU-placement and argument discipline as the
+ *   shutdown callback.  Resets converted to shutdowns by -no-reboot
+ *   arrive on the shutdown callback instead, never on both.
+ *
+ * version 23:
+ * - added qemu_plugin_register_nosplit_code_sequences: byte patterns
+ *   the translator must never split across a TB boundary.  When a TB
+ *   would otherwise end (page boundary, instruction budget,
+ *   single-step) with its final bytes forming a proper prefix of a
+ *   registered sequence, translation continues through the sequence
+ *   via the normal code-fetch path, so the whole sequence always
+ *   appears together in one TB.
+ * - added qemu_plugin_async_run_on_vcpu: queue a one-shot callback to
+ *   run on a specific vCPU's own thread at its next safe point, so a
+ *   plugin can sample per-vCPU state (e.g. read guest memory through
+ *   that vCPU's current address space) without cross-thread reads.
+ *
+ * version 24:
+ * - added qemu_plugin_translate_at: translate (and keep) the block at a
+ *   given address without executing it, so the translation-time
+ *   callbacks state QEMU's answer about code the guest has not reached.
+ * - added qemu_plugin_decode_only_nobuf: how many of those translations
+ *   were declined because the code buffer was full.
+ *
+ * Where an entry above says a signature changed WITHOUT the version
+ * constant moving, the version in force at the time names two
+ * incompatible spellings of the same symbol and cannot be honoured
+ * either way, so the entry point refuses the ambiguous version along
+ * with everything below it.  The gate sits at the entry point rather
+ * than at QEMU_PLUGIN_MIN_VERSION because a floor raised for one API
+ * would also reject every old plugin that never touches it.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 4
+#define QEMU_PLUGIN_VERSION 24
+
+/*
+ * The two values a signed vCPU index takes when it is not an index.
+ *
+ * QEMU_PLUGIN_VCPU_NONE says there is no vCPU to speak of: no vCPU has
+ * been created, or the code asking is not running on a vCPU thread.
+ *
+ * QEMU_PLUGIN_VCPU_UNNAMED says a vCPU exists and the plugin is running
+ * on one, but the event being reported does not belong to any particular
+ * vCPU.  It is the difference between "QEMU has nothing to tell you" and
+ * "QEMU has something to tell you and it is that no vCPU is meant" --
+ * distinct facts, and a plugin that has to guess which one it is holding
+ * will attribute an event to a vCPU that did not cause it.
+ */
+#define QEMU_PLUGIN_VCPU_NONE     (-1)
+#define QEMU_PLUGIN_VCPU_UNNAMED  (-2)
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -255,8 +461,8 @@ typedef struct {
  * @QEMU_PLUGIN_CB_R_REGS: callback reads the CPU's regs
  * @QEMU_PLUGIN_CB_RW_REGS: callback reads and writes the CPU's regs
  *
- * Note: currently QEMU_PLUGIN_CB_RW_REGS is unused, plugins cannot change
- * system register state.
+ * QEMU_PLUGIN_CB_RW_REGS enables write_register, cpu_state_restore,
+ * set_pc, and exec_inline_insn from within the callback.
  */
 enum qemu_plugin_cb_flags {
     QEMU_PLUGIN_CB_NO_REGS,
@@ -276,6 +482,17 @@ enum qemu_plugin_mem_value_type {
     QEMU_PLUGIN_MEM_VALUE_U32,
     QEMU_PLUGIN_MEM_VALUE_U64,
     QEMU_PLUGIN_MEM_VALUE_U128,
+    /*
+     * The access is wider than the 128 bits qemu_plugin_mem_value can
+     * carry (CPUState only ever latches the low 128 bits into
+     * plugin_mem_value_low/high — see tcg_gen_plugin_mem_cb() in
+     * tcg/tcg-op-ldst.c).  No in-tree target currently emits a MemOp
+     * whose size shift exceeds MO_128, so this is a forward-compat
+     * degrade path rather than a live case; appended at the end of the
+     * enum to avoid renumbering the existing values.  data.u128 is
+     * zeroed rather than left uninitialized.
+     */
+    QEMU_PLUGIN_MEM_VALUE_INVALID,
 };
 
 /* typedef qemu_plugin_mem_value - value accessed during a load/store */
@@ -540,6 +757,28 @@ QEMU_PLUGIN_API
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn);
 
 /**
+ * qemu_plugin_insn_branch_target_pc() - resolved static branch target
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * Returns the static control-transfer target the per-ISA translator
+ * resolved for this instruction during translation — the same value
+ * fed to gen_goto_tb / equivalents.  Returns 0 when no static target
+ * exists: either the instruction is not a control transfer, or it is
+ * an indirect / register-form branch whose target is only known at
+ * runtime (plugins should fall back to their own observed-target
+ * history for those).
+ *
+ * Wrong-path tracers should consume this rather than re-decoding the
+ * branch immediate themselves — per-ISA encoding (PC-relative vs.
+ * absolute, sign extension, MIPS delay-slot accounting, ARM Thumb
+ * interworking) is already correctly resolved by the translator.
+ *
+ * Returns: target PC, or 0 if no static target.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn);
+
+/**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle
  *
  * This can be further queried using the qemu_plugin_mem_* query
@@ -586,7 +825,10 @@ bool qemu_plugin_mem_is_store(qemu_plugin_meminfo_t info);
  * qemu_plugin_mem_get_value() - return last value loaded/stored
  * @info: opaque memory transaction handle
  *
- * Returns: memory value
+ * Returns: memory value. If the access is wider than 128 bits — which no
+ * in-tree target currently emits, since CPUState only latches the low 128
+ * bits of an access for plugin use — the returned value has type
+ * QEMU_PLUGIN_MEM_VALUE_INVALID and zeroed data, rather than aborting.
  */
 QEMU_PLUGIN_API
 qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info);
@@ -786,6 +1028,351 @@ void qemu_plugin_register_flush_cb(qemu_plugin_id_t id,
                                    qemu_plugin_simple_cb_t cb);
 
 /**
+ * qemu_plugin_request_tb_flush() - drop every cached translation
+ *
+ * Asks QEMU to invalidate its entire TB cache so subsequent
+ * executions retranslate every basic block from scratch and re-fire
+ * the plugin's translation callback for each.  Use this when the
+ * plugin's translation-time instrumentation depends on dynamic state
+ * (for example whether a trace segment is active): toggling that
+ * state mid-execution otherwise leaves cached TBs running with their
+ * out-of-date instrumentation until QEMU happens to evict them.
+ *
+ * Runs on the calling vCPU and is async-safe relative to TB
+ * execution — any registered flush callback fires before the next TB
+ * begins executing.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_request_tb_flush(void);
+
+/**
+ * typedef qemu_plugin_asid_write_cb_t - address-space-register write hook
+ * @vcpu_index: the vCPU that committed the write
+ * @new_asid: the just-committed value, as reported by
+ *            qemu_plugin_get_addr_space_id()
+ */
+typedef void (*qemu_plugin_asid_write_cb_t)(unsigned int vcpu_index,
+                                            uint64_t new_asid);
+
+/**
+ * qemu_plugin_register_asid_write_cb() - register ASID-write hook
+ * @id: plugin ID
+ * @cb: callback, or NULL to unregister
+ *
+ * Fires synchronously on the owning vCPU thread each time the guest
+ * commits a changed value to the register
+ * qemu_plugin_get_addr_space_id() reports (the same per-target commit
+ * points that produce QEMU_PLUGIN_CPU_EVENT_ASID_WRITE path events),
+ * system emulation only.  Unlike the queued event, the hook fires even
+ * while the per-vCPU event queue is disabled — a plugin can track
+ * address-space transitions during phases where nothing drains the
+ * queue.  Wrong-path (speculative) writes are suppressed.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
+                                        qemu_plugin_asid_write_cb_t cb);
+
+/**
+ * qemu_plugin_register_nosplit_code_sequences() - never-split byte patterns
+ * @seqs: @n_seqs byte patterns of @seq_len bytes each, back to back
+ *        (pattern i at @seqs + i * @seq_len); copied out before return
+ * @seq_len: bytes per pattern (all patterns share one length)
+ * @n_seqs: number of patterns (at most 2); 0 or NULL @seqs clears
+ *
+ * Registers guest-code byte sequences the translator must keep whole
+ * inside a single translation block.  When a TB would otherwise end
+ * cleanly (page boundary, instruction budget, single-step) with its
+ * final translated bytes forming a proper prefix of a registered
+ * sequence, translation continues through the sequence via the normal
+ * code-fetch path (cross-page TBs included).  Sequences are matched on
+ * raw guest-memory bytes.  Intended to be called once, at install time,
+ * before any guest code translates; a fetch fault while continuing is
+ * the fault the next fetch was about to take and is serviced by the
+ * ordinary translation restart.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_nosplit_code_sequences(const uint8_t *seqs,
+                                                 size_t seq_len,
+                                                 size_t n_seqs);
+
+/**
+ * typedef qemu_plugin_vcpu_async_cb_t - one-shot per-vCPU work item
+ * @vcpu_index: the vCPU whose thread the callback is running on
+ * @userdata: pointer passed at queue time
+ */
+typedef void (*qemu_plugin_vcpu_async_cb_t)(unsigned int vcpu_index,
+                                            void *userdata);
+
+/**
+ * qemu_plugin_async_run_on_vcpu() - run a callback on a vCPU's own thread
+ * @vcpu_index: target vCPU
+ * @cb: callback to run
+ * @userdata: passed through to @cb
+ *
+ * Queues @cb to run on @vcpu_index's own thread at that vCPU's next
+ * safe point (between translation blocks).  The callback may read
+ * guest state through the target vCPU's live context — registers,
+ * memory via the vCPU's current address space — which a cross-thread
+ * read cannot do.  Fire-and-forget; ordering against guest execution
+ * is only "at a TB boundary, soon".  No-op if @vcpu_index names no
+ * present vCPU.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_async_run_on_vcpu(unsigned int vcpu_index,
+                                   qemu_plugin_vcpu_async_cb_t cb,
+                                   void *userdata);
+
+/**
+ * enum qemu_plugin_devio_dir - direction/kind of a block-device request
+ * @QEMU_PLUGIN_DEVIO_READ: data read from the device into guest memory
+ * @QEMU_PLUGIN_DEVIO_WRITE: data written from guest memory to the device
+ *                           (also pwrite-zeroes / discard — a zero-byte
+ *                           payload distinguishes those from a data write)
+ * @QEMU_PLUGIN_DEVIO_FLUSH: a cache-flush / write-barrier (no data)
+ */
+enum qemu_plugin_devio_dir {
+    QEMU_PLUGIN_DEVIO_READ  = 0,
+    QEMU_PLUGIN_DEVIO_WRITE = 1,
+    QEMU_PLUGIN_DEVIO_FLUSH = 2,
+};
+
+/**
+ * typedef qemu_plugin_devio_doorbell_cb_t - virtqueue-notify (kick) hook
+ * @vcpu_index: the vCPU that rang the doorbell (wrote the virtqueue
+ *              notify register), resolved from current_cpu, or -1 if the
+ *              notify was not raised from a vCPU thread
+ * @dev_token: an opaque per-device identity (the block device's
+ *             DeviceState pointer, as an integer) that a later start
+ *             hook can match to correlate this doorbell with the
+ *             asynchronous requests it produced
+ *
+ * Fires synchronously in vCPU context when the guest kicks a
+ * block-device virtqueue, BEFORE the (possibly deferred, main-loop)
+ * request processing runs.  It is the one point where the issuing vCPU
+ * — and thus the plugin's owning process/thread — is known.  The plugin
+ * captures the owner keyed by @dev_token; the start hook, which fires on
+ * the main loop with the request geometry but no vCPU, pops the matching
+ * doorbell to attribute the request exactly.  System emulation only;
+ * correct path only (a spec-mode doorbell store reaches no device).
+ */
+typedef void (*qemu_plugin_devio_doorbell_cb_t)(int vcpu_index,
+                                                uint64_t dev_token);
+
+/**
+ * typedef qemu_plugin_devio_start_cb_t - block-device request issue hook
+ * @vcpu_index: the vCPU that issued the request when the block layer was
+ *              entered synchronously on a vCPU thread, else -1 (the
+ *              canonical no-iothread virtio-blk path defers to the main
+ *              loop, so this is typically -1 — use @dev_token + the
+ *              doorbell hook for the true issuing vCPU)
+ * @dir: an enum qemu_plugin_devio_dir value
+ * @offset: byte offset of the request within the backing image
+ * @bytes: request length in bytes (0 for flush)
+ * @dev_token: the attached device's identity (DeviceState pointer as an
+ *             integer), matching the doorbell hook's token for a device
+ *             whose kick was seen in vCPU context; 0 when no device is
+ *             attached.  The plugin correlates this against its captured
+ *             doorbells for exact owner attribution, falling back to
+ *             positional attribution when no doorbell matches (non-virtio
+ *             or kernel-internal I/O).
+ *
+ * Fires synchronously from the block backend when an asynchronous
+ * request (blk_aio_*) is issued.  Returns a nonzero request id the
+ * plugin assigns for later correlation with the completion hook; a
+ * return of 0 means "not tracked" and suppresses the paired completion
+ * notification.  System emulation only.  Never fires on the wrong
+ * (speculative) path — a spec-mode doorbell store is sandboxed and
+ * reaches no device model.
+ */
+typedef uint64_t (*qemu_plugin_devio_start_cb_t)(int vcpu_index,
+                                                 int dir,
+                                                 uint64_t offset,
+                                                 uint64_t bytes,
+                                                 uint64_t dev_token);
+
+/**
+ * typedef qemu_plugin_devio_stop_cb_t - block-device completion hook
+ * @request_id: the id a prior start hook returned for this request
+ *
+ * Fires when a request the start hook tracked (returned nonzero for)
+ * completes, from the block backend's completion chokepoint.  In the
+ * canonical no-iothread configuration this runs on the main loop
+ * thread, not the issuing vCPU thread, so the plugin must serialise
+ * its own state.
+ */
+typedef void (*qemu_plugin_devio_stop_cb_t)(uint64_t request_id);
+
+/**
+ * qemu_plugin_register_devio_cb() - register block-device I/O hooks
+ * @id: plugin ID
+ * @doorbell_cb: virtqueue-notify (kick) hook, or NULL
+ * @start_cb: issue hook, or NULL
+ * @stop_cb: completion hook, or NULL
+ *
+ * Registers synchronous notification of block-device virtqueue kicks
+ * (in vCPU context) and of request issue / completion at the block
+ * backend's blk_aio_* chokepoints (on whichever thread the block layer
+ * runs).  System emulation only.  A tracer uses these to place
+ * disk-request records in the body stream attributed to the exact
+ * issuing process/thread: the doorbell hook captures the owner in vCPU
+ * context, the issue hook correlates the request to it by device token,
+ * and the completion hook marks where the request finishes.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_devio_doorbell_cb_t doorbell_cb,
+                                   qemu_plugin_devio_start_cb_t start_cb,
+                                   qemu_plugin_devio_stop_cb_t stop_cb);
+
+/**
+ * typedef qemu_plugin_vm_shutdown_cb_t - machine-shutdown hook
+ * @id: plugin ID
+ * @vcpu_index: the vCPU the shutdown CAME FROM -- the one that executed
+ *              the device write, and the only vCPU this event is a fact
+ *              about.  Two non-indices stand for the cases where there
+ *              is no such vCPU:
+ *
+ *              QEMU_PLUGIN_VCPU_UNNAMED -- the monitor, a QMP client or
+ *              SIGINT/SIGTERM asked, and no vCPU is responsible.  The
+ *              callback still runs on a vCPU thread, because that is the
+ *              only place guest memory, registers and the privilege /
+ *              address-space APIs resolve; WHICH vCPU is QEMU's own
+ *              scheduling decision, taken by which of them reaches a
+ *              translation-block boundary first, and it carries no
+ *              information about the guest.  Ask
+ *              qemu_plugin_current_vcpu_index() for the one whose state
+ *              the no-argument state APIs will read.
+ *
+ *              QEMU_PLUGIN_VCPU_NONE -- no vCPU has been created, or
+ *              none could be reached, so the callback is NOT running on
+ *              a vCPU thread and no guest state is readable at all.
+ *              A plugin holding an open capture can free it here but
+ *              cannot close it against the machine.
+ * @in_guest_insn: the callback is running INSIDE the guest instruction
+ *              that caused the shutdown, which has BEGUN and has NOT
+ *              retired.  False whenever the callback runs at a TB
+ *              BOUNDARY instead, where the last dispatched block
+ *              completed — which is now every ordinary route: the
+ *              monitor, QMP and SIGINT/SIGTERM are marshalled onto a
+ *              vCPU, and a guest poweroff (a device write or hypercall
+ *              executed under the BQL) is queued on the writing vCPU and
+ *              delivered once its store has retired, because dispatching
+ *              inside the write would hold the BQL against a plugin lock
+ *              (see qemu_plugin_register_vm_shutdown_cb).  True is left
+ *              for a vCPU-context request that arrives without the BQL
+ *              and so really does run mid-instruction.
+ *
+ *              A plugin that closes a capture needs this, because
+ *              claiming the in-flight instruction publishes a block whose
+ *              memory operations are only partly observed and discarding
+ *              it throws away instructions the guest retired.  It is a
+ *              statement about POSITION in the instruction stream and
+ *              @vcpu_index is a statement about ORIGIN; QEMU makes both
+ *              rather than leaving either to be read off the other — a
+ *              guest poweroff names the writing vCPU while reporting no
+ *              instruction in flight, and neither fact can be read off
+ *              the other.
+ *
+ * Dispatched once, when the machine is going down for any reason: the
+ * guest powered itself off or reset with -no-reboot, the monitor or a
+ * QMP client asked for it, or QEMU took SIGINT/SIGTERM.
+ */
+typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
+                                             int vcpu_index,
+                                             bool in_guest_insn);
+
+/**
+ * qemu_plugin_register_vm_shutdown_cb() - register a machine-shutdown cb
+ * @id: plugin ID
+ * @cb: callback
+ *
+ * WHY THIS EXISTS AND WHY THE EXIT CALLBACK IS NOT ENOUGH.  In system
+ * emulation qemu_plugin_register_atexit_cb() fires from libc's atexit(3),
+ * i.e. AFTER qemu_cleanup() has stopped every vCPU and torn the machine
+ * down, on a thread that is not a vCPU thread.  A plugin that still has
+ * state to flush at that point cannot read guest memory, cannot read
+ * register state, and cannot ask for the current privilege level or
+ * address space: every one of those APIs resolves through current_cpu,
+ * which is NULL there.  A capture that has to be *closed* rather than
+ * merely freed therefore cannot be closed from the exit callback.
+ *
+ * This callback is dispatched from the shutdown request itself, before
+ * the main loop leaves and before qemu_cleanup() runs, and QEMU places
+ * it on a vCPU thread whenever one can be reached — on the requesting
+ * vCPU when the request came from vCPU context (the usual case, since a
+ * guest poweroff is a device write or hypercall the guest itself
+ * executed; the delivery is queued to that vCPU's next translation-block
+ * boundary, because the request arrives under the BQL and the dispatch
+ * must not run under it, see below), otherwise by offering the work to
+ * every live vCPU and taking whichever reaches a translation-block
+ * boundary first.  Guest memory, vCPU registers and the
+ * privilege/address-space APIs are all live and stable inside it.
+ *
+ * QEMU waits for that placement without bound.  The offer goes to every
+ * live vCPU, so the callback runs as soon as ANY of them drains its work
+ * queue, and the dispatch drops the BQL around the callback so a plugin
+ * lock held by a peer vCPU cannot deadlock against it.  A wait that does
+ * not end is therefore a vCPU that is genuinely not making progress —
+ * a defect to fix at its source, not a condition QEMU times and steps
+ * around.  QEMU_PLUGIN_VCPU_NONE is dispatched only on the routes where
+ * no vCPU can be reached at all (none exists, or none is live).
+ *
+ * It is dispatched at most once per run.  System emulation only: under
+ * user-mode emulation the exit callback already runs on a guest thread
+ * and needs no equivalent.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
+                                         qemu_plugin_vm_shutdown_cb_t cb);
+
+/**
+ * typedef qemu_plugin_vm_reset_cb_t - machine-reset hook
+ * @id: plugin ID
+ * @vcpu_index: the vCPU the reset CAME FROM, with the same two
+ *              non-indices and the same meaning as
+ *              qemu_plugin_vm_shutdown_cb_t's @vcpu_index.
+ * @in_guest_insn: same statement as qemu_plugin_vm_shutdown_cb_t's:
+ *              a guest-initiated reset is a device write (or, on x86, a
+ *              triple fault raised mid-instruction), so the request
+ *              arrives with that instruction begun and not retired;
+ *              false on the marshalled routes (monitor, QMP, watchdog),
+ *              which run at a translation-block boundary.
+ *
+ * Dispatched when the machine is about to be RESET rather than shut
+ * down: the guest wrote a reset register (x86 port 92h / PIIX RCR /
+ * i8042 pulse, Arm PSCI SYSTEM_RESET, the sifive_test finisher, the
+ * Malta SOFTRES register), tripped a triple fault, a watchdog's reset
+ * action fired, or a monitor/QMP system_reset was issued.  All of those
+ * funnel through the one reset request, which is where this dispatches.
+ *
+ * The machine that comes back is a fresh world — new kernel, new
+ * address spaces, every guest-derived identity recycled — running in
+ * the same QEMU process.  A plugin recording the old world must treat
+ * the reset as that recording's end; nothing it holds names anything
+ * in the new one.  Unlike the shutdown callback this can dispatch more
+ * than once per run: each teardown is its own event.  A reset that
+ * -no-reboot converts into a shutdown is dispatched as the shutdown it
+ * became, never as both.  System emulation only.
+ */
+typedef void (*qemu_plugin_vm_reset_cb_t)(qemu_plugin_id_t id,
+                                          int vcpu_index,
+                                          bool in_guest_insn);
+
+/**
+ * qemu_plugin_register_vm_reset_cb() - register a machine-reset cb
+ * @id: plugin ID
+ * @cb: callback
+ *
+ * Placement and lifetime guarantees are those of
+ * qemu_plugin_register_vm_shutdown_cb(): dispatched from the reset
+ * request, before the machine is torn down, on a vCPU thread whenever
+ * one can be reached, with the BQL dropped around the marshalled form.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_vm_reset_cb(qemu_plugin_id_t id,
+                                      qemu_plugin_vm_reset_cb_t cb);
+
+/**
  * qemu_plugin_register_atexit_cb() - register exit callback
  * @id: plugin ID
  * @cb: callback
@@ -805,6 +1392,23 @@ void qemu_plugin_register_atexit_cb(qemu_plugin_id_t id,
 /* returns how many vcpus were started at this point */
 QEMU_PLUGIN_API
 int qemu_plugin_num_vcpus(void);
+
+/**
+ * qemu_plugin_current_vcpu_index() - which vCPU the caller is running on
+ *
+ * Returns the index of the vCPU whose thread the calling code is on, or
+ * QEMU_PLUGIN_VCPU_NONE outside vCPU context.
+ *
+ * This is the vCPU the state APIs that take no vCPU argument read from —
+ * the register readers and the memory
+ * readers all resolve through it, and they assert rather than answer when
+ * it is QEMU_PLUGIN_VCPU_NONE.  Most callbacks are handed the vCPU they
+ * concern and have no need of this; the ones that need it are the events
+ * QEMU marshals onto a vCPU thread it chose, where the vCPU carrying the
+ * work and the vCPU the work is about are different questions.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_current_vcpu_index(void);
 
 /**
  * qemu_plugin_outs() - output string via QEMU's logging system
@@ -1001,5 +1605,861 @@ void qemu_plugin_u64_set(qemu_plugin_u64 entry, unsigned int vcpu_index,
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
+
+/* ================ CPU State Snapshot/Rollback API ================ */
+
+/*
+ * struct qemu_plugin_cpu_state - Opaque handle to a saved CPU state
+ *
+ * Holds a raw memcpy snapshot of the target's CPUArchState execution
+ * fields (plus the handful of CPUState fields a speculative walk can
+ * dirty), not a per-register walk through the GDB register interface —
+ * this also captures internal state (lazy flags, FPU, etc.) that GDB
+ * register access would miss. Architecture-agnostic: works with any
+ * target (x86, ARM, RISC-V, etc.).
+ */
+struct qemu_plugin_cpu_state;
+
+/**
+ * qemu_plugin_write_register() - write register for current vCPU
+ *
+ * @handle: a @qemu_plugin_reg_handle handle from qemu_plugin_get_registers()
+ * @buf: A GByteArray containing the data to write, in target byte order
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via the QEMU_PLUGIN_CB_RW_REGS flag.
+ *
+ * Returns the number of bytes written. On failure returns -1.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_write_register(struct qemu_plugin_register *handle,
+                               GByteArray *buf);
+
+/**
+ * qemu_plugin_cpu_state_save() - snapshot all CPU registers
+ *
+ * Captures the complete execution state of the current vCPU via a raw
+ * memcpy of its CPUArchState (architecture-agnostic: works with any
+ * target). The returned handle must be freed with
+ * qemu_plugin_cpu_state_free().
+ *
+ * This function is only available in a context that register read access is
+ * explicitly requested via QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
+ *
+ * Returns an opaque handle to the saved state, or NULL on failure.
+ */
+QEMU_PLUGIN_API
+struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void);
+
+/**
+ * qemu_plugin_cpu_state_restore() - restore previously saved CPU registers
+ *
+ * @state: handle returned by qemu_plugin_cpu_state_save()
+ *
+ * Restores the complete register state of the current vCPU from a
+ * previously saved snapshot.
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ *
+ * Returns true on success, false on failure.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state);
+
+/**
+ * qemu_plugin_cpu_state_free() - free a CPU state snapshot
+ *
+ * @state: handle returned by qemu_plugin_cpu_state_save()
+ *
+ * Releases all memory associated with the state snapshot.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state);
+
+/**
+ * qemu_plugin_set_pc() - set the program counter of the current vCPU
+ *
+ * @pc: the new program counter value
+ *
+ * Sets the PC to the given address. Must be used together with
+ * state save/restore for wrong-path execution scenarios.
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_set_pc(uint64_t pc);
+
+/**
+ * qemu_plugin_get_pc() - get the current program counter
+ *
+ * Returns the current program counter of the current vCPU.
+ * Useful for tracking PC changes during wrong-path execution.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_pc(void);
+
+/**
+ * qemu_plugin_exec_inline_insn() - execute one instruction at current PC
+ *
+ * Translates and executes exactly one instruction at the current program
+ * counter. Plugin instrumentation callbacks are suppressed during this
+ * execution to avoid recursive callbacks.
+ *
+ * This is designed for wrong-path simulation: save state, set PC to wrong
+ * target, execute instructions one at a time collecting memory accesses,
+ * then restore state.
+ *
+ * Returns true on success, false on failure (e.g. unmapped address).
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_exec_inline_insn(void);
+
+/**
+ * qemu_plugin_exec_tb() - execute one full translation block at current PC
+ *
+ * Translates and executes a complete basic block at the current program
+ * counter.  All plugin callbacks fire (tb_exec, insn_exec, inline ops,
+ * mem, translation), so the plugin sees the speculative TB the same
+ * shape it sees a normal CP TB.  The plugin is responsible for keeping
+ * its own state separated when fired from inside a spec-mode block —
+ * for example by short-circuiting CP-only state mutations and by
+ * saving/restoring any scoreboard slots clobbered by inline stores
+ * around qemu_plugin_spec_mode_begin/_end.
+ *
+ * After return, qemu_plugin_get_pc() reflects where the branch at the
+ * end of the block went.
+ *
+ * Returns true on success, false on failure (e.g. unmapped address,
+ * exception during execution).
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_exec_tb(void);
+
+/* ================ Speculative Store Buffer API ================ */
+
+/**
+ * qemu_plugin_spec_mode_begin() - enter speculative execution mode
+ *
+ * Initializes the per-CPU speculative store buffer. While active,
+ * all guest memory writes from instruction execution are redirected
+ * to a local cache instead of modifying real guest memory. Guest
+ * memory reads check the buffer first for store-to-load forwarding.
+ *
+ * This is designed for wrong-path execution: enter speculative mode
+ * before executing wrong-path instructions, then call
+ * qemu_plugin_spec_mode_end() to discard all speculative writes.
+ *
+ * @saved_state: optional CPU state snapshot taken before wrong-path
+ *               execution.  If non-NULL and an exception longjmps
+ *               out of wrong-path execution, the cleanup handler
+ *               restores this snapshot before resuming normal
+ *               execution.  Ownership remains with the caller on
+ *               the normal (non-exception) path.
+ *
+ * Must be paired with qemu_plugin_spec_mode_end().
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state);
+
+/**
+ * qemu_plugin_spec_mode_end() - exit speculative execution mode
+ *
+ * Discards all speculative writes accumulated since
+ * qemu_plugin_spec_mode_begin() and returns to normal execution.
+ * Real guest memory is unmodified.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_mode_end(void);
+
+/**
+ * qemu_plugin_spec_vtime_pause() - freeze the guest virtual clock
+ *
+ * Pause the guest's virtual clock (QEMU_CLOCK_VIRTUAL) for the duration of a
+ * wrong-path excursion so the speculative run's host wall-clock time does not
+ * advance the guest's architected timer counters (e.g. aarch64 CNTVCT, x86
+ * TSC, riscv ``time``, mips Count).  Call once at the OUTER excursion boundary,
+ * before qemu_plugin_spec_mode_begin(); pair with qemu_plugin_spec_vtime_resume().
+ * Idempotent and a no-op in user-mode emulation.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_vtime_pause(void);
+
+/**
+ * qemu_plugin_spec_vtime_resume() - resume the guest virtual clock
+ *
+ * Undo qemu_plugin_spec_vtime_pause(), discarding the wall-clock interval the
+ * excursion consumed so the guest's architected counters read the same value
+ * after the excursion as before it.  Call once at the OUTER excursion boundary,
+ * after qemu_plugin_spec_mode_end().
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_vtime_resume(void);
+
+/**
+ * qemu_plugin_vclock_pause() - freeze the guest clock for instrumentation work
+ *
+ * Nestable.  Wrap plugin work that runs on the vCPU thread but is not guest
+ * execution (translation-time decoding, per-TB trace emission) so its host
+ * wall-clock cost is not charged to guest time.  Without it, instrumented
+ * guest interrupt handlers can cost more guest time than one timer period and
+ * the guest collapses into a tick storm.  Pair with
+ * qemu_plugin_vclock_resume(); no-op in user-mode emulation.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_vclock_pause(void);
+
+/**
+ * qemu_plugin_vclock_resume() - undo one qemu_plugin_vclock_pause()
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_vclock_resume(void);
+
+/**
+ * qemu_plugin_vclock_ns() - read the guest virtual clock
+ *
+ * Returns QEMU_CLOCK_VIRTUAL in nanoseconds: the time the GUEST believes has
+ * elapsed, i.e. host wall-clock time minus every interval a
+ * qemu_plugin_vclock_pause() or qemu_plugin_spec_vtime_pause() freeze was in
+ * effect.  Ratioed against host wall time it yields the guest realtime factor,
+ * and ratioed against executed instructions it yields the guest's instruction
+ * rate per guest-second — the quantity that decides how much timer-interrupt
+ * work the guest is charged per unit of forward progress, and hence the only
+ * load-independent way to tell a slow capture from a wedged one.  Returns 0 in
+ * user-mode emulation, which has no guest clock.
+ *
+ * Read-only and side-effect free; callable from any plugin callback.
+ */
+QEMU_PLUGIN_API
+int64_t qemu_plugin_vclock_ns(void);
+
+/**
+ * qemu_plugin_in_async_int() - is the vCPU inside an async-interrupt handler?
+ *
+ * Returns true while the executing vCPU is handling an asynchronous interrupt
+ * (timer/device IRQ/FIQ/SError) — from the interrupt's exception entry until
+ * the exception return that lands back at the interrupted PC, spanning any
+ * scheduler context-switch or nested sync/async exception in between.  False
+ * for synchronous entries alone (syscall/SVC, faults).  A system-mode tracer
+ * reads this to drop the async handler from the trace (non-representative OS
+ * noise) while keeping synchronous syscalls/faults.  Always false in user-mode
+ * emulation and on targets whose exception path is not yet instrumented.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_in_async_int(void);
+
+/**
+ * qemu_plugin_in_spec_mode() - is the vCPU executing speculatively?
+ *
+ * Returns true while the executing vCPU is inside a plugin-driven
+ * speculative (wrong-path) session — between qemu_plugin_spec_mode_begin()
+ * and qemu_plugin_spec_mode_end().  This is the QEMU-side ground truth for
+ * the mode, read from the vCPU itself: a callback fired by a speculative
+ * execution observes true here even if the plugin's own thread-local
+ * session state is not visible to the invoking context.  False when no
+ * vCPU is current.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_in_spec_mode(void);
+
+/*
+ * Ordered per-vCPU path events — the event-stream alternative to
+ * edge-detecting the accumulated fault/async state above.  Each fault
+ * entry/return and async-window edge is appended at its QEMU chokepoint,
+ * in order, with the address-space id and privilege level stamped at the
+ * event instant.  Only populated after a plugin opts in per vCPU via
+ * qemu_plugin_cpu_events_set(); the producing and consuming thread are
+ * both the owning vCPU thread.
+ */
+enum qemu_plugin_cpu_event_kind {
+    QEMU_PLUGIN_CPU_EV_FAULT_ENTER  = 0,
+    QEMU_PLUGIN_CPU_EV_FAULT_RETURN = 1,
+    QEMU_PLUGIN_CPU_EV_ASYNC_ENTER  = 2,
+    QEMU_PLUGIN_CPU_EV_ASYNC_RETURN = 3,
+    /*
+     * A committed architectural write that changed the address-space
+     * register qemu_plugin_get_addr_space_id() reports (MIPS
+     * EntryHi.ASID, Arm TTBR0_EL1, RISC-V SATP, x86 CR3).  Field
+     * semantics FOR THIS KIND differ from the fault/async kinds:
+     * @asid is the NEW value just committed, @pc carries the OLD value
+     * it replaced (not a PC), @priv is the privilege the write executed
+     * at and @depth_after the live fault-stack depth.  Emitted only in
+     * system mode, only when the reported value actually changes, and
+     * never on the wrong path.  Every OS must execute this privileged,
+     * expensive operation to switch address spaces, so the event stream
+     * makes address-space swap mechanics (PTI-style kernel entry
+     * switches, TLB-maintenance save/probe writes, committed context
+     * switches) observable without any OS-specific assumption.
+     */
+    QEMU_PLUGIN_CPU_EV_ASID_WRITE   = 4,
+};
+
+struct qemu_plugin_cpu_event {
+    uint8_t  kind;          /* enum qemu_plugin_cpu_event_kind */
+    uint8_t  priv;          /* privilege level at the event instant */
+    /*
+     * Whether @tp below named the executing software thread at the event
+     * instant: set when the event fired at user privilege (every target's
+     * thread pointer names the thread there) or where the target reports
+     * qemu_plugin_thread_ptr_tracks_current() in the event's context.
+     * When clear, @tp is whatever the register held and identifies no
+     * guest thread (e.g. an interrupt delivered into M-mode firmware).
+     */
+    uint8_t  tp_ok;
+    uint32_t depth_after;   /* fault-stack depth after this event */
+    uint64_t pc;            /* resume PC (fault) / departure PC (async) */
+    uint64_t asid;          /* address-space id at the event instant */
+    /*
+     * qemu_plugin_get_thread_ptr() sampled at the event instant — for an
+     * ASYNC_ENTER, the thread the interrupt was DELIVERED in, read before
+     * any handler instruction runs.  The delivery context is otherwise
+     * unrecoverable by the consumer: the event is drained at the next
+     * executed TB, by which point the vCPU is already inside the handler
+     * (or further), and on an SMP guest the delivering context may be one
+     * the plugin never gets another look at.
+     */
+    uint64_t tp;
+};
+
+/**
+ * qemu_plugin_cpu_events_set() - enable/disable the vCPU path-event queue
+ * @vcpu_index: which vCPU
+ * @enabled: true to start collecting events
+ *
+ * Must be called from the vCPU's own thread (e.g. a tb_exec callback) or
+ * before the vCPU runs.  The queue must be EMPTY at the call: this does not
+ * discard a backlog, it refuses to run with one (QEMU aborts), because a
+ * disable with events still owed is precisely the silent drop it used to
+ * hide.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled);
+
+/**
+ * qemu_plugin_cpu_events_pending_slot() - publish a "drain owed" flag
+ * @slot: a per-vCPU scoreboard entry QEMU may write
+ *
+ * QEMU stores 1 into the @slot entry for that vCPU the instant an event is appended to that
+ * vCPU's path-event queue, and 0 the instant the queue is drained.  This
+ * makes "is a drain owed on this vCPU" JIT-testable, so a plugin can gate a
+ * per-TB conditional callback on it and thereby have a drain point at EVERY
+ * translation-block entry, for one load and one brcond when there is
+ * nothing to do.
+ *
+ * That is what BOUNDS the queue.  With a drain point at every TB entry the
+ * length can only hold what one in-flight TB, plus the exception edges
+ * around it, produced -- see CPU_PLUGIN_EVQ_STRUCTURAL_MAX in
+ * include/hw/core/cpu.h.  Without it, the length grows with the number of
+ * guest instructions executed since the last drain, and a plugin whose
+ * consuming callback is gated on anything at all (an ownership test, a
+ * segment-active flag) cannot bound that at all.
+ *
+ * One slot process-wide; the queue already assumes a single consuming
+ * plugin.  Call once, before the vCPUs run.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_pending_slot(qemu_plugin_u64 slot);
+
+/**
+ * qemu_plugin_cpu_events_stats() - queue-side accounting for a vCPU
+ * @vcpu_index: which vCPU
+ * @max_len: out, may be NULL -- high-water queue length ever reached
+ * @pushes: out, may be NULL -- events appended
+ * @drains: out, may be NULL -- drain calls made
+ *
+ * Produced by QEMU, upstream of every plugin-side attribution decision, so
+ * a plugin gate that refuses a context cannot suppress these numbers.  That
+ * is the point: @max_len is a witness the plugin's own counters cannot be.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_stats(unsigned int vcpu_index,
+                                  uint64_t *max_len, uint64_t *pushes,
+                                  uint64_t *drains);
+
+/**
+ * qemu_plugin_drain_cpu_events() - consume the vCPU's pending path events
+ * @vcpu_index: which vCPU
+ * @evs: out — pointer to the drained events (valid until the next drain
+ *       or events_set call on this vCPU)
+ *
+ * Returns the number of drained events and resets the queue.  Call from
+ * the owning vCPU thread only.
+ */
+QEMU_PLUGIN_API
+size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
+                                    const struct qemu_plugin_cpu_event **evs);
+
+/**
+ * qemu_plugin_async_int_reset() - force-clear the async-interrupt flag
+ *
+ * Clears qemu_plugin_in_async_int() for the executing vCPU.  A tracer calls
+ * this at a known-clean point (e.g. opening a trace segment with the traced
+ * process at user level) to discard any stale state left by a pre-segment
+ * interrupt whose exception return never matched its departure PC.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_async_int_reset(void);
+
+/**
+ * qemu_plugin_fault_depth() - current synchronous-fault nesting depth
+ *
+ * Returns the executing vCPU's live fault-stack depth: the number of
+ * synchronous fault deliveries (whose handlers re-execute the faulting
+ * instruction on exception return) not yet matched by their exception
+ * return.  Unlike async interrupts (dropped via qemu_plugin_in_async_int()),
+ * synchronous faults are KEPT — the handler is real workload-induced code —
+ * so a tracer reads this depth to tag handler code with its nesting level.
+ * QEMU owns the underlying resume-PC stack and maintains it synchronously at
+ * each delivery/return chokepoint, so the value is exact even under dense
+ * nested faults.  The ordered per-vCPU event queue above carries the same
+ * transitions as FAULT_ENTER/FAULT_RETURN events with per-event depth_after
+ * stamps; this accessor reads the live depth at a point in time (e.g. to
+ * baseline a trace window) without consuming events.  Reads zero in
+ * ``*-linux-user`` and on uninstrumented targets.  Must be called from a vCPU
+ * context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_fault_depth(void);
+
+/**
+ * qemu_plugin_rep_iterations() - architectural iteration count of the
+ * self-loop instruction the executing vCPU just ran
+ *
+ * Returns how many iterations the most recently executed fan-out
+ * instruction — today an x86 REP-prefixed string operation — actually
+ * retired during that one execution.  The value is produced by the target
+ * translation from the loop counter's own decrement (CX/ECX/RCX selected by
+ * the address size), so it is architectural truth and not a count of
+ * delivered instrumentation callbacks.
+ *
+ * This distinction is load-bearing because a REP is not always translated as
+ * a loop: exactly one iteration is generated whenever CF_USE_ICOUNT or
+ * CF_SINGLE_STEP is in the TB's cflags, or EFLAGS.TF or the interrupt shadow
+ * is set, and an exception or interrupt taken between iterations splits an
+ * already-looping REP the same way.  A tracer that inferred the iteration
+ * count from how many memory-op callbacks arrived in one execution would
+ * therefore report a different count — and a different trace shape — for
+ * identical guest execution.  Reading it here does not.
+ *
+ * Zero has two meanings, separated by qemu_plugin_rep_complete(): a REP
+ * entered with a zero counter (complete, and a real retired instruction),
+ * or the trailing pass QEMU makes over an instruction it has already
+ * finished when it translated only a single iteration (also complete, but
+ * not a new instruction — the caller should recognise it as a continuation
+ * of the instruction whose iterations it has already seen).
+ *
+ * Valid for the instruction most recently executed on this vCPU, so read it
+ * before running any further guest code (a wrong-path excursion included).
+ * Reads zero on targets with no fan-out instruction.  Must be called from a
+ * vCPU context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_iterations(void);
+
+/**
+ * qemu_plugin_rep_complete() - did the self-loop instruction retire?
+ *
+ * True when the fan-out instruction reported by
+ * qemu_plugin_rep_iterations() finished during that execution: its loop
+ * counter reached zero, or a REPZ/REPNZ flag condition broke the
+ * repetition.  False means QEMU will re-enter the same instruction to
+ * continue it — because it translated a single iteration, because it hit an
+ * internal chunk bound, or because an exception intervened — so more
+ * iterations of the same instruction are still to come.
+ *
+ * A tracer that models each iteration as its own control-flow event uses
+ * this to decide the last iteration's successor: an execution that did not
+ * retire loops back to the instruction, one that did falls through past it.
+ * That makes the emitted shape independent of how many iterations QEMU
+ * happened to pack into one execution.
+ *
+ * Must be called from a vCPU context, before any further guest code runs.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_complete(void);
+
+/**
+ * qemu_plugin_rep_pc() - which instruction the self-loop accounting describes
+ *
+ * Returns the virtual address of the fan-out instruction whose counts
+ * qemu_plugin_rep_iterations() and qemu_plugin_rep_complete() report — the
+ * same address qemu_plugin_insn_vaddr() gives for that instruction.  A
+ * consumer that reads the accounting later than the execution it belongs to,
+ * or on a target with no fan-out instruction at all (where the value stays
+ * zero), compares this against the instruction it is attributing and falls
+ * back instead of crediting another instruction's count.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_pc(void);
+
+/**
+ * qemu_plugin_rep_reenter() - will QEMU re-enter the self-loop instruction?
+ *
+ * True when the execution reported by qemu_plugin_rep_iterations() left by
+ * jumping back to the instruction's own address instead of past it, so the
+ * same instruction is about to be executed again.  Unlike
+ * qemu_plugin_rep_complete() this is an implementation fact rather than an
+ * architectural one, and it exists to make one artefact identifiable: a REP
+ * that QEMU translated as a single iteration re-enters itself even after the
+ * iteration that exhausted the counter, and that final re-entry performs zero
+ * iterations.  A consumer that models every iteration as an instruction uses
+ * this to recognise that zero-iteration execution as the same instruction
+ * finishing — not a new one — and so keep its instruction count independent
+ * of how QEMU translated the REP.
+ *
+ * True is also reported at QEMU's internal repetition bound, where a long
+ * REP is deliberately split into several executions to let the main loop run.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_reenter(void);
+
+/**
+ * qemu_plugin_rep_bytes() - bulk bytes the reported execution moved
+ *
+ * The architectural byte progress of the execution described by
+ * qemu_plugin_rep_pc(): for an AArch64 FEAT_MOPS SET/CPY execution this
+ * is the amount the instruction's own size register was decremented by,
+ * accumulated step by step so a fault mid-instruction leaves exactly the
+ * bytes that were transferred.  A consumer whose fan-out unit is one
+ * memory access (rather than an architectural iteration) uses this as
+ * the register-derived truth to verify the delivered access stream
+ * against: the sizes of the reported accesses must sum to it.  Targets
+ * that publish an iteration count instead (x86 REP) leave it 0.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_bytes(void);
+
+/**
+ * qemu_plugin_rep_chunk_boundary() - did the re-enter sit on a canonical
+ * chunk boundary?
+ *
+ * Qualifies qemu_plugin_rep_reenter(): true when the execution left the
+ * instruction at the point where QEMU's canonical loop translation itself
+ * re-enters — its internal repetition bound, reached when the written-back
+ * counter is one above a non-zero multiple of the bound (65536), under the
+ * instruction's address-size mask.  A looping translation only ever
+ * re-enters there, so its re-entries always report true; a single-iteration
+ * translation (-icount, single-step, TF, the interrupt shadow) re-enters
+ * after every iteration and reports true only at those same counter values.
+ *
+ * This is what lets a consumer reproduce, from any translation, the
+ * per-TB-execution instruction count the canonical translation produces —
+ * the count a per-TB inline counter (the bbv plugin feeding SimPoint
+ * clustering, or this plugin's own scoreboard) observes when no
+ * single-iteration lever is engaged: count executions, keep re-entries
+ * that report true, discard re-entries that report false.  Meaningless
+ * unless qemu_plugin_rep_reenter() is true.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_chunk_boundary(void);
+
+/**
+ * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's
+ * speculative-store footprint cross the soft budget?
+ *
+ * True when a single wrong-path instruction wrote a garbage-size region into
+ * the speculative store sandbox without faulting (it is buffered, not real),
+ * crossing PLUGIN_SPEC_STORE_SOFT_BUDGET lines.  A normal wpdepth-bounded
+ * excursion never trips this; the wrong-path loop should poll it and terminate
+ * the excursion so the sandbox is not filled to its hard cap (which would
+ * silently drop later speculative stores).  Always false in user mode / outside
+ * spec mode.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_spec_store_overflowed(void);
+
+/**
+ * qemu_plugin_spec_reserve_opens() - wrong-path walks that overflowed the
+ * translation buffer and had to open the speculative reserve
+ *
+ * A wrong-path walk cannot tb_flush: the flush would reset the code buffer
+ * under the correct-path TB the walk is nested inside.  When such a walk fills
+ * the buffer, TCG instead opens a reserve held back for exactly this case and
+ * owes a real tb_flush at the next safe point — so every count here is one
+ * walk that evicted the ENTIRE correct-path code cache.  A workload that does
+ * it on every excursion retranslates the world between guest instructions.
+ * Process-wide monotonic total across vCPUs; zero for a run whose wrong path
+ * never filled the buffer.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_reserve_opens(void);
+
+/**
+ * qemu_plugin_spec_reserve_exhausted() - wrong-path walks truncated because the
+ * speculative reserve ran out
+ *
+ * The reserve is finite.  When a single walk's translation footprint exceeds
+ * it, tb_gen_code returns NULL and the walk ends there — at a point determined
+ * by how full the buffer happened to be, which is not architectural state.  A
+ * tracer must not report that truncation as an architectural one (an
+ * unfetchable target): the two are indistinguishable at the walker, and only
+ * this counter separates them.  MUST BE 0 in any capture whose wrong-path
+ * content is expected to be reproducible.  Process-wide monotonic total.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_reserve_exhausted(void);
+
+/**
+ * qemu_plugin_translate_at() - translate the block at @pc without executing it
+ * @pc: the guest virtual address to translate at
+ *
+ * Every translation-time callback fires -- the translation callback with the
+ * whole qemu_plugin_tb and everything readable from it -- because this is a
+ * real translation.  That is the whole point: translation-time facts are
+ * keyed on the live qemu_plugin_tb and readable at no other moment, so the
+ * only way to observe QEMU translating a block the guest has not reached is
+ * to have QEMU translate it.
+ *
+ * The block is KEPT.  If the guest later reaches @pc the cached translation
+ * is a hit and the translation callback does not fire again, so what the
+ * plugin was shown is what executes.
+ *
+ * The translation CONTEXT is the current vCPU state, which is right for a
+ * fall-through or a same-mode branch target and wrong for a target in another
+ * mode.  Deciding that belongs to the caller, which knows which address it
+ * asked about and why.
+ *
+ * Call from a vCPU EXEC callback, on that vCPU's own thread.  Calling from a
+ * translation callback re-enters the translator and is refused by assertion.
+ *
+ * Returns true iff a translation now exists at @pc.  False means declined --
+ * an unreachable page, a translation-time fault, or a full code buffer -- and
+ * nothing was mutated.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_translate_at(uint64_t pc);
+
+/**
+ * qemu_plugin_decode_only_nobuf() - translate-on-demand declines for a full
+ * code buffer
+ *
+ * qemu_plugin_translate_at() runs from inside a plugin callback, so
+ * tb_gen_code's ordinary buffer-full arm -- a flush plus a longjmp -- would
+ * abandon that callback's frame.  A translate-only translation that cannot
+ * get a block therefore declines instead, and this counts the declines.  A
+ * caller that needs to know its coverage is complete reads this: a nonzero
+ * value says some blocks were never translated and why.  Process-wide
+ * monotonic total across vCPUs.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_decode_only_nobuf(void);
+
+/**
+ * qemu_plugin_spec_mem_faulted_take() - did the just-executed wrong-path memory
+ * access read a synthetic placeholder?
+ *
+ * Returns true (and clears the sentinel) when the memory access the current
+ * vCPU just performed on the wrong (speculative) path landed on an
+ * absent/unreadable page and was served a deterministic placeholder value
+ * instead of real memory — the excursion continues, but the value is
+ * synthetic.  A tracer calls this from its memory callback (which fires
+ * immediately after the access) to tag that memop as a synthetic-data fault.
+ * Reads false (and is a no-op) outside wrong-path execution and in user mode
+ * for accesses that hit real memory.  Consumes the flag, so a second call for
+ * the same access returns false.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_spec_mem_faulted_take(void);
+
+/**
+ * qemu_plugin_spec_syscall_blocked_count() - wrong-path syscalls refused
+ *
+ * Returns how many times a syscall was refused because the vCPU issuing it was
+ * on a plugin wrong path.  A speculative walk fetches and executes whatever
+ * the guest has ahead of a mispredicted branch, including syscall
+ * instructions; the walk continues past them at their architectural
+ * fall-through, but the call itself must never be performed, because in
+ * ``*-linux-user`` it is served by the HOST and would produce real side effects on
+ * a path the guest never takes.  That suppression is structural — a syscall
+ * instruction executed under qemu_plugin_spec_mode_begin() unwinds into
+ * qemu_plugin_exec_tb()'s landing pad, never into the syscall dispatcher — so
+ * this counter is a standing self-check rather than a policy knob and reads 0
+ * on a healthy run; a non-zero value means the suppression developed a hole
+ * and the trace ran with real side effects on it.  Always 0 in system
+ * emulation, where a syscall is guest kernel entry and has no host effect.
+ * Process-wide (all vCPUs); safe to call from plugin_exit().
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_syscall_blocked_count(void);
+
+/**
+ * qemu_plugin_spec_clear_exception() - drop a pending speculative exception
+ *
+ * Clears the guest exception a wrong-path EXECUTION-TIME fault latched when it
+ * longjmped out of a speculative qemu_plugin_exec_tb() (x86 #DE/#UD/#GP/#AC,
+ * INTO/BOUND; MIPS arithmetic overflow, teq-family trap).  The raise path
+ * (raise_exception_ra / cpu_loop_exit_restore) already unwound the guest PC
+ * back to the faulting instruction and left cpu->exception_index set; a
+ * wrong-path walker that skips the faulting insn and re-dispatches must call
+ * this first so the next speculative exec_tb starts with no exception pending.
+ * Sets exception_index to EXCP_NONE (-1 in common code, as cpu_loop_exit_noexc
+ * does).  Any arch-specific latch (x86 error_code, etc.) is register state
+ * covered by the CPUArchState snapshot restored wholesale at excursion end and
+ * is inert unless an exception is actually delivered, which the walker never
+ * does.  Only meaningful between qemu_plugin_spec_mode_begin() and _end().
+ * Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_clear_exception(void);
+
+/**
+ * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
+ *
+ * Returns a normalized privilege ordinal: 0 = user / least privileged,
+ * larger = more privileged (kernel/supervisor/hypervisor).  In ``*-linux-user``
+ * this is always 0.  Lets a plugin tell user-space execution from kernel /
+ * system execution (e.g. to count only the target program's user-space
+ * instructions, or stamp a kernel-vs-user bit).  Must be called from a vCPU
+ * context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_get_priv_level(void);
+
+/**
+ * qemu_plugin_get_addr_space_id() - current address-space id of the vCPU
+ *
+ * Returns the architectural identifier of the current address space — the
+ * page-table base / ASID register (x86 CR3, RISC-V SATP, Arm TTBR, MIPS
+ * ASID).  Unique per process address space, so a plugin can pin tracing to a
+ * single target process.  Returns 0 in ``*-linux-user`` (one address space).
+ * Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_addr_space_id(void);
+
+/**
+ * qemu_plugin_paging_enabled() - whether the guest MMU / paging is enabled
+ *
+ * Returns true when the executing vCPU's MMU / paging translation is active
+ * (x86 CR0.PG, Arm SCTLR.M, RISC-V SATP!=Bare; MIPS always has a TLB so
+ * reports true), false otherwise.  Always true in ``*-linux-user``.  A plugin
+ * that speculatively executes wrong-path code relies on the MMU to fault on
+ * fetches into non-code; with paging disabled there is no such bound, so the
+ * plugin should refrain from speculating.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_paging_enabled(void);
+
+/**
+ * qemu_plugin_vaddr_is_kernel() - classify a code VA's privilege domain
+ * @vaddr: a guest-virtual code (instruction-fetch) address
+ *
+ * Returns true when @vaddr lies in the guest's KERNEL (privileged) code
+ * region and false when it lies in the USER region, as decided by the
+ * target's own MMU / segment logic: the canonical upper half (x86_64), the
+ * TTBR1 region select (AArch64), the sign-extended kernel half for the
+ * active paging mode (RISC-V Sv39/48/57), or the fixed segment map (MIPS
+ * kuseg vs kseg).  Kernel and user virtual-address ranges are architecturally
+ * disjoint, so this is a pure range/bit test that never walks page tables and
+ * never faults — safe to call on a speculatively-fetched wrong-path address,
+ * and independent of the current privilege level (which speculative execution
+ * can mis-observe).
+ *
+ * Returns false unconditionally in ``*-linux-user`` (no kernel address space) and
+ * on any target that does not implement the classification.  Must be called
+ * from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
+
+/**
+ * qemu_plugin_get_thread_ptr() - the guest's per-thread pointer register
+ *
+ * Returns the per-software-thread pointer state the guest kernel
+ * maintains: x86_64 FS.base (GS.base for a 32-bit compat task), AArch64
+ * TPIDR_EL0, MIPS CP0 UserLocal — the TLS base, context-switched per
+ * thread — and on RISC-V the kernel's current-task pointer (sscratch
+ * while in user, tp while in kernel: the S-mode trap entry swaps the
+ * two, so that pair is the one value space that names the task at every
+ * privilege; a guest that never arms sscratch degrades to the raw tp).
+ * In every case the value is a stable per-guest-thread identity that
+ * survives vCPU migration — unlike the vCPU index, which names a
+ * scheduling slot, not a thread.
+ *
+ * A sample taken above user privilege is meaningful only where
+ * qemu_plugin_thread_ptr_tracks_current() reports true in that context.
+ * Returns 0 when the target provides no hook or the state was never
+ * written (e.g. a CPU model without the feature, or a guest that sets
+ * no TLS); threads without a thread pointer are architecturally
+ * indistinguishable.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_thread_ptr(void);
+
+/**
+ * qemu_plugin_thread_ptr_tracks_current() - is the thread pointer valid
+ *                                           above user privilege?
+ *
+ * Reports whether the register qemu_plugin_get_thread_ptr() reads keeps
+ * naming the software thread the vCPU is executing when sampled inside
+ * the kernel — i.e. whether the guest kernel reloads it from the incoming
+ * task at every context switch and otherwise leaves it alone.  Where this
+ * is true a plugin can follow a guest task switch that happens entirely
+ * in kernel code (a freshly cloned child taking over before it has ever
+ * run a user instruction, a kernel thread scheduled in, a handler running
+ * after the scheduler moved on) instead of attributing that work to
+ * whichever thread last entered the kernel on that vCPU.
+ *
+ * The answer is a property of the SAMPLING CONTEXT, not a flat target
+ * property: re-ask it at each privileged sample rather than latching one
+ * answer per run.  True for MIPS (CP0 UserLocal), AArch64 (TPIDR_EL0)
+ * and x86-64 (FS.base) at every privilege.  True for RISC-V at U/S
+ * privilege — the reported value there is the kernel's current-task
+ * pointer (see qemu_plugin_get_thread_ptr()) — but false in M-mode
+ * firmware (which runs on its own tp with the S-mode sscratch parked)
+ * and under H-extension virtualization.  False on any target without
+ * the thread-pointer hook.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_thread_ptr_tracks_current(void);
+
+/**
+ * qemu_plugin_set_current_task_offset() - declare where the guest kernel
+ *                                         keeps its current-task pointer
+ * @offset: byte offset of the kernel's current-task pointer within the
+ *          per-CPU region its kernel per-CPU base register addresses
+ *
+ * Some kernels keep no per-task pointer in a *register* at kernel
+ * privilege: Linux/x86-64 reaches ``current`` through the swapped-in
+ * kernel GS base at the per-CPU offset of ``current_task``
+ * (``pcpu_hot`` + 0 on 6.2 <= v < 6.14), a value decided at kernel
+ * link time and not recoverable from architectural state.  A plugin
+ * that has derived that
+ * offset for the guest image it is tracing (from the image's symbol
+ * table, System.map, or the guest's own /proc/kallsyms — per-CPU
+ * symbol values are 0-based offsets) declares it here; the target may
+ * then resolve kernel-privilege thread identity by reading the pointer
+ * through the live per-CPU base.
+ *
+ * The offset is BUILD-dependent.  Declaring a value from a different
+ * kernel image than the one running reads unrelated per-CPU state and
+ * mints wrong identities; when the offset for the running image is not
+ * known, do not call this — the target then keeps its register-only
+ * contract (qemu_plugin_thread_ptr_tracks_current() reports what that
+ * contract can honour, and samples it cannot vouch for are inherited
+ * rather than fabricated).
+ *
+ * Consumed today by x86-64 only; other targets ignore the declaration
+ * (their kernels keep the task pointer in a register).  Process-global
+ * (one guest kernel per emulation); callable at install time, before
+ * any vCPU exists.  No-op in ``*-linux-user``.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_set_current_task_offset(uint64_t offset);
+
+/**
+ * qemu_plugin_icount_enabled() - whether QEMU is running with -icount
+ *
+ * Returns true when instruction-count timing is active.  Under icount the
+ * guest virtual clock is driven by the instruction count rather than host
+ * wall-clock, so the wrong-path virtual-clock freeze (cpu_disable_ticks) does
+ * NOT stop guest time from advancing during a speculative excursion.  A plugin
+ * that speculatively executes wrong-path code should refrain from speculating
+ * under icount (the excursion's instructions would leak into guest time).
+ * Always false in ``*-linux-user``.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_icount_enabled(void);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

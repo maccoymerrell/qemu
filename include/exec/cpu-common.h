@@ -26,6 +26,99 @@
 void cpu_exec_init_all(void);
 void cpu_exec_step_atomic(CPUState *cpu);
 
+/* Plugin helpers for wrong-path speculative execution */
+bool cpu_plugin_exec_inline(CPUState *cpu);
+bool cpu_plugin_exec_tb(CPUState *cpu);
+#ifdef CONFIG_PLUGIN
+/*
+ * Translate (and keep) the block at @pc without executing it, so a plugin's
+ * translation-time callbacks state QEMU's answer about code the guest has not
+ * reached.  See the definition in accel/tcg/cpu-exec.c.
+ */
+bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc);
+#endif
+size_t cpu_plugin_arch_state_size(void);
+void cpu_plugin_arch_state_restore(void *saved, size_t size);
+/*
+ * Wrong-path containment helpers with system-only side effects.  Defined in
+ * cpu-exec.c (compiled per-target, so the CONFIG_USER_ONLY split applies);
+ * no-ops in user-mode emulation.  Called from the common plugins/api.c, which
+ * itself must not reference softmmu-only symbols directly.
+ */
+#ifdef CONFIG_PLUGIN
+void cpu_plugin_spec_vtime_pause(CPUState *cpu);
+void cpu_plugin_spec_vtime_resume(CPUState *cpu);
+#endif
+
+/**
+ * SpecClockResyncReason: which plugin clock freeze just ended
+ *
+ * The plugin freezes the guest virtual clock in two situations, and the
+ * per-target TCGCPUOps::spec_clock_resync hook is told which one it is
+ * unfreezing from.  Both freezes must leave guest time unmoved; they differ
+ * in whether guest architectural state also moved and came back.
+ */
+typedef enum SpecClockResyncReason {
+    /*
+     * A wrong-path (speculative) excursion ended.  The clock was frozen for
+     * its whole duration AND the speculative register state has just been
+     * rolled back, so architectural compare registers and pending-interrupt
+     * bits may have been rewound underneath host timers and IRQ lines that
+     * were not.  Host timer callbacks that fired during the excursion were
+     * suppressed and must be re-delivered.  This is the full reconcile.
+     */
+    SPEC_CLOCK_EXCURSION_END,
+    /*
+     * A correct-path plugin instrumentation window ended (translation-time
+     * decoding, per-TB trace emission).  No guest state moved; only the
+     * clock was frozen and thawed.  A target whose architectural counter is
+     * derived from a different host source than the virtual clock (x86's
+     * TSC) must still re-pin it, because the two sources drift apart across
+     * every freeze; a target whose counters are all derived from the virtual
+     * clock has nothing to do.
+     */
+    SPEC_CLOCK_THAW,
+} SpecClockResyncReason;
+#ifdef CONFIG_PLUGIN
+void cpu_plugin_spec_tlb_flush(CPUState *cpu);
+void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
+/*
+ * Excursion-scoped softmmu TLB bookkeeping: _note snapshots the per-mmu_idx
+ * large-page escalation region at entry; _flush_logged invalidates exactly the
+ * entries the wrong path installed and restores that region at exit.
+ */
+void cpu_plugin_spec_tlb_note(CPUState *cpu);
+void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
+bool cpu_plugin_spec_mode_supported(void);
+void cpu_plugin_vclock_pause(CPUState *cpu);
+void cpu_plugin_vclock_resume(CPUState *cpu);
+/*
+ * Code-buffer pressure a wrong-path (speculative) walk put on the shared
+ * translation cache.  _opens counts walks that overflowed the normal
+ * highwater and had to open the spec reserve — each of those owes a full
+ * tb_flush the moment the walk unwinds, so a nonzero count is a walk that
+ * evicted the whole correct-path cache.  _exhausted counts walks the
+ * reserve itself could not hold: tb_gen_code returned NULL and the chain
+ * was truncated at a point that depends on how full the buffer happened to
+ * be, not on anything architectural.  Both are host-side, cross-vCPU
+ * process-wide totals; the plugin reads them through
+ * qemu_plugin_spec_reserve_opens()/_exhausted().
+ */
+extern unsigned long plugin_spec_reserve_opens;
+extern unsigned long plugin_spec_reserve_exhausted;
+/*
+ * Translate-on-demand translations (cpu_plugin_translate_tb) that could not
+ * get a TB because the code buffer was full.  The flag exists so that case
+ * DECLINES instead of taking tb_gen_code's ordinary tb_flush + cpu_loop_exit
+ * arm, which would longjmp out of the plugin callback the translation was
+ * driven from.  Counted so the decline is a number and not a claim: it is the
+ * difference between a guard that holds and a guard nothing ever reached.
+ * Host-side, cross-vCPU, process-wide; read through
+ * qemu_plugin_decode_only_nobuf().
+ */
+extern unsigned long plugin_decode_only_nobuf;
+#endif /* CONFIG_PLUGIN */
+
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 
 /* The CPU list lock nests outside page_(un)lock or mmap_(un)lock */

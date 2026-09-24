@@ -133,11 +133,157 @@ static void riscv_restore_state_to_opc(CPUState *cs,
     env->excp_uw2 = data[2];
 }
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void riscv_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                   bool *mmu_on)
+{
+    CPURISCVState *env = cpu_env(cs);
+    *priv = env->priv;     /* PRV_U(0) = user, PRV_S(1)/PRV_M(3) privileged */
+    *asid = env->satp;     /* SATP: page-table base + ASID */
+    /* Translation active iff not M-mode and SATP selects a paging mode
+     * (SATP != 0 ⇒ MODE field non-Bare). */
+    *mmu_on = (env->priv != PRV_M) && (env->satp != 0);
+}
+
+static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
+static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPURISCVState *env = cpu_env(cs);
+    /*
+     * The current-task pointer, not the raw tp register.  RISC-V is the one
+     * target where the raw register cannot serve as a cross-privilege thread
+     * identity: the S-mode trap entry contract (Linux
+     * arch/riscv/kernel/entry.S, handle_exception) swaps tp with sscratch
+     * (csrrw tp, CSR_SCRATCH, tp) and later writes sscratch to 0, and the
+     * return path (csrw CSR_SCRATCH, tp, then the register restore) reverses
+     * it.  The task pointer is therefore always in ONE of the two registers,
+     * but WHICH one changes four times per trap:
+     *
+     *   in user:            tp = user TLS,   sscratch = task
+     *   trap entry, pre-swap (the first kernel TB, at stvec):
+     *                       tp = user TLS,   sscratch = task
+     *   entry, post-swap, before `csrw sscratch, x0` (.Lsave_context is a
+     *   BRANCH TARGET, so a TB starts inside this window on every trap from
+     *   user — it is not a single-step-only sliver):
+     *                       tp = task,       sscratch = user TLS
+     *   in kernel, steady:  tp = task,       sscratch = 0
+     *   kernel->kernel trap, between the swap and `csrr tp, CSR_SCRATCH`:
+     *                       tp = 0,          sscratch = task
+     *
+     * What is invariant across all five is that the task pointer is the one
+     * of the pair that is a KERNEL virtual address (task_struct lives in the
+     * kernel's direct map; a user TLS base and the 0 sentinel are not), and
+     * that is what this hook selects.  In S mode tp holds it except in the
+     * pre-swap window, so tp wins the tie; in U mode sscratch holds it.  One
+     * identity value space at every privilege, which is what a per-thread
+     * identity needs, and no window in which the two disagree silently.
+     *
+     * A guest that does not follow the convention (no S-mode OS below,
+     * sscratch never armed, paging Bare) leaves neither register looking like
+     * a kernel address and degrades to the raw tp — the historical value.
+     * M-mode firmware and H-extension virtualization are outside the
+     * contract: plugin_thread_ptr_tracks_current reports false there, and
+     * under virt the rule is not applied at all (vsscratch, not sscratch, is
+     * the swapped register).
+     */
+    if (env->virt_enabled) {
+        return env->gpr[4];
+    }
+    uint64_t tp = env->gpr[4];
+    uint64_t ss = env->sscratch;
+    if (env->priv == PRV_U) {
+        return riscv_vaddr_is_kernel(cs, ss) ? ss : tp;
+    }
+    if (riscv_vaddr_is_kernel(cs, tp)) {
+        return tp;
+    }
+    return riscv_vaddr_is_kernel(cs, ss) ? ss : tp;
+}
+
+static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPURISCVState *env = cpu_env(cs);
+    /* The current-task rule above holds at U/S privilege outside
+     * H-extension virtualization.  M-mode firmware runs on its own tp
+     * (OpenSBI swaps it with mscratch) with the S-mode sscratch parked at
+     * 0, so a sample there names the firmware, not a guest task. */
+    return !env->virt_enabled && env->priv <= PRV_S;
+}
+
+static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPURISCVState *env = cpu_env(cs);
+    /*
+     * A paged RV64 VA must be sign-extended (canonical) from the width of the
+     * active SATP mode: Sv39 → 39 bits, Sv48 → 48, Sv57 → 57.  User VAs
+     * occupy the low canonical half (sign bit clear); the kernel half is the
+     * high, all-ones-extended range (sign bit set), where the OS maps kernel
+     * text.  The guest PC reaches the plugin already sign-extended to 64 bits,
+     * so "kernel" is exactly the addresses whose bits above the sign bit are
+     * all ones — a threshold derived from the live paging width.  With paging
+     * Bare, in M-mode (translation bypassed), or on RV32 (not a system-mode
+     * target; its 32-bit VA is not 64-bit sign-extended), there is no such
+     * kernel/user split — report user. */
+    if (env->priv == PRV_M || riscv_cpu_mxl(env) == MXL_RV32) {
+        return false;
+    }
+    unsigned va_bits;
+    switch (get_field(env->satp, SATP64_MODE)) {
+    case VM_1_10_SV39: va_bits = 39; break;
+    case VM_1_10_SV48: va_bits = 48; break;
+    case VM_1_10_SV57: va_bits = 57; break;
+    default:           return false;   /* Bare / unknown: do not classify */
+    }
+    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
+}
+
+/*
+ * TCGCPUOps::spec_clock_resync for RISC-V — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * RISC-V's audit.  The guest reads time through the `time` CSR, which is
+ * rdtime_fn into the ACLINT mtime counter, itself a function of
+ * QEMU_CLOCK_VIRTUAL: frozen and thawed at the same value, so the counter
+ * needs no re-derivation.  The armed host timers are three -- the ACLINT
+ * machine timer behind mtimecmp (device state, but a one-shot QEMUTimer that
+ * does not re-arm itself), and the Sstc env->stimer/env->vstimer behind
+ * stimecmp/vstimecmp (architectural registers inside the rolled-back
+ * snapshot).  All three are re-armed from their compare registers, and any
+ * expiry the excursion gates suppressed is re-delivered, by
+ * riscv_cpu_plugin_resync_timers.
+ *
+ * The pending-interrupt side has two halves.  CPU_INTERRUPT_HARD is
+ * recomputed from the restored mip (riscv_cpu_interrupt suppresses line
+ * drives for the whole excursion, so line and register can disagree in either
+ * direction), and the externally-asserted mip bits an excursion would
+ * otherwise have swallowed are replayed by cpu_plugin_arch_state_restore
+ * before we get here.
+ *
+ * SPEC_CLOCK_THAW needs nothing: every RISC-V counter is a pure function of
+ * the virtual clock.
+ */
+static void riscv_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    riscv_cpu_plugin_resync_timers(cs);
+}
+#endif
+
 static const TCGCPUOps riscv_tcg_ops = {
     .initialize = riscv_translate_init,
     .translate_code = riscv_translate_code,
     .synchronize_from_tb = riscv_cpu_synchronize_from_tb,
     .restore_state_to_opc = riscv_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = riscv_get_plugin_state,
+    .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
+    .plugin_thread_ptr_tracks_current = riscv_plugin_thread_ptr_tracks_current,
+    .vaddr_is_kernel = riscv_vaddr_is_kernel,
+    .spec_clock_resync = riscv_spec_clock_resync,
+#endif
 
 #ifndef CONFIG_USER_ONLY
     .tlb_fill = riscv_cpu_tlb_fill,
@@ -1074,7 +1220,10 @@ static bool riscv_tcg_cpu_realize(CPUState *cs, Error **errp)
 #ifndef CONFIG_USER_ONLY
     CPURISCVState *env = &cpu->env;
 
-    tcg_cflags_set(CPU(cs), CF_PCREL);
+    /* Pc-relative TBs — unless a TCG plugin is loaded (see
+     * tcg_cflags_set_pcrel: a pc-less TB identity misattributes plugin
+     * records across virtual mappings of one physical page). */
+    tcg_cflags_set_pcrel(CPU(cs));
 
     if (cpu->cfg.ext_sstc) {
         riscv_timer_init(cpu);

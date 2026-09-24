@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/plugin-gen.h"
 #include "translate.h"
 #include "tcg/tcg-op-gvec.h"
 
@@ -37,6 +38,7 @@ static bool trans_BBIT(DisasContext *ctx, arg_BBIT *a)
 
     ctx->hflags |= MIPS_HFLAG_BC;
     ctx->btarget = ctx->base.pc_next + 4 + a->offset * 4;
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
     ctx->hflags |= MIPS_HFLAG_BDS32;
     return true;
 }

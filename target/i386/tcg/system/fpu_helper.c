@@ -31,6 +31,18 @@ void x86_register_ferr_irq(qemu_irq irq)
 
 void fpu_check_raise_ferr_irq(CPUX86State *env)
 {
+    /*
+     * Wrong-path (speculative): asserting FERR# (env->ferr_irq, wired to a
+     * GSI on the PC machine) is a host IRQ-line side effect that lives
+     * outside the WP env snapshot and is not lowered on rollback.  The
+     * architected x87 status (env->fpus/fpstt) is in-snapshot and rolled
+     * back, so we drop only the external IRQ-line assertion here.  The
+     * CR0.NE=1 (#MF) path in fpu_raise_exception is unaffected: it raises
+     * an exception that already aborts the WP chain.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
     if (ferr_irq && !(env->hflags2 & HF2_IGNNE_MASK)) {
         bql_lock();
         qemu_irq_raise(ferr_irq);
@@ -39,9 +51,18 @@ void fpu_check_raise_ferr_irq(CPUX86State *env)
     }
 }
 
-void cpu_clear_ignne(void)
+/*
+ * Takes the env it acts on.  Its sole caller is cpu_set_fpus(), i.e. an
+ * x87 state load executing ON a vCPU, and IGNNE is that vCPU's own hidden
+ * flag; reading first_cpu instead made an FRSTOR/FLDENV/XRSTOR on any vCPU
+ * but the first clear vCPU 0's IGNNE and leave its own set.  The reader,
+ * fpu_check_raise_ferr_irq(), then asserts FERR# on vCPU 0's next unmasked
+ * x87 error, an interrupt that guest never earned.  (cpu_set_ignne() keeps
+ * first_cpu deliberately: its caller is the port-F0h chipset write, which
+ * is a machine-wide event and holds the BQL to prove it.)
+ */
+void cpu_clear_ignne(CPUX86State *env)
 {
-    CPUX86State *env = &X86_CPU(first_cpu)->env;
     env->hflags2 &= ~HF2_IGNNE_MASK;
 }
 

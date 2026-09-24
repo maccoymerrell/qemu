@@ -4137,10 +4137,10 @@ static void fill_prstatus_note(void *data, CPUState *cpu, int signr)
     struct target_elf_prstatus prstatus = {
         .pr_info.si_signo = signr,
         .pr_cursig = signr,
-        .pr_pid = get_task_state(cpu)->ts_tid,
-        .pr_ppid = getppid(),
-        .pr_pgrp = getpgrp(),
-        .pr_sid = getsid(0),
+        .pr_pid = vpid_from_host(get_task_state(cpu)->ts_tid),
+        .pr_ppid = vpid_ppid(),
+        .pr_pgrp = vpid_pgrp(),
+        .pr_sid = vpid_sid(),
     };
 
     elf_core_copy_regs(&prstatus.pr_reg, cpu_env(cpu));
@@ -4156,10 +4156,10 @@ static void fill_prpsinfo_note(void *data, const TaskState *ts)
      * memcpy to the destination afterward.
      */
     struct target_elf_prpsinfo psinfo = {
-        .pr_pid = getpid(),
-        .pr_ppid = getppid(),
-        .pr_pgrp = getpgrp(),
-        .pr_sid = getsid(0),
+        .pr_pid = vpid_tgid(),
+        .pr_ppid = vpid_ppid(),
+        .pr_pgrp = vpid_pgrp(),
+        .pr_sid = vpid_sid(),
         .pr_uid = getuid(),
         .pr_gid = getgid(),
     };

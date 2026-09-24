@@ -61,6 +61,7 @@
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
+#include "qemu/cst_bqslice.h"
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "internal-target.h"
@@ -217,6 +218,17 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
          * shift if to the number of actually executed instructions.
          */
         cpu->neg.icount_decr.u16.low += insns_left;
+    } else if (cst_bq_on && !(tb_cflags(tb) & CF_NOIRQ)) {
+        /*
+         * The identical refund for slice-billed TBs (gen_tb_start
+         * billed the whole TB at entry; a mid-TB unwind must give the
+         * unexecuted tail back, exactly as icount does above).  The
+         * arming edge precedes any translation, so any TB being
+         * unwound off-icount was billed iff !CF_NOIRQ.  Cannot
+         * overflow: low_at_entry <= quantum <= 0xffff and
+         * low_now + insns_left <= low_at_entry.
+         */
+        cpu->neg.icount_decr.u16.low += insns_left;
     }
 
     cpu->cc->tcg_ops->restore_state_to_opc(cpu, tb, data);
@@ -286,6 +298,13 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+#ifdef CONFIG_PLUGIN
+/* See the declarations in exec/cpu-common.h. */
+unsigned long plugin_spec_reserve_opens;
+unsigned long plugin_decode_only_nobuf;
+unsigned long plugin_spec_reserve_exhausted;
+#endif
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               vaddr pc, uint64_t cs_base,
@@ -319,6 +338,71 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     assert_no_pages_locked();
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
+#ifdef CONFIG_PLUGIN
+        if (cpu->plugin_decode_only) {
+            /*
+             * The code buffer filled while translating a block ON DEMAND for
+             * a plugin -- a block the guest has not reached and may never
+             * reach.  Both arms below are wrong for it.  tb_flush +
+             * cpu_loop_exit is a longjmp out of the plugin exec callback this
+             * translation is driven from, with the plugin's own locks held;
+             * and the spec reserve exists to let an in-flight wrong-path WALK
+             * finish, which is not what is in flight here.
+             *
+             * A translate-on-demand that cannot get a TB simply does not
+             * happen.  Return NULL with the same lock contract the exhausted
+             * arm below uses (mmap still held; the caller unlocks after
+             * tb_gen_code and handles NULL) and the caller declines.  Tested
+             * BEFORE plugin_spec_mode so a decode-only translation nested
+             * inside an excursion never opens the reserve on the walk's
+             * behalf.
+             */
+            qatomic_inc(&plugin_decode_only_nobuf);
+            return NULL;
+        }
+        if (cpu->plugin_spec_mode) {
+            /*
+             * The code buffer filled while translating a plugin wrong-path
+             * (speculative) TB.  We must NOT tb_flush here: the flush resets
+             * the buffer under the correct-path TB this wrong-path walk is
+             * nested inside (the walk runs synchronously from that TB's
+             * vcpu_tb_exec plugin callback), and post-flush translation would
+             * overwrite the host code we still have to return into -> SIGSEGV.
+             *
+             * Instead, on the first overflow of this walk, open the spec
+             * reserve held back by tcg_region_assign so the walk runs on, and
+             * flag the flush so cpu_exec_loop() performs it at the next safe
+             * point, once the walk has unwound and the correct-path TB has
+             * finished.
+             *
+             * The reserve is finite, so "runs on" is not "runs to its natural
+             * end": a walk whose footprint exceeds the reserve is cut below,
+             * at a depth set by how full the buffer happened to be.  The
+             * wrong-path chain is therefore flush-invariant only while
+             * plugin_spec_reserve_exhausted stays zero, which is why that
+             * counter is exported rather than described.
+             */
+            if (!cpu->plugin_flush_pending) {
+                cpu->plugin_flush_pending = true;
+                tcg_region_open_spec_reserve(tcg_ctx);
+                qatomic_inc(&plugin_spec_reserve_opens);
+                goto buffer_overflow;          /* retry alloc into the reserve */
+            }
+            /*
+             * The reserve itself is exhausted: a single wrong-path walk's
+             * translation footprint exceeds it (only reachable with a very
+             * large wpdepth; the reserve is sized for the default).  End the
+             * walk here — the flush is already owed.  Logged, never silent.
+             * Return NULL with mmap held: the plugin exec callers unlock
+             * after tb_gen_code and handle NULL (no double-unlock).
+             */
+            qatomic_inc(&plugin_spec_reserve_exhausted);
+            qemu_log_mask(CPU_LOG_TB_OP,
+                          "plugin spec reserve exhausted; wrong-path walk "
+                          "truncated (consider a larger code buffer)\n");
+            return NULL;
+        }
+#endif
         /* flush must be done */
         tb_flush(cpu);
         mmap_unlock();

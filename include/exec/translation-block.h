@@ -80,6 +80,7 @@ struct TranslationBlock {
 #define CF_NOIRQ         0x00010000 /* Generate an uninterruptible TB */
 #define CF_PCREL         0x00020000 /* Opcodes in TB are PC-relative */
 #define CF_BP_PAGE       0x00040000 /* Breakpoint present in code page */
+#define CF_FORCE_SLOW    0x00080000 /* Force slow-path for all mem ops */
 #define CF_CLUSTER_MASK  0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
 
@@ -156,5 +157,6 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 
 bool tcg_cflags_has(CPUState *cpu, uint32_t flags);
 void tcg_cflags_set(CPUState *cpu, uint32_t flags);
+void tcg_cflags_set_pcrel(CPUState *cpu);
 
 #endif /* EXEC_TRANSLATION_BLOCK_H */

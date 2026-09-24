@@ -26,6 +26,7 @@
 #include "translate.h"
 #include "internal.h"
 #include "exec/helper-proto.h"
+#include "exec/plugin-gen.h"
 #include "exec/translation-block.h"
 #include "semihosting/semihost.h"
 #include "trace.h"
@@ -4590,6 +4591,15 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     }
 
     ctx->btarget = btgt;
+    /*
+     * Surface the resolved static target to plugins for wrong-path
+     * tracing.  Indirect branches (OPC_JR/OPC_JALR) leave btgt at
+     * its -1 sentinel above — those rely on the plugin's observed-
+     * target history instead, signalled by branch_target_pc == 0.
+     */
+    if (btgt != (target_ulong)-1) {
+        plugin_gen_record_branch_target((uint64_t)btgt);
+    }
 
     switch (delayslot_size) {
     case 2:
@@ -6054,6 +6064,10 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
+            /* Q13 v4 default, maintainer-vetoable: EntryHi ASID_WRITE is
+             * the sole gate-refresh event; PWBase is stored inline (its
+             * committed-write event push retired with the identity
+             * apparatus). */
             gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_PWBase));
             register_name = "PWBase";
             break;
@@ -8768,6 +8782,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         return;
     }
     ctx->btarget = btarget;
+    plugin_gen_record_branch_target((uint64_t)btarget);
     ctx->hflags |= MIPS_HFLAG_BDS32;
 }
 
@@ -8811,6 +8826,7 @@ static void gen_compute_branch1_r6(DisasContext *ctx, uint32_t op,
     tcg_gen_trunc_i64_tl(bcond, t0);
 
     ctx->btarget = btarget;
+    plugin_gen_record_branch_target((uint64_t)btarget);
 
     switch (delayslot_size) {
     case 2:
@@ -11010,6 +11026,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         if (rs <= rt && rs == 0) {
             /* OPC_BEQZALC, OPC_BNEZALC */
             tcg_gen_movi_tl(cpu_gpr[31], ctx->base.pc_next + 4 + m16_lowbit);
@@ -11021,6 +11038,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC */
     case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC */
@@ -11033,10 +11051,12 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BC:
     case OPC_BALC:
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BEQZC:
     case OPC_BNEZC:
@@ -11045,6 +11065,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             gen_load_gpr(t0, rs);
             bcond_compute = 1;
             ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+            plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         } else {
             /* OPC_JIC, OPC_JIALC */
             TCGv tbase = tcg_temp_new();
@@ -15155,6 +15176,18 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     } else {
         gen_reserved_instruction(ctx);
         g_assert(ctx->base.is_jmp == DISAS_NORETURN);
+        /*
+         * MIPS_HFLAG_M16 is set on a CPU that implements neither MIPS16e
+         * nor microMIPS, so nothing was fetched and there is no instruction
+         * length to add.  The TB still needs one: translator_loop() derives
+         * tb->size from pc_next, and a zero-length TB trips
+         * assert(tb->size != 0) in setjmp_gen_code(), killing the process
+         * instead of delivering the Reserved Instruction exception just
+         * raised.  Two bytes is the shortest instruction any ISA mode of
+         * this architecture has, and no byte of it was consulted during
+         * translation, so it cannot under-cover the TB's invalidation range.
+         */
+        ctx->base.pc_next += 2;
         return;
     }
 
@@ -15223,12 +15256,42 @@ static void mips_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     }
 }
 
+/*
+ * v4 repair (maintainer-vetoable): never-split RETREAT support.  The
+ * checkpoint captures hflags at each insn boundary; a retreat restores
+ * it, so ending the TB at a boundary that re-opens a delay slot (the
+ * dropped sequence's first insn was the slot of a kept branch) re-arms
+ * the pending-branch state.  saved_hflags is poisoned so save_cpu_state
+ * in tb_stop re-emits the hflags (and, under BMASK, btarget) stores —
+ * the spills it thinks it already emitted may have been dropped with
+ * the retreated ops.  ctx->btarget itself is compile-time state set by
+ * the kept branch and is still valid.  The dropped insns are LUI/ORI
+ * immediate loads and never touch hflags themselves.
+ */
+static uint64_t mips_tr_nosplit_checkpoint(DisasContextBase *dcbase,
+                                           CPUState *cpu)
+{
+    return container_of(dcbase, DisasContext, base)->hflags;
+}
+
+static bool mips_tr_nosplit_retreat(DisasContextBase *dcbase, CPUState *cpu,
+                                    vaddr retreat_pc, uint64_t checkpoint)
+{
+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    ctx->hflags = (uint32_t)checkpoint;
+    ctx->saved_hflags = ~ctx->hflags;
+    return true;
+}
+
 static const TranslatorOps mips_tr_ops = {
     .init_disas_context = mips_tr_init_disas_context,
     .tb_start           = mips_tr_tb_start,
     .insn_start         = mips_tr_insn_start,
     .translate_insn     = mips_tr_translate_insn,
     .tb_stop            = mips_tr_tb_stop,
+    .nosplit_checkpoint = mips_tr_nosplit_checkpoint,
+    .nosplit_retreat    = mips_tr_nosplit_retreat,
 };
 
 void mips_translate_code(CPUState *cs, TranslationBlock *tb,

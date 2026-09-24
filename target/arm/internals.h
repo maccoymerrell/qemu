@@ -995,6 +995,23 @@ void arm_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
 /* Call any registered EL change hooks */
 static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) containment.  The EL-change hooks dispatch
+     * device-facing callbacks — PMU counters, the GICv3 CPU-interface
+     * maintenance state, the generic-timer RME recalc — that live outside
+     * the CPUArchState register snapshot the wrong-path walk rolls back.
+     * A speculative `eret` (or AArch32 exception return) fires these on
+     * every excursion; left live, the discarded path mutates GIC/PMU/timer
+     * device state for good.  On aarch64 system mode this corrupted the
+     * GICv3 interface so the kernel never took another timer interrupt and
+     * never returned to the traced user process (observed: user_covered=0).
+     * x86 has no analogous per-EL hook, which is why it was unaffected.
+     */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        return;
+    }
+#endif
     ARMELChangeHook *hook, *next;
     QLIST_FOREACH_SAFE(hook, &cpu->pre_el_change_hooks, node, next) {
         hook->hook(cpu, hook->opaque);
@@ -1002,6 +1019,13 @@ static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
 }
 static inline void arm_call_el_change_hook(ARMCPU *cpu)
 {
+#ifdef CONFIG_PLUGIN
+    /* See arm_call_pre_el_change_hook: suppress device side effects of a
+     * speculative exception-level change. */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        return;
+    }
+#endif
     ARMELChangeHook *hook, *next;
     QLIST_FOREACH_SAFE(hook, &cpu->el_change_hooks, node, next) {
         hook->hook(cpu, hook->opaque);

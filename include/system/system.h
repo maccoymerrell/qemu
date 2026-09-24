@@ -24,6 +24,18 @@ void qemu_remove_machine_init_done_notifier(Notifier *notify);
 
 void configure_rtc(QemuOpts *opts);
 
+/**
+ * rtc_adopt_vm_clock_for_plugin: move the RTC onto the frozen clock
+ *
+ * When a TCG plugin is loaded and the user did not select an RTC clock
+ * explicitly, switch rtc_clock from QEMU_CLOCK_HOST to QEMU_CLOCK_VIRTUAL so
+ * the board's RTC -- whichever model it is, since they all read the one
+ * rtc_clock global -- is frozen alongside every other guest clock when the
+ * plugin stops guest time.  Must be called after plugins are loaded and
+ * before any device realizes; qemu_init_board() is that point.
+ */
+void rtc_adopt_vm_clock_for_plugin(void);
+
 void qemu_init_subsystems(void);
 
 extern int autostart;

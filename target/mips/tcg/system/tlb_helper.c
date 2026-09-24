@@ -271,13 +271,36 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
     }
 }
 
+/*
+ * Wrong-path (speculative) containment.  The emulated MIPS TLB array
+ * (env->tlb->mmu...) lives PAST end_reset_fields in CPUMIPSState, so it is
+ * NOT part of the register snapshot the wrong-path walk rolls back.  A
+ * speculative TLBWI/TLBWR/TLBINV(F) rewrites that array (and may flush the
+ * softmmu TLB), and the change survives the walk — corrupting the correct
+ * path's address translation.  Suppress these on the discarded path; the
+ * CP0 registers they consume (EntryHi/Lo/Index) are in the snapshot and are
+ * rolled back regardless.
+ */
+#ifdef CONFIG_PLUGIN
+#define MIPS_WP_TLB_GATE(env)                          \
+    do {                                               \
+        if (env_cpu(env)->plugin_spec_mode) {          \
+            return;                                    \
+        }                                              \
+    } while (0)
+#else
+#define MIPS_WP_TLB_GATE(env) do { } while (0)
+#endif
+
 void helper_tlbwi(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbwi(env);
 }
 
 void helper_tlbwr(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbwr(env);
 }
 
@@ -288,16 +311,19 @@ void helper_tlbp(CPUMIPSState *env)
 
 void helper_tlbr(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbr(env);
 }
 
 void helper_tlbinv(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbinv(env);
 }
 
 void helper_tlbinvf(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbinvf(env);
 }
 
@@ -338,6 +364,11 @@ static void global_invalidate_tlb(CPUMIPSState *env,
 
 void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
 {
+    /*
+     * Wrong-path: global_invalidate_tlb writes tlb->EHINV into the emulated
+     * TLB array of every vCPU (out of this CPU's snapshot). Skip in spec mode.
+     */
+    MIPS_WP_TLB_GATE(env);
     bool invAll = type == 0;
     bool invVA = type == 1;
     bool invMMid = type == 2;
@@ -937,7 +968,20 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         return true;
     }
 #if !defined(TARGET_MIPS64)
-    if ((ret == TLBRET_NOMATCH) && (env->tlb->nb_tlb > 1)) {
+    if ((ret == TLBRET_NOMATCH) && (env->tlb->nb_tlb > 1)
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative): the hardware page-table walker inserts the
+         * walked entry into the emulated TLB array via r4k_helper_tlbwr (tlbwr
+         * shadow + tlb_in_use), which lives AFTER end_reset_fields and is not
+         * rolled back by the register snapshot.  The forced-probe in
+         * tlb_fill_align only suppresses the final raise, not the walker's
+         * side effect, so skip the HTW refill on the discarded path; the miss
+         * is then reported as a probe failure and aborts the wrong-path chain.
+         */
+        && !cs->plugin_spec_mode
+#endif
+        ) {
         /*
          * Memory reads during hardware page table walking are performed
          * as if they were kernel-mode load instructions.
@@ -1027,6 +1071,39 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
     }
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * True only for synchronous exceptions whose handler RE-EXECUTES the faulting
+ * instruction — i.e. ERET returns to exactly the PC we recorded as the resume
+ * PC.  The tracer's fault-excursion stack pops on an exact resume-PC match, so
+ * only these may push a frame.  An exception whose handler ADVANCES past the
+ * instruction (SYSCALL/BREAK/TRAP/RI/OVERFLOW/FPE, unaligned AdEL/AdES emulated
+ * and skipped, …) would push a frame that never pops and leave the depth stuck
+ * +1 for the rest of that ASID's execution.  The re-executing set is the whole
+ * TLB family (demand paging — the common case, plus LTLBL = TLB-Modified,
+ * execute/read-inhibit) and the coprocessor/feature-unusable faults that lazily
+ * enable a unit and re-run the instruction.
+ */
+static inline bool mips_fault_reexecutes(int excp)
+{
+    switch (excp) {
+    case EXCP_TLBF:     /* TLB refill                       */
+    case EXCP_TLBL:     /* TLB invalid (load/fetch)         */
+    case EXCP_TLBS:     /* TLB invalid (store)              */
+    case EXCP_LTLBL:    /* TLB modified (store to clean pg) */
+    case EXCP_TLBXI:    /* TLB execute-inhibit              */
+    case EXCP_TLBRI:    /* TLB read-inhibit                 */
+    case EXCP_CpU:      /* coprocessor unusable (lazy FP)   */
+    case EXCP_MSADIS:   /* MSA disabled (lazy enable)       */
+    case EXCP_DSPDIS:   /* DSP disabled (lazy enable)       */
+    case EXCP_MDMX:     /* MDMX unusable (lazy enable)      */
+        return true;
+    default:
+        return false;
+    }
+}
+#endif
+
 void mips_cpu_do_interrupt(CPUState *cs)
 {
     MIPSCPU *cpu = MIPS_CPU(cs);
@@ -1034,6 +1111,60 @@ void mips_cpu_do_interrupt(CPUState *cs)
     bool update_badinstr = 0;
     target_ulong offset;
     int cause = -1;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion (external
+     * hardware interrupt) so the tracer drops the handler (OS noise) while
+     * keeping synchronous exceptions (syscall, TLB/address faults).  Record
+     * the interrupted PC; the generic resume in cpu_exec_loop clears the flag
+     * when execution returns there.  Outermost only; never on wrong path.
+     */
+    /*
+     * Both recorded PCs must be the RESUME pc — where the handler's eret
+     * lands — not the raw trapping pc.  On MIPS they differ whenever the
+     * exception hits a branch DELAY SLOT: EPC points at the branch
+     * (CAUSE.BD=1) and the eret re-executes branch+slot.
+     * exception_resume_pc() backs the pc up to the branch under
+     * MIPS_HFLAG_BMASK, exactly as the CP0_EPC assignment below does.
+     * Recording the raw get_pc() slot address instead leaves the async
+     * flag stuck (the departure pc is never re-executed — only the branch
+     * is) and fault-merge frames unmatched (the resume lands on the
+     * branch, not the slot), dropping the faulting BB from the trace.
+     * Mask the mips16 ISA-mode bit so the value compares against TB PCs.
+     */
+    cpu_plugin_async_probe(cs,
+                           cs->exception_index == EXCP_EXT_INTERRUPT
+                           ? "IRQ" : "EXC", cs->exception_index,
+                           cs->exception_index == EXCP_EXT_INTERRUPT);
+    if (cs->exception_index == EXCP_EXT_INTERRUPT &&
+        !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        cpu_plugin_async_enter(cs,
+                               exception_resume_pc(env) & ~(target_ulong)1);
+    } else if (mips_fault_reexecutes(cs->exception_index) &&
+               !cs->plugin_spec_mode) {
+        /*
+         * No !plugin_in_async_int gate here: a window-interior fault is a
+         * real fault whose ERET re-executes its instruction, so the push
+         * keeps the resume-PC stack exactly LIFO and the event stream
+         * complete.  The consumer decides per-mode what an in-window
+         * FAULT_ENTER means (see the x86 twin in seg_helper.c).
+         */
+        /*
+         * Re-executing synchronous FAULT (TLB refill/invalid/modified,
+         * execute/read-inhibit, coprocessor-unusable lazy enable): the ERET
+         * re-executes the faulting instruction (the whole branch+slot pair when
+         * it hit a delay slot), landing on exactly this recorded resume PC so
+         * the tracer's stack pops.  Advance-past exceptions (SYSCALL/BREAK/
+         * TRAP/RI/OVERFLOW/FPE, emulated unaligned AdEL/AdES) are deliberately
+         * NOT pushed — their handler advances CP0_EPC, so a pushed frame would
+         * never match a return PC and would stick the depth +1.  Report the
+         * entry; the tracer owns the stack.
+         */
+        cpu_plugin_fault_push(cs,
+                              exception_resume_pc(env) & ~(target_ulong)1);
+    }
+#endif
 
     if (qemu_loglevel_mask(CPU_LOG_INT)
         && cs->exception_index != EXCP_EXT_INTERRUPT) {
@@ -1095,7 +1226,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
         env->hflags &= ~(MIPS_HFLAG_KSU);
         /* EJTAG probe trap enable is not implemented... */
         if (!(env->CP0_Status & (1 << CP0St_EXL))) {
-            env->CP0_Cause &= ~(1U << CP0Ca_BD);
+            qatomic_and(&env->CP0_Cause, ~(1U << CP0Ca_BD));
         }
         env->active_tc.PC = env->exception_base + 0x480;
         set_hflags_for_handler(env);
@@ -1123,7 +1254,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
         env->hflags |= MIPS_HFLAG_CP0;
         env->hflags &= ~(MIPS_HFLAG_KSU);
         if (!(env->CP0_Status & (1 << CP0St_EXL))) {
-            env->CP0_Cause &= ~(1U << CP0Ca_BD);
+            qatomic_and(&env->CP0_Cause, ~(1U << CP0Ca_BD));
         }
         env->active_tc.PC = env->exception_base;
         set_hflags_for_handler(env);
@@ -1235,8 +1366,8 @@ void mips_cpu_do_interrupt(CPUState *cs)
     case EXCP_CpU:
         cause = 11;
         update_badinstr = 1;
-        env->CP0_Cause = (env->CP0_Cause & ~(0x3 << CP0Ca_CE)) |
-                         (env->error_code << CP0Ca_CE);
+        mips_cause_set_field(env, 0x3 << CP0Ca_CE,
+                             env->error_code << CP0Ca_CE);
         goto set_EPC;
     case EXCP_OVERFLOW:
         cause = 12;
@@ -1294,9 +1425,9 @@ void mips_cpu_do_interrupt(CPUState *cs)
                 set_badinstr_registers(env);
             }
             if (env->hflags & MIPS_HFLAG_BMASK) {
-                env->CP0_Cause |= (1U << CP0Ca_BD);
+                qatomic_or(&env->CP0_Cause, 1U << CP0Ca_BD);
             } else {
-                env->CP0_Cause &= ~(1U << CP0Ca_BD);
+                qatomic_and(&env->CP0_Cause, ~(1U << CP0Ca_BD));
             }
             env->CP0_Status |= (1 << CP0St_EXL);
             if (env->insn_flags & ISA_MIPS3) {
@@ -1322,8 +1453,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
 
         env->active_tc.PC += offset;
         set_hflags_for_handler(env);
-        env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
-                         (cause << CP0Ca_EC);
+        mips_cause_set_field(env, 0x1f << CP0Ca_EC, cause << CP0Ca_EC);
         break;
     default:
         abort();
@@ -1344,6 +1474,23 @@ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     if (interrupt_request & CPU_INTERRUPT_HARD) {
         CPUMIPSState *env = cpu_env(cs);
 
+#ifdef CONFIG_PLUGIN
+        /* #77 line-leak probe (mirror of the riscv CST_IRQ_DIAG): is the
+         * CPU_INTERRUPT_HARD line stuck set with no backing CP0_Cause.IP
+         * (the wrong-path line leak signature)?  Throttled ~1/host-sec. */
+        if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
+            static long last;
+            long now = (long)time(NULL);
+            if (now != last) {
+                last = now;
+                fprintf(stderr, "[mirq] t=%ld ireq=0x%x IP=0x%x en=%d pend=%d\n",
+                        now, interrupt_request,
+                        (env->CP0_Cause & CP0Ca_IP_mask) >> CP0Ca_IP,
+                        cpu_mips_hw_interrupts_enabled(env),
+                        cpu_mips_hw_interrupts_pending(env));
+            }
+        }
+#endif
         if (cpu_mips_hw_interrupts_enabled(env) &&
             cpu_mips_hw_interrupts_pending(env)) {
             /* Raise it */

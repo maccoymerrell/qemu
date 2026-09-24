@@ -122,6 +122,38 @@ struct CPUMIPSMVPContext {
 #define CP0MVPC1_PCX    20
 #define CP0MVPC1_PCP2   10
 #define CP0MVPC1_PCP1   0
+    /*
+     * cpu_index of the VPE that performed the MVPControl.EVP 1 -> 0
+     * transition, or -1 while the processor is enabled.
+     *
+     * MIPS MT: "DVPE ... the multi-VPE processor is placed in single-VPE
+     * mode, in which only the VPE issuing the instruction is allowed to
+     * execute."  EVP clear therefore says something about every VPE EXCEPT
+     * one, and this names the exception.  Without it mips_vpe_active() reads
+     * the shared bit as disabling the VPE that cleared it, which is both
+     * wrong and terminal: the only instruction that can set EVP again is the
+     * EVPE that same VPE has not reached yet.
+     *
+     * Claimed with a plain store by whoever wins the 1 -> 0 transition (those
+     * transitions are totally ordered by the atomic on MVPControl, so the
+     * newest claim is the last store), released with a compare-exchange
+     * against the releaser's own index so a release cannot clobber a claim
+     * that a newer section has already made.
+     */
+    int32_t evp_owner;
+
+    /*
+     * The processor's Count time base.  MIPS MT gives one processor one
+     * Count, shared by every VPE of that processor, and a guest that treats
+     * it as a clocksource requires every VPE to read the same value at the
+     * same instant.  Held here rather than per-VPE for exactly the reason
+     * MVPControl is: see cpu_mips_store_count().
+     *
+     * This is the OFFSET form, the same as CPUMIPSState::CP0_Count -- the
+     * architected value minus the elapsed count_clock ticks -- so that a
+     * read is offset + ticks(now).
+     */
+    int32_t CP0_Count;
 };
 
 typedef struct mips_def_t mips_def_t;
@@ -1174,6 +1206,25 @@ typedef struct CPUArchState {
     struct {} end_reset_fields;
 
     /* Fields from here on are preserved across CPU reset. */
+#ifdef CONFIG_PLUGIN
+    /*
+     * External-interrupt replay across a wrong-path (speculative) excursion.
+     * CP0_Cause sits inside the register snapshot, so the excursion-exit
+     * restore rewinds it -- including IP7..IP2 bits a device asserted or
+     * deasserted DURING the excursion, which are real and must survive.
+     * cpu_mips_irq_request is the single funnel for every writer of those
+     * bits (they are read-only to the guest: cpu_mips_store_cause's write
+     * mask excludes them, so every in-window writer IS external); it records
+     * the delta here and the restore replays it over the rewound Cause.
+     * Cause.TI stays out of the delta (the timer reconcile owns it) and
+     * IP1..IP0 are guest-written architectural state, correctly rolled back.
+     * Deliberately placed after end_reset_fields so the record is outside
+     * the snapshot and cannot itself be rolled back.  See the replay comment
+     * in cpu_plugin_arch_state_restore.
+     */
+    uint32_t plugin_ext_ip_set;      /* externally raised during excursion */
+    uint32_t plugin_ext_ip_clear;    /* externally lowered during excursion */
+#endif
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;
@@ -1360,8 +1411,14 @@ uint64_t cpu_mips_phys_to_kseg1(void *opaque, uint64_t addr);
 
 /* HW declaration specific to the MIPS target */
 void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level);
+#ifdef CONFIG_PLUGIN
+void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env);
+#endif
 void cpu_mips_irq_init_cpu(MIPSCPU *cpu);
 void cpu_mips_clock_init(MIPSCPU *cpu);
+#ifdef CONFIG_PLUGIN
+void mips_cpu_plugin_resync_timers(CPUState *cs);
+#endif
 
 #endif /* !CONFIG_USER_ONLY */
 

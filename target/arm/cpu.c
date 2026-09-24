@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/qemu-plugin.h"
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
@@ -222,6 +223,24 @@ static void cp_reg_check_reset(gpointer key, gpointer value,  gpointer opaque)
     newvalue = read_raw_cp_reg(&cpu->env, ri);
     assert(oldvalue == newvalue);
 }
+
+/*
+ * The MPU and SAU register files survive a CPU reset -- they are reached
+ * through pointers to heap arrays that a reset must not drop -- so they sit
+ * past end_reset_fields, which also puts them outside the region the plugin's
+ * speculative snapshot copies (cpu_plugin_arch_state_size() returns
+ * offsetof(CPUArchState, end_reset_fields)).  That is the whole premise of
+ * arm_pmsa_write_discarded() in helper.c: a wrong-path write here is never
+ * rolled back, so it must not happen.  Check the premise rather than assert
+ * it in prose -- if the marker ever moves to cover this state, the rollback
+ * becomes automatic and the guard in helper.c should go.
+ */
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pmsav7) <
+                  offsetof(CPUARMState, end_reset_fields));
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pmsav8) <
+                  offsetof(CPUARMState, end_reset_fields));
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, sau) <
+                  offsetof(CPUARMState, end_reset_fields));
 
 static void arm_cpu_reset_hold(Object *obj, ResetType type)
 {
@@ -1973,8 +1992,10 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     Error *local_err = NULL;
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
-    /* Use pc-relative instructions in system-mode */
-    tcg_cflags_set(cs, CF_PCREL);
+    /* Use pc-relative instructions in system-mode — unless a TCG plugin is
+     * loaded (see tcg_cflags_set_pcrel: a pc-less TB identity misattributes
+     * plugin records across virtual mappings of one physical page). */
+    tcg_cflags_set_pcrel(cs);
 #endif
 
     /* If we needed to query the host kernel for the CPU features
@@ -2668,12 +2689,197 @@ static const struct SysemuCPUOps arm_sysemu_ops = {
 #endif
 
 #ifdef CONFIG_TCG
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void arm_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                 bool *mmu_on)
+{
+    CPUARMState *env = cpu_env(cs);
+    *priv = arm_current_el(env);          /* EL0 = user, EL1+ = privileged */
+    *asid = env->cp15.ttbr0_el[1];        /* TTBR0_EL1: user page-table base */
+    /* MMU active iff the current EL's SCTLR.M is set. */
+    *mmu_on = (arm_sctlr(env, arm_current_el(env)) & SCTLR_M) != 0;
+}
+
+static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
+static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * At EL0, and for any thread that has a TLS base at all: TPIDR_EL0 —
+     * the EL0 thread pointer (AArch32 TPIDRURW aliases the same state),
+     * reloaded from the incoming task at every switch
+     * (tls_thread_switch()) and never touched in between, so it names the
+     * current task at any EL.  Keeping it at EL1 whenever it is non-zero
+     * is what keeps a thread's kernel excursions on the SAME identity its
+     * user code carries: kernel code running on behalf of a thread is that
+     * thread.
+     *
+     * TPIDR_EL0 == 0 at EL1 is a task with no TLS identity — a kernel
+     * thread (kswapd, ksoftirqd, a per-CPU idle task; fork gives them
+     * tp_value 0 and nothing ever sets it), or a TLS-less user task's
+     * kernel excursion.  Those are distinct program paths that would
+     * otherwise all collapse onto the one identity 0, so fall through to
+     * the kernel's own per-task contract: arm64 keeps `current` in SP_EL0
+     * while in the kernel (arch/arm64/include/asm/current.h get_current()
+     * reads sp_el0; kernel_entry from EL0 installs it and cpu_switch_to()
+     * re-points it at every switch).  task_struct lives in the kernel map,
+     * so a kernel VA is the signature that the install already happened —
+     * during early entry from EL0, SP_EL0 still holds the interrupted
+     * user's stack pointer (a user VA), and this hook must not mint that
+     * as an identity: the tracks-current hook reports false for exactly
+     * that window and the consumer inherits the entering thread, which is
+     * the interrupted thread itself.
+     *
+     * env->sp_el[0] is authoritative while the banked SP_EL1 is active
+     * (Linux runs EL1h); on the EL1t corner the live SP_EL0 is xregs[31].
+     * AArch32 guests keep the historical TPIDRURW-only behaviour.
+     */
+    uint64_t tp = env->cp15.tpidr_el[0];
+    if (!is_a64(env) || arm_current_el(env) == 0 || tp != 0) {
+        return tp;
+    }
+    uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0] : env->xregs[31];
+    if (arm_vaddr_is_kernel(cs, sp0)) {
+        return sp0;
+    }
+    return tp;
+}
+
+static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPUARMState *env = cpu_env(cs);
+    /* TPIDR_EL0 is architecturally separate from the kernel's own
+     * thread pointers (TPIDR_EL1, SP_EL0-as-current), so Linux reloads
+     * it from the incoming task at every switch and never touches it in
+     * between — the sample names the current task at any EL.  The one
+     * state it cannot vouch for is a TLS-less task early in an
+     * entry-from-EL0 window: TPIDR_EL0 is 0 there and SP_EL0 still holds
+     * the interrupted user stack pointer (kernel_entry has not yet
+     * installed `current`), so neither register names the task and the
+     * consumer must inherit the entering thread instead. */
+    if (is_a64(env) && arm_current_el(env) != 0 &&
+        env->cp15.tpidr_el[0] == 0) {
+        uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0]
+                                                 : env->xregs[31];
+        return arm_vaddr_is_kernel(cs, sp0);
+    }
+    return true;
+}
+
+static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * The EL1&0 regime splits the VA space into TTBR0 (low, user) and TTBR1
+     * (high, kernel).  For an AArch64 kernel the architecture selects between
+     * them on bit 55 of the VA — "the bit that is always between the two
+     * regions", per aa64_va_parameters() — so a kernel code VA is exactly one
+     * with bit 55 set.  This is width-agnostic: it holds for 39/48/52-bit VA
+     * configurations alike, which is why it is preferred over a fixed
+     * TTBR1-base constant.  An AArch32 kernel splits the low 4 GiB by a
+     * TTBCR boundary instead (not our system-mode target); report user there.
+     */
+    if (!arm_el_is_aa64(env, 1)) {
+        return false;
+    }
+    return extract64(vaddr, 55, 1) != 0;
+}
+
+/*
+ * Re-derive cs->interrupt_request from the restored env->irq_line_state.
+ *
+ * Arm keeps the state of the six inbound interrupt lines in
+ * env->irq_line_state, which sits inside CPUARMState and therefore inside the
+ * wrong-path register snapshot, while the CPU_INTERRUPT_* bits it drives live
+ * in CPUState, outside it.  A GIC level change delivered by the iothread
+ * during an excursion updates both; the excursion-exit restore then rewinds
+ * only the former, and the two disagree — a line the guest believes is
+ * asserted that the interrupt-request word says is clear, or the reverse.
+ * The virtual-interrupt lines are worse, because arm_cpu_update_virq() and
+ * friends derive their CPU_INTERRUPT_V* bits from irq_line_state combined
+ * with HCR_EL2, so a stale irq_line_state keeps producing the wrong answer at
+ * every subsequent HCR write, not just once.
+ *
+ * cpu_plugin_arch_state_restore carries the live irq_line_state across the
+ * memcpy (it is device-driven state that a discarded path has no business
+ * rewinding), and this re-drives every derived bit from it.  Idempotent: each
+ * arm_cpu_update_* is a plain recompute, and cpu_interrupt/cpu_reset_interrupt
+ * on an already-correct bit is a no-op.
+ *
+ * This is Arm's counterpart of the RISC-V mip reconcile and the MIPS
+ * CP0_Cause.IP reconcile; Arm previously had no interrupt-line reconcile at
+ * all, so an excursion that raced a GIC level change left the line stuck.
+ */
+static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+    static const int lines[] = {
+        CPU_INTERRUPT_HARD, CPU_INTERRUPT_FIQ, CPU_INTERRUPT_NMI,
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(lines); i++) {
+        if (env->irq_line_state & lines[i]) {
+            cpu_interrupt(cs, lines[i]);
+        } else {
+            cpu_reset_interrupt(cs, lines[i]);
+        }
+    }
+    if (arm_feature(env, ARM_FEATURE_EL2)) {
+        arm_cpu_update_virq(cpu);
+        arm_cpu_update_vfiq(cpu);
+        arm_cpu_update_vinmi(cpu);
+        arm_cpu_update_vfnmi(cpu);
+        arm_cpu_update_vserr(cpu);
+    }
+}
+
+/*
+ * TCGCPUOps::spec_clock_resync for Arm — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * Arm's audit: every architectural counter the guest can read (CNTVCT_EL0,
+ * CNTPCT_EL0, and the CNTHP/CNTHV/CNTPS/CNTHVIRT views) is computed on demand
+ * from QEMU_CLOCK_VIRTUAL plus CNTVOFF/CNTPOFF, so the freeze already leaves
+ * them exactly consistent with the frozen time and nothing has to be re-derived
+ * for the counters themselves.  What does need work is the pair of things the
+ * excursion can leave behind: the host QEMUTimers shadowing the compare
+ * registers, and the interrupt lines shadowing irq_line_state.  Both are
+ * reconciled here, unconditionally.
+ *
+ * SPEC_CLOCK_THAW needs nothing: no guest state moved, and every Arm counter
+ * is a pure function of the virtual clock, which resumes at the value it was
+ * frozen at.  (Contrast x86, whose TSC free-runs off a different host
+ * oscillator and must be re-pinned on every thaw.)
+ */
+static void arm_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    arm_cpu_plugin_resync_timers(cs);
+    arm_cpu_plugin_reconcile_irq(cs);
+}
+#endif
+
 static const TCGCPUOps arm_tcg_ops = {
     .initialize = arm_translate_init,
     .translate_code = arm_translate_code,
     .synchronize_from_tb = arm_cpu_synchronize_from_tb,
     .debug_excp_handler = arm_debug_excp_handler,
     .restore_state_to_opc = arm_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = arm_get_plugin_state,
+    .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
+    /* TPIDR_EL0 is the EL0 thread pointer; EL1 has TPIDR_EL1 for its own
+     * per-CPU use, so the kernel only ever writes TPIDR_EL0 from the
+     * incoming task (tls_thread_switch()) and a read at EL1 names the
+     * current task. */
+    .plugin_thread_ptr_tracks_current = arm_plugin_thread_ptr_tracks_current,
+    .vaddr_is_kernel = arm_vaddr_is_kernel,
+    .spec_clock_resync = arm_spec_clock_resync,
+#endif
 
 #ifdef CONFIG_USER_ONLY
     .record_sigsegv = arm_cpu_record_sigsegv,
@@ -2721,6 +2927,8 @@ static void arm_cpu_class_init(ObjectClass *oc, void *data)
     cc->gdb_stop_before_watchpoint = true;
     cc->disas_set_info = arm_disas_set_info;
 
+#if defined(CONFIG_TCG) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#endif
 #ifdef CONFIG_TCG
     cc->tcg_ops = &arm_tcg_ops;
 #endif /* CONFIG_TCG */

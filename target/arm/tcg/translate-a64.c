@@ -19,6 +19,7 @@
 #include "qemu/osdep.h"
 
 #include "exec/exec-all.h"
+#include "exec/plugin-gen.h"
 #include "translate.h"
 #include "translate-a64.h"
 #include "qemu/log.h"
@@ -1646,6 +1647,7 @@ static inline void gen_check_sp_alignment(DisasContext *s)
 
 static bool trans_B(DisasContext *s, arg_i *a)
 {
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
     return true;
@@ -1653,6 +1655,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
 
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
@@ -1665,6 +1668,7 @@ static bool trans_CBZ(DisasContext *s, arg_cbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = read_cpu_reg(s, a->rt, a->sf);
     reset_btype(s);
 
@@ -1682,6 +1686,7 @@ static bool trans_TBZ(DisasContext *s, arg_tbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = tcg_temp_new_i64();
     tcg_gen_andi_i64(tcg_cmp, cpu_reg(s, a->rt), 1ULL << a->bitpos);
 
@@ -1702,6 +1707,7 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
     if (a->c && !dc_isar_feature(aa64_hbc, s)) {
         return false;
     }
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     if (a->cond < 0x0e) {
         /* genuinely conditional branches */
@@ -4404,6 +4410,57 @@ TRANS_FEAT(STZ2G, aa64_mte_insn_reg, do_STG, a, true, true)
 
 typedef void SetFn(TCGv_env, TCGv_i32, TCGv_i32);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Offset of a CPUState plugin field relative to tcg_env (which points at
+ * CPUArchState) -- same relocation target/i386's REP_PLUGIN_OFF and the
+ * icount/can_do_io accessors in accel/tcg/translator.c use.
+ */
+#define MOPS_PLUGIN_OFF(field)                                          \
+    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+#endif
+
+/*
+ * Publish which instruction the FEAT_MOPS per-execution facts describe
+ * (see mops_plugin_entry() in helper-a64.c).  Stored at translation time
+ * from the instruction's own address, before the helper call, so a
+ * consumer reading the facts later can refuse ones that belong to a
+ * different instruction.  Nothing is generated without a plugin, exactly
+ * like x86's do_gen_rep publications.
+ */
+static void gen_mops_plugin_pc(DisasContext *s)
+{
+#ifdef CONFIG_PLUGIN
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st_i64(tcg_constant_i64(s->pc_curr), tcg_env,
+                   MOPS_PLUGIN_OFF(plugin_rep_pc));
+#endif
+}
+
+/*
+ * Under a plugin, end the TB after a FEAT_MOPS bulk instruction — the
+ * shape x86 already gives a REP.  It is what keeps the published facts
+ * unambiguous (one bulk op per TB, so the per-vCPU fields always
+ * describe the block being attributed), lets a consumer's fault
+ * machinery find a faulting bulk op in the block it interrupted (the
+ * op is its TB's terminator, not buried mid-block — a SETP/SETM/SETE
+ * trio no longer shares one TB), and makes a split execution's
+ * instruction accounting exact (the re-entered TB contains only the
+ * bulk op itself, never a tail of never-executed successors).  The
+ * guest-visible semantics are unchanged; without a plugin nothing
+ * changes at all.
+ */
+static void gen_mops_plugin_tb_end(DisasContext *s)
+{
+#ifdef CONFIG_PLUGIN
+    if (s->base.plugin_enabled) {
+        s->base.is_jmp = DISAS_TOO_MANY;
+    }
+#endif
+}
+
 static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
                    bool is_setg, SetFn fn)
 {
@@ -4448,7 +4505,9 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
      * the syndrome anyway, we let it extract them from there rather
      * than passing in an extra three integer arguments.
      */
+    gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
+    gen_mops_plugin_tb_end(s);
     return true;
 }
 
@@ -4507,8 +4566,10 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
      * the syndrome anyway, we let it extract them from there rather
      * than passing in an extra three integer arguments.
      */
+    gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),
        tcg_constant_i32(rdesc));
+    gen_mops_plugin_tb_end(s);
     return true;
 }
 
@@ -10399,10 +10460,32 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 }
 
+/*
+ * v4 repair (maintainer-vetoable): never-split RETREAT re-sync.  The
+ * generic loop is ending the TB at @retreat_pc, dropping the sequence-
+ * prefix insns (MOVZ/MOVK immediate loads) translated beyond it.
+ * tb_stop's DISAS_TOO_MANY path targets pc_curr + 4, so re-sync the
+ * private pc_curr to the last kept insn.  The dropped insns never sync
+ * the pc, so pc_save is stable under CF_PCREL.  A BTYPE reset spill the
+ * first dropped insn emitted is dropped with it: env keeps the pending
+ * BTYPE, the retreat TB exits without touching it, and the next TB —
+ * which re-translates that insn — performs its own check and reset.
+ */
+static bool aarch64_tr_nosplit_retreat(DisasContextBase *dcbase,
+                                       CPUState *cpu, vaddr retreat_pc,
+                                       uint64_t checkpoint)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->pc_curr = retreat_pc - 4;
+    return true;
+}
+
 const TranslatorOps aarch64_translator_ops = {
     .init_disas_context = aarch64_tr_init_disas_context,
     .tb_start           = aarch64_tr_tb_start,
     .insn_start         = aarch64_tr_insn_start,
     .translate_insn     = aarch64_tr_translate_insn,
     .tb_stop            = aarch64_tr_tb_stop,
+    .nosplit_retreat    = aarch64_tr_nosplit_retreat,
 };

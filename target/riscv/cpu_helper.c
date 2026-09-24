@@ -647,6 +647,24 @@ bool riscv_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         RISCVCPU *cpu = RISCV_CPU(cs);
         CPURISCVState *env = &cpu->env;
         int interruptno = riscv_cpu_local_irq_pending(env);
+#ifdef CONFIG_PLUGIN
+        /* #77: why does the timer tick stop being delivered during teardown?
+         * Throttled to ~1/host-sec: is this even called (interrupt_request set?),
+         * and if so does STIP deliver or is it masked (interruptno<0)? */
+        if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
+            static long last;
+            long now = (long)time(NULL);
+            if (now != last) {
+                last = now;
+                fprintf(stderr, "[irq] t=%ld ireq=0x%x deliver=%d mip=0x%llx "
+                        "mie=0x%llx STIP=%d STIE=%d SIE=%d priv=%d\n", now,
+                        interrupt_request, interruptno,
+                        (unsigned long long)env->mip, (unsigned long long)env->mie,
+                        !!(env->mip & MIP_STIP), !!(env->mie & MIE_STIE),
+                        !!(env->mstatus & MSTATUS_SIE), (int)env->priv);
+            }
+        }
+#endif
         if (interruptno >= 0) {
             cs->exception_index = RISCV_EXCP_INT_FLAG | interruptno;
             riscv_cpu_do_interrupt(cs);
@@ -819,6 +837,23 @@ void riscv_cpu_interrupt(CPURISCVState *env)
     uint64_t gein, vsgein = 0, vstip = 0, irqf = 0;
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): don't raise/lower the real CPU interrupt
+     * line.  A speculative CSR write to mip/sip/mie still updates env->mip
+     * (rolled back at walk end), but the global interrupt-request side
+     * effect must not escape the discarded path.  Gate on the WHOLE
+     * excursion (vtime_paused), not just spec_mode: the fault-skip gap
+     * briefly clears spec_mode while the snapshot is live, and an
+     * iothread mip update landing there would drive the line from state
+     * the walk-end restore erases.  The excursion-exit resync recomputes
+     * the line from restored state unconditionally, so nothing has to be
+     * recorded here for it.
+     */
+    if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+        return;
+    }
+#endif
     BQL_LOCK_GUARD();
 
     if (env->virt_enabled) {
@@ -848,6 +883,40 @@ uint64_t riscv_cpu_update_mip(CPURISCVState *env, uint64_t mask, uint64_t value)
     BQL_LOCK_GUARD();
 
     env->mip = (env->mip & ~mask) | (value & mask);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Pending-interrupt replay (part of the spec_clock_resync contract).
+     * env->mip lives inside the wrong-path register snapshot, so the
+     * excursion-exit restore rewinds it.  For bits the GUEST changed that is
+     * exactly right — a speculative CSR write to sip must be discarded.  For
+     * bits an EXTERNAL device changed while the excursion was in flight it is
+     * wrong: the PLIC (SEIP/MEIP), the ACLINT software interrupt (MSIP/SSIP),
+     * hgeip (SGEIP) and the PMU overflow counter (LCOFIP) have no
+     * re-derivation path at excursion exit the way the timer bits do, so a
+     * raise landing inside the window is simply lost and the device waits
+     * forever for an acknowledgement that never comes.
+     *
+     * Record the externally-caused delta so the restore can replay it.  The
+     * timer bits (MTIP/STIP/VSTIP) are excluded because the timer reconcile
+     * re-derives them from the architected compare registers; carrying them
+     * here as well perturbed interrupt-delivery timing across the wrong-path
+     * merge (#77).
+     */
+    {
+        CPUState *cs = env_cpu(env);
+        if (unlikely((cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) &&
+                     !env->plugin_mip_guest_write)) {
+            uint64_t ext = ~(uint64_t)(MIP_MTIP | MIP_STIP | MIP_VSTIP);
+            uint64_t raised = (env->mip & ~old) & ext;
+            uint64_t lowered = (old & ~env->mip) & ext;
+            env->plugin_spec_mip_set =
+                (env->plugin_spec_mip_set & ~lowered) | raised;
+            env->plugin_spec_mip_clear =
+                (env->plugin_spec_mip_clear & ~raised) | lowered;
+        }
+    }
+#endif
 
     riscv_cpu_interrupt(env);
 
@@ -1633,6 +1702,14 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
      * Otherwise raise an exception if necessary.
      */
     if (adue) {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative) walk: don't set/persist A/D in the guest
+         * PTE.  Leaving updated_pte == pte skips the writeback block below;
+         * the translation still succeeds, the bits just aren't persisted.
+         */
+        if (!cs->plugin_spec_mode)
+#endif
         updated_pte |= PTE_A | (access_type == MMU_DATA_STORE ? PTE_D : 0);
     } else if (!(pte & PTE_A) ||
                (access_type == MMU_DATA_STORE && !(pte & PTE_D))) {
@@ -1875,7 +1952,19 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
                   __func__, address, access_type, mmu_idx);
 
-    pmu_tlb_fill_incr_ctr(cpu, access_type);
+    /*
+     * Wrong-path (speculative): do not let a WP TLB fill increment guest
+     * hpmcounters.  The counter state itself is rolled back by the
+     * excursion's register restore, so the increment buys nothing -- but an
+     * overflow it triggers raises MIP_LCOFIP through riscv_cpu_update_mip
+     * WITHOUT the guest-write bracket, so the external-delta record logs it
+     * and the excursion-exit replay re-imposes it onto restored state whose
+     * OF bit and counter were rolled back: a fabricated LCOFIP with
+     * scountovf showing no cause.
+     */
+    if (!cs->plugin_spec_mode) {
+        pmu_tlb_fill_incr_ctr(cpu, access_type);
+    }
     if (two_stage_lookup) {
         /* Two stage lookup */
         ret = get_physical_address(env, &pa, &prot, address,
@@ -2261,6 +2350,81 @@ void riscv_cpu_do_interrupt(CPUState *cs)
      */
     bool async = !!(cs->exception_index & RISCV_EXCP_INT_FLAG);
     target_ulong cause = cs->exception_index & RISCV_EXCP_INT_MASK;
+
+#ifdef CONFIG_PLUGIN
+    if (!async && cause == RISCV_EXCP_ILLEGAL_INST && getenv("CST_ILL_DIAG")) {
+        /* #77: pin down the SIGILL source. bins==0 / garbage => instruction-
+         * memory corruption (leaked store); a valid-but-misaligned encoding =>
+         * bad branch IP.  spec=1 would mean WP is delivering (should never). */
+        fprintf(stderr, "[ill] spec=%d pc=0x%llx bins=0x%08llx priv=%d "
+                "VS=%d FS=%d vill=%d\n",
+                (int)cs->plugin_spec_mode,
+                (unsigned long long)cs->cc->get_pc(cs),
+                (unsigned long long)env->bins, (int)env->priv,
+                (int)((env->mstatus & MSTATUS_VS) >> 9),
+                (int)((env->mstatus & MSTATUS_FS) >> 13),
+                (int)((env->vtype >> (sizeof(target_ulong) * 8 - 1)) & 1));
+    }
+    if (cs->plugin_spec_mode && getenv("CST_TIMER_DIAG")) {
+        fprintf(stderr, "[wpfault] do_interrupt IN SPEC MODE async=%d "
+                "cause=0x%llx pc=0x%llx -- WP fault being RESOLVED\n",
+                (int)async, (unsigned long long)cause,
+                (unsigned long long)cs->cc->get_pc(cs));
+    }
+    /* #77: is the guest timer tick dying?  Count timer IRQs DELIVERED on the
+     * correct path; print the running total once per host-second.  If the total
+     * plateaus after "powering off", the timer tick has stopped (livelock by
+     * timer starvation, the aarch64-storm class). */
+    if (getenv("CST_TICK_DIAG") && async && !cs->plugin_spec_mode) {
+        static unsigned long n_timer, n_async;
+        static long last_sec;
+        n_async++;
+        if (cause == IRQ_S_TIMER || cause == IRQ_M_TIMER ||
+            cause == IRQ_VS_TIMER) {
+            n_timer++;
+        }
+        long nowt = (long)time(NULL);
+        if (nowt != last_sec) {
+            last_sec = nowt;
+            fprintf(stderr, "[tick] t=%ld timer_irqs=%lu async_irqs=%lu\n",
+                    nowt, n_timer, n_async);
+            fflush(stderr);
+        }
+    }
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion so the
+     * tracer drops the handler (OS noise) while keeping synchronous traps
+     * (ecall, page faults).  Record the interrupted PC as the departure point;
+     * the generic resume in cpu_exec_loop clears the flag when execution
+     * returns there.  Outermost only; never on the wrong path.  See cpu.h.
+     */
+    /* Instrument every delivery, including the ones the gates below discard,
+     * so "no window opened" and "no interrupt arrived" are distinguishable. */
+    cpu_plugin_async_probe(cs, async ? "IRQ" : "EXC", cs->exception_index,
+                           async);
+    if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
+    } else if (!async && !cs->plugin_spec_mode) {
+        /*
+         * Synchronous FAULT (page/access fault, illegal insn, misaligned, …):
+         * the trap return re-executes the faulting instruction, so the resume
+         * PC is the trapping PC.  ECALL advances past the instruction and is
+         * left to the normal branch-into-kernel representation.  Report the
+         * entry; the tracer owns the resume-PC stack.
+         *
+         * No !plugin_in_async_int gate: a window-interior fault is a real
+         * fault whose trap return re-executes its instruction, so the push
+         * keeps the resume-PC stack exactly LIFO and the event stream
+         * complete.  The consumer decides per-mode what an in-window
+         * FAULT_ENTER means (see the x86 twin in seg_helper.c).
+         */
+        int c = cs->exception_index;
+        if (c != RISCV_EXCP_U_ECALL && c != RISCV_EXCP_S_ECALL &&
+            c != RISCV_EXCP_VS_ECALL && c != RISCV_EXCP_M_ECALL) {
+            cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
+        }
+    }
+#endif
     uint64_t deleg = async ? env->mideleg : env->medeleg;
     bool s_injected = env->mvip & (1ULL << cause) & env->mvien &&
         !(env->mip & (1ULL << cause));
@@ -2280,6 +2444,20 @@ void riscv_cpu_do_interrupt(CPUState *cs)
     bool nnmi_excep = false;
 
     if (cpu->cfg.ext_smrnmi && env->rnmip && async) {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Defensive WP guard: riscv_do_nmi() writes the Smrnmi RNMI block
+         * (mnstatus/mncause/mnepc), which lives after end_reset_fields and so
+         * is NOT covered by the plugin's wrong-path state snapshot.  This
+         * function is not reached in spec mode today (WP faults are caught by
+         * cpu_plugin_exec_tb's sigsetjmp before do_interrupt runs), but skip
+         * the RNMI write under spec mode anyway so the no-RNMI-leak invariant
+         * survives any future change that routes a WP fault through here.
+         */
+        if (cs->plugin_spec_mode) {
+            return;
+        }
+#endif
         riscv_do_nmi(env, cause | ((target_ulong)1U << (mxlen - 1)),
                      env->virt_enabled);
         return;
@@ -2474,7 +2652,17 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         /* handle the trap in M-mode */
         /* save elp status */
         if (cpu_get_fcfien(env)) {
+#ifdef CONFIG_PLUGIN
+            /*
+             * Defensive WP guard: the MNPELP write below touches the Smrnmi
+             * RNMI block (after end_reset_fields, outside the plugin's WP
+             * snapshot).  Not reachable in spec mode today, but skip it under
+             * spec mode to preserve the no-RNMI-leak invariant defensively.
+             */
+            if (nnmi_excep && !cs->plugin_spec_mode) {
+#else
             if (nnmi_excep) {
+#endif
                 env->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPELP,
                                           env->elp);
             } else {
@@ -2516,6 +2704,18 @@ void riscv_cpu_do_interrupt(CPUState *cs)
                 if (!cpu->cfg.ext_smrnmi || nnmi_excep) {
                     cpu_abort(CPU(cpu), "M-mode double trap\n");
                 } else {
+#ifdef CONFIG_PLUGIN
+                    /*
+                     * Defensive WP guard: riscv_do_nmi() writes the Smrnmi
+                     * RNMI block (after end_reset_fields, outside the plugin's
+                     * WP snapshot).  Not reachable in spec mode today, but skip
+                     * it under spec mode to preserve the no-RNMI-leak invariant
+                     * defensively.
+                     */
+                    if (cs->plugin_spec_mode) {
+                        return;
+                    }
+#endif
                     riscv_do_nmi(env, cause, false);
                     return;
                 }

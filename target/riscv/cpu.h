@@ -476,10 +476,33 @@ struct CPUArchState {
     uint64_t henvcfg;
 #endif
 
+    /* Fields up to this point are cleared by a CPU reset */
+    struct {} end_reset_fields;
+
     /* Fields from here on are preserved across CPU reset. */
     QEMUTimer *stimer; /* Internal timer for S-mode interrupt */
     QEMUTimer *vstimer; /* Internal timer for VS-mode interrupt */
     bool vstime_irq;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Pending-interrupt replay across a wrong-path (speculative) excursion.
+     * env->mip sits inside the register snapshot, so the excursion-exit
+     * restore rewinds it — including bits an external device (PLIC, ACLINT
+     * software interrupt, hgeip, the PMU overflow counter) asserted or
+     * deasserted DURING the excursion, which are real and must survive.
+     * riscv_cpu_update_mip records the externally-caused delta here; the
+     * restore replays it over the rewound mip.  Deliberately placed after
+     * end_reset_fields so it is outside the snapshot and cannot itself be
+     * rolled back.  See the replay comment in cpu_plugin_arch_state_restore.
+     */
+    uint64_t plugin_spec_mip_set;    /* externally raised during excursion */
+    uint64_t plugin_spec_mip_clear;  /* externally lowered during excursion */
+    /* Set while the guest's own mip/sip CSR write is in flight, so its
+     * (speculative, therefore discardable) effect is not mistaken for an
+     * external device assertion. */
+    bool plugin_mip_guest_write;
+#endif
 
     hwaddr kernel_addr;
     hwaddr fdt_addr;
@@ -582,6 +605,9 @@ G_NORETURN void  riscv_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
 bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                         MMUAccessType access_type, int mmu_idx,
                         bool probe, uintptr_t retaddr);
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+void riscv_cpu_plugin_resync_timers(CPUState *cs);
+#endif
 char *riscv_isa_string(RISCVCPU *cpu);
 int riscv_cpu_max_xlen(RISCVCPUClass *mcc);
 bool riscv_cpu_option_set(const char *optname);

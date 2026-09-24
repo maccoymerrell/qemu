@@ -21,6 +21,7 @@
 #include "qemu/host-utils.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
+#include "exec/plugin-gen.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
@@ -1328,6 +1329,121 @@ static void gen_outs(DisasContext *s, MemOp ot, TCGv dshift)
 
 #define REP_MAX 65535
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Offsets of the CPUState self-loop accounting fields relative to tcg_env,
+ * which points at CPUArchState.  Same relocation the icount and can_do_io
+ * accessors in accel/tcg/translator.c use.
+ */
+#define REP_PLUGIN_OFF(field)                                           \
+    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+
+/*
+ * Publish the architectural iteration count of the REP instance in flight.
+ * Called after each iteration's CX/ECX/RCX writeback, so a fault inside a
+ * later iteration leaves the field holding exactly the iterations that
+ * retired.  @iters is a TB-scoped temp holding the running count.
+ */
+static void gen_rep_plugin_count_iter(DisasContext *s, TCGv iters)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_addi_tl(iters, iters, 1);
+    tcg_gen_st_tl(iters, tcg_env, REP_PLUGIN_OFF(plugin_rep_iters));
+}
+
+/*
+ * Publish whether the REP instance retired in this execution.  Constant
+ * @complete forms cover the paths where retirement is known at translation
+ * time (instruction entry: not yet; the done label: the counter hit zero or
+ * a REPZ/REPNZ condition broke it).
+ */
+static void gen_rep_plugin_complete(DisasContext *s, bool complete)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(complete), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_complete));
+}
+
+/*
+ * Publish which exit this execution took: the re-enter-the-same-instruction
+ * path, or past the instruction.  Both call sites are unconditional within
+ * their path, so the value is a translation-time constant.
+ */
+static void gen_rep_plugin_reenter(DisasContext *s, bool reenter)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(reenter), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_reenter));
+}
+
+/*
+ * Publish whether a re-enter exit sits on a canonical chunk boundary — the
+ * exit a looping translation itself takes (counter writeback 65536*m + 1,
+ * m >= 1; see the REP_MAX loop bound in do_gen_rep).  On the looping
+ * translation's re-enter path that is structurally always true.  A
+ * single-iteration translation (can_loop == false) re-enters after every
+ * iteration, so there the boundary must be computed from the written-back
+ * counter @cx_wb: the canonical translation would have left the block here
+ * iff (cx_wb - 1) is a non-zero multiple of REP_MAX + 1 under the
+ * instruction's address-size mask.
+ */
+static void gen_rep_plugin_chunk_const(DisasContext *s, bool chunk)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(chunk), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_chunk));
+}
+
+static void gen_rep_plugin_chunk_dynamic(DisasContext *s, TCGv cx_wb,
+                                         target_ulong cx_mask)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    TCGv t = tcg_temp_new();
+    TCGv low = tcg_temp_new();
+    TCGv nz = tcg_temp_new();
+    tcg_gen_subi_tl(t, cx_wb, 1);
+    /* (t & REP_MAX) == 0: t is a multiple of REP_MAX + 1. */
+    tcg_gen_andi_tl(low, t, REP_MAX);
+    tcg_gen_setcondi_tl(TCG_COND_EQ, low, low, 0);
+    /* (t & cx_mask) != 0: a NON-ZERO multiple within the address size. */
+    tcg_gen_andi_tl(nz, t, cx_mask);
+    tcg_gen_setcondi_tl(TCG_COND_NE, nz, nz, 0);
+    tcg_gen_and_tl(low, low, nz);
+    tcg_gen_st8_tl(low, tcg_env, REP_PLUGIN_OFF(plugin_rep_chunk));
+}
+
+/*
+ * Publish retirement on the re-enter-the-same-instruction path, where it is
+ * only knowable at run time: a REP translated as a single iteration
+ * (can_loop == false) takes this path after its *final* iteration too, and
+ * the instruction has retired exactly when the loop counter reached zero.
+ * When the REP did loop internally this path is only taken at a REP_MAX
+ * chunk boundary, where the counter is provably non-zero, so the test
+ * simply always yields false there.
+ */
+static void gen_rep_plugin_complete_dynamic(DisasContext *s,
+                                            target_ulong cx_mask)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    TCGv done_now = tcg_temp_new();
+    tcg_gen_andi_tl(done_now, cpu_regs[R_ECX], cx_mask);
+    tcg_gen_setcondi_tl(TCG_COND_EQ, done_now, done_now, 0);
+    tcg_gen_st8_tl(done_now, tcg_env, REP_PLUGIN_OFF(plugin_rep_complete));
+}
+#endif /* CONFIG_PLUGIN */
+
 static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
                        void (*fn)(DisasContext *s, MemOp ot, TCGv dshift),
                        bool is_repz_nz)
@@ -1338,6 +1454,13 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
 
     target_ulong cx_mask = MAKE_64BIT_MASK(0, 8 << s->aflag);
     TCGv cx_next = tcg_temp_new();
+#ifdef CONFIG_PLUGIN
+    /*
+     * Running architectural iteration count for this execution of the REP.
+     * TB-scoped so it survives the loop back-edge and the branch to @last.
+     */
+    TCGv rep_iters = tcg_temp_new();
+#endif
 
     /*
      * Check if we must translate a single iteration only.  Normally, HF_RF_MASK
@@ -1369,6 +1492,33 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     gen_update_cc_op(s);
     tcg_set_insn_start_param(s->base.insn_start, 1, CC_OP_DYNAMIC);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Open this execution's self-loop accounting: no iterations retired
+     * yet, instruction not retired yet.  Ahead of the zero-count test, so
+     * a REP entered with CX/ECX/RCX already zero still publishes a count
+     * of 0 rather than leaving the previous REP's value behind.
+     */
+    if (s->base.plugin_enabled) {
+        tcg_gen_movi_tl(rep_iters, 0);
+        /*
+         * Zero the whole 64-bit counter here (the per-iteration updates below
+         * are target_ulong-wide, which would leave a 32-bit target's upper
+         * half stale) and name the instruction the accounting describes.
+         * s->base.pc_next is the current instruction's start address during
+         * translation, the same value plugin_gen_insn_start() publishes as
+         * the instruction's vaddr.
+         */
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env,
+                       REP_PLUGIN_OFF(plugin_rep_iters));
+        tcg_gen_st_i64(tcg_constant_i64(s->base.pc_next), tcg_env,
+                       REP_PLUGIN_OFF(plugin_rep_pc));
+    }
+    gen_rep_plugin_complete(s, false);
+    gen_rep_plugin_reenter(s, false);
+    gen_rep_plugin_chunk_const(s, false);
+#endif
+
     /* Any iteration at all?  */
     tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
 
@@ -1396,6 +1546,10 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     gen_set_label(loop);
     fn(s, ot, dshift);
     tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
+#ifdef CONFIG_PLUGIN
+    /* This iteration has retired (its writeback is committed above). */
+    gen_rep_plugin_count_iter(s, rep_iters);
+#endif
     gen_update_cc_op(s);
 
     /* Leave if REP condition fails.  */
@@ -1421,6 +1575,28 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         gen_set_eflags(s, RF_MASK);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * This path re-enters the same instruction, so retirement is decided by
+     * the counter rather than by which label we left through.
+     *
+     * Chunk boundary: a looping translation only reaches this path when the
+     * loop bound expired — cx_next (already holding the NEXT iteration's
+     * writeback, one below the committed counter) passed both brcond tests
+     * above, i.e. it is a non-zero multiple of REP_MAX + 1 — so the flag is
+     * constant true.  A single-iteration translation reaches it after every
+     * iteration with cx_next still holding the committed writeback, so the
+     * boundary is computed from it.
+     */
+    gen_rep_plugin_complete_dynamic(s, cx_mask);
+    gen_rep_plugin_reenter(s, true);
+    if (can_loop) {
+        gen_rep_plugin_chunk_const(s, true);
+    } else {
+        gen_rep_plugin_chunk_dynamic(s, cx_next, cx_mask);
+    }
+#endif
+
     /* Go to the main loop but reenter the same instruction.  */
     gen_jmp_rel_csize(s, -cur_insn_len(s), 0);
 
@@ -1433,12 +1609,20 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         set_cc_op(s, CC_OP_DYNAMIC);
         fn(s, ot, dshift);
         tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
+#ifdef CONFIG_PLUGIN
+        gen_rep_plugin_count_iter(s, rep_iters);
+#endif
         gen_update_cc_op(s);
     }
 
     /* CX/ECX/RCX is zero, or REPZ/REPNZ broke the repetition.  */
     gen_set_label(done);
     set_cc_op(s, CC_OP_DYNAMIC);
+#ifdef CONFIG_PLUGIN
+    /* Every path into @done retires the instruction and advances past it. */
+    gen_rep_plugin_complete(s, true);
+    gen_rep_plugin_reenter(s, false);
+#endif
     if (had_rf) {
         gen_reset_eflags(s, RF_MASK);
     }
@@ -1636,7 +1820,22 @@ static uint64_t advance_pc(CPUX86State *env, DisasContext *s, int num_bytes)
     /* This is a subsequent insn that crosses a page boundary.  */
     if (s->base.num_insns > 1 &&
         !translator_is_same_page(&s->base, s->pc + num_bytes - 1)) {
-        siglongjmp(s->jmpbuf, 2);
+        /*
+         * v4 repair (maintainer-vetoable): while a never-split extension
+         * is active, permit instructions whose bytes lie entirely within
+         * the TB's TWO-page window — page slot 1 is already claimed by
+         * the first crossing fetch, so page-protection tracking is
+         * intact by construction.  Never beyond page 2.  The flag is
+         * only ever set once a registered sequence's prefix has been
+         * matched at a clean stop, so ordinary translation is
+         * byte-identical.
+         */
+        uint64_t last = s->pc + num_bytes - 1;
+        if (!s->base.nosplit_extend ||
+            (last & TARGET_PAGE_MASK) -
+            (s->base.pc_first & TARGET_PAGE_MASK) > TARGET_PAGE_SIZE) {
+            siglongjmp(s->jmpbuf, 2);
+        }
     }
 
     s->pc += num_bytes;
@@ -1961,6 +2160,13 @@ static target_long insn_get_signed(CPUX86State *env, DisasContext *s, MemOp ot)
 static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
                                         TCGLabel *not_taken, TCGLabel *taken)
 {
+    /*
+     * Static taken-edge target for direct conditional jumps (Jcc /
+     * JCXZ / LOOPcc).  Surfaced to plugins for wrong-path tracing —
+     * see plugin_gen_record_branch_target() docs.  Indirect branches
+     * (JMP_m / CALL_m) take a different path and never reach here.
+     */
+    plugin_gen_record_branch_target((uint64_t)(s->pc + diff));
     if (not_taken) {
         gen_set_label(not_taken);
     }
@@ -3775,6 +3981,13 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     target_ulong pc_arg = dc->base.pc_next;
 
+    /* Plugin R_REGS callbacks fire next; flush deferred cc_op so
+     * env->cc_op reflects the prior insn's ALU op (cpu_compute_eflags
+     * dispatches on it). */
+    if (dcbase->plugin_enabled) {
+        gen_update_cc_op(dc);
+    }
+
     dc->prev_insn_start = dc->base.insn_start;
     dc->prev_insn_end = tcg_last_op();
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
@@ -3881,12 +4094,36 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 }
 
+/*
+ * v4 repair (maintainer-vetoable): never-split RETREAT re-sync.  The
+ * generic loop is ending the TB at @retreat_pc, dropping the sequence-
+ * prefix insns translated beyond it (immediate moves: they never sync
+ * EIP, so pc_save is stable, and they never touch the flags, so cc_op
+ * is unchanged).  Re-sync the private decode pc, and conservatively
+ * re-arm the cc_op spill: the first dropped insn's insn_start may have
+ * flushed cc_op and its (now dropped) spill op with it.  A redundant
+ * re-spill of an already-clean cc_op stores the same value again —
+ * harmless.  CC_OP_DYNAMIC must never be marked dirty.
+ */
+static bool i386_tr_nosplit_retreat(DisasContextBase *dcbase, CPUState *cpu,
+                                    vaddr retreat_pc, uint64_t checkpoint)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->pc = retreat_pc;
+    if (dc->cc_op != CC_OP_DYNAMIC) {
+        dc->cc_op_dirty = true;
+    }
+    return true;
+}
+
 static const TranslatorOps i386_tr_ops = {
     .init_disas_context = i386_tr_init_disas_context,
     .tb_start           = i386_tr_tb_start,
     .insn_start         = i386_tr_insn_start,
     .translate_insn     = i386_tr_translate_insn,
     .tb_stop            = i386_tr_tb_stop,
+    .nosplit_retreat    = i386_tr_nosplit_retreat,
 };
 
 void x86_translate_code(CPUState *cpu, TranslationBlock *tb,

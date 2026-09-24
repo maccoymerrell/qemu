@@ -685,29 +685,46 @@ itrigger_set_count(CPURISCVState *env, int index, int value)
                                    ITRIGGER_COUNT, value);
 }
 
+/*
+ * Whether an icount trigger counts the instructions retired at the privilege
+ * level the CPU is running at now.
+ *
+ * tdata1 holds one enable bit per level, and the levels index them: ITRIGGER_U
+ * is bit 6 and PRV_U is 0, ITRIGGER_S is bit 7 and PRV_S is 1, ITRIGGER_M is
+ * bit 9 and PRV_M is 3.  Under virtualisation the same shape sits one field
+ * along, ITRIGGER_VU at bit 25 for PRV_U and ITRIGGER_VS at bit 26 for PRV_S.
+ * So the level selects a bit -- a one-bit field is never comparable to a
+ * two-bit level.  This is the same selection trigger_priv_match makes for the
+ * same trigger type, and the two must agree: that one decides whether the
+ * trigger fires, this one decides which instructions it counted on the way.
+ */
 static bool check_itrigger_priv(CPURISCVState *env, int index)
 {
     target_ulong tdata1 = env->tdata1[index];
+
     if (env->virt_enabled) {
-        /* check VU/VS bit against current privilege level */
-        return (get_field(tdata1, ITRIGGER_VS) == env->priv) ||
-               (get_field(tdata1, ITRIGGER_VU) == env->priv);
+        return (tdata1 >> 25) & BIT(env->priv);
     } else {
-        /* check U/S/M bit against current privilege level */
-        return (get_field(tdata1, ITRIGGER_M) == env->priv) ||
-               (get_field(tdata1, ITRIGGER_S) == env->priv) ||
-               (get_field(tdata1, ITRIGGER_U) == env->priv);
+        return (tdata1 >> 6) & BIT(env->priv);
     }
 }
 
+/*
+ * Whether any icount trigger is armed at all.
+ *
+ * The answer gates gen_helper_itrigger_match, which is how the count is kept
+ * when icount is off, and it is cached in env->itrigger_enabled -- recomputed
+ * only when tdata1 is written and when a trigger reaches zero, never on a
+ * privilege change.  A privilege-dependent answer would therefore be stale
+ * from the first mret: a trigger armed for U mode is always armed from M
+ * mode, where tdata1 is writable.  The helper is what filters by level, in
+ * trigger_common_match, so this asks only whether one is armed.
+ */
 bool riscv_itrigger_enabled(CPURISCVState *env)
 {
     int count;
     for (int i = 0; i < RV_MAX_TRIGGERS; i++) {
         if (get_trigger_type(env, i) != TRIGGER_TYPE_INST_CNT) {
-            continue;
-        }
-        if (check_itrigger_priv(env, i)) {
             continue;
         }
         count = itrigger_get_count(env, i);
@@ -734,7 +751,12 @@ void helper_itrigger_match(CPURISCVState *env)
         if (!count) {
             continue;
         }
-        itrigger_set_count(env, i, count--);
+        /*
+         * One instruction has retired at an enabled level, so one comes off
+         * the count that is stored -- pre-decrement, or tdata1 keeps the
+         * value it already had and the trigger counts for ever.
+         */
+        itrigger_set_count(env, i, --count);
         if (!count) {
             env->itrigger_enabled = riscv_itrigger_enabled(env);
             do_trigger_action(env, i);
@@ -744,6 +766,17 @@ void helper_itrigger_match(CPURISCVState *env)
 
 static void riscv_itrigger_update_count(CPURISCVState *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not re-arm the itrigger host timer or fire
+     * trigger actions.  env->itrigger_timer[] is a host QEMUTimer outside the
+     * WP register snapshot; a speculative privilege change (sret/mret) or a
+     * speculative timer callback must not reprogram it.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     int count, executed;
     /*
      * Record last icount, so that we can evaluate the executed instructions
@@ -781,9 +814,20 @@ static void riscv_itrigger_update_count(CPURISCVState *env)
              * If itrigger is not enabled in this privilege mode,
              * the number of executed instructions will be discard and
              * the count field in itrigger will not change.
+             *
+             * itrigger_timer[] is a QEMU_CLOCK_VIRTUAL timer, whose
+             * deadlines are NANOSECONDS: icount_get_locked() reads
+             * qemu_icount_bias + icount_to_ns(raw icount).  An
+             * instruction count is neither of those terms, so arming at
+             * `current_icount + count` arms at a timestamp that is
+             * behind the clock by the bias plus the whole icount shift.
+             * The timer therefore expires the moment it is armed, and
+             * this branch re-arms it at the same past deadline from its
+             * own callback: the vCPU never advances.  Convert.
              */
             timer_mod(env->itrigger_timer[i],
-                      current_icount + count);
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      icount_to_ns(count));
         }
     }
 }
@@ -831,9 +875,12 @@ static void itrigger_reg_write(CPURISCVState *env, target_ulong index,
             env->tdata1[index] = new_val;
             if (icount_enabled()) {
                 env->last_icount = icount_get_raw();
-                /* set the count to timer */
+                /* set the count to timer -- in virtual-clock nanoseconds,
+                 * which is what the timer's deadline means; see the
+                 * conversion note in riscv_itrigger_update_count. */
                 timer_mod(env->itrigger_timer[index],
-                          env->last_icount + itrigger_get_count(env, index));
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          icount_to_ns(itrigger_get_count(env, index)));
             } else {
                 env->itrigger_enabled = riscv_itrigger_enabled(env);
             }
@@ -853,12 +900,20 @@ static void itrigger_reg_write(CPURISCVState *env, target_ulong index,
     return;
 }
 
+/*
+ * The count stored in tdata1 is only brought up to date when the privilege
+ * level changes or the trigger's timer expires, so between those points it is
+ * behind by the instructions retired since env->last_icount.  If the level the
+ * CPU is at is one the trigger counts, those instructions have been counted
+ * and have to come off the value a read reports -- the remaining count falls
+ * as the guest runs, and can never rise.
+ */
 static int itrigger_get_adjust_count(CPURISCVState *env)
 {
     int count = itrigger_get_count(env, env->trigger_cur), executed;
     if ((count != 0) && check_itrigger_priv(env, env->trigger_cur)) {
         executed = icount_get_raw() - env->last_icount;
-        count += executed;
+        count -= executed;
     }
     return count;
 }

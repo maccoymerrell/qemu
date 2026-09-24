@@ -73,6 +73,15 @@ struct DisasContextBase {
     int max_insns;
     bool plugin_enabled;
     bool fake_insn;
+    /*
+     * v4 repair (maintainer-vetoable): true while a never-split
+     * (plugin-registered atomic sequence) extension is active in this
+     * translation.  Targets may relax their own mid-TB page-crossing
+     * refusals while set — never beyond the TB's two-page window.
+     * False for every ordinary translation, so stock behaviour is
+     * byte-identical when no sequence prefix has been matched.
+     */
+    bool nosplit_extend;
     struct TCGOp *insn_start;
     void *host_addr[2];
 
@@ -120,6 +129,29 @@ typedef struct TranslatorOps {
     void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
     void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
+
+    /*
+     * v4 repair (maintainer-vetoable): never-split retreat support.
+     * Both hooks are optional and are only consulted when never-split
+     * sequences are registered (a plugin feature; see
+     * translator_nosplit_continue in accel/tcg/translator.c).
+     *
+     * @nosplit_checkpoint: called once per instruction, before
+     * insn_start, to capture a target-private state word for a possible
+     * later retreat to this instruction's boundary (MIPS: hflags, so a
+     * retreat that re-opens a delay slot re-arms the pending branch).
+     *
+     * @nosplit_retreat: the translator is about to end the TB at
+     * @retreat_pc, dropping every op emitted from that boundary on.
+     * Re-sync private decode state (a cached pc, a lazily-flushed
+     * condition-code spill) to that boundary and return true, or
+     * return false to veto the retreat (the TB then splits in place).
+     * The dropped instructions are always a byte-prefix of a registered
+     * sequence — immediate-load instructions by construction.
+     */
+    uint64_t (*nosplit_checkpoint)(DisasContextBase *db, CPUState *cpu);
+    bool (*nosplit_retreat)(DisasContextBase *db, CPUState *cpu,
+                            vaddr retreat_pc, uint64_t checkpoint);
 } TranslatorOps;
 
 /**

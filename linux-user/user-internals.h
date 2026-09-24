@@ -26,6 +26,24 @@ extern char *exec_path;
 void init_task_state(TaskState *ts);
 void task_settid(TaskState *);
 void stop_all_tasks(void);
+
+/*
+ * Deterministic guest process identity, selected by -pid.  Zero means the
+ * guest reads the host's own pid/tid numbers, which differ between runs; see
+ * the block comment in linux-user/main.c for what pinning them covers.
+ */
+extern pid_t qemu_vpid_base;
+void vpid_register(pid_t host_tid);
+pid_t vpid_from_host(pid_t host_tid);
+bool vpid_to_host(abi_long *pid);
+void vpid_refuse_new_process(const char *what);
+/* Name this thread carries in the pinned space (its own host tid when -pid is
+ * not in use), and the thread-group id the guest sees for this process. */
+pid_t vpid_self(void);
+pid_t vpid_tgid(void);
+pid_t vpid_ppid(void);
+pid_t vpid_pgrp(void);
+pid_t vpid_sid(void);
 extern const char *qemu_uname_release;
 extern unsigned long mmap_min_addr;
 

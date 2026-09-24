@@ -1168,6 +1168,46 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
 {
     CPUX86State *env = &cpu->env;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion.  is_hw
+     * marks a hardware (external/NMI) interrupt — async; is_int (software INT)
+     * and exceptions (is_int=0,is_hw=0) are synchronous and stay traced.
+     * Record the interrupted linear PC as the departure point; the generic
+     * resume in cpu_exec_loop clears the flag on iret back to it.  Outermost
+     * only; never on the wrong path.  See cpu.h.
+     */
+    cpu_plugin_async_probe(CPU(cpu), is_hw ? "IRQ" : "EXC", intno, is_hw);
+    if (is_hw) {
+        CPUState *cs_ = CPU(cpu);
+        if (!cs_->plugin_spec_mode && !cs_->plugin_in_async_int) {
+            cpu_plugin_async_enter(cs_, cs_->cc->get_pc(cs_));
+        }
+    } else if (!is_int) {
+        /*
+         * Synchronous FAULT (#PF, #GP, #UD, alignment, …): is_int=0,is_hw=0.
+         * The fault handler's iret re-executes the faulting instruction, so
+         * the resume PC is the trapping PC.  Software INT n (is_int) and
+         * SYSCALL advance past the instruction and are left to the normal
+         * branch-into-kernel representation.  Report the entry; the tracer
+         * owns the resume-PC stack.
+         *
+         * Unconditionally: a fault delivered inside an open async window is
+         * still a real fault whose ERET re-executes its instruction — the
+         * stack stays exactly LIFO whether or not a window is open.  Gating
+         * this push on !plugin_in_async_int made the stack (and every event
+         * consumer) blind to window-interior faults; with captured-interrupt
+         * tracing the window's content is first-class trace content, and a
+         * faulting block sealed without its FAULT_ENTER records a phantom
+         * branch edge into the handler and an execution with silently
+         * missing memops.  The plugin decides per-mode what an in-window
+         * fault means; the producer's job is only to report every entry
+         * (see cpu.h).
+         */
+        cpu_plugin_fault_push(CPU(cpu), CPU(cpu)->cc->get_pc(CPU(cpu)));
+    }
+#endif
+
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         if ((env->cr[0] & CR0_PE_MASK)) {
             static int count;
@@ -2175,6 +2215,19 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     }
     SET_ESP(sa.sp, sa.sp_mask);
     env->eip = new_eip;
+#ifdef CONFIG_PLUGIN
+    if (is_iret) {
+        /*
+         * Report the IRET so a system-mode tracer can pop its fault resume-PC
+         * stack when this lands back on a faulting instruction (env->eip just
+         * committed above).  Far RET (is_iret=0) is not an exception return
+         * and is skipped.  The tracer pops only on a top-of-stack match.
+         * Correct path only — a wrong-path iret must not perturb it.
+         */
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, env->eip);
+    }
+#endif
     if (is_iret) {
         /* NOTE: 'cpl' is the _old_ CPL */
         eflags_mask = TF_MASK | AC_MASK | ID_MASK | RF_MASK | NT_MASK;
@@ -2253,6 +2306,20 @@ void helper_lret_protected(CPUX86State *env, int shift, int addend)
 
 void helper_sysenter(CPUX86State *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path SYSENTER: the fast-entry twin of the system-mode
+     * helper_syscall(), and likewise an inline privilege escalation rather
+     * than a raised exception.  Unwind so the speculative walk resumes at the
+     * architectural fall-through instead of running the guest's kernel entry
+     * path.  (This file is built for both modes; in *-linux-user SYSENTER is
+     * not a syscall ABI, but the guard costs one predicted branch.)
+     */
+    if (unlikely(env_cpu(env)->plugin_spec_mode)) {
+        cpu_loop_exit_restore(env_cpu(env), GETPC());
+    }
+#endif
+
     if (env->sysenter_cs == 0) {
         raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
     }

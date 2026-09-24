@@ -157,7 +157,32 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
         case IDX_IP_REG:
             return gdb_get_reg(env, mem_buf, env->eip);
         case IDX_FLAGS_REG:
-            return gdb_get_reg32(mem_buf, env->eflags);
+            /*
+             * Materialise the lazily-computed CC bits (CF/PF/AF/ZF/SF/OF)
+             * via cpu_compute_eflags before publishing.  Without this,
+             * `env->eflags` carries only the bits that don't depend on
+             * the deferred CC_OP/CC_SRC/CC_DST chain — typically just
+             * IF and the reserved bit-1 — so any plugin / gdb client
+             * reading eflags between an arithmetic op and its
+             * consumer sees stale arithmetic flags.
+             *
+             * KNOWN LIMITATION: when a QEMU plugin's
+             * QEMU_PLUGIN_CB_R_REGS callback fires mid-TB to read
+             * eflags, env->cc_op may still hold the value from TB
+             * entry (CC_OP_EFLAGS) because the i386 translator
+             * defers cpu_cc_op materialization (gen_update_cc_op
+             * only emits the movi when s->cc_op_dirty is true at a
+             * known sync point — helper call, branch, TB exit).  The
+             * plugin's R_REGS helper is target-agnostic, so the
+             * plugin infrastructure cannot know to call
+             * gen_update_cc_op for x86.  Cleanest fix would be a
+             * per-arch "flush translator state" hook in
+             * accel/tcg/plugin-gen.c invoked before each R_REGS
+             * callback; until then, plugin-side eflags reads can be
+             * stale for ALU insns whose flag-writes haven't yet been
+             * forced into memory by an in-TB consumer.
+             */
+            return gdb_get_reg32(mem_buf, cpu_compute_eflags(env));
 
         case IDX_SEG_REGS:
             return gdb_get_reg32(mem_buf, env->segs[R_CS].selector);
@@ -215,6 +240,24 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
             return gdb_read_reg_cs64(env->hflags, mem_buf, env->cr[4]);
         case IDX_CTL_CR8_REG:
 #ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_PLUGIN
+            /*
+             * Wrong-path (speculative): cpu_get_apic_tpr reads the APIC
+             * device, and apic_sync_vapic(SYNC_FROM_VAPIC) writes s->tpr
+             * from the vAPIC page — a device mutation outside the env
+             * snapshot, which the excursion's register restore cannot undo,
+             * feeding apic_get_ppr and interrupt delivery.  helper_read_cr8
+             * already refuses this for the guest's own MOV-from-CR8; this is
+             * the same device access reached through the plugin register-read
+             * API (qemu_plugin_read_register -> gdb_read_register), and it
+             * was the one of the two paths without the gate.  Return the
+             * env-shadowed V_TPR bits, exactly as the helper does.
+             */
+            if (cs->plugin_spec_mode) {
+                tpr = env->int_ctl & V_TPR_MASK;
+                return gdb_read_reg_cs64(env->hflags, mem_buf, tpr);
+            }
+#endif
             tpr = cpu_get_apic_tpr(cpu->apic_state);
 #else
             tpr = 0;
@@ -396,6 +439,24 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
         case IDX_CTL_CR8_REG:
             len = gdb_write_reg_cs64(env->hflags, mem_buf, &tmp);
 #ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_PLUGIN
+            /*
+             * Wrong-path (speculative): cpu_set_apic_tpr writes the APIC
+             * device (apic_set_tpr -> apic_update_irq can raise
+             * CPU_INTERRUPT_HARD) -- a device mutation outside the env
+             * snapshot, which the excursion's register restore cannot undo.
+             * helper_write_cr8 already refuses this for the guest's own
+             * MOV-to-CR8; this is the same device access reached through the
+             * register-write API, the write twin of the gated CR8 read
+             * above.  Apply the env-shadowed V_TPR bits exactly as the
+             * helper does; the walk-end restore rolls them back.
+             */
+            if (cs->plugin_spec_mode) {
+                env->int_ctl = (env->int_ctl & ~V_TPR_MASK) |
+                               (tmp & V_TPR_MASK);
+                return len;
+            }
+#endif
             cpu_set_apic_tpr(cpu->apic_state, tmp);
 #endif
             return len;

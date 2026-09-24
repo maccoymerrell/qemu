@@ -200,7 +200,12 @@ static void riscv_pmu_icount_update_priv(CPURISCVState *env,
     if (icount_enabled()) {
         current_icount = icount_get_raw();
     } else {
-        current_icount = cpu_get_host_ticks();
+        /* The VM tick counter, not the raw host one -- see the note in
+         * riscv_pmu_ctr_get_fixed_counters_val().  The per-privilege deltas
+         * this accumulates feed the same guest-readable minstret, so reading
+         * a different clock here than there would also make the two disagree
+         * across a counter-config write. */
+        current_icount = cpu_get_ticks();
     }
 
     if (env->virt_enabled) {
@@ -240,7 +245,9 @@ static void riscv_pmu_cycle_update_priv(CPURISCVState *env,
     if (icount_enabled()) {
         current_ticks = icount_get();
     } else {
-        current_ticks = cpu_get_host_ticks();
+        /* The VM tick counter, not the raw host one -- see the note in
+         * riscv_pmu_ctr_get_fixed_counters_val(). */
+        current_ticks = cpu_get_ticks();
     }
 
     if (env->virt_enabled) {
@@ -381,6 +388,17 @@ int riscv_pmu_update_event_map(CPURISCVState *env, uint64_t value,
 {
     uint32_t event_idx;
     RISCVCPU *cpu = env_archcpu(env);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not mutate the event->counter map.  It lives
+     * in RISCVCPU (outside the WP register snapshot) and is not rolled back, so
+     * a speculative mhpmevent write would persist a stale binding.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return -1;
+    }
+#endif
 
     if (!riscv_pmu_counter_valid(cpu, ctr_idx) || !cpu->pmu_event_ctr_map) {
         return -1;
@@ -524,10 +542,56 @@ void riscv_pmu_timer_cb(void *priv)
 {
     RISCVCPU *cpu = priv;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): the host pmu_timer (QEMU_CLOCK_VIRTUAL) callback
+     * can fire in the iothread during an excursion's wall-clock window (the
+     * gt-timer precedent, accel/tcg/cpu-exec.c).  pmu_timer_trigger_irq would
+     * re-arm cpu->pmu_timer (outside the WP snapshot, not reconciled by
+     * riscv_cpu_plugin_resync_timers) and clear counter->irq_overflow_left.
+     * Bail on the discarded path; the one-shot has now fired and does not
+     * re-arm itself, so the deferred expiry is owed to the guest -- it is
+     * paid by riscv_pmu_plugin_resync below, from excursion-exit reconcile.
+     *
+     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
+     * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
+     * while the snapshot is still live, and a firing in that gap would set an
+     * OF bit the final restore rolls back while its LCOFIP raise is recorded
+     * and replayed -- a fabricated LCOFIP-without-OF (#77).
+     */
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
+        return;
+    }
+#endif
+
     /* Timer event was triggered only for these events */
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_CPU_CYCLES);
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_INSTRUCTIONS);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path excursion-exit payback for a deferred pmu_timer expiry.  The
+ * overflow one-shot may have fired during the excursion and been bailed by
+ * the gate in riscv_pmu_timer_cb; it does not re-arm itself, so the deferred
+ * firing is owed to the guest.  Re-run the trigger evaluation from CURRENT
+ * counter truth: pmu_timer_trigger_irq reads the live counter value, sets OF
+ * and raises LCOFIP only if the counter really overflowed (the OF-clear
+ * check keeps this consume-once), and otherwise re-arms the timer for the
+ * remaining distance.  The same re-derivation shape as the stimer/ACLINT
+ * resyncs -- never a replay of a recorded event -- and, like them, it runs
+ * unconditionally at every excursion exit, so correctness does not depend on
+ * the cb having recorded that it suppressed a firing.
+ */
+void riscv_pmu_plugin_resync(RISCVCPU *cpu)
+{
+    if (!cpu->pmu_timer) {
+        return;
+    }
+    pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_CPU_CYCLES);
+    pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_INSTRUCTIONS);
+}
+#endif
 
 int riscv_pmu_setup_timer(CPURISCVState *env, uint64_t value, uint32_t ctr_idx)
 {
@@ -535,6 +599,21 @@ int riscv_pmu_setup_timer(CPURISCVState *env, uint64_t value, uint32_t ctr_idx)
     int64_t overflow_ns, overflow_left = 0;
     RISCVCPU *cpu = env_archcpu(env);
     PMUCTRState *counter = &env->pmu_ctrs[ctr_idx];
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not arm the host PMU overflow timer.
+     * cpu->pmu_timer lives outside the WP register snapshot and is NOT
+     * reconciled by riscv_cpu_plugin_resync_timers, so a speculative
+     * mhpmcounter/mcountinhibit write would leave the real timer programmed for
+     * a discarded-path deadline (the #77 host-timer-desync class).  The
+     * speculative counter state is rolled back; leave the host timer as the
+     * correct path armed it.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return -1;
+    }
+#endif
 
     /* No need to setup a timer if LCOFI is disabled when OF is set */
     if (!riscv_pmu_counter_valid(cpu, ctr_idx) || !cpu->cfg.ext_sscofpmf ||

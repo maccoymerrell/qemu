@@ -1258,7 +1258,22 @@ static target_ulong riscv_pmu_ctr_get_fixed_counters_val(CPURISCVState *env,
         if (icount_enabled()) {
                 curr_val = inst ? icount_get_raw() : icount_get();
         } else {
-            curr_val = cpu_get_host_ticks();
+            /*
+             * cpu_get_ticks(), not cpu_get_host_ticks(): both count host CPU
+             * cycles, but only the former is the VM's tick counter -- offset
+             * and gated on timers_state.cpu_ticks_enabled.  The raw host
+             * counter is nobody's clock.  It runs while the VM is stopped, so
+             * a `-S` pause or a monitor stop/cont makes the guest's mcycle
+             * jump by the pause; and it runs through the clock freeze a TCG
+             * plugin takes for instrumentation or for a speculative
+             * excursion, so cycle/instret advance while `time` (ACLINT mtime,
+             * a function of QEMU_CLOCK_VIRTUAL) stands still.  Those are two
+             * architectural counters the guest can read against each other,
+             * and RISC-V's own audit in riscv_spec_clock_resync asserts every
+             * RISC-V counter is a pure function of the virtual clock.  It was
+             * not: this one was a function of the host's.
+             */
+            curr_val = cpu_get_ticks();
         }
 
         goto done;
@@ -1633,6 +1648,26 @@ static RISCVException read_time(CPURISCVState *env, int csrno,
     }
 
     *val = env->rdtime_fn(env->rdtime_fn_arg) + delta;
+#ifdef CONFIG_PLUGIN
+    {
+        static int diag = -1;
+        if (diag < 0) {
+            diag = getenv("CST_TIMER_DIAG") ? 1 : 0;
+        }
+        CPUState *cs = env_cpu(env);
+        if (diag && !cs->plugin_spec_mode) {
+            static unsigned long n;
+            if ((++n & 0x3fff) == 0) {
+                int64_t dl = env->stimer ? env->stimer->expire_time : -1;
+                fprintf(stderr, "[time] t=0x%llx stimecmp=0x%llx STIP=%d "
+                        "stimer_deadline=%lld\n",
+                        (unsigned long long)*val,
+                        (unsigned long long)env->stimecmp,
+                        !!(env->mip & MIP_STIP), (long long)dl);
+            }
+        }
+    }
+#endif
     return RISCV_EXCP_NONE;
 }
 
@@ -3645,7 +3680,17 @@ static RISCVException rmw_mip64(CPURISCVState *env, int csrno,
     }
 
     if (mask) {
+#ifdef CONFIG_PLUGIN
+        /* The guest's own write: its effect on mip is architectural register
+         * state, so a speculative one must be rolled back with everything
+         * else.  Tell riscv_cpu_update_mip not to log it as an external
+         * device assertion needing replay. */
+        env->plugin_mip_guest_write = true;
+#endif
         old_mip = riscv_cpu_update_mip(env, mask, (new_val & mask));
+#ifdef CONFIG_PLUGIN
+        env->plugin_mip_guest_write = false;
+#endif
     } else {
         old_mip = env->mip;
     }
@@ -4282,7 +4327,26 @@ static RISCVException write_satp(CPURISCVState *env, int csrno,
         return RISCV_EXCP_NONE;
     }
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Address-space switch observation: SATP is the register
+     * riscv_get_plugin_state reports, full-register (page-table base +
+     * ASID + mode).  Compare around the legalized commit so writes the
+     * WARL legalization discards (or that rewrite the same value) do
+     * not emit.  The event's pc slot carries the OLD value; the push
+     * itself stamps the just-committed NEW value as the event's asid
+     * (and is a no-op on the wrong path or while the queue is
+     * disabled).
+     */
+    target_ulong old_satp = env->satp;
     env->satp = legalize_xatp(env, env->satp, val);
+    if (env->satp != old_satp) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old_satp, env_cpu(env)->plugin_fault_depth);
+    }
+#else
+    env->satp = legalize_xatp(env, env->satp, val);
+#endif
     return RISCV_EXCP_NONE;
 }
 
@@ -5297,6 +5361,21 @@ static RISCVException write_tdata(CPURISCVState *env, int csrno,
         return RISCV_EXCP_ILLEGAL_INST;
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): tdata_csr_write inserts/removes host
+     * breakpoints/watchpoints (cpu_breakpoint_insert/cpu_watchpoint_insert) and
+     * arms the itrigger host timer -- out-of-band state outside the WP register
+     * snapshot that would leak onto the real CPU (and the riscv restore does
+     * not preserve env->cpu_breakpoint[]/cpu_watchpoint[]).  The architected
+     * tdata registers are rolled back anyway; drop the side-effecting write on
+     * the discarded path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return RISCV_EXCP_NONE;
+    }
+#endif
+
     tdata_csr_write(env, csrno - CSR_TDATA1, val);
     return RISCV_EXCP_NONE;
 }
@@ -5342,6 +5421,17 @@ static RISCVException read_mnscratch(CPURISCVState *env, int csrno,
 
 static int write_mnscratch(CPURISCVState *env, int csrno, target_ulong val)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): mnscratch lives after end_reset_fields and is
+     * not covered by the WP register snapshot, so a discarded-path write would
+     * leak onto the real CPU.  Drop the architected write on the wrong path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return RISCV_EXCP_NONE;
+    }
+#endif
+
     env->mnscratch = val;
     return RISCV_EXCP_NONE;
 }
@@ -5354,6 +5444,17 @@ static int read_mnepc(CPURISCVState *env, int csrno, target_ulong *val)
 
 static int write_mnepc(CPURISCVState *env, int csrno, target_ulong val)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): mnepc lives after end_reset_fields and is not
+     * covered by the WP register snapshot, so a discarded-path write would
+     * leak onto the real CPU.  Drop the architected write on the wrong path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return RISCV_EXCP_NONE;
+    }
+#endif
+
     env->mnepc = val;
     return RISCV_EXCP_NONE;
 }
@@ -5366,6 +5467,17 @@ static int read_mncause(CPURISCVState *env, int csrno, target_ulong *val)
 
 static int write_mncause(CPURISCVState *env, int csrno, target_ulong val)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): mncause lives after end_reset_fields and is
+     * not covered by the WP register snapshot, so a discarded-path write would
+     * leak onto the real CPU.  Drop the architected write on the wrong path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return RISCV_EXCP_NONE;
+    }
+#endif
+
     env->mncause = val;
     return RISCV_EXCP_NONE;
 }
@@ -5379,6 +5491,18 @@ static int read_mnstatus(CPURISCVState *env, int csrno, target_ulong *val)
 static int write_mnstatus(CPURISCVState *env, int csrno, target_ulong val)
 {
     target_ulong mask = (MNSTATUS_NMIE | MNSTATUS_MNPP);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): mnstatus lives after end_reset_fields and is
+     * not covered by the WP register snapshot, so a discarded-path write would
+     * leak onto the real CPU.  Drop the architected write (and its benign,
+     * cache-only tlb_flush) on the wrong path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return RISCV_EXCP_NONE;
+    }
+#endif
 
     if (riscv_has_ext(env, RVH)) {
         /* Flush tlb on mnstatus fields that affect VM. */
@@ -5431,6 +5555,21 @@ static RISCVException rmw_seed(CPURISCVState *env, int csrno,
                                target_ulong write_mask)
 {
     target_ulong rval;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): the seed CSR pulls from the host RNG
+     * (qemu_guest_getrandom), advancing entropy state that is not rolled back
+     * -- a speculative read would perturb determinism / -seed reproducibility.
+     * Return a benign zero without consuming entropy on the discarded path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        if (ret_value) {
+            *ret_value = 0;
+        }
+        return RISCV_EXCP_NONE;
+    }
+#endif
 
     rval = riscv_new_csr_seed(new_value, write_mask);
 

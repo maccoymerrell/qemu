@@ -61,6 +61,21 @@ uint8_t *allocation_tag_mem_probe(CPUARMState *env, int ptr_mmu_idx,
                                   int ptr_size, MMUAccessType tag_access,
                                   bool probe, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) execution: allocation-tag memory is not part
+     * of the snapshotted CPUArchState and is never rolled back, so a tag
+     * STORE issued down a discarded speculative path would persist.  Return
+     * NULL for tag stores so the (already NULL-checking) callers skip the
+     * write.  Tag loads must still resolve normally: returning NULL there
+     * would corrupt the load result rather than suppress a side effect.
+     * This covers both the user-mode (page_get_target_data) and system-mode
+     * (memory_region_get_ram_ptr) paths below.
+     */
+    if (tag_access == MMU_DATA_STORE && env_cpu(env)->plugin_spec_mode) {
+        return NULL;
+    }
+#endif
 #ifdef CONFIG_USER_ONLY
     uint64_t clean_ptr = useronly_clean_ptr(ptr);
     int flags = page_get_flags(clean_ptr);
@@ -219,7 +234,22 @@ uint64_t HELPER(irg)(CPUARMState *env, uint64_t rn, uint64_t rm)
      * SEED for that case.
      */
     if (unlikely(seed == 0) && rrnd) {
-        do {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative) IRG: qemu_guest_getrandom() draws from the
+         * process-global guest-random pool, a persistent static that lives
+         * outside the CPUArchState snapshot and so is not rolled back when the
+         * speculative window unwinds.  Consuming that entropy on the wrong path
+         * perturbs the correct-path draw and breaks -seed reproducibility.
+         * The speculative result is discarded anyway, so force a deterministic
+         * constant SEED and fall through to the in-snapshot LFSR derivation
+         * (it writes only env->cp15.rgsr_el1, which is inside the snapshot).
+         */
+        if (env_cpu(env)->plugin_spec_mode) {
+            seed = 1;
+        }
+#endif
+        while (seed == 0) {
             Error *err = NULL;
             uint16_t two;
 
@@ -234,7 +264,7 @@ uint64_t HELPER(irg)(CPUARMState *env, uint64_t rn, uint64_t rm)
                 two = 1;
             }
             seed = two;
-        } while (seed == 0);
+        }
     }
 
     /* RandomTag */
@@ -503,6 +533,18 @@ void HELPER(stgm)(CPUARMState *env, uint64_t ptr, uint64_t val)
     if (!tag_mem) {
         return;
     }
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * STGM writes tag memory but probes it with tag_access == MMU_DATA_LOAD,
+     * so the spec-mode store gate in allocation_tag_mem_probe() does not
+     * catch it.  Suppress the write directly on the wrong path so discarded
+     * speculative tag stores are not persisted.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
 
     /* See LDGM for comments on BS and on shift.  */
     shift = extract64(ptr, LOG2_TAG_GRANULE, 4) * 4;

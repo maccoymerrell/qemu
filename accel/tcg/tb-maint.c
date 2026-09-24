@@ -404,7 +404,37 @@ static void page_unlock(PageDesc *pd)
 
 void tb_lock_page0(tb_page_addr_t paddr)
 {
-    page_lock(page_find_alloc(paddr >> TARGET_PAGE_BITS, true));
+    PageDesc *pd = page_find_alloc(paddr >> TARGET_PAGE_BITS, true);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (plugin speculative) translation must never BLOCK on a
+     * page lock.  The excursion can hold process-wide state for its whole
+     * duration (on x86 it holds the BQL — see cpu_plugin_spec_vtime_pause),
+     * while the current page-lock holder can be a sibling vCPU translating
+     * REAL code: it holds its TB's page locks across translation and, inside
+     * its translation-time plugin callback, waits for that same state
+     * (cpu_plugin_vclock_pause takes the BQL).  That is a cross-vCPU
+     * lock-order inversion (BQL -> page vs page -> BQL): one thread spins
+     * in page_lock forever below every plugin callback while the other
+     * sleeps holding the page — the x86 -smp 2 marker-window freeze at
+     * segment open, where the post-flush retranslation storm and the
+     * cold-branch wrong-path storm collide on hot pages.  The wrong path
+     * is discardable by design, so it is the edge that yields: trylock,
+     * and on contention abort the speculative translation through the
+     * walker's landing pad (cpu_plugin_exec_tb), like any other wrong-path
+     * dead end.
+     */
+    if (unlikely(current_cpu && current_cpu->plugin_spec_mode)) {
+        if (page_trylock(pd)) {     /* returns true when BUSY */
+            /* Nothing is locked and tcg_ctx->gen_tb is not yet set at
+             * this point in tb_gen_code: nothing to clean up. */
+            cpu_loop_exit(current_cpu);
+        }
+        return;
+    }
+#endif
+    page_lock(pd);
 }
 
 void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
@@ -419,6 +449,24 @@ void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
     }
 
     pd1 = page_find_alloc(pindex1, true);
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path translation: never block on a page lock (deadlock with a
+     * sibling vCPU's translation-time plugin callback; see tb_lock_page0).
+     * Trylock regardless of lock order; on contention abort the
+     * speculative translation. */
+    if (unlikely(current_cpu && current_cpu->plugin_spec_mode)) {
+        if (page_trylock(pd1)) {    /* returns true when BUSY */
+            /* The caller (translator_access) recorded paddr1 in gen_tb
+             * BEFORE this lock attempt; reset it so the landing pad's
+             * tb_unlock_pages releases only what is actually held
+             * (page0). */
+            tb_set_page_addr1(tcg_ctx->gen_tb, -1);
+            cpu_loop_exit(current_cpu);
+        }
+        return;
+    }
+#endif
     if (pindex0 < pindex1) {
         /* Correct locking order, we may block. */
         page_lock(pd1);
@@ -800,6 +848,22 @@ void tb_flush(CPUState *cpu)
             async_safe_run_on_cpu(cpu, do_tb_flush,
                                   RUN_ON_CPU_HOST_INT(tb_flush_count));
         }
+    }
+}
+
+void tb_flush_deferred(CPUState *cpu)
+{
+    /* Unconditionally-async variant of tb_flush for callers that may sit
+     * inside an in-flight translation or TB execution (TCG plugin
+     * callbacks).  In serial (single-threaded rr) context tb_flush would
+     * dispatch do_tb_flush synchronously and reset the code region under
+     * a running tb_gen_code; deferring to the vCPU thread-loop safe point
+     * is always correct, merely later.  The flush-count token dedups
+     * repeated requests exactly like tb_flush's async arm. */
+    if (tcg_enabled()) {
+        unsigned tb_flush_count = qatomic_read(&tb_ctx.tb_flush_count);
+        async_safe_run_on_cpu(cpu, do_tb_flush,
+                              RUN_ON_CPU_HOST_INT(tb_flush_count));
     }
 }
 

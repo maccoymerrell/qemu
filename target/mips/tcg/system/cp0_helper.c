@@ -51,37 +51,95 @@ static bool mips_vp_is_wfi(MIPSCPU *c)
     return cpu->halted && mips_vp_active(env);
 }
 
-static inline void mips_vpe_wake(MIPSCPU *c)
+static inline void mips_vpe_wake(MIPSCPU *c, int why)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't poke another VPE's global interrupt/run state. */
+    if (CPU(c)->plugin_spec_mode) {
+        return;
+    }
+#endif
     /*
      * Don't set ->halted = 0 directly, let it be done via cpu_has_work
      * because there might be other conditions that state that c should
      * be sleeping.
      */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(CPU(c), why);
+    }
     bql_lock();
     cpu_interrupt(CPU(c), CPU_INTERRUPT_WAKE);
     bql_unlock();
 }
 
-static inline void mips_vpe_sleep(MIPSCPU *cpu)
+static inline void mips_vpe_sleep(MIPSCPU *cpu, int why)
 {
     CPUState *cs = CPU(cpu);
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the VPE or clear its wake request. */
+    if (cs->plugin_spec_mode) {
+        return;
+    }
+#endif
     /*
      * The VPE was shut off, really go to bed.
      * Reset any old _WAKE requests.
      */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(cs, why);
+    }
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
 }
 
+/*
+ * Is this VPE's OWN thread state activated -- mips_vpe_active() without the
+ * processor-wide MVPControl.EVP term.
+ *
+ * The two questions are not interchangeable.  EVP says whether the whole
+ * processor may issue right now, and it is 0 for every VPE inside any DVPE
+ * section; VPA / TCStatus.A / TCHalt say whether this particular VPE and
+ * thread context are enabled at all.  Only the second is a property of the
+ * TC whose registers are being written.
+ */
+static bool mips_vpe_tc_activated(CPUMIPSState *env)
+{
+    return (env->CP0_VPEConf0 & (1 << CP0VPEC0_VPA))
+        && (env->active_tc.CP0_TCStatus & (1 << CP0TCSt_A))
+        && !(env->active_tc.CP0_TCHalt & 1);
+}
+
+/*
+ * Reacting to a write of a TC's own halt/activation state.
+ *
+ * These asked mips_vpe_active(), which folds in EVP -- and MIPS MT requires
+ * VPEs to be disabled before a VPE may touch another's TC registers, so
+ * every one of these writes arrives with EVP already 0.  Both answers were
+ * therefore constants inside the only window they are reached from:
+ *
+ *   - mips_tc_sleep() halted the VPE unconditionally.  Through
+ *     helper_mtc0_tchalt() that VPE is the caller itself, so a VPE that had
+ *     just executed DVPE put ITSELF to sleep in the middle of its own
+ *     section, before the EVPE that would re-enable the processor.  Nothing
+ *     could reschedule it, because mips_cpu_has_work() gates on the same
+ *     EVP it had cleared, so the machine stopped with the restore still
+ *     owed -- the residual malta -smp 4 boot wedge.
+ *   - mips_tc_wake() woke nobody, so a TC that the guest un-halted inside a
+ *     section was never scheduled, and an IPI delivered to it was never
+ *     collected: "Unable to send backtrace IPI to CPU0 - perhaps it hung?".
+ *
+ * The processor-wide gate is not theirs to apply.  mips_cpu_has_work()
+ * already holds every VPE off the run queue while EVP is clear, and it is
+ * the DVPE that cleared EVP which owns waking them again.
+ */
 static inline void mips_tc_wake(MIPSCPU *cpu, int tc)
 {
     CPUMIPSState *c = &cpu->env;
 
     /* FIXME: TC reschedule.  */
-    if (mips_vpe_active(c) && !mips_vpe_is_wfi(cpu)) {
-        mips_vpe_wake(cpu);
+    if (mips_vpe_tc_activated(c) && !mips_vpe_is_wfi(cpu)) {
+        mips_vpe_wake(cpu, MIPS_MVP_WAKE_TC);
     }
 }
 
@@ -90,8 +148,8 @@ static inline void mips_tc_sleep(MIPSCPU *cpu, int tc)
     CPUMIPSState *c = &cpu->env;
 
     /* FIXME: TC reschedule.  */
-    if (!mips_vpe_active(c)) {
-        mips_vpe_sleep(cpu);
+    if (!mips_vpe_tc_activated(c)) {
+        mips_vpe_sleep(cpu, MIPS_MVP_SLEEP_TC);
     }
 }
 
@@ -211,6 +269,33 @@ uint32_t cpu_mips_get_random(CPUMIPSState *env)
     if (nb_rand_tlb == 1) {
         return env->tlb->nb_tlb - 1;
     }
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): answer without advancing the generator.
+     *
+     * seed and prev_idx are file-scope statics, so they are not in
+     * CPUArchState at all and cannot be in the region the plugin's
+     * speculative snapshot copies -- that region is
+     * CPUArchState[0 .. end_reset_fields).  A discarded `mfc0 $Random` would
+     * therefore leave the sequence permanently advanced, and the sequence is
+     * not decorative: it chooses which entry the correct path's next TLBWR
+     * replaces, so a wrong path would change the correct path's TLB
+     * replacement pattern and with it the miss stream a trace exists to
+     * record.  Tracing a program must not alter the program it traces.
+     *
+     * nb_tlb - 1 is the value the single-random-entry case above already
+     * returns, so it is a legal index by construction; the architecture
+     * leaves which one Random reports unspecified, and the wrong path is not
+     * entitled to a particular answer -- only to an answer that costs the
+     * correct path nothing.  TLBWR itself never arrives here speculatively:
+     * helper_tlbwr is gated in tcg/system/tlb_helper.c, so the only
+     * speculative caller is the mfc0 read.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return env->tlb->nb_tlb - 1;
+    }
+#endif
 
     /* Don't return same value twice, so get another value */
     do {
@@ -514,20 +599,60 @@ void helper_mtc0_index(CPUMIPSState *env, target_ulong arg1)
 void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
 {
     uint32_t mask = 0;
-    uint32_t newval;
+    int32_t oldval, newval;
 
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        mask |= (1 << CP0MVPCo_CPA) | (1 << CP0MVPCo_VPC) |
-                (1 << CP0MVPCo_EVP);
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared MVP context (env->mvp), out of snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
     }
-    if (env->mvp->CP0_MVPControl & (1 << CP0MVPCo_VPC)) {
-        mask |= (1 << CP0MVPCo_STLB);
+#endif
+    /*
+     * MVPControl is shared by every VPE of the processor, so this masked
+     * read-modify-write races the EVP bit that DVPE/EVPE own.  A plain
+     * load-modify-store would publish a whole word computed from a stale
+     * sample and silently undo a sibling's EVPE; the compare-exchange makes
+     * the write conditional on nothing having moved underneath it.  The
+     * STLB clause of the mask is recomputed each attempt because it is
+     * itself a function of the value being replaced.
+     */
+    do {
+        oldval = qatomic_read(&env->mvp->CP0_MVPControl);
+        mask = 0;
+        if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+            mask |= (1 << CP0MVPCo_CPA) | (1 << CP0MVPCo_VPC) |
+                    (1 << CP0MVPCo_EVP);
+        }
+        if (oldval & (1 << CP0MVPCo_VPC)) {
+            mask |= (1 << CP0MVPCo_STLB);
+        }
+        newval = (oldval & ~mask) | (arg1 & mask);
+
+        /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
+    } while (qatomic_cmpxchg(&env->mvp->CP0_MVPControl,
+                             oldval, newval) != oldval);
+
+    /*
+     * EVP means the same thing however it was written, so an mtc0 that moves
+     * it takes the same ownership as the DVPE or EVPE that would have.  Left
+     * out, an mtc0 that cleared EVP would open a section nobody owns -- every
+     * VPE reading the bit as its own disable, which is the state this claim
+     * exists to prevent.
+     */
+    if ((oldval ^ newval) & (1 << CP0MVPCo_EVP)) {
+        if (newval & (1 << CP0MVPCo_EVP)) {
+            qatomic_cmpxchg(&env->mvp->evp_owner,
+                            env_cpu(env)->cpu_index, -1);
+        } else {
+            qatomic_set(&env->mvp->evp_owner, env_cpu(env)->cpu_index);
+            if (mips_vpe_tc_activated(env)) {
+                env_cpu(env)->halted = 0;   /* see helper_dvpe() */
+            }
+        }
     }
-    newval = (env->mvp->CP0_MVPControl & ~mask) | (arg1 & mask);
 
-    /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
-
-    env->mvp->CP0_MVPControl = newval;
+    mips_mvp_note(env, mask ? MIPS_MVP_MTC0_WR : MIPS_MVP_MTC0_NA,
+                  oldval, newval);
 }
 
 void helper_mtc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
@@ -552,9 +677,17 @@ void helper_mtc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     uint32_t mask;
     uint32_t newval;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     mask = (1 << CP0VPECo_YSI) | (1 << CP0VPECo_GSI) |
            (1 << CP0VPECo_TE) | (0xff << CP0VPECo_TargTC);
@@ -602,9 +735,17 @@ void helper_mtc0_vpeconf0(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_vpeconf0(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     uint32_t mask = 0;
     uint32_t newval;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     mask |= (1 << CP0VPEC0_MVP) | (1 << CP0VPEC0_VPA);
     newval = (other->CP0_VPEConf0 & ~mask) | (arg1 & mask);
@@ -676,7 +817,15 @@ void helper_mtc0_tcstatus(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcstatus(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCStatus = arg1;
@@ -703,7 +852,15 @@ void helper_mttc0_tcbind(CPUMIPSState *env, target_ulong arg1)
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t mask = (1 << CP0TCBd_TBE);
     uint32_t newval;
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other->mvp->CP0_MVPControl & (1 << CP0MVPCo_VPC)) {
         mask |= (1 << CP0TCBd_CurVPE);
@@ -729,7 +886,15 @@ void helper_mtc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.PC = arg1;
@@ -763,8 +928,20 @@ void helper_mtc0_tchalt(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tchalt(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
-    MIPSCPU *other_cpu = env_archcpu(other);
+    CPUMIPSState *other;
+    MIPSCPU *other_cpu;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: writes a sibling TC's env and toggles its run state
+     * (mips_tc_sleep/wake), both out of this CPU's snapshot.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
+    other_cpu = env_archcpu(other);
 
     /* TODO: Halt TC / Restart (if allocated+active) TC. */
 
@@ -789,7 +966,15 @@ void helper_mtc0_tccontext(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tccontext(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCContext = arg1;
@@ -806,7 +991,15 @@ void helper_mtc0_tcschedule(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcschedule(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCSchedule = arg1;
@@ -823,7 +1016,15 @@ void helper_mtc0_tcschefback(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcschefback(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCScheFBack = arg1;
@@ -1061,6 +1262,12 @@ void helper_mtc0_hwrena(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_count(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't reprogram the guest timer device. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_count(env, arg1);
 }
 
@@ -1096,13 +1303,35 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
     if ((old & env->CP0_EntryHi_ASID_mask) !=
         (val & env->CP0_EntryHi_ASID_mask)) {
         tlb_flush(env_cpu(env));
+#ifdef CONFIG_PLUGIN
+        /*
+         * Address-space switch observation: the ASID field
+         * mips_get_plugin_state reports just changed.  EntryHi also
+         * carries VPN bits for TLB maintenance; VPN-only writes take the
+         * branch above and never land here.  The event's pc slot carries
+         * the OLD field value; the push itself stamps the just-committed
+         * NEW value as the event's asid (and is a no-op on the wrong
+         * path or while the queue is disabled).
+         */
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old & env->CP0_EntryHi_ASID_mask,
+                            env_cpu(env)->plugin_fault_depth);
+#endif
     }
 }
 
 void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     other->CP0_EntryHi = arg1;
     sync_c0_entryhi(other, other_tc);
@@ -1110,6 +1339,12 @@ void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_compare(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't reprogram the guest timer / clear its interrupt. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_compare(env, arg1);
 }
 
@@ -1150,7 +1385,15 @@ void helper_mttc0_status(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t mask = env->CP0_Status_rw_bitmask & ~0xf1000018;
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     other->CP0_Status = (other->CP0_Status & ~mask) | (arg1 & mask);
     sync_c0_status(env, other, other_tc);
@@ -1169,13 +1412,35 @@ void helper_mtc0_srsctl(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: cpu_mips_store_cause toggles the soft IRQ line
+     * (interrupt_request, out of snapshot) and on a CP0_Cause.DC flip
+     * starts/stops the host count timer. The CP0_Cause register write
+     * is rolled back with the snapshot anyway, so skip the whole store.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_cause(env, arg1);
 }
 
 void helper_mttc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: writes a sibling TC's CP0_Cause (out of this CPU's
+     * snapshot) and toggles its soft IRQ line / host count timer.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     cpu_mips_store_cause(other, arg1);
 }
@@ -1208,8 +1473,16 @@ void helper_mtc0_ebase(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_ebase(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     target_ulong mask = 0x3FFFF000 | env->CP0_EBaseWG_rw_bitmask;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
     if (arg1 & env->CP0_EBaseWG_rw_bitmask) {
         mask |= ~0x3FFFFFFF;
     }
@@ -1360,7 +1633,15 @@ void helper_mttc0_debug(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t val = arg1 & ((1 << CP0DB_SSt) | (1 << CP0DB_Halt));
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     /* XXX: Might be wrong, check with EJTAG spec. */
     if (other_tc == other->current_tc) {
@@ -1486,7 +1767,15 @@ target_ulong helper_mftdsp(CPUMIPSState *env)
 void helper_mttgpr(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.gpr[sel] = arg1;
@@ -1498,7 +1787,15 @@ void helper_mttgpr(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttlo(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.LO[sel] = arg1;
@@ -1510,7 +1807,15 @@ void helper_mttlo(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mtthi(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.HI[sel] = arg1;
@@ -1522,7 +1827,15 @@ void helper_mtthi(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttacx(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.ACX[sel] = arg1;
@@ -1534,7 +1847,15 @@ void helper_mttacx(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttdsp(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.DSPControl = arg1;
@@ -1559,16 +1880,115 @@ target_ulong helper_emt(void)
 target_ulong helper_dvpe(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->mvp->CP0_MVPControl;
+    target_ulong prev;
 
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        CPU_FOREACH(other_cs) {
-            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
-            /* Turn off all VPEs except the one executing the dvpe.  */
-            if (&other_cpu->env != env) {
-                other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
-                mips_vpe_sleep(other_cpu);
-            }
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared mvp context, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    if (!(env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP))) {
+        /* Without MVP, DVPE reads MVPControl and changes nothing. */
+        prev = env->mvp->CP0_MVPControl;
+        mips_mvp_note(env, MIPS_MVP_DVPE_NA, prev, prev);
+        return prev;
+    }
+
+    /*
+     * One instruction, one read-modify-write.
+     *
+     * MVPControl is a single per-processor register shared by every VPE of
+     * the processor, and the value DVPE returns is what the guest's nesting
+     * protocol tests to decide whether its matching EVPE has to restore EVP
+     * (`prev = dvpe(); ... evpe(prev);`).  Sampling it and clearing EVP must
+     * therefore be indivisible.  Walking the sibling list and clearing the
+     * bit once per sibling instead gave the instruction N-1 separate stores
+     * with the sample outside all of them, so a peer's EVPE landing in the
+     * middle was undone afterwards by this VPE's remaining stores: the peer
+     * had already spent its restore, this VPE still owed one, and EVP stayed
+     * clear.  Every VPE then failed mips_vpe_active(), mips_cpu_has_work()
+     * forced has_work false with an enabled interrupt pending, and the
+     * machine never retired another instruction.
+     */
+    prev = qatomic_fetch_and(&env->mvp->CP0_MVPControl,
+                             ~(int32_t)(1 << CP0MVPCo_EVP));
+    mips_mvp_note(env, MIPS_MVP_DVPE_RD, prev, prev);
+    mips_mvp_note(env, MIPS_MVP_DVPE_WR, prev,
+                  prev & ~(1 << CP0MVPCo_EVP));
+
+    if (!(prev & (1 << CP0MVPCo_EVP))) {
+        /*
+         * The processor was already disabled, so this DVPE is nested inside
+         * another VPE's -- and on hardware it could not have been reached at
+         * all, because that other VPE's DVPE stopped this one from issuing.
+         * QEMU cannot stop a sibling mid-TB, so the instruction does get
+         * executed here; what it must not do is act as though it owned the
+         * disable.  Sleeping the siblings from a nested DVPE halts the VPE
+         * that is holding the section open -- the one VPE that will run the
+         * matching EVPE, because the guest's `evpe(prev)` restores only when
+         * its own DVPE saw EVP set.  That VPE then cannot be rescheduled,
+         * since mips_vpe_active() is false for it too, and the whole
+         * processor stops with EVP clear and the restore still owed.
+         *
+         * Sleeping siblings therefore belongs to the DVPE that performed the
+         * 1 -> 0 transition, and to no other.  With the transition itself
+         * atomic, exactly one VPE owns an open section at a time, and no peer
+         * ISSUES a halt to it while that section is open.
+         *
+         * That is not the same as the owner never being found halted, and
+         * reading it as though it were is what left this stall open.  An
+         * order issued by the PREVIOUS owner, before the EVPE that let this
+         * transition happen, is still unobserved in the target until its next
+         * trip through the top of cpu_exec(); it lands on whatever that VPE
+         * has become by then.  The claim below cancels it.
+         */
+        return prev;
+    }
+
+    /*
+     * This VPE now holds the processor disabled, and the state has to say so,
+     * because "EVP is clear" means the opposite thing about it than it means
+     * about its siblings -- see CPUMIPSMVPContext::evp_owner.
+     */
+    qatomic_set(&env->mvp->evp_owner, env_cpu(env)->cpu_index);
+
+    /*
+     * A stop order this VPE is still carrying is void: it is executing.
+     *
+     * mips_vpe_sleep() stores into a sibling's ->halted from another thread,
+     * and a sibling already inside a TB does not read that store until the
+     * top of cpu_exec().  It can therefore run on for an unbounded number of
+     * instructions after the store -- including, as measured on this guest in
+     * every one of 14 stalls, the DVPE right here.  The order was issued to
+     * stop a VPE from executing during someone else's section; that section
+     * has since ended (its EVPE is what allowed this DVPE to win), and the
+     * VPE it named is now the one VPE that architecture says must keep
+     * running.  Observing it later would park the owner with EVP clear, and
+     * nothing could ever wake it: the EVPE that would is the instruction it
+     * has not reached.
+     *
+     * No further order can arrive while this section is open.  A peer's
+     * sibling-sleep loop runs only inside a section it owns, and its EVPE --
+     * the instruction that lets this DVPE win -- comes after that loop in its
+     * own program order, so every order issued by the previous owner was
+     * issued before this transition.
+     *
+     * The TC's own activation state is asked anyway rather than assumed: a
+     * halt that came from TCHalt / VPA / TCStatus.A is the thread context
+     * saying it must not execute, which is a fact about this VPE and not a
+     * stale statement about someone else's section, and nothing here may
+     * override it.
+     */
+    if (mips_vpe_tc_activated(env)) {
+        env_cpu(env)->halted = 0;
+    }
+
+    CPU_FOREACH(other_cs) {
+        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+        /* Put every VPE except the one executing the dvpe to sleep. */
+        if (&other_cpu->env != env) {
+            mips_vpe_sleep(other_cpu, MIPS_MVP_SLEEP_DVPE);
         }
     }
     return prev;
@@ -1577,19 +1997,75 @@ target_ulong helper_dvpe(CPUMIPSState *env)
 target_ulong helper_evpe(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->mvp->CP0_MVPControl;
+    target_ulong prev;
 
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        CPU_FOREACH(other_cs) {
-            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared mvp context, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    if (!(env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP))) {
+        /* Without MVP, EVPE reads MVPControl and changes nothing. */
+        prev = env->mvp->CP0_MVPControl;
+        mips_mvp_note(env, MIPS_MVP_EVPE_NA, prev, prev);
+        return prev;
+    }
 
-            if (&other_cpu->env != env
-                /* If the VPE is WFI, don't disturb its sleep.  */
-                && !mips_vpe_is_wfi(other_cpu)) {
-                /* Enable the VPE.  */
-                other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
-                mips_vpe_wake(other_cpu); /* And wake it up.  */
-            }
+    /* One instruction, one read-modify-write -- see helper_dvpe(). */
+    prev = qatomic_fetch_or(&env->mvp->CP0_MVPControl,
+                            (int32_t)(1 << CP0MVPCo_EVP));
+    mips_mvp_note(env, MIPS_MVP_EVPE_RD, prev, prev);
+    mips_mvp_note(env, MIPS_MVP_EVPE_WR, prev,
+                  prev | (1 << CP0MVPCo_EVP));
+
+    if (prev & (1 << CP0MVPCo_EVP)) {
+        /*
+         * Already enabled: this EVPE closes nothing, so there is nobody it
+         * put to sleep to wake.  The mirror of the nested-DVPE case above.
+         */
+        return prev;
+    }
+
+    /*
+     * The section is closed, so release the claim -- but only this VPE's own.
+     * The enable above is what lets the next DVPE win, and that DVPE claims
+     * ownership for itself; a plain store here could land after that claim and
+     * erase it, leaving the new owner reading the shared bit as its own
+     * disable again.  The compare-exchange releases nothing it does not own.
+     */
+    qatomic_cmpxchg(&env->mvp->evp_owner, env_cpu(env)->cpu_index, -1);
+
+    CPU_FOREACH(other_cs) {
+        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+
+        /*
+         * Wake every sibling, because the matching DVPE slept every sibling.
+         * mips_vpe_sleep() halts a VPE that was running and clears its wake
+         * request, so nothing but this wake will schedule it again: a VPE
+         * stopped mid-computation has no pending interrupt to revive it.
+         *
+         * The old "if the VPE is WFI, don't disturb its sleep" guard could
+         * not survive here.  It asked mips_vpe_is_wfi() of the live shared
+         * word, so the first sibling's write set EVP and made the answer
+         * true for every later halted sibling: an EVPE closing a DVPE that
+         * had slept N-1 VPEs woke exactly one of them, and the rest stayed
+         * halted with the wake request DVPE cleared never reissued.  An IPI
+         * delivered into that window sets CPU_INTERRUPT_HARD on a vCPU that
+         * is never asked for work again, which is how a guest reports
+         * "Unable to send backtrace IPI to CPU0 - perhaps it hung?".
+         *
+         * Asked instead of the SAMPLED word the guard is vacuous rather than
+         * order-dependent -- an EVPE that reaches this loop sampled EVP
+         * clear, under which mips_vpe_active() is false for every VPE -- so
+         * there is no honest form of it to keep.  The cost is that a VPE
+         * that had executed WAIT before the DVPE leaves WAIT here without an
+         * interrupt; MIPS permits WAIT to terminate for implementation
+         * reasons and Linux's idle loop re-enters, and this is what the
+         * first sibling has always had done to it.
+         */
+        if (&other_cpu->env != env) {
+            mips_vpe_wake(other_cpu, MIPS_MVP_WAKE_EVPE); /* Wake it up. */
         }
     }
     return prev;
@@ -1599,14 +2075,36 @@ target_ulong helper_evpe(CPUMIPSState *env)
 target_ulong helper_dvp(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->CP0_VPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: only own-CPU CP0_VPControl (in-snapshot) plus sibling
+     * sleep/wake (gated in mips_vpe_sleep/wake) — safe, but gate at entry to
+     * match dvpe/evpe and stay robust if the sink gates ever change.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->CP0_VPControl;
 
     if (!((env->CP0_VPControl >> CP0VPCtl_DIS) & 1)) {
+        /*
+         * As in helper_dvpe(): the VP issuing DVP is the one VP that keeps
+         * running, so a sleep order it is still carrying from a peer -- one
+         * a VP inside a TB cannot observe until the top of cpu_exec() -- is
+         * stale, and observing it later would park the VP that owes the
+         * matching EVP.
+         */
+        if (mips_vpe_tc_activated(env)) {
+            env_cpu(env)->halted = 0;
+        }
         CPU_FOREACH(other_cs) {
             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
             /* Turn off all VPs except the one executing the dvp. */
             if (&other_cpu->env != env) {
-                mips_vpe_sleep(other_cpu);
+                mips_vpe_sleep(other_cpu, MIPS_MVP_SLEEP_DVP);
             }
         }
         env->CP0_VPControl |= (1 << CP0VPCtl_DIS);
@@ -1617,7 +2115,15 @@ target_ulong helper_dvp(CPUMIPSState *env)
 target_ulong helper_evp(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->CP0_VPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: see helper_dvp — gate at entry for symmetry/robustness. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->CP0_VPControl;
 
     if ((env->CP0_VPControl >> CP0VPCtl_DIS) & 1) {
         CPU_FOREACH(other_cs) {
@@ -1627,7 +2133,7 @@ target_ulong helper_evp(CPUMIPSState *env)
                  * If the VP is WFI, don't disturb its sleep.
                  * Otherwise, wake it up.
                  */
-                mips_vpe_wake(other_cpu);
+                mips_vpe_wake(other_cpu, MIPS_MVP_WAKE_EVP);
             }
         }
         env->CP0_VPControl &= ~(1 << CP0VPCtl_DIS);

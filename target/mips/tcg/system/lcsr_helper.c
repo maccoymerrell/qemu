@@ -28,6 +28,12 @@ uint64_t helper_lcsr_drdcsr(CPUMIPSState *env, target_ulong r_addr)
 void helper_lcsr_wrcsr(CPUMIPSState *env, target_ulong w_addr,
                       target_ulong val)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: direct IOCSR device write, out of the CPU snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     address_space_stl(&env->iocsr.as, w_addr,
                       val, GET_MEMTXATTRS(env), NULL);
 }
@@ -35,6 +41,12 @@ void helper_lcsr_wrcsr(CPUMIPSState *env, target_ulong w_addr,
 void helper_lcsr_dwrcsr(CPUMIPSState *env, target_ulong w_addr,
                       target_ulong val)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: direct IOCSR device write, out of the CPU snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     address_space_stq(&env->iocsr.as, w_addr,
                       val, GET_MEMTXATTRS(env), NULL);
 }

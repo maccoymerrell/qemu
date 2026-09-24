@@ -152,6 +152,23 @@ static inline bool virtual_gif_set(CPUX86State *env)
     return !virtual_gif_enabled(env) || (env->int_ctl & V_GIF_MASK);
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path (speculative): the SVM/virtualization helpers write host save
+ * state to guest *physical* memory (x86_st*_phys, bypassing the sandboxed
+ * softmmu store path) and mutate complex global VMM state.  None of that can
+ * be rolled back, so abort the speculative walk on encountering one — caught
+ * by cpu_plugin_exec_tb's guard (tb_ok=false), exactly like helper_hlt.
+ */
+#define CST_SPEC_ABORT_VMM(env) do {                       \
+    if (env_cpu(env)->plugin_spec_mode) {                  \
+        cpu_loop_exit(env_cpu(env));                       \
+    }                                                      \
+} while (0)
+#else
+#define CST_SPEC_ABORT_VMM(env) ((void)0)
+#endif
+
 void helper_vmrun(CPUX86State *env, int aflag, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
@@ -159,6 +176,8 @@ void helper_vmrun(CPUX86State *env, int aflag, int next_eip_addend)
     target_ulong addr;
     uint64_t nested_ctl;
     uint32_t event_inj;
+
+    CST_SPEC_ABORT_VMM(env);
     uint32_t asid;
     uint64_t new_cr0;
     uint64_t new_cr3;
@@ -479,6 +498,8 @@ void helper_vmload(CPUX86State *env, int aflag)
     int mmu_idx = MMU_PHYS_IDX;
     target_ulong addr;
 
+    CST_SPEC_ABORT_VMM(env);
+
     if (aflag == 2) {
         addr = env->regs[R_EAX];
     } else {
@@ -539,6 +560,8 @@ void helper_vmsave(CPUX86State *env, int aflag)
 {
     int mmu_idx = MMU_PHYS_IDX;
     target_ulong addr;
+
+    CST_SPEC_ABORT_VMM(env);
 
     if (aflag == 2) {
         addr = env->regs[R_EAX];
@@ -656,6 +679,15 @@ void cpu_svm_check_intercept_param(CPUX86State *env, uint32_t type,
         return;
     }
 
+    /*
+     * Wrong-path (speculative): with HF_GUEST_MASK set, a taken intercept
+     * funnels into cpu_vmexit -> do_vmexit, which writes the VMCB to guest
+     * *physical* memory via x86_st*_phys (bypassing the sandboxed softmmu
+     * store path) and tears down global VMM state — neither is rolled back.
+     * Abort the walk before any such effect, like helper_vmrun/vmload/vmsave.
+     */
+    CST_SPEC_ABORT_VMM(env);
+
     if (!cpu_svm_has_intercept(env, type)) {
         return;
     }
@@ -708,6 +740,14 @@ void helper_svm_check_io(CPUX86State *env, uint32_t port, uint32_t param,
     CPUState *cs = env_cpu(env);
 
     if (env->intercept & (1ULL << (SVM_EXIT_IOIO - SVM_EXIT_INTR))) {
+        /*
+         * Wrong-path (speculative): an intercepted I/O port funnels into
+         * cpu_vmexit (plus a direct x86_stq_phys of exit_info_2 here), which
+         * writes the VMCB to guest *physical* memory bypassing the sandboxed
+         * softmmu path — not rolled back.  Abort before that store, like
+         * cpu_svm_check_intercept_param.
+         */
+        CST_SPEC_ABORT_VMM(env);
         /* FIXME: this should be read in at vmrun (faster this way?) */
         uint64_t addr = x86_ldq_phys(cs, env->vm_vmcb +
                                  offsetof(struct vmcb, control.iopm_base_pa));
@@ -727,6 +767,16 @@ void cpu_vmexit(CPUX86State *env, uint64_t exit_code, uint64_t exit_info_1,
                 uintptr_t retaddr)
 {
     CPUState *cs = env_cpu(env);
+
+    /*
+     * Wrong-path (speculative) chokepoint: cpu_vmexit writes the VMCB to guest
+     * *physical* memory below via x86_st*_phys (bypassing the sandboxed softmmu
+     * store path), unrecoverable state.  Guarding here covers every caller —
+     * the intercept path (already double-gated, harmless), the cr3/cr4
+     * reserved-bit faults in helper_write_crN (reachable in spec with
+     * HF_GUEST_MASK set), and any future caller.
+     */
+    CST_SPEC_ABORT_VMM(env);
 
     cpu_restore_state(cs, retaddr);
 

@@ -62,12 +62,27 @@ struct qemu_plugin_ctx {
      * to strdup plugin args.
      */
     struct qemu_plugin_desc *desc;
+    /*
+     * The API version the plugin exported through qemu_plugin_version, kept
+     * past the load-time range check.  The loader admits every version in
+     * [QEMU_PLUGIN_MIN_VERSION, QEMU_PLUGIN_VERSION], so this number is the
+     * only thing that distinguishes two incompatible spellings of the same
+     * entry point; discarding it is what makes an ABI change undetectable.
+     */
+    int version;
     bool installing;
     bool uninstalling;
     bool resetting;
 };
 
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id);
+
+/*
+ * The lowest API version any loaded plugin declared, for entry points that
+ * carry no plugin id and so cannot ask about their own caller.
+ */
+void plugin_note_declared_version(int version);
+int plugin_declared_version_floor(void);
 
 void plugin_register_inline_op_on_entry(GArray **arr,
                                         enum qemu_plugin_mem_rw rw,
@@ -119,10 +134,29 @@ struct qemu_plugin_scoreboard *plugin_scoreboard_new(size_t element_size);
 
 void plugin_scoreboard_free(struct qemu_plugin_scoreboard *score);
 
+
+/* Queue-non-empty scoreboard slot plumbing (see plugins/core.c). */
+void plugin_set_evq_pending_slot(qemu_plugin_u64 slot, bool set);
+bool plugin_evq_pending_slot_armed(void);
+void plugin_evq_note_drained(CPUState *cpu);
+
 /**
  * qemu_plugin_fillin_mode_info() - populate mode specific info
  * info: pointer to qemu_info_t structure
  */
 void qemu_plugin_fillin_mode_info(qemu_info_t *info);
+
+/**
+ * qemu_plugin_vclock_agency_mode - track the PLUGIN-ACTIVE condition
+ * @active: true when the first plugin installs, false when the last
+ *          uninstalls
+ *
+ * The event-agency discipline (qemu/vclock-agency.h) is gated on the
+ * runtime condition "a plugin is loaded/instrumenting", never on an
+ * environment knob.  System-mode implementation arms the discipline
+ * (plugins/system.c); user-mode is a no-op (plugins/user.c) -- there is
+ * no iothread/VIRTUAL consumption split to move in user mode.
+ */
+void qemu_plugin_vclock_agency_mode(bool active);
 
 #endif /* PLUGIN_H */

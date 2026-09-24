@@ -840,6 +840,27 @@ typedef struct {
 #define PF_ARM_SB          0x10000000   /* Segment contains the location
                                            addressed by the static base */
 
+/* ARM build attributes (".ARM.attributes" section, generic EABI format). */
+#define SHT_ARM_ATTRIBUTES (SHT_LOPROC + 3)              /* 0x70000003 */
+#define SHT_ARM_ATTRIBUTES_SECTION_NAME ".ARM.attributes"
+
+/*
+ * Generic build-attribute "Tag_<scope>" identifiers, used both by the ARM
+ * EABI and the RISC-V psABI.  Each subsection's body is one or more of
+ * these scope blocks.
+ */
+enum {
+    Tag_File    = 1,  /* attributes apply to the whole file */
+    Tag_Section = 2,  /* attributes apply to a list of sections */
+    Tag_Symbol  = 3,  /* attributes apply to a list of symbols */
+};
+
+/*
+ * Format-version byte that introduces every build-attribute section.
+ * ('A' = 0x41 in ASCII; defined by the EABI / psABI build-attributes spec.)
+ */
+#define ELF_BUILD_ATTRIBUTES_VERSION_A 'A'
+
 /* ARM relocs.  */
 #define R_ARM_NONE              0   /* No reloc */
 #define R_ARM_PC24              1   /* PC relative 26 bit branch */
@@ -1454,6 +1475,26 @@ typedef struct {
 #define EF_RISCV_FLOAT_ABI_QUAD   0x0006
 #define EF_RISCV_RVE              0x0008
 #define EF_RISCV_TSO              0x0010
+
+/*
+ * RISC-V build attributes (".riscv.attributes" section).  See the
+ * riscv-elf-psabi document.  Section type and tag values are shared
+ * with the generic ARM EABI build-attributes format.
+ */
+#define SHT_RISCV_ATTRIBUTES      (SHT_LOPROC + 3)        /* 0x70000003 */
+#define SHT_RISCV_ATTRIBUTES_SECTION_NAME ".riscv.attributes"
+
+/* Tag_RISCV_<name> attribute identifiers (ULEB128). */
+enum {
+    Tag_RISCV_stack_align        = 4,
+    Tag_RISCV_arch               = 5,
+    Tag_RISCV_unaligned_access   = 6,
+    Tag_RISCV_priv_spec          = 8,
+    Tag_RISCV_priv_spec_minor    = 10,
+    Tag_RISCV_priv_spec_revision = 12,
+    Tag_RISCV_atomic_abi         = 14,
+    Tag_RISCV_x3_reg_usage       = 16,
+};
 
 typedef struct elf32_rel {
   Elf32_Addr r_offset;

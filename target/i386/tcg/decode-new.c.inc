@@ -873,8 +873,33 @@ static const X86OpEntry opcodes_0F3A[256] = {
      * For other unary operations such as VSQRTSx this is hidden by the "REPScalar"
      * value of vex_special, because the table lists the operand types of VSQRTPx.
      */
-    [0x0a] = X86_OP_ENTRY4(VROUNDSS,   V,x,  H,x, W,ss, vex3 cpuid(SSE41) p_66),
-    [0x0b] = X86_OP_ENTRY4(VROUNDSD,   V,x,  H,x, W,sd, vex3 cpuid(SSE41) p_66),
+    /*
+     * SCALAR, SO THE DESTINATION AND FIRST SOURCE ARE `dq' AND NOT `x'.
+     *
+     * Both emitters assert(!s->vex_l) -- correctly, since gen_helper_roundss /
+     * roundsd are the xmm forms and there is no ymm one to call.  With `x' the
+     * assert was REACHABLE: X86_SIZE_x never refuses, it just picks MO_256
+     * when VEX.L is set, so a guest could encode VEX.256 VROUNDSS and abort
+     * the emulator from userspace ("gen_VROUNDSS: Assertion `!s->vex_l'
+     * failed").  Found by a whole-population encoding sweep; it is the only
+     * such entry -- of the six emitters in emit.c.inc that assert !vex_l, the
+     * other four (VAESIMC, VAESKEYGEN, VPHMINPOSUW, VINSERTPS) already spell
+     * their operands `dq'.
+     *
+     * `dq' is the fix because X86_SIZE_dq REFUSES when vex_l is set and no
+     * operand is `qq', which turns the encoding into #UD before the emitter is
+     * reached -- the same route VPHMINPOSUW takes, and the same answer
+     * validate_vex() already gives every OTHER scalar VEX form through
+     * X86_VEX_REPScalar (`if (s->vex_l) goto illegal').  So this makes
+     * VROUNDSS/VROUNDSD agree with the rest of the emulator rather than
+     * inventing a policy.  Whether silicon #UDs or ignores L on a VEX.LIG
+     * scalar is a separate question and this does not settle it: the assert
+     * was a defect under either answer.
+     *
+     * The VEX.L=0 path is untouched -- `x' and `dq' both give MO_128 there.
+     */
+    [0x0a] = X86_OP_ENTRY4(VROUNDSS,   V,dq, H,dq, W,ss, vex3 cpuid(SSE41) p_66),
+    [0x0b] = X86_OP_ENTRY4(VROUNDSD,   V,dq, H,dq, W,sd, vex3 cpuid(SSE41) p_66),
     [0x0c] = X86_OP_ENTRY4(VBLENDPS,   V,x,  H,x,  W,x,  vex4 cpuid(SSE41) p_66),
     [0x0d] = X86_OP_ENTRY4(VBLENDPD,   V,x,  H,x,  W,x,  vex4 cpuid(SSE41) p_66),
     [0x0e] = X86_OP_ENTRY4(VPBLENDW,   V,x,  H,x,  W,x,  vex4 cpuid(SSE41) avx2_256 p_66),

@@ -46,6 +46,7 @@
 #include "qemu/job.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/plugin.h"
 #include "qemu/sockets.h"
 #include "qemu/timer.h"
 #include "qemu/thread.h"
@@ -633,6 +634,20 @@ void qemu_system_reset_request(ShutdownCause reason)
         error_report("cpus are not resettable, terminating");
         shutdown_requested = reason;
     } else {
+        /*
+         * The machine really will reset: tell any plugin recording it,
+         * HERE, before the flag is set — the main loop tears the machine
+         * down and boots a new world on the same process, which no
+         * shutdown or exit callback will ever report (see
+         * qemu_plugin_vm_reset).  Every reset delivery path — guest
+         * reset device writes, the x86 triple fault, the watchdog's
+         * reset action, monitor/QMP system_reset — funnels through this
+         * request, so this one dispatch covers them all.  The two
+         * branches above become shutdowns and take the shutdown dispatch
+         * in qemu_system_shutdown() instead; a reset is never reported
+         * as both.
+         */
+        qemu_plugin_vm_reset();
         reset_requested = reason;
     }
     cpu_stop_current();
@@ -729,6 +744,16 @@ void qemu_system_shutdown_request(ShutdownCause reason)
 {
     trace_qemu_system_shutdown_request(reason);
     replay_shutdown_request(reason);
+    /*
+     * Tell any plugin holding an open capture, HERE rather than at exit.
+     * A guest poweroff arrives on the writing vCPU's own thread with the
+     * BQL held, so the dispatch is queued on that vCPU and delivered at
+     * its next TB boundary (see qemu_plugin_vm_shutdown) — still before
+     * qemu_cleanup(), so the plugin sees the machine it has been
+     * recording; the second dispatch point in qemu_system_shutdown()
+     * waits for the delivery before teardown.
+     */
+    qemu_plugin_vm_shutdown();
     shutdown_requested = reason;
     qemu_notify_event();
 }
@@ -741,6 +766,15 @@ static void qemu_system_powerdown(void)
 
 static void qemu_system_shutdown(ShutdownCause cause)
 {
+    /*
+     * Second dispatch point, and the only one a HOST SIGNAL reaches:
+     * qemu_system_killed() runs in a signal handler and sets
+     * shutdown_requested directly, so SIGINT/SIGTERM never pass through
+     * qemu_system_shutdown_request().  Idempotent — whichever fires
+     * first wins.  Still before qemu_cleanup(), so the vCPUs are alive
+     * and run_on_cpu() can place the callback on one.
+     */
+    qemu_plugin_vm_shutdown();
     qapi_event_send_shutdown(shutdown_caused_by_guest(cause), cause);
     notifier_list_notify(&shutdown_notifiers, &cause);
 }
@@ -798,6 +832,14 @@ static bool main_loop_should_exit(int *status)
     request = qemu_reset_requested();
     if (request) {
         pause_all_vcpus();
+        /*
+         * A guest-initiated reset queued the plugin's reset callback on
+         * the requesting vCPU (it could not run under the device write's
+         * BQL — see qemu_plugin_vm_reset), and pause_all_vcpus() does not
+         * wait for work queues.  The callback must observe the machine
+         * BEFORE it is reset, so wait for its delivery here.
+         */
+        qemu_plugin_vm_reset_wait_placed();
         qemu_system_reset(request);
         resume_all_vcpus();
         /*

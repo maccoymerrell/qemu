@@ -107,8 +107,16 @@ static TCGv_i32 gen_cpu_index(void)
      * including scoreboard index, will be optimized out.
      * User-mode calls tb_flush when setting this flag. In system-mode, all
      * vcpus are created before generating code.
+     *
+     * The single-vcpu check is load-bearing: !CF_PARALLEL alone also
+     * holds under round-robin TCG (-accel tcg,thread=single, and
+     * therefore under -icount), where several vCPUs share one host
+     * thread AND share translations.  Baking the translating vCPU's
+     * index into a TB other vCPUs will execute routes every per-vCPU
+     * scoreboard access and callback argument to the wrong vCPU.
      */
-    if (!tcg_cflags_has(current_cpu, CF_PARALLEL)) {
+    if (!tcg_cflags_has(current_cpu, CF_PARALLEL) &&
+        CPU_NEXT(first_cpu) == NULL) {
         return tcg_constant_i32(current_cpu->cpu_index);
     }
     TCGv_i32 cpu_index = tcg_temp_ebb_new_i32();
@@ -134,9 +142,21 @@ static TCGv_ptr gen_plugin_u64_ptr(qemu_plugin_u64 entry)
     char *base_ptr = arr->data + entry.offset;
     size_t entry_size = g_array_get_element_size(arr);
 
+    /*
+     * gen_cpu_index() may return the CANONICAL CONSTANT temp for
+     * cpu_index (single-vcpu fast path).  Constant temps are shared by
+     * value across the whole TB, so they must never be written: scaling
+     * in place would silently retarget every later use of that integer
+     * constant in the TB — plugin scoreboard addresses compound
+     * ×entry_size per op and walk off the array (observed as SIGSEGV in
+     * code_gen_buffer), and the cpu_index argument delivered to
+     * callbacks becomes the scaled garbage.  Scale into a fresh temp.
+     */
     TCGv_i32 cpu_index = gen_cpu_index();
-    tcg_gen_muli_i32(cpu_index, cpu_index, entry_size);
-    tcg_gen_ext_i32_ptr(ptr, cpu_index);
+    TCGv_i32 scaled = tcg_temp_ebb_new_i32();
+    tcg_gen_muli_i32(scaled, cpu_index, entry_size);
+    tcg_gen_ext_i32_ptr(ptr, scaled);
+    tcg_temp_free_i32(scaled);
     tcg_temp_free_i32(cpu_index);
     tcg_gen_addi_ptr(ptr, ptr, (intptr_t) base_ptr);
 
@@ -443,8 +463,24 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
 
     pc = db->pc_next;
     insn->vaddr = pc;
+    /*
+     * Cleared per-insn — set by plugin_gen_record_branch_target() if
+     * the target translator resolves a static branch target while
+     * decoding this instruction.  Insn structs are reused across
+     * translations, so failing to reset would leak a stale target
+     * onto a later, unrelated insn.
+     */
+    insn->branch_target_pc = 0;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
+}
+
+void plugin_gen_record_branch_target(uint64_t target_pc)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn) {
+        insn->branch_target_pc = target_pc;
+    }
 }
 
 void plugin_gen_insn_end(void)

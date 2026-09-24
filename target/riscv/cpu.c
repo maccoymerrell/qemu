@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/qemu-plugin.h"
 #include "qemu/qemu-print.h"
 #include "qemu/ctype.h"
 #include "qemu/log.h"
@@ -3060,6 +3061,8 @@ static void riscv_cpu_common_class_init(ObjectClass *c, void *data)
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &riscv_sysemu_ops;
     cc->get_arch_id = riscv_get_arch_id;
+#endif
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 #endif
     cc->gdb_arch_name = riscv_gdb_arch_name;
 

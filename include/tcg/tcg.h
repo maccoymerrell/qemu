@@ -36,6 +36,30 @@
 #include "tcg/tcg-cond.h"
 #include "tcg/debug-assert.h"
 
+/*
+ * Native speculative (wrong-path) memory containment of the host backend.
+ *
+ * The plugin wrong-path simulator routes speculative loads/stores through the
+ * slow-path do_ld/do_st helpers so they land in the spec store sandbox rather
+ * than real guest RAM.  A backend sets TCG_TARGET_HAS_SPEC_FORCE_SLOW to 1 when
+ * its inline qemu_ld/qemu_st emitter honours CF_FORCE_SLOW: on a spec-mode TB
+ * it jumps unconditionally to the slow path instead of taking the inline TLB
+ * fast path (see tcg/i386/tcg-target.c.inc).  That native path works in both
+ * user and system mode.
+ *
+ * On a host whose backend does not implement it, wrong-path containment is
+ * still available in SYSTEM mode through a host-independent path: every TLB
+ * entry a speculative excursion uses carries TLB_FORCE_SLOW (set in
+ * tlb_set_page_full after a spec-entry TLB flush, see accel/tcg/cputlb.c and
+ * cpu-exec.c), which every backend's inline fast-path compare already treats as
+ * a miss.  Only user-mode tracing (no softmmu TLB to carry the flag) still
+ * requires this capability; qemu_plugin_spec_mode_begin refuses there via
+ * cpu_plugin_spec_mode_supported().
+ */
+#ifndef TCG_TARGET_HAS_SPEC_FORCE_SLOW
+#define TCG_TARGET_HAS_SPEC_FORCE_SLOW 0
+#endif
+
 /* XXX: make safe guess about sizes */
 #define MAX_OP_PER_INSTR 266
 
@@ -634,6 +658,12 @@ void tcg_pool_reset(TCGContext *s);
 TranslationBlock *tcg_tb_alloc(TCGContext *s);
 
 void tcg_region_reset_all(void);
+
+#ifdef CONFIG_PLUGIN
+/* Open the spec reserve so an in-flight wrong-path walk can finish; see
+ * tcg/region.c and the spec-overflow path in tb_gen_code. */
+void tcg_region_open_spec_reserve(TCGContext *s);
+#endif
 
 size_t tcg_code_size(void);
 size_t tcg_code_capacity(void);

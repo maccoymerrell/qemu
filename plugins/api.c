@@ -39,11 +39,19 @@
 #include "qemu/main-loop.h"
 #include "qemu/plugin.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "tcg/tcg.h"
+#include "accel/tcg/cpu-ops.h"
+#include "hw/core/cpu.h"
 #include "exec/gdbstub.h"
+#include "exec/plugin-spec.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "exec/translator.h"
+#include "exec/tb-flush.h"
+#include "exec/cpu-common.h"
+#include "system/cpu-timers.h"
 #include "disas/disas.h"
 #include "plugin.h"
 
@@ -57,6 +65,19 @@ void qemu_plugin_uninstall(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
 void qemu_plugin_reset(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
 {
     plugin_reset_uninstall(id, cb, true);
+}
+
+void qemu_plugin_request_tb_flush(void)
+{
+    /* Plugin callbacks run inside a translation (tb_trans) or an
+     * executing TB (tb_exec) — contexts where tb_flush's serial-mode
+     * synchronous dispatch would reset the code region under an
+     * in-flight tb_gen_code.  Always defer: do_tb_flush runs at the
+     * vCPU thread-loop safe point, after any plugin excursion unwinds,
+     * and fires registered flush callbacks from there.  Callers are
+     * expected to be on a vCPU thread (current_cpu set); no-op when
+     * tcg_enabled() is false. */
+    tb_flush_deferred(current_cpu);
 }
 
 /*
@@ -271,6 +292,11 @@ uint64_t qemu_plugin_insn_vaddr(const struct qemu_plugin_insn *insn)
     return insn->vaddr;
 }
 
+uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn)
+{
+    return insn->branch_target_pc;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;
@@ -367,7 +393,23 @@ qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info)
         value.data.u128.high = current_cpu->neg.plugin_mem_value_high;
         break;
     default:
-        g_assert_not_reached();
+        /*
+         * No in-tree target emits a MemOp whose size shift exceeds
+         * MO_128, and CPUState only ever latches the low 128 bits of an
+         * access into plugin_mem_value_low/high (tcg_gen_plugin_mem_cb()
+         * in tcg/tcg-op-ldst.c) — a wider access has already lost its
+         * upper bits before this function is reached, so there is
+         * nothing correct to return.  Degrade instead of aborting the
+         * whole emulator: report the access as unrepresentable and let
+         * the plugin decide what to do with it.
+         */
+        warn_report_once("qemu_plugin_mem_get_value: access wider than "
+                          "128 bits (size shift %u) is not representable; "
+                          "returning QEMU_PLUGIN_MEM_VALUE_INVALID",
+                          qemu_plugin_mem_size_shift(info));
+        value.type = QEMU_PLUGIN_MEM_VALUE_INVALID;
+        memset(&value.data, 0, sizeof(value.data));
+        break;
     }
     return value;
 }
@@ -375,6 +417,51 @@ qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info)
 int qemu_plugin_num_vcpus(void)
 {
     return plugin_num_vcpus();
+}
+
+/*
+ * The vCPU the caller is running on, which is the one every state API
+ * that takes no vCPU argument resolves through.  Those APIs assert on
+ * current_cpu; this reports the same fact and lets a plugin ask instead
+ * of finding out by aborting.
+ */
+int qemu_plugin_current_vcpu_index(void)
+{
+    return current_cpu ? current_cpu->cpu_index : QEMU_PLUGIN_VCPU_NONE;
+}
+
+/*
+ * One-shot per-vCPU work item (qemu_plugin_async_run_on_vcpu): a small
+ * heap closure carried through async_run_on_cpu, so the callback runs on
+ * the target vCPU's own thread with that vCPU's live context (registers,
+ * address space) resolvable through current_cpu.
+ */
+struct plugin_vcpu_async_closure {
+    qemu_plugin_vcpu_async_cb_t cb;
+    void *userdata;
+};
+
+static void plugin_vcpu_async_tramp(CPUState *cpu, run_on_cpu_data data)
+{
+    struct plugin_vcpu_async_closure *cl = data.host_ptr;
+
+    cl->cb(cpu->cpu_index, cl->userdata);
+    g_free(cl);
+}
+
+void qemu_plugin_async_run_on_vcpu(unsigned int vcpu_index,
+                                   qemu_plugin_vcpu_async_cb_t cb,
+                                   void *userdata)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+
+    if (!cpu || !cb) {
+        return;
+    }
+    struct plugin_vcpu_async_closure *cl = g_new(struct plugin_vcpu_async_closure, 1);
+    cl->cb = cb;
+    cl->userdata = userdata;
+    async_run_on_cpu(cpu, plugin_vcpu_async_tramp, RUN_ON_CPU_HOST_PTR(cl));
 }
 
 /*
@@ -452,6 +539,43 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
         return false;
     }
 
+    /*
+     * If in speculative mode, overlay any bytes from the speculative
+     * store buffer on top of the data just read from real memory.
+     * This provides store-to-load forwarding for plugin API reads.
+     */
+    if (current_cpu->plugin_spec_mode &&
+        current_cpu->plugin_spec_store_buf) {
+        /* Overlay speculative bytes; walk by cache line to amortise
+         * the hash lookup across (up to 64) bytes within each line. */
+        size_t off = 0;
+        while (off < len) {
+            vaddr cur = addr + off;
+            vaddr  line_addr = cur & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+            unsigned idx     = (unsigned)(cur & PLUGIN_SPEC_LINE_MASK);
+            unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
+            unsigned chunk   = (unsigned)(len - off) < remain
+                ? (unsigned)(len - off) : remain;
+            /* Hash value = pool index + 1 (see spec_line_get_or_alloc). */
+            gpointer val = g_hash_table_lookup(
+                current_cpu->plugin_spec_store_buf,
+                GUINT_TO_POINTER((guintptr)line_addr));
+            PluginSpecLine *line = val
+                ? &((PluginSpecLine *)current_cpu->plugin_spec_store_pool)
+                      [GPOINTER_TO_SIZE(val) - 1]
+                : NULL;
+            if (line) {
+                uint64_t mask = line->valid_mask >> idx;
+                for (unsigned k = 0; k < chunk; k++) {
+                    if (mask & ((uint64_t)1 << k)) {
+                        data->data[off + k] = line->bytes[idx + k];
+                    }
+                }
+            }
+            off += chunk;
+        }
+    }
+
     return true;
 }
 
@@ -460,6 +584,758 @@ int qemu_plugin_read_register(struct qemu_plugin_register *reg, GByteArray *buf)
     g_assert(current_cpu);
 
     return gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) - 1);
+}
+
+int qemu_plugin_write_register(struct qemu_plugin_register *reg,
+                               GByteArray *buf)
+{
+    g_assert(current_cpu);
+
+    return gdb_write_register(current_cpu, buf->data,
+                              GPOINTER_TO_INT(reg) - 1);
+}
+
+/*
+ * CPU state save/restore for speculative execution rollback.
+ * Snapshots execution state (up to end_reset_fields) via memcpy,
+ * capturing all internal state (lazy flags, FPU, etc.) that the
+ * GDB register interface would miss.  Static config (CPUID, features)
+ * and externally-managed pointers (timers, buffers) are excluded.
+ */
+struct qemu_plugin_cpu_state {
+    void *arch_state;       /* Raw copy of CPUArchState execution fields */
+    size_t arch_state_size; /* offsetof(CPUArchState, end_reset_fields) */
+    /*
+     * A few CPUState (not CPUArchState) execution fields that a wrong-path
+     * walk can dirty and that the arch_state copy above does NOT cover.
+     * Without restoring these, a speculative exception/halt leaks to the
+     * correct path: the main loop then delivers a spurious exception whose
+     * delivery faults against the restored arch state and double/triple-
+     * faults the guest (a real reset in system mode).
+     */
+    int exception_index;
+    uint32_t halted;
+    /*
+     * The per-execution self-loop report (the plugin_rep_* block), for the
+     * same reason and by the same rule as the two fields above: a wrong-path
+     * walk dirties it, and the correct path reads it.
+     *
+     * It is a PUBLICATION CHANNEL, not scratch.  A fan-out instruction
+     * publishes its architectural facts here as it executes, and the consumer
+     * reads them at the NEXT dispatch, because the fields describe the
+     * execution that finished before the callback -- so the value is in flight
+     * across exactly the boundary a speculative excursion is kicked from.  An
+     * excursion that executes any fan-out instruction overwrites the channel
+     * mid-flight, and what the correct path then reads is the wrong path's
+     * count.
+     *
+     * The consumer cannot defend itself.  plugin_rep_pc names the instruction
+     * the report describes, and that is the whole identity: it is an ADDRESS.
+     * A speculative walk that re-enters the very instruction it was launched
+     * from -- the ordinary case, since the excursion starts at the untaken
+     * side of the block that instruction ended -- republishes the same
+     * address with a different count, and no reader can tell the two apart.
+     * Provenance would have to travel with the value, which means it belongs
+     * here, at the excursion boundary, and not in any one consumer.
+     *
+     * Restoring the whole block also keeps a genuine mid-instruction state
+     * intact: a fan-out split by a fault leaves retired-iteration facts
+     * pending for the piece still to come, and an excursion taken in between
+     * must give that state back untouched rather than leave the resumed
+     * instruction reading the speculation's numbers.
+     *
+     * Target-independent on purpose.  x86 REP publishes from generated code
+     * in do_gen_rep(); AArch64 FEAT_MOPS publishes from its step helpers.
+     * Both write these fields, and neither is gated on speculation, so the
+     * repair belongs at the one boundary both cross.
+     */
+    uint64_t rep_iters;
+    uint64_t rep_pc;
+    uint64_t rep_bytes;
+    bool rep_complete;
+    bool rep_reenter;
+    bool rep_chunk;
+};
+
+struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
+{
+    g_assert(current_cpu);
+
+    struct qemu_plugin_cpu_state *state = g_new(struct qemu_plugin_cpu_state,
+                                                1);
+    state->arch_state_size = cpu_plugin_arch_state_size();
+    state->arch_state = g_memdup2((void *)(current_cpu + 1),
+                                  state->arch_state_size);
+    state->exception_index = current_cpu->exception_index;
+    state->halted = current_cpu->halted;
+    state->rep_iters = current_cpu->plugin_rep_iters;
+    state->rep_pc = current_cpu->plugin_rep_pc;
+    state->rep_bytes = current_cpu->plugin_rep_bytes;
+    state->rep_complete = current_cpu->plugin_rep_complete;
+    state->rep_reenter = current_cpu->plugin_rep_reenter;
+    state->rep_chunk = current_cpu->plugin_rep_chunk;
+
+    return state;
+}
+
+bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
+{
+    g_assert(current_cpu);
+
+    if (!state) {
+        return false;
+    }
+
+    cpu_plugin_arch_state_restore(state->arch_state, state->arch_state_size);
+    current_cpu->exception_index = state->exception_index;
+    current_cpu->halted = state->halted;
+    /*
+     * Hand the self-loop report back exactly as the correct path left it.
+     * A consumer inside the excursion has already read the speculative
+     * values it wanted (it reads them per speculative execution, before this
+     * runs); what must not survive is the wrong path's last publication
+     * sitting in the channel when the correct path next looks.
+     */
+    current_cpu->plugin_rep_iters = state->rep_iters;
+    current_cpu->plugin_rep_pc = state->rep_pc;
+    current_cpu->plugin_rep_bytes = state->rep_bytes;
+    current_cpu->plugin_rep_complete = state->rep_complete;
+    current_cpu->plugin_rep_reenter = state->rep_reenter;
+    current_cpu->plugin_rep_chunk = state->rep_chunk;
+    return true;
+}
+
+void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state)
+{
+    if (!state) {
+        return;
+    }
+    g_free(state->arch_state);
+    g_free(state);
+}
+
+void qemu_plugin_set_pc(uint64_t pc)
+{
+    g_assert(current_cpu);
+    g_assert(current_cpu->cc->set_pc);
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Diagnostic (#77): a wrong-path PC redirect must only happen inside a
+     * speculative excursion (plugin_spec_mode set).  If set_pc runs with the
+     * flag OFF, it is steering the REAL guest PC -- a spec-mode escape that
+     * corrupts real execution.
+     */
+    if (unlikely(!current_cpu->plugin_spec_mode) && getenv("CST_SPEC_ESCAPE_DIAG")) {
+        fprintf(stderr, "[setpc-real] set_pc(0x%" PRIx64 ") with "
+                "plugin_spec_mode=0\n", pc);
+    }
+#endif
+    current_cpu->cc->set_pc(current_cpu, (vaddr)pc);
+}
+
+uint64_t qemu_plugin_get_pc(void)
+{
+    g_assert(current_cpu);
+    g_assert(current_cpu->cc->get_pc);
+    return (uint64_t)current_cpu->cc->get_pc(current_cpu);
+}
+
+/* Fill (priv, asid, mmu_on) from the per-target hook; defaults
+ * (0, 0, true) when the target provides none (e.g. *-linux-user, where a
+ * process always has a valid address space, so "paging" is effectively
+ * on for the purpose of bounding speculative fetches). */
+static void plugin_cpu_state(int *priv, uint64_t *asid, bool *mmu_on)
+{
+    *priv = 0;
+    *asid = 0;
+    *mmu_on = true;
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_state) {
+        ops->get_plugin_state(current_cpu, priv, asid, mmu_on);
+    }
+}
+
+int qemu_plugin_get_priv_level(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return priv;
+}
+
+uint64_t qemu_plugin_get_addr_space_id(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return asid;
+}
+
+bool qemu_plugin_paging_enabled(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return mmu_on;
+}
+
+bool qemu_plugin_icount_enabled(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return icount_enabled();
+#endif
+}
+
+uint64_t qemu_plugin_get_thread_ptr(void)
+{
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_thread_ptr) {
+        return ops->get_plugin_thread_ptr(current_cpu);
+    }
+    return 0;
+}
+
+bool qemu_plugin_thread_ptr_tracks_current(void)
+{
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    return ops && ops->get_plugin_thread_ptr &&
+           ops->plugin_thread_ptr_tracks_current &&
+           ops->plugin_thread_ptr_tracks_current(current_cpu);
+}
+
+void qemu_plugin_set_current_task_offset(uint64_t offset)
+{
+    /* Stored process-globally (see plugins/core.c); consumed by targets
+     * whose kernels keep no per-task pointer in a register at kernel
+     * privilege — today x86-64's thread-pointer hooks.  Deliberately
+     * accepted on every target and in user mode: the declaration is
+     * inert where nothing consumes it, and the declaring plugin — which
+     * knows the target it runs on — is the right place to tell its user
+     * the hint has no consumer here. */
+    qemu_plugin_current_task_offset_store(offset);
+}
+
+bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
+{
+    /* Defensive: the classification needs the live vCPU's paging config, but
+     * a plugin may also consult it from a non-vCPU housekeeping context (e.g.
+     * an end-of-run diagnostic).  With no current vCPU there is no address
+     * space to classify against — report user-domain rather than abort. */
+    if (!current_cpu) {
+        return false;
+    }
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->vaddr_is_kernel) {
+        return ops->vaddr_is_kernel(current_cpu, vaddr);
+    }
+    /* No target classifier (user-mode, or an ISA without a kernel/user VA
+     * split visible to the tracer): everything is user-domain. */
+    return false;
+}
+
+bool qemu_plugin_exec_inline_insn(void)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_exec_inline(current_cpu);
+}
+
+bool qemu_plugin_exec_tb(void)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_exec_tb(current_cpu);
+}
+
+bool qemu_plugin_translate_at(uint64_t pc)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_translate_tb(current_cpu, (vaddr)pc);
+}
+
+/*
+ * Bump-allocate (or reuse) the PluginSpecLine for @line_addr.  The
+ * pool is a flat PluginSpecLine[] that grows on demand and is reset
+ * (used = 0) at spec_mode_end — entries from prior simulations are
+ * never freed, just overwritten on reuse.  Returns NULL when the
+ * sandbox line cap is reached and the line isn't already tracked.
+ *
+ * The hash table's value is the line's POOL INDEX plus one, never a
+ * pointer into the pool.  The pool grows by g_realloc_n, which moves
+ * the array: a stored pointer would dangle into the freed copy at the
+ * first growth inside an excursion, and every later hit on a
+ * pre-growth line would read — and worse, WRITE — freed heap.
+ * Measured exactly so under ASAN (riscv64, tb-size=4, wpdepth=65536:
+ * heap-use-after-free in spec_load_bytes against a 20 KiB region this
+ * function's realloc freed), and the writes are the mechanism behind
+ * the downstream free(): invalid pointer aborts the same configuration
+ * produced.  An index is stable across growth by construction; each
+ * lookup resolves it against the pool base of the moment.
+ */
+PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
+{
+    PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+    gpointer val = g_hash_table_lookup(
+        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+    if (val) {
+        return &pool[GPOINTER_TO_SIZE(val) - 1];
+    }
+    if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_LINE_MAX) {
+        return NULL;
+    }
+    if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_SOFT_BUDGET) {
+        /* Wild wrong-path store (a garbage-size memop buffered without faulting):
+         * flag the excursion for prompt termination by the WP loop
+         * (qemu_plugin_spec_store_overflowed).  Keep allocating up to the hard
+         * cap meanwhile so the in-flight store is not torn mid-region. */
+        cpu->plugin_spec_store_overflow = true;
+    }
+    if (cpu->plugin_spec_store_pool_used >= cpu->plugin_spec_store_pool_cap) {
+        size_t new_cap = cpu->plugin_spec_store_pool_cap
+            ? cpu->plugin_spec_store_pool_cap * 2 : 256;
+        cpu->plugin_spec_store_pool = g_realloc_n(
+            cpu->plugin_spec_store_pool, new_cap, sizeof(PluginSpecLine));
+        cpu->plugin_spec_store_pool_cap = new_cap;
+        pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+    }
+    size_t idx = cpu->plugin_spec_store_pool_used++;
+    PluginSpecLine *line = &pool[idx];
+    line->valid_mask = 0;
+    /* bytes[] left uninitialised; valid_mask gates reads, so unused
+     * bytes are never observed. */
+    g_hash_table_insert(cpu->plugin_spec_store_buf,
+                        GUINT_TO_POINTER((guintptr)line_addr),
+                        GSIZE_TO_POINTER(idx + 1));
+    return line;
+}
+
+void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
+{
+    g_assert(current_cpu);
+    g_assert(!current_cpu->plugin_spec_mode);
+
+    /*
+     * @saved_state was added inside version 5, which therefore names both a
+     * no-argument and a one-argument spelling of this function; version 6 is
+     * the first that distinguishes them.  A caller built before the change
+     * passes nothing and QEMU reads the first argument register, so
+     * plugin_spec_saved_state below would be an arbitrary pointer that
+     * qemu_plugin_spec_mode_end() later restores the vCPU from.  This entry
+     * point carries no plugin id, so ask the floor across loaded plugins.
+     */
+    if (plugin_declared_version_floor() < 6) {
+        error_report("plugin: qemu_plugin_spec_mode_begin() gained its "
+                     "saved_state argument at plugin API version 6, and a "
+                     "loaded plugin declares version %d.  QEMU would restore "
+                     "vCPU state from an argument that plugin never passed.  "
+                     "Rebuild the plugin against this qemu-plugin.h.",
+                     plugin_declared_version_floor());
+        _exit(1);
+    }
+
+    /*
+     * Fail-safe containment guard.  Wrong-path tracing routes speculative
+     * stores through the slow-path do_st helpers so they land in the spec
+     * store sandbox instead of real guest RAM.  Two mechanisms provide that
+     * routing (see cpu_plugin_spec_mode_supported): a host backend that
+     * honours CF_FORCE_SLOW bypasses the inline fast path directly (any mode),
+     * and in system mode the portable TLB_FORCE_SLOW path contains stores on
+     * any host backend.  Only user-mode tracing on a backend without
+     * CF_FORCE_SLOW is unsupported — there is no softmmu TLB to carry the flag,
+     * so an inline store would commit to the guest image.  Refuse loudly at
+     * the first spec-mode request there rather than corrupt guest memory, and
+     * rather than silently disabling wrong-path tracing (which would leave the
+     * caller believing the speculative excursion ran).  On x86 the capability
+     * is a compile-time constant, so this collapses to a no-op.
+     *
+     * Terminate with _exit(): this fires from deep inside the plugin's WP
+     * excursion setup (locks held, a half-built speculative session), so the
+     * plugin's registered atexit dump must not run against that inconsistent
+     * state.  _exit() skips atexit handlers and stdio flush; error_report has
+     * already written the diagnostic to the unbuffered stderr.
+     */
+    if (!cpu_plugin_spec_mode_supported()) {
+        error_report("champsim_tracer wrong-path tracing is not supported on "
+                     "this build: user-mode tracing on a host TCG backend that "
+                     "does not honor CF_FORCE_SLOW has no way to sandbox "
+                     "speculative stores, which would corrupt the guest image "
+                     "- refusing to enable.");
+        _exit(1);
+    }
+
+    /* Reuse existing hash table (cleared on previous spec_mode_end) */
+    if (!current_cpu->plugin_spec_store_buf) {
+        current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
+                                                               g_direct_equal);
+    }
+    current_cpu->plugin_spec_saved_state = saved_state;
+    current_cpu->plugin_spec_store_overflow = false;
+    current_cpu->plugin_spec_mode = true;
+
+    /*
+     * Slow-path memory routing.  On a backend that honours CF_FORCE_SLOW the
+     * spec-mode TB cflag (see cpu_plugin_exec_inline / cpu_plugin_exec_tb)
+     * makes the spec-mode translation a distinct TB-cache entry whose
+     * tb_gen_code emits slow-path mem helpers directly, independent of TLB
+     * state, and the flush below is a no-op.  On other host backends (system
+     * mode) the portable TLB_FORCE_SLOW path carries the routing instead: flush
+     * the softmmu TLB here so any correct-path entries resident at excursion
+     * start refill — with TLB_FORCE_SLOW — inside the excursion, rather than
+     * being hit on the inline fast path.  A no-op in user mode (no softmmu
+     * TLB).  The per-target impl lives in cpu-exec.c so this common file does
+     * not reference softmmu-only tlb_flush.
+     */
+    cpu_plugin_spec_tlb_flush_enter(current_cpu);
+}
+
+/*
+ * Checkpoint / restore the guest virtual clock around a whole wrong-path
+ * excursion.  A WP excursion executes (bounded by wpdepth) in real host
+ * wall-clock time, but it is *outside* guest time: it must not advance the
+ * guest's perception of time any more than it advances the guest's registers.
+ * QEMU_CLOCK_VIRTUAL with icount off tracks host time, and every target reads
+ * its architected counter from it — aarch64 CNTVCT_EL0, x86 TSC, riscv `time`,
+ * mips Count — so a single freeze checkpoints the timer count for all ISAs at
+ * once.
+ *
+ * Driven from the plugin's OUTER excursion boundary (wp_enter/wp_end), not
+ * from spec_mode_begin/end: a wrong-path fault-skip tears down and re-enters
+ * spec mode mid-excursion, and pausing per spec-mode-entry would re-enable
+ * ticks across that gap and leak time per skip.  The real per-CPU work
+ * (cpu_disable_ticks/enable_ticks) lives in cpu_plugin_spec_vtime_* in
+ * cpu-exec.c, which is compiled per-target so it is a no-op in user mode;
+ * this common file must not reference the softmmu-only timer symbols.
+ */
+void qemu_plugin_spec_vtime_pause(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_spec_vtime_pause(current_cpu);
+}
+
+void qemu_plugin_spec_vtime_resume(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_spec_vtime_resume(current_cpu);
+}
+
+/*
+ * Nestable guest-clock freeze for correct-path instrumentation windows
+ * (translation-time decode, per-TB emission).  Same transparency rule as the
+ * WP pause above: plugin work is outside guest execution, so its host cost
+ * must not advance guest time.  Per-target impl in cpu-exec.c; no-op in user
+ * mode.
+ */
+void qemu_plugin_vclock_pause(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_vclock_pause(current_cpu);
+}
+
+void qemu_plugin_vclock_resume(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_vclock_resume(current_cpu);
+}
+
+/*
+ * Read side of the same clock the pause above freezes.  A plugin that pauses
+ * for its own cost needs to be able to see what the guest was left believing:
+ * guest-ns per host-ns is the guest realtime factor, and guest instructions
+ * per guest-second is the rate the guest's periodic tick load is charged
+ * against.  Read-only, so no BQL and no runstate interaction.
+ */
+int64_t qemu_plugin_vclock_ns(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return 0;
+#else
+    if (icount_enabled()) {
+        /*
+         * Under icount the virtual clock IS the instruction counter, and
+         * reading it from a vCPU callback with cpu->running && !can_do_io
+         * aborts ("Bad icount read").  There is also nothing to learn: icount
+         * pins guest time to instructions by construction, so the factor this
+         * call exists to measure is a constant of the configuration.
+         */
+        return 0;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+#endif
+}
+
+bool qemu_plugin_in_async_int(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return current_cpu && current_cpu->plugin_in_async_int;
+#endif
+}
+
+bool qemu_plugin_in_spec_mode(void)
+{
+    return current_cpu && current_cpu->plugin_spec_mode;
+}
+
+/* The wire and plugin-facing event layouts are kept field-for-field
+ * identical; the drain below converts explicitly all the same, so a
+ * layout drift shows up as a compile break here rather than corruption.
+ * The KIND VALUES pass through raw as well: the two enums
+ * (QemuPluginCpuEventKind in hw/core/cpu.h, qemu_plugin_cpu_event_kind
+ * in qemu-plugin.h) must stay value-aligned member for member —
+ * FAULT_ENTER/RETURN = 0/1, ASYNC_ENTER/RETURN = 2/3, ASID_WRITE = 4. */
+QEMU_BUILD_BUG_ON(sizeof(struct qemu_plugin_cpu_event) !=
+                  sizeof(QemuPluginCpuEvent));
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_ASID_WRITE !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_ASID_WRITE);
+
+void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (!cpu) {
+        return;
+    }
+    if (cpu->plugin_evq.enabled != enabled) {
+        cpu_plugin_async_probe(cpu, enabled ? "QON" : "QOFF", 0, false);
+    }
+    /*
+     * This function used to zero @len on BOTH arms -- a silent discard of
+     * however many events were pending.  Nothing may be dropped here: a
+     * non-empty queue at this point is a consumer that stopped consuming
+     * while events were still owed, i.e. the unbounded-growth defect this
+     * plumbing exists to make impossible.  Report it as the bug it is.
+     *
+     * The obligation this places on the caller is exact and cheap to meet:
+     * disable (or re-enable) only where the queue is provably empty, which
+     * with a per-TB absorber registered means anywhere at all -- the
+     * preceding TB drained it, and no guest instruction has run since.
+     */
+    if (cpu->plugin_evq.len != 0) {
+        fprintf(stderr,
+                "qemu: FATAL qemu_plugin_cpu_events_set(%d) with %u undrained "
+                "events on cpu %u -- this call would silently discard them\n",
+                (int)enabled, cpu->plugin_evq.len, vcpu_index);
+        fflush(stderr);
+        abort();
+    }
+    cpu->plugin_evq.enabled = enabled;
+    cpu->plugin_evq.len = 0;
+    plugin_evq_note_drained(cpu);
+}
+
+void qemu_plugin_cpu_events_pending_slot(qemu_plugin_u64 slot)
+{
+    plugin_set_evq_pending_slot(slot, true);
+}
+
+void qemu_plugin_cpu_events_stats(unsigned int vcpu_index,
+                                  uint64_t *max_len, uint64_t *pushes,
+                                  uint64_t *drains)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (max_len) {
+        *max_len = cpu ? cpu->plugin_evq.max_len : 0;
+    }
+    if (pushes) {
+        *pushes = cpu ? cpu->plugin_evq.n_push : 0;
+    }
+    if (drains) {
+        *drains = cpu ? cpu->plugin_evq.n_drain : 0;
+    }
+}
+
+size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
+                                    const struct qemu_plugin_cpu_event **evs)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (!cpu || !cpu->plugin_evq.buf) {
+        *evs = NULL;
+        return 0;
+    }
+    QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
+    size_t n = q->len;
+    /* Single producer/consumer == this vCPU thread; handing out the
+     * internal buffer is race-free until the next push, which cannot
+     * happen before the consumer's tb_exec callback returns. */
+    *evs = (const struct qemu_plugin_cpu_event *)q->buf;
+    q->len = 0;
+    q->n_drain++;
+    /* The queue is empty: retract the drain-owed flag so the consumer's
+     * per-TB conditional callback stops dispatching until the next push. */
+    plugin_evq_note_drained(cpu);
+    return n;
+}
+
+void qemu_plugin_async_int_reset(void)
+{
+#ifndef CONFIG_USER_ONLY
+    if (current_cpu) {
+        cpu_plugin_async_probe(current_cpu, "RESET", 0, false);
+        current_cpu->plugin_in_async_int = false;
+    }
+#endif
+}
+
+uint32_t qemu_plugin_fault_depth(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return 0;
+#else
+    return current_cpu ? current_cpu->plugin_fault_depth : 0;
+#endif
+}
+
+/*
+ * Self-loop accounting for the fan-out instruction most recently executed on
+ * this vCPU.  Both fields are written by target-generated TCG from the
+ * instruction's architectural state; targets with no fan-out instruction
+ * never write them, so the pair reads {0, false} there.  Unlike the fault
+ * stack these are meaningful in *-linux-user too, which is where the
+ * single-iteration REP translation is reachable through EFLAGS.TF and the
+ * interrupt shadow.
+ */
+uint64_t qemu_plugin_rep_iterations(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_iters : 0;
+}
+
+bool qemu_plugin_rep_complete(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_complete : false;
+}
+
+uint64_t qemu_plugin_rep_pc(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_pc : 0;
+}
+
+bool qemu_plugin_rep_reenter(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_reenter : false;
+}
+
+uint64_t qemu_plugin_rep_bytes(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_bytes : 0;
+}
+
+bool qemu_plugin_rep_chunk_boundary(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_chunk : false;
+}
+
+bool qemu_plugin_spec_store_overflowed(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return current_cpu && current_cpu->plugin_spec_store_overflow;
+#endif
+}
+
+uint64_t qemu_plugin_spec_reserve_opens(void)
+{
+    return qatomic_read(&plugin_spec_reserve_opens);
+}
+
+uint64_t qemu_plugin_spec_reserve_exhausted(void)
+{
+    return qatomic_read(&plugin_spec_reserve_exhausted);
+}
+
+uint64_t qemu_plugin_decode_only_nobuf(void)
+{
+    return qatomic_read(&plugin_decode_only_nobuf);
+}
+
+bool qemu_plugin_spec_mem_faulted_take(void)
+{
+    if (!current_cpu || !current_cpu->plugin_spec_mem_faulted) {
+        return false;
+    }
+    current_cpu->plugin_spec_mem_faulted = false;
+    return true;
+}
+
+uint64_t qemu_plugin_spec_syscall_blocked_count(void)
+{
+    return qemu_plugin_spec_syscall_blocked;
+}
+
+void qemu_plugin_spec_clear_exception(void)
+{
+    g_assert(current_cpu);
+    /*
+     * Drop a pending guest exception latched by a wrong-path execution-time
+     * fault (x86 #DE/#UD/#GP/#AC, INTO/BOUND; MIPS arithmetic overflow, a
+     * teq-family trap) that longjmped out of a speculative exec_tb.  The raise
+     * path (raise_exception_ra / cpu_loop_exit_restore) already restored the
+     * guest PC to the faulting instruction and left exception_index set; the
+     * wrong-path walker skips that insn and re-dispatches, so the next
+     * speculative exec_tb must start clean with no exception pending.
+     *
+     * EXCP_NONE is -1 in common code (cpu_loop_exit_noexc); this mirrors the
+     * exception_index field access qemu_plugin_cpu_state_save/_restore already
+     * use.  Arch-specific latches (x86 error_code, etc.) live inside the
+     * CPUArchState snapshot restored wholesale at excursion end
+     * (qemu_plugin_cpu_state_restore) and are inert unless an exception is
+     * actually delivered, which the speculative walker never does.
+     */
+    current_cpu->exception_index = -1;
+}
+
+void qemu_plugin_spec_mode_end(void)
+{
+    g_assert(current_cpu);
+    /* May already be false in the longjmp cleanup path */
+    if (!current_cpu->plugin_spec_mode) {
+        return;
+    }
+
+    current_cpu->plugin_spec_mode = false;
+    current_cpu->plugin_spec_saved_state = NULL;
+
+    /* Flush sandbox: clear the line index and reset the pool's
+     * high-water mark.  The pool buffer itself stays allocated for
+     * reuse on the next spec-mode entry. */
+    if (current_cpu->plugin_spec_store_buf) {
+        g_hash_table_remove_all(current_cpu->plugin_spec_store_buf);
+    }
+    current_cpu->plugin_spec_store_pool_used = 0;
+
+    /*
+     * The fault flag belongs to the memop that raised it, and the excursion
+     * it belonged to is over.  It is set only under cpu_plugin_spec_active()
+     * and consumed by qemu_plugin_spec_mem_faulted_take(), whose contract is
+     * that the memory callback takes it immediately after the access — but
+     * two constructions break that pairing and leave it set: an instruction
+     * FETCH raises it with no memory callback behind it to take it, and a
+     * consumer that returns before its take (a per-instruction slot cap, a
+     * muted segment) never reaches one.  Left set, it is read by the FIRST
+     * memop of the NEXT excursion, which is tagged faulted and stripped of
+     * its physical page though nothing faulted for it.
+     *
+     * Cleared at END, not at BEGIN: a fault skip tears spec mode down and
+     * re-enters it mid-excursion, so clearing on entry would erase a flag
+     * that is still live.
+     */
+    current_cpu->plugin_spec_mem_faulted = false;
+
+    /*
+     * Flush the softmmu TLB on spec-mode exit (no-op in user mode).  Spec-mode
+     * accesses still run tlb_fill on a miss and install entries that a regime
+     * change on the wrong path can invalidate for the correct path; the
+     * register snapshot can't undo them (the TLB lives in CPUState).  The
+     * actual flush is in cpu_plugin_spec_tlb_flush (cpu-exec.c, per-target) so
+     * this common file does not reference softmmu-only tlb_flush.
+     */
+    cpu_plugin_spec_tlb_flush(current_cpu);
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

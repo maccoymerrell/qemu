@@ -48,6 +48,50 @@
 #endif
 #include "tcg/tcg-ldst.h"
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Load N bytes with store-to-load forwarding (system mode).
+ * Falls back to the supplied (pre-resolved, contiguous) host address
+ * for bytes not in the buffer.
+ *
+ * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
+ * cache line rather than one per byte.  When no speculative store
+ * overlaps the chunk (the common case) it is a single lookup plus a
+ * bulk memcpy from host_addr.
+ */
+static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
+                            void *host_addr, void *out, int size)
+{
+    uint8_t *hp = host_addr;
+    uint8_t *op = out;
+    while (size > 0) {
+        vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+        unsigned idx       = (unsigned)(guest_addr & PLUGIN_SPEC_LINE_MASK);
+        unsigned remain    = PLUGIN_SPEC_LINE_SIZE - idx;
+        unsigned chunk     = (unsigned)size < remain ? (unsigned)size : remain;
+
+        PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+        uint64_t chunk_mask = (chunk >= 64 ? ~(uint64_t)0
+                                           : (((uint64_t)1 << chunk) - 1)) << idx;
+
+        if (!line || !(line->valid_mask & chunk_mask)) {
+            memcpy(op, hp, chunk);
+        } else {
+            for (unsigned i = 0; i < chunk; i++) {
+                unsigned b = idx + i;
+                op[i] = (line->valid_mask & ((uint64_t)1 << b))
+                        ? line->bytes[b] : hp[i];
+            }
+        }
+        guest_addr += chunk;
+        hp         += chunk;
+        op         += chunk;
+        size       -= chunk;
+    }
+}
+
+#endif /* CONFIG_PLUGIN */
+
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
 /* #define DEBUG_TLB_LOG */
@@ -483,10 +527,18 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     int k;
 
     assert_cpu_is_self(cpu);
+    /*
+     * desc->n_used_entries counts occupied slots of the MAIN table only, so
+     * clearing a victim-tlb entry does not change it.  An entry only reaches
+     * the victim table by eviction from the main table, and tlb_set_page_full
+     * decrements as it evicts, so the entry is already uncounted by the time
+     * it can be found here -- decrementing again would count it out twice.
+     * The main-table-only reading is the one the counter's sole consumer uses:
+     * tlb_mmu_resize_locked takes it as a numerator over tlb_n_entries(fast),
+     * the size of the main table.
+     */
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(cpu, mmu_idx);
-        }
+        tlb_flush_entry_mask_locked(&d->vtable[k], page, mask);
     }
 }
 
@@ -1008,6 +1060,152 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
     full->slow_flags[access_type] = flags;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Record a TLB entry installed by a wrong-path (speculative) excursion so
+ * cpu_plugin_spec_tlb_flush() can invalidate just these pages on exit instead
+ * of flushing the whole TLB.  De-duplicated; a large page or overflow sets the
+ * overflow flag to force a full flush fallback.
+ */
+static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
+                                    bool large_page)
+{
+    if (cpu->plugin_spec_tlb_log_overflow) {
+        return;
+    }
+    /*
+     * A large-page install used to force the overflow fallback: a full
+     * tlb_flush() of every mmu_idx plus the jump cache, on excursion exit.
+     * On x86-64 the kernel direct map and kernel text are 2 MiB mappings, so
+     * essentially every wrong-path walk touches one -- measured, 96% of
+     * excursions ended in the full flush this selective path exists to avoid.
+     *
+     * The escalation was never needed for the entries the walk INSTALLED.
+     * QEMU's softmmu TLB holds one entry per TARGET_PAGE whatever the guest's
+     * page size, so a large-page install still creates exactly one entry, at
+     * addr_page, and that is the only thing the excursion has to take back.
+     * What the large page really affects is the per-mmu_idx large_page_addr /
+     * large_page_mask bookkeeping that tlb_flush_page_locked consults to decide
+     * whether a page flush must escalate; that pair is snapshotted at excursion
+     * entry and restored at exit (cpu_plugin_spec_tlb_note /
+     * cpu_plugin_spec_tlb_flush_logged), so a wrong-path install cannot widen
+     * the correct path's escalation region either.
+     */
+    (void)large_page;
+    for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
+        if (cpu->plugin_spec_tlb_log[i].page == page &&
+            cpu->plugin_spec_tlb_log[i].mmu_idx == mmu_idx) {
+            return;
+        }
+    }
+    if (cpu->plugin_spec_tlb_log_n >= CPU_SPEC_TLB_LOG_MAX) {
+        cpu->plugin_spec_tlb_log_overflow = true;
+        return;
+    }
+    cpu->plugin_spec_tlb_log[cpu->plugin_spec_tlb_log_n].page = page;
+    cpu->plugin_spec_tlb_log[cpu->plugin_spec_tlb_log_n].mmu_idx = mmu_idx;
+    cpu->plugin_spec_tlb_log_n++;
+}
+#endif
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Snapshot the per-mmu_idx large-page escalation region at excursion entry.
+ * tlb_add_large_page() only ever WIDENS it, so a wrong-path install would
+ * widen it permanently and escalate unrelated correct-path page flushes into
+ * full flushes long after the walk was discarded.
+ *
+ * The save lives in the vCPU's own CPUTLBDesc/CPUTLBCommon.  It used to live
+ * in file-scope arrays -- one set for the whole machine, holding a value that
+ * is per-vCPU and per-mmu_idx.  Two vCPUs inside an excursion at the same
+ * time would have interleaved as note(A), note(B), flush(A), flush(B): A's
+ * restore installs B's large-page region into A's descriptors, and since a
+ * region can be NARROWER, a later flush of a page inside A's true region
+ * stops escalating and stale entries survive it; B, whose saved flag A's
+ * restore already cleared, is never restored at all and keeps the widening
+ * the save exists to undo.
+ *
+ * THAT INTERLEAVING CANNOT HAPPEN TODAY, and this is not a bug report: the
+ * ChampSim Tracer runs its wrong-path walk synchronously inside
+ * emit_finalized_bb while holding exec_lock, which is machine-wide, so a peer
+ * vCPU's vcpu_tb_exec blocks there and no second excursion can open.  The
+ * defect was never observed and cannot be, on any target, while that
+ * serialisation holds.  It is corrected anyway because the storage class was
+ * simply wrong for the datum -- the arrays were found by an exhaustive diff
+ * of every writable global in the QEMU executable across an excursion, where
+ * they were the only entry not accounted for by the diff's own bracket -- and
+ * because the containment path must not depend on a plugin-side lock for its
+ * per-vCPU state to stay separate.
+ */
+void cpu_plugin_spec_tlb_note(CPUState *cpu)
+{
+    CPUTLB *tlb = &cpu->neg.tlb;
+
+    qemu_spin_lock(&tlb->c.lock);
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        tlb->d[i].plugin_spec_lp_addr = tlb->d[i].large_page_addr;
+        tlb->d[i].plugin_spec_lp_mask = tlb->d[i].large_page_mask;
+    }
+    tlb->c.plugin_spec_lp_saved = true;
+    qemu_spin_unlock(&tlb->c.lock);
+}
+
+/*
+ * Invalidate exactly the entries the excursion installed, and put the
+ * large-page bookkeeping back.  Deliberately does NOT route through
+ * tlb_flush_page_locked: that helper escalates to a full per-mmu_idx flush
+ * for any page inside the large-page region, which on x86 is most of the
+ * kernel.  Here the caller knows precisely which single entries exist to
+ * remove, so it removes them, with the same two primitives the helper's
+ * non-escalating branch uses.
+ *
+ * The JUMP-CACHE half of tlb_flush_page_by_mmuidx_async_0 -- its two
+ * tb_jmp_cache_clear_page() calls -- is deliberately absent, and the asymmetry
+ * is not an omission (#124).  That clear exists because an ordinary page flush
+ * is issued when the guest CHANGES a virtual-to-physical mapping (invlpg, a
+ * CR3 write, a shootdown), which can leave the jump cache holding a TB
+ * translated from the page's OLD physical contents; the jump cache is keyed on
+ * the virtual PC alone, so nothing else would catch it.  An excursion changes
+ * no mapping.  It installs entries for the mapping already in force and this
+ * function removes them again, so no jump-cache entry becomes stale by
+ * anything the excursion did.
+ *
+ * Nor can the excursion's OWN jump-cache entries be served to the correct
+ * path: tb_lookup() validates a jump-cache hit against pc, cs_base, flags AND
+ * cflags, and every wrong-path TB carries CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+ * CF_SINGLE_STEP (plus CF_FORCE_SLOW in spec mode), a combination the correct
+ * path never requests -- such an entry misses and is overwritten.  Adding the
+ * clear here would therefore buy nothing and would discard correct-path
+ * translations on every excursion.
+ */
+void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
+{
+    CPUTLB *tlb = &cpu->neg.tlb;
+
+    qemu_spin_lock(&tlb->c.lock);
+    for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
+        int midx = cpu->plugin_spec_tlb_log[i].mmu_idx;
+        vaddr page = cpu->plugin_spec_tlb_log[i].page;
+
+        if (midx < 0 || midx >= NB_MMU_MODES) {
+            continue;
+        }
+        if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+            tlb_n_used_entries_dec(cpu, midx);
+        }
+        tlb_flush_vtlb_page_locked(cpu, midx, page);
+    }
+    if (tlb->c.plugin_spec_lp_saved) {
+        for (int i = 0; i < NB_MMU_MODES; i++) {
+            tlb->d[i].large_page_addr = tlb->d[i].plugin_spec_lp_addr;
+            tlb->d[i].large_page_mask = tlb->d[i].plugin_spec_lp_mask;
+        }
+        tlb->c.plugin_spec_lp_saved = false;
+    }
+    qemu_spin_unlock(&tlb->c.lock);
+}
+#endif /* CONFIG_PLUGIN */
+
 /*
  * Add a new TLB entry. At most one entry for a given virtual address
  * is permitted. Only a single TARGET_PAGE_SIZE region is mapped, the
@@ -1040,6 +1238,17 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     }
     addr_page = addr & TARGET_PAGE_MASK;
     paddr_page = full->phys_addr & TARGET_PAGE_MASK;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path installs are logged for targeted invalidation on excursion
+     * exit (see CPUState::plugin_spec_tlb_log), avoiding a full flush.
+     */
+    if (unlikely(cpu_plugin_spec_active(cpu))) {
+        plugin_spec_tlb_log_add(cpu, mmu_idx, addr_page,
+                                full->lg_page_size > TARGET_PAGE_BITS);
+    }
+#endif
 
     prot = full->prot;
     asidx = cpu_asidx_from_attrs(cpu, full->attrs);
@@ -1121,14 +1330,47 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     /*
      * Only evict the old entry to the victim tlb if it's for a
      * different page; otherwise just overwrite the stale data.
+     *
+     * Wrong-path (#77): skip the victim-tlb WRITE.  Preserving the displaced
+     * entry so a future lookup can re-promote it is pure softmmu housekeeping
+     * -- it is not needed to translate the speculative access, and it mutates
+     * persistent victim-TLB state (vindex, vtable, vfulltlb) that the spec
+     * containment does not revert, corrupting the correct path.  Overwriting
+     * the main slot is harmless: the spec install log invalidates it on
+     * excursion exit and the correct path re-fills on its next access.
+     *
+     * The OCCUPANCY ACCOUNTING is not part of that housekeeping and is not
+     * skipped.  desc->n_used_entries counts occupied slots of the main table
+     * only -- a victim-TLB entry is not counted, which is precisely why the
+     * eviction decrements it -- so the decrement records "this slot's previous
+     * tenant is gone", which is equally true when the tenant is destroyed
+     * rather than preserved.  Skipping it made a speculative install account
+     * differently from the correct-path install of the same page into the same
+     * occupied slot: the spec path incremented with no matching decrement, and
+     * cpu_plugin_spec_tlb_flush_logged then decremented once at excursion exit
+     * when it cleared the slot, leaving the counter one ABOVE the occupancy it
+     * describes, cumulatively, until the next full flush of that mmu_idx reset
+     * it.  n_used_entries feeds only tlb_mmu_resize_locked, so the consequence
+     * is a table grown on a fictitious occupancy rate -- it reaches nothing the
+     * guest computes -- but the containment's rule is that it must not change
+     * what the correct path would have counted, and this changed it.
+     *
+     * Measured, x86_64 system marker cell, 16384 excursions: 10251 speculative
+     * installs displaced a live entry for a different page, and the per-
+     * excursion drift between n_used_entries and a recount of the occupied
+     * slots was non-zero on 4757 of them (sum of |drift| 19672).  With the
+     * decrement restored: 607 and 1331, both signs, from causes this hunk does
+     * not address and does not claim to.
      */
     if (!tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
-        unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
-        CPUTLBEntry *tv = &desc->vtable[vidx];
+        if (!cpu_plugin_spec_active(cpu)) {
+            unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
+            CPUTLBEntry *tv = &desc->vtable[vidx];
 
-        /* Evict the old entry into the victim tlb.  */
-        copy_tlb_helper_locked(tv, te);
-        desc->vfulltlb[vidx] = desc->fulltlb[index];
+            /* Evict the old entry into the victim tlb.  */
+            copy_tlb_helper_locked(tv, te);
+            desc->vfulltlb[vidx] = desc->fulltlb[index];
+        }
         tlb_n_used_entries_dec(cpu, mmu_idx);
     }
 
@@ -1157,6 +1399,25 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     tlb_set_compare(full, &tn, addr_page, read_flags,
                     MMU_INST_FETCH, prot & PAGE_EXEC);
+
+#if defined(CONFIG_PLUGIN) && !TCG_TARGET_HAS_SPEC_FORCE_SLOW
+    /*
+     * Portable wrong-path store containment (host backends that do not honor
+     * CF_FORCE_SLOW): tag this entry's data-load and data-store comparators
+     * TLB_FORCE_SLOW while a speculative excursion is active, so every
+     * speculative data access misses the inline fast path on any host and
+     * lands in the sandboxed do_ld/do_st helpers.  The slow path's tlb_hit
+     * ignores the flag (no refill loop) and mmu_lookup1 strips it from the
+     * effective flags, so it is purely a "route to the helper" marker.
+     * Instruction fetch is left untagged — CF_FORCE_SLOW governs data ops
+     * only.  Compiled out where the backend honors CF_FORCE_SLOW (x86), which
+     * bypasses the fast path directly and makes the flag redundant.
+     */
+    if (unlikely(cpu_plugin_spec_active(cpu))) {
+        read_flags |= TLB_FORCE_SLOW;
+        write_flags |= TLB_FORCE_SLOW;
+    }
+#endif
 
     if (wp_flags & BP_MEM_READ) {
         read_flags |= TLB_WATCHPOINT;
@@ -1237,6 +1498,23 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Plugin wrong-path (speculative) execution must neither raise a guest
+     * fault nor demand-page: a speculative access to an absent/ill-aligned
+     * page is a dead end, not a real architectural fault.  Force probe so
+     * the target walker reports the miss instead of raising, and remember
+     * the caller's real intent so a genuine (non-probe) wrong-path miss
+     * aborts the chain below.  This mirrors the user-mode path, where
+     * cpu_loop_exit_sigsegv() longjmps out instead of queuing a guest
+     * signal under plugin_spec_mode.
+     */
+    bool spec_real_access = cpu_plugin_spec_active(cpu) && !probe;
+    if (spec_real_access) {
+        probe = true;
+    }
+#endif
+
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
@@ -1244,6 +1522,10 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
             return true;
         }
     } else {
+#ifdef CONFIG_PLUGIN
+        /* Don't raise an alignment fault on the wrong path either. */
+        if (!spec_real_access)
+#endif
         /* Legacy behaviour is alignment before paging. */
         if (addr & ((1u << memop_alignment_bits(memop)) - 1)) {
             ops->do_unaligned_access(cpu, addr, type, mmu_idx, ra);
@@ -1252,6 +1534,23 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
             return true;
         }
     }
+
+#ifdef CONFIG_PLUGIN
+    if (spec_real_access) {
+        /*
+         * A real wrong-path access missed (absent page) with the raise
+         * suppressed.  Do NOT longjmp/truncate: on a mispredicted path no
+         * instruction retires, so a back-end memory fault is never taken by a
+         * real core.  Signal the miss to the immediate caller (mmu_lookup1 /
+         * atomic_mmu_lookup) via the per-CPU sentinel; it substitutes a
+         * deterministic placeholder value and the excursion continues.  No
+         * page is demand-allocated, as required of speculative execution.
+         */
+        cpu->plugin_spec_absent = true;
+        return false;
+    }
+#endif
+    /* Reached only for a genuine non-spec probe (nonfault) miss. */
     assert(probe);
     return false;
 }
@@ -1304,6 +1603,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     size_t vidx;
 
     assert_cpu_is_self(cpu);
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (#77): never promote a victim-tlb entry into the main TLB.
+     * The promotion swaps entries between the victim and main tables -- pure
+     * housekeeping that mutates persistent TLB state the spec containment can't
+     * revert.  Returning false makes the caller re-fill via tlb_fill instead,
+     * whose install is logged and reverted on excursion exit.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        return false;
+    }
+#endif
     for (vidx = 0; vidx < CPU_VTLB_SIZE; ++vidx) {
         CPUTLBEntry *vtlb = &cpu->neg.tlb.d[mmu_idx].vtable[vidx];
         uint64_t cmp = tlb_read_idx(vtlb, access_type);
@@ -1313,6 +1624,20 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntry tmptlb, *tlb = &cpu->neg.tlb.f[mmu_idx].table[index];
 
             qemu_spin_lock(&cpu->neg.tlb.c.lock);
+            /*
+             * Promoting into an EMPTY main slot raises the main table's
+             * occupancy by one, so n_used_entries has to be told; when the
+             * slot is occupied the swap trades one tenant for another and the
+             * occupancy is unchanged.  The slot is empty whenever a page's own
+             * main entry was flushed while its victim copy survived:
+             * tlb_flush_page_locked clears main and victim copies of the page
+             * it targets, but a victim copy of a DIFFERENT page that indexes
+             * to the same main slot outlives that flush and is promoted back
+             * into the hole it left.
+             */
+            if (tlb_entry_is_empty(tlb)) {
+                tlb_n_used_entries_inc(cpu, mmu_idx);
+            }
             copy_tlb_helper_locked(&tmptlb, tlb);
             copy_tlb_helper_locked(tlb, vtlb);
             copy_tlb_helper_locked(vtlb, &tmptlb);
@@ -1371,6 +1696,15 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
             if (!tlb_fill_align(cpu, addr, access_type, mmu_idx,
                                 0, fault_size, nonfault, retaddr)) {
                 /* Non-faulting page table read failed.  */
+#ifdef CONFIG_PLUGIN
+                /* A wrong-path (spec) real-access miss now returns false and
+                 * sets the absent sentinel instead of longjmping.  This probe
+                 * is not the mmu_lookup1 / atomic consumer, so clear it here so
+                 * it cannot leak into the next real access; the NULL host makes
+                 * helper callers fall back to per-unit ld/st, which garbage-fill
+                 * and continue via the do_ld TLB_SPEC_ABSENT path. */
+                cpu->plugin_spec_absent = false;
+#endif
                 *phost = NULL;
                 *pfull = NULL;
                 return TLB_INVALID_MASK;
@@ -1406,6 +1740,32 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     return flags;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Plugin wrong-path (speculative) execution: deny direct host pointers
+ * from the probe family so helper-mediated memory ops (SVE loads/stores,
+ * DC ZVA's block zero, MOPS, target PTW fast paths, ...) cannot touch
+ * real guest RAM — without a host pointer every caller falls back to its
+ * per-unit cpu_ld/st path, which routes through do_ld/do_st and the
+ * speculative store buffer / load redirection.  CF_FORCE_SLOW only
+ * covers the backend's INLINE qemu_ld/st path; these probes are how
+ * out-of-line helpers bypass it, identically on every guest ISA.
+ *
+ * Returning TLB_MMIO is the canonical "not directly accessible" signal.
+ * The gate also sits BEFORE notdirty_write: marking a clean page dirty
+ * is a real side effect, and on code pages it triggers TB invalidation —
+ * mutating JIT state mid-speculation.
+ */
+static inline bool probe_spec_deny(CPUState *cpu, void **phost)
+{
+    if (cpu_plugin_spec_redirect_probe(cpu)) {
+        *phost = NULL;
+        return true;
+    }
+    return false;
+}
+#endif
+
 int probe_access_full(CPUArchState *env, vaddr addr, int size,
                       MMUAccessType access_type, int mmu_idx,
                       bool nonfault, void **phost, CPUTLBEntryFull **pfull,
@@ -1414,6 +1774,12 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
     int flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                       mmu_idx, nonfault, phost, pfull, retaddr,
                                       true);
+
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
 
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
@@ -1439,6 +1805,12 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
     int flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                       mmu_idx, true, phost, pfull, 0, false);
 
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
+
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
@@ -1461,6 +1833,12 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
     flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                   mmu_idx, nonfault, phost, &full, retaddr,
                                   true);
+
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
 
     /* Handle clean RAM pages. */
     if (unlikely(flags & TLB_NOTDIRTY)) {
@@ -1490,6 +1868,15 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
         return NULL;
     }
 
+#ifdef CONFIG_PLUGIN
+    /* Before the side effects below: a speculative probe must neither
+     * mark pages dirty (TB invalidation on code pages) nor fire
+     * watchpoints. */
+    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
+        return NULL;
+    }
+#endif
+
     if (unlikely(flags & (TLB_NOTDIRTY | TLB_WATCHPOINT))) {
         /* Handle watchpoints.  */
         if (flags & TLB_WATCHPOINT) {
@@ -1515,11 +1902,44 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
     void *host;
     int flags;
 
+#ifdef CONFIG_PLUGIN
+    /* Speculative execution: no direct host pointers (DC ZVA et al.
+     * fall back to their per-unit cpu_ld/st paths, which the spec
+     * sandbox intercepts).  Mirrors the documented user-mode
+     * behaviour. */
+    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
+        return NULL;
+    }
+#endif
+
     flags = probe_access_internal(env_cpu(env), addr, 0, access_type,
                                   mmu_idx, true, &host, &full, 0, false);
 
     /* No combination of flags are expected by the caller. */
     return flags ? NULL : host;
+}
+
+/*
+ * Raw, side-effect-free TLB flags for a page: no fault, no
+ * notdirty_write transition, no watchpoint fire, and no plugin-forced
+ * TLB_MMIO — this asks what the MACHINE has at @addr, independent of
+ * any instrumentation.  Exists for the FEAT_MOPS reporting
+ * normalization (target/arm/tcg/helper-a64.c), whose byte-fallback
+ * classifier must distinguish "fallback because the page is genuine
+ * device memory" (whose per-byte accesses are reported as they happen)
+ * from "fallback because of a watchpoint / clean page / speculation"
+ * (emulation artifacts, normalized to the host-pointer decomposition).
+ * Returns TLB_INVALID_MASK when no translation can be established
+ * without faulting.
+ */
+int tlb_vaddr_lookup_flags(CPUArchState *env, vaddr addr,
+                           MMUAccessType access_type, int mmu_idx)
+{
+    CPUTLBEntryFull *full;
+    void *host;
+
+    return probe_access_internal(env_cpu(env), addr, 0, access_type,
+                                 mmu_idx, true, &host, &full, 0, false);
 }
 
 /*
@@ -1654,6 +2074,24 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
             maybe_resized = true;
             index = tlb_index(cpu, mmu_idx, addr);
             entry = tlb_entry(cpu, mmu_idx, addr);
+#ifdef CONFIG_PLUGIN
+            if (cpu->plugin_spec_absent) {
+                /*
+                 * Wrong-path speculative access to an absent page.  The fill
+                 * declined to raise or demand-page; the entry is stale, so do
+                 * NOT compute a host pointer from it.  Mark this page absent —
+                 * the load path substitutes a deterministic placeholder — and
+                 * return before the haddr compute below.  Both pages of a
+                 * cross-page access are resolved independently by mmu_lookup,
+                 * so each inherits its own TLB_SPEC_ABSENT.
+                 */
+                cpu->plugin_spec_absent = false;
+                data->full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+                data->flags = TLB_SPEC_ABSENT;
+                data->haddr = NULL;
+                return maybe_resized;
+            }
+#endif
         }
         tlb_addr = tlb_read_idx(entry, access_type) & ~TLB_INVALID_MASK;
     }
@@ -1706,6 +2144,22 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
     vaddr addr = data->addr;
     int flags = data->flags;
     int size = data->size;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): a watchpoint hit (cpu_check_watchpoint) sets
+     * watchpoint_hit / wp->flags, raises CPU_INTERRUPT_DEBUG and can invalidate
+     * the current TB; notdirty_write marks a clean page dirty and can
+     * invalidate a code TB -- persistent state outside the WP register
+     * snapshot.  The store/probe entrypoints already gate before mmu_lookup,
+     * but the slow LOAD path reaches here for a read/access watchpoint, so
+     * clear the flags without the side effect on the discarded path.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        data->flags &= ~(TLB_WATCHPOINT | TLB_NOTDIRTY);
+        return;
+    }
+#endif
 
     /* On watchpoint hit, this will longjmp out.  */
     if (flags & TLB_WATCHPOINT) {
@@ -1794,6 +2248,35 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     return crosspage;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path speculative atomic RMW to an absent/unreadable page: never touch
+ * real memory and never longjmp.  Seed the speculative sandbox line with
+ * deterministic placeholder bytes and return a pointer into it, exactly as
+ * spec_atomic_shadow does for a present page.  The RMW mutates the shadow and
+ * the excursion continues; the plugin tags the memop synthetic via
+ * plugin_spec_mem_faulted.  Consumes cpu->plugin_spec_absent (already cleared
+ * by the caller before this is reached).
+ */
+static void *spec_atomic_absent(CPUState *cpu, vaddr addr, int size,
+                                uintptr_t retaddr)
+{
+    cpu->plugin_spec_mem_faulted = true;
+    if (addr & (size - 1)) {
+        /* Guest atomics are naturally aligned; a garbage-unaligned wrong-path
+         * address is pathological — take the world-stop the non-spec path would
+         * (a graceful-stop via the WP walker), rather than mis-shadowing. */
+        cpu_loop_exit_atomic(cpu, retaddr);
+    }
+    uint8_t garbage[16];
+    plugin_spec_garbage_fill(garbage, size, addr);
+    /* A capped sandbox is handled inside spec_atomic_shadow (per-vCPU scratch
+     * line, seeded from the placeholder bytes passed here); there is no page
+     * to fall back to in any case. */
+    return spec_atomic_shadow(cpu, addr, garbage, size);
+}
+#endif
+
 /*
  * Probe for an atomic operation.  Do not allow unaligned operations,
  * or io operations to proceed.  Return the host address.
@@ -1825,6 +2308,12 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                             addr & TARGET_PAGE_MASK)) {
             tlb_fill_align(cpu, addr, MMU_DATA_STORE, mmu_idx,
                            mop, size, false, retaddr);
+#ifdef CONFIG_PLUGIN
+            if (cpu->plugin_spec_absent) {
+                cpu->plugin_spec_absent = false;
+                return spec_atomic_absent(cpu, addr, size, retaddr);
+            }
+#endif
             did_tlb_fill = true;
             index = tlb_index(cpu, mmu_idx, addr);
             tlbe = tlb_entry(cpu, mmu_idx, addr);
@@ -1841,6 +2330,15 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     if (unlikely(tlbe->addr_read == -1)) {
         tlb_fill_align(cpu, addr, MMU_DATA_LOAD, mmu_idx,
                        0, size, false, retaddr);
+#ifdef CONFIG_PLUGIN
+        if (cpu->plugin_spec_absent) {
+            /* Wrong-path atomic on a present-but-unreadable page: the read-side
+             * fill declined under spec.  Sandbox with placeholder bytes and
+             * continue rather than raising. */
+            cpu->plugin_spec_absent = false;
+            return spec_atomic_absent(cpu, addr, size, retaddr);
+        }
+#endif
         /*
          * Since we don't support reads and writes to different
          * addresses, and we do have the proper page loaded for
@@ -1877,6 +2375,23 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
     hostaddr = (void *)((uintptr_t)addr + tlbe->addend);
     full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) atomics must not mutate real guest memory.
+     * Redirect the RMW into the speculative sandbox and return before the
+     * real-memory side effects below (notdirty dirtying / TB invalidation,
+     * watchpoint delivery) — none of which apply to a discarded write.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        /*
+         * spec_atomic_shadow never hands @hostaddr back: a capped sandbox
+         * discards the RMW into the per-vCPU scratch line rather than let it
+         * run on real guest memory.  There is nothing to fall through to.
+         */
+        return spec_atomic_shadow(cpu, addr, hostaddr, size);
+    }
+#endif
 
     if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
         notdirty_write(cpu, addr, size, full, retaddr);
@@ -1979,6 +2494,19 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
 
     tcg_debug_assert(size > 0 && size <= 8);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) MMIO read must not touch the device: device
+     * reads can side-effect (read-to-clear, FIFO pops, ...).  Return the
+     * accumulator unchanged (the new bytes read as 0); any speculatively-
+     * written bytes are overlaid from the spec store buffer by the caller,
+     * exactly as for sandboxed RAM loads.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        return ret_be;
+    }
+#endif
+
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
@@ -1999,6 +2527,15 @@ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     uint64_t a, b;
 
     tcg_debug_assert(size > 8 && size <= 16);
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path 128-bit MMIO read: sandbox (no device touch), as in
+     * do_ld_mmio_beN.  Returns zero; a 16-byte device access on the wrong
+     * path is not expected in practice. */
+    if (cpu_plugin_spec_active(cpu)) {
+        return int128_zero();
+    }
+#endif
 
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
@@ -2153,6 +2690,24 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cpu_plugin_spec_active(cpu) &&
+                 (p->flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+        /* Wrong-path cross-page load whose page is absent OR a device
+         * MMIO region: deterministic placeholder bytes, concatenated
+         * big-endian exactly as do_ld_bytes_beN concatenates the real
+         * bytes.  A speculative MMIO read must never reach the device
+         * model — a device read can have side effects (clear-on-read
+         * status, FIFO pop) that a mis-speculated access must not cause. */
+        for (int i = 0; i < p->size; i++) {
+            uint8_t gb;
+            plugin_spec_garbage_fill(&gb, 1, p->addr + i);
+            ret_be = (ret_be << 8) | gb;
+        }
+        cpu->plugin_spec_mem_faulted = true;
+        return ret_be;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld_mmio_beN(cpu, p->full, ret_be, p->addr, p->size,
                               mmu_idx, type, ra);
@@ -2203,6 +2758,29 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
     uint64_t b;
     MemOp atom;
 
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cpu_plugin_spec_active(cpu) &&
+                 (p->flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+        /* Wrong-path cross-page 128-bit load whose page is absent OR a
+         * device MMIO region: fill the per-page slice with deterministic
+         * placeholder bytes (big-endian, matching the MO_ATOM_NONE
+         * accumulation) instead of dereferencing the invalid host pointer
+         * or issuing a side-effectful speculative device read.
+         * 8 < size <= 16 here. */
+        uint8_t g[16];
+        plugin_spec_garbage_fill(g, size, p->addr);
+        uint64_t hi = a;
+        for (int i = 0; i < size - 8; i++) {
+            hi = (hi << 8) | g[i];
+        }
+        uint64_t lo = 0;
+        for (int i = size - 8; i < size; i++) {
+            lo = (lo << 8) | g[i];
+        }
+        cpu->plugin_spec_mem_faulted = true;
+        return int128_make128(lo, hi);
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld16_mmio_beN(cpu, p->full, a, p->addr, size, mmu_idx, ra);
     }
@@ -2248,6 +2826,23 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
 static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                        MMUAccessType type, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        uint8_t val;
+        if (spec_load_byte(cpu, p->addr, &val)) {
+            return val;
+        }
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Wrong-path load from an absent page OR a device MMIO region:
+             * deterministic placeholder instead of dereferencing the
+             * invalid host pointer or issuing a side-effectful speculative
+             * device read. */
+            plugin_spec_garbage_fill(&val, 1, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+            return val;
+        }
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld_mmio_beN(cpu, p->full, 0, p->addr, 1, mmu_idx, type, ra);
     } else {
@@ -2260,6 +2855,29 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint16_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        /* Read from real memory, then overlay any speculative bytes */
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR a device MMIO region: deterministic
+             * placeholder baseline (no host dereference, and never a
+             * side-effectful speculative device read), still overlaid
+             * with genuine forwarded stores. */
+            plugin_spec_garbage_fill(&ret, 2, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else {
+            ret = load_atom_2(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap16(ret);
+            }
+        }
+        /* Overlay speculative bytes (host endian at this point) */
+        uint16_t src_val = ret;
+        uint16_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 2);
+        return out_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2280,6 +2898,25 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint32_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR device MMIO region: synthetic placeholder,
+             * never a side-effectful speculative device read. */
+            plugin_spec_garbage_fill(&ret, 4, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else {
+            ret = load_atom_4(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap32(ret);
+            }
+        }
+        uint32_t src_val = ret;
+        uint32_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 4);
+        return out_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2300,6 +2937,25 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint64_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR device MMIO region: synthetic placeholder,
+             * never a side-effectful speculative device read. */
+            plugin_spec_garbage_fill(&ret, 8, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else {
+            ret = load_atom_8(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap64(ret);
+            }
+        }
+        uint64_t src_val = ret;
+        uint64_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 8);
+        return out_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2407,6 +3063,19 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
     if (likely(!crosspage)) {
+#ifdef CONFIG_PLUGIN
+        if (unlikely(cpu_plugin_spec_active(cpu) &&
+                     (l.page[0].flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+            /* Wrong-path 128-bit load from an absent page OR a device MMIO
+             * region: deterministic placeholder instead of dereferencing
+             * the invalid host pointer or issuing a side-effectful
+             * speculative device read. */
+            uint8_t g[16];
+            plugin_spec_garbage_fill(g, 16, addr);
+            cpu->plugin_spec_mem_faulted = true;
+            return int128_make128(ldq_le_p(g), ldq_le_p(g + 8));
+        }
+#endif
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             ret = do_ld16_mmio_beN(cpu, l.page[0].full, 0, addr, 16,
                                    l.mmu_idx, ra);
@@ -2561,6 +3230,25 @@ static uint64_t do_st_leN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Plugin wrong-path (speculative) execution: this is the bulk /
+     * cross-page store path (do_st4/8/16 route here when an access
+     * spans a page, and store_helper's general leN path).  Unlike the
+     * fixed-width do_st_1..16 it had no spec gate, so a speculative
+     * cross-page store landed straight in guest RAM via the
+     * store_*_leN host-pointer writes below — escaping the per-vCPU
+     * store sandbox and corrupting real memory (e.g. guest page
+     * tables) that the WP rollback cannot undo.  Sandbox the low
+     * p->size bytes here and return the unconsumed remainder, exactly
+     * as the TLB_DISCARD_WRITE path does. */
+    if (cpu_plugin_spec_active(cpu)) {
+        uint64_t v = val_le;
+        spec_store_bytes(cpu, p->addr, &v, p->size);
+        return p->size >= 8 ? 0 : (val_le >> (p->size * 8));
+    }
+#endif
+
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_st_mmio_leN(cpu, p->full, val_le, p->addr,
                               p->size, mmu_idx, ra);
@@ -2615,6 +3303,20 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
     int size = p->size;
     MemOp atom;
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path containment: same missing-gate gap as do_st_leN, for
+     * the 8<size<=16 cross-page path (e.g. a page-straddling STP). */
+    if (cpu_plugin_spec_active(cpu)) {
+        uint64_t lo = int128_getlo(val_le), hi = int128_gethi(val_le);
+        unsigned nlo = size < 8 ? size : 8;
+        spec_store_bytes(cpu, p->addr, &lo, nlo);
+        if (size > 8) {
+            spec_store_bytes(cpu, p->addr + 8, &hi, size - 8);
+        }
+        return size > 8 ? (hi >> ((size - 8) * 8)) : (lo >> (size * 8));
+    }
+#endif
+
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_st16_mmio_leN(cpu, p->full, val_le, p->addr,
                                 size, mmu_idx, ra);
@@ -2660,6 +3362,12 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
 static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
                     int mmu_idx, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_store_byte(cpu, p->addr, val);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         do_st_mmio_leN(cpu, p->full, val, p->addr, 1, mmu_idx, ra);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
@@ -2672,6 +3380,17 @@ static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
 static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        /* Swap to host endian before storing byte-by-byte */
+        if (memop & MO_BSWAP) {
+            val = bswap16(val);
+        }
+        uint16_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 2);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap16(val);
@@ -2691,6 +3410,16 @@ static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
 static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (memop & MO_BSWAP) {
+            val = bswap32(val);
+        }
+        uint32_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 4);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap32(val);
@@ -2710,6 +3439,16 @@ static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
 static void do_st_8(CPUState *cpu, MMULookupPageData *p, uint64_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (memop & MO_BSWAP) {
+            val = bswap64(val);
+        }
+        uint64_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 8);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap64(val);
@@ -2732,6 +3471,13 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
     MMULookupLocals l;
     bool crosspage;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_store_byte(cpu, addr, val);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     tcg_debug_assert(!crosspage);
@@ -2745,6 +3491,18 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     MMULookupLocals l;
     bool crosspage;
     uint8_t a, b;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap16(val);
+        }
+        uint16_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 2);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
@@ -2768,6 +3526,18 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     MMULookupLocals l;
     bool crosspage;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap32(val);
+        }
+        uint32_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 4);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
@@ -2788,6 +3558,18 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
 {
     MMULookupLocals l;
     bool crosspage;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap64(val);
+        }
+        uint64_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 8);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
@@ -2811,6 +3593,18 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
     bool crosspage;
     uint64_t a, b;
     int first;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap128(val);
+        }
+        Int128 host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 16);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);

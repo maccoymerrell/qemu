@@ -109,6 +109,12 @@ typedef struct CPUArchState {
     target_ulong vstore_pending[VSTORES_MAX];
     bool vtcm_pending;
     VTCMStoreLog vtcm_log;
+
+    /* End-of-execution-state marker used by the plugin spec-mode
+     * save/restore path (offsetof(CPUArchState, end_reset_fields));
+     * placed at struct end here, so the whole CPUArchState is
+     * captured under spec mode for this target. */
+    struct {} end_reset_fields;
 } CPUHexagonState;
 
 typedef struct HexagonCPUClass {

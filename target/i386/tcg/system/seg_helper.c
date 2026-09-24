@@ -31,6 +31,31 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
 {
     int selector;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path SYSCALL: fetched and executed, never performed.
+     *
+     * Unlike every other kernel-entry instruction on every other target — and
+     * unlike this one in *-linux-user — the system-mode SYSCALL does not raise
+     * an exception: it performs the privilege escalation inline, right here,
+     * loading CS/SS and redirecting EIP to LSTAR.  A plugin exploring a
+     * mispredicted path would therefore run the guest's real syscall entry
+     * path, which is kernel work the discarded path never asked for.
+     *
+     * Unwind instead, exactly as raise_interrupt2() does for a speculative
+     * exception.  cpu_loop_exit_restore() rewinds EIP to this instruction and
+     * lands in cpu_plugin_exec_tb()'s spec guard, which reports the failed
+     * block to the plugin; the wrong-path walker then resumes at the
+     * architectural fall-through, treating the unfollowable kernel edge as any
+     * other branch's not-taken side.  RCX/R11 keep their pre-SYSCALL values —
+     * the deterministic-placeholder rule the walker already applies to a
+     * skipped instruction's destinations.
+     */
+    if (unlikely(env_cpu(env)->plugin_spec_mode)) {
+        cpu_loop_exit_restore(env_cpu(env), GETPC());
+    }
+#endif
+
     if (!(env->efer & MSR_EFER_SCE)) {
         raise_exception_err_ra(env, EXCP06_ILLOP, 0, GETPC());
     }

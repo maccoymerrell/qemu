@@ -269,6 +269,29 @@ void helper_set_dr(CPUX86State *env, int reg, target_ulong t0)
         raise_exception_ra(env, EXCP01_DB, GETPC());
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): a MOV-to-DRn would install host debug objects
+     * (cpu_breakpoint_insert/cpu_watchpoint_insert on cs->breakpoints/
+     * watchpoints) and tlb_flush via cpu_x86_update_dr7 — neither is part of
+     * the env snapshot, so they persist past the discarded walk.  Apply only
+     * the env-shadow dr[reg] (rolled back) and skip all host-object work.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        if (reg >= 4 && (t0 & DR_RESERVED_MASK)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+        }
+        if (reg == 6) {
+            env->dr[6] = t0 | DR6_FIXED_1;
+        } else if (reg == 7) {
+            env->dr[7] = (t0 | DR7_FIXED_1);
+        } else {
+            env->dr[reg] = t0;
+        }
+        return;
+    }
+#endif
+
     if (reg < 4) {
         if (hw_breakpoint_enabled(env->dr[7], reg)
             && hw_breakpoint_type(env->dr[7], reg) != DR7_TYPE_IO_RW) {

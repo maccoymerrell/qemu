@@ -131,6 +131,12 @@ typedef struct CPUArchState {
     bool fullacc; /* CPU/MEM if true MEM only otherwise */
 
     uint64_t features;
+
+    /* End-of-execution-state marker used by the plugin spec-mode
+     * save/restore path (offsetof(CPUArchState, end_reset_fields));
+     * placed at struct end here, so the whole CPUArchState is
+     * captured under spec mode for this target. */
+    struct {} end_reset_fields;
 } CPUAVRState;
 
 /**

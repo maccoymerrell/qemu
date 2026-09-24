@@ -20,6 +20,7 @@
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/plugin.h"
 #include "exec/tswap.h"
 #include "qom/object_interfaces.h"
 #include "hw/core/cpu.h"
@@ -2507,6 +2508,26 @@ void virtio_queue_notify(VirtIODevice *vdev, int n)
 
     if (unlikely(!vq->vring.desc || vdev->broken)) {
         return;
+    }
+
+    /*
+     * Plugin devio doorbell notification.  This is the guest's virtqueue
+     * kick reaching the device model in vCPU context (the transport's
+     * MMIO/PIO write handler), the one place the issuing vCPU — and thus
+     * the plugin's owning process/thread — is known before the block
+     * backend runs.  With the virtio ioeventfd fast path the doorbell
+     * write is serviced by the memory-region eventfd match and does not
+     * reach here, so exact devio attribution wants ioeventfd=off (see
+     * the tracer's quickstart); otherwise it falls back to positional.
+     * Restricted to block devices: their attached-device pointer is the
+     * same DeviceState the block backend later reports as the request's
+     * issuing device, so the two correlate by that token.  The token is
+     * the raw VirtIODevice pointer: a VirtIODevice embeds its DeviceState
+     * as the first member, so this is the same address blk_attach_dev()
+     * recorded as blk->dev for this device.
+     */
+    if (vdev->device_id == VIRTIO_ID_BLOCK) {
+        qemu_plugin_devio_doorbell((uint64_t)(uintptr_t)vdev);
     }
 
     trace_virtio_queue_notify(vdev, vq - vdev->vq, vq);

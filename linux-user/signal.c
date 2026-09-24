@@ -759,6 +759,22 @@ void cpu_loop_exit_sigsegv(CPUState *cpu, target_ulong addr,
         tcg_ops->record_sigsegv(cpu, addr, access_type, maperr, ra);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * During plugin speculative (wrong-path) execution, faults discovered
+     * inside translator_ld()/probe_access_internal() must NOT queue a
+     * synchronous signal: the plugin's cpu_plugin_exec_tb() setjmp guard
+     * unwinds the stack so the wrong-path simulator can mark the BB as
+     * faulted, but the queued signal would still be delivered later on
+     * the correct path and kill the guest.  Just longjmp out and let the
+     * plugin observe the failure via its tb_ok=false return.
+     */
+    if (cpu->plugin_spec_mode) {
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit_restore(cpu, ra);
+    }
+#endif
+
     force_sig_fault(TARGET_SIGSEGV,
                     maperr ? TARGET_SEGV_MAPERR : TARGET_SEGV_ACCERR,
                     addr);
@@ -774,6 +790,14 @@ void cpu_loop_exit_sigbus(CPUState *cpu, target_ulong addr,
     if (tcg_ops->record_sigbus) {
         tcg_ops->record_sigbus(cpu, addr, access_type, ra);
     }
+
+#ifdef CONFIG_PLUGIN
+    /* See note in cpu_loop_exit_sigsegv() above. */
+    if (cpu->plugin_spec_mode) {
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit_restore(cpu, ra);
+    }
+#endif
 
     force_sig_fault(TARGET_SIGBUS, TARGET_BUS_ADRALN, addr);
     cpu->exception_index = EXCP_INTERRUPT;
@@ -990,6 +1014,14 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
         die_from_signal(info);
     }
 
+#ifdef CONFIG_PLUGIN
+    /* During wrong-path execution, longjmp back instead of delivering fault */
+    if (cpu->plugin_spec_mode) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        cpu_loop_exit(cpu);
+    }
+#endif
+
     maperr = true;
     if (is_valid && info->si_code == SEGV_ACCERR) {
         /*
@@ -1017,8 +1049,16 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     /*
      * If the access was not on behalf of the guest, within the executable
      * mapping of the generated code buffer, then it is a host bug.
+     *
+     * An MMU_INST_FETCH access is exempt exactly as it is on the SIGSEGV
+     * path: adjust_signal_pc() reports that type for helper_retaddr == 1,
+     * the code-read case, and clears the pc to say the unwinder must not
+     * run because the guest pc is already correct.  A cleared pc is never
+     * in the code gen buffer, so testing it here would call every guest
+     * code read that faults a host bug.
      */
-    if (!in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
+    if (access_type != MMU_INST_FETCH
+        && !in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
         die_from_signal(info);
     }
 
@@ -1029,6 +1069,23 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
         sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
         cpu_loop_exit_sigbus(cpu, guest_addr, access_type, pc);
     }
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Every other si_code returns to the caller, which queues a guest
+     * signal.  A wrong-path excursion may not do that: the queued signal
+     * outlives the excursion and is delivered on the correct path.  Leave
+     * the same way cpu_loop_exit_sigbus() leaves for BUS_ADRALN above, so
+     * the wrong-path simulator sees the excursion end rather than a fault
+     * the guest never took.
+     */
+    if (cpu->plugin_spec_mode) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit_restore(cpu, pc);
+    }
+#endif
+
     return pc;
 }
 

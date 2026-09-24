@@ -159,6 +159,98 @@ struct CPUMIPSTLBContext {
 void sync_c0_status(CPUMIPSState *env, CPUMIPSState *cpu, int tc);
 void cpu_mips_store_status(CPUMIPSState *env, target_ulong val);
 void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val);
+uint64_t mips_cause_cas_retries(void);
+
+/*
+ * Update a field of CP0_Cause without disturbing bits owned by another
+ * thread.  IP7..IP2 and TI are driven by the iothread (device lines, the CP0
+ * timer); every read-modify-write of the whole word from a vCPU is a chance
+ * to erase a pending interrupt that arrived in the window.  Exception entry
+ * writes BD/CE/EC on every single exception, so this is the hottest such
+ * window in the model.
+ */
+static inline void mips_cause_set_field(CPUMIPSState *env, uint32_t mask,
+                                        uint32_t val)
+{
+    uint32_t old, new;
+
+    do {
+        old = qatomic_read(&env->CP0_Cause);
+        new = (old & ~mask) | (val & mask);
+        if (new == old) {
+            return;
+        }
+    } while (qatomic_cmpxchg(&env->CP0_Cause, old, new) != old);
+}
+
+/*
+ * MVPControl condition instrument.  MIPS MT defines MVPControl as one
+ * register per processor, shared by every VPE of that processor, and the
+ * guest's dvpe()/evpe(prev) nesting protocol restores EVP only when the
+ * dvpe that opened the section observed EVP already set.  A VPE left with
+ * EVP clear fails mips_vpe_active() and mips_cpu_has_work() then forces
+ * has_work false, so it never leaves WAIT again.
+ *
+ * The instrument records every read and every write of the shared word,
+ * tracks how many VPEs currently owe an evpe restore, and names the
+ * strand structurally: EVP clear with no outstanding restorer is a
+ * processor that no future evpe can re-enable.  It is off unless
+ * MIPS_MVP_DEBUG is set in the environment.  See target/mips/system/cp0.c.
+ */
+enum {
+    MIPS_MVP_DVPE_RD,   /* dvpe on a VPE that owns MVP: opens a section  */
+    MIPS_MVP_DVPE_WR,
+    MIPS_MVP_EVPE_RD,   /* evpe on a VPE that owns MVP: closes it        */
+    MIPS_MVP_EVPE_WR,
+    MIPS_MVP_DVPE_NA,   /* dvpe/evpe on a VPE without MVP: architecturally */
+    MIPS_MVP_EVPE_NA,   /* a no-op, recorded because the guest still ran it */
+    MIPS_MVP_MTC0_WR,
+    MIPS_MVP_MTC0_NA,
+    /*
+     * Run-state edges.  cs->halted decides whether a vCPU is offered to the
+     * scheduler at all, so a stall in which every VPE is halted is only
+     * explained by naming, for each VPE, which instruction on which VPE
+     * halted it.  Each of these records the setter, the target and the
+     * setter's guest PC; a per-VPE latch keeps the newest of each kind so
+     * the answer survives the ring wrapping.
+     */
+    MIPS_MVP_SLEEP_DVPE,  /* dvpe put a sibling to sleep                  */
+    MIPS_MVP_SLEEP_DVP,   /* dvp (R6) put a sibling to sleep              */
+    MIPS_MVP_SLEEP_TC,    /* mtc0/mttc0 TCHalt deactivated a TC           */
+    MIPS_MVP_SLEEP_WAIT,  /* the VPE executed WAIT                        */
+    MIPS_MVP_WAKE_EVPE,
+    MIPS_MVP_WAKE_EVP,
+    MIPS_MVP_WAKE_TC,
+};
+/*
+ * CP0 Count/Compare condition instrument, latched per VPE beside the
+ * run-state edges above and printed by the same report.
+ *
+ * A guest that stops making progress with every VPE idle in WAIT and no
+ * interrupt pending looks identical to a guest that is merely idle -- the
+ * architectural state is the same word for word, measured.  What tells them
+ * apart is not in the guest at all: it is where the HOST QEMUTimer that will
+ * deliver the next tick has been armed, relative to where the guest's own
+ * Compare asked for it.  cpu_mips_timer_update has one clamp arm that arms it
+ * somewhere else, so the last arming of each kind is latched here and the
+ * arms are counted, per VPE.
+ */
+enum {
+    MIPS_CP0T_ARM,          /* deadline programmed from Compare - Count     */
+    MIPS_CP0T_ARM_BEHIND,   /* target not in the future -> 2^24 (rescue)    */
+    MIPS_CP0T_FIRE,         /* expiry delivered: Cause.TI set, IP7 raised   */
+};
+extern int mips_mvp_debug;
+void mips_mvp_debug_init(void);
+void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after);
+void mips_mvp_note_gate(CPUMIPSState *env);
+void mips_mvp_note_run(CPUState *target, int op);
+void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
+                         int64_t now_ns, int64_t deadline_ns);
+/* Architected Count as of an ALREADY-SAMPLED virtual time.  The instrument
+ * must report the same instant the arming used, not a second, later read. */
+uint32_t cpu_mips_get_count_val_raw(CPUMIPSState *env, int64_t now_ns);
+void cpu_mips_restore_count_base(CPUMIPSState *env);
 
 extern const VMStateDescription vmstate_mips_cpu;
 
@@ -217,11 +309,34 @@ void cpu_mips_stop_count(CPUMIPSState *env);
 
 static inline void mips_env_set_pc(CPUMIPSState *env, target_ulong value)
 {
-    env->active_tc.PC = value & ~(target_ulong)1;
-    if (value & 1) {
-        env->hflags |= MIPS_HFLAG_M16;
+    /*
+     * Bit 0 of a code address is the ISA-mode bit only on a CPU that
+     * implements MIPS16e or microMIPS.  The translator already applies
+     * exactly this test before it will let a register-indirect branch move
+     * the bit into MIPS_HFLAG_M16 (gen_branch(), MIPS_HFLAG_BR); a CPU
+     * model with neither ASE -- P5600, 20Kc, R4000, I6400, ... -- has no
+     * ISA mode to select, and there bit 0 is an ordinary address bit whose
+     * being set makes the fetch unaligned, which decode_opc() already
+     * reports as an address error (EXCP_AdEL).
+     *
+     * Setting MIPS_HFLAG_M16 on such a model instead puts the CPU into a
+     * mode it has no decoder for: mips_tr_translate_insn() falls through to
+     * its final else and returns WITHOUT advancing ctx->base.pc_next, so
+     * translator_loop() computes tb->size == 0 and setjmp_gen_code()'s
+     * assert(tb->size != 0) aborts the process.  Any caller of
+     * CPUClass::set_pc reaches it: gdb "continue at <odd addr>"
+     * (gdbstub.c), -device loader,addr=<odd>,cpu-num=N, or a TCG plugin
+     * using qemu_plugin_set_pc().
+     */
+    if (env->insn_flags & (ASE_MIPS16 | ASE_MICROMIPS)) {
+        env->active_tc.PC = value & ~(target_ulong)1;
+        if (value & 1) {
+            env->hflags |= MIPS_HFLAG_M16;
+        } else {
+            env->hflags &= ~(MIPS_HFLAG_M16);
+        }
     } else {
-        env->hflags &= ~(MIPS_HFLAG_M16);
+        env->active_tc.PC = value;
     }
 }
 
@@ -244,12 +359,29 @@ static inline void restore_pamask(CPUMIPSState *env)
     }
 }
 
+/*
+ * Is the processor enabled as far as THIS VPE is concerned?
+ *
+ * MVPControl.EVP is one bit shared by every VPE, but it does not say the
+ * same thing to all of them.  DVPE "places the processor in single-VPE mode,
+ * in which only the VPE issuing the instruction is allowed to execute", so
+ * EVP clear disables every VPE except the one that cleared it -- and that VPE
+ * is named by evp_owner.
+ *
+ * Reading the bare bit instead makes the exception disappear, and the
+ * disappearance is terminal rather than merely inaccurate.  The owner is the
+ * only VPE that will execute the matching EVPE, so a VPE that is halted while
+ * it owns the section can never be scheduled to issue the one instruction
+ * that would schedule it: mips_cpu_has_work() discards even a pending enabled
+ * interrupt on this arm.
+ */
 static inline int mips_vpe_active(CPUMIPSState *env)
 {
     int active = 1;
 
-    /* Check that the VPE is enabled.  */
-    if (!(env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP))) {
+    /* Check that the processor is enabled, or that this VPE disabled it.  */
+    if (!(env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP)) &&
+        qatomic_read(&env->mvp->evp_owner) != env_cpu(env)->cpu_index) {
         active = 0;
     }
     /* Check that the VPE is activated.  */

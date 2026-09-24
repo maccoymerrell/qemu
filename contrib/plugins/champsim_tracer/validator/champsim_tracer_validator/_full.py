@@ -1464,8 +1464,21 @@ def _final_entry_memop_probe(cst: Path):
         return "unusable", (f"final template {tid} has no static memop "
                             f"slot ({tmpl.get('n_insns')} insns)")
 
+    # The final entry of a budget close is CUT at the remaining budget
+    # (format.rst §4.2a: it declares the partial range [bb_start, bb_stop)
+    # that makes the window's billing exact), so the instructions past the
+    # cut did not run inside the window and carry no memops BY CONTRACT.
+    # The invariant is therefore per published instruction: every
+    # instruction inside the final entry's range carries exactly the memops
+    # its peers carry at that instruction.  Scoring whole-template counts
+    # read a cut that happened to land before a memop instruction (riscv64
+    # [0,1) of 6, mipsel [0,3) of 9) as a loss, and passed x86_64/aarch64
+    # only because their cut landed after every memop (ledger row 496).
+    lo, hi, _n = V._entry_range(final, tmpl)
+
     def shape(e):
-        dps = e.get("dyn_params") or []
+        dps = [dp for dp in (e.get("dyn_params") or [])
+               if lo <= int(getattr(dp, "insn_index", -1)) < hi]
         tally = {}
         for dp in dps:
             k = (int(getattr(dp, "insn_index", -1)),
@@ -1489,16 +1502,18 @@ def _final_entry_memop_probe(cst: Path):
                             f"{n_peers} executions")
     want = shapes.pop()
     if want[0] == 0:
-        return "unusable", (f"final template {tid} performs no memops "
+        return "unusable", (f"final template {tid} performs no memops in "
+                            f"the final entry's range [{lo},{hi}) "
                             f"despite {slots} static slot(s)")
     got = shape(final)
     if got == want:
         return "pass", (f"final entry (seq {final.get('seq_num')}, template "
-                        f"{tid}) carries {got[0]} memops == "
-                        f"{n_peers} peer executions")
+                        f"{tid}, range [{lo},{hi}) of {_n}) carries "
+                        f"{got[0]} memops == {n_peers} peer executions")
     return "drop", (f"final entry (seq {final.get('seq_num')}, template "
-                    f"{tid}) carries {got[0]} memops but its {n_peers} "
-                    f"peer executions all carry {want[0]}")
+                    f"{tid}, range [{lo},{hi}) of {_n}) carries {got[0]} "
+                    f"memops but its {n_peers} peer executions all carry "
+                    f"{want[0]} in that range")
 
 
 def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:

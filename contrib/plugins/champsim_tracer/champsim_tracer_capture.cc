@@ -1675,6 +1675,8 @@ void cst_capture_df_stmt(const struct qemu_plugin_tb *tb, size_t idx,
                              ? ":uxtw"
                          : earows[i].part_ext[k] == QEMU_PLUGIN_DF_EA_EXT_SXTW
                              ? ":sxtw"
+                         : earows[i].part_ext[k] == QEMU_PLUGIN_DF_EA_EXT_BITOFF
+                             ? ":bitoff"
                              : "");
             if (w < 0 || (size_t)w >= sizeof(ea) - ek) {
                 break;

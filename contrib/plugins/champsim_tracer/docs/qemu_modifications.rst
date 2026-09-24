@@ -2652,6 +2652,34 @@ Guest threads in user mode
    ``BNDCSR``; the FPU instruction and data pointers; and the XSAVE
    header.  They stay unassociated, which is the pessimistic direction.
 
+``insn_dataflow_note_helper_rmw()`` (``accel/tcg/insn-dataflow.c``, ``target/i386/tcg/decode-new.c.inc``)
+
+   An x86 locked read-modify-write lowers to one ``tcg_gen_atomic_*``
+   call.  With ``CF_PARALLEL`` set, which is every multi-threaded
+   qemu-user process and every MTTCG guest, that call is a helper.  The
+   helper delivers a load and a store to plugins, but the op stream holds
+   no ``qemu_ld``/``qemu_st`` for the reader to find.  The decode site
+   therefore states the pair, a load and then a store at the memory
+   operand's width.  It does so for ``LOCK`` ``ADD``, ``ADC``, ``SUB``,
+   ``SBB``, ``AND``, ``OR``, ``XOR``, ``INC``, ``DEC``, ``NOT``,
+   ``XADD``, ``BTS``, ``BTR``, ``BTC``, ``CMPXCHG``, ``CMPXCHG8B`` and
+   ``CMPXCHG16B``, and for ``XCHG`` with a memory operand, which is
+   locked without the prefix.  The store's datum names the registers the
+   stored value is computed from and, except for ``XCHG``, the loaded
+   value.  Every result of the helper call carries the loaded value's
+   bit.  The address account drops the displacement's immediate bit, as
+   the op walk's rows do.  A bit-string instruction with a register bit
+   offset also names that register as an address term: the address it
+   touches is ``(reg >> 3)``, sign-extended and rounded down to the
+   operand size, from the modrm address.  The statement uses the
+   ``INSN_DF_EA_EXT_BITOFF`` transform for that term.
+
+   Without ``CF_PARALLEL`` the same call expands to real ops, so nothing
+   is stated.  Both regimes of one encoding then carry the same access
+   rows, store data and address masks.  ``LOCK NEG`` is not stated: its
+   emitter performs a visible load and then loops on a compare-exchange,
+   which is a different access list.
+
 Deterministic guest input (linux-user)
 --------------------------------------
 

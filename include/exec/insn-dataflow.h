@@ -515,6 +515,13 @@ typedef struct InsnDataflowHelperAccess {
 #define INSN_DF_EA_EXT_NONE  0  /* the whole register */
 #define INSN_DF_EA_EXT_UXTW  1  /* its low 32 bits, zero-extended */
 #define INSN_DF_EA_EXT_SXTW  2  /* its low 32 bits, sign-extended */
+/*
+ * x86's bit-string offset: a BT/BTS/BTR/BTC with a register bit offset and a
+ * memory operand addresses (reg >> 3) sign-extended and rounded down to the
+ * operand size, not the register itself.  No shift spells a right shift, so
+ * the transform is named; @shift is the operand size's log2.
+ */
+#define INSN_DF_EA_EXT_BITOFF 3
 
 /*
  * A synthetic address, as the components it is computed from.
@@ -721,6 +728,15 @@ typedef struct InsnDataflow {
      * Internal to the reader -- what a consumer sees is the folded row.
      */
     bool     split_access;
+
+    /*
+     * A helper performs this instruction's load (insn_dataflow_note_helper_rmw)
+     * and returns its value through a call result.  @helper_load_row is that
+     * load's memop row; the op walk adds its bit to every call result of the
+     * instruction.  Internal to the reader.
+     */
+    bool     helper_load;
+    uint8_t  helper_load_row;
 
     /*
      * The decode rule the bytes reached, and the generic word that rule
@@ -1298,6 +1314,31 @@ void insn_dataflow_note_helper_store(uint32_t size,
                                      int64_t offset, InsnDataflowAtom datum);
 
 /*
+ * An atomic read-modify-write a helper performs: one load, then one store,
+ * of @size bytes at the address @parts and @disp name.
+ *
+ * This is the order the nonatomic expansion of the same operation performs,
+ * so both translation regimes of one encoding declare one template shape.
+ * Under CF_PARALLEL the parallel regime lowers the RMW to an atomic helper,
+ * which delivers both accesses to plugins with no qemu_ld/qemu_st op for the
+ * reader to find.
+ *
+ * @srcs are the registers the stored value is computed from.  When
+ * @stores_loaded is set, the value the load returned is also one of them.
+ * Every source is also a read of the instruction.  The helper returns the
+ * loaded value (or a value computed from it), and that return is invisible to
+ * the op walk.  So every call of this instruction also carries the load's bit
+ * into its results.  A source that resolves to no provenance bit refuses the
+ * instruction (INSN_DF_INCOMPLETE_REFUSED) rather than publishing a datum
+ * short.
+ */
+void insn_dataflow_note_helper_rmw(uint32_t size,
+                                   const InsnDataflowEaPart *parts,
+                                   unsigned nparts, int64_t disp,
+                                   const InsnDataflowAtom *srcs,
+                                   unsigned nsrcs, bool stores_loaded);
+
+/*
  * EVERY access a helper performs, in the helper's order: @rows[0..@n).
  *
  * The count is the helper's MAXIMUM.  How many of them an execution performs
@@ -1485,6 +1526,14 @@ static inline void insn_dataflow_note_helper_store(uint32_t size,
                                                    int64_t disp,
                                                    int64_t offset,
                                                    InsnDataflowAtom datum)
+{ }
+static inline void insn_dataflow_note_helper_rmw(uint32_t size,
+                                                 const InsnDataflowEaPart *p,
+                                                 unsigned nparts,
+                                                 int64_t disp,
+                                                 const InsnDataflowAtom *srcs,
+                                                 unsigned nsrcs,
+                                                 bool stores_loaded)
 { }
 static inline void insn_dataflow_note_helper_accesses(
     const InsnDataflowHelperAccess *rows, unsigned n,

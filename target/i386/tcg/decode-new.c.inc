@@ -374,6 +374,51 @@ static void x86_df_note_movlpx_st_word(DisasContext *s, X86OpEntry *entry)
 }
 
 /*
+ * The shape of a locked read-modify-write, by the emitter that performs it.
+ *
+ * Each LOCK arm in emit.c.inc makes one tcg_gen_atomic_* call, and the call
+ * decides what the stored value is computed from.  OP combines the old value
+ * with the source operand (ADD, SUB, AND, OR, XOR, INC, DEC, NOT, XADD, and
+ * the bit-string BTS/BTR/BTC).  CARRY adds the carry flag too (ADC, SBB).
+ * SWAP stores the source alone (XCHG).  CMPXCHG stores the new value or the
+ * old one, chosen by comparing with EAX, and CMPXCHG_PAIR does that with
+ * EDX:EAX and ECX:EBX.  LOCK NEG is absent on purpose; see the caller.
+ */
+typedef enum x86_rmw_kind {
+    X86_RMW_NONE,
+    X86_RMW_OP,
+    X86_RMW_CARRY,
+    X86_RMW_SWAP,
+    X86_RMW_CMPXCHG,
+    X86_RMW_CMPXCHG_PAIR,
+} x86_rmw_kind;
+
+static x86_rmw_kind x86_locked_rmw_kind(const X86DecodedInsn *decode)
+{
+    X86GenFunc gen = decode->e.gen;
+
+    if (gen == gen_ADD || gen == gen_SUB || gen == gen_AND ||
+        gen == gen_OR || gen == gen_XOR || gen == gen_INC ||
+        gen == gen_DEC || gen == gen_NOT || gen == gen_XADD ||
+        gen == gen_BTS || gen == gen_BTR || gen == gen_BTC) {
+        return X86_RMW_OP;
+    }
+    if (gen == gen_ADC || gen == gen_SBB) {
+        return X86_RMW_CARRY;
+    }
+    if (gen == gen_XCHG) {
+        return X86_RMW_SWAP;
+    }
+    if (gen == gen_CMPXCHG) {
+        return X86_RMW_CMPXCHG;
+    }
+    if (gen == gen_CMPXCHG8B || gen == gen_CMPXCHG16B) {
+        return X86_RMW_CMPXCHG_PAIR;
+    }
+    return X86_RMW_NONE;
+}
+
+/*
  * The facts this decoder holds that its ops do not carry.
  *
  * Called once, immediately after the identity is stated and before any
@@ -475,27 +520,44 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
     bool helper_area = area >= 0;
 
     /*
-     * LOCK CMPXCHG under CF_PARALLEL is the same shape: gen_CMPXCHG's
-     * atomic arm calls tcg_gen_atomic_cmpxchg_tl, whose parallel route is
-     * a helper (tcg/tcg-op-ldst.c), so the op stream shows a call and no
-     * qemu_ld/qemu_st while the runtime delivers one atomic RMW access --
-     * QEMU genuinely performs the load as well as the store (the #177
-     * adjudication), and the template said the instruction cannot touch
-     * memory at all.  The rows are stated only for the invisible route:
-     * without CF_PARALLEL the same call expands to a real qemu_ld/qemu_st
-     * pair the op-stream reader records itself, and stating them here too
-     * would declare every access twice.
+     * A LOCKED READ-MODIFY-WRITE under CF_PARALLEL is the same shape.  Each
+     * emitter's LOCK arm calls one tcg_gen_atomic_* operation, whose parallel
+     * route is a helper (tcg/tcg-op-ldst.c).  The op stream shows a call and
+     * no qemu_ld/qemu_st, while the runtime delivers the helper's load and
+     * store (accel/tcg/atomic_common.c.inc).  The template said the
+     * instruction cannot touch memory at all.  The rows are stated only for
+     * that route.  Without CF_PARALLEL the same call expands to a real
+     * qemu_ld/qemu_st pair the reader records itself, and stating them here
+     * too would declare every access twice.
+     *
+     * XCHG with a memory operand is locked by definition: decode sets
+     * PREFIX_LOCK for it before this runs.  LOCK NEG is not here: its
+     * emitter loads with a visible qemu_ld and then loops on a cmpxchg, which
+     * is a different access list.  A 64-bit operation without CONFIG_ATOMIC64
+     * and CMPXCHG16B without HAVE_CMPXCHG128 have no helper: the parallel
+     * translation exits to the exclusive path, whose own translation records
+     * the accesses, so they state nothing.
      */
-    bool locked_cmpxchg = !decode->e.is_decode &&
-        decode->e.gen == gen_CMPXCHG &&
-        (s->prefix & PREFIX_LOCK) &&
-        (tb_cflags(s->base.tb) & CF_PARALLEL);
+    x86_rmw_kind rmw = X86_RMW_NONE;
 
-    if (has_ea && (helper_area || locked_cmpxchg ||
+    if (!decode->e.is_decode && (s->prefix & PREFIX_LOCK) && has_ea &&
+        (tb_cflags(s->base.tb) & CF_PARALLEL)) {
+        rmw = x86_locked_rmw_kind(decode);
+#ifndef CONFIG_ATOMIC64
+        if (decode->op[0].ot == MO_64) {
+            rmw = X86_RMW_NONE;
+        }
+#endif
+        if (decode->op[0].ot == MO_128 && !HAVE_CMPXCHG128) {
+            rmw = X86_RMW_NONE;
+        }
+    }
+
+    if (has_ea && (helper_area || rmw != X86_RMW_NONE ||
                    (word != NULL &&
                     (!strcmp(word, INSN_DF_WORD_PREFETCH) ||
                      !strcmp(word, INSN_DF_WORD_CACHEFLUSH))))) {
-        InsnDataflowEaPart parts[2];
+        InsnDataflowEaPart parts[3];
         unsigned n = 0;
         AddressParts *a = &decode->mem;
 
@@ -587,19 +649,65 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
                 insn_dataflow_note_vec_lane(INSN_DF_VEC_KIND_UNIFORM,
                                             INSN_DF_VEC_LANE_NONE);
             }
-        } else if (locked_cmpxchg) {
+        } else if (rmw != X86_RMW_NONE) {
             /*
-             * The RMW pair, in the order the nonatomic expansion performs
-             * it (qemu_ld then qemu_st), so both translation regimes of
-             * one encoding declare the same template: one load slot and
-             * one store slot at the operand width.
+             * The RMW pair at the memory operand's width, with the sources
+             * the stored value is computed from, in the order the nonatomic
+             * expansion performs it (qemu_ld then qemu_st).  Both translation
+             * regimes of one encoding then declare the same template.
              */
-            uint32_t sz = 1u << decode->op[2].ot;
+            InsnDataflowAtom srcs[4];
+            unsigned nsrc = 0;
+            const X86DecodedOp *src = &decode->op[2];
+            bool reg_src = src->unit == X86_OP_INT && !src->has_ea;
 
-            insn_dataflow_note_synthetic_ea(INSN_DF_RD, sz, parts, n,
-                                            a->disp);
-            insn_dataflow_note_synthetic_ea(INSN_DF_WR, sz, parts, n,
-                                            a->disp);
+            if (decode->e.special == X86_SPECIAL_BitTest && n < 3) {
+                /*
+                 * THE BIT OFFSET MOVES THE ADDRESS.  gen_lea_modrm adds
+                 * (reg >> 3), sign-extended and rounded down to the operand
+                 * size, to the modrm address: `lock bts %rdi,(%rax)` with
+                 * rdi = 70 touches the qword after (%rax).  The register is
+                 * a term of the address, stated with the transform it goes
+                 * through.
+                 */
+                parts[n++] = insn_df_ea(insn_df_reg(x86_reg_names[src->n]),
+                                        decode->op[1].ot,
+                                        INSN_DF_EA_EXT_BITOFF);
+            }
+            switch (rmw) {
+            case X86_RMW_CARRY:
+                /* ADC/SBB add the carry, read from the lazy flag state. */
+                srcs[nsrc++] = insn_df_reg("cc_dst");
+                srcs[nsrc++] = insn_df_reg("cc_src");
+                srcs[nsrc++] = insn_df_reg("cc_src2");
+                /* fall through */
+            case X86_RMW_OP:
+            case X86_RMW_SWAP:
+                if (reg_src) {
+                    srcs[nsrc++] = insn_df_reg(x86_reg_names[src->n]);
+                }
+                break;
+            case X86_RMW_CMPXCHG:
+                /* The comparand is EAX; the new value is the register. */
+                srcs[nsrc++] = insn_df_reg(x86_reg_names[R_EAX]);
+                if (reg_src) {
+                    srcs[nsrc++] = insn_df_reg(x86_reg_names[src->n]);
+                }
+                break;
+            case X86_RMW_CMPXCHG_PAIR:
+                /* EDX:EAX is the comparand, ECX:EBX the new value. */
+                srcs[nsrc++] = insn_df_reg(x86_reg_names[R_EAX]);
+                srcs[nsrc++] = insn_df_reg(x86_reg_names[R_EDX]);
+                srcs[nsrc++] = insn_df_reg(x86_reg_names[R_EBX]);
+                srcs[nsrc++] = insn_df_reg(x86_reg_names[R_ECX]);
+                break;
+            default:
+                break;
+            }
+            /* An exchange stores the register alone; the rest combine. */
+            insn_dataflow_note_helper_rmw(1u << decode->op[0].ot, parts, n,
+                                          a->disp, srcs, nsrc,
+                                          rmw != X86_RMW_SWAP);
         } else {
             insn_dataflow_note_synthetic_ea(INSN_DF_RD,
                                             1u << decode->op[0].ot,

@@ -1090,6 +1090,14 @@ static void df_call(InsnDataflow *d, TCGOp *op)
         df_add_field(d, ptr_args[k].off, ptr_args[k].size, ptr_args[k].dir,
                      prov, true, false);
     }
+    /*
+     * A helper that performs the instruction's load returns what it loaded
+     * (insn_dataflow_note_helper_rmw).  No qemu_ld op exists to seat that
+     * value's bit, so the results carry it from here.
+     */
+    if (d->helper_load) {
+        df_set_bit(prov, INSN_DF_BIT_MEMOP0 + d->helper_load_row);
+    }
     for (unsigned i = 0; i < nb_oargs; i++) {
         TCGTemp *ts = arg_temp(op->args[i]);
 
@@ -2006,6 +2014,57 @@ void insn_dataflow_note_helper_store(uint32_t size,
     df_set_bit(data_prov, (unsigned)bit);
     df_note_synth_ea(INSN_DF_WR, size, parts, nparts, disp, offset,
                      data_prov);
+}
+
+void insn_dataflow_note_helper_rmw(uint32_t size,
+                                   const InsnDataflowEaPart *parts,
+                                   unsigned nparts, int64_t disp,
+                                   const InsnDataflowAtom *srcs,
+                                   unsigned nsrcs, bool stores_loaded)
+{
+    uint64_t data_prov[INSN_DF_REG_WORDS] = { 0 };
+    InsnDataflow *d;
+    int k, w;
+
+    if (df == NULL || !df->decoding) {
+        return;
+    }
+    d = &df->out[df->cur];
+    for (unsigned i = 0; i < nsrcs; i++) {
+        int bit;
+
+        df_state(srcs[i], INSN_DF_RD);
+        bit = df_atom_bit(srcs[i]);
+        if (bit < 0) {
+            d->incomplete |= INSN_DF_INCOMPLETE_REFUSED;
+            return;
+        }
+        df_set_bit(data_prov, (unsigned)bit);
+    }
+    k = df_note_synth_ea(INSN_DF_RD, size, parts, nparts, disp, 0, NULL);
+    if (k < 0) {
+        return;             /* df_add_memop already counted the overflow */
+    }
+    d->helper_load = true;
+    d->helper_load_row = (uint8_t)k;
+    if (stores_loaded) {
+        df_set_bit(data_prov, INSN_DF_BIT_MEMOP0 + (unsigned)k);
+    }
+    w = df_note_synth_ea(INSN_DF_WR, size, parts, nparts, disp, 0,
+                         data_prov);
+
+    /*
+     * THE ADDRESS ACCOUNT IS THE ONE THE OP WALK WOULD HAVE MADE.  The
+     * nonatomic expansion computes this address with a constant add, so its
+     * rows name the registers and not the displacement; the synthetic note
+     * sets the immediate bit whenever there is a displacement.  Both rows
+     * drop it here, so one encoding publishes one address mask in both
+     * regimes, and the rows reach the consumer exactly as the op walk's
+     * rows would.
+     */
+    for (int r = k; r <= w && w >= 0; r++) {
+        df_clear_bit(d->memops[r].addr_prov, INSN_DF_BIT_IMM);
+    }
 }
 
 /*

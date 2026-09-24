@@ -27,6 +27,7 @@
 #include "tcg/tcg-op-gvec.h"
 #include "exec/translator.h"
 #include "exec/insn-dataflow.h"
+#include "qemu/atomic128.h"
 #include "fpu/softfloat.h"
 
 #include "exec/helper-proto.h"

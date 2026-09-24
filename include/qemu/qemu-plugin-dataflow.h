@@ -336,6 +336,9 @@ bool qemu_plugin_insn_memop_datum(const struct qemu_plugin_tb *tb,
 #define QEMU_PLUGIN_DF_EA_EXT_NONE  0   /* the whole register */
 #define QEMU_PLUGIN_DF_EA_EXT_UXTW  1   /* its low 32 bits, zero-extended */
 #define QEMU_PLUGIN_DF_EA_EXT_SXTW  2   /* its low 32 bits, sign-extended */
+/* x86 bit-string offset: (reg >> 3) sign-extended, rounded down to the
+ * operand size, whose log2 the part's shift carries. */
+#define QEMU_PLUGIN_DF_EA_EXT_BITOFF 3
 
 typedef struct qemu_plugin_dataflow_ea {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */

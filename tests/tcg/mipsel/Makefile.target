@@ -1,0 +1,24 @@
+# -*- Mode: makefile -*-
+#
+# MIPS little-endian (mipsel) - included from tests/tcg/Makefile.target
+#
+# The shared MIPS tests in tests/tcg/mips are not pulled in here; this
+# directory holds only mipsel-specific tests.
+#
+
+VPATH += $(SRC_PATH)/tests/tcg/mipsel
+
+ifeq ($(CONFIG_PLUGIN),y)
+# Wrong-path engine contract (tests/tcg/plugins/wp-assert.c): the plugin
+# asserts in-process and aborts on a violation; the guest's output with
+# the plugin must match its output without it.  The red controls live in
+# the runner script described in the plugin's header.
+TESTS += wp-victim
+run-wp-victim: wp-victim libwp-assert.so
+	$(call run-test, wp-victim.ref, env QEMU=$(QEMU) $(QEMU) $(QEMU_OPTS) ./$<, \
+		wp-victim without plugin)
+	$(call run-test, $<, env QEMU=$(QEMU) $(QEMU) $(QEMU_OPTS) \
+		-plugin $(PLUGIN_LIB)/libwp-assert.so$(COMMA)require=on $<, \
+		wp-victim with wp-assert)
+	$(call diff-out, $<, wp-victim.ref.out)
+endif

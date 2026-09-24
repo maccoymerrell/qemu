@@ -19,6 +19,20 @@ X86_64_TESTS += test-1648
 X86_64_TESTS += test-2175
 X86_64_TESTS += cross-modifying-code
 X86_64_TESTS += fma
+ifeq ($(CONFIG_PLUGIN),y)
+# Wrong-path engine contract (tests/tcg/plugins/wp-assert.c): the plugin
+# asserts in-process and aborts on a violation; the guest's output with
+# the plugin must match its output without it.  The red controls live in
+# the runner script described in the plugin's header.
+X86_64_TESTS += wp-victim
+run-wp-victim: wp-victim libwp-assert.so
+	$(call run-test, wp-victim.ref, env QEMU=$(QEMU) $(QEMU) $(QEMU_OPTS) ./$<, \
+		wp-victim without plugin)
+	$(call run-test, $<, env QEMU=$(QEMU) $(QEMU) $(QEMU_OPTS) \
+		-plugin $(PLUGIN_LIB)/libwp-assert.so$(COMMA)require=on $<, \
+		wp-victim with wp-assert)
+	$(call diff-out, $<, wp-victim.ref.out)
+endif
 TESTS=$(MULTIARCH_TESTS) $(X86_64_TESTS) test-x86_64
 else
 TESTS=$(MULTIARCH_TESTS)

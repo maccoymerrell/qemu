@@ -55,20 +55,123 @@ inline constexpr uint32_t CST_MAGIC = cst_wire::MAGIC;
 namespace cst {
 
 /*
- * Bit @pos of a uint64_t dependency mask, or 0 past the mask's width.
- *
- * A template's register-mask pool stacks n_src + max_dep_loads + 1 positions,
- * and max_dep_loads is a u8 on the wire: an instruction whose helper performs
- * a hundred loads (x86 XRSTOR) has a pool wider than the 64-bit masks this
- * reader holds.  The wire's masks are ULEBs and never set such a position for
- * those instructions (the writer withdraws the block instead), so a position
- * past 64 is simply not a bit a mask can have -- and shifting by it would be
- * undefined, not zero.
+ * Bit @pos of a uint64_t mask, or 0 past its width.  For the one-word masks
+ * (the HAS_ADDR masks, whose layout is n_src + 1 positions, and the lane
+ * masks); the HAS_REG masks are DepMask values, below.
  */
 static inline uint64_t cst_bit(unsigned pos)
 {
     return pos < 64 ? (uint64_t)1 << pos : 0;
 }
+
+/*
+ * One HAS_REG dependency mask (dst_dep / store_data_dep), as wide as the
+ * positions the wire can give it.
+ *
+ * A register mask stacks n_src + max_dep_loads + 1 (immediate) positions,
+ * and both counts are u8 on the wire, so a mask can need 511 bits: aarch64
+ * `ld4 {v5.16b-v8.16b}' puts its sixty-fourth element's load bit past 64,
+ * x86 XRSTOR its ninety-eighth.  The wire's masks are ULEBs with no width of
+ * their own; this is the reader's side of that, eight limbs, least
+ * significant first.  Every consumer asks test()/set() rather than shifting,
+ * so no position -- in particular the all-to-all default a renderer builds
+ * for a template with no HAS_REG block -- stops at bit 63.
+ */
+struct DepMask {
+    static constexpr unsigned LIMBS = 8;
+    static constexpr unsigned BITS = LIMBS * 64;
+    std::array<uint64_t, LIMBS> w{};
+
+    static DepMask from_u64(uint64_t v) { DepMask m; m.w[0] = v; return m; }
+    /* Positions [0, n). */
+    static DepMask below(unsigned n)
+    {
+        DepMask m;
+        for (unsigned l = 0; l < LIMBS && n > l * 64; l++) {
+            unsigned k = n - l * 64;
+            m.w[l] = k >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << k) - 1);
+        }
+        return m;
+    }
+    bool test(unsigned pos) const
+    {
+        return pos < BITS && ((w[pos / 64] >> (pos % 64)) & 1);
+    }
+    void set(unsigned pos)
+    {
+        if (pos < BITS) w[pos / 64] |= (uint64_t)1 << (pos % 64);
+    }
+    bool any() const
+    {
+        for (uint64_t x : w) if (x) return true;
+        return false;
+    }
+    /* Positions [lo, lo + LIMBS*64) moved down to [0, ...). */
+    DepMask shr(unsigned lo) const
+    {
+        DepMask m;
+        for (unsigned p = lo; p < BITS; p++) {
+            if (test(p)) m.set(p - lo);
+        }
+        return m;
+    }
+    DepMask &operator|=(const DepMask &o)
+    {
+        for (unsigned l = 0; l < LIMBS; l++) w[l] |= o.w[l];
+        return *this;
+    }
+    DepMask &operator&=(const DepMask &o)
+    {
+        for (unsigned l = 0; l < LIMBS; l++) w[l] &= o.w[l];
+        return *this;
+    }
+    DepMask operator&(const DepMask &o) const { DepMask m = *this; m &= o; return m; }
+    DepMask operator~() const
+    {
+        DepMask m;
+        for (unsigned l = 0; l < LIMBS; l++) m.w[l] = ~w[l];
+        return m;
+    }
+    bool operator==(const DepMask &o) const { return w == o.w; }
+    bool operator!=(const DepMask &o) const { return w != o.w; }
+};
+
+/*
+ * A family of HAS_REG masks (one per destination, or one per store slot),
+ * stored at the stride its widest member needs: one limb for every
+ * instruction whose positions fit 64 -- all but the wide fans -- so a
+ * template costs what it did when the masks were uint64_t.  Indexing
+ * returns the mask as a DepMask value.
+ */
+struct DepMaskRows {
+    uint8_t limbs = 1;
+    std::vector<uint64_t> w;
+
+    size_t size() const { return w.size() / limbs; }
+    bool empty() const { return w.empty(); }
+    DepMask operator[](size_t i) const
+    {
+        DepMask m;
+        for (unsigned l = 0; l < limbs; l++) m.w[l] = w[i * limbs + l];
+        return m;
+    }
+    /* Replace the family with @rows, at the narrowest stride that holds
+     * every set bit of every row. */
+    void assign(const std::vector<DepMask> &rows)
+    {
+        unsigned need = 1;
+        for (const DepMask &m : rows) {
+            for (unsigned l = DepMask::LIMBS; l > need; l--) {
+                if (m.w[l - 1]) { need = l; break; }
+            }
+        }
+        limbs = (uint8_t)need;
+        w.assign(rows.size() * need, 0);
+        for (size_t i = 0; i < rows.size(); i++) {
+            for (unsigned l = 0; l < need; l++) w[i * need + l] = rows[i].w[l];
+        }
+    }
+};
 
 /* ===== Format-layout invariants =====
  *
@@ -488,8 +591,8 @@ struct Instruction {
     uint32_t              max_dep_stores      = 0;
     bool                  has_reg_deps        = false;
     bool                  has_addr_deps       = false;
-    std::vector<uint64_t> dst_dep_mask;
-    std::vector<uint64_t> store_data_dep_mask;
+    DepMaskRows           dst_dep_mask;
+    DepMaskRows           store_data_dep_mask;
     std::vector<uint64_t> load_addr_dep_mask;
     std::vector<uint64_t> store_addr_dep_mask;
 
@@ -603,8 +706,8 @@ struct InsnTemplate {
      */
     bool                  has_reg_deps  = false;
     bool                  has_addr_deps = false;
-    std::vector<uint64_t> dst_dep_mask;
-    std::vector<uint64_t> store_data_dep_mask;
+    DepMaskRows           dst_dep_mask;
+    DepMaskRows           store_data_dep_mask;
     std::vector<uint64_t> load_addr_dep_mask;
     std::vector<uint64_t> store_addr_dep_mask;
 

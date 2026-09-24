@@ -199,6 +199,47 @@ static void bw_write_uleb128(BitWriter *bw, uint64_t v)
     bw_raw(bw, buf, n);
 }
 
+/*
+ * A multi-limb register dep mask as one ULEB: seven bits a byte from the
+ * least significant limb up, until the rest of the value is zero.  A mask
+ * whose high limbs are zero is the same bytes as bw_write_uleb128() of its
+ * low limb, so a one-limb mask's wire bytes do not depend on this path.
+ */
+static void bw_write_uleb128_limbs(BitWriter *bw, const uint64_t *w,
+                                   unsigned limbs)
+{
+    unsigned top = limbs;
+
+    while (top > 1 && w[top - 1] == 0) {
+        top--;
+    }
+    if (top <= 1) {
+        bw_write_uleb128(bw, top ? w[0] : 0);
+        return;
+    }
+    /* Highest set bit + 1 bounds the byte count. */
+    unsigned nbits = (top - 1) * 64 + (64 - (unsigned)__builtin_clzll(w[top - 1]));
+    uint8_t buf[(DEP_MASK_MAX_LIMBS * 64 + 6) / 7];
+    size_t n = 0;
+
+    for (unsigned pos = 0; pos < nbits; pos += 7) {
+        uint8_t byte = 0;
+
+        for (unsigned b = 0; b < 7; b++) {
+            unsigned q = pos + b;
+
+            if (q < top * 64 && ((w[q / 64] >> (q % 64)) & 1)) {
+                byte |= (uint8_t)(1u << b);
+            }
+        }
+        if (pos + 7 < nbits) {
+            byte |= 0x80;
+        }
+        buf[n++] = byte;
+    }
+    bw_raw(bw, buf, n);
+}
+
 static void bw_write_sleb128(BitWriter *bw, int64_t v)
 {
     uint8_t buf[10];
@@ -871,10 +912,14 @@ static void write_insn_descriptors(BitWriter *sub, const BBTemplate *tmpl)
             bw_write_u8(sub, dep_flags);
             if (fld->has_reg_deps) {
                 for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                    bw_write_uleb128(sub, fld->dst_dep_mask[d]);
+                    bw_write_uleb128_limbs(sub,
+                                           dep_row(fld->dst_dep_mask, fld, d),
+                                           fld->dep_limbs);
                 }
                 for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
-                    bw_write_uleb128(sub, fld->store_data_dep_mask[s]);
+                    bw_write_uleb128_limbs(
+                        sub, dep_row(fld->store_data_dep_mask, fld, s),
+                        fld->dep_limbs);
                 }
             }
             if (fld->has_addr_deps) {
@@ -2284,27 +2329,27 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
          * the per-memop -> per-register attribution.  Empty mask. */
         return 0;
     }
+    const unsigned limbs = f->dep_limbs;
     if (want_type == DYN_LOAD_ADDR) {
-        const uint64_t load_bit_k =
-            dep_bit((unsigned)f->n_src_regs + (unsigned)slot);
-        if (!load_bit_k) return 0;      /* no mask position to look up */
+        /* The load's position in the register masks may lie past bit 63
+         * (a wide fan): the masks are multi-limb, and the rank counts the
+         * earlier load positions of the same destination across limbs. */
+        const unsigned pos = (unsigned)f->n_src_regs + (unsigned)slot;
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-            if (!(f->dst_dep_mask[d] & load_bit_k)) continue;
+            const uint64_t *row = dep_row(f->dst_dep_mask, f, d);
+            if (!dep_test(row, limbs, pos)) continue;
             host_reg_idx = d;
             host_lane_mask = f->dst_lane_mask[d];
-            /* Rank among d's load slots: count earlier slots also in
-             * dst_dep[d]'s load-bit range. */
-            uint64_t load_range = f->dst_dep_mask[d]
-                >> (uint64_t)f->n_src_regs;
-            uint64_t earlier = load_range & (dep_bit(slot) - 1);
-            slots_before = (unsigned)__builtin_popcountll(earlier);
+            slots_before = dep_count(row, limbs, f->n_src_regs, pos);
             break;
         }
     } else {
         /* Stores: store_data_dep[slot] points to the value src_reg.
          * Among same-slot-mask stores in store_data_dep[], rank by
-         * how many earlier slots reference the same src. */
-        const uint64_t this_slot_mask = f->store_data_dep_mask[slot]
+         * how many earlier slots reference the same src.  Source
+         * positions are [0, n_src_regs), all in the first limb. */
+        const uint64_t this_slot_mask =
+            dep_row(f->store_data_dep_mask, f, slot)[0]
             & (f->n_src_regs >= 64 ? ~(uint64_t)0
                                    : dep_bit(f->n_src_regs) - 1);
         if (!this_slot_mask) return 0;
@@ -2313,7 +2358,7 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
         host_reg_idx = which;
         host_lane_mask = f->src_lane_mask[which];
         for (uint8_t s = 0; s < slot && s < MAX_STORES; s++) {
-            if (f->store_data_dep_mask[s] & this_slot_mask) {
+            if (dep_row(f->store_data_dep_mask, f, s)[0] & this_slot_mask) {
                 slots_before++;
             }
         }

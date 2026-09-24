@@ -287,9 +287,12 @@ SeatedSet seat_set_as_src(InsnFields *f, InsnRegNames *rn, unsigned nwords)
  * counted as an unmapped name or an unnamed range where it is one.
  */
 /*
- * Set when a provenance member's mask position lies past the mask's 64 bits
- * (dep_bit() in champsim_tracer_mnemonics.h).  Cleared at the start of each
- * instruction's seating and read once its masks are built.
+ * Set when a provenance member's mask position lies past the mask's width
+ * (the register masks are dep_limbs limbs, the address masks one).  With
+ * the register masks sized by dep_limbs_for() no register-mask position can
+ * pass them; the flag is the guard that says so rather than a silent drop.
+ * Cleared at the start of each instruction's seating and read once its
+ * masks are built.
  */
 static thread_local bool tls_mask_unplaceable;
 
@@ -301,9 +304,17 @@ static uint64_t mask_bit_at(unsigned pos)
     return dep_bit(pos);
 }
 
-uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
+static void row_set_at(uint64_t *row, unsigned limbs, unsigned pos)
 {
-    uint64_t mask = 0;
+    if (!dep_set(row, limbs, pos)) {
+        tls_mask_unplaceable = true;
+    }
+}
+
+/* ORs the provenance set's members into the register mask @row. */
+void prov_to_mask(const InsnFields *f, unsigned nwords, uint64_t *row)
+{
+    const unsigned limbs = f->dep_limbs;
 
     for (unsigned w = 0; w < nwords; w++) {
         uint64_t word = tls_set.data()[w];
@@ -319,7 +330,7 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
             case BIT_REG:
                 for (uint8_t i = 0; i < f->n_src_regs; i++) {
                     if (f->src_regs[i] == reg) {
-                        mask |= mask_bit_at(i);
+                        row_set_at(row, limbs, i);
                         break;
                     }
                 }
@@ -328,13 +339,13 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
                 /* The value came out of one of this instruction's own loads;
                  * @reg carries that load's wire slot. */
                 if (reg < f->max_dep_loads) {
-                    mask |= mask_bit_at((unsigned)f->n_src_regs + reg);
+                    row_set_at(row, limbs, (unsigned)f->n_src_regs + reg);
                     g_qdep.load_datum_seated++;
                 }
                 break;
             case BIT_IMM:
-                mask |= mask_bit_at((unsigned)f->n_src_regs +
-                                    f->max_dep_loads);
+                row_set_at(row, limbs,
+                           (unsigned)f->n_src_regs + f->max_dep_loads);
                 break;
             case BIT_CONST:
             case BIT_NOTHING:
@@ -342,7 +353,6 @@ uint64_t prov_to_mask(const InsnFields *f, unsigned nwords)
             }
         }
     }
-    return mask;
 }
 
 /* The same, for an ADDRESS mask, whose layout omits the loaded-data slots
@@ -872,7 +882,7 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
             return qemu_plugin_insn_memop_data_prov(tb, idx, store_rows[k],
                                                     w, nn);
         });
-        out->store_data_dep_mask[k] = prov_to_mask(out, n);
+        prov_to_mask(out, n, dep_row(out->store_data_dep_mask, out, k));
     }
 
     /* ---- the intra-instruction register dataflow ------------------------ */
@@ -916,7 +926,7 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
          * accumulates rather than overwrites.  Overwriting would publish the
          * last field's inputs as the whole register's.
          */
-        out->dst_dep_mask[slot] |= prov_to_mask(out, n);
+        prov_to_mask(out, n, dep_row(out->dst_dep_mask, out, slot));
         any_prov = true;
     }
 
@@ -942,7 +952,7 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         unsigned n = read_set([&](uint64_t *w, unsigned nn) {
             return qemu_plugin_insn_field_prov(tb, idx, fd.second, w, nn);
         });
-        out->dst_dep_mask[slot] |= prov_to_mask(out, n);
+        prov_to_mask(out, n, dep_row(out->dst_dep_mask, out, slot));
         g_qdep.field_dst_prov_seated++;
         any_prov = true;
     }
@@ -952,8 +962,9 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
         const unsigned hi = lo + out->max_dep_loads;
 
         for (uint8_t d = 0; d < out->n_dst_regs; d++) {
-            for (unsigned p = lo; p < hi && p < 64; p++) {
-                out->dst_dep_mask[d] &= ~dep_bit(p);
+            for (unsigned p = lo; p < hi; p++) {
+                dep_clear(dep_row(out->dst_dep_mask, out, d), out->dep_limbs,
+                          p);
             }
         }
         for (unsigned k = 0; k < load_datum_reg.size(); k++) {
@@ -962,7 +973,8 @@ QdepRefusal qdep_apply(const struct qemu_plugin_tb *tb, size_t idx,
             if (slot == UINT8_MAX) {
                 continue;
             }
-            out->dst_dep_mask[slot] |= mask_bit_at(lo + k);
+            row_set_at(dep_row(out->dst_dep_mask, out, slot),
+                       out->dep_limbs, lo + k);
             any_prov = true;
         }
     }

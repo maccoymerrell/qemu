@@ -142,6 +142,22 @@ std::string hex(uint64_t v)
     return b;
 }
 
+/* A multi-limb value (least significant limb first) as one hex integer. */
+std::string hex_limbs(const std::array<uint64_t, 8> &w)
+{
+    int top = 0;
+    for (int i = 7; i > 0; i--) {
+        if (w[i]) { top = i; break; }
+    }
+    std::string out = hex(w[top]);
+    for (int i = top - 1; i >= 0; i--) {
+        char b[24];
+        std::snprintf(b, sizeof(b), "%016" PRIx64, w[i]);
+        out += b;
+    }
+    return out;
+}
+
 /* Resolve a numeric id to "<v> (<name>)" via @m, or "<v> (?)" on miss. */
 std::string named(const std::unordered_map<uint64_t, std::string> &m,
                   uint64_t v)
@@ -327,12 +343,14 @@ void dump_template_insn(FILE *out, const Header &h, Reader &s,
         emitf(out, s, doff, depth + 1,
               "dep_block flags=0x%02x (%s)  [Step 4.5]",
               df, flag_bits(h.maps.dep_block_flag, df).c_str());
+        /* Register masks can pass 64 bits (a wide fan's load positions),
+         * so every mask is read whole. */
         auto dump_masks = [&](const char *label, unsigned count) {
             size_t moff = s.consumed();
             std::string m = std::string(label) + "=[";
             for (unsigned i = 0; i < count; i++) {
                 if (i) m += ", ";
-                m += hex(s.uleb());
+                m += hex_limbs(s.uleb_wide());
             }
             m += ']';
             emit(out, s, moff, depth + 2, m);

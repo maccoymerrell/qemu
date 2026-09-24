@@ -3535,14 +3535,16 @@ mapped and the elements past it (``LMUL`` > 1) are counted, addressed
 and valued but carry no lane mask; a segment access (``nf`` > 1) names
 no per-slot register at all.
 
-The masks are held in 64 bits by the in-tree writer, so an
-instruction whose dependency bit positions pass 64 — ``n_src`` plus
-the load count, for example ``ld4`` of four 16-byte registers of
-bytes (64 loads) or ``vle8.v`` at ``VLEN`` = 128 (128 loads) — has its
-register dependency block withdrawn (``HAS_REG`` clear, the
-all-to-all over-approximation) and with it the per-memop lane
-association.  The wire's ULEB masks have no such width; the limit is
-the writer's.
+A register mask is as wide as its position stack: ``n_src`` plus
+``max_dep_loads`` plus the immediate bit, up to 511 positions, and the
+ULEB carries every one of them.  A fan wider than 64 bits is not a
+special case -- ``ld4 {v5.16b-v8.16b}, [x9]`` performs 64 one-byte
+loads, and with one source the destination ``v8`` holds the bits of
+slots 3, 7, ..., 63, so its ``dst_dep`` mask has bit 64 set and is a
+ten-byte ULEB.  A consumer reads each register mask as a
+multi-precision value; the in-tree writer and ``cst_decode`` hold it
+in as many 64-bit limbs as its stack needs.  A mask whose positions fit
+64 bits is the same bytes it always was.
 
 The active-lane count can be fixed by the instruction encoding
 (x86/NEON/MSA — derivable statically) or read from a register at

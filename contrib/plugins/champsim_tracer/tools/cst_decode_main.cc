@@ -729,21 +729,21 @@ void render_input_pool(std::vector<std::string> &out,
  * written — the trailing memop column needs to know which load slots
  * the operand renderer really placed, not merely which ones exist. */
 template <typename LaneFn>
-void render_input_set_laned(std::string &line, uint64_t mask,
+void render_input_set_laned(std::string &line, const cst::DepMask &mask,
                             const std::vector<std::string> &input_names,
                             bool show_lanes, uint64_t sink_lanes,
-                            LaneFn in_lane, uint64_t *placed = nullptr)
+                            LaneFn in_lane, cst::DepMask *placed = nullptr)
 {
     bool any = false;
     for (size_t i = 0; i < input_names.size(); i++) {
-        if (!(mask & cst::cst_bit(i))) continue;
+        if (!mask.test((unsigned)i)) continue;
         if (show_lanes && sink_lanes) {
             uint64_t il = in_lane(i);
             if (il && !(il & sink_lanes)) continue;  /* no shared lanes */
         }
         if (any) line.append(", ");
         line.append(input_names[i]);
-        if (placed && i < 64) *placed |= cst::cst_bit(i);
+        if (placed) placed->set((unsigned)i);
         any = true;
     }
 }
@@ -814,9 +814,9 @@ std::string render_store_sink(const DisasmContext &ctx,
  */
 bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
                           const cst::Instruction &insn,
-                          uint64_t *out_placed_loads = nullptr)
+                          cst::DepMask *out_placed_loads = nullptr)
 {
-    uint64_t placed = 0;
+    cst::DepMask placed;
     std::vector<uint64_t> load_addrs, store_addrs;
     for (const auto &dp : insn.dyn_params) {
         if (dp.type == cst::DynParam::Load)  load_addrs.push_back(dp.addr);
@@ -837,44 +837,42 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
      * refiner overrides with the precise no-load mask.
      */
     unsigned n_src = (unsigned)insn.src_regs.size();
-    uint64_t addr_only_srcs = 0;
-    for (uint64_t m : insn.load_addr_dep_mask)  addr_only_srcs |= m;
-    for (uint64_t m : insn.store_addr_dep_mask) addr_only_srcs |= m;
+    uint64_t addr_only_u64 = 0;
+    for (uint64_t m : insn.load_addr_dep_mask)  addr_only_u64 |= m;
+    for (uint64_t m : insn.store_addr_dep_mask) addr_only_u64 |= m;
     /* Confine to src_reg bit range and drop the imm bit (which sits
      * at bit n_src in HAS_ADDR layout) so we don't accidentally
      * filter out the immediate from the default. */
-    uint64_t src_bits_mask = (n_src == 64) ? ~(uint64_t)0
-                                           : (cst::cst_bit(n_src) - 1);
+    cst::DepMask addr_only_srcs =
+        cst::DepMask::from_u64(addr_only_u64) & cst::DepMask::below(n_src);
 
     /* Load slots occupy pool bits [n_src, n_src + max_dep_loads); shift
-     * them down to slot indices for the caller.  n_src saturates at
-     * MAX_SRC_REGS (64), where the shift would be undefined and no load
-     * slot can be addressed anyway. */
-    auto shift_out = [&](uint64_t m) -> uint64_t {
-        return n_src >= 64 ? 0 : (m >> n_src);
+     * them down to slot indices for the caller. */
+    auto shift_out = [&](const cst::DepMask &m) -> cst::DepMask {
+        return m.shr(n_src);
     };
-    addr_only_srcs &= src_bits_mask;
 
-    uint64_t all_inputs = 0;
-    for (size_t i = 0; i < inputs.size(); i++) {
-        all_inputs |= cst::cst_bit(i);
-    }
-    uint64_t default_mask = all_inputs & ~addr_only_srcs;
+    /* EVERY input position, however far past bit 63 the load slots run:
+     * the all-to-all default is a fact about the whole pool, and a
+     * default that stopped at 64 left a wide fan's last loads feeding
+     * nothing. */
+    cst::DepMask all_inputs = cst::DepMask::below((unsigned)inputs.size());
+    cst::DepMask default_mask = all_inputs & ~addr_only_srcs;
 
     /* Addressing-src cleanup applies ONLY to a fully-saturated mask
      * (dep_all_to_all / synthesized default): there an addressing reg
      * is a false direct dep (it reaches the sink via the memop).  A
      * strict subset is a precise refiner's deliberate output (e.g.
      * dep_x86_stack_push's SP-dst = SP-src) and renders verbatim. */
-    auto effective = [&](uint64_t m) -> uint64_t {
+    auto effective = [&](const cst::DepMask &m) -> cst::DepMask {
         return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
     };
 
-    auto dst_mask = [&](size_t d) {
+    auto dst_mask = [&](size_t d) -> cst::DepMask {
         return d < insn.dst_dep_mask.size() ? insn.dst_dep_mask[d]
                                             : default_mask;
     };
-    auto store_mask = [&](size_t s) {
+    auto store_mask = [&](size_t s) -> cst::DepMask {
         return s < insn.store_data_dep_mask.size()
                    ? insn.store_data_dep_mask[s]
                    : default_mask;
@@ -926,12 +924,12 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         if (!ctx.show_lanes) return false;
         uint64_t dst_lanes = lane_at(insn.dst_lane_mask, k);
         if (!dst_lanes) return false;
-        uint64_t m = dst_mask(k);
+        cst::DepMask m = dst_mask(k);
         std::vector<size_t> contributors;
         uint64_t covered = 0;
         bool overlap = false;
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (!(m & cst::cst_bit(i))) continue;
+            if (!m.test((unsigned)i)) continue;
             uint64_t lm = input_lane_mask(i);
             if (!lm) return false;          /* imm or scalar — bail */
             if ((lm & dst_lanes) != lm) return false; /* extends past dst */
@@ -945,7 +943,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i : contributors) {
             open_group();
             line.append(inputs[i]);
-            if (i < 64) placed |= cst::cst_bit(i);
+            placed.set((unsigned)i);
             line.append(" -> ");
             emit_dst_name(k, input_lane_mask(i));
         }
@@ -962,7 +960,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             d++;
             continue;
         }
-        uint64_t mask = dst_mask(d);
+        cst::DepMask mask = dst_mask(d);
         size_t end = d + 1;
         while (end < insn.dst_regs.size() && dst_mask(end) == mask
                && !(ctx.show_lanes && lane_at(insn.dst_lane_mask, end))) {
@@ -988,7 +986,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
      * rendered (using the default mask). */
     size_t s = 0;
     while (s < insn.max_dep_stores) {
-        uint64_t mask = store_mask(s);
+        cst::DepMask mask = store_mask(s);
         size_t end = s + 1;
         while (end < insn.max_dep_stores && store_mask(end) == mask) {
             end++;
@@ -1019,7 +1017,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i = 0; i < inputs.size(); i++) {
             sep();
             line.append(inputs[i]);
-            if (i < 64) placed |= cst::cst_bit(i);
+            placed.set((unsigned)i);
         }
         if (out_placed_loads) *out_placed_loads = shift_out(placed);
         return any;
@@ -1063,7 +1061,7 @@ void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
  */
 void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
                         const cst::Instruction &insn,
-                        uint64_t placed_loads)
+                        const cst::DepMask &placed_loads)
 {
     bool with_data = ctx.h->has_mem_data();
     std::vector<uint64_t> load_addrs;
@@ -1079,8 +1077,7 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
          * actually printed that slot.  Stores always render (the store
          * loop iterates every slot up to max_dep_stores). */
         bool covered = has_slot &&
-            (!is_load || (load_idx < 64 &&
-                          (placed_loads & cst::cst_bit(load_idx))));
+            (!is_load || placed_loads.test(load_idx));
         if (!covered && is_load && has_slot) {
             /* Slot exists but went unplaced — render it in full, with
              * its HAS_ADDR input set and address. */
@@ -1166,7 +1163,7 @@ void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
  * entry gets a per-input lane suffix so the deps line mirrors the
  * inline arrows.
  */
-void append_dep_mask(std::string &line, uint64_t m,
+void append_dep_mask(std::string &line, const cst::DepMask &m,
                      const std::vector<uint8_t> &src_regs,
                      unsigned n_loads,
                      const DisasmContext &ctx,
@@ -1193,7 +1190,7 @@ void append_dep_mask(std::string &line, uint64_t m,
             return (in_lane & sink_lanes) != 0;
         };
         for (unsigned i = 0; i < n_src; i++) {
-            if (m & cst::cst_bit(i)) {
+            if (m.test(i)) {
                 uint64_t il = annotate_lanes
                                   ? lane_at(insn->src_lane_mask, i) : 0;
                 if (!feeds(il)) continue;
@@ -1205,7 +1202,7 @@ void append_dep_mask(std::string &line, uint64_t m,
             }
         }
         for (unsigned i = 0; i < n_loads; i++) {
-            if (m & cst::cst_bit((n_src + i))) {
+            if (m.test(n_src + i)) {
                 uint64_t il = annotate_lanes
                                   ? lane_at(insn->load_data_lane_mask, i)
                                   : 0;
@@ -1218,7 +1215,7 @@ void append_dep_mask(std::string &line, uint64_t m,
                 }
             }
         }
-        if (m & cst::cst_bit((n_src + n_loads))) {
+        if (m.test(n_src + n_loads)) {
             sep();
             inner.append("imm");
         }
@@ -1233,7 +1230,7 @@ void append_dep_mask(std::string &line, uint64_t m,
      * dynamic load-data lane mask spans the real byte lanes — they
      * don't intersect), fall back to the unfiltered list so the
      * dependency stays visible and matches the no-lanes rendering. */
-    if (inner.empty() && annotate_lanes && m != 0) {
+    if (inner.empty() && annotate_lanes && m.any()) {
         inner = build(false);
     }
     line.push_back('[');
@@ -1284,27 +1281,24 @@ void emit_disasm_deps_annotation(std::string &line,
 
     /* Default mask, computed identically to the inline renderer's
      * fallback so the annotation can't disagree with the arrows. */
-    uint64_t addr_only_srcs = 0;
-    for (uint64_t m : it.load_addr_dep_mask)  addr_only_srcs |= m;
-    for (uint64_t m : it.store_addr_dep_mask) addr_only_srcs |= m;
-    uint64_t src_bits = (n_src == 64) ? ~(uint64_t)0
-                                       : (cst::cst_bit(n_src) - 1);
-    addr_only_srcs &= src_bits;
+    uint64_t addr_only_u64 = 0;
+    for (uint64_t m : it.load_addr_dep_mask)  addr_only_u64 |= m;
+    for (uint64_t m : it.store_addr_dep_mask) addr_only_u64 |= m;
+    cst::DepMask addr_only_srcs =
+        cst::DepMask::from_u64(addr_only_u64) & cst::DepMask::below(n_src);
 
-    uint64_t all_inputs = src_bits;
-    /* every load_data slot */
-    for (unsigned k = 0; k < n_loads; k++) {
-        all_inputs |= cst::cst_bit((n_src + k));
-    }
+    /* Every source and every load_data slot, however far past bit 63
+     * the load slots run -- the default names the whole pool. */
+    cst::DepMask all_inputs = cst::DepMask::below(n_src + n_loads);
     /* imm bit only when the template carries an immediate. */
     if (it.has_imm) {
-        all_inputs |= cst::cst_bit(imm_bit);
+        all_inputs.set(imm_bit);
     }
-    uint64_t default_mask = all_inputs & ~addr_only_srcs;
+    cst::DepMask default_mask = all_inputs & ~addr_only_srcs;
 
     /* Same saturated-only `effective` rule as emit_disasm_operands
      * so the annotation can't disagree with the arrows. */
-    auto effective = [&](uint64_t m) -> uint64_t {
+    auto effective = [&](const cst::DepMask &m) -> cst::DepMask {
         return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
     };
 
@@ -1314,8 +1308,8 @@ void emit_disasm_deps_annotation(std::string &line,
     /* Dst masks: prefer wire HAS_REG; fall back to default. */
     size_t n_dst = it.dst_regs.size();
     for (size_t d = 0; d < n_dst; d++) {
-        uint64_t m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
-                                                : default_mask;
+        cst::DepMask m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
+                                                    : default_mask;
         m = effective(m);
         line.push_back(' ');
         append_regref(&line, ctx, it.dst_regs[d]);
@@ -1330,9 +1324,9 @@ void emit_disasm_deps_annotation(std::string &line,
     /* Store-data masks: prefer wire; fall back to default per slot
      * up to max_dep_stores so unclassified stores surface too. */
     for (size_t s = 0; s < it.max_dep_stores; s++) {
-        uint64_t m = s < it.store_data_dep_mask.size()
-                         ? it.store_data_dep_mask[s]
-                         : default_mask;
+        cst::DepMask m = s < it.store_data_dep_mask.size()
+                             ? it.store_data_dep_mask[s]
+                             : default_mask;
         m = effective(m);   /* saturated-only addressing-src cleanup */
         line.append(" sdata");
         line.append(std::to_string(s));
@@ -1420,7 +1414,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     emit_disasm_bytes_column(line, insn.raw_bytes);
     emit_disasm_mnemonic(line, ctx, insn);
 
-    uint64_t placed_loads = 0;
+    cst::DepMask placed_loads;
     bool any_operand = emit_disasm_operands(line, ctx, insn, &placed_loads);
     emit_disasm_metaflags(line, ctx, insn, any_operand);
     emit_disasm_memops(line, ctx, insn, placed_loads);
@@ -2147,9 +2141,31 @@ void emit_legacy_template_insn(FILE *out, const cst::Header &h,
                 append_hex(out, v[k]);
             }
         };
+        /* A register mask may pass 64 bits: one hex integer, high limbs
+         * first, the same digits a one-limb mask always printed. */
+        auto fmt_rows = [](const cst::DepMaskRows &v,
+                           const char *name, std::string *out) {
+            if (v.empty()) return;
+            if (!out->empty()) out->push_back(' ');
+            out->append(name);
+            out->push_back('=');
+            for (size_t k = 0; k < v.size(); k++) {
+                if (k) out->push_back(',');
+                cst::DepMask m = v[k];
+                int top = 0;
+                for (int l = (int)cst::DepMask::LIMBS - 1; l > 0; l--) {
+                    if (m.w[l]) { top = l; break; }
+                }
+                out->append("0x");
+                append_hex(out, m.w[top]);
+                for (int l = top - 1; l >= 0; l--) {
+                    append_hex_padded(out, m.w[l], 16);
+                }
+            }
+        };
         std::string body;
-        fmt_vec(I.dst_dep_mask,        "dst", &body);
-        fmt_vec(I.store_data_dep_mask, "sd",  &body);
+        fmt_rows(I.dst_dep_mask,        "dst", &body);
+        fmt_rows(I.store_data_dep_mask, "sd",  &body);
         fmt_vec(I.load_addr_dep_mask,  "la",  &body);
         fmt_vec(I.store_addr_dep_mask, "sa",  &body);
         std::fprintf(out, "    deps: %s\n", body.c_str());

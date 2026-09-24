@@ -124,12 +124,15 @@ struct QdepCounters {
      * provenance.  Zero on a run with no such load means the statement was
      * never made, not that it was made and ignored. */
     uint64_t load_datum_stated;
-    /* A provenance member whose mask position lies past the uint64_t
-     * mask's width (n_src + max_dep_loads + imm beyond 64 -- only a
-     * helper fan's load count reaches that).  Its instruction's HAS_REG
-     * block is withdrawn, so the consumer reads the pessimistic all-to-all
-     * default instead of a mask with a dependency missing; the count is
-     * the instructions withdrawn that way. */
+    /* A provenance member whose mask position lies past its mask's width.
+     * The register masks are sized by dep_limbs_for() to the whole position
+     * stack, so for them this cannot happen; an ADDRESS mask is one limb,
+     * and its imm bit sits at n_src_regs, which passes 64 only at a full
+     * MAX_SRC_REGS list.  Either way the instruction's HAS_REG block is
+     * withdrawn, so the consumer reads the pessimistic all-to-all default
+     * instead of a mask with a dependency missing; the count is the
+     * instructions withdrawn that way, and a non-zero reading is a defect
+     * to chase, not a capacity. */
     uint64_t mask_bit_unplaceable;
     /* Destinations whose dependency mask came from a field row rather than
      * from a TCG global's write record -- every vector and FP destination on

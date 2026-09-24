@@ -158,14 +158,18 @@ void parse_templates_at(Reader &r,
                  * max_dep_loads, max_dep_stores); masks are ULEBs. */
                 if (dep_flags & ids.dep_block_has_reg) {
                     I.has_reg_deps = true;
-                    I.dst_dep_mask.resize(n_dst);
+                    /* A register mask may pass 64 bits (a wide fan's
+                     * load positions); it is read whole. */
+                    std::vector<cst::DepMask> rows(n_dst);
                     for (uint8_t d = 0; d < n_dst; d++) {
-                        I.dst_dep_mask[d] = (uint64_t)sub.uleb();
+                        rows[d].w = sub.uleb_wide();
                     }
-                    I.store_data_dep_mask.resize(I.max_dep_stores);
+                    I.dst_dep_mask.assign(rows);
+                    rows.assign(I.max_dep_stores, cst::DepMask{});
                     for (uint32_t s = 0; s < I.max_dep_stores; s++) {
-                        I.store_data_dep_mask[s] = (uint64_t)sub.uleb();
+                        rows[s].w = sub.uleb_wide();
                     }
+                    I.store_data_dep_mask.assign(rows);
                 }
                 if (dep_flags & ids.dep_block_has_addr) {
                     I.has_addr_deps = true;

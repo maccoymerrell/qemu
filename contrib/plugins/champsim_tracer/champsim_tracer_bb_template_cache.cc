@@ -619,8 +619,9 @@ static uint8_t  g_zero_reg8[MAX_SRC_REGS];
  * so per-insn regions stay 8-aligned within one pool allocation). */
 static size_t insn_fields_pool_size(const InsnFields *f, bool with_names)
 {
-    size_t u64s = (size_t)f->n_dst_regs * 2 +        /* dst_dep + dst_lane */
-                  (size_t)f->max_dep_stores * 2 +    /* store_data + store_addr */
+    const size_t limbs = dep_limbs_for(f->n_src_regs, f->max_dep_loads);
+    size_t u64s = (size_t)f->n_dst_regs * (limbs + 1) + /* dst_dep + dst_lane */
+                  (size_t)f->max_dep_stores * (limbs + 1) + /* store_data + _addr */
                   (size_t)f->max_dep_loads +         /* load_addr */
                   (size_t)f->n_src_regs;             /* src_lane */
     size_t keys = with_names
@@ -659,9 +660,36 @@ static void insn_fields_pack(InsnFields *dst, const InsnFields *src,
         p += n;
         return d;
     };
-    dst->dst_dep_mask        = take_u64(src->dst_dep_mask, src->n_dst_regs);
-    dst->store_data_dep_mask = take_u64(src->store_data_dep_mask,
-                                        src->max_dep_stores);
+    /*
+     * The register dep masks repack from the source's stride (the scratch's
+     * widest, or a committed template's exact one) to the exact stride this
+     * instruction's position stack needs -- one limb unless a wide fan put
+     * a position past 64.  A limb the exact stride drops can hold no
+     * position, so nothing is lost; the assert says so.
+     */
+    const unsigned limbs = dep_limbs_for(src->n_src_regs, src->max_dep_loads);
+    g_assert(src->dep_limbs >= limbs);
+    auto take_dep = [&p, limbs](const uint64_t *sp, unsigned sstride,
+                                unsigned n) -> uint64_t * {
+        if (n == 0) {
+            return g_zero_mask64;
+        }
+        uint64_t *d = (uint64_t *)(void *)p;
+        for (unsigned i = 0; i < n; i++) {
+            memcpy(d + (size_t)i * limbs, sp + (size_t)i * sstride,
+                   (size_t)limbs * sizeof(uint64_t));
+            for (unsigned l = limbs; l < sstride; l++) {
+                g_assert(sp[(size_t)i * sstride + l] == 0);
+            }
+        }
+        p += (size_t)n * limbs * sizeof(uint64_t);
+        return d;
+    };
+    dst->dep_limbs           = (uint8_t)limbs;
+    dst->dst_dep_mask        = take_dep(src->dst_dep_mask, src->dep_limbs,
+                                        src->n_dst_regs);
+    dst->store_data_dep_mask = take_dep(src->store_data_dep_mask,
+                                        src->dep_limbs, src->max_dep_stores);
     dst->load_addr_dep_mask  = take_u64(src->load_addr_dep_mask,
                                         src->max_dep_loads);
     dst->store_addr_dep_mask = take_u64(src->store_addr_dep_mask,

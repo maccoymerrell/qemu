@@ -81,18 +81,25 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  * invariant that has to hold between them is static <= dynamic, asserted
  * below: a template-static slot must always be addressable on the wire.
  *
- * THE DEP MASKS ARE uint64_t, AND THAT IS A BOUND OF THIS WRITER, NOT OF
- * THE FORMAT (the masks are ULEBs on the wire).  A register mask stacks
- * n_src_regs + max_dep_loads + 1 (immediate) bit positions; with the
- * memop caps above the stack can run past 64, and a position that does
- * not fit has no bit to set.  Every producer and reader of a mask
- * position goes through dep_bit() (below), which answers 0 for such a
- * position rather than shifting past the width, and the producer counts
- * the member it could not place and withdraws the instruction's HAS_REG
- * block -- the consumer's all-to-all default is pessimistic, a mask with
- * a dependency missing is not.  InsnFieldsScratch's build-time arrays
- * are sized by these caps; committed templates are not (their spans are
- * exact-count), so the cost is one scratch per translating thread.
+ * THE REGISTER DEP MASKS ARE AS WIDE AS THE POSITIONS THEY INDEX.  A
+ * register mask (dst_dep / store_data_dep) stacks n_src_regs +
+ * max_dep_loads + 1 (immediate) bit positions, and with the memop caps
+ * above that stack runs to 320 -- aarch64 `ld4 {v5.16b-v8.16b}' puts its
+ * sixty-fourth element's bit past 64, x86 XRSTOR its ninety-eighth.  The
+ * wire's masks are ULEBs with no width of their own, so a mask is held as
+ * dep_limbs 64-bit limbs, least significant first (dep_limbs_for()):
+ * one limb for every instruction whose positions fit 64, which is every
+ * instruction without a wide fan and whose wire bytes are therefore
+ * those of a single uint64_t.  Row d of dst_dep_mask is the dep_limbs
+ * words at dst_dep_mask + d * dep_limbs; the same for store_data_dep_mask.
+ * Every producer and reader goes through dep_row() / dep_test() /
+ * dep_set() below, never through a bare shift.  InsnFieldsScratch's
+ * build-time arrays are sized by these caps at the widest stride;
+ * committed templates are not (their spans are exact-count, exact-stride),
+ * so the cost is one scratch per translating thread.
+ *
+ * The ADDRESS masks stay one uint64_t: their layout omits the load slots
+ * (n_src_regs + 1 positions), and n_src_regs is bounded by MAX_SRC_REGS.
  */
 #define MAX_SRC_REGS 64
 #define MAX_DST_REGS 64
@@ -108,12 +115,59 @@ static_assert(MAX_LOADS <= UINT8_MAX && MAX_STORES <= UINT8_MAX,
               "max_dep_loads / max_dep_stores are u8 on the wire");
 
 /*
- * Bit @pos of a uint64_t dependency mask, or 0 where the position is past
- * the mask's width (see the caps comment above).
+ * Bit @pos of a uint64_t mask, or 0 where the position is past its width.
+ * For the one-limb ADDRESS masks and lane masks; the register dep masks are
+ * multi-limb and use the dep_* accessors below.
  */
 static inline uint64_t dep_bit(unsigned pos)
 {
     return pos < 64 ? (uint64_t)1 << pos : 0;
+}
+
+/* The widest register-mask position stack, and its limb count. */
+#define DEP_MASK_MAX_POS    (MAX_SRC_REGS + MAX_LOADS + 1)
+#define DEP_MASK_MAX_LIMBS  ((DEP_MASK_MAX_POS + 63) / 64)
+
+/* Limbs a register mask needs for @n_src sources and @n_loads load slots
+ * (plus the immediate bit above them); never 0. */
+static inline unsigned dep_limbs_for(unsigned n_src, unsigned n_loads)
+{
+    return (n_src + n_loads + 1 + 63) / 64;
+}
+
+/* Is position @pos set in the @limbs-limb mask @row? */
+static inline bool dep_test(const uint64_t *row, unsigned limbs, unsigned pos)
+{
+    return pos / 64 < limbs && ((row[pos / 64] >> (pos % 64)) & 1);
+}
+
+/* Set position @pos; false (nothing set) if the mask has no such bit. */
+static inline bool dep_set(uint64_t *row, unsigned limbs, unsigned pos)
+{
+    if (pos / 64 >= limbs) {
+        return false;
+    }
+    row[pos / 64] |= (uint64_t)1 << (pos % 64);
+    return true;
+}
+
+static inline void dep_clear(uint64_t *row, unsigned limbs, unsigned pos)
+{
+    if (pos / 64 < limbs) {
+        row[pos / 64] &= ~((uint64_t)1 << (pos % 64));
+    }
+}
+
+/* Set bits of @row at positions [lo, hi). */
+static inline unsigned dep_count(const uint64_t *row, unsigned limbs,
+                                 unsigned lo, unsigned hi)
+{
+    unsigned n = 0;
+
+    for (unsigned p = lo; p < hi && p / 64 < limbs; p++) {
+        n += (unsigned)((row[p / 64] >> (p % 64)) & 1);
+    }
+    return n;
 }
 
 /*
@@ -202,11 +256,14 @@ typedef struct InsnFields {
      *   bits [n_src_regs, n_src_regs + max_dep_loads) load_data[i - n_src_regs]
      *   bit  n_src_regs + max_dep_loads               immediate
      *
-     * uint64_t so the imm bit fits when src + load slots stack up.
+     * Each mask is dep_limbs uint64_t limbs, least significant first,
+     * because the stack passes 64 on a wide fan (see the caps comment);
+     * dep_row() is row d's first limb.
      */
     bool     has_reg_deps;
-    uint64_t *dst_dep_mask;         /* [n_dst_regs] */
-    uint64_t *store_data_dep_mask;  /* [max_dep_stores] */
+    uint8_t  dep_limbs;
+    uint64_t *dst_dep_mask;         /* [n_dst_regs * dep_limbs] */
+    uint64_t *store_data_dep_mask;  /* [max_dep_stores * dep_limbs] */
     /*
      * Intra-instruction address dataflow (HAS_ADDR sub-block).
      * Per-memop mask of which template inputs feed its address
@@ -302,6 +359,17 @@ typedef struct InsnFields {
     uint8_t  rep_memops_per_iter;
 } InsnFields;
 
+/* Row @i of a register dep-mask family (dst_dep_mask / store_data_dep_mask). */
+static inline uint64_t *dep_row(uint64_t *base, const InsnFields *f, unsigned i)
+{
+    return base + (size_t)i * f->dep_limbs;
+}
+static inline const uint64_t *dep_row(const uint64_t *base,
+                                      const InsnFields *f, unsigned i)
+{
+    return base + (size_t)i * f->dep_limbs;
+}
+
 /*
  * Build-time backing for one InsnFields: full-size arrays for every span
  * so the operand walker and the dep/lane refiners (which append past the
@@ -317,8 +385,8 @@ typedef struct InsnFieldsScratch {
     InsnFields f;
     uint8_t  src_regs[MAX_SRC_REGS];
     uint8_t  dst_regs[MAX_DST_REGS];
-    uint64_t dst_dep_mask[MAX_DST_REGS];
-    uint64_t store_data_dep_mask[MAX_STORES];
+    uint64_t dst_dep_mask[MAX_DST_REGS * DEP_MASK_MAX_LIMBS];
+    uint64_t store_data_dep_mask[MAX_STORES * DEP_MASK_MAX_LIMBS];
     uint64_t load_addr_dep_mask[MAX_LOADS];
     uint64_t store_addr_dep_mask[MAX_STORES];
     uint64_t src_lane_mask[MAX_SRC_REGS];
@@ -328,6 +396,7 @@ typedef struct InsnFieldsScratch {
 static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
 {
     memset(s, 0, sizeof(*s));
+    s->f.dep_limbs           = DEP_MASK_MAX_LIMBS;
     s->f.src_regs            = s->src_regs;
     s->f.dst_regs            = s->dst_regs;
     s->f.dst_dep_mask        = s->dst_dep_mask;

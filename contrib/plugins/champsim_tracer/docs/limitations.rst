@@ -531,22 +531,6 @@ naturally aligned pieces of at most 16 bytes for exactly this reason
 (``arm_plugin_bulk_mem_cb``, ``docs/qemu_modifications.rst``).  What
 those families do run into is the slot ceiling below, not this one.
 
-**Register dependency masks are held in 64 bits by the writer.**  A
-load's bit in ``dst_dep`` sits at position ``n_src + k``, so an
-instruction with more than about 60 loads has load bits past 64.  The
-writer holds each mask as a ``uint64_t``; when a bit it must set does
-not fit, it withdraws the instruction's register dependency block
-(``HAS_REG`` clear — the all-to-all over-approximation, counted as
-``seating: dependency blocks withdrawn, mask position past 64``), and
-with it the per-memop register and lane association.  The instruction's
-memops are still all on the wire, each with its address, size and
-value.  The instructions this reaches are AArch64 ``ld4``/``st4`` of
-four 16-byte registers of bytes (64 accesses), RISC-V ``vle8.v`` /
-``vle16.v`` and their stores at QEMU's default ``VLEN`` (128 and 64
-accesses), and x86 ``XRSTOR`` (up to 98 loads).  The wire's masks are ULEBs with no width
-limit; the limit is the writer's and the decoder's, whose masks are
-the same width.
-
 **RISC-V V register groups are mapped through their base register.**
 A unit-stride ``vle<eew>.v`` / ``vse<eew>.v`` names the register group
 by its base, so the lane masks map the elements of the base register;

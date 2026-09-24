@@ -46,8 +46,8 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size);
  * itself must not reference softmmu-only symbols directly.
  */
 #ifdef CONFIG_PLUGIN
-void cpu_plugin_spec_vtime_pause(CPUState *cpu);
-void cpu_plugin_spec_vtime_resume(CPUState *cpu);
+void cpu_plugin_excursion_open(CPUState *cpu);
+void cpu_plugin_excursion_close(CPUState *cpu);
 #endif
 
 /**
@@ -111,9 +111,7 @@ extern unsigned long plugin_spec_reserve_exhausted;
  * get a TB because the code buffer was full.  The flag exists so that case
  * DECLINES instead of taking tb_gen_code's ordinary tb_flush + cpu_loop_exit
  * arm, which would longjmp out of the plugin callback the translation was
- * driven from.  Counted so the decline is a number and not a claim: it is the
- * difference between a guard that holds and a guard nothing ever reached.
- * Host-side, cross-vCPU, process-wide; read through
+ * driven from.  Host-side, cross-vCPU, process-wide; read through
  * qemu_plugin_decode_only_nobuf().
  */
 extern unsigned long plugin_decode_only_nobuf;

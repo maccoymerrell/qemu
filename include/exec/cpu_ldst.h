@@ -339,11 +339,11 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
      * or (loads) dereference an unmapped host pointer and SIGSEGV
      * the emulator instead of taking a guest fault.  Returning NULL
      * forces the slow cpu_{ld,st}*_mmuidx_ra path: stores land in
-     * the sandbox, loads fault as guest exceptions the wrong-path
-     * simulator already handles.  ISA-generic — covers every
-     * target's bulk/host-pointer helpers (ARM FEAT_MOPS, x86 string
-     * ops, vector gather/scatter, ...), not just the one that
-     * exposed it.
+     * the sandbox, and loads read through the sandbox overlay, with a
+     * deterministic placeholder for an unmapped page instead of a
+     * fault.  ISA-generic — covers every target's bulk/host-pointer
+     * helpers (ARM FEAT_MOPS, x86 string ops, vector gather/scatter,
+     * ...).
      */
     if (unlikely(env_cpu(env)->plugin_spec_mode)) {
         return NULL;

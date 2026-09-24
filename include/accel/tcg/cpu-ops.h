@@ -142,8 +142,8 @@ struct TCGCPUOps {
      * current privilege level (which a wrong-path walk can mis-observe).
      * Lets a plugin partition kernel from user code, seed a kernel/user bit
      * without trusting a speculated privilege level, and detect a
-     * privilege-domain crossing on a control transfer.  Read priv=0 targets
-     * (user-mode QEMU) do not register this hook, so the API reports "user".
+     * privilege-domain crossing on a control transfer.  In user mode the
+     * hook is not registered and the API reports "user".
      */
     bool (*vaddr_is_kernel)(CPUState *cpu, uint64_t vaddr);
 

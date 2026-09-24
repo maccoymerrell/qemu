@@ -48,6 +48,16 @@ static inline bool cpu_plugin_mem_cbs_enabled(const CPUState *cpu)
 TranslationBlock *tb_gen_code(CPUState *cpu, vaddr pc,
                               uint64_t cs_base, uint32_t flags,
                               int cflags);
+
+/*
+ * cpu-exec.c's lookup, execute and landing-pad cleanup, shared with the
+ * plugin entry points in plugin-exec.c.
+ */
+TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc, uint64_t cs_base,
+                            uint32_t flags, uint32_t cflags);
+TranslationBlock *cpu_tb_exec(CPUState *cpu, TranslationBlock *itb,
+                              int *tb_exit);
+void tcg_ctx_drop_gen_tb(void);
 void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);
@@ -84,19 +94,16 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
  * back to real memory for bytes not in the buffer.
  *
  * The buffer is a GHashTable keyed by line_addr = addr & ~63, with
- * value = PluginSpecLine* containing a 64-byte payload plus a 64-bit
- * valid_mask (bit k = byte k of this line has a speculative value).
- * Lines are bump-allocated from cpu->plugin_spec_store_pool to avoid
- * per-line g_malloc traffic; spec_mode_end clears the hash table and
- * resets pool_used = 0, retaining the underlying storage for reuse.
+ * value = pool index + 1 of a PluginSpecLine (never a pointer; the pool
+ * reallocs).  A line holds a 64-byte payload plus a 64-bit valid_mask
+ * (bit k = byte k of this line has a speculative value).  Lines are
+ * bump-allocated from cpu->plugin_spec_store_pool to avoid per-line
+ * g_malloc traffic; qemu_plugin_spec_mode_end() clears the hash table
+ * and resets pool_used = 0, retaining the underlying storage for reuse.
  *
- * Prior implementation keyed the hash table by individual byte
- * address, costing one g_hash_table_insert per byte stored and one
- * lookup per byte loaded.  On mcf with wp=1 wpdepth=64 memdata=1 the
- * per-byte hash ops were ~6% of total runtime.  The cache-line layout
- * makes a 64-byte vector store one map op + one memcpy, an 8-byte
- * store one map op + an 8-byte memcpy, and a load within a hit line
- * one map op + a single byte read with a bit test.
+ * The cache-line layout makes a 64-byte vector store one map op + one
+ * memcpy, an 8-byte store one map op + an 8-byte memcpy, and a load
+ * within a hit line one map op + a single byte read with a bit test.
  */
 #ifdef CONFIG_PLUGIN
 
@@ -119,8 +126,6 @@ static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
 {
     return cpu_plugin_spec_active(cpu);
 }
-
-/* spec_line_get_or_alloc is declared in include/exec/plugin-spec.h. */
 
 static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
 {
@@ -161,9 +166,8 @@ static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
 }
 
 /* Bulk store: stays within a single cache line in the common case
- * (size <= 16 for SIMD, naturally aligned).  Cross-line stores fall
- * back to per-line chunks; that path is rare on real workloads but
- * still O(size / 64) hash ops, not O(size) as before. */
+ * (size <= 16 for SIMD, naturally aligned).  Cross-line stores are
+ * split into per-line chunks, O(size / 64) hash ops. */
 static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
                                     const void *buf, int size)
 {
@@ -176,8 +180,8 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
 
         PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
         if (!line) {
-            /* Sandbox capped — drop remaining bytes.  See header
-             * comment on PLUGIN_SPEC_STORE_LINE_MAX. */
+            /* Sandbox capped — drop remaining bytes.  See
+             * PLUGIN_SPEC_STORE_LINE_MAX in exec/plugin-spec.h. */
             return;
         }
         memcpy(&line->bytes[idx], p, chunk);
@@ -226,10 +230,8 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
  * spec_store_bytes write nothing when the pool is capped; an atomic handed
  * the real pointer performs a real read-modify-write on real guest memory
  * from the wrong path — the precise mutation of architectural state this
- * sandbox exists to prevent, and one no rollback undoes.  The two are not
- * equivalent degradations, and both copies of atomic_mmu_lookup used to make
- * that trade (fixed in 56b89345b2, which this consolidates so the choice is
- * no longer at a caller's discretion).
+ * sandbox exists to prevent, and one no rollback undoes.  Keeping the choice
+ * here, rather than in each atomic_mmu_lookup, leaves no caller the option.
  */
 static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
                                        const void *real_host, int size)

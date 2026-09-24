@@ -410,16 +410,14 @@ void tb_lock_page0(tb_page_addr_t paddr)
     /*
      * Wrong-path (plugin speculative) translation must never BLOCK on a
      * page lock.  The excursion can hold process-wide state for its whole
-     * duration (on x86 it holds the BQL — see cpu_plugin_spec_vtime_pause),
+     * duration (on x86 it holds the BQL — see cpu_plugin_excursion_open),
      * while the current page-lock holder can be a sibling vCPU translating
      * REAL code: it holds its TB's page locks across translation and, inside
      * its translation-time plugin callback, waits for that same state
      * (cpu_plugin_vclock_pause takes the BQL).  That is a cross-vCPU
      * lock-order inversion (BQL -> page vs page -> BQL): one thread spins
      * in page_lock forever below every plugin callback while the other
-     * sleeps holding the page — the x86 -smp 2 marker-window freeze at
-     * segment open, where the post-flush retranslation storm and the
-     * cold-branch wrong-path storm collide on hot pages.  The wrong path
+     * sleeps holding the page.  The wrong path
      * is discardable by design, so it is the edge that yields: trylock,
      * and on contention abort the speculative translation through the
      * walker's landing pad (cpu_plugin_exec_tb), like any other wrong-path

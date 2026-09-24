@@ -372,8 +372,7 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
      * guarantee: a walk whose footprint exceeds it is cut short by
      * tb_gen_code returning NULL, at a depth set by how full the buffer
      * happened to be.  The wrong-path chain is therefore flush-invariant
-     * only while plugin_spec_reserve_exhausted stays zero, which is why
-     * that counter is exported rather than described.
+     * only while plugin_spec_reserve_exhausted stays zero.
      */
     {
         size_t reserve = s->code_gen_buffer_size / 4;

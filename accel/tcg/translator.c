@@ -15,7 +15,7 @@
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
 #include "qemu/plugin.h"
-#include "qemu/cst_bqslice.h"
+#include "qemu/tcg-slice.h"
 #include "exec/cpu_ldst.h"
 #include "exec/tswap.h"
 #include "tcg/tcg-op-common.h"
@@ -48,18 +48,19 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
     TCGv_i32 count = NULL;
     TCGOp *icount_start_insn = NULL;
     /*
-     * CST_BUDGET_QUANTUM (knob A): emit the SAME budget prologue icount
-     * emits (the sub below and the st16 back to icount_decr.u16.low),
+     * Slice billing (see include/qemu/tcg-slice.h): emit the SAME
+     * budget prologue icount emits (the sub below and the st16 back to icount_decr.u16.low),
      * on the default clock, with no other CF_USE_ICOUNT effect.  The
      * exit check against u32 < 0 is the EXISTING !CF_NOIRQ check --
      * unchanged.  CF_NOIRQ TBs are not billed: icount may bill them
      * because higher-level code guarantees budget (and the replay
      * exception step strips CF_USE_ICOUNT); off-icount an unchecked sub
-     * would wrap u16.low.  The knob is translate-time-global (set before
-     * any translation, constant for the run), so every cached TB agrees.
-     * See include/qemu/cst_bqslice.h.
+     * would wrap u16.low.  Slice billing is translate-time-global (armed
+     * before any translation, constant for the run), so every cached TB
+     * agrees.
      */
-    bool cst_bq_bill = cst_bq_on && !(cflags & (CF_USE_ICOUNT | CF_NOIRQ));
+    bool tcg_slice_bill = tcg_slice_armed &&
+                          !(cflags & (CF_USE_ICOUNT | CF_NOIRQ));
 
     if ((cflags & CF_USE_ICOUNT) || !(cflags & CF_NOIRQ)) {
         count = tcg_temp_new_i32();
@@ -68,7 +69,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
                        - offsetof(ArchCPU, env));
     }
 
-    if ((cflags & CF_USE_ICOUNT) || cst_bq_bill) {
+    if ((cflags & CF_USE_ICOUNT) || tcg_slice_bill) {
         /*
          * We emit a sub with a dummy immediate argument. Keep the insn index
          * of the sub so that we later (when we know the actual insn count)
@@ -92,7 +93,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
         tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, tcg_ctx->exitreq_label);
     }
 
-    if ((cflags & CF_USE_ICOUNT) || cst_bq_bill) {
+    if ((cflags & CF_USE_ICOUNT) || tcg_slice_bill) {
         tcg_gen_st16_i32(count, tcg_env,
                          offsetof(ArchCPU, parent_obj.neg.icount_decr.u16.low)
                          - offsetof(ArchCPU, env));
@@ -108,9 +109,8 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
         /*
          * Update the num_insn immediate parameter now that we know
          * the actual insn count.  Non-NULL exactly when gen_tb_start
-         * emitted the budget sub: always under CF_USE_ICOUNT (identical
-         * to the old CF_USE_ICOUNT test), and under CST_BUDGET_QUANTUM
-         * (knob A) billing.
+         * emitted the budget sub: always under CF_USE_ICOUNT, and under
+         * slice billing.
          */
         tcg_set_insn_param(icount_start_insn, 2,
                            tcgv_i32_arg(tcg_constant_i32(num_insns)));
@@ -140,9 +140,9 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
 /*
  * NEVER-SPLIT (atomic) CODE SEQUENCES — plugin-registered byte patterns
- * the translator keeps whole inside one TB (ChampSim Tracer marker
- * sequences; see qemu_plugin_register_nosplit_code_sequences and
- * docs/qemu_modifications.rst).
+ * the translator keeps whole inside one TB (for example a tracing
+ * plugin's marker sequences; see
+ * qemu_plugin_register_nosplit_code_sequences).
  *
  * At every CLEAN TB-end decision (DISAS_TOO_MANY: page boundary, budget,
  * single-step — never a real control transfer), the translated tail is
@@ -191,7 +191,7 @@ static bool translator_nosplit_read(const DisasContextBase *db, void *dest,
 }
 
 /*
- * v4 repair (maintainer-vetoable): the stop-decision verdict.
+ * Never-split: the stop-decision verdict.
  *
  * EXTEND  — the tail is a proper prefix of a registered sequence and the
  *           continuation is representable: rescind the stop and continue
@@ -264,8 +264,7 @@ static NosplitVerdict translator_nosplit_continue(const DisasContextBase *db,
 }
 
 /*
- * v4 repair (maintainer-vetoable): per-insn boundary records for the
- * never-split RETREAT.  A sequence prefix is at most seq_len-1 < 64
+ * Per-insn boundary records for the never-split RETREAT.  A sequence prefix is at most seq_len-1 < 64
  * bytes, instructions are at least one byte, so the last 64 boundaries
  * always cover any retreat point.  Records are only maintained while
  * never-split sequences are registered.
@@ -374,8 +373,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     while (true) {
         *max_insns = ++db->num_insns;
         if (nosplit_active) {
-            /* v4 repair: record this insn's boundary for a possible
-             * never-split RETREAT (see translator_nosplit_retreat). */
+            /* Record this insn's boundary for a possible never-split
+             * RETREAT (see translator_nosplit_retreat). */
             NosplitInsnRec *r =
                 &nosplit_ring[(db->num_insns - 1) % NOSPLIT_RING_LEN];
             r->pc = db->pc_next;
@@ -423,13 +422,12 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
              * control transfers are never DISAS_TOO_MANY and never
              * continue.
              *
-             * v4 repair (maintainer-vetoable), refuse-once semantics:
-             * a re-arm at a pc where a previous re-arm made no progress
-             * is a target refusal that persists; together with op-buffer
-             * pressure it is a HARD refusal, and a hard refusal mid-
-             * sequence RETREATS — ends the TB before the sequence's
-             * first insn — instead of re-arming (the old re-arm spin)
-             * or splitting the sequence. */
+             * Refuse-once semantics: a re-arm at a pc where a previous
+             * re-arm made no progress is a target refusal that persists;
+             * together with op-buffer pressure it is a HARD refusal, and
+             * a hard refusal mid-sequence RETREATS — ends the TB before
+             * the sequence's first insn — instead of re-arming or
+             * splitting the sequence. */
             if (db->is_jmp == DISAS_TOO_MANY && nosplit_active) {
                 vaddr seq_start = 0;
                 NosplitVerdict v =
@@ -465,10 +463,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
              * at most the ORIGINAL budget so an icount slice cannot
              * livelock on a TB it can never afford.
              *
-             * v4 repair: a hard refusal mid-sequence (op-buffer
-             * pressure, CF_COUNT_MASK ceiling) RETREATS instead of
-             * splitting, so budget-and-boundary collisions no longer
-             * split fixed-width straddles. */
+             * A hard refusal mid-sequence (op-buffer pressure,
+             * CF_COUNT_MASK ceiling) RETREATS instead of splitting, so a
+             * budget-and-boundary collision does not split a fixed-width
+             * straddle. */
             NosplitVerdict v = NOSPLIT_NO_MATCH;
             vaddr seq_start = 0;
             if (nosplit_active) {

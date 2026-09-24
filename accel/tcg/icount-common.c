@@ -512,9 +512,7 @@ void icount_notify_exit(void)
  * in-flight), i.e. a pure function of retired instructions.  A wrong-path
  * excursion retires instructions, so without this the excursion advances
  * guest time in direct proportion to the speculation depth -- the icount
- * analogue of the wall-clock leak, and the reason -icount both hid the
- * stall (its deterministic scheduling serialises the iothread) and
- * overshot the physically-correct tick count.
+ * analogue of the wall-clock leak.
  *
  * Freeze captures the position; thaw puts it back.  Both halves of the
  * position must be handled: the per-vCPU in-flight counters

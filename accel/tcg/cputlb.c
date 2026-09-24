@@ -1063,35 +1063,27 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
 #ifdef CONFIG_PLUGIN
 /*
  * Record a TLB entry installed by a wrong-path (speculative) excursion so
- * cpu_plugin_spec_tlb_flush() can invalidate just these pages on exit instead
- * of flushing the whole TLB.  De-duplicated; a large page or overflow sets the
- * overflow flag to force a full flush fallback.
+ * cpu_plugin_spec_tlb_flush() (through cpu_plugin_spec_tlb_flush_logged())
+ * can invalidate just these pages on exit instead of flushing the whole TLB.
+ * De-duplicated; only log overflow sets the overflow flag that forces the
+ * full-flush fallback.
+ *
+ * A large-page install needs no escalation.  QEMU's softmmu TLB holds one
+ * entry per TARGET_PAGE whatever the guest's page size, so a large-page
+ * install still creates exactly one entry, at addr_page, and that is the only
+ * thing the excursion has to take back.  What the large page affects is the
+ * per-mmu_idx large_page_addr / large_page_mask bookkeeping that
+ * tlb_flush_page_locked consults to decide whether a page flush must
+ * escalate; that pair is snapshotted at excursion entry and restored at exit
+ * (cpu_plugin_spec_tlb_note / cpu_plugin_spec_tlb_flush_logged), so a
+ * wrong-path install cannot widen the correct path's escalation region
+ * either.
  */
-static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
-                                    bool large_page)
+static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page)
 {
     if (cpu->plugin_spec_tlb_log_overflow) {
         return;
     }
-    /*
-     * A large-page install used to force the overflow fallback: a full
-     * tlb_flush() of every mmu_idx plus the jump cache, on excursion exit.
-     * On x86-64 the kernel direct map and kernel text are 2 MiB mappings, so
-     * essentially every wrong-path walk touches one -- measured, 96% of
-     * excursions ended in the full flush this selective path exists to avoid.
-     *
-     * The escalation was never needed for the entries the walk INSTALLED.
-     * QEMU's softmmu TLB holds one entry per TARGET_PAGE whatever the guest's
-     * page size, so a large-page install still creates exactly one entry, at
-     * addr_page, and that is the only thing the excursion has to take back.
-     * What the large page really affects is the per-mmu_idx large_page_addr /
-     * large_page_mask bookkeeping that tlb_flush_page_locked consults to decide
-     * whether a page flush must escalate; that pair is snapshotted at excursion
-     * entry and restored at exit (cpu_plugin_spec_tlb_note /
-     * cpu_plugin_spec_tlb_flush_logged), so a wrong-path install cannot widen
-     * the correct path's escalation region either.
-     */
-    (void)large_page;
     for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
         if (cpu->plugin_spec_tlb_log[i].page == page &&
             cpu->plugin_spec_tlb_log[i].mmu_idx == mmu_idx) {
@@ -1106,36 +1098,16 @@ static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
     cpu->plugin_spec_tlb_log[cpu->plugin_spec_tlb_log_n].mmu_idx = mmu_idx;
     cpu->plugin_spec_tlb_log_n++;
 }
-#endif
 
-#ifdef CONFIG_PLUGIN
 /*
  * Snapshot the per-mmu_idx large-page escalation region at excursion entry.
  * tlb_add_large_page() only ever WIDENS it, so a wrong-path install would
  * widen it permanently and escalate unrelated correct-path page flushes into
  * full flushes long after the walk was discarded.
  *
- * The save lives in the vCPU's own CPUTLBDesc/CPUTLBCommon.  It used to live
- * in file-scope arrays -- one set for the whole machine, holding a value that
- * is per-vCPU and per-mmu_idx.  Two vCPUs inside an excursion at the same
- * time would have interleaved as note(A), note(B), flush(A), flush(B): A's
- * restore installs B's large-page region into A's descriptors, and since a
- * region can be NARROWER, a later flush of a page inside A's true region
- * stops escalating and stale entries survive it; B, whose saved flag A's
- * restore already cleared, is never restored at all and keeps the widening
- * the save exists to undo.
- *
- * THAT INTERLEAVING CANNOT HAPPEN TODAY, and this is not a bug report: the
- * ChampSim Tracer runs its wrong-path walk synchronously inside
- * emit_finalized_bb while holding exec_lock, which is machine-wide, so a peer
- * vCPU's vcpu_tb_exec blocks there and no second excursion can open.  The
- * defect was never observed and cannot be, on any target, while that
- * serialisation holds.  It is corrected anyway because the storage class was
- * simply wrong for the datum -- the arrays were found by an exhaustive diff
- * of every writable global in the QEMU executable across an excursion, where
- * they were the only entry not accounted for by the diff's own bracket -- and
- * because the containment path must not depend on a plugin-side lock for its
- * per-vCPU state to stay separate.
+ * The save lives in the vCPU's own CPUTLBDesc/CPUTLBCommon, per-vCPU and
+ * per-mmu_idx like the values it shadows, so concurrent excursions on
+ * different vCPUs cannot cross-restore each other's region.
  */
 void cpu_plugin_spec_tlb_note(CPUState *cpu)
 {
@@ -1161,7 +1133,7 @@ void cpu_plugin_spec_tlb_note(CPUState *cpu)
  *
  * The JUMP-CACHE half of tlb_flush_page_by_mmuidx_async_0 -- its two
  * tb_jmp_cache_clear_page() calls -- is deliberately absent, and the asymmetry
- * is not an omission (#124).  That clear exists because an ordinary page flush
+ * is not an omission.  That clear exists because an ordinary page flush
  * is issued when the guest CHANGES a virtual-to-physical mapping (invlpg, a
  * CR3 write, a shootdown), which can leave the jump cache holding a TB
  * translated from the page's OLD physical contents; the jump cache is keyed on
@@ -1187,9 +1159,8 @@ void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
         int midx = cpu->plugin_spec_tlb_log[i].mmu_idx;
         vaddr page = cpu->plugin_spec_tlb_log[i].page;
 
-        if (midx < 0 || midx >= NB_MMU_MODES) {
-            continue;
-        }
+        /* Logged only by tlb_set_page_full, with its validated mmu_idx. */
+        tcg_debug_assert(midx >= 0 && midx < NB_MMU_MODES);
         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
             tlb_n_used_entries_dec(cpu, midx);
         }
@@ -1245,8 +1216,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * exit (see CPUState::plugin_spec_tlb_log), avoiding a full flush.
      */
     if (unlikely(cpu_plugin_spec_active(cpu))) {
-        plugin_spec_tlb_log_add(cpu, mmu_idx, addr_page,
-                                full->lg_page_size > TARGET_PAGE_BITS);
+        plugin_spec_tlb_log_add(cpu, mmu_idx, addr_page);
     }
 #endif
 
@@ -1331,7 +1301,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * Only evict the old entry to the victim tlb if it's for a
      * different page; otherwise just overwrite the stale data.
      *
-     * Wrong-path (#77): skip the victim-tlb WRITE.  Preserving the displaced
+     * Wrong-path: skip the victim-tlb WRITE.  Preserving the displaced
      * entry so a future lookup can re-promote it is pure softmmu housekeeping
      * -- it is not needed to translate the speculative access, and it mutates
      * persistent victim-TLB state (vindex, vtable, vfulltlb) that the spec
@@ -1344,23 +1314,11 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * only -- a victim-TLB entry is not counted, which is precisely why the
      * eviction decrements it -- so the decrement records "this slot's previous
      * tenant is gone", which is equally true when the tenant is destroyed
-     * rather than preserved.  Skipping it made a speculative install account
-     * differently from the correct-path install of the same page into the same
-     * occupied slot: the spec path incremented with no matching decrement, and
-     * cpu_plugin_spec_tlb_flush_logged then decremented once at excursion exit
-     * when it cleared the slot, leaving the counter one ABOVE the occupancy it
-     * describes, cumulatively, until the next full flush of that mmu_idx reset
-     * it.  n_used_entries feeds only tlb_mmu_resize_locked, so the consequence
-     * is a table grown on a fictitious occupancy rate -- it reaches nothing the
-     * guest computes -- but the containment's rule is that it must not change
-     * what the correct path would have counted, and this changed it.
-     *
-     * Measured, x86_64 system marker cell, 16384 excursions: 10251 speculative
-     * installs displaced a live entry for a different page, and the per-
-     * excursion drift between n_used_entries and a recount of the occupied
-     * slots was non-zero on 4757 of them (sum of |drift| 19672).  With the
-     * decrement restored: 607 and 1331, both signs, from causes this hunk does
-     * not address and does not claim to.
+     * rather than preserved.  A speculative install therefore accounts
+     * exactly as the correct-path install of the same page into the same
+     * occupied slot does, and cpu_plugin_spec_tlb_flush_logged's decrement at
+     * excursion exit balances the install's increment; the containment must
+     * not change what the correct path would have counted.
      */
     if (!tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
         if (!cpu_plugin_spec_active(cpu)) {
@@ -1502,12 +1460,12 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     /*
      * Plugin wrong-path (speculative) execution must neither raise a guest
      * fault nor demand-page: a speculative access to an absent/ill-aligned
-     * page is a dead end, not a real architectural fault.  Force probe so
-     * the target walker reports the miss instead of raising, and remember
-     * the caller's real intent so a genuine (non-probe) wrong-path miss
-     * aborts the chain below.  This mirrors the user-mode path, where
-     * cpu_loop_exit_sigsegv() longjmps out instead of queuing a guest
-     * signal under plugin_spec_mode.
+     * page is not a real architectural fault.  Force probe so the target
+     * walker reports the miss instead of raising, and remember the caller's
+     * real intent: a genuine (non-probe) wrong-path miss sets
+     * plugin_spec_absent and returns false below, and the caller substitutes
+     * placeholder bytes.  User mode does the same, garbage-filling a
+     * wrong-path access to an unmapped page.
      */
     bool spec_real_access = cpu_plugin_spec_active(cpu) && !probe;
     if (spec_real_access) {
@@ -1605,7 +1563,7 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     assert_cpu_is_self(cpu);
 #ifdef CONFIG_PLUGIN
     /*
-     * Wrong-path (#77): never promote a victim-tlb entry into the main TLB.
+     * Wrong-path: never promote a victim-tlb entry into the main TLB.
      * The promotion swaps entries between the victim and main tables -- pure
      * housekeeping that mutates persistent TLB state the spec containment can't
      * revert.  Returning false makes the caller re-fill via tlb_fill instead,
@@ -2034,6 +1992,22 @@ typedef struct MMULookupPageData {
     int size;
 } MMULookupPageData;
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Plugin wrong-path (speculative) synthetic flag.  Set ONLY in
+ * MMULookupPageData.flags (never in a real CPUTLBEntry address) by
+ * mmu_lookup1 when a speculative access hit an absent page: tlb_fill_align
+ * declined to raise or demand-page and signalled cpu->plugin_spec_absent.
+ * The load path then substitutes deterministic placeholder bytes rather
+ * than dereferencing the (stale/invalid) host pointer, and the wrong-path
+ * excursion continues.  Chosen well above the fast/slow flag bits packed
+ * near TARGET_PAGE_BITS_MIN so it can never collide with them or with an
+ * address bit that reaches these flags.
+ */
+#define TLB_SPEC_ABSENT      (1 << 18)
+QEMU_BUILD_BUG_ON(TLB_SPEC_ABSENT & (TLB_FLAGS_MASK | TLB_SLOW_FLAGS_MASK));
+#endif
+
 typedef struct MMULookupLocals {
     MMULookupPageData page[2];
     MemOp memop;
@@ -2150,10 +2124,11 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
      * Wrong-path (speculative): a watchpoint hit (cpu_check_watchpoint) sets
      * watchpoint_hit / wp->flags, raises CPU_INTERRUPT_DEBUG and can invalidate
      * the current TB; notdirty_write marks a clean page dirty and can
-     * invalidate a code TB -- persistent state outside the WP register
-     * snapshot.  The store/probe entrypoints already gate before mmu_lookup,
-     * but the slow LOAD path reaches here for a read/access watchpoint, so
-     * clear the flags without the side effect on the discarded path.
+     * invalidate a code TB -- persistent state outside the wrong-path
+     * register snapshot.  The store/probe entrypoints already gate before
+     * mmu_lookup, but the slow LOAD path reaches here for a read/access
+     * watchpoint, so clear the flags without the side effect on the
+     * discarded path.
      */
     if (cpu_plugin_spec_active(cpu)) {
         data->flags &= ~(TLB_WATCHPOINT | TLB_NOTDIRTY);
@@ -2265,7 +2240,7 @@ static void *spec_atomic_absent(CPUState *cpu, vaddr addr, int size,
     if (addr & (size - 1)) {
         /* Guest atomics are naturally aligned; a garbage-unaligned wrong-path
          * address is pathological — take the world-stop the non-spec path would
-         * (a graceful-stop via the WP walker), rather than mis-shadowing. */
+         * (a graceful stop of the wrong-path walk), rather than mis-shadowing. */
         cpu_loop_exit_atomic(cpu, retaddr);
     }
     uint8_t garbage[16];
@@ -2871,7 +2846,11 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                 ret = bswap16(ret);
             }
         }
-        /* Overlay speculative bytes (host endian at this point) */
+        /*
+         * Overlay speculative bytes.  spec_load_bytes treats the buffer
+         * as memory-order bytes at p->addr; @ret is already in value order
+         * here, so for a MO_BSWAP load the two orders differ.
+         */
         uint16_t src_val = ret;
         uint16_t out_val;
         spec_load_bytes(cpu, p->addr, &src_val, &out_val, 2);
@@ -3232,16 +3211,13 @@ static uint64_t do_st_leN(CPUState *cpu, MMULookupPageData *p,
 
 #ifdef CONFIG_PLUGIN
     /*
-     * Plugin wrong-path (speculative) execution: this is the bulk /
-     * cross-page store path (do_st4/8/16 route here when an access
-     * spans a page, and store_helper's general leN path).  Unlike the
-     * fixed-width do_st_1..16 it had no spec gate, so a speculative
-     * cross-page store landed straight in guest RAM via the
-     * store_*_leN host-pointer writes below — escaping the per-vCPU
-     * store sandbox and corrupting real memory (e.g. guest page
-     * tables) that the WP rollback cannot undo.  Sandbox the low
-     * p->size bytes here and return the unconsumed remainder, exactly
-     * as the TLB_DISCARD_WRITE path does. */
+     * Plugin wrong-path (speculative) execution.  Every current caller
+     * (do_st4/8/16_mmu) buffers a wrong-path store before mmu_lookup and
+     * never reaches here in spec mode; this gate keeps any other route
+     * from writing guest RAM through the store_*_leN host-pointer writes
+     * below.  It sandboxes the low p->size bytes and returns the
+     * unconsumed remainder, exactly as the TLB_DISCARD_WRITE path does.
+     */
     if (cpu_plugin_spec_active(cpu)) {
         uint64_t v = val_le;
         spec_store_bytes(cpu, p->addr, &v, p->size);
@@ -3304,8 +3280,8 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
 
 #ifdef CONFIG_PLUGIN
-    /* Wrong-path containment: same missing-gate gap as do_st_leN, for
-     * the 8<size<=16 cross-page path (e.g. a page-straddling STP). */
+    /* Wrong-path containment: the do_st_leN gate, for the 8<size<=16
+     * cross-page path (e.g. a page-straddling STP). */
     if (cpu_plugin_spec_active(cpu)) {
         uint64_t lo = int128_getlo(val_le), hi = int128_gethi(val_le);
         unsigned nlo = size < 8 ? size : 8;

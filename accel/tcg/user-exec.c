@@ -38,7 +38,6 @@
 #include "internal-common.h"
 #include "internal-target.h"
 #include "tb-internal.h"
-#include "qemu/qemu-plugin.h"
 #include "qemu/plugin.h"
 
 __thread uintptr_t helper_retaddr;
@@ -965,7 +964,7 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
      * no callback at all.  Answer as the softmmu probe does, with NULL, so
      * the helper takes its per-unit cpu_ld/st path, which reports every
      * access.  Without plugin memory callbacks the flag is never set and
-     * the host pointer is returned as before.
+     * the host pointer is returned.
      */
     if (flags & TLB_MMIO) {
         return NULL;

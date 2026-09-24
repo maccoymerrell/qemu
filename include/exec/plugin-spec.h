@@ -23,20 +23,18 @@
 #define PLUGIN_SPEC_LINE_SIZE  (1u << PLUGIN_SPEC_LINE_SHIFT)
 #define PLUGIN_SPEC_LINE_MASK  (PLUGIN_SPEC_LINE_SIZE - 1u)
 
-/* Sandbox grows up to this many lines per vCPU (each 80 bytes ≈ 80 MiB
- * at the cap) before further speculative stores are dropped.  Matches
- * the prior per-byte buffer's overflow semantics — see the AArch64
- * FEAT_MOPS / x86 REP-on-garbage-size case comment in
- * accel/tcg/internal-common.h. */
+/* Hard cap: the sandbox grows up to this many lines per vCPU (each
+ * 80 bytes, ≈ 80 MiB at the cap); once it is reached, further
+ * speculative stores are dropped rather than buffered. */
 #define PLUGIN_SPEC_STORE_LINE_MAX (1u << 20)
 
-/* Soft per-excursion budget (≈ 16 MiB of lines).  A normal wrong-path excursion
- * (wpdepth-bounded, ~hundreds of lines) never approaches this; crossing it means
+/* Soft per-excursion budget (≈ 20 MiB of lines).  A normal wrong-path excursion
+ * (depth-bounded, ~hundreds of lines) never approaches this; crossing it means
  * a single instruction wrote a garbage-size region into the sandbox without
  * faulting (AArch64 FEAT_MOPS / x86 REP / vector with a wrong-path-garbage
- * size/count).  The allocator flags it and the WP loop terminates the excursion,
- * so the hard cap above is never reached and speculative stores are never
- * silently dropped in normal operation. */
+ * size/count).  The allocator flags it (qemu_plugin_spec_store_overflowed) so
+ * the plugin driving the excursion can end it before the hard cap above starts
+ * dropping speculative stores. */
 #define PLUGIN_SPEC_STORE_SOFT_BUDGET (1u << 18)
 
 /*

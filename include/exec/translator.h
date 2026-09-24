@@ -74,10 +74,10 @@ struct DisasContextBase {
     bool plugin_enabled;
     bool fake_insn;
     /*
-     * v4 repair (maintainer-vetoable): true while a never-split
-     * (plugin-registered atomic sequence) extension is active in this
-     * translation.  Targets may relax their own mid-TB page-crossing
-     * refusals while set — never beyond the TB's two-page window.
+     * True while a never-split (plugin-registered atomic sequence)
+     * extension is active in this translation.  Targets may relax their
+     * own mid-TB page-crossing refusals while set — never beyond the
+     * TB's two-page window.
      * False for every ordinary translation, so stock behaviour is
      * byte-identical when no sequence prefix has been matched.
      */
@@ -131,10 +131,10 @@ typedef struct TranslatorOps {
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
 
     /*
-     * v4 repair (maintainer-vetoable): never-split retreat support.
-     * Both hooks are optional and are only consulted when never-split
-     * sequences are registered (a plugin feature; see
-     * translator_nosplit_continue in accel/tcg/translator.c).
+     * Never-split retreat support.  Both hooks are optional and are
+     * only consulted when never-split sequences are registered (a
+     * plugin feature; see translator_nosplit_continue in
+     * accel/tcg/translator.c).
      *
      * @nosplit_checkpoint: called once per instruction, before
      * insn_start, to capture a target-private state word for a possible

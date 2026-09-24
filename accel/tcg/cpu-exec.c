@@ -1554,7 +1554,7 @@ static bool     g_wprot_active = false;
  * that consumes it are two halves of one vCPU's excursion.  File scope was
  * the wrong storage class for that datum and every other per-excursion
  * static in this file is already __thread (g_spec_icount_freeze,
- * g_clkeq_pause, g_clkaudit_pause, the clkprobe accumulators, the sdiff
+ * g_clkaudit_pause, the clkprobe accumulators, the sdiff
  * buffers).  Shared, two vCPUs cross: A's pause sets it and keeps the BQL,
  * B's resume reads A's flag as its own and reaches bql_unlock() without
  * holding the lock, while A's own resume then sees it false and never
@@ -2009,122 +2009,12 @@ static bool cst_nofreeze(void)
 }
 
 /*
- * CST_CLKEQ (#77 falsifier): the excursion's defining requirement, measured.
- * On return from a wrong path the guest virtual clock must read what it read
- * when the excursion began -- not merely have been unfrozen, but be back at
- * the pause-point value.  Sample it three times and name which half failed:
- *
- *   ADVANCED   the clock moved while the excursion was open: the freeze was
- *              not in effect for the whole window (a peer vCPU's plugin
- *              window restarting the global clock is how that happens).
- *   NOTRESTORED  the clock did not come back to the pause-point value across
- *              the thaw and the per-target resync.
- *
- * Positive control: CST_NOFREEZE / CST_NO_VTPAUSE deliberately skip the
- * freeze, so every excursion must report ADVANCED under them.  A run with the
- * instrument armed and that arm set which reports nothing has a broken
- * instrument, not a clean clock.
- */
-static __thread int64_t g_clkeq_pause;
-static bool cst_clkeq_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        on = getenv("CST_CLKEQ") != NULL;
-    }
-    return on > 0;
-}
-static void cst_clkeq_note_pause(void)
-{
-    if (cst_clkeq_on()) {
-        g_clkeq_pause = cpu_get_clock();
-    }
-}
-static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
-{
-    if (!cst_clkeq_on()) {
-        return;
-    }
-    int64_t post = cpu_get_clock();
-    static __thread uint64_t n_adv, n_not;
-    if (pre_thaw != g_clkeq_pause) {
-        n_adv++;
-        if ((n_adv & (n_adv - 1)) == 0) {   /* powers of two: bound the spam */
-            fprintf(stderr, "[clkeq] cpu%d ADVANCED field=QEMU_CLOCK_VIRTUAL "
-                    "pause=%" PRId64 " in_excursion=%" PRId64 " delta=%" PRId64
-                    "ns n=%" PRIu64 "\n", cpu->cpu_index, g_clkeq_pause,
-                    pre_thaw, pre_thaw - g_clkeq_pause, n_adv);
-            fflush(stderr);
-        }
-    }
-    if (post != g_clkeq_pause) {
-        n_not++;
-        if ((n_not & (n_not - 1)) == 0) {
-            fprintf(stderr, "[clkeq] cpu%d NOTRESTORED field=QEMU_CLOCK_VIRTUAL "
-                    "pause=%" PRId64 " resume=%" PRId64 " delta=%" PRId64
-                    "ns n=%" PRIu64 "\n", cpu->cpu_index, g_clkeq_pause, post,
-                    post - g_clkeq_pause, n_not);
-            fflush(stderr);
-        }
-    }
-    /*
-     * The CONDITION, reported next to the outcome: how many plugin freezes so
-     * far ended with every remaining freeze held by a DIFFERENT vCPU.  Each is
-     * an occasion on which a per-vCPU thaw would have restarted the guest clock
-     * inside a peer's window, so a large figure alongside zero ADVANCED lines
-     * is the measurement that the machine-wide reference count is what holds
-     * the requirement, not luck.
-     *
-     * The count that gates this line is per-vCPU-thread, so the period has to
-     * be chosen against the excursions ONE vCPU takes, not the machine's total.
-     * A fixed 20000 silently reports nothing on exactly the cells the peer
-     * figure exists for: an x86_64 -smp 4 marker cell taking 20587 excursions
-     * spread over four vCPUs printed no line at all, so peer_only_thaws -- the
-     * only readout of the condition -- was unavailable on an SMP run, which is
-     * where the condition lives.  CST_CLKEQ_EVERY sets the period; at 500 the
-     * same cell reports it, and reads 528694.
-     *
-     * A period that cannot be used is SAID, not swapped in silence.  An
-     * operator who asks for a period and is given a different one without
-     * being told reads the resulting lines as answering the question they
-     * set, which is the same misreading the fixed 20000 produced.  The
-     * period is per-vCPU-thread like the count it gates, so a thread reads
-     * the environment once and the refusal is announced once per process.
-     */
-#define CST_CLKEQ_EVERY_DEFAULT 20000
-    static __thread uint64_t n_excursions;
-    static __thread int every = -1;
-    if (every < 0) {
-        const char *s = getenv("CST_CLKEQ_EVERY");
-        every = s ? atoi(s) : CST_CLKEQ_EVERY_DEFAULT;
-        if (every <= 0) {
-            static int refusal_announced;
-            if (qatomic_xchg(&refusal_announced, 1) == 0) {
-                fprintf(stderr, "[clkeq] CST_CLKEQ_EVERY=\"%s\" is not a "
-                        "positive period; refused, reporting every %d "
-                        "excursions per vcpu instead\n",
-                        s ? s : "", CST_CLKEQ_EVERY_DEFAULT);
-                fflush(stderr);
-            }
-            every = CST_CLKEQ_EVERY_DEFAULT;
-        }
-    }
-    if ((++n_excursions % (unsigned)every) == 0) {
-        fprintf(stderr, "[clkeq] cpu%d excursions=%" PRIu64 " advanced=%" PRIu64
-                " notrestored=%" PRIu64 " peer_only_thaws=%" PRIu64 "\n",
-                cpu->cpu_index, n_excursions, n_adv, n_not,
-                cpu_plugin_ticks_peer_only_thaws());
-        fflush(stderr);
-    }
-}
-
-/*
  * CST_CLKAUDIT: can a guest observe ANY time discontinuity across a wrong-path
  * excursion?  Answered by enumerating the sources rather than by checking the
  * ones we thought of.
  *
- * cst_clkeq above samples ONE field, QEMU_CLOCK_VIRTUAL.  A zero from it is a
- * statement about that field and nothing else, and a guest has more than one
+ * An instrument that samples ONE field reports a zero about that field and
+ * nothing else, and a guest has more than one
  * clock: on x86 alone the kernel reads the TSC, the HPET, the ACPI PM timer,
  * the LAPIC current-count, the PIT and the CMOS RTC, and its clocksource
  * watchdog exists precisely to cross-check one against another.  A per-field
@@ -2208,7 +2098,8 @@ static bool cst_clkaudit_on(void)
 {
     static int on = -1;
     if (on < 0) {
-        on = getenv("CST_CLKAUDIT") != NULL;
+        /* CST_CLKEQ: compatibility alias, folded per 2026-09-24 adjudication */
+        on = getenv("CST_CLKAUDIT") != NULL || getenv("CST_CLKEQ") != NULL;
     }
     return on > 0;
 }
@@ -2328,6 +2219,58 @@ static void cst_clkaudit_check(CPUState *cpu,
                 fflush(stderr);
             }
         }
+    }
+
+    /*
+     * The CONDITION, reported next to the outcome: how many plugin freezes so
+     * far ended with every remaining freeze held by a DIFFERENT vCPU.  Each is
+     * an occasion on which a per-vCPU thaw would have restarted the guest clock
+     * inside a peer's window, so a large figure alongside zero ADVANCED lines
+     * is the measurement that the machine-wide reference count is what holds
+     * the requirement, not luck.  advanced/notrestored are the VIRTUAL_RT
+     * row's counts (cpu_get_clock()).
+     *
+     * The count that gates this line is per-vCPU-thread, so the period has to
+     * be chosen against the excursions ONE vCPU takes, not the machine's total.
+     * A fixed 20000 silently reports nothing on exactly the cells the peer
+     * figure exists for: an x86_64 -smp 4 marker cell taking 20587 excursions
+     * spread over four vCPUs printed no line at all, so peer_only_thaws -- the
+     * only readout of the condition -- was unavailable on an SMP run, which is
+     * where the condition lives.  CST_CLKEQ_EVERY sets the period; at 500 the
+     * same cell reports it, and reads 528694.
+     *
+     * A period that cannot be used is SAID, not swapped in silence.  An
+     * operator who asks for a period and is given a different one without
+     * being told reads the resulting lines as answering the question they
+     * set, which is the same misreading the fixed 20000 produced.  The
+     * period is per-vCPU-thread like the count it gates, so a thread reads
+     * the environment once and the refusal is announced once per process.
+     */
+#define CST_CLKEQ_EVERY_DEFAULT 20000
+    static __thread uint64_t n_excursions;
+    static __thread int every = -1;
+    if (every < 0) {
+        const char *s = getenv("CST_CLKEQ_EVERY");
+        every = s ? atoi(s) : CST_CLKEQ_EVERY_DEFAULT;
+        if (every <= 0) {
+            static int refusal_announced;
+            if (qatomic_xchg(&refusal_announced, 1) == 0) {
+                fprintf(stderr, "[clkeq] CST_CLKEQ_EVERY=\"%s\" is not a "
+                        "positive period; refused, reporting every %d "
+                        "excursions per vcpu instead\n",
+                        s ? s : "", CST_CLKEQ_EVERY_DEFAULT);
+                fflush(stderr);
+            }
+            every = CST_CLKEQ_EVERY_DEFAULT;
+        }
+    }
+    if ((++n_excursions % (unsigned)every) == 0) {
+        fprintf(stderr, "[clkeq] cpu%d excursions=%" PRIu64 " advanced=%" PRIu64
+                " notrestored=%" PRIu64 " peer_only_thaws=%" PRIu64 "\n",
+                cpu->cpu_index, n_excursions, n_adv[CST_CLKROOT_VIRTUAL_RT],
+                n_not[CST_CLKROOT_VIRTUAL_RT],
+                cpu_plugin_ticks_peer_only_thaws());
+        fflush(stderr);
     }
 }
 /*
@@ -2501,8 +2444,7 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     }
 #endif
 #ifdef CONFIG_PLUGIN
-    cst_clkeq_note_pause();           /* #77 falsifier: excursion clock equality */
-    cst_clkaudit_note_pause();        /* every root a guest clock derives from */
+    cst_clkaudit_note_pause();       /* every root a guest clock derives from */
 #endif
 #if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN)
     /*
@@ -2684,12 +2626,8 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * restarted the clock underneath this excursion, and this thaw then found
      * ticks already enabled and left them so.
      */
-    int64_t clkeq_pre_thaw = 0;
     int64_t clkaudit_pre_thaw[CST_CLKROOT__COUNT] = { 0 };
 #ifdef CONFIG_PLUGIN
-    if (cst_clkeq_on()) {
-        clkeq_pre_thaw = cpu_get_clock();   /* before the thaw: did it move? */
-    }
     if (cst_clkaudit_on()) {
         /* Sampled here, inside the still-open window: this is what the guest
          * would have read had it executed one more instruction before the
@@ -2754,20 +2692,12 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
 #if defined(CONFIG_PLUGIN)
     cpu_plugin_clock_resync(cpu, SPEC_CLOCK_EXCURSION_END);
 #ifdef CONFIG_PLUGIN
-    /* #77 test: the WP-saturated vCPU starves the main loop's QEMU_CLOCK_VIRTUAL
-     * timer processing, so the guest stimer never fires -> tick death.  Process
-     * expired virtual timers in-thread here (as -icount does at insn boundaries)
-     * under the BQL we already hold, so the deferred tick is delivered. */
-    if (getenv("CST_RUNTIMERS")) {
-        qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
-    }
     /*
-     * The excursion's defining requirement, checked where it must hold: the
-     * guest virtual clock now reads what it read when the excursion began.
+     * The excursion's defining requirement, checked where it must hold: every
+     * guest clock root now reads what it read when the excursion began.
      * Sampled after the thaw and after the per-target resync, so it sees the
      * value the guest will see.
      */
-    cst_clkeq_check(cpu, clkeq_pre_thaw);
     cst_clkaudit_check(cpu, clkaudit_pre_thaw);
     /*
      * The leak diff belongs after the LAST step of the restore, for the same
@@ -2937,11 +2867,7 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
      * install or log overflow falls back to the full flush.
      */
 #ifdef CONFIG_PLUGIN
-    /* #77 diagnostic toggle: CST_WP_FULLFLUSH forces a full TLB flush on every
-     * WP exit instead of the selective per-logged-page flush, to test whether a
-     * WP-installed TLB entry leaking into the correct path causes the teardown
-     * livelock. */
-    if (cpu->plugin_spec_tlb_log_overflow || getenv("CST_WP_FULLFLUSH")) {
+    if (cpu->plugin_spec_tlb_log_overflow) {
         tlb_flush(cpu);
     } else {
         cpu_plugin_spec_tlb_flush_logged(cpu);

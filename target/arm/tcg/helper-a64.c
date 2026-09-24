@@ -1256,6 +1256,29 @@ static inline void mops_plugin_complete(CPUARMState *env) {}
 static inline void mops_plugin_reenter(CPUARMState *env) {}
 #endif
 
+/* DC ZVA byte loop; @normalize reports it once, in host-path shape */
+static void dc_zva_bytes(CPUARMState *env, uint64_t vaddr, int blocklen,
+                         int mmu_idx, uintptr_t ra, bool normalize)
+{
+#ifdef CONFIG_PLUGIN
+    void *saved_cbs = env_cpu(env)->neg.plugin_mem_cbs;
+
+    if (normalize) {
+        env_cpu(env)->neg.plugin_mem_cbs = NULL;
+    }
+#endif
+    for (int i = 0; i < blocklen; i++) {
+        cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
+    }
+#ifdef CONFIG_PLUGIN
+    if (normalize) {
+        env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
+        arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
+                               QEMU_PLUGIN_MEM_W, false, 0);
+    }
+#endif
+}
+
 void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 {
     uintptr_t ra = GETPC();
@@ -1303,25 +1326,8 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
              * its report is normalized to the same decomposition the
              * host-pointer path emits, values zero as DC ZVA stores.
              */
-#ifdef CONFIG_PLUGIN
-            void *saved_cbs = NULL;
-            bool spec = env_cpu(env)->plugin_spec_mode;
-
-            if (spec) {
-                saved_cbs = env_cpu(env)->neg.plugin_mem_cbs;
-                env_cpu(env)->neg.plugin_mem_cbs = NULL;
-            }
-#endif
-            for (int i = 0; i < blocklen; i++) {
-                cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
-            }
-#ifdef CONFIG_PLUGIN
-            if (spec) {
-                env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
-                arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                                       QEMU_PLUGIN_MEM_W, false, 0);
-            }
-#endif
+            dc_zva_bytes(env, vaddr, blocklen, mmu_idx, ra,
+                         env_cpu(env)->plugin_spec_mode);
             return;
         }
     }
@@ -1334,19 +1340,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
          * the report is normalized to the host-pointer decomposition,
          * values zero as DC ZVA stores.
          */
-#ifdef CONFIG_PLUGIN
-        void *saved_cbs = env_cpu(env)->neg.plugin_mem_cbs;
-
-        env_cpu(env)->neg.plugin_mem_cbs = NULL;
-#endif
-        for (int i = 0; i < blocklen; i++) {
-            cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
-        }
-#ifdef CONFIG_PLUGIN
-        env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
-        arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                               QEMU_PLUGIN_MEM_W, false, 0);
-#endif
+        dc_zva_bytes(env, vaddr, blocklen, mmu_idx, ra, true);
         return;
     }
 #endif
@@ -1680,12 +1674,15 @@ static uint64_t arm_reg_or_xzr(CPUARMState *env, int reg)
  * byte accesses is handled generically by tlb_vaddr_to_host()
  * returning NULL in spec mode; this only bounds the *iteration
  * count*, which is MOPS-specific because no other ISA has a single
- * instruction looping a 64-bit register-sized memory op.)  Wrong-
- * path memory state is discarded on rollback, so a bounded set/copy
- * is indistinguishable to any consumer: clamp to a small sub-page
- * size so the helper terminates promptly (sub-page also keeps
- * do_sete()/do_cpye()'s "< page" epilogue invariant intact).  No
- * effect on the correct path.
+ * instruction looping a 64-bit register-sized memory op.)  The clamp
+ * IS visible on the wire: a wrong-path MOPS triple publishes at most
+ * MOPS_SPEC_MAX_BYTES of memops where the correct path at the same
+ * pcs publishes the architectural size (measured: 256 B against
+ * 0x2040 B).  That is an accepted WP/CP-equivalence gap, not a
+ * transparent bound; the honest fix is a budget-derived or
+ * page-multiple ceiling.  Sub-page also keeps do_sete()/do_cpye()'s
+ * "< page" epilogue invariant intact.  No effect on the correct
+ * path.
  */
 #ifdef CONFIG_PLUGIN
 #define MOPS_SPEC_MAX_BYTES 256

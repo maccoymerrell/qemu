@@ -725,11 +725,24 @@ non-concepts under content gating.
 
 The wire's address-space naming is a LABEL: the compact asid index is
 allocated from the live architectural value observed at each gate
-refresh that evaluates on (never on the emit path, which reads the
-per-vCPU carry).  Both the gate bit and the label carry are maintained
-event-driven (``refresh_ctx_gates`` / ``marker_gate_refresh``): at
-every ``is_active`` edge, at each committed address-space write, at
-window opens/releases and at vCPU init — never on the per-TB path.
+refresh that evaluates on (never on the emit path).  Both the gate bit
+and the label carry are maintained event-driven (``refresh_ctx_gates``
+/ ``marker_gate_refresh``): at every ``is_active`` edge, at each
+committed address-space write, at window opens/releases and at vCPU
+init — never on the per-TB path.
+
+A body entry does not read the carry when it is emitted.  Every entry
+leaves the tracer at least one dispatch after its block ran, and a root
+write moves the carry the instant it happens — so the block that
+performed a context switch, or a block held across a switch an excluded
+interrupt hid, would be published under the *incoming* context.  The
+label (asid index and guest thread) is instead sampled at the dispatch
+that promotes the block into the pending-seal slot and travels with the
+block, exactly as its fault-depth stamp does, to whichever route emits
+it: the seal walk (including its cut and continuation pieces and the
+fault-split prefix), the departure and migration drains, and every
+close-time flush.  The close's per-thread ``THREAD_END`` choice keys on
+the same stamped label.
 
 **Shared prologue** (before any lock):
 

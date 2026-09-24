@@ -713,6 +713,7 @@ void PathBuilder::on_segment_open()
     walk_prev_ = nullptr;
     walk_depth_ = 0;
     prev_depth_ = 0;
+    prev_label_ = walk_label_ = chain_label_ = CstEmitLabel();
     rep_state(cpu_index_).pb_prev_facts = RepArchFacts();
     rep_state(cpu_index_).pb_prev_facts_armed = false;
     rep_state(cpu_index_).pb_walk_facts = RepArchFacts();
@@ -798,6 +799,9 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
         SiteGuard(const char *s) : old(g_cst_emit_site) { g_cst_emit_site = s; }
         ~SiteGuard() { g_cst_emit_site = old; }
     } smp_site_guard(a.site);
+    /* Every entry this walk emits publishes the drained block's
+     * promote-time label (CstEmitLabel), never the carry at emit. */
+    CstEmitLabelScope label_scope(a.label);
     std::vector<BBTemplate *> finalized;
 
     g_mutex_lock(&data_lock);
@@ -1020,6 +1024,33 @@ bool PathBuilder::close_flush_will_emit(void) const
     return cp_chain(cpu_index_).has_active_chain();
 }
 
+/* See the declaration: flush_final's emission order, last emitter wins.
+ * The slot arm mirrors close_flush_will_emit's; the chain arm is taken
+ * only when the slot's walk is not. */
+CstEmitLabel PathBuilder::close_flush_label(void) const
+{
+    CstEmitLabel last;
+    if (mid_step_ && walk_prev_ != nullptr) {
+        last = walk_label_;
+    }
+    bool slot_emits = false;
+    if (prev_tb_) {
+        uint64_t executed = 0;
+        if (prev_extent(&executed)) {
+            slot_emits = executed > 0;
+        } else if (retired_executed_of(cpu_index_, prev_tb_, &executed)) {
+            slot_emits = executed > 1;
+        }
+    }
+    if (slot_emits) {
+        return prev_label_;
+    }
+    if (cp_chain(cpu_index_).has_active_chain()) {
+        return chain_label_;
+    }
+    return last;
+}
+
 void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
                               bool stamp_thread_end)
 {
@@ -1059,6 +1090,7 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         mw.site = "flush-midstep";
         mw.at_close = true;
         mw.tid = walk_tid_;
+        mw.label = walk_label_;
         close_walk_emit(out_stream, cpu_index, mw);
     }
     walk_prev_ = nullptr;
@@ -1180,6 +1212,7 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         cw.site = smp_peer_close ? "flush-peer-slot" : "flush-slot";
         cw.at_close = true;
         cw.tid = prev_tid_;
+        cw.label = prev_label_;
         close_walk_emit(out_stream, cpu_index, cw);
     } else if (cp_chain(cpu_index_).has_active_chain()) {
         /* No walkable slot, but the chain still holds fragments that ran
@@ -1197,6 +1230,7 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         cw.site = "flush-chain";
         cw.at_close = true;
         cw.tid = prev_tid_;
+        cw.label = chain_label_;
         close_walk_emit(out_stream, cpu_index, cw);
     }
 
@@ -2284,6 +2318,7 @@ void PathBuilder::emit_prev_at_departure(const StepIn &in)
         cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
         cw.facts = &rep_state(cpu_index_).pb_prev_facts;
         cw.site = "departure";
+        cw.label = prev_label_;
         close_walk_emit(out_stream, cpu_index_, cw);
         g_stats.departure_emits++;
         g_stats.departure_emit_insns += cw.insns_emitted;
@@ -2340,6 +2375,7 @@ void PathBuilder::drain_migrated_holder(void)
         cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
         cw.facts = &rep_state(cpu_index_).pb_prev_facts;
         cw.site = "migrate-drain";
+        cw.label = prev_label_;
         close_walk_emit(out_stream, cpu_index_, cw);
         g_stats.smp_migrated_holders_drained++;
         g_stats.smp_migrated_holder_insns += cw.insns_emitted;
@@ -2616,6 +2652,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
     walk_tid_ = prev_tid_;
+    walk_label_ = prev_label_;
     g_pb_walk_async[pb_vcpu_slot(in.cpu_index)] =
         g_pb_prev_async[pb_vcpu_slot(in.cpu_index)];
     rep_state(in.cpu_index).pb_walk_facts =
@@ -2674,6 +2711,19 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         if (in.cur != nullptr) {
             prev_tid_ = in.cur_tid;
         }
+    }
+    /* THE PROMOTE-TIME LABEL (CstEmitLabel): the context cur runs in, as
+     * this dispatch sampled it — the only moment the label is guaranteed
+     * to be cur's own.  Every later emit route publishes it for this
+     * block, however far the carries have moved by then.  The tid half is
+     * the pre-window peek here and is re-stamped with the minted sample at
+     * this step's seal. */
+    if (in.cur != nullptr) {
+        prev_label_.valid = true;
+        prev_label_.armed = in.cur_label_armed;
+        prev_label_.tid = in.cur_tid;
+        prev_label_.asid = in.cur_label_asid;
+        prev_label_.gen = g_segment_generation.load(std::memory_order_relaxed);
     }
     /* cur's own self-loop facts are only readable at the NEXT dispatch
      * (QEMU's plugin_rep_* fields describe the TB that finished before a
@@ -2959,6 +3009,16 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
 {
     /* Out of the step_events -> step_seal window (see mid_step_). */
     mid_step_ = false;
+    /* The promoted TB's label: its thread half was the pre-window PEEK at
+     * the promote (which cannot mint); @cur_tid is now the minting sample
+     * for that same TB — exactly what the identity commit after this seal
+     * installs — so the stamp names the thread by the id its own seal will
+     * be published under.  Every emission below publishes the WALKED
+     * block's label (CstEmitLabel), never the carry at emit. */
+    if (in.cur != nullptr && prev_tb_ == in.cur && prev_label_.valid) {
+        prev_label_.tid = in.cur_tid;
+    }
+    CstEmitLabelScope label_scope(walk_label_);
     /* The depth-pipeline + kernel-handler fault merge is the system-only
      * DEPTH TRAILER machinery (fault_depth_trailer); it is orthogonal to the
      * wrong-path synthetic-fault marking policy (wp_synthetic_marking), which
@@ -3419,9 +3479,16 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     seal_pc_override_ = 0;
     std::vector<PendingEmit> pending_emits;
     std::vector<CutEmit> cut_emits;
+    /* A cut block is the in-flight chain's EARLIER fragments, sealed
+     * because this walk's first fragment does not continue them: they ran
+     * under the label of the walk that appended them, not this one. */
+    const CstEmitLabel cut_label = chain_label_;
     bool any_finalize = collect_finalized_bbs(in.cpu_index, walk_prev_,
                                               in.prev_start, seal_current_pc,
                                               pending_emits, cut_emits);
+    if (walk_prev_ != nullptr) {
+        chain_label_ = walk_label_;
+    }
 
     /* SMP condition census: this seal resolved at least one terminal
      * branch, and the successor evidence (the scoreboard's current_pc /
@@ -3463,6 +3530,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             g_stats.cut_blocks_multi_per_walk++;
         }
         const bool excluded = !g_features.trace_faults && walk_in_sync_;
+        CstEmitLabelScope cut_scope(cut_label);
         std::vector<RegSnap> &sink = pending_reg_snaps(in.cpu_index);
         std::vector<RegSnap> all = std::move(sink);
         sink.clear();

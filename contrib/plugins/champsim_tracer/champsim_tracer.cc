@@ -1773,6 +1773,81 @@ static inline uint32_t resolve_ctx_asid_index(unsigned int cpu_index)
     return asid_root_to_index(qemu_plugin_get_addr_space_id());
 }
 
+/* The promote-time label sample for the TB dispatching NOW on @cpu_index
+ * (see CstEmitLabel): the gate carry's index when a marker window is armed
+ * (the carry already names this dispatch's context — the root write that
+ * moved it ran before this TB), else the raw live address-space value,
+ * left unminted so first-sighting allocation stays at emit.  Caller holds
+ * exec_lock. */
+static inline void sample_ctx_label(unsigned int cpu_index, uint64_t *asid,
+                                    bool *armed)
+{
+    if (g_marker_armed.load(std::memory_order_relaxed) &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        *asid = g_vcpu_cur_asid_index[cpu_index];
+        *armed = true;
+        return;
+    }
+    *asid = qemu_plugin_get_addr_space_id();
+    *armed = false;
+}
+
+/* Is @l a stamp this segment's maps can answer for? */
+static inline bool emit_label_live(const CstEmitLabel &l)
+{
+    return l.valid &&
+           l.gen == g_segment_generation.load(std::memory_order_relaxed);
+}
+
+/* The (thread, asid) an entry emitted under label @l publishes: the stamp
+ * when it is live, else the emit-time carries (resolve_thread_id /
+ * resolve_ctx_asid_index — the pre-stamp behaviour, reached only where no
+ * dispatch stamped the block).  Caller holds exec_lock. */
+static inline uint32_t label_thread_id(const CstEmitLabel &l,
+                                       unsigned int cpu_index)
+{
+    if (emit_label_live(l) && l.tid != PathBuilder::CST_TID_UNSEEN) {
+        return l.tid;
+    }
+    return resolve_thread_id(cpu_index);
+}
+static inline uint32_t label_asid_index(const CstEmitLabel &l,
+                                        unsigned int cpu_index)
+{
+    if (!emit_label_live(l)) {
+        return resolve_ctx_asid_index(cpu_index);
+    }
+    return l.armed ? (uint32_t)l.asid : asid_root_to_index(l.asid);
+}
+
+/* The guest thread whose final entry @cpu_index's close flush would
+ * publish LAST — the thread-keyed THREAD_END pre-pass's key.  The label of
+ * the drained block, not the vCPU's carry: a builder holding a departed
+ * thread's block ends THAT thread's context. */
+static uint32_t close_flush_tid(unsigned int cpu_index)
+{
+    PathBuilder *b = path_builder_if_created(cpu_index);
+    return label_thread_id(b ? b->close_flush_label() : CstEmitLabel(),
+                           cpu_index);
+}
+
+/* A comparable address-space key for label @l WITHOUT minting a first
+ * sighting for a live unarmed stamp (a predicate must not allocate wire
+ * indices): the armed index, or the unarmed raw value, tagged by kind.
+ * A label that is not live keys on the emit-time carry exactly as the
+ * pre-stamp comparison did. */
+typedef std::pair<bool, uint64_t> LabelAsidKey;
+static inline LabelAsidKey label_asid_key(const CstEmitLabel &l,
+                                          unsigned int cpu_index)
+{
+    if (emit_label_live(l) && !l.armed) {
+        return LabelAsidKey(false, l.asid);
+    }
+    return LabelAsidKey(true, emit_label_live(l)
+                                  ? l.asid
+                                  : resolve_ctx_asid_index(cpu_index));
+}
+
 /* Look up a compact asid index's stored root LABEL for the body-stream
  * emit path (the wire's first-sighting root_phys word; the sig word is
  * permanently 0 — Q21, wire shape unchanged).  Returns false for an index
@@ -2305,6 +2380,11 @@ uint64_t g_dbg_last_emit_seq = 0;
  * plain global, not TLS (the static-TLS budget is spent — see the
  * CST_JUMP_DIAG block above); every writer runs under exec_lock. */
 const char *g_cst_emit_site = "seal";
+/* The emitting block's promote-time context label (CstEmitLabel): set by
+ * each PathBuilder emit route for the duration of its emissions, read by
+ * emit_body_entry.  Plain global; every writer and reader runs under
+ * exec_lock. */
+CstEmitLabel g_emit_label;
 /* The vCPU a segment close is executing on while its flush hook runs, or
  * UINT32_MAX outside a close.  Read by PathBuilder::flush_final to
  * classify PEER-slot extents (stash vs live cursor). */
@@ -4463,12 +4543,18 @@ static void heartbeat_progress(uint64_t icount)
  * a range of one template's instructions for one guest thread; an
  * instruction claimed twice is the trace-invalidating duplicate pair
  * (mid-stream re-emission / duplicate final entry at the budget close).
- * The ledger keeps, per thread, the last two USER claims and fires the
- * moment a new claim re-covers one of them at a position the previous
- * entry's own resolved DIRECT terminal makes unreachable — so a genuine
- * self-loop (taken edge to its own start), an indirect branch, a REP
- * fan-out and a disjoint fault-split continuation all stay silent, and a
- * fire names the two emit sites, vCPUs and seqs of the double claim.
+ * The ledger keeps, per wire CONTEXT — the (asid, thread) pair that
+ * keys every body-stream strand (format.rst) — the last two USER claims
+ * and fires the moment a new claim re-covers one of them at a position
+ * the previous entry's own resolved DIRECT terminal makes unreachable —
+ * so a genuine self-loop (taken edge to its own start), an indirect
+ * branch, a REP fan-out and a disjoint fault-split continuation all stay
+ * silent, and a fire names the two emit sites, vCPUs and seqs of the
+ * double claim.  Keyed by the pair, not the thread alone: two processes
+ * whose threads map to the same id (TLS-less twins are both thread 0)
+ * are two strands, and adjacency across them says nothing about either;
+ * a mislabelled entry lands in the WRONG pair's ledger and fires there,
+ * which is the row-501 witness.
  *
  * Everything runs under exec_lock (every emission does); the map is
  * process-lifetime by the stats.cc immortalization rule.
@@ -4487,8 +4573,8 @@ struct SmpClaim {
 struct SmpTidLedger {
     SmpClaim last[2];          /* [0] = most recent */
 };
-static std::unordered_map<uint32_t, SmpTidLedger> &g_smp_claims =
-    *new std::unordered_map<uint32_t, SmpTidLedger>();
+static std::unordered_map<uint64_t, SmpTidLedger> &g_smp_claims =
+    *new std::unordered_map<uint64_t, SmpTidLedger>();
 
 /* Can @p's terminal successor set DEFINITIVELY exclude a next entry at
  * @pc?  Only a full-range claim whose terminal is a resolved DIRECT
@@ -4548,13 +4634,15 @@ static void smp_claim_report(const char *what, const SmpClaim &cur,
             between.valid ? between.site : "-");
 }
 
-/* One check per emitted entry; @tid ledger updated afterwards.  Fires
+/* One check per emitted entry; the (@asid, @tid) ledger updated
+ * afterwards.  Fires
  * Stats::smp_dup_adjacent_claims / smp_dup_wrongpc_reemit. */
-static void smp_claim_check(uint32_t tid, const BBTemplate *t,
+static void smp_claim_check(uint32_t tid, uint32_t asid,
+                            const BBTemplate *t,
                             uint32_t lo, uint32_t hi, uint64_t seq,
                             unsigned int cpu_index, uint32_t depth)
 {
-    SmpTidLedger &L = g_smp_claims[tid];
+    SmpTidLedger &L = g_smp_claims[((uint64_t)asid << 32) | tid];
     if (t->is_system) {
         /* A kernel entry breaks user-flow adjacency for this thread
          * (signal delivery, excursions): forget the claims rather than
@@ -4890,7 +4978,8 @@ void emit_body_entry(BodyStreamState *out_stream,
         const RepSelfLoopState &rs_wh = rep_state(cpu_index);
         bool wm_defer = false;
         if (rs_wh.warmup_hold_any() && bb_tmpl) {
-            const uint32_t rec_tid = resolve_thread_id(cpu_index);
+            const uint32_t rec_tid = label_thread_id(g_emit_label,
+                                                     cpu_index);
             for (unsigned i = 0; i < RepSelfLoopState::REP_CLK_PCS; i++) {
                 const RepBoundaryHold &h = rs_wh.warmup_hold[i];
                 if (!h.active) {
@@ -4953,7 +5042,7 @@ void emit_body_entry(BodyStreamState *out_stream,
     /* Guest-thread identity on the wire.  cpu_index is a lookup key for the
      * per-vCPU identity (and for live register reads — regfile capture, WP
      * lane gates); the index itself never reaches the stream. */
-    entry.thread_id = resolve_thread_id(cpu_index);
+    entry.thread_id = label_thread_id(g_emit_label, cpu_index);
     if (tiddiag_on() && g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
         bool sys = bb_tmpl && bb_tmpl->is_system;
         (sys ? g_tiddiag_kern_entries : g_tiddiag_user_entries)++;
@@ -4961,26 +5050,50 @@ void emit_body_entry(BodyStreamState *out_stream,
             (sys ? g_tiddiag_kern_retagged : g_tiddiag_user_retagged)++;
         }
     }
+    entry.asid_index = label_asid_index(g_emit_label, cpu_index);
+    /* Row-501 subject count: would the emit-time carry have published this
+     * block under another context?  Compared without minting (an unarmed
+     * stamp is a raw value: compare it with the live raw value). */
+    if (emit_label_live(g_emit_label)) {
+        bool differs = entry.thread_id != resolve_thread_id(cpu_index);
+        if (g_emit_label.armed) {
+            differs = differs || (cpu_index < CST_PIN_MAX_VCPUS &&
+                                  entry.asid_index !=
+                                      g_vcpu_cur_asid_index[cpu_index]);
+        } else {
+            differs = differs ||
+                      g_emit_label.asid != qemu_plugin_get_addr_space_id();
+        }
+        if (differs) {
+            g_stats.emit_label_carry_disagree++;
+            if (bb_tmpl && !bb_tmpl->is_system) {
+                g_stats.emit_label_carry_disagree_user++;
+            }
+        }
+    }
     /* SMP attribution-pair claim ledger: one check per emitted entry, at
      * the entry's FINAL range and identity (see smp_claim_check above). */
     if (bb_tmpl) {
-        smp_claim_check(entry.thread_id, bb_tmpl, entry.bb_start,
+        smp_claim_check(entry.thread_id, entry.asid_index, bb_tmpl,
+                        entry.bb_start,
                         entry.bb_stop, entry.seq_num, cpu_index,
                         entry.fault_depth);
     }
 
-    /* Address-space LABEL on the wire: the captured-at-execution compact
-     * index this vCPU's gate refresh last stamped.  ONE field for both the
-     * wire tag and the (asid, thread) context key — under content gating
-     * every traced block's live label IS its gated label, the KPTI fold is
-     * provably a no-op (an isolated kernel root maps no marker bytes, so
-     * it is never gated and never traced), and a live read at emit would
-     * name whatever context happens to be current when the writer runs
-     * (the shutdown-close defect).  Label-fidelity witness: an emit whose
+    /* Address-space LABEL on the wire (entry.asid_index, set above with
+     * the thread): the captured-at-execution compact index — the label the
+     * vCPU's gate carry held at the dispatch that PROMOTED this block
+     * (CstEmitLabel), not the carry at emit.  ONE field for both the wire
+     * tag and the (asid, thread) context key — under content gating every
+     * traced block's live label IS its gated label, and the KPTI fold is
+     * provably a no-op (an isolated kernel root maps no marker bytes, so it
+     * is never gated and never traced).  Emissions lag execution by at
+     * least one dispatch, and a root write moves the carry the instant it
+     * happens: read at emit, the carry names the context the vCPU has moved
+     * on to, which published a departed process's held block under the
+     * incomer's label (row 501).  Label-fidelity witness: an emit whose
      * live raw value differs from the carried label is counted, never
-     * corrected — emissions lag execution and the carry names the block
-     * being emitted. */
-    entry.asid_index = resolve_ctx_asid_index(cpu_index);
+     * corrected. */
     if (cpu_index < CST_PIN_MAX_VCPUS &&
         g_marker_armed.load(std::memory_order_relaxed) &&
         qemu_plugin_get_addr_space_id() != g_vcpu_cur_asid_root[cpu_index]) {
@@ -6167,12 +6280,12 @@ static void finish_trace_segment(bool prev_executed = true,
                 const bool will = fb && fb->close_flush_will_emit();
                 smp_will_emit[fi] = will ? 1 : 0;
                 if (will) {
-                    smp_last_emitter[resolve_thread_id(fcpu)] = fi;
+                    smp_last_emitter[close_flush_tid(fcpu)] = fi;
                 }
             }
             auto smp_stamp_here = [&](size_t fi) {
                 unsigned int fcpu = flush_order[fi].cpu;
-                auto it = smp_last_emitter.find(resolve_thread_id(fcpu));
+                auto it = smp_last_emitter.find(close_flush_tid(fcpu));
                 return it != smp_last_emitter.end() && it->second == fi;
             };
 
@@ -6298,14 +6411,14 @@ static void finish_trace_segment(bool prev_executed = true,
                 smp_will_emit[fi] = will ? 1 : 0;
                 if (will) {
                     smp_last_emitter[
-                        resolve_thread_id(exit_order[fi].cpu)] = fi;
+                        close_flush_tid(exit_order[fi].cpu)] = fi;
                 }
             }
             for (size_t fi = 0; fi < exit_order.size(); fi++) {
                 const CloseFlush &cf = exit_order[fi];
                 if (PathBuilder *b = path_builder_if_created(cf.cpu)) {
                     auto it = smp_last_emitter.find(
-                        resolve_thread_id(cf.cpu));
+                        close_flush_tid(cf.cpu));
                     const uint64_t cb = g_seg_arch_insns;
                     b->flush_final(/* walk_prev= */ true,
                                    /* prev_in_flight= */ false,
@@ -8134,16 +8247,24 @@ bool deferred_close_take_pending(unsigned int cpu_index)
           g_trace_segments.is_active())) {
         return false;
     }
-    const uint32_t tid = resolve_thread_id(cpu_index);
-    const uint32_t asid = resolve_ctx_asid_index(cpu_index);
+    /* The context is the one the seal publishes its final entry under
+     * (its walked prev's promote-time label); a peer's is the one ITS
+     * flush would publish — both the wire's label, not the carry. */
+    PathBuilder *self = path_builder_if_created(cpu_index);
+    const CstEmitLabel self_l = self ? self->seal_label() : CstEmitLabel();
+    const uint32_t tid = label_thread_id(self_l, cpu_index);
+    const LabelAsidKey asid = label_asid_key(self_l, cpu_index);
     for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         if (i == cpu_index) {
             continue;
         }
         PathBuilder *b = path_builder_if_created(i);
-        if (b && b->holds_close_work() &&
-            resolve_thread_id(i) == tid &&
-            resolve_ctx_asid_index(i) == asid) {
+        if (!b || !b->holds_close_work()) {
+            continue;
+        }
+        const CstEmitLabel peer_l = b->close_flush_label();
+        if (label_thread_id(peer_l, i) == tid &&
+            label_asid_key(peer_l, i) == asid) {
             return false;
         }
     }
@@ -9071,6 +9192,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         }
     }
     in.cur_tid = thread_identity_peek(cpu_index, live_priv);
+    /* The address-space half of the label a promote stamps on this TB (see
+     * CstEmitLabel): sampled HERE, at the dispatch the TB runs in. */
+    sample_ctx_label(cpu_index, &in.cur_label_asid, &in.cur_label_armed);
     /* The step's RAW thread pointer, for the async-owner predicate (see
      * StepIn::cur_tp).  Where the register cannot be trusted at this
      * privilege the step inherits the vCPU's last COMMITTED pointer — the

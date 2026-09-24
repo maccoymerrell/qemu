@@ -602,13 +602,22 @@ struct Stats {
      * thing standing between it and a silent over-claim.  Must be 0. */
     uint64_t close_walk_extent_unknown = 0;
     /* LABEL-FIDELITY witness: entries emitted while the live address-
-     * space value differed from the carried label (emissions lag
-     * execution — deferred seal, close flush — so the carry
-     * g_vcpu_cur_asid_index names the block being emitted, and the live
-     * value names whatever context happens to be current at the writer).
-     * NOT must-be-0: it is the size of the set a live read would have
+     * space value differed from the vCPU's carried label (emissions lag
+     * execution — deferred seal, close flush — and the live value names
+     * whatever context happens to be current at the writer).  NOT
+     * must-be-0: it is the size of the set a live read would have
      * mis-stamped. */
     uint64_t emit_asid_foreign_context = 0;
+    /* THE ROW-501 CONDITION, counted where it is corrected: entries whose
+     * promote-time label (CstEmitLabel — the context the block executed
+     * in) differs from the emit-time carry, i.e. the entries the carry
+     * would have published under ANOTHER context's (thread, asid) — a
+     * root write or identity commit moved the carry between the block's
+     * dispatch and its emission.  NOT must-be-0: it is the subject count
+     * that makes the SMP-dup census's zero meaningful (a hidden switch
+     * whose departed block was held across it lands here). */
+    uint64_t emit_label_carry_disagree = 0;
+    uint64_t emit_label_carry_disagree_user = 0;
     /* Pending-seal slots flushed at a segment close from a vCPU OTHER than
      * the closing one.  Each is a TB the pinned process executed on a vCPU
      * it then left; they used to be dropped.  Non-zero exactly when the

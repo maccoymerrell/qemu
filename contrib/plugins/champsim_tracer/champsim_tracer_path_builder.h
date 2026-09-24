@@ -140,6 +140,55 @@ void emit_body_entry(BodyStreamState *out_stream,
  * models (MTTCG: one thread per vCPU; round-robin: one thread total,
  * and a step cannot be preempted mid-dispatch). */
 extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
+
+/*
+ * THE CONTEXT LABEL A BLOCK EXECUTED UNDER, STAMPED AT PROMOTE.
+ *
+ * Every body entry is emitted at least one dispatch after it executed, so
+ * the per-vCPU carries (g_vcpu_cur_tid, g_vcpu_cur_asid_index) read at
+ * emit name whatever context the vCPU has moved on to — and a root write
+ * refreshes the asid carry the instant it happens, before the block that
+ * performed it (or a block held across a hidden switch) is published.
+ * The departed process's block then went out under the INCOMER's label: a
+ * CFG-impossible adjacent pair inside the incomer's (thread, asid)
+ * context (ledger row 501).  The pending-seal slot therefore carries the
+ * label sampled at the dispatch that promoted it — the dispatch at which
+ * that block began executing — and every emit route publishes the label
+ * of the block it drains, exactly as the fault-depth stamp travels.
+ *
+ * @asid is the compact LABEL index when @armed (a marker window's gate
+ * carry, allocated at the gate event), else the raw live address-space
+ * value sampled at the dispatch, minted to an index at emit exactly as
+ * the unarmed emit path always minted it.  @tid is CST_TID_UNSEEN when
+ * the dispatch's identity was not yet minted (a step that bailed before
+ * its seal); the emit then falls back to the committed identity.  @gen is
+ * the segment generation at the stamp: a label from another segment names
+ * indices of a reset map and is never used.
+ *
+ * g_emit_label is the TRANSFER REGISTER emit_body_entry reads, set by
+ * each emit route for the duration of its emissions (a plain global:
+ * every writer and reader runs under exec_lock).  valid=false means "no
+ * stamp: resolve at emit", the pre-stamp behaviour.
+ */
+struct CstEmitLabel {
+    bool valid = false;
+    bool armed = false;
+    uint32_t tid = UINT32_MAX;       /* == PathBuilder::CST_TID_UNSEEN */
+    uint64_t asid = 0;
+    uint32_t gen = 0;
+};
+extern CstEmitLabel g_emit_label;
+/* RAII: publish @l as the emitting block's label for one route's
+ * emissions, restoring the previous register on exit. */
+struct CstEmitLabelScope {
+    CstEmitLabel old;
+    explicit CstEmitLabelScope(const CstEmitLabel &l) : old(g_emit_label)
+    {
+        g_emit_label = l;
+    }
+    ~CstEmitLabelScope() { g_emit_label = old; }
+};
+
 /* CST diag correlation: seq_num of the most recent body entry emitted
  * process-wide.  A wire-position cursor for the gap/jump diagnostics;
  * plain static like the g_dbg_* mirrors below (every writer runs under
@@ -433,6 +482,12 @@ public:
          * pointer has never been sighted, where the peek yields
          * CST_TID_UNSEEN. */
         uint32_t cur_tid = 0;
+        /* The address-space half of the promote-time label (see
+         * CstEmitLabel): the vCPU's gate carry index when @cur_label_armed,
+         * else the raw live address-space value, both sampled at THIS
+         * dispatch — the context the promoted TB runs in. */
+        uint64_t cur_label_asid = 0;
+        bool cur_label_armed = false;
         /* The RAW thread-pointer sample for this step, and whether it names
          * the executing thread (user privilege, or a privileged context the
          * target vouches for via qemu_plugin_thread_ptr_tracks_current —
@@ -640,6 +695,16 @@ public:
      * census only; see the member). */
     uint32_t prev_tid() const { return prev_tid_; }
 
+    /* The label the seal this step runs publishes its blocks under (the
+     * walked prev's promote-time stamp). */
+    const CstEmitLabel &seal_label() const { return walk_label_; }
+    /* The label of the LAST entry flush_final would put on the wire, in
+     * flush_final's own emission order (mid-step walk, then the slot or
+     * the chain) — so the close's thread-keyed THREAD_END pre-pass and the
+     * same-context peer test key on the context the flush publishes, not
+     * on the vCPU's current carry.  valid=false when nothing is stamped. */
+    CstEmitLabel close_flush_label(void) const;
+
     /* Flush the pending final-TB body entry before a segment finishes.
      * BodyEntries are emitted lazily — the seal phase emits the
      * *previous* TB's entry once its branch direction is known — so a TB
@@ -828,6 +893,9 @@ private:
          * any unsealed block so the per-close context count is keyed by
          * thread, which is what the bound is stated in. */
         uint32_t tid = CST_TID_UNSEEN;
+        /* The promote-time label of the block this walk drains (see
+         * CstEmitLabel) — what every entry the walk emits publishes. */
+        CstEmitLabel label;
         /* Filled by the walk: the template extent that reached the wire,
          * split by privilege.  Measured from the blocks emitted, not from
          * what the slot held — the difference is the whole of 81239d89cd. */
@@ -971,6 +1039,17 @@ private:
      * drains.  prev_tid_ itself is immediately re-stamped with the
      * newly-promoted TB's thread, so it cannot answer for walk_prev_. */
     uint32_t walk_tid_ = CST_TID_UNSEEN;
+    /* THE PROMOTE-TIME LABELS (CstEmitLabel), one per holder of retired
+     * work, carried exactly like the depth stamp: prev_label_ names the
+     * pending-seal slot's block (stamped at its promote, its tid re-stamped
+     * with the minted sample at the same step's seal), walk_label_ the
+     * block the seal walks (prev_label_ at the swap), and chain_label_ the
+     * in-flight chain's fragments (the label of the last walk that
+     * appended to it) — so the cut blocks a walk seals and the close's
+     * chain-only drain publish the context those fragments ran in. */
+    CstEmitLabel prev_label_;
+    CstEmitLabel walk_label_;
+    CstEmitLabel chain_label_;
     /* See note_prev_extent: prev's executed count, measured at the first
      * dispatch after it, for the close walk on a vCPU the process left. */
     uint64_t prev_extent_ = 0;

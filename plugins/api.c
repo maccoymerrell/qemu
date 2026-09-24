@@ -718,18 +718,15 @@ void qemu_plugin_set_pc(uint64_t pc)
 {
     g_assert(current_cpu);
     g_assert(current_cpu->cc->set_pc);
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
-     * Diagnostic (#77): a wrong-path PC redirect must only happen inside a
-     * speculative excursion (plugin_spec_mode set).  If set_pc runs with the
-     * flag OFF, it is steering the REAL guest PC -- a spec-mode escape that
-     * corrupts real execution.
+     * Diagnostic, enabled by CST_SPEC_ESCAPE_DIAG: report a PC redirect made
+     * outside a speculative excursion (plugin_spec_mode clear).  Such a call
+     * steers the real guest PC, which a wrong-path walker must never do.
      */
     if (unlikely(!current_cpu->plugin_spec_mode) && getenv("CST_SPEC_ESCAPE_DIAG")) {
         fprintf(stderr, "[setpc-real] set_pc(0x%" PRIx64 ") with "
                 "plugin_spec_mode=0\n", pc);
     }
-#endif
     current_cpu->cc->set_pc(current_cpu, (vaddr)pc);
 }
 
@@ -781,15 +778,6 @@ bool qemu_plugin_paging_enabled(void)
     bool mmu_on;
     plugin_cpu_state(&priv, &asid, &mmu_on);
     return mmu_on;
-}
-
-bool qemu_plugin_icount_enabled(void)
-{
-#ifdef CONFIG_USER_ONLY
-    return false;
-#else
-    return icount_enabled();
-#endif
 }
 
 uint64_t qemu_plugin_get_thread_ptr(void)
@@ -870,13 +858,9 @@ bool qemu_plugin_translate_at(uint64_t pc)
  * pointer into the pool.  The pool grows by g_realloc_n, which moves
  * the array: a stored pointer would dangle into the freed copy at the
  * first growth inside an excursion, and every later hit on a
- * pre-growth line would read — and worse, WRITE — freed heap.
- * Measured exactly so under ASAN (riscv64, tb-size=4, wpdepth=65536:
- * heap-use-after-free in spec_load_bytes against a 20 KiB region this
- * function's realloc freed), and the writes are the mechanism behind
- * the downstream free(): invalid pointer aborts the same configuration
- * produced.  An index is stable across growth by construction; each
- * lookup resolves it against the pool base of the moment.
+ * pre-growth line would read and write freed heap.  An index is stable
+ * across growth by construction; each lookup resolves it against the
+ * pool base of the moment.
  */
 PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
 {
@@ -921,13 +905,12 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(!current_cpu->plugin_spec_mode);
 
     /*
-     * @saved_state was added inside version 5, which therefore names both a
-     * no-argument and a one-argument spelling of this function; version 6 is
-     * the first that distinguishes them.  A caller built before the change
-     * passes nothing and QEMU reads the first argument register, so
-     * plugin_spec_saved_state below would be an arbitrary pointer that
-     * qemu_plugin_spec_mode_end() later restores the vCPU from.  This entry
-     * point carries no plugin id, so ask the floor across loaded plugins.
+     * Plugin API version 6 is the first whose declaration of this function
+     * is known to take @saved_state; a caller declaring an older version may
+     * pass nothing, and plugin_spec_saved_state below would then be an
+     * arbitrary pointer that qemu_plugin_spec_mode_end() later restores the
+     * vCPU from.  This entry point carries no plugin id, so the check uses
+     * the lowest version any loaded plugin declares.
      */
     if (plugin_declared_version_floor() < 6) {
         error_report("plugin: qemu_plugin_spec_mode_begin() gained its "
@@ -1004,24 +987,23 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
  * mips Count — so a single freeze checkpoints the timer count for all ISAs at
  * once.
  *
- * Driven from the plugin's OUTER excursion boundary (wp_enter/wp_end), not
- * from spec_mode_begin/end: a wrong-path fault-skip tears down and re-enters
- * spec mode mid-excursion, and pausing per spec-mode-entry would re-enable
- * ticks across that gap and leak time per skip.  The real per-CPU work
- * (cpu_disable_ticks/enable_ticks) lives in cpu_plugin_spec_vtime_* in
- * cpu-exec.c, which is compiled per-target so it is a no-op in user mode;
- * this common file must not reference the softmmu-only timer symbols.
+ * A plugin calls the pair once per excursion, around its whole wrong-path
+ * run: pause before qemu_plugin_spec_mode_begin(), resume after
+ * qemu_plugin_spec_mode_end() and the register restore.  The per-CPU work
+ * lives in cpu_plugin_excursion_open/_close (accel/tcg/plugin-window.c),
+ * which is compiled per-target so it is a no-op in user mode; this common
+ * file must not reference the softmmu-only timer symbols.
  */
 void qemu_plugin_spec_vtime_pause(void)
 {
     g_assert(current_cpu);
-    cpu_plugin_spec_vtime_pause(current_cpu);
+    cpu_plugin_excursion_open(current_cpu);
 }
 
 void qemu_plugin_spec_vtime_resume(void)
 {
     g_assert(current_cpu);
-    cpu_plugin_spec_vtime_resume(current_cpu);
+    cpu_plugin_excursion_close(current_cpu);
 }
 
 /*
@@ -1052,9 +1034,6 @@ void qemu_plugin_vclock_resume(void)
  */
 int64_t qemu_plugin_vclock_ns(void)
 {
-#ifdef CONFIG_USER_ONLY
-    return 0;
-#else
     if (icount_enabled()) {
         /*
          * Under icount the virtual clock IS the instruction counter, and
@@ -1066,16 +1045,11 @@ int64_t qemu_plugin_vclock_ns(void)
         return 0;
     }
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-#endif
 }
 
 bool qemu_plugin_in_async_int(void)
 {
-#ifdef CONFIG_USER_ONLY
-    return false;
-#else
     return current_cpu && current_cpu->plugin_in_async_int;
-#endif
 }
 
 bool qemu_plugin_in_spec_mode(void)
@@ -1083,15 +1057,38 @@ bool qemu_plugin_in_spec_mode(void)
     return current_cpu && current_cpu->plugin_spec_mode;
 }
 
-/* The wire and plugin-facing event layouts are kept field-for-field
- * identical; the drain below converts explicitly all the same, so a
- * layout drift shows up as a compile break here rather than corruption.
- * The KIND VALUES pass through raw as well: the two enums
- * (QemuPluginCpuEventKind in hw/core/cpu.h, qemu_plugin_cpu_event_kind
- * in qemu-plugin.h) must stay value-aligned member for member —
- * FAULT_ENTER/RETURN = 0/1, ASYNC_ENTER/RETURN = 2/3, ASID_WRITE = 4. */
+/*
+ * The internal event (QemuPluginCpuEvent, hw/core/cpu.h) and the
+ * plugin-facing struct qemu_plugin_cpu_event share one layout: the drain
+ * below hands out the internal buffer by cast.  The kind values pass
+ * through raw as well, so the two enums must stay value-aligned member for
+ * member.  Every field offset and every kind value is checked here, so a
+ * drift in either is a compile break rather than silent corruption.
+ */
 QEMU_BUILD_BUG_ON(sizeof(struct qemu_plugin_cpu_event) !=
                   sizeof(QemuPluginCpuEvent));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, kind) !=
+                  offsetof(QemuPluginCpuEvent, kind));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, priv) !=
+                  offsetof(QemuPluginCpuEvent, priv));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, tp_ok) !=
+                  offsetof(QemuPluginCpuEvent, tp_ok));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, depth_after) !=
+                  offsetof(QemuPluginCpuEvent, depth_after));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, pc) !=
+                  offsetof(QemuPluginCpuEvent, pc));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, asid) !=
+                  offsetof(QemuPluginCpuEvent, asid));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, tp) !=
+                  offsetof(QemuPluginCpuEvent, tp));
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_ENTER !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER);
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_RETURN !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN);
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_ASYNC_ENTER !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER);
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_ASYNC_RETURN !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN);
 QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_ASID_WRITE !=
                   (int)QEMU_PLUGIN_CPU_EVENT_ASID_WRITE);
 
@@ -1105,11 +1102,10 @@ void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
         cpu_plugin_async_probe(cpu, enabled ? "QON" : "QOFF", 0, false);
     }
     /*
-     * This function used to zero @len on BOTH arms -- a silent discard of
-     * however many events were pending.  Nothing may be dropped here: a
-     * non-empty queue at this point is a consumer that stopped consuming
-     * while events were still owed, i.e. the unbounded-growth defect this
-     * plumbing exists to make impossible.  Report it as the bug it is.
+     * Nothing may be dropped here: a non-empty queue at this point is a
+     * consumer that stopped consuming while events were still owed, i.e. the
+     * unbounded-growth defect this plumbing exists to make impossible.
+     * Report it as the bug it is.
      *
      * The obligation this places on the caller is exact and cheap to meet:
      * disable (or re-enable) only where the queue is provably empty, which
@@ -1160,9 +1156,12 @@ size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
     }
     QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
     size_t n = q->len;
-    /* Single producer/consumer == this vCPU thread; handing out the
-     * internal buffer is race-free until the next push, which cannot
-     * happen before the consumer's tb_exec callback returns. */
+    /*
+     * Single producer/consumer == this vCPU thread; handing out the
+     * internal buffer (by cast; the layouts are checked above) is race-free
+     * until the next push, which cannot happen before the consumer's
+     * tb_exec callback returns.
+     */
     *evs = (const struct qemu_plugin_cpu_event *)q->buf;
     q->len = 0;
     q->n_drain++;
@@ -1174,21 +1173,15 @@ size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
 
 void qemu_plugin_async_int_reset(void)
 {
-#ifndef CONFIG_USER_ONLY
     if (current_cpu) {
         cpu_plugin_async_probe(current_cpu, "RESET", 0, false);
         current_cpu->plugin_in_async_int = false;
     }
-#endif
 }
 
 uint32_t qemu_plugin_fault_depth(void)
 {
-#ifdef CONFIG_USER_ONLY
-    return 0;
-#else
     return current_cpu ? current_cpu->plugin_fault_depth : 0;
-#endif
 }
 
 /*
@@ -1232,11 +1225,7 @@ bool qemu_plugin_rep_chunk_boundary(void)
 
 bool qemu_plugin_spec_store_overflowed(void)
 {
-#ifdef CONFIG_USER_ONLY
-    return false;
-#else
     return current_cpu && current_cpu->plugin_spec_store_overflow;
-#endif
 }
 
 uint64_t qemu_plugin_spec_reserve_opens(void)

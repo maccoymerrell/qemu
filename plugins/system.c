@@ -18,7 +18,7 @@
 #include "plugin.h"
 #include "qemu/timer.h"
 #include "qemu/vclock-agency.h"
-#include "qemu/cst_bqslice.h"
+#include "qemu/tcg-slice.h"
 #include "system/cpu-timers.h"
 #include "system/tcg.h"
 
@@ -91,27 +91,15 @@ static void plugin_vm_shutdown_on_cpu(CPUState *cpu, run_on_cpu_data arg)
      * whole time.  A plugin that closes a capture here takes its own callback
      * lock, and a plugin that instruments speculatively holds that same lock
      * across a wrong-path excursion -- which acquires the BQL from inside it,
-     * at cpu_plugin_spec_vtime_pause, at cpu_plugin_spec_vtime_resume, and at
+     * at cpu_plugin_excursion_open, at cpu_plugin_excursion_close, and at
      * cpu_plugin_arch_state_restore on RISC-V.  So the excursion's order is
      * plugin lock then BQL, and arriving here holding the BQL and then
      * blocking on the plugin lock runs it the other way: the lock's holder is
      * waiting for the BQL this thread owns, and the machine stops dead --
-     * every thread in futex_wait, zero CPU, no close, no trace.
-     *
-     * Measured on the ChampSim Tracer at -smp 4 with the wrong path enabled
-     * and a marker window open, taken to a close by SIGTERM.  Every
-     * reproduction so far is RISC-V: four of eight riscv64 cells stopped
-     * dead, and the two aarch64 cells run with the same arms both closed.
-     * That is a difference in exposure, not in kind -- the pause and the
-     * resume take the BQL on every target, and RISC-V merely has a third
+     * every thread in futex_wait, zero CPU, no close, no trace.  The pause
+     * and the resume take the BQL on every target; RISC-V has a third
      * acquisition (the pending-interrupt replay in
-     * cpu_plugin_arch_state_restore) and so a wider window -- so aarch64 is
-     * unproven here rather than exempt.  Confirmed against this code by an
-     * A/B of two binaries differing only in the ten bytes of the two calls
-     * below: with the drop removed, two of sixteen cells deadlocked, each
-     * with the shutdown callback on the plugin's lock beneath
-     * process_queued_cpu_work and a peer's excursion on the BQL, no shutdown
-     * banner and no assembled trace; with it in place, none of eight.
+     * cpu_plugin_arch_state_restore) and so a wider window.
      *
      * Dropping it is the same treatment process_queued_cpu_work() already
      * gives an exclusive item, and for the same reason.  It costs nothing:
@@ -162,15 +150,10 @@ void qemu_plugin_vm_shutdown(void)
          * This route arrives with the BQL held — a TCG guest's device
          * write takes it in do_st_mmio_leN, an exception handler in
          * cpu_handle_exception — so a synchronous dispatch here has the
-         * same AB/BA exposure the marshalled route had: this thread
+         * lock-order inversion the marshalled route avoids: this thread
          * blocks on a plugin lock a peer vCPU holds across a wrong-path
          * excursion, and that excursion blocks on the BQL this thread
-         * owns.  Measured on the ChampSim Tracer, riscv64 -smp 4 with a
-         * marker window open and the guest running poweroff -f: the
-         * writing vCPU stood in the plugin's shutdown callback beneath
-         * the syscon store while a peer's excursion waited for the BQL,
-         * zero CPU, no close, no trace.  The marshalled route's cure
-         * cannot be copied — this BQL is the device write's own, and
+         * owns.  The marshalled route's cure cannot be copied — this BQL is the device write's own, and
          * releasing it mid-handler would publish a half-updated device —
          * so the dispatch is not run inside the write at all: the work is
          * queued on this same vCPU and runs at its next TB boundary,
@@ -250,10 +233,9 @@ void qemu_plugin_vm_shutdown(void)
 /*
  * Machine reset -> plugin.  The mirror of qemu_plugin_vm_shutdown() above,
  * with the same three routes and the same discipline — keep the two in
- * step, in particular the BQL drop around the marshalled dispatch, whose
- * deadlock (a peer vCPU holding the plugin's lock across a wrong-path
- * excursion that acquires the BQL) was measured and A/B-proven on the
- * shutdown path.  Differences, both consequences of a reset not being
+ * step, in particular the BQL drop around the marshalled dispatch, which
+ * prevents a deadlock against a peer vCPU holding the plugin's lock across
+ * a wrong-path excursion that acquires the BQL.  Differences, both consequences of a reset not being
  * terminal: the placement flag is re-armed per event rather than latched
  * for the run, and the core-side dispatch folds only concurrent
  * duplicates (see qemu_plugin_vm_reset_dispatch).
@@ -318,7 +300,7 @@ void qemu_plugin_vm_reset(void)
          * Malta SOFTRES register) or an x86 triple fault, arriving on
          * the responsible vCPU's own thread with its state live.
          *
-         * The same AB/BA the shutdown route measured (see
+         * The same lock-order inversion as the shutdown route (see
          * qemu_plugin_vm_shutdown): this thread holds the BQL from the
          * device write, and a synchronous dispatch would block on a
          * plugin lock a peer vCPU can hold across a wrong-path excursion
@@ -390,18 +372,20 @@ void qemu_plugin_vm_reset_wait_placed(void)
 }
 
 /*
- * Event-agency arming (PRODUCT; see qemu/vclock-agency.h).  The
- * condition is PLUGIN-ACTIVE -- a runtime fact decided at the plugin
- * loader's install/uninstall edges -- never an environment knob.
+ * Event-agency arming (see qemu/vclock-agency.h).  The condition is
+ * PLUGIN-ACTIVE -- a runtime fact decided at the plugin loader's
+ * install/uninstall edges -- never an environment knob.
  *
- * Arming turns on BOTH halves of the discipline: the VIRTUAL
+ * Arming turns on both halves of the discipline: the VIRTUAL
  * exclusion/consumption side (vclock_agency_set_active) and the
  * guest-insn slice bounding whose breakouts carry the consumption
- * (cst_bq_product_arm) -- the delivery bound IS the slice quantum, so
- * the two are one product decision, armed on one edge.  There is no
- * wake timer: the trigger-site wave (wave/proddr) proved the
- * dispatch-top trigger and its VIRTUAL_RT nudge are the disproven
- * geometry, and the slice breakout needs no real-time wake.
+ * (tcg_slice_arm) -- the delivery bound IS the slice quantum, so
+ * the two are armed together, on one edge.  There is no wake timer: the
+ * slice breakout is the consumption site and needs no real-time wake.
+ *
+ * Disarming is not symmetric.  The slice half stays armed for process
+ * life (translated TBs carry its prologue); only VIRTUAL consumption
+ * returns to stock.
  */
 void qemu_plugin_vclock_agency_mode(bool active)
 {
@@ -417,13 +401,14 @@ void qemu_plugin_vclock_agency_mode(bool active)
         }
         /* the slice half arms first so no engaged window can exist
          * without its consumption sites */
-        cst_bq_product_arm();
+        tcg_slice_arm();
         vclock_agency_set_active(true);
         /* fold in every VIRTUAL timer armed before the plugin loaded
          * (witness slot; the consumption predicate is the fresh
          * breakout-site read) */
         vclock_agency_resync();
     } else {
+        /* The slice half stays armed; see above. */
         vclock_agency_set_active(false);
     }
 }

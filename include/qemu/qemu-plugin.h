@@ -461,8 +461,10 @@ typedef struct {
  * @QEMU_PLUGIN_CB_R_REGS: callback reads the CPU's regs
  * @QEMU_PLUGIN_CB_RW_REGS: callback reads and writes the CPU's regs
  *
- * QEMU_PLUGIN_CB_RW_REGS enables write_register, cpu_state_restore,
- * set_pc, and exec_inline_insn from within the callback.
+ * QEMU does not check these flags for write_register, cpu_state_save,
+ * cpu_state_restore, set_pc or exec_inline_insn: those functions must be
+ * called from a vCPU callback, and the flag a plugin registers states its
+ * intent only.
  */
 enum qemu_plugin_cb_flags {
     QEMU_PLUGIN_CB_NO_REGS,
@@ -1125,9 +1127,11 @@ void qemu_plugin_async_run_on_vcpu(unsigned int vcpu_index,
 /**
  * enum qemu_plugin_devio_dir - direction/kind of a block-device request
  * @QEMU_PLUGIN_DEVIO_READ: data read from the device into guest memory
- * @QEMU_PLUGIN_DEVIO_WRITE: data written from guest memory to the device
- *                           (also pwrite-zeroes / discard — a zero-byte
- *                           payload distinguishes those from a data write)
+ * @QEMU_PLUGIN_DEVIO_WRITE: data written from guest memory to the device;
+ *                           write-zeroes requests are reported as WRITE with
+ *                           their full length and cannot be told apart.
+ *                           Discard, ioctl and zone requests are not
+ *                           reported.
  * @QEMU_PLUGIN_DEVIO_FLUSH: a cache-flush / write-barrier (no data)
  */
 enum qemu_plugin_devio_dir {
@@ -1331,12 +1335,14 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
  * @vcpu_index: the vCPU the reset CAME FROM, with the same two
  *              non-indices and the same meaning as
  *              qemu_plugin_vm_shutdown_cb_t's @vcpu_index.
- * @in_guest_insn: same statement as qemu_plugin_vm_shutdown_cb_t's:
- *              a guest-initiated reset is a device write (or, on x86, a
- *              triple fault raised mid-instruction), so the request
- *              arrives with that instruction begun and not retired;
- *              false on the marshalled routes (monitor, QMP, watchdog),
- *              which run at a translation-block boundary.
+ * @in_guest_insn: same statement as qemu_plugin_vm_shutdown_cb_t's.
+ *              False at every ordinary route: the monitor, QMP and
+ *              watchdog are marshalled onto a vCPU, and a guest-initiated
+ *              reset (a device write or, on x86, a triple fault) arrives
+ *              under the BQL, so it is queued on the responsible vCPU and
+ *              delivered at its next translation-block boundary.  True
+ *              only for a vCPU-context request that arrives without the
+ *              BQL and so really does run mid-instruction.
  *
  * Dispatched when the machine is about to be RESET rather than shut
  * down: the guest wrote a reset register (x86 port 92h / PIIX RCR /
@@ -1626,8 +1632,8 @@ struct qemu_plugin_cpu_state;
  * @handle: a @qemu_plugin_reg_handle handle from qemu_plugin_get_registers()
  * @buf: A GByteArray containing the data to write, in target byte order
  *
- * This function is only available in a context that register write access is
- * explicitly requested via the QEMU_PLUGIN_CB_RW_REGS flag.
+ * Must be called from a vCPU callback; QEMU does not check the callback's
+ * registration flags.
  *
  * Returns the number of bytes written. On failure returns -1.
  */
@@ -1643,8 +1649,8 @@ int qemu_plugin_write_register(struct qemu_plugin_register *handle,
  * target). The returned handle must be freed with
  * qemu_plugin_cpu_state_free().
  *
- * This function is only available in a context that register read access is
- * explicitly requested via QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
+ * Must be called from a vCPU callback; QEMU does not check the callback's
+ * registration flags.
  *
  * Returns an opaque handle to the saved state, or NULL on failure.
  */
@@ -1659,8 +1665,8 @@ struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void);
  * Restores the complete register state of the current vCPU from a
  * previously saved snapshot.
  *
- * This function is only available in a context that register write access is
- * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ * Must be called from a vCPU callback; QEMU does not check the callback's
+ * registration flags.
  *
  * Returns true on success, false on failure.
  */
@@ -1685,8 +1691,8 @@ void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state);
  * Sets the PC to the given address. Must be used together with
  * state save/restore for wrong-path execution scenarios.
  *
- * This function is only available in a context that register write access is
- * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ * Must be called from a vCPU callback; QEMU does not check the callback's
+ * registration flags.
  */
 QEMU_PLUGIN_API
 void qemu_plugin_set_pc(uint64_t pc);
@@ -1704,14 +1710,19 @@ uint64_t qemu_plugin_get_pc(void);
  * qemu_plugin_exec_inline_insn() - execute one instruction at current PC
  *
  * Translates and executes exactly one instruction at the current program
- * counter. Plugin instrumentation callbacks are suppressed during this
- * execution to avoid recursive callbacks.
+ * counter, in a block that does not chain to its successor.  Only memory
+ * callbacks fire for it (the block is translated CF_MEMI_ONLY); instruction
+ * and translation-block callbacks do not, so a caller inside a callback does
+ * not recurse.
  *
  * This is designed for wrong-path simulation: save state, set PC to wrong
  * target, execute instructions one at a time collecting memory accesses,
  * then restore state.
  *
- * Returns true on success, false on failure (e.g. unmapped address).
+ * Returns true on success, including an instruction that ends in an internal
+ * yield inside speculative mode; false when the PC is not mapped for
+ * execution, the block cannot be translated, or the instruction raises an
+ * exception.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_exec_inline_insn(void);
@@ -1830,8 +1841,10 @@ void qemu_plugin_vclock_resume(void);
  * and ratioed against executed instructions it yields the guest's instruction
  * rate per guest-second — the quantity that decides how much timer-interrupt
  * work the guest is charged per unit of forward progress, and hence the only
- * load-independent way to tell a slow capture from a wedged one.  Returns 0 in
- * user-mode emulation, which has no guest clock.
+ * load-independent way to tell a slow capture from a wedged one.  Returns 0
+ * under -icount, where guest time is pinned to the instruction count.  In
+ * user-mode emulation QEMU_CLOCK_VIRTUAL is backed by the host clock, and
+ * that is what this returns.
  *
  * Read-only and side-effect free; callable from any plugin callback.
  */
@@ -2168,8 +2181,10 @@ bool qemu_plugin_rep_chunk_boundary(void);
  * crossing PLUGIN_SPEC_STORE_SOFT_BUDGET lines.  A normal wpdepth-bounded
  * excursion never trips this; the wrong-path loop should poll it and terminate
  * the excursion so the sandbox is not filled to its hard cap (which would
- * silently drop later speculative stores).  Always false in user mode / outside
- * spec mode.
+ * silently drop later speculative stores).  Applies in user-mode and system
+ * emulation alike.  The flag is cleared by qemu_plugin_spec_mode_begin() and
+ * not by qemu_plugin_spec_mode_end(), so between excursions it still reports
+ * the last one.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_spec_store_overflowed(void);
@@ -2452,19 +2467,5 @@ bool qemu_plugin_thread_ptr_tracks_current(void);
  */
 QEMU_PLUGIN_API
 void qemu_plugin_set_current_task_offset(uint64_t offset);
-
-/**
- * qemu_plugin_icount_enabled() - whether QEMU is running with -icount
- *
- * Returns true when instruction-count timing is active.  Under icount the
- * guest virtual clock is driven by the instruction count rather than host
- * wall-clock, so the wrong-path virtual-clock freeze (cpu_disable_ticks) does
- * NOT stop guest time from advancing during a speculative excursion.  A plugin
- * that speculatively executes wrong-path code should refrain from speculating
- * under icount (the excursion's instructions would leak into guest time).
- * Always false in ``*-linux-user``.
- */
-QEMU_PLUGIN_API
-bool qemu_plugin_icount_enabled(void);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

@@ -369,8 +369,11 @@ static void plugin_reset_destroy__locked(struct qemu_plugin_reset_data *data)
     g_assert(success);
     QTAILQ_REMOVE(&plugin.ctxs, ctx, entry);
     if (QTAILQ_EMPTY(&plugin.ctxs)) {
-        /* PLUGIN-ACTIVE edge: the last plugin is gone -- restore stock
-         * VIRTUAL consumption (event-agency discipline) */
+        /*
+         * PLUGIN-ACTIVE edge: the last plugin is gone -- restore stock
+         * VIRTUAL consumption (event-agency discipline).  The slice half
+         * stays armed for process life; see plugins/system.c.
+         */
         qemu_plugin_vclock_agency_mode(false);
     }
     if (data->cb) {

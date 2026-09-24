@@ -142,14 +142,13 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
                                          qemu_plugin_vm_shutdown_cb_t cb)
 {
     /*
-     * @in_guest_insn appended inside version 19; 20 is the first that says
-     * so.  21 moved again, without touching the argument list: @vcpu_index
-     * stopped naming the vCPU the callback was PLACED on and started naming
-     * the vCPU the shutdown CAME FROM.  A version number is the only thing
-     * that separates the two readings, so it has to be the gate -- a plugin
-     * built at 20 would read QEMU_PLUGIN_VCPU_UNNAMED as "no vCPU exists"
-     * and, on a route where one does, close its capture without ever
-     * looking at the machine.
+     * Version 21 is the first whose qemu_plugin_vm_shutdown_cb_t carries
+     * @in_guest_insn and whose @vcpu_index names the vCPU the shutdown CAME
+     * FROM.  The second is a change of meaning with no change of signature,
+     * so only the declared version separates the two readings: a plugin
+     * declaring less would read QEMU_PLUGIN_VCPU_UNNAMED as "no vCPU exists"
+     * and, on a route where one does, close its capture without looking at
+     * the machine.
      */
     plugin_require_abi(id, "qemu_plugin_vm_shutdown_cb_t", 21);
     vm_shutdown_hook = cb;
@@ -276,11 +275,12 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
                                    qemu_plugin_devio_stop_cb_t stop_cb)
 {
     /*
-     * @doorbell_cb INSERTED, and @dev_token appended to the start callback,
-     * inside version 12; 13 is the first version that says so.  A version-12
-     * caller passes three arguments, so start_cb would land in the doorbell
-     * slot, stop_cb in the start slot, and the stop slot would take whatever
-     * the fourth argument register happened to hold.
+     * Version 13 is the first whose declaration of this registrar takes
+     * @doorbell_cb (inserted before @start_cb) and whose start callback takes
+     * @dev_token.  A caller declaring less may pass three arguments, so
+     * start_cb would land in the doorbell slot, stop_cb in the start slot,
+     * and the stop slot would take whatever the fourth argument register
+     * held.
      */
     plugin_require_abi(id, "qemu_plugin_register_devio_cb", 13);
     devio_doorbell_hook = doorbell_cb;
@@ -442,10 +442,10 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * is the same vCPU thread, so no ordering beyond program order is
      * needed (documented single-producer/single-consumer, cpu.h).
      *
-     * A consumer that never published a slot gets the historical behaviour
-     * -- and, deliberately, NOT the tripwire below: the ceiling is a claim
-     * about what the per-TB drain point makes impossible, so it is only
-     * asserted where that drain point exists.
+     * A consumer that never published a slot gets no drain-owed flag and,
+     * deliberately, NOT the tripwire below: the ceiling is a claim about
+     * what the per-TB drain point makes impossible, so it is only asserted
+     * where that drain point exists.
      */
     if (evq_pending_slot_set) {
         qemu_plugin_u64_set(evq_pending_slot, cpu->cpu_index, 1);
@@ -491,10 +491,7 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
      * that departure context never resumes here (a boot/idle/kthread context
      * on a vCPU the guest later parks, the common case once there is more
      * than one vCPU), the flag stays true for the rest of the run and every
-     * later interrupt is swallowed by the edge gate.  Measured on aarch64
-     * --smp 2: both vCPUs entered the traced segment already latched, and 135
-     * of 135 in-segment deliveries were swallowed — the async-window feature
-     * silently inert on every SMP trace.
+     * later interrupt is swallowed by the edge gate.
      *
      * With no consumer there is nothing for the window to mean: the tracer's
      * own readers (qemu_plugin_in_async_int) only act while it is emitting,
@@ -517,7 +514,7 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
      * context switch does), and a genuine resume restores exactly this
      * value before the exception return lands on @departure_pc.  Targets
      * without the hook record 0 on both sides — the return check then
-     * degrades to the historical bare PC equality.
+     * degrades to bare PC equality.
      */
     cpu->plugin_async_departure_tp =
         (ops && ops->get_plugin_thread_ptr) ? ops->get_plugin_thread_ptr(cpu)
@@ -552,10 +549,10 @@ void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
         const char *v = getenv("CST_ASYNCPROD_DIAG");
         on = v != NULL;
         /*
-         * A numeric value raises the line cap ("1" keeps the historical
-         * 40000): a whole-boot delivery stream exhausts 40000 lines long
-         * before a marker window opens, silencing the probe exactly where
-         * the investigation needs it.
+         * A numeric value above 1 raises the line cap from its default of
+         * 40000: a whole-boot delivery stream exhausts 40000 lines long
+         * before a capture window opens, silencing the probe exactly where
+         * it is needed.
          */
         if (on && v[0] && strtoull(v, NULL, 0) > 1) {
             cap = strtoull(v, NULL, 0);

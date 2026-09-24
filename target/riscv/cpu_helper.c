@@ -1676,7 +1676,15 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
 
     if (pte & PTE_U) {
         if (mode != PRV_U) {
-            if (!mmuidx_sum(mmu_idx)) {
+            /*
+             * SUM keeps a supervisor from following a user pointer by
+             * accident.  A debug access (gdbstub, monitor, TCG plugin)
+             * is not an architectural access: it asks what the page
+             * table maps, often precisely because the hart is stopped in
+             * S-mode with SUM clear.  Same rule as the Arm debug walk
+             * with PAN, and x86's debug walk never consults SMAP.
+             */
+            if (!mmuidx_sum(mmu_idx) && !is_debug) {
                 return TRANSLATE_FAIL;
             }
             /* SUM allows only read+write, not execute. */

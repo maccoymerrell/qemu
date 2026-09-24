@@ -72,6 +72,27 @@
  *   one entry per unit before they reach the slot tables (§5.2), so
  *   every published count is one unit's.
  *
+ *   NEVER-DELIVERED: OVER-MAX's under-side sibling, keyed on
+ *   EXECUTIONS.  An insn whose template declares a nonzero max, that
+ *   ran on the correct path (inside an entry's executed range) at least
+ *   once, and whose every such execution published zero loads and zero
+ *   stores.  The contract lets one execution publish fewer than the max,
+ *   and zero, so no single execution is a violation -- but an access the
+ *   template says the instruction performs and that NO execution of it
+ *   ever delivered is the shape of a helper writing guest memory behind
+ *   the memory callbacks (row 514: every qemu-user FXSAVE/XSAVE family
+ *   execution published 0 against a declared 55-99 while the wrong path
+ *   carried them all), and nothing above could see it because 0 is
+ *   within any max.  An insn that never executed is not a subject: a
+ *   template minted for code that did not run delivers nothing and owes
+ *   nothing.  Counted per instruction (pc + encoding bytes) across every
+ *   template carrying it, so an execution that faulted in one template
+ *   and delivered on its retry in another is not a violation.  Excluded: encodings whose access the architecture itself
+ *   can suppress (memop_is_architecturally_optional(), below -- the
+ *   FEAT_MOPS size-0 transfer, a failing RISC-V SC, an x86 REP string
+ *   operation entered with RCX == 0), because for them a
+ *   run of zero-memop executions is the architecture, not a loss.
+ *
  *   REG: flagged only when a dst-register value record lands on an
  *   operand slot >= the insn's static dst count (any slot when the
  *   count is zero), or on an insn position past the template.  Only
@@ -111,6 +132,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -119,6 +141,9 @@
 #include "cst_common.h"
 
 namespace cst {
+
+inline bool memop_is_architecturally_optional(uint8_t isa,
+                                              const std::vector<uint8_t> &raw);
 
 class AttributionLint {
 public:
@@ -193,6 +218,24 @@ public:
                 row.push_back(b);
             }
             rows_.emplace(t.template_id, std::move(row));
+
+            /* The NEVER-DELIVERED rule's subjects: every insn that
+             * declares an access the architecture cannot suppress. */
+            UnderRow ur;
+            for (size_t i = 0; i < t.insns.size(); i++) {
+                const InsnTemplate &I = t.insns[i];
+                if (I.max_dep_loads == 0 && I.max_dep_stores == 0) continue;
+                if (memop_is_architecturally_optional(h.isa, I.raw_bytes)) {
+                    continue;
+                }
+                ur.ipos.push_back((uint32_t)i);
+            }
+            if (!ur.ipos.empty()) {
+                ur.execs.assign(ur.ipos.size(), 0);
+                ur.delivering.assign(ur.ipos.size(), 0);
+                under_rows_.emplace(t.template_id, std::move(ur));
+            }
+            tmpl_by_id_.emplace(t.template_id, &t);
         }
 
         /* dst-reg VALUE family fid -> operand slot (the width family
@@ -349,6 +392,126 @@ public:
         return out;
     }
 
+    /*
+     * The NEVER-DELIVERED rule (header comment).  One row per template
+     * that declares a suppressible-by-nothing access: the declaring insn
+     * positions, ascending, and per position how many CP executions ran
+     * it and how many of those published at least one memop.  A feeder
+     * resolves the row once per entry and walks it against the entry's
+     * executed range, so the per-entry cost is one hash probe.
+     */
+    struct UnderRow {
+        std::vector<uint32_t> ipos;
+        std::vector<uint64_t> execs;
+        std::vector<uint64_t> delivering;
+
+        /* One CP execution of the declaring insn at row index @k,
+         * which published @n memops in all. */
+        void note(size_t k, uint64_t n) {
+            execs[k]++;
+            if (n) delivering[k]++;
+        }
+    };
+
+    UnderRow *under_row(uint32_t template_id) {
+        auto it = under_rows_.find(template_id);
+        return it == under_rows_.end() ? nullptr : &it->second;
+    }
+
+    /* A declaring instruction that executed on the correct path and
+     * never delivered: its identity (first template it was seen in),
+     * its declared maxes and how many executions published nothing.
+     *
+     * Aggregated per INSTRUCTION -- pc and encoding bytes -- across
+     * every template that carries it, not per template position.  One
+     * instruction lives in several templates (a block entered mid-way is
+     * its own template), and the execution that delivers can sit in a
+     * different one from the execution that did not: an aarch64 STTR
+     * that faults at insn 1 of the block at 0x...b5c is re-executed, and
+     * delivers, as insn 0 of the block the fault returns to at
+     * 0x...b60.  Keyed per template the faulting copy reads "never
+     * delivered" although the instruction delivered every time it
+     * completed. */
+    struct UnderSubject {
+        MemSubject id;
+        uint32_t   max_loads  = 0;
+        uint32_t   max_stores = 0;
+        uint64_t   execs      = 0;
+        uint64_t   delivering = 0;
+    };
+
+    /* Every declaring instruction that executed at least once. */
+    std::vector<UnderSubject> under_executed() const {
+        std::map<std::pair<uint64_t, std::vector<uint8_t>>, UnderSubject> agg;
+        for (const auto &kv : under_rows_) {
+            const UnderRow &r = kv.second;
+            auto t = tmpl_by_id_.find(kv.first);
+            for (size_t k = 0; k < r.ipos.size(); k++) {
+                if (r.execs[k] == 0) continue;
+                if (t == tmpl_by_id_.end() ||
+                    r.ipos[k] >= t->second->insns.size()) {
+                    continue;
+                }
+                const InsnTemplate &I = t->second->insns[r.ipos[k]];
+                auto key = std::make_pair(I.pc, I.raw_bytes);
+                auto it = agg.find(key);
+                if (it == agg.end()) {
+                    UnderSubject u;
+                    u.id.template_id = kv.first;
+                    u.id.ipos        = r.ipos[k];
+                    u.id.pc          = I.pc;
+                    u.id.opcode      = I.opcode;
+                    u.id.bytes       = I.raw_bytes;
+                    u.max_loads      = I.max_dep_loads;
+                    u.max_stores     = I.max_dep_stores;
+                    it = agg.emplace(key, std::move(u)).first;
+                } else if (kv.first < it->second.id.template_id) {
+                    it->second.id.template_id = kv.first;
+                    it->second.id.ipos        = r.ipos[k];
+                }
+                it->second.execs      += r.execs[k];
+                it->second.delivering += r.delivering[k];
+            }
+        }
+        std::vector<UnderSubject> out;
+        out.reserve(agg.size());
+        for (auto &kv : agg) out.push_back(std::move(kv.second));
+        std::sort(out.begin(), out.end(),
+                  [](const UnderSubject &a, const UnderSubject &b) {
+                      return a.id.template_id != b.id.template_id
+                                 ? a.id.template_id < b.id.template_id
+                                 : a.id.ipos < b.id.ipos;
+                  });
+        return out;
+    }
+
+    /* The violators: executed, and no execution delivered. */
+    std::vector<UnderSubject> under_subjects() const {
+        std::vector<UnderSubject> out;
+        for (UnderSubject &u : under_executed()) {
+            if (u.delivering == 0) out.push_back(std::move(u));
+        }
+        return out;
+    }
+
+    /* The rule's subject count: declaring instructions that executed on
+     * the correct path at all, and their executions.  A zero verdict
+     * over a trace where this reads zero examined nothing. */
+    uint64_t under_subject_insns() const { return under_executed().size(); }
+    uint64_t under_subject_execs() const {
+        uint64_t n = 0;
+        for (const UnderSubject &u : under_executed()) n += u.execs;
+        return n;
+    }
+
+    /* Violators and their zero-memop executions. */
+    uint64_t never_delivered_insns() const { return under_subjects().size(); }
+    uint64_t never_delivered_execs() const {
+        uint64_t n = 0;
+        for (const UnderSubject &u : under_subjects()) n += u.execs;
+        return n;
+    }
+
     uint64_t mem_violations() const { return mem_memops_; }
     uint64_t reg_violations() const { return reg_records_; }
     uint64_t dangling_refs() const { return dangling_refs_; }
@@ -363,25 +526,29 @@ public:
     }
     bool     any() const {
         return mem_memops_ || reg_records_ || dangling_refs_ ||
-               over_records_;
+               over_records_ || never_delivered_insns() != 0;
     }
 
     /* "N memop (M distinct insns), R regdata (S distinct insns),
      *  D dangling template refs (K distinct ids),
-     *  O over-max executions (P distinct insns)" */
+     *  O over-max executions (P distinct insns),
+     *  U never-delivered executions (V distinct insns)" */
     std::string summary() const {
-        char buf[288];
+        char buf[384];
         std::snprintf(buf, sizeof(buf),
                       "%llu memop (%zu distinct insns), "
                       "%llu regdata (%zu distinct insns), "
                       "%llu dangling template refs (%zu distinct ids), "
-                      "%llu over-max executions (%zu distinct insns)",
+                      "%llu over-max executions (%zu distinct insns), "
+                      "%llu never-delivered executions (%llu distinct insns)",
                       (unsigned long long)mem_memops_, distinct_mem_.size(),
                       (unsigned long long)reg_records_, distinct_reg_.size(),
                       (unsigned long long)dangling_refs_,
                       distinct_dangling_.size(),
                       (unsigned long long)over_records_,
-                      over_subjects_.size());
+                      over_subjects_.size(),
+                      (unsigned long long)never_delivered_execs(),
+                      (unsigned long long)never_delivered_insns());
         return buf;
     }
 
@@ -517,6 +684,32 @@ public:
             }
         }
 
+        /* The NEVER-DELIVERED feeder: the entry's executed range
+         * [@rs, @re), resolved after its whole section applied.  Each
+         * declaring insn inside it ran once; its count cells, as this
+         * tracker follows them, are what that execution published. */
+        void on_cp_range(uint64_t ctx, uint32_t template_id,
+                         uint32_t rs, uint32_t re) {
+            UnderRow *ur = lint_.under_row(template_id);
+            if (!ur) return;
+            ThreadState *ts = nullptr;
+            auto ct = ctxs_.find(ctx);
+            if (ct != ctxs_.end()) ts = &ct->second;
+            for (size_t k = 0; k < ur->ipos.size(); k++) {
+                uint32_t ipos = ur->ipos[k];
+                if (ipos < rs) continue;
+                if (ipos >= re) break;
+                uint64_t n = 0;
+                if (ts) {
+                    auto c = ts->cells.find(insn_key(template_id, ipos));
+                    if (c != ts->cells.end()) {
+                        n = c->second.loads + c->second.stores;
+                    }
+                }
+                ur->note(k, n);
+            }
+        }
+
     private:
         struct Cells { uint64_t loads = 0, stores = 0; };
         struct ThreadState {
@@ -547,6 +740,10 @@ private:
     std::unordered_set<uint32_t> distinct_dangling_;
     uint64_t over_records_ = 0;
     std::unordered_map<uint64_t, OverSubject> over_subjects_;
+    /* NEVER-DELIVERED rows, and the templates they name (the lint is
+     * constructed over, and never outlives, the caller's template list). */
+    std::unordered_map<uint32_t, UnderRow> under_rows_;
+    std::unordered_map<uint32_t, const Template *> tmpl_by_id_;
 };
 
 /*
@@ -649,17 +846,39 @@ struct MemopBimodalityConfig {
  *     rd, so the failing iteration of an LR/SC retry loop realises no
  *     memop while every successful one realises two.
  *
+ *   x86  REP / REPZ / REPNZ string operations (F2/F3 prefix on MOVS,
+ *        CMPS, STOS, LODS, SCAS, INS, OUTS)
+ *     Entered with RCX == 0 the instruction retires and performs no
+ *     iteration, so it touches no memory.  Witnessed: the
+ *     rep_fanout_invariance control program's `rep movsb` at ECX=0 is a
+ *     one-entry, zero-memop execution by design, and the NEVER-DELIVERED
+ *     rule read it as a violation until this case existed.
+ *
  * The same class exists elsewhere and is NOT covered here, because no
  * trace has exercised it yet and a guessed encoding would silently blind
- * the lint: MIPS SC/SCD, x86 REP-prefixed string operations entered with
- * RCX == 0, and predicated SVE / masked AVX-512 accesses with an
- * all-false predicate.  The durable fix is a static wire flag set from
+ * the lint: MIPS SC/SCD, and predicated SVE / masked AVX-512 accesses
+ * with an all-false predicate.  The durable fix is a static wire flag set from
  * the writer's own Capstone classification, which would retire this
  * table; see the note in the lint's report.
  */
 inline bool memop_is_architecturally_optional(uint8_t isa,
                                               const std::vector<uint8_t> &raw)
 {
+    if (isa == 1) {   /* x86_64 */
+        bool rep = false;
+        for (uint8_t b : raw) {
+            if (b == 0xF2 || b == 0xF3) { rep = true; continue; }
+            if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0x2E ||
+                b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 ||
+                b == 0x65 || (b >= 0x40 && b <= 0x4F)) {
+                continue;
+            }
+            return rep && ((b >= 0xA4 && b <= 0xA7) ||
+                           (b >= 0xAA && b <= 0xAF) ||
+                           (b >= 0x6C && b <= 0x6F));
+        }
+        return false;
+    }
     if (raw.size() < 4) return false;
     uint32_t w = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8) |
                  ((uint32_t)raw[2] << 16) | ((uint32_t)raw[3] << 24);

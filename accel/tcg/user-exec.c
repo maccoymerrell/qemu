@@ -958,6 +958,19 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
     flags = probe_access_internal(env, addr, size, access_type, false, ra);
     g_assert((flags & ~TLB_MMIO) == 0);
 
+    /*
+     * TLB_MMIO is how probe_access_internal says the page must not be
+     * touched through a host pointer: plugin memory callbacks are on, and
+     * a helper that wrote through g2h() would perform its accesses with
+     * no callback at all.  Answer as the softmmu probe does, with NULL, so
+     * the helper takes its per-unit cpu_ld/st path, which reports every
+     * access.  Without plugin memory callbacks the flag is never set and
+     * the host pointer is returned as before.
+     */
+    if (flags & TLB_MMIO) {
+        return NULL;
+    }
+
 #ifdef CONFIG_PLUGIN
     if (size && cpu_plugin_spec_redirect_probe(env_cpu(env))) {
         return NULL;

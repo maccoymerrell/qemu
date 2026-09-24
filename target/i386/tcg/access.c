@@ -32,24 +32,37 @@ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
     ret->haddr1 = haddr1;
 
     /*
-     * When haddr1 is NULL, probe_access forced the slow path — under plugin
-     * speculative (wrong-path) execution probe_access returns NULL so the spec
-     * sandbox can intercept every unit access via access_ptr's !haddr1
-     * short-circuit.  There is then no host pointer to resolve for a second
-     * page, and the USER_ONLY contiguity assert below would fire on the two
-     * NULL probes for a page-crossing access.  Only resolve page 2 when page 1
-     * yielded a real host pointer; otherwise the whole access goes slow-path.
+     * When haddr1 is NULL, probe_access forced the slow path: plugin memory
+     * callbacks are on (every unit access must be reported), or the plugin
+     * is executing speculatively (the spec sandbox intercepts every unit
+     * access).  access_ptr then sends the whole access down the per-unit
+     * path, so there is no host pointer to resolve for a second page, and
+     * the USER_ONLY contiguity assert below would fire on the two NULL
+     * probes.  Page 2 is still PROBED outside speculation: the probe is
+     * what faults a straddling FXSAVE/XSAVE before its first byte is
+     * written, as the architecture requires; skipping it would let the
+     * per-unit path write page 1 and fault part-way.  The speculative path
+     * keeps its per-unit treatment of an absent second page.
      */
-    if (unlikely(size2) && haddr1) {
-        haddr2 = probe_access(env, vaddr + size1, size2, type, mmu_idx, ra);
-        if (haddr2 == haddr1 + size1) {
-            ret->size1 = size;
-        } else {
+    if (unlikely(size2)) {
+        if (haddr1) {
+            haddr2 = probe_access(env, vaddr + size1, size2, type, mmu_idx, ra);
+            if (haddr2 == haddr1 + size1) {
+                ret->size1 = size;
+            } else {
 #ifdef CONFIG_USER_ONLY
-            g_assert_not_reached();
+                g_assert_not_reached();
 #else
-            ret->haddr2 = haddr2;
+                ret->haddr2 = haddr2;
 #endif
+            }
+        } else {
+#ifdef CONFIG_PLUGIN
+            if (!env_cpu(env)->plugin_spec_mode)
+#endif
+            {
+                probe_access(env, vaddr + size1, size2, type, mmu_idx, ra);
+            }
         }
     }
 }

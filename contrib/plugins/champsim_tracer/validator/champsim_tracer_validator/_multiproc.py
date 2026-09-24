@@ -337,15 +337,17 @@ def _audit_clean(cfg: MPConfig, cst: Path) -> tuple:
         r"impossible attributions: (\d+) memop \(\d+ distinct insns\), "
         r"(\d+) regdata \(\d+ distinct insns\), "
         r"(\d+) dangling template refs \(\d+ distinct ids\), "
-        r"(\d+) over-max executions \(\d+ distinct insns\)", out)
-    cols = ("memop", "regdata", "dangling", "over-max")
-    vals = [imposs.group(i + 1) if imposs else "?" for i in range(4)]
+        r"(\d+) over-max executions \(\d+ distinct insns\), "
+        r"(\d+) never-delivered executions \(\d+ distinct insns\)", out)
+    cols = ("memop", "regdata", "dangling", "over-max", "never-delivered")
+    vals = [imposs.group(i + 1) if imposs else "?" for i in range(5)]
     ok = (rc == 0 and rollup is not None and rollup.group(1) == "100.00"
           and imposs is not None and all(v == "0" for v in vals))
     failed = [c for c, v in zip(cols, vals) if v != "0"]
     summary = (f"rc={rc} rollup={rollup.group(1) if rollup else '?'}% "
                f"impossible=({vals[0]} memop,{vals[1]} regdata,"
-               f"{vals[3]} over-max) dangling={vals[2]}"
+               f"{vals[3]} over-max,{vals[4]} never-delivered) "
+               f"dangling={vals[2]}"
                + (f" FAILED[{','.join(failed)}]" if failed else ""))
     return ok, summary
 

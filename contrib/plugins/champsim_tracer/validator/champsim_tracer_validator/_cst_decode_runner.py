@@ -1891,7 +1891,7 @@ def _scan_body_order(lines) -> Sequence:
 
 
 # The whole summary cst_lint.h writes -- memop, regdata, dangling template
-# refs and over-max executions.  It used to stop at the regdata group with
+# refs, over-max executions and never-delivered executions.  It used to stop at the regdata group with
 # a `$` anchor, and the lint's summary had grown a dangling-ref group after
 # it (1a41d97879), so the pattern could never match: every trace parsed as
 # clean here whatever the decoder said.  Anchored on the full line now, so a
@@ -1901,7 +1901,8 @@ _IMPOSSIBLE_RE = re.compile(
     r"^; impossible attributions: (\d+) memop \((\d+) distinct insns\), "
     r"(\d+) regdata \((\d+) distinct insns\), "
     r"(\d+) dangling template refs \((\d+) distinct ids\), "
-    r"(\d+) over-max executions \((\d+) distinct insns\)$"
+    r"(\d+) over-max executions \((\d+) distinct insns\), "
+    r"(\d+) never-delivered executions \((\d+) distinct insns\)$"
 )
 
 
@@ -1912,7 +1913,8 @@ def _parse_impossible_attributions(lines: list[str]) -> dict:
     meta so the validator can fail the trace on its own terms."""
     out = {"memop": 0, "memop_insns": 0, "regdata": 0, "regdata_insns": 0,
            "dangling": 0, "dangling_ids": 0,
-           "over_max": 0, "over_max_insns": 0}
+           "over_max": 0, "over_max_insns": 0,
+           "never_delivered": 0, "never_delivered_insns": 0}
     for line in reversed(lines[-8:]):
         if not line.startswith("; impossible attributions: "):
             continue
@@ -1929,7 +1931,9 @@ def _parse_impossible_attributions(lines: list[str]) -> dict:
                "dangling": int(m.group(5)),
                "dangling_ids": int(m.group(6)),
                "over_max": int(m.group(7)),
-               "over_max_insns": int(m.group(8))}
+               "over_max_insns": int(m.group(8)),
+               "never_delivered": int(m.group(9)),
+               "never_delivered_insns": int(m.group(10))}
         break
     return out
 
@@ -1951,7 +1955,9 @@ def lint_failure(imp) -> str | None:
     cols = (("memop", "memop_insns", "impossible memop", "insns"),
             ("regdata", "regdata_insns", "impossible regdata", "insns"),
             ("dangling", "dangling_ids", "dangling template refs", "ids"),
-            ("over_max", "over_max_insns", "over-max executions", "insns"))
+            ("over_max", "over_max_insns", "over-max executions", "insns"),
+            ("never_delivered", "never_delivered_insns",
+             "never-delivered executions", "insns"))
     bad = [f"{imp.get(k, 0)} {label} ({imp.get(d, 0)} distinct {unit})"
            for k, d, label, unit in cols if imp.get(k)]
     return ("decoder lint: " + ", ".join(bad)) if bad else None

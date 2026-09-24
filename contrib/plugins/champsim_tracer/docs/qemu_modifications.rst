@@ -1211,6 +1211,37 @@ speculative path.
    host-pointer return would bypass the buffer and let speculative
    stores leak into guest memory.
 
+   The user-mode ``probe_access()`` also returns ``NULL`` whenever
+   ``probe_access_internal()`` answers ``TLB_MMIO`` -- which in user
+   mode it does exactly when plugin memory callbacks are enabled.  This
+   is an upstream defect, fixed here: the softmmu probe already answers
+   ``NULL`` in that case (its ``check_mem_cbs`` path), but the user-mode
+   one dropped the flag and handed back ``g2h()``, so every helper that
+   asks ``probe_access()`` for a host pointer and writes through it --
+   x86 ``FXSAVE`` / ``FXRSTOR`` / ``XSAVE`` / ``XSAVEOPT`` / ``XRSTOR``
+   through ``access_prepare_mmu``, RISC-V ``CBO.ZERO`` through
+   ``probe_write()``, PowerPC ``lmw`` / ``stmw`` / ``lsw`` / ``stsw`` --
+   performed its accesses with no memory callback on the correct path.
+   The wrong path was unaffected only because the speculative redirect
+   above forces the slow path.  Measured on a qemu-user probe running
+   ``fxsave64`` / ``fxrstor64`` / ``xsave64`` / ``xsaveopt64`` /
+   ``xrstor64`` four times: the correct path carried 0 memops against
+   55 / 52 / 100 / 100 / 90 per execution before, 1588 = 4 x 397 after;
+   RISC-V ``cbo.zero`` 0 before, its 64 one-byte stores after.  Without
+   plugin memory callbacks the flag is never set and the host pointer is
+   returned as before.
+
+   ``target/i386/tcg/access.c`` pairs with it.  When page 1 of a
+   page-crossing access has no host pointer, ``access_prepare_mmu`` used
+   to skip the page-2 probe altogether (the speculative redirect would
+   otherwise trip the user-mode contiguity assert).  On the correct path
+   that probe is what faults a straddling ``FXSAVE`` / ``XSAVE`` before
+   its first byte is written; skipped, the per-unit path wrote page 1 and
+   faulted part-way (measured: 206 and 366 bytes of the mapped page
+   changed under a memory-callback plugin, 0 natively and without one).
+   Page 2 is now probed outside speculation whenever page 1 has no host
+   pointer; the speculative path keeps its per-unit treatment.
+
 ``linux-user/signal.c`` — ``cpu_loop_exit_sigsegv`` /
 ``cpu_loop_exit_sigbus``
 
@@ -1262,9 +1293,11 @@ speculative path.
    plugin's spec store buffer.  These helpers have no
    ``CONFIG_USER_ONLY`` gate around the ``cpu_st*`` slow path, so
    user-mode + speculative execution always routes through the
-   buffer; non-speculative user-mode runs hit the slow path
-   exactly when the host pointer is unavailable, the same as
-   system mode.
+   buffer.  Non-speculative user-mode runs of the ``probe_access()``
+   users (``access_prepare_mmu``) take the slow path whenever plugin
+   memory callbacks are on, because the user-mode probe answers
+   ``NULL`` then (see ``probe_access`` above) -- before that fix they
+   never did, and their correct-path accesses were not reported.
 
 ``include/exec/cpu_ldst.h`` — user-mode ``tlb_vaddr_to_host``
 
@@ -2132,8 +2165,10 @@ program's bulk memory traffic.
    above it needs no such call — its ``cpu_stq_mmuidx_ra()`` stores are
    instrumented already.  The rest of the file's bulk helpers
    (``lmw`` / ``stmw`` / ``lsw`` / ``stsw``) reach their host pointer
-   through ``probe_access()`` and therefore fall back correctly on their
-   own.
+   through ``probe_access()`` and therefore fall back on their own --
+   in user mode only since ``probe_access()`` answers ``NULL`` under
+   memory callbacks (see ``probe_access`` above); before that they
+   wrote through ``g2h()`` unreported.
 
    ``tests/tcg/ppc64/dcbz-instrumentation.c`` holds the invariant.  Every
    access it makes to its test region is a ``DCBZ``; it prints the region

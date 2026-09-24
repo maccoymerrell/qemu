@@ -8784,7 +8784,8 @@ def validate(meta_path: Path, trace_path: Path,
     # template does not carry.  Always zero on a conformant trace.
     imp = trace_meta.get("impossible_attributions") or {}
     if (imp.get("memop") or imp.get("regdata") or imp.get("dangling")
-            or imp.get("over_max") or imp.get("unparsed")):
+            or imp.get("over_max") or imp.get("never_delivered")
+            or imp.get("unparsed")):
         issues.append(Issue(
             "impossible_attribution", "error",
             f"decoder lint counted impossible attributions: "
@@ -8794,7 +8795,9 @@ def validate(meta_path: Path, trace_path: Path,
             f"({imp.get('regdata_insns', 0)} distinct insns), "
             f"{imp.get('dangling', 0)} dangling template refs, "
             f"{imp.get('over_max', 0)} over-max executions "
-            f"({imp.get('over_max_insns', 0)} distinct insns)"
+            f"({imp.get('over_max_insns', 0)} distinct insns), "
+            f"{imp.get('never_delivered', 0)} never-delivered executions "
+            f"({imp.get('never_delivered_insns', 0)} distinct insns)"
             + (f"; UNPARSED summary: {imp['unparsed']}"
                if imp.get("unparsed") else ""),
             dict(imp)))

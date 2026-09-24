@@ -403,7 +403,8 @@ state or wrong-path speculation.
 An **ATTRIBUTION LINT** verdict always closes the report:
 ``impossible attributions: <n> memop (<m> distinct insns), <n> regdata
 (<m> distinct insns), <n> dangling template refs (<m> distinct ids),
-<n> over-max executions (<m> distinct insns)``.
+<n> over-max executions (<m> distinct insns), <n> never-delivered
+executions (<m> distinct insns)``.
 This is a structural sanity check, not a byte accounting: it flags a
 body observation landing on an instruction that statically cannot
 produce it — a memop value on an insn with zero static load/store
@@ -417,12 +418,34 @@ leaking into the wrong entry's drain) or of a template that declares
 fewer accesses than the instruction performs, rather than a
 decode-quality nuance.  Every over-max instruction is named on its own
 ``memop-over-max:`` line with the maxes its template declared and the
-largest counts the trace published. It is always printed and, unlike
+largest counts the trace published.
+
+The last column is over-max's under-side sibling, keyed on executions
+rather than templates.  A correct-path instruction whose template
+declares an access and which ran at least once, yet published zero
+loads and zero stores on every one of its executions, is counted as
+*never delivered*: the contract lets any single execution publish fewer
+accesses than the maximum, including none, so no one execution can be
+faulted, but an instruction that never delivered what it declares is
+the signature of a helper writing guest memory behind the memory
+callbacks (qemu-user ``FXSAVE`` / ``XSAVE`` publishing 0 against a
+declared 55-99 was the instance that motivated the rule).  An
+instruction that never ran is not a subject.  The count is per
+instruction -- pc and encoding bytes -- across every template that
+carries it, so a faulting copy whose retry delivers in the block the
+fault returns to is not counted, and encodings whose access the
+architecture itself can suppress (FEAT_MOPS, RISC-V ``SC``, an x86
+REP string operation entered with ``RCX == 0``) are
+excluded as they are from the bimodality lint below.  Each violator is
+named on a ``memop-never-delivered:`` line, and a ``never-delivered
+subjects:`` line always follows, giving how many declaring instructions
+ran on the correct path and how often -- a zero verdict over a trace
+where that reads zero examined nothing.  The verdict is always printed and, unlike
 every other line in the report, a nonzero count is fatal: ``cst_audit``
 exits 1 instead of 0.  A clean trace always reads ``impossible
 attributions: 0 memop (0 distinct insns), 0 regdata (0 distinct insns),
 0 dangling template refs (0 distinct ids), 0 over-max executions (0
-distinct insns)``.
+distinct insns), 0 never-delivered executions (0 distinct insns)``.
 
 Conservation vs. completeness
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

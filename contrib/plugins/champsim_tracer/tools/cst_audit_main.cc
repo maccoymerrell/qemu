@@ -559,6 +559,9 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             if (cp_re > cp_rs) {
                 s->cp_total_insns += cp_re - cp_rs;
             }
+            over.on_cp_range(((uint64_t)(uint32_t)current_asid << 32) |
+                                 (uint32_t)current_thread,
+                             (uint32_t)prev_cp_tid, cp_rs, cp_re);
             const bool cp_partial = cp_tmpl && (cp_rs > 0 || cp_re < cp_n);
 
             /* Bimodality histogram: this execution's realised-memop
@@ -1419,6 +1422,35 @@ int main(int argc, char **argv)
                         (unsigned long long)o.seen_loads,
                         (unsigned long long)o.seen_stores);
         }
+        /* The never-delivered subjects: each declaring insn that ran on
+         * the correct path and never published a memop, with its maxes
+         * and how many executions it had. */
+        for (const cst::AttributionLint::UnderSubject &u :
+             lint.under_subjects()) {
+            std::string hex;
+            for (uint8_t b : u.id.bytes) {
+                char t[3];
+                std::snprintf(t, sizeof(t), "%02x", b);
+                hex += t;
+            }
+            auto on = h.maps.opcode.find(u.id.opcode);
+            std::printf("    memop-never-delivered: template=BB%u ipos=%u "
+                        "pc=0x%llx opcode=%s bytes=%s "
+                        "max=%u/%u cp_execs=%llu (every one published 0)\n",
+                        u.id.template_id, u.id.ipos,
+                        (unsigned long long)u.id.pc,
+                        on == h.maps.opcode.end() ? "?" : on->second.c_str(),
+                        hex.empty() ? "-" : hex.c_str(),
+                        u.max_loads, u.max_stores,
+                        (unsigned long long)u.execs);
+        }
+        /* Its subject count, always printed: a zero never-delivered
+         * column over a trace that executed no declaring insn examined
+         * nothing, and must be readable as such. */
+        std::printf("  never-delivered subjects: %llu declaring insns "
+                    "executed on the correct path (%llu executions)\n",
+                    (unsigned long long)lint.under_subject_insns(),
+                    (unsigned long long)lint.under_subject_execs());
         if (lint.any()) {
             std::fprintf(stderr,
                          "cst_audit: FAIL: impossible attributions: %s\n",

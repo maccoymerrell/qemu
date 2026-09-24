@@ -1343,6 +1343,18 @@ void BodyWalker::decode_field_delta(Reader &outer,
     const bool has_reg = (flags_ & ids.flag_reg_data) != 0;
     const bool has_ppage = (flags_ & ids.flag_physaddr) != 0;
 
+    /* NEVER-DELIVERED rule: the template's declaring insns, walked in
+     * step with the executed range below (both ascend). */
+    AttributionLint::UnderRow *under =
+        lint ? lint->under_row(template_id) : nullptr;
+    size_t under_k = 0;
+    if (under) {
+        while (under_k < under->ipos.size() &&
+               under->ipos[under_k] < bc.bb_start) {
+            under_k++;
+        }
+    }
+
     for (size_t i = bc.bb_start; i < bc.bb_stop; i++) {
         uint32_t idx = (uint32_t)i;
         uint64_t n_loads = lookup_cell(state_blk, state_gen,
@@ -1368,6 +1380,12 @@ void BodyWalker::decode_field_delta(Reader &outer,
         if (lint && tmpl && (n_loads || n_stores) &&
             AttributionLint::over_max(tmpl->insns[i], n_loads, n_stores)) {
             lint->note_over_max(*tmpl, idx, n_loads, n_stores);
+        }
+        /* Never-delivered: this execution of a declaring insn, and
+         * whether it published anything. */
+        if (under && under_k < under->ipos.size() &&
+            under->ipos[under_k] == idx) {
+            under->note(under_k++, n_loads + n_stores);
         }
 
         if (n_loads || n_stores) {

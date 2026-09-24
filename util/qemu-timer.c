@@ -217,9 +217,30 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
  *
  *     grep -n 'qemu_clock_get_ns\|timer_expired_ns' util/qemu-timer.c
  *
+ * Who the stall actually turns away.  Three mechanisms keep guest-time
+ * events out of a speculative window, and they exclude different readers:
+ *
+ *   - the value freeze (cpu_plugin_clock_freeze()) stops what
+ *     QEMU_CLOCK_VIRTUAL reads, machine-wide;
+ *   - the event agency (qemu/vclock-agency.h) makes the vCPU threads the
+ *     only consumers of VIRTUAL deadlines, evaluated at guest-instruction
+ *     slice breakouts; while it is engaged qemu_clock_use_for_deadline()
+ *     declines VIRTUAL, so the iothread never reaches these four sites, and
+ *     while it is lifted every vCPU is parked, so no excursion is open;
+ *   - this stall, which is therefore read by vCPU threads and by
+ *     AioContext-attached VIRTUAL timerlists.
+ *
+ * Its gate half is load-bearing.  On targets whose excursion does not hold
+ * the BQL throughout (all but x86), a peer vCPU's slice breakout reads
+ * qemu_clock_deadline_ns_all() and may run the VIRTUAL timers while another
+ * vCPU's excursion is open; the stall is what makes that read report no
+ * deadline.  Its handshake-and-notify half serves a reader that hid a
+ * deadline and may then sleep on it; with the iothread excluded, that reader
+ * is an AioContext-attached VIRTUAL timerlist.
+ *
  * The handshake with the release is Dekker's, and it is here because the
- * cost of losing it is a hang.  A reader that hides a deadline from the main
- * loop leaves the main loop parked on an infinite poll, so the release MUST
+ * cost of losing it is a hang.  A reader that hides a deadline from its poll
+ * loop leaves that loop parked on an infinite poll, so the release MUST
  * see the flag of every reader that hid one.  Reader: publish the flag, then
  * re-read the stall.  Releaser: clear the stall, then read the flag.  With a
  * full barrier on each side at least one of the two sees the other, so a
@@ -243,12 +264,11 @@ static bool vclock_processing_stalled(QEMUClockType type)
     smp_mb();
     if (qatomic_read(&plugin_vclock_stall)) {
         /*
-         * Event-agency witness: with the discipline engaged the
-         * iothread never evaluates a VIRTUAL deadline, so this
-         * per-excursion fence is redundant and a confirmed hide here
-         * must not happen.  Counted, never asserted (see the flatten
-         * criterion: the stall/hidden/Dekker machinery is only
-         * deleted once this counter has its witnesses).
+         * A confirmed hide while the agency is engaged is counted
+         * (vclock_agency_note_fence_hit()), never asserted.  The
+         * iothread cannot reach here while engaged, so what the count
+         * sees is the readers set out above, including a peer vCPU's
+         * breakout read during another vCPU's excursion.
          */
         if (vclock_agency_engaged()) {
             vclock_agency_note_fence_hit();
@@ -269,13 +289,9 @@ void qemu_clock_plugin_stall_set(bool on)
     smp_mb();
     /*
      * Notify ONLY if the stall actually hid something.  The release runs once
-     * per wrong-path excursion, which on a system trace is hundreds of
-     * thousands to millions of times per run, and an unconditional notify is
-     * a main-loop wakeup for each one; when this switch was briefly driven
-     * from the clock-value freeze instead -- once per translation block --
-     * the same unconditional notify turned a 14-second fixture into a
-     * 79-second one.  The wakeup belongs to the deadline that was hidden, not
-     * to the freeze that hid nothing.
+     * per wrong-path excursion, and an unconditional notify would be a
+     * wakeup for each one.  The wakeup belongs to the deadline that was
+     * hidden, not to the freeze that hid nothing.
      */
     if (qatomic_read(&plugin_vclock_deadline_hidden) &&
         qatomic_xchg(&plugin_vclock_deadline_hidden, false)) {
@@ -880,13 +896,10 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * stops: every vCPU starves and the guest makes no architectural
          * progress while the process burns 100% of a core.
          *
-         * A running clock used to hide it (@now moves a nanosecond and the
-         * loop ends), which is why such a device could sit in the tree
-         * unnoticed.  A clock that does NOT run -- a TCG plugin freezing
+         * A running clock hides it (@now moves a nanosecond and the loop
+         * ends).  A clock that does NOT run -- a TCG plugin freezing
          * QEMU_CLOCK_VIRTUAL to keep its own instrumentation cost out of
          * guest time -- removes that accident and the wedge is permanent.
-         * Measured, not hypothesised: hw/timer/mips_gictimer.c re-armed at
-         * exactly @now whenever the guest programmed compare == count.
          *
          * The test is whether the DEADLINE MOVED FORWARD, not whether the
          * timer came back.  A timer coming back is the normal, terminating
@@ -894,11 +907,11 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * fired-for + period, which is strictly greater every time, so it
          * catches up to @current_time in a bounded number of iterations and
          * the loop ends by itself.  hw/timer/i8254.c's pit_irq_timer does
-         * exactly that on every x86 boot -- an earlier version of this bound
-         * tested only "is it back at the head and expired", so the PIT ate
-         * the one warning the process ever prints and a device with the real
-         * defect would then have wedged the machine in silence.  A bound
-         * whose alarm is consumed by a healthy device is not a bound.
+         * exactly that on every x86 boot, so a test of only "is it back at
+         * the head and expired" would spend the warning on a healthy PIT and
+         * leave a device with the real defect to wedge the machine in
+         * silence.  A bound whose alarm is consumed by a healthy device is
+         * not a bound.
          *
          * Testing the deadline rather than the identity also covers timers
          * that arm EACH OTHER: whichever of them comes round first inside a
@@ -923,17 +936,11 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * icount_handle_deadline() by calling qemu_clock_run_timers()
          * itself -- so the pass this bound ends is re-entered from the vCPU
          * thread with the vCPU having retired nothing in between.  What is
-         * bounded is the pass, not the machine.  Measured on
-         * target/riscv/debug.c as it stood before 346910c7c5, which armed
-         * this timer with a raw instruction count: with the bound in, the
-         * offender is named and the monitor still answers, and the guest is
-         * parked all the same -- icount_get_raw() reads 19 after five
-         * thousand callbacks and the PC never leaves the instruction after
-         * the arming csrw.  With both bounds compiled out the same build
-         * prints no warning and the monitor cannot be reached at all,
-         * because this loop never returns and so never drops the BQL.
-         * Deferral buys the diagnosis and the management plane; only
-         * repairing the device buys the guest.
+         * bounded is the pass, not the machine: with the bound, the
+         * offender is named and the monitor still answers while the guest
+         * stays parked; without it, this loop never returns and so never
+         * drops the BQL.  Deferral buys the diagnosis and the management
+         * plane; only repairing the device buys the guest.
          *
          * The report names the head's ARMER as well as the head's callback.
          * In the mutual case those are DIFFERENT devices, and the deferred

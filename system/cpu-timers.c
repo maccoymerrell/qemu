@@ -47,7 +47,7 @@
  * The tick counter as a function of the virtual clock -- see
  * cpu_plugin_tsc_lock_to_vclock().  Zero @plugin_tsc_per_ns_q32 means the
  * lock has never been armed and cpu_get_ticks_locked() keeps its own host
- * source.  All four are written once, under the seqlock write lock with the
+ * source.  All three are written once, under the seqlock write lock with the
  * BQL held, and read under whichever of the two the reader already holds.
  */
 static uint64_t plugin_tsc_per_ns_q32;      /* ticks per clock ns, 32.32 */
@@ -189,64 +189,62 @@ void cpu_disable_ticks(void)
  * The count exists because the thing being counted is global while its owners
  * are not.  timers_state is one clock for the whole machine and
  * cpu_ticks_enabled is one boolean, while a plugin freeze is opened and
- * closed per-vCPU: the wrong-path excursion pause in cpu_plugin_spec_vtime_
- * pause() belongs to the excursion's vCPU, and the correct-path
- * instrumentation window in cpu_plugin_vclock_pause() belongs to whichever
- * vCPU is running a plugin callback -- including a translation callback,
- * which is not serialised against a peer's excursion at all.  With both
- * calling cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's window
- * closing restarted the guest clock in the middle of the excursion, and the
- * excursion's own thaw then found the clock already running and did nothing:
- * the guest clock advanced by the excursion's remaining host wall time,
- * which is exactly what the freeze exists to prevent.
+ * closed per-vCPU: the wrong-path excursion freeze in
+ * cpu_plugin_excursion_open() belongs to the excursion's vCPU, and the
+ * correct-path instrumentation window in cpu_plugin_vclock_pause() belongs to
+ * whichever vCPU is running a plugin callback -- including a translation
+ * callback, which is not serialised against a peer's excursion at all.  Were
+ * both to call cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's
+ * window closing would restart the guest clock in the middle of the
+ * excursion, and the excursion's own thaw would find the clock already running: the guest
+ * clock would advance by the excursion's remaining host wall time, which is
+ * exactly what the freeze exists to prevent.
  *
- * The holder array alongside it exists to MEASURE the defect this count
- * closes, rather than assert it: each entry names the vCPU that took one
- * outstanding reference, so a thaw can tell that the freeze it is leaving
- * behind is held ONLY by other vCPUs.  That is exactly the predecessor's
- * failure condition -- its own guards saw this vCPU's windows and nothing
- * else, so it called cpu_enable_ticks() precisely then.  A residual that
- * still includes this vCPU's own outer window is NOT counted: the
- * predecessor handled that case correctly.  Structurally zero on a
+ * The holder array alongside it names the vCPU that took each outstanding
+ * reference, so a thaw can tell when the freeze it leaves behind is held ONLY
+ * by other vCPUs -- the case in which a guard that saw only this vCPU's own
+ * windows would have called cpu_enable_ticks().  cpu_plugin_ticks_peer_only_
+ * thaws() reports how often that happens.  A residual that still includes
+ * this vCPU's own outer window is not counted.  Structurally zero on a
  * single-vCPU machine.
  */
-#define PLUGIN_TICKS_HOLDERS_MAX 64
-static int plugin_ticks_freeze_depth;
-static int plugin_ticks_holder[PLUGIN_TICKS_HOLDERS_MAX];
-static bool plugin_ticks_holders_overflowed;
+#define PLUGIN_CLOCK_HOLDERS_MAX 64
+static int plugin_clock_freeze_depth;
+static int plugin_clock_holder[PLUGIN_CLOCK_HOLDERS_MAX];
+static bool plugin_clock_holders_overflowed;
 static uint64_t plugin_ticks_peer_only_thaws;
 
-void cpu_plugin_ticks_freeze(int cpu_index)
+void cpu_plugin_clock_freeze(int cpu_index)
 {
     assert(bql_locked());
-    if (plugin_ticks_freeze_depth < PLUGIN_TICKS_HOLDERS_MAX) {
-        plugin_ticks_holder[plugin_ticks_freeze_depth] = cpu_index;
+    if (plugin_clock_freeze_depth < PLUGIN_CLOCK_HOLDERS_MAX) {
+        plugin_clock_holder[plugin_clock_freeze_depth] = cpu_index;
     } else {
-        plugin_ticks_holders_overflowed = true;
+        plugin_clock_holders_overflowed = true;
     }
-    if (plugin_ticks_freeze_depth++ == 0) {
+    if (plugin_clock_freeze_depth++ == 0) {
         cpu_disable_ticks();
     }
 }
 
-bool cpu_plugin_ticks_thaw(int cpu_index)
+bool cpu_plugin_clock_thaw(int cpu_index)
 {
     assert(bql_locked());
-    assert(plugin_ticks_freeze_depth > 0);
+    assert(plugin_clock_freeze_depth > 0);
 
     /* Drop one reference belonging to @cpu_index, keeping the array packed. */
-    int n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+    int n = MIN(plugin_clock_freeze_depth, PLUGIN_CLOCK_HOLDERS_MAX);
     for (int i = n - 1; i >= 0; i--) {
-        if (plugin_ticks_holder[i] == cpu_index) {
-            plugin_ticks_holder[i] = plugin_ticks_holder[n - 1];
+        if (plugin_clock_holder[i] == cpu_index) {
+            plugin_clock_holder[i] = plugin_clock_holder[n - 1];
             break;
         }
     }
-    if (--plugin_ticks_freeze_depth > 0) {
+    if (--plugin_clock_freeze_depth > 0) {
         bool mine_remains = false;
-        n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+        n = MIN(plugin_clock_freeze_depth, PLUGIN_CLOCK_HOLDERS_MAX);
         for (int i = 0; i < n; i++) {
-            if (plugin_ticks_holder[i] == cpu_index) {
+            if (plugin_clock_holder[i] == cpu_index) {
                 mine_remains = true;
                 break;
             }
@@ -265,19 +263,19 @@ bool cpu_plugin_ticks_thaw(int cpu_index)
 
 uint64_t cpu_plugin_ticks_peer_only_thaws(void)
 {
-    return plugin_ticks_holders_overflowed ? UINT64_MAX
+    return plugin_clock_holders_overflowed ? UINT64_MAX
                                            : plugin_ticks_peer_only_thaws;
 }
 
 /*
  * Outstanding SPECULATIVE freezes, across every vCPU: the count that owns the
  * guest-visible virtual clock's PROCESSING stall.  See the contract on
- * cpu_plugin_spec_ticks_freeze() in the header for why the stall belongs to
- * this count and not to plugin_ticks_freeze_depth beside it.
+ * cpu_plugin_spec_clock_freeze() in the header for why the stall belongs to
+ * this count and not to plugin_clock_freeze_depth beside it.
  *
  * A second count next to the first is not a second answer to "is the clock
  * frozen".  The value freeze is one question with one answer and
- * plugin_ticks_freeze_depth is still its sole authority -- every freeze,
+ * plugin_clock_freeze_depth is still its sole authority -- every freeze,
  * speculative or not, goes through it.  This count answers a different
  * question, "is a wrong path currently executing", and the two differ
  * precisely because the correct-path window also freezes the value.  Written
@@ -285,7 +283,7 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void)
  */
 static int plugin_spec_stall_depth;
 
-void cpu_plugin_spec_ticks_freeze(int cpu_index)
+void cpu_plugin_spec_clock_freeze(int cpu_index)
 {
     assert(bql_locked());
     /*
@@ -298,15 +296,15 @@ void cpu_plugin_spec_ticks_freeze(int cpu_index)
     if (plugin_spec_stall_depth++ == 0) {
         qemu_clock_plugin_stall_set(true);
     }
-    cpu_plugin_ticks_freeze(cpu_index);
+    cpu_plugin_clock_freeze(cpu_index);
 }
 
-void cpu_plugin_spec_ticks_thaw(int cpu_index)
+void cpu_plugin_spec_clock_thaw(int cpu_index)
 {
     assert(bql_locked());
     assert(plugin_spec_stall_depth > 0);
 
-    cpu_plugin_ticks_thaw(cpu_index);
+    cpu_plugin_clock_thaw(cpu_index);
     /*
      * Unconditional, including on the path where the thaw above declined to
      * restart the clock because a vm_stop owns it.  The stall is this count's
@@ -352,10 +350,7 @@ void cpu_plugin_spec_ticks_thaw(int cpu_index)
  * that may not run backwards -- the x86 TSC -- can only be corrected upwards,
  * so a correction step ADDS agreement when the counter is behind and declines
  * when it is ahead: the disagreement is rectified rather than averaged, and
- * accumulates without bound.  Measured on the x86_64 system marker shape over
- * 556 cells with such a correction in place: the counter stood above its own
- * reference line at 100.00% of correction points in the median cell, by a
- * median 0.97 ms and a maximum 11.20 ms inside a ~20 s run.
+ * accumulates without bound.
  *
  * So the fix is not a better correction, it is removing the second
  * oscillator.  Once armed, cpu_get_ticks_locked() computes the tick counter
@@ -379,9 +374,8 @@ void cpu_plugin_tsc_lock_to_vclock(double tsc_hz)
                        &timers_state.vm_clock_lock);
     if (!plugin_tsc_per_ns_q32) {
         /*
-         * Order matters only for readability: the reference tick value is
-         * still taken from the host-sourced path, because the lock is not
-         * armed until the rate is stored last.
+         * The rate is stored last: it is what arms the lock, so the
+         * reference tick above is still read from the host source.
          */
         plugin_tsc_ref_ticks = cpu_get_ticks_locked();
         plugin_tsc_ref_clk = cpu_get_clock_locked();

@@ -131,7 +131,7 @@ void cpu_disable_ticks(void);
 
 #ifdef CONFIG_PLUGIN
 /**
- * cpu_plugin_ticks_freeze: stop the guest clock for a plugin window
+ * cpu_plugin_clock_freeze: stop the guest clock for a plugin window
  * @cpu_index: the vCPU taking the reference
  *
  * cpu_enable_ticks()/cpu_disable_ticks() drive a single VM-GLOBAL boolean,
@@ -146,10 +146,10 @@ void cpu_disable_ticks(void);
  *
  * Caller must hold the BQL.
  */
-void cpu_plugin_ticks_freeze(int cpu_index);
+void cpu_plugin_clock_freeze(int cpu_index);
 
 /**
- * cpu_plugin_ticks_thaw: leave a plugin clock freeze
+ * cpu_plugin_clock_thaw: leave a plugin clock freeze
  * @cpu_index: the vCPU giving back the reference it took
  *
  * Returns true if this call actually restarted the clock, i.e. it was the
@@ -160,27 +160,26 @@ void cpu_plugin_ticks_freeze(int cpu_index);
  *
  * Caller must hold the BQL.
  */
-bool cpu_plugin_ticks_thaw(int cpu_index);
+bool cpu_plugin_clock_thaw(int cpu_index);
 
 /**
  * cpu_plugin_ticks_peer_only_thaws: how often a freeze was left entirely to peers
  *
  * Counts the thaws that left the clock stopped with EVERY remaining freeze held
- * by a different vCPU.  Each one is an occasion on which restarting the clock
- * from this vCPU's own view -- which is all cpu_enable_ticks() behind a
- * per-vCPU guard can see -- would have run the guest clock inside a peer's
+ * by a different vCPU: the occasions on which a guard that saw only this
+ * vCPU's own windows would have restarted the guest clock inside a peer's
  * window.  A residual that still contains one of this vCPU's own windows is
- * deliberately excluded: a per-vCPU guard gets that case right.  Zero by
+ * not counted, since such a guard keeps the clock stopped there.  Zero by
  * construction on a single-vCPU machine.  UINT64_MAX means the holder array
  * overflowed and the figure is not trustworthy; it is never silently capped.
  */
 uint64_t cpu_plugin_ticks_peer_only_thaws(void);
 
 /**
- * cpu_plugin_spec_ticks_freeze: freeze the guest clock for a SPECULATIVE window
+ * cpu_plugin_spec_clock_freeze: freeze the guest clock for a SPECULATIVE window
  * @cpu_index: the vCPU taking the reference
  *
- * The wrong-path form of cpu_plugin_ticks_freeze(), and the only form that
+ * The wrong-path form of cpu_plugin_clock_freeze(), and the only form that
  * stops the clock's PROCESSING as well as its value.
  *
  * There are two kinds of plugin clock freeze in this tree and they are not the
@@ -195,17 +194,14 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void);
  * and a callback entered there runs on the wrong path's watch, writing state
  * the excursion's restore then rolls back.
  *
- * So the processing stall is scoped to this pair and to nothing else.  Riding
- * it on the machine-wide freeze reference instead -- which the correct-path
- * window also takes, once per translation block -- was measured: the guest's
- * timer processing was then suspended for most of the run rather than for the
- * excursions, and the x86 system marker cell went from 0 to 5 stalled cells in
- * 12 with a new 24.2-24.4k-instruction stall cluster.  The correct-path window
- * keeps its value-only freeze.
+ * So the processing stall is scoped to this pair and to nothing else, not to
+ * the machine-wide freeze reference that the correct-path window also takes
+ * once per translation block; that window keeps its value-only freeze.
  *
- * Machine-wide, for the same reason cpu_plugin_ticks_freeze() is: one clock,
- * many windows.  A peer's translation callback takes no exec lock and would
- * otherwise run a guest timer callback inside another vCPU's excursion.
+ * Machine-wide, for the same reason cpu_plugin_clock_freeze() is: one clock,
+ * many windows.  Which readers the stall turns away, and why that includes a
+ * peer vCPU's slice breakout, is set out at vclock_processing_stalled() in
+ * util/qemu-timer.c.
  *
  * Ordering, which is the substance of the pair: the stall is taken BEFORE the
  * value freeze and released AFTER the thaw, so the state that must not exist
@@ -214,10 +210,10 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void);
  *
  * Caller must hold the BQL.
  */
-void cpu_plugin_spec_ticks_freeze(int cpu_index);
+void cpu_plugin_spec_clock_freeze(int cpu_index);
 
 /**
- * cpu_plugin_spec_ticks_thaw: leave a speculative clock freeze
+ * cpu_plugin_spec_clock_thaw: leave a speculative clock freeze
  * @cpu_index: the vCPU giving back the reference it took
  *
  * The processing stall is released on every path, including the one where the
@@ -225,13 +221,13 @@ void cpu_plugin_spec_ticks_freeze(int cpu_index);
  * that justified it would silence the guest's virtual clock for the rest of
  * the run, and a stopped machine runs no guest-visible timers anyway.
  *
- * Returns nothing, unlike cpu_plugin_ticks_thaw(): that one's bool tells the
+ * Returns nothing, unlike cpu_plugin_clock_thaw(): that one's bool tells the
  * correct-path window whether it was the call that restarted the clock, and
  * an excursion has no use for the answer.
  *
  * Caller must hold the BQL.
  */
-void cpu_plugin_spec_ticks_thaw(int cpu_index);
+void cpu_plugin_spec_clock_thaw(int cpu_index);
 
 /**
  * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()
@@ -276,9 +272,6 @@ void cpu_plugin_tsc_lock_to_vclock(double tsc_hz);
  * Declared outside the CONFIG_PLUGIN block above because neither its
  * definition in system/cpu-timers.c nor its caller in cpu_loop_exec_tb()
  * is plugin-conditional -- only the spec-mode skip inside its body is.
- * Inside that block, a --disable-plugins system build compiled the
- * definition with no prototype in scope and -Wmissing-prototypes refused
- * it, while the caller linked against it regardless.
  */
 void vclock_agency_consume(CPUState *cpu, bool breakout_site);
 

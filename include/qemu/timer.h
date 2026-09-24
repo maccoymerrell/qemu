@@ -252,24 +252,21 @@ void qemu_clock_enable(QEMUClockType type, bool enabled);
  * the monitor, the block layer and the management plane run on them.
  *
  * NOT a refcount and deliberately so: the caller counts, this switch obeys.
- * Its one caller is cpu_plugin_spec_ticks_freeze()/_thaw() in
+ * Its one caller is cpu_plugin_spec_clock_freeze()/_thaw() in
  * system/cpu-timers.c, which drives it from the 0<->1 transitions of the
  * machine-wide count of outstanding SPECULATIVE freezes and is the single
  * authority.
  *
  * That count is not the same as the count of outstanding clock-VALUE freezes
- * beside it, and the difference is the point.  A plugin also freezes the
- * clock's value around a correct-path instrumentation callback, once per
- * translation block, and there the guest is between two of its own
- * instructions: every guest-time event still has a legal position and only
- * the callback's host cost must be kept out of the clock, so the value
- * freeze alone is the whole requirement.  Only a speculative window --
- * execution the guest never performed, with no instruction stream to place
- * an event in -- needs the clock to stop being evaluated as well.  Riding
- * this switch on the value count instead was measured: the guest's timer
- * processing was suspended for most of the run rather than for the
- * excursions, and the x86 system marker cell went from 0 stalled cells in 12
- * to 5, with a stall cluster that had not existed before.
+ * beside it.  A plugin also freezes the clock's value around a correct-path
+ * instrumentation callback, once per translation block, and there the guest
+ * is between two of its own instructions: every guest-time event still has
+ * a legal position and only the callback's host cost must be kept out of
+ * the clock, so the value freeze alone is the whole requirement.  Only a
+ * speculative window -- execution the guest never performed, with no
+ * instruction stream to place an event in -- needs the clock to stop being
+ * evaluated as well.  Which readers the stall actually turns away is set
+ * out at vclock_processing_stalled() in util/qemu-timer.c.
  *
  * NOT implemented as qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which has
  * exactly the right read side and the wrong wait side: it blocks on every
@@ -278,7 +275,8 @@ void qemu_clock_enable(QEMUClockType type, bool enabled);
  * This stops the NEXT callback rather than draining the current one, and
  * never waits for anything.
  *
- * Caller holds the BQL.  Read without it from iothread timerlists.
+ * Caller holds the BQL.  Readers (vCPU threads, AioContext timerlists) read
+ * the switch without it.
  */
 void qemu_clock_plugin_stall_set(bool on);
 

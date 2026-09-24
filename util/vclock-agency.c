@@ -64,7 +64,9 @@ static void vagency_warn_once(int *flag, const char *what)
 
 /*
  * Exit report: printed only when a tripwire fired, so healthy runs stay
- * silent.  Registered lazily at first arming (system mode only).
+ * silent.  consume_runs is not a tripwire; it rides in the line as context
+ * for the others, and a zero is never reported on its own.  Registered
+ * lazily at first arming (system mode only).
  */
 static void vclock_agency_exit_report(void)
 {
@@ -123,12 +125,11 @@ void vclock_agency_fold(int64_t expire, bool main_list)
     }
     if (!main_list) {
         /*
-         * Design open item 3: an AioContext-attached VIRTUAL timerlist
-         * is a non-vCPU consumer whose home context no longer polls on
-         * VIRTUAL while engaged; its delivery bound degrades to the
-         * next main-list boundary.  None exist in our machines today
-         * (verified); if one appears, say so loudly.  It is still
-         * folded into the slot and woken by the boundary's
+         * An AioContext-attached VIRTUAL timerlist is a consumer outside
+         * the vCPU class: its home context does not poll on VIRTUAL
+         * while the agency is engaged, so its delivery bound degrades to
+         * the next main-list boundary.  Count it and warn once.  It is
+         * still folded into the slot and woken by the boundary's
          * qemu_clock_notify(VIRTUAL), exactly as icount wakes them.
          */
         static int warned;
@@ -256,8 +257,7 @@ void vclock_agency_note_fence_hit(void)
  * while active.  In-thread (under the boundary bracket) is the design;
  * an AioContext list running in its home context is icount's own
  * ungated behaviour; a MAIN-LOOP list pass outside the bracket while
- * engaged is the invariant the LX wave proved must read zero
- * (iothread_passes==0 in all six clean cells).
+ * engaged breaks the sole-consumer invariant and is counted.
  */
 void vclock_agency_note_vpass(bool main_list)
 {

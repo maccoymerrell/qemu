@@ -55,8 +55,9 @@ int isa_for_target(const std::string &target_name);
  * One template (section 6): a true basic block as a pc/size/bytes list.
  * @terminated says its last instruction was learned to end a block, which
  * is all fall_through_pc states; nothing else about the branch is claimed.
+ * @max is the most loads (0) / stores (1) one entry of it delivered.
  */
-struct WireInsn { uint64_t pc; uint8_t size; const uint8_t *bytes; };
+struct WireInsn { uint64_t pc; uint8_t size; const uint8_t *bytes; uint8_t max[2]; };
 struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
 
 /*
@@ -88,9 +89,10 @@ Bytes header_member(const HeaderFacts &facts,
  * The body member: lead magic, the opening (asid, thread) declaration of
  * section 4, the entries with their memops as field deltas (section 5),
  * END carrying their count, trailing magic.  @root_phys is the asid-0
- * label (section 4.1a).  Returns in @slots the slots it addressed.
+ * label (section 4.1a).  Returns in @slots the slots it addressed, and in
+ * each template instruction's @max its observed maxima.
  */
-Bytes body_member(uint64_t root_phys, const std::vector<WireTemplate> &templates,
+Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<Memop> &memops, size_t &slots);
 

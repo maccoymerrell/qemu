@@ -238,10 +238,12 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         prev = i.pc;
         b.u8(kUnclassified);    /* opcode */
         b.u8(kUnclassified);    /* branch_type */
-        /* flags, n_src, n_dst, max_dep_loads, max_dep_stores: unclaimed */
-        for (int k = 0; k < 5; k++) {
+        /* flags, n_src, n_dst: unclaimed; max_dep_*: the observed maxima */
+        for (int k = 0; k < 3; k++) {
             b.u8(0);
         }
+        b.u8(i.max[0]);
+        b.u8(i.max[1]);
         b.u8(i.size);
         for (unsigned k = 0; k < i.size; k++) {
             b.u8(i.bytes[k]);
@@ -323,7 +325,7 @@ Bytes header_member(const HeaderFacts &facts,
     return h;
 }
 
-Bytes body_member(uint64_t root_phys, const std::vector<WireTemplate> &templates,
+Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<Memop> &memops, size_t &slots)
 {
@@ -363,7 +365,11 @@ Bytes body_member(uint64_t root_phys, const std::vector<WireTemplate> &templates
                 dir[memops[m].store].push_back(&memops[m]);
             }
             for (int d = 0; d < 2; d++) {
-                slots = std::max(slots, st[ipos].observe(dir[d], d, r));
+                size_t c = st[ipos].observe(dir[d], d, r);
+                slots = std::max(slots, c);
+                /* u8 on the wire; a larger count stays visible as over-max */
+                uint8_t &mx = templates[e.template_id].insns[ipos].max[d];
+                mx = uint8_t(std::min<size_t>(std::max<size_t>(mx, c), 255));
             }
             std::sort(r.begin(), r.end(), [](const Record &x, const Record &y) {
                 return x.fid < y.fid;

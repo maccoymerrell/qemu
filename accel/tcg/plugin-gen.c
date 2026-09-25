@@ -114,9 +114,18 @@ static TCGv_i32 gen_cpu_index(void)
      * thread AND share translations.  Baking the translating vCPU's
      * index into a TB other vCPUs will execute routes every per-vCPU
      * scoreboard access and callback argument to the wrong vCPU.
+     *
+     * The flush above only reclaims space, and lands late: what keeps a
+     * pre-clone TB from another vCPU is the lookup key, since every later
+     * correct-path lookup carries CF_PARALLEL.  The plugin executors
+     * (cpu_plugin_exec_tb, CF_SINGLE_ITER; cpu_plugin_exec_inline,
+     * CF_MEMI_ONLY) clear CF_PARALLEL from their key, so the next thread's
+     * wrong path finds the blocks vCPU 0's wrong path minted alone.  Their
+     * TBs load the index; the correct path keeps the fold.
      */
     if (!tcg_cflags_has(current_cpu, CF_PARALLEL) &&
-        CPU_NEXT(first_cpu) == NULL) {
+        CPU_NEXT(first_cpu) == NULL &&
+        !(tb_cflags(tcg_ctx->gen_tb) & (CF_SINGLE_ITER | CF_MEMI_ONLY))) {
         return tcg_constant_i32(current_cpu->cpu_index);
     }
     TCGv_i32 cpu_index = tcg_temp_ebb_new_i32();

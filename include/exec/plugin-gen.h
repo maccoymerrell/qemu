@@ -44,6 +44,14 @@ void plugin_gen_disable_mem_helpers(void);
  */
 void plugin_gen_record_branch_target(uint64_t target_pc);
 
+/*
+ * The instruction being translated lowers a control transfer with no
+ * static target: INDIRECT (a jump, call or return to a run-time value)
+ * or COND_NO_TARGET (a trap taken only on a condition).  Plugins read it
+ * via qemu_plugin_insn_transfer_kind().
+ */
+void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -66,6 +74,10 @@ static inline void plugin_gen_disable_mem_helpers(void)
 { }
 
 static inline void plugin_gen_record_branch_target(uint64_t target_pc)
+{ }
+
+static inline
+void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind)
 { }
 
 #endif /* CONFIG_PLUGIN */

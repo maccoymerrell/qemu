@@ -2317,6 +2317,7 @@ static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_JMP_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
     s->base.is_jmp = DISAS_JUMP;
@@ -3590,6 +3591,7 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
 
     MemOp ot = gen_pop_T0(s);
     gen_stack_update(s, adjust + (1 << ot));
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
     s->base.is_jmp = DISAS_JUMP;
@@ -3599,6 +3601,7 @@ static void gen_RETF(DisasContext *s, X86DecodedInsn *decode)
 {
     int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     if (!PE(s) || VM86(s)) {
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], 0);
         /* pop offset */

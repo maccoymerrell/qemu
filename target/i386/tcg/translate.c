@@ -2264,6 +2264,7 @@ static void gen_movl_seg(DisasContext *s, X86Seg seg_reg, TCGv src, bool inhibit
 
 static void gen_far_call(DisasContext *s)
 {
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     TCGv_i32 new_cs = tcg_temp_new_i32();
     tcg_gen_trunc_tl_i32(new_cs, s->T1);
     if (PE(s) && !VM86(s)) {
@@ -2282,6 +2283,7 @@ static void gen_far_call(DisasContext *s)
 
 static void gen_far_jmp(DisasContext *s)
 {
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     if (PE(s) && !VM86(s)) {
         TCGv_i32 new_cs = tcg_temp_new_i32();
         tcg_gen_trunc_tl_i32(new_cs, s->T1);

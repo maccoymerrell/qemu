@@ -1220,11 +1220,13 @@ static void gen_compute_branch_nm(DisasContext *ctx, uint32_t opc,
     ctx->btarget = btgt;
     /*
      * See gen_compute_branch in translate.c: btgt stays at its -1
-     * sentinel for indirect branches; only forward real static
-     * targets to plugins.
+     * sentinel for indirect branches, recorded as transfers with no
+     * static target.
      */
     if (btgt != (target_ulong)-1) {
         plugin_gen_record_branch_target((uint64_t)btgt);
+    } else {
+        plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     }
 
  out:

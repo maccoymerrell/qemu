@@ -135,6 +135,8 @@ struct qemu_plugin_insn {
      * (a plugin tracks those from their observed runtime targets).
      */
     uint64_t branch_target_pc;
+    /* the transfer the translator lowered here; plugin_gen_record_*() */
+    enum qemu_plugin_transfer_kind transfer_kind;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

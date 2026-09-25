@@ -4299,6 +4299,7 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
     } else {
         TCGLabel *l1 = gen_new_label();
 
+        plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_COND_NO_TARGET);
         switch (opc) {
         case OPC_TEQ:
         case OPC_TEQI:
@@ -4593,11 +4594,13 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     ctx->btarget = btgt;
     /*
      * Record the resolved static target for plugins.  Indirect branches
-     * (OPC_JR/OPC_JALR) leave btgt at its -1 sentinel above and record
-     * nothing, so their instruction's static target stays unknown (0).
+     * (OPC_JR/OPC_JALR) leave btgt at its -1 sentinel above and are
+     * recorded as transfers with no static target.
      */
     if (btgt != (target_ulong)-1) {
         plugin_gen_record_branch_target((uint64_t)btgt);
+    } else {
+        plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     }
 
     switch (delayslot_size) {
@@ -11067,6 +11070,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
 
             gen_load_gpr(tbase, rt);
             gen_op_addr_addi(ctx, btarget, tbase, offset);
+            plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
         }
         break;
     default:

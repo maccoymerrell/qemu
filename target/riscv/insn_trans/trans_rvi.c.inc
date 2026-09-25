@@ -170,6 +170,7 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
     }
 #endif
 
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
     tcg_gen_mov_tl(cpu_pc, target_pc);
     if (ctx->fcfi_enabled) {
         /*

@@ -248,6 +248,10 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_decode_only_nobuf: how many of those translations
  *   were declined because the code buffer was full.
  *
+ * version 25:
+ * - added qemu_plugin_insn_transfer_kind (the translator lowered a control
+ *   transfer here: static target, run-time target, or conditional trap)
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -259,7 +263,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 24
+#define QEMU_PLUGIN_VERSION 25
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -779,6 +783,39 @@ void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn);
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn);
+
+/**
+ * enum qemu_plugin_transfer_kind - how the translator lowered an insn
+ *
+ * @QEMU_PLUGIN_TRANSFER_NONE: no jump, call or return was lowered here
+ * @QEMU_PLUGIN_TRANSFER_STATIC: one with a translator-resolved target
+ *   (qemu_plugin_insn_branch_target_pc())
+ * @QEMU_PLUGIN_TRANSFER_INDIRECT: one whose target is computed at run time
+ * @QEMU_PLUGIN_TRANSFER_COND_NO_TARGET: a conditional exception (a trap
+ *   on a condition): control leaves only when the condition holds, and
+ *   then for no target the instruction names
+ */
+enum qemu_plugin_transfer_kind {
+    QEMU_PLUGIN_TRANSFER_NONE,
+    QEMU_PLUGIN_TRANSFER_STATIC,
+    QEMU_PLUGIN_TRANSFER_INDIRECT,
+    QEMU_PLUGIN_TRANSFER_COND_NO_TARGET,
+};
+
+/**
+ * qemu_plugin_insn_transfer_kind() - the control transfer lowered here
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * The translator's statement that it lowered a jump, call or return (or
+ * a conditional trap) at this instruction -- for a delayed branch, at the
+ * branch, not its slot.  Unconditional exceptions, system calls and
+ * exception returns are not described.
+ *
+ * Returns: an enum qemu_plugin_transfer_kind value.
+ */
+QEMU_PLUGIN_API
+enum qemu_plugin_transfer_kind
+qemu_plugin_insn_transfer_kind(const struct qemu_plugin_insn *insn);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

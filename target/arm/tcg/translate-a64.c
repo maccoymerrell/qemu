@@ -225,6 +225,7 @@ static void gen_a64_set_pc(DisasContext *s, TCGv_i64 src)
      */
     gen_top_byte_ignore(s, cpu_pc, src, s->tbii);
     s->pc_save = -1;
+    plugin_gen_record_transfer(QEMU_PLUGIN_TRANSFER_INDIRECT);
 }
 
 /*

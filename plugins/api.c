@@ -299,6 +299,12 @@ uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn)
     return insn->branch_target_pc;
 }
 
+enum qemu_plugin_transfer_kind
+qemu_plugin_insn_transfer_kind(const struct qemu_plugin_insn *insn)
+{
+    return insn->transfer_kind;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;

@@ -49,6 +49,12 @@ int64_t icount_get_raw(void);
 /* return the virtual CPU time in ns, based on the instruction counter. */
 int64_t icount_get(void);
 /*
+ * icount_get()'s value without its side effect: the running vCPU's in-flight
+ * count is added, not folded into the global, so the read is legal at any
+ * vCPU position.  For observers whose reading never reaches the guest.
+ */
+int64_t icount_peek(void);
+/*
  * convert an instruction counter value to ns, based on the icount shift.
  * This shift is set as a fixed value with the icount "shift" option
  * (precise mode), or it is constantly approximated and corrected at

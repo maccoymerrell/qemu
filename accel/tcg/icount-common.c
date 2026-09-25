@@ -154,6 +154,40 @@ int64_t icount_get(void)
     return icount;
 }
 
+/*
+ * The same clock icount_get() returns, read without retiring anything.
+ *
+ * icount_get() folds the running vCPU's in-flight count into the global
+ * accumulator (icount_update_locked), and it refuses ("Bad icount read") to
+ * do so from a vCPU that is not at an I/O-capable position: mid-TB the
+ * in-flight count already charges the whole TB, and a DEVICE that consumed
+ * that value would make guest-visible behaviour depend on where in the TB it
+ * read.  An observer that never feeds the value back to the guest has
+ * neither problem, so it takes the sum without the fold: qemu_icount plus
+ * the in-flight count is the invariant the fold preserves, so the value is
+ * the one icount_get() would return at the same point, at the TB
+ * granularity the decrementer charges.  Nothing is written, so any vCPU
+ * position is legal.
+ */
+int64_t icount_peek(void)
+{
+    CPUState *cpu = current_cpu;
+    int64_t icount, ns;
+    unsigned start;
+
+    do {
+        start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
+        icount = qatomic_read_i64(&timers_state.qemu_icount);
+        if (cpu && cpu->running) {
+            icount += icount_get_executed(cpu);
+        }
+        ns = qatomic_read_i64(&timers_state.qemu_icount_bias) +
+             icount_to_ns(icount);
+    } while (seqlock_read_retry(&timers_state.vm_clock_seqlock, start));
+
+    return ns;
+}
+
 int64_t icount_to_ns(int64_t icount)
 {
     return icount << qatomic_read(&timers_state.icount_time_shift);

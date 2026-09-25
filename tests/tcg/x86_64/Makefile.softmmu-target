@@ -42,6 +42,8 @@ QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf
 # marker; the plugin must find every test (require=on) and pass it, and
 # under -icount the guest's output -- which includes every timer
 # interrupt's (vector, interrupted RIP, TSC) -- must be byte-identical.
+# icount=on tells the plugin the clock is the instruction count, so A1
+# holds an excursion to exactly 0 ns of guest time.
 # sleep=off: without it the boot firmware's halts warp the virtual clock
 # to host time and two plugin-less runs already differ.  The red controls
 # live in the runner (cst_runs/rebuild/wp_tests/sys/run_sys.sh): check-tcg
@@ -61,7 +63,7 @@ run-wp-victim-sys: wp-victim-sys libwp-assert.so
 		$(WP_SYS_OPTS) -kernel $<, wp-victim-sys without plugin)
 	$(call run-test, wp-victim-sys, $(QEMU) \
 		-chardev file$(COMMA)path=wp-victim-sys.out$(COMMA)id=output \
-		-plugin $(PLUGIN_LIB)/libwp-assert.so$(COMMA)require=on \
+		-plugin $(PLUGIN_LIB)/libwp-assert.so$(COMMA)require=on$(COMMA)icount=on \
 		$(WP_SYS_OPTS) -kernel $<, wp-victim-sys with wp-assert)
 	$(call diff-out, wp-victim-sys, wp-victim-sys.ref.out)
 EXTRA_RUNS+=run-wp-victim-sys

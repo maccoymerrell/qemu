@@ -659,3 +659,22 @@ void cpu_plugin_cb_window_close(CPUState *cpu)
     }
 #endif
 }
+
+/*
+ * QEMU_CLOCK_VIRTUAL, read for a plugin.  Under icount the clock is the
+ * instruction counter, and qemu_clock_get_ns() reaches it through
+ * icount_get(), which folds the in-flight count into the global and aborts
+ * ("Bad icount read") from a vCPU callback that is not at an I/O-capable
+ * position.  A plugin's reading never reaches the guest, so it takes the same
+ * value without the fold (icount_peek).  Per-target because icount_peek
+ * exists only in system emulation.
+ */
+int64_t cpu_plugin_vclock_ns(void)
+{
+#ifndef CONFIG_USER_ONLY
+    if (icount_enabled()) {
+        return icount_peek();
+    }
+#endif
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}

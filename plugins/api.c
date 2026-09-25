@@ -1036,17 +1036,7 @@ void qemu_plugin_vclock_resume(void)
  */
 int64_t qemu_plugin_vclock_ns(void)
 {
-    if (icount_enabled()) {
-        /*
-         * Under icount the virtual clock IS the instruction counter, and
-         * reading it from a vCPU callback with cpu->running && !can_do_io
-         * aborts ("Bad icount read").  There is also nothing to learn: icount
-         * pins guest time to instructions by construction, so the factor this
-         * call exists to measure is a constant of the configuration.
-         */
-        return 0;
-    }
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return cpu_plugin_vclock_ns();
 }
 
 bool qemu_plugin_in_async_int(void)

@@ -1839,9 +1839,10 @@ void qemu_plugin_vclock_resume(void);
  * and ratioed against executed instructions it yields the guest's instruction
  * rate per guest-second -- the quantity that decides how much timer-interrupt
  * work the guest is charged per unit of forward progress, and hence the only
- * load-independent way to tell a slow guest from a stalled one.  Returns 0
- * under -icount, where guest time is pinned to the instruction count.  In
- * user-mode emulation QEMU_CLOCK_VIRTUAL is backed by the host clock, and
+ * load-independent way to tell a slow guest from a stalled one.  Under
+ * -icount it is the instruction-count clock (bias + retired instructions
+ * scaled by the shift), charged at the granularity icount charges it: a read
+ * from inside a translation block counts that whole block.  In user-mode emulation QEMU_CLOCK_VIRTUAL is backed by the host clock, and
  * that is what this returns.
  *
  * Read-only and side-effect free; callable from any plugin callback.

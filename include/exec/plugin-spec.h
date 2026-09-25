@@ -115,6 +115,8 @@ void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
 bool cpu_plugin_spec_mode_supported(void);
 void cpu_plugin_cb_window_open(CPUState *cpu);
 void cpu_plugin_cb_window_close(CPUState *cpu);
+/* QEMU_CLOCK_VIRTUAL as a plugin may read it: see plugin-window.c. */
+int64_t cpu_plugin_vclock_ns(void);
 /*
  * Code-buffer pressure a wrong-path (speculative) walk put on the shared
  * translation cache.  _opens counts walks that overflowed the normal

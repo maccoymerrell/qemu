@@ -57,6 +57,10 @@
  *                     (default 50000; 0 = the no-delay calibration arm)
  *   bdelay_us=N       system: the same inside every P2B_TIMER excursion
  *                     (default 1000, longer than the guest's deadline)
+ *   icount=on         system: the run is under -icount shift=0,sleep=off,
+ *                     where the guest clock is the instruction count and
+ *                     host time never reaches it, so A1's epsilon is 0
+ *                     exactly: an excursion must advance it by 0 ns
  *   control=P2A P2A2 P2A2X P2B P2B1 P2B1E P2B1L P2B1I C1N C1NS C1NF C2N
  *                     C3N C4N
  *                     (system; see
@@ -233,6 +237,7 @@ static bool is_system;            /* qemu-system: the phase-2 suite */
 static int n_tests = T_USER_LAST; /* tests require=on insists on */
 static long delay_us = 50000;     /* P2A_CLOCK in-excursion host delay */
 static long bdelay_us = 1000;     /* P2B_TIMER in-excursion host delay */
+static bool icount_clock;         /* icount=on: A1's epsilon is exactly 0 */
 /* P2_INFO: the guest's layout and TSC rate */
 static uint64_t wp_lo, wp_hi, tsc_per_ms;
 static bool have_info;
@@ -1193,11 +1198,17 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
         int64_t dv = e.vclk1 - e.vclk0;
         if (e.vclk0 == 0 && e.vclk1 == 0) {
             FAIL("A1 SUBJECT ABSENT: qemu_plugin_vclock_ns() reads 0 on both "
-                 "sides of the bracket (it returns 0 under -icount), so the "
-                 "clock A1 is about cannot be read through the plugin API");
+                 "sides of the bracket, so the clock A1 is about cannot be "
+                 "read through the plugin API");
         } else {
             fprintf(stderr, "[wp-assert] A1 vclock_delta_ns=%" PRId64
-                    " delay_us=%ld\n", dv, delay_us);
+                    " delay_us=%ld%s\n", dv, delay_us,
+                    icount_clock ? " clock=icount" : "");
+            if (icount_clock) {
+                CHECK(dv == 0, "A1 the guest clock advanced %" PRId64 " ns "
+                      "across an excursion under -icount (epsilon is 0: the "
+                      "clock is the instruction count)", dv);
+            }
             if (delay_us > 0) {
                 CHECK(dv < delay_us * 1000 / 2, "A1 the guest clock advanced "
                       "%" PRId64 " ns across an excursion holding a %ld us "
@@ -1709,6 +1720,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             delay_us = atol(kv[1]);
         } else if (g_strcmp0(kv[0], "bdelay_us") == 0) {
             bdelay_us = atol(kv[1]);
+        } else if (g_strcmp0(kv[0], "icount") == 0) {
+            icount_clock = g_strcmp0(kv[1], "on") == 0;
         } else {
             fprintf(stderr, "wp-assert: unknown option %s\n", argv[i]);
             return -1;

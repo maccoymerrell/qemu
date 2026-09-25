@@ -147,13 +147,13 @@ static void riscv_aclint_mtimer_cb(void *opaque)
 /*
  * Wrong-path excursion-exit reconcile: recompute @hartid's MTIP level
  * and host QEMUTimer deadline from the architected mtimecmp.  Reuses the
- * normal mtimecmp-write path, so there is no separate deadline logic: an
- * expiry deferred by the excursion gate in riscv_aclint_mtimer_cb (the
- * one-shot host timer has already fired and will not re-arm itself) — or one
- * whose mip.MTIP raise the excursion's register restore erased — takes the
- * "timecmp <= rtc" branch and raises MTIP now; a still-future deadline
- * re-arms the QEMUTimer.  Idempotent, so running it on an excursion that
- * disturbed nothing is safe.
+ * normal mtimecmp-write path, so there is no separate deadline logic.
+ * riscv_aclint_mtimer_cb has no excursion gate: an expiry that fires during
+ * the excursion raises MTIP there, and the excursion's register restore may
+ * erase that mip.MTIP raise (the one-shot host timer has already fired and
+ * will not re-arm itself).  Such an expiry takes the "timecmp <= rtc" branch
+ * here and raises MTIP now; a still-future deadline re-arms the QEMUTimer.
+ * Idempotent, so running it on an excursion that disturbed nothing is safe.
  * Called from riscv_cpu_plugin_resync_timers with spec mode ended (driving
  * the IRQ line is safe) and the BQL held.
  */

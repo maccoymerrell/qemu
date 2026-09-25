@@ -944,7 +944,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
         else {
             const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 #ifdef CONFIG_PLUGIN
-            /* CST_IRQSTORM (diagnostic): detect an interrupt storm —
+            /* CST_IRQSTORM (diagnostic): detect an interrupt storm --
              * repeated async delivery with the INTERRUPTED guest PC (sampled
              * before the vector redirect) never advancing: each IRQ pass
              * consumed more virtual time than the guest needed to retire one
@@ -1246,8 +1246,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * the window early.  A genuine resume cannot mismatch: the
              * departed thread executes NOTHING between departure and its
              * resume (the resume IS its next instruction), so its thread
-             * pointer — context-switched state the kernel restores before
-             * the exception return — compares equal exactly there.  When
+             * pointer -- context-switched state the kernel restores before
+             * the exception return -- compares equal exactly there.  When
              * the hook is absent both sides read 0 and the test is a bare
              * PC equality.  A mismatch leaves the window open for the
              * owner's later return; if the owner never returns, the flag
@@ -1290,7 +1290,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                     cpu_plugin_async_probe(cpu, "PEERPC", 0, false);
                     /* Condition instrument (CST_ASYNCRET_DIAG): a peer
                      * context hit the departure PC and the close was
-                     * withheld — the case the discriminator exists for. */
+                     * withheld -- the case the discriminator exists for. */
                     static int aret_diag = -1;
                     if (aret_diag < 0) {
                         aret_diag = getenv("CST_ASYNCRET_DIAG") != NULL;

@@ -766,6 +766,13 @@ void helper_itrigger_match(CPURISCVState *env)
 
 static void riscv_itrigger_update_count(CPURISCVState *env)
 {
+    int count, executed;
+    /*
+     * Record last icount, so that we can evaluate the executed instructions
+     * since last privilege mode change or timer expire.
+     */
+    int64_t last_icount = env->last_icount, current_icount;
+
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path (speculative): do not re-arm the itrigger host timer or fire
@@ -777,12 +784,6 @@ static void riscv_itrigger_update_count(CPURISCVState *env)
         return;
     }
 #endif
-    int count, executed;
-    /*
-     * Record last icount, so that we can evaluate the executed instructions
-     * since last privilege mode change or timer expire.
-     */
-    int64_t last_icount = env->last_icount, current_icount;
     current_icount = env->last_icount = icount_get_raw();
 
     for (int i = 0; i < RV_MAX_TRIGGERS; i++) {
@@ -875,9 +876,11 @@ static void itrigger_reg_write(CPURISCVState *env, target_ulong index,
             env->tdata1[index] = new_val;
             if (icount_enabled()) {
                 env->last_icount = icount_get_raw();
-                /* set the count to timer -- in virtual-clock nanoseconds,
+                /*
+                 * set the count to timer -- in virtual-clock nanoseconds,
                  * which is what the timer's deadline means; see the
-                 * conversion note in riscv_itrigger_update_count. */
+                 * conversion note in riscv_itrigger_update_count.
+                 */
                 timer_mod(env->itrigger_timer[index],
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                           icount_to_ns(itrigger_get_count(env, index)));

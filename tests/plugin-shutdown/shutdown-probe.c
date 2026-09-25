@@ -28,19 +28,6 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-/*
- * The probe also builds against a QEMU from before the shutdown callback
- * separated origin from placement, which is how the before/after reading is
- * taken.  There, the vCPU whose state is live cannot be asked for at all --
- * the plugin's only handle on it is the argument that also has to answer
- * "which vCPU caused this", and that is the defect.
- */
-#ifdef QEMU_PLUGIN_VCPU_UNNAMED
-#define PROBE_CURRENT_VCPU() qemu_plugin_current_vcpu_index()
-#else
-#define PROBE_CURRENT_VCPU() (-99)
-#endif
-
 static FILE *report;
 static gboolean wedge_mode;
 static gint wedge_after = 200000;
@@ -103,7 +90,7 @@ static void vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index,
     fprintf(report,
             "SHUTDOWN origin=%d in_guest_insn=%d current=%d last_exec=%d\n",
             vcpu_index, in_guest_insn ? 1 : 0,
-            PROBE_CURRENT_VCPU(),
+            qemu_plugin_current_vcpu_index(),
             g_atomic_int_get(&last_exec_vcpu));
     fflush(report);
 

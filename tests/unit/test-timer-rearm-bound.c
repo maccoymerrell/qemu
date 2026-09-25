@@ -190,7 +190,7 @@ static void test_creeping_rearm(void)
 
     /* Bounded by the ceiling, not by the device's good behaviour. */
     g_assert_cmpuint(n_a, >, 0);
-    g_assert_cmpuint(n_a, <=, 100001);
+    g_assert_cmpuint(n_a, <=, TIMERLIST_MAX_CB_PER_PASS + 1);
     timer_del(&ta);
 }
 

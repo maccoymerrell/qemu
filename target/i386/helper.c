@@ -185,11 +185,11 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
     /*
      * Address-space switch observation: CR3 is the register
      * x86_get_plugin_state reports, compared under the same
-     * CR3_NOFLUSH_MASK that hook applies — the event contract is "the
+     * CR3_NOFLUSH_MASK that hook applies -- the event contract is "the
      * reported value changed", and a write differing only in bit 63
      * (the PCID no-flush command bit, never part of the stored
      * register) does not change it.  This is the one TCG commit point
-     * for every architectural CR3 write — MOV CR3 (helper_write_crN),
+     * for every architectural CR3 write -- MOV CR3 (helper_write_crN),
      * hardware task switches, SMM RSM and SVM world switches all
      * funnel through here.  The event's pc slot carries the OLD
      * (masked) value; the push itself stamps the just-committed NEW

@@ -69,14 +69,16 @@ void qemu_plugin_reset(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
 
 void qemu_plugin_request_tb_flush(void)
 {
-    /* Plugin callbacks run inside a translation (tb_trans) or an
-     * executing TB (tb_exec) — contexts where tb_flush's serial-mode
+    /*
+     * Plugin callbacks run inside a translation (tb_trans) or an
+     * executing TB (tb_exec) -- contexts where tb_flush's serial-mode
      * synchronous dispatch would reset the code region under an
      * in-flight tb_gen_code.  Always defer: do_tb_flush runs at the
      * vCPU thread-loop safe point, after any plugin excursion unwinds,
      * and fires registered flush callbacks from there.  Callers are
      * expected to be on a vCPU thread (current_cpu set); no-op when
-     * tcg_enabled() is false. */
+     * tcg_enabled() is false.
+     */
     tb_flush_deferred(current_cpu);
 }
 
@@ -397,7 +399,7 @@ qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info)
          * No in-tree target emits a MemOp whose size shift exceeds
          * MO_128, and CPUState only ever latches the low 128 bits of an
          * access into plugin_mem_value_low/high (tcg_gen_plugin_mem_cb()
-         * in tcg/tcg-op-ldst.c) — a wider access has already lost its
+         * in tcg/tcg-op-ldst.c) -- a wider access has already lost its
          * upper bits before this function is reached, so there is
          * nothing correct to return.  Degrade instead of aborting the
          * whole emulator: report the access as unrepresentable and let
@@ -546,8 +548,10 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
      */
     if (current_cpu->plugin_spec_mode &&
         current_cpu->plugin_spec_store_buf) {
-        /* Overlay speculative bytes; walk by cache line to amortise
-         * the hash lookup across (up to 64) bytes within each line. */
+        /*
+         * Overlay speculative bytes; walk by cache line to amortise
+         * the hash lookup across (up to 64) bytes within each line.
+         */
         size_t off = 0;
         while (off < len) {
             vaddr cur = addr + off;
@@ -559,7 +563,7 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
             /* Hash value = pool index + 1 (see spec_line_get_or_alloc). */
             gpointer val = g_hash_table_lookup(
                 current_cpu->plugin_spec_store_buf,
-                GUINT_TO_POINTER((guintptr)line_addr));
+                GSIZE_TO_POINTER((gsize)line_addr));
             PluginSpecLine *line = val
                 ? &((PluginSpecLine *)current_cpu->plugin_spec_store_pool)
                       [GPOINTER_TO_SIZE(val) - 1]
@@ -737,10 +741,12 @@ uint64_t qemu_plugin_get_pc(void)
     return (uint64_t)current_cpu->cc->get_pc(current_cpu);
 }
 
-/* Fill (priv, asid, mmu_on) from the per-target hook; defaults
+/*
+ * Fill (priv, asid, mmu_on) from the per-target hook; defaults
  * (0, 0, true) when the target provides none (e.g. *-linux-user, where a
  * process always has a valid address space, so "paging" is effectively
- * on for the purpose of bounding speculative fetches). */
+ * on for the purpose of bounding speculative fetches).
+ */
 static void plugin_cpu_state(int *priv, uint64_t *asid, bool *mmu_on)
 {
     *priv = 0;
@@ -799,24 +805,14 @@ bool qemu_plugin_thread_ptr_tracks_current(void)
            ops->plugin_thread_ptr_tracks_current(current_cpu);
 }
 
-void qemu_plugin_set_current_task_offset(uint64_t offset)
-{
-    /* Stored process-globally (see plugins/core.c); consumed by targets
-     * whose kernels keep no per-task pointer in a register at kernel
-     * privilege — today x86-64's thread-pointer hooks.  Deliberately
-     * accepted on every target and in user mode: the declaration is
-     * inert where nothing consumes it, and the declaring plugin — which
-     * knows the target it runs on — is the right place to tell its user
-     * the hint has no consumer here. */
-    qemu_plugin_current_task_offset_store(offset);
-}
-
 bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
 {
-    /* Defensive: the classification needs the live vCPU's paging config, but
+    /*
+     * Defensive: the classification needs the live vCPU's paging config, but
      * a plugin may also consult it from a non-vCPU housekeeping context (e.g.
      * an end-of-run diagnostic).  With no current vCPU there is no address
-     * space to classify against — report user-domain rather than abort. */
+     * space to classify against -- report user-domain rather than abort.
+     */
     if (!current_cpu) {
         return false;
     }
@@ -824,8 +820,10 @@ bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
     if (ops && ops->vaddr_is_kernel) {
         return ops->vaddr_is_kernel(current_cpu, vaddr);
     }
-    /* No target classifier (user-mode, or an ISA without a kernel/user VA
-     * split visible to the tracer): everything is user-domain. */
+    /*
+     * No target classifier (user-mode, or an ISA without a kernel/user VA
+     * split visible to plugins): everything is user-domain.
+     */
     return false;
 }
 
@@ -850,7 +848,7 @@ bool qemu_plugin_translate_at(uint64_t pc)
 /*
  * Bump-allocate (or reuse) the PluginSpecLine for @line_addr.  The
  * pool is a flat PluginSpecLine[] that grows on demand and is reset
- * (used = 0) at spec_mode_end — entries from prior simulations are
+ * (used = 0) at spec_mode_end -- entries from prior simulations are
  * never freed, just overwritten on reuse.  Returns NULL when the
  * sandbox line cap is reached and the line isn't already tracked.
  *
@@ -866,7 +864,7 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
 {
     PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
     gpointer val = g_hash_table_lookup(
-        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+        cpu->plugin_spec_store_buf, GSIZE_TO_POINTER((gsize)line_addr));
     if (val) {
         return &pool[GPOINTER_TO_SIZE(val) - 1];
     }
@@ -874,10 +872,12 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
         return NULL;
     }
     if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_SOFT_BUDGET) {
-        /* Wild wrong-path store (a garbage-size memop buffered without faulting):
+        /*
+         * Wild wrong-path store (a garbage-size memop buffered without faulting):
          * flag the excursion for prompt termination by the WP loop
          * (qemu_plugin_spec_store_overflowed).  Keep allocating up to the hard
-         * cap meanwhile so the in-flight store is not torn mid-region. */
+         * cap meanwhile so the in-flight store is not torn mid-region.
+         */
         cpu->plugin_spec_store_overflow = true;
     }
     if (cpu->plugin_spec_store_pool_used >= cpu->plugin_spec_store_pool_cap) {
@@ -891,10 +891,12 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
     size_t idx = cpu->plugin_spec_store_pool_used++;
     PluginSpecLine *line = &pool[idx];
     line->valid_mask = 0;
-    /* bytes[] left uninitialised; valid_mask gates reads, so unused
-     * bytes are never observed. */
+    /*
+     * bytes[] left uninitialised; valid_mask gates reads, so unused
+     * bytes are never observed.
+     */
     g_hash_table_insert(cpu->plugin_spec_store_buf,
-                        GUINT_TO_POINTER((guintptr)line_addr),
+                        GSIZE_TO_POINTER((gsize)line_addr),
                         GSIZE_TO_POINTER(idx + 1));
     return line;
 }
@@ -930,8 +932,8 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
      * honours CF_FORCE_SLOW bypasses the inline fast path directly (any mode),
      * and in system mode the portable TLB_FORCE_SLOW path contains stores on
      * any host backend.  Only user-mode tracing on a backend without
-     * CF_FORCE_SLOW is unsupported — there is no softmmu TLB to carry the flag,
-     * so an inline store would commit to the guest image.  Refuse loudly at
+     * CF_FORCE_SLOW is unsupported -- there is no softmmu TLB to carry the
+     * flag, so an inline store would commit to the guest image.  Refuse loudly at
      * the first spec-mode request there rather than corrupt guest memory, and
      * rather than silently disabling wrong-path tracing (which would leave the
      * caller believing the speculative excursion ran).  On x86 the capability
@@ -944,8 +946,8 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
      * already written the diagnostic to the unbuffered stderr.
      */
     if (!cpu_plugin_spec_mode_supported()) {
-        error_report("champsim_tracer wrong-path tracing is not supported on "
-                     "this build: user-mode tracing on a host TCG backend that "
+        error_report("plugin wrong-path execution is not supported on this "
+                     "host backend in user mode: a host TCG backend that "
                      "does not honor CF_FORCE_SLOW has no way to sandbox "
                      "speculative stores, which would corrupt the guest image "
                      "- refusing to enable.");
@@ -969,7 +971,7 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
      * state, and the flush below is a no-op.  On other host backends (system
      * mode) the portable TLB_FORCE_SLOW path carries the routing instead: flush
      * the softmmu TLB here so any correct-path entries resident at excursion
-     * start refill — with TLB_FORCE_SLOW — inside the excursion, rather than
+     * start refill -- with TLB_FORCE_SLOW -- inside the excursion, rather than
      * being hit on the inline fast path.  A no-op in user mode (no softmmu
      * TLB).  The per-target impl lives in cpu-exec.c so this common file does
      * not reference softmmu-only tlb_flush.
@@ -983,8 +985,8 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
  * wall-clock time, but it is *outside* guest time: it must not advance the
  * guest's perception of time any more than it advances the guest's registers.
  * QEMU_CLOCK_VIRTUAL with icount off tracks host time, and every target reads
- * its architected counter from it — aarch64 CNTVCT_EL0, x86 TSC, riscv `time`,
- * mips Count — so a single freeze checkpoints the timer count for all ISAs at
+ * its architected counter from it -- aarch64 CNTVCT_EL0, x86 TSC, riscv `time`,
+ * mips Count -- so a single freeze checkpoints the timer count for all ISAs at
  * once.
  *
  * A plugin calls the pair once per excursion, around its whole wrong-path
@@ -1127,7 +1129,7 @@ void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
 
 void qemu_plugin_cpu_events_pending_slot(qemu_plugin_u64 slot)
 {
-    plugin_set_evq_pending_slot(slot, true);
+    plugin_set_evq_pending_slot(slot);
 }
 
 void qemu_plugin_cpu_events_stats(unsigned int vcpu_index,
@@ -1165,8 +1167,10 @@ size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
     *evs = (const struct qemu_plugin_cpu_event *)q->buf;
     q->len = 0;
     q->n_drain++;
-    /* The queue is empty: retract the drain-owed flag so the consumer's
-     * per-TB conditional callback stops dispatching until the next push. */
+    /*
+     * The queue is empty: retract the drain-owed flag so the consumer's
+     * per-TB conditional callback stops dispatching until the next push.
+     */
     plugin_evq_note_drained(cpu);
     return n;
 }
@@ -1290,9 +1294,11 @@ void qemu_plugin_spec_mode_end(void)
     current_cpu->plugin_spec_mode = false;
     current_cpu->plugin_spec_saved_state = NULL;
 
-    /* Flush sandbox: clear the line index and reset the pool's
+    /*
+     * Flush sandbox: clear the line index and reset the pool's
      * high-water mark.  The pool buffer itself stays allocated for
-     * reuse on the next spec-mode entry. */
+     * reuse on the next spec-mode entry.
+     */
     if (current_cpu->plugin_spec_store_buf) {
         g_hash_table_remove_all(current_cpu->plugin_spec_store_buf);
     }
@@ -1302,7 +1308,7 @@ void qemu_plugin_spec_mode_end(void)
      * The fault flag belongs to the memop that raised it, and the excursion
      * it belonged to is over.  It is set only under cpu_plugin_spec_active()
      * and consumed by qemu_plugin_spec_mem_faulted_take(), whose contract is
-     * that the memory callback takes it immediately after the access — but
+     * that the memory callback takes it immediately after the access -- but
      * two constructions break that pairing and leave it set: an instruction
      * FETCH raises it with no memory callback behind it to take it, and a
      * consumer that returns before its take (a per-instruction slot cap, a

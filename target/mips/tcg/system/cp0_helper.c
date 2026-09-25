@@ -2036,7 +2036,7 @@ target_ulong helper_dvp(CPUMIPSState *env)
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path: only own-CPU CP0_VPControl (in-snapshot) plus sibling
-     * sleep/wake (gated in mips_vpe_sleep/wake) — safe, but gate at entry to
+     * sleep/wake (gated in mips_vpe_sleep/wake) -- safe, but gate at entry to
      * match dvpe/evpe and stay robust if the sink gates ever change.
      */
     if (env_cpu(env)->plugin_spec_mode) {
@@ -2074,7 +2074,7 @@ target_ulong helper_evp(CPUMIPSState *env)
     target_ulong prev;
 
 #ifdef CONFIG_PLUGIN
-    /* Wrong-path: see helper_dvp — gate at entry for symmetry/robustness. */
+    /* Wrong-path: see helper_dvp -- gate at entry for symmetry/robustness. */
     if (env_cpu(env)->plugin_spec_mode) {
         return 0;
     }

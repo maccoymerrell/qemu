@@ -254,8 +254,10 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     rc = install(ctx->id, info, desc->argc, desc->argv);
     ctx->installing = false;
     if (rc == 0) {
-        /* PLUGIN-ACTIVE edge: a plugin is now loaded/instrumenting
-         * (event-agency discipline; idempotent, system-mode decides) */
+        /*
+         * PLUGIN-ACTIVE edge: a plugin is now loaded/instrumenting
+         * (event-agency discipline; idempotent, system-mode decides)
+         */
         qemu_plugin_vclock_agency_mode(true);
     }
     if (rc) {

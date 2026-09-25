@@ -240,26 +240,28 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
  * implements the hardware page-table walker (Config3.PW, PWCtl.PWEn),
  * fall back to the same directory walk the walker performs, from CP0
  * PWBase, SIDE-EFFECT-FREE: PWBase is used strictly as a TRANSLATION
- * INPUT — never stored, compared, or reported as an identity — and the
+ * INPUT -- never stored, compared, or reported as an identity -- and the
  * walk inserts no TLB entry and raises no exception.  Directory
  * pointers are virtual (kseg0 in practice) and resolve through
  * get_physical_address; entries are read from guest RAM physically.
  * Deliberately narrow: huge-page directory entries and non-4K leaf
- * configurations are not decoded — the walk reports failure and the
+ * configurations are not decoded -- the walk reports failure and the
  * debug read fails as it would without the fallback.
  */
 static bool mips_htw_walk_debug(CPUState *cs, vaddr address, hwaddr *out)
 {
 #if defined(TARGET_MIPS64)
-    /* QEMU models the hardware page-table walker for 32-bit MIPS only:
+    /*
+     * QEMU models the hardware page-table walker for 32-bit MIPS only:
      * page_table_walk_refill and the CP0PF_* fields it reads are
      * compiled out under TARGET_MIPS64 (tcg/system/tlb_helper.c), so
      * there is no walker here to mirror and no guest on such a model
-     * programs PWBase.  The debug read keeps the TLB-resident path —
+     * programs PWBase.  The debug read keeps the TLB-resident path --
      * the same honest degradation every model without Config3.PW takes
      * under content gating, counted by the unreadable-at-refresh
      * witness.  No MIPS model is excluded by this; mirror the walker
-     * here if upstream ever models it for MIPS64. */
+     * here if upstream ever models it for MIPS64.
+     */
     return false;
 #else
     CPUMIPSState *env = cpu_env(cs);

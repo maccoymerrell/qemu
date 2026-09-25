@@ -273,7 +273,7 @@ void helper_set_dr(CPUX86State *env, int reg, target_ulong t0)
     /*
      * Wrong-path (speculative): a MOV-to-DRn would install host debug objects
      * (cpu_breakpoint_insert/cpu_watchpoint_insert on cs->breakpoints/
-     * watchpoints) and tlb_flush via cpu_x86_update_dr7 — neither is part of
+     * watchpoints) and tlb_flush via cpu_x86_update_dr7 -- neither is part of
      * the env snapshot, so they persist past the discarded walk.  Apply only
      * the env-shadow dr[reg] (rolled back) and skip all host-object work.
      */

@@ -128,8 +128,10 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
 #endif
     cpu_mips_timer_update(env);
     if (env->insn_flags & ISA_MIPS_R2) {
-        /* Atomic: this runs on the iothread, the guest clears it from its
-         * own vCPU thread, and both touch the whole Cause word. */
+        /*
+         * Atomic: this runs on the iothread, the guest clears it from its
+         * own vCPU thread, and both touch the whole Cause word.
+         */
         qatomic_or(&env->CP0_Cause, 1 << CP0Ca_TI);
     }
     qemu_irq_raise(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
@@ -144,7 +146,7 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
  * Reconcile the host R4K timer with the architected CP0_Count/Compare after a
  * wrong-path excursion.  Runs on every excursion exit, including ones that
  * disturbed nothing, and is idempotent on an already consistent timer.  Called
- * from cpu_plugin_excursion_close — the true excursion-exit boundary, with
+ * from cpu_plugin_excursion_close -- the true excursion-exit boundary, with
  * spec mode ended and the BQL held (a re-delivered expiry raises the timer IRQ
  * line through cpu_mips_irq_request, which expects the BQL).
  */
@@ -152,19 +154,23 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
 
-    /* Reconcile the interrupt line from restored CP0_Cause first: an
+    /*
+     * Reconcile the interrupt line from restored CP0_Cause first: an
      * excursion can suppress a line update while
      * the register snapshot is live, leaving the line stuck relative to
      * the restored IP bits.  Idempotent; independent of the timer.
      * Unconditional, like the timer reconcile below: gating it on "a line
      * drive was observed and suppressed" misses every desync the rollback
-     * produced on its own, so there is no gate. */
+     * produced on its own, so there is no gate.
+     */
     cpu_mips_plugin_reconcile_irq(env);
 
-    /* Re-arm the host deadline from the restored CP0_Count/Compare.  There is
+    /*
+     * Re-arm the host deadline from the restored CP0_Count/Compare.  There is
      * no expiry to replay: an expiry the gate declined to deliver is one the
      * timer list never popped, so it is still armed and still owed to the
-     * guest by the timer list itself. */
+     * guest by the timer list itself.
+     */
     if (env->timer && !(env->CP0_Cause & (1 << CP0Ca_DC))) {
         cpu_mips_timer_update(env);
     }

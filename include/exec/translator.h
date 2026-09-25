@@ -21,6 +21,14 @@
 #include "qemu/bswap.h"
 #include "exec/vaddr.h"
 
+/*
+ * CPUSTATE_OFF_FROM_ENV: offset of CPUState field @f relative to tcg_env,
+ * which points at the CPUArchState embedded in ArchCPU.  For generated
+ * loads and stores of CPUState fields; usable only where ArchCPU is complete.
+ */
+#define CPUSTATE_OFF_FROM_ENV(f) \
+    (offsetof(ArchCPU, parent_obj.f) - offsetof(ArchCPU, env))
+
 /**
  * DisasJumpType:
  * @DISAS_NEXT: Next instruction in program order.
@@ -76,7 +84,7 @@ struct DisasContextBase {
     /*
      * True while a never-split (plugin-registered atomic sequence)
      * extension is active in this translation.  Targets may relax their
-     * own mid-TB page-crossing refusals while set — never beyond the
+     * own mid-TB page-crossing refusals while set -- never beyond the
      * TB's two-page window.
      * False for every ordinary translation, so stock behaviour is
      * byte-identical when no sequence prefix has been matched.
@@ -147,7 +155,7 @@ typedef struct TranslatorOps {
      * condition-code spill) to that boundary and return true, or
      * return false to veto the retreat (the TB then splits in place).
      * The dropped instructions are always a byte-prefix of a registered
-     * sequence — immediate-load instructions by construction.
+     * sequence -- immediate-load instructions by construction.
      */
     uint64_t (*nosplit_checkpoint)(DisasContextBase *db, CPUState *cpu);
     bool (*nosplit_retreat)(DisasContextBase *db, CPUState *cpu,

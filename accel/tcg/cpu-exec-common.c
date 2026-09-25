@@ -39,7 +39,7 @@ void tcg_cflags_set(CPUState *cpu, uint32_t flags)
  * CF_PCREL and TCG plugins are mutually exclusive.  CF_PCREL drops the
  * virtual PC from the TB identity (tb_hash_func is keyed on the physical
  * address alone and tb_lookup_cmp skips the PC test), so one translated TB
- * is dispatched for EVERY virtual mapping of the same physical code —
+ * is dispatched for EVERY virtual mapping of the same physical code --
  * correct for the guest, whose state is maintained pc-relatively, but a
  * plugin's per-instruction record is minted at translation with the
  * translating mapping's vaddrs.  Under a plugin, an execution in another
@@ -47,7 +47,7 @@ void tcg_cflags_set(CPUState *cpu, uint32_t flags)
  * is then reported at the OTHER process's virtual addresses: whole basic
  * blocks attributed to a peer process's mapping, and direct-branch targets
  * naming an address the branch cannot encode.  A plugin cannot repair this
- * downstream — the false vaddr IS the record — so targets that want CF_PCREL set it through
+ * downstream -- the false vaddr IS the record -- so targets that want CF_PCREL set it through
  * here, and it is withheld for the plugin run.  Loaded-plugin state is
  * realize-stable (see qemu_plugin_any_loaded).
  */

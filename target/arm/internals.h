@@ -998,8 +998,8 @@ static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path (speculative) containment.  The EL-change hooks dispatch
-     * device-facing callbacks — PMU counters, the GICv3 CPU-interface
-     * maintenance state, the generic-timer RME recalc — that live outside
+     * device-facing callbacks -- PMU counters, the GICv3 CPU-interface
+     * maintenance state, the generic-timer RME recalc -- that live outside
      * the CPUArchState register snapshot the wrong-path walk rolls back.
      * A speculative `eret` (or AArch32 exception return) fires these on
      * every excursion; left live, the discarded path mutates GIC/PMU/timer
@@ -1018,8 +1018,10 @@ static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
 static inline void arm_call_el_change_hook(ARMCPU *cpu)
 {
 #ifdef CONFIG_PLUGIN
-    /* See arm_call_pre_el_change_hook: suppress device side effects of a
-     * speculative exception-level change. */
+    /*
+     * See arm_call_pre_el_change_hook: suppress device side effects of a
+     * speculative exception-level change.
+     */
     if (unlikely(CPU(cpu)->plugin_spec_mode)) {
         return;
     }

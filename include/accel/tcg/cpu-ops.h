@@ -94,7 +94,7 @@ struct TCGCPUOps {
      *
      * Optional.  Returns the architectural per-thread pointer the
      * guest kernel context-switches per software thread (x86_64
-     * FS.base — GS.base for a 32-bit compat task — AArch64 TPIDR_EL0,
+     * FS.base -- GS.base for a 32-bit compat task -- AArch64 TPIDR_EL0,
      * RISC-V tp/x4, MIPS CP0 UserLocal).  Meaningful when sampled at
      * user privilege; see qemu_plugin_get_thread_ptr().
      */
@@ -132,7 +132,7 @@ struct TCGCPUOps {
      *
      * Optional.  Returns true when @vaddr lies in the guest's KERNEL
      * (privileged/supervisor) code region, false when it lies in the USER
-     * region, as determined by the target's own MMU / segment logic — the
+     * region, as determined by the target's own MMU / segment logic -- the
      * canonical/TTBR/sign-extension range the walker selects on, or the
      * fixed-segment map (MIPS kuseg vs kseg).  This is a pure architectural
      * range/bit test on the address; it does no page-table walk and cannot
@@ -353,6 +353,17 @@ struct TCGCPUOps {
     bool (*need_replay_interrupt)(int interrupt_request);
 #endif /* !CONFIG_USER_ONLY */
 };
+
+/*
+ * vaddr_in_upper_half: true when @v lies in the upper canonical half of a
+ * @bits-wide sign-extended virtual address space, i.e. every bit from
+ * @bits - 1 upwards is set.  Shared by the @vaddr_is_kernel implementations
+ * whose kernel region is that half.
+ */
+static inline bool vaddr_in_upper_half(uint64_t v, unsigned bits)
+{
+    return v >= (~(uint64_t)0 << (bits - 1));
+}
 
 #if defined(CONFIG_USER_ONLY)
 

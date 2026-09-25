@@ -365,11 +365,6 @@ static void global_invalidate_tlb(CPUMIPSState *env,
 
 void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
 {
-    /*
-     * Wrong-path: global_invalidate_tlb writes tlb->EHINV into the emulated
-     * TLB array of every vCPU (out of this CPU's snapshot). Skip in spec mode.
-     */
-    MIPS_WP_TLB_GATE(env);
     bool invAll = type == 0;
     bool invVA = type == 1;
     bool invMMid = type == 2;
@@ -378,6 +373,12 @@ void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
     uint8_t invMsgR = 0;
     uint32_t invMsgMMid = env->CP0_MemoryMapID;
     CPUState *other_cs = first_cpu;
+
+    /*
+     * Wrong-path: global_invalidate_tlb writes tlb->EHINV into the emulated
+     * TLB array of every vCPU (out of this CPU's snapshot). Skip in spec mode.
+     */
+    MIPS_WP_TLB_GATE(env);
 
 #ifdef TARGET_MIPS64
     invMsgR = extract64(arg, 62, 2);
@@ -1075,13 +1076,13 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
 #ifdef CONFIG_PLUGIN
 /*
  * True only for synchronous exceptions whose handler RE-EXECUTES the faulting
- * instruction — i.e. ERET returns to exactly the PC we recorded as the resume
+ * instruction -- i.e. ERET returns to exactly the PC we recorded as the resume
  * PC.  The tracer's fault-excursion stack pops on an exact resume-PC match, so
  * only these may push a frame.  An exception whose handler ADVANCES past the
  * instruction (SYSCALL/BREAK/TRAP/RI/OVERFLOW/FPE, unaligned AdEL/AdES emulated
- * and skipped, …) would push a frame that never pops and leave the depth stuck
- * +1 for the rest of that ASID's execution.  The re-executing set is the whole
- * TLB family (demand paging — the common case, plus LTLBL = TLB-Modified,
+ * and skipped, ...) would push a frame that never pops and leave the depth
+ * stuck +1 for the rest of that ASID's execution.  The re-executing set is the whole
+ * TLB family (demand paging -- the common case, plus LTLBL = TLB-Modified,
  * execute/read-inhibit) and the coprocessor/feature-unusable faults that lazily
  * enable a unit and re-run the instruction.
  */
@@ -1122,14 +1123,14 @@ void mips_cpu_do_interrupt(CPUState *cs)
      * when execution returns there.  Outermost only; never on wrong path.
      */
     /*
-     * Both recorded PCs must be the RESUME pc — where the handler's eret
-     * lands — not the raw trapping pc.  On MIPS they differ whenever the
+     * Both recorded PCs must be the RESUME pc -- where the handler's eret
+     * lands -- not the raw trapping pc.  On MIPS they differ whenever the
      * exception hits a branch DELAY SLOT: EPC points at the branch
      * (CAUSE.BD=1) and the eret re-executes branch+slot.
      * exception_resume_pc() backs the pc up to the branch under
      * MIPS_HFLAG_BMASK, exactly as the CP0_EPC assignment below does.
      * Recording the raw get_pc() slot address instead leaves the async
-     * flag stuck (the departure pc is never re-executed — only the branch
+     * flag stuck (the departure pc is never re-executed -- only the branch
      * is) and fault-merge frames unmatched (the resume lands on the
      * branch, not the slot), dropping the faulting BB from the trace.
      * Mask the mips16 ISA-mode bit so the value compares against TB PCs.
@@ -1158,7 +1159,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
          * it hit a delay slot), landing on exactly this recorded resume PC so
          * the tracer's stack pops.  Advance-past exceptions (SYSCALL/BREAK/
          * TRAP/RI/OVERFLOW/FPE, emulated unaligned AdEL/AdES) are deliberately
-         * NOT pushed — their handler advances CP0_EPC, so a pushed frame would
+         * NOT pushed -- their handler advances CP0_EPC, so a pushed frame would
          * never match a return PC and would stick the depth +1.  Report the
          * entry; the tracer owns the stack.
          */
@@ -1476,9 +1477,11 @@ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         CPUMIPSState *env = cpu_env(cs);
 
 #ifdef CONFIG_PLUGIN
-        /* Line-leak diagnostic (mirror of the riscv CST_IRQ_DIAG): is the
+        /*
+         * Line-leak diagnostic (mirror of the riscv CST_IRQ_DIAG): is the
          * CPU_INTERRUPT_HARD line stuck set with no backing CP0_Cause.IP
-         * (the wrong-path line leak signature)?  Throttled ~1/host-sec. */
+         * (the wrong-path line leak signature)?  Throttled ~1/host-sec.
+         */
         if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
             static long last;
             long now = (long)time(NULL);

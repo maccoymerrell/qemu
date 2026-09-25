@@ -762,20 +762,8 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     arm_call_el_change_hook(cpu);
     bql_unlock();
 
-#ifdef CONFIG_PLUGIN
-    /*
-     * Report the exception return so a system-mode tracer can pop its fault
-     * resume-PC stack when this lands back on a faulting instruction.  Every
-     * legal return is reported (PC committed above, in env->pc for AArch64 or
-     * regs[15] for AArch32 — get_pc reads whichever); the tracer pops only on
-     * a top-of-stack match, so syscall/async returns it never pushed are
-     * ignored.  Correct path only — a wrong-path eret must not perturb it.
-     */
-    {
-        CPUState *cs_ = env_cpu(env);
-        cpu_plugin_fault_pop(cs_, cs_->cc->get_pc(cs_));
-    }
-#endif
+    /* PC committed above: env->pc (AArch64) or regs[15] (AArch32). */
+    cpu_plugin_fault_pop(CPU(cpu), CPU(cpu)->cc->get_pc(CPU(cpu)));
 
     return;
 
@@ -912,7 +900,7 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
  * A run holds the byte VALUES as they were actually transferred (the
  * source may be gone by flush time: an overlapping copy has already
  * overwritten it, a speculative store only exists in the sandbox), in
- * a TARGET_PAGE_SIZE buffer — a run never exceeds one page-bounded
+ * a TARGET_PAGE_SIZE buffer -- a run never exceeds one page-bounded
  * chunk, which is also the fast path's report granularity.
  */
 typedef struct MopsRun {
@@ -922,8 +910,10 @@ typedef struct MopsRun {
     uint64_t buf_base;        /* guest address of buf[0] */
     int      memidx;
     uint8_t *buf;             /* TARGET_PAGE_SIZE, lazily allocated */
-    /* Fallback-classification cache: is the page this run walks device
-     * memory?  One nonfault TLB-flag probe per page, not per byte. */
+    /*
+     * Fallback-classification cache: is the page this run walks device
+     * memory?  One nonfault TLB-flag probe per page, not per byte.
+     */
     uint64_t mmio_page;
     bool     mmio_valid;
     bool     mmio;
@@ -951,14 +941,18 @@ static MopsAccCtx *mops_acc_ctx(CPUARMState *env)
     return cs->plugin_spec_mode ? &acc->spec : &acc->cp;
 }
 
-/* Emit a run's accumulated range through the shared decomposition and
- * deactivate it.  MOPS runs always count toward plugin_rep_iters. */
+/*
+ * Emit a run's accumulated range through the shared decomposition and
+ * deactivate it.  MOPS runs always count toward plugin_rep_iters.
+ */
 static void mops_run_flush(CPUARMState *env, MopsRun *run,
                            enum qemu_plugin_mem_rw rw)
 {
     if (run->active && run->hi > run->lo) {
-        /* run->buf is this reporter's own heap buffer, so its bytes
-         * cannot fault as a guest access: ra 0, no bracket. */
+        /*
+         * run->buf is this reporter's own heap buffer, so its bytes
+         * cannot fault as a guest access: ra 0, no bracket.
+         */
         arm_plugin_emit_pieces(env, run->lo, run->hi - run->lo,
                                run->buf + (run->lo - run->buf_base),
                                run->memidx, rw, true, 0);
@@ -966,8 +960,10 @@ static void mops_run_flush(CPUARMState *env, MopsRun *run,
     run->active = false;
 }
 
-/* Chunk complete: emit both directions, load side first — the order the
- * fast path reports a copy chunk in. */
+/*
+ * Chunk complete: emit both directions, load side first -- the order the
+ * fast path reports a copy chunk in.
+ */
 static void mops_ctx_flush(CPUARMState *env, MopsAccCtx *ctx)
 {
     mops_run_flush(env, &ctx->r, QEMU_PLUGIN_MEM_R);
@@ -978,7 +974,7 @@ static void mops_ctx_flush(CPUARMState *env, MopsAccCtx *ctx)
  * A pending run whose continuation never arrived: the guest abandoned a
  * faulted MOPS (its handler resumed somewhere else), or capture ended
  * mid-instruction.  The bytes were really transferred but their
- * instruction's execution window is gone — reporting them now would
+ * instruction's execution window is gone -- reporting them now would
  * attribute them to whatever instruction is live, so they are dropped
  * and the loss is made visible: here in the log, and plugin-side as a
  * delivered-vs-architectural byte mismatch (the published byte count
@@ -999,7 +995,7 @@ static void mops_run_drop_stale(MopsRun *run)
 /*
  * Is @addr device memory?  Cached per page on the run.  Raw TLB flags,
  * no side effects (no notdirty transition, no watchpoint fire), and no
- * plugin-forced TLB_MMIO — this asks about the machine, not about the
+ * plugin-forced TLB_MMIO -- this asks about the machine, not about the
  * instrumentation.  Never called in spec mode (spec normalizes always;
  * its accesses are sandboxed and cannot reach a device).
  */
@@ -1049,9 +1045,11 @@ static void mops_acc_append(CPUARMState *env, MopsAccCtx *ctx, bool is_store,
         run->active = true;
         run->descending = descending;
         run->memidx = memidx;
-        /* The chunk never crosses a page, so anchoring the buffer at the
+        /*
+         * The chunk never crosses a page, so anchoring the buffer at the
          * lowest address the chunk can reach keeps indexing in-bounds in
-         * both directions. */
+         * both directions.
+         */
         run->buf_base = descending ? addr - (remaining - 1) : addr;
         run->lo = descending ? addr + 1 : addr;
         run->hi = descending ? addr + 1 : addr;
@@ -1075,7 +1073,7 @@ static void mops_acc_append(CPUARMState *env, MopsAccCtx *ctx, bool is_store,
  * re-dirtied it, handing the rest of the chunk back to the fast path),
  * the chunk completes that run so the flushed tiling is the one an
  * uninterrupted fast path would have reported.  Otherwise the chunk is
- * emitted directly — the pure fast path stays allocation-free.
+ * emitted directly -- the pure fast path stays allocation-free.
  */
 static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
@@ -1091,9 +1089,11 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
         return;
     }
     acc = cs->plugin_mops_report;
-    /* Only the MOPS step helpers (@count) own runs; DC ZVA must neither
-     * complete nor invalidate one — the kernel's clear_page() runs inside
-     * the very fault handlers a split MOPS holds its pending run across. */
+    /*
+     * Only the MOPS step helpers (@count) own runs; DC ZVA must neither
+     * complete nor invalidate one -- the kernel's clear_page() runs inside
+     * the very fault handlers a split MOPS holds its pending run across.
+     */
     if (unlikely(acc != NULL) && count) {
         MopsAccCtx *ctx = cs->plugin_spec_mode ? &acc->spec : &acc->cp;
 
@@ -1104,8 +1104,10 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                 (addr - run->buf_base) + size <= TARGET_PAGE_SIZE;
 
             if (contig) {
-                /* Reading @host is a guest access; bracket it like the
-                 * bulk move so a fault unwinds as the guest's. */
+                /*
+                 * Reading @host is a guest access; bracket it like the
+                 * bulk move so a fault unwinds as the guest's.
+                 */
                 if (ra) {
                     set_helper_retaddr(ra);
                 }
@@ -1118,8 +1120,10 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                 } else {
                     run->hi = addr + size;
                 }
-                /* The fast path reports a chunk whole, so this run now
-                 * extends to the chunk boundary: flush it. */
+                /*
+                 * The fast path reports a chunk whole, so this run now
+                 * extends to the chunk boundary: flush it.
+                 */
                 mops_run_flush(env, run, rw);
                 return;
             }
@@ -1135,7 +1139,7 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
  * published through the same CPUState fields x86's do_gen_rep() uses
  * (the plugin consumes both through one accounting path):
  *
- *   entry     — zero the per-execution counters.  Runs after the
+ *   entry     -- zero the per-execution counters.  Runs after the
  *               enable/consistency checks (whose exceptions mean the
  *               operation never began; the stale fields then name some
  *               other instruction and the consumer's pc guard refuses
@@ -1143,14 +1147,14 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
  *               first byte leaves fresh facts: 0 accesses, 0 bytes, not
  *               complete.  The instruction's address itself is stored at
  *               translation time (see gen_mops_plugin_pc()).
- *   bytes     — architectural progress, accumulated from the step
+ *   bytes     -- architectural progress, accumulated from the step
  *               returns, i.e. the same quantity the helper writes back
  *               into the size register.  Survives the fault longjmp the
  *               way do_gen_rep's per-iteration writeback does.
- *   complete  — the instruction retired in this execution (including
+ *   complete  -- the instruction retired in this execution (including
  *               the size==0 NOP-outs, which retire having moved
  *               nothing).
- *   reenter   — this execution ends by re-entering the instruction:
+ *   reenter   -- this execution ends by re-entering the instruction:
  *               set only at the cpu_loop_exit_requested splits, QEMU's
  *               implementation artifact.  A guest-architectural fault
  *               (which real hardware also restarts the instruction for)
@@ -1247,7 +1251,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 
         if (unlikely(!mem)) {
             /*
-             * mem == NULL here means I/O — or, with a plugin attached,
+             * mem == NULL here means I/O -- or, with a plugin attached,
              * speculative (wrong-path) execution, whose probes refuse
              * host pointers.  Just do a series of byte writes as the
              * architecture demands.
@@ -1457,14 +1461,13 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
             bool mmio = !cs->plugin_spec_mode &&
                 mops_fallback_mmio(env, &ctx->w, toaddr,
                                    MMU_DATA_STORE, memidx);
+            void *saved_cbs = cs->neg.plugin_mem_cbs;
 
             if (mmio) {
                 cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
                 cs->plugin_rep_iters++;   /* one per-byte piece delivered */
                 return 1;
             }
-            void *saved_cbs = cs->neg.plugin_mem_cbs;
-
             cs->neg.plugin_mem_cbs = NULL;
             cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
             cs->neg.plugin_mem_cbs = saved_cbs;
@@ -1522,10 +1525,12 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
         cpu_st16_mmu(env, toaddr, int128_make128(repldata, repldata), oi16, ra);
         mte_mops_set_tags(env, toaddr, 16, *mtedesc);
 #ifdef CONFIG_PLUGIN
-        /* The 16-byte store above reports itself as one MO_128 piece —
+        /*
+         * The 16-byte store above reports itself as one MO_128 piece --
          * already the fast-path shape (SETG addresses and sizes are
          * 16-aligned), so no normalization is needed; only the published
-         * access count must include it. */
+         * access count must include it.
+         */
         if (env_cpu(env)->neg.plugin_mem_cbs) {
             env_cpu(env)->plugin_rep_iters++;
         }
@@ -1812,8 +1817,10 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
         if (stagesetsize > 0 &&
             unlikely(cpu_loop_exit_requested(cs) ||
                      mops_spec_yield(env, moved))) {
-            /* QEMU's own re-entry of this instruction, not the guest's:
-             * the next execution continues it rather than beginning it. */
+            /*
+             * QEMU's own re-entry of this instruction, not the guest's:
+             * the next execution continues it rather than beginning it.
+             */
             mops_plugin_reenter(env);
             cpu_loop_exit_restore(cs, ra);
         }
@@ -2162,7 +2169,7 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
      * Easy case: just memmove the host memory. Note that wmem and
      * rmem here point to the *last* byte to copy.  The plugin reports
      * take the ascending base of the range (load before the move,
-     * store after it — see copy_step()).
+     * store after it -- see copy_step()).
      */
     arm_plugin_bulk_mem_cb(env, fromaddr - (copysize - 1), copysize,
                            rmem - (copysize - 1), rmemidx,

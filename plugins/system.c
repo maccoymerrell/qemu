@@ -35,11 +35,11 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
  *
  * Called from the shutdown request and from the main loop's shutdown
  * acknowledge (system/runstate.c), both of which run BEFORE qemu_cleanup()
- * — so the machine is still assembled and the vCPUs still exist.  That is
+ * -- so the machine is still assembled and the vCPUs still exist.  That is
  * the whole value of this seam: everything a plugin needs to close a
  * capture (guest memory, registers, privilege level, address space)
- * resolves through current_cpu, and at atexit(3) time — where
- * qemu_plugin_atexit_cb() fires — current_cpu is NULL and the machine is
+ * resolves through current_cpu, and at atexit(3) time -- where
+ * qemu_plugin_atexit_cb() fires -- current_cpu is NULL and the machine is
  * already down.
  */
 
@@ -70,8 +70,8 @@ static void plugin_shutdown_cond_init(void)
  * client or a host signal name no vCPU (arg -1): a vCPU is borrowed
  * purely because guest memory, registers and the privilege /
  * address-space APIs resolve through current_cpu and nowhere else, WHICH
- * vCPU is decided by which one drains its work queue first — a fact
- * about QEMU's scheduling and about nothing in the guest — and naming
+ * vCPU is decided by which one drains its work queue first -- a fact
+ * about QEMU's scheduling and about nothing in the guest -- and naming
  * that vCPU in the callback would hand the plugin an index it can only
  * read as "the vCPU this is about", and it is not.  An origin index is
  * only forwarded while it still is that fact: under round-robin TCG the
@@ -143,31 +143,31 @@ void qemu_plugin_vm_shutdown(void)
     if (current_cpu) {
         /*
          * The common case: the guest asked, so the request arrives on the
-         * asking vCPU's own thread — part-way through the device write
+         * asking vCPU's own thread -- part-way through the device write
          * (x86 outw, RISC-V's syscon store) or the hypercall
          * (aarch64 PSCI) that performs it.
          *
-         * This route arrives with the BQL held — a TCG guest's device
+         * This route arrives with the BQL held -- a TCG guest's device
          * write takes it in do_st_mmio_leN, an exception handler in
-         * cpu_handle_exception — so a synchronous dispatch here has the
+         * cpu_handle_exception -- so a synchronous dispatch here has the
          * lock-order inversion the marshalled route avoids: this thread
          * blocks on a plugin lock a peer vCPU holds across a wrong-path
          * excursion, and that excursion blocks on the BQL this thread
-         * owns.  The marshalled route's cure cannot be copied — this BQL is the device write's own, and
-         * releasing it mid-handler would publish a half-updated device —
+         * owns.  The marshalled route's cure cannot be copied -- this BQL is the device write's own, and
+         * releasing it mid-handler would publish a half-updated device --
          * so the dispatch is not run inside the write at all: the work is
          * queued on this same vCPU and runs at its next TB boundary,
          * where plugin_vm_shutdown_on_cpu drops the BQL around the
          * callback.  The ORIGIN index rides along, because deferring the
          * dispatch does not change which vCPU the shutdown came from;
-         * what changes is the position fact, in_guest_insn — by the time
+         * what changes is the position fact, in_guest_insn -- by the time
          * the work runs, the store has retired and the block it ended is
          * complete, which is exactly what false reports.
          *
          * The request path returns without waiting.  The second dispatch
          * point (qemu_system_shutdown) runs before teardown and, finding
          * the callback still armed, offers the work to every vCPU and
-         * waits for placement — and a stopped vCPU still drains its work
+         * waits for placement -- and a stopped vCPU still drains its work
          * queue, so the callback cannot be outrun by qemu_cleanup().
          *
          * A vCPU-context request without the BQL held has no lock to
@@ -232,7 +232,7 @@ void qemu_plugin_vm_shutdown(void)
 
 /*
  * Machine reset -> plugin.  The mirror of qemu_plugin_vm_shutdown() above,
- * with the same three routes and the same discipline — keep the two in
+ * with the same three routes and the same discipline -- keep the two in
  * step, in particular the BQL drop around the marshalled dispatch, which
  * prevents a deadlock against a peer vCPU holding the plugin's lock across
  * a wrong-path excursion that acquires the BQL.  Differences, both consequences of a reset not being
@@ -248,8 +248,10 @@ void qemu_plugin_vm_shutdown(void)
 static QemuCond plugin_reset_placed_cond;
 static bool plugin_reset_placed_cond_ready;
 static bool plugin_reset_placed;
-/* A guest-route reset dispatch is queued but not yet delivered; the
- * reset performance waits on it (qemu_plugin_vm_reset_wait_placed). */
+/*
+ * A guest-route reset dispatch is queued but not yet delivered; the
+ * reset performance waits on it (qemu_plugin_vm_reset_wait_placed).
+ */
 static bool plugin_reset_deferred;
 
 static void plugin_reset_cond_init(void)
@@ -262,8 +264,10 @@ static void plugin_reset_cond_init(void)
 
 static void plugin_vm_reset_on_cpu(CPUState *cpu, run_on_cpu_data arg)
 {
-    /* See plugin_vm_shutdown_on_cpu: same BQL drop, same origin-index
-     * discipline. */
+    /*
+     * See plugin_vm_shutdown_on_cpu: same BQL drop, same origin-index
+     * discipline.
+     */
     int origin = arg.host_int;
     bool had_bql = bql_locked();
     int vcpu_index;
@@ -309,7 +313,7 @@ void qemu_plugin_vm_reset(void)
          * callback, carrying the origin index.  A reset differs from a
          * shutdown in having no second dispatch point to wait at, and
          * the pause that precedes the reset does not wait for work
-         * queues — so the reset performance itself waits, at
+         * queues -- so the reset performance itself waits, at
          * qemu_plugin_vm_reset_wait_placed(), for this queued dispatch
          * to land before the machine it must report on is torn down.
          */
@@ -344,9 +348,11 @@ void qemu_plugin_vm_reset(void)
         qemu_plugin_vm_reset_dispatch(QEMU_PLUGIN_VCPU_NONE, false);
         return;
     }
-    /* Unbounded for the shutdown path's reason: the offer reaches every
+    /*
+     * Unbounded for the shutdown path's reason: the offer reaches every
      * live vCPU and the dispatch drops the BQL, so a wait that does not
-     * end is a vCPU genuinely not progressing — its own defect. */
+     * end is a vCPU genuinely not progressing -- its own defect.
+     */
     while (!qatomic_read(&plugin_reset_placed)) {
         qemu_cond_wait_bql(&plugin_reset_placed_cond);
     }
@@ -399,13 +405,17 @@ void qemu_plugin_vclock_agency_mode(bool active)
         if (icount_enabled() || !tcg_enabled()) {
             return;
         }
-        /* the slice half arms first so no engaged window can exist
-         * without its consumption sites */
+        /*
+         * the slice half arms first so no engaged window can exist
+         * without its consumption sites
+         */
         tcg_slice_arm();
         vclock_agency_set_active(true);
-        /* fold in every VIRTUAL timer armed before the plugin loaded
+        /*
+         * fold in every VIRTUAL timer armed before the plugin loaded
          * (witness slot; the consumption predicate is the fresh
-         * breakout-site read) */
+         * breakout-site read)
+         */
         vclock_agency_resync();
     } else {
         /* The slice half stays armed; see above. */

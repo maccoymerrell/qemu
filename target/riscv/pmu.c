@@ -200,11 +200,13 @@ static void riscv_pmu_icount_update_priv(CPURISCVState *env,
     if (icount_enabled()) {
         current_icount = icount_get_raw();
     } else {
-        /* The VM tick counter, not the raw host one -- see the note in
+        /*
+         * The VM tick counter, not the raw host one -- see the note in
          * riscv_pmu_ctr_get_fixed_counters_val().  The per-privilege deltas
          * this accumulates feed the same guest-readable minstret, so reading
          * a different clock here than there would also make the two disagree
-         * across a counter-config write. */
+         * across a counter-config write.
+         */
         current_icount = cpu_get_ticks();
     }
 
@@ -245,8 +247,10 @@ static void riscv_pmu_cycle_update_priv(CPURISCVState *env,
     if (icount_enabled()) {
         current_ticks = icount_get();
     } else {
-        /* The VM tick counter, not the raw host one -- see the note in
-         * riscv_pmu_ctr_get_fixed_counters_val(). */
+        /*
+         * The VM tick counter, not the raw host one -- see the note in
+         * riscv_pmu_ctr_get_fixed_counters_val().
+         */
         current_ticks = cpu_get_ticks();
     }
 

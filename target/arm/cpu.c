@@ -2697,81 +2697,14 @@ static void arm_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     *mmu_on = (arm_sctlr(env, arm_current_el(env)) & SCTLR_M) != 0;
 }
 
-static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
-
-static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
-{
-    CPUARMState *env = cpu_env(cs);
-    /*
-     * At EL0, and for any thread that has a TLS base at all: TPIDR_EL0 —
-     * the EL0 thread pointer (AArch32 TPIDRURW aliases the same state),
-     * reloaded from the incoming task at every switch
-     * (tls_thread_switch()) and never touched in between, so it names the
-     * current task at any EL.  Keeping it at EL1 whenever it is non-zero
-     * is what keeps a thread's kernel excursions on the SAME identity its
-     * user code carries: kernel code running on behalf of a thread is that
-     * thread.
-     *
-     * TPIDR_EL0 == 0 at EL1 is a task with no TLS identity — a kernel
-     * thread (kswapd, ksoftirqd, a per-CPU idle task; fork gives them
-     * tp_value 0 and nothing ever sets it), or a TLS-less user task's
-     * kernel excursion.  Those are distinct program paths that would
-     * otherwise all collapse onto the one identity 0, so fall through to
-     * the kernel's own per-task contract: arm64 keeps `current` in SP_EL0
-     * while in the kernel (arch/arm64/include/asm/current.h get_current()
-     * reads sp_el0; kernel_entry from EL0 installs it and cpu_switch_to()
-     * re-points it at every switch).  task_struct lives in the kernel map,
-     * so a kernel VA is the signature that the install already happened —
-     * during early entry from EL0, SP_EL0 still holds the interrupted
-     * user's stack pointer (a user VA), and this hook must not mint that
-     * as an identity: the tracks-current hook reports false for exactly
-     * that window and the consumer inherits the entering thread, which is
-     * the interrupted thread itself.
-     *
-     * env->sp_el[0] is authoritative while the banked SP_EL1 is active
-     * (Linux runs EL1h); on the EL1t corner the live SP_EL0 is xregs[31].
-     * AArch32 guests report TPIDRURW only.
-     */
-    uint64_t tp = env->cp15.tpidr_el[0];
-    if (!is_a64(env) || arm_current_el(env) == 0 || tp != 0) {
-        return tp;
-    }
-    uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0] : env->xregs[31];
-    if (arm_vaddr_is_kernel(cs, sp0)) {
-        return sp0;
-    }
-    return tp;
-}
-
-static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
-{
-    CPUARMState *env = cpu_env(cs);
-    /* TPIDR_EL0 is architecturally separate from the kernel's own
-     * thread pointers (TPIDR_EL1, SP_EL0-as-current), so Linux reloads
-     * it from the incoming task at every switch and never touches it in
-     * between — the sample names the current task at any EL.  The one
-     * state it cannot vouch for is a TLS-less task early in an
-     * entry-from-EL0 window: TPIDR_EL0 is 0 there and SP_EL0 still holds
-     * the interrupted user stack pointer (kernel_entry has not yet
-     * installed `current`), so neither register names the task and the
-     * consumer must inherit the entering thread instead. */
-    if (is_a64(env) && arm_current_el(env) != 0 &&
-        env->cp15.tpidr_el[0] == 0) {
-        uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0]
-                                                 : env->xregs[31];
-        return arm_vaddr_is_kernel(cs, sp0);
-    }
-    return true;
-}
-
 static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
 {
     CPUARMState *env = cpu_env(cs);
     /*
      * The EL1&0 regime splits the VA space into TTBR0 (low, user) and TTBR1
      * (high, kernel).  For an AArch64 kernel the architecture selects between
-     * them on bit 55 of the VA — "the bit that is always between the two
-     * regions", per aa64_va_parameters() — so a kernel code VA is exactly one
+     * them on bit 55 of the VA -- "the bit that is always between the two
+     * regions", per aa64_va_parameters() -- so a kernel code VA is exactly one
      * with bit 55 set.  This is width-agnostic: it holds for 39/48/52-bit VA
      * configurations alike, which is why it is preferred over a fixed
      * TTBR1-base constant.  An AArch32 kernel splits the low 4 GiB by a
@@ -2783,6 +2716,75 @@ static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
     return extract64(vaddr, 55, 1) != 0;
 }
 
+static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * At EL0, and for any thread that has a TLS base at all: TPIDR_EL0 --
+     * the EL0 thread pointer (AArch32 TPIDRURW aliases the same state),
+     * reloaded from the incoming task at every switch
+     * (tls_thread_switch()) and never touched in between, so it names the
+     * current task at any EL.  Keeping it at EL1 whenever it is non-zero
+     * is what keeps a thread's kernel excursions on the SAME identity its
+     * user code carries: kernel code running on behalf of a thread is that
+     * thread.
+     *
+     * TPIDR_EL0 == 0 at EL1 is a task with no TLS identity -- a kernel
+     * thread (kswapd, ksoftirqd, a per-CPU idle task; fork gives them
+     * tp_value 0 and nothing ever sets it), or a TLS-less user task's
+     * kernel excursion.  Those are distinct program paths that would
+     * otherwise all collapse onto the one identity 0, so fall through to
+     * the kernel's own per-task contract: arm64 keeps `current` in SP_EL0
+     * while in the kernel (arch/arm64/include/asm/current.h get_current()
+     * reads sp_el0; kernel_entry from EL0 installs it and cpu_switch_to()
+     * re-points it at every switch).  task_struct lives in the kernel map,
+     * so a kernel VA is the signature that the install already happened --
+     * during early entry from EL0, SP_EL0 still holds the interrupted
+     * user's stack pointer (a user VA), and this hook must not mint that
+     * as an identity: the tracks-current hook reports false for exactly
+     * that window and the consumer inherits the entering thread, which is
+     * the interrupted thread itself.
+     *
+     * env->sp_el[0] is authoritative while the banked SP_EL1 is active
+     * (Linux runs EL1h); on the EL1t corner the live SP_EL0 is xregs[31].
+     * AArch32 guests report TPIDRURW only.
+     */
+    uint64_t tp = env->cp15.tpidr_el[0];
+    uint64_t sp0;
+
+    if (!is_a64(env) || arm_current_el(env) == 0 || tp != 0) {
+        return tp;
+    }
+    sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0] : env->xregs[31];
+    if (arm_vaddr_is_kernel(cs, sp0)) {
+        return sp0;
+    }
+    return tp;
+}
+
+static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * TPIDR_EL0 is architecturally separate from the kernel's own
+     * thread pointers (TPIDR_EL1, SP_EL0-as-current), so Linux reloads
+     * it from the incoming task at every switch and never touches it in
+     * between -- the sample names the current task at any EL.  The one
+     * state it cannot vouch for is a TLS-less task early in an
+     * entry-from-EL0 window: TPIDR_EL0 is 0 there and SP_EL0 still holds
+     * the interrupted user stack pointer (kernel_entry has not yet
+     * installed `current`), so neither register names the task and the
+     * consumer must inherit the entering thread instead.
+     */
+    if (is_a64(env) && arm_current_el(env) != 0 &&
+        env->cp15.tpidr_el[0] == 0) {
+        uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0]
+                                                 : env->xregs[31];
+        return arm_vaddr_is_kernel(cs, sp0);
+    }
+    return true;
+}
+
 /*
  * Re-derive cs->interrupt_request from the restored env->irq_line_state.
  *
@@ -2791,7 +2793,7 @@ static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * wrong-path register snapshot, while the CPU_INTERRUPT_* bits it drives live
  * in CPUState, outside it.  A GIC level change delivered by the iothread
  * during an excursion updates both; the excursion-exit restore then rewinds
- * only the former, and the two disagree — a line the guest believes is
+ * only the former, and the two disagree -- a line the guest believes is
  * asserted that the interrupt-request word says is clear, or the reverse.
  * The virtual-interrupt lines are worse, because arm_cpu_update_virq() and
  * friends derive their CPU_INTERRUPT_V* bits from irq_line_state combined
@@ -2833,7 +2835,7 @@ static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
 }
 
 /*
- * TCGCPUOps::spec_clock_resync for Arm — see the contract in
+ * TCGCPUOps::spec_clock_resync for Arm -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * Arm's audit: every architectural counter the guest can read (CNTVCT_EL0,

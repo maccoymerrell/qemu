@@ -450,7 +450,7 @@ target_ulong HELPER(rdrand)(CPUX86State *env)
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path (speculative): qemu_guest_getrandom consumes the host RNG,
-     * which is not part of the env snapshot and cannot be rolled back — a
+     * which is not part of the env snapshot and cannot be rolled back -- a
      * speculative rdrand would skew the entropy stream seen on the real path.
      * Skip the RNG and return a benign value, mimicking the "no entropy yet"
      * outcome (CF cleared, all-zero result).

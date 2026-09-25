@@ -115,19 +115,8 @@ static inline void exception_return(CPUMIPSState *env)
     compute_hflags(env);
     debug_post_eret(env);
 
-#ifdef CONFIG_PLUGIN
-    /*
-     * Report the ERET so a system-mode tracer can pop its fault resume-PC
-     * stack when this lands back on a faulting instruction.  PC was just
-     * committed via mips_env_set_pc, so get_pc reads the return target.
-     * Every return is reported; the tracer pops only on a top-of-stack match.
-     * Correct path only — a wrong-path eret must not perturb it.
-     */
-    {
-        CPUState *cs_ = env_cpu(env);
-        cpu_plugin_fault_pop(cs_, cs_->cc->get_pc(cs_));
-    }
-#endif
+    /* PC was just committed via mips_env_set_pc. */
+    cpu_plugin_fault_pop(env_cpu(env), env_cpu(env)->cc->get_pc(env_cpu(env)));
 
 }
 

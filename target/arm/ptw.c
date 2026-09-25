@@ -737,12 +737,7 @@ static uint64_t arm_casq_ptw(CPUARMState *env, uint64_t old_val,
                              ARMMMUFaultInfo *fi)
 {
 #ifdef CONFIG_PLUGIN
-    /*
-     * Wrong-path (speculative) page walk: don't persist the AF/dirty
-     * update to the guest descriptor.  Return old_val so the caller
-     * proceeds with the in-memory descriptor unchanged; the access fault,
-     * if any, is already suppressed in tlb_fill_align().
-     */
+    /* The walk proceeds; AF/dirty is not persisted on the wrong path. */
     if (env_cpu(env)->plugin_spec_mode) {
         return old_val;
     }
@@ -1363,14 +1358,11 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
             /*
              * A debug access is not an architectural one.  PAN exists to
              * stop the KERNEL from following a user pointer by accident;
-             * it says nothing about what a debugger, a gdbstub client or a
-             * TCG plugin may look at, and those readers ask precisely
-             * because the CPU is stopped in a context that cannot.  Left
-             * enforced, `x/16x $user_ptr` fails whenever the guest is in
-             * EL1 with PSTATE.PAN set, and a plugin that reads a user
-             * address to decide something about the current process gets
-             * "unreadable" for a reason that has nothing to do with the
-             * process.  in_debug never reaches the TLB-fill path a real
+             * it says nothing about what a debug reader (the gdbstub,
+             * cpu_memory_rw_debug callers) may look at.  Enforced here,
+             * `x/16x $user_ptr` fails whenever the guest is in EL1 with
+             * PSTATE.PAN set, for a reason that has nothing to do with the
+             * mapping.  in_debug never reaches the TLB-fill path a real
              * access takes, so nothing architectural is relaxed here.
              */
         } else if (user_rw && regime_is_pan(env, mmu_idx)) {

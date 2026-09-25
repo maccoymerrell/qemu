@@ -55,7 +55,7 @@ DeviceState *riscv_aclint_mtimer_create(hwaddr addr, hwaddr size,
 /*
  * Re-derive @hartid's MTIP level and host QEMUTimer deadline from the
  * architected mtimecmp after a wrong-path (speculative) excursion perturbed
- * them — called from riscv_cpu_plugin_resync_timers at the excursion-exit
+ * them -- called from riscv_cpu_plugin_resync_timers at the excursion-exit
  * boundary, with the BQL held.
  */
 void riscv_aclint_mtimer_plugin_resync(RISCVAclintMTimerState *mtimer,

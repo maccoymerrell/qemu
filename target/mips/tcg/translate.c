@@ -15256,7 +15256,7 @@ static void mips_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
  * insn boundary; a retreat restores it, so ending the TB at a boundary that re-opens a delay slot (the
  * dropped sequence's first insn was the slot of a kept branch) re-arms
  * the pending-branch state.  saved_hflags is poisoned so save_cpu_state
- * in tb_stop re-emits the hflags (and, under BMASK, btarget) stores —
+ * in tb_stop re-emits the hflags (and, under BMASK, btarget) stores --
  * the spills it thinks it already emitted may have been dropped with
  * the retreated ops.  ctx->btarget itself is compile-time state set by
  * the kept branch and is still valid.  The dropped insns are LUI/ORI

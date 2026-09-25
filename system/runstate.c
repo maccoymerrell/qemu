@@ -636,12 +636,12 @@ void qemu_system_reset_request(ShutdownCause reason)
     } else {
         /*
          * The machine really will reset: tell any plugin recording it,
-         * HERE, before the flag is set — the main loop tears the machine
+         * HERE, before the flag is set -- the main loop tears the machine
          * down and boots a new world on the same process, which no
          * shutdown or exit callback will ever report (see
-         * qemu_plugin_vm_reset).  Every reset delivery path — guest
+         * qemu_plugin_vm_reset).  Every reset delivery path -- guest
          * reset device writes, the x86 triple fault, the watchdog's
-         * reset action, monitor/QMP system_reset — funnels through this
+         * reset action, monitor/QMP system_reset -- funnels through this
          * request, so this one dispatch covers them all.  The two
          * branches above become shutdowns and take the shutdown dispatch
          * in qemu_system_shutdown() instead; a reset is never reported
@@ -748,7 +748,7 @@ void qemu_system_shutdown_request(ShutdownCause reason)
      * Tell any plugin holding an open capture, HERE rather than at exit.
      * A guest poweroff arrives on the writing vCPU's own thread with the
      * BQL held, so the dispatch is queued on that vCPU and delivered at
-     * its next TB boundary (see qemu_plugin_vm_shutdown) — still before
+     * its next TB boundary (see qemu_plugin_vm_shutdown) -- still before
      * qemu_cleanup(), so the plugin sees the machine it has been
      * recording; the second dispatch point in qemu_system_shutdown()
      * waits for the delivery before teardown.
@@ -770,7 +770,7 @@ static void qemu_system_shutdown(ShutdownCause cause)
      * Second dispatch point, and the only one a HOST SIGNAL reaches:
      * qemu_system_killed() runs in a signal handler and sets
      * shutdown_requested directly, so SIGINT/SIGTERM never pass through
-     * qemu_system_shutdown_request().  Idempotent — whichever fires
+     * qemu_system_shutdown_request().  Idempotent -- whichever fires
      * first wins.  Still before qemu_cleanup(), so the vCPUs are alive
      * and run_on_cpu() can place the callback on one.
      */
@@ -835,7 +835,7 @@ static bool main_loop_should_exit(int *status)
         /*
          * A guest-initiated reset queued the plugin's reset callback on
          * the requesting vCPU (it could not run under the device write's
-         * BQL — see qemu_plugin_vm_reset), and pause_all_vcpus() does not
+         * BQL -- see qemu_plugin_vm_reset), and pause_all_vcpus() does not
          * wait for work queues.  The callback must observe the machine
          * BEFORE it is reset, so wait for its delivery here.
          */

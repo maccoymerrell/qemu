@@ -1171,7 +1171,7 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
 #ifdef CONFIG_PLUGIN
     /*
      * System-mode tracing: flag an asynchronous-interrupt excursion.  is_hw
-     * marks a hardware (external/NMI) interrupt — async; is_int (software INT)
+     * marks a hardware (external/NMI) interrupt -- async; is_int (software INT)
      * and exceptions (is_int=0,is_hw=0) are synchronous and stay traced.
      * Record the interrupted linear PC as the departure point; the generic
      * resume in cpu_exec_loop clears the flag on iret back to it.  Outermost
@@ -1185,7 +1185,7 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
         }
     } else if (!is_int) {
         /*
-         * Synchronous FAULT (#PF, #GP, #UD, alignment, …): is_int=0,is_hw=0.
+         * Synchronous FAULT (#PF, #GP, #UD, alignment, ...): is_int=0,is_hw=0.
          * The fault handler's iret re-executes the faulting instruction, so
          * the resume PC is the trapping PC.  Software INT n (is_int) and
          * SYSCALL advance past the instruction and are left to the normal
@@ -1193,7 +1193,7 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
          * owns the resume-PC stack.
          *
          * Unconditionally: a fault delivered inside an open async window is
-         * still a real fault whose ERET re-executes its instruction — the
+         * still a real fault whose ERET re-executes its instruction -- the
          * stack stays exactly LIFO whether or not a window is open.  Gating
          * this push on !plugin_in_async_int made the stack (and every event
          * consumer) blind to window-interior faults; with captured-interrupt
@@ -1204,7 +1204,8 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
          * fault means; the producer's job is only to report every entry
          * (see cpu.h).
          */
-        cpu_plugin_fault_push(CPU(cpu), CPU(cpu)->cc->get_pc(CPU(cpu)));
+        CPUState *cs = CPU(cpu);
+        cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
     }
 #endif
 
@@ -2215,19 +2216,10 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     }
     SET_ESP(sa.sp, sa.sp_mask);
     env->eip = new_eip;
-#ifdef CONFIG_PLUGIN
     if (is_iret) {
-        /*
-         * Report the IRET so a system-mode tracer can pop its fault resume-PC
-         * stack when this lands back on a faulting instruction (env->eip just
-         * committed above).  Far RET (is_iret=0) is not an exception return
-         * and is skipped.  The tracer pops only on a top-of-stack match.
-         * Correct path only — a wrong-path iret must not perturb it.
-         */
-        CPUState *cs_ = env_cpu(env);
-        cpu_plugin_fault_pop(cs_, env->eip);
+        /* Far RET (is_iret=0) is not an exception return. */
+        cpu_plugin_fault_pop(env_cpu(env), env->eip);
     }
-#endif
     if (is_iret) {
         /* NOTE: 'cpl' is the _old_ CPL */
         eflags_mask = TF_MASK | AC_MASK | ID_MASK | RF_MASK | NT_MASK;

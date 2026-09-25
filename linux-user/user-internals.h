@@ -30,9 +30,10 @@ void stop_all_tasks(void);
 /*
  * Deterministic guest process identity, selected by -pid.  Zero means the
  * guest reads the host's own pid/tid numbers, which differ between runs; see
- * the block comment in linux-user/main.c for what pinning them covers.
+ * the block comment in linux-user/vpid.c for what pinning them covers.
  */
 extern pid_t qemu_vpid_base;
+void vpid_init(pid_t base);
 void vpid_register(pid_t host_tid);
 pid_t vpid_from_host(pid_t host_tid);
 bool vpid_to_host(abi_long *pid);
@@ -129,6 +130,15 @@ void sparc64_get_context(CPUSPARCState *env);
 static inline int is_error(abi_long ret)
 {
     return (abi_ulong)ret >= (abi_ulong)(-4096);
+}
+
+/*
+ * Result of a syscall that hands back this process's own group or session
+ * id: its pinned name under -pid, else what the host returned.
+ */
+static inline abi_long vpid_pgrp_result(abi_long ret)
+{
+    return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
 }
 
 #if (TARGET_ABI_BITS == 32) && !defined(TARGET_ABI_MIPSN32)

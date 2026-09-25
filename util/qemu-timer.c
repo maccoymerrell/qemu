@@ -533,14 +533,10 @@ static void timer_del_locked(QEMUTimerList *timer_list, QEMUTimer *ts)
 }
 
 /*
- * The timer callback this thread is currently running out of
- * timerlist_run_timers(), or NULL when no timer callback is on its stack.
- * A timer armed while this is set was armed BY that callback, which is the
- * fact the no-progress report needs and the only place it can be observed:
- * once the arming returns, the run loop can no longer tell which callback
- * put a timer back on the list.  Thread-local because timer lists belonging
- * to different AioContexts run concurrently, and saved and restored around
- * the call so a callback that runs a nested pass gets its identity back.
+ * The timer callback this thread is running out of timerlist_run_timers(),
+ * or NULL: the arming callback stamped into @armed_by; see the bound above
+ * timerlist_run_timers().  Thread-local because timer lists of different
+ * AioContexts run concurrently; saved and restored around nested passes.
  */
 static __thread QEMUTimerCB *timer_running_cb;
 
@@ -665,26 +661,8 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
 }
 
 /*
- * Report a timer whose deadline did not move forward (see the bound in
- * timerlist_run_timers()).
- *
- * TWO callbacks are named because two are involved and they are not always
- * the same one.  @deferred is the callback of the timer being put off.
- * @armer is the callback that ARMED that timer, taken from the timer's own
- * @armed_by stamp rather than guessed from the run loop's position: they
- * coincide for a device re-arming its OWN timer, they differ for a cycle of
- * devices arming EACH OTHER, and naming only the deferred timer points at
- * the victim and leaves the device that armed it unnamed.
- *
- * The stamp is what makes the two cases distinguishable at all.  The run
- * loop only sees an armed timer once it reaches the head of the list, and
- * ANY other timer due in the same pass is popped in between -- so "the
- * callback that just finished running" is a bystander as often as it is the
- * offender, and using it accuses whichever unrelated device happened to be
- * due alongside the broken one.  @armed_by is recorded by the arming itself
- * and cannot be confused by what ran in between.  NULL means the timer was
- * armed from outside any timer callback, which names no device model and
- * must not be dressed up as one.
+ * Report a timer whose deadline did not move forward, naming both its
+ * arming callback and its own (see the bound above timerlist_run_timers()).
  *
  * Once PER PAIR, not once per process: a warn_report_once() here would be
  * silenced by whichever device happened to be first, and keying on the
@@ -744,11 +722,47 @@ static void timer_warn_no_progress(QEMUTimerCB *armer, QEMUTimerCB *deferred,
 }
 
 /*
- * Ceiling on callbacks run in a single timerlist_run_timers() pass.  See the
- * total bound in the loop; sized far above any legitimate backlog.
+ * The no-progress bound.
+ *
+ * @current_time is sampled once, before the loop, and timer_expired_ns()
+ * counts expire_time <= current_time as expired, so a timer re-armed during
+ * the pass to a deadline it has ALREADY BEEN RUN FOR is popped straight back
+ * out and its callback runs again on identical inputs, forever.  The
+ * iothread runs this loop holding the BQL, so the whole machine stops.  A
+ * running clock hides it (@now moves a nanosecond and the loop ends); a
+ * clock that does not run -- QEMU_CLOCK_VIRTUAL frozen to keep a plugin's
+ * instrumentation cost out of guest time -- makes the wedge permanent.
+ *
+ * The test is whether the DEADLINE MOVED FORWARD, not whether the timer came
+ * back.  A periodic device that fell behind re-arms at fired-for + period,
+ * strictly greater every time, and catches up to @current_time in a bounded
+ * number of iterations; hw/timer/i8254.c's pit_irq_timer does exactly that
+ * on every x86 boot, so an identity test would spend the warning on a
+ * healthy PIT and leave the real defect to wedge the machine in silence.
+ * The deadline test also covers timers that arm EACH OTHER: whichever comes
+ * round first inside a cycle is being re-run for a deadline it already ran
+ * for.
+ *
+ * On a hit the timer is left for the NEXT pass and the BQL is dropped in
+ * between.  Nothing is dropped and the rest of the process runs, which is
+ * what lets whatever froze the clock unfreeze it.  Deferral cannot make a
+ * device ask for a later deadline: a callback that re-arms at an ABSOLUTE
+ * time already behind the clock asks for the same past deadline every pass,
+ * and under -icount the guest then stops for good --
+ * qemu_clock_deadline_ns_all() clamps an expired deadline to 0,
+ * icount_get_limit() rounds that to a budget of 0, and rr_cpu_thread_fn
+ * re-enters this pass through icount_handle_deadline() with nothing retired.
+ * What is bounded is the pass, not the machine: the offender is named and
+ * the monitor still answers; only repairing the device buys the guest.
+ *
+ * The report names the head's ARMER as well as its callback, because in the
+ * mutual case they are different devices.  The armer is @head->armed_by,
+ * stamped by the arming itself from timer_running_cb, NOT @cb: any other
+ * timer due in the same pass is popped between the arming and the moment
+ * the armed timer surfaces at the head, so @cb (whatever ran last) is a
+ * bystander as often as it is the offender.  NULL means the timer was armed
+ * from outside any timer callback and names no device model.
  */
-#define TIMERLIST_MAX_CB_PER_PASS 100000
-
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
     QEMUTimer *ts, *head;
@@ -887,79 +901,9 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         progress = true;
 
         /*
-         * NO-PROGRESS BOUND.  @current_time is sampled ONCE, before the loop,
-         * and timer_expired_ns() counts expire_time <= current_time as
-         * expired -- so a timer that is re-armed during this pass to a
-         * deadline it has ALREADY BEEN RUN FOR is popped straight back out
-         * and its callback runs again on identical inputs, forever.  The
-         * iothread runs this loop holding the BQL, so the whole machine
-         * stops: every vCPU starves and the guest makes no architectural
-         * progress while the process burns 100% of a core.
-         *
-         * A running clock hides it (@now moves a nanosecond and the loop
-         * ends).  A clock that does NOT run -- a TCG plugin freezing
-         * QEMU_CLOCK_VIRTUAL to keep its own instrumentation cost out of
-         * guest time -- removes that accident and the wedge is permanent.
-         *
-         * The test is whether the DEADLINE MOVED FORWARD, not whether the
-         * timer came back.  A timer coming back is the normal, terminating
-         * shape: a periodic device that fell behind re-arms at
-         * fired-for + period, which is strictly greater every time, so it
-         * catches up to @current_time in a bounded number of iterations and
-         * the loop ends by itself.  hw/timer/i8254.c's pit_irq_timer does
-         * exactly that on every x86 boot, so a test of only "is it back at
-         * the head and expired" would spend the warning on a healthy PIT and
-         * leave a device with the real defect to wedge the machine in
-         * silence.  A bound whose alarm is consumed by a healthy device is
-         * not a bound.
-         *
-         * Testing the deadline rather than the identity also covers timers
-         * that arm EACH OTHER: whichever of them comes round first inside a
-         * cycle is being re-run for a deadline it already ran for, which is
-         * the condition below.
-         *
-         * On a hit, leave it for the NEXT pass instead of running it again
-         * here, and drop the BQL in between.  Nothing is dropped and the
-         * rest of the process runs: the iothread, the monitor, and -- where
-         * the vCPU is not budget-gated -- the vCPUs, which is what lets
-         * whatever was freezing the clock unfreeze it and the deadline come
-         * good.  Say so, and say it once per pair rather than once per
-         * process, so a second offending device is still reported.
-         *
-         * WHAT DEFERRAL CANNOT DO is make a device ask for a later
-         * deadline.  A callback that re-arms at an ABSOLUTE time already
-         * behind the clock asks for the same past deadline on every pass,
-         * and under -icount the guest then stops for good:
-         * qemu_clock_deadline_ns_all() clamps an expired deadline to 0,
-         * icount_get_limit() rounds that to a budget of 0, and
-         * rr_cpu_thread_fn answers a zero deadline through
-         * icount_handle_deadline() by calling qemu_clock_run_timers()
-         * itself -- so the pass this bound ends is re-entered from the vCPU
-         * thread with the vCPU having retired nothing in between.  What is
-         * bounded is the pass, not the machine: with the bound, the
-         * offender is named and the monitor still answers while the guest
-         * stays parked; without it, this loop never returns and so never
-         * drops the BQL.  Deferral buys the diagnosis and the management
-         * plane; only repairing the device buys the guest.
-         *
-         * The report names the head's ARMER as well as the head's callback.
-         * In the mutual case those are DIFFERENT devices, and the deferred
-         * timer belongs to the one that did not arm it: reporting the head
-         * alone names the victim, tells the operator it "re-armed its own
-         * timer" when it did not, and spends the pair's single report on it
-         * while the device that actually armed it is never mentioned.
-         *
-         * The armer is @head->armed_by, recorded by the arming itself, NOT
-         * @cb.  @cb is merely whatever ran last, and the loop reaches this
-         * test once per callback: any other timer due in the same pass is
-         * popped between the arming and the moment the armed timer surfaces
-         * at the head, so @cb is a bystander as often as it is the offender.
-         * Two timers on one list with the same deadline are enough -- the
-         * re-armed one sorts behind the other, the other runs in between,
-         * and @cb accuses a device that armed nothing at all.
-         *
-         * @head is only dereferenced after it is read back off the list, so
-         * a callback that deleted its own timer is never touched.
+         * No-progress bound; the model is above this function.  @head is
+         * dereferenced only after it is read back off the list, so a
+         * callback that deleted its own timer is never touched.
          */
         head = timer_list->active_timers;
         if (head && head->last_run_pass == pass &&

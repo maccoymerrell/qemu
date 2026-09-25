@@ -333,15 +333,15 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
      * During plugin speculative (wrong-path) execution, refuse the
      * trapless host-pointer fast path for *every* access type.  In
      * linux-user g2h() is just guest_base + addr with no mapping
-     * check, so on the wrong path — where address registers hold
-     * speculative garbage — a caller would otherwise (stores) write
+     * check, so on the wrong path -- where address registers hold
+     * speculative garbage -- a caller would otherwise (stores) write
      * real guest memory, escaping the per-vCPU spec-store sandbox,
      * or (loads) dereference an unmapped host pointer and SIGSEGV
      * the emulator instead of taking a guest fault.  Returning NULL
      * forces the slow cpu_{ld,st}*_mmuidx_ra path: stores land in
      * the sandbox, and loads read through the sandbox overlay, with a
      * deterministic placeholder for an unmapped page instead of a
-     * fault.  ISA-generic — covers every target's bulk/host-pointer
+     * fault.  ISA-generic -- covers every target's bulk/host-pointer
      * helpers (ARM FEAT_MOPS, x86 string ops, vector gather/scatter,
      * ...).
      */
@@ -357,7 +357,7 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
 
 /*
  * tlb_vaddr_lookup_flags:
- * Raw TLB flags for @addr with NO side effects — no fault, no
+ * Raw TLB flags for @addr with NO side effects -- no fault, no
  * notdirty transition, no watchpoint fire, and no plugin-forced
  * TLB_MMIO.  TLB_INVALID_MASK when no translation can be established
  * without faulting.  Softmmu only; used by the FEAT_MOPS reporting

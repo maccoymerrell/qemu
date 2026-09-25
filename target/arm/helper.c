@@ -1666,13 +1666,17 @@ static void pmintenclr_write(CPUARMState *env, const ARMCPRegInfo *ri,
  * (TTBR/TCR/SCTLR/TTBCR) or the exception vector base (VBAR) takes effect on
  * the QEMU translation regime *immediately*.  On the discarded wrong path that
  * is a containment hole: a mispredicted WP that lands in the KPTI trampoline
- * (mapped at the fixed 0xffff_fbff_… address) executes `msr TTBR1_EL1` to
+ * (mapped at the fixed 0xffff_fbff_... address) executes `msr TTBR1_EL1` to
  * switch from the restricted user-time page tables to the full kernel tables,
- * then escapes its sandbox and runs away through the exception vectors —
+ * then escapes its sandbox and runs away through the exception vectors --
  * millions of speculative insns that never return.  The register's
  * CPUArchState backing is rolled back at walk end, so dropping the speculative
  * reconfiguration is harmless; keeping the WP in the regime it started in is
  * the whole point of containment.
+ *
+ * Only two writers consult this gate: vbar_write and vmsa_ttbr_write drop
+ * the write on the wrong path.  TCR, TTBCR and SCTLR writes are NOT gated
+ * and still take effect there; whether they should is open defect D1.
  */
 static inline bool arm_spec_freeze_regime(CPUARMState *env)
 {
@@ -3208,7 +3212,7 @@ void arm_gt_hvtimer_cb(void *opaque)
  *
  * Arm's guest-observable time sources are the generic timers, and every one
  * of them is a (ctl, cval) register pair inside CPUARMState shadowed by a
- * host QEMUTimer outside it — plus the CNTVOFF_EL2 / CNTPOFF_EL2 offsets and
+ * host QEMUTimer outside it -- plus the CNTVOFF_EL2 / CNTPOFF_EL2 offsets and
  * CNTFRQ, also inside.  The wrong-path register restore rolls the registers
  * back; the host timers do not follow.  Two ways that wedges the guest:
  *
@@ -4461,6 +4465,10 @@ static void vmsa_tcr_el12_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    uint64_t old_ttbr0_el1;
+#endif
+
     if (arm_spec_freeze_regime(env)) {
         return;
     }
@@ -4476,14 +4484,14 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
      * TTBR banks and aliases (TTBR0/TTBR1_EL1, their AArch32 views, and
      * the memdup'd TTBR0_EL12 redirect), so rather than decode which
      * cpreg is being written, bracket the write with a compare of the
-     * one backing field arm_get_plugin_state reports — TTBR0_EL1, i.e.
-     * cp15.ttbr0_el[1] — and emit only when its value changed.  The
+     * one backing field arm_get_plugin_state reports -- TTBR0_EL1, i.e.
+     * cp15.ttbr0_el[1] -- and emit only when its value changed.  The
      * event's pc slot carries the OLD value; the push itself stamps the
      * just-committed NEW value as the event's asid (and is a no-op on
-     * the wrong path — additionally unreachable here through the
-     * spec-freeze gate above — or while the queue is disabled).
+     * the wrong path -- additionally unreachable here through the
+     * spec-freeze gate above -- or while the queue is disabled).
      */
-    uint64_t old_ttbr0_el1 = env->cp15.ttbr0_el[1];
+    old_ttbr0_el1 = env->cp15.ttbr0_el[1];
     raw_write(env, ri, value);
     if (env->cp15.ttbr0_el[1] != old_ttbr0_el1) {
         cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
@@ -11178,25 +11186,30 @@ void arm_cpu_do_interrupt(CPUState *cs)
                          idx == EXCP_VIRQ || idx == EXCP_VFIQ ||
                          idx == EXCP_VSERR || idx == EXCP_NMI ||
                          idx == EXCP_VINMI || idx == EXCP_VFNMI);
-        /* Instrument every delivery, including the ones the gates below
+        /*
+         * Instrument every delivery, including the ones the gates below
          * discard, so "no window opened" and "no interrupt arrived" are
-         * distinguishable. */
+         * distinguishable.
+         */
         cpu_plugin_async_probe(cs, is_async ? "IRQ" : "EXC", idx, is_async);
         if (cs->plugin_spec_mode) {
             /* wrong path: no window edges, no fault events */
         } else if (is_async) {
-            /* Enter the async excursion; record the departure context
+            /*
+             * Enter the async excursion; record the departure context
              * (interrupted PC + thread pointer) so the exception return
              * that lands back there, in the departed thread, ends it.
              * Outermost edge only: the !plugin_in_async_int guard keeps a
              * nested async interrupt from re-entering this block, so the
              * departure context is stamped once per window and the
-             * ASYNC_ENTER event fires once per window. */
+             * ASYNC_ENTER event fires once per window.
+             */
             if (!cs->plugin_in_async_int) {
                 cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
             }
         } else if (idx != EXCP_SWI && idx != EXCP_HVC && idx != EXCP_SMC) {
-            /* Synchronous FAULT (data/prefetch abort, undef, alignment, …):
+            /*
+             * Synchronous FAULT (data/prefetch abort, undef, alignment, ...):
              * the handler's exception return re-executes the faulting
              * instruction, so the resume PC is the current (trapping) PC.
              * Deliberate calls (SVC/HVC/SMC) advance past the instruction and
@@ -11209,7 +11222,8 @@ void arm_cpu_do_interrupt(CPUState *cs)
              * push keeps the resume-PC stack exactly LIFO and the event
              * stream complete.  The consumer decides per-mode what an
              * in-window FAULT_ENTER means (see the x86 twin in
-             * seg_helper.c). */
+             * seg_helper.c).
+             */
             cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
         }
     }

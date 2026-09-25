@@ -988,7 +988,7 @@ void HELPER(set_cp_reg)(CPUARMState *env, const void *rip, uint32_t value)
 #ifdef CONFIG_PLUGIN
         /*
          * Wrong-path (speculative): ARM_CP_IO marks system registers whose
-         * write has a device side effect (GIC ICC_*, generic timer, …) —
+         * write has a device side effect (GIC ICC_*, generic timer, ...) --
          * exactly what must not escape the discarded path.  Suppress the
          * writefn; the register's CPUArchState backing (if any) is rolled
          * back at walk end regardless, so dropping the speculative update is
@@ -1015,12 +1015,12 @@ uint32_t HELPER(get_cp_reg)(CPUARMState *env, const void *rip)
 #ifdef CONFIG_PLUGIN
         /*
          * Wrong-path (speculative): ARM_CP_IO marks system registers whose
-         * ACCESS — not just write — has a device side effect.  Several are
+         * ACCESS -- not just write -- has a device side effect.  Several are
          * read-to-act: ICC_IAR0/1_EL1 (interrupt acknowledge) call
          * icc_activate_irq(), mutating the GICv3 CPU-interface active/pending
          * priority state; a generic-timer status read can re-arm the line.
          * On the discarded path that corrupts the interrupt controller for
-         * good — a speculative IAR read steals the real interrupt's ack, so
+         * good -- a speculative IAR read steals the real interrupt's ack, so
          * the kernel's IRQ handler on the correct path never sees it and the
          * guest wedges.  Suppress the readfn and return 0; the speculative
          * value is thrown away with the rest of the wrong-path state.  This
@@ -1046,8 +1046,10 @@ void HELPER(set_cp_reg64)(CPUARMState *env, const void *rip, uint64_t value)
 
     if (ri->type & ARM_CP_IO) {
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: suppress device side effect of ARM_CP_IO writes.
-         * See HELPER(set_cp_reg). */
+        /*
+         * Wrong-path: suppress device side effect of ARM_CP_IO writes.
+         * See HELPER(set_cp_reg).
+         */
         if (env_cpu(env)->plugin_spec_mode) {
             return;
         }
@@ -1067,8 +1069,10 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
 
     if (ri->type & ARM_CP_IO) {
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: suppress device side effect of an ARM_CP_IO read
-         * (e.g. ICC_IAR*_EL1 interrupt acknowledge).  See HELPER(get_cp_reg). */
+        /*
+         * Wrong-path: suppress device side effect of an ARM_CP_IO read
+         * (e.g. ICC_IAR*_EL1 interrupt acknowledge).  See HELPER(get_cp_reg).
+         */
         if (env_cpu(env)->plugin_spec_mode) {
             return 0;
         }

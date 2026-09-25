@@ -271,7 +271,7 @@ typedef enum X86Seg {
 
 /*
  * CR3 bit 63 (PCID "no-flush"): a command bit on the MOV-to-CR3 *write*
- * when CR4.PCIDE=1 — suppress the PCID-tagged TLB flush — and never part
+ * when CR4.PCIDE=1 -- suppress the PCID-tagged TLB flush -- and never part
  * of the stored register (MOV from CR3 always reads bit 63 as 0).  Used
  * by the plugin address-space reporting to keep an ASID compare from
  * seeing a flush hint as an address-space change.

@@ -146,8 +146,8 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
 
 /*
  * Execute one full translation block at the current PC from a plugin
- * callback.  All plugin callbacks fire — tb_exec, insn_exec, inline ops,
- * and mem — so the plugin sees the speculative TB the same way it sees a
+ * callback.  All plugin callbacks fire -- tb_exec, insn_exec, inline ops,
+ * and mem -- so the plugin sees the speculative TB the same way it sees a
  * normal CP TB and can deliver its instructions through the per-TB
  * exec-cb udata.  The plugin is responsible for keeping its own state
  * separated (e.g. early-out for spec-mode invocations of CP-only state
@@ -191,14 +191,14 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
                                     cpu_mmu_index(cpu, true),
                                     true, &host, 0);
     if (pflags & TLB_INVALID_MASK) {
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
         /*
          * Wrong-path fetch-gate reject classifier (CST_FETCHGATE_DIAG).  The
          * probe above already ran the target walker with probe=true, which
          * walks EXISTING PTEs without demand-paging: a present, executable,
          * privilege-OK but merely iTLB-cold page WALKS + FILLS + succeeds (it
          * never lands here).  Landing here therefore means a real instruction
-         * fetch at the speculating context would FAULT — which is exactly the
+         * fetch at the speculating context would FAULT -- which is exactly the
          * "translation-unavailable" terminate the wrong path takes.  The side
          * effect-free debug walk plus a MMU_DATA_LOAD probe classify WHY:
          *   phys==-1                -> absent (no PTE): a demand-page would be
@@ -278,8 +278,8 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         /*
          * Wrong-path kick deferral.  A cpu_exit() kick that lands during a
          * speculative excursion (iothread IRQ raise, another vCPU's exclusive
-         * request, vm_stop) sets icount_decr.u16.high, which makes every TB —
-         * including this wrong-path TB — exit at its prologue without
+         * request, vm_stop) sets icount_decr.u16.high, which makes every TB --
+         * including this wrong-path TB -- exit at its prologue without
          * retiring an instruction.  A plugin that stops an excursion on zero
          * forward progress would then truncate it, so the wrong path's
          * content would depend on host IRQ timing.  Clear the exit-request
@@ -335,7 +335,7 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          * tcg_ctx->gen_tb in both.  The outer loop's landing pad releases
          * those (cpu_exec_longjmp_cleanup); this pad must do the same, or
          * the page spinlock leaks permanently and the next tb_gen_code
-         * touching that page spins forever below every plugin callback — a
+         * touching that page spins forever below every plugin callback -- a
          * 100%-utime vCPU freeze.  The pointer belongs to whichever pad
          * catches the unwind, and this pad catches the wrong path's.
          */
@@ -515,7 +515,7 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
 }
 
 /*
- * Spec-mode entry TLB flush — the portable (host-independent) half of the
+ * Spec-mode entry TLB flush -- the portable (host-independent) half of the
  * wrong-path store sandbox.
  *
  * On a host TCG backend that does NOT honor CF_FORCE_SLOW, spec-mode routing
@@ -523,8 +523,8 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
  * every TLB entry the excursion uses; tlb_set_page_full stamps it on each
  * entry the excursion installs.  Correct-path entries already resident when
  * the excursion begins predate that stamp and lack the flag, so an inline
- * TLB-hit speculative store would reach real guest RAM.  Flush here so those entries refill —
- * with the flag — inside the excursion, closing the window for pre-existing
+ * TLB-hit speculative store would reach real guest RAM.  Flush here so those entries refill --
+ * with the flag -- inside the excursion, closing the window for pre-existing
  * correct-path entries.
  *
  * Compiled to a no-op on hosts whose backend honors CF_FORCE_SLOW (x86: the
@@ -552,16 +552,14 @@ void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu)
  * bypass routes speculative memory ops to the slow-path helpers in both user
  * and system mode), OR in system mode, where the portable TLB_FORCE_SLOW path
  * (cpu_plugin_spec_tlb_flush_enter + the tlb_set_page_full stamp) contains
- * speculative stores on ANY host backend — every backend's inline fast-path
+ * speculative stores on ANY host backend -- every backend's inline fast-path
  * compare already treats a TLB_FORCE_SLOW entry as a miss.  The only remaining
  * unsupported case is user mode on a backend without CF_FORCE_SLOW: there is
  * no softmmu TLB to carry the flag and stores go straight to the guest image.
  */
 bool cpu_plugin_spec_mode_supported(void)
 {
-#if TCG_TARGET_HAS_SPEC_FORCE_SLOW
-    return true;
-#elif !defined(CONFIG_USER_ONLY)
+#if TCG_TARGET_HAS_SPEC_FORCE_SLOW || !defined(CONFIG_USER_ONLY)
     return true;
 #else
     return false;

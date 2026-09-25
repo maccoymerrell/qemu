@@ -366,19 +366,8 @@ target_ulong helper_sret(CPURISCVState *env)
                             src_priv, src_virt);
     }
 
-#ifdef CONFIG_PLUGIN
-    /*
-     * Report the trap return (SRET) so a system-mode tracer can pop its fault
-     * resume-PC stack when @retpc lands back on a faulting instruction.  The
-     * caller commits env->pc = retpc, so report retpc directly.  Every return
-     * is reported; the tracer pops only on a top-of-stack match.  Correct path
-     * only — a wrong-path trap return must not perturb it.
-     */
-    {
-        CPUState *cs_ = env_cpu(env);
-        cpu_plugin_fault_pop(cs_, retpc);
-    }
-#endif
+    /* The caller commits env->pc = retpc. */
+    cpu_plugin_fault_pop(env_cpu(env), retpc);
 
     return retpc;
 }
@@ -466,13 +455,7 @@ target_ulong helper_mret(CPURISCVState *env)
                             PRV_M, false);
     }
 
-#ifdef CONFIG_PLUGIN
-    /* Report the trap return (MRET); see helper_sret. */
-    {
-        CPUState *cs_ = env_cpu(env);
-        cpu_plugin_fault_pop(cs_, retpc);
-    }
-#endif
+    cpu_plugin_fault_pop(env_cpu(env), retpc);
 
     return retpc;
 }
@@ -601,9 +584,11 @@ void helper_wfi(CPURISCVState *env)
         riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, GETPC());
     } else {
 #ifdef CONFIG_PLUGIN
-        /* WFI diagnostic: reports whether the wake stimer is armed at the
+        /*
+         * WFI diagnostic: reports whether the wake stimer is armed at the
          * moment the guest idles.  An unarmed host timer here means the WFI
-         * never wakes. */
+         * never wakes.
+         */
         if (getenv("CST_TIMER_DIAG")) {
             int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             int64_t exp = env->stimer ? env->stimer->expire_time : -1;

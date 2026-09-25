@@ -43,6 +43,9 @@ get_plugin_meminfo_rw(qemu_plugin_meminfo_t i)
     return i >> 16;
 }
 
+/* Capacity of the never-split sequence table; see qemu_plugin_nosplit_seqs. */
+#define QEMU_PLUGIN_NOSPLIT_MAX 2
+
 #ifdef CONFIG_PLUGIN
 extern QemuOptsList qemu_plugin_opts;
 
@@ -129,7 +132,7 @@ struct qemu_plugin_insn {
      * plugin_gen_record_branch_target() at branch-decode time.  0
      * means "no static target": either this insn is not a branch, or
      * it's an indirect branch whose target is only known at runtime
-     * (those route through the plugin's BranchHistory instead).
+     * (a plugin tracks those from their observed runtime targets).
      */
     uint64_t branch_target_pc;
     GArray *insn_cbs;
@@ -225,7 +228,7 @@ void qemu_plugin_atexit_cb(void);
 /*
  * The machine is going down.  Dispatched to a plugin's registered
  * shutdown hook (qemu_plugin_register_vm_shutdown_cb) from the shutdown
- * request and from the main loop's shutdown acknowledge — whichever
+ * request and from the main loop's shutdown acknowledge -- whichever
  * happens first; the second is a no-op.  Both run before qemu_cleanup(),
  * so the machine is still assembled and the vCPUs still exist, which is
  * what makes this the last usable point for a plugin that must CLOSE
@@ -252,10 +255,10 @@ bool qemu_plugin_vm_shutdown_armed(void);
 /*
  * The machine is about to RESET: torn down and booted again inside the
  * same process.  Dispatched to a plugin's registered reset hook
- * (qemu_plugin_register_vm_reset_cb) from the reset request — the one
+ * (qemu_plugin_register_vm_reset_cb) from the reset request -- the one
  * funnel every delivery path (guest reset device writes, x86 triple
  * fault, watchdog reset action, monitor/QMP system_reset) passes
- * through — before the main loop pauses the vCPUs and resets the
+ * through -- before the main loop pauses the vCPUs and resets the
  * machine.  A request that -no-reboot converts into a shutdown takes
  * the shutdown dispatch instead and never reaches this one.  Unlike
  * the shutdown dispatch this can fire more than once per run: each
@@ -271,7 +274,7 @@ bool qemu_plugin_vm_reset_armed(void);
  * is performed.  A guest-initiated reset arrives on the writing vCPU with
  * the BQL held, so qemu_plugin_vm_reset() queues the callback on that
  * vCPU rather than run it under the write's own lock (the AB/BA against a
- * plugin lock a peer holds across a wrong-path excursion) — and the
+ * plugin lock a peer holds across a wrong-path excursion) -- and the
  * pause that precedes the reset does not wait for work queues.  Called
  * from the reset performance, under the BQL, before the machine the
  * callback must report on is torn down; a no-op when nothing was
@@ -286,11 +289,10 @@ void qemu_plugin_vm_reset_wait_placed(void);
  * plugin_thread_ptr_tracks_current, which dereference the kernel
  * per-CPU base at this offset to name the running task at CPL0).
  * Returns the declared offset; *@set reports whether one was declared
- * at all — an undeclared hint MUST leave the target's legacy
+ * at all -- an undeclared hint MUST leave the target's legacy
  * register-only behaviour untouched.
  */
 uint64_t qemu_plugin_current_task_offset(bool *set);
-void qemu_plugin_current_task_offset_store(uint64_t offset);
 
 /*
  * Never-split (atomic) code byte sequences registered by a plugin
@@ -301,7 +303,6 @@ void qemu_plugin_current_task_offset_store(uint64_t offset);
  * QEMU_PLUGIN_NOSPLIT_MAX pointers, valid for the process lifetime) and
  * *@seq_len (all sequences share one length).
  */
-#define QEMU_PLUGIN_NOSPLIT_MAX 2
 size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs, size_t *seq_len);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
@@ -345,7 +346,6 @@ static inline bool qemu_plugin_any_loaded(void)
     return false;
 }
 
-#define QEMU_PLUGIN_NOSPLIT_MAX 2
 static inline size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs,
                                               size_t *seq_len)
 {

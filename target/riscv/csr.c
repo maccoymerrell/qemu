@@ -1646,10 +1646,11 @@ static RISCVException read_time(CPURISCVState *env, int csrno,
 #ifdef CONFIG_PLUGIN
     {
         static int diag = -1;
+        CPUState *cs = env_cpu(env);
+
         if (diag < 0) {
             diag = getenv("CST_TIMER_DIAG") ? 1 : 0;
         }
-        CPUState *cs = env_cpu(env);
         if (diag && !cs->plugin_spec_mode) {
             static unsigned long n;
             if ((++n & 0x3fff) == 0) {
@@ -3676,10 +3677,12 @@ static RISCVException rmw_mip64(CPURISCVState *env, int csrno,
 
     if (mask) {
 #ifdef CONFIG_PLUGIN
-        /* The guest's own write: its effect on mip is architectural register
+        /*
+         * The guest's own write: its effect on mip is architectural register
          * state, so a speculative one must be rolled back with everything
          * else.  Tell riscv_cpu_update_mip not to log it as an external
-         * device assertion needing replay. */
+         * device assertion needing replay.
+         */
         env->plugin_mip_guest_write = true;
 #endif
         old_mip = riscv_cpu_update_mip(env, mask, (new_val & mask));

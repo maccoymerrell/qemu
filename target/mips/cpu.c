@@ -587,8 +587,10 @@ static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
                                   bool *mmu_on)
 {
     CPUMIPSState *env = cpu_env(cs);
-    /* KSU: 0 = kernel, 1 = supervisor, 2 (MIPS_HFLAG_UM) = user.
-     * Normalize so 0 = user (least privileged), larger = more privileged. */
+    /*
+     * KSU: 0 = kernel, 1 = supervisor, 2 (MIPS_HFLAG_UM) = user.
+     * Normalize so 0 = user (least privileged), larger = more privileged.
+     */
     int ksu = env->hflags & MIPS_HFLAG_KSU;
     *priv = MIPS_HFLAG_UM - ksu;
     /*
@@ -599,12 +601,39 @@ static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
      * system/physaddr.c).
      */
     *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
-    /* MIPS always translates through the TLB (mapped segments fault on a
-     * TLB miss); there is no global paging-disable, so report on. */
+    /*
+     * MIPS always translates through the TLB (mapped segments fault on a
+     * TLB miss); there is no global paging-disable, so report on.
+     */
     *mmu_on = true;
 }
 
-static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    /*
+     * MIPS partitions the VA space into fixed segments by address range
+     * (see get_physical_address()): the low useg (and, on MIPS64, xuseg) is
+     * the only user-accessible region; everything above -- kseg0/1/2/3 and the
+     * 64-bit xsseg/xkphys/xkseg -- is kernel/supervisor.  So a code fetch is
+     * kernel-domain exactly when it falls outside useg/xuseg.  This is a pure
+     * range test on the fixed segment map (no CPU state, no TLB probe); the
+     * same USEG_LIMIT / segment boundaries the address-translation path uses
+     * are applied here.  Cast to target_ulong first so a 32-bit guest's PC
+     * (kseg0 = 0x80000000) compares in its own width rather than as a
+     * spuriously-small uint64_t.
+     */
+    target_ulong address = (target_ulong)vaddr;
+
+    if (address <= USEG_LIMIT) {
+        return false;                         /* useg -- user */
+    }
+#if defined(TARGET_MIPS64)
+    if (address < 0x4000000000000000ULL) {
+        return false;                         /* xuseg -- user */
+    }
+#endif
+    return true;                              /* kseg / xsseg / xkphys / xkseg */
+}
 
 static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
 {
@@ -619,18 +648,18 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
      * so a thread's kernel excursions stay on the SAME identity its user
      * code carries.
      *
-     * UserLocal == 0 in kernel mode is a task with no TLS identity — a
+     * UserLocal == 0 in kernel mode is a task with no TLS identity -- a
      * kernel thread or per-CPU idle task, or any task on a no-ULRI model
      * (this includes the whole 24K/34K Malta class).  Those are distinct
      * program paths, so fall through to the kernel's own per-task
      * contract: Linux/MIPS dedicates $28 (gp) to current_thread_info in
      * kernel mode (arch/mips/include/asm/thread_info.h declares it
      * register-resident in $28; stackframe.h SAVE_SOME derives it from
-     * the kernel sp — `ori $28, sp, _THREAD_MASK; xori $28,
-     * _THREAD_MASK` — on every entry from user).  MIPS keeps
+     * the kernel sp -- `ori $28, sp, _THREAD_MASK; xori $28,
+     * _THREAD_MASK` -- on every entry from user).  MIPS keeps
      * thread_info at the base of each task's kernel stack (no
      * THREAD_INFO_IN_TASK), so the value is per-task and stable for the
-     * task's life.  Before SAVE_SOME runs — the exception-vector window —
+     * task's life.  Before SAVE_SOME runs -- the exception-vector window --
      * $28 still holds the interrupted user's gp, which on MIPS can only
      * be a useg VA: the kernel-VA test rejects it, the tracks-current
      * hook reports false, and the consumer inherits the entering thread
@@ -650,12 +679,14 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
 static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
-    /* UserLocal is user-TLS-only state the kernel has no use of its own
+    /*
+     * UserLocal is user-TLS-only state the kernel has no use of its own
      * for; it is reloaded from the incoming task at every switch and
      * untouched in between, at any privilege.  The state it cannot vouch
      * for: a no-TLS task (UserLocal 0) in the exception-vector window
-     * before SAVE_SOME re-derives $28 — neither register names the task
-     * there, so the consumer inherits the entering thread. */
+     * before SAVE_SOME re-derives $28 -- neither register names the task
+     * there, so the consumer inherits the entering thread.
+     */
     if (env->active_tc.CP0_UserLocal == 0 &&
         (env->hflags & MIPS_HFLAG_KSU) != MIPS_HFLAG_UM) {
         return mips_vaddr_is_kernel(cs, env->active_tc.gpr[28]);
@@ -663,35 +694,8 @@ static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
     return true;
 }
 
-static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
-{
-    /*
-     * MIPS partitions the VA space into fixed segments by address range
-     * (see get_physical_address()): the low useg (and, on MIPS64, xuseg) is
-     * the only user-accessible region; everything above — kseg0/1/2/3 and the
-     * 64-bit xsseg/xkphys/xkseg — is kernel/supervisor.  So a code fetch is
-     * kernel-domain exactly when it falls outside useg/xuseg.  This is a pure
-     * range test on the fixed segment map (no CPU state, no TLB probe); the
-     * same USEG_LIMIT / segment boundaries the address-translation path uses
-     * are applied here.  Cast to target_ulong first so a 32-bit guest's PC
-     * (kseg0 = 0x80000000) compares in its own width rather than as a
-     * spuriously-small uint64_t.
-     */
-    (void)cs;
-    target_ulong address = (target_ulong)vaddr;
-    if (address <= USEG_LIMIT) {
-        return false;                         /* useg — user */
-    }
-#if defined(TARGET_MIPS64)
-    if (address < 0x4000000000000000ULL) {
-        return false;                         /* xuseg — user */
-    }
-#endif
-    return true;                              /* kseg / xsseg / xkphys / xkseg */
-}
-
 /*
- * TCGCPUOps::spec_clock_resync for MIPS — see the contract in
+ * TCGCPUOps::spec_clock_resync for MIPS -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * MIPS's audit.  The only architectural time source is the CP0 Count/Compare

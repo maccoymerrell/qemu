@@ -73,6 +73,11 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
                                uint64_t timecmp, uint64_t delta,
                                uint32_t timer_irq)
 {
+    uint64_t diff, ns_diff, next;
+    RISCVAclintMTimerState *mtimer;
+    uint32_t timebase_freq;
+    uint64_t rtc_r;
+
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path (speculative): a speculative stimecmp/vstimecmp CSR write
@@ -84,10 +89,9 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
         return;
     }
 #endif
-    uint64_t diff, ns_diff, next;
-    RISCVAclintMTimerState *mtimer = env->rdtime_fn_arg;
-    uint32_t timebase_freq = mtimer->timebase_freq;
-    uint64_t rtc_r = env->rdtime_fn(env->rdtime_fn_arg) + delta;
+    mtimer = env->rdtime_fn_arg;
+    timebase_freq = mtimer->timebase_freq;
+    rtc_r = env->rdtime_fn(env->rdtime_fn_arg) + delta;
 
 #ifdef CONFIG_PLUGIN
     if (getenv("CST_TIMER_DIAG")) {
@@ -235,14 +239,15 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
      * The ACLINT machine timer (mip.MTIP) is the hart's clockevent when it
      * has no usable Sstc (e.g. -cpu max,sstc=false: the kernel programs
      * timers through SBI ecalls into M-mode firmware, which writes mtimecmp
-     * over MMIO).  Its compare register is device state — never rolled back
-     * by the excursion's register-snapshot restore — but its one-shot host
-     * QEMUTimer does not re-arm itself, and its expiry cb is deferred by the
-     * same excursion gate as stimer/vstimer (or its mip.MTIP raise erased by
-     * the restore when the fire races excursion entry).  Without this
+     * over MMIO).  Its compare register is device state -- never rolled back
+     * by the excursion's register-snapshot restore -- but its one-shot host
+     * QEMUTimer does not re-arm itself.  Only riscv_vstimer_cb is gated on
+     * the excursion; riscv_stimer_cb and riscv_aclint_mtimer_cb are not, so
+     * an expiry that fires during the excursion raises STIP/MTIP there and
+     * the register restore may erase it.  Without this
      * reconcile the pending MTIP is lost and the guest tick never fires
      * again.  rdtime_fn_arg is the mtimer that owns this hart (the ACLINT is
-     * the only in-tree rdtime provider) — the same handle
+     * the only in-tree rdtime provider) -- the same handle
      * riscv_timer_write_timecmp above dereferences.
      */
     if (env->rdtime_fn_arg) {
@@ -256,8 +261,9 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
 
 /*
  * Wrong-path excursion-exit reconcile.  A WP excursion can perturb the
- * host timers — a stimer cb fires and is deferred, or stimecmp is rolled back
- * by the register-state restore.  Re-arm and re-raise once per excursion,
+ * host timers -- a vstimer cb fires and is deferred by its gate, a stimer cb's
+ * STIP raise is erased by the register-state restore, or stimecmp is rolled
+ * back by that restore.  Re-arm and re-raise once per excursion,
  * unconditionally, so a firing the cb suppressed is not lost -- correctness
  * does not depend on the cb having recorded that it suppressed one, nor on
  * every way a timer can drift having been enumerated.  Runs at the
@@ -268,10 +274,11 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
 {
     CPURISCVState *env = cpu_env(cs);
 
-    /* Recompute the CPU_INTERRUPT_HARD line from the restored register
+    /*
+     * Recompute the CPU_INTERRUPT_HARD line from the restored register
      * state when an excursion suppressed (or raced) a line update: the
      * snapshot restore is a raw memcpy and never drives the line, so a
-     * raise derived from a rolled-back mip bit would otherwise persist —
+     * raise derived from a rolled-back mip bit would otherwise persist --
      * observably (a stuck line costs the TB loop its BQL fast path), even
      * though the mip-based wake/deliver paths ignore it.
      * riscv_cpu_interrupt is the normal mip-update path's own line logic,
@@ -279,7 +286,8 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
      *
      * Unconditional, like the timer reconcile below.  Gating it on "a line
      * drive was observed and suppressed during the excursion" misses every
-     * desync produced by the rollback alone, so there is no gate. */
+     * desync produced by the rollback alone, so there is no gate.
+     */
     riscv_cpu_update_mip(env, 0, 0);
     if (getenv("CST_TIMER_DIAG")) {
         fprintf(stderr, "[stimer] RESYNC stimecmp=0x%llx vstimecmp=0x%llx "

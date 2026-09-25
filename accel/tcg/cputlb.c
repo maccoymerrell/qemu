@@ -1367,7 +1367,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * lands in the sandboxed do_ld/do_st helpers.  The slow path's tlb_hit
      * ignores the flag (no refill loop) and mmu_lookup1 strips it from the
      * effective flags, so it is purely a "route to the helper" marker.
-     * Instruction fetch is left untagged — CF_FORCE_SLOW governs data ops
+     * Instruction fetch is left untagged -- CF_FORCE_SLOW governs data ops
      * only.  Compiled out where the backend honors CF_FORCE_SLOW (x86), which
      * bypasses the fast path directly and makes the flag redundant.
      */
@@ -1703,7 +1703,7 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
  * Plugin wrong-path (speculative) execution: deny direct host pointers
  * from the probe family so helper-mediated memory ops (SVE loads/stores,
  * DC ZVA's block zero, MOPS, target PTW fast paths, ...) cannot touch
- * real guest RAM — without a host pointer every caller falls back to its
+ * real guest RAM -- without a host pointer every caller falls back to its
  * per-unit cpu_ld/st path, which routes through do_ld/do_st and the
  * speculative store buffer / load redirection.  CF_FORCE_SLOW only
  * covers the backend's INLINE qemu_ld/st path; these probes are how
@@ -1711,7 +1711,7 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
  *
  * Returning TLB_MMIO is the canonical "not directly accessible" signal.
  * The gate also sits BEFORE notdirty_write: marking a clean page dirty
- * is a real side effect, and on code pages it triggers TB invalidation —
+ * is a real side effect, and on code pages it triggers TB invalidation --
  * mutating JIT state mid-speculation.
  */
 static inline bool probe_spec_deny(CPUState *cpu, void **phost)
@@ -1880,7 +1880,7 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
 /*
  * Raw, side-effect-free TLB flags for a page: no fault, no
  * notdirty_write transition, no watchpoint fire, and no plugin-forced
- * TLB_MMIO — this asks what the MACHINE has at @addr, independent of
+ * TLB_MMIO -- this asks what the MACHINE has at @addr, independent of
  * any instrumentation.  Exists for the FEAT_MOPS reporting
  * normalization (target/arm/tcg/helper-a64.c), whose byte-fallback
  * classifier must distinguish "fallback because the page is genuine
@@ -2053,8 +2053,8 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
                 /*
                  * Wrong-path speculative access to an absent page.  The fill
                  * declined to raise or demand-page; the entry is stale, so do
-                 * NOT compute a host pointer from it.  Mark this page absent —
-                 * the load path substitutes a deterministic placeholder — and
+                 * NOT compute a host pointer from it.  Mark this page absent --
+                 * the load path substitutes a deterministic placeholder -- and
                  * return before the haddr compute below.  Both pages of a
                  * cross-page access are resolved independently by mmu_lookup,
                  * so each inherits its own TLB_SPEC_ABSENT.
@@ -2238,9 +2238,12 @@ static void *spec_atomic_absent(CPUState *cpu, vaddr addr, int size,
 {
     cpu->plugin_spec_mem_faulted = true;
     if (addr & (size - 1)) {
-        /* Guest atomics are naturally aligned; a garbage-unaligned wrong-path
-         * address is pathological — take the world-stop the non-spec path would
-         * (a graceful stop of the wrong-path walk), rather than mis-shadowing. */
+        /*
+         * Guest atomics are naturally aligned; a garbage-unaligned wrong-path
+         * address is pathological -- take the world-stop the non-spec path
+         * would (a graceful stop of the wrong-path walk), rather than
+         * mis-shadowing.
+         */
         cpu_loop_exit_atomic(cpu, retaddr);
     }
     uint8_t garbage[16];
@@ -2356,7 +2359,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
      * Wrong-path (speculative) atomics must not mutate real guest memory.
      * Redirect the RMW into the speculative sandbox and return before the
      * real-memory side effects below (notdirty dirtying / TB invalidation,
-     * watchpoint delivery) — none of which apply to a discarded write.
+     * watchpoint delivery) -- none of which apply to a discarded write.
      */
     if (cpu_plugin_spec_active(cpu)) {
         /*
@@ -2672,7 +2675,7 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
          * MMIO region: deterministic placeholder bytes, concatenated
          * big-endian exactly as do_ld_bytes_beN concatenates the real
          * bytes.  A speculative MMIO read must never reach the device
-         * model — a device read can have side effects (clear-on-read
+         * model -- a device read can have side effects (clear-on-read
          * status, FIFO pop) that a mis-speculated access must not cause. */
         for (int i = 0; i < p->size; i++) {
             uint8_t gb;

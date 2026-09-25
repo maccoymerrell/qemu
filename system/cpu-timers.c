@@ -273,13 +273,9 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void)
  * cpu_plugin_spec_clock_freeze() in the header for why the stall belongs to
  * this count and not to plugin_clock_freeze_depth beside it.
  *
- * A second count next to the first is not a second answer to "is the clock
- * frozen".  The value freeze is one question with one answer and
- * plugin_clock_freeze_depth is still its sole authority -- every freeze,
- * speculative or not, goes through it.  This count answers a different
- * question, "is a wrong path currently executing", and the two differ
- * precisely because the correct-path window also freezes the value.  Written
- * only under the BQL, which both entry points assert.
+ * plugin_clock_freeze_depth stays the sole authority for the value freeze;
+ * this count answers "is a wrong path executing".  Written only under the
+ * BQL.
  */
 static int plugin_spec_stall_depth;
 

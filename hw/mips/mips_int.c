@@ -100,9 +100,11 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
 }
 
 #ifdef CONFIG_PLUGIN
-/* Recompute CPU_INTERRUPT_HARD from the restored CP0_Cause after a
+/*
+ * Recompute CPU_INTERRUPT_HARD from the restored CP0_Cause after a
  * wrong-path excursion suppressed a line update.  Called from
- * mips_cpu_plugin_resync_timers at the excursion-exit boundary. */
+ * mips_cpu_plugin_resync_timers at the excursion-exit boundary.
+ */
 void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);

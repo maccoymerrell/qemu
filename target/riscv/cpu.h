@@ -491,7 +491,7 @@ struct CPUArchState {
     /*
      * Pending-interrupt replay across a wrong-path (speculative) excursion.
      * env->mip sits inside the register snapshot, so the excursion-exit
-     * restore rewinds it — including bits an external device (PLIC, ACLINT
+     * restore rewinds it -- including bits an external device (PLIC, ACLINT
      * software interrupt, hgeip, the PMU overflow counter) asserted or
      * deasserted DURING the excursion, which are real and must survive.
      * riscv_cpu_update_mip records the externally-caused delta here; the
@@ -500,9 +500,11 @@ struct CPUArchState {
      * rolled back.  See the replay comment in cpu_plugin_arch_state_restore.
      */
     CPUPluginIrqDelta plugin_irq_delta;
-    /* Set while the guest's own mip/sip CSR write is in flight, so its
+    /*
+     * Set while the guest's own mip/sip CSR write is in flight, so its
      * (speculative, therefore discardable) effect is not mistaken for an
-     * external device assertion. */
+     * external device assertion.
+     */
     bool plugin_mip_guest_write;
 #endif
 

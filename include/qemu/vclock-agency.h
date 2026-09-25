@@ -55,7 +55,7 @@
  * every hook site is softmmu-only, and the slot stays INT64_MAX.
  *
  * Tripwire counters count and never gate; each warns once on its first
- * hit, and vclock_agency_counters() returns them:
+ * hit and is reported at exit by vclock_agency_exit_report():
  *   vagency_consume_runs      boundary consumptions; > 0 on any busy
  *                             traced system run
  *   vagency_spec_mode_skips   a boundary reached inside wrong-path mode;
@@ -120,7 +120,6 @@ void vclock_agency_vcpu_unpark(void);
 /* Boundary bracket + counters. */
 void vclock_agency_boundary_begin(void);
 void vclock_agency_boundary_end(void);
-bool vclock_agency_in_boundary(void);
 void vclock_agency_note_consume(void);
 void vclock_agency_note_spec_skip(void);
 void vclock_agency_note_fence_hit(void);
@@ -133,10 +132,20 @@ void vclock_agency_note_vpass(bool main_list);
  */
 void vclock_agency_note_consume_site(bool breakout_site);
 
-/*
- * Counter snapshot, in declaration order: consume_runs, spec_mode_skips,
- * stall_fence_hits, foreign_vruns, aio_virtual_arms.
+/**
+ * vclock_agency_consume: run due QEMU_CLOCK_VIRTUAL timers in-thread
+ * @cpu: the vCPU whose slice breakout this is
+ * @breakout_site: site witness -- true = the slice-breakout site in
+ * cpu_loop_exec_tb(), the ONLY product site; false survives so the
+ * consume_dispatch counter can prove the retired dispatch-top site
+ * stays gone (it must read 0 forever)
+ *
+ * The event-agency discipline's consumption body: called from a
+ * vCPU-owned slice breakout when the fresh
+ * qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0 read says a
+ * deadline is due.  Takes the BQL if not held; skips (and counts)
+ * inside spec mode.  Defined in system/cpu-timers.c.
  */
-void vclock_agency_counters(uint64_t out[5]);
+void vclock_agency_consume(CPUState *cpu, bool breakout_site);
 
 #endif

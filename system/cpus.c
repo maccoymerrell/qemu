@@ -455,35 +455,29 @@ void qemu_wait_io_event_common(CPUState *cpu)
 void qemu_wait_io_event(CPUState *cpu)
 {
     bool slept = false;
-    bool vagency_parked = false;
 
     while (cpu_thread_is_idle(cpu)) {
         if (!slept) {
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
-        }
-        /*
-         * Event-agency halt rule (PRODUCT; see qemu/vclock-agency.h):
-         * park this vCPU thread for the duration of its idle wait.
-         * When the LAST thread parks, the VIRTUAL exclusion lifts and
-         * the iothread consumes deadlines normally -- the correct
-         * wake for a fully-halted machine, with no timed wait.  The
-         * park runs under the BQL (held here except inside
-         * qemu_cond_wait), so the lift edge and the iothread's timer
-         * dispatch are serialized; the lift edge's qemu_notify_event
-         * makes a sleeping iothread recompute its poll timeout WITH
-         * VIRTUAL before this thread ever blocks.
-         */
-        if (!vagency_parked) {
-            vagency_parked = true;
+            /*
+             * Event-agency halt rule (PRODUCT; see qemu/vclock-agency.h):
+             * park this vCPU thread for the duration of its idle wait.
+             * When the LAST thread parks, the VIRTUAL exclusion lifts and
+             * the iothread consumes deadlines normally -- the correct
+             * wake for a fully-halted machine, with no timed wait.  The
+             * park runs under the BQL (held here except inside
+             * qemu_cond_wait), so the lift edge and the iothread's timer
+             * dispatch are serialized; the lift edge's qemu_notify_event
+             * makes a sleeping iothread recompute its poll timeout WITH
+             * VIRTUAL before this thread ever blocks.
+             */
             vclock_agency_vcpu_park();
         }
         qemu_cond_wait(cpu->halt_cond, &bql);
     }
-    if (vagency_parked) {
-        vclock_agency_vcpu_unpark();
-    }
     if (slept) {
+        vclock_agency_vcpu_unpark();
         qemu_plugin_vcpu_resume_cb(cpu);
     }
 

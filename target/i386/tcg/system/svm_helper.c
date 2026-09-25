@@ -177,14 +177,14 @@ void helper_vmrun(CPUX86State *env, int aflag, int next_eip_addend)
     target_ulong addr;
     uint64_t nested_ctl;
     uint32_t event_inj;
-
-    CST_SPEC_ABORT_VMM(env);
     uint32_t asid;
     uint64_t new_cr0;
     uint64_t new_cr3;
     uint64_t new_cr4;
     uint64_t new_dr6;
     uint64_t new_dr7;
+
+    CST_SPEC_ABORT_VMM(env);
 
     if (aflag == 2) {
         addr = env->regs[R_EAX];
@@ -684,7 +684,7 @@ void cpu_svm_check_intercept_param(CPUX86State *env, uint32_t type,
      * Wrong-path (speculative): with HF_GUEST_MASK set, a taken intercept
      * funnels into cpu_vmexit -> do_vmexit, which writes the VMCB to guest
      * *physical* memory via x86_st*_phys (bypassing the sandboxed softmmu
-     * store path) and tears down global VMM state — neither is rolled back.
+     * store path) and tears down global VMM state -- neither is rolled back.
      * Abort the walk before any such effect, like helper_vmrun/vmload/vmsave.
      */
     CST_SPEC_ABORT_VMM(env);
@@ -745,7 +745,7 @@ void helper_svm_check_io(CPUX86State *env, uint32_t port, uint32_t param,
          * Wrong-path (speculative): an intercepted I/O port funnels into
          * cpu_vmexit (plus a direct x86_stq_phys of exit_info_2 here), which
          * writes the VMCB to guest *physical* memory bypassing the sandboxed
-         * softmmu path — not rolled back.  Abort before that store, like
+         * softmmu path -- not rolled back.  Abort before that store, like
          * cpu_svm_check_intercept_param.
          */
         CST_SPEC_ABORT_VMM(env);
@@ -772,7 +772,7 @@ void cpu_vmexit(CPUX86State *env, uint64_t exit_code, uint64_t exit_info_1,
     /*
      * Wrong-path (speculative) chokepoint: cpu_vmexit writes the VMCB to guest
      * *physical* memory below via x86_st*_phys (bypassing the sandboxed softmmu
-     * store path), unrecoverable state.  Guarding here covers every caller —
+     * store path), unrecoverable state.  Guarding here covers every caller --
      * the intercept path (already double-gated, harmless), the cr3/cr4
      * reserved-bit faults in helper_write_crN (reachable in spec with
      * HF_GUEST_MASK set), and any future caller.

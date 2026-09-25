@@ -48,8 +48,8 @@ __thread uintptr_t helper_retaddr;
  *
  * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
  * cache line (a naturally-aligned access stays within one line), not
- * one per byte.  The common case — no speculative store overlaps this
- * load's line — resolves to a single lookup + one page check + a bulk
+ * one per byte.  The common case -- no speculative store overlaps this
+ * load's line -- resolves to a single lookup + one page check + a bulk
  * memcpy from guest memory, instead of N hash lookups and N byte reads.
  * A 64-byte-aligned line never straddles a (>=4 KiB) page, so one page
  * check covers the whole chunk.
@@ -65,9 +65,8 @@ __thread uintptr_t helper_retaddr;
  * user-mode twin of the softmmu TLB_SPEC_ABSENT path.
  */
 static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
-                                 void *out, int size, uintptr_t ra)
+                                 void *out, int size)
 {
-    (void)ra;
     uint8_t *op = out;
     while (size > 0) {
         vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
@@ -126,13 +125,12 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
  * synthetic.  The softmmu twin (spec_store_probe in cputlb.c) does the same
  * with a non-faulting MMU_DATA_STORE probe of each touched page before the
  * do_stN_mmu spec branch buffers the bytes.  The bytes are buffered in the
- * spec sandbox — never real guest memory — preserving store-to-load
+ * spec sandbox -- never real guest memory -- preserving store-to-load
  * forwarding for the rest of the excursion.
  */
 static void spec_store_bytes_user(CPUState *cpu, vaddr addr,
-                                  const void *buf, int size, uintptr_t ra)
+                                  const void *buf, int size)
 {
-    (void)ra;
     vaddr end = addr + size;
     for (vaddr p = addr; p < end; ) {
         if (!guest_addr_valid_untagged(p) ||
@@ -938,7 +936,7 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
     g_assert(-(addr | TARGET_PAGE_MASK) >= size);
     flags = probe_access_internal(env, addr, size, access_type, nonfault, ra);
 #ifdef CONFIG_PLUGIN
-    /* Speculative execution: no direct host pointers — callers fall
+    /* Speculative execution: no direct host pointers -- callers fall
      * back to their per-unit cpu_ld/st path, which the spec sandbox
      * intercepts (twin of the softmmu probe_access_flags gate). */
     if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
@@ -1196,7 +1194,7 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
         uint8_t result = 0;
-        spec_load_bytes_user(cpu, addr, &result, 1, ra);
+        spec_load_bytes_user(cpu, addr, &result, 1);
         return result;
     }
 #endif
@@ -1217,7 +1215,7 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 2, ra);
+        spec_load_bytes_user(cpu, addr, &ret, 2);
         if (mop & MO_BSWAP) {
             ret = bswap16(ret);
         }
@@ -1245,7 +1243,7 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 4, ra);
+        spec_load_bytes_user(cpu, addr, &ret, 4);
         if (mop & MO_BSWAP) {
             ret = bswap32(ret);
         }
@@ -1273,7 +1271,7 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 8, ra);
+        spec_load_bytes_user(cpu, addr, &ret, 8);
         if (mop & MO_BSWAP) {
             ret = bswap64(ret);
         }
@@ -1301,7 +1299,7 @@ static Int128 do_ld16_mmu(CPUState *cpu, abi_ptr addr,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 16, ra);
+        spec_load_bytes_user(cpu, addr, &ret, 16);
         if (mop & MO_BSWAP) {
             ret = bswap128(ret);
         }
@@ -1328,7 +1326,7 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_store_bytes_user(cpu, addr, &val, 1, ra);
+        spec_store_bytes_user(cpu, addr, &val, 1);
         return;
     }
 #endif
@@ -1351,7 +1349,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
             val = bswap16(val);
         }
         uint16_t host_val = val;
-        spec_store_bytes_user(cpu, addr, &host_val, 2, ra);
+        spec_store_bytes_user(cpu, addr, &host_val, 2);
         return;
     }
 #endif
@@ -1378,7 +1376,7 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
             val = bswap32(val);
         }
         uint32_t host_val = val;
-        spec_store_bytes_user(cpu, addr, &host_val, 4, ra);
+        spec_store_bytes_user(cpu, addr, &host_val, 4);
         return;
     }
 #endif
@@ -1405,7 +1403,7 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
             val = bswap64(val);
         }
         uint64_t host_val = val;
-        spec_store_bytes_user(cpu, addr, &host_val, 8, ra);
+        spec_store_bytes_user(cpu, addr, &host_val, 8);
         return;
     }
 #endif
@@ -1432,7 +1430,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
             val = bswap128(val);
         }
         Int128 host_val = val;
-        spec_store_bytes_user(cpu, addr, &host_val, 16, ra);
+        spec_store_bytes_user(cpu, addr, &host_val, 16);
         return;
     }
 #endif
@@ -1579,7 +1577,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         /*
          * spec_atomic_shadow never hands @ret back: a capped sandbox discards
          * the RMW into the per-vCPU scratch line rather than let it run on
-         * real guest memory.  There is nothing to fall through to — and here
+         * real guest memory.  There is nothing to fall through to -- and here
          * least of all, since user mode has no softmmu TLB and therefore no
          * TLB_FORCE_SLOW backstop underneath this decision.
          */

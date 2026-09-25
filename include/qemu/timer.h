@@ -95,18 +95,15 @@ struct QEMUTimer {
      * run_pass generation this timer's callback last ran in and
      * @last_run_expire is the deadline it ran FOR, so a timer that comes
      * back round inside the same pass can be asked whether its new deadline
-     * moved forward.  See the bound in timerlist_run_timers().
+     * moved forward.  See the bound above timerlist_run_timers() in
+     * util/qemu-timer.c.
      */
     uint64_t last_run_pass;
     int64_t last_run_expire;
     /*
-     * The callback that was running on the arming thread when this timer was
-     * last armed, or NULL if it was armed from outside any timer callback.
-     * The no-progress report needs the device that DID the arming, and that
-     * is not deducible from the run loop: the loop only notices an armed
-     * timer once it reaches the head of the list, by which point any number
-     * of unrelated timers due in the same pass have been popped in between.
-     * Written under the list lock in timer_mod_ns_locked().
+     * The arming callback (NULL outside any timer callback); see the bound
+     * above timerlist_run_timers() in util/qemu-timer.c.  Written under the
+     * list lock.
      */
     QEMUTimerCB *armed_by;
 };
@@ -257,16 +254,10 @@ void qemu_clock_enable(QEMUClockType type, bool enabled);
  * machine-wide count of outstanding SPECULATIVE freezes and is the single
  * authority.
  *
- * That count is not the same as the count of outstanding clock-VALUE freezes
- * beside it.  A plugin also freezes the clock's value around a correct-path
- * instrumentation callback, once per translation block, and there the guest
- * is between two of its own instructions: every guest-time event still has
- * a legal position and only the callback's host cost must be kept out of
- * the clock, so the value freeze alone is the whole requirement.  Only a
- * speculative window -- execution the guest never performed, with no
- * instruction stream to place an event in -- needs the clock to stop being
- * evaluated as well.  Which readers the stall actually turns away is set
- * out at vclock_processing_stalled() in util/qemu-timer.c.
+ * The switch is driven only by speculative windows; why a correct-path
+ * window freezes the value alone is on cpu_plugin_spec_clock_freeze() in
+ * include/system/cpu-timers.h.  Which readers the stall actually turns away
+ * is set out at vclock_processing_stalled() in util/qemu-timer.c.
  *
  * NOT implemented as qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which has
  * exactly the right read side and the wrong wait side: it blocks on every
@@ -391,6 +382,12 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list);
  * Returns: true if any timer expired
  */
 bool timerlist_run_timers(QEMUTimerList *timer_list);
+
+/*
+ * Ceiling on callbacks run in a single timerlist_run_timers() pass.  See the
+ * total bound in the loop; sized far above any legitimate backlog.
+ */
+#define TIMERLIST_MAX_CB_PER_PASS 100000
 
 /**
  * timerlist_notify:

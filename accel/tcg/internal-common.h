@@ -130,10 +130,10 @@ static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
 static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
 {
     /* The hash value is the line's pool index + 1, resolved against the
-     * pool base of the moment — never a stored pointer, which the pool's
+     * pool base of the moment -- never a stored pointer, which the pool's
      * realloc growth would leave dangling (see spec_line_get_or_alloc). */
     gpointer val = g_hash_table_lookup(
-        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+        cpu->plugin_spec_store_buf, GSIZE_TO_POINTER((gsize)line_addr));
     if (!val) {
         return NULL;
     }
@@ -180,7 +180,7 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
 
         PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
         if (!line) {
-            /* Sandbox capped — drop remaining bytes.  See
+            /* Sandbox capped -- drop remaining bytes.  See
              * PLUGIN_SPEC_STORE_LINE_MAX in exec/plugin-spec.h. */
             return;
         }
@@ -203,7 +203,7 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
  * host pointer from atomic_mmu_lookup and RMW it in place with real host
  * atomic primitives; left unsandboxed that mutates real guest memory on
  * the discarded wrong path (kernel spinlocks, refcounts, page-table
- * cmpxchg — and user-mode futexes / lock cmpxchg alike).
+ * cmpxchg -- and user-mode futexes / lock cmpxchg alike).
  *
  * We pre-fill the @size accessed bytes of the line from real memory
  * wherever they are not already speculatively dirty (so the RMW reads
@@ -215,21 +215,21 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
  * A naturally-aligned atomic of size <= 16 never crosses a 64-byte line,
  * so idx + size <= 64 and the returned pointer carries the same
  * alignment the guest access guaranteed (PluginSpecLine is 16-aligned
- * with bytes[] at offset 0 — see plugin-spec.h).
+ * with bytes[] at offset 0 -- see plugin-spec.h).
  *
  * Never returns NULL, and deliberately offers no way for a caller to obtain
  * the real pointer.  When the line pool is at PLUGIN_SPEC_STORE_LINE_MAX the
  * RMW is pointed at a per-vCPU scratch line
  * (CPUState::plugin_spec_atomic_scratch) seeded with the same @size baseline
  * bytes, so the operation still computes and still compares against the value
- * it would have seen — the result is simply discarded instead of being
+ * it would have seen -- the result is simply discarded instead of being
  * forwarded to later speculative loads.  That is a genuinely dropped atomic,
  * degrading exactly as a store dropped by a capped pool does.
  *
  * Falling back to @real_host would NOT be that.  spec_store_byte and
  * spec_store_bytes write nothing when the pool is capped; an atomic handed
  * the real pointer performs a real read-modify-write on real guest memory
- * from the wrong path — the precise mutation of architectural state this
+ * from the wrong path -- the precise mutation of architectural state this
  * sandbox exists to prevent, and one no rollback undoes.  Keeping the choice
  * here, rather than in each atomic_mmu_lookup, leaves no caller the option.
  */
@@ -242,8 +242,8 @@ static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
     if (!line) {
         /*
          * Capped: discard the RMW into the per-vCPU scratch line.  Only the
-         * @size accessed bytes matter — an atomic helper reads and writes
-         * exactly the object it was handed — so seed just those, at the same
+         * @size accessed bytes matter -- an atomic helper reads and writes
+         * exactly the object it was handed -- so seed just those, at the same
          * intra-line offset, which preserves the alignment the guest access
          * guaranteed.  Store-to-load forwarding is lost for this one access:
          * a later speculative load of these bytes reads real memory, the same
@@ -256,7 +256,7 @@ static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
          * @idx is size-aligned and the result is aligned iff the scratch line
          * is.  The 16-byte host primitives (cmpxchg16b, LDXP/STXP) fault on a
          * misaligned operand: say so here rather than as a SIGSEGV inside the
-         * atomic helper.  Cold path — only reached with the pool capped.
+         * atomic helper.  Cold path -- only reached with the pool capped.
          */
         g_assert(((uintptr_t)&line->bytes[idx] & (size - 1)) == 0);
         return &line->bytes[idx];

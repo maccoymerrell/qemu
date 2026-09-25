@@ -4,6 +4,10 @@
  * budget save/restore, per-target clock resync, kick re-arm), plus the
  * nestable correct-path instrumentation clock freeze.
  *
+ * Vocabulary: an excursion is one wrong-path run, bracketed by
+ * cpu_plugin_excursion_open() and cpu_plugin_excursion_close(); spec mode
+ * (plugin_spec_mode) is set only inside it.
+ *
  * Copyright (C) 2026, Maccoy Merrell
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -47,20 +51,21 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * rolled back during speculative execution.
      */
 #if defined(TARGET_I386)
-    void *bp_save[4];
+    typeof(env->cpu_breakpoint) bp_save;
     memcpy(bp_save, env->cpu_breakpoint, sizeof(bp_save));
     memcpy(env, saved, size);
     memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
 #elif defined(TARGET_ARM)
-    void *bp_save[16], *wp_save[16];
+    typeof(env->cpu_breakpoint) bp_save;
+    typeof(env->cpu_watchpoint) wp_save;
     memcpy(bp_save, env->cpu_breakpoint, sizeof(bp_save));
     memcpy(wp_save, env->cpu_watchpoint, sizeof(wp_save));
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
     /*
      * The generic timer's host QEMUTimers live OUTSIDE this register snapshot.
-     * If the restore rolls back any timer's ctl/cval — most importantly the
+     * If the restore rolls back any timer's ctl/cval -- most importantly the
      * ISTATUS bit, which an expiry processed during the excursion can
-     * advance to 1 — the architected registers revert but the host
+     * advance to 1 -- the architected registers revert but the host
      * QEMUTimer does not, leaving it parked (e.g. at INT64_MAX) and never
      * firing again, and the guest's timer subsystem livelocks.  Nothing is
      * detected here: arm_cpu_plugin_resync_timers re-runs gt_recalc_timer
@@ -86,12 +91,12 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
     memcpy(env, saved, size);
     memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
     memcpy(env->cpu_watchpoint, wp_save, sizeof(wp_save));
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
     env->irq_line_state = irq_line_save;
 #endif
     /* Clock resync runs in cpu_plugin_excursion_close, not here. */
 #elif defined(TARGET_RISCV)
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
     /*
      * The Sstc supervisor/VS host timers (env->stimer/vstimer) and the ACLINT
      * machine timer live outside this register snapshot, so a rolled-back
@@ -195,7 +200,7 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
     memcpy(env, saved, size);
 #endif
 #elif defined(TARGET_MIPS)
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
     /*
      * The R4K host timer (env->timer) lives outside this register snapshot.
      * A restore that rolls CP0_Count/Compare back is reconciled by
@@ -270,7 +275,7 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
 #endif
 }
 
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
 /*
  * x86 only, and not a diagnostic: set when cpu_plugin_excursion_open kept
  * the BQL for the excursion, so cpu_plugin_excursion_close releases it.
@@ -330,7 +335,7 @@ void cpu_plugin_excursion_open(CPUState *cpu)
     /*
      * Freeze the guest virtual clock across a whole wrong-path excursion so
      * the speculative run's host wall-clock time does not advance the guest's
-     * architected timer counters (CNTVCT / TSC / time / Count) — WP is outside
+     * architected timer counters (CNTVCT / TSC / time / Count) -- WP is outside
      * guest time.  Idempotent + balanced via plugin_excursion_active: a
      * second pause before the matching resume is a no-op.
      */
@@ -380,7 +385,7 @@ void cpu_plugin_excursion_open(CPUState *cpu)
         tcg_slice_note_exc_save();
     }
     cst_clkaudit_note_pause();       /* every root a guest clock derives from */
-#if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN)
+#if defined(TARGET_RISCV)
     /*
      * Start the excursion's pending-interrupt record empty, and do it under
      * the same BQL hold that opens the window, so riscv_cpu_update_mip (which
@@ -402,7 +407,7 @@ void cpu_plugin_excursion_open(CPUState *cpu)
         renv->plugin_irq_delta.clear = 0;
     }
 #endif
-#if defined(TARGET_MIPS) && defined(CONFIG_PLUGIN)
+#if defined(TARGET_MIPS)
     /*
      * Same rule for the mips external Cause.IP record: start it empty, under
      * the same BQL hold that opens the window (cpu_mips_irq_request, the
@@ -561,8 +566,8 @@ void cpu_plugin_excursion_close(CPUState *cpu)
     /*
      * The deferral flag must not outlive its excursion: this resume runs on
      * BOTH exit paths (the plugin's normal resume and the abnormal
-     * cpu_exec_longjmp_cleanup), so clearing it here — outside the branch
-     * above — is what keeps a deferred kick from leaking into the next
+     * cpu_exec_longjmp_cleanup), so clearing it here -- outside the branch
+     * above -- is what keeps a deferred kick from leaking into the next
      * excursion's re-arm decision.
      */
     cpu->plugin_spec_kick_deferred = false;
@@ -575,8 +580,8 @@ void cpu_plugin_excursion_close(CPUState *cpu)
 /*
  * Nestable guest-virtual-clock freeze for plugin instrumentation windows
  * (translation-time decoding, per-TB trace emission).  Same transparency
- * principle as the wrong-path vtime pause above — plugin work is outside
- * guest execution, so its host wall-clock cost must not advance guest time —
+ * principle as the wrong-path vtime pause above -- plugin work is outside
+ * guest execution, so its host wall-clock cost must not advance guest time --
  * but for the CORRECT-path instrumentation cost.  Without this, a heavily
  * instrumented guest tick handler can cost more guest time than one tick
  * period, leaving the next tick already pending on return: the guest

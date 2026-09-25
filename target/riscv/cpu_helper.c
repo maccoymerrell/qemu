@@ -648,9 +648,11 @@ bool riscv_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         CPURISCVState *env = &cpu->env;
         int interruptno = riscv_cpu_local_irq_pending(env);
 #ifdef CONFIG_PLUGIN
-        /* Interrupt-delivery diagnostic, throttled to ~1/host-sec: reports
+        /*
+         * Interrupt-delivery diagnostic, throttled to ~1/host-sec: reports
          * interrupt_request and whether STIP delivers or is masked
-         * (interruptno < 0). */
+         * (interruptno < 0).
+         */
         if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
             static long last;
             long now = (long)time(NULL);
@@ -889,7 +891,7 @@ uint64_t riscv_cpu_update_mip(CPURISCVState *env, uint64_t mask, uint64_t value)
      * Pending-interrupt replay (part of the spec_clock_resync contract).
      * env->mip lives inside the wrong-path register snapshot, so the
      * excursion-exit restore rewinds it.  For bits the GUEST changed that is
-     * exactly right — a speculative CSR write to sip must be discarded.  For
+     * exactly right -- a speculative CSR write to sip must be discarded.  For
      * bits an EXTERNAL device changed while the excursion was in flight it is
      * wrong: the PLIC (SEIP/MEIP), the ACLINT software interrupt (MSIP/SSIP),
      * hgeip (SGEIP) and the PMU overflow counter (LCOFIP) have no
@@ -1703,11 +1705,7 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
      */
     if (adue) {
 #ifdef CONFIG_PLUGIN
-        /*
-         * Wrong-path (speculative) walk: don't set/persist A/D in the guest
-         * PTE.  Leaving updated_pte == pte skips the writeback block below;
-         * the translation still succeeds, the bits just aren't persisted.
-         */
+        /* The walk proceeds; A/D is not persisted on the wrong path. */
         if (!cs->plugin_spec_mode)
 #endif
         updated_pte |= PTE_A | (access_type == MMU_DATA_STORE ? PTE_D : 0);
@@ -2353,9 +2351,11 @@ void riscv_cpu_do_interrupt(CPUState *cs)
 
 #ifdef CONFIG_PLUGIN
     if (!async && cause == RISCV_EXCP_ILLEGAL_INST && getenv("CST_ILL_DIAG")) {
-        /* Illegal-instruction diagnostic: bins==0 / garbage => instruction-
+        /*
+         * Illegal-instruction diagnostic: bins==0 / garbage => instruction-
          * memory corruption (leaked store); a valid-but-misaligned encoding =>
-         * bad branch IP.  spec=1 would mean WP is delivering (should never). */
+         * bad branch IP.  spec=1 would mean WP is delivering (should never).
+         */
         fprintf(stderr, "[ill] spec=%d pc=0x%llx bins=0x%08llx priv=%d "
                 "VS=%d FS=%d vill=%d\n",
                 (int)cs->plugin_spec_mode,
@@ -2371,9 +2371,11 @@ void riscv_cpu_do_interrupt(CPUState *cs)
                 (int)async, (unsigned long long)cause,
                 (unsigned long long)cs->cc->get_pc(cs));
     }
-    /* Timer-tick diagnostic: count timer IRQs delivered on the correct path
+    /*
+     * Timer-tick diagnostic: count timer IRQs delivered on the correct path
      * and print the running total once per host-second.  A total that
-     * plateaus means the guest timer tick has stopped. */
+     * plateaus means the guest timer tick has stopped.
+     */
     if (getenv("CST_TICK_DIAG") && async && !cs->plugin_spec_mode) {
         static unsigned long n_timer, n_async;
         static long last_sec;
@@ -2397,15 +2399,17 @@ void riscv_cpu_do_interrupt(CPUState *cs)
      * the generic resume in cpu_exec_loop clears the flag when execution
      * returns there.  Outermost only; never on the wrong path.  See cpu.h.
      */
-    /* Instrument every delivery, including the ones the gates below discard,
-     * so "no window opened" and "no interrupt arrived" are distinguishable. */
+    /*
+     * Instrument every delivery, including the ones the gates below discard,
+     * so "no window opened" and "no interrupt arrived" are distinguishable.
+     */
     cpu_plugin_async_probe(cs, async ? "IRQ" : "EXC", cs->exception_index,
                            async);
     if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
     } else if (!async && !cs->plugin_spec_mode) {
         /*
-         * Synchronous FAULT (page/access fault, illegal insn, misaligned, …):
+         * Synchronous FAULT (page/access fault, illegal insn, misaligned, ...):
          * the trap return re-executes the faulting instruction, so the resume
          * PC is the trapping PC.  ECALL advances past the instruction and is
          * left to the normal branch-into-kernel representation.  Report the

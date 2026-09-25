@@ -230,7 +230,7 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
             /*
              * Wrong-path (speculative): cpu_get_apic_tpr reads the APIC
              * device, and apic_sync_vapic(SYNC_FROM_VAPIC) writes s->tpr
-             * from the vAPIC page — a device mutation outside the env
+             * from the vAPIC page -- a device mutation outside the env
              * snapshot, which the excursion's register restore cannot undo,
              * feeding apic_get_ppr and interrupt delivery.  helper_read_cr8
              * already refuses this for the guest's own MOV-from-CR8; this is

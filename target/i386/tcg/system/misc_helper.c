@@ -28,7 +28,7 @@
 #include "hw/i386/apic.h"
 
 /*
- * Wrong-path (plugin speculative) port I/O must not reach devices — an
+ * Wrong-path (plugin speculative) port I/O must not reach devices -- an
  * `out` to a shutdown/reset/IRQ port or an `in` that pops a FIFO would be a
  * real side effect on the discarded path.  Port I/O bypasses the cputlb
  * spec store buffer (it goes straight to address_space_io), so it is
@@ -167,7 +167,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
          * Wrong-path (speculative): cr8 is the APIC task-priority register.
          * Apply the env-shadowed V_TPR bits (rolled back at walk end so the
          * speculative path stays self-consistent) but suppress the real APIC
-         * device poke and the global VIRQ interrupt-request mutation — both
+         * device poke and the global VIRQ interrupt-request mutation -- both
          * would persist past the discarded walk.
          */
         if (env_cpu(env)->plugin_spec_mode) {
@@ -336,7 +336,7 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRphysMask(6):
     case MSR_MTRRphysMask(7):
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -346,7 +346,7 @@ void helper_wrmsr(CPUX86State *env)
         break;
     case MSR_MTRRfix64K_00000:
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -357,7 +357,7 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRfix16K_80000:
     case MSR_MTRRfix16K_A0000:
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -374,7 +374,7 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRfix4K_F0000:
     case MSR_MTRRfix4K_F8000:
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -384,7 +384,7 @@ void helper_wrmsr(CPUX86State *env)
         break;
     case MSR_MTRRdefType:
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -403,7 +403,7 @@ void helper_wrmsr(CPUX86State *env)
         break;
     case MSR_MCG_CTL:
 #ifdef CONFIG_PLUGIN
-        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        /* Wrong-path: past end_reset_fields, never restored -- see above. */
         if (cs->plugin_spec_mode) {
             break;
         }
@@ -431,7 +431,7 @@ void helper_wrmsr(CPUX86State *env)
 
 #ifdef CONFIG_PLUGIN
         /*
-         * Wrong-path: x2APIC register writes reach the real APIC device —
+         * Wrong-path: x2APIC register writes reach the real APIC device --
          * ICR writes can fire IPIs, LVT/timer writes reprogram it.  Drop
          * the write on the discarded path.
          */
@@ -456,7 +456,7 @@ void helper_wrmsr(CPUX86State *env)
 #ifdef CONFIG_PLUGIN
             /*
              * Wrong-path: mce_banks[] is past end_reset_fields, never
-             * restored — see the MTRR gate above.  Leaving this ungated
+             * restored -- see the MTRR gate above.  Leaving this ungated
              * additionally desynchronises the banks from mcg_status, which
              * IS rolled back.
              */
@@ -707,8 +707,10 @@ G_NORETURN void helper_mwait(CPUX86State *env, int next_eip_addend)
     CPUState *cs = env_cpu(env);
 
 #ifdef CONFIG_PLUGIN
-    /* Wrong-path: don't halt the vCPU (cs->halted would stall the VM past
-     * the discarded walk).  Abort the speculative walk, like helper_hlt. */
+    /*
+     * Wrong-path: don't halt the vCPU (cs->halted would stall the VM past
+     * the discarded walk).  Abort the speculative walk, like helper_hlt.
+     */
     if (cs->plugin_spec_mode) {
         cpu_loop_exit(cs);
     }

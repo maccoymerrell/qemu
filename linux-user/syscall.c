@@ -9525,9 +9525,7 @@ static const struct {
 #ifdef TARGET_NR_pidfd_open
     { TARGET_NR_pidfd_open, VPID_ARG1 },
 #endif
-#ifdef TARGET_NR_pidfd_send_signal
-    { TARGET_NR_pidfd_send_signal, 0 },  /* pidfd, not a pid: listed so the audit is complete */
-#endif
+    /* pidfd_send_signal takes a pidfd, not a pid. */
 };
 
 /*
@@ -10328,7 +10326,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         ret = get_errno(setsid());
         /* The new session id is this process's own pid, which in the pinned
          * space is its pinned name; unpinned, hand back what the host said. */
-        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
+        return vpid_pgrp_result(ret);
 #ifdef TARGET_NR_sigaction
     case TARGET_NR_sigaction:
         {
@@ -11664,7 +11662,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         /* Pinned, the traced thread group is alone and leads its own group,
          * so any group it can name is its own; the host's real group id is
          * inherited from the launching shell and differs between runs. */
-        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
+        return vpid_pgrp_result(ret);
     case TARGET_NR_fchdir:
         return get_errno(fchdir(arg1));
     case TARGET_NR_personality:
@@ -11774,7 +11772,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_getsid:
         ret = get_errno(getsid(arg1));
         /* Same as getpgid: pinned, it leads its own session. */
-        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
+        return vpid_pgrp_result(ret);
 #if defined(TARGET_NR_fdatasync) /* Not on alpha (osf_datasync ?) */
     case TARGET_NR_fdatasync:
         return get_errno(fdatasync(arg1));
@@ -14298,7 +14296,7 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
      *
      * A plugin exploring a mispredicted path executes whatever instructions
      * the guest has there, and the wrong-path policy is to continue past a
-     * syscall at its architectural fall-through rather than end the walk — a
+     * syscall at its architectural fall-through rather than end the walk -- a
      * real out-of-order core fetches around it and squashes at retire.  What
      * a real core also does is never let it commit, and in *-linux-user a
      * syscall commits against the HOST: it would write files, send packets,

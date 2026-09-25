@@ -4410,16 +4410,6 @@ TRANS_FEAT(STZ2G, aa64_mte_insn_reg, do_STG, a, true, true)
 
 typedef void SetFn(TCGv_env, TCGv_i32, TCGv_i32);
 
-#ifdef CONFIG_PLUGIN
-/*
- * Offset of a CPUState plugin field relative to tcg_env (which points at
- * CPUArchState) -- same relocation target/i386's REP_PLUGIN_OFF and the
- * icount/can_do_io accessors in accel/tcg/translator.c use.
- */
-#define MOPS_PLUGIN_OFF(field)                                          \
-    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
-#endif
-
 /*
  * Publish which instruction the FEAT_MOPS per-execution facts describe
  * (see mops_plugin_entry() in helper-a64.c).  Stored at translation time
@@ -4427,6 +4417,19 @@ typedef void SetFn(TCGv_env, TCGv_i32, TCGv_i32);
  * consumer reading the facts later can refuse ones that belong to a
  * different instruction.  Nothing is generated without a plugin, exactly
  * like x86's do_gen_rep publications.
+ *
+ * FEAT_MOPS publishes through the same CPUState plugin_rep_* fields as x86
+ * REP, but its fan-out unit is one memory access, not an architectural
+ * iteration: plugin_rep_iters counts the accesses this execution reported
+ * (each derived from the helper's own byte progress; see
+ * arm_plugin_emit_pieces()).  plugin_rep_bytes is the architectural anchor
+ * for that count -- the bytes this execution moved, accumulated from the
+ * step helpers' returns, i.e. the instruction's own size-register
+ * decrement -- so a consumer can verify the delivered access stream
+ * against register-derived truth.  plugin_mops_report carries a pending
+ * partially-reported run across the cpu_loop_exit and fault splits of one
+ * bulk instruction, which keeps the reported decomposition identical
+ * however the execution was split.
  */
 static void gen_mops_plugin_pc(DisasContext *s)
 {
@@ -4435,17 +4438,17 @@ static void gen_mops_plugin_pc(DisasContext *s)
         return;
     }
     tcg_gen_st_i64(tcg_constant_i64(s->pc_curr), tcg_env,
-                   MOPS_PLUGIN_OFF(plugin_rep_pc));
+                   CPUSTATE_OFF_FROM_ENV(plugin_rep_pc));
 #endif
 }
 
 /*
- * Under a plugin, end the TB after a FEAT_MOPS bulk instruction — the
+ * Under a plugin, end the TB after a FEAT_MOPS bulk instruction -- the
  * shape x86 already gives a REP.  It is what keeps the published facts
  * unambiguous (one bulk op per TB, so the per-vCPU fields always
  * describe the block being attributed), lets a consumer's fault
  * machinery find a faulting bulk op in the block it interrupted (the
- * op is its TB's terminator, not buried mid-block — a SETP/SETM/SETE
+ * op is its TB's terminator, not buried mid-block -- a SETP/SETM/SETE
  * trio no longer shares one TB), and makes a split execution's
  * instruction accounting exact (the re-entered TB contains only the
  * bulk op itself, never a tail of never-executed successors).  The
@@ -10468,7 +10471,7 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
  * dropped insns never sync the pc, so pc_save is stable under CF_PCREL.  A
  * BTYPE reset spill the first dropped insn emitted is dropped with it: env
  * keeps the pending BTYPE, the retreat TB exits without touching it, and the
- * next TB — which re-translates that insn — performs its own check and
+ * next TB -- which re-translates that insn -- performs its own check and
  * reset.
  */
 static bool aarch64_tr_nosplit_retreat(DisasContextBase *dcbase,

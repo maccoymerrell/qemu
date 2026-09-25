@@ -25,7 +25,7 @@
 #include "exec/cputlb.h"
 #include "plugin-diag.h"
 
-#if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if defined(TARGET_RISCV) && !defined(CONFIG_USER_ONLY)
 /*
  * Render @bits into the CALLER's buffer.  Not a shared static: the one line
  * below names two different masks, and a single buffer makes both names show
@@ -152,7 +152,7 @@ void cst_miperase_check(const CPURISCVState *env,
 }
 #endif
 
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#if !defined(CONFIG_USER_ONLY)
 /*
  * Wrong-path write-leak detector (diagnostic, gated on CST_WPROTECT=<delay_s>).
  * Host-MMU based: write-protect ALL guest RAM for the duration of each wrong-

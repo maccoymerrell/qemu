@@ -15,7 +15,6 @@
 #include "qapi/error.h"
 #include "migration/blocker.h"
 #include "hw/boards.h"
-#include "exec/target_page.h"
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
 
@@ -106,7 +105,6 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
         return g_intern_static_string("RAM");
     }
 }
-
 
 /*
  * Time control

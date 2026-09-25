@@ -25,18 +25,11 @@
 #include "accel/tcg/cpu-ops.h"
 
 /*
- * Ordered per-vCPU path-event producer (see QemuPluginCpuEventQueue in
- * hw/core/cpu.h).  Called from the fault push/pop helpers and the async
- * delivery/close chokepoints, always on the owning vCPU thread.  (asid,
- * priv) are stamped HERE, at the event instant, via the same per-target
- * hook that backs qemu_plugin_get_asid — a later drain sees the address
- * space the event actually happened in, not whatever is live at the next
- * TB boundary.
- */
-/* Synchronous ASID-write hook (qemu_plugin_register_asid_write_cb).
+ * Synchronous ASID-write hook (qemu_plugin_register_asid_write_cb).
  * A single slot suffices: the path-event machinery is already
  * effectively single-consumer (the queue drain hands the whole buffer
- * to whichever plugin asks). */
+ * to whichever plugin asks).
+ */
 static qemu_plugin_asid_write_cb_t asid_write_hook;
 
 /*
@@ -95,7 +88,7 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
  * a vCPU thread, because everything a plugin needs to close a capture
  * (guest memory, registers, privilege level, address space) resolves
  * through current_cpu.  qemu_plugin_atexit_cb() cannot offer any of that
- * — it runs from atexit(3), after qemu_cleanup() has stopped the vCPUs
+ * -- it runs from atexit(3), after qemu_cleanup() has stopped the vCPUs
  * and torn the machine down, on a thread where current_cpu is NULL.
  */
 static qemu_plugin_vm_shutdown_cb_t vm_shutdown_hook;
@@ -132,7 +125,7 @@ int plugin_declared_version_floor(void)
  * is distinguishable from the previous one.  Where the change itself went
  * in without moving QEMU_PLUGIN_VERSION, the version in force at the time
  * names two incompatible ABIs and cannot be honoured either way, so @since
- * is the NEXT version — the ambiguous one is refused with the rest.
+ * is the NEXT version -- the ambiguous one is refused with the rest.
  *
  * Defined below, next to the plugin registry it reads.
  */
@@ -162,7 +155,7 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
  * Idempotent because the shutdown REQUEST and the main loop's shutdown
  * ACKNOWLEDGE are BOTH dispatch points, and neither alone covers every
  * cause: a guest poweroff and a monitor/QMP request go through
- * qemu_system_shutdown_request(), while a host signal does not — the
+ * qemu_system_shutdown_request(), while a host signal does not -- the
  * signal handler cannot call it and sets shutdown_requested directly, so
  * the main loop is the only place SIGINT/SIGTERM is seen.  Whichever
  * arrives first wins; the other is a no-op.
@@ -195,8 +188,8 @@ bool qemu_plugin_vm_shutdown_armed(void)
 
 /*
  * Machine-reset hook (qemu_plugin_register_vm_reset_cb).  Same seam as the
- * shutdown hook — the plugin must see the machine while it is still
- * assembled — but a reset is NOT terminal: the machine boots again in the
+ * shutdown hook -- the plugin must see the machine while it is still
+ * assembled -- but a reset is NOT terminal: the machine boots again in the
  * same process, and a guest can do that more than once.  So delivery is
  * per-event rather than once-per-run: the in-flight exchange folds only
  * CONCURRENT duplicates of the same teardown (two vCPUs racing their reset
@@ -244,8 +237,16 @@ bool qemu_plugin_vm_reset_armed(void)
 static uint64_t current_task_off;
 static bool current_task_off_set;
 
-void qemu_plugin_current_task_offset_store(uint64_t offset)
+void qemu_plugin_set_current_task_offset(uint64_t offset)
 {
+    /*
+     * Consumed by targets whose kernels keep no per-task pointer in a
+     * register at kernel privilege -- today x86-64's thread-pointer hooks.
+     * Deliberately accepted on every target and in user mode: the
+     * declaration is inert where nothing consumes it, and the declaring
+     * plugin -- which knows the target it runs on -- is the right place to
+     * tell its user the hint has no consumer here.
+     */
     current_task_off = offset;
     current_task_off_set = true;
 }
@@ -292,10 +293,12 @@ QEMU_DISABLE_CFI
 void qemu_plugin_devio_doorbell(uint64_t dev_token)
 {
     if (devio_doorbell_hook) {
-        /* The virtqueue kick runs in vCPU context (an MMIO/PIO write the
+        /*
+         * The virtqueue kick runs in vCPU context (an MMIO/PIO write the
          * guest driver performs), so current_cpu is the doorbell-writing
-         * vCPU — the one datum the later, possibly main-loop, issue hook
-         * cannot recover.  Report -1 if somehow not on a vCPU thread. */
+         * vCPU -- the one datum the later, possibly main-loop, issue hook
+         * cannot recover.  Report -1 if somehow not on a vCPU thread.
+         */
         int vcpu_index = current_cpu ? current_cpu->cpu_index : -1;
         devio_doorbell_hook(vcpu_index, dev_token);
     }
@@ -306,10 +309,12 @@ uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes,
                                  uint64_t dev_token)
 {
     if (devio_start_hook) {
-        /* current_cpu is the issuing vCPU only when the block layer is
+        /*
+         * current_cpu is the issuing vCPU only when the block layer is
          * entered synchronously on a vCPU thread; the canonical no-iothread
          * virtio-blk path defers to the main loop, where it is NULL (-1).
-         * The plugin recovers the true owner from @dev_token instead. */
+         * The plugin recovers the true owner from @dev_token instead.
+         */
         int vcpu_index = current_cpu ? current_cpu->cpu_index : -1;
         return devio_start_hook(vcpu_index, dir, offset, bytes, dev_token);
     }
@@ -342,15 +347,10 @@ void qemu_plugin_devio_stop(uint64_t request_id)
 static qemu_plugin_u64 evq_pending_slot;
 static bool evq_pending_slot_set;
 
-void plugin_set_evq_pending_slot(qemu_plugin_u64 slot, bool set)
+void plugin_set_evq_pending_slot(qemu_plugin_u64 slot)
 {
     evq_pending_slot = slot;
-    evq_pending_slot_set = set;
-}
-
-bool plugin_evq_pending_slot_armed(void)
-{
-    return evq_pending_slot_set;
+    evq_pending_slot_set = true;
 }
 
 void plugin_evq_note_drained(CPUState *cpu)
@@ -360,6 +360,15 @@ void plugin_evq_note_drained(CPUState *cpu)
     }
 }
 
+/*
+ * Ordered per-vCPU path-event producer (see QemuPluginCpuEventQueue in
+ * hw/core/cpu.h).  Called from the fault push/pop helpers and the async
+ * delivery/close chokepoints, always on the owning vCPU thread.  (asid,
+ * priv) are stamped HERE, at the event instant, via the same per-target
+ * hook that backs qemu_plugin_get_asid -- a later drain sees the address
+ * space the event actually happened in, not whatever is live at the next
+ * TB boundary.
+ */
 QEMU_DISABLE_CFI
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
@@ -373,7 +382,7 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * The synchronous ASID-write hook fires BEFORE the queue-enabled
      * check: it exists precisely for phases where nothing drains the
      * queue (so it stays disabled) but the plugin still needs to
-     * observe address-space transitions — e.g. fast-forward counting
+     * observe address-space transitions -- e.g. fast-forward counting
      * gated on a pinned process.  Same spec-mode suppression as the
      * queued event; the value passed is the just-committed one the
      * per-target state hook reports.
@@ -408,8 +417,8 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * The thread pointer at the event instant, with whether it names the
      * executing thread here (user privilege always does; above it the
      * target's tracks-current hook answers for this exact state).  For an
-     * ASYNC_ENTER this is the DELIVERING thread — the do_interrupt hooks
-     * push before any guest state switches — which the consumer cannot
+     * ASYNC_ENTER this is the DELIVERING thread -- the do_interrupt hooks
+     * push before any guest state switches -- which the consumer cannot
      * recover at drain time: by then the vCPU is inside the handler, and
      * on an SMP guest the delivered-into context may never be sampled
      * again.
@@ -455,7 +464,7 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * STRUCTURAL TRIPWIRE.  Never a cap: nothing is dropped, truncated or
      * rate-limited here.  Reaching this length means the per-TB drain point
      * argued for at CPU_PLUGIN_EVQ_STRUCTURAL_MAX did not happen, which is a
-     * broken invariant in the tracer, so the run dies loudly rather than
+     * broken invariant in the consuming plugin, so the run dies loudly rather than
      * silently accumulating (and silently costing one guest instruction the
      * whole backlog's worth of work).  Everything needed to diagnose it in
      * one shot is printed.
@@ -467,7 +476,7 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                 "len=%u > %u cap=%u pushes=%" PRIu64 " drains=%" PRIu64
                 " kind=%d pc=0x%" PRIx64 " slot_armed=%d\n"
                 "  (the consumer's per-TB drain point did not run; this is a "
-                "tracer bug, not a workload)\n",
+                "plugin bug, not a workload)\n",
                 cpu->cpu_index, q->len, (unsigned)CPU_PLUGIN_EVQ_STRUCTURAL_MAX,
                 q->cap, q->n_push, q->n_drain, kind, pc,
                 (int)evq_pending_slot_set);
@@ -486,14 +495,14 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
      * producer on the outermost edge (!plugin_in_async_int), and the only
      * thing that clears it is the departure PC being re-fetched, in the
      * departure thread, ON THIS vCPU.  Latching it while the event queue is
-     * disabled — the whole pre-marker boot, and any inter-segment gap —
+     * disabled -- the whole pre-marker boot, and any inter-segment gap --
      * therefore arms a window the plugin never learns of and cannot reap: if
      * that departure context never resumes here (a boot/idle/kthread context
      * on a vCPU the guest later parks, the common case once there is more
      * than one vCPU), the flag stays true for the rest of the run and every
      * later interrupt is swallowed by the edge gate.
      *
-     * With no consumer there is nothing for the window to mean: the tracer's
+     * With no consumer there is nothing for the window to mean: the plugin's
      * own readers (qemu_plugin_in_async_int) only act while it is emitting,
      * which is exactly when the queue is enabled.
      */
@@ -513,7 +522,7 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
      * (exception delivery does not touch it; only the guest kernel's
      * context switch does), and a genuine resume restores exactly this
      * value before the exception return lands on @departure_pc.  Targets
-     * without the hook record 0 on both sides — the return check then
+     * without the hook record 0 on both sides -- the return check then
      * degrades to bare PC equality.
      */
     cpu->plugin_async_departure_tp =
@@ -523,7 +532,7 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
      * The departure ADDRESS SPACE completes the context discriminator: two
      * no-TLS twin processes can read the SAME thread-pointer value and
      * collide on (pc, tp), but each runs on its own root, which the kernel
-     * — like the thread pointer — restores before the exception return
+     * -- like the thread pointer -- restores before the exception return
      * (see cpu.h).
      */
     if (ops && ops->get_plugin_state) {
@@ -1090,9 +1099,9 @@ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1, uint64_t a2,
  * but the call itself is NEVER performed: in *-linux-user a syscall is served
  * by the host, so performing one speculatively would write files, send packets
  * or kill the process on a path the guest never takes.  Suppression is
- * structural — every target's syscall instruction unwinds through
+ * structural -- every target's syscall instruction unwinds through
  * cpu_plugin_exec_tb()'s own landing pad, so do_syscall() is unreachable while
- * cpu->plugin_spec_mode is set — and this counter is the standing proof: the
+ * cpu->plugin_spec_mode is set -- and this counter is the standing proof: the
  * guard in do_syscall() bumps it instead of executing, so a non-zero value
  * means the structural suppression developed a hole.  Read through
  * qemu_plugin_spec_syscall_blocked_count().

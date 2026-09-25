@@ -387,7 +387,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
              * translation footprint exceeds it (only reachable with a very
              * deep wrong-path walk; the reserve is sized for an ordinary
              * one).  End the
-             * walk here — the flush is already owed.  Logged, never silent.
+             * walk here -- the flush is already owed.  Logged, never silent.
              * Return NULL with mmap held: the plugin exec callers unlock
              * after tb_gen_code and handle NULL (no double-unlock).
              */

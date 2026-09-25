@@ -147,8 +147,8 @@ static TCGv_ptr gen_plugin_u64_ptr(qemu_plugin_u64 entry)
      * cpu_index (single-vcpu fast path).  Constant temps are shared by
      * value across the whole TB, so they must never be written: scaling
      * in place would silently retarget every later use of that integer
-     * constant in the TB — plugin scoreboard addresses compound
-     * ×entry_size per op and walk off the array (observed as SIGSEGV in
+     * constant in the TB -- plugin scoreboard addresses compound
+     * xentry_size per op and walk off the array (observed as SIGSEGV in
      * code_gen_buffer), and the cpu_index argument delivered to
      * callbacks becomes the scaled garbage.  Scale into a fresh temp.
      */
@@ -464,7 +464,7 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     pc = db->pc_next;
     insn->vaddr = pc;
     /*
-     * Cleared per-insn — set by plugin_gen_record_branch_target() if
+     * Cleared per-insn -- set by plugin_gen_record_branch_target() if
      * the target translator resolves a static branch target while
      * decoding this instruction.  Insn structs are reused across
      * translations, so failing to reset would leak a stale target

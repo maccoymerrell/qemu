@@ -58,7 +58,7 @@ static void vagency_warn_once(int *flag, const char *what)
 {
     if (qatomic_cmpxchg(flag, 0, 1) == 0) {
         fprintf(stderr, "qemu: vclock-agency: %s (invariant violated; "
-                "counting, see vclock_agency_counters)\n", what);
+                "counting, totals reported at exit)\n", what);
     }
 }
 
@@ -212,7 +212,7 @@ void vclock_agency_boundary_end(void)
     vagency_in_boundary_tls--;
 }
 
-bool vclock_agency_in_boundary(void)
+static bool vclock_agency_in_boundary(void)
 {
     return vagency_in_boundary_tls > 0;
 }
@@ -270,13 +270,4 @@ void vclock_agency_note_vpass(bool main_list)
                           "outside a vCPU boundary while engaged -- the "
                           "sole-consumer invariant broke");
     }
-}
-
-void vclock_agency_counters(uint64_t out[5])
-{
-    out[0] = qatomic_read(&vagency_consume_runs);
-    out[1] = qatomic_read(&vagency_spec_mode_skips);
-    out[2] = qatomic_read(&vagency_stall_fence_hits);
-    out[3] = qatomic_read(&vagency_foreign_vruns);
-    out[4] = qatomic_read(&vagency_aio_virtual_arms);
 }

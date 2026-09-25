@@ -118,14 +118,16 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
                                  bool *mmu_on)
 {
     CPUX86State *env = cpu_env(cs);
-    /* CPL: 0 = kernel … 3 = user.  Normalize so 0 = user (least
-     * privileged), larger = more privileged. */
+    /*
+     * CPL: 0 = kernel ... 3 = user.  Normalize so 0 = user (least
+     * privileged), larger = more privileged.
+     */
     int cpl = (env->hflags & HF_CPL_MASK) >> HF_CPL_SHIFT;
     *priv = 3 - cpl;
     /*
      * CR3 = current page-table base / address-space id, masking bit 63
      * (PCID NOFLUSH).  Architecturally bit 63 is a command bit on the
-     * MOV-to-CR3 write — "skip the TLB flush" — not state: MOV from CR3
+     * MOV-to-CR3 write -- "skip the TLB flush" -- not state: MOV from CR3
      * always reads it as 0, so it can never distinguish address spaces
      * and masking it is unconditionally safe.  TCG does not advertise
      * PCID (TCG_EXT_FEATURES), so the mask guards the verbatim CR3 image
@@ -140,7 +142,25 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
 }
 
-static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPUX86State *env = cpu_env(cs);
+    /*
+     * Long mode: the linear address space is split into a low (user) and a
+     * high (kernel) canonical half with a non-canonical hole between them.
+     * The split sits at the sign bit of the paging width -- 48-bit (LA48) or
+     * 57-bit (LA57, CR4.LA57) -- so the kernel half is exactly the addresses
+     * whose bits above that sign bit are all ones.  Deriving the boundary
+     * from the live paging width (rather than a fixed constant) keeps the
+     * classification correct under LA57.  Outside long mode there is no such
+     * canonical kernel half (32-bit paging splits user/kernel by an
+     * OS-chosen boundary the hardware does not define), so report user.
+     */
+    if (!(env->hflags & HF_LMA_MASK)) {
+        return false;
+    }
+    return vaddr_in_upper_half(vaddr, (env->cr[4] & CR4_LA57_MASK) ? 57 : 48);
+}
 
 /*
  * Resolve the guest kernel's `current` at CPL0 through the per-CPU
@@ -151,7 +171,7 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
  *
  * The contract, as the kernel source states it (Linux 6.6/6.12,
  * arch/x86/entry/entry_64.S paranoid_entry): "the kernel enforces that
- * negative GSBASE values indicate kernel GSBASE" — in-kernel, GS.base
+ * negative GSBASE values indicate kernel GSBASE" -- in-kernel, GS.base
  * is the per-CPU base (a kernel VA), swapped in by SWAPGS at every
  * entry from user; the user GS base is 0 or a user VA
  * (do_arch_prctl_64 refuses ARCH_SET_GS >= TASK_SIZE_MAX, and the
@@ -172,10 +192,10 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
  *    swapgs_restore_regs_and_return_to_usermode's tail); and
  *    asm_load_gs_index's deliberate user-GS bracket.  GS.base holds a
  *    user value there, fails the kernel-VA test, and no context switch
- *    can occur inside such a window — inheritance is exact, the same
+ *    can occur inside such a window -- inheritance is exact, the same
  *    treatment the AArch64/MIPS early-entry windows get.
  *  - A failed or unmapped load (a PTI user page table in the entry
- *    window — canonical runs are nopti — or pre-paging early boot).
+ *    window -- canonical runs are nopti -- or pre-paging early boot).
  *  - A loaded value that is not a kernel VA (per-CPU area not yet
  *    initialised at early boot).
  *
@@ -191,18 +211,20 @@ static bool x86_kernel_current_task(CPUState *cs, uint64_t *task)
     CPUX86State *env = cpu_env(cs);
     bool declared;
     uint64_t off = qemu_plugin_current_task_offset(&declared);
+    uint64_t gsbase = env->segs[R_GS].base;
+    uint8_t buf[8];
+    uint64_t t;
+
     if (!declared) {
         return false;
     }
-    uint64_t gsbase = env->segs[R_GS].base;
     if (!x86_vaddr_is_kernel(cs, gsbase)) {
         return false;                        /* swapgs window / early boot */
     }
-    uint8_t buf[8];
     if (cpu_memory_rw_debug(cs, gsbase + off, buf, sizeof(buf), false) < 0) {
         return false;
     }
-    uint64_t t = ldq_le_p(buf);
+    t = ldq_le_p(buf);
     if (!x86_vaddr_is_kernel(cs, t)) {
         return false;
     }
@@ -215,18 +237,18 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
     CPUX86State *env = cpu_env(cs);
     /*
      * The user TLS base the kernel context-switches per thread: FS.base
-     * for a 64-bit task, GS.base for a 32-bit (compat/legacy) one — the
+     * for a 64-bit task, GS.base for a 32-bit (compat/legacy) one -- the
      * i386 TLS ABI points GS at a set_thread_area GDT descriptor, whose
      * base the segment cache carries.  Selected by the current CS.L, so
      * sample at user privilege (in-kernel the bases are mid-switch and
      * GS is swapped onto the kernel's per-CPU base).
      *
-     * FS.base == 0 at CPL0 is a task with no TLS identity — a kernel
+     * FS.base == 0 at CPL0 is a task with no TLS identity -- a kernel
      * thread, a per-CPU idle task, or a TLS-less user task's kernel
      * excursion: distinct program paths that would otherwise all
      * collapse onto the one identity 0.  Fall through to the kernel's
-     * own per-task contract — `current` through the kernel GS base at
-     * the plugin-declared per-image offset (x86_kernel_current_task) —
+     * own per-task contract -- `current` through the kernel GS base at
+     * the plugin-declared per-image offset (x86_kernel_current_task) --
      * exactly as AArch64 falls back to SP_EL0-as-current and MIPS to
      * $28-as-current_thread_info.  The kernel CS is long-mode, so CPL0
      * always takes the CS64 arm; a compat task's kernel excursion
@@ -249,7 +271,8 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
 static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
-    /* FS.base (GS.base for a compat task) is user TLS state; the kernel's
+    /*
+     * FS.base (GS.base for a compat task) is user TLS state; the kernel's
      * own per-CPU base lives in the swapped GS, so the user register is
      * reloaded from the incoming task at every switch and untouched in
      * between, at any CPL.  A non-zero read therefore names the current
@@ -258,13 +281,14 @@ static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
      * The one state that cannot vouch for itself is CPL0 with
      * FS.base == 0: the register names nothing there, and whether the
      * per-CPU fallback can answer instead is a property of THIS sample
-     * (kernel GS in, mapping readable, value task-shaped — see
+     * (kernel GS in, mapping readable, value task-shaped -- see
      * x86_kernel_current_task).  Mirror the get-hook exactly: true iff
      * the value the get-hook would return actually names the task.
      * With no declared offset this reports true and the get-hook
-     * returns 0 — the pre-hint contract, byte-for-byte, in which every
+     * returns 0 -- the pre-hint contract, byte-for-byte, in which every
      * TLS-less task shares the one identity 0 (honest indistinctness
-     * for lack of a per-image offset, not a fabricated identity). */
+     * for lack of a per-image offset, not a fabricated identity).
+     */
     if ((env->hflags & HF_CS64_MASK) &&
         (env->hflags & HF_CPL_MASK) == 0 &&
         env->segs[R_FS].base == 0) {
@@ -278,29 +302,8 @@ static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
     return true;
 }
 
-static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
-{
-    CPUX86State *env = cpu_env(cs);
-    /*
-     * Long mode: the linear address space is split into a low (user) and a
-     * high (kernel) canonical half with a non-canonical hole between them.
-     * The split sits at the sign bit of the paging width — 48-bit (LA48) or
-     * 57-bit (LA57, CR4.LA57) — so the kernel half is exactly the addresses
-     * whose bits above that sign bit are all ones.  Deriving the boundary
-     * from the live paging width (rather than a fixed constant) keeps the
-     * classification correct under LA57.  Outside long mode there is no such
-     * canonical kernel half (32-bit paging splits user/kernel by an
-     * OS-chosen boundary the hardware does not define), so report user.
-     */
-    if (!(env->hflags & HF_LMA_MASK)) {
-        return false;
-    }
-    unsigned va_bits = (env->cr[4] & CR4_LA57_MASK) ? 57 : 48;
-    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
-}
-
 /*
- * TCGCPUOps::spec_clock_resync for x86 — see the contract in
+ * TCGCPUOps::spec_clock_resync for x86 -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * x86's audit of guest-observable time sources:
@@ -313,7 +316,7 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * which the freeze stops and the thaw resumes at the same value: a deadline
  * expressed in frozen-clock ns is still the same deadline afterwards, so
  * those timers need no re-arm.  None of them lives in CPUX86State either, so
- * the wrong-path register restore cannot roll one back — x86 has no
+ * the wrong-path register restore cannot roll one back -- x86 has no
  * architectural compare register shadowing a host timer the way Arm's
  * CNTV_CVAL, RISC-V's stimecmp and MIPS's CP0_Compare do.  (A speculative MSR
  * write to IA32_TSC_DEADLINE reaches apic_handle_tsc_deadline, but wrong-path

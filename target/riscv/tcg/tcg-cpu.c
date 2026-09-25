@@ -140,12 +140,40 @@ static void riscv_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     CPURISCVState *env = cpu_env(cs);
     *priv = env->priv;     /* PRV_U(0) = user, PRV_S(1)/PRV_M(3) privileged */
     *asid = env->satp;     /* SATP: page-table base + ASID */
-    /* Translation active iff not M-mode and SATP selects a paging mode
-     * (SATP != 0 ⇒ MODE field non-Bare). */
+    /*
+     * Translation active iff not M-mode and SATP selects a paging mode
+     * (SATP != 0 => MODE field non-Bare).
+     */
     *mmu_on = (env->priv != PRV_M) && (env->satp != 0);
 }
 
-static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPURISCVState *env = cpu_env(cs);
+    unsigned va_bits;
+
+    /*
+     * A paged RV64 VA must be sign-extended (canonical) from the width of the
+     * active SATP mode: Sv39 -> 39 bits, Sv48 -> 48, Sv57 -> 57.  User VAs
+     * occupy the low canonical half (sign bit clear); the kernel half is the
+     * high, all-ones-extended range (sign bit set), where the OS maps kernel
+     * text.  The guest PC reaches the plugin already sign-extended to 64 bits,
+     * so "kernel" is exactly the addresses whose bits above the sign bit are
+     * all ones -- a threshold derived from the live paging width.  With paging
+     * Bare, in M-mode (translation bypassed), or on RV32 (not a system-mode
+     * target; its 32-bit VA is not 64-bit sign-extended), there is no such
+     * kernel/user split -- report user. */
+    if (env->priv == PRV_M || riscv_cpu_mxl(env) == MXL_RV32) {
+        return false;
+    }
+    switch (get_field(env->satp, SATP64_MODE)) {
+    case VM_1_10_SV39: va_bits = 39; break;
+    case VM_1_10_SV48: va_bits = 48; break;
+    case VM_1_10_SV57: va_bits = 57; break;
+    default:           return false;   /* Bare / unknown: do not classify */
+    }
+    return vaddr_in_upper_half(vaddr, va_bits);
+}
 
 static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
 {
@@ -165,7 +193,7 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
      *                       tp = user TLS,   sscratch = task
      *   entry, post-swap, before `csrw sscratch, x0` (.Lsave_context is a
      *   BRANCH TARGET, so a TB starts inside this window on every trap from
-     *   user — it is not a single-step-only sliver):
+     *   user -- it is not a single-step-only sliver):
      *                       tp = task,       sscratch = user TLS
      *   in kernel, steady:  tp = task,       sscratch = 0
      *   kernel->kernel trap, between the swap and `csrr tp, CSR_SCRATCH`:
@@ -204,42 +232,17 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
 static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPURISCVState *env = cpu_env(cs);
-    /* The current-task rule above holds at U/S privilege outside
+    /*
+     * The current-task rule above holds at U/S privilege outside
      * H-extension virtualization.  M-mode firmware runs on its own tp
      * (OpenSBI swaps it with mscratch) with the S-mode sscratch parked at
-     * 0, so a sample there names the firmware, not a guest task. */
+     * 0, so a sample there names the firmware, not a guest task.
+     */
     return !env->virt_enabled && env->priv <= PRV_S;
 }
 
-static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
-{
-    CPURISCVState *env = cpu_env(cs);
-    /*
-     * A paged RV64 VA must be sign-extended (canonical) from the width of the
-     * active SATP mode: Sv39 → 39 bits, Sv48 → 48, Sv57 → 57.  User VAs
-     * occupy the low canonical half (sign bit clear); the kernel half is the
-     * high, all-ones-extended range (sign bit set), where the OS maps kernel
-     * text.  The guest PC reaches the plugin already sign-extended to 64 bits,
-     * so "kernel" is exactly the addresses whose bits above the sign bit are
-     * all ones — a threshold derived from the live paging width.  With paging
-     * Bare, in M-mode (translation bypassed), or on RV32 (not a system-mode
-     * target; its 32-bit VA is not 64-bit sign-extended), there is no such
-     * kernel/user split — report user. */
-    if (env->priv == PRV_M || riscv_cpu_mxl(env) == MXL_RV32) {
-        return false;
-    }
-    unsigned va_bits;
-    switch (get_field(env->satp, SATP64_MODE)) {
-    case VM_1_10_SV39: va_bits = 39; break;
-    case VM_1_10_SV48: va_bits = 48; break;
-    case VM_1_10_SV57: va_bits = 57; break;
-    default:           return false;   /* Bare / unknown: do not classify */
-    }
-    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
-}
-
 /*
- * TCGCPUOps::spec_clock_resync for RISC-V — see the contract in
+ * TCGCPUOps::spec_clock_resync for RISC-V -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * RISC-V's audit.  The guest reads time through the `time` CSR, which is
@@ -250,7 +253,7 @@ static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * does not re-arm itself), and the Sstc env->stimer/env->vstimer behind
  * stimecmp/vstimecmp (architectural registers inside the rolled-back
  * snapshot).  All three are re-armed from their compare registers, and any
- * expiry the excursion gates suppressed is re-delivered, by
+ * expiry the vstimer gate deferred or the restore erased is re-delivered, by
  * riscv_cpu_plugin_resync_timers.
  *
  * The pending-interrupt side has two halves.  CPU_INTERRUPT_HARD is

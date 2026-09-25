@@ -53,6 +53,26 @@ struct HeaderFacts {
 int isa_for_target(const std::string &target_name);
 
 /*
+ * The registers an instruction may read and write, as QEMU states them
+ * (qemu_plugin_insn_reg_list), in the wire's GenericRegId (section 5.4):
+ * @id per slot, first appearance first, the order the dependency and
+ * lane masks index.  @opaque names what the statement could not state.
+ */
+struct Regs {
+    std::vector<uint8_t> src, dst;
+    const char *opaque = nullptr;
+    bool operator==(const Regs &o) const { return src == o.src && dst == o.dst; }
+};
+/* GenericRegId values this writer assigns, in section 5.4's bands */
+enum : uint8_t {
+    kRegGpr = 1, kRegAccHi = 61, kRegFpr = 65, kRegVec = 129, kRegPred = 193,
+    kRegSeg = 225, kRegCtrl = 231, kRegBound = 233, kRegAcc = 237,
+    kRegZero = 241, kRegMatrix, kRegSys, kRegFcsr, kRegVctrl, kRegTls,
+    kRegVstart, kRegDspctrl, kRegVcsr, kRegSp, kRegFlags, kRegIp, kRegLr,
+    kRegFp,
+};
+
+/*
  * One template (section 6): a true basic block as a pc/size/bytes list.
  * @terminated says its last instruction was learned to end a block, which
  * is all fall_through_pc states; nothing else about the branch is claimed.
@@ -67,6 +87,7 @@ int isa_for_target(const std::string &target_name);
 struct WireInsn {
     uint64_t pc; uint8_t size; const uint8_t *bytes; uint32_t id; bool fanout;
     uint8_t dep_mask_len[2];
+    const Regs *regs;
 };
 struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
 

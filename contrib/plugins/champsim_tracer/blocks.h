@@ -54,6 +54,7 @@ struct TbShape {
     /* As translated, until its first execution interns it (absorb()). */
     std::vector<Insn> raw;
     std::vector<size_t> traps;  /* conditional traps the translator lowered */
+    std::vector<Regs> regs;     /* per insn, the register statement */
 };
 
 /* The engine's account of the last bulk (fan-out) instruction it ran. */
@@ -74,9 +75,19 @@ public:
         if (it.second) {
             insns_.push_back(&it.first->first);
             marks_.push_back(0);
+            regs.emplace_back();
+            seen_.push_back(false);
         }
         return it.first->second;
     }
+
+    /*
+     * Per instruction, the register statement of its first translation;
+     * a later translation stating another list is a variance, kept with
+     * the list it stated (the reg_list_variance tripwire).
+     */
+    std::vector<Regs> regs;
+    std::vector<std::pair<InsnId, Regs>> variance;
     const Insn &insn(InsnId id) const { return *insns_[id]; }
 
     /*
@@ -86,8 +97,15 @@ public:
      */
     void absorb(TbShape &tb)
     {
-        for (const Insn &i : tb.raw) {
-            tb.insns.push_back(intern(i));
+        for (size_t k = 0; k < tb.raw.size(); k++) {
+            InsnId id = intern(tb.raw[k]);
+            tb.insns.push_back(id);
+            if (!seen_[id]) {
+                regs[id] = tb.regs[k];
+                seen_[id] = true;
+            } else if (!(regs[id] == tb.regs[k])) {
+                variance.push_back({ id, tb.regs[k] });
+            }
         }
         for (size_t t : tb.traps) {
             ends_block(tb.insns[t]);    /* a trap, in place */
@@ -427,7 +445,7 @@ private:
         for (InsnId id : sh) {
             const Insn &i = insn(id);
             t.insns.push_back({ i.pc, i.size, i.bytes, id,
-                                (marks_[id] & kFanout) != 0, {} });
+                                (marks_[id] & kFanout) != 0, {}, &regs[id] });
         }
         t.terminated = ends(sh.back());
         return t;
@@ -437,6 +455,7 @@ private:
     std::vector<const Insn *> insns_;
     /* per insn: known to end a block; TB-final and assembled straight on */
     std::vector<uint8_t> marks_;
+    std::vector<bool> seen_;
     std::map<Shape, uint32_t> shape_ids_;
     std::vector<const Shape *> shapes_;
     std::map<uint32_t, Strand> strands_;

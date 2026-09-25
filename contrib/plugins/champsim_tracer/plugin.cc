@@ -10,7 +10,8 @@
  * execution and writes the correct-path body: true basic blocks as
  * pc/size templates and one entry per block run (blocks.h), with the
  * memory accesses the memory callbacks state (address, size, direction,
- * value), and after each block whose transfer has a nameable alternative a
+ * value), the registers QEMU states each instruction may read and write,
+ * and after each block whose transfer has a nameable alternative a
  * wrong-path chain of the same facts (excursion()).  It claims nothing else
  * about an instruction; system mode keeps an empty body.
  *
@@ -21,8 +22,10 @@
  *   wp=0|1           wrong-path chains (default 1)
  *   wpdepth=<n>      wrong-path instructions per chain (default 64)
  */
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iterator>
@@ -74,6 +77,7 @@ struct Session {
     /* per vCPU: a TB whose transfer's block is still open (a MIPS slot next) */
     std::map<unsigned int, const cst::TbShape *> xfer;
     WpStats wps{};
+    uint64_t overflow = 0;      /* register slots past the capture cap */
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -153,6 +157,163 @@ void memop_tripwire(const cst::MemopCensus &census, const std::string &path)
 }
 
 /*
+ * The wire's GenericRegId (format.rst 5.4) for register @r of TraceISA
+ * @isa: this plugin's vocabulary over QEMU's statement of identity.  The
+ * stack, frame and link registers take the common ids; x86 GPRs follow the
+ * wire's A C D B SI DI R8.. numbering, segments its cs ds es fs gs ss.
+ */
+uint8_t reg_id(int isa, const qemu_plugin_insn_reg &r)
+{
+    static const std::map<std::string, uint8_t> ctl = {
+        { "fctrl", cst::kRegFcsr }, { "fstat", cst::kRegFcsr },
+        { "ftag", cst::kRegFcsr }, { "mxcsr", cst::kRegFcsr },
+        { "fpsr", cst::kRegFcsr }, { "fpcr", cst::kRegFcsr },
+        { "FPSR", cst::kRegFcsr }, { "FPCR", cst::kRegFcsr },
+        { "frm", cst::kRegFcsr }, { "fcr31", cst::kRegFcsr },
+        { "vl", cst::kRegVctrl }, { "vtype", cst::kRegVctrl },
+        { "ffr", cst::kRegVctrl }, { "vstart", cst::kRegVstart },
+        { "vxrm", cst::kRegVcsr }, { "vxsat", cst::kRegVcsr },
+        { "msacsr", cst::kRegVcsr }, { "dspctrl", cst::kRegDspctrl },
+        { "userlocal", cst::kRegTls }, { "TPIDR_EL0", cst::kRegTls },
+        { "TPIDRRO_EL0", cst::kRegTls }, { "za", cst::kRegMatrix },
+    };
+    static const int sp[5] = { 0, 4, 31, 2, 29 }, fp[5] = { 0, 5, 29, 8, 30 },
+                     lr[5] = { 0, -1, 30, 1, 31 };
+    int i = r.index;
+    switch (r.reg_class) {
+    case QEMU_PLUGIN_REG_GPR:
+        return i == sp[isa] ? cst::kRegSp : i == fp[isa] ? cst::kRegFp :
+               i == lr[isa] ? cst::kRegLr :
+               cst::kRegGpr + (isa == 1 && i > 5 ? i - 2 : i);
+    case QEMU_PLUGIN_REG_FP:            return cst::kRegFpr + i;
+    case QEMU_PLUGIN_REG_VECTOR:        return cst::kRegVec + i;
+    case QEMU_PLUGIN_REG_PREDICATE:     return cst::kRegPred + i;
+    case QEMU_PLUGIN_REG_FLAGS:         return cst::kRegFlags;
+    case QEMU_PLUGIN_REG_SEGMENT:       return cst::kRegSeg + "\2\0\5\1\3\4"[i];
+    case QEMU_PLUGIN_REG_ACCUMULATOR:
+        return i < 4 ? cst::kRegAcc + i : cst::kRegAccHi + i - 4;
+    case QEMU_PLUGIN_REG_ZERO:          return cst::kRegZero;
+    }
+    auto c = ctl.find(r.name);
+    return c != ctl.end() ? c->second : !std::strncmp(r.name, "cr", 2) ?
+           cst::kRegCtrl : !std::strncmp(r.name, "bnd", 3) ?
+           cst::kRegBound + (r.name[3] - '0') : cst::kRegSys;
+}
+
+/*
+ * The instruction's register statement on the wire: slots in first-
+ * appearance order, registers QEMU names apart that the wire does not
+ * (x87 control/status/tag words, vl/vtype) merged into one slot.  A MIPS
+ * vector register absorbs its FP half: $fN is the low half of wN.
+ */
+cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
+{
+    constexpr size_t kMax = 64;     /* per direction; more is counted */
+    size_t n;
+    cst::Regs out;
+    const qemu_plugin_insn_reg *r = qemu_plugin_insn_reg_list(insn, &n,
+                                                              &out.opaque);
+    struct Slot { uint8_t id, access; };
+    std::vector<Slot> l;
+    for (size_t k = 0; k < n; k++) {
+        uint8_t id = reg_id(s.facts.isa, r[k]);
+        if (s.facts.isa == 4 && r[k].reg_class == QEMU_PLUGIN_REG_FP) {
+            for (size_t j = 0; j < n; j++) {
+                id = r[j].reg_class == QEMU_PLUGIN_REG_VECTOR &&
+                     r[j].index == r[k].index ? cst::kRegVec + r[k].index : id;
+            }
+        }
+        auto it = std::find_if(l.begin(), l.end(), [id](const Slot &x) {
+            return x.id == id; });
+        if (it == l.end()) {
+            l.push_back({ id, r[k].access });
+        } else {
+            it->access |= r[k].access;
+        }
+    }
+    for (const Slot &x : l) {
+        bool rd = x.access & QEMU_PLUGIN_REG_READ;
+        bool wr = x.access & QEMU_PLUGIN_REG_WRITE;
+        s.overflow += (rd && out.src.size() == kMax) ||
+                      (wr && out.dst.size() == kMax);
+        if (rd && out.src.size() < kMax) {
+            out.src.push_back(x.id);
+        }
+        if (wr && out.dst.size() < kMax) {
+            out.dst.push_back(x.id);
+        }
+    }
+    return out;
+}
+
+/*
+ * The register statement's report: encodings executed, those with a
+ * stated list, the ones it could not fully state by the first effect it
+ * names (<outfile>.reg_opaque.tsv), and every retranslation that stated a
+ * different list (<outfile>.reg_variance.tsv), classed: a vector, FP or
+ * control context the translation depends on (RVV vtype, SVE VL, MIPS FR)
+ * is expected; any other is a defect.
+ */
+void reg_report(Session &s, const std::string &path)
+{
+    std::string base = path.substr(0, path.size() - 4);
+    std::map<std::string, size_t> opaque;
+    size_t executed = s.blocks.regs.size(), stated = 0, odd = 0, full = 0;
+    for (const cst::Regs &r : s.blocks.regs) {
+        stated += !r.src.empty() || !r.dst.empty();
+        full += !r.opaque;
+        if (r.opaque) {
+            opaque[r.opaque]++;
+        }
+    }
+    std::ofstream o(base + ".reg_opaque.tsv"), v(base + ".reg_variance.tsv");
+    o << "class\tencodings\n(complete)\t" << full << '\n';
+    for (const auto &c : opaque) {
+        o << c.first << '\t' << c.second << '\n';
+    }
+    v << "pc\tbytes\tclass\tfirst_src/dst\tthen_src/dst\n";
+    auto list = [](const cst::Regs &r) {
+        std::string t;
+        for (const auto *l : { &r.src, &r.dst }) {
+            for (uint8_t x : *l) {
+                t += std::to_string(x) + ',';
+            }
+            t += '/';
+        }
+        return t;
+    };
+    for (const auto &e : s.blocks.variance) {
+        const cst::Regs &a = s.blocks.regs[e.first], &b = e.second;
+        std::vector<uint8_t> x, y, d;
+        for (const auto *l : { &a.src, &a.dst }) x.insert(x.end(), l->begin(), l->end());
+        for (const auto *l : { &b.src, &b.dst }) y.insert(y.end(), l->begin(), l->end());
+        std::sort(x.begin(), x.end());
+        std::sort(y.begin(), y.end());
+        std::set_symmetric_difference(x.begin(), x.end(), y.begin(), y.end(),
+                                      std::back_inserter(d));
+        bool ctx = !d.empty() && std::all_of(d.begin(), d.end(), [](uint8_t i) {
+            return (i >= cst::kRegFpr && i < cst::kRegSeg) || i == cst::kRegVctrl ||
+                   i == cst::kRegVstart || i == cst::kRegFcsr; });
+        odd += !ctx;
+        const cst::Insn &i = s.blocks.insn(e.first);
+        char hex[40] = "";
+        for (unsigned k = 0; k < i.size; k++) {
+            std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
+        }
+        v << std::hex << "0x" << i.pc << std::dec << '\t' << hex << '\t'
+          << (ctx ? "vector/fp context" : "UNEXPLAINED") << '\t' << list(a)
+          << '\t' << list(b) << '\n';
+    }
+    say("regs: encodings=" + std::to_string(executed) + " stated=" +
+        std::to_string(stated) + " reg_stmt_opaque=" +
+        std::to_string(executed - full) + " (" +
+        std::to_string(opaque.size()) + " classes) reg_list_overflow=" +
+        std::to_string(s.overflow) + " reg_list_variance=" +
+        std::to_string(s.blocks.variance.size()) + " (unexplained " +
+        std::to_string(odd) + ")");
+}
+
+/*
  * Close the segment.  @root_phys is the asid-0 label: the live
  * address-space value, read by the caller where it is readable.
  * Idempotent: whichever ruled route arrives first publishes.
@@ -178,6 +339,7 @@ void publish(uint64_t root_phys, const char *route)
                          entries, chains, s.blocks.memops(), slots, s.wp,
                          census).data() };
     memop_tripwire(census, s.path);
+    reg_report(s, s.path);
     const auto &st = s.blocks.stats;
     say("entries=" + std::to_string(entries.size()) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
@@ -480,6 +642,7 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
         in.pc = qemu_plugin_insn_vaddr(insn);
         in.size = uint8_t(qemu_plugin_insn_data(insn, in.bytes, sizeof(in.bytes)));
         shape->raw.push_back(in);
+        shape->regs.push_back(capture(s, insn));
         auto kind = qemu_plugin_insn_transfer_kind(insn);
         if (kind == QEMU_PLUGIN_TRANSFER_COND_NO_TARGET) {
             shape->traps.push_back(i);

@@ -136,6 +136,31 @@ uint32_t slot_fid(size_t k, bool store, int family)     /* 0 addr 1 data 2 size 
     return kFidSlot0 + 6 * uint32_t(k) + 2 * family + store;
 }
 
+/* The name section 5.4 gives GenericRegId @id */
+std::string reg_name(unsigned id)
+{
+    static const char *const one[] = {
+        "CTRL", "DEBUG", "BOUND0", "BOUND1", "BOUND2", "BOUND3", "ACC0", "ACC1",
+        "ACC2", "ACC3", "ZERO", "MATRIX", "SYS", "FCSR", "VCTRL", "TLS",
+        "VSTART", "DSPCTRL", "VCSR", "SP", "FLAGS", "IP", "LR", "FP_REG",
+    };
+    static const std::pair<unsigned, const char *> bank[] = {
+        { kRegGpr, "GPR" }, { kRegAccHi, "ACCHI" }, { kRegFpr, "FPR" },
+        { kRegVec, "VEC" }, { kRegPred, "PRED" }, { kRegSeg, "SEG" },
+    };
+    if (id >= kRegCtrl) {
+        return std::string("REG_") + one[id - kRegCtrl];
+    }
+    for (int b = 5; b >= 0; b--) {
+        if (id >= bank[b].first) {
+            return std::string("REG_") + bank[b].second +
+                   std::to_string(id - bank[b].first);
+        }
+    }
+    return "REG_NONE";
+}
+
+
 using MapEntries = std::vector<std::pair<uint64_t, std::string>>;
 
 /* Enumerated names take 0, 1, 2 ...; flag names take bits 0, 1, 2 ... */
@@ -159,13 +184,27 @@ MapEntries numbered(std::initializer_list<const char *> names, bool bits,
  * section-2 flag vocabularies, the other block-level field-ids of 5.7
  * and the IFRAME / REGFILE tags, so those names are carried too.  A name
  * is vocabulary, not a claim: of the flags only MEM_DATA and WP are set,
- * and the memop field-ids are named for exactly the @slots the body
- * addresses.
+ * the memop field-ids are named for exactly the @slots the body
+ * addresses, and the reg map for every register a template names.
  * Values are this writer's choice, except the body tags, which are the
  * ones section 2 says the writer assigns.
  */
-Bytes encoding_maps(size_t slots)
+Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates)
 {
+    std::map<unsigned, bool> regs;   /* every id the templates use */
+    for (const WireTemplate &t : templates) {
+        for (const WireInsn &i : t.insns) {
+            for (const auto *l : { &i.regs->src, &i.regs->dst }) {
+                for (uint8_t r : *l) {
+                    regs[r] = true;
+                }
+            }
+        }
+    }
+    MapEntries names;
+    for (const auto &r : regs) {
+        names.push_back({ r.first, reg_name(r.first) });
+    }
     MapEntries fids = numbered({ "CST_FID_BB_START", "CST_FID_BB_STOP",
                                  "CST_FID_BB_FLAGS", "CST_FID_BB_FAULT_DEPTH",
                                  "CST_FID_BB_FAULT_INSN" }, false);
@@ -206,6 +245,7 @@ Bytes encoding_maps(size_t slots)
                                   "CST_METAFLAGS_C", "CST_METAFLAGS_V",
                                   "CST_METAFLAGS_P" }, true) },
         { "field_id", fids },
+        { "reg", names },
         /*
          * Every template instruction carries these two values: this
          * writer classifies nothing yet, and says so by name.
@@ -243,9 +283,13 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         prev = i.pc;
         b.u8(kUnclassified);    /* opcode */
         b.u8(kUnclassified);    /* branch_type */
-        /* flags, n_src, n_dst: unclaimed; then the dependency mask lengths */
-        for (int k = 0; k < 3; k++) {
-            b.u8(0);
+        b.u8(0);                /* flags: unclaimed */
+        b.u8(uint8_t(i.regs->src.size()));
+        b.u8(uint8_t(i.regs->dst.size()));
+        for (const auto *l : { &i.regs->src, &i.regs->dst }) {
+            for (uint8_t r : *l) {
+                b.u8(r);
+            }
         }
         b.u8(i.dep_mask_len[0]);    /* max_dep_loads */
         b.u8(i.dep_mask_len[1]);    /* max_dep_stores */
@@ -402,7 +446,7 @@ Bytes header_member(const HeaderFacts &facts,
     h.str(facts.datetime);
     h.str(facts.comment);
     h.str(facts.target_name);
-    h.section(encoding_maps(std::min(slots, kSlotCount)));
+    h.section(encoding_maps(std::min(slots, kSlotCount), templates));
     h.uleb(0);          /* warmup_end_trace_insn_idx: no warmup, ends at 0 */
     h.uleb(templates.size());   /* templates section, to member EOF */
     for (size_t id = 0; id < templates.size(); id++) {

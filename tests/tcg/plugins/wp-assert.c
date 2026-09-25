@@ -18,6 +18,22 @@
  *                          bit-identical (the runner also compares guest
  *                          output with and without the plugin)
  *
+ * Under system emulation (qemu-system-x86_64 with the bare-metal kernel
+ * tests/tcg/x86_64/system/wp-victim-sys.c) T1-T5 re-run with the real MMU,
+ * every excursion is bracketed by qemu_plugin_spec_vtime_pause/_resume
+ * outside spec_mode_begin/_end, the plugin's own checks run inside
+ * qemu_plugin_vclock_pause/_resume windows, and the phase-2 families run:
+ *
+ *   P2-A clock freeze      the virtual clock does not see a host delay
+ *                          injected inside the excursion (A1), nor does a
+ *                          wrong-path rdtsc pair (A3); the guest's own view
+ *                          (A2) and liveness are judged by the runner
+ *   P2-B interrupt window  no interrupt delivery on the wrong path (B1);
+ *                          delivery, counts and positions are the guest's
+ *                          and the runner's (B2-B4)
+ *   P2-C containment       MMIO/port I/O (C1), TLB (C2), CPL0 faults in an
+ *                          IDT-less window (C3), page walks through MMIO (C4)
+ *
  * On any violation the plugin prints "[wp-assert] FAIL <test>: ..." and
  * aborts.  Every assertion has a control, selected with control=<name>,
  * that perturbs the drive so the assertion MUST fail; a control run that
@@ -36,6 +52,15 @@
  *                     so every test gets a verdict; the run still aborts
  *                     at exit
  *   dumpregs=on       list the registers the target exposes, then run
+ *   delay_us=N        system: host busy-wait inside every P2A_CLOCK
+ *                     excursion, between its first and second exec_tb
+ *                     (default 50000; 0 = the no-delay calibration arm)
+ *   bdelay_us=N       system: the same inside every P2B_TIMER excursion
+ *                     (default 1000, longer than the guest's deadline)
+ *   control=P2A P2A2 P2A2X P2B P2B1 P2B1E P2B1L P2B1I C1N C1NS C1NF C2N
+ *                     C3N C4N
+ *                     (system; see
+ *                     WP_TESTS.md "Softmmu phase 2")
  *
  * Copyright (c) 2026 Maccoy Merrell
  *
@@ -56,7 +81,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 enum {
     T1_STORE = 1, T1_RO, T2_REGS, T3_FETCH_UNMAPPED, T3_STRADDLE, T3_UD,
     T3_DIV0, T3_PRIV, T3_INT3, T3_LOAD_UNMAPPED, T3_SYSCALL, T4_LOOP,
-    T4_REP, T5_REPEAT, T_LAST
+    T4_REP, T5_REPEAT,
+    /* system emulation only: tests/tcg/x86_64/system/wp-victim-sys.c */
+    P2A_CLOCK, P2B_TIMER, P2B_PEND, P2B_ISR, C1_MMIO, C2_TLB, C3_GP,
+    C3_PF, C3_UD, C4_PTW,
+    T_LAST,
+    T_USER_LAST = P2A_CLOCK,    /* linux-user runs T1..T5 only */
+    P2_INFO = 31,               /* not a test: the guest's layout */
 };
 
 static const char *const test_names[T_LAST] = {
@@ -65,8 +96,22 @@ static const char *const test_names[T_LAST] = {
     [T3_UD] = "T3_UD", [T3_DIV0] = "T3_DIV0", [T3_PRIV] = "T3_PRIV",
     [T3_INT3] = "T3_INT3", [T3_LOAD_UNMAPPED] = "T3_LOAD_UNMAPPED",
     [T3_SYSCALL] = "T3_SYSCALL", [T4_LOOP] = "T4_LOOP", [T4_REP] = "T4_REP",
-    [T5_REPEAT] = "T5_REPEAT",
+    [T5_REPEAT] = "T5_REPEAT", [P2A_CLOCK] = "P2A_CLOCK",
+    [P2B_TIMER] = "P2B_TIMER", [P2B_PEND] = "P2B_PEND",
+    [P2B_ISR] = "P2B_ISR", [C1_MMIO] = "C1_MMIO", [C2_TLB] = "C2_TLB",
+    [C3_GP] = "C3_GP", [C3_PF] = "C3_PF", [C3_UD] = "C3_UD",
+    [C4_PTW] = "C4_PTW",
 };
+
+/*
+ * The fixed layout of the system victim (keep in sync with
+ * tests/tcg/x86_64/system/wp-victim-sys.c).
+ */
+#define SYS_RB          0x400000ull    /* C2's pages */
+#define SYS_C2_PAGES    600
+#define SYS_PROBE       0x205000ull    /* not present */
+#define SYS_C4_VA       0x818000ull    /* PTE in e1000 ICR */
+#define SYS_E1K_ICS     0xc8
 
 /*
  * Per-ISA facts.  The marker is an instruction the guest trigger executes
@@ -184,6 +229,22 @@ static bool dump_regs;
 static bool dump_inside;          /* print T5's in-excursion registers */
 static bool require_all;
 static bool merge_calls;          /* control T4C */
+static bool is_system;            /* qemu-system: the phase-2 suite */
+static int n_tests = T_USER_LAST; /* tests require=on insists on */
+static long delay_us = 50000;     /* P2A_CLOCK in-excursion host delay */
+static long bdelay_us = 1000;     /* P2B_TIMER in-excursion host delay */
+/* P2_INFO: the guest's layout and TSC rate */
+static uint64_t wp_lo, wp_hi, tsc_per_ms;
+static bool have_info;
+/* control P2B: the vtime resume owed to the next correct-path block */
+static bool resume_owed;
+/* control P2A2X: re-assert the un-resumed pause at every correct-path block */
+static bool repause;
+/* B1, the event half: ASYNC_ENTER departures, over the whole run */
+static uint64_t ev_async_enter, ev_async_in_wp, ev_async_in_window;
+static uint64_t ev_drains;
+static bool in_window;            /* between an excursion's two drains */
+static uint64_t resets;           /* vm_reset callbacks seen (C3) */
 
 /* ---------------------------------------------------------------- regs */
 
@@ -430,7 +491,27 @@ typedef struct {
     EndReason end;
     RegSnap inside;               /* registers at the end, before restore */
     uint64_t inside_buf0, inside_buf8; /* spec-view reads of buf */
+    /* system emulation */
+    bool vtime;                   /* bracket with spec_vtime_pause/_resume */
+    bool skip_pause, skip_resume, defer_resume;   /* P2A / P2A2 / P2B */
+    long delay_us;                /* host busy-wait after the first exec_tb */
+    int64_t vclk0, vclk1;         /* qemu_plugin_vclock_ns() outside it */
+    uint32_t fdepth0, fdepth1;    /* qemu_plugin_fault_depth() around it */
+    uint64_t async_blocks;        /* spec blocks with in_async_int true */
+    uint64_t probe_addr, probe_hits, probe_faulted;
+    bool c2;                      /* count C2's distinct pages */
+    uint8_t c2_seen[SYS_C2_PAGES];
+    uint64_t c2_pages;
+    /* controls C1NS/C1NF (F12 witness): log every exec_tb call's PC in and
+     * out; persist = keep calling after a false return */
+    bool trace, persist;
+    uint64_t pc_in[8], pc_out[8];
+    bool call_ok[8];
+    uint64_t call_insns_at[8], call_stores_at[8];
 } Exc;
+
+/* F12 witness: report the first correct-path translation after it */
+static bool f12_watch;
 
 static Exc *rec;                   /* recording target, NULL when idle */
 static uint64_t call_tbs, call_insns, call_stores, call_tb_len;
@@ -441,9 +522,55 @@ typedef struct {
     uint64_t n_insns;
 } TBInfo;
 
+/*
+ * The system-mode event queue (qemu_plugin_cpu_events_set), drained at
+ * every correct-path block and at both ends of every excursion.  B1's event
+ * half: an ASYNC_ENTER whose departure PC lies in the guest's
+ * wrong-path-only code is an interrupt delivered on a wrong path, and one
+ * drained at the end of an excursion was stamped inside its window.
+ */
+static void drain_events(unsigned int vcpu)
+{
+    const struct qemu_plugin_cpu_event *evs;
+    size_t n = qemu_plugin_drain_cpu_events(vcpu, &evs);
+    ev_drains++;
+    for (size_t i = 0; i < n; i++) {
+        if (evs[i].kind != QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+            continue;
+        }
+        ev_async_enter++;
+        if (in_window) {
+            ev_async_in_window++;
+            fprintf(stderr, "[wp-assert] FAIL B1: ASYNC_ENTER (departure pc "
+                    "0x%" PRIx64 ") stamped inside an excursion window\n",
+                    evs[i].pc);
+        }
+        if (have_info && evs[i].pc >= wp_lo && evs[i].pc < wp_hi) {
+            ev_async_in_wp++;
+            fprintf(stderr, "[wp-assert] FAIL B1: ASYNC_ENTER departure pc "
+                    "0x%" PRIx64 " is wrong-path-only code\n", evs[i].pc);
+            fflush(stderr);
+        }
+    }
+}
+
 static void vcpu_tb_exec(unsigned int vcpu, void *udata)
 {
     TBInfo *ti = udata;
+    if (is_system && !qemu_plugin_in_spec_mode()) {
+        drain_events(vcpu);
+        if (repause && !rec) {
+            /* control P2A2X: cpu_exec_longjmp_cleanup closes a leaked
+             * excursion at the next longjmp; keep re-opening it */
+            qemu_plugin_spec_vtime_pause();
+        }
+        if (resume_owed && !rec) {
+            /* control P2B: the resume the excursion withheld, one
+             * correct-path boundary late */
+            resume_owed = false;
+            qemu_plugin_spec_vtime_resume();
+        }
+    }
     if (!rec) {
         return;
     }
@@ -452,6 +579,8 @@ static void vcpu_tb_exec(unsigned int vcpu, void *udata)
     call_tb_len = ti->n_insns;
     if (!qemu_plugin_in_spec_mode()) {
         rec->tbs_not_spec++;
+    } else if (qemu_plugin_in_async_int()) {
+        rec->async_blocks++;
     }
     rec->fp = fnv_add(rec->fp, &ti->vaddr, sizeof(ti->vaddr));
 }
@@ -484,8 +613,21 @@ static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
         break;
     default: break;
     }
-    if (qemu_plugin_spec_mem_faulted_take()) {
+    bool faulted = qemu_plugin_spec_mem_faulted_take();
+    if (faulted) {
         rec->faulted_memops++;
+    }
+    if (rec->probe_addr && vaddr == rec->probe_addr) {
+        rec->probe_hits++;
+        rec->probe_faulted += faulted;
+    }
+    if (rec->c2 && !st && vaddr >= SYS_RB &&
+        vaddr < SYS_RB + SYS_C2_PAGES * 0x1000ull) {
+        uint64_t pg = (vaddr - SYS_RB) >> 12;
+        if (!rec->c2_seen[pg]) {
+            rec->c2_seen[pg] = 1;
+            rec->c2_pages++;
+        }
     }
     if (st) {
         rec->stores++;
@@ -502,8 +644,31 @@ static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
     rec->fp = fnv_add(rec->fp, ev, sizeof(ev));
 }
 
+static void busy_wait_us(long us)
+{
+    gint64 end = g_get_monotonic_time() + us;
+    while (g_get_monotonic_time() < end) {
+        /* host time passes; the guest's must not */
+    }
+}
+
 static void excursion(Exc *e)
 {
+    if (e->vtime) {
+        /*
+         * The phase-2 bracket: the marker callback's own work runs inside a
+         * qemu_plugin_vclock_pause window (marker_exec); leave it, read the
+         * guest clock, and freeze it for the excursion.
+         */
+        qemu_plugin_vclock_resume();
+        drain_events(qemu_plugin_current_vcpu_index());
+        in_window = true;
+        e->vclk0 = qemu_plugin_vclock_ns();
+        if (!e->skip_pause) {
+            qemu_plugin_spec_vtime_pause();
+        }
+    }
+    e->fdepth0 = qemu_plugin_fault_depth();
     struct qemu_plugin_cpu_state *saved = qemu_plugin_cpu_state_save();
     if (!saved) {
         FATAL("qemu_plugin_cpu_state_save returned NULL");
@@ -525,7 +690,21 @@ static void excursion(Exc *e)
         call_tbs = call_insns = call_stores = call_tb_len = 0;
         call_store_bytes = 0;
         e->calls++;
+        uint64_t pc_in = e->trace && i < 8 ? read_reg64("rip") : 0;
         bool ok = qemu_plugin_exec_tb();
+        if (e->trace && i < 8) {
+            uint64_t pc_out = read_reg64("rip");
+            e->pc_in[i] = pc_in;
+            e->pc_out[i] = pc_out;
+            e->call_ok[i] = ok;
+            e->call_insns_at[i] = call_insns;
+            e->call_stores_at[i] = call_stores;
+            fprintf(stderr, "[wp-assert] %s call %d spec=%d pc_in=0x%" PRIx64
+                    " ok=%d pc_out=0x%" PRIx64 " tbs=%" PRIu64 " insns=%"
+                    PRIu64 " stores=%" PRIu64 "\n", test_names[cur_test],
+                    i + 1, e->spec, pc_in, ok, pc_out, call_tbs, call_insns,
+                    call_stores);
+        }
         if (ok && merge_calls) {
             /* control T4C: two exec_tb in one accounting window */
             ok = qemu_plugin_exec_tb();
@@ -534,6 +713,9 @@ static void excursion(Exc *e)
         e->max_stores_per_call = MAX(e->max_stores_per_call, call_stores);
         e->max_store_bytes_per_call = MAX(e->max_store_bytes_per_call,
                                           call_store_bytes);
+        if (i == 0 && e->delay_us > 0) {
+            busy_wait_us(e->delay_us);
+        }
         if (call_insns > call_tb_len) {
             e->max_insn_excess = MAX(e->max_insn_excess,
                                      call_insns - call_tb_len);
@@ -542,6 +724,9 @@ static void excursion(Exc *e)
             e->end = END_FAULT;
             if (e->clear) {
                 qemu_plugin_spec_clear_exception();
+            }
+            if (e->persist) {
+                continue;
             }
             break;
         }
@@ -573,16 +758,30 @@ static void excursion(Exc *e)
         }
     }
     qemu_plugin_cpu_state_free(saved);
+    e->fdepth1 = qemu_plugin_fault_depth();
+    if (e->vtime) {
+        if (e->defer_resume) {
+            resume_owed = true;
+        } else if (!e->skip_resume) {
+            qemu_plugin_spec_vtime_resume();
+        }
+        e->vclk1 = qemu_plugin_vclock_ns();
+        drain_events(qemu_plugin_current_vcpu_index());
+        in_window = false;
+        qemu_plugin_vclock_pause();
+    }
     if (verbose) {
         fprintf(stderr, "[wp-assert] exc %s target=0x%" PRIx64 " end=%s "
                 "calls=%" PRIu64 "/%" PRIu64 " tbs=%" PRIu64 " insns=%" PRIu64
                 " ld=%" PRIu64 " st=%" PRIu64 " st_in_buf=%" PRIu64
                 " faulted=%" PRIu64 " st_bytes=%" PRIu64 " max_st_bytes/call=%"
-                PRIu64 " fp=%016" PRIx64 "\n",
+                PRIu64 " fp=%016" PRIx64 " spec=%d not_spec_tbs=%" PRIu64
+                " probe=%" PRIu64 "/%" PRIu64 "\n",
                 test_names[cur_test], e->target, end_names[e->end],
                 e->calls_ok, e->calls, e->tbs, e->insns, e->loads, e->stores,
                 e->stores_in_buf, e->faulted_memops, e->store_bytes,
-                e->max_store_bytes_per_call, e->fp);
+                e->max_store_bytes_per_call, e->fp, e->spec, e->tbs_not_spec,
+                e->probe_hits, e->probe_faulted);
     }
 }
 
@@ -597,7 +796,7 @@ static void check_common(Exc *e, RegSnap *pre, uint64_t pre_sum)
     const char *d = snap_diff(pre, &post);
     CHECK(d == NULL, "T2 register %s differs after the excursion", d);
     free_snap(&post);
-    if (e->buf) {
+    if (e->buf && e->len) {
         uint64_t s = mem_sum(e->buf, e->len);
         CHECK(s == pre_sum, "T1 guest memory [0x%" PRIx64 ",+%" PRIu64
               ") changed across the excursion (sum %016" PRIx64 " -> %016"
@@ -669,10 +868,11 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
               .budget = WP_SHORT_BUDGET, .spec = true, .restore = true,
               .clear = true };
     RegSnap pre = snap_regs();
-    uint64_t pre_sum = buf ? mem_sum(buf, len) : 0;
+    uint64_t pre_sum = buf && len ? mem_sum(buf, len) : 0;
 
     cur_test = test;
     tests_run[test]++;
+    e.vtime = is_system;
 
     switch (test) {
     case T1_STORE:
@@ -944,6 +1144,303 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
         break;
     }
 
+    case P2A_CLOCK: {
+        /*
+         * A1: the guest clock read just outside the vtime bracket does not
+         * see the host delay injected inside it.  A3: the wrong path's own
+         * rdtsc pair, read back from the sandbox while still in spec mode,
+         * straddles that delay and must not show it either.
+         */
+        e.delay_us = delay_us;
+        if (control_is("P2A")) {
+            fprintf(stderr, "[wp-assert] CONTROL P2A: no "
+                    "qemu_plugin_spec_vtime_pause; A1 and A2 must FAIL by "
+                    "about the %ld us delay\n", delay_us);
+            e.skip_pause = true;
+        }
+        if (control_is("P2A2") || control_is("P2A2X")) {
+            static bool said;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "[wp-assert] CONTROL %s: "
+                        "qemu_plugin_spec_vtime_pause without the resume%s; "
+                        "the runner's liveness check must FAIL\n", control,
+                        control_is("P2A2X") ? ", re-paused at every "
+                        "correct-path block" : "");
+            }
+            e.skip_resume = true;
+            repause = control_is("P2A2X");
+        }
+        excursion(&e);
+        check_common(&e, &pre, pre_sum);
+        int64_t dv = e.vclk1 - e.vclk0;
+        if (e.vclk0 == 0 && e.vclk1 == 0) {
+            FAIL("A1 SUBJECT ABSENT: qemu_plugin_vclock_ns() reads 0 on both "
+                 "sides of the bracket (it returns 0 under -icount), so the "
+                 "clock A1 is about cannot be read through the plugin API");
+        } else {
+            fprintf(stderr, "[wp-assert] A1 vclock_delta_ns=%" PRId64
+                    " delay_us=%ld\n", dv, delay_us);
+            if (delay_us > 0) {
+                CHECK(dv < delay_us * 1000 / 2, "A1 the guest clock advanced "
+                      "%" PRId64 " ns across an excursion holding a %ld us "
+                      "host delay", dv, delay_us);
+            }
+        }
+        CHECK(e.calls_ok >= 2, "A3 subject absent: the rdtsc pair did not "
+              "both run (ok=%" PRIu64 ")", e.calls_ok);
+        CHECK(e.inside_buf0 != 0 && e.inside_buf8 >= e.inside_buf0,
+              "A3 subject absent: wrong-path rdtsc pair %" PRIx64 " / %"
+              PRIx64, e.inside_buf0, e.inside_buf8);
+        uint64_t wtsc = e.inside_buf8 - e.inside_buf0;
+        fprintf(stderr, "[wp-assert] A3 wrong_path_tsc_delta=%" PRIu64
+                " tsc_per_ms=%" PRIu64 "\n", wtsc, tsc_per_ms);
+        if (delay_us > 0) {
+            CHECK(have_info && tsc_per_ms > 0, "A3: no TSC rate from P2_INFO");
+            uint64_t d_ticks = (uint64_t)delay_us * tsc_per_ms / 1000;
+            CHECK(wtsc < d_ticks / 2, "A3 the wrong path's rdtsc pair jumped "
+                  "%" PRIu64 " ticks across a %" PRIu64 "-tick host delay",
+                  wtsc, d_ticks);
+        }
+        break;
+    }
+
+    case P2B_TIMER:
+    case P2B_PEND:
+    case P2B_ISR:
+        if (test == P2B_TIMER) {
+            e.delay_us = bdelay_us;
+            if (control_is("P2B")) {
+                /* withhold the resume -- and with it the kick re-arm --
+                 * until the next correct-path block */
+                static bool said;
+                if (!said) {
+                    said = true;
+                    fprintf(stderr, "[wp-assert] CONTROL P2B: every "
+                            "P2B_TIMER excursion's vtime resume (and its "
+                            "deferred-kick re-arm) withheld to the next "
+                            "correct-path block; B2/B3 must FAIL\n");
+                }
+                e.defer_resume = true;
+            }
+        }
+        if (test == P2B_PEND && control_is("P2B1L")) {
+            /*
+             * The design's literal P2B1: spec mode off, clear and restore
+             * kept.  exec_tb has no interrupt-delivery path of its own, so
+             * this is expected NOT to go red; the runner records it as
+             * evidence of that, and P2B1 below is the firing control.
+             */
+            fprintf(stderr, "[wp-assert] CONTROL P2B1L: the pending-interrupt "
+                    "excursion with spec mode off (clear and restore kept)\n");
+            e.spec = false;
+        }
+        if (test == P2B_PEND && control_is("P2B1E")) {
+            /*
+             * The event half's own control: the P2B1 leak below delivers
+             * the pending interrupt on correct-path kernel code, which the
+             * wrong-path-only range excludes.  Widen the range over the
+             * whole kernel text so that real departure must be caught.
+             */
+            fprintf(stderr, "[wp-assert] CONTROL P2B1E: P2B1's leak with the "
+                    "B1 event range widened to [0x100000,0x200000)\n");
+            wp_lo = 0x100000;
+            wp_hi = 0x200000;
+        }
+        if (test == P2B_PEND &&
+            (control_is("P2B1") || control_is("P2B1E"))) {
+            /*
+             * The wrong path's sti really runs and nothing restores
+             * EFLAGS.IF, so the pending interrupt is taken inside the
+             * guest's trigger window -- its IDT-counter detector must see
+             * it.  (The correct path does not resume INSIDE the wrong-path
+             * code: the marker's block continues from its own host code,
+             * whatever env->eip says.)
+             */
+            fprintf(stderr, "[wp-assert] CONTROL %s: the pending-interrupt "
+                    "excursion with spec mode off, no clear, no restore; the "
+                    "leaked IF lets the interrupt in inside the trigger "
+                    "window and B1 must FAIL\n", control);
+            e.spec = false;
+            e.clear = false;
+            e.restore = false;
+            excursion(&e);
+            break;
+        }
+        excursion(&e);
+        check_common(&e, &pre, pre_sum);
+        CHECK(e.tbs > 0, "B subject absent: the wrong path ran no block");
+        if (test == P2B_ISR && !control_is("P2B1I")) {
+            /* the instrument's positive witness: inside the ISR the async
+             * window is open, and spec blocks see it */
+            CHECK(e.async_blocks == e.tbs, "P2B_ISR: %" PRIu64 " of %" PRIu64
+                  " spec blocks inside the timer ISR read "
+                  "qemu_plugin_in_async_int() true", e.async_blocks, e.tbs);
+        } else {
+            if (test == P2B_ISR) {
+                fprintf(stderr, "[wp-assert] CONTROL P2B1I: B1's "
+                        "in_async_int assertion applied to an excursion "
+                        "launched from inside the timer ISR; it must FAIL\n");
+            }
+            CHECK(e.async_blocks == 0, "B1 %" PRIu64 " of %" PRIu64 " spec "
+                  "blocks ran with qemu_plugin_in_async_int() true",
+                  e.async_blocks, e.tbs);
+        }
+        break;
+
+    case C1_MMIO:
+        e.probe_addr = buf + SYS_E1K_ICS;
+        if (control_is("C1N")) {
+            fprintf(stderr, "[wp-assert] CONTROL C1N: the device excursion "
+                    "with spec mode off; the device, the serial port and "
+                    "debug-exit must see it\n");
+            e.spec = false;
+        }
+        if (control_is("C1NS")) {
+            /* three blocks: the serial write (x86 ends a block after
+             * port I/O), the jump, and the page-final device store --
+             * stopping short of debug-exit so the guest lives to read ICR */
+            fprintf(stderr, "[wp-assert] CONTROL C1NS: the device excursion "
+                    "with spec mode off, cut after its first three blocks; "
+                    "the guest's ICR detector must see the store\n");
+            e.spec = false;
+            e.budget = 3;
+            e.trace = true;
+        }
+        if (control_is("C1NF")) {
+            fprintf(stderr, "[wp-assert] CONTROL C1NF: F12 witness -- the "
+                    "C1 excursion (spec on, traced) locates the page-final "
+                    "store; then the same device store placed NOT "
+                    "block-final (wp_mmio_mid) runs under a spec-OFF "
+                    "exec_tb\n");
+            e.trace = true;
+        }
+        excursion(&e);
+        CHECK(e.probe_hits >= 1, "C1 subject absent: no wrong-path store to "
+              "the device register");
+        check_common(&e, &pre, pre_sum);
+        if (control_is("C1NS")) {
+            f12_watch = true;
+        }
+        if (control_is("C1NF")) {
+            /*
+             * wp_mmio_mid sits at wp_mmio_st's page + 0x800
+             * (wp-victim-sys.c): nop; movl $0x20,0xc8(%rdi); nop; jmp.
+             * The stub addresses the device through rdi, so rdi is set to
+             * the BAR for this excursion and put back after it.  A
+             * spec-off exec_tb performs an MMIO access only as a block's
+             * last instruction (can_do_io); here the store is neither
+             * the first nor the last, so io_prepare -> cpu_io_recompile
+             * must unwind every call, each time at the store's PC.
+             */
+            uint64_t st = e.pc_in[2];
+            uint64_t mid = (st & ~0xfffull) + 0x800;
+            g_autoptr(GByteArray) b = g_byte_array_new();
+            static const uint8_t stub[] = { 0x90, 0xc7, 0x87, 0xc8, 0x00,
+                                            0x00, 0x00, 0x20, 0x00, 0x00,
+                                            0x00, 0x90 };
+            bool have = (st & 0xfff) == 0xff6 &&
+                qemu_plugin_read_memory_vaddr(mid, b, sizeof(stub)) &&
+                b->len == sizeof(stub) &&
+                memcmp(b->data, stub, sizeof(stub)) == 0;
+            if (!have) {
+                FAIL("C1NF subject absent: block-final store pc 0x%" PRIx64
+                     " (expected page offset 0xff6), stub at 0x%" PRIx64
+                     " not found", st, mid);
+                break;
+            }
+            Exc w = { .target = mid, .budget = 3, .spec = false,
+                      .restore = true, .clear = true, .vtime = true,
+                      .trace = true, .persist = true,
+                      .probe_addr = buf + SYS_E1K_ICS };
+            struct qemu_plugin_cpu_state *s0 = qemu_plugin_cpu_state_save();
+            perturb_reg("rdi", buf - read_reg64("rdi"));
+            excursion(&w);
+            if (!qemu_plugin_cpu_state_restore(s0)) {
+                FATAL("qemu_plugin_cpu_state_restore returned false");
+            }
+            qemu_plugin_cpu_state_free(s0);
+            int ok = 0, at_store = 0;
+            for (int i = 0; i < 3; i++) {
+                ok += w.call_ok[i];
+                at_store += w.pc_in[i] == mid + 1;
+            }
+            fprintf(stderr, "[wp-assert] F12 WITNESS non-final: target=0x%"
+                    PRIx64 " store_pc=0x%" PRIx64 " calls=3 ok=%d/3 "
+                    "entries_at_store_pc=%d store_insn_started=%d "
+                    "store_memcb=%" PRIu64 "\n",
+                    mid, mid + 1, ok, at_store,
+                    w.call_insns_at[1] >= 1 && w.pc_in[1] == mid + 1,
+                    w.probe_hits);
+            f12_watch = true;
+        }
+        break;
+
+    case C2_TLB:
+        e.budget = SYS_C2_PAGES + 64;
+        e.c2 = true;
+        e.probe_addr = SYS_PROBE;
+        if (control_is("C2N")) {
+            fprintf(stderr, "[wp-assert] CONTROL C2N: the %d-page excursion "
+                    "with spec mode off; its translations persist and the "
+                    "guest's page-fault count must FAIL\n", SYS_C2_PAGES);
+            e.spec = false;
+        }
+        excursion(&e);
+        CHECK(e.c2_pages == SYS_C2_PAGES, "C2 subject: the wrong path loaded "
+              "%" PRIu64 " of %d fresh pages", e.c2_pages, SYS_C2_PAGES);
+        CHECK(e.probe_hits >= 1, "C2 subject absent: no wrong-path load of "
+              "the not-present probe page");
+        if (e.spec) {
+            CHECK(e.probe_faulted >= 1, "C2 the not-present probe load was "
+                  "not flagged synthetic");
+        }
+        check_common(&e, &pre, pre_sum);
+        break;
+
+    case C3_GP:
+    case C3_PF:
+    case C3_UD:
+        if (test == C3_GP && control_is("C3N")) {
+            fprintf(stderr, "[wp-assert] CONTROL C3N: the CPL0 #GP with spec "
+                    "mode off, no clear, no restore, in the guest's IDT-less "
+                    "window; the reset callback must fire\n");
+            e.spec = false;
+            e.clear = false;
+            e.restore = false;
+            excursion(&e);
+            break;
+        }
+        excursion(&e);
+        CHECK(e.end == END_FAULT, "C3 a CPL0 wrong-path fault did not end the "
+              "excursion (end=%s)", end_names[e.end]);
+        CHECK(e.fdepth0 == e.fdepth1, "C3 qemu_plugin_fault_depth() moved "
+              "across the excursion: %u -> %u", e.fdepth0, e.fdepth1);
+        /* the reading is live: C2's correct-path #PFs (whose handler skips
+         * the load, so no iret pops them) leave it well above zero here */
+        fprintf(stderr, "[wp-assert] %s fault_depth %u -> %u\n",
+                test_names[test], e.fdepth0, e.fdepth1);
+        CHECK(resets == 0, "C3 %" PRIu64 " machine resets requested", resets);
+        check_common(&e, &pre, pre_sum);
+        break;
+
+    case C4_PTW:
+        e.probe_addr = SYS_C4_VA;
+        if (control_is("C4N")) {
+            fprintf(stderr, "[wp-assert] CONTROL C4N: the MMIO-PTE walk with "
+                    "spec mode off; the device read must reach the e1000\n");
+            e.spec = false;
+        }
+        excursion(&e);
+        CHECK(e.probe_hits >= 1, "C4 subject absent: no wrong-path access at "
+              "the MMIO-PTE address");
+        if (e.spec) {
+            CHECK(e.probe_faulted >= 1, "C4 the access through the MMIO PTE "
+                  "was not flagged synthetic");
+        }
+        check_common(&e, &pre, pre_sum);
+        break;
+
     default:
         FATAL("unknown test id %d", test);
     }
@@ -961,7 +1458,17 @@ static void marker_exec(unsigned int vcpu, void *udata)
     uint64_t target = read_reg64(isa->arg[1]);
     uint64_t buf = read_reg64(isa->arg[2]);
     uint64_t len = read_reg64(isa->arg[3]);
-    if (test == 0 || test >= T_LAST) {
+    if (test == P2_INFO && is_system) {
+        /* the guest's wrong-path-only code range and its TSC rate */
+        wp_lo = target;
+        wp_hi = buf;
+        tsc_per_ms = len;
+        have_info = true;
+        fprintf(stderr, "[wp-assert] P2_INFO wp=[0x%" PRIx64 ",0x%" PRIx64
+                ") tsc_per_ms=%" PRIu64 "\n", wp_lo, wp_hi, tsc_per_ms);
+        return;
+    }
+    if (test == 0 || test >= (uint64_t)n_tests) {
         cur_test = 0;
         fprintf(stderr, "[wp-assert] FAIL marker: bad test id %" PRIu64 "\n",
                 test);
@@ -976,6 +1483,15 @@ static void marker_exec(unsigned int vcpu, void *udata)
         tests_run[test]++;
         return;
     }
+    if (is_system) {
+        /*
+         * The plugin's own work (register snapshots, checksums, checks)
+         * is instrumentation, not guest execution: keep it off the guest
+         * clock.  excursion() leaves this window around its vtime bracket
+         * and re-enters it after.
+         */
+        qemu_plugin_vclock_pause();
+    }
     run_test((int)test, target, buf, len);
     /*
      * Force the vCPU back through the exception check at the next block
@@ -988,7 +1504,17 @@ static void marker_exec(unsigned int vcpu, void *udata)
      * pending index and delivers it -- so a leaked wrong-path fault
      * becomes a guest signal the victim reports.
      */
-    qemu_plugin_request_tb_flush();
+    if (!is_system || test < P2A_CLOCK || test > P2B_ISR) {
+        /*
+         * (Not after the P2-A/P2-B triggers: the flush's exit and
+         * retranslation are correct-path work outside every freeze, which
+         * the mode=off arm those tests are compared with never does.)
+         */
+        qemu_plugin_request_tb_flush();
+    }
+    if (is_system) {
+        qemu_plugin_vclock_resume();
+    }
     if (verbose) {
         fprintf(stderr, "[wp-assert] %s ok (%d checks)\n", test_names[test],
                 checks_passed[test]);
@@ -1003,6 +1529,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     TBInfo *ti = g_new0(TBInfo, 1);      /* lives as long as the TB may */
     ti->vaddr = qemu_plugin_tb_vaddr(tb);
     ti->n_insns = n;
+    if (f12_watch && !qemu_plugin_in_spec_mode()) {
+        /* controls C1NS/C1NF: what the correct path translates first
+         * after a spec-off device excursion */
+        f12_watch = false;
+        fprintf(stderr, "[wp-assert] F12 first CP translation after the "
+                "witness: vaddr=0x%" PRIx64 " n_insns=%zu\n", ti->vaddr, n);
+    }
     qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec,
                                          QEMU_PLUGIN_CB_NO_REGS, ti);
     for (size_t i = 0; i < n; i++) {
@@ -1025,6 +1558,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
 static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
 {
+    if (is_system) {
+        /* B1's event half and qemu_plugin_in_async_int() both need the
+         * per-vCPU event queue (cpu_plugin_async_enter latches the async
+         * window only while it is enabled) */
+        qemu_plugin_cpu_events_set(vcpu, true);
+    }
     if (regs) {
         return;
     }
@@ -1044,17 +1583,48 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
     }
 }
 
+/*
+ * C3: a wrong-path fault that escalated (double fault -> triple fault) ends
+ * in a machine reset request.  No test in the suite may ever cause one.
+ */
+static void vm_reset(qemu_plugin_id_t id, int vcpu_index, bool in_guest_insn)
+{
+    resets++;
+    fprintf(stderr, "[wp-assert] FAIL C3: machine reset requested (vcpu %d, "
+            "in_guest_insn %d)\n", vcpu_index, in_guest_insn);
+    fflush(stderr);
+    abort();
+}
+
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     int missing = 0, seen = 0;
-    for (int t = 1; t < T_LAST; t++) {
+    for (int t = 1; t < n_tests; t++) {
         seen += tests_run[t];
     }
     if (!isa || (!seen && !require_all)) {
         /* loaded by the generic check-tcg plugin loop: nothing to do */
         return;
     }
-    for (int t = 1; t < T_LAST; t++) {
+    if (is_system) {
+        fprintf(stderr, "[wp-assert] B1 events: drains=%" PRIu64
+                " async_enter=%" PRIu64 " in_window=%" PRIu64
+                " in_wp_code=%" PRIu64 " resets=%" PRIu64 "\n", ev_drains,
+                ev_async_enter, ev_async_in_window, ev_async_in_wp, resets);
+        if (enabled && tests_run[P2B_TIMER] && ev_async_enter == 0) {
+            fprintf(stderr, "[wp-assert] FAIL B1: no ASYNC_ENTER was ever "
+                    "drained (subject absent: the event instrument is "
+                    "blind)\n");
+            missing++;
+        }
+        if (ev_async_in_window || ev_async_in_wp) {
+            fprintf(stderr, "[wp-assert] FAIL B1: %" PRIu64 " interrupts "
+                    "stamped inside a window, %" PRIu64 " departing "
+                    "wrong-path code\n", ev_async_in_window, ev_async_in_wp);
+            missing++;
+        }
+    }
+    for (int t = 1; t < n_tests; t++) {
         if (t == T4_REP && isa->rep_skip) {
             fprintf(stderr, "[wp-assert] SKIP %-18s on %s: %s\n",
                     test_names[t], isa->target, isa->rep_skip);
@@ -1118,6 +1688,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             keep_going = g_strcmp0(kv[1], "on") == 0;
         } else if (g_strcmp0(kv[0], "dumpregs") == 0) {
             dump_regs = g_strcmp0(kv[1], "on") == 0;
+        } else if (g_strcmp0(kv[0], "delay_us") == 0) {
+            delay_us = atol(kv[1]);
+        } else if (g_strcmp0(kv[0], "bdelay_us") == 0) {
+            bdelay_us = atol(kv[1]);
         } else {
             fprintf(stderr, "wp-assert: unknown option %s\n", argv[i]);
             return -1;
@@ -1130,6 +1704,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     for (unsigned i = 0; i < G_N_ELEMENTS(isas); i++) {
         if (strcmp(info->target_name, isas[i].target) == 0) {
             isa = &isas[i];
+        }
+    }
+    if (info->system_emulation) {
+        if (!isa || strcmp(isa->target, "x86_64") != 0) {
+            isa = NULL;           /* only the x86_64 system victim exists */
+        } else {
+            is_system = true;
+            n_tests = T_LAST;
+            qemu_plugin_register_vm_reset_cb(id, vm_reset);
         }
     }
     if (*control) {

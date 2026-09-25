@@ -35,3 +35,34 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 
 # Running
 QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
+
+# The wrong-path engine suite, softmmu form (see the header of
+# tests/tcg/plugins/wp-assert.c): the bare-metal kernel runs once without
+# the plugin and once with libwp-assert driving an excursion at every
+# marker; the plugin must find every test (require=on) and pass it, and
+# under -icount the guest's output -- which includes every timer
+# interrupt's (vector, interrupted RIP, TSC) -- must be byte-identical.
+# sleep=off: without it the boot firmware's halts warp the virtual clock
+# to host time and two plugin-less runs already differ.  The red controls
+# live in the runner (cst_runs/rebuild/wp_tests/sys/run_sys.sh): check-tcg
+# cannot express "this run must fail".
+ifeq ($(CONFIG_PLUGIN),y)
+EXTRA_TESTS+=wp-victim-sys
+wp-victim-sys: CFLAGS+=-mno-red-zone
+wp-victim-sys: $(X64_SYSTEM_SRC)/wp-victim-sys.c $(LINK_SCRIPT) $(CRT_OBJS) $(MINILIB_OBJS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ $(LDFLAGS)
+
+WP_SYS_OPTS=-M q35 -icount shift=0,sleep=off -monitor none -display none \
+	-device isa-debugcon,chardev=output \
+	-device isa-debug-exit,iobase=0xf4,iosize=0x4 -serial none -device e1000
+run-wp-victim-sys: wp-victim-sys libwp-assert.so
+	$(call run-test, wp-victim-sys.ref, $(QEMU) \
+		-chardev file$(COMMA)path=wp-victim-sys.ref.out$(COMMA)id=output \
+		$(WP_SYS_OPTS) -kernel $<, wp-victim-sys without plugin)
+	$(call run-test, wp-victim-sys, $(QEMU) \
+		-chardev file$(COMMA)path=wp-victim-sys.out$(COMMA)id=output \
+		-plugin $(PLUGIN_LIB)/libwp-assert.so$(COMMA)require=on \
+		$(WP_SYS_OPTS) -kernel $<, wp-victim-sys with wp-assert)
+	$(call diff-out, wp-victim-sys, wp-victim-sys.ref.out)
+EXTRA_RUNS+=run-wp-victim-sys
+endif

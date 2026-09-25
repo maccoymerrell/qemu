@@ -62,39 +62,53 @@ struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
 
 /*
  * One memory access as the callback stated it (sections 5.2, 5.3): @pos is
- * the instruction's index in its block, @data_ok says a value came with it.
+ * the instruction's index in its block, @data_ok says a value came with it,
+ * @fault that the wrong path was served a placeholder (section 4.4).
  */
 struct Memop {
     uint64_t addr, lo, hi;
     uint32_t pos;
     uint8_t size;
-    bool store, data_ok;
+    bool store, data_ok, fault;
 };
 
 /*
- * One body entry: the block ran whole in thread @tid (section 4.2), with
- * the memops [begin, end) of the memop array; @base is the block position
- * of the entry's first instruction in the positions those memops carry.
+ * One body entry (section 4.2) or wrong-path chain block (4.3) of thread
+ * @tid, with the memops [begin, end) of the memop array; @base is the
+ * block position of the entry's first instruction in the positions those
+ * memops carry.  @stop cuts the executed range (0: whole), @fault is the
+ * CST_FID_BB_FAULT_INSN (-1: none), @flags the bb_flag bits; a CP entry's
+ * chain is [wp_b, wp_e) of the chain-block array.
  */
-struct WireEntry { uint32_t tid, template_id, base; size_t begin, end; };
+struct WireEntry {
+    uint32_t tid, template_id, base;
+    size_t begin, end;
+    uint32_t stop;
+    int32_t fault;
+    uint8_t flags;
+    size_t wp_b, wp_e;
+};
 
 /*
  * The header member: magic through the templates section (ids = index).
  * @slots is how many load/store slots the body can address.
  */
 Bytes header_member(const HeaderFacts &facts,
-                    const std::vector<WireTemplate> &templates, size_t slots);
+                    const std::vector<WireTemplate> &templates, size_t slots,
+                    bool wp);
 
 /*
  * The body member: lead magic, the opening (asid, thread) declaration of
  * section 4, the entries with their memops as field deltas (section 5),
  * END carrying their count, trailing magic.  @root_phys is the asid-0
- * label (section 4.1a).  Returns in @slots the slots it addressed, and in
- * each template instruction's @max its observed maxima.
+ * label (section 4.1a).  With @wp each entry carries its chain of @chains
+ * (section 4.3).  Returns in @slots the slots it addressed, and in each
+ * template instruction's @max its observed maxima.
  */
 Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
-                  const std::vector<Memop> &memops, size_t &slots);
+                  const std::vector<WireEntry> &chains,
+                  const std::vector<Memop> &memops, size_t &slots, bool wp);
 
 } /* namespace cst */
 

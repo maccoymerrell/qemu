@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <initializer_list>
-#include <map>
+#include <unordered_map>
 #include <utility>
 
 namespace cst {
@@ -115,6 +115,7 @@ enum : uint8_t {
 
 constexpr uint8_t kUnclassified = 0;    /* opcode and branch_type value */
 constexpr uint8_t kFlagMemData = 1;     /* header_flag CST_FLAG_MEM_DATA */
+constexpr uint8_t kFlagWp = 8;          /* header_flag CST_FLAG_WP */
 constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
 
 /*
@@ -122,7 +123,10 @@ constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
  * counts 5 and 6, then slot k of the six memop families 7 + 6k + family,
  * interleaved by slot as section 5.1's layout intent describes.
  */
-enum : uint32_t { kFidNLoads = 5, kFidNStores = 6, kFidSlot0 = 7 };
+enum : uint32_t {
+    kFidStop = 1, kFidFlags = 2, kFidFaultInsn = 4,
+    kFidNLoads = 5, kFidNStores = 6, kFidSlot0 = 7,
+};
 const char *const kSlotFamilies[] = {
     "CST_FID_LOAD_ADDR", "CST_FID_STORE_ADDR", "CST_FID_LOAD_DATA",
     "CST_FID_STORE_DATA", "CST_FID_LOAD_SIZE", "CST_FID_STORE_SIZE",
@@ -154,8 +158,9 @@ MapEntries numbered(std::initializer_list<const char *> names, bool bits,
  * The canonical decoder and auditor additionally demand the rest of the
  * section-2 flag vocabularies, the other block-level field-ids of 5.7
  * and the IFRAME / REGFILE tags, so those names are carried too.  A name
- * is vocabulary, not a claim: of the flags only MEM_DATA is set, and the
- * memop field-ids are named for exactly the @slots the body addresses.
+ * is vocabulary, not a claim: of the flags only MEM_DATA and WP are set,
+ * and the memop field-ids are named for exactly the @slots the body
+ * addresses.
  * Values are this writer's choice, except the body tags, which are the
  * ones section 2 says the writer assigns.
  */
@@ -252,62 +257,138 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
     return b;
 }
 
-/* One field-delta record (section 5): its field id and SLEB_WIDE delta. */
-struct Record { uint32_t fid; uint64_t delta[3]; };
-
-/* A record for @fid when (lo, hi) differs from its state (plo, phi). */
-void change(std::vector<Record> &r, uint32_t fid, uint64_t &plo, uint64_t &phi,
-            uint64_t lo, uint64_t hi)
-{
-    if (lo == plo && hi == phi) {
-        return;
-    }
-    Record x{ fid, {} };
-    uint64_t borrow = lo < plo, t = hi - phi;
-    x.delta[0] = lo - plo;
-    x.delta[1] = t - borrow;
-    x.delta[2] = -uint64_t(hi < phi || t < borrow);
-    r.push_back(x);
-    plo = lo;
-    phi = hi;
-}
-
-/* The field state of one (template, ipos): baseline 0 everywhere. */
-struct InsnState {
-    struct Slot { uint64_t addr, lo, hi, size; };
-    uint64_t count[2] = { 0, 0 };
-    std::vector<Slot> slot[2];
-
-    /* Loads (@d 0) or stores (1) of one execution; returns their number. */
-    size_t observe(const std::vector<const Memop *> &ms, int d,
-                   std::vector<Record> &r)
+/*
+ * One overlay of field state (section 5): (thread, template, ipos, fid) ->
+ * value.  Per thread, as the decoder keys it (Step 6: overlays key on the
+ * thread id).
+ */
+struct Cell {
+    uint32_t tid, tmpl, ipos, fid;
+    bool operator==(const Cell &o) const
     {
-        size_t c = std::min(ms.size(), kSlotCount), k;
-        uint64_t z = 0;
-        change(r, d ? kFidNStores : kFidNLoads, count[d], z, c, 0);
-        slot[d].resize(std::max(slot[d].size(), c));
-        for (k = 0; k < c; k++) {
-            const Memop &m = *ms[k];
-            Slot &s = slot[d][k];
-            change(r, slot_fid(k, d, 0), s.addr, z, m.addr, 0);
-            if (m.data_ok) {
-                change(r, slot_fid(k, d, 1), s.lo, s.hi, m.lo, m.hi);
-            }
-            change(r, slot_fid(k, d, 2), s.size, z, m.size, 0);
-        }
-        return ms.size();
+        return tid == o.tid && tmpl == o.tmpl && ipos == o.ipos && fid == o.fid;
     }
 };
+struct CellHash {
+    size_t operator()(const Cell &c) const
+    {
+        return std::hash<uint64_t>()((uint64_t(c.tid) << 44) ^ (uint64_t(c.tmpl) << 24) ^
+                                     (uint64_t(c.ipos) << 12) ^ c.fid);
+    }
+};
+using Overlay = std::unordered_map<Cell, std::pair<uint64_t, uint64_t>, CellHash>;
+
+/*
+ * One delta section: records against @own, resolving a cell @own lacks
+ * through @fallback (the CP overlay, for a WP section), then the default.
+ */
+class Section {
+public:
+    Section(Overlay &own, const Overlay *fallback, uint32_t tid, uint32_t tmpl)
+        : own_(own), fb_(fallback), tid_(tid), tmpl_(tmpl) {}
+
+    void put(uint32_t ipos, uint32_t fid, uint64_t lo, uint64_t hi = 0,
+             uint64_t def = 0)
+    {
+        Cell c{ tid_, tmpl_, ipos, fid };
+        std::pair<uint64_t, uint64_t> p{ def, 0 };
+        auto it = own_.find(c);
+        if (it != own_.end()) {
+            p = it->second;
+        } else if (fb_) {
+            auto f = fb_->find(c);
+            p = f != fb_->end() ? f->second : p;
+        }
+        if (lo == p.first && hi == p.second) {
+            return;
+        }
+        Record x{ ipos, fid, {} };  /* 192-bit two's-complement difference */
+        uint64_t borrow = lo < p.first, t = hi - p.second;
+        x.delta[0] = lo - p.first;
+        x.delta[1] = t - borrow;
+        x.delta[2] = -uint64_t(hi < p.second || t < borrow);
+        recs_.push_back(x);
+        own_[c] = { lo, hi };
+    }
+
+    Bytes bytes()
+    {
+        std::sort(recs_.begin(), recs_.end(), [](const Record &x, const Record &y) {
+            return x.ipos != y.ipos ? x.ipos < y.ipos : x.fid < y.fid;
+        });
+        Bytes b;
+        b.uleb(recs_.size());
+        uint32_t last = 0;
+        for (const Record &x : recs_) {
+            b.uleb(x.ipos - last);
+            last = x.ipos;
+            b.uleb(x.fid);
+            b.sleb_wide(x.delta);
+        }
+        return b;
+    }
+
+private:
+    struct Record { uint32_t ipos, fid; uint64_t delta[3]; };
+    Overlay &own_;
+    const Overlay *fb_;
+    uint32_t tid_, tmpl_;
+    std::vector<Record> recs_;
+};
+
+/*
+ * The delta section of entry or chain block @e: its memops over the range
+ * it ran, then its block-level cells at BLOCK_POS (section 5.7).
+ */
+Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
+                    std::vector<WireTemplate> &templates,
+                    const std::vector<Memop> &memops, size_t &slots)
+{
+    WireTemplate &t = templates[e.template_id];
+    uint32_t n = uint32_t(t.insns.size()), stop = e.stop ? e.stop : n;
+    Section sec(own, fallback, e.tid, e.template_id);
+    size_t m = e.begin;
+    for (uint32_t ipos = 0; ipos < stop; ipos++) {
+        std::vector<const Memop *> dir[2];
+        for (; m < e.end && memops[m].pos - e.base == ipos; m++) {
+            dir[memops[m].store].push_back(&memops[m]);
+        }
+        for (int d = 0; d < 2; d++) {
+            size_t c = std::min(dir[d].size(), kSlotCount);
+            sec.put(ipos, d ? kFidNStores : kFidNLoads, c);
+            for (size_t k = 0; k < c; k++) {
+                const Memop &x = *dir[d][k];
+                sec.put(ipos, slot_fid(k, d, 0), x.addr);
+                if (x.data_ok) {
+                    sec.put(ipos, slot_fid(k, d, 1), x.lo, x.hi);
+                }
+                sec.put(ipos, slot_fid(k, d, 2), x.size);
+            }
+            slots = std::max(slots, c);
+            /* u8 on the wire; a larger count stays visible as over-max */
+            uint8_t &mx = t.insns[ipos].max[d];
+            mx = uint8_t(std::min<size_t>(std::max<size_t>(mx, dir[d].size()), 255));
+        }
+    }
+    sec.put(n, kFidStop, stop, 0, n);
+    sec.put(n, kFidFlags, e.flags);
+    if (e.fault >= 0) {
+        sec.put(n, kFidFaultInsn, uint64_t(e.fault));
+    }
+    return sec.bytes();
+}
 
 } /* namespace */
 
 Bytes header_member(const HeaderFacts &facts,
-                    const std::vector<WireTemplate> &templates, size_t slots)
+                    const std::vector<WireTemplate> &templates, size_t slots,
+                    bool wp)
 {
     Bytes h;
     h.u32(kMagic);
     h.u8(facts.isa);
-    h.u8(kFlagMemData); /* flags: memop values are the one optional content */
+    /* flags: memop values, and the wrong-path chains when they are on */
+    h.u8(kFlagMemData | (wp ? kFlagWp : 0));
     h.uleb(0);          /* start_insn: no window, the timeline starts at 0 */
     h.uleb(0);          /* warmup_insns: none configured */
     h.uleb(0);          /* total_target_insns: 0 = unbounded */
@@ -327,7 +408,8 @@ Bytes header_member(const HeaderFacts &facts,
 
 Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
-                  const std::vector<Memop> &memops, size_t &slots)
+                  const std::vector<WireEntry> &chains,
+                  const std::vector<Memop> &memops, size_t &slots, bool wp)
 {
     Bytes b;
     b.u32(kMagic);
@@ -337,8 +419,7 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
     b.u64(0);           /* sig: reserved, always 0 */
     b.u8(kTagThread);   /* ... then thread 0 */
     b.sleb(0);
-    /* Field state is per thread (Step 6: overlays key on the thread id). */
-    std::map<uint32_t, std::vector<std::vector<InsnState>>> state;
+    Overlay cp, spec;   /* WP resolves WP -> CP -> default (section 5) */
     slots = 0;
     int64_t tid = 0, tmpl = 0;
     for (const WireEntry &e : entries) {
@@ -350,42 +431,19 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
         b.u8(kTagEntry);
         b.sleb(int64_t(e.template_id) - tmpl);
         tmpl = e.template_id;
-        /* cp_delta_section: memop records; the range defaults to the block */
-        auto &per = state[e.tid];
-        per.resize(templates.size());
-        std::vector<InsnState> &st = per[e.template_id];
-        st.resize(templates[e.template_id].insns.size());
-        Bytes recs;
-        uint64_t n = 0, last = 0;
-        size_t m = e.begin;
-        for (uint32_t ipos = 0; ipos < st.size(); ipos++) {
-            std::vector<Record> r;
-            std::vector<const Memop *> dir[2];
-            for (; m < e.end && memops[m].pos - e.base == ipos; m++) {
-                dir[memops[m].store].push_back(&memops[m]);
+        b.section(entry_section(cp, nullptr, e, templates, memops, slots));
+        if (wp) {
+            Bytes ch;
+            ch.uleb(e.wp_e - e.wp_b);
+            int64_t prev = 0;   /* delta-coded within the chain */
+            for (size_t w = e.wp_b; w < e.wp_e; w++) {
+                ch.sleb(int64_t(chains[w].template_id) - prev);
+                prev = chains[w].template_id;
+                ch.section(entry_section(spec, &cp, chains[w], templates, memops,
+                                         slots));
             }
-            for (int d = 0; d < 2; d++) {
-                size_t c = st[ipos].observe(dir[d], d, r);
-                slots = std::max(slots, c);
-                /* u8 on the wire; a larger count stays visible as over-max */
-                uint8_t &mx = templates[e.template_id].insns[ipos].max[d];
-                mx = uint8_t(std::min<size_t>(std::max<size_t>(mx, c), 255));
-            }
-            std::sort(r.begin(), r.end(), [](const Record &x, const Record &y) {
-                return x.fid < y.fid;
-            });
-            for (const Record &x : r) {
-                recs.uleb(ipos - last);
-                last = ipos;
-                recs.uleb(x.fid);
-                recs.sleb_wide(x.delta);
-                n++;
-            }
+            b.section(ch);
         }
-        Bytes sec;
-        sec.uleb(n);
-        sec.raw(recs);
-        b.section(sec);
     }
     b.u8(kTagEnd);
     b.uleb(entries.size());

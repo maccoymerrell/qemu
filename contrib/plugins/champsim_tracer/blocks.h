@@ -14,7 +14,9 @@
  * shapes and the dictionary is minted at close, after every shape is
  * re-cut at the final set of block ends (recut()).  A memop travels with
  * the instruction whose callback delivered it, into whichever entry and
- * position that instruction lands in.
+ * position that instruction lands in.  A wrong-path excursion runs through
+ * the same machinery on the thread's WP strand (tid | kWp); its sealed
+ * blocks become the chain of the CP entry that launched it.
  */
 #ifndef CHAMPSIM_TRACER_BLOCKS_H
 #define CHAMPSIM_TRACER_BLOCKS_H
@@ -47,6 +49,11 @@ using Shape = std::vector<InsnId>;
 struct TbShape {
     Shape insns;
     int transfer = -1;  /* last insn the translator lowered a jump at */
+    bool indirect = false;  /* ... to a run-time target */
+    uint64_t target = 0;    /* ... else to this translator-resolved one */
+    /* As translated, until its first execution interns it (absorb()). */
+    std::vector<Insn> raw;
+    std::vector<size_t> traps;  /* conditional traps the translator lowered */
 };
 
 /* The engine's account of the last bulk (fan-out) instruction it ran. */
@@ -58,6 +65,9 @@ struct BulkRun {
 
 class BlockAssembler {
 public:
+    static constexpr uint32_t kWp = 1u << 31;   /* a thread's WP strand */
+    enum : uint8_t { kFault = 1, kUnavail = 2, kFirstUnavail = 4 };  /* bb_flag */
+
     InsnId intern(const Insn &i)
     {
         auto it = insn_ids_.emplace(i, InsnId(insns_.size()));
@@ -68,6 +78,25 @@ public:
         return it.first->second;
     }
     const Insn &insn(InsnId id) const { return *insns_[id]; }
+
+    /*
+     * A TB's first execution states what its translation exposed.  Not at
+     * translation: the translation callback runs under QEMU's mmap_lock,
+     * which a wrong-path excursion takes while holding the plugin's lock.
+     */
+    void absorb(TbShape &tb)
+    {
+        for (const Insn &i : tb.raw) {
+            tb.insns.push_back(intern(i));
+        }
+        for (size_t t : tb.traps) {
+            ends_block(tb.insns[t]);    /* a trap, in place */
+        }
+        if (!tb.raw.empty()) {
+            translated(tb);
+            tb.raw = {};
+        }
+    }
 
     /* Evidence that @id ends a true BB. */
     void ends_block(InsnId id)
@@ -105,9 +134,12 @@ public:
      * The pending TB of @tid is over: @ran of its instructions started,
      * @bulk (or null) the engine's latest fan-out account, which is this
      * TB's only if it names the TB's last instruction, and @next_pc the pc
-     * executing next (0 when the thread stopped).
+     * executing next (0 when the thread stopped).  @skipped: instruction
+     * @ran - 1 raised and was skipped; this execution of the block ends
+     * there, as an early exit does (the instruction is not marked).
      */
-    void retire(uint32_t tid, size_t ran, const BulkRun *bulk, uint64_t next_pc)
+    void retire(uint32_t tid, size_t ran, const BulkRun *bulk, uint64_t next_pc,
+                bool skipped = false)
     {
         Strand &s = strand(tid);
         const TbShape *tb = s.pending;
@@ -117,7 +149,7 @@ public:
             return;
         }
         s.pending = nullptr;
-        size_t n = tb->insns.size();
+        size_t n = skipped ? ran : tb->insns.size();
         InsnId last = tb->insns[n - 1];
         if (ran < n) {
             stats.early_exits++;    /* left mid-TB: ranges come later */
@@ -141,8 +173,14 @@ public:
         } else {
             for (size_t i = 0; i < ran && i < n; i++) {
                 for (; m < cut && m->pos <= i; m++) {
+                    if (m->fault && s.fault < 0) {
+                        s.fault = int32_t(s.open.size());
+                    }
                     s.omem.push_back(*m);
                     s.omem.back().pos = uint32_t(s.open.size());
+                }
+                if (skipped && i + 1 == ran && s.fault < 0) {
+                    s.fault = int32_t(s.open.size());
                 }
                 s.open.push_back(tb->insns[i]);
                 if (s.slots_due && !--s.slots_due) {
@@ -164,7 +202,7 @@ public:
             }
         }
         s.reentered = bulk && bulk->reenter ? last : kNone;
-        if (ran < n) {
+        if (ran < n || skipped) {   /* this execution left the block here */
             seal(tid, s);
         } else if (next_pc && !s.open.empty()) {
             const Insn &l = insn(last);
@@ -192,18 +230,54 @@ public:
         }
     }
 
+    /* A wrong-path excursion begins on @wtid's strand, after CP entry @cp. */
+    bool wp_begin(uint32_t wtid, uint32_t cp)
+    {
+        strands_[wtid] = Strand();
+        chain_ = wp_.size();
+        wp_insns_ = 0;
+        return (cp_ = strand(cp).last) != kNoEntry;
+    }
+    /* WP instructions attributed so far: sealed, plus the block in flight */
+    size_t wp_insns(uint32_t wtid) { return wp_insns_ + strand(wtid).open.size(); }
+    size_t wp_blocks() const { return wp_.size() - chain_; }
+    bool open_empty(uint32_t tid) { return strand(tid).open.empty(); }
+
+    /*
+     * The excursion is over: @unavail, the next fetch could not complete
+     * (the block in flight is kept and flagged, or the CP entry is when
+     * nothing ran); otherwise the block in flight is past the walk's end.
+     */
+    void wp_end(uint32_t wtid, bool unavail)
+    {
+        Strand &s = strand(wtid);
+        if (unavail) {
+            seal(wtid, s);
+        }
+        Entry &e = entries_[cp_];
+        e.wp_b = chain_;
+        e.wp_e = wp_.size();
+        if (unavail) {
+            (e.wp_b == e.wp_e ? e : wp_.back()).flags |= e.wp_b == e.wp_e ?
+                kFirstUnavail : kUnavail;
+        }
+        strands_.erase(wtid);
+    }
+
     /*
      * Re-cut every provisional shape at the final block ends and mint the
      * dictionary from what the body references, numbered in first-
-     * reference order.
+     * reference order.  A chain is cut so its ranges sum to @depth: the
+     * block that crosses it stops there (a fault-marked one runs whole),
+     * and nothing after it is attributed (format.rst 4.4).
      */
     void recut(std::vector<WireTemplate> &templates,
-               std::vector<WireEntry> &entries)
+               std::vector<WireEntry> &entries, std::vector<WireEntry> &wp,
+               size_t depth)
     {
         std::map<Shape, uint32_t> minted;
         std::vector<std::vector<uint32_t>> pieces(shapes_.size());
-        for (size_t x = 0; x < entries_.size(); x++) {
-            const Entry &e = entries_[x];
+        auto split = [&](const Entry &e, std::vector<WireEntry> &out) {
             if (pieces[e.shape].empty()) {     /* every shape has a piece */
                 const Shape &sh = *shapes_[e.shape];
                 Shape cut;
@@ -220,20 +294,47 @@ public:
                 }
                 stats.revised_shapes += pieces[e.shape].size() > 1;
             }
-            size_t m = e.mem;
-            size_t end = x + 1 < entries_.size() ? entries_[x + 1].mem : mems_.size();
+            size_t m = e.mem_b;
             uint32_t base = 0;
             for (uint32_t t : pieces[e.shape]) {
                 uint32_t len = uint32_t(templates[t].insns.size());
                 size_t b = m;
-                while (m < end && mems_[m].pos < base + len) {
+                while (m < e.mem_e && mems_[m].pos < base + len) {
                     m++;
                 }
-                entries.push_back({ e.tid, t, base, b, m });
+                bool here = e.fault >= int32_t(base) && e.fault < int32_t(base + len);
+                out.push_back({ e.tid & ~kWp, t, base, b, m, 0,
+                                here ? e.fault - int32_t(base) : -1, 0, 0, 0 });
                 base += len;
             }
+            out.back().flags = e.flags & ~kFault;
+            stats.recut_entries += pieces[e.shape].size() - 1;
+        };
+        for (const Entry &e : entries_) {
+            split(e, entries);
+            std::vector<WireEntry> chain;
+            for (size_t w = e.wp_b; w < e.wp_e; w++) {
+                split(wp_[w], chain);
+            }
+            entries.back().wp_b = wp.size();
+            size_t sum = 0;
+            for (WireEntry &c : chain) {
+                if (sum >= depth) {
+                    break;
+                }
+                size_t len = templates[c.template_id].insns.size();
+                if (sum + len > depth && c.fault < 0) {
+                    c.stop = uint32_t(depth - sum);
+                    while (c.end > c.begin && mems_[c.end - 1].pos >= c.base + c.stop) {
+                        c.end--;
+                    }
+                }
+                sum += len;
+                c.flags |= c.fault >= 0 ? kFault : 0;
+                wp.push_back(c);
+            }
+            entries.back().wp_e = wp.size();
         }
-        stats.recut_entries = entries.size() - entries_.size();
     }
 
     const std::vector<Memop> &memops() const { return mems_; }
@@ -245,6 +346,7 @@ public:
 
 private:
     static constexpr InsnId kNone = ~InsnId(0);
+    static constexpr size_t kNoEntry = ~size_t(0);
     enum : uint8_t { kEnds = 1, kFolded = 2 };  /* marks_ bits */
 
     bool ends(InsnId id) const { return marks_[id] & kEnds; }
@@ -256,8 +358,16 @@ private:
         size_t slots_due = 0;       /* insns left before a branch lands */
         std::vector<Memop> mem;     /* the pending TB's, pos = TB index */
         std::vector<Memop> omem;    /* the open block's, pos = its index */
+        int32_t fault = -1;         /* open block's first faulting insn */
+        size_t last = kNoEntry;     /* its latest sealed entry */
     };
-    struct Entry { uint32_t tid, shape; size_t mem; };  /* memops from mem */
+    /* memops [mem_b, mem_e); a CP entry's chain is wp_[wp_b, wp_e) */
+    struct Entry {
+        uint32_t tid, shape;
+        size_t mem_b, mem_e, wp_b = 0, wp_e = 0;
+        int32_t fault = -1;
+        uint8_t flags = 0;
+    };
 
     Strand &strand(uint32_t tid) { return strands_[tid]; }
 
@@ -273,12 +383,23 @@ private:
     void seal(uint32_t tid, Strand &s)
     {
         if (!s.open.empty()) {
-            entries_.push_back({ tid, shape_id(s.open), mems_.size() });
+            size_t b = mems_.size();
             mems_.insert(mems_.end(), s.omem.begin(), s.omem.end());
+            add(tid, { tid, shape_id(s.open), b, mems_.size() }, s.open.size());
+            list(tid).back().fault = s.fault;
             s.open.clear();
             s.omem.clear();
+            s.fault = -1;
         }
         s.slots_due = 0;
+    }
+
+    std::vector<Entry> &list(uint32_t tid) { return tid & kWp ? wp_ : entries_; }
+    void add(uint32_t tid, const Entry &e, size_t len)
+    {
+        list(tid).push_back(e);
+        strand(tid).last = list(tid).size() - 1;
+        wp_insns_ += tid & kWp ? len : 0;
     }
 
     /* @units self-loop entries of @op, each with the next @share memops. */
@@ -287,11 +408,15 @@ private:
     {
         uint32_t self = shape_id(Shape{ op });
         for (uint64_t k = 0; k < units; k++, m += share) {
-            entries_.push_back({ tid, self, mems_.size() });
+            size_t b = mems_.size();
+            bool fault = false;
             for (size_t j = 0; j < share; j++) {
                 mems_.push_back(m[j]);
                 mems_.back().pos = 0;
+                fault |= m[j].fault;
             }
+            add(tid, { tid, self, b, mems_.size() }, 1);
+            list(tid).back().fault = fault ? 0 : -1;
         }
     }
 
@@ -313,7 +438,8 @@ private:
     std::map<Shape, uint32_t> shape_ids_;
     std::vector<const Shape *> shapes_;
     std::map<uint32_t, Strand> strands_;
-    std::vector<Entry> entries_;
+    std::vector<Entry> entries_, wp_;
+    size_t chain_ = 0, cp_ = 0, wp_insns_ = 0;  /* the excursion in flight */
     std::vector<Memop> mems_;       /* every entry's, pos = its index */
     size_t slots_ = 0;              /* learned trailing slots per branch */
 };

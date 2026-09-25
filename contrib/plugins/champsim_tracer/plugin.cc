@@ -10,18 +10,23 @@
  * execution and writes the correct-path body: true basic blocks as
  * pc/size templates and one entry per block run (blocks.h), with the
  * memory accesses the memory callbacks state (address, size, direction,
- * value).  It claims nothing else about an instruction; system mode keeps
- * an empty body.
+ * value), and after each block whose transfer has a nameable alternative a
+ * wrong-path chain of the same facts (excursion()).  It claims nothing else
+ * about an instruction; system mode keeps an empty body.
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
  *   compress=<cmd>   a filter command each member is streamed through,
  *                    e.g. compress="zstd -T0 -3 -q -c"
+ *   wp=0|1           wrong-path chains (default 1)
+ *   wpdepth=<n>      wrong-path instructions per chain (default 64)
  */
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,8 +45,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 namespace {
 
+/* Why excursions ended early or were not taken (counted, never guessed). */
+struct WpStats {
+    uint64_t launched, first_unavail, unavail, exec_faults, bail_unwind,
+             bail_slot, bail_overflow, bail_noseal, bail_stall, no_state;
+};
+
 struct Session {
-    std::mutex lock;
+    /* recursive: a wrong-path exec_tb fires callbacks on the same thread */
+    std::recursive_mutex lock;
     bool published = false;     /* one segment per run, at most */
     bool system = false;
     std::string path;           /* <outfile>.cst */
@@ -50,8 +62,18 @@ struct Session {
     cst::HeaderFacts facts;
     cst::BlockAssembler blocks;
     std::vector<std::unique_ptr<cst::TbShape>> tbs;  /* live until exit */
+    std::mutex tbs_lock;        /* taken under mmap_lock: guards tbs only */
     qemu_plugin_u64 started;    /* per vCPU: insns begun in the current TB */
     uint64_t no_value = 0;      /* accesses whose value the API withheld */
+    bool wp = true;
+    size_t wpdepth = 64;
+    uint32_t wp_tid = 0;        /* the WP strand in flight, 0 when none */
+    bool fired = false;         /* a WP TB began during this exec_tb */
+    /* per indirect transfer: the latest CP target and the one before it */
+    std::map<cst::InsnId, std::pair<uint64_t, uint64_t>> targets;
+    /* per vCPU: a TB whose transfer's block is still open (a MIPS slot next) */
+    std::map<unsigned int, const cst::TbShape *> xfer;
+    WpStats wps{};
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -99,7 +121,7 @@ std::string local_datetime()
 void publish(uint64_t root_phys, const char *route)
 {
     Session &s = session();
-    std::lock_guard<std::mutex> guard(s.lock);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (s.published) {
         return;
     }
@@ -108,12 +130,12 @@ void publish(uint64_t root_phys, const char *route)
         return qemu_plugin_u64_get(s.started, tid);
     });
     std::vector<cst::WireTemplate> templates;
-    std::vector<cst::WireEntry> entries;
-    s.blocks.recut(templates, entries);
+    std::vector<cst::WireEntry> entries, chains;
+    s.blocks.recut(templates, entries, chains, s.wpdepth);
     /* The body goes first, so the header can be finalised after it. */
     size_t slots;
     cst::Member body = { "body.cst", cst::body_member(root_phys, templates,
-                         entries, s.blocks.memops(), slots).data() };
+                         entries, chains, s.blocks.memops(), slots, s.wp).data() };
     const auto &st = s.blocks.stats;
     say("entries=" + std::to_string(entries.size()) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
@@ -124,8 +146,25 @@ void publish(uint64_t root_phys, const char *route)
         std::to_string(s.blocks.memops().size()) + " max_slots=" +
         std::to_string(slots) + " no_value=" + std::to_string(s.no_value) +
         " uneven_fanout=" + std::to_string(st.uneven_fanout));
+    const WpStats &w = s.wps;
+    if (s.wp && !s.system) {
+        say("wp: excursions=" + std::to_string(w.launched) + " blocks=" +
+            std::to_string(chains.size()) + " first_unavail=" +
+            std::to_string(w.first_unavail) + " unavail=" +
+            std::to_string(w.unavail) + " exec_faults=" +
+            std::to_string(w.exec_faults) + " bails unwind/slot/overflow/noseal/stall=" +
+            std::to_string(w.bail_unwind) + "/" + std::to_string(w.bail_slot) +
+            "/" + std::to_string(w.bail_overflow) + "/" +
+            std::to_string(w.bail_noseal) + "/" + std::to_string(w.bail_stall) +
+            " no_state=" +
+            std::to_string(w.no_state) + " reserve_exhausted=" +
+            std::to_string(qemu_plugin_spec_reserve_exhausted()) +
+            " syscalls_blocked=" +
+            std::to_string(qemu_plugin_spec_syscall_blocked_count()));
+    }
     std::vector<cst::Member> members = {
-        body, { "header.cst", cst::header_member(s.facts, templates, slots).data() },
+        body, { "header.cst", cst::header_member(s.facts, templates, slots,
+                                                 s.wp).data() },
     };
     std::string err;
     bool ok = true;
@@ -145,7 +184,7 @@ void publish(uint64_t root_phys, const char *route)
 void refuse_unattested(const char *route)
 {
     Session &s = session();
-    std::lock_guard<std::mutex> guard(s.lock);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {
         s.published = true;
         say(std::string(route) + " with no vCPU to read the address space "
@@ -185,19 +224,150 @@ void on_exit(qemu_plugin_id_t, void *)
     }
 }
 
+/*
+ * The wrong path from @alt, after the CP entry @vcpu just sealed: the
+ * engine contract of qemu-plugin.h (tests/tcg/plugins/wp-assert.c drives
+ * the same sequence).  One exec_tb per block; each retires into the WP
+ * strand at the pc it left for.  A false return with no TB begun is a
+ * front-end fault and ends the walk; with one begun, the instruction the
+ * scoreboard says began last raised: it is marked, skipped, and the walk
+ * goes on at its fall-through (format.rst 4.4).  The walk ends once
+ * wpdepth instructions are attributed and the block in flight has sealed.
+ */
+void excursion(Session &s, unsigned int vcpu, uint64_t alt)
+{
+    uint32_t wt = vcpu | cst::BlockAssembler::kWp;
+    struct qemu_plugin_cpu_state *saved = qemu_plugin_cpu_state_save();
+    if (!saved || !s.blocks.wp_begin(wt, vcpu)) {
+        s.wps.no_state++;
+        qemu_plugin_cpu_state_free(saved);
+        return;
+    }
+    s.wps.launched++;
+    uint64_t sb = qemu_plugin_u64_get(s.started, vcpu);
+    qemu_plugin_spec_mode_begin(saved);
+    qemu_plugin_set_pc(alt);
+    s.wp_tid = wt;
+    bool unavail = false;
+    size_t sealed = ~size_t(0), extra = 0;
+    for (;;) {
+        s.fired = false;
+        bool ok = qemu_plugin_exec_tb();
+        uint64_t pc = qemu_plugin_get_pc();
+        size_t ran = qemu_plugin_u64_get(s.started, vcpu);
+        if (ok && (!s.fired || !ran)) {
+            s.wps.bail_stall++;     /* no instruction retired: a kick, not a path */
+            break;
+        }
+        if (ok) {
+            cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
+                               qemu_plugin_rep_reenter() };
+            s.blocks.retire(wt, ran, &bulk, pc);
+        } else {
+            qemu_plugin_spec_clear_exception();
+            const cst::TbShape *tb = s.blocks.pending(wt);
+            if (!s.fired || !tb) {
+                unavail = true;     /* the fetch itself failed */
+                break;
+            }
+            /* the engine leaves the pc at the raiser, or past it (a call) */
+            const cst::Insn *f = ran && ran <= tb->insns.size() ?
+                                 &s.blocks.insn(tb->insns[ran - 1]) : nullptr;
+            if (!f || (pc != f->pc && pc != f->pc + f->size)) {
+                s.wps.bail_unwind++;
+                break;
+            }
+            if (tb->transfer >= 0 && int(ran) - 1 > tb->transfer) {
+                s.wps.bail_slot++;  /* a delay slot: no fall-through of its own */
+                break;
+            }
+            s.blocks.retire(wt, ran, nullptr, f->pc + f->size, true);
+            qemu_plugin_set_pc(f->pc + f->size);
+            s.wps.exec_faults++;
+        }
+        if (qemu_plugin_spec_store_overflowed()) {
+            s.wps.bail_overflow++;
+            break;
+        }
+        if (sealed == ~size_t(0) && s.blocks.wp_insns(wt) >= s.wpdepth) {
+            sealed = s.blocks.wp_blocks();  /* the budget is spent ... */
+        }
+        if (sealed != ~size_t(0) && (s.blocks.open_empty(wt) ||
+                                     s.blocks.wp_blocks() > sealed)) {
+            break;                          /* ... and the block in flight done */
+        }
+        if (sealed != ~size_t(0) && ++extra > 16384) {    /* straight-line: finite */
+            s.wps.bail_noseal++;
+            break;
+        }
+    }
+    s.wps.unavail += unavail;
+    s.wps.first_unavail += unavail && !s.blocks.wp_blocks() &&
+                           s.blocks.open_empty(wt);
+    s.blocks.wp_end(wt, unavail);
+    s.wp_tid = 0;
+    qemu_plugin_spec_mode_end();
+    qemu_plugin_cpu_state_restore(saved);
+    qemu_plugin_cpu_state_free(saved);
+    qemu_plugin_u64_set(s.started, vcpu, sb);
+}
+
+/*
+ * The block ending at @ft sealed on the lowered transfer of TB @x: launch
+ * where it offers an alternative the plugin can name (INC5.md) -- the
+ * fall-through of a taken one; the translator's static target of one that
+ * fell through; for a run-time target, the latest earlier CP target other
+ * than where it went.
+ */
+void launch(Session &s, unsigned int vcpu, const cst::TbShape *x, uint64_t ft,
+            uint64_t next)
+{
+    uint64_t other = 0;
+    if (x->indirect) {
+        auto &h = s.targets[x->insns[x->transfer]];
+        other = h.first != next ? h.first : h.second;
+        if (h.first != next) {
+            h = { next, h.first };
+        }
+    }
+    uint64_t alt = next != ft ? (other ? other : ft) :
+                   x->indirect ? other : x->target;
+    if (alt && alt != next) {
+        excursion(s, vcpu, alt);
+    }
+}
+
 /* A TB begins: the previous one of this vCPU is over. */
 void on_tb_exec(unsigned int vcpu, void *udata)
 {
     Session &s = session();
-    auto *tb = static_cast<const cst::TbShape *>(udata);
-    std::lock_guard<std::mutex> guard(s.lock);
+    auto *tb = static_cast<cst::TbShape *>(udata);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (s.published) {
+        return;
+    }
+    s.blocks.absorb(*tb);
+    if (s.wp_tid) {             /* a wrong-path TB: excursion() retires it */
+        s.blocks.begin(s.wp_tid, tb);
+        s.fired = true;
         return;
     }
     cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
                        qemu_plugin_rep_reenter() };
-    s.blocks.retire(vcpu, qemu_plugin_u64_get(s.started, vcpu), &bulk,
-                    s.blocks.insn(tb->insns.front()).pc);
+    const cst::TbShape *prev = s.blocks.pending(vcpu);
+    size_t ran = qemu_plugin_u64_get(s.started, vcpu);
+    uint64_t next = s.blocks.insn(tb->insns.front()).pc;
+    s.blocks.retire(vcpu, ran, &bulk, next);
+    /* the TB whose transfer this retire completes: its own, or its slot's */
+    const cst::TbShape *x = nullptr;
+    if (prev && ran == prev->insns.size()) {
+        x = prev->transfer >= 0 ? prev : s.xfer[vcpu];
+    }
+    s.xfer[vcpu] = x == prev && !s.blocks.open_empty(vcpu) ? x : nullptr;
+    const cst::Insn *l = prev ? &s.blocks.insn(prev->insns.back()) : nullptr;
+    if (s.wp && x && s.blocks.open_empty(vcpu) && bulk.pc != l->pc) {
+        launch(s, vcpu, x, l->pc + l->size, next);
+    }
     s.blocks.begin(vcpu, tb);
 }
 
@@ -211,6 +381,7 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     m.pos = uint32_t(reinterpret_cast<uintptr_t>(udata));
     m.size = uint8_t(1u << qemu_plugin_mem_size_shift(info));
     m.store = qemu_plugin_mem_is_store(info);
+    m.fault = qemu_plugin_spec_mem_faulted_take();  /* false off the wrong path */
     qemu_plugin_mem_value v = qemu_plugin_mem_get_value(info);
     m.data_ok = v.type != QEMU_PLUGIN_MEM_VALUE_INVALID;  /* wider than 128 */
     m.hi = v.type == QEMU_PLUGIN_MEM_VALUE_U128 ? v.data.u128.high : 0;
@@ -222,10 +393,10 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     case QEMU_PLUGIN_MEM_VALUE_U128: m.lo = v.data.u128.low; break;
     default:                         break;
     }
-    std::lock_guard<std::mutex> guard(s.lock);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {
         s.no_value += !m.data_ok;
-        s.blocks.memop(vcpu, m);
+        s.blocks.memop(s.wp_tid ? s.wp_tid : vcpu, m);
     }
 }
 
@@ -235,7 +406,10 @@ void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
                 uint64_t)
 {
     Session &s = session();
-    std::lock_guard<std::mutex> guard(s.lock);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    if (s.wp_tid) {
+        return;     /* never on the wrong path; counted by the engine if so */
+    }
     const cst::TbShape *tb = s.blocks.pending(vcpu);
     uint64_t ran = qemu_plugin_u64_get(s.started, vcpu);
     if (tb && ran >= 1 && ran <= tb->insns.size()) {
@@ -247,7 +421,7 @@ void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
 void on_vcpu_exit(qemu_plugin_id_t, unsigned int vcpu)
 {
     Session &s = session();
-    std::lock_guard<std::mutex> guard(s.lock);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {
         s.blocks.finish(vcpu, qemu_plugin_u64_get(s.started, vcpu));
     }
@@ -258,18 +432,19 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
     Session &s = session();
     auto shape = std::make_unique<cst::TbShape>();
     size_t n = qemu_plugin_tb_n_insns(tb);
-    std::lock_guard<std::mutex> guard(s.lock);
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         cst::Insn in{};
         in.pc = qemu_plugin_insn_vaddr(insn);
         in.size = uint8_t(qemu_plugin_insn_data(insn, in.bytes, sizeof(in.bytes)));
-        shape->insns.push_back(s.blocks.intern(in));
+        shape->raw.push_back(in);
         auto kind = qemu_plugin_insn_transfer_kind(insn);
         if (kind == QEMU_PLUGIN_TRANSFER_COND_NO_TARGET) {
-            s.blocks.ends_block(shape->insns.back());   /* a trap, in place */
+            shape->traps.push_back(i);
         } else if (kind != QEMU_PLUGIN_TRANSFER_NONE) {
             shape->transfer = int(i);
+            shape->indirect = kind == QEMU_PLUGIN_TRANSFER_INDIRECT;
+            shape->target = qemu_plugin_insn_branch_target_pc(insn);
         }
         qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
             insn, QEMU_PLUGIN_INLINE_STORE_U64, s.started, i + 1);
@@ -281,9 +456,10 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
     if (n == 0) {
         return;
     }
-    s.blocks.translated(*shape);
-    qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, QEMU_PLUGIN_CB_NO_REGS,
+    /* RW: an excursion launched here saves, runs and restores the vCPU */
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
                                          shape.get());
+    std::lock_guard<std::mutex> guard(s.tbs_lock);
     s.tbs.push_back(std::move(shape));
 }
 
@@ -299,6 +475,10 @@ bool parse_options(Session &s, int argc, char **argv)
             outfile = val;
         } else if (eq != std::string::npos && key == "compress") {
             s.compress = val;
+        } else if (key == "wp" && (val == "0" || val == "1")) {
+            s.wp = val == "1";
+        } else if (key == "wpdepth" && std::atoi(val.c_str()) > 0) {
+            s.wpdepth = size_t(std::atoi(val.c_str()));
         } else {
             say("unknown or malformed option '" + opt + "'");
             return false;

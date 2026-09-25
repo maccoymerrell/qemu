@@ -612,13 +612,13 @@ static TCGv mxu_CR;
 /*
  * Five characters, not four: "XR10" is four and a terminator makes five.
  *
- * At four the last seven rows held no terminator, and tcg_global_mem_new()
- * takes a C string -- so XR10 was registered under the name "XR10XR11XR12"
- * and so on down the array, XCR under a name whose end was whatever followed
- * the table.  It is a register's NAME, which is what a consumer asking QEMU
- * what an instruction touched is handed, so a register with the wrong name is
- * a register that cannot be identified; it also reads past the object, which
- * is the same defect in its other aspect.
+ * At four the six rows XR10..XR15 held no terminator, and
+ * tcg_global_mem_new() takes a C string -- so XR10 was registered under the
+ * name "XR10XR11XR12XR13XR14XR15XCR" and so on down to XR15 as "XR15XCR";
+ * only the three-character "XCR" row stopped where it should.  That string
+ * becomes TCGTemp::name, which tcg_dump_ops() and the `-d op` log print to
+ * identify the register, so each of those six registers was logged under the
+ * wrong name, read by running past the end of its own row.
  */
 static const char mxuregnames[NUMBER_OF_MXU_REGISTERS][5] = {
     "XR1",  "XR2",  "XR3",  "XR4",  "XR5",  "XR6",  "XR7",  "XR8",

@@ -1262,11 +1262,11 @@ static target_ulong riscv_pmu_ctr_get_fixed_counters_val(CPURISCVState *env,
              * cpu_get_ticks(), not cpu_get_host_ticks(): both count host CPU
              * cycles, but only the former is the VM's tick counter -- offset
              * and gated on timers_state.cpu_ticks_enabled.  The raw host
-             * counter runs while the VM is stopped (a `-S` pause or a
-             * monitor stop/cont would make mcycle jump by the pause) and
-             * through a TCG plugin's clock freeze, while `time` (ACLINT
-             * mtime, a function of QEMU_CLOCK_VIRTUAL) stands still; the
-             * guest can read those counters against each other.
+             * counter runs whenever the VM's clocks are stopped (a `-S`
+             * pause or a monitor stop/cont would make mcycle jump by the
+             * pause), while `time` (ACLINT mtime, a function of
+             * QEMU_CLOCK_VIRTUAL) stands still; the guest can read those
+             * counters against each other.
              */
             curr_val = cpu_get_ticks();
         }

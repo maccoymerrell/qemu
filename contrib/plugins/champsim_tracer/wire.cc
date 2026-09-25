@@ -94,6 +94,8 @@ enum : uint8_t {
     kTagRegfile = 4, kTagAsid = 5,
 };
 
+constexpr uint8_t kUnclassified = 0;    /* opcode and branch_type value */
+
 using MapEntries = std::vector<std::pair<uint64_t, const char *>>;
 
 /* Enumerated names take 0, 1, 2 ...; flag names take bits 0, 1, 2 ... */
@@ -153,6 +155,12 @@ Bytes encoding_maps()
         { "field_id", numbered({ "CST_FID_BB_START", "CST_FID_BB_STOP",
                                  "CST_FID_BB_FLAGS", "CST_FID_BB_FAULT_DEPTH",
                                  "CST_FID_BB_FAULT_INSN" }, false) },
+        /*
+         * Every template instruction carries these two values: this
+         * writer classifies nothing yet, and says so by name.
+         */
+        { "opcode", { { kUnclassified, "GEN_OP_UNKNOWN" } } },
+        { "branch_type", { { kUnclassified, "BRANCH_UNCLASSIFIED" } } },
     };
     Bytes b;
     b.uleb(sizeof(maps) / sizeof(maps[0]));
@@ -167,9 +175,39 @@ Bytes encoding_maps()
     return b;
 }
 
+/* One template payload (section 6); its id is its index. */
+Bytes template_payload(uint64_t id, const WireTemplate &t)
+{
+    Bytes b;
+    const WireInsn &last = t.insns.back();
+    b.uleb(id);
+    b.uleb(t.insns.front().pc);
+    b.uleb(t.insns.size());
+    b.uleb(t.terminated ? last.pc + last.size : 0);     /* fall_through_pc */
+    b.uleb(0);          /* n_targets: branch-target history absent */
+    b.str("");          /* symbol_name */
+    uint64_t prev = t.insns.front().pc;
+    for (const WireInsn &i : t.insns) {
+        b.uleb(i.pc - prev);
+        prev = i.pc;
+        b.u8(kUnclassified);    /* opcode */
+        b.u8(kUnclassified);    /* branch_type */
+        /* flags, n_src, n_dst, max_dep_loads, max_dep_stores: unclaimed */
+        for (int k = 0; k < 5; k++) {
+            b.u8(0);
+        }
+        b.u8(i.size);
+        for (unsigned k = 0; k < i.size; k++) {
+            b.u8(i.bytes[k]);
+        }
+    }
+    return b;
+}
+
 } /* namespace */
 
-Bytes header_member(const HeaderFacts &facts)
+Bytes header_member(const HeaderFacts &facts,
+                    const std::vector<WireTemplate> &templates)
 {
     Bytes h;
     h.u32(kMagic);
@@ -185,11 +223,14 @@ Bytes header_member(const HeaderFacts &facts)
     h.str(facts.target_name);
     h.section(encoding_maps());
     h.uleb(0);          /* warmup_end_trace_insn_idx: no warmup, ends at 0 */
-    h.uleb(0);          /* templates section: num_templates, to member EOF */
+    h.uleb(templates.size());   /* templates section, to member EOF */
+    for (size_t id = 0; id < templates.size(); id++) {
+        h.section(template_payload(id, templates[id]));
+    }
     return h;
 }
 
-Bytes empty_body_member(uint64_t root_phys)
+Bytes body_member(uint64_t root_phys, const std::vector<WireEntry> &entries)
 {
     Bytes b;
     b.u32(kMagic);
@@ -199,8 +240,22 @@ Bytes empty_body_member(uint64_t root_phys)
     b.u64(0);           /* sig: reserved, always 0 */
     b.u8(kTagThread);   /* ... then thread 0 */
     b.sleb(0);
+    int64_t tid = 0, tmpl = 0;
+    for (const WireEntry &e : entries) {
+        if (e.tid != tid) {
+            b.u8(kTagThread);
+            b.sleb(int64_t(e.tid) - tid);
+            tid = e.tid;
+        }
+        b.u8(kTagEntry);
+        b.sleb(int64_t(e.template_id) - tmpl);
+        tmpl = e.template_id;
+        /* cp_delta_section: no record; the range defaults to the block */
+        b.uleb(1);
+        b.uleb(0);
+    }
     b.u8(kTagEnd);
-    b.uleb(0);          /* num_entries */
+    b.uleb(entries.size());
     b.u32(kMagic);
     return b;
 }

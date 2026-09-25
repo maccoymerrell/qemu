@@ -5,10 +5,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This increment is the skeleton: it installs, takes its two options,
- * and publishes a structurally complete segment with an empty body on
- * every ruled exit route.  It registers no execution, translation or
- * memory callback, so it claims no instruction.
+ * It installs, takes its two options, and publishes a structurally
+ * complete segment on every ruled exit route.  In user mode it observes
+ * execution and writes the correct-path body: true basic blocks as
+ * pc/size templates and one entry per block run (blocks.h).  It claims
+ * nothing else about an instruction; system mode keeps an empty body.
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
@@ -19,6 +20,7 @@
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -27,6 +29,7 @@ extern "C" {
 #include "qemu/qemu-plugin.h"   /* the plugin ABI is C; this is its door */
 }
 
+#include "blocks.h"
 #include "container.h"
 #include "wire.h"
 
@@ -43,6 +46,9 @@ struct Session {
     std::string scratch_dir;
     std::string compress;
     cst::HeaderFacts facts;
+    cst::BlockAssembler blocks;
+    std::vector<std::unique_ptr<cst::TbShape>> tbs;  /* live until exit */
+    qemu_plugin_u64 started;    /* per vCPU: insns begun in the current TB */
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -95,10 +101,23 @@ void publish(uint64_t root_phys, const char *route)
         return;
     }
     s.published = true;
+    s.blocks.finish_all([&s](uint32_t tid) {
+        return qemu_plugin_u64_get(s.started, tid);
+    });
+    std::vector<cst::WireTemplate> templates;
+    std::vector<cst::WireEntry> entries;
+    s.blocks.recut(templates, entries);
+    const auto &st = s.blocks.stats;
+    say("entries=" + std::to_string(entries.size()) + " templates=" +
+        std::to_string(templates.size()) + " early_exits=" +
+        std::to_string(st.early_exits) + " late_block_ends=" +
+        std::to_string(st.late_ends) + "; revised " +
+        std::to_string(st.revised_shapes) + " shapes, " +
+        std::to_string(st.recut_entries) + " entries re-cut");
     /* The body goes first, so the header can be finalised after it. */
     std::vector<cst::Member> members = {
-        { "body.cst", cst::empty_body_member(root_phys).data() },
-        { "header.cst", cst::header_member(s.facts).data() },
+        { "body.cst", cst::body_member(root_phys, entries).data() },
+        { "header.cst", cst::header_member(s.facts, templates).data() },
     };
     std::string err;
     bool ok = true;
@@ -156,6 +175,80 @@ void on_exit(qemu_plugin_id_t, void *)
         /* One address space in *-linux-user; the API defines it as 0. */
         publish(0, "exit");
     }
+}
+
+/* A TB begins: the previous one of this vCPU is over. */
+void on_tb_exec(unsigned int vcpu, void *udata)
+{
+    Session &s = session();
+    auto *tb = static_cast<const cst::TbShape *>(udata);
+    std::lock_guard<std::mutex> guard(s.lock);
+    if (s.published) {
+        return;
+    }
+    cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
+                       qemu_plugin_rep_reenter() };
+    s.blocks.retire(vcpu, qemu_plugin_u64_get(s.started, vcpu), &bulk,
+                    s.blocks.insn(tb->insns.front()).pc);
+    s.blocks.begin(vcpu, tb);
+}
+
+/* A syscall ends the block of the instruction that raised it. */
+void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
+                uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                uint64_t)
+{
+    Session &s = session();
+    std::lock_guard<std::mutex> guard(s.lock);
+    const cst::TbShape *tb = s.blocks.pending(vcpu);
+    uint64_t ran = qemu_plugin_u64_get(s.started, vcpu);
+    if (tb && ran >= 1 && ran <= tb->insns.size()) {
+        s.blocks.ends_block(tb->insns[ran - 1]);
+    }
+}
+
+/* A guest thread is gone; its index may be handed to a later thread. */
+void on_vcpu_exit(qemu_plugin_id_t, unsigned int vcpu)
+{
+    Session &s = session();
+    std::lock_guard<std::mutex> guard(s.lock);
+    if (!s.published) {
+        s.blocks.finish(vcpu, qemu_plugin_u64_get(s.started, vcpu));
+    }
+}
+
+void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
+{
+    Session &s = session();
+    auto shape = std::make_unique<cst::TbShape>();
+    size_t n = qemu_plugin_tb_n_insns(tb);
+    std::lock_guard<std::mutex> guard(s.lock);
+    for (size_t i = 0; i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        cst::Insn in{};
+        in.pc = qemu_plugin_insn_vaddr(insn);
+        in.size = uint8_t(qemu_plugin_insn_data(insn, in.bytes, sizeof(in.bytes)));
+        shape->insns.push_back(s.blocks.intern(in));
+        auto kind = qemu_plugin_insn_transfer_kind(insn);
+        if (kind == QEMU_PLUGIN_TRANSFER_COND_NO_TARGET) {
+            s.blocks.ends_block(shape->insns.back());   /* a trap, in place */
+        } else if (kind != QEMU_PLUGIN_TRANSFER_NONE) {
+            shape->transfer = int(i);
+        }
+        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+            insn, QEMU_PLUGIN_INLINE_STORE_U64, s.started, i + 1);
+        /* The engine counts a bulk op's units (FEAT_MOPS) only while the
+         * op carries a memory callback; a no-op one arms the count. */
+        qemu_plugin_register_vcpu_mem_inline_per_vcpu(
+            insn, QEMU_PLUGIN_MEM_RW, QEMU_PLUGIN_INLINE_ADD_U64, s.started, 0);
+    }
+    if (n == 0) {
+        return;
+    }
+    s.blocks.translated(*shape);
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, QEMU_PLUGIN_CB_NO_REGS,
+                                         shape.get());
+    s.tbs.push_back(std::move(shape));
 }
 
 bool parse_options(Session &s, int argc, char **argv)
@@ -220,6 +313,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     if (s.system) {
         qemu_plugin_register_vm_shutdown_cb(id, on_shutdown);
         qemu_plugin_register_vm_reset_cb(id, on_reset);
+    } else {
+        /* System-mode thread identity is a later increment's claim. */
+        s.started = qemu_plugin_scoreboard_u64(
+            qemu_plugin_scoreboard_new(sizeof(uint64_t)));
+        qemu_plugin_register_vcpu_tb_trans_cb(id, on_tb_trans);
+        qemu_plugin_register_vcpu_syscall_cb(id, on_syscall);
+        qemu_plugin_register_vcpu_exit_cb(id, on_vcpu_exit);
     }
     return 0;
 }

@@ -49,15 +49,27 @@ struct HeaderFacts {
 /* Returns the TraceISA byte for a QEMU target name, or -1 if not traced. */
 int isa_for_target(const std::string &target_name);
 
-/* The header member: magic through the (empty) templates section. */
-Bytes header_member(const HeaderFacts &facts);
+/*
+ * One template (section 6): a true basic block as a pc/size/bytes list.
+ * @terminated says its last instruction was learned to end a block, which
+ * is all fall_through_pc states; nothing else about the branch is claimed.
+ */
+struct WireInsn { uint64_t pc; uint8_t size; const uint8_t *bytes; };
+struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
+
+/* One body entry: the block ran whole in thread @tid (section 4.2). */
+struct WireEntry { uint32_t tid, template_id; };
+
+/* The header member: magic through the templates section (ids = index). */
+Bytes header_member(const HeaderFacts &facts,
+                    const std::vector<WireTemplate> &templates);
 
 /*
- * The body member of a segment with no entries: lead magic, the opening
- * (asid, thread) declaration of section 4, END carrying a count of 0,
- * trailing magic.  @root_phys is the asid-0 label (section 4.1a).
+ * The body member: lead magic, the opening (asid, thread) declaration of
+ * section 4, the entries, END carrying their count, trailing magic.
+ * @root_phys is the asid-0 label (section 4.1a).
  */
-Bytes empty_body_member(uint64_t root_phys);
+Bytes body_member(uint64_t root_phys, const std::vector<WireEntry> &entries);
 
 } /* namespace cst */
 

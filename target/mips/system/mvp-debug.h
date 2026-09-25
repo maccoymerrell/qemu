@@ -73,7 +73,7 @@ void mips_mvp_debug_init(void);
 void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after);
 void mips_mvp_note_gate(CPUMIPSState *env);
 void mips_mvp_note_run(CPUState *target, int op);
-void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
-                         int64_t now_ns, int64_t deadline_ns);
+void mips_cp0t_note(CPUMIPSState *env, int op, uint32_t wait,
+                    int64_t now_ns, int64_t deadline_ns);
 
 #endif /* MIPS_MVP_DEBUG_H */

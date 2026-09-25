@@ -393,7 +393,7 @@ void qemu_plugin_vm_reset_wait_placed(void)
  * life (translated TBs carry its prologue); only VIRTUAL consumption
  * returns to stock.
  */
-void qemu_plugin_vclock_agency_mode(bool active)
+void plugin_vclock_agency_set_active(bool active)
 {
     if (active) {
         /*

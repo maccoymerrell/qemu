@@ -242,7 +242,7 @@ static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
 }
 
 /*
- * TCGCPUOps::spec_clock_resync for RISC-V -- see the contract in
+ * TCGCPUOps::plugin_clock_resync for RISC-V -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * RISC-V's audit.  The guest reads time through the `time` CSR, which is
@@ -263,12 +263,13 @@ static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
  * otherwise have swallowed are replayed by cpu_plugin_arch_state_restore
  * before we get here.
  *
- * SPEC_CLOCK_THAW needs nothing: every RISC-V counter is a pure function of
- * the virtual clock.
+ * CPU_PLUGIN_CLOCK_CB_WINDOW_END needs nothing: every RISC-V counter is a
+ * pure function of the virtual clock.
  */
-static void riscv_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+static void riscv_plugin_clock_resync(CPUState *cs,
+                                      CPUPluginClockResyncReason reason)
 {
-    if (reason != SPEC_CLOCK_EXCURSION_END) {
+    if (reason != CPU_PLUGIN_CLOCK_EXCURSION_END) {
         return;
     }
     riscv_cpu_plugin_resync_timers(cs);
@@ -285,7 +286,7 @@ static const TCGCPUOps riscv_tcg_ops = {
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
     .plugin_thread_ptr_tracks_current = riscv_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
-    .spec_clock_resync = riscv_spec_clock_resync,
+    .plugin_clock_resync = riscv_plugin_clock_resync,
 #endif
 
 #ifndef CONFIG_USER_ONLY

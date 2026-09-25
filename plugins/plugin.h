@@ -146,7 +146,7 @@ void plugin_evq_note_drained(CPUState *cpu);
 void qemu_plugin_fillin_mode_info(qemu_info_t *info);
 
 /**
- * qemu_plugin_vclock_agency_mode - track the PLUGIN-ACTIVE condition
+ * plugin_vclock_agency_set_active - track the PLUGIN-ACTIVE condition
  * @active: true when the first plugin installs, false when the last
  *          uninstalls
  *
@@ -159,6 +159,6 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info);
  * half stays armed for process life, because translated TBs carry its
  * prologue.
  */
-void qemu_plugin_vclock_agency_mode(bool active);
+void plugin_vclock_agency_set_active(bool active);
 
 #endif /* PLUGIN_H */

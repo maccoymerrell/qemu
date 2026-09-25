@@ -92,7 +92,7 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     next_ns = now_ns + clock_ticks_to_ns(env->count_clock, wait);
     timer_mod(env->timer, next_ns);
     if (unlikely(mips_mvp_debug > 0)) {
-        mips_mvp_note_timer(env, op, wait, now_ns, next_ns);
+        mips_cp0t_note(env, op, wait, now_ns, next_ns);
     }
 }
 
@@ -136,8 +136,8 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
     }
     qemu_irq_raise(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
     if (unlikely(mips_mvp_debug > 0)) {
-        mips_mvp_note_timer(env, MIPS_CP0T_FIRE, 0,
-                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
+        mips_cp0t_note(env, MIPS_CP0T_FIRE, 0,
+                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
     }
 }
 
@@ -163,7 +163,7 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
      * drive was observed and suppressed" misses every desync the rollback
      * produced on its own, so there is no gate.
      */
-    cpu_mips_plugin_reconcile_irq(env);
+    mips_cpu_plugin_reconcile_irq(env);
 
     /*
      * Re-arm the host deadline from the restored CP0_Count/Compare.  There is

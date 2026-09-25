@@ -74,7 +74,7 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
         unsigned remain    = PLUGIN_SPEC_LINE_SIZE - idx;
         unsigned chunk     = (unsigned)size < remain ? (unsigned)size : remain;
 
-        PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+        CPUPluginSpecLine *line = spec_line_lookup(cpu, line_addr);
         uint64_t chunk_mask = (chunk >= 64 ? ~(uint64_t)0
                                            : (((uint64_t)1 << chunk) - 1)) << idx;
 

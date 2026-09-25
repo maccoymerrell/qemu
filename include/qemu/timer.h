@@ -232,7 +232,7 @@ void qemu_clock_notify(QEMUClockType type);
 void qemu_clock_enable(QEMUClockType type, bool enabled);
 
 /**
- * qemu_clock_plugin_stall_set:
+ * qemu_clock_virtual_stall:
  * @on: true to stall guest-visible virtual-clock processing, false to resume
  *
  * While the stall is held, QEMU_CLOCK_VIRTUAL is not merely fixed in value:
@@ -269,7 +269,7 @@ void qemu_clock_enable(QEMUClockType type, bool enabled);
  * Caller holds the BQL.  Readers (vCPU threads, AioContext timerlists) read
  * the switch without it.
  */
-void qemu_clock_plugin_stall_set(bool on);
+void qemu_clock_virtual_stall(bool on);
 
 /**
  * qemu_clock_run_timers:

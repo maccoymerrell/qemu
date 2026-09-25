@@ -191,7 +191,7 @@ void cpu_disable_ticks(void)
  * cpu_ticks_enabled is one boolean, while a plugin freeze is opened and
  * closed per-vCPU: the wrong-path excursion freeze in
  * cpu_plugin_excursion_open() belongs to the excursion's vCPU, and the
- * correct-path instrumentation window in cpu_plugin_vclock_pause() belongs to
+ * correct-path instrumentation window in cpu_plugin_cb_window_open() belongs to
  * whichever vCPU is running a plugin callback -- including a translation
  * callback, which is not serialised against a peer's excursion at all.  Were
  * both to call cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's
@@ -290,7 +290,7 @@ void cpu_plugin_spec_clock_freeze(int cpu_index)
      * on entry, and releasing it last gives it zero width on exit.
      */
     if (plugin_spec_stall_depth++ == 0) {
-        qemu_clock_plugin_stall_set(true);
+        qemu_clock_virtual_stall(true);
     }
     cpu_plugin_clock_freeze(cpu_index);
 }
@@ -310,7 +310,7 @@ void cpu_plugin_spec_clock_thaw(int cpu_index)
      * regardless; that is vm_stop's doing, not this stall's.
      */
     if (--plugin_spec_stall_depth == 0) {
-        qemu_clock_plugin_stall_set(false);
+        qemu_clock_virtual_stall(false);
     }
 }
 

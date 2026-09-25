@@ -94,7 +94,7 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
  * back to real memory for bytes not in the buffer.
  *
  * The buffer is a GHashTable keyed by line_addr = addr & ~63, with
- * value = pool index + 1 of a PluginSpecLine (never a pointer; the pool
+ * value = pool index + 1 of a CPUPluginSpecLine (never a pointer; the pool
  * reallocs).  A line holds a 64-byte payload plus a 64-bit valid_mask
  * (bit k = byte k of this line has a speculative value).  Lines are
  * bump-allocated from cpu->plugin_spec_store_pool to avoid per-line
@@ -127,7 +127,8 @@ static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
     return cpu_plugin_spec_active(cpu);
 }
 
-static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
+static inline CPUPluginSpecLine *spec_line_lookup(CPUState *cpu,
+                                                  vaddr line_addr)
 {
     /* The hash value is the line's pool index + 1, resolved against the
      * pool base of the moment -- never a stored pointer, which the pool's
@@ -137,7 +138,7 @@ static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
     if (!val) {
         return NULL;
     }
-    return &((PluginSpecLine *)cpu->plugin_spec_store_pool)
+    return &((CPUPluginSpecLine *)cpu->plugin_spec_store_pool)
                 [GPOINTER_TO_SIZE(val) - 1];
 }
 
@@ -145,7 +146,7 @@ static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
 {
     vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
     unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    CPUPluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
     if (!line) {
         return;
     }
@@ -157,7 +158,7 @@ static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
 {
     vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
     unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-    PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+    CPUPluginSpecLine *line = spec_line_lookup(cpu, line_addr);
     if (!line || !(line->valid_mask & ((uint64_t)1 << idx))) {
         return false;
     }
@@ -178,7 +179,7 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
         unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
         unsigned chunk   = (unsigned)size < remain ? (unsigned)size : remain;
 
-        PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+        CPUPluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
         if (!line) {
             /* Sandbox capped -- drop remaining bytes.  See
              * PLUGIN_SPEC_STORE_LINE_MAX in exec/plugin-spec.h. */
@@ -214,7 +215,7 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
  *
  * A naturally-aligned atomic of size <= 16 never crosses a 64-byte line,
  * so idx + size <= 64 and the returned pointer carries the same
- * alignment the guest access guaranteed (PluginSpecLine is 16-aligned
+ * alignment the guest access guaranteed (CPUPluginSpecLine is 16-aligned
  * with bytes[] at offset 0 -- see plugin-spec.h).
  *
  * Never returns NULL, and deliberately offers no way for a caller to obtain
@@ -238,7 +239,7 @@ static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
 {
     vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
     unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    CPUPluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
     if (!line) {
         /*
          * Capped: discard the RMW into the per-vCPU scratch line.  Only the

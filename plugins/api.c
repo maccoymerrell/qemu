@@ -564,8 +564,8 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
             gpointer val = g_hash_table_lookup(
                 current_cpu->plugin_spec_store_buf,
                 GSIZE_TO_POINTER((gsize)line_addr));
-            PluginSpecLine *line = val
-                ? &((PluginSpecLine *)current_cpu->plugin_spec_store_pool)
+            CPUPluginSpecLine *line = val
+                ? &((CPUPluginSpecLine *)current_cpu->plugin_spec_store_pool)
                       [GPOINTER_TO_SIZE(val) - 1]
                 : NULL;
             if (line) {
@@ -846,8 +846,8 @@ bool qemu_plugin_translate_at(uint64_t pc)
 }
 
 /*
- * Bump-allocate (or reuse) the PluginSpecLine for @line_addr.  The
- * pool is a flat PluginSpecLine[] that grows on demand and is reset
+ * Bump-allocate (or reuse) the CPUPluginSpecLine for @line_addr.  The
+ * pool is a flat CPUPluginSpecLine[] that grows on demand and is reset
  * (used = 0) at spec_mode_end -- entries from prior simulations are
  * never freed, just overwritten on reuse.  Returns NULL when the
  * sandbox line cap is reached and the line isn't already tracked.
@@ -860,9 +860,9 @@ bool qemu_plugin_translate_at(uint64_t pc)
  * across growth by construction; each lookup resolves it against the
  * pool base of the moment.
  */
-PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
+CPUPluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
 {
-    PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+    CPUPluginSpecLine *pool = (CPUPluginSpecLine *)cpu->plugin_spec_store_pool;
     gpointer val = g_hash_table_lookup(
         cpu->plugin_spec_store_buf, GSIZE_TO_POINTER((gsize)line_addr));
     if (val) {
@@ -884,12 +884,12 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
         size_t new_cap = cpu->plugin_spec_store_pool_cap
             ? cpu->plugin_spec_store_pool_cap * 2 : 256;
         cpu->plugin_spec_store_pool = g_realloc_n(
-            cpu->plugin_spec_store_pool, new_cap, sizeof(PluginSpecLine));
+            cpu->plugin_spec_store_pool, new_cap, sizeof(CPUPluginSpecLine));
         cpu->plugin_spec_store_pool_cap = new_cap;
-        pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+        pool = (CPUPluginSpecLine *)cpu->plugin_spec_store_pool;
     }
     size_t idx = cpu->plugin_spec_store_pool_used++;
-    PluginSpecLine *line = &pool[idx];
+    CPUPluginSpecLine *line = &pool[idx];
     line->valid_mask = 0;
     /*
      * bytes[] left uninitialised; valid_mask gates reads, so unused
@@ -1018,13 +1018,13 @@ void qemu_plugin_spec_vtime_resume(void)
 void qemu_plugin_vclock_pause(void)
 {
     g_assert(current_cpu);
-    cpu_plugin_vclock_pause(current_cpu);
+    cpu_plugin_cb_window_open(current_cpu);
 }
 
 void qemu_plugin_vclock_resume(void)
 {
     g_assert(current_cpu);
-    cpu_plugin_vclock_resume(current_cpu);
+    cpu_plugin_cb_window_close(current_cpu);
 }
 
 /*
@@ -1060,7 +1060,7 @@ bool qemu_plugin_in_spec_mode(void)
 }
 
 /*
- * The internal event (QemuPluginCpuEvent, hw/core/cpu.h) and the
+ * The internal event (CPUPluginEvent, hw/core/cpu.h) and the
  * plugin-facing struct qemu_plugin_cpu_event share one layout: the drain
  * below hands out the internal buffer by cast.  The kind values pass
  * through raw as well, so the two enums must stay value-aligned member for
@@ -1068,21 +1068,21 @@ bool qemu_plugin_in_spec_mode(void)
  * drift in either is a compile break rather than silent corruption.
  */
 QEMU_BUILD_BUG_ON(sizeof(struct qemu_plugin_cpu_event) !=
-                  sizeof(QemuPluginCpuEvent));
+                  sizeof(CPUPluginEvent));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, kind) !=
-                  offsetof(QemuPluginCpuEvent, kind));
+                  offsetof(CPUPluginEvent, kind));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, priv) !=
-                  offsetof(QemuPluginCpuEvent, priv));
+                  offsetof(CPUPluginEvent, priv));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, tp_ok) !=
-                  offsetof(QemuPluginCpuEvent, tp_ok));
+                  offsetof(CPUPluginEvent, tp_ok));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, depth_after) !=
-                  offsetof(QemuPluginCpuEvent, depth_after));
+                  offsetof(CPUPluginEvent, depth_after));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, pc) !=
-                  offsetof(QemuPluginCpuEvent, pc));
+                  offsetof(CPUPluginEvent, pc));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, asid) !=
-                  offsetof(QemuPluginCpuEvent, asid));
+                  offsetof(CPUPluginEvent, asid));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, tp) !=
-                  offsetof(QemuPluginCpuEvent, tp));
+                  offsetof(CPUPluginEvent, tp));
 QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_ENTER !=
                   (int)QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER);
 QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_RETURN !=
@@ -1156,7 +1156,7 @@ size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
         *evs = NULL;
         return 0;
     }
-    QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
+    CPUPluginEventQueue *q = &cpu->plugin_evq;
     size_t n = q->len;
     /*
      * Single producer/consumer == this vCPU thread; handing out the

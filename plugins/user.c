@@ -24,6 +24,6 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
  * discipline compiles down to this no-op (qemu-user never arms the
  * predicate, and every hook site is softmmu-only).
  */
-void qemu_plugin_vclock_agency_mode(bool active)
+void plugin_vclock_agency_set_active(bool active)
 {
 }

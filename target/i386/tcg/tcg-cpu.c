@@ -303,7 +303,7 @@ static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
 }
 
 /*
- * TCGCPUOps::spec_clock_resync for x86 -- see the contract in
+ * TCGCPUOps::plugin_clock_resync for x86 -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * x86's audit of guest-observable time sources:
@@ -335,32 +335,33 @@ static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
  * BQL-serialised: both callers of this hook hold it, which is what protects
  * the calibration accumulators below and the one-shot arming.
  */
-static int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
-static int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
-static bool    g_pin_locked;                  /* lock armed; nothing left */
+static int64_t g_tsc_cal_last_ht, g_tsc_cal_last_hm; /* previous host sample */
+static int64_t g_tsc_cal_tsc, g_tsc_cal_ns;          /* calibration sums */
+static bool    g_tsc_cal_locked; /* lock armed; nothing left */
 
-static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+static void x86_plugin_clock_resync(CPUState *cs,
+                                    CPUPluginClockResyncReason reason)
 {
     int64_t ht, hm;
 
-    if (g_pin_locked) {
+    if (g_tsc_cal_locked) {
         return;
     }
 
     ht = cpu_get_host_ticks();
     hm = get_clock();
 
-    if (g_pin_last_hm) {
-        g_pin_cal_tsc += ht - g_pin_last_ht;
-        g_pin_cal_ns  += hm - g_pin_last_hm;
+    if (g_tsc_cal_last_hm) {
+        g_tsc_cal_tsc += ht - g_tsc_cal_last_ht;
+        g_tsc_cal_ns  += hm - g_tsc_cal_last_hm;
     }
-    if (g_pin_cal_ns >= 200 * 1000 * 1000) {
-        cpu_plugin_tsc_lock_to_vclock((double)g_pin_cal_tsc /
-                                      (double)g_pin_cal_ns * 1e9);
-        g_pin_locked = true;
+    if (g_tsc_cal_ns >= 200 * 1000 * 1000) {
+        cpu_plugin_tsc_lock_to_vclock((double)g_tsc_cal_tsc /
+                                      (double)g_tsc_cal_ns * 1e9);
+        g_tsc_cal_locked = true;
     }
-    g_pin_last_ht = ht;
-    g_pin_last_hm = hm;
+    g_tsc_cal_last_ht = ht;
+    g_tsc_cal_last_hm = hm;
 }
 #endif
 
@@ -376,7 +377,7 @@ static const TCGCPUOps x86_tcg_ops = {
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
     .plugin_thread_ptr_tracks_current = x86_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
-    .spec_clock_resync = x86_spec_clock_resync,
+    .plugin_clock_resync = x86_plugin_clock_resync,
 #endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,

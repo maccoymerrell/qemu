@@ -27,14 +27,14 @@ void cpu_exec_init_all(void);
 void cpu_exec_step_atomic(CPUState *cpu);
 
 /**
- * SpecClockResyncReason: which plugin clock freeze just ended
+ * CPUPluginClockResyncReason: which plugin clock freeze just ended
  *
  * The plugin freezes the guest virtual clock in two situations, and the
- * per-target TCGCPUOps::spec_clock_resync hook is told which one it is
+ * per-target TCGCPUOps::plugin_clock_resync hook is told which one it is
  * unfreezing from.  Both freezes must leave guest time unmoved; they differ
  * in whether guest architectural state also moved and came back.
  */
-typedef enum SpecClockResyncReason {
+typedef enum CPUPluginClockResyncReason {
     /*
      * A wrong-path (speculative) excursion ended.  The clock was frozen for
      * its whole duration AND the speculative register state has just been
@@ -43,7 +43,7 @@ typedef enum SpecClockResyncReason {
      * were not.  Host timer callbacks that fired during the excursion were
      * suppressed and must be re-delivered.  This is the full reconcile.
      */
-    SPEC_CLOCK_EXCURSION_END,
+    CPU_PLUGIN_CLOCK_EXCURSION_END,
     /*
      * A correct-path plugin instrumentation window ended (translation-time
      * decoding, per-TB trace emission).  No guest state moved; only the
@@ -53,8 +53,8 @@ typedef enum SpecClockResyncReason {
      * every freeze; a target whose counters are all derived from the virtual
      * clock has nothing to do.
      */
-    SPEC_CLOCK_THAW,
-} SpecClockResyncReason;
+    CPU_PLUGIN_CLOCK_CB_WINDOW_END,
+} CPUPluginClockResyncReason;
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 

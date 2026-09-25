@@ -2835,7 +2835,7 @@ static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
 }
 
 /*
- * TCGCPUOps::spec_clock_resync for Arm -- see the contract in
+ * TCGCPUOps::plugin_clock_resync for Arm -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * Arm's audit: every architectural counter the guest can read (CNTVCT_EL0,
@@ -2847,14 +2847,15 @@ static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
  * registers, and the interrupt lines shadowing irq_line_state.  Both are
  * reconciled here, unconditionally.
  *
- * SPEC_CLOCK_THAW needs nothing: no guest state moved, and every Arm counter
- * is a pure function of the virtual clock, which resumes at the value it was
- * frozen at.  (Contrast x86, whose TSC free-runs off a different host
- * oscillator and must be re-pinned on every thaw.)
+ * CPU_PLUGIN_CLOCK_CB_WINDOW_END needs nothing: no guest state moved, and
+ * every Arm counter is a pure function of the virtual clock, which resumes at
+ * the value it was frozen at.  (Contrast x86, whose TSC free-runs off a
+ * different host oscillator and must be re-pinned on every thaw.)
  */
-static void arm_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+static void arm_plugin_clock_resync(CPUState *cs,
+                                    CPUPluginClockResyncReason reason)
 {
-    if (reason != SPEC_CLOCK_EXCURSION_END) {
+    if (reason != CPU_PLUGIN_CLOCK_EXCURSION_END) {
         return;
     }
     arm_cpu_plugin_resync_timers(cs);
@@ -2873,7 +2874,7 @@ static const TCGCPUOps arm_tcg_ops = {
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
     .plugin_thread_ptr_tracks_current = arm_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
-    .spec_clock_resync = arm_spec_clock_resync,
+    .plugin_clock_resync = arm_plugin_clock_resync,
 #endif
 
 #ifdef CONFIG_USER_ONLY

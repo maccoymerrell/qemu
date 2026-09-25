@@ -414,7 +414,7 @@ void tb_lock_page0(tb_page_addr_t paddr)
      * while the current page-lock holder can be a sibling vCPU translating
      * REAL code: it holds its TB's page locks across translation and, inside
      * its translation-time plugin callback, waits for that same state
-     * (cpu_plugin_vclock_pause takes the BQL).  That is a cross-vCPU
+     * (cpu_plugin_cb_window_open takes the BQL).  That is a cross-vCPU
      * lock-order inversion (BQL -> page vs page -> BQL): one thread spins
      * in page_lock forever below every plugin callback while the other
      * sleeps holding the page.  The wrong path

@@ -888,7 +888,7 @@ uint64_t riscv_cpu_update_mip(CPURISCVState *env, uint64_t mask, uint64_t value)
 
 #ifdef CONFIG_PLUGIN
     /*
-     * Pending-interrupt replay (part of the spec_clock_resync contract).
+     * Pending-interrupt replay (part of the plugin_clock_resync contract).
      * env->mip lives inside the wrong-path register snapshot, so the
      * excursion-exit restore rewinds it.  For bits the GUEST changed that is
      * exactly right -- a speculative CSR write to sip must be discarded.  For

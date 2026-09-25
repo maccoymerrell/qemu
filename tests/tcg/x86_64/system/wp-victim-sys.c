@@ -52,7 +52,7 @@ enum {
 #define N_P2A      20       /* clock-freeze triggers */
 #define K_P2B    1000       /* timer-window triggers (B3's K) */
 #define LIVE_TICKS 50       /* liveness phase: periodic ticks required */
-#define C2_PAGES  600       /* > CPU_SPEC_TLB_LOG_MAX */
+#define C2_PAGES  600       /* > CPU_PLUGIN_SPEC_TLB_LOG_MAX */
 #define P2B_DEADLINE 200000 /* LAPIC counts at divide 1: 200 us */
 
 #define TIMER_VEC  0x40

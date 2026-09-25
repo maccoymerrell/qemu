@@ -695,7 +695,7 @@ static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
 }
 
 /*
- * TCGCPUOps::spec_clock_resync for MIPS -- see the contract in
+ * TCGCPUOps::plugin_clock_resync for MIPS -- see the contract in
  * include/accel/tcg/cpu-ops.h.
  *
  * MIPS's audit.  The only architectural time source is the CP0 Count/Compare
@@ -709,12 +709,13 @@ static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
  * CP0_Cause.IP is rewound underneath it.  mips_cpu_plugin_resync_timers does
  * both, unconditionally.
  *
- * SPEC_CLOCK_THAW needs nothing: Count is a pure function of the virtual
- * clock.
+ * CPU_PLUGIN_CLOCK_CB_WINDOW_END needs nothing: Count is a pure function of
+ * the virtual clock.
  */
-static void mips_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+static void mips_plugin_clock_resync(CPUState *cs,
+                                     CPUPluginClockResyncReason reason)
 {
-    if (reason != SPEC_CLOCK_EXCURSION_END) {
+    if (reason != CPU_PLUGIN_CLOCK_EXCURSION_END) {
         return;
     }
     mips_cpu_plugin_resync_timers(cs);
@@ -731,7 +732,7 @@ static const TCGCPUOps mips_tcg_ops = {
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
     .plugin_thread_ptr_tracks_current = mips_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = mips_vaddr_is_kernel,
-    .spec_clock_resync = mips_spec_clock_resync,
+    .plugin_clock_resync = mips_plugin_clock_resync,
 #endif
 
 #if !defined(CONFIG_USER_ONLY)

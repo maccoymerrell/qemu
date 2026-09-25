@@ -105,7 +105,7 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
  * wrong-path excursion suppressed a line update.  Called from
  * mips_cpu_plugin_resync_timers at the excursion-exit boundary.
  */
-void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env)
+void mips_cpu_plugin_reconcile_irq(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);
     if (env->CP0_Cause & CP0Ca_IP_mask) {

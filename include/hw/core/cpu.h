@@ -415,7 +415,7 @@ struct qemu_work_item;
 
 #define CPU_UNSET_NUMA_NODE_ID -1
 
-typedef enum QemuPluginCpuEventKind {
+typedef enum CPUPluginEventKind {
     QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER  = 0,
     QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN = 1,
     QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER  = 2,
@@ -437,10 +437,10 @@ typedef enum QemuPluginCpuEventKind {
      * raw.
      */
     QEMU_PLUGIN_CPU_EVENT_ASID_WRITE   = 4,
-} QemuPluginCpuEventKind;
+} CPUPluginEventKind;
 
-typedef struct QemuPluginCpuEvent {
-    uint8_t  kind;          /* QemuPluginCpuEventKind */
+typedef struct CPUPluginEvent {
+    uint8_t  kind;          /* CPUPluginEventKind */
     uint8_t  priv;          /* privilege level at the event instant */
     uint8_t  tp_ok;         /* @tp named the executing thread at the event
                              * instant (user privilege, or the target's
@@ -451,7 +451,7 @@ typedef struct QemuPluginCpuEvent {
     uint64_t tp;            /* thread pointer at the event instant; for an
                              * ASYNC_ENTER, the DELIVERING thread's (pushed
                              * before any handler state switches) */
-} QemuPluginCpuEvent;
+} CPUPluginEvent;
 
 /* The drain hands the buffer to plugins as struct qemu_plugin_cpu_event;
  * the two layouts must stay identical (checked in plugins/api.c). */
@@ -484,8 +484,8 @@ typedef struct QemuPluginCpuEvent {
  */
 #define CPU_PLUGIN_EVQ_STRUCTURAL_MAX 1024
 
-typedef struct QemuPluginCpuEventQueue {
-    QemuPluginCpuEvent *buf;    /* grow-only; owned by the vCPU */
+typedef struct CPUPluginEventQueue {
+    CPUPluginEvent *buf;    /* grow-only; owned by the vCPU */
     uint32_t len;
     uint32_t cap;
     bool enabled;
@@ -499,7 +499,7 @@ typedef struct QemuPluginCpuEventQueue {
     uint32_t max_len;
     uint64_t n_push;
     uint64_t n_drain;
-} QemuPluginCpuEventQueue;
+} CPUPluginEventQueue;
 
 /*
  * CPUPluginIrqDelta - external interrupt-pending changes recorded during a
@@ -735,7 +735,7 @@ struct CPUState {
      * pointer would dangle; an index survives the realloc).
      * plugin_spec_mode itself lives outside CONFIG_PLUGIN (see above). */
     GHashTable *plugin_spec_store_buf;        /* line_addr -> pool idx + 1 */
-    void *plugin_spec_store_pool;             /* PluginSpecLine[] */
+    void *plugin_spec_store_pool;             /* CPUPluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */
     /*
@@ -751,7 +751,7 @@ struct CPUState {
      * reader has to re-derive as harmless every time.  See
      * spec_atomic_shadow() in accel/tcg/internal-common.h.
      */
-    PluginSpecLine plugin_spec_atomic_scratch;
+    CPUPluginSpecLine plugin_spec_atomic_scratch;
     /* Set when a single wrong-path excursion's speculative-store footprint
      * crosses PLUGIN_SPEC_STORE_SOFT_BUDGET lines -- a garbage-size memop the
      * wrong path executed without faulting (it is buffered, not real).  The WP
@@ -769,7 +769,7 @@ struct CPUState {
      * true-BB boundary and the flush is honored by cpu_exec_loop() at the
      * next safe point, after the nested walk has fully unwound.
      */
-    bool plugin_flush_pending;
+    bool plugin_spec_flush_pending;
     /*
      * Set while this vCPU is inside a plugin-driven TRANSLATE-ONLY
      * translation (cpu_plugin_translate_tb): QEMU is asked to translate a
@@ -809,7 +809,7 @@ struct CPUState {
      * tick/scheduler storm (RCU stall, zero foreground progress).  Composes
      * with plugin_excursion_active: ticks re-enable only when BOTH say so.
      */
-    int plugin_vclock_depth;
+    int plugin_cb_window_depth;
     /*
      * Asynchronous-interrupt exclusion for system-mode tracing.  The target's
      * exception-delivery path sets plugin_in_async_int=true on an ASYNCHRONOUS
@@ -883,7 +883,7 @@ struct CPUState {
      * at source like everything else here.  Disabled (and empty) unless a
      * plugin opts in via qemu_plugin_cpu_events_set().
      */
-    QemuPluginCpuEventQueue plugin_evq;
+    CPUPluginEventQueue plugin_evq;
     /*
      * Wrong-path TLB-install log.  Speculative (wrong-path) accesses can
      * install softmmu TLB entries on a miss.  Rather than a full tlb_flush()
@@ -896,11 +896,11 @@ struct CPUState {
      * covers the wrong-path-changed-EL (eret) concern.  A large-page install or
      * log overflow falls back to a full flush.
      */
-#define CPU_SPEC_TLB_LOG_MAX 64
+#define CPU_PLUGIN_SPEC_TLB_LOG_MAX 64
     struct {
         vaddr page;
         uint16_t mmu_idx;
-    } plugin_spec_tlb_log[CPU_SPEC_TLB_LOG_MAX];
+    } plugin_spec_tlb_log[CPU_PLUGIN_SPEC_TLB_LOG_MAX];
     uint16_t plugin_spec_tlb_log_n;
     bool plugin_spec_tlb_log_overflow;
     /*

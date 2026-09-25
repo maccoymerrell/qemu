@@ -211,7 +211,7 @@ void riscv_timer_init(RISCVCPU *cpu)
  * must be on the correct path (spec mode ended) so driving the IRQ line is safe;
  * BQL is taken if not already held.
  */
-static void riscv_plugin_reconcile_timers(CPURISCVState *env)
+static void riscv_plugin_resync_stimers(CPURISCVState *env)
 {
     bool held;
 
@@ -296,11 +296,11 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
                 (unsigned long long)env->vstimecmp, env->rdtime_fn != NULL,
                 env->vstimecmp == 0 ? " (old:spurious-VSTIP)" : "");
     }
-    riscv_plugin_reconcile_timers(env);
+    riscv_plugin_resync_stimers(env);
     /*
      * The PMU overflow one-shot is the same deferred-cb class, but it runs
      * on QEMU_CLOCK_VIRTUAL directly and does not depend on rdtime_fn, so
-     * its payback sits outside riscv_plugin_reconcile_timers' rdtime gate.
+     * its payback sits outside riscv_plugin_resync_stimers' rdtime gate.
      */
     riscv_pmu_plugin_resync(RISCV_CPU(cs));
 }

@@ -3208,7 +3208,8 @@ void arm_gt_hvtimer_cb(void *opaque)
 /*
  * Re-synchronise the host generic-timer QEMUTimers with the architected timer
  * registers at the end of a wrong-path (speculative) excursion.  Part of the
- * TCGCPUOps::spec_clock_resync contract; see arm_spec_clock_resync in cpu.c.
+ * TCGCPUOps::plugin_clock_resync contract; see arm_plugin_clock_resync in
+ * cpu.c.
  *
  * Arm's guest-observable time sources are the generic timers, and every one
  * of them is a (ctl, cval) register pair inside CPUARMState shadowed by a

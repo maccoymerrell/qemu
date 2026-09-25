@@ -361,7 +361,7 @@ void plugin_evq_note_drained(CPUState *cpu)
 }
 
 /*
- * Ordered per-vCPU path-event producer (see QemuPluginCpuEventQueue in
+ * Ordered per-vCPU path-event producer (see CPUPluginEventQueue in
  * hw/core/cpu.h).  Called from the fault push/pop helpers and the async
  * delivery/close chokepoints, always on the owning vCPU thread.  (asid,
  * priv) are stamped HERE, at the event instant, via the same per-target
@@ -373,7 +373,7 @@ QEMU_DISABLE_CFI
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {
-    QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
+    CPUPluginEventQueue *q = &cpu->plugin_evq;
 
     if (cpu->plugin_spec_mode) {
         return;
@@ -432,7 +432,7 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                  ops->plugin_thread_ptr_tracks_current(cpu));
     }
 
-    q->buf[q->len++] = (QemuPluginCpuEvent) {
+    q->buf[q->len++] = (CPUPluginEvent) {
         .kind = (uint8_t)kind,
         .priv = (uint8_t)priv,
         .tp_ok = tp_ok,

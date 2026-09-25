@@ -241,7 +241,7 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * (cpu_plugin_excursion_open) clears anything recorded after this
      * consume, so the NEXT excursion cannot replay a raise the guest may
      * have acknowledged in between.  The exit reconcile
-     * (mips_cpu_plugin_resync_timers -> cpu_mips_plugin_reconcile_irq) then
+     * (mips_cpu_plugin_resync_timers -> mips_cpu_plugin_reconcile_irq) then
      * recomputes CPU_INTERRUPT_HARD from the now-correct Cause, so a
      * replayed raise produces its kick edge through the reconcile.
      */
@@ -295,7 +295,7 @@ static __thread bool g_excursion_holds_bql;     /* x86: open kept the BQL */
  * per-CPU because the pause/resume pair always runs on the vCPU's own thread,
  * and the pair is made non-reentrant by plugin_excursion_active.
  */
-static __thread IcountFreeze g_spec_icount_freeze;
+static __thread IcountFreeze g_excursion_icount;
 
 /* Guest-insn slice bounding: the CORRECT PATH's remaining slice budget,
  * saved at excursion open and restored at excursion close (see
@@ -304,19 +304,20 @@ static __thread uint16_t g_tcg_slice_exc_low;
 static __thread bool g_tcg_slice_exc_low_active;
 
 /*
- * The per-target clock resynchronisation hook (TCGCPUOps::spec_clock_resync).
+ * The per-target clock resynchronisation hook (TCGCPUOps::plugin_clock_resync).
  * Every guest-observable clock and every armed host QEMUTimer is reconciled
  * to the FROZEN virtual time by the target, at the end of both plugin clock
  * freezes.  The generic code owns the freeze/thaw and the ordering; the
  * target owns the knowledge of what its clocks are.  See the hook's contract
  * in include/accel/tcg/cpu-ops.h.
  */
-static void cpu_plugin_clock_resync(CPUState *cpu, SpecClockResyncReason why)
+static void cpu_plugin_clock_resync(CPUState *cpu,
+                                    CPUPluginClockResyncReason why)
 {
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
-    if (tcg_ops && tcg_ops->spec_clock_resync) {
-        tcg_ops->spec_clock_resync(cpu, why);
+    if (tcg_ops && tcg_ops->plugin_clock_resync) {
+        tcg_ops->plugin_clock_resync(cpu, why);
     }
 }
 #endif
@@ -357,7 +358,7 @@ void cpu_plugin_excursion_open(CPUState *cpu)
          * is not between two of its own instructions -- there is no legal
          * position here for an event derived from guest time.  The
          * correct-path instrumentation window below
-         * (cpu_plugin_vclock_pause) keeps the value-only freeze: it brackets
+         * (cpu_plugin_cb_window_open) keeps the value-only freeze: it brackets
          * a callback that runs beside real guest execution, where every
          * guest-time event still has a position and only the callback's host
          * cost must be kept out of the clock.
@@ -365,12 +366,12 @@ void cpu_plugin_excursion_open(CPUState *cpu)
         cpu_plugin_spec_clock_freeze(cpu->cpu_index);
         /* The other half of the freeze: under -icount the guest clock is
          * driven by retired instructions, which cpu_disable_ticks() does not
-         * touch.  See icount_plugin_freeze(). */
-        icount_plugin_freeze(cpu, &g_spec_icount_freeze);
+         * touch.  See icount_freeze(). */
+        icount_freeze(cpu, &g_excursion_icount);
     }
     /*
      * Guest-insn slice bounding: the default-clock mirror of
-     * icount_plugin_freeze's u16.low capture (that call is a no-op off
+     * icount_freeze's u16.low capture (that call is a no-op off
      * icount).  Save the CORRECT PATH's remaining budget here, at the
      * true excursion open; every spec-mode dispatch runs on its own
      * full quantum (cpu_plugin_exec_tb/_inline), and
@@ -500,7 +501,7 @@ void cpu_plugin_excursion_close(CPUState *cpu)
      * whichever freeze happens to be last out: restore it here unconditionally
      * (a no-op when icount is off or the record was never armed).
      */
-    icount_plugin_thaw(cpu, &g_spec_icount_freeze);
+    icount_thaw(cpu, &g_excursion_icount);
     /*
      * Guest-insn slice bounding: the matching CP budget restore.  This
      * function runs on BOTH excursion exits (the plugin's normal
@@ -534,7 +535,7 @@ void cpu_plugin_excursion_close(CPUState *cpu)
      * to have perturbed one, so no clock source can drift for want of a
      * flag.
      */
-    cpu_plugin_clock_resync(cpu, SPEC_CLOCK_EXCURSION_END);
+    cpu_plugin_clock_resync(cpu, CPU_PLUGIN_CLOCK_EXCURSION_END);
     /*
      * The excursion's defining requirement, checked where it must hold: every
      * guest clock root now reads what it read when the excursion began.
@@ -588,7 +589,7 @@ void cpu_plugin_excursion_close(CPUState *cpu)
  * collapses into a self-sustaining tick/scheduler storm (context-switch
  * storm, RCU-kthread starvation, zero foreground progress).
  *
- * Nesting (plugin_vclock_depth) counts this vCPU's own windows, so callers
+ * Nesting (plugin_cb_window_depth) counts this vCPU's own windows, so callers
  * can wrap arbitrary regions without coordinating.  Composition with the WP
  * pause, and with a window open on a DIFFERENT vCPU, is not this counter's
  * job: each vCPU's outermost window takes one reference on the machine-wide
@@ -607,10 +608,10 @@ void cpu_plugin_excursion_close(CPUState *cpu)
  * timers from being evaluated once per translation block.  The processing
  * stall belongs to cpu_plugin_spec_clock_freeze() and to nothing else.
  */
-void cpu_plugin_vclock_pause(CPUState *cpu)
+void cpu_plugin_cb_window_open(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
-    if (cpu->plugin_vclock_depth++ > 0) {
+    if (cpu->plugin_cb_window_depth++ > 0) {
         return;                    /* already frozen by an outer window */
     }
     if (cst_nofreeze()) {
@@ -627,11 +628,11 @@ void cpu_plugin_vclock_pause(CPUState *cpu)
 #endif
 }
 
-void cpu_plugin_vclock_resume(CPUState *cpu)
+void cpu_plugin_cb_window_close(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
-    g_assert(cpu->plugin_vclock_depth > 0);
-    if (--cpu->plugin_vclock_depth > 0) {
+    g_assert(cpu->plugin_cb_window_depth > 0);
+    if (--cpu->plugin_cb_window_depth > 0) {
         return;                    /* still frozen by an outer window */
     }
     if (cst_nofreeze()) {
@@ -651,7 +652,7 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
          * plugin is installed (plugin_tsc_from_clock, system/cpu-timers.c),
          * so x86's hook has nothing to do past its one-shot arming.
          */
-        cpu_plugin_clock_resync(cpu, SPEC_CLOCK_THAW);
+        cpu_plugin_clock_resync(cpu, CPU_PLUGIN_CLOCK_CB_WINDOW_END);
     }
     if (need_bql) {
         bql_unlock();

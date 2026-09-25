@@ -193,7 +193,7 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
 
 /*
  * The guest-visible virtual-clock PROCESSING stall.  See
- * qemu_clock_plugin_stall_set() in qemu/timer.h for the contract; this is
+ * qemu_clock_virtual_stall() in qemu/timer.h for the contract; this is
  * the state it sets and the four places that read it.
  *
  * Those four are not a list of the sites that seemed to matter.  Every
@@ -249,20 +249,20 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
  * hiding one.  A doubled notify is possible and costs a wakeup; a missed one
  * is not possible, and that is the asymmetry worth paying a fence for.
  */
-static bool plugin_vclock_stall;
-static bool plugin_vclock_deadline_hidden;
+static bool vclock_stall;
+static bool vclock_deadline_hidden;
 
 static bool vclock_processing_stalled(QEMUClockType type)
 {
     if (type != QEMU_CLOCK_VIRTUAL) {
         return false;
     }
-    if (!qatomic_read(&plugin_vclock_stall)) {
+    if (!qatomic_read(&vclock_stall)) {
         return false;
     }
-    qatomic_set(&plugin_vclock_deadline_hidden, true);
+    qatomic_set(&vclock_deadline_hidden, true);
     smp_mb();
-    if (qatomic_read(&plugin_vclock_stall)) {
+    if (qatomic_read(&vclock_stall)) {
         /*
          * A confirmed hide while the agency is engaged is counted
          * (vclock_agency_note_fence_hit()), never asserted.  The
@@ -278,14 +278,14 @@ static bool vclock_processing_stalled(QEMUClockType type)
     return false;
 }
 
-void qemu_clock_plugin_stall_set(bool on)
+void qemu_clock_virtual_stall(bool on)
 {
     if (on) {
-        qatomic_set(&plugin_vclock_stall, true);
+        qatomic_set(&vclock_stall, true);
         return;
     }
 
-    qatomic_set(&plugin_vclock_stall, false);
+    qatomic_set(&vclock_stall, false);
     smp_mb();
     /*
      * Notify ONLY if the stall actually hid something.  The release runs once
@@ -293,8 +293,8 @@ void qemu_clock_plugin_stall_set(bool on)
      * wakeup for each one.  The wakeup belongs to the deadline that was
      * hidden, not to the freeze that hid nothing.
      */
-    if (qatomic_read(&plugin_vclock_deadline_hidden) &&
-        qatomic_xchg(&plugin_vclock_deadline_hidden, false)) {
+    if (qatomic_read(&vclock_deadline_hidden) &&
+        qatomic_xchg(&vclock_deadline_hidden, false)) {
         qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
     }
 }

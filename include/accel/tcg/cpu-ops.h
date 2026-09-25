@@ -148,7 +148,7 @@ struct TCGCPUOps {
     bool (*vaddr_is_kernel)(CPUState *cpu, uint64_t vaddr);
 
     /**
-     * @spec_clock_resync: reconcile every guest clock with the frozen time
+     * @plugin_clock_resync: reconcile every guest clock with the frozen time
      *
      * Optional; system-mode targets only.  Called at the end of a plugin
      * clock freeze, once the virtual clock has been thawed and (for a
@@ -186,7 +186,8 @@ struct TCGCPUOps {
      * target that does not register it will silently accumulate clock skew
      * across excursions; see docs/devel/tcg-plugins.rst.
      */
-    void (*spec_clock_resync)(CPUState *cpu, SpecClockResyncReason reason);
+    void (*plugin_clock_resync)(CPUState *cpu,
+                                CPUPluginClockResyncReason reason);
 #endif
 
 #ifdef CONFIG_USER_ONLY

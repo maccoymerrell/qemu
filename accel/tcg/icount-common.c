@@ -523,7 +523,7 @@ void icount_notify_exit(void)
  * icount_update_locked() and resets the budget behind us.  Restoring all
  * four fields makes the window atomic regardless of what happened inside.
  */
-void icount_plugin_freeze(CPUState *cpu, IcountFreeze *st)
+void icount_freeze(CPUState *cpu, IcountFreeze *st)
 {
     st->active = false;
     if (!icount_enabled()) {
@@ -540,7 +540,7 @@ void icount_plugin_freeze(CPUState *cpu, IcountFreeze *st)
                          &timers_state.vm_clock_lock);
 }
 
-void icount_plugin_thaw(CPUState *cpu, IcountFreeze *st)
+void icount_thaw(CPUState *cpu, IcountFreeze *st)
 {
     if (!st->active) {
         return;

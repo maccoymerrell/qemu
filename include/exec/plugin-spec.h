@@ -46,15 +46,16 @@
  * LDXP/STXP -- fault on a misaligned operand, so the shadow target must
  * satisfy the same alignment the guest access already guaranteed.
  */
-typedef struct PluginSpecLine {
+typedef struct CPUPluginSpecLine {
     uint8_t  bytes[PLUGIN_SPEC_LINE_SIZE];
     uint64_t valid_mask;                       /* bit k = byte k stored */
-} QEMU_ALIGNED(16) PluginSpecLine;
+} QEMU_ALIGNED(16) CPUPluginSpecLine;
 
 /* Defined in plugins/api.c; declared here so the inline helpers in
  * accel/tcg/internal-common.h can call it. */
 struct CPUState;
-PluginSpecLine *spec_line_get_or_alloc(struct CPUState *cpu, vaddr line_addr);
+CPUPluginSpecLine *spec_line_get_or_alloc(struct CPUState *cpu,
+                                          vaddr line_addr);
 
 /*
  * Deterministic pseudo-random placeholder for a wrong-path speculative
@@ -112,8 +113,8 @@ void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
 void cpu_plugin_spec_tlb_note(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
 bool cpu_plugin_spec_mode_supported(void);
-void cpu_plugin_vclock_pause(CPUState *cpu);
-void cpu_plugin_vclock_resume(CPUState *cpu);
+void cpu_plugin_cb_window_open(CPUState *cpu);
+void cpu_plugin_cb_window_close(CPUState *cpu);
 /*
  * Code-buffer pressure a wrong-path (speculative) walk put on the shared
  * translation cache.  _opens counts walks that overflowed the normal

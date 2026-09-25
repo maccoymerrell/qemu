@@ -620,7 +620,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
      * CORRECT-path instrumentation freeze.  A plugin may bracket its
      * correct-path callbacks (translation-time decoding, per-TB emission)
      * with the nestable qemu_plugin_vclock_pause/_resume pair, tracked by
-     * plugin_vclock_depth.  A cpu_loop_exit that longjmps out of a callback
+     * plugin_cb_window_depth.  A cpu_loop_exit that longjmps out of a callback
      * -- e.g. a tlb_fill fault taken while re-translating inside an
      * instrumented region -- unwinds past the plugin's bracket, so the
      * paired _resume is never issued and the depth is leaked > 0.  With the
@@ -634,8 +634,8 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
      * normal case) and in user-mode (pause/resume never touch the depth),
      * and idempotent with a later balanced _resume via the depth guard.
      */
-    while (cpu->plugin_vclock_depth > 0) {
-        cpu_plugin_vclock_resume(cpu);
+    while (cpu->plugin_cb_window_depth > 0) {
+        cpu_plugin_cb_window_close(cpu);
     }
 #endif
 
@@ -1217,8 +1217,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * point with no TB in flight.  Honor the flush before translating
              * anything new, exactly as the in-line overflow path would.
              */
-            if (unlikely(cpu->plugin_flush_pending)) {
-                cpu->plugin_flush_pending = false;
+            if (unlikely(cpu->plugin_spec_flush_pending)) {
+                cpu->plugin_spec_flush_pending = false;
                 tb_flush(cpu);
                 cpu->exception_index = EXCP_INTERRUPT;
                 cpu_loop_exit(cpu);

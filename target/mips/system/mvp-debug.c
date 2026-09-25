@@ -97,9 +97,9 @@ typedef struct MipsCp0TimerLatch {
     int64_t max_fire_gap, prev_fire_now;
 } MipsCp0TimerLatch;
 
-static MipsCp0TimerLatch mvp_timer[MIPS_MVP_MAXVPE];
+static MipsCp0TimerLatch mips_cp0t_latch[MIPS_MVP_MAXVPE];
 
-static void mvp_report_timer(CPUState *cs);
+static void mips_cp0t_report(CPUState *cs);
 
 /*
  * End-of-run census of the CP0 timer arms.  The MVPGATE/MVPWEDGE reports fire
@@ -113,7 +113,7 @@ static void mvp_exit_report(Notifier *n, void *opaque)
     CPUState *cs;
 
     CPU_FOREACH(cs) {
-        mvp_report_timer(cs);
+        mips_cp0t_report(cs);
     }
     fprintf(stderr, "MVPCAUSERACE cas_retries=%" PRIu64 "\n",
             mips_cause_cas_retries());
@@ -288,8 +288,8 @@ void mips_mvp_note_run(CPUState *target, int op)
     }
 }
 
-void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
-                         int64_t now_ns, int64_t deadline_ns)
+void mips_cp0t_note(CPUMIPSState *env, int op, uint32_t wait,
+                    int64_t now_ns, int64_t deadline_ns)
 {
     int i = env_cpu(env)->cpu_index;
     MipsCp0TimerLatch *t;
@@ -297,7 +297,7 @@ void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
     if (!mips_mvp_debug || i < 0 || i >= MIPS_MVP_MAXVPE) {
         return;
     }
-    t = &mvp_timer[i];
+    t = &mips_cp0t_latch[i];
 
     if (op == MIPS_CP0T_FIRE) {
         if (t->prev_fire_now && now_ns - t->prev_fire_now > t->max_fire_gap) {
@@ -328,7 +328,7 @@ void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
     }
 }
 
-static void mvp_report_timer(CPUState *cs)
+static void mips_cp0t_report(CPUState *cs)
 {
     int i = cs->cpu_index;
     MipsCp0TimerLatch *t;
@@ -337,7 +337,7 @@ static void mvp_report_timer(CPUState *cs)
     if (i < 0 || i >= MIPS_MVP_MAXVPE) {
         return;
     }
-    t = &mvp_timer[i];
+    t = &mips_cp0t_latch[i];
     /*
      * Signed modular distance from the last armed Count to Compare: what the
      * guest asked for.  The clamp arms program something else, and the
@@ -394,7 +394,7 @@ static void mvp_report_cpu(const char *what, CPUState *cs)
             (uint32_t)env->active_tc.CP0_TCHalt,
             (uint32_t)env->CP0_Status, (uint32_t)env->CP0_Cause,
             cs->interrupt_request, cs->halted, env->active_tc.PC);
-    mvp_report_timer(cs);
+    mips_cp0t_report(cs);
 }
 
 /*

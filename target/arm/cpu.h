@@ -1178,7 +1178,7 @@ void arm_gt_sel2vtimer_cb(void *opaque);
 /*
  * Re-arm the host generic-timer QEMUTimers to match the architected registers
  * at the end of a wrong-path excursion, over every present timer.  Called
- * from the target's TCGCPUOps::spec_clock_resync hook, which
+ * from the target's TCGCPUOps::plugin_clock_resync hook, which
  * cpu_plugin_excursion_close runs after the register state is restored.
  */
 void arm_cpu_plugin_resync_timers(CPUState *cs);

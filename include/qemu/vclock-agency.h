@@ -51,7 +51,7 @@
  * breakout predicate is the fresh read of mechanism 2.
  *
  * In user mode the discipline is never armed:
- * qemu_plugin_vclock_agency_mode() is a no-op there (plugins/user.c),
+ * plugin_vclock_agency_set_active() is a no-op there (plugins/user.c),
  * every hook site is softmmu-only, and the slot stays INT64_MAX.
  *
  * Tripwire counters count and never gate; each warns once on its first
@@ -103,7 +103,7 @@ static inline bool vclock_agency_engaged(void)
            qatomic_read(&vclock_agency_unparked) > 0;
 }
 
-/* Arm/disarm (plugins/system.c via qemu_plugin_vclock_agency_mode). */
+/* Arm/disarm (plugins/system.c via plugin_vclock_agency_set_active). */
 void vclock_agency_set_active(bool active);
 
 /* Maintenance of vclock_agency_next_due (util/qemu-timer.c). */

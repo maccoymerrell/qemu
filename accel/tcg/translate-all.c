@@ -376,8 +376,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
              * finished.  The reserve is finite; see tcg_region_assign for
              * what happens to a walk that outgrows it.
              */
-            if (!cpu->plugin_flush_pending) {
-                cpu->plugin_flush_pending = true;
+            if (!cpu->plugin_spec_flush_pending) {
+                cpu->plugin_spec_flush_pending = true;
                 tcg_region_open_spec_reserve(tcg_ctx);
                 qatomic_inc(&plugin_spec_reserve_opens);
                 goto buffer_overflow;          /* retry alloc into the reserve */

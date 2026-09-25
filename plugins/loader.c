@@ -258,7 +258,7 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
          * PLUGIN-ACTIVE edge: a plugin is now loaded/instrumenting
          * (event-agency discipline; idempotent, system-mode decides)
          */
-        qemu_plugin_vclock_agency_mode(true);
+        plugin_vclock_agency_set_active(true);
     }
     if (rc) {
         error_setg(errp, "Could not load plugin %s: qemu_plugin_install returned error code %d",
@@ -376,7 +376,7 @@ static void plugin_reset_destroy__locked(struct qemu_plugin_reset_data *data)
          * VIRTUAL consumption (event-agency discipline).  The slice half
          * stays armed for process life; see plugins/system.c.
          */
-        qemu_plugin_vclock_agency_mode(false);
+        plugin_vclock_agency_set_active(false);
     }
     if (data->cb) {
         data->cb(ctx->id);

@@ -67,6 +67,8 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      * when called from a plugin callback context.
      */
     saved_running = cpu->running;
+    /* Restored by the landing pad: see cpu_plugin_exec_tb. */
+    uint32_t saved_cflags_next_tb = cpu->cflags_next_tb;
 
     /*
      * Set up a local exception landing pad so faults during wrong-path
@@ -130,6 +132,7 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
          * codegen ran outside.
          */
         tcg_ctx_drop_gen_tb();
+        cpu->cflags_next_tb = saved_cflags_next_tb;
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         /* A yield is a block that ran: see cpu_plugin_exec_tb. */
@@ -230,6 +233,21 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
     }
 
     saved_running = cpu->running;
+    /*
+     * An unwind out of the block can mint cflags for the NEXT translation
+     * on its way out: cpu_io_recompile (a device access that is not the
+     * block's last instruction), a stop-after-access watchpoint, precise
+     * SMC.  Each names the instruction it unwound at, and the main loop
+     * consumes it at its next tb_find -- but an unwind out of this call
+     * lands in the pad below, not the main loop, and the caller does not
+     * resume at that instruction.  The correct path resumes from the
+     * plugin callback's own block, and a value left behind would be spent
+     * on whatever block the correct path translates next (a count-limited
+     * CF_MEMI_ONLY | CF_NOIRQ block after cpu_io_recompile).  The pad puts
+     * back the value the call found, so nothing minted inside the call
+     * outlives it.
+     */
+    uint32_t saved_cflags_next_tb = cpu->cflags_next_tb;
 
     /*
      * Install our sigsetjmp guard *before* tb_gen_code(): translation can
@@ -322,6 +340,7 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          * catches the unwind, and this pad catches the wrong path's.
          */
         tcg_ctx_drop_gen_tb();
+        cpu->cflags_next_tb = saved_cflags_next_tb;
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         /*

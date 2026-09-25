@@ -50,20 +50,19 @@
 
 #ifdef CONFIG_PLUGIN
 /*
- * Load N bytes with store-to-load forwarding (system mode).
- * Falls back to the supplied (pre-resolved, contiguous) host address
- * for bytes not in the buffer.
- *
- * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
- * cache line rather than one per byte.  When no speculative store
- * overlaps the chunk (the common case) it is a single lookup plus a
- * bulk memcpy from host_addr.
+ * Store-to-load forwarding (system mode): the one overlay every wrong-path
+ * load arm applies.  @buf holds @size bytes in guest MEMORY order (buf[i]
+ * is the byte at @guest_addr + i, as the store buffer records them); each
+ * buffered byte replaces its slot in place.  Every arm reads its raw bytes
+ * (RAM, or the absent/MMIO placeholder), overlays them, and only then does
+ * value-order work (the MO_BSWAP swap, the big-endian slice accumulation):
+ * an overlay laid over an already-swapped value lands mirrored.
+ * Line-chunked like spec_store_bytes: one lookup per cache line.
  */
-static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
-                            void *host_addr, void *out, int size)
+static void spec_overlay_mem(CPUState *cpu, vaddr guest_addr,
+                             void *buf, int size)
 {
-    uint8_t *hp = host_addr;
-    uint8_t *op = out;
+    uint8_t *op = buf;
     while (size > 0) {
         vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
         unsigned idx       = (unsigned)(guest_addr & PLUGIN_SPEC_LINE_MASK);
@@ -74,20 +73,44 @@ static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
         uint64_t chunk_mask = (chunk >= 64 ? ~(uint64_t)0
                                            : (((uint64_t)1 << chunk) - 1)) << idx;
 
-        if (!line || !(line->valid_mask & chunk_mask)) {
-            memcpy(op, hp, chunk);
-        } else {
+        if (line && (line->valid_mask & chunk_mask)) {
             for (unsigned i = 0; i < chunk; i++) {
                 unsigned b = idx + i;
-                op[i] = (line->valid_mask & ((uint64_t)1 << b))
-                        ? line->bytes[b] : hp[i];
+                if (line->valid_mask & ((uint64_t)1 << b)) {
+                    op[i] = line->bytes[b];
+                }
             }
         }
         guest_addr += chunk;
-        hp         += chunk;
         op         += chunk;
         size       -= chunk;
     }
+}
+
+/*
+ * The overlay for a page-crossing slice: do_ld_beN accumulates it
+ * big-endian into the low @size bytes of @ret_be, which is memory order.
+ */
+static uint64_t spec_overlay_be8(CPUState *cpu, vaddr addr,
+                                 uint64_t ret_be, int size)
+{
+    uint8_t b[8];
+
+    stq_be_p(b, ret_be);
+    spec_overlay_mem(cpu, addr, b + 8 - size, size);
+    return ldq_be_p(b);
+}
+
+/* As spec_overlay_be8, for do_ld16_beN's Int128 accumulation. */
+static Int128 spec_overlay_be16(CPUState *cpu, vaddr addr,
+                                Int128 ret_be, int size)
+{
+    uint8_t b[16];
+
+    stq_be_p(b, int128_gethi(ret_be));
+    stq_be_p(b + 8, int128_getlo(ret_be));
+    spec_overlay_mem(cpu, addr, b + 16 - size, size);
+    return int128_make128(ldq_be_p(b + 8), ldq_be_p(b));
 }
 
 #endif /* CONFIG_PLUGIN */
@@ -2683,7 +2706,7 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
             ret_be = (ret_be << 8) | gb;
         }
         cpu->plugin_spec_mem_faulted = true;
-        return ret_be;
+        return spec_overlay_be8(cpu, p->addr, ret_be, p->size);
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2698,7 +2721,8 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
     atom = mop & MO_ATOM_MASK;
     switch (atom) {
     case MO_ATOM_SUBALIGN:
-        return do_ld_parts_beN(p, ret_be);
+        ret_be = do_ld_parts_beN(p, ret_be);
+        break;
 
     case MO_ATOM_IFALIGN_PAIR:
     case MO_ATOM_WITHIN16_PAIR:
@@ -2709,21 +2733,30 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
             ? p->size == half_size
             : p->size >= half_size) {
             if (!HAVE_al8_fast && p->size < 4) {
-                return do_ld_whole_be4(p, ret_be);
+                ret_be = do_ld_whole_be4(p, ret_be);
             } else {
-                return do_ld_whole_be8(cpu, ra, p, ret_be);
+                ret_be = do_ld_whole_be8(cpu, ra, p, ret_be);
             }
+            break;
         }
         /* fall through */
 
     case MO_ATOM_IFALIGN:
     case MO_ATOM_WITHIN16:
     case MO_ATOM_NONE:
-        return do_ld_bytes_beN(p, ret_be);
+        ret_be = do_ld_bytes_beN(p, ret_be);
+        break;
 
     default:
         g_assert_not_reached();
     }
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        /* The slice is memory order until the caller's final swap. */
+        ret_be = spec_overlay_be8(cpu, p->addr, ret_be, p->size);
+    }
+#endif
+    return ret_be;
 }
 
 /*
@@ -2734,6 +2767,7 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
 {
     int size = p->size;
     uint64_t b;
+    Int128 ret;
     MemOp atom;
 
 #ifdef CONFIG_PLUGIN
@@ -2756,7 +2790,7 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
             lo = (lo << 8) | g[i];
         }
         cpu->plugin_spec_mem_faulted = true;
-        return int128_make128(lo, hi);
+        return spec_overlay_be16(cpu, p->addr, int128_make128(lo, hi), size);
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2779,7 +2813,10 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
 
     case MO_ATOM_WITHIN16_PAIR:
         /* Since size > 8, this is the half that must be atomic. */
-        return do_ld_whole_be16(cpu, ra, p, a);
+        ret = do_ld_whole_be16(cpu, ra, p, a);
+        a = int128_gethi(ret);
+        b = int128_getlo(ret);
+        break;
 
     case MO_ATOM_IFALIGN_PAIR:
         /*
@@ -2798,7 +2835,13 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
         g_assert_not_reached();
     }
 
-    return int128_make128(b, a);
+    ret = int128_make128(b, a);
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        ret = spec_overlay_be16(cpu, p->addr, ret, size);
+    }
+#endif
+    return ret;
 }
 
 static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
@@ -2835,7 +2878,7 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        /* Read from real memory, then overlay any speculative bytes */
+        /* Raw bytes, then the overlay, then the swap (spec_overlay_mem). */
         if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
             /* Absent page OR a device MMIO region: deterministic
              * placeholder baseline (no host dereference, and never a
@@ -2845,19 +2888,12 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
             cpu->plugin_spec_mem_faulted = true;
         } else {
             ret = load_atom_2(cpu, ra, p->haddr, memop);
-            if (memop & MO_BSWAP) {
-                ret = bswap16(ret);
-            }
         }
-        /*
-         * Overlay speculative bytes.  spec_load_bytes treats the buffer
-         * as memory-order bytes at p->addr; @ret is already in value order
-         * here, so for a MO_BSWAP load the two orders differ.
-         */
-        uint16_t src_val = ret;
-        uint16_t out_val;
-        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 2);
-        return out_val;
+        spec_overlay_mem(cpu, p->addr, &ret, 2);
+        if (memop & MO_BSWAP) {
+            ret = bswap16(ret);
+        }
+        return ret;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2889,14 +2925,12 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
             cpu->plugin_spec_mem_faulted = true;
         } else {
             ret = load_atom_4(cpu, ra, p->haddr, memop);
-            if (memop & MO_BSWAP) {
-                ret = bswap32(ret);
-            }
         }
-        uint32_t src_val = ret;
-        uint32_t out_val;
-        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 4);
-        return out_val;
+        spec_overlay_mem(cpu, p->addr, &ret, 4);
+        if (memop & MO_BSWAP) {
+            ret = bswap32(ret);
+        }
+        return ret;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2928,14 +2962,12 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
             cpu->plugin_spec_mem_faulted = true;
         } else {
             ret = load_atom_8(cpu, ra, p->haddr, memop);
-            if (memop & MO_BSWAP) {
-                ret = bswap64(ret);
-            }
         }
-        uint64_t src_val = ret;
-        uint64_t out_val;
-        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 8);
-        return out_val;
+        spec_overlay_mem(cpu, p->addr, &ret, 8);
+        if (memop & MO_BSWAP) {
+            ret = bswap64(ret);
+        }
+        return ret;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -3046,16 +3078,23 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
     if (likely(!crosspage)) {
 #ifdef CONFIG_PLUGIN
-        if (unlikely(cpu_plugin_spec_active(cpu) &&
-                     (l.page[0].flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
-            /* Wrong-path 128-bit load from an absent page OR a device MMIO
-             * region: deterministic placeholder instead of dereferencing
-             * the invalid host pointer or issuing a side-effectful
-             * speculative device read. */
-            uint8_t g[16];
-            plugin_spec_garbage_fill(g, 16, addr);
-            cpu->plugin_spec_mem_faulted = true;
-            return int128_make128(ldq_le_p(g), ldq_le_p(g + 8));
+        if (cpu_plugin_spec_active(cpu)) {
+            /* Raw bytes, then the overlay, then the swap (spec_overlay_mem). */
+            if (unlikely(l.page[0].flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+                /* Wrong-path 128-bit load from an absent page OR a device
+                 * MMIO region: deterministic placeholder instead of
+                 * dereferencing the invalid host pointer or issuing a
+                 * side-effectful speculative device read. */
+                plugin_spec_garbage_fill(&ret, 16, addr);
+                cpu->plugin_spec_mem_faulted = true;
+            } else {
+                ret = load_atom_16(cpu, ra, l.page[0].haddr, l.memop);
+            }
+            spec_overlay_mem(cpu, addr, &ret, 16);
+            if (l.memop & MO_BSWAP) {
+                ret = bswap128(ret);
+            }
+            return ret;
         }
 #endif
         if (unlikely(l.page[0].flags & TLB_MMIO)) {

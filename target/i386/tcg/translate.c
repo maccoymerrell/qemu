@@ -2715,6 +2715,18 @@ static void gen_reg_implicit(unsigned rd, unsigned wr, unsigned flags)
     plugin_gen_reg_covered();
 }
 
+/*
+ * An SSE floating-point helper computes through MXCSR -- rounding control
+ * in, exception flags out -- by way of float_status, which no statement
+ * names yet.  The decoded-operand statement does not cover that: the
+ * instruction is counted incomplete (reg_stmt_opaque), as its AArch64
+ * analogue (FPCR through float_status) is.
+ */
+static void gen_reg_sse_fp(void)
+{
+    plugin_gen_reg_opaque("sse-fp:mxcsr");
+}
+
 #include "emit.c.inc"
 
 /*

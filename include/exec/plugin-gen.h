@@ -117,12 +117,16 @@ void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind);
  * plugin_gen_reg_covered: the statements made for this instruction cover
  *   every effect of the helpers it calls.
  * plugin_gen_reg_mute: PLUGIN_REG_MUTE_* for the ops that follow.
+ * plugin_gen_reg_opaque: the instruction has an effect on registers no
+ *   statement names yet (@what, a static string naming the class): the
+ *   statement is counted incomplete, covered or not.
  */
 void plugin_gen_reg(const PluginRegDesc *d, unsigned access);
 void plugin_gen_reg_env(intptr_t offset, unsigned access);
 void plugin_gen_reg_temp(TCGTemp *t, const PluginRegDesc *d);
 void plugin_gen_reg_covered(void);
 void plugin_gen_reg_mute(int mode);
+void plugin_gen_reg_opaque(const char *what);
 
 #else /* !CONFIG_PLUGIN */
 
@@ -165,6 +169,9 @@ static inline void plugin_gen_reg_covered(void)
 { }
 
 static inline void plugin_gen_reg_mute(int mode)
+{ }
+
+static inline void plugin_gen_reg_opaque(const char *what)
 { }
 
 #endif /* CONFIG_PLUGIN */

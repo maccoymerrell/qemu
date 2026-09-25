@@ -623,6 +623,15 @@ void plugin_gen_reg_mute(int mode)
     }
 }
 
+void plugin_gen_reg_opaque(const char *what)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn && !insn->reg_opaque) {
+        insn->reg_opaque = g_intern_static_string(what);
+    }
+}
+
 static void reg_add(GArray *acc, const PluginRegDesc *d, unsigned access,
                     bool ptr, bool noted)
 {

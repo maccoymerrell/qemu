@@ -549,6 +549,7 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                               SSEFunc_0_epp pd_ymm, SSEFunc_0_epp ps_ymm,
                               SSEFunc_0_eppp sd, SSEFunc_0_eppp ss)
 {
+    gen_reg_sse_fp();
     if ((s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) != 0) {
         SSEFunc_0_eppp fn = s->prefix & PREFIX_REPZ ? ss : sd;
         if (!fn) {
@@ -610,6 +611,7 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
 #define FP_SSE(uname, lname)                                                       \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
+    gen_reg_sse_fp();                                                              \
     gen_fp_sse(s, decode,                                                          \
                gen_helper_##lname##pd_xmm,                                         \
                gen_helper_##lname##ps_xmm,                                         \
@@ -632,6 +634,7 @@ static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)            
     SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm : gen_helper_fma4ps_ymm; \
     SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                                   \
                                                                                    \
+    gen_reg_sse_fp();                                                              \
     fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
        tcg_constant_i32(even),                                                     \
        tcg_constant_i32((even) ^ (odd)));                                          \
@@ -643,6 +646,7 @@ static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)            
 {                                                                                  \
     SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;        \
                                                                                    \
+    gen_reg_sse_fp();                                                              \
     fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
        tcg_constant_i32(flags));                                                   \
 }                                                                                  \
@@ -694,6 +698,7 @@ static inline void gen_unary_fp32_sse(DisasContext *s, X86DecodedInsn *decode,
                                       SSEFunc_0_epp ps_ymm,
                                       SSEFunc_0_eppp ss)
 {
+    gen_reg_sse_fp();
     if ((s->prefix & (PREFIX_DATA | PREFIX_REPNZ)) != 0) {
         goto illegal_op;
     } else if (s->prefix & PREFIX_REPZ) {
@@ -732,6 +737,7 @@ static inline void gen_horizontal_fp_sse(DisasContext *s, X86DecodedInsn *decode
                                          SSEFunc_0_eppp pd_xmm, SSEFunc_0_eppp ps_xmm,
                                          SSEFunc_0_eppp pd_ymm, SSEFunc_0_eppp ps_ymm)
 {
+    gen_reg_sse_fp();
     SSEFunc_0_eppp ps, pd, fn;
     ps = s->vex_l ? ps_ymm : ps_xmm;
     pd = s->vex_l ? pd_ymm : pd_xmm;
@@ -796,9 +802,17 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 BINARY_IMM_SSE(VBLENDPD,   blendpd)
 BINARY_IMM_SSE(VBLENDPS,   blendps)
 BINARY_IMM_SSE(VPBLENDW,   pblendw)
-BINARY_IMM_SSE(VDDPS,      dpps)
+#define BINARY_IMM_FP_SSE(uname, lname)                                            \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    gen_reg_sse_fp();                                                              \
+    gen_binary_imm_sse(s, decode,                                                  \
+                       gen_helper_##lname##_xmm,                                   \
+                       gen_helper_##lname##_ymm);                                  \
+}
+BINARY_IMM_FP_SSE(VDDPS,   dpps)
 #define gen_helper_dppd_ymm NULL
-BINARY_IMM_SSE(VDDPD,      dppd)
+BINARY_IMM_FP_SSE(VDDPD,   dppd)
 BINARY_IMM_SSE(VMPSADBW,   mpsadbw)
 BINARY_IMM_SSE(PCLMULQDQ,  pclmulqdq)
 
@@ -1025,13 +1039,23 @@ UNARY_INT_SSE(VMOVSLDUP,    pmovsldup)
 UNARY_INT_SSE(VMOVSHDUP,    pmovshdup)
 UNARY_INT_SSE(VMOVDDUP,     pmovdldup)
 
-UNARY_INT_SSE(VCVTDQ2PD, cvtdq2pd)
-UNARY_INT_SSE(VCVTPD2DQ, cvtpd2dq)
-UNARY_INT_SSE(VCVTTPD2DQ, cvttpd2dq)
-UNARY_INT_SSE(VCVTDQ2PS, cvtdq2ps)
-UNARY_INT_SSE(VCVTPS2DQ, cvtps2dq)
-UNARY_INT_SSE(VCVTTPS2DQ, cvttps2dq)
-UNARY_INT_SSE(VCVTPH2PS, cvtph2ps)
+/* the conversions compute through MXCSR, unlike the moves above */
+#define UNARY_CVT_SSE(uname, lname)                                                \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    gen_reg_sse_fp();                                                              \
+    gen_unary_int_sse(s, decode,                                                   \
+                      gen_helper_##lname##_xmm,                                    \
+                      gen_helper_##lname##_ymm);                                   \
+}
+
+UNARY_CVT_SSE(VCVTDQ2PD, cvtdq2pd)
+UNARY_CVT_SSE(VCVTPD2DQ, cvtpd2dq)
+UNARY_CVT_SSE(VCVTTPD2DQ, cvttpd2dq)
+UNARY_CVT_SSE(VCVTDQ2PS, cvtdq2ps)
+UNARY_CVT_SSE(VCVTPS2DQ, cvtps2dq)
+UNARY_CVT_SSE(VCVTTPS2DQ, cvttps2dq)
+UNARY_CVT_SSE(VCVTPH2PS, cvtph2ps)
 
 
 static inline void gen_unary_imm_sse(DisasContext *s, X86DecodedInsn *decode,
@@ -1064,6 +1088,7 @@ UNARY_IMM_SSE(VPERMILPD_i, vpermilpd_imm)
 static inline void gen_unary_imm_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                                         SSEFunc_0_eppi xmm, SSEFunc_0_eppi ymm)
 {
+    gen_reg_sse_fp();
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     if (!s->vex_l) {
         xmm(tcg_env, OP_PTR0, OP_PTR1, imm);
@@ -1913,6 +1938,7 @@ static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CVTPI2Px(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_helper_enter_mmx(tcg_env);
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvtpi2pd(tcg_env, OP_PTR0, OP_PTR2);
@@ -1923,6 +1949,7 @@ static void gen_CVTPI2Px(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CVTPx2PI(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_helper_enter_mmx(tcg_env);
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvtpd2pi(tcg_env, OP_PTR0, OP_PTR2);
@@ -1933,6 +1960,7 @@ static void gen_CVTPx2PI(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CVTTPx2PI(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_helper_enter_mmx(tcg_env);
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvttpd2pi(tcg_env, OP_PTR0, OP_PTR2);
@@ -4244,6 +4272,7 @@ static const SSEFunc_0_eppp gen_helper_cmp_funcs[32][6] = {
 
 static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     int index = decode->immediate & (s->prefix & PREFIX_VEX ? 31 : 7);
     int b =
         s->prefix & PREFIX_REPZ  ? 2 /* ss */ :
@@ -4255,6 +4284,7 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     SSEFunc_0_epp fn;
     fn = s->prefix & PREFIX_DATA ? gen_helper_comisd : gen_helper_comiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
@@ -4263,6 +4293,7 @@ static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCVTPD2PS(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     if (s->vex_l) {
         gen_helper_cvtpd2ps_ymm(tcg_env, OP_PTR0, OP_PTR2);
     } else {
@@ -4272,6 +4303,7 @@ static void gen_VCVTPD2PS(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCVTPS2PD(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     if (s->vex_l) {
         gen_helper_cvtps2pd_ymm(tcg_env, OP_PTR0, OP_PTR2);
     } else {
@@ -4281,6 +4313,7 @@ static void gen_VCVTPS2PD(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCVTPS2PH(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_unary_imm_fp_sse(s, decode,
                       gen_helper_cvtps2ph_xmm,
                       gen_helper_cvtps2ph_ymm);
@@ -4295,16 +4328,19 @@ static void gen_VCVTPS2PH(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCVTSD2SS(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_helper_cvtsd2ss(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_VCVTSS2SD(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     gen_helper_cvtss2sd(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_VCVTSI2Sx(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     int vec_len = vector_len(s, decode);
     TCGv_i32 in;
 
@@ -4337,6 +4373,7 @@ static inline void gen_VCVTtSx2SI(DisasContext *s, X86DecodedInsn *decode,
                                   SSEFunc_i_ep ss2si, SSEFunc_l_ep ss2sq,
                                   SSEFunc_i_ep sd2si, SSEFunc_l_ep sd2sq)
 {
+    gen_reg_sse_fp();
     TCGv_i32 out;
 
 #ifdef TARGET_X86_64
@@ -4618,6 +4655,7 @@ static void gen_VPHMINPOSUW(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VROUNDSD(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     assert(!s->vex_l);
     gen_helper_roundsd_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
@@ -4625,6 +4663,7 @@ static void gen_VROUNDSD(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VROUNDSS(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     assert(!s->vex_l);
     gen_helper_roundss_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
@@ -4642,6 +4681,7 @@ static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VUCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_reg_sse_fp();
     SSEFunc_0_epp fn;
     fn = s->prefix & PREFIX_DATA ? gen_helper_ucomisd : gen_helper_ucomiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);

@@ -907,24 +907,6 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(!current_cpu->plugin_spec_mode);
 
     /*
-     * Plugin API version 6 is the first whose declaration of this function
-     * is known to take @saved_state; a caller declaring an older version may
-     * pass nothing, and plugin_spec_saved_state below would then be an
-     * arbitrary pointer that qemu_plugin_spec_mode_end() later restores the
-     * vCPU from.  This entry point carries no plugin id, so the check uses
-     * the lowest version any loaded plugin declares.
-     */
-    if (plugin_declared_version_floor() < 6) {
-        error_report("plugin: qemu_plugin_spec_mode_begin() gained its "
-                     "saved_state argument at plugin API version 6, and a "
-                     "loaded plugin declares version %d.  QEMU would restore "
-                     "vCPU state from an argument that plugin never passed.  "
-                     "Rebuild the plugin against this qemu-plugin.h.",
-                     plugin_declared_version_floor());
-        _exit(1);
-    }
-
-    /*
      * Fail-safe containment guard.  Wrong-path tracing routes speculative
      * stores through the slow-path do_st helpers so they land in the spec
      * store sandbox instead of real guest RAM.  Two mechanisms provide that
@@ -960,6 +942,7 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
                                                                g_direct_equal);
     }
     current_cpu->plugin_spec_saved_state = saved_state;
+    current_cpu->plugin_spec_excp_at_begin = current_cpu->exception_index;
     current_cpu->plugin_spec_store_overflow = false;
     current_cpu->plugin_spec_mode = true;
 
@@ -1283,6 +1266,26 @@ void qemu_plugin_spec_mode_end(void)
 
     current_cpu->plugin_spec_mode = false;
     current_cpu->plugin_spec_saved_state = NULL;
+
+    /*
+     * An exception the wrong path latched is discharged here, whatever the
+     * caller did.  A walker is asked to clear it (spec_clear_exception) and
+     * to restore the vCPU (cpu_state_restore, which carries exception_index
+     * too), but one that omits both returns into the correct path with, say,
+     * the wrong path's EXCP_SYSCALL pending: cpu_exec hands it to cpu_loop
+     * and the host performs the call, AFTER plugin_spec_mode was cleared
+     * above, so the do_syscall() barrier never sees it.  Spec mode ending is
+     * the last point at which the exception is known to be the wrong path's,
+     * so it is dropped here, and a syscall dropped this way is counted with
+     * the ones that barrier refuses.
+     */
+    if (current_cpu->exception_index != current_cpu->plugin_spec_excp_at_begin) {
+        if (qemu_plugin_spec_excp_is_syscall &&
+            qemu_plugin_spec_excp_is_syscall(current_cpu->exception_index)) {
+            qemu_plugin_spec_syscall_blocked++;
+        }
+        current_cpu->exception_index = current_cpu->plugin_spec_excp_at_begin;
+    }
 
     /*
      * Flush sandbox: clear the line index and reset the pool's

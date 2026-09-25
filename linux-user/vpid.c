@@ -117,9 +117,10 @@ pid_t vpid_from_host(pid_t host_tid)
  * Returns false when the guest named a positive pid that is not in the pinned
  * space: it cannot have learned that number from us, and letting it through
  * would aim the syscall at an unrelated host process, so the caller answers
- * ESRCH.  Zero and negative arguments keep their kernel meaning (self, this
- * process group, every process) and pass through untouched, as does every
- * argument when -pid is not in use.
+ * ESRCH.  Zero and negative arguments pass through untouched, as does every
+ * argument when -pid is not in use; a negative that names a process group
+ * (kill's -pgrp) is a group id, and its caller translates it with
+ * vpid_pgrp_to_host() instead.
  */
 bool vpid_to_host(abi_long *pid)
 {
@@ -132,6 +133,26 @@ bool vpid_to_host(abi_long *pid)
         return false;
     }
     *pid = host_tid;
+    return true;
+}
+
+/*
+ * The same, for a process-GROUP id.  The result side names this process's
+ * group vpid_pgrp() -- it leads its own group in the pinned space -- so that
+ * is a name in the space too, and on the host it is the group QEMU runs in.
+ * It is the only group the guest can have learned from us; any other positive
+ * id is refused like an unknown pid.  Zero and negative ids keep their kernel
+ * meaning.
+ */
+bool vpid_pgrp_to_host(abi_long *pgrp)
+{
+    if (!qemu_vpid_base || (pid_t)*pgrp <= 0) {
+        return true;
+    }
+    if ((pid_t)*pgrp != vpid_pgrp()) {
+        return false;
+    }
+    *pgrp = getpgrp();
     return true;
 }
 

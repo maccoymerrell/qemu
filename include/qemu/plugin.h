@@ -194,6 +194,8 @@ void qemu_plugin_vcpu_syscall_ret(CPUState *cpu, int64_t num, int64_t ret);
  * standing proof that it holds, and stays 0 on a healthy run.
  */
 extern uint64_t qemu_plugin_spec_syscall_blocked;
+/* *-linux-user: whether @excp is one its cpu_loop() hands to do_syscall() */
+extern bool (*qemu_plugin_spec_excp_is_syscall)(int excp);
 
 void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
                              uint64_t value_low,

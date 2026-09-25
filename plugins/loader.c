@@ -170,6 +170,60 @@ static uint64_t xorshift64star(uint64_t x)
     return x * UINT64_C(2685821657736338717);
 }
 
+#ifdef __ELF__
+#include "elf.h"
+#if HOST_LONG_BITS == 64
+#define ElfW(t) Elf64_##t
+#else
+#define ElfW(t) Elf32_##t
+#endif
+
+/*
+ * Whether the shared object at @path imports @name: an UNDEFINED entry of
+ * that name in its dynamic symbol table is the static linker's record that
+ * the object calls it.  An object whose table cannot be read cannot be shown
+ * not to, and answers true.
+ */
+static bool plugin_imports(const char *path, const char *name)
+{
+    g_autoptr(GMappedFile) mf = g_mapped_file_new(path, FALSE, NULL);
+    const char *img = mf ? g_mapped_file_get_contents(mf) : NULL;
+    size_t len = mf ? g_mapped_file_get_length(mf) : 0;
+    const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *)img;
+    const ElfW(Shdr) *sh;
+
+    if (!img || len < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) ||
+        eh->e_shentsize != sizeof(*sh) ||
+        eh->e_shoff + (size_t)eh->e_shnum * sizeof(*sh) > len) {
+        return true;
+    }
+    sh = (const ElfW(Shdr) *)(img + eh->e_shoff);
+    for (int i = 0; i < eh->e_shnum; i++) {
+        const ElfW(Shdr) *st = &sh[sh[i].sh_link];
+        if (sh[i].sh_type != SHT_DYNSYM || sh[i].sh_link >= eh->e_shnum ||
+            sh[i].sh_offset + sh[i].sh_size > len ||
+            st->sh_offset + st->sh_size > len) {
+            continue;
+        }
+        const ElfW(Sym) *sym = (const ElfW(Sym) *)(img + sh[i].sh_offset);
+        for (size_t j = 0; j < sh[i].sh_size / sizeof(*sym); j++) {
+            if (sym[j].st_shndx == SHN_UNDEF && sym[j].st_name < st->sh_size &&
+                !strncmp(img + st->sh_offset + sym[j].st_name, name,
+                         st->sh_size - sym[j].st_name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+#else
+static bool plugin_imports(const char *path, const char *name)
+{
+    return true;    /* no reader for this object format */
+}
+#endif
+
 /*
  * Disable CFI checks.
  * The install and version functions have been loaded from an external library
@@ -229,7 +283,23 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
          * unless someone can still ask what the plugin was built against.
          */
         ctx->version = version;
-        plugin_note_declared_version(version);
+        /*
+         * qemu_plugin_spec_mode_begin() gained @saved_state while the
+         * constant read 5, so only 6 and up are known to pass it.  The entry
+         * point carries no plugin id and cannot tell which plugin called it,
+         * so the version is checked here, against the plugin that imports
+         * it: refusing at the call would end the whole run for a plugin that
+         * never calls it.
+         */
+        if (version < 6 && plugin_imports(desc->path,
+                                          "qemu_plugin_spec_mode_begin")) {
+            error_setg(errp, "Could not load plugin %s: it declares plugin API "
+                       "version %d and imports qemu_plugin_spec_mode_begin(), "
+                       "which gained its saved_state argument at version 6; "
+                       "rebuild it against this qemu-plugin.h",
+                       desc->path, version);
+            goto err_symbol;
+        }
     }
 
     qemu_rec_mutex_lock(&plugin.lock);

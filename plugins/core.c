@@ -92,21 +92,8 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
  * and torn the machine down, on a thread where current_cpu is NULL.
  */
 static qemu_plugin_vm_shutdown_cb_t vm_shutdown_hook;
+static qemu_plugin_id_t vm_shutdown_hook_id;    /* its registrant */
 static bool vm_shutdown_dispatched;
-
-static int plugin_version_floor = QEMU_PLUGIN_VERSION;
-
-void plugin_note_declared_version(int version)
-{
-    if (version < plugin_version_floor) {
-        plugin_version_floor = version;
-    }
-}
-
-int plugin_declared_version_floor(void)
-{
-    return plugin_version_floor;
-}
 
 /*
  * Refuse an entry point whose SIGNATURE changed after the API version the
@@ -144,6 +131,7 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
      * the machine.
      */
     plugin_require_abi(id, "qemu_plugin_vm_shutdown_cb_t", 21);
+    vm_shutdown_hook_id = id;
     vm_shutdown_hook = cb;
 }
 
@@ -177,7 +165,7 @@ bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index, bool in_guest_insn)
     if (qatomic_xchg(&vm_shutdown_dispatched, true)) {
         return false;
     }
-    cb(0, vcpu_index, in_guest_insn);
+    cb(vm_shutdown_hook_id, vcpu_index, in_guest_insn);
     return true;
 }
 
@@ -197,11 +185,13 @@ bool qemu_plugin_vm_shutdown_armed(void)
  * as soon as the callback returns so the next teardown is seen too.
  */
 static qemu_plugin_vm_reset_cb_t vm_reset_hook;
+static qemu_plugin_id_t vm_reset_hook_id;       /* its registrant */
 static bool vm_reset_dispatch_in_flight;
 
 void qemu_plugin_register_vm_reset_cb(qemu_plugin_id_t id,
                                       qemu_plugin_vm_reset_cb_t cb)
 {
+    vm_reset_hook_id = id;
     vm_reset_hook = cb;
 }
 
@@ -216,7 +206,7 @@ bool qemu_plugin_vm_reset_dispatch(int vcpu_index, bool in_guest_insn)
     if (qatomic_xchg(&vm_reset_dispatch_in_flight, true)) {
         return false;
     }
-    cb(0, vcpu_index, in_guest_insn);
+    cb(vm_reset_hook_id, vcpu_index, in_guest_insn);
     qatomic_set(&vm_reset_dispatch_in_flight, false);
     return true;
 }
@@ -1102,11 +1092,14 @@ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1, uint64_t a2,
  * structural -- every target's syscall instruction unwinds through
  * cpu_plugin_exec_tb()'s own landing pad, so do_syscall() is unreachable while
  * cpu->plugin_spec_mode is set -- and this counter is the standing proof: the
- * guard in do_syscall() bumps it instead of executing, so a non-zero value
- * means the structural suppression developed a hole.  Read through
+ * guard in do_syscall() bumps it instead of executing, and so does
+ * qemu_plugin_spec_mode_end() when it discharges a syscall exception the walker
+ * left latched, so a non-zero value means the walker's discipline developed a
+ * hole that QEMU closed.  Read through
  * qemu_plugin_spec_syscall_blocked_count().
  */
 uint64_t qemu_plugin_spec_syscall_blocked;
+bool (*qemu_plugin_spec_excp_is_syscall)(int excp);
 
 /*
  * Disable CFI checks.

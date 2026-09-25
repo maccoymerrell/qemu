@@ -37,6 +37,7 @@ void vpid_init(pid_t base);
 void vpid_register(pid_t host_tid);
 pid_t vpid_from_host(pid_t host_tid);
 bool vpid_to_host(abi_long *pid);
+bool vpid_pgrp_to_host(abi_long *pgrp);
 void vpid_refuse_new_process(const char *what);
 /* Name this thread carries in the pinned space (its own host tid when -pid is
  * not in use), and the thread-group id the guest sees for this process. */

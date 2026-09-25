@@ -7478,6 +7478,30 @@ _syscall2(int, sys_setgroups, int, size, gid_t *, grouplist)
 _syscall2(int, sys_setreuid, uid_t, ruid, uid_t, euid);
 _syscall2(int, sys_setregid, gid_t, rgid, gid_t, egid);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * The exceptions this target's cpu_loop() hands to do_syscall(), so that
+ * qemu_plugin_spec_mode_end() can count a wrong-path syscall it discharges
+ * with the ones the barrier below refuses.  Targets outside the four the
+ * wrong-path tracer serves are not tabulated: the discharge still happens
+ * there, and only its count is missing.
+ */
+static bool spec_excp_is_syscall(int excp)
+{
+#if defined(TARGET_I386)
+    return excp == EXCP_SYSCALL || excp == 0x80 || excp == EXCP_VSYSCALL;
+#elif defined(TARGET_ARM)
+    return excp == EXCP_SWI;
+#elif defined(TARGET_RISCV)
+    return excp == RISCV_EXCP_U_ECALL;
+#elif defined(TARGET_MIPS)
+    return excp == EXCP_SYSCALL;
+#else
+    return false;
+#endif
+}
+#endif
+
 void syscall_init(void)
 {
     IOCTLEntry *ie;
@@ -7485,6 +7509,9 @@ void syscall_init(void)
     int size;
 
     thunk_init(STRUCT_MAX);
+#ifdef CONFIG_PLUGIN
+    qemu_plugin_spec_excp_is_syscall = spec_excp_is_syscall;
+#endif
 
 #define STRUCT(name, ...) thunk_register_struct(STRUCT_ ## name, #name, struct_ ## name ## _def);
 #define STRUCT_SPECIAL(name) thunk_register_struct_direct(STRUCT_ ## name, #name, &struct_ ## name ## _def);
@@ -9431,10 +9458,11 @@ _syscall5(int, sys_move_mount, int, __from_dfd, const char *, __from_pathname,
 enum {
     VPID_ARG1 = 1,          /* arg1 is a pid/tid */
     VPID_ARG2,              /* arg2 is a pid/tid */
-    VPID_ARG2_IF_PROCESS,   /* arg2 is a pid only when arg1 == PRIO_PROCESS;
-                             * for PRIO_PGRP it is a process group and for
-                             * PRIO_USER a uid, neither of which lives in the
-                             * pinned space */
+    VPID_ARG1_KILL,         /* arg1 is a pid, or below -1 a negated group */
+    VPID_ARG2_PGRP,         /* arg2 is a process group */
+    VPID_ARG2_BY_WHICH,     /* arg2 is what arg1 says: a pid (PRIO_PROCESS),
+                             * a group (PRIO_PGRP) or a uid (PRIO_USER, which
+                             * is not in the pinned space) */
 };
 
 static const struct {
@@ -9442,7 +9470,7 @@ static const struct {
     int arg;        /* which argument holds the pid/tid */
 } vpid_arg_syscalls[] = {
 #ifdef TARGET_NR_kill
-    { TARGET_NR_kill, VPID_ARG1 },
+    { TARGET_NR_kill, VPID_ARG1_KILL },
 #endif
 #ifdef TARGET_NR_tkill
     { TARGET_NR_tkill, VPID_ARG1 },
@@ -9457,7 +9485,7 @@ static const struct {
     { TARGET_NR_rt_tgsigqueueinfo, VPID_ARG1 }, { TARGET_NR_rt_tgsigqueueinfo, VPID_ARG2 },
 #endif
 #ifdef TARGET_NR_setpgid
-    { TARGET_NR_setpgid, VPID_ARG1 }, { TARGET_NR_setpgid, VPID_ARG2 },
+    { TARGET_NR_setpgid, VPID_ARG1 }, { TARGET_NR_setpgid, VPID_ARG2_PGRP },
 #endif
 #ifdef TARGET_NR_getpgid
     { TARGET_NR_getpgid, VPID_ARG1 },
@@ -9466,10 +9494,10 @@ static const struct {
     { TARGET_NR_getsid, VPID_ARG1 },
 #endif
 #ifdef TARGET_NR_getpriority
-    { TARGET_NR_getpriority, VPID_ARG2_IF_PROCESS },
+    { TARGET_NR_getpriority, VPID_ARG2_BY_WHICH },
 #endif
 #ifdef TARGET_NR_setpriority
-    { TARGET_NR_setpriority, VPID_ARG2_IF_PROCESS },
+    { TARGET_NR_setpriority, VPID_ARG2_BY_WHICH },
 #endif
 #ifdef TARGET_NR_sched_setparam
     { TARGET_NR_sched_setparam, VPID_ARG1 },
@@ -9554,8 +9582,26 @@ static bool vpid_map_syscall_args(int num, abi_long *arg1, abi_long *arg2)
                 return false;
             }
             break;
-        case VPID_ARG2_IF_PROCESS:
-            if (*arg1 == PRIO_PROCESS && !vpid_to_host(arg2)) {
+        case VPID_ARG1_KILL:
+            /* a pid_t: the register's upper half is not part of it */
+            if ((pid_t)*arg1 < -1) {
+                abi_long pgrp = -(pid_t)*arg1;
+                if (!vpid_pgrp_to_host(&pgrp)) {
+                    return false;
+                }
+                *arg1 = -pgrp;
+            } else if (!vpid_to_host(arg1)) {
+                return false;
+            }
+            break;
+        case VPID_ARG2_PGRP:
+            if (!vpid_pgrp_to_host(arg2)) {
+                return false;
+            }
+            break;
+        case VPID_ARG2_BY_WHICH:
+            if ((*arg1 == PRIO_PROCESS && !vpid_to_host(arg2)) ||
+                (*arg1 == PRIO_PGRP && !vpid_pgrp_to_host(arg2))) {
                 return false;
             }
             break;

@@ -77,13 +77,6 @@ struct qemu_plugin_ctx {
 
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id);
 
-/*
- * The lowest API version any loaded plugin declared, for entry points that
- * carry no plugin id and so cannot ask about their own caller.
- */
-void plugin_note_declared_version(int version);
-int plugin_declared_version_floor(void);
-
 void plugin_register_inline_op_on_entry(GArray **arr,
                                         enum qemu_plugin_mem_rw rw,
                                         enum qemu_plugin_op op,

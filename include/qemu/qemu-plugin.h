@@ -83,8 +83,8 @@ typedef uint64_t qemu_plugin_id_t;
  *   while the version constant still read 5, so 5 names both the
  *   no-argument and the one-argument spelling and cannot be honoured
  *   either way; 6 is the first version that distinguishes them, and
- *   qemu_plugin_spec_mode_begin() refuses the run when any loaded
- *   plugin declares less.  A caller built before the change passes
+ *   the loader refuses a plugin that declares less and imports
+ *   qemu_plugin_spec_mode_begin().  A caller built before the change passes
  *   nothing, and the state qemu_plugin_spec_mode_end() later restores
  *   the vCPU from would be whatever the first argument register held.
  *   Rebuild the plugin against this header.
@@ -251,9 +251,9 @@ typedef uint64_t qemu_plugin_id_t;
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
- * either way, so the entry point refuses the ambiguous version along
- * with everything below it.  The gate sits at the entry point rather
- * than at QEMU_PLUGIN_MIN_VERSION because a floor raised for one API
+ * either way, so the ambiguous version is refused along with everything
+ * below it, for the plugin that uses that API only.  The gate is per API
+ * rather than at QEMU_PLUGIN_MIN_VERSION because a floor raised for one API
  * would also reject every old plugin that never touches it.
  */
 
@@ -2294,8 +2294,10 @@ bool qemu_plugin_spec_mem_faulted_take(void);
  * instruction executed under qemu_plugin_spec_mode_begin() unwinds into
  * qemu_plugin_exec_tb()'s landing pad, never into the syscall dispatcher -- so
  * this counter is a standing self-check rather than a policy knob and reads 0
- * on a healthy run; a non-zero value means the suppression developed a hole
- * and the trace ran with real side effects on it.  Always 0 in system
+ * on a healthy run.  It counts both places a wrong-path syscall is stopped
+ * after the walker failed to discharge it: the dispatcher reached while spec
+ * mode is still on, and qemu_plugin_spec_mode_end() finding the syscall's
+ * exception still latched.  Neither performs the call.  Always 0 in system
  * emulation, where a syscall is guest kernel entry and has no host effect.
  * Process-wide (all vCPUs); safe to call from plugin_exit().
  */

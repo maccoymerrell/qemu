@@ -760,6 +760,9 @@ struct CPUState {
      * stores.  Cleared per excursion in qemu_plugin_spec_mode_begin. */
     bool plugin_spec_store_overflow;
     struct qemu_plugin_cpu_state *plugin_spec_saved_state;
+    /* exception_index as qemu_plugin_spec_mode_begin() found it; _end()
+     * puts it back, so nothing a wrong path latches outlives spec mode */
+    int plugin_spec_excp_at_begin;
     /*
      * Set when a code-buffer overflow is detected DURING wrong-path
      * (plugin_spec_mode) translation.  A real tb_flush there would reset the

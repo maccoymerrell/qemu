@@ -8,6 +8,7 @@
 #include "wire.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <initializer_list>
 #include <unordered_map>
@@ -59,15 +60,19 @@ void Bytes::sleb(int64_t v)
     }
 }
 
-void Bytes::sleb_wide(const uint64_t limb[3])
+void Bytes::sleb_wide(const uint64_t *limb, int n)
 {
-    uint64_t v[3] = { limb[0], limb[1], limb[2] };
+    uint64_t v[9] = {}; /* n <= 9 */
+    std::copy(limb, limb + n, v);
     for (;;) {
         uint8_t b = v[0] & 0x7f;
-        v[0] = (v[0] >> 7) | (v[1] << 57);
-        v[1] = (v[1] >> 7) | (v[2] << 57);
-        v[2] = uint64_t(int64_t(v[2]) >> 7);    /* sign-propagating */
-        bool zero = !(v[0] | v[1] | v[2]), ones = !~(v[0] & v[1] & v[2]);
+        bool zero = true, ones = true;
+        for (int k = 0; k < n; k++) {
+            v[k] = k + 1 < n ? (v[k] >> 7) | (v[k + 1] << 57) :
+                   uint64_t(int64_t(v[k]) >> 7);    /* sign-propagating */
+            zero = zero && !v[k];
+            ones = ones && !~v[k];
+        }
         bool done = (zero && !(b & 0x40)) || (ones && (b & 0x40));
         u8(done ? b : (b | 0x80));
         if (done) {
@@ -115,6 +120,7 @@ enum : uint8_t {
 
 constexpr uint8_t kUnclassified = 0;    /* opcode and branch_type value */
 constexpr uint8_t kFlagMemData = 1;     /* header_flag CST_FLAG_MEM_DATA */
+constexpr uint8_t kFlagRegData = 2;     /* header_flag CST_FLAG_REG_DATA */
 constexpr uint8_t kFlagWp = 8;          /* header_flag CST_FLAG_WP */
 constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
 
@@ -126,6 +132,8 @@ constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
 enum : uint32_t {
     kFidStop = 1, kFidFlags = 2, kFidFaultInsn = 4,
     kFidNLoads = 5, kFidNStores = 6, kFidSlot0 = 7,
+    /* after every memop slot: METAFLAGS, then DST_REG{k}, DST_REG_WIDTH{k} */
+    kFidMeta = kFidSlot0 + 6 * 512, kFidReg0,
 };
 const char *const kSlotFamilies[] = {
     "CST_FID_LOAD_ADDR", "CST_FID_STORE_ADDR", "CST_FID_LOAD_DATA",
@@ -135,6 +143,7 @@ uint32_t slot_fid(size_t k, bool store, int family)     /* 0 addr 1 data 2 size 
 {
     return kFidSlot0 + 6 * uint32_t(k) + 2 * family + store;
 }
+uint32_t reg_fid(size_t k, bool width) { return kFidReg0 + 2 * uint32_t(k) + width; }
 
 /* The name section 5.4 gives GenericRegId @id */
 std::string reg_name(unsigned id)
@@ -160,7 +169,6 @@ std::string reg_name(unsigned id)
     return "REG_NONE";
 }
 
-
 using MapEntries = std::vector<std::pair<uint64_t, std::string>>;
 
 /* Enumerated names take 0, 1, 2 ...; flag names take bits 0, 1, 2 ... */
@@ -183,15 +191,18 @@ MapEntries numbered(std::initializer_list<const char *> names, bool bits,
  * The canonical decoder and auditor additionally demand the rest of the
  * section-2 flag vocabularies, the other block-level field-ids of 5.7
  * and the IFRAME / REGFILE tags, so those names are carried too.  A name
- * is vocabulary, not a claim: of the flags only MEM_DATA and WP are set,
- * the memop field-ids are named for exactly the @slots the body
- * addresses, and the reg map for every register a template names.
+ * is vocabulary, not a claim: of the flags only MEM_DATA, REG_DATA and WP
+ * are set, the memop field-ids are named for exactly the @slots the body
+ * addresses, the register ones for the widest destination list, and the
+ * reg map for every register a template names.
  * Values are this writer's choice, except the body tags, which are the
  * ones section 2 says the writer assigns.
  */
-Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates)
+Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
+                    bool regdata)
 {
     std::map<unsigned, bool> regs;   /* every id the templates use */
+    size_t ndst = 0;
     for (const WireTemplate &t : templates) {
         for (const WireInsn &i : t.insns) {
             for (const auto *l : { &i.regs->src, &i.regs->dst }) {
@@ -199,6 +210,7 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates)
                     regs[r] = true;
                 }
             }
+            ndst = std::max(ndst, i.regs->dst.size());
         }
     }
     MapEntries names;
@@ -214,6 +226,14 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates)
         for (int f = 0; f < 6; f++) {
             fids.push_back({ slot_fid(k, f & 1, f / 2),
                              kSlotFamilies[f] + std::to_string(k) });
+        }
+    }
+    if (regdata) {
+        fids.push_back({ kFidMeta, "CST_FID_METAFLAGS" });
+        for (size_t k = 0; k < ndst; k++) {
+            fids.push_back({ reg_fid(k, false), "CST_FID_DST_REG" + std::to_string(k) });
+            fids.push_back({ reg_fid(k, true),
+                             "CST_FID_DST_REG_WIDTH" + std::to_string(k) });
         }
     }
     const std::pair<const char *, MapEntries> maps[] = {
@@ -320,7 +340,8 @@ struct CellHash {
                                      (uint64_t(c.ipos) << 12) ^ c.fid);
     }
 };
-using Overlay = std::unordered_map<Cell, std::pair<uint64_t, uint64_t>, CellHash>;
+using Value = std::array<uint64_t, 8>;     /* 512 bits, little-endian limbs */
+using Overlay = std::unordered_map<Cell, Value, CellHash>;
 
 /*
  * One delta section: records against @own, resolving a cell @own lacks
@@ -334,8 +355,13 @@ public:
     void put(uint32_t ipos, uint32_t fid, uint64_t lo, uint64_t hi = 0,
              uint64_t def = 0)
     {
+        put(ipos, fid, Value{ lo, hi }, Value{ def });
+    }
+
+    void put(uint32_t ipos, uint32_t fid, const Value &v, const Value &def)
+    {
         Cell c{ tid_, tmpl_, ipos, fid };
-        std::pair<uint64_t, uint64_t> p{ def, 0 };
+        Value p = def;
         auto it = own_.find(c);
         if (it != own_.end()) {
             p = it->second;
@@ -343,16 +369,19 @@ public:
             auto f = fb_->find(c);
             p = f != fb_->end() ? f->second : p;
         }
-        if (lo == p.first && hi == p.second) {
+        if (v == p) {
             return;
         }
-        Record x{ ipos, fid, {} };  /* 192-bit two's-complement difference */
-        uint64_t borrow = lo < p.first, t = hi - p.second;
-        x.delta[0] = lo - p.first;
-        x.delta[1] = t - borrow;
-        x.delta[2] = -uint64_t(hi < p.second || t < borrow);
+        Record x{ ipos, fid, {} };  /* two's-complement difference, sign limb */
+        uint64_t borrow = 0;
+        for (int k = 0; k < 8; k++) {
+            uint64_t t = v[k] - p[k];
+            x.delta[k] = t - borrow;
+            borrow = v[k] < p[k] || t < borrow;
+        }
+        x.delta[8] = -borrow;
         recs_.push_back(x);
-        own_[c] = { lo, hi };
+        own_[c] = v;
     }
 
     Bytes bytes()
@@ -367,13 +396,13 @@ public:
             b.uleb(x.ipos - last);
             last = x.ipos;
             b.uleb(x.fid);
-            b.sleb_wide(x.delta);
+            b.sleb_wide(x.delta, 9);
         }
         return b;
     }
 
 private:
-    struct Record { uint32_t ipos, fid; uint64_t delta[3]; };
+    struct Record { uint32_t ipos, fid; uint64_t delta[9]; };
     Overlay &own_;
     const Overlay *fb_;
     uint32_t tid_, tmpl_;
@@ -381,13 +410,40 @@ private:
 };
 
 /*
- * The delta section of entry or chain block @e: its memops over the range
- * it ran, then its block-level cells at BLOCK_POS (section 5.7).
+ * Destination register @x.reg - 1's value and width (section 5.4), and for
+ * the integer flags register of x86 / AArch64 the canonical METAFLAGS byte
+ * (section 2): Z N C V P, from EFLAGS ZF SF CF OF PF / NZCV.
+ */
+void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
+             const std::vector<uint8_t> &arena, int isa)
+{
+    static const int bit[2][5] = { { 6, 7, 0, 11, 2 }, { 30, 31, 29, 28, -1 } };
+    Value v{ x.lo, x.hi };
+    if (x.size > 16) {
+        std::memcpy(&v[2], &arena[x.addr], x.size - 16);
+    }
+    sec.put(ipos, reg_fid(x.reg - 1, false), v, Value{});
+    sec.put(ipos, reg_fid(x.reg - 1, true), x.size);
+    if (id == kRegFlags && (isa == 1 || isa == 2)) {
+        uint64_t mf = 0;
+        for (int f = 0; f < 5; f++) {
+            int b = bit[isa - 1][f];
+            mf |= b >= 0 && (x.lo >> b & 1) ? 1u << f : 0;
+        }
+        sec.put(ipos, kFidMeta, mf);
+    }
+}
+
+/*
+ * The delta section of entry or chain block @e: its memops and register
+ * values over the range it ran, then its block-level cells at BLOCK_POS
+ * (section 5.7).
  */
 Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
                     std::vector<WireTemplate> &templates,
                     const std::vector<Memop> &memops, size_t &slots,
-                    MemopCensus &census)
+                    MemopCensus &census, const std::vector<uint8_t> &arena,
+                    int isa)
 {
     WireTemplate &t = templates[e.template_id];
     uint32_t n = uint32_t(t.insns.size()), stop = e.stop ? e.stop : n;
@@ -396,7 +452,15 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
     for (uint32_t ipos = 0; ipos < stop; ipos++) {
         std::vector<const Memop *> dir[2];
         for (; m < e.end && memops[m].pos - e.base == ipos; m++) {
-            dir[memops[m].store].push_back(&memops[m]);
+            const Memop &x = memops[m];
+            if (x.reg) {    /* a slot the template declares (variance aside) */
+                const std::vector<uint8_t> &dst = t.insns[ipos].regs->dst;
+                if (x.reg <= dst.size()) {
+                    put_reg(sec, ipos, x, dst[x.reg - 1], arena, isa);
+                }
+            } else {
+                dir[x.store].push_back(&x);
+            }
         }
         for (int d = 0; d < 2; d++) {
             size_t c = std::min(dir[d].size(), kSlotCount);
@@ -431,13 +495,13 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
 
 Bytes header_member(const HeaderFacts &facts,
                     const std::vector<WireTemplate> &templates, size_t slots,
-                    bool wp)
+                    bool wp, bool regdata)
 {
     Bytes h;
     h.u32(kMagic);
     h.u8(facts.isa);
-    /* flags: memop values, and the wrong-path chains when they are on */
-    h.u8(kFlagMemData | (wp ? kFlagWp : 0));
+    /* flags: memop values, register values, and the wrong-path chains */
+    h.u8(kFlagMemData | (regdata ? kFlagRegData : 0) | (wp ? kFlagWp : 0));
     h.uleb(0);          /* start_insn: no window, the timeline starts at 0 */
     h.uleb(0);          /* warmup_insns: none configured */
     h.uleb(0);          /* total_target_insns: 0 = unbounded */
@@ -446,7 +510,7 @@ Bytes header_member(const HeaderFacts &facts,
     h.str(facts.datetime);
     h.str(facts.comment);
     h.str(facts.target_name);
-    h.section(encoding_maps(std::min(slots, kSlotCount), templates));
+    h.section(encoding_maps(std::min(slots, kSlotCount), templates, regdata));
     h.uleb(0);          /* warmup_end_trace_insn_idx: no warmup, ends at 0 */
     h.uleb(templates.size());   /* templates section, to member EOF */
     for (size_t id = 0; id < templates.size(); id++) {
@@ -459,7 +523,8 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<WireEntry> &chains,
                   const std::vector<Memop> &memops, size_t &slots, bool wp,
-                  MemopCensus &census)
+                  MemopCensus &census, const std::vector<uint8_t> &arena,
+                  int isa)
 {
     Bytes b;
     b.u32(kMagic);
@@ -482,7 +547,7 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
         b.sleb(int64_t(e.template_id) - tmpl);
         tmpl = e.template_id;
         b.section(entry_section(cp, nullptr, e, templates, memops, slots,
-                                census));
+                                census, arena, isa));
         if (wp) {
             Bytes ch;
             ch.uleb(e.wp_e - e.wp_b);
@@ -491,7 +556,7 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                 ch.sleb(int64_t(chains[w].template_id) - prev);
                 prev = chains[w].template_id;
                 ch.section(entry_section(spec, &cp, chains[w], templates, memops,
-                                         slots, census));
+                                         slots, census, arena, isa));
             }
             b.section(ch);
         }

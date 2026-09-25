@@ -30,7 +30,7 @@ public:
     void f64(double v);
     void uleb(uint64_t v);
     void sleb(int64_t v);
-    void sleb_wide(const uint64_t limb[3]);    /* 192-bit two's complement */
+    void sleb_wide(const uint64_t *limb, int n);    /* n limbs, two's complement */
     void str(const std::string &s);        /* string  := len:ULEB bytes */
     void section(const Bytes &payload);    /* section := len:ULEB payload */
     void raw(const Bytes &o) { buf_.insert(buf_.end(), o.buf_.begin(), o.buf_.end()); }
@@ -56,10 +56,13 @@ int isa_for_target(const std::string &target_name);
  * The registers an instruction may read and write, as QEMU states them
  * (qemu_plugin_insn_reg_list), in the wire's GenericRegId (section 5.4):
  * @id per slot, first appearance first, the order the dependency and
- * lane masks index.  @opaque names what the statement could not state.
+ * lane masks index.  @snap[k] is the gdb handle DST_REG{k} is read
+ * through (null: no snapshot, or the constant zero register when
+ * @id is REG_ZERO); @opaque names what the statement could not state.
  */
 struct Regs {
     std::vector<uint8_t> src, dst;
+    std::vector<void *> snap;
     const char *opaque = nullptr;
     bool operator==(const Regs &o) const { return src == o.src && dst == o.dst; }
 };
@@ -107,13 +110,17 @@ struct MemopCensus {
 /*
  * One memory access as the callback stated it (sections 5.2, 5.3): @pos is
  * the instruction's index in its block, @data_ok says a value came with it,
- * @fault that the wrong path was served a placeholder (section 4.4).
+ * @fault that the wrong path was served a placeholder (section 4.4).  With
+ * @reg = k + 1 it is instead destination register k's value after the
+ * instruction (section 5.4): @size bytes, the first 16 in @lo/@hi, the rest
+ * at @addr in the snapshot arena.
  */
 struct Memop {
     uint64_t addr, lo, hi;
     uint32_t pos;
     uint8_t size;
-    bool store, data_ok, fault;
+    uint8_t store : 1, data_ok : 1, fault : 1;
+    uint8_t reg;
 };
 
 /*
@@ -139,7 +146,7 @@ struct WireEntry {
  */
 Bytes header_member(const HeaderFacts &facts,
                     const std::vector<WireTemplate> &templates, size_t slots,
-                    bool wp);
+                    bool wp, bool regdata);
 
 /*
  * The body member: lead magic, the opening (asid, thread) declaration of
@@ -154,7 +161,8 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<WireEntry> &chains,
                   const std::vector<Memop> &memops, size_t &slots, bool wp,
-                  MemopCensus &census);
+                  MemopCensus &census, const std::vector<uint8_t> &arena,
+                  int isa);
 
 } /* namespace cst */
 

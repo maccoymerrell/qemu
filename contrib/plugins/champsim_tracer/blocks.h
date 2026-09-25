@@ -55,6 +55,9 @@ struct TbShape {
     std::vector<Insn> raw;
     std::vector<size_t> traps;  /* conditional traps the translator lowered */
     std::vector<Regs> regs;     /* per insn, the register statement */
+    /* where insn k's snapshot callback reads insn k - 1's destinations */
+    struct At { const TbShape *tb; uint32_t pos; };
+    std::vector<At> at;
 };
 
 /* The engine's account of the last bulk (fan-out) instruction it ran. */
@@ -176,6 +179,12 @@ public:
             bulk = nullptr;
         }
         marks_[last] |= bulk ? kFanout : 0;     /* variable memops: expected */
+        /* A bulk op's register values follow its last unit, not its shares */
+        std::vector<Memop> tail;
+        while (bulk && !mem.empty() && mem.back().reg && mem.back().pos == n - 1) {
+            tail.insert(tail.begin(), mem.back());
+            mem.pop_back();
+        }
         /* A bulk op's memops divide in order into one share per unit. */
         size_t own = std::find_if(mem.begin(), mem.end(), [n](const Memop &m) {
             return m.pos == n - 1; }) - mem.begin();
@@ -219,6 +228,14 @@ public:
                 emit_units(tid, last, bulk->units ? bulk->units - 1 : 0, m,
                            share);
             }
+        }
+        if (!tail.empty() && (bulk->units || !(n == 1 && s.reentered == last))) {
+            Entry &e = list(tid).back();
+            for (Memop t : tail) {
+                t.pos = uint32_t(shapes_[e.shape]->size() - 1);
+                mems_.push_back(t);
+            }
+            e.mem_e = mems_.size();
         }
         s.reentered = bulk && bulk->reenter ? last : kNone;
         if (ran < n || skipped) {   /* this execution left the block here */

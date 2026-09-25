@@ -11,9 +11,10 @@
  * pc/size templates and one entry per block run (blocks.h), with the
  * memory accesses the memory callbacks state (address, size, direction,
  * value), the registers QEMU states each instruction may read and write,
- * and after each block whose transfer has a nameable alternative a
- * wrong-path chain of the same facts (excursion()).  It claims nothing else
- * about an instruction; system mode keeps an empty body.
+ * with every destination's value after it runs, and after each block whose
+ * transfer has a nameable alternative a wrong-path chain of the same facts
+ * (excursion()).  It claims nothing else about an instruction; system mode
+ * keeps an empty body.
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
@@ -21,6 +22,7 @@
  *                    e.g. compress="zstd -T0 -3 -q -c"
  *   wp=0|1           wrong-path chains (default 1)
  *   wpdepth=<n>      wrong-path instructions per chain (default 64)
+ *   regdata=0|1      destination-register values (default 1)
  */
 #include <algorithm>
 #include <cstdio>
@@ -77,7 +79,10 @@ struct Session {
     /* per vCPU: a TB whose transfer's block is still open (a MIPS slot next) */
     std::map<unsigned int, const cst::TbShape *> xfer;
     WpStats wps{};
-    uint64_t overflow = 0;      /* register slots past the capture cap */
+    bool regdata = true;
+    std::vector<uint8_t> arena;     /* register values past their 16th byte */
+    GByteArray *buf = g_byte_array_new();
+    uint64_t snaps = 0, unreadable = 0, overflow = 0;
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -213,7 +218,7 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
     cst::Regs out;
     const qemu_plugin_insn_reg *r = qemu_plugin_insn_reg_list(insn, &n,
                                                               &out.opaque);
-    struct Slot { uint8_t id, access; };
+    struct Slot { uint8_t id, access; void *handle; };
     std::vector<Slot> l;
     for (size_t k = 0; k < n; k++) {
         uint8_t id = reg_id(s.facts.isa, r[k]);
@@ -226,9 +231,10 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
         auto it = std::find_if(l.begin(), l.end(), [id](const Slot &x) {
             return x.id == id; });
         if (it == l.end()) {
-            l.push_back({ id, r[k].access });
+            l.push_back({ id, r[k].access, r[k].handle });
         } else {
             it->access |= r[k].access;
+            it->handle = it->handle ? it->handle : r[k].handle;
         }
     }
     for (const Slot &x : l) {
@@ -241,9 +247,64 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
         }
         if (wr && out.dst.size() < kMax) {
             out.dst.push_back(x.id);
+            out.snap.push_back(x.handle);
         }
     }
     return out;
+}
+
+/*
+ * Section 5.4: the value of every destination of instruction @pos of
+ * @r's TB after it ran, read now that it has, into thread @tid's stream
+ * as it is for memops.  The zero register reads as the zero it is.
+ */
+void snapshot(Session &s, uint32_t tid, const cst::Regs &r, uint32_t pos)
+{
+    for (size_t k = 0; k < r.dst.size(); k++) {
+        cst::Memop m{};
+        m.pos = pos;
+        m.reg = uint8_t(k + 1);
+        m.size = r.dst[k] == cst::kRegZero ? 8 : 0;
+        g_byte_array_set_size(s.buf, 0);
+        if (r.snap[k]) {
+            int len = qemu_plugin_read_register(
+                static_cast<struct qemu_plugin_register *>(r.snap[k]), s.buf);
+            m.size = uint8_t(std::min(std::max(len, 0), 64));
+        }
+        if (!m.size) {
+            s.unreadable++;
+            continue;
+        }
+        g_byte_array_set_size(s.buf, 64);   /* zero-filled past the value */
+        std::memset(s.buf->data + m.size, 0, 64 - m.size);
+        std::memcpy(&m.lo, s.buf->data, 8);
+        std::memcpy(&m.hi, s.buf->data + 8, 8);
+        if (m.size > 16) {
+            m.addr = s.arena.size();
+            s.arena.insert(s.arena.end(), s.buf->data + 16, s.buf->data + m.size);
+        }
+        s.snaps++;
+        s.blocks.memop(tid, m);
+    }
+}
+
+/* Instruction @udata's predecessor in its TB has finished. */
+void on_snap(unsigned int vcpu, void *udata)
+{
+    Session &s = session();
+    auto *at = static_cast<const cst::TbShape::At *>(udata);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    if (!s.published) {
+        snapshot(s, s.wp_tid ? s.wp_tid : vcpu, at->tb->regs[at->pos], at->pos);
+    }
+}
+
+/* The last instruction TB @tb started, @ran of them, has finished. */
+void snapshot_tail(Session &s, uint32_t tid, const cst::TbShape *tb, size_t ran)
+{
+    if (s.regdata && tb && ran && ran <= tb->regs.size()) {
+        snapshot(s, tid, tb->regs[ran - 1], uint32_t(ran - 1));
+    }
 }
 
 /*
@@ -310,7 +371,8 @@ void reg_report(Session &s, const std::string &path)
         std::to_string(opaque.size()) + " classes) reg_list_overflow=" +
         std::to_string(s.overflow) + " reg_list_variance=" +
         std::to_string(s.blocks.variance.size()) + " (unexplained " +
-        std::to_string(odd) + ")");
+        std::to_string(odd) + ") snapshots=" + std::to_string(s.snaps) +
+        " unreadable=" + std::to_string(s.unreadable));
 }
 
 /*
@@ -337,7 +399,7 @@ void publish(uint64_t root_phys, const char *route)
     cst::MemopCensus census;
     cst::Member body = { "body.cst", cst::body_member(root_phys, templates,
                          entries, chains, s.blocks.memops(), slots, s.wp,
-                         census).data() };
+                         census, s.arena, s.facts.isa).data() };
     memop_tripwire(census, s.path);
     reg_report(s, s.path);
     const auto &st = s.blocks.stats;
@@ -347,7 +409,10 @@ void publish(uint64_t root_phys, const char *route)
         std::to_string(st.late_ends) + "; revised " +
         std::to_string(st.revised_shapes) + " shapes, " +
         std::to_string(st.recut_entries) + " entries re-cut; memops=" +
-        std::to_string(s.blocks.memops().size()) + " max_slots=" +
+        std::to_string(std::count_if(s.blocks.memops().begin(),
+                                     s.blocks.memops().end(),
+                                     [](const cst::Memop &m) { return !m.reg; })) +
+        " max_slots=" +
         std::to_string(slots) + " no_value=" + std::to_string(s.no_value) +
         " uneven_fanout=" + std::to_string(st.uneven_fanout));
     const WpStats &w = s.wps;
@@ -368,7 +433,7 @@ void publish(uint64_t root_phys, const char *route)
     }
     std::vector<cst::Member> members = {
         body, { "header.cst", cst::header_member(s.facts, templates, slots,
-                                                 s.wp).data() },
+                                                 s.wp, s.regdata).data() },
     };
     std::string err;
     bool ok = true;
@@ -462,6 +527,9 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
         if (ok && (!s.fired || !ran)) {
             s.wps.bail_stall++;     /* no instruction retired: a kick, not a path */
             break;
+        }
+        if (s.fired) {
+            snapshot_tail(s, wt, s.blocks.pending(wt), ran);
         }
         if (ok) {
             cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
@@ -561,6 +629,7 @@ void on_tb_exec(unsigned int vcpu, void *udata)
     const cst::TbShape *prev = s.blocks.pending(vcpu);
     size_t ran = qemu_plugin_u64_get(s.started, vcpu);
     uint64_t next = s.blocks.insn(tb->insns.front()).pc;
+    snapshot_tail(s, vcpu, prev, ran);
     s.blocks.retire(vcpu, ran, &bulk, next);
     /* the TB whose transfer this retire completes: its own, or its slot's */
     const cst::TbShape *x = nullptr;
@@ -661,6 +730,16 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
     if (n == 0) {
         return;
     }
+    /* Each instruction's start is its predecessor's end (section 5.4). */
+    shape->at.reserve(n);
+    for (size_t i = 1; i < n && s.regdata; i++) {
+        if (!shape->regs[i - 1].dst.empty()) {
+            shape->at.push_back({ shape.get(), uint32_t(i - 1) });
+            qemu_plugin_register_vcpu_insn_exec_cb(qemu_plugin_tb_get_insn(tb, i),
+                                                   on_snap, QEMU_PLUGIN_CB_R_REGS,
+                                                   &shape->at.back());
+        }
+    }
     /* RW: an excursion launched here saves, runs and restores the vCPU */
     qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
                                          shape.get());
@@ -684,6 +763,8 @@ bool parse_options(Session &s, int argc, char **argv)
             s.wp = val == "1";
         } else if (key == "wpdepth" && std::atoi(val.c_str()) > 0) {
             s.wpdepth = size_t(std::atoi(val.c_str()));
+        } else if (key == "regdata" && (val == "0" || val == "1")) {
+            s.regdata = val == "1";
         } else {
             say("unknown or malformed option '" + opt + "'");
             return false;

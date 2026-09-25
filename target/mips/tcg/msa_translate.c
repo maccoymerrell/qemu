@@ -250,6 +250,36 @@ static bool gen_msa_BxZ_V(DisasContext *ctx, int wt, int sa, TCGCond cond)
     return true;
 }
 
+/*
+ * The register statement for an MSA helper, which is handed its vector
+ * registers only as constant numbers: @wd written, and also read when
+ * @merge (the family has members that merge into or accumulate onto wd);
+ * @ws and @wt read (-1: none); @csr: the float families' MSACSR access.
+ * With these stated, the helper does nothing else a statement could name.
+ */
+enum { MSA_NONE = -1 };
+static void gen_msa_regs(int wd, bool merge, int ws, int wt, bool csr)
+{
+    unsigned r = QEMU_PLUGIN_REG_READ, w = QEMU_PLUGIN_REG_WRITE;
+
+    if (wd != MSA_NONE) {
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_fpu.fpr[wd].wr.d[1]),
+                           merge ? r | w : w);
+    }
+    if (ws != MSA_NONE) {
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_fpu.fpr[ws].wr.d[1]),
+                           r);
+    }
+    if (wt != MSA_NONE) {
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_fpu.fpr[wt].wr.d[1]),
+                           r);
+    }
+    if (csr) {
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.msacsr), r | w);
+    }
+    plugin_gen_reg_covered();
+}
+
 static bool trans_BZ_V(DisasContext *ctx, arg_msa_bz *a)
 {
     return gen_msa_BxZ_V(ctx, a->wt, a->sa, TCG_COND_EQ);
@@ -298,6 +328,7 @@ static bool trans_msa_i8(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, true, a->ws, MSA_NONE, false);
     gen_msa_i8(tcg_env,
                tcg_constant_i32(a->wd),
                tcg_constant_i32(a->ws),
@@ -324,6 +355,7 @@ static bool trans_SHF(DisasContext *ctx, arg_msa_i *a)
         return true;
     }
 
+    gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_helper_msa_shf_df(tcg_env,
                           tcg_constant_i32(a->df),
                           tcg_constant_i32(a->wd),
@@ -340,6 +372,7 @@ static bool trans_msa_i5(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_msa_i5(tcg_env,
                tcg_constant_i32(a->df),
                tcg_constant_i32(a->wd),
@@ -367,6 +400,7 @@ static bool trans_LDI(DisasContext *ctx, arg_msa_ldi *a)
         return true;
     }
 
+    gen_msa_regs(a->wd, false, MSA_NONE, MSA_NONE, false);
     gen_helper_msa_ldi_df(tcg_env,
                           tcg_constant_i32(a->df),
                           tcg_constant_i32(a->wd),
@@ -386,6 +420,7 @@ static bool trans_msa_bit(DisasContext *ctx, arg_msa_bit *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, true, a->ws, MSA_NONE, false);
     gen_msa_bit(tcg_env,
                 tcg_constant_i32(a->df),
                 tcg_constant_i32(a->wd),
@@ -415,6 +450,7 @@ static bool trans_msa_3rf(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, true, a->ws, a->wt, true);
     gen_msa_3rf(tcg_env,
                 tcg_constant_i32(a->df),
                 tcg_constant_i32(a->wd),
@@ -435,6 +471,7 @@ static bool trans_msa_3r(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, true, a->ws, a->wt, false);
     gen_msa_3r(tcg_env,
                tcg_constant_i32(a->wd),
                tcg_constant_i32(a->ws),
@@ -529,6 +566,7 @@ static bool trans_MOVE_V(DisasContext *ctx, arg_msa_elm *a)
         return true;
     }
 
+    gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_helper_msa_move_v(tcg_env,
                           tcg_constant_i32(a->wd),
                           tcg_constant_i32(a->ws));
@@ -547,6 +585,9 @@ static bool trans_CTCMSA(DisasContext *ctx, arg_msa_elm *a)
     telm = tcg_temp_new();
 
     gen_load_gpr(telm, a->ws);
+    plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.msacsr),
+                       QEMU_PLUGIN_REG_WRITE);
+    plugin_gen_reg_covered();
     gen_helper_msa_ctcmsa(tcg_env, telm, tcg_constant_i32(a->wd));
 
     return true;
@@ -562,6 +603,9 @@ static bool trans_CFCMSA(DisasContext *ctx, arg_msa_elm *a)
 
     telm = tcg_temp_new();
 
+    plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.msacsr),
+                       QEMU_PLUGIN_REG_READ);
+    plugin_gen_reg_covered();
     gen_helper_msa_cfcmsa(telm, tcg_env, tcg_constant_i32(a->ws));
     gen_store_gpr(telm, a->wd);
 
@@ -579,6 +623,7 @@ static bool trans_msa_elm(DisasContext *ctx, arg_msa_elm_df *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, true, a->ws, MSA_NONE, false);
     gen_msa_elm_df(tcg_env,
                    tcg_constant_i32(a->df),
                    tcg_constant_i32(a->wd),
@@ -593,7 +638,8 @@ TRANS(SPLATI, trans_msa_elm, gen_helper_msa_splati_df);
 TRANS(INSVE,  trans_msa_elm, gen_helper_msa_insve_df);
 
 static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
-                             gen_helper_piii * const gen_msa_elm[4])
+                             gen_helper_piii * const gen_msa_elm[4],
+                             bool insert)
 {
     if (a->df < 0 || !gen_msa_elm[a->df]) {
         return false;
@@ -603,6 +649,12 @@ static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
         return true;
     }
 
+    /* COPY: GPR wd <- an element of ws; INSERT: into wd, from GPR ws */
+    plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[insert ? a->ws :
+                                                            a->wd]),
+                       insert ? QEMU_PLUGIN_REG_READ : QEMU_PLUGIN_REG_WRITE);
+    gen_msa_regs(insert ? a->wd : MSA_NONE, true,
+                 insert ? MSA_NONE : a->ws, MSA_NONE, false);
     gen_msa_elm[a->df](tcg_env,
                        tcg_constant_i32(a->wd),
                        tcg_constant_i32(a->ws),
@@ -629,7 +681,7 @@ static bool trans_COPY_U(DisasContext *ctx, arg_msa_elm_df *a)
         NULL_IF_MIPS32(gen_helper_msa_copy_u_w), NULL
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_copy_u);
+    return trans_msa_elm_fn(ctx, a, gen_msa_copy_u, false);
 }
 
 static bool trans_COPY_S(DisasContext *ctx, arg_msa_elm_df *a)
@@ -644,7 +696,7 @@ static bool trans_COPY_S(DisasContext *ctx, arg_msa_elm_df *a)
         gen_helper_msa_copy_s_w, NULL_IF_MIPS32(gen_helper_msa_copy_s_d)
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_copy_s);
+    return trans_msa_elm_fn(ctx, a, gen_msa_copy_s, false);
 }
 
 static bool trans_INSERT(DisasContext *ctx, arg_msa_elm_df *a)
@@ -654,7 +706,7 @@ static bool trans_INSERT(DisasContext *ctx, arg_msa_elm_df *a)
         gen_helper_msa_insert_w, NULL_IF_MIPS32(gen_helper_msa_insert_d)
     };
 
-    return trans_msa_elm_fn(ctx, a, gen_msa_insert);
+    return trans_msa_elm_fn(ctx, a, gen_msa_insert, true);
 }
 
 TRANS(FCAF,     trans_msa_3rf, gen_helper_msa_fcaf_df);
@@ -708,6 +760,7 @@ static bool trans_msa_2r(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_msa_2r(tcg_env, tcg_constant_i32(a->wd), tcg_constant_i32(a->ws));
 
     return true;
@@ -728,6 +781,9 @@ static bool trans_FILL(DisasContext *ctx, arg_msa_r *a)
         return true;
     }
 
+    plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[a->ws]),
+                       QEMU_PLUGIN_REG_READ);
+    gen_msa_regs(a->wd, false, MSA_NONE, MSA_NONE, false);
     gen_helper_msa_fill_df(tcg_env,
                            tcg_constant_i32(a->df),
                            tcg_constant_i32(a->wd),
@@ -743,6 +799,7 @@ static bool trans_msa_2rf(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    gen_msa_regs(a->wd, false, a->ws, MSA_NONE, true);
     gen_msa_2rf(tcg_env,
                 tcg_constant_i32(a->df),
                 tcg_constant_i32(a->wd),
@@ -769,7 +826,7 @@ TRANS(FFINT_S,  trans_msa_2rf, gen_helper_msa_ffint_s_df);
 TRANS(FFINT_U,  trans_msa_2rf, gen_helper_msa_ffint_u_df);
 
 static bool trans_msa_ldst(DisasContext *ctx, arg_msa_i *a,
-                           gen_helper_piv *gen_msa_ldst)
+                           gen_helper_piv *gen_msa_ldst, bool store)
 {
     TCGv taddr;
 
@@ -780,13 +837,26 @@ static bool trans_msa_ldst(DisasContext *ctx, arg_msa_i *a,
     taddr = tcg_temp_new();
 
     gen_base_offset_addr(ctx, taddr, a->ws, a->sa << a->df);
+    if (store) {
+        gen_msa_regs(MSA_NONE, false, a->wd, MSA_NONE, false);
+    } else {
+        gen_msa_regs(a->wd, false, MSA_NONE, MSA_NONE, false);
+    }
     gen_msa_ldst(tcg_env, tcg_constant_i32(a->wd), taddr);
 
     return true;
 }
 
-TRANS_DF_iv(LD, trans_msa_ldst, gen_helper_msa_ld);
-TRANS_DF_iv(ST, trans_msa_ldst, gen_helper_msa_st);
+static gen_helper_piv * const LD_tab[4] = {
+    gen_helper_msa_ld_b, gen_helper_msa_ld_h,
+    gen_helper_msa_ld_w, gen_helper_msa_ld_d
+};
+static gen_helper_piv * const ST_tab[4] = {
+    gen_helper_msa_st_b, gen_helper_msa_st_h,
+    gen_helper_msa_st_w, gen_helper_msa_st_d
+};
+TRANS(LD, trans_msa_ldst, LD_tab[a->df], false);
+TRANS(ST, trans_msa_ldst, ST_tab[a->df], true);
 
 static bool trans_LSA(DisasContext *ctx, arg_r *a)
 {

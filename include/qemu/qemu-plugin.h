@@ -252,6 +252,11 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_insn_transfer_kind (the translator lowered a control
  *   transfer here: static target, run-time target, or conditional trap)
  *
+ * version 26:
+ * - added qemu_plugin_insn_reg_list: the registers an instruction may read
+ *   and may write, as its translation states them, each with the handle
+ *   qemu_plugin_read_register() takes when the gdbstub has one
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -263,7 +268,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 25
+#define QEMU_PLUGIN_VERSION 26
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -816,6 +821,69 @@ enum qemu_plugin_transfer_kind {
 QEMU_PLUGIN_API
 enum qemu_plugin_transfer_kind
 qemu_plugin_insn_transfer_kind(const struct qemu_plugin_insn *insn);
+
+/**
+ * enum qemu_plugin_reg_class - what kind of register a statement names
+ *
+ * Structural identity only, in the target's own terms (the gdb feature a
+ * register belongs to says the same): no role, no classification.
+ */
+enum qemu_plugin_reg_class {
+    QEMU_PLUGIN_REG_GPR,
+    QEMU_PLUGIN_REG_FP,
+    QEMU_PLUGIN_REG_VECTOR,
+    QEMU_PLUGIN_REG_PREDICATE,
+    QEMU_PLUGIN_REG_FLAGS,
+    QEMU_PLUGIN_REG_SEGMENT,
+    QEMU_PLUGIN_REG_ACCUMULATOR,
+    QEMU_PLUGIN_REG_CONTROL,
+    QEMU_PLUGIN_REG_ZERO,
+};
+
+/* qemu_plugin_insn_reg.access bits */
+#define QEMU_PLUGIN_REG_READ  1
+#define QEMU_PLUGIN_REG_WRITE 2
+
+/**
+ * struct qemu_plugin_insn_reg - one register an instruction may access
+ * @reg_class: an enum qemu_plugin_reg_class value
+ * @access: QEMU_PLUGIN_REG_READ and/or QEMU_PLUGIN_REG_WRITE
+ * @index: the register's number within its class (the target's numbering)
+ * @width: the register's width in bytes
+ * @name: the target's name for it (the gdbstub's where it has one)
+ * @handle: for qemu_plugin_read_register(), or NULL when the gdbstub
+ *   exposes no such register
+ */
+struct qemu_plugin_insn_reg {
+    uint8_t reg_class;
+    uint8_t access;
+    uint16_t index;
+    uint16_t width;
+    const char *name;
+    struct qemu_plugin_register *handle;
+};
+
+/**
+ * qemu_plugin_insn_reg_list() - the registers the instruction may access
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ * @n: set to the number of entries returned
+ * @opaque: if not NULL, set to NULL when the statement is complete, else
+ *   to the name of the first effect it could not state (the helper whose
+ *   access to CPU state is invisible to the translation, or the CPU-state
+ *   field no register is known for)
+ *
+ * The translation's statement of every register the instruction MAY read
+ * and MAY write -- including accesses that happen only on some paths --
+ * in order of first appearance.  An access whose direction the
+ * translation cannot tell is stated as both.  Valid only during the
+ * translation callback; a plugin keeps what it needs.
+ *
+ * Returns: the array (NULL when empty).
+ */
+QEMU_PLUGIN_API
+const struct qemu_plugin_insn_reg *
+qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
+                          const char **opaque);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

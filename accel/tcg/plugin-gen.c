@@ -29,6 +29,11 @@
 #include "exec/exec-all.h"
 #include "exec/plugin-gen.h"
 #include "exec/translator.h"
+#include "accel/tcg/cpu-ops.h"
+#include "tcg/tcg-internal.h"
+
+/* the vCPU translating: its resolve hook names registers (reg_walk()) */
+static __thread CPUState *reg_cpu;
 
 enum plugin_gen_from {
     PLUGIN_GEN_FROM_TB,
@@ -481,6 +486,17 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
      */
     insn->branch_target_pc = 0;
     insn->transfer_kind = QEMU_PLUGIN_TRANSFER_NONE;
+    /* the register statement, likewise */
+    reg_cpu = cpu;
+    if (insn->regs) {
+        g_array_set_size(insn->regs, 0);
+    }
+    if (insn->reg_notes) {
+        g_array_set_size(insn->reg_notes, 0);
+    }
+    insn->reg_opaque = NULL;
+    insn->reg_covered = false;
+    insn->reg_mute = PLUGIN_REG_MUTE_OFF;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
 }
@@ -502,12 +518,347 @@ void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind)
     }
 }
 
+/*
+ * The register statement (qemu_plugin_insn_reg_list()).
+ *
+ * The ops an instruction emits ARE its register accesses: a TCG global of
+ * CPU state read or written, a load or store at a CPU-state offset, a
+ * CPU-state pointer handed to a helper.  plugin_gen_insn_end() walks them
+ * (reg_walk()) and the target's resolve hook names the register behind
+ * each field.  Ops behind a branch are in the list too, so the result is
+ * what the instruction MAY read and write.  The translator adds what the
+ * ops cannot show -- implicit and constant-indexed helper operands, zero
+ * registers -- through plugin_gen_reg*(), recorded as notes anchored at
+ * the last op emitted, so statement order is emission order.
+ */
+typedef struct PluginRegNote {
+    TCGOp *anchor;
+    enum { NOTE_REG, NOTE_TEMP, NOTE_MUTE } kind;
+    uint8_t access;         /* NOTE_REG: bits; NOTE_MUTE: mode */
+    TCGTemp *temp;
+    PluginRegDesc d;
+} PluginRegNote;
+
+/*
+ * One register being collected: the accesses the ops showed, the notes
+ * stated, and whether it was only handed to a helper by pointer.  @wdef:
+ * written on every path so far, so a later read sees the instruction's
+ * own result, not an input.
+ */
+typedef struct RegAcc {
+    PluginRegDesc d;
+    uint8_t ops, stated;
+    bool ptr, noted, wdef;
+} RegAcc;
+
+static void reg_note(PluginRegNote *n)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (!insn) {
+        return;
+    }
+    if (!insn->reg_notes) {
+        insn->reg_notes = g_array_new(false, false, sizeof(PluginRegNote));
+    }
+    n->anchor = tcg_last_op();
+    g_array_append_val(insn->reg_notes, *n);
+}
+
+void plugin_gen_reg(const PluginRegDesc *d, unsigned access)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    PluginRegNote n = { .kind = NOTE_REG, .access = access, .d = *d };
+
+    if (insn && insn->reg_mute) {   /* a muted span states nothing */
+        n.access &= insn->reg_mute == PLUGIN_REG_MUTE_ALL ? 0 :
+                    QEMU_PLUGIN_REG_READ;
+        if (!n.access) {
+            return;
+        }
+    }
+    reg_note(&n);
+}
+
+static int reg_resolve(intptr_t off, unsigned size, PluginRegDesc *d)
+{
+    const TCGCPUOps *ops = reg_cpu ? reg_cpu->cc->tcg_ops : NULL;
+
+    memset(d, 0, sizeof(*d));
+    return ops && ops->plugin_reg_resolve ?
+           ops->plugin_reg_resolve(reg_cpu, off, size, d) : PLUGIN_REG_UNKNOWN;
+}
+
+void plugin_gen_reg_env(intptr_t offset, unsigned access)
+{
+    PluginRegDesc d;
+
+    if (tcg_ctx->plugin_insn &&
+        reg_resolve(offset, 1, &d) == PLUGIN_REG_ARCH) {
+        plugin_gen_reg(&d, access);
+    }
+}
+
+void plugin_gen_reg_temp(TCGTemp *t, const PluginRegDesc *d)
+{
+    PluginRegNote n = { .kind = NOTE_TEMP, .temp = t, .d = *d };
+
+    reg_note(&n);
+}
+
+void plugin_gen_reg_covered(void)
+{
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->reg_covered = true;
+    }
+}
+
+void plugin_gen_reg_mute(int mode)
+{
+    PluginRegNote n = { .kind = NOTE_MUTE, .access = mode };
+
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->reg_mute = mode;
+        reg_note(&n);
+    }
+}
+
+static void reg_add(GArray *acc, const PluginRegDesc *d, unsigned access,
+                    bool ptr, bool noted)
+{
+    RegAcc *a = NULL;
+
+    for (guint i = 0; i < acc->len && !a; i++) {
+        RegAcc *e = &g_array_index(acc, RegAcc, i);
+        a = e->d.cls == d->cls && e->d.index == d->index ? e : NULL;
+    }
+    if (!a) {
+        RegAcc z = { .d = *d };
+        g_array_append_val(acc, z);
+        a = &g_array_index(acc, RegAcc, acc->len - 1);
+    }
+    a->d.width = MAX(a->d.width, d->width);
+    a->ptr |= ptr;
+    a->noted |= noted;
+    if (noted) {
+        a->stated |= access;
+    } else if (!ptr) {
+        access &= a->wdef ? ~QEMU_PLUGIN_REG_READ : ~0;
+        a->ops |= access;
+        a->wdef |= access & QEMU_PLUGIN_REG_WRITE;
+    }
+}
+
+static void reg_opaque(struct qemu_plugin_insn *insn, const char *what)
+{
+    if (!insn->reg_opaque) {
+        insn->reg_opaque = g_intern_string(what);
+    }
+}
+
+/* A CPU-state field accessed by an op: add its register, or say why not */
+static void reg_field(struct qemu_plugin_insn *insn, GArray *acc,
+                      intptr_t off, unsigned size, unsigned access, bool ptr)
+{
+    PluginRegDesc d;
+    char what[40];
+
+    switch (reg_resolve(off, size, &d)) {
+    case PLUGIN_REG_ARCH:
+        reg_add(acc, &d, access, ptr, false);
+        break;
+    case PLUGIN_REG_UNKNOWN:
+        snprintf(what, sizeof(what), "cpu-state+%#" PRIxPTR, off);
+        reg_opaque(insn, what);
+        break;
+    }
+}
+
+static unsigned reg_ldst_size(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_ld8u_i32: case INDEX_op_ld8s_i32: case INDEX_op_st8_i32:
+    case INDEX_op_ld8u_i64: case INDEX_op_ld8s_i64: case INDEX_op_st8_i64:
+        return 1;
+    case INDEX_op_ld16u_i32: case INDEX_op_ld16s_i32: case INDEX_op_st16_i32:
+    case INDEX_op_ld16u_i64: case INDEX_op_ld16s_i64: case INDEX_op_st16_i64:
+        return 2;
+    case INDEX_op_ld_i32: case INDEX_op_st_i32: case INDEX_op_ld32u_i64:
+    case INDEX_op_ld32s_i64: case INDEX_op_st32_i64:
+        return 4;
+    case INDEX_op_ld_i64: case INDEX_op_st_i64:
+        return 8;
+    case INDEX_op_ld_vec: case INDEX_op_st_vec: case INDEX_op_dupm_vec:
+        return tcg_type_size(TCGOP_TYPE(op));
+    default:
+        return 0;
+    }
+}
+
+/* Offset from env that temp @t holds, per @ptrs; INTPTR_MIN if unknown */
+static bool reg_ptr(GHashTable *ptrs, TCGTemp *t, intptr_t *off)
+{
+    gpointer v;
+
+    if (t == tcgv_ptr_temp(tcg_env)) {
+        *off = 0;
+        return true;
+    }
+    if (g_hash_table_lookup_extended(ptrs, t, NULL, &v)) {
+        *off = (intptr_t)v;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * The TCG runtime's own helpers (accel/tcg/tcg-runtime.h) take env for a
+ * block exit or a memory access, never for a register.
+ */
+static bool reg_runtime_helper(const char *name)
+{
+    return !strcmp(name, "lookup_tb_ptr") || !strcmp(name, "exit_atomic") ||
+           g_str_has_prefix(name, "atomic_");
+}
+
+static void reg_walk(const DisasContextBase *db, struct qemu_plugin_insn *insn)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    g_autoptr(GArray) acc = g_array_new(false, false, sizeof(RegAcc));
+    g_autoptr(GHashTable) ptrs = g_hash_table_new(NULL, NULL);
+    g_autoptr(GHashTable) temps = g_hash_table_new(NULL, NULL);
+    GArray *notes = insn->reg_notes;
+    guint next = 0;
+    int mute = 0;
+    TCGOp *op = db->insn_start;
+
+    for (; op; op = QTAILQ_NEXT(op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        bool call = op->opc == INDEX_op_call;
+        unsigned no = call ? TCGOP_CALLO(op) : def->nb_oargs;
+        unsigned ni = call ? TCGOP_CALLI(op) : def->nb_iargs;
+        unsigned size = reg_ldst_size(op);
+        bool takes_env = false;
+        intptr_t off;
+
+        if (op->opc == INDEX_op_insn_start || op->opc == INDEX_op_discard ||
+            op->opc == INDEX_op_plugin_cb || mute == PLUGIN_REG_MUTE_ALL) {
+            goto notes;
+        }
+        if (size) {         /* host load/store: base is the last input */
+            TCGTemp *base = arg_temp(op->args[no + ni - 1]);
+            if (reg_ptr(ptrs, base, &off)) {
+                if (off == INTPTR_MIN) {
+                    reg_opaque(insn, "cpu-state[run-time index]");
+                } else {
+                    reg_field(insn, acc, off + op->args[no + ni], size,
+                              no ? QEMU_PLUGIN_REG_READ :
+                              mute ? 0 : QEMU_PLUGIN_REG_WRITE, false);
+                }
+            }
+        }
+        if (op->opc == INDEX_op_set_label) {     /* a join: paths merge */
+            for (guint i = 0; i < acc->len; i++) {
+                g_array_index(acc, RegAcc, i).wdef = false;
+            }
+        }
+        for (unsigned k = 0; k < no + ni; k++) {
+            unsigned i = (k + no) % (no + ni);  /* inputs, then outputs */
+            TCGTemp *t = arg_temp(op->args[i]);
+            unsigned access = i < no ? (mute ? 0 : QEMU_PLUGIN_REG_WRITE) :
+                              QEMU_PLUGIN_REG_READ;
+            PluginRegDesc *d = g_hash_table_lookup(temps, t);
+
+            if (!t) {
+                continue;
+            }
+            if (d) {
+                reg_add(acc, d, access, false, false);
+            } else if (t->kind == TEMP_GLOBAL && t->mem_base == env) {
+                reg_field(insn, acc, t->mem_offset,
+                          tcg_type_size(t->base_type), access, false);
+            } else if (call && i >= no && reg_ptr(ptrs, t, &off)) {
+                takes_env |= t == env;
+                if (off == INTPTR_MIN) {
+                    reg_opaque(insn, "cpu-state[run-time index]");
+                } else if (t != env) {
+                    reg_field(insn, acc, off, 1, QEMU_PLUGIN_REG_READ |
+                              QEMU_PLUGIN_REG_WRITE, true);
+                }
+            }
+        }
+        if (call && takes_env && !insn->reg_covered &&
+            !reg_runtime_helper(tcg_call_info(op)->name)) {
+            reg_opaque(insn, tcg_call_info(op)->name);
+        }
+        /* track pointers into CPU state: env + constant */
+        if (no == 1 && !call) {
+            TCGTemp *out = arg_temp(op->args[0]);
+            intptr_t base;
+            bool derived = false;
+            if ((op->opc == INDEX_op_mov_i64 || op->opc == INDEX_op_mov_i32) &&
+                reg_ptr(ptrs, arg_temp(op->args[1]), &base)) {
+                derived = true;
+            } else if (op->opc == INDEX_op_add_i64 ||
+                       op->opc == INDEX_op_add_i32) {
+                TCGTemp *a = arg_temp(op->args[1]), *b = arg_temp(op->args[2]);
+                if (!reg_ptr(ptrs, a, &base)) {
+                    TCGTemp *s = a; a = b; b = s;
+                }
+                if (reg_ptr(ptrs, a, &base)) {
+                    derived = true;
+                    base = b->kind == TEMP_CONST && base != INTPTR_MIN ?
+                           base + b->val : INTPTR_MIN;
+                }
+            }
+            if (derived && out->kind != TEMP_GLOBAL) {
+                g_hash_table_insert(ptrs, out, (gpointer)base);
+            } else {
+                g_hash_table_remove(ptrs, out);
+            }
+        }
+    notes:
+        for (; notes && next < notes->len; next++) {
+            PluginRegNote *n = &g_array_index(notes, PluginRegNote, next);
+            if (n->anchor != op && QTAILQ_NEXT(op, link)) {
+                break;
+            }
+            if (n->kind == NOTE_MUTE) {
+                mute = n->access;
+            } else if (n->kind == NOTE_TEMP) {
+                g_hash_table_insert(temps, n->temp, &n->d);
+            } else {
+                reg_add(acc, &n->d, n->access, false, true);
+            }
+        }
+    }
+
+    if (!insn->regs) {
+        insn->regs = g_array_new(false, false,
+                                 sizeof(struct qemu_plugin_insn_reg));
+    }
+    for (guint i = 0; i < acc->len; i++) {
+        RegAcc *a = &g_array_index(acc, RegAcc, i);
+        unsigned access = a->ops | a->stated |
+            (a->ptr && !a->noted ? QEMU_PLUGIN_REG_READ |
+                                   QEMU_PLUGIN_REG_WRITE : 0);
+        struct qemu_plugin_insn_reg r = {
+            .reg_class = a->d.cls, .access = access, .index = a->d.index,
+            .width = a->d.width, .name = g_intern_string(a->d.name),
+        };
+        if (access) {
+            g_array_append_val(insn->regs, r);
+        }
+    }
+}
+
 void plugin_gen_insn_end(void)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;
     struct qemu_plugin_insn *pinsn = tcg_ctx->plugin_insn;
 
     pinsn->len = db->fake_insn ? db->record_len : db->pc_next - pinsn->vaddr;
+    reg_walk(db, pinsn);
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }

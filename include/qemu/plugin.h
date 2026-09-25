@@ -137,6 +137,18 @@ struct qemu_plugin_insn {
     uint64_t branch_target_pc;
     /* the transfer the translator lowered here; plugin_gen_record_*() */
     enum qemu_plugin_transfer_kind transfer_kind;
+    /*
+     * The register statement (qemu_plugin_insn_reg_list()): @regs holds
+     * struct qemu_plugin_insn_reg, built at plugin_gen_insn_end() from the
+     * instruction's ops and the translator's plugin_gen_reg*() statements
+     * (@reg_notes, in emission order); @reg_opaque names the first effect
+     * neither could state.  Reset per instruction.
+     */
+    GArray *regs;
+    GArray *reg_notes;
+    const char *reg_opaque;
+    bool reg_covered;
+    int reg_mute;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

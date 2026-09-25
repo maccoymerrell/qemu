@@ -33,6 +33,7 @@
 #include "accel/accel-cpu-target.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tcg/tcg.h"
+#include "exec/plugin-gen.h"
 #ifndef CONFIG_USER_ONLY
 #include "hw/boards.h"
 #endif
@@ -276,11 +277,88 @@ static void riscv_plugin_clock_resync(CPUState *cs,
 }
 #endif
 
+#ifdef CONFIG_PLUGIN
+/* The register behind a CPURISCVState field (TCGCPUOps.plugin_reg_resolve) */
+static int riscv_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
+                                    PluginRegDesc *d)
+{
+    static const char *const gpr[] = {
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+        "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+        "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+        "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+    };
+    static const char *const fpr[] = {
+        "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+        "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5",
+        "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
+        "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+    };
+    int vlenb = riscv_cpu_cfg(cpu_env(cs))->vlenb;
+    int i;
+
+#define IN(f) PLUGIN_REG_IN(CPURISCVState, f, off)
+#define ELT(f) PLUGIN_REG_ELT(CPURISCVState, f, off)
+    if (IN(gpr)) {
+        i = ELT(gpr);
+        return plugin_reg_desc(d, i ? QEMU_PLUGIN_REG_GPR : QEMU_PLUGIN_REG_ZERO,
+                               i, 8, "%s", gpr[i]);
+    }
+    if (IN(vreg) && vlenb) {    /* the stride is the run-time VLEN */
+        i = (off - offsetof(CPURISCVState, vreg)) / vlenb;
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_VECTOR, i, vlenb, "v%d", i);
+    }
+    if (IN(fpr)) {
+        i = ELT(fpr);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_FP, i, 8, "%s", fpr[i]);
+    }
+    if (IN(frm)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 0, 8, "frm");
+    }
+    if (IN(vl)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 1, 8, "vl");
+    }
+    if (IN(vtype) || IN(vill)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 2, 8, "vtype");
+    }
+    if (IN(vstart)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 3, 8, "vstart");
+    }
+    if (IN(vxrm)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 4, 8, "vxrm");
+    }
+    if (IN(vxsat)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 5, 8, "vxsat");
+    }
+    /*
+     * The pc, the reservation, fault bookkeeping, and mstatus, whose FS/VS
+     * dirty marking every FP and vector instruction performs for the OS's
+     * context switch, not as a data access the instruction makes.
+     */
+#ifndef CONFIG_USER_ONLY
+    if (IN(mstatus)) {
+        return PLUGIN_REG_DROP;
+    }
+#endif
+    if (off < 0 || IN(pc) || IN(load_res) || IN(load_val) || IN(bins) ||
+        IN(badaddr) || IN(fp_status) || IN(priv) || IN(retxh) || IN(elp) ||
+        IN(sw_check_code) || IN(xl)) {
+        return PLUGIN_REG_DROP;
+    }
+#undef IN
+#undef ELT
+    return PLUGIN_REG_UNKNOWN;
+}
+#endif
+
 static const TCGCPUOps riscv_tcg_ops = {
     .initialize = riscv_translate_init,
     .translate_code = riscv_translate_code,
     .synchronize_from_tb = riscv_cpu_synchronize_from_tb,
     .restore_state_to_opc = riscv_restore_state_to_opc,
+#ifdef CONFIG_PLUGIN
+    .plugin_reg_resolve = riscv_plugin_reg_resolve,
+#endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,

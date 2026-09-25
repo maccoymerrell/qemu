@@ -30,6 +30,7 @@
 #ifdef CONFIG_TCG
 #include "exec/translation-block.h"
 #include "accel/tcg/cpu-ops.h"
+#include "exec/plugin-gen.h"
 #endif /* CONFIG_TCG */
 #include "internals.h"
 #include "cpu-features.h"
@@ -2863,12 +2864,84 @@ static void arm_plugin_clock_resync(CPUState *cs,
 }
 #endif
 
+#ifdef CONFIG_PLUGIN
+/* The register behind a CPUARMState field (TCGCPUOps.plugin_reg_resolve) */
+static int arm_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
+                                  PluginRegDesc *d)
+{
+    bool sve = cpu_isar_feature(aa64_sve, ARM_CPU(cs));
+    int i;
+
+#define IN(f) PLUGIN_REG_IN(CPUARMState, f, off)
+#define ELT(f) PLUGIN_REG_ELT(CPUARMState, f, off)
+    if (IN(xregs)) {
+        i = ELT(xregs);
+        return i == 31 ?
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_GPR, i, 8, "sp") :
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_GPR, i, 8, "x%d", i);
+    }
+    if (IN(regs)) {
+        i = ELT(regs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_GPR, i, 4, "r%d", i);
+    }
+    /* NZCV, kept split */
+    if (IN(NF) || IN(ZF) || IN(CF) || IN(VF)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_FLAGS, 0, 4, "cpsr");
+    }
+    if (IN(vfp.zregs)) {
+        i = ELT(vfp.zregs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_VECTOR, i,
+                               sizeof_field(CPUARMState, vfp.zregs[0]),
+                               sve ? "z%d" : "v%d", i);
+    }
+    if (IN(vfp.pregs)) {
+        i = ELT(vfp.pregs);
+        return i == 16 ?
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 16, 32, "ffr") :
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_PREDICATE, i, 32, "p%d", i);
+    }
+    if (IN(vfp.qc) || IN(vfp.fpsr)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 0, 4, "fpsr");
+    }
+    if (IN(vfp.fpcr) || IN(vfp.xregs)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 1, 4, "fpcr");
+    }
+    if (IN(cp15.tpidr_el[0])) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 2, 8, "TPIDR_EL0");
+    }
+    if (IN(cp15.tpidrro_el[0])) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 3, 8,
+                               "TPIDRRO_EL0");
+    }
+    if (IN(zarray)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 4, 256, "za");
+    }
+    if (IN(cp15) || IN(svcr) || IN(daif) || IN(elr_el) || IN(sp_el) ||
+        IN(spsr)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 5, 8, "sys");
+    }
+    /* the pc, translation flags, the exclusive monitor, scratch */
+    if (off < 0 || IN(pc) || IN(hflags) || IN(exclusive_addr) ||
+        IN(exclusive_val) || IN(exclusive_high) || IN(vfp.preg_tmp) ||
+        IN(vfp.scratch) || IN(vfp.fp_status) || IN(btype) ||
+        IN(condexec_bits) || IN(pstate) || IN(aarch64) || IN(thumb)) {
+        return PLUGIN_REG_DROP;
+    }
+#undef IN
+#undef ELT
+    return PLUGIN_REG_UNKNOWN;
+}
+#endif
+
 static const TCGCPUOps arm_tcg_ops = {
     .initialize = arm_translate_init,
     .translate_code = arm_translate_code,
     .synchronize_from_tb = arm_cpu_synchronize_from_tb,
     .debug_excp_handler = arm_debug_excp_handler,
     .restore_state_to_opc = arm_restore_state_to_opc,
+#ifdef CONFIG_PLUGIN
+    .plugin_reg_resolve = arm_plugin_reg_resolve,
+#endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,

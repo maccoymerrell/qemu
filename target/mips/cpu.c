@@ -582,6 +582,7 @@ static const Property mips_cpu_properties[] = {
 
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
+#include "exec/plugin-gen.h"
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
                                   bool *mmu_on)
@@ -722,11 +723,84 @@ static void mips_plugin_clock_resync(CPUState *cs,
 }
 #endif
 
+#ifdef CONFIG_PLUGIN
+/* The register behind a CPUMIPSState field (TCGCPUOps.plugin_reg_resolve) */
+static int mips_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
+                                   PluginRegDesc *d)
+{
+    static const char *const gpr[] = {
+        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "s8", "ra",
+    };
+    int i;
+
+#define IN(f) PLUGIN_REG_IN(CPUMIPSState, f, off)
+#define ELT(f) PLUGIN_REG_ELT(CPUMIPSState, f, off)
+    if (IN(active_tc.gpr)) {
+        i = ELT(active_tc.gpr);
+        return plugin_reg_desc(d, i ? QEMU_PLUGIN_REG_GPR : QEMU_PLUGIN_REG_ZERO,
+                               i, sizeof(target_ulong), "%s", gpr[i]);
+    }
+    if (IN(active_tc.LO)) {
+        i = ELT(active_tc.LO);
+        return i ? plugin_reg_desc(d, QEMU_PLUGIN_REG_ACCUMULATOR, i,
+                                   sizeof(target_ulong), "lo%d", i) :
+                   plugin_reg_desc(d, QEMU_PLUGIN_REG_ACCUMULATOR, 0,
+                                   sizeof(target_ulong), "lo");
+    }
+    if (IN(active_tc.HI)) {
+        i = ELT(active_tc.HI);
+        return i ? plugin_reg_desc(d, QEMU_PLUGIN_REG_ACCUMULATOR, 4 + i,
+                                   sizeof(target_ulong), "hi%d", i) :
+                   plugin_reg_desc(d, QEMU_PLUGIN_REG_ACCUMULATOR, 4,
+                                   sizeof(target_ulong), "hi");
+    }
+    /* an FPR is the low half of the MSA register it shares storage with */
+    if (IN(active_fpu.fpr)) {
+        i = ELT(active_fpu.fpr);
+        return off - offsetof(CPUMIPSState, active_fpu.fpr[i]) < 8 ?
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_FP, i, 8, "f%d", i) :
+            plugin_reg_desc(d, QEMU_PLUGIN_REG_VECTOR, i, 16, "w%d", i);
+    }
+    if (IN(active_fpu.fcr31)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 0, 4, "fcr31");
+    }
+    if (IN(active_fpu.fcr0)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 1, 4, "fcr0");
+    }
+    if (IN(active_tc.DSPControl)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 2,
+                               sizeof(target_ulong), "dspctrl");
+    }
+    if (IN(active_tc.CP0_UserLocal)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 3,
+                               sizeof(target_ulong), "userlocal");
+    }
+    if (IN(active_tc.msacsr)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 4, 4, "msacsr");
+    }
+    /* the pc, delay-slot branch state, LL/SC, translation flags, raise codes */
+    if (off < 0 || IN(active_tc.PC) || IN(btarget) || IN(bcond) ||
+        IN(hflags) || IN(lladdr) || IN(llval) || IN(active_fpu.fp_status) ||
+        IN(active_tc.msa_fp_status) || IN(error_code)) {
+        return PLUGIN_REG_DROP;
+    }
+#undef IN
+#undef ELT
+    return PLUGIN_REG_UNKNOWN;
+}
+#endif
+
 static const TCGCPUOps mips_tcg_ops = {
     .initialize = mips_tcg_init,
     .translate_code = mips_translate_code,
     .synchronize_from_tb = mips_cpu_synchronize_from_tb,
     .restore_state_to_opc = mips_restore_state_to_opc,
+#ifdef CONFIG_PLUGIN
+    .plugin_reg_resolve = mips_plugin_reg_resolve,
+#endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,

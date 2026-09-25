@@ -18,6 +18,8 @@
 #include "exec/mmu-access-type.h"
 #include "exec/vaddr.h"
 
+struct PluginRegDesc;
+
 struct TCGCPUOps {
     /**
      * @initialize: Initialize TCG state
@@ -126,6 +128,20 @@ struct TCGCPUOps {
      * qemu_plugin_thread_ptr_tracks_current().
      */
     bool (*plugin_thread_ptr_tracks_current)(CPUState *cpu);
+
+    /**
+     * @plugin_reg_resolve: name the register a CPU-state field holds
+     *
+     * Optional.  The per-instruction register statement
+     * (qemu_plugin_insn_reg_list()) collects the CPUArchState fields an
+     * instruction's ops read and write; this hook says which architectural
+     * register the @size bytes at @offset belong to -- filling @desc with
+     * its class, index, width and gdb name -- or that the field is
+     * translator bookkeeping.  It states identity from the target's own
+     * layout and nothing else.  Returns a PluginRegResolve value.
+     */
+    int (*plugin_reg_resolve)(CPUState *cpu, intptr_t offset, unsigned size,
+                              struct PluginRegDesc *desc);
 
     /**
      * @vaddr_is_kernel: classify a code virtual address's privilege domain

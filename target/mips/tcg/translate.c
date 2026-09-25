@@ -1194,6 +1194,9 @@ void gen_load_gpr(TCGv t, int reg)
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
     if (reg == 0) {
         tcg_gen_movi_tl(t, 0);
+        /* $zero has no global: the register statement names it here */
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[0]),
+                           QEMU_PLUGIN_REG_READ);
     } else {
         tcg_gen_mov_tl(t, cpu_gpr[reg]);
     }
@@ -1204,6 +1207,9 @@ void gen_store_gpr(TCGv t, int reg)
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
     if (reg != 0) {
         tcg_gen_mov_tl(cpu_gpr[reg], t);
+    } else {
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[0]),
+                           QEMU_PLUGIN_REG_WRITE);
     }
 }
 
@@ -1389,7 +1395,12 @@ void gen_load_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
     if (ctx->hflags & MIPS_HFLAG_F64) {
         tcg_gen_mov_i64(t, fpu_f64[reg]);
     } else {
+        /* FR=0: one architectural double in two 32-bit halves */
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_fpu.fpr[reg]),
+                           QEMU_PLUGIN_REG_READ);
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
         tcg_gen_concat32_i64(t, fpu_f64[reg & ~1], fpu_f64[reg | 1]);
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
     }
 }
 
@@ -1399,10 +1410,14 @@ void gen_store_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
         tcg_gen_mov_i64(fpu_f64[reg], t);
     } else {
         TCGv_i64 t0;
+        plugin_gen_reg_env(offsetof(CPUMIPSState, active_fpu.fpr[reg]),
+                           QEMU_PLUGIN_REG_WRITE);
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
         tcg_gen_deposit_i64(fpu_f64[reg & ~1], fpu_f64[reg & ~1], t, 0, 32);
         t0 = tcg_temp_new_i64();
         tcg_gen_shri_i64(t0, t, 32);
         tcg_gen_deposit_i64(fpu_f64[reg | 1], fpu_f64[reg | 1], t0, 0, 32);
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
     }
 }
 
@@ -2203,12 +2218,14 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWL:
+        plugin_gen_reg_covered();   /* env is for the memory access only */
         gen_helper_0e2i(swl, t1, t0, mem_idx);
         break;
     case OPC_SWRE:
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWR:
+        plugin_gen_reg_covered();
         gen_helper_0e2i(swr, t1, t0, mem_idx);
         break;
     }

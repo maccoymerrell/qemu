@@ -31,6 +31,7 @@
 #endif
 
 #include "tcg-cpu.h"
+#include "exec/plugin-gen.h"
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -365,6 +366,79 @@ static void x86_plugin_clock_resync(CPUState *cs,
 }
 #endif
 
+#ifdef CONFIG_PLUGIN
+/* The register behind a CPUX86State field (TCGCPUOps.plugin_reg_resolve) */
+static int x86_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
+                                  PluginRegDesc *d)
+{
+    static const char *const gpr[] = {
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    };
+    static const char *const seg[] = { "es", "cs", "ss", "ds", "fs", "gs" };
+    int i;
+
+#define IN(f) PLUGIN_REG_IN(CPUX86State, f, off)
+#define ELT(f) PLUGIN_REG_ELT(CPUX86State, f, off)
+    if (IN(regs)) {
+        i = ELT(regs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_GPR, i, 8, "%s", gpr[i]);
+    }
+    /* the lazy condition codes and the direction flag are EFLAGS */
+    if (IN(cc_dst) || IN(cc_src) || IN(cc_src2) || IN(df) || IN(eflags)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_FLAGS, 0, 4, "eflags");
+    }
+    if (IN(segs)) {     /* named for gdb: the fs/gs bases, else selectors */
+        i = ELT(segs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_SEGMENT, i, 8, "%s%s",
+                               seg[i], i >= R_FS ? "_base" : "");
+    }
+    if (IN(xmm_regs)) {
+        i = ELT(xmm_regs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_VECTOR, i, 64, "xmm%d", i);
+    }
+    if (IN(fpregs)) {       /* by CPU-state offset only as MMX, where TOP=0 */
+        i = ELT(fpregs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_FP, i, 10, "st%d", i);
+    }
+    if (IN(opmask_regs)) {
+        i = ELT(opmask_regs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_PREDICATE, i, 8, "k%d", i);
+    }
+    if (IN(fpuc)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 0, 4, "fctrl");
+    }
+    if (IN(fpus) || IN(fpstt)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 1, 4, "fstat");
+    }
+    if (IN(fptags)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 2, 4, "ftag");
+    }
+    if (IN(mxcsr)) {
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 3, 4, "mxcsr");
+    }
+    if (IN(cr)) {
+        i = ELT(cr);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 4 + i, 8, "cr%d", i);
+    }
+    if (IN(bnd_regs)) {
+        i = ELT(bnd_regs);
+        return plugin_reg_desc(d, QEMU_PLUGIN_REG_CONTROL, 16 + i, 16, "bnd%d",
+                               i);
+    }
+    /* the pc, the cc_op descriptor, translation flags, scratch, FIP/FDP */
+    if (off < 0 || IN(eip) || IN(cc_op) || IN(hflags) || IN(hflags2) ||
+        IN(xmm_t0) || IN(mmx_t0) || IN(ft0) || IN(fp_status) ||
+        IN(mmx_status) || IN(sse_status) || IN(fpop) || IN(fpcs) ||
+        IN(fpds) || IN(fpip) || IN(fpdp)) {
+        return PLUGIN_REG_DROP;
+    }
+#undef IN
+#undef ELT
+    return PLUGIN_REG_UNKNOWN;
+}
+#endif
+
 static const TCGCPUOps x86_tcg_ops = {
     .initialize = tcg_x86_init,
     .translate_code = x86_translate_code,
@@ -372,6 +446,9 @@ static const TCGCPUOps x86_tcg_ops = {
     .restore_state_to_opc = x86_restore_state_to_opc,
     .cpu_exec_enter = x86_cpu_exec_enter,
     .cpu_exec_exit = x86_cpu_exec_exit,
+#ifdef CONFIG_PLUGIN
+    .plugin_reg_resolve = x86_plugin_reg_resolve,
+#endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,

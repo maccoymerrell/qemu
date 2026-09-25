@@ -305,6 +305,49 @@ qemu_plugin_insn_transfer_kind(const struct qemu_plugin_insn *insn)
     return insn->transfer_kind;
 }
 
+/* The gdbstub's register handle for @name (see create_register_handles) */
+static struct qemu_plugin_register *reg_handle(const char *name)
+{
+    static GMutex lock;
+    static GHashTable *names;
+    gpointer h;
+
+    g_mutex_lock(&lock);
+    if (!names) {
+        g_autoptr(GArray) regs = gdb_get_register_list(current_cpu);
+        names = g_hash_table_new(g_str_hash, g_str_equal);
+        for (guint i = 0; i < regs->len; i++) {
+            GDBRegDesc *grd = &g_array_index(regs, GDBRegDesc, i);
+            if (grd->name) {
+                g_hash_table_insert(names, (gpointer)g_intern_string(grd->name),
+                                    GINT_TO_POINTER(grd->gdb_reg + 1));
+            }
+        }
+    }
+    h = g_hash_table_lookup(names, name);
+    g_mutex_unlock(&lock);
+    return h;
+}
+
+const struct qemu_plugin_insn_reg *
+qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
+                          const char **opaque)
+{
+    GArray *regs = insn->regs;
+
+    g_assert(current_cpu);
+    *n = regs ? regs->len : 0;
+    if (opaque) {
+        *opaque = insn->reg_opaque;
+    }
+    for (size_t i = 0; i < *n; i++) {
+        struct qemu_plugin_insn_reg *r =
+            &g_array_index(regs, struct qemu_plugin_insn_reg, i);
+        r->handle = reg_handle(r->name);
+    }
+    return *n ? &g_array_index(regs, struct qemu_plugin_insn_reg, 0) : NULL;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;

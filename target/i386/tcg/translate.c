@@ -332,6 +332,15 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
 {
     int dead;
 
+    /*
+     * The instruction writes EFLAGS: the one place the translator states it
+     * for the register statement, since the cc_op store itself may land in
+     * a later instruction (gen_update_cc_op).  DYNAMIC is translator-only.
+     */
+    if (op != CC_OP_DYNAMIC) {
+        plugin_gen_reg_env(offsetof(CPUX86State, cc_src),
+                           QEMU_PLUGIN_REG_WRITE);
+    }
     if (s->cc_op == op) {
         return;
     }
@@ -751,18 +760,23 @@ static void gen_set_eflags(DisasContext *s, target_ulong mask)
 {
     TCGv t = tcg_temp_new();
 
+    /* RF is the resume flag of an interrupted instruction: bookkeeping */
+    plugin_gen_reg_mute(mask == RF_MASK ? PLUGIN_REG_MUTE_ALL : 0);
     tcg_gen_ld_tl(t, tcg_env, offsetof(CPUX86State, eflags));
     tcg_gen_ori_tl(t, t, mask);
     tcg_gen_st_tl(t, tcg_env, offsetof(CPUX86State, eflags));
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
 }
 
 static void gen_reset_eflags(DisasContext *s, target_ulong mask)
 {
     TCGv t = tcg_temp_new();
 
+    plugin_gen_reg_mute(mask == RF_MASK ? PLUGIN_REG_MUTE_ALL : 0);
     tcg_gen_ld_tl(t, tcg_env, offsetof(CPUX86State, eflags));
     tcg_gen_andi_tl(t, t, ~mask);
     tcg_gen_st_tl(t, tcg_env, offsetof(CPUX86State, eflags));
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
 }
 
 static void gen_helper_in_func(MemOp ot, TCGv v, TCGv_i32 n)
@@ -844,8 +858,30 @@ static void gen_movs(DisasContext *s, MemOp ot, TCGv dshift)
 }
 
 /* compute all eflags to reg */
+/*
+ * Normalise a lazy-flags operand in place for a comparison: a re-encoding
+ * of the flags the previous instruction left, not a write of EFLAGS.
+ */
+static void gen_cc_ext(TCGv cc, MemOp size)
+{
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_WRITES);
+    tcg_gen_ext_tl(cc, cc, size);
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
+}
+
+/*
+ * The instruction reads EFLAGS, stated where the translator evaluates a
+ * condition: when the previous instruction left the flags known, the ops
+ * compute the answer at translation and read no flag state at all.
+ */
+static void gen_reg_flags_read(void)
+{
+    plugin_gen_reg_env(offsetof(CPUX86State, cc_src), QEMU_PLUGIN_REG_READ);
+}
+
 static void gen_mov_eflags(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     TCGv dst, src1, src2;
     TCGv_i32 cc_op;
     int live, dead;
@@ -886,8 +922,11 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
 /* compute all eflags to cc_src */
 static void gen_compute_eflags(DisasContext *s)
 {
+    /* rematerialising the lazy flags reads EFLAGS and writes nothing */
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_WRITES);
     gen_mov_eflags(s, cpu_cc_src);
     set_cc_op(s, CC_OP_EFLAGS);
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
 }
 
 typedef struct CCPrepare {
@@ -924,6 +963,7 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
 /* compute eflags.C, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     MemOp size;
 
     switch (s->cc_op) {
@@ -931,15 +971,15 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
         /* (DATA_TYPE)CC_SRCT < (DATA_TYPE)CC_SRC */
         size = s->cc_op - CC_OP_SUBB;
         tcg_gen_ext_tl(s->cc_srcT, s->cc_srcT, size);
-        tcg_gen_ext_tl(cpu_cc_src, cpu_cc_src, size);
+        gen_cc_ext(cpu_cc_src, size);
         return (CCPrepare) { .cond = TCG_COND_LTU, .reg = s->cc_srcT,
                              .reg2 = cpu_cc_src, .use_reg2 = true };
 
     case CC_OP_ADDB ... CC_OP_ADDQ:
         /* (DATA_TYPE)CC_DST < (DATA_TYPE)CC_SRC */
         size = cc_op_size(s->cc_op);
-        tcg_gen_ext_tl(cpu_cc_dst, cpu_cc_dst, size);
-        tcg_gen_ext_tl(cpu_cc_src, cpu_cc_src, size);
+        gen_cc_ext(cpu_cc_dst, size);
+        gen_cc_ext(cpu_cc_src, size);
         return (CCPrepare) { .cond = TCG_COND_LTU, .reg = cpu_cc_dst,
                              .reg2 = cpu_cc_src, .use_reg2 = true };
 
@@ -997,6 +1037,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 /* compute eflags.P, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_p(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     gen_compute_eflags(s);
     return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
                          .imm = CC_P };
@@ -1005,6 +1046,7 @@ static CCPrepare gen_prepare_eflags_p(DisasContext *s, TCGv reg)
 /* compute eflags.S, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     switch (s->cc_op) {
     case CC_OP_DYNAMIC:
         gen_compute_eflags(s);
@@ -1025,6 +1067,7 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
 /* compute eflags.O, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     switch (s->cc_op) {
     case CC_OP_ADOX:
     case CC_OP_ADCOX:
@@ -1045,6 +1088,7 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
 /* compute eflags.Z, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_z(DisasContext *s, TCGv reg)
 {
+    gen_reg_flags_read();
     switch (s->cc_op) {
     case CC_OP_EFLAGS:
     case CC_OP_ADCX:
@@ -1074,6 +1118,7 @@ static CCPrepare gen_prepare_eflags_z(DisasContext *s, TCGv reg)
  * provide more freedom in the translation of a subsequent setcond. */
 static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
 {
+    gen_reg_flags_read();
     int inv, jcc_op, cond;
     MemOp size;
     CCPrepare cc;
@@ -1088,7 +1133,7 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
         switch (jcc_op) {
         case JCC_BE:
             tcg_gen_ext_tl(s->cc_srcT, s->cc_srcT, size);
-            tcg_gen_ext_tl(cpu_cc_src, cpu_cc_src, size);
+            gen_cc_ext(cpu_cc_src, size);
             cc = (CCPrepare) { .cond = TCG_COND_LEU, .reg = s->cc_srcT,
                                .reg2 = cpu_cc_src, .use_reg2 = true };
             break;
@@ -1099,7 +1144,7 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
             cond = TCG_COND_LE;
         fast_jcc_l:
             tcg_gen_ext_tl(s->cc_srcT, s->cc_srcT, size | MO_SIGN);
-            tcg_gen_ext_tl(cpu_cc_src, cpu_cc_src, size | MO_SIGN);
+            gen_cc_ext(cpu_cc_src, size | MO_SIGN);
             cc = (CCPrepare) { .cond = cond, .reg = s->cc_srcT,
                                .reg2 = cpu_cc_src, .use_reg2 = true };
             break;
@@ -1123,7 +1168,7 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
             goto slow_jcc;
         case JCC_LE:
             /* SF or ZF, becomes signed <= 0 */
-            tcg_gen_ext_tl(cpu_cc_dst, cpu_cc_dst, size | MO_SIGN);
+            gen_cc_ext(cpu_cc_dst, size | MO_SIGN);
             cc = (CCPrepare) { .cond = TCG_COND_LE, .reg = cpu_cc_dst };
             break;
         default:
@@ -2650,7 +2695,123 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_qemu_st_i128(t, s->tmp0, mem_index, mop);
 }
 
+/*
+ * The register statement for a helper whose operands are implicit: the
+ * GPRs in @rd (bit n = register n) it reads and in @wr it writes, and its
+ * EFLAGS access (QEMU_PLUGIN_REG_* bits).  Nothing else it does is hidden.
+ */
+static void gen_reg_implicit(unsigned rd, unsigned wr, unsigned flags)
+{
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        unsigned a = (rd >> i & 1 ? QEMU_PLUGIN_REG_READ : 0) |
+                     (wr >> i & 1 ? QEMU_PLUGIN_REG_WRITE : 0);
+        if (a) {
+            plugin_gen_reg_env(offsetof(CPUX86State, regs[i]), a);
+        }
+    }
+    if (flags) {
+        plugin_gen_reg_env(offsetof(CPUX86State, cc_src), flags);
+    }
+    plugin_gen_reg_covered();
+}
+
 #include "emit.c.inc"
+
+/*
+ * The register statement for an x87 instruction (@op as gen_x87 forms it):
+ * the stack registers it reads and writes, numbered ST(i) from the top of
+ * stack the instruction starts with (as the gdbstub numbers them), plus the
+ * status and tag words every one updates and the control word they obey.
+ * The helpers reach all of these through the run-time top of stack, which
+ * no op shows.
+ */
+static void gen_x87_regs(DisasContext *s, int op, int mod, int rm)
+{
+    enum { R = QEMU_PLUGIN_REG_READ, W = QEMU_PLUGIN_REG_WRITE };
+    unsigned st0 = 0, sti = 0, st1 = 0, all = 0;
+    PluginRegDesc d;
+
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    if (mod != 3) {
+        switch (op) {
+        case 0x00 ... 0x07: case 0x10 ... 0x17:
+        case 0x20 ... 0x27: case 0x30 ... 0x37:     /* arithmetic, compare */
+            st0 = (op & 6) == 2 ? R : R | W;
+            break;
+        case 0x08: case 0x18: case 0x28: case 0x38:
+        case 0x1d: case 0x3c: case 0x3d:            /* loads: a push */
+            st0 = W;
+            break;
+        case 0x2c:                                  /* frstor */
+            all = W;
+            break;
+        case 0x2e:                                  /* fnsave */
+            all = R;
+            break;
+        case 0x0c ... 0x0f: case 0x2f:              /* environment words */
+            break;
+        default:                                    /* stores */
+            st0 = R;
+        }
+    } else {
+        switch (op) {
+        case 0x00 ... 0x07:                         /* ST0 op= ST(i) */
+            st0 = (op & 6) == 2 ? R : R | W;
+            sti = R;
+            break;
+        case 0x08:                                  /* fld ST(i) */
+            st0 = W;
+            sti = R;
+            break;
+        case 0x09: case 0x29: case 0x39:            /* fxch */
+            st0 = sti = R | W;
+            break;
+        case 0x0c:                                  /* fchs .. fxam */
+            st0 = R | W;
+            break;
+        case 0x0d:                                  /* constants: a push */
+            st0 = W;
+            break;
+        case 0x0e: case 0x0f:                       /* ST0, ST1 functions */
+            st0 = st1 = R | W;
+            break;
+        case 0x10 ... 0x13: case 0x18 ... 0x1b:     /* fcmov */
+            st0 = R | W;
+            sti = R;
+            break;
+        case 0x15: case 0x33:                       /* fucompp, fcompp */
+            st0 = st1 = R;
+            break;
+        case 0x1d: case 0x1e: case 0x22: case 0x23: case 0x2c: case 0x2d:
+        case 0x32: case 0x3d: case 0x3e:            /* compares */
+            st0 = sti = R;
+            break;
+        case 0x20: case 0x21: case 0x24 ... 0x27:
+        case 0x30: case 0x31: case 0x34 ... 0x37:   /* ST(i) op= ST0 */
+            st0 = R;
+            sti = R | W;
+            break;
+        case 0x2a: case 0x2b: case 0x3a: case 0x3b: /* fst, fstp ST(i) */
+            st0 = R;
+            sti = W;
+            break;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        unsigned a = all | (i == 0 ? st0 : 0) | (i == 1 ? st1 : 0) |
+                     (i == rm && mod == 3 ? sti : 0);
+        if (a) {
+            plugin_reg_desc(&d, QEMU_PLUGIN_REG_FP, i, 10, "st%d", i);
+            plugin_gen_reg(&d, a);
+        }
+    }
+    plugin_gen_reg_env(offsetof(CPUX86State, fpuc), R);
+    plugin_gen_reg_env(offsetof(CPUX86State, fpus), R | W);
+    plugin_gen_reg_env(offsetof(CPUX86State, fptags), R | W);
+    plugin_gen_reg_covered();
+}
 
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
@@ -2668,6 +2829,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     mod = (modrm >> 6) & 3;
     rm = modrm & 7;
     op = ((b & 7) << 3) | ((modrm >> 3) & 7);
+    gen_x87_regs(s, op, mod, rm);
     if (mod != 3) {
         /* memory op */
         TCGv ea = gen_lea_modrm_1(s, decode->mem, false);
@@ -2871,6 +3033,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         if (update_fdp) {
             int last_seg = s->override >= 0 ? s->override : decode->mem.def_seg;
 
+            plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);   /* likewise */
             tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
                            offsetof(CPUX86State,
                                     segs[last_seg].selector));
@@ -2878,6 +3041,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                              offsetof(CPUX86State, fpds));
             tcg_gen_st_tl(last_addr, tcg_env,
                           offsetof(CPUX86State, fpdp));
+            plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
         }
     } else {
         /* register float ops */
@@ -3201,12 +3365,15 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     }
 
     if (update_fip) {
+        /* the last-instruction pointer: FPU bookkeeping, no operand */
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
         tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
                        offsetof(CPUX86State, segs[R_CS].selector));
         tcg_gen_st16_i32(s->tmp2_i32, tcg_env,
                          offsetof(CPUX86State, fpcs));
         tcg_gen_st_tl(eip_cur_tl(s),
                       tcg_env, offsetof(CPUX86State, fpip));
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
     }
     return;
 
@@ -3655,6 +3822,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             gen_update_eip_cur(s);
             translator_io_start(&s->base);
             gen_helper_rdtsc(tcg_env);
+            gen_reg_implicit(0, 1 << R_EAX | 1 << R_EDX, 0);
             gen_helper_rdpid(s->T0, tcg_env);
             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);
             break;

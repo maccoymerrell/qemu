@@ -332,6 +332,9 @@ static TCGv get_gpr(DisasContext *ctx, int reg_num, DisasExtend ext)
     TCGv t;
 
     if (reg_num == 0) {
+        /* x0 has no global: the register statement names it here */
+        plugin_gen_reg_env(offsetof(CPURISCVState, gpr[0]),
+                           QEMU_PLUGIN_REG_READ);
         return ctx->zero;
     }
 
@@ -372,6 +375,10 @@ static TCGv get_gprh(DisasContext *ctx, int reg_num)
 
 static TCGv dest_gpr(DisasContext *ctx, int reg_num)
 {
+    if (reg_num == 0) {
+        plugin_gen_reg_env(offsetof(CPURISCVState, gpr[0]),
+                           QEMU_PLUGIN_REG_WRITE);
+    }
     if (reg_num == 0 || get_olen(ctx) < TARGET_LONG_BITS) {
         return tcg_temp_new();
     }
@@ -388,7 +395,10 @@ static TCGv dest_gprh(DisasContext *ctx, int reg_num)
 
 static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 {
-    if (reg_num != 0) {
+    if (reg_num == 0) {
+        plugin_gen_reg_env(offsetof(CPURISCVState, gpr[0]),
+                           QEMU_PLUGIN_REG_WRITE);
+    } else {
         switch (get_ol(ctx)) {
         case MXL_RV32:
             tcg_gen_ext32s_tl(cpu_gpr[reg_num], t);
@@ -409,7 +419,10 @@ static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
 
 static void gen_set_gpri(DisasContext *ctx, int reg_num, target_long imm)
 {
-    if (reg_num != 0) {
+    if (reg_num == 0) {
+        plugin_gen_reg_env(offsetof(CPURISCVState, gpr[0]),
+                           QEMU_PLUGIN_REG_WRITE);
+    } else {
         switch (get_ol(ctx)) {
         case MXL_RV32:
             tcg_gen_movi_tl(cpu_gpr[reg_num], (int32_t)imm);

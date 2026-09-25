@@ -1145,6 +1145,8 @@ static void gen_AAA(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_aaa(tcg_env);
+    gen_reg_implicit(1 << R_EAX, 1 << R_EAX, QEMU_PLUGIN_REG_READ |
+                     QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -1168,6 +1170,8 @@ static void gen_AAS(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_aas(tcg_env);
+    gen_reg_implicit(1 << R_EAX, 1 << R_EAX, QEMU_PLUGIN_REG_READ |
+                     QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -1895,6 +1899,8 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_cpuid(tcg_env);
+    gen_reg_implicit(1 << R_EAX | 1 << R_ECX,
+                     1 << R_EAX | 1 << R_EBX | 1 << R_ECX | 1 << R_EDX, 0);
 }
 
 static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
@@ -1946,6 +1952,8 @@ static void gen_DAA(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_daa(tcg_env);
+    gen_reg_implicit(1 << R_EAX, 1 << R_EAX, QEMU_PLUGIN_REG_READ |
+                     QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -1953,6 +1961,8 @@ static void gen_DAS(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_das(tcg_env);
+    gen_reg_implicit(1 << R_EAX, 1 << R_EAX, QEMU_PLUGIN_REG_READ |
+                     QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -1973,6 +1983,9 @@ static void gen_DEC(DisasContext *s, X86DecodedInsn *decode)
 static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
+    unsigned ax = 1 << R_EAX | (ot == MO_8 ? 0 : 1 << R_EDX);
+
+    gen_reg_implicit(ax, ax, 0);
 
     switch(ot) {
     case MO_8:
@@ -1996,6 +2009,8 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_helper_emms(tcg_env);
+    plugin_gen_reg_env(offsetof(CPUX86State, fptags), QEMU_PLUGIN_REG_WRITE);
+    gen_reg_implicit(0, 0, 0);
 }
 
 static void gen_ENTER(DisasContext *s, X86DecodedInsn *decode)
@@ -2047,6 +2062,9 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 static void gen_IDIV(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
+    unsigned ax = 1 << R_EAX | (ot == MO_8 ? 0 : 1 << R_EDX);
+
+    gen_reg_implicit(ax, ax, 0);
 
     switch(ot) {
     case MO_8:
@@ -2820,6 +2838,7 @@ static void gen_PCMPESTRI(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_pcmpestri_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
+    gen_reg_implicit(1 << R_EAX | 1 << R_EDX, 1 << R_ECX, 0);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -2827,6 +2846,9 @@ static void gen_PCMPESTRM(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_pcmpestrm_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
+    gen_reg_implicit(1 << R_EAX | 1 << R_EDX, 0, 0);
+    plugin_gen_reg_env(offsetof(CPUX86State, xmm_regs[0]),
+                       QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
     if ((s->prefix & PREFIX_VEX) && !s->vex_l) {
         tcg_gen_gvec_dup_imm(MO_64, offsetof(CPUX86State, xmm_regs[0].ZMM_X(1)),
@@ -2838,6 +2860,7 @@ static void gen_PCMPISTRI(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_pcmpistri_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
+    gen_reg_implicit(0, 1 << R_ECX, 0);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
 
@@ -2845,6 +2868,8 @@ static void gen_PCMPISTRM(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_pcmpistrm_xmm(tcg_env, OP_PTR1, OP_PTR2, imm);
+    plugin_gen_reg_env(offsetof(CPUX86State, xmm_regs[0]),
+                       QEMU_PLUGIN_REG_WRITE);
     assume_cc_op(s, CC_OP_EFLAGS);
     if ((s->prefix & PREFIX_VEX) && !s->vex_l) {
         tcg_gen_gvec_dup_imm(MO_64, offsetof(CPUX86State, xmm_regs[0].ZMM_X(1)),
@@ -3076,6 +3101,7 @@ static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
 
     ot = gen_pop_T0(s);
     gen_helper_write_eflags(tcg_env, s->T0, tcg_constant_i32(mask));
+    gen_reg_implicit(0, 0, QEMU_PLUGIN_REG_WRITE);
     gen_pop_update(s, ot);
     set_cc_op(s, CC_OP_EFLAGS);
     /* abort translation because TF/AC flag may change */
@@ -3242,6 +3268,7 @@ static void gen_PUSHF(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_read_eflags(s->T0, tcg_env);
+    gen_reg_implicit(0, 0, QEMU_PLUGIN_REG_READ);
     gen_push_v(s, s->T0);
 }
 
@@ -3554,6 +3581,7 @@ static void gen_RDMSR(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_rdmsr(tcg_env);
+    gen_reg_implicit(1 << R_ECX, 1 << R_EAX | 1 << R_EDX, 0);
 }
 #else
 #define gen_RDMSR gen_unreachable
@@ -3574,6 +3602,7 @@ static void gen_RDTSC(DisasContext *s, X86DecodedInsn *decode)
     gen_update_eip_cur(s);
     translator_io_start(&s->base);
     gen_helper_rdtsc(tcg_env);
+    gen_reg_implicit(0, 1 << R_EAX | 1 << R_EDX, 0);
 }
 
 static void gen_RDxxBASE(DisasContext *s, X86DecodedInsn *decode)
@@ -4096,6 +4125,9 @@ static void gen_SYSCALL(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_syscall(tcg_env, cur_insn_len_i32(s));
+    /* the return address and saved flags to rcx and r11; the result to rax */
+    gen_reg_implicit(1 << R_EAX, 1 << R_EAX | 1 << R_ECX | 1 << 11,
+                     QEMU_PLUGIN_REG_READ);
     if (LMA(s)) {
         assume_cc_op(s, CC_OP_EFLAGS);
     }
@@ -4652,6 +4684,7 @@ static void gen_WRMSR(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_wrmsr(tcg_env);
+    gen_reg_implicit(1 << R_EAX | 1 << R_ECX | 1 << R_EDX, 0, 0);
     s->base.is_jmp = DISAS_EOB_NEXT;
 }
 #else

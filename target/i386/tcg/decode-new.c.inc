@@ -2536,6 +2536,35 @@ illegal:
  * Convert one instruction. s->base.is_jmp is set if the translation must
  * be stopped.
  */
+/*
+ * The register statement for the decoded vector operands: op[0] is
+ * written, op[1] and op[2] are read (a two-operand form repeats op[0] as
+ * op[1]).  The helpers are handed pointers to them, which carry no
+ * direction; the decode does.
+ */
+static void gen_reg_decoded(X86DecodedInsn *decode)
+{
+    bool vec = false;
+
+    for (int i = 0; i < 3; i++) {
+        X86DecodedOp *op = &decode->op[i];
+        unsigned a = i ? QEMU_PLUGIN_REG_READ : QEMU_PLUGIN_REG_WRITE;
+
+        if (op->has_ea) {
+            continue;
+        } else if (op->unit == X86_OP_SSE) {
+            plugin_gen_reg_env(offsetof(CPUX86State, xmm_regs[op->n]), a);
+            vec = true;
+        } else if (op->unit == X86_OP_MMX) {
+            plugin_gen_reg_env(offsetof(CPUX86State, fpregs[op->n & 7]), a);
+            vec = true;
+        }
+    }
+    if (vec) {
+        plugin_gen_reg_covered();
+    }
+}
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2838,6 +2867,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_helper_enter_mmx(tcg_env);
     }
 
+    gen_reg_decoded(&decode);
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
         gen_lea_modrm(s, &decode);

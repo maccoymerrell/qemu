@@ -357,8 +357,10 @@ static void check_lse2_align(DisasContext *s, int rn, int imm,
 
     type = is_write ? MMU_DATA_STORE : MMU_DATA_LOAD,
     mmu_idx = get_mem_index(s);
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);    /* it only raises */
     gen_helper_unaligned_access(tcg_env, addr, tcg_constant_i32(type),
                                 tcg_constant_i32(mmu_idx));
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
 
     gen_set_label(over_label);
 
@@ -433,7 +435,10 @@ static void a64_test_cc(DisasCompare64 *c64, int cc)
 
 static void gen_rebuild_hflags(DisasContext *s)
 {
+    /* translation-flag bookkeeping: no register (register statement) */
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
     gen_helper_rebuild_hflags_a64(tcg_env, tcg_constant_i32(s->current_el));
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
 }
 
 static void gen_exception_internal(int excp)
@@ -526,11 +531,30 @@ static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
  * to cpu_X[31] and ZR accesses to a temporary which can be discarded.
  * This is the point of the _sp forms.
  */
+/* The register statement's zero register: XZR has no CPU-state field */
+static void gen_reg_xzr(TCGv_i64 t, unsigned access)
+{
+    PluginRegDesc d;
+
+#ifdef CONFIG_PLUGIN
+    if (!tcg_ctx->plugin_insn) {
+        return;
+    }
+#endif
+    plugin_reg_desc(&d, QEMU_PLUGIN_REG_ZERO, 31, 8, "xzr");
+    if (t) {
+        plugin_gen_reg_temp(tcgv_i64_temp(t), &d);
+    } else {
+        plugin_gen_reg(&d, access);
+    }
+}
+
 TCGv_i64 cpu_reg(DisasContext *s, int reg)
 {
     if (reg == 31) {
         TCGv_i64 t = tcg_temp_new_i64();
         tcg_gen_movi_i64(t, 0);
+        gen_reg_xzr(t, 0);      /* read or written: its uses say which */
         return t;
     } else {
         return cpu_X[reg];
@@ -558,6 +582,7 @@ TCGv_i64 read_cpu_reg(DisasContext *s, int reg, int sf)
         }
     } else {
         tcg_gen_movi_i64(v, 0);
+        gen_reg_xzr(NULL, QEMU_PLUGIN_REG_READ);
     }
     return v;
 }
@@ -1733,7 +1758,9 @@ static void set_btype_for_br(DisasContext *s, int rn)
         } else {
             TCGv_i64 pc = tcg_temp_new_i64();
             gen_pc_plus_diff(s, pc, 0);
+            plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);    /* BTI state */
             gen_helper_guarded_page_br(tcg_env, pc);
+            plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
             s->btype = -1;
         }
     }
@@ -2585,10 +2612,12 @@ static void handle_sys(DisasContext *s, bool isread,
          */
         gen_a64_update_pc(s, 0);
         tcg_ri = tcg_temp_new_ptr();
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);    /* a permission check */
         gen_helper_access_check_cp_reg(tcg_ri, tcg_env,
                                        tcg_constant_i32(key),
                                        tcg_constant_i32(syndrome),
                                        tcg_constant_i32(isread));
+        plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
     } else if (ri->type & ARM_CP_RAISES_EXC) {
         /*
          * The readfn or writefn might raise an exception;
@@ -2759,6 +2788,22 @@ static void handle_sys(DisasContext *s, bool isread,
     }
 
     tcg_rt = cpu_reg(s, rt);
+
+    /*
+     * The register statement: the system register, by its CPU-state field
+     * when it has one, else by name; its readfn / writefn helpers do
+     * nothing else a statement could name.
+     */
+    if (ri->fieldoffset && !(ri->type & ARM_CP_CONST)) {
+        plugin_gen_reg_env(ri->fieldoffset, isread ? QEMU_PLUGIN_REG_READ :
+                                                     QEMU_PLUGIN_REG_WRITE);
+    } else if (s->base.plugin_enabled) {
+        PluginRegDesc d;
+        plugin_reg_desc(&d, QEMU_PLUGIN_REG_CONTROL, 5, 8, "%s", ri->name);
+        plugin_gen_reg(&d, isread ? QEMU_PLUGIN_REG_READ :
+                                    QEMU_PLUGIN_REG_WRITE);
+    }
+    plugin_gen_reg_covered();
 
     if (isread) {
         if (ri->type & ARM_CP_CONST) {
@@ -4465,6 +4510,28 @@ static void gen_mops_plugin_tb_end(DisasContext *s)
 #endif
 }
 
+/*
+ * The register statement for a MOPS step: the helper updates the two
+ * address/size registers @rw1 and @rw2 and reads @r3 -- a value to store
+ * (@r3_read_only), else a third address it also updates -- and passes the
+ * algorithm option between the steps in NZCV.
+ */
+static void gen_reg_mops(int rw1, int rw2, int r3, bool r3_read_only)
+{
+    unsigned rw = QEMU_PLUGIN_REG_READ | QEMU_PLUGIN_REG_WRITE;
+
+    plugin_gen_reg_env(offsetof(CPUARMState, xregs[rw1]), rw);
+    plugin_gen_reg_env(offsetof(CPUARMState, xregs[rw2]), rw);
+    plugin_gen_reg_env(offsetof(CPUARMState, NF), rw);  /* the option, in NZCV */
+    if (r3 == 31 && r3_read_only) {
+        gen_reg_xzr(NULL, QEMU_PLUGIN_REG_READ);
+    } else {
+        plugin_gen_reg_env(offsetof(CPUARMState, xregs[r3]),
+                           r3_read_only ? QEMU_PLUGIN_REG_READ : rw);
+    }
+    plugin_gen_reg_covered();
+}
+
 static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
                    bool is_setg, SetFn fn)
 {
@@ -4510,6 +4577,7 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
      * than passing in an extra three integer arguments.
      */
     gen_mops_plugin_pc(s);
+    gen_reg_mops(a->rd, a->rn, a->rs, true);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
     gen_mops_plugin_tb_end(s);
     return true;
@@ -4571,6 +4639,7 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
      * than passing in an extra three integer arguments.
      */
     gen_mops_plugin_pc(s);
+    gen_reg_mops(a->rd, a->rs, a->rn, false);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),
        tcg_constant_i32(rdesc));
     gen_mops_plugin_tb_end(s);
@@ -10368,7 +10437,9 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
              */
             if (s->btype != 0
                 && !btype_destination_ok(insn, s->bt, s->btype)) {
+                plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
                 gen_helper_guarded_page_check(tcg_env);
+                plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
             }
         } else {
             /* Not the first insn: btype must be 0.  */

@@ -182,6 +182,14 @@ static bool require_noover(const int8_t dst, const int8_t dst_lmul,
     return !is_overlapped(dst, dst_size, src, src_size);
 }
 
+/* The register statement: the helper writes the configuration */
+static void rvv_setvl(void)
+{
+    plugin_gen_reg_env(offsetof(CPURISCVState, vl), QEMU_PLUGIN_REG_WRITE);
+    plugin_gen_reg_env(offsetof(CPURISCVState, vtype), QEMU_PLUGIN_REG_WRITE);
+    plugin_gen_reg_covered();
+}
+
 static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
 {
     TCGv s1, dst;
@@ -202,6 +210,7 @@ static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
         s1 = get_gpr(s, rs1, EXT_ZERO);
     }
 
+    rvv_setvl();
     gen_helper_vsetvl(dst, tcg_env, s1, s2);
     gen_set_gpr(s, rd, dst);
     finalize_rvv_inst(s);
@@ -222,6 +231,7 @@ static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
 
     dst = dest_gpr(s, rd);
 
+    rvv_setvl();
     gen_helper_vsetvl(dst, tcg_env, s1, s2);
     gen_set_gpr(s, rd, dst);
     finalize_rvv_inst(s);
@@ -257,6 +267,42 @@ static uint32_t vreg_ofs(DisasContext *s, int reg)
     return offsetof(CPURISCVState, vreg) + reg * s->cfg_ptr->vlenb;
 }
 
+/*
+ * The register statement, made where the operand checks below know each
+ * operand's role and group size: the helpers are handed a pointer to a
+ * group's first register only, with neither its extent nor a direction.
+ * rvv_group: @n groups of 2^@emul registers (a fraction: one) from @reg.
+ * rvv_ctl: vl and vtype, which every vector instruction reads, and v0,
+ * read as the mask when @vm is 0 -- and not read at all otherwise, though
+ * the helper is handed it either way.  A destination is stated as read
+ * too: undisturbed elements and the accumulating forms (which share their
+ * checks with the others) read it.
+ */
+enum { RVV_R = QEMU_PLUGIN_REG_READ, RVV_RW = RVV_R | QEMU_PLUGIN_REG_WRITE };
+
+static void rvv_group(DisasContext *s, int reg, int emul, int n,
+                      unsigned access)
+{
+    for (int i = 0; i < n << MAX(emul, 0) && reg + i < 32; i++) {
+        plugin_gen_reg_env(vreg_ofs(s, reg + i), access);
+    }
+}
+
+/* A load's destination is read only for the elements it leaves in place */
+static unsigned rvv_ld_dest(DisasContext *s, int vm)
+{
+    return QEMU_PLUGIN_REG_WRITE |
+           (!s->vta || (!vm && !s->vma) ? QEMU_PLUGIN_REG_READ : 0);
+}
+
+static void rvv_ctl(DisasContext *s, int vm)
+{
+    plugin_gen_reg_env(offsetof(CPURISCVState, vl), RVV_R);
+    plugin_gen_reg_env(offsetof(CPURISCVState, vtype), RVV_R);
+    plugin_gen_reg_env(vreg_ofs(s, 0), vm ? 0 : RVV_R);
+    plugin_gen_reg_covered();
+}
+
 /* check functions */
 
 /*
@@ -271,12 +317,20 @@ static uint32_t vreg_ofs(DisasContext *s, int reg)
  *   4. Vector register numbers accessed by the segment load or store
  *      cannot increment past 31. (Section 7.8)
  */
-static bool vext_check_store(DisasContext *s, int vd, int nf, uint8_t eew)
+static bool vext_check_ldst(DisasContext *s, int vd, int nf, uint8_t eew)
 {
     int8_t emul = eew - s->sew + s->lmul;
     return (emul >= -3 && emul <= 3) &&
            require_align(vd, emul) &&
            require_nf(vd, nf, emul);
+}
+
+static bool vext_check_store(DisasContext *s, int vd, int nf, int vm,
+                             uint8_t eew)
+{
+    rvv_group(s, vd, eew - s->sew + s->lmul, nf, RVV_R);
+    rvv_ctl(s, vm);
+    return vext_check_ldst(s, vd, nf, eew);
 }
 
 /*
@@ -293,7 +347,9 @@ static bool vext_check_store(DisasContext *s, int vd, int nf, uint8_t eew)
 static bool vext_check_load(DisasContext *s, int vd, int nf, int vm,
                             uint8_t eew)
 {
-    return vext_check_store(s, vd, nf, eew) && require_vm(vm, vd);
+    rvv_group(s, vd, eew - s->sew + s->lmul, nf, rvv_ld_dest(s, vm));
+    rvv_ctl(s, vm);
+    return vext_check_ldst(s, vd, nf, eew) && require_vm(vm, vd);
 }
 
 /*
@@ -309,8 +365,8 @@ static bool vext_check_load(DisasContext *s, int vd, int nf, int vm,
  *   5. Vector register numbers accessed by the segment load or store
  *      cannot increment past 31. (Section 7.8)
  */
-static bool vext_check_st_index(DisasContext *s, int vd, int vs2, int nf,
-                                uint8_t eew)
+static bool vext_check_idx(DisasContext *s, int vd, int vs2, int nf,
+                           uint8_t eew)
 {
     int8_t emul = eew - s->sew + s->lmul;
     bool ret = (emul >= -3 && emul <= 3) &&
@@ -346,13 +402,26 @@ static bool vext_check_st_index(DisasContext *s, int vd, int vs2, int nf,
  *      the source vector register (vs2) group for
  *      indexed segment load instructions. (Section 7.8.3)
  */
+static bool vext_check_st_index(DisasContext *s, int vd, int vs2, int nf,
+                                int vm, uint8_t eew)
+{
+    rvv_group(s, vd, s->lmul, nf, RVV_R);
+    rvv_group(s, vs2, eew - s->sew + s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
+    return vext_check_idx(s, vd, vs2, nf, eew);
+}
+
 static bool vext_check_ld_index(DisasContext *s, int vd, int vs2,
                                 int nf, int vm, uint8_t eew)
 {
     int8_t seg_vd;
     int8_t emul = eew - s->sew + s->lmul;
-    bool ret = vext_check_st_index(s, vd, vs2, nf, eew) &&
-               require_vm(vm, vd);
+    bool ret;
+
+    rvv_group(s, vd, s->lmul, nf, rvv_ld_dest(s, vm));
+    rvv_group(s, vs2, emul, 1, RVV_R);
+    rvv_ctl(s, vm);
+    ret = vext_check_idx(s, vd, vs2, nf, eew) && require_vm(vm, vd);
 
     /* Each segment register group has to follow overlap rules. */
     for (int i = 0; i < nf; ++i) {
@@ -410,6 +479,9 @@ static bool vext_check_input_eew(DisasContext *s, int vs1, uint8_t eew_vs1,
 
 static bool vext_check_ss(DisasContext *s, int vd, int vs, int vm)
 {
+    rvv_group(s, vd, s->lmul, 1, RVV_RW);
+    rvv_group(s, vs, s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
     return require_vm(vm, vd) &&
            require_align(vd, s->lmul) &&
            require_align(vs, s->lmul) &&
@@ -431,14 +503,19 @@ static bool vext_check_ss(DisasContext *s, int vd, int vs, int vm)
  */
 static bool vext_check_sss(DisasContext *s, int vd, int vs1, int vs2, int vm)
 {
+    rvv_group(s, vs1, s->lmul, 1, RVV_R);
     return vext_check_ss(s, vd, vs2, vm) &&
            vext_check_input_eew(s, vs1, s->sew, vs2, s->sew, vm) &&
            require_align(vs1, s->lmul);
 }
 
-static bool vext_check_ms(DisasContext *s, int vd, int vs)
+static bool vext_check_ms(DisasContext *s, int vd, int vs, int vm)
 {
     bool ret = require_align(vs, s->lmul);
+
+    rvv_group(s, vd, 0, 1, RVV_RW);
+    rvv_group(s, vs, s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
     if (vd != vs) {
         ret &= require_noover(vd, 0, vs, s->lmul);
     }
@@ -461,10 +538,12 @@ static bool vext_check_ms(DisasContext *s, int vd, int vs)
  *      with a mask value (e.g., comparisons) or the scalar result
  *      of a reduction. (Section 5.3)
  */
-static bool vext_check_mss(DisasContext *s, int vd, int vs1, int vs2)
+static bool vext_check_mss(DisasContext *s, int vd, int vs1, int vs2, int vm)
 {
-    bool ret = vext_check_ms(s, vd, vs2) &&
-               require_align(vs1, s->lmul);
+    bool ret;
+
+    rvv_group(s, vs1, s->lmul, 1, RVV_R);
+    ret = vext_check_ms(s, vd, vs2, vm) && require_align(vs1, s->lmul);
     if (vd != vs1) {
         ret &= require_noover(vd, 0, vs1, s->lmul);
     }
@@ -527,6 +606,9 @@ static bool vext_narrow_check_common(DisasContext *s, int vd, int vs2,
 
 static bool vext_check_ds(DisasContext *s, int vd, int vs, int vm)
 {
+    rvv_group(s, vd, s->lmul + 1, 1, RVV_RW);
+    rvv_group(s, vs, s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
     return vext_wide_check_common(s, vd, vm) &&
            vext_check_input_eew(s, vs, s->sew, -1, 0, vm) &&
            require_align(vs, s->lmul) &&
@@ -535,6 +617,9 @@ static bool vext_check_ds(DisasContext *s, int vd, int vs, int vm)
 
 static bool vext_check_dd(DisasContext *s, int vd, int vs, int vm)
 {
+    rvv_group(s, vd, s->lmul + 1, 1, RVV_RW);
+    rvv_group(s, vs, s->lmul + 1, 1, RVV_R);
+    rvv_ctl(s, vm);
     return vext_wide_check_common(s, vd, vm) &&
            vext_check_input_eew(s, vs, s->sew + 1, -1, 0, vm) &&
            require_align(vs, s->lmul + 1);
@@ -554,6 +639,7 @@ static bool vext_check_dd(DisasContext *s, int vd, int vs, int vm)
  */
 static bool vext_check_dss(DisasContext *s, int vd, int vs1, int vs2, int vm)
 {
+    rvv_group(s, vs1, s->lmul, 1, RVV_R);
     return vext_check_ds(s, vd, vs2, vm) &&
            vext_check_input_eew(s, vs1, s->sew, vs2, s->sew, vm) &&
            require_align(vs1, s->lmul) &&
@@ -577,6 +663,7 @@ static bool vext_check_dss(DisasContext *s, int vd, int vs1, int vs2, int vm)
  */
 static bool vext_check_dds(DisasContext *s, int vd, int vs1, int vs2, int vm)
 {
+    rvv_group(s, vs2, s->lmul + 1, 1, RVV_R);
     return vext_check_ds(s, vd, vs1, vm) &&
            vext_check_input_eew(s, vs1, s->sew, vs2, s->sew + 1, vm) &&
            require_align(vs2, s->lmul + 1);
@@ -584,7 +671,12 @@ static bool vext_check_dds(DisasContext *s, int vd, int vs1, int vs2, int vm)
 
 static bool vext_check_sd(DisasContext *s, int vd, int vs, int vm)
 {
-    bool ret = vext_narrow_check_common(s, vd, vs, vm) &&
+    bool ret;
+
+    rvv_group(s, vd, s->lmul, 1, RVV_RW);
+    rvv_group(s, vs, s->lmul + 1, 1, RVV_R);
+    rvv_ctl(s, vm);
+    ret = vext_narrow_check_common(s, vd, vs, vm) &&
                vext_check_input_eew(s, vs, s->sew + 1, -1, 0, vm);
     if (vd != vs) {
         ret &= require_noover(vd, s->lmul, vs, s->lmul + 1);
@@ -607,6 +699,7 @@ static bool vext_check_sd(DisasContext *s, int vd, int vs, int vm)
  */
 static bool vext_check_sds(DisasContext *s, int vd, int vs1, int vs2, int vm)
 {
+    rvv_group(s, vs1, s->lmul, 1, RVV_R);
     return vext_check_sd(s, vd, vs2, vm) &&
            vext_check_input_eew(s, vs1, s->sew, vs2, s->sew + 1, vm) &&
            require_align(vs1, s->lmul);
@@ -619,8 +712,13 @@ static bool vext_check_sds(DisasContext *s, int vd, int vs1, int vs2, int vm)
  *   1. Source 1 (vs2) vector register number is multiples of LMUL.
  *      (Section 3.4.2)
  */
-static bool vext_check_reduction(DisasContext *s, int vs2)
+static bool vext_check_reduction(DisasContext *s, int vd, int vs1, int vs2,
+                                 int vm)
 {
+    rvv_group(s, vd, 0, 1, RVV_RW);     /* element 0 of each */
+    rvv_group(s, vs1, 0, 1, RVV_R);
+    rvv_group(s, vs2, s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
     return require_align(vs2, s->lmul) && s->vstart_eq_zero;
 }
 
@@ -642,7 +740,12 @@ static bool vext_check_reduction(DisasContext *s, int vs2)
 static bool vext_check_slide(DisasContext *s, int vd, int vs2,
                              int vm, bool is_over)
 {
-    bool ret = require_align(vs2, s->lmul) &&
+    bool ret;
+
+    rvv_group(s, vd, s->lmul, 1, RVV_RW);
+    rvv_group(s, vs2, s->lmul, 1, RVV_R);
+    rvv_ctl(s, vm);
+    ret = require_align(vs2, s->lmul) &&
                require_align(vd, s->lmul) &&
                require_vm(vm, vd) &&
                vext_check_input_eew(s, -1, 0, vs2, s->sew, vm);
@@ -651,6 +754,23 @@ static bool vext_check_slide(DisasContext *s, int vd, int vs2,
         ret &= (vd != vs2);
     }
     return ret;
+}
+
+/* vmv.v.*: the checks' vs2 = 0 is a placeholder, not an operand */
+static bool vext_check_mov(DisasContext *s, int vd, int vs1)
+{
+    bool ok;
+
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_ALL);
+    ok = vs1 < 0 ? vext_check_ss(s, vd, 0, 1) :
+                   vext_check_sss(s, vd, vs1, 0, 1);
+    plugin_gen_reg_mute(PLUGIN_REG_MUTE_OFF);
+    rvv_group(s, vd, s->lmul, 1, RVV_RW);
+    if (vs1 >= 0) {
+        rvv_group(s, vs1, s->lmul, 1, RVV_R);
+    }
+    rvv_ctl(s, 1);
+    return ok;
 }
 
 /*
@@ -810,7 +930,7 @@ static bool st_us_check(DisasContext *s, arg_r2nfvm* a, uint8_t eew)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_store(s, a->rd, a->nf, eew);
+           vext_check_store(s, a->rd, a->nf, a->vm, eew);
 }
 
 GEN_VEXT_TRANS(vse8_v,  MO_8,  r2nfvm, st_us_op, st_us_check)
@@ -956,7 +1076,7 @@ static bool st_stride_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_store(s, a->rd, a->nf, eew);
+           vext_check_store(s, a->rd, a->nf, a->vm, eew);
 }
 
 GEN_VEXT_TRANS(vsse8_v,  MO_8,  rnfvm, st_stride_op, st_stride_check)
@@ -1096,7 +1216,7 @@ static bool st_index_check(DisasContext *s, arg_rnfvm* a, uint8_t eew)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_st_index(s, a->rd, a->rs2, a->nf, eew) &&
+           vext_check_st_index(s, a->rd, a->rs2, a->nf, a->vm, eew) &&
            vext_check_input_eew(s, a->rd, s->sew, a->rs2, eew, a->vm);
 }
 
@@ -1756,7 +1876,7 @@ static bool opivv_vmadc_check(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_mss(s, a->rd, a->rs1, a->rs2);
+           vext_check_mss(s, a->rd, a->rs1, a->rs2, a->vm);
 }
 
 GEN_OPIVV_TRANS(vmadc_vvm, opivv_vmadc_check)
@@ -1792,7 +1912,7 @@ static bool opivx_vmadc_check(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_ms(s, a->rd, a->rs2);
+           vext_check_ms(s, a->rd, a->rs2, a->vm);
 }
 
 GEN_OPIVX_TRANS(vmadc_vxm, opivx_vmadc_check)
@@ -1966,7 +2086,7 @@ static bool opivv_cmp_check(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_mss(s, a->rd, a->rs1, a->rs2);
+           vext_check_mss(s, a->rd, a->rs1, a->rs2, a->vm);
 }
 
 GEN_OPIVV_TRANS(vmseq_vv, opivv_cmp_check)
@@ -1980,7 +2100,7 @@ static bool opivx_cmp_check(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_ms(s, a->rd, a->rs2);
+           vext_check_ms(s, a->rd, a->rs2, a->vm);
 }
 
 GEN_OPIVX_TRANS(vmseq_vx, opivx_cmp_check)
@@ -2089,7 +2209,7 @@ static bool trans_vmv_v_v(DisasContext *s, arg_vmv_v_v *a)
     if (require_rvv(s) &&
         vext_check_isa_ill(s) &&
         /* vmv.v.v has rs2 = 0 and vm = 1 */
-        vext_check_sss(s, a->rd, a->rs1, 0, 1)) {
+        vext_check_mov(s, a->rd, a->rs1)) {
         if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
             tcg_gen_gvec_mov(s->sew, vreg_ofs(s, a->rd),
                              vreg_ofs(s, a->rs1),
@@ -2119,7 +2239,7 @@ static bool trans_vmv_v_x(DisasContext *s, arg_vmv_v_x *a)
     if (require_rvv(s) &&
         vext_check_isa_ill(s) &&
         /* vmv.v.x has rs2 = 0 and vm = 1 */
-        vext_check_ss(s, a->rd, 0, 1)) {
+        vext_check_mov(s, a->rd, -1)) {
         TCGv s1;
 
         s1 = get_gpr(s, a->rs1, EXT_SIGN);
@@ -2163,7 +2283,7 @@ static bool trans_vmv_v_i(DisasContext *s, arg_vmv_v_i *a)
     if (require_rvv(s) &&
         vext_check_isa_ill(s) &&
         /* vmv.v.i has rs2 = 0 and vm = 1 */
-        vext_check_ss(s, a->rd, 0, 1)) {
+        vext_check_mov(s, a->rd, -1)) {
         int64_t simm = sextract64(a->rs1, 0, 5);
         if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
             tcg_gen_gvec_dup_imm(s->sew, vreg_ofs(s, a->rd),
@@ -2688,7 +2808,7 @@ static bool opfvv_cmp_check(DisasContext *s, arg_rmrr *a)
     return require_rvv(s) &&
            require_rvf(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_mss(s, a->rd, a->rs1, a->rs2);
+           vext_check_mss(s, a->rd, a->rs1, a->rs2, a->vm);
 }
 
 GEN_OPFVV_TRANS(vmfeq_vv, opfvv_cmp_check)
@@ -2701,7 +2821,7 @@ static bool opfvf_cmp_check(DisasContext *s, arg_rmrr *a)
     return require_rvv(s) &&
            require_rvf(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_ms(s, a->rd, a->rs2);
+           vext_check_ms(s, a->rd, a->rs2, a->vm);
 }
 
 GEN_OPFVF_TRANS(vmfeq_vf, opfvf_cmp_check)
@@ -3007,7 +3127,7 @@ static bool reduction_check(DisasContext *s, arg_rmrr *a)
 {
     return require_rvv(s) &&
            vext_check_isa_ill(s) &&
-           vext_check_reduction(s, a->rs2);
+           vext_check_reduction(s, a->rd, a->rs1, a->rs2, a->vm);
 }
 
 GEN_OPIVV_TRANS(vredsum_vs, reduction_check)

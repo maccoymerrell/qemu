@@ -16,6 +16,55 @@
 
 struct DisasContextBase;
 
+/*
+ * One architectural register, as the per-instruction register statement
+ * names it (qemu_plugin_insn_reg_list()): @cls is an enum
+ * qemu_plugin_reg_class, @name the target's (gdb) name.
+ */
+typedef struct PluginRegDesc {
+    uint8_t cls;
+    uint8_t index;
+    uint16_t width;
+    char name[14];
+} PluginRegDesc;
+
+/* What a TCGCPUOps.plugin_reg_resolve hook says a CPU-state field is. */
+enum PluginRegResolve {
+    PLUGIN_REG_UNKNOWN,     /* no register the target knows of */
+    PLUGIN_REG_ARCH,        /* @desc names the register */
+    PLUGIN_REG_DROP,        /* translator bookkeeping, not a register */
+};
+
+/* For resolve hooks: CPU-state offset @off lies in field @f of @T ... */
+#define PLUGIN_REG_IN(T, f, off) \
+    ((uintptr_t)((off) - (intptr_t)offsetof(T, f)) < sizeof_field(T, f))
+/* ... at element number */
+#define PLUGIN_REG_ELT(T, f, off) \
+    ((int)(((off) - (intptr_t)offsetof(T, f)) / sizeof_field(T, f[0])))
+
+/* Fill @d; returns PLUGIN_REG_ARCH */
+static inline int G_GNUC_PRINTF(5, 6)
+plugin_reg_desc(PluginRegDesc *d, int cls, int index, int width,
+                const char *fmt, ...)
+{
+    va_list ap;
+
+    d->cls = cls;
+    d->index = index;
+    d->width = width;
+    va_start(ap, fmt);
+    vsnprintf(d->name, sizeof(d->name), fmt, ap);
+    va_end(ap);
+    return PLUGIN_REG_ARCH;
+}
+
+/* plugin_gen_reg_mute() modes */
+enum {
+    PLUGIN_REG_MUTE_OFF,
+    PLUGIN_REG_MUTE_WRITES, /* the ops only rematerialise state: no writes */
+    PLUGIN_REG_MUTE_ALL,    /* the ops are stated otherwise (plugin_gen_reg) */
+};
+
 #ifdef CONFIG_PLUGIN
 
 bool plugin_gen_tb_start(CPUState *cpu, const struct DisasContextBase *db);
@@ -52,6 +101,29 @@ void plugin_gen_record_branch_target(uint64_t target_pc);
  */
 void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind);
 
+/*
+ * The register statement's translator side (the transfer-kind pattern).
+ * The ops an instruction emits state most of its register accesses by
+ * themselves; plugin_gen_insn_end() collects them.  These calls state
+ * what the ops cannot show:
+ *
+ * plugin_gen_reg: the instruction accesses @d (@access: QEMU_PLUGIN_REG_*
+ *   bits; 0 says it does NOT access @d, e.g. a pointer the helper is
+ *   passed but does not use).  Authoritative over a CPU-state pointer
+ *   whose direction the ops leave unknown.
+ * plugin_gen_reg_env: the same, for the register at CPU-state @offset.
+ * plugin_gen_reg_temp: temp @t stands for register @d from here on (a
+ *   register with no CPU-state field, e.g. a zero register).
+ * plugin_gen_reg_covered: the statements made for this instruction cover
+ *   every effect of the helpers it calls.
+ * plugin_gen_reg_mute: PLUGIN_REG_MUTE_* for the ops that follow.
+ */
+void plugin_gen_reg(const PluginRegDesc *d, unsigned access);
+void plugin_gen_reg_env(intptr_t offset, unsigned access);
+void plugin_gen_reg_temp(TCGTemp *t, const PluginRegDesc *d);
+void plugin_gen_reg_covered(void);
+void plugin_gen_reg_mute(int mode);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -78,6 +150,21 @@ static inline void plugin_gen_record_branch_target(uint64_t target_pc)
 
 static inline
 void plugin_gen_record_transfer(enum qemu_plugin_transfer_kind kind)
+{ }
+
+static inline void plugin_gen_reg(const PluginRegDesc *d, unsigned access)
+{ }
+
+static inline void plugin_gen_reg_env(intptr_t offset, unsigned access)
+{ }
+
+static inline void plugin_gen_reg_temp(TCGTemp *t, const PluginRegDesc *d)
+{ }
+
+static inline void plugin_gen_reg_covered(void)
+{ }
+
+static inline void plugin_gen_reg_mute(int mode)
 { }
 
 #endif /* CONFIG_PLUGIN */

@@ -175,7 +175,8 @@ carry:
   and ``num_insns`` per-insn descriptors.
 * **Per insn:** ``pc_delta``, ``opcode``, ``branch_type``, ``flags``,
   ``n_src``, ``n_dst``, ``src_regs[]``, ``dst_regs[]``, ``max_dep_loads``,
-  ``max_dep_stores``, ``insn_size``, ``insn_bytes[insn_size]``.
+  ``max_dep_stores`` (the load / store dependency-mask lengths, not memop
+  counts), ``insn_size``, ``insn_bytes[insn_size]``.
 * **Body:** a leading ``BODY_TAG_ASID_SWITCH`` (declaring the opening
   address space, with its inline identity) followed by a
   ``BODY_TAG_THREAD_SWITCH`` (declaring the opening thread); one
@@ -517,10 +518,13 @@ Decode by repeated outer-section unwrapping.
           n_dst              : u8
           src_regs[n_src]    : u8 each    ; resolve via encoding_maps.reg
           dst_regs[n_dst]    : u8 each    ; resolve via encoding_maps.reg
-          max_dep_loads      : u8         ; template-static MAX load count
-                                          ; (runtime per-iter count rides on
-                                          ; CST_FID_N_LOADS and can be smaller)
-          max_dep_stores     : u8         ; template-static MAX store count
+          max_dep_loads      : u8         ; LOAD DEPENDENCY MASK LENGTH: the
+                                          ; load positions every dependency
+                                          ; mask spans; NOT a memop count
+                                          ; (an execution's load count rides
+                                          ; on CST_FID_N_LOADS; never larger)
+          max_dep_stores     : u8         ; STORE DEPENDENCY MASK LENGTH; same
+                                          ; contract against CST_FID_N_STORES
           if (flags & ids.insn_flag_has_imm):
             immediate        : SLEB
           insn_size          : u8         ; 0..16
@@ -2374,14 +2378,14 @@ whose size ``DCZID_EL0`` gives, one per access the helper performs.
 In user mode the helper clears the block in naturally aligned 16-byte
 pieces, so a 512-byte block is 32 stores; in system mode a block that
 lands on RAM is cleared the same way, while one that lands on MMIO is
-written a byte at a time, so the template's ``max_dep_stores`` is the
-block length in bytes and an execution against RAM publishes the
-smaller count. ``DC GZVA`` and ``STZGM`` state the same stores. RISC-V
-``CBO.ZERO`` is the same shape: its helper writes the
-``cboz_blocksize`` block one byte at a time whenever the plugin is
-attached (the direct host-page path is withheld so that the stores are
-observable), so it publishes one 1-byte store per byte of the block —
-64 at QEMU's default block size.
+written a byte at a time, so the template's store dependency-mask
+length (``max_dep_stores``) spans the block length in bytes and an
+execution against RAM publishes the smaller ``N_STORES``. ``DC GZVA``
+and ``STZGM`` state the same stores. RISC-V ``CBO.ZERO`` is the same
+shape: its helper writes the ``cboz_blocksize`` block one byte at a
+time whenever the plugin is attached (the direct host-page path is
+withheld so that the stores are observable), so it publishes one
+1-byte store per byte of the block — 64 at QEMU's default block size.
 
 The WRONG PATH does not yet carry this access. The address is on the
 wrong-path template — the opcode is there and the statement is the same
@@ -2725,8 +2729,9 @@ x87, SSE, AVX (YMM), MPX and PKRU state components and no AVX-512
 component, so the most such a helper can perform is 99 stores (with
 the one header load ``XSAVEOPT``/``XSAVE`` read-modify-write) and 98
 loads for ``XRSTOR``; ``FXSAVE``/``FXRSTOR`` perform 55 stores / 52
-loads.  The template states exactly that most as ``max_dep_loads`` /
-``max_dep_stores`` — the decode site declares the helper's access
+loads.  The template sizes its dependency masks for exactly that most:
+``max_dep_loads`` / ``max_dep_stores``, the load / store dependency-mask
+lengths — the decode site declares the helper's access
 list, derived from the same area layout the helper writes — and an
 execution that touches fewer components publishes a smaller
 ``N_LOADS`` / ``N_STORES``.  The vector cases are stated the same way,
@@ -2741,16 +2746,17 @@ the translation ran under — which is 16 for ``vle64.v`` and 128 for
 ``vle8.v`` at QEMU's default ``VLEN`` of 128; ``DC ZVA`` and
 ``CBO.ZERO`` are one store per piece their helpers write (above);
 gather/scatter is at most 16 lanes.  The template header's
-per-instruction maximum is a ``u8`` (255), so every bounded case at
-the default configuration fits both it and the 512-slot ceiling.  A
-configuration whose bound passes 255 — RISC-V ``vle8.v`` at
-``VLEN`` ≥ 256 or ``vle16.v`` at ``VLEN`` ≥ 512, a ``cboz_blocksize``
-above 255, a 256-byte ``DC ZVA`` block (A64FX) in system mode — is
-refused at the decode site rather than stated short, and the
-executions it then performs are reported by the impossible-attribution
-oracle (``cst_decode --strict``, ``cst_audit``).  That is a loud
-failure, not a supported configuration: the per-instruction maximum's
-width is the limit, and widening it is a format change.
+per-instruction dependency-mask length is a ``u8`` (255), so every
+bounded case at the default configuration fits both it and the
+512-slot ceiling.  A configuration whose bound passes 255 — RISC-V
+``vle8.v`` at ``VLEN`` ≥ 256 or ``vle16.v`` at ``VLEN`` ≥ 512, a
+``cboz_blocksize`` above 255, a 256-byte ``DC ZVA`` block (A64FX) in
+system mode — is refused at the decode site rather than stated short,
+and the executions it then performs are reported by the
+impossible-attribution oracle (``cst_decode --strict``,
+``cst_audit``).  That is a loud failure, not a supported configuration:
+the width of the per-instruction dependency-mask length is the limit,
+and widening it is a format change.
 
 The instructions whose fan-out is *unbounded* — bounded only by a
 register value, so that no ceiling could be chosen — are not clamped at
@@ -3429,8 +3435,8 @@ before the payload.
    |   n_dst           u8                             |
    |   src_regs        u8[n_src]                      |
    |   dst_regs        u8[n_dst]                      |
-   |   max_dep_loads   u8      template-static MAX     |
-   |   max_dep_stores  u8      template-static MAX     |
+   |   max_dep_loads   u8      load dep-mask length    |
+   |   max_dep_stores  u8      store dep-mask length   |
    |   immediate       SLEB    only if HAS_IMM        |
    |   insn_size       u8                             |
    |   insn_bytes      bytes[insn_size]               |
@@ -3454,9 +3460,11 @@ sub-block follows the instruction bytes:
 Mask array sizes (``n_dst``, ``max_dep_loads``, ``max_dep_stores``) all
 come from the outer template header — the dep block itself carries
 only the masks.  ``max_dep_loads`` / ``max_dep_stores`` are the
-template-static MAX counts; the runtime per-iteration mem-op counts
-ride on ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` and can be smaller
-(e.g. a conditional load that didn't fire) but never larger.
+LOAD / STORE DEPENDENCY MASK LENGTHS: how many load / store positions
+each mask spans, which is all they state.  They are not a count of
+memops.  How many loads and stores an execution performed rides on
+``CST_FID_N_LOADS`` / ``CST_FID_N_STORES``, which can be smaller (e.g.
+a conditional load that didn't fire) but never larger.
 
 Bit layout inside each register/load mask:
 

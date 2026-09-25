@@ -12,6 +12,7 @@
 #define CHAMPSIM_TRACER_WIRE_H
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -55,10 +56,32 @@ int isa_for_target(const std::string &target_name);
  * One template (section 6): a true basic block as a pc/size/bytes list.
  * @terminated says its last instruction was learned to end a block, which
  * is all fall_through_pc states; nothing else about the branch is claimed.
- * @max is the most loads (0) / stores (1) one entry of it delivered.
+ * @id is the interned instruction; @fanout, the engine's bulk account named
+ * it.  @dep_mask_len is the LOAD (0) / STORE (1) DEPENDENCY MASK LENGTH, the
+ * wire's max_dep_loads / max_dep_stores: how many load / store positions
+ * every dependency mask of the instruction spans.  It is NOT a memop count:
+ * how many memops an execution performed is that entry's N_LOADS / N_STORES.
+ * Filled as the widest count any one entry delivered, so it never under-
+ * sizes a mask a delivered memop needs.
  */
-struct WireInsn { uint64_t pc; uint8_t size; const uint8_t *bytes; uint8_t max[2]; };
+struct WireInsn {
+    uint64_t pc; uint8_t size; const uint8_t *bytes; uint32_t id; bool fanout;
+    uint8_t dep_mask_len[2];
+};
 struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
+
+/*
+ * The should-be-static tripwire (maintainer ruling 2026-09-25): per
+ * instruction, how many executions delivered each (loads << 32 | stores)
+ * count -- correct path [0], wrong path [1], and a wrong-path execution
+ * cut by its own fault [2], which is not a variance.  Decode fixes nearly
+ * every instruction's count, so one outside the fan-out account whose
+ * count varies is a finding.  Side log only; never on the wire.
+ */
+struct MemopCensus {
+    struct Row { const WireInsn *insn; std::map<uint64_t, uint64_t> hist[3]; };
+    std::map<uint32_t, Row> rows;
+};
 
 /*
  * One memory access as the callback stated it (sections 5.2, 5.3): @pos is
@@ -102,13 +125,15 @@ Bytes header_member(const HeaderFacts &facts,
  * section 4, the entries with their memops as field deltas (section 5),
  * END carrying their count, trailing magic.  @root_phys is the asid-0
  * label (section 4.1a).  With @wp each entry carries its chain of @chains
- * (section 4.3).  Returns in @slots the slots it addressed, and in each
- * template instruction's @max its observed maxima.
+ * (section 4.3).  Returns in @slots the slots it addressed, in each
+ * template instruction's @dep_mask_len its dependency mask lengths, and in
+ * @census every execution's memop counts.
  */
 Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<WireEntry> &chains,
-                  const std::vector<Memop> &memops, size_t &slots, bool wp);
+                  const std::vector<Memop> &memops, size_t &slots, bool wp,
+                  MemopCensus &census);
 
 } /* namespace cst */
 

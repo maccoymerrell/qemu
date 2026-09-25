@@ -243,12 +243,12 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         prev = i.pc;
         b.u8(kUnclassified);    /* opcode */
         b.u8(kUnclassified);    /* branch_type */
-        /* flags, n_src, n_dst: unclaimed; max_dep_*: the observed maxima */
+        /* flags, n_src, n_dst: unclaimed; then the dependency mask lengths */
         for (int k = 0; k < 3; k++) {
             b.u8(0);
         }
-        b.u8(i.max[0]);
-        b.u8(i.max[1]);
+        b.u8(i.dep_mask_len[0]);    /* max_dep_loads */
+        b.u8(i.dep_mask_len[1]);    /* max_dep_stores */
         b.u8(i.size);
         for (unsigned k = 0; k < i.size; k++) {
             b.u8(i.bytes[k]);
@@ -342,7 +342,8 @@ private:
  */
 Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
                     std::vector<WireTemplate> &templates,
-                    const std::vector<Memop> &memops, size_t &slots)
+                    const std::vector<Memop> &memops, size_t &slots,
+                    MemopCensus &census)
 {
     WireTemplate &t = templates[e.template_id];
     uint32_t n = uint32_t(t.insns.size()), stop = e.stop ? e.stop : n;
@@ -365,10 +366,14 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
                 sec.put(ipos, slot_fid(k, d, 2), x.size);
             }
             slots = std::max(slots, c);
-            /* u8 on the wire; a larger count stays visible as over-max */
-            uint8_t &mx = t.insns[ipos].max[d];
-            mx = uint8_t(std::min<size_t>(std::max<size_t>(mx, dir[d].size()), 255));
+            /* the mask spans the widest count; u8, a larger one shows as over */
+            uint8_t &len = t.insns[ipos].dep_mask_len[d];
+            len = uint8_t(std::min<size_t>(std::max<size_t>(len, dir[d].size()), 255));
         }
+        MemopCensus::Row &row = census.rows[t.insns[ipos].id];
+        row.insn = &t.insns[ipos];
+        row.hist[int32_t(ipos) == e.fault ? 2 : fallback != nullptr]
+            [uint64_t(dir[0].size()) << 32 | dir[1].size()]++;
     }
     sec.put(n, kFidStop, stop, 0, n);
     sec.put(n, kFidFlags, e.flags);
@@ -409,7 +414,8 @@ Bytes header_member(const HeaderFacts &facts,
 Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                   const std::vector<WireEntry> &entries,
                   const std::vector<WireEntry> &chains,
-                  const std::vector<Memop> &memops, size_t &slots, bool wp)
+                  const std::vector<Memop> &memops, size_t &slots, bool wp,
+                  MemopCensus &census)
 {
     Bytes b;
     b.u32(kMagic);
@@ -431,7 +437,8 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
         b.u8(kTagEntry);
         b.sleb(int64_t(e.template_id) - tmpl);
         tmpl = e.template_id;
-        b.section(entry_section(cp, nullptr, e, templates, memops, slots));
+        b.section(entry_section(cp, nullptr, e, templates, memops, slots,
+                                census));
         if (wp) {
             Bytes ch;
             ch.uleb(e.wp_e - e.wp_b);
@@ -440,7 +447,7 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                 ch.sleb(int64_t(chains[w].template_id) - prev);
                 prev = chains[w].template_id;
                 ch.section(entry_section(spec, &cp, chains[w], templates, memops,
-                                         slots));
+                                         slots, census));
             }
             b.section(ch);
         }

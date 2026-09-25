@@ -114,6 +114,45 @@ std::string local_datetime()
 }
 
 /*
+ * The should-be-static tripwire's report: a count on the side log and, at
+ * <outfile>.nonstatic_memops.tsv, each instruction whose (loads/stores)
+ * count varied across executions -- pc, bytes, whether the engine's fan-out
+ * account (expected to vary) named it, and the histograms per path.
+ */
+void memop_tripwire(const cst::MemopCensus &census, const std::string &path)
+{
+    size_t bugs = 0, fanout = 0;
+    std::ofstream f(path.substr(0, path.size() - 4) + ".nonstatic_memops.tsv");
+    f << "pc\tbytes\tfanout\tcp\twp\twp_fault_cut\n";
+    for (const auto &r : census.rows) {
+        std::map<uint64_t, uint64_t> seen(r.second.hist[0]);
+        seen.insert(r.second.hist[1].begin(), r.second.hist[1].end());
+        if (seen.size() < 2) {
+            continue;
+        }
+        const cst::WireInsn &i = *r.second.insn;
+        (i.fanout ? fanout : bugs)++;
+        char hex[40] = "";
+        for (unsigned k = 0; k < i.size; k++) {
+            std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
+        }
+        f << std::hex << "0x" << i.pc << std::dec << '\t' << hex << '\t'
+          << i.fanout;
+        for (const auto &h : r.second.hist) {
+            f << '\t';
+            for (const auto &c : h) {   /* loads/stores:executions */
+                f << (c.first >> 32) << '/' << uint32_t(c.first) << ':'
+                  << c.second << ' ';
+            }
+        }
+        f << '\n';
+    }
+    say("nonstatic_memop_insns=" + std::to_string(bugs) + " (fan-out " +
+        std::to_string(fanout) + " excluded, of " +
+        std::to_string(census.rows.size()) + " executed insns)");
+}
+
+/*
  * Close the segment.  @root_phys is the asid-0 label: the live
  * address-space value, read by the caller where it is readable.
  * Idempotent: whichever ruled route arrives first publishes.
@@ -134,8 +173,11 @@ void publish(uint64_t root_phys, const char *route)
     s.blocks.recut(templates, entries, chains, s.wpdepth);
     /* The body goes first, so the header can be finalised after it. */
     size_t slots;
+    cst::MemopCensus census;
     cst::Member body = { "body.cst", cst::body_member(root_phys, templates,
-                         entries, chains, s.blocks.memops(), slots, s.wp).data() };
+                         entries, chains, s.blocks.memops(), slots, s.wp,
+                         census).data() };
+    memop_tripwire(census, s.path);
     const auto &st = s.blocks.stats;
     say("entries=" + std::to_string(entries.size()) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +

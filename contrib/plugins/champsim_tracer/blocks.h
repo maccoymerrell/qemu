@@ -157,6 +157,7 @@ public:
         if (ran < n || (bulk && bulk->pc != insn(last).pc)) {
             bulk = nullptr;
         }
+        marks_[last] |= bulk ? kFanout : 0;     /* variable memops: expected */
         /* A bulk op's memops divide in order into one share per unit. */
         size_t own = std::find_if(mem.begin(), mem.end(), [n](const Memop &m) {
             return m.pos == n - 1; }) - mem.begin();
@@ -347,7 +348,7 @@ public:
 private:
     static constexpr InsnId kNone = ~InsnId(0);
     static constexpr size_t kNoEntry = ~size_t(0);
-    enum : uint8_t { kEnds = 1, kFolded = 2 };  /* marks_ bits */
+    enum : uint8_t { kEnds = 1, kFolded = 2, kFanout = 4 };  /* marks_ bits */
 
     bool ends(InsnId id) const { return marks_[id] & kEnds; }
 
@@ -425,7 +426,8 @@ private:
         WireTemplate t;
         for (InsnId id : sh) {
             const Insn &i = insn(id);
-            t.insns.push_back({ i.pc, i.size, i.bytes });
+            t.insns.push_back({ i.pc, i.size, i.bytes, id,
+                                (marks_[id] & kFanout) != 0, {} });
         }
         t.terminated = ends(sh.back());
         return t;

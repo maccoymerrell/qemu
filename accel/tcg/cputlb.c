@@ -3441,6 +3441,47 @@ static void do_st_8(CPUState *cpu, MMULookupPageData *p, uint64_t val,
     }
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path store probe.  A wrong-path store is buffered in the spec
+ * sandbox and never reaches the page, but the wrong path must still observe
+ * whether the correct path could have written there: a store to a read-only
+ * or absent page is flagged synthetic (plugin_spec_mem_faulted), exactly as
+ * the user-mode twin spec_store_bytes_user flags one whose page lacks
+ * PAGE_WRITE_ORG and as a wrong-path load from an absent page is flagged.
+ *
+ * Each page the store touches is probed for MMU_DATA_STORE through
+ * probe_access_internal as a non-faulting probe: the walk never raises and
+ * never demand-pages, the target walker skips the A/D writeback while spec
+ * mode is on, and a successful fill is installed through tlb_set_page_full,
+ * which records it in the spec TLB log that the excursion's close
+ * invalidates.  No watchpoint is checked, no clean page is marked dirty and
+ * no device is touched: only the permission answer is used.  A device page
+ * is writable, so a store to one is not flagged.
+ */
+static void spec_store_probe(CPUState *cpu, vaddr addr, int size,
+                             MemOpIdx oi, uintptr_t ra)
+{
+    int mmu_idx = get_mmuidx(oi);
+
+    while (size > 0) {
+        int in_page = -(addr | TARGET_PAGE_MASK);
+        int n = size < in_page ? size : in_page;
+        CPUTLBEntryFull *full;
+        void *host;
+
+        if (probe_access_internal(cpu, addr, n, MMU_DATA_STORE, mmu_idx,
+                                  true, &host, &full, ra, false)
+            & TLB_INVALID_MASK) {
+            cpu->plugin_spec_mem_faulted = true;
+            return;
+        }
+        addr += n;
+        size -= n;
+    }
+}
+#endif
+
 static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
                        MemOpIdx oi, uintptr_t ra)
 {
@@ -3449,6 +3490,7 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
+        spec_store_probe(cpu, addr, 1, oi, ra);
         spec_store_byte(cpu, addr, val);
         return;
     }
@@ -3475,6 +3517,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
             val = bswap16(val);
         }
         uint16_t host_val = val;
+        spec_store_probe(cpu, addr, 2, oi, ra);
         spec_store_bytes(cpu, addr, &host_val, 2);
         return;
     }
@@ -3509,6 +3552,7 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
             val = bswap32(val);
         }
         uint32_t host_val = val;
+        spec_store_probe(cpu, addr, 4, oi, ra);
         spec_store_bytes(cpu, addr, &host_val, 4);
         return;
     }
@@ -3542,6 +3586,7 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
             val = bswap64(val);
         }
         uint64_t host_val = val;
+        spec_store_probe(cpu, addr, 8, oi, ra);
         spec_store_bytes(cpu, addr, &host_val, 8);
         return;
     }
@@ -3577,6 +3622,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
             val = bswap128(val);
         }
         Int128 host_val = val;
+        spec_store_probe(cpu, addr, 16, oi, ra);
         spec_store_bytes(cpu, addr, &host_val, 16);
         return;
     }

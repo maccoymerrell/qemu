@@ -118,14 +118,16 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
  *
  * A wrong-path store to an unmapped/read-only page does NOT fault the
  * excursion (a mispredicted store never retires): it sandboxes-and-continues,
- * exactly as the softmmu twin does — the do_st spec branch buffers the bytes
- * into the per-vCPU spec line regardless of the real page's writability.  We
- * still probe each touched page's original writability (PAGE_WRITE_ORG, so a
- * store to an SMC-dirty-tracked page whose PAGE_WRITE was cleared is not
- * mis-flagged) purely to set plugin_spec_mem_faulted for a bad-page store so
- * its memop is tagged synthetic.  The bytes are buffered in the spec sandbox —
- * never real guest memory — preserving store-to-load forwarding for the rest
- * of the excursion.
+ * buffering the bytes into the per-vCPU spec line regardless of the real
+ * page's writability.  We still probe each touched page's original
+ * writability (PAGE_WRITE_ORG, so a store to an SMC-dirty-tracked page whose
+ * PAGE_WRITE was cleared is not mis-flagged) purely to set
+ * plugin_spec_mem_faulted for a bad-page store so its memop is tagged
+ * synthetic.  The softmmu twin (spec_store_probe in cputlb.c) does the same
+ * with a non-faulting MMU_DATA_STORE probe of each touched page before the
+ * do_stN_mmu spec branch buffers the bytes.  The bytes are buffered in the
+ * spec sandbox — never real guest memory — preserving store-to-load
+ * forwarding for the rest of the excursion.
  */
 static void spec_store_bytes_user(CPUState *cpu, vaddr addr,
                                   const void *buf, int size, uintptr_t ra)

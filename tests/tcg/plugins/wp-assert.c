@@ -401,6 +401,7 @@ static bool snap_reg_differs(RegSnap *a, RegSnap *b, const char *name)
 /* ------------------------------------------------------------- helpers */
 
 static int cur_test;
+static uint64_t t1_store_buf;      /* control T1RO */
 
 /*
  * A failed assertion aborts at once, unless keepgoing=on: then it is
@@ -876,6 +877,7 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
 
     switch (test) {
     case T1_STORE:
+        t1_store_buf = buf;
         if (control_is("T1")) {
             fprintf(stderr, "[wp-assert] CONTROL T1: excursion WITHOUT "
                     "spec mode; stores reach memory, T1 must FAIL\n");
@@ -906,8 +908,22 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
         check_common(&e, &pre, pre_sum);
         break;
 
-    case T1_RO:
+    case T1_RO: {
+        /* control T1RO (softmmu): the same wrong path with its base
+         * register aimed at T1_STORE's writable buffer.  The synthetic
+         * flag must follow the page, so the flag check must FAIL. */
+        uint64_t ro_delta = 0;
+        if (control_is("T1RO") && is_system && t1_store_buf) {
+            ro_delta = t1_store_buf - buf;
+            fprintf(stderr, "[wp-assert] CONTROL T1RO: T1_RO's wrong path "
+                    "with rdx aimed at the writable buffer 0x%" PRIx64
+                    "; the synthetic-flag check must FAIL\n", t1_store_buf);
+            perturb_reg("rdx", ro_delta);
+        }
         excursion(&e);
+        if (ro_delta) {
+            perturb_reg("rdx", -ro_delta);
+        }
         CHECK(e.stores >= 3, "only %" PRIu64 " wrong-path stores", e.stores);
         CHECK(e.faulted_memops >= 3, "stores to read-only data/code not "
               "flagged synthetic (%" PRIu64 ")", e.faulted_memops);
@@ -915,6 +931,7 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
               "%016" PRIx64 ", not the sandboxed store", e.inside_buf0);
         check_common(&e, &pre, pre_sum);
         break;
+    }
 
     case T2_REGS: {
         const char *const *subjects = isa->t2_subjects;

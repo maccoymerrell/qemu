@@ -65,6 +65,14 @@
  *                     C3N C4N
  *                     (system; see
  *                     WP_TESTS.md "Softmmu phase 2")
+ *   arm=F2|F2C        linux-user: T3_SYSCALL's excursion keeps spec mode
+ *                     on and skips the exception clear and the restore
+ *                     (the omission route of WP_TESTS.md F2/F6); F2C also
+ *                     withholds spec_mode_end until the dispatcher has run
+ *   fwd=on            system: FWD_SHAPES (guest wp-fwd-sys.c) must run;
+ *                     control=FWDN (spec off) / FWDM (store base moved)
+ *   w2=on             system: the reset and shutdown callbacks record the
+ *                     id QEMU hands them (instead of C3's abort on reset)
  *
  * Copyright (c) 2026 Maccoy Merrell
  *
@@ -91,10 +99,17 @@ enum {
     C3_PF, C3_UD, C4_PTW,
     T_LAST,
     T_USER_LAST = P2A_CLOCK,    /* linux-user runs T1..T5 only */
+    /*
+     * Outside the set require=on insists on: the store-forwarding shapes
+     * run by their own guest, tests/tcg/x86_64/system/wp-fwd-sys.c
+     * (fwd=on insists on them instead).
+     */
+    FWD_SHAPES = T_LAST,
+    T_ALL,
     P2_INFO = 31,               /* not a test: the guest's layout */
 };
 
-static const char *const test_names[T_LAST] = {
+static const char *const test_names[T_ALL] = {
     [T1_STORE] = "T1_STORE", [T1_RO] = "T1_RO", [T2_REGS] = "T2_REGS",
     [T3_FETCH_UNMAPPED] = "T3_FETCH_UNMAPPED", [T3_STRADDLE] = "T3_STRADDLE",
     [T3_UD] = "T3_UD", [T3_DIV0] = "T3_DIV0", [T3_PRIV] = "T3_PRIV",
@@ -104,7 +119,7 @@ static const char *const test_names[T_LAST] = {
     [P2B_TIMER] = "P2B_TIMER", [P2B_PEND] = "P2B_PEND",
     [P2B_ISR] = "P2B_ISR", [C1_MMIO] = "C1_MMIO", [C2_TLB] = "C2_TLB",
     [C3_GP] = "C3_GP", [C3_PF] = "C3_PF", [C3_UD] = "C3_UD",
-    [C4_PTW] = "C4_PTW",
+    [C4_PTW] = "C4_PTW", [FWD_SHAPES] = "FWD_SHAPES",
 };
 
 /*
@@ -225,9 +240,9 @@ static bool enabled = true;
 static bool verbose;
 static int t4_budget = 1000;
 static const char *control = "";
-static int tests_run[T_LAST];
-static int checks_passed[T_LAST];
-static int checks_failed[T_LAST];
+static int tests_run[T_ALL];
+static int checks_passed[T_ALL];
+static int checks_failed[T_ALL];
 static bool keep_going;
 static bool dump_regs;
 static bool dump_inside;          /* print T5's in-excursion registers */
@@ -250,6 +265,26 @@ static uint64_t ev_async_enter, ev_async_in_wp, ev_async_in_window;
 static uint64_t ev_drains;
 static bool in_window;            /* between an excursion's two drains */
 static uint64_t resets;           /* vm_reset callbacks seen (C3) */
+/*
+ * arm=F2 / arm=F2C (linux-user): the omission route of WP_TESTS.md F2/F6,
+ * driven on purpose.  T3_SYSCALL's excursion keeps spec mode on and skips
+ * the walker's exception clear and state restore, so the wrong-path
+ * syscall stays latched when the plugin returns.  F2 then calls
+ * qemu_plugin_spec_mode_end() as a walker would; F2C (the counter's
+ * control) leaves spec mode on until the dispatcher has seen the syscall.
+ */
+static const char *arm = "";
+static uint64_t f2_blocked0;
+static bool f2c_open;             /* F2C: spec mode left on, not yet seen */
+/*
+ * w2=on (system): the machine-lifecycle callbacks record the id QEMU hands
+ * them, to be compared with the id the plugin was installed under.
+ */
+static bool w2;
+static qemu_plugin_id_t w2_install_id, w2_atexit_id;
+static uint64_t w2_reset_id, w2_shutdown_id;
+static int w2_reset_calls, w2_shutdown_calls;
+static bool fwd_require;          /* fwd=on: FWD_SHAPES must run */
 
 /* ---------------------------------------------------------------- regs */
 
@@ -392,6 +427,22 @@ static uint64_t snap_u64(RegSnap *s, const char *name)
     abort();
 }
 
+/* A register's raw bytes from a snapshot; returns the length (0: none). */
+static int snap_bytes(RegSnap *s, const char *name, uint8_t *out, int max)
+{
+    for (guint i = 0; i < regs->len; i++) {
+        if (strcmp(g_array_index(regs, Reg, i).name, name) == 0) {
+            int n = MIN(g_array_index(s->len, int, i), max);
+            if (n > 0) {
+                memcpy(out, s->bytes->data + g_array_index(s->off, int, i), n);
+            }
+            return n;
+        }
+    }
+    fprintf(stderr, "[wp-assert] FAIL setup: register %s not exposed\n", name);
+    abort();
+}
+
 static bool snap_reg_differs(RegSnap *a, RegSnap *b, const char *name)
 {
     for (guint i = 0; i < regs->len; i++) {
@@ -446,6 +497,11 @@ static bool control_is(const char *c)
     return strcmp(control, c) == 0;
 }
 
+static bool arm_is(const char *a)
+{
+    return strcmp(arm, a) == 0;
+}
+
 static uint64_t fnv_add(uint64_t h, const void *p, size_t n)
 {
     const uint8_t *b = p;
@@ -488,6 +544,7 @@ typedef struct {
     uint64_t target, buf, len;
     int budget;
     bool spec, restore, clear;
+    bool keep_spec;               /* arm F2C: return with spec mode on */
     /* observed through the ordinary callbacks while recording */
     uint64_t calls, calls_ok, tbs, insns, loads, stores;
     uint64_t stores_in_buf, faulted_memops, tbs_not_spec;
@@ -563,6 +620,16 @@ static void drain_events(unsigned int vcpu)
 static void vcpu_tb_exec(unsigned int vcpu, void *udata)
 {
     TBInfo *ti = udata;
+    if (f2c_open && !rec && qemu_plugin_in_spec_mode() &&
+        qemu_plugin_spec_syscall_blocked_count() > f2_blocked0) {
+        /* arm F2C: the dispatcher has refused the latched syscall */
+        f2c_open = false;
+        qemu_plugin_spec_mode_end();
+        fprintf(stderr, "[wp-assert] ARM F2C: the dispatcher refused %" PRIu64
+                " syscall(s) while spec mode was on; spec mode closed at the "
+                "next block\n",
+                qemu_plugin_spec_syscall_blocked_count() - f2_blocked0);
+    }
     if (is_system && !qemu_plugin_in_spec_mode()) {
         drain_events(vcpu);
         if (repause && !rec) {
@@ -598,6 +665,8 @@ static void vcpu_insn_exec(unsigned int vcpu, void *udata)
         call_insns++;
     }
 }
+
+static void fwd_note(uint64_t vaddr, bool st, unsigned bytes);
 
 static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
                      uint64_t vaddr, void *udata)
@@ -646,8 +715,75 @@ static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
     } else {
         rec->loads++;
     }
+    if (cur_test == FWD_SHAPES && rec->buf) {
+        fwd_note(vaddr, st, 1u << qemu_plugin_mem_size_shift(info));
+    }
     uint64_t ev[4] = { vaddr, st, lo, hi };
     rec->fp = fnv_add(rec->fp, ev, sizeof(ev));
+}
+
+/*
+ * FWD_SHAPES (system): wrong-path store-to-load forwarding through the
+ * softmmu load helpers, one shape per row.  Keep in sync with wp_fwd in
+ * tests/tcg/x86_64/system/wp-fwd-sys.c: the wrong path stores through r13
+ * and loads through rdx (both the buffer), then spins.  @defect names the
+ * filed audit row whose mechanism the shape reaches (sandbox D1/D2); "-"
+ * marks a shape the audit says works, the arm's control.
+ */
+typedef struct {
+    const char *name, *defect, *reg;
+    uint32_t st_off[2];           /* up to two stores, value @st_val[i] */
+    uint8_t st_len[2];
+    uint64_t st_val[2];
+    uint32_t ld_off;
+    uint8_t ld_len;
+    bool bswap;                   /* MOVBE: a big-endian (MO_BSWAP) load */
+} FwdShape;
+
+#define FWD_A 0x1122334455667788ull
+#define FWD_B 0x99aabbccdd0fff01ull
+
+static const FwdShape fwd_shapes[] = {
+    { "LD16_INPAGE",  "D1", "xmm1", { 0x5100 }, { 8 }, { FWD_A }, 0x5100, 16 },
+    { "LD8_XPAGE",    "D1", "rbx",  { 0x0ffc }, { 8 }, { FWD_A }, 0x0ffc, 8 },
+    { "LD4_XPAGE",    "D1", "rcx",  { 0x1ffe }, { 4 }, { FWD_A }, 0x1ffe, 4 },
+    { "LD16_XPAGE12", "D1", "xmm2", { 0x2ff4, 0x2ffc }, { 8, 8 },
+      { FWD_A, FWD_B }, 0x2ff4, 16 },
+    { "LD8_INPAGE",   "-",  "rsi",  { 0x5200 }, { 8 }, { FWD_A }, 0x5200, 8 },
+    { "LD16_XPAGE8",  "-",  "xmm3", { 0x3ff8, 0x4000 }, { 8, 8 },
+      { FWD_A, FWD_B }, 0x3ff8, 16 },
+    { "LD2_XPAGE",    "-",  "rdi",  { 0x4fff }, { 2 }, { FWD_A }, 0x4fff, 2 },
+    { "MOVBE8",       "D2", "r8",   { 0x5300 }, { 8 }, { FWD_A }, 0x5300, 8,
+      true },
+    { "MOVBE4",       "D2", "r9",   { 0x5340 }, { 4 }, { FWD_A }, 0x5340, 4,
+      true },
+    { "MOVBE2",       "D2", "r10",  { 0x5380 }, { 2 }, { FWD_A }, 0x5380, 2,
+      true },
+    { "MOVBE8_NOFWD", "-",  "r12",  { 0 }, { 0 }, { 0 }, 0x53c0, 8, true },
+};
+#define N_FWD G_N_ELEMENTS(fwd_shapes)
+#define FWD_BUF_LEN 0x6000
+
+/* per shape: the stores and the load the engine showed the plugin */
+static int fwd_seen_st[N_FWD], fwd_seen_ld[N_FWD], fwd_ld_bytes[N_FWD];
+
+static void fwd_note(uint64_t vaddr, bool st, unsigned bytes)
+{
+    for (unsigned i = 0; i < N_FWD; i++) {
+        const FwdShape *f = &fwd_shapes[i];
+        uint64_t off = vaddr - rec->buf;
+        if (st) {
+            for (int k = 0; k < 2; k++) {
+                if (f->st_len[k] && off == f->st_off[k] &&
+                    bytes == f->st_len[k]) {
+                    fwd_seen_st[i]++;
+                }
+            }
+        } else if (off == f->ld_off) {
+            fwd_seen_ld[i]++;
+            fwd_ld_bytes[i] = bytes;
+        }
+    }
 }
 
 static void busy_wait_us(long us)
@@ -752,10 +888,10 @@ static void excursion(Exc *e)
         e->inside_buf0 = mem_u64(e->buf);
         e->inside_buf8 = mem_u64(e->buf + 8);
     }
-    if (e->spec) {
+    if (e->spec && !e->keep_spec) {
         qemu_plugin_spec_mode_end();
     }
-    if (qemu_plugin_in_spec_mode()) {
+    if (qemu_plugin_in_spec_mode() && !e->keep_spec) {
         FATAL("qemu_plugin_in_spec_mode() true after spec_mode_end");
     }
     if (e->restore) {
@@ -1045,6 +1181,28 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
 
     case T3_SYSCALL: {
         uint64_t blocked0 = qemu_plugin_spec_syscall_blocked_count();
+        if (arm_is("F2") || arm_is("F2C")) {
+            /*
+             * The omission route: spec mode ON, no exception clear, no
+             * state restore.  F2 ends spec mode as a walker would; F2C
+             * leaves it on (closed by vcpu_tb_exec once the dispatcher has
+             * counted the syscall).  The runner judges the host side
+             * effect; the counter is printed here and at exit.
+             */
+            e.clear = false;
+            e.restore = false;
+            e.keep_spec = arm_is("F2C");
+            f2_blocked0 = blocked0;
+            excursion(&e);
+            f2c_open = e.keep_spec;
+            fprintf(stderr, "[wp-assert] ARM %s: T3_SYSCALL excursion end=%s "
+                    "ok=%" PRIu64 " spec=1 clear=0 restore=0 spec_mode_end=%s"
+                    " blocked_before=%" PRIu64 " blocked_after_excursion=%"
+                    PRIu64 "\n", arm, end_names[e.end], e.calls_ok,
+                    e.keep_spec ? "withheld" : "called", blocked0,
+                    qemu_plugin_spec_syscall_blocked_count());
+            break;
+        }
         if (t3_leak_control(test, &e)) {
             excursion(&e);
             break;
@@ -1469,6 +1627,109 @@ static void run_test(int test, uint64_t target, uint64_t buf, uint64_t len)
         check_common(&e, &pre, pre_sum);
         break;
 
+    case FWD_SHAPES: {
+        /*
+         * Store-to-load forwarding (sandbox D1/D2).  Each shape's expected
+         * load result is computed from the buffer's real bytes, read here
+         * before the excursion, with that shape's stores laid over them;
+         * a MOVBE load then reverses the bytes.  The result is read from
+         * the wrong path's own register at the end of the excursion.
+         */
+        uint8_t real[N_FWD][16];
+        g_autoptr(GByteArray) b = g_byte_array_new();
+        if (len != FWD_BUF_LEN) {
+            FATAL("FWD guest buffer is %" PRIu64 " bytes, not %d", len,
+                  FWD_BUF_LEN);
+        }
+        for (unsigned i = 0; i < N_FWD; i++) {
+            g_byte_array_set_size(b, 0);
+            if (!qemu_plugin_read_memory_vaddr(buf + fwd_shapes[i].ld_off, b,
+                                               fwd_shapes[i].ld_len)) {
+                FATAL("cannot read the FWD buffer");
+            }
+            memcpy(real[i], b->data, fwd_shapes[i].ld_len);
+        }
+        memset(fwd_seen_st, 0, sizeof(fwd_seen_st));
+        memset(fwd_seen_ld, 0, sizeof(fwd_seen_ld));
+        memset(fwd_ld_bytes, 0, sizeof(fwd_ld_bytes));
+        if (control_is("FWDN")) {
+            fprintf(stderr, "[wp-assert] CONTROL FWDN: the forwarding "
+                    "excursion with spec mode off; the stores reach memory, "
+                    "so EVERY shape must MATCH\n");
+            e.spec = false;
+        }
+        uint64_t r13_delta = 0;
+        if (control_is("FWDM")) {
+            r13_delta = 0x20;
+            fprintf(stderr, "[wp-assert] CONTROL FWDM: the store base (r13) "
+                    "moved +0x20 off the loads; every forwarding shape must "
+                    "MISMATCH\n");
+            perturb_reg("r13", r13_delta);
+        }
+        excursion(&e);
+        if (r13_delta) {
+            perturb_reg("r13", -r13_delta);
+        }
+        CHECK(e.end == END_BUDGET && e.calls_ok == (uint64_t)e.budget,
+              "FWD the wrong path did not reach its spin (end=%s ok=%" PRIu64
+              ")", end_names[e.end], e.calls_ok);
+        for (unsigned i = 0; i < N_FWD; i++) {
+            const FwdShape *f = &fwd_shapes[i];
+            uint8_t want[16], got[16] = { 0 };
+            memcpy(want, real[i], f->ld_len);
+            for (int k = 0; k < 2; k++) {
+                for (int j = 0; j < f->st_len[k]; j++) {
+                    int64_t at = (int64_t)f->st_off[k] + j - f->ld_off;
+                    if (at >= 0 && at < f->ld_len) {
+                        want[at] = (uint8_t)(f->st_val[k] >> (8 * j));
+                    }
+                }
+            }
+            if (f->bswap) {
+                for (int j = 0; j < f->ld_len / 2; j++) {
+                    uint8_t t = want[j];
+                    want[j] = want[f->ld_len - 1 - j];
+                    want[f->ld_len - 1 - j] = t;
+                }
+            }
+            int n = snap_bytes(&e.inside, f->reg, got, 16);
+            bool match = n >= f->ld_len && memcmp(got, want, f->ld_len) == 0;
+            /* the shape's subject: its stores and its load really ran, the
+             * load at its full width, and forwarding changes the answer */
+            int nst = (f->st_len[0] != 0) + (f->st_len[1] != 0);
+            bool real_differs = memcmp(real[i], want, f->ld_len) != 0 ||
+                                f->bswap;
+            bool subject = fwd_seen_st[i] >= nst && fwd_seen_ld[i] >= 1 &&
+                           fwd_ld_bytes[i] == f->ld_len && real_differs;
+            GString *g = g_string_new(NULL), *w = g_string_new(NULL),
+                    *r = g_string_new(NULL);
+            for (int j = f->ld_len - 1; j >= 0; j--) {
+                g_string_append_printf(g, "%02x", got[j]);
+                g_string_append_printf(w, "%02x", want[j]);
+                g_string_append_printf(r, "%02x", real[i][j]);
+            }
+            fprintf(stderr, "[wp-assert] FWD %-12s defect=%s load=+0x%x/%u%s "
+                    "got=%s want=%s real=%s seen_st=%d/%d seen_ld=%d "
+                    "ld_bytes=%d subject=%d -> %s\n", f->name, f->defect,
+                    f->ld_off, f->ld_len, f->bswap ? " movbe" : "", g->str,
+                    w->str, r->str, fwd_seen_st[i], nst, fwd_seen_ld[i],
+                    fwd_ld_bytes[i], subject, match ? "MATCH" : "MISMATCH");
+            CHECK(subject, "FWD %s subject absent (stores %d/%d, load %d at "
+                  "%d bytes)", f->name, fwd_seen_st[i], nst, fwd_seen_ld[i],
+                  fwd_ld_bytes[i]);
+            CHECK(match, "FWD %s (%s) got %s, want %s", f->name, f->defect,
+                  g->str, w->str);
+            g_string_free(g, true);
+            g_string_free(w, true);
+            g_string_free(r, true);
+        }
+        if (control_is("FWDN")) {
+            e.buf = 0;             /* the stores are real by design */
+        }
+        check_common(&e, &pre, pre_sum);
+        break;
+    }
+
     default:
         FATAL("unknown test id %d", test);
     }
@@ -1496,7 +1757,8 @@ static void marker_exec(unsigned int vcpu, void *udata)
                 ") tsc_per_ms=%" PRIu64 "\n", wp_lo, wp_hi, tsc_per_ms);
         return;
     }
-    if (test == 0 || test >= (uint64_t)n_tests) {
+    if (test == 0 || (test >= (uint64_t)n_tests &&
+                      !(is_system && test == FWD_SHAPES))) {
         cur_test = 0;
         fprintf(stderr, "[wp-assert] FAIL marker: bad test id %" PRIu64 "\n",
                 test);
@@ -1624,9 +1886,57 @@ static void vm_reset(qemu_plugin_id_t id, int vcpu_index, bool in_guest_insn)
     abort();
 }
 
+/* w2=on: record the id each machine-lifecycle callback is handed */
+static void w2_reset(qemu_plugin_id_t id, int vcpu_index, bool in_guest_insn)
+{
+    w2_reset_calls++;
+    w2_reset_id = id;
+    fprintf(stderr, "[wp-assert] W2 reset callback: id=0x%" PRIx64
+            " registrant=0x%" PRIx64 " vcpu=%d in_guest_insn=%d\n",
+            (uint64_t)id, (uint64_t)w2_install_id, vcpu_index, in_guest_insn);
+}
+
+static void w2_shutdown(qemu_plugin_id_t id, int vcpu_index,
+                        bool in_guest_insn)
+{
+    w2_shutdown_calls++;
+    w2_shutdown_id = id;
+    fprintf(stderr, "[wp-assert] W2 shutdown callback: id=0x%" PRIx64
+            " registrant=0x%" PRIx64 " vcpu=%d in_guest_insn=%d\n",
+            (uint64_t)id, (uint64_t)w2_install_id, vcpu_index, in_guest_insn);
+}
+
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     int missing = 0, seen = 0;
+    if (*arm) {
+        fprintf(stderr, "[wp-assert] ARM %s blocked_count=%" PRIu64
+                " (before the excursion %" PRIu64 ")\n", arm,
+                qemu_plugin_spec_syscall_blocked_count(), f2_blocked0);
+    }
+    if (w2) {
+        w2_atexit_id = id;
+        fprintf(stderr, "[wp-assert] W2 ids: install=0x%" PRIx64 " reset=%d:0x%"
+                PRIx64 " shutdown=%d:0x%" PRIx64 " atexit=0x%" PRIx64 "\n",
+                (uint64_t)w2_install_id, w2_reset_calls, w2_reset_id,
+                w2_shutdown_calls, w2_shutdown_id, (uint64_t)w2_atexit_id);
+    }
+    if (fwd_require || tests_run[FWD_SHAPES]) {
+        int t = FWD_SHAPES;
+        if (!tests_run[t]) {
+            fprintf(stderr, "[wp-assert] FAIL %s: never ran (subject "
+                    "absent: marker not reached)\n", test_names[t]);
+            fflush(stderr);
+            abort();
+        }
+        fprintf(stderr, "[wp-assert] %s %-18s %3d checks failed, %d passed\n",
+                checks_failed[t] ? "FAIL" : "PASS", test_names[t],
+                checks_failed[t], checks_passed[t]);
+        if (checks_failed[t]) {
+            fflush(stderr);
+            abort();
+        }
+    }
     for (int t = 1; t < n_tests; t++) {
         seen += tests_run[t];
     }
@@ -1722,6 +2032,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             bdelay_us = atol(kv[1]);
         } else if (g_strcmp0(kv[0], "icount") == 0) {
             icount_clock = g_strcmp0(kv[1], "on") == 0;
+        } else if (g_strcmp0(kv[0], "arm") == 0) {
+            arm = g_strdup(kv[1]);
+        } else if (g_strcmp0(kv[0], "w2") == 0) {
+            w2 = g_strcmp0(kv[1], "on") == 0;
+        } else if (g_strcmp0(kv[0], "fwd") == 0) {
+            fwd_require = g_strcmp0(kv[1], "on") == 0;
         } else {
             fprintf(stderr, "wp-assert: unknown option %s\n", argv[i]);
             return -1;
@@ -1742,11 +2058,20 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else {
             is_system = true;
             n_tests = T_LAST;
-            qemu_plugin_register_vm_reset_cb(id, vm_reset);
+            if (w2) {
+                w2_install_id = id;
+                qemu_plugin_register_vm_reset_cb(id, w2_reset);
+                qemu_plugin_register_vm_shutdown_cb(id, w2_shutdown);
+            } else {
+                qemu_plugin_register_vm_reset_cb(id, vm_reset);
+            }
         }
     }
     if (*control) {
         fprintf(stderr, "[wp-assert] control=%s armed\n", control);
+    }
+    if (*arm) {
+        fprintf(stderr, "[wp-assert] arm=%s armed\n", arm);
     }
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);

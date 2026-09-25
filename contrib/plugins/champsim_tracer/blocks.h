@@ -12,7 +12,9 @@
  * Evidence can arrive late -- an indirect transfer whose earlier runs fell
  * through was assembled as straight-line -- so entries name PROVISIONAL
  * shapes and the dictionary is minted at close, after every shape is
- * re-cut at the final set of block ends (recut()).
+ * re-cut at the final set of block ends (recut()).  A memop travels with
+ * the instruction whose callback delivered it, into whichever entry and
+ * position that instruction lands in.
  */
 #ifndef CHAMPSIM_TRACER_BLOCKS_H
 #define CHAMPSIM_TRACER_BLOCKS_H
@@ -92,6 +94,9 @@ public:
         }
     }
 
+    /* The callback of the pending TB's instruction @m.pos delivered @m. */
+    void memop(uint32_t tid, const Memop &m) { strand(tid).mem.push_back(m); }
+
     /* @tb starts executing in thread @tid. */
     void begin(uint32_t tid, const TbShape *tb) { strand(tid).pending = tb; }
     const TbShape *pending(uint32_t tid) { return strand(tid).pending; }
@@ -106,6 +111,8 @@ public:
     {
         Strand &s = strand(tid);
         const TbShape *tb = s.pending;
+        std::vector<Memop> mem;
+        mem.swap(s.mem);
         if (!tb) {
             return;
         }
@@ -118,11 +125,25 @@ public:
         if (ran < n || (bulk && bulk->pc != insn(last).pc)) {
             bulk = nullptr;
         }
+        /* A bulk op's memops divide in order into one share per unit. */
+        size_t own = std::find_if(mem.begin(), mem.end(), [n](const Memop &m) {
+            return m.pos == n - 1; }) - mem.begin();
+        size_t share = mem.size() - own;
+        if (bulk && bulk->units) {
+            stats.uneven_fanout += share % bulk->units != 0;
+            share /= bulk->units;
+        }
+        const Memop *m = mem.data(), *cut = m + own + share;
         if (bulk && n == 1 && s.reentered == last) {
             /* A re-entered bulk op: every unit is one self-loop entry. */
-            emit_units(tid, last, bulk->units);
+            stats.uneven_fanout += !bulk->units && share;
+            emit_units(tid, last, bulk->units, m, share);
         } else {
             for (size_t i = 0; i < ran && i < n; i++) {
+                for (; m < cut && m->pos <= i; m++) {
+                    s.omem.push_back(*m);
+                    s.omem.back().pos = uint32_t(s.open.size());
+                }
                 s.open.push_back(tb->insns[i]);
                 if (s.slots_due && !--s.slots_due) {
                     ends_block(tb->insns[i]);
@@ -138,7 +159,8 @@ public:
             if (bulk) {
                 ends_block(last);
                 seal(tid, s);
-                emit_units(tid, last, bulk->units ? bulk->units - 1 : 0);
+                emit_units(tid, last, bulk->units ? bulk->units - 1 : 0, m,
+                           share);
             }
         }
         s.reentered = bulk && bulk->reenter ? last : kNone;
@@ -180,7 +202,8 @@ public:
     {
         std::map<Shape, uint32_t> minted;
         std::vector<std::vector<uint32_t>> pieces(shapes_.size());
-        for (const Entry &e : entries_) {
+        for (size_t x = 0; x < entries_.size(); x++) {
+            const Entry &e = entries_[x];
             if (pieces[e.shape].empty()) {     /* every shape has a piece */
                 const Shape &sh = *shapes_[e.shape];
                 Shape cut;
@@ -197,15 +220,27 @@ public:
                 }
                 stats.revised_shapes += pieces[e.shape].size() > 1;
             }
+            size_t m = e.mem;
+            size_t end = x + 1 < entries_.size() ? entries_[x + 1].mem : mems_.size();
+            uint32_t base = 0;
             for (uint32_t t : pieces[e.shape]) {
-                entries.push_back({ e.tid, t });
+                uint32_t len = uint32_t(templates[t].insns.size());
+                size_t b = m;
+                while (m < end && mems_[m].pos < base + len) {
+                    m++;
+                }
+                entries.push_back({ e.tid, t, base, b, m });
+                base += len;
             }
         }
         stats.recut_entries = entries.size() - entries_.size();
     }
 
+    const std::vector<Memop> &memops() const { return mems_; }
+
     struct {
-        uint64_t early_exits, late_ends, revised_shapes, recut_entries;
+        uint64_t early_exits, late_ends, revised_shapes, recut_entries,
+                 uneven_fanout;
     } stats{};
 
 private:
@@ -219,8 +254,10 @@ private:
         Shape open;                 /* the block assembled so far */
         InsnId reentered = kNone;   /* bulk op QEMU will run again */
         size_t slots_due = 0;       /* insns left before a branch lands */
+        std::vector<Memop> mem;     /* the pending TB's, pos = TB index */
+        std::vector<Memop> omem;    /* the open block's, pos = its index */
     };
-    struct Entry { uint32_t tid, shape; };
+    struct Entry { uint32_t tid, shape; size_t mem; };  /* memops from mem */
 
     Strand &strand(uint32_t tid) { return strands_[tid]; }
 
@@ -236,17 +273,25 @@ private:
     void seal(uint32_t tid, Strand &s)
     {
         if (!s.open.empty()) {
-            entries_.push_back({ tid, shape_id(s.open) });
+            entries_.push_back({ tid, shape_id(s.open), mems_.size() });
+            mems_.insert(mems_.end(), s.omem.begin(), s.omem.end());
             s.open.clear();
+            s.omem.clear();
         }
         s.slots_due = 0;
     }
 
-    void emit_units(uint32_t tid, InsnId op, uint64_t units)
+    /* @units self-loop entries of @op, each with the next @share memops. */
+    void emit_units(uint32_t tid, InsnId op, uint64_t units, const Memop *m,
+                    size_t share)
     {
         uint32_t self = shape_id(Shape{ op });
-        for (uint64_t k = 0; k < units; k++) {
-            entries_.push_back({ tid, self });
+        for (uint64_t k = 0; k < units; k++, m += share) {
+            entries_.push_back({ tid, self, mems_.size() });
+            for (size_t j = 0; j < share; j++) {
+                mems_.push_back(m[j]);
+                mems_.back().pos = 0;
+            }
         }
     }
 
@@ -269,6 +314,7 @@ private:
     std::vector<const Shape *> shapes_;
     std::map<uint32_t, Strand> strands_;
     std::vector<Entry> entries_;
+    std::vector<Memop> mems_;       /* every entry's, pos = its index */
     size_t slots_ = 0;              /* learned trailing slots per branch */
 };
 

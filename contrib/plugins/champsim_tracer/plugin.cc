@@ -8,8 +8,10 @@
  * It installs, takes its two options, and publishes a structurally
  * complete segment on every ruled exit route.  In user mode it observes
  * execution and writes the correct-path body: true basic blocks as
- * pc/size templates and one entry per block run (blocks.h).  It claims
- * nothing else about an instruction; system mode keeps an empty body.
+ * pc/size templates and one entry per block run (blocks.h), with the
+ * memory accesses the memory callbacks state (address, size, direction,
+ * value).  It claims nothing else about an instruction; system mode keeps
+ * an empty body.
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
@@ -49,6 +51,7 @@ struct Session {
     cst::BlockAssembler blocks;
     std::vector<std::unique_ptr<cst::TbShape>> tbs;  /* live until exit */
     qemu_plugin_u64 started;    /* per vCPU: insns begun in the current TB */
+    uint64_t no_value = 0;      /* accesses whose value the API withheld */
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -107,17 +110,22 @@ void publish(uint64_t root_phys, const char *route)
     std::vector<cst::WireTemplate> templates;
     std::vector<cst::WireEntry> entries;
     s.blocks.recut(templates, entries);
+    /* The body goes first, so the header can be finalised after it. */
+    size_t slots;
+    cst::Member body = { "body.cst", cst::body_member(root_phys, templates,
+                         entries, s.blocks.memops(), slots).data() };
     const auto &st = s.blocks.stats;
     say("entries=" + std::to_string(entries.size()) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
         std::to_string(st.early_exits) + " late_block_ends=" +
         std::to_string(st.late_ends) + "; revised " +
         std::to_string(st.revised_shapes) + " shapes, " +
-        std::to_string(st.recut_entries) + " entries re-cut");
-    /* The body goes first, so the header can be finalised after it. */
+        std::to_string(st.recut_entries) + " entries re-cut; memops=" +
+        std::to_string(s.blocks.memops().size()) + " max_slots=" +
+        std::to_string(slots) + " no_value=" + std::to_string(s.no_value) +
+        " uneven_fanout=" + std::to_string(st.uneven_fanout));
     std::vector<cst::Member> members = {
-        { "body.cst", cst::body_member(root_phys, entries).data() },
-        { "header.cst", cst::header_member(s.facts, templates).data() },
+        body, { "header.cst", cst::header_member(s.facts, templates, slots).data() },
     };
     std::string err;
     bool ok = true;
@@ -193,6 +201,34 @@ void on_tb_exec(unsigned int vcpu, void *udata)
     s.blocks.begin(vcpu, tb);
 }
 
+/* An access by the instruction at TB index @udata (sections 5.2, 5.3). */
+void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
+            void *udata)
+{
+    Session &s = session();
+    cst::Memop m{};
+    m.addr = vaddr;
+    m.pos = uint32_t(reinterpret_cast<uintptr_t>(udata));
+    m.size = uint8_t(1u << qemu_plugin_mem_size_shift(info));
+    m.store = qemu_plugin_mem_is_store(info);
+    qemu_plugin_mem_value v = qemu_plugin_mem_get_value(info);
+    m.data_ok = v.type != QEMU_PLUGIN_MEM_VALUE_INVALID;  /* wider than 128 */
+    m.hi = v.type == QEMU_PLUGIN_MEM_VALUE_U128 ? v.data.u128.high : 0;
+    switch (v.type) {
+    case QEMU_PLUGIN_MEM_VALUE_U8:   m.lo = v.data.u8; break;
+    case QEMU_PLUGIN_MEM_VALUE_U16:  m.lo = v.data.u16; break;
+    case QEMU_PLUGIN_MEM_VALUE_U32:  m.lo = v.data.u32; break;
+    case QEMU_PLUGIN_MEM_VALUE_U64:  m.lo = v.data.u64; break;
+    case QEMU_PLUGIN_MEM_VALUE_U128: m.lo = v.data.u128.low; break;
+    default:                         break;
+    }
+    std::lock_guard<std::mutex> guard(s.lock);
+    if (!s.published) {
+        s.no_value += !m.data_ok;
+        s.blocks.memop(vcpu, m);
+    }
+}
+
 /* A syscall ends the block of the instruction that raised it. */
 void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
                 uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -237,10 +273,10 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
         }
         qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
             insn, QEMU_PLUGIN_INLINE_STORE_U64, s.started, i + 1);
-        /* The engine counts a bulk op's units (FEAT_MOPS) only while the
-         * op carries a memory callback; a no-op one arms the count. */
-        qemu_plugin_register_vcpu_mem_inline_per_vcpu(
-            insn, QEMU_PLUGIN_MEM_RW, QEMU_PLUGIN_INLINE_ADD_U64, s.started, 0);
+        /* Also what arms the engine's count of a bulk op's units (MOPS). */
+        qemu_plugin_register_vcpu_mem_cb(insn, on_mem, QEMU_PLUGIN_CB_NO_REGS,
+                                         QEMU_PLUGIN_MEM_RW,
+                                         reinterpret_cast<void *>(uintptr_t(i)));
     }
     if (n == 0) {
         return;

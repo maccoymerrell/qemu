@@ -29,8 +29,10 @@ public:
     void f64(double v);
     void uleb(uint64_t v);
     void sleb(int64_t v);
+    void sleb_wide(const uint64_t limb[3]);    /* 192-bit two's complement */
     void str(const std::string &s);        /* string  := len:ULEB bytes */
     void section(const Bytes &payload);    /* section := len:ULEB payload */
+    void raw(const Bytes &o) { buf_.insert(buf_.end(), o.buf_.begin(), o.buf_.end()); }
     const std::vector<uint8_t> &data() const { return buf_; }
 
 private:
@@ -57,19 +59,40 @@ int isa_for_target(const std::string &target_name);
 struct WireInsn { uint64_t pc; uint8_t size; const uint8_t *bytes; };
 struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
 
-/* One body entry: the block ran whole in thread @tid (section 4.2). */
-struct WireEntry { uint32_t tid, template_id; };
+/*
+ * One memory access as the callback stated it (sections 5.2, 5.3): @pos is
+ * the instruction's index in its block, @data_ok says a value came with it.
+ */
+struct Memop {
+    uint64_t addr, lo, hi;
+    uint32_t pos;
+    uint8_t size;
+    bool store, data_ok;
+};
 
-/* The header member: magic through the templates section (ids = index). */
+/*
+ * One body entry: the block ran whole in thread @tid (section 4.2), with
+ * the memops [begin, end) of the memop array; @base is the block position
+ * of the entry's first instruction in the positions those memops carry.
+ */
+struct WireEntry { uint32_t tid, template_id, base; size_t begin, end; };
+
+/*
+ * The header member: magic through the templates section (ids = index).
+ * @slots is how many load/store slots the body can address.
+ */
 Bytes header_member(const HeaderFacts &facts,
-                    const std::vector<WireTemplate> &templates);
+                    const std::vector<WireTemplate> &templates, size_t slots);
 
 /*
  * The body member: lead magic, the opening (asid, thread) declaration of
- * section 4, the entries, END carrying their count, trailing magic.
- * @root_phys is the asid-0 label (section 4.1a).
+ * section 4, the entries with their memops as field deltas (section 5),
+ * END carrying their count, trailing magic.  @root_phys is the asid-0
+ * label (section 4.1a).  Returns in @slots the slots it addressed.
  */
-Bytes body_member(uint64_t root_phys, const std::vector<WireEntry> &entries);
+Bytes body_member(uint64_t root_phys, const std::vector<WireTemplate> &templates,
+                  const std::vector<WireEntry> &entries,
+                  const std::vector<Memop> &memops, size_t &slots);
 
 } /* namespace cst */
 

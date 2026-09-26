@@ -51,6 +51,7 @@ struct HeaderFacts {
     std::string datetime;
     std::string comment;
     std::string target_name;
+    bool system = false;    /* system mode: SYSTEM and FAULT are claimed */
 };
 
 /* Returns the TraceISA byte for a QEMU target name, or -1 if not traced. */
@@ -89,14 +90,16 @@ enum : uint8_t {
  * every dependency mask of the instruction spans.  It is NOT a memop count:
  * how many memops an execution performed is that entry's N_LOADS / N_STORES.
  * Filled as the widest count any one entry delivered, so it never under-
- * sizes a mask a delivered memop needs.
+ * sizes a mask a delivered memop needs.  @sys: CST_INSN_FLAG_SYSTEM.
  */
 struct WireInsn {
     uint64_t pc; uint8_t size; const uint8_t *bytes; uint32_t id; bool fanout;
     uint8_t dep_mask_len[2];
     const Regs *regs;
+    bool sys;
 };
-struct WireTemplate { std::vector<WireInsn> insns; bool terminated; };
+/* @bpos: the instruction whose transfer ends it (-1: none, a page split) */
+struct WireTemplate { std::vector<WireInsn> insns; bool terminated; int bpos; };
 
 /*
  * The should-be-static tripwire (maintainer ruling 2026-09-25): per
@@ -143,7 +146,10 @@ public:
  * @tid, with the memops at [begin, end) of the memop spill; @base is the
  * block position of the entry's first instruction in the positions those
  * memops carry.  @stop cuts the executed range (0: whole), @fault is the
- * CST_FID_BB_FAULT_INSN (-1: none), @flags the bb_flag bits.
+ * CST_FID_BB_FAULT_INSN (-1: none), @flags the bb_flag bits.  @asid is
+ * the address-space label, @depth the fault depth; the branch at @bpos
+ * (-1: no outcome) sent control to @succ (5.6); @rf - 1 indexes the
+ * REGFILE the entry's context opens with (0: none).
  */
 struct WireEntry {
     uint32_t tid, template_id, base;
@@ -151,6 +157,9 @@ struct WireEntry {
     uint32_t stop;
     int32_t fault;
     uint8_t flags;
+    uint64_t asid = 0, succ = 0;
+    uint32_t depth = 0, rf = 0;
+    int32_t bpos = -1;
 };
 /* Where the body's entries come from: a CP entry and its chain, in order */
 using EntrySink = std::function<void(const WireEntry &, const std::vector<WireEntry> &)>;
@@ -169,17 +178,22 @@ Bytes header_member(const HeaderFacts &facts,
  * opening (asid, thread) declaration of section 4, each entry @feed hands
  * over with its memops as field deltas (section 5) and, with @wp, its
  * chain (section 4.3), then END carrying their count, @count, and the
- * trailing magic.  @root_phys is the asid-0 label (section 4.1a).  Returns
+ * trailing magic.  Each entry's context is switched to as it changes: asid
+ * labels are indexed at first sighting, and with @ordinals so are thread
+ * ids (system mode; user mode's are the thread indices themselves).  Field
+ * state is keyed (asid index, thread), and @regfiles[rf - 1] goes out as
+ * REGFILE ahead of the entry that names it.  Returns
  * in @slots the slots it addressed, in each template instruction's
  * @dep_mask_len its dependency mask lengths, and in @census every
  * execution's memop counts.  It keeps the field state in RAM -- threads x
  * static code -- and nothing that grows with the body.  False: a write
  * failed.
  */
-bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &templates,
+bool body_member(int fd, std::vector<WireTemplate> &templates,
                  const EntryFeed &feed, const MemSpill &memops,
                  size_t &slots, size_t &count, bool wp, MemopCensus &census,
-                 const Spill<uint8_t> &arena, int isa);
+                 const Spill<uint8_t> &arena, int isa, bool ordinals,
+                 const std::vector<Bytes> &regfiles);
 
 } /* namespace cst */
 

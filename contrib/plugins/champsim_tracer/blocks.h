@@ -34,14 +34,30 @@
 
 namespace cst {
 
+/* @sys: executed above user privilege; the same bytes below it are another */
 struct Insn {
     uint64_t pc;
     uint8_t size;
     uint8_t bytes[16];
+    bool sys;
     bool operator<(const Insn &o) const
     {
         return pc != o.pc ? pc < o.pc : size != o.size ? size < o.size :
-               std::memcmp(bytes, o.bytes, size) < 0;
+               sys != o.sys ? sys < o.sys : std::memcmp(bytes, o.bytes, size) < 0;
+    }
+};
+
+/*
+ * What a block executed in (section 4.1): the thread and address-space
+ * label, the fault depth (5.7) and the privilege.  A change cuts the block.
+ */
+struct Ctx {
+    uint64_t asid = 0;
+    uint32_t tid = 0, depth = 0;
+    bool sys = false;
+    bool operator!=(const Ctx &o) const
+    {
+        return asid != o.asid || tid != o.tid || depth != o.depth || sys != o.sys;
     }
 };
 
@@ -73,7 +89,8 @@ struct BulkRun {
 class BlockAssembler {
 public:
     static constexpr uint32_t kWp = 1u << 31;   /* a thread's WP strand */
-    enum : uint8_t { kFault = 1, kUnavail = 2, kFirstUnavail = 4 };  /* bb_flag */
+    enum : uint8_t { kFault = 1, kUnavail = 2, kFirstUnavail = 4, kThreadEnd = 8,
+                     kUnresolved = 16 };    /* bb_flag */
 
     InsnId intern(const Insn &i)
     {
@@ -100,10 +117,12 @@ public:
      * A TB's first execution states what its translation exposed.  Not at
      * translation: the translation callback runs under QEMU's mmap_lock,
      * which a wrong-path excursion takes while holding the plugin's lock.
+     * A TB is translated for one privilege; @sys is the one it runs at.
      */
-    void absorb(TbShape &tb)
+    void absorb(TbShape &tb, bool sys)
     {
         for (size_t k = 0; k < tb.raw.size(); k++) {
+            tb.raw[k].sys = sys;
             InsnId id = intern(tb.raw[k]);
             tb.insns.push_back(id);
             if (!seen_[id]) {
@@ -139,6 +158,9 @@ public:
     void translated(const TbShape &tb)
     {
         int tail = int(tb.insns.size()) - 1 - tb.transfer;
+        if (tb.transfer >= 0) {
+            marks_[tb.insns[tb.transfer]] |= kXfer;
+        }
         if (tb.transfer >= 0 && tail > 0) {
             slots_ = std::max(slots_, size_t(tail));
         }
@@ -153,6 +175,21 @@ public:
     /* @tb starts executing in thread @tid. */
     void begin(uint32_t tid, const TbShape *tb) { strand(tid).pending = tb; }
     const TbShape *pending(uint32_t tid) { return strand(tid).pending; }
+
+    /*
+     * Strand @tid runs in context @c from its next TB on; the block it has
+     * open is cut where the context changed.  @rf (register file index + 1)
+     * rides the next entry sealed, the context's first.
+     */
+    void context(uint32_t tid, const Ctx &c, uint32_t rf = 0)
+    {
+        Strand &s = strand(tid);
+        if (c != s.ctx) {
+            seal(tid, s, 0);
+            s.ctx = c;
+        }
+        s.rf = rf ? rf : s.rf;
+    }
 
     /*
      * The pending TB of @tid is over: @ran of its instructions started,
@@ -182,6 +219,8 @@ public:
             bulk = nullptr;
         }
         marks_[last] |= bulk ? kFanout : 0;     /* variable memops: expected */
+        /* what ran after the TB's last instruction: a bulk op's next unit first */
+        uint64_t after = bulk && bulk->units > 1 ? insn(last).pc : next_pc;
         /* A bulk op's register values follow its last unit, not its shares */
         std::vector<Memop> tail;
         while (bulk && !mem.empty() && mem.back().reg && mem.back().pos == n - 1) {
@@ -200,7 +239,7 @@ public:
         if (bulk && n == 1 && s.reentered == last) {
             /* A re-entered bulk op: every unit is one self-loop entry. */
             stats.uneven_fanout += !bulk->units && share;
-            emit_units(tid, last, bulk->units, m, share);
+            emit_units(tid, last, bulk->units, m, share, next_pc);
         } else {
             for (size_t i = 0; i < ran && i < n; i++) {
                 for (; m < cut && m->pos <= i; m++) {
@@ -217,19 +256,20 @@ public:
                 if (s.slots_due && !--s.slots_due) {
                     ends_block(tb->insns[i]);
                 }
-                if (ends(tb->insns[i])) {
-                    seal(tid, s);
+                if (ends(tb->insns[i])) {   /* where the next one ran, if seen */
+                    seal(tid, s, i + 1 < ran ? insn(tb->insns[i + 1]).pc :
+                                 i + 1 == n ? after : 0);
                 }
             }
             if (ran == n && tb->transfer == int(n) - 1 && slots_ &&
                 !ends(last)) {
                 s.slots_due = slots_;   /* the slots run in the next TB */
             }
-            if (bulk) {
+            if (bulk) {     /* each unit loops to the op; the last leaves */
                 ends_block(last);
-                seal(tid, s);
+                seal(tid, s, after);
                 emit_units(tid, last, bulk->units ? bulk->units - 1 : 0, m,
-                           share);
+                           share, next_pc);
             }
         }
         if (!tail.empty() && (bulk->units || !(n == 1 && s.reentered == last))) {
@@ -243,37 +283,68 @@ public:
         }
         s.reentered = bulk && bulk->reenter ? last : kNone;
         if (ran < n || skipped) {   /* this execution left the block here */
-            seal(tid, s);
+            seal(tid, s, 0);
         } else if (next_pc && !s.open.empty()) {
             const Insn &l = insn(last);
             if (next_pc != l.pc + l.size) {
                 ends_block(last);
-                seal(tid, s);
+                seal(tid, s, next_pc);
             } else {
                 marks_[last] |= kFolded;
             }
         }
     }
 
-    /* The thread is gone: its unfinished block is published as it is. */
-    void finish(uint32_t tid, size_t ran)
+    /*
+     * The thread is gone: its unfinished block is published as it is, the
+     * last its context contributes (THREAD_END).  Returns that entry, or
+     * kNoEntry when nothing was pending.
+     */
+    size_t finish(uint32_t tid, size_t ran)
     {
+        size_t n = entries_.size();
         retire(tid, ran, nullptr, 0);
-        seal(tid, strand(tid));
+        seal(tid, strand(tid), 0);
+        if (entries_.size() == n) {
+            return kNoEntry;
+        }
+        Entry e = entries_.back();
+        e.flags |= kThreadEnd;
+        entries_.set(entries_.size() - 1, e);
+        return entries_.size() - 1;
     }
 
-    /* Every thread stops; @ran(tid) is how far its last TB got. */
+    /*
+     * Every thread stops; @ran(tid) is how far its last TB got.  Two
+     * strands closing in one context (a shared tid) end it once, last.
+     */
     template <typename Ran> void finish_all(Ran ran)
     {
+        std::vector<size_t> ended;
         for (auto &s : strands_) {
-            finish(s.first, ran(s.first));
+            ended.push_back(finish(s.first, ran(s.first)));
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> seen;
+        std::sort(ended.rbegin(), ended.rend());
+        for (size_t i : ended) {
+            Entry e = i != kNoEntry ? entries_[i] : Entry{};
+            std::pair<uint32_t, uint64_t> c{ e.ctx.tid, e.ctx.asid };
+            if (i != kNoEntry && std::count(seen.begin(), seen.end(), c)) {
+                e.flags &= ~kThreadEnd;
+                entries_.set(i, e);
+            }
+            if (i != kNoEntry) {
+                seen.push_back(c);
+            }
         }
     }
+    size_t entries() const { return entries_.size(); }
 
     /* A wrong-path excursion begins on @wtid's strand, after CP entry @cp. */
     bool wp_begin(uint32_t wtid, uint32_t cp)
     {
         strands_[wtid] = Strand();
+        strands_[wtid].ctx = strand(cp).ctx;    /* the thread's real id */
         chain_ = wp_.size();
         wp_insns_ = 0;
         return (cp_ = strand(cp).last) != kNoEntry;
@@ -292,7 +363,7 @@ public:
     {
         Strand &s = strand(wtid);
         if (unavail) {
-            seal(wtid, s);
+            seal(wtid, s, 0);
         }
         Entry e = entries_[cp_];
         e.wp_b = chain_;
@@ -348,11 +419,22 @@ public:
                     m = at;
                 }
                 bool here = e.fault >= int32_t(base) && e.fault < int32_t(base + len);
-                out.push_back({ e.tid & ~kWp, t, base, b, m, 0,
-                                here ? e.fault - int32_t(base) : -1, 0 });
+                WireEntry w{ e.ctx.tid, t, base, b, m, 0,
+                             here ? e.fault - int32_t(base) : -1, 0 };
+                w.asid = e.ctx.asid;
+                w.depth = e.ctx.depth;
+                w.rf = base ? 0 : e.rf;
+                if (templates[t].bpos >= 0) {   /* where the next one ran */
+                    const Shape &sh = *shapes_[e.shape];
+                    size_t k = base + len;
+                    w.bpos = templates[t].bpos;
+                    w.succ = k < sh.size() ? insn(sh[k]).pc : e.fault < 0 ? e.succ : 0;
+                    w.flags = w.succ ? 0 : kUnresolved;
+                }
+                out.push_back(w);
                 base += len;
             }
-            out.back().flags = e.flags & ~kFault;
+            out.back().flags |= e.flags & ~kFault;
             stats.recut_entries += pieces[e.shape].size() - 1;
         };
         std::vector<WireEntry> pieces_of, chain, wp, none;
@@ -373,6 +455,10 @@ public:
                 size_t len = templates[c.template_id].insns.size();
                 if (sum + len > depth && c.fault < 0) {
                     c.stop = uint32_t(depth - sum);
+                    if (c.bpos >= int32_t(c.stop)) {   /* the cut stops short */
+                        c.bpos = -1;
+                        c.flags &= ~kUnresolved;
+                    }
                     size_t end = c.begin;   /* past the last memop it keeps */
                     for (size_t at = c.begin; at < c.end;) {
                         end = mems_.read(at).pos < c.base + c.stop ? at : end;
@@ -401,7 +487,8 @@ public:
 private:
     static constexpr InsnId kNone = ~InsnId(0);
     static constexpr size_t kNoEntry = ~size_t(0);
-    enum : uint8_t { kEnds = 1, kFolded = 2, kFanout = 4 };  /* marks_ bits */
+    /* marks_ bits; kXfer: the translator lowered a transfer at it */
+    enum : uint8_t { kEnds = 1, kFolded = 2, kFanout = 4, kXfer = 8 };
 
     bool ends(InsnId id) const { return marks_[id] & kEnds; }
 
@@ -414,6 +501,8 @@ private:
         std::vector<Memop> omem;    /* the open block's, pos = its index */
         int32_t fault = -1;         /* open block's first faulting insn */
         size_t last = kNoEntry;     /* its latest sealed entry */
+        Ctx ctx;                    /* the context it runs in */
+        uint32_t rf = 0;            /* for the next entry: its REGFILE */
     };
     /* memops [mem_b, mem_e); a CP entry's chain is wp_[wp_b, wp_e) */
     struct Entry {
@@ -421,9 +510,20 @@ private:
         size_t mem_b, mem_e, wp_b = 0, wp_e = 0;
         int32_t fault = -1;
         uint8_t flags = 0;
+        Ctx ctx;
+        uint64_t succ = 0;          /* the pc run next, when observed */
+        uint32_t rf = 0;
     };
 
-    Strand &strand(uint32_t tid) { return strands_[tid]; }
+    Strand &strand(uint32_t tid)
+    {
+        auto it = strands_.find(tid);
+        if (it == strands_.end()) {
+            it = strands_.emplace(tid, Strand()).first;
+            it->second.ctx.tid = tid & ~kWp;
+        }
+        return it->second;
+    }
 
     uint32_t shape_id(const Shape &sh)
     {
@@ -434,7 +534,8 @@ private:
         return it.first->second;
     }
 
-    void seal(uint32_t tid, Strand &s)
+    /* The open block is an entry; @succ is the pc that ran next (0: unseen) */
+    void seal(uint32_t tid, Strand &s, uint64_t succ)
     {
         if (!s.open.empty()) {
             size_t b = mems_.size();
@@ -443,6 +544,7 @@ private:
             }
             Entry e{ tid, shape_id(s.open), b, mems_.size() };
             e.fault = s.fault;
+            e.succ = succ;
             add(tid, e, s.open.size());
             s.open.clear();
             s.omem.clear();
@@ -457,8 +559,12 @@ private:
         mems_.push_back(m);
         stats.memops += !m.reg;
     }
-    void add(uint32_t tid, const Entry &e, size_t len)
+    void add(uint32_t tid, Entry e, size_t len)
     {
+        Strand &s = strand(tid);
+        e.ctx = s.ctx;
+        e.rf = s.rf;
+        s.rf = 0;
         list(tid).push_back(e);
         strand(tid).last = list(tid).size() - 1;
         wp_insns_ += tid & kWp ? len : 0;
@@ -466,7 +572,7 @@ private:
 
     /* @units self-loop entries of @op, each with the next @share memops. */
     void emit_units(uint32_t tid, InsnId op, uint64_t units, const Memop *m,
-                    size_t share)
+                    size_t share, uint64_t next_pc)
     {
         uint32_t self = shape_id(Shape{ op });
         for (uint64_t k = 0; k < units; k++, m += share) {
@@ -480,6 +586,7 @@ private:
             }
             Entry e{ tid, self, b, mems_.size() };
             e.fault = fault ? 0 : -1;
+            e.succ = k + 1 < units ? insn(op).pc : next_pc;
             add(tid, e, 1);
         }
     }
@@ -490,9 +597,12 @@ private:
         for (InsnId id : sh) {
             const Insn &i = insn(id);
             t.insns.push_back({ i.pc, i.size, i.bytes, id,
-                                (marks_[id] & kFanout) != 0, {}, &regs[id] });
+                                (marks_[id] & kFanout) != 0, {}, &regs[id], i.sys });
         }
         t.terminated = ends(sh.back());
+        size_t n = sh.size();   /* the transfer ending it: before its slot */
+        t.bpos = !t.terminated ? -1 :
+                 int(n - 1 - (n > 1 && slots_ && (marks_[sh[n - 2]] & kXfer)));
         return t;
     }
 

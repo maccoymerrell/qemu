@@ -170,9 +170,12 @@ enum : uint8_t {
 };
 
 constexpr uint8_t kUnclassified = 0;    /* opcode and branch_type value */
+constexpr uint8_t kTerminal = 1;        /* branch_type: the block's transfer */
 constexpr uint8_t kFlagMemData = 1;     /* header_flag CST_FLAG_MEM_DATA */
 constexpr uint8_t kFlagRegData = 2;     /* header_flag CST_FLAG_REG_DATA */
 constexpr uint8_t kFlagWp = 8;          /* header_flag CST_FLAG_WP */
+constexpr uint8_t kFlagFault = 16;      /* header_flag CST_FLAG_FAULT */
+constexpr uint8_t kInsnSystem = 128;    /* insn_flag CST_INSN_FLAG_SYSTEM */
 constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
 
 /*
@@ -181,10 +184,11 @@ constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
  * interleaved by slot as section 5.1's layout intent describes.
  */
 enum : uint32_t {
-    kFidStop = 1, kFidFlags = 2, kFidFaultInsn = 4,
+    kFidStop = 1, kFidFlags = 2, kFidDepth = 3, kFidFaultInsn = 4,
     kFidNLoads = 5, kFidNStores = 6, kFidSlot0 = 7,
     /* after every memop slot: METAFLAGS, then DST_REG{k}, DST_REG_WIDTH{k} */
     kFidMeta = kFidSlot0 + 6 * 512, kFidReg0,
+    kFidTaken = kFidReg0 + 512, kFidTarget,     /* past every register pair */
 };
 const char *const kSlotFamilies[] = {
     "CST_FID_LOAD_ADDR", "CST_FID_STORE_ADDR", "CST_FID_LOAD_DATA",
@@ -250,7 +254,7 @@ MapEntries numbered(std::initializer_list<const char *> names, bool bits,
  * ones section 2 says the writer assigns.
  */
 Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
-                    bool regdata)
+                    bool regdata, bool system)
 {
     std::map<unsigned, bool> regs;   /* every id the templates use */
     size_t ndst = 0;
@@ -272,6 +276,8 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                                  "CST_FID_BB_FLAGS", "CST_FID_BB_FAULT_DEPTH",
                                  "CST_FID_BB_FAULT_INSN" }, false);
     fids.push_back({ kFidNLoads, "CST_FID_N_LOADS" });
+    fids.push_back({ kFidTaken, "CST_FID_BRANCH_TAKEN" });   /* always (5.6) */
+    fids.push_back({ kFidTarget, "CST_FID_BRANCH_TARGET" });
     fids.push_back({ kFidNStores, "CST_FID_N_STORES" });
     for (size_t k = 0; k < slots; k++) {
         for (int f = 0; f < 6; f++) {
@@ -287,6 +293,17 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                              "CST_FID_DST_REG_WIDTH" + std::to_string(k) });
         }
     }
+    /* system mode's own names; a user trace omits them (section 2) */
+    MapEntries hflags = numbered({ "CST_FLAG_MEM_DATA", "CST_FLAG_REG_DATA",
+                                   "CST_FLAG_PROFILE", "CST_FLAG_WP" }, true);
+    MapEntries iflags = numbered({ "CST_INSN_FLAG_BRANCH_COND", "CST_INSN_FLAG_HAS_IMM",
+                                   "CST_INSN_FLAG_ATOMIC", "CST_INSN_FLAG_VEC",
+                                   "CST_INSN_FLAG_LANE_PARALLEL",
+                                   "CST_INSN_FLAG_HAS_DEP_BLOCK" }, true, 3);
+    if (system) {
+        hflags.push_back({ kFlagFault, "CST_FLAG_FAULT" });
+        iflags.push_back({ kInsnSystem, "CST_INSN_FLAG_SYSTEM" });
+    }
     const std::pair<const char *, MapEntries> maps[] = {
         { "body_tag", { { kTagEnd, "BODY_TAG_END" },
                         { kTagEntry, "BODY_TAG_ENTRY" },
@@ -294,17 +311,8 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                         { kTagIframe, "BODY_TAG_IFRAME" },
                         { kTagRegfile, "BODY_TAG_REGFILE" },
                         { kTagAsid, "BODY_TAG_ASID_SWITCH" } } },
-        { "header_flag", numbered({ "CST_FLAG_MEM_DATA", "CST_FLAG_REG_DATA",
-                                    "CST_FLAG_PROFILE", "CST_FLAG_WP" },
-                                  true) },
-        /* Bit 3 stays unassigned: section 2 reserves it. */
-        { "insn_flag", numbered({ "CST_INSN_FLAG_BRANCH_COND",
-                                  "CST_INSN_FLAG_HAS_IMM",
-                                  "CST_INSN_FLAG_ATOMIC",
-                                  "CST_INSN_FLAG_VEC",
-                                  "CST_INSN_FLAG_LANE_PARALLEL",
-                                  "CST_INSN_FLAG_HAS_DEP_BLOCK" },
-                                true, 3) },
+        { "header_flag", hflags },
+        { "insn_flag", iflags },    /* bit 3 stays unassigned: section 2 */
         { "dep_block_flag", numbered({ "CST_DEP_BLOCK_HAS_REG",
                                        "CST_DEP_BLOCK_HAS_ADDR" }, true) },
         { "bb_flag", numbered({ "CST_BB_FLAG_SYNTHETIC_FAULT",
@@ -318,11 +326,17 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
         { "field_id", fids },
         { "reg", names },
         /*
-         * Every template instruction carries these two values: this
-         * writer classifies nothing yet, and says so by name.
+         * Every template instruction carries this opcode: this writer
+         * classifies nothing yet, and says so by name.
          */
         { "opcode", { { kUnclassified, "GEN_OP_UNKNOWN" } } },
-        { "branch_type", { { kUnclassified, "BRANCH_UNCLASSIFIED" } } },
+        /*
+         * The one fact about branches claimed: which instruction's
+         * transfer ended the block -- where section 5.6's outcome rides,
+         * and how a reader finds it.  Its class stays unclaimed.
+         */
+        { "branch_type", { { kUnclassified, "BRANCH_UNCLASSIFIED" },
+                           { kTerminal, "BRANCH_TERMINAL" } } },
     };
     Bytes b;
     b.uleb(sizeof(maps) / sizeof(maps[0]));
@@ -353,8 +367,8 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         b.uleb(i.pc - prev);
         prev = i.pc;
         b.u8(kUnclassified);    /* opcode */
-        b.u8(kUnclassified);    /* branch_type */
-        b.u8(0);                /* flags: unclaimed */
+        b.u8(&i - t.insns.data() == t.bpos ? kTerminal : kUnclassified);
+        b.u8(i.sys ? kInsnSystem : 0);  /* flags: the privilege it ran at */
         b.u8(uint8_t(i.regs->src.size()));
         b.u8(uint8_t(i.regs->dst.size()));
         for (const auto *l : { &i.regs->src, &i.regs->dst }) {
@@ -373,22 +387,23 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
 }
 
 /*
- * One overlay of field state (section 5): (thread, template, ipos, fid) ->
- * value.  Per thread, as the decoder keys it (Step 6: overlays key on the
- * thread id).
+ * One overlay of field state (section 5): (asid index, thread, template,
+ * ipos, fid) -> value.  Per context, as section 5 keys it.
  */
 struct Cell {
-    uint32_t tid, tmpl, ipos, fid;
+    uint32_t asid, tid, tmpl, ipos, fid;
     bool operator==(const Cell &o) const
     {
-        return tid == o.tid && tmpl == o.tmpl && ipos == o.ipos && fid == o.fid;
+        return asid == o.asid && tid == o.tid && tmpl == o.tmpl &&
+               ipos == o.ipos && fid == o.fid;
     }
 };
 struct CellHash {
     size_t operator()(const Cell &c) const
     {
-        return std::hash<uint64_t>()((uint64_t(c.tid) << 44) ^ (uint64_t(c.tmpl) << 24) ^
-                                     (uint64_t(c.ipos) << 12) ^ c.fid);
+        return std::hash<uint64_t>()((uint64_t(c.asid) << 54) ^ (uint64_t(c.tid) << 44) ^
+                                     (uint64_t(c.tmpl) << 24) ^ (uint64_t(c.ipos) << 12) ^
+                                     c.fid);
     }
 };
 using Value = std::array<uint64_t, 8>;     /* 512 bits, little-endian limbs */
@@ -400,8 +415,9 @@ using Overlay = std::unordered_map<Cell, Value, CellHash>;
  */
 class Section {
 public:
-    Section(Overlay &own, const Overlay *fallback, uint32_t tid, uint32_t tmpl)
-        : own_(own), fb_(fallback), tid_(tid), tmpl_(tmpl) {}
+    Section(Overlay &own, const Overlay *fallback, uint32_t asid, uint32_t tid,
+            uint32_t tmpl)
+        : own_(own), fb_(fallback), asid_(asid), tid_(tid), tmpl_(tmpl) {}
 
     void put(uint32_t ipos, uint32_t fid, uint64_t lo, uint64_t hi = 0,
              uint64_t def = 0)
@@ -411,7 +427,7 @@ public:
 
     void put(uint32_t ipos, uint32_t fid, const Value &v, const Value &def)
     {
-        Cell c{ tid_, tmpl_, ipos, fid };
+        Cell c{ asid_, tid_, tmpl_, ipos, fid };
         Value p = def;
         auto it = own_.find(c);
         if (it != own_.end()) {
@@ -423,14 +439,14 @@ public:
         if (v == p) {
             return;
         }
-        Record x{ ipos, fid, {} };  /* two's-complement difference, sign limb */
+        Record x{ ipos, fid, {} };  /* (v - p) mod 2**512, as an i512 */
         uint64_t borrow = 0;
         for (int k = 0; k < 8; k++) {
             uint64_t t = v[k] - p[k];
             x.delta[k] = t - borrow;
             borrow = v[k] < p[k] || t < borrow;
         }
-        x.delta[8] = -borrow;
+        x.delta[8] = uint64_t(int64_t(x.delta[7]) >> 63);
         recs_.push_back(x);
         own_[c] = v;
     }
@@ -456,7 +472,7 @@ private:
     struct Record { uint32_t ipos, fid; uint64_t delta[9]; };
     Overlay &own_;
     const Overlay *fb_;
-    uint32_t tid_, tmpl_;
+    uint32_t asid_, tid_, tmpl_;
     std::vector<Record> recs_;
 };
 
@@ -491,13 +507,14 @@ void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
  * (section 5.7).
  */
 Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
+                    uint32_t asid, uint32_t tid,
                     std::vector<WireTemplate> &templates,
                     const MemSpill &memops, size_t &slots,
                     MemopCensus &census, const Spill<uint8_t> &arena, int isa)
 {
     WireTemplate &t = templates[e.template_id];
     uint32_t n = uint32_t(t.insns.size()), stop = e.stop ? e.stop : n;
-    Section sec(own, fallback, e.tid, e.template_id);
+    Section sec(own, fallback, asid, tid, e.template_id);
     size_t m = e.begin, next = m;
     Memop x = m < e.end ? memops.read(next) : Memop{};
     for (uint32_t ipos = 0; ipos < stop; ipos++) {
@@ -534,8 +551,17 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
         row.hist[int32_t(ipos) == e.fault ? 2 : fallback != nullptr]
             [uint64_t(dir[0].size()) << 32 | dir[1].size()]++;
     }
+    if (e.bpos >= 0 && e.succ) {    /* 5.6: direction, signed displacement */
+        const WireInsn &l = t.insns.back(), &br = t.insns[e.bpos];
+        Value d;
+        d.fill(e.succ < br.pc ? ~uint64_t(0) : 0);
+        d[0] = e.succ - br.pc;
+        sec.put(e.bpos, kFidTaken, e.succ != l.pc + l.size);
+        sec.put(e.bpos, kFidTarget, d, Value{});
+    }
     sec.put(n, kFidStop, stop, 0, n);
     sec.put(n, kFidFlags, e.flags);
+    sec.put(n, kFidDepth, e.depth);
     if (e.fault >= 0) {
         sec.put(n, kFidFaultInsn, uint64_t(e.fault));
     }
@@ -552,7 +578,8 @@ Bytes header_member(const HeaderFacts &facts,
     h.u32(kMagic);
     h.u8(facts.isa);
     /* flags: memop values, register values, and the wrong-path chains */
-    h.u8(kFlagMemData | (regdata ? kFlagRegData : 0) | (wp ? kFlagWp : 0));
+    h.u8(kFlagMemData | (regdata ? kFlagRegData : 0) | (wp ? kFlagWp : 0) |
+         (facts.system ? kFlagFault : 0));
     h.uleb(0);          /* start_insn: no window, the timeline starts at 0 */
     h.uleb(0);          /* warmup_insns: none configured */
     h.uleb(0);          /* total_target_insns: 0 = unbounded */
@@ -561,7 +588,8 @@ Bytes header_member(const HeaderFacts &facts,
     h.str(facts.datetime);
     h.str(facts.comment);
     h.str(facts.target_name);
-    h.section(encoding_maps(std::min(slots, kSlotCount), templates, regdata));
+    h.section(encoding_maps(std::min(slots, kSlotCount), templates, regdata,
+                            facts.system));
     h.uleb(0);          /* warmup_end_trace_insn_idx: no warmup, ends at 0 */
     h.uleb(templates.size());   /* templates section, to member EOF */
     for (size_t id = 0; id < templates.size(); id++) {
@@ -570,10 +598,11 @@ Bytes header_member(const HeaderFacts &facts,
     return h;
 }
 
-bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &templates,
+bool body_member(int fd, std::vector<WireTemplate> &templates,
                  const EntryFeed &feed, const MemSpill &memops,
                  size_t &slots, size_t &count, bool wp, MemopCensus &census,
-                 const Spill<uint8_t> &arena, int isa)
+                 const Spill<uint8_t> &arena, int isa, bool ordinals,
+                 const std::vector<Bytes> &regfiles)
 {
     Bytes b;
     bool ok = true;
@@ -584,27 +613,47 @@ bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &template
         }
     };
     b.u32(kMagic);
-    b.u8(kTagAsid);     /* opening context, section 4: asid index 0 ... */
-    b.sleb(0);
-    b.u64(root_phys);   /* ... whose first sighting carries its label */
-    b.u64(0);           /* sig: reserved, always 0 */
-    b.u8(kTagThread);   /* ... then thread 0 */
-    b.sleb(0);
     Overlay cp, spec;   /* WP resolves WP -> CP -> default (section 5) */
     slots = count = 0;
-    int64_t tid = 0, tmpl = 0;
+    int64_t tid = 0, asid = 0, tmpl = 0;
+    std::map<uint64_t, uint32_t> labels;    /* first-sighting indices */
+    std::map<uint32_t, uint32_t> tids;
+    /*
+     * Section 4: the opening ASID_SWITCH + THREAD_SWITCH pair states the
+     * first context; later ones follow either dimension's change.  A
+     * label rides its index's first sighting (root_phys, sig 0).
+     */
+    auto context = [&](uint64_t label, uint32_t t) {
+        auto a = labels.emplace(label, uint32_t(labels.size()));
+        if (count == 1 || a.first->second != asid) {
+            b.u8(kTagAsid);
+            b.sleb(int64_t(a.first->second) - asid);
+            asid = a.first->second;
+            if (a.second) {
+                b.u64(label);
+                b.u64(0);
+            }
+        }
+        int64_t w = ordinals ? tids.emplace(t, uint32_t(tids.size())).first->second : t;
+        if (count == 1 || w != tid) {
+            b.u8(kTagThread);
+            b.sleb(w - tid);
+            tid = w;
+        }
+    };
     feed([&](const WireEntry &e, const std::vector<WireEntry> &chain) {
         count++;
-        if (e.tid != tid) {
-            b.u8(kTagThread);
-            b.sleb(int64_t(e.tid) - tid);
-            tid = e.tid;
+        context(e.asid, e.tid);
+        if (e.rf) {         /* section 4.6: the context's registers at entry */
+            b.u8(kTagRegfile);
+            b.uleb(uint64_t(tid));
+            b.raw(regfiles[e.rf - 1]);
         }
         b.u8(kTagEntry);
         b.sleb(int64_t(e.template_id) - tmpl);
         tmpl = e.template_id;
-        b.section(entry_section(cp, nullptr, e, templates, memops, slots,
-                                census, arena, isa));
+        b.section(entry_section(cp, nullptr, e, uint32_t(asid), uint32_t(tid),
+                                templates, memops, slots, census, arena, isa));
         if (wp) {
             Bytes ch;
             ch.uleb(chain.size());
@@ -612,13 +661,19 @@ bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &template
             for (const WireEntry &c : chain) {
                 ch.sleb(int64_t(c.template_id) - prev);
                 prev = c.template_id;
-                ch.section(entry_section(spec, &cp, c, templates, memops,
-                                         slots, census, arena, isa));
+                ch.section(entry_section(spec, &cp, c, uint32_t(asid), uint32_t(tid),
+                                         templates, memops, slots, census, arena,
+                                         isa));
             }
             b.section(ch);
         }
         drain(1u << 20);
     });
+    if (!count) {       /* nothing ran: the opening context is asid 0, thread 0 */
+        count = 1;
+        context(0, 0);
+        count = 0;
+    }
     b.u8(kTagEnd);
     b.uleb(count);
     b.u32(kMagic);

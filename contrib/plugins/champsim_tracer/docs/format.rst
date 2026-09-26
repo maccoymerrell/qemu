@@ -2096,7 +2096,10 @@ the WP overlay first, fall back to the CP overlay on miss, then to
 the field's template default. Updates always write to the active
 overlay (CP overlay for CP records, WP overlay for WP records); the
 WP overlay never modifies CP state, so CP reconstruction is
-unaffected by speculative side effects.
+unaffected by speculative side effects.  Both overlays are kept per
+context: every ``(asid, thread_id)`` pair (§4.1) has its own, so the same
+template run by two threads, or by one thread in two address spaces,
+never shares a cell.
 
 ::
 

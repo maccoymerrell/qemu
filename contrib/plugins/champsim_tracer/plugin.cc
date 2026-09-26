@@ -17,8 +17,14 @@
  * address-space label -- and the observed outcome of the branch ending it;
  * system mode adds the privilege and fault depth it ran at (identify()).
  * The run streams to disk: what grows with it is spilled to
- * <outfile>.cst.spill.* as it retires, and the close encodes the body
- * from those files into the archive, file to file.
+ * <segment>.spill.* as it retires, and the close encodes the body from
+ * those files into the archive, file to file.
+ *
+ * A run is one segment, <outfile>.cst -- or, with marker=1 (system mode),
+ * one per marker window, <outfile>-<k>.cst: the guest's START sequence
+ * (champsim_marker.h) latches its vaddr, every address space mapping those
+ * bytes is traced, and the window closes at END, at the budget, at the
+ * idle stamp, or with the machine (INC6.md resolutions 4, 5).
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
@@ -28,6 +34,14 @@
  *                    system mode, whose wrong path is not claimed)
  *   wpdepth=<n>      wrong-path instructions per chain (default 64)
  *   regdata=0|1      destination-register values (default 1)
+ *   marker=0|1       marker windows (system mode; default 0)
+ *   budget=<n>       a window closes after n user instructions of the
+ *                    contexts it gates (total_target_insns; 0: unbounded)
+ *   idle=<n>         ... or once n instructions have retired anywhere since
+ *                    the last of those (0: never)
+ *   start=<n>, warmup=<n>, weight=<f>
+ *                    the header's start_insn, warmup_insns (the first n
+ *                    billed) and simpoint_weight
  */
 #include <algorithm>
 #include <cstdio>
@@ -51,6 +65,7 @@ extern "C" {
 }
 
 #include "blocks.h"
+#include "champsim_marker.h"
 #include "container.h"
 #include "wire.h"
 
@@ -65,20 +80,42 @@ struct WpStats {
              bail_slot, bail_overflow, bail_noseal, bail_stall, no_state;
 };
 
+/*
+ * What one segment gathers until its close hands it to encode(): the body
+ * as it streams to its spill files, and the counts its report states.
+ */
+struct Segment {
+    std::string path;           /* its .cst */
+    const char *route = "";     /* the close that ended it */
+    cst::BlockAssembler blocks;
+    cst::Spill<uint8_t> arena;  /* register values past their 16th byte */
+    std::set<std::pair<uint32_t, uint64_t>> sighted;    /* contexts with a REGFILE */
+    std::vector<cst::Bytes> regfiles;
+    uint64_t no_value = 0;      /* accesses whose value the API withheld */
+    uint64_t snaps = 0, unreadable = 0;
+    uint64_t shared_runs = 0, unseparated = 0, excluded = 0, resumed = 0;
+    /* marker mode: STARTs, user instructions billed, gate refreshes */
+    uint64_t starts = 0, billed = 0, warm_end = 0, refreshes = 0, not_traced = 0,
+             lost = 0, end_ungated = 0, end_no_window = 0;
+};
+
 struct Session {
     /* recursive: a wrong-path exec_tb fires callbacks on the same thread */
     std::recursive_mutex lock;
-    bool published = false;     /* one segment per run, at most */
+    bool published = false;     /* the run is over: nothing more is traced */
     bool system = false;
     std::string path;           /* <outfile>.cst */
     std::string scratch_dir;
     std::string compress;
     cst::HeaderFacts facts;
-    cst::BlockAssembler blocks;
+    Segment g;                  /* the open segment, or the next one */
+    std::vector<Segment> done;  /* closed: encoded once the lock is free */
+    bool open = false;
+    uint32_t segs = 0;
     std::vector<std::unique_ptr<cst::TbShape>> tbs;  /* live until exit */
     std::mutex tbs_lock;        /* taken under mmap_lock: guards tbs only */
     qemu_plugin_u64 started;    /* per vCPU: insns begun in the current TB */
-    uint64_t no_value = 0;      /* accesses whose value the API withheld */
+    qemu_plugin_u64 rec;        /* per vCPU: marker mode, it is recording */
     bool wp = true;
     size_t wpdepth = 64;
     uint32_t wp_tid = 0;        /* the WP strand in flight, 0 when none */
@@ -89,9 +126,8 @@ struct Session {
     std::map<unsigned int, const cst::TbShape *> xfer;
     WpStats wps{};
     bool regdata = true;
-    cst::Spill<uint8_t> arena;      /* register values past their 16th byte */
     GByteArray *buf = g_byte_array_new();
-    uint64_t snaps = 0, unreadable = 0, overflow = 0;
+    uint64_t overflow = 0;
     bool wp_given = false;
     /* system mode, per vCPU: the identity of the strand it runs (identify()) */
     struct Vcpu {
@@ -99,6 +135,12 @@ struct Session {
         int priv = -1;
         bool named = false, shared = false, excl = false, events = false;
         uint64_t ran = 0;       /* the pending TB's progress at an async entry */
+        /* marker mode: the windows its context maps, and what it records */
+        std::vector<uint64_t> gate, release;
+        uint64_t label = 0;     /* the address space of its last gated refresh */
+        bool ending = false;
+        bool unsure = false;    /* its last refresh read a window not present */
+        bool seed = false;      /* a peer seed owed at its next TB */
     };
     std::map<unsigned int, Vcpu> vc;
     std::map<uint64_t, uint32_t> by_tp;                 /* thread pointer -> tid */
@@ -106,10 +148,15 @@ struct Session {
     std::map<uint32_t, std::vector<std::pair<int, uint64_t>>> frames;
     std::vector<std::pair<uint64_t, uint32_t>> regions; /* user SP -> tid */
     uint32_t tids = 0;
-    uint64_t shared_runs = 0, unseparated = 0, excluded = 0;
-    std::set<std::pair<uint32_t, uint64_t>> sighted;    /* contexts with a REGFILE */
-    std::vector<cst::Bytes> regfiles;
     std::map<uint8_t, void *> handles;  /* each register's gdb handle; tbs_lock */
+    /* marker mode (INC6.md resolutions 4, 5) */
+    bool marker = false, force = false;
+    uint64_t budget = 0, idle = 0, idle_run = 0;
+    std::vector<uint64_t> windows;      /* latched START vaddrs */
+    uint8_t pat[2][CST_MARKER_PAIR_SEQ_BYTES];  /* START, END */
+    size_t patlen = 0;
+    int ending = 0;                     /* END blocks in flight */
+    uint64_t end_ungated = 0, end_no_window = 0;
 };
 
 /* Immortal: exit callbacks may run while static destructors do. */
@@ -119,16 +166,16 @@ Session &session()
     return *s;
 }
 
-/* The files the run streams to: CP entries, chain blocks, memops, arena */
-std::array<cst::SpillFile *, 4> spills(Session &s)
+/* The files a segment streams to: CP entries, chain blocks, memops, arena */
+std::array<cst::SpillFile *, 4> spills(Segment &g)
 {
-    auto b = s.blocks.spills();
-    return { b[0], b[1], b[2], &s.arena };
+    auto b = g.blocks.spills();
+    return { b[0], b[1], b[2], &g.arena };
 }
 
 void on_fork_child()
 {
-    for (cst::SpillFile *f : spills(session())) {
+    for (cst::SpillFile *f : spills(session().g)) {
         f->fork_child();
     }
 }
@@ -317,7 +364,7 @@ void snapshot(Session &s, uint32_t tid, const cst::Regs &r, uint32_t pos)
             m.size = uint8_t(std::min(std::max(len, 0), 64));
         }
         if (!m.size) {
-            s.unreadable++;
+            s.g.unreadable++;
             continue;
         }
         g_byte_array_set_size(s.buf, 64);   /* zero-filled past the value */
@@ -325,13 +372,13 @@ void snapshot(Session &s, uint32_t tid, const cst::Regs &r, uint32_t pos)
         std::memcpy(&m.lo, s.buf->data, 8);
         std::memcpy(&m.hi, s.buf->data + 8, 8);
         if (m.size > 16) {
-            m.addr = s.arena.size();
+            m.addr = s.g.arena.size();
             for (unsigned b = 16; b < m.size; b++) {
-                s.arena.push_back(s.buf->data[b]);
+                s.g.arena.push_back(s.buf->data[b]);
             }
         }
-        s.snaps++;
-        s.blocks.memop(tid, m);
+        s.g.snaps++;
+        s.g.blocks.memop(tid, m);
     }
 }
 
@@ -340,6 +387,9 @@ void on_snap(unsigned int vcpu, void *udata)
 {
     Session &s = session();
     auto *at = static_cast<const cst::TbShape::At *>(udata);
+    if (s.marker && !qemu_plugin_u64_get(s.rec, vcpu)) {
+        return;
+    }
     std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published && !(s.system && qemu_plugin_in_async_int())) {
         snapshot(s, s.wp_tid ? s.wp_tid : vcpu, at->tb->regs[at->pos], at->pos);
@@ -362,12 +412,12 @@ void snapshot_tail(Session &s, uint32_t tid, const cst::TbShape *tb, size_t ran)
  * control context the translation depends on (RVV vtype, SVE VL, MIPS FR)
  * is expected; any other is a defect.
  */
-void reg_report(Session &s, const std::string &path)
+void reg_report(const Session &s, Segment &g)
 {
-    std::string base = path.substr(0, path.size() - 4);
+    std::string base = g.path.substr(0, g.path.size() - 4);
     std::map<std::string, size_t> opaque;
-    size_t executed = s.blocks.regs.size(), stated = 0, odd = 0, full = 0;
-    for (const cst::Regs &r : s.blocks.regs) {
+    size_t executed = g.blocks.regs.size(), stated = 0, odd = 0, full = 0;
+    for (const cst::Regs &r : g.blocks.regs) {
         stated += !r.src.empty() || !r.dst.empty();
         full += !r.opaque;
         if (r.opaque) {
@@ -390,8 +440,8 @@ void reg_report(Session &s, const std::string &path)
         }
         return t;
     };
-    for (const auto &e : s.blocks.variance) {
-        const cst::Regs &a = s.blocks.regs[e.first], &b = e.second;
+    for (const auto &e : g.blocks.variance) {
+        const cst::Regs &a = g.blocks.regs[e.first], &b = e.second;
         std::vector<uint8_t> x, y, d;
         for (const auto *l : { &a.src, &a.dst }) x.insert(x.end(), l->begin(), l->end());
         for (const auto *l : { &b.src, &b.dst }) y.insert(y.end(), l->begin(), l->end());
@@ -403,7 +453,7 @@ void reg_report(Session &s, const std::string &path)
             return (i >= cst::kRegFpr && i < cst::kRegSeg) || i == cst::kRegVctrl ||
                    i == cst::kRegVstart || i == cst::kRegFcsr; });
         odd += !ctx;
-        const cst::Insn &i = s.blocks.insn(e.first);
+        const cst::Insn &i = g.blocks.insn(e.first);
         char hex[40] = "";
         for (unsigned k = 0; k < i.size; k++) {
             std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
@@ -417,56 +467,123 @@ void reg_report(Session &s, const std::string &path)
         std::to_string(executed - full) + " (" +
         std::to_string(opaque.size()) + " classes) reg_list_overflow=" +
         std::to_string(s.overflow) + " reg_list_variance=" +
-        std::to_string(s.blocks.variance.size()) + " (unexplained " +
-        std::to_string(odd) + ") snapshots=" + std::to_string(s.snaps) +
-        " unreadable=" + std::to_string(s.unreadable));
+        std::to_string(g.blocks.variance.size()) + " (unexplained " +
+        std::to_string(odd) + ") snapshots=" + std::to_string(g.snaps) +
+        " unreadable=" + std::to_string(g.unreadable));
 }
 
-void drop_spills(Session &s)
+void drop_spills(Segment &g)
 {
-    for (cst::SpillFile *f : spills(s)) {
+    for (cst::SpillFile *f : spills(g)) {
         f->remove();
     }
 }
 
 /*
- * Close the segment.  Idempotent: whichever ruled route arrives first
- * publishes.  Every address-space label rode its first sighting, so no
- * vCPU is needed here; a run that executed nothing claims nothing.
+ * Open the next segment at @path (lock held): its spill files, and its own
+ * instruction numbering (blocks.h: absorb()).
  */
-void publish(const char *route)
+bool open_segment(Session &s, const std::string &path)
+{
+    static const char *const names[] = { "cp", "wp", "mem", "arena" };
+    s.g.path = path;
+    s.g.blocks.epoch = ++s.segs;
+    s.g.warm_end = s.facts.warmup ? ~uint64_t(0) : 0;   /* ~0: not crossed */
+    s.open = true;
+    s.idle_run = 0;
+    for (size_t k = 0; k < 4; k++) {
+        if (!spills(s.g)[k]->open(path + ".spill." + names[k])) {
+            say("cannot write " + path + ".spill." + names[k]);
+            drop_spills(s.g);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * No segment is open: the vCPU's event queue stops, emptied first, since
+ * nothing drains it until a START instruments execution again.
+ */
+void on_quiet(unsigned int vcpu, void *)
 {
     Session &s = session();
-    {
-        /*
-         * The plugin lock covers the snapshot only.  The encode below reads
-         * what no callback touches once published is set, and runs with the
-         * lock free: the shutdown callback runs on a vCPU with the BQL
-         * dropped, and a lock held across the encode is one a peer could
-         * be waiting on while it holds the BQL -- the AB/BA of
-         * qemu_modifications.rst (vm_shutdown).  The spill pass runs here,
-         * on that vCPU thread, before any teardown: files are safe to use.
-         */
-        std::lock_guard<std::recursive_mutex> guard(s.lock);
-        if (s.published) {
-            return;
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    const struct qemu_plugin_cpu_event *ev;
+    if (!s.open && s.vc[vcpu].events) {
+        qemu_plugin_drain_cpu_events(vcpu, &ev);
+        qemu_plugin_cpu_events_set(vcpu, false);
+        s.vc[vcpu].events = false;
+    }
+}
+
+/*
+ * Close the open segment by @route (lock held): each strand's pending block
+ * goes on the wire at its measured extent, and the segment is detached, to
+ * be encoded once the lock is free (flush()).  A marker segment's windows go
+ * with it, and every translation is dropped so the next START is scanned
+ * afresh wherever its code already ran.
+ */
+void close_segment(Session &s, const char *route)
+{
+    s.g.blocks.finish_all([&s](uint32_t tid) {
+        auto v = s.vc.find(tid);
+        return v != s.vc.end() && v->second.excl ? v->second.ran :
+               qemu_plugin_u64_get(s.started, tid);
+    });
+    s.g.route = route;
+    s.g.end_ungated = s.end_ungated;
+    s.g.end_no_window = s.end_no_window;
+    s.done.push_back(std::move(s.g));
+    s.g = Segment();
+    s.open = false;
+    if (s.marker) {
+        s.windows.clear();
+        s.force = false;
+        s.ending = 0;
+        s.idle_run = 0;
+        for (auto &v : s.vc) {
+            v.second.gate.clear();
+            v.second.ending = false;
+            qemu_plugin_u64_set(s.rec, v.first, 0);
         }
-        s.published = true;
-        s.blocks.finish_all([&s](uint32_t tid) {
-            auto v = s.vc.find(tid);
-            return v != s.vc.end() && v->second.excl ? v->second.ran :
-                   qemu_plugin_u64_get(s.started, tid);
-        });
+        if (qemu_plugin_current_vcpu_index() >= 0) {
+            qemu_plugin_request_tb_flush();
+        }
+        for (auto &v : s.vc) {
+            qemu_plugin_async_run_on_vcpu(v.first, on_quiet, nullptr);
+        }
+    }
+}
+
+/*
+ * Encode closed segment @g to its .cst.  Every address-space label rode its
+ * first sighting, so no vCPU is needed here; a segment that executed
+ * nothing claims nothing.
+ */
+void encode(Session &s, Segment &g)
+{
+    const char *route = g.route;
+    if (s.marker) {
+        say("marker: " + g.path + " closed by " + route + ": windows=" +
+            std::to_string(g.starts) + " billed_user_insns=" +
+            std::to_string(g.billed) + " gate_refreshes=" +
+            std::to_string(g.refreshes) + " refresh_not_traced=" +
+            std::to_string(g.not_traced) + " gate_lost_residency=" +
+            std::to_string(g.lost) + " end_ungated=" +
+            std::to_string(g.end_ungated) + " end_no_window=" +
+            std::to_string(g.end_no_window));
     }
     if (s.system) {
         say("identity: tids=" + std::to_string(s.tids) + " tid_shared_strands=" +
-            std::to_string(s.shared_runs) + " tid_unseparated=" +
-            std::to_string(s.unseparated) + " async_excluded_tbs=" +
-            std::to_string(s.excluded));
+            std::to_string(g.shared_runs) + " tid_unseparated=" +
+            std::to_string(g.unseparated) + " async_excluded_tbs=" +
+            std::to_string(g.excluded) + (s.marker ? " resumed_in_async_window=" +
+            std::to_string(g.resumed) : ""));
     }
-    if (s.system && (s.unseparated || !s.blocks.entries())) {
-        drop_spills(s);
-        say(std::string(route) + ": " + (s.unseparated ?
+    if (s.system && (g.unseparated || !g.blocks.entries())) {
+        drop_spills(g);
+        say(std::string(route) + ": " + (g.unseparated ?
             "a user thread with no thread pointer and no readable stack "
             "pointer could not be told from another" : "nothing executed") +
             "; no trace published");
@@ -476,24 +593,26 @@ void publish(const char *route)
     /* The body goes first, so the header can be finalised after it. */
     size_t slots, entries, chains = 0;
     cst::MemopCensus census;
+    cst::HeaderFacts facts = s.facts;
+    facts.warm_end = g.warm_end;
     cst::Member body = { "body.cst", {}, cst::scratch_fd(s.scratch_dir) };
     bool ok = cst::body_member(body.fd, templates,
-        [&s, &templates, &chains](const cst::EntrySink &sink) {
-            s.blocks.recut(templates, s.wpdepth,
+        [&s, &g, &templates, &chains](const cst::EntrySink &sink) {
+            g.blocks.recut(templates, s.wpdepth,
                 [&](const cst::WireEntry &e, const std::vector<cst::WireEntry> &c) {
                     chains += c.size();
                     sink(e, c);
                 });
-        }, s.blocks.memops(), slots, entries, s.wp, census, s.arena, s.facts.isa,
-        s.system, s.regfiles);
+        }, g.blocks.memops(), slots, entries, s.wp, census, g.arena, s.facts.isa,
+        s.system, g.regfiles);
     std::string err = ok ? "" : "body not written to " + s.scratch_dir;
-    for (cst::SpillFile *f : spills(s)) {
-        err = f->failed() ? "the spill " + s.path + ".spill.* failed" : err;
+    for (cst::SpillFile *f : spills(g)) {
+        err = f->failed() ? "the spill " + g.path + ".spill.* failed" : err;
         f->remove();
     }
-    memop_tripwire(census, s.path);
-    reg_report(s, s.path);
-    const auto &st = s.blocks.stats;
+    memop_tripwire(census, g.path);
+    reg_report(s, g);
+    const auto &st = g.blocks.stats;
     say("entries=" + std::to_string(entries) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
         std::to_string(st.early_exits) + " late_block_ends=" +
@@ -501,7 +620,7 @@ void publish(const char *route)
         std::to_string(st.revised_shapes) + " shapes, " +
         std::to_string(st.recut_entries) + " entries re-cut; memops=" +
         std::to_string(st.memops) + " max_slots=" +
-        std::to_string(slots) + " no_value=" + std::to_string(s.no_value) +
+        std::to_string(slots) + " no_value=" + std::to_string(g.no_value) +
         " uneven_fanout=" + std::to_string(st.uneven_fanout));
     const WpStats &w = s.wps;
     if (s.wp) {
@@ -520,7 +639,7 @@ void publish(const char *route)
             std::to_string(qemu_plugin_spec_syscall_blocked_count()));
     }
     std::vector<cst::Member> members = {
-        body, { "header.cst", cst::header_member(s.facts, templates, slots,
+        body, { "header.cst", cst::header_member(facts, templates, slots,
                                                  s.wp, s.regdata).data() },
     };
     ok = err.empty();
@@ -528,14 +647,53 @@ void publish(const char *route)
         ok = ok && (s.compress.empty() ||
                     cst::filter_member(m, s.compress, s.scratch_dir, err));
     }
-    ok = ok && cst::publish_archive(s.path, members, err);
+    ok = ok && cst::publish_archive(g.path, members, err);
     for (cst::Member &m : members) {
         if (m.fd >= 0) {
             close(m.fd);
         }
     }
-    say(ok ? "published " + s.path + " at " + route :
+    say(ok ? "published " + g.path + " at " + route :
              "no trace published: " + err);
+}
+
+/* Encode what the closes detached, with the lock free. */
+void flush(Session &s, std::vector<Segment> &d)
+{
+    for (Segment &g : d) {
+        encode(s, g);
+    }
+    d.clear();
+}
+
+/*
+ * The run is over: its open segment closes by @route.  Idempotent: whichever
+ * ruled route arrives first publishes.  The plugin lock covers the close
+ * only.  The encode reads a detached segment no callback touches, and runs
+ * with the lock free: the shutdown callback runs on a vCPU with the BQL
+ * dropped, and a lock held across the encode is one a peer could be waiting
+ * on while it holds the BQL -- the AB/BA of qemu_modifications.rst
+ * (vm_shutdown).  The spill pass runs here, on that vCPU thread, before any
+ * teardown: files are safe to use.
+ */
+void publish(const char *route)
+{
+    Session &s = session();
+    std::vector<Segment> d;
+    {
+        std::lock_guard<std::recursive_mutex> guard(s.lock);
+        if (s.published) {
+            return;
+        }
+        s.published = true;
+        if (s.open) {
+            close_segment(s, route);
+        } else if (s.marker) {
+            say(std::string(route) + ": no window open");
+        }
+        d.swap(s.done);
+    }
+    flush(s, d);
 }
 
 void on_shutdown(qemu_plugin_id_t, int, bool)
@@ -543,10 +701,31 @@ void on_shutdown(qemu_plugin_id_t, int, bool)
     publish("machine shutdown");
 }
 
-/* A reset ends the recorded world; the segment closes there. */
+/*
+ * A reset ends the recorded world.  A whole-run segment closes there and
+ * the run with it; in marker mode the open window's segment closes, every
+ * identity the old world named is forgotten, and a START in the rebooted
+ * world opens the next segment.
+ */
 void on_reset(qemu_plugin_id_t, int, bool)
 {
-    publish("machine reset");
+    Session &s = session();
+    if (!s.marker) {
+        publish("machine reset");
+        return;
+    }
+    std::vector<Segment> d;
+    {
+        std::lock_guard<std::recursive_mutex> guard(s.lock);
+        if (s.open) {
+            close_segment(s, "machine reset");
+        }
+        s.by_tp.clear();
+        s.frames.clear();
+        s.regions.clear();
+        d.swap(s.done);
+    }
+    flush(s, d);
 }
 
 void on_exit(qemu_plugin_id_t, void *)
@@ -559,8 +738,8 @@ void on_exit(qemu_plugin_id_t, void *)
     std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {         /* not a ruled close in system emulation */
         s.published = true;
-        drop_spills(s);
-        say("exit without a machine shutdown or reset; no trace published");
+        drop_spills(s.g);
+        say("exit without a machine shutdown or reset; no open segment published");
     }
 }
 
@@ -578,7 +757,7 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
 {
     uint32_t wt = vcpu | cst::BlockAssembler::kWp;
     struct qemu_plugin_cpu_state *saved = qemu_plugin_cpu_state_save();
-    if (!saved || !s.blocks.wp_begin(wt, vcpu)) {
+    if (!saved || !s.g.blocks.wp_begin(wt, vcpu)) {
         s.wps.no_state++;
         qemu_plugin_cpu_state_free(saved);
         return;
@@ -600,22 +779,22 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
             break;
         }
         if (s.fired) {
-            snapshot_tail(s, wt, s.blocks.pending(wt), ran);
+            snapshot_tail(s, wt, s.g.blocks.pending(wt), ran);
         }
         if (ok) {
             cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
                                qemu_plugin_rep_reenter() };
-            s.blocks.retire(wt, ran, &bulk, pc);
+            s.g.blocks.retire(wt, ran, &bulk, pc);
         } else {
             qemu_plugin_spec_clear_exception();
-            const cst::TbShape *tb = s.blocks.pending(wt);
+            const cst::TbShape *tb = s.g.blocks.pending(wt);
             if (!s.fired || !tb) {
                 unavail = true;     /* the fetch itself failed */
                 break;
             }
             /* the engine leaves the pc at the raiser, or past it (a call) */
             const cst::Insn *f = ran && ran <= tb->insns.size() ?
-                                 &s.blocks.insn(tb->insns[ran - 1]) : nullptr;
+                                 &s.g.blocks.insn(tb->insns[ran - 1]) : nullptr;
             if (!f || (pc != f->pc && pc != f->pc + f->size)) {
                 s.wps.bail_unwind++;
                 break;
@@ -624,7 +803,7 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
                 s.wps.bail_slot++;  /* a delay slot: no fall-through of its own */
                 break;
             }
-            s.blocks.retire(wt, ran, nullptr, f->pc + f->size, true);
+            s.g.blocks.retire(wt, ran, nullptr, f->pc + f->size, true);
             qemu_plugin_set_pc(f->pc + f->size);
             s.wps.exec_faults++;
         }
@@ -632,11 +811,11 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
             s.wps.bail_overflow++;
             break;
         }
-        if (sealed == ~size_t(0) && s.blocks.wp_insns(wt) >= s.wpdepth) {
-            sealed = s.blocks.wp_blocks();  /* the budget is spent ... */
+        if (sealed == ~size_t(0) && s.g.blocks.wp_insns(wt) >= s.wpdepth) {
+            sealed = s.g.blocks.wp_blocks();  /* the budget is spent ... */
         }
-        if (sealed != ~size_t(0) && (s.blocks.open_empty(wt) ||
-                                     s.blocks.wp_blocks() > sealed)) {
+        if (sealed != ~size_t(0) && (s.g.blocks.open_empty(wt) ||
+                                     s.g.blocks.wp_blocks() > sealed)) {
             break;                          /* ... and the block in flight done */
         }
         if (sealed != ~size_t(0) && ++extra > 16384) {    /* straight-line: finite */
@@ -645,9 +824,9 @@ void excursion(Session &s, unsigned int vcpu, uint64_t alt)
         }
     }
     s.wps.unavail += unavail;
-    s.wps.first_unavail += unavail && !s.blocks.wp_blocks() &&
-                           s.blocks.open_empty(wt);
-    s.blocks.wp_end(wt, unavail);
+    s.wps.first_unavail += unavail && !s.g.blocks.wp_blocks() &&
+                           s.g.blocks.open_empty(wt);
+    s.g.blocks.wp_end(wt, unavail);
     s.wp_tid = 0;
     qemu_plugin_spec_mode_end();
     qemu_plugin_cpu_state_restore(saved);
@@ -764,7 +943,7 @@ uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep)
             [&](const std::pair<uint64_t, uint32_t> &a,
                 const std::pair<uint64_t, uint32_t> &b) { return dist(a) < dist(b); });
         if (!sp) {              /* nothing separates it: refused at the close */
-            s.unseparated++;
+            s.g.unseparated++;
             shared = true;
             v.tid = v.tid == ~0u ? (v.anon = s.tids++) : v.tid;
         } else {
@@ -783,52 +962,243 @@ uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep)
             v.named = false;
         }
     }
-    s.shared_runs += shared && !v.shared;
+    s.g.shared_runs += shared && !v.shared;
     v.shared = shared;
     v.priv = priv;
     return v.tid;
 }
 
-/* A TB begins: the previous one of this vCPU is over. */
-void on_tb_exec(unsigned int vcpu, void *udata)
+/*
+ * Marker mode: the gate of vCPU @vcpu (lock held) -- the latched windows
+ * its current context maps, by content: the START bytes re-read at each
+ * window's vaddr through that context (INC6.md resolution 4; the window IS
+ * the vaddr).  @label, the address-space value in force, only tells a
+ * gated context that lost its marker page (gate_lost_residency, a
+ * must-be-0 witness) from a context that never mapped it.
+ */
+void refresh(Session &s, unsigned int vcpu, uint64_t label)
+{
+    Session::Vcpu &v = s.vc[vcpu];
+    std::vector<uint64_t> gate;
+    bool lost = false, absent = false;
+    for (uint64_t w : s.windows) {
+        bool rd = qemu_plugin_read_memory_vaddr(w, s.buf, s.patlen);
+        if (rd && !std::memcmp(s.buf->data, s.pat[0], s.patlen)) {
+            gate.push_back(w);
+        }
+        absent |= !rd;
+        lost |= !rd && label == v.label &&
+                std::count(v.gate.begin(), v.gate.end(), w);
+    }
+    v.unsure = gate.empty() && absent;
+    s.g.refreshes++;
+    s.g.not_traced += gate.empty();
+    s.g.lost += lost;
+    v.gate.swap(gate);
+    v.label = v.gate.empty() ? v.label : label;
+}
+
+/* A committed address-space write: the event, never the value, gates. */
+void on_asid(unsigned int vcpu, uint64_t label)
 {
     Session &s = session();
-    auto *tb = static_cast<cst::TbShape *>(udata);
     std::lock_guard<std::recursive_mutex> guard(s.lock);
-    if (s.published) {
+    if (!s.published && !s.windows.empty()) {
+        refresh(s, vcpu, label);
+    }
+}
+
+/*
+ * A peer seeds its gate through its own context at its next safe point --
+ * which must be that vCPU's context: single-threaded TCG runs a vCPU's
+ * queued work with another vCPU current, so there the seed waits for the
+ * peer's next TB instead.
+ */
+void on_seed(unsigned int vcpu, void *)
+{
+    if (qemu_plugin_current_vcpu_index() != int(vcpu)) {
+        Session &s = session();
+        std::lock_guard<std::recursive_mutex> guard(s.lock);
+        s.vc[vcpu].seed = true;
         return;
     }
+    on_asid(vcpu, qemu_plugin_get_addr_space_id());
+}
+
+/*
+ * A marker sequence translated at @pc (fire-at-translation; a jump into the
+ * middle of one translates no whole sequence).  START latches its vaddr,
+ * opening a segment if none is open, and gates this vCPU and its peers
+ * afresh.  END in a gated context -- its gate read again first if it has
+ * none -- arms the release its block's end performs (tb_exec()); END
+ * anywhere else wins too: it force-closes the open segment, counted and
+ * loud.
+ */
+void fire(Session &s, bool end, uint64_t pc, cst::TbShape &tb)
+{
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    int self = qemu_plugin_current_vcpu_index();
+    char at[40];
+    std::snprintf(at, sizeof(at), "0x%llx", (unsigned long long)pc);
+    if (s.published || self < 0) {
+        return;
+    }
+    Session::Vcpu &v = s.vc[unsigned(self)];
+    if (!end) {
+        bool fresh = !std::count(s.windows.begin(), s.windows.end(), pc);
+        if (!s.open) {
+            open_segment(s, s.path.substr(0, s.path.size() - 4) + "-" +
+                            std::to_string(s.segs) + ".cst");
+            qemu_plugin_request_tb_flush();     /* instrument what runs next */
+            say("START at " + std::string(at) + " opens " + s.g.path);
+        }
+        if (fresh) {
+            s.windows.push_back(pc);
+            s.g.starts++;
+        }
+        refresh(s, unsigned(self), qemu_plugin_get_addr_space_id());
+        for (int k = 0, n = qemu_plugin_num_vcpus(); fresh && k < n; k++) {
+            if (k != self) {
+                qemu_plugin_async_run_on_vcpu(unsigned(k), on_seed, nullptr);
+            }
+        }
+        return;
+    }
+    if (s.open && v.gate.empty()) {     /* judged by the gate as it is now */
+        refresh(s, unsigned(self), qemu_plugin_get_addr_space_id());
+    }
+    if (!s.open) {
+        say("END at " + std::string(at) + " with no window open (end_no_window=" +
+            std::to_string(++s.end_no_window) + ")");
+    } else if (v.gate.empty()) {
+        s.force = true;
+        say("END at " + std::string(at) + " in a context no window gates: "
+            "the segment force-closes (end_ungated=" +
+            std::to_string(++s.end_ungated) + ")");
+    } else {
+        tb.end = true;
+    }
+}
+
+/*
+ * The END's block is over (lock held): the windows its context mapped are
+ * released from every vCPU's gate, and the last release closes the segment.
+ */
+void release(Session &s, Session::Vcpu &v)
+{
+    auto gone = [&v](uint64_t w) {
+        return std::count(v.release.begin(), v.release.end(), w) != 0; };
+    for (auto &u : s.vc) {
+        auto &g = u.second.gate;
+        g.erase(std::remove_if(g.begin(), g.end(), gone), g.end());
+    }
+    s.windows.erase(std::remove_if(s.windows.begin(), s.windows.end(), gone),
+                    s.windows.end());
+    v.ending = false;
+    s.ending--;
+    if (s.windows.empty()) {
+        close_segment(s, "END");
+    }
+}
+
+/*
+ * A marker segment's other closes, at a block boundary (lock held).  END
+ * always wins: an ungated END closes at once, and while an END's block is
+ * still running neither the budget nor the idle stamp may close first.
+ * The budget counts user instructions of gated contexts; the idle stamp,
+ * instructions retired anywhere since the last of them.
+ */
+void closes(Session &s)
+{
+    const char *why = s.force ? "END in an ungated context" : s.ending ? nullptr :
+                      s.budget && s.g.billed >= s.budget ? "budget" :
+                      s.idle && s.idle_run >= s.idle ? "idle" : nullptr;
+    if (s.marker && s.open && why) {
+        close_segment(s, why);
+    }
+}
+
+/*
+ * A TB begins on @vcpu (lock held): the previous one of this vCPU is over.
+ * In marker mode only what a gated context runs is recorded; the block a
+ * vCPU was assembling ends where it leaves the gated space.
+ */
+void tb_exec(Session &s, unsigned int vcpu, cst::TbShape *tb)
+{
     Session::Vcpu &v = s.vc[vcpu];
     size_t nev = 0;
     const struct qemu_plugin_cpu_event *ev = nullptr;
     int priv = 0;
+    bool switched = false;
     if (s.system) {
         if (!v.events) {
             qemu_plugin_cpu_events_set(vcpu, true);
             v.events = true;
         }
         nev = qemu_plugin_drain_cpu_events(vcpu, &ev);
-        if (qemu_plugin_in_async_int()) {
+        s.idle_run += qemu_plugin_u64_get(s.started, vcpu);    /* the TB before */
+        if (v.seed && s.open) {     /* a peer seed on_seed() owed */
+            refresh(s, vcpu, qemu_plugin_get_addr_space_id());
+        }
+        v.seed = false;
+        /*
+         * A window read as not present is no answer: the context may map
+         * it lazily.  Only a fault makes a page present, so the gate is
+         * read again at the context's next fault return.
+         */
+        for (size_t k = 0; v.unsure && s.open && k < nev; k++) {
+            if (ev[k].kind == QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
+                refresh(s, vcpu, qemu_plugin_get_addr_space_id());
+            }
+        }
+        priv = qemu_plugin_get_priv_level();
+        if (qemu_plugin_in_async_int() && (!s.marker || priv != 0)) {
             /* exclude async, keep sync: the handler never reaches the trace */
             v.ran = v.excl ? v.ran : qemu_plugin_u64_get(s.started, vcpu);
             v.excl = true;
-            s.excluded++;
+            s.g.excluded += !s.marker || qemu_plugin_u64_get(s.rec, vcpu);
             return;
+        } else if (qemu_plugin_in_async_int()) {
+            /*
+             * No handler runs user code: this is a context the handler
+             * switched to, resumed while the window waits for its owner.
+             * The window is not this context's.  The owner's interrupted
+             * block ends where it was left, successor and last values
+             * unknown; its events are the window's; the stack pointer here
+             * is a true endpoint.  (Marker mode, where the contexts a
+             * window gates are all the process's; a whole-run segment keeps
+             * increment 6A's exclusion as it stands.)
+             */
+            qemu_plugin_async_int_reset();
+            s.g.resumed++;
+            switched = true;
+            nev = 0;
+            v.priv = -1;
         }
-        priv = qemu_plugin_get_priv_level();
     }
-    s.blocks.absorb(*tb, priv != 0);
+    auto gated = [&s, &v]() { return !s.marker || (s.open && !v.gate.empty()); };
+    bool rec = gated();
+    const cst::TbShape *prev = s.g.blocks.pending(vcpu);
+    if (rec) {
+        s.g.blocks.absorb(*tb, priv != 0);
+    }
     if (s.wp_tid) {             /* a wrong-path TB: excursion() retires it */
-        s.blocks.begin(s.wp_tid, tb);
+        s.g.blocks.begin(s.wp_tid, tb);
         s.fired = true;
+        return;
+    }
+    size_t ran = v.excl ? v.ran : qemu_plugin_u64_get(s.started, vcpu);
+    uint64_t next = tb->raw.front().pc, again = 0, ep = 0;
+    v.excl = false;
+    auto *fr = v.tid != ~0u && (!s.marker || (prev && !switched)) ?
+               &s.frames[v.tid] : nullptr;
+    if (!prev && !rec) {
+        qemu_plugin_u64_set(s.rec, vcpu, 0);
+        closes(s);
         return;
     }
     cst::BulkRun bulk{ qemu_plugin_rep_pc(), qemu_plugin_rep_iterations(),
                        qemu_plugin_rep_reenter() };
-    const cst::TbShape *prev = s.blocks.pending(vcpu);
-    size_t ran = v.excl ? v.ran : qemu_plugin_u64_get(s.started, vcpu);
-    uint64_t next = s.blocks.insn(tb->insns.front()).pc, again = 0, ep = 0;
-    v.excl = false;
     /*
      * A re-executing fault states its resume pc: the instruction there did
      * not complete, and the block stops before it.  (An instruction QEMU
@@ -841,7 +1211,6 @@ void on_tb_exec(unsigned int vcpu, void *udata)
      * that advanced past the instruction returns to no frame the engine's
      * per-vCPU stack can match).
      */
-    auto *fr = v.tid != ~0u ? &s.frames[v.tid] : nullptr;
     for (size_t k = 0; k < nev; k++) {
         bool enter = ev[k].kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER;
         again = !again && enter ? ev[k].pc : again;
@@ -855,27 +1224,37 @@ void on_tb_exec(unsigned int vcpu, void *udata)
     }
     bool cut = false;
     for (size_t k = ran; again && prev && k-- > 0 && k + 2 >= ran && !cut;) {
-        cut = s.blocks.insn(prev->insns[k]).pc == again;
+        cut = s.g.blocks.insn(prev->insns[k]).pc == again;
         ran = cut ? k : ran;
     }
     next = again && !cut ? again : next;
-    if (!cut) {
+    if (!cut && !switched) {
         snapshot_tail(s, vcpu, prev, ran);
     }
-    s.blocks.retire(vcpu, ran, &bulk, next);
+    s.g.blocks.retire(vcpu, ran, switched ? nullptr : &bulk, switched ? 0 : next);
+    if (switched) {
+        s.g.blocks.cut(vcpu);
+    }
+    if (s.marker && prev && !s.g.blocks.insn(prev->insns.front()).sys && ran) {
+        s.g.billed += ran;      /* the window clock: gated user code */
+        s.idle_run = 0;
+        if (s.g.warm_end == ~uint64_t(0) && s.g.billed >= s.facts.warmup) {
+            s.g.warm_end = s.g.blocks.position(vcpu);
+        }
+    }
     /* the TB whose transfer this retire completes: its own, or its slot's */
     const cst::TbShape *x = nullptr;
     if (prev && ran == prev->insns.size()) {
         x = prev->transfer >= 0 ? prev : s.xfer[vcpu];
     }
-    s.xfer[vcpu] = x == prev && !s.blocks.open_empty(vcpu) ? x : nullptr;
-    const cst::Insn *l = prev ? &s.blocks.insn(prev->insns.back()) : nullptr;
-    if (s.wp && x && s.blocks.open_empty(vcpu) && bulk.pc != l->pc) {
-        launch(s, vcpu, x, l->pc + l->size, s.blocks.insn(tb->insns.front()).pc);
+    s.xfer[vcpu] = x == prev && !s.g.blocks.open_empty(vcpu) ? x : nullptr;
+    const cst::Insn *l = prev ? &s.g.blocks.insn(prev->insns.back()) : nullptr;
+    if (s.wp && x && s.g.blocks.open_empty(vcpu) && bulk.pc != l->pc) {
+        launch(s, vcpu, x, l->pc + l->size, tb->raw.front().pc);
     }
     cst::Ctx c;
     c.tid = vcpu;
-    if (s.system) {
+    if (s.system && rec) {
         if (fr && priv == 0) {
             fr->clear();    /* a strand back in user code is in no handler */
         }
@@ -883,19 +1262,52 @@ void on_tb_exec(unsigned int vcpu, void *udata)
         c.asid = qemu_plugin_get_addr_space_id();
         auto &f = s.frames[c.tid];
         while (!f.empty() && (f.back().first > priv ||
-                              f.back().second == s.blocks.insn(tb->insns.front()).pc)) {
+                              f.back().second == tb->raw.front().pc)) {
             f.pop_back();
         }
         c.depth = uint32_t(f.size());
         c.sys = priv != 0;
     }
-    uint32_t rf = 0;
-    if (s.regdata && s.sighted.insert({ c.tid, c.asid }).second) {
-        s.regfiles.push_back(regfile(s));
-        rf = uint32_t(s.regfiles.size());
+    if (rec) {
+        s.g.blocks.context(vcpu, c);
+    } else {
+        s.g.blocks.cut(vcpu);
     }
-    s.blocks.context(vcpu, c, rf);
-    s.blocks.begin(vcpu, tb);
+    /* END defers to the end of the true block it fired in (format.rst) */
+    if (v.ending && s.g.blocks.open_empty(vcpu)) {
+        release(s, v);
+    }
+    closes(s);
+    if (!gated()) {
+        qemu_plugin_u64_set(s.rec, vcpu, 0);
+        return;
+    }
+    if (s.regdata && s.g.sighted.insert({ c.tid, c.asid }).second) {
+        s.g.regfiles.push_back(regfile(s));
+        s.g.blocks.context(vcpu, c, uint32_t(s.g.regfiles.size()));
+    }
+    s.g.blocks.begin(vcpu, tb);
+    qemu_plugin_u64_set(s.rec, vcpu, 1);
+    if (tb->end && !v.ending) {
+        v.ending = true;
+        v.release = v.gate;
+        s.ending++;
+    }
+}
+
+/* A TB begins; a segment a close detached is encoded with the lock free. */
+void on_tb_exec(unsigned int vcpu, void *udata)
+{
+    Session &s = session();
+    std::vector<Segment> d;
+    {
+        std::lock_guard<std::recursive_mutex> guard(s.lock);
+        if (!s.published) {
+            tb_exec(s, vcpu, static_cast<cst::TbShape *>(udata));
+        }
+        d.swap(s.done);
+    }
+    flush(s, d);
 }
 
 /* An access by the instruction at TB index @udata (sections 5.2, 5.3). */
@@ -903,6 +1315,9 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
             void *udata)
 {
     Session &s = session();
+    if (s.marker && !qemu_plugin_u64_get(s.rec, vcpu)) {
+        return;     /* nothing a gated context runs: not recorded */
+    }
     cst::Memop m{};
     m.addr = vaddr;
     m.pos = uint32_t(reinterpret_cast<uintptr_t>(udata));
@@ -922,8 +1337,8 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     }
     std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published && !(s.system && qemu_plugin_in_async_int())) {
-        s.no_value += !m.data_ok;
-        s.blocks.memop(s.wp_tid ? s.wp_tid : vcpu, m);
+        s.g.no_value += !m.data_ok;
+        s.g.blocks.memop(s.wp_tid ? s.wp_tid : vcpu, m);
     }
 }
 
@@ -937,10 +1352,10 @@ void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
     if (s.wp_tid) {
         return;     /* never on the wrong path; counted by the engine if so */
     }
-    const cst::TbShape *tb = s.blocks.pending(vcpu);
+    const cst::TbShape *tb = s.g.blocks.pending(vcpu);
     uint64_t ran = qemu_plugin_u64_get(s.started, vcpu);
     if (tb && ran >= 1 && ran <= tb->insns.size()) {
-        s.blocks.ends_block(tb->insns[ran - 1]);
+        s.g.blocks.ends_block(tb->insns[ran - 1]);
     }
 }
 
@@ -950,11 +1365,17 @@ void on_vcpu_exit(qemu_plugin_id_t, unsigned int vcpu)
     Session &s = session();
     std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {
-        s.blocks.finish(vcpu, qemu_plugin_u64_get(s.started, vcpu));
-        s.sighted.erase({ vcpu, 0 });   /* a later thread here is another */
+        s.g.blocks.finish(vcpu, qemu_plugin_u64_get(s.started, vcpu));
+        s.g.sighted.erase({ vcpu, 0 });   /* a later thread here is another */
     }
 }
 
+/*
+ * A TB is translated.  Marker mode with no window open instruments nothing:
+ * it scans for a START, whose opening drops every translation so what runs
+ * next is instrumented (and a close drops them again), and learns the
+ * registers the code names, which identity and REGFILE read.
+ */
 void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
 {
     Session &s = session();
@@ -966,6 +1387,36 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
         in.pc = qemu_plugin_insn_vaddr(insn);
         in.size = uint8_t(qemu_plugin_insn_data(insn, in.bytes, sizeof(in.bytes)));
         shape->raw.push_back(in);
+    }
+    if (n == 0) {
+        return;
+    }
+    /* Marker mode: a START / END sequence, whole, from an instruction's start */
+    if (s.marker && !qemu_plugin_in_spec_mode()) {
+        std::vector<uint8_t> code;
+        std::vector<size_t> at;
+        for (const cst::Insn &in : shape->raw) {
+            at.push_back(code.size());
+            code.insert(code.end(), in.bytes, in.bytes + in.size);
+        }
+        for (size_t i = 0; i < n; i++) {
+            for (int k = 0; k < 2; k++) {
+                if (at[i] + s.patlen <= code.size() &&
+                    !std::memcmp(&code[at[i]], s.pat[k], s.patlen)) {
+                    fire(s, k, shape->raw[i].pc, *shape);
+                }
+            }
+        }
+        std::lock_guard<std::recursive_mutex> guard(s.lock);
+        if (!s.open) {
+            for (size_t i = 0; i < n; i++) {    /* the registers it names */
+                capture(s, qemu_plugin_tb_get_insn(tb, i));
+            }
+            return;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         shape->regs.push_back(capture(s, insn));
         auto kind = qemu_plugin_insn_transfer_kind(insn);
         if (kind == QEMU_PLUGIN_TRANSFER_COND_NO_TARGET) {
@@ -982,9 +1433,6 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
                                          QEMU_PLUGIN_MEM_RW,
                                          reinterpret_cast<void *>(uintptr_t(i)));
     }
-    if (n == 0) {
-        return;
-    }
     /* Each instruction's start is its predecessor's end (section 5.4). */
     shape->at.reserve(n);
     for (size_t i = 1; i < n && s.regdata; i++) {
@@ -996,8 +1444,8 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
         }
     }
     /* RW: an excursion launched here saves, runs and restores the vCPU */
-    qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
-                                         shape.get());
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, s.wp ? QEMU_PLUGIN_CB_RW_REGS :
+                                         QEMU_PLUGIN_CB_R_REGS, shape.get());
     std::lock_guard<std::mutex> guard(s.tbs_lock);
     s.tbs.push_back(std::move(shape));
 }
@@ -1005,6 +1453,13 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
 bool parse_options(Session &s, int argc, char **argv)
 {
     std::string outfile;
+    /* the window a marker segment claims: header section 3, and its closes */
+    std::map<std::string, uint64_t *> num = {
+        { "budget", &s.budget }, { "idle", &s.idle }, { "start", &s.facts.start },
+        { "warmup", &s.facts.warmup },
+    };
+    bool window = false;
+    char *end = nullptr;
     for (int i = 0; i < argc; i++) {
         std::string opt = argv[i];
         size_t eq = opt.find('=');
@@ -1021,6 +1476,14 @@ bool parse_options(Session &s, int argc, char **argv)
             s.wpdepth = size_t(std::atoi(val.c_str()));
         } else if (key == "regdata" && (val == "0" || val == "1")) {
             s.regdata = val == "1";
+        } else if (key == "marker" && (val == "0" || val == "1")) {
+            s.marker = val == "1";
+        } else if (key == "weight" && !val.empty() &&
+                   (s.facts.weight = std::strtod(val.c_str(), &end), !*end)) {
+            window = true;
+        } else if (num.count(key) && !val.empty() &&
+                   (*num[key] = std::strtoull(val.c_str(), &end, 0), !*end)) {
+            window = true;
         } else {
             say("unknown or malformed option '" + opt + "'");
             return false;
@@ -1030,6 +1493,12 @@ bool parse_options(Session &s, int argc, char **argv)
         say("outfile=<path> is required");
         return false;
     }
+    if (window && !s.marker) {
+        say("budget, idle, start, warmup and weight describe a marker window; "
+            "they need marker=1");
+        return false;
+    }
+    s.facts.total = s.budget;
     s.path = outfile + ".cst";
     size_t slash = s.path.rfind('/');
     s.scratch_dir = slash == std::string::npos ? "." :
@@ -1060,8 +1529,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     std::fclose(probe);
     std::remove((s.path + ".part").c_str());
-    const char *names[] = { "cp", "wp", "mem", "arena" };
     s.system = info->system_emulation;
+    if (s.marker && !s.system) {
+        say("marker=1: a marker window gates address spaces, which only "
+            "system emulation has; refused");
+        return -1;
+    }
     if (s.system && s.wp) {
         if (s.wp_given) {
             say("wp=1: the wrong path is not claimed in system mode; refused");
@@ -1069,12 +1542,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
         s.wp = false;       /* the default there: correct path only */
     }
-    for (size_t k = 0; k < 4; k++) {
-        if (!spills(s)[k]->open(s.path + ".spill." + names[k])) {
-            say("cannot write " + s.path + ".spill." + names[k]);
-            drop_spills(s);
-            return -1;
-        }
+    if (!s.marker && !open_segment(s, s.path)) {     /* the whole run's */
+        return -1;
     }
     pthread_atfork(nullptr, nullptr, on_fork_child);
 
@@ -1087,7 +1556,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     qemu_plugin_register_atexit_cb(id, on_exit, nullptr);
     s.started = qemu_plugin_scoreboard_u64(
         qemu_plugin_scoreboard_new(sizeof(uint64_t)));
+    s.rec = qemu_plugin_scoreboard_u64(qemu_plugin_scoreboard_new(sizeof(uint64_t)));
     qemu_plugin_register_vcpu_tb_trans_cb(id, on_tb_trans);
+    if (s.marker) {     /* the guest ABI's sequences (champsim_marker.h) */
+        for (int k = 0; k < 2; k++) {
+            uint32_t imm = k ? CST_MARKER_END_MAGIC : CST_MARKER_MAGIC;
+            s.patlen = size_t(isa == 1 ? cst_marker_x86_encode_seq_imm(s.pat[k], imm) :
+                              isa == 2 ? cst_marker_a64_encode_seq_imm(s.pat[k], imm) :
+                              isa == 3 ? cst_marker_riscv_encode_seq_imm(s.pat[k], imm) :
+                              cst_marker_mips_encode_seq_imm(s.pat[k], imm));
+        }
+        uint8_t both[2 * sizeof(s.pat[0])];
+        std::memcpy(both, s.pat[0], s.patlen);
+        std::memcpy(both + s.patlen, s.pat[1], s.patlen);
+        qemu_plugin_register_nosplit_code_sequences(both, s.patlen, 2);
+        qemu_plugin_register_asid_write_cb(id, on_asid);
+    }
     if (s.system) {
         qemu_plugin_register_vm_shutdown_cb(id, on_shutdown);
         qemu_plugin_register_vm_reset_cb(id, on_reset);

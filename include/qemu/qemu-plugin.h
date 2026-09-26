@@ -257,6 +257,14 @@ typedef uint64_t qemu_plugin_id_t;
  *   and may write, as its translation states them, each with the handle
  *   qemu_plugin_read_register() takes when the gdbstub has one
  *
+ * version 27:
+ * - struct qemu_plugin_cpu_event gained @sp, the stack pointer at the
+ *   event instant.  The record's stride changed, so a plugin declaring
+ *   an earlier version that imports qemu_plugin_drain_cpu_events() is
+ *   refused at load.
+ * - (qemu_plugin_set_current_task_offset, removed while the constant read
+ *   26, is gone: the thread pointer is the architectural register alone.)
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -268,7 +276,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 26
+#define QEMU_PLUGIN_VERSION 27
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -824,6 +832,15 @@ qemu_plugin_insn_transfer_kind(const struct qemu_plugin_insn *insn);
 
 /**
  * enum qemu_plugin_reg_class - what kind of register a statement names
+ * @QEMU_PLUGIN_REG_GPR: general-purpose
+ * @QEMU_PLUGIN_REG_FP: floating-point
+ * @QEMU_PLUGIN_REG_VECTOR: vector
+ * @QEMU_PLUGIN_REG_PREDICATE: predicate
+ * @QEMU_PLUGIN_REG_FLAGS: condition flags
+ * @QEMU_PLUGIN_REG_SEGMENT: segment
+ * @QEMU_PLUGIN_REG_ACCUMULATOR: accumulator
+ * @QEMU_PLUGIN_REG_CONTROL: control or status
+ * @QEMU_PLUGIN_REG_ZERO: the constant-zero register
  *
  * Structural identity only, in the target's own terms (the gdb feature a
  * register belongs to says the same): no role, no classification.
@@ -2041,6 +2058,17 @@ struct qemu_plugin_cpu_event {
      * the plugin never gets another look at.
      */
     uint64_t tp;
+    /*
+     * The architectural stack pointer at the event instant (x86 RSP,
+     * AArch64 the SP of the current EL, RISC-V x2, MIPS $29; 0 on a
+     * target that does not state it), read where @tp is.  An ENTER is
+     * pushed before the handler switches any state, so from user
+     * privilege it is the interrupted thread's user stack pointer; a
+     * RETURN is pushed once the return has committed, so into user
+     * privilege it is the resumed thread's.  A read at drain time
+     * recovers neither: by then the handler has moved the stack.
+     */
+    uint64_t sp;
 };
 
 /**

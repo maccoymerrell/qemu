@@ -128,6 +128,15 @@ struct TCGCPUOps {
     bool (*plugin_thread_ptr_tracks_current)(CPUState *cpu);
 
     /**
+     * @get_plugin_sp: report the architectural stack pointer
+     *
+     * Optional.  The stack pointer of the vCPU's current state (x86 RSP,
+     * AArch64 the SP of the current EL, RISC-V x2, MIPS $29), stamped on
+     * each path event at its push; see struct qemu_plugin_cpu_event.
+     */
+    uint64_t (*get_plugin_sp)(CPUState *cpu);
+
+    /**
      * @plugin_reg_resolve: name the register a CPU-state field holds
      *
      * Optional.  The per-instruction register statement

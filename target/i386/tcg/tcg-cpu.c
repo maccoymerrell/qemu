@@ -180,6 +180,11 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
     return env->segs[R_GS].base;
 }
 
+static uint64_t x86_get_plugin_sp(CPUState *cs)
+{
+    return cpu_env(cs)->regs[R_ESP];
+}
+
 static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     /*
@@ -341,6 +346,7 @@ static const TCGCPUOps x86_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
+    .get_plugin_sp = x86_get_plugin_sp,
     .plugin_thread_ptr_tracks_current = x86_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
     .plugin_clock_resync = x86_plugin_clock_resync,

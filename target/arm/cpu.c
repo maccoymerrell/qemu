@@ -2729,6 +2729,13 @@ static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
     return env->cp15.tpidr_el[0];
 }
 
+static uint64_t arm_get_plugin_sp(CPUState *cs)
+{
+    CPUARMState *env = cpu_env(cs);
+    /* xregs[31] is the SP the current EL selects (SP_EL0 at EL0) */
+    return is_a64(env) ? env->xregs[31] : env->regs[13];
+}
+
 static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     /*
@@ -2900,6 +2907,7 @@ static const TCGCPUOps arm_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
+    .get_plugin_sp = arm_get_plugin_sp,
     .plugin_thread_ptr_tracks_current = arm_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
     .plugin_clock_resync = arm_plugin_clock_resync,

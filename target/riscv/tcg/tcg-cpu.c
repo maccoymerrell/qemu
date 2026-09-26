@@ -190,6 +190,11 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
     return env->gpr[4];
 }
 
+static uint64_t riscv_get_plugin_sp(CPUState *cs)
+{
+    return cpu_env(cs)->gpr[2];
+}
+
 /*
  * TCGCPUOps::plugin_clock_resync for RISC-V -- see the contract in
  * include/accel/tcg/cpu-ops.h.
@@ -310,6 +315,7 @@ static const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
+    .get_plugin_sp = riscv_get_plugin_sp,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
     .plugin_clock_resync = riscv_plugin_clock_resync,
 #endif

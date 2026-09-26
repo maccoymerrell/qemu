@@ -650,6 +650,11 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
     return env->active_tc.CP0_UserLocal;
 }
 
+static uint64_t mips_get_plugin_sp(CPUState *cs)
+{
+    return cpu_env(cs)->active_tc.gpr[29];
+}
+
 static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
@@ -772,6 +777,7 @@ static const TCGCPUOps mips_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
+    .get_plugin_sp = mips_get_plugin_sp,
     .plugin_thread_ptr_tracks_current = mips_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = mips_vaddr_is_kernel,
     .plugin_clock_resync = mips_plugin_clock_resync,

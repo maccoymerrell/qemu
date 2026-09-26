@@ -451,6 +451,7 @@ typedef struct CPUPluginEvent {
     uint64_t tp;            /* thread pointer at the event instant; for an
                              * ASYNC_ENTER, the DELIVERING thread's (pushed
                              * before any handler state switches) */
+    uint64_t sp;            /* stack pointer at the event instant */
 } CPUPluginEvent;
 
 /* The drain hands the buffer to plugins as struct qemu_plugin_cpu_event;

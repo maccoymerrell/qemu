@@ -1105,6 +1105,8 @@ QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, asid) !=
                   offsetof(CPUPluginEvent, asid));
 QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, tp) !=
                   offsetof(CPUPluginEvent, tp));
+QEMU_BUILD_BUG_ON(offsetof(struct qemu_plugin_cpu_event, sp) !=
+                  offsetof(CPUPluginEvent, sp));
 QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_ENTER !=
                   (int)QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER);
 QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_FAULT_RETURN !=

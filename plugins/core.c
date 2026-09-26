@@ -399,6 +399,7 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
         .pc = pc,
         .asid = asid,
         .tp = tp,
+        .sp = ops && ops->get_plugin_sp ? ops->get_plugin_sp(cpu) : 0,
     };
     q->n_push++;
     if (q->len > q->max_len) {

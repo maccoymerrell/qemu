@@ -2492,23 +2492,20 @@ bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
 /**
  * qemu_plugin_get_thread_ptr() - the guest's per-thread pointer register
  *
- * Returns the per-software-thread pointer state the guest kernel
- * maintains: x86_64 FS.base (GS.base for a 32-bit compat task), AArch64
- * TPIDR_EL0, MIPS CP0 UserLocal -- the TLS base, context-switched per
- * thread -- and on RISC-V the kernel's current-task pointer (sscratch
- * while in user, tp while in kernel: the S-mode trap entry swaps the
- * two, so that pair is the one value space that names the task at every
- * privilege; a guest that never arms sscratch degrades to the raw tp).
- * In every case the value is a stable per-guest-thread identity that
- * survives vCPU migration -- unlike the vCPU index, which names a
- * scheduling slot, not a thread.
+ * Returns the architectural per-thread pointer register: x86_64 FS.base
+ * (GS.base for a 32-bit compat task), AArch64 TPIDR_EL0, MIPS CP0
+ * UserLocal, RISC-V tp -- the TLS base, context-switched per thread.
+ * The register alone: no kernel data structure or kernel register
+ * convention is consulted.  At user privilege the value is a stable
+ * per-guest-thread identity that survives vCPU migration -- unlike the
+ * vCPU index, which names a scheduling slot, not a thread.
  *
  * A sample taken above user privilege is meaningful only where
  * qemu_plugin_thread_ptr_tracks_current() reports true in that context.
  * Returns 0 when the target provides no hook or the state was never
- * written (e.g. a CPU model without the feature, or a guest that sets
- * no TLS); threads without a thread pointer are architecturally
- * indistinguishable.  Must be called from a vCPU context.
+ * written (e.g. a CPU model without the feature, a guest that sets no
+ * TLS, or a task that has none); such threads are indistinguishable by
+ * this register.  Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_get_thread_ptr(void);
@@ -2529,49 +2526,14 @@ uint64_t qemu_plugin_get_thread_ptr(void);
  *
  * The answer is a property of the SAMPLING CONTEXT, not a flat target
  * property: re-ask it at each privileged sample rather than latching one
- * answer per run.  True for MIPS (CP0 UserLocal), AArch64 (TPIDR_EL0)
- * and x86-64 (FS.base) at every privilege.  True for RISC-V at U/S
- * privilege -- the reported value there is the kernel's current-task
- * pointer (see qemu_plugin_get_thread_ptr()) -- but false in M-mode
- * firmware (which runs on its own tp with the S-mode sscratch parked)
- * and under H-extension virtualization.  False on any target without
- * the thread-pointer hook.  Must be called from a vCPU context.
+ * answer per run.  True for AArch64 (TPIDR_EL0) and x86-64 (FS.base) at
+ * every privilege, and for MIPS where the model implements UserLocal
+ * (Config3.ULRI).  False for RISC-V above user (tp is a general-purpose
+ * register a privileged mode may use for its own ends) and on any target
+ * without the hook.  Where it answers true a value of 0 still names no
+ * thread.  Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_thread_ptr_tracks_current(void);
-
-/**
- * qemu_plugin_set_current_task_offset() - declare where the guest kernel
- *                                         keeps its current-task pointer
- * @offset: byte offset of the kernel's current-task pointer within the
- *          per-CPU region its kernel per-CPU base register addresses
- *
- * Some kernels keep no per-task pointer in a *register* at kernel
- * privilege: Linux/x86-64 reaches ``current`` through the swapped-in
- * kernel GS base at the per-CPU offset of ``current_task``
- * (``pcpu_hot`` + 0 on 6.2 <= v < 6.14), a value decided at kernel
- * link time and not recoverable from architectural state.  A plugin
- * that has derived that
- * offset for the guest image it is tracing (from the image's symbol
- * table, System.map, or the guest's own /proc/kallsyms -- per-CPU
- * symbol values are 0-based offsets) declares it here; the target may
- * then resolve kernel-privilege thread identity by reading the pointer
- * through the live per-CPU base.
- *
- * The offset is BUILD-dependent.  Declaring a value from a different
- * kernel image than the one running reads unrelated per-CPU state and
- * mints wrong identities; when the offset for the running image is not
- * known, do not call this -- the target then keeps its register-only
- * contract (qemu_plugin_thread_ptr_tracks_current() reports what that
- * contract can honour, and samples it cannot vouch for are inherited
- * rather than fabricated).
- *
- * Consumed today by x86-64 only; other targets ignore the declaration
- * (their kernels keep the task pointer in a register).  Process-global
- * (one guest kernel per emulation); callable at install time, before
- * any vCPU exists.  No-op in ``*-linux-user``.
- */
-QEMU_PLUGIN_API
-void qemu_plugin_set_current_task_offset(uint64_t offset);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

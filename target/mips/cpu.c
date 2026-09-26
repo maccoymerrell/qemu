@@ -644,37 +644,10 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
      * writes it on every thread switch when Config3.ULRI advertises it;
      * on models without ULRI it stays 0 and threads are architecturally
      * indistinguishable by it (the kernel keeps the TLS pointer in RAM
-     * and trap-emulates rdhwr).  Kept whenever it is non-zero, at any
-     * privilege: it is reloaded from the incoming task at each switch,
-     * so a thread's kernel excursions stay on the SAME identity its user
-     * code carries.
-     *
-     * UserLocal == 0 in kernel mode is a task with no TLS identity -- a
-     * kernel thread or per-CPU idle task, or any task on a no-ULRI model
-     * (this includes the whole 24K/34K Malta class).  Those are distinct
-     * program paths, so fall through to the kernel's own per-task
-     * contract: Linux/MIPS dedicates $28 (gp) to current_thread_info in
-     * kernel mode (arch/mips/include/asm/thread_info.h declares it
-     * register-resident in $28; stackframe.h SAVE_SOME derives it from
-     * the kernel sp -- `ori $28, sp, _THREAD_MASK; xori $28,
-     * _THREAD_MASK` -- on every entry from user).  MIPS keeps
-     * thread_info at the base of each task's kernel stack (no
-     * THREAD_INFO_IN_TASK), so the value is per-task and stable for the
-     * task's life.  Before SAVE_SOME runs -- the exception-vector window --
-     * $28 still holds the interrupted user's gp, which on MIPS can only
-     * be a useg VA: the kernel-VA test rejects it, the tracks-current
-     * hook reports false, and the consumer inherits the entering thread
-     * (which is the interrupted thread itself).
+     * and trap-emulates rdhwr).  The register alone, at every privilege:
+     * no general-purpose register's kernel-mode convention is consulted.
      */
-    uint64_t tp = env->active_tc.CP0_UserLocal;
-    if (tp != 0 || (env->hflags & MIPS_HFLAG_KSU) == MIPS_HFLAG_UM) {
-        return tp;
-    }
-    uint64_t gp = env->active_tc.gpr[28];
-    if (mips_vaddr_is_kernel(cs, gp)) {
-        return gp;
-    }
-    return tp;
+    return env->active_tc.CP0_UserLocal;
 }
 
 static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
@@ -682,17 +655,12 @@ static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
     CPUMIPSState *env = cpu_env(cs);
     /*
      * UserLocal is user-TLS-only state the kernel has no use of its own
-     * for; it is reloaded from the incoming task at every switch and
-     * untouched in between, at any privilege.  The state it cannot vouch
-     * for: a no-TLS task (UserLocal 0) in the exception-vector window
-     * before SAVE_SOME re-derives $28 -- neither register names the task
-     * there, so the consumer inherits the entering thread.
+     * for; where the model implements it (Config3.ULRI) it is reloaded
+     * from the incoming task at every switch and untouched in between,
+     * at any privilege.  Without ULRI there is no such register to
+     * reload, so nothing is tracked.
      */
-    if (env->active_tc.CP0_UserLocal == 0 &&
-        (env->hflags & MIPS_HFLAG_KSU) != MIPS_HFLAG_UM) {
-        return mips_vaddr_is_kernel(cs, env->active_tc.gpr[28]);
-    }
-    return true;
+    return (env->CP0_Config3 >> CP0C3_ULRI) & 1;
 }
 
 /*

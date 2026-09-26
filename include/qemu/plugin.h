@@ -299,18 +299,6 @@ bool qemu_plugin_vm_reset_armed(void);
 void qemu_plugin_vm_reset_wait_placed(void);
 
 /*
- * Guest-kernel current-task location hint, declared by a plugin via
- * qemu_plugin_set_current_task_offset() and consumed by a target's
- * plugin-state hooks (today: x86-64's get_plugin_thread_ptr /
- * plugin_thread_ptr_tracks_current, which dereference the kernel
- * per-CPU base at this offset to name the running task at CPL0).
- * Returns the declared offset; *@set reports whether one was declared
- * at all -- an undeclared hint MUST leave the target's legacy
- * register-only behaviour untouched.
- */
-uint64_t qemu_plugin_current_task_offset(bool *set);
-
-/*
  * Never-split (atomic) code byte sequences registered by a plugin
  * (qemu_plugin_register_nosplit_code_sequences).  The translator consults
  * them at every clean TB-end decision and continues translating through a

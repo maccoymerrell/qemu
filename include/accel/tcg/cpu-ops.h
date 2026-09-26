@@ -112,17 +112,15 @@ struct TCGCPUOps {
      * kernel identifies the task that is CURRENT rather than the one that
      * last ran in user mode.  A function of the state, not a flat target
      * property, because the honest answer can depend on where the sample
-     * is taken: RISC-V's current-task rule (see the RISC-V
-     * @get_plugin_thread_ptr) holds at U/S privilege but not in M-mode
-     * firmware, which runs on its own tp with the S-mode sscratch parked,
-     * and not under H-extension virtualization.
+     * is taken (MIPS UserLocal exists only where Config3.ULRI says so).
      *
-     * Unconditionally true where the register is architecturally separate
-     * from anything the kernel needs for its own use and every mainstream
-     * kernel therefore reloads it from the incoming task at each context
-     * switch, leaving it untouched in between (MIPS CP0 UserLocal, AArch64
-     * TPIDR_EL0, x86-64 FS.base).  NULL (never trusted above user) on any
-     * target that cannot make the statement.
+     * True where the register is architecturally separate from anything
+     * the kernel needs for its own use, so a kernel reloads it from the
+     * incoming task at each context switch and leaves it untouched in
+     * between (MIPS CP0 UserLocal, AArch64 TPIDR_EL0, x86-64 FS.base).
+     * NULL (never trusted above user) on any target that cannot make the
+     * statement from architectural state alone -- RISC-V, whose tp is a
+     * general-purpose register a privileged mode may use for its own ends.
      *
      * Only meaningful alongside @get_plugin_thread_ptr; see
      * qemu_plugin_thread_ptr_tracks_current().

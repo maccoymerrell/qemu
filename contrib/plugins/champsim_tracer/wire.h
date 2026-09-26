@@ -52,6 +52,9 @@ struct HeaderFacts {
     std::string comment;
     std::string target_name;
     bool system = false;    /* system mode: SYSTEM and FAULT are claimed */
+    /* the targeted window (section 3) and warmup_end_trace_insn_idx */
+    uint64_t start = 0, warmup = 0, total = 0, warm_end = 0;
+    double weight = 0.0;
 };
 
 /* Returns the TraceISA byte for a QEMU target name, or -1 if not traced. */

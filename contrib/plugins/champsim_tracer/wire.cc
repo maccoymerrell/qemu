@@ -580,17 +580,17 @@ Bytes header_member(const HeaderFacts &facts,
     /* flags: memop values, register values, and the wrong-path chains */
     h.u8(kFlagMemData | (regdata ? kFlagRegData : 0) | (wp ? kFlagWp : 0) |
          (facts.system ? kFlagFault : 0));
-    h.uleb(0);          /* start_insn: no window, the timeline starts at 0 */
-    h.uleb(0);          /* warmup_insns: none configured */
-    h.uleb(0);          /* total_target_insns: 0 = unbounded */
-    h.f64(0.0);         /* simpoint_weight: not a simpoint segment */
+    h.uleb(facts.start);    /* the window as configured; 0s: none */
+    h.uleb(facts.warmup);
+    h.uleb(facts.total);    /* 0 = unbounded */
+    h.f64(facts.weight);    /* 0.0: not a simpoint segment */
     h.str(facts.command);
     h.str(facts.datetime);
     h.str(facts.comment);
     h.str(facts.target_name);
     h.section(encoding_maps(std::min(slots, kSlotCount), templates, regdata,
                             facts.system));
-    h.uleb(0);          /* warmup_end_trace_insn_idx: no warmup, ends at 0 */
+    h.uleb(facts.warm_end);     /* warmup_end_trace_insn_idx */
     h.uleb(templates.size());   /* templates section, to member EOF */
     for (size_t id = 0; id < templates.size(); id++) {
         h.section(template_payload(id, templates[id]));

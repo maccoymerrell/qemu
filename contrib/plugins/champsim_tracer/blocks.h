@@ -70,8 +70,10 @@ struct TbShape {
     int transfer = -1;  /* last insn the translator lowered a jump at */
     bool indirect = false;  /* ... to a run-time target */
     uint64_t target = 0;    /* ... else to this translator-resolved one */
-    /* As translated, until its first execution interns it (absorb()). */
+    /* As translated; each segment interns it at its first execution there */
     std::vector<Insn> raw;
+    uint32_t epoch = 0;         /* the segment whose ids insns holds */
+    bool end = false;           /* an END marker translated in a gated context */
     std::vector<size_t> traps;  /* conditional traps the translator lowered */
     std::vector<Regs> regs;     /* per insn, the register statement */
     /* where insn k's snapshot callback reads insn k - 1's destinations */
@@ -118,9 +120,15 @@ public:
      * translation: the translation callback runs under QEMU's mmap_lock,
      * which a wrong-path excursion takes while holding the plugin's lock.
      * A TB is translated for one privilege; @sys is the one it runs at.
+     * Each segment (@epoch) numbers instructions afresh.
      */
     void absorb(TbShape &tb, bool sys)
     {
+        if (tb.epoch == epoch) {
+            return;
+        }
+        tb.epoch = epoch;
+        tb.insns.clear();
         for (size_t k = 0; k < tb.raw.size(); k++) {
             tb.raw[k].sys = sys;
             InsnId id = intern(tb.raw[k]);
@@ -137,9 +145,9 @@ public:
         }
         if (!tb.raw.empty()) {
             translated(tb);
-            tb.raw = {};
         }
     }
+    uint32_t epoch = 1;
 
     /* Evidence that @id ends a true BB. */
     void ends_block(InsnId id)
@@ -175,6 +183,10 @@ public:
     /* @tb starts executing in thread @tid. */
     void begin(uint32_t tid, const TbShape *tb) { strand(tid).pending = tb; }
     const TbShape *pending(uint32_t tid) { return strand(tid).pending; }
+    /* @tid left what is traced: its open block ends where it stood */
+    void cut(uint32_t tid) { seal(tid, strand(tid), 0); }
+    /* Instructions the CP body holds so far, @tid's open block included */
+    size_t position(uint32_t tid) { return cp_insns_ + strand(tid).open.size(); }
 
     /*
      * Strand @tid runs in context @c from its next TB on; the block it has
@@ -567,7 +579,7 @@ private:
         s.rf = 0;
         list(tid).push_back(e);
         strand(tid).last = list(tid).size() - 1;
-        wp_insns_ += tid & kWp ? len : 0;
+        (tid & kWp ? wp_insns_ : cp_insns_) += len;
     }
 
     /* @units self-loop entries of @op, each with the next @share memops. */
@@ -616,6 +628,7 @@ private:
     std::map<uint32_t, Strand> strands_;
     Spill<Entry> entries_, wp_;
     size_t chain_ = 0, cp_ = 0, wp_insns_ = 0;  /* the excursion in flight */
+    size_t cp_insns_ = 0;
     MemSpill mems_;                 /* every entry's, pos = its index */
     size_t slots_ = 0;              /* learned trailing slots per branch */
 };

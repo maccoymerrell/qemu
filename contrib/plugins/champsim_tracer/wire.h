@@ -12,9 +12,12 @@
 #define CHAMPSIM_TRACER_WIRE_H
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
+
+#include "container.h"
 
 namespace cst {
 
@@ -35,6 +38,7 @@ public:
     void section(const Bytes &payload);    /* section := len:ULEB payload */
     void raw(const Bytes &o) { buf_.insert(buf_.end(), o.buf_.begin(), o.buf_.end()); }
     const std::vector<uint8_t> &data() const { return buf_; }
+    void clear() { buf_.clear(); }
 
 private:
     std::vector<uint8_t> buf_;
@@ -124,12 +128,22 @@ struct Memop {
 };
 
 /*
+ * The run's memops, spilled as they seal in a compact variable-length
+ * record -- flags, position, size, register, then only the significant
+ * bytes of address and value -- and named by byte offset.
+ */
+class MemSpill : public Spill<uint8_t> {
+public:
+    void push_back(const Memop &m);
+    Memop read(size_t &at) const;       /* the record at @at; @at passes it */
+};
+
+/*
  * One body entry (section 4.2) or wrong-path chain block (4.3) of thread
- * @tid, with the memops [begin, end) of the memop array; @base is the
+ * @tid, with the memops at [begin, end) of the memop spill; @base is the
  * block position of the entry's first instruction in the positions those
  * memops carry.  @stop cuts the executed range (0: whole), @fault is the
- * CST_FID_BB_FAULT_INSN (-1: none), @flags the bb_flag bits; a CP entry's
- * chain is [wp_b, wp_e) of the chain-block array.
+ * CST_FID_BB_FAULT_INSN (-1: none), @flags the bb_flag bits.
  */
 struct WireEntry {
     uint32_t tid, template_id, base;
@@ -137,8 +151,10 @@ struct WireEntry {
     uint32_t stop;
     int32_t fault;
     uint8_t flags;
-    size_t wp_b, wp_e;
 };
+/* Where the body's entries come from: a CP entry and its chain, in order */
+using EntrySink = std::function<void(const WireEntry &, const std::vector<WireEntry> &)>;
+using EntryFeed = std::function<void(const EntrySink &)>;
 
 /*
  * The header member: magic through the templates section (ids = index).
@@ -149,20 +165,21 @@ Bytes header_member(const HeaderFacts &facts,
                     bool wp, bool regdata);
 
 /*
- * The body member: lead magic, the opening (asid, thread) declaration of
- * section 4, the entries with their memops as field deltas (section 5),
- * END carrying their count, trailing magic.  @root_phys is the asid-0
- * label (section 4.1a).  With @wp each entry carries its chain of @chains
- * (section 4.3).  Returns in @slots the slots it addressed, in each
- * template instruction's @dep_mask_len its dependency mask lengths, and in
- * @census every execution's memop counts.
+ * The body member, written to @fd as it is encoded: lead magic, the
+ * opening (asid, thread) declaration of section 4, each entry @feed hands
+ * over with its memops as field deltas (section 5) and, with @wp, its
+ * chain (section 4.3), then END carrying their count, @count, and the
+ * trailing magic.  @root_phys is the asid-0 label (section 4.1a).  Returns
+ * in @slots the slots it addressed, in each template instruction's
+ * @dep_mask_len its dependency mask lengths, and in @census every
+ * execution's memop counts.  It keeps the field state in RAM -- threads x
+ * static code -- and nothing that grows with the body.  False: a write
+ * failed.
  */
-Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
-                  const std::vector<WireEntry> &entries,
-                  const std::vector<WireEntry> &chains,
-                  const std::vector<Memop> &memops, size_t &slots, bool wp,
-                  MemopCensus &census, const std::vector<uint8_t> &arena,
-                  int isa);
+bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &templates,
+                 const EntryFeed &feed, const MemSpill &memops,
+                 size_t &slots, size_t &count, bool wp, MemopCensus &census,
+                 const Spill<uint8_t> &arena, int isa);
 
 } /* namespace cst */
 

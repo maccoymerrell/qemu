@@ -14,7 +14,9 @@
  * with every destination's value after it runs, and after each block whose
  * transfer has a nameable alternative a wrong-path chain of the same facts
  * (excursion()).  It claims nothing else about an instruction; system mode
- * keeps an empty body.
+ * keeps an empty body.  The run streams to disk: what grows with it is
+ * spilled to <outfile>.cst.spill.* as it retires, and the close encodes
+ * the body from those files into the archive, file to file.
  *
  * Options:
  *   outfile=<path>   the trace is <path>.cst (required)
@@ -35,6 +37,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+
+#include <pthread.h>
+#include <unistd.h>
 
 #include <glib.h>            /* ahead of the C block: glib is C++-aware */
 extern "C" {
@@ -80,7 +85,7 @@ struct Session {
     std::map<unsigned int, const cst::TbShape *> xfer;
     WpStats wps{};
     bool regdata = true;
-    std::vector<uint8_t> arena;     /* register values past their 16th byte */
+    cst::Spill<uint8_t> arena;      /* register values past their 16th byte */
     GByteArray *buf = g_byte_array_new();
     uint64_t snaps = 0, unreadable = 0, overflow = 0;
 };
@@ -90,6 +95,20 @@ Session &session()
 {
     static Session *s = new Session;
     return *s;
+}
+
+/* The files the run streams to: CP entries, chain blocks, memops, arena */
+std::array<cst::SpillFile *, 4> spills(Session &s)
+{
+    auto b = s.blocks.spills();
+    return { b[0], b[1], b[2], &s.arena };
+}
+
+void on_fork_child()
+{
+    for (cst::SpillFile *f : spills(session())) {
+        f->fork_child();
+    }
 }
 
 void say(const std::string &msg)
@@ -281,7 +300,9 @@ void snapshot(Session &s, uint32_t tid, const cst::Regs &r, uint32_t pos)
         std::memcpy(&m.hi, s.buf->data + 8, 8);
         if (m.size > 16) {
             m.addr = s.arena.size();
-            s.arena.insert(s.arena.end(), s.buf->data + 16, s.buf->data + m.size);
+            for (unsigned b = 16; b < m.size; b++) {
+                s.arena.push_back(s.buf->data[b]);
+            }
         }
         s.snaps++;
         s.blocks.memop(tid, m);
@@ -392,33 +413,39 @@ void publish(uint64_t root_phys, const char *route)
         return qemu_plugin_u64_get(s.started, tid);
     });
     std::vector<cst::WireTemplate> templates;
-    std::vector<cst::WireEntry> entries, chains;
-    s.blocks.recut(templates, entries, chains, s.wpdepth);
     /* The body goes first, so the header can be finalised after it. */
-    size_t slots;
+    size_t slots, entries, chains = 0;
     cst::MemopCensus census;
-    cst::Member body = { "body.cst", cst::body_member(root_phys, templates,
-                         entries, chains, s.blocks.memops(), slots, s.wp,
-                         census, s.arena, s.facts.isa).data() };
+    cst::Member body = { "body.cst", {}, cst::scratch_fd(s.scratch_dir) };
+    bool ok = cst::body_member(body.fd, root_phys, templates,
+        [&s, &templates, &chains](const cst::EntrySink &sink) {
+            s.blocks.recut(templates, s.wpdepth,
+                [&](const cst::WireEntry &e, const std::vector<cst::WireEntry> &c) {
+                    chains += c.size();
+                    sink(e, c);
+                });
+        }, s.blocks.memops(), slots, entries, s.wp, census, s.arena, s.facts.isa);
+    std::string err = ok ? "" : "body not written to " + s.scratch_dir;
+    for (cst::SpillFile *f : spills(s)) {
+        err = f->failed() ? "the spill " + s.path + ".spill.* failed" : err;
+        f->remove();
+    }
     memop_tripwire(census, s.path);
     reg_report(s, s.path);
     const auto &st = s.blocks.stats;
-    say("entries=" + std::to_string(entries.size()) + " templates=" +
+    say("entries=" + std::to_string(entries) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
         std::to_string(st.early_exits) + " late_block_ends=" +
         std::to_string(st.late_ends) + "; revised " +
         std::to_string(st.revised_shapes) + " shapes, " +
         std::to_string(st.recut_entries) + " entries re-cut; memops=" +
-        std::to_string(std::count_if(s.blocks.memops().begin(),
-                                     s.blocks.memops().end(),
-                                     [](const cst::Memop &m) { return !m.reg; })) +
-        " max_slots=" +
+        std::to_string(st.memops) + " max_slots=" +
         std::to_string(slots) + " no_value=" + std::to_string(s.no_value) +
         " uneven_fanout=" + std::to_string(st.uneven_fanout));
     const WpStats &w = s.wps;
     if (s.wp && !s.system) {
         say("wp: excursions=" + std::to_string(w.launched) + " blocks=" +
-            std::to_string(chains.size()) + " first_unavail=" +
+            std::to_string(chains) + " first_unavail=" +
             std::to_string(w.first_unavail) + " unavail=" +
             std::to_string(w.unavail) + " exec_faults=" +
             std::to_string(w.exec_faults) + " bails unwind/slot/overflow/noseal/stall=" +
@@ -435,13 +462,17 @@ void publish(uint64_t root_phys, const char *route)
         body, { "header.cst", cst::header_member(s.facts, templates, slots,
                                                  s.wp, s.regdata).data() },
     };
-    std::string err;
-    bool ok = true;
+    ok = err.empty();
     for (cst::Member &m : members) {
         ok = ok && (s.compress.empty() ||
                     cst::filter_member(m, s.compress, s.scratch_dir, err));
     }
     ok = ok && cst::publish_archive(s.path, members, err);
+    for (cst::Member &m : members) {
+        if (m.fd >= 0) {
+            close(m.fd);
+        }
+    }
     say(ok ? "published " + s.path + " at " + route :
              "no trace published: " + err);
 }
@@ -456,6 +487,9 @@ void refuse_unattested(const char *route)
     std::lock_guard<std::recursive_mutex> guard(s.lock);
     if (!s.published) {
         s.published = true;
+        for (cst::SpillFile *f : spills(s)) {
+            f->remove();
+        }
         say(std::string(route) + " with no vCPU to read the address space "
             "from; no trace published");
     }
@@ -804,6 +838,17 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     std::fclose(probe);
     std::remove((s.path + ".part").c_str());
+    const char *names[] = { "cp", "wp", "mem", "arena" };
+    for (size_t k = 0; k < 4; k++) {
+        if (!spills(s)[k]->open(s.path + ".spill." + names[k])) {
+            say("cannot write " + s.path + ".spill." + names[k]);
+            for (cst::SpillFile *f : spills(s)) {
+                f->remove();
+            }
+            return -1;
+        }
+    }
+    pthread_atfork(nullptr, nullptr, on_fork_child);
 
     s.system = info->system_emulation;
     s.facts.isa = uint8_t(isa);

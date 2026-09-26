@@ -93,6 +93,57 @@ void Bytes::section(const Bytes &payload)
     buf_.insert(buf_.end(), payload.buf_.begin(), payload.buf_.end());
 }
 
+void MemSpill::push_back(const Memop &m)
+{
+    uint8_t b[40], *p = b + 2;
+    uint32_t pos = m.pos;
+    do {
+        *p++ = uint8_t((pos & 0x7f) | (pos > 0x7f ? 0x80 : 0));
+        pos >>= 7;
+    } while (pos);
+    *p++ = m.size;
+    *p++ = m.reg;
+    auto sig = [&p](uint64_t v) {     /* its significant bytes; how many */
+        uint8_t n = 0;
+        for (; v; v >>= 8, n++) {
+            *p++ = uint8_t(v);
+        }
+        return n;
+    };
+    b[1] = sig(m.addr);
+    b[0] = uint8_t(m.store | m.data_ok << 1 | m.fault << 2 | sig(m.lo) << 3);
+    b[1] |= uint8_t(sig(m.hi) << 4);
+    put(size(), b, size_t(p - b));
+}
+
+Memop MemSpill::read(size_t &at) const
+{
+    uint8_t b[40] = {};
+    get(at, b, std::min(sizeof(b), size() - at));
+    Memop m{};
+    m.store = b[0] & 1;
+    m.data_ok = b[0] >> 1 & 1;
+    m.fault = b[0] >> 2 & 1;
+    const uint8_t *p = b + 2;
+    for (unsigned sh = 0; sh == 0 || p[-1] & 0x80; sh += 7) {
+        m.pos |= uint32_t(*p++ & 0x7f) << sh;
+    }
+    m.size = *p++;
+    m.reg = *p++;
+    auto take = [&p](unsigned n) {
+        uint64_t v = 0;
+        for (unsigned k = 0; k < n; k++) {
+            v |= uint64_t(*p++) << 8 * k;
+        }
+        return v;
+    };
+    m.addr = take(b[1] & 15);
+    m.lo = take(b[0] >> 3);
+    m.hi = take(b[1] >> 4);
+    at += size_t(p - b);
+    return m;
+}
+
 int isa_for_target(const std::string &target_name)
 {
     /* TraceISA; the four ISAs the purpose statement names. */
@@ -415,12 +466,12 @@ private:
  * (section 2): Z N C V P, from EFLAGS ZF SF CF OF PF / NZCV.
  */
 void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
-             const std::vector<uint8_t> &arena, int isa)
+             const Spill<uint8_t> &arena, int isa)
 {
     static const int bit[2][5] = { { 6, 7, 0, 11, 2 }, { 30, 31, 29, 28, -1 } };
     Value v{ x.lo, x.hi };
-    if (x.size > 16) {
-        std::memcpy(&v[2], &arena[x.addr], x.size - 16);
+    for (unsigned k = 16; k < x.size; k++) {
+        v[k / 8] |= uint64_t(arena[x.addr + k - 16]) << (k % 8 * 8);
     }
     sec.put(ipos, reg_fid(x.reg - 1, false), v, Value{});
     sec.put(ipos, reg_fid(x.reg - 1, true), x.size);
@@ -441,37 +492,37 @@ void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
  */
 Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
                     std::vector<WireTemplate> &templates,
-                    const std::vector<Memop> &memops, size_t &slots,
-                    MemopCensus &census, const std::vector<uint8_t> &arena,
-                    int isa)
+                    const MemSpill &memops, size_t &slots,
+                    MemopCensus &census, const Spill<uint8_t> &arena, int isa)
 {
     WireTemplate &t = templates[e.template_id];
     uint32_t n = uint32_t(t.insns.size()), stop = e.stop ? e.stop : n;
     Section sec(own, fallback, e.tid, e.template_id);
-    size_t m = e.begin;
+    size_t m = e.begin, next = m;
+    Memop x = m < e.end ? memops.read(next) : Memop{};
     for (uint32_t ipos = 0; ipos < stop; ipos++) {
-        std::vector<const Memop *> dir[2];
-        for (; m < e.end && memops[m].pos - e.base == ipos; m++) {
-            const Memop &x = memops[m];
+        std::vector<Memop> dir[2];
+        for (; m < e.end && x.pos - e.base == ipos;
+             x = (m = next) < e.end ? memops.read(next) : x) {
             if (x.reg) {    /* a slot the template declares (variance aside) */
                 const std::vector<uint8_t> &dst = t.insns[ipos].regs->dst;
                 if (x.reg <= dst.size()) {
                     put_reg(sec, ipos, x, dst[x.reg - 1], arena, isa);
                 }
             } else {
-                dir[x.store].push_back(&x);
+                dir[x.store].push_back(x);
             }
         }
         for (int d = 0; d < 2; d++) {
             size_t c = std::min(dir[d].size(), kSlotCount);
             sec.put(ipos, d ? kFidNStores : kFidNLoads, c);
             for (size_t k = 0; k < c; k++) {
-                const Memop &x = *dir[d][k];
-                sec.put(ipos, slot_fid(k, d, 0), x.addr);
-                if (x.data_ok) {
-                    sec.put(ipos, slot_fid(k, d, 1), x.lo, x.hi);
+                const Memop &a = dir[d][k];
+                sec.put(ipos, slot_fid(k, d, 0), a.addr);
+                if (a.data_ok) {
+                    sec.put(ipos, slot_fid(k, d, 1), a.lo, a.hi);
                 }
-                sec.put(ipos, slot_fid(k, d, 2), x.size);
+                sec.put(ipos, slot_fid(k, d, 2), a.size);
             }
             slots = std::max(slots, c);
             /* the mask spans the widest count; u8, a larger one shows as over */
@@ -519,14 +570,19 @@ Bytes header_member(const HeaderFacts &facts,
     return h;
 }
 
-Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
-                  const std::vector<WireEntry> &entries,
-                  const std::vector<WireEntry> &chains,
-                  const std::vector<Memop> &memops, size_t &slots, bool wp,
-                  MemopCensus &census, const std::vector<uint8_t> &arena,
-                  int isa)
+bool body_member(int fd, uint64_t root_phys, std::vector<WireTemplate> &templates,
+                 const EntryFeed &feed, const MemSpill &memops,
+                 size_t &slots, size_t &count, bool wp, MemopCensus &census,
+                 const Spill<uint8_t> &arena, int isa)
 {
     Bytes b;
+    bool ok = true;
+    auto drain = [&](size_t above) {    /* to the file in 1 MiB strides */
+        if (b.data().size() >= above) {
+            ok = ok && write_all(fd, b.data().data(), b.data().size());
+            b.clear();
+        }
+    };
     b.u32(kMagic);
     b.u8(kTagAsid);     /* opening context, section 4: asid index 0 ... */
     b.sleb(0);
@@ -535,9 +591,10 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
     b.u8(kTagThread);   /* ... then thread 0 */
     b.sleb(0);
     Overlay cp, spec;   /* WP resolves WP -> CP -> default (section 5) */
-    slots = 0;
+    slots = count = 0;
     int64_t tid = 0, tmpl = 0;
-    for (const WireEntry &e : entries) {
+    feed([&](const WireEntry &e, const std::vector<WireEntry> &chain) {
+        count++;
         if (e.tid != tid) {
             b.u8(kTagThread);
             b.sleb(int64_t(e.tid) - tid);
@@ -550,21 +607,23 @@ Bytes body_member(uint64_t root_phys, std::vector<WireTemplate> &templates,
                                 census, arena, isa));
         if (wp) {
             Bytes ch;
-            ch.uleb(e.wp_e - e.wp_b);
+            ch.uleb(chain.size());
             int64_t prev = 0;   /* delta-coded within the chain */
-            for (size_t w = e.wp_b; w < e.wp_e; w++) {
-                ch.sleb(int64_t(chains[w].template_id) - prev);
-                prev = chains[w].template_id;
-                ch.section(entry_section(spec, &cp, chains[w], templates, memops,
+            for (const WireEntry &c : chain) {
+                ch.sleb(int64_t(c.template_id) - prev);
+                prev = c.template_id;
+                ch.section(entry_section(spec, &cp, c, templates, memops,
                                          slots, census, arena, isa));
             }
             b.section(ch);
         }
-    }
+        drain(1u << 20);
+    });
     b.u8(kTagEnd);
-    b.uleb(entries.size());
+    b.uleb(count);
     b.u32(kMagic);
-    return b;
+    drain(0);
+    return ok;
 }
 
 } /* namespace cst */

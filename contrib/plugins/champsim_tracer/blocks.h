@@ -16,12 +16,15 @@
  * the instruction whose callback delivered it, into whichever entry and
  * position that instruction lands in.  A wrong-path excursion runs through
  * the same machinery on the thread's WP strand (tid | kWp); its sealed
- * blocks become the chain of the CP entry that launched it.
+ * blocks become the chain of the CP entry that launched it.  Entries,
+ * chain blocks and memops are spilled to files as they seal (Spill): RAM
+ * holds what scales with the static code and the threads, never the run.
  */
 #ifndef CHAMPSIM_TRACER_BLOCKS_H
 #define CHAMPSIM_TRACER_BLOCKS_H
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -230,12 +233,13 @@ public:
             }
         }
         if (!tail.empty() && (bulk->units || !(n == 1 && s.reentered == last))) {
-            Entry &e = list(tid).back();
+            Entry e = list(tid).back();
             for (Memop t : tail) {
                 t.pos = uint32_t(shapes_[e.shape]->size() - 1);
-                mems_.push_back(t);
+                keep(t);
             }
             e.mem_e = mems_.size();
+            list(tid).set(list(tid).size() - 1, e);
         }
         s.reentered = bulk && bulk->reenter ? last : kNone;
         if (ran < n || skipped) {   /* this execution left the block here */
@@ -290,26 +294,31 @@ public:
         if (unavail) {
             seal(wtid, s);
         }
-        Entry &e = entries_[cp_];
+        Entry e = entries_[cp_];
         e.wp_b = chain_;
         e.wp_e = wp_.size();
-        if (unavail) {
-            (e.wp_b == e.wp_e ? e : wp_.back()).flags |= e.wp_b == e.wp_e ?
-                kFirstUnavail : kUnavail;
+        if (unavail && e.wp_b == e.wp_e) {
+            e.flags |= kFirstUnavail;
+        } else if (unavail) {
+            Entry w = wp_.back();
+            w.flags |= kUnavail;
+            wp_.set(wp_.size() - 1, w);
         }
+        entries_.set(cp_, e);
         strands_.erase(wtid);
     }
 
     /*
      * Re-cut every provisional shape at the final block ends and mint the
      * dictionary from what the body references, numbered in first-
-     * reference order.  A chain is cut so its ranges sum to @depth: the
+     * reference order, handing @emit each CP entry's pieces in order, the
+     * last with its chain.  A chain is cut so its ranges sum to @depth: the
      * block that crosses it stops there (a fault-marked one runs whole),
-     * and nothing after it is attributed (format.rst 4.4).
+     * and nothing after it is attributed (format.rst 4.4).  One pass over
+     * the spills, in the order they were written.
      */
-    void recut(std::vector<WireTemplate> &templates,
-               std::vector<WireEntry> &entries, std::vector<WireEntry> &wp,
-               size_t depth)
+    void recut(std::vector<WireTemplate> &templates, size_t depth,
+               const EntrySink &emit)
     {
         std::map<Shape, uint32_t> minted;
         std::vector<std::vector<uint32_t>> pieces(shapes_.size());
@@ -335,24 +344,27 @@ public:
             for (uint32_t t : pieces[e.shape]) {
                 uint32_t len = uint32_t(templates[t].insns.size());
                 size_t b = m;
-                while (m < e.mem_e && mems_[m].pos < base + len) {
-                    m++;
+                for (size_t at = m; m < e.mem_e && mems_.read(at).pos < base + len;) {
+                    m = at;
                 }
                 bool here = e.fault >= int32_t(base) && e.fault < int32_t(base + len);
                 out.push_back({ e.tid & ~kWp, t, base, b, m, 0,
-                                here ? e.fault - int32_t(base) : -1, 0, 0, 0 });
+                                here ? e.fault - int32_t(base) : -1, 0 });
                 base += len;
             }
             out.back().flags = e.flags & ~kFault;
             stats.recut_entries += pieces[e.shape].size() - 1;
         };
-        for (const Entry &e : entries_) {
-            split(e, entries);
-            std::vector<WireEntry> chain;
+        std::vector<WireEntry> pieces_of, chain, wp, none;
+        for (size_t i = 0; i < entries_.size(); i++) {
+            const Entry e = entries_[i];
+            pieces_of.clear();
+            chain.clear();
+            wp.clear();
+            split(e, pieces_of);
             for (size_t w = e.wp_b; w < e.wp_e; w++) {
                 split(wp_[w], chain);
             }
-            entries.back().wp_b = wp.size();
             size_t sum = 0;
             for (WireEntry &c : chain) {
                 if (sum >= depth) {
@@ -361,23 +373,29 @@ public:
                 size_t len = templates[c.template_id].insns.size();
                 if (sum + len > depth && c.fault < 0) {
                     c.stop = uint32_t(depth - sum);
-                    while (c.end > c.begin && mems_[c.end - 1].pos >= c.base + c.stop) {
-                        c.end--;
+                    size_t end = c.begin;   /* past the last memop it keeps */
+                    for (size_t at = c.begin; at < c.end;) {
+                        end = mems_.read(at).pos < c.base + c.stop ? at : end;
                     }
+                    c.end = end;
                 }
                 sum += len;
                 c.flags |= c.fault >= 0 ? kFault : 0;
                 wp.push_back(c);
             }
-            entries.back().wp_e = wp.size();
+            for (size_t k = 0; k < pieces_of.size(); k++) {
+                emit(pieces_of[k], k + 1 == pieces_of.size() ? wp : none);
+            }
         }
     }
 
-    const std::vector<Memop> &memops() const { return mems_; }
+    const MemSpill &memops() const { return mems_; }
+    /* the files: CP entries, chain blocks, memops */
+    std::array<SpillFile *, 3> spills() { return { &entries_, &wp_, &mems_ }; }
 
     struct {
         uint64_t early_exits, late_ends, revised_shapes, recut_entries,
-                 uneven_fanout;
+                 uneven_fanout, memops;
     } stats{};
 
 private:
@@ -420,9 +438,12 @@ private:
     {
         if (!s.open.empty()) {
             size_t b = mems_.size();
-            mems_.insert(mems_.end(), s.omem.begin(), s.omem.end());
-            add(tid, { tid, shape_id(s.open), b, mems_.size() }, s.open.size());
-            list(tid).back().fault = s.fault;
+            for (const Memop &m : s.omem) {
+                keep(m);
+            }
+            Entry e{ tid, shape_id(s.open), b, mems_.size() };
+            e.fault = s.fault;
+            add(tid, e, s.open.size());
             s.open.clear();
             s.omem.clear();
             s.fault = -1;
@@ -430,7 +451,12 @@ private:
         s.slots_due = 0;
     }
 
-    std::vector<Entry> &list(uint32_t tid) { return tid & kWp ? wp_ : entries_; }
+    Spill<Entry> &list(uint32_t tid) { return tid & kWp ? wp_ : entries_; }
+    void keep(const Memop &m)
+    {
+        mems_.push_back(m);
+        stats.memops += !m.reg;
+    }
     void add(uint32_t tid, const Entry &e, size_t len)
     {
         list(tid).push_back(e);
@@ -447,12 +473,14 @@ private:
             size_t b = mems_.size();
             bool fault = false;
             for (size_t j = 0; j < share; j++) {
-                mems_.push_back(m[j]);
-                mems_.back().pos = 0;
-                fault |= m[j].fault;
+                Memop x = m[j];
+                x.pos = 0;
+                keep(x);
+                fault |= x.fault;
             }
-            add(tid, { tid, self, b, mems_.size() }, 1);
-            list(tid).back().fault = fault ? 0 : -1;
+            Entry e{ tid, self, b, mems_.size() };
+            e.fault = fault ? 0 : -1;
+            add(tid, e, 1);
         }
     }
 
@@ -476,9 +504,9 @@ private:
     std::map<Shape, uint32_t> shape_ids_;
     std::vector<const Shape *> shapes_;
     std::map<uint32_t, Strand> strands_;
-    std::vector<Entry> entries_, wp_;
+    Spill<Entry> entries_, wp_;
     size_t chain_ = 0, cp_ = 0, wp_insns_ = 0;  /* the excursion in flight */
-    std::vector<Memop> mems_;       /* every entry's, pos = its index */
+    MemSpill mems_;                 /* every entry's, pos = its index */
     size_t slots_ = 0;              /* learned trailing slots per branch */
 };
 

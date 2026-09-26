@@ -31,10 +31,12 @@ std::string errno_text(const char *what)
     return std::string(what) + ": " + std::strerror(errno);
 }
 
-bool write_all(int fd, const uint8_t *p, size_t n)
+/* pread / pwrite (@off >= 0) or write (@off < 0) all @n bytes */
+bool io_all(int fd, uint8_t *p, size_t n, off_t off, bool rd)
 {
     while (n) {
-        ssize_t w = write(fd, p, n);
+        ssize_t w = rd ? pread(fd, p, n, off) : off < 0 ? write(fd, p, n) :
+                    pwrite(fd, p, n, off);
         if (w < 0 && errno == EINTR) {
             continue;
         }
@@ -43,23 +45,13 @@ bool write_all(int fd, const uint8_t *p, size_t n)
         }
         p += w;
         n -= size_t(w);
+        off += off < 0 ? 0 : w;
     }
     return true;
 }
 
-/* An anonymous file in @dir: created, then unlinked at once. */
-int scratch_fd(const std::string &dir)
-{
-    std::string tmpl = dir + "/.cst_member.XXXXXX";
-    int fd = mkstemp(&tmpl[0]);
-    if (fd >= 0) {
-        unlink(tmpl.c_str());
-    }
-    return fd;
-}
-
 /* File Layout: the codecs a reader dispatches on, by their stream magic. */
-const char *codec_suffix(const std::vector<uint8_t> &b)
+const char *codec_suffix(const uint8_t *b, size_t n)
 {
     static const struct { const char *suffix; std::vector<uint8_t> magic; }
     codecs[] = {
@@ -70,8 +62,7 @@ const char *codec_suffix(const std::vector<uint8_t> &b)
         { ".lz4", { 0x04, 0x22, 0x4d, 0x18 } },
     };
     for (const auto &c : codecs) {
-        if (b.size() >= c.magic.size() &&
-            std::equal(c.magic.begin(), c.magic.end(), b.begin())) {
+        if (n >= c.magic.size() && std::equal(c.magic.begin(), c.magic.end(), b)) {
             return c.suffix;
         }
     }
@@ -102,6 +93,113 @@ void ustar_header(uint8_t blk[512], const std::string &name, size_t size)
 
 } /* namespace */
 
+bool write_all(int fd, const uint8_t *p, size_t n)
+{
+    return io_all(fd, const_cast<uint8_t *>(p), n, -1, false);
+}
+
+int scratch_fd(const std::string &dir)
+{
+    std::string tmpl = dir + "/.cst_member.XXXXXX";
+    int fd = mkstemp(&tmpl[0]);
+    if (fd >= 0) {
+        unlink(tmpl.c_str());
+    }
+    return fd;
+}
+
+bool SpillFile::open(const std::string &path)
+{
+    path_ = path;
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    return fd_ >= 0;
+}
+
+void SpillFile::remove()
+{
+    if (fd_ >= 0) {
+        close(fd_);
+        unlink(path_.c_str());
+    }
+    fd_ = -1;
+    tail_ = {};
+    win_ = {};
+}
+
+/*
+ * After fork() the file is shared with the parent, which goes on writing
+ * it: the child copies what is on disk and continues in the copy, as it
+ * continues in its copy of RAM.
+ */
+void SpillFile::fork_child()
+{
+    if (fd_ < 0) {
+        return;
+    }
+    std::string path = path_ + "." + std::to_string(getpid());
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    loff_t in = 0, out = 0;
+    size_t left = disk_ * rec_;
+    while (fd >= 0 && left) {
+        ssize_t c = copy_file_range(fd_, &in, fd, &out, left, 0);
+        if (c <= 0) {
+            break;
+        }
+        left -= size_t(c);
+    }
+    bad_ |= fd < 0 || left;
+    close(fd_);
+    fd_ = fd;
+    path_ = path;
+}
+
+void SpillFile::put(size_t i, const void *rec, size_t n)
+{
+    auto *b = static_cast<const uint8_t *>(rec);
+    if (i < disk_) {
+        bad_ |= !io_all(fd_, const_cast<uint8_t *>(b), rec_, off_t(i * rec_), false);
+        if (i >= win0_ && i < win0_ + winn_) {
+            std::memcpy(&win_[(i - win0_) * rec_], b, rec_);
+        }
+    } else if (i < n_) {
+        std::memcpy(&tail_[(i - disk_) * rec_], b, rec_);
+    } else {
+        tail_.insert(tail_.end(), b, b + n * rec_);
+        n_ += n;
+        if (n_ - disk_ >= cap_) {
+            bad_ |= fd_ < 0 ||
+                    !io_all(fd_, tail_.data(), tail_.size(), off_t(disk_ * rec_), false);
+            disk_ = n_;
+            tail_.clear();
+        }
+    }
+}
+
+void SpillFile::get(size_t i, void *rec, size_t n) const
+{
+    auto *o = static_cast<uint8_t *>(rec);
+    while (n) {
+        if (i < disk_ && (i < win0_ || i >= win0_ + winn_)) {
+            win0_ = i > cap_ / 8 ? i - cap_ / 8 : 0;    /* a little behind @i */
+            winn_ = std::min(cap_, disk_ - win0_);
+            win_.resize(winn_ * rec_);
+            if (!io_all(fd_, win_.data(), win_.size(), off_t(win0_ * rec_), true)) {
+                bad_ = true;
+                winn_ = 0;
+                std::memset(o, 0, n * rec_);
+                return;
+            }
+        }
+        const uint8_t *src = i < disk_ ? &win_[(i - win0_) * rec_] :
+                             &tail_[(i - disk_) * rec_];
+        size_t k = std::min(n, i < disk_ ? win0_ + winn_ - i : n_ - i);
+        std::memcpy(o, src, k * rec_);
+        o += k * rec_;
+        i += k;
+        n -= k;
+    }
+}
+
 bool filter_member(Member &m, const std::string &filter,
                    const std::string &scratch_dir, std::string &err)
 {
@@ -109,9 +207,9 @@ bool filter_member(Member &m, const std::string &filter,
      * The filter reads a file and writes a file: no pipe, so no SIGPIPE
      * and no deadlock between our writes and its output, whatever it does.
      */
-    int in = scratch_fd(scratch_dir), out = scratch_fd(scratch_dir);
+    int in = m.fd >= 0 ? m.fd : scratch_fd(scratch_dir), out = scratch_fd(scratch_dir);
     bool ok = in >= 0 && out >= 0 &&
-              write_all(in, m.bytes.data(), m.bytes.size()) &&
+              (m.fd >= 0 || write_all(in, m.bytes.data(), m.bytes.size())) &&
               lseek(in, 0, SEEK_SET) == 0;
     if (!ok) {
         err = errno_text("compress staging");
@@ -141,33 +239,21 @@ bool filter_member(Member &m, const std::string &filter,
             }
         }
     }
-    std::vector<uint8_t> packed;
-    if (ok) {
-        struct stat st;
-        ok = fstat(out, &st) == 0 && lseek(out, 0, SEEK_SET) == 0;
-        packed.resize(ok ? size_t(st.st_size) : 0);
-        size_t got = 0;
-        while (ok && got < packed.size()) {
-            ssize_t r = read(out, packed.data() + got, packed.size() - got);
-            if (r < 0 && errno == EINTR) {
-                continue;
-            }
-            ok = r > 0;
-            got += ok ? size_t(r) : 0;
-        }
-        if (!ok) {
-            err = errno_text("compress readback");
-        }
-    }
-    const char *suffix = ok ? codec_suffix(packed) : nullptr;
+    uint8_t head[8];
+    ssize_t got = ok ? pread(out, head, sizeof(head), 0) : 0;
+    const char *suffix = got > 0 ? codec_suffix(head, size_t(got)) : nullptr;
     if (ok && !suffix) {
         err = "compress command '" + filter +
               "' produced no codec a reader can dispatch on";
         ok = false;
     }
-    if (ok) {
+    if (ok) {           /* the member is the output now; its input is done */
         m.name += suffix;
-        m.bytes.swap(packed);
+        m.bytes = {};
+        m.fd = out;
+        out = -1;
+    } else if (in == m.fd) {
+        in = -1;        /* still the member's */
     }
     if (in >= 0) {
         close(in);
@@ -181,7 +267,8 @@ bool filter_member(Member &m, const std::string &filter,
 bool publish_archive(const std::string &path,
                      const std::vector<Member> &members, std::string &err)
 {
-    std::string staging = path + ".part";
+    /* per process: a forked child closes its own segment onto @path too */
+    std::string staging = path + ".part." + std::to_string(getpid());
     int fd = open(staging.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         err = errno_text(staging.c_str());
@@ -189,17 +276,30 @@ bool publish_archive(const std::string &path,
     }
     static const uint8_t zeros[1024] = {};
     bool ok = true;
+    std::vector<uint8_t> chunk(1u << 20);
     for (const Member &m : members) {
+        struct stat st;
+        size_t size = m.fd < 0 ? m.bytes.size() :
+                      fstat(m.fd, &st) == 0 ? size_t(st.st_size) : 0;
+        if (ok && size > 077777777777ull) {
+            err = m.name + " is " + std::to_string(size) +
+                  " bytes, past the ustar size field";
+            ok = false;
+        }
         uint8_t blk[512];
-        ustar_header(blk, m.name, m.bytes.size());
-        size_t pad = (512 - m.bytes.size() % 512) % 512;
+        ustar_header(blk, m.name, size);
         ok = ok && write_all(fd, blk, sizeof(blk)) &&
-             write_all(fd, m.bytes.data(), m.bytes.size()) &&
-             write_all(fd, zeros, pad);
+             write_all(fd, m.bytes.data(), m.bytes.size());
+        for (size_t at = 0; ok && m.fd >= 0 && at < size; at += chunk.size()) {
+            size_t n = std::min(chunk.size(), size - at);
+            ok = io_all(m.fd, chunk.data(), n, off_t(at), true) &&
+                 write_all(fd, chunk.data(), n);
+        }
+        ok = ok && write_all(fd, zeros, (512 - size % 512) % 512);
     }
     ok = ok && write_all(fd, zeros, sizeof(zeros));      /* end of archive */
     ok = ok && fsync(fd) == 0;
-    if (!ok) {
+    if (!ok && err.empty()) {
         err = errno_text(staging.c_str());
     }
     if (close(fd) != 0 && ok) {

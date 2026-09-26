@@ -101,10 +101,11 @@ struct Session {
         uint64_t ran = 0;       /* the pending TB's progress at an async entry */
     };
     std::map<unsigned int, Vcpu> vc;
-    std::map<uint64_t, uint32_t> by_tp;                 /* thread pointer -> tid */
+    /* per address space: thread pointer -> tid, user SP regions -> tid */
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> by_tp;
     /* per tid, its open fault frames: (handler privilege, resume pc) */
     std::map<uint32_t, std::vector<std::pair<int, uint64_t>>> frames;
-    std::vector<std::pair<uint64_t, uint32_t>> regions; /* user SP -> tid */
+    std::map<uint64_t, std::vector<std::pair<uint64_t, uint32_t>>> regions;
     uint32_t tids = 0;
     uint64_t shared_runs = 0, unseparated = 0, excluded = 0;
     std::set<std::pair<uint32_t, uint64_t>> sighted;    /* contexts with a REGFILE */
@@ -728,9 +729,12 @@ cst::Bytes regfile(Session &s)
 /*
  * System mode: the guest thread vCPU @v's next block runs as (INC6.md
  * resolution 1; format.rst 4.1).
+ * Names are per address space (fork's child copies its parent's thread
+ * pointer and stack; exec keeps the task but not the program):
  * - The thread pointer, where it names the current thread: at user
  *   privilege, and above it where the target says the register tracks the
- *   thread -- asked again at every sample.
+ *   thread -- asked again at every sample.  A thread that sets its own
+ *   (new) thread pointer in user code keeps its id.
  * - Without one (0, or untracked), at a TRUE ENDPOINT only -- @ep, a user
  *   entry or return the engine stated with its stack pointer, or the first
  *   user block after a return with no event (a system call's) -- the user
@@ -743,14 +747,21 @@ cst::Bytes regfile(Session &s)
  *   boots on) has none to keep: both are the vCPU's own anonymous strand,
  *   which no other vCPU can execute concurrently.
  */
-uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep)
+uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep, uint64_t as)
 {
     constexpr uint64_t kRegion = 1u << 18;
     uint64_t tp = qemu_plugin_get_thread_ptr();
     bool trk = priv == 0 || qemu_plugin_thread_ptr_tracks_current();
     bool shared = false;
     if (tp && trk) {
-        v.tid = s.by_tp.emplace(tp, s.tids).first->second;
+        /*
+         * A thread pointer first seen in user code that ran straight on
+         * from user code (no kernel between), or stated on its entry to the
+         * kernel (above), was set by the thread itself: its TLS, not another
+         * thread -- a thread cannot change there.
+         */
+        bool own = !priv && !v.priv && v.tid != ~0u && !ep;
+        v.tid = s.by_tp.emplace(std::make_pair(as, tp), own ? v.tid : s.tids).first->second;
         s.tids += v.tid == s.tids;
         v.named = true;
     } else if (ep || (priv == 0 && (v.priv != 0 || v.tid == ~0u))) {
@@ -760,7 +771,8 @@ uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep)
         }
         auto dist = [sp](const std::pair<uint64_t, uint32_t> &r) {
             return r.first > sp ? r.first - sp : sp - r.first; };
-        auto r = std::min_element(s.regions.begin(), s.regions.end(),
+        auto &rg = s.regions[as];
+        auto r = std::min_element(rg.begin(), rg.end(),
             [&](const std::pair<uint64_t, uint32_t> &a,
                 const std::pair<uint64_t, uint32_t> &b) { return dist(a) < dist(b); });
         if (!sp) {              /* nothing separates it: refused at the close */
@@ -768,8 +780,8 @@ uint32_t identify(Session &s, Session::Vcpu &v, int priv, uint64_t ep)
             shared = true;
             v.tid = v.tid == ~0u ? (v.anon = s.tids++) : v.tid;
         } else {
-            if (r == s.regions.end() || dist(*r) > kRegion) {
-                r = s.regions.insert(s.regions.end(), { sp, s.tids++ });
+            if (r == rg.end() || dist(*r) > kRegion) {
+                r = rg.insert(rg.end(), { sp, s.tids++ });
             }
             r->first = sp;      /* the region follows its thread's stack */
             v.tid = r->second;
@@ -808,6 +820,15 @@ void on_tb_exec(unsigned int vcpu, void *udata)
             v.events = true;
         }
         nev = qemu_plugin_drain_cpu_events(vcpu, &ev);
+        for (size_t k = 0; k < nev && v.tid != ~0u && !v.priv; k++) {
+            /* a thread entering the kernel from its user code with a new
+             * TLS set it itself */
+            bool enter = ev[k].kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER ||
+                         ev[k].kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER;
+            if (enter && !ev[k].priv && ev[k].tp) {
+                s.by_tp.emplace(std::make_pair(ev[k].asid, ev[k].tp), v.tid);
+            }
+        }
         if (qemu_plugin_in_async_int()) {
             /* exclude async, keep sync: the handler never reaches the trace */
             v.ran = v.excl ? v.ran : qemu_plugin_u64_get(s.started, vcpu);
@@ -879,8 +900,8 @@ void on_tb_exec(unsigned int vcpu, void *udata)
         if (fr && priv == 0) {
             fr->clear();    /* a strand back in user code is in no handler */
         }
-        c.tid = identify(s, v, priv, ep);
         c.asid = qemu_plugin_get_addr_space_id();
+        c.tid = identify(s, v, priv, ep, c.asid);
         auto &f = s.frames[c.tid];
         while (!f.empty() && (f.back().first > priv ||
                               f.back().second == s.blocks.insn(tb->insns.front()).pc)) {

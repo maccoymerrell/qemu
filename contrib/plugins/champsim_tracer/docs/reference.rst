@@ -512,3 +512,62 @@ Absent from the families by design: an address computed into a register
 it reads are the ones its composition names; an atomic read-modify-write
 keeps the default (the registers its accesses move are not stated); and a
 register statement QEMU marked incomplete never gets ``HAS_REG``.
+
+.. _lane-masks:
+
+Lane masks: what this writer states
+-----------------------------------
+
+The four lane-mask families (:doc:`format`, "Vector lane masks") are body
+fields: every execution of a ``CST_INSN_FLAG_VEC`` instruction publishes
+its masks as deltas against the last ones, like every other slotted
+field.  What they are computed from is QEMU's vector statement
+(``qemu_plugin_insn_vector_shape()``), made where the emission holds the facts --
+the element size, the bytes of each register operated on, whether the
+active count is the encoding's or the ``vl`` register's, the element a
+single-element form selects, whether the operation is element-wise, and
+the registers a RISC-V V operand spans:
+
+- the generic vector expanders state an element-wise operation of one
+  element size over whole registers; an expander working on part of a
+  register, or several of different shapes in one instruction, makes the
+  statement MIXED, which carries no masks;
+- AArch64: the multiple- and single-structure loads and stores (``ld1``-
+  ``ld4``, ``st1``-``st4``, one lane) and the three-register vector
+  floating-point funnel;
+- x86: the packed SSE/AVX floating-point funnels and ``pinsr*`` /
+  ``pextr*``;
+- RISC-V V: the single-width checks (``vv``/``vx``/``vi``/unary FP) and the
+  unit-stride and strided loads and stores, unmasked and one field, the
+  active count ``vl`` read at every execution;
+- MIPS MSA: the I8, I5, BIT, 2R, 2RF, 3R and 3RF families (less the
+  widening and narrowing members), ``ld.df`` / ``st.df``, ``insert`` /
+  ``copy_*`` and ``fill``.
+
+Every other vector encoding states no shape and carries no masks:
+out-of-line helpers whose element size the emission does not hold
+(``addp``, ``haddps``), broadcasts (``ld1r``), widening and narrowing
+forms, masked (predicated) RISC-V V forms -- their active elements are
+``v0``'s to say -- segment accesses, SVE loads and stores.
+``<outfile>.deps.tsv`` names each executed vector encoding ``masked``
+(``masked-parallel``) or ``refused-<why>`` with its opcode family, and the
+side log counts them.
+
+Per execution, a vector register slot's mask is the shape's lanes -- for
+an RVV one those below ``vl``, the members of a register group holding the
+elements after its base's -- or the one element a single-element form
+selects; a source that is also the destination (a merge, a pass-through)
+is read whole, less a selected element.  Memop masks follow the rank rule
+through the dependency block's association: the register a memop moves is
+the one ``dst_dep`` / ``store_data_dep`` name for its slot (the access
+statement's per-slot register where the block is per slot, else every
+register, whose masks are the same), and the memops of a register take its
+active lanes in slot order, each as many as its size spans in elements.
+A group's elements past its base register take none.
+
+``CST_INSN_FLAG_LANE_PARALLEL`` is set from the ruled family list --
+``VEC_ADD``, ``VEC_SUB``, ``VEC_MUL``, ``VEC_DIV``, ``VEC_SQRT``,
+``VEC_MADD``, ``VEC_MSUB``, ``VEC_LOGIC`` -- for an instruction whose
+emission QEMU states element-wise on every element; a pairwise, crypto or
+reduction member of those families (stated no shape, or not
+element-wise) keeps it clear.

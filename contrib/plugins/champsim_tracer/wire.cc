@@ -189,7 +189,36 @@ enum : uint32_t {
     /* after every memop slot: METAFLAGS, then DST_REG{k}, DST_REG_WIDTH{k} */
     kFidMeta = kFidSlot0 + 6 * 512, kFidReg0,
     kFidTaken = kFidReg0 + 512, kFidTarget,     /* past every register pair */
+    kFidLane0,      /* slot k of the SRC / DST / LOAD / STORE lane masks: + 4k + f */
 };
+const char *const kLaneFamilies[] = {
+    "CST_FID_SRC_LANE_MASK", "CST_FID_DST_LANE_MASK",
+    "CST_FID_LOAD_DATA_LANE_MASK", "CST_FID_STORE_DATA_LANE_MASK",
+};
+uint32_t lane_fid(size_t k, int family) { return kFidLane0 + 4 * uint32_t(k) + family; }
+constexpr uint8_t kInsnVec = 16, kInsnLaneParallel = 32;    /* insn_flag */
+
+/* CST_INSN_FLAG_VEC: a stated shape and a vector register to mask */
+bool vec(uint8_t id) { return id >= kRegVec && id < kRegPred; }
+bool vec_masked(const WireInsn &i)
+{
+    return (i.cls->vkind == kVecStatic || i.cls->vkind == kVecVl) &&
+           (std::any_of(i.regs->src.begin(), i.regs->src.end(), vec) ||
+            std::any_of(i.regs->dst.begin(), i.regs->dst.end(), vec));
+}
+
+/*
+ * CST_INSN_FLAG_LANE_PARALLEL: the ruled family list (a family whose lanes
+ * may be independent), for an emission QEMU states element-wise on every
+ * element.
+ */
+bool lane_parallel(const WireInsn &i)
+{
+    static const std::set<std::string> ruled = { "VEC_ADD", "VEC_SUB", "VEC_MUL",
+        "VEC_DIV", "VEC_SQRT", "VEC_MADD", "VEC_MSUB", "VEC_LOGIC" };
+    return vec_masked(i) && i.cls->ew && i.cls->dsel < 0 && i.cls->ssel < 0 &&
+           ruled.count(vocabulary(false)[i.cls->op]);
+}
 const char *const kSlotFamilies[] = {
     "CST_FID_LOAD_ADDR", "CST_FID_STORE_ADDR", "CST_FID_LOAD_DATA",
     "CST_FID_STORE_DATA", "CST_FID_LOAD_SIZE", "CST_FID_STORE_SIZE",
@@ -257,7 +286,7 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                     bool regdata, bool system)
 {
     std::map<unsigned, bool> regs;   /* every id the templates use */
-    size_t ndst = 0;
+    size_t ndst = 0, lanes[4] = {};     /* ... and the lane slots they mask */
     for (const WireTemplate &t : templates) {
         for (const WireInsn &i : t.insns) {
             for (const auto *l : { &i.regs->src, &i.regs->dst }) {
@@ -266,6 +295,11 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                 }
             }
             ndst = std::max(ndst, i.regs->dst.size());
+            if (vec_masked(i)) {
+                lanes[0] = std::max(lanes[0], i.regs->src.size());
+                lanes[1] = std::max(lanes[1], i.regs->dst.size());
+                lanes[2] = lanes[3] = slots;
+            }
         }
     }
     MapEntries names, vocab[2];
@@ -288,6 +322,11 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
         for (int f = 0; f < 6; f++) {
             fids.push_back({ slot_fid(k, f & 1, f / 2),
                              kSlotFamilies[f] + std::to_string(k) });
+        }
+    }
+    for (int f = 0; f < 4; f++) {
+        for (size_t k = 0; k < lanes[f]; k++) {
+            fids.push_back({ lane_fid(k, f), kLaneFamilies[f] + std::to_string(k) });
         }
     }
     if (regdata) {
@@ -559,6 +598,23 @@ std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
     return has_reg ? fam : "address";
 }
 
+/*
+ * Whether a vector instruction's lanes are masked (and lane-parallel), or
+ * why not -- no shape stated, several, more than 64 lanes, another per
+ * retranslation, no vector register -- by opcode family; "-": not vector.
+ */
+std::string lane_status(const WireInsn &i)
+{
+    static const char *const why[] = { "none", "no-vector-reg", "no-vector-reg",
+                                       "mixed", "wide", "varies" };
+    const Class &c = *i.cls;
+    if (!c.vword && c.vkind == kVecNone) {
+        return "-";
+    }
+    return (vec_masked(i) ? lane_parallel(i) ? "masked-parallel" : "masked" :
+            std::string("refused-") + why[c.vkind]) + ":" + vocabulary(false)[c.op];
+}
+
 /* One template payload (section 6); its id is its index. */
 Bytes template_payload(uint64_t id, const WireTemplate &t, const MemopCensus &census,
                        std::map<uint32_t, std::string> &deps)
@@ -585,7 +641,9 @@ Bytes template_payload(uint64_t id, const WireTemplate &t, const MemopCensus &ce
         auto row = census.rows.find(i.id);
         Bytes dep;
         deps[i.id] = dep_block(i, row != census.rows.end() ? &row->second : nullptr, dep);
+        deps[i.id] += '\t' + lane_status(i);
         flags |= dep.data().empty() ? 0 : kInsnDeps;
+        flags |= vec_masked(i) ? kInsnVec | (lane_parallel(i) ? kInsnLaneParallel : 0) : 0;
         b.u8(flags | (i.sys ? kInsnSystem : 0));  /* and the privilege it ran at */
         b.u8(uint8_t(i.regs->src.size()));
         b.u8(uint8_t(i.regs->dst.size()));
@@ -724,6 +782,79 @@ void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
 }
 
 /*
+ * The lane masks of instruction @i at @ipos, this execution (format.rst
+ * "Vector lane masks"), @dir its loads and stores, @vl what an RVV one read.
+ * A vector register slot takes the shape's lanes -- those below vl for an
+ * RVV one, the members of a register group holding the elements after the
+ * base's -- or the element a single-element form selects; a source that is
+ * also the destination is read whole, less that element.  A memop takes, by
+ * the rank rule, the next lanes its size spans among its register's active
+ * ones (a group's base: the elements past it take none).  Its register is
+ * the one the dependency block names: the stated one where dep_block()
+ * names it per slot (a move whose accesses are complete, branch-free, one
+ * direction), else every one, whose masks are the same -- and a memop moving
+ * every register counts in each one's rank.
+ */
+void put_lanes(Section &sec, uint32_t ipos, const WireInsn &i,
+               const std::vector<Memop> *dir, const Memop *vl, MemopCensus &census)
+{
+    const Class &c = *i.cls;
+    const Regs &r = *i.regs;
+    if (!vec_masked(i) || (c.vkind == kVecVl && !(vl && vl->data_ok))) {
+        census.vl_unread += vec_masked(i);
+        return;
+    }
+    auto run = [](uint64_t n) { return n >= 64 ? ~uint64_t(0) : (uint64_t(1) << n) - 1; };
+    /* member m of an aligned register group holds elements m * vn on */
+    auto act = [&](uint8_t id, int8_t sel) {
+        uint64_t m = uint64_t(id - kRegVec) % c.vgroup * c.vn;
+        uint64_t n = c.vkind == kVecVl ? vl->lo : uint64_t(c.vn) * c.vgroup;
+        return sel >= 0 ? uint64_t(1) << sel : run(n > m ? std::min<uint64_t>(n - m, c.vn) : 0);
+    };
+    const uint64_t full = run(c.vn), dmask = act(kRegVec, c.dsel), smask = act(kRegVec, c.ssel);
+    for (size_t k = 0; k < r.src.size(); k++) {
+        bool merge = std::find(r.dst.begin(), r.dst.end(), r.src[k]) != r.dst.end();
+        if (vec(r.src[k])) {
+            sec.put(ipos, lane_fid(k, 0), merge ? full & ~(c.dsel >= 0 ? dmask : 0) :
+                                          act(r.src[k], c.ssel));
+        }
+    }
+    for (size_t k = 0; k < r.dst.size(); k++) {
+        if (vec(r.dst[k])) {
+            sec.put(ipos, lane_fid(k, 1), act(r.dst[k], c.dsel));
+        }
+    }
+    std::vector<const Acc *> listed[2];
+    for (const Acc &a : r.acc) {
+        if (a.dir) {
+            listed[a.dir != 1].push_back(&a);
+        }
+    }
+    const bool move = c.kind == kDepMove || c.kind == kDepMoveWb;
+    for (int d = 0; d < 2; d++) {
+        bool per = move && !(r.aflags & 3) && !i.fanout && !r.acc_varies &&
+                   listed[d].size() == dir[d].size() && listed[!d].empty() && dir[!d].empty();
+        /* per register slot the lanes taken so far; -1: by memops moving every one */
+        std::map<int, unsigned> used;
+        const std::vector<uint8_t> &regs = d ? r.src : r.dst;
+        const int first = int(std::find_if(regs.begin(), regs.end(), vec) - regs.begin());
+        for (size_t k = 0; k < std::min(dir[d].size(), kSlotCount); k++) {
+            const int reg = per ? listed[d][k]->reg : -1;
+            unsigned u = used[-1] + used[reg >= 0 ? reg : first];
+            unsigned span = std::max(1u, unsigned(dir[d][k].size / c.vesz)), rank = 0;
+            uint64_t m = 0, lanes = d ? smask : dmask;
+            for (unsigned j = 0; j < 64; j++) {
+                if (lanes >> j & 1 && rank++ - u < span) {
+                    m |= uint64_t(1) << j;
+                }
+            }
+            used[reg] += span;
+            sec.put(ipos, lane_fid(k, 2 + d), m);
+        }
+    }
+}
+
+/*
  * The delta section of entry or chain block @e: its memops and register
  * values over the range it ran, then its block-level cells at BLOCK_POS
  * (section 5.7).
@@ -741,9 +872,13 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
     Memop x = m < e.end ? memops.read(next) : Memop{};
     for (uint32_t ipos = 0; ipos < stop; ipos++) {
         std::vector<Memop> dir[2];
+        Memop vl{}, *vlp = nullptr;
         for (; m < e.end && x.pos - e.base == ipos;
              x = (m = next) < e.end ? memops.read(next) : x) {
-            if (x.reg) {    /* a slot the template declares (variance aside) */
+            if (x.reg == kVlRecord) {
+                vl = x;
+                vlp = &vl;
+            } else if (x.reg) {    /* a slot the template declares (variance aside) */
                 const std::vector<uint8_t> &dst = t.insns[ipos].regs->dst;
                 if (x.reg <= dst.size()) {
                     put_reg(sec, ipos, x, dst[x.reg - 1], arena, isa);
@@ -768,6 +903,7 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
             uint8_t &len = t.insns[ipos].dep_mask_len[d];
             len = uint8_t(std::min<size_t>(std::max<size_t>(len, dir[d].size()), 255));
         }
+        put_lanes(sec, ipos, t.insns[ipos], dir, vlp, census);
         MemopCensus::Row &row = census.rows[t.insns[ipos].id];
         row.insn = &t.insns[ipos];
         row.hist[int32_t(ipos) == e.fault ? 2 : fallback != nullptr]

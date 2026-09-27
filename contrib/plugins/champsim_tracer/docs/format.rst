@@ -3540,7 +3540,13 @@ wire already carries, so no field of its own is needed:
   active lane (the ``r``-th set bit of its ``DST_LANE_MASK`` /
   ``SRC_LANE_MASK``) and as many following lanes as its size spans in
   elements; this is the value ``LOAD_DATA_LANE_MASK{k}`` /
-  ``STORE_DATA_LANE_MASK{k}`` publishes.
+  ``STORE_DATA_LANE_MASK{k}`` publishes.  The rank counts lanes: a
+  memop spanning several lanes takes that many, and the register's next
+  memop starts at the active lane after them -- the lanes its address
+  relative to the access base gives.  AVX ``vpaddd (%rax), %ymm2, %ymm3``
+  makes two 16-byte loads of 4-byte elements: lanes ``{0..3}`` and
+  ``{4..7}``.  A memop past the register's active lanes publishes no
+  lane.
 
 A de-interleaving structure load is where both matter.  AArch64
 ``ld3 {v0.4s-v2.4s}, [x0]`` performs twelve 4-byte loads, element ``e``

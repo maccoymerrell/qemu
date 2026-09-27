@@ -90,6 +90,7 @@ struct Regs {
     std::vector<Acc> acc;
     uint8_t aflags = 0;
     bool acc_varies = false;
+    void *vl = nullptr;     /* the gdb handle of the vl register it reads */
     bool operator==(const Regs &o) const { return src == o.src && dst == o.dst; }
 };
 /* GenericRegId values this writer assigns, in section 5.4's bands */
@@ -134,6 +135,7 @@ struct WireTemplate { std::vector<WireInsn> insns; bool terminated; int bpos; };
 struct MemopCensus {
     struct Row { const WireInsn *insn; std::map<uint64_t, uint64_t> hist[3]; };
     std::map<uint32_t, Row> rows;
+    uint64_t vl_unread = 0;     /* RVV executions whose vl was not read */
 };
 
 /*
@@ -144,6 +146,7 @@ struct MemopCensus {
  * instruction (section 5.4): @size bytes, the first 16 in @lo/@hi, the rest
  * at @addr in the snapshot arena.
  */
+constexpr uint8_t kVlRecord = 255;  /* Memop @reg: the vl an execution read, in @lo */
 struct Memop {
     uint64_t addr, lo, hi;
     uint32_t pos;

@@ -70,11 +70,27 @@ inline const std::vector<std::string> &vocabulary(bool branch)
  */
 enum : uint8_t { kDepNone, kDepMove, kDepPush, kDepPop, kDepMoveWb };
 
+/*
+ * Its vector shape (qemu_plugin_insn_vector_shape()): none, lanes all active or
+ * below vl, the emission held several shapes, more than 64 lanes (or a
+ * selector outside them), or retranslations stated different shapes.
+ */
+enum : uint8_t { kVecNone, kVecStatic, kVecVl, kVecMixed, kVecWide, kVecVaries };
+
 /* An instruction's class: opcode, branch type, insn_flag bits, immediate */
 struct Class {
     uint8_t op = 0, br = 0, flags = 0;
     int64_t imm = 0;
     uint8_t kind = 0;   /* its dependency refiner family (wire.cc), by word */
+    /* the shape: @vn lanes of @vesz bytes a register, the element selected (-1: all) */
+    uint8_t vkind = kVecNone, vesz = 0, vn = 0, vgroup = 1;  /* registers an operand */
+    int8_t dsel = -1, ssel = -1;
+    bool ew = false, vword = false;     /* element-wise; a "vec." word */
+    bool same_shape(const Class &o) const
+    {
+        return vkind == o.vkind && vesz == o.vesz && vn == o.vn && vgroup == o.vgroup &&
+               dsel == o.dsel && ssel == o.ssel && ew == o.ew;
+    }
     bool operator==(const Class &o) const
     {
         return op == o.op && br == o.br && flags == o.flags && imm == o.imm &&

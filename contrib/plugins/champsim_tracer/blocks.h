@@ -83,6 +83,7 @@ struct TbShape {
     struct Ea { const TbShape *tb; uint32_t pos; void *base, *index;
                 uint8_t shift; int8_t ext; int64_t disp; };
     std::vector<Ea> ea;
+    std::vector<Ea> vl;     /* per RVV instruction: the vl register it reads */
     /* where insn k's snapshot callback reads insn k - 1's destinations */
     struct At { const TbShape *tb; uint32_t pos; };
     std::vector<At> at;
@@ -159,6 +160,7 @@ public:
             regs[id].acc_varies |= regs[id].acc != tb.regs[k].acc;
             regs[id].aflags |= tb.regs[k].aflags;
             cls_variance += !(cls[id] == tb.cls[k]);
+            cls[id].vkind = cls[id].same_shape(tb.cls[k]) ? cls[id].vkind : kVecVaries;
         }
         for (size_t t : tb.traps) {
             ends_block(tb.insns[t]);    /* a trap, in place */

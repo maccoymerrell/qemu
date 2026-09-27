@@ -320,6 +320,7 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
             }
         }
         ids.push_back(id);
+        out.vl = !std::strcmp(r[k].name, "vl") ? r[k].handle : out.vl;
         auto it = std::find_if(l.begin(), l.end(), [id](const Slot &x) {
             return x.id == id; });
         if (it == l.end()) {
@@ -395,6 +396,20 @@ void classify_insn(Session &s, struct qemu_plugin_insn *insn, cst::TbShape &tb)
     };
     auto k = ok ? kinds.find(d->word) : kinds.end();
     c.kind = k != kinds.end() ? k->second : cst::kDepNone;
+    /* the vector shape: at most 64 lanes, and a selector among them */
+    const struct qemu_plugin_insn_vector *v = qemu_plugin_insn_vector_shape(insn);
+    int n = v->esz ? v->oprsz / v->esz : 0;
+    bool fits = n >= 1 && n <= 64 && v->dsel < n && v->ssel < n;
+    c.vkind = v->kind == QEMU_PLUGIN_VEC_MIXED ? cst::kVecMixed : v->kind == QEMU_PLUGIN_VEC_NONE ?
+              cst::kVecNone : !fits ? cst::kVecWide : v->kind == QEMU_PLUGIN_VEC_VL ?
+              cst::kVecVl : cst::kVecStatic;
+    c.vesz = v->esz;
+    c.vn = uint8_t(fits ? n : 0);
+    c.vgroup = std::max<uint8_t>(v->group, 1);
+    c.dsel = v->dsel;
+    c.ssel = v->ssel;
+    c.ew = v->elementwise;
+    c.vword = d->word && !std::strncmp(d->word, "vec.", 4);
     tb.cls.push_back(c);
     const std::string &name = cst::vocabulary(false)[c.op];
     if (name != "PREFETCH" && name != "CACHE_FLUSH" && name != "TLB_FLUSH" &&
@@ -589,11 +604,11 @@ void vocab_report(const Session &s, Segment &g)
  * listed at <outfile>.deps.tsv.
  */
 void deps_report(Segment &g, const std::vector<cst::WireTemplate> &templates,
-                 const std::map<uint32_t, std::string> &deps)
+                 const std::map<uint32_t, std::string> &deps, uint64_t vl_unread)
 {
-    std::map<std::string, size_t> n;
+    std::map<std::string, size_t> n, lanes, vec;
     std::ofstream f(g.path.substr(0, g.path.size() - 4) + ".deps.tsv");
-    f << "pc\tbytes\tfamily\n";
+    f << "pc\tbytes\tfamily\tlanes\n";
     std::set<uint32_t> seen;
     for (const cst::WireTemplate &t : templates) {
         for (const cst::WireInsn &i : t.insns) {
@@ -601,7 +616,13 @@ void deps_report(Segment &g, const std::vector<cst::WireTemplate> &templates,
             if (d == deps.end() || !seen.insert(i.id).second) {
                 continue;
             }
-            n[d->second]++;
+            size_t tab = d->second.find('\t');
+            std::string ln = d->second.substr(tab + 1);
+            n[d->second.substr(0, tab)]++;
+            if (ln != "-") {
+                lanes[ln]++;
+                vec[ln.substr(0, ln.find(':'))]++;
+            }
             char hex[40] = "";
             for (unsigned k = 0; k < i.size; k++) {
                 std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
@@ -615,6 +636,18 @@ void deps_report(Segment &g, const std::vector<cst::WireTemplate> &templates,
         line += " " + c.first + "=" + std::to_string(c.second);
     }
     say("deps:" + line);
+    line = " vl_unread=" + std::to_string(vl_unread);
+    for (const auto &c : vec) {
+        line += " " + c.first + "=" + std::to_string(c.second);
+    }
+    std::string sep = " (";
+    for (const auto &c : lanes) {   /* each refusal by family */
+        if (c.first.compare(0, 7, "refused") == 0) {
+            line += sep + c.first + " x" + std::to_string(c.second);
+            sep = ", ";
+        }
+    }
+    say("lanes:" + line + (sep == ", " ? ")" : ""));
 }
 
 void drop_spills(Segment &g)
@@ -789,7 +822,7 @@ void encode(Session &s, Segment &g)
         body, { "header.cst", cst::header_member(facts, templates, slots, s.wp,
                                                  s.regdata, census, deps).data() },
     };
-    deps_report(g, templates, deps);
+    deps_report(g, templates, deps, census.vl_unread);
     ok = err.empty();
     for (cst::Member &m : members) {
         ok = ok && (s.compress.empty() ||
@@ -1490,6 +1523,37 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     }
 }
 
+/* The low 64 bits of the register behind gdb handle @h; false: unread */
+bool read_u64(void *h, uint64_t &v)
+{
+    GByteArray *b = g_byte_array_new();
+    bool ok = h && qemu_plugin_read_register(
+                       static_cast<struct qemu_plugin_register *>(h), b) > 0;
+    if (ok) {
+        std::memcpy(&v, b->data, std::min<size_t>(b->len, 8));
+    }
+    g_byte_array_free(b, true);
+    return ok;
+}
+
+/* An RVV instruction @udata begins: the vl it reads, its lanes' active count */
+void on_vl(unsigned int vcpu, void *udata)
+{
+    Session &s = session();
+    auto *e = static_cast<const cst::TbShape::Ea *>(udata);
+    if (s.marker && !qemu_plugin_u64_get(s.rec, vcpu)) {
+        return;
+    }
+    cst::Memop m{};
+    m.pos = e->pos;
+    m.reg = cst::kVlRecord;
+    m.data_ok = read_u64(e->base, m.lo);
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    if (!s.published && !(s.system && qemu_plugin_in_async_int())) {
+        s.g.blocks.memop(s.wp_tid ? s.wp_tid : vcpu, m);
+    }
+}
+
 /*
  * A prefetch / cache / TLB operation @udata begins: the load memop format.rst
  * 5.2 requires, synthesized from the address it names -- ADDRESS-ONLY, width
@@ -1503,15 +1567,8 @@ void on_ea(unsigned int vcpu, void *udata)
         return;
     }
     uint64_t v[2] = { 0, 0 };
-    for (int k = 0; k < 2; k++) {
-        void *h = k ? e->index : e->base;
-        GByteArray *b = g_byte_array_new();
-        if (h && qemu_plugin_read_register(
-                     static_cast<struct qemu_plugin_register *>(h), b) > 0) {
-            std::memcpy(&v[k], b->data, std::min<size_t>(b->len, 8));
-        }
-        g_byte_array_free(b, true);
-    }
+    read_u64(e->base, v[0]);
+    read_u64(e->index, v[1]);
     v[1] = e->ext == 32 ? uint32_t(v[1]) : e->ext == -32 ? uint64_t(int32_t(v[1])) : v[1];
     cst::Memop m{};
     m.addr = v[0] + (v[1] << e->shift) + uint64_t(e->disp);
@@ -1625,10 +1682,18 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
         }
     }
     /* after the snapshots, so the memops a strand receives stay in order */
-    for (const cst::TbShape::Ea &e : shape->ea) {
-        qemu_plugin_register_vcpu_insn_exec_cb(qemu_plugin_tb_get_insn(tb, e.pos),
-                                               on_ea, QEMU_PLUGIN_CB_R_REGS,
-                                               const_cast<cst::TbShape::Ea *>(&e));
+    for (size_t i = 0; i < n; i++) {
+        if (shape->cls[i].vkind == cst::kVecVl && shape->regs[i].vl) {
+            shape->vl.push_back({ shape.get(), uint32_t(i), shape->regs[i].vl, nullptr, 0, 0, 0 });
+        }
+    }
+    for (auto *l : { &shape->ea, &shape->vl }) {
+        for (const cst::TbShape::Ea &e : *l) {
+            qemu_plugin_register_vcpu_insn_exec_cb(qemu_plugin_tb_get_insn(tb, e.pos),
+                                                   l == &shape->ea ? on_ea : on_vl,
+                                                   QEMU_PLUGIN_CB_R_REGS,
+                                                   const_cast<cst::TbShape::Ea *>(&e));
+        }
     }
     /* RW: an excursion launched here saves, runs and restores the vCPU */
     qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, s.wp ? QEMU_PLUGIN_CB_RW_REGS :

@@ -189,6 +189,28 @@ void plugin_gen_record_addr_named(void);
 void plugin_gen_record_access_reg(intptr_t off);
 void plugin_gen_record_access(unsigned dir, TCGTemp *val);
 
+/*
+ * The vector statement (qemu_plugin_insn_vector_shape()): an operation on
+ * elements of 1 << @vece bytes over @oprsz bytes of each register operand
+ * (PLUGIN_VEC_* @flags), writing destination element @dsel alone and
+ * reading source element @ssel alone (-1: all).  The generic expanders
+ * state with PLUGIN_VEC_GVEC and their element-wise operations with
+ * PLUGIN_VEC_EW; a decode site's statement replaces theirs, and one with
+ * @oprsz 0 says the site holds no shape.  An expander operating on part of
+ * a register -- an operand offset inside one, not at its first byte -- or
+ * across more than one holds no register-wide shape, and makes the
+ * statement MIXED.
+ */
+#define PLUGIN_VEC_EW   1   /* element-wise */
+#define PLUGIN_VEC_VL   2   /* the active count is the vl register's */
+#define PLUGIN_VEC_GVEC 4   /* stated by the generic expanders */
+#define PLUGIN_VEC_GROUP(lg) ((lg) << 4)    /* 2^@lg registers an operand */
+void plugin_gen_record_vec(unsigned vece, unsigned oprsz, unsigned flags,
+                           int dsel, int ssel);
+/* An expander's element-wise operation on the operands at offsets @d..@c */
+void plugin_gen_record_gvec(unsigned vece, uint32_t oprsz, intptr_t d,
+                            intptr_t a, intptr_t b, intptr_t c);
+
 #else /* !CONFIG_PLUGIN */
 
 #define PLUGIN_ADDR_UNSTATED 1
@@ -210,6 +232,19 @@ static inline void plugin_gen_record_access_reg(intptr_t off)
 { }
 
 static inline void plugin_gen_record_access(unsigned dir, TCGTemp *val)
+{ }
+
+#define PLUGIN_VEC_EW   1
+#define PLUGIN_VEC_VL   2
+#define PLUGIN_VEC_GVEC 4
+#define PLUGIN_VEC_GROUP(lg) ((lg) << 4)
+static inline void plugin_gen_record_vec(unsigned vece, unsigned oprsz,
+                                         unsigned flags, int dsel, int ssel)
+{ }
+
+static inline void plugin_gen_record_gvec(unsigned vece, uint32_t oprsz,
+                                          intptr_t d, intptr_t a, intptr_t b,
+                                          intptr_t c)
 { }
 
 static inline

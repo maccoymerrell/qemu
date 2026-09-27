@@ -319,6 +319,13 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
                        "against this qemu-plugin.h", desc->path, version);
             goto err_symbol;
         }
+        if (version < 30 &&
+            plugin_imports(desc->path, "qemu_plugin_insn_vector_shape")) {
+            error_setg(errp, "Could not load plugin %s: it declares plugin API "
+                       "version %d and imports qemu_plugin_insn_vector_shape(), "
+                       "which is version 30's", desc->path, version);
+            goto err_symbol;
+        }
     }
 
     qemu_rec_mutex_lock(&plugin.lock);

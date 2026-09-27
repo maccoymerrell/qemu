@@ -176,6 +176,13 @@ struct qemu_plugin_insn {
     unsigned addr_next;
     intptr_t access_reg;
     unsigned access_flags;
+    /*
+     * The vector statement (qemu_plugin_insn_vector_shape()), and who made it:
+     * 0 none, 1 the generic expanders, 2 a decode site (whose stands).
+     * Reset per instruction.
+     */
+    struct qemu_plugin_insn_vector vec;
+    uint8_t vec_from;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

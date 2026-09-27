@@ -346,6 +346,12 @@ qemu_plugin_insn_access_list(const struct qemu_plugin_insn *insn, size_t *n,
     return *n ? (struct qemu_plugin_insn_access *)insn->access->data : NULL;
 }
 
+const struct qemu_plugin_insn_vector *
+qemu_plugin_insn_vector_shape(const struct qemu_plugin_insn *insn)
+{
+    return &insn->vec;
+}
+
 const struct qemu_plugin_insn_reg *
 qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
                           const char **opaque)

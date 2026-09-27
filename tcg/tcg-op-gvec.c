@@ -24,6 +24,7 @@
 #include "tcg/tcg-op-gvec-common.h"
 #include "tcg/tcg-gvec-desc.h"
 #include "tcg-has.h"
+#include "exec/plugin-gen.h"
 
 #define MAX_UNROLL  4
 
@@ -1204,6 +1205,7 @@ void tcg_gen_gvec_2(uint32_t dofs, uint32_t aofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, -1, -1);
     check_size_align(oprsz, maxsz, dofs | aofs);
     check_overlap_2(dofs, aofs, maxsz);
 
@@ -1268,6 +1270,7 @@ void tcg_gen_gvec_2i(uint32_t dofs, uint32_t aofs, uint32_t oprsz,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, -1, -1);
     check_size_align(oprsz, maxsz, dofs | aofs);
     check_overlap_2(dofs, aofs, maxsz);
 
@@ -1334,6 +1337,7 @@ void tcg_gen_gvec_2s(uint32_t dofs, uint32_t aofs, uint32_t oprsz,
 {
     TCGType type;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, -1, -1);
     check_size_align(oprsz, maxsz, dofs | aofs);
     check_overlap_2(dofs, aofs, maxsz);
 
@@ -1414,6 +1418,7 @@ void tcg_gen_gvec_3(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, bofs, -1);
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
@@ -1481,6 +1486,7 @@ void tcg_gen_gvec_3i(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, bofs, -1);
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
@@ -1549,6 +1555,7 @@ void tcg_gen_gvec_4(uint32_t dofs, uint32_t aofs, uint32_t bofs, uint32_t cofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, bofs, cofs);
     check_size_align(oprsz, maxsz, dofs | aofs | bofs | cofs);
     check_overlap_4(dofs, aofs, bofs, cofs, maxsz);
 
@@ -1619,6 +1626,7 @@ void tcg_gen_gvec_4i(uint32_t dofs, uint32_t aofs, uint32_t bofs, uint32_t cofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(g->vece, oprsz, dofs, aofs, bofs, cofs);
     check_size_align(oprsz, maxsz, dofs | aofs | bofs | cofs);
     check_overlap_4(dofs, aofs, bofs, cofs, maxsz);
 
@@ -3768,6 +3776,7 @@ void tcg_gen_gvec_cmp(TCGCond cond, unsigned vece, uint32_t dofs,
     TCGType type;
     uint32_t some;
 
+    plugin_gen_record_gvec(vece, oprsz, dofs, aofs, bofs, -1);
     check_size_align(oprsz, maxsz, dofs | aofs | bofs);
     check_overlap_3(dofs, aofs, bofs, maxsz);
 
@@ -3888,6 +3897,7 @@ void tcg_gen_gvec_cmps(TCGCond cond, unsigned vece, uint32_t dofs,
 
     TCGType type;
 
+    plugin_gen_record_gvec(vece, oprsz, dofs, aofs, -1, -1);
     check_size_align(oprsz, maxsz, dofs | aofs);
     check_overlap_2(dofs, aofs, maxsz);
 

@@ -278,6 +278,12 @@ typedef uint64_t qemu_plugin_id_t;
  *   this version's, so a plugin declaring an earlier one that imports it
  *   is refused at load.
  *
+ * version 30:
+ * - added qemu_plugin_insn_vector_shape: the shape a vector instruction's
+ *   emission states -- element size, operand size, where its active
+ *   element count is read, the element a single-element form selects.
+ *   A plugin declaring an earlier version that imports it is refused.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -289,7 +295,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 29
+#define QEMU_PLUGIN_VERSION 30
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -1037,6 +1043,65 @@ QEMU_PLUGIN_API
 const struct qemu_plugin_insn_access *
 qemu_plugin_insn_access_list(const struct qemu_plugin_insn *insn, size_t *n,
                              unsigned *flags);
+
+/**
+ * enum qemu_plugin_vec_kind - where a vector shape's active count is read
+ * @QEMU_PLUGIN_VEC_NONE: the emission stated no shape
+ * @QEMU_PLUGIN_VEC_STATIC: every element of @oprsz is operated on
+ * @QEMU_PLUGIN_VEC_VL: the elements below the value of the vl register
+ *   (RISC-V V) at execution are operated on
+ * @QEMU_PLUGIN_VEC_MIXED: the emission held more than one shape, or
+ *   operated on part of a register or across several
+ */
+enum qemu_plugin_vec_kind {
+    QEMU_PLUGIN_VEC_NONE,
+    QEMU_PLUGIN_VEC_STATIC,
+    QEMU_PLUGIN_VEC_VL,
+    QEMU_PLUGIN_VEC_MIXED,
+};
+
+/**
+ * struct qemu_plugin_insn_vector - the shape a vector emission states
+ * @kind: an enum qemu_plugin_vec_kind value
+ * @esz: the element size in bytes
+ * @oprsz: the bytes of each vector register operand operated on
+ * @dsel: the one element of the destination written (the others kept),
+ *   or -1 for every element operated on
+ * @ssel: the one element of a source that is not also the destination
+ *   read, or -1 for every element operated on
+ * @elementwise: element i of the destination is computed from element i
+ *   of each vector source alone
+ * @group: how many consecutive registers each operand spans, its elements
+ *   running on from one register to the next (RISC-V V LMUL > 1); @oprsz
+ *   is one register's
+ *
+ * Stated where the emission holds these facts: the generic vector
+ * expanders (an element-wise operation of one element size) and the
+ * targets' vector decode funnels.  A single-element form, a load that
+ * fills or a store that drains a register's elements in order, and an
+ * element-wise operation are each stated; a form the funnel does not hold
+ * the shape of (widening, narrowing, predicated, segment) is not.
+ */
+struct qemu_plugin_insn_vector {
+    uint8_t kind;
+    uint8_t esz;
+    uint16_t oprsz;
+    int8_t dsel, ssel;
+    bool elementwise;
+    uint8_t group;
+};
+
+/**
+ * qemu_plugin_insn_vector_shape() - the shape a vector emission states
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * Valid only during the translation callback.
+ *
+ * Returns: the statement; never NULL (@kind NONE when there is none).
+ */
+QEMU_PLUGIN_API
+const struct qemu_plugin_insn_vector *
+qemu_plugin_insn_vector_shape(const struct qemu_plugin_insn *insn);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

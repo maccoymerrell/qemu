@@ -513,6 +513,9 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     insn->addr_next = 0;
     insn->access_reg = -1;
     insn->access_flags = 0;
+    /* the vector statement, likewise */
+    memset(&insn->vec, 0, sizeof(insn->vec));
+    insn->vec_from = 0;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
 }
@@ -766,6 +769,60 @@ void plugin_gen_record_access(unsigned dir, TCGTemp *val)
         insn->access_reg = -1;
         access_rec(insn, dir, reg);
     }
+}
+
+/*
+ * A decode site's statement stands (the last one made); the expanders'
+ * stands while every one of them agrees, and is MIXED once two differ.
+ */
+void plugin_gen_record_vec(unsigned vece, unsigned oprsz, unsigned flags,
+                           int dsel, int ssel)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    bool gvec = flags & PLUGIN_VEC_GVEC;
+    struct qemu_plugin_insn_vector v = {
+        .kind = !oprsz ? QEMU_PLUGIN_VEC_NONE : flags & PLUGIN_VEC_VL ?
+                QEMU_PLUGIN_VEC_VL : QEMU_PLUGIN_VEC_STATIC,
+        .esz = oprsz ? 1 << vece : 0, .oprsz = oprsz,
+        .dsel = dsel, .ssel = ssel, .elementwise = flags & PLUGIN_VEC_EW,
+        .group = 1 << (flags >> 4),
+    };
+
+    if (!insn || (gvec && insn->vec_from == 2)) {
+        return;
+    }
+    if (gvec && insn->vec_from == 1 &&
+        (v.esz != insn->vec.esz || v.oprsz != insn->vec.oprsz ||
+         v.elementwise != insn->vec.elementwise)) {
+        insn->vec.kind = QEMU_PLUGIN_VEC_MIXED;
+        return;
+    }
+    if (!(gvec && insn->vec_from == 1)) {
+        insn->vec = v;
+        insn->vec_from = gvec ? 1 : 2;
+    }
+}
+
+void plugin_gen_record_gvec(unsigned vece, uint32_t oprsz, intptr_t d,
+                            intptr_t a, intptr_t b, intptr_t c)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    intptr_t ofs[4] = { d, a, b, c };
+    PluginRegDesc x, y;
+
+    /* an operand that starts inside a register, or ends past it */
+    for (int i = 0; insn && insn->vec_from != 2 && i < 4; i++) {
+        if (ofs[i] > 0 && reg_resolve(ofs[i], 1, &x) == PLUGIN_REG_ARCH &&
+            ((reg_resolve(ofs[i] - 1, 1, &y) == PLUGIN_REG_ARCH &&
+              x.cls == y.cls && x.index == y.index) ||
+             reg_resolve(ofs[i] + oprsz - 1, 1, &y) != PLUGIN_REG_ARCH ||
+             x.cls != y.cls || x.index != y.index)) {
+            insn->vec.kind = QEMU_PLUGIN_VEC_MIXED;
+            insn->vec_from = 1;
+            return;
+        }
+    }
+    plugin_gen_record_vec(vece, oprsz, PLUGIN_VEC_GVEC | PLUGIN_VEC_EW, -1, -1);
 }
 
 void plugin_gen_record_branch_target(uint64_t target_pc)

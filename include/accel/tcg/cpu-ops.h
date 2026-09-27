@@ -151,6 +151,19 @@ struct TCGCPUOps {
                               struct PluginRegDesc *desc);
 
     /**
+     * @plugin_word: the generic word of a decoder pattern
+     *
+     * Optional.  The per-instruction decode statement
+     * (qemu_plugin_insn_decode()) names the decodetree pattern that
+     * matched; this hook gives the word the target's own table states for
+     * it ("int.add", "mem.load" ...), or NULL for a pattern the table has
+     * no row for, and sets PLUGIN_WORD_* bits in @flags for what the row
+     * says of the pattern.  Identity, pattern by pattern: nothing is
+     * inferred.  plugin_word_lookup() does the lookup.
+     */
+    const char *(*plugin_word)(const char *pattern, unsigned *flags);
+
+    /**
      * @vaddr_is_kernel: classify a code virtual address's privilege domain
      *
      * Optional.  Returns true when @vaddr lies in the guest's KERNEL

@@ -936,6 +936,7 @@ void tcg_gen_atomic_cmpxchg_i32_chk(TCGv_i32 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);
+    plugin_gen_record_atomic();
     tcg_gen_atomic_cmpxchg_i32_int(retv, addr, cmpv, newv, idx, memop);
 }
 
@@ -1052,6 +1053,7 @@ void tcg_gen_atomic_cmpxchg_i64_chk(TCGv_i64 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);
+    plugin_gen_record_atomic();
     tcg_gen_atomic_cmpxchg_i64_int(retv, addr, cmpv, newv, idx, memop);
 }
 
@@ -1146,6 +1148,7 @@ void tcg_gen_atomic_cmpxchg_i128_chk(TCGv_i128 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & (MO_SIZE | MO_SIGN)) == MO_128);
+    plugin_gen_record_atomic();
     tcg_gen_atomic_cmpxchg_i128_int(retv, addr, cmpv, newv, idx, memop);
 }
 
@@ -1262,6 +1265,7 @@ void tcg_gen_atomic_##NAME##_i32_chk(TCGv_i32 ret, TCGTemp *addr,       \
 {                                                                       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);                       \
+    plugin_gen_record_atomic();                                         \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
         do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME);     \
     } else {                                                            \
@@ -1275,6 +1279,7 @@ void tcg_gen_atomic_##NAME##_i64_chk(TCGv_i64 ret, TCGTemp *addr,       \
 {                                                                       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);                       \
+    plugin_gen_record_atomic();                                         \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
         do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME);     \
     } else {                                                            \

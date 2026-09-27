@@ -329,6 +329,12 @@ static struct qemu_plugin_register *reg_handle(const char *name)
     return h;
 }
 
+const struct qemu_plugin_insn_decoded *
+qemu_plugin_insn_decode(const struct qemu_plugin_insn *insn)
+{
+    return &insn->decode;
+}
+
 const struct qemu_plugin_insn_reg *
 qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
                           const char **opaque)

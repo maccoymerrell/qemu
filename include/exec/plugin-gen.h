@@ -65,6 +65,21 @@ enum {
     PLUGIN_REG_MUTE_ALL,    /* the ops are stated otherwise (plugin_gen_reg) */
 };
 
+/*
+ * A target's word table (TCGCPUOps.plugin_word): each row states the word
+ * of the space-separated decoder patterns it lists, and what the listed
+ * patterns are besides -- the immediate field they decode is an address
+ * offset, or they are exclusive-monitor accesses.
+ */
+#define PLUGIN_WORD_IMM_ADDR 1
+#define PLUGIN_WORD_ATOMIC   2
+#define PLUGIN_WORD_NO_IMM   4  /* the decoded imm is no operand (a selector) */
+typedef struct PluginWordRow {
+    const char *word;
+    unsigned flags;
+    const char *patterns;
+} PluginWordRow;
+
 #ifdef CONFIG_PLUGIN
 
 bool plugin_gen_tb_start(CPUState *cpu, const struct DisasContextBase *db);
@@ -128,7 +143,59 @@ void plugin_gen_reg_covered(void);
 void plugin_gen_reg_mute(int mode);
 void plugin_gen_reg_opaque(const char *what);
 
+/*
+ * The decode statement (qemu_plugin_insn_decode()), made where the
+ * translator decodes.  plugin_gen_record_word(): the generic word, the
+ * last statement winning; plugin_gen_record_pattern(): the decoder pattern
+ * that matched (decodetree emits it on success), whose word the target's
+ * TCGCPUOps.plugin_word names unless a word was stated.  An immediate a
+ * decoder hands over is an operand unless plugin_gen_record_imm_address()
+ * (or a branch target) says the instruction used it as an address or as no
+ * operand at all; one the translator states itself (decoded, where the
+ * field is an encoding) is not replaced by the field.
+ * plugin_gen_record_ea(): the address a non-accessing instruction names,
+ * as CPU-state offsets of its base and index registers (-1: none).
+ */
+void plugin_gen_record_word(const char *word);
+
+const char *plugin_word_lookup(const PluginWordRow *rows, size_t n,
+                               const char *pattern, unsigned *flags);
+void plugin_gen_record_pattern(const char *name, bool has_imm, int64_t imm);
+void plugin_gen_record_atomic(void);
+void plugin_gen_record_imm(int64_t imm);
+void plugin_gen_record_imm_address(void);
+void plugin_gen_record_ea(intptr_t base, intptr_t index, unsigned shift,
+                          int ext, int64_t disp);
+
 #else /* !CONFIG_PLUGIN */
+
+static inline
+const char *plugin_word_lookup(const PluginWordRow *rows, size_t n,
+                               const char *pattern, unsigned *flags)
+{
+    *flags = 0;
+    return NULL;
+}
+
+static inline void plugin_gen_record_word(const char *word)
+{ }
+
+static inline
+void plugin_gen_record_pattern(const char *name, bool has_imm, int64_t imm)
+{ }
+
+static inline void plugin_gen_record_atomic(void)
+{ }
+
+static inline void plugin_gen_record_imm(int64_t imm)
+{ }
+
+static inline void plugin_gen_record_imm_address(void)
+{ }
+
+static inline void plugin_gen_record_ea(intptr_t base, intptr_t index,
+                                        unsigned shift, int ext, int64_t disp)
+{ }
 
 static inline
 bool plugin_gen_tb_start(CPUState *cpu, const struct DisasContextBase *db)

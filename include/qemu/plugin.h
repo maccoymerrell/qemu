@@ -149,6 +149,14 @@ struct qemu_plugin_insn {
     const char *reg_opaque;
     bool reg_covered;
     int reg_mute;
+    /*
+     * The decode statement (qemu_plugin_insn_decode()): the translator's
+     * plugin_gen_record_*() calls, reset per instruction.  @imm_addr: the
+     * stated immediate was consumed as an address (or is no operand), so
+     * it is not stated; @imm_stated: the translator stated it itself.
+     */
+    struct qemu_plugin_insn_decoded decode;
+    bool imm_addr, imm_stated;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

@@ -497,8 +497,119 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     insn->reg_opaque = NULL;
     insn->reg_covered = false;
     insn->reg_mute = PLUGIN_REG_MUTE_OFF;
+    /* the decode statement, likewise */
+    memset(&insn->decode, 0, sizeof(insn->decode));
+    insn->imm_addr = false;
+    insn->imm_stated = false;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
+}
+
+void plugin_gen_record_word(const char *word)
+{
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->decode.word = word;
+    }
+}
+
+void plugin_gen_record_pattern(const char *name, bool has_imm, int64_t imm)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        insn->decode.pattern = name;
+        if (has_imm && !insn->imm_stated) {     /* the translator's wins */
+            plugin_gen_record_imm(imm);
+            insn->imm_stated = false;
+        }
+    }
+}
+
+void plugin_gen_record_atomic(void)
+{
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->decode.atomic = true;
+    }
+}
+
+void plugin_gen_record_imm(int64_t imm)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        insn->decode.has_imm = true;
+        insn->decode.imm = imm;
+        insn->imm_stated = true;
+    }
+}
+
+void plugin_gen_record_imm_address(void)
+{
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->imm_addr = true;
+    }
+}
+
+/*
+ * The row of @rows naming @pattern.  Every target table is indexed once,
+ * on first use; each row's pattern list is split into its names.
+ */
+const char *plugin_word_lookup(const PluginWordRow *rows, size_t n,
+                               const char *pattern, unsigned *flags)
+{
+    static GHashTable *index;   /* rows -> (name -> row) */
+    static GMutex lock;
+    GHashTable *t;
+    const PluginWordRow *r;
+
+    g_mutex_lock(&lock);
+    index = index ? index : g_hash_table_new(NULL, NULL);
+    t = g_hash_table_lookup(index, rows);
+    if (!t) {
+        t = g_hash_table_new(g_str_hash, g_str_equal);
+        for (size_t i = 0; i < n; i++) {
+            char **names = g_strsplit_set(rows[i].patterns, " ", -1);
+
+            for (char **p = names; *p; p++) {
+                if (**p) {
+                    g_hash_table_insert(t, (gpointer)g_intern_string(*p),
+                                        (gpointer)&rows[i]);
+                }
+            }
+            g_strfreev(names);
+        }
+        g_hash_table_insert(index, (gpointer)rows, t);
+    }
+    r = g_hash_table_lookup(t, pattern);
+    g_mutex_unlock(&lock);
+    *flags = r ? r->flags : 0;
+    return r ? r->word : NULL;
+}
+
+static int reg_resolve(intptr_t off, unsigned size, PluginRegDesc *d);
+
+/* The gdb name of the register at CPU-state offset @off (none: NULL) */
+static const char *ea_reg(intptr_t off)
+{
+    PluginRegDesc d;
+
+    return off >= 0 && reg_resolve(off, 1, &d) == PLUGIN_REG_ARCH &&
+           d.cls != QEMU_PLUGIN_REG_ZERO ? g_intern_string(d.name) : NULL;
+}
+
+void plugin_gen_record_ea(intptr_t base, intptr_t index, unsigned shift,
+                          int ext, int64_t disp)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        insn->decode.has_ea = true;
+        insn->decode.ea_base = ea_reg(base);
+        insn->decode.ea_index = ea_reg(index);
+        insn->decode.ea_shift = shift;
+        insn->decode.ea_ext = ext;
+        insn->decode.ea_disp = disp;
+    }
 }
 
 void plugin_gen_record_branch_target(uint64_t target_pc)
@@ -507,6 +618,7 @@ void plugin_gen_record_branch_target(uint64_t target_pc)
     if (insn) {
         insn->branch_target_pc = target_pc;
         insn->transfer_kind = QEMU_PLUGIN_TRANSFER_STATIC;
+        insn->imm_addr = true;  /* an encoded offset was the target's */
     }
 }
 
@@ -866,8 +978,20 @@ void plugin_gen_insn_end(void)
     const DisasContextBase *db = tcg_ctx->plugin_db;
     struct qemu_plugin_insn *pinsn = tcg_ctx->plugin_insn;
 
+    const TCGCPUOps *ops = reg_cpu ? reg_cpu->cc->tcg_ops : NULL;
+
     pinsn->len = db->fake_insn ? db->record_len : db->pc_next - pinsn->vaddr;
     reg_walk(db, pinsn);
+    /* a pattern's row: its word, unless the translator stated one */
+    if (pinsn->decode.pattern && ops && ops->plugin_word) {
+        unsigned f = 0;
+        const char *w = ops->plugin_word(pinsn->decode.pattern, &f);
+
+        pinsn->decode.word = pinsn->decode.word ? pinsn->decode.word : w;
+        pinsn->imm_addr |= f & (PLUGIN_WORD_IMM_ADDR | PLUGIN_WORD_NO_IMM);
+        pinsn->decode.atomic |= f & PLUGIN_WORD_ATOMIC;
+    }
+    pinsn->decode.has_imm &= !pinsn->imm_addr;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }

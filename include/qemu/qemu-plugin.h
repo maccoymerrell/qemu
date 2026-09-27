@@ -265,6 +265,12 @@ typedef uint64_t qemu_plugin_id_t;
  * - (qemu_plugin_set_current_task_offset, removed while the constant read
  *   26, is gone: the thread pointer is the architectural register alone.)
  *
+ * version 28:
+ * - added qemu_plugin_insn_decode: what the decode sites state an
+ *   instruction is -- its generic word and matched pattern, atomicity,
+ *   the operand immediate, and the address a prefetch or cache/TLB
+ *   maintenance operation names
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -276,7 +282,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 27
+#define QEMU_PLUGIN_VERSION 28
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -901,6 +907,63 @@ QEMU_PLUGIN_API
 const struct qemu_plugin_insn_reg *
 qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
                           const char **opaque);
+
+/**
+ * struct qemu_plugin_insn_decoded - what the decoder states it decoded
+ * @word: what the instruction does, as a dotted lowercase word whose first
+ *   part is its domain ("int.add", "fp.mul", "mem.load", "branch.cond",
+ *   "sys.syscall"); NULL when the translator stated none
+ * @pattern: the decoder pattern that matched, where the target's decoder
+ *   names its patterns; NULL elsewhere.  With no @word it says which
+ *   pattern the target has no word for.
+ * @atomic: the instruction is an atomic access: its translation emitted
+ *   an atomic read-modify-write or compare-and-swap, it carries a LOCK
+ *   prefix, or it is an exclusive-monitor (load-linked/store-conditional)
+ *   load or store
+ * @has_imm: the instruction encodes an operand immediate, held in @imm
+ *   sign-extended as the decoder extracted it.  An address displacement
+ *   or a branch offset is not an operand immediate.
+ * @imm: see @has_imm
+ * @has_ea: the instruction names a memory address it does not access
+ *   (a prefetch, or cache or TLB maintenance by address); the address is
+ *   @ea_disp plus the value of register @ea_base plus that of @ea_index,
+ *   extended by @ea_ext (0: as is, 32: its low 32 bits zero-extended,
+ *   -32: sign-extended) and shifted left by @ea_shift
+ * @ea_base: gdb name of the base register, or NULL for none
+ * @ea_index: gdb name of the index register, or NULL for none
+ * @ea_shift: see @has_ea
+ * @ea_ext: see @has_ea
+ * @ea_disp: see @has_ea; a pc-relative form states the absolute address
+ */
+struct qemu_plugin_insn_decoded {
+    const char *word;
+    const char *pattern;
+    bool atomic;
+    bool has_imm;
+    int64_t imm;
+    bool has_ea;
+    const char *ea_base;
+    const char *ea_index;
+    uint8_t ea_shift;
+    int8_t ea_ext;
+    int64_t ea_disp;
+};
+
+/**
+ * qemu_plugin_insn_decode() - what the decoder states it decoded
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * The decode sites' statement of what the instruction is: identity, not
+ * interpretation -- the translator states the pattern it matched and the
+ * word its target gives that pattern, and what its emission already knows
+ * (atomicity, the operand immediate, an address it names but does not
+ * access).  Valid only during the translation callback.
+ *
+ * Returns: the statement; never NULL.
+ */
+QEMU_PLUGIN_API
+const struct qemu_plugin_insn_decoded *
+qemu_plugin_insn_decode(const struct qemu_plugin_insn *insn);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

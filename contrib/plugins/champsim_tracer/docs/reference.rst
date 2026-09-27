@@ -448,3 +448,67 @@ Branch types (``BranchType``)
        always self-PC) and so the fan-out shape is obvious at
        template-parse time.
 
+
+.. _dependency-blocks:
+
+Dependency blocks: what this writer states
+------------------------------------------
+
+An instruction's dependency sub-block (:doc:`format`, Step 4.5) is only
+ever a refinement of the all-to-all default, and the writer emits one only
+where a mask is strictly smaller than that default.  Every mask is computed
+from what QEMU states at translation -- the register list
+(``qemu_plugin_insn_reg_list()``), the decode word
+(``qemu_plugin_insn_decode()``) and the access statement
+(``qemu_plugin_insn_access_list()``): per memory callback the translation
+emits, the registers its decode site composed the address from (or that
+the address is a constant the encoding fixes: absolute, or pc-relative and
+folded), and, where the emission states it, the register the access moves.
+Nothing is read from the instruction bytes and nothing is inferred from the
+ops.
+
+An access list is trusted for a direction only when it is complete there:
+no helper that could access memory runs, or every execution delivered
+exactly the listed count and no op branches over a listed access.  Slot
+``k`` is taken to be the ``k``-th listed access only when no op branches
+over one and every execution delivered the listed count; otherwise a
+direction's slots share the union of its compositions.  A bulk (fan-out)
+instruction, and one whose retranslation stated a different list, carries
+no block.
+
+The families, each named in ``<outfile>.deps.tsv`` per encoding with the
+reason when none applies:
+
+``address``
+   ``HAS_ADDR`` only: each load and store address names the registers its
+   composition reads.  Models address generation apart from data: a load
+   issues when its address operands are ready, a store splits into its
+   address and data halves.
+``passthrough``
+   By decode word (``mem.load``, ``mem.store``, ``int.mov``, ``int.movzx``,
+   ``int.movsx``, ``fp.mov``, ``vec.load``, ``vec.store``, ``vec.mov``,
+   and the written-back ``mem.load.wb`` / ``mem.store.wb``): a loaded value
+   feeds the register the access names -- itself too, and the address
+   registers, when that register is also a source (a merge such as MIPS
+   ``lwl``); a data register no access names takes every load and the
+   sources no load's address reads.  A store's datum is the register its
+   access names, or nothing but the immediate for a constant.  A
+   written-back base depends on itself and the sources the accesses do not
+   move.  Models load-to-use wakeup on the load alone, store-data
+   forwarding, and writeback address updates off the data path.
+``vec-struct``
+   ``passthrough`` whose loads name two or more vector registers (AArch64
+   ``ld2``-``ld4``, ``ld1`` multiple): each register depends on its own
+   structure elements.  Models per-register wakeup of de-interleaving
+   structure loads.
+``stack``
+   ``mem.push`` / ``mem.pop``: the stack pointer depends only on itself
+   (and the immediate), a pushed datum on the sources less the stack
+   pointer and a load's address, a popped register on the loads.  Models a
+   stack engine: pointer updates off the data path.
+
+Absent from the families by design: an address computed into a register
+(``int.lea``) keeps the default, which is already exact -- the registers
+it reads are the ones its composition names; an atomic read-modify-write
+keeps the default (the registers its accesses move are not stated); and a
+register statement QEMU marked incomplete never gets ``HAS_REG``.

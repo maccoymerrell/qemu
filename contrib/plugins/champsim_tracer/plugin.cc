@@ -310,6 +310,7 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
                                                               &out.opaque);
     struct Slot { uint8_t id, access; void *handle; };
     std::vector<Slot> l;
+    std::vector<uint8_t> ids;   /* per list entry, its slot id */
     for (size_t k = 0; k < n; k++) {
         uint8_t id = reg_id(s.facts.isa, r[k]);
         if (s.facts.isa == 4 && r[k].reg_class == QEMU_PLUGIN_REG_FP) {
@@ -318,6 +319,7 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
                      r[j].index == r[k].index ? cst::kRegVec + r[k].index : id;
             }
         }
+        ids.push_back(id);
         auto it = std::find_if(l.begin(), l.end(), [id](const Slot &x) {
             return x.id == id; });
         if (it == l.end()) {
@@ -344,6 +346,25 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
             out.snap.push_back(x.handle);
         }
     }
+    /* the access statement, in these slots (-3: a register not in them) */
+    size_t na;
+    unsigned af;
+    const qemu_plugin_insn_access *a = qemu_plugin_insn_access_list(insn, &na, &af);
+    auto slot = [&ids](const std::vector<uint8_t> &v, int16_t k) {
+        auto it = k < 0 ? v.end() : std::find(v.begin(), v.end(), ids[k]);
+        return int8_t(k < 0 ? -1 : it == v.end() ? -3 : it - v.begin());
+    };
+    out.aflags = uint8_t(af);
+    for (size_t k = 0; k < na; k++) {
+        cst::Acc x{ a[k].dir, a[k].form, slot(out.src, a[k].base),
+                    slot(out.src, a[k].index), slot(out.src, a[k].seg),
+                    int8_t(a[k].reg == -2 ? -2 : slot(a[k].dir == QEMU_PLUGIN_MEM_R ?
+                                                      out.dst : out.src, a[k].reg)) };
+        x.form = x.base == -3 || x.index == -3 || x.seg == -3 ?
+                 QEMU_PLUGIN_ADDR_UNSTATED : x.form;
+        x.reg = x.reg == -3 ? -1 : x.reg;
+        out.acc.push_back(x);
+    }
     return out;
 }
 
@@ -363,6 +384,17 @@ void classify_insn(Session &s, struct qemu_plugin_insn *insn, cst::TbShape &tb)
                      std::string("unstated ") + (d->pattern ? d->pattern : "-"));
     c.flags |= (d->atomic ? cst::kInsnAtomic : 0) | (d->has_imm ? cst::kInsnImm : 0);
     c.imm = d->has_imm ? d->imm : 0;
+    static const std::map<std::string, uint8_t> kinds = {
+        { "mem.load", cst::kDepMove }, { "mem.store", cst::kDepMove },
+        { "vec.load", cst::kDepMove }, { "vec.store", cst::kDepMove },
+        { "int.mov", cst::kDepMove }, { "int.movzx", cst::kDepMove },
+        { "int.movsx", cst::kDepMove }, { "fp.mov", cst::kDepMove },
+        { "vec.mov", cst::kDepMove }, { "mem.push", cst::kDepPush },
+        { "mem.pop", cst::kDepPop },
+        { "mem.load.wb", cst::kDepMoveWb }, { "mem.store.wb", cst::kDepMoveWb },
+    };
+    auto k = ok ? kinds.find(d->word) : kinds.end();
+    c.kind = k != kinds.end() ? k->second : cst::kDepNone;
     tb.cls.push_back(c);
     const std::string &name = cst::vocabulary(false)[c.op];
     if (name != "PREFETCH" && name != "CACHE_FLUSH" && name != "TLB_FLUSH" &&
@@ -551,6 +583,40 @@ void vocab_report(const Session &s, Segment &g)
         std::to_string(s.ea_unstated));
 }
 
+/*
+ * The dependency statement's report: per executed encoding the family its
+ * block carries, or why it carries none (wire.cc dep_block()), counted and
+ * listed at <outfile>.deps.tsv.
+ */
+void deps_report(Segment &g, const std::vector<cst::WireTemplate> &templates,
+                 const std::map<uint32_t, std::string> &deps)
+{
+    std::map<std::string, size_t> n;
+    std::ofstream f(g.path.substr(0, g.path.size() - 4) + ".deps.tsv");
+    f << "pc\tbytes\tfamily\n";
+    std::set<uint32_t> seen;
+    for (const cst::WireTemplate &t : templates) {
+        for (const cst::WireInsn &i : t.insns) {
+            auto d = deps.find(i.id);
+            if (d == deps.end() || !seen.insert(i.id).second) {
+                continue;
+            }
+            n[d->second]++;
+            char hex[40] = "";
+            for (unsigned k = 0; k < i.size; k++) {
+                std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
+            }
+            f << std::hex << "0x" << i.pc << std::dec << '\t' << hex << '\t'
+              << d->second << '\n';
+        }
+    }
+    std::string line;
+    for (const auto &c : n) {
+        line += " " + c.first + "=" + std::to_string(c.second);
+    }
+    say("deps:" + line);
+}
+
 void drop_spills(Segment &g)
 {
     for (cst::SpillFile *f : spills(g)) {
@@ -718,10 +784,12 @@ void encode(Session &s, Segment &g)
             " syscalls_blocked=" +
             std::to_string(qemu_plugin_spec_syscall_blocked_count()));
     }
+    std::map<uint32_t, std::string> deps;
     std::vector<cst::Member> members = {
-        body, { "header.cst", cst::header_member(facts, templates, slots,
-                                                 s.wp, s.regdata).data() },
+        body, { "header.cst", cst::header_member(facts, templates, slots, s.wp,
+                                                 s.regdata, census, deps).data() },
     };
+    deps_report(g, templates, deps);
     ok = err.empty();
     for (cst::Member &m : members) {
         ok = ok && (s.compress.empty() ||

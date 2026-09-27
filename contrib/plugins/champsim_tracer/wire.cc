@@ -11,6 +11,7 @@
 #include <array>
 #include <cstring>
 #include <initializer_list>
+#include <set>
 #include <unordered_map>
 #include <utility>
 
@@ -174,6 +175,7 @@ constexpr uint8_t kFlagRegData = 2;     /* header_flag CST_FLAG_REG_DATA */
 constexpr uint8_t kFlagWp = 8;          /* header_flag CST_FLAG_WP */
 constexpr uint8_t kFlagFault = 16;      /* header_flag CST_FLAG_FAULT */
 constexpr uint8_t kInsnSystem = 128;    /* insn_flag CST_INSN_FLAG_SYSTEM */
+constexpr uint8_t kInsnDeps = 64;       /* insn_flag CST_INSN_FLAG_HAS_DEP_BLOCK */
 constexpr size_t kSlotCount = 512;      /* CST_FID_SLOT_COUNT, section 2 */
 
 /*
@@ -344,8 +346,222 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
     return b;
 }
 
+/*
+ * The dependency sub-block (format.rst Step 4.5, Reference section 3) of
+ * @i, appended to @b; returns the family it carries or why it carries
+ * none.  The default -- no block -- is all-to-all and always true; every
+ * mask here is a SUBSET of it, and only from what QEMU stated: the access
+ * statement's address compositions and moved registers, the decode word's
+ * refiner kind, the register slots.  An access list is trusted for a
+ * direction only when it is complete there: no helper could add accesses
+ * (or every execution delivered exactly the listed count and no branch
+ * could skip one), and a per-slot claim only when slot k is surely the
+ * k-th listed access (no branch, every execution the listed count).
+ */
+using Bits = std::array<uint64_t, 8>;   /* up to 512 positions */
+std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
+{
+    const Regs &r = *i.regs;
+    const size_t n = r.src.size(), L = i.dep_mask_len[0], S = i.dep_mask_len[1];
+    const bool imm = i.cls->flags & kInsnImm;
+    auto bit = [](Bits &m, size_t k) { m[k / 64] |= uint64_t(1) << (k % 64); };
+    auto range = [&](size_t lo, size_t hi) { Bits m{}; for (; lo < hi; lo++) bit(m, lo); return m; };
+    auto either = [](Bits a, const Bits &o) { for (int k = 0; k < 8; k++) a[k] |= o[k]; return a; };
+    Bits full = range(0, n + L), afull = range(0, n);
+    if (imm) { bit(full, n + L); bit(afull, n); }
+    if (n + L + 1 > 512 || r.acc_varies) {
+        return r.acc_varies ? "none:access-variance" : "none:wide";
+    }
+    /* the listed accesses per direction: loads (a prefetch's named one) */
+    const std::string &op = vocabulary(false)[i.cls->op];
+    bool synth = op == "PREFETCH" || op == "CACHE_FLUSH" || op == "TLB_FLUSH" ||
+                 op == "VEC_PREFETCH";
+    std::vector<const Acc *> dir[2], named;
+    for (const Acc &a : r.acc) {
+        (a.dir ? dir[a.dir != 1] : named).push_back(&a);
+    }
+    if (synth) {
+        dir[0] = named;
+    }
+    const size_t lim[2] = { L, S };
+    bool valid[2], slotted[2];
+    for (int d = 0; d < 2; d++) {
+        bool exact = true;
+        for (int p = 0; row && p < 2; p++) {
+            for (const auto &h : row->hist[p]) {
+                exact &= (d ? uint32_t(h.first) : h.first >> 32) == dir[d].size();
+            }
+        }
+        bool helpers = r.aflags & 1, branches = r.aflags & 2;
+        valid[d] = lim[d] && lim[d] <= dir[d].size() &&
+                   (!helpers || (exact && !branches)) && !i.fanout;
+        slotted[d] = valid[d] && exact && !branches;
+    }
+    auto amask = [&](const Acc *a) {
+        Bits m{};
+        for (int8_t k : { a->base, a->index, a->seg }) {
+            if (k >= 0) bit(m, size_t(k));
+        }
+        return a->form == 1 ? m : a->form == 2 ? Bits{} : afull;   /* REGS CONST */
+    };
+    std::vector<Bits> addr[2];
+    bool has_addr = false;
+    for (int d = 0; d < 2; d++) {
+        Bits u{};
+        for (const Acc *a : dir[d]) u = either(u, amask(a));
+        for (size_t k = 0; k < lim[d]; k++) {
+            addr[d].push_back(!valid[d] ? afull : slotted[d] ? amask(dir[d][k]) : u);
+            has_addr |= addr[d].back() != afull;
+        }
+    }
+    /* the register masks, by the word's refiner kind */
+    std::vector<Bits> dst(r.dst.size(), full), sd(S, full);
+    auto in_src = [&](uint8_t id) {
+        return int(std::find(r.src.begin(), r.src.end(), id) - r.src.begin()); };
+    Bits loads = range(n, n + L);
+    std::string fam = "address";
+    const uint8_t kind = r.opaque ? kDepNone : i.cls->kind;
+    const bool move = kind == kDepMove || kind == kDepMoveWb;
+    /*
+     * A written-back base (mem.*.wb) moves by its offset: it depends on the
+     * sources less the registers the accesses move, and itself.
+     */
+    std::set<int> base;
+    Bits wbm = range(0, n);
+    if (imm) bit(wbm, n + L);
+    for (const Acc &a : r.acc) {
+        for (int8_t k : { a.base, a.index, a.seg }) {
+            if (a.form == 1 && k >= 0) base.insert(k);
+        }
+        if (a.dir > 1 && a.reg >= 0) wbm[a.reg / 64] &= ~(uint64_t(1) << (a.reg % 64));
+    }
+    auto wb = [&](size_t d) {
+        int s = in_src(r.dst[d]);
+        if (kind != kDepMoveWb || !base.count(s)) return false;
+        dst[d] = wbm;
+        bit(dst[d], size_t(s));
+        return true;
+    };
+    if (move && valid[0] && dir[1].empty() && !S) {
+        /*
+         * passthrough: a loaded value moves to its register.  A destination
+         * no access names takes the loads and the sources no load's address
+         * reads (a merge from another register, vmovhps' second source).
+         */
+        std::set<int8_t> tgt;
+        Bits rest = range(0, n);
+        bool known = true;
+        for (const Acc *a : dir[0]) {
+            known &= a->form != 0;
+            for (int8_t k : { a->base, a->index, a->seg }) {
+                if (a->form == 1 && k >= 0) rest[k / 64] &= ~(uint64_t(1) << (k % 64));
+            }
+        }
+        for (size_t d = 0; d < r.dst.size(); d++) {
+            Bits m{};
+            int s = in_src(r.dst[d]);
+            for (size_t k = 0; slotted[0] && k < L; k++) {
+                if (dir[0][k]->reg == int8_t(d)) {
+                    bit(m, n + k);
+                    m = s < int(n) ? either(m, amask(dir[0][k])) : m;
+                    tgt.insert(int8_t(d));
+                }
+            }
+            bool data = r.dst[d] < kRegSeg || r.dst[d] == kRegSp ||
+                        r.dst[d] == kRegLr || r.dst[d] == kRegFp;
+            if (m != Bits{}) {
+                if (s < int(n)) bit(m, size_t(s));   /* a merge keeps its old value */
+                dst[d] = m;
+            } else if (wb(d)) {
+            } else if (s == int(n) && data && known) {
+                dst[d] = slotted[0] && std::all_of(dir[0].begin(), dir[0].end(),
+                    [](const Acc *a) { return a->reg >= 0; }) ? full : either(loads, rest);
+            }
+        }
+        fam = tgt.size() > 1 && op.compare(0, 4, "VEC_") == 0 ? "vec-struct" : "passthrough";
+    } else if (move && valid[1] && dir[0].empty() && !L) {
+        /* passthrough: a register's value moves to memory */
+        bool all = std::all_of(dir[1].begin(), dir[1].end(), [](const Acc *a) {
+            return a->reg != -1; });
+        auto moved = [&](const Acc *a) {    /* a constant: the zero reg or imm */
+            Bits m{};
+            int z = in_src(kRegZero);
+            if (a->reg >= 0) bit(m, size_t(a->reg));
+            if (a->reg == -2 && imm) bit(m, n);
+            if (a->reg == -2 && z < int(n)) bit(m, size_t(z));
+            return m;
+        };
+        Bits u{};
+        for (const Acc *a : dir[1]) u = either(u, moved(a));
+        for (size_t k = 0; k < S; k++) {
+            const Acc *a = slotted[1] ? dir[1][k] : nullptr;
+            sd[k] = a ? (a->reg == -1 ? full : moved(a)) : all ? u : full;
+        }
+        for (size_t d = 0; d < r.dst.size(); d++) {
+            wb(d);
+        }
+        fam = "passthrough";
+    } else if ((kind == kDepPush || kind == kDepPop) && in_src(kRegSp) < int(n)) {
+        /* stack: the pointer moves by a constant; the datum is the rest */
+        int sp = in_src(kRegSp);
+        Bits spm{};
+        bit(spm, size_t(sp));
+        if (imm) bit(spm, n + L);
+        bool alone = r.dst.size() == 1 && !S;       /* pop %sp */
+        for (size_t d = 0; d < r.dst.size(); d++) {
+            if (r.dst[d] == kRegSp && !(kind == kDepPush && dir[1].size() != 1)) {
+                dst[d] = kind == kDepPop && alone ? either(spm, loads) : spm;
+            } else if (kind == kDepPop && L) {
+                Bits m = loads;
+                if (in_src(r.dst[d]) < int(n)) bit(m, size_t(in_src(r.dst[d])));
+                dst[d] = m;
+            }
+        }
+        Bits data = kind == kDepPop ? loads : either(range(0, n), loads);
+        if (kind == kDepPush) {     /* less the pointer and a load's address */
+            if (imm) bit(data, n + L);
+            data[sp / 64] &= ~(uint64_t(1) << (sp % 64));
+            for (const Acc *a : dir[0]) {
+                for (int8_t k : { a->base, a->index, a->seg }) {
+                    if (a->form == 1 && k >= 0) data[k / 64] &= ~(uint64_t(1) << (k % 64));
+                }
+            }
+        }
+        for (size_t k = 0; k < S; k++) {
+            sd[k] = (kind == kDepPush && dir[1].size() != 1) || data == Bits{} ? full : data;
+        }
+        fam = "stack";
+    }
+    bool has_reg = false;
+    for (const auto *v : { &dst, &sd }) {
+        for (const Bits &m : *v) has_reg |= m != full;
+    }
+    if (!has_reg && !has_addr) {
+        return L + S ? (valid[0] || valid[1] ? "none:no-gain" : "none:list-incomplete")
+                     : "none";
+    }
+    auto uleb = [&b](const Bits &m) {     /* a multi-limb ULEB */
+        size_t top = 512;
+        while (top && !(m[(top - 1) / 64] >> ((top - 1) % 64) & 1)) top--;
+        for (size_t k = 0; k == 0 || k < top; k += 7) {
+            uint8_t v = uint8_t(m[k / 64] >> (k % 64) | (k % 64 > 57 && k / 64 < 7 ?
+                                                         m[k / 64 + 1] << (64 - k % 64) : 0)) & 0x7f;
+            b.u8(v | (k + 7 < top ? 0x80 : 0));
+        }
+    };
+    b.u8(uint8_t((has_reg ? 1 : 0) | (has_addr ? 2 : 0)));
+    if (has_reg) {
+        for (const auto *v : { &dst, &sd }) for (const Bits &m : *v) uleb(m);
+    }
+    if (has_addr) {
+        for (int d = 0; d < 2; d++) for (const Bits &m : addr[d]) uleb(m);
+    }
+    return has_reg ? fam : "address";
+}
+
 /* One template payload (section 6); its id is its index. */
-Bytes template_payload(uint64_t id, const WireTemplate &t)
+Bytes template_payload(uint64_t id, const WireTemplate &t, const MemopCensus &census,
+                       std::map<uint32_t, std::string> &deps)
 {
     Bytes b;
     const WireInsn &last = t.insns.back();
@@ -366,6 +582,10 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         b.u8(i.cls->op);
         b.u8(i.fanout ? rep : i.cls->br);
         uint8_t flags = i.cls->flags | (i.fanout ? kInsnCond : 0);
+        auto row = census.rows.find(i.id);
+        Bytes dep;
+        deps[i.id] = dep_block(i, row != census.rows.end() ? &row->second : nullptr, dep);
+        flags |= dep.data().empty() ? 0 : kInsnDeps;
         b.u8(flags | (i.sys ? kInsnSystem : 0));  /* and the privilege it ran at */
         b.u8(uint8_t(i.regs->src.size()));
         b.u8(uint8_t(i.regs->dst.size()));
@@ -383,6 +603,7 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         for (unsigned k = 0; k < i.size; k++) {
             b.u8(i.bytes[k]);
         }
+        b.raw(dep);
     }
     return b;
 }
@@ -573,7 +794,8 @@ Bytes entry_section(Overlay &own, const Overlay *fallback, const WireEntry &e,
 
 Bytes header_member(const HeaderFacts &facts,
                     const std::vector<WireTemplate> &templates, size_t slots,
-                    bool wp, bool regdata)
+                    bool wp, bool regdata, const MemopCensus &census,
+                    std::map<uint32_t, std::string> &deps)
 {
     Bytes h;
     h.u32(kMagic);
@@ -594,7 +816,7 @@ Bytes header_member(const HeaderFacts &facts,
     h.uleb(facts.warm_end);     /* warmup_end_trace_insn_idx */
     h.uleb(templates.size());   /* templates section, to member EOF */
     for (size_t id = 0; id < templates.size(); id++) {
-        h.section(template_payload(id, templates[id]));
+        h.section(template_payload(id, templates[id], census, deps));
     }
     return h;
 }

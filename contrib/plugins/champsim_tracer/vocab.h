@@ -63,13 +63,22 @@ inline const std::vector<std::string> &vocabulary(bool branch)
     return sets[branch];
 }
 
+/*
+ * The dependency refiner a word selects (wire.cc dep_block()): a move of a
+ * value between register and memory (and one that writes its base back); a
+ * stack push / pop.  From the decode word -- never the opcode.
+ */
+enum : uint8_t { kDepNone, kDepMove, kDepPush, kDepPop, kDepMoveWb };
+
 /* An instruction's class: opcode, branch type, insn_flag bits, immediate */
 struct Class {
     uint8_t op = 0, br = 0, flags = 0;
     int64_t imm = 0;
+    uint8_t kind = 0;   /* its dependency refiner family (wire.cc), by word */
     bool operator==(const Class &o) const
     {
-        return op == o.op && br == o.br && flags == o.flags && imm == o.imm;
+        return op == o.op && br == o.br && flags == o.flags && imm == o.imm &&
+               kind == o.kind;
     }
 };
 

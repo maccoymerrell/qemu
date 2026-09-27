@@ -68,11 +68,28 @@ int isa_for_target(const std::string &target_name);
  * lane masks index.  @snap[k] is the gdb handle DST_REG{k} is read
  * through (null: no snapshot, or the constant zero register when
  * @id is REG_ZERO); @opaque names what the statement could not state.
+ * @acc is the access statement (qemu_plugin_insn_access_list()) in these
+ * slots: per access its direction, address form and the src slots its
+ * address reads (-1 none), and the slot it moves -- dst for a load, src
+ * for a store (-1 unstated, -2 a constant); @aflags its HELPERS /
+ * BRANCHES bits; @acc_varies: a retranslation stated another.
  */
+struct Acc {
+    uint8_t dir, form;
+    int8_t base, index, seg, reg;
+    bool operator==(const Acc &o) const
+    {
+        return dir == o.dir && form == o.form && base == o.base &&
+               index == o.index && seg == o.seg && reg == o.reg;
+    }
+};
 struct Regs {
     std::vector<uint8_t> src, dst;
     std::vector<void *> snap;
     const char *opaque = nullptr;
+    std::vector<Acc> acc;
+    uint8_t aflags = 0;
+    bool acc_varies = false;
     bool operator==(const Regs &o) const { return src == o.src && dst == o.dst; }
 };
 /* GenericRegId values this writer assigns, in section 5.4's bands */
@@ -172,11 +189,15 @@ using EntryFeed = std::function<void(const EntrySink &)>;
 
 /*
  * The header member: magic through the templates section (ids = index).
- * @slots is how many load/store slots the body can address.
+ * @slots is how many load/store slots the body can address; @census, the
+ * memop counts each instruction's executions delivered, against which its
+ * dependency block is checked, and @deps receives per instruction the
+ * dependency family it carries (or why none) for the side log.
  */
 Bytes header_member(const HeaderFacts &facts,
                     const std::vector<WireTemplate> &templates, size_t slots,
-                    bool wp, bool regdata);
+                    bool wp, bool regdata, const MemopCensus &census,
+                    std::map<uint32_t, std::string> &deps);
 
 /*
  * The body member, written to @fd as it is encoded: lead magic, the

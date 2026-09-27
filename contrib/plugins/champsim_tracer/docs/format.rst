@@ -543,11 +543,12 @@ Decode by repeated outer-section unwrapping.
         (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
         carries only dep_block_flags + the masks.  HAS_REG and HAS_ADDR
         are independent: HAS_REG carries refiner-produced output deps
-        (per-dst-reg, per-store-data), HAS_ADDR carries walker-produced
-        per-memop address deps (which src_regs feed the load/store
-        address — so the consumer can fire each memop without waiting
-        on inputs irrelevant to its address).  See Reference §3 for
-        the bit layout inside each mask.
+        (per-dst-reg, per-store-data), HAS_ADDR carries per-memop
+        address deps (which src_regs feed the load/store address — so
+        the consumer can fire each memop without waiting on inputs
+        irrelevant to its address).  A family the block omits is the
+        all-to-all default for that family.  See Reference §3 for the
+        bit layout inside each mask.
    4.6  Template profile block (consumed from tmpl_section,
         immediately after the last insn descriptor, present only when
         the `CST_FLAG_PROFILE` header bit is set — resolve the
@@ -3495,7 +3496,14 @@ in this role; no other ISA has segmented addressing.
 Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore
-the block.
+the block.  The two families default separately: a block with
+``HAS_ADDR`` and no ``HAS_REG`` states the address masks and leaves
+every ``dst_dep`` / ``store_data_dep`` at the all-to-all default, and
+one with ``HAS_REG`` and no ``HAS_ADDR`` leaves every address mask
+naming every source.  An address mask never takes a source out of a
+register mask: a register that forms an address and also feeds a value
+(``add (%rax), %rax``) is named in both, and a register mask drops an
+address register only where the block's own ``HAS_REG`` masks omit it.
 
 Vector lane masks
 ^^^^^^^^^^^^^^^^^

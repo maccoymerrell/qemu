@@ -155,6 +155,9 @@ public:
             } else if (!(regs[id] == tb.regs[k])) {
                 variance.push_back({ id, tb.regs[k] });
             }
+            /* another access list: no dependency claim; flags: the union */
+            regs[id].acc_varies |= regs[id].acc != tb.regs[k].acc;
+            regs[id].aflags |= tb.regs[k].aflags;
             cls_variance += !(cls[id] == tb.cls[k]);
         }
         for (size_t t : tb.traps) {

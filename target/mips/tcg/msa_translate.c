@@ -198,7 +198,9 @@ typedef void gen_helper_piiii(TCGv_ptr, TCGv_i32, TCGv_i32, TCGv_i32, TCGv_i32);
     }; \
     static bool trans_##NAME(DisasContext *ctx, arg_##NAME *a) \
     { \
-        return trans_func(ctx, a, NAME##_tab[a->df]); \
+        bool ok = trans_func(ctx, a, NAME##_tab[a->df]); \
+        plugin_gen_record_vec(0, 0, 0, -1, -1); /* widening: no shape */ \
+        return ok; \
     }
 
 static void gen_check_zero_element(TCGv tresult, uint8_t df, uint8_t wt,
@@ -328,6 +330,7 @@ static bool trans_msa_i8(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    plugin_gen_record_vec(MO_8, 16, PLUGIN_VEC_EW, -1, -1);
     gen_msa_regs(a->wd, true, a->ws, MSA_NONE, false);
     gen_msa_i8(tcg_env,
                tcg_constant_i32(a->wd),
@@ -372,6 +375,7 @@ static bool trans_msa_i5(DisasContext *ctx, arg_msa_i *a,
         return true;
     }
 
+    plugin_gen_record_vec(a->df, 16, PLUGIN_VEC_EW, -1, -1);
     gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_msa_i5(tcg_env,
                tcg_constant_i32(a->df),
@@ -400,6 +404,7 @@ static bool trans_LDI(DisasContext *ctx, arg_msa_ldi *a)
         return true;
     }
 
+    plugin_gen_record_vec(a->df, 16, 0, -1, -1);
     gen_msa_regs(a->wd, false, MSA_NONE, MSA_NONE, false);
     gen_helper_msa_ldi_df(tcg_env,
                           tcg_constant_i32(a->df),
@@ -420,6 +425,7 @@ static bool trans_msa_bit(DisasContext *ctx, arg_msa_bit *a,
         return true;
     }
 
+    plugin_gen_record_vec(a->df, 16, PLUGIN_VEC_EW, -1, -1);
     gen_msa_regs(a->wd, true, a->ws, MSA_NONE, false);
     gen_msa_bit(tcg_env,
                 tcg_constant_i32(a->df),
@@ -450,6 +456,10 @@ static bool trans_msa_3rf(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    /* the narrowing conversions are not of one element size */
+    plugin_gen_record_vec(a->df, gen_msa_3rf == gen_helper_msa_fexdo_df ||
+                          gen_msa_3rf == gen_helper_msa_ftq_df ? 0 : 16,
+                          0, -1, -1);
     gen_msa_regs(a->wd, true, a->ws, a->wt, true);
     gen_msa_3rf(tcg_env,
                 tcg_constant_i32(a->df),
@@ -471,6 +481,7 @@ static bool trans_msa_3r(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    plugin_gen_record_vec(a->df, 16, 0, -1, -1);
     gen_msa_regs(a->wd, true, a->ws, a->wt, false);
     gen_msa_3r(tcg_env,
                tcg_constant_i32(a->wd),
@@ -653,6 +664,8 @@ static bool trans_msa_elm_fn(DisasContext *ctx, arg_msa_elm_df *a,
     plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[insert ? a->ws :
                                                             a->wd]),
                        insert ? QEMU_PLUGIN_REG_READ : QEMU_PLUGIN_REG_WRITE);
+    plugin_gen_record_vec(a->df, 16, 0, insert ? a->n : -1,
+                          insert ? -1 : a->n);
     gen_msa_regs(insert ? a->wd : MSA_NONE, true,
                  insert ? MSA_NONE : a->ws, MSA_NONE, false);
     gen_msa_elm[a->df](tcg_env,
@@ -760,6 +773,7 @@ static bool trans_msa_2r(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    plugin_gen_record_vec(a->df, 16, PLUGIN_VEC_EW, -1, -1);
     gen_msa_regs(a->wd, false, a->ws, MSA_NONE, false);
     gen_msa_2r(tcg_env, tcg_constant_i32(a->wd), tcg_constant_i32(a->ws));
 
@@ -783,6 +797,7 @@ static bool trans_FILL(DisasContext *ctx, arg_msa_r *a)
 
     plugin_gen_reg_env(offsetof(CPUMIPSState, active_tc.gpr[a->ws]),
                        QEMU_PLUGIN_REG_READ);
+    plugin_gen_record_vec(a->df, 16, 0, -1, -1);
     gen_msa_regs(a->wd, false, MSA_NONE, MSA_NONE, false);
     gen_helper_msa_fill_df(tcg_env,
                            tcg_constant_i32(a->df),
@@ -799,6 +814,12 @@ static bool trans_msa_2rf(DisasContext *ctx, arg_msa_r *a,
         return true;
     }
 
+    /* the widening conversions are not of one element size */
+    plugin_gen_record_vec(a->df, gen_msa_2rf == gen_helper_msa_fexupl_df ||
+                          gen_msa_2rf == gen_helper_msa_fexupr_df ||
+                          gen_msa_2rf == gen_helper_msa_ffql_df ||
+                          gen_msa_2rf == gen_helper_msa_ffqr_df ? 0 : 16,
+                          PLUGIN_VEC_EW, -1, -1);
     gen_msa_regs(a->wd, false, a->ws, MSA_NONE, true);
     gen_msa_2rf(tcg_env,
                 tcg_constant_i32(a->df),
@@ -837,6 +858,7 @@ static bool trans_msa_ldst(DisasContext *ctx, arg_msa_i *a,
     taddr = tcg_temp_new();
 
     gen_base_offset_addr(ctx, taddr, a->ws, a->sa << a->df);
+    plugin_gen_record_vec(a->df, 16, 0, -1, -1);
     if (store) {
         gen_msa_regs(MSA_NONE, false, a->wd, MSA_NONE, false);
     } else {

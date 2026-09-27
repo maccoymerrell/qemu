@@ -512,14 +512,23 @@ static inline bool vsm3_check(DisasContext *s, arg_rmrr *a)
            s->sew == MO_32;
 }
 
+/* An element-group operation is not element-wise: it states no shape */
+static bool vext_egs_shape(void)
+{
+    plugin_gen_record_vec(0, 0, 0, -1, -1);
+    return true;
+}
+
 static inline bool vsm3me_check(DisasContext *s, arg_rmrr *a)
 {
-    return vsm3_check(s, a) && vext_check_sss(s, a->rd, a->rs1, a->rs2, a->vm);
+    return vsm3_check(s, a) &&
+           vext_check_sss(s, a->rd, a->rs1, a->rs2, a->vm) && vext_egs_shape();
 }
 
 static inline bool vsm3c_check(DisasContext *s, arg_rmrr *a)
 {
-    return vsm3_check(s, a) && vext_check_ss(s, a->rd, a->rs2, a->vm);
+    return vsm3_check(s, a) && vext_check_ss(s, a->rd, a->rs2, a->vm) &&
+           vext_egs_shape();
 }
 
 GEN_VV_UNMASKED_TRANS(vsm3me_vv, vsm3me_check, ZVKSH_EGS)
@@ -538,7 +547,7 @@ static bool vgmul_check(DisasContext *s, arg_rmr *a)
            vext_check_isa_ill(s) &&
            require_rvv(s) &&
            MAXSZ(s) >= egw_bytes &&
-           vext_check_ss(s, a->rd, a->rs2, a->vm) &&
+           vext_check_ss(s, a->rd, a->rs2, a->vm) && vext_egs_shape() &&
            s->sew == MO_32;
 }
 

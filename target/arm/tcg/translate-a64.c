@@ -4075,6 +4075,7 @@ static bool trans_LD_mult(DisasContext *s, arg_ldst_mult *a)
     }
 
     total = a->rpt * a->selem * (a->q ? 16 : 8);
+    plugin_gen_record_vec(size, a->q ? 16 : 8, 0, -1, -1);
     tcg_rn = cpu_reg_sp(s, a->rn);
 
     /*
@@ -4166,6 +4167,7 @@ static bool trans_ST_mult(DisasContext *s, arg_ldst_mult *a)
     }
 
     total = a->rpt * a->selem * (a->q ? 16 : 8);
+    plugin_gen_record_vec(size, a->q ? 16 : 8, 0, -1, -1);
     tcg_rn = cpu_reg_sp(s, a->rn);
 
     /*
@@ -4231,6 +4233,7 @@ static bool trans_ST_single(DisasContext *s, arg_ldst_single *a)
     }
 
     total = a->selem << a->scale;
+    plugin_gen_record_vec(a->scale, 16, 0, -1, a->index);
     tcg_rn = cpu_reg_sp(s, a->rn);
 
     mop = finalize_memop_asimd(s, a->scale);
@@ -4271,6 +4274,7 @@ static bool trans_LD_single(DisasContext *s, arg_ldst_single *a)
     }
 
     total = a->selem << a->scale;
+    plugin_gen_record_vec(a->scale, 16, 0, a->index, -1);
     tcg_rn = cpu_reg_sp(s, a->rn);
 
     mop = finalize_memop_asimd(s, a->scale);
@@ -6004,6 +6008,7 @@ static bool do_fp3_vector_with_fpsttype(DisasContext *s, arg_qrrr_e *a,
     if (check <= 0) {
         return check == 0;
     }
+    plugin_gen_record_vec(esz, a->q ? 16 : 8, 0, -1, -1);
 
     gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm, fpsttype,
                       data, fns[esz - 1]);

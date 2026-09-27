@@ -463,6 +463,8 @@ static void gen_store_sse(DisasContext *s, X86DecodedInsn *decode, int src_ofs)
         return;
     }
 
+    /* the shape the register-to-register move states, of the bytes stored */
+    plugin_gen_record_gvec(MO_8, 1 << ot, -1, src_ofs, -1, -1);
     switch (ot) {
     case MO_64:
         gen_stq_env_A0(s, src_ofs);
@@ -575,6 +577,8 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
         ps = s->vex_l ? ps_ymm : ps_xmm;
         pd = s->vex_l ? pd_ymm : pd_xmm;
         fn = s->prefix & PREFIX_DATA ? pd : ps;
+        plugin_gen_record_vec(s->prefix & PREFIX_DATA ? MO_64 : MO_32,
+                              vector_len(s, decode), PLUGIN_VEC_EW, -1, -1);
         if (!fn) {
             gen_illegal_opcode(s);
             return;
@@ -613,6 +617,8 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
         ps = s->vex_l ? ps_ymm : ps_xmm;
         pd = s->vex_l ? pd_ymm : pd_xmm;
         fn = s->prefix & PREFIX_DATA ? pd : ps;
+        plugin_gen_record_vec(s->prefix & PREFIX_DATA ? MO_64 : MO_32,
+                              vector_len(s, decode), PLUGIN_VEC_EW, -1, -1);
     }
     if (fn) {
         fn(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
@@ -2975,6 +2981,8 @@ static inline void gen_pextr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
 
+    plugin_gen_record_vec(ot, vec_len, 0, -1, val);
+
     switch (ot) {
     case MO_8:
         tcg_gen_ld8u_tl(s->T0, tcg_env, vector_elem_offset(&decode->op[1], ot, val));
@@ -3016,6 +3024,8 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int vec_len = vector_len(s, decode);
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
+
+    plugin_gen_record_vec(ot, vec_len, 0, val, -1);
 
     if (decode->op[1].offset != decode->op[0].offset) {
         assert(vec_len == 16);

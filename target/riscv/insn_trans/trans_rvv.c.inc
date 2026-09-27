@@ -295,6 +295,23 @@ static unsigned rvv_ld_dest(DisasContext *s, int vm)
            (!s->vta || (!vm && !s->vma) ? QEMU_PLUGIN_REG_READ : 0);
 }
 
+/*
+ * The vector statement: elements of 1 << @eew bytes, the elements below vl
+ * active, in the 2^@emul registers (a fraction: part of one) each operand
+ * is -- unmasked only: under a mask the active elements are v0's to say;
+ * one field only.  Every other form states that it holds no shape
+ * (vext_check_isa_ill()).
+ */
+static void rvv_shape(DisasContext *s, int eew, int emul, int vm, int nf,
+                      unsigned ew)
+{
+    if (vm && nf == 1) {
+        plugin_gen_record_vec(eew, s->cfg_ptr->vlenb >> MAX(-emul, 0),
+                              PLUGIN_VEC_VL | PLUGIN_VEC_GROUP(MAX(emul, 0)) |
+                              ew, -1, -1);
+    }
+}
+
 static void rvv_ctl(DisasContext *s, int vm)
 {
     plugin_gen_reg_env(offsetof(CPURISCVState, vl), RVV_R);
@@ -330,6 +347,7 @@ static bool vext_check_store(DisasContext *s, int vd, int nf, int vm,
 {
     rvv_group(s, vd, eew - s->sew + s->lmul, nf, RVV_R);
     rvv_ctl(s, vm);
+    rvv_shape(s, eew, eew - s->sew + s->lmul, vm, nf, 0);
     return vext_check_ldst(s, vd, nf, eew);
 }
 
@@ -349,6 +367,7 @@ static bool vext_check_load(DisasContext *s, int vd, int nf, int vm,
 {
     rvv_group(s, vd, eew - s->sew + s->lmul, nf, rvv_ld_dest(s, vm));
     rvv_ctl(s, vm);
+    rvv_shape(s, eew, eew - s->sew + s->lmul, vm, nf, 0);
     return vext_check_ldst(s, vd, nf, eew) && require_vm(vm, vd);
 }
 
@@ -482,6 +501,7 @@ static bool vext_check_ss(DisasContext *s, int vd, int vs, int vm)
     rvv_group(s, vd, s->lmul, 1, RVV_RW);
     rvv_group(s, vs, s->lmul, 1, RVV_R);
     rvv_ctl(s, vm);
+    rvv_shape(s, s->sew, s->lmul, vm, 1, PLUGIN_VEC_EW);
     return require_vm(vm, vd) &&
            require_align(vd, s->lmul) &&
            require_align(vs, s->lmul) &&
@@ -779,6 +799,7 @@ static bool vext_check_mov(DisasContext *s, int vd, int vs1)
  */
 static bool vext_check_isa_ill(DisasContext *s)
 {
+    plugin_gen_record_vec(0, 0, 0, -1, -1);
     return !s->vill;
 }
 

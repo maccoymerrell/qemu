@@ -764,6 +764,71 @@ static int mips_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
 #undef ELT
     return PLUGIN_REG_UNKNOWN;
 }
+
+/*
+ * The word of each decodetree pattern (TCGCPUOps.plugin_word): msa.decode
+ * and rel6.decode, and the vendor decoders.  The legacy hand decoder
+ * (translate.c) states its words where it decodes.
+ */
+#define IA PLUGIN_WORD_IMM_ADDR
+static const PluginWordRow mips_words[] = {
+    { "vec.add", 0, "ADDV ADDVI ADD_A ADDS_A ADDS_S ADDS_U AVE_S AVE_U "
+                    "AVER_S AVER_U HADD_S HADD_U FADD" },
+    { "vec.sub", 0, "SUBV SUBVI SUBS_S SUBS_U SUBSUS_U SUBSUU_S ASUB_S "
+                    "ASUB_U HSUB_S HSUB_U FSUB PSUBW PSUBH PSUBB" },
+    { "vec.mul", 0, "MULV MUL_Q MULR_Q FMUL FEXP2" },
+    { "vec.div", 0, "DIV_S DIV_U MOD_S MOD_U FDIV FRCP" },
+    { "vec.sqrt", 0, "FSQRT FRSQRT" },
+    { "vec.madd", 0, "MADDV MADD_Q MADDR_Q FMADD DOTP_S DOTP_U DPADD_S "
+                     "DPADD_U" },
+    { "vec.msub", 0, "MSUBV MSUB_Q MSUBR_Q FMSUB DPSUB_S DPSUB_U" },
+    { "vec.logic", 0, "AND_V OR_V NOR_V XOR_V BMNZ_V BMZ_V BSEL_V ANDI ORI "
+                      "NORI XORI BMNZI BMZI BSELI BCLR BCLRI BSET BSETI "
+                      "BNEG BNEGI BINSL BINSLI BINSR BINSRI PAND PXOR POR "
+                      "PNOR" },
+    { "vec.shift", 0, "SLL SRA SRL SLLI SRAI SRLI SRAR SRARI SRLR SRLRI" },
+    { "vec.cmp", 0, "CEQ CEQI CLT_S CLT_U CLTI_S CLTI_U CLE_S CLE_U CLEI_S "
+                    "CLEI_U PCGTW PCGTH PCGTB PCEQW PCEQH PCEQB" },
+    { "vec.minmax", 0, "MAX_S MAX_U MIN_S MIN_U MAX_A MIN_A MAXI_S MAXI_U "
+                       "MINI_S MINI_U SAT_S SAT_U" },
+    { "vec.fcmp", 0, "FCAF FCUN FCEQ FCUEQ FCLT FCULT FCLE FCULE FSAF FSUN "
+                     "FSEQ FSUEQ FSLT FSULT FSLE FSULE FCOR FCUNE FCNE "
+                     "FSOR FSUNE FSNE FMIN FMIN_A FMAX FMAX_A FCLASS" },
+    { "vec.fcvt", 0, "FEXDO FTQ FTRUNC_S FTRUNC_U FRINT FLOG2 FEXUPL "
+                     "FEXUPR FFQL FFQR FTINT_S FTINT_U FFINT_S FFINT_U" },
+    { "vec.shuf", 0, "SLD SLDI SPLAT SPLATI PCKEV PCKOD ILVL ILVR ILVEV "
+                     "ILVOD VSHF SHF COPY_S COPY_U INSERT INSVE PEXTLW "
+                     "PPACW PEXTLH PEXTLB PEXTUW PCPYLD PCPYUD PCPYH "
+                     "PROT3W" },
+    { "vec.mov", 0, "FILL LDI MOVE_V" },
+    { "vec.count", 0, "PCNT NLOC NLZC" },
+    { "vec.load", IA, "LD" },
+    { "vec.store", IA, "ST" },
+    { "branch.cond", IA, "BZ_V BNZ_V BZ BNZ BBIT" },
+    { "sys.reg", 0, "CTCMSA CFCMSA RDCSR DRDCSR WRCSR DWRCSR" },
+    { "sys.misc", 0, "CPUCFG" },
+    { "sys.trap", 0, "REMOVED" },   /* R6-removed encodings: RI */
+    { "int.add", 0, "LSA DLSA BADDU" },
+    { "int.mov", 0, "MFHI1 MTHI1 MFLO1 MTLO1" },
+    { "int.mul", 0, "MULS MULSU MULHI MULHIU MULSHI MULSHIU DMUL MULTu_G "
+                    "DMULTu_G" },
+    { "int.madd", 0, "MACC MACCU MACCHI MACCHIU" },
+    { "int.msub", 0, "MSAC MSACU MSACHI MSACHIU" },
+    { "int.div", 0, "DIV_G DIVU_G DDIV_G DDIVU_G MOD_G MODU_G DMOD_G "
+                    "DMODU_G" },
+    { "int.bitfield", 0, "EXTS CINS" },
+    { "int.count", 0, "POP" },
+    { "int.setcc", 0, "SEQNE SEQNEI" },
+    { "mem.load", IA, "LQ" },
+    { "mem.store", IA, "SQ" },
+};
+#undef IA
+
+static const char *mips_plugin_word(const char *pattern, unsigned *flags)
+{
+    return plugin_word_lookup(mips_words, ARRAY_SIZE(mips_words), pattern,
+                              flags);
+}
 #endif
 
 static const TCGCPUOps mips_tcg_ops = {
@@ -773,6 +838,7 @@ static const TCGCPUOps mips_tcg_ops = {
     .restore_state_to_opc = mips_restore_state_to_opc,
 #ifdef CONFIG_PLUGIN
     .plugin_reg_resolve = mips_plugin_reg_resolve,
+    .plugin_word = mips_plugin_word,
 #endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,

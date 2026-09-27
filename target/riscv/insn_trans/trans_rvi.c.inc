@@ -87,8 +87,18 @@ static bool trans_auipc(DisasContext *ctx, arg_auipc *a)
     return true;
 }
 
+/*
+ * Call, return or jump: the RISC-V spec's return-address-stack hints
+ * (unprivileged ISA, JAL/JALR "rd/rs1 link register" table), x1 and x5
+ * being the link registers.  A link rd pushes (a call); otherwise a link
+ * rs1 pops (a return); anything else is a plain jump.  c.j/c.jal/c.jr/
+ * c.jalr decode to these same patterns.
+ */
+#define LINK_REG(r) ((r) == xRA || (r) == xT0)
+
 static bool trans_jal(DisasContext *ctx, arg_jal *a)
 {
+    plugin_gen_record_word(LINK_REG(a->rd) ? "branch.call" : "branch.jump");
     gen_jal(ctx, a->rd, a->imm);
     return true;
 }
@@ -144,6 +154,9 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
     TCGv target_pc = tcg_temp_new();
     TCGv succ_pc = dest_gpr(ctx, a->rd);
 
+    plugin_gen_record_word(LINK_REG(a->rd) ? "branch.call.ind" :
+                           LINK_REG(a->rs1) ? "branch.ret" : "branch.jump.ind");
+    plugin_gen_record_imm_address();    /* imm: the target's offset */
     tcg_gen_addi_tl(target_pc, get_gpr(ctx, a->rs1, EXT_NONE), a->imm);
     tcg_gen_andi_tl(target_pc, target_pc, (target_ulong)-2);
 

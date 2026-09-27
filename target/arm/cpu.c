@@ -2893,6 +2893,264 @@ static int arm_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
 #undef ELT
     return PLUGIN_REG_UNKNOWN;
 }
+
+/*
+ * The word of every A64, SVE and SME decoder pattern (TCGCPUOps.plugin_word).
+ * One name space: a name two decoders share has one row (LDR/STR, A64 and
+ * SME, are both register fills and spills), for its SVE meaning where the
+ * two differ; translate-a64.c states the word of the A64 CLZ, CLS and RBIT,
+ * and of what one pattern holds besides its row (writeback, the inverted
+ * logical forms, ORR/BIC immediate, the SYS aliases).  NO_IMM: the
+ * decoded imm is a selector (element size/index, tile mask, a constant's
+ * one-bit choice, an element size in tsz), not an operand.
+ */
+static const PluginWordRow arm_word_rows[] = {
+    { "int.lea", PLUGIN_WORD_IMM_ADDR, "ADR ADRP" },
+    { "int.add", 0, "ADD_i ADDS_i ADDG_i ADD_r ADDS_r ADD_ext ADDS_ext ADC "
+      "ADCS LDADD ADDVL ADDSVL ADDPL ADDSPL INCDEC_r SINCDEC_r_32 "
+      "SINCDEC_r_64 INCDECP_r SINCDECP_r_32 SINCDECP_r_64" },
+    { "int.sub", 0, "SUB_i SUBS_i SUBG_i SUB_r SUBS_r SUB_ext SUBS_ext SBC "
+      "SBCS SUBP SUBPS" },
+    { "int.and", 0, "AND_i ANDS_i AND_r ANDS_r" },
+    { "int.andn", 0, "LDCLR" },
+    { "int.or", 0, "ORR_i ORR_r LDSET" },
+    { "int.xor", 0, "EOR_i EOR_r LDEOR" },
+    { "int.mov", 0, "MOVN MOVZ MOVK RDVL RDSVL CNT_r" },
+    { "int.bitfield", 0, "SBFM BFM UBFM EXTR" },
+    { "int.div", 0, "UDIV SDIV" },
+    { "int.shl", 0, "LSLV" },
+    { "int.shr", 0, "LSRV" },
+    { "int.sar", 0, "ASRV" },
+    { "int.ror", 0, "RORV" },
+    { "int.crc", 0, "CRC32 CRC32C" },
+    { "int.bits", 0, "IRG GMI" },
+    { "int.bswap", 0, "REV16 REV32 REV64" },
+    { "int.count", 0, "CNTP" },
+    { "int.flags", 0, "CFINV XAFLAG AXFLAG RMIF SETF8 SETF16" },
+    { "int.cmp", 0, "CCMP CTERM" },
+    { "int.cmov", 0, "CSEL" },
+    { "int.madd", 0, "MADD_w MADD_x SMADDL UMADDL" },
+    { "int.msub", 0, "MSUB_w MSUB_x SMSUBL UMSUBL" },
+    { "int.mul", 0, "SMULH UMULH" },
+    { "int.xchg", 0, "SWP CAS CASP" },
+    { "mem.minmax", 0, "LDSMAX LDSMIN LDUMAX LDUMIN" },
+    { "branch.jump", PLUGIN_WORD_IMM_ADDR, "B" },
+    { "branch.call", PLUGIN_WORD_IMM_ADDR, "BL" },
+    { "branch.cond", PLUGIN_WORD_IMM_ADDR, "CBZ TBZ B_cond" },
+    { "branch.jump.ind", 0, "BR BRAZ BRA" },
+    { "branch.call.ind", 0, "BLR BLRAZ BLRA" },
+    { "branch.ret", 0, "RET RETA" },
+    { "sys.eret", 0, "ERET ERETA" },
+    { "sys.syscall", 0, "SVC HVC SMC" },
+    { "sys.trap", 0, "BRK HLT INVALID FAIL OK" },
+    { "sys.nop", 0, "NOP YIELD ESB" },
+    { "sys.misc", 0, "WFE WFI WFET WFIT CLREX" },
+    { "sys.pac", 0, "XPACLRI PACIA1716 PACIB1716 AUTIA1716 AUTIB1716 PACIAZ "
+      "PACIASP PACIBZ PACIBSP AUTIAZ AUTIASP AUTIBZ AUTIBSP PACIA PACIB PACDA "
+      "PACDB AUTIA AUTIB AUTDA AUTDB XPACI XPACD PACGA" },
+    { "sys.reg", 0, "SYS MSR_i_UAO MSR_i_PAN MSR_i_SPSEL MSR_i_SBSS MSR_i_DIT "
+      "MSR_i_TCO MSR_i_DAIFSET MSR_i_DAIFCLEAR MSR_i_ALLINT MSR_i_SVCR" },
+    { "mem.fence", 0, "DSB_DMB DSB_nXS ISB SB" },
+    { "mem.load", PLUGIN_WORD_IMM_ADDR, "LD_lit LD_lit_v LDP LDP_v LDR_i "
+      "LDR_v_i LDRA LDAPR_i LDG LDGM LDR_pri LDR_zri LDR" },
+    { "mem.load", 0, "LDR_v LDAR LDAPR" },
+    { "mem.load", PLUGIN_WORD_ATOMIC, "LDXR LDXP" },
+    { "mem.store", PLUGIN_WORD_IMM_ADDR, "STP STP_v STR_i STR_v_i STLR_i STGP "
+      "STG STZG ST2G STZ2G STGM STZGM STR_pri STR_zri STR" },
+    { "mem.store", 0, "STR_v STLR" },
+    { "mem.store", PLUGIN_WORD_ATOMIC, "STXR STXP" },
+    { "mem.prefetch", PLUGIN_WORD_IMM_ADDR, "PRFM_lit PRFM_i PRFM_r" },
+    { "mem.set", 0, "SETP SETM SETE SETGP SETGM SETGE" },
+    { "mem.copy", 0, "CPYFP CPYFM CPYFE CPYP CPYM CPYE" },
+    { "vec.load", PLUGIN_WORD_IMM_ADDR, "LD1R_zpri LD_zpri LDNF1_zpri "
+      "LD1RQ_zpri LD1RO_zpri" },
+    { "vec.load", 0, "LD_mult LD_single LD_single_repl LD_zprr LDFF1_zprr "
+      "LD1RQ_zprr LD1RO_zprr LDST1" },
+    { "vec.gather", PLUGIN_WORD_IMM_ADDR, "LD1_zpiz" },
+    { "vec.gather", 0, "LD1_zprz LDNT1_zprz" },
+    { "vec.store", PLUGIN_WORD_IMM_ADDR, "ST_zpri" },
+    { "vec.store", 0, "ST_mult ST_single ST_zprr" },
+    { "vec.scatter", PLUGIN_WORD_IMM_ADDR, "ST1_zpiz" },
+    { "vec.scatter", 0, "ST1_zprz STNT1_zprz" },
+    { "vec.prefetch", 0, "PRF PRF_ns PRF_rr" },
+    { "fp.add", 0, "FADD_s FADDP_s" },
+    { "fp.sub", 0, "FSUB_s FABD_s" },
+    { "fp.mul", 0, "FMUL_s FNMUL_s FMULX_s FMUL_si FMULX_si" },
+    { "fp.div", 0, "FDIV_s" },
+    { "fp.sqrt", 0, "FSQRT_s" },
+    { "fp.madd", 0, "FMADD FNMADD FMLA_si" },
+    { "fp.msub", 0, "FMSUB FNMSUB FMLS_si" },
+    { "fp.recip", 0, "FRECPS_s FRECPE_s FRECPX_s" },
+    { "fp.rsqrt", 0, "FRSQRTS_s FRSQRTE_s" },
+    { "fp.minmax", 0, "FMAX_s FMIN_s FMAXNM_s FMINNM_s FMAXP_s FMINP_s "
+      "FMAXNMP_s FMINNMP_s" },
+    { "fp.cmp", 0, "FCMEQ_s FCMGE_s FCMGT_s FACGE_s FACGT_s FCMGT0_s FCMGE0_s "
+      "FCMEQ0_s FCMLE0_s FCMLT0_s FCMP FCCMP" },
+    { "fp.cmov", 0, "FCSEL" },
+    { "fp.mov", 0, "FMOV_ws FMOV_sw FMOV_xd FMOV_dx FMOV_xu FMOV_ux FMOV_xh "
+      "FMOV_hx FMOV_s FABS_s FNEG_s FMOVI_s" },
+    { "fp.cvt", 0, "SCVTF_g UCVTF_g FCVTZS_g FCVTZU_g FCVTNS_g FCVTNU_g "
+      "FCVTPS_g FCVTPU_g FCVTMS_g FCVTMU_g FCVTAS_g FCVTAU_g FJCVTZS FRINTN_s "
+      "FRINTP_s FRINTM_s FRINTZ_s FRINTA_s FRINTX_s FRINTI_s BFCVT_s "
+      "FRINT32Z_s FRINT32X_s FRINT64Z_s FRINT64X_s FCVT_s_ds FCVT_s_hs "
+      "FCVT_s_sd FCVT_s_hd FCVT_s_sh FCVT_s_dh FCVTXN_s SCVTF_f UCVTF_f "
+      "FCVTNS_f FCVTNU_f FCVTPS_f FCVTPU_f FCVTMS_f FCVTMU_f FCVTZS_f "
+      "FCVTZU_f FCVTAS_f FCVTAU_f" },
+    { "vec.add", PLUGIN_WORD_NO_IMM, "FADD_zpzi" },
+    { "vec.add", 0, "SQADD_s UQADD_s SUQADD_s USQADD_s ADD_s ADDP_s FADD_v "
+      "FADDP_v ADDP_v SQADD_v UQADD_v SUQADD_v USQADD_v ADD_v SHADD_v UHADD_v "
+      "SRHADD_v URHADD_v FCADD_90 FCADD_270 SADDL_v UADDL_v SADDW UADDW ADDHN "
+      "RADDHN ADDV SADDLV UADDLV SADDLP_v UADDLP_v SADALP_v UADALP_v ADD_zpzz "
+      "UADDV SADDV ADD_zzz SQADD_zzz UQADD_zzz INDEX_ii INDEX_ir INDEX_ri "
+      "INDEX_rr ADR_s32 ADR_u32 ADR_p32 ADR_p64 INCDEC_v SINCDEC_v INCDECP_z "
+      "SINCDECP_z ADD_zzi SQADD_zzi UQADD_zzi FCADD FADDV FADDA FADD_zzz "
+      "FADD_zpzz SADALP_zpzz UADALP_zpzz SHADD UHADD SRHADD URHADD ADDP "
+      "SQADD_zpzz UQADD_zpzz SUQADD USQADD SADDLB SADDLT UADDLB UADDLT "
+      "SADDLBT SADDWB SADDWT UADDWB UADDWT CADD_rot90 CADD_rot270 "
+      "SQCADD_rot90 SQCADD_rot270 ADCLB ADCLT ADDHNB ADDHNT RADDHNB RADDHNT "
+      "FADDP ADDHA_s ADDVA_s ADDHA_d ADDVA_d" },
+    { "vec.sub", PLUGIN_WORD_NO_IMM, "FSUB_zpzi FSUBR_zpzi" },
+    { "vec.sub", 0, "SQSUB_s UQSUB_s SUB_s FSUB_v FABD_v SQSUB_v UQSUB_v "
+      "SUB_v SHSUB_v UHSUB_v SABD_v UABD_v SABA_v UABA_v SSUBL_v USUBL_v "
+      "SABAL_v UABAL_v SABDL_v UABDL_v SSUBW USUBW SUBHN RSUBHN SUB_zpzz "
+      "SABD_zpzz UABD_zpzz SUB_zzz SQSUB_zzz UQSUB_zzz SUB_zzi SUBR_zzi "
+      "SQSUB_zzi UQSUB_zzi FSUB_zzz FSUB_zpzz FABD SHSUB UHSUB SQSUB_zpzz "
+      "UQSUB_zpzz SSUBLB SSUBLT USUBLB USUBLT SABDLB SABDLT UABDLB UABDLT "
+      "SSUBLBT SSUBLTB SSUBWB SSUBWT USUBWB USUBWT SABALB SABALT UABALB "
+      "UABALT SABA UABA SUBHNB SUBHNT RSUBHNB RSUBHNT" },
+    { "vec.mul", PLUGIN_WORD_NO_IMM, "FMUL_zpzi" },
+    { "vec.mul", 0, "SQDMULH_s SQRDMULH_s SQDMULL_si FMUL_v FMULX_v MUL_v "
+      "PMUL_v SQDMULH_v SQRDMULH_v SMULL_v UMULL_v SQDMULL_v PMULL_p8 "
+      "PMULL_p64 SQDMULH_si SQRDMULH_si FMUL_vi FMULX_vi MUL_vi SQDMULH_vi "
+      "SQRDMULH_vi SMULL_vi UMULL_vi SQDMULL_vi MUL_zpzz SMULH_zpzz "
+      "UMULH_zpzz MUL_zzi SMULLB_zzx_s SMULLB_zzx_d SMULLT_zzx_s SMULLT_zzx_d "
+      "UMULLB_zzx_s UMULLB_zzx_d UMULLT_zzx_s UMULLT_zzx_d SQDMULLB_zzx_s "
+      "SQDMULLB_zzx_d SQDMULLT_zzx_s SQDMULLT_zzx_d SQDMULH_zzx_h "
+      "SQDMULH_zzx_s SQDMULH_zzx_d SQRDMULH_zzx_h SQRDMULH_zzx_s "
+      "SQRDMULH_zzx_d MUL_zzx_h MUL_zzx_s MUL_zzx_d FMUL_zzx FMUL_zzz FTSMUL "
+      "FMUL_zpzz FSCALE FMULX MUL_zzz SMULH_zzz UMULH_zzz PMUL_zzz "
+      "SQDMULH_zzz SQRDMULH_zzz SQDMULLB_zzz SQDMULLT_zzz PMULLB PMULLT "
+      "SMULLB_zzz SMULLT_zzz UMULLB_zzz UMULLT_zzz" },
+    { "vec.div", 0, "FDIV_v FRECPS_v FRECPE_v URECPE_v SDIV_zpzz UDIV_zpzz "
+      "FRECPE FRECPS FDIV FRECPX URECPE" },
+    { "vec.sqrt", 0, "FRSQRTS_v FSQRT_v FRSQRTE_v URSQRTE_v FRSQRTE FRSQRTS "
+      "FSQRT URSQRTE" },
+    { "vec.madd", 0, "SQRDMLAH_s SQDMLAL_si FMLA_v FMLAL_v FMLAL2_v MLA_v "
+      "SQRDMLAH_v SDOT_v UDOT_v USDOT_v BFDOT_v BFMLAL_v BFMMLA SMMLA UMMLA "
+      "USMMLA FCMLA_v SMLAL_v UMLAL_v SQDMLAL_v SQRDMLAH_si FMLA_vi FMLAL_vi "
+      "FMLAL2_vi MLA_vi SQRDMLAH_vi SDOT_vi UDOT_vi SUDOT_vi USDOT_vi "
+      "BFDOT_vi BFMLAL_vi FCMLA_vi SMLAL_vi UMLAL_vi SQDMLAL_vi MLA DOT_zzzz "
+      "CDOT_zzzz SDOT_zzxw_s SDOT_zzxw_d UDOT_zzxw_s UDOT_zzxw_d MLA_zzxz_h "
+      "MLA_zzxz_s MLA_zzxz_d SQRDMLAH_zzxz_h SQRDMLAH_zzxz_s SQRDMLAH_zzxz_d "
+      "USDOT_zzxw_s SUDOT_zzxw_s SQDMLALB_zzxw_s SQDMLALB_zzxw_d "
+      "SQDMLALT_zzxw_s SQDMLALT_zzxw_d CDOT_zzxw_s CDOT_zzxw_d CMLA_zzxz_h "
+      "CMLA_zzxz_s SQRDCMLAH_zzxz_h SQRDCMLAH_zzxz_s SMLALB_zzxw_s "
+      "SMLALB_zzxw_d SMLALT_zzxw_s SMLALT_zzxw_d UMLALB_zzxw_s UMLALB_zzxw_d "
+      "UMLALT_zzxw_s UMLALT_zzxw_d FCMLA_zpzzz FCMLA_zzxz FMLA_zzxz FTMAD "
+      "FMLA_zpzzz FNMLA_zpzzz SQDMLALB_zzzw SQDMLALT_zzzw SQDMLALBT "
+      "SQRDMLAH_zzzz SMLALB_zzzw SMLALT_zzzw UMLALB_zzzw UMLALT_zzzw "
+      "CMLA_zzzz SQRDCMLAH_zzzz USDOT_zzzz FMMLA_s FMMLA_d FMLALB_zzzw "
+      "FMLALT_zzzw BFMLALB_zzzw BFMLALT_zzzw BFDOT_zzzz FMLALB_zzxw "
+      "FMLALT_zzxw BFMLALB_zzxw BFMLALT_zzxw BFDOT_zzxz FMOPA_s FMOPA_d "
+      "BFMOPA FMOPA_h SMOPA_s SUMOPA_s USMOPA_s UMOPA_s SMOPA_d SUMOPA_d "
+      "USMOPA_d UMOPA_d" },
+    { "vec.msub", 0, "SQRDMLSH_s SQDMLSL_si FMLS_v FMLSL_v FMLSL2_v MLS_v "
+      "SQRDMLSH_v SMLSL_v UMLSL_v SQDMLSL_v SQRDMLSH_si FMLS_vi FMLSL_vi "
+      "FMLSL2_vi MLS_vi SQRDMLSH_vi SMLSL_vi UMLSL_vi SQDMLSL_vi MLS "
+      "MLS_zzxz_h MLS_zzxz_s MLS_zzxz_d SQRDMLSH_zzxz_h SQRDMLSH_zzxz_s "
+      "SQRDMLSH_zzxz_d SQDMLSLB_zzxw_s SQDMLSLB_zzxw_d SQDMLSLT_zzxw_s "
+      "SQDMLSLT_zzxw_d SMLSLB_zzxw_s SMLSLB_zzxw_d SMLSLT_zzxw_s "
+      "SMLSLT_zzxw_d UMLSLB_zzxw_s UMLSLB_zzxw_d UMLSLT_zzxw_s UMLSLT_zzxw_d "
+      "FMLS_zzxz FMLS_zpzzz FNMLS_zpzzz SQDMLSLB_zzzw SQDMLSLT_zzzw SQDMLSLBT "
+      "SQRDMLSH_zzzz SMLSLB_zzzw SMLSLT_zzzw UMLSLB_zzzw UMLSLT_zzzw "
+      "FMLSLB_zzzw FMLSLT_zzzw FMLSLB_zzxw FMLSLT_zzxw" },
+    { "vec.mov", PLUGIN_WORD_NO_IMM, "DUP_element_s DUP_element_v DUP_general "
+      "ZERO DUP_x" },
+    { "vec.mov", 0, "FMOVI_v_h Vimm MOVPRFX_z MOVPRFX_m SXTB UXTB SXTH UXTH "
+      "SXTW UXTW MOVPRFX DUPM FCPY CPY_m_i CPY_z_i DUP_s UNPK CPY_m_v CPY_m_r "
+      "FDUP DUP_i MOVA" },
+    { "vec.shuf", PLUGIN_WORD_NO_IMM, "INS_general SMOV UMOV SQXTNB SQXTNT "
+      "UQXTNB UQXTNT SQXTUNB SQXTUNT" },
+    { "vec.shuf", 0, "INS_element EXT_d EXT_q TBL_TBX UZP1 UZP2 TRN1 TRN2 "
+      "ZIP1 ZIP2 SQXTUN_s SQXTN_s UQXTN_s REV16_v REV32_v REV64_v XTN "
+      "SQXTUN_v SQXTN_v UQXTN_v FEXPA EXT EXT_sve2 INSR_f INSR_r REV_v TBL "
+      "TBL_sve2 TBX ZIP1_p ZIP2_p UZP1_p UZP2_p TRN1_p TRN2_p REV_p PUNPKLO "
+      "PUNPKHI ZIP1_z ZIP2_z UZP1_z UZP2_z TRN1_z TRN2_z ZIP1_q ZIP2_q UZP1_q "
+      "UZP2_q TRN1_q TRN2_q COMPACT CLASTA_z CLASTB_z CLASTA_v CLASTB_v "
+      "CLASTA_r CLASTB_r LASTA_v LASTB_v LASTA_r LASTB_r REVB REVH REVW REVD "
+      "SPLICE SPLICE_sve2 BEXT BDEP BGRP" },
+    { "vec.logic", 0, "AND_v BIC_v ORR_v ORN_v EOR_v BSL_v BIT_v BIF_v NOT_v "
+      "EOR3 BCAX ORR_zpzz EOR_zpzz AND_zpzz BIC_zpzz ORV EORV ANDV CNOT "
+      "NOT_zpz AND_zzz ORR_zzz EOR_zzz BIC_zzz BSL BSL1N BSL2N NBSL FTSSEL "
+      "ORR_zzi EOR_zzi AND_zzi SEL_zpzz EORBT EORTB" },
+    { "vec.shift", 0, "SSHL_s USHL_s SRSHL_s URSHL_s SQSHL_s UQSHL_s SQRSHL_s "
+      "UQRSHL_s SSHL_v USHL_v SRSHL_v URSHL_v SQSHL_v UQSHL_v SQRSHL_v "
+      "UQRSHL_v SSHR_v USHR_v SSRA_v USRA_v SRSHR_v URSHR_v SRSRA_v URSRA_v "
+      "SRI_v SHL_v SLI_v SSHLL_v USHLL_v SHRN_v RSHRN_v SQSHL_vi UQSHL_vi "
+      "SQSHLU_vi SQSHRN_v UQSHRN_v SQSHRUN_v SQRSHRN_v UQRSHRN_v SQRSHRUN_v "
+      "SSHR_s USHR_s SSRA_s USRA_s SRSHR_s URSHR_s SRSRA_s URSRA_s SRI_s "
+      "SHL_s SLI_s SQSHL_si UQSHL_si SQSHLU_si SQSHRN_si UQSHRN_si SQSHRUN_si "
+      "SQRSHRN_si UQRSHRN_si SQRSHRUN_si SHLL_v ASR_zpzi LSR_zpzi LSL_zpzi "
+      "ASRD SQSHL_zpzi UQSHL_zpzi SRSHR URSHR SQSHLU ASR_zpzz LSR_zpzz "
+      "LSL_zpzz ASR_zpzw LSR_zpzw LSL_zpzw ASR_zzi LSR_zzi LSL_zzi ASR_zzw "
+      "LSR_zzw LSL_zzw SRSHL URSHL SQSHL UQSHL SQRSHL UQRSHL SSHLLB SSHLLT "
+      "USHLLB USHLLT SSRA USRA SRSRA URSRA SRI SLI SQSHRUNB SQSHRUNT "
+      "SQRSHRUNB SQRSHRUNT SHRNB SHRNT RSHRNB RSHRNT SQSHRNB SQSHRNT SQRSHRNB "
+      "SQRSHRNT UQSHRNB UQSHRNT UQRSHRNB UQRSHRNT" },
+    { "vec.cmp", 0, "CMGT_s CMHI_s CMGE_s CMHS_s CMTST_s CMEQ_s CMGT_v CMHI_v "
+      "CMGE_v CMHS_v CMTST_v CMEQ_v CMGT0_s CMGE0_s CMEQ0_s CMLE0_s CMLT0_s "
+      "CMGT0_v CMGE0_v CMEQ0_v CMLE0_v CMLT0_v CMPHS_ppzz CMPHI_ppzz "
+      "CMPGE_ppzz CMPGT_ppzz CMPEQ_ppzz CMPNE_ppzz CMPEQ_ppzw CMPNE_ppzw "
+      "CMPGE_ppzw CMPGT_ppzw CMPLT_ppzw CMPLE_ppzw CMPHS_ppzw CMPHI_ppzw "
+      "CMPLO_ppzw CMPLS_ppzw CMPHS_ppzi CMPHI_ppzi CMPLO_ppzi CMPLS_ppzi "
+      "CMPGE_ppzi CMPGT_ppzi CMPLT_ppzi CMPLE_ppzi CMPEQ_ppzi CMPNE_ppzi "
+      "MATCH NMATCH" },
+    { "vec.minmax", 0, "SMAXP_v SMINP_v UMAXP_v UMINP_v SMAX_v UMAX_v SMIN_v "
+      "UMIN_v SMAXV UMAXV SMINV UMINV SMAX_zpzz UMAX_zpzz SMIN_zpzz UMIN_zpzz "
+      "SMAX_zzi UMAX_zzi SMIN_zzi UMIN_zzi SMAXP UMAXP SMINP UMINP SCLAMP "
+      "UCLAMP" },
+    { "vec.abs", 0, "SQABS_s SQNEG_s ABS_s NEG_s SQABS_v SQNEG_v ABS_v NEG_v "
+      "FABS_v FNEG_v FABS FNEG ABS NEG SQABS SQNEG" },
+    { "vec.count", 0, "CLS_v CLZ_v CNT_v RBIT_v CLS CLZ CNT_zpz RBIT HISTCNT "
+      "HISTSEG" },
+    { "vec.crypto", PLUGIN_WORD_NO_IMM, "SM3TT1A SM3TT1B SM3TT2A SM3TT2B" },
+    { "vec.crypto", 0, "AESE AESD AESMC AESIMC SHA1C SHA1P SHA1M SHA1SU0 "
+      "SHA256H SHA256H2 SHA256SU1 SHA1H SHA1SU1 SHA256SU0 SHA512H SHA512H2 "
+      "SHA512SU1 RAX1 SM3PARTW1 SM3PARTW2 SM4EKEY SHA512SU0 SM4E SM3SS1 XAR" },
+    { "vec.pred", PLUGIN_WORD_NO_IMM, "PSEL" },
+    { "vec.pred", 0, "AND_pppp BIC_pppp EOR_pppp SEL_pppp ORR_pppp ORN_pppp "
+      "NOR_pppp NAND_pppp PTEST PTRUE SETFFR PFALSE RDFFR_p RDFFR WRFFR "
+      "PFIRST PNEXT BRKPA BRKPB BRKA_z BRKB_z BRKA_m BRKB_m BRKN WHILE "
+      "WHILE_ptr" },
+    { "vec.fcmp", PLUGIN_WORD_NO_IMM, "FMAXNM_zpzi FMINNM_zpzi FMAX_zpzi "
+      "FMIN_zpzi" },
+    { "vec.fcmp", 0, "FMAX_v FMIN_v FMAXNM_v FMINNM_v FCMEQ_v FCMGE_v FCMGT_v "
+      "FACGE_v FACGT_v FMAXP_v FMINP_v FMAXNMP_v FMINNMP_v FMAXNMV_h "
+      "FMAXNMV_s FMINNMV_h FMINNMV_s FMAXV_h FMAXV_s FMINV_h FMINV_s FCMGT0_v "
+      "FCMGE0_v FCMEQ0_v FCMLE0_v FCMLT0_v FCMGE_ppzz FCMGT_ppzz FCMEQ_ppzz "
+      "FCMNE_ppzz FCMUO_ppzz FACGE_ppzz FACGT_ppzz FMAXNMV FMINNMV FMAXV "
+      "FMINV FCMGE_ppz0 FCMGT_ppz0 FCMLT_ppz0 FCMLE_ppz0 FCMEQ_ppz0 "
+      "FCMNE_ppz0 FMAXNM_zpzz FMINNM_zpzz FMAX_zpzz FMIN_zpzz FMAXNMP FMINNMP "
+      "FMAXP FMINP" },
+    { "vec.fcvt", 0, "FCVTN_v FCVTXN_v BFCVTN_v FRINTN_v FRINTM_v FRINTP_v "
+      "FRINTZ_v FRINTA_v FRINTX_v FRINTI_v FRINT32Z_v FRINT32X_v FRINT64Z_v "
+      "FRINT64X_v SCVTF_vi UCVTF_vi FCVTNS_vi FCVTNU_vi FCVTPS_vi FCVTPU_vi "
+      "FCVTMS_vi FCVTMU_vi FCVTZS_vi FCVTZU_vi FCVTAS_vi FCVTAU_vi FCVTL_v "
+      "SCVTF_vf UCVTF_vf FCVTZS_vf FCVTZU_vf FCVT_sh FCVT_hs BFCVT FCVT_dh "
+      "FCVT_hd FCVT_ds FCVT_sd FCVTZS_hh FCVTZU_hh FCVTZS_hs FCVTZU_hs "
+      "FCVTZS_hd FCVTZU_hd FCVTZS_ss FCVTZU_ss FCVTZS_ds FCVTZU_ds FCVTZS_sd "
+      "FCVTZU_sd FCVTZS_dd FCVTZU_dd FRINTN FRINTP FRINTM FRINTZ FRINTA "
+      "FRINTX FRINTI SCVTF_hh SCVTF_sh SCVTF_dh SCVTF_ss SCVTF_sd SCVTF_ds "
+      "SCVTF_dd UCVTF_hh UCVTF_sh UCVTF_dh UCVTF_ss UCVTF_sd UCVTF_ds "
+      "UCVTF_dd FCVTXNT_ds FCVTX_ds FCVTNT_sh BFCVTNT FCVTLT_hs FCVTNT_ds "
+      "FCVTLT_sd FLOGB" },
+};
+
+static const char *arm_plugin_word(const char *pattern, unsigned *flags)
+{
+    return plugin_word_lookup(arm_word_rows, ARRAY_SIZE(arm_word_rows),
+                              pattern, flags);
+}
 #endif
 
 static const TCGCPUOps arm_tcg_ops = {
@@ -2903,6 +3161,7 @@ static const TCGCPUOps arm_tcg_ops = {
     .restore_state_to_opc = arm_restore_state_to_opc,
 #ifdef CONFIG_PLUGIN
     .plugin_reg_resolve = arm_plugin_reg_resolve,
+    .plugin_word = arm_plugin_word,
 #endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,

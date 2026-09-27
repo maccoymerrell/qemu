@@ -511,11 +511,24 @@ static const SSEFunc_0_epp fns_3dnow[] = {
     [0xbf] = gen_helper_pavgusb,
 };
 
+/* The word of each 3DNow! operation, by its opcode byte */
+static const char *const words_3dnow[ARRAY_SIZE(fns_3dnow)] = {
+    [0x0c] = "vec.fcvt", [0x0d] = "vec.fcvt", [0x1c] = "vec.fcvt",
+    [0x1d] = "vec.fcvt", [0x8a] = "vec.sub", [0x8e] = "vec.add",
+    [0x90] = "vec.fcmp", [0x94] = "vec.fcmp", [0x96] = "vec.div",
+    [0x97] = "vec.sqrt", [0x9a] = "vec.sub", [0x9e] = "vec.add",
+    [0xa0] = "vec.fcmp", [0xa4] = "vec.fcmp", [0xa6] = "vec.div",
+    [0xa7] = "vec.sqrt", [0xb6] = "vec.div", [0xaa] = "vec.sub",
+    [0xae] = "vec.add", [0xb0] = "vec.fcmp", [0xb4] = "vec.mul",
+    [0xb7] = "vec.mul", [0xbb] = "vec.shuf", [0xbf] = "vec.add",
+};
+
 static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
 {
     uint8_t b = decode->immediate;
     SSEFunc_0_epp fn = b < ARRAY_SIZE(fns_3dnow) ? fns_3dnow[b] : NULL;
 
+    plugin_gen_record_word(fn ? words_3dnow[b] : NULL);
     if (!fn) {
         gen_illegal_opcode(s);
         return;
@@ -2555,7 +2568,36 @@ static void gen_MOV(DisasContext *s, X86DecodedInsn *decode)
 {
     /* nothing to do! */
 }
-#define gen_NOP gen_MOV
+
+/* Nothing to do either; separate from gen_MOV, whose word is not a no-op's */
+static void gen_NOP(DisasContext *s, X86DecodedInsn *decode)
+{
+}
+
+/* INVD, WBINVD: nothing to do; cache-wide maintenance (mem.fence) */
+static void gen_WBINVD(DisasContext *s, X86DecodedInsn *decode)
+{
+}
+
+/* CLFLUSH, CLFLUSHOPT, CLWB: nothing to do; they name an address */
+static void gen_CLFLUSH(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_plugin_ea(s, &decode->mem);
+}
+
+/*
+ * 0F 18 (PREFETCHNTA/T0/T1/T2 for /0-/3, reserved NOPs above) and 0F 0D
+ * (PREFETCH, PREFETCHW, PREFETCHWT1 for /0-/2): nothing to do; a memory
+ * form of a prefetch names an address.
+ */
+static void gen_PREFETCH(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (decode->op[0].has_ea &&
+        ((s->modrm >> 3) & 7) < (decode->b == 0x18 ? 4 : 3)) {
+        plugin_gen_record_word("mem.prefetch");
+        gen_plugin_ea(s, &decode->mem);
+    }
+}
 
 static void gen_MASKMOV(DisasContext *s, X86DecodedInsn *decode)
 {

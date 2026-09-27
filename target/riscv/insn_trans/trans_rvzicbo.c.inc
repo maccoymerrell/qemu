@@ -28,9 +28,22 @@
     }                                \
 } while (0)
 
+/*
+ * The block address a cbo names, for plugins: rs1, cut to the address width
+ * as get_address() does (a pointer-masking width other than 32 or XLEN is
+ * not stateable and is left unstated).
+ */
+static void cbo_record_ea(DisasContext *ctx, int rs1)
+{
+    int ext = ctx->addr_xl != 32 ? 0 : ctx->addr_signed ? -32 : 32;
+
+    plugin_gen_record_ea(offsetof(CPURISCVState, gpr[rs1]), -1, 0, ext, 0);
+}
+
 static bool trans_cbo_clean(DisasContext *ctx, arg_cbo_clean *a)
 {
     REQUIRE_ZICBOM(ctx);
+    cbo_record_ea(ctx, a->rs1);
     TCGv src = get_address(ctx, a->rs1, 0);
 
     gen_helper_cbo_clean_flush(tcg_env, src);
@@ -40,6 +53,7 @@ static bool trans_cbo_clean(DisasContext *ctx, arg_cbo_clean *a)
 static bool trans_cbo_flush(DisasContext *ctx, arg_cbo_flush *a)
 {
     REQUIRE_ZICBOM(ctx);
+    cbo_record_ea(ctx, a->rs1);
     TCGv src = get_address(ctx, a->rs1, 0);
 
     gen_helper_cbo_clean_flush(tcg_env, src);
@@ -49,6 +63,7 @@ static bool trans_cbo_flush(DisasContext *ctx, arg_cbo_flush *a)
 static bool trans_cbo_inval(DisasContext *ctx, arg_cbo_inval *a)
 {
     REQUIRE_ZICBOM(ctx);
+    cbo_record_ea(ctx, a->rs1);
     TCGv src = get_address(ctx, a->rs1, 0);
 
     gen_helper_cbo_inval(tcg_env, src);

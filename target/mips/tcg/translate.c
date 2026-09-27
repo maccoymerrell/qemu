@@ -1347,6 +1347,7 @@ void generate_exception_break(DisasContext *ctx, int code)
 
 void gen_reserved_instruction(DisasContext *ctx)
 {
+    plugin_gen_record_word("sys.trap");     /* all it does: raise RI */
     generate_exception_end(ctx, EXCP_RI);
 }
 
@@ -1850,6 +1851,7 @@ static inline void gen_r6_cmp_ ## fmt(DisasContext *ctx, int n,         \
 {                                                                       \
     TCGv_i ## bits fp0 = tcg_temp_new_i ## bits();                      \
     TCGv_i ## bits fp1 = tcg_temp_new_i ## bits();                      \
+    plugin_gen_record_word("fp.cmp");                                   \
     if (ifmt == FMT_D) {                                                \
         check_cp1_registers(ctx, fs | ft | fd);                         \
     }                                                                   \
@@ -1960,6 +1962,25 @@ OP_LD_ATOMIC(lld, mo_endian(ctx) | MO_UQ);
 #endif
 #undef OP_LD_ATOMIC
 
+/* A non-accessing instruction's word and the address it names ($0: none) */
+static void gen_word_ea(const char *word, int base, int index, int disp)
+{
+    plugin_gen_record_word(word);
+    plugin_gen_record_ea(offsetof(CPUMIPSState, active_tc.gpr[base]),
+                         offsetof(CPUMIPSState, active_tc.gpr[index]),
+                         0, 0, disp);
+}
+
+/* CACHE op: Hit-type operations (4-7) name an address; Index-type a set/way */
+static void gen_cache_word(int op, int base, int disp)
+{
+    if (op >> 2 >= 4) {
+        gen_word_ea("mem.cache", base, 0, disp);
+    } else {
+        plugin_gen_record_word("mem.fence");
+    }
+}
+
 void gen_base_offset_addr(DisasContext *ctx, TCGv addr, int base, int offset)
 {
     if (base == 0) {
@@ -2047,6 +2068,7 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
     TCGv t0, t1;
     int mem_idx = ctx->mem_idx;
 
+    plugin_gen_record_word("mem.load");
     if (rt == 0 && ctx->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F |
                                       INSN_LOONGSON3A)) {
         /*
@@ -2074,6 +2096,7 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         break;
     case OPC_LLD:
     case R6_OPC_LLD:
+        plugin_gen_record_atomic();     /* a plain load that arms the monitor */
         op_ld_lld(t0, t0, mem_idx, ctx);
         gen_store_gpr(t0, rt);
         break;
@@ -2165,6 +2188,7 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         /* fall through */
     case OPC_LL:
     case R6_OPC_LL:
+        plugin_gen_record_atomic();
         op_ld_ll(t0, t0, mem_idx, ctx);
         gen_store_gpr(t0, rt);
         break;
@@ -2179,6 +2203,7 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
     TCGv t1 = tcg_temp_new();
     int mem_idx = ctx->mem_idx;
 
+    plugin_gen_record_word("mem.store");
     gen_base_offset_addr(ctx, t0, base, offset);
     gen_load_gpr(t1, rt);
     switch (opc) {
@@ -2240,6 +2265,7 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     TCGLabel *l1 = gen_new_label();
     TCGLabel *done = gen_new_label();
 
+    plugin_gen_record_word("mem.store");    /* ATOMIC: the cmpxchg states it */
     t0 = tcg_temp_new();
     addr = tcg_temp_new();
     /* compare the address against that of the preceding LL */
@@ -2268,6 +2294,8 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
      * Don't do NOP if destination is zero: we must perform the actual
      * memory access.
      */
+    plugin_gen_record_word(opc == OPC_LWC1 || opc == OPC_LDC1 ? "mem.load"
+                                                              : "mem.store");
     switch (opc) {
     case OPC_LWC1:
         {
@@ -2335,6 +2363,8 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm = (target_long)imm; /* Sign extend to 32/64 bits */
 
+    plugin_gen_record_word("int.add");
+    plugin_gen_record_imm(imm);
     if (rt == 0 && opc != OPC_ADDI && opc != OPC_DADDI) {
         /*
          * If no destination, treat it as a NOP.
@@ -2411,6 +2441,11 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
 {
     target_ulong uimm;
 
+    plugin_gen_record_word(opc == OPC_ANDI ? "int.and" : opc == OPC_ORI ?
+                           "int.or" : opc == OPC_XORI ? "int.xor" :
+                           rs && (ctx->insn_flags & ISA_MIPS_R6) ? "int.add" :
+                           "int.mov");      /* LUI, or R6 AUI */
+    plugin_gen_record_imm((uint16_t)imm);
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2460,6 +2495,8 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
     target_ulong uimm = (target_long)imm; /* Sign extend to 32/64 bits */
     TCGv t0;
 
+    plugin_gen_record_word("int.setcc");
+    plugin_gen_record_imm(imm);
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2483,6 +2520,25 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     target_ulong uimm = ((uint16_t)imm) & 0x1f;
     TCGv t0;
 
+    switch (opc) {
+    case OPC_SRA: case OPC_DSRA: case OPC_DSRA32:
+        plugin_gen_record_word("int.sar");
+        break;
+    case OPC_SRL: case OPC_DSRL: case OPC_DSRL32:
+        plugin_gen_record_word("int.shr");
+        break;
+    case OPC_ROTR: case OPC_DROTR: case OPC_DROTR32:
+        plugin_gen_record_word("int.ror");
+        break;
+    default:
+        plugin_gen_record_word("int.shl");
+    }
+    if (opc == OPC_SLL && rt == 0 && rs == 0) {
+        /* sll $0, $0, sa: the ISA's nop / ssnop / ehb / pause */
+        plugin_gen_record_word("sys.nop");
+    } else {
+        plugin_gen_record_imm(uimm);
+    }
     if (rt == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2554,6 +2610,10 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
 static void gen_arith(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
+    plugin_gen_record_word(opc == OPC_MUL ? "int.mul" :
+                           opc == OPC_SUB || opc == OPC_SUBU ||
+                           opc == OPC_DSUB || opc == OPC_DSUBU ? "int.sub" :
+                           "int.add");
     if (rd == 0 && opc != OPC_ADD && opc != OPC_SUB
        && opc != OPC_DADD && opc != OPC_DSUB) {
         /*
@@ -2718,6 +2778,7 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1, t2;
 
+    plugin_gen_record_word("int.cmov");
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2748,6 +2809,8 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
 static void gen_logic(DisasContext *ctx, uint32_t opc,
                       int rd, int rs, int rt)
 {
+    plugin_gen_record_word(opc == OPC_AND ? "int.and" : opc == OPC_OR ?
+                           "int.or" : opc == OPC_XOR ? "int.xor" : "int.not");
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2803,6 +2866,7 @@ static void gen_slt(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1;
 
+    plugin_gen_record_word("int.setcc");
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -2828,6 +2892,10 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1;
 
+    plugin_gen_record_word(opc == OPC_SLLV || opc == OPC_DSLLV ? "int.shl" :
+                           opc == OPC_SRLV || opc == OPC_DSRLV ? "int.shr" :
+                           opc == OPC_SRAV || opc == OPC_DSRAV ? "int.sar" :
+                           "int.ror");
     if (rd == 0) {
         /*
          * If no destination, treat it as a NOP.
@@ -2892,6 +2960,7 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
 /* Arithmetic on HI/LO registers */
 static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
 {
+    plugin_gen_record_word("int.mov");
     if (reg == 0 && (opc == OPC_MFHI || opc == OPC_MFLO)) {
         /* Treat as NOP. */
         return;
@@ -2967,6 +3036,10 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
     target_long offset;
     target_long addr;
 
+    plugin_gen_record_word(MASK_OPC_PCREL_TOP2BITS(opc) == OPC_ADDIUPC ||
+                           MASK_OPC_PCREL_TOP5BITS(opc) == OPC_AUIPC ||
+                           MASK_OPC_PCREL_TOP5BITS(opc) == OPC_ALUIPC ?
+                           "int.lea" : "mem.load");
     switch (MASK_OPC_PCREL_TOP2BITS(opc)) {
     case OPC_ADDIUPC:
         if (rs != 0) {
@@ -3028,6 +3101,14 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
 {
     TCGv t0, t1;
 
+    switch (opc) {
+    case R6_OPC_DIV: case R6_OPC_MOD: case R6_OPC_DIVU: case R6_OPC_MODU:
+    case R6_OPC_DDIV: case R6_OPC_DMOD: case R6_OPC_DDIVU: case R6_OPC_DMODU:
+        plugin_gen_record_word("int.div");
+        break;
+    default:
+        plugin_gen_record_word("int.mul");
+    }
     if (rd == 0) {
         /* Treat as NOP. */
         return;
@@ -3204,6 +3285,7 @@ static void gen_div1_tx79(DisasContext *ctx, uint32_t opc, int rs, int rt)
 {
     TCGv t0, t1;
 
+    plugin_gen_record_word("int.div");
     t0 = tcg_temp_new();
     t1 = tcg_temp_new();
 
@@ -3255,6 +3337,19 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0, t1;
 
+    switch (opc) {
+    case OPC_DIV: case OPC_DIVU: case OPC_DDIV: case OPC_DDIVU:
+        plugin_gen_record_word("int.div");
+        break;
+    case OPC_MADD: case OPC_MADDU:
+        plugin_gen_record_word("int.madd");
+        break;
+    case OPC_MSUB: case OPC_MSUBU:
+        plugin_gen_record_word("int.msub");
+        break;
+    default:
+        plugin_gen_record_word("int.mul");
+    }
     t0 = tcg_temp_new();
     t1 = tcg_temp_new();
 
@@ -3449,6 +3544,9 @@ static void gen_mul_txx9(DisasContext *ctx, uint32_t opc,
     TCGv t1 = tcg_temp_new();
     int acc = 0;
 
+    plugin_gen_record_word(opc == OPC_MULT || opc == OPC_MULTU ||
+                           opc == MMI_OPC_MULT1 || opc == MMI_OPC_MULTU1 ?
+                           "int.mul" : "int.madd");
     gen_load_gpr(t0, rs);
     gen_load_gpr(t1, rt);
 
@@ -3541,6 +3639,7 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0;
 
+    plugin_gen_record_word("int.count");
     if (rd == 0) {
         /* Treat as NOP. */
         return;
@@ -4288,6 +4387,11 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
         }
         break;
     }
+    /* an always-true condition is an unconditional trap (below) */
+    plugin_gen_record_word("sys.trap.cond");
+    if (rt < 0) {
+        plugin_gen_record_imm(imm);     /* the immediate forms */
+    }
     if (cond == 0) {
         switch (opc) {
         case OPC_TEQ:   /* rs == rs */
@@ -4297,6 +4401,7 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
         case OPC_TGEU:  /* rs >= rs unsigned */
         case OPC_TGEIU: /* r0 >= 0  unsigned */
             /* Always trap */
+            plugin_gen_record_word("sys.trap");
 #ifdef CONFIG_USER_ONLY
             /* Pass the break code along to cpu_loop. */
             tcg_gen_st_i32(tcg_constant_i32(code), tcg_env,
@@ -4372,6 +4477,34 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
     }
 }
 
+/*
+ * The word of a delay-slot branch: B (BEQ rx,rx) and BAL (BGEZAL $0) are
+ * the always-taken forms the translator detects below; JR $31 and JALR
+ * $0,$31 (R6's JR) are the ISA's return hint; JALR links through rd (rt).
+ */
+static const char *branch_word(uint32_t opc, int rs, int rt)
+{
+    switch (opc) {
+    case OPC_BEQ: case OPC_BEQL:
+        return rs == rt ? "branch.jump" : "branch.cond";
+    case OPC_BGEZ: case OPC_BGEZL: case OPC_BLEZ: case OPC_BLEZL:
+        return rs ? "branch.cond" : "branch.jump";
+    case OPC_BGEZAL: case OPC_BGEZALL:
+        return rs ? "branch.call.cond" : "branch.call";
+    case OPC_BLTZAL: case OPC_BLTZALL:
+        return "branch.call.cond";
+    case OPC_J:
+        return "branch.jump";
+    case OPC_JAL: case OPC_JALX:
+        return "branch.call";
+    case OPC_JR: case OPC_JALR:
+        return opc == OPC_JALR && rt ? "branch.call.ind" :
+               rs == 31 ? "branch.ret" : "branch.jump.ind";
+    default:    /* BNE(L), BGTZ(L), BLTZ(L), BPOSGE32/64 */
+        return "branch.cond";
+    }
+}
+
 /* Branches (before delay slot) */
 static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
                                int insn_bytes,
@@ -4384,6 +4517,7 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     TCGv t0 = tcg_temp_new();
     TCGv t1 = tcg_temp_new();
 
+    plugin_gen_record_word(branch_word(opc, rs, rt));
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
 #ifdef MIPS_DEBUG_DISAS
         LOG_DISAS("Branch in delay / forbidden slot at PC 0x%016"
@@ -4651,6 +4785,8 @@ static void gen_bitops(DisasContext *ctx, uint32_t opc, int rt,
     TCGv t0 = tcg_temp_new();
     TCGv t1 = tcg_temp_new();
 
+    plugin_gen_record_word("int.bitfield");
+    plugin_gen_record_imm(lsb);         /* pos */
     gen_load_gpr(t1, rs);
     switch (opc) {
     case OPC_EXT:
@@ -4718,6 +4854,8 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
 {
     TCGv t0;
 
+    plugin_gen_record_word(op2 == OPC_SEB || op2 == OPC_SEH ? "int.movsx"
+                                                            : "int.bswap");
     if (rd == 0) {
         /* If no destination, treat it as a NOP. */
         return;
@@ -4832,12 +4970,16 @@ static void gen_align_bits(DisasContext *ctx, int wordsz, int rd, int rs,
 
 void gen_align(DisasContext *ctx, int wordsz, int rd, int rs, int rt, int bp)
 {
+    plugin_gen_record_word("int.bitfield");     /* extract from rs:rt */
+    plugin_gen_record_imm(bp);
     gen_align_bits(ctx, wordsz, rd, rs, rt, bp * 8);
 }
 
 static void gen_bitswap(DisasContext *ctx, int opc, int rd, int rt)
 {
     TCGv t0;
+
+    plugin_gen_record_word("int.bitrev");
     if (rd == 0) {
         /* Treat as NOP. */
         return;
@@ -8698,6 +8840,24 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
 }
 #endif /* !CONFIG_USER_ONLY */
 
+/* The word of a COP0 CO-format operation (TLBINVF: TLB-wide, no address) */
+static const char *c0_word(uint32_t opc)
+{
+    switch (opc) {
+    case OPC_TLBWI: case OPC_TLBWR: case OPC_TLBP: case OPC_TLBR:
+    case OPC_TLBINV:
+        return "mem.tlb";
+    case OPC_TLBINVF:
+        return "mem.fence";
+    case OPC_ERET: case OPC_DERET:
+        return "sys.eret";
+    case OPC_WAIT:
+        return "sys.misc";
+    default:
+        return "sys.trap";  /* reserved: RI */
+    }
+}
+
 /* CP1 Branches (before delay slot) */
 static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
                                 int32_t cc, int32_t offset)
@@ -8705,6 +8865,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
     target_ulong btarget;
     TCGv_i32 t0 = tcg_temp_new_i32();
 
+    plugin_gen_record_word("branch.cond");
     if ((ctx->insn_flags & ISA_MIPS_R6) && (ctx->hflags & MIPS_HFLAG_BMASK)) {
         gen_reserved_instruction(ctx);
         return;
@@ -8809,6 +8970,7 @@ static void gen_compute_branch1_r6(DisasContext *ctx, uint32_t op,
     target_ulong btarget;
     TCGv_i64 t0 = tcg_temp_new_i64();
 
+    plugin_gen_record_word("branch.cond");
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
 #ifdef MIPS_DEBUG_DISAS
         LOG_DISAS("Branch in delay / forbidden slot at PC 0x%016"
@@ -9071,6 +9233,8 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
 {
     TCGv t0 = tcg_temp_new();
 
+    plugin_gen_record_word(opc == OPC_CFC1 || opc == OPC_CTC1 ? "sys.reg"
+                                                              : "fp.mov");
     switch (opc) {
     case OPC_MFC1:
         {
@@ -9142,6 +9306,7 @@ static void gen_movci(DisasContext *ctx, int rd, int rs, int cc, int tf)
     TCGCond cond;
     TCGv_i32 t0;
 
+    plugin_gen_record_word("int.cmov");     /* MOVF / MOVT */
     if (rd == 0) {
         /* Treat as NOP. */
         return;
@@ -9296,10 +9461,45 @@ static void gen_sel_d(DisasContext *ctx, enum fopcode op1, int fd, int ft,
     gen_store_fpr64(ctx, fp0, fd);
 }
 
+/*
+ * The word of a COP1 arithmetic operation, by function: paired-single
+ * (fmt PS) is packed FP; functions 28-31 are MIN/MINA/MAX/MAXA on R6 and
+ * the MIPS-3D RECIP2/RECIP1/RSQRT1/RSQRT2 before it.
+ */
+static const char *fp_word(DisasContext *ctx, uint32_t op1)
+{
+    static const char *const sd[64] = {
+        "fp.add", "fp.sub", "fp.mul", "fp.div", "fp.sqrt", "fp.mov", "fp.mov",
+        "fp.mov", [8 ... 15] = "fp.cvt", [16 ... 20] = "fp.cmov", "fp.recip",
+        "fp.rsqrt", "fp.cmov", "fp.madd", "fp.msub", "fp.cvt", "fp.cmp",
+        "fp.recip", "fp.recip", "fp.rsqrt", "fp.rsqrt", [32 ... 47] = "fp.cvt",
+        [48 ... 63] = "fp.cmp",
+    };
+    static const char *const ps[64] = {
+        "vec.add", "vec.sub", "vec.mul", [5] = "vec.abs", "vec.mov", "vec.abs",
+        [17 ... 19] = "fp.cmov", [24] = "vec.add", [26] = "vec.mul",
+        [28 ... 29] = "vec.div", [30 ... 31] = "vec.sqrt",
+        [32 ... 35] = "vec.shuf", [36] = "vec.fcvt", [37 ... 47] = "vec.shuf",
+        [48 ... 63] = "vec.fcmp",
+    };
+    uint32_t func = op1 & 0x3f, fmt = (op1 >> 21) & 0x1f;
+
+    if (func >= 28 && func <= 31 && fmt != FMT_PS &&
+        (ctx->insn_flags & ISA_MIPS_R6)) {
+        return "fp.minmax";
+    }
+    if (func == 38) {   /* CVT.PS.S packs two singles; CVT.PS.PW converts */
+        return fmt == FMT_S ? "vec.shuf" : "vec.fcvt";
+    }
+    return (fmt == FMT_PS ? ps : sd)[func] ?: "sys.trap";
+}
+
 static void gen_farith(DisasContext *ctx, enum fopcode op1,
                        int ft, int fs, int fd, int cc)
 {
     uint32_t func = ctx->opcode & 0x3f;
+
+    plugin_gen_record_word(fp_word(ctx, op1));
     switch (op1) {
     case OPC_ADD_S:
         {
@@ -10576,6 +10776,8 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0 = tcg_temp_new();
 
+    plugin_gen_record_word(opc == OPC_LWXC1 || opc == OPC_LDXC1 ||
+                           opc == OPC_LUXC1 ? "mem.load" : "mem.store");
     if (base == 0) {
         gen_load_gpr(t0, index);
     } else if (index == 0) {
@@ -10649,6 +10851,22 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
 static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
                            int fd, int fr, int fs, int ft)
 {
+    switch (opc) {
+    case OPC_ALNV_PS:
+        plugin_gen_record_word("vec.shuf");
+        break;
+    case OPC_MADD_PS: case OPC_NMADD_PS:
+        plugin_gen_record_word("vec.madd");
+        break;
+    case OPC_MSUB_PS: case OPC_NMSUB_PS:
+        plugin_gen_record_word("vec.msub");
+        break;
+    case OPC_MSUB_S: case OPC_MSUB_D: case OPC_NMSUB_S: case OPC_NMSUB_D:
+        plugin_gen_record_word("fp.msub");
+        break;
+    default:
+        plugin_gen_record_word("fp.madd");
+    }
     switch (opc) {
     case OPC_ALNV_PS:
         check_ps(ctx);
@@ -10867,6 +11085,7 @@ void gen_rdhwr(DisasContext *ctx, int rt, int rd, int sel)
 {
     TCGv t0;
 
+    plugin_gen_record_word("sys.reg");
 #if !defined(CONFIG_USER_ONLY)
     /*
      * The Linux kernel will emulate rdhwr if it's not supported natively.
@@ -11014,6 +11233,30 @@ static void gen_branch(DisasContext *ctx, int insn_bytes)
     }
 }
 
+/*
+ * The word of an R6 compact branch: the xxxALC forms link (BEQZALC/BNEZALC
+ * when rs == 0 < rt, BLEZALC/BGTZALC with rs == 0, BGEZALC/BLTZALC with
+ * rs == rt); JIC through $31 is the return hint.
+ */
+static const char *compact_branch_word(uint32_t opc, int rs, int rt)
+{
+    switch (opc) {
+    case OPC_BC:
+        return "branch.jump";
+    case OPC_BALC:
+        return "branch.call";
+    case OPC_BOVC: case OPC_BNVC:
+        return rs < rt && rs == 0 ? "branch.call.cond" : "branch.cond";
+    case OPC_BLEZALC: case OPC_BGTZALC:
+        return rs == 0 || rs == rt ? "branch.call.cond" : "branch.cond";
+    case OPC_BEQZC: case OPC_BNEZC:     /* OPC_JIC, OPC_JIALC when rs == 0 */
+        return rs ? "branch.cond" : opc == OPC_JIALC ? "branch.call.ind" :
+               rt == 31 ? "branch.ret" : "branch.jump.ind";
+    default:
+        return "branch.cond";
+    }
+}
+
 /* Compact Branches */
 static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
                                        int rs, int rt, int32_t offset)
@@ -11023,6 +11266,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
     TCGv t1 = tcg_temp_new();
     int m16_lowbit = (ctx->hflags & MIPS_HFLAG_M16) != 0;
 
+    plugin_gen_record_word(compact_branch_word(opc, rs, rt));
     if (ctx->hflags & MIPS_HFLAG_BMASK) {
 #ifdef MIPS_DEBUG_DISAS
         LOG_DISAS("Branch in delay / forbidden slot at PC 0x%016"
@@ -11249,6 +11493,7 @@ void gen_addiupc(DisasContext *ctx, int rx, int imm,
 {
     target_ulong npc;
 
+    plugin_gen_record_word("int.lea");
     if (extended && (ctx->hflags & MIPS_HFLAG_BMASK)) {
         gen_reserved_instruction(ctx);
         return;
@@ -11301,6 +11546,7 @@ static void gen_sync(int stype)
 {
     TCGBar tcg_mo = TCG_BAR_SC;
 
+    plugin_gen_record_word("mem.fence");
     switch (stype) {
     case 0x4: /* SYNC_WMB */
         tcg_mo |= TCG_MO_ST_ST;
@@ -11365,6 +11611,7 @@ static void gen_mips_lx(DisasContext *ctx, uint32_t opc,
 {
     TCGv t0;
 
+    plugin_gen_record_word("mem.load");     /* LBUX/LHX/LWX/LDX */
     if (!(ctx->insn_flags & INSN_OCTEON)) {
         check_dsp(ctx);
     }
@@ -13056,6 +13303,7 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case R6_OPC_SDBBP:
+        plugin_gen_record_word("sys.trap");
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -13323,6 +13571,7 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_PMON:
         /* Pmon entry point, also R4010 selsl */
+        plugin_gen_record_word("sys.misc");
 #ifdef MIPS_STRICT_STANDARD
         MIPS_INVAL("PMON / selsl");
         gen_reserved_instruction(ctx);
@@ -13331,9 +13580,11 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
 #endif
         break;
     case OPC_SYSCALL:
+        plugin_gen_record_word("sys.syscall");
         generate_exception_end(ctx, EXCP_SYSCALL);
         break;
     case OPC_BREAK:
+        plugin_gen_record_word("sys.trap");
         generate_exception_break(ctx, extract32(ctx->opcode, 6, 20));
         break;
     case OPC_SYNC:
@@ -13459,6 +13710,7 @@ static void decode_opc_special2_legacy(CPUMIPSState *env, DisasContext *ctx)
         gen_cl(ctx, op1, rd, rs);
         break;
     case OPC_SDBBP:
+        plugin_gen_record_word("sys.trap");
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -13500,6 +13752,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
     op1 = MASK_SPECIAL3(ctx->opcode);
     switch (op1) {
     case R6_OPC_PREF:
+        gen_word_ea("mem.prefetch", rs, 0, imm);
         if (rt >= 24) {
             /* hint codes 24-31 are reserved and signal RI */
             gen_reserved_instruction(ctx);
@@ -13507,6 +13760,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         /* Treat as NOP. */
         break;
     case R6_OPC_CACHE:
+        gen_cache_word(rt, rs, imm);
         check_cp0_enabled(ctx);
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
             gen_cache_operation(ctx, rt, rs, imm);
@@ -13520,11 +13774,13 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_BSHFL:
         {
+            op2 = MASK_BSHFL(ctx->opcode);
+            plugin_gen_record_word(op2 == OPC_BITSWAP ? "int.bitrev"
+                                                      : "int.bitfield");
             if (rd == 0) {
                 /* Treat as NOP. */
                 break;
             }
-            op2 = MASK_BSHFL(ctx->opcode);
             switch (op2) {
             case OPC_ALIGN:
             case OPC_ALIGN_1:
@@ -13539,7 +13795,12 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
 #ifndef CONFIG_USER_ONLY
-    case OPC_GINV:
+    case OPC_GINV:     /* GINVI: I-cache-wide; GINVT: the TLB by rs */
+        if (extract32(ctx->opcode, 6, 2) == 2) {
+            gen_word_ea("mem.tlb", rs, 0, 0);
+        } else {
+            plugin_gen_record_word("mem.fence");
+        }
         if (unlikely(ctx->gi <= 1)) {
             gen_reserved_instruction(ctx);
         }
@@ -13567,11 +13828,13 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DBSHFL:
         check_mips_64(ctx);
         {
+            op2 = MASK_DBSHFL(ctx->opcode);
+            plugin_gen_record_word(op2 == OPC_DBITSWAP ? "int.bitrev"
+                                                       : "int.bitfield");
             if (rd == 0) {
                 /* Treat as NOP. */
                 break;
             }
-            op2 = MASK_DBSHFL(ctx->opcode);
             switch (op2) {
             case OPC_DALIGN:
             case OPC_DALIGN_1:
@@ -14229,6 +14492,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
             gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_SL, true);
             return;
         case OPC_CACHEE:
+            gen_cache_word(rt, rs, imm);
             check_eva(ctx);
             check_cp0_enabled(ctx);
             if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
@@ -14236,6 +14500,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
             }
             return;
         case OPC_PREFE:
+            gen_word_ea("mem.prefetch", rs, 0, imm);
             check_cp0_enabled(ctx);
             /* Treat as NOP. */
             return;
@@ -14304,6 +14569,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         gen_rdhwr(ctx, rt, rd, extract32(ctx->opcode, 6, 3));
         break;
     case OPC_FORK:
+        plugin_gen_record_word("sys.misc");     /* MT: thread contexts */
         check_mt(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -14315,6 +14581,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_YIELD:
+        plugin_gen_record_word("sys.misc");
         check_mt(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -14417,6 +14684,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             gen_reserved_instruction(ctx);
             break;
         case OPC_SYNCI:
+            gen_word_ea("mem.cache", rs, 0, imm);
             check_insn(ctx, ISA_MIPS_R2);
             /*
              * Break the TB to be able to sync copied instructions
@@ -14433,6 +14701,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             break;
 #if defined(TARGET_MIPS64)
         case OPC_DAHI:
+            plugin_gen_record_word("int.add");
+            plugin_gen_record_imm(imm);
             check_insn(ctx, ISA_MIPS_R6);
             check_mips_64(ctx);
             if (rs != 0) {
@@ -14440,6 +14710,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             }
             break;
         case OPC_DATI:
+            plugin_gen_record_word("int.add");
+            plugin_gen_record_imm(imm);
             check_insn(ctx, ISA_MIPS_R6);
             check_mips_64(ctx);
             if (rs != 0) {
@@ -14467,6 +14739,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_DMFC0:
         case OPC_DMTC0:
 #endif
+            plugin_gen_record_word("sys.reg");
 #ifndef CONFIG_USER_ONLY
             gen_cp0(env, ctx, op1, rt, rd);
 #endif /* !CONFIG_USER_ONLY */
@@ -14487,11 +14760,13 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_C0_D:
         case OPC_C0_E:
         case OPC_C0_F:
+            plugin_gen_record_word(c0_word(MASK_C0(ctx->opcode)));
 #ifndef CONFIG_USER_ONLY
             gen_cp0(env, ctx, MASK_C0(ctx->opcode), rt, rd);
 #endif /* !CONFIG_USER_ONLY */
             break;
         case OPC_MFMC0:
+            plugin_gen_record_word("sys.reg");  /* DI/EI/DMT/EMT/DVPE/... */
 #ifndef CONFIG_USER_ONLY
             {
                 uint32_t op2;
@@ -14565,10 +14840,12 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
 #endif /* !CONFIG_USER_ONLY */
             break;
         case OPC_RDPGPR:
+            plugin_gen_record_word("sys.reg");
             check_insn(ctx, ISA_MIPS_R2);
             gen_load_srsgpr(rt, rd);
             break;
         case OPC_WRPGPR:
+            plugin_gen_record_word("sys.reg");
             check_insn(ctx, ISA_MIPS_R2);
             gen_store_srsgpr(rt, rd);
             break;
@@ -14693,6 +14970,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_SL, false);
         break;
     case OPC_CACHE:
+        gen_cache_word(rt, rs, imm);
         check_cp0_enabled(ctx);
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
@@ -14701,6 +14979,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         /* Treat as NOP. */
         break;
     case OPC_PREF:
+        gen_word_ea("mem.prefetch", rs, 0, imm);
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 | INSN_R5900);
         /* Treat as NOP. */
         break;
@@ -14869,6 +15148,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         } else {
             /* OPC_LWC2, OPC_SWC2 */
             /* COP2: Not implemented. */
+            plugin_gen_record_word("sys.trap");     /* CpU is all it does */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
         break;
@@ -14888,6 +15168,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         } else {
             /* OPC_LWC2, OPC_SWC2 */
             /* COP2: Not implemented. */
+            plugin_gen_record_word("sys.trap");     /* CpU is all it does */
             generate_exception_err(ctx, EXCP_CpU, 2);
         }
         break;
@@ -14914,6 +15195,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 gen_flt3_ldst(ctx, op1, sa, rd, rs, rt);
                 break;
             case OPC_PREFX:
+                gen_word_ea("mem.prefetch", rs, rt, 0);
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
                 /* Treat as NOP. */
                 break;
@@ -15005,6 +15287,8 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         if (ctx->insn_flags & ISA_MIPS_R6) {
 #if defined(TARGET_MIPS64)
             /* OPC_DAUI */
+            plugin_gen_record_word("int.add");
+            plugin_gen_record_imm((uint16_t)imm);
             check_mips_64(ctx);
             if (rs == 0) {
                 generate_exception(ctx, EXCP_RI);
@@ -15026,6 +15310,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_MDMX:
         /* MDMX: Not implemented. */
+        plugin_gen_record_word("sys.nop");
         break;
     case OPC_PCREL:
         check_insn(ctx, ISA_MIPS_R6);

@@ -1970,6 +1970,32 @@ static bool trans_NOP(DisasContext *s, arg_NOP *a)
     return true;
 }
 
+/* PRFM: a no-op for QEMU, which names an address (xzr is no index) */
+static bool prfm_ea(int rn, int rm, unsigned shift, int ext, int64_t disp)
+{
+    plugin_gen_record_ea(rn < 0 ? -1 : offsetof(CPUARMState, xregs[rn]),
+                         rm < 0 || rm == 31 ? -1 :
+                         offsetof(CPUARMState, xregs[rm]), shift, ext, disp);
+    return true;
+}
+
+static bool trans_PRFM_lit(DisasContext *s, arg_prfm_lit *a)
+{
+    return prfm_ea(-1, -1, 0, 0, s->pc_curr + a->imm);
+}
+
+static bool trans_PRFM_i(DisasContext *s, arg_prfm_i *a)
+{
+    return prfm_ea(a->rn, -1, 0, 0, a->imm);
+}
+
+static bool trans_PRFM_r(DisasContext *s, arg_prfm_r *a)
+{
+    /* opt: option<2,0>, 0 UXTW, 2 SXTW, 1/3 LSL/SXTX; S scales by 8 */
+    return prfm_ea(a->rn, a->rm, a->s ? 3 : 0,
+                   a->opt == 0 ? 32 : a->opt == 2 ? -32 : 0, 0);
+}
+
 static bool trans_YIELD(DisasContext *s, arg_YIELD *a)
 {
     /*
@@ -2848,8 +2874,44 @@ static void handle_sys(DisasContext *s, bool isread,
     }
 }
 
+/*
+ * The word of a SYS/SYSL/MRS/MSR (the pattern says sys.reg): the ISA's
+ * system-instruction aliases (op0 == 1).  CRn 7: AT and address-less
+ * cache maintenance (IC IALLU[IS], DC set/way) and CFP/DVP/COSP/CPP are
+ * mem.fence; DC ZVA/GVA/GZVA mem.zero; DC/IC by address mem.cache, whose
+ * address is Xt.  CRn 8/9: TLBI by address or range is mem.tlb (Xt packs
+ * the page number with ASID/TTL fields: no address is stated), the rest
+ * (ALL, VMALL, ASID, PAALL) mem.fence.
+ */
+static void sys_word(arg_SYS *a)
+{
+    unsigned op1 = a->op1, crm = a->crm, op2 = a->op2;
+
+    if (a->op0 != 1 || a->l) {
+        return;
+    }
+    if (a->crn == 7) {
+        if (crm == 8 || crm == 9 || (crm == 3 && op1 == 3) ||
+            ((crm == 1 || crm == 5) && op2 == 0) ||
+            (op1 == 0 && (crm == 6 || crm == 10 || crm == 14) && !(op2 & 1))) {
+            plugin_gen_record_word("mem.fence");
+        } else if (crm == 4 && op1 == 3) {
+            plugin_gen_record_word("mem.zero");
+        } else if ((op2 & 1) || (op1 == 4 && crm == 14)) {
+            plugin_gen_record_word("mem.cache");
+            plugin_gen_record_ea(a->rt == 31 ? -1 :
+                                 offsetof(CPUARMState, xregs[a->rt]),
+                                 -1, 0, 0, 0);
+        }
+    } else if (a->crn == 8 || a->crn == 9) {
+        plugin_gen_record_word((op2 & 1) || (op1 == 4 && (crm == 0 || crm == 4))
+                               ? "mem.tlb" : "mem.fence");
+    }
+}
+
 static bool trans_SYS(DisasContext *s, arg_SYS *a)
 {
+    sys_word(a);
     handle_sys(s, a->l, a->op0, a->op1, a->op2, a->crn, a->crm, a->rt);
     return true;
 }
@@ -3353,6 +3415,9 @@ static void op_addr_ldstpair_pre(DisasContext *s, arg_ldstpair *a,
                                  TCGv_i64 *clean_addr, TCGv_i64 *dirty_addr,
                                  uint64_t offset, bool is_store, MemOp mop)
 {
+    if (a->w) {
+        plugin_gen_record_word(is_store ? "mem.store.wb" : "mem.load.wb");
+    }
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -3531,6 +3596,9 @@ static bool trans_STGP(DisasContext *s, arg_ldstpair *a)
     if (!dc_isar_feature(aa64_mte_insn_reg, s)) {
         return false;
     }
+    if (a->w) {
+        plugin_gen_record_word("mem.store.wb");
+    }
 
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
@@ -3580,6 +3648,9 @@ static void op_addr_ldst_imm_pre(DisasContext *s, arg_ldst_imm *a,
 {
     int memidx;
 
+    if (a->w) {
+        plugin_gen_record_word(is_store ? "mem.store.wb" : "mem.load.wb");
+    }
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -3853,6 +3924,9 @@ static bool trans_LDRA(DisasContext *s, arg_LDRA *a)
     /* Load with pointer authentication */
     if (!dc_isar_feature(aa64_pauth, s)) {
         return false;
+    }
+    if (a->w) {
+        plugin_gen_record_word("mem.load.wb");
     }
 
     if (a->rn == 31) {
@@ -4386,6 +4460,9 @@ static bool do_STG(DisasContext *s, arg_ldst_tag *a, bool is_zero, bool is_pair)
 {
     TCGv_i64 addr, tcg_rt;
 
+    if (a->w) {
+        plugin_gen_record_word("mem.store.wb");
+    }
     if (a->rn == 31) {
         gen_check_sp_alignment(s);
     }
@@ -4829,6 +4906,7 @@ static bool gen_rri_log(DisasContext *s, arg_rri_log *a, bool set_cc,
     if (!a->sf) {
         imm &= 0xffffffffull;
     }
+    plugin_gen_record_imm(imm);             /* the mask, not its encoding */
 
     tcg_rd = set_cc ? cpu_reg(s, a->rd) : cpu_reg_sp(s, a->rd);
     tcg_rn = cpu_reg(s, a->rn);
@@ -4855,6 +4933,7 @@ TRANS(ANDS_i, gen_rri_log, a, true, tcg_gen_andi_i64)
 static bool trans_MOVZ(DisasContext *s, arg_movw *a)
 {
     int pos = a->hw << 4;
+    plugin_gen_record_imm((uint64_t)a->imm << pos);   /* the value moved */
     tcg_gen_movi_i64(cpu_reg(s, a->rd), (uint64_t)a->imm << pos);
     return true;
 }
@@ -4868,6 +4947,7 @@ static bool trans_MOVN(DisasContext *s, arg_movw *a)
     if (!a->sf) {
         imm = (uint32_t)imm;
     }
+    plugin_gen_record_imm(imm);
     tcg_gen_movi_i64(cpu_reg(s, a->rd), imm);
     return true;
 }
@@ -4877,6 +4957,7 @@ static bool trans_MOVK(DisasContext *s, arg_movw *a)
     int pos = a->hw << 4;
     TCGv_i64 tcg_rd, tcg_im;
 
+    plugin_gen_record_imm((uint64_t)a->imm << pos);   /* the bits moved */
     tcg_rd = cpu_reg(s, a->rd);
     tcg_im = tcg_constant_i64(a->imm);
     tcg_gen_deposit_i64(tcg_rd, tcg_rd, tcg_im, pos, 16);
@@ -7427,6 +7508,7 @@ static bool trans_FMOVI_s(DisasContext *s, arg_FMOVI_s *a)
     }
 
     imm = vfp_expand_imm(a->esz, a->imm);
+    plugin_gen_record_imm(imm);             /* the constant, not imm8 */
     write_fp_dreg(s, a->rd, tcg_constant_i64(imm));
     return true;
 }
@@ -7562,6 +7644,7 @@ static bool trans_Vimm(DisasContext *s, arg_Vimm *a)
     if ((a->cmode & 1) && a->cmode < 12) {
         /* For op=1, the imm will be inverted, so BIC becomes AND. */
         fn = a->op ? tcg_gen_gvec_andi : tcg_gen_gvec_ori;
+        plugin_gen_record_word("vec.logic");
     } else {
         /* There is one unallocated cmode/op combination in this space */
         if (a->cmode == 15 && a->op == 1 && a->q == 0) {
@@ -8351,7 +8434,11 @@ static void gen_rev32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
     tcg_gen_rotri_i64(tcg_rd, tcg_rd, 32);
 }
 
-TRANS(RBIT, gen_rr, a->rd, a->rn, a->sf ? gen_helper_rbit64 : gen_rbit32)
+static bool trans_RBIT(DisasContext *s, arg_RBIT *a)
+{
+    plugin_gen_record_word("int.bitrev");   /* the table's RBIT is SVE's */
+    return gen_rr(s, a->rd, a->rn, a->sf ? gen_helper_rbit64 : gen_rbit32);
+}
 TRANS(REV16, gen_rr, a->rd, a->rn, a->sf ? gen_rev16_64 : gen_rev16_32)
 TRANS(REV32, gen_rr, a->rd, a->rn, a->sf ? gen_rev32 : gen_rev_32)
 TRANS(REV64, gen_rr, a->rd, a->rn, tcg_gen_bswap64_i64)
@@ -8379,8 +8466,17 @@ static void gen_cls32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
     tcg_gen_extu_i32_i64(tcg_rd, t32);
 }
 
-TRANS(CLZ, gen_rr, a->rd, a->rn, a->sf ? gen_clz64 : gen_clz32)
-TRANS(CLS, gen_rr, a->rd, a->rn, a->sf ? tcg_gen_clrsb_i64 : gen_cls32)
+static bool trans_CLZ(DisasContext *s, arg_CLZ *a)
+{
+    plugin_gen_record_word("int.count");    /* the table's CLZ is SVE's */
+    return gen_rr(s, a->rd, a->rn, a->sf ? gen_clz64 : gen_clz32);
+}
+
+static bool trans_CLS(DisasContext *s, arg_CLS *a)
+{
+    plugin_gen_record_word("int.count");    /* the table's CLS is SVE's */
+    return gen_rr(s, a->rd, a->rn, a->sf ? tcg_gen_clrsb_i64 : gen_cls32);
+}
 
 static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
 {
@@ -8432,6 +8528,10 @@ static bool do_logic_reg(DisasContext *s, arg_logic_shift *a,
         return false;
     }
 
+    if (a->n) {
+        plugin_gen_record_word(fn == tcg_gen_xor_i64 ? "int.xnor" :
+                               fn == tcg_gen_or_i64 ? "int.orn" : "int.andn");
+    }
     tcg_rd = cpu_reg(s, a->rd);
     tcg_rn = cpu_reg(s, a->rn);
 
@@ -8461,6 +8561,7 @@ static bool trans_ORR_r(DisasContext *s, arg_logic_shift *a)
         TCGv_i64 tcg_rm = cpu_reg(s, a->rm);
 
         if (a->n) {
+            plugin_gen_record_word("int.orn");
             tcg_gen_not_i64(tcg_rd, tcg_rm);
             if (!a->sf) {
                 tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
@@ -8728,8 +8829,10 @@ static bool trans_CCMP(DisasContext *s, arg_CCMP *a)
 
     /* Load the arguments for the new comparison.  */
     if (a->imm) {
+        plugin_gen_record_imm(a->y);        /* imm selects the form */
         tcg_y = tcg_constant_i64(a->y);
     } else {
+        plugin_gen_record_imm_address();    /* no operand immediate */
         tcg_y = cpu_reg(s, a->y);
     }
     tcg_rn = cpu_reg(s, a->rn);
@@ -10455,6 +10558,7 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (!disas_a64(s, insn) &&
         !disas_sme(s, insn) &&
         !disas_sve(s, insn)) {
+        plugin_gen_record_word("sys.trap");
         unallocated_encoding(s);
     }
 

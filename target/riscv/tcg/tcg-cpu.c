@@ -302,6 +302,235 @@ static int riscv_plugin_reg_resolve(CPUState *cs, intptr_t off, unsigned size,
 #undef ELT
     return PLUGIN_REG_UNKNOWN;
 }
+
+/*
+ * The word of every pattern of insn32/insn16/xthead/XVentanaCondOps.decode
+ * (TCGCPUOps.plugin_word); insn16 patterns named like insn32's share the
+ * row.  jal/jalr state their call/return/jump flavour in trans_rvi.c.inc.
+ * Zicbop prefetch.{i,r,w} are ORI with rd=x0 (not decoded apart): int.or.
+ */
+#define IA PLUGIN_WORD_IMM_ADDR
+static const PluginWordRow riscv_words[] = {
+    { "int.add", 0, "add addi addiw addw addd addid amoadd_b amoadd_h "
+                    "amoadd_w amoadd_d" },
+    { "int.sub", 0, "sub subw subd" },
+    /* Zba is the address-generation extension; th.addsl is Zba's shNadd */
+    { "int.lea", 0, "add_uw sh1add sh2add sh3add sh1add_uw sh2add_uw "
+                    "sh3add_uw th_addsl1 th_addsl2 th_addsl3" },
+    { "int.lea", IA, "auipc" },
+    { "int.mov", 0, "lui cm_mva01s cm_mvsa01" },
+    /* Zimop: imm is the MOP number, a selector (rd := 0) */
+    { "int.mov", PLUGIN_WORD_NO_IMM, "mop_r_n mop_rr_n" },
+    { "int.mul", 0, "mul mulh mulhsu mulhu mulw muld c_mul clmul clmulh "
+                    "clmulr" },
+    { "int.div", 0, "div divu rem remu divw divuw remw remuw divd divud remd "
+                    "remud" },
+    { "int.madd", 0, "th_mula th_mulah th_mulaw" },
+    { "int.msub", 0, "th_muls th_mulsh th_mulsw" },
+    { "int.and", 0, "and andi amoand_b amoand_h amoand_w amoand_d" },
+    { "int.or", 0, "or ori amoor_b amoor_h amoor_w amoor_d" },
+    { "int.xor", 0, "xor xori amoxor_b amoxor_h amoxor_w amoxor_d" },
+    { "int.andn", 0, "andn" },
+    { "int.orn", 0, "orn" },
+    { "int.xnor", 0, "xnor" },
+    { "int.not", 0, "c_not" },
+    { "int.shl", 0, "sll slli sllw slliw slld sllid slli_uw" },
+    { "int.shr", 0, "srl srli srlw srliw srld srlid" },
+    { "int.sar", 0, "sra srai sraw sraiw srad sraid" },
+    { "int.rol", 0, "rol rolw" },
+    { "int.ror", 0, "ror rori rorw roriw th_srri th_srriw" },
+    { "int.setcc", 0, "slt slti sltu sltiu" },
+    { "int.minmax", 0, "min minu max maxu" },
+    { "int.cmov", 0, "czero_eqz czero_nez th_mveqz th_mvnez vt_maskc "
+                     "vt_maskcn" },
+    { "int.movsx", 0, "sext_b sext_h c_sext_b c_sext_h" },
+    { "int.movzx", 0, "zext_h_32 zext_h_64 c_zext_b c_zext_h c_zext_w" },
+    { "int.count", 0, "clz clzw ctz ctzw cpop cpopw th_ff0 th_ff1" },
+    { "int.bitrev", 0, "brev8" },
+    { "int.bswap", 0, "rev8_32 rev8_64 orc_b th_rev th_revw th_tstnbz" },
+    { "int.bitfield", 0, "pack packh packw zip unzip xperm4 xperm8 th_ext "
+                         "th_extu" },
+    /* bit ops; scalar crypto (Zkn/Zks) too: no int.* crypto word yet */
+    { "int.bits", 0, "bclr bclri bext bexti binv binvi bset bseti th_tst "
+                     "aes32dsi aes32dsmi aes32esi aes32esmi aes64ds aes64dsm "
+                     "aes64es aes64esm aes64im aes64ks1i aes64ks2 sha256sig0 "
+                     "sha256sig1 sha256sum0 sha256sum1 sha512sig0 "
+                     "sha512sig0h sha512sig0l sha512sig1 sha512sig1h "
+                     "sha512sig1l sha512sum0 sha512sum0r sha512sum1 "
+                     "sha512sum1r sm3p0 sm3p1 sm4ed sm4ks" },
+    { "mem.minmax", 0, "amomin_b amomin_h amomin_w amomin_d amomax_b "
+                       "amomax_h amomax_w amomax_d amominu_b amominu_h "
+                       "amominu_w amominu_d amomaxu_b amomaxu_h amomaxu_w "
+                       "amomaxu_d" },
+    { "int.xchg", 0, "amoswap_b amoswap_h amoswap_w amoswap_d ssamoswap_w "
+                     "ssamoswap_d amocas_b amocas_h amocas_w amocas_d "
+                     "amocas_q" },
+    { "mem.load", PLUGIN_WORD_ATOMIC, "lr_w lr_d" },
+    { "mem.load", IA, "lb lh lw ld lbu lhu lwu ldu lq c_lbu c_lh c_lhu flh "
+                      "flw fld c_flw c_fld" },
+    { "mem.store", IA, "sb sh sw sd sq c_sb c_sh fsh fsw fsd c_fsw c_fsd" },
+    { "mem.load", 0, "hlv_b hlv_bu hlv_h hlv_hu hlv_w hlv_wu hlv_d hlvx_hu "
+                     "hlvx_wu th_lrb th_lrbu th_lrh th_lrhu th_lrw th_lrwu "
+                     "th_lrd th_lurb th_lurbu th_lurh th_lurhu th_lurw "
+                     "th_lurwu th_lurd th_ldd th_lwd th_lwud th_flrd th_flrw "
+                     "th_flurd th_flurw" },
+    /* sc_*: atomic by gen_sc's cmpxchg */
+    { "mem.store", 0, "sc_w sc_d hsv_b hsv_h hsv_w hsv_d th_srb th_srh "
+                      "th_srw th_srd th_surb th_surh th_surw th_surd th_sdd "
+                      "th_swd th_fsrd th_fsrw th_fsurd th_fsurw" },
+    { "mem.load.wb", 0, "th_lbia th_lbib th_lbuia th_lbuib th_lhia th_lhib "
+                        "th_lhuia th_lhuib th_lwia th_lwib th_lwuia th_lwuib "
+                        "th_ldia th_ldib" },
+    { "mem.store.wb", 0, "th_sbia th_sbib th_shia th_shib th_swia th_swib "
+                         "th_sdia th_sdib" },
+    { "mem.push", 0, "cm_push sspush" },
+    { "mem.pop", 0, "cm_pop sspopchk" },
+    { "mem.fence", 0, "fence fence_i sfence_w_inval sfence_inval_ir th_sync "
+                      "th_sync_i th_sync_is th_sync_s th_dcache_call "
+                      "th_dcache_ciall th_dcache_iall th_dcache_csw "
+                      "th_dcache_cisw th_dcache_isw th_icache_iall "
+                      "th_icache_ialls th_l2cache_call th_l2cache_ciall "
+                      "th_l2cache_iall" },
+    { "mem.cache", 0, "cbo_clean cbo_flush cbo_inval th_dcache_cpa "
+                      "th_dcache_cipa th_dcache_ipa th_dcache_cva "
+                      "th_dcache_civa th_dcache_iva th_dcache_cpal1 "
+                      "th_dcache_cval1 th_icache_ipa th_icache_iva" },
+    { "mem.zero", 0, "cbo_zero" },
+    { "mem.tlb", 0, "sfence_vma hfence_gvma hfence_vvma sinval_vma "
+                    "hinval_vvma hinval_gvma th_sfence_vmas" },
+    { "branch.cond", 0, "beq bne blt bge bltu bgeu" },
+    { "branch.jump", 0, "jal" },
+    { "branch.jump.ind", 0, "jalr" },
+    { "branch.call.ind", 0, "cm_jalt" },
+    { "branch.ret", 0, "cm_popret cm_popretz" },
+    { "sys.syscall", 0, "ecall" },
+    { "sys.trap", 0, "ebreak illegal c64_illegal" },
+    { "sys.eret", 0, "uret sret mret mnret" },
+    { "sys.misc", 0, "wfi wrs_nto wrs_sto sctrclr" },
+    { "sys.nop", 0, "pause lpad c_mop_n" },
+    { "sys.reg", 0, "csrrw csrrs csrrc csrrwi csrrsi csrrci ssrdp" },
+    { "fp.add", 0, "fadd_h fadd_s fadd_d" },
+    { "fp.sub", 0, "fsub_h fsub_s fsub_d" },
+    { "fp.mul", 0, "fmul_h fmul_s fmul_d" },
+    { "fp.div", 0, "fdiv_h fdiv_s fdiv_d" },
+    { "fp.sqrt", 0, "fsqrt_h fsqrt_s fsqrt_d" },
+    { "fp.madd", 0, "fmadd_h fmadd_s fmadd_d fnmadd_h fnmadd_s fnmadd_d" },
+    { "fp.msub", 0, "fmsub_h fmsub_s fmsub_d fnmsub_h fnmsub_s fnmsub_d" },
+    { "fp.mov", 0, "fsgnj_h fsgnj_s fsgnj_d fsgnjn_h fsgnjn_s fsgnjn_d "
+                   "fsgnjx_h fsgnjx_s fsgnjx_d fmv_x_h fmv_h_x fmv_x_w "
+                   "fmv_w_x fmv_x_d fmv_d_x fmvh_x_d fmvp_d_x fli_h fli_s "
+                   "fli_d th_fmv_hw_x th_fmv_x_hw" },
+    { "fp.cvt", 0, "fcvt_w_s fcvt_wu_s fcvt_s_w fcvt_s_wu fcvt_l_s fcvt_lu_s "
+                   "fcvt_s_l fcvt_s_lu fcvt_s_d fcvt_d_s fcvt_w_d fcvt_wu_d "
+                   "fcvt_d_w fcvt_d_wu fcvt_l_d fcvt_lu_d fcvt_d_l fcvt_d_lu "
+                   "fcvt_h_s fcvt_s_h fcvt_h_d fcvt_d_h fcvt_w_h fcvt_wu_h "
+                   "fcvt_h_w fcvt_h_wu fcvt_l_h fcvt_lu_h fcvt_h_l fcvt_h_lu "
+                   "fcvt_bf16_s fcvt_s_bf16 fcvtmod_w_d fround_h fround_s "
+                   "fround_d froundnx_h froundnx_s froundnx_d" },
+    { "fp.cmp", 0, "feq_h feq_s feq_d flt_h flt_s flt_d fle_h fle_s fle_d "
+                   "fleq_h fleq_s fleq_d fltq_h fltq_s fltq_d fclass_h "
+                   "fclass_s fclass_d" },
+    { "fp.minmax", 0, "fmin_h fmin_s fmin_d fmax_h fmax_s fmax_d fminm_h "
+                      "fminm_s fminm_d fmaxm_h fmaxm_s fmaxm_d" },
+    /* RVV: everything on the vector register file is vec.* */
+    { "vec.config", 0, "vsetvl vsetvli vsetivli" },
+    { "vec.load", 0, "vle8_v vle16_v vle32_v vle64_v vle8ff_v vle16ff_v "
+                     "vle32ff_v vle64ff_v vlm_v vlse8_v vlse16_v vlse32_v "
+                     "vlse64_v vl1re8_v vl1re16_v vl1re32_v vl1re64_v "
+                     "vl2re8_v vl2re16_v vl2re32_v vl2re64_v vl4re8_v "
+                     "vl4re16_v vl4re32_v vl4re64_v vl8re8_v vl8re16_v "
+                     "vl8re32_v vl8re64_v" },
+    { "vec.store", 0, "vse8_v vse16_v vse32_v vse64_v vsm_v vsse8_v vsse16_v "
+                      "vsse32_v vsse64_v vs1r_v vs2r_v vs4r_v vs8r_v" },
+    { "vec.gather", 0, "vlxei8_v vlxei16_v vlxei32_v vlxei64_v" },
+    { "vec.scatter", 0, "vsxei8_v vsxei16_v vsxei32_v vsxei64_v" },
+    { "vec.add", 0, "vadd_vv vadd_vx vadd_vi vwaddu_vv vwaddu_vx vwadd_vv "
+                    "vwadd_vx vwaddu_wv vwaddu_wx vwadd_wv vwadd_wx vadc_vvm "
+                    "vadc_vxm vadc_vim vmadc_vvm vmadc_vxm vmadc_vim "
+                    "vsaddu_vv vsaddu_vx vsaddu_vi vsadd_vv vsadd_vx "
+                    "vsadd_vi vaadd_vv vaadd_vx vaaddu_vv vaaddu_vx vfadd_vv "
+                    "vfadd_vf vfwadd_vv vfwadd_vf vfwadd_wv vfwadd_wf "
+                    "vredsum_vs vwredsumu_vs vwredsum_vs vfredusum_vs "
+                    "vfredosum_vs vfwredusum_vs vfwredosum_vs" },
+    { "vec.sub", 0, "vsub_vv vsub_vx vrsub_vx vrsub_vi vwsubu_vv vwsubu_vx "
+                    "vwsub_vv vwsub_vx vwsubu_wv vwsubu_wx vwsub_wv vwsub_wx "
+                    "vsbc_vvm vsbc_vxm vmsbc_vvm vmsbc_vxm vssubu_vv "
+                    "vssubu_vx vssub_vv vssub_vx vasub_vv vasub_vx vasubu_vv "
+                    "vasubu_vx vfsub_vv vfsub_vf vfrsub_vf vfwsub_vv "
+                    "vfwsub_vf vfwsub_wv vfwsub_wf" },
+    { "vec.mul", 0, "vmul_vv vmul_vx vmulh_vv vmulh_vx vmulhu_vv vmulhu_vx "
+                    "vmulhsu_vv vmulhsu_vx vwmulu_vv vwmulu_vx vwmulsu_vv "
+                    "vwmulsu_vx vwmul_vv vwmul_vx vsmul_vv vsmul_vx vfmul_vv "
+                    "vfmul_vf vfwmul_vv vfwmul_vf vclmul_vv vclmul_vx "
+                    "vclmulh_vv vclmulh_vx" },
+    { "vec.div", 0, "vdivu_vv vdivu_vx vdiv_vv vdiv_vx vremu_vv vremu_vx "
+                    "vrem_vv vrem_vx vfdiv_vv vfdiv_vf vfrdiv_vf vfrec7_v" },
+    { "vec.sqrt", 0, "vfsqrt_v vfrsqrt7_v" },
+    { "vec.madd", 0, "vmacc_vv vmacc_vx vmadd_vv vmadd_vx vwmaccu_vv "
+                     "vwmaccu_vx vwmacc_vv vwmacc_vx vwmaccsu_vv vwmaccsu_vx "
+                     "vwmaccus_vx vfmacc_vv vfmacc_vf vfnmacc_vv vfnmacc_vf "
+                     "vfmadd_vv vfmadd_vf vfnmadd_vv vfnmadd_vf vfwmacc_vv "
+                     "vfwmacc_vf vfwnmacc_vv vfwnmacc_vf vfwmaccbf16_vv "
+                     "vfwmaccbf16_vf" },
+    { "vec.msub", 0, "vnmsac_vv vnmsac_vx vnmsub_vv vnmsub_vx vfmsac_vv "
+                     "vfmsac_vf vfnmsac_vv vfnmsac_vf vfmsub_vv vfmsub_vf "
+                     "vfnmsub_vv vfnmsub_vf vfwmsac_vv vfwmsac_vf "
+                     "vfwnmsac_vv vfwnmsac_vf" },
+    { "vec.logic", 0, "vand_vv vand_vx vand_vi vor_vv vor_vx vor_vi vxor_vv "
+                      "vxor_vx vxor_vi vandn_vv vandn_vx vredand_vs "
+                      "vredor_vs vredxor_vs" },
+    { "vec.shift", 0, "vsll_vv vsll_vx vsll_vi vsrl_vv vsrl_vx vsrl_vi "
+                      "vsra_vv vsra_vx vsra_vi vnsrl_wv vnsrl_wx vnsrl_wi "
+                      "vnsra_wv vnsra_wx vnsra_wi vssrl_vv vssrl_vx vssrl_vi "
+                      "vssra_vv vssra_vx vssra_vi vnclipu_wv vnclipu_wx "
+                      "vnclipu_wi vnclip_wv vnclip_wx vnclip_wi vwsll_vv "
+                      "vwsll_vx vwsll_vi vrol_vv vrol_vx vror_vv vror_vx "
+                      "vror_vi" },
+    { "vec.cmp", 0, "vmseq_vv vmseq_vx vmseq_vi vmsne_vv vmsne_vx vmsne_vi "
+                    "vmsltu_vv vmsltu_vx vmslt_vv vmslt_vx vmsleu_vv "
+                    "vmsleu_vx vmsleu_vi vmsle_vv vmsle_vx vmsle_vi "
+                    "vmsgtu_vx vmsgtu_vi vmsgt_vx vmsgt_vi" },
+    { "vec.minmax", 0, "vminu_vv vminu_vx vmin_vv vmin_vx vmaxu_vv vmaxu_vx "
+                       "vmax_vv vmax_vx vredminu_vs vredmin_vs vredmaxu_vs "
+                       "vredmax_vs" },
+    { "vec.fcmp", 0, "vmfeq_vv vmfeq_vf vmfne_vv vmfne_vf vmflt_vv vmflt_vf "
+                     "vmfle_vv vmfle_vf vmfgt_vf vmfge_vf vfclass_v vfmin_vv "
+                     "vfmin_vf vfmax_vv vfmax_vf vfredmin_vs vfredmax_vs" },
+    { "vec.abs", 0, "vfsgnj_vv vfsgnj_vf vfsgnjn_vv vfsgnjn_vf vfsgnjx_vv "
+                    "vfsgnjx_vf" },
+    { "vec.count", 0, "vbrev8_v vbrev_v vclz_v vctz_v vcpop_v" },
+    { "vec.fcvt", 0, "vfcvt_xu_f_v vfcvt_x_f_v vfcvt_f_xu_v vfcvt_f_x_v "
+                     "vfcvt_rtz_xu_f_v vfcvt_rtz_x_f_v vfwcvt_xu_f_v "
+                     "vfwcvt_x_f_v vfwcvt_f_xu_v vfwcvt_f_x_v vfwcvt_f_f_v "
+                     "vfwcvt_rtz_xu_f_v vfwcvt_rtz_x_f_v vfncvt_xu_f_w "
+                     "vfncvt_x_f_w vfncvt_f_xu_w vfncvt_f_x_w vfncvt_f_f_w "
+                     "vfncvt_rod_f_f_w vfncvt_rtz_xu_f_w vfncvt_rtz_x_f_w "
+                     "vfncvtbf16_f_f_w vfwcvtbf16_f_f_v" },
+    { "vec.mov", 0, "vmv_v_v vmv_v_x vmv_v_i vmerge_vvm vmerge_vxm "
+                    "vmerge_vim vfmerge_vfm vfmv_v_f vmv1r_v vmv2r_v vmv4r_v "
+                    "vmv8r_v vid_v vzext_vf2 vzext_vf4 vzext_vf8 vsext_vf2 "
+                    "vsext_vf4 vsext_vf8" },
+    { "vec.shuf", 0, "vmv_x_s vmv_s_x vfmv_f_s vfmv_s_f vslideup_vx "
+                     "vslideup_vi vslide1up_vx vslidedown_vx vslidedown_vi "
+                     "vslide1down_vx vfslide1up_vf vfslide1down_vf "
+                     "vrgather_vv vrgatherei16_vv vrgather_vx vrgather_vi "
+                     "vcompress_vm vrev8_v" },
+    { "vec.pred", 0, "vmand_mm vmnand_mm vmandn_mm vmxor_mm vmor_mm vmnor_mm "
+                     "vmorn_mm vmxnor_mm vcpop_m vfirst_m vmsbf_m vmsif_m "
+                     "vmsof_m viota_m" },
+    { "vec.crypto", 0, "vaesef_vv vaesef_vs vaesdf_vv vaesdf_vs vaesem_vv "
+                       "vaesem_vs vaesdm_vv vaesdm_vs vaesz_vs vaeskf1_vi "
+                       "vaeskf2_vi vsha2ms_vv vsha2ch_vv vsha2cl_vv "
+                       "vsm3me_vv vsm3c_vi vghsh_vv vgmul_vv vsm4k_vi "
+                       "vsm4r_vv vsm4r_vs" },
+};
+#undef IA
+
+static const char *riscv_plugin_word(const char *pattern, unsigned *flags)
+{
+    return plugin_word_lookup(riscv_words, ARRAY_SIZE(riscv_words), pattern,
+                              flags);
+}
 #endif
 
 static const TCGCPUOps riscv_tcg_ops = {
@@ -311,6 +540,7 @@ static const TCGCPUOps riscv_tcg_ops = {
     .restore_state_to_opc = riscv_restore_state_to_opc,
 #ifdef CONFIG_PLUGIN
     .plugin_reg_resolve = riscv_plugin_reg_resolve,
+    .plugin_word = riscv_plugin_word,
 #endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,

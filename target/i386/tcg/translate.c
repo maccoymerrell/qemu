@@ -1798,6 +1798,7 @@ static void gen_exception(DisasContext *s, int trapno)
    the instruction is known, but it isn't allowed in the current cpu mode.  */
 static void gen_illegal_opcode(DisasContext *s)
 {
+    plugin_gen_record_word("sys.trap");     /* whatever was decoded: #UD */
     gen_exception(s, EXCP06_ILLOP);
 }
 
@@ -2108,6 +2109,26 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
     }
 
     return ea;
+}
+
+/*
+ * The address a prefetch or a cache or TLB maintenance instruction names,
+ * stated as base + (index << scale) + disp from the decoded AddressParts
+ * (RIP-relative: no base, disp already absolute).  Not stated when a
+ * segment base joins the sum (FS/GS in 64-bit code; an override or ADDSEG
+ * outside it) or for 16-bit addressing, which the statement cannot carry.
+ */
+static void gen_plugin_ea(DisasContext *s, const AddressParts *a)
+{
+    bool seg = CODE64(s) ? s->override == R_FS || s->override == R_GS
+                         : s->override >= 0 || ADDSEG(s);
+
+    if (s->aflag != MO_16 && !seg) {
+        plugin_gen_record_ea(
+            a->base >= 0 ? offsetof(CPUX86State, regs[a->base]) : -1,
+            a->index >= 0 ? offsetof(CPUX86State, regs[a->index]) : -1,
+            a->scale, s->aflag == MO_32 ? 32 : 0, a->disp);
+    }
 }
 
 /* Used for BNDCL, BNDCU, BNDCN.  */
@@ -2825,6 +2846,78 @@ static void gen_x87_regs(DisasContext *s, int op, int mod, int rm)
     plugin_gen_reg_covered();
 }
 
+/*
+ * The word of an x87 instruction (@op as gen_x87 forms it); NULL for the
+ * encodings gen_x87 refuses.
+ */
+static const char *x87_word(int op, int mod, int rm)
+{
+    /* fadd fmul fcom fcomp fsub fsubr fdiv fdivr */
+    static const char *const arith[8] = {
+        "fp.add", "fp.mul", "fp.cmp", "fp.cmp",
+        "fp.sub", "fp.sub", "fp.div", "fp.div",
+    };
+    /* grp d9/6: f2xm1 fyl2x fptan fpatan fxtract fprem1 fdecstp fincstp */
+    static const char *const d9_6[8] = {
+        "fp.transc", "fp.transc", "fp.transc", "fp.transc",
+        "fp.transc", "fp.transc", "sys.nop", "sys.nop",
+    };
+    /* grp d9/7: fprem fyl2xp1 fsqrt fsincos frndint fscale fsin fcos */
+    static const char *const d9_7[8] = {
+        "fp.transc", "fp.transc", "fp.sqrt", "fp.transc",
+        "fp.cvt", "fp.transc", "fp.transc", "fp.transc",
+    };
+
+    if (mod != 3) {
+        switch (op) {
+        case 0x00 ... 0x07: case 0x10 ... 0x17:
+        case 0x20 ... 0x27: case 0x30 ... 0x37:
+            return arith[op & 7];
+        case 0x08: case 0x0a: case 0x0b: case 0x28: case 0x2a: case 0x2b:
+        case 0x1d: case 0x1f:           /* fld, fst, fstp; fldt, fstpt */
+            return "fp.mov";
+        case 0x18 ... 0x1b: case 0x29: case 0x38 ... 0x3b:
+        case 0x3c ... 0x3f:             /* fild, fist(t)(p), fbld, fbstp */
+            return "fp.cvt";
+        case 0x0c: case 0x0d: case 0x2c:    /* fldenv, fldcw, frstor */
+            return "mem.load";
+        case 0x0e: case 0x0f: case 0x2e: case 0x2f:
+            return "mem.store";         /* fnstenv fnstcw fnsave fnstsw */
+        }
+        return NULL;
+    }
+    switch (op) {
+    case 0x00 ... 0x07: case 0x20 ... 0x27: case 0x30 ... 0x37:
+        return op == 0x33 && rm != 1 ? NULL : arith[op & 7]; /* fcompp */
+    case 0x08: case 0x09: case 0x29: case 0x39: /* fld, fxch */
+    case 0x0b: case 0x2a: case 0x2b: case 0x3a: case 0x3b: /* fst(p) */
+        return "fp.mov";
+    case 0x0a:                                  /* fnop */
+        return rm == 0 ? "sys.nop" : NULL;
+    case 0x0c:                                  /* fchs fabs ftst fxam */
+        return rm < 2 ? "fp.mov" : rm == 4 || rm == 5 ? "fp.cmp" : NULL;
+    case 0x0d:                                  /* fld1 .. fldz */
+        return rm < 7 ? "fp.mov" : NULL;
+    case 0x0e:
+        return d9_6[rm];
+    case 0x0f:
+        return d9_7[rm];
+    case 0x15:                                  /* fucompp */
+        return rm == 1 ? "fp.cmp" : NULL;
+    case 0x1c:                          /* feni fdisi fclex fninit fsetpm */
+        return rm < 5 ? "sys.nop" : NULL;
+    case 0x1d: case 0x1e: case 0x2c: case 0x2d: case 0x3d: case 0x3e:
+        return "fp.cmp";                /* fucomi fcomi fucom(p) f(u)comip */
+    case 0x10 ... 0x13: case 0x18 ... 0x1b:     /* fcmov */
+        return "fp.cmov";
+    case 0x28: case 0x38:                       /* ffree(p) */
+        return "sys.nop";
+    case 0x3c:                                  /* fnstsw ax */
+        return rm == 0 ? "sys.reg" : NULL;
+    }
+    return NULL;
+}
+
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
 {
     bool update_fip = true;
@@ -2832,6 +2925,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     int modrm = s->modrm;
     int mod, rm, op;
 
+    plugin_gen_record_word(x87_word(((b & 7) << 3) | ((modrm >> 3) & 7),
+                                    (modrm >> 6) & 3, modrm & 7));
     if (s->flags & (HF_EM_MASK | HF_TS_MASK)) {
         /* if CR0.EM or CR0.TS are set, generate an FPU exception */
         /* XXX: what to do if illegal op ? */
@@ -3393,6 +3488,66 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     gen_illegal_opcode(s);
 }
 
+/*
+ * The word of an instruction gen_multi0F translates (@b as it forms it);
+ * NULL for the encodings it refuses.
+ */
+static const char *multi0F_word(DisasContext *s, int b, int modrm)
+{
+    /* 0F 01 memory forms: sgdt sidt lgdt lidt smsw - lmsw invlpg */
+    static const char *const grp7_mem[8] = {
+        "mem.store", "mem.store", "mem.load", "mem.load",
+        "mem.store", NULL, "mem.load", "mem.tlb",
+    };
+    int op = (modrm >> 3) & 7;
+    bool mem = (modrm >> 6) != 3;
+
+    switch (b) {
+    case 0x1c7:                         /* rdrand, rdseed, rdpid */
+        return op >= 6 ? "sys.reg" : NULL;
+    case 0x100:                         /* sldt str lldt ltr verr verw */
+        return op >= 6 ? NULL : op >= 4 ? "sys.misc" : !mem ? "sys.reg"
+             : op < 2 ? "mem.store" : "mem.load";
+    case 0x101:
+        if (mem) {
+            return grp7_mem[op];
+        }
+        switch (modrm) {
+        case 0xd9:                      /* vmmcall */
+            return "sys.syscall";
+        case 0xda:                      /* vmload */
+            return "mem.load";
+        case 0xdb:                      /* vmsave */
+            return "mem.store";
+        case 0xdf:                      /* invlpga */
+            return "mem.tlb";
+        case 0xee: case 0xef:           /* rdpkru, wrpkru */
+            return "sys.reg";
+        case 0xc8 ... 0xcb: case 0xd0: case 0xd1: case 0xd8: case 0xdc:
+        case 0xdd: case 0xf8: case 0xf9:
+            /* monitor mwait clac stac xgetbv xsetbv vmrun stgi clgi ... */
+            return "sys.misc";
+        }
+        return op == 4 || op == 6 ? "sys.reg" : NULL;  /* smsw, lmsw */
+    case 0x11a:
+    case 0x11b:
+        if (!(s->flags & HF_MPX_EN_MASK)) {
+            return "sys.nop";
+        }
+        if (b == 0x11b && mem && (s->prefix & PREFIX_REPZ)) {
+            return "int.lea";                           /* bndmk */
+        }
+        if (s->prefix & (PREFIX_REPNZ | (b == 0x11a ? PREFIX_REPZ : 0))) {
+            return "sys.trap.cond";                     /* bndcl bndcu bndcn */
+        }
+        if (s->prefix & PREFIX_DATA) {                  /* bndmov */
+            return !mem ? "sys.reg" : b == 0x11a ? "mem.load" : "mem.store";
+        }
+        return !mem ? "sys.nop" : b == 0x11a ? "mem.load" : "mem.store";
+    }
+    return NULL;
+}
+
 static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
 {
     int prefixes = s->prefix;
@@ -3402,6 +3557,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
     MemOp ot;
     int reg, rm, mod, op;
 
+    plugin_gen_record_word(multi0F_word(s, b, modrm));
     /* now check op code */
     switch (b) {
     case 0x1c7: /* RDSEED, RDPID with f3 prefix */
@@ -3709,6 +3865,8 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 break;
             }
             gen_svm_check_intercept(s, SVM_EXIT_INVLPGA);
+            plugin_gen_record_ea(offsetof(CPUX86State, regs[R_EAX]), -1, 0,
+                                 s->aflag == MO_64 ? 0 : 32, 0);
             if (s->aflag == MO_64) {
                 tcg_gen_mov_tl(s->A0, cpu_regs[R_EAX]);
             } else {
@@ -3806,6 +3964,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 break;
             }
             gen_svm_check_intercept(s, SVM_EXIT_INVLPG);
+            gen_plugin_ea(s, &decode->mem);
             gen_lea_modrm(s, decode);
             gen_helper_flush_page(tcg_env, s->A0);
             s->base.is_jmp = DISAS_EOB_NEXT;

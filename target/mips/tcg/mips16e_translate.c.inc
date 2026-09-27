@@ -142,6 +142,7 @@ static void gen_mips16_save(DisasContext *ctx,
                             int do_ra, int do_s0, int do_s1,
                             int framesize)
 {
+    plugin_gen_record_word("mem.push");
     TCGv t0 = tcg_temp_new();
     TCGv t1 = tcg_temp_new();
     int args, astatic;
@@ -303,6 +304,7 @@ static void gen_mips16_restore(DisasContext *ctx,
                                int do_ra, int do_s0, int do_s1,
                                int framesize)
 {
+    plugin_gen_record_word("mem.pop");
     int astatic;
     TCGv t0 = tcg_temp_new();
 
@@ -585,9 +587,13 @@ static int decode_extended_mips16_opc(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case M16_OPC_LI:
+        plugin_gen_record_word("int.mov");
+        plugin_gen_record_imm((uint16_t)imm);
         tcg_gen_movi_tl(cpu_gpr[rx], (uint16_t) imm);
         break;
     case M16_OPC_CMPI:
+        plugin_gen_record_word("int.xor");
+        plugin_gen_record_imm((uint16_t)imm);
         tcg_gen_xori_tl(cpu_gpr[24], cpu_gpr[rx], (uint16_t) imm);
         break;
 #if defined(TARGET_MIPS64)
@@ -949,6 +955,7 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
             }
             break;
         case RR_SDBBP:
+            plugin_gen_record_word("sys.trap");
             if (is_uhi(ctx, extract32(ctx->opcode, 5, 6))) {
                 ctx->base.is_jmp = DISAS_SEMIHOST;
             } else {
@@ -967,6 +974,7 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
             gen_slt(ctx, OPC_SLTU, 24, rx, ry);
             break;
         case RR_BREAK:
+            plugin_gen_record_word("sys.trap");
             generate_exception_break(ctx, extract32(ctx->opcode, 5, 6));
             break;
         case RR_SLLV:
@@ -1008,6 +1016,7 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
             break;
         case RR_CNVT:
             check_insn(ctx, ISA_MIPS_R1);
+            plugin_gen_record_word(cnvt_op & 4 ? "int.movsx" : "int.movzx");
             switch (cnvt_op) {
             case RR_RY_CNVT_ZEB:
                 tcg_gen_ext8u_tl(cpu_gpr[rx], cpu_gpr[rx]);

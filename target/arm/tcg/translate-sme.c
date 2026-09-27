@@ -221,6 +221,7 @@ static bool trans_LDST1(DisasContext *s, arg_LDST1 *a)
     if (!dc_isar_feature(aa64_sme, s)) {
         return false;
     }
+    plugin_gen_record_word(a->st ? "vec.store" : "vec.load");
     if (!sme_smza_enabled_check(s)) {
         return true;
     }

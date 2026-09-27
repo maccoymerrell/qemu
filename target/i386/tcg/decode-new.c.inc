@@ -360,12 +360,12 @@ static void decode_group15(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         [4] = X86_OP_ENTRYw(XSAVE,      M,y, cpuid(XSAVE) p_00),
         [5] = X86_OP_ENTRYr(XRSTOR,     M,y, cpuid(XSAVE) p_00),
         [6] = X86_OP_ENTRYw(XSAVEOPT,   M,b, cpuid(XSAVEOPT) p_00),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSH) p_00),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSH) p_00),
     };
 
     static const X86OpEntry group15_mem_66[8] = {
-        [6] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLWB)),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSHOPT)),
+        [6] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLWB)),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSHOPT)),
     };
 
     uint8_t modrm = get_modrm(s, env);
@@ -1291,10 +1291,10 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xf6] = X86_OP_ENTRY3(PSADBW,   V,x, H,x, W,x,         vex4 mmx avx2_256 p_00_66),
     [0xf7] = X86_OP_ENTRY3(MASKMOV,  None,None, V,dq, U,dq, vex4_unal avx2_256 mmx p_00_66),
 
-    [0x08] = X86_OP_ENTRY0(NOP,           svm(INVD)),
-    [0x09] = X86_OP_ENTRY0(NOP,           svm(WBINVD)),
+    [0x08] = X86_OP_ENTRY0(WBINVD,        svm(INVD)),
+    [0x09] = X86_OP_ENTRY0(WBINVD,        svm(WBINVD)),
     [0x0b] = X86_OP_ENTRY0(UD),           /* UD2 */
-    [0x0d] = X86_OP_ENTRY1(NOP,  M,v),    /* 3DNow! prefetch */
+    [0x0d] = X86_OP_ENTRY1(PREFETCH, M,v),  /* 3DNow! prefetch */
     [0x0e] = X86_OP_ENTRY0(EMMS,                              cpuid(3DNOW)), /* femms */
     /*
      * 3DNow!'s opcode byte comes *after* modrm and displacements, making it
@@ -1303,7 +1303,7 @@ static const X86OpEntry opcodes_0F[256] = {
      */
     [0x0f] = X86_OP_ENTRY3(3dnow,       P,q, Q,q, I,b,        cpuid(3DNOW)),
 
-    [0x18] = X86_OP_ENTRY1(NOP,  nop,v),  /* prefetch/reserved NOP */
+    [0x18] = X86_OP_ENTRY1(PREFETCH, nop,v), /* prefetch/reserved NOP */
     [0x19] = X86_OP_ENTRY1(NOP,  nop,v),  /* reserved NOP */
     [0x1a] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
     [0x1b] = X86_OP_ENTRY1(multi0F, nop,v, nolea),  /* unconverted MPX */
@@ -2565,6 +2565,236 @@ static void gen_reg_decoded(X86DecodedInsn *decode)
     }
 }
 
+/*
+ * The generic word of each gen_* function; a NULL word: the function
+ * states it (x87, 3DNow! and the unconverted 0F opcodes switch on bytes
+ * past the table).  Scalar SSE forms (F3/F2 prefix with REPScalar) take
+ * the second table's word.
+ */
+typedef struct X86Word {
+    const char *word;
+    const X86GenFunc *gen;
+} X86Word;
+#define W(word, ...) { word, (const X86GenFunc[]) { __VA_ARGS__, NULL } }
+
+static const X86Word x86_words[] = {
+    W("int.add", gen_ADD, gen_ADC, gen_ADCX, gen_ADOX, gen_XADD, gen_CMPccXADD),
+    W("int.sub", gen_SUB, gen_SBB),
+    W("int.mul", gen_MUL, gen_IMUL, gen_IMUL3, gen_MULX),
+    W("int.div", gen_DIV, gen_IDIV),
+    W("int.neg", gen_NEG),
+    W("int.not", gen_NOT),
+    W("int.inc", gen_INC),
+    W("int.dec", gen_DEC),
+    W("int.decimal", gen_AAA, gen_AAD, gen_AAM, gen_AAS, gen_DAA, gen_DAS),
+    W("int.and", gen_AND),
+    W("int.andn", gen_ANDN),
+    W("int.or", gen_OR),
+    W("int.xor", gen_XOR),
+    W("int.shl", gen_SHL, gen_SHLD, gen_SHLX),
+    W("int.shr", gen_SHR, gen_SHRD, gen_SHRX),
+    W("int.sar", gen_SAR, gen_SARX),
+    W("int.rol", gen_ROL, gen_RCL),
+    W("int.ror", gen_ROR, gen_RCR, gen_RORX),
+    W("int.bitfield", gen_BEXTR, gen_BZHI, gen_PDEP, gen_PEXT),
+    W("int.count", gen_BSF, gen_BSR, gen_LZCNT, gen_TZCNT, gen_POPCNT),
+    W("int.bswap", gen_BSWAP),
+    W("int.bits", gen_BLSI, gen_BLSMSK, gen_BLSR),
+    W("int.crc", gen_CRC32),
+    W("int.test", gen_BT, gen_BTC, gen_BTR, gen_BTS),
+    W("int.cmov", gen_CMOVcc),
+    W("int.setcc", gen_SETcc, gen_SALC),
+    W("int.mov", gen_MOV, gen_MOVBE, gen_LAHF, gen_SAHF),
+    W("int.movsx", gen_CBW, gen_CWD),
+    W("int.lea", gen_LEA),
+    W("int.xchg", gen_XCHG, gen_CMPXCHG, gen_CMPXCHG8B, gen_CMPXCHG16B),
+    W("int.flags", gen_CLC, gen_STC, gen_CMC, gen_CLD, gen_STD),
+    W("mem.load", gen_LDS, gen_LES, gen_LFS, gen_LGS, gen_LSS, gen_XLAT,
+      gen_LDMXCSR, gen_FXRSTOR, gen_XRSTOR),
+    W("mem.store", gen_STMXCSR, gen_FXSAVE, gen_XSAVE, gen_XSAVEOPT),
+    W("mem.push", gen_PUSH, gen_PUSHA, gen_PUSHF, gen_ENTER),
+    W("mem.pop", gen_POP, gen_POPA, gen_POPF, gen_LEAVE),
+    W("mem.cache", gen_CLFLUSH),
+    W("mem.fence", gen_LFENCE, gen_MFENCE, gen_SFENCE, gen_WBINVD),
+    W("str.movs", gen_MOVS), W("str.cmps", gen_CMPS), W("str.scas", gen_SCAS),
+    W("str.lods", gen_LODS), W("str.stos", gen_STOS), W("str.ins", gen_INS),
+    W("str.outs", gen_OUTS), W("io.in", gen_IN), W("io.out", gen_OUT),
+    W("fp.mov", gen_VMOVSS, gen_VMOVSS_ld, gen_VMOVSS_st, gen_VMOVSD_ld),
+    W("fp.cvt", gen_VCVTSS2SD, gen_VCVTSD2SS, gen_VCVTSI2Sx, gen_VCVTSx2SI,
+      gen_VCVTTSx2SI, gen_VROUNDSS, gen_VROUNDSD),
+    W("fp.cmp", gen_VCOMI, gen_VUCOMI),
+    W("fp.madd", gen_VFMADD132Sx, gen_VFMADD213Sx, gen_VFMADD231Sx,
+      gen_VFNMADD132Sx, gen_VFNMADD213Sx, gen_VFNMADD231Sx),
+    W("fp.msub", gen_VFMSUB132Sx, gen_VFMSUB213Sx, gen_VFMSUB231Sx,
+      gen_VFNMSUB132Sx, gen_VFNMSUB213Sx, gen_VFNMSUB231Sx),
+    W("vec.add", gen_VADD, gen_VADDSUB, gen_VHADD, gen_PADDB, gen_PADDW,
+      gen_PADDD, gen_PADDQ, gen_PADDSB, gen_PADDSW, gen_PADDUSB, gen_PADDUSW,
+      gen_PHADDW, gen_PHADDD, gen_PHADDSW, gen_PAVGB, gen_PAVGW),
+    W("vec.sub", gen_VSUB, gen_VHSUB, gen_PSUBB, gen_PSUBW, gen_PSUBD,
+      gen_PSUBQ, gen_PSUBSB, gen_PSUBSW, gen_PSUBUSB, gen_PSUBUSW, gen_PHSUBW,
+      gen_PHSUBD, gen_PHSUBSW, gen_PSADBW, gen_VMPSADBW),
+    W("vec.mul", gen_VMUL, gen_PMULLW, gen_PMULLD, gen_PMULHW, gen_PMULHUW,
+      gen_PMULHRSW, gen_PMULUDQ, gen_PMULDQ, gen_PCLMULQDQ),
+    W("vec.div", gen_VDIV, gen_VRCP),
+    W("vec.sqrt", gen_VSQRT, gen_VRSQRT),
+    W("vec.madd", gen_PMADDWD, gen_PMADDUBSW, gen_VDDPS, gen_VDDPD,
+      gen_VFMADD132Px, gen_VFMADD213Px, gen_VFMADD231Px, gen_VFNMADD132Px,
+      gen_VFNMADD213Px, gen_VFNMADD231Px, gen_VFMADDSUB132Px,
+      gen_VFMADDSUB213Px, gen_VFMADDSUB231Px),
+    W("vec.msub", gen_VFMSUB132Px, gen_VFMSUB213Px, gen_VFMSUB231Px,
+      gen_VFNMSUB132Px, gen_VFNMSUB213Px, gen_VFNMSUB231Px,
+      gen_VFMSUBADD132Px, gen_VFMSUBADD213Px, gen_VFMSUBADD231Px),
+    W("vec.mov", gen_MOVDQ, gen_MOVD_from, gen_MOVD_to, gen_MOVQ, gen_MOVq_dq,
+      gen_MOVMSK, gen_PMOVMSKB, gen_VMOVHLPS, gen_VMOVLHPS, gen_VMOVHPx,
+      gen_VMOVHPx_ld, gen_VMOVHPx_st, gen_VMOVLPx, gen_VMOVLPx_ld,
+      gen_VMOVLPx_st, gen_VMOVDDUP, gen_VMOVSLDUP, gen_VMOVSHDUP,
+      gen_VPBROADCASTB, gen_VPBROADCASTW, gen_VPBROADCASTD, gen_VPBROADCASTQ,
+      gen_VBROADCASTx128, gen_VPMOVSXBW, gen_VPMOVSXBD, gen_VPMOVSXBQ,
+      gen_VPMOVSXWD, gen_VPMOVSXWQ, gen_VPMOVSXDQ, gen_VPMOVZXBW,
+      gen_VPMOVZXBD, gen_VPMOVZXBQ, gen_VPMOVZXWD, gen_VPMOVZXWQ,
+      gen_VPMOVZXDQ),
+    W("vec.shuf", gen_PSHUFB, gen_PSHUFD, gen_PSHUFHW, gen_PSHUFLW,
+      gen_PSHUFW, gen_VSHUF, gen_PALIGNR, gen_PUNPCKLBW, gen_PUNPCKLWD,
+      gen_PUNPCKLDQ, gen_PUNPCKLQDQ, gen_PUNPCKHBW, gen_PUNPCKHWD,
+      gen_PUNPCKHDQ, gen_PUNPCKHQDQ, gen_VUNPCKLPx, gen_VUNPCKHPx,
+      gen_PACKSSWB, gen_PACKSSDW, gen_PACKUSWB, gen_VPACKUSDW, gen_PINSRB,
+      gen_PINSRW, gen_PINSR, gen_PEXTRB, gen_PEXTRW, gen_PEXTR,
+      gen_VINSERTPS_r, gen_VINSERTPS_m, gen_VEXTRACTPS, gen_VINSERTx128,
+      gen_VEXTRACTx128, gen_VPERMD, gen_VPERMQ, gen_VPERMILPS, gen_VPERMILPD,
+      gen_VPERMILPS_i, gen_VPERMILPD_i, gen_VPERM2x128, gen_BLENDVPS,
+      gen_BLENDVPD, gen_PBLENDVB, gen_VBLENDVPS, gen_VBLENDVPD, gen_VPBLENDVB,
+      gen_VBLENDPS, gen_VBLENDPD, gen_VPBLENDW, gen_EXTRQ_i, gen_EXTRQ_r,
+      gen_INSERTQ_i, gen_INSERTQ_r),
+    W("vec.logic", gen_PAND, gen_PANDN, gen_POR, gen_PXOR),
+    W("vec.shift", gen_PSLLW_i, gen_PSLLD_i, gen_PSLLQ_i, gen_PSLLDQ_i,
+      gen_PSRLW_i, gen_PSRLD_i, gen_PSRLQ_i, gen_PSRLDQ_i, gen_PSRAW_i,
+      gen_PSRAD_i, gen_PSLLW_r, gen_PSLLD_r, gen_PSLLQ_r, gen_PSRLW_r,
+      gen_PSRLD_r, gen_PSRLQ_r, gen_PSRAW_r, gen_PSRAD_r, gen_VPSLLV,
+      gen_VPSRLV, gen_VPSRAV),
+    W("vec.cmp", gen_PCMPEQB, gen_PCMPEQW, gen_PCMPEQD, gen_PCMPEQQ,
+      gen_PCMPGTB, gen_PCMPGTW, gen_PCMPGTD, gen_PCMPGTQ, gen_VPTEST,
+      gen_VTESTPS, gen_VTESTPD, gen_PCMPESTRI, gen_PCMPESTRM, gen_PCMPISTRI,
+      gen_PCMPISTRM),
+    W("vec.minmax", gen_PMINSB, gen_PMINSW, gen_PMINSD, gen_PMINUB,
+      gen_PMINUW, gen_PMINUD, gen_PMAXSB, gen_PMAXSW, gen_PMAXSD, gen_PMAXUB,
+      gen_PMAXUW, gen_PMAXUD, gen_VPHMINPOSUW),
+    W("vec.abs", gen_PABSB, gen_PABSW, gen_PABSD, gen_PSIGNB, gen_PSIGNW,
+      gen_PSIGND),
+    W("vec.crypto", gen_VAESDEC, gen_VAESDECLAST, gen_VAESENC,
+      gen_VAESENCLAST, gen_VAESIMC, gen_VAESKEYGEN, gen_SHA1MSG1, gen_SHA1MSG2,
+      gen_SHA1NEXTE, gen_SHA1RNDS4, gen_SHA256MSG1, gen_SHA256MSG2,
+      gen_SHA256RNDS2),
+    W("vec.fcmp", gen_VMIN, gen_VMAX, gen_VCMP),
+    W("vec.fcvt", gen_VCVTDQ2PS, gen_VCVTPS2DQ, gen_VCVTTPS2DQ, gen_VCVTPS2PD,
+      gen_VCVTPD2PS, gen_VCVTTPD2DQ, gen_VCVTDQ2PD, gen_VCVTPD2DQ,
+      gen_VCVTPH2PS, gen_VCVTPS2PH, gen_CVTPI2Px, gen_CVTPx2PI, gen_CVTTPx2PI,
+      gen_VROUNDPS, gen_VROUNDPD),
+    W("vec.load", gen_VMASKMOVPS, gen_VMASKMOVPD, gen_VPMASKMOV),
+    W("vec.store", gen_VMASKMOVPS_st, gen_VMASKMOVPD_st, gen_VPMASKMOV_st,
+      gen_MASKMOV),
+    W("vec.gather", gen_VPGATHERD, gen_VPGATHERQ),
+    W("branch.jump", gen_JMP, gen_JMPF),
+    W("branch.jump.ind", gen_JMP_m, gen_JMPF_m),
+    W("branch.call", gen_CALL, gen_CALLF),
+    W("branch.call.ind", gen_CALL_m, gen_CALLF_m),
+    W("branch.ret", gen_RET, gen_RETF),
+    W("branch.cond", gen_Jcc, gen_JCXZ, gen_LOOP, gen_LOOPE, gen_LOOPNE),
+    W("sys.syscall", gen_SYSCALL, gen_SYSENTER, gen_INT),
+    W("sys.eret", gen_IRET, gen_SYSRET, gen_SYSEXIT, gen_RSM),
+    W("sys.trap", gen_INT1, gen_INT3, gen_UD),
+    W("sys.trap.cond", gen_INTO, gen_BOUND),
+    W("sys.nop", gen_NOP, gen_PAUSE, gen_WAIT, gen_VZEROUPPER, gen_VZEROALL,
+      gen_PREFETCH),
+    W("sys.reg", gen_RDxxBASE, gen_WRxxBASE, gen_CLTS, gen_LAR, gen_LSL),
+    W("sys.misc", gen_CPUID, gen_RDTSC, gen_RDPMC, gen_RDMSR, gen_WRMSR,
+      gen_HLT, gen_CLI, gen_STI, gen_EMMS, gen_ARPL),
+    W(NULL, gen_x87, gen_3dnow, gen_multi0F),
+};
+
+static const X86Word x86_words_scalar[] = {
+    W("fp.add", gen_VADD), W("fp.sub", gen_VSUB), W("fp.mul", gen_VMUL),
+    W("fp.div", gen_VDIV), W("fp.sqrt", gen_VSQRT), W("fp.rsqrt", gen_VRSQRT),
+    W("fp.recip", gen_VRCP), W("fp.minmax", gen_VMIN, gen_VMAX),
+    W("fp.cmp", gen_VCMP),
+};
+#undef W
+
+static const char *x86_word(X86GenFunc gen, bool scalar)
+{
+    static GHashTable *words[2];
+    static gsize init;
+    const char *w;
+
+    if (g_once_init_enter(&init)) {
+        for (int k = 0; k < 2; k++) {
+            const X86Word *t = k ? x86_words_scalar : x86_words;
+            size_t n = k ? ARRAY_SIZE(x86_words_scalar) : ARRAY_SIZE(x86_words);
+
+            words[k] = g_hash_table_new(NULL, NULL);
+            for (size_t i = 0; i < n; i++) {
+                for (const X86GenFunc *g = t[i].gen; *g; g++) {
+                    g_hash_table_insert(words[k], (gpointer)*g,
+                                        (gpointer)t[i].word);
+                }
+            }
+        }
+        g_once_init_leave(&init, 1);
+    }
+    w = scalar ? g_hash_table_lookup(words[1], (gpointer)gen) : NULL;
+    return w ? w : g_hash_table_lookup(words[0], (gpointer)gen);
+}
+
+/*
+ * The decode statement of a decoded instruction: the word of its gen_*
+ * function, told apart where one function serves several operations, and
+ * its operand immediate.  (A gen_* function stating a word itself runs
+ * later and wins; so does a #UD.)
+ */
+static void gen_decode_statement(DisasContext *s, X86DecodedInsn *decode)
+{
+    X86OpEntry *e = &decode->e;
+    X86GenFunc g = e->gen;
+    const char *w = x86_word(g, (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) &&
+                                e->vex_special == X86_VEX_REPScalar);
+
+    if (e->op0 == X86_TYPE_None && (g == gen_SUB || g == gen_AND)) {
+        w = g == gen_SUB ? "int.cmp" : "int.test";      /* no writeback */
+    } else if (g == gen_MOV) {
+        X86OpUnit u0 = decode->op[0].unit, u1 = decode->op[1].unit;
+
+        w = u0 == X86_OP_CR || u0 == X86_OP_DR ||
+            u1 == X86_OP_CR || u1 == X86_OP_DR ? "sys.reg"
+            : e->special == X86_SPECIAL_ZExtT0 ? "int.movzx"
+            : e->special == X86_SPECIAL_SExtT0 ? "int.movsx" : w;
+    } else if ((g == gen_VMOVLPx || g == gen_VMOVLPx_st) &&
+               (s->prefix & PREFIX_REPNZ)) {
+        w = "fp.mov";                                   /* movsd, movntsd */
+    }
+    plugin_gen_record_word(w);
+
+    /* not operands: a 3DNow! opcode byte, an is4 register selector */
+    if (g == gen_3dnow || g == gen_VBLENDVPS || g == gen_VBLENDVPD ||
+        g == gen_VPBLENDVB) {
+        return;
+    }
+    if (e->op2 == X86_TYPE_None &&
+        (g == gen_ROL || g == gen_ROR || g == gen_RCL || g == gen_RCR ||
+         g == gen_SHL || g == gen_SHR || g == gen_SAR)) {
+        plugin_gen_record_imm(1);       /* D0/D1: the count the opcode fixes */
+    }
+    for (int i = 0; i < 4; i++) {
+        if (i == 3 ? e->op3 != X86_TYPE_None
+                   : decode->op[i].unit == X86_OP_IMM) {
+            plugin_gen_record_imm((target_long)(i == 3 ? decode->immediate
+                                                       : decode->op[i].imm));
+            break;
+        }
+    }
+    if (g == gen_JMPF || g == gen_CALLF) {
+        plugin_gen_record_imm_address();                /* ptr16:16/32 */
+    }
+}
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -2735,6 +2965,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     if (!decode.e.gen) {
         goto unknown_op;
     }
+    gen_decode_statement(s, &decode);
 
     if (!has_cpuid_feature(s, decode.e.cpuid)) {
         goto illegal_op;
@@ -2874,6 +3105,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     }
     if (s->prefix & PREFIX_LOCK) {
         assert(decode.op[0].has_ea && !decode.op[2].has_ea);
+        plugin_gen_record_atomic();
         gen_load(s, &decode, 2, s->T1);
         decode.e.gen(s, &decode);
     } else {

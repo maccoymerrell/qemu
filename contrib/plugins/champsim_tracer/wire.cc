@@ -571,13 +571,30 @@ std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
         }
         fam = "stack";
     }
-    bool has_reg = false;
+    bool has_reg = false, sat = false;
     for (const auto *v : { &dst, &sd }) {
-        for (const Bits &m : *v) has_reg |= m != full;
+        for (const Bits &m : *v) {
+            has_reg |= m != full;
+            sat |= m == full;
+        }
     }
+    /*
+     * A source only an address mask names reaches a sink through the memop
+     * alone (format.rst, lane-granularity resolution, rule 2), so a
+     * saturated sink loses one that only a store's address names -- no
+     * load carries it.  Such a block states no address masks.
+     */
+    Bits lda{}, sta{};
+    for (const Bits &m : addr[0]) lda = either(lda, m);
+    for (const Bits &m : addr[1]) sta = either(sta, m);
+    bool cut = false;
+    for (size_t k = 0; k < n; k++) {
+        cut |= sat && has_addr && (sta[k / 64] & ~lda[k / 64]) >> (k % 64) & 1;
+    }
+    has_addr &= !cut;
     if (!has_reg && !has_addr) {
-        return L + S ? (valid[0] || valid[1] ? "none:no-gain" : "none:list-incomplete")
-                     : "none";
+        return cut ? "none:store-address" : L + S ? (valid[0] || valid[1] ?
+               "none:no-gain" : "none:list-incomplete") : "none";
     }
     auto uleb = [&b](const Bits &m) {     /* a multi-limb ULEB */
         size_t top = 512;

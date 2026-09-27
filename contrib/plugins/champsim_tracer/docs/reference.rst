@@ -483,7 +483,14 @@ reason when none applies:
    ``HAS_ADDR`` only: each load and store address names the registers its
    composition reads.  Models address generation apart from data: a load
    issues when its address operands are ready, a store splits into its
-   address and data halves.
+   address and data halves.  A consumer reads a source that only address
+   masks name as reaching the sinks through the memop (:doc:`format`,
+   lane-granularity resolution, rule 2), which a saturated ``dst_dep`` /
+   ``store_data_dep`` does through a load but not through a store: where a
+   store's address names a source no load's address does and a register
+   mask is saturated -- the stack pointer a ``call`` both addresses and
+   moves -- the block states no address masks (``none:store-address`` in
+   ``<outfile>.deps.tsv``).
 ``passthrough``
    By decode word (``mem.load``, ``mem.store``, ``int.mov``, ``int.movzx``,
    ``int.movsx``, ``fp.mov``, ``vec.load``, ``vec.store``, ``vec.mov``,

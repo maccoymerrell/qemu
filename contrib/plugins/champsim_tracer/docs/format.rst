@@ -546,9 +546,8 @@ Decode by repeated outer-section unwrapping.
         (per-dst-reg, per-store-data), HAS_ADDR carries per-memop
         address deps (which src_regs feed the load/store address — so
         the consumer can fire each memop without waiting on inputs
-        irrelevant to its address).  A family the block omits is the
-        all-to-all default for that family.  See Reference §3 for the
-        bit layout inside each mask.
+        irrelevant to its address).  See Reference §3 for the bit
+        layout inside each mask.
    4.6  Template profile block (consumed from tmpl_section,
         immediately after the last insn descriptor, present only when
         the `CST_FLAG_PROFILE` header bit is set — resolve the
@@ -3496,14 +3495,7 @@ in this role; no other ISA has segmented addressing.
 Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore
-the block.  The two families default separately: a block with
-``HAS_ADDR`` and no ``HAS_REG`` states the address masks and leaves
-every ``dst_dep`` / ``store_data_dep`` at the all-to-all default, and
-one with ``HAS_REG`` and no ``HAS_ADDR`` leaves every address mask
-naming every source.  An address mask never takes a source out of a
-register mask: a register that forms an address and also feeds a value
-(``add (%rax), %rax``) is named in both, and a register mask drops an
-address register only where the block's own ``HAS_REG`` masks omit it.
+the block.
 
 Vector lane masks
 ^^^^^^^^^^^^^^^^^
@@ -3540,13 +3532,7 @@ wire already carries, so no field of its own is needed:
   active lane (the ``r``-th set bit of its ``DST_LANE_MASK`` /
   ``SRC_LANE_MASK``) and as many following lanes as its size spans in
   elements; this is the value ``LOAD_DATA_LANE_MASK{k}`` /
-  ``STORE_DATA_LANE_MASK{k}`` publishes.  The rank counts lanes: a
-  memop spanning several lanes takes that many, and the register's next
-  memop starts at the active lane after them -- the lanes its address
-  relative to the access base gives.  AVX ``vpaddd (%rax), %ymm2, %ymm3``
-  makes two 16-byte loads of 4-byte elements: lanes ``{0..3}`` and
-  ``{4..7}``.  A memop past the register's active lanes publishes no
-  lane.
+  ``STORE_DATA_LANE_MASK{k}`` publishes.
 
 A de-interleaving structure load is where both matter.  AArch64
 ``ld3 {v0.4s-v2.4s}, [x0]`` performs twelve 4-byte loads, element ``e``

@@ -80,7 +80,7 @@ bool filter_member(Member &m, const std::string &filter,
  * Write the archive to @path, all or nothing: the bytes go to a sibling
  * staging file (<path>.part.<pid>), are flushed to disk, and only then
  * renamed onto @path, so a reader never observes a torn container.  A
- * member past the ustar size field (8 GiB) is refused, not truncated.
+ * member of 8 GiB or more states its size in GNU base-256.
  */
 bool publish_archive(const std::string &path,
                      const std::vector<Member> &members, std::string &err);

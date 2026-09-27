@@ -70,14 +70,21 @@ const char *codec_suffix(const uint8_t *b, size_t n)
 }
 
 /* One ustar header block for a regular file. */
-void ustar_header(uint8_t blk[512], const std::string &name, size_t size)
+void ustar_header(uint8_t blk[512], const std::string &name, uint64_t size)
 {
     std::memset(blk, 0, 512);
     std::memcpy(blk, name.data(), name.size());          /* name[100] */
     std::snprintf((char *)blk + 100, 8, "%07o", 0644);    /* mode */
     std::snprintf((char *)blk + 108, 8, "%07o", 0);       /* uid */
     std::snprintf((char *)blk + 116, 8, "%07o", 0);       /* gid */
-    std::snprintf((char *)blk + 124, 12, "%011llo", (unsigned long long)size);
+    if (size >> 33) {       /* past 11 octal digits: GNU base-256, no NUL */
+        blk[124] = 0x80;
+        for (int i = 11; i > 0; i--, size >>= 8) {
+            blk[124 + i] = uint8_t(size);
+        }
+    } else {
+        std::snprintf((char *)blk + 124, 12, "%011llo", (unsigned long long)size);
+    }
     std::snprintf((char *)blk + 136, 12, "%011llo",
                   (unsigned long long)std::time(nullptr));
     blk[156] = '0';                                       /* typeflag */
@@ -281,11 +288,6 @@ bool publish_archive(const std::string &path,
         struct stat st;
         size_t size = m.fd < 0 ? m.bytes.size() :
                       fstat(m.fd, &st) == 0 ? size_t(st.st_size) : 0;
-        if (ok && size > 077777777777ull) {
-            err = m.name + " is " + std::to_string(size) +
-                  " bytes, past the ustar size field";
-            ok = false;
-        }
         uint8_t blk[512];
         ustar_header(blk, m.name, size);
         ok = ok && write_all(fd, blk, sizeof(blk)) &&

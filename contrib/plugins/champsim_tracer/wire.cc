@@ -806,7 +806,8 @@ void put_reg(Section &sec, uint32_t ipos, const Memop &x, uint8_t id,
  * base's -- or the element a single-element form selects; a source that is
  * also the destination is read whole, less that element.  A memop takes, by
  * the rank rule, the next lanes its size spans among its register's active
- * ones (a group's base: the elements past it take none).  Its register is
+ * ones (a group's base: the elements past it take none), a broadcast's
+ * load every one (format.rst: the lanes taking its value).  Its register is
  * the one the dependency block names: the stated one where dep_block()
  * names it per slot (a move whose accesses are complete, branch-free, one
  * direction), else every one, whose masks are the same -- and a memop moving
@@ -861,7 +862,7 @@ void put_lanes(Section &sec, uint32_t ipos, const WireInsn &i,
             unsigned span = std::max(1u, unsigned(dir[d][k].size / c.vesz)), rank = 0;
             uint64_t m = 0, lanes = d ? smask : dmask;
             for (unsigned j = 0; j < 64; j++) {
-                if (lanes >> j & 1 && rank++ - u < span) {
+                if (lanes >> j & 1 && ((c.dup && !d) || rank++ - u < span)) {
                     m |= uint64_t(1) << j;
                 }
             }

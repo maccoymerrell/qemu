@@ -86,6 +86,7 @@ struct Class {
     uint8_t vkind = kVecNone, vesz = 0, vn = 0, vgroup = 1;  /* registers an operand */
     int8_t dsel = -1, ssel = -1;
     bool ew = false, vword = false;     /* element-wise; a "vec." word */
+    bool dup = false;                   /* a ".dup" word: one element to every lane */
     bool same_shape(const Class &o) const
     {
         return vkind == o.vkind && vesz == o.vesz && vn == o.vn && vgroup == o.vgroup &&
@@ -145,9 +146,10 @@ inline const char *vocab_rows()
         "vec.abs VEC_LOGIC\n"   "vec.add VEC_ADD\n"     "vec.cmp VEC_LOGIC\n"
         "vec.config MOV\n"      "vec.count VEC_LOGIC\n" "vec.crypto VEC_LOGIC\n"
         "vec.div VEC_DIV\n"     "vec.fcmp FP_CMP\n"     "vec.fcvt FP_CVT\n"
-        "vec.gather VEC_LOAD\n" "vec.load VEC_LOAD\n"   "vec.logic VEC_LOGIC\n"
-        "vec.madd VEC_MADD\n"   "vec.minmax VEC_LOGIC\n" "vec.mov VEC_MOV\n"
-        "vec.msub VEC_MSUB\n"   "vec.mul VEC_MUL\n"     "vec.pred VEC_LOGIC\n"
+        "vec.gather VEC_LOAD\n" "vec.load VEC_LOAD\n"   "vec.load.dup VEC_LOAD\n"
+        "vec.logic VEC_LOGIC\n" "vec.madd VEC_MADD\n"   "vec.minmax VEC_LOGIC\n"
+        "vec.mov VEC_MOV\n"     "vec.mov.dup VEC_MOV\n" "vec.msub VEC_MSUB\n"
+        "vec.mul VEC_MUL\n"     "vec.pred VEC_LOGIC\n"
         "vec.prefetch VEC_PREFETCH\n"               "vec.scatter VEC_STORE\n"
         "vec.shift VEC_LOGIC\n" "vec.shuf VEC_SHUF\n"   "vec.sqrt VEC_SQRT\n"
         "vec.store VEC_STORE\n" "vec.sub VEC_SUB\n";

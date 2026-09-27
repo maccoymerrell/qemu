@@ -391,6 +391,7 @@ void classify_insn(Session &s, struct qemu_plugin_insn *insn, cst::TbShape &tb)
         { "int.mov", cst::kDepMove }, { "int.movzx", cst::kDepMove },
         { "int.movsx", cst::kDepMove }, { "fp.mov", cst::kDepMove },
         { "vec.mov", cst::kDepMove }, { "mem.push", cst::kDepPush },
+        { "vec.load.dup", cst::kDepMove }, { "vec.mov.dup", cst::kDepMove },
         { "mem.pop", cst::kDepPop },
         { "mem.load.wb", cst::kDepMoveWb }, { "mem.store.wb", cst::kDepMoveWb },
     };
@@ -410,6 +411,7 @@ void classify_insn(Session &s, struct qemu_plugin_insn *insn, cst::TbShape &tb)
     c.ssel = v->ssel;
     c.ew = v->elementwise;
     c.vword = d->word && !std::strncmp(d->word, "vec.", 4);
+    c.dup = ok && std::strstr(d->word, ".dup");
     tb.cls.push_back(c);
     const std::string &name = cst::vocabulary(false)[c.op];
     if (name != "PREFETCH" && name != "CACHE_FLUSH" && name != "TLB_FLUSH" &&

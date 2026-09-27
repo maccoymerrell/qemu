@@ -494,8 +494,9 @@ reason when none applies:
 ``passthrough``
    By decode word (``mem.load``, ``mem.store``, ``int.mov``, ``int.movzx``,
    ``int.movsx``, ``fp.mov``, ``vec.load``, ``vec.store``, ``vec.mov``,
-   and the written-back ``mem.load.wb`` / ``mem.store.wb``): a loaded value
-   feeds the register the access names -- itself too, and the address
+   the broadcasts ``vec.load.dup`` / ``vec.mov.dup``, and the written-back
+   ``mem.load.wb`` / ``mem.store.wb``): a loaded value feeds the register
+   the access names -- itself too, and the address
    registers, when that register is also a source (a merge such as MIPS
    ``lwl``); a data register no access names takes every load and the
    sources no load's address reads.  A store's datum is the register its
@@ -540,10 +541,11 @@ the registers a RISC-V V operand spans:
   register, or several of different shapes in one instruction, makes the
   statement MIXED, which carries no masks;
 - AArch64: the multiple- and single-structure loads and stores (``ld1``-
-  ``ld4``, ``st1``-``st4``, one lane) and the three-register vector
-  floating-point funnel;
-- x86: the packed SSE/AVX floating-point funnels and ``pinsr*`` /
-  ``pextr*``;
+  ``ld4``, ``st1``-``st4``, one lane), the replicating loads (``ld1r``-
+  ``ld4r``) and the three-register vector floating-point funnel;
+- x86: the packed SSE/AVX floating-point funnels, ``pinsr*`` /
+  ``pextr*`` and the broadcasts (``vpbroadcast*``, ``vbroadcastss``,
+  ``vbroadcasti128``), from memory or a register's element 0;
 - RISC-V V: the single-width checks (``vv``/``vx``/``vi``/unary FP) and the
   unit-stride and strided loads and stores, unmasked and one field, the
   active count ``vl`` read at every execution;
@@ -553,7 +555,7 @@ the registers a RISC-V V operand spans:
 
 Every other vector encoding states no shape and carries no masks:
 out-of-line helpers whose element size the emission does not hold
-(``addp``, ``haddps``), broadcasts (``ld1r``), widening and narrowing
+(``addp``, ``haddps``), widening and narrowing
 forms, masked (predicated) RISC-V V forms -- their active elements are
 ``v0``'s to say -- segment accesses, SVE loads and stores.
 ``<outfile>.deps.tsv`` names each executed vector encoding ``masked``
@@ -570,7 +572,12 @@ the one ``dst_dep`` / ``store_data_dep`` name for its slot (the access
 statement's per-slot register where the block is per slot, else every
 register, whose masks are the same), and the memops of a register take its
 active lanes in slot order, each as many as its size spans in elements.
-A group's elements past its base register take none.
+A group's elements past its base register take none.  A broadcast -- the
+decode word ``vec.load.dup`` / ``vec.mov.dup``, one element replicated to
+every lane -- is where the rank reading does not apply: every active lane
+of the register takes its value from the one load, so that load's mask is
+all of them (:doc:`format`: bit ``j`` iff lane ``j`` takes its value from
+the load).
 
 ``CST_INSN_FLAG_LANE_PARALLEL`` is set from the ruled family list --
 ``VEC_ADD``, ``VEC_SUB``, ``VEC_MUL``, ``VEC_DIV``, ``VEC_SQRT``,

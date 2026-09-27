@@ -271,6 +271,13 @@ typedef uint64_t qemu_plugin_id_t;
  *   the operand immediate, and the address a prefetch or cache/TLB
  *   maintenance operation names
  *
+ * version 29:
+ * - added qemu_plugin_insn_access_list: each memory access an
+ *   instruction's translation emits, with the registers its address is
+ *   composed from and the register it moves.  The record array's stride is
+ *   this version's, so a plugin declaring an earlier one that imports it
+ *   is refused at load.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -282,7 +289,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 28
+#define QEMU_PLUGIN_VERSION 29
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -964,6 +971,72 @@ struct qemu_plugin_insn_decoded {
 QEMU_PLUGIN_API
 const struct qemu_plugin_insn_decoded *
 qemu_plugin_insn_decode(const struct qemu_plugin_insn *insn);
+
+/**
+ * enum qemu_plugin_addr_form - how an access's address is composed
+ * @QEMU_PLUGIN_ADDR_UNSTATED: the translator stated no composition
+ * @QEMU_PLUGIN_ADDR_REGS: the named registers, plus constants
+ * @QEMU_PLUGIN_ADDR_CONST: a constant the encoding fixes -- an absolute
+ *   address, or a pc-relative one the translator folded
+ */
+enum qemu_plugin_addr_form {
+    QEMU_PLUGIN_ADDR_UNSTATED,
+    QEMU_PLUGIN_ADDR_REGS,
+    QEMU_PLUGIN_ADDR_CONST,
+};
+
+/**
+ * struct qemu_plugin_insn_access - one memory access a translation emits
+ * @dir: QEMU_PLUGIN_MEM_R or QEMU_PLUGIN_MEM_W as the access's memory
+ *   callback reports it (QEMU_PLUGIN_MEM_RW for an atomic read-modify-write
+ *   done in one step); 0 for an address the instruction names without
+ *   accessing it (a prefetch, a cache or TLB maintenance operation, an
+ *   address computed into a register)
+ * @form: an enum qemu_plugin_addr_form value
+ * @base: the register the address is based on, as an index into
+ *   qemu_plugin_insn_reg_list(); -1 for none
+ * @index: the register added to it (scaled or extended), likewise
+ * @seg: the segment register whose base is added, likewise
+ * @reg: the register the access moves -- a load's destination, a store's
+ *   source -- likewise; -1 when not stated, -2 when a store's value is a
+ *   constant
+ *
+ * Each register named is one the instruction reads as an input; a
+ * composition naming a register the list does not state as read is
+ * reported as QEMU_PLUGIN_ADDR_UNSTATED.
+ */
+struct qemu_plugin_insn_access {
+    uint8_t dir;
+    uint8_t form;
+    int16_t base, index, seg, reg;
+};
+
+/* qemu_plugin_insn_access_list() @flags bits */
+#define QEMU_PLUGIN_ACCESS_HELPERS  1   /* a helper runs that may access more */
+#define QEMU_PLUGIN_ACCESS_BRANCHES 2   /* a listed access may be branched over */
+
+/**
+ * qemu_plugin_insn_access_list() - the memory accesses a translation emits
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ * @n: set to the number of entries returned
+ * @flags: if not NULL, set to QEMU_PLUGIN_ACCESS_* bits: the translation
+ *   calls a helper that has side effects and returns, which may access
+ *   memory this list does not show; its ops may branch over an access
+ *   listed, which then does not execute
+ *
+ * One entry per memory callback the translation emits, in emission order,
+ * each with the address composition its decode site stated -- which
+ * registers form the effective address -- and the register it moves where
+ * the emission states it; addresses named but not accessed are entries
+ * too.  A fact of the decode, not an interpretation: nothing is inferred
+ * from the ops.  Valid only during the translation callback.
+ *
+ * Returns: the array (NULL when empty).
+ */
+QEMU_PLUGIN_API
+const struct qemu_plugin_insn_access *
+qemu_plugin_insn_access_list(const struct qemu_plugin_insn *insn, size_t *n,
+                             unsigned *flags);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

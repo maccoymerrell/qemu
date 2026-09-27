@@ -167,7 +167,50 @@ void plugin_gen_record_imm_address(void);
 void plugin_gen_record_ea(intptr_t base, intptr_t index, unsigned shift,
                           int ext, int64_t disp);
 
+/*
+ * The access statement (qemu_plugin_insn_access_list()), made where a
+ * decode site composes an address: plugin_gen_record_addr() names the
+ * CPU-state offsets of the registers it is composed from (-1: none;
+ * PLUGIN_ADDR_UNSTATED: not stated) -- current now, or held in temp @held
+ * until plugin_gen_record_addr_use() makes the address in a temp current:
+ * its held composition, the register whose own global it is, a constant,
+ * else unstated; @seg adds a segment register.  plugin_gen_record_addr_offset():
+ * @dst holds @src's address plus a constant.  plugin_gen_record_addr_named():
+ * the current address is named, not accessed.  plugin_gen_record_access_reg():
+ * the register the next access moves (-2: a constant it stores).  plugin_gen_record_access(): the
+ * emission made a memory callback (tcg-op-ldst.c).
+ */
+#define PLUGIN_ADDR_UNSTATED 1
+void plugin_gen_record_addr(TCGTemp *held, intptr_t base, intptr_t index,
+                            intptr_t seg, unsigned flags);
+void plugin_gen_record_addr_offset(TCGTemp *dst, TCGTemp *src);
+void plugin_gen_record_addr_use(TCGTemp *t, intptr_t seg);
+void plugin_gen_record_addr_named(void);
+void plugin_gen_record_access_reg(intptr_t off);
+void plugin_gen_record_access(unsigned dir, TCGTemp *val);
+
 #else /* !CONFIG_PLUGIN */
+
+#define PLUGIN_ADDR_UNSTATED 1
+static inline void plugin_gen_record_addr(TCGTemp *held, intptr_t base,
+                                          intptr_t index, intptr_t seg,
+                                          unsigned flags)
+{ }
+
+static inline void plugin_gen_record_addr_offset(TCGTemp *dst, TCGTemp *src)
+{ }
+
+static inline void plugin_gen_record_addr_use(TCGTemp *t, intptr_t seg)
+{ }
+
+static inline void plugin_gen_record_addr_named(void)
+{ }
+
+static inline void plugin_gen_record_access_reg(intptr_t off)
+{ }
+
+static inline void plugin_gen_record_access(unsigned dir, TCGTemp *val)
+{ }
 
 static inline
 const char *plugin_word_lookup(const PluginWordRow *rows, size_t n,

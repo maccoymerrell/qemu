@@ -335,6 +335,17 @@ qemu_plugin_insn_decode(const struct qemu_plugin_insn *insn)
     return &insn->decode;
 }
 
+const struct qemu_plugin_insn_access *
+qemu_plugin_insn_access_list(const struct qemu_plugin_insn *insn, size_t *n,
+                             unsigned *flags)
+{
+    *n = insn->access ? insn->access->len : 0;
+    if (flags) {
+        *flags = insn->access_flags;
+    }
+    return *n ? (struct qemu_plugin_insn_access *)insn->access->data : NULL;
+}
+
 const struct qemu_plugin_insn_reg *
 qemu_plugin_insn_reg_list(const struct qemu_plugin_insn *insn, size_t *n,
                           const char **opaque)

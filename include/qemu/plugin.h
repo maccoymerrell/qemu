@@ -157,6 +157,25 @@ struct qemu_plugin_insn {
      */
     struct qemu_plugin_insn_decoded decode;
     bool imm_addr, imm_stated;
+    /*
+     * The access statement (qemu_plugin_insn_access_list()): each memory
+     * callback the translation emits (@access_recs, internal records of
+     * CPU-state offsets) with the address composition current when it was
+     * emitted (@addr_cur) -- or held, until used, in the temps of
+     * @addr_held -- and the register a site said the next one moves
+     * (@access_reg).  Resolved against @regs at plugin_gen_insn_end() into
+     * @access; @access_flags are QEMU_PLUGIN_ACCESS_* bits.  Reset per
+     * instruction.
+     */
+    GArray *access_recs, *access;
+    struct plugin_addr_stmt {
+        void *temp, *anchor;    /* the TCGTemp holding it; the op it follows */
+        uint8_t form;
+        intptr_t base, index, seg;
+    } addr_cur, addr_held[4];
+    unsigned addr_next;
+    intptr_t access_reg;
+    unsigned access_flags;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

@@ -501,6 +501,18 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     memset(&insn->decode, 0, sizeof(insn->decode));
     insn->imm_addr = false;
     insn->imm_stated = false;
+    /* the access statement, likewise */
+    if (insn->access_recs) {
+        g_array_set_size(insn->access_recs, 0);
+    }
+    if (insn->access) {
+        g_array_set_size(insn->access, 0);
+    }
+    memset(&insn->addr_cur, 0, sizeof(insn->addr_cur));
+    memset(insn->addr_held, 0, sizeof(insn->addr_held));
+    insn->addr_next = 0;
+    insn->access_reg = -1;
+    insn->access_flags = 0;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
 }
@@ -609,6 +621,150 @@ void plugin_gen_record_ea(intptr_t base, intptr_t index, unsigned shift,
         insn->decode.ea_shift = shift;
         insn->decode.ea_ext = ext;
         insn->decode.ea_disp = disp;
+        /* the registers it names are read, though no op reads them */
+        for (int k = 0; k < 2; k++) {
+            if ((k ? index : base) >= 0) {
+                plugin_gen_reg_env(k ? index : base, QEMU_PLUGIN_REG_READ);
+            }
+        }
+        plugin_gen_record_addr(NULL, base, index, -1, 0);
+        plugin_gen_record_addr_named();
+    }
+}
+
+/*
+ * The access statement (qemu_plugin_insn_access_list()).  A decode site
+ * states how it composed an address -- from which registers' CPU-state
+ * offsets -- either as current now or as held in a temp until the site's
+ * access path uses that temp (plugin_gen_record_addr_use()); each memory
+ * callback the emission then makes (plugin_gen_record_access(), from
+ * tcg-op-ldst.c) is recorded with the composition current.  Nothing here
+ * inspects what the ops compute: a temp is only matched by identity, a
+ * register's own global stands for that register, a constant for none.
+ */
+typedef struct PluginAccessRec {
+    uint8_t dir;
+    struct plugin_addr_stmt a;
+    intptr_t reg;
+    TCGOp *at;          /* the op that makes the access */
+} PluginAccessRec;
+
+/* The CPU-state offset of the register whose own value @t is, or -1 */
+static intptr_t addr_global(TCGTemp *t)
+{
+    return t && t->kind == TEMP_GLOBAL && t->mem_base == tcgv_ptr_temp(tcg_env)
+           ? t->mem_offset : -1;
+}
+
+static struct plugin_addr_stmt addr_stmt(intptr_t base, intptr_t index,
+                                         intptr_t seg, unsigned flags)
+{
+    struct plugin_addr_stmt a = {
+        .anchor = tcg_last_op(), .base = base, .index = index, .seg = seg,
+        .form = flags & PLUGIN_ADDR_UNSTATED ? QEMU_PLUGIN_ADDR_UNSTATED :
+                base < 0 && index < 0 && seg < 0 ? QEMU_PLUGIN_ADDR_CONST :
+                QEMU_PLUGIN_ADDR_REGS,
+    };
+    return a;
+}
+
+/* The composition of the address in @t (@take: a held one is used up) */
+static struct plugin_addr_stmt addr_of(struct qemu_plugin_insn *insn,
+                                       TCGTemp *t, bool take)
+{
+    for (unsigned k = 1; k <= ARRAY_SIZE(insn->addr_held); k++) {
+        struct plugin_addr_stmt *h =
+            &insn->addr_held[(insn->addr_next - k) % ARRAY_SIZE(insn->addr_held)];
+        if (h->temp && h->temp == t) {
+            struct plugin_addr_stmt a = *h;
+            h->temp = take ? NULL : h->temp;
+            return a;
+        }
+    }
+    return addr_stmt(addr_global(t), -1, -1, addr_global(t) >= 0 ? 0 :
+                     t && t->kind == TEMP_CONST ? 0 : PLUGIN_ADDR_UNSTATED);
+}
+
+void plugin_gen_record_addr(TCGTemp *held, intptr_t base, intptr_t index,
+                            intptr_t seg, unsigned flags)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    struct plugin_addr_stmt a = addr_stmt(base, index, seg, flags);
+
+    if (!insn) {
+        return;
+    } else if (!held) {
+        insn->addr_cur = a;
+        return;
+    }
+    a.temp = held;
+    insn->addr_held[insn->addr_next++ % ARRAY_SIZE(insn->addr_held)] = a;
+}
+
+void plugin_gen_record_addr_offset(TCGTemp *dst, TCGTemp *src)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        struct plugin_addr_stmt a = addr_of(insn, src, false);
+        a.temp = dst;
+        insn->addr_held[insn->addr_next++ % ARRAY_SIZE(insn->addr_held)] = a;
+    }
+}
+
+void plugin_gen_record_addr_use(TCGTemp *t, intptr_t seg)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        struct plugin_addr_stmt a = addr_of(insn, t, true);
+        if (seg >= 0 && a.form != QEMU_PLUGIN_ADDR_UNSTATED) {
+            a.seg = seg;
+            a.form = QEMU_PLUGIN_ADDR_REGS;
+        }
+        a.temp = NULL;
+        a.anchor = a.anchor ? a.anchor : tcg_last_op();
+        insn->addr_cur = a;
+    }
+}
+
+static void access_rec(struct qemu_plugin_insn *insn, unsigned dir,
+                       intptr_t reg)
+{
+    PluginAccessRec r = { .dir = dir, .a = insn->addr_cur, .reg = reg,
+                          .at = tcg_last_op() };
+
+    if (!insn->access_recs) {
+        insn->access_recs = g_array_new(false, false, sizeof(PluginAccessRec));
+    }
+    g_array_append_val(insn->access_recs, r);
+}
+
+void plugin_gen_record_addr_named(void)
+{
+    if (tcg_ctx->plugin_insn) {
+        access_rec(tcg_ctx->plugin_insn, 0, -1);
+    }
+}
+
+void plugin_gen_record_access_reg(intptr_t off)
+{
+    if (tcg_ctx->plugin_insn) {
+        tcg_ctx->plugin_insn->access_reg = off;
+    }
+}
+
+void plugin_gen_record_access(unsigned dir, TCGTemp *val)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    intptr_t reg;
+
+    if (insn) {
+        reg = insn->access_reg != -1 ? insn->access_reg : addr_global(val);
+        reg = reg < 0 && val && val->kind == TEMP_CONST &&
+              dir == QEMU_PLUGIN_MEM_W ? -2 : reg;
+        insn->access_reg = -1;
+        access_rec(insn, dir, reg);
     }
 }
 
@@ -842,6 +998,66 @@ static bool reg_runtime_helper(const char *name)
            g_str_has_prefix(name, "atomic_");
 }
 
+/*
+ * Whether an access may not run: it follows a branch whose label is still
+ * ahead (@open, the labels branched to and not yet reached; NULL stands
+ * for a block exit), so the ops may skip it.  And whether a helper runs
+ * that may access memory the list does not show: one that has side
+ * effects and returns.
+ */
+static void access_branches(struct qemu_plugin_insn *insn, TCGOp *op,
+                            GPtrArray *open)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    if (op->opc == INDEX_op_call &&
+        !(tcg_call_info(op)->flags & (TCG_CALL_NO_SE | TCG_CALL_NO_RETURN))) {
+        insn->access_flags |= QEMU_PLUGIN_ACCESS_HELPERS;
+    }
+    if (op->opc == INDEX_op_set_label) {
+        g_ptr_array_remove(open, arg_label(op->args[0]));
+    } else if (op->opc == INDEX_op_br || op->opc == INDEX_op_brcond_i32 ||
+               op->opc == INDEX_op_brcond_i64 || op->opc == INDEX_op_brcond2_i32) {
+        g_ptr_array_add(open, arg_label(op->args[def->nb_iargs + def->nb_cargs - 1]));
+    } else if (def->flags & TCG_OPF_BB_END) {
+        g_ptr_array_add(open, NULL);
+    }
+    for (guint i = 0; open->len && insn->access_recs &&
+         i < insn->access_recs->len; i++) {
+        if (g_array_index(insn->access_recs, PluginAccessRec, i).at == op) {
+            insn->access_flags |= QEMU_PLUGIN_ACCESS_BRANCHES;
+        }
+    }
+}
+
+/*
+ * An address composed after the instruction wrote one of its registers is
+ * not composed from that register's input value: the composition is not
+ * stated.  Checked at the op each composition follows (@op), against what
+ * the walk has seen written so far.
+ */
+static void access_written(struct qemu_plugin_insn *insn, GArray *acc,
+                           TCGOp *op)
+{
+    for (guint i = 0; insn->access_recs && i < insn->access_recs->len; i++) {
+        PluginAccessRec *r = &g_array_index(insn->access_recs,
+                                            PluginAccessRec, i);
+        intptr_t off[3] = { r->a.base, r->a.index, r->a.seg };
+        PluginRegDesc d;
+
+        for (int k = 0; k < 3 && r->a.anchor == op; k++) {
+            for (guint j = 0; off[k] >= 0 && j < acc->len &&
+                 reg_resolve(off[k], 1, &d) == PLUGIN_REG_ARCH; j++) {
+                RegAcc *e = &g_array_index(acc, RegAcc, j);
+                if (e->d.cls == d.cls && e->d.index == d.index &&
+                    ((e->ops | e->stated) & QEMU_PLUGIN_REG_WRITE)) {
+                    r->a.form = QEMU_PLUGIN_ADDR_UNSTATED;
+                }
+            }
+        }
+    }
+}
+
 static void reg_walk(const DisasContextBase *db, struct qemu_plugin_insn *insn)
 {
     TCGTemp *env = tcgv_ptr_temp(tcg_env);
@@ -849,6 +1065,7 @@ static void reg_walk(const DisasContextBase *db, struct qemu_plugin_insn *insn)
     g_autoptr(GHashTable) ptrs = g_hash_table_new(NULL, NULL);
     g_autoptr(GHashTable) temps = g_hash_table_new(NULL, NULL);
     GArray *notes = insn->reg_notes;
+    g_autoptr(GPtrArray) open = g_ptr_array_new();
     guint next = 0;
     int mute = 0;
     TCGOp *op = db->insn_start;
@@ -952,6 +1169,8 @@ static void reg_walk(const DisasContextBase *db, struct qemu_plugin_insn *insn)
                 reg_add(acc, &n->d, n->access, false, true);
             }
         }
+        access_written(insn, acc, op);
+        access_branches(insn, op, open);
     }
 
     if (!insn->regs) {
@@ -970,6 +1189,68 @@ static void reg_walk(const DisasContextBase *db, struct qemu_plugin_insn *insn)
         if (access) {
             g_array_append_val(insn->regs, r);
         }
+    }
+}
+
+/*
+ * The register list entry for the register at CPU-state offset @off that
+ * the instruction accesses as @want: its index; -1 for no register, -2 for
+ * the constant-zero register, -3 for one the list does not state so.
+ */
+static int access_slot(struct qemu_plugin_insn *insn, intptr_t off,
+                       unsigned want)
+{
+    PluginRegDesc d;
+
+    if (off < 0) {
+        return -1;
+    } else if (reg_resolve(off, 1, &d) != PLUGIN_REG_ARCH) {
+        return -3;
+    } else if (d.cls == QEMU_PLUGIN_REG_ZERO) {
+        return -2;
+    }
+    for (guint i = 0; insn->regs && i < insn->regs->len; i++) {
+        struct qemu_plugin_insn_reg *r =
+            &g_array_index(insn->regs, struct qemu_plugin_insn_reg, i);
+        if (r->reg_class == d.cls && r->index == d.index && (r->access & want)) {
+            return i;
+        }
+    }
+    return -3;
+}
+
+/* The access records, stated in the register list's terms */
+static void access_resolve(struct qemu_plugin_insn *insn)
+{
+    if (!insn->access) {
+        insn->access = g_array_new(false, false,
+                                   sizeof(struct qemu_plugin_insn_access));
+    }
+    for (guint i = 0; insn->access_recs && i < insn->access_recs->len; i++) {
+        PluginAccessRec *r = &g_array_index(insn->access_recs,
+                                            PluginAccessRec, i);
+        struct qemu_plugin_insn_access x = {
+            .dir = r->dir, .form = r->a.form, .base = -1, .index = -1,
+            .seg = -1, .reg = r->reg == -2 ? -2 : -1,
+        };
+        intptr_t off[3] = { r->a.base, r->a.index, r->a.seg };
+        int16_t *slot[3] = { &x.base, &x.index, &x.seg };
+        bool named = false;
+
+        for (int k = 0; k < 3 && x.form == QEMU_PLUGIN_ADDR_REGS; k++) {
+            int v = access_slot(insn, off[k], QEMU_PLUGIN_REG_READ);
+            x.form = v == -3 ? QEMU_PLUGIN_ADDR_UNSTATED : x.form;
+            *slot[k] = v >= 0 ? v : -1;
+            named |= v >= 0;
+        }
+        x.form = x.form == QEMU_PLUGIN_ADDR_REGS && !named ?
+                 QEMU_PLUGIN_ADDR_CONST : x.form;
+        if (r->reg >= 0) {
+            int v = access_slot(insn, r->reg, r->dir == QEMU_PLUGIN_MEM_R ?
+                                QEMU_PLUGIN_REG_WRITE : QEMU_PLUGIN_REG_READ);
+            x.reg = v >= 0 ? v : v == -2 && r->dir == QEMU_PLUGIN_MEM_W ? -2 : -1;
+        }
+        g_array_append_val(insn->access, x);
     }
 }
 
@@ -992,6 +1273,7 @@ void plugin_gen_insn_end(void)
         pinsn->decode.atomic |= f & PLUGIN_WORD_ATOMIC;
     }
     pinsn->decode.has_imm &= !pinsn->imm_addr;
+    access_resolve(pinsn);
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }

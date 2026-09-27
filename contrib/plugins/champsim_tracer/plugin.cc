@@ -44,6 +44,7 @@
  *                    billed) and simpoint_weight
  */
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -135,6 +136,7 @@ struct Session {
         int priv = -1;
         bool named = false, shared = false, excl = false, events = false;
         uint64_t ran = 0;       /* the pending TB's progress at an async entry */
+        std::array<uint64_t, 3> dep{};  /* that entry's departure: pc, tp, asid */
         /* marker mode: the windows its context maps, and what it records */
         std::vector<uint64_t> gate, release;
         uint64_t label = 0;     /* the address space of its last gated refresh */
@@ -758,8 +760,8 @@ void encode(Session &s, Segment &g)
         say("identity: tids=" + std::to_string(s.tids) + " tid_shared_strands=" +
             std::to_string(g.shared_runs) + " tid_unseparated=" +
             std::to_string(g.unseparated) + " async_excluded_tbs=" +
-            std::to_string(g.excluded) + (s.marker ? " resumed_in_async_window=" +
-            std::to_string(g.resumed) : ""));
+            std::to_string(g.excluded) + " resumed_in_async_window=" +
+            std::to_string(g.resumed));
     }
     if (s.system && (g.unseparated || !g.blocks.entries())) {
         drop_spills(g);
@@ -1335,22 +1337,26 @@ void tb_exec(Session &s, unsigned int vcpu, cst::TbShape *tb)
             }
         }
         priv = qemu_plugin_get_priv_level();
+        /* a window that closed away from its departure: the handler switched */
+        for (size_t k = 0; k < nev; k++) {
+            std::array<uint64_t, 3> at = { ev[k].pc, ev[k].tp, ev[k].asid };
+            v.dep = ev[k].kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER ? at : v.dep;
+            switched |= ev[k].kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN && v.excl && at != v.dep;
+        }
         if (qemu_plugin_in_async_int() && (!s.marker || priv != 0)) {
             /* exclude async, keep sync: the handler never reaches the trace */
             v.ran = v.excl ? v.ran : qemu_plugin_u64_get(s.started, vcpu);
             v.excl = true;
             s.g.excluded += !s.marker || qemu_plugin_u64_get(s.rec, vcpu);
             return;
-        } else if (qemu_plugin_in_async_int()) {
+        } else if (qemu_plugin_in_async_int() || switched) {
             /*
-             * No handler runs user code: this is a context the handler
-             * switched to, resumed while the window waits for its owner.
-             * The window is not this context's.  The owner's interrupted
-             * block ends where it was left, successor and last values
-             * unknown; its events are the window's; the stack pointer here
-             * is a true endpoint.  (Marker mode, where the contexts a
-             * window gates are all the process's; a whole-run segment keeps
-             * increment 6A's exclusion as it stands.)
+             * No handler runs user code, and QEMU closes a window its
+             * handler switched away from: this is a context the handler
+             * switched to.  The window is not this context's.  The owner's
+             * interrupted block ends where it was left, successor and last
+             * values unknown; its events are the window's; the stack
+             * pointer here is a true endpoint.
              */
             qemu_plugin_async_int_reset();
             s.g.resumed++;

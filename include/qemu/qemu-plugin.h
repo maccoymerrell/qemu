@@ -2179,7 +2179,9 @@ int64_t qemu_plugin_vclock_ns(void);
  * Returns true while the executing vCPU is handling an asynchronous interrupt
  * (timer/device IRQ/FIQ/SError) -- from the interrupt's exception entry until
  * the exception return that lands back at the interrupted PC, spanning any
- * scheduler context-switch or nested sync/async exception in between.  False
+ * nested sync/async exception in between, or until the handler switches to
+ * another context (address space, or a thread pointer that names the
+ * executing thread): an ASYNC_RETURN whose context is not the ENTER's.  False
  * for synchronous entries alone (syscall/SVC, faults).  A system-mode plugin
  * reads this to tell asynchronous handler code apart from synchronous
  * syscalls/faults.  Always false in user-mode

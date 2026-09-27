@@ -820,9 +820,9 @@ struct CPUState {
      * interrupt entry (timer/device IRQ/FIQ/SError), recording the interrupted
      * guest PC (the departure point, where the handler's exception return will
      * resume) in plugin_async_departure_pc.  The exception-return path clears
-     * the flag when it returns to exactly that PC -- robust to the scheduler
-     * context-switching away and to nesting (the outermost departure PC is
-     * kept).  A tracer reads the flag (qemu_plugin_in_async_int) to drop the
+     * the flag when it returns to exactly that PC, or once the departed
+     * context is no longer the one running -- the handler switched away --
+     * and is robust to nesting (the outermost departure PC is kept).  A tracer reads the flag (qemu_plugin_in_async_int) to drop the
      * async handler -- non-representative OS noise -- while keeping synchronous
      * syscalls/faults.  Set only on the correct path (never wrong-path).
      *

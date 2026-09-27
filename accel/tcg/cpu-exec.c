@@ -1250,11 +1250,17 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * the exception return -- compares equal exactly there.  When
              * the hook is absent both sides read 0 and the test is a bare
              * PC equality.  A mismatch leaves the window open for the
-             * owner's later return; if the owner never returns, the flag
-             * stays set until the plugin clears it.
+             * owner's later return.
+             *
+             * The window is the departed context's: it also ends where
+             * that context does -- the handler switched away.  Once the
+             * address space, or a thread pointer the target says names the
+             * executing thread here, differs from the departure's, what
+             * runs is another context's work, not the interrupt's, and the
+             * window closes on it (the event's context tells the consumer
+             * the owner did not resume).
              */
-            if (unlikely(cpu->plugin_in_async_int) &&
-                pc == cpu->plugin_async_departure_pc) {
+            if (unlikely(cpu->plugin_in_async_int)) {
                 const TCGCPUOps *aret_ops = cpu->cc->tcg_ops;
                 uint64_t cur_tp =
                     (aret_ops && aret_ops->get_plugin_thread_ptr)
@@ -1279,9 +1285,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                                                &aret_mmu);
                 }
 
-                if (cur_tp == cpu->plugin_async_departure_tp &&
-                    cur_asid == cpu->plugin_async_departure_asid) {
-                    cpu_plugin_async_probe(cpu, "CLOSE", 0, false);
+                bool away = cur_asid != cpu->plugin_async_departure_asid ||
+                    (cur_tp != cpu->plugin_async_departure_tp &&
+                     aret_ops && aret_ops->plugin_thread_ptr_tracks_current &&
+                     aret_ops->plugin_thread_ptr_tracks_current(cpu));
+
+                if (pc != cpu->plugin_async_departure_pc && !away) {
+                    /* still the handler, or the departed context in it */
+                } else if (away || cur_tp == cpu->plugin_async_departure_tp) {
+                    cpu_plugin_async_probe(cpu, away ? "AWAY" : "CLOSE", 0,
+                                           false);
                     cpu->plugin_in_async_int = false;
                     cpu_plugin_evq_push(cpu,
                                         QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN,

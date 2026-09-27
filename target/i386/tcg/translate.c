@@ -639,6 +639,11 @@ static TCGv eip_cur_tl(DisasContext *s)
 static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
                                int def_seg, int ovr_seg)
 {
+    /* the segment whose base the cases below add, if any */
+    int added = ovr_seg >= 0 || aflag == MO_64 || !ADDSEG(s) ? ovr_seg : def_seg;
+
+    plugin_gen_record_addr_use(tcgv_tl_temp(a0),
+                               added >= 0 ? offsetof(CPUX86State, segs[added]) : -1);
     switch (aflag) {
 #ifdef TARGET_X86_64
     case MO_64:
@@ -2107,7 +2112,12 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
         tcg_gen_addi_tl(s->A0, ea, a.disp);
         ea = s->A0;
     }
-
+    /* its composition; a VSIB index is a vector no scalar address reads */
+    plugin_gen_record_addr(tcgv_tl_temp(ea),
+                           a.base >= 0 ? offsetof(CPUX86State, regs[a.base]) : -1,
+                           a.index >= 0 && !is_vsib ?
+                           offsetof(CPUX86State, regs[a.index]) : -1, -1,
+                           is_vsib && a.index >= 0 ? PLUGIN_ADDR_UNSTATED : 0);
     return ea;
 }
 
@@ -2380,6 +2390,7 @@ static void gen_lea_ss_ofs(DisasContext *s, TCGv dest, TCGv src, target_ulong of
 {
     if (offset) {
         tcg_gen_addi_tl(dest, src, offset);
+        plugin_gen_record_addr_offset(tcgv_tl_temp(dest), tcgv_tl_temp(src));
         src = dest;
     }
     gen_lea_v_seg_dest(s, mo_stacksize(s), dest, src, R_SS, -1);
@@ -2394,6 +2405,8 @@ static void gen_push_v(DisasContext *s, TCGv val)
     TCGv new_esp = tcg_temp_new();
 
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
+    plugin_gen_record_addr(tcgv_tl_temp(new_esp),
+                           offsetof(CPUX86State, regs[R_ESP]), -1, -1, 0);
 
     /* Now reduce the value to the address size and apply SS base.  */
     gen_lea_ss_ofs(s, s->A0, new_esp, 0);

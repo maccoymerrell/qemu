@@ -1983,6 +1983,8 @@ static void gen_cache_word(int op, int base, int disp)
 
 void gen_base_offset_addr(DisasContext *ctx, TCGv addr, int base, int offset)
 {
+    /* the composition of the accesses that follow */
+    plugin_gen_record_addr(NULL, base ? offsetof(CPUMIPSState, active_tc.gpr[base]) : -1, -1, -1, 0);
     if (base == 0) {
         tcg_gen_movi_tl(addr, offset);
     } else if (offset == 0) {
@@ -2069,6 +2071,7 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
     int mem_idx = ctx->mem_idx;
 
     plugin_gen_record_word("mem.load");
+    plugin_gen_record_access_reg(offsetof(CPUMIPSState, active_tc.gpr[rt]));   /* its destination */
     if (rt == 0 && ctx->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F |
                                       INSN_LOONGSON3A)) {
         /*
@@ -2206,6 +2209,7 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
     plugin_gen_record_word("mem.store");
     gen_base_offset_addr(ctx, t0, base, offset);
     gen_load_gpr(t1, rt);
+    plugin_gen_record_access_reg(offsetof(CPUMIPSState, active_tc.gpr[rt]));   /* its source */
     switch (opc) {
 #if defined(TARGET_MIPS64)
     case OPC_SD:
@@ -10778,6 +10782,7 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
 
     plugin_gen_record_word(opc == OPC_LWXC1 || opc == OPC_LDXC1 ||
                            opc == OPC_LUXC1 ? "mem.load" : "mem.store");
+    plugin_gen_record_addr(NULL, base ? offsetof(CPUMIPSState, active_tc.gpr[base]) : -1, index ? offsetof(CPUMIPSState, active_tc.gpr[index]) : -1, -1, 0);
     if (base == 0) {
         gen_load_gpr(t0, index);
     } else if (index == 0) {
@@ -11617,6 +11622,7 @@ static void gen_mips_lx(DisasContext *ctx, uint32_t opc,
     }
     t0 = tcg_temp_new();
 
+    plugin_gen_record_addr(NULL, base ? offsetof(CPUMIPSState, active_tc.gpr[base]) : -1, offset ? offsetof(CPUMIPSState, active_tc.gpr[offset]) : -1, -1, 0);
     if (base == 0) {
         gen_load_gpr(t0, offset);
     } else if (offset == 0) {

@@ -2452,6 +2452,7 @@ static void gen_LEA(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv ea = gen_lea_modrm_1(s, decode->mem, false);
     gen_lea_v_seg_dest(s, s->aflag, s->T0, ea, -1, -1);
+    plugin_gen_record_addr_named();     /* computed, not accessed */
 }
 
 static void gen_LEAVE(DisasContext *s, X86DecodedInsn *decode)
@@ -2566,7 +2567,15 @@ static void gen_MFENCE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_MOV(DisasContext *s, X86DecodedInsn *decode)
 {
-    /* nothing to do! */
+    /* nothing to do! -- but a store says which register it moves */
+    X86DecodedOp *src = &decode->op[1];
+
+    if (decode->op[0].has_ea && src->unit == X86_OP_INT && !src->has_ea) {
+        int n = src->ot == MO_8 && byte_reg_is_xH(s, src->n) ? src->n - 4 : src->n;
+        plugin_gen_record_access_reg(offsetof(CPUX86State, regs[n]));
+    } else if (decode->op[0].has_ea && src->unit == X86_OP_IMM) {
+        plugin_gen_record_access_reg(-2);   /* a constant */
+    }
 }
 
 /* Nothing to do either; separate from gen_MOV, whose word is not a no-op's */
@@ -2664,6 +2673,9 @@ static void gen_MOVD_to(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_MOVDQ(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (decode->op[0].has_ea) {     /* a store: the register it moves */
+        plugin_gen_record_access_reg(decode->op[2].offset);
+    }
     gen_store_sse(s, decode, decode->op[2].offset);
 }
 
@@ -4824,6 +4836,8 @@ static void gen_XLAT(DisasContext *s, X86DecodedInsn *decode)
 {
     /* AL is already zero-extended into s->T0.  */
     tcg_gen_add_tl(s->A0, cpu_regs[R_EBX], s->T0);
+    plugin_gen_record_addr(tcgv_tl_temp(s->A0), offsetof(CPUX86State, regs[R_EBX]),
+                           offsetof(CPUX86State, regs[R_EAX]), -1, 0);
     gen_lea_v_seg(s, s->A0, R_DS, s->override);
     gen_op_ld_v(s, MO_8, s->T0, s->A0);
 }

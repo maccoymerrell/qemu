@@ -243,6 +243,8 @@ static void gen_a64_set_pc(DisasContext *s, TCGv_i64 src)
 TCGv_i64 clean_data_tbi(DisasContext *s, TCGv_i64 addr)
 {
     TCGv_i64 clean = tcg_temp_new_i64();
+
+    plugin_gen_record_addr_use(tcgv_i64_temp(addr), -1);   /* its accesses' */
 #ifdef CONFIG_USER_ONLY
     gen_top_byte_ignore(s, clean, addr, s->tbid);
 #else
@@ -288,6 +290,7 @@ static TCGv_i64 gen_mte_check1_mmuidx(DisasContext *s, TCGv_i64 addr,
         desc = FIELD_DP32(desc, MTEDESC, ALIGN, memop_alignment_bits(memop));
         desc = FIELD_DP32(desc, MTEDESC, SIZEM1, memop_size(memop) - 1);
 
+        plugin_gen_record_addr_use(tcgv_i64_temp(addr), -1);
         ret = tcg_temp_new_i64();
         gen_helper_mte_check(ret, tcg_env, tcg_constant_i32(desc), addr);
 
@@ -320,6 +323,7 @@ TCGv_i64 gen_mte_checkN(DisasContext *s, TCGv_i64 addr, bool is_write,
         desc = FIELD_DP32(desc, MTEDESC, ALIGN, memop_alignment_bits(single_mop));
         desc = FIELD_DP32(desc, MTEDESC, SIZEM1, total_size - 1);
 
+        plugin_gen_record_addr_use(tcgv_i64_temp(addr), -1);
         ret = tcg_temp_new_i64();
         gen_helper_mte_check(ret, tcg_env, tcg_constant_i32(desc), addr);
 
@@ -1221,6 +1225,7 @@ static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, MemOp mop)
     /* This writes the bottom N bits of a 128 bit wide vector to memory */
     TCGv_i64 tmplo = tcg_temp_new_i64();
 
+    plugin_gen_record_access_reg(vec_full_reg_offset(s, srcidx));
     tcg_gen_ld_i64(tmplo, tcg_env, fp_reg_offset(s, srcidx, MO_64));
 
     if ((mop & MO_SIZE) < MO_128) {
@@ -1245,6 +1250,7 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, MemOp mop)
     TCGv_i64 tmplo = tcg_temp_new_i64();
     TCGv_i64 tmphi = NULL;
 
+    plugin_gen_record_access_reg(vec_full_reg_offset(s, destidx));
     if ((mop & MO_SIZE) < MO_128) {
         tcg_gen_qemu_ld_i64(tmplo, tcg_addr, get_mem_index(s), mop);
     } else {
@@ -1384,6 +1390,7 @@ static void do_vec_st(DisasContext *s, int srcidx, int element,
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
     read_vec_element(s, tcg_tmp, srcidx, element, mop & MO_SIZE);
+    plugin_gen_record_access_reg(vec_full_reg_offset(s, srcidx));
     tcg_gen_qemu_st_i64(tcg_tmp, tcg_addr, get_mem_index(s), mop);
 }
 
@@ -1393,6 +1400,7 @@ static void do_vec_ld(DisasContext *s, int destidx, int element,
 {
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
+    plugin_gen_record_access_reg(vec_full_reg_offset(s, destidx));
     tcg_gen_qemu_ld_i64(tcg_tmp, tcg_addr, get_mem_index(s), mop);
     write_vec_element(s, tcg_tmp, destidx, element, mop & MO_SIZE);
 }
@@ -3390,6 +3398,7 @@ static bool trans_LD_lit(DisasContext *s, arg_ldlit *a)
     MemOp memop = finalize_memop(s, a->sz + a->sign * MO_SIGN);
 
     gen_pc_plus_diff(s, clean_addr, a->imm);
+    plugin_gen_record_addr(NULL, -1, -1, -1, 0);    /* pc-relative */
     do_gpr_ld(s, tcg_rt, clean_addr, memop,
               false, true, a->rt, iss_sf, false);
     return true;
@@ -3407,6 +3416,7 @@ static bool trans_LD_lit_v(DisasContext *s, arg_ldlit *a)
     memop = finalize_memop_asimd(s, a->sz);
     clean_addr = tcg_temp_new_i64();
     gen_pc_plus_diff(s, clean_addr, a->imm);
+    plugin_gen_record_addr(NULL, -1, -1, -1, 0);    /* pc-relative */
     do_fp_ld(s, a->rt, clean_addr, memop);
     return true;
 }
@@ -3426,6 +3436,8 @@ static void op_addr_ldstpair_pre(DisasContext *s, arg_ldstpair *a,
     if (!a->p) {
         tcg_gen_addi_i64(*dirty_addr, *dirty_addr, offset);
     }
+    plugin_gen_record_addr(tcgv_i64_temp(*dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]), -1, -1, 0);
 
     *clean_addr = gen_mte_checkN(s, *dirty_addr, is_store,
                                  (a->w || a->rn != 31), 2 << a->sz, mop);
@@ -3608,6 +3620,8 @@ static bool trans_STGP(DisasContext *s, arg_ldstpair *a)
     if (!a->p) {
         tcg_gen_addi_i64(dirty_addr, dirty_addr, offset);
     }
+    plugin_gen_record_addr(tcgv_i64_temp(dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]), -1, -1, 0);
 
     clean_addr = clean_data_tbi(s, dirty_addr);
     tcg_rt = cpu_reg(s, a->rt);
@@ -3659,6 +3673,8 @@ static void op_addr_ldst_imm_pre(DisasContext *s, arg_ldst_imm *a,
     if (!a->p) {
         tcg_gen_addi_i64(*dirty_addr, *dirty_addr, offset);
     }
+    plugin_gen_record_addr(tcgv_i64_temp(*dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]), -1, -1, 0);
     memidx = get_a64_user_mem_index(s, a->unpriv);
     *clean_addr = gen_mte_check1_mmuidx(s, *dirty_addr, is_store,
                                         a->w || a->rn != 31,
@@ -3757,6 +3773,10 @@ static void op_addr_ldst_pre(DisasContext *s, arg_ldst *a,
     ext_and_shift_reg(tcg_rm, tcg_rm, a->opt, a->s ? a->sz : 0);
 
     tcg_gen_add_i64(*dirty_addr, *dirty_addr, tcg_rm);
+    plugin_gen_record_addr(tcgv_i64_temp(*dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]),
+                           a->rm == 31 ? -1 : offsetof(CPUARMState, xregs[a->rm]),
+                           -1, 0);
     *clean_addr = gen_mte_check1(s, *dirty_addr, is_store, true, memop);
 }
 
@@ -3980,6 +4000,8 @@ static bool trans_LDAPR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     mop = check_ordered_align(s, a->rn, a->imm, false, mop);
     dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
     tcg_gen_addi_i64(dirty_addr, dirty_addr, a->imm);
+    plugin_gen_record_addr(tcgv_i64_temp(dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]), -1, -1, 0);
     clean_addr = clean_data_tbi(s, dirty_addr);
 
     /*
@@ -4011,6 +4033,8 @@ static bool trans_STLR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     mop = check_ordered_align(s, a->rn, a->imm, true, mop);
     dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
     tcg_gen_addi_i64(dirty_addr, dirty_addr, a->imm);
+    plugin_gen_record_addr(tcgv_i64_temp(dirty_addr),
+                           offsetof(CPUARMState, xregs[a->rn]), -1, -1, 0);
     clean_addr = clean_data_tbi(s, dirty_addr);
 
     /* Store-Release semantics */
@@ -4298,6 +4322,7 @@ static bool trans_LD_single_repl(DisasContext *s, arg_LD_single_repl *a)
         /* Load and replicate to all elements */
         TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
+        plugin_gen_record_access_reg(vec_full_reg_offset(s, rt));
         tcg_gen_qemu_ld_i64(tcg_tmp, clean_addr, get_mem_index(s), mop);
         tcg_gen_gvec_dup_i64(a->scale, vec_full_reg_offset(s, rt),
                              (a->q + 1) * 8, vec_full_reg_size(s), tcg_tmp);

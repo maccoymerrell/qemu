@@ -660,6 +660,8 @@ static TCGv get_address(DisasContext *ctx, int rs1, int imm)
     TCGv src1 = get_gpr(ctx, rs1, EXT_NONE);
 
     tcg_gen_addi_tl(addr, src1, imm);
+    plugin_gen_record_addr(NULL, rs1 ? offsetof(CPURISCVState, gpr[rs1]) : -1,
+                           -1, -1, 0);      /* its accesses' composition */
     if (ctx->addr_signed) {
         tcg_gen_sextract_tl(addr, addr, 0, ctx->addr_xl);
     } else {

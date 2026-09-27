@@ -169,8 +169,6 @@ enum : uint8_t {
     kTagRegfile = 4, kTagAsid = 5,
 };
 
-constexpr uint8_t kUnclassified = 0;    /* opcode and branch_type value */
-constexpr uint8_t kTerminal = 1;        /* branch_type: the block's transfer */
 constexpr uint8_t kFlagMemData = 1;     /* header_flag CST_FLAG_MEM_DATA */
 constexpr uint8_t kFlagRegData = 2;     /* header_flag CST_FLAG_REG_DATA */
 constexpr uint8_t kFlagWp = 8;          /* header_flag CST_FLAG_WP */
@@ -268,9 +266,14 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
             ndst = std::max(ndst, i.regs->dst.size());
         }
     }
-    MapEntries names;
+    MapEntries names, vocab[2];
     for (const auto &r : regs) {
         names.push_back({ r.first, reg_name(r.first) });
+    }
+    for (int b = 0; b < 2; b++) {
+        for (const std::string &n : vocabulary(b)) {
+            vocab[b].push_back({ vocab[b].size(), (b ? "BRANCH_" : "GEN_OP_") + n });
+        }
     }
     MapEntries fids = numbered({ "CST_FID_BB_START", "CST_FID_BB_STOP",
                                  "CST_FID_BB_FLAGS", "CST_FID_BB_FAULT_DEPTH",
@@ -325,18 +328,8 @@ Bytes encoding_maps(size_t slots, const std::vector<WireTemplate> &templates,
                                   "CST_METAFLAGS_P" }, true) },
         { "field_id", fids },
         { "reg", names },
-        /*
-         * Every template instruction carries this opcode: this writer
-         * classifies nothing yet, and says so by name.
-         */
-        { "opcode", { { kUnclassified, "GEN_OP_UNKNOWN" } } },
-        /*
-         * The one fact about branches claimed: which instruction's
-         * transfer ended the block -- where section 5.6's outcome rides,
-         * and how a reader finds it.  Its class stays unclaimed.
-         */
-        { "branch_type", { { kUnclassified, "BRANCH_UNCLASSIFIED" },
-                           { kTerminal, "BRANCH_TERMINAL" } } },
+        { "opcode", vocab[0] },         /* the canonical sets (vocab.h) */
+        { "branch_type", vocab[1] },
     };
     Bytes b;
     b.uleb(sizeof(maps) / sizeof(maps[0]));
@@ -366,9 +359,14 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
     for (const WireInsn &i : t.insns) {
         b.uleb(i.pc - prev);
         prev = i.pc;
-        b.u8(kUnclassified);    /* opcode */
-        b.u8(&i - t.insns.data() == t.bpos ? kTerminal : kUnclassified);
-        b.u8(i.sys ? kInsnSystem : 0);  /* flags: the privilege it ran at */
+        /* a bulk op is the self-loop of its fan-out (format.rst) */
+        static const auto &br = vocabulary(true);
+        static const uint8_t rep = uint8_t(std::find(br.begin(), br.end(), "REP") -
+                                           br.begin());
+        b.u8(i.cls->op);
+        b.u8(i.fanout ? rep : i.cls->br);
+        uint8_t flags = i.cls->flags | (i.fanout ? kInsnCond : 0);
+        b.u8(flags | (i.sys ? kInsnSystem : 0));  /* and the privilege it ran at */
         b.u8(uint8_t(i.regs->src.size()));
         b.u8(uint8_t(i.regs->dst.size()));
         for (const auto *l : { &i.regs->src, &i.regs->dst }) {
@@ -378,6 +376,9 @@ Bytes template_payload(uint64_t id, const WireTemplate &t)
         }
         b.u8(i.dep_mask_len[0]);    /* max_dep_loads */
         b.u8(i.dep_mask_len[1]);    /* max_dep_stores */
+        if (flags & kInsnImm) {
+            b.sleb(i.cls->imm);
+        }
         b.u8(i.size);
         for (unsigned k = 0; k < i.size; k++) {
             b.u8(i.bytes[k]);

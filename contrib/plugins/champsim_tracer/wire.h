@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "container.h"
+#include "vocab.h"
 
 namespace cst {
 
@@ -100,6 +101,7 @@ struct WireInsn {
     uint8_t dep_mask_len[2];
     const Regs *regs;
     bool sys;
+    const Class *cls;   /* its class (vocab.h); fan-out makes it BRANCH_REP */
 };
 /* @bpos: the instruction whose transfer ends it (-1: none, a page split) */
 struct WireTemplate { std::vector<WireInsn> insns; bool terminated; int bpos; };

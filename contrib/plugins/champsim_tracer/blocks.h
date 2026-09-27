@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "wire.h"
@@ -76,6 +77,12 @@ struct TbShape {
     bool end = false;           /* an END marker translated in a gated context */
     std::vector<size_t> traps;  /* conditional traps the translator lowered */
     std::vector<Regs> regs;     /* per insn, the register statement */
+    std::vector<Class> cls;     /* ... its class (vocab.h) */
+    std::vector<std::string> why;   /* ... why it has none ("": it has) */
+    /* per prefetch / cache / TLB operation: the address it names (plugin.cc) */
+    struct Ea { const TbShape *tb; uint32_t pos; void *base, *index;
+                uint8_t shift; int8_t ext; int64_t disp; };
+    std::vector<Ea> ea;
     /* where insn k's snapshot callback reads insn k - 1's destinations */
     struct At { const TbShape *tb; uint32_t pos; };
     std::vector<At> at;
@@ -101,6 +108,7 @@ public:
             insns_.push_back(&it.first->first);
             marks_.push_back(0);
             regs.emplace_back();
+            cls.emplace_back();
             seen_.push_back(false);
         }
         return it.first->second;
@@ -113,6 +121,10 @@ public:
      */
     std::vector<Regs> regs;
     std::vector<std::pair<InsnId, Regs>> variance;
+    /* likewise its class; and each executed one QEMU's word gave none */
+    std::vector<Class> cls;
+    size_t cls_variance = 0;
+    std::map<InsnId, std::string> unclassified;
     const Insn &insn(InsnId id) const { return *insns_[id]; }
 
     /*
@@ -135,10 +147,15 @@ public:
             tb.insns.push_back(id);
             if (!seen_[id]) {
                 regs[id] = tb.regs[k];
+                cls[id] = tb.cls[k];
                 seen_[id] = true;
+                if (!tb.why[k].empty()) {
+                    unclassified[id] = tb.why[k];
+                }
             } else if (!(regs[id] == tb.regs[k])) {
                 variance.push_back({ id, tb.regs[k] });
             }
+            cls_variance += !(cls[id] == tb.cls[k]);
         }
         for (size_t t : tb.traps) {
             ends_block(tb.insns[t]);    /* a trap, in place */
@@ -609,7 +626,8 @@ private:
         for (InsnId id : sh) {
             const Insn &i = insn(id);
             t.insns.push_back({ i.pc, i.size, i.bytes, id,
-                                (marks_[id] & kFanout) != 0, {}, &regs[id], i.sys });
+                                (marks_[id] & kFanout) != 0, {}, &regs[id], i.sys,
+                                &cls[id] });
         }
         t.terminated = ends(sh.back());
         size_t n = sh.size();   /* the transfer ending it: before its slot */

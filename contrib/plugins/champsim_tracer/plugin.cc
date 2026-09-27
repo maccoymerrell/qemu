@@ -149,6 +149,8 @@ struct Session {
     std::vector<std::pair<uint64_t, uint32_t>> regions; /* user SP -> tid */
     uint32_t tids = 0;
     std::map<uint8_t, void *> handles;  /* each register's gdb handle; tbs_lock */
+    std::map<std::string, void *> named;    /* ... by gdb name; tbs_lock */
+    uint64_t ea_unstated = 0;           /* PREFETCH-class insns naming no address */
     /* marker mode (INC6.md resolutions 4, 5) */
     bool marker = false, force = false;
     uint64_t budget = 0, idle = 0, idle_run = 0;
@@ -346,6 +348,48 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
 }
 
 /*
+ * The class of @insn (vocab.h) from what its decode site stated, in @tb:
+ * the word's row, QEMU's ATOMIC and operand immediate; with no row, the
+ * reason, named for the report.  A PREFETCH / CACHE_FLUSH / TLB_FLUSH class
+ * also keeps the address the instruction names (format.rst 5.2), its
+ * registers by gdb handle.
+ */
+void classify_insn(Session &s, struct qemu_plugin_insn *insn, cst::TbShape &tb)
+{
+    const struct qemu_plugin_insn_decoded *d = qemu_plugin_insn_decode(insn);
+    cst::Class c;
+    bool ok = cst::classify(d->word, c);
+    tb.why.push_back(ok ? "" : d->word ? std::string("refused ") + d->word :
+                     std::string("unstated ") + (d->pattern ? d->pattern : "-"));
+    c.flags |= (d->atomic ? cst::kInsnAtomic : 0) | (d->has_imm ? cst::kInsnImm : 0);
+    c.imm = d->has_imm ? d->imm : 0;
+    tb.cls.push_back(c);
+    const std::string &name = cst::vocabulary(false)[c.op];
+    if (name != "PREFETCH" && name != "CACHE_FLUSH" && name != "TLB_FLUSH" &&
+        name != "VEC_PREFETCH") {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(s.tbs_lock);
+    if (s.named.empty()) {
+        GArray *r = qemu_plugin_get_registers();
+        for (guint k = 0; r && k < r->len; k++) {
+            auto &e = g_array_index(r, qemu_plugin_reg_descriptor, k);
+            s.named.emplace(e.name, e.handle);
+        }
+        g_array_free(r, true);
+    }
+    auto handle = [&s](const char *n) { auto it = n ? s.named.find(n) : s.named.end();
+                                        return it != s.named.end() ? it->second : nullptr; };
+    void *base = handle(d->ea_base), *index = handle(d->ea_index);
+    if (!d->has_ea || (d->ea_base && !base) || (d->ea_index && !index)) {
+        s.ea_unstated++;
+        return;
+    }
+    tb.ea.push_back({ &tb, uint32_t(tb.cls.size() - 1), base, index, d->ea_shift,
+                      d->ea_ext, d->ea_disp });
+}
+
+/*
  * Section 5.4: the value of every destination of instruction @pos of
  * @r's TB after it ran, read now that it has, into thread @tid's stream
  * as it is for memops.  The zero register reads as the zero it is.
@@ -470,6 +514,41 @@ void reg_report(const Session &s, Segment &g)
         std::to_string(g.blocks.variance.size()) + " (unexplained " +
         std::to_string(odd) + ") snapshots=" + std::to_string(g.snaps) +
         " unreadable=" + std::to_string(g.unreadable));
+}
+
+/*
+ * The classification's report: executed encodings, those the vocabulary
+ * classified, and every one it did not -- a word it refused, or no word
+ * stated -- by name, with each instance at <outfile>.vocab.tsv.
+ */
+void vocab_report(const Session &s, Segment &g)
+{
+    std::map<std::string, size_t> why;
+    std::ofstream f(g.path.substr(0, g.path.size() - 4) + ".vocab.tsv");
+    f << "pc\tbytes\treason\n";
+    for (const auto &u : g.blocks.unclassified) {
+        why[u.second]++;
+        const cst::Insn &i = g.blocks.insn(u.first);
+        char hex[40] = "";
+        for (unsigned k = 0; k < i.size; k++) {
+            std::snprintf(hex + 2 * k, 3, "%02x", i.bytes[k]);
+        }
+        f << std::hex << "0x" << i.pc << std::dec << '\t' << hex << '\t' << u.second << '\n';
+    }
+    std::string named, sep = " (";
+    size_t refused = 0;
+    for (const auto &w : why) {
+        named += sep + w.first + " x" + std::to_string(w.second);
+        sep = ", ";
+        refused += w.first.compare(0, 8, "refused ") == 0 ? w.second : 0;
+    }
+    say("vocab: encodings=" + std::to_string(g.blocks.regs.size()) + " classified=" +
+        std::to_string(g.blocks.regs.size() - g.blocks.unclassified.size()) +
+        " vocab_refused=" + std::to_string(refused) + " vocab_unstated=" +
+        std::to_string(g.blocks.unclassified.size() - refused) +
+        (named.empty() ? "" : named + ")") + " class_variance=" +
+        std::to_string(g.blocks.cls_variance) + " ea_unstated=" +
+        std::to_string(s.ea_unstated));
 }
 
 void drop_spills(Segment &g)
@@ -612,6 +691,7 @@ void encode(Session &s, Segment &g)
     }
     memop_tripwire(census, g.path);
     reg_report(s, g);
+    vocab_report(s, g);
     const auto &st = g.blocks.stats;
     say("entries=" + std::to_string(entries) + " templates=" +
         std::to_string(templates.size()) + " early_exits=" +
@@ -1342,6 +1422,38 @@ void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     }
 }
 
+/*
+ * A prefetch / cache / TLB operation @udata begins: the load memop format.rst
+ * 5.2 requires, synthesized from the address it names -- ADDRESS-ONLY, width
+ * 0 and no datum.
+ */
+void on_ea(unsigned int vcpu, void *udata)
+{
+    Session &s = session();
+    auto *e = static_cast<const cst::TbShape::Ea *>(udata);
+    if (s.marker && !qemu_plugin_u64_get(s.rec, vcpu)) {
+        return;
+    }
+    uint64_t v[2] = { 0, 0 };
+    for (int k = 0; k < 2; k++) {
+        void *h = k ? e->index : e->base;
+        GByteArray *b = g_byte_array_new();
+        if (h && qemu_plugin_read_register(
+                     static_cast<struct qemu_plugin_register *>(h), b) > 0) {
+            std::memcpy(&v[k], b->data, std::min<size_t>(b->len, 8));
+        }
+        g_byte_array_free(b, true);
+    }
+    v[1] = e->ext == 32 ? uint32_t(v[1]) : e->ext == -32 ? uint64_t(int32_t(v[1])) : v[1];
+    cst::Memop m{};
+    m.addr = v[0] + (v[1] << e->shift) + uint64_t(e->disp);
+    m.pos = e->pos;
+    std::lock_guard<std::recursive_mutex> guard(s.lock);
+    if (!s.published && !(s.system && qemu_plugin_in_async_int())) {
+        s.g.blocks.memop(s.wp_tid ? s.wp_tid : vcpu, m);
+    }
+}
+
 /* A syscall ends the block of the instruction that raised it. */
 void on_syscall(qemu_plugin_id_t, unsigned int vcpu, int64_t, uint64_t,
                 uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -1418,6 +1530,7 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         shape->regs.push_back(capture(s, insn));
+        classify_insn(s, insn, *shape);
         auto kind = qemu_plugin_insn_transfer_kind(insn);
         if (kind == QEMU_PLUGIN_TRANSFER_COND_NO_TARGET) {
             shape->traps.push_back(i);
@@ -1442,6 +1555,12 @@ void on_tb_trans(qemu_plugin_id_t, struct qemu_plugin_tb *tb)
                                                    on_snap, QEMU_PLUGIN_CB_R_REGS,
                                                    &shape->at.back());
         }
+    }
+    /* after the snapshots, so the memops a strand receives stay in order */
+    for (const cst::TbShape::Ea &e : shape->ea) {
+        qemu_plugin_register_vcpu_insn_exec_cb(qemu_plugin_tb_get_insn(tb, e.pos),
+                                               on_ea, QEMU_PLUGIN_CB_R_REGS,
+                                               const_cast<cst::TbShape::Ea *>(&e));
     }
     /* RW: an excursion launched here saves, runs and restores the vCPU */
     qemu_plugin_register_vcpu_tb_exec_cb(tb, on_tb_exec, s.wp ? QEMU_PLUGIN_CB_RW_REGS :

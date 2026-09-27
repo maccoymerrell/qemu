@@ -847,11 +847,22 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 UNARY_INT_GVEC(PABSB,          tcg_gen_gvec_abs, MO_8)
 UNARY_INT_GVEC(PABSW,          tcg_gen_gvec_abs, MO_16)
 UNARY_INT_GVEC(PABSD,          tcg_gen_gvec_abs, MO_32)
-UNARY_INT_GVEC(VBROADCASTx128, tcg_gen_gvec_dup_mem, MO_128)
-UNARY_INT_GVEC(VPBROADCASTB,   tcg_gen_gvec_dup_mem, MO_8)
-UNARY_INT_GVEC(VPBROADCASTW,   tcg_gen_gvec_dup_mem, MO_16)
-UNARY_INT_GVEC(VPBROADCASTD,   tcg_gen_gvec_dup_mem, MO_32)
-UNARY_INT_GVEC(VPBROADCASTQ,   tcg_gen_gvec_dup_mem, MO_64)
+
+/* Element 0 of the source (a register's, or the loaded one) to every element */
+#define BROADCAST_GVEC(uname, vece)                                                \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    int vec_len = vector_len(s, decode);                                          \
+                                                                                   \
+    plugin_gen_record_vec(vece, vec_len, 0, -1, 0);                                \
+    tcg_gen_gvec_dup_mem(vece, decode->op[0].offset,                               \
+                         decode->op[2].offset, vec_len, vec_len);                  \
+}
+BROADCAST_GVEC(VBROADCASTx128, MO_128)
+BROADCAST_GVEC(VPBROADCASTB,   MO_8)
+BROADCAST_GVEC(VPBROADCASTW,   MO_16)
+BROADCAST_GVEC(VPBROADCASTD,   MO_32)
+BROADCAST_GVEC(VPBROADCASTQ,   MO_64)
 
 
 #define BINARY_INT_GVEC(uname, func, ...)                                          \

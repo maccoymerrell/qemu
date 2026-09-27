@@ -2964,8 +2964,9 @@ static const PluginWordRow arm_word_rows[] = {
     { "mem.copy", 0, "CPYFP CPYFM CPYFE CPYP CPYM CPYE" },
     { "vec.load", PLUGIN_WORD_IMM_ADDR, "LD1R_zpri LD_zpri LDNF1_zpri "
       "LD1RQ_zpri LD1RO_zpri" },
-    { "vec.load", 0, "LD_mult LD_single LD_single_repl LD_zprr LDFF1_zprr "
+    { "vec.load", 0, "LD_mult LD_single LD_zprr LDFF1_zprr "
       "LD1RQ_zprr LD1RO_zprr LDST1" },
+    { "vec.load.dup", 0, "LD_single_repl" },
     { "vec.gather", PLUGIN_WORD_IMM_ADDR, "LD1_zpiz" },
     { "vec.gather", 0, "LD1_zprz LDNT1_zprz" },
     { "vec.store", PLUGIN_WORD_IMM_ADDR, "ST_zpri" },

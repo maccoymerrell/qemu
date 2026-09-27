@@ -4315,6 +4315,7 @@ static bool trans_LD_single_repl(DisasContext *s, arg_LD_single_repl *a)
     }
 
     total = a->selem << a->scale;
+    plugin_gen_record_vec(a->scale, (a->q + 1) * 8, 0, -1, -1);
     tcg_rn = cpu_reg_sp(s, a->rn);
 
     mop = finalize_memop_asimd(s, a->scale);

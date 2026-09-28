@@ -20,7 +20,6 @@ tests = {
   'test-string-output-visitor': [testqapi],
   'test-visitor-serialization': [testqapi],
   'test-bitmap': [],
-  'test-timer-rearm-bound': [],
   'test-resv-mem': [],
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
@@ -95,6 +94,8 @@ if have_block
     'test-crypto-afsplit': [io],
     'test-crypto-block': [io],
     'test-timed-average': [],
+    # the timer list (util/qemu-timer.c) is built only with the block layer
+    'test-timer-rearm-bound': [],
     'test-uuid': [],
   }
   if gnutls.found() and \

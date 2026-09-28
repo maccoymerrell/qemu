@@ -667,7 +667,10 @@ void cpu_plugin_cb_window_close(CPUState *cpu)
  * ("Bad icount read") from a vCPU callback that is not at an I/O-capable
  * position.  A plugin's reading never reaches the guest, so it takes the same
  * value without the fold (icount_peek).  Per-target because icount_peek
- * exists only in system emulation.
+ * exists only in system emulation.  User emulation has no virtual clock of
+ * its own: there QEMU_CLOCK_VIRTUAL is cpu_get_clock(), which a user binary
+ * takes from its stub, and a build with no system target links no
+ * qemu_clock_get_ns() -- so the stub is read directly, the same value.
  */
 int64_t cpu_plugin_vclock_ns(void)
 {
@@ -675,6 +678,8 @@ int64_t cpu_plugin_vclock_ns(void)
     if (icount_enabled()) {
         return icount_peek();
     }
-#endif
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+#else
+    return cpu_get_clock();
+#endif
 }

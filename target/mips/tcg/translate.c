@@ -2279,8 +2279,10 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     tcg_gen_br(done);
 
     gen_set_label(l1);
-    /* generate cmpxchg */
+    /* generate cmpxchg: its datum is rt (the reservation's value is no register) */
     val = tcg_temp_new();
+    plugin_gen_record_data(rt ? offsetof(CPUMIPSState, active_tc.gpr[rt]) : -1,
+                           -1, -1, -1);
     gen_load_gpr(val, rt);
     tcg_gen_atomic_cmpxchg_tl(t0, cpu_lladdr, cpu_llval, val,
                               eva ? MIPS_HFLAG_UM : ctx->mem_idx, tcg_mo);
@@ -2312,6 +2314,8 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
     case OPC_SWC1:
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
+            plugin_gen_record_data(offsetof(CPUMIPSState, active_fpu.fpr[ft]),
+                                   -1, -1, -1);
             gen_load_fpr32(ctx, fp0, ft);
             tcg_gen_qemu_st_i32(fp0, t0, ctx->mem_idx, mo_endian(ctx) | MO_UL |
                                 ctx->default_tcg_memop_mask);
@@ -2328,6 +2332,8 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
     case OPC_SDC1:
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
+            plugin_gen_record_data(offsetof(CPUMIPSState, active_fpu.fpr[ft]),
+                                   -1, -1, -1);
             gen_load_fpr64(ctx, fp0, ft);
             tcg_gen_qemu_st_i64(fp0, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ |
                                 ctx->default_tcg_memop_mask);

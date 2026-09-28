@@ -284,6 +284,13 @@ typedef uint64_t qemu_plugin_id_t;
  *   element count is read, the element a single-element form selects.
  *   A plugin declaring an earlier version that imports it is refused.
  *
+ * version 31:
+ * - struct qemu_plugin_insn_access gained @ndata / @data: the registers a
+ *   store's or read-modify-write's datum is formed from, as opposed to
+ *   the ones only its address reads.  The record array's stride is this
+ *   version's, so a plugin declaring an earlier one that imports
+ *   qemu_plugin_insn_access_list() is refused at load.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -295,7 +302,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 30
+#define QEMU_PLUGIN_VERSION 31
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -1006,15 +1013,27 @@ enum qemu_plugin_addr_form {
  * @reg: the register the access moves -- a load's destination, a store's
  *   source -- likewise; -1 when not stated, -2 when a store's value is a
  *   constant
+ * @ndata: for a store or a read-modify-write, how many registers its
+ *   datum -- the value it writes to memory -- is formed from besides what
+ *   memory held: 0 when that is a constant, or only what the instruction
+ *   loaded; -1 when the emission does not state it, and for a load
+ * @data: those registers, likewise indices into qemu_plugin_insn_reg_list()
  *
  * Each register named is one the instruction reads as an input; a
  * composition naming a register the list does not state as read is
- * reported as QEMU_PLUGIN_ADDR_UNSTATED.
+ * reported as QEMU_PLUGIN_ADDR_UNSTATED, and a datum naming one as not
+ * stated.  A register only an address reads is in no @data; one the
+ * datum is formed from is there whether or not an address reads it too.
+ * Whether a conditional store happens at all (a store-conditional's
+ * reservation check) is not its datum: such an access is behind a branch
+ * (QEMU_PLUGIN_ACCESS_BRANCHES).
  */
 struct qemu_plugin_insn_access {
     uint8_t dir;
     uint8_t form;
     int16_t base, index, seg, reg;
+    int8_t ndata;
+    int16_t data[4];
 };
 
 /* qemu_plugin_insn_access_list() @flags bits */
@@ -1027,14 +1046,15 @@ struct qemu_plugin_insn_access {
  * @n: set to the number of entries returned
  * @flags: if not NULL, set to QEMU_PLUGIN_ACCESS_* bits: the translation
  *   calls a helper that has side effects and returns, which may access
- *   memory this list does not show; its ops may branch over an access
- *   listed, which then does not execute
+ *   memory this list does not show (an atomic helper, whose one
+ *   read-modify-write the list shows, is not such a helper); its ops may
+ *   branch over an access listed, which then does not execute
  *
  * One entry per memory callback the translation emits, in emission order,
  * each with the address composition its decode site stated -- which
- * registers form the effective address -- and the register it moves where
- * the emission states it; addresses named but not accessed are entries
- * too.  A fact of the decode, not an interpretation: nothing is inferred
+ * registers form the effective address -- the register it moves and, for
+ * a store, the registers its datum is formed from, where the emission
+ * states them; addresses named but not accessed are entries too.  A fact of the decode, not an interpretation: nothing is inferred
  * from the ops.  Valid only during the translation callback.
  *
  * Returns: the array (NULL when empty).

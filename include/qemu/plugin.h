@@ -163,9 +163,11 @@ struct qemu_plugin_insn {
      * CPU-state offsets) with the address composition current when it was
      * emitted (@addr_cur) -- or held, until used, in the temps of
      * @addr_held -- and the register a site said the next one moves
-     * (@access_reg).  Resolved against @regs at plugin_gen_insn_end() into
-     * @access; @access_flags are QEMU_PLUGIN_ACCESS_* bits.  Reset per
-     * instruction.
+     * (@access_reg), and the registers the stores it emits from then on
+     * form their data from (@data_cur, made by a decode site or, for its
+     * own operands, an atomic emitter).  Resolved against @regs at
+     * plugin_gen_insn_end() into @access; @access_flags are
+     * QEMU_PLUGIN_ACCESS_* bits.  Reset per instruction.
      */
     GArray *access_recs, *access;
     struct plugin_addr_stmt {
@@ -176,6 +178,11 @@ struct qemu_plugin_insn {
     unsigned addr_next;
     intptr_t access_reg;
     unsigned access_flags;
+    struct plugin_data_stmt {
+        uint8_t from;           /* 0 none, 1 an atomic emitter, 2 a decode site */
+        int8_t n;               /* -1: not stated */
+        intptr_t off[4];        /* CPU-state offsets; -1: a constant */
+    } data_cur;
     /*
      * The vector statement (qemu_plugin_insn_vector_shape()), and who made it:
      * 0 none, 1 the generic expanders, 2 a decode site (whose stands).

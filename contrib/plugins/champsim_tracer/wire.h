@@ -71,16 +71,19 @@ int isa_for_target(const std::string &target_name);
  * @acc is the access statement (qemu_plugin_insn_access_list()) in these
  * slots: per access its direction, address form and the src slots its
  * address reads (-1 none), and the slot it moves -- dst for a load, src
- * for a store (-1 unstated, -2 a constant); @aflags its HELPERS /
- * BRANCHES bits; @acc_varies: a retranslation stated another.
+ * for a store (-1 unstated, -2 a constant) -- and for a store the src
+ * slots its datum is formed from, @data (@nd -1: unstated); @aflags its
+ * HELPERS / BRANCHES bits; @acc_varies: a retranslation stated another.
  */
 struct Acc {
     uint8_t dir, form;
-    int8_t base, index, seg, reg;
+    int8_t base, index, seg, reg, nd;
+    uint64_t data;
     bool operator==(const Acc &o) const
     {
         return dir == o.dir && form == o.form && base == o.base &&
-               index == o.index && seg == o.seg && reg == o.reg;
+               index == o.index && seg == o.seg && reg == o.reg &&
+               nd == o.nd && data == o.data;
     }
 };
 struct Regs {

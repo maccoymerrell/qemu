@@ -463,7 +463,7 @@ std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
     const bool move = kind == kDepMove || kind == kDepMoveWb;
     /*
      * A written-back base (mem.*.wb) moves by its offset: it depends on the
-     * sources less the registers the accesses move, and itself.
+     * sources less the registers the accesses move or store, and itself.
      */
     std::set<int> base;
     Bits wbm = range(0, n);
@@ -473,6 +473,7 @@ std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
             if (a.form == 1 && k >= 0) base.insert(k);
         }
         if (a.dir > 1 && a.reg >= 0) wbm[a.reg / 64] &= ~(uint64_t(1) << (a.reg % 64));
+        if (a.dir > 1 && a.nd >= 0) wbm[0] &= ~a.data;
     }
     auto wb = [&](size_t d) {
         int s = in_src(r.dst[d]);
@@ -570,6 +571,47 @@ std::string dep_block(const WireInsn &i, const MemopCensus::Row *row, Bytes &b)
             sd[k] = (kind == kDepPush && dir[1].size() != 1) || data == Bits{} ? full : data;
         }
         fam = "stack";
+    }
+    /*
+     * The data statement: a store's datum is formed from the registers its
+     * access names, the loads and the immediate -- never from a register
+     * only an address reads.  It refines a store mask the refiner left
+     * saturated; and where every store states it and no helper or branch
+     * can hide a dependence, a destination that is no address register
+     * computes alongside, from the same inputs, and drops those too, while
+     * an address register written back never takes a datum's registers.
+     */
+    const bool dstated = valid[1] && !dir[1].empty() &&
+        std::all_of(dir[1].begin(), dir[1].end(), [](const Acc *a) { return a->nd >= 0; });
+    auto dmask = [&](const Acc *a) {
+        Bits m = loads;
+        for (size_t k = 0; k < n; k++) if (a->data >> k & 1) bit(m, k);
+        if (imm) bit(m, n + L);
+        return m;
+    };
+    Bits du{}, ao{};
+    fam = fam == "address" && dstated ? "data" : fam;
+    for (const Acc *a : dir[1]) du = either(du, dmask(a));
+    for (size_t k = 0; k < S && dstated; k++) {
+        sd[k] = sd[k] != full ? sd[k] : slotted[1] ? dmask(dir[1][k]) : du;
+    }
+    for (int k : base) {
+        if (!(du[k / 64] >> (k % 64) & 1)) bit(ao, size_t(k));
+    }
+    Bits keep = either(range(0, n), loads);         /* an address register's */
+    if (imm) bit(keep, n + L);
+    for (size_t k = 0; k < n; k++) {
+        if (du[k / 64] >> (k % 64) & 1) keep[k / 64] &= ~(uint64_t(1) << (k % 64));
+    }
+    for (size_t d = 0; dstated && !(r.aflags & 3) && named.empty() && (!L || valid[0]) &&
+                       d < r.dst.size(); d++) {
+        int s = in_src(r.dst[d]);
+        if (dst[d] == full && s < int(n) && base.count(s)) {
+            dst[d] = keep;              /* written back: never from a datum */
+            bit(dst[d], size_t(s));
+        } else if (dst[d] == full) {
+            for (int k = 0; k < 8; k++) dst[d][k] &= ~ao[k];
+        }
     }
     bool has_reg = false, sat = false;
     for (const auto *v : { &dst, &sd }) {

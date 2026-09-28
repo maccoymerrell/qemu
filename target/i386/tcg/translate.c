@@ -2671,8 +2671,10 @@ static inline void gen_ldq_env_A0(DisasContext *s, int offset)
     tcg_gen_st_i64(s->tmp1_i64, tcg_env, offset);
 }
 
+/* The stores below move the register at @offset: that is their datum. */
 static inline void gen_stq_env_A0(DisasContext *s, int offset)
 {
+    plugin_gen_record_data(offset, -1, -1, -1);
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, offset);
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEUQ);
 }
@@ -2697,6 +2699,7 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
 
+    plugin_gen_record_data(offset, -1, -1, -1);
     tcg_gen_ld_i128(t, tcg_env, offset);
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop);
 }
@@ -2722,6 +2725,7 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
 
+    plugin_gen_record_data(offset, -1, -1, -1);
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(s->tmp0, s->A0, 16);
@@ -3100,6 +3104,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             update_fip = update_fdp = false;
             break;
         case 0x0f: /* fnstcw mem */
+            plugin_gen_record_data(offsetof(CPUX86State, fpuc), -1, -1, -1);
             gen_helper_fnstcw(s->tmp2_i32, tcg_env);
             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                 s->mem_index, MO_LEUW);
@@ -3123,6 +3128,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             update_fip = update_fdp = false;
             break;
         case 0x2f: /* fnstsw mem */
+            plugin_gen_record_data(offsetof(CPUX86State, fpus), -1, -1, -1);
             gen_helper_fnstsw(s->tmp2_i32, tcg_env);
             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                 s->mem_index, MO_LEUW);

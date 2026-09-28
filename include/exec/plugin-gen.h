@@ -190,6 +190,19 @@ void plugin_gen_record_access_reg(intptr_t off);
 void plugin_gen_record_access(unsigned dir, TCGTemp *val);
 
 /*
+ * The data statement: the registers (CPU-state offsets; -1 for none, or a
+ * constant) the datum of each store and read-modify-write the instruction
+ * emits from here on is formed from, besides what memory held -- stated by
+ * the decode site that forms it, and current until another statement.
+ * plugin_gen_record_data_temps(): an atomic emitter's own operands, where
+ * no site stated one -- a register's own global names it, a constant
+ * nothing, any other temp leaves the datum unstated; (NULL, NULL) retires
+ * it.  A store with neither statement has the register it moves.
+ */
+void plugin_gen_record_data(intptr_t a, intptr_t b, intptr_t c, intptr_t d);
+void plugin_gen_record_data_temps(TCGTemp *a, TCGTemp *b);
+
+/*
  * The vector statement (qemu_plugin_insn_vector_shape()): an operation on
  * elements of 1 << @vece bytes over @oprsz bytes of each register operand
  * (PLUGIN_VEC_* @flags), writing destination element @dsel alone and
@@ -229,6 +242,13 @@ static inline void plugin_gen_record_addr_named(void)
 { }
 
 static inline void plugin_gen_record_access_reg(intptr_t off)
+{ }
+
+static inline void plugin_gen_record_data(intptr_t a, intptr_t b,
+                                          intptr_t c, intptr_t d)
+{ }
+
+static inline void plugin_gen_record_data_temps(TCGTemp *a, TCGTemp *b)
 { }
 
 static inline void plugin_gen_record_access(unsigned dir, TCGTemp *val)

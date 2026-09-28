@@ -463,9 +463,11 @@ from what QEMU states at translation -- the register list
 (``qemu_plugin_insn_access_list()``): per memory callback the translation
 emits, the registers its decode site composed the address from (or that
 the address is a constant the encoding fixes: absolute, or pc-relative and
-folded), and, where the emission states it, the register the access moves.
-Nothing is read from the instruction bytes and nothing is inferred from the
-ops.
+folded), and, where the emission states them, the register the access moves
+and, for a store or read-modify-write, the registers its datum is formed
+from.  An atomic read-modify-write callback is read as the load and the
+store it reports.  Nothing is read from the instruction bytes and nothing
+is inferred from the ops.
 
 An access list is trusted for a direction only when it is complete there:
 no helper that could access memory runs, or every execution delivered
@@ -514,12 +516,25 @@ reason when none applies:
    (and the immediate), a pushed datum on the sources less the stack
    pointer and a load's address, a popped register on the loads.  Models a
    stack engine: pointer updates off the data path.
+``data``
+   Every store of the instruction states its datum's registers (a pair
+   store's two, an atomic's operands, a read-modify-write's register
+   operand and carry, a ``setcc``'s flags): each ``store_data_dep`` is
+   those registers, the loads and the immediate -- never a register only
+   an address reads.  Where no helper runs and no op branches over an
+   access, a destination that is not an address register (the flags, an
+   atomic's old value) drops the registers only addresses read, and an
+   address register written back drops the datum's registers.  Also refines
+   a store mask the families above leave saturated.  Models store-data
+   readiness apart from the address, and the address-generation
+   independence of a read-modify-write's result.  A store-conditional's
+   status stays saturated: whether it stores is decided by its reservation
+   check, a branch.
 
 Absent from the families by design: an address computed into a register
 (``int.lea``) keeps the default, which is already exact -- the registers
-it reads are the ones its composition names; an atomic read-modify-write
-keeps the default (the registers its accesses move are not stated); and a
-register statement QEMU marked incomplete never gets ``HAS_REG``.
+it reads are the ones its composition names; and a register statement
+QEMU marked incomplete never gets ``HAS_REG``.
 
 .. _lane-masks:
 

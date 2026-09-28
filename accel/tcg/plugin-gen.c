@@ -513,6 +513,7 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     insn->addr_next = 0;
     insn->access_reg = -1;
     insn->access_flags = 0;
+    memset(&insn->data_cur, 0, sizeof(insn->data_cur));
     /* the vector statement, likewise */
     memset(&insn->vec, 0, sizeof(insn->vec));
     insn->vec_from = 0;
@@ -649,8 +650,11 @@ typedef struct PluginAccessRec {
     uint8_t dir;
     struct plugin_addr_stmt a;
     intptr_t reg;
+    struct plugin_data_stmt data;   /* @n -1: not stated */
     TCGOp *at;          /* the op that makes the access */
 } PluginAccessRec;
+
+static bool temp_is_zero(struct qemu_plugin_insn *insn, TCGTemp *t);
 
 /* The CPU-state offset of the register whose own value @t is, or -1 */
 static intptr_t addr_global(TCGTemp *t)
@@ -731,11 +735,24 @@ void plugin_gen_record_addr_use(TCGTemp *t, intptr_t seg)
     }
 }
 
+/*
+ * A store's datum: the statement current, else the register it moves (a
+ * constant: none).  A load has none.
+ */
 static void access_rec(struct qemu_plugin_insn *insn, unsigned dir,
                        intptr_t reg)
 {
     PluginAccessRec r = { .dir = dir, .a = insn->addr_cur, .reg = reg,
-                          .at = tcg_last_op() };
+                          .data = { .n = -1 }, .at = tcg_last_op() };
+
+    if (dir & QEMU_PLUGIN_MEM_W) {
+        r.data = insn->data_cur;
+        if (!r.data.from && reg != -1) {
+            r.data = (struct plugin_data_stmt) { .from = 1, .n = reg >= 0,
+                                                 .off = { reg } };
+        }
+        r.data.n = r.data.from ? r.data.n : -1;
+    }
 
     if (!insn->access_recs) {
         insn->access_recs = g_array_new(false, false, sizeof(PluginAccessRec));
@@ -764,11 +781,48 @@ void plugin_gen_record_access(unsigned dir, TCGTemp *val)
 
     if (insn) {
         reg = insn->access_reg != -1 ? insn->access_reg : addr_global(val);
-        reg = reg < 0 && val && val->kind == TEMP_CONST &&
+        reg = reg < 0 && val && (val->kind == TEMP_CONST ||
+                                 temp_is_zero(insn, val)) &&
               dir == QEMU_PLUGIN_MEM_W ? -2 : reg;
         insn->access_reg = -1;
         access_rec(insn, dir, reg);
     }
+}
+
+void plugin_gen_record_data(intptr_t a, intptr_t b, intptr_t c, intptr_t d)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (insn) {
+        insn->data_cur = (struct plugin_data_stmt) {
+            .from = 2, .n = 4, .off = { a, b, c, d },
+        };
+    }
+}
+
+void plugin_gen_record_data_temps(TCGTemp *a, TCGTemp *b)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    TCGTemp *t[2] = { a, b };
+    struct plugin_data_stmt x = { .from = 1, .n = 2, .off = { -1, -1, -1, -1 } };
+
+    if (!insn || insn->data_cur.from == 2) {
+        return;                 /* a decode site's stands */
+    } else if (!a && !b) {
+        insn->data_cur.from = 0;
+        return;
+    }
+    for (int k = 0; k < 2; k++) {
+        PluginRegDesc d;
+
+        x.off[k] = addr_global(t[k]);
+        x.n = t[k] && x.off[k] < 0 && t[k]->kind != TEMP_CONST &&
+              !temp_is_zero(insn, t[k]) ? -1 : x.n;
+        /* a global of translator state (a reservation) is no register */
+        x.off[k] = x.off[k] >= 0 && reg_resolve(x.off[k], 1, &d) ==
+                   PLUGIN_REG_DROP ? -1 : x.off[k];
+    }
+    insn->data_cur = x;
 }
 
 /*
@@ -875,6 +929,19 @@ typedef struct RegAcc {
     uint8_t ops, stated;
     bool ptr, noted, wdef;
 } RegAcc;
+
+/* @t holds the constant-zero register a translator named it as */
+static bool temp_is_zero(struct qemu_plugin_insn *insn, TCGTemp *t)
+{
+    for (guint i = 0; t && insn->reg_notes && i < insn->reg_notes->len; i++) {
+        PluginRegNote *n = &g_array_index(insn->reg_notes, PluginRegNote, i);
+        if (n->kind == NOTE_TEMP && n->temp == t &&
+            n->d.cls == QEMU_PLUGIN_REG_ZERO) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void reg_note(PluginRegNote *n)
 {
@@ -1068,8 +1135,9 @@ static void access_branches(struct qemu_plugin_insn *insn, TCGOp *op,
     const TCGOpDef *def = &tcg_op_defs[op->opc];
 
     if (op->opc == INDEX_op_call &&
-        !(tcg_call_info(op)->flags & (TCG_CALL_NO_SE | TCG_CALL_NO_RETURN))) {
-        insn->access_flags |= QEMU_PLUGIN_ACCESS_HELPERS;
+        !(tcg_call_info(op)->flags & (TCG_CALL_NO_SE | TCG_CALL_NO_RETURN)) &&
+        !g_str_has_prefix(tcg_call_info(op)->name, "atomic_")) {
+        insn->access_flags |= QEMU_PLUGIN_ACCESS_HELPERS;   /* not one listed */
     }
     if (op->opc == INDEX_op_set_label) {
         g_ptr_array_remove(open, arg_label(op->args[0]));
@@ -1289,6 +1357,7 @@ static void access_resolve(struct qemu_plugin_insn *insn)
         struct qemu_plugin_insn_access x = {
             .dir = r->dir, .form = r->a.form, .base = -1, .index = -1,
             .seg = -1, .reg = r->reg == -2 ? -2 : -1,
+            .data = { -1, -1, -1, -1 },
         };
         intptr_t off[3] = { r->a.base, r->a.index, r->a.seg };
         int16_t *slot[3] = { &x.base, &x.index, &x.seg };
@@ -1306,6 +1375,28 @@ static void access_resolve(struct qemu_plugin_insn *insn)
             int v = access_slot(insn, r->reg, r->dir == QEMU_PLUGIN_MEM_R ?
                                 QEMU_PLUGIN_REG_WRITE : QEMU_PLUGIN_REG_READ);
             x.reg = v >= 0 ? v : v == -2 && r->dir == QEMU_PLUGIN_MEM_W ? -2 : -1;
+        }
+        /*
+         * The datum's registers: an input the list states read, each once;
+         * the zero register is none; a field that is no register (scratch
+         * a value passed through) or one the list does not state read
+         * unstates it.
+         */
+        x.ndata = r->data.n < 0 ? -1 : 0;
+        for (int k = 0; k < r->data.n && x.ndata >= 0; k++) {
+            int v = access_slot(insn, r->data.off[k], QEMU_PLUGIN_REG_READ);
+
+            if (v == -3) {
+                x.ndata = -1;
+            } else if (v >= 0) {
+                bool dup = false;
+                for (int j = 0; j < x.ndata; j++) {
+                    dup |= x.data[j] == v;
+                }
+                if (!dup) {
+                    x.data[x.ndata++] = v;
+                }
+            }
         }
         g_array_append_val(insn->access, x);
     }

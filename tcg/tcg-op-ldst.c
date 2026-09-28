@@ -902,7 +902,9 @@ void tcg_gen_nonatomic_cmpxchg_i32_chk(TCGv_i32 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);
+    plugin_gen_record_data_temps(tcgv_i32_temp(cmpv), tcgv_i32_temp(newv));
     tcg_gen_nonatomic_cmpxchg_i32_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void tcg_gen_atomic_cmpxchg_i32_int(TCGv_i32 retv, TCGTemp *addr,
@@ -941,7 +943,9 @@ void tcg_gen_atomic_cmpxchg_i32_chk(TCGv_i32 retv, TCGTemp *addr,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);
     plugin_gen_record_atomic();
+    plugin_gen_record_data_temps(tcgv_i32_temp(cmpv), tcgv_i32_temp(newv));
     tcg_gen_atomic_cmpxchg_i32_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void tcg_gen_nonatomic_cmpxchg_i64_int(TCGv_i64 retv, TCGTemp *addr,
@@ -986,7 +990,9 @@ void tcg_gen_nonatomic_cmpxchg_i64_chk(TCGv_i64 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);
+    plugin_gen_record_data_temps(tcgv_i64_temp(cmpv), tcgv_i64_temp(newv));
     tcg_gen_nonatomic_cmpxchg_i64_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void tcg_gen_atomic_cmpxchg_i64_int(TCGv_i64 retv, TCGTemp *addr,
@@ -1059,7 +1065,9 @@ void tcg_gen_atomic_cmpxchg_i64_chk(TCGv_i64 retv, TCGTemp *addr,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);
     plugin_gen_record_atomic();
+    plugin_gen_record_data_temps(tcgv_i64_temp(cmpv), tcgv_i64_temp(newv));
     tcg_gen_atomic_cmpxchg_i64_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void tcg_gen_nonatomic_cmpxchg_i128_int(TCGv_i128 retv, TCGTemp *addr,
@@ -1112,7 +1120,9 @@ void tcg_gen_nonatomic_cmpxchg_i128_chk(TCGv_i128 retv, TCGTemp *addr,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & (MO_SIZE | MO_SIGN)) == MO_128);
+    plugin_gen_record_data_temps(tcgv_i128_temp(cmpv), tcgv_i128_temp(newv));
     tcg_gen_nonatomic_cmpxchg_i128_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void tcg_gen_atomic_cmpxchg_i128_int(TCGv_i128 retv, TCGTemp *addr,
@@ -1155,7 +1165,9 @@ void tcg_gen_atomic_cmpxchg_i128_chk(TCGv_i128 retv, TCGTemp *addr,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & (MO_SIZE | MO_SIGN)) == MO_128);
     plugin_gen_record_atomic();
+    plugin_gen_record_data_temps(tcgv_i128_temp(cmpv), tcgv_i128_temp(newv));
     tcg_gen_atomic_cmpxchg_i128_int(retv, addr, cmpv, newv, idx, memop);
+    plugin_gen_record_data_temps(NULL, NULL);
 }
 
 static void do_nonatomic_op_i32(TCGv_i32 ret, TCGTemp *addr, TCGv_i32 val,
@@ -1274,12 +1286,14 @@ void tcg_gen_atomic_##NAME##_i32_chk(TCGv_i32 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);                       \
     plugin_gen_record_atomic();                                         \
+    plugin_gen_record_data_temps(tcgv_i32_temp(val), NULL);             \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
         do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME);     \
     } else {                                                            \
         do_nonatomic_op_i32(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i32);                        \
     }                                                                   \
+    plugin_gen_record_data_temps(NULL, NULL);                           \
 }                                                                       \
 void tcg_gen_atomic_##NAME##_i64_chk(TCGv_i64 ret, TCGTemp *addr,       \
                                      TCGv_i64 val, TCGArg idx,          \
@@ -1288,12 +1302,14 @@ void tcg_gen_atomic_##NAME##_i64_chk(TCGv_i64 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);                       \
     plugin_gen_record_atomic();                                         \
+    plugin_gen_record_data_temps(tcgv_i64_temp(val), NULL);             \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
         do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME);     \
     } else {                                                            \
         do_nonatomic_op_i64(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i64);                        \
     }                                                                   \
+    plugin_gen_record_data_temps(NULL, NULL);                           \
 }
 
 GEN_ATOMIC_HELPER(fetch_add, add, 0)

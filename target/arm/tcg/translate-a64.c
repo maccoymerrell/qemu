@@ -553,6 +553,12 @@ static void gen_reg_xzr(TCGv_i64 t, unsigned access)
     }
 }
 
+/* General register @reg as a datum's register: XZR (31) contributes none */
+static intptr_t data_xreg(int reg)
+{
+    return reg == 31 ? -1 : offsetof(CPUARMState, xregs[reg]);
+}
+
 TCGv_i64 cpu_reg(DisasContext *s, int reg)
 {
     if (reg == 31) {
@@ -3075,6 +3081,9 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     TCGv_i64 tmp, clean_addr;
     MemOp memop;
 
+    /* the datum: Rt (and Rt2); the monitor's value is no register */
+    plugin_gen_record_data(data_xreg(rt), is_pair ? data_xreg(rt2) : -1, -1, -1);
+
     /*
      * FIXME: We are out of spec here.  We have recorded only the address
      * from load_exclusive, not the entire range, and we assume that the
@@ -3203,6 +3212,8 @@ static void gen_compare_and_swap_pair(DisasContext *s, int rs, int rt,
     if (rn == 31) {
         gen_check_sp_alignment(s);
     }
+    plugin_gen_record_data(data_xreg(rs), data_xreg(rs + 1),
+                           data_xreg(rt), data_xreg(rt + 1));
 
     /* This is a single atomic access, despite the "pair". */
     memop = check_atomic_align(s, rn, size + 1);
@@ -3463,6 +3474,7 @@ static bool trans_STP(DisasContext *s, arg_ldstpair *a)
     op_addr_ldstpair_pre(s, a, &clean_addr, &dirty_addr, offset, true, mop);
     tcg_rt = cpu_reg(s, a->rt);
     tcg_rt2 = cpu_reg(s, a->rt2);
+    plugin_gen_record_data(data_xreg(a->rt), data_xreg(a->rt2), -1, -1);
     /*
      * We built mop above for the single logical access -- rebuild it
      * now for the paired operation.
@@ -3868,6 +3880,7 @@ static bool do_atomic_ld(DisasContext *s, arg_atomic *a, AtomicThreeOpFn *fn,
                                 a->rn != 31, mop);
     tcg_rs = read_cpu_reg(s, a->rs, true);
     tcg_rt = cpu_reg(s, a->rt);
+    plugin_gen_record_data(data_xreg(a->rs), -1, -1, -1);   /* a copy of Rs */
     if (invert) {
         tcg_gen_not_i64(tcg_rs, tcg_rs);
     }

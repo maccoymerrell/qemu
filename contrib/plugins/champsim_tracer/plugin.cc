@@ -362,10 +362,20 @@ cst::Regs capture(Session &s, struct qemu_plugin_insn *insn)
         cst::Acc x{ a[k].dir, a[k].form, slot(out.src, a[k].base),
                     slot(out.src, a[k].index), slot(out.src, a[k].seg),
                     int8_t(a[k].reg == -2 ? -2 : slot(a[k].dir == QEMU_PLUGIN_MEM_R ?
-                                                      out.dst : out.src, a[k].reg)) };
+                                                      out.dst : out.src, a[k].reg)),
+                    a[k].ndata, 0 };
+        for (int j = 0; j < a[k].ndata && x.nd >= 0; j++) {   /* the datum's */
+            int8_t v = slot(out.src, a[k].data[j]);
+            x.nd = v < 0 ? -1 : x.nd;
+            x.data |= v >= 0 ? uint64_t(1) << v : 0;
+        }
         x.form = x.base == -3 || x.index == -3 || x.seg == -3 ?
                  QEMU_PLUGIN_ADDR_UNSTATED : x.form;
         x.reg = x.reg == -3 ? -1 : x.reg;
+        if (x.dir == QEMU_PLUGIN_MEM_RW) {  /* the load and the store it reports */
+            out.acc.push_back({ QEMU_PLUGIN_MEM_R, x.form, x.base, x.index, x.seg, -1, -1, 0 });
+            x.dir = QEMU_PLUGIN_MEM_W;
+        }
         out.acc.push_back(x);
     }
     return out;

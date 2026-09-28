@@ -108,7 +108,7 @@ static void rr_stop_kick_timer(void)
 
 static void rr_wait_io_event(void)
 {
-    CPUState *cpu;
+    CPUState *cpu, *running = current_cpu;
     bool vagency_parked = false;
 
     while (all_cpu_threads_idle()) {
@@ -132,9 +132,17 @@ static void rr_wait_io_event(void)
 
     rr_start_kick_timer();
 
+    /*
+     * Queued work (async_run_on_cpu) runs as the vCPU it was queued on, as
+     * it does at the kick-off wait above and on an MTTCG thread, whose
+     * current_cpu is its own vCPU: current_cpu names that vCPU while its
+     * work runs, and the run loop's afterwards.
+     */
     CPU_FOREACH(cpu) {
+        current_cpu = cpu;
         qemu_wait_io_event_common(cpu);
     }
+    current_cpu = running;
 }
 
 /*

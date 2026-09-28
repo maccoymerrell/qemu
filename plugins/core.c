@@ -320,6 +320,30 @@ void plugin_evq_note_drained(CPUState *cpu)
 }
 
 /*
+ * The frames an exception return into user mode leaves open belong to
+ * handlers that returned somewhere other than their resume PC: close them,
+ * one FAULT_RETURN each, innermost first.  A target without the privilege
+ * hook reports none of its returns as user mode.
+ */
+QEMU_DISABLE_CFI
+void cpu_plugin_fault_unwind(CPUState *cpu, uint64_t target_pc)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    int priv = 1;
+    uint64_t asid;
+    bool mmu_on;
+
+    if (ops && ops->get_plugin_state) {
+        ops->get_plugin_state(cpu, &priv, &asid, &mmu_on);
+    }
+    while (priv == 0 && cpu->plugin_fault_depth) {
+        cpu->plugin_fault_depth--;
+        cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN, target_pc,
+                            cpu->plugin_fault_depth);
+    }
+}
+
+/*
  * Ordered per-vCPU path-event producer (see CPUPluginEventQueue in
  * hw/core/cpu.h).  Called from the fault push/pop helpers and the async
  * delivery/close chokepoints, always on the owning vCPU thread.  (asid,

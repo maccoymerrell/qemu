@@ -869,7 +869,8 @@ struct CPUState {
      * exception-return lands) and bumps plugin_fault_depth.
      * cpu_plugin_fault_pop (each target's exception-return path) pops the top
      * IFF the return target equals it -- so syscall/async returns, which never
-     * pushed, don't disturb the stack.  Both are no-ops on the wrong path
+     * pushed, don't disturb the stack -- and a return into user mode closes
+     * every frame left (a handler that advanced past its instruction).  Both are no-ops on the wrong path
      * (plugin_spec_mode).  Each push/pop also appends an ordered
      * FAULT_ENTER/FAULT_RETURN event to the queue below -- the channel a
      * plugin consumes the transitions through; plugin_fault_depth is the
@@ -993,6 +994,11 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc);
 void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
                             bool is_async);
 
+/* An exception return that lands in user mode closes every frame still
+ * open (see cpu_plugin_fault_pop); defined in plugins/core.c, where the
+ * per-target privilege hook is reachable. */
+void cpu_plugin_fault_unwind(CPUState *cpu, uint64_t target_pc);
+
 /*
  * System-mode synchronous-fault excursion stack (see the plugin_fault_* fields
  * above).  Each target's do_interrupt calls _push for a RE-EXECUTING fault
@@ -1016,12 +1022,17 @@ static inline void cpu_plugin_fault_push(CPUState *cpu, uint64_t resume_pc)
 
 /*
  * cpu_plugin_fault_pop: report an exception return (ERET/SRET/MRET/IRET)
- * landing on @target_pc, which the caller has already committed.  Every
- * target's exception-return helper calls this unconditionally; the gating
- * lives here: nothing happens on the wrong path or with an empty stack, and
- * the top frame is popped only on an exact resume-PC match, so returns that
- * never pushed (syscall, async) leave the stack alone.  Without
- * CONFIG_PLUGIN it is a no-op macro that does not evaluate its arguments.
+ * landing on @target_pc, which the caller has already committed along with
+ * the privilege it returns to.  Every target's exception-return helper
+ * calls this unconditionally; the gating lives here: nothing happens on the
+ * wrong path or with an empty stack, and the top frame is popped on an
+ * exact resume-PC match, so returns that never pushed (syscall, async)
+ * leave the stack alone.  A handler that does not re-execute -- it emulated
+ * and advanced past the instruction, took an exception-table fixup, or
+ * delivered a signal -- returns to no resume PC, so its frame is closed
+ * instead by the return that reaches user mode: a vCPU running user code is
+ * inside no handler, whatever the stack still holds.  Without CONFIG_PLUGIN
+ * it is a no-op macro that does not evaluate its arguments.
  */
 static inline void cpu_plugin_fault_pop(CPUState *cpu, uint64_t target_pc)
 {
@@ -1036,13 +1047,15 @@ static inline void cpu_plugin_fault_pop(CPUState *cpu, uint64_t target_pc)
      * the match is exact, not heuristic.
      */
     uint32_t top = cpu->plugin_fault_depth - 1;
-    if (top < CPU_PLUGIN_FAULT_STACK_MAX &&
-        cpu->plugin_fault_stack[top] != target_pc) {
-        return;
+    if (top >= CPU_PLUGIN_FAULT_STACK_MAX ||
+        cpu->plugin_fault_stack[top] == target_pc) {
+        cpu->plugin_fault_depth--;
+        cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN, target_pc,
+                            cpu->plugin_fault_depth);
     }
-    cpu->plugin_fault_depth--;
-    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN, target_pc,
-                        cpu->plugin_fault_depth);
+    if (cpu->plugin_fault_depth) {
+        cpu_plugin_fault_unwind(cpu, target_pc);
+    }
 }
 #else
 #define cpu_plugin_fault_pop(cpu, target_pc) do { } while (0)

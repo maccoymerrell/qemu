@@ -33,7 +33,7 @@ namespace cst {
 /*
  * FieldStateTable storage (mirrors the writer's
  * BodyStreamState::cp_field_state in champsim_tracer_output.cc):
- * blocks indexed by template_id; values is a flat
+ * blocks keyed by template_id; values is a flat
  * (n_insns * physical stride) Wide array; gens is per-cell
  * generation — a cell "exists" only when gens[idx]==table.generation,
  * so bumping the generation invalidates every cell in O(1).  Replaces
@@ -87,7 +87,12 @@ struct FieldStateBlock {
 };
 
 struct FieldStateTable {
-    std::vector<std::unique_ptr<FieldStateBlock>> blocks; /* index = template_id */
+    /* Keyed by template_id; only the templates this context ran and a
+     * later record still names (BodyWalker::forget_after()).  A vector
+     * indexed by id held a slot per id below the highest one the context
+     * ever ran -- per context, and twice that in growth slack -- which a
+     * trace of millions of wrong-path templates cannot afford. */
+    std::unordered_map<uint32_t, std::unique_ptr<FieldStateBlock>> blocks;
     uint32_t generation = 1;
 };
 
@@ -171,6 +176,23 @@ public:
     void set_max_entries(uint64_t n) { max_entries_ = n; }
 
     const BodyStats &stats() const { return stats_; }
+
+    /* Retention bound.  A template's field-state blocks are read only
+     * by the records that name it, so once the last ENTRY naming it --
+     * in its own section or its wrong-path chain -- is done, no later
+     * record reads them.  last_references() finds that ENTRY per
+     * template in a parse-skip pass over @body, a second reader of the
+     * same body member (nothing is applied or materialised); handed to
+     * forget_after(), walk() / walk_bb() drop every context's blocks of
+     * a template as that ENTRY completes.  Without it they keep every
+     * block to the end of the body: a dense block per template per
+     * context, which a trace minting millions of wrong-path templates
+     * cannot hold.  What a consumer sees is unchanged either way. */
+    std::vector<std::pair<uint32_t, uint32_t>> last_references(Reader &body) const;
+    void forget_after(std::vector<std::pair<uint32_t, uint32_t>> last)
+    {
+        forget_ = std::move(last);
+    }
 
     /* Impossible-attribution lint (see cst_lint.h).  Populated on the
      * batch walk() path only — CP entries checked, WP chains and
@@ -347,6 +369,9 @@ private:
     void     handle_entry(WalkState &ws, const Callback &cb);
     void     handle_iframe(WalkState &ws);
     uint64_t handle_end();
+    /* Drop the blocks of every template whose last naming ENTRY is
+     * @ws's latest (forget_after()). */
+    void     forget_done(WalkState &ws);
 
     /* Streaming-path counterparts of handle_entry / handle_iframe.
      * handle_entry_bb applies (or parse-skips) the CP field deltas,
@@ -439,6 +464,10 @@ private:
     AttributionLint lint_;
     /* Optional positional sink for disk-I/O records (set_devio_callback). */
     DevioCallback devio_cb_;
+    /* (last naming ENTRY's seq, template_id), ascending (forget_after()),
+     * and how far the walk has consumed it. */
+    std::vector<std::pair<uint32_t, uint32_t>> forget_;
+    size_t forget_next_ = 0;
     /* request_id -> (thread_id, asid) captured from an EXACT DEVIO_START,
      * so its paired DEVIO_STOP can be surfaced with the same owner. */
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> devio_owner_;

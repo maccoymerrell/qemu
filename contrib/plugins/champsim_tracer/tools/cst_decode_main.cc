@@ -2579,6 +2579,24 @@ int run_body_render(const Options &opts, const cst::Header &h,
     cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
     walker.set_max_entries(opts.max_entries);
 
+    /*
+     * Retention: a whole-body walk first learns, in a parse-skip pass of
+     * its own over the body, the last ENTRY naming each template, so the
+     * walk holds a template's field state only while records still name
+     * it (BodyWalker::forget_after).  A pass that cannot complete leaves
+     * the walk keeping everything: the walk itself then meets whatever
+     * stopped the pass, and reports it as it always has.  --max stops
+     * early and keeps little; it is not worth a pass.
+     */
+    if (opts.max_entries == 0) {
+        try {
+            auto pre = cst::body_stream_open(cf);
+            walker.forget_after(walker.last_references(pre->reader()));
+        } catch (const std::exception &) {
+            walker.forget_after({});
+        }
+    }
+
     if (std::strcmp(opts.format, "legacy") == 0) {
         render_legacy(stdout, h, templates, by_id, walker);
     } else if (std::strcmp(opts.format, "disasm") == 0) {

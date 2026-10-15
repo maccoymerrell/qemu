@@ -17,6 +17,7 @@
 
 #include "cst_decode.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -205,9 +206,6 @@ FieldStateBlock *table_get_or_create_block(FieldStateTable &t,
                                            uint32_t template_id,
                                            uint32_t need_n_insns)
 {
-    if (template_id >= t.blocks.size()) {
-        t.blocks.resize((size_t)template_id + 1);
-    }
     auto &slot = t.blocks[template_id];
     if (!slot) {
         slot = std::make_unique<FieldStateBlock>();
@@ -219,8 +217,8 @@ FieldStateBlock *table_get_or_create_block(FieldStateTable &t,
 const FieldStateBlock *table_get_block(const FieldStateTable &t,
                                        uint32_t template_id)
 {
-    if (template_id >= t.blocks.size()) return nullptr;
-    return t.blocks[template_id].get();
+    auto it = t.blocks.find(template_id);
+    return it == t.blocks.end() ? nullptr : it->second.get();
 }
 
 /* Read cell (block, ipos, slot).  Returns whether the lookup hit a
@@ -911,6 +909,106 @@ uint64_t BodyWalker::handle_end()
     return body_.uleb();
 }
 
+/*
+ * The parse-skip pass behind forget_after(): every record consumed as
+ * walk() consumes it, but a section is skipped by its length, and of an
+ * ENTRY only the template ids are read -- its own (delta from the
+ * previous ENTRY's) and its chain blocks' (delta-coded within the
+ * chain, Step 6.8).  An IFRAME re-states the preceding ENTRY against
+ * fresh overlays and names no template of its own.
+ */
+std::vector<std::pair<uint32_t, uint32_t>>
+BodyWalker::last_references(Reader &body) const
+{
+    const ResolvedIds &ids = header_.ids;
+    const bool wp = flags_ & ids.flag_wp;
+    std::unordered_map<uint32_t, uint32_t> last;
+    std::vector<bool> seen_asids;
+    uint32_t asid = 0, seq = 0;
+    int32_t prev = 0;
+    auto skip_section = [](Reader &r) { SectionScope s(r); };
+    for (;;) {
+        uint8_t tag = body.u8();
+        if (tag == ids.body_tag_end) {
+            break;
+        } else if (tag == ids.body_tag_thread_switch) {
+            (void)body.sleb();
+        } else if (tag == ids.body_tag_asid_switch) {
+            asid = (uint32_t)((int64_t)asid + body.sleb());
+            if (asid >= seen_asids.size()) {
+                seen_asids.resize((size_t)asid + 1, false);
+            }
+            if (!seen_asids[asid]) {
+                (void)body.u64_le();
+                (void)body.u64_le();
+                seen_asids[asid] = true;
+            }
+        } else if (tag == ids.body_tag_regfile) {
+            (void)body.uleb();
+            uint64_t n = body.uleb();
+            for (uint64_t i = 0; i < n; i++) {
+                (void)body.u8();
+                uint8_t width = body.u8();
+                uint8_t buf[256];
+                if (width) body.raw(buf, width);
+            }
+        } else if (tag == ids.body_tag_devio_start) {
+            (void)body.uleb();
+            (void)body.u8();
+            (void)body.uleb();
+            (void)body.uleb();
+            if (body.u8() == CST_DEVIO_ATTR_EXACT) {
+                (void)body.uleb();
+                (void)body.uleb();
+            }
+        } else if (tag == ids.body_tag_devio_stop) {
+            (void)body.uleb();
+        } else if (tag == ids.body_tag_entry) {
+            prev += (int32_t)body.sleb();
+            seq++;
+            last[(uint32_t)prev] = seq;
+            skip_section(body);
+            if (wp) {
+                SectionScope s(body); Reader &wpb = s;
+                uint64_t n = wpb.uleb();
+                int32_t t = 0;
+                for (uint64_t k = 0; k < n; k++) {
+                    t += (int32_t)wpb.sleb();
+                    last[(uint32_t)t] = seq;
+                    skip_section(wpb);
+                }
+            }
+        } else if (tag == ids.body_tag_iframe) {
+            skip_section(body);
+            if (wp) {
+                skip_section(body);
+            }
+        } else {
+            throw std::runtime_error("Unknown body tag");
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    out.reserve(last.size());
+    for (const auto &l : last) {
+        out.push_back({ l.second, l.first });
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+void BodyWalker::forget_done(WalkState &ws)
+{
+    for (; forget_next_ < forget_.size() && forget_[forget_next_].first <= ws.seq;
+         forget_next_++) {
+        uint32_t t = forget_[forget_next_].second;
+        for (auto *m : { &ws.cp_states, &ws.wp_states }) {
+            for (auto &c : *m) {
+                c.second.blocks.erase(t);
+            }
+        }
+    }
+}
+
 void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
 {
     WalkState ws;
@@ -946,6 +1044,7 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
         }
         if (tag == ids.body_tag_entry) {
             handle_entry(ws, cb);
+            forget_done(ws);
             if (max_entries_ && stats_.cp_entries >= max_entries_) {
                 /* Early stop.  Caller skips trailing-magic check; the
                  * underlying decompressor subprocess (if any) is torn
@@ -1913,6 +2012,7 @@ void BodyWalker::walk_bb(bool cp_fields, WpDecode wp,
         }
         if (tag == ids.body_tag_entry) {
             handle_entry_bb(ws, cp_fields, wp, cb);
+            forget_done(ws);
             if (max_entries_ && stats_.cp_entries >= max_entries_) {
                 return;
             }

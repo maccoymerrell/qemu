@@ -8,7 +8,6 @@
 
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -586,16 +585,39 @@ bool ustar_magic_ok(const UstarHeader *h)
 
 struct TarMember {
     std::string name;
-    const uint8_t *data;
-    size_t size;
+    uint64_t off;     /* payload offset in the container */
+    uint64_t size;
 };
 
-std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
+/* pread exactly @n bytes at @off, or throw. */
+void pread_full(int fd, void *buf, size_t n, uint64_t off)
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (n > 0) {
+        ssize_t r = ::pread(fd, p, n, (off_t)off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error("pread: " + std::string(strerror(errno)));
+        }
+        if (r == 0) {
+            throw std::runtime_error("pread: unexpected end of file");
+        }
+        p += r;
+        n -= (size_t)r;
+        off += (uint64_t)r;
+    }
+}
+
+/* The archive is read header block by header block (pread), never
+ * mapped: member payloads are only located here, and read on demand. */
+std::vector<TarMember> walk_tar(int fd, uint64_t size)
 {
     std::vector<TarMember> out;
-    size_t off = 0;
+    uint64_t off = 0;
+    UstarHeader hdr;
     while (off + 512 <= size) {
-        const UstarHeader *h = (const UstarHeader *)(data + off);
+        pread_full(fd, &hdr, sizeof(hdr), off);
+        const UstarHeader *h = &hdr;
 
         /* Two consecutive zero blocks = end-of-archive. */
         bool all_zero = true;
@@ -620,7 +642,7 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
         if (off + member_size > size) {
             throw std::runtime_error("tar: member extends past EOF");
         }
-        size_t padded = (member_size + 511) & ~(size_t)511;
+        uint64_t padded = (member_size + 511) & ~(uint64_t)511;
 
         char tf = h->typeflag;
         if (tf == 'x' || tf == 'g') {
@@ -633,8 +655,8 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
         if (tf == '\0' || tf == '0') {
             TarMember m;
             m.name = std::string(h->name, name_len);
-            m.data = data + off;
-            m.size = (size_t)member_size;
+            m.off  = off;
+            m.size = member_size;
             out.push_back(std::move(m));
         }
         /* Other typeflags (symlinks, dirs, GNU 'L', ...) skipped. */
@@ -686,9 +708,10 @@ std::string decode_thread_flag()
 }
 
 /* Source pulling bytes from a subprocess decompressor's stdout.
- * ctor forks the decompressor + a feeder child (writes compressed
- * bytes to its stdin); dtor closes stdout, SIGTERMs + reaps both
- * (handles --max early exit).
+ * ctor forks the decompressor + a feeder child (preads the compressed
+ * member from the container and writes it to the decompressor's
+ * stdin); dtor closes stdout, SIGTERMs + reaps both (handles --max
+ * early exit).
  *
  * The feeder is a separate process because a single-thread parent
  * doing write(in)+read(out) deadlocks the moment the decompressor's
@@ -696,7 +719,7 @@ std::string decode_thread_flag()
 class ChildProcessSource : public Source {
 public:
     ChildProcessSource(const std::string &codec,
-                       const uint8_t *data, size_t size)
+                       int fd, uint64_t off, uint64_t size)
         : codec_(codec)
     {
         /*
@@ -750,16 +773,30 @@ public:
         }
         if (feeder_ == 0) {
             close(out_pipe[0]);
-            const uint8_t *p = data;
-            size_t remaining = size;
             /* On --max early teardown the feeder may see EPIPE;
-             * treat as a normal early exit. */
+             * treat as a normal early exit.  A short or failed read of
+             * the container exits non-zero, and the decompressor then
+             * sees a truncated stream and fails its own exit check. */
             signal(SIGPIPE, SIG_IGN);
+            static uint8_t chunk[1 << 20];
+            uint64_t pos = off, remaining = size;
             while (remaining > 0) {
-                ssize_t n = write(in_pipe[1], p, remaining);
-                if (n <= 0) break;
-                p += n;
-                remaining -= (size_t)n;
+                size_t want = remaining < sizeof(chunk)
+                    ? (size_t)remaining : sizeof(chunk);
+                ssize_t got = ::pread(fd, chunk, want, (off_t)pos);
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0) _exit(1);
+                const uint8_t *p = chunk;
+                size_t left = (size_t)got;
+                while (left > 0) {
+                    ssize_t n = write(in_pipe[1], p, left);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) _exit(0);
+                    p += n;
+                    left -= (size_t)n;
+                }
+                pos += (uint64_t)got;
+                remaining -= (uint64_t)got;
             }
             close(in_pipe[1]);
             _exit(0);
@@ -823,34 +860,47 @@ private:
     int   out_fd_ = -1;
 };
 
-/* Memory-backed Source: hands out bytes from a contiguous in-memory
- * buffer.  Used for body_stream_open's uncompressed-body path so
- * mem-backed and stream-backed bodies share the same Reader API. */
-class MemorySource : public Source {
+/* File-range Source: hands out an uncompressed member's bytes by
+ * pread from the container, so an uncompressed body streams through
+ * the Reader's bounded buffer exactly like a decompressed one. */
+class FileRangeSource : public Source {
 public:
-    MemorySource(const uint8_t *data, size_t size)
-        : data_(data), end_(size), pos_(0) {}
+    FileRangeSource(int fd, uint64_t off, uint64_t size)
+        : fd_(fd), pos_(off), end_(off + size)
+    {
+        (void)posix_fadvise(fd_, (off_t)off, (off_t)size,
+                            POSIX_FADV_SEQUENTIAL);
+    }
     size_t read(uint8_t *out, size_t n) override
     {
-        size_t take = end_ - pos_;
-        if (take > n) take = n;
-        std::memcpy(out, data_ + pos_, take);
-        pos_ += take;
-        return take;
+        uint64_t left = end_ - pos_;
+        size_t take = left < n ? (size_t)left : n;
+        if (take == 0) return 0;
+        for (;;) {
+            ssize_t r = ::pread(fd_, out, take, (off_t)pos_);
+            if (r > 0) {
+                pos_ += (uint64_t)r;
+                return (size_t)r;
+            }
+            if (r < 0 && errno == EINTR) continue;
+            throw std::runtime_error(r == 0
+                ? std::string("body member: unexpected end of file")
+                : "body member read: " + std::string(strerror(errno)));
+        }
     }
 private:
-    const uint8_t *data_;
-    size_t end_;
-    size_t pos_;
+    int      fd_;
+    uint64_t pos_;
+    uint64_t end_;
 };
 
-/* Synchronous decompress into @out_buf.  Used for the small header
- * member so eager decompression avoids streaming bookkeeping. */
+/* Synchronous decompress into @out_buf.  Used for the header member
+ * so eager decompression avoids streaming bookkeeping. */
 void decompress_to_buffer(const std::string &codec,
-                          const uint8_t *data, size_t size,
+                          int fd, uint64_t off, uint64_t size,
                           std::vector<uint8_t> *out_buf)
 {
-    ChildProcessSource src(codec, data, size);
+    ChildProcessSource src(codec, fd, off, size);
     uint8_t buf[64 * 1024];
     for (;;) {
         size_t n = src.read(buf, sizeof(buf));
@@ -866,39 +916,38 @@ void decompress_to_buffer(const std::string &codec,
 
 CstFile::~CstFile()
 {
-    if (map_) {
-        munmap((void *)map_, map_size_);
+    if (fd_ >= 0) {
+        ::close(fd_);
     }
 }
 
 CstFile::CstFile(CstFile &&o) noexcept
     : path_(std::move(o.path_)),
-      map_(o.map_), map_size_(o.map_size_),
+      fd_(o.fd_),
       header_buf_(std::move(o.header_buf_)),
       header_(o.header_),
-      body_raw_(o.body_raw_),
+      body_off_(o.body_off_), body_size_(o.body_size_),
       body_codec_(std::move(o.body_codec_))
 {
-    o.map_ = nullptr;
-    o.map_size_ = 0;
+    o.fd_ = -1;
     o.header_ = {};
-    o.body_raw_ = {};
+    o.body_off_ = o.body_size_ = 0;
 }
 
 CstFile &CstFile::operator=(CstFile &&o) noexcept
 {
     if (this != &o) {
-        if (map_) munmap((void *)map_, map_size_);
+        if (fd_ >= 0) ::close(fd_);
         path_ = std::move(o.path_);
-        map_ = o.map_;
-        map_size_ = o.map_size_;
+        fd_ = o.fd_;
         header_buf_ = std::move(o.header_buf_);
         header_ = o.header_;
-        body_raw_ = o.body_raw_;
+        body_off_ = o.body_off_;
+        body_size_ = o.body_size_;
         body_codec_ = std::move(o.body_codec_);
-        o.map_ = nullptr;
-        o.map_size_ = 0;
-        o.body_raw_ = {};
+        o.fd_ = -1;
+        o.header_ = {};
+        o.body_off_ = o.body_size_ = 0;
     }
     return *this;
 }
@@ -908,24 +957,17 @@ std::unique_ptr<CstFile> cst_file_open(const std::string &path)
     std::unique_ptr<CstFile> cf(new CstFile());
     cf->path_ = path;
 
-    int fd = ::open(path.c_str(), O_RDONLY);
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         throw std::runtime_error("open(" + path + "): " + strerror(errno));
     }
+    cf->fd_ = fd;   /* closed by ~CstFile, including on a throw below */
     struct stat st{};
     if (fstat(fd, &st) != 0) {
-        ::close(fd);
         throw std::runtime_error("fstat: " + std::string(strerror(errno)));
     }
-    void *map = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (map == MAP_FAILED) {
-        throw std::runtime_error("mmap: " + std::string(strerror(errno)));
-    }
-    cf->map_ = (const uint8_t *)map;
-    cf->map_size_ = (size_t)st.st_size;
 
-    auto members = walk_tar(cf->map_, cf->map_size_);
+    auto members = walk_tar(fd, (uint64_t)st.st_size);
     const TarMember *body_m = nullptr;
     const TarMember *header_m = nullptr;
     for (const auto &m : members) {
@@ -955,18 +997,19 @@ std::unique_ptr<CstFile> cst_file_open(const std::string &path)
      * lazily so consumers like --templates-only never pay the cost. */
     std::string header_codec = codec_from_suffix(header_m->name);
     if (header_codec.empty()) {
-        cf->header_.data = header_m->data;
-        cf->header_.size = header_m->size;
+        cf->header_buf_.resize((size_t)header_m->size);
+        pread_full(fd, cf->header_buf_.data(), (size_t)header_m->size,
+                   header_m->off);
     } else {
-        decompress_to_buffer(header_codec, header_m->data, header_m->size,
+        decompress_to_buffer(header_codec, fd, header_m->off, header_m->size,
                              &cf->header_buf_);
-        cf->header_.data = cf->header_buf_.data();
-        cf->header_.size = cf->header_buf_.size();
     }
+    cf->header_.data = cf->header_buf_.data();
+    cf->header_.size = cf->header_buf_.size();
 
-    cf->body_raw_.data = body_m->data;
-    cf->body_raw_.size = body_m->size;
-    cf->body_codec_    = codec_from_suffix(body_m->name);
+    cf->body_off_   = body_m->off;
+    cf->body_size_  = body_m->size;
+    cf->body_codec_ = codec_from_suffix(body_m->name);
     return cf;
 }
 
@@ -979,16 +1022,16 @@ BodyStream::~BodyStream() = default;
 std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf)
 {
     auto bs = std::unique_ptr<BodyStream>(new BodyStream());
-    MemberView raw = cf.body_raw();
-    if (raw.size < 8) {
+    if (cf.body_size_ < 8) {
         throw std::runtime_error("body member too small");
     }
     std::unique_ptr<Source> src;
     if (cf.body_codec().empty()) {
-        src = std::make_unique<MemorySource>(raw.data, raw.size);
+        src = std::make_unique<FileRangeSource>(cf.fd_, cf.body_off_,
+                                                cf.body_size_);
     } else {
         src = std::make_unique<ChildProcessSource>(
-            cf.body_codec(), raw.data, raw.size);
+            cf.body_codec(), cf.fd_, cf.body_off_, cf.body_size_);
     }
     /* Reader owns `src` for normal pulls; finalize() routes through
      * it to wait+check the ChildProcessSource. */

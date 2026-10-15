@@ -1122,7 +1122,7 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          int scalar_bits,
                          Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint16_t) const,
                          AttributionLint *lint,
-                         const std::vector<uint8_t> *lint_row,
+                         const AttributionLint::Row *lint_row,
                          RecordSpan *span)
 {
     const uint32_t N = tmpl ? (uint32_t)tmpl->insns.size() : 0;
@@ -1344,7 +1344,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
     /* Per-insn capability row for the lint checks; resolved once per
      * section so the record loop stays hash-free. */
-    const std::vector<uint8_t> *lint_row =
+    const AttributionLint::Row *lint_row =
         lint ? lint->row(template_id) : nullptr;
 
     /* Resolve the per-(state,base) blocks once; the record loop

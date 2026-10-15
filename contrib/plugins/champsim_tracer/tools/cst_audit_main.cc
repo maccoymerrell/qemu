@@ -295,7 +295,7 @@ struct LintCtx {
     cst::AttributionLint::DeltaTracker *tracker;
     /* The OVER-MAX feeder: every CP count cell, not only flagged ones. */
     cst::AttributionLint::OverMaxTracker *over;
-    const std::vector<uint8_t>         *row;      /* template caps row */
+    const cst::AttributionLint::Row    *row;      /* template caps row */
     uint32_t                            thread;
     /* (asid << 32) | thread: the writer's field-state overlay key. */
     uint64_t                            ctx;
@@ -1270,14 +1270,14 @@ int main(int argc, char **argv)
         cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
         /* Stream the body records through a Reader (decompressor
-         * subprocess for codec'd bodies, mmap view otherwise).
+         * subprocess for codec'd bodies, a file-range read otherwise).
          * Streaming avoids materialising the whole decompressed
          * body in RAM. */
         auto body_stream = cst::body_stream_open(*cf);
 
         Stats s;
         s.file_size = (size_t)st.st_size;
-        s.body_compressed = cf->body_raw().size;
+        s.body_compressed = cf->body_raw_size();
         s.body_codec = cf->body_codec();
         s.header_bytes = cf->header().size;
         s.templates_count = templates.size();

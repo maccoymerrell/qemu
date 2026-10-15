@@ -191,10 +191,22 @@ public:
             }
         }
 
-        rows_.reserve(templates.size());
-        for (const Template &t : templates) {
-            std::vector<uint8_t> row;
-            row.reserve(t.insns.size());
+        /* Every per-template table is one flat pool plus a per-template
+         * record (TmplRec): the lint is built over the whole dictionary
+         * and held for the whole walk, and a trace minting millions of
+         * wrong-path templates cannot afford a container per template. */
+        tmpls_.reserve(templates.size());
+        size_t n_insns = 0;
+        for (const Template &t : templates) n_insns += t.insns.size();
+        row_pool_.reserve(n_insns);
+        std::vector<size_t> row_off;
+        row_off.reserve(templates.size());
+        /* (template index, first declaring position, count) per template
+         * that declares an unsuppressible access. */
+        std::vector<std::pair<size_t, std::pair<size_t, size_t>>> unders;
+        for (size_t ti = 0; ti < templates.size(); ti++) {
+            const Template &t = templates[ti];
+            row_off.push_back(row_pool_.size());
             for (const InsnTemplate &I : t.insns) {
                 uint8_t b = (uint8_t)(I.dst_regs.size() < N_DST_MASK
                                           ? I.dst_regs.size() : N_DST_MASK);
@@ -205,37 +217,49 @@ public:
                 if (I.max_dep_loads == 0 && I.max_dep_stores == 0 &&
                     !writes_seg && !exempt.count(I.opcode)) {
                     b |= MEM_IMPOSSIBLE;
-                    uint32_t ipos = (uint32_t)row.size();
-                    MemSubject s;
-                    s.template_id = t.template_id;
-                    s.ipos        = ipos;
-                    s.pc          = I.pc;
-                    s.opcode      = I.opcode;
-                    s.bytes       = I.raw_bytes;
-                    mem_flagged_.emplace(insn_key(t.template_id, ipos),
-                                         std::move(s));
                 }
-                row.push_back(b);
+                row_pool_.push_back(b);
             }
-            rows_.emplace(t.template_id, std::move(row));
 
             /* The NEVER-DELIVERED rule's subjects: every insn that
              * declares an access the architecture cannot suppress. */
-            UnderRow ur;
+            size_t first = under_ipos_.size();
             for (size_t i = 0; i < t.insns.size(); i++) {
                 const InsnTemplate &I = t.insns[i];
                 if (I.max_dep_loads == 0 && I.max_dep_stores == 0) continue;
                 if (memop_is_architecturally_optional(h.isa, I.raw_bytes)) {
                     continue;
                 }
-                ur.ipos.push_back((uint32_t)i);
+                under_ipos_.push_back((uint32_t)i);
             }
-            if (!ur.ipos.empty()) {
-                ur.execs.assign(ur.ipos.size(), 0);
-                ur.delivering.assign(ur.ipos.size(), 0);
-                under_rows_.emplace(t.template_id, std::move(ur));
+            if (under_ipos_.size() != first) {
+                unders.push_back({ti, {first, under_ipos_.size() - first}});
             }
-            tmpl_by_id_.emplace(t.template_id, &t);
+        }
+        /* The pools are complete: only now do their addresses hold. */
+        under_execs_.assign(under_ipos_.size(), 0);
+        under_deliv_.assign(under_ipos_.size(), 0);
+        under_rows_.reserve(unders.size());
+        std::vector<uint32_t> under_of(templates.size(), UINT32_MAX);
+        for (const auto &u : unders) {
+            UnderRow ur;
+            ur.template_id = templates[u.first].template_id;
+            ur.ipos       = {under_ipos_.data() + u.second.first,
+                             u.second.second};
+            ur.execs      = {under_execs_.data() + u.second.first,
+                             u.second.second};
+            ur.delivering = {under_deliv_.data() + u.second.first,
+                             u.second.second};
+            under_of[u.first] = (uint32_t)under_rows_.size();
+            under_rows_.push_back(ur);
+        }
+        for (size_t ti = 0; ti < templates.size(); ti++) {
+            const Template &t = templates[ti];
+            TmplRec rec;
+            rec.t     = &t;
+            rec.row   = {row_pool_.data() + row_off[ti], t.insns.size()};
+            rec.under = under_of[ti];
+            tmpls_.emplace(t.template_id, rec);
         }
 
         /* dst-reg VALUE family fid -> operand slot (the width family
@@ -250,9 +274,23 @@ public:
         }
     }
 
-    const std::vector<uint8_t> *row(uint32_t template_id) const {
-        auto it = rows_.find(template_id);
-        return it == rows_.end() ? nullptr : &it->second;
+    /* A view over contiguous lint-owned elements (the pools). */
+    template <class T>
+    struct Span {
+        T     *p = nullptr;
+        size_t n = 0;
+        size_t size() const { return n; }
+        bool   empty() const { return n == 0; }
+        T &operator[](size_t i) const { return p[i]; }
+        T *begin() const { return p; }
+        T *end() const { return p + n; }
+    };
+    /* One template's capability row: a byte per insn (layout above). */
+    using Row = Span<const uint8_t>;
+
+    const Row *row(uint32_t template_id) const {
+        auto it = tmpls_.find(template_id);
+        return it == tmpls_.end() ? nullptr : &it->second.row;
     }
 
     /*
@@ -284,10 +322,23 @@ public:
         std::vector<MemSubject> out;
         out.reserve(distinct_mem_.size());
         for (uint64_t k : distinct_mem_) {
-            auto it = mem_flagged_.find(k);
-            if (it != mem_flagged_.end()) {
-                out.push_back(it->second);
+            /* The identity is read back from the template the lint was
+             * built over, for exactly the insns its row marks. */
+            uint32_t tid  = (uint32_t)(k >> 32);
+            uint32_t ipos = (uint32_t)k;
+            auto it = tmpls_.find(tid);
+            if (it == tmpls_.end() || ipos >= it->second.row.size() ||
+                !(it->second.row[ipos] & MEM_IMPOSSIBLE)) {
+                continue;
             }
+            const InsnTemplate &I = it->second.t->insns[ipos];
+            MemSubject s;
+            s.template_id = tid;
+            s.ipos        = ipos;
+            s.pc          = I.pc;
+            s.opcode      = I.opcode;
+            s.bytes       = I.raw_bytes;
+            out.push_back(std::move(s));
         }
         std::sort(out.begin(), out.end(),
                   [](const MemSubject &a, const MemSubject &b) {
@@ -401,9 +452,10 @@ public:
      * executed range, so the per-entry cost is one hash probe.
      */
     struct UnderRow {
-        std::vector<uint32_t> ipos;
-        std::vector<uint64_t> execs;
-        std::vector<uint64_t> delivering;
+        uint32_t              template_id = 0;
+        Span<const uint32_t>  ipos;
+        Span<uint64_t>        execs;
+        Span<uint64_t>        delivering;
 
         /* One CP execution of the declaring insn at row index @k,
          * which published @n memops in all. */
@@ -414,8 +466,9 @@ public:
     };
 
     UnderRow *under_row(uint32_t template_id) {
-        auto it = under_rows_.find(template_id);
-        return it == under_rows_.end() ? nullptr : &it->second;
+        auto it = tmpls_.find(template_id);
+        return it == tmpls_.end() || it->second.under == UINT32_MAX
+                   ? nullptr : &under_rows_[it->second.under];
     }
 
     /* A declaring instruction that executed on the correct path and
@@ -443,21 +496,20 @@ public:
     /* Every declaring instruction that executed at least once. */
     std::vector<UnderSubject> under_executed() const {
         std::map<std::pair<uint64_t, std::vector<uint8_t>>, UnderSubject> agg;
-        for (const auto &kv : under_rows_) {
-            const UnderRow &r = kv.second;
-            auto t = tmpl_by_id_.find(kv.first);
+        for (const UnderRow &r : under_rows_) {
+            auto t = tmpls_.find(r.template_id);
             for (size_t k = 0; k < r.ipos.size(); k++) {
                 if (r.execs[k] == 0) continue;
-                if (t == tmpl_by_id_.end() ||
-                    r.ipos[k] >= t->second->insns.size()) {
+                if (t == tmpls_.end() ||
+                    r.ipos[k] >= t->second.t->insns.size()) {
                     continue;
                 }
-                const InsnTemplate &I = t->second->insns[r.ipos[k]];
+                const InsnTemplate &I = t->second.t->insns[r.ipos[k]];
                 auto key = std::make_pair(I.pc, I.raw_bytes);
                 auto it = agg.find(key);
                 if (it == agg.end()) {
                     UnderSubject u;
-                    u.id.template_id = kv.first;
+                    u.id.template_id = r.template_id;
                     u.id.ipos        = r.ipos[k];
                     u.id.pc          = I.pc;
                     u.id.opcode      = I.opcode;
@@ -465,8 +517,8 @@ public:
                     u.max_loads      = I.max_dep_loads;
                     u.max_stores     = I.max_dep_stores;
                     it = agg.emplace(key, std::move(u)).first;
-                } else if (kv.first < it->second.id.template_id) {
-                    it->second.id.template_id = kv.first;
+                } else if (r.template_id < it->second.id.template_id) {
+                    it->second.id.template_id = r.template_id;
                     it->second.id.ipos        = r.ipos[k];
                 }
                 it->second.execs      += r.execs[k];
@@ -725,10 +777,18 @@ private:
         return ((uint64_t)template_id << 32) | ipos;
     }
 
-    std::unordered_map<uint32_t, std::vector<uint8_t>> rows_;
-    /* Identity of every insn the MEM rule marked impossible, keyed the
-     * same way distinct_mem_ is, so a violation can be named. */
-    std::unordered_map<uint64_t, MemSubject> mem_flagged_;
+    /* Per template: the template itself (the lint is constructed over,
+     * and never outlives, the caller's template list -- a violation's
+     * identity is read back from it), its capability row in row_pool_,
+     * and its NEVER-DELIVERED row's index in under_rows_ (UINT32_MAX:
+     * none). */
+    struct TmplRec {
+        const Template *t = nullptr;
+        Row             row;
+        uint32_t        under = UINT32_MAX;
+    };
+    std::unordered_map<uint32_t, TmplRec> tmpls_;
+    std::vector<uint8_t> row_pool_;
     std::vector<int16_t> dst_slot_;
     bool reg_enabled_;
 
@@ -740,10 +800,12 @@ private:
     std::unordered_set<uint32_t> distinct_dangling_;
     uint64_t over_records_ = 0;
     std::unordered_map<uint64_t, OverSubject> over_subjects_;
-    /* NEVER-DELIVERED rows, and the templates they name (the lint is
-     * constructed over, and never outlives, the caller's template list). */
-    std::unordered_map<uint32_t, UnderRow> under_rows_;
-    std::unordered_map<uint32_t, const Template *> tmpl_by_id_;
+    /* NEVER-DELIVERED rows over three flat pools: per declaring insn,
+     * its position, executions, and executions that delivered. */
+    std::vector<UnderRow> under_rows_;
+    std::vector<uint32_t> under_ipos_;
+    std::vector<uint64_t> under_execs_;
+    std::vector<uint64_t> under_deliv_;
 };
 
 /*

@@ -1,7 +1,7 @@
 /*
  * ChampSim Tracer offline tools — byte stream reader.
  *
- * Stateful reader over an in-memory buffer (mmap'd .cst) or a
+ * Stateful reader over an in-memory buffer (a header member) or a
  * Source-backed stream (decompressor pipe).  ULEB/SLEB walkers,
  * length-prefixed string reader, and sub() which carves a
  * length-prefixed sub-section into a bounded reader, advancing the
@@ -345,7 +345,7 @@ private:
     uint64_t uleb_slow();
     int64_t  sleb_slow();
 
-    /* Memory-backed bounds check (used by sub() on mmap Readers). */
+    /* Memory-backed bounds check (used by sub() on in-memory Readers). */
     void check_mem(size_t n) const {
         if (pos_ + n > end_) {
             throw std::runtime_error("reader past end");

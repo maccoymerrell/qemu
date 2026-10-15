@@ -782,7 +782,7 @@ Reusing the decoder library
 
 The decoder bundle (``cst_common`` / ``cst_reader`` / ``cst_format``
 / ``cst_decode``, plus optional ``cst_objdump``) is plain C++17 over
-a small POSIX set (``mmap`` / ``fork`` / ``pipe``) and is meant to
+a small POSIX set (``pread`` / ``fork`` / ``pipe``) and is meant to
 be lifted into your own consumer wholesale.  The design rules a
 re-user must respect:
 
@@ -814,11 +814,24 @@ re-user must respect:
 * **Bring your own byte source.**  A ``Reader`` can wrap any byte
   source; consumers may bypass ``cst_file_open`` / the ustar +
   decompressor machinery entirely.  Streaming readers pull through
-  a sliding buffer so a 100 GB body never has to be resident, and
-  the bundled decompressor uses a separate feeder child so a
+  a sliding buffer so a 100 GB body never has to be resident.  The
+  container itself is read by offset, never mapped: an uncompressed
+  body streams from the file through the same buffer a decompressed
+  one does, so a trace's size costs no address space.  The bundled
+  decompressor uses a separate feeder child so a
   single-threaded parent doing ``write(in)`` + ``read(out)`` cannot
   deadlock when the codec's stdin buffer fills before it produces
   output.
+
+The template dictionary is held whole for the walk, one
+``InsnTemplate`` per instruction of every template, so its
+per-instruction arrays (registers, encoding bytes, dependency masks)
+are inline ``SmallVec`` storage rather than ``std::vector``: a
+wrong-path system trace mints millions of templates (4.1M templates
+holding 21M instructions on an x86_64 wp16 run), and a heap block per
+array put the dictionary at ~500 B per instruction.  The
+impossible-attribution lint built over the dictionary keeps its
+per-template tables in flat pools for the same reason.
 
 Internally the field-delta replay is two passes (apply every wire
 record to its ``(insn, slot)`` state cell, then materialise one row

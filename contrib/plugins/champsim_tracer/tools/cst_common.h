@@ -18,7 +18,9 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -137,22 +139,164 @@ struct DepMask {
 };
 
 /*
+ * A short array of trivially-copyable elements held inline up to @B bytes
+ * and on the heap past that, with an element count of at most 65535.
+ *
+ * It is the storage of the template dictionary's per-instruction arrays
+ * (registers, encoding bytes, dependency masks).  Those arrays are a few
+ * bytes each, and a dictionary holds one set per instruction for the whole
+ * decode: as std::vector each cost a 24-byte header plus a separate heap
+ * block, which on a wrong-path system trace minting millions of templates
+ * (16.9M instructions) was ~600 B per instruction and the bulk of the
+ * decoder's footprint.  Inline, the common instruction costs no allocation
+ * at all.  The interface is the subset of std::vector the tools read
+ * through, and a const view converts to std::vector where an API takes one.
+ *
+ * @aux is one spare byte in what would otherwise be padding, for an owner
+ * that has a per-array byte to keep (DepMaskRows' stride).
+ */
+template <class T, size_t B>
+class SmallVec {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "SmallVec holds trivially-copyable elements only");
+    static_assert(B >= sizeof(T *), "inline area must hold the heap pointer");
+    static constexpr size_t CAP = B / sizeof(T);
+
+public:
+    SmallVec() = default;
+    SmallVec(const SmallVec &o) { assign(o.begin(), o.end()); aux_ = o.aux_; }
+    SmallVec(SmallVec &&o) noexcept
+    {
+        std::memcpy(buf_, o.buf_, B);
+        n_ = o.n_;
+        aux_ = o.aux_;
+        o.n_ = 0;
+    }
+    SmallVec &operator=(const SmallVec &o)
+    {
+        if (this != &o) { assign(o.begin(), o.end()); aux_ = o.aux_; }
+        return *this;
+    }
+    SmallVec &operator=(SmallVec &&o) noexcept
+    {
+        if (this != &o) {
+            release();
+            std::memcpy(buf_, o.buf_, B);
+            n_ = o.n_;
+            aux_ = o.aux_;
+            o.n_ = 0;
+        }
+        return *this;
+    }
+    ~SmallVec() { release(); }
+
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    T *data() { return n_ > CAP ? heap() : reinterpret_cast<T *>(buf_); }
+    const T *data() const
+    {
+        return n_ > CAP ? heap() : reinterpret_cast<const T *>(buf_);
+    }
+    T &operator[](size_t i) { return data()[i]; }
+    const T &operator[](size_t i) const { return data()[i]; }
+    T *begin() { return data(); }
+    T *end() { return data() + n_; }
+    const T *begin() const { return data(); }
+    const T *end() const { return data() + n_; }
+
+    /* Resize to @n elements, all value-initialised (zero). */
+    void resize(size_t n) { assign(n, T{}); }
+    void assign(size_t n, const T &v)
+    {
+        T *p = reset(n);
+        for (size_t i = 0; i < n; i++) p[i] = v;
+    }
+    void assign(const T *first, const T *last)
+    {
+        size_t n = (size_t)(last - first);
+        if (first >= begin() && first < end()) {
+            /* Self-assignment of a sub-range: copy out first. */
+            std::vector<T> tmp(first, last);
+            assign(tmp.data(), tmp.data() + n);
+            return;
+        }
+        T *p = reset(n);
+        if (n) std::memcpy(p, first, n * sizeof(T));
+    }
+
+    operator std::vector<T>() const { return std::vector<T>(begin(), end()); }
+    bool operator==(const SmallVec &o) const
+    {
+        return n_ == o.n_ && (n_ == 0 ||
+               std::memcmp(data(), o.data(), n_ * sizeof(T)) == 0);
+    }
+    bool operator!=(const SmallVec &o) const { return !(*this == o); }
+
+    uint8_t aux() const { return aux_; }
+    void set_aux(uint8_t v) { aux_ = v; }
+
+private:
+    T *heap() const
+    {
+        T *p;
+        std::memcpy(&p, buf_, sizeof(p));
+        return p;
+    }
+    void release()
+    {
+        if (n_ > CAP) delete[] heap();
+        n_ = 0;
+    }
+    /* Drop the contents and make room for @n elements (uninitialised). */
+    T *reset(size_t n)
+    {
+        if (n > 0xFFFF) {
+            throw std::length_error("SmallVec: more than 65535 elements");
+        }
+        release();
+        n_ = (uint16_t)n;
+        if (n > CAP) {
+            T *p = new T[n];
+            std::memcpy(buf_, &p, sizeof(p));
+            return p;
+        }
+        return reinterpret_cast<T *>(buf_);
+    }
+
+    alignas(T) unsigned char buf_[B];
+    uint8_t  aux_ = 0;
+    uint16_t n_   = 0;
+};
+
+/* The dictionary's per-instruction arrays.  13 inline bytes keep a
+ * SmallVec of bytes at 16 bytes and hold every register list and all but
+ * the longest x86 encodings; two inline words hold a scalar instruction's
+ * masks (one or two rows of one limb). */
+using RegList   = SmallVec<uint8_t, 13>;
+using ByteList  = SmallVec<uint8_t, 13>;
+using MaskList  = SmallVec<uint64_t, 16>;
+static_assert(sizeof(RegList) == 16, "RegList packs to 16 bytes");
+static_assert(sizeof(MaskList) == 24, "MaskList packs to 24 bytes");
+
+/*
  * A family of HAS_REG masks (one per destination, or one per store slot),
  * stored at the stride its widest member needs: one limb for every
  * instruction whose positions fit 64 -- all but the wide fans -- so a
  * template costs what it did when the masks were uint64_t.  Indexing
- * returns the mask as a DepMask value.
+ * returns the mask as a DepMask value.  The stride rides in the limb
+ * array's spare byte (0 reads as the default stride, 1).
  */
 struct DepMaskRows {
-    uint8_t limbs = 1;
-    std::vector<uint64_t> w;
+    MaskList w;
 
-    size_t size() const { return w.size() / limbs; }
+    unsigned limbs() const { return w.aux() ? w.aux() : 1u; }
+    size_t size() const { return w.size() / limbs(); }
     bool empty() const { return w.empty(); }
     DepMask operator[](size_t i) const
     {
         DepMask m;
-        for (unsigned l = 0; l < limbs; l++) m.w[l] = w[i * limbs + l];
+        unsigned lb = limbs();
+        for (unsigned l = 0; l < lb; l++) m.w[l] = w[i * lb + l];
         return m;
     }
     /* Replace the family with @rows, at the narrowest stride that holds
@@ -165,13 +309,14 @@ struct DepMaskRows {
                 if (m.w[l - 1]) { need = l; break; }
             }
         }
-        limbs = (uint8_t)need;
         w.assign(rows.size() * need, 0);
+        w.set_aux((uint8_t)need);
         for (size_t i = 0; i < rows.size(); i++) {
             for (unsigned l = 0; l < need; l++) w[i * need + l] = rows[i].w[l];
         }
     }
 };
+static_assert(sizeof(DepMaskRows) == 24, "DepMaskRows packs to 24 bytes");
 
 /* ===== Format-layout invariants =====
  *
@@ -661,17 +806,11 @@ struct Instruction {
 /* ===== Template (parsed from the templates section) ===== */
 
 struct InsnTemplate {
+    /* Member order packs the scalars ahead of the inline arrays: one
+     * InsnTemplate per instruction of every template is held for the whole
+     * decode (see SmallVec). */
     uint64_t pc = 0;
-    uint8_t  opcode = 0;
-    uint8_t  branch_type = 0;
-    bool     branch_conditional = false;
-    bool     has_imm = false;
     int64_t  imm = 0;
-    bool     is_atomic = false;
-    /* CST_INSN_FLAG_SYSTEM: privileged (non-user) execution context.
-     * Uniform across a template; always false in user-mode traces and
-     * in traces predating the flag. */
-    bool     is_system = false;
     /*
      * Template-static MAX memop counts.  Runtime counts arrive via
      * CST_FID_N_LOADS/N_STORES and may be smaller but never larger.
@@ -681,10 +820,24 @@ struct InsnTemplate {
      */
     uint32_t max_dep_loads = 0;
     uint32_t max_dep_stores = 0;
-    std::vector<uint8_t> src_regs;
-    std::vector<uint8_t> dst_regs;
-    std::vector<uint8_t> raw_bytes;       /* may be 0..16 bytes */
-
+    uint8_t  opcode = 0;
+    uint8_t  branch_type = 0;
+    bool     branch_conditional = false;
+    bool     has_imm = false;
+    bool     is_atomic = false;
+    /* CST_INSN_FLAG_SYSTEM: privileged (non-user) execution context.
+     * Uniform across a template; always false in user-mode traces and
+     * in traces predating the flag. */
+    bool     is_system = false;
+    /*
+     * Lane-parallel bit (CST_INSN_FLAG_LANE_PARALLEL): static per
+     * instruction.  When set, lane k of each dst depends only on lane k
+     * of every src; when clear, lanes participate but don't line up by
+     * index (shuffles / broadcasts / horizontal reductions).  Per-slot
+     * lane masks themselves are dynamic — emitted as FID deltas, not
+     * here — see Instruction::src_lane_mask et al.
+     */
+    bool     lane_parallel = false;
     /*
      * Intra-instruction dataflow sub-block (CST_INSN_FLAG_HAS_DEP_BLOCK).
      * Empty when the wire format did not carry the corresponding
@@ -704,23 +857,18 @@ struct InsnTemplate {
      *   bits [0, src_regs.size())                          src_reg[i]
      *   bit  src_regs.size()                                immediate
      */
-    bool                  has_reg_deps  = false;
-    bool                  has_addr_deps = false;
-    DepMaskRows           dst_dep_mask;
-    DepMaskRows           store_data_dep_mask;
-    std::vector<uint64_t> load_addr_dep_mask;
-    std::vector<uint64_t> store_addr_dep_mask;
-
-    /*
-     * Lane-parallel bit (CST_INSN_FLAG_LANE_PARALLEL): static per
-     * instruction.  When set, lane k of each dst depends only on lane k
-     * of every src; when clear, lanes participate but don't line up by
-     * index (shuffles / broadcasts / horizontal reductions).  Per-slot
-     * lane masks themselves are dynamic — emitted as FID deltas, not
-     * here — see Instruction::src_lane_mask et al.
-     */
-    bool                  lane_parallel = false;
+    bool     has_reg_deps  = false;
+    bool     has_addr_deps = false;
+    RegList  src_regs;
+    RegList  dst_regs;
+    ByteList raw_bytes;       /* may be 0..16 bytes */
+    DepMaskRows dst_dep_mask;
+    DepMaskRows store_data_dep_mask;
+    MaskList    load_addr_dep_mask;
+    MaskList    store_addr_dep_mask;
 };
+static_assert(sizeof(InsnTemplate) <= 184,
+              "InsnTemplate is held per instruction for a whole decode");
 
 /*
  * Decoded template profile block (format §6).  Run-aggregated,

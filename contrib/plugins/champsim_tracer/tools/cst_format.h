@@ -3,13 +3,14 @@
  *
  * Reads a .cst file (POSIX-ustar archive carrying body.cst[.<codec>]
  * + header.cst[.<codec>]) into typed cst::Header / cst::Template plus
- * the body member's decoded byte range.  The CstFile loader owns the
- * mmap and, per member, either points into it (uncompressed) or holds
- * a decompressed copy; MemberView ranges live as long as the CstFile.
+ * a stream over the body member.  The CstFile loader holds the open
+ * file and the header member's (decompressed) bytes; the body is read
+ * from the file as a stream, never mapped or loaded whole, so a trace
+ * of any size costs the reader a bounded buffer.
  *
  * Part of the rippable bundle (see cst_decode.h).  cst_format.cc
  * bundles pure-byte parsers (no I/O), the .cst container open (POSIX
- * mmap), and the codec decompressor subprocess (fork/pipe/wait +
+ * pread), and the codec decompressor subprocess (fork/pipe/wait +
  * execlp of zstd|xz|gzip|bzip2|lz4 `-d -c` on $PATH).  Consumers can
  * instead construct a cst::Reader over their own byte source and
  * bypass cst_file_open / body_stream_open; parse_header takes a
@@ -29,8 +30,12 @@
 
 namespace cst {
 
-/* Carries the mmap + eagerly-decompressed header member.  Construct
- * via cst_file_open; dtor releases mmap + buffer.  The body is NOT
+class BodyStream;
+class CstFile;
+std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf);
+
+/* Carries the open file + eagerly-read header member.  Construct
+ * via cst_file_open; dtor closes the file.  The body is NOT
  * decompressed up-front — spawn body_stream_open(*this) to walk
  * records, so header-only consumers (--templates-only) spawn no
  * decompressor and read no body bytes. */
@@ -47,9 +52,9 @@ public:
     /* Filename of the underlying .cst on disk, for diagnostics. */
     const std::string &path() const { return path_; }
 
-    /* Raw (still-compressed if codec'd) body member as a range in the
-     * mmap.  Used by body_stream_open to dispatch the decompressor. */
-    MemberView body_raw() const { return body_raw_; }
+    /* Size of the raw (still-compressed if codec'd) body member.  Its
+     * bytes are read from the file by body_stream_open. */
+    uint64_t body_raw_size() const { return body_size_; }
     /* Codec (zstd / xz / gzip / bzip2 / lz4) inferred from the body
      * member's filename suffix; empty for uncompressed bodies. */
     const std::string &body_codec() const { return body_codec_; }
@@ -58,15 +63,19 @@ private:
     CstFile() = default;
     friend std::unique_ptr<CstFile> cst_file_open(const std::string &);
 
+    friend std::unique_ptr<BodyStream> body_stream_open(const CstFile &);
+
     std::string path_;
-    const uint8_t *map_ = nullptr;
-    size_t map_size_ = 0;
-    /* Eagerly-decompressed header buffer (empty if uncompressed). */
+    /* The container, open for the CstFile's lifetime; members are read
+     * by offset (pread), so any number of body streams may run at once. */
+    int fd_ = -1;
+    /* The header member's bytes (decompressed when codec'd). */
     std::vector<uint8_t> header_buf_;
     MemberView header_{};
-    /* Raw body member view into the outer mmap (compressed bytes if
-     * a codec suffix is present; otherwise uncompressed payload). */
-    MemberView  body_raw_{};
+    /* Raw body member's byte range in the container (compressed bytes
+     * if a codec suffix is present; otherwise uncompressed payload). */
+    uint64_t    body_off_  = 0;
+    uint64_t    body_size_ = 0;
     std::string body_codec_;
 };
 

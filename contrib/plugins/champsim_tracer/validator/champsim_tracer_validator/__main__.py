@@ -503,6 +503,33 @@ def _parse_args() -> argparse.Namespace:
                          "ASID space inside the sleep window).")
     system_args(ct)
 
+    ff = sub.add_parser(
+        "fault_frame_test",
+        help="Fault-frame identity witness (system mode, x86_64, -smp 1): "
+             "userfaultfd holds faulting threads inside their handlers so "
+             "peer threads fault in one block on one vCPU in a chosen "
+             "order; plus an abandoned invocation re-entered afresh and a "
+             "two-fault join.  Asserts census_frames_opened == faulting "
+             "invocations, every executed body instruction on the wire as "
+             "pieces of its one template, handlers at depth >= 1, and "
+             "clock_minus_wire == 0.")
+    common(ff)
+    ff.add_argument("--isa", choices=ISA_CHOICES, action="append",
+                    required=True,
+                    help="x86_64 (the other staged guest kernels lack "
+                         "CONFIG_USERFAULTFD and SKIP).")
+    ff.add_argument("--build-dir", type=Path, required=True)
+    ff.add_argument("--case", action="append", default=None,
+                    help="Run only this case (repeatable; default all).  "
+                         "Cases: serial (negative control), peer_same_pc, "
+                         "peer_same_pc_bfirst, peer_later_pc, "
+                         "abandoned_later_pc, abandoned_same_pc, join.")
+    ff.add_argument("--depth", type=int, default=64)
+    ff.add_argument("--stop", type=int, default=1_000_000,
+                    help="Marker-window budget; the END marker closes the "
+                         "window long before it.")
+    system_args(ff)
+
     dl = sub.add_parser(
         "deadlatch_test",
         help="Dead-latch must-fire test (system mode): the marked "
@@ -1906,6 +1933,94 @@ def cmd_churn_test(args) -> int:
     return rc_total
 
 
+def cmd_fault_frame_test(args) -> int:
+    """Fault-frame identity witness (system mode, x86_64, -smp 1).
+
+    Peer threads faulting in one block on one vCPU, an invocation abandoned
+    by a SIGSEGV handler and the block entered afresh, and two faults inside
+    one invocation (the case-(a2) join) -- each case must open exactly one
+    fault frame per faulting invocation, put every executed instruction of
+    the block on the wire exactly once as pieces of its one template, and
+    stamp each excursion's handler at depth >= 1.  See ``_fault_frame``.
+
+    With more than one case the cases run CONCURRENTLY, each as its own
+    single-case invocation (own output dir, own log, printed in order
+    afterwards); every per-run guard stays on the child."""
+    from . import _fault_frame as FF
+    args.system = True
+    args.smp = 1
+    names = args.case or [c.name for c in FF.CASES]
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rc_total = 0
+    ran = 0
+    for isa in args.isa:
+        if isa not in FF.ISAS:
+            print(f"fault_frame_test[{isa}]: SKIP  the staged {isa} guest "
+                  f"kernel is built without CONFIG_USERFAULTFD, the "
+                  f"mechanism that holds a faulting thread inside its "
+                  f"handler")
+            continue
+        ran += 1
+        if len(names) > 1:
+            procs = []
+            for n in names:
+                log = out / f"{n}.log"
+                cmd = [sys.executable, "-m", "champsim_tracer_validator",
+                       "fault_frame_test", "--isa", isa,
+                       "--build-dir", str(args.build_dir),
+                       "-o", str(out / n), "--case", n,
+                       "--depth", str(args.depth), "--stop", str(args.stop)]
+                f = open(log, "w")
+                procs.append((n, log, f, subprocess.Popen(
+                    cmd, cwd=str(Path(__file__).resolve().parent.parent),
+                    stdout=f, stderr=subprocess.STDOUT)))
+            for n, log, f, p in procs:
+                rc = p.wait()
+                f.close()
+                print(f"\n---- fault_frame_test {isa} case {n} (rc={rc}) ----")
+                print(log.read_text(errors="replace"), end="")
+                rc_total |= int(rc != 0)
+            continue
+        case = FF.CASE_BY_NAME[names[0]]
+        label = f"fault_frame[{isa}:{case.name}]"
+        print(f"\n==== fault_frame_test {isa} {case.name}: {case.what} ====")
+        exe = FF.build(case, out)
+        plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+        rc = _trace_system(args, isa, exe, plugin, exe)
+        if rc != 0:
+            print(f"{label}: FAIL  trace rc={rc}")
+            rc_total = 1
+            continue
+        console = Path(f"{exe}.console.log")
+        stats = Path(f"{exe}.stats.log")
+        cst = Path(f"{exe}.cst")
+        ctext = console.read_text(errors="replace")
+        # The workload dies loudly (perror + exit 2) when the guest refuses
+        # it the mechanism; that is a broken cell, never a skip.
+        for tag in ("userfaultfd:", "UFFDIO_", "mlockall:", "mmap:"):
+            if tag in ctext:
+                print(f"{label}: FAIL  the workload reported "
+                      f"'{tag}' -- the fault schedule never ran")
+                rc_total = 1
+        if _check_segment_coverage(console, label=label, smp=1,
+                                   workload="fault_frame", system=True):
+            rc_total = 1
+        if _must0.gate([stats], label):
+            rc_total = 1
+        lo, hi = FF.body_extent(exe)
+        decoder = Path(os.environ.get("CST_DECODE") or
+                       args.build_dir / "contrib" / "plugins" / "cst_decode")
+        strands = FF.scan_wire(cst, decoder, lo, hi)
+        stats_text = stats.read_text() if stats.is_file() else ""
+        if FF.assess(case, label, strands, stats_text, _stats_value):
+            rc_total = 1
+        print(f"{label}: {'PASS' if rc_total == 0 else 'FAIL'}")
+    if ran == 0:
+        return RC_SKIP
+    return rc_total
+
+
 def cmd_deadlatch_test(args) -> int:
     """Dead-latch must-fire test (system mode).
 
@@ -2198,6 +2313,8 @@ def main() -> int:
         return cmd_mt_test(args)
     if args.cmd == "churn_test":
         return cmd_churn_test(args)
+    if args.cmd == "fault_frame_test":
+        return cmd_fault_frame_test(args)
     if args.cmd == "deadlatch_test":
         return cmd_deadlatch_test(args)
     if args.cmd == "full":

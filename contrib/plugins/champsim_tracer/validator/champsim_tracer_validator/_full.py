@@ -141,6 +141,7 @@ FEATURES: dict[str, str] = {
     "behavior:wp_fault_to_budget": "WP execution-time fault continues to budget",
     "behavior:wp_tlb_cold_capture": "WP fetch of a valid-PTE but TLB-cold code page captures real bytes (system mode)",
     "behavior:syscall_fault_nesting": "system-mode syscall/fault nesting discipline",
+    "behavior:fault_frame_identity": "a fault frame is one faulting invocation of one guest thread: peer threads faulting in one block on one vCPU each open their own, an abandoned invocation re-entered afresh opens a new one, two faults in one invocation join",
     "behavior:user_code_identity": "content gate: every captured user template byte-matches the marked image",
     "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
     "behavior:marker_detection_exact": "a COMPLETE marker sequence is never missed: the base translator never splits a magic sequence across TBs, so the whole-sequence byte match made at translation time sees all of it in one delivered block and fires there — translation reach IS detection, with no execution callback behind it; a branch landing mid-sequence reaches fewer than the full sequence's instructions and is deliberately NOT a marker",
@@ -1002,6 +1003,15 @@ def _chk_thread_system(ctx: Ctx) -> Outcome:
          "--stop", "200000", "--seeds", "1"],
         timeout=900, log_path=d / "run.log")
     return _cli_outcome(rc, tail, 900)
+
+
+def _chk_fault_frame(ctx: Ctx) -> Outcome:
+    d = ctx.dir("system_fault_frame_x86")
+    rc, tail = _run_cli(
+        ["fault_frame_test", "--isa", "x86_64",
+         "--build-dir", str(ctx.build_dir), "-o", str(d)],
+        timeout=1800, log_path=d / "run.log")
+    return _cli_outcome(rc, tail, 1800)
 
 
 def _chk_thread_system_mipsel(ctx: Ctx) -> Outcome:
@@ -2145,6 +2155,12 @@ def build_checks() -> list:
                    "--smp 2)",
                    ["behavior:thread_strand_sequential"],
                    _chk_thread_system_mipsel))
+    C.append(Check("system.fault_frame_x86", "system",
+                   "fault-frame identity: peer threads faulting in one "
+                   "block on one vCPU, an abandoned invocation re-entered, "
+                   "a two-fault join (x86, userfaultfd, -smp 1)",
+                   ["behavior:fault_frame_identity",
+                    "behavior:syscall_fault_nesting"], _chk_fault_frame))
     C.append(Check("system.smc_x86", "system",
                    "self-modifying code mints revisions under the marker "
                    "window / pinned ASID (x86 system boot)",

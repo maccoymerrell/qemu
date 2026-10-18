@@ -2383,15 +2383,17 @@ attached (the direct host-page path is withheld so that the stores are
 observable), so it publishes one 1-byte store per byte of the block —
 64 at QEMU's default block size.
 
-The WRONG PATH does not yet carry this access. The address is on the
-wrong-path template — the opcode is there and the statement is the same
-one — but the per-instruction callback that computes the effective
-address at execution is not armed inside a speculative excursion, which
-runs its translation with ``CF_MEMI_ONLY`` (``accel/tcg/cpu-exec.c``,
-``cpu_plugin_exec_tb()``; ``plugins/api.c`` suppresses non-memory
-instrumentation under that flag). So a wrong-path ``dc cvau`` reaches
-the wire classified and address-less. That is a known loss with a named
-mechanism, not a property of the instruction or of the excursion.
+The synthesised address is published on BOTH paths, on the same terms.
+A wrong-path ``dc cvau``, ``prefetcht0``, ``cbo.flush`` or ``pref``
+carries its ``LOAD_ADDR`` and its ``N_LOADS`` count in the excursion's
+entry exactly as the correct-path execution does, computed from the
+speculative operand registers at the moment the instruction runs. The
+per-instruction callback that computes it is armed inside an excursion:
+the wrong-path walker executes blocks through ``cpu_plugin_exec_tb()``
+(``accel/tcg/cpu-exec.c``), whose translation does not set
+``CF_MEMI_ONLY``. That flag, under which ``plugins/api.c`` suppresses
+non-memory instrumentation, belongs to ``cpu_plugin_exec_inline()``, a
+single-instruction route the tracer does not use.
 
 LOAD / STORE as fall-through classifications
 """"""""""""""""""""""""""""""""""""""""""""

@@ -3406,19 +3406,22 @@ static void vcpu_mem_cb(unsigned int cpu_index,
  * ea = base + scaled/shifted index + disp and routes it through
  * MemAccessRecorder into the BodyEntry's load slots.
  *
- * CORRECT PATH ONLY, AND THAT IS A KNOWN LOSS.  The mechanism is
- * cpu_plugin_exec_tb()'s cflags: a speculative excursion translates with
- * CF_MEMI_ONLY (accel/tcg/cpu-exec.c), and plugins/api.c registers no
- * per-instruction callback under that flag, so this one is never armed on
- * the wrong path.  The justification that used to stand here -- "fine,
- * since these generate no architectural memops on either path anyway" --
- * is REFUTED by the wire's own contract: format.rst 5.2 says the address
- * is owed whether or not a datum moves, and it is owed on both paths.
- * Measured on the aarch64 wrong-path leg: gem5 issues one line-sized
- * access for each of `dc cvau', `dc civac' and `dc cvac' inside the
- * excursion and the trace publishes none, twelve rows per axis across
- * three axes.  The template is right -- the excursion's entries carry the
- * cache-flush opcode -- and only the per-execution address is missing.
+ * BOTH PATHS, ON THE SAME TERMS.  format.rst 5.2 owes the address
+ * whether or not a datum moves, and it names no path: a wrong-path
+ * prefetch or cache-maintenance instruction touches the line its
+ * speculative operand register names, and the excursion's entries carry
+ * that address exactly as the correct path's do.
+ *
+ * The callback IS armed inside an excursion.  A wrong-path walk runs
+ * blocks through qemu_plugin_exec_tb(), and cpu_plugin_exec_tb()
+ * (accel/tcg/cpu-exec.c) translates with CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+ * CF_SINGLE_STEP and NOT CF_MEMI_ONLY.  CF_MEMI_ONLY -- under which
+ * plugins/api.c registers no per-instruction callback -- belongs to
+ * cpu_plugin_exec_inline(), the single-instruction route, which this
+ * plugin never calls.  So mem-only translation is not a reason the wrong
+ * path could lack this access; the one gate that ever withheld it was
+ * this plugin's own, and the callback below names which gates apply on
+ * which path.
  */
 
 typedef struct {

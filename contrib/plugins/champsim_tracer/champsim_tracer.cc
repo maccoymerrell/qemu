@@ -1983,11 +1983,19 @@ static bool marker_read_guest(uint64_t addr, uint8_t *out, size_t len)
  * that simply does not map the vaddr also reads as unreadable here — which
  * verdict lands where is the CALLER's judgment (marker_gate_refresh owns
  * the residency-witness predicate); this function only reports what it
- * saw via @unreadable_out.  On a software-TLB target (MIPS) a RESIDENT
- * page's debug read can still fail — Q-MIPSREAD v4 default,
- * maintainer-vetoable (presented question 2): the refresh would walk the
- * guest page table from PWBase as a TRANSLATION INPUT, never as an
- * identity; not implemented in this pass.  Caller holds exec_lock.
+ * saw via @unreadable_out.  On MIPS a debug read resolves through the
+ * TLB, so a RESIDENT page whose entry is not in the TLB reads unreadable
+ * unless the core can refill it itself: on a core with the hardware
+ * page-table walker (Config3.PW, enabled by the guest) QEMU's debug
+ * translation falls back to that walker's own walk, side-effect-free
+ * (mips_htw_translate_debug), and the walker's input commits (PWCtl.PWEn
+ * rising, PWBase moving while on) are refresh events too — Linux runs
+ * switch_mm with the walker stopped, so the EntryHi write alone would
+ * evaluate with the walker off.  On a software-TLB core (34Kf, 24Kf: no
+ * walker) there is no core state to walk from and the read stays
+ * TLB-only: an evicted entry gates the context off until the next
+ * admission event (marker_end_found_gate_off counts what that costs).
+ * Caller holds exec_lock.
  */
 static bool marker_gate_eval(uint64_t *ord_out, bool *unreadable_out)
 {
@@ -2184,7 +2192,8 @@ static void marker_seed_peer_gates(unsigned int self)
  * cover: a fresh address space's marker page is not resident until it
  * EXECUTES the sequence (demand paging — the root-write refresh before
  * that reads it unreadable and honestly gates off), and on a software-TLB
- * target the refresh's debug read can fail for a resident page too.
+ * MIPS core (no hardware page-table walker) the refresh's debug read can
+ * fail for a resident page too.
  * Without it a second instance at the same layout (Q15: identical
  * (vaddr, bytes) = the same window) is never admitted: its user TBs drop
  * as foreign, or — worse — ride a stale peer gate under the PREVIOUS
@@ -10480,6 +10489,10 @@ static void marker_translate_end(unsigned int cpu_index, uint64_t seq_vaddr,
                 matched.push_back(w.vaddr);
             }
         }
+        if (!matched.empty() && !marker_gate_get(cpu_index)) {
+            /* This context maps the marker and its gate had lost it. */
+            g_stats.marker_end_found_gate_off++;
+        }
         if (matched.empty()) {
             /* Q12: END-ALWAYS-WINS.  A correct-path END in a context that
              * maps no open window still ends the capture — counted and
@@ -10521,8 +10534,9 @@ static void marker_translate_end(unsigned int cpu_index, uint64_t seq_vaddr,
          * and reach its boundary; the segment close tears it down.
          *
          * "Must stay gated" is ENFORCED here, not assumed: on a target
-         * whose refreshes misread the resident marker page (software-TLB
-         * mipsel — the churn evidence read 2778 unreadable of 3006) the
+         * whose refreshes misread the resident marker page (mipsel on a
+         * software-TLB core — the churn evidence read 2778 unreadable of
+         * 3006; marker_end_found_gate_off counts the arrivals) the
          * ending context's gate bit is OFF at this point, and with
          * stepping JIT-gated off no boundary ever evaluates the take —
          * the END arm then rots until the machine-shutdown backstop
@@ -10555,6 +10569,9 @@ static void marker_translate_end(unsigned int cpu_index, uint64_t seq_vaddr,
                     "the run completed in a context that maps no open "
                     "window's marker bytes");
             return;
+        }
+        if (!marker_gate_get(cpu_index)) {
+            g_stats.marker_end_found_gate_off++;
         }
     }
     /* Pinned-simpoint END: same admission + coverage-wait discipline as

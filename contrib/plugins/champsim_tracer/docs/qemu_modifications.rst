@@ -333,23 +333,46 @@ Plugin API additions
    new ISA to system-mode tracing means implementing it (see
    :doc:`extending`).
 
-``target/mips/system/physaddr.c`` — debug reads fall back to the
-hardware page-table walk
+``target/mips/system/physaddr.c``, ``target/mips/tcg/system/tlb_helper.c``
+— debug reads translate through the hardware page-table walker
 
-   ``mips_cpu_get_phys_page_debug`` resolves through the software TLB
-   matched against the live ``EntryHi.ASID``, so immediately after a
-   ``switch_mm`` a resident page's translation is simply not in the TLB
-   and a debug read fails.  On a model implementing the hardware
-   page-table walker (``Config3.PW``, ``PWCtl.PWEn``), a miss now falls
-   back to the same directory walk the walker performs, from
-   ``CP0 PWBase``, side-effect-free: no TLB insertion, no exception, and
-   PWBase used strictly as a TRANSLATION INPUT — never stored, compared
-   or reported as an identity.  This is what makes the ChampSim Tracer's
-   content-gate refresh (``qemu_plugin_read_memory_vaddr`` at each
-   committed address-space change) readable on MIPS.  Huge-page
-   directory entries and non-4K leaf configurations are not decoded; the
-   walk reports failure and the caller keeps the plain miss.  (v4
-   default #2, maintainer-vetoable.)
+   ``mips_cpu_get_phys_page_debug`` resolves through the TLB, so a
+   resident page whose entry is not in the TLB reads as unmapped to every
+   debug reader.  On a core whose hardware page-table walker would refill
+   that miss (``Config3.PW`` with ``PWCtl.PWEn`` set — P5600 among QEMU's
+   models), the debug translation now answers what the core would
+   translate: ``mips_htw_translate_debug`` runs the walker's own walk —
+   ``page_table_walk_refill`` is split into ``page_table_walk``, which
+   computes the EntryLo pair and PageMask, and the refill, which installs
+   them as ``TLBWR`` does — at the walker's kernel ``mmu_idx``, then
+   makes the lookup ``r4k_map_address`` would make in that entry for a
+   data load (even/odd select, ``V``, ``RI``).  It is invoked only where
+   ``mips_cpu_tlb_fill`` invokes the walker (``TLBRET_NOMATCH`` on an
+   R4K-style TLB) and is side-effect-free: the entries are read from
+   guest physical memory, so no TLB entry, CP0 write, softmmu fill or
+   exception results.  One walk serves both callers, so huge pages, the
+   dual-page option and any leaf page size the walker supports are
+   translated identically.  QEMU models the walker for 32-bit MIPS only,
+   so a MIPS64 build keeps the TLB-only answer.
+
+   The walker's input commits are address-space-write events
+   (``QEMU_PLUGIN_CPU_EVENT_ASID_WRITE``, ``cp0_helper.c``
+   ``mips_htw_inputs_committed``): ``PWCtl.PWEn`` rising, and ``PWBase``
+   changing while the walker is on (``mtc0 PWBase`` becomes a helper on
+   32-bit targets for this).  On a walker core these are where an
+   address-space switch completes: Linux stops the walker across
+   ``switch_mm`` (``htw_stop`` / ``htw_start`` around
+   ``check_switch_mmu_context``, which writes ``EntryHi.ASID`` before
+   ``PWBase``), so at the ``EntryHi`` write the walker is off and
+   ``PWBase`` still names the previous mm.  An observer that re-reads
+   what the live context maps — the ChampSim Tracer's content-gate
+   refresh — does so again when the walker comes back on.
+
+   A core without the walker (``34Kf``, ``24Kf``) has no architectural
+   page-table state at all — the refill is the operating system's
+   handler, and where it finds the page table is OS convention — so its
+   debug reads stay TLB-only; see the tracer's
+   ``marker END found its mapping context gated OFF`` counter.
 
 ``disas/capstone.c``, ``include/disas/capstone.h`` and
 ``include/disas/dis-asm.h``

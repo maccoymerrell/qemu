@@ -1201,13 +1201,55 @@ void helper_mtc0_wired(CPUMIPSState *env, target_ulong arg1)
     }
 }
 
+#if !defined(TARGET_MIPS64)
+/*
+ * The hardware page-table walker's translation inputs just committed a
+ * change that can alter what this core translates for the live ASID: the
+ * walker came on (PWCtl.PWEn 0 -> 1), or PWBase moved while it is on.
+ * On a walker core this, not the EntryHi write, is where an address-space
+ * switch completes -- Linux stops the walker across switch_mm (htw_stop /
+ * htw_start around check_switch_mmu_context, which writes EntryHi.ASID
+ * before PWBase), so at the EntryHi write the walker is off and PWBase
+ * still names the previous mm.  Report it on the address-space-write
+ * channel so an observer re-evaluating what the live context maps does
+ * so here, with the inputs the core itself now translates through.  The
+ * event's pc slot carries the (unchanged) ASID; wrong-path pushes are
+ * dropped by cpu_plugin_evq_push.
+ */
+static void mips_htw_inputs_committed(CPUMIPSState *env)
+{
+#ifdef CONFIG_PLUGIN
+    if (env->CP0_Config3 & (1 << CP0C3_PW)) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask,
+                            env_cpu(env)->plugin_fault_depth);
+    }
+#endif
+}
+
+void helper_mtc0_pwbase(CPUMIPSState *env, target_ulong arg1)
+{
+    target_ulong old = env->CP0_PWBase;
+
+    env->CP0_PWBase = arg1;
+    if (old != arg1 && (env->CP0_PWCtl & (1 << CP0PC_PWEN))) {
+        mips_htw_inputs_committed(env);
+    }
+}
+#endif
+
 void helper_mtc0_pwctl(CPUMIPSState *env, target_ulong arg1)
 {
 #if defined(TARGET_MIPS64)
     /* PWEn = 0. Hardware page table walking is not implemented. */
     env->CP0_PWCtl = (env->CP0_PWCtl & 0x000000C0) | (arg1 & 0x5C00003F);
 #else
+    bool was_on = env->CP0_PWCtl & (1 << CP0PC_PWEN);
+
     env->CP0_PWCtl = (arg1 & 0x800000FF);
+    if (!was_on && (env->CP0_PWCtl & (1 << CP0PC_PWEN))) {
+        mips_htw_inputs_committed(env);
+    }
 #endif
 }
 

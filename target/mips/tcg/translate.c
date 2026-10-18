@@ -6681,11 +6681,14 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            /* Q13 v4 default, maintainer-vetoable: EntryHi ASID_WRITE is
-             * the sole gate-refresh event; PWBase is stored inline (its
-             * committed-write event push retired with the identity
-             * apparatus). */
+#if defined(TARGET_MIPS64)
             gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_PWBase));
+#else
+            /* A helper, not an inline store: a PWBase move while the
+             * walker is on is a translation-input commit point
+             * (mips_htw_inputs_committed). */
+            gen_helper_mtc0_pwbase(tcg_env, arg);
+#endif
             register_name = "PWBase";
             break;
         case CP0_REG05__PWFIELD:

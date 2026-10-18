@@ -1186,6 +1186,25 @@ struct Stats {
     uint64_t refresh_gate_turned_off = 0;
     uint64_t refresh_gate_turned_on = 0;
     uint64_t marker_end_no_close = 0;
+    /*
+     * marker_end_found_gate_off — WITNESS of a lost context.  An END reached
+     * translation in a context that DOES map an open window's marker bytes
+     * (the END's own read just proved it) while that vCPU's gate bit was
+     * OFF: the gate refreshes had stopped tracing a context that maps the
+     * marker, and everything it ran between the last OFF and this END went
+     * out of the trace as foreign.  The END admission repairs the close,
+     * never the loss.  Not a "(must be 0)" row, because one cause is
+     * legitimate everywhere: a context whose marker page was demand-paged
+     * (a fork child's file-backed text before its first fault) honestly
+     * reads unmapped at its refreshes.  Where the debug translation is
+     * page-table-authoritative and the marker page stays resident (every
+     * x86_64/aarch64/riscv64 core; mipsel on a core whose guest enabled
+     * the hardware page-table walker) a single-process cell must read 0 —
+     * the validator's churn_test asserts it there.  On a software-TLB MIPS
+     * core (no Config3.PW) a resident page whose TLB entry was evicted is
+     * unreadable to every debug read and this counts the consequence.
+     */
+    uint64_t marker_end_found_gate_off = 0;
         /* An END that executed on the correct path, could not be attributed to
      * any owner, and closed the capture anyway.  MAINTAINER RULING
      * (2026-08-02): "END kills the tracer, regardless of simpoints, just

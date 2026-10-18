@@ -624,13 +624,39 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
  * resulting in a TLB or XTLB Refill exception.
  */
 
+/*
+ * @debug: the walk serves a debug translation (mips_htw_translate_debug),
+ * not a refill.  The entry is then read exactly where the walker reads it
+ * -- the same address translated at the same kernel mmu_idx -- but from
+ * guest physical memory directly, so the read installs no softmmu TLB
+ * entry and cannot raise: a debug lookup must leave no trace on the CPU.
+ */
 static bool get_pte(CPUMIPSState *env, uint64_t vaddr, MemOp op,
-                    uint64_t *pte, unsigned ptw_mmu_idx)
+                    uint64_t *pte, unsigned ptw_mmu_idx, bool debug)
 {
     MemOpIdx oi;
 
     if ((vaddr & (memop_size(op) - 1)) != 0) {
         return false;
+    }
+
+    if (debug) {
+        hwaddr paddr;
+        int prot;
+        uint8_t buf[8];
+
+        if (get_physical_address(env, &paddr, &prot, vaddr, MMU_DATA_LOAD,
+                                 ptw_mmu_idx) != TLBRET_MATCH) {
+            return false;
+        }
+        cpu_physical_memory_read(paddr, buf, memop_size(op));
+        if (op == MO_64) {
+            *pte = mips_env_is_bigendian(env) ? ldq_be_p(buf) : ldq_le_p(buf);
+        } else {
+            *pte = mips_env_is_bigendian(env) ? (uint32_t)ldl_be_p(buf)
+                                              : (uint32_t)ldl_le_p(buf);
+        }
+        return true;
     }
 
     oi = make_memop_idx(op | mo_endian_env(env), ptw_mmu_idx);
@@ -662,7 +688,7 @@ static uint64_t get_tlb_entry_layout(CPUMIPSState *env, uint64_t entry,
 static int walk_directory(CPUMIPSState *env, uint64_t *vaddr,
         int directory_index, bool *huge_page, bool *hgpg_directory_hit,
         uint64_t *pw_entrylo0, uint64_t *pw_entrylo1,
-        MemOp directory_mop, MemOp leaf_mop, int ptw_mmu_idx)
+        MemOp directory_mop, MemOp leaf_mop, int ptw_mmu_idx, bool debug)
 {
     int dph = (env->CP0_PWCtl >> CP0PC_DPH) & 0x1;
     int psn = (env->CP0_PWCtl >> CP0PC_PSN) & 0x3F;
@@ -679,7 +705,7 @@ static int walk_directory(CPUMIPSState *env, uint64_t *vaddr,
         /* wrong base address */
         return 0;
     }
-    if (!get_pte(env, *vaddr, directory_mop, &entry, ptw_mmu_idx)) {
+    if (!get_pte(env, *vaddr, directory_mop, &entry, ptw_mmu_idx, debug)) {
         return 0;
     }
 
@@ -705,7 +731,7 @@ static int walk_directory(CPUMIPSState *env, uint64_t *vaddr,
                                      ptw_mmu_idx) != TLBRET_MATCH) {
                 return 0;
             }
-            if (!get_pte(env, vaddr2, leaf_mop, &entry, ptw_mmu_idx)) {
+            if (!get_pte(env, vaddr2, leaf_mop, &entry, ptw_mmu_idx, debug)) {
                 return 0;
             }
             entry = get_tlb_entry_layout(env, entry, leaf_mop, pf_ptew);
@@ -724,8 +750,17 @@ static int walk_directory(CPUMIPSState *env, uint64_t *vaddr,
     }
 }
 
-static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
-                                   int ptw_mmu_idx)
+/*
+ * The walk proper: everything the hardware walker computes for @address
+ * -- the EntryLo pair and the PageMask of the entry it would insert --
+ * without inserting it.  page_table_walk_refill() installs the result the
+ * way TLBWR does; mips_htw_translate_debug() only reads it.  One walk
+ * serves both, so the debug translation cannot drift from the refill.
+ */
+static bool page_table_walk(CPUMIPSState *env, vaddr address,
+                            int ptw_mmu_idx, bool debug,
+                            uint64_t *out_entrylo0, uint64_t *out_entrylo1,
+                            int32_t *out_pagemask)
 {
     int gdw = (env->CP0_PWSize >> CP0PS_GDW) & 0x3F;
     int udw = (env->CP0_PWSize >> CP0PS_UDW) & 0x3F;
@@ -741,7 +776,6 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
     bool hgpg_mdhit = false;
 
     int32_t pw_pagemask = 0;
-    target_ulong pw_entryhi = 0;
     uint64_t pw_entrylo0 = 0;
     uint64_t pw_entrylo1 = 0;
 
@@ -808,7 +842,7 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
         vaddr |= goffset;
         switch (walk_directory(env, &vaddr, pf_gdw, &huge_page, &hgpg_gdhit,
                                &pw_entrylo0, &pw_entrylo1,
-                               directory_mop, leaf_mop, ptw_mmu_idx))
+                               directory_mop, leaf_mop, ptw_mmu_idx, debug))
         {
         case 0:
             return false;
@@ -825,7 +859,7 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
         vaddr |= uoffset;
         switch (walk_directory(env, &vaddr, pf_udw, &huge_page, &hgpg_udhit,
                                &pw_entrylo0, &pw_entrylo1,
-                               directory_mop, leaf_mop, ptw_mmu_idx))
+                               directory_mop, leaf_mop, ptw_mmu_idx, debug))
         {
         case 0:
             return false;
@@ -842,7 +876,7 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
         vaddr |= moffset;
         switch (walk_directory(env, &vaddr, pf_mdw, &huge_page, &hgpg_mdhit,
                                &pw_entrylo0, &pw_entrylo1,
-                               directory_mop, leaf_mop, ptw_mmu_idx))
+                               directory_mop, leaf_mop, ptw_mmu_idx, debug))
         {
         case 0:
             return false;
@@ -860,7 +894,7 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
                              ptw_mmu_idx) != TLBRET_MATCH) {
         return false;
     }
-    if (!get_pte(env, vaddr, leaf_mop, &dir_entry, ptw_mmu_idx)) {
+    if (!get_pte(env, vaddr, leaf_mop, &dir_entry, ptw_mmu_idx, debug)) {
         return false;
     }
     dir_entry = get_tlb_entry_layout(env, dir_entry, leaf_mop, pf_ptew);
@@ -872,7 +906,7 @@ static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
                              ptw_mmu_idx) != TLBRET_MATCH) {
         return false;
     }
-    if (!get_pte(env, vaddr, leaf_mop, &dir_entry, ptw_mmu_idx)) {
+    if (!get_pte(env, vaddr, leaf_mop, &dir_entry, ptw_mmu_idx, debug)) {
         return false;
     }
     dir_entry = get_tlb_entry_layout(env, dir_entry, leaf_mop, pf_ptew);
@@ -908,6 +942,24 @@ refill:
     }
     pw_pagemask = m >> TARGET_PAGE_BITS;
     pw_pagemask = compute_pagemask(pw_pagemask << CP0PM_MASK);
+    *out_entrylo0 = pw_entrylo0;
+    *out_entrylo1 = pw_entrylo1;
+    *out_pagemask = pw_pagemask;
+    return true;
+}
+
+static bool page_table_walk_refill(CPUMIPSState *env, vaddr address,
+                                   int ptw_mmu_idx)
+{
+    int32_t pw_pagemask;
+    target_ulong pw_entryhi;
+    uint64_t pw_entrylo0;
+    uint64_t pw_entrylo1;
+
+    if (!page_table_walk(env, address, ptw_mmu_idx, false,
+                         &pw_entrylo0, &pw_entrylo1, &pw_pagemask)) {
+        return false;
+    }
     pw_entryhi = (address & ~0x1fff) | (env->CP0_EntryHi & 0xFF);
     {
         target_ulong tmp_entryhi = env->CP0_EntryHi;
@@ -932,6 +984,58 @@ refill:
         env->CP0_EntryLo0 = tmp_entrylo0;
         env->CP0_EntryLo1 = tmp_entrylo1;
     }
+    return true;
+}
+
+/*
+ * Debug translation through the hardware page-table walker.
+ *
+ * A debug read (gdbstub, monitor, qemu_plugin_read_memory_vaddr) resolves
+ * through the TLB alone, so on a TLB miss it fails even where the core
+ * itself would not: a core with Config3.PW refills a miss from the page
+ * table before any exception is taken.  This answers what the core would
+ * translate at this instant -- the walk page_table_walk_refill performs,
+ * at the same kernel mmu_idx (mips_cpu_tlb_fill's choice, the walker's
+ * accesses are kernel-mode loads), followed by exactly the lookup
+ * r4k_map_address would make in the entry the refill would install, for
+ * a data load -- and changes nothing: no TLB entry, no CP0 write, no
+ * softmmu TLB fill, no exception.  The walker's own preconditions apply
+ * unchanged, PWCtl.PWEn included: while the guest has the walker
+ * stopped, the core would take a refill exception, and so the debug
+ * read fails too.
+ *
+ * The caller invokes this only where mips_cpu_tlb_fill would invoke the
+ * walker: a TLBRET_NOMATCH on an R4K-style TLB.
+ */
+bool mips_htw_translate_debug(CPUMIPSState *env, vaddr address,
+                              hwaddr *physical)
+{
+    int ptw_mmu_idx = (env->hflags & MIPS_HFLAG_ERL ?
+                       MMU_ERL_IDX : MMU_KERNEL_IDX);
+    uint64_t lo0, lo1, lo;
+    int32_t pagemask;
+    uint64_t pfn_mask;
+    target_ulong mask;
+    int n;
+
+    if (!page_table_walk(env, address, ptw_mmu_idx, true,
+                         &lo0, &lo1, &pagemask)) {
+        return false;
+    }
+    /* r4k_fill_tlb's PFN, then r4k_map_address's even/odd select,
+     * V check and RI check (MMU_DATA_LOAD), for this one entry. */
+    pfn_mask = (uint32_t)pagemask >> (TARGET_PAGE_BITS + 1);
+    mask = (uint32_t)pagemask | ~(TARGET_PAGE_MASK << 1);
+    n = !!(address & mask & ~(mask >> 1));
+    lo = n ? lo1 : lo0;
+    if (!(lo & 2)) {
+        return false;
+    }
+    if ((lo >> CP0EnLo_RI) & 1) {
+        return false;
+    }
+    *physical = ((get_tlb_pfn_from_entrylo(lo) & ~pfn_mask) << 12) |
+                (address & (mask >> 1));
     return true;
 }
 #endif

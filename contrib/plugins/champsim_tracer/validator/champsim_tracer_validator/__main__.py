@@ -1919,6 +1919,8 @@ def cmd_churn_test(args) -> int:
             # residency witness, must hold.
             if _must0.gate([stats_log], f"churn_test[{isa}]"):
                 rc_total = 1
+            if _check_end_found_gate_off(isa, stats_text, ctext):
+                rc_total = 1
 
         for tool, extra in (("cst_audit", []), ("cst_decode", ["--strict"])):
             tool_path = args.build_dir / "contrib" / "plugins" / tool
@@ -2156,6 +2158,51 @@ def cmd_deadlatch_test(args) -> int:
             if _must0.gate([stats_log], f"deadlatch_test[{isa}/{shape}]"):
                 rc_total = 1
     return rc_total
+
+
+_END_GATE_OFF_ROW = "marker END found its mapping context gated OFF"
+_HTW_ENABLED_LINE = "Hardware Page Table Walker enabled"
+
+
+def _check_end_found_gate_off(isa: str, stats_text: str,
+                              console_text: str) -> bool:
+    """The churn cell's single marked process must never be lost by its
+    gate.  ``marker END found its mapping context gated OFF`` counts the
+    END marker arriving in a context that maps the marker bytes while its
+    gate was off -- every instruction it ran since the gate dropped it
+    went out as foreign.  It must read 0 wherever the debug translation
+    the gate reads through is page-table-authoritative: every x86_64,
+    aarch64 and riscv64 core, and mipsel when the guest kernel enabled the
+    hardware page-table walker (the console line is the guest's own
+    statement that the core has one and it is on).  On a software-TLB
+    MIPS core the count is the known, reported cost of a TLB-only debug
+    read and does not gate here (the coverage check above still does).
+    Returns True on failure.  A missing row fails: no subject, no pass."""
+    authoritative = isa != "mipsel" or _HTW_ENABLED_LINE in console_text
+    if _END_GATE_OFF_ROW not in stats_text:
+        print(f"churn_test[{isa}]: FAIL  stats carry no "
+              f"'{_END_GATE_OFF_ROW}' row -- the lost-context witness "
+              f"cannot be read")
+        return True
+    n = _stats_value(stats_text, _END_GATE_OFF_ROW)
+    if not authoritative:
+        print(f"churn_test[{isa}]: end_found_gate_off={n} (software-TLB "
+              f"core: reported, not gated)")
+        return False
+    if n != 0:
+        print(f"churn_test[{isa}]: FAIL  end_found_gate_off={n} -- the gate "
+              f"lost the marked process on a core whose debug translation "
+              f"walks the page table")
+        return True
+    # 0 is also what a run whose window closed at budget reads, because no
+    # END is translated then; the coverage check (closed AT budget) is
+    # what proves the marked process was followed, and the re-admission
+    # count below is printed so a reader can see the gate was exercised.
+    reon = _stats_value(stats_text, "gate refresh turned the gate ON")
+    print(f"churn_test[{isa}]: end_found_gate_off=0 (must be 0: "
+          f"page-table-authoritative debug translation; gate re-admitted "
+          f"the marked context {reon}x at refreshes)")
+    return False
 
 
 def _stats_value(stats_text: str, label: str) -> int:

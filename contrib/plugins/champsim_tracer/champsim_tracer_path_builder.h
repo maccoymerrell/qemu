@@ -836,6 +836,12 @@ private:
     ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint32_t tid) const;
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece,
                                   uint64_t resume, uint32_t tid) const;
+    /* Both fault-event matches also require the faulting TB to lie on the
+     * frame's resume suffix — a subrun at or past its emission cursor — so
+     * a fresh invocation of the block (entered from its head after the
+     * frame's own invocation was abandoned) is a new excursion. */
+    static bool frame_on_resume_suffix(const CtxFrame &f,
+                                       const BBTemplate *piece);
     /* Completion candidate for a just-sealed BB claiming to be some frame's
      * resume suffix.  Keyed (tid, window, resume_pc) — v4 default Q6,
      * maintainer-vetoable: @seal_window is the window ordinal at the seal

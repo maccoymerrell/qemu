@@ -1817,8 +1817,9 @@ re-execution delivers it again.
 * **Case (a) — re-fault.**  The resume PC matches an in-flight
   ledger entry of the *same thread* in the *same marker window*
   (the entry key is ``(thread, window, resume_pc)``): the same
-  instruction faulted again (a TLB refill followed by the demand fault is *one* faulting
-  instruction).  Nothing new retired, so nothing new is emitted; the
+  instruction faulted again, on the entry's *resume suffix* (below) —
+  a TLB refill followed by the demand fault is *one* faulting
+  instruction.  Nothing new retired, so nothing new is emitted; the
   entry is marked back in flight.  One refinement: a bulk-memory
   self-loop that re-faults having retired further *iterations*
   mid-piece publishes them as a one-instruction piece at the loop —
@@ -1838,6 +1839,20 @@ re-execution delivers it again.
   instruction, so the eventual completion continues from the final
   suffix.  Minting a second ledger entry keyed at the first resume
   PC instead would leak the original entry.
+
+  Both cases require the faulting TB to lie on the entry's **resume
+  suffix**: a subrun that starts at or past the entry's cursor.  The
+  exception return lands on the faulting instruction, whose index *is*
+  the cursor, so the re-executing suffix starts there (or, flowing on
+  across a TB boundary, past it).  A subrun that starts *before* the
+  cursor is the block entered afresh from its head — a new invocation
+  by the same thread after the entry's own invocation was abandoned
+  without ever resuming (a ``SIGSEGV`` handler that ``siglongjmp``\ s
+  out) — and its fault is a new excursion, case (b).  Whether the entry
+  is *returned* cannot tell the two apart: the pinned-user leak sweep
+  marks a thread's entries returned at the first user-privilege TB it
+  dispatches, and for a genuine join that TB is the resume suffix
+  itself.
 * **Case (b) — new fault.**  The resume PC lies inside the deferred
   prev: prev *is* the faulting BB and its terminating branch never
   ran.  It is folded into a serializable template (force-committing

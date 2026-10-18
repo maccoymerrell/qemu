@@ -1462,7 +1462,8 @@ ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc,
  * join (joining it published a piece of the owner's template under the
  * peer's label, dropped the peer's prefix, and re-keyed the owner's frame
  * to the peer's fault PC so the owner's own return and completion both
- * missed).  Top-down so nesting is respected. */
+ * missed).  The piece must also lie on the frame's resume suffix
+ * (frame_on_resume_suffix).  Top-down so nesting is respected. */
 ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
                                            uint64_t resume,
                                            uint32_t tid) const
@@ -1471,11 +1472,38 @@ ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
         const CtxFrame &f = frames_[i];
         if (f.tid == tid && f.window == win_cur_ &&
             tmpl_contains_pc(f.full_tmpl, resume) &&
-            tmpl_subrun_pos(f.full_tmpl, piece) != UINT32_MAX) {
+            frame_on_resume_suffix(f, piece)) {
             return (ptrdiff_t)i;
         }
     }
     return -1;
+}
+
+/* Is @piece — the TB that just faulted — on @f's RESUME SUFFIX: a
+ * byte-identical subrun of the frame's template that starts at or past the
+ * frame's emission cursor?  Only the suffix re-executing after the frame's
+ * exception return can re-fault the frame's instruction (case a) or take a
+ * later fault inside its block (case a2), and that suffix starts AT the
+ * cursor (the return lands on the faulting instruction, whose index is
+ * emitted_to) or, flowing on across a TB boundary, past it.
+ *
+ * A subrun that starts BEFORE the cursor is the block entered afresh from
+ * its head — a NEW invocation by the same thread, after the frame's own
+ * invocation was abandoned without ever resuming (a SIGSEGV handler that
+ * siglongjmps out; the user leak sweep then marks the frame returned and
+ * nothing erases it).  Its fault is a new excursion: claiming it for the
+ * stale frame dropped the new invocation's executed prefix [0, cursor)
+ * unpublished — wholly at the same instruction (case a), or with the stale
+ * frame's [cursor, k) piece published in its place (case a2) — and opened
+ * no frame for it.  `returned` cannot tell the two apart: the leak sweep
+ * marks a frame returned at the first user TB its thread dispatches, which
+ * for a genuine join is the resume suffix itself, so every user-privilege
+ * join meets a returned frame. */
+bool PathBuilder::frame_on_resume_suffix(const CtxFrame &f,
+                                         const BBTemplate *piece)
+{
+    const uint32_t pos = tmpl_subrun_pos(f.full_tmpl, piece);
+    return pos != UINT32_MAX && pos >= f.emitted_to;
 }
 
 /*
@@ -1799,8 +1827,7 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
      * whose ledger entries a re-fault or a join may name. */
     ptrdiff_t cont = frame_idx_for_resume(resume, owner_tid);
     if (cont >= 0 &&
-        tmpl_subrun_pos(frames_[(size_t)cont].full_tmpl, walk_prev_)
-            == UINT32_MAX) {
+        !frame_on_resume_suffix(frames_[(size_t)cont], walk_prev_)) {
         cont = -1;
     }
     if (cont < 0) {                                        /* case (a2) */

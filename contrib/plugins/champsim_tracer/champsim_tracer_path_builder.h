@@ -384,14 +384,19 @@ uint64_t cst_end_take_wait_vaddr(unsigned int cpu_index);
  * the marker-window ordinal in force when the fault classified, and the
  * faulting instruction (v4 default Q6, maintainer-vetoable: no address-
  * space root or ASID is ever stored or compared as an identity; the
- * WINDOW ORDINAL is the model's only stable internal key).  @returned
+ * WINDOW ORDINAL is the model's only stable internal key).  Every event
+ * that names a frame matches all three components — the re-fault and the
+ * same-block join at a FAULT_ENTER, the FAULT_RETURN, and the completing
+ * seal — because the ledger is per vCPU and a vCPU multiplexes guest
+ * threads: a peer thread's event at the same PC is never this frame's.
+ * @returned
  * records the FAULT_RETURN — the continuation is still fired by the
  * resume suffix's SEAL, one or more TB steps later. */
 struct CtxFrame {
     BBTemplate *full_tmpl = nullptr;   /* the faulting BB's full template */
     uint64_t window = 0;               /* marker-window ordinal at the
                                         * frame's classification — the
-                                        * (tid, window) completion key */
+                                        * key's window component */
     uint64_t resume_pc = 0;            /* faulting insn = where ERET lands */
     uint32_t depth = 0;                /* depth the faulting BB ran at */
     uint8_t async_in_depth = 0;        /* the captured-async component (0/1)
@@ -820,20 +825,24 @@ private:
                               bool *prev_emitted, uint32_t owner_tid,
                               BodyStreamState *out_stream,
                               const StepIn &in);
-    void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
-    ptrdiff_t frame_idx_for_resume(uint64_t resume_pc) const;
+    /* @ret_tid is StepIn::cur_tid of the drain carrying the return — the
+     * thread whose TB dispatches at the return target. */
+    void apply_fault_return(const struct qemu_plugin_cpu_event &ev,
+                            uint32_t ret_tid);
+    /* The fault-event lookups.  Keyed (tid, window, resume_pc) and
+     * (tid, window, containment, subrun): the ledger is per vCPU and a vCPU
+     * multiplexes guest threads, so a frame is only ever named by an event
+     * of the thread that owns it.  No address-space identity is compared. */
+    ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint32_t tid) const;
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece,
-                                  uint64_t resume) const;
+                                  uint64_t resume, uint32_t tid) const;
     /* Completion candidate for a just-sealed BB claiming to be some frame's
      * resume suffix.  Keyed (tid, window, resume_pc) — v4 default Q6,
      * maintainer-vetoable: @seal_window is the window ordinal at the seal
      * (StepIn::cur_window) and @seal_tid the committed thread
-     * (StepIn::walk_tid), and this
-     * asid is the second half of the (thread,asid) key.  USER frames match
-     * the hard asid key (merge_suffix_matches is a PURE DIAGNOSTIC there —
-     * Decision C); KERNEL-code frames (is_system) also complete on the
-     * byte-content path when the key misses, because kernel fault events
-     * stamp the loaded mm, not ownership (see the .cc comment). */
+     * (StepIn::walk_tid).  No address-space identity is compared;
+     * merge_suffix_matches is a PURE DIAGNOSTIC on a key match, never a
+     * reject reason (see the .cc comment). */
     static bool frame_matches_completion(const CtxFrame &f,
                                          const BBTemplate *suffix,
                                          uint64_t seal_window,

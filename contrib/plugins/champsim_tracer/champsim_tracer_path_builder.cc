@@ -1413,17 +1413,34 @@ void PathBuilder::prime_from_live()
     primed_ = true;
 }
 
-/* Frame lookup by resume PC within the CURRENT marker window (win_cur_,
- * stamped at each drain): both the frame's ENTER and a later re-fault /
- * return of the same instruction classify while the faulting flow's
- * window is in force, so the (window, resume_pc) pair matches without any
- * address-space identity (v4 default Q6).  Top-down so nesting (LIFO
- * position) is respected when duplicate resume PCs exist. */
-ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc) const
+/* Frame lookup by resume PC, keyed (tid, window, resume_pc) — the frame
+ * identity of v4 default Q6.  The window is the CURRENT marker window
+ * (win_cur_, stamped at each drain): both the frame's ENTER and a later
+ * re-fault / return of the same instruction classify while the faulting
+ * flow's window is in force, so no address-space identity is needed.
+ *
+ * @tid is the guest thread the event belongs to, and it is part of the key
+ * because frames_ is per vCPU and a vCPU multiplexes guest threads (system
+ * mode).  Two threads of one process running the same code fault at the
+ * same instruction routinely — each touching its own not-yet-present page
+ * through its own base register — and while the first blocks in its
+ * handler the scheduler runs the second.  Keyed without the thread, the
+ * second thread's fault read as the FIRST thread's frame re-faulting: its
+ * executed prefix was dropped unpublished, it opened no frame (its handler
+ * emitted at depth 0, its resumed suffix sealed as a fresh template at the
+ * fault PC), and whichever thread's return arrived first marked the other's
+ * frame returned.  In user mode every guest thread is its own CPUState, so
+ * a ledger only ever holds one thread's frames and the key is inert there.
+ *
+ * Top-down so nesting (LIFO position) is respected when duplicate resume
+ * PCs exist. */
+ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc,
+                                            uint32_t tid) const
 {
     for (size_t i = frames_.size(); i-- > 0; ) {
         if (frames_[i].resume_pc == resume_pc &&
-            frames_[i].window == win_cur_) {
+            frames_[i].window == win_cur_ &&
+            frames_[i].tid == tid) {
             return (ptrdiff_t)i;
         }
     }
@@ -1438,14 +1455,21 @@ ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc) const
  * fresh fault it takes on a LATER instruction belongs to the same
  * pending block — not to a new frame keyed at the suffix's start, which
  * would drop every instruction ahead of the first resume from the
- * merged emission.  Same window and byte-content guards as the resume
- * match; top-down so nesting is respected. */
+ * merged emission.  Keyed (tid, window, containment, subrun): the same
+ * thread and window as the resume match, for the same reason — a peer
+ * thread faulting at a LATER instruction of the same code while this
+ * frame's owner sits in its handler is a new excursion of its own, not a
+ * join (joining it published a piece of the owner's template under the
+ * peer's label, dropped the peer's prefix, and re-keyed the owner's frame
+ * to the peer's fault PC so the owner's own return and completion both
+ * missed).  Top-down so nesting is respected. */
 ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
-                                           uint64_t resume) const
+                                           uint64_t resume,
+                                           uint32_t tid) const
 {
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.window == win_cur_ &&
+        if (f.tid == tid && f.window == win_cur_ &&
             tmpl_contains_pc(f.full_tmpl, resume) &&
             tmpl_subrun_pos(f.full_tmpl, piece) != UINT32_MAX) {
             return (ptrdiff_t)i;
@@ -1770,14 +1794,17 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         }
     };
 
-    ptrdiff_t cont = frame_idx_for_resume(resume);
+    /* The faulting block is walk_prev_, so its thread (@owner_tid, the
+     * sampler that stamps a case-(b) frame's tid below) is the thread
+     * whose ledger entries a re-fault or a join may name. */
+    ptrdiff_t cont = frame_idx_for_resume(resume, owner_tid);
     if (cont >= 0 &&
         tmpl_subrun_pos(frames_[(size_t)cont].full_tmpl, walk_prev_)
             == UINT32_MAX) {
         cont = -1;
     }
     if (cont < 0) {                                        /* case (a2) */
-        cont = frame_idx_for_block(walk_prev_, resume);
+        cont = frame_idx_for_block(walk_prev_, resume, owner_tid);
     }
     if (cont >= 0) {                                  /* case (a) / (a2) */
         CtxFrame &f = frames_[(size_t)cont];
@@ -1935,10 +1962,20 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
  * faulting instruction.  Mark the matching frame returnable — emission
  * still rides the resume suffix's SEAL, one or more TB steps later.
  * Returns for faults that never stashed (case (c), pre-prime, foreign)
- * match no frame and are consumed silently. */
-void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
+ * match no frame and are consumed silently.
+ *
+ * @ret_tid is StepIn::cur_tid of the drain carrying the return: the
+ * retained return drains at the first admitted dispatch after it, which is
+ * the returning thread's TB at the return target, so it names the returning
+ * thread.  QEMU's pop compares bare PCs, so when two threads' excursions
+ * share a resume PC either return pops; only the thread says whose frame
+ * it closes.  A return to a user-privilege target is sampled at user
+ * privilege on every ISA, so this does not lean on the kernel-privilege
+ * thread-pointer tracking. */
+void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev,
+                                     uint32_t ret_tid)
 {
-    ptrdiff_t idx = frame_idx_for_resume(ev.pc);
+    ptrdiff_t idx = frame_idx_for_resume(ev.pc, ret_tid);
     if (idx >= 0) {
         frames_[(size_t)idx].returned = true;
         gap_record_fault_return(ev.pc);
@@ -3125,7 +3162,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
                 raw_depth_ = ev.depth_after;
                 if (fault_on) {
-                    apply_fault_return(ev);
+                    apply_fault_return(ev, in.cur_tid);
                 }
             }
             /* async kinds were applied by step_events.  ASID_WRITE's

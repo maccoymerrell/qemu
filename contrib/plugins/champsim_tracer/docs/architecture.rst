@@ -1019,12 +1019,15 @@ fault events exactly once, then runs the shared seal walk:
   unwind in between — the moment it was rescheduled after the peer's
   return.  Each ``CtxFrame`` therefore records the guest thread that
   entered the excursion (``CtxFrame::tid``, the identity the faulting
-  block itself is emitted with), and three places consult it: the depth
-  stamp counts only the executing thread's own frames, the pinned-user
-  leak sweep retires only the frames of the thread whose user code proves
-  it is at depth ``0``, and a completion's leaked-deeper sweep retires
-  only same-thread ledger entries, sparing frames a peer put above it
-  on the ledger — those nest concurrently, not inside.  This is what ``fault_depth`` is defined to
+  block itself is emitted with), and the ledger is read through it
+  everywhere: the depth stamp counts only the executing thread's own
+  frames, the pinned-user leak sweep retires only the frames of the
+  thread whose user code proves it is at depth ``0``, a completion's
+  leaked-deeper sweep retires only same-thread ledger entries, sparing
+  frames a peer put above it on the ledger — those nest concurrently,
+  not inside — and every event that names a frame (a re-fault, a
+  same-block join, a return, a completion) names only the owning
+  thread's (:ref:`fault-excursions`).  This is what ``fault_depth`` is defined to
   mean (:doc:`format` §4.2a): the depth *this* basic block executed at.  A thread that *migrates* across vCPUs mid-excursion
   leaves its frames behind on the vacated vCPU and is counted at depth
   ``0`` on the new one — the documented single-core-pin scope boundary,
@@ -1812,8 +1815,9 @@ it is not an observation of a retired instruction, and the
 re-execution delivers it again.
 
 * **Case (a) — re-fault.**  The resume PC matches an in-flight
-  ledger entry ``{resume_pc, asid}``: the same instruction faulted
-  again (a TLB refill followed by the demand fault is *one* faulting
+  ledger entry of the *same thread* in the *same marker window*
+  (the entry key is ``(thread, window, resume_pc)``): the same
+  instruction faulted again (a TLB refill followed by the demand fault is *one* faulting
   instruction).  Nothing new retired, so nothing new is emitted; the
   entry is marked back in flight.  One refinement: a bulk-memory
   self-loop that re-faults having retired further *iterations*
@@ -1822,7 +1826,8 @@ re-execution delivers it again.
   staying on the instruction.
 * **Case (a2) — second fault, same block.**  The resume PC is new,
   but the faulting TB is a byte-identical subrun of an in-flight
-  entry's template and the new resume PC lies inside that template:
+  entry's template (same thread, same window) and the new resume PC
+  lies inside that template:
   a *later* instruction of the same pending block faulted (the
   archetype is a load's demand-zero fault followed by a store's CoW
   fault in one BB — the resume suffix re-executing after the first
@@ -1839,8 +1844,8 @@ re-execution delivers it again.
   an incomplete head if needed), its executed prefix ``[0, K)`` — up
   to the faulting instruction — is emitted at the fault, and a fresh
   ledger entry records the block's identity: the full template, the
-  resume PC, the event-stamped address space, the owning thread, the
-  depth the block ran at, and the emission cursor ``K``.  When the
+  resume PC, the marker window, the owning thread, the depth the
+  block ran at, and the emission cursor ``K``.  When the
   resume PC is not an instruction of the folded template (a
   force-committed incomplete head), no prefix can be named: nothing
   is emitted, no entry opens, and the accumulators drop with the
@@ -1873,23 +1878,30 @@ the entry.  Any leaked same-thread entry sitting *deeper* on the
 ledger (strict LIFO says an inner excursion unwinds first, so a
 survivor lost its own continuation) is simply retired with it: it
 holds nothing emittable — its prefix reached the wire at its fault —
-and retiring it keeps the depth count honest.  Completion is keyed on
-the sealing context's ``(thread,
-asid)``: the thread dimension is implicit (the PathBuilder is
-per-vCPU-thread state), and the seal's effective pin asid is the
-second half of the key.  A *user* entry completes only when its
-event-stamped asid equals the seal's — which makes the same-VA
-swallow (an entry from *another* address space, reachable through
-ASID reuse since every process maps code at the same low VAs,
-consuming an innocent block's seal) impossible by construction, so
-the byte-content comparison on that arm is a diagnostic, not a
-gate.  A *kernel-code* entry additionally completes on the
-byte-content path when the asid key misses: a kernel fault's event
-stamp is whatever mm is loaded at the fault instant — under
-multi-process churn routinely another task's, for the same reason
-kernel-excursion ownership exists — while the ledger only ever
-holds the pinned process's own excursions, so content identity over
-the one shared kernel image is the reliable key there.  A returned
+and retiring it keeps the depth count honest.
+
+Every event that names a ledger entry — the re-fault and the
+same-block join at a ``FAULT_ENTER``, the ``FAULT_RETURN``, and the
+completing seal — matches the entry's full key ``(thread, window,
+resume_pc)``: the guest thread that ran the faulting block, the
+marker-window ordinal in force when it faulted, and the faulting
+instruction.  The thread is in the key because the ledger is
+per-vCPU state and a vCPU multiplexes guest threads: two threads
+running the same code routinely fault at the same instruction (each
+touching its own not-yet-present page through its own base
+register), and while the first blocks in its handler the second
+runs.  Its fault is an excursion of its own — its own prefix, its
+own depth, its own continuation — never the first thread's
+re-fault or join; and since QEMU's pop compares bare PCs, only the
+returning thread (the thread of the TB dispatching at the return
+target) says whose entry a return closes.  The window makes the
+same-VA swallow — an entry from *another* traced address space
+(concurrent instances and fork children map code at identical low
+VAs) consuming an innocent block's seal — impossible by
+construction, with no page-table root or ASID stored or compared;
+the byte-content comparison on a key match is a diagnostic, not a
+gate.  In user mode every guest thread is its own vCPU, so a ledger
+only ever holds one thread's entries.  A returned
 entry is preferred by event identity; an entry whose return was
 never observed (a non-LIFO guest return — a context switch inside a
 blocking fault resuming the outer task first) completes on the same

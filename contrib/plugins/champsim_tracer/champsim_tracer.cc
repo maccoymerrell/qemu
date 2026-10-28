@@ -3398,6 +3398,25 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
 }
 
+/*
+ * The wrong path's capture of a delay-slot branch's destinations.
+ * Registered — by wrong-path translations only — on the delay slot of a
+ * [branch, delay-slot] tail, pointing at the branch: firing pre-exec of the
+ * delay slot means the branch has just retired, so its dst registers (the
+ * link register of a linking branch) hold post-branch values that the
+ * delay slot has not yet had the chance to overwrite.  The correct path
+ * skips this hook and captures the branch at the next dispatch instead
+ * (snap_prev_tail_dsts); it fires only inside a wrong-path walk, so a
+ * correct-path dispatch of a block that carries it records nothing.
+ */
+static void vcpu_insn_wp_branch_snap_cb(unsigned int cpu_index, void *udata)
+{
+    if (!g_wp_in_progress) {
+        return;
+    }
+    vcpu_insn_reg_snap_cb(cpu_index, udata);
+}
+
 /* ========================= Memory access callback ========================= */
 
 static void vcpu_mem_cb(unsigned int cpu_index,
@@ -9693,7 +9712,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
  * Detect the pair by branch_type and skip the cb whose ci-1 is the branch
  * (ci == n-1); snap_prev_tail_dsts then captures both canonical[n-2]
  * (branch, with REG_IP override) and canonical[n-1] (delay slot) at the
- * right time.
+ * right time.  That deferral is correct-path only: the wrong-path walk
+ * reads just each fragment's LAST insn live, so a wrong-path translation
+ * arms the skipped hook with vcpu_insn_wp_branch_snap_cb instead, and the
+ * walk takes the branch's REG_IP from its post-exec_tb read
+ * (wp_append_fragment_insns).
  */
 static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
                              size_t raw_n_insns,
@@ -9731,13 +9754,24 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
         if (ci == 0) {
             continue;  /* no predecessor canonical insn in this TB */
         }
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         if (delay_slot_tail && ci == canonical_n_insns - 1) {
-            /* The cb HERE would capture canonical[n-2] (the branch); defer
-             * it to snap_prev_tail_dsts so the branch's REG_IP dst gets the
-             * goto_tb successor override. */
+            /* The cb HERE would capture canonical[n-2] (the branch).  On
+             * the correct path, defer it to snap_prev_tail_dsts so the
+             * branch's REG_IP dst gets the goto_tb successor override.
+             * A wrong-path translation has no such deferral — the WP
+             * fragment walk reads only the fragment's LAST insn live — so
+             * it arms the branch's capture here, at the delay slot's
+             * pre-exec (see vcpu_insn_wp_branch_snap_cb). */
+            if (g_wp_in_progress && g_features.wp_reg_data) {
+                qemu_plugin_register_vcpu_insn_exec_cond_cb(
+                    insn, vcpu_insn_wp_branch_snap_cb,
+                    QEMU_PLUGIN_CB_R_REGS,
+                    QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
+                    &refs[ci - 1]);
+            }
             continue;
         }
-        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         /* Gate on the is_active scoreboard slot so the callback skips
          * entirely between segments via a JIT-emitted check — no
          * plugin-side tb_flush needed at segment boundaries.  Translations

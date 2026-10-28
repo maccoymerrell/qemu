@@ -387,7 +387,12 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
                  * captured at insn (i+1)'s pre-exec during the just-finished
                  * exec_tb, i.e. exactly the post-this-insn / pre-next-insn
                  * regfile state.  Mirrors CP regdata semantics for all but
-                 * each fragment's last executed insn. */
+                 * each fragment's last executed insn.
+                 *
+                 * That includes the branch of a [branch, delay-slot] tail:
+                 * a wrong-path translation arms its capture on the delay
+                 * slot (vcpu_insn_wp_branch_snap_cb), where the correct path
+                 * defers it to the next dispatch instead. */
                 for (uint8_t k = 0; k < f->n_dst_regs; k++) {
                     if (wp_snap_cursor <
                         wp_pending_reg_snaps.size()) {
@@ -402,14 +407,41 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
                         bb_reg_snaps.emplace_back(RegSnap{});
                     }
                 }
+                /* The delay-slot branch's PC destination.  Its value is the
+                 * branch's successor, which no register holds at the delay
+                 * slot's pre-exec: a TB does not write the guest PC back
+                 * until it exits, so the read there is the block's entry
+                 * PC.  The successor is published when the TB exits — a
+                 * wrong-path TB is CF_NO_GOTO_TB, so its exit always syncs
+                 * the PC — which makes the post-exec_tb read the value,
+                 * exactly as it is for the delay slot after it.  Only the
+                 * PC dst takes it: the branch's other dsts (a link
+                 * register) keep the delay slot's pre-exec capture, which
+                 * a delay slot that writes the same register cannot
+                 * shadow. */
+                if (i + 2 == n_executed_in_cur &&
+                    n_executed_in_cur == cur->n_insns &&
+                    f->branch_type != BRANCH_NONE &&
+                    cur->insn_fields[i + 1].branch_type == BRANCH_NONE &&
+                    cur->insn_reg_names) {
+                    const InsnRegNames *names = &cur->insn_reg_names[i];
+                    size_t base = bb_reg_snaps.size() - f->n_dst_regs;
+                    for (uint8_t k = 0; k < f->n_dst_regs; k++) {
+                        if (f->dst_regs[k] == REG_IP) {
+                            g_reg_snaps.read_into_snap(
+                                cpu_index, names->dst_qemu_reg_keys[k],
+                                &bb_reg_snaps[base + k]);
+                        }
+                    }
+                }
             } else {
                 /* Last executed insn of this fragment: no successor pre-exec
                  * hook inside the fragment to capture it.  Fall back to a
                  * live read from current (post-exec_tb) regfile state.  For
                  * a multi-fragment exec_tb this captures the
                  * post-everything-in-exec_tb state, so later fragments'
-                 * writes can shadow this insn's writes (the one residual
-                 * case where WP regdata loses per-insn precision). */
+                 * writes can shadow this insn's writes — the residual case
+                 * where WP regdata loses per-insn precision. */
                 g_reg_snaps.capture_insn_snaps_live(cpu_index,
                                                     cur, i,
                                                     bb_reg_snaps);
